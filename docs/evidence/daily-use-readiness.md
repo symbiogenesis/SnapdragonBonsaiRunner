@@ -139,3 +139,67 @@ final power and the record correction was at most 130 seconds; the command's mon
 unavailable after it exited. Equal endpoints prove no uninterrupted stability.
 No owned compiler/test process was started. The single scratch summary was
 consolidated here and removed; no raw build output or duplicate receipt is retained.
+
+## Next-step implementation and stopped bootstrap
+
+The reviewed source at Runner
+`107cbb4989317e005900513b2995c8cfca0af79e` includes trusted immutable-candidate
+adapter controls for both cache actions and source routing, failed checker
+preparation receipt invalidation with a Foundation-owned Windows regression,
+deadline/cancellation checkpoints through portable copy/hash/publication, and
+larger-of-UTC/monotonic inherited-owner budget admission. The separate native
+`log-capture-v1` request/package path binds exactly three flood/drain controls;
+it preserves the original six-case authority workload. These are source changes,
+not passing compiled, distribution, isolation or actual-model verdicts.
+
+The sandbox workflow input/plumbing remains uncommitted in
+`target/next-steps-20261114/isolation/.github/workflows/sandbox-qualification.yml`,
+branch `work/next-isolation-20261114`. Its mandatory startup/syntax preflight did
+not run, so it was not integrated. The native request API is implemented; the new
+workflow input must not be treated as available on current main.
+
+A dedicated local workload began at `2026-11-14T20:32:30.7640240Z` with a
+660-second aggregate allowance, a conservative 600-second estimate, and sixty
+seconds reserved for cleanup, power and retention. Fixed work selected workflow
+startup/syntax and named adapter/receipt controls, native checker preparation,
+immutable-tip validation and eight named Rust regressions. Two native tool crates
+and checker preparation justified exceeding five minutes; no model, audio,
+benchmark, full suite, Git push or CI operation was selected.
+
+The first native supervisor invocation exited 1 with `Unknown maintenance command.`:
+the cached `target/debug/bonsai-tools.exe` lacks the selected `release-tool`
+entry point. Its SHA-256 was
+`6a24169cad5d00202391854dd164a241d8025a27705e1491fd845d683bee9dfa`.
+No selected command, compiler, test or supervised child started. All selected
+checks and fresh checker preparation remain pending. The workload stopped at
+that bootstrap failure without a retry or an alternative supervisor. This is
+not a passing startup/preflight verdict and supplies no application cleanup claim.
+
+The eight pending focused Rust selections are:
+
+- `command::push_sanity::windows::tests::push_sanity_failed_preparation_invalidates_existing_receipt`
+- `command::push_sanity::windows::tests::push_sanity_trusted_controls_reject_non_head_candidate_adapters`
+- `command::push_sanity::windows::tests::push_sanity_snapshot_is_independent_of_index_and_worktree`
+- `native_acceptance_budget::tests::owner_clocks_charge_wall_or_monotonic_elapsed_without_renewal`
+- `native_acceptance_budget::tests::predeclared_owner_allowance_uses_residual_time_without_extending_any_deadline`
+- `app_update::portable::tests::portable_replacement_expired_work_never_publishes_or_leaves_copy`
+- `sandbox_qualification::tests::sandbox_log_workload_cannot_expand_or_substitute_original_authority_controls`
+- `sandbox_qualification::tests::sandbox_log_admission_keeps_three_controls_inside_the_original_deadline`
+
+Native power before setup observed AC disconnected, battery saver off and charge
+69%; after the failed bootstrap at 78.881 seconds it observed AC disconnected,
+saver off and charge 68%. After removal of the four explicitly selected temporary
+files and their directory, the native endpoint at `2026-11-14T20:34:54.7138782Z`
+observed AC disconnected, saver off and charge 67%; monotonic elapsed was
+143.954 seconds. Final record integration remains charged to the original
+660-second allowance. There were no comparison arms; equal AC endpoints do not
+establish uninterrupted stability. This summary is retained without temporary
+command adapters, request files, raw build chatter or duplicate receipts.
+
+Next admission requires a source-bound current native supervisor/prepared checker
+and the unexecuted focused controls. Owner-operated Source checks, Foundation,
+dependency auditing and exact-source acceptance-package receipts still precede
+device work. Actual UI/model lifecycle, clean-machine/Schannel/proxy distribution,
+broker-only transport, hard scratch/private-temp quotas, same-user isolation and
+independent complete-answer/listening review remain open. No new performance
+candidate or default is promoted by this source work.

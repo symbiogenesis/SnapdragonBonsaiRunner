@@ -288,7 +288,9 @@ adoption decisions without displacing native daily-use acceptance.
   read/write/panic failure, complete tail retention and shared-deadline cleanup.
   Qualify the separate source-bound `log-capture-v1` workload for stdout/stderr
   flood and normal-exit tail/file release, preserving the original six-case
-  authority workload and each original deadline. Independently bound scratch and
+  authority workload and each original deadline. Finish its workflow input/plumbing
+  integration after mandatory startup/syntax preflight; the stopped local bootstrap
+  ran none of those checks. Independently bound scratch and
   PSEC-private temp storage; qualify exhaustion, diagnostic/credential retention
   and owner-loss cleanup.
 - [ ] Qualify the [broker contract](docs/broker-policy.md): authentication, numeric

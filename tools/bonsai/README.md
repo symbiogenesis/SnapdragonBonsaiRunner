@@ -277,8 +277,9 @@ Focused source controls use
 checks the staged-probe adapter without running the ignored sandbox workload.
 These controls establish neither actual-device nor hosted workflow qualification.
 
-The workflow also admits the separate, explicitly selected `log-capture-v1`
-workload. It runs exactly three controls: stdout flood, stderr flood and normal-exit
+Native requests also admit the separate, explicitly selected `log-capture-v1`
+workload. Workflow input/plumbing still requires mandatory startup/syntax preflight
+and integration before dispatch can select it. It runs exactly three controls: stdout flood, stderr flood and normal-exit
 tail draining/file release. The default `authority-v1` remains the original six
 controls; neither workload appends cases from the other. Both native `prepare`
 and `qualify` requests carry `workload`, and the source/run/digest-bound package

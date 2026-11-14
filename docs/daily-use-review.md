@@ -57,8 +57,9 @@ workload when this work is selected, without restarting an earlier trial clock.
 
 The source-bound `log-capture-v1` workload selects exactly three model-free
 controls: stdout flood, stderr flood and normal-exit tail draining/file release.
-It preserves the separate original six-case `authority-v1` workload. After owning
-source/compiler acceptance, the owner may select one workload:
+It preserves the separate original six-case `authority-v1` workload. Integrate the
+workflow input/plumbing after its mandatory startup/syntax preflight, then obtain
+owning source/compiler acceptance before the owner selects this workload:
 
 ```powershell
 gh workflow run sandbox-qualification.yml --ref main -f target=snapdragon -f workload=log-capture-v1
