@@ -25,5 +25,10 @@ required-features = ["test-probe"]
 test = false
 doc = false
 
+[[bin]]
+name = "bonsai-push-recovery"
+path = "src/bin/bonsai-push-recovery.rs"
+doc = false
+
 [lints]
 workspace = true
