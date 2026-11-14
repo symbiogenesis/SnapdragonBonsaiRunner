@@ -202,6 +202,116 @@ fn native_source_closure_rejects_partial_flags_and_lost_generation() -> TestResu
     Ok(())
 }
 
+fn clang_cl_unit(scratch: &Scratch) -> Result<Unit, Box<dyn std::error::Error>> {
+    let mut unit = scratch.unit()?;
+    let common = [
+        "--target=aarch64-pc-windows-msvc",
+        "/nologo",
+        "-TP",
+        "/clang:-march=armv8-a+dotprod+i8mm",
+        "-MD", // clang-cl CRT selection, not GNU dependency generation.
+        "/O2",
+        "/EHs",
+    ];
+    unit.arguments = std::iter::once("clang-cl.exe")
+        .chain(common)
+        .map(str::to_string)
+        .chain([
+            "-clang:-MD".into(),
+            format!("-clang:-MT{}", unit.object.path),
+            format!("-clang:-MF{}", unit.dependencies.path),
+            format!("/Fo{}", unit.object.path),
+            "-c".into(),
+            "--".into(),
+            unit.source.clone(),
+        ])
+        .collect();
+    unit.preprocessing_arguments = std::iter::once("clang-cl.exe")
+        .chain(common)
+        .map(str::to_string)
+        .chain([
+            "/P".into(),
+            format!("/Fi{}", unit.preprocessed.path),
+            "--".into(),
+            unit.source.clone(),
+        ])
+        .collect();
+    Ok(unit)
+}
+
+#[test]
+fn native_source_closure_clang_cl_original_arrays_and_split_outputs() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut unit = clang_cl_unit(&scratch)?;
+    assert_eq!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0)?, 1);
+    unit.arguments[11] = "/Fo".into();
+    unit.arguments.insert(12, unit.object.path.clone());
+    unit.preprocessing_arguments[9] = "/Fi".into();
+    unit.preprocessing_arguments
+        .insert(10, unit.preprocessed.path.clone());
+    assert_eq!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0)?, 1);
+    Ok(())
+}
+
+#[test]
+fn native_source_closure_clang_cl_rejects_partial_hidden_or_changed_configuration() -> TestResult {
+    let scratch = Scratch::new()?;
+    for option in [
+        "@hidden.rsp",
+        "/E",
+        "/EP",
+        "/Zs",
+        "/Yuprecompiled.h",
+        "/Fpstate.pch",
+        "/Fdstate.pdb",
+        "/Tcother.c",
+        "/link",
+        "/clang:-MMD",
+        "/clang:-MP",
+        "/clang:-Xclang",
+        "--driver-mode=gcc",
+        "-oother.obj",
+        "/sourceDependenciesother.json",
+        "additional.c",
+        "/clang:-include-pch",
+        "/clang:-include-pch=state.pch",
+        "-include-pch=state.pch",
+        "/clang:-fmodule-file=state.pcm",
+        "/clang:-fmodules",
+        "/clang:-fprebuilt-module-path=modules",
+        "/clang:-march=",
+        "/I",
+    ] {
+        let mut unit = clang_cl_unit(&scratch)?;
+        unit.arguments.insert(1, option.into());
+        unit.preprocessing_arguments.insert(1, option.into());
+        assert!(
+            verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err(),
+            "{option}"
+        );
+    }
+    for position in [8, 9, 10, 11, 12] {
+        let mut unit = clang_cl_unit(&scratch)?;
+        unit.arguments.remove(position);
+        assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    }
+    let mut unit = clang_cl_unit(&scratch)?;
+    unit.preprocessing_arguments[4] = "/clang:-march=armv8-a".into();
+    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    let mut unit = clang_cl_unit(&scratch)?;
+    unit.arguments.insert(1, format!("/Fo{}", unit.object.path));
+    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    let mut unit = clang_cl_unit(&scratch)?;
+    unit.arguments.push(unit.source.clone());
+    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    let mut unit = clang_cl_unit(&scratch)?;
+    let extra = scratch.file("additional.c", b"int hidden;\n")?;
+    unit.arguments.insert(1, extra.path.clone());
+    unit.preprocessing_arguments.insert(1, extra.path);
+    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    Ok(())
+}
+
 fn recursive_unit(scratch: &Scratch) -> Result<Unit, Box<dyn std::error::Error>> {
     let mut unit = scratch.unit()?;
     let intermediate = scratch.file("intermediate.txt", b"7\n")?;

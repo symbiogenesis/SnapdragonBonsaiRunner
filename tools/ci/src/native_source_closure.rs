@@ -236,6 +236,12 @@ fn arguments_valid(arguments: &[String], compiler: &str) -> bool {
 }
 
 fn configuration(unit: &Unit, preprocess: bool) -> Result<Vec<&str>> {
+    let compiler = unit.arguments.first().map_or("", String::as_str);
+    if compiler.rsplit(['/', '\\']).next().is_some_and(|name| {
+        name.eq_ignore_ascii_case("clang-cl") || name.eq_ignore_ascii_case("clang-cl.exe")
+    }) {
+        return clang_cl::configuration(unit, preprocess);
+    }
     let args = if preprocess {
         &unit.preprocessing_arguments
     } else {
@@ -610,6 +616,9 @@ pub(super) fn collect(arguments: &[OsString]) -> Result<String> {
 
 #[path = "native_source_collect.rs"]
 mod collector;
+
+#[path = "native_source_clang_cl.rs"]
+mod clang_cl;
 
 #[cfg(test)]
 #[path = "native_source_closure_tests.rs"]

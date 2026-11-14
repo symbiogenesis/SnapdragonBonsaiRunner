@@ -300,11 +300,38 @@ subsequent mutations; this is not an atomic filesystem snapshot.
 
 Exit codes, source revision and effective target/configuration remain the owning
 producer's claims. Collection does not observe their execution or establish
-source ancestry. Clang-cl `/c`/`/Fo`, shell-command databases and response files
-remain outside this supported subset. In particular, this assembler does not
+source ancestry. Shell-command databases and response files remain outside this
+supported subset. In particular, this assembler does not
 instrument ASR's CMake build or supply its missing original compiler captures.
 The owning CI build must export the admitted original argument arrays and
 artifacts; link, PE, model and retirement gates remain separate.
+
+Original `clang-cl`/`clang-cl.exe` argument arrays also have a separate admitted
+subset, selected by the retained compiler basename. Compilation requires `/c`
+(or `-c`), `/FoABSOLUTE_OBJECT` (or `/Fo ABSOLUTE_OBJECT`) and the forwarded
+`/clang:-MD`, `/clang:-MFABSOLUTE_DEPFILE`, `/clang:-MTABSOLUTE_OBJECT` options;
+the `-clang:` spelling is also admitted. Preprocessing requires `/P` and
+`/FiABSOLUTE_PREPROCESSED` (or `/Fi ABSOLUTE_PREPROCESSED`). `-P`, `-Fo` and `-Fi`
+spellings are equivalent. Both commands retain the exact source argument and
+identical ordered remaining configuration, including CRT/ISA flags. `clang-cl`
+`-MD` selects the CRT; it never substitutes for forwarded `-MD` dependency
+generation. An optional `--` may precede only the one source and must occur in
+both configurations. Output aliases resolve to the retained ordinary absolute
+file identities. Original argument arrays are preserved without rewriting.
+
+This subset rejects PCH, extra output selectors (including `/Fd`), hidden or
+partial dependency controls, response files, driver-mode overrides and additional
+source arguments. Other configuration values must use joined option spellings
+(such as `/IABSOLUTE_DIRECTORY` or `-DNAME=VALUE`). Common options use an explicit
+allowlist for macros, includes, language/CRT, optimization, warnings and floating
+point settings; forwarded common options are limited to `-march=`, `-mcpu=`,
+`-mtune=` and `-ffp-contract=`. Unknown options, hidden forwarded PCH/module inputs
+and separate positional configuration values reject. Owning builds must record supported original
+invocations and a complete argument-array database at execution time. Existing
+CMake shell-command databases, relative outputs, and missing dependency captures
+cannot be converted into original evidence by this support. Literal regressions
+exercise parser and manifest binding only; no actual `clang-cl` capture or
+effective target is qualified.
 
 This verifies the declared selection and its retained bytes. A trusted owning
 build must independently establish the original inventory's completeness, generated-file

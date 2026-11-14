@@ -149,6 +149,50 @@ fn native_source_collect_original_bytes_and_recursive_provenance() -> TestResult
 }
 
 #[test]
+fn native_source_collect_clang_cl_retains_original_database_arguments() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut request = scratch.fixture()?;
+    let compiler = scratch.path("clang-cl.exe");
+    fs::write(&compiler, b"literal clang-cl identity; not executable")?;
+    request["compiler"] = json!(compiler);
+    let arguments = json!([
+        compiler,
+        "--target=aarch64-pc-windows-msvc",
+        "/MD",
+        "/c",
+        format!("/Fo{}", scratch.path("input.obj")),
+        "/clang:-MD",
+        format!("/clang:-MF{}", scratch.path("input.d")),
+        format!("/clang:-MT{}", scratch.path("input.obj")),
+        scratch.path("input.c")
+    ]);
+    request["units"][0]["arguments"] = arguments.clone();
+    request["units"][0]["preprocessingArguments"] = json!([
+        compiler,
+        "--target=aarch64-pc-windows-msvc",
+        "/MD",
+        "/P",
+        format!("/Fi{}", scratch.path("input.i")),
+        scratch.path("input.c")
+    ]);
+    fs::write(
+        scratch.path("compile_commands.json"),
+        serde_json::to_vec(&json!([{
+            "directory":scratch.0, "file":scratch.path("input.c"), "arguments":arguments,
+            "output":scratch.path("input.obj")
+        }]))?,
+    )?;
+    let manifest: Value = serde_json::from_str(&collect(request.clone())?)?;
+    assert_eq!(manifest["units"][0]["arguments"], arguments);
+    // Changing both the manifest command and preprocessing config cannot hide
+    // a different original compilation-database command.
+    request["units"][0]["arguments"][2] = json!("/MT");
+    request["units"][0]["preprocessingArguments"][2] = json!("/MT");
+    assert!(collect(request).is_err());
+    Ok(())
+}
+
+#[test]
 fn native_source_collect_rejects_failures_missing_inputs_and_inventory() -> TestResult {
     let scratch = Scratch::new()?;
     let original = scratch.fixture()?;
