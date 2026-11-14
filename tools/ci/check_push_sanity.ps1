@@ -29,7 +29,10 @@ try {
     $receiptPath = Join-Path $target 'push-checker.json'
     # A failed explicit rebuild cannot leave an earlier preparation admitted.
     # Keep its binary for diagnosis/reuse, but publish a receipt only on success.
-    if ($Prepare) { [IO.File]::Delete($receiptPath) }
+    if ($Prepare) {
+        [void][IO.Directory]::CreateDirectory($target)
+        [IO.File]::Delete($receiptPath)
+    }
     # Ordinary pushes never compile. A missing/stale helper is a prerequisite
     # failure, avoiding an unsupervised cold compiler inside the push allowance.
     if (-not $Prepare) {

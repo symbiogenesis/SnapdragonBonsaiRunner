@@ -399,8 +399,7 @@ pub(super) fn check(
 mod tests {
     use super::*;
 
-    #[test]
-    fn push_sanity_failed_preparation_invalidates_existing_receipt() -> Result<()> {
+    fn preparation_case(case: &str) -> Result<()> {
         let temporary = super::super::canonical_path(std::env::temp_dir())?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -421,16 +420,23 @@ mod tests {
             &policy,
             &policy,
             "test_push_sanity.ps1",
-            &[
-                "-Case".into(),
-                "failed_preparation_invalidates_existing_receipt".into(),
-            ],
+            &["-Case".into(), case.into()],
         );
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Push preparation fixture cleanup escaped temp.".into());
         }
         fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
         result
+    }
+
+    #[test]
+    fn push_sanity_fresh_preparation_reaches_committed_bootstrap() -> Result<()> {
+        preparation_case("fresh_preparation_reaches_committed_bootstrap")
+    }
+
+    #[test]
+    fn push_sanity_failed_preparation_invalidates_existing_receipt() -> Result<()> {
+        preparation_case("failed_preparation_invalidates_existing_receipt")
     }
 
     #[test]
