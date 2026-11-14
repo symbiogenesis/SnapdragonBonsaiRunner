@@ -402,30 +402,43 @@ adoption decisions without displacing native daily-use acceptance.
   loaded-DSP admission; qualify signed arithmetic, correlated completions,
   buffers, cancellation, teardown and TTS/shared-KV integration. Simulated native
   transport, fixed F32 and guarded-Q2 controls do not qualify speech state.
+  First supply a reviewed session-bound provider for exact loaded-DSP bytes and
+  effective usable VTCM; package/URI selection and capacity attributes cannot
+  supply those missing observations. Ordinary speech activation arithmetic also
+  needs an independent oracle beyond the current exact diagnostic subset.
 - [ ] **S2 — Qualify Rust ASR for production.** Compare the complete Rust graph and
   explicit Rust-only service against pinned Qwen3-ASR 1.7B controls. Complete
   owning hosted build/link and native-control regressions; preserve independent
   frontend/numerical/tokenizer observations. Qualify transcript/state,
   microphone-to-Swift submission, quality, cancellation, lifecycle and resources
   before replacing production or removing native dependencies.
+  Implement native capture of every generation step's raw logits and complete
+  all-layer committed KV; current debug output and device argmax cannot populate
+  the complete independent replay. Include omitted-unit-axis loading controls.
 - [ ] Retire remaining Runner/Prism native/reference/DLL/publisher families
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
   codec/ABI, state and fallback obligations with independent controls, then remove
-  compiler/provisioning/build paths. Prism needs an independent observation
-  provider before its 40 active C++ files can be removed; retain every approved
+  compiler/provisioning/build paths. Prism needs complete independent observation
+  provider coverage before its 40 active C++ files can be removed; retain every approved
   green ID, all 22,817 ordered backend geometries and separate performance work.
   Retain required replay data and qualify owning hosted builds without a project
   C++ toolchain. Capture original selected compiled/preprocessed/generated inputs
   and the complete schema-3 compilation database beyond ASR's registry inventory;
   run source and [link/package verification](tools/bonsai/README.md#selected-native-link-and-package-capture)
   on those actual captures in owning CI.
-  Resolve authenticated intake of the exact publisher source archive before
-  expanding its file inventory; retain the failed HTTP 404 outcome and do not
-  substitute changed source or reopen the completed intake workload.
+  Qualify the retained-artifact source manifest collector on actual owning-build
+  artifacts; supply original supported argument arrays rather than rewriting
+  clang-cl or shell command lines into its admitted subset.
+  Inventory the restored original publisher archive identity in owning CI after
+  fresh exact-byte intake. Retain the failed `prism-engine` HTTP 404 outcome and
+  its original pin; do not substitute archive bytes or reopen that completed
+  intake workload. The source-lock correction alone supplies no archive inventory.
 - [ ] Replace the [MSVC startup/panic runtime boundary](docs/cpp-retirement.md#msvc-startup-and-panic-runtime)
   with a qualified Rust provider while preserving preparation-peer recovery,
   worker draining and scoped cleanup. Static CRT linkage alone does not retire
   the embedded C++ exception runtime; a blanket abort profile changes recovery.
+  Qualify schema-2 COFF runtime-symbol observations on actual retained link inputs
+  separately from provider replacement, selected library members and source ancestry.
 
 ## Creative quality, adapters and memory
 

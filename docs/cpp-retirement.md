@@ -123,6 +123,16 @@ subset. It neither reexecutes the source verifier/linker nor establishes static
 library source ancestry, system dependency closure or absence of embedded C++.
 Actual owning capture and hosted no-project-C++ builds remain separate gates.
 
+The source verifier's [`native-closure-collect` assembler](../tools/ci/README.md#selected-compiler-source-closure)
+hashes a reviewed selection of retained original artifacts into schema 3 and
+runs the existing verifier before emitting the manifest. Three new collector
+controls and the existing source controls passed (20 selected checks), with
+strict native ARM64 Release all-target analysis and docs. It executes no compiler
+or generator, authenticates no supplied exit code and establishes no effective
+compiler target. Its argument subset still excludes clang-cl, shell commands and
+response files; actual owning-build instrumentation and original captures remain
+required. Rehashing is not an atomic snapshot or continuous file-stability proof.
+
 The Rust [`native-archive-inventory` command](../tools/ci/README.md#immutable-external-source-archives)
 also expands pinned external source ZIPs into complete sorted member identities,
 including build inputs and notices, without extraction or source execution. It
@@ -134,6 +144,20 @@ the fixed two-archive workload before Prism intake without retry. The
 [retained no-go](evidence/native-source-archives/summary.json) records exact
 identities, missing pre-setup power, intake/cleanup power, allowance and cleanup.
 Submodule contents and selected compiler/link closure remain separate inventories.
+
+Source-location review found commit
+[`73bfe6cc485554822f80c473a3c0c4f25e80f41b`](https://github.com/PrismML-Eng/llama.cpp/commit/73bfe6cc485554822f80c473a3c0c4f25e80f41b)
+publicly available in PrismML's `llama.cpp` repository. Git history traced the
+different `prism-engine` URL/size/digest to commit `cb00d288`, an unrelated Rust
+release repin. The [`native-reference` pin](../tools/native-reference/pins.json)
+restores the exact native tuple from its parent: 39,423,279 bytes/SHA-256
+`5ee8738706229e84e85db7051d7a40797c91e22a7ffa8f4bfb8fea4bf2cb0293`, also retained
+in the earlier [headless source record](runtime-candidates/headless-ucrt-argv.json).
+Native Git commit/header identities and the current Rust source pin are unchanged.
+The historical 404 receipt retains its actual failed URL and pin; its workload
+stays closed. No archive intake was repeated. Fresh original-byte verification
+and file inventory under the restored pin remain owning-CI gates; a corrected
+URL or equal Git commit text supplies neither verdict.
 
 Rust ASR exposes borrowed mel, encoder rows, prompt IDs, each full logits/greedy
 decision and all-layer committed KV through EOS, before its state resets.
@@ -161,6 +185,13 @@ during terminal/EOF intake cannot grant success. Seven focused controls and stri
 Rust-only Release analysis/docs passed. Arbitrary readers still need caller-bound
 I/O and the original absolute deadline. No independent native observations were
 manufactured or captured, and production ASR remains on its existing native engine.
+
+The Rust loader preserves GGML's omitted trailing unit dimensions for F32/F16/Q8
+projections and F32/F16 convolutions, with three selected wire-loader controls and
+strict Rust-only Release analysis/docs passing. Complete native replay remains
+unavailable: native debug output exposes selected intermediates/prefill logits,
+but not every generated token's raw logits and all-layer committed KV. A native
+observation provider must supply those values before the replay can qualify S2.
 
 [Rust TTS observations](../src/speech-tts/README.md#independent-graph-observations)
 likewise lend complete prompts/overlays, raw semantic and acoustic logits before
@@ -197,6 +228,13 @@ count and position without copying complete caches. Four focused transaction
 controls and the existing worker/state control passed with strict Release analysis.
 Whole-codec/PCM, pinned-model cancellation and recovery remain independent gates.
 
+Reference RVQ encoding rejects invalid geometry, nonfinite/overflowing
+centroid norms, projections, candidate scores and residuals. Failure and unwind
+restore the caller's original code prefix; successful finite-input FMA order and
+first-index ties remain unchanged. Four new mathematical/failure controls and the
+existing nearest-centroid control passed with native ARM64 Release analysis/docs.
+These synthetic controls do not supply independent pinned-codec observations.
+
 The [native Q8 projection adapter](../tools/hexagon/native_rpc/README.md#q8-matrix-preparation-and-immutable-placement)
 connects immutable host dispatch to signed-queue ABI calls, exact FD mapping,
 correlated completions and mandatory independent output review. Failed or
@@ -217,6 +255,15 @@ mathematical answers rather than DSP observations. Hosted native receipts now
 bind every Q8 dispatch, native, projection and oracle source/test input; omitted
 or changed identities reject. Signed execution, general speech activations and
 device source/package/driver admission remain pending.
+
+The missing Q8 admission provider must independently bind the actual loaded
+signed module bytes and effective usable VTCM to this session and its guarded
+source/package/catalog/driver identities. Current URI and DSP capacity queries
+do not establish those facts; the [source ledger](../tools/hexagon/native_rpc/sources.json)
+keeps loaded-DSP binding pending. The exact diagnostic oracle also restricts
+activation/scaling arithmetic; it cannot qualify ordinary speech activations or
+authorize serving integration. A CLI route that reused fixed F32/Q2 admission
+would lose these requirements.
 
 Final acceptance requires source/generated-source and dependency inventories,
 binary-linkage assessment, clean hosted consumer builds without a project C++
@@ -258,3 +305,14 @@ workers, and scoped cancellation/completion guards depend on destructors. Changi
 `panic = "abort"` would alter recovery; ordinary passing tests do not qualify
 [abort-mode releases](https://doc.rust-lang.org/cargo/reference/profiles.html#panic).
 Neither workspace has a qualified pure Rust ARM64 MSVC CRT/SEH provider.
+
+Schema 2 of the retained [link/package verifier](../tools/bonsai/README.md#selected-native-link-and-package-capture)
+additionally inspects actual ARM64 COFF objects and MSVC archive members for a
+bounded known C++ exception-symbol family, including short-import targets.
+This exposes references/definitions hidden by static linkage. Schema-1 replay is
+preserved. Observations do not establish which archive members reached the
+shipped image, complete runtime/source ancestry, or absence of embedded C++.
+`cppRuntimeAbsenceQualified` and `nativeRetirementQualified` remain false;
+compiler/sysroot provider replacement and recovery acceptance are still required.
+Twelve focused link/parser controls and strict native ARM64 Release all-target
+analysis passed; no actual toolchain/runtime artifact was inspected.
