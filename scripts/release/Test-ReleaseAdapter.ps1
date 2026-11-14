@@ -9,19 +9,29 @@ $fixture = Join-Path ([IO.Path]::GetTempPath()) ('SwiftBonsai-Adapter-Controls-'
 [void][IO.Directory]::CreateDirectory($fixture)
 $probePath = Join-Path $fixture 'probe.ps1'
 $savedTools = $env:BONSAI_TOOLS_PATH
+$savedRustup = $env:RUSTUP_TOOLCHAIN
+$savedLocation = Get-Location
 $savedPreference = $PSNativeCommandUseErrorActionPreference
 $savedExitCode = Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction SilentlyContinue
 $savedError = [Console]::Error
 $capturedError = [IO.StringWriter]::new()
 $engine = (Get-Process -Id $PID).Path
 $probeMode = 'success'
+$repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+$expectedCompiler = '+nightly-2026-11-12-aarch64-pc-windows-msvc'
 function Invoke-AdapterProbe {
     # Keep the outer adapter's actual native stream redirection. Only executable
     # selection is replaced, and the child never executes the supplied Cargo args.
     & $engine -NoLogo -NoProfile -NonInteractive -File $probePath $probeMode
     $global:LASTEXITCODE = $LASTEXITCODE
 }
-function cargo { Invoke-AdapterProbe }
+function cargo {
+    if ($args.Count -lt 2 -or $args[0] -cne $expectedCompiler -or $args[1] -cne 'run') {
+        throw 'Release Cargo fallback did not explicitly select the repository compiler.'
+    }
+    if ($probeMode -ceq 'arguments-only') { $global:LASTEXITCODE = 0; return 'null' }
+    Invoke-AdapterProbe
+}
 try {
     @'
 param([string]$Mode)
@@ -37,6 +47,9 @@ if ($Mode -ceq 'invalid') {
 }
 [Console]::Out.WriteLine('{"value":"fixture reply","items":[1,2]}')
 '@ | Set-Content -LiteralPath $probePath -Encoding utf8NoBOM
+    # Match hosted callers that execute in runner.temp with a different default.
+    Set-Location -LiteralPath $fixture
+    $env:RUSTUP_TOOLCHAIN = 'stable'
     [Console]::SetError($capturedError)
     $PSNativeCommandUseErrorActionPreference = $true
     foreach ($selection in @('configured', 'cargo')) {
@@ -62,11 +75,17 @@ if ($Mode -ceq 'invalid') {
         catch { $rejected = $true }
         if (-not $rejected) { throw "Invalid JSON was accepted for $selection." }
     }
-    Write-Output 'Release adapter controls passed: native JSON and visible stderr, nonzero diagnostics and invalid JSON for configured tools and Cargo fallback.'
+    $probeMode = 'arguments-only'
+    $null = & (Join-Path $repository '.github/release/Collect-Notices.ps1') -RepositoryRoot $repository -OutputPath (Join-Path $fixture 'notices.txt')
+    $null = & (Join-Path $repository '.github/release/Package-Release.ps1') -RepositoryRoot $repository -InputDirectory $fixture -OutputDirectory $fixture -EvidenceDirectory $fixture -Tag 'v0.3.1' -SourceRevision ('a' * 40)
+    $null = & (Join-Path $PSScriptRoot 'Test-WindowsExecutable.ps1') -ExecutablePath (Join-Path $fixture 'inert.exe') -ManifestSha256 ('b' * 64) -EvidenceDirectory $fixture
+    Write-Output 'Release adapter controls passed: native JSON and visible stderr, failure diagnostics, and repository-pinned Cargo fallbacks outside the checkout.'
 } finally {
     [Console]::SetError($savedError)
     $capturedError.Dispose()
     $env:BONSAI_TOOLS_PATH = $savedTools
+    $env:RUSTUP_TOOLCHAIN = $savedRustup
+    Set-Location -LiteralPath $savedLocation.Path
     $PSNativeCommandUseErrorActionPreference = $savedPreference
     if ($null -eq $savedExitCode) {
         Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue

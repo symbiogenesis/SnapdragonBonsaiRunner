@@ -977,7 +977,7 @@ mod tests {
         let original = state.active_conversation;
         let mut harness = Harness::builder()
             .with_size([1180.0, 860.0])
-            .with_context_setup(super::super::configure)
+            .with_context_setup(super::super::configure_test_context)
             .build_ui_state(
                 |ui, state: &mut super::super::State| {
                     state.handle_input_shortcuts(ui.ctx());

@@ -5,8 +5,9 @@ param([Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][strin
     [Parameter(Mandatory)][string]$EvidenceDirectory)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Release-Common.ps1')
 $request = @{operation='executable-smoke';executablePath=$ExecutablePath;manifestSha256=$ManifestSha256;evidenceDirectory=$EvidenceDirectory}
 $json = ConvertTo-Json -InputObject $request -Compress
 if ($env:BONSAI_TOOLS_PATH) { & $env:BONSAI_TOOLS_PATH release-package --json $json }
-else { & cargo run --quiet --locked --manifest-path (Join-Path $PSScriptRoot '../../Cargo.toml') -p bonsai-tools --bin bonsai-tools -- release-package --json $json }
+else { & cargo "+$(Get-ReleaseToolchain ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))))" run --quiet --locked --manifest-path (Join-Path $PSScriptRoot '../../Cargo.toml') -p bonsai-tools --bin bonsai-tools -- release-package --json $json }
 if ($LASTEXITCODE -ne 0) { throw 'Native executable smoke failed.' }

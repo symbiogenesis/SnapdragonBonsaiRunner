@@ -1,6 +1,7 @@
 # Development guide
 
-Runner is unreleased. [Build a portable executable](#build-a-single-executable)
+Use a [Windows ARM64 prerelease](releases.md#download-and-open),
+[build a portable executable](#build-a-single-executable)
 or use [contributor source launch](#contributor-source-launch). Application
 controls are under [Native chat app](#native-chat-app); publication procedures
 live in the [Windows distribution guide](releases.md).

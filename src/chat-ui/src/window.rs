@@ -1991,7 +1991,7 @@ impl State {
         });
     }
 
-    fn show_transcript(&mut self, ui: &mut egui::Ui, width: f32) {
+    fn show_transcript(&mut self, ui: &mut egui::Ui, width: f32, viewport: egui::Rect) {
         let available = !self
             .updates
             .as_ref()
@@ -2007,6 +2007,7 @@ impl State {
         match self.transcript.show_with_actions(
             ui,
             width,
+            viewport,
             self.speaking_message,
             self.speech_output,
             Some(controls),
@@ -2059,9 +2060,11 @@ impl State {
                 }
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt(("conversation-scroll", self.active_conversation))
+                    .animated(false)
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                    .show_viewport(ui, |ui, viewport| {
+                        let content_top = ui.next_widget_position().y;
                         if empty {
                             self.empty_state(ui);
                         } else {
@@ -2076,7 +2079,13 @@ impl State {
                                     ui.set_width(width);
                                     ui.push_id(
                                         ("conversation-text", self.active_conversation),
-                                        |ui| self.show_transcript(ui, width),
+                                        |ui| {
+                                            let viewport = viewport.translate(egui::vec2(
+                                                0.0,
+                                                content_top - ui.next_widget_position().y,
+                                            ));
+                                            self.show_transcript(ui, width, viewport);
+                                        },
                                     );
                                 });
                             });

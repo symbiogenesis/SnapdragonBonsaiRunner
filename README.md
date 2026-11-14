@@ -10,7 +10,8 @@ experimental Hexagon acceleration on supported X2 installations.
 and [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B).
 Prompts and conversations stay on your device.
 
-**Unreleased.** Build a portable executable with the
+**Prerelease.** [Download a Windows ARM64 build](https://github.com/symbiogenesis/SwiftBonsai2Runner/releases)
+or build a portable executable with the
 [development guide](docs/development-guide.md#build-a-single-executable).
 Clean-machine setup, actual-model behavior, quality, performance and isolation
 still need [acceptance testing](PLAN.md).

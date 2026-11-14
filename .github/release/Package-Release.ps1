@@ -11,5 +11,5 @@ $request = @{ operation='package'; repositoryRoot=$RepositoryRoot; inputDirector
     outputDirectory=$OutputDirectory; evidenceDirectory=$EvidenceDirectory; tag=$Tag; sourceRevision=$SourceRevision }
 $json = ConvertTo-Json -InputObject $request -Compress
 if ($env:BONSAI_TOOLS_PATH) { & $env:BONSAI_TOOLS_PATH release-package --json $json }
-else { & cargo run --quiet --locked --manifest-path (Join-Path $RepositoryRoot 'Cargo.toml') -p bonsai-tools --bin bonsai-tools -- release-package --json $json }
+else { & cargo "+$(Get-ReleaseToolchain $RepositoryRoot)" run --quiet --locked --manifest-path (Join-Path $RepositoryRoot 'Cargo.toml') -p bonsai-tools --bin bonsai-tools -- release-package --json $json }
 if ($LASTEXITCODE -ne 0) { throw 'Native release packaging failed.' }

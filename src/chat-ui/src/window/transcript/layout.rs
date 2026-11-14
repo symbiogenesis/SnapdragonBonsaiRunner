@@ -28,7 +28,7 @@ impl Budget {
         }
     }
 
-    fn admit(&mut self, bytes: usize) -> bool {
+    const fn admit(&mut self, bytes: usize) -> bool {
         if self.layouts >= MAX_LAYOUTS_PER_FRAME
             || (self.layouts != 0 && self.bytes.saturating_add(bytes) > LAYOUT_BYTES_PER_FRAME)
         {
@@ -45,12 +45,15 @@ struct Anchor {
     message: u64,
     // A retained active Find result anchors its exact source position. Ordinary
     // reading anchors the first visible message top, including a partial row.
+    // Keep its content position so unchanged geometry yields an exact zero delta.
     matched: Option<Range<usize>>,
-    top: f32,
+    position: f32,
 }
 
 struct Observation {
     offset: f32,
+    height: f32,
+    total: f32,
     anchor: Anchor,
     bottom: bool,
 }
@@ -95,6 +98,7 @@ impl Transcript {
         &mut self,
         ui: &egui::Ui,
         width: f32,
+        viewport: egui::Rect,
         controls: Option<&MessageControls<'_>>,
     ) -> Rows {
         let body_width = 2.0_f32.mul_add(-MESSAGE_INSET.x, width);
@@ -108,8 +112,10 @@ impl Transcript {
         }
         self.viewport.budget.begin(ui.ctx().cumulative_frame_nr());
         let gap = MESSAGE_GAP.max(ui.spacing().item_spacing.y);
-        let viewport_height = ui.clip_rect().height();
-        let offset = (ui.clip_rect().top() - ui.next_widget_position().y).max(0.0);
+        // ScrollArea rounds the painted content origin to physical pixels.
+        // Its supplied viewport retains the exact logical scroll offset.
+        let offset = viewport.top().max(0.0);
+        let viewport_height = (viewport.bottom() - offset).max(0.0);
         let old_total = position(&rows, rows.len(), gap);
         let anchor = self.layout_anchor(&rows, offset, viewport_height, gap);
         let follow_bottom = offset > 0.0
@@ -129,15 +135,21 @@ impl Transcript {
             + self
                 .find_anchor_offset(anchor.0, anchor.1.matched.as_ref())
                 .unwrap_or(0.0);
-        let desired = if follow_bottom {
-            total - viewport_height
+        let movement = if follow_bottom {
+            self.viewport
+                .observation
+                .as_ref()
+                .filter(|previous| (previous.offset - offset).abs() < 0.5)
+                .map_or(total - old_total, |previous| {
+                    total - previous.total + previous.height - viewport_height
+                })
         } else {
-            anchor_position - anchor.1.top
+            anchor_position - anchor.1.position
         };
-        let correction = if navigating {
+        let correction = if navigating || movement == 0.0 {
             0.0
         } else {
-            desired.clamp(0.0, (total - viewport_height).max(0.0)) - offset
+            (offset + movement).clamp(0.0, (total - viewport_height).max(0.0)) - offset
         };
         let corrected_offset = offset + correction;
         // Earlier measurements can shrink and expose rows that were offscreen
@@ -148,8 +160,10 @@ impl Transcript {
         }
         self.viewport.observation = (!navigating).then_some(Observation {
             offset: corrected_offset,
+            height: viewport_height,
+            total,
             anchor: Anchor {
-                top: anchor_position - corrected_offset,
+                position: anchor_position,
                 ..anchor.1
             },
             bottom: total - corrected_offset <= viewport_height + 2.0,
@@ -205,7 +219,7 @@ impl Transcript {
                     Anchor {
                         message: self.messages[index].id,
                         matched,
-                        top: position(rows, index, gap) + local - offset,
+                        position: position(rows, index, gap) + local,
                     },
                 )
             })
@@ -398,19 +412,25 @@ mod tests {
             .with_context_setup(|context| {
                 context.add_font_provider(crate::window::test_font_provider());
                 context.style_mut_of(egui::Theme::Dark, |style| {
-                    style.scroll_animation = egui::style::ScrollAnimation::none()
+                    style.scroll_animation = egui::style::ScrollAnimation::none();
                 });
             })
             .build_ui_state(
                 |ui, scene: &mut Scene| {
-                    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                    let mut scroll = egui::ScrollArea::vertical()
+                        .animated(false)
+                        .auto_shrink([false, false]);
                     if let Some(offset) = scene.requested_offset.take() {
                         scroll = scroll.vertical_scroll_offset(offset);
                     }
-                    let output = scroll.show(ui, |ui| {
-                        scene
-                            .transcript
-                            .show(ui, ui.available_width().min(600.0), None, false);
+                    let output = scroll.show_viewport(ui, |ui, viewport| {
+                        scene.transcript.show(
+                            ui,
+                            ui.available_width().min(600.0),
+                            viewport,
+                            None,
+                            false,
+                        );
                     });
                     scene.offset = output.state.clamped_offset().y;
                 },
@@ -544,6 +564,33 @@ mod tests {
         chat.state_mut().requested_offset = Some(requested);
         settle(&mut chat, 2);
         assert!((chat.state().offset - requested).abs() < 0.5);
+    }
+
+    #[test]
+    fn fractional_viewport_offsets_settle_without_moving_the_reading_anchor() {
+        for scale in [1.0, 1.5, 2.0] {
+            let mut chat = harness();
+            chat.ctx.set_pixels_per_point(scale);
+            settle(&mut chat, 5);
+            let requested = top(chat.state(), 10) + 20.375;
+            chat.state_mut().requested_offset = Some(requested);
+            settle(&mut chat, 2);
+            assert!(
+                chat.state()
+                    .transcript
+                    .viewport
+                    .observation
+                    .as_ref()
+                    .is_some_and(|observation| {
+                        observation.offset.to_bits() == requested.to_bits()
+                    }),
+                "The logical viewport must retain the fractional offset at scale {scale}"
+            );
+            let before = top(chat.state(), 10);
+            chat.run();
+            assert_eq!(chat.state().offset.to_bits(), requested.to_bits());
+            assert_eq!(top(chat.state(), 10).to_bits(), before.to_bits());
+        }
     }
 
     #[test]

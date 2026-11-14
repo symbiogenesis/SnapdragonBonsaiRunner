@@ -1,6 +1,8 @@
 # Windows distribution
 
-Runner is unreleased. Build the portable Windows ARM64 executable with the
+Runner is available as a
+[Windows ARM64 prerelease](https://github.com/symbiogenesis/SwiftBonsai2Runner/releases).
+Build a portable executable with the
 [development guide](development-guide.md#build-a-single-executable).
 The format, setup and update behavior below still require the acceptance work
 in [PLAN.md](../PLAN.md).
