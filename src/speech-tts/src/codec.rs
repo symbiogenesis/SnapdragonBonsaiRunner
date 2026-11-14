@@ -1336,6 +1336,10 @@ fn rvq_numerical_error() -> io::Error {
 #[path = "codec/rvq_tests.rs"]
 mod rvq_tests;
 
+#[cfg(test)]
+#[path = "codec/dac_tests.rs"]
+mod dac_tests;
+
 // Avoid a duplicate code buffer while preventing partial reference publication.
 struct RvqCodeAppend<'a> {
     codes: &'a mut Vec<i32>,
@@ -1552,6 +1556,14 @@ impl DacDecoder {
         let mut audio =
             self.conv_post
                 .forward_stream_parallel(&h, cur_frames, &mut state.dac_post, threads)?;
+        // Clamping infinity would turn a failed graph into apparently valid
+        // full-scale PCM before Codec's final finite-output admission.
+        if audio.iter().any(|sample| !sample.is_finite()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid DAC numerical result.",
+            ));
+        }
         for sample in &mut audio {
             *sample = sample.clamp(-1.0_f32, 1.0_f32);
         }

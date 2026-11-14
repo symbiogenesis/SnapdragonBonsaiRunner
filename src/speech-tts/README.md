@@ -325,3 +325,12 @@ residual subtraction and codebook-major output. Four `rvq_reference_` controls
 provide literal two-layer nearest-centroid answers, grouped/tail ties, finite
 overflow refusals, late failure rollback and mutable-geometry rejection. These
 synthetic controls do not qualify complete pinned-codec/native-model parity.
+
+The `dac_reference_` controls execute the complete four-block 8/5/4/3 DAC
+topology with nonzero overlap and all three dilated residual branches per block.
+An independently factored impulse polynomial supplies exact dyadic PCM answers
+and a flushed all-zero state across three chunk schedules. A separate nonlinear
+final-Snake control checks both finite saturation endpoints. DAC output must be
+finite before clipping: an overflowing final projection cannot become apparently
+valid full-scale PCM. These small synthetic weights do not supply pinned-codec
+observations, listening acceptance or a model-performance verdict.
