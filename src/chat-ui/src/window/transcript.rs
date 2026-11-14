@@ -441,10 +441,11 @@ impl Transcript {
         &mut self,
         ui: &mut egui::Ui,
         width: f32,
+        viewport: egui::Rect,
         speaking_message: Option<u64>,
         speech_enabled: bool,
     ) -> Option<u64> {
-        match self.show_with_actions(ui, width, speaking_message, speech_enabled, None) {
+        match self.show_with_actions(ui, width, viewport, speaking_message, speech_enabled, None) {
             Some(TranscriptAction::ReadAloud(id)) => Some(id),
             _ => None,
         }
@@ -454,6 +455,7 @@ impl Transcript {
         &mut self,
         ui: &mut egui::Ui,
         width: f32,
+        viewport: egui::Rect,
         speaking_message: Option<u64>,
         speech_enabled: bool,
         controls: Option<MessageControls<'_>>,
@@ -461,7 +463,7 @@ impl Transcript {
         let mut action = None;
         self.search.refresh(&self.messages);
         let width = width.max(120.0);
-        let rows = self.prepare_layout(ui, width, controls.as_ref());
+        let rows = self.prepare_layout(ui, width, viewport, controls.as_ref());
         for (message, row) in self.messages.iter_mut().zip(rows.messages) {
             let (rect, _) =
                 ui.allocate_exact_size(Vec2::new(width, row.height), egui::Sense::hover());

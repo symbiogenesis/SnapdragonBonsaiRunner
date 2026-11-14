@@ -1169,7 +1169,11 @@ fn find_controls_navigate_unicode_matches_and_refresh_streamed_text() {
             |ui, transcript: &mut Transcript| {
                 transcript.close_find_on_escape(ui.ctx());
                 transcript.search_bar(ui);
-                egui::ScrollArea::vertical().show(ui, |ui| transcript.show(ui, 700.0, None, true));
+                egui::ScrollArea::vertical()
+                    .animated(false)
+                    .show_viewport(ui, |ui, viewport| {
+                        transcript.show(ui, 700.0, viewport, None, true)
+                    });
             },
             {
                 let mut transcript = Transcript::default();
