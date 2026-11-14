@@ -106,12 +106,13 @@ impl PendingCapture {
                 drop(process);
                 published.store(status, Ordering::Release);
             });
-        let thread = if let Ok(thread) = thread {
-            Some(thread)
-        } else {
-            result.store(THREAD_FAILED, Ordering::Release);
-            None
-        };
+        let thread = thread.map_or_else(
+            |_| {
+                result.store(THREAD_FAILED, Ordering::Release);
+                None
+            },
+            Some,
+        );
         Capture {
             result,
             thread: Mutex::new(thread),
