@@ -35,6 +35,7 @@ fn invalid() -> io::Error {
 #[derive(Debug)]
 enum Metadata {
     U32(u32),
+    I32(i32),
     F32(f32),
     String(String),
     U32Array(Vec<u32>),
@@ -76,7 +77,25 @@ fn text_bytes(
     bytes.clear();
     bytes.try_reserve_exact(length).map_err(|_| invalid())?;
     bytes.resize(length, 0);
-    reader.read_exact(bytes)
+    reader.read_exact(bytes)?;
+    if bytes.contains(&0) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_bool_bytes(reader: &mut impl Read, count: u64) -> io::Result<()> {
+    let mut read = 0_u64;
+    let mut scratch = [0_u8; 1024];
+    while read < count {
+        let step = usize::try_from((count - read).min(1024)).map_err(|_| invalid())?;
+        reader.read_exact(&mut scratch[..step])?;
+        if scratch[..step].iter().any(|&byte| byte > 1) {
+            return Err(invalid());
+        }
+        read += u64::try_from(step).map_err(|_| invalid())?;
+    }
+    Ok(())
 }
 
 fn skip(reader: &mut (impl Read + Seek), bytes: u64, length: u64) -> io::Result<()> {
@@ -102,20 +121,21 @@ fn metadata_value(
 ) -> io::Result<Metadata> {
     Ok(match read_u32(reader)? {
         4 => Metadata::U32(read_u32(reader)?),
-        5 => {
-            let value = read_u32(reader)?;
-            if value <= i32::MAX.unsigned_abs() {
-                Metadata::U32(value)
-            } else {
-                Metadata::Other
-            }
-        }
+        5 => Metadata::I32(i32::from_le_bytes(read_u32(reader)?.to_le_bytes())),
         6 => {
             let value = f32::from_bits(read_u32(reader)?);
             if !value.is_finite() {
                 return Err(invalid());
             }
             Metadata::F32(value)
+        }
+        7 => {
+            let mut byte = [0_u8; 1];
+            reader.read_exact(&mut byte)?;
+            if byte[0] > 1 {
+                return Err(invalid());
+            }
+            Metadata::Other
         }
         8 => Metadata::String(text(reader, budget, 16 * 1024 * 1024)?),
         9 => {
@@ -140,6 +160,9 @@ fn metadata_value(
                 } else {
                     Metadata::U32Array(values)
                 }
+            } else if kind == 7 {
+                validate_bool_bytes(reader, count)?;
+                Metadata::Other
             } else if kind == 8 {
                 // These are predominantly tokenizer tokens and merge rules.
                 // Validate every byte without allocating a new String for each
@@ -217,7 +240,7 @@ impl Weights {
         }
         let alignment = match metadata.get("general.alignment") {
             None => 32,
-            Some(Metadata::U32(value)) if value.is_power_of_two() && *value <= 4096 => {
+            Some(Metadata::U32(value)) if value.is_power_of_two() && *value <= 1_048_576 => {
                 u64::from(*value)
             }
             _ => return Err(invalid()),
@@ -262,6 +285,9 @@ impl Weights {
         }
         let position = reader.stream_position()?;
         let data = position.checked_add(alignment - 1).ok_or_else(invalid)? / alignment * alignment;
+        if data > length {
+            return Err(invalid());
+        }
         let mut ranges = Vec::with_capacity(tensors.len());
         for tensor in tensors.values_mut() {
             tensor.offset = data.checked_add(tensor.offset).ok_or_else(invalid)?;
@@ -288,6 +314,7 @@ impl Weights {
     pub(crate) fn u32(&self, key: &str) -> io::Result<u32> {
         match self.metadata.get(key) {
             Some(Metadata::U32(value)) => Ok(*value),
+            Some(Metadata::I32(value)) => u32::try_from(*value).map_err(|_| invalid()),
             _ => Err(invalid()),
         }
     }
@@ -761,6 +788,118 @@ mod tests {
         validate_packed(8, &bytes)?;
         decode_block(8, &bytes, &mut decoded);
         assert_eq!(decoded[..2], [-64.0, 63.5]);
+        Ok(())
+    }
+
+    fn push_kv_str(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
+        out.extend(
+            u64::try_from(bytes.len())
+                .map_err(|_| invalid())?
+                .to_le_bytes(),
+        );
+        out.extend(bytes);
+        Ok(())
+    }
+
+    fn write_raw_gguf(bytes: &[u8]) -> io::Result<Fixture> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "Bonsai-RustWeightsHardened-{}-{id}.gguf",
+            std::process::id()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(bytes)?;
+        Ok(Fixture(path))
+    }
+
+    fn single_tensor_gguf(
+        kv: &[(&[u8], u32, &[u8])],
+        alignment: usize,
+        tensor_offset: u64,
+    ) -> io::Result<Fixture> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3_u32.to_le_bytes());
+        bytes.extend(1_u64.to_le_bytes());
+        bytes.extend(
+            u64::try_from(kv.len())
+                .map_err(|_| invalid())?
+                .to_le_bytes(),
+        );
+        for &(key, kind, val) in kv {
+            push_kv_str(&mut bytes, key)?;
+            bytes.extend(kind.to_le_bytes());
+            bytes.extend(val);
+        }
+        push_kv_str(&mut bytes, b"w")?;
+        bytes.extend(1_u32.to_le_bytes());
+        bytes.extend(1_u64.to_le_bytes());
+        bytes.extend(0_u32.to_le_bytes());
+        bytes.extend(tensor_offset.to_le_bytes());
+        let padded = bytes.len().div_ceil(alignment) * alignment;
+        bytes.resize(
+            padded + usize::try_from(tensor_offset).map_err(|_| invalid())? + 4,
+            0,
+        );
+        write_raw_gguf(&bytes)
+    }
+
+    #[test]
+    fn hardened_gguf_metadata_and_alignment_checks() -> io::Result<()> {
+        // Bool scalar: 0/1 valid, 2 invalid.
+        let ok_bool = single_tensor_gguf(&[(b"b", 7, &[1])], 32, 0)?;
+        assert!(Weights::open(&ok_bool.0).is_ok());
+        let bad_bool = single_tensor_gguf(&[(b"b", 7, &[2])], 32, 0)?;
+        assert!(Weights::open(&bad_bool.0).is_err());
+
+        // Bool array: 2 rejected.
+        let mut bad_bool_arr = Vec::new();
+        bad_bool_arr.extend(7_u32.to_le_bytes());
+        bad_bool_arr.extend(2_u64.to_le_bytes());
+        bad_bool_arr.extend([0_u8, 2]);
+        let bad_bool_arr_file = single_tensor_gguf(&[(b"arr", 9, &bad_bool_arr)], 32, 0)?;
+        assert!(Weights::open(&bad_bool_arr_file.0).is_err());
+
+        // Interior NUL in string metadata rejected.
+        let mut nul_str = Vec::new();
+        push_kv_str(&mut nul_str, b"hi\0there")?;
+        let nul_str_file = single_tensor_gguf(&[(b"s", 8, &nul_str)], 32, 0)?;
+        assert!(Weights::open(&nul_str_file.0).is_err());
+
+        // Signed INT32 general.alignment rejected even when positive.
+        let signed_align =
+            single_tensor_gguf(&[(b"general.alignment", 5, &32_i32.to_le_bytes())], 32, 0)?;
+        assert!(Weights::open(&signed_align.0).is_err());
+
+        // Non-power-of-two and > 1_048_576 general.alignment rejected; 1_048_576 accepted.
+        for bad_align in [0_u32, 3, 2_097_152] {
+            let file = single_tensor_gguf(
+                &[(b"general.alignment", 4, &bad_align.to_le_bytes())],
+                32,
+                0,
+            )?;
+            assert!(Weights::open(&file.0).is_err());
+        }
+        let max_align = single_tensor_gguf(
+            &[(b"general.alignment", 4, &1_048_576_u32.to_le_bytes())],
+            1_048_576,
+            0,
+        )?;
+        assert!(Weights::open(&max_align.0).is_ok());
+
+        // Duplicate metadata key rejected.
+        let dup_key = single_tensor_gguf(
+            &[
+                (b"dup", 4, &1_u32.to_le_bytes()),
+                (b"dup", 4, &2_u32.to_le_bytes()),
+            ],
+            32,
+            0,
+        )?;
+        assert!(Weights::open(&dup_key.0).is_err());
         Ok(())
     }
 }

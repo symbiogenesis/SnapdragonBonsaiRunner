@@ -190,6 +190,8 @@ impl Drop for SynthesisGuard<'_> {
 type Observer<'a> =
     std::cell::RefCell<&'a mut dyn FnMut(observation::Observation<'_>) -> io::Result<()>>;
 
+type CancelHook<'a> = std::cell::RefCell<&'a mut (dyn FnMut() -> io::Result<()> + Send)>;
+
 struct Voice {
     talker: rust_talker::Talker,
     reference: rust_talker::Reference,
@@ -292,7 +294,12 @@ impl Synthesizer {
         self.codec.sample_rate()
     }
 
-    fn voice(&mut self, profile: &CStr, observe: &Observer<'_>) -> io::Result<&mut Voice> {
+    fn voice(
+        &mut self,
+        profile: &CStr,
+        cancel: &CancelHook<'_>,
+        observe: &Observer<'_>,
+    ) -> io::Result<&mut Voice> {
         let Self {
             voices,
             design,
@@ -302,6 +309,7 @@ impl Synthesizer {
             threads,
         } = self;
         voices.get_or_create(profile, || {
+            (cancel.borrow_mut())().map_err(|error| SynthesisStage::DesignModel.failure(error))?;
             let mut talker = match design.take() {
                 Some(talker) => talker,
                 None => load_talker(model_path, "voice_design", *threads)
@@ -318,7 +326,7 @@ impl Synthesizer {
                         codes.push(frame);
                         Ok(())
                     },
-                    &mut || Ok(()),
+                    &mut || (cancel.borrow_mut())(),
                     &mut |observation| {
                         observe.borrow_mut()(observation::Observation::Talker {
                             phase: observation::Phase::Design,
@@ -328,7 +336,7 @@ impl Synthesizer {
                 )
                 .map_err(|error| SynthesisStage::ReferenceGeneration.failure(error))?;
             let samples = codec
-                .decode(&codes)
+                .decode_cancellable(&codes, &mut || (cancel.borrow_mut())())
                 .map_err(|error| SynthesisStage::ReferenceDecode.failure(error))?;
             let count = sample_count(&samples, 0)
                 .ok_or_else(|| SynthesisStage::ReferenceValidation.failure(invalid_audio()))?;
@@ -346,6 +354,8 @@ impl Synthesizer {
                 talker,
                 samples,
                 || {
+                    (cancel.borrow_mut())()
+                        .map_err(|error| SynthesisStage::BaseWeights.failure(error))?;
                     weights::Weights::open(voice_model_path)
                         .map_err(|error| SynthesisStage::BaseWeights.failure(error))
                 },
@@ -362,13 +372,17 @@ impl Synthesizer {
                     }
                     let speaker = rust_codec::Speaker::load(weights)
                         .map_err(|error| SynthesisStage::SpeakerWeights.failure(error))?
-                        .extract(samples)
+                        .extract_cancellable(samples, &mut || (cancel.borrow_mut())())
                         .map_err(|error| SynthesisStage::SpeakerExtraction.failure(error))?;
                     let reference_codes = codec
-                        .encode_reference(samples)
+                        .encode_reference_cancellable(samples, &mut || (cancel.borrow_mut())())
                         .map_err(|error| SynthesisStage::ReferenceEncoding.failure(error))?;
+                    (cancel.borrow_mut())()
+                        .map_err(|error| SynthesisStage::BaseTokenizer.failure(error))?;
                     let tokenizer = tokenizer::Tokenizer::load(voice_model_path)
                         .map_err(|error| SynthesisStage::BaseTokenizer.failure(error))?;
+                    (cancel.borrow_mut())()
+                        .map_err(|error| SynthesisStage::BaseModel.failure(error))?;
                     let talker = rust_talker::Talker::load(weights, tokenizer, *threads)
                         .map_err(|error| SynthesisStage::BaseModel.failure(error))?;
                     let reference = rust_talker::Reference {
@@ -388,7 +402,21 @@ impl Synthesizer {
     /// Rejects invalid input, incomplete token generation, invalid samples and
     /// inference failures. Text and voice descriptions are never logged.
     pub fn synthesize(&mut self, text: &str, voice: &str) -> io::Result<Audio> {
-        let audio = self.synthesize_owned(text, voice)?;
+        self.synthesize_cancellable(text, voice, &mut || Ok(()))
+    }
+
+    /// Generate a complete clip with cooperative cancellation polling.
+    ///
+    /// # Errors
+    /// Returns [`Self::synthesize`] failures or the first error yielded by
+    /// `cancel`, discarding reusable voice and codec state after input admission.
+    pub fn synthesize_cancellable(
+        &mut self,
+        text: &str,
+        voice: &str,
+        cancel: &mut (dyn FnMut() -> io::Result<()> + Send),
+    ) -> io::Result<Audio> {
+        let audio = self.synthesize_owned_cancellable(text, voice, cancel)?;
         Ok(Audio {
             samples: audio.samples,
             sample_rate: audio.sample_rate,
@@ -400,12 +428,31 @@ impl Synthesizer {
     /// # Errors
     /// Returns the same failures as [`Self::synthesize`].
     pub fn synthesize_owned(&mut self, text: &str, voice: &str) -> io::Result<Waveform> {
+        self.synthesize_owned_cancellable(text, voice, &mut || Ok(()))
+    }
+
+    /// Generate a complete Rust-owned waveform buffer with cooperative
+    /// cancellation polling.
+    ///
+    /// # Errors
+    /// Returns the same failures as [`Self::synthesize_cancellable`].
+    pub fn synthesize_owned_cancellable(
+        &mut self,
+        text: &str,
+        voice: &str,
+        cancel: &mut (dyn FnMut() -> io::Result<()> + Send),
+    ) -> io::Result<Waveform> {
         let mut samples = Vec::new();
-        self.synthesize_stream(text, voice, &mut |chunk| {
-            samples.try_reserve(chunk.len()).map_err(io::Error::other)?;
-            samples.extend_from_slice(chunk);
-            Ok(())
-        })?;
+        self.synthesize_stream_cancellable(
+            text,
+            voice,
+            &mut |chunk| {
+                samples.try_reserve(chunk.len()).map_err(io::Error::other)?;
+                samples.extend_from_slice(chunk);
+                Ok(())
+            },
+            cancel,
+        )?;
         Ok(Waveform {
             samples,
             sample_rate: self.sample_rate(),
@@ -426,7 +473,25 @@ impl Synthesizer {
         voice: &str,
         sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
     ) -> io::Result<()> {
-        self.synthesize_stream_observed(text, voice, sink, &mut |_| Ok(()))
+        self.synthesize_stream_cancellable(text, voice, sink, &mut || Ok(()))
+    }
+
+    /// Generate bounded mono PCM chunks with cooperative cancellation polling.
+    ///
+    /// Note: the out-of-process `speech-service` binary retains its explicit
+    /// `exit(70)` watchdog contract when a client disconnects asynchronously.
+    ///
+    /// # Errors
+    /// Returns [`Self::synthesize_stream`] failures or `cancel` errors; after
+    /// input admission, any cancellation or error drops warm voice/codec reuse.
+    pub fn synthesize_stream_cancellable(
+        &mut self,
+        text: &str,
+        voice: &str,
+        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
+        cancel: &mut (dyn FnMut() -> io::Result<()> + Send),
+    ) -> io::Result<()> {
+        self.synthesize_stream_observed_cancellable(text, voice, sink, cancel, &mut |_| Ok(()))
     }
 
     /// Synthesize with borrowed observations of both model roles and output.
@@ -450,8 +515,27 @@ impl Synthesizer {
         sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
         observe: &mut dyn FnMut(observation::Observation<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.synthesize_stream_observed_cancellable(text, voice, sink, &mut || Ok(()), observe)
+    }
+
+    /// Synthesize with both cooperative cancellation polling and borrowed
+    /// model/audio observations.
+    ///
+    /// # Errors
+    /// Returns [`Self::synthesize_stream_observed`] failures or the first error
+    /// yielded by `cancel`. After input admission, cancellation discards
+    /// reusable voice and codec state.
+    pub fn synthesize_stream_observed_cancellable(
+        &mut self,
+        text: &str,
+        voice: &str,
+        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
+        cancel: &mut (dyn FnMut() -> io::Result<()> + Send),
+        observe: &mut dyn FnMut(observation::Observation<'_>) -> io::Result<()>,
+    ) -> io::Result<()> {
         let text = bounded_input(text, MAX_TEXT)?;
         let profile = bounded_input(voice, MAX_VOICE)?;
+        let cancel = std::cell::RefCell::new(cancel);
         let observe = std::cell::RefCell::new(observe);
         let mut guard = SynthesisGuard {
             synthesizer: self,
@@ -459,15 +543,18 @@ impl Synthesizer {
         };
         let synthesizer = &mut *guard.synthesizer;
         let result = (|| {
-            let _ = synthesizer.voice(&profile, &observe)?;
+            let _ = synthesizer.voice(&profile, &cancel, &observe)?;
             let Self { voices, codec, .. } = synthesizer;
             let (_, voice) = voices.0.as_mut().ok_or_else(invalid_audio)?;
+            (cancel.borrow_mut())().map_err(|error| SynthesisStage::CodecPriming.failure(error))?;
             observe.borrow_mut()(observation::Observation::Speaker(&voice.reference.speaker))?;
             observe.borrow_mut()(observation::Observation::ReferenceCodes(
                 &voice.reference.codes,
             ))?;
             codec
-                .prime_reference(&voice.reference.codes)
+                .prime_reference_cancellable(&voice.reference.codes, &mut || {
+                    (cancel.borrow_mut())()
+                })
                 .map_err(|error| SynthesisStage::CodecPriming.failure(error))?;
             let mut count = 0;
             voice
@@ -478,7 +565,7 @@ impl Synthesizer {
                     Some(&voice.reference),
                     &mut |frame| {
                         let chunk = codec
-                            .decode_stream(&[frame])
+                            .decode_stream_cancellable(&[frame], &mut || (cancel.borrow_mut())())
                             .map_err(|error| SynthesisStage::CodecDecode.failure(error))?;
                         count = sample_count(&chunk, count).ok_or_else(|| {
                             SynthesisStage::AudioValidation.failure(invalid_audio())
@@ -489,7 +576,7 @@ impl Synthesizer {
                         })?;
                         sink(&chunk).map_err(|error| SynthesisStage::AudioOutput.failure(error))
                     },
-                    &mut || Ok(()),
+                    &mut || (cancel.borrow_mut())(),
                     &mut |observation| {
                         observe.borrow_mut()(observation::Observation::Talker {
                             phase: observation::Phase::Base,

@@ -35,7 +35,7 @@ fn copy_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
     Ok(owned)
 }
 
-/// The pinned scanner's borrowed chunks, which can split multibyte whitespace.
+/// The scanner's UTF-8-scalar-aligned pretokenization chunks.
 #[cfg(test)]
 pub(super) fn pretokenize(text: &[u8]) -> io::Result<Vec<&[u8]>> {
     if text.len() > MAX_INPUT_BYTES || std::str::from_utf8(text).is_err() {

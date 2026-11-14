@@ -88,12 +88,12 @@ impl Gguf {
             let kind = read_u32(&mut reader)?;
             let entry = match kind {
                 TYPE_UINT32 => Entry::U32(read_u32(&mut reader)?),
+                TYPE_BOOL => {
+                    read_bool_scalar(&mut reader)?;
+                    Entry::OtherScalar
+                }
                 TYPE_STRING => {
-                    let len = read_u64(&mut reader)?;
-                    if len > MAX_STRING_BYTES {
-                        return Err(invalid());
-                    }
-                    skip_bytes(&mut reader, len)?;
+                    validate_string(&mut reader)?;
                     Entry::OtherScalar
                 }
                 TYPE_ARRAY => read_array(&mut reader, &mut retained_bytes)?,
@@ -169,10 +169,40 @@ fn read_key(reader: &mut impl Read) -> io::Result<Box<[u8]>> {
     bytes.try_reserve_exact(len).map_err(|_| invalid())?;
     bytes.resize(len, 0);
     reader.read_exact(&mut bytes)?;
-    if bytes.contains(&0) {
+    if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
         return Err(invalid());
     }
     Ok(bytes.into_boxed_slice())
+}
+
+fn read_bool_scalar(reader: &mut impl Read) -> io::Result<()> {
+    let mut byte = [0_u8; 1];
+    reader.read_exact(&mut byte)?;
+    if byte[0] > 1 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn read_string_checked(reader: &mut impl Read, max_len: u64) -> io::Result<Vec<u8>> {
+    let len = read_u64(reader)?;
+    if len > max_len {
+        return Err(invalid());
+    }
+    let len = usize::try_from(len).map_err(|_| invalid())?;
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(len).map_err(|_| invalid())?;
+    raw.resize(len, 0);
+    reader.read_exact(&mut raw)?;
+    if raw.contains(&0) || std::str::from_utf8(&raw).is_err() {
+        return Err(invalid());
+    }
+    Ok(raw)
+}
+
+fn validate_string(reader: &mut impl Read) -> io::Result<()> {
+    let _ = read_string_checked(reader, MAX_STRING_BYTES)?;
+    Ok(())
 }
 
 fn read_array(reader: &mut impl Read, retained_bytes: &mut usize) -> io::Result<Entry> {
@@ -186,31 +216,37 @@ fn read_array(reader: &mut impl Read, retained_bytes: &mut usize) -> io::Result<
         let mut values = Vec::new();
         values.try_reserve_exact(count).map_err(|_| invalid())?;
         for _ in 0..count {
-            let len = read_u64(reader)?;
-            if len > MAX_STRING_BYTES {
-                return Err(invalid());
-            }
-            let len = usize::try_from(len).map_err(|_| invalid())?;
+            let raw = read_string_checked(reader, MAX_STRING_BYTES)?;
             *retained_bytes = retained_bytes
-                .checked_add(len)
+                .checked_add(raw.len())
                 .filter(|&total| total <= MAX_RETAINED_STRING_BYTES)
                 .ok_or_else(invalid)?;
-            let mut raw = Vec::new();
-            raw.try_reserve_exact(len).map_err(|_| invalid())?;
-            raw.resize(len, 0);
-            reader.read_exact(&mut raw)?;
-            // Preserve the retired C-string handoff: bytes after an embedded NUL are ignored.
-            if let Some(nul) = raw.iter().position(|&byte| byte == 0) {
-                raw.truncate(nul);
-            }
             values.push(raw.into_boxed_slice());
         }
         return Ok(Entry::StringArray(values));
+    }
+    if element_kind == TYPE_BOOL {
+        validate_bool_bytes(reader, count)?;
+        return Ok(Entry::OtherArray);
     }
     let width = scalar_width(element_kind).ok_or_else(invalid)?;
     let total = count.checked_mul(width).ok_or_else(invalid)?;
     skip_bytes(reader, total)?;
     Ok(Entry::OtherArray)
+}
+
+fn validate_bool_bytes(reader: &mut impl Read, count: u64) -> io::Result<()> {
+    let mut read = 0_u64;
+    let mut scratch = [0_u8; 1024];
+    while read < count {
+        let step = usize::try_from((count - read).min(1024)).map_err(|_| invalid())?;
+        reader.read_exact(&mut scratch[..step])?;
+        if scratch[..step].iter().any(|&byte| byte > 1) {
+            return Err(invalid());
+        }
+        read += u64::try_from(step).map_err(|_| invalid())?;
+    }
+    Ok(())
 }
 
 fn skip_bytes(reader: &mut impl Read, count: u64) -> io::Result<()> {
@@ -225,4 +261,94 @@ fn skip_bytes(reader: &mut impl Read, count: u64) -> io::Result<()> {
         skipped += u64::try_from(step).map_err(|_| invalid())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::{Gguf, TYPE_ARRAY, TYPE_BOOL, TYPE_STRING, TYPE_UINT32};
+
+    fn push_str(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend(u64::try_from(bytes.len()).unwrap_or(0).to_le_bytes());
+        out.extend(bytes);
+    }
+
+    fn header(kv_count: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(b"GGUF");
+        out.extend(3_u32.to_le_bytes());
+        out.extend(0_u64.to_le_bytes());
+        out.extend(kv_count.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn rejects_invalid_bool_scalar_and_bool_array() {
+        let mut valid = header(2);
+        push_str(&mut valid, b"flag");
+        valid.extend(TYPE_BOOL.to_le_bytes());
+        valid.push(1);
+        push_str(&mut valid, b"flags");
+        valid.extend(TYPE_ARRAY.to_le_bytes());
+        valid.extend(TYPE_BOOL.to_le_bytes());
+        valid.extend(2_u64.to_le_bytes());
+        valid.extend([0_u8, 1_u8]);
+        assert!(Gguf::from_reader(Cursor::new(valid)).is_ok());
+
+        let mut bad_scalar = header(1);
+        push_str(&mut bad_scalar, b"flag");
+        bad_scalar.extend(TYPE_BOOL.to_le_bytes());
+        bad_scalar.push(2);
+        assert!(Gguf::from_reader(Cursor::new(bad_scalar)).is_err());
+
+        let mut bad_array = header(1);
+        push_str(&mut bad_array, b"flags");
+        bad_array.extend(TYPE_ARRAY.to_le_bytes());
+        bad_array.extend(TYPE_BOOL.to_le_bytes());
+        bad_array.extend(2_u64.to_le_bytes());
+        bad_array.extend([0_u8, 255_u8]);
+        assert!(Gguf::from_reader(Cursor::new(bad_array)).is_err());
+    }
+
+    #[test]
+    fn rejects_non_utf8_embedded_nul_strings_and_duplicate_keys() {
+        // Duplicate key
+        let mut dup = header(2);
+        for val in [1_u32, 2_u32] {
+            push_str(&mut dup, b"k");
+            dup.extend(TYPE_UINT32.to_le_bytes());
+            dup.extend(val.to_le_bytes());
+        }
+        assert!(Gguf::from_reader(Cursor::new(dup)).is_err());
+
+        // Non-UTF-8 key and embedded NUL key
+        for bad_key in [b"\xff".as_slice(), b"a\0b".as_slice()] {
+            let mut data = header(1);
+            push_str(&mut data, bad_key);
+            data.extend(TYPE_UINT32.to_le_bytes());
+            data.extend(1_u32.to_le_bytes());
+            assert!(Gguf::from_reader(Cursor::new(data)).is_err());
+        }
+
+        // Scalar string: non-UTF-8 and embedded NUL
+        for bad_val in [b"\xfe\xff".as_slice(), b"ok\0tail".as_slice()] {
+            let mut data = header(1);
+            push_str(&mut data, b"s");
+            data.extend(TYPE_STRING.to_le_bytes());
+            push_str(&mut data, bad_val);
+            assert!(Gguf::from_reader(Cursor::new(data)).is_err());
+        }
+
+        // String array: non-UTF-8 and embedded NUL (must fail instead of truncating)
+        for bad_elem in [b"\x80".as_slice(), b"tok\0suffix".as_slice()] {
+            let mut data = header(1);
+            push_str(&mut data, b"tokens");
+            data.extend(TYPE_ARRAY.to_le_bytes());
+            data.extend(TYPE_STRING.to_le_bytes());
+            data.extend(1_u64.to_le_bytes());
+            push_str(&mut data, bad_elem);
+            assert!(Gguf::from_reader(Cursor::new(data)).is_err());
+        }
+    }
 }

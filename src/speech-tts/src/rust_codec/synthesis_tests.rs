@@ -299,3 +299,29 @@ fn synthesis_observer_completed_guard_resets_stream_but_retains_warm_reuse() -> 
     assert_stream_reset(&synthesizer.codec);
     Ok(())
 }
+
+#[test]
+fn synthesis_stream_cancellable_stops_before_priming_and_discards_warm_reuse() -> io::Result<()> {
+    let mut synthesizer = warm_synthesizer()?;
+    let mut checks = 0_usize;
+    let mut delivered = 0_usize;
+    let result = synthesizer.synthesize_stream_cancellable(
+        "hello",
+        "warm",
+        &mut |_| {
+            delivered += 1;
+            Ok(())
+        },
+        &mut || {
+            checks += 1;
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        },
+    );
+    assert!(result.is_err_and(|error| error.kind() == io::ErrorKind::Interrupted));
+    assert_eq!(checks, 1);
+    assert_eq!(delivered, 0);
+    assert!(synthesizer.voices.0.is_none());
+    assert!(synthesizer.codec.primed.is_none());
+    assert_stream_reset(&synthesizer.codec);
+    Ok(())
+}

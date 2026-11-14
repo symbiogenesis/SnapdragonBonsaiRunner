@@ -29,7 +29,10 @@ const fn digit(codepoint: u32) -> bool {
 }
 
 const fn whitespace(codepoint: u32) -> bool {
-    matches!(codepoint, 0x20 | 0x09..=0x0d | 0xa0 | 0x2000..=0x2002 | 0x200b)
+    matches!(
+        codepoint,
+        0x20 | 0x09..=0x0d | 0xa0 | 0x2000..=0x2002 | 0x200b | 0x3000
+    )
 }
 
 const fn newline(codepoint: u32) -> bool {
@@ -63,7 +66,7 @@ fn contraction(text: &[u8], start: usize) -> io::Result<Option<usize>> {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Keep the native scanner's ordered rules and byte-level whitespace quirks together for review."
+    reason = "Keep the scanner's ordered pretokenization rules and scalar whitespace branching together for review."
 )]
 fn next_chunk<'a>(text: &'a [u8], index: &mut usize) -> io::Result<Option<&'a [u8]>> {
     if *index >= text.len() {
@@ -105,18 +108,26 @@ fn next_chunk<'a>(text: &'a [u8], index: &mut usize) -> io::Result<Option<&'a [u
         return Ok(Some(&text[start..cursor]));
     }
     if whitespace(current) {
+        let mut previous_whitespace_start = start;
         let mut whitespace_end = start + width;
-        while whitespace_end < text.len()
-            && whitespace(u32::from(text[whitespace_end]))
-            && !newline(u32::from(text[whitespace_end]))
-        {
-            whitespace_end += 1;
+        let mut whitespace_chars = 1_usize;
+        while whitespace_end < text.len() {
+            let (next, next_width) = codepoint(text, whitespace_end)?;
+            if !whitespace(next) || newline(next) {
+                break;
+            }
+            previous_whitespace_start = whitespace_end;
+            whitespace_end += next_width;
+            whitespace_chars += 1;
         }
-        let followed = whitespace_end < text.len()
-            && !whitespace(u32::from(text[whitespace_end]))
-            && !newline(u32::from(text[whitespace_end]));
-        if followed && whitespace_end - start > 1 {
-            *index = whitespace_end - 1;
+        let followed = if whitespace_end < text.len() {
+            let (next, _) = codepoint(text, whitespace_end)?;
+            !whitespace(next) && !newline(next)
+        } else {
+            false
+        };
+        if followed && whitespace_chars > 1 {
+            *index = previous_whitespace_start;
             return Ok(Some(&text[start..*index]));
         }
         let mut cursor = start + width;
@@ -199,4 +210,44 @@ pub(super) fn pretokenize(text: &[u8]) -> io::Result<Vec<&[u8]>> {
         chunks.push(chunk?);
     }
     Ok(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::pretokenize;
+
+    #[test]
+    fn multibyte_unicode_whitespace_preserves_utf8_scalar_boundaries() -> io::Result<()> {
+        assert_eq!(
+            pretokenize("\u{00A0}foo".as_bytes())?,
+            [b"\xc2\xa0foo".as_slice()]
+        );
+        assert_eq!(
+            pretokenize("\u{3000}bar".as_bytes())?,
+            [b"\xe3\x80\x80bar".as_slice()]
+        );
+        assert_eq!(
+            pretokenize("\u{00A0}\u{00A0}foo".as_bytes())?,
+            [b"\xc2\xa0".as_slice(), b"\xc2\xa0foo".as_slice()]
+        );
+        assert_eq!(
+            pretokenize("\u{2000}\u{2000}word".as_bytes())?,
+            ["\u{2000}".as_bytes(), "\u{2000}word".as_bytes()]
+        );
+        for input in [
+            "a\u{00A0}b",
+            " \u{3000}bar",
+            "\u{00A0}\u{3000}x",
+            "\u{200b}\u{200b}end",
+        ] {
+            let chunks = pretokenize(input.as_bytes())?;
+            for chunk in &chunks {
+                assert!(std::str::from_utf8(chunk).is_ok());
+            }
+            assert_eq!(chunks.concat(), input.as_bytes());
+        }
+        Ok(())
+    }
 }

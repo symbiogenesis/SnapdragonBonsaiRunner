@@ -754,7 +754,12 @@ impl Encoder {
         })
     }
 
-    fn encode(&self, samples: &[f32]) -> io::Result<Vec<[i32; 16]>> {
+    fn encode_cancellable(
+        &self,
+        samples: &[f32],
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<[i32; 16]>> {
+        cancel()?;
         if samples.len() < TOKENIZER_HOP_24K
             || samples.len() > 24_000 * 30
             || !samples.iter().all(|value| value.is_finite())
@@ -768,6 +773,7 @@ impl Encoder {
             self.first
                 .forward_parallel(&samples[..frames], frames, self.threads)?;
         for stage in &self.stages {
+            cancel()?;
             let residual = hidden.clone();
             elu(&mut hidden);
             (hidden, _) = stage
@@ -783,18 +789,22 @@ impl Encoder {
             elu(&mut hidden);
             (hidden, frames) = stage.down.forward_parallel(&hidden, frames, self.threads)?;
         }
+        cancel()?;
         elu(&mut hidden);
         (hidden, frames) = self.last.forward_parallel(&hidden, frames, self.threads)?;
         let mut state = TransformerState::default();
         let mut transformed = Vec::with_capacity(hidden.len());
         for frame in hidden.chunks_exact(self.transformer.hidden) {
+            cancel()?;
             transformed.extend(self.transformer.step(frame, &mut state)?);
         }
+        cancel()?;
         (hidden, frames) = self
             .down
             .forward_parallel(&transformed, frames, self.threads)?;
         let mut flat = Vec::with_capacity(frames * 16);
         self.semantic.encode(&hidden, frames, &mut flat)?;
+        cancel()?;
         self.acoustic.encode(&hidden, frames, &mut flat)?;
         codebook_major_to_frames(&flat, frames)
     }
@@ -1093,12 +1103,21 @@ impl Codec {
         };
     }
 
-    pub(crate) fn decode(&mut self, codes: &[[i32; 16]]) -> io::Result<Vec<f32>> {
+    pub(crate) fn decode_cancellable(
+        &mut self,
+        codes: &[[i32; 16]],
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<f32>> {
         self.reset();
-        self.decode_stream(codes)
+        self.decode_stream_cancellable(codes, cancel)
     }
 
-    pub(crate) fn decode_stream(&mut self, codes: &[[i32; 16]]) -> io::Result<Vec<f32>> {
+    pub(crate) fn decode_stream_cancellable(
+        &mut self,
+        codes: &[[i32; 16]],
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<f32>> {
+        cancel()?;
         if codes.is_empty()
             || codes.len() > 1500
             || codes
@@ -1112,6 +1131,7 @@ impl Codec {
         // Execute one frame at a time so emission chunk boundaries cannot alter
         // attention windows, convolution context, or floating-point grouping.
         for row in codes {
+            cancel()?;
             let latent = self.quantizer.decode(row, 1)?;
             let latent = self.pre.forward_stream_parallel(
                 &latent,
@@ -1124,12 +1144,14 @@ impl Codec {
                 .step(&latent, &mut self.state.transformer)?;
             let mut frames = 1;
             for (stage, context) in self.upsample.iter().zip(&mut self.state.audio.upsample_dw) {
+                cancel()?;
                 (latent, frames) = stage.conv.forward_parallel(&latent, frames, self.threads)?;
                 latent =
                     stage
                         .block
                         .forward_stream_parallel(&latent, frames, context, self.threads)?;
             }
+            cancel()?;
             let samples = self.dac.forward_stream_parallel(
                 &latent,
                 frames,
@@ -1146,7 +1168,23 @@ impl Codec {
         Ok(output)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Non-cancellable convenience helper retained for tests."
+        )
+    )]
     pub(crate) fn prime_reference(&mut self, codes: &[[i32; 16]]) -> io::Result<()> {
+        self.prime_reference_cancellable(codes, &mut || Ok(()))
+    }
+
+    pub(crate) fn prime_reference_cancellable(
+        &mut self,
+        codes: &[[i32; 16]],
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        cancel()?;
         if codes.is_empty()
             || codes.len() > (24_000 * 30) / TOKENIZER_HOP_24K
             || codes
@@ -1164,14 +1202,19 @@ impl Codec {
         }
         self.reset();
         for row in codes {
-            drop(self.decode_stream(std::slice::from_ref(row))?);
+            cancel()?;
+            drop(self.decode_stream_cancellable(std::slice::from_ref(row), cancel)?);
         }
         self.primed = Some((codes.to_vec(), self.state.clone()));
         Ok(())
     }
 
-    pub(crate) fn encode_reference(&self, samples: &[f32]) -> io::Result<Vec<[i32; 16]>> {
-        self.encoder.encode(samples)
+    pub(crate) fn encode_reference_cancellable(
+        &self,
+        samples: &[f32],
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<[i32; 16]>> {
+        self.encoder.encode_cancellable(samples, cancel)
     }
 }
 
@@ -1240,7 +1283,12 @@ impl Speaker {
         }))
     }
 
-    pub(crate) fn extract(&self, samples: &[f32]) -> io::Result<Vec<f32>> {
+    pub(crate) fn extract_cancellable(
+        &self,
+        samples: &[f32],
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<f32>> {
+        cancel()?;
         if samples.is_empty()
             || samples.len() > 24_000 * 30
             || !samples.iter().all(|value| value.is_finite())
@@ -1248,6 +1296,7 @@ impl Speaker {
             return Err(invalid());
         }
         let vector = self.0.extract_xvector(samples)?;
+        cancel()?;
         if vector.len() != 2048 || !vector.iter().all(|value| value.is_finite()) {
             return Err(invalid());
         }

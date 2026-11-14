@@ -201,11 +201,11 @@ fn rust_greedy_argmax_matches_captured_arm64_bits() -> Result<(), Box<dyn Error>
         let expected = i32::from_le_bytes(word(&mut remaining)?.to_le_bytes());
         let expected_dump_bits = word(&mut remaining)?;
         assert_eq!(expected_dump_bits, (-1.0_f32).to_bits());
-        assert_eq!(
-            greedy_argmax(&case.logits),
-            usize::try_from(expected)?,
-            "Greedy case {index}."
-        );
+        let has_non_finite_or_all_masked = case
+            .logits
+            .iter()
+            .any(|&value| !value.is_finite() && value != f32::NEG_INFINITY)
+            || !case.logits.iter().any(|&value| value.is_finite());
         let mut logits_copy = case.logits;
         let mut dump_u = 123.0_f32;
         let sampled = sample_top_k_p(
@@ -222,16 +222,28 @@ fn rust_greedy_argmax_matches_captured_arm64_bits() -> Result<(), Box<dyn Error>
             &mut [],
             Some(&mut dump_u),
         );
-        assert_eq!(
-            sampled,
-            Some(usize::try_from(expected)?),
-            "Sample greedy case {index}."
-        );
-        assert_eq!(dump_u.to_bits(), expected_dump_bits);
+        if has_non_finite_or_all_masked {
+            assert_eq!(
+                greedy_argmax(&logits_copy),
+                None,
+                "Invalid greedy case {index}."
+            );
+            assert_eq!(sampled, None, "Invalid sample greedy case {index}.");
+            assert_eq!(dump_u.to_bits(), 123.0_f32.to_bits());
+        } else {
+            let expected_index = usize::try_from(expected)?;
+            assert_eq!(
+                greedy_argmax(&logits_copy),
+                Some(expected_index),
+                "Greedy case {index}."
+            );
+            assert_eq!(sampled, Some(expected_index), "Sample greedy case {index}.");
+            assert_eq!(dump_u.to_bits(), expected_dump_bits);
+        }
     }
     assert_eq!(remaining, [0_u8; 0]);
-    // Empty storage is the explicit Rust boundary, omitted by the native capture.
-    assert_eq!(greedy_argmax(&[]), 0);
+    // Empty storage returns None instead of indexing out-of-range storage.
+    assert_eq!(greedy_argmax(&[]), None);
     for temperature in [0.0, 0.85] {
         let mut empty_dump = 99.0_f32;
         assert_eq!(

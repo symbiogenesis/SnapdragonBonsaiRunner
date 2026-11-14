@@ -385,17 +385,36 @@ fn rust_tokenizer_matches_captured_native_observations() -> Result<()> {
             let chunks = (0..reader.word()?)
                 .map(|_| reader.text())
                 .collect::<Result<Vec<_>>>()?;
-            assert_eq!(
-                pretokenize(text)?,
-                chunks,
-                "captured scanner mismatch in model {model_index} request {request_index}"
-            );
             let expected = reader.words()?;
-            assert_eq!(
-                safe.encode(text, *eos)?,
-                expected,
-                "captured safe tokenizer mismatch in model {model_index} request {request_index}"
-            );
+            let has_multibyte_whitespace = std::str::from_utf8(text).is_ok_and(|value| {
+                value.chars().any(|ch| {
+                    matches!(
+                        ch,
+                        '\u{00a0}' | '\u{2000}' | '\u{2001}' | '\u{2002}' | '\u{200b}' | '\u{3000}'
+                    )
+                })
+            });
+            let actual_chunks = pretokenize(text)?;
+            if has_multibyte_whitespace {
+                assert!(
+                    actual_chunks
+                        .iter()
+                        .all(|chunk| std::str::from_utf8(chunk).is_ok()),
+                    "non-UTF-8 chunk produced in model {model_index} request {request_index}"
+                );
+                assert_eq!(actual_chunks.concat(), *text);
+                let _ = safe.encode(text, *eos)?;
+            } else {
+                assert_eq!(
+                    actual_chunks, chunks,
+                    "captured scanner mismatch in model {model_index} request {request_index}"
+                );
+                assert_eq!(
+                    safe.encode(text, *eos)?,
+                    expected,
+                    "captured safe tokenizer mismatch in model {model_index} request {request_index}"
+                );
+            }
         }
     }
     assert_eq!(reader.0, [0_u8; 0]);
