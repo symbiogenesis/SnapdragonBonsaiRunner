@@ -52,6 +52,7 @@ not evidence of a browser frontend.
 | `windows-sys` | Selected process/credential/audio/accessibility APIs. Broker pre-bind options use Tokio's `TcpSocket` and the native exclusive-address helper; `socket2` is transitive through Tokio. |
 | `windows`, `windows-future` | Compatible WinRT microphone permission/capture; distinct from windows-sys. Retain future 0.3.2 with windows 0.62.2; 0.100 is incompatible. |
 | `eframe`, `wgpu` | Native UI, accessibility, clipboard, fallback/system fonts and all three explicit Windows backends. |
+| `markdown-syntax` | Exact `=0.7.2`, default features disabled: dependency-free Markdown AST parsing for native response rendering. No HTML renderer or web frontend. See [Markdown parsing](#native-markdown-parsing) for the reviewed scope and limits. |
 | `egui_kittest`, `egui_system_font_provider` | Test harness/font checks; capture-only splitting offers little while production needs graphics. |
 | `toml` | CI-only manifest parsing with parse/serde/std features. |
 | `ureq` | Synchronous HTTPS for native provisioning, updates and CI. Reuse the workspace pin with defaults, automatic compression and cookies disabled; Windows selects Schannel and system trust through native-tls-no-default and PlatformVerifier, portable checks select Rustls. No new async runtime is required. |
@@ -91,6 +92,40 @@ remain independently necessary. Removing curl removes an installed
 executable requirement, but no binary-size, latency or throughput improvement is
 claimed without a matching measurement. [PLAN.md](../PLAN.md) owns live-network
 and device qualification.
+
+### Native Markdown parsing
+
+`bonsai-chat` pins `markdown-syntax = "=0.7.2"` with `default-features = false`.
+The reviewed crates.io package has no normal, build or development dependencies;
+its manifest sets `build = false`, and both `default` and the unused `html` feature
+are empty. Its Rust source contains no `unsafe` token. The package is dual licensed
+MIT/Apache-2.0; the registry checksum in [Cargo.lock](../Cargo.lock) binds the exact
+reviewed bytes. Repeat the source and dependency review before changing this pin.
+
+The [offline MXC parser worker](sandboxing.md#markdown-parser-worker) consumes the
+owned AST and absolute UTF-8 spans. The trusted UI validates bounded binary render
+descriptions before native egui text layout, without generating HTML. MXC reuses
+the application's existing process boundary and does not add parser dependencies.
+Unavailable or failed worker parsing leaves plain source visible; there is no
+in-process parser fallback. Headings, emphasis/strong/strikethrough, code,
+lists/task lists, quotes, text-column tables and thematic breaks form the supported
+subset. Link labels and image alt text are inert; raw HTML and unsupported
+extensions stay literal. Source-to-display mappings keep Find tied to original
+response bytes; matches without an exact displayed mapping show the message's source. Message Copy,
+export, recovery and model history keep the original text. Parsing and mapping
+retain the [transcript bounds](streaming-resources.md#native-chat-and-transcript)
+and existing layout-cache reuse.
+
+This is a young library, not an established reputation or independent performance
+qualification. The reviewed source caps block and inline nesting at 32 and leaves
+deeper constructs literal. Its upstream claims linear parsing and bounded stack,
+but Runner makes no measured latency or throughput claim. The exact-source
+[conformance harness](https://github.com/plimeor/markdown-syntax/blob/20c7d290545773044446f6c4421fa79d9fa067f0/tests/html_conformance.rs)
+compares against vendored CommonMark/GFM cases, excludes nine CommonMark cases
+that its extra syntax changes, and reports results without asserting a pass-rate
+threshold. That harness and empty named defect lists do not establish complete
+CommonMark conformance. Runner's supported-subset regressions and native device
+acceptance remain separate obligations in [PLAN.md](../PLAN.md).
 
 ## JSON selection
 

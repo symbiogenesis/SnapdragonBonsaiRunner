@@ -236,7 +236,7 @@ playback for a hidden response.
 | **F3 / Shift+F3** | Next / previous Find match; Enter/Shift+Enter does the same while Find is focused. |
 | **Close find / Escape** | Close Find and clear its highlights. A further Escape stops generation or speech when no popup or dialog owns it. |
 | **Latest / down arrow** | Return to the newest message. |
-| Message **Copy** | Copy exact source text. Native styling keeps Markdown markers visible and never executes code or activates generated links. |
+| Message **Copy** | Copy exact source text, including Markdown. Assistant responses render supported Markdown natively; selecting text copies its displayed form. Generated links remain inert, HTML stays literal and code never executes. |
 | **Edit and resend / Regenerate** | Create and send a branch using the verified history prefix, preserving the original chat and draft. |
 | **Branch from here** | Create a branch without sending. A selected user message becomes the new draft. |
 | **Continue response** | Send an explicit continuation for the latest answer in context, preserving the current draft. |
@@ -248,6 +248,14 @@ the sidebar filter intact. Iteration actions require verified message positions
 and ordinary readiness/context checks; recovered messages without verified
 positions remain copyable and searchable. A locally identified interrupted answer
 can be used as context; intermediate Extra effort drafts cannot.
+
+Assistant responses support headings, emphasis, strong text, strikethrough, code,
+lists and task lists, quotes, simple text-column tables and thematic breaks.
+Link labels and image alt text render without opening URLs or fetching images;
+unsupported extensions stay literal. Find searches the original response and maps
+matches to the rendered text. A match entirely within hidden syntax or a hidden
+destination shows that message's source so every result remains visible. Message Copy, export,
+recovery and model history keep the original response bytes.
 
 **Retry response** appears directly beneath an identified unanswered prompt or
 interrupted answer. The original prompt can also remain in the composer for

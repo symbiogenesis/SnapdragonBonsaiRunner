@@ -1,6 +1,7 @@
 # Windows integration and worker sandboxing
 
-The native UI requires containment for owned inference, ASR, TTS and file-decoder workers.
+The native UI requires containment for owned inference, ASR, TTS, file-decoder and
+Markdown parser workers.
 `bonsai-windows-process` combines pinned **MXC 1.0.1** Process Security Environment
 (PSEC), suspended creation,
 verified Job ownership before resume, exact worker PID, resource limits and
@@ -38,6 +39,46 @@ Swift receives transcript text. Failure to admit or initialize the helper stops
 import without an in-process decoding fallback. Media Foundation compatibility
 with the headless policy requires native qualification.
 
+### Markdown parser worker
+
+Assistant Markdown is parsed by one persistent offline MXC/PSEC worker, using the
+same `bonsai-chat` executable's private `--markdown-worker` entry point before UI
+initialization. Anonymous stdin/stdout pipes carry bounded binary requests and
+render descriptions; stderr is a `NUL` sink. Parsing and pipe I/O run outside the
+UI event loop. The trusted parent independently validates UTF-8, spans, style
+flags, sizes and source mappings before constructing native text layout. See the
+[streaming contract](streaming-resources.md#native-chat-and-transcript) for limits.
+
+The worker policy grants read access to the exact current executable and required
+Windows runtime files, private application scratch and Windows' private PSEC
+temporary storage. It requests no network or host-loopback capability, user-file,
+desktop or device grants. This is restricted filesystem authority, not literally
+zero filesystem access. A verified one-process Job contains the worker and its
+committed memory. It receives no broker credentials, model files or conversation
+storage paths.
+
+The parser-specific launch builds a minimal child environment from the native
+Windows directory/drive and private `TEMP`/`TMP`; it inherits no caller entries,
+`PATH`, profile variables or application options. Other workers retain their
+documented environment policy. The Markdown Job limits committed memory to
+256 MiB. Startup/handshake has a ten-second allowance and each request two seconds;
+owned-worker stop and pipe joining share five seconds. Native process-creation
+failure retains its existing ten-second cleanup allowance, and synchronous native
+creation calls remain nonpreemptible.
+
+Unavailable admission, launch failure, malformed output, worker failure or a
+request timeout ends the parser session and leaves complete plain source visible
+in the native chat. There is no in-process parser fallback. Parser results never
+authorize opening generated URLs, fetching images or executing code. Message
+Copy, model history, export and recovery retain the original response bytes.
+Worker teardown belongs to the native owner's shutdown path; unconfirmed cleanup
+is a failure, not successful containment.
+
+This source contract does not establish independent negative-control, process
+lifetime or overhead acceptance. Qualify network, loopback, user-file, device,
+desktop and child-process denial, malformed/stale IPC and teardown against the
+actual Windows ARM64 policy before claiming those gates complete.
+
 ### Boundary work and overhead
 
 Every new and existing authority boundary must keep work proportional to the
@@ -69,7 +110,7 @@ qualification; see [PLAN.md](../PLAN.md#optional-agents).
 
 ## Worker authority
 
-Treat model, tokenizer, adapter and audio parsing as compromise entry points,
+Treat model, tokenizer, adapter, audio and Markdown parsing as compromise entry points,
 even for verified pins. Provisioning/compiler tools are trusted maintenance with
 their existing authority, outside inference policy. Independently managed speech
 companions retain their own permissions.
@@ -90,11 +131,12 @@ The owned-worker policy grants:
   trusted parent readers retain at most 16 MiB per stream. A log limit or capture
   read/write failure terminates the exact worker, and successful cleanup also
   requires completed capture threads within its existing absolute allowance.
-  Offline binary-pipe decoders keep protocol stdout and a `NUL` stderr sink.
+  Offline binary-pipe decoder/parser workers keep protocol stdout and a `NUL`
+  stderr sink.
 - Windows' own private PSEC temporary storage. Windows can replace the requested
   child TEMP/TMP with `Packages/sandbox.{id}/AC/Temp`; supplied scratch is not the
   sole writable location, and effective TEMP must not be claimed to equal cwd.
-- Explicit bidirectional host-loopback access required by the current native
+- For HTTP workers, explicit bidirectional host-loopback access required by the current native
   HTTP servers, with external ingress and egress denied by policy and no
   Internet/private-LAN capability.
 
@@ -132,7 +174,7 @@ policy, while daily-service isolation remains unqualified under the
 Explicit availability probes require PSEC 1.1 and container-hosted loopback, then
 create/dispose a real minimal environment; versions or exports alone are
 insufficient. Ordinary launches admit the complete policy once, without that
-throwaway preflight. HTTP workers require host-loopback support; offline decoders
+throwaway preflight. HTTP workers require host-loopback support; offline decoder/parser workers
 require PSEC 1.1 without requesting or probing loopback authority. There are no audit/learning modes,
 SDK backend dispatch, DACL augmentation, global loopback exemptions or weaker
 fallbacks. Host Firewall restrictions remain independent.

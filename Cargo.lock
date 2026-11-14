@@ -525,6 +525,7 @@ dependencies = [
  "egui_kittest",
  "egui_system_font_provider",
  "httparse",
+ "markdown-syntax",
  "memchr",
  "raw-window-handle",
  "serde",
@@ -2089,6 +2090,12 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "markdown-syntax"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdc80d14a63a37b18f4be7f78578385e4b9378ae1ac480740e4380aae7ecd108"
 
 [[package]]
 name = "memchr"

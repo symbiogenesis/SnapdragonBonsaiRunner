@@ -200,7 +200,7 @@ Installed upgrade/rollback acceptance is independent of portable updates.
 | Component | Contract |
 | --- | --- |
 | Workspace | Each conversation owns its draft, response settings, visible transcript and exact committed history. Creation/branching has no count cap; encoded recovery and per-conversation message bounds still apply. Transcript eviction never changes model history. |
-| Presentation | Selectable source-preserving text only; never activate generated links or execute code. Native heading/list/quote/code styling falls back to plain text after its span bound. Copy, selection and Find retain exact source offsets. |
+| Presentation | Assistant answers render supported Markdown with native Rust text widgets; user messages stay literal. Generated links and image labels remain inert, HTML stays literal and code never executes. Bounded parsing and styling fall back to source text. Message Copy, export, recovery and model history retain exact source; selection copies displayed text. Find searches source and maps matches to rendered text, showing source when a match lacks an exact displayed mapping. |
 | Message iteration | Edit/Regenerate branch the verified history prefix, preserving the original draft. Branch creates without sending; Continue is explicit. Identified interrupted answers can enter history; intermediate effort drafts cannot. |
 | Response retry | A visible Retry response control belongs to the identified failed prompt or interrupted answer. Retrying an unanswered prompt reuses its existing transcript card and preserves the composer and cursor; retrying a partial answer creates a branch from its original prompt, preserving the source conversation and draft. After confirmed teardown, Reload model only restores readiness; a separate Retry response action sends the prompt. |
 | Recovery | User-scoped DPAPI, atomic bounded saves, one writer/data folder and persistent opt-out. Restore never replays requests or starts capture/playback. Preserve unreadable bytes until an explicit save. See [recovery operation](development-guide.md#optional-recovery-and-preview). |
@@ -211,6 +211,12 @@ Installed upgrade/rollback acceptance is independent of portable updates.
 | Stop/retry | No generation elapsed-time cutoff. Stop freezes queued updates and wakes network/backpressure waits. Retry requires acknowledged teardown, fresh credentials/diagnostics and repeated artifact/identity/memory admission. Preserve completed turns/newer drafts; never replay or reduce the profile automatically. Completion winning the Stop race must leave transcript and history consistent. |
 | Rejections | Only the exact [broker recovery errors](broker-policy.md#native-client-completion-and-recovery) retain readiness and restore input. Other disconnects require explicit Retry and identify no token/memory cause. |
 | Alerts | One shared native panel selects among setup/model/saving/speech/audio/update failures. Each has a two-line summary and source-specific actions. Details provides a bounded scrollable modal; Copy error copies the complete message. Successful progress stays separate. |
+
+Markdown parsing uses a persistent [offline native sandbox worker](sandboxing.md#markdown-parser-worker),
+with bounded background pipe I/O and trusted-parent validation of its render
+description. The UI creates native egui text widgets from admitted results.
+Unavailable or failed parsing leaves complete plain source visible and ends the
+parser session; parsing never falls back into the trusted UI process.
 
 The model states are unavailable, preparing, ready, generating, awaiting teardown,
 stopping, retryable and restarting. Send requires acknowledged readiness; Retry

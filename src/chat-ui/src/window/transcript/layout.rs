@@ -277,7 +277,8 @@ impl Transcript {
         if cache.body_revision != message.body_revision {
             return None;
         }
-        let characters = message.body.get(..matched.start)?.chars().count();
+        let display = cache.source_map.offset(matched.start);
+        let characters = cache.body.job.text.get(..display)?.chars().count();
         Some(
             MESSAGE_INSET.y
                 + MESSAGE_ACTION_SIZE
@@ -615,7 +616,8 @@ mod tests {
         let cursor_y = |scene: &Scene| -> Result<f32, &'static str> {
             let message = &scene.transcript.messages[10];
             let cache = message.cache.as_ref().ok_or("Expected Find galley")?;
-            let characters = message.body[..target.range.start].chars().count();
+            let display = cache.source_map.offset(target.range.start);
+            let characters = cache.body.job.text[..display].chars().count();
             Ok(top(scene, 10)
                 + MESSAGE_INSET.y
                 + MESSAGE_ACTION_SIZE

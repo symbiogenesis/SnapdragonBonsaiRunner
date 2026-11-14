@@ -184,7 +184,20 @@ adoption decisions without displacing native daily-use acceptance.
   Stop/cancellation and bounded intake/writes. Measure the supplied modest critique prompt
   before selecting prefill optimizations; keep its private text out of evidence.
 - [ ] Qualify compact message headers, thinking expansion, speech/iteration
-  controls, styled Unicode/code selection, copying and Find geometry.
+  controls and native Markdown responses: headings, nested emphasis/lists/quotes,
+  code, task lists and text-column tables; Unicode selection, original-source
+  Copy/export/recovery, rendered Find mapping and source display for hidden-syntax
+  matches, malformed/streaming input and bounded plain-source fallback. Keep
+  native accessibility, X1/X2 responsiveness and complete CommonMark claims
+  separate from focused supported-subset checks.
+- [ ] Qualify the persistent offline Markdown worker's MXC/PSEC admission and
+  denial controls, one-process/memory limits, bounded binary IPC and trusted-parent
+  validation. Cover malformed/stale results, queue backpressure, worker exits and
+  timeouts, failed cleanup and window-close teardown; require plain-source
+  availability after failure without in-process parsing. Qualify actual native
+  network/loopback/file/device/desktop/child denial and boundary overhead separately
+  from portable parser/DTO regressions. Complete final-source strict native
+  analysis and named regressions, including minimal child-environment contents.
 - [ ] Qualify Settings scope, compact/wrapped navigation, persistence, generation
   locks, adapter disclosure, diagnostics, scrolling and Close/Escape focus return.
 - [ ] Qualify responsive sidebar/drawer/hide/reopen behavior, stable manual width,

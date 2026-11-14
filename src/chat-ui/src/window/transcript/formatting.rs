@@ -1,153 +1,295 @@
-//! Native text styling without removing source characters or interpreting HTML.
-//! Raw offsets therefore remain valid for copying, selection and Find. Only the
-//! message whose layout cache changed is scanned, with one forward highlight merge.
+//! Bounded native Markdown presentation; original message bytes stay in history.
+#![forbid(unsafe_code)]
 use super::{egui, search};
+use std::{ops::Range, sync::Arc};
 
-// Adversarial alternating markers cannot create an unbounded section inventory.
-// After this many input spans, retain the remaining source as ordinary text;
-// Find still applies its separately bounded highlights across that remainder.
+mod markdown;
+mod pending;
+mod wire;
+pub(super) use pending::Pending;
+#[cfg(test)]
+mod tests;
+
+const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
 const MAX_STYLE_SPANS: usize = 16_384;
+const MAX_RENDERED_BYTES: usize = 4 * MAX_MARKDOWN_BYTES;
 
-#[derive(Clone, Copy)]
-struct Fence {
-    marker: u8,
-    width: usize,
+struct Mapping {
+    source: Range<usize>,
+    display: Range<usize>,
+    verbatim: bool,
+}
+
+/// Ordered content runs, avoiding a per-byte map for long responses.
+#[derive(Default)]
+pub(super) struct SourceMap {
+    entries: Vec<Mapping>,
+    display_bytes: usize,
+}
+
+impl SourceMap {
+    // Callers supply UTF-8 boundaries from the source Find scanner. Direct
+    // content runs preserve those boundaries; normalized runs use an endpoint.
+    pub(super) fn offset(&self, source_byte: usize) -> usize {
+        self.entries
+            .get(
+                self.entries
+                    .partition_point(|entry| entry.source.end <= source_byte),
+            )
+            .map_or(self.display_bytes, |entry| {
+                entry.display.start
+                    + if entry.verbatim {
+                        source_byte.saturating_sub(entry.source.start)
+                    } else {
+                        0
+                    }
+            })
+    }
+
+    pub(super) fn range(&self, source: Range<usize>) -> Range<usize> {
+        let first = self
+            .entries
+            .partition_point(|entry| entry.source.end <= source.start);
+        let last = self
+            .entries
+            .partition_point(|entry| entry.source.start < source.end);
+        if first >= last {
+            let offset = self.offset(source.start);
+            return offset..offset;
+        }
+        let start = self.offset(source.start);
+        let entry = &self.entries[last - 1];
+        let end = if entry.verbatim {
+            entry.display.start + source.end.min(entry.source.end) - entry.source.start
+        } else {
+            entry.display.end
+        };
+        start..end
+    }
+
+    fn exact_match(&self, source: &Range<usize>) -> bool {
+        let first = self
+            .entries
+            .partition_point(|entry| entry.source.end <= source.start);
+        let last = self
+            .entries
+            .partition_point(|entry| entry.source.start < source.end);
+        first < last
+            && self.entries[first..last].iter().all(|entry| {
+                entry.verbatim
+                    || (source.start <= entry.source.start && source.end >= entry.source.end)
+            })
+    }
+}
+
+pub(super) struct Layout {
+    pub(super) job: egui::text::LayoutJob,
+    pub(super) source_map: Arc<SourceMap>,
 }
 
 struct Builder<'a> {
+    source: &'a str,
     job: egui::text::LayoutJob,
+    source_map: SourceMap,
     matches: &'a [search::Match],
     next_match: usize,
     visuals: &'a egui::Visuals,
-    fallback: egui::TextFormat,
-    styled_spans: usize,
+    normal: egui::TextFormat,
+    spans: usize,
+    limited: bool,
 }
 
 impl Builder<'_> {
-    fn append(&mut self, text: &str, format: &egui::TextFormat) {
-        let offset = self.job.text.len();
-        let end = offset + text.len();
-        let mut cursor = offset;
-        let base = if self.styled_spans < MAX_STYLE_SPANS {
-            format.clone()
-        } else {
-            self.fallback.clone()
+    fn append(&mut self, text: &str, source: Option<Range<usize>>, format: &egui::TextFormat) {
+        if text.is_empty() || self.limited {
+            return;
+        }
+        self.spans += 1;
+        if self.spans > MAX_STYLE_SPANS || self.job.text.len() + text.len() > MAX_RENDERED_BYTES {
+            self.limited = true;
+            return;
+        }
+        let display_start = self.job.text.len();
+        let Some(source) = source.filter(|range| !range.is_empty()) else {
+            self.job.append(text, 0.0, format.clone());
+            return;
         };
-        self.styled_spans = self.styled_spans.saturating_add(1);
-        while cursor < end {
-            while self
-                .matches
-                .get(self.next_match)
-                .is_some_and(|found| found.range.end <= cursor)
-            {
-                self.next_match += 1;
-            }
-            let found = self
-                .matches
-                .get(self.next_match)
-                .filter(|found| found.range.start < end);
-            let (until, highlighted) = match found {
-                Some(found) if found.range.start <= cursor => (found.range.end.min(end), true),
-                Some(found) => (found.range.start.min(end), false),
-                None => (end, false),
-            };
-            let mut effective = base.clone();
-            if highlighted {
-                effective.background = self.visuals.selection.bg_fill;
-                effective.color = self.visuals.selection.stroke.color;
-            }
-            // The pinned LayoutJob::append coalesces adjacent equal formats.
-            self.job
-                .append(&text[cursor - offset..until - offset], 0.0, effective);
-            cursor = until;
+        let verbatim = self.source.get(source.clone()) == Some(text);
+        let mapping = Mapping {
+            source,
+            display: display_start..display_start + text.len(),
+            verbatim,
+        };
+        while self
+            .matches
+            .get(self.next_match)
+            .is_some_and(|found| found.range.end <= mapping.source.start)
+        {
+            self.next_match += 1;
         }
-    }
-
-    fn inline(&mut self, text: &str, normal: &egui::TextFormat, code: &egui::TextFormat) {
-        let bytes = text.as_bytes();
         let mut cursor = 0;
-        let mut previous = 0;
-        let mut delimiter = None;
-        while cursor < bytes.len() {
-            if bytes[cursor] == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-            } else if bytes[cursor] == b'`' {
-                let start = cursor;
-                while bytes.get(cursor) == Some(&b'`') {
-                    cursor += 1;
-                }
-                let width = cursor - start;
-                if delimiter.is_none() {
-                    self.append(&text[previous..start], normal);
-                    previous = start;
-                    delimiter = Some(width);
-                } else if delimiter == Some(width) {
-                    self.append(&text[previous..cursor], code);
-                    previous = cursor;
-                    delimiter = None;
-                }
+        let mut index = self.next_match;
+        while let Some(found) = self
+            .matches
+            .get(index)
+            .filter(|found| found.range.start < mapping.source.end)
+        {
+            let start = if verbatim {
+                found.range.start.saturating_sub(mapping.source.start)
             } else {
-                cursor += 1;
+                0
+            };
+            let end = if verbatim {
+                found.range.end.min(mapping.source.end) - mapping.source.start
+            } else {
+                text.len()
+            };
+            if cursor < start {
+                self.job.append(&text[cursor..start], 0.0, format.clone());
             }
+            let mut highlighted = format.clone();
+            highlighted.background = self.visuals.selection.bg_fill;
+            highlighted.color = self.visuals.selection.stroke.color;
+            self.job
+                .append(&text[start.max(cursor)..end], 0.0, highlighted);
+            cursor = end;
+            if !verbatim {
+                break;
+            }
+            index += 1;
         }
-        // An unfinished inline span remains readable while a response streams.
-        self.append(
-            &text[previous..],
-            if delimiter.is_some() { code } else { normal },
-        );
+        if cursor < text.len() {
+            self.job.append(&text[cursor..], 0.0, format.clone());
+        }
+        self.source_map.entries.push(mapping);
     }
-}
 
-fn fence_start(line: &str) -> Option<(Fence, &str)> {
-    let trimmed = line.trim_start_matches(' ');
-    if line.len() - trimmed.len() > 3 {
-        return None;
+    fn generated(&mut self, text: &str, format: &egui::TextFormat) {
+        self.append(text, None, format);
     }
-    let marker = *trimmed.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
-    }
-    let width = trimmed.bytes().take_while(|byte| *byte == marker).count();
-    (width >= 3).then_some((Fence { marker, width }, &trimmed[width..]))
-}
 
-fn heading_size(line: &str) -> Option<f32> {
-    let level = line.bytes().take_while(|byte| *byte == b'#').count();
-    if !(1..=6).contains(&level)
-        || !line
-            .as_bytes()
-            .get(level)
-            .is_none_or(u8::is_ascii_whitespace)
-    {
-        return None;
-    }
-    Some(match level {
-        1 => 22.0,
-        2 => 20.0,
-        _ => 18.0,
-    })
-}
-
-fn list_prefix(line: &str) -> Option<usize> {
-    let trimmed = line.trim_start_matches(' ');
-    let indent = line.len() - trimmed.len();
-    let bytes = trimmed.as_bytes();
-    let marker = if matches!(bytes.first(), Some(b'-' | b'*' | b'+')) {
-        1
-    } else {
-        let digits = bytes
-            .iter()
-            .take_while(|byte| byte.is_ascii_digit())
+    fn newlines(&mut self, count: usize) {
+        if self.job.text.is_empty() {
+            return;
+        }
+        let existing = self
+            .job
+            .text
+            .bytes()
+            .rev()
+            .take(count)
+            .take_while(|byte| *byte == b'\n')
             .count();
-        if digits == 0 || !matches!(bytes.get(digits), Some(b'.' | b')')) {
-            return None;
+        let normal = self.normal.clone();
+        for _ in existing..count {
+            self.generated("\n", &normal);
         }
-        digits + 1
+    }
+
+    fn literal(&mut self, span: Option<markdown_syntax::Span>, format: &egui::TextFormat) {
+        if let Some(span) = span
+            && let Some(text) = self.source.get(span.start..span.end)
+        {
+            self.append(text, Some(span.start..span.end), format);
+        }
+    }
+
+    fn value(
+        &mut self,
+        value: &str,
+        span: Option<markdown_syntax::Span>,
+        format: &egui::TextFormat,
+    ) {
+        let range = span.and_then(|span| {
+            let source = self.source.get(span.start..span.end)?;
+            Some(source.find(value).map_or(span.start..span.end, |offset| {
+                span.start + offset..span.start + offset + value.len()
+            }))
+        });
+        self.append(value, range, format);
+    }
+}
+
+fn plain(
+    body: &str,
+    width: f32,
+    format: egui::TextFormat,
+    visuals: &egui::Visuals,
+    matches: &[search::Match],
+) -> Layout {
+    let mut job = egui::text::LayoutJob::default();
+    // Plain fallback must retain the complete bounded transcript, even above
+    // the smaller parser/rendering allowance.
+    let mut cursor = 0;
+    for found in matches {
+        if cursor < found.range.start {
+            job.append(&body[cursor..found.range.start], 0.0, format.clone());
+        }
+        let mut highlighted = format.clone();
+        highlighted.background = visuals.selection.bg_fill;
+        highlighted.color = visuals.selection.stroke.color;
+        job.append(&body[found.range.clone()], 0.0, highlighted);
+        cursor = found.range.end;
+    }
+    job.append(&body[cursor..], 0.0, format);
+    job.wrap.max_width = width;
+    let source_map = SourceMap {
+        entries: vec![Mapping {
+            source: 0..body.len(),
+            display: 0..body.len(),
+            verbatim: true,
+        }],
+        display_bytes: body.len(),
     };
-    bytes
-        .get(marker)
-        .is_some_and(u8::is_ascii_whitespace)
-        .then_some(indent + marker)
+    Layout {
+        job,
+        source_map: Arc::new(source_map),
+    }
+}
+
+// Only the sandbox entry point and inert unit-test fixtures call the parser.
+fn parse_layout(body: &str) -> Layout {
+    let width = 600.0;
+    let visuals = egui::Visuals::dark();
+    let text_size = 16.0;
+    let matches = &[];
+    let normal =
+        egui::TextFormat::simple(egui::FontId::proportional(text_size), visuals.text_color());
+    if body.len() > MAX_MARKDOWN_BYTES {
+        return plain(body, width, normal, &visuals, matches);
+    }
+    let mut builder = Builder {
+        source: body,
+        job: egui::text::LayoutJob {
+            text: String::with_capacity(body.len()),
+            ..Default::default()
+        },
+        source_map: SourceMap::default(),
+        matches,
+        next_match: 0,
+        visuals: &visuals,
+        normal: normal.clone(),
+        spans: 0,
+        limited: false,
+    };
+    let parsed = markdown_syntax::parse(body);
+    builder.blocks(&parsed.document.children, &normal, 0, false);
+    if body.ends_with('\n') {
+        builder.newlines(1);
+    }
+    builder.source_map.display_bytes = builder.job.text.len();
+    if builder.limited {
+        return plain(body, width, normal, &visuals, matches);
+    }
+    builder.job.wrap.max_width = width;
+    Layout {
+        job: builder.job,
+        source_map: Arc::new(builder.source_map),
+    }
+}
+
+pub(super) fn parse_wire(body: &str) -> Vec<u8> {
+    wire::encode(&parse_layout(body))
 }
 
 pub(super) fn layout_job(
@@ -157,236 +299,72 @@ pub(super) fn layout_job(
     text_size: f32,
     visuals: &egui::Visuals,
     matches: &[search::Match],
-) -> egui::text::LayoutJob {
+    parsed: Option<&Layout>,
+) -> Layout {
     let normal =
         egui::TextFormat::simple(egui::FontId::proportional(text_size), visuals.text_color());
-    let mut builder = Builder {
-        job: egui::text::LayoutJob {
-            // Styling preserves every source byte; reserve the final text size
-            // once instead of growing/copying it at successive styled spans.
-            text: String::with_capacity(body.len()),
-            ..Default::default()
-        },
-        matches,
-        next_match: 0,
-        visuals,
-        fallback: normal.clone(),
-        styled_spans: 0,
+    let Some(parsed) = parsed.filter(|_| structured) else {
+        return plain(body, width, normal, visuals, matches);
     };
-    builder.job.wrap.max_width = width;
-    if !structured {
-        builder.append(body, &normal);
-        return builder.job;
+    if matches
+        .iter()
+        .any(|found| !parsed.source_map.exact_match(&found.range))
+    {
+        return plain(body, width, normal, visuals, matches);
     }
-    let mut code =
-        egui::TextFormat::simple(egui::FontId::monospace(text_size), visuals.text_color());
-    code.background = visuals.code_bg_color;
-    let mut fence: Option<Fence> = None;
-    for line in body.split_inclusive('\n') {
-        let delimiter = fence_start(line);
-        if let Some(open) = fence {
-            builder.append(line, &code);
-            if delimiter.is_some_and(|(close, rest)| {
-                close.marker == open.marker && close.width >= open.width && rest.trim().is_empty()
-            }) {
-                fence = None;
-            }
-        } else if let Some((open, _)) = delimiter {
-            fence = Some(open);
-            builder.append(line, &code);
+    let highlights: Vec<_> = matches
+        .iter()
+        .map(|found| parsed.source_map.range(found.range.clone()))
+        .collect();
+    let template = egui::Visuals::dark();
+    let mut job = egui::text::LayoutJob {
+        text: String::with_capacity(parsed.job.text.len()),
+        ..Default::default()
+    };
+    job.wrap.max_width = width;
+    let mut next_match = 0;
+    for section in &parsed.job.sections {
+        let mut format = section.format.clone();
+        format.font_id.size *= text_size / 16.0;
+        format.color = if format.color == template.strong_text_color() {
+            visuals.strong_text_color()
         } else {
-            let trimmed = line.trim_start_matches(' ');
-            let mut format = normal.clone();
-            if let Some(size) = heading_size(trimmed) {
-                format.font_id.size = size * (text_size / 16.0);
-            } else if trimmed.starts_with("> ") {
-                format.italics = true;
+            visuals.text_color()
+        };
+        format.background = if format.background == template.code_bg_color {
+            visuals.code_bg_color
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        if format.strikethrough.width > 0.0 {
+            format.strikethrough.color = format.color;
+        }
+        let mut cursor = section.byte_range.start.0;
+        let end = section.byte_range.end.0;
+        while cursor < end {
+            while highlights
+                .get(next_match)
+                .is_some_and(|found| found.end <= cursor)
+            {
+                next_match += 1;
             }
-            if let Some(prefix) = list_prefix(line) {
-                let mut marker = format.clone();
-                marker.font_id = egui::FontId::monospace(text_size);
-                builder.append(&line[..prefix], &marker);
-                builder.inline(&line[prefix..], &format, &code);
-            } else {
-                builder.inline(line, &format, &code);
+            let found = highlights.get(next_match).filter(|found| found.start < end);
+            let (until, highlighted) = match found {
+                Some(found) if found.start <= cursor => (found.end.min(end), true),
+                Some(found) => (found.start.min(end), false),
+                None => (end, false),
+            };
+            let mut effective = format.clone();
+            if highlighted {
+                effective.background = visuals.selection.bg_fill;
+                effective.color = visuals.selection.stroke.color;
             }
+            job.append(&parsed.job.text[cursor..until], 0.0, effective);
+            cursor = until;
         }
     }
-    builder.job
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn format_at(job: &egui::text::LayoutJob, offset: usize) -> Option<&egui::TextFormat> {
-        job.sections
-            .iter()
-            .find(|section| section.byte_range.contains(&egui::text::ByteIndex(offset)))
-            .map(|section| &section.format)
-    }
-
-    #[test]
-    fn structured_text_retains_raw_unicode_and_styles_native_code_and_headings() {
-        let source = "# Heading 界\n\nUse `let é = 1;` here.\n- First\n2. Second\n> A quote\n```rust\nfn main() { /* 🌱 */ }\n```\n<html>literal</html>";
-        let visuals = egui::Visuals::dark();
-        let job = layout_job(source, true, 600.0, 16.0, &visuals, &[]);
-        assert_eq!(job.text, source);
-        assert_eq!(job.wrap.max_width.to_bits(), 600.0_f32.to_bits());
-        assert_eq!(
-            format_at(&job, 0).map(|format| format.font_id.size.to_bits()),
-            Some(22.0_f32.to_bits())
-        );
-        for needle in ["let é", "fn main", "```rust"] {
-            let offset = source.find(needle);
-            assert!(
-                offset
-                    .and_then(|offset| format_at(&job, offset))
-                    .is_some_and(|format| {
-                        format.font_id.family == egui::FontFamily::Monospace
-                            && format.background == visuals.code_bg_color
-                    })
-            );
-        }
-        assert!(
-            source
-                .find("A quote")
-                .and_then(|offset| format_at(&job, offset))
-                .is_some_and(|format| format.italics)
-        );
-        assert!(
-            source
-                .find("<html>")
-                .and_then(|offset| format_at(&job, offset))
-                .is_some_and(|format| format.font_id.family == egui::FontFamily::Proportional)
-        );
-    }
-
-    #[test]
-    fn unfinished_fences_stream_as_code_until_a_matching_close() {
-        let visuals = egui::Visuals::dark();
-        for source in [
-            "~~~rust\n界",
-            "````rust\n```\nstill code",
-            "An unfinished `界",
-        ] {
-            let job = layout_job(source, true, 600.0, 16.0, &visuals, &[]);
-            assert_eq!(job.text, source);
-            assert!(
-                format_at(&job, source.len() - 1)
-                    .is_some_and(|format| format.font_id.family == egui::FontFamily::Monospace)
-            );
-        }
-        let source = "~~~rust\ncode\n~~~\nProse";
-        let job = layout_job(source, true, 600.0, 16.0, &visuals, &[]);
-        assert_eq!(job.text, source);
-        assert!(
-            format_at(&job, source.len() - 1)
-                .is_some_and(|format| format.font_id.family == egui::FontFamily::Proportional)
-        );
-    }
-
-    #[test]
-    fn find_highlights_cross_native_style_boundaries_without_changing_offsets() {
-        let source = "# Heading `界` tail\n```\n🌱 code\n```\n";
-        let visuals = egui::Visuals::dark();
-        let start = source.find("Heading").unwrap_or_default();
-        let end = source.find("code").unwrap_or_default() + "code".len();
-        let matches = [search::Match {
-            message: 1,
-            range: start..end,
-        }];
-        let job = layout_job(source, true, 420.0, 16.0, &visuals, &matches);
-        assert_eq!(job.text, source);
-        for section in &job.sections {
-            assert!(source.is_char_boundary(section.byte_range.start.0));
-            assert!(source.is_char_boundary(section.byte_range.end.0));
-            if section.byte_range.start.0 >= start && section.byte_range.end.0 <= end {
-                assert_eq!(section.format.background, visuals.selection.bg_fill);
-                assert_eq!(section.format.color, visuals.selection.stroke.color);
-            }
-        }
-        assert!(
-            source
-                .find('界')
-                .and_then(|offset| format_at(&job, offset))
-                .is_some_and(|format| format.font_id.family == egui::FontFamily::Monospace)
-        );
-    }
-
-    #[test]
-    fn user_markup_and_escaped_inline_markers_stay_literal() {
-        let source = "# Heading\n```rust\n界\n```\n`inline`";
-        let visuals = egui::Visuals::dark();
-        let job = layout_job(source, false, 600.0, 16.0, &visuals, &[]);
-        assert_eq!(job.text, source);
-        assert!(
-            job.sections
-                .iter()
-                .all(|section| section.format.font_id == egui::FontId::proportional(16.0))
-        );
-        let escaped = "Escaped \\`normal";
-        let job = layout_job(escaped, true, 600.0, 16.0, &visuals, &[]);
-        assert_eq!(job.text, escaped);
-        assert!(
-            job.sections
-                .iter()
-                .all(|section| section.format.font_id.family == egui::FontFamily::Proportional)
-        );
-    }
-
-    #[test]
-    fn alternating_markers_bound_sections_and_plain_lines_coalesce() {
-        let visuals = egui::Visuals::dark();
-        let source = "`x` ".repeat(MAX_STYLE_SPANS);
-        let job = layout_job(&source, true, 600.0, 16.0, &visuals, &[]);
-        assert_eq!(job.text, source);
-        assert!(job.sections.len() <= MAX_STYLE_SPANS + 1);
-        let source = "ordinary line\n".repeat(100);
-        let job = layout_job(&source, true, 600.0, 16.0, &visuals, &[]);
-        assert_eq!(job.text, source);
-        assert_eq!(job.sections.len(), 1);
-    }
-
-    #[test]
-    fn code_background_changes_invalidate_only_assistant_layouts() {
-        use super::super::{HighlightKey, Role, Transcript};
-        use egui_kittest::Harness;
-
-        let mut transcript = Transcript::default();
-        transcript.push(Role::User, "`literal`".to_owned());
-        transcript.push(Role::Assistant, "```rust\nlet x = 1;\n```".to_owned());
-        let mut chat = Harness::builder()
-            .with_theme(egui::Theme::Dark)
-            .build_ui_state(
-                |ui, transcript: &mut Transcript| {
-                    for message in &mut transcript.messages {
-                        message.layout(
-                            ui,
-                            600.0,
-                            &[],
-                            HighlightKey {
-                                query_revision: 0,
-                                count: 0,
-                            },
-                            None,
-                        );
-                    }
-                },
-                transcript,
-            );
-        chat.run();
-        let before: Vec<_> = chat
-            .state()
-            .messages
-            .iter()
-            .map(|message| message.body_layouts)
-            .collect();
-        let mut visuals = chat.ctx.style_of(egui::Theme::Dark).visuals.clone();
-        visuals.code_bg_color = egui::Color32::RED;
-        chat.ctx.set_visuals(visuals);
-        chat.run();
-        assert_eq!(chat.state().messages[0].body_layouts, before[0]);
-        assert_eq!(chat.state().messages[1].body_layouts, before[1] + 1);
+    Layout {
+        job,
+        source_map: Arc::clone(&parsed.source_map),
     }
 }

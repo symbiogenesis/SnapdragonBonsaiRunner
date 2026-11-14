@@ -373,8 +373,33 @@ impl NativeProcess {
         policy: &SandboxPolicy,
         network: SandboxNetwork,
     ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
-        let containment = containment::Environment::create(spec, policy, network)?;
         let environment = containment::child_environment(policy)?;
+        Self::start_sandboxed_piped_with_environment(spec, command, policy, network, &environment)
+    }
+
+    pub(super) fn start_sandboxed_piped_minimal(
+        spec: &ProcessSpec,
+        command: Vec<u16>,
+        policy: &SandboxPolicy,
+    ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
+        let environment = containment::minimal_child_environment(policy)?;
+        Self::start_sandboxed_piped_with_environment(
+            spec,
+            command,
+            policy,
+            SandboxNetwork::Offline,
+            &environment,
+        )
+    }
+
+    fn start_sandboxed_piped_with_environment(
+        spec: &ProcessSpec,
+        command: Vec<u16>,
+        policy: &SandboxPolicy,
+        network: SandboxNetwork,
+        environment: &[u16],
+    ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
+        let containment = containment::Environment::create(spec, policy, network)?;
         let (child_input, parent_input) = anonymous_pipe(true)?;
         let (parent_output, child_output) = anonymous_pipe(false)?;
         let process = Self::launch(
@@ -388,7 +413,7 @@ impl NativeProcess {
                 mitigation_profile: MitigationProfile::Headless,
             },
             command,
-            Some(&environment),
+            Some(environment),
             Some(containment),
             Some((child_input, child_output)),
         )?;

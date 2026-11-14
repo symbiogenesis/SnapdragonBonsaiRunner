@@ -11,6 +11,10 @@ mod layout;
 mod message_controls;
 mod search;
 
+pub(super) fn markdown_worker_parse(source: &str) -> Vec<u8> {
+    formatting::parse_wire(source)
+}
+
 #[derive(Clone, Copy)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -49,6 +53,7 @@ struct LayoutCache {
     text_size: f32,
     color: Color32,
     code_background: Option<Color32>,
+    strong_color: Option<Color32>,
     reasoning_color: Color32,
     body_revision: u64,
     // Search owns the ranges. For an unchanged body and effective query, the
@@ -62,6 +67,8 @@ struct LayoutCache {
     highlight_color: Color32,
     reasoning_bytes: usize,
     body: Arc<egui::Galley>,
+    // Find retains source byte ranges; the galley contains rendered Markdown.
+    source_map: Arc<formatting::SourceMap>,
     reasoning: Option<Arc<egui::Galley>>,
 }
 
@@ -97,6 +104,8 @@ pub(super) struct Message {
     show_reasoning: bool,
     #[serde(skip)]
     cache: Option<LayoutCache>,
+    #[serde(skip)]
+    markdown: formatting::Pending,
     #[serde(skip)]
     measured_height: Option<f32>,
     #[cfg(test)]
@@ -228,6 +237,7 @@ impl Transcript {
             pending: role == Role::Assistant,
             show_reasoning: false,
             cache: None,
+            markdown: formatting::Pending::default(),
             measured_height: None,
             #[cfg(test)]
             body_layouts: 0,
@@ -605,8 +615,12 @@ impl Message {
         highlights: HighlightKey,
         selected: Option<&Range<usize>>,
     ) -> &LayoutCache {
+        let markdown_changed = self.role == Role::Assistant
+            && self.markdown.refresh(ui, self.body_revision, &self.body);
         let color = ui.visuals().text_color();
         let code_background = (self.role == Role::Assistant).then_some(ui.visuals().code_bg_color);
+        let strong_color =
+            (self.role == Role::Assistant).then_some(ui.visuals().strong_text_color());
         let reasoning_color = ui.visuals().weak_text_color();
         let pixels_per_point = ui.ctx().pixels_per_point();
         let text_size = super::appearance::text_size(ui.ctx());
@@ -621,9 +635,11 @@ impl Message {
                     && cache.pixels_per_point.to_bits() == pixels_per_point.to_bits()
                     && cache.text_size.to_bits() == text_size.to_bits();
                 let body_unchanged = same_geometry
+                    && !markdown_changed
                     && cache.body_revision == self.body_revision
                     && cache.color == color
                     && cache.code_background == code_background
+                    && cache.strong_color == strong_color
                     && cache.highlights == highlights
                     && (matches.is_empty()
                         || (cache.highlight_fill == highlight_fill
@@ -655,9 +671,13 @@ impl Message {
         // does not reconstruct the cache or adjust either galley's Arc count.
         let (previous_body, previous_reasoning, previous_underline) =
             self.cache.take().map_or((None, None, Vec::new()), |cache| {
-                (Some(cache.body), cache.reasoning, cache.underline)
+                (
+                    Some((cache.body, cache.source_map)),
+                    cache.reasoning,
+                    cache.underline,
+                )
             });
-        let body = if body_unchanged && let Some(body) = previous_body {
+        let (body, source_map) = if body_unchanged && let Some(body) = previous_body {
             body
         } else {
             #[cfg(test)]
@@ -674,7 +694,12 @@ impl Message {
                 {
                     self.underline_layouts += 1;
                 }
-                active_underline(&self.body, &body, selected, pixels_per_point)
+                active_underline(
+                    &body.job.text,
+                    &body,
+                    &source_map.range(selected.clone()),
+                    pixels_per_point,
+                )
             }
         } else {
             Vec::new()
@@ -699,6 +724,7 @@ impl Message {
             text_size,
             color,
             code_background,
+            strong_color,
             reasoning_color,
             body_revision: self.body_revision,
             highlights,
@@ -708,6 +734,7 @@ impl Message {
             highlight_color,
             reasoning_bytes: self.reasoning.len(),
             body,
+            source_map,
             reasoning,
         })
     }
@@ -725,9 +752,12 @@ impl Message {
                 && cache.pixels_per_point.to_bits() == ui.ctx().pixels_per_point().to_bits()
                 && cache.text_size.to_bits() == super::appearance::text_size(ui.ctx()).to_bits()
                 && cache.body_revision == self.body_revision
+                && (self.role != Role::Assistant || !self.markdown.changed())
                 && cache.color == ui.visuals().text_color()
                 && cache.code_background
                     == (self.role == Role::Assistant).then_some(ui.visuals().code_bg_color)
+                && cache.strong_color
+                    == (self.role == Role::Assistant).then_some(ui.visuals().strong_text_color())
                 && cache.highlights == highlights
                 && (highlights.count == 0
                     || (cache.highlight_fill == ui.visuals().selection.bg_fill
@@ -746,19 +776,23 @@ impl Message {
         width: f32,
         text_size: f32,
         matches: &[search::Match],
-    ) -> Arc<egui::Galley> {
+    ) -> (Arc<egui::Galley>, Arc<formatting::SourceMap>) {
         #[cfg(test)]
         self.highlight_range_visits
             .set(self.highlight_range_visits.get() + matches.len());
-        let job = formatting::layout_job(
+        let layout = formatting::layout_job(
             &self.body,
             self.role == Role::Assistant,
             width,
             text_size,
             ui.visuals(),
             matches,
+            self.markdown.parsed(),
         );
-        ui.fonts_mut(|fonts| fonts.layout_job(job))
+        (
+            ui.fonts_mut(|fonts| fonts.layout_job(layout.job)),
+            layout.source_map,
+        )
     }
     fn height(&self) -> f32 {
         let Some(cache) = &self.cache else {
@@ -769,6 +803,9 @@ impl Message {
         let mut height = 2.0_f32.mul_add(MESSAGE_INSET.y, MESSAGE_ACTION_SIZE)
             + MESSAGE_CONTENT_GAP
             + cache.body.size().y.max(20.0);
+        if self.markdown.failed() {
+            height += MESSAGE_CONTENT_GAP + 60.0;
+        }
         if !self.reasoning.is_empty() {
             height += MESSAGE_CONTENT_GAP + MESSAGE_ACTION_SIZE;
             if self.show_reasoning
@@ -820,13 +857,22 @@ impl Message {
                     );
                 }
                 if let Some(target) = target {
-                    let characters = self.body[..target].chars().count();
+                    let display = cache.source_map.offset(target);
+                    let characters = cache.body.job.text[..display].chars().count();
                     found_rect = Some(
                         cache
                             .body
                             .pos_from_cursor(egui::text::CCursor::new(characters))
                             .translate(response.rect.min.to_vec2()),
                     );
+                }
+                if self.markdown.failed() {
+                    let message = if self.markdown.cleanup_failed() {
+                        "Formatting stopped; showing source. Restart the app."
+                    } else {
+                        "Formatting unavailable; showing source."
+                    };
+                    child.label(RichText::new(message).small().weak());
                 }
             }
             if !self.reasoning.is_empty() {
@@ -861,7 +907,7 @@ impl Message {
     }
 }
 
-// Match byte offsets map to Unicode scalar indices in the galley. Retain only
+// Display byte offsets map to Unicode scalar indices in the galley. Retain only
 // the selected glyph runs, splitting wrapped rows and font fallback baselines
 // in the same way as epaint's TextFormat underline. Newlines own no glyph.
 fn active_underline(

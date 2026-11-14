@@ -74,6 +74,11 @@ mod sidebar_status;
 #[cfg(test)]
 mod tests;
 mod transcript;
+
+/// Produce inert layout data only from the parser sandbox's hidden entry point.
+pub(crate) fn markdown_worker_parse(source: &str) -> Vec<u8> {
+    transcript::markdown_worker_parse(source)
+}
 mod updates;
 mod workspace;
 

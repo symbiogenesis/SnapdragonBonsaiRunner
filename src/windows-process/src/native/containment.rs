@@ -122,6 +122,40 @@ pub(super) fn child_environment(policy: &SandboxPolicy) -> io::Result<Vec<u16>> 
     child_environment_from(policy, std::env::vars_os())
 }
 
+pub(super) fn minimal_child_environment(policy: &SandboxPolicy) -> io::Result<Vec<u16>> {
+    minimal_environment_from(policy, &windows_directory()?)
+}
+
+fn minimal_environment_from(policy: &SandboxPolicy, windows: &Path) -> io::Result<Vec<u16>> {
+    let Some(Component::Prefix(prefix)) = windows.components().next() else {
+        return Err(invalid("minimal worker requires a local Windows directory"));
+    };
+    let Prefix::Disk(drive) = prefix.kind() else {
+        return Err(invalid(
+            "minimal worker requires a drive-letter Windows directory",
+        ));
+    };
+    let windows = path_text(windows)?;
+    let scratch = path_text(&policy.writable_directory)?;
+    // No inherited entry is consulted, including entries with unknown secret
+    // names. Runtime paths come from Windows rather than caller-controlled
+    // SystemRoot/windir values. The ordinary worker environment is unchanged.
+    super::environment::build(
+        [
+            (OsString::from("SystemRoot"), OsString::from(&windows)),
+            (OsString::from("windir"), OsString::from(windows)),
+            (
+                OsString::from("SystemDrive"),
+                OsString::from(format!("{}:", char::from(drive))),
+            ),
+        ],
+        &BTreeMap::from([
+            ("TEMP".to_owned(), scratch.clone()),
+            ("TMP".to_owned(), scratch),
+        ]),
+    )
+}
+
 fn child_environment_from(
     policy: &SandboxPolicy,
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
@@ -260,7 +294,7 @@ fn within(path: &Path, root: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-fn runtime_paths() -> io::Result<Vec<String>> {
+fn windows_directory() -> io::Result<PathBuf> {
     let mut buffer = vec![0_u16; 32_768];
     // SAFETY: The writable UTF-16 allocation has exactly the supplied capacity.
     let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), 32_768) };
@@ -271,6 +305,11 @@ fn runtime_paths() -> io::Result<Vec<String>> {
     }
     let windows = PathBuf::from(OsString::from_wide(&buffer[..length]));
     validate_local_path(&windows)?;
+    Ok(windows)
+}
+
+fn runtime_paths() -> io::Result<Vec<String>> {
+    let windows = windows_directory()?;
     let mut paths = Vec::new();
     for name in ["System32", "WinSxS", "SysWOW64"] {
         let path = windows.join(name);
@@ -330,6 +369,32 @@ mod tests {
     use std::{fs, time::SystemTime};
 
     use super::*;
+
+    #[test]
+    fn minimal_child_environment_contains_only_native_windows_paths_and_private_temp()
+    -> io::Result<()> {
+        let policy = SandboxPolicy {
+            readonly_paths: Vec::new(),
+            writable_directory: PathBuf::from("R:\\private\\scratch"),
+        };
+        let block = minimal_environment_from(&policy, Path::new("R:\\Windows"))?;
+        let entries: Vec<_> = block
+            .split(|unit| *unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        assert_eq!(entries.len(), 5);
+        for expected in [
+            "SystemRoot=R:\\Windows",
+            "windir=R:\\Windows",
+            "SystemDrive=R:",
+            "TEMP=R:\\private\\scratch",
+            "TMP=R:\\private\\scratch",
+        ] {
+            assert!(entries.contains(&expected.encode_utf16().collect::<Vec<_>>().as_slice()));
+        }
+        assert!(block.ends_with(&[0, 0]));
+        Ok(())
+    }
 
     #[test]
     fn child_environment_admits_the_retained_snapshot_and_rejects_late_credentials()

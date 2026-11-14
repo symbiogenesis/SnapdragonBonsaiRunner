@@ -154,7 +154,9 @@ fn reader_size_reflows_styled_text_reasoning_and_find_once() {
         assert!(message.cache.is_some(), "Expected a reader layout cache");
         return;
     };
-    assert_eq!(cache.body.job.text, body);
+    assert!(cache.body.job.text.contains("Heading 界"));
+    assert!(cache.body.job.text.contains("Use needle here."));
+    assert!(!cache.body.job.text.contains('`'));
     assert!(
         cache
             .body
@@ -348,8 +350,9 @@ fn assert_active_underline_matches_glyphs(message: &Message) {
         assert!(cache.selected.is_some(), "Expected an active Find result");
         return;
     };
-    let start = message.body[..selected.start].chars().count();
-    let end = start + message.body[selected.clone()].chars().count();
+    let selected = cache.source_map.range(selected.clone());
+    let start = cache.body.job.text[..selected.start].chars().count();
+    let end = start + cache.body.job.text[selected].chars().count();
     let stroke = egui::Stroke::new(2.0, cache.highlight_color);
     let mut offset = 0;
     let mut selected_glyphs = 0;
@@ -378,6 +381,48 @@ fn assert_active_underline_matches_glyphs(message: &Message) {
     }
     assert_ne!(cache.underline.len(), 0);
     assert!(cache.underline.len() <= selected_glyphs);
+}
+
+#[test]
+fn markdown_find_maps_unicode_source_and_reuses_display_layout_on_navigation()
+-> Result<(), &'static str> {
+    let source = "# Heading 界\n\nA **needle 🌱** and `needle 界`.";
+    let mut transcript = Transcript::default();
+    transcript.push(Role::Assistant, source.to_owned());
+    transcript.find_query("needle");
+    let mut chat = harness(transcript);
+    chat.run();
+    assert_eq!(chat.state().search.matches.len(), 2);
+    let message = &chat.state().messages[0];
+    let cache = message.cache.as_ref().ok_or("Expected rendered layout")?;
+    assert_eq!(message.body, source);
+    assert!(chat.state().plain_text().contains(source));
+    assert!(cache.body.job.text.contains("A needle 🌱 and needle 界."));
+    assert!(!cache.body.job.text.contains("**"));
+    assert!(!cache.body.job.text.contains('`'));
+    for found in &chat.state().search.matches {
+        assert_eq!(source.get(found.range.clone()), Some("needle"));
+        assert_eq!(
+            cache
+                .body
+                .job
+                .text
+                .get(cache.source_map.range(found.range.clone())),
+            Some("needle")
+        );
+    }
+    assert_active_underline_matches_glyphs(message);
+    let galley = Arc::clone(&cache.body);
+    let initial_underlines = message.underline_layouts;
+    chat.state_mut().search.active = 1;
+    chat.run();
+    let message = &chat.state().messages[0];
+    let cache = message.cache.as_ref().ok_or("Expected retained layout")?;
+    assert!(Arc::ptr_eq(&galley, &cache.body));
+    assert_eq!(message.body_layouts, 1);
+    assert_eq!(message.underline_layouts, initial_underlines + 1);
+    assert_active_underline_matches_glyphs(message);
+    Ok(())
 }
 
 #[test]

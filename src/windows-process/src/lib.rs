@@ -877,6 +877,31 @@ impl OwnedProcess {
         Ok((Self(process), input, output))
     }
 
+    /// Starts an offline piped worker without inheriting caller environment entries.
+    ///
+    /// The requested child environment contains only `SystemRoot`, `windir` and
+    /// `SystemDrive` derived from the native Windows directory, plus private
+    /// scratch `TEMP`/`TMP`. It supplies no `PATH`, profile variables, application
+    /// options or arbitrary inherited values. Windows PSEC may supply its own
+    /// private temporary-storage environment. The parent environment is unchanged.
+    /// Existing filesystem, Job, memory, handle and cleanup requirements from
+    /// [`Self::start_sandboxed_piped`] remain in force. There is no loopback grant.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::start_sandboxed_piped`], including its
+    /// conservative ambient credential-name preflight, or native Windows-directory
+    /// lookup and minimal environment encoding failures.
+    pub fn start_sandboxed_piped_minimal(
+        spec: &ProcessSpec,
+        policy: &SandboxPolicy,
+    ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
+        Self::validate_sandboxed(spec)?;
+        let command = command_line(&spec.executable, &spec.arguments)?;
+        let (process, input, output) =
+            native::NativeProcess::start_sandboxed_piped_minimal(spec, command, policy)?;
+        Ok((Self(process), input, output))
+    }
+
     fn validate_sandboxed(spec: &ProcessSpec) -> io::Result<()> {
         validate_process(spec)?;
         if spec.active_process_limit != 1 {
