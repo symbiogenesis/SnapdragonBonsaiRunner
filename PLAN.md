@@ -126,8 +126,12 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify acknowledged model/broker shutdown, descendant teardown, empty
   Jobs, released listeners and fresh-owner replay. Include startup timeout,
   failed-cleanup receipt retention and one shared absolute deadline.
-- [ ] Diagnose native startup descendant-cancellation and bounded failure/output
-  fixtures that produce empty child output; retain useful exit diagnostics.
+- [ ] Qualify native startup descendant-cancellation and bounded failure/output
+  fixtures, visible child readiness diagnostics, exact root exit/capture summaries
+  and pre-cleanup status/teardown receipts. Preserve a single cleanup allowance
+  and keep raw compiler captures out of presentation. Close the focused compiled
+  controls and owning-lane checks; the [local workload](docs/evidence/daily-use-readiness.md)
+  supplied no passing Rust-test verdict.
 - [ ] Diagnose publisher PQ2/PTQ1 exits before HTTP readiness, including missing
   backend exit codes and bounded diagnostics, before selecting more timing work.
 - [ ] Qualify source-launch first frame/readiness, staged text/speech setup,
