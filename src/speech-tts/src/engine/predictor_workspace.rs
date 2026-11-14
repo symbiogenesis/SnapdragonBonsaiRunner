@@ -7,12 +7,13 @@
 
 use std::io;
 
-use super::LayerKvCache;
+use super::{LayerKvCache, decoder_workspace::DecoderWorkspace};
 
 #[derive(Default)]
 pub(crate) struct PredictorWorkspace {
     layers: Vec<LayerKvCache>,
     seen: Vec<u8>,
+    decoder: DecoderWorkspace,
 }
 
 impl PredictorWorkspace {
@@ -23,6 +24,11 @@ impl PredictorWorkspace {
             layer.seq_len = 0;
         }
         self.seen.clear();
+        self.decoder.clear();
+    }
+
+    pub(crate) fn decoder(&mut self) -> &mut DecoderWorkspace {
+        &mut self.decoder
     }
 
     pub(super) fn frame(&mut self, layers: usize) -> io::Result<Frame<'_>> {
@@ -39,8 +45,8 @@ impl PredictorWorkspace {
 pub(super) struct Frame<'a>(&'a mut PredictorWorkspace);
 
 impl Frame<'_> {
-    pub(super) fn buffers(&mut self) -> (&mut [LayerKvCache], &mut Vec<u8>) {
-        (&mut self.0.layers, &mut self.0.seen)
+    pub(super) fn buffers(&mut self) -> (&mut [LayerKvCache], &mut Vec<u8>, &mut DecoderWorkspace) {
+        (&mut self.0.layers, &mut self.0.seen, &mut self.0.decoder)
     }
 }
 
@@ -61,7 +67,8 @@ mod tests {
         let mut workspace = PredictorWorkspace::default();
         let allocations = {
             let mut frame = workspace.frame(2)?;
-            let (layers, seen) = frame.buffers();
+            let (layers, seen, decoder) = frame.buffers();
+            decoder.norm.extend_from_slice(&[f32::NAN; 16]);
             for (index, layer) in layers.iter_mut().enumerate() {
                 layer.k.extend_from_slice(&[-0.0, 0.25, 0.5, 0.75]);
                 layer.v.extend_from_slice(&[1.0, 1.25, 1.5, 1.75]);
@@ -87,9 +94,13 @@ mod tests {
                 .all(|layer| layer.k.is_empty() && layer.v.is_empty() && layer.seq_len == 0)
         );
         assert_eq!(workspace.seen, Vec::<u8>::new());
+        assert!(workspace.decoder.norm.is_empty());
+        assert_eq!(workspace.decoder.norm.capacity(), 16);
         let interrupted = std::panic::catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
             let mut frame = workspace.frame(2)?;
-            let (layers, seen) = frame.buffers();
+            let (layers, seen, decoder) = frame.buffers();
+            assert!(decoder.norm.is_empty());
+            decoder.norm.extend_from_slice(&[f32::NAN; 16]);
             for (layer, allocation) in layers.iter_mut().zip(&allocations) {
                 assert_eq!(
                     (
@@ -115,6 +126,8 @@ mod tests {
                 .all(|layer| layer.k.is_empty() && layer.v.is_empty() && layer.seq_len == 0)
         );
         assert_eq!(workspace.seen, Vec::<u8>::new());
+        assert!(workspace.decoder.norm.is_empty());
+        assert_eq!(workspace.decoder.norm.capacity(), 16);
         drop(workspace.frame(1)?);
         assert_eq!(workspace.layers.len(), 1);
         assert!(workspace.layers[0].k.is_empty() && workspace.layers[0].v.is_empty());

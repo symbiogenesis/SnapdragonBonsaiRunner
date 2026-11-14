@@ -30,6 +30,7 @@ use crate::{
     sampling,
 };
 
+pub(crate) mod decoder_workspace;
 mod kv_append;
 mod packed;
 pub(crate) mod predictor_workspace;
@@ -784,10 +785,6 @@ impl LinearProjection {
 
     /// Project one vector `input` (`[in_dim]`) into `[out_dim]`, optionally reusing a pre-folded
     /// Hadamard activation slice (`pre_folded`) shared across sibling projections (`q/k/v` or `gate/up`).
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Dispatches across F32, Q8_0, PQ2_0, and PTQ1_0 weight representations with optional reusable row parallelism."
-    )]
     pub fn forward_vec_with_pre_folded(
         &self,
         input: &[f32],
@@ -795,6 +792,24 @@ impl LinearProjection {
         lora: Option<&LoraProjectionPatch>,
         threads: usize,
     ) -> io::Result<Vec<f32>> {
+        let mut out = Vec::new();
+        self.forward_vec_into(input, pre_folded, lora, threads, &mut out)?;
+        Ok(out)
+    }
+
+    /// Overwrite request-owned projection storage without retaining a logical output.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Dispatches across F32, Q8_0, PQ2_0, and PTQ1_0 weight representations with optional reusable row parallelism."
+    )]
+    pub(crate) fn forward_vec_into(
+        &self,
+        input: &[f32],
+        pre_folded: Option<&[f32]>,
+        lora: Option<&LoraProjectionPatch>,
+        threads: usize,
+        out: &mut Vec<f32>,
+    ) -> io::Result<()> {
         if input.len() != self.in_dim
             || self
                 .bias
@@ -807,10 +822,12 @@ impl LinearProjection {
             ));
         }
         let layout = projection_layout::validate(self.in_dim, self.out_dim, &self.weight)?;
-        let mut out = self
-            .bias
-            .clone()
-            .unwrap_or_else(|| vec![0.0_f32; self.out_dim]);
+        decoder_workspace::resize(out, self.out_dim)?;
+        if let Some(bias) = &self.bias {
+            out.copy_from_slice(bias);
+        } else {
+            out.fill(0.0);
+        }
         let worker_count = threads.clamp(1, 18).min(self.out_dim.max(1));
         let level = Level::new();
 
@@ -823,7 +840,7 @@ impl LinearProjection {
                         packed::rows(simd, *ggml_type, &bytes[offset..], input, destination);
                     });
                 };
-                run_row_chunks(&mut out, worker_count, compute_slice);
+                run_row_chunks(out, worker_count, compute_slice);
             }
             WeightQuantization::F32(w) => {
                 let in_dim = self.in_dim;
@@ -836,7 +853,7 @@ impl LinearProjection {
                         }
                     });
                 };
-                run_row_chunks(&mut out, worker_count, compute_slice);
+                run_row_chunks(out, worker_count, compute_slice);
             }
             WeightQuantization::Q8_0 { blocks } => {
                 let blocks_per_row = layout.groups_per_row;
@@ -855,7 +872,7 @@ impl LinearProjection {
                         }
                     });
                 };
-                run_row_chunks(&mut out, worker_count, compute_slice);
+                run_row_chunks(out, worker_count, compute_slice);
             }
             WeightQuantization::PQ2_0 {
                 group_size,
@@ -888,7 +905,7 @@ impl LinearProjection {
                         }
                     });
                 };
-                run_row_chunks(&mut out, worker_count, compute_slice);
+                run_row_chunks(out, worker_count, compute_slice);
             }
             WeightQuantization::PTQ1_0 {
                 group_size,
@@ -924,14 +941,14 @@ impl LinearProjection {
                         }
                     });
                 };
-                run_row_chunks(&mut out, worker_count, compute_slice);
+                run_row_chunks(out, worker_count, compute_slice);
             }
         }
 
         if let Some(patch) = lora {
-            patch.apply(input, &mut out)?;
+            patch.apply(input, out)?;
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -993,6 +1010,12 @@ fn rms_norm_in_place_simd<S: Simd>(simd: S, data: &mut [f32], weight: &[f32], sc
 
 /// RMS normalization (`x * weight / sqrt(mean(x^2) + eps)`).
 pub fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> io::Result<Vec<f32>> {
+    let mut out = Vec::new();
+    rms_norm_into(input, weight, eps, &mut out)?;
+    Ok(out)
+}
+
+fn rms_norm_into(input: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) -> io::Result<()> {
     if input.is_empty() || input.len() != weight.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1002,10 +1025,10 @@ pub fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> io::Result<Vec<f32>>
     let inv_n = 1.0_f32 / usize_to_f32(input.len());
     let mean_sq = input.iter().map(|&v| v * v).sum::<f32>() * inv_n;
     let scale = 1.0_f32 / (mean_sq + eps).sqrt();
-    let mut out = vec![0.0_f32; input.len()];
+    decoder_workspace::resize(out, input.len())?;
     let level = Level::new();
-    dispatch!(level, simd => rms_norm_scale_simd(simd, input, weight, scale, &mut out));
-    Ok(out)
+    dispatch!(level, simd => rms_norm_scale_simd(simd, input, weight, scale, out));
+    Ok(())
 }
 
 /// In-place RMS normalization (`data[i] = (data[i] * scale) * weight[i]`), avoiding per-head heap allocations.
@@ -1171,7 +1194,6 @@ impl QwenDecoderLayer {
     /// Failed steps, including unwinding, preserve the prior KV contents and position.
     #[expect(
         clippy::too_many_arguments,
-        clippy::too_many_lines,
         reason = "Keep GQA geometry, cache ownership and compute budget explicit."
     )]
     pub fn forward_step_parallel(
@@ -1185,6 +1207,39 @@ impl QwenDecoderLayer {
         kv: &mut LayerKvCache,
         adapter: Option<&TalkerLoraAdapter>,
         workers: usize,
+    ) -> io::Result<Vec<f32>> {
+        self.forward_step_reusing(
+            input,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_theta,
+            rms_eps,
+            kv,
+            adapter,
+            workers,
+            &mut decoder_workspace::DecoderWorkspace::default(),
+        )
+    }
+
+    /// Evaluate with utterance-owned temporaries and the same transactional KV append.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "Keep GQA geometry, transactional cache and request-owned temporary storage explicit."
+    )]
+    pub(crate) fn forward_step_reusing(
+        &self,
+        input: &[f32],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        rms_eps: f32,
+        kv: &mut LayerKvCache,
+        adapter: Option<&TalkerLoraAdapter>,
+        workers: usize,
+        workspace: &mut decoder_workspace::DecoderWorkspace,
     ) -> io::Result<Vec<f32>> {
         if !(1..=256).contains(&workers) {
             return Err(io::Error::new(
@@ -1237,7 +1292,18 @@ impl QwenDecoderLayer {
         {
             return Err(invalid_geometry());
         }
-        let h_norm = rms_norm(input, &self.attn_norm_w, rms_eps)?;
+        let decoder_workspace::DecoderWorkspace {
+            norm: h_norm,
+            q,
+            k,
+            v,
+            attention: attn_out,
+            scores,
+            projected,
+            gate,
+            up,
+        } = workspace;
+        rms_norm_into(input, &self.attn_norm_w, rms_eps, h_norm)?;
         let patch = |proj: &LinearProjection| adapter.and_then(|a| a.patches.get(&proj.name));
 
         let q_sig = self.q_proj.hadamard_signature();
@@ -1249,7 +1315,7 @@ impl QwenDecoderLayer {
             Some((
                 signs,
                 block,
-                apply_hadamard_sign_fold(&h_norm, signs, block)?,
+                apply_hadamard_sign_fold(h_norm, signs, block)?,
             ))
         } else {
             None
@@ -1264,23 +1330,26 @@ impl QwenDecoderLayer {
             })
         };
 
-        let mut q = self.q_proj.forward_vec_with_pre_folded(
-            &h_norm,
+        self.q_proj.forward_vec_into(
+            h_norm,
             qkv_fold_for(q_sig),
             patch(&self.q_proj),
             workers,
+            q,
         )?;
-        let mut k = self.k_proj.forward_vec_with_pre_folded(
-            &h_norm,
+        self.k_proj.forward_vec_into(
+            h_norm,
             qkv_fold_for(k_sig),
             patch(&self.k_proj),
             workers,
+            k,
         )?;
-        let v = self.v_proj.forward_vec_with_pre_folded(
-            &h_norm,
+        self.v_proj.forward_vec_into(
+            h_norm,
             qkv_fold_for(v_sig),
             patch(&self.v_proj),
             workers,
+            v,
         )?;
 
         for h in 0..num_q_heads {
@@ -1299,12 +1368,12 @@ impl QwenDecoderLayer {
         }
 
         let pos = kv.seq_len;
-        apply_rope_neox_in_place(&mut q, num_q_heads, head_dim, pos, rope_theta)?;
-        apply_rope_neox_in_place(&mut k, num_kv_heads, head_dim, pos, rope_theta)?;
+        apply_rope_neox_in_place(q, num_q_heads, head_dim, pos, rope_theta)?;
+        apply_rope_neox_in_place(k, num_kv_heads, head_dim, pos, rope_theta)?;
 
         // Attention may read this provisional position, but later projection,
         // adapter or numerical failure must not publish it for the next call.
-        let append = kv_append::KvAppend::new(kv, &k, &v)?;
+        let append = kv_append::KvAppend::new(kv, k, v)?;
         let kv = append.cache();
 
         let total_seq = kv.seq_len;
@@ -1312,8 +1381,9 @@ impl QwenDecoderLayer {
         let gqa_ratio = num_q_heads / num_kv_heads;
         let scale = 1.0_f32 / usize_to_f32(head_dim).sqrt();
 
-        let mut attn_out = vec![0.0_f32; num_q_heads * head_dim];
-        let mut scores = vec![0.0_f32; total_seq];
+        decoder_workspace::resize(attn_out, query_width)?;
+        attn_out.fill(0.0);
+        decoder_workspace::resize(scores, total_seq)?;
         let level = Level::new();
 
         dispatch!(level, simd => {
@@ -1331,7 +1401,7 @@ impl QwenDecoderLayer {
                     }
                 }
                 let mut sum_exp = 0.0_f32;
-                for s in &mut scores {
+                for s in &mut *scores {
                     *s = (*s - max_score).exp();
                     sum_exp += *s;
                 }
@@ -1346,49 +1416,45 @@ impl QwenDecoderLayer {
             }
         });
 
-        let o_vec = self
-            .o_proj
-            .forward_vec_parallel(&attn_out, patch(&self.o_proj), workers)?;
+        self.o_proj
+            .forward_vec_into(attn_out, None, patch(&self.o_proj), workers, projected)?;
         let mut x_res: Vec<f32> = input
             .iter()
-            .zip(o_vec.iter())
+            .zip(projected.iter())
             .map(|(&a, &b)| a + b)
             .collect();
 
-        let h2 = rms_norm(&x_res, &self.ffn_norm_w, rms_eps)?;
+        rms_norm_into(&x_res, &self.ffn_norm_w, rms_eps, h_norm)?;
         let gate_sig = self.gate_proj.hadamard_signature();
         let up_sig = self.up_proj.hadamard_signature();
         let shared_ffn_folded = if let Some((signs, block)) = gate_sig
             && up_sig == gate_sig
         {
-            Some(apply_hadamard_sign_fold(&h2, signs, block)?)
+            Some(apply_hadamard_sign_fold(h_norm, signs, block)?)
         } else {
             None
         };
-        let gate = self.gate_proj.forward_vec_with_pre_folded(
-            &h2,
+        self.gate_proj.forward_vec_into(
+            h_norm,
             shared_ffn_folded.as_deref(),
             patch(&self.gate_proj),
             workers,
+            gate,
         )?;
-        let up = self.up_proj.forward_vec_with_pre_folded(
-            &h2,
+        self.up_proj.forward_vec_into(
+            h_norm,
             shared_ffn_folded.as_deref(),
             patch(&self.up_proj),
             workers,
+            up,
         )?;
-        let swiglu: Vec<f32> = gate
-            .iter()
-            .zip(up.iter())
-            .map(|(&g, &u)| {
-                let silu = g / (1.0_f32 + (-g).exp());
-                silu * u
-            })
-            .collect();
-        let down = self
-            .down_proj
-            .forward_vec_parallel(&swiglu, patch(&self.down_proj), workers)?;
-        dispatch!(level, simd => axpy_simd(simd, 1.0_f32, &down, &mut x_res));
+        for (g, &u) in gate.iter_mut().zip(up.iter()) {
+            let silu = *g / (1.0_f32 + (-*g).exp());
+            *g = silu * u;
+        }
+        self.down_proj
+            .forward_vec_into(gate, None, patch(&self.down_proj), workers, projected)?;
+        dispatch!(level, simd => axpy_simd(simd, 1.0_f32, projected, &mut x_res));
         if x_res.iter().any(|value| !value.is_finite()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1550,7 +1616,7 @@ impl CodePredictorModel {
         // Clear logical state even when admission below rejects. The guard also
         // clears partial frames on cancellation, numerical errors and unwind.
         let mut frame = workspace.frame(self.layers.len())?;
-        let (kv_caches, seen_scratch) = frame.buffers();
+        let (kv_caches, seen_scratch, decoder_workspace) = frame.buffers();
         if !(1..=256).contains(&workers) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1587,7 +1653,7 @@ impl CodePredictorModel {
         let mut h = self.project_in_parallel(talker_hidden, workers)?;
         for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
             cancel()?;
-            h = std::borrow::Cow::Owned(layer.forward_step_parallel(
+            h = std::borrow::Cow::Owned(layer.forward_step_reusing(
                 &h,
                 self.num_q_heads,
                 self.num_kv_heads,
@@ -1597,6 +1663,7 @@ impl CodePredictorModel {
                 kv,
                 None,
                 workers,
+                decoder_workspace,
             )?);
         }
 
@@ -1607,7 +1674,7 @@ impl CodePredictorModel {
             let mut h_step = self.project_in_parallel(next_raw, workers)?;
             for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
                 cancel()?;
-                h_step = std::borrow::Cow::Owned(layer.forward_step_parallel(
+                h_step = std::borrow::Cow::Owned(layer.forward_step_reusing(
                     &h_step,
                     self.num_q_heads,
                     self.num_kv_heads,
@@ -1617,6 +1684,7 @@ impl CodePredictorModel {
                     kv,
                     None,
                     workers,
+                    decoder_workspace,
                 )?);
             }
             let normed = rms_norm(&h_step, &self.norm_w, self.rms_norm_eps)?;

@@ -13,7 +13,8 @@ use std::io;
 use crate::{
     engine::{
         CodePredictorModel, DecoupledSamplingParams, LayerKvCache, LinearProjection,
-        QwenDecoderLayer, TOTAL_CODE_GROUPS, predictor_workspace::PredictorWorkspace, rms_norm,
+        QwenDecoderLayer, TOTAL_CODE_GROUPS, decoder_workspace::DecoderWorkspace,
+        predictor_workspace::PredictorWorkspace, rms_norm,
     },
     sampling::{self, SampleTopKPParams},
     tokenizer::Tokenizer,
@@ -586,11 +587,12 @@ impl Talker {
         row: &[f32],
         caches: &mut [LayerKvCache],
         cancel: &mut dyn FnMut() -> io::Result<()>,
+        workspace: &mut DecoderWorkspace,
     ) -> io::Result<Vec<f32>> {
         let mut hidden = row.to_vec();
         for (layer, cache) in self.layers.iter().zip(caches) {
             cancel()?;
-            hidden = layer.forward_step_parallel(
+            hidden = layer.forward_step_reusing(
                 &hidden,
                 self.geometry.heads,
                 self.geometry.kv_heads,
@@ -600,6 +602,7 @@ impl Talker {
                 cache,
                 None,
                 self.threads,
+                workspace,
             )?;
         }
         rms_norm(&hidden, &self.norm, self.geometry.norm_eps)
@@ -649,6 +652,7 @@ impl Talker {
         prompt: &Prompt,
         snapshot: &mut Option<PrefillCache>,
         cancel: &mut dyn FnMut() -> io::Result<()>,
+        workspace: &mut DecoderWorkspace,
     ) -> io::Result<(Vec<LayerKvCache>, Vec<f32>)> {
         cancel()?;
         let prefix = prompt
@@ -680,7 +684,7 @@ impl Talker {
             .enumerate()
             .skip(if reused { prefix } else { 0 })
         {
-            hidden = self.forward(row, &mut caches, cancel)?;
+            hidden = self.forward(row, &mut caches, cancel, workspace)?;
             if !reused && prefix != 0 && position + 1 == prefix {
                 *snapshot = PrefillCache::capture(&prompt.rows[..prefix], &caches, &hidden);
             }
@@ -712,7 +716,13 @@ impl Talker {
             trailing: &prompt.trailing,
             cacheable_rows: prompt.cacheable_rows,
         })?;
-        let (mut caches, mut hidden) = self.prefill(&prompt, prefill_cache, cancel)?;
+        let mut predictor_workspace = PredictorWorkspace::default();
+        let (mut caches, mut hidden) = self.prefill(
+            &prompt,
+            prefill_cache,
+            cancel,
+            predictor_workspace.decoder(),
+        )?;
         let mut history = Vec::with_capacity(MAX_NEW_TOKENS);
         // The sampler marks vocabulary entries while applying repetition
         // penalties after the first frame; its workspace is caller-owned.
@@ -720,7 +730,6 @@ impl Talker {
         // Acoustic frames have independent sessions. Retain only their buffer
         // capacities within this utterance; the frame guard clears all KV and
         // sampler lengths on every return, cancellation and unwind.
-        let mut predictor_workspace = PredictorWorkspace::default();
         let mut params = if self.base {
             DecoupledSamplingParams::base_clone()
         } else {
@@ -807,7 +816,7 @@ impl Talker {
             let mut next = self.sum_codes(&frame)?;
             let overlay = prompt.trailing.get(step).unwrap_or(&self.tts_pad);
             add(&mut next, overlay)?;
-            hidden = self.forward(&next, &mut caches, cancel)?;
+            hidden = self.forward(&next, &mut caches, cancel, predictor_workspace.decoder())?;
         }
         Err(invalid(
             "Speech reached its token ceiling before a complete end marker.",
@@ -996,16 +1005,27 @@ pub(crate) mod tests {
             cacheable_rows: 2,
         };
         let mut snapshot = None;
+        let mut workspace = super::DecoderWorkspace::default();
         let mut cold_calls = 0;
-        let cold = talker.prefill(&prompt, &mut snapshot, &mut || {
-            cold_calls += 1;
-            Ok(())
-        })?;
+        let cold = talker.prefill(
+            &prompt,
+            &mut snapshot,
+            &mut || {
+                cold_calls += 1;
+                Ok(())
+            },
+            &mut workspace,
+        )?;
         let mut warm_calls = 0;
-        let warm = talker.prefill(&prompt, &mut snapshot, &mut || {
-            warm_calls += 1;
-            Ok(())
-        })?;
+        let warm = talker.prefill(
+            &prompt,
+            &mut snapshot,
+            &mut || {
+                warm_calls += 1;
+                Ok(())
+            },
+            &mut workspace,
+        )?;
         assert_eq!((cold_calls, warm_calls), (4, 2));
         let bits = |values: &[f32]| {
             values
@@ -1026,19 +1046,25 @@ pub(crate) mod tests {
             };
         assert_state(&cold, &warm);
         prompt.rows[2][0] = -0.375;
-        let edited_suffix = talker.prefill(&prompt, &mut snapshot, &mut || Ok(()))?;
-        let edited_cold = talker.prefill(&prompt, &mut None, &mut || Ok(()))?;
+        let edited_suffix =
+            talker.prefill(&prompt, &mut snapshot, &mut || Ok(()), &mut workspace)?;
+        let edited_cold = talker.prefill(&prompt, &mut None, &mut || Ok(()), &mut workspace)?;
         assert_state(&edited_suffix, &edited_cold);
         prompt.rows[0][0] = 0.5;
         let mut changed_calls = 0;
-        let edited_prefix = talker.prefill(&prompt, &mut snapshot, &mut || {
-            changed_calls += 1;
-            Ok(())
-        })?;
+        let edited_prefix = talker.prefill(
+            &prompt,
+            &mut snapshot,
+            &mut || {
+                changed_calls += 1;
+                Ok(())
+            },
+            &mut workspace,
+        )?;
         assert_eq!(changed_calls, cold_calls);
         assert_state(
             &edited_prefix,
-            &talker.prefill(&prompt, &mut None, &mut || Ok(()))?,
+            &talker.prefill(&prompt, &mut None, &mut || Ok(()), &mut workspace)?,
         );
         Ok(())
     }

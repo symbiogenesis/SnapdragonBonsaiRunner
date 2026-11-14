@@ -57,6 +57,27 @@ requests. Allocation-identity/reset and fresh-frame replay controls establish th
 ownership change; actual-model latency attribution and the observed regression
 remain unqualified until matched-power measurements run.
 
+Talker and CodePredictor also share one utterance-owned decoder workspace across
+layers, prompt positions and acoustic frames. Nine vectors retain only temporary
+norm, Q/K/V, attention/score, projection and gate/up storage. Every consumer
+overwrites its inputs before reading them; the gate becomes the SwiGLU output
+in place, and O/down projections share one buffer. Predictor frame guards clear
+all temporary lengths on return, cancellation and unwind, and utterance teardown
+releases their capacities. This removes twelve temporary allocation sites per
+decoder step after the required capacities are available; output, RoPE and any
+ternary-fold allocations remain separate.
+
+For maximum observed hidden/query/KV/FFN widths `H/Q/K/I` and sequence length `S`,
+the nine vectors request at most `4 * (2H + 2Q + 2K + 2I + S)` payload bytes,
+plus vector headers and allocator overhead. Maxima apply across both models,
+so a shorter predictor frame retains the preceding Talker score capacity.
+Capacities persist during codec callbacks, which changes allocation overlap.
+One returned hidden vector is additional, as are existing KV, folded inputs,
+sampler and prefix-cache storage. Literal output/cache bits, poisoned scratch,
+changing widths, allocation identity and late-failure recovery provide focused
+source controls. They establish neither actual peak/process RAM savings nor
+X1/X2 request latency; conservative serving admission remains unchanged.
+
 F32/F16, Q8_0, Q4_K and Q6_K projections decode directly during multiplication,
 without whole-weight expansion or activation requantization. Four-row groups
 retain per-row rounding/accumulation; SIMD dispatch stays outside block loops.
