@@ -28,6 +28,30 @@ fn checked_in_ptq1_capture_source_matches_released_runtime() -> crate::Result<()
 }
 
 #[test]
+fn checked_in_ptq1_native_control_identity_is_independent_of_rust_runtime_repins()
+-> crate::Result<()> {
+    // This is the original reference engine, not the separately repinned Rust
+    // candidate. Keep its archive identity literal so a Rust release update
+    // cannot accidentally move the native control to a different repository or
+    // substitute another archive's byte count/hash while keeping this commit.
+    // The original tuple is retained in cb00d288^:tools/native-reference/pins.json.
+    let expected = json!({
+        "commit":"73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+        "url":"https://github.com/PrismML-Eng/llama.cpp/archive/73bfe6cc485554822f80c473a3c0c4f25e80f41b.zip",
+        "bytes":39_423_279,
+        "sha256":"5ee8738706229e84e85db7051d7a40797c91e22a7ffa8f4bfb8fea4bf2cb0293",
+        "headerSha256":"50d9375b080df279b9a5d93df9e489f18785b0b9fa98a51045a7c637433e0d9c"
+    });
+    let pins = source_pins(&repository(), Kind::Ptq1)?;
+    assert_eq!(pins["nativeSource"], expected);
+    let plan = run(json!({"operation":"plan", "repositoryDirectory":repository()}))?;
+    assert_eq!(plan["NativeSource"], expected);
+    assert_eq!(plan["RustSource"], pins["rustSource"]);
+    assert_eq!(plan["ModelProcessStarted"], false);
+    Ok(())
+}
+
+#[test]
 fn plans_keep_one_selected_ptq1_pair_and_the_fixed_row_pair() -> crate::Result<()> {
     for workers in [1, 4] {
         for backend in ["auto", "scalar", "neon"] {
