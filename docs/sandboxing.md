@@ -55,10 +55,13 @@ flags, sizes and source mappings before constructing native text layout. See the
 [streaming contract](streaming-resources.md#native-chat-and-transcript) for limits.
 
 The launcher prepares and hands off the headless broker image before opening the
-UI, so recovered responses can format while model setup runs or after it fails.
-Formatting uses that exact configured path, including explicit source-launch
-broker paths. Older source launchers without this early handoff defer formatting
-until their model-stage broker handoff. The parent retains the image and ancestor handles
+UI. An explicit warmup starts the persistent worker without a source request;
+Swift and speech setup wait asynchronously for its handshake or terminal failure.
+Direct configured launches use the same ordering. Parser failure leaves source
+visible and allows model setup to continue without a parser retry. Formatting
+uses the exact configured path, including explicit source-launch broker paths.
+Older source launchers without this early handoff defer formatting until their
+model-stage broker handoff. The parent retains the image and ancestor handles
 through worker death. The hidden entry point refuses execution outside an actual
 AppContainer and accepts no ordinary broker options.
 

@@ -65,11 +65,13 @@ Retry observes memory again; the UI uses broker-reported capacity for guidance.
 These development defaults do not establish model, device or promotion acceptance.
 
 The launcher checks/builds presentation and the headless broker image before
-opening the window. The UI can format recovered answers immediately, independently
-of model preparation. After the first UI tick, an owned preparation worker
+opening the window. The UI warms the Markdown parser before starting Swift or
+speech preparation, without waiting for a response to request formatting.
+Drafting and browsing remain available during its asynchronous handshake.
+Readiness or terminal parser failure releases model setup; failure leaves source
+visible and never retries the parser. An owned preparation worker then
 verifies/provisions the selected pinned Rust runtime and hands off text chat.
-Speech artifact
-preparation, companion builds and fresh speech credentials continue separately
+Speech artifact preparation, companion builds and fresh speech credentials continue separately
 while Swift loads and serves text chat. A speech preparation failure leaves text
 chat and its drafts/history intact; closing cancels both owned stages.
 Each preparation process receives one ten-second cleanup allowance. A failed
@@ -218,10 +220,10 @@ with bounded background pipe I/O and trusted-parent validation of its render
 description. The pure Rust `bonsai-markdown` library runs in a separate private
 `--markdown-worker` invocation of the configured headless broker image, before
 model, credential or network setup. The GUI image cannot initialize under the
-worker's required Win32k denial. The launcher's prepared broker path enters the
-formatting queue before model setup, including when model setup later fails.
-Older source launchers without that handoff retain deferred formatting until
-their configured broker is prepared.
+worker's required Win32k denial. The prepared broker path starts one parser
+handshake before model setup, including for direct configured launches. No
+synthetic source request is needed. Older source launchers without that handoff
+retain deferred formatting until their configured broker is prepared.
 The UI creates native egui text widgets from admitted results.
 Unavailable or failed parsing leaves complete plain source visible and ends the
 parser session; parsing never falls back into the trusted UI process.
