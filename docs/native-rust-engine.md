@@ -65,7 +65,15 @@ recurrent and convolution state within `1e-3 + 1e-3 * abs(reference)` against
 pinned native execution. This does not qualify K4/V4's different numerical and
 state identity; it needs its [independent packet](quantized-kv.md#first-practical-promotion-packet).
 Exact prompt/tokenizer and sampler fixtures belong to Prism. Runner's serving
-subset excludes speculation and client-selected cache, worker or backend overrides.
+subset excludes speculation (including deferred `#35` shared drafter
+embeddings/head and `#38` transactional grammar speculation), delayed recurrent
+checkpoint replay (`#37`), partial-file tensor unmapping (`#18`) and
+client-selected cache, worker or backend overrides. See the
+[screening ledger](research-register.md#august-to-november-2026-screening-ledger) and
+[memory ledger](swift-memory.md#memory-selected-serving-context) for how pinned runtime
+source controls (`#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#26`, `#28`,
+`#30`–`#34`, `#36`) and `#14` execution-shape accounting retain compiled CI and X1/X2
+device qualification gates.
 
 The opt-in [owned request-attribution mode](validation.md#bounded-source-request-attribution)
 uses the pinned checker from a hosted source-bound package, with retained

@@ -285,6 +285,21 @@ Qwen reference with MTP tensors does not establish an admitted Swift MTP path.
 Adaptive short draft lengths may reduce wasted verification, but acceptance
 alone cannot establish benefit without full drafting/verify/recovery cost.
 
+Existing algorithm source controls (`#19`–`#20`, `#22`, `#30`–`#34`, `#36` in the
+[screening ledger](research-register.md#august-to-november-2026-screening-ledger)) retain
+their compiled CI, actual-model, full-state restoration and X1/X2 device benefit gates.
+Three related screening leads remain explicitly deferred:
+
+- **#35 (shared drafter embeddings/head)**: extends the DFlash2 / trained-drafter gate
+  above by requiring exact tokenizer, transformed basis, scale/adapter and weight identity
+  checks before sharing host embedding or output-head storage.
+- **#37 (checkpointable delayed recurrent updates / `ReplaySSM`)**: extends the
+  `KVBuffer` / `TreeWY` / `SpecLA` boundary above with mandatory factor/window buffer charges,
+  bounded-error forward reconstruction, cancellation cleanup and matched batch-one benefit.
+- **#38 (transactional grammar speculation)**: requires constrained-decoding masks or
+  speculative token branches to participate in the atomic KV, GDN, convolution and sampler
+  transaction so rejected or cancelled steps roll back both graph state and grammar cursor.
+
 ### Certified sparse attention is a separate approximation
 
 The [approximation

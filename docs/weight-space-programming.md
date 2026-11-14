@@ -478,6 +478,24 @@ retain their own hashes and deterministic composition order. This command accept
 at most 48 MiB of JSON, allowing the probe's bounded 32 MiB capture plus metadata;
 retain only deliberately selected rows rather than full-layer activation dumps.
 
+For reproducible calibration accounting and redacted diagnostics (screening item **#51**,
+pending compiled CI checks), `tools/bonsai/src/` enforces:
+
+- [`calibration_metrics.rs`](../tools/bonsai/src/calibration_metrics.rs) computes
+  finite-checked scaled `f64` L2 norms/distances (`scaled_l2_norm`, `scaled_l2_distance`),
+  clamped `Option<f64>` cosine similarity (`cosine_similarity`), normalized energy entropy
+  (`normalized_energy_entropy`), coordinate support coverage (`coordinate_coverage`),
+  relative L2 error (`relative_l2_error`, `worst_row_relative_l2_error`) and bounded
+  streaming aggregation (`RowMetricsAccumulator`, `CalibrationRowSummary`).
+- `ffn_surrogate.rs`, `ffn_surrogate/structured.rs` and `weight_patch.rs` compute
+  `fitInputSha256` over explicit path-free `FitInputHashView` projections (excluding local
+  `output_path`), attach `RowMetricsAccumulator` replay summaries, and bound exported
+  `weight_patch` constraint violations to top-8 (`MAX_VIOLATION_REPORT_ROWS = 8` selected by
+  `constraintViolation` and restored to original row order).
+- `ffn_surrogate.rs`, `ffn_surrogate/structured.rs`, `weight_patch.rs` and `adapter_edit.rs`
+  omit raw local paths (`outputPath`, `sourceAdapterPath`) from exported JSON receipts,
+  emitting `"published": bool` alongside SHA-256 digests and byte lengths.
+
 ```powershell
 bonsai-tools weight-patch --request C:\Research\direction-request.json
 bonsai-tools weight-patch --request C:\Research\fit-request.json

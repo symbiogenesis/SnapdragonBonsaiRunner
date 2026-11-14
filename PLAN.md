@@ -114,6 +114,23 @@ adoption decisions without displacing native daily-use acceptance.
   process-tree regression still need compiled owning-lane verification, including
   cold Cargo host/target links; the local direct diagnostic compile/self-test and
   Windows process-identity control passed.
+- [ ] Complete owning-lane `source-checks` / `foundation` compiler, analyzer and
+  focused regression acceptance for the August–November 2026 screening controls
+  (`#8`, `#14`, `#45`–`#51` in the
+  [screening ledger](docs/research-register.md#august-to-november-2026-screening-ledger)):
+  broker queue-wait closure/`poll_peek` abandonment and 864-interleaving scheduler
+  simulation, `json-candidate` single-pass error classification, UI `50 ms` TCP
+  connect slices, `error_ui` frame-zero-clone copy action, Markdown prefix-layout
+  retention without in-process UI parsing, incremental `stream.rs` cursor,
+  cooperative `speech-tts` `CancelHook` entrypoints, `sampling.rs` `f64`/finite/greedy-argmax
+  fixes, hardened GGUF validation and scalar-boundary multibyte whitespace tokenization,
+  `bonsai-cpu-policy::context` itemized `SwiftExecutionShape` / `SwiftMemoryBreakdown`
+  and `Rotated4FittedValues` (`16,896` B/tok), and `tools/bonsai` `calibration_metrics`,
+  path-free `fitInputSha256` & omitted receipt paths, top-8 violation caps, single-pass
+  startup path/64-hex redaction, `<= 256`-byte JSON parse errors and `evidence-archive`
+  path guards. Audit `#1` (`ClampedL2`) is closed; pinned runtime/Runner source controls
+  (`#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#26`, `#28`, `#30`–`#34`, `#36`)
+  retain their compiled CI, actual-model and X1/X2 device gates below.
 - [ ] Qualify compiler-cache recovery after failed analyzers/tests, immutable
   exact hits, cancelled/setup-failure skips and nonblocking optional saves.
   Qualify same-run publication recovery from partial drafts and ambiguous API
@@ -347,7 +364,13 @@ adoption decisions without displacing native daily-use acceptance.
   [Shuttle schedule replay](docs/validation.md#candidate-reference-guided-controls)
   where existing scheduler histories leave a concrete concurrency gap. Keep
   models small and independently asserted; replay controls do not qualify real
-  Windows process, Job, handle or network enforcement.
+  Windows process, Job, handle or network enforcement. Include owning CI and
+  actual-model acceptance for screening items `#8`, `#49` and `#50` (`AcceptedChat::serve`
+  queue-wait cancellation/`poll_peek`, deterministic 864-interleaving simulation without
+  adding `shuttle` to workspace manifests, `json-candidate` single-pass malformed-JSON
+  rejection, UI `50 ms` TCP connect slices, `error_ui` frame-zero-clone copy action,
+  streaming Markdown prefix-layout retention without UI parsing and incremental TTS
+  segmentation).
 - [ ] Qualify actual-model [streaming/audio resources](docs/streaming-resources.md):
   ready prefixes, chat/speech overlap, PCM/WinMM reuse, final-storage intake,
   fragmented framing, caps/tails/truncation, failed writes, driver refusal,
@@ -416,6 +439,10 @@ adoption decisions without displacing native daily-use acceptance.
   Qualify fault paths, resources and whole-request benefit.
 - [ ] Consider FP32 factor buffers or SpecLA/TreeWY/RecoverSSM recovery only for
   measured state/checkpoint cost; preserve complete checkpoints and numerical scope.
+  Deferred screening items `#35` (shared drafter embeddings/head), `#37` (checkpointable
+  delayed recurrent updates / `ReplaySSM`) and `#38` (transactional grammar speculation)
+  likewise require explicit weight/feature/mask identity, atomic KV/GDN/convolution/sampler
+  rollback and complete-cycle benefit before integration.
 
 ## Complete C++ retirement
 
@@ -425,6 +452,10 @@ adoption decisions without displacing native daily-use acceptance.
   Close tokenizer/sampler, voice identity, Design/Base lifetime, cancellation,
   recovery, listening and resources; diagnose the latency regression with matched
   power. Mathematical controls and replay tooling do not close model acceptance.
+  Include owning compiled CI and actual-model validation of `#8` (`synthesize_*_cancellable`)
+  and `#45`–`#48` (`sampling.rs` finite/`f64`/`Option<usize>` greedy and repetition-penalty
+  ordering, GGUF `TYPE_BOOL`/UTF-8/`INT32` `general.alignment`/bounds, and scalar-boundary
+  multibyte Unicode whitespace scanning).
 - [ ] Qualify the [native Q8 transport](tools/hexagon/native_rpc/README.md#q8-matrix-preparation-and-immutable-placement)
   under contained HTP0 execution and owning hosted compilation. Bind Q8
   tensor/solver mapping and exact source/model/package/catalog/driver/VTCM/
@@ -581,7 +612,11 @@ evaluation controls without making the pruned candidate a prerequisite for W8.
   profile. Reject compensation that loses to the uncompensated branch or fails
   the fixed development-error/generalization gates. Keep whole-FFN replacement
   as a separate capacity experiment. Scalar reconstruction does not qualify
-  production NEON or complete-answer quality.
+  production NEON or complete-answer quality. Include owning compiled CI verification of
+  `#51` (`calibration_metrics`, path-free `fitInputSha256`, omitted raw receipt paths,
+  top-8 `weight_patch` violation caps, single-pass `startup_diagnostics` redaction,
+  `<= 256`-byte scalar-free JSON parse errors and `evidence_archive` path guards) before
+  running device calibration captures.
 - [ ] **W8.2 — Turn a viable FFN candidate into removed work and allocations.**
   Add a distinct opt-in graph/loading identity with selective packed-payload
   admission, surviving adapter semantics and complete state/reset/rollback
@@ -763,6 +798,12 @@ nor editing the available Abliteration factors.
   raising serialized request limits, coordinate Prism server/message/tokenizer/
   worker limits with Runner request/recovery bounds and qualify Unicode/escaped
   byte limits as well as exact token limits.
+- [ ] Qualify `#14`'s itemized worst-case execution-shape ledger (`SwiftExecutionShape`,
+  `SwiftMemoryBreakdown`, `SwiftKvCacheFormat::Rotated4FittedValues` at `16,896` B/tok
+  and monotonic `SwiftContextPlan::for_execution_shape`) in compiled CI and M1–M3 model
+  checks. Deferred screening leads `#16` (aligned staging reuse), `#17` (optional Windows
+  unbuffered direct I/O) and `#18` (owned tensor range mapping) remain gated behind measured
+  cold-start/I/O/mapping bottlenecks and retained-handle/alignment/Job-commit contracts.
 
 ## Bounded calibration and optional precision
 
@@ -849,6 +890,9 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   quality under K1's source, power and budget controls. Its guarded rotated
   reconstruction improvement and unchanged record size do not qualify answer
   quality or a default change. See the [candidate contract](docs/quantized-kv.md#fitted-value-scale-candidate).
+  Screening audit `#1` (`ClampedL2` reference identity) is closed; deferred item `#21`
+  (calibrated K-cache mean centering) remains gated behind K1 baseline attribution,
+  separate center-vector accounting and held-out answer parity.
 - [ ] Only for material recurrent-state traffic/storage, compare FP16 recurrence
   with FP32, then at most one DAMP-inspired split; qualify trajectory error,
   convolution, rounding/RNG, restore and total benefit before extra factors.
@@ -1018,7 +1062,10 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   availability and upstream microbenchmarks supply no device benefit verdict.
 - [ ] Capture a matched complete-request pair and record promotion or hold;
   update README measurements only after a freshly declared, source-bound capture
-  with aggregate/per-arm power and cleanup observations.
+  with aggregate/per-arm power and cleanup observations. Surveyed source controls `#22`,
+  `#26` and `#28` retain the owning compiled CI and X1/X2 device gates above; deferred CPU
+  kernel candidates `#23`–`#25`, `#27` and `#29` stay gated behind baseline bottleneck
+  attribution and per-kernel numerical/tail/resource acceptance.
 
 ## Adreno Vulkan
 
@@ -1043,7 +1090,9 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Optimize measured bottlenecks only, including packed kernels, reusable
   weights, cache/lifetime accounting and bounded scratch.
 - [ ] Qualify full-device benefit, pressure/device-loss/cancellation recovery,
-  rollback, resources and safety before selecting a GPU profile.
+  rollback, resources and safety before selecting a GPU profile. Keep conditional Adreno
+  GPU, async storage and DCVS/power-scaling gates from screening items `#39`–`#44`
+  deferred behind driver/access resolution and matched host/device attribution.
 
 ## Hexagon NPU
 
@@ -1124,10 +1173,22 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   partial-HVX profile.
 - [ ] Complete sustained qualification only in an eligible environment where
   setup, every arm, power, cleanup and retention fit the original allowance;
-  leave it pending when the laptop budget cannot support it.
+  leave it pending when the laptop budget cannot support it. Keep conditional Hexagon
+  NPU, Adreno GPU, async storage lifetime and DCVS/power-scaling gates (`#39`–`#44`)
+  deferred unless predeclared workload evidence justifies reopening them under `NPU-1`–`NPU-8`.
 
 ## Survey ideas outside the current laptop backlog
 
+- [ ] **August–November 2026 screening backlog disposition (`#1`–`#51`).** Track
+  the three frozen upstream snapshots (`PrismML-Eng/llama.cpp@6447906bf96c1a023980d3453fb59daa6af3bb23`,
+  `ggml-org/llama.cpp@a956a852c9c8bc1fb07206364838ddef299178c0` and
+  `vllm-project/vllm@5e51c0ca1041168de7aa9e096982aebaeebabd38`) and item status splits in the
+  [screening ledger](docs/research-register.md#august-to-november-2026-screening-ledger):
+  audit `#1` (`ClampedL2`) is closed; source controls `#8`, `#14` and `#45`–`#51` (Runner
+  source hardening) plus `#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#26`, `#28`,
+  `#30`–`#34` and `#36` await compiled CI and X1/X2 device gates above; deferred items
+  `#16`–`#18`, `#21`, `#23`–`#25`, `#27`, `#29`, `#35` and `#37`–`#44` stay gated behind
+  their explicit bottleneck, interface and safety acceptance criteria.
 - [ ] **F1 — Conditional research.** After a useful verifier and compatible
   published auxiliary exist, screen trained parallel/phrase proposals with
   admitted native resources. After a useful

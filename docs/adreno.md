@@ -118,7 +118,11 @@ submission/waits and critical-path traces, including faults, evictions and
 sustained failures. Overlapping durations cannot be summed; utilization is not
 energy. [GPUView][gpuview] requires native ARM64 tooling. Native diagnostics use
 absolute system-temp lanes and inherited Windows system/profile variables.
-Moving source links are leads, not build pins.
+Moving source links are leads, not build pins. Conditional accelerator, async storage and
+DCVS/power-scaling gates from the August–November 2026 screening (`#39`–`#44` in the
+[screening ledger](research-register.md#august-to-november-2026-screening-ledger)) remain
+deferred behind `VK_ERROR_INCOMPATIBLE_DRIVER` diagnosis, packed-projection controls and
+matched host/device resource accounting.
 
 ## Cross-device research limits
 

@@ -84,11 +84,16 @@ outside ordinary Runner launch policy:
 The [algorithm contract](inference-algorithms.md#hybrid-cache-reuse-and-speculative-state)
 owns verifier and speculative-state requirements. Triangular GDN remains a
 separate profile. The source changes below retain the
-[cross-generation gates](#cross-generation-cpu-promotion). The 0.1.28 binary
-delivery includes its source-bound helper implementations; it does not establish
-model parity, benefit or profile promotion. Changed helper registry APIs still
-require publication before dependent registry crates; binary delivery does not
-establish that separate publication.
+[cross-generation gates](#cross-generation-cpu-promotion), and surveyed screening source
+controls (`#22`, `#26`, `#28` alongside the preparation, attention and GDN candidates
+below) remain gated on compiled strict Release checks, fallback controls and matched X1/X2
+complete-request CI receipts. Deferred CPU kernel candidates (`#23`–`#25`, `#27`, `#29`)
+remain outside the active implementation queue until baseline attribution establishes an
+actionable hotspot and each path closes its exact arithmetic, tail/scale and benefit
+requirements. The 0.1.28 binary delivery includes its source-bound helper
+implementations; it does not establish model parity, benefit or profile promotion. Changed
+helper registry APIs still require publication before dependent registry crates; binary
+delivery does not establish that separate publication.
 
 ## CPU preparation candidates
 

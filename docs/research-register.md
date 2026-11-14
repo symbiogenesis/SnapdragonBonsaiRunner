@@ -223,6 +223,28 @@ Keep research scoped to a selected usability need or demonstrated bottleneck.
 These are references for selected design questions, not a proposed implementation
 backlog or a performance ranking.
 
+### August to November 2026 screening ledger
+
+The August 14 to November 14, 2026 screening covered **51 items** (`#1`–`#51`)
+across three frozen upstream source snapshots, mapped cleanly to owning docs and
+[PLAN.md](../PLAN.md):
+
+| Surveyed repository / branch | Frozen revision | Snapshot date | Surveyed entries |
+| --- | --- | --- | ---: |
+| `PrismML-Eng/llama.cpp` (`prism`) | `6447906bf96c1a023980d3453fb59daa6af3bb23` | 2026-11-06 | 1,713 |
+| `ggml-org/llama.cpp` (`master`) | `a956a852c9c8bc1fb07206364838ddef299178c0` | 2026-11-14 | 1,964 |
+| `vllm-project/vllm` (`main`) | `5e51c0ca1041168de7aa9e096982aebaeebabd38` | 2026-11-14 | 5,456 |
+
+Screening triage preserves strict separation between implemented source controls,
+closed audits, deferred research leads and compiled/device acceptance gates:
+
+| Screening status | Items | Owning boundary and gate |
+| --- | --- | --- |
+| Closed audit | `#1` | `ClampedL2` `Q8_0` clipping/scale reference contract retained per `PrismML-Eng/llama.cpp@73bfe6cc485554822f80c473a3c0c4f25e80f41b` and `6447906bf96c1a023980d3453fb59daa6af3bb23` (distinguished from `ggml-org/llama.cpp@5fdfa628`); tracked in [quantized KV](quantized-kv.md#qualification-contract). |
+| Implemented Runner source controls (pending compiled CI & device gates) | `#8`, `#14`, `#45`–`#51` | Landed in source across `bonsai-broker`, `bonsai-chat`, `bonsai-cpu-policy`, `bonsai-speech-tts` and `bonsai-tools` (`#8` cancellation/schedule exploration, `#14` itemized execution-shape memory ledger, `#45`–`#48` sampler/GGUF/UTF-8 scanner hardening, `#49`–`#50` single-pass JSON error & proportional streaming Markdown/TTS cursor, `#51` bounded `calibration_metrics`/path-free hashes & receipts/redaction). Compiled `source-checks`/`foundation`, actual-model and X1/X2 device gates remain pending in [validation](validation.md#promotion-criteria). |
+| Pinned Prism/Runner source controls (pending CI, model & device gates) | `#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#26`, `#28`, `#30`–`#34`, `#36` | Existing source controls inside pinned Prism `0.1.28` / Runner runtime, memory, KV, algorithm, CPU-kernel and broker boundaries; retain their compiled CI, actual-model, state-recovery and X1/X2 device gates in [the runtime contract](native-rust-engine.md), [algorithms](inference-algorithms.md) and [CPU kernels](cpu-kernels.md). |
+| Deferred / conditional backlog | `#16`–`#18`, `#21`, `#23`–`#25`, `#27`, `#29`, `#35`, `#37`–`#44` | Gated behind measured bottlenecks, artifact/interface readiness and predeclared allowances: `#16` aligned staging reuse, `#17` optional Windows unbuffered direct I/O and `#18` owned tensor range mapping ([memory](swift-memory.md)); `#21` calibrated K-cache mean centering ([quantized KV](quantized-kv.md)); `#23`–`#25`, `#27` and `#29` conditional CPU kernel candidates ([CPU kernels](cpu-kernels.md)); `#35` shared drafter embeddings/head, `#37` checkpointable delayed recurrent updates / `ReplaySSM` and `#38` transactional grammar speculation ([algorithms](inference-algorithms.md)); `#39`–`#44` Adreno GPU, Hexagon NPU, async storage lifetime and DCVS/power-scaling gates ([Hexagon](hexagon.md), [Adreno](adreno.md)). |
+
 ### Unsloth calibration, sensitivity and evaluation principles
 
 The [Dynamic 4-bit analysis](https://unsloth.ai/blog/dynamic-4bit),

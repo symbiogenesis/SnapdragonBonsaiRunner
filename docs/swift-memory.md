@@ -297,6 +297,21 @@ memory rejects launch; running pressure tears down the owned model. Memory
 snapshots reserve no RAM. Immediate pre-spawn and child checks still require
 the selected Job allowance plus the 4 GiB host reserve.
 
+For worst-case admission attribution (screening item **#14**), `bonsai-cpu-policy::context`
+pairs `SwiftKvCacheFormat::Rotated4FittedValues` (`16,896` bytes/token) with
+`SwiftExecutionShape`, `SwiftMemoryBreakdown` and `SwiftContextPlan::for_execution_shape`:
+
+- Itemizes (a) weights and fixed runtime (`FIXED_RUNTIME_BYTES`), (b) active, rollback
+  and prompt-reuse recurrent/convolution checkpoint copies (`RECURRENT_BYTES = 156,893,184`
+  per copy), (c) live KV copies, `score_rows_per_token * 4` score scratch and `128`-byte
+  per-token metadata, (d) worst-case execution scratch
+  `max(decode_scratch, tile_prefill_scratch, speculative_verify_scratch + multi_row_logits + replay_scratch)`,
+  (e) optional accelerator resident arena and staging bytes outside Windows Job private
+  commit (`job_commit_bytes()`), and (f) allocator fragmentation margin inside Job commit.
+- Enforces monotonic conservative limits (`for_execution_shape <= for_profile` when matched
+  to a legacy `SwiftContextProfile`), leaving existing context admission ceilings unchanged
+  while awaiting compiled CI and device qualification.
+
 Publisher serving receives `--ctx-size`. Native serving receives paired
 `--context-tokens` and `--memory-limit-bytes`. Runner enables cache-aware sizing,
 full-context K4/V4, four workers and latest-prefix capabilities only for the
@@ -438,6 +453,12 @@ can map eligible CPU tensors directly; other buffer types may copy them. Its
 prefetches the complete file and cannot unmap fragments. Prefetch populates the
 physical cache, not the process working set. Disabling it would not remove tensor
 storage; no current CLI switch exposes that choice.
+
+Three memory/I/O screening candidates remain explicitly deferred in [PLAN.md](../PLAN.md#native-context-expansion-roadmap)
+until measured cold-start, I/O or mapping bottlenecks justify dedicated contracts: **#16**
+(aligned staging reuse), **#17** (optional Windows unbuffered direct I/O preserving strict
+sector alignment, fallible fallback and CNG handle integrity) and **#18** (owned tensor
+range mapping avoiding full-file unmap gaps without weakening file-handle/reparse guards).
 
 ### Graph and output buffers
 

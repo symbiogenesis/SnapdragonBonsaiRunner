@@ -100,7 +100,10 @@ For identical incoming projections, keys and attention probabilities remain
 unchanged. Future states can diverge through changed values.
 
 The guard precedes the rounded inverse transform and guarantees neither lower
-original-space/attention error nor better answers. Native encoding cost,
+original-space/attention error nor better answers. In `bonsai-cpu-policy::context`,
+`SwiftKvCacheFormat::Rotated4FittedValues` (`16,896` bytes/token) integrates into
+`SwiftExecutionShape` / `SwiftMemoryBreakdown` alongside `Rsq4`, `Rsq4K3v` and `F16`
+without relaxing conservative admission. Native encoding cost,
 complete-request cost and held-out model quality remain pending under K1.
 The candidate keeps the ordinary graph state ceiling. Runner's trusted launch
 policy does not expose or select `rsq4vf`; inclusion in the runtime bundle does
@@ -155,6 +158,14 @@ tokenizer, broker, capability/readiness and UI limits, supported request bounds
 and an exact-source verified runtime release.
 
 ## Qualification contract
+
+Closed screening item **#1** (`ClampedL2`) retains Prism's `Q8_0` clipping/scale
+reference identity per `PrismML-Eng/llama.cpp@73bfe6cc485554822f80c473a3c0c4f25e80f41b`
+and `6447906bf96c1a023980d3453fb59daa6af3bb23` (distinct from `ggml-org/llama.cpp@5fdfa628`).
+Deferred screening item **#21** (calibrated K-cache mean centering) remains gated behind
+K1 K4/V4 baseline attribution; before admission or kernel implementation, it requires
+separate center-vector storage accounting, bounded native calibration provenance,
+complete state/checkpoint identity isolation and held-out quality comparison.
 
 Freeze the exact Runner/Prism source, model/adapter, compiler, codec/layout,
 selected precision, context/output bounds and device/driver identities before

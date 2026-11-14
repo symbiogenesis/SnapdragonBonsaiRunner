@@ -14,6 +14,12 @@ the canonical request; permissive maps or enums can erase that evidence.
 [Absolute deadlines](https://docs.rs/tokio/1.54.1/tokio/time/fn.timeout_at.html)
 include expiry checks around immediately ready operations. Parser and runtime
 selection rationale lives in the [dependency audit](dependency-audit.md).
+Under the optional qualification-only `json-candidate` feature
+(`src/broker/src/json_candidate_parser.rs`, screening item **#49**), malformed JSON
+syntax and schema deserialization failures return `Rejection::ChatSchema` directly from
+one `simd-json` pass without a duplicate full-body `serde_json` parse (delegating to
+`AuthorizedHead::prepare` only when an explicit `abliteration_scale` field requires exact
+decimal parity). Compiled CI and equivalence checks remain pending.
 
 ## Public request contract
 
@@ -335,10 +341,17 @@ The OS backlog is separate. Full capacity returns immediately, so callers must
 avoid busy retry loops.
 
 `AcceptedChat::serve()` allows a thirty-second queue wait from acceptance, then
-serves without a total elapsed-time limit. Shutdown races accepting/active work
-and wakes queued entries. `close()` retains the listener until service drop.
-Async cleanup still requires polling; dropping operations closes sockets/releases
-permits directly.
+serves without a total elapsed-time limit. During `Reservation::enter(queue_deadline)`
+(screening item **#8**), `AcceptedChat::serve` races `service.gate.closed()` and
+non-consuming client EOF/error detection via `stream.poll_peek` (stopping further peeks
+once request bytes arrive so polling stays edge-driven until wait completion). Shutdown
+races accepting/active work (`serve_chat_inner` inherits `service.gate.closed()` around
+`receive_admitted`) and wakes queued entries. `close()` retains the listener until service
+drop. Async cleanup still requires polling; dropping operations closes sockets/releases
+permits directly. Deterministic 864-interleaving schedule exploration in
+`src/broker/tests/scheduler_simulation.rs` covers `RequestGate` admission, queued
+disconnect/drop, `GenerationAttempt` abort latching and late orphan probes without
+requiring external concurrency crates; compiled CI acceptance remains pending.
 
 Once generation connection is attempted, failed delivery, disconnect, expiry or
 external cancellation permanently closes admission before releasing the active

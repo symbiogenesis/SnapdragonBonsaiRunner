@@ -182,7 +182,10 @@ Strict backend requests fail explicitly; preferred
 fallback precedes generation under qualified eligibility and memory/state-transition rules.
 Arbitrary inherited overrides remain unsupported. Helpers need owned lifetime, parent-death teardown
 and independent resource/isolation qualification; drivers/services are not implicitly contained by
-the single-process Job.
+the single-process Job. Deferred August–November 2026 screening candidates covering Hexagon
+NPU, Adreno GPU, async storage lifetimes and DCVS/power-scaling gates (`#39`–`#44` in
+[PLAN.md](../PLAN.md#hexagon-npu)) leave these Job commit, arena-sealing, signed-package
+and benefit rules intact until explicitly reopened and qualified.
 
 ## Qualification evidence
 
