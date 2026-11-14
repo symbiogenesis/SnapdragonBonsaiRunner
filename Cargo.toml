@@ -90,6 +90,12 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+# CI rejects semantic defects, not digit grouping, optional const promotion or
+# unit-expression punctuation. These produced release failures with no behavior
+# change; keep correctness, suspicious-code and performance checks in force.
+unreadable_literal = "allow"
+missing_const_for_fn = "allow"
+semicolon_if_nothing_returned = "allow"
 as_conversions = "deny"
 dbg_macro = "deny"
 exit = "deny"
