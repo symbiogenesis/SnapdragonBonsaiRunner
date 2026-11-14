@@ -60,6 +60,11 @@ runs:
       env:
         CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
         CARGO_BUILD_FINGERPRINT: content
+        # This executable only orchestrates CI. Avoid optimizing the coordinator
+        # before any application checks can start. These process-local overrides
+        # never affect the strict Release analyzers, tests or shipped binaries.
+        CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '256'
       run: |
         Set-StrictMode -Version Latest
         $ErrorActionPreference = 'Stop'

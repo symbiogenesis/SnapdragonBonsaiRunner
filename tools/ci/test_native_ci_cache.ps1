@@ -14,6 +14,20 @@ function Invoke-CacheFixture([scriptblock]$Work) {
 }
 function Update-CacheFixture([string]$Root,[string]$Field,$Value) { $path=Join-Path $Root 'receipt.json'; $receipt=[IO.File]::ReadAllText($path) | ConvertFrom-Json -AsHashtable; $receipt[$Field]=$Value; [IO.File]::WriteAllText($path,($receipt | ConvertTo-Json)) }
 $cases=[ordered]@{
+ bootstrap_codegen_overrides_stay_in_coordinator_build={
+    $repository=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+    $action=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/ci-tool/action.yml')).Replace("`r`n","`n")
+    $steps=Get-CiActionSteps $action
+    $build=$steps['Build the CI executable only after its inputs change']
+    Assert-Ci ($build.Contains("CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'"))
+    Assert-Ci ($build.Contains("CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '256'"))
+    Assert-Ci ($build.Contains('--release --manifest-path'))
+    Assert-Ci ($build.Contains('--package bonsai-ci --bin bonsai-ci --target-dir'))
+    Assert-Ci ($action.Contains("'.github/actions/ci-tool/**'")) 'The exact source identity must bind coordinator build settings.'
+    $outside=$action.Replace($build,'')
+    Assert-Ci ($outside -cnotmatch 'CARGO_PROFILE_RELEASE_(?:OPT_LEVEL|CODEGEN_UNITS):') 'Coordinator settings cannot escape their build step.'
+    Assert-Ci ($build -cnotmatch '(?:GITHUB_ENV|setx|SetEnvironmentVariable)') 'Coordinator settings cannot persist into application checks.'
+ }
  exact_receipt_and_native_bytes_pass={ Invoke-CacheFixture { param($r) Assert-CiEqual (Test-CiCache $r $source $image) (Join-Path $r 'bonsai-ci.exe') } }
  every_build_identity_mismatch_fails={ Invoke-CacheFixture { param($r) foreach ($pair in @(@('sourceId',('b'*64)),@('hostId','another-image'),@('toolchain','nightly-other'),@('compiler','host: x86_64-pc-windows-msvc'),@('schemaVersion',$true),@('schemaVersion',2))) { New-CiCacheReceipt $r $source $image $compilerIdentity | Out-Null; Update-CacheFixture $r $pair[0] $pair[1]; Assert-CiReject { Test-CiCache $r $source $image } } } }
  changed_and_wrong_native_bytes_fail={ Invoke-CacheFixture { param($r) foreach ($raw in @((New-FixturePe 0x8664),(New-FixturePe 0xaa64 0x10b),(New-FixturePe 0xaa64 0x20b 0x2002),(New-FixturePe 0xaa64 0x20b 0),([Text.Encoding]::UTF8.GetBytes('not a PE')))) { [IO.File]::WriteAllBytes((Join-Path $r 'bonsai-ci.exe'),$raw); Assert-CiReject { Test-CiCache $r $source $image } }; $raw=New-FixturePe; $raw[127]=1; [IO.File]::WriteAllBytes((Join-Path $r 'bonsai-ci.exe'),$raw); Assert-CiReject { Test-CiCache $r $source $image } } }

@@ -42,7 +42,12 @@ adoption decisions without displacing native daily-use acceptance.
   Foundation and dependency-audit acceptance for the published startup,
   staged-index, ASR/UI fixture, workflow-consolidation and dependency corrections,
   syntax/selector guards, portable and planner compiler-cache recovery, portable
-  environment fixtures and separate hosted/device scheduling. Include fresh
+  environment fixtures and separate hosted/device scheduling. Qualify
+  producer/check overlap, TTS-only routing, complete lane cache-input closure,
+  separate build/check snapshots, coordinator-only fast bootstrap and Foundation's
+  opt-in incremental Release compilation. Compare cold, unchanged and edited
+  runs on matching hosted images, including cache transfer/storage costs; preserve
+  every selected analyzer, test, reference and integration verdict. Include fresh
   advisory/yank checks for both workspace lockfiles and the SDK reader's patched
   archive parser. Verify
   cold/hit/input-change paths, failed-regression recovery and independent push handoffs.
