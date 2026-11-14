@@ -56,14 +56,24 @@ struct Index {
     tensors: BTreeMap<String, Tensor>,
 }
 
-struct Reader<R> {
+struct Reader<'a, R> {
     source: R,
     length: u64,
     remaining: usize,
+    cancel: &'a mut dyn FnMut() -> bool,
 }
 
-impl<R: Read + Seek> Reader<R> {
+fn check_cancel(cancel: &mut (impl FnMut() -> bool + ?Sized)) -> io::Result<()> {
+    if cancel() {
+        Err(io::Error::from(io::ErrorKind::Interrupted))
+    } else {
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek> Reader<'_, R> {
     fn bytes<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        check_cancel(self.cancel)?;
         let mut bytes = [0; N];
         self.source.read_exact(&mut bytes)?;
         Ok(bytes)
@@ -91,11 +101,13 @@ impl<R: Read + Seek> Reader<R> {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(count).map_err(|_| invalid())?;
         bytes.resize(count, 0);
+        check_cancel(self.cancel)?;
         self.source.read_exact(&mut bytes)?;
         String::from_utf8(bytes).map_err(|_| invalid())
     }
 
     fn skip(&mut self, bytes: u64) -> io::Result<()> {
+        check_cancel(self.cancel)?;
         let end = self
             .source
             .stream_position()?
@@ -261,6 +273,7 @@ impl<R: Read + Seek> Reader<R> {
         }
         let mut ranges = Vec::with_capacity(entries.len());
         for tensor in entries.values_mut() {
+            check_cancel(self.cancel)?;
             tensor.offset = data.checked_add(tensor.offset).ok_or_else(invalid)?;
             let end = tensor
                 .offset
@@ -275,6 +288,7 @@ impl<R: Read + Seek> Reader<R> {
         if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
             return Err(invalid());
         }
+        check_cancel(self.cancel)?;
         Ok(Index {
             metadata: values,
             tensors: entries,
@@ -308,10 +322,15 @@ fn layout(kind: u32) -> io::Result<(u64, u64)> {
 
 #[cfg(any(feature = "native-engine", test))]
 pub(super) fn validate(source: &mut (impl Read + Seek), length: u64) -> io::Result<()> {
-    model::validate(&read_index(source, length)?)
+    model::validate(&read_index(source, length, &mut || false)?)
 }
 
-fn read_index(source: &mut (impl Read + Seek), length: u64) -> io::Result<Index> {
+fn read_index(
+    source: &mut (impl Read + Seek),
+    length: u64,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<Index> {
+    check_cancel(cancel)?;
     if !(24..=MAX_FILE_BYTES).contains(&length) {
         return Err(invalid());
     }
@@ -320,6 +339,7 @@ fn read_index(source: &mut (impl Read + Seek), length: u64) -> io::Result<Index>
         source: BufReader::with_capacity(256 * 1024, source),
         length,
         remaining: MAX_METADATA,
+        cancel,
     };
     reader.index()
 }
@@ -330,8 +350,9 @@ pub(super) fn decoder(
     precision: crate::decoder::CachePrecision,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<crate::decoder::Model> {
-    let index = read_index(source, length)?;
+    let index = read_index(source, length, cancel)?;
     model::validate(&index)?;
+    check_cancel(cancel)?;
     decoder::load(index, source, precision, cancel)
 }
 
@@ -340,17 +361,20 @@ pub(super) fn encoder(
     length: u64,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<(crate::encoder::Encoder, crate::frontend::Frontend)> {
-    let index = read_index(source, length)?;
+    let index = read_index(source, length, cancel)?;
     model::validate(&index)?;
+    check_cancel(cancel)?;
     encoder::load(index, source, cancel)
 }
 
 pub(super) fn tokenizer(
     source: &mut (impl Read + Seek),
     length: u64,
+    cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<(crate::tokenizer::Tokenizer, crate::protocol::PromptTokens)> {
-    let mut index = read_index(source, length)?;
+    let mut index = read_index(source, length, cancel)?;
     model::validate(&index)?;
+    check_cancel(cancel)?;
     if let Some(Value::Text(pre)) = index.metadata.get("tokenizer.ggml.pre")
         && !matches!(pre.as_str(), "" | "qwen2")
     {
@@ -372,6 +396,7 @@ pub(super) fn tokenizer(
         merges,
         u32::try_from(eos).map_err(|_| invalid())?,
     )?;
+    check_cancel(cancel)?;
     let prompt = model::prompt_tokens(&index, &tokenizer)?;
     Ok((tokenizer, prompt))
 }

@@ -115,6 +115,15 @@ binary16 rounding/overflow, uniform grouped attention, complete cache/reset and
 cancellation/unwind. `rust-decoder.json` identifies this scalar arithmetic
 separately from native activation requantization and flash attention.
 
+Rust model loading passes the caller's cancellation/deadline check through each
+GGUF index scan, including buffered vocabulary/merge entries and tensor ranges,
+before any initial seek and before returning the complete index. Cancellation
+returns `Interrupted` without admitting a partial index; a new load starts at the
+original file header. Two `rust_asr_intake_` controls cover pre-cancelled graph and
+tokenizer intake without source I/O and cancellation while metadata is buffered.
+These checks do not bound a blocking OS read or qualify actual-model cancellation;
+the caller still supervises the original absolute lifetime.
+
 Prompt prefill evaluates the tied vocabulary projection only at the final
 position, matching the pinned native graph's selected output. Earlier positions
 retain all block, final-normalization and cache-commit validation; only their

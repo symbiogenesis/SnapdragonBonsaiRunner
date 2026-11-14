@@ -112,7 +112,8 @@ impl RustRecognizer {
                 return Err(invalid());
             }
         }
-        let (tokenizer, prompt_tokens) = crate::intake::tokenizer(&mut file, properties.len())?;
+        let (tokenizer, prompt_tokens) =
+            crate::intake::tokenizer(&mut file, properties.len(), cancel)?;
         check(cancel)?;
         let (encoder, frontend) = Encoder::load(&mut file, properties.len(), cancel)?;
         check(cancel)?;

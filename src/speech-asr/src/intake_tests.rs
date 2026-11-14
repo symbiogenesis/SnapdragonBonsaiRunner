@@ -76,6 +76,7 @@ fn parse(bytes: Vec<u8>) -> io::Result<Index> {
         source: Cursor::new(bytes),
         length,
         remaining: super::MAX_METADATA,
+        cancel: &mut || false,
     }
     .index()
 }
@@ -96,6 +97,69 @@ fn rust_asr_intake_reads_independent_f32_q8_layout_and_reordered_metadata() -> i
     assert_eq!(index.tensors["q8"].bytes, 68);
     assert_eq!(index.tensors["f32"].bytes, 12);
     assert_eq!(index.tensors["q8"].offset - index.tensors["f32"].offset, 32);
+    Ok(())
+}
+
+#[test]
+fn rust_asr_intake_precancelled_graph_loading_performs_no_source_io() {
+    let mut source = Cursor::new(vec![0; 32]);
+    source.set_position(7);
+    assert_eq!(
+        super::decoder(
+            &mut source,
+            32,
+            crate::decoder::CachePrecision::F16,
+            &mut || true,
+        )
+        .err()
+        .map(|error| error.kind()),
+        Some(io::ErrorKind::Interrupted)
+    );
+    assert_eq!(source.position(), 7);
+    assert_eq!(
+        super::encoder(&mut source, 32, &mut || true)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::Interrupted)
+    );
+    assert_eq!(source.position(), 7);
+    assert_eq!(
+        super::tokenizer(&mut source, 32, &mut || true)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::Interrupted)
+    );
+    assert_eq!(source.position(), 7);
+}
+
+#[test]
+fn rust_asr_intake_cancellation_interrupts_buffered_metadata_and_allows_fresh_intake()
+-> io::Result<()> {
+    // The entire original wire fits in the reader's 256 KiB input buffer.
+    // Cancellation must still be polled between its vocabulary entries.
+    let bytes = wire(
+        &[("tokens", strings(&["literal"; 200]))],
+        &[("weight", &[1], 0, 0)],
+        4,
+    );
+    let length = u64::try_from(bytes.len()).map_err(|_| invalid())?;
+    let mut source = Cursor::new(bytes);
+    let mut polls = 0;
+    assert_eq!(
+        super::read_index(&mut source, length, &mut || {
+            polls += 1;
+            polls == 50
+        })
+        .err()
+        .map(|error| error.kind()),
+        Some(io::ErrorKind::Interrupted)
+    );
+    assert_eq!(polls, 50);
+    let index = super::read_index(&mut source, length, &mut || false)?;
+    assert!(
+        matches!(index.metadata.get("tokens"), Some(Value::Strings(tokens)) if tokens.len() == 200)
+    );
+    assert_eq!(index.tensors["weight"].bytes, 4);
     Ok(())
 }
 
@@ -294,6 +358,7 @@ fn rust_asr_intake_charges_empty_string_arrays_and_skipped_scalars() {
         source: Cursor::new(strings(&["", ""])),
         length: 32,
         remaining: 63,
+        cancel: &mut || false,
     };
     // Two empty strings still own two String objects and their length words.
     assert!(reader.value().is_err());
@@ -308,6 +373,7 @@ fn rust_asr_intake_charges_empty_string_arrays_and_skipped_scalars() {
         ),
         length: 16,
         remaining: 64,
+        cancel: &mut || false,
     };
     assert!(reader.value().is_err());
 }
