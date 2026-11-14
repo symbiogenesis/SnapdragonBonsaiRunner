@@ -21,6 +21,7 @@
   },
   "semantics": {
     "projections": "f32-f16-or-packed-q8_0-with-f32-activations-and-separate-scalar-accumulation",
+    "tensorAxes": "omitted-trailing-ggml-axes-are-one-for-projections-and-convolutions-matching-catalog-admission",
     "normalization": "pre-attention-pre-ffn-and-per-head-qk-rmsnorm",
     "rotary": "neox-temporal-position-mrope-reduction",
     "attention": "causal-gqa-softmax-over-complete-committed-kv-plus-one-provisional-row",

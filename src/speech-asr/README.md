@@ -103,7 +103,10 @@ pinned-vocabulary observations and owning-crate acceptance remain necessary.
 `decoder.rs` implements a complete independent scalar causal decoder: token/audio
 prefill, GQA, per-head Q/K RMSNorm, temporal NeoX RoPE, SwiGLU, tied output logits
 and isolated session state. Its GGUF loader reads F32/F16/Q8_0 decoder projections
-and F32 normalization vectors from the admitted tensor ranges. F16 and F32 cache
+and F32 normalization vectors from the admitted tensor ranges. Projection and
+convolution loading preserve GGML's omitted trailing unit axes, matching catalog
+admission; literal F32/F16/Q8_0 wire controls cover one-row matrices and
+one-channel kernels. F16 and F32 cache
 policies are explicit; the native engine defaults to F16. No cache append becomes
 visible until every layer and the logits succeed. Step failure/unwind preserves
 all committed KV bits, while failed prefill resets the entire attempted prompt.

@@ -93,8 +93,13 @@ impl<R: Read + Seek> Loader<'_, R> {
     ) -> io::Result<Projection> {
         let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
         let input = usize::try_from(tensor.shape[0]).map_err(|_| invalid())?;
+        // GGML fills omitted trailing dimensions with one. The common model
+        // catalog admits that convention, so loading must preserve it too.
         let output =
-            usize::try_from(*tensor.shape.get(1).ok_or_else(invalid)?).map_err(|_| invalid())?;
+            usize::try_from(tensor.shape.get(1).copied().unwrap_or(1)).map_err(|_| invalid())?;
+        if tensor.shape.iter().skip(2).any(|axis| *axis != 1) {
+            return Err(invalid());
+        }
         match tensor.kind {
             0 => Projection::f32(input, output, self.vector(name, cancel)?),
             1 => Projection::f16(input, output, &self.bytes(name, cancel)?.1),
@@ -109,12 +114,20 @@ impl<R: Read + Seek> Loader<'_, R> {
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Projection> {
         let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
-        if tensor.shape.len() != 4 || tensor.shape[0] != 3 || tensor.shape[1] != 3 {
+        if tensor.shape.first() != Some(&3)
+            || tensor.shape.get(1) != Some(&3)
+            || tensor.shape.iter().skip(4).any(|axis| *axis != 1)
+        {
             return Err(invalid());
         }
-        let input = usize::try_from(9_u64.checked_mul(tensor.shape[2]).ok_or_else(invalid)?)
-            .map_err(|_| invalid())?;
-        let output = usize::try_from(tensor.shape[3]).map_err(|_| invalid())?;
+        let input = usize::try_from(
+            9_u64
+                .checked_mul(tensor.shape.get(2).copied().unwrap_or(1))
+                .ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+        let output =
+            usize::try_from(tensor.shape.get(3).copied().unwrap_or(1)).map_err(|_| invalid())?;
         match tensor.kind {
             0 => Projection::f32(input, output, self.vector(name, cancel)?),
             1 => Projection::f16(input, output, &self.bytes(name, cancel)?.1),
@@ -255,6 +268,120 @@ mod tests {
         assert!(loader.projection("missing", &mut || false).is_err());
         assert!(loader.projection("quant", &mut || true).is_err());
         assert!(Projection::f16(1, 1, &[0]).is_err());
+        Ok(())
+    }
+
+    fn one_tensor(shape: &[u64], kind: u32, bytes: u64) -> Index {
+        Index {
+            metadata: BTreeMap::new(),
+            tensors: BTreeMap::from([(
+                "weight".into(),
+                Tensor {
+                    shape: shape.to_vec(),
+                    kind,
+                    offset: 0,
+                    bytes,
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn rust_asr_decoder_wire_projection_preserves_omitted_unit_axes() -> io::Result<()> {
+        for shape in [&[2][..], &[2, 1], &[2, 1, 1], &[2, 1, 1, 1]] {
+            for (kind, bytes) in [
+                (
+                    0,
+                    [1.0_f32.to_le_bytes(), (-2.0_f32).to_le_bytes()].concat(),
+                ),
+                (
+                    1,
+                    [0x3c00_u16.to_le_bytes(), 0xc000_u16.to_le_bytes()].concat(),
+                ),
+            ] {
+                let length = u64::try_from(bytes.len()).map_err(|_| super::invalid())?;
+                let mut source = Cursor::new(bytes);
+                let mut loader = Loader {
+                    index: one_tensor(shape, kind, length),
+                    source: &mut source,
+                    remaining: length,
+                };
+                let projection = loader.projection("weight", &mut || false)?;
+                assert_eq!(projection.dimensions(), (2, 1));
+                assert_eq!(projection.multiply(&[5.0, 6.0], &mut || false)?, [-7.0]);
+            }
+        }
+        for shape in [&[32][..], &[32, 1], &[32, 1, 1, 1]] {
+            // Half scale .5 and signed coefficients 1,-1,127,-128 sum to -1.
+            let mut bytes = vec![0; 34];
+            bytes[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            bytes[2..6].copy_from_slice(&[1, 255, 127, 128]);
+            let mut source = Cursor::new(bytes);
+            let mut loader = Loader {
+                index: one_tensor(shape, 8, 34),
+                source: &mut source,
+                remaining: 34,
+            };
+            assert_eq!(
+                loader
+                    .projection("weight", &mut || false)?
+                    .multiply(&[1.0; 32], &mut || false)?,
+                [-0.5]
+            );
+        }
+        // A genuinely nonunit third axis is not a matrix and must fail before I/O.
+        let mut source = Cursor::new(Vec::<u8>::new());
+        let mut loader = Loader {
+            index: one_tensor(&[2, 1, 2], 0, 16),
+            source: &mut source,
+            remaining: 16,
+        };
+        assert!(loader.projection("weight", &mut || false).is_err());
+        assert_eq!(source.position(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rust_asr_decoder_wire_convolution_preserves_omitted_unit_axes() -> io::Result<()> {
+        for shape in [&[3, 3][..], &[3, 3, 1], &[3, 3, 1, 1]] {
+            for (kind, bytes) in [
+                (
+                    0,
+                    [1.0_f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0]
+                        .into_iter()
+                        .flat_map(f32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    1,
+                    [
+                        0x3c00_u16, 0xc000, 0x4200, 0xc400, 0x4500, 0xc600, 0x4700, 0xc800, 0x4880,
+                    ]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                ),
+            ] {
+                let length = u64::try_from(bytes.len()).map_err(|_| super::invalid())?;
+                let mut source = Cursor::new(bytes);
+                let mut loader = Loader {
+                    index: one_tensor(shape, kind, length),
+                    source: &mut source,
+                    remaining: length,
+                };
+                let projection = loader.convolution("weight", &mut || false)?;
+                assert_eq!(projection.dimensions(), (9, 1));
+                assert_eq!(projection.multiply(&[1.0; 9], &mut || false)?, [5.0]);
+            }
+        }
+        let mut source = Cursor::new(Vec::<u8>::new());
+        let mut loader = Loader {
+            index: one_tensor(&[3], 0, 12),
+            source: &mut source,
+            remaining: 12,
+        };
+        assert!(loader.convolution("weight", &mut || false).is_err());
+        assert_eq!(source.position(), 0);
         Ok(())
     }
 }
