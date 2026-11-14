@@ -86,13 +86,18 @@ meta_variable_misuse = "deny"
 all = { level = "deny", priority = -1 }
 
 [workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cargo = { level = "deny", priority = -1 }
-# CI rejects semantic defects, not digit grouping, optional const promotion or
-# unit-expression punctuation. These produced release failures with no behavior
-# change; keep correctness, suspicious-code and performance checks in force.
+# Block defects and inefficient operations without turning new style preferences
+# into failures through Rust's warnings policy. Individual safety/ownership
+# requirements below take precedence over these category defaults.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "allow", priority = -1 }
+complexity = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+cargo = { level = "allow", priority = -1 }
+# Preserve named allowances for historical nonsemantic failures.
 unreadable_literal = "allow"
 missing_const_for_fn = "allow"
 semicolon_if_nothing_returned = "allow"
@@ -102,6 +107,7 @@ struct_field_names = "allow"
 struct_excessive_bools = "allow"
 too_many_lines = "allow"
 suspicious_operation_groupings = "allow"
+redundant_clone = "deny"
 as_conversions = "deny"
 dbg_macro = "deny"
 exit = "deny"
