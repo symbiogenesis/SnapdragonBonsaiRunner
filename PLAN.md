@@ -636,12 +636,16 @@ nor editing the available Abliteration factors.
   state for the selected worker policy, including loaded-zero identity, nonzero
   effect, scale/history changes and prefix reuse. Keep the CPU/FP16 reference
   policy, one-token smoke and development K4/V4 acceptance distinct; P1's
-  authenticated authoring/basis requirements remain independent.
+  authenticated authoring/basis requirements remain independent. Run owning
+  strict Release analyzers and the artifact-pin, retained-greedy and promotion
+  receipt regressions; local validation stopped before Rust compilation.
 - [ ] **P3 — Qualify PTQ1 application service and rollback.** Prepare a newly
   source-bound PTQ1 service/rollback packet for the selected
   runtime. Qualify scale/count/context rejection, active interruption, independent
   fresh-owner replay, original-PQ2 rollback and final file verification under
   [application acceptance](docs/validation.md#actual-model-application-acceptance).
+  Execute the CPU/cache/reuse, power, incomplete-response and malformed-transport
+  cleanup regressions before actual-model capture; source review is not execution.
 - [ ] **P4 — Measure the PTQ1 deployment benefit.** After correctness, run matched
   complete-answer CPU PQ2/PTQ1 comparisons with the same cache, backend, workers
   and standard adapter. Verify explicit CPU readiness; retain startup, prefill,

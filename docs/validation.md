@@ -439,7 +439,7 @@ Required replay receipts, pinned external source paths, inventories and license
 records retain their identities as inert evidence, without authorizing execution.
 The [language guard](../tools/ci/check_owned_languages.ps1)
 checks executable source rather than deleting those records. Remaining migrations
-are tracked under [tooling implementation](../PLAN.md#tooling-implementation).
+are tracked under [publication and qualification prerequisites](../PLAN.md#publication-and-qualification-prerequisites).
 
 Rust uses the [exact nightly](../rust-toolchain.toml), edition 2024, checked Release
 arithmetic, warnings-as-errors and strict Clippy/rustdoc. Safe roots forbid unsafe
