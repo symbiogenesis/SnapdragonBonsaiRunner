@@ -38,6 +38,12 @@ ARM64 public declarations, packet layout and queue-call signatures. It links no
 inference library, SDK runtime or driver. Retire compilation only after independent
 retained observations and Rust assertions satisfy its owning contract.
 
+Queue observation schema 2 records every asserted size, alignment, member offset
+and constant, together with separate timed/nonblocking mock results. The verifier
+rejects omitted or changed observations; the Rust producer exposes the same
+complete layout selection. This closes the former partial-output gap. Original
+Windows C observations and owning hosted capture remain required before deletion.
+
 The public QAIC start/stop harness and its generator/Haskell/Cabal/GCC route are
 retired. The [public wire contract](hexagon-source-audit.md#public-qaic-generation-and-wire-control)
 now authenticates the original successful provider, complete retained selection,
@@ -63,14 +69,26 @@ fixtures exercise a test-only cache and do not qualify current serving graphs.
 
 Use Prism's [migration inventory](https://github.com/symbiogenesis/prism-inference/blob/main/tools/prism/upstream/migration.json)
 for the file-level provider list. The native boundary under
-`tools/prism/upstream/common/` includes `bridge.cpp`, its 39 C++ headers and coupled
+`tools/prism/upstream/common/` includes `bridge.cpp`, its 38 C++ headers and coupled
 `public_c_abi.h`/`public_c_abi.c`. Retire each route only after its numerical,
 text/API, model/session or concurrency assertions have independent replacements;
 remove the final dispatcher after every provider has migrated.
 
+Two model-free reference families now use separate Rust implementations in the
+owning reference arm. MTP derives its six original predicates from nonnegative
+capacity minus reserved anchors. Reasoning budget uses active delimiter-prefix
+positions and accepted-event ordinals, preserving all 71 source semantic
+conditions, null-vocabulary lifecycle, clone ownership, exceptional candidate bits
+and UTF-8 boundary behavior. The reasoning C++ header and both families' native
+include/dispatch/build edges are removed. Original source IDs, required reference
+green IDs, catalog and ordered geometry schedules remain intact; reports disclose
+the independent providers and do not claim native replay. Owning hosted acceptance
+and the remaining 39 C++ files stay separate gates.
+
 The [checked-in boundary verifier](../tools/ci/README.md#checked-in-native-retirement-boundary)
-now binds Runner's remaining C file and the clean read-only Prism snapshot's 40 C++
-files plus coupled C ABI source/header. Exact per-file families and declared
+now binds Runner's remaining C file and the reviewed Prism snapshot's 39 C++
+files plus coupled C ABI source/header and migrated Rust assertion/provider edges.
+Exact per-file families and declared
 compiler/provider/contracts identities preserve the green-ID baseline and both
 original ordered geometry schedules. Four focused controls, strict Release
 analysis/docs and real snapshot verification passed. The guard rejects added,
@@ -191,6 +209,13 @@ cache checks. Literal prompt, unused-head overflow/final-failure, complete cache
 observer and miniature EOS/replay controls passed with strict Rust-only Release
 analysis. These corrections supply no measured model latency or S2 verdict.
 
+The ASR CNN also preserves GGML's binary16 im2col/kernel operand boundary, including
+nearest-even ties, signed zero and subnormals. Kernels narrow once at intake and
+each stage narrows post-GELU activations before its scalar F32 dot. Finite overflow
+rejects transactionally. The candidate arithmetic identity is v2; old v1 candidate
+packets reject without reinterpreting retained observations. Independent dyadic
+and staged-convolution controls supply no native reduction-order or model verdict.
+
 Rust GGUF intake now polls the caller's original cancellation/deadline callback
 through metadata scalars, buffered strings and tensor-range finalization, before
 initial source I/O and before publishing loaded graph/tokenizer state. The focused
@@ -254,6 +279,15 @@ decision/code/conditioning and PCM event through a fixed 16 KiB buffer. Complete
 and terminal EOF are checked inside synthesis cleanup ownership; only successful
 engine return grants success. Literal miniature controls and independent review
 cover the comparator, without supplying original native observations.
+
+The explicit [prebuilt TTS replay consumer](../src/speech-tts/README.md#prebuilt-consumer)
+verifies its executing image, compiled Q8/Q4 model pins, original UTF-8 inputs and
+complete packet identities/headers before loading. Ordered cold, repeated, edited
+and changed-voice cases share one synthesizer and inherited absolute owner deadline.
+Failures leave later cases unattempted, and candidate-case/entry/exit power stays
+separate from reference-arm and aggregate observations. It opens no audio device
+and supplies no missing independent packets or S1 acceptance. Ordinary Rust TTS
+builds no longer invoke an empty build script.
 
 TTS's provider-neutral `CaptureWriter` writes the same bounded replay format
 from borrowed original prompts, logits, all-layer caches, decisions, codes,

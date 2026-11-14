@@ -448,7 +448,7 @@ adoption decisions without displacing native daily-use acceptance.
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
   codec/ABI, state and fallback obligations with independent controls, then remove
   compiler/provisioning/build paths. Prism needs complete independent observation
-  provider coverage before its 40 active C++ files can be removed; retain every approved
+  provider coverage for its 39 remaining C++ files; retain every approved
   green ID, all 22,817 ordered backend geometries and separate performance work.
   Retain required replay data and qualify owning hosted builds without a project
   C++ toolchain. Capture original selected compiled/preprocessed/generated inputs

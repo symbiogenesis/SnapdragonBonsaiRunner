@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "prism",
-  "sourceRevision": "d30bcfec3c5ca8f57814aad428979a2abe258e57",
+  "sourceRevision": "4f8ec12f09875c258681dde90fc20f869f492807",
   "exclusions": [
     {
       "path": ".git",
@@ -266,7 +266,7 @@
     {
       "id": "common-reasoning-budget",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/reasoning_budget.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve all 71 original reasoning-budget semantic conditions, null-vocabulary lifecycle, exceptional candidate bits, clone ownership and UTF-8 boundary assertions using the independently implemented active-prefix/event-ordinal Rust reference. The C++ header/include/dispatch/CMake edge is retired; owning hosted acceptance and whole-repository native retirement remain separate."
       ],
       "retirementQualified": false
     },
@@ -379,8 +379,8 @@
     },
     {
       "path": "tools/prism/upstream/common/bridge.cpp",
-      "bytes": 16014,
-      "sha256": "2be9cfe360910be92c0260013932bfdb8ff379f6ab5837bcdaaee98e65cef689",
+      "bytes": 15323,
+      "sha256": "c3b7268a71598461b32fdd9ff2a6da7e64c68ceaa602fa3a7bf5a287a46e4b0a",
       "family": "common-bridge"
     },
     {
@@ -546,12 +546,6 @@
       "family": "common-quantization"
     },
     {
-      "path": "tools/prism/upstream/common/reasoning_budget.hpp",
-      "bytes": 10887,
-      "sha256": "2a13d475165a9c866f22bdd0763cdcaaee0034510bc36b51798ba9c4ec7a25d5",
-      "family": "common-reasoning-budget"
-    },
-    {
       "path": "tools/prism/upstream/common/sampling.hpp",
       "bytes": 15586,
       "sha256": "4c577b442710ac605598000ab234fb4e9224db941ca84d59537bd9218e3241d5",
@@ -586,13 +580,13 @@
     {
       "path": "Cargo.lock",
       "bytes": 54992,
-      "sha256": "2e9f8ff3ab2c0a8848194cce61bad8f62caf9633aac28ec87672c03830764f8d",
+      "sha256": "d7ef72d1bad3d3b5f5afebc00d4417fe5ee5eeb8f461b98730fb9791fd2df85b",
       "family": "external-native"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 5626,
-      "sha256": "39a28e9b7a2f883be0084af6c3afe2ca545c7e9253c210330e6f1a9a0e0dc986",
+      "bytes": 5730,
+      "sha256": "8d8009b88dc135dc4b632ddf2b6808446e075784cd312800beac7806879379e0",
       "family": "external-native"
     },
     {
@@ -630,6 +624,48 @@
       "bytes": 3301844,
       "sha256": "bb1264b48ee43841949ef350a84bd2731a0656e9c4cd565c1afcecbfd75633a6",
       "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/common.rs",
+      "bytes": 7202,
+      "sha256": "9d71e2ca284daac46c8880f1e9b82d56644d1f601b939ce20796cdd75ecde295",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/engine.rs",
+      "bytes": 21780,
+      "sha256": "5385d75bd3e1f2adc6f68c2a968a37b28a0a2eebd34ea6f7f7b27d451a63369f",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/harness.rs",
+      "bytes": 29784,
+      "sha256": "67fefe7c89c48705d019623de497ffa783386ccd25c66e92ba679cbee3d90ce0",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reasoning-budget-cases.json",
+      "bytes": 4098,
+      "sha256": "c5d4d241e022d504ae9c2162014267c9a0da538cc88add1992888617953562fb",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reasoning_budget.rs",
+      "bytes": 32707,
+      "sha256": "a6728070bf1f1112680dce036f078bcdce3a8263f62fef93f0c0a7d54f8d5aff",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reference_provider.rs",
+      "bytes": 7668,
+      "sha256": "61a839d3e437d03f9648e345b127470c09f86cc69b923010cfd3fe94ff0b9d75",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reference_reasoning.rs",
+      "bytes": 17372,
+      "sha256": "f663363492fe31af05fa76f4e68dbc484449b21eee4ccbc555c480350fa783be",
+      "family": "common-reasoning-budget"
     },
     {
       "path": "tools/codec-probe/Cargo.toml",
@@ -711,8 +747,8 @@
     },
     {
       "path": "tools/prism/upstream/common/CMakeLists.txt",
-      "bytes": 5198,
-      "sha256": "b8adecdccdfde5b86c296e29c5690e63f9d2662c4dba0dec0d9a521fbbdb5eed",
+      "bytes": 5177,
+      "sha256": "4660d1ff53fd04d3d8d90b8492046829fc300c1dcbb64efdcd14e19e03bc843e",
       "family": "native-build"
     },
     {
@@ -723,8 +759,8 @@
     },
     {
       "path": "tools/prism/upstream/migration.json",
-      "bytes": 43390,
-      "sha256": "bd5ec6f529d6ba1504e13f3525850514d66c276ee3a23b2304e155d904dfcd14",
+      "bytes": 43498,
+      "sha256": "98a4396b6c537ad0edca656224312590b9d030c2e48d192ebc375aa16570734f",
       "family": "upstream-contracts"
     },
     {

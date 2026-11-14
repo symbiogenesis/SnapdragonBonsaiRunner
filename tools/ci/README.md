@@ -364,21 +364,22 @@ bonsai-ci native-boundary-verify --root $snapshotRoot --manifest $manifest --exp
 ```
 
 Use `native-boundary.prism.json` with the independently retained Prism checkout
-as `--root`. The Runner baseline is source revision
-`2c8f57b99234c07c474442fb1cedfac3677dfd46`; the clean read-only Prism baseline is
-`d30bcfec3c5ca8f57814aad428979a2abe258e57`. The command verifies exact file bytes,
+as `--root`. Each manifest's `sourceRevision` identifies its reviewed source
+snapshot. The command verifies exact file bytes,
 not Git branch/HEAD provenance: `gitRevisionVerified` stays false. Bind the
 reviewed manifest digest and original source revision independently; computing a
 new digest from changed bytes is not inventory acceptance.
 
 Here `$snapshotRoot` supplies the manifest's exact reviewed input bytes. Runner's
 manifest now follows the remaining queue C control and native Rust replay/build
-edges after public-wire retirement; Prism's manifest retains its read-only source
-snapshot. The verifier checks bytes rather than Git revision provenance. Inventory
+edges after public-wire retirement; Prism's manifest follows the reviewed
+reasoning-budget/MTP reference retirement, including the independent Rust provider
+and complete source assertions. The verifier checks bytes rather than Git revision
+provenance. Inventory
 acceptance supplies no native-model or hosted compiler verdict.
 
 The manifests enumerate Runner's remaining Windows queue ABI C control and
-Prism's 40 C++ files plus its coupled C ABI source/header. Each file belongs to an
+Prism's 39 C++ files plus its coupled C ABI source/header. Each file belongs to an
 explicit replacement family.
 Additional identities bind operative compiler/provisioning/dispatcher/cache/
 packaging paths and immutable catalog, migration, required-green-ID and complete
