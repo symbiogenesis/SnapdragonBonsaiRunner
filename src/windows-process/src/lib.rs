@@ -1033,7 +1033,8 @@ impl OwnedProcess {
     ///
     /// # Errors
     /// Returns invalid zero timeouts, Windows failures, or `TimedOut` if active
-    /// processes remain after the deadline. Dropping still closes the Job.
+    /// processes remain after the deadline. Dropping still closes the Job and
+    /// native containment without renewing an explicitly attempted stop's wait.
     pub fn stop(&self, timeout: Duration) -> io::Result<()> {
         self.0.stop(timeout)
     }

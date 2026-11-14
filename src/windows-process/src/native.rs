@@ -62,6 +62,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::{ProcessMemory, ProcessSpec, SandboxNetwork, SandboxPolicy, ToolProcessSpec, invalid};
 
 pub(super) mod caller;
+mod cleanup;
 mod containment;
 mod cpu;
 pub(super) mod devices;
@@ -297,6 +298,7 @@ pub(super) struct NativeProcess {
     id: u32,
     // Drop after the Job and retained root: containment outlives the worker.
     containment: Option<containment::Environment>,
+    stop_attempt: cleanup::StopAttempt,
 }
 
 impl NativeProcess {
@@ -517,6 +519,7 @@ impl NativeProcess {
             process,
             id: info.dwProcessId,
             containment,
+            stop_attempt: cleanup::StopAttempt::default(),
         })
     }
 
@@ -570,9 +573,10 @@ impl NativeProcess {
     }
 
     pub(super) fn stop(&self, timeout: Duration) -> io::Result<()> {
-        if timeout.is_zero() {
-            return Err(invalid("cleanup timeout must be positive"));
-        }
+        self.stop_attempt.run(timeout, || self.stop_within(timeout))
+    }
+
+    fn stop_within(&self, timeout: Duration) -> io::Result<()> {
         let start = Instant::now();
         // Retain synchronization handles before termination: Windows removes a
         // member from Job accounting shortly before signaling its process handle.
@@ -855,7 +859,10 @@ impl Drop for NativeProcess {
             // Retain PSEC while requesting complete tree termination and waiting
             // for the exact root. Closing the Job remains the final kill guard
             // even when a native query/wait fails during best-effort Drop.
-            let _ = self.stop(Duration::from_secs(10));
+            // An explicit attempt has already spent its caller's allowance,
+            // whether it succeeded or failed. Never renew that wait in Drop.
+            self.stop_attempt
+                .on_drop(|| self.stop(Duration::from_secs(10)));
         }
     }
 }
