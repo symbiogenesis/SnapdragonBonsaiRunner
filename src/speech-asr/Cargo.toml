@@ -15,7 +15,7 @@ default = ["native-engine"]
 # Production remains on the independently retained native control engine.
 native-engine = ["dep:bonsai-speech-service", "dep:fearless_simd", "dep:serde_json", "dep:transcribe-cpp"]
 # Explicit qualification binary; never selected by application provisioning.
-rust-qualification = ["dep:bonsai-speech-service", "dep:serde_json"]
+rust-qualification = ["dep:bonsai-artifacts", "dep:bonsai-cpu-policy", "dep:bonsai-speech-service", "dep:bonsai-windows-process", "dep:serde", "dep:serde_json"]
 
 [[bin]]
 name = "bonsai-speech-asr"
@@ -27,12 +27,23 @@ name = "bonsai-asr-rust-qualification"
 path = "src/rust_main.rs"
 required-features = ["rust-qualification"]
 
+[[bin]]
+name = "bonsai-asr-replay"
+path = "src/replay_main.rs"
+required-features = ["rust-qualification"]
+
 [dependencies]
+bonsai-artifacts = { workspace = true, optional = true }
+bonsai-cpu-policy = { workspace = true, optional = true }
 bonsai-speech-service = { workspace = true, optional = true }
 fearless_simd = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 sha2.workspace = true
 transcribe-cpp = { version = "=0.4.1", default-features = false, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+bonsai-windows-process = { workspace = true, optional = true }
 
 [lints]
 workspace = true

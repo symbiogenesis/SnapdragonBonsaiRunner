@@ -564,8 +564,12 @@ dependencies = [
 name = "bonsai-speech-asr"
 version = "0.3.2"
 dependencies = [
+ "bonsai-artifacts",
+ "bonsai-cpu-policy",
  "bonsai-speech-service",
+ "bonsai-windows-process",
  "fearless_simd 1.2.0",
+ "serde",
  "serde_json",
  "sha2",
  "transcribe-cpp",

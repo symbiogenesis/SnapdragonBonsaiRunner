@@ -283,6 +283,94 @@ They establish streaming comparison behavior; they provide no full-model or
 native-engine observation. Independent complete
 native captures and owning hosted/model/device qualification remain pending.
 
+### Prebuilt independent replay consumer
+
+`bonsai-asr-replay` is an explicit Rust-only consumer of one retained complete
+`ASRREPL1` packet. Build it before any owner-device allowance begins:
+
+```powershell
+cargo build --locked --package bonsai-speech-asr --no-default-features --features rust-qualification --bin bonsai-asr-replay --release --target aarch64-pc-windows-msvc
+```
+
+The prebuilt executable accepts exactly `--request <absolute-json-path> --sha256
+<reviewed-request-sha256>`. Its single JSON report goes to standard output on
+success, refusal, numerical failure or caught unwind. Capture that report within
+the original allowance and preserve failed/no-go results. A report write failure
+returns failure; an absent report establishes no verdict. The request is bounded
+to 64 KiB, rejects duplicate/unknown fields and has this schema (the strings below
+describe required reviewed values, rather than supplying replay evidence):
+
+```json
+{
+  "schemaVersion": 1,
+  "reference": {
+    "revision": "40 lowercase hexadecimal Git revision characters",
+    "compiler": "exact independent compiler identity",
+    "target": "exact independent target",
+    "executableSha256": "64 lowercase hexadecimal digest characters",
+    "arithmetic": "reviewed independent provider arithmetic identity"
+  },
+  "candidate": {
+    "revision": "40 lowercase hexadecimal reviewed Runner revision characters",
+    "compiler": "exact candidate compiler identity",
+    "target": "aarch64-pc-windows-msvc",
+    "executableSha256": "64 lowercase hexadecimal digest characters for this replay executable",
+    "arithmetic": "rust-asr-scalar-f32-v1-f16-kv-f64-erfc-gelu"
+  },
+  "model": "C:\\Models\\Qwen3-ASR-1.7B-Q8_0.gguf",
+  "pcm": { "path": "C:\\Replay\\original.f32le", "bytes": 804, "sha256": "reviewed digest" },
+  "packet": { "path": "C:\\Replay\\original.asrrepl", "bytes": 1, "sha256": "reviewed digest" },
+  "tolerances": {
+    "frontend": { "kind": "bits" },
+    "encoder": { "kind": "finite", "absolute": 0.0, "relative": 0.0 },
+    "logits": { "kind": "bits" },
+    "cache": { "kind": "bits" }
+  },
+  "ownerStartedTick": 1,
+  "workDeadlineTick": 2,
+  "clockFrequency": 1,
+  "fixedWork": "Describe the one selected PCM replay, verification, loading and cleanup.",
+  "estimatedSeconds": 240
+}
+```
+
+Supply the original owner's Windows performance-counter start, frequency and
+absolute work deadline. This consumer admits only the ordinary five-minute
+owner workload: work ends at most 270 seconds after that original start, leaving
+at least thirty seconds for the owner's forced cleanup, report retention and
+aggregate power observations. The conservative estimate must be 1 through 240
+seconds and fit the *remaining* work allowance at intake. Setup is charged to the
+same start; the consumer cannot renew it. The estimate and fixed work must be
+reviewed before starting. An external Rust process owner must enforce that
+original lifetime because synchronous OS file/output I/O cannot be preempted by
+cooperative checks. The executable neither compiles helpers nor retries work.
+
+The consumer verifies its actual executing image, the compiled model lock's
+complete pinned bytes, the original raw mono 16 kHz f32 little-endian PCM, and
+the entire retained packet with immutable file/ancestor guards. It bounds PCM
+to 201 through 480,000 samples and the retained packet to 16 GiB. The packet's
+source/compiler/target/arithmetic/model/PCM/tolerance header must match the
+reviewed request before Rust model loading begins. All stage, generation and
+complete-cache comparisons and terminal/EOF validation then use `Replay`.
+Reference arithmetic must differ from this Rust scalar provider and reference
+and candidate image digests must differ. Those checks prevent obvious
+self-comparison; they cannot authenticate source independence or compiler
+provenance. The owner still authenticates both reviewed builds and original
+reference observations. No native packet is generated or substituted.
+
+The report retains the request digest, phase, value-free failure kind and
+entry/exit AC, battery-saver and charge snapshots, preserving unavailable values
+as unknown. It records a successful transcript by length and digest, without
+duplicating text. Its power scope covers only this consumer; aggregate setup,
+reference-arm and post-retention power remain the owner's separate observations.
+Equal endpoints do not prove continuous stability. Performance eligibility,
+production qualification and native retirement stay false. Retain the reviewed
+request plus original packet/PCM and their integrity records for independent
+replay; one summary or hashes alone cannot replace those inputs. Three focused
+`rust_asr_consumer_` controls cover request identity/shape, inherited deadline/
+estimate admission and literal PCM bit/boundary handling. They load no model and
+supply no independent native or full-model acceptance.
+
 ### Original observation packet writer
 
 `replay::CaptureWriter` writes the same `ASRREPL1` format from provider-neutral
