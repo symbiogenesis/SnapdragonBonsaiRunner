@@ -103,6 +103,10 @@ try {
             if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery failed; checker receipt remains invalid.' }
         }
         @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
+        if (-not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
+            [IO.File]::Delete($receiptPath)
+            throw 'Push blocked: rebuilt checker did not pass receipt verification.'
+        }
     }
     if ($Prepare) {
         'Prepared the committed native checker and recovery supervisor; this is not an outgoing-tip validation verdict.'

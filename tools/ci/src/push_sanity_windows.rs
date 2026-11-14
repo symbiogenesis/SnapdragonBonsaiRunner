@@ -558,6 +558,26 @@ mod tests {
     }
 
     #[test]
+    fn push_sanity_collection_checker_source_recovers_from_committed_source() -> Result<()> {
+        preparation_case("collection_checker_source_recovers_from_committed_source")
+    }
+
+    #[test]
+    fn push_sanity_collection_checker_digest_recovers_from_committed_source() -> Result<()> {
+        preparation_case("collection_checker_digest_recovers_from_committed_source")
+    }
+
+    #[test]
+    fn push_sanity_collection_recovery_source_blocks_recovery() -> Result<()> {
+        preparation_case("collection_recovery_source_blocks_recovery")
+    }
+
+    #[test]
+    fn push_sanity_collection_recovery_digest_blocks_recovery() -> Result<()> {
+        preparation_case("collection_recovery_digest_blocks_recovery")
+    }
+
+    #[test]
     fn push_sanity_script_batch_preserves_scopes_and_rejections() -> Result<()> {
         let temporary = super::super::canonical_path(std::env::temp_dir())?;
         let nonce = SystemTime::now()
