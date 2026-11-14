@@ -43,7 +43,10 @@ function Invoke-IncrementalFixture([string]$Incremental, [string]$Release = 'fal
         Assert-Ci ($null -ne $script:observation) 'The selected checks never reached the native executor.'
         return $script:observation
     } finally {
-        foreach ($name in $original.Keys) { [Environment]::SetEnvironmentVariable($name, $original[$name]) }
+        foreach ($name in $original.Keys) {
+            $value = if ($null -eq $original[$name]) { [NullString]::Value } else { $original[$name] }
+            [Environment]::SetEnvironmentVariable($name, $value)
+        }
         Remove-CiScratch $scratch
     }
 }
