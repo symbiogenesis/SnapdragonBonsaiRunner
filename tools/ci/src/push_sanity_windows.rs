@@ -52,7 +52,7 @@ impl Work {
             fs::write(
                 &batch,
                 format!(
-                    "@echo off\r\nchcp 65001 >nul\r\n{}\r\nexit /b %errorlevel%\r\n",
+                    "@echo off\r\nchcp 65001 >nul\r\nset \"ERRORLEVEL=\"\r\n{}\r\nexit /b %errorlevel%\r\n",
                     words.join(" ")
                 ),
             )
@@ -120,6 +120,12 @@ impl Work {
             .stop(Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
         drop(child);
+        if [&stdout, &stderr]
+            .into_iter()
+            .any(|path| fs::metadata(path).is_ok_and(|metadata| metadata.len() > 4 * 1024 * 1024))
+        {
+            return Err("Push command output exceeded its final byte bound; push blocked.".into());
+        }
         let output = fs::read(&stdout).map_err(|error| error.to_string())?;
         if code != 0 {
             let mut detail = output;
@@ -241,7 +247,8 @@ impl Work {
             self.script(source, root, "check_workflow_syntax.ps1", &arguments)?;
         }
         // Execute only named, model-free controls for the failure-producing adapters.
-        // Fixtures read adjacent manifests, so use the immutable snapshot's script.
+        // Fixtures verify the committed checking policy. Historical outgoing tips
+        // need not contain fixture names introduced by a later checking policy.
         for (selected, script, cases) in [
             (
                 plan.cache_fixture,
@@ -259,7 +266,7 @@ impl Work {
         ] {
             if selected {
                 for case in cases {
-                    self.script(source, source, script, &["-Case".into(), (*case).into()])?;
+                    self.script(source, root, script, &["-Case".into(), (*case).into()])?;
                 }
             }
         }
