@@ -33,10 +33,20 @@ missing captures/assertions remain pending or rejected.
 
 ## Runner checked-in native files
 
-`tools/hexagon/public_qaic_wire.c` and `windows_queue_abi.c` are hosted C controls
-for pinned public declarations and generated wire/ABI observations. They link no
+`tools/hexagon/windows_queue_abi.c` remains the hosted C control for pinned Windows
+ARM64 public declarations, packet layout and queue-call signatures. It links no
 inference library, SDK runtime or driver. Retire compilation only after independent
-retained observations and Rust assertions satisfy their owning contracts.
+retained observations and Rust assertions satisfy its owning contract.
+
+The public QAIC start/stop harness and its generator/Haskell/Cabal/GCC route are
+retired. The [public wire contract](hexagon-source-audit.md#public-qaic-generation-and-wire-control)
+now authenticates the original successful provider, complete retained selection,
+generated/public inputs and original C/Rust outputs before comparing fresh Rust
+encoding and literal assertions. Original harness/provider source remains inert
+replay data with exact historical identities. Retired generation requests fail
+before intake. This closes the fixed Linux LP64 vector's source/build dependency;
+it supplies no fresh Windows C ABI observation, SDK equivalence or device verdict.
+Owning hosted acceptance of the replay migration remains pending.
 
 Speech's licensed Philox, sampling, tokenizer and lifetime observations live in
 `src/speech-tts/tests/fixtures/`. Keep their provenance, replay inputs and independent
@@ -59,7 +69,7 @@ text/API, model/session or concurrency assertions have independent replacements;
 remove the final dispatcher after every provider has migrated.
 
 The [checked-in boundary verifier](../tools/ci/README.md#checked-in-native-retirement-boundary)
-now binds Runner's two C files and the clean read-only Prism snapshot's 40 C++
+now binds Runner's remaining C file and the clean read-only Prism snapshot's 40 C++
 files plus coupled C ABI source/header. Exact per-file families and declared
 compiler/provider/contracts identities preserve the green-ID baseline and both
 original ordered geometry schedules. Four focused controls, strict Release
@@ -180,6 +190,15 @@ positions retain their block, final-normalization, cancellation and transactiona
 cache checks. Literal prompt, unused-head overflow/final-failure, complete cache,
 observer and miniature EOS/replay controls passed with strict Rust-only Release
 analysis. These corrections supply no measured model latency or S2 verdict.
+
+Rust GGUF intake now polls the caller's original cancellation/deadline callback
+through metadata scalars, buffered strings and tensor-range finalization, before
+initial source I/O and before publishing loaded graph/tokenizer state. The focused
+pre-cancelled and buffered-metadata controls preserve interruption and fresh intake;
+the omitted-unit-axis projection/convolution controls remain passing. Rust-only
+strict native Release analysis covers the qualification binaries. Blocking OS I/O
+still needs the external owner's original deadline and process supervision; these
+checks supply no actual-model cancellation or S2 acceptance.
 
 The [ASR replay comparator](../src/speech-asr/README.md#streaming-independent-replay)
 now binds reviewed reference/candidate source/compiler/target/executable,
@@ -370,10 +389,15 @@ Schema 2 of the retained [link/package verifier](../tools/bonsai/README.md#selec
 additionally inspects actual ARM64 COFF objects and MSVC archive members for a
 bounded known C++ exception-symbol family, including short-import targets.
 Schema 3 also observes named normal/delay imports in each exact linked/package
-image and reports unresolved ordinal imports separately. Historical replay is
-preserved. Observations do not establish which archive members reached the
+image and reports unresolved ordinal imports separately. Schema 4 additionally
+resolves original named/ordinal imports through digest-bound retained package or
+dependency images, including bounded named/ordinal forwarder chains and all export
+aliases. Missing, cyclic, malformed and API-set routes reject; no loader search or
+host DLL substitution supplies a missing provider. Historical replay is preserved.
+These observations do not establish which archive members reached the
 shipped image, complete runtime/source ancestry, or absence of embedded C++.
 `cppRuntimeAbsenceQualified` and `nativeRetirementQualified` remain false;
 compiler/sysroot provider replacement and recovery acceptance are still required.
-Literal link/parser controls and strict native ARM64 Release all-target analysis
-cover the supported subset; no actual toolchain/runtime artifact was inspected.
+Literal link/parser controls cover the supported subset; no actual
+toolchain/runtime artifact was inspected. Recursive dependency imports, API-set
+routing and provider implementation language remain unqualified.

@@ -433,10 +433,11 @@ adoption decisions without displacing native daily-use acceptance.
   Supply a reviewed upstream numerical observation ABI and capture every generation
   step's raw logits and complete all-layer committed KV through the bounded packet
   writer; current debug output and device argmax cannot populate the complete
-  independent replay. Include omitted-unit-axis loading controls.
+  independent replay.
   Qualify the prebuilt source-bound replay consumer with actual independent
   packets, matching provider identities and the original owner clock/power scope.
-- [ ] Retire remaining Runner/Prism native/reference/DLL/publisher families
+- [ ] Retire the remaining Windows queue ABI, ASR, Prism reference and publisher
+  native/DLL families
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
   codec/ABI, state and fallback obligations with independent controls, then remove
   compiler/provisioning/build paths. Prism needs complete independent observation
@@ -459,9 +460,9 @@ adoption decisions without displacing native daily-use acceptance.
   with a qualified Rust provider while preserving preparation-peer recovery,
   worker draining and scoped cleanup. Static CRT linkage alone does not retire
   the embedded C++ exception runtime; a blanket abort profile changes recovery.
-  Qualify schema-3 COFF and exact-image PE runtime-symbol observations on actual
-  retained link/package inputs; resolve applicable ordinal/forwarder boundaries
-  separately from provider replacement, selected library members and source ancestry.
+  Qualify schema-4 COFF, exact-image PE runtime-symbol and retained ordinal/forwarder
+  observations on actual link/package inputs. Keep provider replacement, selected
+  library members and source ancestry separate from those observations.
 
 ## Creative quality, adapters and memory
 
