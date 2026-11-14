@@ -64,6 +64,7 @@ pub const COMMANDS: &[&str] = &[
     "release-tool",
     "native-reference",
     "acceptance-driver",
+    "ci-report",
 ];
 
 /// Returns the native maintenance protocol capabilities without reading a request.
@@ -231,6 +232,9 @@ pub mod provision;
 
 /// Model-free native host, driver and bounded tool inventory.
 pub mod doctor;
+
+/// Pure hosted capability, admission, runtime and fixed-work receipt gates.
+pub mod ci_report;
 
 mod bounded_input;
 mod https_transfer;

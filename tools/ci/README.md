@@ -70,6 +70,13 @@ per-test limits or change test selection and concurrency.
 Repository tooling and CI need Rust and PowerShell 7.6 or newer. They do not
 install or invoke a Python runtime. Standalone PowerShell startup/index/cache
 guards run before any Rust bootstrap, using .NET APIs without downloaded modules.
+
+After native bootstrap, `bonsai-tools ci-report` owns the hosted Foundation
+capability, admission-only, Swift/adapter/PTQ1 memory and runtime-server report
+gates, plus native PTQ1 capture-mode/work-count admission. The command validates
+exact typed fields without reading the host, launching a model or granting
+qualification, and returns the original report. Workflow blocks compose and
+forward the corresponding request; native fixtures own the domain assertions.
 The source-language guard rejects owned Python files, bytecode, Python workflow
 shells/setup and literal interpreter commands. PowerShell's native parser checks
 direct calls and `Start-Process`, including quoted paths and case variants, while

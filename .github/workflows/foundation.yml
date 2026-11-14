@@ -294,11 +294,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $data = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-Inference'
           $inference = & $env:BONSAI_TOOLS_PATH provision --json (@{ operation = 'inference'; dataDirectory = $data; includeCapabilities = $true } | ConvertTo-Json -Compress) | ConvertFrom-Json
-          if ($inference.CapabilityVerification.Status -cne 'verified' -or
-              $inference.Capabilities.qualification -cne 'unqualified' -or
-              $inference.Capabilities.runtime.target.architecture -cne 'aarch64') {
-            throw 'Invalid verified released-runtime capability report.'
-          }
+          @{ operation = 'runtime-capabilities'; report = $inference } | ConvertTo-Json -Depth 64 -Compress | & $env:BONSAI_TOOLS_PATH ci-report --request - | Out-Null
           $evidence = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-GgufChecks'
           "BONSAI_GGUF_EVIDENCE=$evidence" >> $env:GITHUB_ENV
           $request = Join-Path $env:RUNNER_TEMP 'gguf-check-request.json'
@@ -321,7 +317,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $result = & $env:BONSAI_TOOLS_PATH cpu-check --json (@{ dataDirectory = (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-Runtime'); checkOnly = $true } | ConvertTo-Json -Compress) | ConvertFrom-Json
-          if ($result.ModelProcessStarted -or $result.AvailablePhysicalBytesAtAdmission -le 0) { throw 'Invalid admission-only result.' }
+          @{ operation = 'admission-only'; report = $result } | ConvertTo-Json -Depth 64 -Compress | & $env:BONSAI_TOOLS_PATH ci-report --request - | Out-Null
           $result | ConvertTo-Json
   release-integration:
     if: needs.changes.outputs.release == 'true'
@@ -346,14 +342,13 @@ jobs:
           & $env:BONSAI_TOOLS_PATH provision --json (@{ operation = 'adapter'; dataDirectory = $data } | ConvertTo-Json -Compress)
           & $env:BONSAI_TOOLS_PATH provision --json (@{ operation = 'adapter'; dataDirectory = $data; verifyOnly = $true } | ConvertTo-Json -Compress)
           $result = & $env:BONSAI_TOOLS_PATH cpu-check --json (@{ dataDirectory = $data; profile = 'swift-pq2-assessment'; checkOnly = $true } | ConvertTo-Json -Compress) | ConvertFrom-Json
-          if ($result.ModelProcessStarted -or $result.RequiredAvailableBytes -ne 16642998272 -or
-              $result.ServiceCeilingBytes -ne 12348030976 -or $result.AvailableMemoryFloorBytes -ne 4GB) { throw 'Invalid Swift admission-only result.' }
+          @{ operation = 'swift-admission'; report = $result } | ConvertTo-Json -Depth 64 -Compress | & $env:BONSAI_TOOLS_PATH ci-report --request - | Out-Null
           $result | ConvertTo-Json
           $adapterCheck = & $env:BONSAI_TOOLS_PATH cpu-check --json (@{ dataDirectory = $data; profile = 'swift-pq2-assessment'; useAbliterateLora = $true; checkOnly = $true } | ConvertTo-Json -Compress) | ConvertFrom-Json
-          if ($adapterCheck.ModelProcessStarted -or -not $adapterCheck.AdapterRequested -or $adapterCheck.EstimatedAdapterBytes -ne 9682464) { throw 'Invalid explicit adapter admission-only result.' }
+          @{ operation = 'adapter-admission'; report = $adapterCheck } | ConvertTo-Json -Depth 64 -Compress | & $env:BONSAI_TOOLS_PATH ci-report --request - | Out-Null
           $adapterCheck | ConvertTo-Json
           $ptqCheck = & $env:BONSAI_TOOLS_PATH cpu-check --json (@{ dataDirectory = $data; profile = 'swift-pq2-assessment'; useRepackedPtq1 = $true; checkOnly = $true } | ConvertTo-Json -Compress) | ConvertFrom-Json
-          if ($ptqCheck.ModelProcessStarted -or $ptqCheck.EstimatedWeightBytes -ne 5946648928 -or $ptqCheck.WeightRepresentation -cne 'current-repacked-PTQ1_0') { throw 'Invalid derived PTQ1 admission-only result.' }
+          @{ operation = 'ptq1-admission'; report = $ptqCheck } | ConvertTo-Json -Depth 64 -Compress | & $env:BONSAI_TOOLS_PATH ci-report --request - | Out-Null
       - name: Verify publisher ARM64 runtime and planned server switches
         shell: pwsh
         run: |
@@ -363,7 +358,5 @@ jobs:
           $data = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-Runtime'
           & $env:BONSAI_TOOLS_PATH provision --json (@{ operation = 'engine'; dataDirectory = $data } | ConvertTo-Json -Compress)
           $plan = & $env:BONSAI_TOOLS_PATH server-plan --json (@{ dataDirectory = $data; verification = 'runtime' } | ConvertTo-Json -Compress) | ConvertFrom-Json
-          if ($plan.LaunchEnabled -or $plan.ModelProcessStarted -or
-              $plan.RuntimeHelpVerification -notlike 'all-planned-switches-advertised*' -or
-              $plan.ArtifactVerification -notlike '*model-not-checked') { throw 'Invalid runtime-only preflight result.' }
+          @{ operation = 'runtime-server-plan'; report = $plan } | ConvertTo-Json -Depth 64 -Compress | & $env:BONSAI_TOOLS_PATH ci-report --request - | Out-Null
           $plan | Select-Object Status, ArtifactVerification, RuntimeHelpVerification | ConvertTo-Json

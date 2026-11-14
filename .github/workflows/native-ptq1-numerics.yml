@@ -68,8 +68,7 @@ jobs:
             repositoryDirectory=$env:GITHUB_WORKSPACE; rustBackend=$env:BONSAI_PTQ1_RUST_BACKEND
             rowWorkers=[int]$env:BONSAI_PTQ1_ROW_WORKERS; adapterCondition=$env:BONSAI_PTQ1_ADAPTER_CONDITION
           } | ConvertTo-Json -Compress) | ConvertFrom-Json
-          if ($plan.CaptureMode -cne $env:BONSAI_PTQ1_CAPTURE_MODE -or $plan.ModelProcessStarted -or $plan.DefaultMayChange) { throw 'Capture mode planning failed closed.' }
-          if ($env:BONSAI_PTQ1_CAPTURE_MODE -ceq 'request-timing' -and ($plan.NativeSamples -ne 0 -or $plan.RustSamples -ne 1 -or $plan.OutputTokens -ne 1)) { throw 'Request timing must select one bounded Rust source-session request only.' }
+          @{ operation = 'capture-plan'; report = $plan; expectedCaptureMode = $env:BONSAI_PTQ1_CAPTURE_MODE } | ConvertTo-Json -Depth 64 -Compress | & $env:BONSAI_TOOLS_PATH ci-report --request - | Out-Null
       - name: Validate fixed native-state decoding and control binding
         shell: pwsh
         run: >-

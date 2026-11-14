@@ -197,6 +197,7 @@ fn dispatch(command: &str, request: serde_json::Value) -> bonsai_tools::Result<s
         "native-reference" => bonsai_tools::native_reference::run(&request),
         "acceptance-driver" => bonsai_tools::acceptance_driver::run(&request),
         "release-package" => bonsai_tools::release_package::run(request),
+        "ci-report" => bonsai_tools::ci_report::run(request),
         "startup-diagnostics" => bonsai_tools::startup_diagnostics::run(request),
         _ => Err("Unknown maintenance command.".into()),
     }
