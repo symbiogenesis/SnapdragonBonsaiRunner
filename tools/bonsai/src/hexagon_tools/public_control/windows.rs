@@ -101,21 +101,17 @@ fn compiler(control: &mut Control, report: &mut Value) -> Result<PathBuf> {
     report["compiler"] = json!({"selectedFiles":selected,"toolsVersion":tool_version,"windowsSdkVersion":sdk_version,"target":"aarch64-pc-windows-msvc","scope":"selected native compiler/linker components; not-complete-OS-closure"});
     Ok(compiler)
 }
-fn inputs(control: &Control, pin: &Value, report: &mut Value) -> Result<PathBuf> {
-    let inputs = control.output.join("inputs");
-    let retained = control.review.join("inputs");
-    directory(&inputs)?;
-    directory(&retained)?;
-    let mut entries = Vec::new();
-    for input in list(pin, "publicInputs")? {
-        entries.push(control.receive(input, &inputs, 1_048_576)?);
-        let name = string(input, "name")?;
-        copy(&inputs.join(name), &retained.join(format!("{name}.txt")))?;
-    }
-    let public = json_file(&control.source("public-qaic.lock.json"), 1_048_576)?;
-    let archive = control
-        .root
-        .join("docs/evidence/hexagon-public-qaic-41_171_859_264");
+const REVIEWED_ARCHIVE: &str = "docs/evidence/hexagon-public-qaic-41171859264";
+
+struct ReviewedSource {
+    path: PathBuf,
+    name: String,
+    identity: Value,
+}
+
+fn reviewed_sources(root: &Path, public: &Value) -> Result<Vec<ReviewedSource>> {
+    let archive = root.join(REVIEWED_ARCHIVE);
+    let mut sources = Vec::new();
     for (field, subdirectory) in [
         ("headers", "wire-public-inputs"),
         ("reviewedGeneratedFiles", "generated-public-source"),
@@ -126,20 +122,47 @@ fn inputs(control: &Control, pin: &Value, report: &mut Value) -> Result<PathBuf>
                 continue;
             }
             let source = archive.join(subdirectory).join(format!("{name}.txt"));
-            let mut item = pinned(&source, input)?;
-            copy(&source, &inputs.join(name))?;
-            copy(&source, &retained.join(format!("{name}.txt")))?;
+            let mut item = pinned(&source, input)
+                .map_err(|error| format!("Reviewed public input {}: {error}", source.display()))?;
             item["origin"] = json!(
                 source
-                    .strip_prefix(&control.root)
+                    .strip_prefix(root)
                     .map_err(|e| e.to_string())?
                     .to_string_lossy()
                     .replace('\\', "/")
             );
             item["url"] = input["url"].clone();
-            entries.push(item);
+            sources.push(ReviewedSource {
+                path: source,
+                name: name.to_owned(),
+                identity: item,
+            });
         }
     }
+    Ok(sources)
+}
+
+fn inputs(control: &Control, pin: &Value, report: &mut Value) -> Result<PathBuf> {
+    let public = json_file(&control.source("public-qaic.lock.json"), 1_048_576)?;
+    // Check the complete retained source closure before spending network or
+    // compiler work. The portable policy fixtures exercise this same intake.
+    let sources = reviewed_sources(&control.root, &public)?;
+    let inputs = control.output.join("inputs");
+    let retained = control.review.join("inputs");
+    directory(&inputs)?;
+    directory(&retained)?;
+    let mut entries = Vec::new();
+    for input in list(pin, "publicInputs")? {
+        entries.push(control.receive(input, &inputs, 1_048_576)?);
+        let name = string(input, "name")?;
+        copy(&inputs.join(name), &retained.join(format!("{name}.txt")))?;
+    }
+    for source in sources {
+        copy(&source.path, &inputs.join(&source.name))?;
+        copy(&source.path, &retained.join(format!("{}.txt", source.name)))?;
+        entries.push(source.identity);
+    }
+    let archive = control.root.join(REVIEWED_ARCHIVE);
     let notices = control.review.join("notices");
     directory(&notices)?;
     for entry in fs::read_dir(archive.join("inputs-and-notices")).map_err(|e| e.to_string())? {
@@ -490,4 +513,31 @@ fn negatives(control: &mut Control, compiler: &Path, inputs: &Path) -> Result<Va
         )?;
     }
     Ok(json!(controls.map(|control| control.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reviewed_sources_require_complete_exact_archive() -> Result<()> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("Fixture workspace root is unavailable.")?;
+        let public = json_file(&root.join("tools/hexagon/public-qaic.lock.json"), 1_048_576)?;
+        let sources = reviewed_sources(root, &public)?;
+        assert_eq!(sources.len(), 7);
+        assert!(sources.iter().any(|source| source.name == "htp_iface_stub.c"));
+        assert!(!sources.iter().any(|source| source.name == "htp_iface_skel.c"));
+        assert!(reviewed_sources(&root.join("Cargo.toml"), &public).is_err());
+        let mut changed = public;
+        changed["wireCapture"]["headers"][0]["sha256"] = json!("0".repeat(64));
+        let error = reviewed_sources(root, &changed)
+            .err()
+            .ok_or("Changed reviewed source identity was accepted.")?;
+        assert!(error.contains("remote.h.txt"));
+        assert!(error.contains("exact reviewed identity"));
+        Ok(())
+    }
 }
