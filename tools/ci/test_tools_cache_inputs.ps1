@@ -3,6 +3,12 @@ param([string]$Case)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
 $repository=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $actionPath=Join-Path $repository '.github/actions/bonsai-tools/action.yml'
+function Restore-CacheEnvironment([string]$Name,$Value) {
+    # PowerShell 7.5+ converts $null to an empty string for this .NET method.
+    # Preserve real empty originals while removing variables originally absent.
+    if ($null -eq $Value) { [Environment]::SetEnvironmentVariable($Name,[NullString]::Value) }
+    else { [Environment]::SetEnvironmentVariable($Name,$Value) }
+}
 # Cargo's checked-in manifests use one-line path/workspace declarations. Fail
 # closed for unfamiliar local declaration syntax rather than guessing a closure.
 function Get-CargoDependencyDeclarations([string]$Manifest,[bool]$WorkspaceOnly=$false) {
@@ -93,30 +99,29 @@ function Invoke-LanePhaseFixture([string]$BuildOnly) {
         $steps=Get-CiActionSteps ([IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml')))
         & ([scriptblock]::Create((Get-CiActionBody $steps['Format, analyze, document, test and build the selected crates']))) | Out-Null
         return ,$script:capturedLaneArguments
-    } finally { foreach ($key in $original.Keys) { [Environment]::SetEnvironmentVariable($key,$original[$key]) }; Remove-CiScratch $scratch }
+    } finally { foreach ($key in $original.Keys) { Restore-CacheEnvironment $key $original[$key] }; Remove-CiScratch $scratch }
 }
 function Invoke-ToolsEnvironmentFixture([object[]]$Scenarios) {
     # Linux can contain both RUSTFLAGS and RustFlags. Preserve the actual names
     # so fixture cleanup does not merge distinct ambient environment entries.
     $scratch=New-CiScratch 'bonsai-tools-identity-'; $original=[hashtable]::new([StringComparer]::Ordinal); foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) { $original[$entry.Key]=$entry.Value }
     try {
-        foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) { if ($name.ToUpperInvariant().StartsWith('RUST',[StringComparison]::Ordinal) -or $name.ToUpperInvariant().StartsWith('CARGO_',[StringComparison]::Ordinal)) { [Environment]::SetEnvironmentVariable($name,$null) } }
+        foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) { if ($name.ToUpperInvariant().StartsWith('RUST',[StringComparison]::Ordinal) -or $name.ToUpperInvariant().StartsWith('CARGO_',[StringComparison]::Ordinal)) { [Environment]::SetEnvironmentVariable($name,[NullString]::Value) } }
         $cargoDirectory=Join-Path $scratch 'cargo'; [void][IO.Directory]::CreateDirectory($cargoDirectory)
         $environment=@{TOOLS_SOURCE_ID=('a'*64);RUNNER_ENVIRONMENT='github-hosted';ImageOS='fixture-os';ImageVersion='fixture-image';RUNNER_TEMP=$scratch;CARGO_HOME=$cargoDirectory;GITHUB_ENV=(Join-Path $scratch 'environment')}; foreach ($key in $environment.Keys) { [Environment]::SetEnvironmentVariable($key,$environment[$key]) }
         $action=[IO.File]::ReadAllText($actionPath); $begin=$action.IndexOf('        $buildInputs = '); $end=$action.IndexOf('        "BONSAI_TOOLS_SOURCE_ID=',$begin); $script=(($action.Substring($begin,$end-$begin) -split '\r?\n' | ForEach-Object { if ($_.Length -ge 8) { $_.Substring(8) } else { '' } }) -join "`n")
         $result=@()
         foreach ($scenario in $Scenarios) {
-            # Use the same API for deletion and assignment. Windows names are
-            # case-insensitive; the PowerShell provider can retain a differently
-            # cased entry when a mixed-case transition removes its old spelling.
-            foreach ($key in $scenario.environment.Keys) { if ($null -eq $scenario.environment[$key]) { [Environment]::SetEnvironmentVariable($key,$null) } }
+            # NullString passes an actual null through PowerShell's string
+            # parameter binder; ordinary $null would leave an empty override.
+            foreach ($key in $scenario.environment.Keys) { if ($null -eq $scenario.environment[$key]) { [Environment]::SetEnvironmentVariable($key,[NullString]::Value) } }
             foreach ($key in $scenario.environment.Keys) { if ($null -ne $scenario.environment[$key]) { [Environment]::SetEnvironmentVariable($key,$scenario.environment[$key]) } }
             foreach ($name in @('config','config.toml')) { $path=Join-Path $cargoDirectory $name; if ($scenario.ContainsKey($name)) { [IO.File]::WriteAllText($path,$scenario[$name]) } elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path) } }
             [IO.File]::WriteAllText($env:GITHUB_ENV,''); & ([scriptblock]::Create($script)) | Out-Null
             $result+=@([IO.File]::ReadAllLines($env:GITHUB_ENV) | Where-Object { $_.StartsWith('BONSAI_TOOLS_CACHE_HOST=',[StringComparison]::Ordinal) })
         }
         return ,$result
-    } finally { foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) { if (-not $original.ContainsKey($name)) { [Environment]::SetEnvironmentVariable($name,$null) } }; foreach ($name in $original.Keys) { [Environment]::SetEnvironmentVariable($name,$original[$name]) }; Remove-CiScratch $scratch }
+    } finally { foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) { if (-not $original.ContainsKey($name)) { [Environment]::SetEnvironmentVariable($name,[NullString]::Value) } }; foreach ($name in $original.Keys) { Restore-CacheEnvironment $name $original[$name] }; Remove-CiScratch $scratch }
 }
 $cases=[ordered]@{
  lane_dependency_and_embedded_closures_hashed={
@@ -185,7 +190,7 @@ $cases=[ordered]@{
         Invoke-ToolsEnvironmentFixture @(@{environment=@{}}) | Out-Null
         Assert-CiEqual ([Environment]::GetEnvironmentVariable($names[0])) 'uppercase'
         if (-not $IsWindows) { Assert-CiEqual ([Environment]::GetEnvironmentVariable($names[1])) 'mixed-case' }
-    } finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$before[$name]) } }
+    } finally { foreach ($name in $names) { Restore-CacheEnvironment $name $before[$name] } }
  }
  metadata_and_override_paths_do_not_partition={ $values=Invoke-ToolsEnvironmentFixture @(@{environment=@{}},@{environment=@{GITHUB_RUN_ID='new-run';CARGO_TARGET_DIR='different-target';CARGO_BUILD_FINGERPRINT='mtime'}}); Assert-CiEqual $values[0] $values[1] }
 }
