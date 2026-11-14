@@ -1,6 +1,13 @@
 #Requires -Version 7.6
 # Shared native release entry adapter. Importing performs no work.
 Set-StrictMode -Version Latest
+function Get-ReleaseToolchain([string]$RepositoryRoot) {
+    # Cargo's manifest path does not select rustup's compiler outside the checkout.
+    $toolchain = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'rust-toolchain.toml') -Raw
+    $channel = [regex]::Match($toolchain, '(?m)^channel\s*=\s*"(nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})"\s*$').Groups[1].Value
+    if (-not $channel) { throw 'Release bootstrap requires the repository-pinned dated nightly.' }
+    "$channel-aarch64-pc-windows-msvc"
+}
 function Invoke-NativeReleasePolicy([hashtable]$Request) {
     $json = ConvertTo-Json -InputObject $Request -Depth 100 -Compress
     $nativePreference = $PSNativeCommandUseErrorActionPreference
@@ -9,8 +16,10 @@ function Invoke-NativeReleasePolicy([hashtable]$Request) {
         if ($env:BONSAI_TOOLS_PATH) {
             $output = @($json | & $env:BONSAI_TOOLS_PATH release-tool --request - 2>&1)
         } else {
-            $manifest = Join-Path $PSScriptRoot '../../Cargo.toml'
-            $output = @($json | & cargo run --quiet --locked --manifest-path $manifest -p bonsai-tools --bin bonsai-tools -- release-tool --request - 2>&1)
+            $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+            $manifest = Join-Path $repository 'Cargo.toml'
+            $toolchain = Get-ReleaseToolchain $repository
+            $output = @($json | & cargo "+$toolchain" run --quiet --locked --manifest-path $manifest -p bonsai-tools --bin bonsai-tools -- release-tool --request - 2>&1)
         }
         $code = $LASTEXITCODE
     } finally { $PSNativeCommandUseErrorActionPreference = $nativePreference }
