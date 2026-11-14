@@ -29,6 +29,12 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] **L1 — Qualify the Rust/PowerShell tooling migration.** Have the owner
   qualify published source in Source checks/Foundation, migrated fixture
   inventories, exact native helper/cache handoffs and separate SDK/ABI controls.
+  Include native CPU packet/evaluator and retained scalar replay identities;
+  SDK, wire, Windows ABI and source-ledger controls; Rust icon/source-builder,
+  release/publication and notice tools; native report/fixture admission; and
+  prebuilt sandbox, acceptance and X2 owner clock/power/teardown handoffs.
+  Preserve missing pre-bootstrap power as unknown and qualify exact cache hits,
+  original aggregate deadlines, losing/no-go retention and independent replay.
   Include the expanded language guard, native PE closure and direct headless-build
   handoff; local checks do not establish hosted or actual-system acceptance.
   Public reconstruction and replay retain P1's schema-2 scalar-v2 identity.
@@ -102,22 +108,6 @@ adoption decisions without displacing native daily-use acceptance.
   or generation, renamed executables, original options, read-only targets, sharing
   exhaustion, restart failure, data preservation and rollback; source and preview
   launches must stay silent. See [update behavior](docs/releases.md#update-and-remove).
-
-## Tooling implementation
-
-- [ ] **L2 — Reduce PowerShell to small orchestration and bootstrap checks.**
-  Move the CPU-bundle evaluator's typed admission, power/identity validation,
-  receipt scoring and comparison policy into Rust, then reduce its owner launcher
-  to parameter forwarding. Preserve the complete schema-2 packet, fixed workload,
-  original aggregate deadline, native process containment and per-arm power rules.
-- [ ] Move native-reference safetensors/GGUF parsing and reconstruction policy into
-  Rust. Preserve independent replay, original replay inputs and P1's schema-2
-  scalar-v2 arithmetic/source identities; do not silently reinterpret old evidence.
-- [ ] Move Hexagon SDK lexical/declaration analysis and inventory validation into
-  Rust. Keep small compiler/environment orchestration and pre-bootstrap CI guards
-  in PowerShell, preserving separate SDK, wire and Windows ABI controls.
-- [ ] Move application icon rasterization and ICO encoding from PowerShell to a
-  Rust asset tool, preserving the vector source, frame sizes and native branding.
 
 ## Application and daily service
 
