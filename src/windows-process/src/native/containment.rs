@@ -119,9 +119,22 @@ fn native_error(error: impl std::fmt::Display) -> io::Error {
 }
 
 pub(super) fn child_environment(policy: &SandboxPolicy) -> io::Result<Vec<u16>> {
+    child_environment_from(policy, std::env::vars_os())
+}
+
+fn child_environment_from(
+    policy: &SandboxPolicy,
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+) -> io::Result<Vec<u16>> {
+    // Admit exactly the snapshot that CreateProcessW will receive. A separate
+    // caller preflight cannot cover environment changes before worker creation.
+    let inherited: Vec<_> = inherited.into_iter().collect();
+    for (name, _) in &inherited {
+        crate::validate_sandbox_environment_name(name)?;
+    }
     let scratch = path_text(&policy.writable_directory)?;
     super::environment::build(
-        std::env::vars_os(),
+        inherited,
         &BTreeMap::from([
             ("TEMP".to_owned(), scratch.clone()),
             ("TMP".to_owned(), scratch),
@@ -317,6 +330,53 @@ mod tests {
     use std::{fs, time::SystemTime};
 
     use super::*;
+
+    #[test]
+    fn child_environment_admits_the_retained_snapshot_and_rejects_late_credentials()
+    -> io::Result<()> {
+        let policy = SandboxPolicy {
+            readonly_paths: Vec::new(),
+            writable_directory: PathBuf::from("C:\\private\\scratch"),
+        };
+        let inherited = vec![
+            (OsString::from("SystemRoot"), OsString::from("C:\\Windows")),
+            (OsString::from("USERPROFILE"), OsString::from("C:\\profile")),
+            (OsString::from("TEMP"), OsString::from("C:\\previous-temp")),
+            (OsString::from("TMP"), OsString::from("C:\\previous-temp")),
+        ];
+        let block = child_environment_from(&policy, inherited.clone())?;
+        for expected in [
+            "SystemRoot=C:\\Windows",
+            "USERPROFILE=C:\\profile",
+            "TEMP=C:\\private\\scratch",
+            "TMP=C:\\private\\scratch",
+        ] {
+            assert!(
+                block.split(|unit| *unit == 0).any(|entry| {
+                    entry == expected.encode_utf16().collect::<Vec<_>>().as_slice()
+                })
+            );
+        }
+        // A clean earlier snapshot must not authorize a changed child snapshot.
+        // Inject it as data: this control never mutates the process environment.
+        for name in [
+            "OPENAI_API_KEY",
+            "gItHuB_ToKeN",
+            "ConnectionStrings__Default",
+        ] {
+            let mut changed = inherited.clone();
+            changed.push((OsString::from(name), OsString::from("credential-fixture")));
+            let error = child_environment_from(&policy, changed)
+                .err()
+                .ok_or_else(|| io::Error::other("credential-bearing snapshot admitted"))?;
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "sandbox launch rejects inherited credential environment variables"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn offline_policy_omits_network_authority_and_preserves_headless_restrictions() -> io::Result<()>

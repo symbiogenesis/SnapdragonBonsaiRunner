@@ -107,9 +107,11 @@ OS/profile environment entries are passed through; the launcher does not clear
 the environment or relocate Windows/profile folders into a checkout. Child
 TEMP/TMP select scratch before Windows applies PSEC's own temporary-storage policy.
 Known credential-shaped variables, including common tokens, API keys, passwords
-and connection strings, reject sandbox launch with a value-free error. This is a
-conservative guard, not proof that every arbitrarily named inherited value is
-non-secret. Run from an appropriately scoped parent environment.
+and connection strings, reject sandbox launch with a value-free error. The exact
+inherited snapshot used to build the child environment is checked again; an earlier
+clean preflight cannot authorize subsequently introduced credential variables.
+This is a conservative guard, not proof that every arbitrarily named inherited
+value is non-secret. Run from an appropriately scoped parent environment.
 
 Existing artifact verification and retained handles remain in force. Jobs still
 enforce process count and committed memory; the physical-RAM watchdog remains

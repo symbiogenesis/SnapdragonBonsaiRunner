@@ -1205,7 +1205,11 @@ fn forbidden_environment_name(name: &OsStr) -> bool {
 /// # Errors
 /// Returns `InvalidInput` when a recognized credential-shaped name is present.
 pub fn validate_sandbox_environment() -> io::Result<()> {
-    if std::env::vars_os().any(|(name, _)| credential_environment_name(&name)) {
+    std::env::vars_os().try_for_each(|(name, _)| validate_sandbox_environment_name(&name))
+}
+
+fn validate_sandbox_environment_name(name: &OsStr) -> io::Result<()> {
+    if credential_environment_name(name) {
         return Err(invalid(
             "sandbox launch rejects inherited credential environment variables",
         ));
