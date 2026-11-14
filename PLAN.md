@@ -1181,18 +1181,133 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   NPU, Adreno GPU, async storage lifetime and DCVS/power-scaling gates (`#39`–`#44`)
   deferred unless predeclared workload evidence justifies reopening them under `NPU-1`–`NPU-8`.
 
+## August to November 2026 upstream screening follow-up
+
+Track remaining qualification, conditional candidates and housekeeping from the
+51-item screening (`PrismML-Eng/llama.cpp@6447906bf96c1a023980d3453fb59daa6af3bb23`,
+`ggml-org/llama.cpp@a956a852c9c8bc1fb07206364838ddef299178c0` and
+`vllm-project/vllm@5e51c0ca1041168de7aa9e096982aebaeebabd38`) in the
+[screening ledger](docs/research-register.md#august-to-november-2026-screening-ledger).
+Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
+
+### Repin, CI and device qualification of landed screening controls
+
+- [ ] Refresh the local [push guard](tools/ci/README.md#local-push-guard) receipt
+  (`tools/ci/check_push_sanity.ps1 -Prepare` within its declared allowance) before
+  pushing outgoing tips, accounting for the `tools/source-sanity` analyzer update.
+- [ ] Publish a Foundation release bundle from reviewed `prism-inference` `main`
+  (`0.1.29` working tree, including `129fae8..c0893f8`) and repin Runner past
+  `Prism 0.1.28` under the [distribution guide](docs/releases.md) so installed and
+  daily-use builds consume the new runtime checkpoints, GDN guards, memory ledger
+  and worker cancellation (`#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`,
+  `#25`–`#26`, `#28`, `#30`–`#34`, `#36`, `#45`–`#51`).
+- [ ] Complete hosted `source-checks` and `foundation` compiler, strict Release
+  analyzer and full regression-suite verdicts in both repositories under
+  [promotion criteria](docs/validation.md#promotion-criteria); local merge checks
+  ran scoped Clippy and targeted `--exact` tests only.
+- [ ] Qualify landed controls on actual weights and X1/X2 hardware within
+  predeclared 5-to-15-minute AC/battery-logged allowances:
+  - [ ] `#8`: Exercise live long-prefill HTTP Stop/disconnect,
+    `Worker::settled_within` and `speech-tts` cooperative `CancelHook` cancellation.
+  - [ ] `#14`: Compare `SwiftExecutionShape` and `SwiftExecutionMemoryLedger`
+    conservative commit charges against measured Windows Job-object commit across
+    M1–M3 (`8K`–`256K`).
+  - [ ] `#30`–`#34`, `#36`: Measure complete-cycle suffix speculation
+    (`SpeculativeStats` proposed/verified/accepted histograms, `replay_steps` and
+    `VerificationLimits` stop/cap truncation) against single-token decode before
+    enabling speculation by default.
+  - [ ] `#49`–`#51`: Qualify live `bonsai-chat` streaming Markdown prefix retention,
+    incremental TTS segmentation and `bonsai-tools` calibration/probe receipts.
+
+### Conditional screening items deferred pending bottleneck or prerequisite evidence
+
+#### Memory, loading and approximate cache
+
+- [ ] **#16 — Aligned loading and upload staging reuse.** Process largest tensors
+  first, reuse bounded aligned staging and shrink excess capacity once accelerator
+  upload or cold-load staging demonstrates a measured bottleneck under the
+  [memory contract](docs/swift-memory.md).
+- [ ] **#17 — Optional Windows unbuffered direct I/O.** Prototype an aligned
+  `FILE_FLAG_NO_BUFFERING` handle with logical seek semantics, CNG digest continuity
+  and explicit buffered fallback only if cold model loading is I/O-bound and beats
+  the existing mapped path.
+- [ ] **#18 — Owned tensor-range mapping and pinning.** Merge owned tensor byte
+  ranges and exclude unrelated spans instead of mapping `first..last` when
+  shared-weight or accelerator pinning requires it, preserving Windows handle and
+  reparse-point identity guards.
+- [ ] **#21 — Calibrated K-cache mean centering.** Evaluate subtracting a
+  per-layer/head/channel key mean on rotated `K4` only after `K1` baseline
+  attribution, with separate center-vector storage/identity accounting and held-out
+  answer parity under [quantized KV](docs/quantized-kv.md#qualification-contract).
+
+#### CPU kernel tuning
+
+- [ ] **#23 — Weight-stationary multirow decode.** Evaluate reusing quantized
+  activation blocks across multiple output rows on X1/X2, measuring register
+  pressure and L1/L2 cache behavior while preserving per-block reduction order.
+- [ ] **#24 — Token-count projection crossover tuning.** Benchmark separate 1-token
+  decode, short verification block (`2`–`9`) and larger prefill tile crossovers with
+  odd-tail retention, keeping any rounding change behind an explicit profile gate.
+- [ ] **#25 — Remaining shared activation-preparation consumers.** Extend shared
+  transform-and-quantize preparation to remaining recurrent sibling projections
+  sharing identical input, basis, width and quantizer.
+- [ ] **#27 — Fused GDN `conv1d + SiLU + ClampedL2` pass.** Evaluate fusing causal
+  3-tap convolution, `SiLU` and `ClampedL2` Q/K normalization alongside joined BF16
+  alpha/beta to cut intermediate traversals while preserving exact `ClampedL2`
+  numerics.
+- [ ] **#29 — Consumer-layout attention probabilities and tail balancing.** Emit FP16
+  attention probabilities directly in consumer layout and split oversized final
+  head/token tasks without changing the FP16 boundary or reduction order under
+  [CPU kernels](docs/cpu-kernels.md#cross-generation-cpu-promotion).
+
+#### Speculative decoding extensions
+
+- [ ] **#35 — Shared target embeddings and LM head for learned drafters.** Share
+  transformed embeddings/head with strict tokenizer, basis, scale, adapter and
+  feature-order identity checks only after a compatible published Swift drafter is
+  available under
+  [inference algorithms](docs/inference-algorithms.md#hybrid-cache-reuse-and-speculative-state).
+- [ ] **#37 — Checkpointable delayed recurrent updates (`ReplaySSM`).** Include ring
+  cursors, pending inputs and materialization boundaries in state identity only if
+  measured state-copy traffic justifies `KVBuffer`/`SpecLA`-style delayed recurrence.
+- [ ] **#38 — Transactional grammar speculation.** Bind grammar state advancement and
+  rejection-sampling masks into the atomic KV/GDN/convolution/sampler rollback
+  transaction before allowing speculative decoding alongside grammar constraints.
+
+#### Adreno Vulkan, Hexagon NPU and power policy
+
+- [ ] **#39 — Native packed Vulkan (`PTQ1` / integer-dot) kernels.** Gate behind
+  `VK_ERROR_INCOMPATIBLE_DRIVER` diagnosis and Qualcomm matrix-conversion capability
+  checks with explicit fallback under [Adreno](docs/adreno.md).
+- [ ] **#40 — Resource-pressure fused versus decomposed GPU attention.** Select
+  row/head tile shapes from register and local-memory pressure to prevent spills and
+  Windows GPU TDRs while preserving global normalization and FP16 probabilities.
+- [ ] **#41 — Hexagon `PQ2`/`PTQ1` tile packing, VTCM sizing and IOVA placement.**
+  Tailor host repacking and mapping placement to actual queried VTCM capacity and
+  Swift's `PQ2`/`PTQ1` layouts under [Hexagon](docs/hexagon.md).
+- [ ] **#42 — Pipelined DMA, HVX preparation and HMX chunkwise GDN.** Gate under an
+  explicit separate numerical profile (HMX FP16 intermediates do not preserve the
+  FP32 GDN contract) with a small-token CPU/HVX fallback.
+- [ ] **#43 — Device-side explicit async storage fences.** Extend implicit-storage
+  dependency tracking and terminal-completion transfer batching to Adreno/Hexagon
+  async arenas (CPU `GraphAllocator` multi-hop view/alias liveness is already landed).
+- [ ] **#44 — Sustained versus burst accelerator DCVS/HMX power policy.** Compare
+  sustained versus burst clock/power modes on X1/X2 using complete-answer latency,
+  energy/charge delta and thermal comfort rather than peak microbenchmark clocks.
+
+### Pre-existing `main` verification housekeeping
+
+- [ ] Fix `format_at(&layout.job, "old")` in
+  [formatting tests](src/chat-ui/src/window/transcript/formatting/tests.rs)
+  (`markdown_renders_native_headings_emphasis_and_literal_code`), where
+  `job.text.find("old")` matches `"old"` inside `"bold"` instead of `"~~old~~"`.
+- [ ] Update unfulfilled `#[expect(clippy::used_underscore_binding)]` attributes in
+  [credentials tests](src/windows-credentials/src/tests.rs) under `nightly-2026-11-12`.
+- [ ] Gate or wire up unused `pub(super) async fn exchange` in
+  [broker progress helper](src/broker/tests/native_model/progress.rs).
+
 ## Survey ideas outside the current laptop backlog
 
-- [ ] **August–November 2026 screening backlog disposition (`#1`–`#51`).** Track
-  the three frozen upstream snapshots (`PrismML-Eng/llama.cpp@6447906bf96c1a023980d3453fb59daa6af3bb23`,
-  `ggml-org/llama.cpp@a956a852c9c8bc1fb07206364838ddef299178c0` and
-  `vllm-project/vllm@5e51c0ca1041168de7aa9e096982aebaeebabd38`) and item status splits in the
-  [screening ledger](docs/research-register.md#august-to-november-2026-screening-ledger):
-  audit `#1` (`ClampedL2`) is closed; source controls `#8`, `#14` and `#45`–`#51` (Runner
-  source hardening) plus `#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#26`, `#28`,
-  `#30`–`#34` and `#36` await compiled CI and X1/X2 device gates above; deferred items
-  `#16`–`#18`, `#21`, `#23`–`#25`, `#27`, `#29`, `#35` and `#37`–`#44` stay gated behind
-  their explicit bottleneck, interface and safety acceptance criteria.
 - [ ] **F1 — Conditional research.** After a useful verifier and compatible
   published auxiliary exist, screen trained parallel/phrase proposals with
   admitted native resources. After a useful
