@@ -74,6 +74,8 @@ adoption decisions without displacing native daily-use acceptance.
   against inherited Cargo target overrides before claiming prepared-helper admission.
   Include policy-only bootstrap closure, batched script scope/rejection controls
   and source-language scan newline diagnostics in owning CI acceptance.
+  Qualify parallel formatter root/configuration/failure parity, managed AST
+  traversal and pinned linter archive cache-hit/poisoning controls.
 - [ ] Qualify Runner's checked-tools producer, shared regression runner and
   native-acceptance caches: cold build, exact hit and relevant-input invalidation,
   fresh same-run packages, source/digest verification and every selected check.

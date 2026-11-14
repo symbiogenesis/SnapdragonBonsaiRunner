@@ -737,6 +737,15 @@ invoking each trusted script in a child scope and rejecting a failed call before
 starting another. Source-language scanning filters whole files with the existing
 expressions before entering per-line diagnostics; PowerShell AST checks and
 multiline Rust resolution checks still inspect their complete inputs.
+AST traversal uses a managed command-type predicate, preserving nested command
+inspection without entering PowerShell for every AST node.
+
+Cargo still discovers the complete formatting target set, including local path
+dependencies. Its check-only Rustfmt invocation uses the outgoing source's
+dated compiler pin and at most four supervised native workers. External roots
+or nested formatter configurations retain the original ordered single session.
+Every worker must pass before candidate adapter bodies can execute; all workers
+share the original process/output bounds and cleanup reserve.
 
 The screen checks owned-language policy, parses changed PowerShell without
 executing it, checks workspace Rust formatting when Rust/build inputs change,
@@ -772,8 +781,12 @@ an outgoing-tip verdict, an automatic retry or a way to renew an expired clock.
 Owning CI still qualifies the complete preparation/receipt, snapshot and batched
 script controls. Local focused checks do not establish that CI verdict.
 `BONSAI_ACTIONLINT_PATH` can supply the reviewed actionlint 1.7.12 executable for
-an offline syntax check; otherwise the existing checker fetches its pinned,
-digest-verified asset. Snapshot intake and native work share the original allowance;
+an offline syntax check. Otherwise, the checker caches its pinned archive under
+`%TEMP%\Bonsai-Actionlint-Cache`, keyed by the compiled archive digest, and fetches
+the asset on a cache miss. Every use copies bytes into invocation-private storage
+and verifies the digest before extraction. Corrupt cache entries block the check;
+cached executables and cached check verdicts are never used. Snapshot intake and
+native work share the original allowance;
 the native supervisor stops admitting commands at 270 seconds, retaining cleanup
 reserve. Power is observed before bootstrap and after cleanup; unavailable
 battery-saver observations remain unknown. These are correctness checks, with
