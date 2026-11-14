@@ -892,7 +892,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(transfers, 1);
             assert!(!path.exists());
-            assert!(quarantine_files(&working)?.is_empty());
+            assert_eq!(quarantine_files(&working)?, Vec::<PathBuf>::new());
             assert_eq!(
                 fs::read(&partial).map_err(|error| error.to_string())?,
                 replacement
