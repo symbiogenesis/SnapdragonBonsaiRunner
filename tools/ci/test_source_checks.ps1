@@ -71,9 +71,18 @@ $cases=[ordered]@{
     Assert-SourceSelection (Invoke-SourceSelection push refs/heads/main @('tools/future-reader/Cargo.lock')) $false $false $true
     Assert-SourceSelection (Invoke-SourceSelection push refs/heads/main @('docs/Cargo.lock.md')) $false $true $false
  }
+ main_push_always_records_source_verdict={
+    foreach ($name in @('source-checks.yml','foundation.yml')) {
+        $workflow=[IO.File]::ReadAllText((Join-Path $repository ".github/workflows/$name"))
+        $trigger=[regex]::Match($workflow,'(?ms)^  push:\r?\n(.*?)(?=^  [a-z_]+:)').Groups[1].Value
+        Assert-Ci (-not [string]::IsNullOrWhiteSpace($trigger)) "A push trigger must record $name for release revisions."
+        Assert-Ci ($trigger -cnotmatch '(?m)^    paths(?:-ignore)?:') "Path filtering must not leave a release revision without a $name verdict."
+    }
+    Assert-SourceSelection (Invoke-SourceSelection push refs/heads/main @('src/broker/request.rs')) $false $false $false
+ }
  every_workspace_lock_is_audited_after_root_failure={
     $workflow=[IO.File]::ReadAllText((Join-Path $repository '.github/workflows/source-checks.yml'))
-    Assert-Ci ($workflow.Contains("      - '**/Cargo.lock'")) 'Nested lockfile changes must trigger Source checks.'
+
     $audit=(Get-CiJobBlocks $workflow)['audit']
     $commands=[regex]::Matches($audit,'audit --file "\$GITHUB_WORKSPACE/([^\"]+)" --deny yanked')
     Assert-CiSet @($commands | ForEach-Object { $_.Groups[1].Value }) @('Cargo.lock','tools/hexagon/sdk-reader/Cargo.lock')

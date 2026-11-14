@@ -2,10 +2,6 @@ name: Foundation
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '*.md'
-      - 'docs/**'
-      - '.rumdl.toml'
   workflow_dispatch:
 permissions:
   contents: read

@@ -2,17 +2,6 @@ name: Source checks
 on:
   push:
     branches: [main]
-    paths:
-      - '**/*.md'
-      - '.rumdl.toml'
-      - Cargo.lock
-      - '**/Cargo.lock'
-      - Cargo.toml
-      - '**/Cargo.toml'
-      - rust-toolchain.toml
-      - '.github/**'
-      - 'tools/ci/**'
-      - .github/workflows/source-checks.yml
   pull_request:
     branches: [main]
   schedule:
