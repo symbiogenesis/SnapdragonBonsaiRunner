@@ -15,6 +15,7 @@ on:
         default: true
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: windows-release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
@@ -36,6 +37,15 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - uses: $/.github/actions/ci-tool
+      - name: Require successful exact-source Foundation and Source checks before release work
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & $env:BONSAI_CI_PATH release-prerequisites --revision $env:GITHUB_SHA
       - name: Check workflow startup and tooling policy before the build fan-out
         run: |
           $ErrorActionPreference = 'Stop'
@@ -75,7 +85,7 @@ jobs:
           }
   build:
     needs: validate
-    name: Check and build / ${{ matrix.lane }}
+    name: Build production / ${{ matrix.lane }}
     runs-on: windows-11-arm
     strategy:
       fail-fast: false
@@ -110,6 +120,9 @@ jobs:
           packages: ${{ matrix.packages }}
           affected: ${{ matrix.packages }}
           github-release: 'true'
+          # Foundation owns format/analyzers/docs/tests at this exact SHA.
+          # Production linking still runs with the publication build profile.
+          build-only: 'true'
       - name: Stage source-bound executable and complete third-party notices
         working-directory: ${{ runner.temp }}
         env:
@@ -133,6 +146,22 @@ jobs:
             bytes = (Get-Item -LiteralPath $executable).Length
             sha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory 'build-manifest.json') -Encoding utf8NoBOM
+          if ($env:RELEASE_LANE -ceq 'maintenance') {
+            # Keep the actual maintenance CLI separate from the shipped launcher.
+            # Packaging/publication consume this source-bound same-run build.
+            $package = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-CheckedTools'
+            [void][IO.Directory]::CreateDirectory($package)
+            foreach ($name in @('bonsai-tools.exe', 'bonsai-reference-numerics.exe', 'bonsai-completion-test-probe.exe')) {
+              Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "aarch64-pc-windows-msvc/release/$name") -Destination (Join-Path $package $name)
+            }
+            @{
+              SchemaVersion = 3
+              Revision = $env:GITHUB_SHA
+              Sha256 = (Get-FileHash -LiteralPath (Join-Path $package 'bonsai-tools.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+              NumericSha256 = (Get-FileHash -LiteralPath (Join-Path $package 'bonsai-reference-numerics.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+              ProbeSha256 = (Get-FileHash -LiteralPath (Join-Path $package 'bonsai-completion-test-probe.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $package 'receipt.json') -Encoding utf8NoBOM
+          }
           if ($env:RELEASE_LANE -ceq 'tts') {
             & (Join-Path $env:GITHUB_WORKSPACE '.github/release/Collect-Notices.ps1') -RepositoryRoot $env:GITHUB_WORKSPACE -OutputPath (Join-Path $directory 'THIRD-PARTY-NOTICES.txt')
           }
@@ -141,6 +170,15 @@ jobs:
           name: release-build-${{ matrix.lane }}
           path: ${{ runner.temp }}/release-lane
           if-no-files-found: error
+          retention-days: 30
+      - name: Share the same-run maintenance CLI for packaging and publication
+        if: matrix.lane == 'maintenance'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bonsai-tools-windows-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/SwiftBonsai-CheckedTools
+          if-no-files-found: error
+          compression-level: 1
           retention-days: 30
   package:
     needs: [validate, build]
@@ -153,6 +191,7 @@ jobs:
         with:
           pattern: release-build-*
           path: ${{ runner.temp }}/release-inputs
+      - uses: $/.github/actions/use-bonsai-tools
       - name: Assemble and verify the portable executable without model work
         working-directory: ${{ runner.temp }}
         env:
@@ -180,15 +219,26 @@ jobs:
     runs-on: windows-11-arm
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
+      - uses: $/.github/actions/ci-tool
+      - name: Recheck exact-source CI prerequisites before publication
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & $env:BONSAI_CI_PATH release-prerequisites --revision $env:GITHUB_SHA
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows-release-assets
           path: ${{ runner.temp }}/release-assets
+      - uses: $/.github/actions/use-bonsai-tools
       - name: Verify assets, create a draft, upload and publish this exact source
         working-directory: ${{ runner.temp }}
         env:
@@ -202,6 +252,6 @@ jobs:
             "[Download the Windows ARM64 executable]($release)"
             "Source: $env:GITHUB_SHA"
             ''
-            'All five Rust lanes, portable packaging and model-free executable smoke checks passed.'
+            'Exact-source Foundation and Source checks, all five production builds, portable packaging and model-free executable smoke checks passed.'
             'The release includes its manifest and SHA-256 inventory. Application qualification remains separate.'
           ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8NoBOM
