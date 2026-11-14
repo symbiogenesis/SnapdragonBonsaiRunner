@@ -171,7 +171,7 @@ fn required_gates(ptq1: bool) -> impl Iterator<Item = &'static Gate> {
 
 fn gate_requirement(gate: &Gate, ptq1: bool) -> &'static str {
     if ptq1 && gate.id == "paired-target-device-benefit" {
-        "Matched original-PQ2/current-weight-PTQ1 trials on the same pinned runtime, device, standard adapter at 1.3 and worker policy retain complete responses, cold load, prefill, decode, end-to-end latency, resources and losing outcomes; demonstrate at least 10% lower end-to-end latency or a reviewed capacity/energy benefit within accepted latency and quality limits."
+        "Matched original-PQ2/current-weight-PTQ1 CPU trials on the same pinned runtime, device, standard adapter at 1.3, FP16 cache, reset-every-request and worker policy retain complete responses, cold load, prefill, decode, end-to-end latency, resources and losing outcomes; demonstrate at least 10% lower end-to-end latency or a reviewed capacity/energy benefit within accepted latency and quality limits. This comparison does not qualify automatic X2 NPU placement or packed-cache serving."
     } else {
         gate.requirement
     }
@@ -375,6 +375,7 @@ fn policy(
             "physicalReserveBytes": 4_294_967_296_u64,
             "nativeRowWorkers": native_row_workers,
             "servingStatePolicy": "reset-every-request",
+            "placement": "cpu", "projectionBackend": "cpu", "kvCache": "f16",
             "target": "aarch64-pc-windows-msvc"
         },
         "requiredGates": required_gates(ptq1).map(|gate| json!({"id": gate.id, "repository": gate.repository, "snapdragonRequired": gate.device, "humanReviewRequired": gate.human, "revisionBinding": if gate.id == SERVICE_GATE {"serviceHarnessRevision"} else if gate.repository == PRISM {"runtimeRevision"} else {"runnerRevision"}, "requirement": gate_requirement(gate, ptq1)})).collect::<Vec<_>>()
@@ -436,7 +437,9 @@ fn select_ptq1(policy: &mut Value, reference: &Value) -> crate::Result<()> {
         "runtimeLockSha256": identity["runtimeLockSha256"],
         "adapterSha256": identity["adapterSha256"], "adapterScale": identity["adapterScale"],
         "nativeRowWorkers": identity["nativeRowWorkers"],
-        "servingStatePolicy": identity["servingStatePolicy"]
+        "servingStatePolicy": identity["servingStatePolicy"],
+        "placement": identity["placement"], "projectionBackend": identity["projectionBackend"],
+        "kvCache": identity["kvCache"]
     });
     Ok(())
 }

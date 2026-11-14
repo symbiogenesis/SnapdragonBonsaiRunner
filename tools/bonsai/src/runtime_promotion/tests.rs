@@ -108,6 +108,9 @@ fn ptq1_plan_binds_export_rollback_and_all_independent_gates() -> crate::Result<
         "adapterScale",
         "nativeRowWorkers",
         "servingStatePolicy",
+        "placement",
+        "projectionBackend",
+        "kvCache",
     ] {
         assert_eq!(
             ptq1["identities"]["rollback"][field],
@@ -332,6 +335,50 @@ fn ptq1_parallel_evidence_cannot_qualify_single_worker_or_original_pq2() -> crat
     }
     assert_eq!(
         score(evidence(&parallel)?, &parallel, &std::env::temp_dir())?["promotionReady"],
+        false
+    );
+    Ok(())
+}
+
+#[test]
+fn ptq1_reference_evidence_cannot_qualify_other_placement_cache_or_reuse() -> crate::Result<()> {
+    let policy = policy(
+        &"a".repeat(40),
+        4,
+        None,
+        WeightRepresentation::CurrentRepackedPtq1,
+    )?;
+    for (field, expected) in [
+        ("placement", "cpu"),
+        ("projectionBackend", "cpu"),
+        ("kvCache", "f16"),
+        ("servingStatePolicy", "reset-every-request"),
+    ] {
+        assert_eq!(policy["identities"][field], expected);
+        assert_eq!(policy["identities"]["rollback"][field], expected);
+    }
+    for (field, value) in [
+        ("placement", "auto"),
+        ("projectionBackend", "native-q2"),
+        ("kvCache", "rsq4"),
+        ("servingStatePolicy", "same-session-live-prefix"),
+    ] {
+        for pointer in [
+            format!("/identities/{field}"),
+            format!("/identities/rollback/{field}"),
+        ] {
+            let mut changed = evidence(&policy)?;
+            *changed
+                .pointer_mut(&pointer)
+                .ok_or("Missing execution-policy identity.")? = json!(value);
+            assert!(
+                score(changed, &policy, &std::env::temp_dir()).is_err(),
+                "{pointer}"
+            );
+        }
+    }
+    assert_eq!(
+        score(evidence(&policy)?, &policy, &std::env::temp_dir())?["promotionReady"],
         false
     );
     Ok(())

@@ -263,7 +263,10 @@ Runner revision. Omitting `weightRepresentation`, or explicitly selecting
 receipt, exact derived model and original PQ2 rollback identities. It retains all
 seventeen runtime/application gates and adds independently reviewed lossless-packing
 and actual-device original-PQ2 rollback gates. Its paired benefit gate compares
-PQ2 and PTQ1 on the same released engine and app settings. Scoring changes no launch default.
+PQ2 and PTQ1 on the same released engine with CPU placement, FP16 cache and request
+reset. This reference policy does not qualify the development default's K4/V4,
+prefix reuse or automatic X2 NPU placement; those need their independent production
+acceptance packets. Scoring changes no launch default.
 
 ### Inspect the policy
 
@@ -295,10 +298,11 @@ $plan.policy.requiredGates
 
 The evaluator checks offline completeness and byte integrity, without inference,
 benchmarks, selection changes, reviewer authentication or network provenance checks.
-The version-2 policy binds the selected `nativeRowWorkers` (one by default, or explicit four)
-and `servingStatePolicy: reset-every-request`. Evidence for a different worker count
-or experimental state reuse cannot qualify this policy. Regenerate pending manifests
-after a policy identity change.
+The version-2 policy binds the selected `nativeRowWorkers` (one by default, or explicit four),
+`servingStatePolicy: reset-every-request`, `placement: cpu`, `projectionBackend: cpu`
+and `kvCache: f16`. The same execution identities bind original-PQ2 rollback.
+Evidence for a different worker count, placement, cache or state reuse cannot qualify
+this reference policy. Regenerate pending manifests after a policy identity change.
 PTQ1 `file-score` requests must select the same `weightRepresentation`; PQ2 evidence,
 changed packing receipts and changed original-PQ2 rollback identities are rejected.
 The scored report retains the policy digest, profile, exact identities, gate counts
@@ -337,7 +341,7 @@ acceptance, installation and rollback. Released private-service adapter readines
 per-request scale/state lifecycle qualify independently of source-graph support or
 adapter-disabled smoke checks.
 
-Device gates require self-hosted ARM64 Snapdragon X Elite, X2 Elite or X2 Elite
+Device gates require self-hosted ARM64 Snapdragon X Elite or Snapdragon X2 Elite
 Extreme evidence, with the same family across all completed device gates.
 `processorName` must match that family.
 Paired promotion requires predeclared **10% end-to-end latency benefit**, or reviewed
