@@ -242,7 +242,7 @@ mod tests {
     fn sandbox_capture_distinguishes_read_and_disk_exhaustion_failures() {
         let mut retained = Vec::new();
         assert_eq!(copy_bounded(&mut FailedRead, &mut retained, 4), READ_FAILED);
-        assert!(retained.is_empty());
+        assert_eq!(retained, Vec::<u8>::new());
         assert_eq!(
             copy_bounded(&mut Cursor::new(b"bytes"), &mut FailedWrite, 4),
             WRITE_FAILED

@@ -232,6 +232,6 @@ mod tests {
         assert!(plan.source_fixture);
         let plan = selection(&[".github/workflows/source-checks.yml".into()]);
         assert!(plan.workflows && plan.source_fixture);
-        assert!(plan.cache_actions.is_empty());
+        assert_eq!(plan.cache_actions, Vec::<&str>::new());
     }
 }
