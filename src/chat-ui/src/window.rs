@@ -128,6 +128,7 @@ struct State {
     events: client::EventReceiver,
     worker: Option<JoinHandle<()>>,
     markdown_image: Option<std::path::PathBuf>,
+    pending_config: Option<Config>,
     startup_request: Option<crate::startup::Request>,
     startup: Option<crate::startup::Session>,
     setup: setup::Setup,
@@ -274,6 +275,7 @@ impl State {
             events,
             worker: None,
             markdown_image: None,
+            pending_config: None,
             startup_request: None,
             startup: None,
             setup: setup::Setup::default(),
@@ -409,7 +411,30 @@ impl State {
         state
     }
 
-    fn poll_startup(&mut self) {
+    fn markdown_preparing(&self, ctx: &egui::Context) -> bool {
+        self.markdown_image.as_ref().is_some_and(|image| {
+            crate::markdown_service::Service::configure(ctx, image);
+            crate::markdown_service::Service::get(ctx).is_some_and(|service| service.warm_up())
+        })
+    }
+
+    fn poll_startup(&mut self, ctx: &egui::Context) {
+        if (self.startup_request.is_some() || self.pending_config.is_some())
+            && self.markdown_preparing(ctx)
+        {
+            // Let the small parser handshake finish before model preparation
+            // competes for CPU and disk. Drafting and recovery remain available.
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+        if let Some(image) = &self.markdown_image {
+            crate::markdown_service::Service::configure(ctx, image);
+        }
+        if let Some(config) = self.pending_config.take()
+            && let Err(error) = self.attach_configuration(config, false)
+        {
+            self.fail_startup(&error);
+        }
         if let Some(request) = self.startup_request.take() {
             match crate::startup::Session::start(request) {
                 Ok(session) => self.startup = Some(session),
@@ -941,7 +966,11 @@ impl State {
     }
 
     fn drain_events(&mut self) {
-        if self.worker.is_none() && (self.startup_request.is_some() || self.startup.is_some()) {
+        if self.worker.is_none()
+            && (self.startup_request.is_some()
+                || self.pending_config.is_some()
+                || self.startup.is_some())
+        {
             return;
         }
         // Bound per-frame work even when the worker refills the bounded queue.
@@ -1656,6 +1685,7 @@ impl Drop for State {
         self.appearance_store.take();
         self.audio_paste.take();
         self.updates.take();
+        self.pending_config.take();
         self.startup_request.take();
         self.startup.take();
         self.stop_speech();
@@ -2185,10 +2215,7 @@ impl eframe::App for State {
         self.poll_placement(frame, ctx.input(|input| input.viewport().close_requested()));
         let was_ready = self.model.ready();
         let was_busy = self.model.busy();
-        self.poll_startup();
-        if let Some(image) = &self.markdown_image {
-            crate::markdown_service::Service::configure(ctx, image);
-        }
+        self.poll_startup(ctx);
         self.drain_events();
         self.close_with_pending_update(ctx);
         self.poll_updates(ctx);
@@ -2272,19 +2299,20 @@ pub(super) fn run(config: Config) -> io::Result<()> {
         Box::new(move |cc| {
             graphics::install(cc);
             configure(&cc.egui_ctx);
-            let (commands, incoming) = mpsc::channel();
-            let (events, incoming_events) = client::event_channel();
+            let (commands, _incoming) = mpsc::channel();
+            let (_events, incoming_events) = client::event_channel();
             let microphone = microphone::Microphone::new().ok();
-            let mut state = State::create(commands, incoming_events, Some(&config), microphone);
+            let mut state = State::create(commands, incoming_events, None, microphone);
+            state.model = ModelLifecycle::Preparing;
+            state.preview = false;
+            state.runtime_description = runtime_description(&config);
+            state.abliteration_enabled = config.use_abliterate_lora;
+            state.markdown_image = Some(config.broker.clone());
+            state.pending_config = Some(config);
             state.attach_recovery(recovery);
             state.attach_placement(placement, cc);
             state.attach_appearance(appearance, &cc.egui_ctx);
             state.attach_profile(profile);
-            state.worker = Some(
-                std::thread::Builder::new()
-                    .name("swift-chat-client".to_owned())
-                    .spawn(move || client::run(config, incoming, events))?,
-            );
             Ok(Box::new(state))
         }),
     )
@@ -2484,6 +2512,70 @@ mod startup_tests {
     }
 
     #[test]
+    fn model_preparation_waits_for_markdown_handshake_or_terminal_failure() -> io::Result<()> {
+        for ready in [true, false] {
+            let (request, directory) = fixture_with_broker(true)?;
+            let context = egui::Context::default();
+            let settle = crate::markdown_service::Service::startup_fixture(&context);
+            let (commands, _incoming) = mpsc::channel();
+            let (events, incoming_events) = client::event_channel();
+            let mut state = State::pending_startup(commands, incoming_events, request);
+            drop(events);
+            state.input = "Draft while formatting starts".into();
+            state.poll_startup(&context);
+            state.drain_events();
+            assert!(state.startup_request.is_some());
+            assert!(state.startup.is_none() && state.worker.is_none() && state.speech.is_none());
+            assert!(!state.warning && state.model.waiting_model());
+            assert_eq!(state.input, "Draft while formatting starts");
+            assert!(state.markdown_preparing(&context));
+            // The direct executable path also defers both the client and speech
+            // discovery, and has no live event producer while it is waiting.
+            state.startup_request.take();
+            state.pending_config = Some(Config {
+                broker: directory.join("nonadjacent-parser/broker.exe"),
+                data: directory.clone(),
+                evidence: directory.clone(),
+                frontend_port: 5173,
+                backend_port: 8081,
+                use_abliterate_lora: false,
+                use_repacked_ptq1: false,
+                native_engine: true,
+                native_row_workers: 4,
+                latest_prompt_reuse: false,
+                kv_cache: None,
+                placement: None,
+                canary: None,
+                qwen_tts: None,
+            });
+            state.poll_startup(&context);
+            state.drain_events();
+            assert!(state.pending_config.is_some());
+            assert!(state.worker.is_none() && state.speech.is_none());
+            assert!(!state.warning && state.model.waiting_model());
+            settle(ready);
+            assert!(!state.markdown_preparing(&context));
+            // The production starter is deliberately not called by this inert
+            // control: readiness must release the gate for either outcome.
+            state.pending_config.take();
+            drop(state);
+            drop(settle);
+            drop(context);
+            fs::remove_dir_all(directory)?;
+        }
+        let (request, directory) = fixture()?;
+        let (commands, _incoming) = mpsc::channel();
+        let (_events, incoming_events) = client::event_channel();
+        let state = State::pending_startup(commands, incoming_events, request);
+        let context = egui::Context::default();
+        assert!(!state.markdown_preparing(&context));
+        assert!(crate::markdown_service::Service::get(&context).is_none());
+        drop(state);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
     fn configured_markdown_image_is_available_before_model_setup_and_after_failure()
     -> io::Result<()> {
         let (request, directory) = fixture_with_broker(true)?;
@@ -2529,7 +2621,7 @@ mod startup_tests {
                 "Synthetic speech preparation failure",
             )))))
             .map_err(|_| io::Error::other("Preparation fixture disconnected"))?;
-        state.poll_startup();
+        state.poll_startup(&egui::Context::default());
         assert!(state.startup.is_none() && state.speech_checked);
         assert_eq!(state.model, ModelLifecycle::Generating);
         assert_eq!(state.request_conversation, conversation);
@@ -2725,7 +2817,7 @@ mod startup_tests {
                     speech_pending,
                 }))
                 .map_err(|_| io::Error::other("Fixture disconnected"))?;
-            state.poll_startup();
+            state.poll_startup(&egui::Context::default());
             assert!(
                 state.worker.is_none(),
                 "Pause must beat an unread model handoff"
@@ -2741,7 +2833,7 @@ mod startup_tests {
                         "Setup process cleanup could not be confirmed.",
                     )))))
                     .map_err(|_| io::Error::other("Fixture disconnected"))?;
-                state.poll_startup();
+                state.poll_startup(&egui::Context::default());
                 state.retry_setup();
                 assert!(state.startup_request.is_none());
             } else {

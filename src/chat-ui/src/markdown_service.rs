@@ -67,6 +67,7 @@ struct Request {
 #[derive(Default)]
 struct State {
     next: u64,
+    ready: bool,
     failed: bool,
     results: BTreeMap<Ticket, Status>,
 }
@@ -74,11 +75,19 @@ struct State {
 #[derive(Default)]
 struct Shared {
     cancelled: AtomicBool,
+    warmup: AtomicBool,
     cleanup_failed: AtomicBool,
     state: Mutex<State>,
 }
 
 impl Shared {
+    fn ready(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready = true;
+    }
+
     fn fail(&self) {
         let mut state = self
             .state
@@ -115,7 +124,7 @@ impl Shared {
     }
 }
 
-/// Context-owned, lazy, single-worker Markdown transport with no parser in the UI.
+/// Context-owned single-worker Markdown transport with no parser in the UI.
 pub(crate) struct Service {
     shared: Arc<Shared>,
     requests: SyncSender<Request>,
@@ -124,9 +133,7 @@ pub(crate) struct Service {
 
 impl Service {
     #[cfg(test)]
-    pub(crate) fn fixture(
-        context: &egui::Context,
-    ) -> impl Fn() -> std::io::Result<Arc<str>> + use<> {
+    fn inert(context: &egui::Context) -> (Arc<Self>, Receiver<Request>) {
         let (requests, pending) = mpsc::sync_channel(MAX_REQUESTS);
         let service = Arc::new(Self {
             shared: Arc::new(Shared::default()),
@@ -139,6 +146,14 @@ impl Service {
                 Arc::clone(&service),
             );
         });
+        (service, pending)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        context: &egui::Context,
+    ) -> impl Fn() -> std::io::Result<Arc<str>> + use<> {
+        let (service, pending) = Self::inert(context);
         move || {
             let request = pending.try_recv().map_err(std::io::Error::other)?;
             service
@@ -146,6 +161,34 @@ impl Service {
                 .complete(request.ticket, bonsai_markdown::parse(&request.source));
             Ok(request.source)
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_fixture(context: &egui::Context) -> impl Fn(bool) + use<> {
+        let (service, pending) = Self::inert(context);
+        move |ready| {
+            let _retain_requests = &pending;
+            if ready {
+                service.shared.ready();
+            } else {
+                service.shared.fail();
+            }
+        }
+    }
+
+    /// Starts the sandbox without a parse request; true means handshake pending.
+    /// Terminal formatting failure lets independent model preparation continue.
+    pub(crate) fn warm_up(&self) -> bool {
+        self.shared.warmup.store(true, Ordering::Release);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.ready
+            && !state.failed
+            && !self.shared.cancelled.load(Ordering::Acquire)
+            && !ADMISSION_CLOSED.load(Ordering::Acquire)
     }
 
     /// Supplies the verified headless image after native startup prepares it.
@@ -175,7 +218,7 @@ impl Service {
             if let Some(service) = data.get_temp::<Arc<Self>>(identity) {
                 return Some(service);
             }
-            // Source launches prepare the broker after the first UI frame.
+            // Legacy launchers can prepare the broker after the first UI frame.
             // Restored messages wait without poisoning the parser session.
             let image = data.get_temp::<PathBuf>(egui::Id::unique("offline-markdown-image"))?;
             let service = Self::new(image);
@@ -300,8 +343,15 @@ impl Drop for Active {
     }
 }
 
-fn next_request(shared: &Shared, requests: &Receiver<Request>) -> Option<Request> {
+fn next_request(
+    shared: &Shared,
+    requests: &Receiver<Request>,
+    allow_warmup: bool,
+) -> Option<Request> {
     while !shared.cancelled.load(Ordering::Acquire) {
+        if allow_warmup && shared.warmup.load(Ordering::Acquire) {
+            return None;
+        }
         match requests.recv_timeout(POLL) {
             Ok(request) if shared.pending(request.ticket) => return Some(request),
             Ok(_) | Err(RecvTimeoutError::Timeout) => {}
@@ -312,9 +362,12 @@ fn next_request(shared: &Shared, requests: &Receiver<Request>) -> Option<Request
 }
 
 fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
-    let Some(first) = next_request(shared, requests) else {
+    let first = next_request(shared, requests, true);
+    if shared.cancelled.load(Ordering::Acquire)
+        || (first.is_none() && !shared.warmup.load(Ordering::Acquire))
+    {
         return;
-    };
+    }
     let Some(_active) = Active::acquire() else {
         shared.fail();
         return;
@@ -360,7 +413,8 @@ fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
     let ready = await_event(shared, &process, &events, startup)
         .is_some_and(|event| matches!(event, protocol::Event::Ready));
     if ready {
-        let mut request = Some(first);
+        shared.ready();
+        let mut request = first.or_else(|| next_request(shared, requests, false));
         while let Some(current) = request {
             if !shared.cancelled.load(Ordering::Acquire) && shared.pending(current.ticket) {
                 let ticket = current.ticket;
@@ -378,7 +432,7 @@ fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
                 }
                 shared.complete(ticket, bytes);
             }
-            request = next_request(shared, requests);
+            request = next_request(shared, requests, false);
         }
     }
     shared.fail();
@@ -426,6 +480,28 @@ fn await_event(
 mod tests {
     use super::*;
     use std::io;
+
+    #[test]
+    fn markdown_warmup_preserves_queued_source_without_a_synthetic_request() -> io::Result<()> {
+        let context = egui::Context::default();
+        let (service, pending) = Service::inert(&context);
+        assert!(service.warm_up());
+        assert!(pending.try_recv().is_err());
+        let source: Arc<str> = Arc::from("**A restored answer**");
+        let ticket = service.request(Arc::clone(&source));
+        assert!(ticket.admitted());
+        assert!(next_request(&service.shared, &pending, true).is_none());
+        let request = next_request(&service.shared, &pending, false)
+            .ok_or_else(|| io::Error::other("Warmup consumed the queued source"))?;
+        assert_eq!(request.ticket, ticket);
+        assert!(Arc::ptr_eq(&request.source, &source));
+        service.shared.ready();
+        assert!(!service.warm_up());
+        service.reject();
+        assert!(!service.warm_up());
+        assert!(matches!(service.poll(ticket), Status::Failed));
+        Ok(())
+    }
 
     #[test]
     fn markdown_waits_for_prepared_image_and_reuses_one_context_service() -> io::Result<()> {
