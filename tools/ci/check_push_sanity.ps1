@@ -24,7 +24,7 @@ try {
     $head = (git -C $Root rev-parse --verify HEAD).Trim()
     $inputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'tools/ci', 'src/artifacts', 'src/windows-process', 'src/windows-credentials', 'scripts/release/Release-Common.ps1')
     $revisions = @($inputs | ForEach-Object { '{0}:{1}' -f $head, $_ })
-    $objects = @(git -C $Root rev-parse --end-of-options @revisions)
+    $objects = @(git -C $Root rev-parse @revisions)
     if ($objects.Count -ne $inputs.Count -or @($objects | Where-Object { $_ -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' }).Count) { throw 'Push blocked: committed checker input identities are incomplete.' }
     $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
     $tool = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
