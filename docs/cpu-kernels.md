@@ -550,6 +550,29 @@ full-model state/logit/adapter/cancellation acceptance and matched complete-requ
 benefit remain required. Runner's 0.1.28 development pin consumes these source
 changes without qualifying the named controls, model behavior or benefit.
 
+### Bounded attention score growth
+
+Prism source candidate `508edc3a2d5239918f9f568de3d5833e7d730af9`
+reuses initialized attention scores and grows their
+allocation geometrically within the existing full-context scratch reservation.
+Ordinary packed/FP16 attention and explicit prompt tiles overwrite every consumed
+score before softmax; unused causal suffixes remain unread. Growth initializes
+only newly exposed elements, preserves fallible reservation and changes no
+arithmetic, KV state, worker policy or memory admission.
+
+For sequential ingestion of `N` tokens with four packed-cache score rows, this
+removes `8 * N * (N - 1)` redundant zero-store bytes: 512 MiB minus 64 KiB at
+8,192 tokens. These are source work counts. Geometric growth can retain more
+early-context capacity than exact growth; it establishes no peak-RAM reduction.
+The same work reduction applies to X1 and X2 without relying on cache topology
+or optional instructions.
+
+Poisoned ordinary/tiled score controls, allocation refusal, non-power-of-two
+ceilings and short tails cover storage ownership independently of timing.
+Strict Release analysis/linking, compiled controls, complete-model state/logits/
+adapters/cancellation and matched CPU request benefit remain pending. This is a
+later Prism source candidate; Runner's published 0.1.28 lock remains unchanged.
+
 ## Execution and dispatch
 
 The default `experimental-neon` feature uses [`fearless_simd` 1.1.0][fearless]'s safe core API under

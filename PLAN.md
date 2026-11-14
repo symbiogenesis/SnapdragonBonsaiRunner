@@ -433,6 +433,14 @@ adoption decisions without displacing native daily-use acceptance.
   matching alone establishes neither voice quality nor intelligibility.
 - [ ] Qualify chat, warm TTS and overlap: idle/active/ASR monitoring, 30-second
   leases, Stop/wake, shared threads, memory, heat and comfort.
+- [ ] Qualify shared utterance-owned Talker/CodePredictor decoder scratch:
+  owning-lane strict Release analysis/linking; literal outputs, poisoned storage,
+  width changes, allocation identity and late-failure recovery; packed Q8/Q4,
+  adapter/model parity, cancellation and unwind. Measure retained cross-model
+  capacities and codec-callback overlap with complete X1/X2 request latency and
+  process resources under the [speech storage contract](docs/streaming-resources.md#native-speech-generation-and-streaming).
+  The local check stopped at preexisting Windows-process dependency lints before
+  compiling this candidate; all named regressions remain pending.
 - [ ] After ordinary Q4 acceptance, evaluate a verified 48 kHz decoder only with
   compatible locked weights, license, reference-audio/PCM/UI changes and listening
   acceptance.
@@ -788,6 +796,14 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 
 ## CPU kernels
 
+- [ ] Qualify [bounded attention score growth](docs/cpu-kernels.md#bounded-attention-score-growth)
+  in the later Prism source candidate: strict native Release analysis/linking,
+  poisoned ordinary/tiled scores, reservation refusal, capacity ceilings and
+  short tails; complete-model state/logits/adapters/cancellation and matched
+  CPU-only request benefit. Account for larger early-context capacity within
+  unchanged admission; source zero-store counts establish no process-RAM savings.
+  The shared local run stopped before Prism compilation/tests. Release and repin
+  only through the existing source/bundle workflow; preserve 0.1.28 rollback.
 - [ ] Qualify the [ggml-inspired execution controls](docs/cpu-kernels.md#fusion-witnesses-precision-admission-and-few-token-tiles):
   actual completed fusion counts versus separate arithmetic, adapter/unsupported
   capability rejection before callbacks, pinned BF16/F32 precision boundaries,

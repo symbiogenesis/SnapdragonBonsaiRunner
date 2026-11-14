@@ -171,6 +171,17 @@ record source/reuse limits; [PLAN.md](../PLAN.md) owns selection and qualificati
 | PCM intake | Reuses a fixed 16 KiB buffer for HTTP headers, chunk framing and PCM. Parses buffered metadata without byte-sized socket reads; chunk-size lines use ten fixed bytes. A lending helper owns cursor/alignment rules and releases available even-byte prefixes immediately, retaining at most one split sample in two reader-owned bytes. Checks cancellation/deadlines even for buffered data; requires exact chunk endings, terminal framing and EOF. |
 | TTS execution | Rust owns working Talker KV for one request, resets CodePredictor KV per frame and retains the selected codec state through synthesis. Base can retain one exact reference-prefix snapshot, capped at 64 rows and 8 MiB including row keys, hidden output and layer KV; restoring its working prefix adds at most another 8 MiB before ordinary continuation growth. Copies are fallible, matching compares complete row bits, and cancellation/failure or voice replacement discards reuse. Codec convolutions and ConvNeXt share the selected bounded projection team, with per-worker patch/activation scratch and disjoint output windows; streaming context and overlap carry keep their original update order. Cancellation runs between prompt projections, decoder layers, codebooks and frame delivery. No GGML graph allocator or foreign hidden-state bridge remains in serving. The existing output ceiling and contained Job admission still apply; full Rust scratch and peak memory require separate measurement. |
 
+Talker and CodePredictor share one utterance-owned decoder workspace across
+layers, prompt positions and acoustic frames. Its nine temporary vectors are
+overwritten before use; normalization and O/down projection buffers are reused,
+and SwiGLU replaces the gate values in place. Predictor frame guards clear
+temporary lengths on return and unwind; utterance teardown releases capacity.
+The [speech CPU contract](../src/speech-tts/README.md#cpu-execution) accounts for
+cross-model maximum widths, retained score capacity and separate output/KV/
+folded-input storage. Retained temporaries overlap codec callbacks, so fewer
+allocation sites alone establish neither lower process peaks nor faster speech.
+Serving admission is unchanged; X1/X2 resource and request benefit remain pending.
+
 The TTS library documents [Rust waveform ownership](../src/speech-tts/README.md#native-waveform-ownership)
 and [voice-conditioning lifetime](../src/speech-tts/README.md#voice-conditioning).
 The companion's [HTTP contract](../tools/qwen-tts/README.md#http-contract) owns
