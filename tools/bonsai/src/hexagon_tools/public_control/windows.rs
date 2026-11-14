@@ -528,8 +528,16 @@ mod tests {
         let public = json_file(&root.join("tools/hexagon/public-qaic.lock.json"), 1_048_576)?;
         let sources = reviewed_sources(root, &public)?;
         assert_eq!(sources.len(), 7);
-        assert!(sources.iter().any(|source| source.name == "htp_iface_stub.c"));
-        assert!(!sources.iter().any(|source| source.name == "htp_iface_skel.c"));
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.name == "htp_iface_stub.c")
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|source| source.name == "htp_iface_skel.c")
+        );
         assert!(reviewed_sources(&root.join("Cargo.toml"), &public).is_err());
         let mut changed = public;
         changed["wireCapture"]["headers"][0]["sha256"] = json!("0".repeat(64));
