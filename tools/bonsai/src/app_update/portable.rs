@@ -3,14 +3,14 @@
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{self, Read as _, Seek as _},
+    io::{self, Read as _, Seek as _, Write as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-use bonsai_artifacts::VerifiedFile;
+use bonsai_artifacts::{ArtifactError, VerifiedFile};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -50,7 +50,12 @@ impl Drop for Temporary {
     }
 }
 
-fn original(target: &Path, expected: &str) -> crate::Result<()> {
+fn original(
+    target: &Path,
+    expected: &str,
+    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+) -> crate::Result<()> {
+    checkpoint()?;
     external(target)?;
     let metadata = fs::symlink_metadata(target).map_err(|error| error.to_string())?;
     if !metadata.is_file()
@@ -58,11 +63,23 @@ fn original(target: &Path, expected: &str) -> crate::Result<()> {
         || metadata.len() == 0
         || metadata.len() > MAX_INSTALLER
         || !crate::identity::is_lower_hex(expected, 64)
-        || crate::startup_cache::digest_file(target)? != expected
     {
         return Err("The original portable executable changed; no replacement was made.".into());
     }
-    Ok(())
+    let mut stopped = None;
+    let verified = VerifiedFile::verify_with(target, metadata.len(), expected, || {
+        checkpoint().map_err(|error| {
+            stopped = Some(error);
+            ArtifactError::Cancelled
+        })
+    });
+    if let Some(error) = stopped {
+        return Err(error);
+    }
+    verified.map_err(|error| {
+        format!("The original portable executable changed; no replacement was made: {error}")
+    })?;
+    checkpoint()
 }
 
 fn validate_restart_arguments(request: &Replacement) -> crate::Result<()> {
@@ -97,11 +114,14 @@ fn publish(
     previous_sha256: &str,
     mut rename: impl FnMut(&File, &Path) -> io::Result<()>,
     mut retry: impl FnMut(&io::Error) -> bool,
+    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
 ) -> crate::Result<()> {
     loop {
+        checkpoint()?;
         // Release the read lock before the atomic rename; Windows must be able
         // to replace this image once the original launcher has exited.
-        original(target, previous_sha256)?;
+        original(target, previous_sha256, checkpoint)?;
+        checkpoint()?;
         match rename(temporary, target) {
             Ok(()) => return Ok(()),
             Err(error) if retry(&error) => {}
@@ -121,8 +141,11 @@ fn copy_and_replace(
     previous_sha256: &str,
     rename: impl FnMut(&File, &Path) -> io::Result<()>,
     retry: impl FnMut(&io::Error) -> bool,
+    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
 ) -> crate::Result<()> {
-    original(target, previous_sha256)?;
+    checkpoint()?;
+    original(target, previous_sha256, checkpoint)?;
+    checkpoint()?;
     let _parents = hold_parents(target)?;
     let temporary = target.with_file_name(format!(
         ".SwiftBonsai-update-{}.exe",
@@ -148,20 +171,39 @@ fn copy_and_replace(
     let copied = (|| {
         let mut input =
             bonsai_artifacts::open_locked_file(source.path()).map_err(|error| error.to_string())?;
-        if io::copy(&mut input, &mut destination).map_err(|error| error.to_string())? != asset.bytes
-        {
+        let mut buffer = vec![0; 1024 * 1024];
+        let mut copied = 0_u64;
+        loop {
+            checkpoint()?;
+            let count = input.read(&mut buffer).map_err(|error| error.to_string())?;
+            checkpoint()?;
+            if count == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(u64::try_from(count).map_err(|error| error.to_string())?)
+                .filter(|copied| *copied <= asset.bytes)
+                .ok_or("The portable replacement copy exceeds its expected length.")?;
+            destination
+                .write_all(&buffer[..count])
+                .map_err(|error| error.to_string())?;
+        }
+        if copied != asset.bytes {
             return Err("The portable replacement copy has an unexpected length.".into());
         }
-        destination.sync_all().map_err(|error| error.to_string())
+        destination.sync_all().map_err(|error| error.to_string())?;
+        checkpoint()
     })();
     let result = copied.and_then(|()| {
         destination.rewind().map_err(|error| error.to_string())?;
         let mut hasher = crate::identity::Hasher::new()?;
         let mut buffer = vec![0; 1024 * 1024];
         loop {
+            checkpoint()?;
             let count = destination
                 .read(&mut buffer)
                 .map_err(|error| error.to_string())?;
+            checkpoint()?;
             if count == 0 {
                 break;
             }
@@ -170,7 +212,14 @@ fn copy_and_replace(
         if hasher.finalize_hex()? != asset.sha256 {
             return Err("The portable replacement copy failed SHA-256 verification.".into());
         }
-        publish(&destination, target, previous_sha256, rename, retry)
+        publish(
+            &destination,
+            target,
+            previous_sha256,
+            rename,
+            retry,
+            checkpoint,
+        )
     });
     // Keep exclusive byte/path ownership through native handle-based rename;
     // close before removing an unpublished temporary file on failure.
@@ -224,7 +273,11 @@ pub(super) fn replace(request: &Replacement) -> crate::Result<Value> {
             "The replacement helper does not match the confirmed executable version.".into(),
         );
     }
-    original(&request.target, &request.previous_sha256)?;
+    original(
+        &request.target,
+        &request.previous_sha256,
+        &mut crate::startup_cancel::checkpoint,
+    )?;
     validate_restart_arguments(request)?;
     let directory = super::staged(&request.version)?;
     let _lock = crate::startup_cache::lock_file(&directory.join("update.lock"))?;
@@ -256,6 +309,13 @@ pub(super) fn replace(request: &Replacement) -> crate::Result<Value> {
                 Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
             );
             Instant::now() < deadline
+        },
+        &mut || {
+            crate::startup_cancel::checkpoint()?;
+            if Instant::now() >= deadline {
+                return Err("Portable replacement exceeded its aggregate copy, verification and publication allowance; the original executable was retained.".into());
+            }
+            Ok(())
         },
     )?;
     let mut command = Command::new(&request.target);
@@ -407,6 +467,7 @@ mod tests {
             &previous,
             replace_open_file,
             |_| false,
+            &mut || Ok(()),
         )?;
         assert_eq!(
             fs::read(&target).map_err(|error| error.to_string())?,
@@ -421,6 +482,7 @@ mod tests {
                 &previous,
                 replace_open_file,
                 |_| false,
+                &mut || Ok(()),
             )
             .is_err()
         );
@@ -452,6 +514,7 @@ mod tests {
                 retries += 1;
                 retries < 2
             },
+            &mut || Ok(()),
         )
         .err()
         .ok_or("Accepted a failed atomic replacement.")?;
@@ -475,10 +538,62 @@ mod tests {
                 &crate::identity::sha256(b"old executable"),
                 replace_open_file,
                 |_| false,
+                &mut || Ok(()),
             )
             .is_err()
         );
         assert_eq!(fixture.entries()?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn portable_replacement_expired_work_never_publishes_or_leaves_copy() -> crate::Result<()> {
+        for expired_at_start in [true, false] {
+            let fixture = Fixture::new()?;
+            let (source, asset) = fixture.source()?;
+            let target = fixture.target()?;
+            let expired = std::cell::Cell::new(expired_at_start);
+            let mut attempts = 0;
+            let error = copy_and_replace(
+                &source,
+                &asset,
+                &target,
+                &crate::identity::sha256(b"old executable"),
+                |file, destination| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        Err(io::Error::from_raw_os_error(32))
+                    } else {
+                        replace_open_file(file, destination)
+                    }
+                },
+                |_| {
+                    // A sharing wait cannot renew the original allowance.
+                    expired.set(true);
+                    true
+                },
+                &mut || {
+                    if expired.get() {
+                        Err("Replacement allowance expired.".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .err()
+            .ok_or("Published an expired portable replacement.")?;
+            assert!(error.contains("allowance expired"));
+            assert_eq!(attempts, usize::from(!expired_at_start));
+            assert_eq!(fixture.entries()?, 2);
+            assert_eq!(
+                fs::read(&target).map_err(|error| error.to_string())?,
+                b"old executable"
+            );
+            assert_eq!(
+                fs::read(source.path()).map_err(|error| error.to_string())?,
+                b"new executable"
+            );
+        }
         Ok(())
     }
 
@@ -499,6 +614,7 @@ mod tests {
                 Err(io::Error::from_raw_os_error(32))
             },
             |_| true,
+            &mut || Ok(()),
         )
         .err()
         .ok_or("Overwrote an original changed between retries.")?;
@@ -530,6 +646,7 @@ mod tests {
             &crate::identity::sha256(b"old executable"),
             replace_open_file,
             |_| false,
+            &mut || Ok(()),
         );
         fs::set_permissions(&target, permissions).map_err(|error| error.to_string())?;
         assert!(result.is_err());
@@ -561,6 +678,7 @@ mod tests {
                     Ok(())
                 },
                 |_| false,
+                &mut || Ok(()),
             )
             .is_err()
         );
@@ -596,6 +714,7 @@ mod tests {
             &previous,
             replace_open_file,
             |_| false,
+            &mut || Ok(()),
         )?;
         let request = Replacement {
             target: target.clone(),
