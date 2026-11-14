@@ -192,6 +192,15 @@ Rust-only Release analysis/docs passed. Arbitrary readers still need caller-boun
 I/O and the original absolute deadline. No independent native observations were
 manufactured or captured, and production ASR remains on its existing native engine.
 
+The explicit [`bonsai-asr-replay` consumer](../src/speech-asr/README.md#prebuilt-independent-replay-consumer)
+verifies the reviewed request, executing candidate image, pinned model, original
+PCM and complete packet identities before running Rust replay. Its inherited
+native counter deadline covers intake, hashing, loading, comparison and cleanup;
+the owner retains the aggregate clock, reference-arm power observations and
+external process supervision. Endpoint power observations and a successful
+complete replay remain separate from performance and production qualification.
+The consumer supplies no missing native packet or upstream observation ABI.
+
 The provider-neutral [`CaptureWriter`](../src/speech-asr/README.md#original-observation-packet-writer)
 serializes that complete replay from borrowed original observations, with reviewed
 geometry/EOS, contiguous full logits/KV and sticky write/order/cancellation/unwind
@@ -226,6 +235,14 @@ decision/code/conditioning and PCM event through a fixed 16 KiB buffer. Complete
 and terminal EOF are checked inside synthesis cleanup ownership; only successful
 engine return grants success. Literal miniature controls and independent review
 cover the comparator, without supplying original native observations.
+
+TTS's provider-neutral `CaptureWriter` writes the same bounded replay format
+from borrowed original prompts, logits, all-layer caches, decisions, codes,
+conditioning and PCM. Reviewed geometry, complete cold/warm ordering and EOS
+are mandatory; only successful provider return, terminal flush and final
+cancellation acceptance permit retaining a complete packet. Refusal and unwind
+are sticky. Adapting Rust observation events records Rust execution only; the
+writer authenticates neither a provider nor independent pinned-model answers.
 
 Eight `speaker_reference_` mathematical controls additionally exercise production
 Slaney linear/logarithmic anchors, eight-point Hann/DFT and channel-major mel,
@@ -301,6 +318,13 @@ activation/scaling arithmetic; it cannot qualify ordinary speech activations or
 authorize serving integration. A CLI route that reused fixed F32/Q2 admission
 would lose these requirements.
 
+Both Q8 oracles provide controlled preparation, review and submission methods
+that poll the caller's original cancellation and absolute work deadline through
+the final output review. Bounded owner work must use these methods and preserve
+cleanup reserves; the convenience methods impose no time bound. Focused controls
+exercise refusal during intake/arithmetic and late review without publication.
+They establish neither native cancellation latency nor signed-session admission.
+
 Final acceptance requires source/generated-source and dependency inventories,
 binary-linkage assessment, clean hosted consumer builds without a project C++
 toolchain, preserved qualification contracts and no operative retired controls.
@@ -345,10 +369,11 @@ Neither workspace has a qualified pure Rust ARM64 MSVC CRT/SEH provider.
 Schema 2 of the retained [link/package verifier](../tools/bonsai/README.md#selected-native-link-and-package-capture)
 additionally inspects actual ARM64 COFF objects and MSVC archive members for a
 bounded known C++ exception-symbol family, including short-import targets.
-This exposes references/definitions hidden by static linkage. Schema-1 replay is
+Schema 3 also observes named normal/delay imports in each exact linked/package
+image and reports unresolved ordinal imports separately. Historical replay is
 preserved. Observations do not establish which archive members reached the
 shipped image, complete runtime/source ancestry, or absence of embedded C++.
 `cppRuntimeAbsenceQualified` and `nativeRetirementQualified` remain false;
 compiler/sysroot provider replacement and recovery acceptance are still required.
-Twelve focused link/parser controls and strict native ARM64 Release all-target
-analysis passed; no actual toolchain/runtime artifact was inspected.
+Literal link/parser controls and strict native ARM64 Release all-target analysis
+cover the supported subset; no actual toolchain/runtime artifact was inspected.

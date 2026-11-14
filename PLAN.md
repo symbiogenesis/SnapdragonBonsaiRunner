@@ -411,6 +411,8 @@ adoption decisions without displacing native daily-use acceptance.
   supply those missing observations. Review predeclared scalar projection-error
   tolerances for ordinary speech activations, then qualify actual signed-path
   error and HVX quantization arithmetic independently of the exact diagnostic subset.
+  Verify cancellation and the original absolute work deadline through controlled
+  oracle preparation and final review, preserving native cleanup reserves.
 - [ ] **S2 — Qualify Rust ASR for production.** Compare the complete Rust graph and
   explicit Rust-only service against pinned Qwen3-ASR 1.7B controls. Complete
   owning hosted build/link and native-control regressions; preserve independent
@@ -421,6 +423,8 @@ adoption decisions without displacing native daily-use acceptance.
   step's raw logits and complete all-layer committed KV through the bounded packet
   writer; current debug output and device argmax cannot populate the complete
   independent replay. Include omitted-unit-axis loading controls.
+  Qualify the prebuilt source-bound replay consumer with actual independent
+  packets, matching provider identities and the original owner clock/power scope.
 - [ ] Retire remaining Runner/Prism native/reference/DLL/publisher families
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
   codec/ABI, state and fallback obligations with independent controls, then remove
@@ -444,7 +448,8 @@ adoption decisions without displacing native daily-use acceptance.
   with a qualified Rust provider while preserving preparation-peer recovery,
   worker draining and scoped cleanup. Static CRT linkage alone does not retire
   the embedded C++ exception runtime; a blanket abort profile changes recovery.
-  Qualify schema-2 COFF runtime-symbol observations on actual retained link inputs
+  Qualify schema-3 COFF and exact-image PE runtime-symbol observations on actual
+  retained link/package inputs; resolve applicable ordinal/forwarder boundaries
   separately from provider replacement, selected library members and source ancestry.
 
 ## Creative quality, adapters and memory
