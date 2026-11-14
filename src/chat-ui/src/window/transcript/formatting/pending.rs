@@ -182,6 +182,10 @@ impl Pending {
             if ticket.admitted() {
                 self.ticket = Some(ticket);
                 self.ticket_source = self.request_source.take();
+                // Admission follows polling. An idle transcript needs another
+                // frame to collect even the first completed parse.
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
             } else if service.unavailable() {
                 self.failed = true;
                 self.request_source = None;
@@ -267,6 +271,8 @@ mod tests {
             transcript,
         );
         chat.step();
+        chat.step();
+        chat.step();
         assert!(!chat.state().messages[0].markdown.failed());
         assert_eq!(
             chat.state().messages[0]
@@ -275,8 +281,20 @@ mod tests {
                 .map(|cache| cache.body.job.text.as_str()),
             Some(source)
         );
+        assert!(
+            chat.output()
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|output| output.repaint_delay > std::time::Duration::from_millis(16))
+        );
         let respond = Service::fixture(&chat.ctx);
         chat.step();
+        assert!(
+            chat.output()
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|output| output.repaint_delay <= std::time::Duration::from_millis(16))
+        );
         assert_eq!(&*respond()?, source);
         chat.step();
         let message = &chat.state().messages[0];

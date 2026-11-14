@@ -242,7 +242,8 @@ adoption decisions without displacing native daily-use acceptance.
   with private `LOCALAPPDATA` in owning native acceptance. Verify recovered
   responses format before model preparation and after model setup failures using
   the launcher's prepared image, including explicit nonadjacent broker paths and
-  unchanged-source asynchronous layout invalidation. Include the source launch's
+  unchanged-source asynchronous layout invalidation and repaint after request
+  admission in an idle window. Include the source launch's
   early broker build and preserved source-lock provenance; older launchers without
   an image handoff retain deferred formatting. Parser entry must precede model,
   credential and network setup. Retain actual child exit state before cleanup
