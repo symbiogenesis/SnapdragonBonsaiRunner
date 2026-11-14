@@ -150,3 +150,51 @@ fn keeps_original_tolerance_signed_zero_and_finite_controls() -> crate::Result<(
     }
     Ok(())
 }
+
+#[test]
+fn native_greedy_receipts_bind_retained_logits_and_first_maximum() -> crate::Result<()> {
+    let logits = [-4.0_f32, -0.0, 0.0, 2.0, 2.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    native::validate_greedy(&logits, 3)?;
+    for claimed in [0, 1, 2, 4, 5, u64::MAX] {
+        assert!(native::validate_greedy(&logits, claimed).is_err());
+    }
+    let zeros = [(-0.0_f32).to_le_bytes(), 0.0_f32.to_le_bytes()].concat();
+    native::validate_greedy(&zeros, 0)?;
+    assert!(native::validate_greedy(&zeros, 1).is_err());
+    for malformed in [&[][..], &logits[..logits.len() - 1]] {
+        assert!(native::validate_greedy(malformed, 3).is_err());
+    }
+    for index in 0..5 {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut changed = logits.clone();
+            changed[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(native::validate_greedy(&changed, 3).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_greedy_receipts_reject_agreeing_stale_tokens_despite_logit_tolerance() -> crate::Result<()>
+{
+    let native_logits = [1.0005_f32.to_le_bytes(), 1.0_f32.to_le_bytes()].concat();
+    let rust_logits = [1.0_f32.to_le_bytes(), 1.0005_f32.to_le_bytes()].concat();
+    let component = json!({"elements":2,"offset":0,"stride":4,"code":"f32"});
+    assert_eq!(
+        compare_bytes(&native_logits, &rust_logits, &component, 0.001, 0.001)?["failedElements"],
+        0
+    );
+    native::validate_greedy(&native_logits, 0)?;
+    native::validate_greedy(&rust_logits, 1)?;
+    // A shared stale token must not turn different retained maxima into a match.
+    for claimed in [0, 1, 2, u64::MAX] {
+        assert!(
+            native::validate_greedy(&native_logits, claimed).is_err()
+                || native::validate_greedy(&rust_logits, claimed).is_err()
+        );
+    }
+    Ok(())
+}

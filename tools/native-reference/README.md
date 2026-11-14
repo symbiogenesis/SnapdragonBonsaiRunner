@@ -107,6 +107,9 @@ hybrid layout: 16 FP16 K/V layers and 48 F32 convolution/recurrent layers, exact
 positions/types/extents and complete consumption. Control JSON, stdout and logits
 are bounded before reads. Every value must be finite and satisfy
 `1e-3 + 1e-3 * abs(reference)`; greedy-ID equality cannot override a value failure.
+Each claimed greedy ID must also equal the first maximum independently recovered
+from its retained logits, including signed-zero ties. Agreement between two
+unverified claimed IDs cannot establish greedy equality.
 The complete one-token comparison is 129 files / 39,504,384 values.
 
 Model-free synthetic checks cover transposed V, recurrent inventory, the native

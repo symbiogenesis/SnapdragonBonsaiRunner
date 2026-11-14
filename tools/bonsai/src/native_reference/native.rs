@@ -228,6 +228,30 @@ pub(super) fn adapter_condition(capture: &Value, condition: &str) -> crate::Resu
     Ok(json!({"validated":true}))
 }
 
+pub(super) fn validate_greedy(logits: &[u8], claimed: u64) -> crate::Result<()> {
+    let (values, trailing) = logits.as_chunks::<4>();
+    require(
+        !values.is_empty() && trailing.is_empty(),
+        "greedy logits extent differs",
+    )?;
+    let mut maximum = f32::NEG_INFINITY;
+    let mut greedy = 0;
+    for (index, bytes) in values.iter().enumerate() {
+        let value = f32::from_le_bytes(*bytes);
+        require(value.is_finite(), "nonfinite greedy logit")?;
+        // Both pinned collectors choose the first maximum, including signed-zero
+        // ties. Derive it from retained bytes instead of trusting matching claims.
+        if value > maximum {
+            maximum = value;
+            greedy = index;
+        }
+    }
+    require(
+        usize::try_from(claimed).ok() == Some(greedy),
+        "claimed greedy token differs from retained logits",
+    )
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "The historical comparator receipt binds complete state and every explicit fixed execution control."
@@ -277,9 +301,12 @@ pub(super) fn compare(request: &Value) -> crate::Result<Value> {
         expected_logits.len() == 248_320 * 4,
         "native logits extent changed",
     )?;
+    let actual_logits = read(&actual, 248_320 * 4)?;
+    validate_greedy(&expected_logits, integer(step, "greedyToken")?)?;
+    validate_greedy(&actual_logits, integer(&rust_step, "greedy_token")?)?;
     let mut compared = compare_bytes(
         &expected_logits,
-        &read(&actual, 248_320 * 4)?,
+        &actual_logits,
         &json!({"elements":248_320,"offset":0,"stride":4,"code":"f32"}),
         0.001,
         0.001,
