@@ -80,7 +80,8 @@ data directory until explicitly deleted. Developer
 ## Publish a release
 
 Follow push authorization and CI ownership under [AGENTS.md](../AGENTS.md).
-When the user requests a release, review source, publish `main` and dispatch `release.yml` with
+When the user requests a release, review source, publish `main`, create and push
+the matching tag at that commit, then dispatch `release.yml` with
 `prerelease=true`. An omitted `tag` uses `workspace.package.version` from
 `Cargo.toml`; an explicit tag must match it. The publication body links to the
 README at that immutable source revision. No per-version notes are required.
@@ -94,6 +95,12 @@ clean-machine, actual-model, quality, performance or isolation acceptance.
 Only the publication job writes release content. It uploads the exact three-asset
 inventory to a draft and verifies remote assets and source before publication.
 The tag must identify the checked commit. Existing publications are never replaced.
+
+Successful draft creation is confirmed by an independent API read of the returned
+release ID, without relying on immediate catalog visibility. Draft admission
+allows GitHub's temporary `untagged-` URL within the same repository while checking
+the exact ID, tag, source, description, flags and asset identities. Published
+releases must use the canonical tag URL.
 
 To recover interrupted publication, rerun the failed job from the same run:
 
@@ -109,3 +116,5 @@ Draft mutation still requires the original current `main`. Unknown assets,
 changed metadata or bytes, and absent or changed tags stop recovery. A new
 dispatch refuses an existing release; rebuilding or deleting a draft is not a
 recovery path.
+If a source correction is needed after a draft was created, retain that failed
+outcome and prepare a new version from the corrected source.

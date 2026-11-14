@@ -139,7 +139,7 @@ impl Publication {
         let body = json!({"tag_name":self.tag()?,"target_commitish":self.revision()?,"name":format!("Swift Bonsai 2 Runner {}",self.tag()?),"body":self.policy["notes"],"draft":true,"prerelease":self.policy["prerelease"]});
         let input = working.join("release-create.json");
         write_json(&input, &body)?;
-        let failure = transport(
+        let created = transport(
             "gh",
             &[
                 "api".into(),
@@ -151,15 +151,25 @@ impl Publication {
             ],
             180,
         )
-        .err();
-        let release = self.find(transport)?.ok_or_else(|| {
-            format!(
-                "Draft creation was not confirmed; mutation is not retried. {}",
-                failure.unwrap_or_default()
-            )
-        })?;
-        self.check(&release, true, 0, false)?;
-        Ok(release)
+        .and_then(|raw| response(&raw))
+        .and_then(|release| super::id(&release["id"]));
+        match created {
+            Ok(id) => {
+                // The catalog may not show a new draft yet. Its mutation reply
+                // supplies only a lookup identity; an independent GET must
+                // confirm that identity and every reviewed policy field.
+                let release = self.get(transport, id)?;
+                self.check(&release, true, id, false)?;
+                Ok(release)
+            }
+            Err(failure) => {
+                let release = self.find(transport)?.ok_or_else(|| {
+                    format!("Draft creation was not confirmed; mutation is not retried. {failure}")
+                })?;
+                self.check(&release, true, 0, false)?;
+                Ok(release)
+            }
+        }
     }
     fn upload(&self, transport: &mut Transport<'_>, id: u64) -> Result<()> {
         let assets = self.policy["assets"].as_object().ok_or("Missing assets.")?;
@@ -358,6 +368,137 @@ pub(super) fn publish(value: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn creation_fixture() -> Result<(Publication, Value)> {
+        let root = std::env::temp_dir().join(format!(
+            "release-create-test-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&root).map_err(|error| error.to_string())?;
+        let revision = "a".repeat(40);
+        let publication = Publication {
+            repository_root: root,
+            policy: json!({"repository":"example/repo","tag":"v0.3.2","sourceRevision":revision,"notes":"reviewed notes","prerelease":true,"assets":{}}),
+        };
+        let draft = json!({"id":445_527_014,"url":"https://api.github.com/repos/example/repo/releases/445527014","html_url":"https://github.com/example/repo/releases/tag/untagged-0123456789abcdef0123","tag_name":"v0.3.2","target_commitish":revision,"name":"Swift Bonsai 2 Runner v0.3.2","body":"reviewed notes","draft":true,"prerelease":true,"assets":[]});
+        Ok((publication, draft))
+    }
+
+    fn discard_creation(publication: &Publication) -> Result<()> {
+        fs::remove_file(publication.repository_root.join("release-create.json"))
+            .and_then(|()| fs::remove_dir(&publication.repository_root))
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn release_publication_created_draft_uses_id_readback_when_catalog_is_stale() -> Result<()> {
+        let (publication, draft) = creation_fixture()?;
+        let mut calls = Vec::new();
+        let created = publication.create(
+            &mut |command, args, _| {
+                assert_eq!(command, "gh");
+                if args[1] == "--method" {
+                    assert_eq!(args[2], "POST");
+                    assert_eq!(args[3], "repos/example/repo/releases");
+                    calls.push("POST");
+                    return Ok(draft.to_string());
+                }
+                if args[1].ends_with("?per_page=100") {
+                    calls.push("stale catalog");
+                    return Ok(String::new());
+                }
+                assert_eq!(args[1], "repos/example/repo/releases/445527014");
+                calls.push("GET by ID");
+                Ok(draft.to_string())
+            },
+            &publication.repository_root,
+        )?;
+        assert_eq!(created, draft);
+        assert_eq!(calls, ["POST", "GET by ID"]);
+        discard_creation(&publication)
+    }
+
+    #[test]
+    fn release_publication_created_draft_requires_matching_authoritative_readback() -> Result<()> {
+        let (publication, draft) = creation_fixture()?;
+        let mut readbacks = vec![None];
+        for (field, value) in [
+            ("id", json!(445_527_015)),
+            ("tag_name", json!("v0.3.3")),
+            ("target_commitish", json!("b".repeat(40))),
+            ("name", json!("changed title")),
+            ("body", json!("changed notes")),
+            ("draft", json!(false)),
+            ("prerelease", json!(false)),
+            ("assets", json!([{"name":"unreviewed.exe"}])),
+        ] {
+            let mut changed = draft.clone();
+            changed[field] = value;
+            readbacks.push(Some(changed));
+        }
+        for readback in readbacks {
+            let mut calls = Vec::new();
+            let result = publication.create(
+                &mut |command, args, _| {
+                    assert_eq!(command, "gh");
+                    if args[1] == "--method" {
+                        assert_eq!(args[2], "POST");
+                        calls.push("POST");
+                        return Ok(draft.to_string());
+                    }
+                    assert_eq!(args[1], "repos/example/repo/releases/445527014");
+                    calls.push("GET by ID");
+                    readback
+                        .as_ref()
+                        .map(Value::to_string)
+                        .ok_or_else(|| "Authoritative readback unavailable".into())
+                },
+                &publication.repository_root,
+            );
+            assert!(
+                result.is_err(),
+                "Trusted mutation response without readback"
+            );
+            assert_eq!(calls, ["POST", "GET by ID"]);
+        }
+        discard_creation(&publication)
+    }
+
+    #[test]
+    fn release_publication_uncertain_creation_uses_catalog_without_repeating_post() -> Result<()> {
+        let (publication, draft) = creation_fixture()?;
+        let replies: [Result<String>; 4] = [
+            Err("Lost mutation response".into()),
+            Ok("malformed response".into()),
+            Ok(json!({"id":0}).to_string()),
+            Ok(json!({"id":445_527_014.0}).to_string()),
+        ];
+        for reply in replies {
+            let mut calls = Vec::new();
+            let created = publication.create(
+                &mut |command, args, _| {
+                    assert_eq!(command, "gh");
+                    if args[1] == "--method" {
+                        assert_eq!(args[2], "POST");
+                        calls.push("POST");
+                        return reply.clone();
+                    }
+                    if args[1].ends_with("?per_page=100") {
+                        calls.push("catalog");
+                        return Ok(json!({"id":445_527_014,"tag_name":"v0.3.2"}).to_string());
+                    }
+                    assert_eq!(args[1], "repos/example/repo/releases/445527014");
+                    calls.push("GET by ID");
+                    Ok(draft.to_string())
+                },
+                &publication.repository_root,
+            )?;
+            assert_eq!(created, draft);
+            assert_eq!(calls, ["POST", "catalog", "GET by ID"]);
+        }
+        discard_creation(&publication)
+    }
+
     #[test]
     fn release_publication_ambiguous_mutations_are_read_back_once_and_published_replay_never_writes()
     -> Result<()> {
