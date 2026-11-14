@@ -123,6 +123,7 @@ fn tool_identity(revision: &str) -> Result<(PathBuf, String)> {
 fn create(request: &Value) -> Result<Value> {
     let (started, frequency) = ticks()?;
     let started_unix = unix()?;
+    let power_before = crate::host_cpu::power_snapshot();
     require(
         cfg!(target_arch = "aarch64"),
         "Use native Windows ARM64 tools.",
@@ -135,7 +136,7 @@ fn create(request: &Value) -> Result<Value> {
         "Use actual dispatched run ID.",
     )?;
     tool_identity(runner)?;
-    let result = json!({"schema_version":1,"kind":"prism-cpu-bundle-owner-start","run_id":request["runId"],"runner_commit":runner,"candidate_commit":candidate,"clock_frequency":frequency,"started_tick":started,"deadline_tick":started.checked_add(600*frequency).ok_or("Owner clock overflow.")?,"started_unix_milliseconds":started_unix,"deadline_unix_milliseconds":started_unix+600_000,"power_before":crate::host_cpu::power_snapshot(),"budget_seconds":600,"conservative_estimate_seconds":600,"planning_estimate_seconds":[300,480],"schedule":SCHEDULE,"fixed_work":"One bundle-only ABBA comparison with 32 output tokens reserved per arm: each collector has 60 seconds, each supervised helper at most 95 seconds, with 10 seconds condition checks and 5 seconds metadata. Reserve 60 seconds bootstrap/intake and 100 seconds cleanup/evaluation/upload; 600 seconds maximum aggregate. Planning estimate 5-8 minutes is not an empirical timing prediction. Stop once complete or infeasible; no retry or split matrix."});
+    let result = json!({"schema_version":1,"kind":"prism-cpu-bundle-owner-start","run_id":request["runId"],"runner_commit":runner,"candidate_commit":candidate,"clock_frequency":frequency,"started_tick":started,"deadline_tick":started.checked_add(600*frequency).ok_or("Owner clock overflow.")?,"started_unix_milliseconds":started_unix,"deadline_unix_milliseconds":started_unix+600_000,"power_before":power_before,"budget_seconds":600,"conservative_estimate_seconds":600,"planning_estimate_seconds":[300,480],"schedule":SCHEDULE,"fixed_work":"One bundle-only ABBA comparison with 32 output tokens reserved per arm: each collector has 60 seconds, each supervised helper at most 95 seconds, with 10 seconds condition checks and 5 seconds metadata. Reserve 60 seconds bootstrap/intake and 100 seconds cleanup/evaluation/upload; 600 seconds maximum aggregate. Planning estimate 5-8 minutes is not an empirical timing prediction. Stop once complete or infeasible; no retry or split matrix."});
     save(&destination, &result, true)?;
     Ok(result)
 }
@@ -335,6 +336,29 @@ fn finalize(request: &Value) -> Result<Value> {
         "Final power unknown or mismatched; qualification pending.",
     )?;
     Ok(result)
+}
+
+fn admit(request: &Value) -> Result<Value> {
+    let original = original(request)?;
+    matches(
+        &original["candidate_commit"],
+        &json!(hex(&request["candidateCommit"], 40)?),
+    )?;
+    tool_identity(&variable("GITHUB_SHA"))?;
+    let (now, frequency) = ticks()?;
+    require(
+        integer(&original["deadline_tick"], 1, i64::MAX.unsigned_abs())?.saturating_sub(now)
+            >= 540 * frequency,
+        "The complete fixed comparison cannot fit its original pre-bootstrap allowance.",
+    )?;
+    let destination = PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or("Missing RUNNER_TEMP.")?)
+        .join("CpuBundle-OwnerStart.json");
+    save(&destination, &original, true)?;
+    append_env(
+        "GITHUB_ENV",
+        &format!("BONSAI_CPU_BUNDLE_START={}", destination.display()),
+    )?;
+    Ok(json!({"Status":"admitted","StartReceipt":destination}))
 }
 fn proof(root: &Path, relative: &str) -> Result<Value> {
     Ok(json!({"path":relative,"sha256":digest(&root.join(relative))?}))
@@ -662,6 +686,7 @@ fn retain(context: &Context, packet: &Path, packet_data: &Value, failure: bool) 
 pub(super) fn run(request: &Value) -> Result<Value> {
     match request["operation"].as_str() {
         Some("bundle-owner-start") => create(request),
+        Some("bundle-owner-admit") => admit(request),
         Some("bundle-owner-finalize") => finalize(request),
         Some("bundle-capture") => capture(request),
         _ => Err("Unknown owner operation.".into()),

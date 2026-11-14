@@ -216,7 +216,7 @@ fn checked(root: &Path, reference: &Value, seen: &mut BTreeSet<PathBuf>) -> Resu
     hex(&reference["sha256"], 64)?;
     read(&path)
 }
-fn power(value: &Value) -> Result<(bool, bool)> {
+pub(super) fn power(value: &Value) -> Result<(bool, bool)> {
     subset(
         value,
         &json!({"status":"observed","source":"GetSystemPowerStatus"}),
@@ -755,6 +755,7 @@ pub(super) fn run(request: &Value) -> Result<Value> {
             "runnerCommit",
             "candidateCommit",
         ],
+        Some("bundle-owner-admit") => &["operation", "startReceipt", "candidateCommit"],
         Some("bundle-owner-finalize") => &["operation", "startReceipt"],
         Some("bundle-capture") => &[
             "operation",
@@ -777,7 +778,12 @@ pub(super) fn run(request: &Value) -> Result<Value> {
     )?;
     match request["operation"].as_str() {
         Some("bundle-prepare") => prepare::run(request),
-        Some("bundle-owner-start" | "bundle-owner-finalize" | "bundle-capture") => {
+        Some(
+            "bundle-owner-start"
+            | "bundle-owner-admit"
+            | "bundle-owner-finalize"
+            | "bundle-capture",
+        ) => {
             #[cfg(windows)]
             {
                 owner::run(request)

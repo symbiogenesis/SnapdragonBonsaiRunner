@@ -193,7 +193,10 @@ $env:BONSAI_TOOLS_PATH = '<absolute-checked-tools-path>'
 $env:CPU_BUNDLE_OWNER_START_RECEIPT = $ownerReceipt
 ```
 
-Carry that variable into owner-managed bootstrap. Register an ephemeral runner
+Carry both `CPU_BUNDLE_OWNER_START_RECEIPT` and `BONSAI_TOOLS_PATH` into
+owner-managed bootstrap. The first step now delegates original-budget admission
+to that prebuilt native helper before checkout or same-run artifact intake.
+Register an ephemeral runner
 with only `cpu-bundle-<run-id>`; missing/foreign receipts reject capture. The
 script does not register runners or create credentials.
 

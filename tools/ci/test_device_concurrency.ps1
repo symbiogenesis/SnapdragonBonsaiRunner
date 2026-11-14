@@ -34,6 +34,18 @@ $cases=[ordered]@{
         foreach ($name in $device) { Assert-Ci ('prepare' -cin (Get-CiDependencies $jobs[$name])) ($workflowName+' device job must consume preparation.') }
     }
  }
+ native_owner_clocks_and_jobs_stay_in_rust={
+    $x2=(Get-CiJobBlocks $workflows['x2-cpu-evaluation']).evaluate
+    Assert-Ci ($x2.IndexOf("operation = 'ci-owner-admit'") -lt $x2.IndexOf('uses: actions/checkout@')) 'Original native receipt must be admitted before checkout/intake.'
+    foreach ($operation in @('ci-capture','ci-owner-finalize')) { Assert-Ci ($x2.Contains("operation = '$operation'")) "Missing native $operation handoff." }
+    foreach ($scriptPolicy in @('Diagnostics.Stopwatch','ProcessStartInfo','WaitForExit','.Kill(')) { Assert-Ci (-not $x2.Contains($scriptPolicy)) 'Owner clocks and process lifetime must stay native.' }
+    Assert-Ci ($x2.Contains("env.BONSAI_X2_UPLOAD_ALLOWED == 'true'")) 'Native original-budget upload gate is required.'
+    Assert-Ci ($x2.Contains('timeout-minutes: 1')) 'The upload must have its predeclared one-minute bound.'
+    $bundle=(Get-CiJobBlocks $workflows['cpu-bundle-comparison']).compare
+    if (-not $bundle) { $bundle=@((Get-CiJobBlocks $workflows['cpu-bundle-comparison']).Values | Where-Object { $_.Contains("operation = 'bundle-owner-admit'") })[0] }
+    Assert-Ci ($bundle.IndexOf("operation = 'bundle-owner-admit'") -lt $bundle.IndexOf('uses: actions/checkout@')) 'Frozen comparison must admit its original native budget first.'
+    Assert-Ci (-not $bundle.Contains('Diagnostics.Stopwatch')) 'Frozen comparison clocks must stay native.'
+ }
  rejected_tts_target_stays_hosted={
     $workflow=$workflows['tts-evaluation']; $header=($workflow -split '(?m)^jobs:\s*$',2)[0]
     Assert-Ci (-not $header.Contains('swift-lora-snapdragon')) 'A rejected TTS option cannot reserve the physical device.'

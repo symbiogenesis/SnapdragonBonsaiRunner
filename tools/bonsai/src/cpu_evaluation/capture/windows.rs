@@ -377,13 +377,17 @@ pub(super) fn run(request: &Request) -> crate::Result<Value> {
     )?;
     let native = crate::host_cpu::run(&json!({}))?;
     let plan = observed_plan(request, &native)?;
-    let evidence = std::env::temp_dir().join(format!(
-        "Bonsai-X2CpuEvaluation-{}",
-        crate::startup_process::unique()
-    ));
+    let evidence = request.evidence_directory.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!(
+            "Bonsai-X2CpuEvaluation-{}",
+            crate::startup_process::unique()
+        ))
+    });
     external(&evidence)?;
     fs::create_dir(&evidence).map_err(|error| error.to_string())?;
-    publish_evidence(&evidence)?;
+    if request.evidence_directory.is_none() {
+        publish_evidence(&evidence)?;
+    }
     let report = report(request, &native, &plan);
     let mut context = Context {
         request,

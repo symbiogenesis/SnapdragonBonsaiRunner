@@ -9,6 +9,7 @@ use crate::Result;
 mod bundle;
 mod capture;
 mod conditions;
+mod owner_ci;
 mod source_comparison;
 
 #[derive(Deserialize)]
@@ -120,6 +121,12 @@ fn arguments(model: &str, threads: Threads, prompt: &str) -> Result<Vec<String>>
 /// Rejects unknown fields, unsupported operations/devices, unbounded CPU counts,
 /// unavailable candidate budgets and invalid compiled CPU plans.
 pub fn run(request: Value) -> Result<Value> {
+    if request["operation"]
+        .as_str()
+        .is_some_and(|operation| operation.starts_with("ci-"))
+    {
+        return owner_ci::run(request);
+    }
     if request["operation"]
         .as_str()
         .is_some_and(|operation| operation.starts_with("bundle-"))

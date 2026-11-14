@@ -788,13 +788,40 @@ The Rust maintenance planner selects only `6/6` decode/prefill threads against t
 `4/4` control. These are thread counts without affinity pinning; Windows chooses placement.
 One fixed short synthetic creative-writing prompt runs in two reversed pairs: at most four fresh processes, a 16-token cap and a 45-second process deadline. OS file cache is not flushed. Other thread budgets and long prompts remain in PLAN.
 
-All setup, verification, preflight, model loading and comparison share one at-most-240-second
-process budget within the five-minute owner job. Hosted tool compilation is outside that device job;
-the device verifies this run's exact revision, digest and ARM64 tools instead of compiling. The
-parent charges checkout and tool intake to its remaining job clock, caps the child at the lesser of
-240 seconds and the remaining time before 270 job seconds, and bounds teardown at ten seconds,
-within the original deadline. Rust reserves twenty seconds for cleanup/reporting and refuses model
-trials when the remaining budget cannot fit the four per-sample deadlines plus teardown room.
+All bootstrap, setup, verification, preflight, model loading, comparison and
+retention share one original five-minute allowance. Hosted tool compilation is
+outside that device job; the owner supplies the exact checked native helper,
+its schema-3 receipt and both bound companion helpers before starting the
+pre-bootstrap declaration. The device's same-run intake must match that helper
+identity and never compiles a replacement.
+
+Before registering the run-specific ephemeral runner, use that checked helper:
+
+```powershell
+$env:BONSAI_TOOLS_PATH = '<absolute same-run checked bonsai-tools.exe>'
+$env:BONSAI_X2_OWNER_START_RECEIPT = Join-Path $env:TEMP ('x2-owner-' + $runId + '.json')
+& $env:BONSAI_TOOLS_PATH cpu-evaluation --json (@{
+    operation = 'ci-owner-start'; outputPath = $env:BONSAI_X2_OWNER_START_RECEIPT
+    runId = $runId; runnerRevision = $runnerRevision
+} | ConvertTo-Json -Compress)
+```
+
+Carry both variables into owner-managed bootstrap. Rust admits that receipt
+before checkout, checks its original monotonic/UTC anchors, and retains AC,
+battery saver and available charge observations before setup and after owned
+work, plus each sample's existing independent observations and final post-upload
+power. Missing/mismatched power blocks eligibility; later observations never fill
+an earlier unknown. Equal endpoints do not establish continuous stability.
+
+Native `ci-capture` owns the credential-free worker Job and original deadline.
+It reserves **70 seconds** for the upload's one-minute workflow bound and final
+power, closing work by original second 230 within the unchanged 300-second cap.
+The worker's separate maximum remains 240 seconds; setup consumes the original
+clock and can leave less. Rust retains its twenty-second cleanup/report reserve
+and refuses the entire fixed screen when the four sample deadlines and teardown
+cannot fit. This conservative retention reserve can make the selected screen
+infeasible: retain the no-go, never reduce the matrix, retry or create a new clock.
+The owning CI's post-upload native check remains a separate acceptance gate.
 
 The completion batch's opt-in `totalTimeoutSeconds` (1..240) charges artifact/runtime hashing and
 all samples to one monotonic clock. Hash verification checks that clock at the existing one-second

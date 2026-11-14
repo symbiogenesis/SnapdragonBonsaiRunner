@@ -60,6 +60,7 @@ fn startup_command(command: &str, request: &serde_json::Value) -> bool {
         ))
         || (command == "speech-evaluation" && request["operation"] == "evaluate")
         || (command == "cpu-evaluation" && request["operation"] == "bundle-prepare")
+        || (command == "cpu-evaluation" && request["operation"] == "ci-capture")
         || (command == "chat-package"
             && matches!(request["operation"].as_str(), Some("launch" | "start")))
 }

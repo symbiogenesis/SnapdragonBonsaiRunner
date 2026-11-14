@@ -35,7 +35,10 @@ struct Request {
     work_deadline_tick: Option<u64>,
     parent_process_id: Option<u32>,
     parent_creation_time_file_time: Option<u64>,
+    evidence_directory: Option<PathBuf>,
 }
+
+pub(super) const MINIMUM_COMPLETE_WORK_SECONDS: u64 = 221;
 
 const fn budget() -> u64 {
     240
@@ -117,7 +120,7 @@ fn batch_allowance(remaining: u64, plan: &Value) -> crate::Result<u64> {
         "The X2 workload must remain the complete fixed four-sample screen.",
     )?;
     require(
-        remaining >= 201,
+        remaining >= MINIMUM_COMPLETE_WORK_SECONDS - 20,
         "Setup left insufficient room for the complete four-sample X2 screen and teardown; qualification remains pending.",
     )?;
     Ok(remaining - 10)

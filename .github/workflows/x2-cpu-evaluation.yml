@@ -66,10 +66,15 @@ jobs:
     runs-on: [self-hosted, Windows, ARM64, "x2-cpu-${{ github.run_id }}"]
     timeout-minutes: 5
     steps:
-      - name: Start the complete owner-job budget before checkout and tool intake
+      - name: Admit the original source-bound pre-bootstrap owner receipt
         shell: pwsh
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          "BONSAI_X2_JOB_STARTED_UTC=$([DateTime]::UtcNow.ToString('o'))" >> $env:GITHUB_ENV
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $request = @{ operation = 'ci-owner-admit'; startReceipt = $env:BONSAI_X2_OWNER_START_RECEIPT }
+          & $env:BONSAI_TOOLS_PATH cpu-evaluation --json (ConvertTo-Json -InputObject $request -Compress)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -81,79 +86,19 @@ jobs:
           BONSAI_X2_ATTRIBUTION: ${{ inputs.observe_output_progress }}
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $data = Join-Path $env:LOCALAPPDATA 'SwiftBonsai2'
-          $jobStarted = [DateTime]::Parse($env:BONSAI_X2_JOB_STARTED_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
-          # All checkout/download/intake time is charged to the same job clock.
-          # Stop work by 270 seconds, retaining thirty seconds for teardown/upload.
-          $workSeconds = [int][Math]::Floor([Math]::Min(240, 270 - ([DateTime]::UtcNow - $jobStarted).TotalSeconds))
-          if ($workSeconds -lt 1) { throw 'Owner-job setup exhausted the complete X2 budget; qualification remains pending.' }
-          $frequency = [Diagnostics.Stopwatch]::Frequency
-          $workDeadline = [Diagnostics.Stopwatch]::GetTimestamp() + ([long]$workSeconds * $frequency)
-          # CIM remains an independent OS observation; Rust verifies its count/name
-          # against native topology and registry identity before planning or capture.
-          $processors = @(Get-CimInstance -ClassName Win32_Processor -Property Name, NumberOfLogicalProcessors -OperationTimeoutSec 10 |
+          # CIM is the independent Windows environment observation. Rust admits
+          # its typed name/count and owns clocks, credential removal and Jobs.
+          $processors = @(Get-CimInstance Win32_Processor -Property Name, NumberOfLogicalProcessors -OperationTimeoutSec 10 |
             ForEach-Object { @{ name = $_.Name; logicalProcessors = [int]$_.NumberOfLogicalProcessors } })
-          if ($env:BONSAI_X2_ATTRIBUTION -cnotin @('true', 'false')) { throw 'Invalid attribution input.' }
-          $caller = [Diagnostics.Process]::GetCurrentProcess()
-          try { $creation = $caller.StartTime.ToUniversalTime().ToFileTimeUtc() } finally { $caller.Dispose() }
-          $request = Join-Path $env:RUNNER_TEMP 'x2-cpu-request.json'
-          @{ operation = 'capture'; dataDirectory = $data; cimProcessors = $processors
-             workBudgetSeconds = $workSeconds; workDeadlineTick = $workDeadline
-             observeOutputProgress = ($env:BONSAI_X2_ATTRIBUTION -ceq 'true')
-             parentProcessId = $PID; parentCreationTimeFileTime = $creation } |
-            ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $request -Encoding utf8NoBOM
-          # Keep Actions upload credentials in this step, outside the complete
-          # evaluation/model process tree. Preserve CI identity and Windows env.
-          $start = [Diagnostics.ProcessStartInfo]::new($env:BONSAI_TOOLS_PATH)
-          $start.WorkingDirectory = $env:RUNNER_TEMP
-          $start.UseShellExecute = $false
-          $start.CreateNoWindow = $true
-          $start.RedirectStandardOutput = $true
-          $start.RedirectStandardError = $true
-          foreach ($argument in @('cpu-evaluation', '--request', $request)) {
-            $start.ArgumentList.Add($argument)
-          }
-          foreach ($name in @('ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNNER_INPUT_TOKEN')) {
-            [void]$start.Environment.Remove($name)
-          }
-          $child = [Diagnostics.Process]::Start($start)
-          try {
-            $stdout = $child.StandardOutput.ReadToEndAsync()
-            $stderr = $child.StandardError.ReadToEndAsync()
-            $remainingMilliseconds = [int][Math]::Floor(($workDeadline - [Diagnostics.Stopwatch]::GetTimestamp()) * 1000.0 / $frequency) - 10000
-            if ($remainingMilliseconds -lt 1 -or -not $child.WaitForExit($remainingMilliseconds)) { throw 'The complete X2 screen exceeded its original owner-job deadline.' }
-            [Console]::Out.Write($stdout.GetAwaiter().GetResult())
-            [Console]::Error.Write($stderr.GetAwaiter().GetResult())
-            $code = $child.ExitCode
-          } finally {
-            try {
-              if (-not $child.HasExited) {
-                $child.Kill($true)
-                if (-not $child.WaitForExit(10000)) { throw 'X2 screen cleanup exceeded ten seconds.' }
-              }
-            } finally { $child.Dispose() }
-          }
-          if ($code -ne 0) { throw 'X2 CPU screening failed; inspect retained evidence.' }
-          $entry = @(Get-Content -LiteralPath $env:GITHUB_ENV | Where-Object { $_.StartsWith('BONSAI_X2_CPU_EVIDENCE=') })
-          if ($entry.Count -ne 1) { throw 'X2 CPU evidence path is missing or ambiguous.' }
-          $evidence = $entry[0].Substring('BONSAI_X2_CPU_EVIDENCE='.Length)
-          $report = Get-Content -LiteralPath (Join-Path $evidence 'cpu-evaluation.json') -Raw | ConvertFrom-Json
-          @(('CPU: ' + $report.ProcessorName),
-            'Fresh-process CPU thread screening only. Defaults remain unchanged.',
-            'Prompt/decode timings are separate; complete process time includes loading.',
-            'CLI template defaults differ from chat; energy, quality and sustained comfort remain unqualified.',
-            ('Execution conditions: ' + $report.ExecutionConditions.Status),
-            'Each sample retains native CPU/power observations before launch and after teardown, outside its wall timer.',
-            ('Instrumented output/memory attribution: ' + $report.InstrumentedAttribution),
-            'Attribution captures suppress every timing ratio; file output boundaries do not establish startup/prefill/decode or first-token latency.',
-            'Ratios below one favor the candidate; mismatched token counts or changed/unknown batch/sample/pair conditions suppress ratios.') |
-            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
-          $report.Comparisons | ConvertTo-Json -Depth 8 | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          $request = @{ operation = 'ci-capture'; startReceipt = $env:BONSAI_X2_OWNER_START
+            dataDirectory = (Join-Path $env:LOCALAPPDATA 'SwiftBonsai2'); cimProcessors = $processors
+            attributionInput = $env:BONSAI_X2_ATTRIBUTION }
+          & $env:BONSAI_TOOLS_PATH cpu-evaluation --json (ConvertTo-Json -InputObject $request -Depth 8 -Compress)
       - name: Retain credential-free synthetic CPU evidence
-        if: always() && env.BONSAI_X2_CPU_EVIDENCE != ''
+        if: always() && env.BONSAI_X2_CPU_EVIDENCE != '' && env.BONSAI_X2_UPLOAD_ALLOWED == 'true'
+        timeout-minutes: 1
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: x2-cpu-${{ github.run_id }}-${{ github.run_attempt }}
@@ -164,3 +109,12 @@ jobs:
           if-no-files-found: error
           retention-days: 90
           compression-level: 1
+      - name: Confirm original X2 deadline and power through bounded upload
+        if: always() && env.BONSAI_X2_OWNER_START != ''
+        shell: pwsh
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & $env:BONSAI_TOOLS_PATH cpu-evaluation --json (@{ operation = 'ci-owner-finalize'; startReceipt = $env:BONSAI_X2_OWNER_START } | ConvertTo-Json -Compress)

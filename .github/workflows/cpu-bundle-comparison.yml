@@ -147,29 +147,14 @@ jobs:
     steps:
       - name: Admit the original pre-bootstrap owner allowance
         shell: pwsh
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          # The owner creates this external receipt before registering/starting
-          # this run's ephemeral runner. Missing setup timing is not inferred.
-          if (-not $env:CPU_BUNDLE_OWNER_START_RECEIPT -or
-              -not [IO.Path]::IsPathFullyQualified($env:CPU_BUNDLE_OWNER_START_RECEIPT)) {
-            throw 'Create the original owner-start receipt before ephemeral-runner bootstrap.'
-          }
-          $original = Get-Content -LiteralPath $env:CPU_BUNDLE_OWNER_START_RECEIPT -Raw | ConvertFrom-Json
-          $frequency = [Diagnostics.Stopwatch]::Frequency
-          $now = [Diagnostics.Stopwatch]::GetTimestamp()
-          if ($original.kind -cne 'prism-cpu-bundle-owner-start' -or $original.schema_version -ne 1 -or
-              $original.run_id -cne $env:GITHUB_RUN_ID -or $original.runner_commit -cne $env:GITHUB_SHA -or
-              $original.candidate_commit -cne $env:CPU_BUNDLE_RUNTIME_COMMIT -or
-              $original.clock_frequency -ne $frequency -or $original.budget_seconds -ne 600 -or
-              $original.deadline_tick -ne $original.started_tick + 600L * $frequency -or
-              $original.started_tick -ge $now -or $original.deadline_tick - $now -lt 540L * $frequency) {
-            throw 'The complete fixed comparison cannot fit its original pre-bootstrap allowance.'
-          }
-          $start = Join-Path $env:RUNNER_TEMP 'CpuBundle-OwnerStart.json'
-          Copy-Item -LiteralPath $env:CPU_BUNDLE_OWNER_START_RECEIPT -Destination $start
-          "BONSAI_CPU_BUNDLE_START=$start" >> $env:GITHUB_ENV
+          $PSNativeCommandUseErrorActionPreference = $true
+          $request = @{ operation = 'bundle-owner-admit'; startReceipt = $env:CPU_BUNDLE_OWNER_START_RECEIPT
+            candidateCommit = $env:CPU_BUNDLE_RUNTIME_COMMIT }
+          & $env:BONSAI_TOOLS_PATH cpu-evaluation --json (ConvertTo-Json -InputObject $request -Compress)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
