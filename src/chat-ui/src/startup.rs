@@ -849,7 +849,9 @@ mod tests {
                 false,
                 None,
             );
-            let error = result.expect_err("Synthetic startup unexpectedly succeeded.");
+            let error = result
+                .err()
+                .ok_or_else(|| io::Error::other("Synthetic startup unexpectedly succeeded."))?;
             let message = error.to_string();
             assert!(message.contains(expected), "{name}: {message}");
             if mode != "bound" {

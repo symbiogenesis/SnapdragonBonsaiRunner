@@ -28,7 +28,7 @@ impl Budget {
         }
     }
 
-    fn admit(&mut self, bytes: usize) -> bool {
+    const fn admit(&mut self, bytes: usize) -> bool {
         if self.layouts >= MAX_LAYOUTS_PER_FRAME
             || (self.layouts != 0 && self.bytes.saturating_add(bytes) > LAYOUT_BYTES_PER_FRAME)
         {
@@ -398,7 +398,7 @@ mod tests {
             .with_context_setup(|context| {
                 context.add_font_provider(crate::window::test_font_provider());
                 context.style_mut_of(egui::Theme::Dark, |style| {
-                    style.scroll_animation = egui::style::ScrollAnimation::none()
+                    style.scroll_animation = egui::style::ScrollAnimation::none();
                 });
             })
             .build_ui_state(
