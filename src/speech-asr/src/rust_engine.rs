@@ -15,7 +15,7 @@ use crate::{
 use std::{fs::OpenOptions, io, path::Path, sync::Arc};
 
 /// Independent arithmetic identity; not the native GGML/flash-attention identity.
-pub const ARITHMETIC_IDENTITY: &str = "rust-asr-scalar-f32-v1-f16-kv-f64-erfc-gelu";
+pub const ARITHMETIC_IDENTITY: &str = "rust-asr-scalar-f32-v2-f16-conv-kv-f64-erfc-gelu";
 
 /// Borrowed numerical observations for an independently retained replay packet.
 ///

@@ -11,7 +11,7 @@
 )]
 
 use crate::{
-    decoder::Projection,
+    decoder::{Projection, binary16_operand},
     frontend::{Frontend, MelSpectrogram},
     protocol::EncoderLayout,
 };
@@ -208,9 +208,13 @@ impl Encoder {
 
     /// Admit every convolution, transformer and output-head shape before execution.
     ///
+    /// Convolution kernels are rounded once to nearest-even binary16, matching
+    /// the admitted native F16 dot operands. Biases and scalar sums stay F32.
+    ///
     /// # Errors
-    /// Rejects missing/incompatible weights, unsupported geometry or nonfinite biases.
-    pub fn new(config: Config, weights: Weights) -> io::Result<Self> {
+    /// Rejects missing/incompatible weights, unsupported geometry, nonfinite
+    /// biases or convolution weights that overflow binary16.
+    pub fn new(config: Config, mut weights: Weights) -> io::Result<Self> {
         let c = config;
         if !(1..=128).contains(&c.mel_bins)
             || !(1..=1024).contains(&c.channels)
@@ -229,8 +233,9 @@ impl Encoder {
         if layout.rows_per_chunk > c.max_positions {
             return Err(invalid());
         }
-        for (layer, convolution) in weights.convolutions.iter().enumerate() {
+        for (layer, convolution) in weights.convolutions.iter_mut().enumerate() {
             convolution.validate(9 * if layer == 0 { 1 } else { c.channels }, c.channels)?;
+            convolution.weights.round_convolution_weights()?;
         }
         if weights.convolution_out.dimensions() != (c.channels * c.mel_bins.div_ceil(8), c.hidden) {
             return Err(invalid());
@@ -413,8 +418,10 @@ fn convolve(
                             && px < width
                             && py < height
                         {
+                            // The pinned native im2col stage narrows every
+                            // activation before its convolution dot product.
                             patch[(channel * 3 + ky) * 3 + kx] =
-                                input[(channel * height + py) * width + px];
+                                binary16_operand(input[(channel * height + py) * width + px])?;
                         }
                     }
                 }

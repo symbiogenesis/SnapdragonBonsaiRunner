@@ -383,6 +383,9 @@ fn rust_asr_replay_rejects_changed_identity_input_and_invalid_tolerances() -> io
     let mut identity = binding();
     identity.reference.revision = [0; 20];
     assert!(Replay::new(packet.bytes.as_slice(), &identity, Tolerances::BITS).is_err());
+    let mut identity = binding();
+    identity.candidate.arithmetic = "rust-asr-scalar-f32-v1-f16-kv-f64-erfc-gelu";
+    assert!(Replay::new(packet.bytes.as_slice(), &identity, Tolerances::BITS).is_err());
     for invalid in [f32::NAN, f32::INFINITY, -1.0] {
         let tolerances = Tolerances {
             logits: Tolerance::Finite {

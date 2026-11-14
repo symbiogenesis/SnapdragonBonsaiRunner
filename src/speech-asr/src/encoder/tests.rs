@@ -111,6 +111,100 @@ fn rust_asr_encoder_stride_padding_kernel_order_and_finite_output() -> io::Resul
 }
 
 #[test]
+fn rust_asr_encoder_convolution_half_operands_and_every_stage_narrowing() -> io::Result<()> {
+    let Encoder {
+        config,
+        mut weights,
+    } = fixture()?;
+    let mut kernel = vec![0.0; 9];
+    // Binary16 ties: 16 + 2^-7 rounds down to even 16, whereas
+    // 1 + 3*2^-11 rounds up to even 1 + 2^-9. The exact product
+    // 16*(1 + 2^-9) = 16.03125 is large enough that GELU rounds to x.
+    kernel[4] = 16.0 + 1.0 / 128.0;
+    weights.convolutions[0].weights = Projection::f32(9, 1, kernel)?;
+    let encoder = Encoder::new(config, weights)?;
+    assert_eq!(
+        convolve(
+            &encoder.weights.convolutions[0],
+            &[1.0 + 3.0 / 2048.0],
+            1,
+            1,
+            1,
+            &mut || false,
+        )?,
+        [16.03125]
+    );
+
+    let mut kernel = vec![0.0; 9];
+    kernel[4] = 1.0;
+    let first = Linear {
+        weights: Projection::f32(9, 1, kernel.clone())?,
+        bias: vec![0.0],
+    };
+    kernel[4] = 16.0;
+    let second = Linear {
+        weights: Projection::f32(9, 1, kernel)?,
+        bias: vec![0.0],
+    };
+    let first_output = convolve(&first, &[1.0], 1, 1, 1, &mut || false)?;
+    assert!((first_output[0] - 0.841_344_7).abs() < 0.000_000_1);
+    // GELU(1) narrows independently to half 0x3abb = 0.84130859375
+    // before the next stage. Its exact product with 16 is 13.4609375.
+    assert_eq!(
+        convolve(&second, &first_output, 1, 1, 1, &mut || false)?,
+        [13.4609375]
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_asr_encoder_convolution_half_boundaries_and_finite_overflow() -> io::Result<()> {
+    for (input, expected) in [
+        (-0.0_f32, -0.0_f32),
+        (1.0 / 33_554_432.0, 0.0),
+        (3.0 / 33_554_432.0, 1.0 / 8_388_608.0),
+        (-3.0 / 33_554_432.0, -1.0 / 8_388_608.0),
+        (65_504.0, 65_504.0),
+        (-65_504.0, -65_504.0),
+    ] {
+        assert_eq!(
+            super::binary16_operand(input)?.to_bits(),
+            expected.to_bits()
+        );
+    }
+    for input in [65_520.0, -65_520.0, f32::INFINITY, f32::NAN] {
+        assert!(super::binary16_operand(input).is_err());
+    }
+    let Encoder {
+        config,
+        mut weights,
+    } = fixture()?;
+    let mut kernel = vec![0.0; 9];
+    kernel[4] = 65_520.0;
+    weights.convolutions[1].weights = Projection::f32(9, 1, kernel)?;
+    assert!(Encoder::new(config, weights).is_err());
+    let fresh = fixture()?;
+    assert!(
+        convolve(
+            &fresh.weights.convolutions[0],
+            &[65_520.0],
+            1,
+            1,
+            1,
+            &mut || false,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        convolve(&fresh.weights.convolutions[0], &[1.0], 1, 1, 1, &mut || {
+            false
+        },)?,
+        [0.0]
+    );
+    Ok(())
+}
+
+#[test]
 fn rust_asr_encoder_layer_norm_bias_and_bidirectional_attention() -> io::Result<()> {
     let norm = Norm {
         weight: vec![2.0, 3.0],

@@ -64,6 +64,20 @@ enum Storage {
 }
 
 impl Projection {
+    // ggml_conv_2d uses the F16 im2col dot provider for admitted F32/F16
+    // kernels. Its F32 kernel rows are converted to that provider's F16
+    // operand type too. Do this once when admitting the encoder, rather than
+    // converting the same immutable kernel at every spatial position.
+    pub(super) fn round_convolution_weights(&mut self) -> io::Result<()> {
+        let Storage::Float(values) = &mut self.data else {
+            return Err(invalid());
+        };
+        for value in values {
+            *value = binary16_operand(*value)?;
+        }
+        Ok(())
+    }
+
     /// Return `(input width, output rows)` for checked graph construction.
     #[must_use]
     pub const fn dimensions(&self) -> (usize, usize) {
@@ -239,6 +253,15 @@ fn cache_value(value: f32, precision: CachePrecision) -> io::Result<f32> {
     }
     if matches!(precision, CachePrecision::F32) {
         return Ok(value);
+    }
+    binary16_operand(value)
+}
+
+// Shared exact nearest-even conversion for F16 cache and convolution operands.
+// Reject finite values that would narrow to infinity before graph publication.
+pub(super) fn binary16_operand(value: f32) -> io::Result<f32> {
+    if !value.is_finite() {
+        return Err(invalid());
     }
     let bits = value.to_bits();
     let sign = bits & 0x8000_0000;

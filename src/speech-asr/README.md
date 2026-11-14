@@ -137,12 +137,21 @@ flattening, per-chunk positional sinusoids, ragged-tail trimming, full bidirecti
 attention, biased layer normalization/GELU FFNs and the decoder-width output head.
 Its GGUF loader rejects different frontend metadata and preserves checkpoint
 window/filterbank tensors. `encode_pcm` consumes the Rust frontend directly.
-Six `rust_asr_encoder_` controls cover hand-calculated convolution edges, GELU,
+The `rust_asr_encoder_` controls cover hand-calculated convolution edges, GELU,
 normalization, bidirectional attention, sinusoidal positions and complete chunk-tail
-output, including failure/cancellation replay. The scalar F32 convolution,
+output, including failure/cancellation replay. The F16-operand/F32-sum convolution,
 f64 erf-based GELU and F32-activation Q8 projections have distinct arithmetic
 identities in `rust-encoder.json`; they do not establish native optimized-kernel
 or full-model parity.
+
+Each convolution now narrows kernels and im2col activations to nearest-even
+binary16, matching the pinned `ggml_conv_2d` operand boundary, including F32
+kernel conversion by its F16 dot provider. Kernels narrow once during encoder
+admission; each stage narrows the preceding GELU output separately. Biases and
+scalar accumulation retain F32. Independent dyadic tie/subnormal/overflow and
+two-stage GELU controls cover this correction. Candidate arithmetic is v2;
+old v1 packet identities reject rather than being reinterpreted. Native SIMD
+reduction order, complete model parity and S2 acceptance remain pending.
 
 `rust_engine::RustRecognizer` composes the complete Rust graph as an explicit
 qualification API. It loads all components through one immutable model-file
@@ -324,7 +333,7 @@ describe required reviewed values, rather than supplying replay evidence):
     "compiler": "exact candidate compiler identity",
     "target": "aarch64-pc-windows-msvc",
     "executableSha256": "64 lowercase hexadecimal digest characters for this replay executable",
-    "arithmetic": "rust-asr-scalar-f32-v1-f16-kv-f64-erfc-gelu"
+    "arithmetic": "rust-asr-scalar-f32-v2-f16-conv-kv-f64-erfc-gelu"
   },
   "model": "C:\\Models\\Qwen3-ASR-1.7B-Q8_0.gguf",
   "pcm": { "path": "C:\\Replay\\original.f32le", "bytes": 804, "sha256": "reviewed digest" },

@@ -2,14 +2,16 @@
   "schemaVersion": 1,
   "provider": "rust-independent-scalar-audio-encoder",
   "scope": "complete-three-convolution-bidirectional-transformer-and-decoder-width-output-head",
-  "arithmeticIdentity": "rust-scalar-encoder-f32-v1-f64-erfc-gelu",
+  "arithmeticIdentity": "rust-scalar-encoder-f32-v2-f16-conv-f64-erfc-gelu",
   "nativeSource": {
     "package": "transcribe-cpp-sys", "version": "0.4.1",
     "repository": "https://github.com/handy-computer/transcribe.cpp",
     "commit": "4d7c1ccefd39e5a9ea36cca5f8fefc6dcc14b99b", "license": "MIT",
     "files": [
       {"path": "src/arch/qwen3_asr/encoder.cpp", "sha256": "88c18dc5b9e8de38dbea97d100b84f70b2cd149e7fe6fd75b52e30366825f2d9"},
-      {"path": "src/arch/qwen3_asr/model.cpp", "sha256": "90aeefb27ffb74d57ed338a27c342b44f388207b8c4a111faa5673e975c43ecc"}
+      {"path": "src/arch/qwen3_asr/model.cpp", "sha256": "90aeefb27ffb74d57ed338a27c342b44f388207b8c4a111faa5673e975c43ecc"},
+      {"path": "ggml/src/ggml.c", "sha256": "7e8bf2b60598b50d718f46aa3c36c9293b10f4e7dfde6844f0693e6fc976d505"},
+      {"path": "ggml/src/ggml-cpu/ggml-cpu.c", "sha256": "f3dd3cbd942d9b5604ebf40c4d1e06a3817c694232e69899e1d9e6b135e7128e"}
     ]
   },
   "controls": {
@@ -20,7 +22,8 @@
     "nativeQuantizedMatmulParity": false, "nativeFlashAttentionParity": false
   },
   "semantics": {
-    "convolution": "three-kernel3-stride2-pad1-stages-with-erf-gelu-and-independent-mel-chunk-padding",
+    "convolution": "three-kernel3-stride2-pad1-stages-with-nearest-even-f16-kernel-and-im2col-operands-f32-scalar-sums-erf-gelu-and-independent-mel-chunk-padding",
+    "convolutionNarrowing": "immutable-kernels-rounded-once-at-encoder-admission-and-activations-before-each-stage-dot-bias-and-gelu-stay-f32-narrowing-overflow-rejects-before-publication",
     "flattening": "time-major-then-channel-slow-frequency-fast",
     "position": "f64-sinusoid-10000-timescale-rounded-to-f32-restarting-per-chunk",
     "tail": "remove-padded-final-chunk-rows-before-every-transformer-block",
