@@ -787,32 +787,37 @@ is verified before execution. The recovery helper's independent
 identity covers the root manifest, lockfile, compiler pin, `.cargo` and
 `src/windows-process`, so ordinary `tools/ci` changes can invalidate the checker
 without invalidating its recovery supervisor. Explicit preparation invalidates
-the previous receipts and removes both packages' build outputs before rebuilding,
-preserving dependency caches. A failed build cannot admit previous helper bytes.
-Its caller must enforce the declared source-build allowance.
+the previous receipts and makes two target-specific `cargo rustc` calls, one for
+each binary, with a fresh invocation metadata nonce. This forces binary
+recompilation and relinking while preserving dependency and library artifacts.
+A failed build cannot admit previous helper bytes. Its caller must enforce the
+declared source-build allowance.
 
 A missing, stale or corrupt checker or checker receipt triggers one automatic
 recovery attempt. The hook removes the invalid checker receipt before verifying
 the independent recovery helper and snapshotting committed `HEAD`. The native
-supervisor owns focused checker-package cleanup followed by one locked, offline
-Cargo build and its descendants. Removing package outputs, including linked
-executable copies, prevents Cargo from re-admitting corrupted cached bytes as
-fresh outputs; dependency caches remain reusable. Cleanup and build share a
-90-second maximum with reserves for the remaining checks and cleanup inside the
-original push allowance. Nightly checksum/content fingerprints preserve reuse of
+supervisor owns one locked, offline `cargo rustc --bin bonsai-ci` invocation and
+its descendants. A fresh target-specific `-C metadata=<nonce>` argument forces
+the selected binary to recompile and relink, replacing its output aliases instead
+of accepting corrupted cached executable bytes as fresh. Dependency and library
+artifacts remain reusable; recovery neither cleans build directories nor marks
+an existing cache as safe to delete. The compilation has a 90-second maximum with
+reserves for the remaining checks and process-tree cleanup inside the original
+push allowance. Nightly checksum/content fingerprints preserve reuse of
 unchanged dependency artifacts across fresh archive paths. A successful build
 publishes the new checker receipt; the hook verifies it and resumes immutable
 outgoing-tip checks, passing all elapsed preparation time into the existing
 aggregate deadline. A failed build, exhausted allowance or unavailable dependency
-blocks the push without another
-attempt. Missing, stale or corrupt recovery-helper bytes or receipt require
+blocks the push without another attempt. Missing, stale or corrupt
+recovery-helper bytes or receipt require
 explicit `-Prepare`; an invalid checker is never used as the recovery authority.
 
 A valid checker keeps the policy-only fast path and does not compile. Recovery
 fetches no Cargo dependencies and cannot renew an expired clock. Neither recovery
 nor explicit preparation supplies an outgoing-tip verdict or authorizes a push.
 Owning CI still qualifies complete preparation and recovery receipts, invalidation,
-typed receipt-field rejection, corrupted-output regeneration, shared deadlines,
+typed receipt-field rejection, nonce-driven corrupted-output regeneration,
+dependency/library reuse, legacy-cache compatibility, shared deadlines,
 process-tree cleanup, snapshots and batched script controls.
 Local focused checks do not establish that CI verdict.
 `BONSAI_ACTIONLINT_PATH` can supply the reviewed actionlint 1.7.12 executable for

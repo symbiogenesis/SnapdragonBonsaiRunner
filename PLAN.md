@@ -70,8 +70,9 @@ adoption decisions without displacing native daily-use acceptance.
   its declared allowance. Qualify one-attempt automatic checker recovery through
   the independently source/digest-bound native supervisor: missing/stale/corrupt
   checker receipts, array-valued receipt-field rejection, unchanged fast path,
-  recovery-helper rejection, corrupted linked-output regeneration, focused
-  package cleanup with dependency-cache reuse, offline incremental reuse,
+  recovery-helper rejection, nonce-driven corrupted linked-output regeneration,
+  target-specific recompilation with dependency/library reuse, legacy-cache
+  compatibility without directory deletion or cache marking, offline incremental reuse,
   failed-build receipt invalidation, process-tree teardown
   and immutable-tip continuation within the original shared push allowance.
   Qualify trusted candidate-root adapter controls for both cache actions and
