@@ -155,15 +155,33 @@ fn finish_response_after_cleanup(
         })
         .flatten();
     let parsed = stream.is_some();
+    let response_failure = stream.as_ref().and_then(response_pending_reason);
     report["samples"][index]["responseParsePassed"] = json!(parsed);
     report["samples"][index]["stream"] = stream.unwrap_or(Value::Null);
     if !cleaned {
         report["pendingReason"] = json!("owned-cleanup-unconfirmed");
     } else if captured.is_some() && !parsed {
         report["pendingReason"] = json!("invalid-or-incomplete-response");
+    } else if let Some(reason) = response_failure {
+        report["pendingReason"] = json!(reason);
     }
     save_acceptance_report(evidence, report);
-    cleaned && parsed
+    cleaned && parsed && response_failure.is_none()
+}
+
+fn response_pending_reason(stream: &Value) -> Option<&'static str> {
+    let content = stream["visibleContent"].as_str().unwrap_or("");
+    (stream["finishReason"] != "stop"
+        || stream["naturallyStopped"] != true
+        || stream["reportedCompletionTokens"]
+            .as_u64()
+            .is_none_or(|n| !(1..=u64::from(CAP)).contains(&n))
+        || content.trim().is_empty()
+        || stream["visibleContentSha256"] != digest(content.as_bytes())
+        || stream["requestMilliseconds"]
+            .as_f64()
+            .is_none_or(|ms| !ms.is_finite() || ms <= 0.0))
+    .then_some("incomplete-or-invalid-complete-response")
 }
 
 fn sample_pending_reason(sample: &Value, repacked: bool, row_workers: u8) -> Option<&'static str> {
@@ -179,7 +197,6 @@ fn sample_pending_reason(sample: &Value, repacked: bool, row_workers: u8) -> Opt
         true,
     );
     let stream = &sample["stream"];
-    let content = stream["visibleContent"].as_str().unwrap_or("");
     if [
         "rowWorkerReadinessVersion",
         "rowWorkerReadinessRevision",
@@ -194,16 +211,7 @@ fn sample_pending_reason(sample: &Value, repacked: bool, row_workers: u8) -> Opt
     if sample["modelIdentity"] != model_identity(repacked)
         || sample["configuredNativeRowWorkers"] != row_workers
         || sample["verifiedReadinessObserved"] != true
-        || stream["finishReason"] != "stop"
-        || stream["naturallyStopped"] != true
-        || stream["reportedCompletionTokens"]
-            .as_u64()
-            .is_none_or(|n| !(1..=u64::from(CAP)).contains(&n))
-        || content.trim().is_empty()
-        || stream["visibleContentSha256"] != digest(content.as_bytes())
-        || stream["requestMilliseconds"]
-            .as_f64()
-            .is_none_or(|ms| !ms.is_finite() || ms <= 0.0)
+        || response_pending_reason(stream).is_some()
         || sample["cleanup"]["ownedJobEmpty"] != true
         || sample["cleanup"]["listenerReleased"] != true
     {
@@ -1082,6 +1090,71 @@ fn native_representation_complete_bytes_survive_expired_second_request() {
             fs::remove_dir(evidence).unwrap();
         }).await.unwrap();
     });
+}
+
+#[test]
+fn native_representation_incomplete_first_arm_blocks_next_owner_after_cleanup() {
+    let evidence = env::temp_dir().join(format!(
+        "Bonsai-Representation-Incomplete-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&evidence).unwrap();
+    for (finish_reason, tokens, content, elapsed) in [
+        (
+            "length",
+            Some(u64::from(CAP)),
+            "Oak",
+            Duration::from_millis(1),
+        ),
+        ("stop", None, "Oak", Duration::from_millis(1)),
+        ("stop", Some(0), "Oak", Duration::from_millis(1)),
+        ("stop", Some(1), "  ", Duration::from_millis(1)),
+        ("stop", Some(1), "Oak", Duration::ZERO),
+    ] {
+        let content_event = json!({"choices":[{"delta":{"content":content},"finish_reason":null}]});
+        let mut terminal = json!({"choices":[{"delta":{},"finish_reason":finish_reason}]});
+        if let Some(tokens) = tokens {
+            terminal["usage"] = json!({"completion_tokens":tokens});
+        }
+        let payload = format!("data: {content_event}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+        let captured = CapturedResponse {
+            bytes: format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",payload.len()).into_bytes(),
+            elapsed,
+        };
+        let mut report = json!({"passed":false,"samples":[{
+            "cleanup":{"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true}}]});
+        assert!(!finish_response_after_cleanup(
+            Some(&captured),
+            &evidence,
+            &mut report,
+            0
+        ));
+        assert_eq!(
+            report["pendingReason"],
+            "incomplete-or-invalid-complete-response"
+        );
+        assert_eq!(report["samples"][0]["responseParsePassed"], true);
+        assert_eq!(
+            report["samples"][0]["stream"]["finishReason"],
+            finish_reason
+        );
+        assert_eq!(
+            report["samples"][0]["stream"]["reportedCompletionTokens"],
+            json!(tokens)
+        );
+        assert_eq!(report["samples"][0]["stream"]["visibleContent"], content);
+        assert_eq!(report["samples"][0]["cleanup"]["ownedJobEmpty"], true);
+        let retained: Value =
+            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
+        assert_eq!(retained, report);
+        assert_eq!(retained["passed"], false);
+    }
+    fs::remove_file(evidence.join("acceptance.json")).unwrap();
+    fs::remove_dir(evidence).unwrap();
 }
 
 #[test]

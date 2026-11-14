@@ -171,7 +171,9 @@ startup/request times and original-PQ2 rollback observations before the next arm
 Fallible response capture retains transport failures and raw-byte identity before
 owned cleanup. Complete-response parsing runs only after confirmed cleanup;
 malformed or truncated responses remain pending with cleanup and power endpoints,
-and cannot admit the next owner. Failed or timed-out startup also retains a
+and cannot admit the next owner. A parsed response with a length stop, missing or
+zero usage, blank content or invalid timing also stops the pair after cleanup;
+its parsed losing outcome remains retained. Failed or timed-out startup retains a
 pending terminal receipt instead of unwinding through the pair.
 Latency/resource ratios require identical bytes and usage, eligible matched power,
 matching released worker-readiness identities and independently verified CPU
