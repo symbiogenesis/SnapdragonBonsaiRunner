@@ -72,12 +72,6 @@
   ],
   "files": [
     {
-      "path": "tools/hexagon/public_qaic_wire.c",
-      "bytes": 5643,
-      "sha256": "a3d8ca46afe5bdf58690a58f243ad917fe97d68c879f67a02a257f24725fc0bb",
-      "family": "hexagon-qaic"
-    },
-    {
       "path": "tools/hexagon/windows_queue_abi.c",
       "bytes": 11246,
       "sha256": "42b162626ecbbee43a7c21be4fa9801546bc773cd92ca53c46ef0a506ca1833e",
@@ -99,20 +93,20 @@
     },
     {
       "path": ".github/workflows/hexagon-qualification.yml",
-      "bytes": 34670,
-      "sha256": "e7ac26c953677a592b8f0a73839f43907c34059596c72dd846bc8cbb229bb47f",
+      "bytes": 30163,
+      "sha256": "a2a6a7f8f0575d2ca3ae30a6d11f05a5064ca55e79c38c653f25f67da8899742",
       "family": "hexagon-windows-abi"
     },
     {
       "path": "Cargo.lock",
-      "bytes": 132197,
-      "sha256": "23665f31bd43ad3849344dedd24da199ccea6bff175bc181d49348bb1f58893d",
+      "bytes": 133023,
+      "sha256": "1765bb78a66af5030fee89f7a9f5f982809a281ad3a029b807016c6c099839b0",
       "family": "native-asr"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 3372,
-      "sha256": "932aa2baed90d89dea988e016e1967196d97950b5e63ac91bf56d33fbd59bdad",
+      "bytes": 4283,
+      "sha256": "76ddbf7923a8b0ed3324a0298ff69087004fd3f09e9d91ad0eda0e287a06f6c9",
       "family": "msvc-unwind"
     },
     {
@@ -135,14 +129,14 @@
     },
     {
       "path": "src/cpu-policy/src/lib.rs",
-      "bytes": 25751,
-      "sha256": "c262d5f33e1a5c709f8ececa6569a800f0e55a8a3a6232e32f071ad11ff873ed",
+      "bytes": 25925,
+      "sha256": "e152f163d4409cbd071aa111ffdb7ddc50a9f8a39c8a67af87ee090f864d0b2f",
       "family": "msvc-unwind"
     },
     {
       "path": "src/speech-asr/Cargo.toml",
-      "bytes": 1302,
-      "sha256": "743d14a016f139672d16bc4a32fe3e94f34abf56138e613c3e5bb4b836c1f6a6",
+      "bytes": 1797,
+      "sha256": "411608fc9dc644a42d82b1e2bc69e7474d0d4dfa86f1b5cf6500fa976596611c",
       "family": "native-asr"
     },
     {
@@ -159,8 +153,8 @@
     },
     {
       "path": "src/speech-asr/src/native.rs",
-      "bytes": 13079,
-      "sha256": "de2baab18ae910921f10afbc2df33065115d9e446127873520c35716bbf36b7c",
+      "bytes": 13090,
+      "sha256": "f101703fd6a7cca6a56d1a3351b9c41e7fe5e07b22c8ed7e5b722a9136a04445",
       "family": "native-asr"
     },
     {
@@ -182,9 +176,33 @@
       "family": "compiler-provisioning"
     },
     {
+      "path": "tools/bonsai/src/hexagon_tools/public_control/mod.rs",
+      "bytes": 18070,
+      "sha256": "e53f73a0bf18379e12b38eb44482032a2f6bcc8f96a86c9572b0943f14929377",
+      "family": "hexagon-qaic"
+    },
+    {
+      "path": "tools/bonsai/src/hexagon_tools/public_control/retained.rs",
+      "bytes": 10376,
+      "sha256": "2d0b183b94d71e9e816303105d59647a5f66f83fc412ee28ff720216f374f909",
+      "family": "hexagon-qaic"
+    },
+    {
+      "path": "tools/bonsai/src/hexagon_tools/public_control/windows.rs",
+      "bytes": 18607,
+      "sha256": "e930ef6fbda76c81a015ba055a13de38118769c78bb9fa76d847f27a1564468f",
+      "family": "hexagon-qaic"
+    },
+    {
+      "path": "tools/bonsai/src/hexagon_tools/public_control/wire.rs",
+      "bytes": 3919,
+      "sha256": "47b982a49fd4690b32ba22c29ed2cb741a423b269d146bb4d0d55b044ddfbde5",
+      "family": "hexagon-qaic"
+    },
+    {
       "path": "tools/bonsai/src/native_startup.rs",
-      "bytes": 38078,
-      "sha256": "66405aec1db43d06de6a36541fc0568d25125021deb0128207c5bf522130adc3",
+      "bytes": 38082,
+      "sha256": "e44d8080a97831211d9d8fb15c4a155f7a63042baa8f7a150d4848f19b424329",
       "family": "compiler-provisioning"
     },
     {
@@ -201,14 +219,14 @@
     },
     {
       "path": "tools/bonsai/src/publisher_startup.rs",
-      "bytes": 12611,
-      "sha256": "640e6e2471a1da14312df00e02c4f89c27231519d40538eac1e2642f60ee9e9f",
+      "bytes": 13191,
+      "sha256": "92fa661c38b147292d5c244d517f046bc6cf09519c0025d55b5677f78ea0ceb6",
       "family": "publisher-runtime"
     },
     {
       "path": "tools/bonsai/src/publisher_startup/windows.rs",
-      "bytes": 13845,
-      "sha256": "2e89a900ed94937485de3d0587db24d20ab5de27c32ede6de4682556218d52b2",
+      "bytes": 13459,
+      "sha256": "7eb62764c63242c4383db7b252d147bc6b747f3a0909cd2fc9091e6feda871cd",
       "family": "publisher-runtime"
     },
     {
@@ -218,33 +236,27 @@
       "family": "compiler-provisioning"
     },
     {
+      "path": "tools/hexagon/public_idl_control.rs",
+      "bytes": 6052,
+      "sha256": "48e270908335dc0d92c54ddae9adfe5e718d0fecd74ef34adbd00f25a4a11a56",
+      "family": "hexagon-qaic"
+    },
+    {
+      "path": "tools/hexagon/public-qaic.lock.json",
+      "bytes": 3122,
+      "sha256": "306daaef5a3956b3fe49d8c34b955199f7b1f8438e2404a26c562ab75315ea0a",
+      "family": "hexagon-qaic"
+    },
+    {
       "path": "tools/hexagon/public-qaic-wire.expected.json",
       "bytes": 1797,
       "sha256": "de50944e2eab9c56eab0544a42c2754c421e4bdcb5cae20ac52294981aa3e552",
       "family": "hexagon-qaic"
     },
     {
-      "path": "tools/hexagon/public-qaic.lock.json",
-      "bytes": 8665,
-      "sha256": "7b7b7c6205fe6c11ad2c7b6bcfae57430beccd96dab77e92f8c9cf7f1f6e0f90",
-      "family": "hexagon-qaic"
-    },
-    {
-      "path": "tools/hexagon/public_idl_control.rs",
-      "bytes": 6042,
-      "sha256": "f4fe57638001868ebb9fe62b09dd08af1e23695ec469c5546205a4a6a75eeaa1",
-      "family": "hexagon-qaic"
-    },
-    {
-      "path": "tools/hexagon/public_qaic_wire.ps1",
-      "bytes": 8846,
-      "sha256": "8021790ada53e708473bc6db56e90be4c935888159779928fd7ed162c9edbdbb",
-      "family": "hexagon-qaic"
-    },
-    {
       "path": "tools/hexagon/windows_queue_abi.ps1",
-      "bytes": 16118,
-      "sha256": "b60fa0efce76cd7333e917df7c43f1790ca27300c4fba313f28230e3d1179e88",
+      "bytes": 729,
+      "sha256": "7d4dd22444c1d6b7576877fd95baf7f76434503857c12881713b6ca00d367ddb",
       "family": "hexagon-windows-abi"
     },
     {

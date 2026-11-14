@@ -7,7 +7,7 @@
 //!
 //! This only encodes public-control bytes. It has no FFI, driver, SDK, queue,
 //! process-init or runtime integration and proves no signed-module compatibility.
-//! The generated C mock must be compared independently against this result.
+//! The retained original generated-C observation is compared against this result.
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 
@@ -117,8 +117,8 @@ mod tests {
     fn matches_independently_derived_public_start_stop_vector() {
         // These bytes were hand-derived from the pinned generator before the
         // Rust encoder existed and before observing generated stub execution.
-        // The separately built generated-C mock captures its actual input and
-        // is compared by the owning hosted control, rather than recreated here.
+        // The retained independently built generated-C mock captured its input and
+        // is compared by the owning hosted control; it is not reexecuted here.
         let expected = [
             0x44, 0x33, 0x22, 0x11, 0x00, 0x00, 0x00, 0x00, 0x18, 0x07, 0x76, 0x65, 0x54, 0x43,
             0x32, 0x21, 0x64, 0x53, 0x42, 0x31, 0x74, 0x63, 0x52, 0x41, 0x48, 0x37, 0x26, 0x15,

@@ -101,52 +101,11 @@ fn compiler(control: &mut Control, report: &mut Value) -> Result<PathBuf> {
     report["compiler"] = json!({"selectedFiles":selected,"toolsVersion":tool_version,"windowsSdkVersion":sdk_version,"target":"aarch64-pc-windows-msvc","scope":"selected native compiler/linker components; not-complete-OS-closure"});
     Ok(compiler)
 }
-const REVIEWED_ARCHIVE: &str = "docs/evidence/hexagon-public-qaic-41171859264";
-
-struct ReviewedSource {
-    path: PathBuf,
-    name: String,
-    identity: Value,
-}
-
-fn reviewed_sources(root: &Path, public: &Value) -> Result<Vec<ReviewedSource>> {
-    let archive = root.join(REVIEWED_ARCHIVE);
-    let mut sources = Vec::new();
-    for (field, subdirectory) in [
-        ("headers", "wire-public-inputs"),
-        ("reviewedGeneratedFiles", "generated-public-source"),
-    ] {
-        for input in list(&public["wireCapture"], field)? {
-            let name = string(input, "name")?;
-            if name == "htp_iface_skel.c" {
-                continue;
-            }
-            let source = archive.join(subdirectory).join(format!("{name}.txt"));
-            let mut item = pinned(&source, input)
-                .map_err(|error| format!("Reviewed public input {}: {error}", source.display()))?;
-            item["origin"] = json!(
-                source
-                    .strip_prefix(root)
-                    .map_err(|e| e.to_string())?
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            );
-            item["url"] = input["url"].clone();
-            sources.push(ReviewedSource {
-                path: source,
-                name: name.to_owned(),
-                identity: item,
-            });
-        }
-    }
-    Ok(sources)
-}
-
 fn inputs(control: &Control, pin: &Value, report: &mut Value) -> Result<PathBuf> {
     let public = json_file(&control.source("public-qaic.lock.json"), 1_048_576)?;
     // Check the complete retained source closure before spending network or
     // compiler work. The portable policy fixtures exercise this same intake.
-    let sources = reviewed_sources(&control.root, &public)?;
+    report["retainedWireReplay"] = retained::verify(&control.root, &public)?;
     let inputs = control.output.join("inputs");
     let retained = control.review.join("inputs");
     directory(&inputs)?;
@@ -157,12 +116,9 @@ fn inputs(control: &Control, pin: &Value, report: &mut Value) -> Result<PathBuf>
         let name = string(input, "name")?;
         copy(&inputs.join(name), &retained.join(format!("{name}.txt")))?;
     }
-    for source in sources {
-        copy(&source.path, &inputs.join(&source.name))?;
-        copy(&source.path, &retained.join(format!("{}.txt", source.name)))?;
-        entries.push(source.identity);
-    }
-    let archive = control.root.join(REVIEWED_ARCHIVE);
+    let archive = control
+        .root
+        .join("docs/evidence/hexagon-public-qaic-41171859264");
     let notices = control.review.join("notices");
     directory(&notices)?;
     for entry in fs::read_dir(archive.join("inputs-and-notices")).map_err(|e| e.to_string())? {
@@ -178,7 +134,6 @@ fn inputs(control: &Control, pin: &Value, report: &mut Value) -> Result<PathBuf>
     for name in [
         "windows_queue_abi.c",
         "windows_queue_abi.rs",
-        "public_qaic_wire.c",
         "public_idl_control.rs",
         "public-qaic-wire.expected.json",
     ] {
@@ -199,7 +154,6 @@ fn build(
     inputs: &Path,
     name: &str,
     sources: &[PathBuf],
-    branch: bool,
 ) -> Result<PathBuf> {
     let executable = control.output.join(format!("{name}.exe"));
     let mut args: Vec<OsString> = vec![
@@ -210,23 +164,12 @@ fn build(
         "/Od".into(),
         "/GS".into(),
         "/guard:cf".into(),
+        "/W4".into(),
+        "/WX".into(),
         format!("/I{}", inputs.display()).into(),
         format!("/Fo{}\\", control.output.display()).into(),
         format!("/Fe{}", executable.display()).into(),
     ];
-    if branch {
-        args.extend([
-            "/W1".into(),
-            "/wd4068".into(),
-            "/U_WIN32".into(),
-            "/D_CRT_SECURE_NO_WARNINGS".into(),
-            "/D_ATTRIBUTE_UNUSED=".into(),
-            "/D_ATTRIBUTE_VISIBILITY=".into(),
-            format!("/FI{}", inputs.join("AEEStdDef.h").display()).into(),
-        ]);
-    } else {
-        args.extend(["/W4".into(), "/WX".into()]);
-    }
     args.extend(sources.iter().map(|source| source.as_os_str().to_owned()));
     args.extend([
         "/link".into(),
@@ -247,7 +190,9 @@ fn rust(
     compiler: &Path,
     name: &str,
     source: &str,
+    tests: bool,
 ) -> Result<(PathBuf, Value)> {
+    let source_identity = identity(&control.source(source))?;
     let executable = control.output.join(format!("{name}-rust.exe"));
     let args = vec![
         rustc.as_os_str().to_owned(),
@@ -262,6 +207,21 @@ fn rust(
         "-o".into(),
         executable.clone().into_os_string(),
     ];
+    if tests {
+        let test_executable = control.output.join(format!("{name}-rust-tests.exe"));
+        let mut test_args = args.clone();
+        *test_args
+            .last_mut()
+            .ok_or("Rust output argument missing.")? = test_executable.clone().into_os_string();
+        test_args.push("--test".into());
+        control.run(&format!("{name}-rust-test-build"), test_args, 30)?;
+        arm64(&test_executable)?;
+        control.run(
+            &format!("{name}-rust-tests"),
+            vec![test_executable.into_os_string()],
+            5,
+        )?;
+    }
     control.run(&format!("{name}-rust-build"), args, 30)?;
     arm64(&executable)?;
     let text = control.run(
@@ -269,6 +229,7 @@ fn rust(
         vec![executable.clone().into_os_string()],
         5,
     )?;
+    pinned(&control.source(source), &source_identity)?;
     Ok((executable, wire::parse(&text)?))
 }
 fn queue(
@@ -284,7 +245,6 @@ fn queue(
         inputs,
         "queue-abi",
         &[control.source("windows_queue_abi.c")],
-        false,
     )?;
     let text = control.run(
         "queue-abi-capture",
@@ -303,6 +263,7 @@ fn queue(
         compiler,
         "queue-abi",
         "windows_queue_abi.rs",
+        false,
     )?;
     let shared = [
         "schemaVersion",
@@ -328,45 +289,31 @@ fn queue(
 fn start_stop(
     control: &mut Control,
     compiler: &Path,
-    inputs: &Path,
     rustc: &Path,
     report: &mut Value,
 ) -> Result<()> {
-    let executable = build(
-        control,
-        compiler,
-        inputs,
-        "start-stop-wire",
-        &[
-            inputs.join("htp_iface_stub.c"),
-            control.source("public_qaic_wire.c"),
-        ],
-        true,
+    let public = json_file(&control.source("public-qaic.lock.json"), 1_048_576)?;
+    let source = pinned(
+        &control.source("public_idl_control.rs"),
+        &public["rustWireControl"]["source"],
     )?;
-    let text = control.run(
-        "start-stop-wire-capture",
-        vec![executable.clone().into_os_string()],
-        5,
-    )?;
-    let observed = wire::parse(&text)?;
-    wire::capture(
-        &observed,
-        &json_file(&control.source("public-qaic-wire.expected.json"), 1_048_576)?,
-    )?;
+    let observed = &report["retainedWireReplay"]["observed"];
     let (rust_executable, rust) = rust(
         control,
         rustc,
         compiler,
         "start-stop",
         "public_idl_control.rs",
+        true,
     )?;
-    fields_equal(&rust, &observed, wire::SHARED)?;
-    report["startStopWire"] = json!({"passed":true,"generatedFilesUnchanged":true,"nativeCompilerTarget":"aarch64-pc-windows-msvc","publicHeaderConditionals":"non-Windows public branch: /U_WIN32; _WIN64 and _M_ARM64 preserved","generatedSourceAllocatorBranch":"standard malloc/free; no qtest_stdlib replacement","generatedAttributeConfiguration":"documented #ifndef overrides _ATTRIBUTE_UNUSED/_ATTRIBUTE_VISIBILITY empty for MSVC","wholeWindowsHeaderClosureQualified":false,"sdkEquivalenceQualified":false,"observed":observed,"rustObserved":rust,"executable":identity(&executable)?,"rustExecutable":identity(&rust_executable)?});
+    pinned(&control.source("public_idl_control.rs"), &source)?;
+    wire::rust_receipt(&rust, observed)?;
+    report["startStopWire"] = json!({"passed":true,"mode":"retained-independent-C-observation-and-fresh-Rust-encoding","originalProviderTarget":"x86_64-linux-gnu","freshRustTarget":"aarch64-pc-windows-msvc","freshCExecution":false,"wholeWindowsHeaderClosureQualified":false,"sdkEquivalenceQualified":false,"observed":observed,"rustObserved":rust,"rustExecutable":identity(&rust_executable)?});
     Ok(())
 }
 pub(super) fn run(request: &Request) -> Result<Value> {
-    let mut control = Control::new(request, 600, true)?;
-    let mut report = json!({"schemaVersion":1,"kind":"hosted-windows-arm64-public-queue-wire-control","passed":false,"sourceCommit":std::env::var("GITHUB_SHA").unwrap_or_default(),"runId":std::env::var("GITHUB_RUN_ID").unwrap_or_default(),"runAttempt":std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default(),"controller":identity(&request.repository_directory.join("tools/bonsai/src/hexagon_tools/public_control/windows.rs"))?,"driverLoaded":false,"sdkUsed":false,"deviceExecuted":false,"profileEligible":false,"scope":"public queue/packet ABI and explicitly selected non-Windows public start/stop wire branch","wholeWindowsHeaderClosureQualified":false,"sdkEquivalenceQualified":false});
+    let mut control = Control::new(request, 600)?;
+    let mut report = json!({"schemaVersion":1,"kind":"hosted-windows-arm64-public-queue-wire-control","passed":false,"sourceCommit":std::env::var("GITHUB_SHA").unwrap_or_default(),"runId":std::env::var("GITHUB_RUN_ID").unwrap_or_default(),"runAttempt":std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default(),"controller":identity(&request.repository_directory.join("tools/bonsai/src/hexagon_tools/public_control/windows.rs"))?,"driverLoaded":false,"sdkUsed":false,"deviceExecuted":false,"profileEligible":false,"scope":"native public queue/packet ABI plus retained Linux C start/stop observations and fresh Rust encoding","wholeWindowsHeaderClosureQualified":false,"sdkEquivalenceQualified":false});
     control.provenance(&mut report)?;
     let result: Result<()> = (|| {
         let path = control.source("windows-queue-abi.lock.json");
@@ -394,13 +341,7 @@ pub(super) fn run(request: &Request) -> Result<Value> {
             &request.rustc,
             &mut report,
         )?;
-        start_stop(
-            &mut control,
-            &compiler,
-            &inputs,
-            &request.rustc,
-            &mut report,
-        )?;
+        start_stop(&mut control, &compiler, &request.rustc, &mut report)?;
         for component in list(&report["compiler"], "selectedFiles")? {
             pinned(Path::new(string(component, "path")?), component)?;
         }
@@ -526,26 +467,12 @@ mod tests {
             .and_then(Path::parent)
             .ok_or("Fixture workspace root is unavailable.")?;
         let public = json_file(&root.join("tools/hexagon/public-qaic.lock.json"), 1_048_576)?;
-        let sources = reviewed_sources(root, &public)?;
-        assert_eq!(sources.len(), 7);
-        assert!(
-            sources
-                .iter()
-                .any(|source| source.name == "htp_iface_stub.c")
-        );
-        assert!(
-            !sources
-                .iter()
-                .any(|source| source.name == "htp_iface_skel.c")
-        );
-        assert!(reviewed_sources(&root.join("Cargo.toml"), &public).is_err());
+        let replay = retained::verify(root, &public)?;
+        assert_eq!(replay["originalSourceInputsVerified"], true);
+        assert!(retained::verify(&root.join("Cargo.toml"), &public).is_err());
         let mut changed = public;
         changed["wireCapture"]["headers"][0]["sha256"] = json!("0".repeat(64));
-        let error = reviewed_sources(root, &changed)
-            .err()
-            .ok_or("Changed reviewed source identity was accepted.")?;
-        assert!(error.contains("remote.h.txt"));
-        assert!(error.contains("exact reviewed identity"));
+        assert!(retained::verify(root, &changed).is_err());
         Ok(())
     }
 }

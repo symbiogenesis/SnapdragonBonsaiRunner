@@ -1,150 +1,21 @@
 {
-  "schemaVersion": 1,
-  "purpose": "hosted-independent-public-source-QAIC-marshalling-oracle-only",
-  "generationReviewOnly": false,
-  "generationMode": "reviewed-standard-types; public-hosted-mock-only",
-  "qaicRepository": "https://github.com/qualcomm/QAIC",
+  "schemaVersion": 2,
+  "purpose": "Frozen independent public-wire replay; generator and C mock execution are retired.",
   "qaicCommit": "a66a0019fb488abae955bbc9b3a9de3dc15962d0",
-  "setupAction": "haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d",
-  "ghcVersion": "9.10.3",
-  "cabalVersion": "3.12.1.0",
-  "hackageIndexState": "2026-10-29T00:00:00Z",
-  "sourceFiles": [
-    {
-      "path": "README.md",
-      "bytes": 37846,
-      "sha256": "bce26b318f45a1aee6c46b0b94988e2cec8c59fdb17394a5401f964496a5f470"
-    },
-    {
-      "path": "LICENSE.txt",
-      "bytes": 1689,
-      "sha256": "3a15c06f7c0f8e38e884e0a20e739fe0d92c1ac0996928af4ab119170603d1f8"
-    },
-    {
-      "path": "src/Makefile",
-      "bytes": 5869,
-      "sha256": "5d7e6960dbe6eff6d46fe256cf4534e594ef7fe3245898dcb674df3650e0e81c"
-    },
-    {
-      "path": "src/qaic.cabal",
-      "bytes": 2942,
-      "sha256": "c27f82fabc467ec8c4eee782e8fb9a4833f02f55d6a83db99117a1810718d910"
-    },
-    {
-      "path": "src/file2hs/file2hs.cabal",
-      "bytes": 391,
-      "sha256": "6aa4755b05a3e1f60213f7f4e5a6519cb078219558f9bb995c4494502abdd20f"
-    },
-    {
-      "path": "src/Language/SO/CStub.c",
-      "bytes": 3111,
-      "sha256": "5f7bd861ad40c089bde8cc93b68d0687e3f3a240cbab1bcff9b60eb494ce4214"
-    },
-    {
-      "path": "src/Language/SO/Stub.c",
-      "bytes": 1387,
-      "sha256": "8fcd0627db58983a55b7a359e1d0b3eafbb1908d38a55752d525284eacbf2377"
-    },
-    {
-      "path": "src/Language/SO/Env.c",
-      "bytes": 4526,
-      "sha256": "3f1e229596e18da85c1645fa5d29375319471680e774eb0d70aa01c20a4b7c28"
-    },
-    {
-      "path": "src/Language/SO/Allocator.c",
-      "bytes": 2014,
-      "sha256": "a56e2e6f4b09de1f959e9ef0185ea1b2312eb848c6debd1781d5a420a99f1127"
-    },
-    {
-      "path": "src/Language/SO/Slim.c",
-      "bytes": 5430,
-      "sha256": "f5c3c8d88284bf606c6b44858b17a80a67f03e1f3c81955d7d7240551d43504d"
-    }
-  ],
-  "publicInputs": [
-    {
-      "name": "htp_iface.idl",
-      "bytes": 718,
-      "sha256": "196448f5166f300c572172b83a51e128e71e4471f13e30d0c5f88d6ce0cfe8bc",
-      "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/19cce6919992fdffd92e0ac152caaf1e2b8f254e/ggml/src/ggml-hexagon/htp/htp_iface.idl"
-    },
-    {
-      "name": "AEEStdDef.idl",
-      "bytes": 1793,
-      "sha256": "dda9bee2163b148be27365c101c11356cbefa691c3687a34586e705c074c7ddc",
-      "url": "https://raw.githubusercontent.com/qualcomm/fastrpc/a56e9d4de3614a8d8f4b0e15ff561350c4b686e3/idl/AEEStdDef.idl"
-    },
-    {
-      "name": "remote.idl",
-      "bytes": 1498,
-      "sha256": "43b4130d14dc4152b9b3cafc7899d781e2e3546076383a65159774000275021e",
-      "url": "https://raw.githubusercontent.com/qualcomm/fastrpc/a56e9d4de3614a8d8f4b0e15ff561350c4b686e3/idl/remote.idl"
-    },
-    {
-      "name": "LICENSE-FastRPC.txt",
-      "bytes": 1565,
-      "sha256": "683e80f5436e6b0761139e626d2c764870ea0ed19b14916ef4c82772b99c4d44",
-      "url": "https://raw.githubusercontent.com/qualcomm/fastrpc/a56e9d4de3614a8d8f4b0e15ff561350c4b686e3/LICENSE.txt"
-    },
-    {
-      "name": "LICENSE-llama.cpp.txt",
-      "bytes": 1078,
-      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
-      "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/19cce6919992fdffd92e0ac152caaf1e2b8f254e/LICENSE"
-    }
-  ],
-  "buildArguments": [
-    "make",
-    "-C",
-    "src",
-    "TARGET_ARCH=x86_64-linux"
-  ],
-  "generatorArguments": [
-    "--map-dll",
-    "--standard-types",
-    "--include-path={public-input-directory}",
-    "--output-path={new-output-directory}",
-    "{checked-htp_iface.idl}"
-  ],
-  "expectedGeneratedFiles": [
-    "htp_iface.h",
-    "htp_iface_stub.c",
-    "htp_iface_skel.c"
-  ],
-  "sdkQaicEquivalenceQualified": false,
-  "sdkImportEquivalenceQualified": false,
   "deviceInvocationAuthorized": false,
   "profileEligible": false,
-  "dependencyFreezePins": {
-    "file2hs": {
-      "bytes": 277,
-      "sha256": "4f8f56c8657486361f23cc724519bdc8fe0b6ff2e1dae7f47007343b0e73a9e3"
-    },
-    "qaic": {
-      "bytes": 1028,
-      "sha256": "8fc54632de05d73fb3b0d7eec4440013ae3519dd906441f2ace2b67be4acf360"
-    }
-  },
-  "externalPackagePin": {
-    "pkg-name": "syb",
-    "pkg-version": "0.7.4",
-    "pkg-cabal-sha256": "db6f86d818f7732a2cb3a7a8cf630642a90c9faef7a13bd5dad136505774605b",
-    "pkg-src-sha256": "ddcaca983f67a170c0cfdbd037a268779880e2f9b57f93135eaccb6ae4c5da3f",
-    "id": "syb-0.7.4-cc7cdcfd9c4a632d5494d4b83b22e9186ad56e02dd5c4a8c0fa59a4021d3c9c9"
-  },
   "rustWireControl": {
-    "toolchain": "nightly-2026-11-12-x86_64-unknown-linux-gnu",
-    "target": "x86_64-unknown-linux-gnu",
+    "toolchain": "nightly-2026-11-12-aarch64-pc-windows-msvc",
+    "target": "aarch64-pc-windows-msvc",
     "source": {
       "name": "public_idl_control.rs",
-      "bytes": 6042,
-      "sha256": "f4fe57638001868ebb9fe62b09dd08af1e23695ec469c5546205a4a6a75eeaa1"
+      "bytes": 6052,
+      "sha256": "48e270908335dc0d92c54ddae9adfe5e718d0fecd74ef34adbd00f25a4a11a56"
     },
     "deviceInvocationAuthorized": false
   },
   "wireCapture": {
-    "enabled": true,
-    "scope": "public-generated-C-and-public-headers-hosted-Linux-mocks-only",
+    "mode": "retained-independent-observation",
     "harness": {
       "name": "public_qaic_wire.c",
       "bytes": 5643,
@@ -203,35 +74,6 @@
         "bytes": 20248,
         "sha256": "b517ef6f7b895bc42133cac2b97258bd1d0618c1b47b84c878d10d616f6e541d"
       }
-    ],
-    "standardTypeReviewedGenerationRun": "41171073546",
-    "priorLegacyGeneratedFiles": [
-      {
-        "name": "htp_iface.h",
-        "bytes": 7889,
-        "sha256": "3b02ce54c600a685c0699ddf6d9384daf32d17d968507322f0560279b6ccd656"
-      },
-      {
-        "name": "htp_iface_stub.c",
-        "bytes": 16931,
-        "sha256": "8d5b65aec8130cf9017e4b6c98b5534ade42c37b197b21a31122d802ca1bb725"
-      },
-      {
-        "name": "htp_iface_skel.c",
-        "bytes": 20188,
-        "sha256": "56f456e821a5fe703117688fcf90c21d313438b7f66447b87e1cbfcf551dab44"
-      }
-    ],
-    "firstReviewedGenerationRun": "41169481882",
-    "compilerSelection": "/usr/bin/gcc; actual-resolved-identity-pinned-and-rechecked-within-run",
-    "compilerTarget": "x86_64-linux-gnu",
-    "compilerFlags": [
-      "-std=gnu11",
-      "-O0",
-      "-fno-lto",
-      "-fno-strict-aliasing",
-      "-include",
-      "{checked-public-AEEStdDef.h}"
     ],
     "sdkLinked": false,
     "deviceInvocationAuthorized": false,

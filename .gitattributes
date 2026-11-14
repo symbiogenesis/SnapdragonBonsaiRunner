@@ -18,7 +18,6 @@ docs/evidence/hexagon-public-qaic-41169481882/** -text -whitespace
 docs/evidence/hexagon-public-qaic-41171859264/** -text -whitespace
 
 # Keep public queue/wire control sources and pins portable.
-tools/hexagon/public_qaic_wire.c text eol=lf
 tools/hexagon/public-qaic-wire.expected.json text eol=lf
 tools/hexagon/public_idl_control.rs text eol=lf
 tools/hexagon/windows_queue_abi.* text eol=lf

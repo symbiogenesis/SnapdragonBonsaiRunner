@@ -33,7 +33,7 @@ operation ledger and independent capture bytes remain unchanged.
 current native fixture preparation, model-free policy controls and the independent
 `public-native-abi` hosted job. That job checks native queue layouts and the retained
 generated start/stop wire control without depending on device preparation or admission.
-SDK and public-QAIC preparation helpers retain exact pins and
+SDK preparation and retained public-QAIC observations preserve exact pins and
 [source/ABI boundaries](../../docs/hexagon-source-audit.md#sdk-inputs-recipe-and-terms).
 New SDK or wire coverage needs a separately reviewed hosted workload. Existing
 provenance snapshots cannot replace unavailable replay bytes or close the Windows,
@@ -70,18 +70,23 @@ invokes this native inventory directly under its process supervisor, without a
 PowerShell child. Native-source and executable digests identify migrated receipts;
 historical SDK receipts keep their original source identities.
 
-The public QAIC generation/mock-wire and Windows ARM64 queue ABI commands also
-run in native Rust. `public_qaic_oracle.ps1` and `windows_queue_abi.ps1` only
-forward to `hexagon-tools`'s `public-control` request. Each hosted lane supplies
-its own native executable and retains explicit Rust-source and supervisor
-identities. Windows ABI has no dependency on the SDK inventory, checked-policy
-job, signed package or device lanes. The hosted Linux source oracle uses an
-owned process group; Windows uses atomic Job ownership. Native supervision
-preserves the original aggregate allowances and 4 MiB combined output bound,
-retains failed controls and replay captures, and drops empty logs and successful
-build chatter. Public raw-source downloads require the reviewed HTTPS origin
-and reject redirects. No SDK, ABI, callback, cache, driver or profile qualification
-is inferred from matching wire bytes.
+`windows_queue_abi.ps1` forwards to `hexagon-tools`'s `public-control` request.
+The native Windows ARM64 lane compiles the public queue declarations and negative
+ABI controls, then compares fresh Rust start/stop encoding and its literal test
+against the retained independent Linux C observation. The replay authenticates
+the original provider receipt, complete retained selection, restored original
+control sources, generated/public inputs, notices and both original outputs.
+The public QAIC generator, Haskell/Cabal build, GCC mock compilation, generated-C
+execution and obsolete generation adapter are removed. Retired `public-qaic`
+requests reject before intake. Historical captures remain observations of their
+original run; they supply no fresh C declaration or calling-convention verdict.
+
+Windows ABI has no dependency on the SDK inventory, checked-policy job, signed
+package or device lanes. Windows uses atomic Job ownership. Native supervision
+preserves the original aggregate allowance and 4 MiB combined output bound,
+retains failed controls, and drops empty logs and successful build chatter.
+Public queue-header downloads require the reviewed HTTPS origin and reject
+redirects. Matching retained wire bytes grants no SDK, driver or profile verdict.
 
 Self-hosted inventory, session and dispatch workflow arms forward to the native
 `owner-operation` command. It charges checkout and intake to the original

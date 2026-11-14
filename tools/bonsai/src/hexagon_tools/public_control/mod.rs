@@ -1,4 +1,4 @@
-//! Hosted public compiler controls. SDK, wire and Windows ABI gates stay independent.
+//! Hosted Windows ABI controls and retained independent public-wire replay.
 use super::{hold, plain};
 use crate::{Result, bounded_input, hexagon_policy, identity as ids, startup_process};
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use std::{
 };
 
 mod process;
-mod qaic;
+mod retained;
 mod windows;
 mod wire;
 
@@ -24,10 +24,6 @@ pub(super) struct Request {
     repository_directory: PathBuf,
     output_directory: PathBuf,
     rustc: PathBuf,
-    #[serde(default)]
-    source_directory: Option<PathBuf>,
-    #[serde(default)]
-    pin_path: Option<PathBuf>,
 }
 
 fn require(valid: bool, message: &str) -> Result<()> {
@@ -191,7 +187,7 @@ impl Control {
             "Cargo.lock",
             "tools/bonsai/src/hexagon_tools/public_control/mod.rs",
             "tools/bonsai/src/hexagon_tools/public_control/process.rs",
-            "tools/bonsai/src/hexagon_tools/public_control/qaic.rs",
+            "tools/bonsai/src/hexagon_tools/public_control/retained.rs",
             "tools/bonsai/src/hexagon_tools/public_control/windows.rs",
             "tools/bonsai/src/hexagon_tools/public_control/wire.rs",
             "tools/bonsai/src/https_transfer.rs",
@@ -209,22 +205,14 @@ impl Control {
             identity(&std::env::current_exe().map_err(|error| error.to_string())?)?;
         Ok(())
     }
-    #[expect(
-        clippy::needless_bool,
-        reason = "The two independent hosted compiler targets resolve opposite predicates on Windows ARM64 and Linux x86_64."
-    )]
-    fn new(request: &Request, seconds: u64, windows: bool) -> Result<Self> {
+    fn new(request: &Request, seconds: u64) -> Result<Self> {
         require(
             std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
                 && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted"),
             "Public compiler controls require hosted execution; owner fallback is unsupported.",
         )?;
         require(
-            if windows {
-                cfg!(all(windows, target_arch = "aarch64"))
-            } else {
-                cfg!(all(target_os = "linux", target_arch = "x86_64"))
-            },
+            cfg!(all(windows, target_arch = "aarch64")),
             "Hosted public compiler target differs from its independent lane.",
         )?;
         for (name, length) in [
@@ -248,19 +236,17 @@ impl Control {
         plain(&request.output_directory)?;
         bonsai_artifacts::validate_external_path(&request.output_directory)
             .map_err(|e| e.to_string())?;
-        if windows {
-            let scratch = std::env::var_os("RUNNER_TEMP")
-                .map(PathBuf::from)
-                .ok_or("Hosted scratch unavailable.")?;
-            require(
-                request.output_directory.starts_with(scratch),
-                "Select a new output directory inside hosted scratch.",
-            )?;
-        }
+        let scratch = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .ok_or("Hosted scratch unavailable.")?;
+        require(
+            request.output_directory.starts_with(scratch),
+            "Select a new output directory inside hosted scratch.",
+        )?;
         directory(&request.output_directory)?;
         let review = request.output_directory.join("review");
         directory(&review)?;
-        let environment = child_environment(windows, std::env::vars());
+        let environment = child_environment(true, std::env::vars());
         let removed = REMOVED_ENVIRONMENT
             .iter()
             .map(|name| (*name).to_owned())
@@ -367,7 +353,9 @@ impl Control {
 pub(super) fn run(request: &Request) -> Result<Value> {
     match request.operation.as_str() {
         "windows-abi" => windows::run(request),
-        "public-qaic" => qaic::run(request),
+        "public-qaic" => Err(
+            "Public QAIC generation is retired; use the retained independent wire replay.".into(),
+        ),
         _ => Err("Unknown public compiler control.".into()),
     }
 }
@@ -375,6 +363,22 @@ pub(super) fn run(request: &Request) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retired_public_qaic_generation_rejects_before_intake() -> Result<()> {
+        let request: Request = serde_json::from_value(json!({
+            "operation":"public-qaic", "repositoryDirectory":"missing-source",
+            "outputDirectory":"missing-output", "rustc":"missing-compiler"
+        }))
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            run(&request),
+            Err(
+                "Public QAIC generation is retired; use the retained independent wire replay."
+                    .into()
+            )
+        );
+        Ok(())
+    }
     #[test]
     fn public_input_writer_closes_before_guarded_identity() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
