@@ -13,6 +13,7 @@ const SERIAL: AdapterProfile = AdapterProfile {
     case: CASE,
     repacked: false,
     row_workers: 1,
+    placement: AdapterPlacement::Auto,
     optional_requests: false,
     required_scale_history: false,
 };

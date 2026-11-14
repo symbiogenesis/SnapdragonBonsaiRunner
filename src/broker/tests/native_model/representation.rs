@@ -26,6 +26,7 @@ fn profiles(row_workers: u8) -> [AdapterProfile; 2] {
         case,
         repacked,
         row_workers,
+        placement: AdapterPlacement::Cpu,
         optional_requests: false,
         required_scale_history: false,
     })
@@ -202,7 +203,13 @@ fn comparison(samples: &[Value], row_workers: u8) -> Value {
         && samples[0]["stream"]["reportedCompletionTokens"]
             == samples[1]["stream"]["reportedCompletionTokens"];
     let power_conditions = bonsai_cpu_policy::power::compare_samples(samples);
-    let eligible = matched && power_conditions["performanceComparisonEligible"] == true;
+    let power_matched = power_conditions["performanceComparisonEligible"] == true;
+    let cpu_placement_matched = samples.iter().all(|sample| {
+        sample["configuredPlacement"] == "cpu"
+            && sample["cpuPlacementIndependentlyVerified"] == true
+            && sample["verifiedProjectionBackend"] == "cpu"
+    });
+    let eligible = matched && power_matched && cpu_placement_matched;
     let observed_ratio = matched.then(|| {
         samples[1]["stream"]["requestMilliseconds"]
             .as_f64()
@@ -212,10 +219,11 @@ fn comparison(samples: &[Value], row_workers: u8) -> Value {
                 .unwrap()
     });
     json!({"status":"captured-complete-pair", "matchedOutputAndUsage":matched,
+        "comparisonKind":"cpu-only-packing", "cpuPlacementMatched":cpu_placement_matched,
         "ptq1OverPq2RequestLatency":eligible.then_some(observed_ratio).flatten(),
         "observedUnqualifiedRequestLatencyRatio":observed_ratio,
         "performanceComparisonEligible":eligible,"powerConditions":power_conditions,
-        "resources":resource_comparison(samples, matched),
+        "resources":resource_comparison(samples, matched, power_matched, cpu_placement_matched),
         "fixedOrder":true, "qualityReview":"pending", "repeatedTrialBenefitQualified":false})
 }
 
@@ -238,7 +246,12 @@ const RESOURCE_METRICS: [(&str, &str); 4] = [
     ),
 ];
 
-fn resource_comparison(samples: &[Value], matched: bool) -> Value {
+fn resource_comparison(
+    samples: &[Value],
+    matched: bool,
+    power_matched: bool,
+    cpu_placement_matched: bool,
+) -> Value {
     let pending = |reason| {
         json!({"status":"pending", "reason":reason, "metrics":[],
             "fullResourceGateQualified":false,"pagingQualified":false,
@@ -249,6 +262,12 @@ fn resource_comparison(samples: &[Value], matched: bool) -> Value {
     }
     if !matched {
         return pending("different-complete-output-or-usage");
+    }
+    if !power_matched {
+        return pending("unknown-or-mismatched-power-conditions");
+    }
+    if !cpu_placement_matched {
+        return pending("missing-or-mismatched-cpu-placement-readiness");
     }
     let resources = [
         &samples[0]["cleanup"]["backendResources"],
@@ -320,6 +339,7 @@ async fn paired_responses(
             "rowWorkerCountIndependentlyObserved":false, "verifiedReadinessObserved":false,
             "startupMilliseconds":null, "stream":null, "cleanup":null}));
         record_worker_readiness(&mut report["samples"][index], profile.row_workers, false);
+        record_cpu_placement(&mut report["samples"][index], false);
         power::begin(&mut report["samples"][index]);
         report["phase"] = json!(format!("arm-{index}-startup"));
         save_acceptance_report(evidence, report);
@@ -334,6 +354,7 @@ async fn paired_responses(
         report["samples"][index]["startupMilliseconds"] =
             json!(started.elapsed().as_secs_f64() * 1000.0);
         record_worker_readiness(&mut report["samples"][index], profile.row_workers, true);
+        record_cpu_placement(&mut report["samples"][index], true);
         let port = owner.port();
         let credential = key(&owner);
         let (stop, stopped) = oneshot::channel();
@@ -364,6 +385,16 @@ async fn paired_responses(
 
 fn can_start_owner(deadline: tokio::time::Instant) -> bool {
     deadline.saturating_duration_since(tokio::time::Instant::now()) > NEXT_OWNER_RESERVE
+}
+
+fn record_cpu_placement(sample: &mut Value, verified: bool) {
+    // Both representation profiles explicitly request CPU. The source-bound
+    // production launcher accepts ownership only after private readiness verifies
+    // requested CPU placement and the effective CPU projection backend. Startup
+    // verification does not establish executed operations or performance.
+    sample["configuredPlacement"] = json!("cpu");
+    sample["cpuPlacementIndependentlyVerified"] = json!(verified);
+    sample["verifiedProjectionBackend"] = json!(verified.then_some("cpu"));
 }
 
 #[test]
@@ -436,6 +467,7 @@ pub(super) fn complete_sample(repacked: bool, row_workers: u8) -> Value {
         os_peak_root_working_set_bytes: Some(2000),
     }));
     record_worker_readiness(&mut sample, row_workers, true);
+    record_cpu_placement(&mut sample, true);
     sample
 }
 
@@ -474,6 +506,12 @@ fn native_representation_power_gates_timing_without_erasing_answers_or_rollback(
         assert_eq!(compared["performanceComparisonEligible"], false);
         assert!(compared["ptq1OverPq2RequestLatency"].is_null());
         assert_eq!(compared["observedUnqualifiedRequestLatencyRatio"], 1.0);
+        assert_eq!(compared["resources"]["status"], "pending");
+        assert_eq!(
+            compared["resources"]["reason"],
+            "unknown-or-mismatched-power-conditions"
+        );
+        assert_eq!(compared["resources"]["metrics"], json!([]));
         assert_eq!(original_pq2_rollback_observation(&changed, 4), rollback);
     }
     let mut other_source = pair;
@@ -484,6 +522,53 @@ fn native_representation_power_gates_timing_without_erasing_answers_or_rollback(
         comparison(&other_source, 4)["performanceComparisonEligible"],
         false
     );
+}
+
+#[test]
+fn native_representation_cpu_placement_gates_comparisons_without_erasing_answers() {
+    for row_workers in [1, 4] {
+        let pair = vec![
+            complete_sample(false, row_workers),
+            complete_sample(true, row_workers),
+        ];
+        let matched = comparison(&pair, row_workers);
+        assert_eq!(matched["comparisonKind"], "cpu-only-packing");
+        assert_eq!(matched["cpuPlacementMatched"], true);
+        let rollback = original_pq2_rollback_observation(&pair, row_workers);
+        for index in 0..2 {
+            for (field, changed) in [
+                ("configuredPlacement", json!("auto")),
+                ("cpuPlacementIndependentlyVerified", json!(false)),
+                ("verifiedProjectionBackend", json!("hexagon-native-q2")),
+            ] {
+                for value in [Value::Null, changed] {
+                    let mut invalid = pair.clone();
+                    invalid[index][field] = value;
+                    let compared = comparison(&invalid, row_workers);
+                    assert_eq!(compared["status"], "captured-complete-pair");
+                    assert_eq!(compared["cpuPlacementMatched"], false);
+                    assert_eq!(compared["performanceComparisonEligible"], false);
+                    assert!(compared["ptq1OverPq2RequestLatency"].is_null());
+                    assert_eq!(compared["observedUnqualifiedRequestLatencyRatio"], 1.0);
+                    assert_eq!(compared["resources"]["status"], "pending");
+                    assert_eq!(
+                        compared["resources"]["reason"],
+                        "missing-or-mismatched-cpu-placement-readiness"
+                    );
+                    assert_eq!(compared["resources"]["metrics"], json!([]));
+                    assert_eq!(
+                        original_pq2_rollback_observation(&invalid, row_workers),
+                        rollback
+                    );
+                }
+            }
+        }
+        let mut not_started = json!({});
+        record_cpu_placement(&mut not_started, false);
+        assert_eq!(not_started["configuredPlacement"], "cpu");
+        assert_eq!(not_started["cpuPlacementIndependentlyVerified"], false);
+        assert!(not_started["verifiedProjectionBackend"].is_null());
+    }
 }
 
 #[test]
@@ -597,7 +682,7 @@ fn native_representation_resources_compare_matching_domains_only() {
 fn native_representation_resources_reject_missing_or_inconsistent_observations() {
     let pair = vec![complete_sample(false, 4), complete_sample(true, 4)];
     assert_eq!(
-        resource_comparison(&pair[..1], true)["reason"],
+        resource_comparison(&pair[..1], true, true, true)["reason"],
         "incomplete-pair"
     );
     for index in 0..2 {
@@ -725,11 +810,22 @@ fn native_representation_row4_profile_is_explicit_and_preserves_pair() {
             (ROW4_PROFILE, ROW4_CASE, 4)
         );
         assert_eq!(single.repacked, parallel.repacked);
+        assert!(
+            single.placement == AdapterPlacement::Cpu
+                && parallel.placement == AdapterPlacement::Cpu
+        );
         assert!(!parallel.optional_requests && !parallel.required_scale_history);
         let mut expected = adapter_arguments(single, "8081");
         *expected.last_mut().unwrap() = "4".into();
         let mut actual = adapter_arguments(parallel, "8081");
         assert_eq!(actual, expected);
+        assert_eq!(
+            actual
+                .array_windows::<2>()
+                .filter(|[flag, value]| flag == "--placement" && value == "cpu")
+                .count(),
+            1
+        );
         assert_eq!(
             actual.iter().any(|arg| arg == "--use-original-pq2"),
             !parallel.repacked
@@ -907,7 +1003,9 @@ fn capture_complete_responses(row_workers: u8) {
     let mut report = json!({"schemaVersion":1,"case":profile.case,"profile":profile.name,
         "revision":env::var("GITHUB_SHA").unwrap(),"runId":env::var("GITHUB_RUN_ID").unwrap(),
         "runAttempt":env::var("GITHUB_RUN_ATTEMPT").unwrap(),"passed":false,
-        "scope":"bounded-single-pair-complete-response-feasibility",
+        "scope":"bounded-single-pair-cpu-only-complete-response-feasibility",
+        "comparisonKind":"cpu-only-packing","configuredPlacement":"cpu",
+        "automaticPq2PlacementComparisonQualified":false,
         "request":body(),"requestSha256":digest(&serde_json::to_vec(&body()).unwrap()),
         "representationOrder":["PQ2_0","current-repacked-PTQ1_0"],"configuredNativeRowWorkers":row_workers,
         "configuredSeed":42,"requestedAdapterScale":1.3,"servingStatePolicy":"reset-every-request",

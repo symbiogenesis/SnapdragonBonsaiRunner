@@ -101,7 +101,7 @@ sandbox admission, unchanged resource limits and retained artifact guards.
 | `ptq1-adapter-service-row4` / `pq2-adapter-service-row4` | Four workers: three `Hi` one-token streams at 1.3, negative zero and 2.0; invalid-scale and context rejections; interrupt a scale-1.3 request with a 4,096-token reservation after its first visible prefix. Verify cleanup, then use a fresh authenticated owner/new credentials for an exact initial-response replay and cleanup. |
 | `ptq1-adapter-service-rollback-row4` | Complete PTQ1 service sequence, then a third fresh owner explicitly selects original PQ2, adapter 1.3 and four workers, naturally completes the fixed tree-name request within 32 tokens and cleans up. Verify the original file's complete CNG length/SHA-256 after cleanup. |
 | `pq2-adapter-speed` | Fixed-order one/four-worker fresh-owner PQ2 pair, adapter 1.3, seed 42, same public counting prompt, thinking off, eight-token caps. |
-| `ptq1-pq2-complete-response` / `ptq1-pq2-complete-response-row4` | One/four workers respectively: fresh original-PQ2 owner followed by current-weight PTQ1, adapter 1.3, seed 42 and production sampling. Same tree-name prompt, thinking off, 32-token ceiling; both must stop naturally. |
+| `ptq1-pq2-complete-response` / `ptq1-pq2-complete-response-row4` | One/four workers respectively: fresh original-PQ2 owner followed by current-weight PTQ1, both explicitly CPU-only, adapter 1.3, seed 42 and production sampling. Same tree-name prompt, thinking off, 32-token ceiling; both must stop naturally. |
 
 Captured-history profiles replay the exact initial visible assistant UTF-8 text,
 bound to its digest, source-message identity, terminal reason and usage. Missing
@@ -168,8 +168,13 @@ It is application request throughput, not decode TPS or TTFT.
 Complete-response pairs require natural stops, positive usage and both cleanups;
 `length` is truncated. Retain exact text/digests, identities, sampler/template,
 startup/request times and original-PQ2 rollback observations before the next arm.
-Latency/resource ratios require identical bytes and usage, eligible matched power
-and matching released worker-readiness identities. Compare each positive,
+Latency/resource ratios require identical bytes and usage, eligible matched power,
+matching released worker-readiness identities and independently verified CPU
+placement/backend for both arms. Historical auto-placement or missing-placement
+captures retain their answers and raw observations but cannot supply this CPU-only
+comparison. Comparing PTQ1 against X2's automatic original-PQ2 NPU placement needs
+a separate declared deployment comparison; this pair does not qualify that tradeoff.
+Compare each positive,
 consistent native accounting domain separately: lifetime Job commit, lifetime
 root residency, sampled serving private commit and sampled serving residency.
 Never add domains; sampled system available memory is context, not model usage.

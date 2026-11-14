@@ -130,11 +130,27 @@ struct Workloads {
     stalled_consumer: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdapterPlacement {
+    Auto,
+    Cpu,
+}
+
+impl AdapterPlacement {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
 struct AdapterProfile {
     name: &'static str,
     case: &'static str,
     repacked: bool,
     row_workers: u8,
+    placement: AdapterPlacement,
     optional_requests: bool,
     required_scale_history: bool,
 }
@@ -144,6 +160,7 @@ const PTQ1_ADAPTER_PROFILE: AdapterProfile = AdapterProfile {
     case: PTQ1_ADAPTER_CASE,
     repacked: true,
     row_workers: 1,
+    placement: AdapterPlacement::Auto,
     optional_requests: true,
     required_scale_history: false,
 };
@@ -152,6 +169,7 @@ const PTQ1_ADAPTER_LIFECYCLE_PROFILE: AdapterProfile = AdapterProfile {
     case: PTQ1_ADAPTER_LIFECYCLE_CASE,
     repacked: true,
     row_workers: 1,
+    placement: AdapterPlacement::Auto,
     optional_requests: false,
     required_scale_history: true,
 };
@@ -160,6 +178,7 @@ const PTQ1_ADAPTER_LIFECYCLE_ROW4_PROFILE: AdapterProfile = AdapterProfile {
     case: PTQ1_ADAPTER_LIFECYCLE_ROW4_CASE,
     repacked: true,
     row_workers: 4,
+    placement: AdapterPlacement::Auto,
     optional_requests: false,
     required_scale_history: true,
 };
@@ -168,6 +187,7 @@ const PQ2_ADAPTER_ROW4_PROFILE: AdapterProfile = AdapterProfile {
     case: PQ2_ADAPTER_ROW4_CASE,
     repacked: false,
     row_workers: 4,
+    placement: AdapterPlacement::Auto,
     optional_requests: false,
     required_scale_history: false,
 };
@@ -176,6 +196,7 @@ const PQ2_ADAPTER_LIFECYCLE_PROFILE: AdapterProfile = AdapterProfile {
     case: PQ2_ADAPTER_LIFECYCLE_CASE,
     repacked: false,
     row_workers: 4,
+    placement: AdapterPlacement::Auto,
     optional_requests: false,
     required_scale_history: true,
 };
@@ -1645,6 +1666,9 @@ fn adapter_arguments(profile: &AdapterProfile, port: &str) -> Vec<OsString> {
         // Rollback must keep selecting the retained original artifact even if
         // the application's representation default changes after qualification.
         args.push("--use-original-pq2".into());
+    }
+    if profile.placement == AdapterPlacement::Cpu {
+        args.extend(["--placement".into(), profile.placement.name().into()]);
     }
     args.extend([
         "--native-row-workers".into(),

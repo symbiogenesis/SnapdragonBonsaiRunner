@@ -16,6 +16,7 @@ const ROLLBACK_PROFILE: AdapterProfile = AdapterProfile {
     case: CASE,
     repacked: false,
     row_workers: 4,
+    placement: AdapterPlacement::Auto,
     optional_requests: false,
     required_scale_history: false,
 };

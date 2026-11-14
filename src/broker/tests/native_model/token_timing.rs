@@ -121,6 +121,7 @@ async fn paired_capture(
             case: CASE,
             repacked,
             row_workers: 4,
+            placement: AdapterPlacement::Auto,
             optional_requests: false,
             required_scale_history: false,
         };

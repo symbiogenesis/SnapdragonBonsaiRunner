@@ -14,6 +14,7 @@ pub(super) const ADAPTER_PROFILE: AdapterProfile = AdapterProfile {
     case: CASE,
     repacked: true,
     row_workers: 4,
+    placement: AdapterPlacement::Auto,
     optional_requests: false,
     required_scale_history: false,
 };
@@ -25,6 +26,7 @@ pub(super) const PQ2_ADAPTER_PROFILE: AdapterProfile = AdapterProfile {
     case: PQ2_CASE,
     repacked: false,
     row_workers: 4,
+    placement: AdapterPlacement::Auto,
     optional_requests: false,
     required_scale_history: false,
 };
