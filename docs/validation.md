@@ -101,7 +101,7 @@ sandbox admission, unchanged resource limits and retained artifact guards.
 | `ptq1-adapter-service-row4` / `pq2-adapter-service-row4` | Four workers: three `Hi` one-token streams at 1.3, negative zero and 2.0; invalid-scale and context rejections; interrupt a scale-1.3 request with a 4,096-token reservation after its first visible prefix. Verify cleanup, then use a fresh authenticated owner/new credentials for an exact initial-response replay and cleanup. |
 | `ptq1-adapter-service-rollback-row4` | Complete PTQ1 service sequence, then a third fresh owner explicitly selects original PQ2, adapter 1.3 and four workers, naturally completes the fixed tree-name request within 32 tokens and cleans up. Verify the original file's complete CNG length/SHA-256 after cleanup. |
 | `pq2-adapter-speed` | Fixed-order one/four-worker fresh-owner PQ2 pair, adapter 1.3, seed 42, same public counting prompt, thinking off, eight-token caps. |
-| `ptq1-pq2-complete-response` / `ptq1-pq2-complete-response-row4` | One/four workers respectively: fresh original-PQ2 owner followed by current-weight PTQ1, both explicitly CPU-only, adapter 1.3, seed 42 and production sampling. Same tree-name prompt, thinking off, 32-token ceiling; both must stop naturally. |
+| `ptq1-pq2-complete-response` / `ptq1-pq2-complete-response-row4` | One/four workers respectively: fresh original-PQ2 owner followed by current-weight PTQ1, both explicitly CPU-only with K4/V4 (`rsq4`) and disabled prefix reuse, adapter 1.3, seed 42 and production sampling. Same tree-name prompt, thinking off, 32-token ceiling; both must stop naturally. |
 
 Captured-history profiles replay the exact initial visible assistant UTF-8 text,
 bound to its digest, source-message identity, terminal reason and usage. Missing
@@ -175,7 +175,10 @@ and cannot admit the next owner. Failed or timed-out startup also retains a
 pending terminal receipt instead of unwinding through the pair.
 Latency/resource ratios require identical bytes and usage, eligible matched power,
 matching released worker-readiness identities and independently verified CPU
-placement/backend for both arms. Historical auto-placement or missing-placement
+placement/backend, K4/V4 cache and disabled prefix reuse for both arms. These
+explicit source-bound controls are checked by private readiness after successful
+startup. This pair supplies no CPU/FP16 numerical acceptance or full-context/cache
+quality qualification. Historical auto-placement or missing-policy
 captures retain their answers and raw observations but cannot supply this CPU-only
 comparison. Comparing PTQ1 against X2's automatic original-PQ2 NPU placement needs
 a separate declared deployment comparison; this pair does not qualify that tradeoff.

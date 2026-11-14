@@ -253,7 +253,8 @@ fn comparison(samples: &[Value], row_workers: u8) -> Value {
             && sample["cpuPlacementIndependentlyVerified"] == true
             && sample["verifiedProjectionBackend"] == "cpu"
     });
-    let eligible = matched && power_matched && cpu_placement_matched;
+    let state_policy_matched = samples.iter().all(state_policy_matches);
+    let eligible = matched && power_matched && cpu_placement_matched && state_policy_matched;
     let observed_ratio = matched.then(|| {
         samples[1]["stream"]["requestMilliseconds"]
             .as_f64()
@@ -264,6 +265,8 @@ fn comparison(samples: &[Value], row_workers: u8) -> Value {
     });
     json!({"status":"captured-complete-pair", "matchedOutputAndUsage":matched,
         "comparisonKind":"cpu-only-packing", "cpuPlacementMatched":cpu_placement_matched,
+        "configuredKvCache":"rsq4", "configuredPromptReuse":"disabled",
+        "statePolicyMatched":state_policy_matched,
         "ptq1OverPq2RequestLatency":eligible.then_some(observed_ratio).flatten(),
         "observedUnqualifiedRequestLatencyRatio":observed_ratio,
         "performanceComparisonEligible":eligible,"powerConditions":power_conditions,
@@ -312,6 +315,9 @@ fn resource_comparison(
     }
     if !cpu_placement_matched {
         return pending("missing-or-mismatched-cpu-placement-readiness");
+    }
+    if !samples.iter().all(state_policy_matches) {
+        return pending("missing-or-mismatched-state-policy-readiness");
     }
     let resources = [
         &samples[0]["cleanup"]["backendResources"],
@@ -448,11 +454,21 @@ fn can_start_owner(deadline: tokio::time::Instant) -> bool {
 fn record_cpu_placement(sample: &mut Value, verified: bool) {
     // Both representation profiles explicitly request CPU. The source-bound
     // production launcher accepts ownership only after private readiness verifies
-    // requested CPU placement and the effective CPU projection backend. Startup
-    // verification does not establish executed operations or performance.
+    // requested CPU placement, the effective CPU projection backend, the selected
+    // rsq4 cache and disabled prefix reuse. Startup verification does not establish
+    // executed operations, cache quality, numerical parity or performance.
     sample["configuredPlacement"] = json!("cpu");
     sample["cpuPlacementIndependentlyVerified"] = json!(verified);
     sample["verifiedProjectionBackend"] = json!(verified.then_some("cpu"));
+    sample["configuredKvCache"] = json!("rsq4");
+    sample["configuredPromptReuse"] = json!("disabled");
+    sample["statePolicyIndependentlyVerified"] = json!(verified);
+}
+
+fn state_policy_matches(sample: &Value) -> bool {
+    sample["configuredKvCache"] == "rsq4"
+        && sample["configuredPromptReuse"] == "disabled"
+        && sample["statePolicyIndependentlyVerified"] == true
 }
 
 #[test]
@@ -592,6 +608,9 @@ fn native_representation_cpu_placement_gates_comparisons_without_erasing_answers
         let matched = comparison(&pair, row_workers);
         assert_eq!(matched["comparisonKind"], "cpu-only-packing");
         assert_eq!(matched["cpuPlacementMatched"], true);
+        assert_eq!(matched["configuredKvCache"], "rsq4");
+        assert_eq!(matched["configuredPromptReuse"], "disabled");
+        assert_eq!(matched["statePolicyMatched"], true);
         let rollback = original_pq2_rollback_observation(&pair, row_workers);
         for index in 0..2 {
             for (field, changed) in [
@@ -620,12 +639,33 @@ fn native_representation_cpu_placement_gates_comparisons_without_erasing_answers
                     );
                 }
             }
+            for (field, changed) in [
+                ("configuredKvCache", json!("f16")),
+                ("configuredPromptReuse", json!("latest")),
+                ("statePolicyIndependentlyVerified", json!(false)),
+            ] {
+                for value in [Value::Null, changed] {
+                    let mut invalid = pair.clone();
+                    invalid[index][field] = value;
+                    let compared = comparison(&invalid, row_workers);
+                    assert_eq!(compared["status"], "captured-complete-pair");
+                    assert_eq!(compared["statePolicyMatched"], false);
+                    assert_eq!(compared["performanceComparisonEligible"], false);
+                    assert!(compared["ptq1OverPq2RequestLatency"].is_null());
+                    assert_eq!(
+                        compared["resources"]["reason"],
+                        "missing-or-mismatched-state-policy-readiness"
+                    );
+                    assert_eq!(compared["resources"]["metrics"], json!([]));
+                }
+            }
         }
         let mut not_started = json!({});
         record_cpu_placement(&mut not_started, false);
         assert_eq!(not_started["configuredPlacement"], "cpu");
         assert_eq!(not_started["cpuPlacementIndependentlyVerified"], false);
         assert!(not_started["verifiedProjectionBackend"].is_null());
+        assert_eq!(not_started["statePolicyIndependentlyVerified"], false);
     }
 }
 
@@ -884,6 +924,15 @@ fn native_representation_row4_profile_is_explicit_and_preserves_pair() {
                 .count(),
             1
         );
+        for (flag, value) in [("--kv-cache", "rsq4"), ("--prompt-reuse", "disabled")] {
+            assert_eq!(
+                actual
+                    .array_windows::<2>()
+                    .filter(|[arg, selected]| arg == flag && selected == value)
+                    .count(),
+                1
+            );
+        }
         assert_eq!(
             actual.iter().any(|arg| arg == "--use-original-pq2"),
             !parallel.repacked
@@ -1180,6 +1229,8 @@ fn capture_complete_responses(row_workers: u8) {
         "runAttempt":env::var("GITHUB_RUN_ATTEMPT").unwrap(),"passed":false,
         "scope":"bounded-single-pair-cpu-only-complete-response-feasibility",
         "comparisonKind":"cpu-only-packing","configuredPlacement":"cpu",
+        "configuredKvCache":"rsq4","configuredPromptReuse":"disabled",
+        "statePolicyScope":"K4/V4 with reset on every request; supplies no CPU/FP16 numerical or full-context/cache quality qualification",
         "automaticPq2PlacementComparisonQualified":false,
         "request":body(),"requestSha256":digest(&serde_json::to_vec(&body()).unwrap()),
         "representationOrder":["PQ2_0","current-repacked-PTQ1_0"],"configuredNativeRowWorkers":row_workers,

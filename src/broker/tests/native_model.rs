@@ -1670,6 +1670,12 @@ fn adapter_arguments(profile: &AdapterProfile, port: &str) -> Vec<OsString> {
     if profile.placement == AdapterPlacement::Cpu {
         args.extend(["--placement".into(), profile.placement.name().into()]);
     }
+    if matches!(
+        profile.name,
+        representation::PROFILE | representation::ROW4_PROFILE
+    ) {
+        args.extend(["--kv-cache", "rsq4", "--prompt-reuse", "disabled"].map(OsString::from));
+    }
     args.extend([
         "--native-row-workers".into(),
         profile.row_workers.to_string().into(),
