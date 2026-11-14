@@ -45,7 +45,7 @@ struct Selection {
     rust: bool,
     workflows: bool,
     powershell: Vec<String>,
-    cache_fixture: bool,
+    cache_actions: Vec<&'static str>,
     source_fixture: bool,
 }
 
@@ -73,20 +73,25 @@ fn selection(paths: &[String]) -> Selection {
             .filter(|path| extension(path, "ps1") || extension(path, "psm1"))
             .map(|path| (*path).clone())
             .collect(),
-        cache_fixture: owned.iter().any(|path| {
-            [
-                ".github/actions/bonsai-tools/action.yml",
-                ".github/actions/ci-tool/action.yml",
-                "tools/ci/test_tools_cache_inputs.ps1",
-                "tools/ci/test_support.ps1",
-            ]
-            .contains(&path.as_str())
-        }),
+        cache_actions: ["bonsai-tools", "ci-tool"]
+            .into_iter()
+            .filter(|action| {
+                owned.iter().any(|path| {
+                    path.as_str() == format!(".github/actions/{action}/action.yml")
+                        || [
+                            "tools/ci/test_tools_cache_inputs.ps1",
+                            "tools/ci/test_support.ps1",
+                        ]
+                        .contains(&path.as_str())
+                })
+            })
+            .collect(),
         source_fixture: owned.iter().any(|path| {
             [
                 ".github/workflows/source-checks.yml",
                 "tools/ci/select_source_checks.ps1",
                 "tools/ci/test_source_checks.ps1",
+                "tools/ci/test_support.ps1",
             ]
             .contains(&path.as_str())
         }),
@@ -217,10 +222,16 @@ mod tests {
     #[test]
     fn push_sanity_routes_known_environment_and_source_regressions() {
         let plan = selection(&[".github/actions/bonsai-tools/action.yml".into()]);
-        assert!(plan.workflows && plan.cache_fixture);
+        assert!(plan.workflows);
+        assert_eq!(plan.cache_actions, ["bonsai-tools"]);
         assert!(!plan.source_fixture);
+        let plan = selection(&[".github/actions/ci-tool/action.yml".into()]);
+        assert_eq!(plan.cache_actions, ["ci-tool"]);
+        let plan = selection(&["tools/ci/test_support.ps1".into()]);
+        assert_eq!(plan.cache_actions, ["bonsai-tools", "ci-tool"]);
+        assert!(plan.source_fixture);
         let plan = selection(&[".github/workflows/source-checks.yml".into()]);
         assert!(plan.workflows && plan.source_fixture);
-        assert!(!plan.cache_fixture);
+        assert!(plan.cache_actions.is_empty());
     }
 }

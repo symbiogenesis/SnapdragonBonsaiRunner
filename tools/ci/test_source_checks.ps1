@@ -1,8 +1,8 @@
 #Requires -Version 7.6
-param([string]$Case)
+param([string]$Case,[string]$CandidateRoot)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
-$repository=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-$selector=Join-Path $PSScriptRoot 'select_source_checks.ps1'
+$repository=if ($CandidateRoot) { (Resolve-Path -LiteralPath $CandidateRoot).ProviderPath } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
+$selector=Join-Path $repository 'tools/ci/select_source_checks.ps1'
 
 function Invoke-SourceSelection([string]$Event,[string]$Ref,[string[]]$Paths=@(),[string]$Range='valid') {
     $scratch=New-CiScratch 'bonsai-source-selection-'

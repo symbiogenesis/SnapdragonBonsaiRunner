@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bonsai_windows_process::{OwnedProcess, ToolProcessSpec};
 
-use super::{Update, selection};
+use super::{Selection, Update, selection};
 use crate::Result;
 
 struct Work {
@@ -64,19 +64,10 @@ impl Work {
                 environment,
             );
         }
-        // Windows Store execution aliases cannot be started with CreateProcess
-        // suspended in an owned Job. The PowerShell adapter supplies its actual
-        // running image, preserving the same version without a shell fallback.
-        let shell = (program == "pwsh.exe")
-            .then(|| std::env::var_os("BONSAI_PUSH_PWSH_PATH").map(PathBuf::from))
-            .flatten();
         let search = std::env::var_os("PATH").unwrap_or_default();
-        let executable = shell
-            .or_else(|| {
-                std::env::split_paths(&search)
-                    .map(|directory| directory.join(program))
-                    .find(|path| path.is_absolute() && path.is_file())
-            })
+        let executable = std::env::split_paths(&search)
+            .map(|directory| directory.join(program))
+            .find(|path| path.is_absolute() && path.is_file())
             .ok_or_else(|| format!("Push sanity requires {program} on PATH."))?;
         if !executable.is_absolute() || !executable.is_file() {
             return Err(format!(
@@ -203,8 +194,9 @@ impl Work {
         )?;
         let powershell: Vec<_> = plan
             .powershell
-            .into_iter()
-            .filter(|path| source.join(path).is_file())
+            .iter()
+            .filter(|path| source.join(path.as_str()).is_file())
+            .cloned()
             .collect();
         if !powershell.is_empty() {
             let paths_file = self.directory.join("powershell-paths.json");
@@ -246,29 +238,46 @@ impl Work {
             }
             self.script(source, root, "check_workflow_syntax.ps1", &arguments)?;
         }
-        // Execute only named, model-free controls for the failure-producing adapters.
-        // Fixtures verify the committed checking policy. Historical outgoing tips
-        // need not contain fixture names introduced by a later checking policy.
-        for (selected, script, cases) in [
-            (
-                plan.cache_fixture,
-                "test_tools_cache_inputs.ps1",
-                &[
-                    "mixed_case_names_have_same_build_identity",
-                    "environment_fixture_preserves_absent_and_empty_values",
-                ][..],
-            ),
-            (
-                plan.source_fixture,
-                "test_source_checks.ps1",
-                &["main_push_always_records_source_verdict"][..],
-            ),
-        ] {
-            if selected {
-                for case in cases {
-                    self.script(source, root, script, &["-Case".into(), (*case).into()])?;
-                }
+        self.adapter_checks(root, source, &plan)
+    }
+
+    fn adapter_checks(&mut self, policy: &Path, source: &Path, plan: &Selection) -> Result<()> {
+        // Assertions and support come from the committed checking policy. Inputs
+        // come from this outgoing snapshot even when it is not checking HEAD.
+        // Candidate fixture scripts are never used, so later controls can also
+        // exercise historical adapters that did not yet contain those fixtures.
+        for action in &plan.cache_actions {
+            for case in [
+                "mixed_case_names_have_same_build_identity",
+                "environment_fixture_preserves_absent_and_empty_values",
+            ] {
+                self.script(
+                    source,
+                    policy,
+                    "test_tools_cache_inputs.ps1",
+                    &[
+                        "-Case".into(),
+                        case.into(),
+                        "-CandidateRoot".into(),
+                        source.into(),
+                        "-EnvironmentAction".into(),
+                        (*action).into(),
+                    ],
+                )?;
             }
+        }
+        if plan.source_fixture {
+            self.script(
+                source,
+                policy,
+                "test_source_checks.ps1",
+                &[
+                    "-Case".into(),
+                    "main_push_always_records_source_verdict".into(),
+                    "-CandidateRoot".into(),
+                    source.into(),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -389,6 +398,112 @@ pub(super) fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_sanity_trusted_controls_reject_non_head_candidate_adapters() -> Result<()> {
+        let temporary = super::super::canonical_path(std::env::temp_dir())?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch = temporary.join(format!("bonsai-push-adapters-{nonce}"));
+        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let mut work = Work {
+            directory: scratch.clone(),
+            started: Instant::now(),
+            sequence: 0,
+        };
+        let result = (|| {
+            let policy =
+                super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+            let root = scratch.join("repository");
+            fs::create_dir(&root).map_err(|error| error.to_string())?;
+            work.git(&root, &["init", "--quiet"])?;
+            let adapters = [
+                ".github/actions/bonsai-tools/action.yml",
+                ".github/actions/ci-tool/action.yml",
+                "tools/ci/select_source_checks.ps1",
+            ];
+            let mut originals = Vec::new();
+            for name in adapters {
+                let text =
+                    fs::read_to_string(policy.join(name)).map_err(|error| error.to_string())?;
+                let broken = if name.ends_with("action.yml") {
+                    text.replace(
+                        "$buildInputs = @(",
+                        "$buildInputs = @('constant'); $ignoredInputs = @(",
+                    )
+                } else {
+                    text.replace(
+                        "$selected.audit=$eligible.audit -and",
+                        "$selected.audit=$eligible.audit -or",
+                    )
+                };
+                assert_ne!(text, broken, "The adapter mutation must change {name}.");
+                let path = root.join(name);
+                fs::create_dir_all(path.parent().ok_or("Missing adapter parent.")?)
+                    .map_err(|error| error.to_string())?;
+                fs::write(&path, broken).map_err(|error| error.to_string())?;
+                originals.push((path, text));
+            }
+            for name in ["source-checks", "foundation"] {
+                let relative = format!(".github/workflows/{name}.yml");
+                let path = root.join(&relative);
+                fs::create_dir_all(path.parent().ok_or("Missing workflow parent.")?)
+                    .map_err(|error| error.to_string())?;
+                fs::copy(policy.join(relative), path).map_err(|error| error.to_string())?;
+            }
+            // An outgoing candidate cannot replace trusted fixture assertions
+            // or support with its own successful or failing script.
+            for name in [
+                "test_tools_cache_inputs",
+                "test_source_checks",
+                "test_support",
+            ] {
+                fs::write(
+                    root.join(format!("tools/ci/{name}.ps1")),
+                    "throw 'Candidate fixture must never execute.'",
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            work.git(&root, &["add", "--all"])?;
+            let commit = [
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "adapter fixture",
+            ];
+            work.git(&root, &commit)?;
+            for (path, text) in originals {
+                fs::write(path, text).map_err(|error| error.to_string())?;
+            }
+            work.git(&root, &["add", "--all"])?;
+            work.git(&root, &commit)?;
+            let broken = work.snapshot(&root, "HEAD~1", 0)?;
+            for path in adapters {
+                assert!(
+                    work.adapter_checks(&policy, &broken, &selection(&[path.into()]))
+                        .is_err(),
+                    "Trusted controls must reject the non-HEAD candidate's {path}."
+                );
+            }
+            let repaired = work.snapshot(&root, "HEAD", 1)?;
+            work.adapter_checks(&policy, &repaired, &selection(&adapters.map(String::from)))
+        })();
+        if scratch.parent() != Some(temporary.as_path()) {
+            return Err("Push adapter fixture cleanup escaped temp.".into());
+        }
+        fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
+        result
+    }
 
     #[test]
     fn push_sanity_snapshot_is_independent_of_index_and_worktree() -> Result<()> {

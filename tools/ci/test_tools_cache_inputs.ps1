@@ -1,7 +1,11 @@
 #Requires -Version 7.6
-param([string]$Case)
+param(
+    [string]$Case,
+    [string]$CandidateRoot,
+    [ValidateSet('bonsai-tools','ci-tool')][string]$EnvironmentAction='bonsai-tools'
+)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
-$repository=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$repository=if ($CandidateRoot) { (Resolve-Path -LiteralPath $CandidateRoot).ProviderPath } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
 $actionPath=Join-Path $repository '.github/actions/bonsai-tools/action.yml'
 function Restore-CacheEnvironment([string]$Name,$Value) {
     # PowerShell 7.5+ converts $null to an empty string for this .NET method.
@@ -108,8 +112,11 @@ function Invoke-ToolsEnvironmentFixture([object[]]$Scenarios) {
     try {
         foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) { if ($name.ToUpperInvariant().StartsWith('RUST',[StringComparison]::Ordinal) -or $name.ToUpperInvariant().StartsWith('CARGO_',[StringComparison]::Ordinal)) { [Environment]::SetEnvironmentVariable($name,[NullString]::Value) } }
         $cargoDirectory=Join-Path $scratch 'cargo'; [void][IO.Directory]::CreateDirectory($cargoDirectory)
-        $environment=@{TOOLS_SOURCE_ID=('a'*64);RUNNER_ENVIRONMENT='github-hosted';ImageOS='fixture-os';ImageVersion='fixture-image';RUNNER_TEMP=$scratch;CARGO_HOME=$cargoDirectory;GITHUB_ENV=(Join-Path $scratch 'environment')}; foreach ($key in $environment.Keys) { [Environment]::SetEnvironmentVariable($key,$environment[$key]) }
-        $action=[IO.File]::ReadAllText($actionPath); $begin=$action.IndexOf('        $buildInputs = '); $end=$action.IndexOf('        "BONSAI_TOOLS_SOURCE_ID=',$begin); $script=(($action.Substring($begin,$end-$begin) -split '\r?\n' | ForEach-Object { if ($_.Length -ge 8) { $_.Substring(8) } else { '' } }) -join "`n")
+        $environment=@{TOOLS_SOURCE_ID=('a'*64);CI_SOURCE_ID=('a'*64);RUNNER_ENVIRONMENT='github-hosted';ImageOS='fixture-os';ImageVersion='fixture-image';RUNNER_TEMP=$scratch;CARGO_HOME=$cargoDirectory;GITHUB_ENV=(Join-Path $scratch 'environment')}; foreach ($key in $environment.Keys) { [Environment]::SetEnvironmentVariable($key,$environment[$key]) }
+        # Keep this harness and its assertions in the committed checking policy;
+        # only the selected immutable candidate's adapter supplies the body.
+        $prefix=if ($EnvironmentAction -ceq 'ci-tool') { 'BONSAI_CI' } else { 'BONSAI_TOOLS' }
+        $action=[IO.File]::ReadAllText((Join-Path $repository ".github/actions/$EnvironmentAction/action.yml")); $begin=$action.IndexOf('        $buildInputs = '); if ($begin -lt 0) { throw 'Missing candidate cache-input adapter.' }; $end=$action.IndexOf(('        "'+$prefix+'_SOURCE_ID='),$begin); if ($end -le $begin) { throw 'Missing candidate cache-input output boundary.' }; $script=(($action.Substring($begin,$end-$begin) -split '\r?\n' | ForEach-Object { if ($_.Length -ge 8) { $_.Substring(8) } else { '' } }) -join "`n")
         $result=@()
         foreach ($scenario in $Scenarios) {
             # NullString passes an actual null through PowerShell's string
@@ -118,7 +125,9 @@ function Invoke-ToolsEnvironmentFixture([object[]]$Scenarios) {
             foreach ($key in $scenario.environment.Keys) { if ($null -ne $scenario.environment[$key]) { [Environment]::SetEnvironmentVariable($key,$scenario.environment[$key]) } }
             foreach ($name in @('config','config.toml')) { $path=Join-Path $cargoDirectory $name; if ($scenario.ContainsKey($name)) { [IO.File]::WriteAllText($path,$scenario[$name]) } elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path) } }
             [IO.File]::WriteAllText($env:GITHUB_ENV,''); & ([scriptblock]::Create($script)) | Out-Null
-            $result+=@([IO.File]::ReadAllLines($env:GITHUB_ENV) | Where-Object { $_.StartsWith('BONSAI_TOOLS_CACHE_HOST=',[StringComparison]::Ordinal) })
+            $identity=@([IO.File]::ReadAllLines($env:GITHUB_ENV) | Where-Object { $_.StartsWith(($prefix+'_CACHE_HOST='),[StringComparison]::Ordinal) })
+            Assert-CiEqual $identity.Count 1
+            $result+=$identity
         }
         return ,$result
     } finally { foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) { if (-not $original.ContainsKey($name)) { [Environment]::SetEnvironmentVariable($name,[NullString]::Value) } }; foreach ($name in $original.Keys) { Restore-CacheEnvironment $name $original[$name] }; Remove-CiScratch $scratch }
