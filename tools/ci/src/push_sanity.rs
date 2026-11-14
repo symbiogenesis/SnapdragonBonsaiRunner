@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::Result;
 
@@ -56,21 +56,21 @@ fn selection(paths: &[String]) -> Selection {
         .collect();
     Selection {
         rust: owned.iter().any(|path| {
-            path.ends_with(".rs")
+            extension(path, "rs")
                 || path.ends_with("Cargo.toml")
                 || path.as_str() == "rust-toolchain.toml"
                 || path.starts_with(".cargo/")
         }),
         workflows: owned.iter().any(|path| {
-            path.ends_with(".yml")
-                || path.ends_with(".yaml")
+            extension(path, "yml")
+                || extension(path, "yaml")
                 || path.as_str() == ".github/workflows/actions.lock"
                 || path.as_str() == "tools/ci/check_workflow_startup.ps1"
                 || path.as_str() == "tools/ci/check_workflow_syntax.ps1"
         }),
         powershell: owned
             .iter()
-            .filter(|path| path.ends_with(".ps1") || path.ends_with(".psm1"))
+            .filter(|path| extension(path, "ps1") || extension(path, "psm1"))
             .map(|path| (*path).clone())
             .collect(),
         cache_fixture: owned.iter().any(|path| {
@@ -93,6 +93,29 @@ fn selection(paths: &[String]) -> Selection {
     }
 }
 
+fn extension(path: &str, expected: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+fn canonical_path(path: PathBuf) -> Result<PathBuf> {
+    let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    // Canonical Windows paths have a verbatim prefix. The Job boundary accepts
+    // ordinary drive/UNC paths and deliberately rejects device path spellings.
+    #[cfg(windows)]
+    {
+        let text = path.to_str().ok_or("Push sanity paths must be UTF-8.")?;
+        if let Some(suffix) = text.strip_prefix("\\\\?\\UNC\\") {
+            return Ok(PathBuf::from(format!("\\\\{suffix}")));
+        }
+        if let Some(suffix) = text.strip_prefix("\\\\?\\") {
+            return Ok(PathBuf::from(suffix));
+        }
+    }
+    Ok(path)
+}
+
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     if !matches!(arguments.len(), 3 | 5 | 7)
         || arguments[1] != "--root"
@@ -101,10 +124,9 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     {
         return Err(USAGE.into());
     }
-    let root =
-        std::fs::canonicalize(PathBuf::from(&arguments[2])).map_err(|error| error.to_string())?;
+    let root = canonical_path(PathBuf::from(&arguments[2]))?;
     let policy = if arguments.len() >= 5 {
-        std::fs::canonicalize(PathBuf::from(&arguments[4])).map_err(|error| error.to_string())?
+        canonical_path(PathBuf::from(&arguments[4]))?
     } else {
         root.clone()
     };

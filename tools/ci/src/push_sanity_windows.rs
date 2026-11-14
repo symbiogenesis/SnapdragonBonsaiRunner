@@ -244,13 +244,15 @@ pub(super) fn check(
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
-    let temporary = fs::canonicalize(std::env::temp_dir()).map_err(|error| error.to_string())?;
+    let temporary = super::canonical_path(std::env::temp_dir())?;
     let directory = temporary.join(format!("bonsai-push-sanity-{}-{nonce}", std::process::id()));
     fs::create_dir(&directory).map_err(|error| error.to_string())?;
     let before = bonsai_windows_process::power_status();
     let mut work = Work {
         directory,
-        started: Instant::now() - Duration::from_millis(bootstrap_milliseconds),
+        started: Instant::now()
+            .checked_sub(Duration::from_millis(bootstrap_milliseconds))
+            .ok_or("Push bootstrap start predates the monotonic clock.")?,
         sequence: 0,
     };
     let result = (|| {
@@ -333,8 +335,7 @@ mod tests {
 
     #[test]
     fn push_sanity_snapshot_is_independent_of_index_and_worktree() -> Result<()> {
-        let temporary =
-            fs::canonicalize(std::env::temp_dir()).map_err(|error| error.to_string())?;
+        let temporary = super::super::canonical_path(std::env::temp_dir())?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?

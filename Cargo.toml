@@ -96,6 +96,12 @@ cargo = { level = "deny", priority = -1 }
 unreadable_literal = "allow"
 missing_const_for_fn = "allow"
 semicolon_if_nothing_returned = "allow"
+# Wire field names, independent selection flags and source line counts are not
+# correctness contracts. Grouping heuristics also misread run/job API identities.
+struct_field_names = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+suspicious_operation_groupings = "allow"
 as_conversions = "deny"
 dbg_macro = "deny"
 exit = "deny"
