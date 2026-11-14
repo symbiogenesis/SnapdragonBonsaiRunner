@@ -8,6 +8,8 @@ $PSNativeCommandUseErrorActionPreference = $true
 $updates = [Console]::In.ReadToEnd()
 if (-not $updates.Trim()) { return }
 $started = [Diagnostics.Stopwatch]::StartNew()
+$originalPwsh = $env:BONSAI_PUSH_PWSH_PATH
+$env:BONSAI_PUSH_PWSH_PATH = [Environment]::ProcessPath
 Add-Type -AssemblyName System.Windows.Forms
 $power = [Windows.Forms.SystemInformation]::PowerStatus
 Write-Host "Push sanity power before: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown."
@@ -31,4 +33,6 @@ try {
     Remove-Item -LiteralPath $absolute -Recurse -Force
     $power = [Windows.Forms.SystemInformation]::PowerStatus
     Write-Host "Push sanity power after: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown; aggregate elapsed=$($started.Elapsed)."
+    if ($null -eq $originalPwsh) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH', [NullString]::Value) }
+    else { $env:BONSAI_PUSH_PWSH_PATH = $originalPwsh }
 }

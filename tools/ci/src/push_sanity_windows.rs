@@ -29,11 +29,26 @@ impl Work {
         if self.started.elapsed() >= Duration::from_secs(270) {
             return Err("Push sanity aggregate allowance exhausted; push blocked.".into());
         }
-        let executable =
-            std::env::split_paths(&std::env::var_os("PATH").ok_or("PATH is unavailable")?)
-                .map(|directory| directory.join(program))
-                .find(|path| path.is_absolute() && path.is_file())
-                .ok_or_else(|| format!("Push sanity requires {program} on PATH."))?;
+        // Windows Store execution aliases cannot be started with CreateProcess
+        // suspended in an owned Job. The PowerShell adapter supplies its actual
+        // running image, preserving the same version without a shell fallback.
+        let shell = (program == "pwsh.exe")
+            .then(|| std::env::var_os("BONSAI_PUSH_PWSH_PATH").map(PathBuf::from))
+            .flatten();
+        let search = std::env::var_os("PATH").unwrap_or_default();
+        let executable = shell
+            .or_else(|| {
+                std::env::split_paths(&search)
+                    .map(|directory| directory.join(program))
+                    .find(|path| path.is_absolute() && path.is_file())
+            })
+            .ok_or_else(|| format!("Push sanity requires {program} on PATH."))?;
+        if !executable.is_absolute() || !executable.is_file() {
+            return Err(format!(
+                "Invalid native tool image: {}",
+                executable.display()
+            ));
+        }
         let name = self.sequence;
         self.sequence += 1;
         let stdout = self.directory.join(format!("{name}.stdout"));
@@ -46,7 +61,7 @@ impl Work {
             stderr: stderr.clone(),
             environment,
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("Cannot start {program} in {}: {error}", root.display()))?;
         let code = loop {
             if let Some(code) = child.try_wait().map_err(|error| error.to_string())? {
                 break code;
