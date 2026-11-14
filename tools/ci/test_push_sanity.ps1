@@ -35,12 +35,16 @@ function Invoke-PushRecoveryFixture([string]$CheckerState,[string]$RecoveryState
         }
         $checkerReceipt=@{SchemaVersion=1;SourceIdentity=$identities.checker;Sha256=(Get-FileHash -LiteralPath $checker -Algorithm SHA256).Hash.ToLowerInvariant()}
         if ($CheckerState -ceq 'stale') { $checkerReceipt.SourceIdentity='0' * 64 }
+        if ($CheckerState -ceq 'collection-source') { $checkerReceipt.SourceIdentity=@($identities.checker,('0' * 64)) }
+        if ($CheckerState -ceq 'collection-digest') { $checkerReceipt.Sha256=@($checkerReceipt.Sha256,('0' * 64)) }
         $checkerReceipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-checker.json') -Encoding utf8NoBOM
         if ($CheckerState -ceq 'missing') { [IO.File]::Delete((Join-Path $target 'push-checker.json')) }
         if ($CheckerState -ceq 'malformed') { Write-CiFixture $target 'push-checker.json' '{"unfinished":' }
         if ($CheckerState -ceq 'corrupt') { [IO.File]::AppendAllText($checker,'Changed after receipt publication.') }
         $recoveryReceipt=@{SchemaVersion=1;SourceIdentity=$identities.recovery;Sha256=(Get-FileHash -LiteralPath $recovery -Algorithm SHA256).Hash.ToLowerInvariant()}
         if ($RecoveryState -ceq 'invalid') { $recoveryReceipt.Sha256='0' * 64 }
+        if ($RecoveryState -ceq 'collection-source') { $recoveryReceipt.SourceIdentity=@($identities.recovery,('0' * 64)) }
+        if ($RecoveryState -ceq 'collection-digest') { $recoveryReceipt.Sha256=@($recoveryReceipt.Sha256,('0' * 64)) }
         $recoveryReceipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-recovery.json') -Encoding utf8NoBOM
         Write-CiFixture $repository 'unrelated-source.txt' 'Uncommitted poison must not reach recovery.'
         $driver=Join-Path $scratch 'recovery-driver.ps1'
@@ -55,7 +59,7 @@ function git {
     if ($LASTEXITCODE) { throw 'Fixture Git command failed.' }
     if ($args -ccontains 'archive') {
         $script:archiveCalls++
-        Assert-Ci ($RecoveryState -cne 'invalid') 'An unverified supervisor reached source intake.'
+        Assert-Ci ($RecoveryState -ceq 'valid') 'An unverified supervisor reached source intake.'
         Assert-CiEqual $script:archiveCalls 1
         Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-checker.json'))) 'Recovery retained the old checker receipt during source intake.'
         Assert-Ci (-not ($args -ccontains '--')) 'Recovery selected a partial policy archive.'
@@ -72,7 +76,7 @@ try { & $Adapter -Root $Repository -TargetDirectory $Target }
 catch { $failure=$_.Exception.Message }
 Assert-Ci ($null -ne $failure) 'Recovery fixture unexpectedly admitted an inert checker.'
 Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-checker.json'))) 'Failed recovery published or retained a checker receipt.'
-if ($RecoveryState -ceq 'invalid') {
+if ($RecoveryState -cne 'valid') {
     Assert-CiEqual $script:archiveCalls 0
     Assert-Ci ($failure.Contains('-Prepare')) 'Invalid supervisor did not explain explicit preparation.'
 } elseif ($RunRecovery) {
@@ -92,9 +96,13 @@ if ($RecoveryState -ceq 'invalid') {
 $cases=[ordered]@{
  stale_checker_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'stale' }
  malformed_checker_receipt_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'malformed' }
+ collection_checker_source_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'collection-source' }
+ collection_checker_digest_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'collection-digest' }
  corrupt_checker_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'corrupt' }
  missing_checker_receipt_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'missing' }
  unverified_supervisor_blocks_recovery={ Invoke-PushRecoveryFixture 'stale' 'invalid' }
+ collection_recovery_source_blocks_recovery={ Invoke-PushRecoveryFixture 'stale' 'collection-source' }
+ collection_recovery_digest_blocks_recovery={ Invoke-PushRecoveryFixture 'stale' 'collection-digest' }
  failed_automatic_recovery_invalidates_existing_receipt={ Invoke-PushRecoveryFixture 'stale' -RunRecovery }
  ordinary_push_archives_only_committed_policy={
     $scratch=New-CiScratch 'bonsai-push-policy-'
