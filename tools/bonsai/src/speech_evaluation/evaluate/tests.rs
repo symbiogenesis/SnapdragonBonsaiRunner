@@ -218,12 +218,14 @@ fn fixed_listening_packets_preserve_control_and_bind_exact_synthesis_text() -> c
 #[test]
 fn listening_clip_identity_binds_original_wave_and_exact_pcm_geometry() -> crate::Result<()> {
     use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
     let bytes = fixture();
     let identity = clip_identity(&bytes)?;
-    assert_eq!(
-        identity["ClipSha256"],
-        format!("{:x}", Sha256::digest(&bytes))
-    );
+    let mut expected_sha256 = String::with_capacity(64);
+    for byte in Sha256::digest(&bytes) {
+        write!(expected_sha256, "{byte:02x}").map_err(|error| error.to_string())?;
+    }
+    assert_eq!(identity["ClipSha256"], expected_sha256);
     assert_eq!(identity["ClipBytes"], 48);
     assert_eq!(identity["SampleRate"], 24_000);
     assert_eq!(identity["Channels"], 1);
