@@ -358,7 +358,7 @@ mod tests {
                 )?;
                 let mut calls = Vec::new();
                 build_with(&plan, |operation, request| {
-                    calls.push((operation.to_owned(), request.clone()));
+                    calls.push((operation.to_owned(), request));
                     match operation {
                         "launcher" => {
                             let launcher = plan
