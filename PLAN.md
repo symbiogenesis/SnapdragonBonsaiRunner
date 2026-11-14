@@ -57,7 +57,7 @@ adoption decisions without displacing native daily-use acceptance.
   focused checks while preserving hosted ordinary-verdict coverage.
   Follow the [startup preflight](tools/ci/README.md#action-dependency-pins) before
   workflow changes and verify supported self-hosted runner versions.
-  Include the [30-run failure audit](docs/evidence/ci-failure-audit.md), exact-source
+  Include the [failure audit and latest ten-run follow-up](docs/evidence/ci-failure-audit.md), exact-source
   Release prerequisite/rerun admission, production-only lanes and same-run tool
   reuse; unrestricted main-push verdicts with unchanged scoped selection;
   immutable outgoing-tip push checks; public-input writer/identity handoff; and
@@ -76,6 +76,15 @@ adoption decisions without displacing native daily-use acceptance.
   and source-language scan newline diagnostics in owning CI acceptance.
   Qualify parallel formatter root/configuration/failure parity, managed AST
   traversal and pinned linter archive cache-hit/poisoning controls.
+  Include portable maintenance consumer selection and budget/verdict fixtures,
+  complete pinned public-ABI source intake before downloads, formatter-config
+  push selection and behavior-focused Clippy policy.
+- [ ] Establish remote enforcement of basic sanity before updating `main`.
+  Stage a trusted exact-commit candidate check before activating required-check
+  rules, preserve reviewed direct-main promotion without routine pull requests,
+  and restrict session administration/check-issuer credentials. Local hooks alone
+  cannot enforce remote acceptance; the current repository has no active rules.
+  See the [concrete rule/process requirements](docs/evidence/ci-failure-audit.md#process-corrections-and-remaining-limits).
 - [ ] Qualify Runner's checked-tools producer, shared regression runner and
   native-acceptance caches: cold build, exact hit and relevant-input invalidation,
   fresh same-run packages, source/digest verification and every selected check.

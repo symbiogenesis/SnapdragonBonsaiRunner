@@ -59,9 +59,15 @@ to TTS model lockfiles still rebuild and check the CLI that embeds those identit
 
 The Linux planner restores locked downloads and compiler/image-isolated incremental
 outputs after source changes. It still builds the current source and runs its routing
-and gate regressions before producing a plan. Windows Release's TTS lane also skips
-the ASR compiler/tool provisioning dependency; its format, Clippy, documentation,
-complete tests, executable build and third-party notices remain required.
+and gate regressions before producing a plan. Windows Release requires successful
+Foundation and Source checks for its exact main-push source before the build
+fan-out, then verifies those prerequisites again before publication. Foundation
+owns formatting, Clippy, documentation and tests. Release's five build-only lanes
+link with the production profile, which differs from Foundation's incremental
+profile; packaging and publication reuse the same-run maintenance tools.
+The TTS lane skips ASR provisioning and still supplies its executable and complete
+third-party notices. Release primitives, package validation and smoke checks
+retain their independent obligations.
 
 Hexagon runs its layout and ranking controls alongside one policy-tool producer.
 Both native builders consume that run's revision/digest-verified CLI. Policy tests,
@@ -748,7 +754,8 @@ Every worker must pass before candidate adapter bodies can execute; all workers
 share the original process/output bounds and cleanup reserve.
 
 The screen checks owned-language policy, parses changed PowerShell without
-executing it, checks workspace Rust formatting when Rust/build inputs change,
+executing it, checks workspace Rust formatting when Rust/build inputs or root/nested
+`rustfmt.toml` / `.rustfmt.toml` configurations change,
 and validates workflow startup plus Actions syntax when YAML/action inputs
 change. Named cache-environment controls independently exercise both cache
 actions, and source-routing controls exercise the selected source adapter.
@@ -804,7 +811,10 @@ requires GitHub rules and restricted bypass/push credentials. This change does
 not install remote rules or change the owner's direct-main delivery workflow.
 Release separately enforces trusted exact-source CI results at publication.
 
-The workspace keeps correctness and performance Clippy checks. Digit grouping,
+The workspace requires correctness, suspicious-code and performance Clippy groups,
+plus explicit native safety and ownership rules. Style, complexity, pedantic,
+nursery and Cargo preference groups are explicitly allowed under `-D warnings`;
+new toolchain preferences cannot silently become required checks. Digit grouping,
 optional const promotion, unit-expression punctuation, wire field names,
 independent selector booleans and source line counts are explicitly allowed.
 The operation-grouping heuristic is also disabled after misreading a correct

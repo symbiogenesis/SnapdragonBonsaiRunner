@@ -485,6 +485,12 @@ unsafe operations stay small, documented and behind safe owners. Prefer scoped
 allowances still require their specific reason. Existing all-target Clippy,
 rustdoc and owning tests enforce the policy across supported feature profiles.
 
+Clippy requires correctness, suspicious-code and performance checks plus explicit
+safety and ownership requirements. Style, complexity, pedantic, nursery and Cargo
+preference groups are allowed explicitly so `-D warnings` cannot turn their
+defaults into release blockers. New required lints need a concrete defect or
+boundary contract; avoid adding a preference rule to repair a cosmetic failure.
+
 Settled-source hosted acceptance must use the current compiler and include owning
 speech fixtures and production linking; see [PLAN.md](../PLAN.md#runtime-and-correctness).
 
