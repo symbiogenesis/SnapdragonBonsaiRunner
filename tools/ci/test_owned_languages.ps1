@@ -6,6 +6,21 @@ function Invoke-LanguageFixture([scriptblock]$Work) { $scratch=New-CiScratch 'bo
 $cases=[ordered]@{
  owned_source_and_bytecode_rejected={ Invoke-LanguageFixture { param($r) foreach ($name in @('tools/a.py','tools/b.PY','scripts/c.pyc','tools/d.pyo','tools/e.pyw')) { Write-CiFixture $r $name 'fixture' }; Assert-CiEqual (Test-OwnedLanguages $r).Count 5 } }
  runtime_setup_and_commands_rejected={ Invoke-LanguageFixture { param($r) Write-CiFixture $r '.github/workflows/control.yml' "steps:`n  - uses: actions/setup-python@fixture`n    shell: python`n    run: python3 -B tools/control.py`n    run: PYTHON3.14 -B tools/control.py`n"; Assert-CiEqual (Test-OwnedLanguages $r).Count 4 } }
+ line_diagnostics_preserve_all_line_endings={ Invoke-LanguageFixture { param($r)
+    foreach ($ending in @("`n","`r`n","`r")) {
+        $source=@('# inert prefix', 'run: PYTHON3.14 -B control.py', '# inert middle', 'shell: python', 'uses: actions/setup-python@fixture') -join $ending
+        Write-CiFixture $r 'tools/control.sh' $source
+        Assert-CiEqual (Test-OwnedLanguages $r) @(
+            'tools/control.sh:2: Python execution/setup is prohibited'
+            'tools/control.sh:4: Python execution/setup is prohibited'
+            'tools/control.sh:5: Python execution/setup is prohibited'
+        )
+    }
+ } }
+ cross_line_candidates_do_not_become_commands={ Invoke-LanguageFixture { param($r)
+    Write-CiFixture $r 'tools/control.sh' "run:`n  # inert continuation`nconst VALUE = Command::new(`n  historical = 'python.exe'`n"
+    Assert-CiEqual (Test-OwnedLanguages $r) @()
+ } }
  powershell_literal_interpreters_rejected={ Invoke-LanguageFixture { param($r)
     $commands=@('python3.14 -B control.py', '& "C:\Tools\Python.EXE" control.py', "& '/opt/bin/python3' control.py", 'py control.py',
         'Start-Process -FilePath "python.exe" -Wait', 'Start-Process PYTHON3 -Wait', 'saps -FilePath:pythonw.exe', '$result = & python3 control.py; Write-Output $result')

@@ -34,6 +34,13 @@ function Get-PowerShellPythonCalls([string]$Path) {
 
 function Test-OwnedLanguages([string]$RepositoryRoot) {
     $errors=[Collections.Generic.List[string]]::new()
+    $linePolicy=[regex]::new((@(
+        '^\s*(?:-\s*)?(?:run:\s*)?(?:&\s*)?[''"]?(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?(?:\s|[''"]|$)'
+        '^\s*shell:\s*[''"]?python(?:[23](?:\.[0-9]+)*)?(?:\s|[''"]|$)'
+        '^\s*(?:-\s*)?uses:\s*[''"]?actions/setup-python@'
+        '(?:Command::new|startup_process::resolve|::resolve)\([^;]*["''](?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?["'']'
+    ) -join '|'),[Text.RegularExpressions.RegexOptions]'IgnoreCase,Multiline')
+    $rustPolicy=[regex]::new('(?is)(?:Command::new|(?:startup_process::)?resolve)\(\s*(?:OsStr::new\(\s*)?"(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?"')
     $pending=[Collections.Generic.Stack[string]]::new(); $pending.Push([IO.Path]::GetFullPath($RepositoryRoot))
     while ($pending.Count) {
         $directory=$pending.Pop()
@@ -51,12 +58,18 @@ function Test-OwnedLanguages([string]$RepositoryRoot) {
                 foreach ($lineNumber in (Get-PowerShellPythonCalls $entry)) { $errors.Add("${relative}:${lineNumber}: Python execution is prohibited") }
                 continue
             }
-            $lineNumber=0
-            foreach ($line in [IO.File]::ReadAllLines($entry)) {
-                $lineNumber++
-                if ($line -imatch '^\s*(?:-\s*)?(?:run:\s*)?(?:&\s*)?[''"]?(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?(?:\s|[''"]|$)' -or $line -imatch '^\s*shell:\s*[''"]?python(?:[23](?:\.[0-9]+)*)?(?:\s|[''"]|$)' -or $line -imatch '^\s*(?:-\s*)?uses:\s*[''"]?actions/setup-python@' -or $line -imatch '(?:Command::new|startup_process::resolve|::resolve)\([^;]*["''](?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?["'']') { $errors.Add("${relative}:${lineNumber}: Python execution/setup is prohibited") }
+            $text=[IO.File]::ReadAllText($entry)
+            # Most files have no candidate. Scan those in .NET without entering
+            # a PowerShell loop for every line; retain exact per-line diagnostics
+            # for candidates, including CR-only files and multiline false alarms.
+            if ($linePolicy.IsMatch($text.Replace("`r","`n"))) {
+                $lineNumber=0
+                foreach ($line in [IO.File]::ReadAllLines($entry)) {
+                    $lineNumber++
+                    if ($linePolicy.IsMatch($line)) { $errors.Add("${relative}:${lineNumber}: Python execution/setup is prohibited") }
+                }
             }
-            if ($extension -ieq '.rs' -and [regex]::IsMatch([IO.File]::ReadAllText($entry),'(?is)(?:Command::new|(?:startup_process::)?resolve)\(\s*(?:OsStr::new\(\s*)?"(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?"')) { $errors.Add("${relative}: Python runtime process resolution is prohibited") }
+            if ($extension -ieq '.rs' -and $rustPolicy.IsMatch($text)) { $errors.Add("${relative}: Python runtime process resolution is prohibited") }
         }
     }
     return ,$errors.ToArray()
