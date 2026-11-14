@@ -371,14 +371,15 @@ not Git branch/HEAD provenance: `gitRevisionVerified` stays false. Bind the
 reviewed manifest digest and original source revision independently; computing a
 new digest from changed bytes is not inventory acceptance.
 
-Here `$snapshotRoot` is an independently retained checkout of the manifest's
-`sourceRevision`. The frozen Runner manifest still names the original PowerShell
-wire/ABI edges. Replay it with those original bytes; migrated current-source Rust
-controls require separate qualification and cannot use this old manifest as a
-current-checkout acceptance command.
+Here `$snapshotRoot` supplies the manifest's exact reviewed input bytes. Runner's
+manifest now follows the remaining queue C control and native Rust replay/build
+edges after public-wire retirement; Prism's manifest retains its read-only source
+snapshot. The verifier checks bytes rather than Git revision provenance. Inventory
+acceptance supplies no native-model or hosted compiler verdict.
 
-The manifests enumerate both Runner C controls and Prism's 40 C++ files plus its
-coupled C ABI source/header. Each file belongs to an explicit replacement family.
+The manifests enumerate Runner's remaining Windows queue ABI C control and
+Prism's 40 C++ files plus its coupled C ABI source/header. Each file belongs to an
+explicit replacement family.
 Additional identities bind operative compiler/provisioning/dispatcher/cache/
 packaging paths and immutable catalog, migration, required-green-ID and complete
 ordered backend geometry contracts. The 22,817 correctness geometries and 1,530
