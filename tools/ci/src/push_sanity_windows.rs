@@ -29,6 +29,41 @@ impl Work {
         if self.started.elapsed() >= Duration::from_secs(270) {
             return Err("Push sanity aggregate allowance exhausted; push blocked.".into());
         }
+        if program == "pwsh.exe" {
+            // Packaged PowerShell rejects suspended direct creation. CMD starts
+            // it normally inside our already-owned Job; no breakaway is enabled.
+            let image =
+                std::env::var_os("BONSAI_PUSH_PWSH_PATH").unwrap_or_else(|| "pwsh.exe".into());
+            let mut words = vec![image];
+            words.extend_from_slice(arguments);
+            let words = words
+                .iter()
+                .map(|word| {
+                    let text = word
+                        .to_str()
+                        .ok_or("PowerShell startup arguments must be UTF-8.")?;
+                    if text.contains(['\"', '\r', '\n', '\0']) {
+                        return Err("Unsupported PowerShell startup argument.".into());
+                    }
+                    Ok(format!("\"{}\"", text.replace('%', "%%")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let batch = self.directory.join(format!("shell-{}.cmd", self.sequence));
+            fs::write(
+                &batch,
+                format!(
+                    "@echo off\r\nchcp 65001 >nul\r\n{}\r\nexit /b %errorlevel%\r\n",
+                    words.join(" ")
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            return self.command(
+                root,
+                "cmd.exe",
+                &["/d".into(), "/c".into(), batch.into_os_string()],
+                environment,
+            );
+        }
         // Windows Store execution aliases cannot be started with CreateProcess
         // suspended in an owned Job. The PowerShell adapter supplies its actual
         // running image, preserving the same version without a shell fallback.
