@@ -627,8 +627,8 @@
     },
     {
       "path": "tests/upstream_prism/common.rs",
-      "bytes": 7202,
-      "sha256": "9d71e2ca284daac46c8880f1e9b82d56644d1f601b939ce20796cdd75ecde295",
+      "bytes": 7407,
+      "sha256": "afee16dc910ec3703d2d922d362e1bf5c13868bf21f9fa60d8d52c96faee0e98",
       "family": "upstream-contracts"
     },
     {
@@ -639,8 +639,8 @@
     },
     {
       "path": "tests/upstream_prism/harness.rs",
-      "bytes": 29784,
-      "sha256": "67fefe7c89c48705d019623de497ffa783386ccd25c66e92ba679cbee3d90ce0",
+      "bytes": 30755,
+      "sha256": "c55273bf9f61a2eaba16c41584818bb101773397d9476e953206884905a2a0ed",
       "family": "upstream-contracts"
     },
     {
@@ -657,14 +657,14 @@
     },
     {
       "path": "tests/upstream_prism/reference_provider.rs",
-      "bytes": 7668,
-      "sha256": "61a839d3e437d03f9648e345b127470c09f86cc69b923010cfd3fe94ff0b9d75",
+      "bytes": 7871,
+      "sha256": "21074aa88b6e05ee06171f7415c14d5b6bbca90f1cb70879fda3c7f93b321d70",
       "family": "upstream-contracts"
     },
     {
       "path": "tests/upstream_prism/reference_reasoning.rs",
-      "bytes": 17372,
-      "sha256": "f663363492fe31af05fa76f4e68dbc484449b21eee4ccbc555c480350fa783be",
+      "bytes": 17855,
+      "sha256": "097295b3ab74d33c7e40840b8b52b627928af2e5ae932e834d6aa378b164ef6f",
       "family": "common-reasoning-budget"
     },
     {
