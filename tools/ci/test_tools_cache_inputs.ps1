@@ -106,7 +106,10 @@ function Invoke-ToolsEnvironmentFixture([object[]]$Scenarios) {
         $action=[IO.File]::ReadAllText($actionPath); $begin=$action.IndexOf('        $buildInputs = '); $end=$action.IndexOf('        "BONSAI_TOOLS_SOURCE_ID=',$begin); $script=(($action.Substring($begin,$end-$begin) -split '\r?\n' | ForEach-Object { if ($_.Length -ge 8) { $_.Substring(8) } else { '' } }) -join "`n")
         $result=@()
         foreach ($scenario in $Scenarios) {
-            foreach ($key in $scenario.environment.Keys) { if ($null -eq $scenario.environment[$key]) { Remove-Item -LiteralPath "Env:$key" -ErrorAction SilentlyContinue } }
+            # Use the same API for deletion and assignment. Windows names are
+            # case-insensitive; the PowerShell provider can retain a differently
+            # cased entry when a mixed-case transition removes its old spelling.
+            foreach ($key in $scenario.environment.Keys) { if ($null -eq $scenario.environment[$key]) { [Environment]::SetEnvironmentVariable($key,$null) } }
             foreach ($key in $scenario.environment.Keys) { if ($null -ne $scenario.environment[$key]) { [Environment]::SetEnvironmentVariable($key,$scenario.environment[$key]) } }
             foreach ($name in @('config','config.toml')) { $path=Join-Path $cargoDirectory $name; if ($scenario.ContainsKey($name)) { [IO.File]::WriteAllText($path,$scenario[$name]) } elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path) } }
             [IO.File]::WriteAllText($env:GITHUB_ENV,''); & ([scriptblock]::Create($script)) | Out-Null
