@@ -252,6 +252,7 @@ struct Report {
     sha256: String,
 }
 
+#[derive(Clone, Copy)]
 enum RetainedKind {
     Report,
     Harness,
