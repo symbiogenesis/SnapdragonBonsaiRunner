@@ -1,7 +1,10 @@
 #Requires -Version 7.6
 <# Bootstrap the native push checker; Git's original ref-update input stays on stdin. #>
 [CmdletBinding()]
-param([string]$Root = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent))
+param(
+    [string]$Root = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
+    [string]$TargetDirectory = (Join-Path ([IO.Path]::GetTempPath()) 'Bonsai-Push-Sanity-Cargo')
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
@@ -13,7 +16,7 @@ $env:BONSAI_PUSH_PWSH_PATH = [Environment]::ProcessPath
 Add-Type -AssemblyName System.Windows.Forms
 $power = [Windows.Forms.SystemInformation]::PowerStatus
 Write-Host "Push sanity power before: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown."
-$target = Join-Path ([IO.Path]::GetTempPath()) 'Bonsai-Push-Sanity-Cargo'
+$target = [IO.Path]::GetFullPath($TargetDirectory)
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('bonsai-push-bootstrap-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($scratch)
 try {
