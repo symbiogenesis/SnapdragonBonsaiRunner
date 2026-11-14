@@ -46,7 +46,7 @@ fn dependency_environment(rustc: &Path) -> Result<BTreeMap<String, String>> {
     ]))
 }
 
-fn dependency_arguments(repository: &Path, target: &Path) -> Vec<OsString> {
+fn dependency_arguments(manifest: &Path, target: &Path, package: &str) -> Vec<OsString> {
     vec![
         "build".into(),
         "--locked".into(),
@@ -55,15 +55,11 @@ fn dependency_arguments(repository: &Path, target: &Path) -> Vec<OsString> {
         "--target".into(),
         TARGET.into(),
         "--manifest-path".into(),
-        repository.join("Cargo.toml").into_os_string(),
+        manifest.as_os_str().to_owned(),
         "--target-dir".into(),
         target.as_os_str().to_owned(),
-        // This small existing owner enables serde's derive macro and JSON.
-        // Hashing is explicit: sha2 is only a dev dependency of tools on Windows.
         "--package".into(),
-        "bonsai-cpu-policy".into(),
-        "--package".into(),
-        "sha2".into(),
+        package.into(),
         "--message-format=json-render-diagnostics".into(),
     ]
 }
@@ -81,12 +77,33 @@ fn dependencies(context: &mut Context, rustc: &Path, output: &Path) -> Result<Ve
     bonsai_artifacts::validate_external_path(&target).map_err(|error| error.to_string())?;
     let lock = context.repo.join("Cargo.lock");
     let lock_digest = context.digest(&lock, 16 * 1024 * 1024)?;
-    let build = context.run(
+    let dependency_started = std::time::Instant::now();
+    // CPU policy enables serde's derive macro and JSON without the CLI closure.
+    let mut build = context.run(
         cargo.as_os_str(),
-        &dependency_arguments(&context.repo, &target),
+        &dependency_arguments(
+            &context.repo.join("Cargo.toml"),
+            &target,
+            "bonsai-cpu-policy",
+        ),
         180,
         &output.join("dependencies-build.txt"),
     )?;
+    // Select the hash dependency from its existing normal owner. Combining its
+    // non-workspace package ID with a workspace selection prunes its context.
+    let remaining = std::time::Duration::from_secs(180)
+        .checked_sub(dependency_started.elapsed())
+        .map(|duration| duration.as_secs())
+        .filter(|seconds| *seconds > 0)
+        .ok_or("Projection dependency build exhausted its original 180-second allowance.")?;
+    let hash = context.run(
+        cargo.as_os_str(),
+        &dependency_arguments(&context.repo.join("tools/ci/Cargo.toml"), &target, "sha2"),
+        remaining,
+        &output.join("hash-build.txt"),
+    )?;
+    build.stdout.push('\n');
+    build.stdout.push_str(&hash.stdout);
     let mut selected = BTreeMap::<String, PathBuf>::new();
     let mut artifacts = Vec::new();
     let mut directories = BTreeSet::new();
@@ -307,11 +324,11 @@ mod tests {
             for (name, source) in [
                 (
                     "Cargo.toml",
-                    "[package]\nname = 'projection-link-control'\nversion = '0.0.0'\nedition = '2024'\n\n[workspace]\nmembers = ['policy', 'tools']\nexclude = ['support/serde', 'support/serde_json', 'support/sha2']\n\n[[bin]]\nname = 'projection-link-control'\npath = 'main.rs'\n\n[dependencies]\nbonsai-cpu-policy = { path = 'policy' }\nsha2 = { path = 'support/sha2' }\n",
+                    "[package]\nname = 'projection-link-control'\nversion = '0.0.0'\nedition = '2024'\n\n[workspace]\nmembers = ['policy', 'tools', 'tools/ci']\nexclude = ['support/serde', 'support/serde_json', 'support/sha2']\n\n[[bin]]\nname = 'projection-link-control'\npath = 'main.rs'\n\n[dependencies]\nbonsai-cpu-policy = { path = 'policy' }\n",
                 ),
                 (
                     "Cargo.lock",
-                    "version = 4\n\n[[package]]\nname = 'bonsai-cpu-policy'\nversion = '0.0.0'\ndependencies = ['serde', 'serde_json']\n\n[[package]]\nname = 'bonsai-tools'\nversion = '0.0.0'\ndependencies = ['sha2']\n\n[[package]]\nname = 'projection-link-control'\nversion = '0.0.0'\ndependencies = ['bonsai-cpu-policy', 'sha2']\n\n[[package]]\nname = 'serde'\nversion = '0.0.0'\n\n[[package]]\nname = 'serde_json'\nversion = '0.0.0'\n\n[[package]]\nname = 'sha2'\nversion = '0.0.0'\n",
+                    "version = 4\n\n[[package]]\nname = 'bonsai-ci'\nversion = '0.0.0'\ndependencies = ['sha2']\n\n[[package]]\nname = 'bonsai-cpu-policy'\nversion = '0.0.0'\ndependencies = ['serde', 'serde_json']\n\n[[package]]\nname = 'bonsai-tools'\nversion = '0.0.0'\ndependencies = ['sha2']\n\n[[package]]\nname = 'projection-link-control'\nversion = '0.0.0'\ndependencies = ['bonsai-cpu-policy']\n\n[[package]]\nname = 'serde'\nversion = '0.0.0'\n\n[[package]]\nname = 'serde_json'\nversion = '0.0.0'\n\n[[package]]\nname = 'sha2'\nversion = '0.0.0'\n",
                 ),
                 (
                     "build.rs",
@@ -340,6 +357,14 @@ mod tests {
                 (
                     "tools/src/lib.rs",
                     "compile_error!(\"Projection dependencies must not compile the maintenance CLI.\");\n",
+                ),
+                (
+                    "tools/ci/Cargo.toml",
+                    "[package]\nname = 'bonsai-ci'\nversion = '0.0.0'\nedition = '2024'\n\n[dependencies]\nsha2 = { path = '../../support/sha2' }\n",
+                ),
+                (
+                    "tools/ci/src/lib.rs",
+                    "compile_error!(\"Hash dependency selection must not compile the CI tool.\");\n",
                 ),
                 (
                     "support/serde/Cargo.toml",
@@ -386,6 +411,33 @@ mod tests {
             Ok(())
         }
 
+        fn check_fixture_dependencies(
+            cargo: &Path,
+            root: &Path,
+            target: &Path,
+            environment: &BTreeMap<String, String>,
+        ) -> Result<()> {
+            let dependencies = startup_process::run_strict(
+                cargo.as_os_str(),
+                &dependency_arguments(&root.join("Cargo.toml"), target, "bonsai-cpu-policy"),
+                root,
+                environment,
+                Duration::from_secs(45),
+                &root.join("dependency-build.txt"),
+            )?;
+            assert_eq!(dependencies.code, 0, "{}", dependencies.stderr);
+            let hash = startup_process::run_strict(
+                cargo.as_os_str(),
+                &dependency_arguments(&root.join("tools/ci/Cargo.toml"), target, "sha2"),
+                root,
+                environment,
+                Duration::from_secs(45),
+                &root.join("hash-build.txt"),
+            )?;
+            assert_eq!(hash.code, 0, "{}", hash.stderr);
+            assert_dependency_selection(&format!("{}{}", dependencies.stdout, hash.stdout))
+        }
+
         #[test]
         fn projection_cargo_links_build_script_and_native_target_with_pinned_environment()
         -> Result<()> {
@@ -428,16 +480,7 @@ mod tests {
                 ]
             );
             let target = scratch.0.join("target");
-            let dependencies = startup_process::run_strict(
-                cargo.as_os_str(),
-                &dependency_arguments(&scratch.0, &target),
-                &scratch.0,
-                &environment,
-                Duration::from_secs(45),
-                &scratch.0.join("dependency-build.txt"),
-            )?;
-            assert_eq!(dependencies.code, 0, "{}", dependencies.stderr);
-            assert_dependency_selection(&dependencies.stdout)?;
+            check_fixture_dependencies(&cargo, &scratch.0, &target, &environment)?;
             let built = startup_process::run_strict(
                 cargo.as_os_str(),
                 &[
