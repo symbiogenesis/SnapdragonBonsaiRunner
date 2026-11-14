@@ -23,7 +23,9 @@ $scratch = Join-Path ([IO.Path]::GetTempPath()) ('bonsai-push-bootstrap-' + [gui
 try {
     $head = (git -C $Root rev-parse --verify HEAD).Trim()
     $inputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'tools/ci', 'src/artifacts', 'src/windows-process', 'src/windows-credentials', 'scripts/release/Release-Common.ps1')
-    $objects = @($inputs | ForEach-Object { (git -C $Root rev-parse --verify ('{0}:{1}' -f $head, $_)).Trim() })
+    $revisions = @($inputs | ForEach-Object { '{0}:{1}' -f $head, $_ })
+    $objects = @(git -C $Root rev-parse --end-of-options @revisions)
+    if ($objects.Count -ne $inputs.Count -or @($objects | Where-Object { $_ -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' }).Count) { throw 'Push blocked: committed checker input identities are incomplete.' }
     $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
     $tool = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
     $receiptPath = Join-Path $target 'push-checker.json'
@@ -40,10 +42,23 @@ try {
         $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
         if ($receipt.Count -ne 3 -or $receipt.SchemaVersion -ne 1 -or $receipt.SourceIdentity -cne $sourceId -or $receipt.Sha256 -cne (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Push blocked: checker source or bytes changed; explicit preparation is required.' }
     }
-    # Policy scripts and compiler configuration come from committed HEAD.
+    # Pushes need only committed checking policy. Preparation still snapshots
+    # the complete source/configuration closure for Cargo's workspace intake.
     $archive = Join-Path $scratch 'policy.zip'
     $policy = Join-Path $scratch 'source'
-    git -C $Root archive --format=zip --output=$archive $head
+    $archiveArguments = @('-C', $Root, 'archive', '--format=zip', "--output=$archive", $head)
+    if (-not $Prepare) {
+        $archiveArguments += @('--',
+            'tools/ci/check_push_snapshot.ps1',
+            'tools/ci/check_owned_languages.ps1',
+            'tools/ci/check_powershell_syntax.ps1',
+            'tools/ci/check_workflow_startup.ps1',
+            'tools/ci/check_workflow_syntax.ps1',
+            'tools/ci/test_tools_cache_inputs.ps1',
+            'tools/ci/test_source_checks.ps1',
+            'tools/ci/test_support.ps1')
+    }
+    git @archiveArguments
     Expand-Archive -LiteralPath $archive -DestinationPath $policy
     if ($Prepare) {
         . (Join-Path $policy 'scripts/release/Release-Common.ps1')
