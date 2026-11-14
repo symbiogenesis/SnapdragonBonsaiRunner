@@ -54,10 +54,11 @@ event loop. The trusted parent independently validates UTF-8, spans, style
 flags, sizes and source mappings before constructing native text layout. See the
 [streaming contract](streaming-resources.md#native-chat-and-transcript) for limits.
 
-Recovered responses remain literal while startup prepares the configured broker
-image; this pending dependency does not fail the parser session. Once the image
-is available, formatting uses that exact configured path, including explicit
-source-launch broker paths. The parent retains the image and ancestor handles
+The launcher prepares and hands off the headless broker image before opening the
+UI, so recovered responses can format while model setup runs or after it fails.
+Formatting uses that exact configured path, including explicit source-launch
+broker paths. Older source launchers without this early handoff defer formatting
+until their model-stage broker handoff. The parent retains the image and ancestor handles
 through worker death. The hidden entry point refuses execution outside an actual
 AppContainer and accepts no ordinary broker options.
 

@@ -9,12 +9,12 @@ pub(in crate::window::transcript) struct Pending {
     parsed_source: Option<Arc<str>>,
     failed: bool,
     cleanup_failed: bool,
-    #[cfg(not(test))]
     service: Option<Arc<crate::markdown_service::Service>>,
-    #[cfg(not(test))]
     ticket: Option<crate::markdown_service::Ticket>,
     ticket_source: Option<Arc<str>>,
     request_source: Option<Arc<str>>,
+    #[cfg(test)]
+    asynchronous_fixture: bool,
 }
 
 impl Pending {
@@ -65,13 +65,11 @@ impl Pending {
         !preserves_ticket
     }
 
-    #[cfg(test)]
     pub(in crate::window::transcript) fn changed(&self) -> bool {
-        self.revision.is_none()
-    }
-
-    #[cfg(not(test))]
-    pub(in crate::window::transcript) fn changed(&self) -> bool {
+        #[cfg(test)]
+        if !self.asynchronous_fixture {
+            return self.revision.is_none();
+        }
         self.request_source.is_some()
             || self.ticket.is_some()
             || self
@@ -81,12 +79,7 @@ impl Pending {
     }
 
     #[cfg(test)]
-    pub(in crate::window::transcript) fn refresh(
-        &mut self,
-        _ui: &egui::Ui,
-        revision: u64,
-        source: &str,
-    ) -> bool {
+    fn refresh_fixture(&mut self, _ui: &egui::Ui, revision: u64, source: &str) -> bool {
         if self.revision == Some(revision) {
             return false;
         }
@@ -102,13 +95,16 @@ impl Pending {
         true
     }
 
-    #[cfg(not(test))]
     pub(in crate::window::transcript) fn refresh(
         &mut self,
         ui: &egui::Ui,
         revision: u64,
         source: &str,
     ) -> bool {
+        #[cfg(test)]
+        if !self.asynchronous_fixture {
+            return self.refresh_fixture(ui, revision, source);
+        }
         use crate::markdown_service::{Service, Status};
         let mut changed = false;
         if let Some(service) = &self.service {
@@ -201,7 +197,6 @@ impl Pending {
     }
 }
 
-#[cfg(not(test))]
 impl Drop for Pending {
     fn drop(&mut self) {
         if let Some(service) = &self.service
@@ -215,6 +210,11 @@ impl Drop for Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        markdown_service::Service,
+        window::transcript::{Role, Transcript},
+    };
+    use egui_kittest::Harness;
 
     #[test]
     fn prefix_extension_retains_parsed_layout_and_active_ticket() {
@@ -250,5 +250,45 @@ mod tests {
         assert!(pending.parsed.is_none());
         assert!(pending.parsed_source.is_none());
         assert_eq!(pending.request_source.as_deref(), Some(replaced));
+    }
+
+    #[test]
+    fn markdown_async_configuration_formats_unchanged_restored_source() -> std::io::Result<()> {
+        let source = "# Heading 界\n\nA **bold** answer 🌱.";
+        let mut transcript = Transcript::default();
+        transcript.push(Role::Assistant, source.to_owned());
+        transcript.messages[0].markdown.asynchronous_fixture = true;
+        let mut chat = Harness::builder().build_ui_state(
+            |ui, transcript: &mut Transcript| {
+                egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
+                    transcript.show(ui, 600.0, viewport, None, false);
+                });
+            },
+            transcript,
+        );
+        chat.step();
+        assert!(!chat.state().messages[0].markdown.failed());
+        assert_eq!(
+            chat.state().messages[0]
+                .cache
+                .as_ref()
+                .map(|cache| cache.body.job.text.as_str()),
+            Some(source)
+        );
+        let respond = Service::fixture(&chat.ctx);
+        chat.step();
+        assert_eq!(&*respond()?, source);
+        chat.step();
+        let message = &chat.state().messages[0];
+        assert_eq!(
+            message
+                .cache
+                .as_ref()
+                .map(|cache| cache.body.job.text.as_str()),
+            Some("Heading 界\n\nA bold answer 🌱.")
+        );
+        assert_eq!(message.body, source);
+        assert!(!message.markdown.failed());
+        Ok(())
     }
 }

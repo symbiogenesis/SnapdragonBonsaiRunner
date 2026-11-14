@@ -35,6 +35,7 @@ pub(crate) struct Request {
     payload: PathBuf,
     working: PathBuf,
     pub(crate) data: PathBuf,
+    pub(crate) markdown_image: Option<PathBuf>,
     pub(crate) canary_configured: bool,
     pub(crate) tts_configured: bool,
     preparation: Preparation,
@@ -43,7 +44,9 @@ pub(crate) struct Request {
 
 #[derive(Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct RequestedSpeech {
+struct RequestedStartup {
+    #[serde(default)]
+    broker_path: Option<PathBuf>,
     #[serde(default)]
     canary_key_file: Option<String>,
     #[serde(default)]
@@ -90,7 +93,15 @@ impl Request {
             }
         }
         let payload = bounded_text(&request)?;
-        let speech: RequestedSpeech = serde_json::from_str(&payload).map_err(io::Error::other)?;
+        let speech: RequestedStartup = serde_json::from_str(&payload).map_err(io::Error::other)?;
+        if let Some(broker) = &speech.broker_path {
+            bonsai_windows_credentials::validate_external_path(broker)?;
+            if !broker.is_file() {
+                return Err(io::Error::other(
+                    "Native startup requires the configured headless broker image.",
+                ));
+            }
+        }
         // New launchers advertise the stage contract in their serialized request.
         // An older maintenance executable can still build this UI from source;
         // retain its combined preparation protocol until it is rebuilt too.
@@ -123,6 +134,7 @@ impl Request {
             payload: request,
             working,
             data,
+            markdown_image: speech.broker_path,
             canary_configured,
             tts_configured,
             preparation,
@@ -595,6 +607,7 @@ mod tests {
             payload: config.data.join("request.json"),
             working: config.data.clone(),
             data: config.data.clone(),
+            markdown_image: None,
             canary_configured: true,
             tts_configured: true,
             preparation: Preparation::Staged,
@@ -647,6 +660,7 @@ mod tests {
             payload: config.data.join("request.json"),
             working: config.data.clone(),
             data: config.data.clone(),
+            markdown_image: None,
             canary_configured: true,
             tts_configured: true,
             preparation: Preparation::Staged,

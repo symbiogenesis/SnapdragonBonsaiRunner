@@ -64,10 +64,11 @@ to immutable cache/scratch charges, process limits and a 4 GiB host reserve.
 Retry observes memory again; the UI uses broker-reported capacity for guidance.
 These development defaults do not establish model, device or promotion acceptance.
 
-The launcher checks/builds presentation first. After the first UI tick, an owned
-preparation worker verifies/provisions the selected pinned Rust runtime alongside
-building/verifying the broker, then hands off text chat after both finish. Either
-failure cancels and joins the other operation before reporting failure. Speech artifact
+The launcher checks/builds presentation and the headless broker image before
+opening the window. The UI can format recovered answers immediately, independently
+of model preparation. After the first UI tick, an owned preparation worker
+verifies/provisions the selected pinned Rust runtime and hands off text chat.
+Speech artifact
 preparation, companion builds and fresh speech credentials continue separately
 while Swift loads and serves text chat. A speech preparation failure leaves text
 chat and its drafts/history intact; closing cancels both owned stages.
@@ -217,8 +218,10 @@ with bounded background pipe I/O and trusted-parent validation of its render
 description. The pure Rust `bonsai-markdown` library runs in a separate private
 `--markdown-worker` invocation of the configured headless broker image, before
 model, credential or network setup. The GUI image cannot initialize under the
-worker's required Win32k denial. Recovered responses stay literal until startup
-prepares the configured broker, then enter the same bounded formatting queue.
+worker's required Win32k denial. The launcher's prepared broker path enters the
+formatting queue before model setup, including when model setup later fails.
+Older source launchers without that handoff retain deferred formatting until
+their configured broker is prepared.
 The UI creates native egui text widgets from admitted results.
 Unavailable or failed parsing leaves complete plain source visible and ends the
 parser session; parsing never falls back into the trusted UI process.

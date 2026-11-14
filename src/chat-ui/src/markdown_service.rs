@@ -123,6 +123,31 @@ pub(crate) struct Service {
 }
 
 impl Service {
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        context: &egui::Context,
+    ) -> impl Fn() -> std::io::Result<Arc<str>> + use<> {
+        let (requests, pending) = mpsc::sync_channel(MAX_REQUESTS);
+        let service = Arc::new(Self {
+            shared: Arc::new(Shared::default()),
+            requests,
+            worker: Mutex::new(None),
+        });
+        context.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique("offline-markdown-service"),
+                Arc::clone(&service),
+            );
+        });
+        move || {
+            let request = pending.try_recv().map_err(std::io::Error::other)?;
+            service
+                .shared
+                .complete(request.ticket, bonsai_markdown::parse(&request.source));
+            Ok(request.source)
+        }
+    }
+
     /// Supplies the verified headless image after native startup prepares it.
     pub(crate) fn configure(context: &egui::Context, image: &Path) {
         context.data_mut(|data| {

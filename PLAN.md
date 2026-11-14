@@ -240,8 +240,11 @@ adoption decisions without displacing native daily-use acceptance.
   regression, private-entry direct-invocation refusal, pure `bonsai-markdown`
   parsing without native UI/graphics imports, and the six-key minimal environment
   with private `LOCALAPPDATA` in owning native acceptance. Verify recovered
-  responses defer formatting until their configured broker image is prepared,
-  including explicit nonadjacent broker paths; parser entry must precede model,
+  responses format before model preparation and after model setup failures using
+  the launcher's prepared image, including explicit nonadjacent broker paths and
+  unchanged-source asynchronous layout invalidation. Include the source launch's
+  early broker build and preserved source-lock provenance; older launchers without
+  an image handoff retain deferred formatting. Parser entry must precede model,
   credential and network setup. Retain actual child exit state before cleanup
   when diagnosing failed startup or pipe exchange.
 - [ ] Qualify Settings scope, compact/wrapped navigation, persistence, generation

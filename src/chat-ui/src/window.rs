@@ -381,6 +381,9 @@ impl State {
         request: crate::startup::Request,
     ) -> Self {
         let mut state = Self::create(commands, events, None, None);
+        // The launcher already prepared this image. Formatting recovered
+        // answers must not wait for model provisioning or depend on its result.
+        state.markdown_image.clone_from(&request.markdown_image);
         state.updates = updates::Updates::for_startup(&request);
         state.preview = false;
         state.canary_configured = request.canary_configured;
@@ -2442,6 +2445,10 @@ mod startup_tests {
     }
 
     fn fixture() -> io::Result<(crate::startup::Request, PathBuf)> {
+        fixture_with_broker(false)
+    }
+
+    fn fixture_with_broker(prepared: bool) -> io::Result<(crate::startup::Request, PathBuf)> {
         let directory = std::env::temp_dir().join(format!(
             "Bonsai-UI-Startup-{}-{}",
             std::process::id(),
@@ -2455,6 +2462,16 @@ mod startup_tests {
         let tool = directory.join("tool.exe");
         fs::write(&request, "{}")?;
         fs::write(&tool, [])?;
+        if prepared {
+            let parser = directory.join("nonadjacent-parser");
+            fs::create_dir(&parser)?;
+            let broker = parser.join("broker.exe");
+            fs::write(&broker, b"inert broker path fixture")?;
+            fs::write(
+                &request,
+                serde_json::to_vec(&serde_json::json!({"BrokerPath": broker}))?,
+            )?;
+        }
         let arguments = vec![
             OsString::from("--startup-tool"),
             tool.into_os_string(),
@@ -2464,6 +2481,23 @@ mod startup_tests {
             directory.clone().into_os_string(),
         ];
         Ok((crate::startup::Request::parse(&arguments)?, directory))
+    }
+
+    #[test]
+    fn configured_markdown_image_is_available_before_model_setup_and_after_failure()
+    -> io::Result<()> {
+        let (request, directory) = fixture_with_broker(true)?;
+        let expected = directory.join("nonadjacent-parser/broker.exe");
+        let (commands, _incoming) = mpsc::channel();
+        let (_events, incoming_events) = client::event_channel();
+        let mut state = State::pending_startup(commands, incoming_events, request);
+        assert_eq!(state.markdown_image.as_deref(), Some(expected.as_path()));
+        assert!(state.worker.is_none() && state.startup.is_none());
+        state.fail_startup(&io::Error::other("Synthetic model preparation failure"));
+        assert_eq!(state.markdown_image.as_deref(), Some(expected.as_path()));
+        drop(state);
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]

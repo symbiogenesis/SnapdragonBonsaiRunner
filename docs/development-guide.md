@@ -183,8 +183,9 @@ selection; `-PublisherEngine` selects publisher rollback, prepared from its pinn
 release. See [runtime selection](#runtime-selection). The script
 only forwards to Rust and propagates its exit code; it builds or provisions nothing.
 
-After the first native frame, preparation verifies/provisions the pinned runtime
-concurrently with the broker build; failure cancels and joins the peer. Models
+The launcher prepares the UI and headless broker image before opening the window,
+so recovered replies can render Markdown independently of model setup. After the
+first native frame, preparation verifies/provisions the pinned runtime. Models
 and adapters use compiled locks. Explicit PTQ1 is verify-only. Speech preparation
 continues independently, with at most two artifact workers and below-normal CPU
 priority for compiler descendants. Models load on demand. Closing cancels and
