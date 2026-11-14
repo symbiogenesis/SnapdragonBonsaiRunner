@@ -129,9 +129,15 @@ runs the existing verifier before emitting the manifest. Three new collector
 controls and the existing source controls passed (20 selected checks), with
 strict native ARM64 Release all-target analysis and docs. It executes no compiler
 or generator, authenticates no supplied exit code and establishes no effective
-compiler target. Its argument subset still excludes clang-cl, shell commands and
-response files; actual owning-build instrumentation and original captures remain
-required. Rehashing is not an atomic snapshot or continuous file-stability proof.
+compiler target. Its separate `clang-cl` subset preserves original argument
+arrays, matched ordered configuration, explicit outputs and complete forwarded
+dependency generation; CRT `-MD` cannot substitute for dependency `-MD`. Three
+new literal controls and two named compatibility controls, strict ARM64 Release
+all-target analysis, docs and production tool linking passed. Hidden PCH/modules,
+unknown options, extra sources, shell-command databases and response files reject.
+Actual owning-build instrumentation and original captures remain required;
+historical shell commands or relative outputs cannot be rewritten into evidence.
+Rehashing is not an atomic snapshot or continuous file-stability proof.
 
 The Rust [`native-archive-inventory` command](../tools/ci/README.md#immutable-external-source-archives)
 also expands pinned external source ZIPs into complete sorted member identities,
@@ -186,6 +192,17 @@ Rust-only Release analysis/docs passed. Arbitrary readers still need caller-boun
 I/O and the original absolute deadline. No independent native observations were
 manufactured or captured, and production ASR remains on its existing native engine.
 
+The provider-neutral [`CaptureWriter`](../src/speech-asr/README.md#original-observation-packet-writer)
+serializes that complete replay from borrowed original observations, with reviewed
+geometry/EOS, contiguous full logits/KV and sticky write/order/cancellation/unwind
+failures. It widens original F16 cache words scalar by scalar through a fixed
+16 KiB buffer; terminal publication requires successful provider completion and
+flush. Five writer controls and the existing literal replay control passed with
+strict Rust-only Release analysis/docs. The pinned Rust/C API exposes no numerical
+observer, and internal device argmax/debug output cannot supply the missing
+observations. A reviewed upstream observation ABI and actual independent captures
+remain required; serialization alone supplies neither native execution nor parity.
+
 The Rust loader preserves GGML's omitted trailing unit dimensions for F32/F16/Q8
 projections and F32/F16 convolutions, with three selected wire-loader controls and
 strict Rust-only Release analysis/docs passing. Complete native replay remains
@@ -235,6 +252,15 @@ first-index ties remain unchanged. Four new mathematical/failure controls and th
 existing nearest-centroid control passed with native ARM64 Release analysis/docs.
 These synthetic controls do not supply independent pinned-codec observations.
 
+Three `dac_reference_` controls now exercise the complete four-block 8/5/4/3
+waveform graph, nonzero overlap and every dilated residual branch against an
+independently factored impulse polynomial, chunk schedules and flushed state.
+Nonlinear final-Snake and finite saturation controls complement the exact dyadic
+PCM answers. Final DAC output rejects nonfinite values before clipping, so overflow
+cannot become apparently valid full-scale PCM. Strict Release analysis/docs and
+one existing streaming regression also passed. These synthetic weights do not
+supply independent pinned-model codec/PCM observations or listening acceptance.
+
 The [native Q8 projection adapter](../tools/hexagon/native_rpc/README.md#q8-matrix-preparation-and-immutable-placement)
 connects immutable host dispatch to signed-queue ABI calls, exact FD mapping,
 correlated completions and mandatory independent output review. Failed or
@@ -255,6 +281,16 @@ mathematical answers rather than DSP observations. Hosted native receipts now
 bind every Q8 dispatch, native, projection and oracle source/test input; omitted
 or changed identities reject. Signed execution, general speech activations and
 device source/package/driver admission remain pending.
+
+`Q8ReferenceOracle` separately evaluates original row-major signed weights and
+ordinary finite F32 activations in ordered scalar F64, including finite half
+subnormal/signed scales. Every output must meet explicitly predeclared absolute
+and relative error limits before publication. Five new controls and the four
+exact-oracle controls passed with optimized warning-denied native compilation and
+docs; Clippy passed with documented preexisting exceptions. This is ideal
+projection-error review, without emulating HVX half quantization, QF16 or kernel
+reduction order. Useful tolerance review, actual signed-path error, quantization
+parity, session admission and speech qualification remain independent gates.
 
 The missing Q8 admission provider must independently bind the actual loaded
 signed module bytes and effective usable VTCM to this session and its guarded

@@ -404,17 +404,19 @@ adoption decisions without displacing native daily-use acceptance.
   transport, fixed F32 and guarded-Q2 controls do not qualify speech state.
   First supply a reviewed session-bound provider for exact loaded-DSP bytes and
   effective usable VTCM; package/URI selection and capacity attributes cannot
-  supply those missing observations. Ordinary speech activation arithmetic also
-  needs an independent oracle beyond the current exact diagnostic subset.
+  supply those missing observations. Review predeclared scalar projection-error
+  tolerances for ordinary speech activations, then qualify actual signed-path
+  error and HVX quantization arithmetic independently of the exact diagnostic subset.
 - [ ] **S2 — Qualify Rust ASR for production.** Compare the complete Rust graph and
   explicit Rust-only service against pinned Qwen3-ASR 1.7B controls. Complete
   owning hosted build/link and native-control regressions; preserve independent
   frontend/numerical/tokenizer observations. Qualify transcript/state,
   microphone-to-Swift submission, quality, cancellation, lifecycle and resources
   before replacing production or removing native dependencies.
-  Implement native capture of every generation step's raw logits and complete
-  all-layer committed KV; current debug output and device argmax cannot populate
-  the complete independent replay. Include omitted-unit-axis loading controls.
+  Supply a reviewed upstream numerical observation ABI and capture every generation
+  step's raw logits and complete all-layer committed KV through the bounded packet
+  writer; current debug output and device argmax cannot populate the complete
+  independent replay. Include omitted-unit-axis loading controls.
 - [ ] Retire remaining Runner/Prism native/reference/DLL/publisher families
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
   codec/ABI, state and fallback obligations with independent controls, then remove
@@ -427,8 +429,9 @@ adoption decisions without displacing native daily-use acceptance.
   run source and [link/package verification](tools/bonsai/README.md#selected-native-link-and-package-capture)
   on those actual captures in owning CI.
   Qualify the retained-artifact source manifest collector on actual owning-build
-  artifacts; supply original supported argument arrays rather than rewriting
-  clang-cl or shell command lines into its admitted subset.
+  artifacts; retain original supported Clang/clang-cl argument arrays at execution,
+  with explicit outputs and complete dependencies. Do not rewrite shell command
+  strings or historical relative-output databases into admitted evidence.
   Inventory the restored original publisher archive identity in owning CI after
   fresh exact-byte intake. Retain the failed `prism-engine` HTTP 404 outcome and
   its original pin; do not substitute archive bytes or reopen that completed
