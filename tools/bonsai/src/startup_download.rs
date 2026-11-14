@@ -529,7 +529,7 @@ fn receive_repair_observed_with(
     publish_repair(&completed, &partial, path)
 }
 
-/// Retains one aggregate transfer allowance across resume/restart attempts.
+/// Shares one absolute allowance across cached verification, transfer and publication.
 pub(crate) fn receive_with_timeout(
     uri: &str,
     path: &Path,
@@ -538,19 +538,18 @@ pub(crate) fn receive_with_timeout(
     working: &Path,
     timeout: Duration,
 ) -> crate::Result<()> {
-    let until = Instant::now()
-        .checked_add(timeout)
-        .ok_or("Invalid pinned download allowance.")?;
-    receive_with(
-        uri,
-        path,
-        bytes,
-        sha256,
-        working,
-        |uri, partial, offset, bytes, working| {
-            transfer_repair_until(uri, partial, offset, bytes, working, until)
-        },
-    )
+    with_repair_deadline(timeout, |until| {
+        receive_with(
+            uri,
+            path,
+            bytes,
+            sha256,
+            working,
+            |uri, partial, offset, bytes, working| {
+                transfer_repair_until(uri, partial, offset, bytes, working, until)
+            },
+        )
+    })
 }
 
 fn receive_with(
@@ -561,7 +560,7 @@ fn receive_with(
     working: &Path,
     mut transfer: impl FnMut(&str, &Path, u64, u64, &Path) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    crate::startup_cancel::checkpoint()?;
+    repair_checkpoint()?;
     expected(bytes, sha256)?;
     download_uri(uri)?;
     validate_external_path(path).map_err(|error| error.to_string())?;
@@ -589,7 +588,7 @@ fn receive_with(
     }
     let mut quarantined: Option<PathBuf> = None;
     let completed = loop {
-        crate::startup_cancel::checkpoint()?;
+        repair_checkpoint()?;
         if offset < bytes {
             transfer(uri, &partial, offset, bytes, working)?;
         }
@@ -612,6 +611,7 @@ fn receive_with(
         validate_external_path(&quarantine).map_err(|error| error.to_string())?;
         // Link exclusively while the checked read handle still denies writes.
         // A crash before unlinking only leaves another safe evidence alias.
+        repair_checkpoint()?;
         fs::hard_link(&partial, &quarantine)
             .map_err(|error| format!("Cannot preserve invalid download bytes: {error}"))?;
         drop(completed);
@@ -624,7 +624,7 @@ fn receive_with(
         quarantined = Some(quarantine);
         offset = 0;
     };
-    crate::startup_cancel::checkpoint()?;
+    repair_checkpoint()?;
     match fs::hard_link(&partial, path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -823,6 +823,80 @@ mod tests {
             &working,
             Duration::from_secs(30),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn download_timeout_bounds_verified_cache_hits_and_preserves_unfinished_cleanup()
+    -> crate::Result<()> {
+        let (working, path, partial, hash) = recovery_fixture()?;
+        fs::write(&path, b"right").map_err(|error| error.to_string())?;
+        let result = receive_with_timeout(
+            "https://example.invalid/artifact",
+            &path,
+            5,
+            &hash,
+            &working,
+            Duration::ZERO,
+        );
+        assert!(result.is_err_and(|error| error.contains("aggregate allowance")));
+        assert_eq!(fs::read(&path).map_err(|error| error.to_string())?, b"right");
+        assert_eq!(
+            fs::read(&partial).map_err(|error| error.to_string())?,
+            b"wrong"
+        );
+        assert!(!path.with_added_extension("download.lock").exists());
+        assert_eq!(REPAIR_DEADLINE.with(Cell::get), None);
+        with_repair_deadline(Duration::from_secs(30), |outer| {
+            receive_with_timeout(
+                "https://example.invalid/artifact",
+                &path,
+                5,
+                &hash,
+                &working,
+                Duration::from_secs(60),
+            )?;
+            assert_eq!(REPAIR_DEADLINE.with(Cell::get), Some(outer));
+            Ok(())
+        })?;
+        assert!(!partial.exists());
+        assert_eq!(REPAIR_DEADLINE.with(Cell::get), None);
+        fs::remove_dir_all(working).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn download_timeout_stops_before_retry_or_publication_after_transfer() -> crate::Result<()> {
+        for replacement in [b"wrong".as_slice(), b"right"] {
+            let (working, path, partial, hash) = recovery_fixture()?;
+            fs::write(&partial, b"wr").map_err(|error| error.to_string())?;
+            let mut transfers = 0;
+            let result = with_repair_deadline(Duration::from_secs(60), |_| {
+                receive_with(
+                    "https://example.invalid/artifact",
+                    &path,
+                    5,
+                    &hash,
+                    &working,
+                    |_, destination, offset, _, _| {
+                        transfers += 1;
+                        assert_eq!(offset, 2);
+                        fs::write(destination, replacement).map_err(|error| error.to_string())?;
+                        REPAIR_DEADLINE.with(|deadline| deadline.set(Some(Instant::now())));
+                        Ok(())
+                    },
+                )
+            });
+            assert!(result.is_err());
+            assert_eq!(transfers, 1);
+            assert!(!path.exists());
+            assert!(quarantine_files(&working)?.is_empty());
+            assert_eq!(
+                fs::read(&partial).map_err(|error| error.to_string())?,
+                replacement
+            );
+            assert_eq!(REPAIR_DEADLINE.with(Cell::get), None);
+            fs::remove_dir_all(working).map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
