@@ -13,6 +13,12 @@ inputs:
   github-release:
     description: Use GitHub's execution cap only in the hosted Windows Release workflow.
     default: 'false'
+  build-only:
+    description: Prepare production binaries for same-run consumers; the independent full-check job remains required.
+    default: 'false'
+  incremental:
+    description: Reuse Foundation workspace code generation with the production optimization level and 16 codegen units.
+    default: 'false'
 outputs:
   has-packages:
     description: Whether this lane selected packages.
@@ -82,9 +88,14 @@ runs:
           ${{ env.CARGO_HOME }}/registry/cache
           ${{ env.CARGO_HOME }}/git/db
           ${{ env.CARGO_TARGET_DIR }}
-        key: broker-v5-${{ inputs.lane }}-${{ runner.os }}-${{ runner.arch }}-${{ env.BROKER_CACHE_HOST }}-nightly-2026-11-12-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}-${{ hashFiles('config/**', 'tests/fixtures/**', 'tools/ci/**', '.github/actions/ci-tool/**', '.github/actions/check-rust/**', '.github/actions/native-speech/**') }}-${{ inputs.lane == 'ui' && hashFiles('src/chat-ui/**', 'src/windows-*/**') || inputs.lane == 'core' && hashFiles('src/broker/**', 'src/speech-service/**', 'src/artifacts/**', 'src/cpu-policy/**', 'src/windows-*/**') || inputs.lane == 'asr' && hashFiles('src/speech-asr/**', 'src/speech-service/**', 'src/artifacts/**', 'src/windows-*/**') || inputs.lane == 'tts' && hashFiles('src/speech-tts/**', 'src/speech-service/**', 'src/artifacts/**', 'src/windows-*/**') || hashFiles('tools/bonsai/**', 'tools/ci/**', 'src/artifacts/**', 'src/cpu-policy/**', 'src/windows-*/**') }}-content-v1
+        # A dependency edit must create a new snapshot: an immutable exact hit
+        # cannot save the downstream objects Cargo rebuilt after that edit.
+        # Build and full-check snapshots differ so the latter can add test and
+        # analyzer outputs after consuming this source's production build.
+        key: broker-v5-${{ inputs.lane }}-${{ runner.os }}-${{ runner.arch }}-${{ env.BROKER_CACHE_HOST }}-nightly-2026-11-12-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'rustfmt.toml', 'clippy.toml') }}-${{ hashFiles('config/**', 'tests/fixtures/**', 'src/audio/**', 'tools/ci/**', '.github/actions/ci-tool/**', '.github/actions/check-rust/**', '.github/actions/native-speech/**') }}-${{ inputs.lane == 'ui' && hashFiles('src/chat-ui/**', 'src/windows-*/**') || inputs.lane == 'core' && hashFiles('src/broker/**', 'src/speech-service/**', 'src/artifacts/**', 'src/cpu-policy/**', 'src/windows-*/**') || inputs.lane == 'asr' && hashFiles('src/speech-asr/**', 'src/speech-service/**', 'src/artifacts/**', 'src/windows-*/**') || inputs.lane == 'tts' && hashFiles('src/speech-tts/**', 'src/speech-service/**', 'src/artifacts/**', 'src/windows-*/**') || hashFiles('tools/bonsai/**', 'tools/ci/**', 'tools/native-reference/reference_numerics.rs', 'src/artifacts/**', 'src/cpu-policy/**', 'src/windows-*/**', 'src/speech-asr/model.lock.json', 'src/speech-tts/model*.lock.json', 'tools/canary-asr/**', 'tools/qwen-tts/**', 'tools/hexagon/diagnostic.manifest', 'src/chat-ui/assets/bonsai.ico', 'LICENSE', 'NOTICE') }}-content-v2-${{ inputs.incremental == 'true' && 'incremental16' || 'production' }}-${{ inputs.build-only == 'true' && 'build' || 'checks' }}
         restore-keys: |
-          broker-v5-${{ inputs.lane }}-${{ runner.os }}-${{ runner.arch }}-${{ env.BROKER_CACHE_HOST }}-nightly-2026-11-12-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}-
+          broker-v5-${{ inputs.lane }}-${{ runner.os }}-${{ runner.arch }}-${{ env.BROKER_CACHE_HOST }}-nightly-2026-11-12-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'rustfmt.toml', 'clippy.toml') }}-${{ hashFiles('config/**', 'tests/fixtures/**', 'src/audio/**', 'tools/ci/**', '.github/actions/ci-tool/**', '.github/actions/check-rust/**', '.github/actions/native-speech/**') }}-${{ inputs.lane == 'ui' && hashFiles('src/chat-ui/**', 'src/windows-*/**') || inputs.lane == 'core' && hashFiles('src/broker/**', 'src/speech-service/**', 'src/artifacts/**', 'src/cpu-policy/**', 'src/windows-*/**') || inputs.lane == 'asr' && hashFiles('src/speech-asr/**', 'src/speech-service/**', 'src/artifacts/**', 'src/windows-*/**') || inputs.lane == 'tts' && hashFiles('src/speech-tts/**', 'src/speech-service/**', 'src/artifacts/**', 'src/windows-*/**') || hashFiles('tools/bonsai/**', 'tools/ci/**', 'tools/native-reference/reference_numerics.rs', 'src/artifacts/**', 'src/cpu-policy/**', 'src/windows-*/**', 'src/speech-asr/model.lock.json', 'src/speech-tts/model*.lock.json', 'tools/canary-asr/**', 'tools/qwen-tts/**', 'tools/hexagon/diagnostic.manifest', 'src/chat-ui/assets/bonsai.ico', 'LICENSE', 'NOTICE') }}-content-v2-${{ inputs.incremental == 'true' && 'incremental16' || 'production' }}-
+          broker-v5-${{ inputs.lane }}-${{ runner.os }}-${{ runner.arch }}-${{ env.BROKER_CACHE_HOST }}-nightly-2026-11-12-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'rustfmt.toml', 'clippy.toml') }}-
           broker-v5-${{ inputs.lane }}-${{ runner.os }}-${{ runner.arch }}-${{ env.BROKER_CACHE_HOST }}-nightly-2026-11-12-
     - name: Prepare reusable native speech compiler outputs
       if: steps.packages.outputs.has-packages == 'true' && inputs.lane == 'asr'
@@ -96,6 +107,8 @@ runs:
       env:
         RUNNER_ENVIRONMENT: ${{ runner.environment }}
         GITHUB_RELEASE_BUILD: ${{ inputs.github-release }}
+        BUILD_ONLY: ${{ inputs.build-only }}
+        INCREMENTAL: ${{ inputs.incremental }}
       if: steps.packages.outputs.has-packages == 'true'
       shell: pwsh
       working-directory: ${{ runner.temp }}
@@ -103,15 +116,26 @@ runs:
         Set-StrictMode -Version Latest
         $ErrorActionPreference = 'Stop'
         $PSNativeCommandUseErrorActionPreference = $true
+        # Foundation incremental compilation policy.
+        if ($env:INCREMENTAL -cnotin @('true', 'false')) { throw 'incremental must be true or false.' }
+        if ($env:INCREMENTAL -ceq 'true') {
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'Incremental Foundation checks require a hosted runner.' }
+          if ($env:GITHUB_RELEASE_BUILD -ceq 'true') { throw 'Published releases must use the production build profile.' }
+          $env:CARGO_INCREMENTAL = '1'
+          $env:CARGO_PROFILE_RELEASE_INCREMENTAL = 'true'
+          $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '16'
+        }
+        # End Foundation incremental compilation policy.
         $evidence = Join-Path $env:RUNNER_TEMP ('SwiftBonsai-BrokerChecks-' + [guid]::NewGuid().ToString('N'))
         "BROKER_CHECK_EVIDENCE=$evidence" >> $env:GITHUB_ENV
         $deadlineArguments = @(if ($env:GITHUB_RELEASE_BUILD -ceq 'true') { '--github-release' } else { '--timeout-seconds', '1800' })
-        & $env:BONSAI_CI_PATH rust-check --root $env:GITHUB_WORKSPACE --group Broker --packages-json $env:BROKER_PACKAGES --target $env:CARGO_TARGET_DIR --evidence $evidence @deadlineArguments --full-tests --build
+        $phaseArguments = @(if ($env:BUILD_ONLY -ceq 'true') { '--phase', 'build' } else { '--full-tests', '--build' })
+        & $env:BONSAI_CI_PATH rust-check --root $env:GITHUB_WORKSPACE --group Broker --packages-json $env:BROKER_PACKAGES --target $env:CARGO_TARGET_DIR --evidence $evidence @deadlineArguments @phaseArguments
     - name: Retain this lane's correctness and analyzer evidence
       if: always() && env.BROKER_CHECK_EVIDENCE != ''
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: broker-checks-${{ inputs.lane }}-${{ github.run_id }}
+        name: broker-checks-${{ inputs.lane }}-${{ github.job }}-${{ github.run_id }}
         path: ${{ env.BROKER_CHECK_EVIDENCE }}
         if-no-files-found: error
         compression-level: 1

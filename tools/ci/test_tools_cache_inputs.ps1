@@ -45,11 +45,12 @@ function Get-CargoEmbeddedFiles([string]$Package,[string]$Source) {
     foreach ($match in $manifestRelative) { [IO.Path]::GetFullPath((Join-Path $Package $match.Groups[1].Value.TrimStart('/'))) }
     if ([IO.Path]::GetFileName($Source) -ceq 'build.rs') { foreach ($match in [regex]::Matches($text,'\.set_icon\("([^"\\]+)"\)')) { [IO.Path]::GetFullPath((Join-Path $Package $match.Groups[1].Value)) } }
 }
-function Get-RequiredToolsFiles([string]$Root) {
+function Get-RequiredToolsFiles([string]$Root,[string[]]$Packages=@('tools/bonsai')) {
     $files=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($name in @('Cargo.toml','Cargo.lock','rust-toolchain.toml')) { [void]$files.Add((Join-Path $Root $name)) }
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $Root '.cargo') -File -Recurse) { [void]$files.Add($file.FullName) }
-    foreach ($package in (Get-CargoPackageClosure $Root 'tools/bonsai')) {
+    $closure=@($Packages | ForEach-Object { Get-CargoPackageClosure $Root $_ } | ForEach-Object { $_ } | Sort-Object -Unique)
+    foreach ($package in $closure) {
         [void]$files.Add((Join-Path $package 'Cargo.toml')); $sources=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($file in Get-ChildItem -LiteralPath $package -File -Filter '*.rs' -Recurse) { [void]$sources.Add($file.FullName) }
         # Binaries may explicitly point outside the package directory.
@@ -69,6 +70,30 @@ function Get-ToolsHashPatterns {
 }
 function Get-UncoveredToolsFiles([string[]]$Files,[string[]]$Patterns) {
     foreach ($file in $Files) { $covered=$false; foreach ($pattern in $Patterns) { if ([Management.Automation.WildcardPattern]::new($pattern,[Management.Automation.WildcardOptions]::CultureInvariant).IsMatch($file)) { $covered=$true; break } }; if (-not $covered) { $file } }
+}
+function Get-LaneCachePatterns([string]$Lane) {
+    $action=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml')).Replace("`r`n","`n")
+    $key=([regex]::Match($action,'(?m)^        key: (.+)$')).Groups[1].Value
+    $branches=@([regex]::Matches($key,'inputs\.lane == ''([^'']+)'' && hashFiles\(([^)]+)\)'))
+    Assert-Ci ($branches.Count -gt 0) 'Expected lane-specific cache identities.'
+    $common=$key.Substring(0,$branches[0].Index)
+    $selected=@($branches | Where-Object { $_.Groups[1].Value -ceq $Lane })
+    $source=if ($selected.Count) { $selected[0].Groups[2].Value } else { ([regex]::Match($key,'\|\| hashFiles\(([^)]+)\)')).Groups[1].Value }
+    Assert-Ci (-not [string]::IsNullOrEmpty($source)) "Missing source identity for $Lane"
+    foreach ($hash in [regex]::Matches($common,'hashFiles\(([^)]+)\)')) { foreach ($match in [regex]::Matches($hash.Groups[1].Value,'''([^'']+)''')) { $match.Groups[1].Value } }
+    foreach ($match in [regex]::Matches($source,'''([^'']+)''')) { $match.Groups[1].Value }
+}
+function Invoke-LanePhaseFixture([string]$BuildOnly) {
+    $scratch=New-CiScratch 'bonsai-lane-phase-'; $original=@{}
+    $environment=@{BUILD_ONLY=$BuildOnly;INCREMENTAL='false';GITHUB_RELEASE_BUILD='false';BONSAI_CI_PATH='Invoke-CapturedLane';RUNNER_TEMP=$scratch;GITHUB_ENV=(Join-Path $scratch 'environment');GITHUB_WORKSPACE=$repository;BROKER_PACKAGES='["bonsai-tools"]';CARGO_TARGET_DIR=(Join-Path $scratch 'target')}
+    foreach ($key in $environment.Keys) { $original[$key]=[Environment]::GetEnvironmentVariable($key) }
+    try {
+        foreach ($key in $environment.Keys) { [Environment]::SetEnvironmentVariable($key,$environment[$key]) }
+        function Invoke-CapturedLane { $script:capturedLaneArguments=@($args) }
+        $steps=Get-CiActionSteps ([IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml')))
+        & ([scriptblock]::Create((Get-CiActionBody $steps['Format, analyze, document, test and build the selected crates']))) | Out-Null
+        return ,$script:capturedLaneArguments
+    } finally { foreach ($key in $original.Keys) { [Environment]::SetEnvironmentVariable($key,$original[$key]) }; Remove-CiScratch $scratch }
 }
 function Invoke-ToolsEnvironmentFixture([object[]]$Scenarios) {
     # Linux can contain both RUSTFLAGS and RustFlags. Preserve the actual names
@@ -91,6 +116,34 @@ function Invoke-ToolsEnvironmentFixture([object[]]$Scenarios) {
     } finally { foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) { if (-not $original.ContainsKey($name)) { [Environment]::SetEnvironmentVariable($name,$null) } }; foreach ($name in $original.Keys) { [Environment]::SetEnvironmentVariable($name,$original[$name]) }; Remove-CiScratch $scratch }
 }
 $cases=[ordered]@{
+ lane_dependency_and_embedded_closures_hashed={
+    $lanes=@{ui=@('src/chat-ui');core=@('src/broker','src/speech-service');asr=@('src/speech-asr');tts=@('src/speech-tts');tools=@('tools/bonsai');maintenance=@('tools/bonsai','tools/ci','src/audio','src/artifacts','src/cpu-policy','src/windows-process','src/windows-credentials')}
+    foreach ($lane in $lanes.Keys) { $files=@(Get-RequiredToolsFiles $repository $lanes[$lane]); Assert-CiEqual @(Get-UncoveredToolsFiles $files @(Get-LaneCachePatterns $lane)) @() }
+ }
+ lane_audio_and_external_source_omissions_detected={
+    foreach ($lane in @('ui','core','asr','tts','tools','maintenance')) {
+        $patterns=@(Get-LaneCachePatterns $lane); $path='src/audio/src/lib.rs'
+        Assert-CiEqual @(Get-UncoveredToolsFiles @($path) $patterns) @()
+        $reduced=@($patterns | Where-Object { -not [Management.Automation.WildcardPattern]::new($_).IsMatch($path) })
+        Assert-CiEqual @(Get-UncoveredToolsFiles @($path) $reduced) @($path)
+    }
+    foreach ($path in @('.cargo/config.toml','tools/native-reference/reference_numerics.rs','src/chat-ui/assets/bonsai.ico','LICENSE','NOTICE')) { Assert-CiEqual @(Get-UncoveredToolsFiles @($path) @(Get-LaneCachePatterns 'tools')) @() }
+ }
+ lane_producer_and_checks_save_distinct_snapshots={
+    $action=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml')).Replace("`r`n","`n")
+    $key=([regex]::Match($action,'(?m)^        key: (.+)$')).Groups[1].Value
+    $suffix='${{ inputs.build-only == ''true'' && ''build'' || ''checks'' }}'
+    Assert-Ci ($key.EndsWith($suffix,[StringComparison]::Ordinal))
+    $sameSource=$key.Substring(0,$key.Length-$suffix.Length)
+    $firstRestore=([regex]::Match($action,'restore-keys: \|\r?\n          (.+)')).Groups[1].Value
+    Assert-CiEqual $firstRestore $sameSource
+    Assert-Ci ($action.Contains("steps.cargo-cache.outputs.cache-hit != 'true'"))
+    Assert-Ci ($action.Contains('name: broker-checks-${{ inputs.lane }}-${{ github.job }}-${{ github.run_id }}'))
+ }
+ lane_build_only_never_replaces_default_full_checks={
+    $build=Invoke-LanePhaseFixture 'true'; Assert-Ci ('--phase' -cin $build); Assert-Ci ('build' -cin $build); Assert-Ci ('--full-tests' -cnotin $build)
+    foreach ($mode in @('false','')) { $checks=Invoke-LanePhaseFixture $mode; Assert-Ci ('--full-tests' -cin $checks); Assert-Ci ('--build' -cin $checks); Assert-Ci ('--phase' -cnotin $checks) }
+ }
  real_dependency_embedded_closure_hashed={ $files=@(Get-RequiredToolsFiles $repository); Assert-CiEqual @(Get-UncoveredToolsFiles $files (Get-ToolsHashPatterns)) @(); foreach ($file in $files) { Assert-Ci (Test-Path -LiteralPath (Join-Path $repository $file) -PathType Leaf) $file } }
  missing_audio_and_embedded_input_detected={ $files=@(Get-RequiredToolsFiles $repository); $patterns=Get-ToolsHashPatterns; foreach ($path in @('src/audio/src/lib.rs','src/speech-asr/model.lock.json','src/speech-tts/model.lock.json','tools/qwen-tts/model.lock.json','tools/hexagon/diagnostic.manifest','src/chat-ui/assets/bonsai.ico','LICENSE','NOTICE')) { Assert-Ci ($path -cin $files) $path; $reduced=@($patterns | Where-Object { -not [Management.Automation.WildcardPattern]::new($_).IsMatch($path) }); Assert-Ci ($path -cin @(Get-UncoveredToolsFiles $files $reduced)) $path } }
  traversal_and_literals_use_manifest_owner={
