@@ -72,6 +72,7 @@ mod isa;
 #[cfg(feature = "test-probe")]
 mod job_probe;
 mod opencl;
+mod output;
 mod power;
 mod power_policy;
 pub(super) mod presentation;
@@ -299,6 +300,9 @@ pub(super) struct NativeProcess {
     // Drop after the Job and retained root: containment outlives the worker.
     containment: Option<containment::Environment>,
     stop_attempt: cleanup::StopAttempt,
+    // Capture threads own process handles, never a Job handle that could keep
+    // kill-on-close from taking effect after an abrupt owner exit.
+    captures: Option<output::Captures>,
 }
 
 impl NativeProcess {
@@ -426,44 +430,15 @@ impl NativeProcess {
     ) -> io::Result<Self> {
         let executable = wide(spec.executable.as_os_str());
         let directory = wide(spec.working_directory.as_os_str());
-        // SAFETY: Null attributes/name request a new noninheritable unnamed Job.
-        let job = owned(unsafe { CreateJobObjectW(null(), null()) })?;
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            // A headless engine must terminate on an unhandled exception rather
-            // than waiting for a Windows Error Reporting dialog. The Job applies
-            // this policy to descendants without changing the owner's error mode.
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-        if let Some((memory, processes)) = spec.limits {
-            limits.BasicLimitInformation.LimitFlags |=
-                JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-            limits.BasicLimitInformation.ActiveProcessLimit = processes;
-            limits.JobMemoryLimit = memory;
-        }
-        if let Some(priority) = spec.priority_class {
-            // A Job limit applies before the first root instruction and to
-            // descendants, including compilers that create their own nested
-            // Jobs. No process-wide setting is changed on the UI/launcher.
-            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
-            limits.BasicLimitInformation.PriorityClass = priority;
-        }
-        // SAFETY: The handle is owned/live, class matches the initialized structure,
-        // and the exact readable structure size is passed synchronously.
-        check(unsafe {
-            SetInformationJobObject(
-                job.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                ptr::from_ref(&limits).cast(),
-                win_size::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
-            )
-        })?;
-        let [input, output, error] = standard_streams(spec, pipes)?;
+        let job = launch_job(spec)?;
+        let ([input, output, error_output], pending_captures) =
+            standard_streams(spec, pipes, containment.is_some())?;
         let attributes = CreationAttributes::new(
             job.as_raw_handle(),
             [
                 input.as_raw_handle(),
                 output.as_raw_handle(),
-                error.as_raw_handle(),
+                error_output.as_raw_handle(),
             ],
             spec.mitigation_profile.flags(),
             containment.as_ref().map(containment::Environment::raw),
@@ -473,7 +448,7 @@ impl NativeProcess {
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
         startup.StartupInfo.hStdInput = input.as_raw_handle();
         startup.StartupInfo.hStdOutput = output.as_raw_handle();
-        startup.StartupInfo.hStdError = error.as_raw_handle();
+        startup.StartupInfo.hStdError = error_output.as_raw_handle();
         startup.lpAttributeList = attributes.address();
         let mut info = PROCESS_INFORMATION::default();
         // SAFETY: All strings are terminated and mutable command storage is live.
@@ -501,17 +476,36 @@ impl NativeProcess {
         })?;
         let process = owned(info.hProcess)?;
         let thread = owned(info.hThread)?;
-        if let Err(error) = resume_owned(
-            &process,
-            &thread,
-            &job,
-            spec.mitigation_profile,
-            containment.is_some(),
-        ) {
+        let captures = match pending_captures
+            .map(|captures| captures.start(&process))
+            .transpose()
+        {
+            Ok(captures) => captures,
+            Err(error) => {
+                drop([input, output, error_output]);
+                terminate_failed_start(&process, None).map_err(crate::unconfirmed_start_cleanup)?;
+                return Err(error);
+            }
+        };
+        let start = captures
+            .as_ref()
+            .map_or(Ok(()), output::Captures::check)
+            .and_then(|()| {
+                resume_owned(
+                    &process,
+                    &thread,
+                    &job,
+                    spec.mitigation_profile,
+                    containment.is_some(),
+                )
+            });
+        if let Err(error) = start {
             // PSEC may broker process creation rather than inheriting JOB_LIST.
             // Any failure before confirmed ownership must terminate this exact
             // retained root, even when closing our Job cannot reach it yet.
-            terminate_failed_start(&process).map_err(crate::unconfirmed_start_cleanup)?;
+            drop([input, output, error_output]);
+            terminate_failed_start(&process, captures.as_ref())
+                .map_err(crate::unconfirmed_start_cleanup)?;
             return Err(error);
         }
         Ok(Self {
@@ -520,6 +514,7 @@ impl NativeProcess {
             id: info.dwProcessId,
             containment,
             stop_attempt: cleanup::StopAttempt::default(),
+            captures,
         })
     }
 
@@ -532,6 +527,45 @@ impl NativeProcess {
     }
 
     pub(super) fn wait_for_exit(&self, timeout: Duration) -> io::Result<Option<u32>> {
+        let started = Instant::now();
+        self.check_captures()?;
+        let Some(code) = self.root_wait_for_exit(timeout)? else {
+            return Ok(None);
+        };
+        while !self.captures_finished()? {
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return Ok(None);
+            };
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+        self.check_captures()?;
+        Ok(Some(code))
+    }
+
+    fn check_captures(&self) -> io::Result<()> {
+        if let Some(captures) = &self.captures
+            && let Err(error) = captures.check()
+        {
+            let status = match self.root_wait_for_exit(Duration::ZERO) {
+                Ok(Some(code)) => format!("native root exit code {code} (0x{code:08X})"),
+                Ok(None) => "native root still running; exit code unknown".to_owned(),
+                Err(_) => "native root exit code unknown; query failed".to_owned(),
+            };
+            return Err(io::Error::new(error.kind(), format!("{error}; {status}")));
+        }
+        Ok(())
+    }
+
+    fn captures_finished(&self) -> io::Result<bool> {
+        self.captures
+            .as_ref()
+            .map_or(Ok(true), output::Captures::finished)
+    }
+
+    fn root_wait_for_exit(&self, timeout: Duration) -> io::Result<Option<u32>> {
         let milliseconds = u32::try_from(timeout.as_millis())
             .ok()
             .filter(|value| *value < u32::MAX)
@@ -587,10 +621,12 @@ impl NativeProcess {
         let members = members?;
         loop {
             // Job accounting can reach zero just before the root handle becomes
-            // signaled. A successful stop also guarantees try_wait sees exit.
+            // signaled. Cleanup confirms raw root exit independently of an
+            // operation's retained log-capture failure.
             if self.active_processes()? == 0
-                && self.try_wait()?.is_some()
+                && self.root_wait_for_exit(Duration::ZERO)?.is_some()
                 && members_exited(&members)?
+                && self.captures_finished()?
             {
                 return Ok(());
             }
@@ -836,21 +872,49 @@ fn resume_owned(
     }
 }
 
-fn terminate_failed_start(process: &OwnedHandle) -> io::Result<()> {
+fn terminate_failed_start(
+    process: &OwnedHandle,
+    captures: Option<&output::Captures>,
+) -> io::Result<()> {
+    let started = Instant::now();
     // SAFETY: This is the exact newly created root, retained against PID reuse.
     let terminated = unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+    let remaining = Duration::from_secs(10).saturating_sub(started.elapsed());
+    let milliseconds = u32::try_from(remaining.as_millis())
+        .map_err(|_| invalid("failed-start wait interval exceeds the native bound"))?;
     // SAFETY: Wait only on the same live root handle, with a bounded timeout.
-    match unsafe { WaitForSingleObject(process.as_raw_handle(), 10_000) } {
-        WAIT_OBJECT_0 => Ok(()),
-        WAIT_TIMEOUT => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "failed worker startup did not terminate",
-        )),
-        _ if terminated == 0 => Err(io::Error::last_os_error()),
-        _ => Err(io::Error::other(
-            "failed worker startup exit could not be confirmed",
-        )),
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), milliseconds) } {
+        WAIT_OBJECT_0 => (),
+        WAIT_TIMEOUT => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "failed worker startup did not terminate",
+            ));
+        }
+        _ if terminated == 0 => return Err(io::Error::last_os_error()),
+        _ => {
+            return Err(io::Error::other(
+                "failed worker startup exit could not be confirmed",
+            ));
+        }
     }
+    // Closing the parent's child endpoints precedes this call. Captures then
+    // drain through EOF and join using the remainder of the same allowance.
+    while let Some(captures) = captures
+        && !captures.finished()?
+    {
+        let remaining = Duration::from_secs(10)
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "failed worker capture cleanup timed out",
+                )
+            })?;
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    Ok(())
 }
 
 impl Drop for NativeProcess {
@@ -1175,7 +1239,8 @@ mod pipe_tests {
 fn standard_streams(
     spec: &LaunchSpec<'_>,
     pipes: Option<(OwnedHandle, OwnedHandle)>,
-) -> io::Result<[OwnedHandle; 3]> {
+    bounded_logs: bool,
+) -> io::Result<([OwnedHandle; 3], Option<output::PendingCaptures>)> {
     if let Some((input, output)) = pipes {
         // Binary pipe workers report bounded errors in their protocol. A NUL
         // handle avoids granting codecs an unbounded disk-log sink.
@@ -1185,28 +1250,71 @@ fn standard_streams(
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             OPEN_EXISTING,
         )?;
-        return Ok([input, output, error]);
+        return Ok(([input, output, error], None));
     }
-    Ok([
-        standard_file(
-            OsStr::new("NUL"),
-            0x8000_0000,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            OPEN_EXISTING,
-        )?,
-        standard_file(
-            spec.stdout.as_os_str(),
-            0x4000_0000,
-            FILE_SHARE_READ,
-            CREATE_NEW,
-        )?,
-        standard_file(
-            spec.stderr.as_os_str(),
-            0x4000_0000,
-            FILE_SHARE_READ,
-            CREATE_NEW,
-        )?,
-    ])
+    let input = standard_file(
+        OsStr::new("NUL"),
+        0x8000_0000,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    )?;
+    if bounded_logs {
+        let ([output, error], captures) = output::prepare(spec.stdout, spec.stderr)?;
+        return Ok(([input, output, error], Some(captures)));
+    }
+    Ok((
+        [
+            input,
+            standard_file(
+                spec.stdout.as_os_str(),
+                0x4000_0000,
+                FILE_SHARE_READ,
+                CREATE_NEW,
+            )?,
+            standard_file(
+                spec.stderr.as_os_str(),
+                0x4000_0000,
+                FILE_SHARE_READ,
+                CREATE_NEW,
+            )?,
+        ],
+        None,
+    ))
+}
+
+fn launch_job(spec: &LaunchSpec<'_>) -> io::Result<OwnedHandle> {
+    // SAFETY: Null attributes/name request a new noninheritable unnamed Job.
+    let job = owned(unsafe { CreateJobObjectW(null(), null()) })?;
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        // A headless engine must terminate on an unhandled exception rather
+        // than waiting for a Windows Error Reporting dialog. The Job applies
+        // this policy to descendants without changing the owner's error mode.
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    if let Some((memory, processes)) = spec.limits {
+        limits.BasicLimitInformation.LimitFlags |=
+            JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = processes;
+        limits.JobMemoryLimit = memory;
+    }
+    if let Some(priority) = spec.priority_class {
+        // A Job limit applies before the first root instruction and to
+        // descendants, including compilers that create their own nested
+        // Jobs. No process-wide setting is changed on the UI/launcher.
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+        limits.BasicLimitInformation.PriorityClass = priority;
+    }
+    // SAFETY: The handle is owned/live, class matches the initialized structure,
+    // and the exact readable structure size is passed synchronously.
+    check(unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            ptr::from_ref(&limits).cast(),
+            win_size::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
+        )
+    })?;
+    Ok(job)
 }
 
 fn standard_file(

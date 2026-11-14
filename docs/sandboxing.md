@@ -86,7 +86,11 @@ The owned-worker policy grants:
   every non-root check remain in force.
 - Writable application scratch below a fresh protected owner/LocalSystem
   directory. Keys and parent-opened stdout/stderr remain outside that writable
-  grant; only their specific standard handles are inherited.
+  grant. HTTP workers inherit only bounded-pipe standard-output/error writers;
+  trusted parent readers retain at most 16 MiB per stream. A log limit or capture
+  read/write failure terminates the exact worker, and successful cleanup also
+  requires completed capture threads within its existing absolute allowance.
+  Offline binary-pipe decoders keep protocol stdout and a `NUL` stderr sink.
 - Windows' own private PSEC temporary storage. Windows can replace the requested
   child TEMP/TMP with `Packages/sandbox.{id}/AC/Temp`; supplied scratch is not the
   sole writable location, and effective TEMP must not be claimed to equal cwd.
@@ -115,8 +119,9 @@ value is non-secret. Run from an appropriately scoped parent environment.
 
 Existing artifact verification and retained handles remain in force. Jobs still
 enforce process count and committed memory; the physical-RAM watchdog remains
-necessary for mapped weights. Scratch and log storage do not acquire a disk quota
-merely by being private. Same-user processes outside the sandbox can still read
+necessary for mapped weights. The hard parent-owned log bound does not quota
+application scratch or Windows-managed private temporary storage. Same-user
+processes outside the sandbox can still read
 owner-protected credentials or interfere with endpoints. Administrator/trusted
 owner compromise is outside this boundary. The development app enforces this
 policy, while daily-service isolation remains unqualified under the

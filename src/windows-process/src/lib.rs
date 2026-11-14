@@ -828,6 +828,10 @@ impl OwnedProcess {
     /// OS/profile environment entries are inherited; TEMP/TMP request scratch
     /// but PSEC can replace them with that OS-managed temporary directory.
     /// All policy and capability failures reject without an uncontained retry.
+    /// Parent-owned pipe readers retain at most 16 MiB for each standard stream;
+    /// excess output or a failed capture terminates the exact worker. The worker
+    /// inherits no seekable log-file handle. This does not quota its writable
+    /// application scratch or Windows-managed private temporary directory.
     /// Native launches require a verified one-process Job before the first
     /// instruction. PSEC may omit ordinary creation attributes, so suspended
     /// Job assignment is repaired explicitly and native terminate-on-close is
@@ -1013,18 +1017,28 @@ impl OwnedProcess {
         self.0.id()
     }
 
-    /// Polls root completion without waiting; exit code 259 is handled correctly.
+    /// Polls root and contained-log completion without waiting.
+    ///
+    /// Exit code 259 is handled correctly. A sandboxed HTTP worker's status is
+    /// returned only after both bounded captures finish and are joined.
     ///
     /// # Errors
-    /// Returns failed Windows wait/query operations.
+    /// Returns failed Windows wait/query operations or contained log failures,
+    /// with the observed native exit code or an explicit unknown observation.
     pub fn try_wait(&self) -> io::Result<Option<u32>> {
         self.0.try_wait()
     }
 
-    /// Waits up to a bounded interval for root completion, waking immediately on exit.
+    /// Waits within one bounded interval for root exit and contained log capture.
+    ///
+    /// A sandboxed HTTP worker also requires completed, joined standard-stream
+    /// capture before returning its exit status. Binary-pipe workers have no log
+    /// captures. Captured bytes and the worker's native exit code stay unchanged.
     ///
     /// # Errors
-    /// Rejects intervals at or above the native infinite-wait sentinel, or a failed wait.
+    /// Rejects intervals at or above the native infinite-wait sentinel, failed
+    /// waits, or sandbox log overflow/read/write failures. A log failure does not
+    /// establish cleanup; the caller must still explicitly stop the owner.
     pub fn wait_for_exit(&self, timeout: Duration) -> io::Result<Option<u32>> {
         self.0.wait_for_exit(timeout)
     }
@@ -1033,8 +1047,10 @@ impl OwnedProcess {
     ///
     /// # Errors
     /// Returns invalid zero timeouts, Windows failures, or `TimedOut` if active
-    /// processes remain after the deadline. Dropping still closes the Job and
-    /// native containment without renewing an explicitly attempted stop's wait.
+    /// processes or contained log captures remain after the deadline. A known log
+    /// failure does not prevent confirming process cleanup. Dropping still closes
+    /// the Job and native containment without renewing an explicitly attempted
+    /// stop's wait.
     pub fn stop(&self, timeout: Duration) -> io::Result<()> {
         self.0.stop(timeout)
     }

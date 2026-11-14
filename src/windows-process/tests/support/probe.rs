@@ -60,6 +60,9 @@ fn main() -> io::Result<()> {
         "sandbox-connect-allowed" => sandbox_connect(&args, true)?,
         "sandbox-connect-denied" => sandbox_connect(&args, false)?,
         "sandbox-temp-denied" => sandbox_temp_denied(&args)?,
+        "sandbox-flood-stdout" => flood_output(&mut io::stdout().lock())?,
+        "sandbox-flood-stderr" => flood_output(&mut io::stderr().lock())?,
+        "sandbox-output-tail" => output_tail()?,
         "crash" => native_crash(),
         "error-policy" | "error-policy-owner" => error_policy(mode)?,
         "listen" => {
@@ -112,6 +115,28 @@ fn main() -> io::Result<()> {
         _ => return Err(io::Error::other("unknown probe mode")),
     }
     Ok(())
+}
+
+fn flood_output(output: &mut impl io::Write) -> io::Result<()> {
+    // This exceeds the production 16 MiB limit without growing fixture memory.
+    for _ in 0..1025 {
+        output.write_all(&[b'x'; 16_384])?;
+    }
+    wait_forever();
+    Ok(())
+}
+
+fn output_tail() -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    // Both streams exceed one pipe buffer; a single blocking reader would
+    // deadlock against the other stream before this worker could exit.
+    for byte in 0..17_u8 {
+        stdout.write_all(&[byte; 16_384])?;
+        stderr.write_all(&[255 - byte; 16_384])?;
+    }
+    stdout.flush()?;
+    stderr.flush()
 }
 
 fn priority_tree() -> io::Result<()> {

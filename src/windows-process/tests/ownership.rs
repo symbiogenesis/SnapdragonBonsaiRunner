@@ -355,6 +355,92 @@ fn native_sandbox_limits_files_and_preserves_loopback_process_identity() -> io::
     Ok(())
 }
 
+#[test]
+#[ignore = "Requires a native Windows PSEC v1.1 host with host-loopback ingress support."]
+fn native_sandbox_stdout_flood_is_capped_and_stopped() -> io::Result<()> {
+    sandbox_output_flood("stdout")
+}
+
+#[test]
+#[ignore = "Requires a native Windows PSEC v1.1 host with host-loopback ingress support."]
+fn native_sandbox_stderr_flood_is_capped_and_stopped() -> io::Result<()> {
+    sandbox_output_flood("stderr")
+}
+
+#[test]
+#[ignore = "Requires a native Windows PSEC v1.1 host with host-loopback ingress support."]
+fn native_sandbox_exit_drains_both_logs_and_releases_capture_files() -> io::Result<()> {
+    let lane = Lane::new("sandbox-output-tail")?;
+    let scratch = lane.path.join("scratch");
+    fs::create_dir(&scratch)?;
+    let mut spec = lane.spec(vec![OsString::from("sandbox-output-tail")]);
+    spec.working_directory.clone_from(&scratch);
+    spec.active_process_limit = 1;
+    let process = OwnedProcess::start_sandboxed(
+        &spec,
+        &SandboxPolicy {
+            readonly_paths: vec![spec.executable.clone()],
+            writable_directory: scratch,
+        },
+    )?;
+    until(|| process.try_wait().map(|code| code.is_some()))?;
+    assert_eq!(process.try_wait()?, Some(0));
+    for (stderr, path) in [(false, &spec.stdout), (true, &spec.stderr)] {
+        // Status publication must precede neither tail retention nor release of
+        // the parent's no-delete-sharing capture file, even with owner retained.
+        let retained = path.with_extension("retained");
+        fs::rename(path, &retained)?;
+        let bytes = fs::read(retained)?;
+        assert_eq!(bytes.len(), 17 * 16_384);
+        for (byte, chunk) in (0..17_u8).zip(bytes.as_chunks::<16_384>().0) {
+            let expected = if stderr { 255 - byte } else { byte };
+            assert!(chunk.iter().all(|value| *value == expected));
+        }
+    }
+    process.stop(TIMEOUT)?;
+    drop(process);
+    fs::remove_dir_all(lane.path)
+}
+
+fn sandbox_output_flood(stream: &str) -> io::Result<()> {
+    let lane = Lane::new(&format!("sandbox-{stream}-flood"))?;
+    let scratch = lane.path.join("scratch");
+    fs::create_dir(&scratch)?;
+    let mut spec = lane.spec(vec![OsString::from(format!("sandbox-flood-{stream}"))]);
+    spec.working_directory.clone_from(&scratch);
+    spec.active_process_limit = 1;
+    let process = OwnedProcess::start_sandboxed(
+        &spec,
+        &SandboxPolicy {
+            readonly_paths: vec![spec.executable.clone()],
+            writable_directory: scratch,
+        },
+    )?;
+    let capture_failed = || match process.try_wait() {
+        Err(error) if error.to_string().contains("retained-log bound") => Ok(true),
+        Err(error) => Err(error),
+        Ok(None) => Ok(false),
+        Ok(Some(_)) => Err(io::Error::other(
+            "flood worker exited without a log-limit error",
+        )),
+    };
+    until(capture_failed)?;
+    // Log overflow is an operation failure, while cleanup has its own verdict.
+    // The original native Job and exact root must still be confirmed stopped.
+    process.stop(TIMEOUT)?;
+    assert_eq!(process.active_processes()?, 0);
+    for (name, path) in [("stdout", &spec.stdout), ("stderr", &spec.stderr)] {
+        let length = fs::metadata(path)?.len();
+        if name == stream {
+            assert_eq!(length, 16 * 1024 * 1024);
+        } else {
+            assert!(length <= 16 * 1024 * 1024);
+        }
+    }
+    drop(process);
+    fs::remove_dir_all(lane.path)
+}
+
 fn assert_other_worker_temp_denied(first_scratch: &std::path::Path) -> io::Result<()> {
     // Windows can replace the requested TEMP/TMP with an OS-managed private
     // AppContainer temp. Prove isolation with a live second worker, rather than
