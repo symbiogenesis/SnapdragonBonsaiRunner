@@ -49,12 +49,12 @@ $cases=[ordered]@{
     Assert-CiReject { Assert-FoundationPlannerGuard ($job.Replace('          throw ','          Write-Output ')) }
     foreach ($value in @('true','${{ false }}')) { Assert-CiReject { Assert-FoundationPlannerGuard ($job.Replace('        shell: pwsh',"        continue-on-error: $value`n        shell: pwsh")) } }
  }
- consumers_wait_for_checked_cli={
-    foreach ($name in @('speech','foundation-tests','release-integration')) { Assert-CiSet (Get-CiDependencies $jobs[$name]) @('changes','checked-tools') }
-    foreach ($name in @('checked-tools','maintenance','speech-tts')) { Assert-CiSet (Get-CiDependencies $jobs[$name]) @('changes') }
+ consumers_and_checks_overlap_after_source_bound_cli={
+    foreach ($name in @('checked-tools','speech','foundation-tests','release-integration')) { Assert-CiSet (Get-CiDependencies $jobs[$name]) @('changes','tools-package') }
+    foreach ($name in @('tools-package','maintenance','speech-tts')) { Assert-CiSet (Get-CiDependencies $jobs[$name]) @('changes') }
     $expected=@($config.workflows.foundation.Keys)+@('changes'); Assert-CiSet (Get-CiDependencies $jobs.foundation) $expected; Assert-CiSet $jobs.Keys ($expected+@('foundation')); Assert-Ci (Test-CiAcyclic $jobs)
  }
- missing_producer_and_cycles_fail={ $changed=$jobs.Clone(); $changed.Remove('checked-tools'); Assert-Ci (-not (Test-CiAcyclic $changed)); $changed=$jobs.Clone(); $changed['checked-tools']="`n    needs: speech`n"; Assert-Ci (-not (Test-CiAcyclic $changed)) }
+ missing_producer_and_cycles_fail={ $changed=$jobs.Clone(); $changed.Remove('tools-package'); Assert-Ci (-not (Test-CiAcyclic $changed)); $changed=$jobs.Clone(); $changed['tools-package']="`n    needs: speech`n"; Assert-Ci (-not (Test-CiAcyclic $changed)) }
  every_package_has_one_owning_lane={
     $registry=[IO.File]::ReadAllText((Join-Path $repository 'config/rust-packages.json')) | ConvertFrom-Json -AsHashtable; $owned=@()
     foreach ($name in @('maintenance','checked-tools')) {
@@ -64,18 +64,20 @@ $cases=[ordered]@{
     }
     Assert-CiEqual $owned.Count @($owned | Sort-Object -Unique).Count; Assert-CiSet $owned @('bonsai-artifacts','bonsai-audio','bonsai-cpu-policy','bonsai-windows-process','bonsai-windows-credentials','bonsai-ci','bonsai-tools')
  }
- cli_checked_before_publication={
-    $producer=$jobs['checked-tools']; Assert-Ci ($producer.IndexOf('uses: $/.github/actions/check-rust') -lt $producer.IndexOf('Stage the checked maintenance CLI'))
-    foreach ($fragment in @('lane: tools','SchemaVersion = 3','Revision = $env:GITHUB_SHA','NumericSha256 = (Get-FileHash','bonsai-reference-numerics.exe','ProbeSha256 = (Get-FileHash','name: bonsai-tools-windows-arm64-${{ github.sha }}')) { Assert-Ci ($producer.Contains($fragment)) $fragment }
+ cli_built_before_publication_and_fully_checked_independently={
+    $producer=$jobs['tools-package']; Assert-Ci ($producer.IndexOf('uses: $/.github/actions/check-rust') -lt $producer.IndexOf('Stage the source-bound maintenance CLI'))
+    foreach ($fragment in @('lane: tools',"build-only: 'true'",'SchemaVersion = 3','Revision = $env:GITHUB_SHA','NumericSha256 = (Get-FileHash','bonsai-reference-numerics.exe','ProbeSha256 = (Get-FileHash','name: bonsai-tools-windows-arm64-${{ github.sha }}')) { Assert-Ci ($producer.Contains($fragment)) $fragment }
+    $checks=$jobs['checked-tools']; Assert-Ci ($checks.Contains('uses: $/.github/actions/check-rust')); Assert-Ci (-not $checks.Contains('build-only:')); Assert-Ci ($checks.Contains('uses: $/.github/actions/use-bonsai-tools')); Assert-Ci ($checks -cnotmatch '(?m)^        continue-on-error:')
     $consumer=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/use-bonsai-tools/action.yml')); Assert-Ci ($consumer.Contains('name: bonsai-tools-windows-arm64-${{ github.sha }}')); Assert-Ci (-not $consumer.Contains('run-id:')); Assert-Ci ($consumer.Contains('$receipt.Revision -cne $env:GITHUB_SHA'))
  }
- router_and_gate_select_producer={ Assert-CiEqual $config.workflows.foundation['checked-tools'] 'tools'; Assert-CiEqual $config.workflows.foundation.maintenance 'maintenance'; Assert-Ci ('tools' -cnotin $config.groups.maintenance['groups']); Assert-Ci ('bonsai-tools' -cin $config.groups.maintenance.exclude_packages); Assert-Ci ('tools' -cin $config.groups.rust_lanes.groups) }
+ router_and_gate_select_producer_and_complete_checks={ Assert-CiEqual $config.workflows.foundation['tools-package'] 'tools'; Assert-CiEqual $config.workflows.foundation['checked-tools'] 'tools'; Assert-CiEqual $config.workflows.foundation.maintenance 'maintenance'; Assert-Ci ('tools' -cnotin $config.groups.maintenance['groups']); Assert-Ci ('bonsai-tools' -cin $config.groups.maintenance.exclude_packages); Assert-Ci ('tools' -cin $config.groups.rust_lanes.groups) }
  speech_lanes_keep_independent_results={
+    Assert-Ci ('speech_asr' -cin $config.groups.tools.groups); Assert-Ci ('speech' -cnotin $config.groups.tools.groups); Assert-Ci ('speech_tts' -cnotin $config.groups.tools.groups)
     foreach ($pair in @(@('speech','asr'),@('speech-tts','tts'))) { $block=$jobs[$pair[0]]; $lane=$pair[1]; foreach ($fragment in @("contains(fromJSON(needs.changes.outputs.speech_lanes), '$lane')","lane: $lane",("packages: '[`"bonsai-speech-$lane`"]'"))) { Assert-Ci ($block.Contains($fragment)) $fragment }; Assert-CiEqual $config.workflows.foundation[$pair[0]] "speech_$lane" }
     Assert-Ci ($jobs.speech.Contains('uses: $/.github/actions/use-bonsai-tools')); Assert-Ci (-not $jobs['speech-tts'].Contains('bonsai-tools')); Assert-Ci (-not $jobs.speech.Contains('strategy:'))
  }
  only_asr_needs_native_compiler={
-    $action=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml')); foreach ($fragment in @("if (`$env:RUST_LANE -ceq 'asr')","if: steps.packages.outputs.has-packages == 'true' && inputs.lane == 'asr'",'--full-tests --build')) { Assert-Ci ($action.Contains($fragment)) $fragment }
+    $action=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml')); foreach ($fragment in @("if (`$env:RUST_LANE -ceq 'asr')","if: steps.packages.outputs.has-packages == 'true' && inputs.lane == 'asr'","'--full-tests', '--build'")) { Assert-Ci ($action.Contains($fragment)) $fragment }
     $release=[IO.File]::ReadAllText((Join-Path $repository '.github/workflows/release.yml')); Assert-Ci ($release -cmatch 'uses: \$/\.github/actions/bonsai-tools\r?\n\s+if: matrix.lane == ''asr''\r?\n'); Assert-Ci ([IO.File]::ReadAllText((Join-Path $repository 'tools/ci/src/checks/mod.rs')).Contains('--all-targets'))
  }
  planner_reuses_build_but_runs_regressions={
@@ -94,12 +96,12 @@ $cases=[ordered]@{
  cpu_policy_fixtures_run_on_hosted_source_lane={
     $planner=$jobs.changes; Assert-Ci ($planner.Contains('runs-on: ubuntu-24.04-arm')); Assert-Ci ($planner.Contains('pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/cpu-bundle/test_cpu_bundle.ps1"')); Assert-Ci (-not $planner.Contains('run_device')); Assert-FoundationPlannerCache $planner; Assert-Ci ('tools/native-reference/reference_numerics.rs' -cin $config.package_inputs['bonsai-tools'])
  }
- independent_reference_and_pe_fixtures_are_checked_before_upload={
-    $producer=$jobs['checked-tools']; $step='Check independent numerical references and static PE closure without models'
-    Assert-Ci ($producer.IndexOf('Stage the checked maintenance CLI') -lt $producer.IndexOf($step)); Assert-Ci ($producer.IndexOf($step) -lt $producer.IndexOf('Share the checked native Windows ARM64 maintenance CLI'))
-    foreach ($fragment in @('runs-on: windows-11-arm','SwiftBonsai-CheckedTools/bonsai-reference-numerics.exe','$env:BONSAI_REFERENCE_NUMERIC_TOOL = $numeric','tools/native-reference/test_compare.ps1','tools/native-reference/test_audit_retained.ps1',"'tools/row-parallel/test_compare.ps1') -ToolPath `$numeric",'tools/runtime-candidates/test_pe_closure.ps1')) { Assert-Ci ($producer.Contains($fragment)) $fragment }
-    Assert-Ci ($producer.Contains("'tools/runtime-candidates/test_pe_closure.ps1') -ToolPath (Join-Path `$env:RUNNER_TEMP 'SwiftBonsai-CheckedTools/bonsai-tools.exe')")) 'PE fixtures must consume the same-run checked native CLI.'
-    $selection=($producer -split [regex]::Escape($step),2)[1] -split '      - name:',2; Assert-Ci ($selection[0] -cnotmatch '(?m)^\s+if:')
+ independent_reference_and_pe_fixtures_gate_the_same_run_package={
+    $checks=$jobs['checked-tools']; $step='Check independent numerical references and static PE closure without models'
+    Assert-Ci ($checks.IndexOf('uses: $/.github/actions/use-bonsai-tools') -lt $checks.IndexOf($step)); Assert-Ci (-not $jobs['tools-package'].Contains($step))
+    foreach ($fragment in @('runs-on: windows-11-arm','SwiftBonsai-CheckedTools/bonsai-reference-numerics.exe','$env:BONSAI_REFERENCE_NUMERIC_TOOL = $numeric','tools/native-reference/test_compare.ps1','tools/native-reference/test_audit_retained.ps1',"'tools/row-parallel/test_compare.ps1') -ToolPath `$numeric",'tools/runtime-candidates/test_pe_closure.ps1')) { Assert-Ci ($checks.Contains($fragment)) $fragment }
+    Assert-Ci ($checks.Contains("'tools/runtime-candidates/test_pe_closure.ps1') -ToolPath (Join-Path `$env:RUNNER_TEMP 'SwiftBonsai-CheckedTools/bonsai-tools.exe')")) 'PE fixtures must consume the same-run source-bound native CLI.'
+    $selection=($checks -split [regex]::Escape($step),2)[1] -split '      - name:',2; Assert-Ci ($selection[0] -cnotmatch '(?m)^\s+if:')
  }
 }
 Invoke-CiCases $cases $Case

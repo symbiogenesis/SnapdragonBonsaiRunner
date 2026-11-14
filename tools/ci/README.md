@@ -28,14 +28,34 @@ the plan, package list, boolean groups and filtered matrices;
 set and rejects planner failure, malformed results and unsuccessful selected
 jobs. Only deliberately unselected skips are permitted.
 The workflow transfers the planner's tested Linux executable to this gate rather
-than installing Rust and compiling it a second time. The independent `checked-tools`
-producer owns the maintenance CLI's full checks and its same-run CLI/probe artifact.
-ASR and native integration wait for that producer while Rust-only TTS, the six other
-maintenance crates, broker and UI lanes run concurrently. The aggregate maps ASR and
-TTS to their independent selected groups and requires both results. Package checks retain one owning
-lane; dependencies still compile wherever consumed. The configured aggregate requires all
-selected jobs, including both `checked-tools` and `maintenance`. The dependency change
-exposes concurrency; it supplies no measured hosted speedup or acceptance verdict.
+than installing Rust and compiling it a second time. The `tools-package` producer
+builds the maintenance CLI and publishes its same-run revision/digest-bound bundle.
+ASR, native integration and release integration start after that package is ready,
+alongside `checked-tools`, which still owns the CLI's format, strict Release Clippy,
+documentation, complete tests, production build and independent numerical/PE controls.
+Rust-only TTS, the six other maintenance crates, broker and UI start after planning.
+Foundation requires every selected result, including both `tools-package` and
+`checked-tools`; a successful package never substitutes for successful checks.
+Package checks retain one owning lane. The dependency change exposes concurrency;
+it supplies no measured hosted speedup or acceptance verdict.
+
+The build-only producer and complete tools checks use the same external Cargo
+target and build inputs, with separate immutable cache suffixes. Complete checks
+can restore the current source's producer build before falling back to earlier
+source outputs, then save their richer analyzer/test outputs under their own key.
+All selected checks execute even on exact hits; cache saves remain optional.
+
+Foundation also enables incremental Release compilation with 16 code generation
+units for its workspace and local path crates. Their per-crate incremental data
+stays in each lane's existing compiler cache, allowing source edits to reuse
+unchanged work within a crate. Optimization level, overflow checks, static CRT,
+strict analyzers and complete tests stay required. The action defaults incremental
+compilation off for publication Release and other callers. Cold tracking overhead,
+cache transfer size and net hosted elapsed time still need owner acceptance.
+
+A TTS-only source edit selects its Rust lane without scheduling the maintenance CLI
+producer. ASR still selects that producer for its native source preparation. Changes
+to TTS model lockfiles still rebuild and check the CLI that embeds those identities.
 
 The Linux planner restores locked downloads and compiler/image-isolated incremental
 outputs after source changes. It still builds the current source and runs its routing
@@ -85,12 +105,12 @@ static check; source review remains required. Required replay inputs and externa
 Each `test_*.ps1` fixture script accepts `-Case NAME` for a focused local check;
 their complete selections remain hosted CI work.
 
-Same-run checked-tool bundles use receipt schema 3, with `NumericSha256` for
+Same-run source-bound tool bundles use receipt schema 3, with `NumericSha256` for
 `bonsai-reference-numerics.exe` alongside the CLI and completion probe. Exact-input
 executable caches use schema 4. Native qualification verifies and holds the
 helper bytes; it never compiles a replacement during a device trial. Foundation
-runs reference, audit, row and PE fixtures before publishing
-checked tools. PE fixtures consume that same run's checked `bonsai-tools` executable;
+requires reference, audit, row and PE fixtures in the independent `checked-tools`
+job. PE fixtures consume that same run's source-bound `bonsai-tools` executable;
 the audit's binary parsing and closure policy run in Rust. CPU policy fixtures run
 in its portable source-control step.
 
@@ -483,7 +503,10 @@ test or acceptance results. Changed inputs use the incremental target fallback a
 build again. Invalid receipts or executable bytes fail before selection. The shared
 toolchain action skips duplicate cache extraction/installation only for the same
 request already verified in that job, and rechecks compiler, sysroot and components
-on every invocation. No release optimization or check/test flags change.
+on every invocation. Only the coordinator's own bootstrap build disables LLVM
+optimization and uses 256 code generation units to reduce cold startup work.
+These overrides are scoped to that build step and bound by its source identity;
+application strict Release profiles and all check/test flags remain unchanged.
 The packaged maintenance-tool cache includes every local dependency and embedded
 production input, including audio, pinned legacy speech locks, the diagnostic
 manifest, launcher icon and notices. Its exact executable and incremental target

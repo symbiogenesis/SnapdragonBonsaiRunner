@@ -110,7 +110,7 @@
       "groups": [
         "integration",
         "release",
-        "speech"
+        "speech_asr"
       ],
       "paths": [
         ".github/actions/bonsai-tools/**",
@@ -180,6 +180,7 @@
       "speech": "speech_asr",
       "speech-tts": "speech_tts",
       "maintenance": "maintenance",
+      "tools-package": "tools",
       "checked-tools": "tools",
       "foundation-tests": "integration",
       "release-integration": "release"

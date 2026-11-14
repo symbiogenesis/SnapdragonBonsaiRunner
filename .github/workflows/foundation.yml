@@ -70,6 +70,7 @@ jobs:
           pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_native_ci_cache.ps1"
           pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_tools_cache_inputs.ps1"
           pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_rust_toolchain.ps1"
+          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_incremental_ci.ps1"
           pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/cpu-bundle/test_cpu_bundle.ps1"
       - name: Check CI selection and gate regressions
         id: ci-regressions
@@ -118,6 +119,7 @@ jobs:
       - uses: $/.github/actions/check-rust
         with:
           lane: ${{ matrix.lane }}
+          incremental: 'true'
           packages: ${{ matrix.lane == 'ui' && '["bonsai-chat"]' || '["bonsai-broker","bonsai-speech-service"]' }}
           affected: ${{ needs.changes.outputs.packages }}
   maintenance:
@@ -134,11 +136,12 @@ jobs:
         uses: $/.github/actions/check-rust
         with:
           lane: maintenance
+          incremental: 'true'
           packages: '["bonsai-artifacts","bonsai-audio","bonsai-cpu-policy","bonsai-windows-process","bonsai-windows-credentials","bonsai-ci"]'
           affected: ${{ needs.changes.outputs.packages }}
-  checked-tools:
-    # Consumers need the CLI's own checked package, not unrelated maintenance tests.
-    # All dependency-crate checks remain independent requirements of Foundation.
+  tools-package:
+    # Package source-bound binaries first. Full CLI checks and consuming lanes
+    # overlap; Foundation still requires every independent result before passing.
     if: needs.changes.outputs.tools == 'true'
     needs: changes
     runs-on: windows-11-arm
@@ -147,16 +150,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Check the affected maintenance CLI package
+      - name: Build the affected maintenance CLI package
         uses: $/.github/actions/check-rust
         with:
           lane: tools
+          incremental: 'true'
           packages: '["bonsai-tools"]'
           affected: ${{ needs.changes.outputs.packages }}
+          build-only: 'true'
       - name: Reuse a packaged CLI when only its consumers changed
         if: needs.changes.outputs.tools == 'true' && !contains(fromJSON(needs.changes.outputs.packages), 'bonsai-tools')
         uses: $/.github/actions/bonsai-tools
-      - name: Stage the checked maintenance CLI and revision receipt
+      - name: Stage the source-bound maintenance CLI and revision receipt
         if: needs.changes.outputs.tools == 'true'
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -179,6 +184,33 @@ jobs:
             NumericSha256 = (Get-FileHash -LiteralPath $numeric -Algorithm SHA256).Hash.ToLowerInvariant()
             ProbeSha256 = (Get-FileHash -LiteralPath $probe -Algorithm SHA256).Hash.ToLowerInvariant()
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $package 'receipt.json')
+      - name: Share the source-bound native Windows ARM64 maintenance CLI
+        if: needs.changes.outputs.tools == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bonsai-tools-windows-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/SwiftBonsai-CheckedTools
+          if-no-files-found: error
+          compression-level: 1
+  checked-tools:
+    # Compilation outputs can come from tools-package; no check verdict is cached.
+    if: needs.changes.outputs.tools == 'true'
+    needs: [changes, tools-package]
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the affected maintenance CLI package
+        uses: $/.github/actions/check-rust
+        with:
+          lane: tools
+          incremental: 'true'
+          packages: '["bonsai-tools"]'
+          affected: ${{ needs.changes.outputs.packages }}
+      - name: Use the current run's source-bound maintenance CLI
+        uses: $/.github/actions/use-bonsai-tools
       - name: Check independent numerical references and static PE closure without models
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -192,29 +224,22 @@ jobs:
           & (Join-Path $env:GITHUB_WORKSPACE 'tools/native-reference/test_audit_retained.ps1')
           & (Join-Path $env:GITHUB_WORKSPACE 'tools/row-parallel/test_compare.ps1') -ToolPath $numeric
           & (Join-Path $env:GITHUB_WORKSPACE 'tools/runtime-candidates/test_pe_closure.ps1') -ToolPath (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-CheckedTools/bonsai-tools.exe')
-      - name: Share the checked native Windows ARM64 maintenance CLI
-        if: needs.changes.outputs.tools == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: bonsai-tools-windows-arm64-${{ github.sha }}
-          path: ${{ runner.temp }}/SwiftBonsai-CheckedTools
-          if-no-files-found: error
-          compression-level: 1
   speech:
     name: speech / asr
     if: needs.changes.outputs.speech == 'true' && contains(fromJSON(needs.changes.outputs.speech_lanes), 'asr')
-    needs: [changes, checked-tools]
+    needs: [changes, tools-package]
     runs-on: windows-11-arm
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Use the current run's checked maintenance CLI for source provisioning
+      - name: Use the current run's source-bound maintenance CLI for source provisioning
         uses: $/.github/actions/use-bonsai-tools
       - uses: $/.github/actions/check-rust
         with:
           lane: asr
+          incremental: 'true'
           packages: '["bonsai-speech-asr"]'
           affected: ${{ needs.changes.outputs.packages }}
   speech-tts:
@@ -231,12 +256,13 @@ jobs:
       - uses: $/.github/actions/check-rust
         with:
           lane: tts
+          incremental: 'true'
           packages: '["bonsai-speech-tts"]'
           affected: ${{ needs.changes.outputs.packages }}
   # Preserve the required check name; only the planner may authorize skips.
   foundation:
     if: always() && github.ref == 'refs/heads/main'
-    needs: [changes, broker, maintenance, checked-tools, speech, speech-tts, foundation-tests, release-integration]
+    needs: [changes, broker, maintenance, tools-package, checked-tools, speech, speech-tts, foundation-tests, release-integration]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
@@ -263,18 +289,18 @@ jobs:
   foundation-tests:
     name: Native integration
     if: needs.changes.outputs.integration == 'true'
-    needs: [changes, checked-tools]
+    needs: [changes, tools-package]
     runs-on: windows-11-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Use the checked maintenance CLI
+      - name: Use the source-bound maintenance CLI
         uses: $/.github/actions/use-bonsai-tools
       # Domain regressions (provisioning, builds, promotion and process ownership)
-      # run as native Rust tests in the CLI producer before this handoff.
-      # Dependency crates retain their complete independent maintenance checks.
+      # run in checked-tools alongside these integration checks. Foundation
+      # requires both results and all independent dependency-crate checks.
       - name: Hexagon packed-layout and bounded inventory controls without devices
         shell: pwsh
         run: |
@@ -321,14 +347,14 @@ jobs:
           $result | ConvertTo-Json
   release-integration:
     if: needs.changes.outputs.release == 'true'
-    needs: [changes, checked-tools]
+    needs: [changes, tools-package]
     runs-on: windows-11-arm
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Use the checked maintenance CLI
+      - name: Use the source-bound maintenance CLI
         uses: $/.github/actions/use-bonsai-tools
       - name: Swift assessment policy and pinned ARM64 runtime
         shell: pwsh

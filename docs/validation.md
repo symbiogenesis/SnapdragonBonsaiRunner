@@ -317,18 +317,21 @@ groups remain independent. Planner/gate regressions run first; the tested cached
 executable is handed to aggregation, avoiding a second compiler install/build or Cargo metadata.
 
 The `maintenance` lane owns affected checks for the six supporting maintenance
-crates, including Windows Job tests. The independent `checked-tools` lane owns
-the maintenance CLI's checks and publishes the CLI plus feature-gated Rust
-completion probe. Consumers verify revision, both digests and ARM64 identities;
-lifecycle fixtures retain production headless mitigations. Speech and native
-integration lanes depend on `checked-tools` without waiting for independent
-maintenance, broker or UI checks. The aggregate gate still requires every
-selected lane.
-ASR and TTS use separate lanes. ASR uses the checked CLI to prepare its pinned
+crates, including Windows Job tests. The `tools-package` producer builds and
+publishes the source-bound CLI, numerical reference and feature-gated Rust
+completion probe. Consumers verify the revision, all three digests and ARM64
+identities; lifecycle fixtures retain production headless mitigations. The
+independent `checked-tools` lane owns the complete CLI checks plus numerical,
+retained-audit, row and PE controls. ASR, native integration and release integration
+depend on `tools-package` and run alongside those checks. The aggregate gate
+requires both results and every other selected lane before qualifying Foundation.
+ASR and TTS use separate lanes. ASR uses the source-bound CLI to prepare its pinned
 native compiler environment. Its Cargo cache prefixes also bind the checked
 native build-host hash, and the lane retains that model-free host report.
 TTS compiles entirely as Rust and uses the ordinary lane-specific Cargo cache;
-it has no native static-library cache or compiler-preparation step. Cached
+TTS-only source edits do not select the tools producer or its checks. Embedded
+model lockfile changes still select their CLI consumer. TTS has no native
+static-library cache or compiler-preparation step. Cached
 compiler output never replaces the selected checks or fresh receipts.
 
 Pinned C++ `--version`/`--help` use fixed-command inspection with 512 MiB,

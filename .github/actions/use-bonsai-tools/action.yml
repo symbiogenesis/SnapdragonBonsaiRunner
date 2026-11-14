@@ -1,14 +1,14 @@
-name: Use checked Bonsai tools
-description: Download the current run's checked Windows ARM64 CLI and verify its revision and digest.
+name: Use source-bound Bonsai tools
+description: Download the current run's Windows ARM64 CLI and verify its revision and digest; Foundation independently requires its full checks.
 runs:
   using: composite
   steps:
-    - name: Download the producer job's checked CLI
+    - name: Download the producer job's source-bound CLI
       uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: bonsai-tools-windows-arm64-${{ github.sha }}
         path: ${{ runner.temp }}/SwiftBonsai-CheckedTools
-    - name: Verify and select the checked CLI
+    - name: Verify and select the source-bound CLI
       shell: pwsh
       working-directory: ${{ runner.temp }}
       run: |
@@ -24,7 +24,7 @@ runs:
             $receipt.Sha256 -cne (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() -or
             $receipt.NumericSha256 -cne (Get-FileHash -LiteralPath $numeric -Algorithm SHA256).Hash.ToLowerInvariant() -or
             $receipt.ProbeSha256 -cne (Get-FileHash -LiteralPath $probe -Algorithm SHA256).Hash.ToLowerInvariant()) {
-          throw 'Checked maintenance CLI revision or digest differs.'
+          throw 'Source-bound maintenance CLI revision or digest differs.'
         }
         & $tool artifact --json (@{ operation = 'arm64'; path = $tool } | ConvertTo-Json -Compress) | Out-Null
         & $tool artifact --json (@{ operation = 'arm64'; path = $probe } | ConvertTo-Json -Compress) | Out-Null

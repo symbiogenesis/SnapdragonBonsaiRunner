@@ -415,7 +415,7 @@ fn runner_ci_native_ui_uses_dedicated_lane_without_maintenance() -> TestResult {
 }
 
 #[test]
-fn runner_ci_speech_selects_checked_tools_without_unrelated_lanes() -> TestResult {
+fn runner_ci_only_asr_selects_checked_tools_without_unrelated_lanes() -> TestResult {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     for (package, lane) in [("asr", "speech_asr"), ("tts", "speech_tts")] {
@@ -427,9 +427,10 @@ fn runner_ci_speech_selects_checked_tools_without_unrelated_lanes() -> TestResul
             "changed inputs",
         )?;
         assert_eq!(plan.packages, [format!("bonsai-speech-{package}")]);
-        for group in [lane, "speech", "tools"] {
+        for group in [lane, "speech"] {
             assert!(plan.groups[group], "{package}: {group}");
         }
+        assert_eq!(plan.groups["tools"], package == "asr", "{package}");
         for group in [
             "broker_checks",
             "ui",
@@ -525,7 +526,13 @@ fn runner_ci_gate_requires_independent_maintenance_cli_and_speech_results() -> T
         needs[job] = json!({"result": "success"});
     }
     assert_eq!(gate::failures(&needs, jobs), Vec::<String>::new());
-    for job in ["maintenance", "checked-tools", "speech"] {
+    for job in [
+        "maintenance",
+        "tools-package",
+        "checked-tools",
+        "speech",
+        "speech-tts",
+    ] {
         for result in ["skipped", "failure", "cancelled"] {
             needs[job]["result"] = json!(result);
             assert!(!gate::failures(&needs, jobs).is_empty(), "{job}: {result}");
@@ -545,6 +552,7 @@ fn runner_ci_dependency_checks_remain_independent_of_cli_production() -> TestRes
         assert!(plan.groups["maintenance"] && plan.groups["tools"], "{path}");
     }
     assert_eq!(config["workflows"]["foundation"]["checked-tools"], "tools");
+    assert_eq!(config["workflows"]["foundation"]["tools-package"], "tools");
     Ok(())
 }
 
