@@ -18,6 +18,15 @@ use bonsai_windows_process::{
     available_memory_bytes, listener_process_id, native_sandbox_available,
 };
 
+// Hosted packages retain the exact probe next to their checked test binaries.
+// The native qualifier verifies/holds this path through all six controls; normal
+// source tests keep Cargo's own compiled executable selection.
+fn probe_executable() -> PathBuf {
+    std::env::var_os("BONSAI_SANDBOX_PROBE_PATH").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_bonsai-process-test-probe")),
+        PathBuf::from,
+    )
+}
 const TIMEOUT: Duration = Duration::from_secs(10);
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -38,7 +47,7 @@ impl Lane {
 
     fn spec(&self, arguments: Vec<OsString>) -> ProcessSpec {
         ProcessSpec {
-            executable: PathBuf::from(env!("CARGO_BIN_EXE_bonsai-process-test-probe")),
+            executable: probe_executable(),
             arguments,
             working_directory: self.path.clone(),
             stdout: self.path.join("stdout.log"),
@@ -511,7 +520,7 @@ fn background_tool_job_lowers_root_and_nested_descendant_priority() -> io::Resul
     use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
 
     let control = Lane::new("priority-control")?;
-    let status = Command::new(env!("CARGO_BIN_EXE_bonsai-process-test-probe"))
+    let status = Command::new(probe_executable())
         .arg("priority-report")
         .current_dir(&control.path)
         .creation_flags(0x0800_0000)
@@ -638,7 +647,7 @@ fn active_process_limit_blocks_descendants() -> io::Result<()> {
 #[test]
 fn headless_mitigations_apply_at_creation_without_changing_tool_policy() -> io::Result<()> {
     let control = Lane::new("mitigation-control")?;
-    let status = Command::new(env!("CARGO_BIN_EXE_bonsai-process-test-probe"))
+    let status = Command::new(probe_executable())
         .arg("mitigations")
         .current_dir(&control.path)
         .creation_flags(0x0800_0000)
@@ -697,7 +706,7 @@ fn headless_mitigations_apply_at_creation_without_changing_tool_policy() -> io::
 #[test]
 fn inspection_keeps_non_win32k_mitigations_and_rejects_worker_arguments() -> io::Result<()> {
     let control = Lane::new("inspection-control")?;
-    let status = Command::new(env!("CARGO_BIN_EXE_bonsai-process-test-probe"))
+    let status = Command::new(probe_executable())
         .arg("--version")
         .current_dir(&control.path)
         .creation_flags(0x0800_0000)
@@ -774,7 +783,7 @@ fn committed_memory_limit_denies_allocations() -> io::Result<()> {
 fn abrupt_owner_death_kills_entire_tree() -> io::Result<()> {
     let lane = Lane::new("owner-death")?;
     let port = unused_port()?;
-    let mut owner = Command::new(env!("CARGO_BIN_EXE_bonsai-process-test-probe"))
+    let mut owner = Command::new(probe_executable())
         .args(["owner", &port.to_string()])
         .current_dir(&lane.path)
         .creation_flags(0x0800_0000)
@@ -796,7 +805,7 @@ fn native_sandbox_abrupt_owner_death_ends_worker_and_listener() -> io::Result<()
     native_sandbox_available()?;
     let lane = Lane::new("sandbox-owner-death")?;
     let port = unused_port()?;
-    let mut owner = Command::new(env!("CARGO_BIN_EXE_bonsai-process-test-probe"))
+    let mut owner = Command::new(probe_executable())
         .args(["sandbox-owner", &port.to_string()])
         .current_dir(&lane.path)
         .creation_flags(0x0800_0000)
@@ -857,7 +866,7 @@ fn native_sandbox_abrupt_owner_death_ends_worker_and_listener() -> io::Result<()
 #[test]
 fn backend_overrides_are_rejected_without_changing_parent_environment() -> io::Result<()> {
     let lane = Lane::new("environment")?;
-    let status = Command::new(env!("CARGO_BIN_EXE_bonsai-process-test-probe"))
+    let status = Command::new(probe_executable())
         .args(["owner", &unused_port()?.to_string()])
         .env("LLAMA_TEST_OVERRIDE", "1")
         .current_dir(&lane.path)
@@ -894,7 +903,7 @@ fn active_standard_evidence_allows_readers_and_rejects_other_writers() -> io::Re
 #[test]
 fn headless_error_policy_applies_to_root_and_descendants_only() -> io::Result<()> {
     let lane = Lane::new("error-policy")?;
-    let status = Command::new(env!("CARGO_BIN_EXE_bonsai-process-test-probe"))
+    let status = Command::new(probe_executable())
         .arg("error-policy-owner")
         .current_dir(&lane.path)
         .creation_flags(0x0800_0000)

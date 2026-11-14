@@ -44,6 +44,7 @@ fn startup_command(command: &str, request: &serde_json::Value) -> bool {
         command,
         "source-build"
             | "acceptance-driver"
+            | "sandbox-qualification"
             | "chat-launch"
             | "chat-prepare"
             | "hexagon-tools"
@@ -198,6 +199,7 @@ fn dispatch(command: &str, request: serde_json::Value) -> bonsai_tools::Result<s
         "acceptance-driver" => bonsai_tools::acceptance_driver::run(&request),
         "release-package" => bonsai_tools::release_package::run(request),
         "ci-report" => bonsai_tools::ci_report::run(request),
+        "sandbox-qualification" => bonsai_tools::sandbox_qualification::run(&request),
         "startup-diagnostics" => bonsai_tools::startup_diagnostics::run(request),
         _ => Err("Unknown maintenance command.".into()),
     }

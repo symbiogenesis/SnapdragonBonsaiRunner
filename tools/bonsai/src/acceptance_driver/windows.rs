@@ -237,6 +237,25 @@ fn supervise(
     result
 }
 
+pub(super) fn supervised_tool(
+    executable: &Path,
+    arguments: Vec<OsString>,
+    working: &Path,
+    environment: BTreeMap<String, String>,
+    deadline: u64,
+    frequency: u64,
+) -> crate::Result<(i32, String, String)> {
+    let result = supervise(
+        executable,
+        arguments,
+        working,
+        environment,
+        deadline,
+        frequency,
+    )?;
+    Ok((result.code, result.stdout, result.stderr))
+}
+
 fn selected_bridge(limits: &Value, snapshot: u64, frequency: u64) -> crate::Result<Bridge> {
     let (now, current_frequency) = ticks()?;
     if frequency != current_frequency {

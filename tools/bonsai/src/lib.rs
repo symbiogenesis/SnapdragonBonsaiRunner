@@ -65,6 +65,7 @@ pub const COMMANDS: &[&str] = &[
     "native-reference",
     "acceptance-driver",
     "ci-report",
+    "sandbox-qualification",
 ];
 
 /// Returns the native maintenance protocol capabilities without reading a request.
@@ -214,6 +215,9 @@ pub mod acceptance_driver;
 
 /// Native source-bound portable packaging and model-free extraction checks.
 pub mod release_package;
+
+/// Hosted prebuilt native sandbox controls and bounded owner qualification.
+pub mod sandbox_qualification;
 
 /// Retained caller identity for cancellation of native startup work.
 pub mod startup_cancel;

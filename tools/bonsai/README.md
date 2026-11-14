@@ -256,6 +256,27 @@ Focused source-only controls are
 inert native process ownership, child-only credential removal and original
 deadline expiry. They execute no model and establish no device qualification.
 
+`sandbox-qualification` moves the six existing capability/process controls into a
+native `prepare` / `qualify` handoff. Hosted preparation selects the exact Cargo
+artifacts, packages five ARM64 executables, and publishes a schema-1 source/run
+and digest receipt. Qualification builds nothing: it holds the complete package,
+admits every required case before execution, supervises the complete child tree,
+and requires one exact positive libtest summary per selected case. The original
+300-second job clock includes download, intake, inventories, separate per-case
+power observations, cleanup and evidence; inherited owner clocks can only shorten
+it. The fixed conservative estimate is 240 seconds total: 180 seconds across
+the six case estimates and sixty for intake, inventories, power, cleanup and
+evidence. Each case's estimate covers its fixed native wait controls; the sum of
+the remaining estimates must fit before starting another arm. The workflow's hosted
+preparation/execution caps sum to the original thirty minutes; owner execution
+keeps five minutes. Execution reports use schema 2 and explicitly retain unknown
+pre-bootstrap power. Historical schema-1 reports retain their original meaning.
+Focused source controls use
+`cargo test --offline -p bonsai-tools --lib sandbox_qualification::tests::`;
+`cargo check --offline -p bonsai-windows-process --features test-probe --test ownership`
+checks the staged-probe adapter without running the ignored sandbox workload.
+These controls establish neither actual-device nor hosted workflow qualification.
+
 `pe-closure` audits ARM64 PE files without loading them. Supply `bundleDirectory`
 and `systemDirectory`; omitted/null `aliases` reads `apisetschema.dll`. It follows
 candidate normal/delay imports and recursive system normal imports, rejects GUI

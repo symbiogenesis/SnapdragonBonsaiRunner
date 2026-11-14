@@ -251,6 +251,26 @@ pub fn run(request: &Value) -> crate::Result<Value> {
     }
 }
 
+/// Shared contained native execution for source-bound qualification packages.
+#[cfg(windows)]
+pub(crate) fn supervised_tool(
+    executable: &std::path::Path,
+    arguments: Vec<std::ffi::OsString>,
+    working: &std::path::Path,
+    environment: std::collections::BTreeMap<String, String>,
+    deadline: u64,
+    frequency: u64,
+) -> crate::Result<(i32, String, String)> {
+    windows::supervised_tool(
+        executable,
+        arguments,
+        working,
+        environment,
+        deadline,
+        frequency,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
