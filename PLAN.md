@@ -129,11 +129,14 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify automatic startup/15-minute release discovery, conditional metadata
   requests, compression, server-directed backoff and manual checks. Cover paginated
   numeric/prerelease selection, incomplete/no-release/network failures, changed
-  publication and tampered staging/original bytes. Verify background download,
-  one prompt per verified release, Later and the Settings badge, deferred replacement
-  on close without reopening, explicit replacement/restart, close during download
-  or generation, renamed executables, original options, read-only targets, sharing
-  exhaustion, restart failure, data preservation and rollback; source and preview
+  publication and tampered staging/original bytes. Verify compact Settings with
+  one action per update state, background download and a nonmodal restart nudge
+  that preserves typing and generation. Qualify one shared confirmation only after
+  initiating restart, cancellation without approval, Later and the Settings badge,
+  deferred replacement on close without reopening, explicit replacement/restart,
+  close during download or generation, renamed executables, original options,
+  read-only targets, sharing exhaustion, restart failure, data preservation and
+  rollback; source and preview
   launches must stay silent. See [update behavior](docs/releases.md#update-and-remove).
 
 ## Application and daily service

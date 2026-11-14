@@ -60,11 +60,19 @@ older versions. An incomplete catalog or invalid newest release fails without
 falling back. Conditional requests reuse unchanged metadata; failures honor
 server backoff and never count as successful checks.
 
-The app downloads and verifies the asset digest, manifest, checksums and
-tag/source identity before offering an update. Install now closes, replaces and
-reopens the app with its original options and data directory. **Later** leaves a
-Settings badge and installs on close without reopening. A verified release prompts
-once per session. Closing before verification finishes exits without replacement.
+Settings shows the current version, update status and one relevant action without
+opening another settings area. The app downloads and verifies the asset digest,
+manifest, checksums and tag/source identity in the background. A quiet nudge offers
+**Restart to update** and **Later** while typing and generation continue. The
+Settings badge also shows that an update is ready.
+
+Choosing **Restart to update** from the nudge or Settings opens one confirmation
+popup. **Restart and update** closes, replaces and reopens the app with its original
+options and data directory; **Cancel** leaves it running without authorizing an
+installation. **Later** dismisses the nudge for that verified release during the
+session, keeps the Settings badge and installs on close without reopening. No
+confirmation appears automatically when a download finishes. Closing before
+verification finishes exits without replacement.
 
 Replacement requires confirmed process teardown and revalidated publication.
 Download or replacement failure preserves the existing executable. If restart

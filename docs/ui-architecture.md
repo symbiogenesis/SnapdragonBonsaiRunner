@@ -133,10 +133,12 @@ releases prompt capacity; only a fresh launch/Retry can change selected memory c
 
 Current-source portable builds check GitHub after startup and every 15 minutes and automatically
 download the highest newer numeric version, including published prereleases.
-The native Settings view also accepts a manual check. Discovery exhausts at most
-three pages of 100 releases; a full final page fails explicitly because catalog
-completeness is unknown. Drafts are excluded, and invalid newest assets never
-cause fallback. GitHub SHA-256 identities, the release manifest, checksum inventory
+The native Settings view shows the version, update status and one action for the
+current state: check, download/retry or restart to update. It opens no additional
+settings area. Discovery exhausts at most three pages of 100 releases; a full
+final page fails explicitly because catalog completeness is unknown. Drafts are
+excluded, and invalid newest assets never cause fallback. GitHub SHA-256
+identities, the release manifest, checksum inventory
 and tag/source revision must agree before download or use.
 
 Metadata requests use the shared native Rust HTTPS client with Windows Schannel,
@@ -158,12 +160,17 @@ Network and HTTP failures persist an exponential cooldown across helper processe
 honoring `Retry-After` and exhausted GitHub rate-limit reset instructions. Failed
 requests never fall back to cached success or immediately retry.
 
-After the download is verified, a native prompt offers immediate installation or
-**Later**. Later dismisses the prompt for that verified release during the session
-and leaves a pending-update badge on the bottom-left Settings button. Downloads
-do not depend on acceptance. Immediate installation closes and reopens Swift;
-closing with a deferred verified portable update replaces the executable and
-leaves the app closed. Closing during an unfinished download exits normally.
+After the download is verified, a nonmodal nudge offers **Restart to update** or
+**Later** without interrupting typing or generation. A pending-update badge stays
+on the bottom-left Settings button. Choosing restart from the nudge or Settings
+opens one shared native confirmation popup; **Restart and update** authorizes
+immediate installation, while **Cancel** leaves the app running without authorizing
+installation. Confirmation never opens automatically after a background check or
+download. Later dismisses the nudge for that verified release during the session
+and defers installation until normal close. Downloads do not depend on acceptance.
+Immediate installation closes and reopens Swift; closing with a deferred verified
+portable update replaces the executable and leaves the app closed. Closing during
+an unfinished download exits normally.
 
 Replacing the executable requires the current verified release and successful
 owned model, speech and UI teardown. Explicit immediate installation or a normal
@@ -181,9 +188,11 @@ failure leaves the updated executable available for manual launch.
 Models, runtime downloads, conversations and preferences stay separate.
 Source and preview launches start no update discovery or installer work.
 
-MSI operations are an optional distribution path. They require explicit
-confirmation, fresh publication/staged-byte verification, successful teardown
-and the dedicated update exit. A leftover queue or ordinary close cannot install.
+MSI operations are an optional distribution path. Settings offers download before
+installation and uses the shared confirmation popup with **Close and install**.
+MSI installation requires explicit confirmation, fresh publication/staged-byte
+verification, successful teardown and the dedicated update exit. A leftover queue
+or ordinary close cannot install.
 Installed upgrade/rollback acceptance is independent of portable updates.
 
 ### Conversation and failure semantics
