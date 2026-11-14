@@ -970,6 +970,46 @@ impl Write for Interruptible<'_> {
     }
 }
 
+fn connect_interruptible(
+    address: SocketAddr,
+    connect_timeout: Duration,
+    commands: &Receiver<Command>,
+) -> Result<TcpStream> {
+    check_commands(commands)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if thread::Builder::new()
+        .name("chat-connect".into())
+        .spawn(move || {
+            let _sent = sender.send(TcpStream::connect_timeout(&address, connect_timeout));
+        })
+        .is_err()
+    {
+        let connected = TcpStream::connect_timeout(&address, connect_timeout);
+        check_commands(commands)?;
+        return connected.map_err(|_| {
+            Failure::Message("Could not connect to the model service on this computer.")
+        });
+    }
+    loop {
+        check_commands(commands)?;
+        match receiver.recv_timeout(IO_POLL) {
+            Ok(connected) => {
+                check_commands(commands)?;
+                return connected.map_err(|_| {
+                    Failure::Message("Could not connect to the model service on this computer.")
+                });
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                check_commands(commands)?;
+                return Err(Failure::Message(
+                    "Could not connect to the model service on this computer.",
+                ));
+            }
+        }
+    }
+}
+
 fn generate(
     port: u16,
     key: &str,
@@ -980,11 +1020,8 @@ fn generate(
     check_commands(commands)?;
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let connect_timeout = Duration::from_secs(1);
-    let connected = TcpStream::connect_timeout(&address, connect_timeout);
+    let stream = connect_interruptible(address, connect_timeout, commands)?;
     check_commands(commands)?;
-    let stream = connected.map_err(|_| {
-        Failure::Message("Could not connect to the model service on this computer.")
-    })?;
     let _nodelay = stream.set_nodelay(true);
     stream
         .set_nonblocking(true)
@@ -1035,6 +1072,7 @@ fn exchange(
             Ok(())
         })?;
     }
+    check_commands(commands)?;
     let completion = sse.finish()?;
     let (text, reasoning) = sse.into_answer();
     Ok((

@@ -147,7 +147,7 @@ pub(super) fn sentence_boundary(text: &str, limit: usize, complete: bool) -> Opt
 }
 
 /// Unicode mandatory line breaks (UAX #14 classes BK, CR, LF and NL).
-const fn line_break(character: char) -> bool {
+pub(super) const fn line_break(character: char) -> bool {
     matches!(
         character,
         '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
@@ -186,11 +186,11 @@ fn include_non_speakable_tail(text: &str, limit: usize, end: usize, complete: bo
     }
 }
 
-const fn is_sentence_punctuation(character: char) -> bool {
+pub(super) const fn is_sentence_punctuation(character: char) -> bool {
     matches!(character, '.' | '!' | '?' | '…' | '。' | '！' | '？')
 }
 
-const fn is_closing_delimiter(character: char) -> bool {
+pub(super) const fn is_closing_delimiter(character: char) -> bool {
     matches!(
         character,
         '"' | '\''

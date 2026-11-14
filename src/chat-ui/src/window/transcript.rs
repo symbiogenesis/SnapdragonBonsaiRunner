@@ -783,7 +783,7 @@ impl Message {
             text_size,
             ui.visuals(),
             matches,
-            self.markdown.parsed(),
+            self.markdown.parsed_for(&self.body),
         );
         (
             ui.fonts_mut(|fonts| fonts.layout_job(layout.job)),

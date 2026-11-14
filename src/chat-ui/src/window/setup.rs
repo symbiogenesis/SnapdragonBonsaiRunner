@@ -253,14 +253,28 @@ impl State {
         }
     }
 
-    pub(super) fn speech_setup_error_actions(&mut self, ui: &mut egui::Ui, error: &str) {
-        let retry = self.can_retry_speech_setup() && cleanup_known(error);
+    fn speech_setup_retry_button(&mut self, ui: &mut egui::Ui, retry: bool) {
         if ui
             .add_enabled(retry, egui::Button::new("Retry speech setup"))
             .clicked()
         {
             self.retry_speech_setup();
         }
+    }
+
+    pub(super) fn speech_setup_current_error_actions(&mut self, ui: &mut egui::Ui) {
+        let retry = self.can_retry_speech_setup()
+            && self
+                .setup
+                .speech_error
+                .as_deref()
+                .is_some_and(cleanup_known);
+        self.speech_setup_retry_button(ui, retry);
+    }
+
+    pub(super) fn speech_setup_error_actions(&mut self, ui: &mut egui::Ui, error: &str) {
+        let retry = self.can_retry_speech_setup() && cleanup_known(error);
+        self.speech_setup_retry_button(ui, retry);
     }
 }
 

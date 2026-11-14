@@ -39,7 +39,7 @@ pub(super) fn summary(ui: &mut egui::Ui, message: &str) {
 pub(super) fn copy_button(ui: &mut egui::Ui, label: &str, message: &str) {
     let id = ui.make_persistent_id(("error-copy", label));
     super::controls::CopyButton::new(label, id)
-        .source(egui::Id::unique(message))
+        .source(egui::Id::unique("alert-copy"))
         .show(ui, || message.to_owned())
         .on_hover_text("Copy the complete message, including details beyond the preview.");
 }
@@ -249,17 +249,19 @@ impl State {
                         }
                     });
                     self.alerts.selection = Some(selected);
-                    let (message, error) = self.alert_text(selected);
-                    summary(ui, message);
-                    let error = error.to_owned();
+                    {
+                        let (message, _) = self.alert_text(selected);
+                        summary(ui, message);
+                    }
                     ui.push_id(selected, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            self.alert_actions(ui, selected, &error);
+                            self.alert_actions(ui, selected);
                             if ui.button("View details").clicked() {
                                 self.alerts.details = Some(selected);
                                 self.focus_composer = false;
                             }
-                            copy_button(ui, "Copy error", &error);
+                            let (_, error) = self.alert_text(selected);
+                            copy_button(ui, "Copy error", error);
                         });
                     });
                 });
@@ -267,7 +269,7 @@ impl State {
         ui.add_space(8.0);
     }
 
-    fn alert_actions(&mut self, ui: &mut egui::Ui, kind: AlertKind, error: &str) {
+    fn alert_actions(&mut self, ui: &mut egui::Ui, kind: AlertKind) {
         match kind {
             AlertKind::Setup => self.setup_error_actions(ui),
             AlertKind::Model => {
@@ -275,7 +277,7 @@ impl State {
                     self.retry();
                 }
             }
-            AlertKind::SpeechSetup => self.speech_setup_error_actions(ui, error),
+            AlertKind::SpeechSetup => self.speech_setup_current_error_actions(ui),
             AlertKind::AudioFile => self.audio_file_error_actions(ui),
             AlertKind::Update => {
                 if ui.button("Application settings").clicked() {

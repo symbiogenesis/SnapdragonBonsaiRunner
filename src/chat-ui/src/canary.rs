@@ -30,6 +30,7 @@ const MAX_WAVE_RESPONSE: usize = 5_760_044;
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_TEXT: usize = 32768;
 const IO_POLL: Duration = Duration::from_millis(250);
+const CONNECT_POLL: Duration = Duration::from_millis(50);
 const READY_LIMIT: Duration = Duration::from_secs(5);
 const TRANSCRIBE_LIMIT: Duration = Duration::from_mins(2);
 
@@ -307,8 +308,7 @@ impl Client {
         };
         let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port));
         let timeout = IO_POLL.min(call.until.saturating_duration_since(Instant::now()));
-        let mut stream = TcpStream::connect_timeout(&address, timeout)
-            .map_err(|_| Failure::Message("Could not connect to the local Qwen3-ASR companion."))?;
+        let mut stream = connect_cancellable(address, timeout, call)?;
         call.check()?;
         stream
             .set_nodelay(true)
@@ -632,6 +632,42 @@ fn write_all_vectored(
         }
     }
     call.check()
+}
+
+fn connect_cancellable(address: SocketAddr, limit: Duration, call: &Call<'_>) -> Result<TcpStream> {
+    call.check()?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("canary-connect".into())
+        .spawn(move || {
+            let _sent = sender.send(TcpStream::connect_timeout(&address, limit));
+        })
+        .is_err()
+    {
+        let stream = TcpStream::connect_timeout(&address, limit)
+            .map_err(|_| Failure::Message("Could not connect to the local Qwen3-ASR companion."))?;
+        call.check()?;
+        return Ok(stream);
+    }
+    loop {
+        call.check()?;
+        let step = CONNECT_POLL.min(call.until.saturating_duration_since(Instant::now()));
+        match receiver.recv_timeout(step) {
+            Ok(result) => {
+                call.check()?;
+                return result.map_err(|_| {
+                    Failure::Message("Could not connect to the local Qwen3-ASR companion.")
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                call.check()?;
+                return Err(Failure::Message(
+                    "Could not connect to the local Qwen3-ASR companion.",
+                ));
+            }
+        }
+    }
 }
 
 fn read(stream: &mut TcpStream, bytes: &mut [u8], call: &Call<'_>) -> Result<usize> {

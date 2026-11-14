@@ -10,7 +10,7 @@ fn render(source: &str, matches: &[search::Match]) -> Layout {
         16.0,
         &egui::Visuals::dark(),
         matches,
-        Some(&parsed),
+        Some((&parsed, source.len())),
     )
 }
 
@@ -215,4 +215,41 @@ fn markdown_theme_changes_invalidate_only_assistant_layouts() {
     chat.run();
     assert_eq!(chat.state().messages[0].body_layouts, before[0]);
     assert_eq!(chat.state().messages[1].body_layouts, before[1] + 1);
+}
+
+#[test]
+fn markdown_streaming_prefix_retains_formatted_prefix_and_renders_plain_tail() {
+    let prefix = "# Title\n\nUse **bold** ";
+    let full = "# Title\n\nUse **bold** and *italic* tail";
+    let parsed = parse_layout(prefix);
+    let bold_start = full.find("bold").unwrap_or_default();
+    let tail_start = full.find("tail").unwrap_or_default();
+    let matches = [
+        search::Match {
+            message: 1,
+            range: bold_start..bold_start + 4,
+        },
+        search::Match {
+            message: 1,
+            range: tail_start..tail_start + 4,
+        },
+    ];
+    let layout = layout_job(
+        full,
+        true,
+        600.0,
+        16.0,
+        &egui::Visuals::dark(),
+        &matches,
+        Some((&parsed, prefix.len())),
+    );
+    assert_eq!(layout.job.text, "Title\n\nUse bold and *italic* tail");
+    let bold_display = layout.source_map.range(bold_start..bold_start + 4);
+    let tail_display = layout.source_map.range(tail_start..tail_start + 4);
+    assert_eq!(layout.job.text.get(bold_display), Some("bold"));
+    assert_eq!(layout.job.text.get(tail_display), Some("tail"));
+    for pair in layout.source_map.entries.windows(2) {
+        assert!(pair[0].source.end <= pair[1].source.start);
+        assert!(pair[0].display.end <= pair[1].display.start);
+    }
 }

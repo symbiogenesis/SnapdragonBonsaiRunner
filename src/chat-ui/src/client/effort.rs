@@ -121,6 +121,7 @@ fn run_with(
         ));
     }
 
+    check_commands(commands)?;
     notify(events, Event::Stage(DRAFT))?;
     let request = stage_request(
         pending,

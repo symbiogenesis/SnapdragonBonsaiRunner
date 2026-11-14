@@ -148,26 +148,56 @@ pub(super) fn layout_job(
     text_size: f32,
     visuals: &egui::Visuals,
     matches: &[search::Match],
-    parsed: Option<&Layout>,
+    parsed: Option<(&Layout, usize)>,
 ) -> Layout {
     let normal =
         egui::TextFormat::simple(egui::FontId::proportional(text_size), visuals.text_color());
-    let Some(parsed) = parsed.filter(|_| structured) else {
+    let Some((parsed, prefix_len)) = parsed.filter(|_| structured) else {
         return plain(body, width, normal, visuals, matches);
     };
-    if matches
-        .iter()
-        .any(|found| !parsed.source_map.exact_match(&found.range))
-    {
+    if prefix_len > body.len() || !body.is_char_boundary(prefix_len) {
+        return plain(body, width, normal, visuals, matches);
+    }
+    let tail_start = if prefix_len < body.len() {
+        let mapped_end = parsed
+            .source_map
+            .entries
+            .last()
+            .map_or(0, |entry| entry.source.end);
+        let trailing_ws = body[mapped_end.min(prefix_len)..prefix_len]
+            .bytes()
+            .rev()
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        let emitted_ws = parsed
+            .job
+            .text
+            .bytes()
+            .rev()
+            .take(trailing_ws)
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        prefix_len - (trailing_ws - emitted_ws)
+    } else {
+        prefix_len
+    };
+    if matches.iter().any(|found| {
+        if found.range.end <= tail_start {
+            !parsed.source_map.exact_match(&found.range)
+        } else {
+            found.range.start < tail_start
+        }
+    }) {
         return plain(body, width, normal, visuals, matches);
     }
     let highlights: Vec<_> = matches
         .iter()
+        .filter(|found| found.range.end <= tail_start)
         .map(|found| parsed.source_map.range(found.range.clone()))
         .collect();
     let template = egui::Visuals::dark();
     let mut job = egui::text::LayoutJob {
-        text: String::with_capacity(parsed.job.text.len()),
+        text: String::with_capacity(parsed.job.text.len() + (body.len() - tail_start)),
         ..Default::default()
     };
     job.wrap.max_width = width;
@@ -212,8 +242,46 @@ pub(super) fn layout_job(
             cursor = until;
         }
     }
-    Layout {
-        job,
-        source_map: Arc::clone(&parsed.source_map),
-    }
+    let source_map = if tail_start < body.len() {
+        let tail_display_start = job.text.len();
+        let mut cursor = tail_start;
+        for found in matches
+            .iter()
+            .filter(|found| found.range.start >= tail_start)
+        {
+            if cursor < found.range.start {
+                job.append(&body[cursor..found.range.start], 0.0, normal.clone());
+            }
+            let mut highlighted = normal.clone();
+            highlighted.background = visuals.selection.bg_fill;
+            highlighted.color = visuals.selection.stroke.color;
+            job.append(&body[found.range.clone()], 0.0, highlighted);
+            cursor = found.range.end;
+        }
+        if cursor < body.len() {
+            job.append(&body[cursor..], 0.0, normal);
+        }
+        let mut entries: Vec<Mapping> = parsed
+            .source_map
+            .entries
+            .iter()
+            .map(|entry| Mapping {
+                source: entry.source.clone(),
+                display: entry.display.clone(),
+                verbatim: entry.verbatim,
+            })
+            .collect();
+        entries.push(Mapping {
+            source: tail_start..body.len(),
+            display: tail_display_start..job.text.len(),
+            verbatim: true,
+        });
+        Arc::new(SourceMap {
+            entries,
+            display_bytes: job.text.len(),
+        })
+    } else {
+        Arc::clone(&parsed.source_map)
+    };
+    Layout { job, source_map }
 }

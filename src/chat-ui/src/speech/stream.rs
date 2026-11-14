@@ -1,6 +1,8 @@
 //! Unicode-safe incremental speech segmentation with a bounded text lifetime.
 
-use super::segmentation::{self, horizontal_whitespace};
+use super::segmentation::{
+    self, horizontal_whitespace, is_closing_delimiter, is_sentence_punctuation, line_break,
+};
 use super::{Duration, Instant, MAX_TEXT, VecDeque};
 
 const LATENCY: Duration = Duration::from_millis(700);
@@ -11,8 +13,28 @@ pub(super) struct Text {
     units: usize,
     since: Option<Instant>,
     pub(super) finished: bool,
+    scanned_ws: usize,
+    scanned_bytes: usize,
+    scanned_chars: usize,
     #[cfg(test)]
     compacted_bytes: usize,
+    #[cfg(test)]
+    scanned_checks: usize,
+}
+
+fn safe_scan_end(pending: &str, min_offset: usize) -> usize {
+    let mut end = pending.len();
+    while end > min_offset {
+        let Some(ch) = pending[min_offset..end].chars().next_back() else {
+            break;
+        };
+        if is_sentence_punctuation(ch) || is_closing_delimiter(ch) || ch == '\r' {
+            end -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
 }
 
 impl Text {
@@ -28,7 +50,7 @@ impl Text {
         // The fallback is an idle timeout, not a periodic word-fragment timer.
         // Keep collecting a continuous clause until punctuation or MAX_SEGMENT
         // releases it; otherwise each brief fragment restarts model synthesis.
-        if !text.is_empty() && !self.pending.trim().is_empty() {
+        if !text.is_empty() && (self.since.is_some() || !text.trim().is_empty()) {
             self.since = Some(now);
         }
         Ok(())
@@ -45,6 +67,37 @@ impl Text {
         let expired = self
             .since
             .is_some_and(|since| now.duration_since(since) >= LATENCY);
+        if !self.finished && !expired && self.since.is_some() {
+            let ws_start = if self.scanned_bytes > 0 {
+                self.scanned_ws
+            } else {
+                self.pending.len() - self.pending.trim_start_matches(horizontal_whitespace).len()
+            };
+            let resume = self.scanned_bytes.max(ws_start);
+            let tail = &self.pending[resume..];
+            #[cfg(test)]
+            {
+                self.scanned_checks += tail.len();
+            }
+            if !tail
+                .chars()
+                .any(|ch| line_break(ch) || is_sentence_punctuation(ch))
+            {
+                let tail_chars = tail.chars().count();
+                if self.scanned_chars + tail_chars <= super::MAX_SEGMENT {
+                    let safe_end = safe_scan_end(&self.pending, ws_start);
+                    if safe_end > resume {
+                        self.scanned_chars += self.pending[resume..safe_end].chars().count();
+                        self.scanned_bytes = safe_end;
+                    } else if self.scanned_bytes == 0 {
+                        self.scanned_bytes = ws_start;
+                        self.scanned_chars = 0;
+                    }
+                    self.scanned_ws = ws_start;
+                    return;
+                }
+            }
+        }
         let mut consumed = 0;
         let mut emitted = false;
         loop {
@@ -54,6 +107,10 @@ impl Text {
             consumed = self.pending.len() - pending.len();
             if !self.finished && pending.trim().is_empty() {
                 break;
+            }
+            #[cfg(test)]
+            {
+                self.scanned_checks += pending.len();
             }
             let maximum = segmentation::maximum(pending);
             let limit = maximum.unwrap_or(pending.len());
@@ -99,6 +156,9 @@ impl Text {
         if consumed == self.pending.len() {
             self.pending.clear();
             self.since = None;
+            self.scanned_ws = 0;
+            self.scanned_bytes = 0;
+            self.scanned_chars = 0;
         } else {
             if consumed > 0 {
                 #[cfg(test)]
@@ -106,9 +166,20 @@ impl Text {
                     self.compacted_bytes += self.pending.len() - consumed;
                 }
                 self.pending.drain(..consumed);
+                self.scanned_ws = 0;
+                self.scanned_bytes = 0;
+                self.scanned_chars = 0;
             }
             if emitted {
                 self.since = Some(now);
+            }
+            if !self.finished && !expired && self.since.is_some() && !self.pending.is_empty() {
+                let ws_start = self.pending.len()
+                    - self.pending.trim_start_matches(horizontal_whitespace).len();
+                let safe_end = safe_scan_end(&self.pending, ws_start);
+                self.scanned_ws = ws_start;
+                self.scanned_bytes = safe_end;
+                self.scanned_chars = self.pending[ws_start..safe_end].chars().count();
             }
         }
     }
@@ -600,6 +671,29 @@ mod tests {
         assert_eq!(text.ready(now), ["… Well, let's continue."]);
         text.finished = true;
         assert!(text.ready(now).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_clause_buffering_avoids_quadratic_rescan() -> Result<(), &'static str> {
+        let now = Instant::now();
+        let mut text = Text::default();
+        let mut appended_bytes = 0_usize;
+        // Stream many small fragments without sentence breaks below MAX_SEGMENT.
+        for _ in 0..45 {
+            let chunk = "ab ";
+            appended_bytes += chunk.len();
+            text.append(chunk, now)?;
+            assert!(text.ready(now).is_empty());
+        }
+        assert!(
+            text.scanned_checks <= appended_bytes * 2,
+            "expected linear incremental scans ({} <= {})",
+            text.scanned_checks,
+            appended_bytes * 2
+        );
+        text.finished = true;
+        assert_eq!(text.ready(now).len(), 1);
         Ok(())
     }
 }

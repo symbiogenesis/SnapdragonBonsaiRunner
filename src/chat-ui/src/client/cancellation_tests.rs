@@ -133,3 +133,24 @@ fn owned_broker_teardown_requires_success_before_preserving_attempt_outcome() {
         }
     }
 }
+
+#[test]
+fn connect_interruptible_honors_prequeued_stop_and_shutdown() -> io::Result<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let address = SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        listener.local_addr()?.port(),
+    ));
+    for (command, expected) in [
+        (Command::Stop, Failure::Stopped),
+        (Command::Shutdown, Failure::Shutdown),
+    ] {
+        let (commands, incoming) = mpsc::channel();
+        assert!(commands.send(command).is_ok());
+        assert_eq!(
+            connect_interruptible(address, Duration::from_secs(1), &incoming).err(),
+            Some(expected)
+        );
+    }
+    Ok(())
+}
