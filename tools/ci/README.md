@@ -736,11 +736,11 @@ no source, and an unavailable remote base selects the complete tree.
 A separate temporary Git index materializes each tip without changing the
 owner's index or working files. Unstaged fixes cannot conceal a broken commit.
 
-Normal pushes resolve the ordered checker input identities in one Git command
+Pushes with a valid checker resolve its ordered input identities in one Git command
 and extract only the eight committed checking-policy scripts and their support.
-Preparation still extracts the complete committed build source. The native
-checker groups each tip's selected PowerShell calls into one supervised process,
-invoking each trusted script in a child scope and rejecting a failed call before
+Preparation and automatic recovery extract the complete committed build source.
+The native checker groups each tip's selected PowerShell calls into one supervised
+process, invoking each trusted script in a child scope and rejecting a failed call before
 starting another. Source-language scanning filters whole files with the existing
 expressions before entering per-line diagnostics; PowerShell AST checks and
 multiline Rust resolution checks still inspect their complete inputs.
@@ -768,26 +768,45 @@ dependency audit or benchmark. Foundation retains compilation, analyzers and
 complete tests; this screen does not establish their verdicts.
 
 Prerequisites are native Windows ARM64, PowerShell 7.6+, Git, the pinned Rust
-toolchain and a prepared checker matching the current committed checker inputs.
-Missing prerequisites fail closed. Prepare explicitly in a predeclared source-build
-allowance, with locked dependencies already cached:
+toolchain and prepared source/digest-bound helpers. Missing prerequisites fail
+closed. Initial preparation builds both `bonsai-ci.exe` and
+`bonsai-push-recovery.exe` from committed source. Run it in a predeclared
+source-build allowance under external Rust process-tree supervision, with locked
+dependencies already cached:
 
 ```powershell
 pwsh -NoLogo -NoProfile -File tools/ci/check_push_sanity.ps1 -Prepare
 ```
 
-Preparation selects the explicit Windows ARM64 target and its matching output,
-so inherited Cargo target settings cannot cause an old host binary to be receipted.
-It reads the committed compiler configuration and source from its own
-working directory and records their Git object identities plus the executable
-digest. A push verifies that receipt before executing the helper. Ordinary pushes
-never compile or fetch missing Cargo dependencies. Explicit preparation first
-invalidates its previous receipt; a failed rebuild retains helper bytes without
-admitting them. Explicit preparation is a
-source build whose caller must supervise within the declared allowance; it is not
-an outgoing-tip verdict, an automatic retry or a way to renew an expired clock.
-Owning CI still qualifies the complete preparation/receipt, snapshot and batched
-script controls. Local focused checks do not establish that CI verdict.
+Preparation selects the explicit Windows ARM64 target and matching output paths,
+so inherited Cargo target settings cannot cause old host binaries to be receipted.
+Each receipt records committed Git input identities and the executable digest;
+every helper is verified before execution. The recovery helper's independent
+identity covers the root manifest, lockfile, compiler pin, `.cargo` and
+`src/windows-process`, so ordinary `tools/ci` changes can invalidate the checker
+without invalidating its recovery supervisor. Explicit preparation invalidates
+the previous receipts before building; failure retains helper bytes without
+admitting them. Its caller must enforce the declared source-build allowance.
+
+A missing, stale or corrupt checker or checker receipt triggers one automatic
+recovery attempt. The hook first admits the independently verified recovery helper,
+snapshots committed `HEAD` and removes the invalid checker receipt. The native
+supervisor owns one locked, offline Cargo build and its descendants, with a
+90-second maximum and reserves for the remaining checks and cleanup inside the
+original push allowance. Nightly checksum/content fingerprints reuse incremental
+artifacts across fresh archive paths. A successful build publishes the new checker
+receipt; the hook verifies it and resumes immutable outgoing-tip checks, passing
+all elapsed preparation time into the existing aggregate deadline. A failed build,
+exhausted allowance or unavailable dependency blocks the push without another
+attempt. Missing, stale or corrupt recovery-helper bytes or receipt require
+explicit `-Prepare`; an invalid checker is never used as the recovery authority.
+
+A valid checker keeps the policy-only fast path and does not compile. Recovery
+fetches no Cargo dependencies and cannot renew an expired clock. Neither recovery
+nor explicit preparation supplies an outgoing-tip verdict or authorizes a push.
+Owning CI still qualifies complete preparation and recovery receipts, invalidation,
+shared deadlines, process-tree cleanup, snapshots and batched script controls.
+Local focused checks do not establish that CI verdict.
 `BONSAI_ACTIONLINT_PATH` can supply the reviewed actionlint 1.7.12 executable for
 an offline syntax check. Otherwise, the checker caches its pinned archive under
 `%TEMP%\Bonsai-Actionlint-Cache`, keyed by the compiled archive digest, and fetches
