@@ -423,13 +423,13 @@ impl Updates {
             deferred: false,
             close_requested: false,
             next_check: Instant::now(),
-            status: "Checking for application updates shortly.".into(),
+            status: "Checking for updates shortly…".into(),
             error: None,
         })
     }
 
-    pub(super) const fn available(&self) -> bool {
-        self.version.is_some()
+    pub(super) fn available(&self) -> bool {
+        self.verified_download()
     }
 
     pub(super) fn installing(&self) -> bool {
@@ -465,9 +465,13 @@ impl Updates {
             self.release_identity = None;
         }
         self.version = result.version;
-        self.status = self.version.as_ref().map_or_else(String::new, |version| {
-            format!("Version {version} is available.")
-        });
+        self.status = if self.downloaded {
+            "Update ready to install.".into()
+        } else {
+            self.version.as_ref().map_or_else(String::new, |version| {
+                format!("Version {version} is available.")
+            })
+        };
         self.installation.portable && !self.downloaded
     }
 
@@ -493,9 +497,9 @@ impl Updates {
             Ok(task) => {
                 self.task = Some(task);
                 self.status = match operation {
-                    Operation::Check => "Checking GitHub for updates...",
-                    Operation::Download => "Downloading and verifying the application update...",
-                    Operation::Install => "Preparing the update. The app will close when ready...",
+                    Operation::Check => "Checking for updates…",
+                    Operation::Download => "Downloading update…",
+                    Operation::Install => "Preparing update…",
                 }
                 .into();
             }
@@ -511,6 +515,7 @@ impl Updates {
     pub(super) fn poll(&mut self) -> Option<String> {
         if self.task.is_none()
             && !self.installing()
+            && !self.confirming
             && !self.cleanup_unconfirmed
             && !self.close_requested
             && Instant::now() >= self.next_check
@@ -547,7 +552,7 @@ impl Updates {
                 self.downloaded = false;
                 self.confirming = false;
                 self.deferred = false;
-                self.status = "You are using the latest published version.".into();
+                self.status = "Swift is up to date.".into();
             }
             "no-release" => {
                 self.version = None;
@@ -560,7 +565,7 @@ impl Updates {
             "downloaded" => {
                 self.release_identity = result.release_identity;
                 self.downloaded = true;
-                self.status = "Update verified and ready to install.".into();
+                self.status = "Update ready to install.".into();
             }
             "queued" => {
                 if operation != Operation::Install || !self.confirmed || !self.verified_download() {
@@ -665,27 +670,73 @@ impl Updates {
             && !self.cleanup_unconfirmed
     }
 
-    pub(super) fn notification(&mut self, ctx: &egui::Context) -> bool {
+    /// Background availability never opens a modal or takes keyboard focus.
+    pub(super) fn nudge(&mut self, ui: &mut egui::Ui, can_install: bool) {
+        if !self.notification_pending() || self.confirming {
+            return;
+        }
+        super::controls::notice_frame(ui).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Update ready").strong());
+                if ui
+                    .add_enabled(can_install, update_button(ui, "Restart to update", true))
+                    .on_disabled_hover_text(
+                        "Finish the response and wait for setup or shutdown before restarting.",
+                    )
+                    .clicked()
+                {
+                    self.confirming = true;
+                }
+                if ui
+                    .add(update_button(ui, "Later", false))
+                    .on_hover_text(
+                        "Install this update when you close Swift, without reopening it.",
+                    )
+                    .clicked()
+                {
+                    self.defer();
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+
+    pub(super) const fn confirmation_pending(&self) -> bool {
+        self.confirming
+    }
+
+    pub(super) fn confirmation(&mut self, ctx: &egui::Context, can_install: bool) -> bool {
         let mut install = false;
-        let mut later = false;
+        let mut cancel = false;
         let width = (ctx.content_rect().width() - 64.0).clamp(240.0, 420.0);
+        let idle = self.task.is_none() && !self.installing() && !self.cleanup_unconfirmed;
         let modal = egui::Modal::new(egui::Id::unique("application-update-prompt")).show(ctx, |ui| {
             ui.set_width(width);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            ui.heading("Update ready");
-            ui.label(format!("Swift {} is downloaded and verified.", self.version.as_deref().unwrap_or_default()));
-            ui.label("Update now to restart Swift, or choose Later to install when you close it. Your saving setting still applies.");
+            ui.heading(if self.installation.portable { "Restart to update?" } else { "Close and install update?" });
+            ui.label(format!("Version {} is ready.", self.version.as_deref().unwrap_or_default()));
+            ui.label(if self.installation.portable {
+                "Swift will restart to finish updating. Your data and settings will be kept. Unsaved conversations follow your saving setting."
+            } else {
+                "Swift will close and open the Windows installer. Unsaved conversations follow your saving setting. Windows may ask for administrator approval. Reopen Swift after installation."
+            });
+            if !can_install {
+                ui.label("Finish the response and wait for setup or shutdown before updating.");
+            }
             ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
-                install = ui.add(update_button(ui, "Update and restart", true)).clicked();
-                later = ui.add(update_button(ui, "Later", false)).clicked();
+                let label = if self.installation.portable { "Restart and update" } else { "Close and install" };
+                install = ui.add_enabled(can_install && idle && self.verified_download(), update_button(ui, label, true)).clicked();
+                cancel = ui.add(update_button(ui, "Cancel", false)).clicked();
             });
         });
         if install {
+            self.confirming = false;
             self.notified = true;
             self.confirmed = true;
-        } else if later || modal.should_close() {
-            self.defer();
+        } else if cancel || modal.should_close() {
+            self.confirming = false;
+            self.confirmed = false;
         }
         install
     }
@@ -724,180 +775,75 @@ impl Updates {
             .map(|error| (self.status.as_str(), error))
     }
 
-    fn status_controls(&self, ui: &mut egui::Ui) {
-        status_frame(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                if self.task.is_some() || self.installing() {
-                    ui.spinner();
-                }
-                super::error_ui::summary(ui, &self.status);
-            });
-            if self.installation.portable {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(
-                        "New releases download automatically. Choose Update now, or Later to install when you close Swift.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            }
-        });
-    }
-
-    pub(super) fn controls(&mut self, ui: &mut egui::Ui, can_install: bool) -> bool {
+    pub(super) fn controls(&mut self, ui: &mut egui::Ui, can_install: bool) {
         update_header(ui);
-        self.status_controls(ui);
-        ui.add_space(10.0);
         let idle = self.task.is_none() && !self.installing() && !self.cleanup_unconfirmed;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-            if self.downloaded
-                && !self.confirming
-                && ui
-                    .add_enabled(
-                        idle && can_install && self.verified_download(),
-                        update_button(ui, "Install update and close", true),
-                    )
-                    .clicked()
-            {
-                self.confirming = true;
+        ui.horizontal_top(|ui| {
+            if self.task.is_some() || self.installing() {
+                ui.spinner();
             }
-            if self.version.is_some()
-                && !self.downloaded
-                && ui
-                    .add_enabled(idle, update_button(ui, "Download update", true))
-                    .clicked()
-            {
-                self.start(Operation::Download);
-            }
-            if ui
-                .add_enabled(
-                    idle,
-                    update_button(ui, "Check for updates", self.version.is_none()),
-                )
-                .clicked()
-            {
-                self.start(Operation::Check);
-            }
+            super::error_ui::summary(ui, &self.status);
         });
-        if self.downloaded && !can_install && !self.installing() {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("Finish the response and wait for model preparation or shutdown before installing.").small().weak());
+        if !idle {
+            return;
         }
-        let mut install = false;
-        if self.confirming {
-            ui.add_space(10.0);
-            status_frame(ui, |ui| {
-                ui.label(egui::RichText::new("Ready to close and install?").strong());
-                ui.add_space(4.0);
-                ui.label(if self.installation.portable {
-                    "Swift will close, replace this executable and reopen with the same options and data directory. Unsaved conversations follow your saving setting."
-                } else { "The app will close. Unsaved conversations follow your saving setting. Windows may ask for administrator approval. Reopen Swift after installation." });
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    if ui
-                        .add_enabled(
-                            can_install && idle && self.verified_download(),
-                            update_button(ui, "Close and install", true),
-                        )
-                        .clicked()
-                    {
-                        self.confirming = false;
-                        self.confirmed = true;
-                        self.notified = true;
-                        install = true;
-                    }
-                    let decline = if self.installation.portable {
-                        "Later"
-                    } else {
-                        "Cancel update"
-                    };
-                    if ui.add(update_button(ui, decline, false)).clicked() {
-                        self.defer();
-                    }
-                });
-            });
-        }
-        ui.add_space(10.0);
-        ui.label(
-            egui::RichText::new(
-                "Checks GitHub at startup and every 15 minutes. Published prereleases are included.",
+        ui.add_space(6.0);
+        let ready = self.verified_download();
+        let label = if ready {
+            if self.installation.portable {
+                "Restart to update"
+            } else {
+                "Install update"
+            }
+        } else if self.version.is_some() {
+            "Download update"
+        } else {
+            "Check for updates"
+        };
+        if ui
+            .add_enabled(!ready || can_install, update_button(ui, label, ready))
+            .on_disabled_hover_text(
+                "Finish the response and wait for setup or shutdown before updating.",
             )
-            .small()
-            .weak(),
-        );
-        install
+            .clicked()
+        {
+            if ready {
+                self.confirming = true;
+            } else {
+                self.start(if self.version.is_some() {
+                    Operation::Download
+                } else {
+                    Operation::Check
+                });
+            }
+        }
     }
 }
 
 fn update_header(ui: &mut egui::Ui) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-        ui.label(
-            egui::RichText::new("Application updates")
-                .strong()
-                .size(16.0),
-        );
-        egui::Frame::new()
-            .fill(ui.visuals().extreme_bg_color)
-            .corner_radius(6)
-            .inner_margin(egui::Margin::symmetric(8, 4))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .small()
-                        .monospace(),
-                )
-                .on_hover_text("Application version");
-            });
-    });
-    ui.add_space(10.0);
-}
-
-fn status_frame(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new()
-        .fill(ui.visuals().faint_bg_color)
-        .corner_radius(8)
-        .inner_margin(12)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            contents(ui);
-        });
+    ui.label(
+        egui::RichText::new(format!("Swift · Version {}", env!("CARGO_PKG_VERSION"))).strong(),
+    );
+    ui.add_space(4.0);
 }
 
 fn update_button<'a>(ui: &egui::Ui, label: &'a str, primary: bool) -> egui::Button<'a> {
-    let button = egui::Button::new(egui::RichText::new(label).color(if primary {
-        ui.visuals().selection.stroke.color
-    } else {
-        ui.visuals().text_color()
-    }))
-    .min_size(egui::vec2(0.0, 34.0))
-    .corner_radius(8);
     if primary {
-        button.fill(ui.visuals().selection.bg_fill)
+        super::controls::primary_button(ui, label).min_size(egui::vec2(0.0, 36.0))
     } else {
-        button
+        super::controls::action_button(label)
     }
 }
 
 /// Presents manual update guidance when no installed-app updater is attached.
 pub(super) fn manual_controls(ui: &mut egui::Ui) {
     update_header(ui);
-    status_frame(ui, |ui| {
-        ui.label(egui::RichText::new("Manual updates").strong());
-        ui.add_space(4.0);
-        ui.label("Download the latest Windows ARM64 release from GitHub.");
-    });
-    ui.add_space(10.0);
+    ui.label("Automatic updates are unavailable for this launch.");
     ui.hyperlink_to(
         "Open GitHub releases",
         "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases",
-    );
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("Close Swift, verify the new executable against its published SHA-256, then replace your copy. Keep the same data directory to preserve models and conversations.").small().weak());
+    )
+    .on_hover_text("Close Swift, verify the new Windows ARM64 executable against its published SHA-256, then replace your copy. Keep the same data directory to preserve models and conversations.");
 }
 
 #[cfg(test)]
@@ -971,7 +917,8 @@ mod tests {
     }
 
     #[test]
-    fn portable_prompt_later_keeps_settings_badge_and_owns_keyboard_shortcuts() -> io::Result<()> {
+    fn background_update_nudge_preserves_shortcuts_and_later_keeps_settings_badge() -> io::Result<()>
+    {
         use egui_kittest::{Harness, kittest::Queryable as _};
         let (state, commands) = update_state()?;
         let original = state.active_conversation;
@@ -986,14 +933,22 @@ mod tests {
                 state,
             );
         assert!(harness.query_by_label("Update ready").is_some());
-        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        assert!(harness.query_by_label("Restart to update?").is_none());
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
-        harness.key_press(egui::Key::Enter);
         harness.run();
-        assert_eq!(harness.state().active_conversation, original);
+        assert!(harness.state().transcript.find_open());
         assert_eq!(harness.state().input, "Keep this draft");
         assert!(commands.try_recv().is_err());
         harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(!harness.state().transcript.find_open());
+        assert!(harness.query_by_label("Update ready").is_some());
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.run();
+        assert_ne!(harness.state().active_conversation, original);
+        harness
+            .get_by_role_and_label(egui::Role::Button, "Later")
+            .click();
         harness.run();
         assert!(harness.query_by_label("Update ready").is_none());
         let updates = harness
@@ -1012,6 +967,68 @@ mod tests {
         assert!(commands.try_recv().is_err());
         harness.run_steps(2);
         assert!(harness.query_by_label("Update ready").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn nudge_opens_one_confirmation_and_cancel_never_approves_installation() -> io::Result<()> {
+        use egui_kittest::{Harness, kittest::Queryable as _};
+        let (state, commands) = update_state()?;
+        let original = state.active_conversation;
+        let mut harness = Harness::builder()
+            .with_size([1180.0, 860.0])
+            .with_context_setup(super::super::configure_test_context)
+            .build_ui_state(
+                |ui, state: &mut super::super::State| {
+                    state.handle_input_shortcuts(ui.ctx());
+                    state.draw(ui);
+                },
+                state,
+            );
+        harness
+            .get_by_role_and_label(egui::Role::Button, "Restart to update")
+            .click();
+        harness.run();
+        assert!(harness.query_by_label("Restart to update?").is_some());
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().active_conversation, original);
+        assert!(!harness.state().transcript.find_open());
+        assert_eq!(harness.state().input, "Keep this draft");
+        assert!(commands.try_recv().is_err());
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        let updates = harness
+            .state()
+            .updates
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Missing updates"))?;
+        assert!(!updates.confirming && !updates.confirmed && !updates.deferred);
+        assert!(harness.query_by_label("Restart to update?").is_none());
+        assert!(commands.try_recv().is_err());
+        harness
+            .get_by_role_and_label(egui::Role::Button, "Restart to update")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::Role::Button, "Restart and update")
+            .click();
+        harness.run();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(crate::client::Command::Stop)
+        ));
+        assert!(commands.try_recv().is_err());
+        assert!(
+            harness
+                .state()
+                .updates
+                .as_ref()
+                .is_some_and(|updates| updates.waiting_for_stop && updates.confirmed)
+        );
+        assert!(harness.query_by_label("Restart to update?").is_none());
         Ok(())
     }
 
@@ -1194,7 +1211,8 @@ mod tests {
     }
 
     #[test]
-    fn update_confirmation_needs_both_clicks_and_current_install_admission() -> io::Result<()> {
+    fn compact_settings_use_one_action_and_confirmation_rechecks_install_admission()
+    -> io::Result<()> {
         use egui_kittest::{
             Harness,
             kittest::{NodeT as _, Queryable as _},
@@ -1202,43 +1220,53 @@ mod tests {
         let mut harness = Harness::builder().with_size([640.0, 640.0]).build_ui_state(
             |ui, state: &mut (Updates, bool, usize)| {
                 let can_install = state.1;
-                if state.0.controls(ui, can_install) {
-                    state.2 += 1;
+                if state.0.confirmation_pending() {
+                    if state.0.confirmation(ui.ctx(), can_install) {
+                        state.2 += 1;
+                    }
+                } else {
+                    state.0.controls(ui, can_install);
                 }
             },
             (update_fixture()?, true, 0),
         );
         harness
-            .get_by_role_and_label(egui::Role::Button, "Install update and close")
+            .get_by_role_and_label(egui::Role::Button, "Restart to update")
             .click();
         harness.run();
         assert_eq!(harness.state().2, 0);
         assert!(harness.state().0.confirming);
         assert!(!harness.state().0.confirmed);
         assert!(!harness.state().0.should_close());
+        assert!(
+            harness
+                .query_by_label("Ready to close and install?")
+                .is_none()
+        );
         harness.state_mut().1 = false;
         harness.run();
         assert!(
             harness
-                .get_by_role_and_label(egui::Role::Button, "Close and install")
+                .get_by_role_and_label(egui::Role::Button, "Restart and update")
                 .accesskit_node()
                 .is_disabled()
         );
         harness
-            .get_by_role_and_label(egui::Role::Button, "Later")
+            .get_by_role_and_label(egui::Role::Button, "Cancel")
             .click();
         harness.run();
         assert!(!harness.state().0.confirming);
         assert!(!harness.state().0.confirmed);
+        assert!(!harness.state().0.deferred);
         assert_eq!(harness.state().2, 0);
         harness.state_mut().1 = true;
         harness.run();
         harness
-            .get_by_role_and_label(egui::Role::Button, "Install update and close")
+            .get_by_role_and_label(egui::Role::Button, "Restart to update")
             .click();
         harness.run();
         harness
-            .get_by_role_and_label(egui::Role::Button, "Close and install")
+            .get_by_role_and_label(egui::Role::Button, "Restart and update")
             .click();
         harness.run();
         assert_eq!(harness.state().2, 1);
@@ -1246,6 +1274,88 @@ mod tests {
         assert!(harness.state().0.confirmed);
         assert!(harness.state().0.task.is_none());
         assert!(!harness.state().0.should_close());
+        Ok(())
+    }
+
+    #[test]
+    fn settings_confirmation_returns_to_settings_and_msi_stays_explicit() -> io::Result<()> {
+        use egui_kittest::{Harness, kittest::Queryable as _};
+        let (mut state, commands) = update_state()?;
+        state.open_settings(super::super::settings::Page::Application);
+        let mut harness = Harness::builder()
+            .with_size([760.0, 640.0])
+            .with_context_setup(super::super::configure_test_context)
+            .build_ui_state(
+                |ui, state: &mut super::super::State| {
+                    state.handle_input_shortcuts(ui.ctx());
+                    state.draw(ui);
+                },
+                state,
+            );
+        assert!(
+            harness
+                .query_by_role_and_label(egui::Role::Button, "Check for updates")
+                .is_none()
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(egui::Role::Button, "Download update")
+                .is_none()
+        );
+        harness
+            .get_by_role_and_label(egui::Role::Button, "Restart to update")
+            .click();
+        harness.run();
+        assert!(harness.query_by_label("Restart to update?").is_some());
+        harness
+            .get_by_role_and_label(egui::Role::Button, "Cancel")
+            .click();
+        harness.run();
+        assert!(harness.state().show_settings);
+        assert!(
+            harness
+                .query_by_role_and_label(egui::Role::Button, "Restart to update")
+                .is_some()
+        );
+        let updates = harness
+            .state_mut()
+            .updates
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Missing updates"))?;
+        updates.installation.portable = false;
+        assert!(!updates.notification_pending());
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::Role::Button, "Install update")
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("Close and install update?")
+                .is_some()
+        );
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(!harness.state_mut().prepare_update_on_close());
+        assert!(commands.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn periodic_check_waits_for_confirmation_without_losing_ready_status() -> io::Result<()> {
+        let mut updates = update_fixture()?;
+        updates.confirming = true;
+        updates.next_check = Instant::now();
+        assert!(updates.poll().is_none());
+        assert!(updates.confirming && updates.task.is_none());
+        let same = Response {
+            status: "available".into(),
+            version: updates.version.clone(),
+            release_identity: updates.release_identity.clone(),
+        };
+        assert!(!updates.select_candidate(same));
+        assert!(updates.confirming && updates.verified_download());
+        assert_eq!(updates.status, "Update ready to install.");
         Ok(())
     }
 

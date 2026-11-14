@@ -45,7 +45,7 @@ impl State {
             || self.alerts.details.is_some()
             || self.edit_message.is_some()
             || self.help.is_some()
-            || self.update_notification_visible(ctx)
+            || self.update_confirmation_visible()
             || !ctx.memory(|memory| {
                 memory
                     .focused()

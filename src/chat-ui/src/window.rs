@@ -723,7 +723,7 @@ impl State {
     }
 
     fn handle_escape(&mut self, ctx: &egui::Context) {
-        if self.update_notification_visible(ctx) {
+        if self.update_confirmation_visible() {
             return;
         }
         // The transcript viewer owns Escape and all background shortcuts, even
@@ -793,7 +793,7 @@ impl State {
                 }
             }
         });
-        if self.update_notification_visible(ctx) {
+        if self.update_confirmation_visible() {
             return;
         }
         if self.rename_conversation.is_none()
@@ -1794,14 +1794,10 @@ impl State {
             updates::manual_controls(ui);
             return;
         };
-        let requested = updates.controls(ui, can_install);
+        updates.controls(ui, can_install);
         if self.model == ModelLifecycle::Unavailable && !setup_stopped {
             ui.label("If model preparation failed, close Swift before updating the application.");
         }
-        if !requested {
-            return;
-        }
-        self.begin_update();
     }
 
     fn begin_update(&mut self) {
@@ -1822,25 +1818,10 @@ impl State {
         }
     }
 
-    fn update_notification_visible(&self, ctx: &egui::Context) -> bool {
-        self.can_install_update()
-            && self
-                .updates
-                .as_ref()
-                .is_some_and(updates::Updates::notification_pending)
-            && !self.show_settings
-            && !self.show_audio_transcript
-            && !self.show_diagnostics
-            && self.alerts.details.is_none()
-            && self.rename_conversation.is_none()
-            && self.delete_conversation.is_none()
-            && self.edit_message.is_none()
-            && self.help.is_none()
-            && !self.dictation_requested
-            && !self.speaking
-            && self.audio_import.is_none()
-            && self.pending_voice_transcript.is_none()
-            && !egui::Popup::is_any_open(ctx)
+    fn update_confirmation_visible(&self) -> bool {
+        self.updates
+            .as_ref()
+            .is_some_and(updates::Updates::confirmation_pending)
     }
 
     fn close_with_pending_update(&mut self, ctx: &egui::Context) {
@@ -2022,6 +2003,10 @@ impl State {
         self.setup_controls(ui);
         self.conversation_notices(ui);
         self.alert_panel(ui);
+        let can_install = self.can_install_update();
+        if let Some(updates) = &mut self.updates {
+            updates.nudge(ui, can_install);
+        }
     }
 
     fn draw_workspace(&mut self, ui: &mut egui::Ui) {
@@ -2106,25 +2091,31 @@ impl State {
         // Disable the workspace on the first modal frame too: egui's modal
         // focus layer is otherwise inherited only from the preceding pass.
         let drawer = self.sidebar_open && ui.available_width() < navigation::DOCK_THRESHOLD;
-        let update_notification = self.update_notification_visible(ui.ctx());
+        let update_confirmation = self.update_confirmation_visible();
         ui.add_enabled_ui(
             !self.show_settings
                 && !self.show_audio_transcript
                 && self.alerts.details.is_none()
-                && !update_notification
+                && !update_confirmation
                 && !drawer,
             |ui| {
                 self.draw_workspace(ui);
             },
         );
         let ctx = ui.ctx().clone();
-        if update_notification {
+        if update_confirmation {
+            let can_install = self.can_install_update();
             if self
                 .updates
                 .as_mut()
-                .is_some_and(|updates| updates.notification(&ctx))
+                .is_some_and(|updates| updates.confirmation(&ctx, can_install))
             {
                 self.begin_update();
+            } else if !self.update_confirmation_visible() {
+                if !self.show_settings {
+                    self.focus_composer = true;
+                }
+                ctx.request_repaint();
             }
             return;
         }
