@@ -44,6 +44,40 @@ fn native_source_manifest_extends_selection_without_relabelling_legacy() -> crat
 use serde_json::json;
 
 #[test]
+fn reference_json_keeps_root_zero_depth64_including_unused_config_metadata() -> crate::Result<()> {
+    let nested =
+        |leaf: &str, levels: usize| format!("{}{leaf}{}", "[".repeat(levels), "]".repeat(levels));
+    for leaf in ["null", "{}", "[]", "\"leaf\"", "1", "true"] {
+        decode(nested(leaf, 64).as_bytes())?;
+        assert_eq!(
+            decode(nested(leaf, 65).as_bytes()).err().as_deref(),
+            Some("reference JSON nesting exceeds depth 64")
+        );
+    }
+    assert!(decode(nested(r#"{"unused":null}"#, 64).as_bytes()).is_err());
+    let config = json!({"schema_version":2,"model_type":"prism_hadamard_qwen35","base_model_type":"qwen3_5","tensor_namespace":"mlx-vlm-qwen3_5","gdn_activation_layout":"grouped","quantization":{"bits":2,"group_size":128,"mode":"affine"},"modules":super::public::blocks().map(|block|json!({"path":format!("model.layers.{block}.linear_attn.out_proj"),"block":1024,"dtype":"float16","embedding":false})).collect::<Vec<_>>()});
+    let mut config = serde_json::to_string(&config).map_err(|error| error.to_string())?;
+    config.pop();
+    // The ignored field is one edge below the root. Its leaf may be at 64,
+    // while the same valid configuration with a leaf at 65 must reject.
+    let with_metadata =
+        |levels| format!("{config},\"unusedMetadata\":{}}}", nested("null", levels));
+    assert_eq!(
+        super::public::config_sites(with_metadata(63).as_bytes())?
+            .as_array()
+            .map(Vec::len),
+        Some(48)
+    );
+    assert_eq!(
+        super::public::config_sites(with_metadata(64).as_bytes())
+            .err()
+            .as_deref(),
+        Some("reference JSON nesting exceeds depth 64")
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_ambiguous_json_and_every_tensor_extent() -> crate::Result<()> {
     for raw in [r#"{"x":1,"x":2}"#, r#"{"x":1e999}"#, "{}{}"] {
         assert!(decode(raw.as_bytes()).is_err());

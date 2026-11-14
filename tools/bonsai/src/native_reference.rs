@@ -92,11 +92,27 @@ impl<'de> serde::Deserialize<'de> for StrictJson {
     }
 }
 
+fn check_json_depth(value: &Value, depth: usize) -> crate::Result<()> {
+    require(depth <= 64, "reference JSON nesting exceeds depth 64")?;
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| check_json_depth(value, depth + 1)),
+        Value::Object(values) => values
+            .values()
+            .try_for_each(|value| check_json_depth(value, depth + 1)),
+        _ => Ok(()),
+    }
+}
+
 fn decode(bytes: &[u8]) -> crate::Result<Value> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
     let StrictJson(value) =
         StrictJson::deserialize(&mut decoder).map_err(|error| error.to_string())?;
     decoder.end().map_err(|error| error.to_string())?;
+    // Preserve Assert-JsonElement's root-zero limit for every value, including
+    // unused metadata and scalar leaves, before any semantic field selection.
+    check_json_depth(&value, 0)?;
     Ok(value)
 }
 
