@@ -141,6 +141,87 @@ mod native {
             .map_err(|error| error.to_string())
     }
 
+    struct Work<'a> {
+        source: &'a Path,
+        scratch: &'a Path,
+        executable: PathBuf,
+        started: Instant,
+        limit: Duration,
+        output: u64,
+    }
+
+    impl Work<'_> {
+        fn command(&mut self, name: &str, arguments: Vec<OsString>) -> Result<(), String> {
+            if self.started.elapsed() >= self.limit {
+                return Err("Push checker recovery exhausted its original allowance.".into());
+            }
+            let stdout = self.scratch.join(format!("{name}.stdout"));
+            let stderr = self.scratch.join(format!("{name}.stderr"));
+            let environment = BTreeMap::from([
+                ("CARGO_UNSTABLE_CHECKSUM_FRESHNESS".into(), "true".into()),
+                ("CARGO_BUILD_FINGERPRINT".into(), "content".into()),
+                ("CARGO_INCREMENTAL".into(), "1".into()),
+            ]);
+            let child = OwnedProcess::start_tool(&ToolProcessSpec {
+                executable: self.executable.clone(),
+                arguments,
+                working_directory: self.source.into(),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                environment,
+            })
+            .map_err(|error| format!("Cannot start owned checker recovery {name}: {error}"))?;
+            let result: Result<u32, String> = (|| {
+                loop {
+                    if self.started.elapsed() >= self.limit
+                        || self.output.saturating_add(output_bytes(&stdout, &stderr)?) > MAX_OUTPUT
+                    {
+                        return Err("Push checker recovery exceeded its original time/output allowance; push blocked.".into());
+                    }
+                    if let Some(code) = child.try_wait().map_err(|error| error.to_string())? {
+                        return Ok(code);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })();
+            let stopped = child
+                .stop(Duration::from_secs(5))
+                .map_err(|error| format!("Checker recovery tree cleanup failed: {error}"));
+            drop(child);
+            if let Err(error) = stopped {
+                return Err(match result {
+                    Err(primary) => format!("{primary}; {error}"),
+                    Ok(_) => error,
+                });
+            }
+            let code = result?;
+            self.output = self.output.saturating_add(output_bytes(&stdout, &stderr)?);
+            if self.output > MAX_OUTPUT {
+                return Err(
+                    "Push checker recovery exceeded its final output bound; push blocked.".into(),
+                );
+            }
+            let output = fs::read(&stdout).map_err(|error| error.to_string())?;
+            let errors = fs::read(&stderr).map_err(|error| error.to_string())?;
+            if code != 0 {
+                let detail = [output, errors].concat();
+                let excerpt = String::from_utf8_lossy(&detail[detail.len().saturating_sub(8192)..]);
+                return Err(format!(
+                    "Push checker recovery {name} failed with exit code {code}; push blocked.\n{excerpt}"
+                ));
+            }
+            std::io::stdout()
+                .lock()
+                .write_all(&output)
+                .map_err(|error| error.to_string())?;
+            std::io::stderr()
+                .lock()
+                .write_all(&errors)
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+    }
+
     fn execute(
         arguments: &policy::Arguments,
         started: Instant,
@@ -169,84 +250,44 @@ mod native {
         if started.elapsed() >= work {
             return Err("Push checker recovery setup exhausted its original allowance.".into());
         }
-        let stdout = scratch.join("cargo.stdout");
-        let stderr = scratch.join("cargo.stderr");
-        let command = vec![
-            OsString::from(format!("+{}", arguments.toolchain)),
-            "build".into(),
-            "--quiet".into(),
+        let common = vec![
+            OsString::from("--quiet"),
             "--locked".into(),
             "--offline".into(),
             "--manifest-path".into(),
             manifest.into_os_string(),
             "--package".into(),
             "bonsai-ci".into(),
-            "--bin".into(),
-            "bonsai-ci".into(),
             "--target".into(),
             "aarch64-pc-windows-msvc".into(),
             "--target-dir".into(),
             target.into_os_string(),
         ];
-        let environment = BTreeMap::from([
-            ("CARGO_UNSTABLE_CHECKSUM_FRESHNESS".into(), "true".into()),
-            ("CARGO_BUILD_FINGERPRINT".into(), "content".into()),
-            ("CARGO_INCREMENTAL".into(), "1".into()),
-        ]);
-        let child = OwnedProcess::start_tool(&ToolProcessSpec {
+        let mut work = Work {
+            source: &source,
+            scratch,
             executable: cargo()?,
-            arguments: command,
-            working_directory: source,
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-            environment,
-        })
-        .map_err(|error| format!("Cannot start owned checker recovery: {error}"))?;
-        let result: Result<u32, String> = (|| {
-            loop {
-                if started.elapsed() >= work || output_bytes(&stdout, &stderr)? > MAX_OUTPUT {
-                    return Err("Push checker recovery exceeded its original time/output allowance; push blocked.".into());
-                }
-                if let Some(code) = child.try_wait().map_err(|error| error.to_string())? {
-                    return Ok(code);
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        })();
-        let stopped = child
-            .stop(Duration::from_secs(5))
-            .map_err(|error| format!("Checker recovery tree cleanup failed: {error}"));
-        drop(child);
-        if let Err(error) = stopped {
-            return Err(match result {
-                Err(primary) => format!("{primary}; {error}"),
-                Ok(_) => error,
-            });
-        }
-        let code = result?;
-        if output_bytes(&stdout, &stderr)? > MAX_OUTPUT {
-            return Err(
-                "Push checker recovery exceeded its final output bound; push blocked.".into(),
-            );
-        }
-        let output = fs::read(&stdout).map_err(|error| error.to_string())?;
-        let errors = fs::read(&stderr).map_err(|error| error.to_string())?;
-        if code != 0 {
-            let detail = [output, errors].concat();
-            let excerpt = String::from_utf8_lossy(&detail[detail.len().saturating_sub(8192)..]);
-            return Err(format!(
-                "Push checker recovery failed with exit code {code}; push blocked.\n{excerpt}"
-            ));
-        }
-        std::io::stdout()
-            .lock()
-            .write_all(&output)
-            .map_err(|error| error.to_string())?;
-        std::io::stderr()
-            .lock()
-            .write_all(&errors)
-            .map_err(|error| error.to_string())?;
-        Ok(())
+            started,
+            limit: work,
+            output: 0,
+        };
+        // Cargo may regard a corrupted executable (and its hardlinked deps
+        // image) as fresh. Clean only this package before rebuilding so a new
+        // receipt cannot admit stale bytes; retain all dependency compilation.
+        let mut clean = vec![
+            OsString::from(format!("+{}", arguments.toolchain)),
+            "clean".into(),
+        ];
+        clean.extend_from_slice(&common);
+        work.command("clean", clean)?;
+        let mut build = vec![
+            OsString::from(format!("+{}", arguments.toolchain)),
+            "build".into(),
+            "--bin".into(),
+            "bonsai-ci".into(),
+        ];
+        build.extend(common);
+        work.command("build", build)
     }
 
     pub(super) fn run() -> Result<(), String> {
