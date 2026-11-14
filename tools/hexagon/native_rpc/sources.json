@@ -375,7 +375,7 @@
   },
   "q8ExactArithmeticOracle": {
     "status": "independent-exact-diagnostic-subset-no-device-or-speech-qualification",
-    "api": "Q8ExactOracle::new; review; submit",
+    "api": "Q8ExactOracle::new; review; submit; new_with_control; review_with_control; submit_with_control",
     "ggmlCommit": "19cce6919992fdffd92e0ac152caaf1e2b8f254e",
     "quantizationSource": {
       "path": "ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h",
@@ -392,18 +392,20 @@
     "arithmetic": "independent-original-row-major-signed-i8-dot-in-i32; exact-scaled-i64-units; every-ordered-prefix-must-round-trip-through-F32; no-FMA-or-general-QF16-emulation",
     "acceptance": "every-output-bit-including-zero-sign; original-borrowed-inputs-only; unsupported-inputs-reject-before-native-submit",
     "controls": "four-q8_oracle_-literal-controls-no-driver-DSP-or-model-execution",
+    "boundedPreparationAndReview": "caller-owned-original-absolute-work-deadline-and-cancellation-through-with_control-methods; polls-through-final-review-before-publication; three-q8_control_-model-free-controls",
     "signedPackageDeviceQualified": false,
     "ttsPrefillOrSharedKvQualified": false,
     "profileEligible": false
   },
   "q8ReferenceArithmeticOracle": {
     "status": "independent-scalar-projection-error-control-no-device-or-speech-qualification",
-    "api": "Q8ReferenceOracle::new; review; submit",
+    "api": "Q8ReferenceOracle::new; review; submit; new_with_control; review_with_control; submit_with_control",
     "arithmetic": "original-row-major-signed-i8-codes; independently-widened-finite-F16-scales; F64-lane-dots-and-block-sums-in-original-order; separate-multiply-add",
     "activationSubset": "all-finite-F32; no-native-half-quantization-inverse-or-QF16-emulation",
     "acceptance": "caller-reviewed-fixed-finite-absolute-0-through-f32MAX-and-relative-0-through1-tolerances; absolute-plus-relative-times-reference-magnitude; every-finite-output; numeric-zero-signs-may-differ",
     "inputPolicy": "unchanged-original-borrowed-inputs; invalid-extents-nonfinite-or-unrepresentable-F32-reference-reject-before-submit",
     "controls": "five-q8_reference_-literal-controls-no-driver-DSP-or-model-execution",
+    "boundedPreparationAndReview": "caller-owned-original-absolute-work-deadline-and-cancellation-through-with_control-methods; no-renewed-clock; legacy-convenience-methods-impose-no-bound; three-q8_control_-model-free-controls",
     "nativeQuantizationParityQualified": false,
     "signedPackageDeviceQualified": false,
     "ttsPrefillOrSharedKvQualified": false,

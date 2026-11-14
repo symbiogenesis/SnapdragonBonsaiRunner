@@ -329,3 +329,154 @@ fn q8_reference_submits_original_fractional_inputs_and_rejects_before_publicatio
     assert_eq!(transport.calls, 2);
     Ok(())
 }
+
+#[test]
+fn q8_control_refusal_during_validation_and_arithmetic_returns_no_oracle() -> Result<(), Error> {
+    let projection = Q8Matmul::new(128, 32, 1, 100_000)?;
+    let (weights, activation) = inputs(projection);
+    // Stop before intake, during activation/weight validation, during arithmetic,
+    // and after the final block. No attempt may return a partial expected array.
+    let mut total = 0;
+    Q8ExactOracle::new_with_control(projection, &weights, &activation, || {
+        total += 1;
+        Ok(())
+    })?;
+    for refusal in [1, 3, 20, total - 1, total] {
+        let mut calls = 0;
+        let mut control = || {
+            calls += 1;
+            if calls == refusal {
+                Err(Error::Contract)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(
+            Q8ExactOracle::new_with_control(projection, &weights, &activation, &mut control)
+                .is_err()
+        );
+        assert_eq!(calls, refusal);
+        calls = 0;
+        assert!(
+            Q8ReferenceOracle::new_with_control(
+                projection,
+                &weights,
+                &activation,
+                0.0,
+                0.0,
+                || {
+                    calls += 1;
+                    if calls == refusal {
+                        Err(Error::Contract)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(calls, refusal);
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_control_expired_original_deadline_and_cancellation_skip_transport() -> Result<(), Error> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+    let projection = Q8Matmul::new(128, 32, 1, 100_000)?;
+    let (weights, activation) = inputs(projection);
+    let exact = Q8ExactOracle::new(projection, &weights, &activation)?;
+    let reference = Q8ReferenceOracle::new(projection, &weights, &activation, 0.0, 0.0)?;
+    let mut transport = ReviewedTransport {
+        weights: &weights,
+        activation: &activation,
+        value: -80_962.5,
+        calls: 0,
+    };
+    let mut output = [77.0; 32];
+    let expired = Instant::now();
+    let cancelled = AtomicBool::new(false);
+    let mut check = || {
+        if cancelled.load(Ordering::Relaxed) || Instant::now() >= expired {
+            Err(Error::Contract)
+        } else {
+            Ok(())
+        }
+    };
+    assert!(
+        exact
+            .submit_with_control(&mut transport, &mut output, &mut check)
+            .is_err()
+    );
+    cancelled.store(true, Ordering::Relaxed);
+    assert!(
+        reference
+            .submit_with_control(&mut transport, &mut output, || {
+                if cancelled.load(Ordering::Relaxed) {
+                    Err(Error::Contract)
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(transport.calls, 0);
+    assert_eq!(output, [77.0; 32]);
+    Ok(())
+}
+
+#[test]
+fn q8_control_late_refusal_prevents_exact_and_tolerance_publication() -> Result<(), Error> {
+    let projection = Q8Matmul::new(128, 32, 1, 100_000)?;
+    let (weights, activation) = inputs(projection);
+    let exact = Q8ExactOracle::new(projection, &weights, &activation)?;
+    let reference = Q8ReferenceOracle::new(projection, &weights, &activation, 0.0, 0.0)?;
+    let mut transport = ReviewedTransport {
+        weights: &weights,
+        activation: &activation,
+        value: -80_962.5,
+        calls: 0,
+    };
+    let mut output = [77.0; 32];
+    let mut total = 0;
+    exact.submit_with_control(&mut transport, &mut output, || {
+        total += 1;
+        Ok(())
+    })?;
+    assert_eq!(output, [-80_962.5; 32]);
+    for refusal in [3, total - 1, total] {
+        let mut calls = 0;
+        output.fill(77.0);
+        assert!(
+            exact
+                .submit_with_control(&mut transport, &mut output, || {
+                    calls += 1;
+                    if calls == refusal {
+                        Err(Error::Contract)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(calls, refusal);
+        assert_eq!(output, [77.0; 32]);
+        calls = 0;
+        assert!(
+            reference
+                .submit_with_control(&mut transport, &mut output, || {
+                    calls += 1;
+                    if calls == refusal {
+                        Err(Error::Contract)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(calls, refusal);
+        assert_eq!(output, [77.0; 32]);
+    }
+    Ok(())
+}

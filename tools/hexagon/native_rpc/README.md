@@ -202,6 +202,20 @@ speech tolerances. Device numerical acceptance must separately establish useful
 reviewed limits and the actual signed path; loaded-DSP and usable-VTCM admission
 remain independent prerequisites.
 
+Both oracles expose `new_with_control`, `review_with_control` and
+`submit_with_control` for bounded work. The same caller-owned cancellation and
+original absolute work deadline, including cleanup reserve, must cover input
+validation, expected-value preparation, native setup/submission and every output
+review. Preparation polls before intake/allocation, once per 32-lane block and
+before returning; review polls through the final output and before acceptance.
+Refusal before submission makes no transport call; refusal during review reaches
+the native owner before publication. The simpler constructors and methods impose
+no time bound and are unsuitable for bounded owner-device work. Synchronous
+allocation/native calls still require external process supervision. Three
+`q8_control_` controls cover cancelled/expired intake, refusal during validation
+and arithmetic, and late refusal without output publication. They run no native
+driver or model and do not establish a cancellation-latency measurement.
+
 The Q8 packet/solver controls remain mathematical/layout checks, not native
 captures. Signed-package/device execution, exact loaded DSP identity, contained
 HTP0 supervision, Q8 activation quantization/arithmetic, correlated completions

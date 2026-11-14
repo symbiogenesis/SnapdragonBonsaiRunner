@@ -49,10 +49,6 @@ impl<'a> Q8ReferenceOracle<'a> {
     /// # Errors
     /// Rejects invalid tolerances, extents, nonfinite inputs/scales, allocation
     /// failure and a reference outside the finite F32 range before submission.
-    #[allow(
-        clippy::suboptimal_flops,
-        reason = "The independent scalar reference requires separately rounded multiplication and addition"
-    )]
     pub fn new(
         projection: Q8Matmul,
         weights: &'a [u8],
@@ -60,19 +56,60 @@ impl<'a> Q8ReferenceOracle<'a> {
         absolute_tolerance: f64,
         relative_tolerance: f64,
     ) -> Result<Self, Error> {
+        Self::new_with_control(
+            projection,
+            weights,
+            activation,
+            absolute_tolerance,
+            relative_tolerance,
+            || Ok(()),
+        )
+    }
+
+    /// Evaluate under the caller's original cancellation/deadline policy.
+    ///
+    /// `check` must retain the inherited absolute work deadline, including its
+    /// cleanup reserve, rather than start a new allowance. It runs before input
+    /// scanning/allocation, at most 32 arithmetic lanes apart and before return.
+    /// This variant is required for bounded device work; [`Self::new`] supplies
+    /// no cancellation or time bound. Refusal returns no partially built oracle.
+    /// Synchronous allocation still requires external process supervision.
+    ///
+    /// # Errors
+    /// Propagates control refusal and every input/arithmetic error of [`Self::new`].
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "The independent scalar reference requires separately rounded multiplication and addition"
+    )]
+    pub fn new_with_control(
+        projection: Q8Matmul,
+        weights: &'a [u8],
+        activation: &'a [f32],
+        absolute_tolerance: f64,
+        relative_tolerance: f64,
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        check()?;
         if !absolute_tolerance.is_finite()
             || !(0.0..=f64::from(f32::MAX)).contains(&absolute_tolerance)
             || !relative_tolerance.is_finite()
             || !(0.0..=1.0).contains(&relative_tolerance)
             || weights.len() != projection.weight_bytes()
             || activation.len() != projection.columns() * projection.batch()
-            || activation.iter().any(|value| !value.is_finite())
         {
             return Err(Error::Contract);
         }
+        for block in activation.as_chunks::<32>().0 {
+            check()?;
+            if block.iter().any(|value| !value.is_finite()) {
+                return Err(Error::Contract);
+            }
+        }
         for block in weights.as_chunks::<34>().0 {
+            check()?;
             reference_scale(u16::from_le_bytes([block[0], block[1]]))?;
         }
+        check()?;
         let mut expected = Vec::new();
         expected
             .try_reserve_exact(projection.rows() * projection.batch())
@@ -87,6 +124,7 @@ impl<'a> Q8ReferenceOracle<'a> {
                     .iter()
                     .zip(vector.as_chunks::<32>().0)
                 {
+                    check()?;
                     let mut dot = 0.0;
                     for (&code, &input) in weight[2..].iter().zip(input) {
                         dot += f64::from(i8::from_ne_bytes([code])) * f64::from(input);
@@ -102,6 +140,7 @@ impl<'a> Q8ReferenceOracle<'a> {
                 expected.push(value);
             }
         }
+        check()?;
         Ok(Self {
             weights,
             activation,
@@ -118,24 +157,40 @@ impl<'a> Q8ReferenceOracle<'a> {
     ///
     /// # Errors
     /// Rejects changed extents, nonfinite values or any exceeded error bound.
+    pub fn review(&self, output: &[f32]) -> Result<(), Error> {
+        self.review_with_control(output, || Ok(()))
+    }
+
+    /// Review every result under the original caller-owned work allowance.
+    ///
+    /// `check` follows the same contract as [`Self::new_with_control`]. Refusal
+    /// cannot become numerical success, including after the last output value.
+    ///
+    /// # Errors
+    /// Propagates control refusal and the numerical errors of [`Self::review`].
     #[allow(
         clippy::suboptimal_flops,
         reason = "The declared tolerance formula preserves separate multiply/add rounding"
     )]
-    pub fn review(&self, output: &[f32]) -> Result<(), Error> {
-        if output.len() != self.expected.len()
-            || !output
-                .iter()
-                .zip(&self.expected)
-                .all(|(&actual, &expected)| {
-                    actual.is_finite()
-                        && (f64::from(actual) - expected).abs()
-                            <= self.absolute_tolerance + self.relative_tolerance * expected.abs()
-                })
-        {
+    pub fn review_with_control(
+        &self,
+        output: &[f32],
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        check()?;
+        if output.len() != self.expected.len() {
             return Err(Error::Contract);
         }
-        Ok(())
+        for (&actual, &expected) in output.iter().zip(&self.expected) {
+            check()?;
+            if !actual.is_finite()
+                || (f64::from(actual) - expected).abs()
+                    > self.absolute_tolerance + self.relative_tolerance * expected.abs()
+            {
+                return Err(Error::Contract);
+            }
+        }
+        check()
     }
 
     /// Submit unchanged borrowed inputs with mandatory scalar error review.
@@ -146,8 +201,27 @@ impl<'a> Q8ReferenceOracle<'a> {
     /// # Errors
     /// Propagates transport failures or rejected numerical error bounds.
     pub fn submit(&self, transport: &mut dyn Q8Submitter, output: &mut [f32]) -> Result<(), Error> {
+        self.submit_with_control(transport, output, || Ok(()))
+    }
+
+    /// Submit with the same cancellation/deadline policy used for preparation.
+    ///
+    /// Control refusal before submission makes no transport call. During review,
+    /// refusal reaches the transport before publication and ends native ownership
+    /// under [`Q8Submitter`]'s terminal-failure contract. The transport still owns
+    /// its independent native-call deadline and uncertain-buffer retention.
+    ///
+    /// # Errors
+    /// Propagates control, transport and numerical review failures.
+    pub fn submit_with_control(
+        &self,
+        transport: &mut dyn Q8Submitter,
+        output: &mut [f32],
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        check()?;
         transport.submit(self.weights, self.activation, output, &mut |actual| {
-            self.review(actual)
+            self.review_with_control(actual, &mut check)
         })
     }
 }
@@ -201,12 +275,31 @@ impl<'a> Q8ExactOracle<'a> {
         weights: &'a [u8],
         activation: &'a [f32],
     ) -> Result<Self, Error> {
+        Self::new_with_control(projection, weights, activation, || Ok(()))
+    }
+
+    /// Evaluate exact dots under the original cancellation/deadline policy.
+    ///
+    /// `check` follows [`Q8ReferenceOracle::new_with_control`]'s inherited-clock
+    /// contract and runs at most 32 arithmetic lanes apart. Refusal returns no
+    /// partial oracle. [`Self::new`] supplies no cancellation or time bound.
+    ///
+    /// # Errors
+    /// Propagates control refusal and every input/arithmetic error of [`Self::new`].
+    pub fn new_with_control(
+        projection: Q8Matmul,
+        weights: &'a [u8],
+        activation: &'a [f32],
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        check()?;
         if weights.len() != projection.weight_bytes()
             || activation.len() != projection.columns() * projection.batch()
         {
             return Err(Error::Contract);
         }
         for block in activation.as_chunks::<32>().0 {
+            check()?;
             if !block.iter().all(|&value| {
                 value.is_finite() && (-127.0..=127.0).contains(&value) && value.fract() == 0.0
             }) || !block.iter().any(|value| value.abs() == 127.0)
@@ -215,8 +308,10 @@ impl<'a> Q8ExactOracle<'a> {
             }
         }
         for block in weights.as_chunks::<34>().0 {
+            check()?;
             scale(u16::from_le_bytes([block[0], block[1]]))?;
         }
+        check()?;
         let count = projection.rows() * projection.batch();
         let mut expected = Vec::new();
         expected
@@ -235,6 +330,7 @@ impl<'a> Q8ExactOracle<'a> {
                     .iter()
                     .zip(vector.as_chunks::<32>().0)
                 {
+                    check()?;
                     let mut dot = 0_i32;
                     for (&code, &input) in weight[2..].iter().zip(input) {
                         dot += i32::from(i8::from_ne_bytes([code])) * exact_input(input);
@@ -246,6 +342,7 @@ impl<'a> Q8ExactOracle<'a> {
                 expected.push(value);
             }
         }
+        check()?;
         Ok(Self {
             weights,
             activation,
@@ -258,15 +355,32 @@ impl<'a> Q8ExactOracle<'a> {
     /// # Errors
     /// Rejects changed extents or any mismatching/nonfinite returned value.
     pub fn review(&self, output: &[f32]) -> Result<(), Error> {
-        if output.len() != self.expected.len()
-            || !output
-                .iter()
-                .zip(&self.expected)
-                .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
-        {
+        self.review_with_control(output, || Ok(()))
+    }
+
+    /// Review every exact result under the original caller-owned work allowance.
+    ///
+    /// `check` follows [`Self::new_with_control`]'s contract, including a final
+    /// check after every output bit has matched.
+    ///
+    /// # Errors
+    /// Propagates control refusal and the numerical errors of [`Self::review`].
+    pub fn review_with_control(
+        &self,
+        output: &[f32],
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        check()?;
+        if output.len() != self.expected.len() {
             return Err(Error::Contract);
         }
-        Ok(())
+        for (actual, expected) in output.iter().zip(&self.expected) {
+            check()?;
+            if actual.to_bits() != expected.to_bits() {
+                return Err(Error::Contract);
+            }
+        }
+        check()
     }
 
     /// Submit the same immutable inputs with mandatory independent numeric review.
@@ -277,8 +391,26 @@ impl<'a> Q8ExactOracle<'a> {
     /// # Errors
     /// Propagates transport, cancellation, bound or independent numeric failure.
     pub fn submit(&self, transport: &mut dyn Q8Submitter, output: &mut [f32]) -> Result<(), Error> {
+        self.submit_with_control(transport, output, || Ok(()))
+    }
+
+    /// Submit unchanged inputs with bounded exact review before publication.
+    ///
+    /// `check` follows [`Self::new_with_control`]'s contract. Refusal before the
+    /// call skips transport; refusal inside review is a terminal native error.
+    /// Native deadlines and uncertain-buffer ownership remain the transport's.
+    ///
+    /// # Errors
+    /// Propagates control, transport and exact numerical review failures.
+    pub fn submit_with_control(
+        &self,
+        transport: &mut dyn Q8Submitter,
+        output: &mut [f32],
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        check()?;
         transport.submit(self.weights, self.activation, output, &mut |actual| {
-            self.review(actual)
+            self.review_with_control(actual, &mut check)
         })
     }
 }
