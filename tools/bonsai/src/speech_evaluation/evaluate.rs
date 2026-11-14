@@ -11,12 +11,44 @@ mod windows;
 
 #[cfg(any(windows, test))]
 const MODEL: &str = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign";
-#[cfg(windows)]
-const TEXT: &str = "The quick brown fox crossed the quiet garden.";
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const VOICE: &str = "A calm, clear narrator with a natural speaking pace.";
 #[cfg(any(windows, test))]
 const MAX_PCM: usize = 5_760_000;
+
+/// Fixed public packets keep listening captures reproducible without taking
+/// arbitrary or private text into the hosted comparison.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum SpeechPacket {
+    #[default]
+    Control,
+    DailyNarrative,
+    DailyInstructions,
+}
+
+#[cfg(any(windows, test))]
+impl SpeechPacket {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::DailyNarrative => "daily-narrative",
+            Self::DailyInstructions => "daily-instructions",
+        }
+    }
+
+    const fn text(self) -> &'static str {
+        match self {
+            Self::Control => "The quick brown fox crossed the quiet garden.",
+            Self::DailyNarrative => {
+                "At six, the station clock rang twice. \"Wait,\" said Lena. \"The last train is early.\" Outside, rain softened the chalk arrows on the platform."
+            }
+            Self::DailyInstructions => {
+                "First, fold the blue card. Next, place it beside the cup. Pause here. Then read the final line quietly: the room is ready."
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,6 +102,27 @@ pub(super) struct Request {
     repetitions: u8,
     #[serde(default)]
     response_format: Format,
+    #[serde(default)]
+    speech_packet: SpeechPacket,
+}
+
+#[cfg(any(windows, test))]
+fn synthesis_payload(request: &Request) -> crate::Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({"model": MODEL,
+        "input": request.speech_packet.text(), "voice_description": VOICE,
+        "language": "Auto", "response_format": request.response_format.name()}))
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(any(windows, test))]
+fn clip_identity(bytes: &[u8]) -> crate::Result<Value> {
+    let pcm = bonsai_audio::mono_pcm16_data(bytes, 24_000, 2_880_000)
+        .ok_or("Evaluation output was not a complete bounded mono 24 kHz PCM16 WAV.")?;
+    Ok(
+        serde_json::json!({"ClipSha256": crate::identity::sha256(bytes),
+        "ClipBytes": bytes.len(), "SampleRate": 24_000, "Channels": 1,
+        "SampleCount": pcm.len() / 2}),
+    )
 }
 
 pub(super) fn thread_grid(available: usize) -> crate::Result<Vec<usize>> {

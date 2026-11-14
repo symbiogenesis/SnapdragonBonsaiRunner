@@ -158,10 +158,84 @@ fn evaluation_schema_rejects_unknown_fields_and_coerced_options() {
         ("repetitions", json!(true)),
         ("repetitions", json!(2.5)),
         ("responseFormat", json!("mp3")),
+        ("speechPacket", json!("private text")),
+        ("speechPacket", json!(null)),
+        ("speechPacket", json!(true)),
+        ("speechPacket", json!(1)),
         ("threads", json!([256])),
     ] {
         let mut bad = value.clone();
         bad[field] = invalid;
         assert!(serde_json::from_value::<Request>(bad).is_err());
     }
+}
+
+#[test]
+fn fixed_listening_packets_preserve_control_and_bind_exact_synthesis_text() -> crate::Result<()> {
+    let base = json!({"repositoryRoot": "C:/source", "dataDirectory": "C:/models"});
+    let default: Request =
+        serde_json::from_value(base.clone()).map_err(|error| error.to_string())?;
+    assert_eq!(default.speech_packet.name(), "control");
+    let expected_packets = [
+        ("control", "The quick brown fox crossed the quiet garden."),
+        (
+            "daily-narrative",
+            "At six, the station clock rang twice. \"Wait,\" said Lena. \"The last train is early.\" Outside, rain softened the chalk arrows on the platform.",
+        ),
+        (
+            "daily-instructions",
+            "First, fold the blue card. Next, place it beside the cup. Pause here. Then read the final line quietly: the room is ready.",
+        ),
+    ];
+    for (packet, text) in expected_packets {
+        for format in ["pcm", "wav"] {
+            let mut value = base.clone();
+            value["speechPacket"] = json!(packet);
+            value["responseFormat"] = json!(format);
+            let request: Request =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            assert_eq!(request.speech_packet.name(), packet);
+            assert_eq!(request.speech_packet.text(), text);
+            let payload = synthesis_payload(&request)?;
+            let observed: Value =
+                serde_json::from_slice(&payload).map_err(|error| error.to_string())?;
+            assert_eq!(
+                observed,
+                json!({
+                    "model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", "input": text,
+                    "voice_description": "A calm, clear narrator with a natural speaking pace.",
+                    "language": "Auto", "response_format": format,
+                })
+            );
+            if packet == "control" && format == "pcm" {
+                assert_eq!(payload, synthesis_payload(&default)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn listening_clip_identity_binds_original_wave_and_exact_pcm_geometry() -> crate::Result<()> {
+    use sha2::{Digest as _, Sha256};
+    let bytes = fixture();
+    let identity = clip_identity(&bytes)?;
+    assert_eq!(
+        identity["ClipSha256"],
+        format!("{:x}", Sha256::digest(&bytes))
+    );
+    assert_eq!(identity["ClipBytes"], 48);
+    assert_eq!(identity["SampleRate"], 24_000);
+    assert_eq!(identity["Channels"], 1);
+    assert_eq!(identity["SampleCount"], 2);
+    let mut changed = bytes.clone();
+    changed[44] ^= 1;
+    assert_ne!(
+        identity["ClipSha256"],
+        clip_identity(&changed)?["ClipSha256"]
+    );
+    for invalid in [&bytes[..47], &[0; 48]] {
+        assert!(clip_identity(invalid).is_err());
+    }
+    Ok(())
 }

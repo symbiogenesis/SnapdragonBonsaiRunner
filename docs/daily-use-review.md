@@ -131,14 +131,22 @@ For live read-aloud also retain the exact paragraph/chunk boundaries, their
 generation order and completion state; file continuity cannot prove audible
 continuity. Distinguish voice bootstrap, first PCM, first audible sound, warm
 synthesis, playback gaps and terminal cleanup. Never infer Snapdragon latency
-from a hosted capture. These texts require a separately prepared, source-bound
-capture; the current TTS workflow has no text input and does not generate them.
-Its existing fixed-text comparison (`The quick brown fox crossed the quiet garden.`)
-remains hosted-only and supplies a separate listening control:
+from a hosted capture. The source-bound native `speech-evaluation` request selects
+these fixed texts with `speechPacket: "daily-narrative"` or
+`speechPacket: "daily-instructions"`; it accepts no arbitrary text. The existing
+fixed-text comparison (`The quick brown fox crossed the quiet garden.`) remains
+the default `control` packet. All selections retain the complete hosted-only
+matrix and supply listening captures, with independent human review still pending:
 
 ```powershell
 gh workflow run tts-evaluation.yml --ref main -f target=hosted-arm64 -f repetitions=1 -f response_format=pcm
 ```
+
+Retained reports identify the selected packet, exact text and text SHA-256. Each
+complete synthesis record identifies the exact request digest and original WAV
+digest, length, sample rate, channel count and sample count. Review the named
+hashed clip; successful HTTP/audio framing does not establish intelligibility,
+pronunciation or complete spoken coverage.
 
 An independent listener reviews the identified complete clip for intelligibility,
 voice consistency, pronunciation, punctuation/prosody and audible cuts/gaps,

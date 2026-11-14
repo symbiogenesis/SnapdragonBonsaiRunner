@@ -835,7 +835,14 @@ bootstrap Cargo on the owner device.
 `{"operation":"host-plan","repetitions":2}` request derives the bounded local
 thread grid; `plan` still accepts explicit thread counts. `evaluate` accepts
 `repositoryRoot`, `dataDirectory`, optional `ttsPath` and `evidenceDirectory`,
-`repetitions` (1–3, default 2), and `responseFormat` (`pcm` or `wav`, default `pcm`).
+`repetitions` (1–3, default 2), `responseFormat` (`pcm` or `wav`, default `pcm`),
+and `speechPacket` (`control`, `daily-narrative` or `daily-instructions`, default
+`control`). Each packet selects fixed public text: the existing fox control or
+one of the [daily-use listening paragraphs](../../docs/daily-use-review.md#speech-listening-packet).
+Unknown selectors and freeform text are rejected. The report retains the packet,
+exact text and SHA-256; each completed synthesis binds its request and original
+WAV SHA-256, byte length, sample rate, channels and sample count for independent
+listening. Packet selection keeps the existing complete hosted matrix and limits.
 Execution requires this repository's hosted Windows ARM64 main CI and a prebuilt
 tool. The workflow's retained Snapdragon selector rejects before checkout/setup;
 owner-device speech qualification remains pending.

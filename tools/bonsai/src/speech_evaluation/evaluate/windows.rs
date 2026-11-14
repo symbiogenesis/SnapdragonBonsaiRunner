@@ -14,7 +14,9 @@ use std::{
 };
 
 use super::super::http::{Call, exchange};
-use super::{MODEL, Request, TEXT, VOICE, comparisons, ready, thread_grid, wave};
+use super::{
+    Request, VOICE, clip_identity, comparisons, ready, synthesis_payload, thread_grid, wave,
+};
 use crate::native_qualification::save_report as save;
 
 fn power() -> Value {
@@ -280,9 +282,7 @@ fn synthesis(
     fs::write(supervisor.lane.join(format!("phase-{phase}")), [])
         .map_err(|error| error.to_string())?;
     let format = prepared.request.response_format;
-    let payload = serde_json::to_vec(&json!({"model": MODEL, "input": TEXT,
-        "voice_description": VOICE, "language": "Auto", "response_format": format.name()}))
-    .map_err(|error| error.to_string())?;
+    let payload = synthesis_payload(prepared.request)?;
     let call = Call {
         port,
         token: prepared.credentials.frontend_key().as_bytes(),
@@ -293,15 +293,27 @@ fn synthesis(
     };
     let response = exchange(&call, || supervisor.checkpoint())?;
     let bytes = wave(format, &response.bytes)?;
+    let mut record = clip_identity(&bytes)?;
     let seconds =
         f64::from(u32::try_from(bytes.len() - 44).map_err(|error| error.to_string())?) / 48_000.0;
     let clip = format!("{phase}.wav");
     fs::write(supervisor.lane.join(&clip), bytes).map_err(|error| error.to_string())?;
-    Ok(
-        json!({"Phase": phase, "FirstBodyMs": response.first_body.as_secs_f64() * 1000.0,
+    let observations = json!({"Phase": phase, "FirstBodyMs": response.first_body.as_secs_f64() * 1000.0,
         "InferenceMs": response.elapsed.as_secs_f64() * 1000.0, "AudioSeconds": seconds,
-        "RealTimeFactor": response.elapsed.as_secs_f64() / seconds, "CompletePcm16": true, "Clip": clip}),
-    )
+        "RealTimeFactor": response.elapsed.as_secs_f64() / seconds, "CompletePcm16": true, "Clip": clip,
+        "SpeechPacket": prepared.request.speech_packet.name(),
+        "TextSha256": crate::identity::sha256(prepared.request.speech_packet.text().as_bytes()),
+        "RequestSha256": crate::identity::sha256(&payload)});
+    record
+        .as_object_mut()
+        .ok_or("Invalid clip identity.")?
+        .extend(
+            observations
+                .as_object()
+                .ok_or("Invalid synthesis observations.")?
+                .clone(),
+        );
+    Ok(record)
 }
 
 fn capture(
@@ -478,7 +490,10 @@ pub(super) fn run(request: &Request) -> crate::Result<Value> {
         "Repetitions": request.repetitions, "Plan": plan, "Records": [], "Sessions": [], "Comparisons": [],
         "ColdReadyDefinition": "Supervisor spawn, verified artifact hashing and new model process through readiness; operating-system file cache is not flushed.",
         "Sampling": "Fixed design reference phrase and seed; reusable Base speaker conditioning; upstream text sampling defaults.",
-        "Text": TEXT, "VoiceDescription": VOICE });
+        "SpeechPacket": request.speech_packet.name(),
+        "Text": request.speech_packet.text(),
+        "TextSha256": crate::identity::sha256(request.speech_packet.text().as_bytes()),
+        "VoiceDescription": VOICE });
     save(&path, &report)?;
     let result =
         publish(&evidence).and_then(|()| execute(request, &evidence, &threads, &mut report));
