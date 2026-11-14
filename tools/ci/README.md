@@ -88,7 +88,11 @@ from compilation and setup in the command receipt. Timing reports do not impose
 per-test limits or change test selection and concurrency.
 
 Repository tooling and CI need Rust and PowerShell 7.6 or newer. They do not
-install or invoke a Python runtime. Standalone PowerShell startup/index/cache
+install or invoke a Python runtime, including through external or vendored
+build/generation helpers. The same prohibition covers application code,
+diagnostics, research, validation and qualification under the
+[language policy](../../AGENTS.md#tooling-languages).
+Standalone PowerShell startup/index/cache
 guards run before any Rust bootstrap, using .NET APIs without downloaded modules.
 
 After native bootstrap, `bonsai-tools ci-report` owns the hosted Foundation
@@ -101,7 +105,9 @@ The source-language guard rejects owned Python files, bytecode, Python workflow
 shells/setup and literal interpreter commands. PowerShell's native parser checks
 direct calls and `Start-Process`, including quoted paths and case variants, while
 leaving strings/comments as data. Computed executable names are outside this
-static check; source review remains required. Required replay inputs and external artifact identities retain their names. Vendored sources are excluded.
+static check; source review remains required. Required replay inputs and external
+artifact identities retain their names. Vendored sources are excluded from this
+static scan; that exclusion does not authorize executing Python from them.
 Each `test_*.ps1` fixture script accepts `-Case NAME` for a focused local check;
 their complete selections remain hosted CI work.
 

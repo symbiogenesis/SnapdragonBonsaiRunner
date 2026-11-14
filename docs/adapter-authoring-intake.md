@@ -82,6 +82,12 @@ direction. A mismatch is evidence requiring investigation, not an intake success
 
 ## Toolchain manifest
 
+This manifest records the publisher's original external authoring environment.
+Its fields and the conversion manifest's `invocation` are inert provenance data;
+intake validates them in Rust without installing or executing the recorded tools.
+They do not authorize Python use. Independent numerical reproduction must use
+native Rust, as in the [public-pack reference](adapter-public-reference.md).
+
 `schemaVersion` is `1`. Required nonempty text fields are `python`, `numpy`,
 `safetensors`, `ggufWriter` and `matrixMultiplication`, each at most 4096 UTF-16
 units. Retain exact original build/version/source identities and the F32 matrix

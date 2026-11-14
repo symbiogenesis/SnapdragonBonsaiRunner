@@ -42,8 +42,10 @@ sites/tokens and bound scratch; capturing two full residual/FFN layers over
 4,096 tokens already costs 704 MiB before overhead.
 
 Sparse fitting and activation-dependent factors are later options only when
-they outperform simpler controls. Production application stays native Rust;
-no hosted fitting service or Python inference dependency belongs in the app.
+they outperform simpler controls. Fitting, numerical reproduction and inference
+must use native Rust; Python is prohibited for offline experiments as well as
+the application under the [language policy](../AGENTS.md#tooling-languages).
+No hosted fitting service belongs in the app.
 
 ## A shared patch without rewriting the packed models
 

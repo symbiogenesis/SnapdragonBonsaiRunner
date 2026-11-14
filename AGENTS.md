@@ -77,11 +77,16 @@ own verifier from running, so do not rely on that job as the first check.
 
 # Tooling languages
 
-Use Rust or PowerShell 7.6 or later for repository tooling and CI. Do not add
-owned Python files, Python runtime setup, inline Python or Python subprocesses.
+Use Rust or PowerShell 7.6 or later for repository tooling and CI. Do not use
+Python for the application, builds, tooling, CI, diagnostics, research, validation
+or qualification. Do not add Python code, install a Python runtime or invoke
+Python, including inline commands, subprocesses and external or vendored
+build/generation helpers. Implement any required helper in Rust or PowerShell
+within the responsibilities below.
 Use `tools/ci/check_owned_languages.ps1` to check the boundary. Historical
-provenance records and external source citations remain evidence, not executable
-dependencies. Keep binary parsing, numerical work, typed validation and policy,
+provenance records, external source citations, source inventories and required
+license records remain inert evidence; retaining them does not authorize Python
+execution. Keep binary parsing, numerical work, typed validation and policy,
 and process lifetime enforcement in Rust. Keep PowerShell small: environment
 setup, command composition, entry-point adapters and checks that must run before
 Rust bootstrap. Reuse native commands instead of duplicating their policy in

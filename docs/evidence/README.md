@@ -2,6 +2,9 @@
 
 Keep inputs and records required by the consumers below under the
 [retention policy](../validation.md#evidence-retention).
+Historical records may name retired Python tools or external Python sources.
+Preserve those identities as inert evidence; use the current Rust/PowerShell
+consumers below without installing or executing the recorded Python tools.
 
 | Retained material | Current consumer |
 | --- | --- |

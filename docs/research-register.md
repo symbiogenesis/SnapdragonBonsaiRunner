@@ -29,6 +29,9 @@ files' licenses/notices and review native Windows ARM64, numerical and ownership
 boundaries. License labels describe the surveyed declaration and need verification
 at adoption. Algorithm, product-design and regression references do not require
 adopting their runtime, frontend, build tools or complete architecture.
+Python implementations remain source references only. Project experiments,
+fitting, reproduction and validation must use Rust or PowerShell under the
+[language policy](../AGENTS.md#tooling-languages), including any build helpers.
 
 ## Experiment scope and budgets
 

@@ -412,12 +412,17 @@ independent listening.
 
 ## Standards
 
-Repository tooling uses Rust and PowerShell 7.6 or newer, without an owned Python
-runtime dependency. Rust owns binary/numerical work, typed policy and validation,
+Repository tooling uses Rust and PowerShell 7.6 or newer. Python is prohibited
+in the application, builds, tooling, CI, diagnostics, research, validation and
+qualification, including external or vendored build/generation helpers. Do not
+install or invoke a Python runtime; implement required helpers in the permitted
+languages. Rust owns binary/numerical work, typed policy and validation,
 and native process lifetimes. PowerShell owns small environment/command adapters
 and checks that must run before Rust bootstrap. Native application provisioning
 and supervision stay in Rust; installed use must not require PowerShell.
-Required replay receipts and pinned external source paths retain their identities. The [language guard](../tools/ci/check_owned_languages.ps1)
+Required replay receipts, pinned external source paths, inventories and license
+records retain their identities as inert evidence, without authorizing execution.
+The [language guard](../tools/ci/check_owned_languages.ps1)
 checks executable source rather than deleting those records. Remaining migrations
 are tracked under [tooling implementation](../PLAN.md#tooling-implementation).
 

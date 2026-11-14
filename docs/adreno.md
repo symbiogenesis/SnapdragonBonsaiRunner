@@ -180,7 +180,7 @@ is not an application dependency.
 | Checked source | Result |
 | --- | --- |
 | [OpenCL dispatch](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/ggml/src/ggml-opencl/ggml-opencl.cpp#L7734) | Packed PQ2/PTQ1 projections are ineligible; the limited FP32 GDN and convolution branches do not establish complete Swift coverage. |
-| [Build recipe](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/ggml/src/ggml-opencl/CMakeLists.txt) | Public OpenCL source kernels can be embedded; an OpenCL SDK and Python are build requirements. No accelerated Runner binary is built in this screen. |
+| [Build recipe](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/ggml/src/ggml-opencl/CMakeLists.txt) | The external upstream recipe embeds kernels using an OpenCL SDK and a Python generator. Runner must replace any adopted generation step with Rust; this recipe is not an approved project build path. No accelerated Runner binary is built in this screen. |
 | [Backend documentation](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/docs/backend/OPENCL.md) | Windows ARM64 and X2-90 are listed, but optional Qualcomm prebuilt kernels are a separate manually provisioned library for selected other formats. They are excluded from this public-source comparison. |
 
 The publisher rollback remains the CPU archive in `config/swift-assessment.lock.json`; the
