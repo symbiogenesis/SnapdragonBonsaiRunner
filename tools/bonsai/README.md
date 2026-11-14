@@ -277,6 +277,22 @@ Focused source controls use
 checks the staged-probe adapter without running the ignored sandbox workload.
 These controls establish neither actual-device nor hosted workflow qualification.
 
+The workflow also admits the separate, explicitly selected `log-capture-v1`
+workload. It runs exactly three controls: stdout flood, stderr flood and normal-exit
+tail draining/file release. The default `authority-v1` remains the original six
+controls; neither workload appends cases from the other. Both native `prepare`
+and `qualify` requests carry `workload`, and the source/run/digest-bound package
+receipt must match that selection and its exact case inventory. Legacy packages
+without a workload identity can authorize only the original authority controls.
+The capture workload's conservative estimate is 150 seconds: thirty per control
+plus sixty for intake, inventories, power, cleanup and evidence. Its original
+300-second ceiling and inherited shorter clocks remain unchanged. Selecting it
+does not authorize repeating or continuing an earlier trial. It provides no
+scratch/PSEC-private-temp quota, broker-only transport, actual-model or performance
+verdict. Source admission controls are
+`sandbox_log_workload_cannot_expand_or_substitute_original_authority_controls`
+and `sandbox_log_admission_keeps_three_controls_inside_the_original_deadline`.
+
 `pe-closure` audits ARM64 PE files without loading them. Supply `bundleDirectory`
 and `systemDirectory`; omitted/null `aliases` reads `apisetschema.dll`. It follows
 candidate normal/delay imports and recursive system normal imports, rejects GUI

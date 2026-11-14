@@ -1,7 +1,8 @@
 //! Hosted preparation and one original-budget native sandbox fixture sequence.
 
 use super::{
-    CASES, FILES, TOOLCHAIN, inventory, package_identity, remaining_fit, selected_artifacts, text,
+    FILES, TOOLCHAIN, Workload, inventory, package_identity, remaining_fit, selected_artifacts,
+    text,
 };
 use serde_json::{Value, json};
 use std::{
@@ -236,6 +237,7 @@ fn prune_blank_logs(evidence: &Path) -> crate::Result<()> {
 
 fn prepare(request: &Value) -> crate::Result<Value> {
     ci_guard(true)?;
+    let workload = Workload::select(request.get("workload"))?;
     let repository = PathBuf::from(text(request, "repositoryRoot")?);
     let target = path(request, "buildDirectory")?;
     let output = path(request, "outputDirectory")?;
@@ -254,7 +256,7 @@ fn prepare(request: &Value) -> crate::Result<Value> {
         .and_then(|()| fs::create_dir(&output))
         .and_then(|()| fs::create_dir(&evidence))
         .map_err(|error| error.to_string())?;
-    let mut report = json!({"SchemaVersion":1,"Kind":"native-sandbox-hosted-preparation","Revision":env("GITHUB_SHA")?,"RunId":env("GITHUB_RUN_ID")?,"RunAttempt":env("GITHUB_RUN_ATTEMPT")?,"Passed":false,"ModelExecuted":false,"OwnerDeviceExecuted":false,"Stage":"compile-ownership"});
+    let mut report = json!({"SchemaVersion":1,"Kind":"native-sandbox-hosted-preparation","Revision":env("GITHUB_SHA")?,"RunId":env("GITHUB_RUN_ID")?,"RunAttempt":env("GITHUB_RUN_ATTEMPT")?,"Workload":workload.name(),"Passed":false,"ModelExecuted":false,"OwnerDeviceExecuted":false,"Stage":"compile-ownership"});
     let result = (|| -> crate::Result<Value> {
         let ownership = compile(
             &repository,
@@ -299,7 +301,7 @@ fn prepare(request: &Value) -> crate::Result<Value> {
             if listed.code != 0 {
                 return Err("Sandbox hosted case inventory failed.".into());
             }
-            inventory(binary, &listed.stdout)?;
+            inventory(binary, &listed.stdout, workload)?;
             clean_capture(&evidence, binary)?;
         }
         let mut files = Vec::new();
@@ -309,12 +311,13 @@ fn prepare(request: &Value) -> crate::Result<Value> {
             let (bytes, hash) = digest(&path)?;
             files.push(json!({"Name":name,"Bytes":bytes,"Sha256":hash}));
         }
-        let receipt = json!({"SchemaVersion":1,"Kind":"native-sandbox-prebuilt-package","Revision":env("GITHUB_SHA")?,"RunId":env("GITHUB_RUN_ID")?,"RunAttempt":env("GITHUB_RUN_ATTEMPT")?,"Toolchain":TOOLCHAIN,"MxcVersion":"1.0.1","Files":files,"Cases":CASES,"ModelExecuted":false});
+        let receipt = json!({"SchemaVersion":1,"Kind":"native-sandbox-prebuilt-package","Revision":env("GITHUB_SHA")?,"RunId":env("GITHUB_RUN_ID")?,"RunAttempt":env("GITHUB_RUN_ATTEMPT")?,"Toolchain":TOOLCHAIN,"MxcVersion":"1.0.1","Files":files,"Workload":workload.name(),"Cases":workload.cases(),"ModelExecuted":false});
         package_identity(
             &receipt,
             &env("GITHUB_SHA")?,
             &env("GITHUB_RUN_ID")?,
             &env("GITHUB_RUN_ATTEMPT")?,
+            workload,
         )?;
         write_json(&output.join("receipt.json"), &receipt)?;
         report["Stage"] = "completed".into();
@@ -334,6 +337,7 @@ fn hold_package(
     root: &Path,
     deadline: u64,
     frequency: u64,
+    workload: Workload,
 ) -> crate::Result<(Value, File, Vec<bonsai_artifacts::VerifiedFile>)> {
     if std::env::current_exe().map_err(|error| error.to_string())? != root.join("bonsai-tools.exe")
     {
@@ -349,6 +353,7 @@ fn hold_package(
         &env("GITHUB_SHA")?,
         &env("GITHUB_RUN_ID")?,
         &env("GITHUB_RUN_ATTEMPT")?,
+        workload,
     )?;
     let mut expected = FILES.iter().copied().collect::<BTreeSet<_>>();
     expected.insert("receipt.json");
@@ -523,6 +528,7 @@ fn native_host(report: &mut Value, target: &str) -> crate::Result<()> {
 
 fn qualify(request: &Value) -> crate::Result<Value> {
     ci_guard(false)?;
+    let workload = Workload::select(request.get("workload"))?;
     let root = path(request, "packageDirectory")?;
     let evidence = path(request, "evidenceDirectory")?;
     let work = path(request, "workingDirectory")?;
@@ -547,7 +553,7 @@ fn qualify(request: &Value) -> crate::Result<Value> {
     {
         return Err("Sandbox target differs from its admitted runner environment.".into());
     }
-    let mut report = json!({"SchemaVersion":2,"Kind":"native-sandbox-prebuilt-qualification","Revision":env("GITHUB_SHA")?,"RunId":env("GITHUB_RUN_ID")?,"RunAttempt":env("GITHUB_RUN_ATTEMPT")?,"Toolchain":TOOLCHAIN,"Target":target,"Tests":CASES.iter().map(|(_,name)|json!({"Name":name,"ExitCode":null,"Passed":false,"Status":"pending","PowerBefore":null,"PowerAfter":null})).collect::<Vec<_>>(),"Passed":false,"ActualModelQualified":false,"BrokerOnlyTransportQualified":false,"PerformanceMeasured":false,"PowerBefore":crate::host_cpu::power_snapshot(),"PowerAfter":null,"PreBootstrapPower":null,"WholeJobMaximumSeconds":300,"FixedCaseCount":6,"EstimatedTotalSeconds":240,"Cleanup":{"WorkingDirectoryRemoved":false,"RetainedForDiagnosis":false},"Scope":"Six fixed model-free native sandbox controls; host-loopback authority includes other host services; no model, broker-only transport, throughput or complete application qualification."});
+    let mut report = json!({"SchemaVersion":2,"Kind":"native-sandbox-prebuilt-qualification","Revision":env("GITHUB_SHA")?,"RunId":env("GITHUB_RUN_ID")?,"RunAttempt":env("GITHUB_RUN_ATTEMPT")?,"Toolchain":TOOLCHAIN,"Target":target,"Workload":workload.name(),"Tests":workload.cases().iter().map(|(_,name)|json!({"Name":name,"ExitCode":null,"Passed":false,"Status":"pending","PowerBefore":null,"PowerAfter":null})).collect::<Vec<_>>(),"Passed":false,"ActualModelQualified":false,"BrokerOnlyTransportQualified":false,"PerformanceMeasured":false,"PowerBefore":crate::host_cpu::power_snapshot(),"PowerAfter":null,"PreBootstrapPower":null,"WholeJobMaximumSeconds":300,"FixedCaseCount":workload.cases().len(),"EstimatedTotalSeconds":workload.estimated_total_seconds(),"Cleanup":{"WorkingDirectoryRemoved":false,"RetainedForDiagnosis":false},"Scope":workload.scope()});
     let result = (|| -> crate::Result<Value> {
         let (deadline, work_deadline, frequency) = budget(&mut report)?;
         let execution = Execution {
@@ -558,7 +564,8 @@ fn qualify(request: &Value) -> crate::Result<Value> {
             work_deadline,
             frequency,
         };
-        let (receipt, _receipt_handle, _files) = hold_package(&root, deadline, frequency)?;
+        let (receipt, _receipt_handle, _files) =
+            hold_package(&root, deadline, frequency, workload)?;
         report["Package"] = receipt.clone();
         report["MxcVersion"] = receipt["MxcVersion"].clone();
         native_host(&mut report, target)?;
@@ -574,11 +581,17 @@ fn qualify(request: &Value) -> crate::Result<Value> {
             if listed.0 != 0 {
                 return Err("Sandbox prebuilt case inventory failed.".into());
             }
-            inventory(binary, &listed.1)?;
+            inventory(binary, &listed.1, workload)?;
         }
-        for (index, &(binary, name)) in CASES.iter().enumerate() {
+        for (index, &(binary, name)) in workload.cases().iter().enumerate() {
             check_deadline(work_deadline, frequency)?;
-            remaining_fit(clocks()?.0, frequency, work_deadline, CASES.len() - index)?;
+            remaining_fit(
+                clocks()?.0,
+                frequency,
+                work_deadline,
+                workload.cases().len() - index,
+                workload,
+            )?;
             report["Tests"][index]["Status"] = "running".into();
             report["Tests"][index]["PowerBefore"] = crate::host_cpu::power_snapshot();
             write_json(&evidence.join("qualification.json"), &report)?;

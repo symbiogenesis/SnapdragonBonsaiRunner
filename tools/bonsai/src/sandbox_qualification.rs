@@ -49,6 +49,74 @@ const TOOLCHAIN: &str = "nightly-2026-11-12-aarch64-pc-windows-msvc";
 // Fixed controls contain different numbers of ten-second native waits. Keep
 // their conservative remaining estimates attached to the original case order.
 const CASE_SECONDS: &[u64] = &[45, 25, 15, 15, 50, 30];
+const LOG_CASES: &[(&str, &str)] = &[
+    (
+        "sandbox-ownership.exe",
+        "native_sandbox_stdout_flood_is_capped_and_stopped",
+    ),
+    (
+        "sandbox-ownership.exe",
+        "native_sandbox_stderr_flood_is_capped_and_stopped",
+    ),
+    (
+        "sandbox-ownership.exe",
+        "native_sandbox_exit_drains_both_logs_and_releases_capture_files",
+    ),
+];
+const LOG_CASE_SECONDS: &[u64] = &[30, 30, 30];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Workload {
+    Authority,
+    LogCapture,
+}
+
+impl Workload {
+    fn select(value: Option<&Value>) -> crate::Result<Self> {
+        match value {
+            None => Ok(Self::Authority),
+            Some(Value::String(name)) if name == "authority-v1" => Ok(Self::Authority),
+            Some(Value::String(name)) if name == "log-capture-v1" => Ok(Self::LogCapture),
+            _ => Err("Unknown sandbox qualification workload.".into()),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Authority => "authority-v1",
+            Self::LogCapture => "log-capture-v1",
+        }
+    }
+
+    const fn cases(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Authority => CASES,
+            Self::LogCapture => LOG_CASES,
+        }
+    }
+
+    const fn seconds(self) -> &'static [u64] {
+        match self {
+            Self::Authority => CASE_SECONDS,
+            Self::LogCapture => LOG_CASE_SECONDS,
+        }
+    }
+
+    fn estimated_total_seconds(self) -> u64 {
+        self.seconds().iter().sum::<u64>() + 60
+    }
+
+    const fn scope(self) -> &'static str {
+        match self {
+            Self::Authority => {
+                "Six fixed model-free native sandbox controls; host-loopback authority includes other host services; no model, broker-only transport, throughput or complete application qualification."
+            }
+            Self::LogCapture => {
+                "Three fixed model-free native capture controls: stdout flood, stderr flood and normal-exit tail draining; no scratch/private-temp quota, broker-only transport, model, performance or complete application qualification."
+            }
+        }
+    }
+}
 
 fn text<'a>(value: &'a Value, key: &str) -> crate::Result<&'a str> {
     value[key]
@@ -95,6 +163,7 @@ fn package_identity(
     revision: &str,
     run: &str,
     attempt: &str,
+    workload: Workload,
 ) -> crate::Result<()> {
     if receipt["SchemaVersion"] != 1
         || receipt["Kind"] != "native-sandbox-prebuilt-package"
@@ -104,7 +173,10 @@ fn package_identity(
         || receipt["Toolchain"] != TOOLCHAIN
         || receipt["ModelExecuted"] != false
         || receipt["MxcVersion"] != "1.0.1"
-        || receipt["Cases"] != json!(CASES)
+        // Legacy schema-1 packages omit Workload and retain only the original
+        // six authority controls. They can never authorize the log workload.
+        || Workload::select(receipt.get("Workload"))? != workload
+        || receipt["Cases"] != json!(workload.cases())
     {
         return Err("Sandbox package source/run/workload identity differs.".into());
     }
@@ -130,9 +202,9 @@ fn package_identity(
     Ok(())
 }
 
-fn inventory(binary: &str, output: &str) -> crate::Result<()> {
+fn inventory(binary: &str, output: &str, workload: Workload) -> crate::Result<()> {
     let listed = output.lines().collect::<std::collections::BTreeSet<_>>();
-    for &(file, name) in CASES {
+    for &(file, name) in workload.cases() {
         if file == binary && !listed.contains(format!("{name}: test").as_str()) {
             return Err(format!("Required native sandbox case missing: {name}"));
         }
@@ -140,12 +212,19 @@ fn inventory(binary: &str, output: &str) -> crate::Result<()> {
     Ok(())
 }
 
-fn remaining_fit(now: u64, frequency: u64, deadline: u64, cases: usize) -> crate::Result<()> {
+fn remaining_fit(
+    now: u64,
+    frequency: u64,
+    deadline: u64,
+    cases: usize,
+    workload: Workload,
+) -> crate::Result<()> {
     if frequency == 0
         || cases == 0
-        || cases > CASES.len()
-        || CASE_SECONDS
-            .get(CASES.len() - cases..)
+        || cases > workload.cases().len()
+        || workload
+            .seconds()
+            .get(workload.cases().len() - cases..)
             .map(|seconds| seconds.iter().sum::<u64>())
             .and_then(|seconds| seconds.checked_mul(frequency))
             .and_then(|ticks| now.checked_add(ticks))
@@ -211,7 +290,7 @@ mod tests {
             .map(|name| json!({"Name":name,"Bytes":1,"Sha256":"b".repeat(64)}))
             .collect::<Vec<_>>();
         let receipt = json!({"SchemaVersion":1,"Kind":"native-sandbox-prebuilt-package","Revision":"a".repeat(40),"RunId":"123","RunAttempt":"1","Toolchain":TOOLCHAIN,"ModelExecuted":false,"MxcVersion":"1.0.1","Cases":CASES,"Files":files});
-        package_identity(&receipt, &"a".repeat(40), "123", "1")?;
+        package_identity(&receipt, &"a".repeat(40), "123", "1", Workload::Authority)?;
         for (field, value) in [
             ("RunId", json!("124")),
             ("Cases", json!([])),
@@ -220,7 +299,10 @@ mod tests {
         ] {
             let mut changed = receipt.clone();
             changed[field] = value;
-            assert!(package_identity(&changed, &"a".repeat(40), "123", "1").is_err());
+            assert!(
+                package_identity(&changed, &"a".repeat(40), "123", "1", Workload::Authority)
+                    .is_err()
+            );
         }
         let listed = CASES
             .iter()
@@ -228,8 +310,8 @@ mod tests {
             .map(|(_, name)| format!("{name}: test"))
             .collect::<Vec<_>>()
             .join("\n");
-        inventory("sandbox-ownership.exe", &listed)?;
-        assert!(inventory("sandbox-ownership.exe", "").is_err());
+        inventory("sandbox-ownership.exe", &listed, Workload::Authority)?;
+        assert!(inventory("sandbox-ownership.exe", "", Workload::Authority).is_err());
         Ok(())
     }
 
@@ -238,10 +320,10 @@ mod tests {
     -> crate::Result<()> {
         assert_eq!(CASE_SECONDS.len(), CASES.len());
         assert_eq!(CASE_SECONDS.iter().sum::<u64>(), 180);
-        remaining_fit(1_000, 10, 2_800, 6)?;
-        assert!(remaining_fit(1_001, 10, 2_800, 6).is_err());
-        remaining_fit(1_450, 10, 2_800, 5)?;
-        assert!(remaining_fit(1_451, 10, 2_800, 5).is_err());
+        remaining_fit(1_000, 10, 2_800, 6, Workload::Authority)?;
+        assert!(remaining_fit(1_001, 10, 2_800, 6, Workload::Authority).is_err());
+        remaining_fit(1_450, 10, 2_800, 5, Workload::Authority)?;
+        assert!(remaining_fit(1_451, 10, 2_800, 5, Workload::Authority).is_err());
         for (now, frequency, deadline, count) in [
             (0, 0, 1, 1),
             (0, u64::MAX, u64::MAX, 6),
@@ -249,7 +331,94 @@ mod tests {
             (0, 1, 1, 0),
             (0, 1, u64::MAX, 7),
         ] {
-            assert!(remaining_fit(now, frequency, deadline, count).is_err());
+            assert!(remaining_fit(now, frequency, deadline, count, Workload::Authority).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_log_workload_cannot_expand_or_substitute_original_authority_controls()
+    -> crate::Result<()> {
+        assert_eq!(Workload::select(None)?, Workload::Authority);
+        assert_eq!(
+            Workload::select(Some(&json!("authority-v1")))?,
+            Workload::Authority
+        );
+        assert_eq!(
+            Workload::select(Some(&json!("log-capture-v1")))?,
+            Workload::LogCapture
+        );
+        for value in [Value::Null, json!("logs"), json!([]), json!(true)] {
+            assert!(Workload::select(Some(&value)).is_err());
+        }
+        let files = FILES
+            .iter()
+            .map(|name| json!({"Name":name,"Bytes":1,"Sha256":"b".repeat(64)}))
+            .collect::<Vec<_>>();
+        let mut receipt = json!({"SchemaVersion":1,"Kind":"native-sandbox-prebuilt-package","Revision":"a".repeat(40),"RunId":"123","RunAttempt":"1","Toolchain":TOOLCHAIN,"ModelExecuted":false,"MxcVersion":"1.0.1","Workload":"log-capture-v1","Cases":LOG_CASES,"Files":files});
+        package_identity(&receipt, &"a".repeat(40), "123", "1", Workload::LogCapture)?;
+        assert!(
+            package_identity(&receipt, &"a".repeat(40), "123", "1", Workload::Authority).is_err()
+        );
+        for (field, value) in [
+            ("Workload", Value::Null),
+            ("Workload", json!("authority-v1")),
+            ("Cases", json!(CASES)),
+            ("Cases", json!([LOG_CASES[0], LOG_CASES[1]])),
+        ] {
+            let mut changed = receipt.clone();
+            changed[field] = value;
+            assert!(
+                package_identity(&changed, &"a".repeat(40), "123", "1", Workload::LogCapture)
+                    .is_err()
+            );
+        }
+        receipt
+            .as_object_mut()
+            .ok_or("fixture receipt must be an object")?
+            .remove("Workload");
+        assert!(
+            package_identity(&receipt, &"a".repeat(40), "123", "1", Workload::LogCapture).is_err()
+        );
+        let listed = LOG_CASES
+            .iter()
+            .map(|(_, name)| format!("{name}: test"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        inventory("sandbox-ownership.exe", &listed, Workload::LogCapture)?;
+        assert!(inventory("sandbox-ownership.exe", &listed, Workload::Authority).is_err());
+        assert!(
+            inventory(
+                "sandbox-ownership.exe",
+                &format!("{}: test", LOG_CASES[0].1),
+                Workload::LogCapture,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_log_admission_keeps_three_controls_inside_the_original_deadline() -> crate::Result<()>
+    {
+        let workload = Workload::LogCapture;
+        assert_eq!(workload.cases().len(), 3);
+        assert_eq!(workload.seconds().len(), 3);
+        assert_eq!(workload.estimated_total_seconds(), 150);
+        assert_eq!(Workload::Authority.estimated_total_seconds(), 240);
+        for index in 0..workload.cases().len() {
+            let now = 1_000 + u64::try_from(index).map_err(|error| error.to_string())? * 300;
+            remaining_fit(now, 10, 1_900, 3 - index, workload)?;
+            assert!(remaining_fit(now + 1, 10, 1_900, 3 - index, workload).is_err());
+        }
+        for (now, frequency, deadline, count) in [
+            (0, 0, 1, 1),
+            (0, u64::MAX, u64::MAX, 3),
+            (u64::MAX, 1, u64::MAX, 1),
+            (0, 1, 1, 0),
+            (0, 1, u64::MAX, 4),
+        ] {
+            assert!(remaining_fit(now, frequency, deadline, count, workload).is_err());
         }
         Ok(())
     }
