@@ -54,6 +54,25 @@ fn identity(path: &Path) -> Result<Value> {
         json!({"name":path.file_name().and_then(|s|s.to_str()).ok_or("Invalid input filename.")?,"bytes":file.metadata().map_err(|error|error.to_string())?.len(),"sha256":digest}),
     )
 }
+fn store_input(path: &Path, bytes: &[u8]) -> Result<Value> {
+    {
+        let mut output = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        std::io::Write::write_all(&mut output, bytes).map_err(|error| error.to_string())?;
+        output.sync_all().map_err(|error| error.to_string())?;
+    }
+    // Identity intake denies writers on Windows. Close our own writer first;
+    // weakening sharing would permit mutation during the retained hash read.
+    let stored = identity(path)?;
+    require(
+        stored["bytes"] == bytes.len() && stored["sha256"] == ids::sha256(bytes),
+        "Stored public input differs from the verified download.",
+    )?;
+    Ok(stored)
+}
 fn pinned(path: &Path, expected: &Value) -> Result<Value> {
     let actual = identity(path)?;
     require(
@@ -339,13 +358,7 @@ impl Control {
                 && pin["sha256"] == ids::sha256(&response.body),
             "Public input differs from exact byte/digest pin.",
         )?;
-        let mut output = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
-        std::io::Write::write_all(&mut output, &response.body).map_err(|e| e.to_string())?;
-        let mut result = identity(&path)?;
+        let mut result = store_input(&path, &response.body)?;
         result["url"] = json!(url);
         Ok(result)
     }
@@ -362,6 +375,24 @@ pub(super) fn run(request: &Request) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn public_input_writer_closes_before_guarded_identity() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "Bonsai-Public-Input-{}.h",
+            startup_process::unique()
+        ));
+        let bytes = b"reviewed public ABI header\n";
+        let result = (|| {
+            let received = store_input(&path, bytes)?;
+            assert_eq!(received["bytes"], bytes.len());
+            assert_eq!(received["sha256"], ids::sha256(bytes));
+            assert!(store_input(&path, b"replacement").is_err());
+            assert_eq!(fs::read(&path).map_err(|error| error.to_string())?, bytes);
+            Ok(())
+        })();
+        fs::remove_file(&path).map_err(|error| error.to_string())?;
+        result
+    }
     fn inherited_fixture() -> Vec<(String, String)> {
         [
             ("SystemRoot", "protected-root"),
