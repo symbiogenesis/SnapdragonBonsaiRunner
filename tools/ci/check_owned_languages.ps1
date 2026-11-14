@@ -9,10 +9,10 @@ function Test-PythonInterpreter([string]$Name) {
     [IO.Path]::GetFileName($Name.Replace('\','/')) -imatch '^(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?$'
 }
 
-function Get-PowerShellPythonCalls([string]$Path) {
+function Get-PowerShellPythonCalls([string]$Path, [Func[Management.Automation.Language.Ast,bool]]$CommandPredicate) {
     $tokens=$null; $parseErrors=$null
     $syntax=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$parseErrors)
-    $commands=$syntax.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] },$true)
+    $commands=$syntax.FindAll($CommandPredicate,$true)
     foreach ($command in $commands) {
         $name=$command.GetCommandName()
         if (-not $name) { continue }
@@ -34,6 +34,10 @@ function Get-PowerShellPythonCalls([string]$Path) {
 
 function Test-OwnedLanguages([string]$RepositoryRoot) {
     $errors=[Collections.Generic.List[string]]::new()
+    # Bind the same type test directly to .NET so AST traversal does not invoke
+    # a PowerShell scriptblock for every node. Nested commands remain included.
+    $commandPredicate=[Delegate]::CreateDelegate([Func[Management.Automation.Language.Ast,bool]],
+        [Management.Automation.Language.CommandAst], [type].GetMethod('IsInstanceOfType',[type[]]@([object])))
     $linePolicy=[regex]::new((@(
         '^\s*(?:-\s*)?(?:run:\s*)?(?:&\s*)?[''"]?(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?(?:\s|[''"]|$)'
         '^\s*shell:\s*[''"]?python(?:[23](?:\.[0-9]+)*)?(?:\s|[''"]|$)'
@@ -55,7 +59,7 @@ function Test-OwnedLanguages([string]$RepositoryRoot) {
             if ($extension -in @('.py','.pyc','.pyo','.pyw')) { $errors.Add("${relative}: owned Python code/runtime bytecode is prohibited"); continue }
             if ($extension -notin @('.ps1','.psm1','.rs','.yml','.yaml','.sh') -and $relative -cne '.githooks/pre-commit') { continue }
             if ($extension -in @('.ps1','.psm1')) {
-                foreach ($lineNumber in (Get-PowerShellPythonCalls $entry)) { $errors.Add("${relative}:${lineNumber}: Python execution is prohibited") }
+                foreach ($lineNumber in (Get-PowerShellPythonCalls $entry $commandPredicate)) { $errors.Add("${relative}:${lineNumber}: Python execution is prohibited") }
                 continue
             }
             $text=[IO.File]::ReadAllText($entry)

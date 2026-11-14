@@ -27,6 +27,20 @@ $cases=[ordered]@{
     Write-CiFixture $r 'tools/control.PS1' ($commands -join "`n")
     Assert-CiEqual (Test-OwnedLanguages $r).Count $commands.Count
  } }
+ nested_powershell_commands_preserve_exact_diagnostics={ Invoke-LanguageFixture { param($r)
+    Write-CiFixture $r 'tools/nested.ps1' @'
+$historical = 'python control.py is inert metadata'
+function Invoke-Nested {
+    $description = 'Start-Process python.exe is inert metadata'
+    & { python3.14 -B control.py }
+    $deferred = { Start-Process -FilePath "python.exe" -Wait }
+}
+'@
+    Assert-CiEqual (Test-OwnedLanguages $r) @(
+        'tools/nested.ps1:4: Python execution is prohibited'
+        'tools/nested.ps1:5: Python execution is prohibited'
+    )
+ } }
  powershell_provenance_strings_preserved={ Invoke-LanguageFixture { param($r)
     $source=@('# python control.py', '$historical = ''python control.py''', 'Write-Output "Start-Process python.exe"',
         'Start-Process bonsai-tools.exe -ArgumentList "python is historical metadata"', '& pwsh -NoProfile -File control.ps1')
