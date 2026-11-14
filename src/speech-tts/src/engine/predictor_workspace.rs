@@ -94,12 +94,12 @@ mod tests {
                 .all(|layer| layer.k.is_empty() && layer.v.is_empty() && layer.seq_len == 0)
         );
         assert_eq!(workspace.seen, Vec::<u8>::new());
-        assert!(workspace.decoder.norm.is_empty());
+        assert_eq!(workspace.decoder.norm, Vec::<f32>::new());
         assert_eq!(workspace.decoder.norm.capacity(), 16);
         let interrupted = std::panic::catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
             let mut frame = workspace.frame(2)?;
             let (layers, seen, decoder) = frame.buffers();
-            assert!(decoder.norm.is_empty());
+            assert_eq!(decoder.norm, Vec::<f32>::new());
             decoder.norm.extend_from_slice(&[f32::NAN; 16]);
             for (layer, allocation) in layers.iter_mut().zip(&allocations) {
                 assert_eq!(
@@ -126,7 +126,7 @@ mod tests {
                 .all(|layer| layer.k.is_empty() && layer.v.is_empty() && layer.seq_len == 0)
         );
         assert_eq!(workspace.seen, Vec::<u8>::new());
-        assert!(workspace.decoder.norm.is_empty());
+        assert_eq!(workspace.decoder.norm, Vec::<f32>::new());
         assert_eq!(workspace.decoder.norm.capacity(), 16);
         drop(workspace.frame(1)?);
         assert_eq!(workspace.layers.len(), 1);
