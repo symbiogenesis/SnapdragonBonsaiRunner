@@ -33,6 +33,32 @@ pub(crate) struct ProcessOutput {
     pub(crate) code: u32,
 }
 
+impl ProcessOutput {
+    pub(crate) fn failure_summary(&self) -> String {
+        format!(
+            "exit code {} (0x{:08X}); stdout: {}; stderr: {}",
+            self.code,
+            self.code,
+            diagnostic_excerpt(&self.stdout),
+            diagnostic_excerpt(&self.stderr),
+        )
+    }
+}
+
+fn diagnostic_excerpt(text: &str) -> String {
+    const MAXIMUM: usize = 2048;
+    let text = text.trim();
+    if text.is_empty() {
+        return "<empty>".into();
+    }
+    let end = text.floor_char_boundary(text.len().min(MAXIMUM));
+    format!(
+        "{}{}",
+        &text[..end],
+        if end < text.len() { " [truncated]" } else { "" }
+    )
+}
+
 pub(crate) fn unique() -> String {
     format!(
         "{}-{}-{}",
@@ -270,12 +296,12 @@ fn write_log(log: &Path, output: &ProcessOutput) -> crate::Result<()> {
         .map_err(|error| error.to_string())
 }
 
-fn reject_survivors(survivors: u32, log: &Path) -> crate::Result<()> {
+fn reject_survivors(survivors: u32, status: u32, log: &Path) -> crate::Result<()> {
     if survivors == 0 {
         return Ok(());
     }
     let message = format!(
-        "Tool root exited with {survivors} surviving owned Job members; descendants were stopped."
+        "Tool root exited with code {status} (0x{status:08X}) and {survivors} surviving owned Job members; descendants were stopped."
     );
     OpenOptions::new()
         .append(true)
@@ -405,16 +431,56 @@ struct RunSpec<'a> {
     log: &'a Path,
 }
 
-fn write_failure_log(log: &Path, message: &str, stdout: &Path, stderr: &Path) -> crate::Result<()> {
+fn write_failure_log(
+    log: &Path,
+    message: &str,
+    status: &crate::Result<Option<u32>>,
+    cleanup: &crate::Result<()>,
+    stdout: &Path,
+    stderr: &Path,
+) -> crate::Result<()> {
+    // Observe the root before forced teardown. A cleanup termination code must
+    // never be presented as the cause of a compiler's original failure.
+    let status = match status {
+        Ok(Some(code)) => format!("exited-0x{code:08X}"),
+        Ok(None) => "running".into(),
+        Err(_) => "status-unavailable".into(),
+    };
+    let cleanup = if cleanup.is_ok() {
+        "confirmed"
+    } else {
+        "unconfirmed"
+    };
     fs::write(
         log,
         format!(
-            "{message}\nstdout: {}\nstderr: {}\n",
+            "{message}\nRoot process before cleanup: {status}\nOwned process cleanup: {cleanup}\nstdout: {}\nstderr: {}\n",
             stdout.display(),
             stderr.display()
         ),
     )
     .map_err(|error| error.to_string())
+}
+
+fn fail_owned(
+    guard: &mut ChildGuard,
+    log: &Path,
+    message: &str,
+    stdout: &Path,
+    stderr: &Path,
+) -> crate::Result<ProcessOutput> {
+    let status = guard.try_wait();
+    let cleanup = if guard.finished { Ok(()) } else { guard.stop() };
+    if cleanup.is_ok() {
+        guard.finished = true;
+    }
+    write_failure_log(log, message, &status, &cleanup, stdout, stderr)?;
+    let cleanup = if cleanup.is_ok() {
+        ""
+    } else {
+        " Owned process cleanup could not be confirmed."
+    };
+    Err(format!("{message}{cleanup} Evidence: {}", log.display()))
 }
 
 fn run_owned(
@@ -482,8 +548,7 @@ fn run_owned(
     let started = Instant::now();
     let status = loop {
         if let Err(error) = checkpoint() {
-            write_failure_log(log, &error, &stdout_path, &stderr_path)?;
-            return Err(format!("{error} Evidence: {}", log.display()));
+            return fail_owned(&mut guard, log, &error, &stdout_path, &stderr_path);
         }
         if let Some(status) = guard.try_wait()? {
             break status;
@@ -498,29 +563,30 @@ fn run_owned(
                 .len()
                 > MAX_OUTPUT
         {
-            write_failure_log(
+            return fail_owned(
+                &mut guard,
                 log,
                 "Tool timed out or exceeded its output bound.",
                 &stdout_path,
                 &stderr_path,
-            )?;
-            return Err(format!(
-                "Tool timed out or exceeded its output bound. Evidence: {}",
-                log.display()
-            ));
+            );
         }
         thread::sleep(Duration::from_millis(20));
     };
     let survivors = guard.stop_after_exit(policy)?;
-    checkpoint()?;
+    if let Err(error) = checkpoint() {
+        return fail_owned(&mut guard, log, &error, &stdout_path, &stderr_path);
+    }
     let output = ProcessOutput {
         stdout: text(&stdout_path)?,
         stderr: text(&stderr_path)?,
         code: status,
     };
     write_log(log, &output)?;
-    reject_survivors(survivors, log)?;
-    checkpoint()?;
+    reject_survivors(survivors, status, log)?;
+    if let Err(error) = checkpoint() {
+        return fail_owned(&mut guard, log, &error, &stdout_path, &stderr_path);
+    }
     Ok(output)
 }
 
@@ -529,6 +595,62 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use std::os::windows::process::CommandExt as _;
+
+    #[test]
+    fn failure_summary_preserves_exit_code_and_bounded_unicode_streams() {
+        let mut output = ProcessOutput {
+            stdout: "  compiler output\n".into(),
+            stderr: " \r\n\t".into(),
+            code: 0xc000_0142,
+        };
+        assert_eq!(
+            output.failure_summary(),
+            "exit code 3221225794 (0xC0000142); stdout: compiler output; stderr: <empty>"
+        );
+        output.stdout = format!("{}\u{1f331}omitted", "a".repeat(2047));
+        output.stderr = "\u{1f331}".repeat(1024);
+        let summary = output.failure_summary();
+        assert!(summary.contains(&format!("{} [truncated]", "a".repeat(2047))));
+        assert!(!summary.contains("omitted"));
+        assert!(summary.contains(&format!("{} [truncated]", "\u{1f331}".repeat(512))));
+        assert!(summary.len() < 4200);
+    }
+
+    #[test]
+    fn failure_receipt_keeps_pre_cleanup_exit_and_unknown_status_distinct() -> crate::Result<()> {
+        let scratch = std::env::temp_dir().join(format!("Bonsai-Process-Failure-{}", unique()));
+        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let log = scratch.join("failure.log");
+        let stdout = scratch.join("capture.stdout");
+        let stderr = scratch.join("capture.stderr");
+        for (status, cleanup, expected) in [
+            (
+                Ok(Some(0xc000_0142)),
+                Ok(()),
+                "Root process before cleanup: exited-0xC0000142\nOwned process cleanup: confirmed",
+            ),
+            (
+                Ok(None),
+                Ok(()),
+                "Root process before cleanup: running\nOwned process cleanup: confirmed",
+            ),
+            (
+                Err("private status error".into()),
+                Err("private cleanup error".into()),
+                "Root process before cleanup: status-unavailable\nOwned process cleanup: unconfirmed",
+            ),
+        ] {
+            write_failure_log(&log, "Fixed failure.", &status, &cleanup, &stdout, &stderr)?;
+            let evidence = fs::read_to_string(&log).map_err(|error| error.to_string())?;
+            assert!(evidence.starts_with("Fixed failure.\n"));
+            assert!(evidence.contains(expected));
+            assert!(!evidence.contains("private"));
+            assert!(evidence.contains(&format!("stdout: {}", stdout.display())));
+            assert!(evidence.contains(&format!("stderr: {}", stderr.display())));
+        }
+        fs::remove_file(log).map_err(|error| error.to_string())?;
+        fs::remove_dir(scratch).map_err(|error| error.to_string())
+    }
 
     #[test]
     fn build_deadlines_require_the_explicit_exact_hosted_release() {
@@ -732,6 +854,7 @@ mod tests {
                 "--exact".into(),
                 "startup_process::tests::compiler_tree_parent".into(),
                 "--ignored".into(),
+                "--nocapture".into(),
             ],
             marker,
         ))
@@ -754,6 +877,7 @@ mod tests {
             "descendant.partial",
             format!("{}\n{creation}", std::process::id()),
         )?;
+        std::io::stderr().write_all(b"Synthetic compiler descendant ready.\n")?;
         fs::rename("descendant.partial", "descendant.txt")?;
         thread::sleep(Duration::from_secs(30));
         Ok(())
@@ -765,11 +889,13 @@ mod tests {
     fn compiler_tree_parent() -> std::io::Result<()> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let wait = compiler_tree_wait()?;
+        std::io::stderr().write_all(b"Synthetic compiler parent started.\n")?;
         let mut child = std::process::Command::new(std::env::current_exe()?)
             .args([
                 "--exact",
                 "startup_process::tests::compiler_tree_leaf",
                 "--ignored",
+                "--nocapture",
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()?;
@@ -841,11 +967,18 @@ mod tests {
         assert!(crate::startup_cache::lock_file(&lock_path).is_err());
         drop(lock);
         let _next_build = crate::startup_cache::lock_file(&lock_path)?;
-        assert!(
-            fs::read_to_string(scratch.join("cancel.log"))
-                .map_err(|error| error.to_string())?
-                .contains("Synthetic caller cancellation.")
-        );
+        let evidence =
+            fs::read_to_string(scratch.join("cancel.log")).map_err(|error| error.to_string())?;
+        assert!(evidence.contains("Synthetic caller cancellation."));
+        assert!(evidence.contains("Root process before cleanup: running"));
+        assert!(evidence.contains("Owned process cleanup: confirmed"));
+        let captured = evidence
+            .lines()
+            .find_map(|line| line.strip_prefix("stderr: "))
+            .ok_or("Missing compiler stderr capture identity.")?;
+        let captured = fs::read_to_string(captured).map_err(|error| error.to_string())?;
+        assert!(captured.contains("Synthetic compiler parent started."));
+        assert!(captured.contains("Synthetic compiler descendant ready."));
         Ok(())
     }
 

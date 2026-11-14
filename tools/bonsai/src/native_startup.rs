@@ -142,7 +142,7 @@ fn checked_process(
         return Err(format!(
             "Native build preparation failed ({name}); see {}: {}",
             log.display(),
-            result.stderr.trim()
+            result.failure_summary()
         ));
     }
     Ok(result.stdout)

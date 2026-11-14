@@ -195,7 +195,7 @@ pub(crate) fn cached_build_with_timeout(
             return Err(format!(
                 "Source build failed; see {}\n{}",
                 log.display(),
-                result.stderr
+                result.failure_summary()
             ));
         }
         Ok(())
