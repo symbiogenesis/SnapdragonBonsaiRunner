@@ -91,10 +91,12 @@ try {
             $env:CARGO_INCREMENTAL = '1'
             Push-Location -LiteralPath $policy
             try {
-                # Cargo freshness is not an output-integrity check. Discard both
-                # packages' aliases/fingerprints before admitting rebuilt bytes.
-                cargo "+$toolchain" clean --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --package bonsai-windows-process --target aarch64-pc-windows-msvc --target-dir $target
-                cargo "+$toolchain" build --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --package bonsai-windows-process --bin bonsai-push-recovery --target aarch64-pc-windows-msvc --target-dir $target
+                # Extra target-only rustc arguments dirty these binary units,
+                # even if their cached output bytes were externally changed.
+                # Dependencies retain their normal fingerprints and cache.
+                $metadata = 'bonsai_push_prepare_' + [guid]::NewGuid().ToString('N')
+                cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
+                cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-windows-process --bin bonsai-push-recovery --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
             }
             finally { Pop-Location }
             @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-FileHash -LiteralPath $recoveryTool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
