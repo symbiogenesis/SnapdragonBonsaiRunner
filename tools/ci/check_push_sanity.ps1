@@ -27,6 +27,9 @@ try {
     $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
     $tool = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
     $receiptPath = Join-Path $target 'push-checker.json'
+    # A failed explicit rebuild cannot leave an earlier preparation admitted.
+    # Keep its binary for diagnosis/reuse, but publish a receipt only on success.
+    if ($Prepare) { [IO.File]::Delete($receiptPath) }
     # Ordinary pushes never compile. A missing/stale helper is a prerequisite
     # failure, avoiding an unsupervised cold compiler inside the push allowance.
     if (-not $Prepare) {
