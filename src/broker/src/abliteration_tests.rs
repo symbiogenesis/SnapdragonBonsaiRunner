@@ -127,7 +127,14 @@ mod transport {
 
     const FRONT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const BACK: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const EMPTY_RESPONSE: [u8; 0] = [];
+    const SCHEMA_REJECTION: &[u8] = concat!(
+        "HTTP/1.1 400 Bad Request\r\n",
+        "Connection: close\r\nCache-Control: no-store\r\n",
+        "X-Content-Type-Options: nosniff\r\n",
+        "Content-Type: application/json\r\nContent-Length: 41\r\n\r\n",
+        r#"{"error":{"code":"invalid_chat_request"}}"#
+    )
+    .as_bytes();
 
     async fn request(port: u16, scale: f64) -> TcpStream {
         let body = serde_json::to_vec(&json!({
@@ -182,7 +189,7 @@ mod transport {
     }
 
     #[test]
-    fn invalid_scale_closes_schema_connection_before_backend_and_preserves_service() {
+    fn invalid_scale_returns_schema_error_before_backend_and_preserves_service() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -199,12 +206,12 @@ mod transport {
                 let worker = Arc::clone(&service);
                 let rejected =
                     spawn_local(async move { worker.accept().await.unwrap().serve().await });
-                // Do not half-close the client: schema rejection itself must
-                // close this complete request without emitting HTTP bytes.
+                // Keep the sending side open: this complete authenticated
+                // schema rejection must send its fixed reply and close itself.
                 let mut client = request(service.port(), 2.000_000_01).await;
                 let mut bytes = Vec::new();
                 client.read_to_end(&mut bytes).await.unwrap();
-                assert_eq!(bytes, EMPTY_RESPONSE);
+                assert_eq!(bytes, SCHEMA_REJECTION);
                 assert_eq!(
                     rejected.await.unwrap(),
                     Err(ServiceError::Request(ServeError::Receive(
