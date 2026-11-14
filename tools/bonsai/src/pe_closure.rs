@@ -268,6 +268,21 @@ pub(crate) fn imports(image: &Image, delayed: bool) -> Result<Vec<String>> {
     Err("Unterminated import directory".into())
 }
 
+pub(crate) enum ImportSymbol<'a> {
+    Name(&'a str),
+    Ordinal(u16),
+}
+
+pub(crate) fn visit_import_symbols(
+    image: &Image,
+    delayed: bool,
+    visitor: impl FnMut(&str, ImportSymbol<'_>) -> Result<()>,
+) -> Result<usize> {
+    symbol_imports::visit_import_symbols(image, delayed, visitor)
+}
+
+mod symbol_imports;
+
 fn api_text(data: &[u8], offset: usize, length: usize) -> Result<String> {
     if !length.is_multiple_of(2) {
         return Err("Invalid API-set name extent".into());

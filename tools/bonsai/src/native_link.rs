@@ -438,7 +438,7 @@ fn verify_inputs(
 }
 
 fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
-    if ![1, 2].contains(&manifest.schema_version)
+    if ![1, 2, 3].contains(&manifest.schema_version)
         || manifest.kind != "selected-lld-arm64-link-package"
         || !(1..=128).contains(&manifest.links.len())
     {
@@ -464,6 +464,7 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
     let mut packaged_images = BTreeSet::new();
     let mut imported_systems = BTreeSet::new();
     let mut runtime_symbols = BTreeMap::new();
+    let mut runtime_imports = Vec::new();
     for link in &manifest.links {
         verify_inputs(
             link,
@@ -472,7 +473,7 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
             &manifest.linker,
             &outputs,
             &mut covered,
-            (manifest.schema_version == 2).then_some(&mut runtime_symbols),
+            (manifest.schema_version >= 2).then_some(&mut runtime_symbols),
         )?;
         let file = package
             .get(&link.package_name)
@@ -501,6 +502,33 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
                 }
             }
         }
+        if manifest.schema_version >= 3 {
+            let mut named = 0;
+            let mut known = Vec::new();
+            let mut ordinals = Vec::new();
+            for delayed in [false, true] {
+                crate::pe_closure::visit_import_symbols(&image, delayed, |module, symbol| {
+                    match symbol {
+                        crate::pe_closure::ImportSymbol::Name(name) => {
+                            named += 1;
+                            if coff::known(name.as_bytes()) {
+                                known
+                                    .push(json!({"module":module,"delayed":delayed,"symbol":name}));
+                            }
+                        }
+                        crate::pe_closure::ImportSymbol::Ordinal(ordinal) => {
+                            ordinals
+                                .push(json!({"module":module,"delayed":delayed,"ordinal":ordinal}));
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            runtime_imports.push(json!({
+                "packageName":link.package_name,"bytes":file.bytes,"sha256":file.sha256,
+                "namedImportCount":named,"knownCppEhImports":known,"ordinalImports":ordinals
+            }));
+        }
     }
     let expected_images: BTreeSet<_> = package
         .keys()
@@ -527,8 +555,10 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
         "sourceClosureReexecuted":false, "independentSourceReceiptReviewRequired":true,
         "freshLinkerExecution":false, "systemDependencyClosureChecked":false,
         "staticLibrarySourceClosureChecked":false, "cppRuntimeAbsenceQualified":false,
-        "coffRuntimeSymbolsChecked":manifest.schema_version == 2,
+        "coffRuntimeSymbolsChecked":manifest.schema_version >= 2,
         "coffRuntimeSymbolInputs":runtime_symbols.into_values().collect::<Vec<_>>(),
+        "peRuntimeImportsChecked":manifest.schema_version >= 3,
+        "peRuntimeImportImages":runtime_imports,"ordinalImportTargetsResolved":false,
         "archiveMemberLinkSelectionChecked":false,
         "nativeRetirementQualified":false
     }))

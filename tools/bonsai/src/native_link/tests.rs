@@ -109,6 +109,40 @@ fn coff_object(defined: bool) -> Vec<u8> {
     bytes
 }
 
+fn runtime_image() -> Vec<u8> {
+    let mut bytes = image();
+    put32(&mut bytes, 0x400, 0x1400);
+    put32(&mut bytes, 0x410, 0x1440);
+    for table in [0x800, 0x840] {
+        for (index, value) in [0x1480_u64, 0x14c0, (1 << 63) | 0x11]
+            .into_iter()
+            .enumerate()
+        {
+            bytes[table + index * 8..table + index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes[0x882..0x895].copy_from_slice(b"_CxxThrowException\0");
+    bytes[0x8c2..0x8d4].copy_from_slice(b"ordinary_function\0");
+    put32(&mut bytes, 0x60c, 0x1540);
+    put32(&mut bytes, 0x610, 0x1500);
+    bytes[0x900..0x908].copy_from_slice(&0x1580_u64.to_le_bytes());
+    bytes[0x908..0x910].copy_from_slice(&((1_u64 << 63) | 0x17).to_le_bytes());
+    bytes[0x940..0x948].copy_from_slice(&0x1_4000_1000_u64.to_le_bytes());
+    bytes[0x948..0x950].copy_from_slice(&0x1_4000_2000_u64.to_le_bytes());
+    bytes[0x982..0x995].copy_from_slice(b"__CxxFrameHandler3\0");
+    // An unrelated string in the same image cannot become an import witness.
+    bytes[0xa00..0xa13].copy_from_slice(b"__CxxFrameHandler4\0");
+    bytes
+}
+
+fn replace_image(scratch: &Scratch, capture: &mut Capture, bytes: &[u8]) -> TestResult {
+    capture.links[0].output = scratch.file("linked.exe", bytes)?;
+    let packaged = scratch.file("package/service.exe", bytes)?;
+    capture.package_files[0].bytes = packaged.bytes;
+    capture.package_files[0].sha256 = packaged.sha256;
+    Ok(())
+}
+
 fn coff_archive() -> Vec<u8> {
     let mut bytes = b"!<arch>\n".to_vec();
     let mut header = [b' '; 60];
@@ -265,6 +299,133 @@ fn native_link_schema_two_reports_coff_runtime_evidence_without_an_absence_verdi
     rejected(
         verify(&manifest, &mut Intake::default()),
         "COFF runtime inspection requires an ordinary MSVC archive.",
+    );
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_three_observes_named_and_ordinal_normal_and_delay_imports() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = fixture(&scratch)?;
+    capture.schema_version = 3;
+    replace_image(&scratch, &mut capture, &runtime_image())?;
+    let receipt = verify(&capture, &mut Intake::default())?;
+    assert_eq!(receipt["coffRuntimeSymbolsChecked"], true);
+    assert_eq!(receipt["peRuntimeImportsChecked"], true);
+    let image = &receipt["peRuntimeImportImages"][0];
+    assert_eq!(image["packageName"], "service.exe");
+    assert_eq!(image["sha256"], capture.links[0].output.sha256);
+    assert_eq!(image["namedImportCount"], 3);
+    assert_eq!(
+        image["knownCppEhImports"],
+        json!([
+            {"module":"kernel32.dll","delayed":false,"symbol":"_CxxThrowException"},
+            {"module":"bcrypt.dll","delayed":true,"symbol":"__CxxFrameHandler3"}
+        ])
+    );
+    assert_eq!(
+        image["ordinalImports"],
+        json!([
+            {"module":"kernel32.dll","delayed":false,"ordinal":17},
+            {"module":"bcrypt.dll","delayed":true,"ordinal":23}
+        ])
+    );
+    assert_eq!(receipt["ordinalImportTargetsResolved"], false);
+    assert_eq!(receipt["cppRuntimeAbsenceQualified"], false);
+    assert_eq!(receipt["nativeRetirementQualified"], false);
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_three_uses_only_unbound_iat_when_lookup_is_absent() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = fixture(&scratch)?;
+    capture.schema_version = 3;
+    let mut bytes = runtime_image();
+    put32(&mut bytes, 0x400, 0);
+    replace_image(&scratch, &mut capture, &bytes)?;
+    let receipt = verify(&capture, &mut Intake::default())?;
+    assert_eq!(receipt["peRuntimeImportImages"][0]["namedImportCount"], 3);
+    put32(&mut bytes, 0x404, 1);
+    replace_image(&scratch, &mut capture, &bytes)?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "PE symbol inspection requires lookup and address tables",
+    );
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_three_rejects_unrecoverable_or_malformed_symbol_tables() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = fixture(&scratch)?;
+    capture.schema_version = 3;
+    for (offset, mutation, expected) in [
+        (
+            0x800,
+            (1_u64 << 63 | 0x1_0011).to_le_bytes().to_vec(),
+            "PE ordinal import contains reserved bits",
+        ),
+        (
+            0x800,
+            0x8000_1480_u64.to_le_bytes().to_vec(),
+            "PE name import contains reserved bits",
+        ),
+        (
+            0x882,
+            vec![0],
+            "PE import symbol is empty, unterminated or exceeds its bound",
+        ),
+        (
+            0x882,
+            vec![b' '],
+            "PE import symbol must contain only ASCII graphic bytes",
+        ),
+        (
+            0x858,
+            1_u64.to_le_bytes().to_vec(),
+            "PE import address table lacks its matching terminator",
+        ),
+        (
+            0x600,
+            3_u32.to_le_bytes().to_vec(),
+            "PE symbol inspection requires RVA-based delay descriptors",
+        ),
+        (
+            0x610,
+            0_u32.to_le_bytes().to_vec(),
+            "PE symbol inspection requires lookup and address tables",
+        ),
+        (
+            0x400,
+            0x1ffc_u32.to_le_bytes().to_vec(),
+            "PE RVA extent outside raw section",
+        ),
+        (
+            0x800,
+            0x1ffe_u64.to_le_bytes().to_vec(),
+            "PE RVA extent outside raw section",
+        ),
+    ] {
+        let mut bytes = runtime_image();
+        bytes[offset..offset + mutation.len()].copy_from_slice(&mutation);
+        replace_image(&scratch, &mut capture, &bytes)?;
+        rejected(verify(&capture, &mut Intake::default()), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_three_requires_thunks_without_extending_historical_replay() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = fixture(&scratch)?;
+    capture.schema_version = 2;
+    let receipt = verify(&capture, &mut Intake::default())?;
+    assert_eq!(receipt["peRuntimeImportsChecked"], false);
+    capture.schema_version = 3;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "PE symbol inspection requires lookup and address tables",
     );
     Ok(())
 }

@@ -50,7 +50,7 @@ fn name(data: &[u8]) -> Result<&[u8]> {
     Ok(&data[..end])
 }
 
-fn known(symbol: &[u8]) -> bool {
+pub(super) fn known(symbol: &[u8]) -> bool {
     let symbol = symbol.strip_prefix(b"__imp_").unwrap_or(symbol);
     matches!(
         symbol,
