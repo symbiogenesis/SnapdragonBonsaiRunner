@@ -59,6 +59,10 @@ fn floats(bytes: &mut Vec<u8>, values: &[f32]) -> io::Result<()> {
 
 fn header() -> io::Result<Vec<u8>> {
     let binding = binding();
+    header_for(&binding)
+}
+
+fn header_for(binding: &Binding<'_>) -> io::Result<Vec<u8>> {
     let mut bytes = b"TTSREPL1".to_vec();
     for provider in [&binding.reference, &binding.candidate] {
         bytes.extend(provider.revision);
@@ -73,7 +77,7 @@ fn header() -> io::Result<Vec<u8>> {
     }
     bytes.extend(binding.request);
     number(&mut bytes, binding.workers)?;
-    bytes.push(0);
+    bytes.push(u8::from(binding.retained_voice));
     bytes.extend([0; 6]);
     Ok(bytes)
 }
@@ -177,14 +181,12 @@ fn packet() -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn graph<R: io::Read>(
-    replay: &mut Replay<R>,
+fn graph_events(
+    observer: &mut impl FnMut(Observation<'_>) -> io::Result<()>,
     phase: Phase,
-    cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<()> {
-    let mut observe = |observation: TalkerObservation<'_>| {
-        replay.observe(Observation::Talker { phase, observation }, cancel)
-    };
+    let mut observe =
+        |observation: TalkerObservation<'_>| observer(Observation::Talker { phase, observation });
     observe(TalkerObservation::Prompt {
         rows: &[vec![1.0, -0.0], vec![2.0, -3.0]],
         trailing: &[vec![-1.0, 0.0]],
@@ -225,58 +227,47 @@ fn graph<R: io::Read>(
         codes: &[0; 16],
     })?;
     if phase == Phase::Base {
-        replay.observe(
-            Observation::Pcm {
-                phase,
-                samples: &[0.5, -0.25],
-            },
-            cancel,
-        )?;
+        observer(Observation::Pcm {
+            phase,
+            samples: &[0.5, -0.25],
+        })?;
     }
-    replay.observe(
-        Observation::Talker {
-            phase,
-            observation: TalkerObservation::Logits {
-                frame: 1,
-                hidden: &[-3.0, 4.0],
-                logits: &[-0.25, 0.5],
-                cache: &caches(3),
-            },
+    observer(Observation::Talker {
+        phase,
+        observation: TalkerObservation::Logits {
+            frame: 1,
+            hidden: &[-3.0, 4.0],
+            logits: &[-0.25, 0.5],
+            cache: &caches(3),
         },
-        cancel,
-    )?;
-    replay.observe(
-        Observation::Talker {
-            phase,
-            observation: TalkerObservation::Decision {
-                frame: 1,
-                token: 1,
-                eos: true,
-            },
+    })?;
+    observer(Observation::Talker {
+        phase,
+        observation: TalkerObservation::Decision {
+            frame: 1,
+            token: 1,
+            eos: true,
         },
-        cancel,
-    )
+    })
+}
+
+fn drive_events(observer: &mut impl FnMut(Observation<'_>) -> io::Result<()>) -> io::Result<()> {
+    graph_events(observer, Phase::Design)?;
+    observer(Observation::Pcm {
+        phase: Phase::Design,
+        samples: &[0.125, -0.125, 0.25],
+    })?;
+    observer(Observation::Speaker(&[2.0, -3.0]))?;
+    observer(Observation::ReferenceCodes(&[[0; 16]]))?;
+    graph_events(observer, Phase::Base)?;
+    observer(Observation::Complete {
+        samples: 2,
+        sample_rate: 24_000,
+    })
 }
 
 fn drive<R: io::Read>(replay: &mut Replay<R>, cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
-    graph(replay, Phase::Design, cancel)?;
-    replay.observe(
-        Observation::Pcm {
-            phase: Phase::Design,
-            samples: &[0.125, -0.125, 0.25],
-        },
-        cancel,
-    )?;
-    replay.observe(Observation::Speaker(&[2.0, -3.0]), cancel)?;
-    replay.observe(Observation::ReferenceCodes(&[[0; 16]]), cancel)?;
-    graph(replay, Phase::Base, cancel)?;
-    replay.observe(
-        Observation::Complete {
-            samples: 2,
-            sample_rate: 24_000,
-        },
-        cancel,
-    )
+    drive_events(&mut |event| replay.observe(event, cancel))
 }
 
 #[test]
@@ -417,6 +408,326 @@ fn tts_replay_cancellation_and_unwind_are_sticky() -> io::Result<()> {
         replay
             .observe(Observation::Speaker(&[]), &mut || false)
             .is_err()
+    );
+    Ok(())
+}
+
+fn capture_layout() -> super::CaptureLayout {
+    let decoder = super::DecoderLayout {
+        hidden: 2,
+        vocabulary: 2,
+        layers: 2,
+        kv_width: 2,
+    };
+    let graph = super::GraphLayout {
+        talker: decoder,
+        predictor: decoder,
+        eos: 1,
+    };
+    super::CaptureLayout {
+        design: graph,
+        base: graph,
+        speaker_width: 2,
+        sample_rate: 24_000,
+    }
+}
+
+#[test]
+fn tts_capture_matches_independent_literal_packet_and_replay() -> io::Result<()> {
+    let mut capture =
+        super::CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    drive_events(&mut |event| capture.observe(event.into(), &mut || false))?;
+    let bytes = capture.finish(Ok(()), &mut || false)?;
+    assert_eq!(bytes, packet()?);
+    let mut replay = Replay::new(bytes.as_slice(), &binding(), Tolerances::BITS)?;
+    drive(&mut replay, &mut || false)?;
+    assert!(replay.complete);
+    Ok(())
+}
+
+#[test]
+fn tts_capture_borrows_original_contiguous_prompts_and_all_layer_views() -> io::Result<()> {
+    use super::{Cache, CaptureEvent, LayerCache, Rows};
+    let mut capture =
+        super::CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    drive_events(&mut |event| match CaptureEvent::from(event) {
+        CaptureEvent::Prompt {
+            phase,
+            cacheable_rows,
+            ..
+        } => capture.observe(
+            CaptureEvent::Prompt {
+                phase,
+                rows: Rows::Contiguous {
+                    values: &[1.0, -0.0, 2.0, -3.0],
+                    width: 2,
+                },
+                trailing: Rows::Contiguous {
+                    values: &[-1.0, 0.0],
+                    width: 2,
+                },
+                cacheable_rows,
+            },
+            &mut || false,
+        ),
+        CaptureEvent::Logits {
+            phase,
+            frame,
+            codebook,
+            hidden,
+            logits,
+            cache: Cache::Rust(layers),
+        } => {
+            let layers: Vec<_> = layers
+                .iter()
+                .map(|layer| LayerCache {
+                    keys: &layer.k,
+                    values: &layer.v,
+                    positions: layer.seq_len,
+                })
+                .collect();
+            capture.observe(
+                CaptureEvent::Logits {
+                    phase,
+                    frame,
+                    codebook,
+                    hidden,
+                    logits,
+                    cache: Cache::Original(&layers),
+                },
+                &mut || false,
+            )
+        }
+        CaptureEvent::PredictorPrefill {
+            phase,
+            frame,
+            cache: Cache::Rust(layers),
+        } => {
+            let layers: Vec<_> = layers
+                .iter()
+                .map(|layer| LayerCache {
+                    keys: &layer.k,
+                    values: &layer.v,
+                    positions: layer.seq_len,
+                })
+                .collect();
+            capture.observe(
+                CaptureEvent::PredictorPrefill {
+                    phase,
+                    frame,
+                    cache: Cache::Original(&layers),
+                },
+                &mut || false,
+            )
+        }
+        event => capture.observe(event, &mut || false),
+    })?;
+    assert_eq!(capture.finish(Ok(()), &mut || false)?, packet()?);
+    Ok(())
+}
+
+#[test]
+fn tts_capture_warm_voice_omits_design_and_retains_complete_base_conditioning() -> io::Result<()> {
+    let mut binding = binding();
+    binding.retained_voice = true;
+    let mut expected = header_for(&binding)?;
+    expected.push(8);
+    floats(&mut expected, &[2.0, -3.0])?;
+    expected.push(9);
+    number(&mut expected, 1)?;
+    expected.extend([0; 16 * 4]);
+    graph_packet(&mut expected, 1)?;
+    expected.push(11);
+    number(&mut expected, 2)?;
+    expected.extend(24_000_u32.to_le_bytes());
+    expected.push(255);
+    number(&mut expected, 41)?;
+    let mut capture =
+        super::CaptureWriter::new(Vec::new(), &binding, Tolerances::BITS, capture_layout())?;
+    capture.observe(Observation::Speaker(&[2.0, -3.0]).into(), &mut || false)?;
+    capture.observe(Observation::ReferenceCodes(&[[0; 16]]).into(), &mut || {
+        false
+    })?;
+    graph_events(
+        &mut |event| capture.observe(event.into(), &mut || false),
+        Phase::Base,
+    )?;
+    capture.observe(
+        Observation::Complete {
+            samples: 2,
+            sample_rate: 24_000,
+        }
+        .into(),
+        &mut || false,
+    )?;
+    assert_eq!(capture.finish(Ok(()), &mut || false)?, expected);
+    Ok(())
+}
+
+#[test]
+fn tts_capture_rejects_incomplete_geometry_schedule_decisions_and_false_completion()
+-> io::Result<()> {
+    use super::{Cache, CaptureEvent, CaptureWriter, Rows};
+    for changed in 0..11 {
+        let mut capture =
+            CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+        let mut modified = false;
+        let result = drive_events(&mut |event| {
+            let mut event = CaptureEvent::from(event);
+            if !modified {
+                match (changed, &mut event) {
+                    (0, CaptureEvent::Prompt { rows, .. }) => {
+                        *rows = Rows::Contiguous {
+                            values: &[1.0, 2.0, 3.0],
+                            width: 2,
+                        };
+                        modified = true;
+                    }
+                    (1, CaptureEvent::Logits { cache, .. }) => {
+                        *cache = Cache::Original(&[]);
+                        modified = true;
+                    }
+                    (2, CaptureEvent::Logits { frame, .. }) => {
+                        *frame += 1;
+                        modified = true;
+                    }
+                    (3, CaptureEvent::Decision { eos, .. }) => {
+                        *eos = true;
+                        modified = true;
+                    }
+                    (
+                        4,
+                        CaptureEvent::Decision {
+                            token,
+                            codebook: Some(_),
+                            ..
+                        },
+                    ) => {
+                        *token = 2;
+                        modified = true;
+                    }
+                    (
+                        5,
+                        CaptureEvent::Logits {
+                            codebook: Some(codebook),
+                            ..
+                        },
+                    ) => {
+                        *codebook += 1;
+                        modified = true;
+                    }
+                    (6, CaptureEvent::Frame { codes, .. }) => {
+                        *codes = &[1; 16];
+                        modified = true;
+                    }
+                    (7, CaptureEvent::Pcm { samples, .. }) => {
+                        *samples = &[f32::NAN];
+                        modified = true;
+                    }
+                    (8, CaptureEvent::Speaker(values)) => {
+                        *values = &[];
+                        modified = true;
+                    }
+                    (9, CaptureEvent::Complete { samples, .. }) => {
+                        *samples += 1;
+                        modified = true;
+                    }
+                    (10, CaptureEvent::Complete { sample_rate, .. }) => {
+                        *sample_rate = 48_000;
+                        modified = true;
+                    }
+                    _ => {}
+                }
+            }
+            capture.observe(event, &mut || false)
+        });
+        assert!(modified && result.is_err(), "mutation {changed}");
+        assert!(capture.finish(Ok(()), &mut || false).is_err());
+    }
+    let capture = CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    assert!(capture.finish(Ok(()), &mut || false).is_err());
+    let mut capture =
+        CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    drive_events(&mut |event| capture.observe(event.into(), &mut || false))?;
+    assert!(
+        capture
+            .finish(Err(io::ErrorKind::Other.into()), &mut || false)
+            .is_err()
+    );
+    let mut capture =
+        CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    drive_events(&mut |event| capture.observe(event.into(), &mut || false))?;
+    assert!(
+        capture
+            .observe(CaptureEvent::Speaker(&[2.0, -3.0]), &mut || false)
+            .is_err()
+    );
+    assert!(capture.finish(Ok(()), &mut || false).is_err());
+    Ok(())
+}
+
+struct FlushFailure;
+
+impl io::Write for FlushFailure {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+#[test]
+fn tts_capture_cancellation_unwind_and_flush_failure_cannot_publish_success() -> io::Result<()> {
+    use super::{CaptureEvent, CaptureWriter};
+    let mut capture =
+        CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    let mut checks = 0;
+    drive_events(&mut |event| {
+        capture.observe(event.into(), &mut || {
+            checks += 1;
+            false
+        })
+    })?;
+    capture.finish(Ok(()), &mut || {
+        checks += 1;
+        false
+    })?;
+    for boundary in 1..=checks {
+        let mut capture =
+            CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+        let mut seen = 0;
+        let mut cancel = || {
+            seen += 1;
+            seen == boundary
+        };
+        let result = drive_events(&mut |event| capture.observe(event.into(), &mut cancel));
+        let result = capture.finish(result, &mut cancel);
+        assert_eq!(
+            result.err().map(|error| error.kind()),
+            Some(io::ErrorKind::Interrupted),
+            "boundary {boundary}"
+        );
+    }
+    let mut capture =
+        CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        capture.observe(CaptureEvent::Speaker(&[]), &mut || {
+            std::panic::resume_unwind(Box::new("capture cancellation unwound"))
+        })
+    }));
+    assert!(unwound.is_err());
+    assert!(capture.finish(Ok(()), &mut || false).is_err());
+    let mut capture =
+        CaptureWriter::new(FlushFailure, &binding(), Tolerances::BITS, capture_layout())?;
+    drive_events(&mut |event| capture.observe(event.into(), &mut || false))?;
+    assert_eq!(
+        capture
+            .finish(Ok(()), &mut || false)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::BrokenPipe)
     );
     Ok(())
 }

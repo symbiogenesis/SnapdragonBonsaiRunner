@@ -17,6 +17,11 @@ use crate::{
     },
 };
 
+mod capture;
+pub use capture::{
+    Cache, CaptureEvent, CaptureLayout, CaptureWriter, DecoderLayout, GraphLayout, LayerCache, Rows,
+};
+
 /// Reviewed identity of one independently retained observation provider.
 pub struct Provider<'a> {
     /// Original twenty-byte Git revision.

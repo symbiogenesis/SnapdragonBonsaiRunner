@@ -309,6 +309,30 @@ codec/speaker models or obtaining independent native captures. Independent
 original full-model observations, owning hosted acceptance and device/listening/
 resource qualification remain required.
 
+`replay::CaptureWriter` writes the same packet from borrowed original events;
+it executes no engine and authenticates no provider. Review `CaptureLayout`
+independently against both models before execution: complete Talker/predictor
+hidden/vocabulary/layer/KV dimensions, authoritative EOS, speaker width and
+codec rate. `CaptureEvent` accepts original contiguous prompt rows and all-layer
+F32 cache views without copying complete tensors. `CaptureEvent::from` also
+borrows ordinary Rust observations directly; those bytes record Rust execution
+only and cannot supply an independent native reference.
+
+The writer enforces cold Design/EOS/PCM teardown order or warm-voice omission,
+complete Base conditioning, contiguous semantic frames, every predictor prefill
+and all fifteen ordered logits/decisions, sampled-frame identity, all committed
+cache positions/extents, finite nonempty PCM and exact delivered sample totals.
+Only `finish(actual_provider_result, cancel)` writes Terminal after observed
+Complete and the provider's successful return. Refusal, reordered/partial input,
+cancellation, I/O failure and caught callback unwinding invalidate the writer.
+Retain a packet only after final flush and `finish` succeed. The caller still
+owns output I/O bounds, actual provider completion, source/model/input guards,
+original aggregate allowance, power and cleanup. This adapter supplies no native
+observation ABI or independent pinned-model capture. Five focused `tts_capture_`
+controls compare against the literal packet and cover native-compatible borrowed
+views, cold/warm schedules, geometry/decision/terminal failures, cancellation,
+unwinding and failed flush.
+
 The `speaker_reference_` controls include a complete miniature waveform-to-vector
 graph with closed-form embedding answers, in addition to individual primitives.
 It exercises all three ordered SE-Res2Net outputs, aggregation, temporal pooling
