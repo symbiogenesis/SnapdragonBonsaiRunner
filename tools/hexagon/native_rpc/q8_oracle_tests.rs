@@ -151,3 +151,181 @@ fn q8_oracle_submits_original_inputs_and_refuses_corrupt_result_before_publicati
     assert_eq!(transport.calls, 2);
     Ok(())
 }
+
+#[test]
+fn q8_reference_fractional_signed_dots_and_late_vector_review() -> Result<(), Error> {
+    for batch in [1, 2, 4] {
+        let projection = Q8Matmul::new(128, 64, batch, 200_000)?;
+        let mut weights = vec![0; projection.weight_bytes()];
+        for (index, block) in weights.as_chunks_mut::<34>().0.iter_mut().enumerate() {
+            // 1.5, -0.5, smallest positive half subnormal, negative zero.
+            let scale = [0x3e00_u16, 0xb800, 0x0001, 0x8000][index % 4];
+            block[..2].copy_from_slice(&scale.to_le_bytes());
+            block[2..6].copy_from_slice(&[0x80, 0x7f, 0xff, 2]);
+        }
+        let mut activation = vec![0.0; projection.columns() * batch];
+        for (index, vector) in activation.as_chunks_mut::<128>().0.iter_mut().enumerate() {
+            let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
+            for block in vector.as_chunks_mut::<32>().0 {
+                block[..4].copy_from_slice(&[0.125 * sign, -0.25 * sign, 1.5 * sign, -2.0 * sign]);
+            }
+        }
+        // Signed dot=-16-31.75-1.5-4=-53.25. Scale sum=1+2^-24.
+        // Returning -53.25 has absolute error 53.25/2^24 < 0.000004.
+        let oracle = Q8ReferenceOracle::new(projection, &weights, &activation, 0.000_004, 0.0)?;
+        let mut output = vec![-53.25; 64 * batch];
+        for vector in output.as_chunks_mut::<64>().0.iter_mut().skip(1).step_by(2) {
+            vector.fill(53.25);
+        }
+        oracle.review(&output)?;
+        let end = output.len() - 1;
+        output[end] = 0.0;
+        assert!(oracle.review(&output).is_err());
+        output[end] = f32::NAN;
+        assert!(oracle.review(&output).is_err());
+        assert!(oracle.review(&output[..end]).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_reference_finite_half_scales_preserve_subnormals_and_signed_extremes() -> Result<(), Error> {
+    let projection = Q8Matmul::new(128, 32, 1, 100_000)?;
+    let mut weights = vec![0; projection.weight_bytes()];
+    let mut activation = vec![0.0; 128];
+    // First row dot=-128*0.5 + 127*0.5 + 2*0.75=1, exactly.
+    activation[..3].copy_from_slice(&[0.5, 0.5, 0.75]);
+    let half_and_expected = [
+        (0x0000_u16, 0x0000_0000_u32),
+        (0x8000, 0x8000_0000),
+        (0x0001, 0x3380_0000),
+        (0x8001, 0xb380_0000),
+        (0x03ff, 0x387f_c000),
+        (0x0400, 0x3880_0000),
+        (0x3555, 0x3eaa_a000),
+        (0xb555, 0xbeaa_a000),
+        (0x7bff, 0x477f_e000),
+        (0xfbff, 0xc77f_e000),
+    ];
+    let mut output = vec![0.0; 32];
+    for (row, value) in output.iter_mut().enumerate() {
+        let (half, expected) = half_and_expected[row % half_and_expected.len()];
+        let start = row * 4 * 34;
+        weights[start..start + 2].copy_from_slice(&half.to_le_bytes());
+        weights[start + 2..start + 5].copy_from_slice(&[0x80, 0x7f, 2]);
+        *value = f32::from_bits(expected);
+    }
+    let oracle = Q8ReferenceOracle::new(projection, &weights, &activation, 0.0, 0.0)?;
+    oracle.review(&output)?;
+    // Numeric error review deliberately accepts either zero sign.
+    output[0] = -0.0;
+    output[1] = 0.0;
+    oracle.review(&output)?;
+    output[31] = f32::INFINITY;
+    assert!(oracle.review(&output).is_err());
+    Ok(())
+}
+
+#[test]
+fn q8_reference_predeclared_tolerance_boundaries_are_inclusive_and_immutable() -> Result<(), Error>
+{
+    let projection = Q8Matmul::new(128, 32, 1, 100_000)?;
+    let mut weights = vec![0; projection.weight_bytes()];
+    let mut activation = vec![0.0; 128];
+    activation[0] = 0.5;
+    for row in weights.as_chunks_mut::<136>().0 {
+        row[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        row[2] = 4;
+    }
+    let reference = Q8ReferenceOracle::new(projection, &weights, &activation, 0.25, 0.125)?;
+    // Reference=2; allowed error=.25+.125*2=.5, inclusive on either side.
+    reference.review(&[1.5; 32])?;
+    reference.review(&[2.5; 32])?;
+    assert!(
+        reference
+            .review(&[f32::from_bits(2.5_f32.to_bits() + 1); 32])
+            .is_err()
+    );
+    assert!(
+        reference
+            .review(&[f32::from_bits(1.5_f32.to_bits() - 1); 32])
+            .is_err()
+    );
+    reference.review(&[2.0; 32])?;
+    for (absolute, relative) in [
+        (-1.0, 0.0),
+        (f64::NAN, 0.0),
+        (f64::INFINITY, 0.0),
+        (f64::MAX, 0.0),
+        (0.0, -1.0),
+        (0.0, f64::NAN),
+        (0.0, f64::INFINITY),
+        (0.0, 1.00001),
+    ] {
+        assert!(
+            Q8ReferenceOracle::new(projection, &weights, &activation, absolute, relative).is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn q8_reference_rejects_nonfinite_extents_and_unrepresentable_projection() -> Result<(), Error> {
+    let projection = Q8Matmul::new(128, 32, 1, 100_000)?;
+    let mut weights = vec![0; projection.weight_bytes()];
+    let mut activation = vec![0.5; 128];
+    assert!(
+        Q8ReferenceOracle::new(
+            projection,
+            &weights[..weights.len() - 1],
+            &activation,
+            0.0,
+            0.0
+        )
+        .is_err()
+    );
+    assert!(Q8ReferenceOracle::new(projection, &weights, &activation[..127], 0.0, 0.0).is_err());
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        activation[127] = invalid;
+        assert!(Q8ReferenceOracle::new(projection, &weights, &activation, 0.0, 0.0).is_err());
+    }
+    activation[127] = 0.5;
+    let end = weights.len();
+    for half in [0x7c00_u16, 0xfc00, 0x7e00] {
+        weights[end - 34..end - 32].copy_from_slice(&half.to_le_bytes());
+        assert!(Q8ReferenceOracle::new(projection, &weights, &activation, 0.0, 0.0).is_err());
+    }
+    weights[end - 34..end - 32].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    weights[end - 1] = 2;
+    activation[127] = f32::MAX;
+    assert!(Q8ReferenceOracle::new(projection, &weights, &activation, 0.0, 0.0).is_err());
+    Ok(())
+}
+
+#[test]
+fn q8_reference_submits_original_fractional_inputs_and_rejects_before_publication()
+-> Result<(), Error> {
+    let projection = Q8Matmul::new(128, 32, 1, 100_000)?;
+    let mut weights = vec![0; projection.weight_bytes()];
+    for row in weights.as_chunks_mut::<136>().0 {
+        row[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        row[2] = 3;
+    }
+    let mut activation = vec![0.0; 128];
+    activation[0] = 0.125;
+    let reference = Q8ReferenceOracle::new(projection, &weights, &activation, 0.0, 0.0)?;
+    let mut transport = ReviewedTransport {
+        weights: &weights,
+        activation: &activation,
+        value: 0.375,
+        calls: 0,
+    };
+    let mut output = [77.0; 32];
+    reference.submit(&mut transport, &mut output)?;
+    assert_eq!(output, [0.375; 32]);
+    transport.value = 0.5;
+    assert!(reference.submit(&mut transport, &mut output).is_err());
+    assert_eq!(output, [0.375; 32]);
+    assert_eq!(transport.calls, 2);
+    Ok(())
+}

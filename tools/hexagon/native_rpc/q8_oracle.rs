@@ -1,4 +1,8 @@
-//! Independent signed-dot control for a deliberately exact Q8 diagnostic subset.
+//! Independent original-weight Q8 projection controls.
+//!
+//! `Q8ReferenceOracle` reviews ordinary finite activations against an explicitly
+//! ordered scalar F64 projection with caller-declared error limits. It measures
+//! projection error, without emulating HVX activation quantization or QF16.
 //!
 //! The pinned `quantize_block_f32_q8_0_tiled` converts each 32-value group to
 //! half, multiplies its absolute maximum by half 0x2008, and uses the half
@@ -11,6 +15,161 @@
 //! arithmetic or substituting a Rust TTS F32/FMA oracle for the DSP algorithm.
 
 use crate::{Error, Q8Matmul, Q8Submitter};
+
+/// Independent scalar projection-error review for ordinary F32 activations.
+///
+/// Original row-major signed Q8 codes and finite binary16 scales are evaluated
+/// in F64, with separate multiply/add and the original block/lane order. This
+/// reference does not emulate DSP half activation quantization, its inverse,
+/// QF16 arithmetic or kernel reduction order. Passing means only that every
+/// returned value met the declared error limits for this scalar reference.
+/// It grants no native identity, device, exact-parity or speech acceptance.
+pub struct Q8ReferenceOracle<'a> {
+    weights: &'a [u8],
+    activation: &'a [f32],
+    expected: Box<[f64]>,
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+}
+
+impl<'a> Q8ReferenceOracle<'a> {
+    /// Evaluate every original row/vector with predeclared numerical tolerances.
+    ///
+    /// Each 32-code signed dot is accumulated in lane order in F64, multiplied
+    /// by its exactly widened half scale, then added in original block order.
+    /// All finite half scales, including subnormals and signed zero, and all
+    /// finite F32 inputs are supported. A candidate must satisfy
+    /// `abs(actual-reference) <= absolute + relative * abs(reference)`.
+    /// Absolute tolerance is finite in `0..=f32::MAX`; relative tolerance is
+    /// finite in `0..=1`. Neither has a default. The caller must independently
+    /// review these limits before observing results; construction cannot
+    /// authenticate that review. Unlike the exact oracle, equal zero values
+    /// with different signs meet this numerical error rule.
+    ///
+    /// # Errors
+    /// Rejects invalid tolerances, extents, nonfinite inputs/scales, allocation
+    /// failure and a reference outside the finite F32 range before submission.
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "The independent scalar reference requires separately rounded multiplication and addition"
+    )]
+    pub fn new(
+        projection: Q8Matmul,
+        weights: &'a [u8],
+        activation: &'a [f32],
+        absolute_tolerance: f64,
+        relative_tolerance: f64,
+    ) -> Result<Self, Error> {
+        if !absolute_tolerance.is_finite()
+            || !(0.0..=f64::from(f32::MAX)).contains(&absolute_tolerance)
+            || !relative_tolerance.is_finite()
+            || !(0.0..=1.0).contains(&relative_tolerance)
+            || weights.len() != projection.weight_bytes()
+            || activation.len() != projection.columns() * projection.batch()
+            || activation.iter().any(|value| !value.is_finite())
+        {
+            return Err(Error::Contract);
+        }
+        for block in weights.as_chunks::<34>().0 {
+            reference_scale(u16::from_le_bytes([block[0], block[1]]))?;
+        }
+        let mut expected = Vec::new();
+        expected
+            .try_reserve_exact(projection.rows() * projection.batch())
+            .map_err(|_| Error::Contract)?;
+        let row_bytes = projection.columns() / 32 * 34;
+        for vector in activation.chunks_exact(projection.columns()) {
+            for row in weights.chunks_exact(row_bytes) {
+                let mut value = 0.0;
+                for (weight, input) in row
+                    .as_chunks::<34>()
+                    .0
+                    .iter()
+                    .zip(vector.as_chunks::<32>().0)
+                {
+                    let mut dot = 0.0;
+                    for (&code, &input) in weight[2..].iter().zip(input) {
+                        dot += f64::from(i8::from_ne_bytes([code])) * f64::from(input);
+                    }
+                    value += dot * reference_scale(u16::from_le_bytes([weight[0], weight[1]]))?;
+                    if !value.is_finite() {
+                        return Err(Error::Contract);
+                    }
+                }
+                if value.abs() > f64::from(f32::MAX) {
+                    return Err(Error::Contract);
+                }
+                expected.push(value);
+            }
+        }
+        Ok(Self {
+            weights,
+            activation,
+            expected: expected.into_boxed_slice(),
+            absolute_tolerance,
+            relative_tolerance,
+        })
+    }
+
+    /// Require every finite returned value to satisfy the original error rule.
+    ///
+    /// The full output is checked, including later vectors and row tails.
+    /// Tolerances cannot be changed after construction or a failed review.
+    ///
+    /// # Errors
+    /// Rejects changed extents, nonfinite values or any exceeded error bound.
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "The declared tolerance formula preserves separate multiply/add rounding"
+    )]
+    pub fn review(&self, output: &[f32]) -> Result<(), Error> {
+        if output.len() != self.expected.len()
+            || !output
+                .iter()
+                .zip(&self.expected)
+                .all(|(&actual, &expected)| {
+                    actual.is_finite()
+                        && (f64::from(actual) - expected).abs()
+                            <= self.absolute_tolerance + self.relative_tolerance * expected.abs()
+                })
+        {
+            return Err(Error::Contract);
+        }
+        Ok(())
+    }
+
+    /// Submit unchanged borrowed inputs with mandatory scalar error review.
+    ///
+    /// The transport owns terminal errors, deadlines, cancellation and cleanup.
+    /// No candidate output may be published before the complete review passes.
+    ///
+    /// # Errors
+    /// Propagates transport failures or rejected numerical error bounds.
+    pub fn submit(&self, transport: &mut dyn Q8Submitter, output: &mut [f32]) -> Result<(), Error> {
+        transport.submit(self.weights, self.activation, output, &mut |actual| {
+            self.review(actual)
+        })
+    }
+}
+
+fn reference_scale(bits: u16) -> Result<f64, Error> {
+    let exponent = (bits >> 10) & 31;
+    let fraction = bits & 1023;
+    if exponent == 31 {
+        return Err(Error::Contract);
+    }
+    let (significand, power) = if exponent == 0 {
+        (fraction, -24)
+    } else {
+        (1024 + fraction, i32::from(exponent) - 25)
+    };
+    let magnitude = f64::from(significand) * 2.0_f64.powi(power);
+    Ok(if bits & 0x8000 == 0 {
+        magnitude
+    } else {
+        -magnitude
+    })
+}
 
 /// Independent numeric review of unchanged inputs in an exact diagnostic subset.
 ///

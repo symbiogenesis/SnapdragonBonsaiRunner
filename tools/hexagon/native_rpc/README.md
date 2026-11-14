@@ -178,6 +178,30 @@ The hosted compiler/device source inventory now also binds every Q8 dispatcher,
 projection, native adapter, oracle and test input; incomplete older source sets
 cannot pass current receipt admission.
 
+`Q8ReferenceOracle` separately reviews projection error for ordinary finite F32
+activations and every finite half weight scale, including signed zero and
+subnormals. It reads original row-major signed Q8 weights, accumulates each
+32-code dot in lane order in F64, multiplies by the independently widened half
+scale and accumulates blocks in original order. No tiled native packing or
+serving projection implementation supplies its expected answers. The caller
+must independently review and declare finite absolute and relative error limits
+before observing results; the oracle fixes them at construction and requires
+every finite output to satisfy `abs(actual-reference) <= absolute + relative *
+abs(reference)`. Absolute error is bounded by `f32::MAX`, relative error by one;
+neither has a default. Numerical zero signs may differ. Reference results outside
+the finite F32 range reject before submission, and no failed review can publish
+output through the submission adapter.
+
+Five `q8_reference_` controls cover literal fractional signed dots across N=1/2/4,
+finite half normals/subnormals/signed zero, extreme signed codes, later-vector
+corruption, inclusive immutable tolerance boundaries, malformed/nonfinite input,
+unrepresentable output and unchanged-input publication. This is a scalar F64
+projection-error reference, not exact real arithmetic, HVX activation
+quantization/inverse/QF16 emulation, native captured observations or qualified
+speech tolerances. Device numerical acceptance must separately establish useful
+reviewed limits and the actual signed path; loaded-DSP and usable-VTCM admission
+remain independent prerequisites.
+
 The Q8 packet/solver controls remain mathematical/layout checks, not native
 captures. Signed-package/device execution, exact loaded DSP identity, contained
 HTP0 supervision, Q8 activation quantization/arithmetic, correlated completions

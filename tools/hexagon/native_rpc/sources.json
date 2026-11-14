@@ -396,6 +396,19 @@
     "ttsPrefillOrSharedKvQualified": false,
     "profileEligible": false
   },
+  "q8ReferenceArithmeticOracle": {
+    "status": "independent-scalar-projection-error-control-no-device-or-speech-qualification",
+    "api": "Q8ReferenceOracle::new; review; submit",
+    "arithmetic": "original-row-major-signed-i8-codes; independently-widened-finite-F16-scales; F64-lane-dots-and-block-sums-in-original-order; separate-multiply-add",
+    "activationSubset": "all-finite-F32; no-native-half-quantization-inverse-or-QF16-emulation",
+    "acceptance": "caller-reviewed-fixed-finite-absolute-0-through-f32MAX-and-relative-0-through1-tolerances; absolute-plus-relative-times-reference-magnitude; every-finite-output; numeric-zero-signs-may-differ",
+    "inputPolicy": "unchanged-original-borrowed-inputs; invalid-extents-nonfinite-or-unrepresentable-F32-reference-reject-before-submit",
+    "controls": "five-q8_reference_-literal-controls-no-driver-DSP-or-model-execution",
+    "nativeQuantizationParityQualified": false,
+    "signedPackageDeviceQualified": false,
+    "ttsPrefillOrSharedKvQualified": false,
+    "profileEligible": false
+  },
   "windowsAbi": [
     "https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryserviceconfigw",
     "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw",
