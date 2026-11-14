@@ -214,7 +214,12 @@ Installed upgrade/rollback acceptance is independent of portable updates.
 
 Markdown parsing uses a persistent [offline native sandbox worker](sandboxing.md#markdown-parser-worker),
 with bounded background pipe I/O and trusted-parent validation of its render
-description. The UI creates native egui text widgets from admitted results.
+description. The pure Rust `bonsai-markdown` library runs in a separate private
+`--markdown-worker` invocation of the configured headless broker image, before
+model, credential or network setup. The GUI image cannot initialize under the
+worker's required Win32k denial. Recovered responses stay literal until startup
+prepares the configured broker, then enter the same bounded formatting queue.
+The UI creates native egui text widgets from admitted results.
 Unavailable or failed parsing leaves complete plain source visible and ends the
 parser session; parsing never falls back into the trusted UI process.
 

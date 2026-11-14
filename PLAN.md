@@ -219,8 +219,14 @@ adoption decisions without displacing native daily-use acceptance.
   network/loopback/file/device/desktop/child denial and boundary overhead separately
   from portable parser/DTO regressions. Complete final-source strict native
   analysis and named regressions, including minimal child-environment contents.
-  Include the production-image handshake/Unicode regression and the six-key
-  minimal environment with private `LOCALAPPDATA` in owning native acceptance.
+  Include the configured headless broker image's production handshake/Unicode
+  regression, private-entry direct-invocation refusal, pure `bonsai-markdown`
+  parsing without native UI/graphics imports, and the six-key minimal environment
+  with private `LOCALAPPDATA` in owning native acceptance. Verify recovered
+  responses defer formatting until their configured broker image is prepared,
+  including explicit nonadjacent broker paths; parser entry must precede model,
+  credential and network setup. Retain actual child exit state before cleanup
+  when diagnosing failed startup or pipe exchange.
 - [ ] Qualify Settings scope, compact/wrapped navigation, persistence, generation
   locks, adapter disclosure, diagnostics, scrolling and Close/Escape focus return.
 - [ ] Qualify responsive sidebar/drawer/hide/reopen behavior, stable manual width,

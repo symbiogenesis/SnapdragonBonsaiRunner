@@ -95,7 +95,12 @@ and device qualification.
 
 ### Native Markdown parsing
 
-`bonsai-chat` pins `markdown-syntax = "=0.7.2"` with `default-features = false`.
+The pure Rust `bonsai-markdown` library pins `markdown-syntax = "=0.7.2"` with
+`default-features = false`. It uses egui's platform-independent text/style types
+without eframe, winit, wgpu or native presentation dependencies. Production
+parsing runs in a separate offline invocation of the configured headless
+`bonsai-broker` image; the private entry point precedes model, credential and
+network setup. The UI independently validates its output before rendering.
 The reviewed crates.io package has no normal, build or development dependencies;
 its manifest sets `build = false`, and both `default` and the unused `html` feature
 are empty. Its Rust source contains no `unsafe` token. The package is dual licensed
@@ -105,7 +110,8 @@ reviewed bytes. Repeat the source and dependency review before changing this pin
 The [offline MXC parser worker](sandboxing.md#markdown-parser-worker) consumes the
 owned AST and absolute UTF-8 spans. The trusted UI validates bounded binary render
 descriptions before native egui text layout, without generating HTML. MXC reuses
-the application's existing process boundary and does not add parser dependencies.
+the application's existing process boundary; the broker image hosts this separate
+worker without adding another packaged executable or initializing its ordinary service.
 Unavailable or failed worker parsing leaves plain source visible; there is no
 in-process parser fallback. Headings, emphasis/strong/strikethrough, code,
 lists/task lists, quotes, text-column tables and thematic breaks form the supported

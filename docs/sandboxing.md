@@ -41,20 +41,34 @@ with the headless policy requires native qualification.
 
 ### Markdown parser worker
 
-Assistant Markdown is parsed by one persistent offline MXC/PSEC worker, using the
-same `bonsai-chat` executable's private `--markdown-worker` entry point before UI
-initialization. Anonymous stdin/stdout pipes carry bounded binary requests and
-render descriptions; stderr is a `NUL` sink. Parsing and pipe I/O run outside the
-UI event loop. The trusted parent independently validates UTF-8, spans, style
+Assistant Markdown is parsed by one persistent offline MXC/PSEC worker, using a
+separate invocation of the configured headless `bonsai-broker` executable's
+private `--markdown-worker` entry point. It calls the pure Rust `bonsai-markdown`
+library before ordinary broker configuration, model loading, credential access
+or network initialization. The worker image has no native UI/graphics imports:
+reusing the GUI image fails DLL initialization under the required Win32k denial,
+before its private entry point can run. This adds no package executable.
+Anonymous stdin/stdout pipes carry bounded binary requests and render
+descriptions; stderr is a `NUL` sink. Parsing and pipe I/O run outside the UI
+event loop. The trusted parent independently validates UTF-8, spans, style
 flags, sizes and source mappings before constructing native text layout. See the
 [streaming contract](streaming-resources.md#native-chat-and-transcript) for limits.
 
-The ignored production-image regression
-`markdown_production_image_formats_under_native_containment` checks a real
-sandbox handshake and repeated Unicode formatting, independently of UI fixtures
-that bypass process launch.
+Recovered responses remain literal while startup prepares the configured broker
+image; this pending dependency does not fail the parser session. Once the image
+is available, formatting uses that exact configured path, including explicit
+source-launch broker paths. The parent retains the image and ancestor handles
+through worker death. The hidden entry point refuses execution outside an actual
+AppContainer and accepts no ordinary broker options.
 
-The worker policy grants read access to the exact current executable and required
+The broker's ignored production-image regression
+`markdown_production_image_formats_under_native_containment` checks a real sandbox
+handshake and repeated Unicode formatting, independently of UI fixtures that
+bypass process launch. Failed exchanges retain the child exit state before
+cleanup. `markdown_worker_refuses_direct_invocation_without_stdout` separately
+checks ordinary invocation refusal with no protocol or diagnostic output.
+
+The worker policy grants read access to the exact configured broker image and required
 Windows runtime files, private application scratch and Windows' private PSEC
 temporary storage. It requests no network or host-loopback capability, user-file,
 desktop or device grants. This is restricted filesystem authority, not literally
@@ -71,7 +85,8 @@ no caller entries, `PATH`, caller profile paths or application options. Ambient
 credential and backend-override names cannot reject this fixed-environment
 launch; admission checks its six constructed child names. Workers that inherit
 caller entries retain their documented rejection policy. The Markdown Job limits
-committed memory to 256 MiB. Startup/handshake has a ten-second allowance and each request two seconds;
+committed memory to 256 MiB. Startup/handshake has a ten-second allowance and each
+request two seconds;
 owned-worker stop and pipe joining share five seconds. Native process-creation
 failure retains its existing ten-second cleanup allowance, and synchronous native
 creation calls remain nonpreemptible.
