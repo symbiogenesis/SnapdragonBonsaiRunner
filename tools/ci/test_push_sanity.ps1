@@ -53,14 +53,14 @@ function Invoke-PushRecoveryFixture([string]$CheckerState,[string]$RecoveryState
 param([string]$Adapter,[string]$Repository,[string]$Target,[string]$GitPath,[string]$Support,[string]$RecoveryState,[switch]$RunRecovery)
 . $Support
 $PSNativeCommandUseErrorActionPreference=$true
-$script:archiveCalls=0
+$global:BonsaiPushRecoveryArchiveCalls=0
 function git {
     & $GitPath @args
     if ($LASTEXITCODE) { throw 'Fixture Git command failed.' }
     if ($args -ccontains 'archive') {
-        $script:archiveCalls++
+        $global:BonsaiPushRecoveryArchiveCalls++
         Assert-Ci ($RecoveryState -ceq 'valid') 'An unverified supervisor reached source intake.'
-        Assert-CiEqual $script:archiveCalls 1
+        Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 1
         Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-checker.json'))) 'Recovery retained the old checker receipt during source intake.'
         Assert-Ci (-not ($args -ccontains '--')) 'Recovery selected a partial policy archive.'
         $archive=@($args | Where-Object { $_.StartsWith('--output=',[StringComparison]::Ordinal) })[0].Substring(9)
@@ -77,10 +77,10 @@ catch { $failure=$_.Exception.Message }
 Assert-Ci ($null -ne $failure) 'Recovery fixture unexpectedly admitted an inert checker.'
 Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-checker.json'))) 'Failed recovery published or retained a checker receipt.'
 if ($RecoveryState -cne 'valid') {
-    Assert-CiEqual $script:archiveCalls 0
+    Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 0
     Assert-Ci ($failure.Contains('-Prepare')) 'Invalid supervisor did not explain explicit preparation.'
 } elseif ($RunRecovery) {
-    Assert-CiEqual $script:archiveCalls 1
+    Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 1
     Assert-Ci ($failure.Contains('bonsai-push-recovery')) 'Failure did not originate from the recovery executable.'
 } else {
     Assert-CiEqual $failure 'Expected complete committed recovery source verified before supervisor execution.'
