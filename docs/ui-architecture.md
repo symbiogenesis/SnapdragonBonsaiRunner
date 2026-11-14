@@ -71,6 +71,8 @@ failure cancels and joins the other operation before reporting failure. Speech a
 preparation, companion builds and fresh speech credentials continue separately
 while Swift loads and serves text chat. A speech preparation failure leaves text
 chat and its drafts/history intact; closing cancels both owned stages.
+Each preparation process receives one ten-second cleanup allowance. A failed
+explicit cleanup cannot restart that wait when its process owner is dropped.
 Speech artifact preparation uses at most two concurrent workers, preserves exact
 verification and partial-download ownership, and cancels peers on failure.
 The complete speech preparation Job, including compiler descendants, runs at

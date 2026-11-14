@@ -161,14 +161,6 @@ fn configuration(output: &str) -> io::Result<crate::client::Config> {
         .map_err(io::Error::other)
 }
 
-struct Process(OwnedProcess);
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _stopped = self.0.stop(Duration::from_secs(10));
-    }
-}
-
 fn execute(
     request: &Request,
     stage: &str,
@@ -251,11 +243,11 @@ fn capture(
     // Speech setup can compile native libraries while Swift verifies/loads.
     // Lower its complete owned Job's CPU priority so compiler descendants also
     // yield to model startup and text requests on smaller Snapdragon systems.
-    let child = Process(if background {
+    let child = if background {
         OwnedProcess::start_background_tool(spec)?
     } else {
         OwnedProcess::start_tool(spec)?
-    });
+    };
     let started = Instant::now();
     let mut observed = Instant::now();
     let outcome = (|| loop {
@@ -272,7 +264,7 @@ fn capture(
                 "Native startup output exceeded its bound.",
             ));
         }
-        if let Some(status) = child.0.try_wait()? {
+        if let Some(status) = child.try_wait()? {
             break Ok(status);
         }
         if observed.elapsed() >= Duration::from_millis(250) {
@@ -289,12 +281,7 @@ fn capture(
         }
         thread::sleep(Duration::from_millis(20));
     })();
-    child.0.stop(Duration::from_secs(10)).map_err(|error| {
-        io::Error::other(format!(
-            "Setup process cleanup could not be confirmed. Close Swift before trying again. {error}"
-        ))
-    })?;
-    let status = outcome?;
+    let status = finish_capture(outcome, || child.stop(Duration::from_secs(10)))?;
     if status != 0 {
         return Err(preparation_failure(
             status,
@@ -303,6 +290,21 @@ fn capture(
         ));
     }
     bounded_text(&spec.stdout)
+}
+
+fn finish_capture(
+    outcome: io::Result<u32>,
+    stop: impl FnOnce() -> io::Result<()>,
+) -> io::Result<u32> {
+    // Every ordinary return reaches this one explicit cleanup attempt. Tool
+    // ownership still closes the kill-on-close Job during unwinding; a Drop
+    // wrapper must not grant another timeout after this allowance was spent.
+    stop().map_err(|error| {
+        io::Error::other(format!(
+            "Setup process cleanup could not be confirmed. Close Swift before trying again. {error}"
+        ))
+    })?;
+    outcome
 }
 
 fn preparation_failure(
@@ -489,6 +491,28 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_cleanup_failure_is_terminal_after_one_stop_attempt() {
+        for outcome in [Ok(0), Ok(7), Err(io::ErrorKind::Interrupted)] {
+            let mut stops = 0;
+            let result = finish_capture(outcome.map_err(io::Error::from), || {
+                stops += 1;
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            });
+            assert_eq!(stops, 1);
+            assert!(result.is_err_and(|error| error.to_string().contains(
+                "Setup process cleanup could not be confirmed. Close Swift before trying again."
+            )));
+        }
+        let mut stops = 0;
+        let result = finish_capture(Err(io::Error::from(io::ErrorKind::Interrupted)), || {
+            stops += 1;
+            Ok(())
+        });
+        assert_eq!(stops, 1);
+        assert!(result.is_err_and(|error| error.kind() == io::ErrorKind::Interrupted));
+    }
 
     #[test]
     fn preparation_failure_preserves_unsigned_exit_with_empty_or_unreadable_stderr() {
