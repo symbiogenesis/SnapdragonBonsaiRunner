@@ -103,6 +103,13 @@ before publication.
 Do not create Runner pull requests as the routine delivery workflow. Parallel
 workers must still use individual Git worktrees and one commit per logical change.
 
+Every push must pass the tracked `.githooks/pre-push` source sanity check for
+each outgoing branch/tag tip. Keep `core.hooksPath` set to `.githooks` in this
+clone. Do not use `--no-verify`, override or disable the hooks, or replace the
+immutable-tip check with a working-tree check. Missing prerequisites or a failed
+check block the push until repaired; passing checks do not authorize a push.
+See [the push guard](tools/ci/README.md#local-push-guard) for scope and limits.
+
 # Prism repository workflow
 
 Push commits and tags in the sibling `..\prism-inference` clone when requested by

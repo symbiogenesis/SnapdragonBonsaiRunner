@@ -649,3 +649,60 @@ and pin policy, not general YAML/Actions syntax or upstream provenance.
 
 Run its focused real-index regressions with
 `pwsh -NoProfile -File tools/ci/test_staged_workflows.ps1`.
+
+### Local push guard
+
+The tracked `pre-push` hook uses the same `core.hooksPath = .githooks` setting.
+It admits a prepared, source/digest-bound `bonsai-ci` and reads committed `HEAD`
+policy in temporary storage, then checks the actual outgoing branch/tag objects supplied by Git.
+Each distinct commit is checked once, with the union of changes for every ref
+that sends it. Annotated tags resolve to their commits, deleted refs introduce
+no source, and an unavailable remote base selects the complete tree.
+A separate temporary Git index materializes each tip without changing the
+owner's index or working files. Unstaged fixes cannot conceal a broken commit.
+
+The screen checks owned-language policy, parses changed PowerShell without
+executing it, checks workspace Rust formatting when Rust/build inputs change,
+and validates workflow startup plus Actions syntax when YAML/action inputs
+change. Only named cache-environment and source-routing controls run for their
+own adapters. It adds no PowerShell style rules, model work, full test suite,
+dependency audit or benchmark. Foundation retains compilation, analyzers and
+complete tests; this screen does not establish their verdicts.
+
+Prerequisites are native Windows ARM64, PowerShell 7.6+, Git, the pinned Rust
+toolchain and a prepared checker matching the current committed checker inputs.
+Missing prerequisites fail closed. Prepare explicitly in a predeclared source-build
+allowance, with locked dependencies already cached:
+
+```powershell
+pwsh -NoLogo -NoProfile -File tools/ci/check_push_sanity.ps1 -Prepare
+```
+
+Preparation reads the committed compiler configuration and source from its own
+working directory and records their Git object identities plus the executable
+digest. A push verifies that receipt before executing the helper. Ordinary pushes
+never compile or fetch missing Cargo dependencies. Explicit preparation is a
+source build whose caller must supervise within the declared allowance; it is not
+an outgoing-tip verdict, an automatic retry or a way to renew an expired clock.
+The final preparation/receipt and snapshot-config corrections still require owning
+CI validation; the local audit allowance closed before those checks could run.
+`BONSAI_ACTIONLINT_PATH` can supply the reviewed actionlint 1.7.12 executable for
+an offline syntax check; otherwise the existing checker fetches its pinned,
+digest-verified asset. Snapshot intake and native work share the original allowance;
+the native supervisor stops admitting commands at 270 seconds, retaining cleanup
+reserve. Power is observed before bootstrap and after cleanup; unavailable
+battery-saver observations remain unknown. These are correctness checks, with
+no performance-comparison qualification.
+
+[AGENTS.md](../../AGENTS.md#runner-repository-workflow) prohibits bypassing this
+guard. Git hooks remain a local control: an operator who can change Git config
+or invoke `--no-verify` can technically bypass them. An absolute remote rejection
+requires GitHub rules and restricted bypass/push credentials. This change does
+not install remote rules or change the owner's direct-main delivery workflow.
+Release separately enforces trusted exact-source CI results at publication.
+
+The workspace keeps correctness and performance Clippy checks. Digit grouping,
+optional const promotion, unit-expression punctuation, wire field names,
+independent selector booleans and source line counts are explicitly allowed.
+The operation-grouping heuristic is also disabled after misreading a correct
+run/job identity comparison. These preferences must not become release failures.

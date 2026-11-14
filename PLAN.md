@@ -57,6 +57,16 @@ adoption decisions without displacing native daily-use acceptance.
   focused checks while preserving hosted ordinary-verdict coverage.
   Follow the [startup preflight](tools/ci/README.md#action-dependency-pins) before
   workflow changes and verify supported self-hosted runner versions.
+  Include the [30-run failure audit](docs/evidence/ci-failure-audit.md), exact-source
+  Release prerequisite/rerun admission, production-only lanes and same-run tool
+  reuse; unrestricted main-push verdicts with unchanged scoped selection;
+  immutable outgoing-tip push checks; public-input writer/identity handoff; and
+  narrow projection dependency builds. Local focused checks leave hosted gates
+  pending, including the historical linker-child identity that was not retained.
+  Run the final snapshot-config regression and complete push adapter, preparation
+  receipt/invalidation, packaged-shell and historical-tip/output-bound controls;
+  those source-only follow-ups have no passing post-audit local verdict. Keep
+  helper preparation explicit and caller-supervised within its declared allowance.
 - [ ] Qualify Runner's checked-tools producer, shared regression runner and
   native-acceptance caches: cold build, exact hit and relevant-input invalidation,
   fresh same-run packages, source/digest verification and every selected check.

@@ -8,6 +8,7 @@ consumers below without installing or executing the recorded Python tools.
 
 | Retained material | Current consumer |
 | --- | --- |
+| [CI failure audit](ci-failure-audit.md) | Root causes for the latest 30 failed runs, targeted prevention and pending hosted acceptance |
 | [Prism 0.1.28 delivery](prism-0.1.28-release.md) | Current runtime/source lock, original release receipt and independent lock-update replay |
 | [Daily-use readiness](daily-use-readiness.md) | Actionable qualification failures, bounded local-check outcome and open daily-use/isolation acceptance gates |
 | `cpp-retirement-model-free.json` | [TTS decode-graph fixture provenance](../../src/speech-tts/tests/fixtures/decode-graph-v1.provenance.json) |

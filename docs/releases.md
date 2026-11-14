@@ -86,8 +86,23 @@ the matching tag at that commit, then dispatch `release.yml` with
 `Cargo.toml`; an explicit tag must match it. The publication body links to the
 README at that immutable source revision. No per-version notes are required.
 
-Windows Release runs startup and tooling checks before building five application
-lanes on hosted Windows ARM64. It verifies source-bound receipts and notices,
+Before dispatch, Foundation and Source checks must have completed successfully
+for that exact main-push commit. Both workflows record a verdict on every main
+push; their selectors still avoid unrelated expensive work. Follow CI ownership
+when inspecting those runs. Release does not dispatch, wait for or retry them.
+Its native `release-prerequisites` gate checks repository, workflow, exact SHA,
+main-push event, latest attempt and complete paginated job inventory, including
+the successful Foundation planner/aggregate and Source lock-verification step.
+Missing, pending, failed, cancelled, skipped required or bundle-only results
+block Release before its build fan-out. The gate repeats before publication.
+
+Foundation owns formatting, analyzers, documentation and tests. Windows Release
+consumes that verdict and builds five production lanes on hosted Windows ARM64,
+without repeating those checks. Its production profile remains independent of
+Foundation's incremental profile. Packaging and publication reuse the maintenance
+lane's same-run, revision/digest-verified native tools instead of rebuilding them.
+Release retains its own primitive/argument controls, source checks, notices,
+packaging and executable smoke checks. It verifies source-bound receipts and notices,
 assembles the executable, and checks its GUI header, extraction and identities.
 Missing notice material stops publication. These checks do not establish
 clean-machine, actual-model, quality, performance or isolation acceptance.

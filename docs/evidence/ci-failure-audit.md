@@ -1,0 +1,143 @@
+# CI failure audit
+
+This records the latest **30 failed workflow runs**, across all workflows, returned
+by `gh run list --status failure --limit 30` on 2026-11-14. It is 30 runs in total,
+not 30 per workflow: 16 Foundation, 10 Hexagon and four Windows Release runs.
+The sample spans 2026-11-13 22:31 through 2026-11-14 19:37 UTC. Cancelled runs are
+outside this failure sample. Run 43628943271 has two failed attempts; both were
+inspected. Failures in multiple jobs of one run are listed together.
+
+The reviewed local starting revision was `d195bc778d0e17df0e90555abfac826af5af90fa`,
+27 commits ahead of the local `origin/main` at
+`3d3ffe77a39c8afbe9edf30f28b0d8ca8cd7e5d8`. Many historical corrections already
+existed locally. A local correction is not a successful hosted rerun.
+
+## Every sampled run
+
+Run links identify the full source revision, attempt and retained logs. Cause
+codes below identify the originating job/step and correction; aggregate rejection
+after a failed planner is a consequence, not another root cause.
+
+| Run | Workflow | Source | Causes |
+| --- | --- | --- | --- |
+| [43633113374](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43633113374) | Foundation | `3d3ffe77` | F2 |
+| [43631697910](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43631697910) | Windows Release | `8aca8b02` | R4 |
+| [43631695104](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43631695104) | Foundation | `8aca8b02` | F2 |
+| [43631695096](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43631695096) | Hexagon | `8aca8b02` | H2, H4 |
+| [43628943863](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43628943863) | Foundation | `a0873e69` | F2 |
+| [43628943271](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43628943271) | Windows Release | `a0873e69` | R3, attempts 1 and 2 |
+| [43580820777](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43580820777) | Foundation | `d3fe70d5` | F2 |
+| [43580820773](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43580820773) | Hexagon | `d3fe70d5` | H2, H4 |
+| [43580820113](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43580820113) | Windows Release | `d3fe70d5` | R2a–R2e |
+| [43580406374](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43580406374) | Hexagon | `b008b2d7` | H3, H4 |
+| [43580406370](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43580406370) | Foundation | `b008b2d7` | F2 |
+| [43579574922](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43579574922) | Foundation | `da2311c1` | F2 |
+| [43579574822](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43579574822) | Hexagon | `da2311c1` | H3, H4 |
+| [43578257461](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43578257461) | Foundation | `a05c11de` | F2 |
+| [43577726760](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43577726760) | Foundation | `3546ba73` | F2 |
+| [43577726709](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43577726709) | Windows Release | `3546ba73` | R1 |
+| [43577726696](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43577726696) | Hexagon | `3546ba73` | H3 |
+| [43576602927](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43576602927) | Foundation | `250c3e9b` | F2 |
+| [43575640226](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43575640226) | Foundation | `ca1c99ab` | F2 |
+| [43575640207](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43575640207) | Hexagon | `ca1c99ab` | H3 |
+| [43574528631](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43574528631) | Foundation | `1fc86278` | F2 |
+| [43574528645](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43574528645) | Hexagon | `1fc86278` | H2 |
+| [43565674892](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43565674892) | Hexagon | `ba6db31d` | H2 |
+| [43565674757](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43565674757) | Foundation | `ba6db31d` | F2 |
+| [43562543809](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43562543809) | Foundation | `7c09d422` | F2 |
+| [43526969258](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43526969258) | Hexagon | `90e6e876` | H1 |
+| [43526969076](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43526969076) | Foundation | `90e6e876` | F1 |
+| [43523437861](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43523437861) | Hexagon | `feca21a1` | H1 |
+| [43523438099](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43523438099) | Foundation | `feca21a1` | F1 |
+| [43519935649](https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/43519935649) | Foundation | `83077b76` | F1 |
+
+## Causes and prevention
+
+| Code | Confirmed cause and source correction | Prevention and limits |
+| --- | --- | --- |
+| F1 | `changes` cache-input fixture used `RustFlags` and `RUSTFLAGS` in PowerShell's case-insensitive hash literal; parsing rejected duplicate keys. Existing `1b486bf9` uses an ordinal map. | Keep case-sensitive environment fixtures. Name the failed fixture before rethrowing its original error. |
+| F2 | `mixed_case_names_have_same_build_identity` attempted removal with `$null`; PowerShell 7.5+ bound that call to an empty string, leaving a hashed override. Existing `2f20e3ab` uses actual-null deletion. The step was initially bundled under `Check CI selection and gate regressions`, then split into `Check CI orchestration fixtures`. | New focused fixture preserves and restores both absent and deliberately empty values; do not normalize distinct inputs into a false cache match. The Foundation aggregate correctly rejected the failed planner. No product check verdict was reached. |
+| H1 | `controls` / `Prepare source-bound…`: `dispatch-build.txt` reports that the root exited with one surviving owned Job member; strict teardown stopped it and rejected the run. Neither child identity nor root exit code was retained in these historical records. | Existing `e74ab4c8`/`c1b18b80` use pinned LLD to avoid persistent MSVC linker-service descendants. Attribution of these particular historical children to a PDB server is an inference, not an established identity. Keep strict teardown; no basis exists to waive it as a false positive or claim this historical uncertainty eliminated. |
+| H2 | Same `controls` preparation exceeded its fixed 180-second dependency-build bound. Latest capture was 197,898 stdout bytes and 9,956 stderr bytes, below the output bound; compilation reached Windows process/MXC dependencies without completing. It built the entire tools library merely to obtain three externs; Windows SHA-256 was also only a dev dependency there. | Build CPU policy for serde/JSON, then only locked SHA-256 using its normal dependency context in the CI manifest. Both commands share the original 180 seconds. Preserve pinned host/target linking and independent numerical/source controls. The focused fixture makes both large owners unbuildable and requires the actual dependency artifacts. Hosted cold-build duration remains pending. |
+| H3 | `ranking-controls` / `Validate comparative…`: `cargo fmt -p bonsai-cpu-policy` rejected array wrapping at `hardware/tests.rs:27`, after all eight ranking tests passed. Existing `d3fe70d5` repaired formatting. | Keep the package-scoped formatter once in its owning lane; pre-push Rust formatting catches this before publication. This was a format failure, not failed ranking arithmetic. |
+| H4 | `public-native-abi` / `Compare real public queue declarations…`: Win32 sharing violation (`os error 32`). `Control::receive` retained its writable download handle while restrictive read-only identity intake denied write sharing. Latest provenance had `commands: []`, placing failure before compilation. | Sync and close the writer before guarded identity intake, then verify length/hash again. A network-free Windows fixture checks identity, duplicate refusal and cleanup. Do not weaken the immutable-read sharing contract or retry the same deterministic failure. |
+| R1 | `validate` release primitive probe merged compiler/rustup stderr into successful JSON stdout; JSON parsing saw an `info:` prefix. Existing `f39ae0bc` separates stderr; `4ee2037d` pins bootstrap. | Keep machine-readable stdout separate from diagnostics. Package/publish now consume the same-run checked helper bundle instead of bootstrapping it again. |
+| R2a | `maintenance` tests: seven failures shared a stale numerical capture source (`1429a337…`) while the runtime lock selected `99671be7…`. An expected allowance-error assertion was masked by that earlier identity failure. Existing `56feb066` updates the capture pin. | Preserve source identity admission and its focused controls. A mismatch is actionable, not a reason to weaken numerical evidence. |
+| R2b | `core` test `invalid_scale_closes_schema_connection_before_backend_and_preserves_service` expected empty EOF although the service correctly returned a framed 400 `invalid_chat_request`. Existing `a78e1936` corrects the expectation. | Assert the documented protocol response; retain the independent no-backend-launch/service-preservation checks. |
+| R2c | `ui`: eleven failed controls covered transcript reflow/viewport anchors, continuous repaint effects, recovery initialization and missing font/glyph initialization. Existing `143eb46e`, `a0873e69`, `9737da04` address these source/fixture defects. | Preserve UI behavioral tests and shared font setup in the owning Foundation lane. Do not suppress failed UI behavior as cosmetic lint. Actual UI/device acceptance remains separate. |
+| R2d | `ui` Clippy rejected optional const promotion, unit-expression punctuation and a deliberate `expect_err`; maintenance rejected a redundant clone. Existing `63da734e` and ownership cleanup corrected the source. | Allow optional const promotion and unit punctuation globally, alongside digit grouping below; preserve panic/ownership and correctness controls. No blanket analyzer waiver was added. |
+| R2e | `tts` notice collection bootstrapped Cargo outside the checkout with default rustc 1.99.1, below the workspace's 1.101 requirement. Existing `4ee2037d` pins the dated toolchain in the release adapter and notice collector. | Pin the compiler explicitly across working-directory changes; reuse existing native outputs where possible. Notice completeness remains required. |
+| R3 | `publish`: attempt 1 created a draft but confirmation rejected GitHub's valid temporary `untagged-` draft URL; attempt 2 rejected the same draft on reread. Existing `f61a2242` permits that temporary URL for the exact draft while preserving canonical published URLs and metadata/asset checks. | Reuse and independently inspect an existing same-run draft; do not repeat ambiguous mutations. Preserve source, tag, description, flags and byte identities. Both failed attempts remain part of the history. |
+| R4 | `maintenance` Clippy rejected grouping of opaque numeric fixture IDs (`unreadable_literal`); `3d3ffe77` reformatted them. | Allow this cosmetic lint in the workspace. The root check never demonstrated incorrect program behavior. |
+
+## Structural corrections
+
+Release previously started expensive checks even while Foundation's planner for
+the same SHA had already failed. It now requires the latest successful exact-SHA
+main-push Foundation and Source checks, verifies attempt-specific paginated jobs
+and mandatory gate steps, and checks again before publication. Older successes,
+ancestors, skipped mandatory jobs, bundle-only work and changing rerun attempts
+cannot substitute. Release then builds its five production lanes without
+repeating Foundation's analyzers/tests, and shares its source/digest-bound native
+tools with packaging and publication. Independent release primitives, notices,
+packaging and executable smoke checks remain required.
+
+Both prerequisite workflows now emit a verdict for every main push. Existing
+selectors retain their scope: unrelated changes do not select expensive jobs,
+unless earlier code still lacks a successful baseline. This avoids a permanently
+missing exact-SHA verdict for code-only or documentation-only release commits.
+
+The tracked pre-push guard materializes outgoing branch/tag tips with a separate
+Git index and applies basic source checks before an ordinary push. Agent
+instructions prohibit bypassing it. Only changed PowerShell syntax and existing
+workflow/format/policy checks are selected, plus named controls for known fragile
+adapters. It adds no general style linter or full local suite. Local hooks cannot
+technically prevent a privileged operator from disabling them; absolute remote
+enforcement requires GitHub rules plus restricted push/bypass credentials. No
+remote rules, pushes, CI dispatches or new runs were performed in this audit.
+
+## Local validation and retention
+
+The predeclared workload started 2026-11-14 19:52:30 UTC with a 720-second ceiling
+and conservative 600-second estimate. Two Rust tool crates plus focused fixtures,
+source checks, integration and cleanup justified extending the default five
+minutes. AC was disconnected, charge was 86%, and battery saver was unknown at
+the start. No models, full suites, benchmarks or performance comparisons were
+selected. Equal endpoint observations cannot prove uninterrupted power stability.
+
+The last aggregate power observation was 2026-11-14 20:04:42 UTC: AC disconnected,
+80% charge, battery saver unknown. The observed wall-clock interval was about
+12 minutes 12 seconds, **12 seconds beyond the declared limit** and below the
+absolute 15-minute ceiling. The final check and its cleanup/observation ran late;
+this is an allowance overrun, not a qualified timing result. No diagnostic clock
+was restarted and no further diagnostics were run.
+Intermediate native push-check snapshots observed battery saver off at 82% and
+81% charge; these do not fill the unknown aggregate endpoint saver observations.
+
+| Selected work | Result and scope |
+| --- | --- |
+| Four cache-environment cases, two Source routing/trigger cases, startup guard, one startup fixture, owned-language guard | Nine focused commands passed in the Foundation worktree. |
+| Integrated workflow syntax plus `same_repository_action_and_script_text_pass` | All 13 manifests and the named fixture passed before snapshot-specific changes. |
+| Native release-prerequisite fixtures | Four passed: exact identity/latest failure, complete gate/attempt binding, pagination/legitimate skips and rerun race. |
+| Native outgoing-tip fixtures | Four passed after fixing Windows verbatim paths, including a real temporary-index snapshot with conflicting staged/unstaged repairs. |
+| Public-input writer handoff | The one network-free Windows fixture passed. |
+| Projection dependency/linker handoff | Initial selection failed because Cargo pruned the hash package from the selected owner's context; corrected two-context source passed the named fixture. |
+| Strict Release Clippy, CI and tools library/test targets | Passed after resolving the native path arithmetic and removing nonsemantic blockers. This preceded the final CMD/config/preparation source follow-ups; their final analyzer verdict remains pending. |
+| Complete local push adapter | Earlier failures exposed direct packaged-PowerShell launch restrictions, then snapshot actionlint config discovery. The owned-CMD correction compiled and reached the workflow syntax stage, where custom runner labels were incorrectly rejected. No passing complete-adapter verdict is claimed. |
+
+The final source makes actionlint's config explicit, adds its named snapshot
+regression, handles final output bounds and historical fixture compatibility,
+and changes ordinary pushes to require an already prepared source/digest-bound
+helper. The last change removes an unbounded hidden Cargo bootstrap from a push;
+explicit preparation remains a caller-supervised source build. These source-only
+follow-ups were reviewed after the allowance closed and were **not rerun**.
+No helper preparation receipt for the final source was created. A push therefore
+fails closed until its prerequisite is prepared and the remaining checks pass.
+Owning hosted acceptance stays in [C1](../../PLAN.md).
+
+Failed logs and only specifically selected nonblank artifact files were inspected
+in temporary storage. The per-run source identities, errors, losing outcomes and
+limits above are the durable diagnosis; no complete artifact ZIP, copied source
+tree, successful build chatter or placeholder receipt belongs in this record.
+This summary does not replace any independent numerical/ABI replay inputs already
+required by the repository's existing evidence consumers.
