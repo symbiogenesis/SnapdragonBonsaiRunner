@@ -67,6 +67,10 @@ adoption decisions without displacing native daily-use acceptance.
   receipt/invalidation, packaged-shell and historical-tip/output-bound controls;
   those source-only follow-ups have no passing post-audit local verdict. Keep
   helper preparation explicit and caller-supervised within its declared allowance.
+  Add trusted candidate-root adapter controls for non-HEAD outgoing tips; current
+  named self-checks exercise committed HEAD policy, while static source checks
+  inspect every outgoing snapshot. Verify explicit target/output preparation
+  against inherited Cargo target overrides before claiming prepared-helper admission.
 - [ ] Qualify Runner's checked-tools producer, shared regression runner and
   native-acceptance caches: cold build, exact hit and relevant-input invalidation,
   fresh same-run packages, source/digest verification and every selected check.

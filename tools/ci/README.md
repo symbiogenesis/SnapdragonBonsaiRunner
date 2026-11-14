@@ -665,7 +665,9 @@ The screen checks owned-language policy, parses changed PowerShell without
 executing it, checks workspace Rust formatting when Rust/build inputs change,
 and validates workflow startup plus Actions syntax when YAML/action inputs
 change. Only named cache-environment and source-routing controls run for their
-own adapters. It adds no PowerShell style rules, model work, full test suite,
+own adapters in the committed checking policy. For non-HEAD/historical tips,
+those self-checks do not establish the candidate's adapter behavior; basic
+syntax/format/workflow checks still inspect each outgoing snapshot. It adds no PowerShell style rules, model work, full test suite,
 dependency audit or benchmark. Foundation retains compilation, analyzers and
 complete tests; this screen does not establish their verdicts.
 
@@ -678,7 +680,9 @@ allowance, with locked dependencies already cached:
 pwsh -NoLogo -NoProfile -File tools/ci/check_push_sanity.ps1 -Prepare
 ```
 
-Preparation reads the committed compiler configuration and source from its own
+Preparation selects the explicit Windows ARM64 target and its matching output,
+so inherited Cargo target settings cannot cause an old host binary to be receipted.
+It reads the committed compiler configuration and source from its own
 working directory and records their Git object identities plus the executable
 digest. A push verifies that receipt before executing the helper. Ordinary pushes
 never compile or fetch missing Cargo dependencies. Explicit preparation is a

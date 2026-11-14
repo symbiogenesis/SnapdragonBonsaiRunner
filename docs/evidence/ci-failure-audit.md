@@ -131,6 +131,11 @@ and changes ordinary pushes to require an already prepared source/digest-bound
 helper. The last change removes an unbounded hidden Cargo bootstrap from a push;
 explicit preparation remains a caller-supervised source build. These source-only
 follow-ups were reviewed after the allowance closed and were **not rerun**.
+Preparation now binds an explicit Windows ARM64 target/output, closing a source-
+review finding where a Cargo target override could leave an older host binary.
+Named adapter self-checks use the committed checking policy; they do not qualify
+non-HEAD candidate adapter behavior. All outgoing snapshots still receive static
+checks. Candidate-root adapter controls remain a scoped follow-up in C1.
 No helper preparation receipt for the final source was created. A push therefore
 fails closed until its prerequisite is prepared and the remaining checks pass.
 Owning hosted acceptance stays in [C1](../../PLAN.md).
