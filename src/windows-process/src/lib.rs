@@ -881,8 +881,10 @@ impl OwnedProcess {
     ///
     /// The requested child environment contains only `SystemRoot`, `windir` and
     /// `SystemDrive` derived from the native Windows directory, plus private
-    /// scratch `TEMP`/`TMP`. It supplies no `PATH`, profile variables, application
-    /// options or arbitrary inherited values. Windows PSEC may supply its own
+    /// scratch `TEMP`/`TMP` and `LOCALAPPDATA`. Windows PSEC requires the latter
+    /// name to be present; it receives the private scratch path, not the user's
+    /// profile. It supplies no `PATH`, caller profile paths, application options
+    /// or arbitrary inherited values. Windows PSEC may supply its own
     /// private temporary-storage environment. The parent environment is unchanged.
     /// Existing filesystem, Job, memory, handle and cleanup requirements from
     /// [`Self::start_sandboxed_piped`] remain in force. There is no loopback grant.

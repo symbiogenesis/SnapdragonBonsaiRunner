@@ -211,6 +211,8 @@ adoption decisions without displacing native daily-use acceptance.
   network/loopback/file/device/desktop/child denial and boundary overhead separately
   from portable parser/DTO regressions. Complete final-source strict native
   analysis and named regressions, including minimal child-environment contents.
+  Include the production-image handshake/Unicode regression and the six-key
+  minimal environment with private `LOCALAPPDATA` in owning native acceptance.
 - [ ] Qualify Settings scope, compact/wrapped navigation, persistence, generation
   locks, adapter disclosure, diagnostics, scrolling and Close/Escape focus return.
 - [ ] Qualify responsive sidebar/drawer/hide/reopen behavior, stable manual width,

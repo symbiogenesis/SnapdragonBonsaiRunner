@@ -49,6 +49,11 @@ UI event loop. The trusted parent independently validates UTF-8, spans, style
 flags, sizes and source mappings before constructing native text layout. See the
 [streaming contract](streaming-resources.md#native-chat-and-transcript) for limits.
 
+The ignored production-image regression
+`markdown_production_image_formats_under_native_containment` checks a real
+sandbox handshake and repeated Unicode formatting, independently of UI fixtures
+that bypass process launch.
+
 The worker policy grants read access to the exact current executable and required
 Windows runtime files, private application scratch and Windows' private PSEC
 temporary storage. It requests no network or host-loopback capability, user-file,
@@ -58,9 +63,12 @@ committed memory. It receives no broker credentials, model files or conversation
 storage paths.
 
 The parser-specific launch builds a minimal child environment from the native
-Windows directory/drive and private `TEMP`/`TMP`; it inherits no caller entries,
-`PATH`, profile variables or application options. Other workers retain their
-documented environment policy. The Markdown Job limits committed memory to
+Windows directory/drive and private `TEMP`/`TMP`/`LOCALAPPDATA`. PSEC requires
+`SYSTEMROOT` and `LOCALAPPDATA` names in a supplied environment; omitting either
+rejects process creation with Windows error 203. `LOCALAPPDATA` points to the
+same private scratch as `TEMP`/`TMP`, never the user's profile. The parser inherits
+no caller entries, `PATH`, caller profile paths or application options. Other
+workers retain their documented environment policy. The Markdown Job limits committed memory to
 256 MiB. Startup/handshake has a ten-second allowance and each request two seconds;
 owned-worker stop and pipe joining share five seconds. Native process-creation
 failure retains its existing ten-second cleanup allowance, and synchronous native

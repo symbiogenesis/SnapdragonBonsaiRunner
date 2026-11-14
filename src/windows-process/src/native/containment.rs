@@ -144,7 +144,10 @@ fn minimal_environment_from(policy: &SandboxPolicy, windows: &Path) -> io::Resul
     let scratch = path_text(&policy.writable_directory)?;
     // No inherited entry is consulted, including entries with unknown secret
     // names. Runtime paths come from Windows rather than caller-controlled
-    // SystemRoot/windir values. The ordinary worker environment is unchanged.
+    // SystemRoot/windir values. PSEC requires LOCALAPPDATA to be present even
+    // for an offline worker (mxc-sdk 1.0.1 launch_diagnostics.rs). Bind that
+    // presence-only requirement to private scratch, never the caller's profile.
+    // The ordinary worker environment is unchanged.
     super::environment::build(
         [
             (OsString::from("SystemRoot"), OsString::from(&windows)),
@@ -153,6 +156,7 @@ fn minimal_environment_from(policy: &SandboxPolicy, windows: &Path) -> io::Resul
                 OsString::from("SystemDrive"),
                 OsString::from(format!("{}:", char::from(drive))),
             ),
+            (OsString::from("LOCALAPPDATA"), OsString::from(&scratch)),
         ],
         &BTreeMap::from([
             ("TEMP".to_owned(), scratch.clone()),
@@ -376,7 +380,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minimal_child_environment_contains_only_native_windows_paths_and_private_temp()
+    fn minimal_child_environment_contains_required_psec_names_and_only_private_storage()
     -> io::Result<()> {
         let policy = SandboxPolicy {
             readonly_paths: Vec::new(),
@@ -387,11 +391,12 @@ mod tests {
             .split(|unit| *unit == 0)
             .filter(|entry| !entry.is_empty())
             .collect();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 6);
         for expected in [
             "SystemRoot=R:\\Windows",
             "windir=R:\\Windows",
             "SystemDrive=R:",
+            "LOCALAPPDATA=R:\\private\\scratch",
             "TEMP=R:\\private\\scratch",
             "TMP=R:\\private\\scratch",
         ] {
