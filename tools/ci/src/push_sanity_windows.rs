@@ -400,6 +400,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn push_sanity_failed_preparation_invalidates_existing_receipt() -> Result<()> {
+        let temporary = super::super::canonical_path(std::env::temp_dir())?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch = temporary.join(format!("bonsai-push-preparation-{nonce}"));
+        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let mut work = Work {
+            directory: scratch.clone(),
+            started: Instant::now(),
+            sequence: 0,
+        };
+        // This bootstrap adapter requires Windows. Foundation's native CI
+        // library lane owns it; the Linux planner does not exercise WinForms.
+        let policy =
+            super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+        let result = work.script(
+            &policy,
+            &policy,
+            "test_push_sanity.ps1",
+            &[
+                "-Case".into(),
+                "failed_preparation_invalidates_existing_receipt".into(),
+            ],
+        );
+        if scratch.parent() != Some(temporary.as_path()) {
+            return Err("Push preparation fixture cleanup escaped temp.".into());
+        }
+        fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
+        result
+    }
+
+    #[test]
     fn push_sanity_trusted_controls_reject_non_head_candidate_adapters() -> Result<()> {
         let temporary = super::super::canonical_path(std::env::temp_dir())?;
         let nonce = SystemTime::now()
