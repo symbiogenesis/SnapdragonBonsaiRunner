@@ -12,6 +12,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::rust_engine::{ARITHMETIC_IDENTITY, Observation, RustRecognizer};
 
+mod capture;
+pub use capture::{CacheValues, CaptureLayout, CaptureWriter, DecoderSnapshot, LayerCache};
+
 const MAGIC: &[u8; 8] = b"ASRREPL1";
 const MAX_TEXT: usize = 128 * 1024;
 

@@ -1,6 +1,9 @@
 //! Literal miniature-graph replay answers; no expected values come from capture.
 
-use super::{Binding, Provider, Replay, Stage, Tolerance, Tolerances};
+use super::{
+    Binding, CacheValues, CaptureLayout, CaptureWriter, DecoderSnapshot, LayerCache, Provider,
+    Replay, Stage, Tolerance, Tolerances,
+};
 use crate::{
     protocol::PromptTokens,
     rust_engine::{
@@ -124,6 +127,230 @@ fn packet() -> Packet {
         cache,
         terminal,
     }
+}
+
+const fn capture_layout() -> CaptureLayout {
+    CaptureLayout {
+        encoder_width: 2,
+        vocabulary: 11,
+        decoder_layers: 2,
+        kv_width: 2,
+        eos_token: 0,
+    }
+}
+
+fn capture_prefix<W: io::Write>(capture: &mut CaptureWriter<W>) -> io::Result<()> {
+    capture.frontend(1, &[-1.5; 128], &mut || false)?;
+    capture.encoder(1, &[2.0, -3.0], &mut || false)?;
+    capture.prompt(
+        &[1, 4, 3, 2, 3, 1, 5, 3, 8, 9, 10, 2, 3, 1, 6, 3],
+        9..10,
+        &mut || false,
+    )
+}
+
+fn capture_answer<W: io::Write>(capture: &mut CaptureWriter<W>) -> io::Result<()> {
+    // The same mathematical answers as packet(), without invoking either graph.
+    let mut keys = [0_u16; 32];
+    for index in [4, 6, 9, 16, 18, 21, 30] {
+        keys[index] = 0x8000;
+    }
+    let mut values = [0_u16; 32];
+    for row in values.as_chunks_mut::<2>().0 {
+        row[0] = 0x3a88;
+    }
+    values[18..20].copy_from_slice(&[0x39d8, 0xbc62]);
+    capture.decoder(
+        &DecoderSnapshot {
+            generation_index: 0,
+            logits: &[1.0 / 1.5_f32.sqrt(); 11],
+            token: 0,
+            positions: 16,
+            layers: &[
+                LayerCache {
+                    keys: CacheValues::F16(&keys),
+                    values: CacheValues::F16(&[0; 32]),
+                },
+                LayerCache {
+                    keys: CacheValues::F16(&keys),
+                    values: CacheValues::F16(&values),
+                },
+            ],
+        },
+        &mut || false,
+    )
+}
+
+#[test]
+fn rust_asr_capture_writes_original_literal_packet_and_replays() -> io::Result<()> {
+    let mut capture =
+        CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    capture_prefix(&mut capture)?;
+    capture_answer(&mut capture)?;
+    let bytes = capture.finish(Ok(""), &mut || false)?;
+    assert_eq!(bytes, packet().bytes);
+    let mut recognizer = recognizer(0)?;
+    assert_eq!(
+        Replay::new(bytes.as_slice(), &binding(), Tolerances::BITS)?.transcribe(
+            &mut recognizer,
+            &[0.0; 201],
+            &mut || false
+        )?,
+        ""
+    );
+    assert_cleared(&recognizer);
+    Ok(())
+}
+
+#[test]
+fn rust_asr_capture_requires_complete_original_state_greedy_eos_and_success() -> io::Result<()> {
+    for case in 0..6 {
+        let mut capture =
+            CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+        capture_prefix(&mut capture)?;
+        let mut logits = [0.0; 11];
+        if case == 5 {
+            logits[0] = f32::NAN;
+        }
+        let layers = [
+            LayerCache {
+                keys: CacheValues::F32(&[0.0; 32]),
+                values: CacheValues::F32(&[0.0; 32]),
+            },
+            LayerCache {
+                keys: CacheValues::F32(&[0.0; 32]),
+                values: CacheValues::F32(&[0.0; 32]),
+            },
+        ];
+        assert!(
+            capture
+                .decoder(
+                    &DecoderSnapshot {
+                        generation_index: usize::from(case == 0),
+                        logits: if case == 1 { &logits[..10] } else { &logits },
+                        token: u32::from(case == 2),
+                        positions: if case == 3 { 15 } else { 16 },
+                        layers: if case == 4 { &layers[..1] } else { &layers },
+                    },
+                    &mut || false
+                )
+                .is_err()
+        );
+        assert!(capture_answer(&mut capture).is_err());
+        assert!(capture.finish(Ok(""), &mut || false).is_err());
+    }
+    let mut layout = capture_layout();
+    layout.eos_token = 1;
+    let mut capture = CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, layout)?;
+    capture_prefix(&mut capture)?;
+    capture_answer(&mut capture)?;
+    assert!(capture.finish(Ok(""), &mut || false).is_err());
+    let mut capture =
+        CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    capture_prefix(&mut capture)?;
+    capture_answer(&mut capture)?;
+    assert!(
+        capture
+            .finish(Err(io::ErrorKind::Interrupted.into()), &mut || false)
+            .is_err()
+    );
+    let mut capture =
+        CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+    capture_prefix(&mut capture)?;
+    capture_answer(&mut capture)?;
+    assert!(capture_answer(&mut capture).is_err());
+    assert!(capture.finish(Ok(""), &mut || false).is_err());
+    Ok(())
+}
+
+#[test]
+fn rust_asr_capture_rejects_changed_layout_and_sticky_order_cancel_unwind() -> io::Result<()> {
+    let mut layout = capture_layout();
+    layout.decoder_layers = 0;
+    assert!(CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, layout).is_err());
+    let mut identity = binding();
+    identity.reference.executable = [0; 32];
+    assert!(CaptureWriter::new(Vec::new(), &identity, Tolerances::BITS, capture_layout()).is_err());
+    for case in 0..4 {
+        let mut capture =
+            CaptureWriter::new(Vec::new(), &binding(), Tolerances::BITS, capture_layout())?;
+        if case == 0 {
+            assert!(capture.encoder(1, &[2.0, -3.0], &mut || false).is_err());
+        } else if case == 1 {
+            assert!(capture.frontend(1, &[0.0; 127], &mut || false).is_err());
+        } else if case == 2 {
+            assert!(capture.frontend(1, &[0.0; 128], &mut || true).is_err());
+        } else {
+            #[expect(
+                clippy::panic,
+                reason = "Controlled callback unwind checks sticky capture refusal."
+            )]
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture.frontend(1, &[0.0; 128], &mut || {
+                    panic!("capture cancellation unwind")
+                })
+            }));
+            assert!(result.is_err());
+        }
+        assert!(capture_prefix(&mut capture).is_err());
+        assert!(capture.finish(Ok(""), &mut || false).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_asr_capture_bounds_buffer_and_never_recovers_from_write_or_flush_failure() -> io::Result<()>
+{
+    struct Sink {
+        fail_write: bool,
+        fail_flush: bool,
+    }
+    impl io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            assert!(bytes.len() <= 16 * 1024);
+            if self.fail_write {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(bytes.len())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut capture = CaptureWriter::new(
+        Sink {
+            fail_write: true,
+            fail_flush: false,
+        },
+        &binding(),
+        Tolerances::BITS,
+        capture_layout(),
+    )?;
+    assert!(
+        capture
+            .frontend(33, &vec![0.0; 33 * 128], &mut || false)
+            .is_err()
+    );
+    assert!(capture_prefix(&mut capture).is_err());
+    assert!(capture.finish(Ok(""), &mut || false).is_err());
+    let mut capture = CaptureWriter::new(
+        Sink {
+            fail_write: false,
+            fail_flush: true,
+        },
+        &binding(),
+        Tolerances::BITS,
+        capture_layout(),
+    )?;
+    capture_prefix(&mut capture)?;
+    capture_answer(&mut capture)?;
+    assert!(capture.finish(Ok(""), &mut || false).is_err());
+    Ok(())
 }
 
 #[test]

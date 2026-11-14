@@ -282,3 +282,36 @@ unwind while the decoder is active, and cancellation during terminal/EOF intake.
 They establish streaming comparison behavior; they provide no full-model or
 native-engine observation. Independent complete
 native captures and owning hosted/model/device qualification remain pending.
+
+### Original observation packet writer
+
+`replay::CaptureWriter` writes the same `ASRREPL1` format from provider-neutral
+borrowed slices. An independent provider supplies every frontend/encoder value,
+prompt ID, raw generation logit and complete ordered layer cache; it needs no
+Rust decoder `Session`. Before capture, supply reviewed `Binding`, `Tolerances`
+and `CaptureLayout` values, including complete vocabulary, layer count, KV width
+and the verified model's EOS ID. The writer checks exact dimensions, contiguous
+positions, complete layers, lowest-ID finite greedy decisions and final EOS.
+It cannot infer omitted model layers from a partial first snapshot.
+
+The writer copies no tensor or cache and uses one fixed 16 KiB output buffer.
+`CacheValues::F16` borrows original binary16 words and widens them one scalar at
+a time, retaining zero signs and exceptional payloads without an expanded cache.
+It checks caller cancellation between records and every 4,096 numerical values;
+caller-owned output I/O still needs an absolute deadline. Ordering, geometry,
+write, cancellation and caught-callback-unwind failures are sticky. Pass the
+actual successful complete provider result to `finish` after its cleanup/reset;
+only successful finalization and flush permits retaining the packet as complete.
+Failed output remains an incomplete capture, even if some bytes were written.
+Binding/layout claims, provider success and actual source/model/PCM ownership
+still require independent authentication. The writer supplies no model evidence.
+
+The pinned `transcribe-cpp` 0.4.1 Rust API and `transcribe.h` currently expose
+no numerical observation callback. Qwen's `decoder.cpp` keeps `step.logits`
+internally while reading back `step.argmax`; its debug dumps do not supply all
+generation logits and complete all-layer committed KV. A reviewed upstream
+observation ABI and its source/build/lifetime qualification remain necessary
+before this writer can consume complete native observations. No native capture
+was performed or synthesized. Five `rust_asr_capture_` controls cover original
+literal packet bytes, replay compatibility, missing/changed state, EOS/success,
+sticky refusal/unwind and bounded-buffer write/flush failures.
