@@ -120,6 +120,13 @@ fn parse(input: &str) -> Result<Value, String> {
     serde_json::from_str(input).map_err(|_| "Invalid compiled CPU configuration.".into())
 }
 
+fn hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn validate_options(
     profile: Profile,
     use_abliterate_lora: bool,
