@@ -41,49 +41,57 @@ impl Row<'_> {
 
     fn contents(&self, ui: &mut egui::Ui, width: f32) -> Option<Action> {
         let mut action = None;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let title = RichText::new(&self.conversation.title).color(if self.active {
-                ui.visuals().selection.stroke.color
-            } else {
-                ui.visuals().text_color()
-            });
-            let response = ui
-                .add_enabled_ui(self.availability.select, |ui| {
-                    let button = egui::Button::selectable(self.active, title)
-                        .truncate()
-                        .corner_radius(8);
-                    let button = if self.responding {
-                        button.right_text(egui::Atom::paint(egui::vec2(3.0, 20.0), |ui, args| {
-                            response_progress(
-                                ui,
-                                args.rect,
-                                args.fallback_text_color,
-                                &self.conversation.title,
-                            );
-                        }))
-                    } else {
-                        button.right_text(())
-                    };
-                    ui.add_sized([(width - 38.0).max(40.0), ROW_HEIGHT], button)
-                })
-                .inner;
-            // Pending composer focus during generation must not repaint forever.
-            if self.active && self.reveal {
-                response.scroll_to_me(Some(egui::Align::Center));
-            }
-            if response.on_hover_text(&self.conversation.title).clicked() {
-                action = Some(Action::Select(self.conversation.id));
-            }
-            let (response, _) = egui::containers::menu::MenuButton::from_button(
-                controls::quiet_button("⋯").min_size(egui::vec2(34.0, ROW_HEIGHT)),
-            )
-            .ui(ui, |ui| {
-                action = self.menu(ui);
-            });
-            let label = format!("Actions for {}", self.conversation.title);
-            response.accessible_name(&label).on_hover_text(label);
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, ROW_HEIGHT),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                // Reserve the menu's actual padded width before sizing the title.
+                let (response, _) = egui::containers::menu::MenuButton::from_button(
+                    controls::quiet_button("⋯").min_size(egui::vec2(34.0, ROW_HEIGHT)),
+                )
+                .ui(ui, |ui| {
+                    action = self.menu(ui);
+                });
+                let label = format!("Actions for {}", self.conversation.title);
+                response.accessible_name(&label).on_hover_text(label);
+                let title = RichText::new(&self.conversation.title).color(if self.active {
+                    ui.visuals().selection.stroke.color
+                } else {
+                    ui.visuals().text_color()
+                });
+                let response = ui
+                    .add_enabled_ui(self.availability.select, |ui| {
+                        let button = egui::Button::selectable(self.active, title)
+                            .truncate()
+                            .corner_radius(8);
+                        let button = if self.responding {
+                            button.right_text(egui::Atom::paint(
+                                egui::vec2(3.0, 20.0),
+                                |ui, args| {
+                                    response_progress(
+                                        ui,
+                                        args.rect,
+                                        args.fallback_text_color,
+                                        &self.conversation.title,
+                                    );
+                                },
+                            ))
+                        } else {
+                            button.right_text(())
+                        };
+                        ui.add_sized([ui.available_width().max(40.0), ROW_HEIGHT], button)
+                    })
+                    .inner;
+                // Pending composer focus during generation must not repaint forever.
+                if self.active && self.reveal {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
+                if response.on_hover_text(&self.conversation.title).clicked() {
+                    action = Some(Action::Select(self.conversation.id));
+                }
+            },
+        );
         action
     }
 
