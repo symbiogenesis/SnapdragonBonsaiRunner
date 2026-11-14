@@ -106,12 +106,11 @@ impl PendingCapture {
                 drop(process);
                 published.store(status, Ordering::Release);
             });
-        let thread = match thread {
-            Ok(thread) => Some(thread),
-            Err(_) => {
-                result.store(THREAD_FAILED, Ordering::Release);
-                None
-            }
+        let thread = if let Ok(thread) = thread {
+            Some(thread)
+        } else {
+            result.store(THREAD_FAILED, Ordering::Release);
+            None
         };
         Capture {
             result,
@@ -164,6 +163,7 @@ impl Capture {
         {
             self.result.store(THREAD_FAILED, Ordering::Release);
         }
+        drop(handle);
         Ok(true)
     }
 }
