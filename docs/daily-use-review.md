@@ -139,8 +139,12 @@ the default `control` packet. All selections retain the complete hosted-only
 matrix and supply listening captures, with independent human review still pending:
 
 ```powershell
-gh workflow run tts-evaluation.yml --ref main -f target=hosted-arm64 -f repetitions=1 -f response_format=pcm
+gh workflow run tts-evaluation.yml --ref main -f target=hosted-arm64 -f repetitions=1 -f response_format=pcm -f speech_packet=daily-narrative
 ```
+
+The workflow input `speech_packet` selects `control`, `daily-narrative` or
+`daily-instructions`; omitting it preserves the control text. Select each packet
+as declared hosted work, without transferring its verdict to another text.
 
 Retained reports identify the selected packet, exact text and text SHA-256. Each
 complete synthesis record identifies the exact request digest and original WAV

@@ -17,6 +17,11 @@ on:
         type: choice
         options: [pcm, wav]
         default: pcm
+      speech_packet:
+        description: Fixed public listening text; each selection retains its own text and audio identities
+        type: choice
+        options: [control, daily-narrative, daily-instructions]
+        default: control
 permissions:
   contents: read
 concurrency:
@@ -52,6 +57,7 @@ jobs:
         env:
           EVALUATION_REPETITIONS: ${{ inputs.repetitions }}
           EVALUATION_FORMAT: ${{ inputs.response_format }}
+          EVALUATION_SPEECH_PACKET: ${{ inputs.speech_packet }}
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           Set-StrictMode -Version Latest
@@ -60,10 +66,12 @@ jobs:
           $result = & $env:BONSAI_TOOLS_PATH speech-evaluation --json (@{
             operation = 'evaluate'; repositoryRoot = $env:GITHUB_WORKSPACE; dataDirectory = $data
             repetitions = [int]$env:EVALUATION_REPETITIONS; responseFormat = $env:EVALUATION_FORMAT
+            speechPacket = $env:EVALUATION_SPEECH_PACKET
           } | ConvertTo-Json -Depth 64 -Compress) | ConvertFrom-Json -AsHashtable
           $result | ConvertTo-Json -Depth 8
           $report = Get-Content -LiteralPath $result.ReportPath -Raw | ConvertFrom-Json
           @('CPU: ' + $report.Cpu,
+            'Speech packet: ' + $report.SpeechPacket + '; text SHA-256: ' + $report.TextSha256,
             'These measurements describe this runner only. Hosted ARM64 results do not qualify Snapdragon performance.',
             'Q8_0 remains the default. Voice quality requires independent listening to the retained synthetic WAV clips.',
             'Phase private/working-set maxima are sampled every 25 ms; the working-set and Job high-water counters cover each complete process lifetime.',
