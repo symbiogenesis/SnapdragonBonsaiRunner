@@ -5,6 +5,11 @@
 //! confined here. Review this boundary and its fixed `FlatBuffer` policy whenever
 //! either dependency changes; never use SDK dispatch, audit or fallback tiers.
 
+#![deny(
+    clippy::non_send_fields_in_send_ty,
+    reason = "This module audits native handle thread safety independently of broad Clippy category defaults."
+)]
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
