@@ -1,0 +1,10 @@
+#!/bin/sh
+# Validate the immutable branch/tag tips supplied by Git, including non-HEAD refs.
+set -eu
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+if command -v pwsh >/dev/null 2>&1; then
+    exec pwsh -NoLogo -NoProfile -NonInteractive -File tools/ci/check_push_sanity.ps1
+fi
+echo 'Push blocked: PowerShell 7.6+ is required for source sanity checks.' >&2
+exit 1
