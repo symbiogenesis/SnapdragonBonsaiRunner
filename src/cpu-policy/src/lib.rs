@@ -32,6 +32,9 @@ const SWIFT_WEIGHT_BYTES: u64 = 7_206_168_928;
 const PTQ1_WEIGHT_BYTES: u64 = 5_946_648_928;
 const ADAPTER_BYTES: u64 = 9_682_464;
 const PTQ1_FILENAME: &str = "Swift-Bonsai-2-current-repacked-PTQ1_0.gguf";
+const PTQ1_SHA256: &str = "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5";
+const PTQ1_TOKENIZER_SHA256: &str =
+    "4ac520292c253d0f559aa3a22de4784dee3eefec14cc0d62e2507c47063c1fe5";
 const ESTIMATE_SCOPE: &str = "Whole file plus persistent caches/transforms; temporary construction, tokenizer, graph/scratch and allocation overhead use remaining allowance. Source arithmetic, not measured peak.";
 
 /// Fixed reference process memory ceiling: 18 GiB.
@@ -115,13 +118,6 @@ fn require(condition: bool, message: &str) -> Result<(), String> {
 
 fn parse(input: &str) -> Result<Value, String> {
     serde_json::from_str(input).map_err(|_| "Invalid compiled CPU configuration.".into())
-}
-
-fn hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_options(
@@ -486,8 +482,8 @@ pub fn select_artifact(
             && Some(evidence.source_filename) == lock["model"]["filename"].as_str()
             && Some(evidence.source_repository) == lock["model"]["repository"].as_str()
             && evidence.output_filename == PTQ1_FILENAME
-            && hex(evidence.output_sha256, 64)
-            && hex(evidence.tokenizer_metadata_sha256, 64)
+            && evidence.output_sha256 == PTQ1_SHA256
+            && evidence.tokenizer_metadata_sha256 == PTQ1_TOKENIZER_SHA256
             && evidence.exact_pq2_reconstruction_verified
             && evidence.non_pq2_tensor_bytes_copied_verbatim
             && evidence.converted_tensor_count == 402
