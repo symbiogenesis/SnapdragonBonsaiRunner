@@ -46,6 +46,28 @@ fn dependency_environment(rustc: &Path) -> Result<BTreeMap<String, String>> {
     ]))
 }
 
+fn dependency_arguments(repository: &Path, target: &Path) -> Vec<OsString> {
+    vec![
+        "build".into(),
+        "--locked".into(),
+        "--release".into(),
+        "--lib".into(),
+        "--target".into(),
+        TARGET.into(),
+        "--manifest-path".into(),
+        repository.join("Cargo.toml").into_os_string(),
+        "--target-dir".into(),
+        target.as_os_str().to_owned(),
+        // This small existing owner enables serde's derive macro and JSON.
+        // Hashing is explicit: sha2 is only a dev dependency of tools on Windows.
+        "--package".into(),
+        "bonsai-cpu-policy".into(),
+        "--package".into(),
+        "sha2".into(),
+        "--message-format=json-render-diagnostics".into(),
+    ]
+}
+
 fn dependencies(context: &mut Context, rustc: &Path, output: &Path) -> Result<Vec<OsString>> {
     context.environment.extend(dependency_environment(rustc)?);
     let cargo = rustc
@@ -61,21 +83,7 @@ fn dependencies(context: &mut Context, rustc: &Path, output: &Path) -> Result<Ve
     let lock_digest = context.digest(&lock, 16 * 1024 * 1024)?;
     let build = context.run(
         cargo.as_os_str(),
-        &[
-            "build".into(),
-            "--locked".into(),
-            "--release".into(),
-            "--lib".into(),
-            "--target".into(),
-            TARGET.into(),
-            "--manifest-path".into(),
-            context.repo.join("Cargo.toml").into_os_string(),
-            "--target-dir".into(),
-            target.clone().into_os_string(),
-            "--package".into(),
-            "bonsai-tools".into(),
-            "--message-format=json-render-diagnostics".into(),
-        ],
+        &dependency_arguments(&context.repo, &target),
         180,
         &output.join("dependencies-build.txt"),
     )?;
@@ -299,11 +307,11 @@ mod tests {
             for (name, source) in [
                 (
                     "Cargo.toml",
-                    "[package]\nname = 'projection-link-control'\nversion = '0.0.0'\nedition = '2024'\n\n[workspace]\n\n[[bin]]\nname = 'projection-link-control'\npath = 'main.rs'\n",
+                    "[package]\nname = 'projection-link-control'\nversion = '0.0.0'\nedition = '2024'\n\n[workspace]\nmembers = ['policy', 'tools']\nexclude = ['support/serde', 'support/serde_json', 'support/sha2']\n\n[[bin]]\nname = 'projection-link-control'\npath = 'main.rs'\n\n[dependencies]\nbonsai-cpu-policy = { path = 'policy' }\nsha2 = { path = 'support/sha2' }\n",
                 ),
                 (
                     "Cargo.lock",
-                    "version = 4\n\n[[package]]\nname = 'projection-link-control'\nversion = '0.0.0'\n",
+                    "version = 4\n\n[[package]]\nname = 'bonsai-cpu-policy'\nversion = '0.0.0'\ndependencies = ['serde', 'serde_json']\n\n[[package]]\nname = 'bonsai-tools'\nversion = '0.0.0'\ndependencies = ['sha2']\n\n[[package]]\nname = 'projection-link-control'\nversion = '0.0.0'\ndependencies = ['bonsai-cpu-policy', 'sha2']\n\n[[package]]\nname = 'serde'\nversion = '0.0.0'\n\n[[package]]\nname = 'serde_json'\nversion = '0.0.0'\n\n[[package]]\nname = 'sha2'\nversion = '0.0.0'\n",
                 ),
                 (
                     "build.rs",
@@ -311,12 +319,71 @@ mod tests {
                 ),
                 (
                     "main.rs",
-                    "fn main() { assert_eq!(env!(\"BONSAI_PROJECTION_CONTROL\"), \"host-linked\"); }\n",
+                    "fn main() { assert_eq!(env!(\"BONSAI_PROJECTION_CONTROL\"), \"host-linked\"); assert_eq!(bonsai_cpu_policy::marker(), \"host-linked\"); }\n",
                 ),
+                (
+                    "policy/Cargo.toml",
+                    "[package]\nname = 'bonsai-cpu-policy'\nversion = '0.0.0'\nedition = '2024'\n\n[dependencies]\nserde = { path = '../support/serde', features = ['derive'] }\nserde_json = { path = '../support/serde_json' }\n",
+                ),
+                (
+                    "policy/build.rs",
+                    "fn main() { println!(\"cargo:rustc-env=BONSAI_PROJECTION_CONTROL=host-linked\"); }\n",
+                ),
+                (
+                    "policy/src/lib.rs",
+                    "pub fn marker() -> &'static str { env!(\"BONSAI_PROJECTION_CONTROL\") }\n",
+                ),
+                (
+                    "tools/Cargo.toml",
+                    "[package]\nname = 'bonsai-tools'\nversion = '0.0.0'\nedition = '2024'\n\n[dev-dependencies]\nsha2 = { path = '../support/sha2' }\n",
+                ),
+                (
+                    "tools/src/lib.rs",
+                    "compile_error!(\"Projection dependencies must not compile the maintenance CLI.\");\n",
+                ),
+                (
+                    "support/serde/Cargo.toml",
+                    "[package]\nname = 'serde'\nversion = '0.0.0'\nedition = '2024'\n\n[features]\nderive = []\n",
+                ),
+                (
+                    "support/serde/src/lib.rs",
+                    "#[cfg(not(feature = \"derive\"))]\ncompile_error!(\"Projection intake requires serde derive.\");\npub fn marker() {}\n",
+                ),
+                (
+                    "support/serde_json/Cargo.toml",
+                    "[package]\nname = 'serde_json'\nversion = '0.0.0'\nedition = '2024'\n",
+                ),
+                ("support/serde_json/src/lib.rs", "pub fn marker() {}\n"),
+                (
+                    "support/sha2/Cargo.toml",
+                    "[package]\nname = 'sha2'\nversion = '0.0.0'\nedition = '2024'\n",
+                ),
+                ("support/sha2/src/lib.rs", "pub fn marker() {}\n"),
             ] {
-                fs::write(scratch.0.join(name), source).map_err(|error| error.to_string())?;
+                let path = scratch.0.join(name);
+                fs::create_dir_all(path.parent().ok_or("Missing fixture directory.")?)
+                    .and_then(|()| fs::write(path, source))
+                    .map_err(|error| error.to_string())?;
             }
             Ok(scratch)
+        }
+
+        fn assert_dependency_selection(output: &str) -> Result<()> {
+            let selected = output
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            for name in ["serde", "serde_json", "sha2", "bonsai_cpu_policy"] {
+                assert!(selected.iter().any(|message| {
+                    message["reason"] == "compiler-artifact" && message["target"]["name"] == name
+                }));
+            }
+            assert!(!selected.iter().any(|message| {
+                message["reason"] == "compiler-artifact"
+                    && message["target"]["name"] == "bonsai_tools"
+            }));
+            Ok(())
         }
 
         #[test]
@@ -361,6 +428,16 @@ mod tests {
                 ]
             );
             let target = scratch.0.join("target");
+            let dependencies = startup_process::run_strict(
+                cargo.as_os_str(),
+                &dependency_arguments(&scratch.0, &target),
+                &scratch.0,
+                &environment,
+                Duration::from_secs(45),
+                &scratch.0.join("dependency-build.txt"),
+            )?;
+            assert_eq!(dependencies.code, 0, "{}", dependencies.stderr);
+            assert_dependency_selection(&dependencies.stdout)?;
             let built = startup_process::run_strict(
                 cargo.as_os_str(),
                 &[
