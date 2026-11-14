@@ -39,24 +39,24 @@ impl ProcessOutput {
             "exit code {} (0x{:08X}); stdout: {}; stderr: {}",
             self.code,
             self.code,
-            diagnostic_excerpt(&self.stdout),
-            diagnostic_excerpt(&self.stderr),
+            capture_summary(&self.stdout),
+            capture_summary(&self.stderr),
         )
     }
 }
 
-fn diagnostic_excerpt(text: &str) -> String {
-    const MAXIMUM: usize = 2048;
-    let text = text.trim();
+fn capture_summary(text: &str) -> String {
+    // Tool output can contain inherited environment values. Returned errors may
+    // reach presentation or receipts; leave raw bytes in their local capture.
     if text.is_empty() {
         return "<empty>".into();
     }
-    let end = text.floor_char_boundary(text.len().min(MAXIMUM));
-    format!(
-        "{}{}",
-        &text[..end],
-        if end < text.len() { " [truncated]" } else { "" }
-    )
+    let classification = if text.trim().is_empty() {
+        "whitespace-only; "
+    } else {
+        ""
+    };
+    format!("{classification}{} captured bytes; see log", text.len())
 }
 
 pub(crate) fn unique() -> String {
@@ -471,9 +471,10 @@ fn fail_owned(
 ) -> crate::Result<ProcessOutput> {
     let status = guard.try_wait();
     let cleanup = if guard.finished { Ok(()) } else { guard.stop() };
-    if cleanup.is_ok() {
-        guard.finished = true;
-    }
+    // Spend the existing cleanup allowance once. Dropping still closes the
+    // kill-on-close Job, but must not begin a second five-second wait after an
+    // unconfirmed stop. The receipt and returned error keep that failure open.
+    guard.finished = true;
     write_failure_log(log, message, &status, &cleanup, stdout, stderr)?;
     let cleanup = if cleanup.is_ok() {
         ""
@@ -597,23 +598,24 @@ mod tests {
     use std::os::windows::process::CommandExt as _;
 
     #[test]
-    fn failure_summary_preserves_exit_code_and_bounded_unicode_streams() {
+    fn failure_summary_preserves_exit_code_without_copying_capture_contents() {
         let mut output = ProcessOutput {
-            stdout: "  compiler output\n".into(),
+            stdout: "\u{1f331}private-stdout".into(),
             stderr: " \r\n\t".into(),
             code: 0xc000_0142,
         };
         assert_eq!(
             output.failure_summary(),
-            "exit code 3221225794 (0xC0000142); stdout: compiler output; stderr: <empty>"
+            "exit code 3221225794 (0xC0000142); stdout: 18 captured bytes; see log; stderr: whitespace-only; 4 captured bytes; see log"
         );
-        output.stdout = format!("{}\u{1f331}omitted", "a".repeat(2047));
-        output.stderr = "\u{1f331}".repeat(1024);
+        output.stdout.clear();
+        output.stderr = format!("{}private-stderr", "\u{1f331}".repeat(1024));
         let summary = output.failure_summary();
-        assert!(summary.contains(&format!("{} [truncated]", "a".repeat(2047))));
-        assert!(!summary.contains("omitted"));
-        assert!(summary.contains(&format!("{} [truncated]", "\u{1f331}".repeat(512))));
-        assert!(summary.len() < 4200);
+        assert!(summary.contains("stdout: <empty>"));
+        assert!(summary.contains("stderr: 4110 captured bytes; see log"));
+        assert!(!summary.contains("private"));
+        assert!(!summary.contains('\u{1f331}'));
+        assert!(summary.len() < 200);
     }
 
     #[test]
