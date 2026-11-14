@@ -211,7 +211,7 @@ mod tests {
             ),
         ]
     }
-    fn request(operation: &str, report: Value) -> Value {
+    fn request(operation: &str, report: &Value) -> Value {
         let mut value = json!({"operation":operation,"report":report});
         if operation == "capture-plan" {
             value["expectedCaptureMode"] = json!("request-timing");
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn hosted_report_gates_preserve_verified_fields_without_host_operations() -> Result<()> {
         for (operation, report) in fixtures() {
-            assert_eq!(run(request(operation, report.clone()))?, report);
+            assert_eq!(run(request(operation, &report))?, report);
         }
         Ok(())
     }
@@ -305,7 +305,7 @@ mod tests {
                 .pointer_mut(pointer)
                 .ok_or("Missing fixture pointer.")? = value;
             assert!(
-                run(request(operation, report)).is_err(),
+                run(request(operation, &report)).is_err(),
                 "{operation}: {pointer}"
             );
         }
@@ -314,7 +314,7 @@ mod tests {
             .filter(|(_, value)| value.get("ModelProcessStarted").is_some())
         {
             report["ModelProcessStarted"] = json!(true);
-            assert!(run(request(operation, report)).is_err());
+            assert!(run(request(operation, &report)).is_err());
         }
         assert!(run(json!({"operation":"admission-only","report":{}})).is_err());
         Ok(())
