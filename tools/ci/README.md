@@ -459,6 +459,11 @@ the test phase. They cannot combine with `--full-tests`. Each invocation require
 exactly one passing test, zero failures and zero ignored tests; zero matches fail.
 The existing aggregate deadline and source/compiler receipts apply, including the
 named case and target. Focused selections must not reconstruct a complete suite.
+On the owner device, the first failed focused selection stops the command; later
+selections remain explicitly pending in `SkippedChecks`. This includes compilation
+failures and zero-match or invalid test summaries. Hosted checks continue after
+ordinary exit/test failures and retain each selected verdict; supervision or
+setup failures still terminate execution.
 
 ```powershell
 bonsai-ci rust-plan --root $PWD --package bonsai-broker --phase clippy

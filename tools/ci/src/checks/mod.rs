@@ -514,6 +514,34 @@ fn focused_test_result(check: &Check, code: u32, stdout: &str) -> Result<Option<
         .transpose()
 }
 
+#[cfg(any(windows, test))]
+fn record_check_result(
+    owner: bool,
+    report: &mut serde_json::Value,
+    check: &Check,
+    remaining: &[Check],
+    record: serde_json::Value,
+) -> Result<bool> {
+    let stop = owner && check.test_case.is_some() && record["Passed"] != true;
+    report["Checks"]
+        .as_array_mut()
+        .ok_or("Invalid check receipt.")?
+        .push(record);
+    if stop {
+        report["SkippedChecks"] = serde_json::Value::Array(
+            remaining
+                .iter()
+                .map(|next| {
+                    serde_json::json!({"Name": next.name, "Phase": next.phase,
+                        "Packages": next.packages, "TestCase": next.test_case,
+                        "Status": "pending", "Reason": "earlier-focused-check-failed"})
+                })
+                .collect(),
+        );
+    }
+    Ok(stop)
+}
+
 fn toolchain(options: &Options) -> Result<String> {
     if let Some(toolchain) = &options.toolchain {
         return identifier(toolchain)

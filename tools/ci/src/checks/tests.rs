@@ -441,6 +441,69 @@ fn focused_case_verdict_rejects_zero_ignored_duplicate_or_failed_summaries() -> 
 }
 
 #[test]
+fn local_focused_failure_stops_and_retains_pending_selections() -> Result<()> {
+    let package = fixture("application", false);
+    let mut options = parse(&[
+        "rust-check".into(),
+        "--package".into(),
+        "application".into(),
+        "--test-case".into(),
+        "module::first".into(),
+        "--test-case".into(),
+        "module::second".into(),
+    ])?;
+    options.root = PathBuf::from("workspace");
+    let mut checks = plan(&options, &[&package], PINNED_TOOLCHAIN)?;
+    let passed = serde_json::json!({"Name": "previous-check", "Passed": true});
+    for record in [
+        serde_json::json!({"Passed": false, "ExitCode": 101, "TestPassed": null}),
+        serde_json::json!({"Passed": false, "ExitCode": 0, "Error": "zero matches"}),
+        serde_json::json!({"Passed": false, "ExitCode": null, "Error": "deadline"}),
+    ] {
+        let mut report = serde_json::json!({"Checks": [passed.clone()], "SkippedChecks": []});
+        assert!(record_check_result(
+            true,
+            &mut report,
+            &checks[0],
+            &checks[1..],
+            record.clone()
+        )?);
+        assert_eq!(report["Checks"], serde_json::json!([passed, record]));
+        assert_eq!(
+            report["SkippedChecks"],
+            serde_json::json!([{
+                "Name": "application-test-2", "Phase": "test", "Packages": ["application"],
+                "TestCase": "module::second", "Status": "pending",
+                "Reason": "earlier-focused-check-failed"
+            }])
+        );
+    }
+    for (owner, passed) in [(false, false), (false, true), (true, true)] {
+        let mut report = serde_json::json!({"Checks": [], "SkippedChecks": []});
+        assert!(!record_check_result(
+            owner,
+            &mut report,
+            &checks[0],
+            &checks[1..],
+            serde_json::json!({"Passed": passed})
+        )?);
+        assert_eq!(report["Checks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(report["SkippedChecks"], serde_json::json!([]));
+    }
+    checks[0].test_case = None;
+    let mut report = serde_json::json!({"Checks": [], "SkippedChecks": []});
+    assert!(!record_check_result(
+        true,
+        &mut report,
+        &checks[0],
+        &checks[1..],
+        serde_json::json!({"Passed": false})
+    )?);
+    assert_eq!(report["SkippedChecks"], serde_json::json!([]));
+    Ok(())
+}
+
+#[test]
 fn release_deadlines_require_the_explicit_exact_hosted_workflow() {
     let environment = std::collections::BTreeMap::from([
         ("BONSAI_RELEASE_BUILD", "true"),

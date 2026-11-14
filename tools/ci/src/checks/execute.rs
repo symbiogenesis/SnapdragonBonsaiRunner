@@ -256,7 +256,7 @@ impl Execution<'_> {
             return Err("Rust compiler identification failed.".into());
         }
         report["CompilerIdentity"] = identity.1.into();
-        for check in self.plan {
+        for (index, check) in self.plan.iter().enumerate() {
             let log = self.evidence.join(format!("{}.log", check.name));
             let started = Instant::now();
             let mut record = json!({"Name": check.name, "Phase": check.phase, "Packages": check.packages,
@@ -284,11 +284,16 @@ impl Execution<'_> {
                     }
                     Err(error) => record["Error"] = error.into(),
                 }
+            } else if let Err(error) = &result {
+                record["Error"] = error.as_str().into();
             }
-            report["Checks"]
-                .as_array_mut()
-                .ok_or("Invalid check receipt.")?
-                .push(record);
+            let stop = super::record_check_result(
+                self.owner,
+                report,
+                check,
+                &self.plan[index + 1..],
+                record,
+            )?;
             receipt(receipt_path, report)?;
             result.map_err(|error| {
                 format!(
@@ -299,6 +304,13 @@ impl Execution<'_> {
                     log.display()
                 )
             })?;
+            if stop {
+                return Err(format!(
+                    "Local focused check {} failed; remaining selections were not executed. Receipt: {}",
+                    check.name,
+                    receipt_path.display()
+                ));
+            }
         }
         if report["Checks"]
             .as_array()
@@ -364,7 +376,7 @@ pub(super) fn run(
         "SchemaVersion": 2, "Revision": std::env::var("GITHUB_SHA").ok(), "Toolchain": toolchain,
         "CheckProfile": options.profile, "FingerprintMode": std::env::var("CARGO_BUILD_FINGERPRINT").unwrap_or_else(|_| "mtime".into()),
         "Packages": packages.iter().map(|package| &package.name).collect::<Vec<_>>(), "TargetDirectory": target,
-        "WorkingDirectory": work, "CompilerIdentity": null, "Checks": [], "Success": false, "Error": null,
+        "WorkingDirectory": work, "CompilerIdentity": null, "Checks": [], "SkippedChecks": [], "Success": false, "Error": null,
         "PerformanceMeasured": false, "PlannedCargoInvocations": plan.len(), "UnbatchedCargoInvocations": packages.len() * options.phases.len(),
         "GitHubReleaseDeadline": options.github_release,
         "WorkspaceSha256": workspace_hash, "LockSha256": lock_hash, "RegistrySha256": registry_hash
