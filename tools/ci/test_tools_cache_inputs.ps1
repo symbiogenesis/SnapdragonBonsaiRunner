@@ -181,6 +181,19 @@ $cases=[ordered]@{
         Assert-CiEqual $values[0] $values[3]; Assert-CiEqual $values[1] $values[2]; Assert-Ci ($values[0] -cne $values[1])
     }
  }
+ environment_fixture_preserves_absent_and_empty_values={
+    $names=@('CARGO_BUILD_CACHE_FIXTURE_ABSENT','CARGO_BUILD_CACHE_FIXTURE_EMPTY'); $before=[hashtable]::new([StringComparer]::Ordinal)
+    foreach ($name in $names) { $before[$name]=[Environment]::GetEnvironmentVariable($name) }
+    try {
+        [Environment]::SetEnvironmentVariable($names[0],[NullString]::Value)
+        [Environment]::SetEnvironmentVariable($names[1],'')
+        $values=Invoke-ToolsEnvironmentFixture @(@{environment=@{}},@{environment=@{RUSTFLAGS=''}},@{environment=@{RUSTFLAGS=$null}})
+        Assert-CiEqual $values[0] $values[2]
+        Assert-Ci ($values[0] -cne $values[1]) 'An explicit empty override must remain distinct from an absent override.'
+        Assert-Ci ($null -eq [Environment]::GetEnvironmentVariable($names[0])) 'Fixture cleanup created an override that was originally absent.'
+        Assert-CiEqual ([Environment]::GetEnvironmentVariable($names[1])) ''
+    } finally { foreach ($name in $names) { Restore-CacheEnvironment $name $before[$name] } }
+ }
  environment_fixture_restores_case_sensitive_names={
     $names=@('CARGO_BUILD_CACHE_FIXTURE','Cargo_Build_Cache_Fixture'); $before=[hashtable]::new([StringComparer]::Ordinal)
     foreach ($name in $names) { $before[$name]=[Environment]::GetEnvironmentVariable($name) }

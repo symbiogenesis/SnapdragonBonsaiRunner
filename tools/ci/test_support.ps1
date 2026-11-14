@@ -24,7 +24,11 @@ function Remove-CiScratch([string]$Path) {
 function Invoke-CiCases([Collections.IDictionary]$Cases,[string]$SelectedCase) {
     if ($SelectedCase -and -not $Cases.Contains($SelectedCase)) { throw "Unknown named case: $SelectedCase" }
     $selected=@(if ($SelectedCase) { $SelectedCase } else { $Cases.Keys })
-    foreach ($name in $selected) { & $Cases[$name]; "PASS $name" }
+    foreach ($name in $selected) {
+        try { & $Cases[$name] }
+        catch { [Console]::Error.WriteLine("FAIL ${name}: $($_.Exception.Message)"); throw }
+        "PASS $name"
+    }
     "$($selected.Count) focused fixture(s) passed."
 }
 function Get-CiJobBlocks([string]$Text) {
