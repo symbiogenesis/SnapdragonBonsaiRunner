@@ -2,6 +2,13 @@
 param([Parameter(Mandatory)][string]$ActionlintPath, [string]$Case)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
 $checker = Join-Path $PSScriptRoot 'check_workflow_syntax.ps1'
+function Invoke-ArchiveCacheFixture([scriptblock]$Work) {
+    $scratch = New-CiScratch 'bonsai-actionlint-cache-'
+    try {
+        . $checker
+        & $Work $scratch
+    } finally { Remove-CiScratch $scratch }
+}
 function Invoke-SyntaxFixture([string]$Source, [bool]$Reject = $false, [bool]$WithoutGit = $false) {
     $scratch = New-CiScratch 'bonsai-workflow-syntax-'
     try {
@@ -41,6 +48,41 @@ jobs:
           Write-Output 'uses: $/literal-text'
 '@
 $cases = [ordered]@{
+    archive_cache_reuses_verified_bytes_and_rejects_poison = { Invoke-ArchiveCacheFixture { param($scratch)
+        $payload = Join-Path $scratch 'payload.zip'
+        [IO.File]::WriteAllText($payload, 'Inert archive bytes; never extracted or executed.')
+        $digest = (Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash.ToLowerInvariant()
+        $downloads = [Collections.Generic.List[string]]::new()
+        function Invoke-WebRequest {
+            param($Uri, $OutFile, $ConnectionTimeoutSeconds, $OperationTimeoutSeconds, $MaximumRetryCount, $RetryIntervalSec)
+            $downloads.Add($Uri)
+            [IO.File]::Copy($payload, $OutFile, $false)
+        }
+        $cache = Join-Path $scratch 'cache'
+        $first = Join-Path $scratch 'first.zip'; $second = Join-Path $scratch 'second.zip'; $third = Join-Path $scratch 'third.zip'
+        Assert-CiEqual (Get-PinnedActionlintArchive 'https://fixture.invalid/pinned.zip' $digest 'asset.zip' $first $cache) $first
+        Assert-CiEqual $downloads.Count 1
+        Assert-CiEqual (Get-PinnedActionlintArchive 'https://fixture.invalid/pinned.zip' $digest 'asset.zip' $second $cache) $second
+        Assert-CiEqual $downloads.Count 1
+        Assert-CiEqual ([IO.File]::ReadAllText($first)) ([IO.File]::ReadAllText($second))
+        $cached = Join-Path (Join-Path $cache $digest) 'asset.zip'
+        [IO.File]::WriteAllText($cached, 'Poisoned cached bytes must never be extracted.')
+        Assert-CiReject { Get-PinnedActionlintArchive 'https://fixture.invalid/pinned.zip' $digest 'asset.zip' $third $cache } 'Pinned actionlint archive checksum differs'
+        Assert-CiEqual $downloads.Count 1
+        Assert-CiEqual ([IO.File]::ReadAllText($cached)) 'Poisoned cached bytes must never be extracted.'
+    } }
+    archive_cache_rejects_download_before_publication = { Invoke-ArchiveCacheFixture { param($scratch)
+        $payload = Join-Path $scratch 'payload.zip'
+        [IO.File]::WriteAllText($payload, 'Expected inert bytes.')
+        $digest = (Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash.ToLowerInvariant()
+        function Invoke-WebRequest {
+            param($Uri, $OutFile, $ConnectionTimeoutSeconds, $OperationTimeoutSeconds, $MaximumRetryCount, $RetryIntervalSec)
+            [IO.File]::WriteAllText($OutFile, 'Rejected download bytes.')
+        }
+        $cache = Join-Path $scratch 'cache'
+        Assert-CiReject { Get-PinnedActionlintArchive 'https://fixture.invalid/pinned.zip' $digest 'asset.zip' (Join-Path $scratch 'download.zip') $cache } 'Pinned actionlint archive checksum differs'
+        Assert-Ci (-not (Test-Path -LiteralPath $cache)) 'A rejected download published cache data.'
+    } }
     snapshot_custom_runner_labels_use_explicit_configuration = {
         Invoke-SyntaxFixture ($valid.Replace('runs-on: ubuntu-latest', 'runs-on: [self-hosted, fixture-snapdragon]')) $false $true
     }

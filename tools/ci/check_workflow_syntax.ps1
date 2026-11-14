@@ -19,6 +19,31 @@ $assets = @{
     'Windows-Arm64' = @('windows_arm64.zip', 'cadcf7ea4efe3a68728893813643cebe1185e5b1d4be5b96245f65c9a4d5ea41')
     'Windows-X64' = @('windows_amd64.zip', '6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9')
 }
+function Get-PinnedActionlintArchive([string]$Uri, [string]$Digest, [string]$Asset,
+    [string]$PrivateArchive, [string]$CacheRoot) {
+    $cacheDirectory = Join-Path $CacheRoot $Digest
+    $cachedArchive = Join-Path $cacheDirectory $Asset
+    if ([IO.File]::Exists($cachedArchive)) {
+        # Only invocation-private, freshly verified bytes may be extracted.
+        [IO.File]::Copy($cachedArchive, $PrivateArchive, $false)
+    } else {
+        # Retry only the immutable download, never a failed check.
+        Invoke-WebRequest -Uri $Uri -OutFile $PrivateArchive -ConnectionTimeoutSeconds 10 -OperationTimeoutSeconds 20 -MaximumRetryCount 2 -RetryIntervalSec 1
+    }
+    if ((Get-FileHash -LiteralPath $PrivateArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Digest) { throw 'Pinned actionlint archive checksum differs; refusing to execute it.' }
+    if (-not [IO.File]::Exists($cachedArchive)) {
+        [void][IO.Directory]::CreateDirectory($cacheDirectory)
+        $pending = Join-Path $cacheDirectory ([guid]::NewGuid().ToString('N') + '.partial')
+        try {
+            [IO.File]::Copy($PrivateArchive, $pending, $false)
+            # A same-directory rename publishes complete bytes exclusively;
+            # concurrent or poisoned entries are never overwritten.
+            [IO.File]::Move($pending, $cachedArchive, $false)
+        } finally { [IO.File]::Delete($pending) }
+    }
+    return $PrivateArchive
+}
+if ($MyInvocation.InvocationName -eq '.') { return }
 . (Join-Path $PSScriptRoot 'check_workflow_startup.ps1') -Root $Root
 $scratch = $null
 try {
@@ -30,10 +55,8 @@ try {
         $scratch = Join-Path ([IO.Path]::GetTempPath()) ('bonsai-actionlint-' + [guid]::NewGuid().ToString('N'))
         [void][IO.Directory]::CreateDirectory($scratch)
         $archive = Join-Path $scratch $asset
-        # Retry only the immutable download, never a failed check. Each attempt
-        # has its own short network limit and the retry count is finite.
-        Invoke-WebRequest -Uri "https://github.com/rhysd/actionlint/releases/download/v$version/actionlint_${version}_$asset" -OutFile $archive -ConnectionTimeoutSeconds 10 -OperationTimeoutSeconds 20 -MaximumRetryCount 2 -RetryIntervalSec 1
-        if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $digest) { throw 'Pinned actionlint archive checksum differs; refusing to execute it.' }
+        $cache = Join-Path ([IO.Path]::GetTempPath()) 'Bonsai-Actionlint-Cache'
+        $archive = Get-PinnedActionlintArchive "https://github.com/rhysd/actionlint/releases/download/v$version/actionlint_${version}_$asset" $digest $asset $archive $cache
         $executable = if ($IsWindows) { 'actionlint.exe' } else { 'actionlint' }
         if ($IsWindows) { Expand-Archive -LiteralPath $archive -DestinationPath $scratch }
         else { tar -xzf $archive -C $scratch $executable }
