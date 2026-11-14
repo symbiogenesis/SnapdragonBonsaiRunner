@@ -230,6 +230,62 @@ Model-free controls and captured fixtures do not qualify those properties.
 
 ## Streaming independent replay
 
+### Prebuilt consumer
+
+Build `bonsai-tts-replay` outside any owner-device qualification allowance:
+
+```powershell
+cargo build --locked --release -p bonsai-speech-tts --features rust-qualification --bin bonsai-tts-replay --target aarch64-pc-windows-msvc
+& $reviewedReplay --request C:\Replay\request.json --sha256 $reviewedRequestDigest
+```
+
+The explicit feature keeps qualification out of ordinary application builds.
+The executable opens no audio device and invokes no native reference engine.
+Its reviewed JSON request has these required fields, with unknown fields rejected:
+
+| Field | Required value |
+| --- | --- |
+| `schemaVersion` | `1` |
+| `reference`, `candidate` | Objects containing `revision` (40 lowercase hexadecimal characters), `compiler`, `target`, `executableSha256` (64 lowercase hexadecimal characters), and `arithmetic`. Authenticate both builds separately. Candidate target is `aarch64-pc-windows-msvc` and arithmetic is `observation::ARITHMETIC_IDENTITY`; reference arithmetic and image digest must differ. |
+| `quantization` | `q8` or `q4`, selecting the complete compiled `model.lock.json` or `model-q4.lock.json`. |
+| `models` | Absolute `design`, `base`, and `codec` paths. Bytes and digests come exclusively from that compiled lock. |
+| `workers` | Explicit integer from 1 through 256. |
+| `cases` | One through eight ordered objects, each containing `text`, `voice`, `packet`, and `retainedVoice`. Each artifact is `{ "path": "absolute path", "bytes": originalByteCount, "sha256": "reviewed original digest" }`. |
+| `tolerances` | Six explicit `prompt`, `hidden`, `logits`, `cache`, `speaker`, and `pcm` rules, each `{ "kind": "bits" }` or `{ "kind": "finite", "absolute": nonnegativeFiniteF32, "relative": nonnegativeFiniteF32 }`. |
+| `ownerStartedTick`, `workDeadlineTick`, `clockFrequency` | Original owner's Windows performance-counter start, absolute work deadline and frequency. |
+| `fixedWork`, `estimatedSeconds` | Nonblank fixed workload declared before starting; conservative 1–240 second aggregate estimate fitting the remaining allowance. |
+
+Text and voice files contain original UTF-8, without stripping whitespace or
+changing line endings. Limits are 8,192/4,096 bytes and 2,048/1,024 Unicode
+scalars respectively; blank text, NUL and malformed UTF-8 reject. Each original
+packet is bounded to 16,777,216,000 bytes. All headers and original input/packet
+digests are verified before model loading, with immutable file/ancestor guards
+held through consumption. The first case requires `retainedVoice: false`;
+subsequent cases require true exactly when the preceding successful voice bytes
+match. This supports cold, repeated, edited and changed-voice comparisons in one
+process. A mismatch or failed case stops the selection; later cases stay unattempted.
+
+One inherited five-minute owner allowance covers setup, intake, hashing, loading,
+all selected comparisons and cleanup. Work ends no later than 270 seconds after
+the original start, reserving thirty seconds for forced cleanup, power and
+retention. The consumer never renews the clock, compiles helpers or retries a
+case. The external native Rust owner must enforce that original process lifetime:
+TTS model loading, graph compute and synchronous OS I/O remain nonpreemptible.
+
+The value-free JSON report records request/input/packet identities, each case's
+pass/failure/unattempted status and AC, battery-saver and charge observations at
+consumer entry/exit and around each candidate synthesis, including unwind.
+Unavailable power stays unknown. Aggregate setup, independent reference-arm and
+post-retention observations remain the owner's responsibility; equal endpoints
+do not prove continuous stability. Performance, production and native retirement
+qualification remain false. Retain the original packets, text/voice bytes and
+reviewed request with integrity records; summaries or hashes cannot replace replay
+inputs. The three `rust_tts_consumer_` controls exercise admission, original-clock
+bounds, pinned Q8/Q4 identities, voice transitions and lossless private inputs
+without loading a model. Actual independent packets and S1 acceptance remain open.
+
+### Comparator and packet format
+
 `replay::Replay::synthesize` compares the ordinary Rust synthesis graph with an
 authenticated original observation packet. It reads expected values through one
 fixed 16 KiB buffer and borrows live observations; it allocates no duplicate

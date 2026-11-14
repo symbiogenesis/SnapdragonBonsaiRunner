@@ -594,11 +594,15 @@ dependencies = [
 name = "bonsai-speech-tts"
 version = "0.3.2"
 dependencies = [
+ "bonsai-artifacts",
  "bonsai-audio",
+ "bonsai-cpu-policy",
  "bonsai-speech-service",
+ "bonsai-windows-process",
  "fearless_simd 1.2.0",
  "libm",
  "rayon",
+ "serde",
  "serde_json",
  "sha2",
 ]

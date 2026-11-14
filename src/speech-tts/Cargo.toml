@@ -1,5 +1,6 @@
 [package]
 name = "bonsai-speech-tts"
+default-run = "bonsai-speech-tts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,14 +11,32 @@ keywords = ["speech", "tts", "qwen", "rust", "native"]
 categories = ["multimedia::audio"]
 description = "Owned native Qwen VoiceDesign speech inference for Bonsai"
 
+[features]
+rust-qualification = ["dep:bonsai-artifacts", "dep:bonsai-cpu-policy", "dep:bonsai-windows-process", "dep:serde"]
+
+[[bin]]
+name = "bonsai-speech-tts"
+path = "src/main.rs"
+
+[[bin]]
+name = "bonsai-tts-replay"
+path = "src/replay_main.rs"
+required-features = ["rust-qualification"]
+
 [dependencies]
+bonsai-artifacts = { workspace = true, optional = true }
 bonsai-audio.workspace = true
+bonsai-cpu-policy = { workspace = true, optional = true }
 bonsai-speech-service.workspace = true
 fearless_simd.workspace = true
 libm = "=0.2.16"
 rayon = "=1.12.0"
+serde = { workspace = true, features = ["derive"], optional = true }
 serde_json.workspace = true
 sha2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+bonsai-windows-process = { workspace = true, optional = true }
 
 [lints]
 workspace = true
