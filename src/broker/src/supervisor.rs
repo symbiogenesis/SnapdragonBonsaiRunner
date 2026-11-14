@@ -125,6 +125,9 @@ where
     C: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     ensure_time(deadline)?;
+    // AcceptedChat::serve wraps the complete serve_chat_with_budget future—including
+    // receive_admitted—in service.gate.closed(), and receive_admitted reads client so
+    // peer disconnect yields ReceiveError::Incomplete without blocking.
     let Some(received) = receive_admitted(client, policy, deadline, budget).await? else {
         return Ok(());
     };

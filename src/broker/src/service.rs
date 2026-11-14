@@ -23,6 +23,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
+    io::ReadBuf,
     net::{TcpListener, TcpSocket, TcpStream},
     time::{Instant, timeout_at},
 };
@@ -235,33 +236,71 @@ impl AcceptedChat<'_> {
     /// # Errors
     /// Returns [`ServiceError`] for queue/deadline/shutdown or request failure.
     pub async fn serve(self) -> Result<(), ServiceError> {
-        let queue_deadline = self.accepted + QUEUE_TIMEOUT;
+        let Self {
+            stream,
+            reservation,
+            service,
+            accepted,
+        } = self;
+        let queue_deadline = accepted + QUEUE_TIMEOUT;
         if Instant::now() >= queue_deadline {
             return Err(ServiceError::Gate(GateError::Deadline));
         }
-        let active = timeout_at(queue_deadline, self.reservation.enter(queue_deadline))
+        let active = {
+            let mut shutdown = pin!(service.gate.closed());
+            let mut entering = pin!(reservation.enter(queue_deadline));
+            let mut peek_enabled = true;
+            let mut peek_buf = [0_u8; 1];
+            timeout_at(
+                queue_deadline,
+                poll_fn(|cx| {
+                    if shutdown.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(ServiceError::Gate(GateError::Closed)));
+                    }
+                    if peek_enabled {
+                        let mut read_buf = ReadBuf::new(&mut peek_buf);
+                        match stream.poll_peek(cx, &mut read_buf) {
+                            Poll::Ready(Ok(0) | Err(_)) => {
+                                return Poll::Ready(Err(ServiceError::Request(
+                                    ServeError::ClientAbandoned,
+                                )));
+                            }
+                            Poll::Ready(Ok(_)) => {
+                                // Request bytes are already queued; stop peeking so we do not
+                                // busy-poll while continuing to await gate admission or closure.
+                                peek_enabled = false;
+                            }
+                            Poll::Pending => {}
+                        }
+                    }
+                    entering
+                        .as_mut()
+                        .poll(cx)
+                        .map(|result| result.map_err(ServiceError::Gate))
+                }),
+            )
             .await
-            .map_err(|_| ServiceError::Gate(GateError::Deadline))?
-            .map_err(ServiceError::Gate)?;
+            .map_err(|_| ServiceError::Gate(GateError::Deadline))??
+        };
         if Instant::now() >= queue_deadline {
             return Err(ServiceError::Gate(GateError::Deadline));
         }
         active.check().map_err(ServiceError::Gate)?;
         let result = {
             let backend = GenerationAttempt {
-                backend: &self.service.backend,
-                gate: &self.service.gate,
+                backend: &service.backend,
+                gate: &service.gate,
                 counted: AtomicBool::new(false),
                 generation: AtomicBool::new(false),
                 completed: AtomicBool::new(false),
             };
-            let mut shutdown = pin!(self.service.gate.closed());
+            let mut shutdown = pin!(service.gate.closed());
             let mut serving = pin!(serve_chat_with_budget(
-                self.stream,
-                &self.service.policy,
+                stream,
+                &service.policy,
                 &backend,
                 RequestDeadline::NONE,
-                &self.service.burst
+                &service.burst
             ));
             let result = poll_fn(|cx| {
                 if shutdown.as_mut().poll(cx).is_ready() {
@@ -274,7 +313,7 @@ impl AcceptedChat<'_> {
             })
             .await;
             backend.completed.store(result.is_ok(), Ordering::Relaxed);
-            if self.service.gate.is_closed() {
+            if service.gate.is_closed() {
                 Err(ServiceError::Gate(GateError::Closed))
             } else {
                 result

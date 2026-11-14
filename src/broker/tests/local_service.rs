@@ -700,3 +700,52 @@ fn expired_connector_deadline_never_connects() {
         );
     });
 }
+
+#[test]
+fn queued_client_disconnect_aborts_before_slot_without_closing_gate() {
+    run(async {
+        let backend = listener().await;
+        let service = service(&backend, 1).await;
+        let worker = Arc::clone(&service);
+        let active = spawn_local(async move { worker.accept().await.unwrap().serve().await });
+
+        let mut first_client = TcpStream::connect(("127.0.0.1", service.port()))
+            .await
+            .unwrap();
+        send_request(&mut first_client, service.port()).await;
+        count(&backend).await;
+        let (mut generation, _) = backend.accept().await.unwrap();
+        read_request(&mut generation).await;
+
+        let queued_client = TcpStream::connect(("127.0.0.1", service.port()))
+            .await
+            .unwrap();
+        let worker = Arc::clone(&service);
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let queued = spawn_local(async move {
+            let accepted = worker.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            accepted.serve().await
+        });
+        accepted_rx.await.unwrap();
+        tokio::task::yield_now().await;
+
+        drop(queued_client);
+        assert_eq!(
+            queued.await.unwrap(),
+            Err(ServiceError::Request(ServeError::ClientAbandoned))
+        );
+        // Gate remains open and the backend never receives a connection for the abandoned queue entry.
+        assert!(
+            timeout(Duration::from_millis(20), backend.accept())
+                .await
+                .is_err()
+        );
+
+        service.close();
+        assert_eq!(
+            active.await.unwrap(),
+            Err(ServiceError::Gate(GateError::Closed))
+        );
+    });
+}

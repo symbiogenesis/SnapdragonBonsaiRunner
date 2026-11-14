@@ -55,16 +55,20 @@ impl JsonCandidateScratch {
             let mut deserializer = simd_json::Deserializer::from_tape(tape);
             let result = match Object::<ClientChat<'_>>::deserialize(&mut deserializer) {
                 Ok(Object(chat)) if chat.abliteration_scale.is_none() => head.prepare_chat(&chat),
-                // Preserve production decimal conversion and value-free errors,
-                // including escaped scale keys and partially consumed tapes.
-                Ok(_) | Err(_) => head.prepare(body),
+                // Only parsed requests with an explicit `abliteration_scale`
+                // delegate to production serde_json so decimal conversion
+                // matches exactly; schema failures already classify to
+                // `Rejection::ChatSchema` without re-parsing the full body.
+                Ok(_) => head.prepare(body),
+                Err(_) => Err(Rejection::ChatSchema),
             };
             self.tape = deserializer.into_tape().reset();
             result
         } else {
-            // Failed parsing can also leave borrowed nodes in a partial tape.
+            // Failed syntax tokenization can leave borrowed nodes in a partial
+            // tape; return `ChatSchema` without re-scanning malformed JSON.
             self.tape = tape.reset();
-            head.prepare(body)
+            Err(Rejection::ChatSchema)
         };
         self.input.clear();
         result

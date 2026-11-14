@@ -8,7 +8,7 @@
 use bonsai_broker::scheduler::{ActiveRequest, GateError, MAX_WAITING, RequestGate, Reservation};
 use std::{
     collections::VecDeque,
-    pin::Pin,
+    pin::{Pin, pin},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -422,5 +422,390 @@ fn reordered_polling_cancellation_and_deadline_edges_match_reference_model() {
             // existing active guard, queued entry and unpolled entry.
             history.shutdown().await;
             drop(history);
+        });
+}
+
+#[test]
+fn exhaustive_gate_latch_and_queued_drop_interleavings_prevent_orphan_admission() {
+    #[derive(Clone, Copy)]
+    enum Step {
+        Release { id: usize, latch_failure: bool },
+        DisconnectWaiter(usize),
+        PollWaiter(usize),
+        ProbeOrphan,
+    }
+
+    struct AttemptGuard<'a> {
+        gate: &'a RequestGate,
+        active: Option<ActiveRequest<'a>>,
+        generation_started: bool,
+        completed: bool,
+    }
+
+    impl Drop for AttemptGuard<'_> {
+        fn drop(&mut self) {
+            if self.generation_started && !self.completed {
+                self.gate.close();
+            }
+            drop(self.active.take());
+        }
+    }
+
+    fn permute<const N: usize>(items: [usize; N], out: &mut Vec<[usize; N]>) {
+        fn recurse<const N: usize>(idx: usize, arr: &mut [usize; N], out: &mut Vec<[usize; N]>) {
+            if idx == N {
+                out.push(*arr);
+                return;
+            }
+            for j in idx..N {
+                arr.swap(idx, j);
+                recurse(idx + 1, arr, out);
+                arr.swap(idx, j);
+            }
+        }
+        let mut copy = items;
+        recurse(0, &mut copy, out);
+    }
+
+    let mut queue_orders = Vec::new();
+    permute([0, 1, 2], &mut queue_orders);
+    let mut four_orders = Vec::new();
+    permute([0, 1, 2, 3], &mut four_orders);
+    let mut five_orders = Vec::new();
+    permute([0, 1, 2, 3, 4], &mut five_orders);
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap()
+        .block_on(async {
+            // Family 1: active attempt aborts and latches gate across all queue/wakeup/drop orders.
+            for &[a, b, c] in &queue_orders {
+                for &order in &four_orders {
+                    tokio::task::yield_now().await;
+                    let gate = RequestGate::new(2).unwrap();
+                    let origin = Instant::now();
+                    let deadline = origin + Duration::from_millis(50);
+
+                    let r_a = gate.reserve().unwrap();
+                    let r_b = gate.reserve().unwrap();
+                    let r_c = gate.reserve().unwrap();
+
+                    let mut slots: [Option<Entry<'_>>; 3] = [
+                        Some(Box::pin(r_a.enter(deadline))),
+                        Some(Box::pin(r_b.enter(deadline))),
+                        Some(Box::pin(r_c.enter(deadline))),
+                    ];
+
+                    // Establish active owner `a` and enqueue `b`, `c` in `a -> b -> c` order.
+                    let Poll::Ready(Ok(active_a)) = slots[a]
+                        .take()
+                        .unwrap()
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                    else {
+                        unreachable!("first waiter always acquires idle active slot");
+                    };
+                    assert!(
+                        slots[b]
+                            .as_mut()
+                            .unwrap()
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+                    assert!(
+                        slots[c]
+                            .as_mut()
+                            .unwrap()
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+
+                    let mut attempts: [Option<AttemptGuard<'_>>; 3] = [None, None, None];
+                    attempts[a] = Some(AttemptGuard {
+                        gate: &gate,
+                        active: Some(active_a),
+                        generation_started: true,
+                        completed: false,
+                    });
+                    let mut latched = false;
+                    let steps = [
+                        Step::Release {
+                            id: a,
+                            latch_failure: true,
+                        },
+                        Step::DisconnectWaiter(b),
+                        Step::PollWaiter(c),
+                        Step::ProbeOrphan,
+                    ];
+
+                    for step_idx in order {
+                        match steps[step_idx] {
+                            Step::Release { id, latch_failure } => {
+                                if let Some(mut attempt) = attempts[id].take() {
+                                    attempt.completed = !latch_failure;
+                                    drop(attempt);
+                                    if latch_failure {
+                                        latched = true;
+                                        assert!(gate.is_closed());
+                                    }
+                                }
+                            }
+                            Step::DisconnectWaiter(id) => {
+                                drop(slots[id].take());
+                                assert_eq!(gate.is_closed(), latched);
+                            }
+                            Step::PollWaiter(id) => {
+                                if let Some(fut) = slots[id].as_mut() {
+                                    match fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                                    {
+                                        Poll::Pending => assert!(!latched),
+                                        Poll::Ready(Ok(active)) => {
+                                            assert!(!latched, "orphan acquired active after latch");
+                                            slots[id] = None;
+                                            attempts[id] = Some(AttemptGuard {
+                                                gate: &gate,
+                                                active: Some(active),
+                                                generation_started: true,
+                                                completed: false,
+                                            });
+                                        }
+                                        Poll::Ready(Err(err)) => {
+                                            assert_eq!(err, GateError::Closed);
+                                            assert!(latched);
+                                            slots[id] = None;
+                                        }
+                                    }
+                                }
+                            }
+                            Step::ProbeOrphan => match gate.reserve() {
+                                Err(GateError::Closed) => assert!(latched),
+                                Err(GateError::Capacity) => assert!(!latched),
+                                Err(GateError::Deadline) => unreachable!("reserve has no deadline"),
+                                Err(GateError::Configuration) => {
+                                    unreachable!("valid gate capacity")
+                                }
+                                Ok(res) => {
+                                    assert!(!latched, "orphan reserve succeeded after latch");
+                                    let mut fut = pin!(res.enter(deadline));
+                                    if let Poll::Ready(Ok(_)) =
+                                        fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                                    {
+                                        unreachable!("orphan cannot steal occupied slot");
+                                    }
+                                }
+                            },
+                        }
+                    }
+
+                    // Drain remaining handles cleanly; gate must remain closed with zero orphans.
+                    for id in 0..3 {
+                        if let Some(mut fut) = slots[id].take() {
+                            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                                Poll::Ready(Err(GateError::Closed)) => {}
+                                Poll::Pending => {
+                                    unreachable!("latched queue entry must not stay pending")
+                                }
+                                Poll::Ready(Ok(_)) => {
+                                    unreachable!("latched queue entry must not acquire slot")
+                                }
+                                Poll::Ready(Err(err)) => {
+                                    unreachable!("unexpected gate error: {err:?}")
+                                }
+                            }
+                        }
+                        drop(attempts[id].take());
+                    }
+                    assert!(gate.is_closed());
+                    assert_eq!(gate.reserve().err(), Some(GateError::Closed));
+                }
+            }
+
+            // Family 2: active attempt completes cleanly, raced with queued drop, second waiter
+            // takeover/abort latch, third waiter wakeup, and late orphan probe.
+            for &[a, b, c] in &queue_orders {
+                for &order in &five_orders {
+                    tokio::task::yield_now().await;
+                    let gate = RequestGate::new(2).unwrap();
+                    let origin = Instant::now();
+                    let deadline = origin + Duration::from_millis(50);
+
+                    let r_a = gate.reserve().unwrap();
+                    let r_b = gate.reserve().unwrap();
+                    let r_c = gate.reserve().unwrap();
+
+                    let mut slots: [Option<Entry<'_>>; 3] = [
+                        Some(Box::pin(r_a.enter(deadline))),
+                        Some(Box::pin(r_b.enter(deadline))),
+                        Some(Box::pin(r_c.enter(deadline))),
+                    ];
+
+                    let Poll::Ready(Ok(active_a)) = slots[a]
+                        .take()
+                        .unwrap()
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                    else {
+                        unreachable!("first waiter always acquires idle active slot");
+                    };
+                    assert!(
+                        slots[b]
+                            .as_mut()
+                            .unwrap()
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+                    assert!(
+                        slots[c]
+                            .as_mut()
+                            .unwrap()
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+
+                    let mut attempts: [Option<AttemptGuard<'_>>; 3] = [None, None, None];
+                    attempts[a] = Some(AttemptGuard {
+                        gate: &gate,
+                        active: Some(active_a),
+                        generation_started: true,
+                        completed: true,
+                    });
+                    let mut active_count = 1_usize;
+                    let mut latched = false;
+
+                    // Operations:
+                    // 0: clean release of first attempt
+                    // 1: disconnect queued waiter `b`
+                    // 2: poll waiter `b` (if still live; starts generation and aborts with latch)
+                    // 3: poll waiter `c`
+                    // 4: late orphan reserve + enter
+                    for step_idx in order {
+                        match step_idx {
+                            0 => {
+                                if let Some(attempt) = attempts[a].take() {
+                                    drop(attempt);
+                                    active_count -= 1;
+                                }
+                            }
+                            1 => {
+                                drop(slots[b].take());
+                            }
+                            2 => {
+                                if let Some(fut) = slots[b].as_mut() {
+                                    match fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                                    {
+                                        Poll::Pending => {}
+                                        Poll::Ready(Ok(active_b)) => {
+                                            assert!(!latched);
+                                            assert_eq!(active_count, 0);
+                                            slots[b] = None;
+                                            active_count += 1;
+                                            let guard = AttemptGuard {
+                                                gate: &gate,
+                                                active: Some(active_b),
+                                                generation_started: true,
+                                                completed: false,
+                                            };
+                                            drop(guard);
+                                            active_count -= 1;
+                                            latched = true;
+                                            assert!(gate.is_closed());
+                                        }
+                                        Poll::Ready(Err(GateError::Closed)) => {
+                                            assert!(latched);
+                                            slots[b] = None;
+                                        }
+                                        Poll::Ready(Err(other)) => {
+                                            unreachable!("unexpected error: {other:?}")
+                                        }
+                                    }
+                                }
+                            }
+                            3 => {
+                                if let Some(fut) = slots[c].as_mut() {
+                                    match fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                                    {
+                                        Poll::Pending => assert!(!latched),
+                                        Poll::Ready(Ok(active_c)) => {
+                                            assert!(!latched);
+                                            assert_eq!(active_count, 0);
+                                            slots[c] = None;
+                                            active_count += 1;
+                                            attempts[c] = Some(AttemptGuard {
+                                                gate: &gate,
+                                                active: Some(active_c),
+                                                generation_started: true,
+                                                completed: false,
+                                            });
+                                        }
+                                        Poll::Ready(Err(GateError::Closed)) => {
+                                            assert!(latched);
+                                            slots[c] = None;
+                                        }
+                                        Poll::Ready(Err(other)) => {
+                                            unreachable!("unexpected error: {other:?}")
+                                        }
+                                    }
+                                }
+                            }
+                            4 => match gate.reserve() {
+                                Err(GateError::Closed) => assert!(latched),
+                                Err(GateError::Capacity) => {}
+                                Err(GateError::Deadline) => unreachable!("reserve has no deadline"),
+                                Err(GateError::Configuration) => {
+                                    unreachable!("valid gate capacity")
+                                }
+                                Ok(res) => {
+                                    assert!(!latched, "orphan acquired after latch");
+                                    let mut fut = pin!(res.enter(deadline));
+                                    match fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                                    {
+                                        Poll::Pending => {}
+                                        Poll::Ready(Ok(active)) => {
+                                            assert_eq!(active_count, 0);
+                                            assert!(!latched);
+                                            drop(active);
+                                        }
+                                        Poll::Ready(Err(other)) => {
+                                            unreachable!("unexpected orphan error: {other:?}")
+                                        }
+                                    }
+                                }
+                            },
+                            _ => unreachable!("step index in 0..5"),
+                        }
+                        assert!(active_count <= 1);
+                    }
+
+                    // Tear down remaining slots/attempts and verify latch prevents late acquisition.
+                    for id in 0..3 {
+                        if let Some(mut attempt) = attempts[id].take() {
+                            attempt.completed = false;
+                            drop(attempt);
+                            latched = true;
+                        }
+                        if let Some(mut fut) = slots[id].take() {
+                            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                                Poll::Ready(Err(GateError::Closed)) => {}
+                                Poll::Ready(Ok(_)) if !latched => {}
+                                Poll::Pending => {
+                                    unreachable!("residual queue entry must not stay pending")
+                                }
+                                Poll::Ready(Ok(_)) => {
+                                    unreachable!("latched residual entry must not acquire slot")
+                                }
+                                Poll::Ready(Err(err)) => {
+                                    unreachable!("unexpected residual gate error: {err:?}")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         });
 }

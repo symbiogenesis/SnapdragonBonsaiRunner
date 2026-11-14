@@ -26,6 +26,8 @@ pub const CONTEXT_BYTES_PER_TOKEN: u64 = 2 * KV_BYTES_PER_TOKEN + MAX_CONTEXT_SC
 pub const STATE_BYTES_PER_TOKEN: u64 = KV_BYTES_PER_TOKEN + 24 * 4 + 128;
 /// K4/V4 records, including their four-byte scales, across Swift's attention layers.
 pub const RSQ4_KV_BYTES_PER_TOKEN: u64 = 16_896;
+/// `Rotated4FittedValues` K/V records, including block scales, across Swift's attention layers.
+pub const ROTATED4_FITTED_VALUES_KV_BYTES_PER_TOKEN: u64 = 16_896;
 /// K4/V3 records, including their four-byte scales, across Swift's attention layers.
 pub const RSQ4K3V_KV_BYTES_PER_TOKEN: u64 = 14_848;
 /// The runtime's reviewed total graph-state allocation ceiling.
@@ -99,6 +101,216 @@ impl SwiftContextProfile {
     }
 }
 
+/// Concrete attention KV representation selected for an execution shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwiftKvCacheFormat {
+    /// Unpacked FP16 attention KV records (`65_536` bytes/token).
+    F16,
+    /// Native K4/V4 block-quantized KV records (`16_896` bytes/token).
+    Rsq4,
+    /// Native K4/V3 asymmetric KV records (`14_848` bytes/token).
+    Rsq4K3v,
+    /// Hadamard-rotated 4-bit fitted-values KV records (`16_896` bytes/token).
+    Rotated4FittedValues,
+}
+
+impl SwiftKvCacheFormat {
+    /// Attention KV payload per token, including per-block scales.
+    #[must_use]
+    pub const fn kv_bytes_per_token(self) -> u64 {
+        match self {
+            Self::F16 => KV_BYTES_PER_TOKEN,
+            Self::Rsq4 => RSQ4_KV_BYTES_PER_TOKEN,
+            Self::Rsq4K3v => RSQ4K3V_KV_BYTES_PER_TOKEN,
+            Self::Rotated4FittedValues => ROTATED4_FITTED_VALUES_KV_BYTES_PER_TOKEN,
+        }
+    }
+
+    /// Map an admission profile to its base attention KV representation.
+    #[must_use]
+    pub const fn from_profile(profile: SwiftContextProfile) -> Self {
+        match profile {
+            SwiftContextProfile::PublisherF16 | SwiftContextProfile::NativeF16 => Self::F16,
+            SwiftContextProfile::NativeRsq4 | SwiftContextProfile::NativeRsq4Full => Self::Rsq4,
+            SwiftContextProfile::NativeRsq4K3v => Self::Rsq4K3v,
+        }
+    }
+}
+
+/// Explicit worst-case runtime, checkpoint, scratch, and accelerator shape for
+/// Swift admission accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwiftExecutionShape {
+    /// Attention KV format charged per token per live KV copy.
+    pub kv_format: SwiftKvCacheFormat,
+    /// Model weights and fixed runtime allowance charged inside the Job commit limit.
+    pub weights_and_fixed_runtime_bytes: u64,
+    /// Live active recurrent/convolution state copies (`RECURRENT_BYTES` each).
+    pub active_recurrent_copies: u8,
+    /// Live rollback recurrent/convolution checkpoint copies (`RECURRENT_BYTES` each).
+    pub rollback_recurrent_copies: u8,
+    /// Live prompt-reuse recurrent/convolution checkpoint copies (`RECURRENT_BYTES` each).
+    pub reuse_recurrent_copies: u8,
+    /// Live KV cache copies retained concurrently across active, rollback, or reuse histories.
+    pub live_kv_copies: u8,
+    /// Attention score row allowance per token (`24` sequential or `MAX_CONTEXT_SCORE_ROWS` batched).
+    pub score_rows_per_token: u64,
+    /// Token and page table bookkeeping bytes charged per token.
+    pub per_token_metadata_bytes: u64,
+    /// Fixed scratch budget for single-token sequential decode.
+    pub decode_scratch_bytes: u64,
+    /// Fixed scratch budget for tiled prompt prefill.
+    pub tile_prefill_scratch_bytes: u64,
+    /// Fixed verification scratch for speculative decoding.
+    pub speculative_verify_scratch_bytes: u64,
+    /// Multi-row target logits scratch required during speculative verification.
+    pub multi_row_logits_bytes: u64,
+    /// Recurrent state replay scratch during delayed verification/rollback.
+    pub replay_scratch_bytes: u64,
+    /// Optional accelerator resident arena tracked outside Windows Job private commit.
+    pub accelerator_resident_arena_bytes: u64,
+    /// Optional accelerator transfer staging buffers tracked outside Windows Job private commit.
+    pub accelerator_staging_bytes: u64,
+    /// Allocator fragmentation margin included inside the Windows Job commit limit.
+    pub allocator_fragmentation_margin_bytes: u64,
+}
+
+impl SwiftExecutionShape {
+    /// Conservative execution shape matching an existing [`SwiftContextProfile`],
+    /// explicitly accounting for active, rollback, and reuse recurrent copies.
+    #[must_use]
+    pub const fn for_profile(profile: SwiftContextProfile) -> Self {
+        let score_rows_per_token = match profile {
+            SwiftContextProfile::PublisherF16 => MAX_CONTEXT_SCORE_ROWS,
+            SwiftContextProfile::NativeF16
+            | SwiftContextProfile::NativeRsq4
+            | SwiftContextProfile::NativeRsq4Full
+            | SwiftContextProfile::NativeRsq4K3v => 24,
+        };
+        Self {
+            kv_format: SwiftKvCacheFormat::from_profile(profile),
+            weights_and_fixed_runtime_bytes: FIXED_RUNTIME_BYTES,
+            active_recurrent_copies: 1,
+            rollback_recurrent_copies: 1,
+            reuse_recurrent_copies: 1,
+            live_kv_copies: 2,
+            score_rows_per_token,
+            per_token_metadata_bytes: 128,
+            decode_scratch_bytes: 0,
+            tile_prefill_scratch_bytes: 0,
+            speculative_verify_scratch_bytes: 0,
+            multi_row_logits_bytes: 0,
+            replay_scratch_bytes: 0,
+            accelerator_resident_arena_bytes: 0,
+            accelerator_staging_bytes: 0,
+            allocator_fragmentation_margin_bytes: 0,
+        }
+    }
+
+    /// Total live recurrent/convolution checkpoint bytes across active, rollback,
+    /// and reuse copies (`156_893_184` bytes per copy), or `None` on overflow.
+    #[must_use]
+    pub fn recurrent_checkpoint_bytes(&self) -> Option<u64> {
+        let copies = u64::from(self.active_recurrent_copies)
+            .checked_add(u64::from(self.rollback_recurrent_copies))?
+            .checked_add(u64::from(self.reuse_recurrent_copies))?;
+        copies.checked_mul(RECURRENT_BYTES)
+    }
+
+    /// Live KV cache, score scratch, and metadata bytes charged per admitted token.
+    #[must_use]
+    pub fn kv_bytes_per_token_total(&self) -> Option<u64> {
+        let kv = u64::from(self.live_kv_copies).checked_mul(self.kv_format.kv_bytes_per_token())?;
+        let scores = self.score_rows_per_token.checked_mul(4)?;
+        kv.checked_add(scores)?
+            .checked_add(self.per_token_metadata_bytes)
+    }
+
+    /// Worst-case execution scratch bytes:
+    /// `max(decode_scratch, tile_prefill_scratch, speculative_verify_scratch + multi_row_logits + replay_scratch)`.
+    #[must_use]
+    pub fn execution_scratch_bytes(&self) -> Option<u64> {
+        let speculative_total = self
+            .speculative_verify_scratch_bytes
+            .checked_add(self.multi_row_logits_bytes)?
+            .checked_add(self.replay_scratch_bytes)?;
+        Some(
+            self.decode_scratch_bytes
+                .max(self.tile_prefill_scratch_bytes)
+                .max(speculative_total),
+        )
+    }
+
+    /// Itemize all worst-case memory categories for `context_tokens`.
+    #[must_use]
+    pub fn breakdown(&self, context_tokens: usize) -> Option<SwiftMemoryBreakdown> {
+        let tokens = u64::try_from(context_tokens).ok()?;
+        let per_token = self.kv_bytes_per_token_total()?;
+        let live_kv_bytes = tokens.checked_mul(per_token)?;
+        let recurrent_checkpoint_bytes = self.recurrent_checkpoint_bytes()?;
+        let execution_scratch_bytes = self.execution_scratch_bytes()?;
+        Some(SwiftMemoryBreakdown {
+            weights_and_fixed_runtime_bytes: self.weights_and_fixed_runtime_bytes,
+            recurrent_checkpoint_bytes,
+            live_kv_bytes,
+            execution_scratch_bytes,
+            accelerator_resident_arena_bytes: self.accelerator_resident_arena_bytes,
+            accelerator_staging_bytes: self.accelerator_staging_bytes,
+            allocator_fragmentation_margin_bytes: self.allocator_fragmentation_margin_bytes,
+        })
+    }
+}
+
+/// Itemized worst-case execution memory ledger across CPU Job commit and
+/// unified-memory accelerator reservations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwiftMemoryBreakdown {
+    /// Model weights and fixed runtime allowance (`a`).
+    pub weights_and_fixed_runtime_bytes: u64,
+    /// Live recurrent/convolution checkpoint copies across active, rollback, and reuse (`b`).
+    pub recurrent_checkpoint_bytes: u64,
+    /// Live KV cache copies and per-token bookkeeping for the selected context (`c`).
+    pub live_kv_bytes: u64,
+    /// Worst-case execution scratch across decode, tile prefill, and speculative verify/replay (`d`).
+    pub execution_scratch_bytes: u64,
+    /// Optional accelerator resident arena outside Windows Job private commit (`e`).
+    pub accelerator_resident_arena_bytes: u64,
+    /// Optional accelerator transfer staging bytes outside Windows Job private commit (`e`).
+    pub accelerator_staging_bytes: u64,
+    /// Allocator fragmentation margin included inside the Windows Job commit limit (`f`).
+    pub allocator_fragmentation_margin_bytes: u64,
+}
+
+impl SwiftMemoryBreakdown {
+    /// Complete host private memory subject to the Windows Job commit ceiling
+    /// (`weights + fixed runtime + recurrent copies + live KV + scratch + fragmentation`),
+    /// excluding external accelerator resident arena and staging allocations.
+    #[must_use]
+    pub fn job_commit_bytes(&self) -> Option<u64> {
+        self.weights_and_fixed_runtime_bytes
+            .checked_add(self.recurrent_checkpoint_bytes)?
+            .checked_add(self.live_kv_bytes)?
+            .checked_add(self.execution_scratch_bytes)?
+            .checked_add(self.allocator_fragmentation_margin_bytes)
+    }
+
+    /// Total optional accelerator resident arena and staging bytes tracked
+    /// outside the Windows Job private commit limit.
+    #[must_use]
+    pub fn accelerator_bytes(&self) -> Option<u64> {
+        self.accelerator_resident_arena_bytes
+            .checked_add(self.accelerator_staging_bytes)
+    }
+
+    /// Combined physical RAM ledger across Windows Job commit and unified
+    /// accelerator reservations, excluding [`HOST_RESERVE_BYTES`].
+    #[must_use]
+    pub fn total_footprint_bytes(&self) -> Option<u64> {
+        self.job_commit_bytes()?
+            .checked_add(self.accelerator_bytes()?)
+    }
+}
+
 /// A context and its complete conservative Job/admission requirements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwiftContextPlan {
@@ -167,6 +379,64 @@ impl SwiftContextPlan {
             memory_limit_bytes: usize::try_from(memory_limit).map_err(|_| insufficient())?,
             required_available_bytes,
         })
+    }
+
+    /// Select the largest page-aligned context admitted by both the base
+    /// `profile` curve and an explicit [`SwiftExecutionShape`] memory ledger.
+    ///
+    /// Guarantees `context_tokens` never exceeds [`Self::for_profile`] under
+    /// the same `available_bytes`, sizes `memory_limit_bytes` strictly from
+    /// [`SwiftMemoryBreakdown::job_commit_bytes`], and charges both Job commit
+    /// and external accelerator allocations against `available_bytes`.
+    ///
+    /// # Errors
+    /// Rejects insufficient memory, zero per-token footprint, or arithmetic
+    /// overflow while assembling the breakdown.
+    pub fn for_execution_shape(
+        available_bytes: u64,
+        profile: SwiftContextProfile,
+        shape: &SwiftExecutionShape,
+    ) -> Result<(Self, SwiftMemoryBreakdown), String> {
+        let baseline = Self::for_profile(available_bytes, profile)?;
+        let zero_context = shape.breakdown(0).ok_or_else(insufficient)?;
+        let fixed_physical = zero_context
+            .total_footprint_bytes()
+            .ok_or_else(insufficient)?;
+        let per_token = shape
+            .kv_bytes_per_token_total()
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(insufficient)?;
+        let allocation = available_bytes
+            .checked_sub(HOST_RESERVE_BYTES)
+            .and_then(|bytes| bytes.checked_sub(STARTUP_RESERVE_BYTES))
+            .and_then(|bytes| bytes.checked_sub(fixed_physical))
+            .ok_or_else(insufficient)?;
+        let state_allocation = profile
+            .state_limit_bytes()
+            .checked_sub(RECURRENT_BYTES)
+            .ok_or_else(insufficient)?;
+        let tokens =
+            (allocation / per_token).min(state_allocation / profile.state_bytes_per_token());
+        let tokens = usize::try_from(tokens)
+            .map_err(|_| insufficient())?
+            .min(baseline.context_tokens)
+            .min(MODEL_CONTEXT_TOKENS);
+        let context_tokens = tokens / CONTEXT_PAGE_TOKENS * CONTEXT_PAGE_TOKENS;
+        if context_tokens < MIN_CONTEXT_TOKENS {
+            return Err(insufficient());
+        }
+        let breakdown = shape.breakdown(context_tokens).ok_or_else(insufficient)?;
+        let job_commit = breakdown.job_commit_bytes().ok_or_else(insufficient)?;
+        let required_available_bytes = breakdown
+            .total_footprint_bytes()
+            .and_then(|bytes| bytes.checked_add(HOST_RESERVE_BYTES))
+            .ok_or_else(insufficient)?;
+        let plan = Self {
+            context_tokens,
+            memory_limit_bytes: usize::try_from(job_commit).map_err(|_| insufficient())?,
+            required_available_bytes,
+        };
+        Ok((plan, breakdown))
     }
 }
 
@@ -375,6 +645,81 @@ mod tests {
             );
             assert!(SwiftContextPlan::for_profile(0, profile).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn itemized_execution_shape_accounts_all_categories_and_preserves_conservative_curve()
+    -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            SwiftKvCacheFormat::Rotated4FittedValues.kv_bytes_per_token(),
+            16_896
+        );
+        let gib = 1024 * 1024 * 1024;
+        let baseline = SwiftContextPlan::for_profile(20 * gib, SwiftContextProfile::NativeRsq4)?;
+        let mut shape = SwiftExecutionShape::for_profile(SwiftContextProfile::NativeRsq4);
+        shape.kv_format = SwiftKvCacheFormat::Rotated4FittedValues;
+        shape.decode_scratch_bytes = 8 * 1024 * 1024;
+        shape.tile_prefill_scratch_bytes = 32 * 1024 * 1024;
+        shape.speculative_verify_scratch_bytes = 24 * 1024 * 1024;
+        shape.multi_row_logits_bytes = 16 * 1024 * 1024;
+        shape.replay_scratch_bytes = 20 * 1024 * 1024;
+        shape.accelerator_resident_arena_bytes = 512 * 1024 * 1024;
+        shape.accelerator_staging_bytes = 64 * 1024 * 1024;
+        shape.allocator_fragmentation_margin_bytes = 48 * 1024 * 1024;
+
+        let (plan, breakdown) = SwiftContextPlan::for_execution_shape(
+            20 * gib,
+            SwiftContextProfile::NativeRsq4,
+            &shape,
+        )?;
+        assert!(plan.context_tokens <= baseline.context_tokens);
+        assert_eq!(
+            breakdown.weights_and_fixed_runtime_bytes,
+            FIXED_RUNTIME_BYTES
+        );
+        assert_eq!(breakdown.recurrent_checkpoint_bytes, 3 * RECURRENT_BYTES);
+        assert_eq!(
+            breakdown.execution_scratch_bytes,
+            (24 + 16 + 20) * 1024 * 1024
+        );
+        assert_eq!(
+            breakdown.accelerator_bytes(),
+            Some((512 + 64) * 1024 * 1024)
+        );
+        assert_eq!(
+            breakdown.allocator_fragmentation_margin_bytes,
+            48 * 1024 * 1024
+        );
+        assert_eq!(
+            u64::try_from(plan.memory_limit_bytes)?,
+            breakdown.job_commit_bytes().ok_or("overflow")?
+        );
+        assert_eq!(
+            plan.required_available_bytes,
+            breakdown
+                .job_commit_bytes()
+                .and_then(|job| job.checked_add(breakdown.accelerator_bytes()?))
+                .and_then(|total| total.checked_add(HOST_RESERVE_BYTES))
+                .ok_or("overflow")?
+        );
+        assert!(plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 20 * gib);
+
+        // Smaller speculative branch falls back to tile prefill scratch when larger.
+        shape.replay_scratch_bytes = 0;
+        shape.speculative_verify_scratch_bytes = 4 * 1024 * 1024;
+        shape.multi_row_logits_bytes = 4 * 1024 * 1024;
+        assert_eq!(shape.execution_scratch_bytes(), Some(32 * 1024 * 1024));
+
+        // Larger scratch or accelerator reservation never increases admitted context.
+        let mut larger = shape;
+        larger.accelerator_resident_arena_bytes += gib;
+        let (tighter, _) = SwiftContextPlan::for_execution_shape(
+            20 * gib,
+            SwiftContextProfile::NativeRsq4,
+            &larger,
+        )?;
+        assert!(tighter.context_tokens <= plan.context_tokens);
         Ok(())
     }
 }
