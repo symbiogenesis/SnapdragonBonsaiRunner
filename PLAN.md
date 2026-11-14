@@ -67,9 +67,10 @@ adoption decisions without displacing native daily-use acceptance.
   receipt/invalidation, packaged-shell and historical-tip/output-bound controls;
   those source-only follow-ups have no passing post-audit local verdict. Keep
   helper preparation explicit and caller-supervised within its declared allowance.
-  Add trusted candidate-root adapter controls for non-HEAD outgoing tips; current
-  named self-checks exercise committed HEAD policy, while static source checks
-  inspect every outgoing snapshot. Verify explicit target/output preparation
+  Qualify trusted candidate-root adapter controls for both cache actions and
+  source selection, including non-HEAD mutations and poisoned candidate fixtures;
+  assertions and support remain bound to committed checking policy. Qualify
+  failed-preparation receipt invalidation. Verify explicit target/output preparation
   against inherited Cargo target overrides before claiming prepared-helper admission.
 - [ ] Qualify Runner's checked-tools producer, shared regression runner and
   native-acceptance caches: cold build, exact hit and relevant-input invalidation,
@@ -113,6 +114,9 @@ adoption decisions without displacing native daily-use acceptance.
   pause/retry, disk/network/permission failures and independent speech retry.
   Include the shared deadline through verified cache hits, hashing, recovery,
   publication and cleanup; the follow-up local check stopped before compilation.
+  Qualify portable replacement's shared copy/hash/publication deadline and
+  cancellation, preserving original bytes and removing unpublished sibling files;
+  synchronous native I/O remains nonpreemptible.
 - [ ] Qualify the shared native Rust HTTPS replacement in its owning compiler,
   analyzer and regression lanes, then exercise Windows Schannel/system trust,
   proxies, CI baseline lookup with Windows system trust, patched-client address
@@ -143,7 +147,9 @@ adoption decisions without displacing native daily-use acceptance.
   readiness, Stop/Retry, recovery and explicit publisher rollback.
 - [ ] Qualify acknowledged model/broker shutdown, descendant teardown, empty
   Jobs, released listeners and fresh-owner replay. Include startup timeout,
-  failed-cleanup receipt retention and one shared absolute deadline.
+  failed-cleanup receipt retention and one shared absolute deadline. Qualify
+  inherited owner admission against the larger UTC/monotonic elapsed cost,
+  including fractional expiry and a shorter inherited allowance.
 - [ ] Qualify native startup descendant-cancellation and bounded failure/output
   fixtures, visible child readiness diagnostics, exact root exit/capture summaries
   and pre-cleanup status/teardown receipts. Preserve a single cleanup allowance
@@ -280,8 +286,9 @@ adoption decisions without displacing native daily-use acceptance.
   as an independent review source for staging/ancestor mutation races.
 - [ ] Qualify parent-drained stdout/stderr's hard 16 MiB per-stream cap,
   read/write/panic failure, complete tail retention and shared-deadline cleanup.
-  Admit and execute the new native flood/drain controls without silently expanding
-  the existing fixed six-case sandbox workload. Independently bound scratch and
+  Qualify the separate source-bound `log-capture-v1` workload for stdout/stderr
+  flood and normal-exit tail/file release, preserving the original six-case
+  authority workload and each original deadline. Independently bound scratch and
   PSEC-private temp storage; qualify exhaustion, diagnostic/credential retention
   and owner-loss cleanup.
 - [ ] Qualify the [broker contract](docs/broker-policy.md): authentication, numeric

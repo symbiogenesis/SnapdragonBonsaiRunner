@@ -53,6 +53,25 @@ Reload model and Retry response; preserve drafts/history across switching and
 recovery. Reload alone must never resend. Use a distinct predeclared feasible
 workload when this work is selected, without restarting an earlier trial clock.
 
+### Separate sandbox log-capture handoff
+
+The source-bound `log-capture-v1` workload selects exactly three model-free
+controls: stdout flood, stderr flood and normal-exit tail draining/file release.
+It preserves the separate original six-case `authority-v1` workload. After owning
+source/compiler acceptance, the owner may select one workload:
+
+```powershell
+gh workflow run sandbox-qualification.yml --ref main -f target=snapdragon -f workload=log-capture-v1
+```
+
+The declared estimate is 150 seconds total, including 60 seconds for package
+intake, inventories, power, teardown and evidence, within the original five-minute
+maximum. It uses its same-run prebuilt package and compiles nothing on the device.
+Do not use another workload to continue an expired or incomplete trial. Native
+entry/case/exit power does not fill unknown pre-bootstrap observations; retain
+aggregate endpoints separately. A pass supplies no hard scratch/private-temp
+quota, broker-only transport, same-user isolation, model or performance verdict.
+
 ## Portable setup and update review
 
 Use the source-bound single executable on native Windows ARM64, with an

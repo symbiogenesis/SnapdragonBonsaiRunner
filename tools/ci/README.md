@@ -664,10 +664,12 @@ owner's index or working files. Unstaged fixes cannot conceal a broken commit.
 The screen checks owned-language policy, parses changed PowerShell without
 executing it, checks workspace Rust formatting when Rust/build inputs change,
 and validates workflow startup plus Actions syntax when YAML/action inputs
-change. Only named cache-environment and source-routing controls run for their
-own adapters in the committed checking policy. For non-HEAD/historical tips,
-those self-checks do not establish the candidate's adapter behavior; basic
-syntax/format/workflow checks still inspect each outgoing snapshot. It adds no PowerShell style rules, model work, full test suite,
+change. Named cache-environment controls independently exercise both cache
+actions, and source-routing controls exercise the selected source adapter.
+Trusted assertions and support come from committed checking policy; adapter
+inputs come from each immutable outgoing snapshot, including non-HEAD/historical
+tips. Candidate fixture scripts cannot replace those assertions. Basic
+syntax/format/workflow checks also inspect every outgoing snapshot. It adds no PowerShell style rules, model work, full test suite,
 dependency audit or benchmark. Foundation retains compilation, analyzers and
 complete tests; this screen does not establish their verdicts.
 
@@ -685,7 +687,9 @@ so inherited Cargo target settings cannot cause an old host binary to be receipt
 It reads the committed compiler configuration and source from its own
 working directory and records their Git object identities plus the executable
 digest. A push verifies that receipt before executing the helper. Ordinary pushes
-never compile or fetch missing Cargo dependencies. Explicit preparation is a
+never compile or fetch missing Cargo dependencies. Explicit preparation first
+invalidates its previous receipt; a failed rebuild retains helper bytes without
+admitting them. Explicit preparation is a
 source build whose caller must supervise within the declared allowance; it is not
 an outgoing-tip verdict, an automatic retry or a way to renew an expired clock.
 The final preparation/receipt and snapshot-config corrections still require owning
