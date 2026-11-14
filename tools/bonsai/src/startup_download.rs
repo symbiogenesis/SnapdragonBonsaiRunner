@@ -840,7 +840,10 @@ mod tests {
             Duration::ZERO,
         );
         assert!(result.is_err_and(|error| error.contains("aggregate allowance")));
-        assert_eq!(fs::read(&path).map_err(|error| error.to_string())?, b"right");
+        assert_eq!(
+            fs::read(&path).map_err(|error| error.to_string())?,
+            b"right"
+        );
         assert_eq!(
             fs::read(&partial).map_err(|error| error.to_string())?,
             b"wrong"
