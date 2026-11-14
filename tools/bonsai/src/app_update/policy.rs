@@ -25,7 +25,7 @@ impl Distribution {
 pub(super) struct Version(u8, u8, u16);
 
 impl Version {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(super) fn next_for_test(self) -> crate::Result<String> {
         let next = self
             .2

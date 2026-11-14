@@ -106,6 +106,7 @@ impl Workload {
         self.seconds().iter().sum::<u64>() + 60
     }
 
+    #[cfg(windows)]
     const fn scope(self) -> &'static str {
         match self {
             Self::Authority => {
@@ -402,6 +403,11 @@ mod tests {
     fn sandbox_log_admission_keeps_three_controls_inside_the_original_deadline() -> crate::Result<()>
     {
         let workload = Workload::LogCapture;
+        assert_eq!(workload.name(), "log-capture-v1");
+        assert_eq!(Workload::Authority.name(), "authority-v1");
+        for selected in [workload, Workload::Authority] {
+            assert_eq!(Workload::select(Some(&json!(selected.name())))?, selected);
+        }
         assert_eq!(workload.cases().len(), 3);
         assert_eq!(workload.seconds().len(), 3);
         assert_eq!(workload.estimated_total_seconds(), 150);

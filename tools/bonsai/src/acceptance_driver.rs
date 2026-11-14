@@ -276,12 +276,20 @@ mod tests {
     use super::*;
     #[test]
     fn bridge_charges_every_fraction_without_restarting_deadlines() -> crate::Result<()> {
-        let limits = json!({"HardLimitSeconds":150,"CaseBudgetSeconds":140});
+        let limits = json!({"HardLimitSeconds":150,"CaseBudgetSeconds":140,"OwnerDeadlineApplied":true,"OwnerElapsedSeconds":0.25,"OwnerWorkSeconds":140,"OwnerProcessExitReserveSeconds":10,"PreparationElapsedSeconds":0.5});
         let result = bridge(&limits, 1000, 1001, 100)?;
         assert_eq!(result.hard_deadline, 16_000);
         assert_eq!(result.work_deadline, 15_000);
         assert_eq!(result.hard_seconds, 149);
         assert_eq!(result.case_seconds, 139);
+        let mut report = json!({});
+        apply_budget(&mut report, &limits, &result);
+        assert_eq!(report["OwnerDeadlineApplied"], true);
+        assert_eq!(report["OwnerElapsedMilliseconds"], 260.0);
+        assert_eq!(report["PreparationElapsedMilliseconds"], 510.0);
+        assert_eq!(report["PreparationWallElapsedMilliseconds"], Value::Null);
+        assert_eq!(report["ModelCaseBudgetSeconds"], 139);
+        assert_eq!(report["TestProcessHardLimitSeconds"], 149);
         assert!(bridge(&limits, 1000, 15_000, 100).is_err());
         assert!(bridge(&limits, 1000, 999, 100).is_err());
         assert!(bridge(&limits, 1000, 1000, 0).is_err());
@@ -303,6 +311,11 @@ mod tests {
             assert!(profile(profile_name, false, false).is_ok());
         }
         assert!(profile("unknown", false, false).is_err());
+        assert!(carries_workload_verdict("pq2-no-adapter"));
+        assert!(carries_workload_verdict("ptq1-adapter-boundaries-row4"));
+        assert!(!carries_workload_verdict("pq2-adapter-speed"));
+        assert!(!carries_workload_verdict("ptq1-pq2-complete-response-row4"));
+        assert!(!carries_workload_verdict("unknown"));
         let accepted = "Native backend startup failure: stage=authenticated-readiness, error=Backend, process=exited-0xC0000142";
         assert_eq!(
             startup_markers(&format!("{accepted}\r")),
