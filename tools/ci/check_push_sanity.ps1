@@ -1,5 +1,5 @@
 #Requires -Version 7.6
-<# Admit a prepared native checker; preparation is explicit, never part of a push. #>
+<# Admit a prepared checker; recover its cache once under a verified native supervisor. #>
 [CmdletBinding()]
 param(
     [string]$Root = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
@@ -9,10 +9,23 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+function Test-PushHelperReceipt([string]$ReceiptPath, [string]$Image, [string]$SourceIdentity) {
+    if (-not (Test-Path -LiteralPath $Image -PathType Leaf) -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $false }
+    try {
+        $receipt = Get-Content -LiteralPath $ReceiptPath -Raw | ConvertFrom-Json -AsHashtable
+        return $receipt -is [Collections.IDictionary] -and $receipt.Count -eq 3 -and
+            $receipt.Contains('SchemaVersion') -and $receipt.Contains('SourceIdentity') -and $receipt.Contains('Sha256') -and
+            $receipt.SchemaVersion -is [long] -and $receipt.SchemaVersion -eq 1 -and
+            $receipt.SourceIdentity -ceq $SourceIdentity -and
+            $receipt.Sha256 -ceq (Get-FileHash -LiteralPath $Image -Algorithm SHA256).Hash.ToLowerInvariant()
+    } catch { return $false }
+}
 $updates = if ([Console]::IsInputRedirected) { [Console]::In.ReadToEnd() } else { '' }
 if (-not $updates.Trim() -and -not $Prepare) { return }
 $started = [Diagnostics.Stopwatch]::StartNew()
 $originalPwsh = $env:BONSAI_PUSH_PWSH_PATH
+$originalChecksum = $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS
+$originalFingerprint = $env:CARGO_BUILD_FINGERPRINT
 $env:BONSAI_PUSH_PWSH_PATH = [Environment]::ProcessPath
 Add-Type -AssemblyName System.Windows.Forms
 $power = [Windows.Forms.SystemInformation]::PowerStatus
@@ -29,25 +42,32 @@ try {
     $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
     $tool = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
     $receiptPath = Join-Path $target 'push-checker.json'
+    $recoveryTool = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-push-recovery.exe'
+    $recoveryReceiptPath = Join-Path $target 'push-recovery.json'
+    $recover = -not $Prepare -and -not (Test-PushHelperReceipt $receiptPath $tool $sourceId)
+    if ($Prepare -or $recover) {
+        $recoveryInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'src/windows-process')
+        $recoveryObjects = @($recoveryInputs | ForEach-Object { $objects[[array]::IndexOf($inputs, $_)] })
+        $recoveryId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($recoveryObjects -join "`n")))).ToLowerInvariant()
+    }
     # A failed explicit rebuild cannot leave an earlier preparation admitted.
     # Keep its binary for diagnosis/reuse, but publish a receipt only on success.
     if ($Prepare) {
         [void][IO.Directory]::CreateDirectory($target)
         [IO.File]::Delete($receiptPath)
+        [IO.File]::Delete($recoveryReceiptPath)
     }
-    # Ordinary pushes never compile. A missing/stale helper is a prerequisite
-    # failure, avoiding an unsupervised cold compiler inside the push allowance.
-    if (-not $Prepare) {
-        if (-not (Test-Path -LiteralPath $tool -PathType Leaf) -or -not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { throw 'Push blocked: prepare the committed checker with tools/ci/check_push_sanity.ps1 -Prepare in a declared source-build allowance.' }
-        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
-        if ($receipt.Count -ne 3 -or $receipt.SchemaVersion -ne 1 -or $receipt.SourceIdentity -cne $sourceId -or $receipt.Sha256 -cne (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Push blocked: checker source or bytes changed; explicit preparation is required.' }
+    if ($recover) {
+        [IO.File]::Delete($receiptPath)
+        if (-not (Test-PushHelperReceipt $recoveryReceiptPath $recoveryTool $recoveryId)) { throw 'Push blocked: recovery supervisor is missing, stale or invalid; prepare with tools/ci/check_push_sanity.ps1 -Prepare in a declared source-build allowance.' }
+        Write-Host 'Push checker cache is missing, stale or invalid; attempting one bounded offline incremental recovery.'
     }
-    # Pushes need only committed checking policy. Preparation still snapshots
-    # the complete source/configuration closure for Cargo's workspace intake.
+    # A valid checker needs only committed checking policy. Both preparation
+    # and recovery snapshot the complete committed Cargo input closure.
     $archive = Join-Path $scratch 'policy.zip'
     $policy = Join-Path $scratch 'source'
     $archiveArguments = @('-C', $Root, 'archive', '--format=zip', "--output=$archive", $head)
-    if (-not $Prepare) {
+    if (-not $Prepare -and -not $recover) {
         $archiveArguments += @('--',
             'tools/ci/check_push_snapshot.ps1',
             'tools/ci/check_owned_languages.ps1',
@@ -60,14 +80,24 @@ try {
     }
     git @archiveArguments
     Expand-Archive -LiteralPath $archive -DestinationPath $policy
-    if ($Prepare) {
+    if ($Prepare -or $recover) {
         . (Join-Path $policy 'scripts/release/Release-Common.ps1')
         $toolchain = Get-ReleaseToolchain $policy
-        Push-Location -LiteralPath $policy
-        try { cargo "+$toolchain" build --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target aarch64-pc-windows-msvc --target-dir $target }
-        finally { Pop-Location }
+        if ($Prepare) {
+            $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = 'true'
+            $env:CARGO_BUILD_FINGERPRINT = 'content'
+            Push-Location -LiteralPath $policy
+            try { cargo "+$toolchain" build --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --package bonsai-windows-process --bin bonsai-push-recovery --target aarch64-pc-windows-msvc --target-dir $target }
+            finally { Pop-Location }
+            @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-FileHash -LiteralPath $recoveryTool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
+        } else {
+            & $recoveryTool --source $policy --target-directory $target --toolchain $toolchain --bootstrap-milliseconds $started.ElapsedMilliseconds
+            if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery failed; checker receipt remains invalid.' }
+        }
         @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
-        'Prepared the committed native checker; this is not an outgoing-tip validation verdict.'
+    }
+    if ($Prepare) {
+        'Prepared the committed native checker and recovery supervisor; this is not an outgoing-tip validation verdict.'
         return
     }
     $updates | & $tool push-sanity --root $Root --policy-root $policy --bootstrap-milliseconds $started.ElapsedMilliseconds
@@ -81,4 +111,8 @@ try {
     Write-Host "Push sanity power after: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown; aggregate elapsed=$($started.Elapsed)."
     if ($null -eq $originalPwsh) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH', [NullString]::Value) }
     else { $env:BONSAI_PUSH_PWSH_PATH = $originalPwsh }
+    if ($null -eq $originalChecksum) { [Environment]::SetEnvironmentVariable('CARGO_UNSTABLE_CHECKSUM_FRESHNESS', [NullString]::Value) }
+    else { $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = $originalChecksum }
+    if ($null -eq $originalFingerprint) { [Environment]::SetEnvironmentVariable('CARGO_BUILD_FINGERPRINT', [NullString]::Value) }
+    else { $env:CARGO_BUILD_FINGERPRINT = $originalFingerprint }
 }

@@ -528,6 +528,36 @@ mod tests {
     }
 
     #[test]
+    fn push_sanity_stale_checker_recovers_from_committed_source() -> Result<()> {
+        preparation_case("stale_checker_recovers_from_committed_source")
+    }
+
+    #[test]
+    fn push_sanity_malformed_checker_receipt_recovers_from_committed_source() -> Result<()> {
+        preparation_case("malformed_checker_receipt_recovers_from_committed_source")
+    }
+
+    #[test]
+    fn push_sanity_corrupt_checker_recovers_from_committed_source() -> Result<()> {
+        preparation_case("corrupt_checker_recovers_from_committed_source")
+    }
+
+    #[test]
+    fn push_sanity_missing_checker_receipt_recovers_from_committed_source() -> Result<()> {
+        preparation_case("missing_checker_receipt_recovers_from_committed_source")
+    }
+
+    #[test]
+    fn push_sanity_unverified_supervisor_blocks_recovery() -> Result<()> {
+        preparation_case("unverified_supervisor_blocks_recovery")
+    }
+
+    #[test]
+    fn push_sanity_failed_automatic_recovery_invalidates_existing_receipt() -> Result<()> {
+        preparation_case("failed_automatic_recovery_invalidates_existing_receipt")
+    }
+
+    #[test]
     fn push_sanity_script_batch_preserves_scopes_and_rejections() -> Result<()> {
         let temporary = super::super::canonical_path(std::env::temp_dir())?;
         let nonce = SystemTime::now()
