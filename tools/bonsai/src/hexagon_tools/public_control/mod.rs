@@ -7,7 +7,6 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs::{self, File},
-    io::Read as _,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };

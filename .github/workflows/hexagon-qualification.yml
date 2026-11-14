@@ -70,7 +70,7 @@ jobs:
         with:
           toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
           components: ''
-      - name: Compare real public queue declarations, native packets and explicitly selected wire branch
+      - name: Compare native public queue ABI and replay independent wire observations
         shell: pwsh
         working-directory: ${{ runner.temp }}
         env:
