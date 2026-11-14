@@ -53,6 +53,8 @@ adoption decisions without displacing native daily-use acceptance.
   cold/hit/input-change paths, failed-regression recovery and independent push handoffs.
   Verify per-test timing reports, shared UI font discovery, native process-tree
   fixtures and concurrent/virtual-time broker controls in their owning lanes.
+  Include first-failure termination and explicit pending selections for local
+  focused checks while preserving hosted ordinary-verdict coverage.
   Follow the [startup preflight](tools/ci/README.md#action-dependency-pins) before
   workflow changes and verify supported self-hosted runner versions.
 - [ ] Qualify Runner's checked-tools producer, shared regression runner and
@@ -95,6 +97,8 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] **D1 — Qualify portable setup, repair and updates.** Cover fresh/custom data folders,
   automatic model/adapter/runtime setup, interruption/resume, corruption repair,
   pause/retry, disk/network/permission failures and independent speech retry.
+  Include the shared deadline through verified cache hits, hashing, recovery,
+  publication and cleanup; the follow-up local check stopped before compilation.
 - [ ] Qualify the shared native Rust HTTPS replacement in its owning compiler,
   analyzer and regression lanes, then exercise Windows Schannel/system trust,
   proxies, CI baseline lookup with Windows system trust, patched-client address
@@ -129,6 +133,8 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify native startup descendant-cancellation and bounded failure/output
   fixtures, visible child readiness diagnostics, exact root exit/capture summaries
   and pre-cleanup status/teardown receipts. Preserve a single cleanup allowance
+  through explicit preparation stop and contained-process destruction, including
+  failure and unattempted-drop controls,
   and keep raw compiler captures out of presentation. Close the focused compiled
   controls and owning-lane checks; the [local workload](docs/evidence/daily-use-readiness.md)
   supplied no passing Rust-test verdict.
@@ -258,8 +264,12 @@ adoption decisions without displacing native daily-use acceptance.
   contained readers and preserve their narrower rights. Compare Codex's
   [no-reparse handle controls](docs/research-register.md#reliability-and-distribution-references)
   as an independent review source for staging/ancestor mutation races.
-- [ ] Bound scratch, PSEC-private temp and stdout/stderr storage; qualify
-  exhaustion, diagnostic/credential retention and owner-loss cleanup.
+- [ ] Qualify parent-drained stdout/stderr's hard 16 MiB per-stream cap,
+  read/write/panic failure, complete tail retention and shared-deadline cleanup.
+  Admit and execute the new native flood/drain controls without silently expanding
+  the existing fixed six-case sandbox workload. Independently bound scratch and
+  PSEC-private temp storage; qualify exhaustion, diagnostic/credential retention
+  and owner-loss cleanup.
 - [ ] Qualify the [broker contract](docs/broker-policy.md): authentication, numeric
   loopback, Host/Origin/routes, rejected tools/loading/overrides, queue/byte/token
   bounds, rate limits, absolute operation deadlines and disconnect/stalled-consumer
