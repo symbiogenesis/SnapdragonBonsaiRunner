@@ -148,21 +148,20 @@ fn minimal_environment_from(policy: &SandboxPolicy, windows: &Path) -> io::Resul
     // for an offline worker (mxc-sdk 1.0.1 launch_diagnostics.rs). Bind that
     // presence-only requirement to private scratch, never the caller's profile.
     // The ordinary worker environment is unchanged.
-    super::environment::build(
-        [
-            (OsString::from("SystemRoot"), OsString::from(&windows)),
-            (OsString::from("windir"), OsString::from(windows)),
-            (
-                OsString::from("SystemDrive"),
-                OsString::from(format!("{}:", char::from(drive))),
-            ),
-            (OsString::from("LOCALAPPDATA"), OsString::from(&scratch)),
-        ],
-        &BTreeMap::from([
-            ("TEMP".to_owned(), scratch.clone()),
-            ("TMP".to_owned(), scratch),
-        ]),
-    )
+    let entries = [
+        (OsString::from("SystemRoot"), OsString::from(&windows)),
+        (OsString::from("windir"), OsString::from(windows)),
+        (
+            OsString::from("SystemDrive"),
+            OsString::from(format!("{}:", char::from(drive))),
+        ),
+        (OsString::from("LOCALAPPDATA"), OsString::from(&scratch)),
+        (OsString::from("TEMP"), OsString::from(&scratch)),
+        (OsString::from("TMP"), OsString::from(scratch)),
+    ];
+    // Admit the exact child names, not caller entries that will never reach it.
+    crate::validate_sandboxed_environment_names(entries.iter().map(|(name, _)| name.clone()))?;
+    super::environment::build(entries, &BTreeMap::new())
 }
 
 fn child_environment_from(

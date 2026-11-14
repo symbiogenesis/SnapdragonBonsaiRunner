@@ -841,7 +841,7 @@ impl OwnedProcess {
     /// Returns invalid launch/grant paths, reparse paths, overlapping read/write
     /// grants, unavailable native PSEC support or failed native creation.
     pub fn start_sandboxed(spec: &ProcessSpec, policy: &SandboxPolicy) -> io::Result<Self> {
-        Self::validate_sandboxed(spec)?;
+        Self::validate_sandboxed(spec, std::env::vars_os().map(|(name, _)| name))?;
         let command = command_line(&spec.executable, &spec.arguments)?;
         native::NativeProcess::start_sandboxed(spec, command, policy).map(Self)
     }
@@ -870,7 +870,7 @@ impl OwnedProcess {
         policy: &SandboxPolicy,
         network: SandboxNetwork,
     ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
-        Self::validate_sandboxed(spec)?;
+        Self::validate_sandboxed(spec, std::env::vars_os().map(|(name, _)| name))?;
         let command = command_line(&spec.executable, &spec.arguments)?;
         let (process, input, output) =
             native::NativeProcess::start_sandboxed_piped(spec, command, policy, network)?;
@@ -886,32 +886,38 @@ impl OwnedProcess {
     /// profile. It supplies no `PATH`, caller profile paths, application options
     /// or arbitrary inherited values. Windows PSEC may supply its own
     /// private temporary-storage environment. The parent environment is unchanged.
-    /// Existing filesystem, Job, memory, handle and cleanup requirements from
-    /// [`Self::start_sandboxed_piped`] remain in force. There is no loopback grant.
+    /// Caller credential and backend-override names do not reject this launch:
+    /// no caller entries are inherited, and the constructed child names are
+    /// independently admitted. Existing filesystem, Job, memory, handle and cleanup
+    /// requirements from [`Self::start_sandboxed_piped`] remain in force. There is
+    /// no loopback grant.
     ///
     /// # Errors
-    /// Returns the same errors as [`Self::start_sandboxed_piped`], including its
-    /// conservative ambient credential-name preflight, or native Windows-directory
-    /// lookup and minimal environment encoding failures.
+    /// Returns the same path, policy, resource, handle and native launch errors as
+    /// [`Self::start_sandboxed_piped`], or native Windows-directory lookup and
+    /// minimal child-environment admission/encoding failures.
     pub fn start_sandboxed_piped_minimal(
         spec: &ProcessSpec,
         policy: &SandboxPolicy,
     ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
-        Self::validate_sandboxed(spec)?;
+        Self::validate_sandboxed(spec, std::iter::empty())?;
         let command = command_line(&spec.executable, &spec.arguments)?;
         let (process, input, output) =
             native::NativeProcess::start_sandboxed_piped_minimal(spec, command, policy)?;
         Ok((Self(process), input, output))
     }
 
-    fn validate_sandboxed(spec: &ProcessSpec) -> io::Result<()> {
-        validate_process(spec)?;
+    fn validate_sandboxed(
+        spec: &ProcessSpec,
+        inherited_names: impl IntoIterator<Item = OsString>,
+    ) -> io::Result<()> {
+        validate_process_spec(spec)?;
         if spec.active_process_limit != 1 {
             return Err(invalid(
                 "native sandbox requires a single-process worker policy",
             ));
         }
-        validate_sandbox_environment()
+        validate_sandboxed_environment_names(inherited_names)
     }
 
     /// Atomically owns a startup compiler/tool tree and then resumes its root.
@@ -1128,6 +1134,14 @@ impl OwnedProcess {
 }
 
 fn validate_process(spec: &ProcessSpec) -> io::Result<()> {
+    validate_process_spec(spec)?;
+    for (name, _) in std::env::vars_os() {
+        validate_backend_environment_name(&name)?;
+    }
+    Ok(())
+}
+
+fn validate_process_spec(spec: &ProcessSpec) -> io::Result<()> {
     for path in [
         &spec.executable,
         &spec.working_directory,
@@ -1144,10 +1158,22 @@ fn validate_process(spec: &ProcessSpec) -> io::Result<()> {
             "job memory and active-process limits must be positive",
         ));
     }
-    for (name, _) in std::env::vars_os() {
-        if forbidden_environment_name(&name) {
-            return Err(invalid("inherited environment contains a backend override"));
-        }
+    Ok(())
+}
+
+fn validate_backend_environment_name(name: &OsStr) -> io::Result<()> {
+    if forbidden_environment_name(name) {
+        return Err(invalid("inherited environment contains a backend override"));
+    }
+    Ok(())
+}
+
+fn validate_sandboxed_environment_names(
+    names: impl IntoIterator<Item = OsString>,
+) -> io::Result<()> {
+    for name in names {
+        validate_backend_environment_name(&name)?;
+        validate_sandbox_environment_name(&name)?;
     }
     Ok(())
 }
@@ -1242,9 +1268,11 @@ fn forbidden_environment_name(name: &OsStr) -> bool {
 /// Checks ambient credential variable names without creating a native environment.
 ///
 /// This cheap preflight never changes the caller's environment and is not proof
-/// of PSEC availability or enforcement. Every sandboxed launch repeats this
-/// check and admits its complete native policy before creating its worker.
-/// Unknown inherited variable names can still contain secrets.
+/// of PSEC availability or enforcement. Sandboxed launches that inherit caller
+/// entries repeat this check and admit their complete native policy before
+/// creating the worker. Minimal-environment launches instead admit only their
+/// constructed child entries. Unknown inherited variable names can still contain
+/// secrets.
 ///
 /// # Errors
 /// Returns `InvalidInput` when a recognized credential-shaped name is present.
@@ -1452,6 +1480,33 @@ fn quote(value: &OsStr, output: &mut Vec<u16>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimal_worker_admission_excludes_ambient_credentials_and_backend_overrides()
+    -> io::Result<()> {
+        // The minimal path passes no inherited names. Ordinary paths must still
+        // reject every poisoned entry, without changing global process state.
+        validate_sandboxed_environment_names(std::iter::empty())?;
+        for name in [
+            "OPENAI_API_KEY",
+            "HF_TOKEN",
+            "LLAMA_ARG_THREADS",
+            "MODEL_ENDPOINT",
+        ] {
+            assert!(validate_sandboxed_environment_names([OsString::from(name)]).is_err());
+        }
+        validate_sandboxed_environment_names(
+            [
+                "SystemRoot",
+                "windir",
+                "SystemDrive",
+                "LOCALAPPDATA",
+                "TEMP",
+                "TMP",
+            ]
+            .map(OsString::from),
+        )
+    }
 
     #[test]
     fn windows_argument_quoting() -> io::Result<()> {

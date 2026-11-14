@@ -67,9 +67,11 @@ Windows directory/drive and private `TEMP`/`TMP`/`LOCALAPPDATA`. PSEC requires
 `SYSTEMROOT` and `LOCALAPPDATA` names in a supplied environment; omitting either
 rejects process creation with Windows error 203. `LOCALAPPDATA` points to the
 same private scratch as `TEMP`/`TMP`, never the user's profile. The parser inherits
-no caller entries, `PATH`, caller profile paths or application options. Other
-workers retain their documented environment policy. The Markdown Job limits committed memory to
-256 MiB. Startup/handshake has a ten-second allowance and each request two seconds;
+no caller entries, `PATH`, caller profile paths or application options. Ambient
+credential and backend-override names cannot reject this fixed-environment
+launch; admission checks its six constructed child names. Workers that inherit
+caller entries retain their documented rejection policy. The Markdown Job limits
+committed memory to 256 MiB. Startup/handshake has a ten-second allowance and each request two seconds;
 owned-worker stop and pipe joining share five seconds. Native process-creation
 failure retains its existing ten-second cleanup allowance, and synchronous native
 creation calls remain nonpreemptible.
@@ -161,8 +163,8 @@ OS/profile environment entries are passed through; the launcher does not clear
 the environment or relocate Windows/profile folders into a checkout. Child
 TEMP/TMP select scratch before Windows applies PSEC's own temporary-storage policy.
 Known credential-shaped variables, including common tokens, API keys, passwords
-and connection strings, reject sandbox launch with a value-free error. The exact
-inherited snapshot used to build the child environment is checked again; an earlier
+and connection strings, reject environment-inheriting sandbox launches with a
+value-free error. The exact inherited snapshot used to build the child environment is checked again; an earlier
 clean preflight cannot authorize subsequently introduced credential variables.
 This is a conservative guard, not proof that every arbitrarily named inherited
 value is non-secret. Run from an appropriately scoped parent environment.
