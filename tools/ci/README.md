@@ -265,6 +265,47 @@ unit, 16 MiB documents, 256 MiB per file and 2 GiB aggregate checked bytes,
 including repeated inputs. `native_source_closure_` controls use literal miniature
 fixtures; they are not captures of a compiler execution.
 
+`native-closure-collect` assembles this schema-3 manifest from original files
+already retained by the owning build. It hashes the files and runs the complete
+source verifier before emitting a manifest on stdout; failure emits no manifest.
+It runs no compiler, preprocessor or generator and copies no source tree:
+
+```powershell
+$manifest = & $reviewedCiTool native-closure-collect --request $collectionRequest --expected-sha256 $reviewedRequestSha256
+if ($LASTEXITCODE -ne 0) { throw 'Native closure collection failed.' }
+[IO.File]::WriteAllText($closureManifest, $manifest + "`n", [Text.UTF8Encoding]::new($false))
+$reviewedManifestSha256 = (Get-FileHash -LiteralPath $closureManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+& $reviewedCiTool native-closure-verify --manifest $closureManifest --expected-sha256 $reviewedManifestSha256
+```
+
+The strict request has `schemaVersion: 1`,
+`kind: selected-clang-native-source-collection`, `sourceRevision`,
+`target: aarch64-pc-windows-msvc`, `configuration`, `compiler`,
+`compilationDatabase` and `units`. It uses the same unit fields listed above,
+except `compiler`, `compilationDatabase`, `dependencies`, `preprocessed` and
+`object` are absolute path strings, whose byte identities the collector computes.
+Each input is `{path, origin, generation}`; generated inputs recursively supply
+`{generator, arguments, workingDirectory, exitCode, inputs}`, with `generator`
+also an absolute path string. Source/toolchain leaves omit `generation` or set it
+to null. Every original compiler/preprocessor/generator exit must be supplied
+explicitly and be zero. No successful code or missing provenance is inferred.
+
+The request SHA-256 binds the reviewed selection and invocation records. Output
+is the ordinary schema-3 manifest, usable by the existing link/package verifier.
+Retain only its required original files and receipt; collection does not package
+them or change their paths. Bounds above still apply, with an additional 100,000
+classified-input record limit. The verifier rehashes originals before emission
+and detects changes between collection and verification. Later replay detects
+subsequent mutations; this is not an atomic filesystem snapshot.
+
+Exit codes, source revision and effective target/configuration remain the owning
+producer's claims. Collection does not observe their execution or establish
+source ancestry. Clang-cl `/c`/`/Fo`, shell-command databases and response files
+remain outside this supported subset. In particular, this assembler does not
+instrument ASR's CMake build or supply its missing original compiler captures.
+The owning CI build must export the admitted original argument arrays and
+artifacts; link, PE, model and retirement gates remain separate.
+
 This verifies the declared selection and its retained bytes. A trusted owning
 build must independently establish the original inventory's completeness, generated-file
 classification, effective compiler/environment configuration, matching

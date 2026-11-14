@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::native_source_inventory::{digest, hex, lower_hex, plain_ancestors, read_bounded};
@@ -19,7 +19,7 @@ const MAX_DOCUMENT: u64 = 16 * 1024 * 1024;
 const MAX_FILE: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Identity {
     path: String,
@@ -27,7 +27,7 @@ struct Identity {
     sha256: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Generation {
     generator: Identity,
@@ -39,14 +39,14 @@ struct Generation {
 
 // Schema 1 captured only immediate generator inputs. Schema 2 classifies each
 // input recursively so a generated intermediate cannot lose its own provenance.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum GenerationInput {
     Classified(Input),
     Legacy(Identity),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Input {
     identity: Identity,
@@ -54,7 +54,7 @@ struct Input {
     generation: Option<Generation>,
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 enum Origin {
     Source,
@@ -62,7 +62,7 @@ enum Origin {
     Generated,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Unit {
     source: String,
@@ -77,7 +77,7 @@ struct Unit {
     inputs: Vec<Input>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Manifest {
     schema_version: u32,
@@ -544,10 +544,14 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
         .ok_or(USAGE)?;
     path_key(path)?;
     let bytes = read_bounded(Path::new(path), MAX_DOCUMENT)?;
-    if hex(&Sha256::digest(&bytes)) != expected {
+    verify_manifest_bytes(&bytes, expected)
+}
+
+fn verify_manifest_bytes(bytes: &[u8], expected: &str) -> Result<String> {
+    if hex(&Sha256::digest(bytes)) != expected {
         return Err("Native closure manifest differs from its reviewed SHA-256.".into());
     }
-    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let manifest: Manifest = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     if ![1, 2, 3].contains(&manifest.schema_version)
         || manifest.kind != "selected-clang-native-source-closure"
         || !lower_hex(&manifest.source_revision, 40)
@@ -599,6 +603,13 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     })
     .to_string())
 }
+
+pub(super) fn collect(arguments: &[OsString]) -> Result<String> {
+    collector::run(arguments)
+}
+
+#[path = "native_source_collect.rs"]
+mod collector;
 
 #[cfg(test)]
 #[path = "native_source_closure_tests.rs"]
