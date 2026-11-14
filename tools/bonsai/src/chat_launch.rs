@@ -104,6 +104,9 @@ struct Request {
     chat_path: Option<PathBuf>,
     #[serde(default)]
     broker_path: Option<PathBuf>,
+    // Retain the checkout's runtime lock after the early formatter handoff.
+    #[serde(default)]
+    source_built_broker: bool,
     #[serde(default)]
     asr_path: Option<PathBuf>,
     #[serde(default)]
@@ -656,7 +659,7 @@ fn inference_request(request: &Request, working: &Path) -> Value {
     });
     // A source-built broker embeds this checkout's lock. Explicit prebuilt
     // brokers retain the maintenance executable's compiled package lock instead.
-    if request.broker_path.is_none() {
+    if request.broker_path.is_none() || request.source_built_broker {
         provision["lockPath"] = json!(
             request
                 .repository_root
@@ -897,12 +900,25 @@ fn launch_pending(
     working: &Path,
     tool: &Path,
 ) -> crate::Result<Value> {
-    // Only the presentation executable is needed before the native window can
-    // open. Backend builds, speech downloads and credentials run in the UI's
-    // owned preparation worker after its first frame.
+    // Both images are needed before opening the window: the headless broker
+    // also formats recovered answers while model setup is pending or fails.
+    // Downloads, model preparation and speech stay in the owned UI worker.
+    let mut packages = Vec::with_capacity(2);
     if request.chat_path.is_none() {
-        let built = operations.apps(&request, &["bonsai-chat"], working)?;
-        request.chat_path = Some(path_field(&built, "ChatPath")?);
+        packages.push("bonsai-chat");
+    }
+    if request.broker_path.is_none() {
+        packages.push("bonsai-broker");
+    }
+    if !packages.is_empty() {
+        let built = operations.apps(&request, &packages, working)?;
+        if request.chat_path.is_none() {
+            request.chat_path = Some(path_field(&built, "ChatPath")?);
+        }
+        if request.broker_path.is_none() {
+            request.broker_path = Some(path_field(&built, "BrokerPath")?);
+            request.source_built_broker = true;
+        }
     }
     request.working_directory = Some(working.into());
     let path = working.join(format!(
@@ -1020,7 +1036,7 @@ fn working_directory(requested: Option<&Path>) -> crate::Result<PathBuf> {
     Err("Cannot create a fresh external chat session directory.".into())
 }
 
-/// Opens native chat before preparing its backend, credentials and speech files.
+/// Opens native chat with offline formatting before preparing model and speech files.
 ///
 /// Speech-only provisioning returns model paths without compiling or starting an
 /// application. Ordinary startup checks cached speech lengths; native services
@@ -1032,6 +1048,9 @@ fn working_directory(requested: Option<&Path>) -> crate::Result<PathBuf> {
 pub fn run(value: Value) -> crate::Result<Value> {
     crate::startup_cancel::checkpoint()?;
     let mut request: Request = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    if request.source_built_broker {
+        return Err("SourceBuiltBroker is reserved for the owned chat preparation worker.".into());
+    }
     // Only the running, recognized bundle can advertise portable updating.
     request.portable_executable = if crate::chat_package::bundle::current_is_bundled()? {
         Some(std::env::current_exe().map_err(|error| error.to_string())?)

@@ -624,13 +624,11 @@ fn failed_native_runtime_preparation_stops_before_downloads_builds_and_keys() ->
 }
 
 #[test]
-fn native_window_handoff_precedes_backend_downloads_builds_and_keys() -> crate::Result<()> {
-    for prebuilt_chat in [false, true] {
-        let mut fixture = fixture(if prebuilt_chat {
-            "early-prebuilt"
-        } else {
-            "early-build"
-        })?;
+fn native_window_handoff_prepares_images_before_model_downloads_and_keys() -> crate::Result<()> {
+    for (prebuilt_chat, prebuilt_broker) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let mut fixture = fixture("early-images")?;
         if !prebuilt_chat {
             fixture
                 .request
@@ -638,18 +636,30 @@ fn native_window_handoff_precedes_backend_downloads_builds_and_keys() -> crate::
                 .ok_or("Expected request.")?
                 .remove("ChatPath");
         }
+        if !prebuilt_broker {
+            fixture
+                .request
+                .as_object_mut()
+                .ok_or("Expected request.")?
+                .remove("BrokerPath");
+        }
         fixture.request["ForceBuild"] = json!(true);
         fixture.request["NativeEngine"] = json!(true);
         let plan = plan(fixture.request)?;
         let mut recorder = Recorder::new(fixture.root.clone());
         let tool = fixture.root.join("maintenance.exe");
         launch_pending(plan.request, &mut recorder, &fixture.working, &tool)?;
-        assert_eq!(recorder.events.len(), if prebuilt_chat { 1 } else { 2 });
+        let mut packages = Vec::new();
         if !prebuilt_chat {
-            assert_eq!(
-                recorder.events[0],
-                Event::Apps(vec!["bonsai-chat".into()], true)
-            );
+            packages.push("bonsai-chat".into());
+        }
+        if !prebuilt_broker {
+            packages.push("bonsai-broker".into());
+        }
+        let build_count = usize::from(!packages.is_empty());
+        assert_eq!(recorder.events.len(), 1 + build_count);
+        if build_count != 0 {
+            assert_eq!(recorder.events[0], Event::Apps(packages, true));
         }
         let (_, arguments, _) = recorder.launch()?;
         assert_eq!(value_after(arguments, "--startup-tool")?, tool);
@@ -661,16 +671,68 @@ fn native_window_handoff_precedes_backend_downloads_builds_and_keys() -> crate::
         let request: Request =
             serde_json::from_slice(&fs::read(request_path).map_err(|error| error.to_string())?)
                 .map_err(|error| error.to_string())?;
-        assert!(request.chat_path.is_some());
+        assert_eq!(
+            request.chat_path,
+            Some(fixture.root.join(if prebuilt_chat {
+                "chat.exe"
+            } else {
+                "built-chat.exe"
+            }))
+        );
+        assert_eq!(
+            request.broker_path,
+            Some(fixture.root.join(if prebuilt_broker {
+                "broker.exe"
+            } else {
+                "built-broker.exe"
+            }))
+        );
+        assert_eq!(request.source_built_broker, !prebuilt_broker);
         assert!(request.force_build);
         assert_eq!(
             request.working_directory.as_deref(),
             Some(fixture.working.as_path())
         );
-        let deferred = prepare(request, true)?;
-        assert!(!deferred.app_packages.contains(&"bonsai-chat"));
+        let mut deferred = prepare(request, true)?;
+        assert!(deferred.app_packages.is_empty());
         assert_eq!(deferred.native_selection, Some("All"));
+        deferred.request.preparation_stage = PreparationStage::Model;
+        prepare_backend(deferred, &mut recorder, &fixture.working)?;
+        let Some(Event::Inference(runtime)) = recorder.events.last() else {
+            return Err(
+                "Model setup must still prepare the runtime without rebuilding images.".into(),
+            );
+        };
+        assert_eq!(
+            runtime.get("lockPath"),
+            (!prebuilt_broker)
+                .then(|| fixture
+                    .root
+                    .join("repository/config/prism-inference.lock.json"))
+                .map(|path| json!(path))
+                .as_ref()
+        );
+        assert_eq!(recorder.artifact_requests.len(), 1);
+        assert_eq!(
+            recorder
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Apps(..)))
+                .count(),
+            build_count
+        );
     }
+    Ok(())
+}
+
+#[test]
+fn source_built_broker_provenance_is_reserved_for_owned_preparation() -> crate::Result<()> {
+    let mut fixture = fixture("reserved-broker-provenance")?;
+    fixture.request["SourceBuiltBroker"] = json!(true);
+    assert_eq!(
+        run(fixture.request),
+        Err("SourceBuiltBroker is reserved for the owned chat preparation worker.".into())
+    );
     Ok(())
 }
 
