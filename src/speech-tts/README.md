@@ -315,3 +315,13 @@ It exercises all three ordered SE-Res2Net outputs, aggregation, temporal pooling
 and final projection. Literal coefficient and quadrature controls distinguish
 double-angle baking from the former F32 angles. This graph uses synthetic small
 weights; pinned-weight speaker/voice and full native-model parity remain separate.
+
+Reference RVQ encoding rejects nonfinite weights, centroid norms, projected
+residuals and every candidate distance before selecting a code. Checked geometry
+and code-index conversion reject invalid layouts without substituting centroid
+zero. A scoped append preserves the caller's existing codes on failure or unwind;
+successful encoding retains the original projection/FMA order, first-index ties,
+residual subtraction and codebook-major output. Four `rvq_reference_` controls
+provide literal two-layer nearest-centroid answers, grouped/tail ties, finite
+overflow refusals, late failure rollback and mutable-geometry rejection. These
+synthetic controls do not qualify complete pinned-codec/native-model parity.

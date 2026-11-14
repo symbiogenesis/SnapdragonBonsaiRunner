@@ -414,7 +414,7 @@ fn rvq_argmin_simd<S: Simd>(
     r: &[f32],
     codebook_size: usize,
     d: usize,
-) -> usize {
+) -> Option<usize> {
     let mut best_e = 0_usize;
     let mut best_sc = f32::INFINITY;
     let quads = codebook_size / 4;
@@ -433,6 +433,9 @@ fn rvq_argmin_simd<S: Simd>(
         for (k, &dot) in dots.iter().enumerate() {
             let e = e_base + k;
             let sc = (-2.0_f32).mul_add(dot, sq[e]);
+            if !sc.is_finite() {
+                return None;
+            }
             if sc < best_sc {
                 best_sc = sc;
                 best_e = e;
@@ -443,12 +446,15 @@ fn rvq_argmin_simd<S: Simd>(
         let c = &cb[e * d..(e + 1) * d];
         let dot = dot_f32_simd(simd, r, c, 0.0_f32);
         let sc = (-2.0_f32).mul_add(dot, sq[e]);
+        if !sc.is_finite() {
+            return None;
+        }
         if sc < best_sc {
             best_sc = sc;
             best_e = e;
         }
     }
-    best_e
+    Some(best_e)
 }
 
 /// Number of RVQ codebooks (`1` semantic + `15` acoustic).
@@ -1209,10 +1215,13 @@ impl RvqEncodeSide {
             || codebook_size == 0
             || codebook_dim == 0
             || hidden_size == 0
-            || input_proj.len() != codebook_dim * hidden_size
-            || codebooks
-                .iter()
-                .any(|cb| cb.len() != codebook_size * codebook_dim)
+            || i32::try_from(codebook_size - 1).is_err()
+            || codebook_dim.checked_mul(hidden_size) != Some(input_proj.len())
+            || input_proj.iter().any(|value| !value.is_finite())
+            || codebooks.iter().any(|cb| {
+                codebook_size.checked_mul(codebook_dim) != Some(cb.len())
+                    || cb.iter().any(|value| !value.is_finite())
+            })
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1226,6 +1235,12 @@ impl RvqEncodeSide {
             for e in 0..codebook_size {
                 let row = &cb[e * codebook_dim..(e + 1) * codebook_dim];
                 let norm_sq = dispatch!(level, simd => dot_f32_simd(simd, row, row, 0.0_f32));
+                if !norm_sq.is_finite() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Nonfinite RVQ centroid squared norm.",
+                    ));
+                }
                 layer_sq.push(norm_sq);
             }
             sqsum.push(layer_sq);
@@ -1242,20 +1257,38 @@ impl RvqEncodeSide {
     }
 
     /// Quantize `[frames, hidden_size]` into `[num_layers, frames]` codes.
+    /// Failure or unwinding preserves every preexisting output code.
     pub fn encode(
         &self,
         hidden: &[f32],
         frames: usize,
         codes_out: &mut Vec<i32>,
     ) -> io::Result<()> {
-        if hidden.len() != frames * self.hidden_size {
+        if frames == 0
+            || self.num_layers == 0
+            || self.codebook_size == 0
+            || self.codebook_dim == 0
+            || self.hidden_size == 0
+            || i32::try_from(self.codebook_size - 1).is_err()
+            || frames.checked_mul(self.hidden_size) != Some(hidden.len())
+            || self.codebook_dim.checked_mul(self.hidden_size) != Some(self.input_proj.len())
+            || self.codebooks.len() != self.num_layers
+            || self.sqsum.len() != self.num_layers
+            || self
+                .codebooks
+                .iter()
+                .any(|cb| self.codebook_size.checked_mul(self.codebook_dim) != Some(cb.len()))
+            || self.sqsum.iter().any(|sq| sq.len() != self.codebook_size)
+            || hidden.iter().any(|value| !value.is_finite())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Invalid RvqEncodeSide input length.",
+                "Invalid RvqEncodeSide input or geometry.",
             ));
         }
         let d = self.codebook_dim;
-        let mut res = vec![0.0_f32; frames * d];
+        let elements = frames.checked_mul(d).ok_or_else(rvq_numerical_error)?;
+        let mut res = vec![0.0_f32; elements];
         let level = Level::new();
         for t in 0..frames {
             let x = &hidden[t * self.hidden_size..(t + 1) * self.hidden_size];
@@ -1264,8 +1297,12 @@ impl RvqEncodeSide {
                 level,
                 simd => matvec_4rows_simd(simd, &self.input_proj, x, None, y)
             );
+            if y.iter().any(|value| !value.is_finite()) {
+                return Err(rvq_numerical_error());
+            }
         }
 
+        let mut append = RvqCodeAppend::new(codes_out);
         for l in 0..self.num_layers {
             let cb = &self.codebooks[l];
             let sq = &self.sqsum[l];
@@ -1274,13 +1311,53 @@ impl RvqEncodeSide {
                 let best_e = dispatch!(
                     level,
                     simd => rvq_argmin_simd(simd, cb, sq, r, self.codebook_size, d)
-                );
-                codes_out.push(i32::try_from(best_e).unwrap_or(0));
+                )
+                .ok_or_else(rvq_numerical_error)?;
+                append
+                    .codes
+                    .push(i32::try_from(best_e).map_err(|_| rvq_numerical_error())?);
                 let best_centroid = &cb[best_e * d..(best_e + 1) * d];
                 dispatch!(level, simd => sub_slice_in_place_simd(simd, r, best_centroid));
+                if r.iter().any(|value| !value.is_finite()) {
+                    return Err(rvq_numerical_error());
+                }
             }
         }
+        append.committed = true;
         Ok(())
+    }
+}
+
+fn rvq_numerical_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "Invalid RVQ numerical result.")
+}
+
+#[cfg(test)]
+#[path = "codec/rvq_tests.rs"]
+mod rvq_tests;
+
+// Avoid a duplicate code buffer while preventing partial reference publication.
+struct RvqCodeAppend<'a> {
+    codes: &'a mut Vec<i32>,
+    original: usize,
+    committed: bool,
+}
+
+impl<'a> RvqCodeAppend<'a> {
+    fn new(codes: &'a mut Vec<i32>) -> Self {
+        Self {
+            original: codes.len(),
+            codes,
+            committed: false,
+        }
+    }
+}
+
+impl Drop for RvqCodeAppend<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.codes.truncate(self.original);
+        }
     }
 }
 
