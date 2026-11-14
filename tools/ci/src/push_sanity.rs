@@ -58,6 +58,10 @@ fn selection(paths: &[String]) -> Selection {
         rust: owned.iter().any(|path| {
             extension(path, "rs")
                 || path.ends_with("Cargo.toml")
+                || matches!(
+                    Path::new(path).file_name().and_then(|name| name.to_str()),
+                    Some("rustfmt.toml" | ".rustfmt.toml")
+                )
                 || path.as_str() == "rust-toolchain.toml"
                 || path.starts_with(".cargo/")
         }),
@@ -233,5 +237,20 @@ mod tests {
         let plan = selection(&[".github/workflows/source-checks.yml".into()]);
         assert!(plan.workflows && plan.source_fixture);
         assert_eq!(plan.cache_actions, Vec::<&str>::new());
+    }
+
+    #[test]
+    fn push_sanity_formats_changed_root_and_nested_rustfmt_configuration() {
+        for path in [
+            "rustfmt.toml",
+            ".rustfmt.toml",
+            "src/audio/rustfmt.toml",
+            "src/audio/.rustfmt.toml",
+        ] {
+            assert!(selection(&[path.into()]).rust, "{path}");
+        }
+        for path in ["docs/settings.toml", "docs/rustfmt.toml.example"] {
+            assert!(!selection(&[path.into()]).rust, "{path}");
+        }
     }
 }
