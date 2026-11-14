@@ -71,8 +71,10 @@ struct Budget {
 /// clock/frequency used by the inherited owner. The owner binding can only
 /// shorten the independent job allowance; malformed or exhausted input rejects.
 /// Supplying the original `jobStartedTick` also charges monotonic preparation
-/// time, taking the larger of the wall and monotonic elapsed costs. Omitting it
-/// preserves legacy wall-only inputs; a supplied invalid or null tick rejects.
+/// time, taking the larger of the wall and monotonic elapsed costs. The inherited
+/// owner also charges the larger elapsed cost from its own original starts.
+/// Omitting the job tick preserves legacy wall-only inputs; a supplied invalid
+/// or null tick rejects.
 ///
 /// # Errors
 /// Returns a diagnostic for invalid clock/binding fields or an exhausted budget.
@@ -189,10 +191,13 @@ fn calculate(request: &Request) -> crate::Result<Budget> {
             .and_then(|tick| u64::try_from(tick).ok())
             .filter(|tick| *tick <= now_tick)
             .ok_or("The original owner monotonic start is invalid or in the future.")?;
-        if utc_ticks(field("StartedUtc")?)? > now {
-            return Err("The owner start requires a nonfuture round-trip UTC timestamp.".into());
-        }
+        let wall_ticks = now
+            .checked_sub(utc_ticks(field("StartedUtc")?)?)
+            .ok_or("The owner start requires a nonfuture round-trip UTC timestamp.")?;
         let elapsed_ticks = now_tick - started_tick;
+        let charged = elapsed_ticks
+            .div_ceil(frequency)
+            .max(wall_ticks.div_ceil(TICKS_PER_SECOND));
         // Fifteen seconds remain for process completion, collection and runner
         // exit before the independently enforced original owner work cutoff.
         // Its remaining thirty-second lifetime reserve is separate from these
@@ -200,9 +205,9 @@ fn calculate(request: &Request) -> crate::Result<Budget> {
         hard_limit = hard_limit.min(
             i128::from(work_seconds)
                 - i128::from(OWNER_PROCESS_EXIT_RESERVE_SECONDS)
-                - i128::from(elapsed_ticks.div_ceil(frequency)),
+                - i128::from(charged),
         );
-        Some(seconds(elapsed_ticks, frequency)?)
+        Some(seconds(elapsed_ticks, frequency)?.max(seconds(wall_ticks, TICKS_PER_SECOND)?))
     } else {
         None
     };
@@ -526,8 +531,9 @@ mod tests {
                 input["ownerDeadline"]["WorkSeconds"] = json!(work_seconds.to_string());
                 input["ownerDeadline"]["StartedTick"] =
                     json!((500_000 - elapsed_milliseconds).to_string());
+                let charged_milliseconds = elapsed_milliseconds.max(50_000);
                 let expected_hard = 250.min(
-                    i64::from(work_seconds) - 15 - i64::from(elapsed_milliseconds.div_ceil(1000)),
+                    i64::from(work_seconds) - 15 - i64::from(charged_milliseconds.div_ceil(1000)),
                 );
                 let result = run(input);
                 if expected_hard <= 10 {
@@ -545,7 +551,7 @@ mod tests {
                 assert_eq!(case, 240.min(expected_hard - 10));
                 assert!(case + 10 <= hard);
                 assert!(
-                    hard * 1000 + i64::from(elapsed_milliseconds)
+                    hard * 1000 + i64::from(charged_milliseconds)
                         <= i64::from(work_seconds - 15) * 1000
                 );
                 assert!(hard + 20 <= 270);
@@ -559,9 +565,33 @@ mod tests {
         input["ownerDeadline"] = owner();
         input["ownerDeadline"]["WorkSeconds"] = json!("270");
         input["ownerDeadline"]["StartedTick"] = json!("470000");
+        input["ownerDeadline"]["StartedUtc"] = json!("2026-10-31T00:00:20.0000000Z");
         let report = run(input)?;
         assert_eq!(report["HardLimitSeconds"], 225);
         assert_eq!(report["CaseBudgetSeconds"], 215);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_clocks_charge_wall_or_monotonic_elapsed_without_renewal() -> crate::Result<()> {
+        let mut input = request();
+        input["ownerDeadline"] = owner();
+        // Only ten monotonic seconds elapsed, but the original UTC start is
+        // fifty seconds old. The inherited owner cannot gain forty seconds.
+        input["ownerDeadline"]["StartedTick"] = json!("490000");
+        let report = run(input.clone())?;
+        assert_eq!(report["OwnerElapsedSeconds"], 50.0);
+        assert_eq!(report["HardLimitSeconds"], 145);
+        assert_eq!(report["CaseBudgetSeconds"], 135);
+        // Moving UTC backwards cannot enlarge a longer monotonic interval.
+        input["ownerDeadline"]["StartedUtc"] = json!("2026-10-31T00:00:45.0000000Z");
+        input["ownerDeadline"]["StartedTick"] = json!("450000");
+        assert_eq!(run(input.clone())?["HardLimitSeconds"], 145);
+        // Fractional wall costs are rounded up before deadline admission.
+        input["ownerDeadline"]["StartedUtc"] = json!("2026-10-30T23:57:46.0000000Z");
+        assert_eq!(run(input.clone())?["CaseBudgetSeconds"], 1);
+        input["ownerDeadline"]["StartedUtc"] = json!("2026-10-30T23:57:45.9999999Z");
+        assert!(run(input).is_err());
         Ok(())
     }
 
