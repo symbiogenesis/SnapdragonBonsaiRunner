@@ -298,3 +298,49 @@ fn preprocessing_shares_one_deadline_and_work_counter() -> crate::Result<()> {
     assert!(run_fixture(request).is_err());
     Ok(())
 }
+
+#[test]
+fn structured_fit_input_hash_and_receipt_omit_output_path_and_report_metrics() -> crate::Result<()>
+{
+    let baseline = run_fixture(fixture()?)?;
+    assert_eq!(baseline["published"], false);
+    assert!(
+        baseline
+            .as_object()
+            .ok_or("Missing structured receipt object.")?
+            .get("outputPath")
+            .is_none()
+    );
+    for section in [
+        &baseline["diagnostics"]["development"],
+        &baseline["sourceOrderF32Diagnostics"]["development"],
+    ] {
+        assert!(number(&section["worstRowRelativeL2Error"])? < 1e-10);
+        assert!(number(&section["meanCosineSimilarity"])? > 0.999_999);
+        assert!(number(&section["minCosineSimilarity"])? > 0.999_999);
+        assert!((0.0..=1.0).contains(&number(&section["meanCandidateEnergyEntropy"])?));
+        assert!((0.0..=1.0).contains(&number(&section["meanCandidateCoordinateCoverage"])?));
+    }
+
+    let dir =
+        std::env::temp_dir().join(format!("bonsai-structured-pathfree-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let out_path = dir.join("structured.json");
+    let mut with_output = fixture()?;
+    with_output["outputPath"] = json!(out_path);
+    let published = run_fixture(with_output);
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_dir(&dir);
+    let published = published?;
+    assert_eq!(published["published"], true);
+    assert!(
+        published
+            .as_object()
+            .ok_or("Missing published structured receipt.")?
+            .get("outputPath")
+            .is_none()
+    );
+    assert_eq!(baseline["fitInputSha256"], published["fitInputSha256"]);
+    assert_eq!(baseline["artifactSha256"], published["artifactSha256"]);
+    Ok(())
+}

@@ -176,3 +176,112 @@ fn atomic_publication_never_overwrites_existing_output() -> crate::Result<()> {
     result?;
     cleanup.map_err(|error| error.to_string())
 }
+
+#[test]
+fn fit_input_hash_omits_output_path_receipt_omits_path_and_rows_cap_to_top_violations()
+-> crate::Result<()> {
+    let baseline = run(fixture())?;
+    assert_eq!(baseline["published"], false);
+    assert!(
+        baseline
+            .as_object()
+            .ok_or("Missing patch report.")?
+            .get("outputPath")
+            .is_none()
+    );
+    assert_eq!(baseline["rowSummary"]["totalRows"], 3);
+    assert_eq!(baseline["rowSummary"]["reportedRows"], 3);
+    assert_eq!(baseline["rowSummary"]["omittedRows"], 0);
+    assert!(
+        baseline["rowSummary"]["factorsL2Norm"]
+            .as_f64()
+            .is_some_and(|v| v.is_finite())
+    );
+    assert!(
+        baseline["rowSummary"]["factorsEnergyEntropy"]
+            .as_f64()
+            .is_some_and(|v| (0.0..=1.0).contains(&v))
+    );
+    assert!(
+        baseline["rowSummary"]["factorsCoordinateCoverage"]
+            .as_f64()
+            .is_some_and(|v| (0.0..=1.0).contains(&v))
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "bonsai-weight-patch-pathfree-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let path = dir.join("patch.json");
+    let mut with_output = fixture();
+    with_output["outputPath"] = json!(path);
+    let published = run(with_output);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir(&dir);
+    let published = published?;
+    assert_eq!(published["published"], true);
+    assert!(
+        published
+            .as_object()
+            .ok_or("Missing published patch report.")?
+            .get("outputPath")
+            .is_none()
+    );
+    assert_eq!(
+        baseline["artifact"]["fitInputSha256"],
+        published["artifact"]["fitInputSha256"]
+    );
+
+    let mut large = fixture();
+    let mut rows = vec![
+        json!({"sampleId":"fit-target","groupId":"fit-target-trace","tokenIndex":0,
+            "split":"fit","label":"target","activation":vector(INPUT_WIDTH,1.0),
+            "residual":vector(OUTPUT_WIDTH,1.0)}),
+        json!({"sampleId":"fit-preserve","groupId":"fit-preserve-trace","tokenIndex":0,
+            "split":"fit","label":"preserve","activation":vector(INPUT_WIDTH,0.0),
+            "residual":vector(OUTPUT_WIDTH,0.0)}),
+    ];
+    for idx in 0..14_u32 {
+        let (label, scale) = if idx >= 6 {
+            (
+                "target",
+                f32::from(u8::try_from(idx + 2).map_err(|e| e.to_string())?) * -10.0,
+            )
+        } else {
+            ("preserve", 0.0)
+        };
+        rows.push(json!({
+            "sampleId": format!("holdout-{idx}"),
+            "groupId": format!("holdout-group-{idx}"),
+            "tokenIndex": 0,
+            "split": "holdout",
+            "label": label,
+            "activation": vector(INPUT_WIDTH, scale),
+            "residual": vector(OUTPUT_WIDTH, 1.0)
+        }));
+    }
+    large["rows"] = Value::Array(rows);
+    let capped = run(large)?;
+    let reported = capped["rows"].as_array().ok_or("Missing rows array.")?;
+    assert_eq!(reported.len(), MAX_VIOLATION_REPORT_ROWS);
+    assert_eq!(capped["rowSummary"]["totalRows"], 16);
+    assert_eq!(
+        capped["rowSummary"]["reportedRows"],
+        MAX_VIOLATION_REPORT_ROWS
+    );
+    assert_eq!(capped["rowSummary"]["omittedRows"], 8);
+    assert_eq!(
+        capped["rowSummary"]["reportedRowLimit"],
+        MAX_VIOLATION_REPORT_ROWS
+    );
+    for entry in reported {
+        assert_eq!(entry["split"], "holdout");
+        assert!(
+            entry["constraintViolation"]
+                .as_f64()
+                .is_some_and(|v| v > 1.0)
+        );
+    }
+    Ok(())
+}

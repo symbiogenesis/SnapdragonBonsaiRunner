@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 const INPUT_WIDTH: usize = 17_408;
 const OUTPUT_WIDTH: usize = 5_120;
 const MAX_ROWS: usize = 256;
+const MAX_VIOLATION_REPORT_ROWS: usize = 8;
 const EXECUTION_PROFILE: &str = "experimental-ffn-cpu-scalar-unfused-v1";
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -123,6 +124,19 @@ struct Request {
     controls: Controls,
     #[serde(default)]
     output_path: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FitInputHashView<'a> {
+    operation: &'a Operation,
+    schema_version: u32,
+    source: &'a Source,
+    site: &'a Site,
+    rows: &'a [Row],
+    direction: &'a Option<Vec<f32>>,
+    direction_source_sha256: &'a Option<String>,
+    controls: &'a Controls,
 }
 
 fn hex(value: &str, length: usize) -> crate::Result<()> {
@@ -279,7 +293,17 @@ fn factor_hash(values: &[f32]) -> crate::Result<String> {
 fn request_hash(request: &Request) -> crate::Result<String> {
     let mut hash = crate::identity::Hasher::new()?;
     hash.update(b"bonsai-weight-patch-expanded-request-v1\0")?;
-    hash.update(&serde_json::to_vec(request).map_err(|error| error.to_string())?)?;
+    let hash_view = FitInputHashView {
+        operation: &request.operation,
+        schema_version: request.schema_version,
+        source: &request.source,
+        site: &request.site,
+        rows: &request.rows,
+        direction: &request.direction,
+        direction_source_sha256: &request.direction_source_sha256,
+        controls: &request.controls,
+    };
+    hash.update(&serde_json::to_vec(&hash_view).map_err(|error| error.to_string())?)?;
     hash.finalize_hex()
 }
 
@@ -376,27 +400,76 @@ fn direction(request: &Request) -> crate::Result<Value> {
     )
 }
 
-fn diagnostics(request: &Request, factors: &[f32]) -> Vec<Value> {
-    request
-        .rows
-        .iter()
-        .map(|row| {
-            let push = row
-                .activation
-                .iter()
-                .zip(factors)
-                .map(|(&activation, &factor)| f64::from(activation) * f64::from(factor))
-                .sum::<f64>();
-            let violation = match row.label {
-                Label::Target => (push + request.controls.delta).max(0.0),
-                Label::Preserve => (push.abs() - request.controls.epsilon).max(0.0),
-            };
-            json!({"sampleId":row.sample_id,"groupId":row.group_id,"tokenIndex":row.token_index,
-            "split":if row.split == Split::Fit {"fit"} else {"holdout"},
-            "label":if row.label == Label::Target {"target"} else {"preserve"},
-            "scalarPush":push,"constraintViolation":violation})
-        })
-        .collect()
+fn diagnostics(request: &Request, factors: &[f32]) -> crate::Result<(Vec<Value>, Value)> {
+    let mut entries = Vec::with_capacity(request.rows.len());
+    let mut violated_rows = 0_u32;
+    let mut max_violation = 0.0_f64;
+    for (index, row) in request.rows.iter().enumerate() {
+        let push = row
+            .activation
+            .iter()
+            .zip(factors)
+            .map(|(&activation, &factor)| f64::from(activation) * f64::from(factor))
+            .sum::<f64>();
+        let violation = match row.label {
+            Label::Target => (push + request.controls.delta).max(0.0),
+            Label::Preserve => (push.abs() - request.controls.epsilon).max(0.0),
+        };
+        if !push.is_finite() || !violation.is_finite() {
+            return Err("Nonfinite row scalar diagnostic in weight-patch.".into());
+        }
+        if violation > 0.0 {
+            violated_rows = violated_rows
+                .checked_add(1)
+                .ok_or("Violated row count overflow.")?;
+        }
+        max_violation = max_violation.max(violation);
+        entries.push((
+            index,
+            violation,
+            json!({
+                "sampleId": row.sample_id,
+                "groupId": row.group_id,
+                "tokenIndex": row.token_index,
+                "split": if row.split == Split::Fit { "fit" } else { "holdout" },
+                "label": if row.label == Label::Target { "target" } else { "preserve" },
+                "scalarPush": push,
+                "constraintViolation": violation
+            }),
+        ));
+    }
+    let total_rows = request.rows.len();
+    if entries.len() > MAX_VIOLATION_REPORT_ROWS {
+        entries.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        entries.truncate(MAX_VIOLATION_REPORT_ROWS);
+        entries.sort_by_key(|entry| entry.0);
+    }
+    let reported_rows = entries.len();
+    let omitted_rows = total_rows.saturating_sub(reported_rows);
+    let factors_f64: Vec<f64> = factors.iter().copied().map(f64::from).collect();
+    let factors_l2_norm = crate::calibration_metrics::scaled_l2_norm(&factors_f64)?;
+    let factors_energy_entropy =
+        crate::calibration_metrics::normalized_energy_entropy(&factors_f64)?;
+    let factors_coordinate_coverage =
+        crate::calibration_metrics::coordinate_coverage(&factors_f64)?;
+    let rows = entries.into_iter().map(|(_, _, value)| value).collect();
+    let summary = json!({
+        "totalRows": total_rows,
+        "reportedRows": reported_rows,
+        "omittedRows": omitted_rows,
+        "reportedRowLimit": MAX_VIOLATION_REPORT_ROWS,
+        "violatedRows": violated_rows,
+        "maxConstraintViolation": max_violation,
+        "factorsL2Norm": factors_l2_norm,
+        "factorsEnergyEntropy": factors_energy_entropy,
+        "factorsCoordinateCoverage": factors_coordinate_coverage
+    });
+    Ok((rows, summary))
 }
 
 pub(crate) fn publish(path: &Path, bytes: &[u8]) -> crate::Result<()> {
@@ -451,6 +524,7 @@ fn fit(request: &Request) -> crate::Result<Value> {
         })
         .collect();
     let solution = solver::solve(&rows, request.controls.validated()?)?;
+    let (reported_rows, row_summary) = diagnostics(request, &solution.factors)?;
     let mut report = json!({"schemaVersion":1,"status":solution.status,
         "iterations":solution.iterations,"optimizationCertificate":{
             "kind":"conservative-floating-point-primal-dual-gap",
@@ -461,7 +535,7 @@ fn fit(request: &Request) -> crate::Result<Value> {
             "dualGradientMaximum":solution.certificate.dual_gradient_max,
             "dualWeights":solution.certificate.dual_weights,
             "evaluatedFactors":"F32-le","lambda":request.controls.lambda},
-        "rows":diagnostics(request,&solution.factors),"holdoutUsedForFit":false,
+        "rows":reported_rows,"rowSummary":row_summary,"published":false,"holdoutUsedForFit":false,
         "sourceAuthenticated":false,"behaviorQualified":false,"installed":false,
         "limits":{"maxRows":MAX_ROWS,"timeBudgetMilliseconds":request.controls.time_budget_milliseconds,
             "maxCellVisits":500_000_000},"artifact":null});
@@ -479,7 +553,7 @@ fn fit(request: &Request) -> crate::Result<Value> {
     if let Some(path) = &request.output_path {
         let bytes = serde_json::to_vec_pretty(&artifact).map_err(|error| error.to_string())?;
         publish(path, &bytes)?;
-        report["outputPath"] = json!(path);
+        report["published"] = json!(true);
         let mut hash = crate::identity::Hasher::new()?;
         hash.update(&bytes)?;
         report["artifactSha256"] = json!(hash.finalize_hex()?);

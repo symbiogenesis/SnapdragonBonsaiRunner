@@ -176,3 +176,41 @@ fn edited_adapter_publication_never_overwrites_existing_output() -> Result<()> {
     result?;
     cleanup.map_err(|error| error.to_string())
 }
+
+#[test]
+fn adapter_edit_receipt_omits_local_paths_and_emits_published_status_and_digest() -> Result<()> {
+    let inspect = receipt(
+        &"0".repeat(64),
+        128,
+        1,
+        2,
+        false,
+        json!({"changedCoefficients": 4}),
+    );
+    let object = inspect
+        .as_object()
+        .ok_or("Missing adapter edit receipt object.")?;
+    assert!(object.get("sourceAdapterPath").is_none());
+    assert!(object.get("outputPath").is_none());
+    assert_eq!(inspect["published"], false);
+    assert_eq!(inspect["candidateBytes"], 128);
+    assert_eq!(inspect["sourceAdapterSha256"], ADAPTER_SHA256);
+
+    let published = receipt(
+        &"1".repeat(64),
+        256,
+        1,
+        2,
+        true,
+        json!({"changedCoefficients": 4}),
+    );
+    assert_eq!(published["published"], true);
+    assert!(
+        published
+            .as_object()
+            .ok_or("Missing published adapter edit receipt object.")?
+            .get("outputPath")
+            .is_none()
+    );
+    Ok(())
+}

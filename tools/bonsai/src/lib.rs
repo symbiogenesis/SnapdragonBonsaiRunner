@@ -114,6 +114,9 @@ pub mod qualification;
 /// Offline, source-bound research fitting for independent rank-one FFN patches.
 pub mod weight_patch;
 
+/// Scaled floating-point calibration, directional alignment and dispersion metrics.
+pub mod calibration_metrics;
+
 /// Offline bounded low-rank fitting of a complete FFN branch replacement.
 pub mod ffn_surrogate;
 

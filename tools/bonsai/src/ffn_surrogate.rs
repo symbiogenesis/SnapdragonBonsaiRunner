@@ -95,6 +95,16 @@ struct Request {
     output_path: Option<PathBuf>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FitInputHashView<'a> {
+    schema_version: u32,
+    source: &'a Source,
+    site: &'a Site,
+    rows: &'a [Row],
+    controls: &'a Controls,
+}
+
 fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
 }
@@ -265,7 +275,14 @@ pub fn run(request: Value) -> crate::Result<Value> {
     let mut work = solution.work;
     let diagnostics =
         solver::diagnostics(&request.rows, &solution.a, &solution.b, deadline, &mut work)?;
-    let request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let hash_view = FitInputHashView {
+        schema_version: request.schema_version,
+        source: &request.source,
+        site: &request.site,
+        rows: &request.rows,
+        controls: &request.controls,
+    };
+    let request_bytes = serde_json::to_vec(&hash_view).map_err(|error| error.to_string())?;
     let effective_rank = solution.a.len();
     let artifact = json!({"schemaVersion":1,"kind":"experimental-whole-ffn-surrogate-v1",
         "enabled":false,"qualification":"unqualified-research-only","source":request.source,
@@ -285,7 +302,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
     }
     Ok(
         json!({"schemaVersion":1,"status":"fitted-unqualified","artifact":artifact,
-        "artifactSha256":artifact_sha256,"outputPath":request.output_path,
+        "artifactSha256":artifact_sha256,"published":request.output_path.is_some(),
         "diagnostics":diagnostics,"diagnosticArithmetic":"F64 reduction of exported F32 factors; not a runtime parity oracle",
         "requestedRank":request.controls.rank,"effectiveRank":effective_rank,
         "factorPayloadBytes":effective_rank * WIDTH * 2 * 4,

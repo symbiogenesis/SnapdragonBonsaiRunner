@@ -12,6 +12,29 @@ const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WEIGHT_PATCH_REQUEST_BYTES: u64 = 48 * 1024 * 1024;
 // Legacy scoring permits 24 responses of 1 Mi UTF-16 units, including JSON escapes.
 const MAX_QUALIFICATION_REQUEST_BYTES: u64 = 160 * 1024 * 1024;
+const MAX_JSON_PARSE_ERROR_BYTES: usize = 256;
+
+pub(crate) fn bounded_json_error(error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "I/O failure",
+        serde_json::error::Category::Syntax => "syntax error",
+        serde_json::error::Category::Data => "data error",
+        serde_json::error::Category::Eof => "unexpected end of input",
+    };
+    let mut message = format!(
+        "Invalid JSON command request ({category} at line {}, column {}).",
+        error.line(),
+        error.column()
+    );
+    if message.len() > MAX_JSON_PARSE_ERROR_BYTES {
+        let mut end = MAX_JSON_PARSE_ERROR_BYTES;
+        while end > 0 && !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
 
 fn decode(reader: impl Read, maximum: u64) -> crate::Result<Value> {
     let mut bytes = Vec::new();
@@ -22,7 +45,8 @@ fn decode(reader: impl Read, maximum: u64) -> crate::Result<Value> {
     if u64::try_from(bytes.len()).map_err(|error| error.to_string())? > maximum {
         return Err(format!("Command request exceeds {maximum} bytes."));
     }
-    let request: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let request: Value =
+        serde_json::from_slice(&bytes).map_err(|error| bounded_json_error(&error))?;
     if !request.is_object() {
         return Err("Command request must be a JSON object.".into());
     }
@@ -271,6 +295,14 @@ mod tests {
             assert!(decode(bytes, 8).is_err());
         }
         assert!(decode(&b"{}"[..], 1).is_err());
+
+        let secret_payload = br#"{"token":"SUPER_SECRET_SCALAR_VALUE_DO_NOT_ECHO" bad"#;
+        let error = decode(&secret_payload[..], 1024)
+            .err()
+            .ok_or("Expected malformed JSON error.")?;
+        assert!(error.len() <= MAX_JSON_PARSE_ERROR_BYTES);
+        assert!(!error.contains("SUPER_SECRET_SCALAR_VALUE_DO_NOT_ECHO"));
+        assert!(error.contains("line 1"));
         Ok(())
     }
 

@@ -66,8 +66,71 @@ struct Manifest {
     files: Vec<Entry>,
 }
 
+fn contains_local_path_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (index, _) in bytes.iter().enumerate() {
+        let tail = &bytes[index..];
+        let prev = index.checked_sub(1).map(|i| bytes[i]);
+        let drive = tail.len() >= 3
+            && tail[0].is_ascii_alphabetic()
+            && tail[1] == b':'
+            && matches!(tail[2], b'\\' | b'/')
+            && prev.is_none_or(|byte| !byte.is_ascii_alphanumeric());
+        let unc = tail.len() >= 3
+            && tail[0] == b'\\'
+            && tail[1] == b'\\'
+            && !tail[2].is_ascii_whitespace()
+            && !tail[2].is_ascii_control()
+            && tail[2] != b'\\';
+        let file_url = tail.len() >= 7 && tail[..7].eq_ignore_ascii_case(b"file://");
+        let posix_home = prev.is_none_or(|byte| {
+            matches!(
+                byte,
+                b' ' | b'\t'
+                    | b'\n'
+                    | b'\r'
+                    | b'"'
+                    | b'\''
+                    | b'`'
+                    | b'='
+                    | b'('
+                    | b'['
+                    | b'<'
+                    | b','
+                    | b';'
+                    | b':'
+            )
+        }) && ((tail.len() >= 7 && tail[..7].eq_ignore_ascii_case(b"/users/"))
+            || (tail.len() >= 6 && tail[..6].eq_ignore_ascii_case(b"/home/")));
+        if drive || unc || file_url || posix_home {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_local_path(value: &Value) -> bool {
+    match value {
+        Value::String(text) => contains_local_path_text(text),
+        Value::Array(items) => items.iter().any(contains_local_path),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| contains_local_path_text(key) || contains_local_path(item)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn safe_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    if contains_local_path_text(&message) {
+        "Evidence archive operation failed without disclosing local paths.".into()
+    } else {
+        message
+    }
+}
+
 fn external(path: &Path) -> crate::Result<()> {
-    validate_external_path(path).map_err(|error| error.to_string())
+    validate_external_path(path).map_err(safe_error)
 }
 
 fn safe_name(name: &str) -> bool {
@@ -115,11 +178,12 @@ fn validate(manifest: &Manifest) -> crate::Result<u64> {
             .identities
             .as_object()
             .is_none_or(serde_json::Map::is_empty)
+        || contains_local_path(&manifest.identities)
         || manifest.files.is_empty()
         || manifest.files.len() > ENTRY_LIMIT
     {
         return Err(
-            "A reviewed credential-free selection and exact capture identities are required."
+            "A reviewed credential-free selection and path-free capture identities are required."
                 .into(),
         );
     }
@@ -164,17 +228,17 @@ fn read_manifest(
     let mut directories = BTreeMap::new();
     hold_directories(directory, &mut directories)?;
     let path = directory.join(MANIFEST);
-    let input = open_locked_file(&path).map_err(|error| error.to_string())?;
+    let input = open_locked_file(&path).map_err(safe_error)?;
     let mut bytes = Vec::new();
     input
         .take(MANIFEST_LIMIT + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+        .map_err(safe_error)?;
     let length = u64::try_from(bytes.len()).map_err(|_| "Evidence manifest length overflow.")?;
     if length > MANIFEST_LIMIT || sha256(&bytes) != digest {
         return Err("Evidence manifest differs from its independently retained identity.".into());
     }
-    let guard = VerifiedFile::verify(&path, length, digest).map_err(|error| error.to_string())?;
+    let guard = VerifiedFile::verify(&path, length, digest).map_err(safe_error)?;
     let manifest = serde_json::from_slice(&bytes).map_err(|_| "Invalid evidence manifest.")?;
     Ok((
         bytes,
@@ -198,8 +262,8 @@ fn inventory(directory: &Path, manifest: &Manifest) -> crate::Result<()> {
     let mut pending = vec![PathBuf::new()];
     while let Some(relative) = pending.pop() {
         external(&directory.join(&relative))?;
-        for entry in fs::read_dir(directory.join(&relative)).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(directory.join(&relative)).map_err(safe_error)? {
+            let entry = entry.map_err(safe_error)?;
             let path = relative.join(entry.file_name());
             let name = path
                 .to_str()
@@ -208,7 +272,7 @@ fn inventory(directory: &Path, manifest: &Manifest) -> crate::Result<()> {
             if !expected.contains(&name) || !seen.insert(name) {
                 return Err("Evidence archive contains unexpected or duplicate entries.".into());
             }
-            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(safe_error)?;
             if bonsai_artifacts::is_redirect(&metadata) {
                 return Err("Evidence archive contains a redirected path.".into());
             }
@@ -240,10 +304,7 @@ fn guards(directory: &Path, manifest: &Manifest) -> crate::Result<SelectionGuard
             path.parent().ok_or("Missing evidence parent.")?,
             &mut directories,
         )?;
-        files.push(
-            VerifiedFile::verify(&path, entry.bytes, &entry.sha256)
-                .map_err(|error| error.to_string())?,
-        );
+        files.push(VerifiedFile::verify(&path, entry.bytes, &entry.sha256).map_err(safe_error)?);
     }
     Ok(SelectionGuards {
         _files: files,
@@ -260,7 +321,7 @@ fn create(path: &Path) -> crate::Result<File> {
         use std::os::windows::fs::OpenOptionsExt as _;
         options.share_mode(0).custom_flags(0x0020_0000);
     }
-    options.open(path).map_err(|error| error.to_string())
+    options.open(path).map_err(safe_error)
 }
 
 fn hold_directories(path: &Path, handles: &mut BTreeMap<PathBuf, File>) -> crate::Result<()> {
@@ -283,8 +344,8 @@ fn hold_directories(path: &Path, handles: &mut BTreeMap<PathBuf, File>) -> crate
                 .share_mode(1)
                 .custom_flags(0x0220_0000);
         }
-        let directory = options.open(ancestor).map_err(|error| error.to_string())?;
-        let metadata = directory.metadata().map_err(|error| error.to_string())?;
+        let directory = options.open(ancestor).map_err(safe_error)?;
+        let metadata = directory.metadata().map_err(safe_error)?;
         if !metadata.is_dir() || bonsai_artifacts::is_redirect(&metadata) {
             return Err("Evidence destination ancestry must contain ordinary directories.".into());
         }
@@ -313,15 +374,15 @@ fn copy(directory: &Path, output: &Path, bytes: &[u8], manifest: &Manifest) -> c
     hold_directories(parent, &mut directory_guards)?;
     // Resolve existing ancestry before comparison, including Windows short-name
     // aliases and the actual filesystem's case spelling. The output leaf is new.
-    let source_identity = fs::canonicalize(directory).map_err(|error| error.to_string())?;
+    let source_identity = fs::canonicalize(directory).map_err(safe_error)?;
     let output_identity = fs::canonicalize(parent)
-        .map_err(|error| error.to_string())?
+        .map_err(safe_error)?
         .join(output.file_name().ok_or("Missing output directory name.")?);
     if !separate_trees(&source_identity, &output_identity) {
         return Err("Evidence source and destination must be separate directory trees.".into());
     }
     // A fresh directory and create_new files preserve every existing backup.
-    fs::create_dir(output).map_err(|error| error.to_string())?;
+    fs::create_dir(output).map_err(safe_error)?;
     hold_directories(output, &mut directory_guards)?;
     for entry in &manifest.files {
         let mut parent = output.to_owned();
@@ -332,22 +393,19 @@ fn copy(directory: &Path, output: &Path, bytes: &[u8], manifest: &Manifest) -> c
             match fs::create_dir(&parent) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(safe_error(error)),
             }
             // Hold every new level before creating its descendants.
             hold_directories(&parent, &mut directory_guards)?;
         }
         let path = output.join(&entry.path);
-        let mut source =
-            open_locked_file(&directory.join(&entry.path)).map_err(|error| error.to_string())?;
+        let mut source = open_locked_file(&directory.join(&entry.path)).map_err(safe_error)?;
         let mut destination = create(&path)?;
         let mut digest = Hasher::new()?;
         let mut remaining = entry.bytes;
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
-            let count = source
-                .read(&mut buffer)
-                .map_err(|error| error.to_string())?;
+            let count = source.read(&mut buffer).map_err(safe_error)?;
             if count == 0 {
                 break;
             }
@@ -356,26 +414,24 @@ fn copy(directory: &Path, output: &Path, bytes: &[u8], manifest: &Manifest) -> c
                 .ok_or("Evidence input grew during copying.")?;
             destination
                 .write_all(&buffer[..count])
-                .map_err(|error| error.to_string())?;
+                .map_err(safe_error)?;
             digest.update(&buffer[..count])?;
         }
         if remaining != 0 || digest.finalize_hex()? != entry.sha256 {
             return Err("Evidence copy differs from the selected identity.".into());
         }
-        destination.sync_all().map_err(|error| error.to_string())?;
+        destination.sync_all().map_err(safe_error)?;
     }
     // Publish the success marker last. Failed copies remain unsealed for diagnosis.
     let mut destination = create(&output.join(MANIFEST))?;
-    destination
-        .write_all(bytes)
-        .map_err(|error| error.to_string())?;
-    destination.sync_all().map_err(|error| error.to_string())
+    destination.write_all(bytes).map_err(safe_error)?;
+    destination.sync_all().map_err(safe_error)
 }
 
-fn receipt(directory: &Path, digest: &str, manifest: &Manifest) -> crate::Result<Value> {
+fn receipt(digest: &str, manifest: &Manifest) -> crate::Result<Value> {
     Ok(
         json!({"schemaVersion":1,"kind":"bonsai-qualification-evidence-integrity",
-        "directory":directory,"manifestSha256":digest,"files":manifest.files.len(),
+        "manifestSha256":digest,"files":manifest.files.len(),
         "bytes":validate(manifest)?,"identities":manifest.identities,"integrityVerified":true,
         "qualificationGranted":false,"defaultPromotionQualified":false,
         "scope":"Exact selected bytes and archive inventory only. The caller must retain this digest separately and arrange durable storage; this is no execution, provenance, human-review or promotion verdict."}),
@@ -395,7 +451,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
     if !cfg!(windows) {
         return Err("Evidence archival requires Windows file and ancestor guards.".into());
     }
-    match serde_json::from_value(request).map_err(|error| error.to_string())? {
+    match serde_json::from_value(request).map_err(|error| crate::cli::bounded_json_error(&error))? {
         Request::Seal {
             source,
             output,
@@ -423,14 +479,14 @@ pub fn run(request: Value) -> crate::Result<Value> {
             let _copied = guards(&output, &manifest)?;
             let digest = sha256(&bytes);
             let (_bytes, _manifest, _manifest_guard) = read_manifest(&output, &digest)?;
-            receipt(&output, &digest, &manifest)
+            receipt(&digest, &manifest)
         }
         Request::Verify { directory, digest } => {
             let (_bytes, manifest, _manifest_guard) = read_manifest(&directory, &digest)?;
             validate(&manifest)?;
             let _guards = guards(&directory, &manifest)?;
             inventory(&directory, &manifest)?;
-            receipt(&directory, &digest, &manifest)
+            receipt(&digest, &manifest)
         }
         Request::Restore {
             directory,
@@ -445,7 +501,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
             let _copied = guards(&output, &manifest)?;
             inventory(&output, &manifest)?;
             let (_bytes, _manifest, _copied_manifest_guard) = read_manifest(&output, &digest)?;
-            receipt(&output, &digest, &manifest)
+            receipt(&digest, &manifest)
         }
     }
 }
@@ -653,5 +709,68 @@ mod tests {
         fs::write(manifest, bytes).map_err(|error| error.to_string())?;
         assert!(run(request).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn evidence_archive_rejects_local_user_and_unc_paths_in_identities_and_errors() {
+        for bad_identity in [
+            json!({"source": r"C:\Users\alice\evidence"}),
+            json!({"nested": ["ok", r"\\server\share\logs"]}),
+            json!({"macPath": "/Users/alice/tmp/run.json"}),
+            json!({"linuxPath": "/home/bob/.cache/model"}),
+            json!({r"C:\Users\alice": "ok"}),
+            json!({"url": "file:///Users/alice/archive.json"}),
+        ] {
+            let manifest = Manifest {
+                schema_version: 1,
+                kind: "bonsai-qualification-evidence".into(),
+                credential_free_selection_reviewed: true,
+                identities: bad_identity,
+                files: vec![Entry {
+                    path: "summary.json".into(),
+                    bytes: 0,
+                    sha256: sha256(b""),
+                }],
+            };
+            assert!(validate(&manifest).is_err());
+        }
+
+        let valid_url = Manifest {
+            schema_version: 1,
+            kind: "bonsai-qualification-evidence".into(),
+            credential_free_selection_reviewed: true,
+            identities: json!({"runUrl": "https://github.com/org/repo/actions/runs/123"}),
+            files: vec![Entry {
+                path: "summary.json".into(),
+                bytes: 0,
+                sha256: sha256(b""),
+            }],
+        };
+        assert!(validate(&valid_url).is_ok());
+
+        let receipt_value = receipt(&sha256(b""), &valid_url).ok();
+        assert!(receipt_value.is_some());
+        if let Some(value) = receipt_value {
+            assert!(
+                value
+                    .as_object()
+                    .is_some_and(|obj| !obj.contains_key("directory"))
+            );
+        }
+
+        let redacted = safe_error(r"open failed at C:\Users\alice\secret.json");
+        assert!(!redacted.contains("Alice"));
+        assert!(!redacted.contains("alice"));
+        assert!(!redacted.contains(r"C:\Users"));
+
+        if cfg!(windows) {
+            let err = run(json!({
+                "operation": "bad-op-C:\\Users\\alice\\secret",
+                "directory": r"C:\Temp\x"
+            }))
+            .err()
+            .unwrap_or_default();
+            assert!(!err.contains("alice"));
+        }
     }
 }

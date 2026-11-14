@@ -381,3 +381,26 @@ fn missing_log_stays_incomplete_and_invalid_requests_never_reflect_values() -> c
     );
     Ok(())
 }
+
+#[test]
+fn sanitization_redacts_local_user_and_unc_paths_in_single_pass_preserving_urls() {
+    let keys = vec!["a".repeat(64)];
+    let sample = format!(
+        "path=C:\\Users\\Alice\\secret.json quoted=\"c:/Users/Bob Smith/log.txt\" unc=\\\\fileserver\\share\\drop mac=(/Users/alice/tmp) linux=/home/bob/.ssh url=https://example.com/home/docs key={}",
+        "A".repeat(64)
+    );
+    let sanitized = sanitize(&sample, &keys);
+    assert!(!sanitized.contains("Alice"));
+    assert!(!sanitized.contains("Bob Smith"));
+    assert!(!sanitized.contains("fileserver"));
+    assert!(!sanitized.contains("alice"));
+    assert!(!sanitized.contains(".ssh"));
+    assert!(!sanitized.to_ascii_lowercase().contains(&"a".repeat(64)));
+    assert!(sanitized.contains("path=[REDACTED]"));
+    assert!(sanitized.contains("quoted=\"[REDACTED]\""));
+    assert!(sanitized.contains("unc=[REDACTED]"));
+    assert!(sanitized.contains("mac=([REDACTED])"));
+    assert!(sanitized.contains("linux=[REDACTED]"));
+    assert!(sanitized.contains("url=https://example.com/home/docs"));
+    assert!(sanitized.contains("key=[REDACTED]"));
+}

@@ -161,3 +161,70 @@ fn rejects_zero_targets_and_expired_time_or_work() -> crate::Result<()> {
     assert!(solver::charge(&mut work, 1, Instant::now() + Duration::from_secs(1)).is_err());
     Ok(())
 }
+
+#[test]
+fn fit_input_hash_and_receipt_omit_output_path_and_report_calibration_metrics() -> crate::Result<()>
+{
+    let baseline = run(fixture())?;
+    assert_eq!(baseline["published"], false);
+    assert!(
+        baseline
+            .as_object()
+            .ok_or("Missing surrogate receipt object.")?
+            .get("outputPath")
+            .is_none()
+    );
+    let dev = &baseline["diagnostics"]["development"];
+    assert!(
+        dev["worstRowRelativeL2Error"]
+            .as_f64()
+            .is_some_and(|v| v < 1e-5)
+    );
+    assert!(
+        dev["meanCosineSimilarity"]
+            .as_f64()
+            .is_some_and(|v| v > 0.999_999)
+    );
+    assert!(
+        dev["minCosineSimilarity"]
+            .as_f64()
+            .is_some_and(|v| v > 0.999_999)
+    );
+    assert!(
+        dev["meanOutputEnergyEntropy"]
+            .as_f64()
+            .is_some_and(|v| (0.0..=1.0).contains(&v))
+    );
+    assert!(
+        dev["meanOutputCoordinateCoverage"]
+            .as_f64()
+            .is_some_and(|v| (0.0..=1.0).contains(&v))
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "bonsai-ffn-surrogate-pathfree-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let out_path = dir.join("surrogate.json");
+    let mut with_output = fixture();
+    with_output["outputPath"] = json!(out_path);
+    let published = run(with_output);
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_dir(&dir);
+    let published = published?;
+    assert_eq!(published["published"], true);
+    assert!(
+        published
+            .as_object()
+            .ok_or("Missing published surrogate receipt object.")?
+            .get("outputPath")
+            .is_none()
+    );
+    assert_eq!(
+        baseline["artifact"]["fitInputSha256"],
+        published["artifact"]["fitInputSha256"]
+    );
+    assert_eq!(baseline["artifactSha256"], published["artifactSha256"]);
+    Ok(())
+}

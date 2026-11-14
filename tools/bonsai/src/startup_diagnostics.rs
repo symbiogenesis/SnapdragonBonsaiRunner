@@ -199,47 +199,133 @@ fn contains_key(text: &str, keys: &[String]) -> bool {
     })
 }
 
-fn replace_key(text: &str, key: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut remaining = text;
-    while let Some(index) = remaining
-        .as_bytes()
-        .windows(key.len())
-        .position(|part| part.eq_ignore_ascii_case(key.as_bytes()))
-    {
-        // Matched ASCII key bytes always begin/end on UTF-8 character boundaries.
-        output.push_str(&remaining[..index]);
-        output.push_str("[REDACTED]");
-        remaining = &remaining[index + key.len()..];
+fn is_path_delimiter_before(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\t'
+            | b'\n'
+            | b'\r'
+            | b'"'
+            | b'\''
+            | b'`'
+            | b'='
+            | b'('
+            | b'['
+            | b'{'
+            | b'<'
+            | b','
+            | b';'
+            | b':'
+    )
+}
+
+fn path_value_stop(tail: &[u8], opener: Option<u8>) -> usize {
+    tail.iter()
+        .position(|&byte| match opener {
+            Some(quote) => {
+                byte == quote || matches!(byte, b'\r' | b'\n') || byte.is_ascii_control()
+            }
+            None => {
+                byte.is_ascii_whitespace()
+                    || byte.is_ascii_control()
+                    || matches!(
+                        byte,
+                        b'"' | b'\'' | b'`' | b'<' | b'>' | b')' | b']' | b'}' | b',' | b';'
+                    )
+            }
+        })
+        .unwrap_or(tail.len())
+}
+
+fn local_path_len(bytes: &[u8], index: usize) -> Option<usize> {
+    let prev = index.checked_sub(1).map(|i| bytes[i]);
+    if !prev.is_none_or(is_path_delimiter_before) {
+        return None;
     }
-    output.push_str(remaining);
-    output
+    let tail = &bytes[index..];
+    let is_windows_user = tail.len() >= 8
+        && tail[0].is_ascii_alphabetic()
+        && tail[1] == b':'
+        && matches!(tail[2], b'\\' | b'/')
+        && tail[3..8].eq_ignore_ascii_case(b"users")
+        && tail.get(8).is_none_or(|&byte| {
+            matches!(byte, b'\\' | b'/') || byte.is_ascii_whitespace() || byte.is_ascii_control()
+        });
+    let is_unc = tail.len() >= 3
+        && tail[0] == b'\\'
+        && tail[1] == b'\\'
+        && !tail[2].is_ascii_whitespace()
+        && !tail[2].is_ascii_control()
+        && tail[2] != b'\\';
+    let is_posix_home = (tail.len() >= 7 && tail[..7].eq_ignore_ascii_case(b"/users/"))
+        || (tail.len() >= 6 && tail[..6].eq_ignore_ascii_case(b"/home/"));
+    if !(is_windows_user || is_unc || is_posix_home) {
+        return None;
+    }
+    let opener = prev.filter(|&byte| byte == b'"' || byte == b'\'');
+    let len = path_value_stop(tail, opener);
+    (len > 0).then_some(len)
+}
+
+fn custom_key_match_len(bytes: &[u8], keys: &[String]) -> Option<usize> {
+    keys.iter()
+        .filter(|key| !key.is_empty())
+        .filter_map(|key| {
+            let key_bytes = key.as_bytes();
+            (bytes.len() >= key_bytes.len()
+                && bytes[..key_bytes.len()].eq_ignore_ascii_case(key_bytes))
+            .then_some(key_bytes.len())
+        })
+        .max()
 }
 
 fn sanitize(text: &str, keys: &[String]) -> String {
-    let mut text = text.to_owned();
-    for key in keys {
-        text = replace_key(&text, key);
-    }
+    let bytes = text.as_bytes();
+    let check_custom_keys = keys.iter().any(|key| {
+        !key.is_empty() && (key.len() < 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    });
     let mut output = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character.is_ascii_hexdigit() {
-            let mut run = String::from(character);
-            while characters.peek().is_some_and(char::is_ascii_hexdigit) {
-                if let Some(next) = characters.next() {
-                    run.push(next);
-                }
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(path_len) = local_path_len(bytes, index) {
+            output.push_str("[REDACTED]");
+            index += path_len;
+            continue;
+        }
+        if check_custom_keys && let Some(key_len) = custom_key_match_len(&bytes[index..], keys) {
+            output.push_str("[REDACTED]");
+            index += key_len;
+            continue;
+        }
+        let byte = bytes[index];
+        if byte.is_ascii_hexdigit() {
+            let mut run_len = 1;
+            while index + run_len < bytes.len() && bytes[index + run_len].is_ascii_hexdigit() {
+                run_len += 1;
             }
-            if run.len() >= 64 {
+            if run_len >= 64 {
                 output.push_str("[REDACTED]");
-            } else {
-                output.push_str(&run);
+                index += run_len;
+                continue;
             }
-        } else if character.is_ascii_control() && !matches!(character, '\t' | '\n' | '\r') {
-            output.push('?');
-        } else {
+            if !check_custom_keys {
+                output.push_str(&text[index..index + run_len]);
+                index += run_len;
+                continue;
+            }
+        }
+        if byte < 0x80 {
+            if byte.is_ascii_control() && !matches!(byte, b'\t' | b'\n' | b'\r') {
+                output.push('?');
+            } else {
+                output.push(char::from(byte));
+            }
+            index += 1;
+        } else if let Some(character) = text[index..].chars().next() {
             output.push(character);
+            index += character.len_utf8();
+        } else {
+            break;
         }
     }
     output

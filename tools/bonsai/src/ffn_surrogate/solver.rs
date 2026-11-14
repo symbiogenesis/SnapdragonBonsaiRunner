@@ -273,37 +273,57 @@ pub(super) fn diagnostics(
     deadline: Instant,
     work: &mut u64,
 ) -> crate::Result<serde_json::Value> {
-    let mut totals = [(0_u32, 0.0, 0.0), (0_u32, 0.0, 0.0)];
+    let mut totals = [
+        (
+            0_u32,
+            0.0,
+            0.0,
+            crate::calibration_metrics::RowMetricsAccumulator::new(),
+        ),
+        (
+            0_u32,
+            0.0,
+            0.0,
+            crate::calibration_metrics::RowMetricsAccumulator::new(),
+        ),
+    ];
     for row in rows {
         let prediction = prediction(&row.input, a, b, deadline, work)?;
+        let target: Vec<f64> = row.target.iter().copied().map(f64::from).collect();
         let squared_error = prediction
             .iter()
-            .zip(&row.target)
-            .map(|(&value, &target)| (value - f64::from(target)).powi(2))
+            .zip(&target)
+            .map(|(&value, &target)| (value - target).powi(2))
             .sum::<f64>();
-        let energy = row
-            .target
-            .iter()
-            .map(|&value| f64::from(value).powi(2))
-            .sum::<f64>();
+        let energy = target.iter().map(|&value| value.powi(2)).sum::<f64>();
         charge(work, row.target.len() * 2, deadline)?;
         let total = &mut totals[usize::from(row.split == Split::Development)];
         total.0 += 1;
         total.1 += squared_error;
         total.2 += energy;
+        total.3.record_pair(&target, &prediction)?;
     }
     let mut result = serde_json::Map::new();
-    for (name, (count, error, energy)) in ["fit", "development"].into_iter().zip(totals) {
+    for (name, (count, error, energy, replay)) in ["fit", "development"].into_iter().zip(totals) {
         if !error.is_finite() || !energy.is_finite() {
             return Err("Nonfinite exported-factor diagnostics.".into());
         }
         let cells = f64::from(count)
             * f64::from(u32::try_from(rows[0].target.len()).map_err(|error| error.to_string())?);
+        let summary = replay.finish();
         result.insert(
             name.into(),
-            serde_json::json!({"rows":count,"meanSquaredError":error / cells,
-            "zeroBranchMeanSquaredError":energy / cells,
-            "relativeSquaredError":if energy > 0.0 {Some(error / energy)} else {None}}),
+            serde_json::json!({
+                "rows": count,
+                "meanSquaredError": error / cells,
+                "zeroBranchMeanSquaredError": energy / cells,
+                "relativeSquaredError": if energy > 0.0 { Some(error / energy) } else { None },
+                "worstRowRelativeL2Error": summary.worst_row_relative_l2_error,
+                "meanCosineSimilarity": summary.mean_cosine_similarity,
+                "minCosineSimilarity": summary.min_cosine_similarity,
+                "meanOutputEnergyEntropy": summary.mean_candidate_energy_entropy,
+                "meanOutputCoordinateCoverage": summary.mean_candidate_coordinate_coverage
+            }),
         );
     }
     Ok(result.into())

@@ -50,6 +50,8 @@ pub(super) fn diagnostics(
         let output = branch(&row.input, &row.retained_branch, solution, deadline, work)?;
         let total = &mut totals[usize::from(row.split == Split::Development)];
         total.rows += 1;
+        let mut teacher_vec = Vec::with_capacity(row.teacher_target.len());
+        let mut output_vec = Vec::with_capacity(output.len());
         for (((&teacher, &retained), &original), &output) in row
             .teacher_target
             .iter()
@@ -61,6 +63,8 @@ pub(super) fn diagnostics(
             let retained = f64::from(retained);
             let original = f64::from(original);
             let output = f64::from(output);
+            teacher_vec.push(teacher);
+            output_vec.push(output);
             total.teacher_energy += teacher.powi(2);
             total.original_teacher_energy += original.powi(2);
             total.uncompensated_error += (teacher - retained).powi(2);
@@ -68,6 +72,9 @@ pub(super) fn diagnostics(
             total.prefix_drift += (teacher - original).powi(2);
             total.original_prefix_error += (output - original).powi(2);
         }
+        total
+            .replay_metrics
+            .record_pair(&teacher_vec, &output_vec)?;
         solver::charge(work, WIDTH * 6, deadline)?;
     }
     let result = super::summarize(&totals)?;

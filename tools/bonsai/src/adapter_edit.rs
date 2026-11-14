@@ -262,6 +262,37 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+fn receipt(
+    candidate_sha256: &str,
+    candidate_bytes: usize,
+    keep_numerator: usize,
+    keep_denominator: usize,
+    published: bool,
+    weight_edit: Value,
+) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "kind": "experimental-edited-rank-one-adapter",
+        "algorithm": ALGORITHM,
+        "sourceAdapterSha256": ADAPTER_SHA256,
+        "candidateSha256": candidate_sha256,
+        "candidateBytes": candidate_bytes,
+        "keepNumerator": keep_numerator,
+        "keepDenominator": keep_denominator,
+        "published": published,
+        "weightEdit": weight_edit,
+        "all129SitesRetained": true,
+        "bFactorsUnchanged": true,
+        "embeddingFactorsUnchanged": true,
+        "metadataAndLayoutUnchanged": true,
+        "diskSizeReduced": false,
+        "behaviorQualified": false,
+        "performanceQualified": false,
+        "installed": false,
+        "scope": "Edits only the existing adapter's linear F32 A coefficients; retains its rank, directions, embedding, metadata and all sites. Sparse payload estimates exclude container, allocator and runtime overhead. Weight-space error is not an accuracy bound."
+    })
+}
+
 /// Inspects a deterministic magnitude edit or publishes its separately named GGUF.
 ///
 /// # Errors
@@ -279,16 +310,12 @@ pub fn run(request: Value) -> Result<Value> {
     if let Some(output) = &request.output_path {
         publish(output, &candidate)?;
     }
-    Ok(
-        json!({"schemaVersion":1,"kind":"experimental-edited-rank-one-adapter",
-        "algorithm":ALGORITHM,"sourceAdapterSha256":ADAPTER_SHA256,
-        "candidateSha256":candidate_sha256,"candidateBytes":candidate.len(),
-        "sourceAdapterPath":request.adapter_path,"outputPath":request.output_path,
-        "keepNumerator":request.keep_numerator,"keepDenominator":request.keep_denominator,
-        "published":request.operation==Operation::Create,"weightEdit":summary,
-        "all129SitesRetained":true,"bFactorsUnchanged":true,"embeddingFactorsUnchanged":true,
-        "metadataAndLayoutUnchanged":true,"diskSizeReduced":false,
-        "behaviorQualified":false,"performanceQualified":false,"installed":false,
-        "scope":"Edits only the existing adapter's linear F32 A coefficients; retains its rank, directions, embedding, metadata and all sites. Sparse payload estimates exclude container, allocator and runtime overhead. Weight-space error is not an accuracy bound."}),
-    )
+    Ok(receipt(
+        &candidate_sha256,
+        candidate.len(),
+        request.keep_numerator,
+        request.keep_denominator,
+        request.operation == Operation::Create,
+        summary,
+    ))
 }

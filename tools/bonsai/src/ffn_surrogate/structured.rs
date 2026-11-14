@@ -78,6 +78,19 @@ struct Request {
     output_path: Option<PathBuf>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FitInputHashView<'a> {
+    schema_version: u32,
+    source: &'a Source,
+    student_execution: &'a StudentExecution,
+    capture_sha256: &'a str,
+    site: &'a Site,
+    omission: &'a Omission,
+    rows: &'a [Row],
+    controls: &'a Controls,
+}
+
 fn identity(value: &str, width: usize) -> crate::Result<()> {
     if !crate::identity::is_lower_hex(value, width) {
         return Err("Noncanonical structured-compensation identity.".into());
@@ -267,6 +280,7 @@ struct Totals {
     compensated_error: f64,
     prefix_drift: f64,
     original_prefix_error: f64,
+    replay_metrics: crate::calibration_metrics::RowMetricsAccumulator,
 }
 
 fn ratio(error: f64, energy: f64) -> Option<f64> {
@@ -284,6 +298,7 @@ fn diagnostics(
         let prediction = solver::prediction(&row.input, &solution.a, &solution.b, deadline, work)?;
         let total = &mut totals[usize::from(row.split == Split::Development)];
         total.rows += 1;
+        let mut missing_target = Vec::with_capacity(row.teacher_target.len());
         for (((&teacher, &retained), &original), &correction) in row
             .teacher_target
             .iter()
@@ -295,6 +310,7 @@ fn diagnostics(
             let retained = f64::from(retained);
             let original = f64::from(original);
             let missing = teacher - retained;
+            missing_target.push(missing);
             total.teacher_energy += teacher.powi(2);
             total.original_teacher_energy += original.powi(2);
             total.uncompensated_error += missing.powi(2);
@@ -302,6 +318,9 @@ fn diagnostics(
             total.prefix_drift += (teacher - original).powi(2);
             total.original_prefix_error += (retained + correction - original).powi(2);
         }
+        total
+            .replay_metrics
+            .record_pair(&missing_target, &prediction)?;
         solver::charge(work, WIDTH * 6, deadline)?;
     }
     let result = summarize(&totals)?;
@@ -324,6 +343,7 @@ fn summarize(totals: &[Totals; 2]) -> crate::Result<Value> {
         {
             return Err("Nonfinite structured exported-factor diagnostics.".into());
         }
+        let summary = total.replay_metrics.finish();
         result.insert(name.into(), json!({"rows":total.rows,
             "teacherSquaredEnergy":total.teacher_energy,
             "originalPrefixTeacherSquaredEnergy":total.original_teacher_energy,
@@ -333,7 +353,12 @@ fn summarize(totals: &[Totals; 2]) -> crate::Result<Value> {
             "relativeSquaredError":ratio(total.compensated_error,total.teacher_energy),
             "teacherPrefixDriftSquaredError":total.prefix_drift,
             "teacherPrefixDriftRelativeSquaredError":ratio(total.prefix_drift,total.original_teacher_energy),
-            "correctedBranchVersusOriginalPrefixRelativeSquaredError":ratio(total.original_prefix_error,total.original_teacher_energy)}));
+            "correctedBranchVersusOriginalPrefixRelativeSquaredError":ratio(total.original_prefix_error,total.original_teacher_energy),
+            "worstRowRelativeL2Error":summary.worst_row_relative_l2_error,
+            "meanCosineSimilarity":summary.mean_cosine_similarity,
+            "minCosineSimilarity":summary.min_cosine_similarity,
+            "meanCandidateEnergyEntropy":summary.mean_candidate_energy_entropy,
+            "meanCandidateCoordinateCoverage":summary.mean_candidate_coordinate_coverage}));
     }
     Ok(result.into())
 }
@@ -440,7 +465,17 @@ pub(super) fn run(value: Value, started: Instant) -> crate::Result<Value> {
     let screening = application::combined_screen(&reconstruction_screen, &application_screen)?;
     let passed = screening["passed"] == true;
     let rank = solution.a.len();
-    let request_bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let hash_view = FitInputHashView {
+        schema_version: request.schema_version,
+        source: &request.source,
+        student_execution: &request.student_execution,
+        capture_sha256: &request.capture_sha256,
+        site: &request.site,
+        omission: &request.omission,
+        rows: &request.rows,
+        controls: &request.controls,
+    };
+    let request_bytes = serde_json::to_vec(&hash_view).map_err(|error| error.to_string())?;
     let fit_input_sha256 = hash(&request_bytes)?;
     let model_bound_sign_sha256 = sign_hash(&request)?;
     let resource_estimates = geometry(&request, rank);
@@ -478,7 +513,8 @@ pub(super) fn run(value: Value, started: Instant) -> crate::Result<Value> {
     }
     Ok(
         json!({"schemaVersion":2,"status":if passed {"development-screen-passed-unqualified"} else {"development-rejected"},
-        "artifact":artifact,"artifactSha256":artifact_sha256,"outputPath":if passed {request.output_path.as_ref()} else {None},
+        "artifact":artifact,"artifactSha256":artifact_sha256,
+        "published":passed && request.output_path.is_some(),
         "fitInputSha256":fit_input_sha256,"diagnostics":diagnostics,"developmentScreen":screening,
         "factorApplicationArithmetic":APPLICATION_ARITHMETIC,
         "sourceOrderF32Diagnostics":application_diagnostics,
