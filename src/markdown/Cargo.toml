@@ -1,0 +1,16 @@
+[package]
+name = "bonsai-markdown"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded inert Markdown render packets for the offline native parser"
+
+[dependencies]
+egui = { version = "=0.37.0", default-features = false }
+markdown-syntax = { version = "=0.7.2", default-features = false }
+
+[lints]
+workspace = true

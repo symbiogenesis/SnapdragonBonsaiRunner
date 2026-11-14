@@ -25,6 +25,14 @@
       ]
     },
     {
+      "Name": "bonsai-markdown",
+      "Manifest": "src/markdown/Cargo.toml",
+      "Group": "Broker",
+      "Features": [
+        "*"
+      ]
+    },
+    {
       "Name": "bonsai-chat",
       "Manifest": "src/chat-ui/Cargo.toml",
       "Group": "Broker",

@@ -561,6 +561,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bonsai-markdown"
+version = "0.3.2"
+dependencies = [
+ "egui",
+ "markdown-syntax",
+]
+
+[[package]]
 name = "bonsai-speech-asr"
 version = "0.3.2"
 dependencies = [

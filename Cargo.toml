@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "src/broker",
     "src/chat-ui",
+    "src/markdown",
     "src/speech-asr",
     "src/speech-tts",
     "src/speech-service",
@@ -28,6 +29,7 @@ repository = "https://github.com/symbiogenesis/SwiftBonsai2Runner"
 bonsai-artifacts = { path = "src/artifacts" }
 bonsai-audio = { path = "src/audio" }
 bonsai-cpu-policy = { path = "src/cpu-policy" }
+bonsai-markdown = { path = "src/markdown" }
 bonsai-speech-service = { path = "src/speech-service" }
 bonsai-windows-credentials = { version = "=0.1.4", path = "src/windows-credentials" }
 bonsai-windows-process = { version = "=0.1.2", path = "src/windows-process" }
