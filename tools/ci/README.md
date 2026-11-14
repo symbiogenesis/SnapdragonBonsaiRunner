@@ -729,6 +729,15 @@ no source, and an unavailable remote base selects the complete tree.
 A separate temporary Git index materializes each tip without changing the
 owner's index or working files. Unstaged fixes cannot conceal a broken commit.
 
+Normal pushes resolve the ordered checker input identities in one Git command
+and extract only the eight committed checking-policy scripts and their support.
+Preparation still extracts the complete committed build source. The native
+checker groups each tip's selected PowerShell calls into one supervised process,
+invoking each trusted script in a child scope and rejecting a failed call before
+starting another. Source-language scanning filters whole files with the existing
+expressions before entering per-line diagnostics; PowerShell AST checks and
+multiline Rust resolution checks still inspect their complete inputs.
+
 The screen checks owned-language policy, parses changed PowerShell without
 executing it, checks workspace Rust formatting when Rust/build inputs change,
 and validates workflow startup plus Actions syntax when YAML/action inputs
@@ -760,8 +769,8 @@ invalidates its previous receipt; a failed rebuild retains helper bytes without
 admitting them. Explicit preparation is a
 source build whose caller must supervise within the declared allowance; it is not
 an outgoing-tip verdict, an automatic retry or a way to renew an expired clock.
-The final preparation/receipt and snapshot-config corrections still require owning
-CI validation; the local audit allowance closed before those checks could run.
+Owning CI still qualifies the complete preparation/receipt, snapshot and batched
+script controls. Local focused checks do not establish that CI verdict.
 `BONSAI_ACTIONLINT_PATH` can supply the reviewed actionlint 1.7.12 executable for
 an offline syntax check; otherwise the existing checker fetches its pinned,
 digest-verified asset. Snapshot intake and native work share the original allowance;
@@ -769,6 +778,11 @@ the native supervisor stops admitting commands at 270 seconds, retaining cleanup
 reserve. Power is observed before bootstrap and after cleanup; unavailable
 battery-saver observations remain unknown. These are correctness checks, with
 no performance-comparison qualification.
+
+Set `$env:BONSAI_PUSH_TIMINGS = '1'` before a push to print elapsed times for the
+supervised native commands. Remove it afterward with
+`Remove-Item Env:BONSAI_PUSH_TIMINGS`. Timing output is diagnostic and does not
+qualify a performance comparison.
 
 [AGENTS.md](../../AGENTS.md#runner-repository-workflow) prohibits bypassing this
 guard. Git hooks remain a local control: an operator who can change Git config

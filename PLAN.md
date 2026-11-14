@@ -63,15 +63,17 @@ adoption decisions without displacing native daily-use acceptance.
   immutable outgoing-tip push checks; public-input writer/identity handoff; and
   narrow projection dependency builds. Local focused checks leave hosted gates
   pending, including the historical linker-child identity that was not retained.
-  Run the final snapshot-config regression and complete push adapter, preparation
-  receipt/invalidation, packaged-shell and historical-tip/output-bound controls;
-  those source-only follow-ups have no passing post-audit local verdict. Keep
+  Qualify the final snapshot-config regression and complete push adapter, preparation
+  receipt/invalidation, packaged-shell and historical-tip/output-bound controls
+  in owning CI; local focused controls do not establish complete acceptance. Keep
   helper preparation explicit and caller-supervised within its declared allowance.
   Qualify trusted candidate-root adapter controls for both cache actions and
   source selection, including non-HEAD mutations and poisoned candidate fixtures;
   assertions and support remain bound to committed checking policy. Qualify
   failed-preparation receipt invalidation. Verify explicit target/output preparation
   against inherited Cargo target overrides before claiming prepared-helper admission.
+  Include policy-only bootstrap closure, batched script scope/rejection controls
+  and source-language scan newline diagnostics in owning CI acceptance.
 - [ ] Qualify Runner's checked-tools producer, shared regression runner and
   native-acceptance caches: cold build, exact hit and relevant-input invalidation,
   fresh same-run packages, source/digest verification and every selected check.
