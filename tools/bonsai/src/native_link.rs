@@ -19,6 +19,7 @@ const IMAGE_LIMIT: u64 = 32 * 1024 * 1024;
 const TOTAL_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
 mod coff;
+mod runtime_boundary;
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -72,6 +73,13 @@ struct PackageFile {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DependencyImage {
+    module: String,
+    identity: Identity,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Capture {
     schema_version: u32,
     kind: String,
@@ -82,6 +90,8 @@ struct Capture {
     package_directory: PathBuf,
     package_files: Vec<PackageFile>,
     system_imports: Vec<String>,
+    #[serde(default)]
+    dependency_images: Vec<DependencyImage>,
 }
 
 #[derive(Default)]
@@ -438,11 +448,14 @@ fn verify_inputs(
 }
 
 fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
-    if ![1, 2, 3].contains(&manifest.schema_version)
+    if ![1, 2, 3, 4].contains(&manifest.schema_version)
         || manifest.kind != "selected-lld-arm64-link-package"
         || !(1..=128).contains(&manifest.links.len())
     {
         return Err("Unsupported native link manifest identity or bounds.".into());
+    }
+    if manifest.schema_version < 4 && !manifest.dependency_images.is_empty() {
+        return Err("Native link dependency images require schema 4.".into());
     }
     let objects = source_objects(manifest, intake)?;
     let linker = intake.verify(&manifest.linker, FILE_LIMIT)?;
@@ -465,6 +478,9 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
     let mut imported_systems = BTreeSet::new();
     let mut runtime_symbols = BTreeMap::new();
     let mut runtime_imports = Vec::new();
+    let mut boundary = (manifest.schema_version >= 4)
+        .then(|| runtime_boundary::Boundary::prepare(manifest, &package, intake))
+        .transpose()?;
     for link in &manifest.links {
         verify_inputs(
             link,
@@ -508,6 +524,9 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
             let mut ordinals = Vec::new();
             for delayed in [false, true] {
                 crate::pe_closure::visit_import_symbols(&image, delayed, |module, symbol| {
+                    if let Some(boundary) = boundary.as_mut() {
+                        boundary.observe(&link.package_name, module, delayed, &symbol)?;
+                    }
                     match symbol {
                         crate::pe_closure::ImportSymbol::Name(name) => {
                             named += 1;
@@ -530,6 +549,9 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
             }));
         }
     }
+    let boundary = boundary
+        .map(runtime_boundary::Boundary::finish)
+        .transpose()?;
     let expected_images: BTreeSet<_> = package
         .keys()
         .filter(|name| image_name(name))
@@ -558,7 +580,9 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
         "coffRuntimeSymbolsChecked":manifest.schema_version >= 2,
         "coffRuntimeSymbolInputs":runtime_symbols.into_values().collect::<Vec<_>>(),
         "peRuntimeImportsChecked":manifest.schema_version >= 3,
-        "peRuntimeImportImages":runtime_imports,"ordinalImportTargetsResolved":false,
+        "peRuntimeImportImages":runtime_imports,"ordinalImportTargetsResolved":boundary.is_some(),
+        "forwardedImportTargetsResolved":boundary.is_some(),
+        "runtimeImportBoundary":boundary,
         "archiveMemberLinkSelectionChecked":false,
         "nativeRetirementQualified":false
     }))

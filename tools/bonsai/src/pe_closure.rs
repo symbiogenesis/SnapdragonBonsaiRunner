@@ -283,6 +283,8 @@ pub(crate) fn visit_import_symbols(
 
 mod symbol_imports;
 
+pub(crate) mod symbol_exports;
+
 fn api_text(data: &[u8], offset: usize, length: usize) -> Result<String> {
     if !length.is_multiple_of(2) {
         return Err("Invalid API-set name extent".into());

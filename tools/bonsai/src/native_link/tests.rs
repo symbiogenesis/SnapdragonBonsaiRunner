@@ -135,6 +135,86 @@ fn runtime_image() -> Vec<u8> {
     bytes
 }
 
+fn export_image(
+    base: u32,
+    names: &[(&str, u16)],
+    targets: &[Option<&str>],
+) -> std::result::Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut bytes = image();
+    put32(&mut bytes, 0x98 + 112, 0x1600);
+    put32(&mut bytes, 0x98 + 116, 0x400);
+    put32(&mut bytes, 0xa10, base);
+    put32(&mut bytes, 0xa14, u32::try_from(targets.len())?);
+    put32(&mut bytes, 0xa18, u32::try_from(names.len())?);
+    put32(&mut bytes, 0xa1c, 0x1640);
+    put32(&mut bytes, 0xa20, 0x1680);
+    put32(&mut bytes, 0xa24, 0x16c0);
+    let mut string = 0xb00;
+    for (index, (name, ordinal)) in names.iter().enumerate() {
+        put32(
+            &mut bytes,
+            0xa80 + index * 4,
+            u32::try_from(string + 0xc00)?,
+        );
+        put16(&mut bytes, 0xac0 + index * 2, *ordinal);
+        bytes[string..string + name.len()].copy_from_slice(name.as_bytes());
+        string += name.len() + 1;
+    }
+    for (index, target) in targets.iter().enumerate() {
+        let rva = if let Some(target) = target {
+            let rva = u32::try_from(string + 0xc00)?;
+            bytes[string..string + target.len()].copy_from_slice(target.as_bytes());
+            string += target.len() + 1;
+            rva
+        } else {
+            0x1e00
+        };
+        put32(&mut bytes, 0xa40 + index * 4, rva);
+    }
+    Ok(bytes)
+}
+
+fn dependency(scratch: &Scratch, capture: &mut Capture, module: &str, bytes: &[u8]) -> TestResult {
+    let identity = scratch.file(module, bytes)?;
+    if let Some(existing) = capture
+        .dependency_images
+        .iter_mut()
+        .find(|item| item.module == module)
+    {
+        existing.identity = identity;
+    } else {
+        capture.dependency_images.push(DependencyImage {
+            module: module.into(),
+            identity,
+        });
+    }
+    Ok(())
+}
+
+fn runtime_fixture(scratch: &Scratch) -> std::result::Result<Capture, Box<dyn std::error::Error>> {
+    let mut capture = fixture(scratch)?;
+    capture.schema_version = 4;
+    replace_image(scratch, &mut capture, &runtime_image())?;
+    dependency(
+        scratch,
+        &mut capture,
+        "kernel32.dll",
+        &export_image(
+            17,
+            &[("_CxxThrowException", 0), ("ordinary_function", 1)],
+            &[None, None],
+        )?,
+    )?;
+    dependency(
+        scratch,
+        &mut capture,
+        "bcrypt.dll",
+        &export_image(23, &[("__CxxFrameHandler3", 0)], &[None])?,
+    )?;
+    verify(&capture, &mut Intake::default())?;
+    Ok(capture)
+}
+
 fn replace_image(scratch: &Scratch, capture: &mut Capture, bytes: &[u8]) -> TestResult {
     capture.links[0].output = scratch.file("linked.exe", bytes)?;
     let packaged = scratch.file("package/service.exe", bytes)?;
@@ -223,6 +303,7 @@ fn fixture(scratch: &Scratch) -> std::result::Result<Capture, Box<dyn std::error
             sha256: packaged.sha256,
         }],
         system_imports: vec!["kernel32.dll".into(), "bcrypt.dll".into()],
+        dependency_images: Vec::new(),
     };
     // Every mutation control starts from a successfully admitted selection.
     // Otherwise a path/setup failure could masquerade as policy rejection.
@@ -333,6 +414,201 @@ fn native_link_schema_three_observes_named_and_ordinal_normal_and_delay_imports(
     assert_eq!(receipt["ordinalImportTargetsResolved"], false);
     assert_eq!(receipt["cppRuntimeAbsenceQualified"], false);
     assert_eq!(receipt["nativeRetirementQualified"], false);
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_four_resolves_ordinal_aliases_against_exact_provider_images() -> TestResult {
+    let scratch = Scratch::new()?;
+    let capture = runtime_fixture(&scratch)?;
+    let receipt = verify(&capture, &mut Intake::default())?;
+    assert_eq!(receipt["ordinalImportTargetsResolved"], true);
+    assert_eq!(receipt["forwardedImportTargetsResolved"], true);
+    let boundary = &receipt["runtimeImportBoundary"];
+    assert_eq!(
+        boundary["images"].as_array().ok_or("Missing images")?.len(),
+        2
+    );
+    let routes = boundary["routes"].as_array().ok_or("Missing routes")?;
+    assert_eq!(routes.len(), 5);
+    assert_eq!(routes[2]["importSymbol"], json!({"ordinal":17}));
+    assert_eq!(routes[2]["knownCppEhNames"], json!(["_CxxThrowException"]));
+    assert_eq!(routes[2]["stages"][0]["exportOrdinal"], 17);
+    assert_eq!(routes[4]["delayed"], true);
+    assert_eq!(routes[4]["knownCppEhNames"], json!(["__CxxFrameHandler3"]));
+    for image in boundary["images"].as_array().ok_or("Missing images")? {
+        let supplied = capture
+            .dependency_images
+            .iter()
+            .find(|item| item.module == image["module"])
+            .ok_or("Unexpected provider image")?;
+        assert_eq!(image["bytes"], supplied.identity.bytes);
+        assert_eq!(image["sha256"], supplied.identity.sha256);
+    }
+    assert_eq!(boundary["recursiveDependencyImportsChecked"], false);
+    assert_eq!(boundary["apiSetRoutingQualified"], false);
+    assert_eq!(boundary["providerImplementationLanguageQualified"], false);
+    assert_eq!(receipt["systemDependencyClosureChecked"], false);
+    assert_eq!(receipt["cppRuntimeAbsenceQualified"], false);
+    assert_eq!(receipt["nativeRetirementQualified"], false);
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_four_follows_original_name_and_ordinal_forwarders() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = runtime_fixture(&scratch)?;
+    dependency(
+        &scratch,
+        &mut capture,
+        "kernel32.dll",
+        &export_image(
+            17,
+            &[("_CxxThrowException", 0), ("ordinary_function", 1)],
+            &[Some("helper.#29"), None],
+        )?,
+    )?;
+    dependency(
+        &scratch,
+        &mut capture,
+        "helper.dll",
+        &export_image(
+            29,
+            &[("export_alias", 0)],
+            &[Some("terminal.__CxxFrameHandler4")],
+        )?,
+    )?;
+    dependency(
+        &scratch,
+        &mut capture,
+        "terminal.dll",
+        &export_image(
+            41,
+            &[("__CxxFrameHandler4", 0), ("ordinary_alias", 0)],
+            &[None],
+        )?,
+    )?;
+    let receipt = verify(&capture, &mut Intake::default())?;
+    let route = &receipt["runtimeImportBoundary"]["routes"][2];
+    assert_eq!(
+        route["knownCppEhNames"],
+        json!(["_CxxThrowException", "__CxxFrameHandler4"])
+    );
+    let stages = route["stages"].as_array().ok_or("Missing stages")?;
+    assert_eq!(stages.len(), 3);
+    assert_eq!(stages[0]["forwarder"], "helper.#29");
+    assert_eq!(stages[1]["requestedSymbol"], json!({"ordinal":29}));
+    assert_eq!(stages[1]["forwarder"], "terminal.__CxxFrameHandler4");
+    assert_eq!(
+        stages[2]["exportNames"],
+        json!(["__CxxFrameHandler4", "ordinary_alias"])
+    );
+    assert_eq!(stages[2]["forwarder"], Value::Null);
+    assert_eq!(stages[2]["targetRva"], 0x1e00);
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_four_rejects_missing_cyclic_and_unused_provider_routes() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = runtime_fixture(&scratch)?;
+    dependency(
+        &scratch,
+        &mut capture,
+        "kernel32.dll",
+        &export_image(
+            17,
+            &[("_CxxThrowException", 0), ("ordinary_function", 1)],
+            &[Some("helper.#29"), None],
+        )?,
+    )?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "Native link runtime route lacks a retained provider image: helper.dll",
+    );
+    dependency(
+        &scratch,
+        &mut capture,
+        "helper.dll",
+        &export_image(28, &[], &[None])?,
+    )?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "Native link runtime route names an absent ordinal: helper.dll!#29",
+    );
+    dependency(
+        &scratch,
+        &mut capture,
+        "helper.dll",
+        &export_image(29, &[], &[Some("kernel32.#17")])?,
+    )?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "Native link runtime route cycles or exceeds its depth bound.",
+    );
+    dependency(
+        &scratch,
+        &mut capture,
+        "helper.dll",
+        &export_image(29, &[], &[Some("api-ms-example.#17")])?,
+    )?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "Native link runtime route requires separately qualified API-set routing.",
+    );
+    dependency(
+        &scratch,
+        &mut capture,
+        "helper.dll",
+        &export_image(29, &[], &[None])?,
+    )?;
+    dependency(
+        &scratch,
+        &mut capture,
+        "unused.dll",
+        &export_image(1, &[], &[None])?,
+    )?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "Native link dependency image selection contains an unused provider.",
+    );
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_four_rejects_malformed_exports_forwarders_and_changed_bytes() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = runtime_fixture(&scratch)?;
+    let mut bytes = export_image(
+        17,
+        &[("_CxxThrowException", 0), ("ordinary_function", 1)],
+        &[None, None],
+    )?;
+    put16(&mut bytes, 0xac0, 2);
+    dependency(&scratch, &mut capture, "kernel32.dll", &bytes)?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "PE named export ordinal index exceeds its table",
+    );
+    dependency(
+        &scratch,
+        &mut capture,
+        "kernel32.dll",
+        &export_image(
+            17,
+            &[("_CxxThrowException", 0), ("ordinary_function", 1)],
+            &[Some("helper.#65536"), None],
+        )?,
+    )?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "PE forwarder ordinal exceeds its supported range",
+    );
+    let path = &capture.dependency_images[0].identity.path;
+    let mut changed = fs::read(path)?;
+    changed[0x1000] = 1;
+    fs::write(path, changed)?;
+    assert!(verify(&capture, &mut Intake::default()).is_err());
     Ok(())
 }
 
