@@ -67,16 +67,21 @@ pub(super) fn model_identity(repacked: bool) -> Value {
     }
 }
 
+struct CapturedResponse {
+    bytes: Vec<u8>,
+    elapsed: Duration,
+}
+
 async fn measured_response(
     port: u16,
     credential: &str,
     evidence: &Path,
     report: &mut Value,
-) -> Value {
-    // Final parsing and hashing follow connection closure. This timer includes
+) -> Option<CapturedResponse> {
+    // Parsing waits for owned cleanup. This timer includes
     // prefill, generation, transport and incremental observer/receipt I/O.
     let started = tokio::time::Instant::now();
-    let bytes = progress::exchange(
+    let bytes = progress::try_exchange(
         port,
         credential,
         &body(),
@@ -84,9 +89,9 @@ async fn measured_response(
         report,
         "representation-complete-response",
     )
-    .await;
+    .await?;
     let elapsed = started.elapsed();
-    response_observation(&bytes, elapsed)
+    Some(CapturedResponse { bytes, elapsed })
 }
 
 pub(super) fn response_observation(bytes: &[u8], elapsed: Duration) -> Value {
@@ -107,19 +112,58 @@ async fn record_response(
     deadline: tokio::time::Instant,
     report: &mut Value,
     index: usize,
-) -> bool {
+) -> Option<CapturedResponse> {
     let observed = adapter_work_before_cleanup(
         deadline,
         measured_response(port, credential, evidence, report),
     )
     .await;
-    let completed = observed.is_some();
-    report["samples"][index]["stream"] = observed.unwrap_or(Value::Null);
-    if !completed {
-        report["pendingReason"] = json!("request-budget-expired");
+    report["samples"][index]["stream"] = Value::Null;
+    let captured = match observed {
+        Some(Some(captured)) => Some(captured),
+        Some(None) => {
+            report["pendingReason"] = json!("request-transport-failed");
+            None
+        }
+        None => {
+            report["pendingReason"] = json!("request-budget-expired");
+            None
+        }
+    };
+    if let Some(captured) = &captured {
+        report["samples"][index]["responseBytes"] = json!(captured.bytes.len());
+        report["samples"][index]["responseSha256"] = json!(digest(&captured.bytes));
+        report["samples"][index]["responseParsePassed"] = json!(false);
     }
     save_acceptance_report(evidence, report);
-    completed
+    captured
+}
+
+fn finish_response_after_cleanup(
+    captured: Option<&CapturedResponse>,
+    evidence: &Path,
+    report: &mut Value,
+    index: usize,
+) -> bool {
+    let cleanup = &report["samples"][index]["cleanup"];
+    let cleaned = service_integration::cleanup_passed(cleanup);
+    let stream = cleaned
+        .then(|| {
+            captured.and_then(|captured| {
+                service_rollback::response_after_cleanup(&captured.bytes, captured.elapsed, cleanup)
+            })
+        })
+        .flatten();
+    let parsed = stream.is_some();
+    report["samples"][index]["responseParsePassed"] = json!(parsed);
+    report["samples"][index]["stream"] = stream.unwrap_or(Value::Null);
+    if !cleaned {
+        report["pendingReason"] = json!("owned-cleanup-unconfirmed");
+    } else if captured.is_some() && !parsed {
+        report["pendingReason"] = json!("invalid-or-incomplete-response");
+    }
+    save_acceptance_report(evidence, report);
+    cleaned && parsed
 }
 
 fn sample_pending_reason(sample: &Value, repacked: bool, row_workers: u8) -> Option<&'static str> {
@@ -344,12 +388,23 @@ async fn paired_responses(
         report["phase"] = json!(format!("arm-{index}-startup"));
         save_acceptance_report(evidence, report);
         let started = tokio::time::Instant::now();
-        let Some(owner) =
-            adapter_work_before_cleanup(deadline, start_adapter(profile, data, evidence)).await
-        else {
-            report["pendingReason"] = json!("startup-budget-expired");
-            power::finish(&mut report["samples"][index]);
-            break;
+        let startup = adapter_work_before_cleanup(
+            deadline,
+            start_adapter_with_progress(profile, data, evidence, |_| {}),
+        )
+        .await;
+        let owner = match startup {
+            Some(Ok(owner)) => owner,
+            result => {
+                report["pendingReason"] = json!(if result.is_some() {
+                    "startup-failed"
+                } else {
+                    "startup-budget-expired"
+                });
+                power::finish(&mut report["samples"][index]);
+                save_acceptance_report(evidence, report);
+                break;
+            }
         };
         report["samples"][index]["startupMilliseconds"] =
             json!(started.elapsed().as_secs_f64() * 1000.0);
@@ -361,16 +416,19 @@ async fn paired_responses(
         let running = spawn_local(owner.run(async { stopped.await.map_err(io::Error::other) }));
         report["phase"] = json!(format!("arm-{index}-request"));
         save_acceptance_report(evidence, report);
-        let expired = !record_response(port, &credential, evidence, deadline, report, index).await;
+        let captured = record_response(port, &credential, evidence, deadline, report, index).await;
         report["phase"] = json!(format!("arm-{index}-cleanup"));
         save_acceptance_report(evidence, report);
-        report["samples"][index]["cleanup"] =
-            adapter_owned_stop(stop, running, port, expired).await;
+        let (cleanup, _) =
+            service_integration::stop_owner(stop, running, port, true, deadline).await;
+        report["samples"][index]["cleanup"] = cleanup;
+        save_acceptance_report(evidence, report);
+        let completed = finish_response_after_cleanup(captured.as_ref(), evidence, report, index);
         power::finish(&mut report["samples"][index]);
         report["originalPq2Rollback"] =
             original_pq2_rollback_observation(report["samples"].as_array().unwrap(), row_workers);
         save_acceptance_report(evidence, report);
-        if expired {
+        if !completed {
             break;
         }
     }
@@ -952,9 +1010,13 @@ fn native_representation_complete_bytes_survive_expired_second_request() {
             });
             let deadline = tokio::time::Instant::now()+STOP_WAIT+Duration::from_millis(300);
             let mut report = json!({"passed":false,"samples":[{},{}]});
-            assert!(record_response(port,"fixture",&evidence,deadline,&mut report,0).await);
+            let captured = record_response(port,"fixture",&evidence,deadline,&mut report,0).await;
+            assert!(captured.is_some());
+            assert!(report["samples"][0]["stream"].is_null());
+            report["samples"][0]["cleanup"] = json!({"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true});
+            assert!(finish_response_after_cleanup(captured.as_ref(),&evidence,&mut report,0));
             let first: Value = serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-            assert!(!record_response(port,"fixture",&evidence,deadline,&mut report,1).await);
+            assert!(record_response(port,"fixture",&evidence,deadline,&mut report,1).await.is_none());
             fixture.await.unwrap();
             let saved: Value = serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
             assert_eq!(saved["samples"][0],first["samples"][0]);
@@ -970,6 +1032,119 @@ fn native_representation_complete_bytes_survive_expired_second_request() {
             fs::remove_file(evidence.join("acceptance.json")).unwrap();
             fs::remove_dir(evidence).unwrap();
         }).await.unwrap();
+    });
+}
+
+#[test]
+fn native_representation_invalid_transport_and_sse_wait_for_cleanup_and_keep_receipts() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        timeout(Duration::from_secs(10), async {
+            let evidence = env::temp_dir().join(format!(
+                "Bonsai-Representation-Invalid-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&evidence).unwrap();
+            for wire in [
+                b"HTTP/1.1 503 Unavailable\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbad\r\n0\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbad\r\n0\r\n",
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let fixture = tokio::spawn(async move {
+                    let (peer, _) = listener.accept().await.unwrap();
+                    let mut peer = BufReader::new(peer);
+                    let mut length = 0;
+                    loop {
+                        let line = prefix_line(&mut peer, 16 * 1024).await;
+                        if let Some(value) = line.strip_prefix("Content-Length: ") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    peer.read_exact(&mut vec![0; length]).await.unwrap();
+                    peer.get_mut().write_all(wire).await.unwrap();
+                    peer.get_mut().shutdown().await.unwrap();
+                });
+                let mut report = json!({"passed":false,"samples":[complete_sample(false, 4)]});
+                let captured = record_response(
+                    port,
+                    "fixture",
+                    &evidence,
+                    tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(5),
+                    &mut report,
+                    0,
+                )
+                .await;
+                fixture.await.unwrap();
+                assert!(captured.is_some());
+                assert!(report["samples"][0]["stream"].is_null());
+                assert_eq!(report["samples"][0]["responseBytes"], wire.len());
+                assert_eq!(report["samples"][0]["responseSha256"], digest(wire));
+                report["samples"][0]["cleanup"] =
+                    json!({"status":"pending","ownedJobEmpty":null,"listenerReleased":null});
+                assert!(!finish_response_after_cleanup(
+                    captured.as_ref(),
+                    &evidence,
+                    &mut report,
+                    0
+                ));
+                assert_eq!(report["pendingReason"], "owned-cleanup-unconfirmed");
+                report["samples"][0]["cleanup"] =
+                    json!({"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true});
+                assert!(!finish_response_after_cleanup(
+                    captured.as_ref(),
+                    &evidence,
+                    &mut report,
+                    0
+                ));
+                assert_eq!(report["pendingReason"], "invalid-or-incomplete-response");
+                assert!(report["samples"][0]["stream"].is_null());
+                let saved: Value =
+                    serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
+                        .unwrap();
+                assert_eq!(saved, report);
+                assert_eq!(saved["samples"][0]["cleanup"]["ownedJobEmpty"], true);
+                assert_eq!(
+                    saved["samples"][0]["powerBefore"],
+                    saved["samples"][0]["powerAfter"]
+                );
+                assert_eq!(saved["passed"], false);
+            }
+            let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let mut report = json!({"passed":false,"samples":[{}]});
+            assert!(
+                record_response(
+                    port,
+                    "fixture",
+                    &evidence,
+                    tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(5),
+                    &mut report,
+                    0
+                )
+                .await
+                .is_none()
+            );
+            assert_eq!(report["pendingReason"], "request-transport-failed");
+            assert_eq!(report["requestProgress"][0]["transportErrorObserved"], true);
+            assert!(report["samples"][0]["stream"].is_null());
+            fs::remove_file(evidence.join("acceptance.json")).unwrap();
+            fs::remove_dir(evidence).unwrap();
+        })
+        .await
+        .unwrap();
     });
 }
 

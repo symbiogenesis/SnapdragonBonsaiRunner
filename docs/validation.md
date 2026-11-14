@@ -168,6 +168,11 @@ It is application request throughput, not decode TPS or TTFT.
 Complete-response pairs require natural stops, positive usage and both cleanups;
 `length` is truncated. Retain exact text/digests, identities, sampler/template,
 startup/request times and original-PQ2 rollback observations before the next arm.
+Fallible response capture retains transport failures and raw-byte identity before
+owned cleanup. Complete-response parsing runs only after confirmed cleanup;
+malformed or truncated responses remain pending with cleanup and power endpoints,
+and cannot admit the next owner. Failed or timed-out startup also retains a
+pending terminal receipt instead of unwinding through the pair.
 Latency/resource ratios require identical bytes and usage, eligible matched power,
 matching released worker-readiness identities and independently verified CPU
 placement/backend for both arms. Historical auto-placement or missing-placement

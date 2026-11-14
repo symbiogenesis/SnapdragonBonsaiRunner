@@ -130,7 +130,11 @@ fn verify_original_retention(
     if verified { guard } else { None }
 }
 
-fn response_after_cleanup(bytes: &[u8], elapsed: Duration, cleanup: &Value) -> Option<Value> {
+pub(super) fn response_after_cleanup(
+    bytes: &[u8],
+    elapsed: Duration,
+    cleanup: &Value,
+) -> Option<Value> {
     if cleanup["ownedJobEmpty"] != true || cleanup["listenerReleased"] != true {
         return None;
     }
