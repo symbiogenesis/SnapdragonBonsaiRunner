@@ -69,6 +69,70 @@ benefit, resource/comfort acceptance and original-PQ2 rollback. All nineteen
 PTQ1 promotion gates must pass for one frozen candidate; missing evidence leaves
 promotion pending. [PLAN.md](../PLAN.md) owns that work.
 
+### Vetting the CPU option
+
+Freeze the Runner revision, released runtime/source identities, model/export
+receipt, adapter at 1.3, backend, worker count, cache, placement and prefix policy
+before collecting acceptance. Keep X1 and X2 results separate. A later source or
+settings change needs a new evidence envelope; historical captures remain bound
+to their original candidate and closed allowance.
+
+The existing [promotion policy](native-rust-engine.md#default-runtime-promotion)
+describes the CPU/FP16 reference profile with request state reset. It does not
+qualify the development K4/V4 cache, prefix reuse, memory-selected long contexts
+or automatic X2 NPU placement. Qualify those selected production settings
+independently before claiming daily-use readiness.
+
+Follow this order, stopping on an actionable failure rather than expanding a
+failing experiment:
+
+1. Independently verify the complete export with `ptq1-packing`, preserving both
+   full artifact identities and the export-receipt digest. Existing symbol/scale
+   parity is the packing result; no new model export is needed merely to vet it.
+2. Use newly source-bound hosted tools for the selected scalar/explicit-NEON
+   numerical and adapter controls. Compare complete logits and live state;
+   loaded-zero/no-adapter identity, nonzero effect, scale/history changes,
+   prefix reuse and authenticated adapter basis remain distinct requirements.
+   The one-supplied-token smoke cannot close full-context acceptance.
+3. Qualify the released service and original-PQ2 rollback with the application
+   profiles in [validation](validation.md#actual-model-application-acceptance),
+   including rejection, interruption, fresh-owner replay, owned cleanup and
+   final original-file verification. Short tree-name responses establish only
+   their declared sequence.
+4. Compare PTQ1 and original PQ2 with explicit CPU placement, the same cache,
+   worker/backend/adapter policy and complete requests. Retain cold startup,
+   prefill, decode, end-to-end latency, separate memory domains and losing
+   outcomes. Independently compare the selected PTQ1 deployment with automatic
+   PQ2 placement on X2; a CPU representation pair cannot establish that tradeoff.
+5. Complete held-out answer and long-context review, resource/energy and
+   comfort acceptance, isolation, recovery and clean-install/rollback checks.
+   Require the reviewed benefit gate: at least 10% lower end-to-end latency, or
+   a capacity/energy benefit within accepted latency and quality limits.
+
+Inspect the numerical selection and promotion envelope without loading a model,
+using a trusted prebuilt `bonsai-tools.exe` selected as `$maintenanceExecutable`:
+
+```powershell
+& $maintenanceExecutable native-qualification --json (@{
+    operation = 'plan'; kind = 'ptq1'; repositoryDirectory = $PWD.Path
+    rustBackend = 'neon'; rowWorkers = 4; adapterCondition = 'standard'
+} | ConvertTo-Json -Compress)
+& $maintenanceExecutable runtime-promotion --json (@{
+    operation = 'plan'; runnerRevision = '<full-reviewed-Runner-commit>'
+    nativeRowWorkers = 4; weightRepresentation = 'current-repacked-PTQ1_0'
+} | ConvertTo-Json -Compress)
+```
+
+These commands prepare no capture tools and close no acceptance gate. CI dispatch
+and verdicts follow [owner control](../AGENTS.md#ci-ownership-and-completion).
+Each device workload needs its fixed work, estimate and original aggregate
+allowance declared before setup; power observations and cleanup share that clock.
+Benchmarks remain CI-only. Missing/mismatched power leaves performance
+inconclusive, and equal endpoints do not prove continuous stability. Retain only
+the [required evidence](validation.md#evidence-retention), including independent
+replay bytes where required. File savings alone change neither memory admission
+nor context capacity.
+
 ## Exact PTQ1 packing
 
 PTQ1 stores each 128-symbol group in **28 bytes**, versus PQ2's **34**: 24 five-trit

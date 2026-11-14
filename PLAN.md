@@ -617,16 +617,33 @@ nor editing the available Abliteration factors.
   replay retained comparisons with the schema-2 scalar auditor. Separately obtain
   authenticated original checkpoint/conversion/invocation/toolchain inputs and
   verify native writer mappings through [authoring intake](docs/adapter-authoring-intake.md).
-- [ ] Qualify candidate PTQ1 scalar/explicit-NEON logits and complete live
+- [ ] **P2 — Qualify PTQ1 numerical execution.** Bind one released-source
+  candidate, selected worker/backend/cache/placement and adapter policy. Qualify
+  scalar/explicit-NEON logits and complete live
   state for the selected worker policy, including loaded-zero identity, nonzero
-  effect, scale/history changes and prefix reuse.
-- [ ] Prepare a newly source-bound PTQ1 service/rollback packet for the selected
+  effect, scale/history changes and prefix reuse. Keep the CPU/FP16 reference
+  policy, one-token smoke and development K4/V4 acceptance distinct; P1's
+  authenticated authoring/basis requirements remain independent.
+- [ ] **P3 — Qualify PTQ1 application service and rollback.** Prepare a newly
+  source-bound PTQ1 service/rollback packet for the selected
   runtime. Qualify scale/count/context rejection, active interruption, independent
   fresh-owner replay, original-PQ2 rollback and final file verification under
   [application acceptance](docs/validation.md#actual-model-application-acceptance).
-- [ ] Close matched complete-answer/per-prompt adapter benefit, independent human
-  quality/comfort, full context/output, resources, isolation, recovery and clean
-  installation before reconsidering [PTQ1 default promotion](docs/swift-memory.md#release-decision).
+- [ ] **P4 — Measure the PTQ1 deployment benefit.** After correctness, run matched
+  complete-answer CPU PQ2/PTQ1 comparisons with the same cache, backend, workers
+  and standard adapter. Verify explicit CPU readiness; retain startup, prefill,
+  decode, end-to-end latency, separate process-memory domains and losing outcomes.
+  Separately compare against automatic PQ2 placement on X2. Qualify repeated
+  benefit and per-prompt adapter gates in owning CI with eligible aggregate/per-arm
+  power observations. Serialized savings and short tree-name pairs establish no
+  actual usable RAM, energy, quality or repeated performance benefit.
+- [ ] **P5 — Complete PTQ1 profile acceptance.** Close independent human
+  quality/comfort, selected-cache/prefix/full context/output, resources, isolation,
+  recovery and clean installation before reconsidering
+  [PTQ1 default promotion](docs/swift-memory.md#release-decision). Follow the
+  [vetting sequence](docs/swift-memory.md#vetting-the-cpu-option), keep X1/X2
+  evidence separate and require all nineteen reference-policy gates plus the
+  selected production-profile acceptance; missing gates remain pending.
 - [ ] Qualify source request-timing attribution after owning hosted checks; use
   actual operation measurements before selecting hotspots.
 - [ ] Qualify native adapter allocation reuse: omit unused serialized
