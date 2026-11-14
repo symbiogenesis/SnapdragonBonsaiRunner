@@ -6,7 +6,7 @@ use std::process::ExitCode;
 #[cfg(any(all(windows, target_arch = "aarch64"), test))]
 mod policy {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     pub(super) const USAGE: &str = "bonsai-push-recovery --source PATH --target-directory PATH --toolchain nightly-YYYY-MM-DD-aarch64-pc-windows-msvc --bootstrap-milliseconds N";
 
@@ -73,6 +73,34 @@ mod policy {
             .filter(|remaining| *remaining >= 1000)
             .ok_or("Push checker recovery cannot fit in the original allowance; push blocked.")?;
         Ok(remaining.min(90_000))
+    }
+
+    pub(super) fn cargo_arguments(
+        arguments: &Arguments,
+        manifest: &Path,
+        target: &Path,
+        nonce: &str,
+    ) -> Vec<OsString> {
+        vec![
+            OsString::from(format!("+{}", arguments.toolchain)),
+            "rustc".into(),
+            "--quiet".into(),
+            "--locked".into(),
+            "--offline".into(),
+            "--manifest-path".into(),
+            manifest.into(),
+            "--package".into(),
+            "bonsai-ci".into(),
+            "--bin".into(),
+            "bonsai-ci".into(),
+            "--target".into(),
+            "aarch64-pc-windows-msvc".into(),
+            "--target-dir".into(),
+            target.into(),
+            "--".into(),
+            "-C".into(),
+            format!("metadata=bonsai_push_recovery_{nonce}").into(),
+        ]
     }
 
     pub(super) fn matching_pin(document: &str, selected: &str) -> bool {
@@ -205,7 +233,11 @@ mod native {
             let errors = fs::read(&stderr).map_err(|error| error.to_string())?;
             if code != 0 {
                 let detail = [output, errors].concat();
-                let excerpt = String::from_utf8_lossy(&detail[detail.len().saturating_sub(8192)..]);
+                let excerpt = if detail.is_empty() {
+                    std::borrow::Cow::Borrowed("<empty stdout and stderr>")
+                } else {
+                    String::from_utf8_lossy(&detail[detail.len().saturating_sub(8192)..])
+                };
                 return Err(format!(
                     "Push checker recovery {name} failed with exit code {code}; push blocked.\n{excerpt}"
                 ));
@@ -250,19 +282,6 @@ mod native {
         if started.elapsed() >= work {
             return Err("Push checker recovery setup exhausted its original allowance.".into());
         }
-        let common = vec![
-            OsString::from("--quiet"),
-            "--locked".into(),
-            "--offline".into(),
-            "--manifest-path".into(),
-            manifest.into_os_string(),
-            "--package".into(),
-            "bonsai-ci".into(),
-            "--target".into(),
-            "aarch64-pc-windows-msvc".into(),
-            "--target-dir".into(),
-            target.into_os_string(),
-        ];
         let mut work = Work {
             source: &source,
             scratch,
@@ -271,23 +290,22 @@ mod native {
             limit: work,
             output: 0,
         };
-        // Cargo may regard a corrupted executable (and its hardlinked deps
-        // image) as fresh. Clean only this package before rebuilding so a new
-        // receipt cannot admit stale bytes; retain all dependency compilation.
-        let mut clean = vec![
-            OsString::from(format!("+{}", arguments.toolchain)),
-            "clean".into(),
-        ];
-        clean.extend_from_slice(&common);
-        work.command("clean", clean)?;
-        let mut build = vec![
-            OsString::from(format!("+{}", arguments.toolchain)),
-            "build".into(),
-            "--bin".into(),
-            "bonsai-ci".into(),
-        ];
-        build.extend(common);
-        work.command("build", build)
+        // A changed target-specific rustc argument dirties the checker binary
+        // even when Cargo considers corrupted executable aliases fresh. Force
+        // one relink without cleaning or blessing a legacy target directory;
+        // dependency compilation receives no extra flags and remains cached.
+        let nonce = format!(
+            "{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos(),
+        );
+        work.command(
+            "relink",
+            policy::cargo_arguments(arguments, &manifest, &target, &nonce),
+        )
     }
 
     pub(super) fn run() -> Result<(), String> {
@@ -347,6 +365,42 @@ mod tests {
         for elapsed in [234_001, 235_000, 270_000, u64::MAX] {
             assert!(policy::work_milliseconds(elapsed).is_err());
         }
+    }
+
+    #[test]
+    fn recovery_forces_only_the_checker_binary_to_relink() {
+        let arguments = policy::Arguments {
+            source: PathBuf::from("source"),
+            target: PathBuf::from("target"),
+            toolchain: "nightly-2026-11-12-aarch64-pc-windows-msvc".into(),
+            elapsed: 0,
+        };
+        let first = policy::cargo_arguments(
+            &arguments,
+            &arguments.source.join("Cargo.toml"),
+            &arguments.target,
+            "first",
+        );
+        let second = policy::cargo_arguments(
+            &arguments,
+            &arguments.source.join("Cargo.toml"),
+            &arguments.target,
+            "second",
+        );
+        assert_eq!(first[1], "rustc");
+        assert_eq!(first[2..5], ["--quiet", "--locked", "--offline"]);
+        assert_eq!(
+            first[7..11],
+            ["--package", "bonsai-ci", "--bin", "bonsai-ci"]
+        );
+        assert_eq!(
+            first[11..14],
+            ["--target", "aarch64-pc-windows-msvc", "--target-dir"]
+        );
+        assert_eq!(first[15..17], ["--", "-C"]);
+        assert_eq!(first[17], "metadata=bonsai_push_recovery_first");
+        assert_eq!(second[17], "metadata=bonsai_push_recovery_second");
+        assert_eq!(first[..17], second[..17]);
     }
 
     #[test]
