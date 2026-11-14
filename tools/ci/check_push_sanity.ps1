@@ -22,7 +22,7 @@ $scratch = Join-Path ([IO.Path]::GetTempPath()) ('bonsai-push-bootstrap-' + [gui
 [void][IO.Directory]::CreateDirectory($scratch)
 try {
     $head = (git -C $Root rev-parse --verify HEAD).Trim()
-    $inputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'tools/ci', 'src/artifacts', 'src/windows-process', 'src/windows-credentials')
+    $inputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'tools/ci', 'src/artifacts', 'src/windows-process', 'src/windows-credentials', 'scripts/release/Release-Common.ps1')
     $objects = @($inputs | ForEach-Object { (git -C $Root rev-parse --verify ('{0}:{1}' -f $head, $_)).Trim() })
     $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
     $tool = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
@@ -40,8 +40,10 @@ try {
     git -C $Root archive --format=zip --output=$archive $head
     Expand-Archive -LiteralPath $archive -DestinationPath $policy
     if ($Prepare) {
+        . (Join-Path $policy 'scripts/release/Release-Common.ps1')
+        $toolchain = Get-ReleaseToolchain $policy
         Push-Location -LiteralPath $policy
-        try { cargo build --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target aarch64-pc-windows-msvc --target-dir $target }
+        try { cargo "+$toolchain" build --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target aarch64-pc-windows-msvc --target-dir $target }
         finally { Pop-Location }
         @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
         'Prepared the committed native checker; this is not an outgoing-tip validation verdict.'
