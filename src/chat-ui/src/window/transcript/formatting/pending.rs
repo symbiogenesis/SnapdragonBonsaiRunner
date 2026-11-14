@@ -95,7 +95,14 @@ impl Pending {
             self.request_source = Some(Arc::from(source));
         }
         if let Some(request_source) = &self.request_source {
-            let service = self.service.get_or_insert_with(|| Service::get(ui.ctx()));
+            if self.service.is_none() {
+                self.service = Service::get(ui.ctx());
+            }
+            let Some(service) = &self.service else {
+                // Recovered messages can precede the asynchronously prepared
+                // broker image. Startup will repaint when it becomes available.
+                return changed;
+            };
             let ticket = service.request(Arc::clone(request_source));
             if ticket.admitted() {
                 self.ticket = Some(ticket);

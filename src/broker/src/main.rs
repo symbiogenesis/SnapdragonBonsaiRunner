@@ -6,6 +6,24 @@ use std::{env, ffi::OsString, io::Write, process::ExitCode};
 
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1).peekable();
+    #[cfg(windows)]
+    if args
+        .peek()
+        .is_some_and(|value| value == "--markdown-worker")
+    {
+        args.next();
+        // Dispatch before broker configuration, credentials, Tokio or listeners.
+        // The desktop image cannot initialize under the headless Win32k policy.
+        return if args.next().is_none()
+            && bonsai_windows_credentials::is_app_container().unwrap_or(false)
+            && bonsai_markdown::serve(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
+                .is_ok()
+        {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     if args.peek().is_some_and(|value| value == "--help") {
         args.next();
         #[cfg(windows)]

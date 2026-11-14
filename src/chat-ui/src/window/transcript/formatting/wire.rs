@@ -45,22 +45,26 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[cfg(test)]
 fn push_count(bytes: &mut Vec<u8>, value: usize) -> Option<()> {
     bytes.extend_from_slice(&u32::try_from(value).ok()?.to_le_bytes());
     Some(())
 }
 
+#[cfg(test)]
 fn push_range(bytes: &mut Vec<u8>, range: &Range<usize>) -> Option<()> {
     push_count(bytes, range.start)?;
     push_count(bytes, range.end)
 }
 
+#[cfg(test)]
 fn font_size(size: f32) -> Option<u8> {
     [16_u8, 18, 20, 22]
         .into_iter()
         .find(|candidate| f32::from(*candidate).to_bits() == size.to_bits())
 }
 
+#[cfg(test)]
 fn flags(format: &egui::TextFormat, visuals: &egui::Visuals) -> u8 {
     let mut flags = 0;
     if format.font_id.family == egui::FontFamily::Monospace {
@@ -78,6 +82,7 @@ fn flags(format: &egui::TextFormat, visuals: &egui::Visuals) -> u8 {
     flags
 }
 
+#[cfg(test)]
 fn encode_checked(layout: &Layout) -> Option<Vec<u8>> {
     let text = &layout.job.text;
     let sections = &layout.job.sections;
@@ -118,6 +123,7 @@ fn encode_checked(layout: &Layout) -> Option<Vec<u8>> {
 
 /// Encoding runs only in the untrusted parser process. An invalid layout is
 /// represented by a rejected empty payload rather than a partial message.
+#[cfg(test)]
 pub(super) fn encode(layout: &Layout) -> Vec<u8> {
     encode_checked(layout).unwrap_or_default()
 }

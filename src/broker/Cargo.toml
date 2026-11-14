@@ -33,6 +33,7 @@ subtle.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "signal", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
+bonsai-markdown.workspace = true
 bonsai-windows-process.workspace = true
 bonsai-windows-credentials.workspace = true
 

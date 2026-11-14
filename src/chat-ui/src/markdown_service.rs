@@ -11,8 +11,7 @@
 use eframe::egui;
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
-    io,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -124,6 +123,13 @@ pub(crate) struct Service {
 }
 
 impl Service {
+    /// Supplies the verified headless image after native startup prepares it.
+    pub(crate) fn configure(context: &egui::Context, image: &Path) {
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::unique("offline-markdown-image"), image.to_owned());
+        });
+    }
+
     /// Separates a terminal session failure from transient queue backpressure.
     pub(crate) fn unavailable(&self) -> bool {
         let state = self
@@ -138,25 +144,28 @@ impl Service {
             || ADMISSION_CLOSED.load(Ordering::Acquire)
     }
     /// Reuses one service for the native UI context; process setup stays off its thread.
-    pub(crate) fn get(context: &egui::Context) -> Arc<Self> {
+    pub(crate) fn get(context: &egui::Context) -> Option<Arc<Self>> {
         context.data_mut(|data| {
             let identity = egui::Id::unique("offline-markdown-service");
             if let Some(service) = data.get_temp::<Arc<Self>>(identity) {
-                return service;
+                return Some(service);
             }
-            let service = Self::new();
+            // Source launches prepare the broker after the first UI frame.
+            // Restored messages wait without poisoning the parser session.
+            let image = data.get_temp::<PathBuf>(egui::Id::unique("offline-markdown-image"))?;
+            let service = Self::new(image);
             data.insert_temp(identity, Arc::clone(&service));
-            service
+            Some(service)
         })
     }
 
-    fn new() -> Arc<Self> {
+    fn new(image: PathBuf) -> Arc<Self> {
         let shared = Arc::new(Shared::default());
         let (requests, pending) = mpsc::sync_channel(MAX_REQUESTS);
         let state = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("bonsai-markdown-supervisor".to_owned())
-            .spawn(move || supervise(&state, &pending));
+            .spawn(move || supervise(&state, &pending, &image));
         let worker = worker.map_or_else(
             |_| {
                 shared.fail();
@@ -277,7 +286,7 @@ fn next_request(shared: &Shared, requests: &Receiver<Request>) -> Option<Request
     None
 }
 
-fn supervise(shared: &Shared, requests: &Receiver<Request>) {
+fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
     let Some(first) = next_request(shared, requests) else {
         return;
     };
@@ -286,7 +295,7 @@ fn supervise(shared: &Shared, requests: &Receiver<Request>) {
         return;
     };
     let startup = Instant::now() + STARTUP_LIMIT;
-    let Ok(mut prepared) = ownership::Prepared::new() else {
+    let Ok(mut prepared) = ownership::Prepared::new(image) else {
         shared.fail();
         return;
     };
@@ -388,24 +397,23 @@ fn await_event(
     None
 }
 
-/// Hidden parser entry point. Ordinary desktop invocation cannot parse input;
-/// the trusted parent's launch establishes the stronger fixed PSEC/Job policy.
-pub(crate) fn run_worker(arguments: &[OsString]) -> std::process::ExitCode {
-    if arguments.len() != 1
-        || arguments[0] != "--markdown-worker"
-        || !bonsai_windows_credentials::is_app_container().unwrap_or(false)
-    {
-        return std::process::ExitCode::FAILURE;
-    }
-    match protocol::worker(&mut io::stdin().lock(), &mut io::stdout().lock()) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(_) => std::process::ExitCode::FAILURE,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+
+    #[test]
+    fn markdown_waits_for_prepared_image_and_reuses_one_context_service() -> io::Result<()> {
+        let context = egui::Context::default();
+        assert!(Service::get(&context).is_none());
+        Service::configure(&context, Path::new("C:\\prepared\\broker.exe"));
+        let first = Service::get(&context).ok_or_else(|| io::Error::other("Missing service"))?;
+        let second = Service::get(&context).ok_or_else(|| io::Error::other("Missing service"))?;
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!first.unavailable());
+        // No request is admitted here, so the supervisor never launches a child.
+        Ok(())
+    }
 
     #[test]
     fn markdown_queue_backpressure_is_temporary_and_rejection_stays_terminal() -> io::Result<()> {

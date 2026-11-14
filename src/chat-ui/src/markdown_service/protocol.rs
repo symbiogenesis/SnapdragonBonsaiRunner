@@ -1,5 +1,5 @@
 //! Fixed bounded framing, independent of the untrusted parser's output format.
-use super::{MAX_OUTPUT_BYTES, MAX_SOURCE_BYTES, Request, Ticket};
+use super::{MAX_OUTPUT_BYTES, Request, Ticket};
 use std::{
     io::{self, Read, Write},
     sync::mpsc::{Receiver, SyncSender},
@@ -80,22 +80,6 @@ pub(super) fn exchange(
         if ticket != request.ticket || events.send(Event::Response(ticket, bytes)).is_err() {
             return;
         }
-    }
-}
-
-pub(super) fn worker(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
-    write_frame(output, RESPONSE_MAGIC, Ticket(0), &[])?;
-    loop {
-        let (ticket, bytes) = read_frame(input, REQUEST_MAGIC, MAX_SOURCE_BYTES)?;
-        if ticket == Ticket(0) {
-            return Err(io::Error::other("Invalid Markdown request identity"));
-        }
-        let source = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
-        let rendered = crate::markdown_worker::parse(source);
-        if rendered.len() > MAX_OUTPUT_BYTES {
-            return Err(io::Error::other("Oversized Markdown result"));
-        }
-        write_frame(output, RESPONSE_MAGIC, ticket, &rendered)?;
     }
 }
 

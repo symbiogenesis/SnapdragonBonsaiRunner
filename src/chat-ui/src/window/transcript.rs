@@ -11,10 +11,6 @@ mod layout;
 mod message_controls;
 mod search;
 
-pub(super) fn markdown_worker_parse(source: &str) -> Vec<u8> {
-    formatting::parse_wire(source)
-}
-
 #[derive(Clone, Copy)]
 #[expect(
     clippy::struct_excessive_bools,

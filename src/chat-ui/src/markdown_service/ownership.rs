@@ -76,9 +76,8 @@ pub(super) struct Prepared {
 }
 
 impl Prepared {
-    pub(super) fn new() -> io::Result<Self> {
-        let executable = std::env::current_exe()?;
-        let retained = Executable::open(&executable)?;
+    pub(super) fn new(executable: &Path) -> io::Result<Self> {
+        let retained = Executable::open(executable)?;
         let scratch = PrivateDirectory::create(&std::env::temp_dir())?;
         let worker = scratch.path().join("worker");
         if let Err(error) = fs::create_dir(&worker) {
@@ -88,7 +87,7 @@ impl Prepared {
             return Err(error);
         }
         let specification = ProcessSpec {
-            executable: executable.clone(),
+            executable: executable.to_owned(),
             arguments: vec![OsString::from("--markdown-worker")],
             working_directory: worker.clone(),
             stdout: scratch.path().join("markdown.stdout"),
@@ -97,7 +96,7 @@ impl Prepared {
             active_process_limit: 1,
         };
         let policy = SandboxPolicy {
-            readonly_paths: vec![executable],
+            readonly_paths: vec![executable.to_owned()],
             writable_directory: worker,
         };
         Ok(Self {

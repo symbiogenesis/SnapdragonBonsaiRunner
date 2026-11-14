@@ -27,8 +27,6 @@ mod http;
 #[cfg(windows)]
 mod markdown_service;
 #[cfg(windows)]
-mod markdown_worker;
-#[cfg(windows)]
 mod native_speech;
 #[cfg(windows)]
 mod recovery;
@@ -372,12 +370,6 @@ fn validate_configuration(
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args
-        .first()
-        .is_some_and(|argument| argument == "--markdown-worker")
-    {
-        return markdown_service::run_worker(&args);
-    }
     if args
         .first()
         .is_some_and(|argument| argument == "--audio-import-worker")

@@ -17,7 +17,6 @@ httparse.workspace = true
 memchr.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-markdown-syntax = { version = "=0.7.2", default-features = false }
 bonsai-audio.workspace = true
 eframe = { version = "=0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "system_fonts", "wgpu_no_default_features"] }
 # Select all supported Windows backends explicitly for eframe's shared renderer.
@@ -33,6 +32,7 @@ windows-core = "=0.62.2"
 windows-future = "=0.3.2"
 
 [target.'cfg(windows)'.dev-dependencies]
+bonsai-markdown.workspace = true
 egui_kittest = { version = "=0.37.0", features = ["wgpu"] }
 egui_system_font_provider = "=0.37.0"
 

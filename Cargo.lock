@@ -502,6 +502,7 @@ version = "0.3.2"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-cpu-policy",
+ "bonsai-markdown",
  "bonsai-windows-credentials",
  "bonsai-windows-process",
  "http",
@@ -519,13 +520,13 @@ name = "bonsai-chat"
 version = "0.3.2"
 dependencies = [
  "bonsai-audio",
+ "bonsai-markdown",
  "bonsai-windows-credentials",
  "bonsai-windows-process",
  "eframe",
  "egui_kittest",
  "egui_system_font_provider",
  "httparse",
- "markdown-syntax",
  "memchr",
  "raw-window-handle",
  "serde",

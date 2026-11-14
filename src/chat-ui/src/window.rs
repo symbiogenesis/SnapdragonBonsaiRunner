@@ -75,10 +75,6 @@ mod sidebar_status;
 mod tests;
 mod transcript;
 
-/// Produce inert layout data only from the parser sandbox's hidden entry point.
-pub(crate) fn markdown_worker_parse(source: &str) -> Vec<u8> {
-    transcript::markdown_worker_parse(source)
-}
 mod updates;
 mod workspace;
 
@@ -131,6 +127,7 @@ struct State {
     commands: Sender<Command>,
     events: client::EventReceiver,
     worker: Option<JoinHandle<()>>,
+    markdown_image: Option<std::path::PathBuf>,
     startup_request: Option<crate::startup::Request>,
     startup: Option<crate::startup::Session>,
     setup: setup::Setup,
@@ -243,6 +240,7 @@ impl State {
             .and_then(|config| speech::start(config.canary.clone(), config.qwen_tts.clone()).ok());
         let mut state = Self::initial_state(commands, events, microphone, speech);
         if let Some(config) = config {
+            state.markdown_image = Some(config.broker.clone());
             state.model = ModelLifecycle::Preparing;
             state.preview = false;
             state.runtime_description = runtime_description(config);
@@ -275,6 +273,7 @@ impl State {
             commands,
             events,
             worker: None,
+            markdown_image: None,
             startup_request: None,
             startup: None,
             setup: setup::Setup::default(),
@@ -518,6 +517,7 @@ impl State {
         let (events, incoming_events) = client::event_channel();
         self.abliteration_enabled = config.use_abliterate_lora;
         self.runtime_description = runtime_description(&config);
+        self.markdown_image = Some(config.broker.clone());
         if !speech_pending {
             self.attach_speech_configuration(&config);
         }
@@ -2183,6 +2183,9 @@ impl eframe::App for State {
         let was_ready = self.model.ready();
         let was_busy = self.model.busy();
         self.poll_startup();
+        if let Some(image) = &self.markdown_image {
+            crate::markdown_service::Service::configure(ctx, image);
+        }
         self.drain_events();
         self.close_with_pending_update(ctx);
         self.poll_updates(ctx);

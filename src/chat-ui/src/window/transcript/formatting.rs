@@ -3,7 +3,6 @@
 use super::{egui, search};
 use std::{ops::Range, sync::Arc};
 
-mod markdown;
 mod pending;
 mod wire;
 pub(super) use pending::Pending;
@@ -87,129 +86,6 @@ pub(super) struct Layout {
     pub(super) source_map: Arc<SourceMap>,
 }
 
-struct Builder<'a> {
-    source: &'a str,
-    job: egui::text::LayoutJob,
-    source_map: SourceMap,
-    matches: &'a [search::Match],
-    next_match: usize,
-    visuals: &'a egui::Visuals,
-    normal: egui::TextFormat,
-    spans: usize,
-    limited: bool,
-}
-
-impl Builder<'_> {
-    fn append(&mut self, text: &str, source: Option<Range<usize>>, format: &egui::TextFormat) {
-        if text.is_empty() || self.limited {
-            return;
-        }
-        self.spans += 1;
-        if self.spans > MAX_STYLE_SPANS || self.job.text.len() + text.len() > MAX_RENDERED_BYTES {
-            self.limited = true;
-            return;
-        }
-        let display_start = self.job.text.len();
-        let Some(source) = source.filter(|range| !range.is_empty()) else {
-            self.job.append(text, 0.0, format.clone());
-            return;
-        };
-        let verbatim = self.source.get(source.clone()) == Some(text);
-        let mapping = Mapping {
-            source,
-            display: display_start..display_start + text.len(),
-            verbatim,
-        };
-        while self
-            .matches
-            .get(self.next_match)
-            .is_some_and(|found| found.range.end <= mapping.source.start)
-        {
-            self.next_match += 1;
-        }
-        let mut cursor = 0;
-        let mut index = self.next_match;
-        while let Some(found) = self
-            .matches
-            .get(index)
-            .filter(|found| found.range.start < mapping.source.end)
-        {
-            let start = if verbatim {
-                found.range.start.saturating_sub(mapping.source.start)
-            } else {
-                0
-            };
-            let end = if verbatim {
-                found.range.end.min(mapping.source.end) - mapping.source.start
-            } else {
-                text.len()
-            };
-            if cursor < start {
-                self.job.append(&text[cursor..start], 0.0, format.clone());
-            }
-            let mut highlighted = format.clone();
-            highlighted.background = self.visuals.selection.bg_fill;
-            highlighted.color = self.visuals.selection.stroke.color;
-            self.job
-                .append(&text[start.max(cursor)..end], 0.0, highlighted);
-            cursor = end;
-            if !verbatim {
-                break;
-            }
-            index += 1;
-        }
-        if cursor < text.len() {
-            self.job.append(&text[cursor..], 0.0, format.clone());
-        }
-        self.source_map.entries.push(mapping);
-    }
-
-    fn generated(&mut self, text: &str, format: &egui::TextFormat) {
-        self.append(text, None, format);
-    }
-
-    fn newlines(&mut self, count: usize) {
-        if self.job.text.is_empty() {
-            return;
-        }
-        let existing = self
-            .job
-            .text
-            .bytes()
-            .rev()
-            .take(count)
-            .take_while(|byte| *byte == b'\n')
-            .count();
-        let normal = self.normal.clone();
-        for _ in existing..count {
-            self.generated("\n", &normal);
-        }
-    }
-
-    fn literal(&mut self, span: Option<markdown_syntax::Span>, format: &egui::TextFormat) {
-        if let Some(span) = span
-            && let Some(text) = self.source.get(span.start..span.end)
-        {
-            self.append(text, Some(span.start..span.end), format);
-        }
-    }
-
-    fn value(
-        &mut self,
-        value: &str,
-        span: Option<markdown_syntax::Span>,
-        format: &egui::TextFormat,
-    ) {
-        let range = span.and_then(|span| {
-            let source = self.source.get(span.start..span.end)?;
-            Some(source.find(value).map_or(span.start..span.end, |offset| {
-                span.start + offset..span.start + offset + value.len()
-            }))
-        });
-        self.append(value, range, format);
-    }
-}
-
 fn plain(
     body: &str,
     width: f32,
@@ -247,51 +123,24 @@ fn plain(
     }
 }
 
-// Only the sandbox entry point and inert unit-test fixtures call the parser.
+#[cfg(test)]
 fn parse_layout(body: &str) -> Layout {
-    let width = 600.0;
-    let visuals = egui::Visuals::dark();
-    let text_size = 16.0;
-    let matches = &[];
-    let normal =
-        egui::TextFormat::simple(egui::FontId::proportional(text_size), visuals.text_color());
-    if body.len() > MAX_MARKDOWN_BYTES {
-        return plain(body, width, normal, &visuals, matches);
-    }
-    let mut builder = Builder {
-        source: body,
-        job: egui::text::LayoutJob {
-            text: String::with_capacity(body.len()),
-            ..Default::default()
-        },
-        source_map: SourceMap::default(),
-        matches,
-        next_match: 0,
-        visuals: &visuals,
-        normal: normal.clone(),
-        spans: 0,
-        limited: false,
-    };
-    let parsed = markdown_syntax::parse(body);
-    builder.blocks(&parsed.document.children, &normal, 0, false);
-    if body.ends_with('\n') {
-        builder.newlines(1);
-    }
-    builder.source_map.display_bytes = builder.job.text.len();
-    if builder.limited {
-        return plain(body, width, normal, &visuals, matches);
-    }
-    builder.job.wrap.max_width = width;
-    Layout {
-        job: builder.job,
-        source_map: Arc::new(builder.source_map),
-    }
+    wire::decode(body, &parse_wire(body)).unwrap_or_else(|| {
+        let visuals = egui::Visuals::dark();
+        plain(
+            body,
+            600.0,
+            egui::TextFormat::simple(egui::FontId::proportional(16.0), visuals.text_color()),
+            &visuals,
+            &[],
+        )
+    })
 }
 
+#[cfg(test)]
 pub(super) fn parse_wire(body: &str) -> Vec<u8> {
-    wire::encode(&parse_layout(body))
+    bonsai_markdown::parse(body)
 }
-
 pub(super) fn layout_job(
     body: &str,
     structured: bool,
