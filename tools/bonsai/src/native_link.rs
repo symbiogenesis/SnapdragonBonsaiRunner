@@ -18,6 +18,8 @@ const FILE_LIMIT: u64 = 256 * 1024 * 1024;
 const IMAGE_LIMIT: u64 = 32 * 1024 * 1024;
 const TOTAL_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
+mod coff;
+
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Identity {
@@ -360,7 +362,9 @@ fn verify_inputs(
     linker: &Identity,
     outputs: &BTreeSet<String>,
     covered: &mut BTreeSet<String>,
+    runtime_symbols: Option<&mut BTreeMap<String, Value>>,
 ) -> Result<()> {
+    let mut runtime_symbols = runtime_symbols;
     let arguments = verify_arguments(link, linker)?;
     let linker = path_key(&linker.path)?;
     let mut inputs = BTreeSet::new();
@@ -395,12 +399,36 @@ fn verify_inputs(
                         "Native link compiled object differs from the source selection.".into(),
                     );
                 }
-                covered.insert(key);
+                covered.insert(key.clone());
             }
             InputKind::Library | InputKind::ToolchainObject if objects.contains_key(&key) => {
                 return Err("Native link cannot relabel a selected compiled object.".into());
             }
             InputKind::Library | InputKind::ToolchainObject => {}
+        }
+        if let Some(observations) = runtime_symbols.as_deref_mut()
+            && !observations.contains_key(&key)
+        {
+            let symbols = coff::inspect(
+                &intake.read(&input.identity, FILE_LIMIT)?,
+                matches!(input.kind, InputKind::Library),
+            )?;
+            let symbols: Vec<_> = symbols
+                .into_iter()
+                .map(|symbol| {
+                    json!({
+                        "archiveMemberOffset":symbol.member_offset,
+                        "symbol":symbol.symbol, "binding":symbol.binding
+                    })
+                })
+                .collect();
+            observations.insert(
+                key,
+                json!({
+                    "path":input.identity.path, "bytes":input.identity.bytes,
+                    "sha256":input.identity.sha256, "knownCppEhSymbols":symbols
+                }),
+            );
         }
     }
     if inputs != arguments {
@@ -410,7 +438,7 @@ fn verify_inputs(
 }
 
 fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
-    if manifest.schema_version != 1
+    if ![1, 2].contains(&manifest.schema_version)
         || manifest.kind != "selected-lld-arm64-link-package"
         || !(1..=128).contains(&manifest.links.len())
     {
@@ -435,6 +463,7 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
     }
     let mut packaged_images = BTreeSet::new();
     let mut imported_systems = BTreeSet::new();
+    let mut runtime_symbols = BTreeMap::new();
     for link in &manifest.links {
         verify_inputs(
             link,
@@ -443,6 +472,7 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
             &manifest.linker,
             &outputs,
             &mut covered,
+            (manifest.schema_version == 2).then_some(&mut runtime_symbols),
         )?;
         let file = package
             .get(&link.package_name)
@@ -488,6 +518,7 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
     }
     Ok(json!({
         "schemaVersion":1, "kind":"selected-native-link-package-verification", "passed":true,
+        "manifestSchemaVersion":manifest.schema_version,
         "sourceManifestSha256":manifest.source_manifest.sha256,
         "sourceReceiptSha256":manifest.source_receipt.sha256,
         "linkerSha256":manifest.linker.sha256, "translationUnits":objects.len(),
@@ -496,6 +527,9 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
         "sourceClosureReexecuted":false, "independentSourceReceiptReviewRequired":true,
         "freshLinkerExecution":false, "systemDependencyClosureChecked":false,
         "staticLibrarySourceClosureChecked":false, "cppRuntimeAbsenceQualified":false,
+        "coffRuntimeSymbolsChecked":manifest.schema_version == 2,
+        "coffRuntimeSymbolInputs":runtime_symbols.into_values().collect::<Vec<_>>(),
+        "archiveMemberLinkSelectionChecked":false,
         "nativeRetirementQualified":false
     }))
 }

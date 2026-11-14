@@ -95,10 +95,36 @@ fn image() -> Vec<u8> {
     bytes
 }
 
+fn coff_object(defined: bool) -> Vec<u8> {
+    let mut bytes = vec![0; 101];
+    put16(&mut bytes, 0, 0xaa64);
+    put16(&mut bytes, 2, 1);
+    put32(&mut bytes, 8, 60);
+    put32(&mut bytes, 12, 1);
+    put32(&mut bytes, 64, 4);
+    put16(&mut bytes, 72, u16::from(defined));
+    bytes[76] = 2;
+    put32(&mut bytes, 78, 23);
+    bytes[82..].copy_from_slice(b"__CxxFrameHandler3\0");
+    bytes
+}
+
+fn coff_archive() -> Vec<u8> {
+    let mut bytes = b"!<arch>\n".to_vec();
+    let mut header = [b' '; 60];
+    header[..12].copy_from_slice(b"runtime.obj/");
+    header[48..51].copy_from_slice(b"101");
+    header[58..].copy_from_slice(b"`\n");
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&coff_object(true));
+    bytes.push(b'\n');
+    bytes
+}
+
 fn fixture(scratch: &Scratch) -> std::result::Result<Capture, Box<dyn std::error::Error>> {
-    let object = scratch.file("source.obj", b"literal original object bytes")?;
+    let object = scratch.file("source.obj", &coff_object(false))?;
     let linker = scratch.file("lld-link.exe", b"literal original linker bytes")?;
-    let library = scratch.file("system.lib", b"literal original import-library bytes")?;
+    let library = scratch.file("system.lib", &coff_archive())?;
     let source = scratch.document(
         "source-manifest.json",
         &json!({
@@ -186,6 +212,60 @@ fn native_link_literal_package_binds_all_objects_imports_and_limits_claims() -> 
     assert_eq!(receipt["independentSourceReceiptReviewRequired"], true);
     assert_eq!(receipt["cppRuntimeAbsenceQualified"], false);
     assert_eq!(receipt["nativeRetirementQualified"], false);
+    assert_eq!(receipt["coffRuntimeSymbolsChecked"], false);
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_two_reports_coff_runtime_evidence_without_an_absence_verdict() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut manifest = fixture(&scratch)?;
+    manifest.schema_version = 2;
+    let receipt = verify(&manifest, &mut Intake::default())?;
+    assert_eq!(receipt["coffRuntimeSymbolsChecked"], true);
+    let inputs = receipt["coffRuntimeSymbolInputs"]
+        .as_array()
+        .ok_or("Missing COFF inputs")?;
+    assert_eq!(inputs.len(), 2);
+    for (file, binding, member) in [
+        ("source.obj", "undefined", Value::Null),
+        ("system.lib", "defined", json!(8)),
+    ] {
+        let input = inputs
+            .iter()
+            .find(|input| {
+                input["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(file))
+            })
+            .ok_or("Missing COFF input")?;
+        assert_eq!(
+            input["knownCppEhSymbols"],
+            json!([{
+                "archiveMemberOffset":member,"symbol":"__CxxFrameHandler3","binding":binding
+            }])
+        );
+        assert!(
+            input["sha256"]
+                .as_str()
+                .is_some_and(|hash| is_lower_hex(hash, 64))
+        );
+    }
+    assert_eq!(receipt["archiveMemberLinkSelectionChecked"], false);
+    assert_eq!(receipt["cppRuntimeAbsenceQualified"], false);
+    assert_eq!(receipt["nativeRetirementQualified"], false);
+
+    // Schema 1 replays its original scope. Schema 2 refuses opaque input bytes
+    // rather than silently treating unsupported inputs as symbol-free.
+    manifest.links[0].inputs[1].identity =
+        scratch.file("system.lib", b"opaque old library fixture")?;
+    manifest.schema_version = 1;
+    verify(&manifest, &mut Intake::default())?;
+    manifest.schema_version = 2;
+    rejected(
+        verify(&manifest, &mut Intake::default()),
+        "COFF runtime inspection requires an ordinary MSVC archive.",
+    );
     Ok(())
 }
 
