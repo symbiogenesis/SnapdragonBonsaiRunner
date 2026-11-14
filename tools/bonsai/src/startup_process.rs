@@ -149,7 +149,14 @@ struct ChildGuard {
     child: OwnedProcess,
     #[cfg(not(windows))]
     child: Child,
-    finished: bool,
+    cleanup: CleanupState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupState {
+    Pending,
+    Confirmed,
+    Unconfirmed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -186,28 +193,21 @@ impl ChildGuard {
         }
     }
 
-    #[cfg_attr(
-        windows,
-        expect(
-            clippy::needless_pass_by_ref_mut,
-            reason = "The non-Windows std::process::Child kill/wait API requires a mutable borrow."
-        )
-    )]
     fn stop(&mut self) -> crate::Result<()> {
-        #[cfg(windows)]
-        {
-            self.child
-                .stop(Duration::from_secs(5))
-                .map_err(|error| error.to_string())
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = self.child.kill();
-            self.child
-                .wait()
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        }
+        let child = &mut self.child;
+        cleanup_once(&mut self.cleanup, || {
+            #[cfg(windows)]
+            {
+                child
+                    .stop(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = child.kill();
+                child.wait().map(|_| ()).map_err(|error| error.to_string())
+            }
+        })
     }
 
     fn stop_after_exit(&mut self, policy: ExitPolicy) -> crate::Result<u32> {
@@ -236,14 +236,30 @@ impl ChildGuard {
             0
         };
         self.stop()?;
-        self.finished = true;
         Ok(survivors)
     }
 }
 
+fn cleanup_once(
+    state: &mut CleanupState,
+    cleanup: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<()> {
+    // Mark the allowance spent before calling native code, including a failed
+    // natural-root-exit stop. Drop may close the Job but must not renew its wait.
+    if *state != CleanupState::Pending {
+        return Err("Owned process cleanup allowance was already spent.".into());
+    }
+    *state = CleanupState::Unconfirmed;
+    let result = cleanup();
+    if result.is_ok() {
+        *state = CleanupState::Confirmed;
+    }
+    result
+}
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if !self.finished {
+        if self.cleanup == CleanupState::Pending {
             let _ = self.stop();
         }
     }
@@ -470,18 +486,32 @@ fn fail_owned(
     stderr: &Path,
 ) -> crate::Result<ProcessOutput> {
     let status = guard.try_wait();
-    let cleanup = if guard.finished { Ok(()) } else { guard.stop() };
-    // Spend the existing cleanup allowance once. Dropping still closes the
-    // kill-on-close Job, but must not begin a second five-second wait after an
-    // unconfirmed stop. The receipt and returned error keep that failure open.
-    guard.finished = true;
-    write_failure_log(log, message, &status, &cleanup, stdout, stderr)?;
+    let cleanup = if guard.cleanup == CleanupState::Confirmed {
+        Ok(())
+    } else {
+        guard.stop()
+    };
+    let evidence = write_failure_log(log, message, &status, &cleanup, stdout, stderr);
+    Err(failure_error(log, message, &cleanup, &evidence))
+}
+
+fn failure_error(
+    log: &Path,
+    message: &str,
+    cleanup: &crate::Result<()>,
+    evidence: &crate::Result<()>,
+) -> String {
     let cleanup = if cleanup.is_ok() {
         ""
     } else {
         " Owned process cleanup could not be confirmed."
     };
-    Err(format!("{message}{cleanup} Evidence: {}", log.display()))
+    let evidence = if evidence.is_ok() {
+        ""
+    } else {
+        " Failure evidence could not be written."
+    };
+    format!("{message}{cleanup}{evidence} Evidence: {}", log.display())
 }
 
 fn run_owned(
@@ -544,7 +574,7 @@ fn run_owned(
     };
     let mut guard = ChildGuard {
         child,
-        finished: false,
+        cleanup: CleanupState::Pending,
     };
     let started = Instant::now();
     let status = loop {
@@ -574,7 +604,10 @@ fn run_owned(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let survivors = guard.stop_after_exit(policy)?;
+    let survivors = match guard.stop_after_exit(policy) {
+        Ok(survivors) => survivors,
+        Err(error) => return fail_owned(&mut guard, log, &error, &stdout_path, &stderr_path),
+    };
     if let Err(error) = checkpoint() {
         return fail_owned(&mut guard, log, &error, &stdout_path, &stderr_path);
     }
@@ -596,6 +629,77 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use std::os::windows::process::CommandExt as _;
+
+    #[test]
+    fn failed_explicit_cleanup_spends_its_allowance_before_drop() {
+        for outcome in [Ok(()), Err("Synthetic native cleanup failure.".into())] {
+            let mut cleanup = CleanupState::Pending;
+            let mut calls = 0;
+            let expected = outcome.clone();
+            assert_eq!(
+                cleanup_once(&mut cleanup, || {
+                    calls += 1;
+                    outcome
+                }),
+                expected
+            );
+            assert_eq!(
+                cleanup,
+                if expected.is_ok() {
+                    CleanupState::Confirmed
+                } else {
+                    CleanupState::Unconfirmed
+                }
+            );
+            // This is the same state checked by ChildGuard::drop after a root
+            // has exited. A failed native stop cannot grant another wait.
+            if cleanup == CleanupState::Pending {
+                let _cleanup = cleanup_once(&mut cleanup, || {
+                    calls += 1;
+                    Ok(())
+                });
+            }
+            assert!(
+                cleanup_once(&mut cleanup, || {
+                    calls += 1;
+                    Ok(())
+                })
+                .is_err_and(|error| error == "Owned process cleanup allowance was already spent.")
+            );
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn failure_evidence_write_error_preserves_cause_and_unconfirmed_cleanup() -> crate::Result<()> {
+        let scratch = std::env::temp_dir().join(format!("Bonsai-Process-Failure-{}", unique()));
+        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let status = Ok(None);
+        let cleanup = Err("private native cleanup error".into());
+        // Writing a file over an existing directory fails independently of
+        // device permissions; no process or timing fixture is needed.
+        let evidence = write_failure_log(
+            &scratch,
+            "Original startup cancellation.",
+            &status,
+            &cleanup,
+            &scratch.join("capture.stdout"),
+            &scratch.join("capture.stderr"),
+        );
+        assert!(evidence.is_err());
+        let returned = failure_error(
+            &scratch,
+            "Original startup cancellation.",
+            &cleanup,
+            &evidence,
+        );
+        assert!(returned.starts_with("Original startup cancellation."));
+        assert!(returned.contains("Owned process cleanup could not be confirmed."));
+        assert!(returned.contains("Failure evidence could not be written."));
+        assert!(!returned.contains("private native cleanup error"));
+        assert!(returned.ends_with(&format!("Evidence: {}", scratch.display())));
+        fs::remove_dir(scratch).map_err(|error| error.to_string())
+    }
 
     #[test]
     fn failure_summary_preserves_exit_code_without_copying_capture_contents() {
