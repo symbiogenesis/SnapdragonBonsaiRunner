@@ -45,6 +45,11 @@ try {
     if ($identity[0] -cne $version) { throw "Expected actionlint $version; received $($identity[0])." }
     $workflows = @(Get-ChildItem -LiteralPath (Join-Path $Root '.github/workflows') -File | Where-Object { $_.Extension -cin @('.yml', '.yaml') } | Sort-Object Name | ForEach-Object FullName)
     if (-not $workflows.Count) { throw 'No workflow manifests found.' }
+    # Immutable push snapshots intentionally have no Git metadata. Do not rely
+    # on actionlint's Git-root discovery to find our custom runner labels there.
+    $lintArguments = @('-shellcheck=', '-pyflakes=', '-no-color')
+    $configuration = Join-Path $Root '.github/actionlint.yaml'
+    if (Test-Path -LiteralPath $configuration -PathType Leaf) { $lintArguments += @('-config-file', $configuration) }
     Push-Location -LiteralPath $Root
     try {
         # Keep validation identical across hosts; neither optional linter is
@@ -62,7 +67,7 @@ try {
                 }
             }
             $source = $lines -join "`n"
-            $source | & $ActionlintPath -shellcheck= -pyflakes= -no-color -stdin-filename $workflow -
+            $source | & $ActionlintPath @lintArguments -stdin-filename $workflow -
         }
     } finally { Pop-Location }
     "Workflow syntax policy passed: $($workflows.Count) manifests (actionlint $version)."

@@ -2,10 +2,11 @@
 param([Parameter(Mandatory)][string]$ActionlintPath, [string]$Case)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
 $checker = Join-Path $PSScriptRoot 'check_workflow_syntax.ps1'
-function Invoke-SyntaxFixture([string]$Source, [bool]$Reject = $false) {
+function Invoke-SyntaxFixture([string]$Source, [bool]$Reject = $false, [bool]$WithoutGit = $false) {
     $scratch = New-CiScratch 'bonsai-workflow-syntax-'
     try {
-        [void][IO.Directory]::CreateDirectory((Join-Path $scratch '.git'))
+        if (-not $WithoutGit) { [void][IO.Directory]::CreateDirectory((Join-Path $scratch '.git')) }
+        if ($WithoutGit) { Write-CiFixture $scratch '.github/actionlint.yaml' "self-hosted-runner:`n  labels:`n    - fixture-snapdragon`n" }
         Write-CiFixture $scratch '.github/workflows/fixture.yml' $Source
         Write-CiFixture $scratch '.github/actions/fixture/action.yml' @'
 name: Fixture
@@ -40,6 +41,9 @@ jobs:
           Write-Output 'uses: $/literal-text'
 '@
 $cases = [ordered]@{
+    snapshot_custom_runner_labels_use_explicit_configuration = {
+        Invoke-SyntaxFixture ($valid.Replace('runs-on: ubuntu-latest', 'runs-on: [self-hosted, fixture-snapdragon]')) $false $true
+    }
     same_repository_action_and_script_text_pass = { Invoke-SyntaxFixture $valid }
     quoted_same_repository_action_keys_pass = {
         Invoke-SyntaxFixture ($valid.Replace('uses: $/', "'uses': `$/"))
