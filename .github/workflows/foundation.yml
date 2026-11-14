@@ -116,7 +116,7 @@ jobs:
         with:
           lane: ${{ matrix.lane }}
           incremental: 'true'
-          packages: ${{ matrix.lane == 'ui' && '["bonsai-chat"]' || '["bonsai-broker","bonsai-speech-service"]' }}
+          packages: ${{ matrix.lane == 'ui' && '["bonsai-chat"]' || '["bonsai-broker","bonsai-markdown","bonsai-speech-service"]' }}
           affected: ${{ needs.changes.outputs.packages }}
   maintenance:
     if: needs.changes.outputs.maintenance == 'true'

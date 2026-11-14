@@ -60,6 +60,7 @@
     "broker": {
       "packages": [
         "bonsai-broker",
+        "bonsai-markdown",
         "bonsai-speech-service"
       ]
     },
@@ -96,6 +97,7 @@
       ],
       "exclude_packages": [
         "bonsai-broker",
+        "bonsai-markdown",
         "bonsai-chat",
         "bonsai-speech-asr",
         "bonsai-speech-tts",

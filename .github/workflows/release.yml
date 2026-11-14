@@ -95,7 +95,7 @@ jobs:
             packages: '["bonsai-tools","bonsai-ci","bonsai-artifacts","bonsai-audio","bonsai-cpu-policy","bonsai-windows-process","bonsai-windows-credentials"]'
             executable: bonsai-tools.exe
           - lane: core
-            packages: '["bonsai-broker","bonsai-speech-service"]'
+            packages: '["bonsai-broker","bonsai-markdown","bonsai-speech-service"]'
             executable: bonsai-broker.exe
           - lane: ui
             packages: '["bonsai-chat"]'
