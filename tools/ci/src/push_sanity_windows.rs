@@ -245,14 +245,64 @@ impl Work {
         // Adapter controls execute candidate bodies. Inspect Rust formatting
         // before those bodies can modify the materialized committed snapshot.
         if plan.rust {
-            self.command(
-                source,
-                "cargo.exe",
-                &["fmt".into(), "--all".into(), "--".into(), "--check".into()],
-                BTreeMap::new(),
-            )?;
+            self.format_check(source)?;
         }
         self.script_calls(root, source, &calls)?;
+        Ok(())
+    }
+
+    fn format_check(&mut self, source: &Path) -> Result<()> {
+        let toolchain = super::super::push_format::toolchain(source)?;
+        #[cfg(test)]
+        let environment = BTreeMap::new();
+        #[cfg(not(test))]
+        let environment = {
+            let image = self.command(
+                source,
+                "rustup.exe",
+                &[
+                    "which".into(),
+                    "--toolchain".into(),
+                    toolchain.clone().into(),
+                    "rustfmt".into(),
+                ],
+                BTreeMap::new(),
+            )?;
+            let image = std::str::from_utf8(&image)
+                .map_err(|error| error.to_string())?
+                .trim();
+            let adapter = std::env::current_exe().map_err(|error| error.to_string())?;
+            let remaining = 270_000_u128
+                .checked_sub(self.started.elapsed().as_millis())
+                .filter(|remaining| *remaining >= 6000)
+                .ok_or("Push sanity has no formatting work and cleanup allowance remaining.")?;
+            BTreeMap::from([
+                (
+                    "RUSTFMT".into(),
+                    adapter
+                        .to_str()
+                        .ok_or("Formatter adapter path must be UTF-8.")?
+                        .into(),
+                ),
+                (super::super::push_format::IMAGE.into(), image.into()),
+                (
+                    super::super::push_format::BUDGET.into(),
+                    remaining.to_string(),
+                ),
+            ])
+        };
+        self.command(
+            source,
+            "cargo.exe",
+            &[
+                format!("+{toolchain}").into(),
+                "fmt".into(),
+                "--all".into(),
+                "--".into(),
+                "--check".into(),
+            ],
+            environment,
+        )?;
         Ok(())
     }
 

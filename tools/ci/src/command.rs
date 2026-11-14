@@ -36,6 +36,9 @@ mod native_boundary;
 #[path = "push_sanity.rs"]
 mod push_sanity;
 
+#[path = "push_format.rs"]
+mod push_format;
+
 const USAGE: &str = "Usage: bonsai-ci impact [--root PATH] [--config PATH] [--workflow FILE] [--before REV] [--after REV] [--full]\n       bonsai-ci gate [--root PATH] [--config PATH] --workflow NAME\n       bonsai-ci rust-select --root PATH\n       bonsai-ci rust-plan --root PATH [--package NAME] [--phase PHASE]\n       bonsai-ci rust-check --root PATH --target PATH --evidence PATH [--package NAME] [--phase PHASE]";
 
 #[derive(Default)]
@@ -173,6 +176,9 @@ fn native_operation(arguments: &[OsString]) -> Option<Result<String>> {
 /// Rejects invalid arguments/configuration, failed output writes and incomplete
 /// or unsuccessful selected gates. Baseline failures select full coverage.
 pub fn run(arguments: &[OsString]) -> Result<String> {
+    if push_format::selected(arguments) {
+        return push_format::run(arguments);
+    }
     if let Some(result) = native_operation(arguments) {
         return result;
     }

@@ -104,7 +104,7 @@ fn extension(path: &str, expected: &str) -> bool {
         .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
 }
 
-fn canonical_path(path: PathBuf) -> Result<PathBuf> {
+pub(super) fn canonical_path(path: PathBuf) -> Result<PathBuf> {
     let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
     // Canonical Windows paths have a verbatim prefix. The Job boundary accepts
     // ordinary drive/UNC paths and deliberately rejects device path spellings.
