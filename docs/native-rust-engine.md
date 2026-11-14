@@ -315,7 +315,8 @@ File scores also retain `evidenceManifest.bytes` and `evidenceManifest.sha256`
 over the exact input file bytes before parsing. This digest differs from the
 canonical JSON `policySha256`. Completed gate records include the verified
 relative `reportFile` and service `harness.packageFile` for archive retrieval;
-pending attachments expose no unverified retrieval path. Archive the original
+pending attachments expose no unverified retrieval path, report digest, execution,
+runtime or reviewer provenance. Their review note remains visible. Archive the original
 manifest and those files with the score.
 Independently review CI/source/report/reviewer identities and require `promotionReady:
 true` before claiming full qualification or promoting PTQ1; command success alone
@@ -384,7 +385,7 @@ shape:
 }
 ```
 
-Each completed (`passed` or `rejected`) gate requires a nonempty report, bounded to 16
+Each completed (`passed` or `rejected`) gate requires a nonblank report, bounded to 16
 MiB, with an exact lowercase SHA-256 and a relative path without traversal. Reports must
 remain outside Git, namespace paths and reparse points. Runtime gates bind the selected
 Prism source revision except the explicitly separated released-service harness;

@@ -403,21 +403,68 @@ fn stale_artifacts_unknown_duplicate_and_array_records_reject() -> crate::Result
 }
 
 #[test]
-fn pending_attachments_do_not_advertise_unverified_retrieval_paths() -> crate::Result<()> {
+fn pending_attachments_do_not_advertise_unverified_provenance_or_retrieval_paths()
+-> crate::Result<()> {
     let policy = policy_fixture()?;
     let mut input = evidence(&policy)?;
     input["gates"] = json!([{
         "id": SERVICE_GATE, "status": "pending", "note": "Capture and review remain pending.",
         "report": {"file": "../uncollected.json", "sha256": "0".repeat(64)},
+        "execution": {"repository": "unreviewed/repository", "revision": "unreviewed",
+            "gitRef": "unreviewed", "runId": "0", "runAttempt": 0, "architecture": "unknown",
+            "deviceModel": "unknown", "processorName": "unreviewed", "selfHosted": false},
+        "reviewerId": "unreviewed", "humanReviewed": true,
+        "testedRuntime": {"revision": "unreviewed"},
         "harness": {"workflowPath": "unreviewed", "artifactId": "0", "artifactName": "pending",
             "package": {"file": "../uncollected.zip", "sha256": "0".repeat(64)}}
     }]);
     let scored = score(input, &policy, &std::env::temp_dir())?;
     assert_eq!(scored["promotionReady"], false);
     assert_eq!(scored["gateCounts"]["passed"], 0);
-    assert_eq!(scored["gates"][16]["reportFile"], Value::Null);
-    assert_eq!(scored["gates"][16]["harness"], Value::Null);
+    for field in [
+        "reviewerId",
+        "runUrl",
+        "executionRepository",
+        "executionRevision",
+        "deviceModel",
+        "processorName",
+        "reportFile",
+        "reportSha256",
+        "testedRuntime",
+        "harness",
+    ] {
+        assert_eq!(scored["gates"][16][field], Value::Null, "{field}");
+    }
+    assert_eq!(scored["gates"][16]["humanReviewed"], false);
+    assert_eq!(
+        scored["gates"][16]["note"],
+        "Capture and review remain pending."
+    );
     Ok(())
+}
+
+#[test]
+fn whitespace_only_reports_cannot_support_completed_gates() -> crate::Result<()> {
+    let directory =
+        std::env::temp_dir().join(format!("Promotion-Blank-Report-{}", std::process::id()));
+    std::fs::create_dir(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join("report.json");
+    let result = (|| {
+        for bytes in [b" \r\n\t".as_slice(), "\u{a0}\u{2003}".as_bytes()] {
+            std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+            let report = Report {
+                file: "report.json".into(),
+                sha256: sha256(bytes),
+            };
+            assert!(validate_report(&report, &directory, RetainedKind::Report).is_err());
+            // Binary harness packages retain byte integrity without a text-content gate.
+            validate_report(&report, &directory, RetainedKind::Harness)?;
+        }
+        Ok(())
+    })();
+    std::fs::remove_file(path).map_err(|error| error.to_string())?;
+    std::fs::remove_dir(directory).map_err(|error| error.to_string())?;
+    result
 }
 
 fn assert_service_rejections(input: &Value, policy: &Value, directory: &Path) -> crate::Result<()> {

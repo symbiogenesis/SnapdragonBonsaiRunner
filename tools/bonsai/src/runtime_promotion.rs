@@ -252,6 +252,11 @@ struct Report {
     sha256: String,
 }
 
+enum RetainedKind {
+    Report,
+    Harness,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Execution {
@@ -479,7 +484,7 @@ fn validate_record(
         .report
         .as_ref()
         .ok_or("Completed promotion gate is missing its report.")?;
-    validate_report(report, directory, REPORT_LIMIT)?;
+    validate_report(report, directory, RetainedKind::Report)?;
     let execution = record
         .execution
         .as_ref()
@@ -535,7 +540,7 @@ fn validate_record(
     Ok(())
 }
 
-fn validate_report(report: &Report, directory: &Path, limit: u64) -> crate::Result<()> {
+fn validate_report(report: &Report, directory: &Path, kind: RetainedKind) -> crate::Result<()> {
     require(
         !report.file.as_os_str().is_empty()
             && report
@@ -548,10 +553,19 @@ fn validate_report(report: &Report, directory: &Path, limit: u64) -> crate::Resu
         is_lower_hex(&report.sha256, 64),
         "Promotion report digest is invalid.",
     )?;
+    let (limit, require_nonblank) = match kind {
+        RetainedKind::Report => (REPORT_LIMIT, true),
+        RetainedKind::Harness => (HARNESS_LIMIT, false),
+    };
     let bytes = read(&directory.join(&report.file), limit)?;
     require(
         !bytes.is_empty() && sha256(&bytes) == report.sha256,
         "Promotion report is empty or its digest does not match.",
+    )?;
+    require(
+        !require_nonblank
+            || !matches!(std::str::from_utf8(&bytes), Ok(text) if text.trim().is_empty()),
+        "A whitespace-only report cannot support a completed promotion gate.",
     )?;
     Ok(())
 }
@@ -608,7 +622,7 @@ fn validate_service(record: &Record, policy: &Value, directory: &Path) -> crate:
             && harness.artifact_name == artifact,
         "Released service evidence must identify the owning workflow and retained harness artifact.",
     )?;
-    validate_report(&harness.package, directory, HARNESS_LIMIT)
+    validate_report(&harness.package, directory, RetainedKind::Harness)
 }
 
 fn score(value: Value, policy: &Value, directory: &Path) -> crate::Result<Value> {
@@ -690,21 +704,17 @@ fn score(value: Value, policy: &Value, directory: &Path) -> crate::Result<Value>
             Status::Pending => pending += 1,
             Status::Rejected => rejected += 1,
         }
-        let run_url = record
-            .and_then(|record| record.execution.as_ref())
-            .map(|execution| {
-                format!(
-                    "https://github.com/{}/actions/runs/{}/attempts/{}",
-                    execution.repository, execution.run_id, execution.run_attempt
-                )
-            });
-        let retained_report = record
-            .filter(|record| record.status != Status::Pending)
-            .and_then(|record| record.report.as_ref());
-        let retained_harness = record
-            .filter(|record| record.status != Status::Pending)
-            .and_then(|record| record.harness.as_ref());
-        verdicts.push(json!({"id": gate.id, "status": match verdict {Status::Passed => "passed", Status::Pending => "pending", Status::Rejected => "rejected"}, "repository": gate.repository, "requirement": gate_requirement(gate, ptq1), "snapdragonRequired": gate.device, "humanReviewRequired": gate.human, "note": record.map(|record| &record.note), "reviewerId": record.and_then(|record| record.reviewer_id.as_ref()), "humanReviewed": record.is_some_and(|record| record.human_reviewed), "runUrl": run_url, "executionRepository": record.and_then(|record| record.execution.as_ref()).map(|execution| &execution.repository), "executionRevision": record.and_then(|record| record.execution.as_ref()).map(|execution| &execution.revision), "deviceModel": record.and_then(|record| record.execution.as_ref()).map(|execution| &execution.device_model), "processorName": record.and_then(|record| record.execution.as_ref()).and_then(|execution| execution.processor_name.as_ref()), "reportFile": retained_report.map(|report| &report.file), "reportSha256": record.and_then(|record| record.report.as_ref()).map(|report| &report.sha256), "testedRuntime": record.and_then(|record| record.tested_runtime.as_ref()), "harness": retained_harness.map(|harness| json!({"workflowPath": harness.workflow_path, "artifactId": harness.artifact_id, "artifactName": harness.artifact_name, "packageFile": harness.package.file, "packageSha256": harness.package.sha256}))}));
+        let completed_record = record.filter(|record| record.status != Status::Pending);
+        let retained_execution = completed_record.and_then(|record| record.execution.as_ref());
+        let run_url = retained_execution.map(|execution| {
+            format!(
+                "https://github.com/{}/actions/runs/{}/attempts/{}",
+                execution.repository, execution.run_id, execution.run_attempt
+            )
+        });
+        let retained_report = completed_record.and_then(|record| record.report.as_ref());
+        let retained_harness = completed_record.and_then(|record| record.harness.as_ref());
+        verdicts.push(json!({"id": gate.id, "status": match verdict {Status::Passed => "passed", Status::Pending => "pending", Status::Rejected => "rejected"}, "repository": gate.repository, "requirement": gate_requirement(gate, ptq1), "snapdragonRequired": gate.device, "humanReviewRequired": gate.human, "note": record.map(|record| &record.note), "reviewerId": completed_record.and_then(|record| record.reviewer_id.as_ref()), "humanReviewed": completed_record.is_some_and(|record| record.human_reviewed), "runUrl": run_url, "executionRepository": retained_execution.map(|execution| &execution.repository), "executionRevision": retained_execution.map(|execution| &execution.revision), "deviceModel": retained_execution.map(|execution| &execution.device_model), "processorName": retained_execution.and_then(|execution| execution.processor_name.as_ref()), "reportFile": retained_report.map(|report| &report.file), "reportSha256": retained_report.map(|report| &report.sha256), "testedRuntime": completed_record.and_then(|record| record.tested_runtime.as_ref()), "harness": retained_harness.map(|harness| json!({"workflowPath": harness.workflow_path, "artifactId": harness.artifact_id, "artifactName": harness.artifact_name, "packageFile": harness.package.file, "packageSha256": harness.package.sha256}))}));
     }
     Ok(
         json!({"schemaVersion": 2, "policySha256": evidence.policy_sha256, "profile": policy["profile"], "identities": policy["identities"], "status": match status {Status::Passed => "passed", Status::Pending => "pending", Status::Rejected => "rejected"}, "promotionReady": status == Status::Passed, "gateCounts": {"passed": passed, "pending": pending, "rejected": rejected}, "deviceFamily": device_family.map(SnapdragonFamily::device_model), "gates": verdicts, "scope": "Offline integrity and reviewer-attested evidence completeness only for the selected representation. CI provenance and human identity require independent review. Does not collect qualification, authenticate attestations or enable serving defaults."}),
