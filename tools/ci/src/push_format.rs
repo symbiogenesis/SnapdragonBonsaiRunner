@@ -123,12 +123,13 @@ fn execute(image: &Path, arguments: &[OsString], milliseconds: u64) -> Result<St
         std::env::current_dir().map_err(|error| error.to_string())?,
     )?;
     let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let mut groups = groups(arguments, workers)?;
     // Preserve Rustfmt's single-session ordering for external targets or local
     // configuration overrides. The normal workspace shares its root config.
-    if !shared_configuration(arguments, &working) {
-        groups = self::groups(arguments, 1)?;
-    }
+    let groups = if shared_configuration(arguments, &working) {
+        groups(arguments, workers)?
+    } else {
+        groups(arguments, 1)?
+    };
     fs::create_dir(&directory).map_err(|error| error.to_string())?;
     let mut jobs = Vec::<(OwnedProcess, PathBuf, PathBuf, Option<u32>)>::new();
     let result: Result<()> = (|| {

@@ -126,7 +126,8 @@ impl Work {
         }
         let output = fs::read(&stdout).map_err(|error| error.to_string())?;
         if std::env::var("BONSAI_PUSH_TIMINGS").as_deref() == Ok("1") {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "Push sanity timing: {program} {arguments:?}: {:?}.",
                 command_started.elapsed()
             );
