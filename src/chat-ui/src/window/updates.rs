@@ -946,6 +946,11 @@ mod tests {
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
         harness.run();
         assert_ne!(harness.state().active_conversation, original);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(crate::client::Command::NewChat)
+        ));
+        assert!(commands.try_recv().is_err());
         harness
             .get_by_role_and_label(egui::Role::Button, "Later")
             .click();
