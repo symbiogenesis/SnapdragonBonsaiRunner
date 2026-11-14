@@ -108,6 +108,25 @@ pub(super) fn tag(value: &Value) -> Result<Value> {
     }
 }
 
+fn release_url_matches(url: &str, repository: &str, tag: &str, draft: bool) -> bool {
+    let prefix = format!("https://github.com/{repository}/releases/tag/");
+    if url == format!("{prefix}{tag}") {
+        return true;
+    }
+    // GitHub may retain an opaque untagged URL while the release is a draft.
+    // Admit only one bounded ASCII slug under this repository's exact route.
+    draft
+        && url
+            .strip_prefix(&format!("{prefix}untagged-"))
+            .is_some_and(|token| {
+                !token.is_empty()
+                    && token.len() <= 128
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+            })
+}
+
 pub(super) fn validate(value: &Value) -> Result<()> {
     let release = &value["release"];
     let expected = id(&release["id"])?;
@@ -127,7 +146,7 @@ pub(super) fn validate(value: &Value) -> Result<()> {
         || release["tag_name"] != tag
         || release["target_commitish"] != revision
         || release["name"] != format!("Swift Bonsai 2 Runner {tag}")
-        || release["html_url"] != format!("https://github.com/{repository}/releases/tag/{tag}")
+        || !release_url_matches(text(release, "html_url")?, repository, tag, expected_draft)
         || text(release, "body")?.replace("\r\n", "\n")
             != text(value, "notes")?.replace("\r\n", "\n")
         || release["draft"].as_bool() != Some(expected_draft)
@@ -169,6 +188,51 @@ pub(super) fn validate(value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn url_request(url: &str, draft: bool) -> Value {
+        json!({"repository":"symbiogenesis/SwiftBonsai2Runner","tag":"v0.3.1","sourceRevision":"a".repeat(40),"notes":"notes","prerelease":true,"expectedDraft":draft,"complete":true,"expectedId":445527014,
+            "assets":{},"release":{"id":445527014,"tag_name":"v0.3.1","target_commitish":"a".repeat(40),"name":"Swift Bonsai 2 Runner v0.3.1","html_url":url,"body":"notes","draft":draft,"prerelease":true,"assets":[]}})
+    }
+
+    #[test]
+    fn release_publication_accepts_temporary_urls_only_for_same_repository_drafts() -> Result<()> {
+        let canonical = "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/v0.3.1";
+        let actual_draft = "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-9e752f591542a514f849";
+        validate(&url_request(canonical, true))?;
+        validate(&url_request(canonical, false))?;
+        validate(&url_request(actual_draft, true))?;
+        assert!(validate(&url_request(actual_draft, false)).is_err());
+        let future_draft =
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-Draft_A-42";
+        validate(&url_request(future_draft, true))?;
+        let prefix = "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-";
+        validate(&url_request(&format!("{prefix}{}", "a".repeat(128)), true))?;
+        assert!(validate(&url_request(&format!("{prefix}{}", "a".repeat(129)), true)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn release_publication_rejects_untrusted_or_malformed_draft_urls() {
+        for url in [
+            "https://github.com/another/SwiftBonsai2Runner/releases/tag/untagged-9e752f591542a514f849",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner-foreign/releases/tag/untagged-9e752f591542a514f849",
+            "https://github.com.example/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a",
+            "https://github.com@foreign.example/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a",
+            "http://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a/extra",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a?draft=true",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a#fragment",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a.exe",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a%2fextra",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a\\extra",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-α",
+            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/v0.3.1?draft=true",
+        ] {
+            assert!(validate(&url_request(url, true)).is_err(), "Accepted {url}");
+        }
+    }
+
     #[test]
     fn release_catalog_rejects_duplicates_noninteger_ids_and_oversize() -> Result<()> {
         assert_eq!(
