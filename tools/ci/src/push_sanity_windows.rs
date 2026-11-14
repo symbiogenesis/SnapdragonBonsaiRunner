@@ -242,7 +242,8 @@ impl Work {
             });
         }
         calls.extend(Self::adapter_calls(source, &plan));
-        self.script_calls(root, source, &calls)?;
+        // Adapter controls execute candidate bodies. Inspect Rust formatting
+        // before those bodies can modify the materialized committed snapshot.
         if plan.rust {
             self.command(
                 source,
@@ -251,6 +252,7 @@ impl Work {
                 BTreeMap::new(),
             )?;
         }
+        self.script_calls(root, source, &calls)?;
         Ok(())
     }
 
@@ -493,6 +495,84 @@ mod tests {
         let result = work.script(&policy, &policy, "test_push_snapshot.ps1", &[]);
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Push batch fixture cleanup escaped temp.".into());
+        }
+        fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
+        result
+    }
+
+    #[test]
+    fn push_sanity_checks_format_before_candidate_adapter_execution() -> Result<()> {
+        let temporary = super::super::canonical_path(std::env::temp_dir())?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch = temporary.join(format!("bonsai-push-format-order-{nonce}"));
+        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let mut work = Work {
+            directory: scratch.clone(),
+            started: Instant::now(),
+            sequence: 0,
+        };
+        let result = (|| {
+            let policy =
+                super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+            let source = scratch.join("candidate");
+            fs::create_dir_all(source.join("src")).map_err(|error| error.to_string())?;
+            fs::write(
+                source.join("Cargo.toml"),
+                "[package]\nname = \"push-format-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n",
+            )
+            .map_err(|error| error.to_string())?;
+            fs::copy(
+                policy.join("rust-toolchain.toml"),
+                source.join("rust-toolchain.toml"),
+            )
+            .map_err(|error| error.to_string())?;
+            let rust_source = source.join("src/main.rs");
+            let unformatted = "fn main( ){ }\n";
+            fs::write(&rust_source, unformatted).map_err(|error| error.to_string())?;
+            let escaped = rust_source
+                .to_str()
+                .ok_or("Format fixture path must be UTF-8.")?
+                .replace('\'', "''");
+            for action in ["bonsai-tools", "ci-tool"] {
+                let relative = format!(".github/actions/{action}/action.yml");
+                let text = fs::read_to_string(policy.join(&relative))
+                    .map_err(|error| error.to_string())?;
+                // Retain the harness's exact extraction start, then repair the
+                // Rust file without changing the original environment hash.
+                let mutated = text.replace(
+                    "$buildInputs = @(",
+                    &format!(
+                        "$buildInputs = $null; [IO.File]::WriteAllText('{escaped}', 'fn main() {{}}' + [Environment]::NewLine); $buildInputs = @("
+                    ),
+                );
+                assert_ne!(mutated, text, "Cache mutation must change {action}.");
+                let target = source.join(relative);
+                fs::create_dir_all(target.parent().ok_or("Missing action parent.")?)
+                    .map_err(|error| error.to_string())?;
+                fs::write(target, mutated).map_err(|error| error.to_string())?;
+            }
+            let failure = work
+                .checks(
+                    &policy,
+                    &source,
+                    &[
+                        "src/main.rs".into(),
+                        "tools/ci/test_tools_cache_inputs.ps1".into(),
+                    ],
+                )
+                .expect_err("Committed formatting must fail before candidate repair.");
+            assert!(failure.contains("cargo.exe"), "{failure}");
+            assert_eq!(
+                fs::read_to_string(rust_source).map_err(|error| error.to_string())?,
+                unformatted
+            );
+            Ok(())
+        })();
+        if scratch.parent() != Some(temporary.as_path()) {
+            return Err("Push format fixture cleanup escaped temp.".into());
         }
         fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
         result
