@@ -108,6 +108,17 @@ and negative compiler controls remain operative. SDK equivalence, other methods,
 queue/cache/callback ownership, signed computation and model/profile qualification
 remain independent; owning hosted acceptance of this migration remains pending.
 
+Queue observation schema 2 retains every C control size, alignment and member
+offset, including both queue-buffer union aliases, plus all asserted packet,
+cache/reference, operation, dtype and status constants. Fresh Rust layout
+observations must match those complete literal expectations, alongside the
+distinct timed/nonblocking mocks. The earlier abbreviated receipt omitted HTP
+offsets and alignments and cannot supply a complete replacement replay. No
+successful independent Windows queue capture is currently retained; keep the C
+provider and negative compiler controls until an owning hosted build supplies
+the complete original source/header/compiler, command and observation selection.
+Schema advancement alone grants neither that missing capture nor retirement.
+
 Captured C/header/Rust files are immutable `.txt` data with hashes and notices, not
 production build inputs. Retain the complete QAIC/FastRPC/llama licenses, IDL/version
 notices and template provenance. QAIC's BSD-3-Clause-Clear terms exclude a patent

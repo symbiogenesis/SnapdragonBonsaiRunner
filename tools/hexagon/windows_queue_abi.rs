@@ -77,6 +77,109 @@ struct Profile {
     counters: [u32; 8],
 }
 
+fn layout<T>(offsets: &[(&str, usize)]) -> String {
+    let mut fields = format!(
+        "\"bytes\":{},\"alignment\":{}",
+        size_of::<T>(),
+        align_of::<T>()
+    );
+    for (name, offset) in offsets {
+        fields.push_str(&format!(",\"{name}\":{offset}"));
+    }
+    format!("{{{fields}}}")
+}
+
+fn layouts() -> String {
+    let observed = [
+        ("result", layout::<i32>(&[])),
+        ("queue", layout::<*mut std::ffi::c_void>(&[])),
+        (
+            "queueBuffer",
+            layout::<Buffer>(&[
+                ("fd", offset_of!(Buffer, fd)),
+                ("size", offset_of!(Buffer, size)),
+                ("offset", offset_of!(Buffer, offset)),
+                ("flags", offset_of!(Buffer, flags)),
+                ("ptr", offset_of!(Buffer, address)),
+                ("address", offset_of!(Buffer, address)),
+            ]),
+        ),
+        (
+            "tensor",
+            layout::<Tensor>(&[
+                ("data", offset_of!(Tensor, data)),
+                ("size", offset_of!(Tensor, size)),
+                ("flags", offset_of!(Tensor, flags)),
+                ("type", offset_of!(Tensor, kind)),
+                ("bi", offset_of!(Tensor, buffer)),
+                ("ti", offset_of!(Tensor, tensor)),
+                ("ne", offset_of!(Tensor, dimensions)),
+                ("nb", offset_of!(Tensor, strides)),
+            ]),
+        ),
+        (
+            "buffer",
+            layout::<HtpBuffer>(&[
+                ("base", offset_of!(HtpBuffer, base)),
+                ("size", offset_of!(HtpBuffer, size)),
+                ("flags", offset_of!(HtpBuffer, flags)),
+                ("fd", offset_of!(HtpBuffer, fd)),
+            ]),
+        ),
+        (
+            "operation",
+            layout::<Operation>(&[
+                ("opcode", offset_of!(Operation, opcode)),
+                ("flags", offset_of!(Operation, flags)),
+                ("params", offset_of!(Operation, params)),
+                ("kernel_params", offset_of!(Operation, kernel_params)),
+                ("src", offset_of!(Operation, source)),
+                ("dst", offset_of!(Operation, destination)),
+                ("pad", offset_of!(Operation, padding)),
+            ]),
+        ),
+        (
+            "request",
+            layout::<Request>(&[
+                ("seq", offset_of!(Request, sequence)),
+                ("n_bufs", offset_of!(Request, buffers)),
+                ("n_tensors", offset_of!(Request, tensors)),
+                ("n_ops", offset_of!(Request, operations)),
+                ("n_traces", offset_of!(Request, traces)),
+            ]),
+        ),
+        (
+            "response",
+            layout::<Response>(&[
+                ("seq", offset_of!(Response, sequence)),
+                ("cycles_start", offset_of!(Response, cycles_start)),
+                ("cycles_stop", offset_of!(Response, cycles_stop)),
+                ("status", offset_of!(Response, status)),
+                ("n_bufs", offset_of!(Response, buffers)),
+                ("n_tensors", offset_of!(Response, tensors)),
+                ("n_ops", offset_of!(Response, operations)),
+                ("usecs", offset_of!(Response, microseconds)),
+                ("n_traces", offset_of!(Response, traces)),
+            ]),
+        ),
+        (
+            "profile",
+            layout::<Profile>(&[
+                ("opcode", offset_of!(Profile, opcode)),
+                ("usecs", offset_of!(Profile, microseconds)),
+                ("cycles_start", offset_of!(Profile, cycles_start)),
+                ("cycles_stop", offset_of!(Profile, cycles_stop)),
+                ("pmu", offset_of!(Profile, counters)),
+            ]),
+        ),
+    ];
+    observed
+        .into_iter()
+        .map(|(name, value)| format!("\"{name}\":{value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn main() -> ExitCode {
     if std::env::args_os().len() != 1 || !cfg!(all(windows, target_arch = "aarch64")) {
         return ExitCode::FAILURE;
@@ -97,19 +200,34 @@ fn main() -> ExitCode {
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     let output = format!(
         concat!(
-            "{{\"schemaVersion\":1,\"kind\":\"windows-arm64-Rust-queue-abi-control\",",
+            "{{\"schemaVersion\":2,\"kind\":\"windows-arm64-Rust-queue-abi-control\",",
             "\"queueBuffer\":{{\"bytes\":{},\"alignment\":{},\"fdOffset\":{},",
             "\"sizeOffset\":{},\"offsetOffset\":{},\"flagsOffset\":{},\"addressOffset\":{}}},",
             "\"htp\":{{\"tensorBytes\":{},\"bufferBytes\":{},\"operationBytes\":{},",
             "\"requestBytes\":{},\"responseBytes\":{},\"profileBytes\":{}}},",
-            "\"infiniteTimeout\":{},\"bufferHex\":\"{}\",",
+            "\"infiniteTimeout\":{},\"bufferHex\":\"{}\",\"layouts\":{{{}}},",
+            "\"constants\":{{\"packetMessage\":1,\"packetBuffers\":2,",
+            "\"reference\":4,\"dereference\":8,\"flushSender\":16,",
+            "\"invalidateSender\":32,\"flushRecipient\":64,\"invalidateRecipient\":128,",
+            "\"multiplyMatrix\":4,\"float32\":0,\"q2_0\":42,\"ok\":1}},",
             "\"driverLoaded\":false,\"deviceExecuted\":false,\"profileEligible\":false}}\n"
         ),
-        size_of::<Buffer>(), align_of::<Buffer>(), offset_of!(Buffer, fd),
-        offset_of!(Buffer, size), offset_of!(Buffer, offset), offset_of!(Buffer, flags),
-        offset_of!(Buffer, address), size_of::<Tensor>(), size_of::<HtpBuffer>(),
-        size_of::<Operation>(), size_of::<Request>(), size_of::<Response>(), size_of::<Profile>(),
-        u32::MAX, hex,
+        size_of::<Buffer>(),
+        align_of::<Buffer>(),
+        offset_of!(Buffer, fd),
+        offset_of!(Buffer, size),
+        offset_of!(Buffer, offset),
+        offset_of!(Buffer, flags),
+        offset_of!(Buffer, address),
+        size_of::<Tensor>(),
+        size_of::<HtpBuffer>(),
+        size_of::<Operation>(),
+        size_of::<Request>(),
+        size_of::<Response>(),
+        size_of::<Profile>(),
+        u32::MAX,
+        hex,
+        layouts(),
     );
     match io::stdout().lock().write_all(output.as_bytes()) {
         Ok(()) => ExitCode::SUCCESS,

@@ -170,6 +170,69 @@ typedef int (*write_noblock_signature)(dspqueue_t, uint32_t, uint32_t, struct ds
 typedef int (*read_signature)(dspqueue_t, uint32_t *, uint32_t, uint32_t *,
                               struct dspqueue_buffer *, uint32_t, uint32_t *, uint8_t *);
 
+/* Keep every asserted layout in the original observation, rather than retaining
+ * only aggregate HTP sizes. A future Rust replay must not lose these assertions. */
+#define PRINT_LAYOUT(name, type) \
+    printf("\"" name "\":{\"bytes\":%zu,\"alignment\":%zu", sizeof(type), _Alignof(type))
+#define PRINT_OFFSET(type, member) \
+    printf(",\"" #member "\":%zu", offsetof(type, member))
+
+static void print_layouts(void) {
+    printf(",\"layouts\":{");
+    PRINT_LAYOUT("result", AEEResult); printf("},");
+    PRINT_LAYOUT("queue", dspqueue_t); printf("},");
+    PRINT_LAYOUT("queueBuffer", struct dspqueue_buffer);
+    PRINT_OFFSET(struct dspqueue_buffer, fd); PRINT_OFFSET(struct dspqueue_buffer, size);
+    PRINT_OFFSET(struct dspqueue_buffer, offset); PRINT_OFFSET(struct dspqueue_buffer, flags);
+    PRINT_OFFSET(struct dspqueue_buffer, ptr); PRINT_OFFSET(struct dspqueue_buffer, address);
+    printf("},");
+    PRINT_LAYOUT("tensor", struct htp_tensor);
+    PRINT_OFFSET(struct htp_tensor, data); PRINT_OFFSET(struct htp_tensor, size);
+    PRINT_OFFSET(struct htp_tensor, flags); PRINT_OFFSET(struct htp_tensor, type);
+    PRINT_OFFSET(struct htp_tensor, bi); PRINT_OFFSET(struct htp_tensor, ti);
+    PRINT_OFFSET(struct htp_tensor, ne); PRINT_OFFSET(struct htp_tensor, nb);
+    printf("},");
+    PRINT_LAYOUT("buffer", struct htp_buf_desc);
+    PRINT_OFFSET(struct htp_buf_desc, base); PRINT_OFFSET(struct htp_buf_desc, size);
+    PRINT_OFFSET(struct htp_buf_desc, flags); PRINT_OFFSET(struct htp_buf_desc, fd);
+    printf("},");
+    PRINT_LAYOUT("operation", struct htp_op_desc);
+    PRINT_OFFSET(struct htp_op_desc, opcode); PRINT_OFFSET(struct htp_op_desc, flags);
+    PRINT_OFFSET(struct htp_op_desc, params); PRINT_OFFSET(struct htp_op_desc, kernel_params);
+    PRINT_OFFSET(struct htp_op_desc, src); PRINT_OFFSET(struct htp_op_desc, dst);
+    PRINT_OFFSET(struct htp_op_desc, pad);
+    printf("},");
+    PRINT_LAYOUT("request", struct htp_opbatch_req);
+    PRINT_OFFSET(struct htp_opbatch_req, seq); PRINT_OFFSET(struct htp_opbatch_req, n_bufs);
+    PRINT_OFFSET(struct htp_opbatch_req, n_tensors); PRINT_OFFSET(struct htp_opbatch_req, n_ops);
+    PRINT_OFFSET(struct htp_opbatch_req, n_traces);
+    printf("},");
+    PRINT_LAYOUT("response", struct htp_opbatch_rsp);
+    PRINT_OFFSET(struct htp_opbatch_rsp, seq); PRINT_OFFSET(struct htp_opbatch_rsp, cycles_start);
+    PRINT_OFFSET(struct htp_opbatch_rsp, cycles_stop); PRINT_OFFSET(struct htp_opbatch_rsp, status);
+    PRINT_OFFSET(struct htp_opbatch_rsp, n_bufs); PRINT_OFFSET(struct htp_opbatch_rsp, n_tensors);
+    PRINT_OFFSET(struct htp_opbatch_rsp, n_ops); PRINT_OFFSET(struct htp_opbatch_rsp, usecs);
+    PRINT_OFFSET(struct htp_opbatch_rsp, n_traces);
+    printf("},");
+    PRINT_LAYOUT("profile", struct htp_prof_desc);
+    PRINT_OFFSET(struct htp_prof_desc, opcode); PRINT_OFFSET(struct htp_prof_desc, usecs);
+    PRINT_OFFSET(struct htp_prof_desc, cycles_start); PRINT_OFFSET(struct htp_prof_desc, cycles_stop);
+    PRINT_OFFSET(struct htp_prof_desc, pmu);
+    printf("}}");
+    printf(",\"constants\":{\"packetMessage\":%u,\"packetBuffers\":%u,"
+           "\"reference\":%u,\"dereference\":%u,\"flushSender\":%u,"
+           "\"invalidateSender\":%u,\"flushRecipient\":%u,\"invalidateRecipient\":%u,"
+           "\"multiplyMatrix\":%u,\"float32\":%u,\"q2_0\":%u,\"ok\":%u}",
+           (unsigned int)DSPQUEUE_PACKET_FLAG_MESSAGE, (unsigned int)DSPQUEUE_PACKET_FLAG_BUFFERS,
+           (unsigned int)DSPQUEUE_BUFFER_FLAG_REF, (unsigned int)DSPQUEUE_BUFFER_FLAG_DEREF,
+           (unsigned int)DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER,
+           (unsigned int)DSPQUEUE_BUFFER_FLAG_INVALIDATE_SENDER,
+           (unsigned int)DSPQUEUE_BUFFER_FLAG_FLUSH_RECIPIENT,
+           (unsigned int)DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT,
+           (unsigned int)HTP_OP_MUL_MAT, (unsigned int)HTP_TYPE_F32,
+           (unsigned int)HTP_TYPE_Q2_0, (unsigned int)HTP_STATUS_OK);
+}
+
 int main(void) {
     /* The public opaque queue pointer is preserved as such, never narrowed to an int. */
     create_signature create_fn = dspqueue_create;
@@ -195,7 +258,7 @@ int main(void) {
         memcmp(&received, &original, sizeof(original)) != 0 || memcmp(message, payload, sizeof(payload)) != 0) {
         ++unexpected;
     }
-    printf("{\"schemaVersion\":1,\"kind\":\"windows-arm64-public-queue-abi-control\","
+    printf("{\"schemaVersion\":2,\"kind\":\"windows-arm64-public-queue-abi-control\","
            "\"queueBuffer\":{\"bytes\":%zu,\"alignment\":%zu,\"fdOffset\":%zu,"
            "\"sizeOffset\":%zu,\"offsetOffset\":%zu,\"flagsOffset\":%zu,\"addressOffset\":%zu},"
            "\"htp\":{\"tensorBytes\":%zu,\"bufferBytes\":%zu,\"operationBytes\":%zu,"
@@ -213,7 +276,9 @@ int main(void) {
     for (size_t index = 0; index < sizeof(original); ++index) {
         printf("%02x", (unsigned int)((const unsigned char *)&original)[index]);
     }
-    printf("\",\"driverLoaded\":false,\"deviceExecuted\":false,\"profileEligible\":false}\n");
+    printf("\"");
+    print_layouts();
+    printf(",\"driverLoaded\":false,\"deviceExecuted\":false,\"profileEligible\":false}\n");
     return calls == 6 && timed_write_calls == 1 && noblock_write_calls == 1 &&
            unexpected == 0 && result == 0 ? 0 : 1;
 }

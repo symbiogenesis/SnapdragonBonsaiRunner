@@ -252,11 +252,6 @@ fn queue(
         5,
     )?;
     let observed = wire::parse(&text)?;
-    let expected = json!({"schemaVersion":1,"kind":"windows-arm64-public-queue-abi-control","queueBuffer":{"bytes":24,"alignment":8,"fdOffset":0,"sizeOffset":4,"offsetOffset":8,"flagsOffset":12,"addressOffset":16},"htp":{"tensorBytes":56,"bufferBytes":24,"operationBytes":232,"requestBytes":24,"responseBytes":88,"profileBytes":48},"queueWrites":{"timed":{"arguments":7,"timeoutMicroseconds":100_000,"calls":1},"nonblocking":{"arguments":6,"calls":1}},"infiniteTimeout":4_294_967_295_u64,"mockCalls":6,"unexpectedCalls":0,"returnCode":0,"bufferHex":"98badcfe403020100403020194000000efcdab8967452381","driverLoaded":false,"deviceExecuted":false,"profileEligible":false});
-    require(
-        observed == expected,
-        "Public native queue/packet ABI differs from independent expectation.",
-    )?;
     let (rust_executable, rust) = rust(
         control,
         rustc,
@@ -265,10 +260,44 @@ fn queue(
         "windows_queue_abi.rs",
         false,
     )?;
+    queue_observations(&observed, &rust)?;
+    report["queueAbi"] = json!({"passed":true,"nativeWindowsConditionals":true,"completeAssertedLayoutsObserved":true,"observed":observed,"rustObserved":rust,"executable":identity(&executable)?,"rustExecutable":identity(&rust_executable)?});
+    report["queueAbi"]["negativeControlsRejected"] = negatives(control, compiler, inputs)?;
+    Ok(())
+}
+
+fn queue_expected() -> Value {
+    json!({"schemaVersion":2,"kind":"windows-arm64-public-queue-abi-control",
+        "queueBuffer":{"bytes":24,"alignment":8,"fdOffset":0,"sizeOffset":4,"offsetOffset":8,"flagsOffset":12,"addressOffset":16},
+        "htp":{"tensorBytes":56,"bufferBytes":24,"operationBytes":232,"requestBytes":24,"responseBytes":88,"profileBytes":48},
+        "layouts":{
+            "result":{"bytes":4,"alignment":4},
+            "queue":{"bytes":8,"alignment":8},
+            "queueBuffer":{"bytes":24,"alignment":8,"fd":0,"size":4,"offset":8,"flags":12,"ptr":16,"address":16},
+            "tensor":{"bytes":56,"alignment":8,"data":0,"size":8,"flags":12,"type":16,"bi":20,"ti":22,"ne":24,"nb":40},
+            "buffer":{"bytes":24,"alignment":8,"base":0,"size":8,"flags":16,"fd":20},
+            "operation":{"bytes":232,"alignment":4,"opcode":0,"flags":4,"params":8,"kernel_params":72,"src":200,"dst":220,"pad":228},
+            "request":{"bytes":24,"alignment":8,"seq":0,"n_bufs":8,"n_tensors":12,"n_ops":16,"n_traces":20},
+            "response":{"bytes":88,"alignment":8,"seq":0,"cycles_start":8,"cycles_stop":16,"status":24,"n_bufs":28,"n_tensors":32,"n_ops":36,"usecs":40,"n_traces":44},
+            "profile":{"bytes":48,"alignment":4,"opcode":0,"usecs":4,"cycles_start":8,"cycles_stop":12,"pmu":16}},
+        "constants":{"packetMessage":1,"packetBuffers":2,"reference":4,"dereference":8,"flushSender":16,"invalidateSender":32,"flushRecipient":64,"invalidateRecipient":128,"multiplyMatrix":4,"float32":0,"q2_0":42,"ok":1},
+        "queueWrites":{"timed":{"arguments":7,"timeoutMicroseconds":100_000,"calls":1},"nonblocking":{"arguments":6,"calls":1}},
+        "infiniteTimeout":4_294_967_295_u64,"mockCalls":6,"unexpectedCalls":0,"returnCode":0,
+        "bufferHex":"98badcfe403020100403020194000000efcdab8967452381",
+        "driverLoaded":false,"deviceExecuted":false,"profileEligible":false})
+}
+
+fn queue_observations(observed: &Value, rust: &Value) -> Result<()> {
+    require(
+        *observed == queue_expected(),
+        "Public native queue/packet ABI differs from independent expectation.",
+    )?;
     let shared = [
         "schemaVersion",
         "queueBuffer",
         "htp",
+        "layouts",
+        "constants",
         "infiniteTimeout",
         "bufferHex",
         "driverLoaded",
@@ -281,10 +310,7 @@ fn queue(
             && rust["kind"] == "windows-arm64-Rust-queue-abi-control",
         "Native Rust queue receipt shape differs.",
     )?;
-    fields_equal(&rust, &observed, &shared)?;
-    report["queueAbi"] = json!({"passed":true,"nativeWindowsConditionals":true,"observed":observed,"rustObserved":rust,"executable":identity(&executable)?,"rustExecutable":identity(&rust_executable)?});
-    report["queueAbi"]["negativeControlsRejected"] = negatives(control, compiler, inputs)?;
-    Ok(())
+    fields_equal(rust, observed, &shared)
 }
 fn start_stop(
     control: &mut Control,
@@ -459,6 +485,69 @@ fn negatives(control: &mut Control, compiler: &Path, inputs: &Path) -> Result<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rust_queue_observation() -> Result<Value> {
+        let mut rust = queue_expected();
+        let fields = rust.as_object_mut().ok_or("Literal queue object absent.")?;
+        for field in ["queueWrites", "mockCalls", "unexpectedCalls", "returnCode"] {
+            fields.remove(field);
+        }
+        rust["kind"] = json!("windows-arm64-Rust-queue-abi-control");
+        Ok(rust)
+    }
+
+    #[test]
+    fn windows_queue_complete_layout_observation_rejects_mutation_and_omission() -> Result<()> {
+        let native = queue_expected();
+        let rust = rust_queue_observation()?;
+        queue_observations(&native, &rust)?;
+        // Every retained assertion remains mandatory, including offsets that
+        // the old receipt omitted and the union's pointer/address alias.
+        for (layout, fields) in native["layouts"]
+            .as_object()
+            .ok_or("Literal layouts absent.")?
+        {
+            for field in fields.as_object().ok_or("Literal layout absent.")?.keys() {
+                let mut missing = rust.clone();
+                missing["layouts"][layout]
+                    .as_object_mut()
+                    .ok_or("Literal layout absent.")?
+                    .remove(field);
+                assert!(queue_observations(&native, &missing).is_err());
+                let mut changed = native.clone();
+                changed["layouts"][layout][field] = json!(999);
+                let mut matching_changed_rust = rust.clone();
+                matching_changed_rust["layouts"][layout][field] = json!(999);
+                assert!(queue_observations(&changed, &matching_changed_rust).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn windows_queue_complete_constants_and_mock_calls_are_mandatory() -> Result<()> {
+        let native = queue_expected();
+        let rust = rust_queue_observation()?;
+        for name in native["constants"]
+            .as_object()
+            .ok_or("Literal constants absent.")?
+            .keys()
+        {
+            let mut changed = rust.clone();
+            changed["constants"][name] = json!(999);
+            assert!(queue_observations(&native, &changed).is_err());
+        }
+        let mut changed = native.clone();
+        changed["queueWrites"]["timed"]["calls"] = json!(0);
+        assert!(queue_observations(&changed, &rust).is_err());
+        changed = native.clone();
+        changed["queueWrites"]["nonblocking"]["calls"] = json!(0);
+        assert!(queue_observations(&changed, &rust).is_err());
+        changed = native;
+        changed["schemaVersion"] = json!(1);
+        assert!(queue_observations(&changed, &rust).is_err());
+        Ok(())
+    }
 
     #[test]
     fn reviewed_sources_require_complete_exact_archive() -> Result<()> {
