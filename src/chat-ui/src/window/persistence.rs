@@ -413,6 +413,7 @@ mod tests {
             let (commands, incoming) = mpsc::channel();
             let (_events, events) = client::event_channel();
             let mut restored = State::create(commands, events, None, None);
+            restored.preview = false;
             restored.restore_workspace(&original.workspace_bytes()?)?;
             restored.model = ModelLifecycle::Ready;
             restored.restore_selected_history();
