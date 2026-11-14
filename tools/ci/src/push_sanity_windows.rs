@@ -12,6 +12,12 @@ use bonsai_windows_process::{OwnedProcess, ToolProcessSpec};
 use super::{Selection, Update, selection};
 use crate::Result;
 
+#[derive(serde::Serialize)]
+struct ScriptCall {
+    script: &'static str,
+    parameters: BTreeMap<&'static str, serde_json::Value>,
+}
+
 struct Work {
     directory: PathBuf,
     started: Instant,
@@ -29,6 +35,7 @@ impl Work {
         if self.started.elapsed() >= Duration::from_secs(270) {
             return Err("Push sanity aggregate allowance exhausted; push blocked.".into());
         }
+        let command_started = Instant::now();
         if program == "pwsh.exe" {
             // Packaged PowerShell rejects suspended direct creation. CMD starts
             // it normally inside our already-owned Job; no breakaway is enabled.
@@ -118,6 +125,12 @@ impl Work {
             return Err("Push command output exceeded its final byte bound; push blocked.".into());
         }
         let output = fs::read(&stdout).map_err(|error| error.to_string())?;
+        if std::env::var("BONSAI_PUSH_TIMINGS").as_deref() == Ok("1") {
+            eprintln!(
+                "Push sanity timing: {program} {arguments:?}: {:?}.",
+                command_started.elapsed()
+            );
+        }
         if code != 0 {
             let mut detail = output;
             detail.extend(fs::read(&stderr).map_err(|error| error.to_string())?);
@@ -186,12 +199,10 @@ impl Work {
 
     fn checks(&mut self, root: &Path, source: &Path, paths: &[String]) -> Result<()> {
         let plan = selection(paths);
-        self.script(
-            source,
-            root,
-            "check_owned_languages.ps1",
-            &["-Root".into(), source.into()],
-        )?;
+        let mut calls = vec![ScriptCall {
+            script: "check_owned_languages.ps1",
+            parameters: BTreeMap::from([("Root", serde_json::json!(source))]),
+        }];
         let powershell: Vec<_> = plan
             .powershell
             .iter()
@@ -205,18 +216,33 @@ impl Work {
                 serde_json::to_vec(&powershell).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-            self.script(
-                source,
-                root,
-                "check_powershell_syntax.ps1",
-                &[
-                    "-Root".into(),
-                    source.into(),
-                    "-PathsFile".into(),
-                    paths_file.into_os_string(),
-                ],
-            )?;
+            calls.push(ScriptCall {
+                script: "check_powershell_syntax.ps1",
+                parameters: BTreeMap::from([
+                    ("Root", serde_json::json!(source)),
+                    ("PathsFile", serde_json::json!(paths_file)),
+                ]),
+            });
         }
+        if plan.workflows {
+            calls.push(ScriptCall {
+                script: "check_workflow_startup.ps1",
+                parameters: BTreeMap::from([("Root", serde_json::json!(source))]),
+            });
+            let mut parameters = BTreeMap::from([("Root", serde_json::json!(source))]);
+            if let Some(path) = std::env::var_os("BONSAI_ACTIONLINT_PATH") {
+                let path = path
+                    .into_string()
+                    .map_err(|_| "Push sanity actionlint path must be UTF-8.")?;
+                parameters.insert("ActionlintPath", serde_json::json!(path));
+            }
+            calls.push(ScriptCall {
+                script: "check_workflow_syntax.ps1",
+                parameters,
+            });
+        }
+        calls.extend(Self::adapter_calls(source, &plan));
+        self.script_calls(root, source, &calls)?;
         if plan.rust {
             self.command(
                 source,
@@ -225,61 +251,65 @@ impl Work {
                 BTreeMap::new(),
             )?;
         }
-        if plan.workflows {
-            self.script(
-                source,
-                root,
-                "check_workflow_startup.ps1",
-                &["-Root".into(), source.into()],
-            )?;
-            let mut arguments = vec!["-Root".into(), source.into()];
-            if let Some(path) = std::env::var_os("BONSAI_ACTIONLINT_PATH") {
-                arguments.extend(["-ActionlintPath".into(), path]);
-            }
-            self.script(source, root, "check_workflow_syntax.ps1", &arguments)?;
-        }
-        self.adapter_checks(root, source, &plan)
+        Ok(())
     }
 
-    fn adapter_checks(&mut self, policy: &Path, source: &Path, plan: &Selection) -> Result<()> {
+    fn script_calls(&mut self, policy: &Path, source: &Path, calls: &[ScriptCall]) -> Result<()> {
+        let calls_file = self
+            .directory
+            .join(format!("script-calls-{}.json", self.sequence));
+        fs::write(
+            &calls_file,
+            serde_json::to_vec(calls).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        self.script(
+            source,
+            policy,
+            "check_push_snapshot.ps1",
+            &["-CallsFile".into(), calls_file.into_os_string()],
+        )
+    }
+
+    fn adapter_calls(source: &Path, plan: &Selection) -> Vec<ScriptCall> {
         // Assertions and support come from the committed checking policy. Inputs
         // come from this outgoing snapshot even when it is not checking HEAD.
         // Candidate fixture scripts are never used, so later controls can also
         // exercise historical adapters that did not yet contain those fixtures.
+        let mut calls = Vec::new();
         for action in &plan.cache_actions {
             for case in [
                 "mixed_case_names_have_same_build_identity",
                 "environment_fixture_preserves_absent_and_empty_values",
             ] {
-                self.script(
-                    source,
-                    policy,
-                    "test_tools_cache_inputs.ps1",
-                    &[
-                        "-Case".into(),
-                        case.into(),
-                        "-CandidateRoot".into(),
-                        source.into(),
-                        "-EnvironmentAction".into(),
-                        (*action).into(),
-                    ],
-                )?;
+                calls.push(ScriptCall {
+                    script: "test_tools_cache_inputs.ps1",
+                    parameters: BTreeMap::from([
+                        ("Case", serde_json::json!(case)),
+                        ("CandidateRoot", serde_json::json!(source)),
+                        ("EnvironmentAction", serde_json::json!(action)),
+                    ]),
+                });
             }
         }
         if plan.source_fixture {
-            self.script(
-                source,
-                policy,
-                "test_source_checks.ps1",
-                &[
-                    "-Case".into(),
-                    "main_push_always_records_source_verdict".into(),
-                    "-CandidateRoot".into(),
-                    source.into(),
-                ],
-            )?;
+            calls.push(ScriptCall {
+                script: "test_source_checks.ps1",
+                parameters: BTreeMap::from([
+                    (
+                        "Case",
+                        serde_json::json!("main_push_always_records_source_verdict"),
+                    ),
+                    ("CandidateRoot", serde_json::json!(source)),
+                ]),
+            });
         }
-        Ok(())
+        calls
+    }
+
+    #[cfg(test)]
+    fn adapter_checks(&mut self, policy: &Path, source: &Path, plan: &Selection) -> Result<()> {
+        self.script_calls(policy, source, &Self::adapter_calls(source, plan))
     }
 }
 
@@ -437,6 +467,35 @@ mod tests {
     #[test]
     fn push_sanity_failed_preparation_invalidates_existing_receipt() -> Result<()> {
         preparation_case("failed_preparation_invalidates_existing_receipt")
+    }
+
+    #[test]
+    fn push_sanity_ordinary_push_archives_only_committed_policy() -> Result<()> {
+        preparation_case("ordinary_push_archives_only_committed_policy")
+    }
+
+    #[test]
+    fn push_sanity_script_batch_preserves_scopes_and_rejections() -> Result<()> {
+        let temporary = super::super::canonical_path(std::env::temp_dir())?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch = temporary.join(format!("bonsai-push-script-batch-{nonce}"));
+        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let mut work = Work {
+            directory: scratch.clone(),
+            started: Instant::now(),
+            sequence: 0,
+        };
+        let policy =
+            super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+        let result = work.script(&policy, &policy, "test_push_snapshot.ps1", &[]);
+        if scratch.parent() != Some(temporary.as_path()) {
+            return Err("Push batch fixture cleanup escaped temp.".into());
+        }
+        fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
+        result
     }
 
     #[test]
