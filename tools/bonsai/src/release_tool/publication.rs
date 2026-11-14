@@ -190,8 +190,8 @@ mod tests {
     use super::*;
 
     fn url_request(url: &str, draft: bool) -> Value {
-        json!({"repository":"symbiogenesis/SwiftBonsai2Runner","tag":"v0.3.1","sourceRevision":"a".repeat(40),"notes":"notes","prerelease":true,"expectedDraft":draft,"complete":true,"expectedId":445527014,
-            "assets":{},"release":{"id":445527014,"tag_name":"v0.3.1","target_commitish":"a".repeat(40),"name":"Swift Bonsai 2 Runner v0.3.1","html_url":url,"body":"notes","draft":draft,"prerelease":true,"assets":[]}})
+        json!({"repository":"symbiogenesis/SwiftBonsai2Runner","tag":"v0.3.1","sourceRevision":"a".repeat(40),"notes":"notes","prerelease":true,"expectedDraft":draft,"complete":true,"expectedId":445_527_014,
+            "assets":{},"release":{"id":445_527_014,"tag_name":"v0.3.1","target_commitish":"a".repeat(40),"name":"Swift Bonsai 2 Runner v0.3.1","html_url":url,"body":"notes","draft":draft,"prerelease":true,"assets":[]}})
     }
 
     #[test]
