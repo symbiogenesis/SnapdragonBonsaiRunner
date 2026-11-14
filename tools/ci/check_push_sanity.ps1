@@ -16,6 +16,7 @@ function Test-PushHelperReceipt([string]$ReceiptPath, [string]$Image, [string]$S
         return $receipt -is [Collections.IDictionary] -and $receipt.Count -eq 3 -and
             $receipt.Contains('SchemaVersion') -and $receipt.Contains('SourceIdentity') -and $receipt.Contains('Sha256') -and
             $receipt.SchemaVersion -is [long] -and $receipt.SchemaVersion -eq 1 -and
+            $receipt.SourceIdentity -is [string] -and $receipt.Sha256 -is [string] -and
             $receipt.SourceIdentity -ceq $SourceIdentity -and
             $receipt.Sha256 -ceq (Get-FileHash -LiteralPath $Image -Algorithm SHA256).Hash.ToLowerInvariant()
     } catch { return $false }
@@ -26,6 +27,7 @@ $started = [Diagnostics.Stopwatch]::StartNew()
 $originalPwsh = $env:BONSAI_PUSH_PWSH_PATH
 $originalChecksum = $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS
 $originalFingerprint = $env:CARGO_BUILD_FINGERPRINT
+$originalIncremental = $env:CARGO_INCREMENTAL
 $env:BONSAI_PUSH_PWSH_PATH = [Environment]::ProcessPath
 Add-Type -AssemblyName System.Windows.Forms
 $power = [Windows.Forms.SystemInformation]::PowerStatus
@@ -86,8 +88,14 @@ try {
         if ($Prepare) {
             $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = 'true'
             $env:CARGO_BUILD_FINGERPRINT = 'content'
+            $env:CARGO_INCREMENTAL = '1'
             Push-Location -LiteralPath $policy
-            try { cargo "+$toolchain" build --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --package bonsai-windows-process --bin bonsai-push-recovery --target aarch64-pc-windows-msvc --target-dir $target }
+            try {
+                # Cargo freshness is not an output-integrity check. Discard both
+                # packages' aliases/fingerprints before admitting rebuilt bytes.
+                cargo "+$toolchain" clean --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --package bonsai-windows-process --target aarch64-pc-windows-msvc --target-dir $target
+                cargo "+$toolchain" build --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --package bonsai-windows-process --bin bonsai-push-recovery --target aarch64-pc-windows-msvc --target-dir $target
+            }
             finally { Pop-Location }
             @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-FileHash -LiteralPath $recoveryTool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
         } else {
@@ -115,4 +123,6 @@ try {
     else { $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = $originalChecksum }
     if ($null -eq $originalFingerprint) { [Environment]::SetEnvironmentVariable('CARGO_BUILD_FINGERPRINT', [NullString]::Value) }
     else { $env:CARGO_BUILD_FINGERPRINT = $originalFingerprint }
+    if ($null -eq $originalIncremental) { [Environment]::SetEnvironmentVariable('CARGO_INCREMENTAL', [NullString]::Value) }
+    else { $env:CARGO_INCREMENTAL = $originalIncremental }
 }
