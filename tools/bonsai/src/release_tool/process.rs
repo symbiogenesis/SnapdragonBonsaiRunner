@@ -109,7 +109,6 @@ fn excerpt(text: &str) -> String {
 
 fn executable_name(name: &str) -> OsString {
     let path = Path::new(name);
-    let mut executable = OsString::from(name);
     if cfg!(windows)
         && !name.contains(['/', '\\'])
         && path.components().count() == 1
@@ -118,9 +117,10 @@ fn executable_name(name: &str) -> OsString {
     {
         // The native resolver searches exact PATH entries without shell/PATHEXT
         // expansion. Release adapters use bare cargo, gh and git names.
-        executable.push(".exe");
+        path.with_added_extension("exe").into_os_string()
+    } else {
+        OsString::from(name)
     }
-    executable
 }
 
 pub(super) fn invoke(value: &Value) -> Result<Value> {

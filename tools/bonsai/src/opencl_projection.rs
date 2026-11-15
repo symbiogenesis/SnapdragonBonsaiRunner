@@ -156,15 +156,21 @@ fn prepared(q8k: &[u8], columns: usize) -> crate::Result<Prepared> {
     let mut codes = Vec::with_capacity(columns);
     let mut scales = Vec::with_capacity(columns / 256);
     for block in q8k.as_chunks::<292>().0 {
-        let scale = f32::from_le_bytes(block[..4].try_into().map_err(|_| "Invalid Q8_K scale.")?);
+        let (scale_bytes, body) = block
+            .split_first_chunk::<4>()
+            .ok_or("Invalid Q8_K scale.")?;
+        let scale = f32::from_le_bytes(*scale_bytes);
         if !scale.is_finite() {
             return Err("Nonfinite original Q8_K scale.".into());
         }
-        for (values, sum) in block[4..260]
+        let (values_bytes, sum_bytes) = body
+            .split_first_chunk::<256>()
+            .ok_or("Incomplete original Q8_K records.")?;
+        for (values, sum) in values_bytes
             .as_chunks::<16>()
             .0
             .iter()
-            .zip(block[260..].as_chunks::<2>().0)
+            .zip(sum_bytes.as_chunks::<2>().0)
         {
             let sum = i16::from_le_bytes(*sum);
             let expected: i16 = values
@@ -176,7 +182,7 @@ fn prepared(q8k: &[u8], columns: usize) -> crate::Result<Prepared> {
             }
         }
         scales.push(scale);
-        codes.extend_from_slice(&block[4..260]);
+        codes.extend_from_slice(values_bytes);
     }
     Ok(Prepared { codes, scales })
 }
@@ -231,17 +237,20 @@ fn scalar(
             .zip(input.codes.as_chunks::<128>().0)
             .enumerate()
         {
+            let (scale_bytes, packed_bytes) = block
+                .split_first_chunk::<2>()
+                .ok_or("Invalid PQ2 half scale.")?;
             let mut dot = 0_i32;
             // Independent scalar byte traversal: four adjacent symbols from
             // each original packed byte, including code 3 and signed -128.
-            for (&packed, values) in block[2..].iter().zip(codes.as_chunks::<4>().0) {
+            for (&packed, values) in packed_bytes.iter().zip(codes.as_chunks::<4>().0) {
                 for (shift, &value) in [0, 2, 4, 6].into_iter().zip(values) {
                     dot += (i32::from((packed >> shift) & 3) - 1)
                         * i32::from(i8::from_ne_bytes([value]));
                 }
             }
             dots.push(dot);
-            let scale = half(&block[..2])? * input.scales[index / 2];
+            let scale = half(scale_bytes)? * input.scales[index / 2];
             // The integer lies in [-32768,32768] and converts exactly to F32.
             let integer = f32::from(
                 i16::try_from(dot)

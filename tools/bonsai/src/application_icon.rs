@@ -378,33 +378,42 @@ mod tests {
     #[test]
     fn icon_png_has_valid_chunks_transparency_and_native_color() -> Result<()> {
         let frame = png(&parse(SOURCE)?, 16)?;
-        assert_eq!(&frame[..8], b"\x89PNG\r\n\x1a\n");
+        let (signature, mut rest) = frame
+            .split_first_chunk::<8>()
+            .ok_or("Truncated PNG signature.")?;
+        assert_eq!(signature, b"\x89PNG\r\n\x1a\n");
         assert_eq!(&frame[16..24], &[0, 0, 0, 16, 0, 0, 0, 16]);
-        let mut cursor = 8;
         let mut payload = Vec::new();
-        while cursor < frame.len() {
-            let length = usize::try_from(u32::from_be_bytes(
-                frame[cursor..cursor + 4].try_into().map_err(|_| "chunk")?,
-            ))
-            .map_err(|e| e.to_string())?;
-            let end = cursor + 8 + length;
-            assert_eq!(
-                crc32(&frame[cursor + 4..end]),
-                u32::from_be_bytes(frame[end..end + 4].try_into().map_err(|_| "CRC")?)
-            );
-            if &frame[cursor + 4..cursor + 8] == b"IDAT" {
-                flate2::read::ZlibDecoder::new(&frame[cursor + 8..end])
+        while !rest.is_empty() {
+            let (len_bytes, after_len) = rest
+                .split_first_chunk::<4>()
+                .ok_or("Truncated PNG chunk length.")?;
+            let length =
+                usize::try_from(u32::from_be_bytes(*len_bytes)).map_err(|e| e.to_string())?;
+            let (kind_and_data, after_body) = after_len
+                .split_at_checked(4 + length)
+                .ok_or("Truncated PNG chunk payload.")?;
+            let (crc_bytes, next) = after_body
+                .split_first_chunk::<4>()
+                .ok_or("Truncated PNG chunk CRC.")?;
+            assert_eq!(crc32(kind_and_data), u32::from_be_bytes(*crc_bytes));
+            let (kind, data) = kind_and_data
+                .split_first_chunk::<4>()
+                .ok_or("Missing PNG chunk kind.")?;
+            if kind == b"IDAT" {
+                flate2::read::ZlibDecoder::new(data)
                     .read_to_end(&mut payload)
                     .map_err(|e| e.to_string())?;
             }
-            cursor = end + 4;
+            rest = next;
         }
         assert_eq!(payload.len(), 16 * 65);
         let pixels: Vec<_> = payload
             .as_chunks::<65>()
             .0
             .iter()
-            .flat_map(|row| row[1..].as_chunks::<4>().0.iter())
+            .filter_map(|row| row.split_first())
+            .flat_map(|(_, row)| row.as_chunks::<4>().0.iter())
             .collect();
         assert!(pixels.iter().all(|p| p[..3] == [0x2e, 0x85, 0x55]));
         for alpha in [0, 255] {
@@ -420,19 +429,21 @@ mod tests {
             .map(|s| s.to_le_bytes().to_vec())
             .collect();
         let icon = ico(&frames)?;
-        assert_eq!(&icon[..6], &[0, 0, 1, 0, 7, 0]);
-        for (index, size) in SIZES.into_iter().enumerate() {
-            let start = 6 + index * 16;
-            assert_eq!(u32::from(icon[start]), size % 256);
-            assert_eq!(icon[start], icon[start + 1]);
-            assert_eq!(&icon[start + 4..start + 8], &[1, 0, 32, 0]);
-            let offset = usize::try_from(u32::from_le_bytes(
-                icon[start + 12..start + 16]
-                    .try_into()
-                    .map_err(|_| "offset")?,
-            ))
-            .map_err(|e| e.to_string())?;
-            assert_eq!(&icon[offset..offset + 4], &frames[index]);
+        let (header, rest) = icon
+            .split_first_chunk::<6>()
+            .ok_or("Truncated ICO header.")?;
+        assert_eq!(header, &[0, 0, 1, 0, 7, 0]);
+        for ((size, entry), expected_frame) in
+            SIZES.into_iter().zip(rest.as_chunks::<16>().0).zip(&frames)
+        {
+            assert_eq!(u32::from(entry[0]), size % 256);
+            assert_eq!(entry[0], entry[1]);
+            assert_eq!(&entry[4..8], &[1, 0, 32, 0]);
+            let (_, tail) = entry.split_at(12);
+            let (offset_bytes, _) = tail.split_first_chunk::<4>().ok_or("offset")?;
+            let offset =
+                usize::try_from(u32::from_le_bytes(*offset_bytes)).map_err(|e| e.to_string())?;
+            assert_eq!(&icon[offset..offset + 4], expected_frame);
         }
         Ok(())
     }

@@ -42,7 +42,13 @@ impl Reader<'_> {
             .read_exact(bytes)
             .map_err(|error| error.to_string())?;
         if masked {
-            self.digest.update(&vec![0; bytes.len()])?;
+            const ZEROS: [u8; 64] = [0; 64];
+            let mut remaining = bytes.len();
+            while remaining != 0 {
+                let count = remaining.min(ZEROS.len());
+                self.digest.update(&ZEROS[..count])?;
+                remaining -= count;
+            }
         } else {
             self.digest.update(bytes)?;
         }

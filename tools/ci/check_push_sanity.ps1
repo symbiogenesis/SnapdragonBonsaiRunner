@@ -122,7 +122,8 @@ function Sync-PushSourceTree([string]$Source, [string]$Destination) {
                     if ($srcFile.Length -eq $dstFile.Length) {
                         $srcBytes = [IO.File]::ReadAllBytes($srcFile.FullName)
                         $dstBytes = [IO.File]::ReadAllBytes($dstFile.FullName)
-                        if ([Convert]::ToBase64String($srcBytes) -ceq [Convert]::ToBase64String($dstBytes)) {
+                        # PowerShell 7.6 forbids ByRef-like ReadOnlySpan<byte> parameters on MemoryExtensions::SequenceEqual.
+                        if ([System.Linq.Enumerable]::SequenceEqual([byte[]]$srcBytes, [byte[]]$dstBytes)) {
                             $same = $true
                         }
                     }
