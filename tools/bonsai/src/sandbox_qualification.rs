@@ -64,11 +64,27 @@ const LOG_CASES: &[(&str, &str)] = &[
     ),
 ];
 const LOG_CASE_SECONDS: &[u64] = &[30, 30, 30];
+const INFERENCE_AUTHORITY_CASES: &[(&str, &str)] = &[
+    (
+        "sandbox-ownership.exe",
+        "native_sandbox_broker_pipe_enforces_offline_inference_authority",
+    ),
+    (
+        "sandbox-ownership.exe",
+        "native_sandbox_broker_pipe_private_storage_budget_caps_scratch_and_temp",
+    ),
+    (
+        "sandbox-ownership.exe",
+        "native_sandbox_broker_pipe_abrupt_owner_death_ends_worker",
+    ),
+];
+const INFERENCE_AUTHORITY_CASE_SECONDS: &[u64] = &[45, 30, 45];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Workload {
     Authority,
     LogCapture,
+    InferenceAuthority,
 }
 
 impl Workload {
@@ -77,6 +93,9 @@ impl Workload {
             None => Ok(Self::Authority),
             Some(Value::String(name)) if name == "authority-v1" => Ok(Self::Authority),
             Some(Value::String(name)) if name == "log-capture-v1" => Ok(Self::LogCapture),
+            Some(Value::String(name)) if name == "inference-authority-v1" => {
+                Ok(Self::InferenceAuthority)
+            }
             _ => Err("Unknown sandbox qualification workload.".into()),
         }
     }
@@ -85,6 +104,7 @@ impl Workload {
         match self {
             Self::Authority => "authority-v1",
             Self::LogCapture => "log-capture-v1",
+            Self::InferenceAuthority => "inference-authority-v1",
         }
     }
 
@@ -92,6 +112,7 @@ impl Workload {
         match self {
             Self::Authority => CASES,
             Self::LogCapture => LOG_CASES,
+            Self::InferenceAuthority => INFERENCE_AUTHORITY_CASES,
         }
     }
 
@@ -99,6 +120,7 @@ impl Workload {
         match self {
             Self::Authority => CASE_SECONDS,
             Self::LogCapture => LOG_CASE_SECONDS,
+            Self::InferenceAuthority => INFERENCE_AUTHORITY_CASE_SECONDS,
         }
     }
 
@@ -114,6 +136,9 @@ impl Workload {
             }
             Self::LogCapture => {
                 "Three fixed model-free native capture controls: stdout flood, stderr flood and normal-exit tail draining; no scratch/private-temp quota, broker-only transport, model, performance or complete application qualification."
+            }
+            Self::InferenceAuthority => {
+                "Three fixed model-free offline broker-pipe sandbox controls: AppContainer offline broker-pipe communication and egress denial, 64 MiB/1024-entry private storage ceiling across scratch and private temp, and abrupt owner termination; no model, throughput or complete application qualification."
             }
         }
     }
@@ -416,6 +441,43 @@ mod tests {
             let now = 1_000 + u64::try_from(index).map_err(|error| error.to_string())? * 300;
             remaining_fit(now, 10, 1_900, 3 - index, workload)?;
             assert!(remaining_fit(now + 1, 10, 1_900, 3 - index, workload).is_err());
+        }
+        for (now, frequency, deadline, count) in [
+            (0, 0, 1, 1),
+            (0, u64::MAX, u64::MAX, 3),
+            (u64::MAX, 1, u64::MAX, 1),
+            (0, 1, 1, 0),
+            (0, 1, u64::MAX, 4),
+        ] {
+            assert!(remaining_fit(now, frequency, deadline, count, workload).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_inference_authority_workload_is_isolated_and_fits_original_deadline()
+    -> crate::Result<()> {
+        let default_workload = Workload::select(None)?;
+        assert_eq!(default_workload, Workload::Authority);
+        assert_eq!(Workload::Authority.estimated_total_seconds(), 240);
+
+        let workload = Workload::select(Some(&json!("inference-authority-v1")))?;
+        assert_eq!(workload, Workload::InferenceAuthority);
+        assert_eq!(workload.name(), "inference-authority-v1");
+        assert_eq!(workload.cases().len(), 3);
+        assert!(
+            workload
+                .cases()
+                .iter()
+                .all(|(binary, _)| *binary == "sandbox-ownership.exe")
+        );
+        assert_eq!(workload.seconds(), &[45, 30, 45]);
+        assert_eq!(workload.estimated_total_seconds(), 180);
+
+        for (index, elapsed) in [0_u64, 450, 750].into_iter().enumerate() {
+            let now = 1_000 + elapsed;
+            remaining_fit(now, 10, 2_200, 3 - index, workload)?;
+            assert!(remaining_fit(now + 1, 10, 2_200, 3 - index, workload).is_err());
         }
         for (now, frequency, deadline, count) in [
             (0, 0, 1, 1),
