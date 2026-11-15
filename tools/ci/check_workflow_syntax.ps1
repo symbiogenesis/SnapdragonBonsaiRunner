@@ -58,7 +58,10 @@ try {
         $cache = Join-Path ([IO.Path]::GetTempPath()) 'Bonsai-Actionlint-Cache'
         $archive = Get-PinnedActionlintArchive "https://github.com/rhysd/actionlint/releases/download/v$version/actionlint_${version}_$asset" $digest $asset $archive $cache
         $executable = if ($IsWindows) { 'actionlint.exe' } else { 'actionlint' }
-        if ($IsWindows) { Expand-Archive -LiteralPath $archive -DestinationPath $scratch }
+        if ($IsWindows) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [IO.Compression.ZipFile]::ExtractToDirectory($archive, $scratch, $true)
+        }
         else { tar -xzf $archive -C $scratch $executable }
         $ActionlintPath = Join-Path $scratch $executable
     }
