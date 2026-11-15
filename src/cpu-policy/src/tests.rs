@@ -416,3 +416,75 @@ fn family_thread_budgets_and_speculation_arguments_stay_bounded() -> Result<(), 
     }
     Ok(())
 }
+
+#[test]
+fn swift_mmproj_lock_and_server_arguments_enforce_identity_and_path_bounds() -> Result<(), String> {
+    let data = std::env::temp_dir().join("Bonsai mmproj policy fixture");
+    let artifact = swift_mmproj_artifact(&data)?;
+    assert_eq!(artifact.bytes, MMPROJ_BYTES);
+    assert_eq!(
+        artifact.sha256,
+        "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903"
+    );
+    assert_eq!(
+        artifact.path,
+        data.join("mmproj")
+            .join("6ed5e12bf84b7a63069882c91dd9e9218647d17b")
+            .join("Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf")
+    );
+    assert!(swift_mmproj_artifact(Path::new("relative\\data")).is_err());
+
+    let text_args = server::arguments_with_mmproj(
+        "C:\\models\\Swift.gguf",
+        None,
+        "C:\\keys\\k.key",
+        8080,
+        Profile::SwiftPq2Assessment,
+    )?;
+    assert!(text_args.iter().any(|arg| arg == "--no-mmproj"));
+    assert!(!text_args.iter().any(|arg| arg == "--mmproj"));
+
+    let mmproj_text = artifact.path.to_string_lossy().into_owned();
+    let vision_args = server::arguments_with_mmproj(
+        "C:\\models\\Swift.gguf",
+        Some(&mmproj_text),
+        "C:\\keys\\k.key",
+        8080,
+        Profile::SwiftPq2Assessment,
+    )?;
+    assert!(!vision_args.iter().any(|arg| arg == "--no-mmproj"));
+    let index = vision_args
+        .iter()
+        .position(|arg| arg == "--mmproj")
+        .ok_or_else(|| "missing --mmproj".to_owned())?;
+    assert_eq!(vision_args.get(index + 1), Some(&mmproj_text));
+    assert_eq!(
+        vision_args.get(index + 2).map(String::as_str),
+        Some("--no-mmproj-offload")
+    );
+    assert_eq!(
+        vision_args.get(index + 3).map(String::as_str),
+        Some("--image-max-tokens")
+    );
+    assert_eq!(vision_args.get(index + 4).map(String::as_str), Some("1024"));
+
+    for bad_mmproj in [
+        "",
+        "  ",
+        "-leading-switch.gguf",
+        "%LOCALAPPDATA%\\m.gguf",
+        "a\0b",
+    ] {
+        assert!(
+            server::arguments_with_mmproj(
+                "C:\\models\\Swift.gguf",
+                Some(bad_mmproj),
+                "C:\\keys\\k.key",
+                8080,
+                Profile::SwiftPq2Assessment,
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}

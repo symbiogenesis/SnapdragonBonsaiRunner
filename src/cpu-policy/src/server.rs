@@ -223,6 +223,47 @@ fn validate_reference_profile(profile: &Value, model_bytes: u64) -> Result<(), S
     )
 }
 
+/// Build interactive server arguments, enabling the pinned Swift vision projector (`--mmproj`)
+/// when `mmproj_path` is provided or retaining `--no-mmproj` otherwise.
+///
+/// # Errors
+/// Rejects invalid model, key, or mmproj paths (empty, NUL-containing, unexpanded `%VAR%`, or
+/// leading `-`), or non-loopback ports.
+pub fn arguments_with_mmproj(
+    model_path: &str,
+    mmproj_path: Option<&str>,
+    key_file: &str,
+    port: u16,
+    profile: Profile,
+) -> Result<Vec<String>, String> {
+    let mut args = arguments(model_path, key_file, port, profile)?;
+    let Some(mmproj) = mmproj_path else {
+        return Ok(args);
+    };
+    require(
+        !mmproj.trim().is_empty()
+            && !mmproj.contains('\0')
+            && !crate::unexpanded_variable(mmproj)
+            && !mmproj.trim_start().starts_with('-'),
+        "A verified mmproj path without leading switches is required.",
+    )?;
+    let index = args
+        .iter()
+        .position(|argument| argument == "--no-mmproj")
+        .ok_or_else(|| "Server arguments are missing the expected --no-mmproj flag.".to_owned())?;
+    args.splice(
+        index..=index,
+        [
+            "--mmproj".to_owned(),
+            mmproj.to_owned(),
+            "--no-mmproj-offload".to_owned(),
+            "--image-max-tokens".to_owned(),
+            crate::DEFAULT_IMAGE_MAX_TOKENS.to_string(),
+        ],
+    );
+    Ok(args)
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
 enum Request {

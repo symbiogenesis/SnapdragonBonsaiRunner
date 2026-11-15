@@ -438,6 +438,77 @@ impl SwiftContextPlan {
         };
         Ok((plan, breakdown))
     }
+
+    /// Derive a context plan for `profile`, reserving [`crate::MMPROJ_RESERVE_BYTES`]
+    /// when `request_vision` is true and fitting within `available_bytes`.
+    ///
+    /// If `available_bytes` admits text-only Swift but cannot accommodate the vision
+    /// projector reserve, this cleanly falls back to `(text_only_plan, false)`.
+    ///
+    /// # Errors
+    /// Returns an error if even text-only Swift cannot fit within `available_bytes`.
+    pub fn for_profile_with_vision(
+        available_bytes: u64,
+        profile: SwiftContextProfile,
+        request_vision: bool,
+    ) -> Result<(Self, bool), String> {
+        if !request_vision {
+            return Ok((Self::for_profile(available_bytes, profile)?, false));
+        }
+        if let Some(remaining) = available_bytes.checked_sub(crate::MMPROJ_RESERVE_BYTES)
+            && let Ok(mut plan) = Self::for_profile(remaining, profile)
+        {
+            apply_mmproj_reserve_to_plan(&mut plan)?;
+            return Ok((plan, true));
+        }
+        Ok((Self::for_profile(available_bytes, profile)?, false))
+    }
+
+    /// Derive a context plan and itemized memory breakdown for `shape`, reserving
+    /// [`crate::MMPROJ_RESERVE_BYTES`] when `request_vision` is true and fits.
+    ///
+    /// Falls back to `(text_only_plan, breakdown, false)` when available RAM fits
+    /// text-only execution but cannot admit the vision projector reserve.
+    ///
+    /// # Errors
+    /// Returns an error if even text-only Swift cannot fit within `available_bytes`.
+    pub fn for_execution_shape_with_vision(
+        available_bytes: u64,
+        profile: SwiftContextProfile,
+        shape: &SwiftExecutionShape,
+        request_vision: bool,
+    ) -> Result<(Self, SwiftMemoryBreakdown, bool), String> {
+        if !request_vision {
+            let (plan, breakdown) = Self::for_execution_shape(available_bytes, profile, shape)?;
+            return Ok((plan, breakdown, false));
+        }
+        if let Some(remaining) = available_bytes.checked_sub(crate::MMPROJ_RESERVE_BYTES)
+            && let Ok((mut plan, mut breakdown)) =
+                Self::for_execution_shape(remaining, profile, shape)
+        {
+            apply_mmproj_reserve_to_plan(&mut plan)?;
+            breakdown.weights_and_fixed_runtime_bytes = breakdown
+                .weights_and_fixed_runtime_bytes
+                .checked_add(crate::MMPROJ_RESERVE_BYTES)
+                .ok_or_else(insufficient)?;
+            return Ok((plan, breakdown, true));
+        }
+        let (plan, breakdown) = Self::for_execution_shape(available_bytes, profile, shape)?;
+        Ok((plan, breakdown, false))
+    }
+}
+
+fn apply_mmproj_reserve_to_plan(plan: &mut SwiftContextPlan) -> Result<(), String> {
+    let reserve_usize = usize::try_from(crate::MMPROJ_RESERVE_BYTES).map_err(|_| insufficient())?;
+    plan.memory_limit_bytes = plan
+        .memory_limit_bytes
+        .checked_add(reserve_usize)
+        .ok_or_else(insufficient)?;
+    plan.required_available_bytes = plan
+        .required_available_bytes
+        .checked_add(crate::MMPROJ_RESERVE_BYTES)
+        .ok_or_else(insufficient)?;
+    Ok(())
 }
 
 fn insufficient() -> String {
@@ -618,6 +689,67 @@ mod tests {
         assert!(
             next_page * NativeRsq4Full.state_bytes_per_token() + RECURRENT_BYTES
                 > NativeRsq4Full.state_limit_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vision_context_planning_reserves_mmproj_or_falls_back_cleanly() -> Result<(), Box<dyn Error>>
+    {
+        let profile = SwiftContextProfile::NativeRsq4;
+        let minimum = HOST_RESERVE_BYTES
+            + STARTUP_RESERVE_BYTES
+            + FIXED_RUNTIME_BYTES
+            + u64::try_from(MIN_CONTEXT_TOKENS)? * profile.context_bytes_per_token();
+        let (fallback, vision_on_tight_ram) =
+            SwiftContextPlan::for_profile_with_vision(minimum, profile, true)?;
+        assert!(!vision_on_tight_ram);
+        assert_eq!(fallback, SwiftContextPlan::for_profile(minimum, profile)?);
+
+        let with_vision_budget = minimum + crate::MMPROJ_RESERVE_BYTES;
+        let (vision_plan, vision_admitted) =
+            SwiftContextPlan::for_profile_with_vision(with_vision_budget, profile, true)?;
+        assert!(vision_admitted);
+        assert_eq!(vision_plan.context_tokens, MIN_CONTEXT_TOKENS);
+        assert_eq!(
+            vision_plan.required_available_bytes - fallback.required_available_bytes,
+            crate::MMPROJ_RESERVE_BYTES
+        );
+        assert_eq!(
+            u64::try_from(vision_plan.memory_limit_bytes - fallback.memory_limit_bytes)?,
+            crate::MMPROJ_RESERVE_BYTES
+        );
+
+        let shape = SwiftExecutionShape::for_profile(profile);
+        let shape_min_footprint = shape
+            .breakdown(MIN_CONTEXT_TOKENS)
+            .and_then(|breakdown| breakdown.total_footprint_bytes())
+            .ok_or("missing minimum shape footprint")?;
+        let shape_base_budget =
+            minimum.max(HOST_RESERVE_BYTES + STARTUP_RESERVE_BYTES + shape_min_footprint);
+        let (shape_fallback, _) =
+            SwiftContextPlan::for_execution_shape(shape_base_budget, profile, &shape)?;
+        let (shape_plan, breakdown, shape_vision) =
+            SwiftContextPlan::for_execution_shape_with_vision(
+                shape_base_budget + crate::MMPROJ_RESERVE_BYTES,
+                profile,
+                &shape,
+                true,
+            )?;
+        assert!(shape_vision);
+        assert_eq!(
+            shape_plan.required_available_bytes - shape_fallback.required_available_bytes,
+            crate::MMPROJ_RESERVE_BYTES
+        );
+        assert_eq!(
+            breakdown
+                .total_footprint_bytes()
+                .map(|b| b + HOST_RESERVE_BYTES),
+            Some(shape_plan.required_available_bytes)
+        );
+        assert_eq!(
+            breakdown.job_commit_bytes(),
+            Some(u64::try_from(shape_plan.memory_limit_bytes)?)
         );
         Ok(())
     }

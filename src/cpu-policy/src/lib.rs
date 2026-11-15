@@ -31,6 +31,18 @@ const PHYSICAL_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SWIFT_WEIGHT_BYTES: u64 = 7_206_168_928;
 const PTQ1_WEIGHT_BYTES: u64 = 5_946_648_928;
 const ADAPTER_BYTES: u64 = 9_682_464;
+/// Embedded pinned Swift vision projector (`mmproj`) lock document.
+pub const MMPROJ_LOCK: &str = include_str!("../../../config/swift-mmproj.lock.json");
+/// Exact byte length of the pinned Swift vision projector (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`).
+pub const MMPROJ_BYTES: u64 = 629_246_976;
+/// Conservative process memory reserve (`768 MiB`) budgeted when vision is enabled.
+pub const MMPROJ_RESERVE_BYTES: u64 = 768 * 1024 * 1024;
+/// Default maximum visual tokens encoded per image (`--image-max-tokens`).
+pub const DEFAULT_IMAGE_MAX_TOKENS: usize = 1_024;
+const MMPROJ_REPOSITORY: &str = "prism-ml/Ternary-Bonsai-2-27B-gguf";
+const MMPROJ_REVISION: &str = "6ed5e12bf84b7a63069882c91dd9e9218647d17b";
+const MMPROJ_FILENAME: &str = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf";
+const MMPROJ_SHA256: &str = "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903";
 const PTQ1_FILENAME: &str = "Swift-Bonsai-2-current-repacked-PTQ1_0.gguf";
 const PTQ1_SHA256: &str = "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5";
 const PTQ1_TOKENIZER_SHA256: &str =
@@ -676,6 +688,97 @@ fn unexpanded_variable(path: &str) -> bool {
         previous = Some(index);
     }
     false
+}
+
+/// Verified identity and installation path of the pinned Swift vision projector (`mmproj`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwiftMmprojArtifact {
+    /// Lexical target file path inside `data/mmproj/<revision>/<filename>`.
+    pub path: PathBuf,
+    /// Pinned exact byte length.
+    pub bytes: u64,
+    /// Pinned lowercase hexadecimal SHA-256 digest.
+    pub sha256: String,
+    /// Source repository identifier.
+    pub repository: String,
+    /// Pinned commit revision.
+    pub revision: String,
+    /// Pinned GGUF filename.
+    pub filename: String,
+    /// Pinned immutable download URL.
+    pub url: String,
+}
+
+fn validate_mmproj(mmproj_lock: &Value, swift_lock: &Value) -> Result<(), String> {
+    let entry = &mmproj_lock["mmproj"];
+    let compatibility = &mmproj_lock["compatibility"];
+    let repository = entry["repository"]
+        .as_str()
+        .ok_or("Invalid mmproj repository.")?;
+    let revision = entry["revision"]
+        .as_str()
+        .ok_or("Invalid mmproj revision.")?;
+    let filename = entry["filename"]
+        .as_str()
+        .ok_or("Invalid mmproj filename.")?;
+    let sha256 = entry["sha256"].as_str().ok_or("Invalid mmproj digest.")?;
+    let url = entry["url"].as_str().ok_or("Invalid mmproj URL.")?;
+    let expected_url = format!("https://huggingface.co/{repository}/resolve/{revision}/{filename}");
+    let default_tokens =
+        u64::try_from(DEFAULT_IMAGE_MAX_TOKENS).map_err(|_| "Invalid default image tokens.")?;
+    require(
+        mmproj_lock.is_object()
+            && mmproj_lock["schemaVersion"].as_u64() == Some(1)
+            && repository == MMPROJ_REPOSITORY
+            && revision == MMPROJ_REVISION
+            && hex(revision, 40)
+            && filename == MMPROJ_FILENAME
+            && entry["bytes"].as_u64() == Some(MMPROJ_BYTES)
+            && hex(sha256, 64)
+            && sha256 == MMPROJ_SHA256
+            && url == expected_url
+            && compatibility["modelRepository"].as_str()
+                == swift_lock["model"]["repository"].as_str()
+            && compatibility["modelRevision"].as_str() == swift_lock["model"]["revision"].as_str()
+            && compatibility["architecture"].as_str()
+                == swift_lock["model"]["architecture"].as_str()
+            && compatibility["defaultImageMaxTokens"].as_u64() == Some(default_tokens)
+            && compatibility["memoryReserveBytes"].as_u64() == Some(MMPROJ_RESERVE_BYTES),
+        "Invalid or incompatible Swift mmproj artifact configuration.",
+    )
+}
+
+/// Resolve the pinned Swift Qwen3-VL vision projector (`mmproj`) path and digest under `data`.
+///
+/// # Errors
+/// Rejects non-absolute, NUL-containing, or unexpanded data directories, and rejects
+/// malformed or inconsistent compiled mmproj lock metadata.
+pub fn swift_mmproj_artifact(data: &Path) -> Result<SwiftMmprojArtifact, String> {
+    let data_text = data.to_str().ok_or("Invalid data directory.")?;
+    require(
+        data.is_absolute() && !data_text.contains('\0') && !unexpanded_variable(data_text),
+        "An expanded absolute data directory is required.",
+    )?;
+    let mmproj_lock = parse(MMPROJ_LOCK)?;
+    let swift_lock = parse(SWIFT_LOCK)?;
+    validate_mmproj(&mmproj_lock, &swift_lock)?;
+    let entry = &mmproj_lock["mmproj"];
+    let filename = entry["filename"]
+        .as_str()
+        .ok_or("Invalid mmproj filename.")?;
+    let path_string = artifact_path(data, "mmproj", entry, filename)?;
+    Ok(SwiftMmprojArtifact {
+        path: PathBuf::from(path_string),
+        bytes: MMPROJ_BYTES,
+        sha256: MMPROJ_SHA256.to_owned(),
+        repository: MMPROJ_REPOSITORY.to_owned(),
+        revision: MMPROJ_REVISION.to_owned(),
+        filename: MMPROJ_FILENAME.to_owned(),
+        url: entry["url"]
+            .as_str()
+            .ok_or("Invalid mmproj URL.")?
+            .to_owned(),
+    })
 }
 
 /// Build the fixed completion plan for one explicit profile and option selection.

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "mmproj": {
+    "repository": "prism-ml/Ternary-Bonsai-2-27B-gguf",
+    "revision": "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
+    "filename": "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+    "bytes": 629246976,
+    "sha256": "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903",
+    "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+    "license": "Apache-2.0"
+  },
+  "compatibility": {
+    "modelRepository": "ukisai/Swift-Bonsai-2-GGUF",
+    "modelRevision": "a3bdac086bbb6b04d87d0108d18943b5f63868f7",
+    "architecture": "qwen35",
+    "defaultImageMaxTokens": 1024,
+    "memoryReserveBytes": 805306368
+  }
+}
