@@ -162,16 +162,22 @@ pub(super) fn search_field(
     ui: &mut egui::Ui,
     search: &mut history_search::Search,
 ) -> egui::Response {
+    const CLEAR_BUTTON_SIZE: f32 = 24.0;
+    const ITEM_SPACING: f32 = 6.0;
+
     egui::Frame::new()
         .fill(ui.visuals().extreme_bg_color)
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
         .corner_radius(8)
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+            let clear_size = egui::Vec2::splat(CLEAR_BUTTON_SIZE);
+            ui.spacing_mut().item_spacing.x = ITEM_SPACING;
+            ui.spacing_mut().button_padding = egui::Vec2::ZERO;
+            ui.spacing_mut().interact_size = clear_size;
             ui.horizontal(|ui| {
                 search_icon(ui);
-                let clear_width = if search.text.is_empty() { 0.0 } else { 30.0 };
+                let clear_width = ITEM_SPACING + CLEAR_BUTTON_SIZE;
                 let field = ui
                     .add(
                         egui::TextEdit::singleline(&mut search.text)
@@ -188,12 +194,13 @@ pub(super) fn search_field(
                             .return_key(None),
                     )
                     .accessible_name("Search conversations");
-                if !search.text.is_empty()
-                    && ui
-                        .add(controls::quiet_button("×").min_size(egui::Vec2::splat(24.0)))
-                        .accessible_name("Clear conversation search")
-                        .on_hover_text("Clear search · Escape")
-                        .clicked()
+                if search.text.is_empty() {
+                    ui.allocate_exact_size(clear_size, egui::Sense::hover());
+                } else if ui
+                    .add_sized(clear_size, controls::quiet_button("×").min_size(clear_size))
+                    .accessible_name("Clear conversation search")
+                    .on_hover_text("Clear search · Escape")
+                    .clicked()
                 {
                     search.clear();
                     field.request_focus();

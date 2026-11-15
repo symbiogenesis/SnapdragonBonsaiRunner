@@ -626,3 +626,83 @@ fn conversation_history_new_conversation_clears_the_filter_and_preserves_the_dra
         assert!(!matches!(command, Command::Send { .. }));
     }
 }
+
+#[test]
+fn conversation_history_search_box_keeps_stable_bounds_when_typing_and_clearing() {
+    for (size, sidebar_width) in [
+        ([1180.0, 860.0], 256.0),
+        ([1180.0, 860.0], 216.0),
+        ([480.0, 640.0], 256.0),
+    ] {
+        let mut chat = harness(size);
+        chat.state_mut().app.appearance.sidebar_width = sidebar_width;
+        chat.run();
+        open_sidebar(&mut chat, size[0]);
+
+        let new_chat = chat
+            .get_by_role_and_label(egui::Role::Button, "+ New conversation")
+            .rect();
+        let initial_input = chat
+            .get_by_role_and_label(egui::Role::TextInput, "Search conversations")
+            .rect();
+        let initial_heading = chat.get_by_label("CONVERSATIONS").rect();
+
+        chat.get_by_role_and_label(egui::Role::TextInput, "Search conversations")
+            .focus();
+        chat.run();
+
+        for query in ["g", "arden", &" cedar".repeat(20)] {
+            chat.get_by_role_and_label(egui::Role::TextInput, "Search conversations")
+                .type_text(query);
+            // Check both the immediate typing step and the settled frame.
+            for _ in 0..2 {
+                chat.step();
+                let input = chat
+                    .get_by_role_and_label(egui::Role::TextInput, "Search conversations")
+                    .rect();
+                let clear = chat
+                    .get_by_role_and_label(egui::Role::Button, "Clear conversation search")
+                    .rect();
+                let heading = chat.get_by_label("CONVERSATIONS").rect();
+
+                assert!(
+                    (input.left() - initial_input.left()).abs() < 0.5
+                        && (input.right() - initial_input.right()).abs() < 0.5
+                        && (input.top() - initial_input.top()).abs() < 0.5
+                        && (input.bottom() - initial_input.bottom()).abs() < 0.5,
+                    "size={size:?} sidebar_width={sidebar_width} initial={initial_input:?} input={input:?}"
+                );
+                assert!(
+                    (clear.width() - 24.0).abs() < 0.5 && (clear.height() - 24.0).abs() < 0.5,
+                    "size={size:?} clear={clear:?}"
+                );
+                assert!(
+                    (clear.left() - (input.right() + 6.0)).abs() < 0.5,
+                    "size={size:?} input={input:?} clear={clear:?}"
+                );
+                // The search frame has 10pt horizontal inner margin and a 1pt stroke;
+                // its right edge must align with the sidebar's inner right edge without clipping.
+                assert!(
+                    ((clear.right() + 11.0) - new_chat.right()).abs() < 0.5,
+                    "size={size:?} clear_right={} new_chat_right={}",
+                    clear.right(),
+                    new_chat.right()
+                );
+                assert!(
+                    (heading.top() - initial_heading.top()).abs() < 0.5
+                        && (heading.bottom() - initial_heading.bottom()).abs() < 0.5,
+                    "size={size:?} initial_heading={initial_heading:?} heading={heading:?}"
+                );
+            }
+        }
+
+        clear_query(&mut chat);
+        let cleared_input = chat
+            .get_by_role_and_label(egui::Role::TextInput, "Search conversations")
+            .rect();
+        let cleared_heading = chat.get_by_label("CONVERSATIONS").rect();
+        assert!((cleared_input.width() - initial_input.width()).abs() < 0.5);
+        assert!((cleared_input.height() - initial_input.height()).abs() < 0.5);
+        assert!((cleared_heading.top() - initial_heading.top()).abs() < 0.5);
+    }
+}
