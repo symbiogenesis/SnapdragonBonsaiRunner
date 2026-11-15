@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use super::{Image, Result, extent, mapped, offset_at, u16_at, u32_at};
+use super::{Image, Result, mapped};
+use crate::pe_format::{DATA_DIR_EXPORT, c_bytes, extent, u16_at, u32_at, usize_at as offset_at};
 
 const EXPORT_LIMIT: usize = 65_536;
 const TEXT_LIMIT: usize = 4096;
@@ -22,30 +23,34 @@ pub(crate) struct Table {
 
 fn text(image: &Image, rva: u32, bound: usize, total: &mut usize) -> Result<String> {
     let (offset, available) = mapped(image, u64::from(rva), 1)?;
-    let bytes = extent(
+    let slice = extent(
         &image.data,
         offset,
         available.min(bound).min(TEXT_LIMIT + 1),
     )?;
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .filter(|end| *end > 0 && *end <= TEXT_LIMIT)
-        .ok_or("PE export text is empty, unterminated or exceeds its bound")?;
-    if !bytes[..end].iter().all(u8::is_ascii_graphic) {
+    let bytes = c_bytes(
+        slice,
+        TEXT_LIMIT,
+        "PE export text is empty, unterminated or exceeds its bound",
+    )?;
+    if bytes.is_empty() {
+        return Err("PE export text is empty, unterminated or exceeds its bound".into());
+    }
+    if !bytes.iter().all(u8::is_ascii_graphic) {
         return Err("PE export text must contain only ASCII graphic bytes".into());
     }
     *total = total
-        .checked_add(end)
+        .checked_add(bytes.len())
         .filter(|total| *total <= TOTAL_TEXT_LIMIT)
         .ok_or("PE export names exceed their aggregate byte bound")?;
-    String::from_utf8(bytes[..end].to_vec()).map_err(|error| error.to_string())
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn inspect(image: &Image) -> Result<Table> {
-    let directory = image.optional + 112;
-    let rva = u32_at(&image.data, directory)?;
-    let size = offset_at(&image.data, directory + 4)?;
+    let (rva, size_u32) = image.layout.directory(DATA_DIR_EXPORT);
+    let size = usize::try_from(size_u32).map_err(|error| error.to_string())?;
     if rva == 0 && size == 0 {
         return Ok(Table::default());
     }

@@ -83,29 +83,7 @@ fn archive(executable: &Path) -> crate::Result<(ZipArchive<File>, String)> {
 }
 
 pub(crate) fn require_windowless(file: &mut File) -> crate::Result<()> {
-    file.rewind().map_err(|error| error.to_string())?;
-    let mut dos = [0; 64];
-    file.read_exact(&mut dos)
-        .map_err(|error| error.to_string())?;
-    let offset = u64::from(u32::from_le_bytes(
-        dos[60..64].try_into().map_err(|_| "Invalid PE offset.")?,
-    ));
-    if dos[..2] != *b"MZ" || offset < 64 {
-        return Err("Invalid launcher DOS header.".into());
-    }
-    file.seek(std::io::SeekFrom::Start(offset))
-        .map_err(|error| error.to_string())?;
-    let mut pe = [0; 94];
-    file.read_exact(&mut pe)
-        .map_err(|error| error.to_string())?;
-    if pe[..6] != [b'P', b'E', 0, 0, 0x64, 0xaa]
-        || u16::from_le_bytes([pe[20], pe[21]]) < 70
-        || pe[24..26] != [0x0b, 0x02]
-        || pe[92..94] != [2, 0]
-    {
-        return Err("Bundling requires the Windows GUI-subsystem bonsai-launcher image.".into());
-    }
-    Ok(())
+    crate::pe_format::require_arm64_gui_subsystem(file)
 }
 
 fn supports_bundle(file: &mut File) -> crate::Result<bool> {

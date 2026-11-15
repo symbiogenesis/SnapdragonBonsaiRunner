@@ -247,6 +247,7 @@ mod bounded_input;
 mod https_transfer;
 mod identity;
 mod native_startup;
+mod pe_format;
 mod pe_machine;
 #[cfg(windows)]
 mod runtime_probe;

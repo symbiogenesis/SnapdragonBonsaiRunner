@@ -1,6 +1,12 @@
 //! Bounded COFF symbol observations, never a source or linked-code absence proof.
 
-use crate::Result;
+use crate::{
+    Result,
+    pe_format::{
+        LeCursor, MACHINE_ARM64, c_bytes, extent, i16_at, i32_at, u16_at, u32_at,
+        usize_at as size_at,
+    },
+};
 
 const SYMBOL_LIMIT: usize = 1_000_000;
 const NAME_LIMIT: usize = 4096;
@@ -16,38 +22,12 @@ pub(super) struct Observation {
     pub(super) binding: &'static str,
 }
 
-fn extent(data: &[u8], offset: usize, size: usize) -> Result<&[u8]> {
-    data.get(offset..offset.checked_add(size).ok_or("COFF extent overflow.")?)
-        .ok_or_else(|| "COFF extent outside retained input.".into())
-}
-
-fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
-    Ok(u16::from_le_bytes(
-        extent(data, offset, 2)?
-            .try_into()
-            .map_err(|_| "COFF u16.")?,
-    ))
-}
-
-fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        extent(data, offset, 4)?
-            .try_into()
-            .map_err(|_| "COFF u32.")?,
-    ))
-}
-
-fn size_at(data: &[u8], offset: usize) -> Result<usize> {
-    usize::try_from(u32_at(data, offset)?).map_err(|error| error.to_string())
-}
-
 fn name(data: &[u8]) -> Result<&[u8]> {
-    let end = data
-        .iter()
-        .take(NAME_LIMIT + 1)
-        .position(|byte| *byte == 0)
-        .ok_or("COFF symbol name is unterminated or exceeds its bound.")?;
-    Ok(&data[..end])
+    c_bytes(
+        data,
+        NAME_LIMIT,
+        "COFF symbol name is unterminated or exceeds its bound.",
+    )
 }
 
 pub(super) fn known(symbol: &[u8]) -> bool {
@@ -97,7 +77,7 @@ fn object(data: &[u8], member: Option<usize>, result: &mut Vec<Observation>) -> 
     extent(data, 0, 20)?;
     let anonymous = u16_at(data, 0)? == 0 && u16_at(data, 2)? == u16::MAX;
     let (header, sections, table, count, width) = if anonymous {
-        if u16_at(data, 6)? != 0xaa64 {
+        if u16_at(data, 6)? != MACHINE_ARM64 {
             return Err("COFF runtime inspection requires native ARM64 inputs.".into());
         }
         if u16_at(data, 4)? == 0 {
@@ -136,7 +116,7 @@ fn object(data: &[u8], member: Option<usize>, result: &mut Vec<Observation>) -> 
             20,
         )
     } else {
-        if u16_at(data, 0)? != 0xaa64 || u16_at(data, 16)? != 0 {
+        if u16_at(data, 0)? != MACHINE_ARM64 || u16_at(data, 16)? != 0 {
             return Err("COFF runtime inspection requires native ARM64 object headers.".into());
         }
         (
@@ -189,9 +169,9 @@ fn object(data: &[u8], member: Option<usize>, result: &mut Vec<Observation>) -> 
         }
         if storage == 2 || storage == 105 {
             let section = if width == 18 {
-                i32::from(i16::from_le_bytes([entry[12], entry[13]]))
+                i32::from(i16_at(entry, 12)?)
             } else {
-                i32::from_le_bytes(entry[12..16].try_into().map_err(|_| "COFF section.")?)
+                i32_at(entry, 12)?
             };
             if section < -1 || (storage == 105 && (section != 0 || auxiliary != 1)) {
                 return Err(
@@ -226,20 +206,21 @@ pub(super) fn inspect(data: &[u8], archive: bool) -> Result<Vec<Observation>> {
         object(data, None, &mut result)?;
         return Ok(result);
     }
-    if !data.starts_with(b"!<arch>\n") {
+    let mut cursor = LeCursor::new(data);
+    if cursor.take(8).ok() != Some(b"!<arch>\n") {
         return Err("COFF runtime inspection requires an ordinary MSVC archive.".into());
     }
-    let mut offset = 8;
     let mut members = 0;
     let mut object_members = 0;
     let mut linker_members = 0;
     let mut long_names = false;
-    while offset < data.len() {
+    while !cursor.is_empty() {
         members += 1;
         if members > MEMBER_LIMIT {
             return Err("COFF archive member count exceeds its bound.".into());
         }
-        let header = extent(data, offset, 60)?;
+        let member_offset = cursor.position();
+        let header = cursor.read_array::<60>()?;
         if &header[58..] != b"`\n" {
             return Err("COFF archive member header is malformed.".into());
         }
@@ -248,7 +229,7 @@ pub(super) fn inspect(data: &[u8], archive: bool) -> Result<Vec<Observation>> {
             .trim()
             .parse::<usize>()
             .map_err(|error| error.to_string())?;
-        let payload = extent(data, offset + 60, size)?;
+        let payload = cursor.take(size)?;
         let label = std::str::from_utf8(&header[..16])
             .map_err(|error| error.to_string())?
             .trim_end();
@@ -266,15 +247,11 @@ pub(super) fn inspect(data: &[u8], archive: bool) -> Result<Vec<Observation>> {
             if label.is_empty() || label.starts_with("#1/") || label == "/SYM64/" {
                 return Err("Unsupported COFF archive member naming format.".into());
             }
-            object(payload, Some(offset), &mut result)?;
+            object(payload, Some(member_offset), &mut result)?;
             object_members += 1;
         }
-        offset += 60 + size;
-        if size % 2 != 0 {
-            if extent(data, offset, 1)? != b"\n" {
-                return Err("COFF archive member padding is malformed.".into());
-            }
-            offset += 1;
+        if size % 2 != 0 && cursor.read_u8()? != b'\n' {
+            return Err("COFF archive member padding is malformed.".into());
         }
     }
     if object_members == 0 {

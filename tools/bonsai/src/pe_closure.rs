@@ -45,52 +45,11 @@ struct Request {
     aliases: Option<Aliases>,
 }
 
-struct Section {
-    name: String,
-    virtual_size: u64,
-    virtual_address: u64,
-    raw_size: usize,
-    raw: usize,
-}
+use crate::pe_format::{PeLayout, PePolicy, extent, u32_at, usize_at as offset_at};
 
 pub(crate) struct Image {
     data: Vec<u8>,
-    optional: usize,
-    base: u64,
-    sections: Vec<Section>,
-}
-
-fn extent(data: &[u8], offset: usize, size: usize) -> Result<&[u8]> {
-    data.get(offset..offset.checked_add(size).ok_or("PE extent outside file")?)
-        .ok_or_else(|| "PE extent outside file".into())
-}
-
-fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
-    Ok(u16::from_le_bytes(
-        extent(data, offset, 2)?
-            .try_into()
-            .map_err(|_| "PE extent outside file")?,
-    ))
-}
-
-fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        extent(data, offset, 4)?
-            .try_into()
-            .map_err(|_| "PE extent outside file")?,
-    ))
-}
-
-fn offset_at(data: &[u8], offset: usize) -> Result<usize> {
-    usize::try_from(u32_at(data, offset)?).map_err(|error| error.to_string())
-}
-
-fn u64_at(data: &[u8], offset: usize) -> Result<u64> {
-    Ok(u64::from_le_bytes(
-        extent(data, offset, 8)?
-            .try_into()
-            .map_err(|_| "PE extent outside file")?,
-    ))
+    layout: PeLayout,
 }
 
 fn ordinary_directory(path: &Path) -> Result<()> {
@@ -142,75 +101,16 @@ fn read_image(path: &Path, budget: &Budget) -> Result<Image> {
 }
 
 pub(crate) fn parse_image(data: Vec<u8>) -> Result<Image> {
-    extent(&data, 0, 64)?;
-    if data.get(..2) != Some(b"MZ") {
-        return Err("Missing DOS signature".into());
-    }
-    let pe = offset_at(&data, 60)?;
-    extent(&data, pe, 24)?;
-    if u32_at(&data, pe)? != 0x4550 || u16_at(&data, pe + 4)? != 0xaa64 {
-        return Err("Expected native ARM64 PE".into());
-    }
-    let optional = pe + 24;
-    let size = usize::from(u16_at(&data, pe + 20)?);
-    if size < 112 {
-        return Err("Truncated PE32+ optional header".into());
-    }
-    extent(&data, optional, size)?;
-    if u16_at(&data, optional)? != 0x20b {
-        return Err("Expected PE32+".into());
-    }
-    let directories = offset_at(&data, optional + 108)?;
-    if !(14..=(size - 112) / 8).contains(&directories) {
-        return Err("PE directory count exceeds optional header or omits import tables".into());
-    }
-    let count = usize::from(u16_at(&data, pe + 6)?);
-    if count > 96 {
-        return Err("Too many PE sections".into());
-    }
-    let section = optional + size;
-    extent(&data, section, count * 40)?;
-    let mut sections = Vec::new();
-    for index in 0..count {
-        let header = section + index * 40;
-        let entry = Section {
-            name: String::from_utf8_lossy(extent(&data, header, 8)?)
-                .trim_end_matches('\0')
-                .into(),
-            virtual_size: u64::from(u32_at(&data, header + 8)?),
-            virtual_address: u64::from(u32_at(&data, header + 12)?),
-            raw_size: offset_at(&data, header + 16)?,
-            raw: offset_at(&data, header + 20)?,
-        };
-        extent(&data, entry.raw, entry.raw_size)?;
-        sections.push(entry);
-    }
-    let base = u64_at(&data, optional + 24)?;
-    Ok(Image {
-        data,
-        optional,
-        base,
-        sections,
-    })
+    let layout = PeLayout::parse(&mut data.as_slice(), &PePolicy::STATIC_AUDIT)?;
+    Ok(Image { data, layout })
 }
 
 fn mapped(image: &Image, rva: u64, size: usize) -> Result<(usize, usize)> {
-    for section in &image.sections {
-        let raw_size = u64::try_from(section.raw_size).map_err(|error| error.to_string())?;
-        if rva >= section.virtual_address
-            && rva < section.virtual_address + section.virtual_size.max(raw_size)
-        {
-            let delta = usize::try_from(rva - section.virtual_address)
-                .map_err(|error| error.to_string())?;
-            if delta > section.raw_size || size > section.raw_size - delta {
-                return Err("PE RVA extent outside raw section".into());
-            }
-            let offset = section.raw + delta;
-            extent(&image.data, offset, size)?;
-            return Ok((offset, section.raw_size - delta));
-        }
-    }
-    Err("Unmapped PE RVA".into())
+    let (offset, available) = image.layout.map_rva(rva, size, false)?;
+    Ok((
+        usize::try_from(offset).map_err(|error| error.to_string())?,
+        available,
+    ))
 }
 
 fn safe_module(name: &str) -> bool {
@@ -224,14 +124,15 @@ fn safe_module(name: &str) -> bool {
 }
 
 fn module(image: &Image, rva: u64) -> Result<String> {
-    let (offset, available) = mapped(image, rva, 1)?;
-    let data = extent(&image.data, offset, available.min(260))?;
-    let end = data
-        .iter()
-        .position(|byte| *byte == 0)
-        .filter(|end| *end > 0)
-        .ok_or("Unterminated import name")?;
-    let name = std::str::from_utf8(&data[..end])
+    let mut scratch = [0_u8; 260];
+    let bytes = image.layout.read_c_bytes_at(
+        &mut image.data.as_slice(),
+        rva,
+        false,
+        &mut scratch,
+        "Unterminated import name",
+    )?;
+    let name = std::str::from_utf8(bytes)
         .map_err(|_| "Unsafe import module name")?
         .to_ascii_lowercase();
     if !safe_module(&name) {
@@ -241,31 +142,25 @@ fn module(image: &Image, rva: u64) -> Result<String> {
 }
 
 pub(crate) fn imports(image: &Image, delayed: bool) -> Result<Vec<String>> {
-    let directory_index = if delayed { 13 } else { 1 };
-    let directory = image.optional + 112 + directory_index * 8;
-    let rva = u64::from(u32_at(&image.data, directory)?);
-    let size = offset_at(&image.data, directory + 4)?;
-    if rva == 0 && size == 0 {
-        return Ok(Vec::new());
-    }
-    let width = if delayed { 32 } else { 20 };
-    if rva == 0 || !(width..=65_536).contains(&size) {
-        return Err("Invalid import directory extent".into());
-    }
-    let (start, _) = mapped(image, rva, size)?;
     let mut result = Vec::new();
-    for position in (0..=size - width).step_by(width) {
-        let record = extent(&image.data, start + position, width)?;
-        if record.iter().all(|byte| *byte == 0) {
-            return Ok(result);
-        }
-        let mut name = u64::from(u32_at(record, if delayed { 4 } else { 12 })?);
-        if delayed && u32_at(record, 0)? & 1 == 0 {
-            name = name.checked_sub(image.base).ok_or("Unmapped PE RVA")?;
-        }
-        result.push(module(image, name)?);
-    }
-    Err("Unterminated import directory".into())
+    image.layout.visit_import_descriptors::<_, String>(
+        &mut image.data.as_slice(),
+        delayed,
+        65_536,
+        65_536,
+        false,
+        |_, descriptor| {
+            let rva = image.layout.resolve_import_name_rva(
+                delayed,
+                descriptor.attributes,
+                descriptor.name_raw,
+                false,
+            )?;
+            result.push(module(image, rva)?);
+            Ok(())
+        },
+    )?;
+    Ok(result)
 }
 
 pub(crate) enum ImportSymbol<'a> {
@@ -303,14 +198,16 @@ fn api_text(data: &[u8], offset: usize, length: usize) -> Result<String> {
 fn api_sets(system: &Path, budget: &Budget) -> Result<Aliases> {
     let image = read_image(&system.join("apisetschema.dll"), budget)?;
     let sections: Vec<_> = image
-        .sections
+        .layout
+        .sections()
         .iter()
-        .filter(|section| section.name == ".apiset")
+        .filter(|section| section.name_bytes() == b".apiset")
         .collect();
     let [section] = sections.as_slice() else {
         return Err("Expected one API-set namespace".into());
     };
-    let data = extent(&image.data, section.raw, section.raw_size)?;
+    let raw = usize::try_from(section.raw_offset).map_err(|error| error.to_string())?;
+    let data = extent(&image.data, raw, section.raw_size)?;
     let size = offset_at(data, 4)?;
     if data.len() < 28 || u32_at(data, 0)? != 6 || !(28..=data.len()).contains(&size) {
         return Err("Unsupported API-set namespace".into());

@@ -1,38 +1,6 @@
 //! Basic PE machine probing; file admission and architecture policy stay with callers.
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "Private maintenance modules expose only a crate-local implementation API."
-)]
 
-use std::io::{self, Read, Seek, SeekFrom};
-
-#[derive(Debug)]
-pub(super) enum Error {
-    DosRead(io::Error),
-    DosSignature,
-    Offset,
-    Io(io::Error),
-    PeSignature,
-}
-
-pub(super) fn machine(reader: &mut (impl Read + Seek), length: u64) -> Result<u16, Error> {
-    let mut dos = [0; 64];
-    reader.read_exact(&mut dos).map_err(Error::DosRead)?;
-    let [b'M', b'Z', .., o0, o1, o2, o3] = dos else {
-        return Err(Error::DosSignature);
-    };
-    let offset = u64::from(u32::from_le_bytes([o0, o1, o2, o3]));
-    if offset < 64 || offset.checked_add(24).is_none_or(|end| end > length) {
-        return Err(Error::Offset);
-    }
-    reader.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
-    let mut pe = [0; 6];
-    reader.read_exact(&mut pe).map_err(Error::Io)?;
-    let [b'P', b'E', 0, 0, m0, m1] = pe else {
-        return Err(Error::PeSignature);
-    };
-    Ok(u16::from_le_bytes([m0, m1]))
-}
+pub(super) use crate::pe_format::{PeProbeError as Error, read_pe_machine as machine};
 
 #[cfg(test)]
 mod tests {
