@@ -1957,17 +1957,6 @@ impl State {
     }
 
     fn conversation_notices(&mut self, ui: &mut egui::Ui) {
-        if self.model.busy()
-            && let Some(owner) = self.request_conversation
-            && owner != self.active_conversation
-        {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(self.generation_status());
-                if ui.small_button("Show response").clicked() {
-                    self.switch_conversation(owner);
-                }
-            });
-        }
         if let Some(notice) = self.conversation_notice {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(notice).small());

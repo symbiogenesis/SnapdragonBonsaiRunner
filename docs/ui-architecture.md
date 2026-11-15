@@ -249,9 +249,12 @@ channel on worker attachment. Late events cannot reopen admission in another pha
 Drafting, browsing and conversation creation remain available during preparation,
 failure and generation. Only one request runs: incoming content, reasoning, stages
 and history belong to its submitting conversation, which cannot be deleted until
-it settles. Show response returns to that owner; Stop controls it from any chat.
+it settles. Stop controls it from any chat; other conversations show a single
+background-response notice below the composer, with no duplicate workspace
+banner or return button.
 Its sidebar row shows an animated vertical activity indicator while generating,
-including thinking and responses received while another conversation is selected.
+including thinking and responses received while another conversation is selected;
+selecting that row returns to the response.
 Completion, Stop, rejection or failure removes the indicator.
 Coalesce history changes and restore the selected history before the next Send,
 without replay. Teardown/unacknowledged restart blocks navigation until turn events

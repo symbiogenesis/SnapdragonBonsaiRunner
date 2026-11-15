@@ -655,7 +655,23 @@ fn background_generation_keeps_composer_and_conversation_navigation_available() 
         assert_eq!(chat.state().app.input, "Draft in another chat");
         assert!(chat.state().app.transcript.messages.is_empty());
         assert!(chat.state().commands.try_recv().is_err());
-        chat.get_by_role_and_label(egui::Role::Button, "Show response")
+        assert!(
+            chat.query_by_role_and_label(egui::Role::Button, "Show response")
+                .is_none()
+        );
+        let composer_rect = chat
+            .get_by_role_and_label(egui::Role::MultilineTextInput, "Message")
+            .rect();
+        let notices: Vec<_> = chat
+            .get_all_by_label(
+                "Responding in ‘Original question’. You can draft here while you wait.",
+            )
+            .map(|node| node.rect())
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].top() >= composer_rect.bottom());
+        open_sidebar(&mut chat, size);
+        chat.get_by_role_and_label(egui::Role::Button, "Original question")
             .click();
         chat.run();
         assert_eq!(chat.state().app.active_conversation, owner);

@@ -226,8 +226,9 @@ branches clear it; the query is not saved. Selecting a result opens Find in that
 chat. A title-only match can have no matching message body.
 
 Only one response runs at a time. While it generates, you can draft, browse or
-create another conversation. Enter cannot queue a second request. **Show response**
-returns to the generating chat; **Stop** controls it from any conversation.
+create another conversation. Enter cannot queue a second request. Other chats show
+the background-response notice below the composer; select the sidebar row with the
+response indicator to return, and **Stop** controls generation from any conversation.
 Completion, rejection and Stop preserve newer drafts. The generating chat cannot
 be deleted until it settles. Switching conversations stops speech and never starts
 playback for a hidden response.
