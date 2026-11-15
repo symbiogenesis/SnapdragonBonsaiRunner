@@ -76,7 +76,7 @@ impl Launch {
             || self
                 .threads
                 .is_some_and(|value| !(1..=256).contains(&value))
-            || (self.codec.is_none() && (self.quantization.is_some() || self.threads.is_some()))
+            || (self.codec.is_none() && self.quantization.is_some())
             || self.codec.is_some() != self.voice_model.is_some()
         {
             return Err(
@@ -687,6 +687,52 @@ fn main() -> std::io::Result<()> {
         );
         drop(speech);
         unrelated.stop(Duration::from_secs(5))?;
+        Ok(())
+    }
+
+    #[test]
+    fn asr_launch_allows_bounded_threads_and_rejects_quantization_or_invalid_threads()
+    -> io::Result<()> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("Bonsai-ASR-Launch-{stamp}"));
+        fs::create_dir(&directory)?;
+        let executable = directory.join("asr.exe");
+        let model = directory.join("asr.gguf");
+        let key = directory.join("token.key");
+        for path in [&executable, &model, &key] {
+            fs::write(path, b"fixture")?;
+        }
+        let mut launch = super::Launch {
+            executable,
+            model,
+            codec: None,
+            voice_model: None,
+            quantization: None,
+            threads: Some(8),
+            evidence: directory.clone(),
+        };
+        let (specification, policy, _private) = launch
+            .specification(&key, 8766)
+            .map_err(|_| io::Error::other("Could not prepare synthetic ASR worker"))?;
+        assert!(
+            specification
+                .arguments
+                .array_windows()
+                .any(|[flag, value]| flag == "--threads" && value == "8")
+        );
+        assert_eq!(policy.readonly_paths.len(), 3);
+        for bad_threads in [Some(0), Some(257)] {
+            launch.threads = bad_threads;
+            assert!(launch.validate().is_err());
+        }
+        launch.threads = Some(8);
+        launch.quantization = Some("Q8_0".to_owned());
+        assert!(launch.validate().is_err());
+        drop(_private);
+        let _ = fs::remove_dir_all(&directory);
         Ok(())
     }
 }
