@@ -404,3 +404,40 @@ fn sanitization_redacts_local_user_and_unc_paths_in_single_pass_preserving_urls(
     assert!(sanitized.contains("url=https://example.com/home/docs"));
     assert!(sanitized.contains("key=[REDACTED]"));
 }
+
+#[test]
+fn frontend_only_broker_pipe_session_collects_without_backend_key_file_and_rejects_bad_backend_key()
+-> crate::Result<()> {
+    let fixture = Fixture::new()?;
+    let session = fixture.session('1')?;
+    fs::remove_file(session.join("backend.key")).map_err(|error| error.to_string())?;
+    fs::write(session.join("backend.stdout"), []).map_err(|error| error.to_string())?;
+    fs::write(
+        session.join("backend.stderr"),
+        format!("frontend={}\n", "a".repeat(64)),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let result = fixture.collect()?;
+    assert_eq!(result["Ready"], true);
+    let receipt = fixture.receipt()?;
+    assert_eq!(receipt["Sources"][1]["Published"], true);
+    let public_stderr =
+        fs::read_to_string(fixture.0.join(PUBLIC_FILES[1])).map_err(|error| error.to_string())?;
+    assert!(!public_stderr.contains(&"a".repeat(64)));
+    assert!(public_stderr.contains("frontend=[REDACTED]"));
+
+    for bad_key in ["not-hex", &"b".repeat(65), ""] {
+        fs::write(session.join("backend.key"), bad_key).map_err(|error| error.to_string())?;
+        let bad = fixture.collect()?;
+        assert_eq!(bad["Ready"], false);
+        assert_eq!(bad["Classification"], "key-validation-failed");
+    }
+
+    fs::remove_file(session.join("backend.key")).map_err(|error| error.to_string())?;
+    fs::remove_file(session.join("frontend.key")).map_err(|error| error.to_string())?;
+    let missing_frontend = fixture.collect()?;
+    assert_eq!(missing_frontend["Ready"], false);
+    assert_eq!(missing_frontend["Classification"], "key-validation-failed");
+    Ok(())
+}

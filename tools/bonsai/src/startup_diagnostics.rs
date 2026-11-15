@@ -341,8 +341,11 @@ fn collect_logs(
     for directory in &directories {
         ordinary_directory(directory).map_err(|_| "key-validation-failed")?;
         for name in ["frontend.key", "backend.key"] {
-            let (bytes, guard) =
-                read_bounded(&directory.join(name), 64).map_err(|_| "key-validation-failed")?;
+            let (bytes, guard) = match read_bounded(&directory.join(name), 64) {
+                Ok(ok) => ok,
+                Err("missing") if name == "backend.key" => continue,
+                Err(_) => return Err("key-validation-failed"),
+            };
             let key = String::from_utf8(bytes).map_err(|_| "key-validation-failed")?;
             if !crate::identity::is_lower_hex(&key, 64) {
                 return Err("key-validation-failed");
