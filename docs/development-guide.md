@@ -327,9 +327,12 @@ fresh** preserves the existing conversation and draft. Guidance never trims hist
 changes reply limits or disables Send automatically.
 
 Drafts accept up to 1,048,576 Unicode characters. Oversized edits reject as a whole.
-The independent 1 MiB serialized request bound includes history and JSON escaping;
+The independent serialized request bound (1 MiB text-only, or 16 MiB when
+multimodal PNG `image_url` data URLs are attached, up to 24 `image_url` parts
+across history and the current turn) includes history and JSON escaping;
 the broker also counts the exact prompt and reserves reply space. A recognized
-input/context rejection keeps the model ready and restores the prompt only to an
+input/context rejection keeps the model ready and restores the prompt (including
+staged draft attachments when unedited) only to an
 empty composer. Edit the draft, reduce the reply limit or start a conversation.
 Other uncertain failures require explicit Retry; requests never replay
 automatically. See the [broker error contract](broker-policy.md#native-client-completion-and-recovery)
@@ -464,12 +467,29 @@ ASR. Cancel/Escape, revocation, Send, conversation changes, read-aloud or closin
 cancel input and invalidate late results. Missing/not-ready Qwen3-ASR or denied
 permission keeps capture off and exposes setup guidance.
 
-The **plus button** at the composer's lower left selects one local audio file.
-You can also copy an audio file in Explorer and press **Ctrl+V** while the composer
-has focus. Supported extensions are MP3, WAV, M4A, AAC, FLAC and WMA, subject to
-the installed Windows media decoders. Import and conversion run off the UI thread,
-keep audio in memory and require no microphone permission. Select one file at a
-time. File size and total duration have no fixed cap; available physical memory
+The **plus button** (`+`, accessible name **Add attachment**) at the composer's
+lower left opens the native **Attachment options** popup with **Audio files**,
+**Text files** and **Images and Videos**. **Audio files** stays greyed out with
+a loading spinner and `Loading ASR…` alongside it until Qwen3-ASR is ready (or
+`ASR unavailable` when disabled/unconfigured). When ASR is ready, choosing
+**Audio files** — or pressing **Ctrl+V** while the composer has focus after
+copying an audio file in Explorer — imports MP3, WAV, M4A, AAC, FLAC or WMA
+subject to the installed Windows media decoders. Meanwhile, **Text files** and
+**Images and Videos** remain active while Swift is still loading, attaching
+selected files strictly as draft attachments on the active message (up to 8
+attachments per message; readiness or import completion never auto-sends a draft
+with attachments). Supported UTF-8 text attachments (`256 KiB` per file,
+`512 KiB` total per message) format as fenced blocks on send; images
+(WIC-normalized to `<= 1,280` px PNGs) and videos (up to `6` evenly spaced
+Media Foundation keyframes at `<= 768` px PNGs, `64 MiB` source cap) decode
+inside an isolated offline AppContainer `--attachment-import-worker` child and
+appear as removable composer chips and transcript attachment cards with an
+**Attachment preview** lightbox (including **Previous frame** / **Next frame**
+stepping for video keyframes). **Send** stays disabled with a clear tooltip if
+media attachments are staged on a text-only launch without vision (`mmproj`)
+support. Audio import and conversion also run off the UI thread,
+keep audio in memory and require no microphone permission. Select one audio file at a
+time. Audio file size and total duration have no fixed cap; available physical memory
 and commit govern buffer and transcript allocation. Decoding/recognition runs sequentially with at most one segment of lookahead.
 Each request fits the 30-second ASR contract and prefers a quiet pause while
 preserving every sample. Actual decoder EOF ends the import, not duration tags.
@@ -668,6 +688,14 @@ its control. Launch prepares the selected pinned runtime automatically, includin
 an explicitly selected publisher rollback. No prior runtime-provisioning command
 is required. Keep the same model, adapter and data-directory options when changing
 an explicit engine selection.
+
+For multimodal context (`Images and Videos`), Swift setup also prepares and
+verifies `config/swift-mmproj.lock.json` (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`,
+`629,246,976` bytes), reserving `768 MiB` in memory planning (`--no-mmproj-offload`,
+`1,024` default max image tokens) unless disabled with `--no-mmproj` (PowerShell
+`-NoMmproj`, installed JSON `NoMmproj: true`). `--publisher-engine` activates
+`Input modalities: text, image` when the vision reserve fits; the pinned native
+Rust `0.1.28` runtime remains text-only regardless of `--no-mmproj`.
 
 Engine options are mutually exclusive. Installed launches retain
 `NativeEngine: false` for publisher rollback and `NativeEngine: true` for explicit

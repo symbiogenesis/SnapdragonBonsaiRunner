@@ -320,6 +320,14 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify speech after X1/X2 data-directory moves, CPU-feature or Windows
   changes, retaining pinned-model loading/tokenization/sampling, workspace/lease,
   listening and lifecycle gates.
+- [ ] Qualify Swift `mmproj` provisioning/verification
+  (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`), `768 MiB` memory-planner reserve
+  and `--no-mmproj` opt-out across X1/X2 memory configurations,
+  `--publisher-engine` multimodal image and video-keyframe turns
+  (`Input modalities: text, image`), future native Rust `mmproj` enablement once
+  supported by a pinned Prism release, composer `+` menu ASR loading state and
+  draft-only attachment staging while Swift prepares, and DPAPI attachment
+  persistence.
 - [ ] Qualify full selected context/output, long histories, speech, offline
   restart, memory pressure and recovery. Independently exercise requested
   `bounded_history` and `stalled_consumer` workloads under the acceptance contract.
@@ -351,6 +359,11 @@ adoption decisions without displacing native daily-use acceptance.
   networking, malformed/flooded/truncated pipes, Stop/close and confirmed teardown
   or bounded quarantine. Cover portable and installed app identities and Windows
   microphone consent/revocation independently; no in-process decoder fallback.
+- [ ] Qualify AppContainer `--attachment-import-worker` WIC image
+  normalization and Media Foundation sequential video keyframe extraction
+  under Win32k, network and unrelated-file denial, including multi-file COM
+  picker bounds, bounded pipe framing, cancellation/deadlines and confirmed Job
+  teardown.
 - [ ] Qualify [negligible boundary overhead](docs/validation.md#boundary-overhead-acceptance)
   for existing microphone/file, process, artifact/credential and authenticated
   transport paths as well as new isolation. Measure cold setup separately from

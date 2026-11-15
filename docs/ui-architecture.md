@@ -123,9 +123,13 @@ establish promotion or full-model/device qualification.
 ### Long drafts and context guidance
 
 Draft/edit transactions and serialized requests retain independent
-[storage bounds](streaming-resources.md#native-chat-and-transcript). Reject an
+[storage bounds](streaming-resources.md#native-chat-and-transcript): 1 MiB
+text-only and 16 MiB when multimodal PNG `image_url` data URLs are attached
+(up to 24 `image_url` parts across history and the current turn). Reject an
 oversized edit as a whole, preserving text, selection and undo. Restore rejected
-or interrupted prompts only to an empty composer in the originating conversation.
+or interrupted prompts only to an empty composer in the originating conversation
+(and restore staged draft attachments with rejected prompts when the originating
+composer remains unedited).
 
 Context guidance is advisory; exact [broker admission](broker-policy.md#text-chat-admission)
 governs Send. It never trims history, changes reply limits or disables Send.
@@ -305,7 +309,9 @@ content with no broker, credentials, microphone or speech service.
 ## Interoperability belongs at the API boundary
 
 Use local LLM HTTP/JSON/SSE conventions: numeric loopback, bearer authorization,
-`POST /v1/chat/completions`, text messages and `text/event-stream`. Preserve supplied
+`POST /v1/chat/completions`, text messages (or multimodal user content arrays
+combining `text` and bounded PNG `image_url` `data:image/png;base64,...` parts
+when the backend reports `Input modalities: text, image`) and `text/event-stream`. Preserve supplied
 assistant reasoning separately as `reasoning_content`. [Broker policy](broker-policy.md#public-request-contract)
 owns the supported subset, bounds, errors and native completion semantics.
 Route names alone establish neither arbitrary-server nor OpenAI SDK compatibility;
@@ -345,8 +351,25 @@ ASR preparation, generation ownership and the successful-input idle lease follow
 the [speech scheduling contract](streaming-resources.md#speech-scheduling-and-playback).
 No audio upload or inference precedes complete finalized-WAV validation.
 
-The composer's native plus button selects one audio file; Ctrl+V in the focused
-composer accepts files copied from Explorer. Selection stays in the trusted UI;
+The composer's `+` button (`Add attachment`) opens the native `Attachment options`
+popup with `Audio files`, `Text files` and `Images and Videos`. `Audio files` is
+disabled with a spinner and `Loading ASR…` until Qwen3-ASR is ready (or
+`ASR unavailable` when disabled or unconfigured). While Swift is still loading,
+`Text files` and `Images and Videos` remain enabled and attach files strictly to
+the active draft without auto-sending on import completion or model readiness.
+Up to `8` attachments fit on one message: UTF-8 text files (`256 KiB` per file,
+`512 KiB` per message) format as fenced blocks on send; source media files
+(`<= 64 MiB`) decode off the UI thread inside the private headless
+`--attachment-import-worker` entry point in an offline AppContainer (WIC
+normalization to `<= 1,280` px PNGs for images, and sequential Media Foundation
+extraction of up to `6` evenly spaced `<= 768` px PNG keyframes for videos).
+Staged attachments render as removable composer chips and committed transcript
+cards, opening the `Attachment preview` lightbox (with `Previous frame` /
+`Next frame` stepping for videos). `Send` remains disabled with guidance if
+media attachments are present without vision (`mmproj`) capability.
+
+When ASR is ready, choosing `Audio files` selects one audio file, and `Ctrl+V` in
+the focused composer accepts audio files copied from Explorer. Selection stays in the trusted UI;
 retained file/ancestor handles bind that authorization through decoder cleanup.
 One offline MXC process normalizes MP3/WAV and Windows-supported M4A/AAC/FLAC/WMA
 to in-memory mono 16 kHz
@@ -408,8 +431,11 @@ talkers, budgets, service lifetime and external-service requirements (including
 `consistent_voice: true` and complete-WAV fallback). The [ASR](../tools/canary-asr/README.md)
 and [Qwen](../tools/qwen-tts/README.md) READMEs define companion protocols.
 Service failure exposes setup guidance without substituting a recognizer or
-Windows voice. Images, video and image generation remain unavailable in the
-pinned Swift profile.
+Windows voice. Image and video keyframe context requires a vision-capable Swift
+launch (`Input modalities: text, image` with verified `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`
+on `--publisher-engine`; the pinned native Rust `0.1.28` runtime remains
+text-only and `--no-mmproj` disables the projector), while raster image and video
+generation remain unavailable in the pinned Swift profile.
 
 ## Candidate native improvements
 
