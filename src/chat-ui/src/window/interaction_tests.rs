@@ -1611,6 +1611,11 @@ fn response_speaker_loading_is_cancellable_and_only_failures_open_alerts() -> io
     chat.state_mut().app.speech = Some(session);
     chat.state_mut().app.speech_output = true;
     chat.run();
+    assert!(
+        chat.query_by_label("Enter to send · Shift+Enter for a new line")
+            .is_none()
+    );
+    assert!(chat.query_by_label("Ready when you are.").is_none());
     chat.get_by_role_and_label(egui::Role::Button, "Read this response aloud")
         .click();
     chat.run_steps(8);

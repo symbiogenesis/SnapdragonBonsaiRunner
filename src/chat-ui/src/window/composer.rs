@@ -234,15 +234,14 @@ impl State {
         {
             error_ui::summary(ui, &self.speech_status);
         }
-        // Keyboard guidance stays visually separate from audio feedback.
-        if self.model.busy() || self.model.ready() || !self.warning && self.setup.error.is_none() {
-            let status: std::borrow::Cow<'_, str> = if self.model.busy() {
-                self.generation_status().into()
-            } else if self.model.ready() {
-                "Enter to send · Shift+Enter for a new line".into()
-            } else {
-                self.status.as_str().into()
-            };
+        let status: Option<std::borrow::Cow<'_, str>> = if self.model.busy() {
+            Some(self.generation_status().into())
+        } else if !self.model.ready() && !self.warning && self.setup.error.is_none() {
+            Some(self.status.as_str().into())
+        } else {
+            None
+        };
+        if let Some(status) = status {
             let preview: String = status.chars().take(320).collect();
             ui.add(egui::Label::new(RichText::new(preview).small().weak()).truncate());
         }
