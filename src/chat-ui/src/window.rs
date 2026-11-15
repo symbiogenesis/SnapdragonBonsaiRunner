@@ -1725,6 +1725,7 @@ fn test_font_provider() -> std::sync::Arc<egui_system_font_provider::SystemFontP
 
 #[cfg(test)]
 fn configure_test_context(ctx: &egui::Context) {
+    appearance::prepare_fonts();
     configure(ctx);
     ctx.add_font_provider(test_font_provider());
 }
@@ -2296,6 +2297,7 @@ fn native_options() -> io::Result<eframe::NativeOptions> {
 }
 
 pub(super) fn run(config: Config) -> io::Result<()> {
+    appearance::prepare_fonts();
     let recovery = crate::recovery::Recovery::open(&config.data);
     let placement = placement::Placement::open(&config.data);
     let appearance = appearance::Store::open(&config.data);
@@ -2343,6 +2345,7 @@ fn startup_exit_result(update_approved: bool, failure: Option<String>) -> io::Re
 }
 
 pub(super) fn run_startup(request: crate::startup::Request) -> io::Result<bool> {
+    appearance::prepare_fonts();
     prepare_startup_directory(&request.data)?;
     // Retain the established recovery ordering: restore before accepting a draft.
     let recovery = crate::recovery::Recovery::open(&request.data);
@@ -2383,6 +2386,7 @@ pub(super) fn run_startup(request: crate::startup::Request) -> io::Result<bool> 
 }
 /// Opens only a seeded interface; no backend, credential or audio operation runs.
 pub(super) fn run_preview() -> io::Result<()> {
+    appearance::prepare_fonts();
     eframe::run_native("Swift Bonsai · Preview", native_options()?, Box::new(|cc| {
         graphics::install(cc);
         configure(&cc.egui_ctx);
