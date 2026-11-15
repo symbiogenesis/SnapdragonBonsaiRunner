@@ -55,6 +55,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--prompt-reuse disabled|latest] (experimental exact latest-state reuse; Rust only)\n",
     "  [--kv-cache f16|rsq4|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
     "  [--placement auto|cpu] (native Swift only; CPU requires a reviewed compatible release)\n",
+    "  [--reset-on-cancel] (reviewed native runtime only; reset live state in place on client cancel)\n",
     "  [--use-abliterate-lora] (pinned adapter; request scale 0..2, default 1.3; Swift CPU only)\n",
     "  [--use-repacked-ptq1|--use-original-pq2] (mutually exclusive weight selections; Swift CPU only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
@@ -136,6 +137,7 @@ pub struct LaunchConfig {
     latest_prompt_reuse: bool,
     kv_cache: Option<crate::inference::KvCache>,
     placement: crate::inference::Placement,
+    reset_on_cancel: bool,
     use_abliterate_lora: bool,
     weight_representation: WeightRepresentation,
 }
@@ -159,6 +161,7 @@ impl LaunchConfig {
         let mut native_engine = None;
         let (mut native_row_workers, mut latest_prompt_reuse) = (None, None);
         let (mut kv_cache, mut placement) = (None, None);
+        let mut reset_on_cancel = false;
         let mut use_abliterate_lora = false;
         let mut use_repacked_ptq1 = None;
         let mut profile = None;
@@ -186,6 +189,9 @@ impl LaunchConfig {
                 }
                 Some("--placement") if placement.is_none() => {
                     placement = Some(crate::inference::Placement::parse(args.next().as_deref())?);
+                }
+                Some("--reset-on-cancel") if !reset_on_cancel => {
+                    reset_on_cancel = true;
                 }
                 Some("--use-abliterate-lora") if !use_abliterate_lora => {
                     use_abliterate_lora = true;
@@ -244,6 +250,7 @@ impl LaunchConfig {
             latest_prompt_reuse,
             kv_cache,
             placement,
+            reset_on_cancel,
             use_abliterate_lora,
             weight_representation: if use_repacked_ptq1.unwrap_or(false) {
                 WeightRepresentation::CurrentRepackedPtq1
@@ -252,6 +259,9 @@ impl LaunchConfig {
             },
         };
         configuration.validate_selection(use_repacked_ptq1.is_some())?;
+        if configuration.reset_on_cancel && !crate::inference::reset_on_cancel_supported()? {
+            return Err(LaunchError::NativeRuntime);
+        }
         Ok(configuration)
     }
 
@@ -264,6 +274,7 @@ impl LaunchConfig {
             || (self.native_engine && !swift)
             || (self.native_row_workers == 4 && !self.native_engine)
             || (self.latest_prompt_reuse && !self.native_engine)
+            || (self.reset_on_cancel && !self.native_engine)
             || (self.use_abliterate_lora && !swift)
             || (explicit_weight && !swift)
         {
@@ -747,6 +758,9 @@ impl LaunchConfig {
         if adapter {
             service.enable_pinned_abliteration();
         }
+        if self.reset_on_cancel {
+            service.enable_reset_on_cancel();
+        }
         Ok(service)
     }
 
@@ -845,8 +859,9 @@ impl LaunchedService {
     /// Serve while observing process exit, listener PID and physical/process memory.
     ///
     /// Every exit closes admission, drains owned sockets, terminates the complete
-    /// Job and confirms it is empty. Interrupted generation ends this instance;
-    /// no automatic restart or admission reset is supplied.
+    /// Job and confirms it is empty. Interrupted generation ends this instance
+    /// unless `--reset-on-cancel` was selected and the owned native backend
+    /// acknowledged `POST /reset`.
     ///
     /// # Errors
     /// Returns resource/backend/cleanup failure after shutting down the service.
@@ -1399,6 +1414,50 @@ mod tests {
             LaunchConfig::parse(reference).err(),
             Some(LaunchError::Arguments)
         );
+    }
+
+    #[test]
+    fn reset_on_cancel_is_explicit_native_swift_only() -> Result<(), LaunchError> {
+        let default = LaunchConfig::parse(arguments())?;
+        assert!(!default.reset_on_cancel);
+
+        let mut native = arguments();
+        native.extend(["--profile", "swift-pq2-assessment", "--native-engine"].map(OsString::from));
+        assert!(!LaunchConfig::parse(native.clone())?.reset_on_cancel);
+
+        let mut enabled = native;
+        enabled.push("--reset-on-cancel".into());
+        assert!(LaunchConfig::parse(enabled.clone())?.reset_on_cancel);
+
+        let mut duplicate = enabled;
+        duplicate.push("--reset-on-cancel".into());
+        assert_eq!(
+            LaunchConfig::parse(duplicate).err(),
+            Some(LaunchError::Arguments)
+        );
+
+        let mut reference = arguments();
+        reference.push("--reset-on-cancel".into());
+        assert_eq!(
+            LaunchConfig::parse(reference).err(),
+            Some(LaunchError::Arguments)
+        );
+
+        let mut publisher = arguments();
+        publisher.extend(
+            [
+                "--profile",
+                "swift-pq2-assessment",
+                "--publisher-engine",
+                "--reset-on-cancel",
+            ]
+            .map(OsString::from),
+        );
+        assert_eq!(
+            LaunchConfig::parse(publisher).err(),
+            Some(LaunchError::Arguments)
+        );
+        Ok(())
     }
 
     #[test]

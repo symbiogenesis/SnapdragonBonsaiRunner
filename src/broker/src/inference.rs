@@ -333,6 +333,22 @@ pub(super) fn memory_context_supported() -> Result<bool, LaunchError> {
     Ok(reviewed_release_matches(&pin, MEMORY_CONTEXT_RELEASE))
 }
 
+// In-place cancellation recovery requires a reviewed release whose worker loop
+// observes abandoned generation sockets, settles active computation within a
+// bounded timeout, and resets live model state on authenticated `POST /reset`
+// without expecting a `Content-Type` header.
+const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> =
+    Some(("0.1.28", "99671be7ab2be01e406a11b0c3d6caede398d96f"));
+
+fn reset_on_cancel_release_matches(release: &ReleasePin) -> bool {
+    reviewed_release_matches(release, RESET_ON_CANCEL_RELEASE)
+}
+
+pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
+    let pin = release(LOCK)?;
+    Ok(reset_on_cancel_release_matches(&pin))
+}
+
 pub(super) fn pinned_version() -> Result<String, LaunchError> {
     release(LOCK).map(|release| release.version)
 }
@@ -418,6 +434,18 @@ mod tests {
             );
         }
         assert_eq!(pinned_placement(true, None)?, Placement::Auto);
+        assert!(reset_on_cancel_supported()?);
+        let mut pin = release(LOCK)?;
+        assert!(reset_on_cancel_release_matches(&pin));
+        for (version, commit) in [
+            ("0.1.27", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
+            ("0.1.28", "1429a33772089dfd3a50a96c698b9dbe0b36836a"),
+            ("0.1.28", "0000000000000000000000000000000000000000"),
+        ] {
+            pin.version = version.into();
+            pin.commit = commit.into();
+            assert!(!reset_on_cancel_release_matches(&pin));
+        }
         assert_eq!(pinned_placement(false, None)?, Placement::Auto);
         for placement in [Placement::Auto, Placement::Cpu] {
             assert_eq!(

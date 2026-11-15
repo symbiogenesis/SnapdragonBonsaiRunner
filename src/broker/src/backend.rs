@@ -36,6 +36,7 @@ pub const MAX_CHUNK_LINE_BYTES: usize = 32;
 /// Largest accumulated chunk framing metadata in bytes for one response.
 pub const MAX_CHUNK_METADATA_BYTES: usize = 64 * 1024;
 const COUNT_ROUTE: &str = "/v1/chat/completions/input_tokens";
+const RESET_ROUTE: &str = "/reset";
 
 /// Contains no private header, body, credential or native I/O diagnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +167,74 @@ struct CountRejection<'a> {
 struct CountRejectionCode<'a> {
     #[serde(borrow)]
     code: Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResetAck<'a> {
+    #[serde(borrow)]
+    status: Cow<'a, str>,
+}
+
+/// Reset the private native backend's live generation state after client cancellation.
+///
+/// Sends an empty authenticated `POST /reset` without `Content-Type` and requires
+/// a framed `200 OK` JSON `{"status":"ok"}` acknowledgement within `deadline`.
+pub(crate) async fn reset_backend<S>(
+    mut stream: S,
+    policy: &BackendPolicy,
+    deadline: RequestDeadline,
+) -> Result<(), BackendError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let write_deadline = deadline.earlier(Instant::now() + WRITE_TIMEOUT);
+    ensure_time(write_deadline)?;
+    let head = format!(
+        "POST {RESET_ROUTE} HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        policy.authority, policy.authorization,
+    );
+    write_deadline
+        .timeout(async {
+            stream.write_all(head.as_bytes()).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| BackendError::Deadline)?
+        .map_err(|_| BackendError::Io)?;
+    ensure_time(write_deadline)?;
+
+    let mut reader = BufReader::with_capacity(8192, stream);
+    let (_, framing) = read_head(&mut reader, false, false, deadline).await?;
+    ensure_time(deadline)?;
+    let body = BackendBody {
+        reader: Some(reader),
+        framing,
+        remaining_budget: MAX_RESPONSE_BYTES,
+        metadata_bytes: 0,
+        deadline,
+        timer: deadline.timer(),
+    };
+    let limit = u64::try_from(MAX_COUNT_BYTES + 1).map_err(|_| BackendError::Metadata)?;
+    let mut body = body.take(limit);
+    let mut bytes = Vec::with_capacity(64);
+    body.read_to_end(&mut bytes).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            BackendError::Deadline
+        } else {
+            BackendError::Body
+        }
+    })?;
+    if bytes.len() > MAX_COUNT_BYTES {
+        return Err(BackendError::Metadata);
+    }
+    let Object(ack): Object<ResetAck<'_>> =
+        serde_json::from_slice(&bytes).map_err(|_| BackendError::Metadata)?;
+    ensure_time(deadline)?;
+    if ack.status != "ok" {
+        return Err(BackendError::Metadata);
+    }
+    Ok(())
 }
 
 /// Send the admitted bytes unchanged to the sole generation route.

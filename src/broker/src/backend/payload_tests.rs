@@ -292,3 +292,78 @@ fn payload_pending_direct_reads_keep_the_absolute_deadline() -> io::Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn reset_backend_requires_exact_ok_ack_and_omits_content_type() -> io::Result<()> {
+    let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let policy = BackendPolicy::new(8081, key).map_err(|_| io::Error::other("policy"))?;
+    runtime()?.block_on(async {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let exchange = tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = server.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let text = String::from_utf8(request).map_err(io::Error::other)?;
+            assert!(text.starts_with("POST /reset HTTP/1.1\r\n"));
+            assert!(!text.to_ascii_lowercase().contains("content-type:"));
+            assert!(text.contains("Content-Length: 0\r\n"));
+            server
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n{\"status\":\"ok\"}",
+                )
+                .await?;
+            server.flush().await
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(reset_backend(client, &policy, deadline.into()).await, Ok(()));
+        exchange.await.map_err(io::Error::other)??;
+
+        for (response, expected) in [
+            (
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}".as_slice(),
+                BackendError::Metadata,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"busy\"}".as_slice(),
+                BackendError::Metadata,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"status\":\"ok\",\"extra\":true}".as_slice(),
+                BackendError::Metadata,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":".as_slice(),
+                BackendError::Body,
+            ),
+        ] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let payload = response.to_vec();
+            tokio::spawn(async move {
+                let mut sink = [0u8; 512];
+                let _ = server.read(&mut sink).await;
+                let _ = server.write_all(&payload).await;
+                let _ = server.shutdown().await;
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            assert_eq!(
+                reset_backend(client, &policy, deadline.into()).await,
+                Err(expected)
+            );
+        }
+        let (client, _server) = tokio::io::duplex(64);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
+        assert_eq!(
+            reset_backend(client, &policy, expired.into()).await,
+            Err(BackendError::Deadline)
+        );
+        Ok(())
+    })
+}

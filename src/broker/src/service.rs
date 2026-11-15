@@ -30,6 +30,8 @@ use tokio::{
 
 /// Maximum time an accepted socket may wait for the single active request slot.
 pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time allowed for backend settlement and `POST /reset` after client cancellation.
+pub const RESET_TIMEOUT: Duration = Duration::from_secs(15);
 
 mod burst;
 pub(crate) use burst::BurstBudget;
@@ -71,6 +73,7 @@ pub struct LocalChatService {
     port: u16,
     capacity: usize,
     burst: BurstBudget,
+    reset_on_cancel: bool,
 }
 
 impl LocalChatService {
@@ -121,6 +124,7 @@ impl LocalChatService {
             port,
             capacity: max_waiting + 1,
             burst: BurstBudget::new(Instant::now()),
+            reset_on_cancel: false,
         })
     }
 
@@ -164,6 +168,31 @@ impl LocalChatService {
     #[cfg(windows)]
     pub(crate) const fn enable_pinned_abliteration(&mut self) {
         self.policy.pinned_abliteration = true;
+    }
+
+    /// Enable in-place `POST /reset` recovery when a client cancels active generation.
+    ///
+    /// By default (`false`), any interrupted generation attempt permanently closes
+    /// admission. Callers may enable this only when the owned backend implements
+    /// bounded cancellation settlement and authenticated `POST /reset`.
+    pub const fn enable_reset_on_cancel(&mut self) {
+        self.reset_on_cancel = true;
+    }
+
+    async fn reset_backend(&self) -> Result<(), BackendError> {
+        let deadline = Instant::now() + RESET_TIMEOUT;
+        let mut shutdown = pin!(self.gate.closed());
+        let mut resetting = pin!(async {
+            let stream = self.backend.connect(deadline).await?;
+            crate::backend::reset_backend(stream, self.backend.policy(), deadline.into()).await
+        });
+        poll_fn(|cx| {
+            if shutdown.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(BackendError::Io));
+            }
+            resetting.as_mut().poll(cx)
+        })
+        .await
     }
 
     /// Stop admission and wake queued, accepting and active operations.
@@ -229,9 +258,10 @@ impl AcceptedChat<'_> {
     /// HTTP response. Client half-close is treated as abandonment by the
     /// supervisor, and disconnecting closes the backend transport. Once a
     /// generation connection is attempted, any failure or caller cancellation
-    /// closes the entire admission gate: a new request must not follow an
-    /// unacknowledged backend cancellation. Recreating this service requires
-    /// the caller to establish a stopped or freshly owned backend first.
+    /// closes the entire admission gate unless [`LocalChatService::enable_reset_on_cancel`]
+    /// is enabled and an authenticated backend `POST /reset` succeeds after a
+    /// client-initiated disconnect while still holding the active slot. Recreating
+    /// a closed service requires a stopped or freshly owned backend first.
     ///
     /// # Errors
     /// Returns [`ServiceError`] for queue/deadline/shutdown or request failure.
@@ -294,25 +324,44 @@ impl AcceptedChat<'_> {
                 generation: AtomicBool::new(false),
                 completed: AtomicBool::new(false),
             };
-            let mut shutdown = pin!(service.gate.closed());
-            let mut serving = pin!(serve_chat_with_budget(
-                stream,
-                &service.policy,
-                &backend,
-                RequestDeadline::NONE,
-                &service.burst
-            ));
-            let result = poll_fn(|cx| {
-                if shutdown.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Err(ServiceError::Gate(GateError::Closed)));
-                }
-                serving
-                    .as_mut()
-                    .poll(cx)
-                    .map(|result| result.map_err(ServiceError::Request))
-            })
-            .await;
-            backend.completed.store(result.is_ok(), Ordering::Relaxed);
+            let result = {
+                let mut shutdown = pin!(service.gate.closed());
+                let mut serving = pin!(serve_chat_with_budget(
+                    stream,
+                    &service.policy,
+                    &backend,
+                    RequestDeadline::NONE,
+                    &service.burst
+                ));
+                poll_fn(|cx| {
+                    if shutdown.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(ServiceError::Gate(GateError::Closed)));
+                    }
+                    serving
+                        .as_mut()
+                        .poll(cx)
+                        .map(|result| result.map_err(ServiceError::Request))
+                })
+                .await
+            };
+            let client_cancelled = matches!(
+                result,
+                Err(ServiceError::Request(
+                    ServeError::ClientAbandoned
+                        | ServeError::Response(crate::response::ResponseError::ClientIo)
+                ))
+            );
+            if result.is_ok() {
+                backend.completed.store(true, Ordering::Relaxed);
+            } else if service.reset_on_cancel
+                && client_cancelled
+                && !service.gate.is_closed()
+                && backend.generation.load(Ordering::Relaxed)
+                && service.reset_backend().await.is_ok()
+                && !service.gate.is_closed()
+            {
+                backend.completed.store(true, Ordering::Relaxed);
+            }
             if service.gate.is_closed() {
                 Err(ServiceError::Gate(GateError::Closed))
             } else {
@@ -357,5 +406,259 @@ impl Drop for GenerationAttempt<'_> {
         if self.generation.load(Ordering::Relaxed) && !self.completed.load(Ordering::Relaxed) {
             self.gate.close();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const FRONTEND_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const BACKEND_KEY: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    async fn read_http_head(stream: &mut TcpStream) -> io::Result<String> {
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 512];
+        let head_end = loop {
+            if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let count = stream.read(&mut chunk).await?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete HTTP head",
+                ));
+            }
+            raw.extend_from_slice(&chunk[..count]);
+        };
+        let head = String::from_utf8(raw[..head_end].to_vec()).map_err(io::Error::other)?;
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let already = raw.len() - head_end;
+        if already < content_length {
+            let mut body = vec![0_u8; content_length - already];
+            stream.read_exact(&mut body).await?;
+        }
+        Ok(head)
+    }
+
+    fn client_request(port: u16) -> String {
+        let body = r#"{"model":"bonsai","messages":[{"role":"user","content":"hi"}],"stream":true,"max_completion_tokens":32}"#;
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {FRONTEND_KEY}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn reset_on_cancel_recovers_in_place_and_default_still_closes_gate() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+            // 1. Default service closes gate when active generation is abandoned.
+            let backend_listener = bound_loopback_socket(0)?.listen(16)?;
+            let backend_port = backend_listener.local_addr()?.port();
+            let service =
+                LocalChatService::bind(0, FRONTEND_KEY, backend_port, BACKEND_KEY, 1)
+                    .await
+                    .map_err(|_| io::Error::other("bind"))?;
+            let frontend_port = service.port();
+            let backend_task = tokio::spawn(async move {
+                let (mut count_conn, _) = backend_listener.accept().await?;
+                let _ = read_http_head(&mut count_conn).await?;
+                let count_body = r#"{"object":"response.input_tokens","input_tokens":8}"#;
+                count_conn
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{count_body}",
+                            count_body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                drop(count_conn);
+
+                let (mut gen_conn, _) = backend_listener.accept().await?;
+                let _ = read_http_head(&mut gen_conn).await?;
+                let sse_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+                gen_conn
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{sse_chunk}\r\n",
+                            sse_chunk.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                gen_conn.flush().await?;
+                let mut eof = [0_u8; 16];
+                let _ = gen_conn.read(&mut eof).await?;
+                Ok::<(), io::Error>(())
+            });
+            let client_task = tokio::spawn(async move {
+                let mut client =
+                    TcpStream::connect((Ipv4Addr::LOCALHOST, frontend_port)).await?;
+                client
+                    .write_all(client_request(frontend_port).as_bytes())
+                    .await?;
+                let mut buf = [0_u8; 256];
+                let _ = client.read(&mut buf).await?;
+                drop(client);
+                Ok::<(), io::Error>(())
+            });
+            let accepted = service.accept().await.map_err(|_| io::Error::other("accept"))?;
+            assert!(accepted.serve().await.is_err());
+            client_task.await.map_err(io::Error::other)??;
+            backend_task.await.map_err(io::Error::other)??;
+            assert!(matches!(
+                service.accept().await,
+                Err(ServiceError::Gate(GateError::Closed))
+            ));
+
+            // 2. Opt-in reset_on_cancel resets the backend before admitting a queued turn.
+            let backend_listener = bound_loopback_socket(0)?.listen(16)?;
+            let backend_port = backend_listener.local_addr()?.port();
+            let mut service =
+                LocalChatService::bind(0, FRONTEND_KEY, backend_port, BACKEND_KEY, 1)
+                    .await
+                    .map_err(|_| io::Error::other("bind"))?;
+            service.enable_reset_on_cancel();
+            let frontend_port = service.port();
+            let (first_streaming_tx, first_streaming_rx) = tokio::sync::oneshot::channel();
+            let backend_task = tokio::spawn(async move {
+                // First request count + abandoned generation.
+                let (mut count_conn, _) = backend_listener.accept().await?;
+                let head = read_http_head(&mut count_conn).await?;
+                assert!(head.starts_with("POST /v1/chat/completions/input_tokens "));
+                let count_body = r#"{"object":"response.input_tokens","input_tokens":8}"#;
+                count_conn
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{count_body}",
+                            count_body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                drop(count_conn);
+
+                let (mut gen_conn, _) = backend_listener.accept().await?;
+                let head = read_http_head(&mut gen_conn).await?;
+                assert!(head.starts_with("POST /v1/chat/completions "));
+                let sse_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+                gen_conn
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{sse_chunk}\r\n",
+                            sse_chunk.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                gen_conn.flush().await?;
+                let _ = first_streaming_tx.send(());
+                let mut eof = [0_u8; 16];
+                assert_eq!(gen_conn.read(&mut eof).await?, 0);
+                drop(gen_conn);
+
+                // Reset must arrive BEFORE the queued second request's count!
+                let (mut reset_conn, _) = backend_listener.accept().await?;
+                let reset_head = read_http_head(&mut reset_conn).await?;
+                assert!(reset_head.starts_with("POST /reset HTTP/1.1\r\n"));
+                assert!(!reset_head.to_ascii_lowercase().contains("content-type:"));
+                reset_conn
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+                    )
+                    .await?;
+                drop(reset_conn);
+
+                // Queued second request count + complete generation.
+                let (mut count2, _) = backend_listener.accept().await?;
+                let head2 = read_http_head(&mut count2).await?;
+                assert!(head2.starts_with("POST /v1/chat/completions/input_tokens "));
+                count2
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{count_body}",
+                            count_body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                drop(count2);
+
+                let (mut gen2, _) = backend_listener.accept().await?;
+                let head2 = read_http_head(&mut gen2).await?;
+                assert!(head2.starts_with("POST /v1/chat/completions "));
+                let done = "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                gen2.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{done}\r\n0\r\n\r\n",
+                        done.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+                drop(gen2);
+                Ok::<(), io::Error>(())
+            });
+
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let clients = tokio::spawn(async move {
+                let mut client1 =
+                    TcpStream::connect((Ipv4Addr::LOCALHOST, frontend_port)).await?;
+                client1
+                    .write_all(client_request(frontend_port).as_bytes())
+                    .await?;
+                let _ = first_streaming_rx.await;
+                let mut partial = [0_u8; 256];
+                let _ = client1.read(&mut partial).await?;
+
+                let mut client2 =
+                    TcpStream::connect((Ipv4Addr::LOCALHOST, frontend_port)).await?;
+                client2
+                    .write_all(client_request(frontend_port).as_bytes())
+                    .await?;
+                // Abandon client1 while client2 is waiting in the broker queue.
+                drop(client1);
+
+                let mut full = Vec::new();
+                client2.read_to_end(&mut full).await?;
+                let text = String::from_utf8(full).map_err(io::Error::other)?;
+                assert!(text.contains("HTTP/1.1 200 OK"));
+                assert!(text.contains("[DONE]"));
+                let _ = shutdown_tx.send(());
+                Ok::<(), io::Error>(())
+            });
+
+            let report = crate::runtime::run(&service, async move {
+                let _ = shutdown_rx.await;
+                Ok(())
+            })
+            .await;
+            clients.await.map_err(io::Error::other)??;
+            backend_task.await.map_err(io::Error::other)??;
+            assert_eq!(report.exit, crate::runtime::RunExit::Shutdown);
+            assert_eq!(report.completed, 1);
+            assert_eq!(report.failed, 1);
+            Ok::<(), io::Error>(())
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "service test timed out"))?
+        })
     }
 }

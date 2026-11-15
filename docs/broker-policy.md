@@ -355,9 +355,15 @@ requiring external concurrency crates; compiled CI acceptance remains pending.
 
 Once generation connection is attempted, failed delivery, disconnect, expiry or
 external cancellation permanently closes admission before releasing the active
-permit. Clean framed completion disarms the latch. Closing sockets does not
-acknowledge model cancellation; a stopped or freshly owned backend is required
-before recreating the service. Failures before generation do not latch it.
+permit by default. Clean framed completion disarms the latch. When the caller
+explicitly enables `LocalChatService::enable_reset_on_cancel` (via
+`--reset-on-cancel` on reviewed native Swift releases), a client-initiated
+disconnect during generation drops the generation socket and issues an
+authenticated private `POST /reset` while still holding the active permit; only
+a framed `200 OK` `{"status":"ok"}` acknowledgement disarms the latch before any
+queued or subsequent turn is admitted. Any failed `/reset`, non-client backend
+error or external service cancellation still closes admission permanently.
+Failures before generation do not latch it.
 
 Receiver/backend/response APIs create no listener, task or process. Owned
 `'static` streams must close on Drop; the lifetime bound cannot prove that.
@@ -404,6 +410,7 @@ executables, models, profile JSON and overrides. The default is `reference-cpu`;
 | `--native-row-workers 1\|4` | Swift Rust defaults to four; explicit one remains available. Publisher/reference defaults to one and rejects four. Readiness must match the selected worker count. |
 | `--use-repacked-ptq1` | Only the pinned current-weight export; missing/altered bytes reject. Publisher and native Rust Swift support are explicit; full end-to-end qualification remains separate. |
 | `--use-abliterate-lora` | Only the pinned adapter on publisher or native Rust Swift; enables bounded per-request scale with verified readiness. Reject for reference. The app requests it by default (`bonsai-tools chat --no-abliterate-lora` opts out); direct broker launch omits it. |
+| `--reset-on-cancel` | Opt-in in-place `POST /reset` recovery on client-cancelled generation; reviewed native Rust Swift releases only. Default omits it so direct broker callers still close admission on abandoned generation. |
 | `--check-only` | Verify policy/artifacts and report admission without credentials or a process. |
 
 [Runtime selection](development-guide.md#runtime-selection) lists app options.
