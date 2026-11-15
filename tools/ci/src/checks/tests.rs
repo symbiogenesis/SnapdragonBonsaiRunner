@@ -89,7 +89,7 @@ fn restricted_features_remain_separate_and_formatting_has_no_features() -> Resul
 
 #[test]
 fn production_batches_preserve_explicit_package_coverage_and_release_policy() -> Result<()> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = crate::command::test_workspace_root();
     let packages = registry(&root)?;
     verify_workspace_registry(&root)?;
     assert!(packages.len() >= 13);
@@ -632,7 +632,7 @@ fn workspace_registry_rejects_missing_extra_or_mismatched_packages() -> Result<(
         )
         .map_err(|error| error.to_string())?;
         assert!(verify_workspace_registry(&scratch).is_err());
-        verify_workspace_registry(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+        verify_workspace_registry(&crate::command::test_workspace_root())?;
         Ok(())
     })();
     let _ = fs::remove_dir_all(&scratch);

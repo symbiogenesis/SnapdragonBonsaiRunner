@@ -270,13 +270,47 @@ pub fn run(arguments: &[OsString]) -> Result<String> {
 }
 
 #[cfg(test)]
+fn workspace_root_from(runtime: Option<&std::ffi::OsStr>, compile_time: &str) -> PathBuf {
+    runtime
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| PathBuf::from(compile_time), PathBuf::from)
+        .join("../..")
+}
+
+#[cfg(test)]
+pub(in crate::command) fn test_workspace_root() -> PathBuf {
+    workspace_root_from(
+        std::env::var_os("CARGO_MANIFEST_DIR").as_deref(),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
 
     use serde_json::json;
 
-    use super::{action_outputs, parse};
+    use super::{action_outputs, parse, workspace_root_from};
     use crate::impact::Plan;
+
+    #[test]
+    fn test_workspace_root_prefers_runtime_manifest_dir_over_stale_compile_path() {
+        assert_eq!(
+            workspace_root_from(Some(OsStr::new("live/tools/ci")), "deleted/tools/ci"),
+            PathBuf::from("live/tools/ci").join("../..")
+        );
+        assert_eq!(
+            workspace_root_from(Some(OsStr::new("")), "compile/tools/ci"),
+            PathBuf::from("compile/tools/ci").join("../..")
+        );
+        assert_eq!(
+            workspace_root_from(None, "compile/tools/ci"),
+            PathBuf::from("compile/tools/ci").join("../..")
+        );
+    }
 
     #[test]
     fn output_preserves_plan_packages_booleans_and_filtered_matrices() -> crate::Result<()> {

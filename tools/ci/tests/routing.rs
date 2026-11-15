@@ -13,6 +13,13 @@ use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+fn workspace_root() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+        .join("../..")
+}
+
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 struct WorkspaceCase {
@@ -396,7 +403,7 @@ fn package_path_override_does_not_claim_unrelated_root_files() -> TestResult {
 
 #[test]
 fn runner_ci_native_ui_uses_dedicated_lane_without_maintenance() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = workspace_root();
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     let plan = impact::select(
         &root,
@@ -416,7 +423,7 @@ fn runner_ci_native_ui_uses_dedicated_lane_without_maintenance() -> TestResult {
 
 #[test]
 fn runner_ci_only_asr_selects_checked_tools_without_unrelated_lanes() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = workspace_root();
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     for (package, lane) in [("asr", "speech_asr"), ("tts", "speech_tts")] {
         let plan = impact::select(
@@ -446,7 +453,7 @@ fn runner_ci_only_asr_selects_checked_tools_without_unrelated_lanes() -> TestRes
 
 #[test]
 fn runner_ci_q4_lock_rebuilds_the_embedded_planner_and_tts() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = workspace_root();
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     let plan = impact::select(
         &root,
@@ -463,7 +470,7 @@ fn runner_ci_q4_lock_rebuilds_the_embedded_planner_and_tts() -> TestResult {
 
 #[test]
 fn runner_ci_native_packages_and_embedded_notices_select_checked_cli() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = workspace_root();
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     for path in [
         "tools/bonsai/src/chat_package.rs",
@@ -483,7 +490,7 @@ fn runner_ci_native_packages_and_embedded_notices_select_checked_cli() -> TestRe
 
 #[test]
 fn runner_ci_shared_changes_assign_every_package_to_exactly_one_lane() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = workspace_root();
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     let plan = impact::select(&root, &["Cargo.lock".into()], false, &config, "shared")?;
     assert!(plan.full);
@@ -515,7 +522,7 @@ fn runner_ci_shared_changes_assign_every_package_to_exactly_one_lane() -> TestRe
 
 #[test]
 fn runner_ci_gate_requires_independent_maintenance_cli_and_speech_results() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = workspace_root();
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     let plan = impact::select(&root, &[], true, &config, "full")?;
     let jobs = &config["workflows"]["foundation"];
@@ -544,7 +551,7 @@ fn runner_ci_gate_requires_independent_maintenance_cli_and_speech_results() -> T
 
 #[test]
 fn runner_ci_dependency_checks_remain_independent_of_cli_production() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = workspace_root();
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     for path in ["src/artifacts/src/lib.rs", "src/windows-process/src/lib.rs"] {
         let plan = impact::select(&root, &[path.into()], false, &config, "CLI dependency")?;
@@ -708,7 +715,7 @@ fn extract_quoted_argument(text: &str, needle: &str) -> Vec<String> {
 
 #[test]
 fn runner_ci_every_embedded_file_selects_its_owning_package() -> TestResult {
-    let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+    let root = fs::canonicalize(workspace_root())?;
     let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
     let registry: Value =
         serde_json::from_slice(&fs::read(root.join("config/rust-packages.json"))?)?;

@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn push_markdown_passes_every_repository_markdown_file() -> TestResult {
-        let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+        let root = fs::canonicalize(crate::command::test_workspace_root())?;
         let mut stack = vec![root.clone()];
         let mut markdown = Vec::new();
         while let Some(dir) = stack.pop() {

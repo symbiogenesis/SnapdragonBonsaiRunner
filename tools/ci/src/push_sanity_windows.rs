@@ -1565,8 +1565,7 @@ mod tests {
         };
         // This bootstrap adapter requires Windows. Foundation's native CI
         // library lane owns it; the Linux planner does not exercise WinForms.
-        let policy =
-            super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+        let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
         let result = work.script(
             &policy,
             &policy,
@@ -1689,8 +1688,7 @@ mod tests {
             started: Instant::now(),
             sequence: 0,
         };
-        let policy =
-            super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+        let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
         let result = work.script(&policy, &policy, "test_push_snapshot.ps1", &[]);
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Push batch fixture cleanup escaped temp.".into());
@@ -1714,8 +1712,7 @@ mod tests {
             sequence: 0,
         };
         let result = (|| {
-            let policy =
-                super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+            let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
             let source = scratch.join("candidate");
             fs::create_dir_all(source.join("src")).map_err(|error| error.to_string())?;
             fs::write(
@@ -1793,8 +1790,7 @@ mod tests {
             sequence: 0,
         };
         let result = (|| {
-            let policy =
-                super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+            let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
             let root = scratch.join("repository");
             fs::create_dir(&root).map_err(|error| error.to_string())?;
             work.git(&root, &["init", "--quiet"])?;
@@ -1960,8 +1956,7 @@ mod tests {
         let scratch = temporary.join(format!("bonsai-push-hexlock-{nonce}"));
         fs::create_dir(&scratch).map_err(|error| error.to_string())?;
         let result = (|| {
-            let policy =
-                super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+            let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
             fs::create_dir_all(scratch.join("tools/hexagon")).map_err(|error| error.to_string())?;
             fs::copy(
                 policy.join("tools/hexagon/windows-queue-abi.lock.json"),

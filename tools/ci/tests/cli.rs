@@ -3,7 +3,7 @@
 
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,10 @@ fn empty_repository_diff_writes_unselected_actions_outputs() -> Result<(), Box<d
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let scratch = temporary_root.join(format!("Bonsai-CiCommand-{}-{nonce}", std::process::id()));
     fs::create_dir(&scratch)?;
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = std::env::var_os("CARGO_MANIFEST_DIR")
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+        .join("../..");
     let output_path = scratch.join("output.txt");
     let summary_path = scratch.join("summary.txt");
     let output = Command::new(env!("CARGO_BIN_EXE_bonsai-ci"))
