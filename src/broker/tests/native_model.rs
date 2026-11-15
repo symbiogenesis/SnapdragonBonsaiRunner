@@ -1802,6 +1802,17 @@ fn adapter_summary(label: &str, scale: f64, cap: u32, summary: &StreamSummary) -
         "reportedCompletionTokens":summary.completion_tokens})
 }
 
+fn canonical_json_f64(value: f64) -> f64 {
+    // serde_json's float formatter (zmij) and parser can differ by 1 ULP on
+    // midpoint binary64 durations such as 1_069_900 ns (1.0698999999999999 ms).
+    // Canonicalize once so in-memory report values match parsed acceptance.json.
+    serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
+fn elapsed_milliseconds(elapsed: Duration) -> f64 {
+    canonical_json_f64(elapsed.as_secs_f64() * 1000.0)
+}
+
 fn save_acceptance_report(evidence: &Path, report: &Value) {
     fs::write(
         evidence.join("acceptance.json"),
@@ -2171,7 +2182,7 @@ async fn adapter_start_before_cleanup<T>(
     // Never wait for a fresh readiness timeout or restart the case clock.
     let started = tokio::time::Instant::now();
     let result = adapter_work_before_cleanup(deadline, startup).await;
-    report["startupMilliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+    report["startupMilliseconds"] = json!(elapsed_milliseconds(started.elapsed()));
     // The short memory-only guard is released at this statement, before receipt
     // I/O. The callback likewise releases its guard before startup continues.
     report["startupProgress"] = json!(&*progress.lock().unwrap());

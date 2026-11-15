@@ -87,9 +87,9 @@ fn metrics(progress: &Value) -> Value {
         return measured;
     }
     measured["status"] = json!("measured-short-window");
-    measured["timeToFirstTokenSeconds"] = json!(first / 1000.0);
-    measured["generationTokensPerSecond"] = json!(rate);
-    measured["generationIntervalSeconds"] = json!(interval);
+    measured["timeToFirstTokenSeconds"] = json!(canonical_json_f64(first / 1000.0));
+    measured["generationTokensPerSecond"] = json!(canonical_json_f64(rate));
+    measured["generationIntervalSeconds"] = json!(canonical_json_f64(interval));
     measured["generationIntervalTokens"] = json!(CAP - 1);
     measured["tokenBoundaryEvidence"] = json!(
         "reviewed-pinned-nonspeculative-per-committed-token-callback; ASCII-only; below-1024-byte-split-bound; eight-nonempty-deltas-match-eight-reported-tokens"

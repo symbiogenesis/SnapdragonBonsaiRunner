@@ -231,7 +231,7 @@ struct Receipt<'a> {
 impl Receipt<'_> {
     fn save(&mut self) {
         self.progress.fields["requestMilliseconds"] =
-            json!(self.started.elapsed().as_secs_f64() * 1000.0);
+            json!(elapsed_milliseconds(self.started.elapsed()));
         self.report["requestProgress"][self.index] = self.progress.fields.clone();
         save_acceptance_report(self.evidence, self.report);
     }
@@ -249,7 +249,7 @@ impl Drop for Receipt<'_> {
         self.progress.fields["cancelledBeforeConnectionClose"] =
             json!(self.progress.fields["connectionClosed"] != true);
         self.progress.fields["requestMilliseconds"] =
-            json!(self.started.elapsed().as_secs_f64() * 1000.0);
+            json!(elapsed_milliseconds(self.started.elapsed()));
         self.report["requestProgress"][self.index] = self.progress.fields.clone();
         // Cancellation or a failed read may already be unwinding. Preserve the
         // observation when possible without introducing a second panic.
@@ -327,7 +327,7 @@ async fn read_response<S: tokio::io::AsyncRead + Unpin>(
         bytes.extend_from_slice(&buffer[..count]);
         receipt
             .progress
-            .observe(&bytes, receipt.started.elapsed().as_secs_f64() * 1000.0);
+            .observe(&bytes, elapsed_milliseconds(receipt.started.elapsed()));
         receipt.save();
     }
 }
@@ -564,4 +564,13 @@ fn native_progress_read_error_retains_partial_response_identity_before_cleanup()
         fs::remove_file(evidence.join("acceptance.json")).unwrap();
         fs::remove_dir(evidence).unwrap();
     });
+}
+
+#[test]
+fn elapsed_milliseconds_canonicalizes_midpoint_json_floats() {
+    let ms = elapsed_milliseconds(Duration::from_nanos(1_069_900));
+    let in_memory = json!({"requestMilliseconds": ms});
+    let round_tripped: Value =
+        serde_json::from_slice(&serde_json::to_vec_pretty(&in_memory).unwrap()).unwrap();
+    assert_eq!(round_tripped, in_memory);
 }

@@ -124,7 +124,7 @@ fn verify_original_retention(
         "bytes":identity["bytes"],"sha256":identity["sha256"],
         "afterOwnedCleanup":true,"completeFileThroughEof":verified,
         "finishedBeforeOriginalDeadline":verified,"fileAndAncestorGuardsRetainedThroughFinalReceipt":verified,
-        "milliseconds":started.elapsed().as_secs_f64()*1000.0,
+        "milliseconds":elapsed_milliseconds(started.elapsed()),
         "method":"bonsai-artifacts complete-file length/SHA-256 verification using Windows CNG, with cancellation checks before each bounded read; blocking OS work is not preemptible"});
     save_acceptance_report(evidence, report);
     if verified { guard } else { None }

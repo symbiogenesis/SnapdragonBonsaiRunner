@@ -98,7 +98,7 @@ pub(super) fn response_observation(bytes: &[u8], elapsed: Duration) -> Value {
     let summary = streamed_response(bytes);
     let mut observed = stream_observation(&summary, CAP);
     let content = speed::visible_output(bytes);
-    observed["requestMilliseconds"] = json!(elapsed.as_secs_f64() * 1000.0);
+    observed["requestMilliseconds"] = json!(elapsed_milliseconds(elapsed));
     observed["visibleContentSha256"] = json!(digest(content.as_bytes()));
     observed["visibleContent"] = json!(content);
     observed["naturallyStopped"] = json!(summary.finish_reason == "stop");
@@ -421,7 +421,7 @@ async fn paired_responses(
             }
         };
         report["samples"][index]["startupMilliseconds"] =
-            json!(started.elapsed().as_secs_f64() * 1000.0);
+            json!(elapsed_milliseconds(started.elapsed()));
         record_worker_readiness(&mut report["samples"][index], profile.row_workers, true);
         record_cpu_placement(&mut report["samples"][index], true);
         let port = owner.port();
