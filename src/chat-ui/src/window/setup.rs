@@ -2,6 +2,7 @@
 use super::{ModelLifecycle, RichText, State, egui};
 use crate::startup::{SetupActivity, SetupKind, SetupStatus};
 use std::{io, path::PathBuf};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DISK_FULL};
 
 #[derive(Default)]
 pub(super) struct Setup {
@@ -68,12 +69,17 @@ fn byte_count(bytes: u64) -> String {
 }
 
 pub(super) fn failure_message(error: &io::Error) -> &'static str {
-    let text = error.to_string().to_ascii_lowercase();
-    if !cleanup_known(&error.to_string()) {
-        "Setup could not confirm that its processes stopped. Close Swift before trying again."
-    } else if error.kind() == io::ErrorKind::Interrupted {
-        "Setup paused. Select Retry setup to continue. Your draft is safe."
-    } else if text.contains("not enough free disk space")
+    let message = error.to_string();
+    if !cleanup_known(&message) {
+        return "Setup could not confirm that its processes stopped. Close Swift before trying again.";
+    }
+    if error.kind() == io::ErrorKind::Interrupted {
+        return "Setup paused. Select Retry setup to continue. Your draft is safe.";
+    }
+    let text = message.to_ascii_lowercase();
+    if error.kind() == io::ErrorKind::StorageFull
+        || error.raw_os_error() == Some(ERROR_DISK_FULL.cast_signed())
+        || text.contains("not enough free disk space")
         || text.contains("not enough disk space")
         || text.contains("disk full")
         || text.contains("not enough space on the disk")
@@ -81,7 +87,9 @@ pub(super) fn failure_message(error: &io::Error) -> &'static str {
         || text.contains("free storage") && text.contains("is available")
     {
         "Setup needs more free storage. Free some space, then select Retry setup. Your draft is safe."
-    } else if text.contains("access is denied")
+    } else if error.kind() == io::ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed())
+        || text.contains("access is denied")
         || text.contains("permissiondenied")
         || text.contains("permission denied")
         || text.contains("os error 5")
