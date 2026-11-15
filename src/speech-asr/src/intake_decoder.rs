@@ -80,8 +80,8 @@ impl<R: Read + Seek> Loader<'_, R> {
         values
             .try_reserve_exact(bytes.len() / 4)
             .map_err(io::Error::other)?;
-        for bytes in bytes.as_chunks::<4>().0 {
-            values.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        for &bytes in bytes.as_chunks::<4>().0 {
+            values.push(f32::from_le_bytes(bytes));
         }
         Ok(values)
     }

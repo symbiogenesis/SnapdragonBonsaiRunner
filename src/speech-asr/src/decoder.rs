@@ -154,9 +154,10 @@ impl Projection {
                     .iter()
                     .zip(output.as_chunks_mut::<32>().0)
                 {
-                    let scale = half(u16::from_le_bytes([block[0], block[1]]))?;
-                    for (value, byte) in target.iter_mut().zip(&block[2..]) {
-                        *value = scale * f32::from(i8::from_le_bytes([*byte]));
+                    let [s0, s1, ref qs @ ..] = *block;
+                    let scale = half(u16::from_le_bytes([s0, s1]))?;
+                    for (value, &byte) in target.iter_mut().zip(qs) {
+                        *value = scale * f32::from(byte.cast_signed());
                     }
                 }
             }
@@ -198,10 +199,10 @@ impl Projection {
                         .iter()
                         .zip(input.as_chunks::<32>().0)
                     {
-                        let scale = half(u16::from_le_bytes([block[0], block[1]]))?;
-                        for (byte, activation) in block[2..].iter().zip(activations) {
-                            *target +=
-                                (scale * f32::from(i8::from_le_bytes([*byte]))) * *activation;
+                        let [s0, s1, ref qs @ ..] = *block;
+                        let scale = half(u16::from_le_bytes([s0, s1]))?;
+                        for (&byte, activation) in qs.iter().zip(activations) {
+                            *target += (scale * f32::from(byte.cast_signed())) * *activation;
                         }
                     }
                 }

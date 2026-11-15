@@ -119,10 +119,9 @@ impl Tokenizer {
             charge(&mut charged, &line)?;
             let split = line
                 .as_bytes()
-                .iter()
-                .enumerate()
-                .skip(1)
-                .find_map(|(offset, byte)| (*byte == b' ').then_some(offset))
+                .get(1..)
+                .and_then(|rest| rest.iter().position(|&byte| byte == b' '))
+                .map(|offset| offset + 1)
                 .ok_or_else(invalid)?;
             if line.contains('\u{1f}') {
                 return Err(invalid());
