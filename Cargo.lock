@@ -622,6 +622,7 @@ dependencies = [
 name = "bonsai-tools"
 version = "0.3.2"
 dependencies = [
+ "base64ct",
  "bonsai-artifacts",
  "bonsai-audio",
  "bonsai-cpu-policy",

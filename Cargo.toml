@@ -26,6 +26,7 @@ license = "Apache-2.0"
 repository = "https://github.com/symbiogenesis/SwiftBonsai2Runner"
 
 [workspace.dependencies]
+base64ct = { version = "=1.8.3", default-features = false, features = ["alloc"] }
 bonsai-artifacts = { path = "src/artifacts" }
 bonsai-audio = { path = "src/audio" }
 bonsai-cpu-policy = { path = "src/cpu-policy" }

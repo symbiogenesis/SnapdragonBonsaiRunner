@@ -49,6 +49,7 @@ test = false
 doc = false
 
 [dependencies]
+base64ct.workspace = true
 bonsai-artifacts.workspace = true
 bonsai-audio.workspace = true
 bonsai-cpu-policy.workspace = true

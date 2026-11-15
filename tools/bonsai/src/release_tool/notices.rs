@@ -1,5 +1,6 @@
 //! Locked source notice selection and exact immutable upstream fallback policy.
 use super::{Result, bytes, path, read_json, resolve, text};
+use base64ct::{Base64, Encoding as _};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::{
@@ -171,43 +172,17 @@ pub(super) fn tree(value: &Value) -> Result<Value> {
 }
 
 fn base64(source: &str) -> Result<Vec<u8>> {
-    let data: Vec<_> = source
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    if data.len() % 4 != 0 || data.len() > 6 * 1024 * 1024 {
+    if source.len() > 8 * 1024 * 1024 {
         return Err("Invalid notice base64 extent.".into());
     }
-    let mut bytes = Vec::new();
-    for (index, part) in data.as_chunks::<4>().0.iter().enumerate() {
-        let decode = |b: u8| match b {
-            b'A'..=b'Z' => Ok(b - b'A'),
-            b'a'..=b'z' => Ok(b - b'a' + 26),
-            b'0'..=b'9' => Ok(b - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err("Invalid notice base64.".to_owned()),
-        };
-        let a = decode(part[0])?;
-        let b = decode(part[1])?;
-        let c = if part[2] == b'=' { 0 } else { decode(part[2])? };
-        let d = if part[3] == b'=' { 0 } else { decode(part[3])? };
-        if (part[2] == b'=' && part[3] != b'=')
-            || (part[3] == b'=' && index + 1 != data.len() / 4)
-            || (part[2] == b'=' && b & 15 != 0)
-            || (part[3] == b'=' && c & 3 != 0)
-        {
-            return Err("Invalid notice base64 padding.".into());
-        }
-        bytes.push((a << 2) | (b >> 4));
-        if part[2] != b'=' {
-            bytes.push((b << 4) | (c >> 2));
-        }
-        if part[3] != b'=' {
-            bytes.push((c << 6) | d);
-        }
+    let cleaned: String = source
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect();
+    if cleaned.len() > 6 * 1024 * 1024 {
+        return Err("Invalid notice base64 extent.".into());
     }
-    Ok(bytes)
+    Base64::decode_vec(&cleaned).map_err(|_| "Invalid notice base64.".into())
 }
 
 pub(super) fn blob(value: &Value) -> Result<Value> {
