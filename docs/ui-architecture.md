@@ -321,11 +321,10 @@ Microphone access is requested on the UI thread only after explicit action.
 Denied, cancelled or unavailable access fails closed; stale permission, capture
 or transcription results cannot reactivate it. Audio stays on authenticated
 numeric loopback. The composer microphone records one bounded utterance; finishing
-capture transcribes with Qwen3-ASR 1.7B and submits the text through the ordinary
-prompt path when Swift is ready. Otherwise the text remains a draft, with no
-deferred automatic send. Cancel, conversation changes and teardown invalidate
-late results. Speech output uses only visible assistant answers, excluding
-reasoning/private drafts.
+capture transcribes with Qwen3-ASR 1.7B and leaves the text in the draft for
+explicit Send, with no automatic submission. Cancel, conversation changes and
+teardown invalidate late results. Speech output uses only visible assistant
+answers, excluding reasoning/private drafts.
 
 ASR preparation, generation ownership and the successful-input idle lease follow
 the [speech scheduling contract](streaming-resources.md#speech-scheduling-and-playback).

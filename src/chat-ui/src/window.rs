@@ -1396,7 +1396,7 @@ impl State {
                 // StopListening also acknowledges file cleanup. It must not
                 // overwrite file progress, success, cancellation or errors.
                 if !self.audio_file_active && self.listening {
-                    "Recording. Click the microphone to transcribe and send; Escape cancels."
+                    "Recording. Click the microphone to transcribe; Escape cancels."
                         .clone_into(&mut self.speech_status);
                 } else if !self.audio_file_active && self.dictation_requested {
                     "Microphone enabled.".clone_into(&mut self.speech_status);
@@ -1545,7 +1545,8 @@ impl State {
         if !complete {
             "Voice message exceeds the prompt limit. Your draft was kept; no message was sent."
                 .clone_into(&mut self.speech_status);
-        } else if self.model.ready()
+        } else if from_file
+            && self.model.ready()
             && !self.composing
             && self.rename_conversation.is_none()
             && self.delete_conversation.is_none()
@@ -1553,22 +1554,19 @@ impl State {
             && !self.show_settings
             && !self.show_audio_transcript
             && self.alerts.details.is_none()
-            && !(from_file && self.audio_file_review_required)
+            && !self.audio_file_review_required
         {
             self.submit();
             if self.model.busy() {
-                if from_file {
-                    "Audio file transcribed and sent."
-                } else {
-                    "Voice message transcribed and sent."
-                }
-                .clone_into(&mut self.speech_status);
+                "Audio file transcribed and sent.".clone_into(&mut self.speech_status);
             }
         } else {
             if from_file && self.model.ready() {
                 "Audio file transcribed. Review the draft, then select Send."
             } else if from_file {
                 "Audio file transcribed. Select Send when the model is ready."
+            } else if self.model.ready() {
+                "Voice message transcribed. Review the draft, then select Send."
             } else {
                 "Voice message transcribed. Select Send when the model is ready."
             }
@@ -1645,7 +1643,7 @@ impl State {
                     && self.microphone_generation == Some(generation)
                     && self.speech_command(speech::Command::PrepareInput { generation })
                 {
-                    "Recording. Click the microphone to send; Escape cancels. Finishes after 25 seconds."
+                    "Recording. Click the microphone to transcribe; Escape cancels. Finishes after 25 seconds."
                         .clone_into(&mut self.speech_status);
                 }
             }

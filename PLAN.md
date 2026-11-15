@@ -293,7 +293,7 @@ adoption decisions without displacing native daily-use acceptance.
   opt-out, unreadable-byte preservation, monitor/DPI changes and no automatic
   request replay, microphone capture or playback after restore.
 - [ ] Qualify Qwen3-ASR microphone permission, explicit/25-second completion,
-  autodetection, cancellation and exactly one ordinary Swift submission. Cover
+  autodetection, cancellation, draft insertion and explicit Swift submission. Cover
   unavailable-model drafts, late results, ASR/TTS exclusion and recorder cleanup.
 - [ ] Qualify microphone model preparation after permission and successful
   recording startup: loading/capture overlap, empty/invalid final clips,

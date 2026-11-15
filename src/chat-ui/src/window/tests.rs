@@ -1181,16 +1181,26 @@ fn finished_voice_message_submits_once_through_the_normal_prompt_flow() {
     state.dictation_finishing = true;
     state.microphone_generation = Some(7);
     state.accept_transcript(7, "  Explain bonsai pruning  ");
+    assert!(commands.try_recv().is_err());
+    assert_eq!(state.input, "Explain bonsai pruning");
+    assert_eq!(
+        state.speech_status,
+        "Voice message transcribed. Review the draft, then select Send."
+    );
+    assert!(state.model.ready());
+    assert!(!state.dictation_requested && !state.dictation_finishing);
+    assert!(state.microphone_generation.is_none());
+    state.accept_transcript(7, "Duplicate recognition");
+    assert_eq!(state.input, "Explain bonsai pruning");
+    assert!(commands.try_recv().is_err());
+    assert!(state.transcript.messages.is_empty());
+    state.submit();
     assert!(matches!(
         commands.try_recv(),
         Ok(Command::Send { text, .. }) if text == "Explain bonsai pruning"
     ));
     assert_eq!(state.input, "");
     assert!(state.model.busy());
-    assert!(!state.dictation_requested && !state.dictation_finishing);
-    assert!(state.microphone_generation.is_none());
-    state.accept_transcript(7, "Duplicate recognition");
-    assert!(commands.try_recv().is_err());
     assert_eq!(state.transcript.messages[0].body, "Explain bonsai pruning");
 }
 
@@ -1331,10 +1341,7 @@ fn voice_message_separates_spoken_words_from_an_existing_draft() {
         state.dictation_finishing = true;
         state.microphone_generation = Some(7);
         state.accept_transcript(7, "Explain bonsai");
-        assert!(matches!(
-            commands.try_recv(),
-            Ok(Command::Send { text, .. }) if text == "Existing draft Explain bonsai"
-        ));
+        assert_eq!(state.input, "Existing draft Explain bonsai");
         assert!(commands.try_recv().is_err());
     }
 }
@@ -1469,6 +1476,7 @@ fn voice_message_waits_for_native_input_dispatch_before_sending_once() {
     let (mut state, commands, _events) = state();
     state.model = ModelLifecycle::Ready;
     queue_voice_message(&mut state);
+    assert_eq!(state.input, "");
     assert!(commands.try_recv().is_err());
     let ctx = egui::Context::default();
     let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -1476,10 +1484,7 @@ fn voice_message_waits_for_native_input_dispatch_before_sending_once() {
         state.flush_voice_transcript(ui.ctx());
     });
     output.drop_without_applying_deltas();
-    assert!(matches!(
-        commands.try_recv(),
-        Ok(Command::Send { text, .. }) if text == "Queued voice message"
-    ));
+    assert_eq!(state.input, "Queued voice message");
     assert!(commands.try_recv().is_err());
 }
 

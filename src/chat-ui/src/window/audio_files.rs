@@ -620,6 +620,12 @@ mod tests {
             state.audio_file_active = from_file;
             state.model = ModelLifecycle::Ready;
             state.accept_transcript(1_u64 << 63, "Next question");
+            if !from_file {
+                assert_eq!(state.input, "Next question");
+                assert!(requests.try_recv().is_err());
+                assert!(commands.try_recv().is_err());
+                state.submit();
+            }
             assert!(matches!(
                 requests.try_recv(),
                 Ok(client::Command::Send { text, .. }) if text == "Next question"

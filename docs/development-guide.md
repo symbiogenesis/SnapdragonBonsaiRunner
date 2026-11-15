@@ -431,12 +431,11 @@ The microphone button beside Send starts input only after explicit action and
 Windows permission. Click it again to finish the utterance; capture also finishes
 at 25 seconds. Mono 16 kHz WAV audio stays in memory and is transcribed locally by
 Qwen3-ASR 1.7B with language autodetection. The recognized text enters the composer
-and is sent once through the normal Swift prompt path if the model is ready.
-If Swift is unavailable or still preparing, the text remains a draft for explicit
-Send; readiness never sends it later. This is bounded utterance capture, not VAD
-or streaming ASR. Cancel/Escape, revocation, Send, conversation changes, read-aloud
-or closing cancel input and invalidate late results. Missing/not-ready Qwen3-ASR
-or denied permission keeps capture off and exposes setup guidance.
+as a draft for review and explicit Send; stopping capture or model readiness never
+sends it automatically. This is bounded utterance capture, not VAD or streaming
+ASR. Cancel/Escape, revocation, Send, conversation changes, read-aloud or closing
+cancel input and invalidate late results. Missing/not-ready Qwen3-ASR or denied
+permission keeps capture off and exposes setup guidance.
 
 The **plus button** at the composer's lower left selects one local audio file.
 You can also copy an audio file in Explorer and press **Ctrl+V** while the composer

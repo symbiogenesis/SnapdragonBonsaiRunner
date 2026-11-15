@@ -19,7 +19,7 @@ pub(super) fn button(ui: &mut egui::Ui, phase: Phase, enabled: bool) -> egui::Re
         .accessible_name("Microphone")
         .on_hover_text(match phase {
             Phase::Finishing => "Cancel voice message · Escape",
-            Phase::Recording => "Finish recording, transcribe and send · Escape cancels",
+            Phase::Recording => "Finish recording and transcribe · Escape cancels",
             Phase::Idle => "Record a voice message · Qwen3-ASR 1.7B",
         });
     let center = response.rect.center();
