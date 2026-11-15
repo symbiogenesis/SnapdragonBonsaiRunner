@@ -13,7 +13,7 @@
 )]
 
 use crate::{packed, row_workers, threads};
-use fearless_simd::{Level, dispatch, f32x4, prelude::*};
+use fearless_simd::{dispatch, f32x4, prelude::*};
 use std::io;
 
 /// Required mono PCM sample rate.
@@ -241,7 +241,7 @@ impl Frontend {
             cancelled(&mut is_cancelled)?;
         }
         let mut frame_major = zeroes(frames * MEL_BINS)?;
-        let level = Level::new();
+        let level = packed::simd_level();
         row_workers::run_aligned(
             &mut frame_major,
             threads,

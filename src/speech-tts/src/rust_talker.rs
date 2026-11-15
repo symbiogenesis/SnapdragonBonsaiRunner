@@ -726,7 +726,7 @@ impl Talker {
         let mut history = Vec::with_capacity(MAX_NEW_TOKENS);
         // The sampler marks vocabulary entries while applying repetition
         // penalties after the first frame; its workspace is caller-owned.
-        let mut scratch = vec![0; self.geometry.vocab];
+        let mut scratch = sampling::SamplerScratch::new(self.geometry.vocab);
         // Acoustic frames have independent sessions. Retain only their buffer
         // capacities within this utterance; the frame guard clears all KV and
         // sampler lengths on every return, cancellation and unwind.
@@ -754,7 +754,7 @@ impl Talker {
             sampling::suppress(&mut logits, vocab - 1024, vocab, self.specials.eos);
             let subsequence = i64::try_from(step * TOTAL_CODE_GROUPS)
                 .map_err(|_| invalid("Speech sampler sequence overflow."))?;
-            let token = sampling::sample_top_k_p(
+            let token = sampling::sample_top_k_p_with_scratch(
                 &mut logits,
                 SampleTopKPParams {
                     temperature: params.temperature,

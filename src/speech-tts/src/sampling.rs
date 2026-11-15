@@ -352,12 +352,29 @@ fn msvc_nth_element<T: Copy, F: Fn(T, T) -> bool>(mut slice: &mut [T], mut nth: 
     msvc_insertion_sort(slice, &pred);
 }
 
-/// Apply the pinned top-k cutoff in place (`0 < top_k < logits.len()`).
+/// Reusable buffers for repeated [`sample_top_k_p_with_scratch`] calls.
 #[expect(
     clippy::redundant_pub_crate,
     reason = "Sampler policy is private to the speech crate and captured-observation replay."
 )]
-pub(super) fn top_k_mask(logits: &mut [f32], top_k: i32) {
+pub(super) struct SamplerScratch {
+    seen: Vec<u8>,
+    top_k: Vec<f32>,
+    top_p: Vec<TokenProb>,
+}
+
+impl SamplerScratch {
+    /// Pre-allocate scratch sized for `vocab` vocabulary entries.
+    pub(super) fn new(vocab: usize) -> Self {
+        Self {
+            seen: vec![0; vocab],
+            top_k: Vec::with_capacity(vocab),
+            top_p: Vec::with_capacity(vocab),
+        }
+    }
+}
+
+fn top_k_mask_with_scratch(logits: &mut [f32], top_k: i32, tmp: &mut Vec<f32>) {
     if logits
         .iter()
         .any(|&logit| !logit.is_finite() && logit != f32::NEG_INFINITY)
@@ -368,8 +385,9 @@ pub(super) fn top_k_mask(logits: &mut [f32], top_k: i32) {
         && k > 0
         && k < logits.len()
     {
-        let mut tmp = logits.to_vec();
-        msvc_nth_element(&mut tmp, k - 1, |a, b| a > b);
+        tmp.clear();
+        tmp.extend_from_slice(logits);
+        msvc_nth_element(tmp, k - 1, |a, b| a > b);
         let threshold = tmp[k - 1];
         for logit in logits.iter_mut() {
             if *logit < threshold {
@@ -379,7 +397,23 @@ pub(super) fn top_k_mask(logits: &mut [f32], top_k: i32) {
     }
 }
 
-fn top_p_mask_with_temperature(logits: &mut [f32], top_p: f32, temperature: f32) {
+/// Apply the pinned top-k cutoff in place (`0 < top_k < logits.len()`).
+#[cfg(test)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Sampler policy is private to the speech crate and captured-observation replay."
+)]
+pub(super) fn top_k_mask(logits: &mut [f32], top_k: i32) {
+    let mut tmp = Vec::new();
+    top_k_mask_with_scratch(logits, top_k, &mut tmp);
+}
+
+fn top_p_mask_with_temperature_into(
+    logits: &mut [f32],
+    top_p: f32,
+    temperature: f32,
+    sorted_buf: &mut Vec<TokenProb>,
+) {
     if !(top_p > 0.0 && top_p < 1.0)
         || !(temperature.is_finite() && temperature > 0.0)
         || logits.is_empty()
@@ -412,7 +446,7 @@ fn top_p_mask_with_temperature(logits: &mut [f32], top_p: f32, temperature: f32)
         return;
     }
     let inv_sum = 1.0_f64 / sum_exp;
-    let mut sorted_buf = Vec::new();
+    sorted_buf.clear();
     for (id, logit) in logits.iter_mut().enumerate() {
         if *logit == f32::NEG_INFINITY {
             continue;
@@ -426,7 +460,7 @@ fn top_p_mask_with_temperature(logits: &mut [f32], top_p: f32, temperature: f32)
         }
     }
     if !sorted_buf.is_empty() {
-        msvc_sort(&mut sorted_buf, |a, b| a.prob > b.prob);
+        msvc_sort(sorted_buf, |a, b| a.prob > b.prob);
         let mut cum = 0.0_f64;
         let top_p_f64 = f64::from(top_p);
         for (index, candidate) in sorted_buf.iter().enumerate() {
@@ -441,6 +475,12 @@ fn top_p_mask_with_temperature(logits: &mut [f32], top_p: f32, temperature: f32)
     }
 }
 
+#[cfg(test)]
+fn top_p_mask_with_temperature(logits: &mut [f32], top_p: f32, temperature: f32) {
+    let mut sorted_buf = Vec::new();
+    top_p_mask_with_temperature_into(logits, top_p, temperature, &mut sorted_buf);
+}
+
 /// Apply the pinned top-p nucleus mask in place at unit temperature (`0.0 < top_p < 1.0`).
 #[cfg(test)]
 #[expect(
@@ -449,6 +489,29 @@ fn top_p_mask_with_temperature(logits: &mut [f32], top_p: f32, temperature: f32)
 )]
 pub(super) fn top_p_mask(logits: &mut [f32], top_p: f32) {
     top_p_mask_with_temperature(logits, top_p, 1.0);
+}
+
+/// Execute the full pinned `sample_top_k_p` chain with caller-owned scratch buffers.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Sampler policy is private to the speech crate and captured-observation replay."
+)]
+pub(super) fn sample_top_k_p_with_scratch(
+    logits: &mut [f32],
+    params: SampleTopKPParams,
+    history: &[i32],
+    scratch: &mut SamplerScratch,
+    dump_u_out: Option<&mut f32>,
+) -> Option<usize> {
+    sample_top_k_p_inner(
+        logits,
+        params,
+        history,
+        &mut scratch.seen,
+        &mut scratch.top_k,
+        &mut scratch.top_p,
+        dump_u_out,
+    )
 }
 
 /// Execute the full pinned `sample_top_k_p` chain in safe Rust.
@@ -479,6 +542,28 @@ pub(super) fn sample_top_k_p(
     seen: &mut [u8],
     dump_u_out: Option<&mut f32>,
 ) -> Option<usize> {
+    let mut top_k_buf = Vec::new();
+    let mut top_p_buf = Vec::new();
+    sample_top_k_p_inner(
+        logits,
+        params,
+        history,
+        seen,
+        &mut top_k_buf,
+        &mut top_p_buf,
+        dump_u_out,
+    )
+}
+
+fn sample_top_k_p_inner(
+    logits: &mut [f32],
+    params: SampleTopKPParams,
+    history: &[i32],
+    seen: &mut [u8],
+    top_k_buf: &mut Vec<f32>,
+    top_p_buf: &mut Vec<TokenProb>,
+    dump_u_out: Option<&mut f32>,
+) -> Option<usize> {
     if logits.is_empty()
         || !params.temperature.is_finite()
         || params.temperature < 0.0
@@ -506,8 +591,8 @@ pub(super) fn sample_top_k_p(
         }
         return Some(choice);
     }
-    top_k_mask(logits, params.top_k);
-    top_p_mask_with_temperature(logits, params.top_p, params.temperature);
+    top_k_mask_with_scratch(logits, params.top_k, top_k_buf);
+    top_p_mask_with_temperature_into(logits, params.top_p, params.temperature, top_p_buf);
 
     let mut max_val = f32::NEG_INFINITY;
     for &logit in logits.iter() {

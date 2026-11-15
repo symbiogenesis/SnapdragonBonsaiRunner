@@ -17,7 +17,7 @@ use crate::{
         CausalConv1d, CausalTransConv1d, CodecStreamState, ConvNeXtBlock, DacBlock, DacDecoder,
         DacResUnit, PadMode, RvqDecoder, RvqEncodeSide, RvqGroup, SnakeBeta, TOKENIZER_HOP_24K,
     },
-    engine::{LinearProjection, apply_rope_neox_in_place, rms_norm},
+    engine::{LinearProjection, apply_rope_neox_in_place, rms_norm_in_place},
     speaker_encoder::{
         AttentiveStatPool, AudioMelConfig, EcapaSpeakerEncoder, MelSpectrogramExtractor,
         SeRes2NetBlock, SqueezeExcitation, TdnnConv1d,
@@ -441,7 +441,19 @@ impl Transformer {
         })
     }
 
+    #[cfg(test)]
     fn step(&self, input: &[f32], state: &mut TransformerState) -> io::Result<Vec<f32>> {
+        let mut scratch = CodecTransformerScratch::default();
+        self.step_with_scratch(input, state, &mut scratch)?;
+        Ok(scratch.hidden)
+    }
+
+    fn step_with_scratch<'s>(
+        &self,
+        input: &[f32],
+        state: &mut TransformerState,
+        scratch: &'s mut CodecTransformerScratch,
+    ) -> io::Result<&'s [f32]> {
         let stride = self
             .kv_heads
             .checked_mul(self.head_dim)
@@ -456,101 +468,189 @@ impl Transformer {
         if state.layers.len() != self.layers.len() {
             return Err(invalid());
         }
-        let mut hidden = if let Some(proj) = &self.input {
-            proj.forward_vec_parallel(input, None, self.threads)?
+        if let Some(proj) = &self.input {
+            proj.forward_vec_into(input, None, None, self.threads, &mut scratch.hidden)?;
         } else {
-            input.to_vec()
-        };
-        if hidden.len() != self.hidden || input.iter().any(|value| !value.is_finite()) {
+            scratch.hidden.clear();
+            scratch.hidden.extend_from_slice(input);
+        }
+        if scratch.hidden.len() != self.hidden || input.iter().any(|value| !value.is_finite()) {
             return Err(invalid());
         }
         for (layer, cache) in self.layers.iter().zip(&mut state.layers) {
-            let normalized = normalize(&hidden, &layer.norm, layer.norm_bias.as_deref(), self.eps)?;
-            let mut q = layer
-                .q
-                .forward_vec_parallel(&normalized, None, self.threads)?;
-            let mut k = layer
-                .k
-                .forward_vec_parallel(&normalized, None, self.threads)?;
-            let v = layer
-                .v
-                .forward_vec_parallel(&normalized, None, self.threads)?;
+            normalize_into(
+                &scratch.hidden,
+                &layer.norm,
+                layer.norm_bias.as_deref(),
+                self.eps,
+                &mut scratch.normalized,
+            )?;
+            layer.q.forward_vec_into(
+                &scratch.normalized,
+                None,
+                None,
+                self.threads,
+                &mut scratch.q,
+            )?;
+            layer.k.forward_vec_into(
+                &scratch.normalized,
+                None,
+                None,
+                self.threads,
+                &mut scratch.k,
+            )?;
+            layer.v.forward_vec_into(
+                &scratch.normalized,
+                None,
+                None,
+                self.threads,
+                &mut scratch.v,
+            )?;
             apply_rope_neox_in_place(
-                &mut q,
+                &mut scratch.q,
                 self.heads,
                 self.head_dim,
                 state.position,
                 self.theta,
             )?;
             apply_rope_neox_in_place(
-                &mut k,
+                &mut scratch.k,
                 self.kv_heads,
                 self.head_dim,
                 state.position,
                 self.theta,
             )?;
-            let attended = append_attention(
-                &q,
-                &k,
-                &v,
+            append_attention_into(
+                &scratch.q,
+                &scratch.k,
+                &scratch.v,
                 self.heads,
                 self.kv_heads,
                 self.head_dim,
                 self.window,
                 cache,
+                &mut scratch.scores,
+                &mut scratch.attended,
             )?;
-            let projected = layer
-                .output
-                .forward_vec_parallel(&attended, None, self.threads)?;
-            for ((dst, value), scale) in hidden.iter_mut().zip(projected).zip(&layer.attn_scale) {
+            layer.output.forward_vec_into(
+                &scratch.attended,
+                None,
+                None,
+                self.threads,
+                &mut scratch.projected,
+            )?;
+            for ((dst, &value), &scale) in scratch
+                .hidden
+                .iter_mut()
+                .zip(&scratch.projected)
+                .zip(&layer.attn_scale)
+            {
                 *dst += value * scale;
             }
-            let normalized = normalize(
-                &hidden,
+            normalize_into(
+                &scratch.hidden,
                 &layer.ffn_norm,
                 layer.ffn_bias.as_deref(),
                 self.eps,
+                &mut scratch.normalized,
             )?;
-            let mut up = layer
-                .up
-                .forward_vec_parallel(&normalized, None, self.threads)?;
+            layer.up.forward_vec_into(
+                &scratch.normalized,
+                None,
+                None,
+                self.threads,
+                &mut scratch.up,
+            )?;
             if let Some(gate) = &layer.gate {
-                let gate = gate.forward_vec_parallel(&normalized, None, self.threads)?;
-                for (value, gate) in up.iter_mut().zip(gate) {
+                gate.forward_vec_into(
+                    &scratch.normalized,
+                    None,
+                    None,
+                    self.threads,
+                    &mut scratch.gate,
+                )?;
+                for (value, &gate) in scratch.up.iter_mut().zip(&scratch.gate) {
                     *value *= gate / (1.0 + (-gate).exp());
                 }
             } else {
-                for value in &mut up {
+                for value in &mut scratch.up {
                     *value = gelu_erf(*value);
                 }
             }
-            let projected = layer.down.forward_vec_parallel(&up, None, self.threads)?;
-            for ((dst, value), scale) in hidden.iter_mut().zip(projected).zip(&layer.ffn_scale) {
+            layer.down.forward_vec_into(
+                &scratch.up,
+                None,
+                None,
+                self.threads,
+                &mut scratch.projected,
+            )?;
+            for ((dst, &value), &scale) in scratch
+                .hidden
+                .iter_mut()
+                .zip(&scratch.projected)
+                .zip(&layer.ffn_scale)
+            {
                 *dst += value * scale;
             }
         }
         if let Some(norm) = &self.final_norm {
-            hidden = rms_norm(&hidden, norm, self.eps)?;
+            rms_norm_in_place(&mut scratch.hidden, norm, self.eps)?;
         }
         if let Some(proj) = &self.output {
-            hidden = proj.forward_vec_parallel(&hidden, None, self.threads)?;
+            proj.forward_vec_into(
+                &scratch.hidden,
+                None,
+                None,
+                self.threads,
+                &mut scratch.projected,
+            )?;
+            std::mem::swap(&mut scratch.hidden, &mut scratch.projected);
         }
-        if hidden.iter().any(|value| !value.is_finite()) {
+        if scratch.hidden.iter().any(|value| !value.is_finite()) {
             return Err(invalid());
         }
         append.commit();
-        Ok(hidden)
+        Ok(&scratch.hidden)
     }
 }
 
+#[derive(Default)]
+struct CodecTransformerScratch {
+    hidden: Vec<f32>,
+    normalized: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    scores: Vec<f32>,
+    attended: Vec<f32>,
+    projected: Vec<f32>,
+    up: Vec<f32>,
+    gate: Vec<f32>,
+}
+
+#[cfg(test)]
 fn normalize(
     input: &[f32],
     weight: &[f32],
     bias: Option<&[f32]>,
     eps: f32,
 ) -> io::Result<Vec<f32>> {
+    let mut output = Vec::new();
+    normalize_into(input, weight, bias, eps, &mut output)?;
+    Ok(output)
+}
+
+fn normalize_into(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    eps: f32,
+    output: &mut Vec<f32>,
+) -> io::Result<()> {
     let Some(bias) = bias else {
-        return rms_norm(input, weight, eps);
+        output.clear();
+        output.extend_from_slice(input);
+        return rms_norm_in_place(output, weight, eps);
     };
     if input.is_empty()
         || input.len() != weight.len()
@@ -579,23 +679,25 @@ fn normalize(
         return Err(invalid());
     }
     let inv = 1.0 / denominator.sqrt();
-    let output: Vec<_> = input
-        .iter()
-        .zip(weight)
-        .zip(bias)
-        .map(|((&value, &scale), &offset)| ((value - mean) * inv).mul_add(scale, offset))
-        .collect();
+    output.clear();
+    output.extend(
+        input
+            .iter()
+            .zip(weight)
+            .zip(bias)
+            .map(|((&value, &scale), &offset)| ((value - mean) * inv).mul_add(scale, offset)),
+    );
     if output.iter().any(|value| !value.is_finite()) {
         return Err(invalid());
     }
-    Ok(output)
+    Ok(())
 }
 
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Keep query/key/value geometry and owned cache explicit."
 )]
-// The enclosing TransformerAppend owns rollback and delayed window eviction.
 fn append_attention(
     query: &[f32],
     key: &[f32],
@@ -606,6 +708,40 @@ fn append_attention(
     window: Option<usize>,
     state: &mut KvState,
 ) -> io::Result<Vec<f32>> {
+    let mut scores = Vec::new();
+    let mut output = Vec::new();
+    append_attention_into(
+        query,
+        key,
+        value,
+        heads,
+        kv_heads,
+        width,
+        window,
+        state,
+        &mut scores,
+        &mut output,
+    )?;
+    Ok(output)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep query/key/value geometry and owned cache explicit."
+)]
+// The enclosing TransformerAppend owns rollback and delayed window eviction.
+fn append_attention_into(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    width: usize,
+    window: Option<usize>,
+    state: &mut KvState,
+    scores: &mut Vec<f32>,
+    output: &mut Vec<f32>,
+) -> io::Result<()> {
     let stride = kv_heads.checked_mul(width).ok_or_else(invalid)?;
     let query_width = heads.checked_mul(width).ok_or_else(invalid)?;
     if heads == 0
@@ -631,10 +767,8 @@ fn append_attention(
     let total = state.keys.len() / stride;
     let frames = window.map_or(total, |window| total.min(window));
     let first = total - frames;
-    let mut output = Vec::new();
-    zero_workspace(&mut output, query.len());
-    let mut scores = Vec::new();
-    zero_workspace(&mut scores, frames);
+    zero_workspace(output, query.len());
+    zero_workspace(scores, frames);
     let scale = 1.0 / count_float(width)?.sqrt();
     for head in 0..heads {
         let kv_head = head / (heads / kv_heads);
@@ -672,7 +806,7 @@ fn append_attention(
     if output.iter().any(|value| !value.is_finite()) {
         return Err(invalid());
     }
-    Ok(output)
+    Ok(())
 }
 
 // Mimi uses erf GELU; the DAC's ConvNeXt uses the separate tanh GELU.
@@ -870,10 +1004,15 @@ impl Encoder {
         elu(&mut hidden);
         (hidden, frames) = self.last.forward_parallel(&hidden, frames, self.threads)?;
         let mut state = TransformerState::default();
+        let mut scratch = CodecTransformerScratch::default();
         let mut transformed = Vec::with_capacity(hidden.len());
         for frame in hidden.chunks_exact(self.transformer.hidden) {
             cancel()?;
-            transformed.extend(self.transformer.step(frame, &mut state)?);
+            transformed.extend_from_slice(self.transformer.step_with_scratch(
+                frame,
+                &mut state,
+                &mut scratch,
+            )?);
         }
         cancel()?;
         (hidden, frames) = self
@@ -1201,6 +1340,7 @@ impl Codec {
             return Err(invalid());
         }
         let mut output = Vec::with_capacity(codes.len() * TOKENIZER_HOP_24K);
+        let mut transformer_scratch = CodecTransformerScratch::default();
         // Execute one frame at a time so emission chunk boundaries cannot alter
         // attention windows, convolution context, or floating-point grouping.
         for row in codes {
@@ -1212,21 +1352,29 @@ impl Codec {
                 &mut self.state.audio.pre_conv,
                 self.threads,
             )?;
-            let mut latent = self
-                .transformer
-                .step(&latent, &mut self.state.transformer)?;
+            let latent = self.transformer.step_with_scratch(
+                &latent,
+                &mut self.state.transformer,
+                &mut transformer_scratch,
+            )?;
             let mut frames = 1;
+            let mut upsampled: Option<Vec<f32>> = None;
             for (stage, context) in self.upsample.iter().zip(&mut self.state.audio.upsample_dw) {
                 cancel()?;
-                (latent, frames) = stage.conv.forward_parallel(&latent, frames, self.threads)?;
-                latent =
-                    stage
-                        .block
-                        .forward_stream_parallel(&latent, frames, context, self.threads)?;
+                let input = upsampled.as_deref().unwrap_or(latent);
+                let (next, next_frames) =
+                    stage.conv.forward_parallel(input, frames, self.threads)?;
+                upsampled = Some(stage.block.forward_stream_parallel(
+                    &next,
+                    next_frames,
+                    context,
+                    self.threads,
+                )?);
+                frames = next_frames;
             }
             cancel()?;
             let samples = self.dac.forward_stream_parallel(
-                &latent,
+                upsampled.as_deref().unwrap_or(latent),
                 frames,
                 &mut self.state.audio,
                 self.threads,

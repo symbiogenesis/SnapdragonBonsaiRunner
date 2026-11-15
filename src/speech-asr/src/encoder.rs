@@ -359,6 +359,7 @@ impl Encoder {
         check(cancel)?;
         let mut rows = zeros(layout.audio_rows * c.hidden)?;
         let mut conv_scratch = Vec::new();
+        let mut prepared = PreparedBatch::default();
         let mut row_offset = 0;
         for chunk in 0..layout.chunks {
             check(cancel)?;
@@ -382,6 +383,7 @@ impl Encoder {
                     height,
                     channels,
                     workers,
+                    &mut prepared,
                     &mut conv_scratch,
                     cancel,
                 )?;
@@ -407,7 +409,7 @@ impl Encoder {
                         }
                     }
                 }
-                let prepared = PreparedBatch::new(&flat_in, retained, flat_dim);
+                prepared.prepare_into(&flat_in, retained, flat_dim);
                 let chunk_rows =
                     &mut rows[row_offset * c.hidden..(row_offset + retained) * c.hidden];
                 self.weights.convolution_out.multiply_batch_prepared_into(
@@ -450,6 +452,7 @@ impl Encoder {
                 &mut attn_out,
                 &mut proj,
                 &mut ffn_buf,
+                &mut prepared,
                 &mut conv_scratch,
                 num_rows,
                 c,
@@ -460,9 +463,9 @@ impl Encoder {
         self.weights
             .output_norm
             .apply_batch(&rows, &mut norm_buf, c.hidden, workers)?;
-        let out_in_prepared = PreparedBatch::new(&norm_buf, num_rows, c.hidden);
+        prepared.prepare_into(&norm_buf, num_rows, c.hidden);
         self.weights.output_in.apply_batch_prepared(
-            &out_in_prepared,
+            &prepared,
             &norm_buf,
             workers,
             &mut conv_scratch,
@@ -471,9 +474,9 @@ impl Encoder {
         )?;
         gelu_parallel(&mut proj, workers, c.hidden)?;
         let mut values = zeros(num_rows * c.output)?;
-        let out_out_prepared = PreparedBatch::new(&proj, num_rows, c.hidden);
+        prepared.prepare_into(&proj, num_rows, c.hidden);
         self.weights.output_out.apply_batch_prepared(
-            &out_out_prepared,
+            &prepared,
             &proj,
             workers,
             &mut conv_scratch,
@@ -523,6 +526,7 @@ fn convolve_with_threads(
     height: usize,
     channels: usize,
     workers: usize,
+    prepared: &mut PreparedBatch,
     scratch: &mut Vec<f32>,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Vec<f32>> {
@@ -555,9 +559,9 @@ fn convolve_with_threads(
             }
         }
     }
-    let prepared = PreparedBatch::new(&patches, total_patches, patch_width);
+    prepared.prepare_into(&patches, total_patches, patch_width);
     let mut flat_out = zeros(total_patches * out_channels)?;
-    linear.apply_batch_prepared(&prepared, &patches, workers, scratch, &mut flat_out, cancel)?;
+    linear.apply_batch_prepared(prepared, &patches, workers, scratch, &mut flat_out, cancel)?;
     gelu_parallel(&mut flat_out, workers, out_channels)?;
     let mut output = zeros(total_patches * out_channels)?;
     for (pos, src_row) in flat_out.chunks_exact(out_channels).enumerate() {
@@ -579,6 +583,7 @@ fn convolve(
     channels: usize,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Vec<f32>> {
+    let mut prepared = PreparedBatch::default();
     let mut scratch = Vec::new();
     convolve_with_threads(
         linear,
@@ -587,6 +592,7 @@ fn convolve(
         height,
         channels,
         1,
+        &mut prepared,
         &mut scratch,
         cancel,
     )
@@ -664,6 +670,7 @@ fn transform_block(
     attn_out: &mut [f32],
     proj: &mut [f32],
     ffn_buf: &mut [f32],
+    prepared: &mut PreparedBatch,
     scratch: &mut Vec<f32>,
     num_rows: usize,
     c: Config,
@@ -674,16 +681,16 @@ fn transform_block(
     block
         .attention_norm
         .apply_batch(rows, norm_buf, c.hidden, workers)?;
-    let qkv_prepared = PreparedBatch::new(norm_buf, num_rows, c.hidden);
+    prepared.prepare_into(norm_buf, num_rows, c.hidden);
     block
         .query
-        .apply_batch_prepared(&qkv_prepared, norm_buf, workers, scratch, q, cancel)?;
+        .apply_batch_prepared(prepared, norm_buf, workers, scratch, q, cancel)?;
     block
         .key
-        .apply_batch_prepared(&qkv_prepared, norm_buf, workers, scratch, k, cancel)?;
+        .apply_batch_prepared(prepared, norm_buf, workers, scratch, k, cancel)?;
     block
         .value
-        .apply_batch_prepared(&qkv_prepared, norm_buf, workers, scratch, v, cancel)?;
+        .apply_batch_prepared(prepared, norm_buf, workers, scratch, v, cancel)?;
 
     for _ in 0..(num_rows * c.heads) {
         check(cancel)?;
@@ -721,39 +728,24 @@ fn transform_block(
         Ok(())
     })?;
 
-    let attn_prepared = PreparedBatch::new(attn_out, num_rows, c.hidden);
-    block.attention_out.apply_batch_prepared(
-        &attn_prepared,
-        attn_out,
-        workers,
-        scratch,
-        proj,
-        cancel,
-    )?;
+    prepared.prepare_into(attn_out, num_rows, c.hidden);
+    block
+        .attention_out
+        .apply_batch_prepared(prepared, attn_out, workers, scratch, proj, cancel)?;
     add_residual_batch(rows, proj, workers, c.hidden)?;
 
     block
         .ffn_norm
         .apply_batch(rows, norm_buf, c.hidden, workers)?;
-    let ffn_prepared = PreparedBatch::new(norm_buf, num_rows, c.hidden);
-    block.ffn_in.apply_batch_prepared(
-        &ffn_prepared,
-        norm_buf,
-        workers,
-        scratch,
-        ffn_buf,
-        cancel,
-    )?;
+    prepared.prepare_into(norm_buf, num_rows, c.hidden);
+    block
+        .ffn_in
+        .apply_batch_prepared(prepared, norm_buf, workers, scratch, ffn_buf, cancel)?;
     gelu_parallel(ffn_buf, workers, c.intermediate)?;
-    let ffn_out_prepared = PreparedBatch::new(ffn_buf, num_rows, c.intermediate);
-    block.ffn_out.apply_batch_prepared(
-        &ffn_out_prepared,
-        ffn_buf,
-        workers,
-        scratch,
-        proj,
-        cancel,
-    )?;
+    prepared.prepare_into(ffn_buf, num_rows, c.intermediate);
+    block
+        .ffn_out
+        .apply_batch_prepared(prepared, ffn_buf, workers, scratch, proj, cancel)?;
     add_residual_batch(rows, proj, workers, c.hidden)
 }
 

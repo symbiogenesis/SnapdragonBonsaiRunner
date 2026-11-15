@@ -9,8 +9,16 @@
     reason = "Non-fused multiply and add preserve exact left-to-right scalar f32 bit parity."
 )]
 
+use std::sync::OnceLock;
+
 use crate::row_workers;
 use fearless_simd::{Level, dispatch, f32x4, prelude::*, u8x16};
+
+static SIMD_LEVEL: OnceLock<Level> = OnceLock::new();
+
+pub(super) fn simd_level() -> Level {
+    *SIMD_LEVEL.get_or_init(Level::new)
+}
 
 /// Borrowed weight slice for row-major `F32` or `Q8_0` matrices.
 #[derive(Clone, Copy)]
@@ -28,6 +36,7 @@ pub(super) struct WeightMatrix<'a> {
 }
 
 /// Four-position-packed input activations so sibling projections share transposition.
+#[derive(Default)]
 pub(super) struct PreparedBatch {
     input: usize,
     batch: usize,
@@ -36,27 +45,38 @@ pub(super) struct PreparedBatch {
 }
 
 impl PreparedBatch {
+    #[cfg(test)]
     pub(super) fn new(raw_input: &[f32], batch: usize, input: usize) -> Self {
-        let num_quads = batch / 4;
-        let mut quads = Vec::new();
-        if num_quads > 0 && input > 0 {
-            quads.resize(num_quads * input, [0.0; 4]);
-            for q in 0..num_quads {
+        let mut prepared = Self::default();
+        prepared.prepare_into(raw_input, batch, input);
+        prepared
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.input = 0;
+        self.batch = 0;
+        self.num_quads = 0;
+        self.quads.clear();
+    }
+
+    pub(super) fn prepare_into(&mut self, raw_input: &[f32], batch: usize, input: usize) {
+        self.input = input;
+        self.batch = batch;
+        self.num_quads = batch / 4;
+        if self.num_quads > 0 && input > 0 {
+            self.quads.resize(self.num_quads * input, [0.0; 4]);
+            for q in 0..self.num_quads {
                 let p0 = &raw_input[(q * 4) * input..(q * 4 + 1) * input];
                 let p1 = &raw_input[(q * 4 + 1) * input..(q * 4 + 2) * input];
                 let p2 = &raw_input[(q * 4 + 2) * input..(q * 4 + 3) * input];
                 let p3 = &raw_input[(q * 4 + 3) * input..(q * 4 + 4) * input];
-                let dst = &mut quads[q * input..(q + 1) * input];
+                let dst = &mut self.quads[q * input..(q + 1) * input];
                 for col in 0..input {
                     dst[col] = [p0[col], p1[col], p2[col], p3[col]];
                 }
             }
-        }
-        Self {
-            input,
-            batch,
-            num_quads,
-            quads,
+        } else {
+            self.quads.clear();
         }
     }
 
@@ -71,7 +91,7 @@ impl PreparedBatch {
 
 /// Return `true` if every sample is finite and within `[-1.0, 1.0]`.
 pub(super) fn pcm_in_unit_range(pcm: &[f32]) -> bool {
-    let level = Level::new();
+    let level = simd_level();
     dispatch!(level, simd => pcm_in_unit_range_simd(simd, pcm))
 }
 
@@ -268,7 +288,7 @@ pub(super) fn multiply_single_into(
     workers: usize,
     out: &mut [f32],
 ) {
-    let level = Level::new();
+    let level = simd_level();
     row_workers::run_aligned(out, workers, 4, &|start_row, slice| {
         dispatch!(level, simd => single_rows_simd(simd, weights, start_row, input, slice));
     });
@@ -652,7 +672,7 @@ pub(super) fn multiply_batch_prepared_into(
     let output = weights.output;
     let input = weights.input;
     let num_quads = prepared.num_quads;
-    let level = Level::new();
+    let level = simd_level();
     if num_quads > 0 {
         let row_stride = num_quads * 4;
         let needed = output * row_stride;
@@ -688,7 +708,7 @@ pub(super) fn multiply_batch_prepared_into(
 
 /// Compute scaled dot products between `query` and 4 key slices in exact left-to-right order.
 pub(super) fn dot_4keys_seq(query: &[f32], keys: [&[f32]; 4], divisor: f32) -> [f32; 4] {
-    let level = Level::new();
+    let level = simd_level();
     dispatch!(level, simd => dot_4keys_seq_simd(simd, query, keys, divisor))
 }
 
@@ -722,7 +742,7 @@ fn dot_4keys_seq_simd<S: Simd>(
 
 /// Accumulate `out[d] += w * v[d]` in exact left-to-right non-FMA order for 4 value rows.
 pub(super) fn weighted_value_accum_4(out: &mut [f32], values: [&[f32]; 4], weights: [f32; 4]) {
-    let level = Level::new();
+    let level = simd_level();
     dispatch!(level, simd => weighted_value_accum_4_simd(simd, out, values, weights));
 }
 
@@ -758,7 +778,7 @@ fn weighted_value_accum_4_simd<S: Simd>(
 
 /// Accumulate `out[d] += weight * v[d]` in exact non-FMA order.
 pub(super) fn weighted_value_accum(out: &mut [f32], value: &[f32], weight: f32) {
-    let level = Level::new();
+    let level = simd_level();
     dispatch!(level, simd => weighted_value_accum_simd(simd, out, value, weight));
 }
 

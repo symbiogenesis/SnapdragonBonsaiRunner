@@ -519,6 +519,7 @@ struct DecoderWorkspace {
     batch_gate: Vec<f32>,
     batch_up: Vec<f32>,
     transposed_scratch: Vec<f32>,
+    prepared: PreparedBatch,
 }
 
 impl DecoderWorkspace {
@@ -545,6 +546,7 @@ impl DecoderWorkspace {
         self.batch_gate.clear();
         self.batch_up.clear();
         self.transposed_scratch.clear();
+        self.prepared.clear();
     }
 }
 
@@ -826,9 +828,9 @@ fn prefill_inner(
             hidden,
             workers,
         )?;
-        let qkv_prepared = PreparedBatch::new(&ws.batch_norm, total, hidden);
+        ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
         block.query.multiply_batch_prepared_into(
-            &qkv_prepared,
+            &ws.prepared,
             &ws.batch_norm,
             workers,
             &mut ws.transposed_scratch,
@@ -836,7 +838,7 @@ fn prefill_inner(
             cancel,
         )?;
         block.key.multiply_batch_prepared_into(
-            &qkv_prepared,
+            &ws.prepared,
             &ws.batch_norm,
             workers,
             &mut ws.transposed_scratch,
@@ -844,7 +846,7 @@ fn prefill_inner(
             cancel,
         )?;
         block.value.multiply_batch_prepared_into(
-            &qkv_prepared,
+            &ws.prepared,
             &ws.batch_norm,
             workers,
             &mut ws.transposed_scratch,
@@ -936,9 +938,9 @@ fn prefill_inner(
             },
         )?;
 
-        let attn_prepared = PreparedBatch::new(&ws.batch_attn, total, q_width);
+        ws.prepared.prepare_into(&ws.batch_attn, total, q_width);
         block.attention_out.multiply_batch_prepared_into(
-            &attn_prepared,
+            &ws.prepared,
             &ws.batch_attn,
             workers,
             &mut ws.transposed_scratch,
@@ -955,9 +957,9 @@ fn prefill_inner(
             hidden,
             workers,
         )?;
-        let ffn_prepared = PreparedBatch::new(&ws.batch_norm, total, hidden);
+        ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
         block.gate.multiply_batch_prepared_into(
-            &ffn_prepared,
+            &ws.prepared,
             &ws.batch_norm,
             workers,
             &mut ws.transposed_scratch,
@@ -965,7 +967,7 @@ fn prefill_inner(
             cancel,
         )?;
         block.up.multiply_batch_prepared_into(
-            &ffn_prepared,
+            &ws.prepared,
             &ws.batch_norm,
             workers,
             &mut ws.transposed_scratch,
@@ -985,9 +987,10 @@ fn prefill_inner(
                 finite(gate_slice)
             },
         )?;
-        let down_prepared = PreparedBatch::new(&ws.batch_gate, total, c.intermediate);
+        ws.prepared
+            .prepare_into(&ws.batch_gate, total, c.intermediate);
         block.down.multiply_batch_prepared_into(
-            &down_prepared,
+            &ws.prepared,
             &ws.batch_gate,
             workers,
             &mut ws.transposed_scratch,

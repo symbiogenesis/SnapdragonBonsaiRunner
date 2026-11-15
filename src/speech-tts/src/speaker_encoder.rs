@@ -671,11 +671,12 @@ impl AttentiveStatPool {
         let scores = self.conv.forward(&attn, frames, false)?;
 
         let mut stats = vec![0.0_f32; channels * 2];
+        let mut weights = Vec::with_capacity(frames);
         for c in 0..channels {
             let s_row = &scores[c * frames..(c + 1) * frames];
             let x_row = &input[c * frames..(c + 1) * frames];
             let max_s = s_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut weights = Vec::with_capacity(frames);
+            weights.clear();
             let mut w_sum = 0.0_f32;
             for &s in s_row {
                 let w = (s - max_s).exp();
