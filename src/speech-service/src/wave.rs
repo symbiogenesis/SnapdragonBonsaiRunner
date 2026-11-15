@@ -1,23 +1,17 @@
 //! Complete canonical PCM input and output; never opens an audio device.
 
 use crate::http::Error;
+use bonsai_audio::WavError;
+use std::io;
 
 pub(super) fn decode<'a>(bytes: &[u8], samples: &'a mut Vec<f32>) -> Result<&'a [f32], Error> {
     samples.clear();
-    let pcm = bonsai_audio::mono_pcm16_data(bytes, 16_000, 16_000 * 30)
-        .ok_or_else(|| Error::bad("invalid_audio"))?;
-    samples
-        .try_reserve_exact(pcm.len() / 2)
-        .map_err(|_| Error::new(503, "allocation_failed"))?;
-    samples.extend(
-        pcm.as_chunks::<2>()
-            .0
-            .iter()
-            // 1.0 / 32_768.0 is exact binary 2^-15, preserving bit-for-bit equality
-            // with division by 32_768.0 across every i16 sample without FP division.
-            .map(|&sample| f32::from(i16::from_le_bytes(sample)) * (1.0 / 32_768.0)),
-    );
-    Ok(samples)
+    let pcm = bonsai_audio::mono_pcm16_data_checked(bytes, 16_000, 16_000 * 30)
+        .map_err(|_| Error::bad("invalid_audio"))?;
+    bonsai_audio::decode_pcm16le_into(pcm, samples).map_err(|error| match error {
+        WavError::AllocationFailed => Error::new(503, "allocation_failed"),
+        _ => Error::bad("invalid_audio"),
+    })
 }
 
 /// Fixed conversion payload, independent of the duration of an admitted clip.
@@ -40,29 +34,14 @@ pub(super) fn header(samples: &[f32], sample_rate: u32) -> Result<[u8; 44], Erro
     let Some(max_samples) = max_samples_for_rate(sample_rate) else {
         return Err(Error::new(502, "invalid_audio_output"));
     };
-    if bonsai_audio::finite_sample_count(samples, 0, max_samples).is_none() {
-        return Err(Error::new(502, "invalid_audio_output"));
-    }
-    bonsai_audio::mono_pcm16_header(sample_rate, samples.len())
-        .ok_or_else(|| Error::new(502, "invalid_audio_output"))
+    bonsai_audio::mono_pcm16_header_checked(samples, sample_rate, max_samples)
+        .map_err(|_| Error::new(502, "invalid_audio_output"))
 }
 
 // Callers provide at most PCM_SAMPLES samples and a PCM_BYTES output buffer.
 // Reuse that storage for every chunk instead of retaining a second full clip.
-pub(super) fn pcm_into<'a>(samples: &[f32], bytes: &'a mut [u8]) -> &'a [u8] {
-    let bytes = &mut bytes[..samples.len() * 2];
-    for (sample, target) in samples.iter().zip(bytes.as_chunks_mut::<2>().0) {
-        *target = pcm(*sample).to_le_bytes();
-    }
-    bytes
-}
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "Finite samples are explicitly clamped and rounded into the representable PCM16 range."
-)]
-pub(super) fn pcm(sample: f32) -> i16 {
-    (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16
+pub(super) fn pcm_into<'a>(samples: &[f32], bytes: &'a mut [u8]) -> io::Result<&'a [u8]> {
+    bonsai_audio::encode_pcm16le_into(samples, bytes).map_err(io::Error::other)
 }
 
 #[cfg(test)]
@@ -101,20 +80,21 @@ mod tests {
     }
 
     #[test]
-    fn pcm_bytes_preserve_clipping_rounding_and_signed_zero() {
+    fn pcm_bytes_preserve_clipping_rounding_and_signed_zero() -> std::io::Result<()> {
         let samples = [-2.0, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 2.0];
         let mut bytes = [0; 16];
         assert_eq!(
-            pcm_into(&samples, &mut bytes),
+            pcm_into(&samples, &mut bytes)?,
             &[
                 1, 128, 1, 128, 0, 192, 0, 0, 0, 0, 0, 64, 255, 127, 255, 127
             ]
         );
         let mut bytes = [0; 4];
         assert_eq!(
-            pcm_into(&[-0.5 / 32767.0, 0.5 / 32767.0], &mut bytes),
+            pcm_into(&[-0.5 / 32767.0, 0.5 / 32767.0], &mut bytes)?,
             &[255, 255, 1, 0]
         );
+        Ok(())
     }
 
     #[test]

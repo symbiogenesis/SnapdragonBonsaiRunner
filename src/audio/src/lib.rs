@@ -6,9 +6,71 @@
 //! before entering this boundary. Audio stays borrowed and no devices are opened.
 #![forbid(unsafe_code)]
 
+use std::{error::Error, fmt};
+
 mod segmentation;
 
 pub use segmentation::pcm16_pause_boundary;
+
+/// Descriptive error returned by checked WAV framing and PCM16 conversion helpers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WavError {
+    /// Input does not begin with a valid `RIFF`..`WAVE` header matching its byte length.
+    InvalidRiffHeader,
+    /// A RIFF chunk header or payload is truncated or overflows bounds.
+    TruncatedChunk,
+    /// WAV input contains more than one `fmt ` chunk.
+    DuplicateFormatChunk,
+    /// WAV input contains more than one `data` chunk.
+    DuplicateDataChunk,
+    /// WAV input is missing a required `fmt ` chunk.
+    MissingFormatChunk,
+    /// WAV input is missing a required `data` chunk.
+    MissingDataChunk,
+    /// WAV input contains non-canonical chunks or chunk ordering.
+    NonCanonicalChunkLayout,
+    /// The `fmt ` chunk does not describe canonical 16-bit mono PCM at the expected sample rate.
+    UnsupportedFormat,
+    /// The `data` chunk is empty, unaligned, or exceeds the caller's sample limit.
+    InvalidDataLength,
+    /// PCM output contains non-finite samples, zero length, or an unsupported rate.
+    InvalidSamples,
+    /// Destination PCM byte slice is smaller than `samples.len() * 2`.
+    BufferTooSmall,
+    /// Sample destination vector capacity reservation failed.
+    AllocationFailed,
+}
+
+impl fmt::Display for WavError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidRiffHeader => {
+                "WAV input must start with a valid RIFF/WAVE header matching its byte length"
+            }
+            Self::TruncatedChunk => "WAV RIFF chunk header or payload is truncated",
+            Self::DuplicateFormatChunk => "WAV input contains duplicate 'fmt ' chunks",
+            Self::DuplicateDataChunk => "WAV input contains duplicate 'data' chunks",
+            Self::MissingFormatChunk => "WAV input is missing a required 'fmt ' chunk",
+            Self::MissingDataChunk => "WAV input is missing a required 'data' chunk",
+            Self::NonCanonicalChunkLayout => {
+                "WAV input must contain only canonical 'fmt ' followed by 'data' chunks"
+            }
+            Self::UnsupportedFormat => {
+                "WAV 'fmt ' chunk is not canonical 16-bit mono PCM at the expected sample rate"
+            }
+            Self::InvalidDataLength => {
+                "WAV 'data' chunk is empty, unaligned, or exceeds the maximum sample count"
+            }
+            Self::InvalidSamples => {
+                "PCM output contains non-finite samples, zero length, or an invalid rate"
+            }
+            Self::BufferTooSmall => "destination PCM buffer is smaller than required",
+            Self::AllocationFailed => "failed to reserve sample buffer capacity",
+        })
+    }
+}
+
+impl Error for WavError {}
 
 /// Admits a nonempty finite PCM chunk and returns its cumulative sample count.
 ///
@@ -23,6 +85,134 @@ pub fn finite_sample_count(samples: &[f32], previous: usize, maximum: usize) -> 
         .then_some(total)
 }
 
+fn validate_canonical_pcm16_fmt(
+    body: &[u8],
+    sample_rate: u32,
+    byte_rate: u32,
+) -> Result<(), WavError> {
+    let Ok(fmt) = <&[u8; 16]>::try_from(body) else {
+        return Err(WavError::UnsupportedFormat);
+    };
+    let audio_format = u16::from_le_bytes([fmt[0], fmt[1]]);
+    let channels = u16::from_le_bytes([fmt[2], fmt[3]]);
+    let rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
+    let actual_byte_rate = u32::from_le_bytes([fmt[8], fmt[9], fmt[10], fmt[11]]);
+    let block_align = u16::from_le_bytes([fmt[12], fmt[13]]);
+    let bits_per_sample = u16::from_le_bytes([fmt[14], fmt[15]]);
+    if audio_format != 1
+        || channels != 1
+        || rate != sample_rate
+        || actual_byte_rate != byte_rate
+        || block_align != 2
+        || bits_per_sample != 16
+    {
+        return Err(WavError::UnsupportedFormat);
+    }
+    Ok(())
+}
+
+/// Validates a canonical, bounded mono PCM16 WAV and returns its borrowed payload.
+///
+/// Rejects duplicate `fmt ` or `data` chunks, missing chunks, mismatched rates,
+/// lengths, channel/sample formats, empty or partial samples, extra chunks,
+/// and trailing data with a descriptive [`WavError`].
+///
+/// # Errors
+/// Returns [`WavError`] describing the first structural, format, or bound violation.
+pub fn mono_pcm16_data_checked(
+    wave: &[u8],
+    sample_rate: u32,
+    maximum_samples: u32,
+) -> Result<&[u8], WavError> {
+    if sample_rate == 0 {
+        return Err(WavError::UnsupportedFormat);
+    }
+    let byte_rate = sample_rate
+        .checked_mul(2)
+        .ok_or(WavError::UnsupportedFormat)?;
+    let Some((riff_head, _)) = wave.split_first_chunk::<12>() else {
+        return Err(WavError::InvalidRiffHeader);
+    };
+    if &riff_head[..4] != b"RIFF" || &riff_head[8..12] != b"WAVE" {
+        return Err(WavError::InvalidRiffHeader);
+    }
+    let riff_size = u32::from_le_bytes([riff_head[4], riff_head[5], riff_head[6], riff_head[7]]);
+    if usize::try_from(riff_size).ok() != Some(wave.len() - 8) {
+        return Err(WavError::InvalidRiffHeader);
+    }
+
+    let mut offset = 12;
+    let mut fmt_valid = false;
+    let mut data_payload: Option<&[u8]> = None;
+    let mut non_canonical = false;
+    let mut chunks = 0_usize;
+
+    while offset < wave.len() {
+        chunks += 1;
+        if chunks > 128 {
+            return Err(WavError::NonCanonicalChunkLayout);
+        }
+        let Some((chunk_header, _)) = wave[offset..].split_first_chunk::<8>() else {
+            return Err(WavError::TruncatedChunk);
+        };
+        let [id0, id1, id2, id3, s0, s1, s2, s3] = *chunk_header;
+        let id = [id0, id1, id2, id3];
+        let length = usize::try_from(u32::from_le_bytes([s0, s1, s2, s3]))
+            .map_err(|_| WavError::TruncatedChunk)?;
+        let body_start = offset + 8;
+        let body_end = body_start
+            .checked_add(length)
+            .ok_or(WavError::TruncatedChunk)?;
+        let padded_end = body_end
+            .checked_add(length % 2)
+            .ok_or(WavError::TruncatedChunk)?;
+        if padded_end > wave.len() {
+            return Err(WavError::TruncatedChunk);
+        }
+        match &id {
+            b"fmt " => {
+                if fmt_valid {
+                    return Err(WavError::DuplicateFormatChunk);
+                }
+                if data_payload.is_some() {
+                    non_canonical = true;
+                }
+                validate_canonical_pcm16_fmt(&wave[body_start..body_end], sample_rate, byte_rate)?;
+                fmt_valid = true;
+            }
+            b"data" => {
+                if data_payload.is_some() {
+                    return Err(WavError::DuplicateDataChunk);
+                }
+                if !fmt_valid {
+                    non_canonical = true;
+                }
+                data_payload = Some(&wave[body_start..body_end]);
+            }
+            _ => {
+                non_canonical = true;
+            }
+        }
+        offset = padded_end;
+    }
+
+    if !fmt_valid {
+        return Err(WavError::MissingFormatChunk);
+    }
+    let payload = data_payload.ok_or(WavError::MissingDataChunk)?;
+    if non_canonical {
+        return Err(WavError::NonCanonicalChunkLayout);
+    }
+    if payload.is_empty() || !payload.len().is_multiple_of(2) {
+        return Err(WavError::InvalidDataLength);
+    }
+    let samples = payload.len() / 2;
+    if u32::try_from(samples).map_err(|_| WavError::InvalidDataLength)? > maximum_samples {
+        return Err(WavError::InvalidDataLength);
+    }
+    Ok(payload)
+}
+
 /// Returns the borrowed PCM payload of a canonical, bounded mono PCM16 WAV.
 ///
 /// Rejects mismatched rates, lengths, channel/sample formats, empty or partial
@@ -30,15 +220,79 @@ pub fn finite_sample_count(samples: &[f32], previous: usize, maximum: usize) -> 
 /// mono samples, independently of their two-byte representation.
 #[must_use]
 pub fn mono_pcm16_data(wave: &[u8], sample_rate: u32, maximum_samples: u32) -> Option<&[u8]> {
-    let (header, payload) = wave.split_first_chunk::<44>()?;
-    if payload.is_empty() || !payload.len().is_multiple_of(2) {
-        return None;
+    mono_pcm16_data_checked(wave, sample_rate, maximum_samples).ok()
+}
+
+/// Validates finite samples against `maximum_samples` and builds a canonical 44-byte WAV header.
+///
+/// # Errors
+/// Returns [`WavError::InvalidSamples`] when samples are empty, non-finite, exceed
+/// `maximum_samples`, or cannot be framed at `sample_rate`.
+pub fn mono_pcm16_header_checked(
+    samples: &[f32],
+    sample_rate: u32,
+    maximum_samples: usize,
+) -> Result<[u8; 44], WavError> {
+    if finite_sample_count(samples, 0, maximum_samples).is_none() {
+        return Err(WavError::InvalidSamples);
     }
-    let samples = payload.len() / 2;
-    if u32::try_from(samples).ok()? > maximum_samples {
-        return None;
+    mono_pcm16_header(sample_rate, samples.len()).ok_or(WavError::InvalidSamples)
+}
+
+/// Decodes little-endian signed 16-bit PCM bytes into normalized `f32` samples.
+///
+/// Clears `samples` before validation and reserves exact capacity fallibly.
+///
+/// # Errors
+/// Returns [`WavError::InvalidDataLength`] for empty or odd-length PCM payloads,
+/// or [`WavError::AllocationFailed`] if reserving sample capacity fails.
+pub fn decode_pcm16le_into<'a>(
+    pcm: &[u8],
+    samples: &'a mut Vec<f32>,
+) -> Result<&'a [f32], WavError> {
+    samples.clear();
+    let (pairs, remainder) = pcm.as_chunks::<2>();
+    if pairs.is_empty() || !remainder.is_empty() {
+        return Err(WavError::InvalidDataLength);
     }
-    (*header == mono_pcm16_header(sample_rate, samples)?).then_some(payload)
+    samples
+        .try_reserve_exact(pairs.len())
+        .map_err(|_| WavError::AllocationFailed)?;
+    samples.extend(
+        pairs
+            .iter()
+            // 1.0 / 32_768.0 is exact binary 2^-15, preserving bit-for-bit equality
+            // with division by 32_768.0 across every i16 sample without FP division.
+            .map(|&sample| f32::from(i16::from_le_bytes(sample)) * (1.0 / 32_768.0)),
+    );
+    Ok(samples)
+}
+
+/// Converts one normalized floating-point sample into a clamped signed 16-bit PCM integer.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Finite samples are explicitly clamped and rounded into the representable PCM16 range."
+)]
+#[must_use]
+pub fn encode_pcm16le_sample(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16
+}
+
+/// Encodes normalized floating-point samples into little-endian signed 16-bit PCM bytes.
+///
+/// # Errors
+/// Returns [`WavError::BufferTooSmall`] when `bytes` cannot hold `samples.len() * 2` bytes.
+pub fn encode_pcm16le_into<'a>(samples: &[f32], bytes: &'a mut [u8]) -> Result<&'a [u8], WavError> {
+    let byte_len = samples
+        .len()
+        .checked_mul(2)
+        .ok_or(WavError::BufferTooSmall)?;
+    let target = bytes.get_mut(..byte_len).ok_or(WavError::BufferTooSmall)?;
+    for (sample, slot) in samples.iter().zip(target.as_chunks_mut::<2>().0) {
+        *slot = encode_pcm16le_sample(*sample).to_le_bytes();
+    }
+    Ok(target)
 }
 
 /// Builds the exact 44-byte header for a nonempty mono PCM16 WAV clip.
@@ -72,7 +326,11 @@ pub fn mono_pcm16_header(sample_rate: u32, samples: usize) -> Option<[u8; 44]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{finite_sample_count, mono_pcm16_data, mono_pcm16_header};
+    use super::{
+        WavError, decode_pcm16le_into, encode_pcm16le_into, encode_pcm16le_sample,
+        finite_sample_count, mono_pcm16_data, mono_pcm16_data_checked, mono_pcm16_header,
+        mono_pcm16_header_checked,
+    };
 
     #[test]
     fn complete_and_streamed_samples_share_finite_count_and_overflow_bounds() {
@@ -155,5 +413,69 @@ mod tests {
         assert!(mono_pcm16_header(u32::MAX, 1).is_none());
         assert!(mono_pcm16_header(16_000, usize::MAX).is_none());
         assert!(mono_pcm16_header(16_000, 2_147_483_630).is_none());
+    }
+
+    #[test]
+    fn duplicate_fmt_chunks_are_rejected_with_descriptive_error() {
+        let wave = fixture(16_000);
+        let fmt_chunk = &wave[12..36];
+        let mut duplicated_fmt_before_data = wave[..36].to_vec();
+        duplicated_fmt_before_data.extend_from_slice(fmt_chunk);
+        duplicated_fmt_before_data.extend_from_slice(&wave[36..]);
+        let riff_len = u32::try_from(duplicated_fmt_before_data.len() - 8).unwrap_or_default();
+        duplicated_fmt_before_data[4..8].copy_from_slice(&riff_len.to_le_bytes());
+
+        let error = mono_pcm16_data_checked(&duplicated_fmt_before_data, 16_000, 480_000)
+            .err()
+            .unwrap_or(WavError::InvalidRiffHeader);
+        assert_eq!(error, WavError::DuplicateFormatChunk);
+        assert!(error.to_string().contains("duplicate 'fmt '"));
+        assert!(mono_pcm16_data(&duplicated_fmt_before_data, 16_000, 480_000).is_none());
+
+        let mut duplicated_fmt_after_data = wave.clone();
+        duplicated_fmt_after_data.extend_from_slice(fmt_chunk);
+        let riff_len = u32::try_from(duplicated_fmt_after_data.len() - 8).unwrap_or_default();
+        duplicated_fmt_after_data[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        assert_eq!(
+            mono_pcm16_data_checked(&duplicated_fmt_after_data, 16_000, 480_000),
+            Err(WavError::DuplicateFormatChunk)
+        );
+    }
+
+    #[test]
+    fn pcm16le_encoding_and_decoding_preserve_exact_samples_and_bounds() {
+        let samples = [-2.0, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 2.0];
+        let mut bytes = [0_u8; 16];
+        assert_eq!(
+            encode_pcm16le_into(&samples, &mut bytes),
+            Ok([
+                1, 128, 1, 128, 0, 192, 0, 0, 0, 0, 0, 64, 255, 127, 255, 127
+            ]
+            .as_slice())
+        );
+        assert_eq!(encode_pcm16le_sample(-2.0), -32767);
+        assert_eq!(encode_pcm16le_sample(2.0), 32767);
+        assert_eq!(
+            encode_pcm16le_into(&[0.0], &mut [0_u8; 1]),
+            Err(WavError::BufferTooSmall)
+        );
+
+        let mut decoded = Vec::new();
+        let pcm = [0_u8, 0x80, 0xff, 0xff, 0, 0, 0xff, 0x7f];
+        assert_eq!(
+            decode_pcm16le_into(&pcm, &mut decoded),
+            Ok([-1.0, -1.0 / 32768.0, 0.0, 32767.0 / 32768.0].as_slice())
+        );
+        assert_eq!(
+            decode_pcm16le_into(&[0_u8; 3], &mut decoded),
+            Err(WavError::InvalidDataLength)
+        );
+        assert!(decoded.is_empty());
+
+        assert!(mono_pcm16_header_checked(&[0.0, 1.0], 24_000, 10).is_ok());
+        assert_eq!(
+            mono_pcm16_header_checked(&[f32::NAN], 24_000, 10),
+            Err(WavError::InvalidSamples)
+        );
     }
 }

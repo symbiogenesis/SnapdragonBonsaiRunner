@@ -1,6 +1,6 @@
 //! Strict JSON and multipart supported subsets; all payloads stay in memory.
 
-use crate::{ASR_MODEL, Request, TTS_MODEL, http::Error, wave};
+use crate::{ASR_MODEL, Kind, Request, TTS_MODEL, http::Error, wave};
 use serde::Deserialize;
 use std::borrow::Cow;
 
@@ -62,12 +62,26 @@ impl<'de> serde::de::Visitor<'de> for SpeechObject {
     }
 }
 
-pub(super) fn synthesize<'a>(media: &str, bytes: &'a [u8]) -> Result<Speech<'a>, Error> {
-    if !media.eq_ignore_ascii_case("application/json")
-        && !media.eq_ignore_ascii_case("application/json; charset=utf-8")
-    {
-        return Err(Error::new(415, "unsupported_media_type"));
+pub(super) fn validate_media(kind: Kind, media: &str) -> Result<(), Error> {
+    match kind {
+        Kind::Canary => {
+            let _ = boundary(media)?;
+            Ok(())
+        }
+        Kind::QwenTts => {
+            if media.eq_ignore_ascii_case("application/json")
+                || media.eq_ignore_ascii_case("application/json; charset=utf-8")
+            {
+                Ok(())
+            } else {
+                Err(Error::new(415, "unsupported_media_type"))
+            }
+        }
     }
+}
+
+pub(super) fn synthesize<'a>(media: &str, bytes: &'a [u8]) -> Result<Speech<'a>, Error> {
+    validate_media(Kind::QwenTts, media)?;
     let mut input = serde_json::Deserializer::from_slice(bytes);
     let speech = serde::Deserializer::deserialize_map(&mut input, SpeechObject)
         .map_err(|_| Error::bad("invalid_json"))?;

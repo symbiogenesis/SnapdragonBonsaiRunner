@@ -28,8 +28,17 @@ pub(super) struct Scratch {
     samples: Vec<f32>,
 }
 
-fn recycle_wire(wire: &mut Vec<u8>) {
+fn scrub_wire(wire: &mut Vec<u8>) {
+    // Scrub retained capacity as well as active length so bearer credentials
+    // read into the header buffer do not outlive the connection.
+    wire.fill(0);
+    wire.resize(wire.capacity(), 0);
+    std::hint::black_box(wire.as_mut_slice());
     wire.clear();
+}
+
+fn recycle_wire(wire: &mut Vec<u8>) {
+    scrub_wire(wire);
     if wire.capacity() > RETAINED_WIRE_BYTES {
         drop(std::mem::take(wire));
     }
@@ -42,6 +51,12 @@ impl Scratch {
         if self.samples.capacity() > RETAINED_INPUT_SAMPLES {
             drop(std::mem::take(&mut self.samples));
         }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        scrub_wire(&mut self.wire);
     }
 }
 
@@ -213,7 +228,11 @@ fn stream(
                 io::Error::other("Invalid streaming speech audio.")
             })?;
         for chunk in samples.chunks(wave::PCM_SAMPLES) {
-            if peer.write_all(frame.encode(chunk)).is_err() {
+            if frame
+                .encode(chunk)
+                .and_then(|bytes| peer.write_all(bytes))
+                .is_err()
+            {
                 failed = true;
                 return Err(io::Error::other("Streaming speech response failed."));
             }
@@ -349,12 +368,10 @@ fn parse_head(bytes: &[u8], port: u16, key: &[u8; 64], kind: Kind) -> Result<Hea
             return Err(Error::bad("invalid_headers"));
         }
     }
-    let mut expected = [0; 71];
-    expected[..7].copy_from_slice(b"Bearer ");
-    expected[7..].copy_from_slice(key);
-    if !header_value(parsed.headers, "authorization")
-        .is_some_and(|value| bool::from(value.ct_eq(&expected)))
-    {
+    let authorized = header_value(parsed.headers, "authorization")
+        .and_then(|value| value.strip_prefix(b"Bearer "))
+        .is_some_and(|token| bool::from(token.ct_eq(key.as_slice())));
+    if !authorized {
         return Err(Error::new(401, "unauthorized"));
     }
     let mut port_digits = NumBuffer::new();
@@ -448,6 +465,9 @@ fn framing(
     let media = std::str::from_utf8(header_value(headers, "content-type").unwrap_or_default())
         .map_err(|_| Error::new(415, "unsupported_media_type"))?
         .to_owned();
+    if !health {
+        request::validate_media(kind, &media)?;
+    }
     Ok((length, media))
 }
 
@@ -466,8 +486,8 @@ impl PcmFrame {
         }
     }
 
-    fn encode(&mut self, samples: &[f32]) -> &[u8] {
-        let length = wave::pcm_into(samples, &mut self.bytes[CHUNK_PREFIX..]).len();
+    fn encode(&mut self, samples: &[f32]) -> io::Result<&[u8]> {
+        let length = wave::pcm_into(samples, &mut self.bytes[CHUNK_PREFIX..])?.len();
         self.bytes[CHUNK_PREFIX - 2..CHUNK_PREFIX].copy_from_slice(b"\r\n");
         let mut first = CHUNK_PREFIX - 2;
         let mut size = length;
@@ -478,7 +498,7 @@ impl PcmFrame {
         }
         let end = CHUNK_PREFIX + length;
         self.bytes[end..end + 2].copy_from_slice(b"\r\n");
-        &self.bytes[first..end + 2]
+        Ok(&self.bytes[first..end + 2])
     }
 }
 
@@ -499,7 +519,7 @@ fn send_wave(peer: &mut TcpStream, samples: &[f32], header: &[u8; 44]) -> io::Re
 fn write_pcm(samples: &[f32], mut write: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
     let mut bytes = vec![0; wave::PCM_BYTES].into_boxed_slice();
     for samples in samples.chunks(wave::PCM_SAMPLES) {
-        write(wave::pcm_into(samples, &mut bytes))?;
+        write(wave::pcm_into(samples, &mut bytes)?)?;
     }
     Ok(())
 }
@@ -631,6 +651,58 @@ mod intake_tests {
         assert!(wire[4..].iter().all(|byte| *byte == 0));
         Ok(())
     }
+
+    #[test]
+    fn bearer_validation_rejects_mismatched_scheme_and_key() -> Result<(), Error> {
+        let key = [b'a'; 64];
+        let valid = format!(
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1:1234\r\nAuthorization: Bearer {}\r\n\r\n",
+            "a".repeat(64)
+        );
+        assert!(parse_head(valid.as_bytes(), 1234, &key, Kind::QwenTts)?.health);
+
+        for bad_auth in [
+            "Basic ".to_owned() + &"a".repeat(64),
+            "bearer ".to_owned() + &"a".repeat(64),
+            "Bearer ".to_owned() + &"b".repeat(64),
+            "Bearer ".to_owned() + &"a".repeat(63),
+            "Bearer ".to_owned() + &"a".repeat(65),
+        ] {
+            let head = format!(
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1:1234\r\nAuthorization: {bad_auth}\r\n\r\n"
+            );
+            assert_eq!(
+                parse_head(head.as_bytes(), 1234, &key, Kind::QwenTts).err(),
+                Some(Error::new(401, "unauthorized"))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_content_type_rejects_before_reading_request_body() -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let mut client = TcpStream::connect(("127.0.0.1", port))?;
+        let (mut peer, _) = listener.accept()?;
+        let key = [b'k'; 64];
+        // Advertise a body without sending any body bytes and keep the socket open:
+        // receive() must reject with 415 immediately after headers, not wait for the body.
+        let head = format!(
+            "POST /v1/audio/speech HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nContent-Length: 4096\r\nContent-Type: text/plain\r\n\r\n",
+            "k".repeat(64)
+        );
+        client.write_all(head.as_bytes())?;
+        let mut scratch = Scratch::default();
+        let err = super::receive(&mut peer, port, &key, Kind::QwenTts, &mut scratch).err();
+        scratch.recycle();
+        assert_eq!(err, Some(Error::new(415, "unsupported_media_type")));
+        assert!(scratch.wire.is_empty());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -690,7 +762,7 @@ mod pcm_tests {
                 }
                 let mut bytes = [0; 8];
                 assert_eq!(
-                    wave::pcm_into(samples, &mut bytes),
+                    wave::pcm_into(samples, &mut bytes)?,
                     &[1, 128, 0, 0, 0, 64, 255, 127]
                 );
                 Ok(())
@@ -753,7 +825,7 @@ mod pcm_tests {
     }
 
     #[test]
-    fn streaming_pcm_reuses_one_frame_across_hex_boundaries_and_shorter_tails() {
+    fn streaming_pcm_reuses_one_frame_across_hex_boundaries_and_shorter_tails() -> io::Result<()> {
         let mut frame = PcmFrame::new();
         let storage = frame.bytes.as_ptr();
         let samples = vec![0.5; wave::PCM_SAMPLES];
@@ -767,7 +839,7 @@ mod pcm_tests {
             wave::PCM_SAMPLES,
             1,
         ] {
-            let encoded = frame.encode(&samples[..count]);
+            let encoded = frame.encode(&samples[..count])?;
             let prefix = format!("{:x}\r\n", count * 2);
             assert_eq!(&encoded[..prefix.len()], prefix.as_bytes());
             assert_eq!(&encoded[encoded.len() - 2..], b"\r\n");
@@ -781,5 +853,6 @@ mod pcm_tests {
             );
             assert_eq!(frame.bytes.as_ptr(), storage);
         }
+        Ok(())
     }
 }

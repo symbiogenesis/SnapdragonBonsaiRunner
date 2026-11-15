@@ -4,13 +4,13 @@
 pub(super) use bonsai_windows_credentials::RetainedCredential as Credential;
 
 #[cfg(not(windows))]
-use std::{fs::File, io, path::Path};
+use std::{io, path::Path};
 
 #[cfg(not(windows))]
-pub(super) struct Credential {
-    key: [u8; 64],
-    _reader: File,
-}
+enum Never {}
+
+#[cfg(not(windows))]
+pub(super) struct Credential(Never);
 
 #[cfg(not(windows))]
 impl Credential {
@@ -22,13 +22,6 @@ impl Credential {
     }
 
     pub(super) const fn bytes(&self) -> &[u8; 64] {
-        &self.key
-    }
-}
-
-#[cfg(not(windows))]
-impl Drop for Credential {
-    fn drop(&mut self) {
-        self.key.fill(0);
+        match self.0 {}
     }
 }

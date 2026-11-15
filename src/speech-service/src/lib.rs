@@ -157,6 +157,21 @@ pub fn serve(engine: impl Engine, port: u16, key_file: &Path) -> io::Result<()> 
     serve_with_ready(engine, port, key_file, |_| Ok(()))
 }
 
+fn accept_next<T>(mut accept: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match accept() {
+            Ok(accepted) => return Ok(accepted),
+            Err(error) => match error.kind() {
+                io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => {}
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                _ => return Err(error),
+            },
+        }
+    }
+}
+
 /// Serves a loaded companion and invokes a value-free notification after binding.
 ///
 /// The callback runs only after credential validation and exclusive listening
@@ -182,7 +197,7 @@ pub fn serve_with_ready(
     on_ready(port)?;
     let mut scratch = http::Scratch::default();
     loop {
-        let (mut peer, address) = listener.accept()?;
+        let (mut peer, address) = accept_next(|| listener.accept())?;
         if address.ip() != Ipv4Addr::LOCALHOST {
             continue;
         }
@@ -192,6 +207,41 @@ pub fn serve_with_ready(
             credential.bytes(),
             &mut engine,
             &mut scratch,
+        );
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::accept_next;
+    use std::io;
+
+    #[test]
+    fn accept_next_retries_transient_errors_and_propagates_fatal_ones() {
+        let mut sequence = [
+            Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted")),
+            Err(io::Error::new(io::ErrorKind::ConnectionAborted, "aborted")),
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "would block")),
+            Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")),
+            Ok(42_u8),
+        ]
+        .into_iter();
+        let accepted = accept_next(|| {
+            sequence
+                .next()
+                .unwrap_or_else(|| Err(io::Error::other("exhausted")))
+        });
+        assert_eq!(accepted.ok(), Some(42));
+
+        let mut fatal_calls = 0_usize;
+        let fatal = accept_next(|| -> io::Result<u8> {
+            fatal_calls += 1;
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "fatal"))
+        });
+        assert_eq!(fatal_calls, 1);
+        assert_eq!(
+            fatal.err().map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
         );
     }
 }
