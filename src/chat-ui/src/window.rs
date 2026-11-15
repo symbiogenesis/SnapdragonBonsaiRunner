@@ -152,6 +152,7 @@ struct State {
     conversation_search: history_search::Search,
     active_conversation: u64,
     request_conversation: Option<u64>,
+    auto_continuing: bool,
     routing_request: bool,
     next_conversation: u64,
     rename_conversation: Option<(u64, String)>,
@@ -231,6 +232,7 @@ struct State {
     speaking_message: Option<u64>,
     streaming_read_aloud: bool,
     streaming_active: bool,
+    streaming_utf16: usize,
     streaming_suppressed: bool,
     streaming_svg_filter: svg_fence::StreamingSvgFilter,
     answer_complete: bool,
@@ -304,6 +306,7 @@ impl State {
             conversation_search: history_search::Search::default(),
             active_conversation: 1,
             request_conversation: None,
+            auto_continuing: false,
             routing_request: false,
             next_conversation: 2,
             rename_conversation: None,
@@ -382,6 +385,7 @@ impl State {
             speaking_message: None,
             streaming_read_aloud: false,
             streaming_active: false,
+            streaming_utf16: 0,
             streaming_suppressed: false,
             streaming_svg_filter: svg_fence::StreamingSvgFilter::new(),
             answer_complete: false,
@@ -570,6 +574,7 @@ impl State {
         self.worker = Some(start(config, incoming, events)?);
         self.commands = commands;
         self.events = incoming_events;
+        self.auto_continuing = false;
         self.set_status("Preparing your local model…", false);
         Ok(())
     }
@@ -703,6 +708,7 @@ impl State {
             self.transcript.start_turn(text, self.committed.len());
         }
         self.request_conversation = Some(self.active_conversation);
+        self.auto_continuing = false;
         self.touch_conversation(self.active_conversation);
         self.input.clear();
         self.place_composer_cursor(0);
@@ -905,6 +911,35 @@ impl State {
         }
     }
 
+    fn restore_committed_last_answer(&mut self) {
+        if let Some(answer) = self
+            .committed
+            .last()
+            .filter(|entry| entry.role == "assistant")
+        {
+            answer.content.as_ref().clone_into(&mut self.last_answer);
+            self.answer_complete = !self.transcript.latest_interrupted(&self.committed);
+        }
+    }
+
+    fn finish_streaming_speech(&mut self) {
+        if self.streaming_active {
+            if let Some(tail) = self.streaming_svg_filter.finish()
+                && !tail.is_empty()
+            {
+                let units = tail.encode_utf16().take(speech::MAX_TEXT + 1).count();
+                if units <= speech::MAX_TEXT.saturating_sub(self.streaming_utf16) {
+                    self.streaming_utf16 += units;
+                    self.speech_command(speech::Command::AppendStream { text: tail });
+                }
+            }
+            self.speech_command(speech::Command::FinishStream);
+        } else {
+            self.streaming_svg_filter.reset();
+        }
+        self.streaming_utf16 = 0;
+    }
+
     fn fail(&mut self, message: &str) {
         if matches!(
             self.model,
@@ -920,6 +955,7 @@ impl State {
     }
 
     fn fail_current_conversation(&mut self, message: &str) {
+        let auto_continuing = std::mem::replace(&mut self.auto_continuing, false);
         if !self.routing_request {
             self.stop_speech();
         }
@@ -931,10 +967,14 @@ impl State {
                 | ModelLifecycle::AwaitingTeardown
         );
         let adopted = mutating_turn && self.adopt_interrupted();
+        if mutating_turn && !adopted && auto_continuing {
+            self.transcript.discard_turn(self.committed.len());
+            self.restore_committed_last_answer();
+        }
         self.context_tokens = None;
         self.model = ModelLifecycle::Unavailable;
         self.transcript.remove_empty_response();
-        if !adopted && !self.transcript.latest_interrupted(&self.committed) {
+        if !adopted && !auto_continuing && !self.transcript.latest_interrupted(&self.committed) {
             self.retain_draft();
         }
         if mutating_turn {
@@ -944,31 +984,37 @@ impl State {
     }
 
     fn reject(&mut self, message: &str, text: &str, retry_required: bool) {
+        let auto_continuing = std::mem::replace(&mut self.auto_continuing, false);
         if !self.routing_request
             && let Some(id) = self.request_conversation
             && id != self.active_conversation
         {
-            // A worker can reject a queued Send after announcing teardown.
-            // Restore its prompt only to the conversation that sent it.
-            let mut restored = false;
-            if let Some(saved) = self
-                .conversations
-                .iter_mut()
-                .find(|conversation| conversation.id == id)
-                .and_then(|conversation| conversation.saved.as_mut())
-                && saved.input.is_empty()
-                && draft_buffer::fits(text)
-            {
-                text.clone_into(&mut saved.input);
-                restored = true;
-            }
-            if restored {
-                self.touch_conversation(id);
+            if !auto_continuing {
+                // A worker can reject a queued Send after announcing teardown.
+                // Restore its prompt only to the conversation that sent it.
+                let mut restored = false;
+                if let Some(saved) = self
+                    .conversations
+                    .iter_mut()
+                    .find(|conversation| conversation.id == id)
+                    .and_then(|conversation| conversation.saved.as_mut())
+                    && saved.input.is_empty()
+                    && draft_buffer::fits(text)
+                {
+                    text.clone_into(&mut saved.input);
+                    restored = true;
+                }
+                if restored {
+                    self.touch_conversation(id);
+                }
             }
             return;
         }
         let adopted = retry_required && self.adopt_interrupted();
-        if !retry_required {
+        if auto_continuing && !adopted {
+            self.transcript.discard_turn(self.committed.len());
+            self.restore_committed_last_answer();
+        } else if !retry_required {
             self.transcript.interrupt_turn(self.committed.len());
         }
         self.touch_conversation(self.active_or_routed_conversation());
@@ -979,17 +1025,24 @@ impl State {
             if self.model.stopping() && retry_required {
                 self.model = ModelLifecycle::AwaitingTeardown;
             }
-            if !adopted && self.input.is_empty() && draft_buffer::fits(text) {
+            if !adopted && !auto_continuing && self.input.is_empty() && draft_buffer::fits(text) {
                 text.clone_into(&mut self.input);
                 self.place_composer_cursor(self.input.chars().count());
             }
-            if !adopted {
+            if !adopted && !auto_continuing {
                 self.retain_draft();
             }
             return;
         }
         if !self.routing_request {
-            self.stop_speech();
+            if auto_continuing && !retry_required && self.stage.is_none() {
+                if self.streaming_active {
+                    self.speaking_message = self.transcript.messages.last().map(|entry| entry.id);
+                }
+                self.finish_streaming_speech();
+            } else {
+                self.stop_speech();
+            }
         }
         self.model = if retry_required {
             if self.model.retryable() {
@@ -1001,16 +1054,31 @@ impl State {
             ModelLifecycle::Ready
         };
         self.transcript.remove_empty_response();
-        if !adopted && self.input.is_empty() && draft_buffer::fits(text) {
+        if !adopted && !auto_continuing && self.input.is_empty() && draft_buffer::fits(text) {
             text.clone_into(&mut self.input);
             self.place_composer_cursor(self.input.chars().count());
         }
-        if !adopted {
+        if !adopted && !auto_continuing {
             self.retain_draft();
         }
-        self.set_status(if adopted { "Response interrupted. The partial reply is included in this conversation; retry the model to continue." } else { message }, true);
-        message.clone_into(&mut self.status_detail);
-        self.focus_composer = !retry_required;
+        if auto_continuing && !retry_required {
+            self.set_status(
+                "Response reached the selected output cap, including thinking. You can ask Swift to continue.",
+                false,
+            );
+            self.record(message);
+        } else {
+            self.set_status(
+                if adopted {
+                    "Response interrupted. The partial reply is included in this conversation; retry the model to continue."
+                } else {
+                    message
+                },
+                true,
+            );
+            message.clone_into(&mut self.status_detail);
+        }
+        self.focus_composer = !retry_required && !auto_continuing;
     }
 
     fn drain_events(&mut self) {
@@ -1061,11 +1129,13 @@ impl State {
         self.recovery_dirty = true;
         match event {
             Event::Starting => {
+                self.auto_continuing = false;
                 self.context_tokens = None;
                 self.model = ModelLifecycle::Preparing;
                 self.set_status("Preparing your local model…", false);
             }
             Event::Restarting => {
+                self.auto_continuing = false;
                 self.context_tokens = None;
                 self.model = ModelLifecycle::Restarting;
                 self.set_status("Restarting the local model…", false);
@@ -1082,6 +1152,7 @@ impl State {
             Event::ModelStopped => self.stopped_model(),
             Event::ContextCapacity(tokens) => self.context_tokens = Some(tokens),
             Event::Ready => {
+                self.auto_continuing = false;
                 self.model = ModelLifecycle::Ready;
                 self.set_status("Ready when you are.", false);
             }
@@ -1121,34 +1192,39 @@ impl State {
                 self.touch_conversation(self.active_or_routed_conversation());
             }
             Event::Complete(completion) => {
-                if self.streaming_active {
-                    if let Some(tail) = self.streaming_svg_filter.finish()
-                        && !tail.is_empty()
-                    {
-                        self.speech_command(speech::Command::AppendStream { text: tail });
-                    }
-                    self.speech_command(speech::Command::FinishStream);
-                } else {
-                    self.streaming_svg_filter.reset();
-                }
+                self.auto_continuing = false;
                 self.transcript.remove_empty_response();
                 self.model = ModelLifecycle::Ready;
                 self.answer_complete = true;
-                let message = match completion {
-                    Completion::Finished => "Ready when you are.",
+                match completion {
+                    Completion::Finished => {
+                        self.finish_streaming_speech();
+                        self.set_status("Ready when you are.", false);
+                        self.touch_conversation(self.active_or_routed_conversation());
+                    }
                     Completion::TokenLimit
                         if !self.retained_draft.is_empty()
                             && self.last_answer == self.retained_draft =>
                     {
-                        "Review did not finish. Your complete draft is retained."
+                        self.finish_streaming_speech();
+                        self.set_status(
+                            "Review did not finish. Your complete draft is retained.",
+                            false,
+                        );
+                        self.touch_conversation(self.active_or_routed_conversation());
                     }
                     Completion::TokenLimit => {
                         self.transcript.mark_token_limit(&self.committed);
-                        "Response reached the selected output cap, including thinking. You can ask Swift to continue."
+                        if !self.try_auto_continue() {
+                            self.finish_streaming_speech();
+                            self.set_status(
+                                "Response reached the selected output cap, including thinking. You can ask Swift to continue.",
+                                false,
+                            );
+                            self.touch_conversation(self.active_or_routed_conversation());
+                        }
                     }
-                };
-                self.set_status(message, completion == Completion::TokenLimit);
-                self.touch_conversation(self.active_or_routed_conversation());
+                }
             }
             Event::Failed(message) => self.fail(&message),
         }
@@ -1172,6 +1248,7 @@ impl State {
     }
 
     fn stopping_response(&mut self, text: &str) {
+        let auto_continuing = std::mem::replace(&mut self.auto_continuing, false);
         if !self.routing_request {
             self.stop_speech();
         }
@@ -1182,12 +1259,17 @@ impl State {
             ModelLifecycle::Stopping
         };
         let adopted = self.adopt_interrupted();
-        if !adopted && self.input.is_empty() && draft_buffer::fits(text) {
-            text.clone_into(&mut self.input);
-            self.place_composer_cursor(self.input.chars().count());
+        if !adopted {
+            if auto_continuing {
+                self.transcript.discard_turn(self.committed.len());
+                self.restore_committed_last_answer();
+            } else if self.input.is_empty() && draft_buffer::fits(text) {
+                text.clone_into(&mut self.input);
+                self.place_composer_cursor(self.input.chars().count());
+            }
         }
         self.transcript.remove_empty_response();
-        if !adopted {
+        if !adopted && !auto_continuing {
             self.retain_draft();
         }
         self.set_status(
@@ -1201,12 +1283,14 @@ impl State {
     }
 
     fn stopped_response(&mut self) {
+        self.auto_continuing = false;
         self.model = ModelLifecycle::Ready;
         self.set_status(client::STOPPED_MESSAGE, false);
         self.focus_composer = true;
     }
 
     fn stopped_model(&mut self) {
+        self.auto_continuing = false;
         self.context_tokens = None;
         self.model = ModelLifecycle::Stopped;
         self.set_status("Local model stopped.", false);
@@ -1251,6 +1335,7 @@ impl State {
         self.speech_loading = false;
         self.speaking_message = None;
         self.streaming_active = false;
+        self.streaming_utf16 = 0;
         self.streaming_suppressed = true;
         "Speech worker stopped. Restart the app to retry.".clone_into(&mut self.speech_status);
         self.speech_notice = true;
@@ -1279,6 +1364,7 @@ impl State {
         self.speech_loading = false;
         self.speaking_message = None;
         self.streaming_active = false;
+        self.streaming_utf16 = 0;
         self.streaming_suppressed = true;
         self.streaming_svg_filter.reset();
     }

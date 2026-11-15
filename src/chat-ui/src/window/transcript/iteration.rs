@@ -127,6 +127,27 @@ impl Transcript {
         self.clear_turn(prefix);
     }
 
+    pub(in crate::window) fn discard_turn(&mut self, prefix: usize) {
+        let Some(prompt_index) = self.messages.iter().rposition(|message| {
+            message.role == Role::User
+                && message.history_index.is_none()
+                && (message.turn_prefix == Some(prefix) || message.retry_prefix == Some(prefix))
+        }) else {
+            return;
+        };
+        if !self.messages[prompt_index..].iter().all(|message| {
+            message.history_index.is_none()
+                && (message.turn_prefix.is_none() || message.turn_prefix == Some(prefix))
+        }) {
+            return;
+        }
+        for message in self.messages.drain(prompt_index..) {
+            self.text_bytes = self.text_bytes.saturating_sub(message.text_bytes());
+        }
+        self.history_revision = self.history_revision.wrapping_add(1);
+        self.search.invalidate();
+    }
+
     /// Adopt only a locally identified turn, never a text-matched legacy turn.
     /// No request is sent: the next explicit send restores this history first.
     pub(in crate::window) fn adopt_interrupted(

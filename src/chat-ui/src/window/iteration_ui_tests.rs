@@ -310,6 +310,8 @@ fn token_limit_response_offers_continue_and_retry_buttons_at_minimum_width() {
         chat.run();
 
         assert!(chat.query_by_label("Max length").is_some());
+        assert!(chat.query_by_label("Model needs attention").is_none());
+        assert!(chat.query_by_label("1 alert").is_none());
         let continue_rect = chat
             .get_by_role_and_label(egui::Role::Button, "Continue response")
             .rect();
@@ -418,4 +420,75 @@ fn interrupted_partial_response_offers_visible_continue_and_retry_buttons() {
         ));
         assert_eq!(chat.state().app.input, "Unsent followup");
     }
+}
+
+#[test]
+fn token_limit_automatically_continues_without_alerting_while_context_window_has_capacity() {
+    let mut chat = harness([1180.0, 860.0]);
+    chat.state_mut().app.context_tokens = Some(131_072);
+    chat.state_mut().app.input = "Write a comprehensive guide".into();
+    chat.state_mut().app.submit();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { .. })
+    ));
+    chat.state_mut().app.input = "Draft for after completion 🌱".into();
+    chat.state_mut()
+        .app
+        .model_event(Event::Text("Section 1 hit the reply cap.".into()));
+    let mut committed = chat.state().app.committed.clone();
+    committed.push(client::Message {
+        role: "user",
+        content: "Write a comprehensive guide".into(),
+        reasoning_content: None,
+    });
+    committed.push(client::Message {
+        role: "assistant",
+        content: "Section 1 hit the reply cap.".into(),
+        reasoning_content: None,
+    });
+    chat.state_mut()
+        .app
+        .model_event(Event::Committed(committed));
+    chat.state_mut()
+        .app
+        .model_event(Event::Complete(Completion::TokenLimit));
+    chat.run();
+
+    assert!(chat.query_by_label("Model needs attention").is_none());
+    assert!(chat.query_by_label("1 alert").is_none());
+    assert!(chat.state().app.model.busy());
+    assert_eq!(chat.state().app.input, "Draft for after completion 🌱");
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { text, .. }) if text == iteration::CONTINUE_PROMPT
+    ));
+    assert!(chat.state().commands.try_recv().is_err());
+
+    chat.state_mut()
+        .app
+        .model_event(Event::Text("Section 2 completed the guide.".into()));
+    let mut final_committed = chat.state().app.committed.clone();
+    final_committed.push(client::Message {
+        role: "user",
+        content: iteration::CONTINUE_PROMPT.into(),
+        reasoning_content: None,
+    });
+    final_committed.push(client::Message {
+        role: "assistant",
+        content: "Section 2 completed the guide.".into(),
+        reasoning_content: None,
+    });
+    chat.state_mut()
+        .app
+        .model_event(Event::Committed(final_committed));
+    chat.state_mut()
+        .app
+        .model_event(Event::Complete(Completion::Finished));
+    chat.run();
+
+    assert_eq!(chat.state().app.model, ModelLifecycle::Ready);
+    assert!(chat.query_by_label("Model needs attention").is_none());
+    assert_eq!(chat.state().app.input, "Draft for after completion 🌱");
+    assert!(chat.state().commands.try_recv().is_err());
 }

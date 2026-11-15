@@ -32,7 +32,7 @@ use input::Input;
 use segmentation::segments;
 
 const POLL: Duration = Duration::from_millis(50);
-const MAX_TEXT: usize = 32768;
+pub(crate) const MAX_TEXT: usize = 32768;
 // Short clips keep CPU synthesis within its bounded request deadline. The HTTP
 // companion accepts larger inputs, but a readout retains and sequences all text.
 const MAX_SEGMENT: usize = 256;

@@ -76,17 +76,28 @@ impl State {
                 return;
             }
             self.streaming_active = true;
+            self.streaming_utf16 = 0;
             self.speaking = true;
             self.speech_loading = true;
             self.speaking_message = self.transcript.messages.last().map(|message| message.id);
             self.speech_notice = false;
             "Reading the response as it arrives.".clone_into(&mut self.speech_status);
         }
+        let units = text.encode_utf16().take(speech::MAX_TEXT + 1).count();
+        if units > speech::MAX_TEXT.saturating_sub(self.streaming_utf16) {
+            self.speech_command(speech::Command::FinishStream);
+            self.streaming_active = false;
+            self.streaming_utf16 = 0;
+            self.streaming_suppressed = true;
+            return;
+        }
+        self.streaming_utf16 += units;
         self.speech_command(speech::Command::AppendStream { text });
     }
 
     pub(super) fn replace_streaming_stage(&mut self) {
         self.streaming_svg_filter.reset();
+        self.streaming_utf16 = 0;
         if self.streaming_active {
             self.stop_speech();
             self.streaming_suppressed = false;
@@ -293,6 +304,92 @@ mod tests {
         state.model_event(client::Event::Complete(client::Completion::Finished));
         let svg_only_id = state.transcript.messages[1].id;
         assert_eq!(state.transcript.speech_text(svg_only_id), None);
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_read_aloud_stays_continuous_across_automatic_token_limit_continuations()
+    -> io::Result<()> {
+        let (mut state, speech_commands) = fixture()?;
+        let (model_commands, incoming_model) = mpsc::channel();
+        state.commands = model_commands;
+        state.context_tokens = Some(65_536);
+        state.model = ModelLifecycle::Ready;
+        state.transcript.clear();
+        state.toggle_streaming_read_aloud();
+
+        state.input = "Read a two-part story".to_owned();
+        state.submit();
+        assert!(matches!(
+            incoming_model.try_recv(),
+            Ok(client::Command::Send { .. })
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopSpeaking
+        ));
+
+        state.model_event(client::Event::Text("First part. ".to_owned()));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::BeginStream { .. }
+        ));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "First part. ")
+        );
+
+        let first_committed = vec![
+            client::Message {
+                role: "user",
+                content: "Read a two-part story".into(),
+                reasoning_content: None,
+            },
+            client::Message {
+                role: "assistant",
+                content: "First part. ".into(),
+                reasoning_content: None,
+            },
+        ];
+        state.model_event(client::Event::Committed(first_committed.clone()));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+
+        assert!(state.model.busy() && state.streaming_active);
+        assert!(matches!(
+            incoming_model.try_recv(),
+            Ok(client::Command::Send { .. })
+        ));
+        // Part 1 is not cut off with StopSpeaking or closed early with FinishStream.
+        assert!(
+            speech_commands
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+
+        state.model_event(client::Event::Text("Second part.".to_owned()));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Second part.")
+        );
+        let mut second_committed = first_committed;
+        second_committed.push(client::Message {
+            role: "user",
+            content: crate::window::iteration::CONTINUE_PROMPT.into(),
+            reasoning_content: None,
+        });
+        second_committed.push(client::Message {
+            role: "assistant",
+            content: "Second part.".into(),
+            reasoning_content: None,
+        });
+        state.model_event(client::Event::Committed(second_committed));
+        state.model_event(client::Event::Complete(client::Completion::Finished));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::FinishStream
+        ));
         Ok(())
     }
 }

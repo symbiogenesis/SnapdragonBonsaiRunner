@@ -279,8 +279,14 @@ recovery and model history keep the original response bytes.
 **Continue response** and **Retry response** appear directly beneath an identified
 interrupted or reply-length-capped answer, and **Retry response** appears beneath
 an identified unanswered prompt (**Continue response** stays on the latest
-incomplete answer in context). The original prompt can also remain in the composer for
-editing; these controls preserve whatever
+incomplete answer in context). When a visible reply reaches the selected output cap
+and the broker-reported context window has estimated capacity for a continuation and
+reply reservation, Swift automatically sends that continuation turn without raising a
+model alert, preserving your draft, cursor and active read-aloud stream. If the
+context window lacks room (or an unanswered automatic continuation is stopped or
+rejected for capacity), the capped turn settles cleanly with **Continue response**
+and **Retry response** available on its card. The original prompt can also remain in
+the composer for editing; these controls preserve whatever
 is currently in the composer. An unanswered prompt keeps its existing card when
 retried. Starting a different message removes that prompt's retry control.
 During model preparation or teardown, message footer controls stay disabled. After confirmed

@@ -1,7 +1,7 @@
 //! Explicit message iteration preserves the source conversation and exact history.
 use super::{Command, Conversation, INPUT_LIMIT, ModelLifecycle, State, Transcript, egui};
 
-const CONTINUE_PROMPT: &str = "Continue your previous response from where it stopped, without repeating what you already wrote.";
+pub(super) const CONTINUE_PROMPT: &str = "Continue your previous response from where it stopped, without repeating what you already wrote.";
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum MessageAction {
@@ -136,6 +136,86 @@ impl State {
             }
             _ => {}
         }
+    }
+
+    pub(super) fn try_auto_continue(&mut self) -> bool {
+        if self.preview
+            || self.model != ModelLifecycle::Ready
+            || self
+                .updates
+                .as_ref()
+                .is_some_and(super::updates::Updates::installing)
+            || self.last_answer.trim().is_empty()
+            || self.committed.len() >= 127
+            || !self
+                .transcript
+                .messages
+                .last()
+                .is_some_and(|message| message.can_continue(&self.committed))
+        {
+            return false;
+        }
+        let Some(capacity) = self.context_tokens else {
+            return false;
+        };
+        let max_completion_tokens = super::OUTPUT_TOKENS
+            .get(self.output_budget)
+            .copied()
+            .unwrap_or(4096);
+        let history_tokens = *self
+            .context_history
+            .get_or_insert_with(|| crate::context::history_tokens(&self.committed));
+        let estimate = crate::context::Estimate::new(
+            history_tokens,
+            CONTINUE_PROMPT,
+            max_completion_tokens,
+            self.extra_effort,
+            Some(capacity),
+        );
+        if estimate.overflow() > 0 {
+            return false;
+        }
+        if !self.routing_request {
+            self.restore_selected_history();
+            if self.model != ModelLifecycle::Ready {
+                return true;
+            }
+        }
+        if self
+            .commands
+            .send(Command::Send {
+                text: CONTINUE_PROMPT.to_owned(),
+                max_completion_tokens,
+                extra_effort: self.extra_effort,
+                enable_thinking: self.enable_thinking,
+                abliteration_scale: self.abliteration_scale,
+            })
+            .is_err()
+        {
+            self.fail("The model worker stopped. Close and restart the app.");
+            return true;
+        }
+        self.last_answer.clear();
+        self.retained_draft.clear();
+        self.stage = None;
+        self.answer_complete = false;
+        if !self.streaming_active {
+            self.streaming_svg_filter.reset();
+            self.streaming_suppressed =
+                self.routing_request || !self.speech_output || self.speaking;
+        }
+        let owner = self.active_or_routed_conversation();
+        self.transcript
+            .start_turn(CONTINUE_PROMPT.to_owned(), self.committed.len());
+        if self.streaming_active {
+            self.speaking_message = self.transcript.messages.last().map(|message| message.id);
+        }
+        self.request_conversation = Some(owner);
+        self.touch_conversation(owner);
+        self.model = ModelLifecycle::Generating;
+        self.auto_continuing = true;
+        self.set_status("Continuing response…", false);
+        true
     }
 
     fn retry_response(&mut self, id: u64) {
@@ -735,6 +815,244 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("retained draft missing"))?;
         assert!(!final_answer.token_limit);
         assert!(!final_answer.can_continue(&state.committed));
+        assert!(!state.warning);
         Ok(())
+    }
+
+    #[test]
+    fn token_limit_auto_continues_within_context_capacity_without_alerting_and_stops_when_full()
+    -> std::io::Result<()> {
+        let entry = |role, content: &str| client::Message {
+            role,
+            content: content.into(),
+            reasoning_content: None,
+        };
+        let (mut state, commands) = fixture();
+        state.context_tokens = Some(131_072);
+        state.extra_effort = false;
+        state.input = "Long walkthrough".into();
+        state.submit();
+        assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
+
+        state.input = "Keep my next draft 🌱".into();
+        state.place_composer_cursor(6);
+        let cursor = (state.composer_cursor, state.pending_cursor);
+
+        state.model_event(client::Event::Text("Part one.".into()));
+        let mut committed = state.committed.clone();
+        committed.push(entry("user", "Long walkthrough"));
+        committed.push(entry("assistant", "Part one."));
+        state.model_event(client::Event::Committed(committed));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+
+        assert_eq!(state.model, ModelLifecycle::Generating);
+        assert!(state.auto_continuing);
+        assert!(!state.warning);
+        assert!(state.active_alerts().is_empty());
+        assert_eq!(state.input, "Keep my next draft 🌱");
+        assert_eq!((state.composer_cursor, state.pending_cursor), cursor);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Send {
+                text,
+                enable_thinking: true,
+                extra_effort: false,
+                max_completion_tokens: 1024,
+                ..
+            }) if text == CONTINUE_PROMPT
+        ));
+        assert!(commands.try_recv().is_err());
+
+        // Shrink reported capacity so the next output reservation no longer fits.
+        state.context_tokens = Some(1_024);
+        state.model_event(client::Event::Text("Part two.".into()));
+        let mut second = state.committed.clone();
+        second.push(entry("user", CONTINUE_PROMPT));
+        second.push(entry("assistant", "Part two."));
+        state.model_event(client::Event::Committed(second));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+
+        assert_eq!(state.model, ModelLifecycle::Ready);
+        assert!(!state.auto_continuing);
+        assert!(!state.warning);
+        assert!(state.active_alerts().is_empty());
+        assert!(commands.try_recv().is_err());
+        let capped = state
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| std::io::Error::other("second capped answer missing"))?;
+        assert!(capped.token_limit);
+        assert!(capped.can_continue(&state.committed));
+        assert_eq!(state.input, "Keep my next draft 🌱");
+        Ok(())
+    }
+
+    #[test]
+    fn auto_continue_rejection_and_early_stop_discard_synthetic_prompt_and_keep_empty_composer()
+    -> std::io::Result<()> {
+        let entry = |role, content: &str| client::Message {
+            role,
+            content: content.into(),
+            reasoning_content: None,
+        };
+        let (mut state, commands) = fixture();
+        state.context_tokens = Some(32_768);
+        state.extra_effort = false;
+        state.input = "Write a guide".into();
+        state.submit();
+        assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
+        assert!(state.input.is_empty());
+
+        state.model_event(client::Event::Text("Part one.".into()));
+        let mut committed = state.committed.clone();
+        committed.push(entry("user", "Write a guide"));
+        committed.push(entry("assistant", "Part one."));
+        state.model_event(client::Event::Committed(committed));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Send { text, .. }) if text == CONTINUE_PROMPT
+        ));
+        assert!(state.auto_continuing);
+
+        // Exact broker count rejection on the automatic continuation cleans up silently.
+        state.model_event(client::Event::Rejected {
+            message: "Context limit reached.".into(),
+            text: CONTINUE_PROMPT.into(),
+            retry_required: false,
+        });
+        assert_eq!(state.model, ModelLifecycle::Ready);
+        assert!(!state.warning);
+        assert!(state.active_alerts().is_empty());
+        assert!(state.input.is_empty());
+        assert_eq!(state.last_answer, "Part one.");
+        let last = state
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| std::io::Error::other("capped answer missing"))?;
+        assert_eq!(last.body, "Part one.");
+        assert!(last.can_continue(&state.committed));
+
+        // Thinking-only TokenLimit (no visible text) does not loop automatic continuations.
+        state.input = "Hard puzzle".into();
+        state.submit();
+        assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
+        state.model_event(client::Event::Reasoning("All budget spent thinking".into()));
+        let mut thinking_only = state.committed.clone();
+        thinking_only.push(entry("user", "Hard puzzle"));
+        thinking_only.push(client::Message {
+            role: "assistant",
+            content: "".into(),
+            reasoning_content: Some("All budget spent thinking".into()),
+        });
+        state.model_event(client::Event::Committed(thinking_only));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+        assert_eq!(state.model, ModelLifecycle::Ready);
+        assert!(!state.warning);
+        assert!(commands.try_recv().is_err());
+
+        // Stopping an automatic continuation before prose arrives also discards the synthetic prompt.
+        state.input = "Another long guide".into();
+        state.submit();
+        assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
+        state.model_event(client::Event::Text("First section.".into()));
+        let mut third = state.committed.clone();
+        third.push(entry("user", "Another long guide"));
+        third.push(entry("assistant", "First section."));
+        state.model_event(client::Event::Committed(third));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+        assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
+        state.stop_generation();
+        assert!(matches!(commands.try_recv(), Ok(Command::Stop)));
+        state.model_event(client::Event::Stopping(CONTINUE_PROMPT.into()));
+        state.model_event(client::Event::Stopped);
+        assert_eq!(state.model, ModelLifecycle::Ready);
+        assert!(!state.warning);
+        assert!(state.input.is_empty());
+        let stopped_last = state
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| std::io::Error::other("first section missing"))?;
+        assert_eq!(stopped_last.body, "First section.");
+        assert!(stopped_last.can_continue(&state.committed));
+        Ok(())
+    }
+
+    #[test]
+    fn background_token_limit_auto_continues_owner_and_defers_selected_history_restore() {
+        let (mut state, commands) = fixture();
+        state.context_tokens = Some(65_536);
+        state.extra_effort = false;
+        let owner = state.active_conversation;
+        state.input = "Background walkthrough".into();
+        state.submit();
+        assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
+        state.input = "Owner draft".into();
+
+        state.new_chat();
+        let selected = state.active_conversation;
+        state.input = "Selected draft 🌱".into();
+        assert!(state.restore_history);
+
+        state.model_event(client::Event::Text("Background part one.".into()));
+        let mut owner_history = state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == owner)
+            .and_then(|conversation| conversation.saved.as_ref())
+            .map(|saved| saved.committed.clone())
+            .unwrap_or_default();
+        owner_history.push(client::Message {
+            role: "user",
+            content: "Background walkthrough".into(),
+            reasoning_content: None,
+        });
+        owner_history.push(client::Message {
+            role: "assistant",
+            content: "Background part one.".into(),
+            reasoning_content: None,
+        });
+        state.model_event(client::Event::Committed(owner_history.clone()));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+
+        assert_eq!(state.active_conversation, selected);
+        assert_eq!(state.request_conversation, Some(owner));
+        assert_eq!(state.model, ModelLifecycle::Generating);
+        assert!(state.restore_history);
+        assert!(!state.warning);
+        assert_eq!(state.input, "Selected draft 🌱");
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Send { text, .. }) if text == CONTINUE_PROMPT
+        ));
+        assert!(commands.try_recv().is_err());
+
+        state.model_event(client::Event::Text("Background part two.".into()));
+        owner_history.push(client::Message {
+            role: "user",
+            content: CONTINUE_PROMPT.into(),
+            reasoning_content: None,
+        });
+        owner_history.push(client::Message {
+            role: "assistant",
+            content: "Background part two.".into(),
+            reasoning_content: None,
+        });
+        state.model_event(client::Event::Committed(owner_history));
+        state.model_event(client::Event::Complete(client::Completion::Finished));
+
+        assert_eq!(state.model, ModelLifecycle::Ready);
+        assert!(!state.restore_history);
+        assert!(
+            matches!(commands.try_recv(), Ok(Command::RestoreChat(history)) if history.is_empty())
+        );
+        assert!(commands.try_recv().is_err());
+        state.switch_conversation(owner);
+        assert_eq!(state.input, "Owner draft");
+        assert_eq!(state.committed.len(), 8);
+        assert_eq!(state.last_answer, "Background part two.");
     }
 }
