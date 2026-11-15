@@ -20,6 +20,8 @@ pub(super) const ADAPTER_SHA256: &str =
     "f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42";
 pub(super) const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
+pub(super) const MMPROJ_SHA256: &str =
+    "28e6426fe933262e362bfbe3054f973d9deac116f49e7e342d1a7748b44c1904";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KvCache {
@@ -314,6 +316,20 @@ fn reset_on_cancel_release_matches(release: &ReleasePin) -> bool {
 pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
     let pin = release(LOCK)?;
     Ok(reset_on_cancel_release_matches(&pin))
+}
+
+// Multimodal image/mmproj support requires a separately reviewed native release
+// that implements vision projector loading, image embedding injection and the
+// matching readiness identity fields. Pinned 0.1.28 stays text-only.
+const VISION_RELEASE: Option<(&str, &str)> = None;
+
+fn vision_release_matches(release: &ReleasePin) -> bool {
+    reviewed_release_matches(release, VISION_RELEASE)
+}
+
+pub(super) fn vision_supported() -> Result<bool, LaunchError> {
+    let pin = release(LOCK)?;
+    Ok(vision_release_matches(&pin))
 }
 
 pub(super) fn pinned_version() -> Result<String, LaunchError> {
@@ -653,6 +669,8 @@ mod tests {
             Err(LaunchError::Artifacts)
         );
         assert!(prompt_reuse_supported(&pin, false).is_ok());
+        assert!(!vision_supported()?);
+        assert!(!vision_release_matches(&pin));
         Ok(())
     }
 }

@@ -115,6 +115,8 @@ pub struct LaunchPlan {
     pub arguments: Vec<OsString>,
     /// Whole-model path verified before launch.
     pub model_path: PathBuf,
+    /// Optional verified vision projector identity for Swift multimodal launch.
+    pub mmproj: Option<bonsai_cpu_policy::SwiftMmprojArtifact>,
     /// Optional pinned adapter identity; never an arbitrary caller-supplied path.
     pub adapter: Option<bonsai_cpu_policy::AbliterateLoraArtifact>,
     /// Pinned archive path verified before launch.
@@ -151,6 +153,36 @@ impl LaunchPlan {
         self.context_tokens = context.context_tokens;
         self.memory_limit_bytes = context.memory_limit_bytes;
         self.required_available_bytes = context.required_available_bytes;
+        Ok(())
+    }
+
+    /// Enable the verified Swift vision projector (`mmproj`) on this interactive launch.
+    #[cfg(windows)]
+    pub(crate) fn enable_swift_mmproj(
+        &mut self,
+        mmproj: bonsai_cpu_policy::SwiftMmprojArtifact,
+    ) -> Result<(), PolicyError> {
+        if self.arguments.iter().any(|argument| argument == "--mmproj") {
+            return Err(PolicyError::Configuration);
+        }
+        validate_external_path(&mmproj.path)?;
+        let _path_text = mmproj.path.to_str().ok_or(PolicyError::Path)?;
+        let index = self
+            .arguments
+            .iter()
+            .position(|argument| argument == "--no-mmproj")
+            .ok_or(PolicyError::Configuration)?;
+        self.arguments.splice(
+            index..=index,
+            [
+                OsString::from("--mmproj"),
+                mmproj.path.as_os_str().to_owned(),
+                OsString::from("--no-mmproj-offload"),
+                OsString::from("--image-max-tokens"),
+                OsString::from(bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS.to_string()),
+            ],
+        );
+        self.mmproj = Some(mmproj);
         Ok(())
     }
 
@@ -259,6 +291,7 @@ impl LaunchPlan {
             executable,
             arguments,
             model_path,
+            mmproj: None,
             adapter,
             archive_path,
             runtime_directory,
@@ -824,5 +857,59 @@ mod tests {
             assert!(parse_swift_pins(&changed).is_err());
         }
         assert!(parse_pins(SWIFT_LOCK_JSON).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enable_swift_mmproj_replaces_no_mmproj_with_bounded_image_tokens() -> Result<(), PolicyError>
+    {
+        let data = std::env::temp_dir().join("Bonsai-launch-policy-mmproj");
+        let key = data.join("backend.key");
+        let mut plan = LaunchPlan::for_profile_with_options(
+            &data,
+            8081,
+            &key,
+            LaunchProfile::SwiftPq2Assessment,
+            false,
+            false,
+        )?;
+        assert!(plan.mmproj.is_none());
+        assert!(plan.arguments.iter().any(|arg| arg == "--no-mmproj"));
+        let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&data)
+            .map_err(|_| PolicyError::Configuration)?;
+        let expected_path = mmproj.path.clone();
+        plan.enable_swift_mmproj(mmproj.clone())?;
+        assert!(!plan.arguments.iter().any(|arg| arg == "--no-mmproj"));
+        assert!(
+            plan.mmproj
+                .as_ref()
+                .is_some_and(|item| item.path == expected_path)
+        );
+        let expected_flag_pos = plan
+            .arguments
+            .iter()
+            .position(|arg| arg == "--mmproj")
+            .ok_or(PolicyError::Configuration)?;
+        assert_eq!(
+            plan.arguments.get(expected_flag_pos + 1),
+            Some(expected_path.as_os_str()).map(OsString::from).as_ref()
+        );
+        assert_eq!(
+            plan.arguments.get(expected_flag_pos + 2),
+            Some(&OsString::from("--no-mmproj-offload"))
+        );
+        assert_eq!(
+            plan.arguments.get(expected_flag_pos + 3),
+            Some(&OsString::from("--image-max-tokens"))
+        );
+        assert_eq!(
+            plan.arguments.get(expected_flag_pos + 4),
+            Some(&OsString::from("1024"))
+        );
+        assert_eq!(
+            plan.enable_swift_mmproj(mmproj),
+            Err(PolicyError::Configuration)
+        );
+        Ok(())
     }
 }

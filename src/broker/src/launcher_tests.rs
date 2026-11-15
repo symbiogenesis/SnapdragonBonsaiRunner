@@ -156,6 +156,7 @@ fn owned_ready_backend_stops_with_service() -> io::Result<()> {
             credentials,
             _artifacts: VerifiedArtifacts::synthetic_for_test(),
             _adapter: None,
+            _mmproj: None,
             _native_executable: None,
             memory_limit_bytes: PROBE_MEMORY,
             backend_port: port,

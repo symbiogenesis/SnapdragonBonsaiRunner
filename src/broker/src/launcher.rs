@@ -56,6 +56,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--kv-cache f16|rsq4|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
     "  [--placement auto|cpu] (native Swift only; CPU requires a reviewed compatible release)\n",
     "  [--reset-on-cancel] (reviewed native runtime only; reset live state in place on client cancel)\n",
+    "  [--no-mmproj] (disable multimodal vision projector; Swift only)\n",
     "  [--use-abliterate-lora] (pinned adapter; request scale 0..2, default 1.3; Swift CPU only)\n",
     "  [--use-repacked-ptq1|--use-original-pq2] (mutually exclusive weight selections; Swift CPU only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
@@ -138,6 +139,7 @@ pub struct LaunchConfig {
     kv_cache: Option<crate::inference::KvCache>,
     placement: crate::inference::Placement,
     reset_on_cancel: bool,
+    no_mmproj: bool,
     use_abliterate_lora: bool,
     weight_representation: WeightRepresentation,
 }
@@ -162,6 +164,7 @@ impl LaunchConfig {
         let (mut native_row_workers, mut latest_prompt_reuse) = (None, None);
         let (mut kv_cache, mut placement) = (None, None);
         let mut reset_on_cancel = false;
+        let mut no_mmproj = false;
         let mut use_abliterate_lora = false;
         let mut use_repacked_ptq1 = None;
         let mut profile = None;
@@ -192,6 +195,9 @@ impl LaunchConfig {
                 }
                 Some("--reset-on-cancel") if !reset_on_cancel => {
                     reset_on_cancel = true;
+                }
+                Some("--no-mmproj") if !no_mmproj => {
+                    no_mmproj = true;
                 }
                 Some("--use-abliterate-lora") if !use_abliterate_lora => {
                     use_abliterate_lora = true;
@@ -251,6 +257,7 @@ impl LaunchConfig {
             kv_cache,
             placement,
             reset_on_cancel,
+            no_mmproj,
             use_abliterate_lora,
             weight_representation: if use_repacked_ptq1.unwrap_or(false) {
                 WeightRepresentation::CurrentRepackedPtq1
@@ -275,6 +282,7 @@ impl LaunchConfig {
             || (self.native_row_workers == 4 && !self.native_engine)
             || (self.latest_prompt_reuse && !self.native_engine)
             || (self.reset_on_cancel && !self.native_engine)
+            || (self.no_mmproj && !swift)
             || (self.use_abliterate_lora && !swift)
             || (explicit_weight && !swift)
         {
@@ -327,28 +335,43 @@ impl LaunchConfig {
             && (!self.native_engine || crate::inference::memory_context_supported()?))
     }
 
+    fn runtime_supports_vision(&self) -> Result<bool, LaunchError> {
+        Ok(self.memory_context_supported()?
+            && !self.no_mmproj
+            && (!self.native_engine || crate::inference::vision_supported()?))
+    }
+
+    fn swift_context_profile(
+        &self,
+    ) -> Result<bonsai_cpu_policy::context::SwiftContextProfile, LaunchError> {
+        use bonsai_cpu_policy::context::SwiftContextProfile;
+        if self.native_engine {
+            match self.kv_cache {
+                Some(crate::inference::KvCache::Rsq4)
+                    if crate::inference::full_context_supported()? =>
+                {
+                    Ok(SwiftContextProfile::NativeRsq4Full)
+                }
+                Some(crate::inference::KvCache::Rsq4) => Ok(SwiftContextProfile::NativeRsq4),
+                Some(crate::inference::KvCache::Rsq4K3v) => Ok(SwiftContextProfile::NativeRsq4K3v),
+                Some(crate::inference::KvCache::F16) | None => Ok(SwiftContextProfile::NativeF16),
+            }
+        } else {
+            Ok(SwiftContextProfile::PublisherF16)
+        }
+    }
+
     // Call only after the exact released runtime's context and cache-accounting
     // contract is admitted. Cache selection remains immutable through retry.
     fn swift_context_plan(
         &self,
         available_bytes: u64,
     ) -> Result<bonsai_cpu_policy::context::SwiftContextPlan, LaunchError> {
-        use bonsai_cpu_policy::context::{SwiftContextPlan, SwiftContextProfile};
-        let profile = if self.native_engine {
-            match self.kv_cache {
-                Some(crate::inference::KvCache::Rsq4)
-                    if crate::inference::full_context_supported()? =>
-                {
-                    SwiftContextProfile::NativeRsq4Full
-                }
-                Some(crate::inference::KvCache::Rsq4) => SwiftContextProfile::NativeRsq4,
-                Some(crate::inference::KvCache::Rsq4K3v) => SwiftContextProfile::NativeRsq4K3v,
-                Some(crate::inference::KvCache::F16) | None => SwiftContextProfile::NativeF16,
-            }
-        } else {
-            SwiftContextProfile::PublisherF16
-        };
-        SwiftContextPlan::for_profile(available_bytes, profile).map_err(|_| LaunchError::Memory)
+        bonsai_cpu_policy::context::SwiftContextPlan::for_profile(
+            available_bytes,
+            self.swift_context_profile()?,
+        )
+        .map_err(|_| LaunchError::Memory)
     }
 
     fn initial_memory_admission(&self, plan: &LaunchPlan) -> Result<(), LaunchError> {
@@ -380,6 +403,7 @@ impl LaunchConfig {
         let _native_executable = self.native_executable_guard()?;
         let _artifacts = self.verify_artifacts(&plan)?;
         let _adapter = Self::adapter_guard(&plan)?;
+        let _mmproj = self.mmproj_guard()?;
         let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
         let memory_admitted = if self.memory_context_supported()? {
             self.swift_context_plan(available).is_ok()
@@ -428,6 +452,38 @@ impl LaunchConfig {
                 .map_err(|_| LaunchError::Adapter)
             })
             .transpose()
+    }
+
+    fn mmproj_guard(
+        &self,
+    ) -> Result<
+        Option<(
+            bonsai_cpu_policy::SwiftMmprojArtifact,
+            bonsai_artifacts::VerifiedFile,
+        )>,
+        LaunchError,
+    > {
+        if !self.runtime_supports_vision()? {
+            return Ok(None);
+        }
+        let artifact = bonsai_cpu_policy::swift_mmproj_artifact(&self.data)
+            .map_err(|_| LaunchError::Policy)?;
+        bonsai_artifacts::validate_external_path(&artifact.path).map_err(|_| LaunchError::Path)?;
+        match std::fs::symlink_metadata(&artifact.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(LaunchError::Artifacts),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(LaunchError::Artifacts);
+            }
+            Ok(_) => {}
+        }
+        let guard = bonsai_artifacts::VerifiedFile::verify(
+            &artifact.path,
+            artifact.bytes,
+            &artifact.sha256,
+        )
+        .map_err(|_| LaunchError::Artifacts)?;
+        Ok(Some((artifact, guard)))
     }
 
     fn verify_artifacts(&self, plan: &LaunchPlan) -> Result<VerifiedArtifacts, LaunchError> {
@@ -526,6 +582,14 @@ impl LaunchConfig {
                 adapter.path.as_os_str().to_owned(),
             ]);
         }
+        if let Some(mmproj) = &plan.mmproj {
+            arguments.extend([
+                OsString::from("--mmproj"),
+                mmproj.path.as_os_str().to_owned(),
+                OsString::from("--image-max-tokens"),
+                OsString::from(bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS.to_string()),
+            ]);
+        }
         arguments
     }
 
@@ -565,6 +629,7 @@ impl LaunchConfig {
         specification: &ProcessSpec,
         artifacts: &VerifiedArtifacts,
         adapter: Option<&bonsai_artifacts::VerifiedFile>,
+        mmproj: Option<&bonsai_artifacts::VerifiedFile>,
         credentials: &PrivateCredentials,
     ) -> Result<OwnedProcess, LaunchError> {
         if !self.requires_native_sandbox() {
@@ -577,6 +642,7 @@ impl LaunchConfig {
             credentials.backend_path().to_owned(),
         ]);
         readonly_paths.extend(adapter.map(|file| file.path().to_owned()));
+        readonly_paths.extend(mmproj.map(|file| file.path().to_owned()));
         readonly_paths.sort();
         readonly_paths.dedup();
         let policy = SandboxPolicy {
@@ -661,6 +727,7 @@ impl LaunchConfig {
         let artifacts = self.verify_artifacts(&preliminary)?;
         startup_timing.phase(StartupPhase::AdapterVerification);
         let adapter = Self::adapter_guard(&preliminary)?;
+        let mut mmproj = self.mmproj_guard()?;
         if poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_ready())).await {
             return Err(LaunchError::Cancelled);
         }
@@ -677,11 +744,27 @@ impl LaunchConfig {
         )
         .map_err(|_| LaunchError::Policy)?;
         if self.memory_context_supported()? {
-            let context = self
-                .swift_context_plan(available_memory_bytes().map_err(|_| LaunchError::Memory)?)?;
+            let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
+            let profile = self.swift_context_profile()?;
+            let (context, vision_admitted) =
+                bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_vision(
+                    available,
+                    profile,
+                    mmproj.is_some(),
+                )
+                .map_err(|_| LaunchError::Memory)?;
+            if !vision_admitted {
+                mmproj = None;
+            }
             plan.select_swift_context(context)
                 .map_err(|_| LaunchError::Policy)?;
         }
+        if let Some((artifact, _)) = &mmproj {
+            plan.enable_swift_mmproj(artifact.clone())
+                .map_err(|_| LaunchError::Policy)?;
+        }
+        let vision_enabled = mmproj.is_some();
+        let mmproj_file = mmproj.map(|(_, guard)| guard);
         let context_tokens = plan.context_tokens;
         // Reserve only as a collision check; PID checks close the release/bind
         // race without ever trusting a pre-existing server on the selected port.
@@ -693,8 +776,13 @@ impl LaunchConfig {
         validate_external_path(&specification.executable).map_err(|_| LaunchError::Path)?;
         drop(reservation);
         startup_timing.phase(StartupPhase::ProcessCreation);
-        let process =
-            self.start_process(&specification, &artifacts, adapter.as_ref(), &credentials)?;
+        let process = self.start_process(
+            &specification,
+            &artifacts,
+            adapter.as_ref(),
+            mmproj_file.as_ref(),
+            &credentials,
+        )?;
         startup_timing.phase(StartupPhase::AuthenticatedReadiness);
         let models = match wait_ready_models(
             &process,
@@ -714,11 +802,17 @@ impl LaunchConfig {
         };
         if self.native_engine {
             startup_timing.phase(StartupPhase::NativeIdentity);
-            self.confirm_native_identity(&process, &models, context_tokens)?;
+            self.confirm_native_identity(&process, &models, context_tokens, vision_enabled)?;
         }
         startup_timing.phase(StartupPhase::FrontendBinding);
         let service = self
-            .bind_frontend(&process, &credentials, adapter.is_some(), context_tokens)
+            .bind_frontend(
+                &process,
+                &credentials,
+                adapter.is_some(),
+                context_tokens,
+                vision_enabled,
+            )
             .await?;
         startup_timing.finish();
         Ok(LaunchedService {
@@ -727,6 +821,7 @@ impl LaunchConfig {
             credentials,
             _artifacts: artifacts,
             _adapter: adapter,
+            _mmproj: mmproj_file,
             _native_executable: native_executable,
             memory_limit_bytes: specification.memory_limit_bytes,
             backend_port: self.backend_port,
@@ -739,6 +834,7 @@ impl LaunchConfig {
         credentials: &PrivateCredentials,
         adapter: bool,
         context_tokens: usize,
+        vision_enabled: bool,
     ) -> Result<LocalChatService, LaunchError> {
         let Ok(mut service) = LocalChatService::bind(
             self.frontend_port,
@@ -760,6 +856,9 @@ impl LaunchConfig {
         if adapter {
             service.enable_pinned_abliteration();
         }
+        if vision_enabled {
+            service.enable_vision();
+        }
         if self.reset_on_cancel {
             service.enable_reset_on_cancel();
         }
@@ -771,6 +870,7 @@ impl LaunchConfig {
         process: &OwnedProcess,
         models: &[u8],
         context_tokens: usize,
+        vision_enabled: bool,
     ) -> Result<(), LaunchError> {
         let valid = crate::inference::pinned_version().is_ok_and(|version| {
             validate_native_identity(
@@ -779,6 +879,7 @@ impl LaunchConfig {
                 self.use_abliterate_lora,
                 WorkerReadiness::for_version(&version, self.native_row_workers)
                     .with_prompt_reuse(self.latest_prompt_reuse)
+                    .with_vision(vision_enabled)
                     .with_kv_cache(self.kv_cache)
                     .with_placement(self.placement)
                     .with_context_tokens(context_tokens),
@@ -842,6 +943,7 @@ pub struct LaunchedService {
     credentials: PrivateCredentials,
     _artifacts: VerifiedArtifacts,
     _adapter: Option<bonsai_artifacts::VerifiedFile>,
+    _mmproj: Option<bonsai_artifacts::VerifiedFile>,
     _native_executable: Option<bonsai_artifacts::VerifiedFile>,
     memory_limit_bytes: usize,
     backend_port: u16,
@@ -856,6 +958,11 @@ impl LaunchedService {
     /// Actual immutable context shared by runtime, exact admission and UI guidance.
     pub const fn context_tokens(&self) -> usize {
         self.service.context_tokens()
+    }
+
+    /// Whether the active supervised backend admits multimodal image context.
+    pub const fn vision_enabled(&self) -> bool {
+        self.service.vision_enabled()
     }
 
     /// Protected evidence directory; contains credentials, so share only selected logs.
@@ -2136,5 +2243,77 @@ mod tests {
             assert!(validate_health(message.as_bytes()).is_err());
         }
         assert!(validate_health(&vec![b' '; 20 * 1024 + 1]).is_err());
+    }
+
+    #[test]
+    fn no_mmproj_and_mmproj_guard_enforce_swift_only_fallback_and_integrity()
+    -> Result<(), LaunchError> {
+        let mut swift = arguments();
+        swift.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        let mut publisher_args = swift.clone();
+        publisher_args.push("--publisher-engine".into());
+        let publisher = LaunchConfig::parse(publisher_args.clone())?;
+        assert!(!publisher.no_mmproj);
+        assert!(publisher.runtime_supports_vision()?);
+
+        let mut opt_out = publisher_args;
+        opt_out.push("--no-mmproj".into());
+        let parsed_opt_out = LaunchConfig::parse(opt_out.clone())?;
+        assert!(parsed_opt_out.no_mmproj);
+        assert!(!parsed_opt_out.runtime_supports_vision()?);
+        assert!(parsed_opt_out.mmproj_guard()?.is_none());
+
+        // Duplicate --no-mmproj and reference-cpu --no-mmproj are rejected.
+        let mut dup = opt_out;
+        dup.push("--no-mmproj".into());
+        assert_eq!(LaunchConfig::parse(dup).err(), Some(LaunchError::Arguments));
+        let mut reference = arguments();
+        reference.push("--no-mmproj".into());
+        assert_eq!(
+            LaunchConfig::parse(reference).err(),
+            Some(LaunchError::Arguments)
+        );
+
+        // Native 0.1.28 remains text-only regardless of --no-mmproj.
+        let native = LaunchConfig::parse(swift)?;
+        assert!(!native.runtime_supports_vision()?);
+        assert!(native.mmproj_guard()?.is_none());
+
+        // Real temp data directory: missing mmproj falls back cleanly to None;
+        // wrong bytes at the locked mmproj path fails closed with Artifacts.
+        let temp =
+            std::env::temp_dir().join(format!("Bonsai-mmproj-guard-test-{}", std::process::id()));
+        let _cleanup = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).map_err(|_| LaunchError::Path)?;
+        let evidence = temp.join("evidence");
+        std::fs::create_dir_all(&evidence).map_err(|_| LaunchError::Path)?;
+        let mut temp_cfg = LaunchConfig::parse([
+            OsString::from("--launch-development"),
+            "--allow-unisolated-backend".into(),
+            "--profile".into(),
+            "swift-pq2-assessment".into(),
+            "--publisher-engine".into(),
+            "--data-directory".into(),
+            temp.as_os_str().to_owned(),
+            "--evidence-parent".into(),
+            evidence.as_os_str().to_owned(),
+            "--frontend-port".into(),
+            "0".into(),
+            "--backend-port".into(),
+            "8081".into(),
+        ])?;
+        assert!(temp_cfg.mmproj_guard()?.is_none());
+
+        let artifact =
+            bonsai_cpu_policy::swift_mmproj_artifact(&temp).map_err(|_| LaunchError::Policy)?;
+        if let Some(parent) = artifact.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|_| LaunchError::Path)?;
+        }
+        std::fs::write(&artifact.path, b"not the genuine mmproj").map_err(|_| LaunchError::Path)?;
+        assert_eq!(temp_cfg.mmproj_guard().err(), Some(LaunchError::Artifacts));
+        temp_cfg.no_mmproj = true;
+        assert!(temp_cfg.mmproj_guard()?.is_none());
+        let _cleanup = std::fs::remove_dir_all(&temp);
+        Ok(())
     }
 }

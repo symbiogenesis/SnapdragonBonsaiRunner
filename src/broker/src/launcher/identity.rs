@@ -11,6 +11,7 @@ pub(super) struct WorkerReadiness {
     legacy_missing_allowed: bool,
     projection_startup_required: bool,
     latest_prompt_reuse: bool,
+    vision: bool,
     kv_cache: Option<crate::inference::KvCache>,
     placement: crate::inference::Placement,
 }
@@ -27,6 +28,7 @@ impl WorkerReadiness {
             // always publishes its completed placement/residency observation.
             projection_startup_required: version == "0.1.28",
             latest_prompt_reuse: false,
+            vision: false,
             kv_cache: None,
             placement: crate::inference::Placement::Auto,
         }
@@ -34,6 +36,11 @@ impl WorkerReadiness {
 
     pub(super) const fn with_prompt_reuse(mut self, latest: bool) -> Self {
         self.latest_prompt_reuse = latest;
+        self
+    }
+
+    pub(super) const fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
         self
     }
 
@@ -141,6 +148,12 @@ struct NativeModel<'a> {
     projection_backend: Option<Text<'a>>,
     #[serde(default, borrow, deserialize_with = "present")]
     startup_projection: Option<crate::Object<StartupProjection<'a>>>,
+    #[serde(default, deserialize_with = "present")]
+    vision: Option<bool>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    mmproj_sha256: Option<Text<'a>>,
+    #[serde(default, deserialize_with = "present")]
+    image_max_tokens: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -271,6 +284,15 @@ pub(super) fn validate_native_identity(
             && model.abliteration_scale_range.is_none()
     };
     let placement = (workers.placement == crate::inference::Placement::Cpu).then_some("cpu");
+    let vision_match = if workers.vision {
+        model.vision == Some(true)
+            && model.mmproj_sha256.as_deref() == Some(crate::inference::MMPROJ_SHA256)
+            && model.image_max_tokens == Some(bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS)
+    } else {
+        !model.vision.unwrap_or(false)
+            && model.mmproj_sha256.is_none()
+            && model.image_max_tokens.is_none()
+    };
     if &*model.id != id
         || &*model.object != "model"
         || &*model.model_sha256 != hash
@@ -285,6 +307,7 @@ pub(super) fn validate_native_identity(
         || model.projection_backend.as_deref() != placement
         || !startup_projection_matches(model, workers, repacked)
         || !extensions_match
+        || !vision_match
     {
         return Err(io::Error::other("native model readiness identity mismatch"));
     }
@@ -851,5 +874,49 @@ mod context_tests {
         assert!(validate_native_identity(wire.as_bytes(), false, false, selected).is_ok());
         let legacy = WorkerReadiness::for_version("0.1.27", 1);
         assert!(validate_native_identity(wire.as_bytes(), false, false, legacy).is_err());
+    }
+
+    #[test]
+    fn readiness_enforces_vision_projector_and_image_token_identity() {
+        let with_vision = serde_json::json!({"data":[{
+            "id":"Swift-Bonsai-2-PQ2_0", "object":"model",
+            "model_sha256":crate::inference::MODEL_SHA256,
+            "template_sha256":crate::inference::TEMPLATE_SHA256,
+            "runtime":"prism-inference", "context_tokens":8192,
+            "seed":42, "row_workers":1,
+            "vision":true,
+            "mmproj_sha256":crate::inference::MMPROJ_SHA256,
+            "image_max_tokens":1024
+        }]})
+        .to_string();
+        let vision_wire = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{with_vision}",
+            with_vision.len()
+        );
+        let expect_vision = WorkerReadiness::for_version("0.1.27", 1).with_vision(true);
+        let expect_text = WorkerReadiness::for_version("0.1.27", 1);
+        assert!(
+            validate_native_identity(vision_wire.as_bytes(), false, false, expect_vision).is_ok()
+        );
+        assert!(
+            validate_native_identity(vision_wire.as_bytes(), false, false, expect_text).is_err()
+        );
+
+        let text_body = serde_json::json!({"data":[{
+            "id":"Swift-Bonsai-2-PQ2_0", "object":"model",
+            "model_sha256":crate::inference::MODEL_SHA256,
+            "template_sha256":crate::inference::TEMPLATE_SHA256,
+            "runtime":"prism-inference", "context_tokens":8192,
+            "seed":42, "row_workers":1
+        }]})
+        .to_string();
+        let text_wire = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text_body}",
+            text_body.len()
+        );
+        assert!(validate_native_identity(text_wire.as_bytes(), false, false, expect_text).is_ok());
+        assert!(
+            validate_native_identity(text_wire.as_bytes(), false, false, expect_vision).is_err()
+        );
     }
 }
