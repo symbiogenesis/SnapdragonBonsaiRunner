@@ -1154,7 +1154,11 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   partial secondary arenas), `bonsai-hexagon-runtime` (`X1_V73_MAX_NPU_LAYERS = 27`,
   `plan_x1_v73_three_processor_placement` partitioning `168` NPU `Q2_0` + `232`
   GPU `Q2_0` projections), `CompositeProjectionExecutor`, `CompositeTelemetry`,
-  and `HybridPrefillCoordinator` under [Hexagon policy](docs/hexagon.md).
+  `HybridPrefillCoordinator`, Runner `bonsai-broker` `"hexagon-native-q2-partial"`
+  (`v73`/`v81`) startup readiness admission, Runner `1|4|8|12` row-worker admission
+  with Snapdragon X1 `8`-worker live host default, and Prism per-group
+  `Transforms::project_group_into_with_executor` CPU sibling dispatch under partial
+  executors under [Hexagon policy](docs/hexagon.md).
 - [ ] Qualify the pinned model-thread initialization/readiness handshake
   and `startup_projection` facts, including failed initialization, CPU/external
   executors, actual resident counts/bytes and Runner's bounded observation
@@ -1296,8 +1300,12 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   encoder/causal prefill and `row_workers` in `src/speech-asr/src/`, X1 `(8, 12)`
   TTS / `(8, 10)` ASR thread budgets / `SpeculationPolicy` /
   `"runner-x1-cpu-evaluation-plan"` (`d8-p12`) in `cpu-policy` / `bonsai-tools`,
-  and Prism server `--cpu-family x1|x2`, `--spec-type none|suffix`, and
-  `--draft-max 1..=8`.
+  Prism server `--cpu-family x1|x2`, `--spec-type none|suffix`, and
+  `--draft-max 1..=8`, Runner `1|4|8|12` row-worker admission with Snapdragon X1
+  `8`-worker live host default, Prism per-group CPU sibling dispatch under partial
+  executors, Prism tiled (`ProjectionTile`) / head-major 4-query parallel
+  `SwiftVisionEncoder` (with parallel `LayerNorm` & bicubic resize), and
+  `bonsai-chat` scanline RGBA box downscaling / chunked BGRX normalization.
 - [ ] **#24 — Token-count projection crossover tuning.** Benchmark separate 1-token
   decode, short verification block (`2`–`9`) and larger prefill tile crossovers with
   odd-tail retention, keeping any rounding change behind an explicit profile gate.

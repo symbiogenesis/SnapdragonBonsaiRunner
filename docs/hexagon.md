@@ -6,7 +6,9 @@ Runner pins [Prism 0.1.30](../config/prism-inference.lock.json), source
 when the verified signed GenieX v0.10.0 package and CDSP driver are available.
 The expected DSP file is `<data_directory>/hexagon/runtime/libggml-htp-v81.so`.
 When those prerequisites are absent, the [Rust runtime][rust-runtime] retains CPU
-inference, with four NEON row workers under Runner's default launch policy.
+inference, defaulting omitted live host launches to eight NEON row workers on
+Snapdragon X1 and four otherwise (admitting explicit
+`--native-row-workers 1|4|8|12`).
 
 The fixed placement (`DEFAULT_NATIVE_Q2_PROJECTIONS`) covers 168 `PQ2_0`
 projections across `blk.0..=blk.26`. Its 2,888,663,040 resident weight bytes
@@ -29,7 +31,12 @@ model-thread initialization handshake before authenticated serving readiness
 and reports a versioned `startup_projection` observation. Runner requires that
 object for the reviewed 0.1.30 source, with consistent requested/effective
 placement, the fixed
-168-tensor/2,888,663,040-byte resident layout and bounded host metadata; CPU and
+168-tensor/2,888,663,040-byte resident layout and bounded host metadata (`"hexagon-native-q2-resident"`),
+or—under `auto` placement when secondary CDSP arenas fall back cleanly without
+repacking—`"hexagon-native-q2-partial"` (`hexagon-v73-hvx-native-q2-partial-v1-experimental`
+or `hexagon-v81-hvx-native-q2-partial-v1-experimental` with `1..168` resident
+tensors, `1..2,888,663,040` resident weight bytes, and `1..=524,288` host
+metadata bytes); CPU and
 external observations cannot assert resident weights. Explicit legacy 0.1.27
 source retains its older readiness contract and may omit the object. These
 startup facts do not qualify executed operations, model state, signed-device

@@ -237,8 +237,10 @@ separate NPU transport, operation lifetime and signed-solver boundaries.
 
 ## Bounded parallel-row qualification
 
-Runner explicitly selects four row workers; trusted
-`bonsai-tools chat --native-row-workers 1` selects one. A persistent pool and
+Runner admits explicit `--native-row-workers 1|4|8|12` for the reviewed parallel
+release and defaults omitted live host launches to `8` on Snapdragon X1 (four
+otherwise; pure CLI/plan parsers remain host-independent at `4`), while trusted
+`bonsai-tools chat --native-row-workers 1` selects serial execution. A persistent pool and
 readiness identity establish availability, not correctness or benefit.
 
 For each selected source and worker policy, compare all logits and every logical
