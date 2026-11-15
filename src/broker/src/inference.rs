@@ -320,6 +320,20 @@ pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
     Ok(reset_on_cancel_release_matches(&pin))
 }
 
+// Offline anonymous broker-pipe transport requires a separately reviewed native
+// release implementing `--broker-pipe`, `AppContainer` verification, `SB2PIPE1`
+// / `SB2OKAY1` handshake, `KIND_SERVER_READY`, and `KIND_RESET`.
+const BROKER_PIPE_RELEASE: Option<(&str, &str)> = None;
+
+fn broker_pipe_release_matches(release: &ReleasePin) -> bool {
+    reviewed_release_matches(release, BROKER_PIPE_RELEASE)
+}
+
+pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
+    let pin = release(LOCK)?;
+    Ok(broker_pipe_release_matches(&pin))
+}
+
 // Multimodal image/mmproj support requires a separately reviewed native release
 // that implements vision projector loading, image embedding injection and the
 // matching readiness identity fields.
@@ -697,6 +711,23 @@ mod tests {
         let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&data)?;
         assert_eq!(ADAPTER_SHA256, adapter.sha256);
         assert_eq!(MMPROJ_SHA256, mmproj.sha256);
+        Ok(())
+    }
+
+    #[test]
+    fn broker_pipe_waits_for_a_separately_reviewed_native_release() -> Result<(), LaunchError> {
+        let mut pin = release(LOCK)?;
+        assert_eq!(BROKER_PIPE_RELEASE, None);
+        assert!(!broker_pipe_supported()?);
+        assert!(!broker_pipe_release_matches(&pin));
+        for (version, commit) in [
+            ("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
+            ("0.1.31", "0000000000000000000000000000000000000000"),
+        ] {
+            pin.version = version.into();
+            pin.commit = commit.into();
+            assert!(!broker_pipe_release_matches(&pin));
+        }
         Ok(())
     }
 }

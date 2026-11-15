@@ -9,6 +9,7 @@ use std::{
 };
 
 const PROBE_NAME: &str = "launcher::lifecycle_tests::synthetic_backend_probe";
+const HOLDER_PROBE_NAME: &str = "launcher::lifecycle_tests::synthetic_pipe_holder_probe";
 const PROBE_MEMORY: usize = 512 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -16,6 +17,22 @@ struct Fixture {
     process: OwnedProcess,
     credentials: PrivateCredentials,
     port: u16,
+}
+
+fn holder_probe(directory: &std::path::Path) -> io::Result<OwnedProcess> {
+    let specification = ProcessSpec {
+        executable: std::env::current_exe()?,
+        arguments: ["--exact", HOLDER_PROBE_NAME, "--ignored", "--nocapture"]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        working_directory: directory.to_path_buf(),
+        stdout: directory.join("probe.stdout"),
+        stderr: directory.join("probe.stderr"),
+        memory_limit_bytes: PROBE_MEMORY,
+        active_process_limit: 1,
+    };
+    OwnedProcess::start(&specification)
 }
 
 fn probe() -> io::Result<Fixture> {
@@ -160,6 +177,7 @@ fn owned_ready_backend_stops_with_service() -> io::Result<()> {
             _native_executable: None,
             memory_limit_bytes: PROBE_MEMORY,
             backend_port: port,
+            storage_budget: None,
         };
         let frontend_port = launched.port();
         let report = launched
@@ -322,4 +340,395 @@ fn serve_probe(stream: &mut BlockingStream, key: &str) -> io::Result<()> {
         body.len()
     )?;
     stream.flush()
+}
+
+#[test]
+#[ignore = "subprocess entry point; invoked only as an owned holder child"]
+fn synthetic_pipe_holder_probe() -> io::Result<()> {
+    std::thread::sleep(Duration::from_secs(30));
+    Ok(())
+}
+
+fn write_pipe_frame(
+    writer: &mut impl Write,
+    stream_id: u32,
+    kind: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    let len = u32::try_from(payload.len()).map_err(|_| io::Error::other("frame too large"))?;
+    let mut header = [0_u8; 9];
+    header[..4].copy_from_slice(&stream_id.to_be_bytes());
+    header[4] = kind;
+    header[5..9].copy_from_slice(&len.to_be_bytes());
+    writer.write_all(&header)?;
+    if !payload.is_empty() {
+        writer.write_all(payload)?;
+    }
+    writer.flush()
+}
+
+fn read_pipe_frame(reader: &mut impl Read) -> io::Result<Option<(u32, u8, Vec<u8>)>> {
+    let mut header = [0_u8; 9];
+    let mut read = 0;
+    while read < header.len() {
+        match reader.read(&mut header[read..]) {
+            Ok(0) if read == 0 => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated test pipe frame header",
+                ));
+            }
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let stream_id = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    let kind = header[4];
+    let len = usize::try_from(u32::from_be_bytes([
+        header[5], header[6], header[7], header[8],
+    ]))
+    .map_err(|_| io::Error::other("frame length overflow"))?;
+    let mut payload = vec![0_u8; len];
+    if len > 0 {
+        reader.read_exact(&mut payload)?;
+    }
+    Ok(Some((stream_id, kind, payload)))
+}
+
+fn complete_http_request(buffer: &[u8]) -> Option<usize> {
+    let head_end = buffer.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+    let head = std::str::from_utf8(&buffer[..head_end]).ok()?;
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    (buffer.len() >= head_end + content_length).then_some(head_end)
+}
+
+fn run_synthetic_pipe_server(
+    mut reader: io::PipeReader,
+    mut writer: io::PipeWriter,
+    backend_key: &str,
+) -> io::Result<(bool, bool)> {
+    const KIND_OPEN: u8 = 1;
+    const KIND_DATA: u8 = 2;
+    const KIND_EOF: u8 = 3;
+    const KIND_RESET: u8 = 4;
+    const KIND_SERVER_READY: u8 = 5;
+
+    let mut handshake = [0_u8; 8 + 64];
+    reader.read_exact(&mut handshake)?;
+    if &handshake[..8] != b"SB2PIPE1" || &handshake[8..] != backend_key.as_bytes() {
+        return Err(io::Error::other("Invalid synthetic pipe handshake."));
+    }
+    writer.write_all(b"SB2OKAY1")?;
+    writer.flush()?;
+    write_pipe_frame(&mut writer, 0, KIND_SERVER_READY, &[])?;
+
+    let expected_auth = format!("Authorization: Bearer {backend_key}");
+    let mut active: Option<(u32, Vec<u8>)> = None;
+    let mut chat_count = 0_u32;
+    let mut saw_generation_reset = false;
+    let mut saw_reset_post = false;
+
+    while let Some((stream_id, kind, payload)) = read_pipe_frame(&mut reader)? {
+        match kind {
+            KIND_OPEN => {
+                if active.is_some() {
+                    return Err(io::Error::other("Unexpected concurrent stream open."));
+                }
+                active = Some((stream_id, Vec::new()));
+            }
+            KIND_DATA => {
+                let Some((active_id, buffer)) = active.as_mut() else {
+                    continue;
+                };
+                if *active_id != stream_id {
+                    return Err(io::Error::other("Data frame stream mismatch."));
+                }
+                buffer.extend_from_slice(&payload);
+                let Some(head_end) = complete_http_request(buffer) else {
+                    continue;
+                };
+                let head = std::str::from_utf8(&buffer[..head_end]).map_err(io::Error::other)?;
+                let authorized = head.lines().any(|line| line == expected_auth);
+                let response = if head.starts_with("GET /health HTTP/1.1\r\n") && authorized {
+                    let body = r#"{"status":"ok"}"#;
+                    Some(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ))
+                } else if head.starts_with("GET /v1/models HTTP/1.1\r\n") {
+                    if authorized {
+                        let body = r#"{"data":[]}"#;
+                        Some(format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ))
+                    } else {
+                        let body = r#"{"error":"unauthorized"}"#;
+                        Some(format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ))
+                    }
+                } else if head.starts_with("POST /reset HTTP/1.1\r\n") && authorized {
+                    if head.to_ascii_lowercase().contains("content-type:") {
+                        return Err(io::Error::other(
+                            "POST /reset included unexpected Content-Type.",
+                        ));
+                    }
+                    saw_reset_post = true;
+                    let body = r#"{"status":"ok"}"#;
+                    Some(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ))
+                } else if head.starts_with("POST /v1/chat/completions/input_tokens ") && authorized
+                {
+                    let body = r#"{"object":"response.input_tokens","input_tokens":8}"#;
+                    Some(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ))
+                } else if head.starts_with("POST /v1/chat/completions ") && authorized {
+                    chat_count += 1;
+                    if chat_count == 1 {
+                        let sse_chunk =
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+                        let partial = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{sse_chunk}\r\n",
+                            sse_chunk.len()
+                        );
+                        write_pipe_frame(&mut writer, stream_id, KIND_DATA, partial.as_bytes())?;
+                        None
+                    } else {
+                        let done = "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                        Some(format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{done}\r\n0\r\n\r\n",
+                            done.len()
+                        ))
+                    }
+                } else {
+                    let body = r#"{"error":"unauthorized"}"#;
+                    Some(format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ))
+                };
+                if let Some(response) = response {
+                    write_pipe_frame(&mut writer, stream_id, KIND_DATA, response.as_bytes())?;
+                    write_pipe_frame(&mut writer, stream_id, KIND_EOF, &[])?;
+                    active = None;
+                }
+            }
+            KIND_EOF => {
+                if active
+                    .as_ref()
+                    .is_some_and(|(active_id, _)| *active_id == stream_id)
+                {
+                    active = None;
+                }
+            }
+            KIND_RESET => {
+                if active
+                    .as_ref()
+                    .is_some_and(|(active_id, _)| *active_id == stream_id)
+                {
+                    saw_generation_reset = true;
+                    active = None;
+                }
+            }
+            _ => return Err(io::Error::other("Unexpected frame kind from parent pipe.")),
+        }
+    }
+    Ok((saw_generation_reset, saw_reset_post))
+}
+
+fn pipe_client_chat_request(port: u16, key: &str) -> String {
+    let body = r#"{"model":"bonsai","messages":[{"role":"user","content":"hi"}],"stream":true,"max_completion_tokens":32}"#;
+    format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[test]
+fn broker_pipe_launched_service_serves_cancels_resets_and_avoids_backend_key_file() -> io::Result<()>
+{
+    check(async {
+        let parent: PathBuf = std::env::temp_dir().components().collect();
+        let credentials = PrivateCredentials::create_frontend_only(&parent)?;
+        assert!(!credentials.has_backend_file());
+        assert!(!credentials.backend_path().exists());
+        let worker_dir = credentials.directory().join("worker");
+        fs::create_dir(&worker_dir)?;
+
+        let process = holder_probe(credentials.directory())?;
+        let (p2c_rx, p2c_tx) = io::pipe()?;
+        let (c2p_rx, c2p_tx) = io::pipe()?;
+
+        let backend_key = credentials.backend_key().to_owned();
+        let server_handle =
+            std::thread::spawn(move || run_synthetic_pipe_server(p2c_rx, c2p_tx, &backend_key));
+
+        let pipe_backend =
+            crate::pipe_transport::PipeBackend::from_io(c2p_rx, p2c_tx, credentials.backend_key())
+                .map_err(|_| io::Error::other("PipeBackend::from_io failed."))?;
+        let models = wait_ready_models_pipe(
+            &process,
+            &pipe_backend,
+            credentials.backend_key(),
+            PROBE_MEMORY,
+            Some((
+                MAX_WORKER_PRIVATE_STORAGE_BYTES,
+                MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
+            )),
+            Some(worker_dir.as_path()),
+            pending(),
+        )
+        .await
+        .map_err(|_| io::Error::other("wait_ready_models_pipe failed."))?;
+        assert!(String::from_utf8_lossy(&models).contains("\"data\""));
+
+        let mut service = LocalChatService::bind_pipe(
+            0,
+            credentials.frontend_key(),
+            credentials.backend_key(),
+            pipe_backend,
+            1,
+        )
+        .await
+        .map_err(|_| io::Error::other("bind_pipe failed."))?;
+        service.enable_reset_on_cancel();
+
+        let frontend_key = credentials.frontend_key().to_owned();
+        let launched = LaunchedService {
+            service,
+            process,
+            credentials,
+            _artifacts: VerifiedArtifacts::synthetic_for_test(),
+            _adapter: None,
+            _mmproj: None,
+            _native_executable: None,
+            memory_limit_bytes: PROBE_MEMORY,
+            backend_port: 0,
+            storage_budget: Some((
+                MAX_WORKER_PRIVATE_STORAGE_BYTES,
+                MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
+            )),
+        };
+        let frontend_port = launched.port();
+        let evidence_dir = launched.evidence_directory().to_path_buf();
+        assert!(!evidence_dir.join("backend.key").exists());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let client_task = tokio::spawn(async move {
+            // 1. Start a streaming chat request and abandon mid-stream after the first delta.
+            let mut first = TcpStream::connect((Ipv4Addr::LOCALHOST, frontend_port)).await?;
+            first
+                .write_all(pipe_client_chat_request(frontend_port, &frontend_key).as_bytes())
+                .await?;
+            first.flush().await?;
+            let mut partial = Vec::new();
+            let mut buf = [0_u8; 512];
+            while !partial.windows(3).any(|window| window == b"Hel") {
+                let count = first.read(&mut buf).await?;
+                if count == 0 {
+                    return Err(io::Error::other("First stream ended before SSE delta."));
+                }
+                partial.extend_from_slice(&buf[..count]);
+            }
+            drop(first);
+
+            // 2. Follow-up request waits through KIND_RESET + POST /reset and completes.
+            let mut second = TcpStream::connect((Ipv4Addr::LOCALHOST, frontend_port)).await?;
+            second
+                .write_all(pipe_client_chat_request(frontend_port, &frontend_key).as_bytes())
+                .await?;
+            second.flush().await?;
+            let mut completed = Vec::new();
+            second.read_to_end(&mut completed).await?;
+            let response = String::from_utf8_lossy(&completed);
+            if !response.contains("data: [DONE]") {
+                return Err(io::Error::other("Second stream did not finish cleanly."));
+            }
+            let _ = shutdown_tx.send(());
+            Ok::<(), io::Error>(())
+        });
+
+        let report = launched
+            .run(async {
+                let _ = shutdown_rx.await;
+                Ok(())
+            })
+            .await
+            .map_err(|_| io::Error::other("Broker-pipe LaunchedService failed."))?;
+        client_task.await.map_err(io::Error::other)??;
+        let (saw_generation_reset, saw_reset_post) = server_handle
+            .join()
+            .map_err(|_| io::Error::other("Synthetic pipe server panicked."))??;
+        assert!(saw_generation_reset);
+        assert!(saw_reset_post);
+        assert_eq!(report.exit, RunExit::Shutdown);
+        assert_eq!(report.completed, 1);
+        assert!(!evidence_dir.join("backend.key").exists());
+        let _ = fs::remove_dir_all(&evidence_dir);
+        Ok(())
+    })
+}
+
+#[test]
+fn launched_service_stops_with_sandbox_error_when_storage_budget_exceeded() -> io::Result<()> {
+    check(async {
+        let parent: PathBuf = std::env::temp_dir().components().collect();
+        let credentials = PrivateCredentials::create_frontend_only(&parent)?;
+        let worker_dir = credentials.directory().join("worker");
+        fs::create_dir(&worker_dir)?;
+        let process = holder_probe(credentials.directory())?;
+
+        let (p2c_rx, p2c_tx) = io::pipe()?;
+        let (c2p_rx, c2p_tx) = io::pipe()?;
+        let pipe_backend =
+            crate::pipe_transport::PipeBackend::from_io(c2p_rx, p2c_tx, credentials.backend_key())
+                .map_err(|_| io::Error::other("PipeBackend::from_io failed."))?;
+        let service = LocalChatService::bind_pipe(
+            0,
+            credentials.frontend_key(),
+            credentials.backend_key(),
+            pipe_backend,
+            0,
+        )
+        .await
+        .map_err(|_| io::Error::other("bind_pipe failed."))?;
+
+        fs::write(worker_dir.join("overflow.bin"), [0x5A_u8; 256])?;
+
+        let launched = LaunchedService {
+            service,
+            process,
+            credentials,
+            _artifacts: VerifiedArtifacts::synthetic_for_test(),
+            _adapter: None,
+            _mmproj: None,
+            _native_executable: None,
+            memory_limit_bytes: PROBE_MEMORY,
+            backend_port: 0,
+            storage_budget: Some((128, 16)),
+        };
+        let evidence_dir = launched.evidence_directory().to_path_buf();
+        let result = launched.run(pending()).await;
+        drop((p2c_rx, c2p_tx));
+        assert_eq!(result.err(), Some(LaunchError::Sandbox));
+        let _ = fs::remove_dir_all(&evidence_dir);
+        Ok(())
+    })
 }

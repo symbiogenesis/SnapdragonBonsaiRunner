@@ -18,11 +18,13 @@ use crate::{
     runtime::{BackendResources, RunExit, RunReport, run},
     scheduler::MAX_WAITING,
     service::{LocalChatService, bound_loopback_socket},
+    supervisor::BackendConnector,
 };
 use bonsai_windows_credentials::{PrivateCredentials, validate_external_path};
 use bonsai_windows_process::{
-    OwnedProcess, ProcessMemory, ProcessSpec, SandboxPolicy, available_memory_bytes,
-    listener_process_id, native_sandbox_available, validate_sandbox_environment,
+    MAX_WORKER_PRIVATE_STORAGE_BYTES, MAX_WORKER_PRIVATE_STORAGE_ENTRIES, OwnedProcess,
+    ProcessMemory, ProcessSpec, SandboxPolicy, available_memory_bytes, listener_process_id,
+    native_sandbox_available, native_sandbox_offline_available, validate_sandbox_environment,
 };
 use std::{
     cell::Cell,
@@ -45,10 +47,10 @@ use tokio::{
 pub const LAUNCH_USAGE: &str = concat!(
     "Windows CPU development launcher (daily isolation unqualified).\n",
     "bonsai-broker --launch-development\n",
-    "  <--require-native-sandbox|--allow-unisolated-backend>\n",
+    "  <--require-native-sandbox|--allow-unisolated-backend> [--require-broker-pipe]\n",
     "  --data-directory <existing-external-directory>\n",
     "  --evidence-parent <existing-external-directory>\n",
-    "  --frontend-port <0-or-1024..65535> --backend-port <1024..65535>\n",
+    "  --frontend-port <0-or-1024..65535> [--backend-port <1024..65535>]\n",
     "  [--profile <reference-cpu|swift-pq2-assessment>]\n",
     "  [--native-engine|--publisher-engine] (Swift defaults to the pinned Rust runtime; publisher is explicit rollback)\n",
     "  [--native-row-workers 1|4|8|12] (Rust defaults to 8 on Snapdragon X1 or 4 otherwise; publisher supports only 1)\n",
@@ -61,7 +63,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--use-repacked-ptq1|--use-original-pq2] (mutually exclusive weight selections; Swift CPU only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
     "Default: reference-cpu. Only compiled model/runtime pins and fixed CPU policies are accepted.\n",
-    "Swift defaults to Rust with four workers and original PQ2 weights; PTQ1 requires explicit selection. Full daily-use qualification remains pending.\n",
+    "Swift defaults to Rust with four workers and original PQ2 weights; PTQ1 requires explicit selection. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
     "Creates fresh protected credentials; prints paths, never key values.\n",
 );
 
@@ -132,6 +134,7 @@ pub struct LaunchConfig {
     max_waiting: usize,
     check_only: bool,
     containment: BackendContainment,
+    require_broker_pipe: bool,
     profile: LaunchProfile,
     native_engine: bool,
     native_row_workers: u8,
@@ -189,7 +192,8 @@ impl LaunchConfig {
         family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
     ) -> Result<Self, LaunchError> {
         let mut args = args.into_iter();
-        let (mut launch, mut unisolated, mut require_native_sandbox) = (false, false, false);
+        let (mut launch, mut unisolated, mut require_native_sandbox, mut require_broker_pipe) =
+            (false, false, false, false);
         let mut check_only = false;
         let mut native_engine = None;
         let (mut native_row_workers, mut latest_prompt_reuse) = (None, None);
@@ -207,6 +211,9 @@ impl LaunchConfig {
                 Some("--allow-unisolated-backend") if !unisolated => unisolated = true,
                 Some("--require-native-sandbox") if !require_native_sandbox => {
                     require_native_sandbox = true;
+                }
+                Some("--require-broker-pipe") if !require_broker_pipe => {
+                    require_broker_pipe = true;
                 }
                 Some("--check-only") if !check_only => check_only = true,
                 Some("--native-engine" | "--publisher-engine") if native_engine.is_none() => {
@@ -262,7 +269,17 @@ impl LaunchConfig {
             }
         }
         let frontend_port = frontend_port.ok_or(LaunchError::Arguments)?;
-        let backend_port = backend_port.ok_or(LaunchError::Arguments)?;
+        let backend_port = match backend_port {
+            Some(port) => port,
+            None if require_broker_pipe => {
+                if frontend_port == 8081 {
+                    8082
+                } else {
+                    8081
+                }
+            }
+            None => return Err(LaunchError::Arguments),
+        };
         let max_waiting = max_waiting.unwrap_or(2);
         let profile = profile.unwrap_or_default();
         let native_engine = native_engine.unwrap_or(profile == LaunchProfile::SwiftPq2Assessment);
@@ -285,6 +302,7 @@ impl LaunchConfig {
             max_waiting,
             check_only,
             containment: containment(launch, unisolated, require_native_sandbox)?,
+            require_broker_pipe,
             profile,
             native_engine,
             native_row_workers,
@@ -304,6 +322,9 @@ impl LaunchConfig {
         if configuration.reset_on_cancel && !crate::inference::reset_on_cancel_supported()? {
             return Err(LaunchError::NativeRuntime);
         }
+        if configuration.require_broker_pipe && !crate::inference::broker_pipe_supported()? {
+            return Err(LaunchError::NativeRuntime);
+        }
         Ok(configuration)
     }
 
@@ -314,6 +335,8 @@ impl LaunchConfig {
             || self.backend_port == self.frontend_port
             || self.max_waiting > MAX_WAITING
             || (self.native_engine && !swift)
+            || (self.require_broker_pipe
+                && (!self.requires_native_sandbox() || !self.native_engine))
             || (self.native_row_workers != 1 && !self.native_engine)
             || (self.latest_prompt_reuse && !self.native_engine)
             || (self.reset_on_cancel && !self.native_engine)
@@ -348,6 +371,21 @@ impl LaunchConfig {
     #[must_use]
     pub const fn uses_native_engine(&self) -> bool {
         self.native_engine
+    }
+
+    fn uses_broker_pipe(&self) -> Result<bool, LaunchError> {
+        if !self.requires_native_sandbox() || !self.native_engine {
+            return if self.require_broker_pipe {
+                Err(LaunchError::Arguments)
+            } else {
+                Ok(false)
+            };
+        }
+        let supported = crate::inference::broker_pipe_supported()?;
+        if self.require_broker_pipe && !supported {
+            return Err(LaunchError::NativeRuntime);
+        }
+        Ok(supported)
     }
 
     /// Whether the explicitly selected model is the verified current-weight PTQ1 export.
@@ -449,7 +487,10 @@ impl LaunchConfig {
     }
 
     fn check_sandbox_support(&self) -> Result<(), LaunchError> {
-        if self.requires_native_sandbox() {
+        if self.uses_broker_pipe()? {
+            native_sandbox_offline_available()
+                .map_err(|error| Self::sandbox_support_error(error.kind()))?;
+        } else if self.requires_native_sandbox() {
             native_sandbox_available()
                 .map_err(|error| Self::sandbox_support_error(error.kind()))?;
         }
@@ -457,8 +498,8 @@ impl LaunchConfig {
     }
 
     fn check_launch_environment(&self) -> Result<(), LaunchError> {
-        if self.requires_native_sandbox() {
-            // Real launch admits the complete policy without a throwaway PSEC.
+        if self.requires_native_sandbox() && !self.uses_broker_pipe()? {
+            // Real launch admits the complete V1 loopback policy without a throwaway PSEC.
             validate_sandbox_environment()
                 .map_err(|error| Self::sandbox_support_error(error.kind()))?;
         }
@@ -576,18 +617,27 @@ impl LaunchConfig {
         }
     }
 
-    fn native_arguments(&self, plan: &LaunchPlan, key_path: &std::path::Path) -> Vec<OsString> {
+    fn native_arguments(
+        &self,
+        plan: &LaunchPlan,
+        key_path: Option<&std::path::Path>,
+    ) -> Vec<OsString> {
         let mut arguments = vec![
             OsString::from("--native-engine-child"),
             OsString::from("--model"),
             plan.model_path.as_os_str().to_owned(),
-            OsString::from("--port"),
-            OsString::from(self.backend_port.to_string()),
-            OsString::from("--key-file"),
-            key_path.as_os_str().to_owned(),
-            OsString::from("--seed"),
-            OsString::from("42"),
         ];
+        if let Some(key_path) = key_path {
+            arguments.extend([
+                OsString::from("--port"),
+                OsString::from(self.backend_port.to_string()),
+                OsString::from("--key-file"),
+                key_path.as_os_str().to_owned(),
+            ]);
+        } else {
+            arguments.push(OsString::from("--broker-pipe"));
+        }
+        arguments.extend([OsString::from("--seed"), OsString::from("42")]);
         if crate::inference::memory_context_supported().unwrap_or(false) {
             arguments.extend([
                 OsString::from("--context-tokens"),
@@ -636,6 +686,7 @@ impl LaunchConfig {
         plan: LaunchPlan,
         credentials: &PrivateCredentials,
         native: Option<(PathBuf, bonsai_artifacts::VerifiedFile)>,
+        broker_pipe: bool,
     ) -> Result<(ProcessSpec, Option<bonsai_artifacts::VerifiedFile>), LaunchError> {
         // The worker may write only this child, never the sibling keys or logs.
         // Its parent already has the credential owner's protected inheritable ACL.
@@ -643,7 +694,8 @@ impl LaunchConfig {
         std::fs::create_dir(&working_directory).map_err(|_| LaunchError::Path)?;
         validate_external_path(&working_directory).map_err(|_| LaunchError::Path)?;
         let (executable, arguments, guard) = if let Some((executable, guard)) = native {
-            let arguments = self.native_arguments(&plan, credentials.backend_path());
+            let key_path = (!broker_pipe).then(|| credentials.backend_path());
+            let arguments = self.native_arguments(&plan, key_path);
             (executable, arguments, Some(guard))
         } else {
             (plan.executable, plan.arguments, None)
@@ -669,16 +721,21 @@ impl LaunchConfig {
         adapter: Option<&bonsai_artifacts::VerifiedFile>,
         mmproj: Option<&bonsai_artifacts::VerifiedFile>,
         credentials: &PrivateCredentials,
-    ) -> Result<OwnedProcess, LaunchError> {
+        broker_pipe: bool,
+    ) -> Result<(OwnedProcess, Option<(std::fs::File, std::fs::File)>), LaunchError> {
         if !self.requires_native_sandbox() {
-            return OwnedProcess::start(specification).map_err(|_| LaunchError::Process);
+            return OwnedProcess::start(specification)
+                .map(|process| (process, None))
+                .map_err(|_| LaunchError::Process);
         }
         let mut readonly_paths = artifacts.runtime_files();
         readonly_paths.extend([
             specification.executable.clone(),
             artifacts.model().to_owned(),
-            credentials.backend_path().to_owned(),
         ]);
+        if !broker_pipe && credentials.has_backend_file() {
+            readonly_paths.push(credentials.backend_path().to_owned());
+        }
         readonly_paths.extend(adapter.map(|file| file.path().to_owned()));
         readonly_paths.extend(mmproj.map(|file| file.path().to_owned()));
         readonly_paths.sort();
@@ -687,7 +744,13 @@ impl LaunchConfig {
             readonly_paths,
             writable_directory: specification.working_directory.clone(),
         };
-        OwnedProcess::start_sandboxed(specification, &policy).map_err(|error| {
+        let started = if broker_pipe {
+            OwnedProcess::start_sandboxed_broker_pipe(specification, &policy)
+                .map(|(process, child_in, child_out)| (process, Some((child_in, child_out))))
+        } else {
+            OwnedProcess::start_sandboxed(specification, &policy).map(|process| (process, None))
+        };
+        started.map_err(|error| {
             // The native boundary emits fixed validation reasons or Windows API
             // errors, never arguments, file contents or credential values. Keep
             // that technical cause in the broker's retained stderr while the UI
@@ -743,6 +806,7 @@ impl LaunchConfig {
         if self.check_only {
             return Err(LaunchError::Arguments);
         }
+        let broker_pipe = self.uses_broker_pipe()?;
         self.check_launch_environment()?;
         self.validate_paths()?;
         // Resolve policy before creating secrets or loading any native code.
@@ -770,8 +834,12 @@ impl LaunchConfig {
             return Err(LaunchError::Cancelled);
         }
         startup_timing.phase(StartupPhase::CredentialsAndRuntime);
-        let credentials = PrivateCredentials::create(&self.evidence_parent)
-            .map_err(|_| LaunchError::Credentials)?;
+        let credentials = if broker_pipe {
+            PrivateCredentials::create_frontend_only(&self.evidence_parent)
+        } else {
+            PrivateCredentials::create(&self.evidence_parent)
+        }
+        .map_err(|_| LaunchError::Credentials)?;
         let mut plan = LaunchPlan::for_profile_with_options(
             &self.data,
             self.backend_port,
@@ -804,39 +872,103 @@ impl LaunchConfig {
         let vision_enabled = mmproj.is_some();
         let mmproj_file = mmproj.map(|(_, guard)| guard);
         let context_tokens = plan.context_tokens;
-        // Reserve only as a collision check; PID checks close the release/bind
-        // race without ever trusting a pre-existing server on the selected port.
-        let reservation =
-            bound_loopback_socket(self.backend_port).map_err(|_| LaunchError::Port)?;
+        // Reserve only as a collision check in TCP modes; offline broker-pipe binds no port.
+        let reservation = if broker_pipe {
+            None
+        } else {
+            Some(bound_loopback_socket(self.backend_port).map_err(|_| LaunchError::Port)?)
+        };
         admit(plan.required_available_bytes)?;
         let (specification, native_executable) =
-            self.specification(plan, &credentials, native_executable)?;
+            self.specification(plan, &credentials, native_executable, broker_pipe)?;
         validate_external_path(&specification.executable).map_err(|_| LaunchError::Path)?;
         drop(reservation);
+        let storage_budget = self.requires_native_sandbox().then_some((
+            MAX_WORKER_PRIVATE_STORAGE_BYTES,
+            MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
+        ));
+        let worker_root = specification.working_directory.clone();
         startup_timing.phase(StartupPhase::ProcessCreation);
-        let process = self.start_process(
+        let (process, pipe_handles) = self.start_process(
             &specification,
             &artifacts,
             adapter.as_ref(),
             mmproj_file.as_ref(),
             &credentials,
+            broker_pipe,
         )?;
-        startup_timing.phase(StartupPhase::AuthenticatedReadiness);
-        let models = match wait_ready_models(
+        if guard(
             &process,
-            self.backend_port,
-            credentials.backend_key(),
             specification.memory_limit_bytes,
-            shutdown,
+            storage_budget,
+            Some(worker_root.as_path()),
         )
-        .await
+        .is_err()
         {
-            Ok(models) => models,
-            Err(error) => {
-                note_startup_failure(StartupStage::AuthenticatedReadiness, error, &process);
-                process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-                return Err(error);
-            }
+            // Keep sandbox storage rejections distinct if the check tripped right after spawn.
+            let err = check_storage_budget(&process, storage_budget, Some(worker_root.as_path()))
+                .err()
+                .unwrap_or(LaunchError::Backend);
+            process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+            return Err(err);
+        }
+        startup_timing.phase(StartupPhase::AuthenticatedReadiness);
+        let (pipe_backend, models) = if let Some((child_stdin, child_stdout)) = pipe_handles {
+            let pipe_backend = match crate::pipe_transport::PipeBackend::connect_stdio(
+                child_stdin,
+                child_stdout,
+                credentials.backend_key(),
+            ) {
+                Ok(backend) => backend,
+                Err(_) => {
+                    note_startup_failure(
+                        StartupStage::AuthenticatedReadiness,
+                        LaunchError::Backend,
+                        &process,
+                    );
+                    process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+                    return Err(LaunchError::Backend);
+                }
+            };
+            let models = match wait_ready_models_pipe(
+                &process,
+                &pipe_backend,
+                credentials.backend_key(),
+                specification.memory_limit_bytes,
+                storage_budget,
+                Some(worker_root.as_path()),
+                shutdown,
+            )
+            .await
+            {
+                Ok(models) => models,
+                Err(error) => {
+                    note_startup_failure(StartupStage::AuthenticatedReadiness, error, &process);
+                    process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+                    return Err(error);
+                }
+            };
+            (Some(pipe_backend), models)
+        } else {
+            let models = match wait_ready_models(
+                &process,
+                self.backend_port,
+                credentials.backend_key(),
+                specification.memory_limit_bytes,
+                storage_budget,
+                Some(worker_root.as_path()),
+                shutdown,
+            )
+            .await
+            {
+                Ok(models) => models,
+                Err(error) => {
+                    note_startup_failure(StartupStage::AuthenticatedReadiness, error, &process);
+                    process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+                    return Err(error);
+                }
+            };
+            (None, models)
         };
         if self.native_engine {
             startup_timing.phase(StartupPhase::NativeIdentity);
@@ -847,6 +979,7 @@ impl LaunchConfig {
             .bind_frontend(
                 &process,
                 &credentials,
+                pipe_backend,
                 adapter.is_some(),
                 context_tokens,
                 vision_enabled,
@@ -862,7 +995,8 @@ impl LaunchConfig {
             _mmproj: mmproj_file,
             _native_executable: native_executable,
             memory_limit_bytes: specification.memory_limit_bytes,
-            backend_port: self.backend_port,
+            backend_port: if broker_pipe { 0 } else { self.backend_port },
+            storage_budget,
         })
     }
 
@@ -870,19 +1004,31 @@ impl LaunchConfig {
         &self,
         process: &OwnedProcess,
         credentials: &PrivateCredentials,
+        pipe_backend: Option<crate::pipe_transport::PipeBackend>,
         adapter: bool,
         context_tokens: usize,
         vision_enabled: bool,
     ) -> Result<LocalChatService, LaunchError> {
-        let Ok(mut service) = LocalChatService::bind(
-            self.frontend_port,
-            credentials.frontend_key(),
-            self.backend_port,
-            credentials.backend_key(),
-            self.max_waiting,
-        )
-        .await
-        else {
+        let bound = if let Some(pipe_backend) = pipe_backend {
+            LocalChatService::bind_pipe(
+                self.frontend_port,
+                credentials.frontend_key(),
+                credentials.backend_key(),
+                pipe_backend,
+                self.max_waiting,
+            )
+            .await
+        } else {
+            LocalChatService::bind(
+                self.frontend_port,
+                credentials.frontend_key(),
+                self.backend_port,
+                credentials.backend_key(),
+                self.max_waiting,
+            )
+            .await
+        };
+        let Ok(mut service) = bound else {
             process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
             return Err(LaunchError::Service);
         };
@@ -985,6 +1131,7 @@ pub struct LaunchedService {
     _native_executable: Option<bonsai_artifacts::VerifiedFile>,
     memory_limit_bytes: usize,
     backend_port: u16,
+    storage_budget: Option<(u64, usize)>,
 }
 
 impl LaunchedService {
@@ -1024,16 +1171,25 @@ impl LaunchedService {
         let failure = Cell::new(None);
         let resources = Cell::new(BackendResources::default());
         let mut shutdown = pin!(shutdown);
+        let worker_root = self.credentials.directory().join("worker");
         let monitoring = async {
             let mut tick = interval(Duration::from_millis(250));
             loop {
                 tick.tick().await;
-                let status = guard(&self.process, self.memory_limit_bytes).and_then(
-                    |(memory, available)| {
-                        resources.set(resource_sample(resources.get(), memory, available));
+                let status = guard(
+                    &self.process,
+                    self.memory_limit_bytes,
+                    self.storage_budget,
+                    Some(worker_root.as_path()),
+                )
+                .and_then(|(memory, available)| {
+                    resources.set(resource_sample(resources.get(), memory, available));
+                    if self.backend_port == 0 {
+                        Ok(())
+                    } else {
                         owner(&self.process, self.backend_port)
-                    },
-                );
+                    }
+                });
                 if let Err(error) = status {
                     failure.set(Some(error));
                     return Err(io::Error::other("Owned backend guard failed."));
@@ -1123,7 +1279,30 @@ fn admit(required: u64) -> Result<(), LaunchError> {
     Ok(())
 }
 
-fn guard(process: &OwnedProcess, limit: usize) -> Result<(ProcessMemory, u64), LaunchError> {
+fn check_storage_budget(
+    process: &OwnedProcess,
+    storage_budget: Option<(u64, usize)>,
+    worker_root: Option<&std::path::Path>,
+) -> Result<(), LaunchError> {
+    if let Some((max_bytes, max_entries)) = storage_budget {
+        process
+            .check_private_storage_budget(max_bytes, max_entries)
+            .map_err(|_| LaunchError::Sandbox)?;
+        if let Some(worker_root) = worker_root {
+            let roots = [worker_root.to_path_buf()];
+            bonsai_windows_process::check_private_storage_roots(&roots, max_bytes, max_entries)
+                .map_err(|_| LaunchError::Sandbox)?;
+        }
+    }
+    Ok(())
+}
+
+fn guard(
+    process: &OwnedProcess,
+    limit: usize,
+    storage_budget: Option<(u64, usize)>,
+    worker_root: Option<&std::path::Path>,
+) -> Result<(ProcessMemory, u64), LaunchError> {
     if process
         .try_wait()
         .map_err(|_| LaunchError::Backend)?
@@ -1135,6 +1314,7 @@ fn guard(process: &OwnedProcess, limit: usize) -> Result<(ProcessMemory, u64), L
     if memory.private_bytes > limit || memory.working_set_bytes > limit {
         return Err(LaunchError::Memory);
     }
+    check_storage_budget(process, storage_budget, worker_root)?;
     let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
     if available < PHYSICAL_RESERVE {
         return Err(LaunchError::Memory);
@@ -1171,30 +1351,10 @@ fn owner(process: &OwnedProcess, port: u16) -> Result<(), LaunchError> {
     Ok(())
 }
 
-async fn wait_ready_models(
-    process: &OwnedProcess,
-    port: u16,
-    key: &str,
-    limit: usize,
+async fn run_startup_with_timeout<T>(
     shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<Vec<u8>, LaunchError> {
-    let startup = async {
-        loop {
-            guard(process, limit)?;
-            match listener_process_id(port).map_err(|_| LaunchError::Backend)? {
-                Some(pid) if pid != process.id() => return Err(LaunchError::Backend),
-                Some(_) if healthy(port, key, process.id()).await => {
-                    if let Some(models) = authenticated_models(port, key, process.id()).await {
-                        owner(process, port)?;
-                        guard(process, limit)?;
-                        return Ok(models);
-                    }
-                }
-                _ => {}
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    };
+    startup: impl Future<Output = Result<T, LaunchError>>,
+) -> Result<T, LaunchError> {
     let mut shutdown = pin!(shutdown);
     let mut startup = pin!(timeout(STARTUP_TIMEOUT, startup));
     poll_fn(|cx| {
@@ -1209,6 +1369,91 @@ async fn wait_ready_models(
     .await
 }
 
+async fn wait_ready_models(
+    process: &OwnedProcess,
+    port: u16,
+    key: &str,
+    limit: usize,
+    storage_budget: Option<(u64, usize)>,
+    worker_root: Option<&std::path::Path>,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<Vec<u8>, LaunchError> {
+    run_startup_with_timeout(shutdown, async {
+        loop {
+            guard(process, limit, storage_budget, worker_root)?;
+            match listener_process_id(port).map_err(|_| LaunchError::Backend)? {
+                Some(pid) if pid != process.id() => return Err(LaunchError::Backend),
+                Some(_) if healthy(port, key, process.id()).await => {
+                    if let Some(models) = authenticated_models(port, key, process.id()).await {
+                        owner(process, port)?;
+                        guard(process, limit, storage_budget, worker_root)?;
+                        return Ok(models);
+                    }
+                }
+                _ => {}
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+}
+
+async fn wait_ready_models_pipe(
+    process: &OwnedProcess,
+    backend: &crate::pipe_transport::PipeBackend,
+    key: &str,
+    limit: usize,
+    storage_budget: Option<(u64, usize)>,
+    worker_root: Option<&std::path::Path>,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<Vec<u8>, LaunchError> {
+    run_startup_with_timeout(shutdown, async {
+        guard(process, limit, storage_budget, worker_root)?;
+        {
+            let ready_deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+            let mut ready = pin!(backend.wait_server_ready(ready_deadline));
+            let mut tick = interval(Duration::from_millis(250));
+            poll_fn(|cx| {
+                if let Poll::Ready(result) = ready.as_mut().poll(cx) {
+                    return Poll::Ready(match result {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(guard(process, limit, storage_budget, worker_root)
+                            .err()
+                            .unwrap_or(LaunchError::Backend)),
+                    });
+                }
+                while tick.poll_tick(cx).is_ready() {
+                    if let Err(error) = guard(process, limit, storage_budget, worker_root) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                Poll::Pending
+            })
+            .await?;
+        }
+        guard(process, limit, storage_budget, worker_root)?;
+        let health = pipe_exchange(backend, "/health", Some(key))
+            .await
+            .and_then(|bytes| validate_health(&bytes))
+            .is_ok();
+        if !health {
+            return Err(guard(process, limit, storage_budget, worker_root)
+                .err()
+                .unwrap_or(LaunchError::Backend));
+        }
+        let models = pipe_authenticated_models(backend, key)
+            .await
+            .ok_or_else(|| {
+                guard(process, limit, storage_budget, worker_root)
+                    .err()
+                    .unwrap_or(LaunchError::Backend)
+            })?;
+        guard(process, limit, storage_budget, worker_root)?;
+        Ok(models)
+    })
+    .await
+}
+
 #[cfg(test)]
 async fn wait_ready(
     process: &OwnedProcess,
@@ -1217,7 +1462,7 @@ async fn wait_ready(
     limit: usize,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<(), LaunchError> {
-    wait_ready_models(process, port, key, limit, shutdown)
+    wait_ready_models(process, port, key, limit, None, None, shutdown)
         .await
         .map(|_| ())
 }
@@ -1237,19 +1482,24 @@ async fn health_exchange(port: u16, key: &str, process_id: u32) -> io::Result<()
     validate_health(&exchange(port, "/health", Some(key), process_id).await?)
 }
 
+fn validate_models_pair(denied: &[u8], allowed: &[u8]) -> io::Result<()> {
+    validate_response(denied, 401)?;
+    let body = validate_response(allowed, 200)?;
+    let models: serde_json::Value = serde_json::from_slice(body).map_err(io::Error::other)?;
+    if !models.get("data").is_some_and(serde_json::Value::is_array) {
+        return Err(io::Error::other("Backend authentication probe failed."));
+    }
+    Ok(())
+}
+
 async fn authenticated_models(port: u16, key: &str, process_id: u32) -> Option<Vec<u8>> {
     timeout(Duration::from_secs(2), async {
         // Publisher /health is public while native /health requires the key.
         // Either way, /v1/models must reject missing credentials and accept
         // this newly generated key.
         let denied = exchange(port, "/v1/models", None, process_id).await?;
-        validate_response(&denied, 401)?;
         let allowed = exchange(port, "/v1/models", Some(key), process_id).await?;
-        let body = validate_response(&allowed, 200)?;
-        let models: serde_json::Value = serde_json::from_slice(body).map_err(io::Error::other)?;
-        if !models.get("data").is_some_and(serde_json::Value::is_array) {
-            return Err(io::Error::other("Backend authentication probe failed."));
-        }
+        validate_models_pair(&denied, &allowed)?;
         Ok::<Vec<u8>, io::Error>(allowed)
     })
     .await
@@ -1257,9 +1507,65 @@ async fn authenticated_models(port: u16, key: &str, process_id: u32) -> Option<V
     .and_then(Result::ok)
 }
 
+async fn pipe_authenticated_models(
+    backend: &crate::pipe_transport::PipeBackend,
+    key: &str,
+) -> Option<Vec<u8>> {
+    let denied = pipe_exchange(backend, "/v1/models", None).await.ok()?;
+    let allowed = pipe_exchange(backend, "/v1/models", Some(key)).await.ok()?;
+    validate_models_pair(&denied, &allowed).ok()?;
+    Some(allowed)
+}
+
 #[cfg(test)]
 async fn authenticated(port: u16, key: &str, process_id: u32) -> bool {
     authenticated_models(port, key, process_id).await.is_some()
+}
+
+async fn pipe_exchange(
+    backend: &crate::pipe_transport::PipeBackend,
+    path: &str,
+    key: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    timeout(Duration::from_secs(2), async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let stream = backend
+            .connect(deadline)
+            .await
+            .map_err(|_| io::Error::other("Broker-pipe connect failed."))?;
+        exchange_http(
+            stream,
+            crate::pipe_transport::BROKER_PIPE_HOST_PORT,
+            path,
+            key,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Broker-pipe readiness timed out."))?
+}
+
+async fn exchange_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    port: u16,
+    path: &str,
+    key: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    let head = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    if let Some(key) = key {
+        stream.write_all(b"Authorization: Bearer ").await?;
+        stream.write_all(key.as_bytes()).await?;
+        stream.write_all(b"\r\n").await?;
+    }
+    stream.write_all(b"Connection: close\r\n\r\n").await?;
+    stream.flush().await?;
+    let mut bytes = Vec::with_capacity(1024);
+    stream
+        .take(u64::try_from(HEALTH_LIMIT + 1).map_err(io::Error::other)?)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
 }
 
 async fn exchange(
@@ -1275,22 +1581,9 @@ async fn exchange(
         Ok(())
     };
     check_owner()?;
-    let mut stream = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
+    let stream = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
     check_owner()?;
-    let head = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
-    stream.write_all(head.as_bytes()).await?;
-    if let Some(key) = key {
-        stream.write_all(b"Authorization: Bearer ").await?;
-        stream.write_all(key.as_bytes()).await?;
-        stream.write_all(b"\r\n").await?;
-    }
-    stream.write_all(b"Connection: close\r\n\r\n").await?;
-    let mut bytes = Vec::with_capacity(1024);
-    stream
-        .take(u64::try_from(HEALTH_LIMIT + 1).map_err(io::Error::other)?)
-        .read_to_end(&mut bytes)
-        .await?;
-    Ok(bytes)
+    exchange_http(stream, port, path, key).await
 }
 
 fn validate_health(bytes: &[u8]) -> io::Result<()> {
@@ -1751,7 +2044,7 @@ mod tests {
                     repacked,
                 )
                 .map_err(|_| LaunchError::Policy)?;
-                let child = config.native_arguments(&plan, &key);
+                let child = config.native_arguments(&plan, Some(&key));
                 let expected_flag = workers != "1";
                 assert_eq!(
                     child.iter().filter(|arg| *arg == "--row-workers").count(),
@@ -1839,7 +2132,7 @@ mod tests {
             selected.extend(["--prompt-reuse", name].map(OsString::from));
             let config = LaunchConfig::parse(selected.clone())?;
             assert_eq!(config.latest_prompt_reuse, latest);
-            let child = config.native_arguments(&plan, &key);
+            let child = config.native_arguments(&plan, Some(&key));
             assert_eq!(
                 child
                     .array_windows()
@@ -1918,7 +2211,7 @@ mod tests {
         let mut config = LaunchConfig::parse(native)?;
         for policy in [KvCache::Rsq4, KvCache::F16, KvCache::Rsq4K3v] {
             config.kv_cache = Some(policy);
-            let child = config.native_arguments(&plan, &key);
+            let child = config.native_arguments(&plan, Some(&key));
             assert_eq!(
                 child
                     .array_windows::<2>()
@@ -1983,7 +2276,7 @@ mod tests {
         for placement in [Placement::Auto, Placement::Cpu] {
             // Model-free routing control for the exact reviewed source-bound release.
             config.placement = placement;
-            let child = config.native_arguments(&plan, &key);
+            let child = config.native_arguments(&plan, Some(&key));
             assert_eq!(
                 child
                     .array_windows::<2>()
@@ -1996,6 +2289,13 @@ mod tests {
                 admitted
             );
         }
+        let pipe_child = config.native_arguments(&plan, None);
+        assert!(pipe_child.iter().any(|arg| arg == "--broker-pipe"));
+        assert!(
+            !pipe_child
+                .iter()
+                .any(|arg| arg == "--port" || arg == "--key-file")
+        );
         Ok(())
     }
 
@@ -2400,5 +2700,111 @@ mod tests {
         assert!(temp_cfg.mmproj_guard()?.is_none());
         let _cleanup = std::fs::remove_dir_all(&temp);
         Ok(())
+    }
+
+    #[test]
+    fn require_broker_pipe_enforces_sandbox_native_engine_and_reviewed_release() {
+        let mut valid = [
+            "--launch-development",
+            "--require-native-sandbox",
+            "--require-broker-pipe",
+            "--profile",
+            "swift-pq2-assessment",
+            "--data-directory",
+            "C:\\ExternalData",
+            "--evidence-parent",
+            "C:\\ExternalEvidence",
+            "--frontend-port",
+            "0",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        // While BROKER_PIPE_RELEASE is None, valid flag combinations fail closed with NativeRuntime.
+        assert_eq!(
+            LaunchConfig::parse(valid.clone()).err(),
+            Some(LaunchError::NativeRuntime)
+        );
+
+        // Duplicate flag is rejected as Arguments.
+        let mut dup = valid.clone();
+        dup.push("--require-broker-pipe".into());
+        assert_eq!(LaunchConfig::parse(dup).err(), Some(LaunchError::Arguments));
+
+        // Optional explicit --backend-port still fails closed with NativeRuntime when release is unpinned.
+        valid.extend(["--backend-port", "8081"].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse(valid).err(),
+            Some(LaunchError::NativeRuntime)
+        );
+
+        // Invalid combinations reject with Arguments before release gating.
+        for bad in [
+            vec![
+                "--launch-development",
+                "--allow-unisolated-backend",
+                "--require-broker-pipe",
+                "--profile",
+                "swift-pq2-assessment",
+                "--data-directory",
+                "C:\\ExternalData",
+                "--evidence-parent",
+                "C:\\ExternalEvidence",
+                "--frontend-port",
+                "0",
+            ],
+            vec![
+                "--launch-development",
+                "--require-native-sandbox",
+                "--require-broker-pipe",
+                "--profile",
+                "swift-pq2-assessment",
+                "--publisher-engine",
+                "--data-directory",
+                "C:\\ExternalData",
+                "--evidence-parent",
+                "C:\\ExternalEvidence",
+                "--frontend-port",
+                "0",
+            ],
+            vec![
+                "--launch-development",
+                "--require-native-sandbox",
+                "--require-broker-pipe",
+                "--data-directory",
+                "C:\\ExternalData",
+                "--evidence-parent",
+                "C:\\ExternalEvidence",
+                "--frontend-port",
+                "0",
+            ],
+        ] {
+            let args = bad.into_iter().map(OsString::from).collect::<Vec<_>>();
+            assert_eq!(
+                LaunchConfig::parse(args).err(),
+                Some(LaunchError::Arguments)
+            );
+        }
+
+        // Omitting --backend-port without --require-broker-pipe still rejects.
+        let missing_port = [
+            "--launch-development",
+            "--require-native-sandbox",
+            "--profile",
+            "swift-pq2-assessment",
+            "--data-directory",
+            "C:\\ExternalData",
+            "--evidence-parent",
+            "C:\\ExternalEvidence",
+            "--frontend-port",
+            "0",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            LaunchConfig::parse(missing_port).err(),
+            Some(LaunchError::Arguments)
+        );
     }
 }
