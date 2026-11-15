@@ -290,10 +290,20 @@ fn row_worker_evidence_cannot_qualify_a_different_execution_policy() -> crate::R
     assert_eq!(parallel["identities"]["nativeRowWorkers"], 4);
     assert!(score(evidence(&single)?, &parallel, &std::env::temp_dir()).is_err());
     assert!(score(evidence(&parallel)?, &single, &std::env::temp_dir()).is_err());
+    for workers in [8_u8, 12] {
+        let parallel_workers = policy(
+            &"a".repeat(40),
+            workers,
+            None,
+            WeightRepresentation::OriginalPq2,
+        )?;
+        assert_eq!(parallel_workers["identities"]["nativeRowWorkers"], workers);
+    }
     for value in [
         json!(0),
         json!(2),
-        json!(8),
+        json!(5),
+        json!(16),
         json!(256),
         json!(-1),
         json!("4"),

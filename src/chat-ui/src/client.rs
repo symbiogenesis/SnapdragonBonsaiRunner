@@ -528,10 +528,11 @@ fn runtime_arguments(config: &Config) -> Vec<&'static str> {
     }
     arguments.extend([
         "--native-row-workers",
-        if config.native_row_workers == 4 {
-            "4"
-        } else {
-            "1"
+        match config.native_row_workers {
+            4 => "4",
+            8 => "8",
+            12 => "12",
+            _ => "1",
         },
     ]);
     if config.latest_prompt_reuse {
@@ -1556,6 +1557,21 @@ mod tests {
                 "4"
             ]
         );
+        for (workers, text) in [(8, "8"), (12, "12")] {
+            config.native_row_workers = workers;
+            assert_eq!(
+                runtime_arguments(&config),
+                [
+                    "--use-abliterate-lora",
+                    "--use-original-pq2",
+                    "--native-engine",
+                    "--reset-on-cancel",
+                    "--native-row-workers",
+                    text
+                ]
+            );
+        }
+        config.native_row_workers = 4;
         config.use_abliterate_lora = false;
         config.use_repacked_ptq1 = true;
         assert_eq!(

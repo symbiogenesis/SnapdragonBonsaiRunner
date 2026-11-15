@@ -246,7 +246,9 @@ fn row_workers_supported(
     workers: u8,
     memory_release: Option<(&str, &str)>,
 ) -> Result<(), LaunchError> {
-    if workers == 1 || (workers == 4 && reviewed_release_matches(release, memory_release)) {
+    if workers == 1
+        || (matches!(workers, 4 | 8 | 12) && reviewed_release_matches(release, memory_release))
+    {
         Ok(())
     } else {
         Err(LaunchError::Artifacts)
@@ -597,8 +599,9 @@ mod tests {
     #[test]
     fn four_row_workers_require_the_reviewed_parallel_release() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
-        assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
-        assert!(row_workers_supported(&pin, 4, MEMORY_CONTEXT_RELEASE).is_ok());
+        for workers in [1, 4, 8, 12] {
+            assert!(row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE).is_ok());
+        }
         for workers in [0, 2, 3, 5, 16, 255] {
             assert_eq!(
                 row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE),
@@ -622,18 +625,22 @@ mod tests {
         ] {
             pin.version = version.into();
             assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
-            assert_eq!(
-                row_workers_supported(&pin, 4, MEMORY_CONTEXT_RELEASE),
-                Err(LaunchError::Artifacts)
-            );
+            for workers in [4, 8, 12] {
+                assert_eq!(
+                    row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE),
+                    Err(LaunchError::Artifacts)
+                );
+            }
         }
         pin = release(LOCK)?;
         pin.commit = "0".repeat(40);
         assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
-        assert_eq!(
-            row_workers_supported(&pin, 4, MEMORY_CONTEXT_RELEASE),
-            Err(LaunchError::Artifacts)
-        );
+        for workers in [4, 8, 12] {
+            assert_eq!(
+                row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE),
+                Err(LaunchError::Artifacts)
+            );
+        }
         Ok(())
     }
 

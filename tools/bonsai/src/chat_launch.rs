@@ -199,17 +199,32 @@ where
 
 impl Request {
     const fn native_row_workers(&self) -> u8 {
+        self.native_row_workers_for_family(None)
+    }
+
+    const fn native_row_workers_for_family(
+        &self,
+        family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+    ) -> u8 {
         match self.native_row_workers {
             Some(workers) => workers,
-            None if self.native_engine => 4,
+            None if self.native_engine => {
+                bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_workers(family)
+            }
             None => 1,
         }
     }
 
-    fn validate_native_runtime(&mut self) -> crate::Result<()> {
-        let workers = self.native_row_workers();
-        if !matches!(workers, 1 | 4) || (workers == 4 && !self.native_engine) {
-            return Err("NativeRowWorkers must be 1 or 4; four requires NativeEngine.".into());
+    fn validate_native_runtime(
+        &mut self,
+        family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+    ) -> crate::Result<()> {
+        let workers = self.native_row_workers_for_family(family);
+        if !matches!(workers, 1 | 4 | 8 | 12) || (workers != 1 && !self.native_engine) {
+            return Err(
+                "NativeRowWorkers must be 1, 4, 8 or 12; parallel workers require NativeEngine."
+                    .into(),
+            );
         }
         if self.prompt_reuse == PromptReuse::Latest && !self.native_engine {
             return Err("Latest prompt reuse requires NativeEngine.".into());
@@ -332,8 +347,37 @@ fn validate_paths(request: &Request) -> crate::Result<()> {
     Ok(())
 }
 
-fn prepare(mut request: Request, native_host: bool) -> crate::Result<Plan> {
-    request.validate_native_runtime()?;
+fn observed_host_family() -> Option<bonsai_cpu_policy::hardware::SnapdragonFamily> {
+    #[cfg(windows)]
+    {
+        std::thread::available_parallelism()
+            .ok()
+            .is_some_and(|cores| cores.get() >= 8)
+            .then(|| bonsai_windows_process::native_build_host().ok())
+            .flatten()
+            .and_then(|host| {
+                bonsai_cpu_policy::hardware::SnapdragonFamily::from_processor_name(
+                    &host.processor_name,
+                )
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+fn prepare(request: Request, native_host: bool) -> crate::Result<Plan> {
+    prepare_for_family(request, native_host, None)
+}
+
+fn prepare_for_family(
+    mut request: Request,
+    native_host: bool,
+    family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+) -> crate::Result<Plan> {
+    request.validate_native_runtime(family)?;
     if !request.speech_models_only && !native_host {
         return Err("Run chat in the native ARM64 executable on Windows ARM64.".into());
     }
@@ -1084,7 +1128,11 @@ pub fn run(value: Value) -> crate::Result<Value> {
         };
         Some(guard)
     };
-    let plan = prepare(request, cfg!(all(windows, target_arch = "aarch64")))?;
+    let plan = prepare_for_family(
+        request,
+        cfg!(all(windows, target_arch = "aarch64")),
+        observed_host_family(),
+    )?;
     let working = working_directory(plan.request.working_directory.as_deref())?;
     if plan.request.speech_models_only {
         return prepare_backend(plan, &mut Native, &working);
@@ -1113,7 +1161,11 @@ pub fn run(value: Value) -> crate::Result<Value> {
 pub fn prepare_run(value: Value) -> crate::Result<Value> {
     crate::startup_cancel::checkpoint()?;
     let request: Request = serde_json::from_value(value).map_err(|error| error.to_string())?;
-    let plan = prepare(request, cfg!(all(windows, target_arch = "aarch64")))?;
+    let plan = prepare_for_family(
+        request,
+        cfg!(all(windows, target_arch = "aarch64")),
+        observed_host_family(),
+    )?;
     if plan.request.speech_models_only {
         return Err("Use chat-launch for SpeechModelsOnly provisioning.".into());
     }

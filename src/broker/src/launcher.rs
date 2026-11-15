@@ -51,7 +51,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  --frontend-port <0-or-1024..65535> --backend-port <1024..65535>\n",
     "  [--profile <reference-cpu|swift-pq2-assessment>]\n",
     "  [--native-engine|--publisher-engine] (Swift defaults to the pinned Rust runtime; publisher is explicit rollback)\n",
-    "  [--native-row-workers 1|4] (Rust defaults to 4; publisher supports only 1)\n",
+    "  [--native-row-workers 1|4|8|12] (Rust defaults to 8 on Snapdragon X1 or 4 otherwise; publisher supports only 1)\n",
     "  [--prompt-reuse disabled|latest] (experimental exact latest-state reuse; Rust only)\n",
     "  [--kv-cache f16|rsq4|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
     "  [--placement auto|cpu] (native Swift only; CPU requires a reviewed compatible release)\n",
@@ -157,6 +157,37 @@ impl LaunchConfig {
     /// # Errors
     /// Rejects unknown/repeated options, nondecimal ports and missing opt-ins.
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, LaunchError> {
+        Self::parse_for_family(args, None)
+    }
+
+    /// Parse the launcher arguments using the observed Windows ARM64 host family
+    /// when `--native-row-workers` is omitted.
+    ///
+    /// # Errors
+    /// Rejects unknown/repeated options, nondecimal ports and missing opt-ins.
+    pub fn parse_host(args: impl IntoIterator<Item = OsString>) -> Result<Self, LaunchError> {
+        let family = std::thread::available_parallelism()
+            .ok()
+            .is_some_and(|cores| cores.get() >= 8)
+            .then(|| bonsai_windows_process::native_build_host().ok())
+            .flatten()
+            .and_then(|host| {
+                bonsai_cpu_policy::hardware::SnapdragonFamily::from_processor_name(
+                    &host.processor_name,
+                )
+            });
+        Self::parse_for_family(args, family)
+    }
+
+    /// Parse the launcher arguments using an explicit Snapdragon host family for
+    /// default `--native-row-workers` selection.
+    ///
+    /// # Errors
+    /// Rejects unknown/repeated options, nondecimal ports and missing opt-ins.
+    pub fn parse_for_family(
+        args: impl IntoIterator<Item = OsString>,
+        family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+    ) -> Result<Self, LaunchError> {
         let mut args = args.into_iter();
         let (mut launch, mut unisolated, mut require_native_sandbox) = (false, false, false);
         let mut check_only = false;
@@ -235,7 +266,11 @@ impl LaunchConfig {
         let max_waiting = max_waiting.unwrap_or(2);
         let profile = profile.unwrap_or_default();
         let native_engine = native_engine.unwrap_or(profile == LaunchProfile::SwiftPq2Assessment);
-        let native_row_workers = native_row_workers.unwrap_or(if native_engine { 4 } else { 1 });
+        let native_row_workers = native_row_workers.unwrap_or(if native_engine {
+            bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_workers(family)
+        } else {
+            1
+        });
         let latest_prompt_reuse = latest_prompt_reuse.unwrap_or(false);
         let kv_cache = crate::inference::pinned_kv_cache(native_engine, kv_cache)?;
         if placement.is_some() && profile != LaunchProfile::SwiftPq2Assessment {
@@ -279,7 +314,7 @@ impl LaunchConfig {
             || self.backend_port == self.frontend_port
             || self.max_waiting > MAX_WAITING
             || (self.native_engine && !swift)
-            || (self.native_row_workers == 4 && !self.native_engine)
+            || (self.native_row_workers != 1 && !self.native_engine)
             || (self.latest_prompt_reuse && !self.native_engine)
             || (self.reset_on_cancel && !self.native_engine)
             || (self.no_mmproj && !swift)
@@ -561,8 +596,11 @@ impl LaunchConfig {
                 OsString::from(plan.memory_limit_bytes.to_string()),
             ]);
         }
-        if self.native_row_workers == 4 {
-            arguments.extend([OsString::from("--row-workers"), OsString::from("4")]);
+        if self.native_row_workers > 1 {
+            arguments.extend([
+                OsString::from("--row-workers"),
+                OsString::from(self.native_row_workers.to_string()),
+            ]);
         }
         if self.latest_prompt_reuse {
             arguments.extend([OsString::from("--prompt-reuse"), OsString::from("latest")]);
@@ -1038,6 +1076,8 @@ fn row_workers(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
     match value.and_then(std::ffi::OsStr::to_str) {
         Some("1") => Ok(1),
         Some("4") => Ok(4),
+        Some("8") => Ok(8),
+        Some("12") => Ok(12),
         _ => Err(LaunchError::Arguments),
     }
 }
@@ -1676,20 +1716,23 @@ mod tests {
             Some(LaunchError::Arguments)
         );
         for profile in [None, Some("swift-pq2-assessment")] {
-            let mut publisher = arguments();
-            if let Some(profile) = profile {
-                publisher.extend(["--profile", profile].map(OsString::from));
+            for workers in ["4", "8", "12"] {
+                let mut publisher = arguments();
+                if let Some(profile) = profile {
+                    publisher.extend(["--profile", profile].map(OsString::from));
+                }
+                publisher.extend(
+                    ["--publisher-engine", "--native-row-workers", workers].map(OsString::from),
+                );
+                assert_eq!(
+                    LaunchConfig::parse(publisher).err(),
+                    Some(LaunchError::Arguments)
+                );
             }
-            publisher
-                .extend(["--publisher-engine", "--native-row-workers", "4"].map(OsString::from));
-            assert_eq!(
-                LaunchConfig::parse(publisher).err(),
-                Some(LaunchError::Arguments)
-            );
         }
         let data = std::env::temp_dir().join("Bonsai-row-routing");
         let key = data.join("backend.key");
-        for workers in ["1", "4"] {
+        for workers in ["1", "4", "8", "12"] {
             for repacked in [false, true] {
                 let mut args = native.clone();
                 args.extend(
@@ -1709,15 +1752,16 @@ mod tests {
                 )
                 .map_err(|_| LaunchError::Policy)?;
                 let child = config.native_arguments(&plan, &key);
+                let expected_flag = workers != "1";
                 assert_eq!(
                     child.iter().filter(|arg| *arg == "--row-workers").count(),
-                    usize::from(workers == "4")
+                    usize::from(expected_flag)
                 );
-                if workers == "4" {
+                if expected_flag {
                     assert!(
                         child
                             .array_windows()
-                            .any(|[flag, value]| flag == "--row-workers" && value == "4")
+                            .any(|[flag, value]| flag == "--row-workers" && value == workers)
                     );
                 }
                 let adapter = plan.adapter.as_ref().ok_or(LaunchError::Adapter)?;
@@ -1733,6 +1777,43 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn snapdragon_x1_host_defaults_native_row_workers_to_eight() -> Result<(), LaunchError> {
+        use bonsai_cpu_policy::hardware::SnapdragonFamily;
+
+        let mut swift = arguments();
+        swift.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse_for_family(swift.clone(), Some(SnapdragonFamily::XElite))?
+                .native_row_workers,
+            8
+        );
+        assert_eq!(
+            LaunchConfig::parse_for_family(swift.clone(), Some(SnapdragonFamily::X2EliteExtreme))?
+                .native_row_workers,
+            4
+        );
+        assert_eq!(
+            LaunchConfig::parse_for_family(swift.clone(), None)?.native_row_workers,
+            4
+        );
+        let mut explicit = swift.clone();
+        explicit.extend(["--native-row-workers", "12"].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse_for_family(explicit, Some(SnapdragonFamily::XElite))?
+                .native_row_workers,
+            12
+        );
+        let mut publisher = swift;
+        publisher.push("--publisher-engine".into());
+        assert_eq!(
+            LaunchConfig::parse_for_family(publisher, Some(SnapdragonFamily::XElite))?
+                .native_row_workers,
+            1
+        );
         Ok(())
     }
 

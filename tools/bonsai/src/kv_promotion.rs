@@ -194,7 +194,7 @@ fn policy(declaration: &Declaration) -> crate::Result<Value> {
             && ids.seed == 42
             && ids.context_tokens == 8192
             && (1..=4096).contains(&ids.max_completion_tokens)
-            && matches!(ids.row_workers, 1 | 4)
+            && matches!(ids.row_workers, 1 | 4 | 8 | 12)
             && concrete(&ids.projection_backend),
         "Declare the standard adapter/seed, fixed 8K bound, supported worker count and projection placement.",
     )?;

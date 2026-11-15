@@ -16,7 +16,7 @@ Uses a prebuilt bonsai-tools executable. Rust owns startup and application polic
 param(
     [switch]$NativeEngine,
     [switch]$PublisherEngine,
-    [ValidateSet(1, 4)]
+    [ValidateSet(1, 4, 8, 12)]
     [int]$NativeRowWorkers,
     [ValidateSet('disabled', 'latest')]
     [string]$PromptReuse,

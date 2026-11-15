@@ -264,9 +264,9 @@ impl Request {
             return Err("Batched operations require the explicit HMX bitplane backend.".into());
         }
         if self.adapter_path.is_some() != (self.adapter_case != AdapterCase::None)
-            || ![1, 4].contains(&self.row_workers)
+            || ![1, 4, 8, 12].contains(&self.row_workers)
         {
-            return Err("Select the approved adapter path exactly for an adapter case, and one or four CPU row workers.".into());
+            return Err("Select the approved adapter path exactly for an adapter case, and 1, 4, 8 or 12 CPU row workers.".into());
         }
         Ok(())
     }

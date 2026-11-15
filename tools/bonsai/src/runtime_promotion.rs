@@ -297,8 +297,8 @@ fn policy(
     weight_representation: WeightRepresentation,
 ) -> crate::Result<Value> {
     require(
-        matches!(native_row_workers, 1 | 4),
-        "Promotion requires an explicitly supported native row-worker count (1 or 4).",
+        matches!(native_row_workers, 1 | 4 | 8 | 12),
+        "Promotion requires an explicitly supported native row-worker count (1, 4, 8 or 12).",
     )?;
     require(
         is_lower_hex(revision, 40),

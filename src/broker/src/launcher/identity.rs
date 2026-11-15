@@ -60,7 +60,7 @@ impl WorkerReadiness {
     }
 
     fn accepts(self, observed: Option<u8>) -> bool {
-        matches!(self.expected, 1 | 4)
+        matches!(self.expected, 1 | 4 | 8 | 12)
             && observed.map_or(self.legacy_missing_allowed, |workers| {
                 workers == self.expected
             })
@@ -928,6 +928,46 @@ mod tests {
                 .is_err()
             );
         }
+        for expected in [8, 12] {
+            let policy = WorkerReadiness::for_version("0.1.30", expected);
+            assert!(validate_native_identity(&response(None), false, false, policy).is_err());
+            assert!(
+                validate_native_identity(
+                    &response(Some(&expected.to_string())),
+                    false,
+                    false,
+                    policy,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_row_worker_readiness_accepts_eight_and_twelve() -> Result<(), serde_json::Error> {
+        use crate::inference::KvCache;
+        use serde_json::json;
+
+        for expected in [4_u8, 8, 12] {
+            let (mut model, _) = kv_cache_model(false, false);
+            model["row_workers"] = json!(expected);
+            model["startup_projection"] = projection_startup("cpu");
+            let policy =
+                WorkerReadiness::for_version("0.1.30", expected).with_kv_cache(Some(KvCache::Rsq4));
+            assert!(
+                validate_native_identity(&model_response(&model)?, false, false, policy).is_ok()
+            );
+            for other in [1_u8, 4, 8, 12] {
+                if other != expected {
+                    model["row_workers"] = json!(other);
+                    assert!(
+                        validate_native_identity(&model_response(&model)?, false, false, policy)
+                            .is_err()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 

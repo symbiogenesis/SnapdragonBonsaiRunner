@@ -56,12 +56,92 @@ mod tts;
 mod window;
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostFamily {
+    SnapdragonXElite,
+    Other,
+}
+
+#[cfg(windows)]
+impl HostFamily {
+    const fn default_native_row_workers(self) -> u8 {
+        match self {
+            Self::SnapdragonXElite => 8,
+            Self::Other => 4,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn host_family_from_processor_name(name: &str) -> HostFamily {
+    if name.is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
+        return HostFamily::Other;
+    }
+    let mut words = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| {
+            !word.is_empty() && !word.eq_ignore_ascii_case("r") && !word.eq_ignore_ascii_case("tm")
+        });
+    let Some(mut word) = words.next() else {
+        return HostFamily::Other;
+    };
+    if word.eq_ignore_ascii_case("qualcomm") {
+        let Some(next) = words.next() else {
+            return HostFamily::Other;
+        };
+        word = next;
+    }
+    if !word.eq_ignore_ascii_case("snapdragon") {
+        return HostFamily::Other;
+    }
+    let Some(generation) = words.next() else {
+        return HostFamily::Other;
+    };
+    let Some(tier) = words.next() else {
+        return HostFamily::Other;
+    };
+    let extreme = words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("extreme"));
+    if (generation.eq_ignore_ascii_case("x") || generation.eq_ignore_ascii_case("x1"))
+        && tier.eq_ignore_ascii_case("elite")
+        && !extreme
+    {
+        HostFamily::SnapdragonXElite
+    } else {
+        HostFamily::Other
+    }
+}
+
+#[cfg(windows)]
+fn detect_host_family() -> HostFamily {
+    let enough_cores = std::thread::available_parallelism()
+        .ok()
+        .is_some_and(|cores| cores.get() >= 8);
+    if !enough_cores {
+        return HostFamily::Other;
+    }
+    let Ok(host) = bonsai_windows_process::native_build_host() else {
+        return HostFamily::Other;
+    };
+    host_family_from_processor_name(&host.processor_name)
+}
+
+#[cfg(all(test, windows))]
+fn configuration(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<client::Config, &'static str> {
+    configuration_for_family(args, HostFamily::Other)
+}
+
+#[cfg(windows)]
 #[expect(
     clippy::too_many_lines,
     reason = "Parse the bounded native launcher contract without accepting arbitrary service arguments."
 )]
-fn configuration(
+fn configuration_for_family(
     args: impl IntoIterator<Item = std::ffi::OsString>,
+    host_family: HostFamily,
 ) -> Result<client::Config, &'static str> {
     use std::path::PathBuf;
     let mut args = args.into_iter();
@@ -98,7 +178,9 @@ fn configuration(
                     match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
                         Some("1") => 1,
                         Some("4") => 4,
-                        _ => return Err("Native row workers must be 1 or 4."),
+                        Some("8") => 8,
+                        Some("12") => 12,
+                        _ => return Err("Native row workers must be 1, 4, 8 or 12."),
                     },
                 );
             }
@@ -230,13 +312,17 @@ fn configuration(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
     }
     let native_engine = native_engine.unwrap_or(true);
-    let native_row_workers = native_row_workers.unwrap_or(if native_engine { 4 } else { 1 });
+    let native_row_workers = native_row_workers.unwrap_or(if native_engine {
+        host_family.default_native_row_workers()
+    } else {
+        1
+    });
     let latest_prompt_reuse = latest_prompt_reuse.unwrap_or(false);
     if latest_prompt_reuse && !native_engine {
         return Err("Latest prompt reuse requires --native-engine.");
@@ -247,8 +333,8 @@ fn configuration(
     if placement.is_some() && !native_engine {
         return Err("Placement selection requires --native-engine.");
     }
-    if native_row_workers == 4 && !native_engine {
-        return Err("Four native row workers require --native-engine.");
+    if native_row_workers != 1 && !native_engine {
+        return Err("Parallel native row workers require --native-engine.");
     }
     let canary_launch = match (canary_executable, canary_model) {
         (None, None) => None,
@@ -405,7 +491,7 @@ fn main() -> std::process::ExitCode {
     {
         startup::Request::parse(&args).and_then(window::run_startup)
     } else {
-        configuration(args)
+        configuration_for_family(args, detect_host_family())
             .map_err(std::io::Error::other)
             .and_then(window::run)
             .map(|()| false)
@@ -773,12 +859,12 @@ mod tests {
         let mut native = args.clone();
         native.push("--native-engine".into());
         assert!(configuration(native.clone()).is_ok_and(|config| config.use_abliterate_lora));
-        for value in ["0", "2", "3", "16", "01", "+4", "4.0", " 4"] {
+        for value in ["0", "2", "3", "5", "16", "01", "+4", "4.0", " 4"] {
             let mut rejected = native.clone();
             rejected.extend(["--native-row-workers", value].map(OsString::from));
             assert!(configuration(rejected).is_err());
         }
-        for value in ["1", "4"] {
+        for value in ["1", "4", "8", "12"] {
             let mut configured = native.clone();
             configured.extend(["--native-row-workers", value].map(OsString::from));
             let selected = configuration(configured.clone()).map_err(io::Error::other)?;
@@ -787,10 +873,28 @@ mod tests {
             configured.extend(["--native-row-workers", value].map(OsString::from));
             assert!(configuration(configured).is_err());
         }
-        let mut publisher_rows = args.clone();
-        publisher_rows
-            .extend(["--publisher-engine", "--native-row-workers", "4"].map(OsString::from));
-        assert!(configuration(publisher_rows).is_err());
+        for value in ["4", "8", "12"] {
+            let mut publisher_rows = args.clone();
+            publisher_rows
+                .extend(["--publisher-engine", "--native-row-workers", value].map(OsString::from));
+            assert!(configuration(publisher_rows).is_err());
+        }
+        let x1_default = super::configuration_for_family(
+            args.clone(),
+            super::host_family_from_processor_name(
+                "Snapdragon(R) X Elite - X1E78100 - Qualcomm(R) Oryon(TM) CPU",
+            ),
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(x1_default.native_row_workers, 8);
+        let x2_default = super::configuration_for_family(
+            args.clone(),
+            super::host_family_from_processor_name(
+                "Snapdragon(R) X2 Elite Extreme - X2E-94-100 - Qualcomm(R) Oryon(TM) CPU",
+            ),
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(x2_default.native_row_workers, 4);
         let mut missing_rows = native.clone();
         missing_rows.push("--native-row-workers".into());
         assert!(configuration(missing_rows).is_err());

@@ -85,7 +85,7 @@ fn launched(args: Vec<OsString>) -> ExitCode {
     let Ok((args, owner_control)) = OwnerShutdown::take_arguments(args) else {
         return failure(b"Private owner shutdown control rejected.\n");
     };
-    let Ok(configuration) = LaunchConfig::parse(args) else {
+    let Ok(configuration) = LaunchConfig::parse_host(args) else {
         return failure(LAUNCH_USAGE.as_bytes());
     };
     let profile_name = if configuration.uses_native_engine() {

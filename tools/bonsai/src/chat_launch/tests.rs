@@ -1177,42 +1177,59 @@ fn missing_app_selection_and_force_build_reach_build_owners() -> crate::Result<(
 
 #[test]
 fn explicit_rust_runtime_survives_early_window_and_backend_preparation() -> crate::Result<()> {
-    let mut fixture = fixture("native-runtime")?;
-    fixture.request["NativeEngine"] = json!(true);
-    fixture.request["NativeRowWorkers"] = json!(4);
-    fixture.request["NoAbliterateLora"] = json!(true);
-    fixture.request["NoSpeechModels"] = json!(true);
-    let mut recorder = Recorder::new(fixture.root.clone());
-    launch_pending(
-        plan(fixture.request)?.request,
-        &mut recorder,
-        &fixture.working,
-        &fixture.root.join("maintenance.exe"),
+    let mut case = fixture("native-runtime")?;
+    for workers in [4, 8, 12] {
+        case.request["NativeEngine"] = json!(true);
+        case.request["NativeRowWorkers"] = json!(workers);
+        case.request["NoAbliterateLora"] = json!(true);
+        case.request["NoSpeechModels"] = json!(true);
+        let worker_text = workers.to_string();
+        let mut recorder = Recorder::new(case.root.clone());
+        launch_pending(
+            plan(case.request.clone())?.request,
+            &mut recorder,
+            &case.working,
+            &case.root.join("maintenance.exe"),
+        )?;
+        let (_, arguments, _) = recorder.launch()?;
+        let request_path = PathBuf::from(value_after(arguments, "--startup-request")?);
+        let request =
+            serde_json::from_slice(&fs::read(request_path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        let deferred = prepare(request, true)?;
+        assert!(deferred.request.native_engine && deferred.request.no_abliterate_lora);
+        assert_eq!(deferred.request.native_row_workers, Some(workers));
+        let prepared = prepare_backend(deferred, &mut recorder, &case.working)?;
+        let arguments = prepared["Arguments"]
+            .as_array()
+            .ok_or("Missing arguments.")?;
+        assert!(arguments.iter().any(|value| value == "--native-engine"));
+        assert!(
+            arguments
+                .array_windows::<2>()
+                .any(|args| args[0] == "--native-row-workers" && args[1] == worker_text)
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|value| value == "--no-abliterate-lora")
+        );
+        assert!(!arguments.iter().any(|value| value == "--use-repacked-ptq1"));
+    }
+    let mut x1_default = fixture("x1-default")?;
+    x1_default.request["NativeEngine"] = json!(true);
+    let x1_plan = prepare_for_family(
+        serde_json::from_value(x1_default.request.clone()).map_err(|error| error.to_string())?,
+        true,
+        Some(bonsai_cpu_policy::hardware::SnapdragonFamily::XElite),
     )?;
-    let (_, arguments, _) = recorder.launch()?;
-    let request_path = PathBuf::from(value_after(arguments, "--startup-request")?);
-    let request =
-        serde_json::from_slice(&fs::read(request_path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-    let deferred = prepare(request, true)?;
-    assert!(deferred.request.native_engine && deferred.request.no_abliterate_lora);
-    assert_eq!(deferred.request.native_row_workers, Some(4));
-    let prepared = prepare_backend(deferred, &mut recorder, &fixture.working)?;
-    let arguments = prepared["Arguments"]
-        .as_array()
-        .ok_or("Missing arguments.")?;
-    assert!(arguments.iter().any(|value| value == "--native-engine"));
-    assert!(
-        arguments
-            .array_windows::<2>()
-            .any(|args| args[0] == "--native-row-workers" && args[1] == "4")
-    );
-    assert!(
-        arguments
-            .iter()
-            .any(|value| value == "--no-abliterate-lora")
-    );
-    assert!(!arguments.iter().any(|value| value == "--use-repacked-ptq1"));
+    assert_eq!(x1_plan.request.native_row_workers, Some(8));
+    let x2_plan = prepare_for_family(
+        serde_json::from_value(x1_default.request).map_err(|error| error.to_string())?,
+        true,
+        Some(bonsai_cpu_policy::hardware::SnapdragonFamily::X2EliteExtreme),
+    )?;
+    assert_eq!(x2_plan.request.native_row_workers, Some(4));
     Ok(())
 }
 
@@ -1247,7 +1264,10 @@ fn invalid_options_reject_before_provisioning() -> crate::Result<()> {
     let fixture = fixture("invalid")?;
     for patch in [
         json!({"NativeRowWorkers": 4}),
+        json!({"NativeRowWorkers": 8}),
+        json!({"NativeRowWorkers": 12}),
         json!({"NativeEngine": true, "NativeRowWorkers": 2}),
+        json!({"NativeEngine": true, "NativeRowWorkers": 16}),
         json!({"NativeEngine": true, "NativeRowWorkers": 0}),
         json!({"NativeEngine": true, "NativeRowWorkers": "4"}),
         json!({"NativeEngine": true, "NativeRowWorkers": 4.0}),
