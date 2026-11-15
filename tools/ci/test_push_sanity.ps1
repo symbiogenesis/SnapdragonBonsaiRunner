@@ -2,7 +2,7 @@
 param([string]$Case)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
 $adapter=Join-Path $PSScriptRoot 'check_push_sanity.ps1'
-function Invoke-PushRecoveryFixture([string]$CheckerState,[string]$RecoveryState='valid',[switch]$RunRecovery) {
+function Invoke-PushRecoveryFixture([string]$CheckerState,[string]$RecoveryState='valid',[switch]$RunRecovery,[ValidateSet('none','handoff','invalid-output')][string]$PreparationState='none') {
     $scratch=New-CiScratch 'bonsai-push-recovery-'
     try {
         $repository=Join-Path $scratch 'repository'; $target=Join-Path $scratch 'target'
@@ -11,6 +11,27 @@ function Invoke-PushRecoveryFixture([string]$CheckerState,[string]$RecoveryState
         foreach ($path in @('Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo/fixture.txt','tools/ci/fixture.txt','src/artifacts/fixture.txt','src/windows-process/fixture.txt','src/windows-credentials/fixture.txt')) { Write-CiFixture $repository $path 'Inert committed build identity; no Cargo consumer.' }
         Write-CiFixture $repository 'unrelated-source.txt' 'Committed full-source input.'
         Write-CiFixture $repository 'scripts/release/Release-Common.ps1' "function Get-ReleaseToolchain([string]`$RepositoryRoot) { 'nightly-2026-11-12-aarch64-pc-windows-msvc' }"
+        if ($PreparationState -cne 'none') {
+            Write-CiFixture $repository 'tools/ci/prepare_push_helpers.ps1' @'
+#Requires -Version 7.6
+param([string]$Root,[string]$SourceRoot,[string]$TargetDirectory,[string]$ScratchDirectory,[long]$BootstrapMilliseconds)
+$global:BonsaiPushAutomaticPreparationCalls++
+Assert-CiEqual $global:BonsaiPushAutomaticPreparationCalls 1
+Assert-CiEqual $Root $global:BonsaiPushPreparationExpectedRoot
+Assert-CiEqual $TargetDirectory $global:BonsaiPushPreparationExpectedTarget
+Assert-CiEqual $SourceRoot ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..')))
+Assert-CiEqual $ScratchDirectory (Split-Path $SourceRoot -Parent)
+Assert-Ci ($BootstrapMilliseconds -gt 0) 'Automatic preparation did not receive elapsed bootstrap time.'
+Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $TargetDirectory 'push-checker.json'))) 'Preparation retained the old checker receipt.'
+Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $TargetDirectory 'push-recovery.json'))) 'Preparation retained the old recovery receipt.'
+Assert-CiEqual ([IO.File]::ReadAllText((Join-Path $SourceRoot 'unrelated-source.txt'))) 'Committed full-source input.'
+if ($global:BonsaiPushPreparationState -ceq 'handoff') { throw 'Expected committed automatic preparation invocation before native execution.' }
+foreach ($entry in @(@{Receipt='push-checker.json';Image='bonsai-ci.exe'},@{Receipt='push-recovery.json';Image='bonsai-push-recovery.exe'})) {
+    $image=Join-Path $TargetDirectory "aarch64-pc-windows-msvc/debug/$($entry.Image)"
+    @{SchemaVersion=1;SourceIdentity=('0' * 64);Sha256=(Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $TargetDirectory $entry.Receipt) -Encoding utf8NoBOM
+}
+'@
+        }
         & git -C $repository init --quiet
         if ($LASTEXITCODE) { throw 'Cannot initialize recovery fixture.' }
         & git -C $repository add --all
@@ -51,13 +72,18 @@ function Invoke-PushRecoveryFixture([string]$CheckerState,[string]$RecoveryState
         if ($RecoveryState -ceq 'missing-image') { [IO.File]::Delete($recovery) }
         if ($RecoveryState -ceq 'corrupt') { [IO.File]::AppendAllText($recovery,'Changed after recovery receipt publication.') }
         Write-CiFixture $repository 'unrelated-source.txt' 'Uncommitted poison must not reach recovery.'
+        if ($PreparationState -cne 'none') { Write-CiFixture $repository 'tools/ci/prepare_push_helpers.ps1' "throw 'Uncommitted preparation helper must never execute.'" }
         $driver=Join-Path $scratch 'recovery-driver.ps1'
         @'
 #Requires -Version 7.6
-param([string]$Adapter,[string]$Repository,[string]$Target,[string]$GitPath,[string]$Support,[string]$RecoveryState,[switch]$RunRecovery)
+param([string]$Adapter,[string]$Repository,[string]$Target,[string]$GitPath,[string]$Support,[string]$RecoveryState,[switch]$RunRecovery,[string]$PreparationState)
 . $Support
 $PSNativeCommandUseErrorActionPreference=$true
 $global:BonsaiPushRecoveryArchiveCalls=0
+$global:BonsaiPushAutomaticPreparationCalls=0
+$global:BonsaiPushPreparationState=$PreparationState
+$global:BonsaiPushPreparationExpectedRoot=$Repository
+$global:BonsaiPushPreparationExpectedTarget=$Target
 function git {
     & $GitPath @args
     if ($LASTEXITCODE) { throw 'Fixture Git command failed.' }
@@ -74,8 +100,9 @@ function git {
         Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
         Assert-CiEqual ([IO.File]::ReadAllText((Join-Path $unpacked 'unrelated-source.txt'))) 'Committed full-source input.'
         Assert-Ci (Test-Path -LiteralPath (Join-Path $unpacked 'Cargo.toml')) 'Recovery omitted committed build inputs.'
-        if ($RecoveryState -cne 'valid') { throw 'Expected automatic preparation from complete committed source before native execution.' }
-        if (-not $RunRecovery) { throw 'Expected complete committed recovery source verified before supervisor execution.' }
+        if ($RecoveryState -cne 'valid') {
+            if ($PreparationState -ceq 'none') { throw 'Expected automatic preparation from complete committed source before native execution.' }
+        } elseif (-not $RunRecovery) { throw 'Expected complete committed recovery source verified before supervisor execution.' }
     }
 }
 $failure=$null
@@ -85,7 +112,16 @@ Assert-Ci ($null -ne $failure) 'Recovery fixture unexpectedly admitted an inert 
 Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-checker.json'))) 'Failed recovery published or retained a checker receipt.'
 if ($RecoveryState -cne 'valid') {
     Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 1
-    Assert-CiEqual $failure 'Expected automatic preparation from complete committed source before native execution.'
+    if ($PreparationState -ceq 'handoff') {
+        Assert-CiEqual $global:BonsaiPushAutomaticPreparationCalls 1
+        Assert-CiEqual $failure 'Expected committed automatic preparation invocation before native execution.'
+    } elseif ($PreparationState -ceq 'invalid-output') {
+        Assert-CiEqual $global:BonsaiPushAutomaticPreparationCalls 1
+        Assert-Ci ($failure.Contains('automatic preparation did not produce verified helpers for the original committed source')) 'Automatic preparation admitted helpers for a different source identity.'
+    } else {
+        Assert-CiEqual $global:BonsaiPushAutomaticPreparationCalls 0
+        Assert-CiEqual $failure 'Expected automatic preparation from complete committed source before native execution.'
+    }
     Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-recovery.json'))) 'Failed automatic preparation published or retained a recovery receipt.'
 } elseif ($RunRecovery) {
     Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 1
@@ -95,7 +131,7 @@ if ($RecoveryState -cne 'valid') {
 }
 'Committed automatic recovery admission and failure retention passed.'
 '@ | Set-Content -LiteralPath $driver -Encoding utf8NoBOM
-        $arguments=@('-NoLogo','-NoProfile','-NonInteractive','-File',$driver,'-Adapter',$adapter,'-Repository',$repository,'-Target',$target,'-GitPath',(Get-Command git -CommandType Application).Source,'-Support',(Join-Path $PSScriptRoot 'test_support.ps1'),'-RecoveryState',$RecoveryState)
+        $arguments=@('-NoLogo','-NoProfile','-NonInteractive','-File',$driver,'-Adapter',$adapter,'-Repository',$repository,'-Target',$target,'-GitPath',(Get-Command git -CommandType Application).Source,'-Support',(Join-Path $PSScriptRoot 'test_support.ps1'),'-RecoveryState',$RecoveryState,'-PreparationState',$PreparationState)
         if ($RunRecovery) { $arguments+='-RunRecovery' }
         "refs/heads/main $head refs/heads/main $head" | & ([Environment]::ProcessPath) @arguments
         if ($LASTEXITCODE) { throw 'Automatic recovery fixture failed.' }
@@ -115,6 +151,8 @@ $cases=[ordered]@{
  corrupt_recovery_helper_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'corrupt' }
  collection_recovery_source_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'collection-source' }
  collection_recovery_digest_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'collection-digest' }
+ automatic_preparation_invokes_committed_helper_once={ Invoke-PushRecoveryFixture 'stale' 'invalid' -PreparationState handoff }
+ automatic_preparation_rejects_invalid_prepared_outputs={ Invoke-PushRecoveryFixture 'stale' 'invalid' -PreparationState invalid-output }
  failed_automatic_recovery_invalidates_existing_receipt={ Invoke-PushRecoveryFixture 'stale' -RunRecovery }
  ordinary_push_archives_only_committed_policy={
     $scratch=New-CiScratch 'bonsai-push-policy-'

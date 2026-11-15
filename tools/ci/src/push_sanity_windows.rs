@@ -927,6 +927,16 @@ mod tests {
     }
 
     #[test]
+    fn push_sanity_automatic_preparation_invokes_committed_helper_once() -> Result<()> {
+        preparation_case("automatic_preparation_invokes_committed_helper_once")
+    }
+
+    #[test]
+    fn push_sanity_automatic_preparation_rejects_invalid_prepared_outputs() -> Result<()> {
+        preparation_case("automatic_preparation_rejects_invalid_prepared_outputs")
+    }
+
+    #[test]
     fn push_sanity_failed_automatic_recovery_invalidates_existing_receipt() -> Result<()> {
         preparation_case("failed_automatic_recovery_invalidates_existing_receipt")
     }
