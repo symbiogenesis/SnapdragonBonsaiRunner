@@ -3,8 +3,10 @@
 use super::{
     Api, DEVICE_NOT_FOUND, GPU, Id, MAX_DEVICES, MAX_PLATFORMS, bounded_count, check, invalid,
 };
-use crate::{OpenClDevice, OpenClPq2Projection, OpenClProjectionSelection};
-use std::ffi::{c_char, c_void};
+use crate::{
+    AdrenoFamily, OpenClDevice, OpenClKernelKind, OpenClPq2Projection, OpenClProjectionSelection,
+};
+use std::ffi::{CStr, c_char, c_void};
 use std::io;
 
 type Context = unsafe extern "system" fn(
@@ -71,6 +73,152 @@ __kernel void pq2_q8k_block_dots(__global const uchar *weights,
     output[block] = sum;
 }
 ";
+
+const GEMV_4ROW_SOURCE: &str = r"
+__kernel void pq2_q8k_gemv_4row(__global const uchar *weights,
+                                __global const char *codes,
+                                __global int *output,
+                                const uint blocks_per_row) {
+    const size_t gid = get_global_id(0);
+    const size_t col_block = gid % blocks_per_row;
+    const size_t row_base = (gid / blocks_per_row) * 4;
+    const size_t act_base = col_block * 128;
+    const size_t r0 = (row_base * blocks_per_row + col_block) * 34 + 2;
+    const size_t r1 = ((row_base + 1) * blocks_per_row + col_block) * 34 + 2;
+    const size_t r2 = ((row_base + 2) * blocks_per_row + col_block) * 34 + 2;
+    const size_t r3 = ((row_base + 3) * blocks_per_row + col_block) * 34 + 2;
+    int sum0 = 0;
+    int sum1 = 0;
+    int sum2 = 0;
+    int sum3 = 0;
+    for (uint lane = 0; lane < 128; ++lane) {
+        const int act = convert_int(codes[act_base + lane]);
+        const uint byte_off = lane / 4;
+        const uint shift = 2 * (lane % 4);
+        sum0 += (convert_int((weights[r0 + byte_off] >> shift) & 3U) - 1) * act;
+        sum1 += (convert_int((weights[r1 + byte_off] >> shift) & 3U) - 1) * act;
+        sum2 += (convert_int((weights[r2 + byte_off] >> shift) & 3U) - 1) * act;
+        sum3 += (convert_int((weights[r3 + byte_off] >> shift) & 3U) - 1) * act;
+    }
+    output[row_base * blocks_per_row + col_block] = sum0;
+    output[(row_base + 1) * blocks_per_row + col_block] = sum1;
+    output[(row_base + 2) * blocks_per_row + col_block] = sum2;
+    output[(row_base + 3) * blocks_per_row + col_block] = sum3;
+}
+";
+
+const GEMV_8ROW_SOURCE: &str = r"
+__kernel void pq2_q8k_gemv_8row(__global const uchar *weights,
+                                __global const char *codes,
+                                __global int *output,
+                                const uint blocks_per_row) {
+    const size_t gid = get_global_id(0);
+    const size_t col_block = gid % blocks_per_row;
+    const size_t row_base = (gid / blocks_per_row) * 8;
+    const size_t act_base = col_block * 128;
+    int sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint lane = 0; lane < 128; ++lane) {
+        const int act = convert_int(codes[act_base + lane]);
+        const uint byte_off = lane / 4;
+        const uint shift = 2 * (lane % 4);
+        for (uint r = 0; r < 8; ++r) {
+            const size_t offset = ((row_base + r) * blocks_per_row + col_block) * 34 + 2;
+            const uint symbol = (weights[offset + byte_off] >> shift) & 3U;
+            sums[r] += (convert_int(symbol) - 1) * act;
+        }
+    }
+    for (uint r = 0; r < 8; ++r) {
+        output[(row_base + r) * blocks_per_row + col_block] = sums[r];
+    }
+}
+";
+
+const PREFILL_4COL_SOURCE: &str = r"
+__kernel void pq2_q8k_prefill_4col(__global const uchar *weights,
+                                   __global const char *codes,
+                                   __global int *output,
+                                   const uint blocks_per_row,
+                                   const uint total_blocks) {
+    const size_t gid = get_global_id(0);
+    const size_t block = gid % total_blocks;
+    const size_t col_block = block % blocks_per_row;
+    const size_t token_base = (gid / total_blocks) * 4;
+    const size_t weight_base = block * 34 + 2;
+    int sum0 = 0;
+    int sum1 = 0;
+    int sum2 = 0;
+    int sum3 = 0;
+    for (uint lane = 0; lane < 128; ++lane) {
+        const uint symbol = (weights[weight_base + lane / 4] >> (2 * (lane % 4))) & 3U;
+        const int weight = convert_int(symbol) - 1;
+        sum0 += weight * convert_int(codes[((token_base + 0) * blocks_per_row + col_block) * 128 + lane]);
+        sum1 += weight * convert_int(codes[((token_base + 1) * blocks_per_row + col_block) * 128 + lane]);
+        sum2 += weight * convert_int(codes[((token_base + 2) * blocks_per_row + col_block) * 128 + lane]);
+        sum3 += weight * convert_int(codes[((token_base + 3) * blocks_per_row + col_block) * 128 + lane]);
+    }
+    output[(token_base + 0) * total_blocks + block] = sum0;
+    output[(token_base + 1) * total_blocks + block] = sum1;
+    output[(token_base + 2) * total_blocks + block] = sum2;
+    output[(token_base + 3) * total_blocks + block] = sum3;
+}
+";
+
+const FWHT_LOCAL_1024_SOURCE: &str = r"
+__kernel void fwht_local_1024(__global const uchar *weights,
+                              __global const char *codes,
+                              __global int *output) {
+    (void)weights;
+    __local int scratch[1024];
+    const size_t token = get_group_id(0);
+    const size_t lid = get_local_id(0);
+    const __global uchar *src = (const __global uchar *)codes;
+    for (uint k = 0; k < 4; ++k) {
+        const size_t idx = lid + k * 256;
+        const size_t byte_offset = (token * 1024 + idx) * 4;
+        const uint raw = convert_uint(src[byte_offset])
+            | (convert_uint(src[byte_offset + 1]) << 8)
+            | (convert_uint(src[byte_offset + 2]) << 16)
+            | (convert_uint(src[byte_offset + 3]) << 24);
+        scratch[idx] = as_int(raw);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint stride = 1; stride < 1024; stride *= 2) {
+        for (uint b = 0; b < 2; ++b) {
+            const size_t pair = lid + b * 256;
+            const size_t pos = (pair / stride) * (stride * 2) + (pair % stride);
+            const int a = scratch[pos];
+            const int c = scratch[pos + stride];
+            scratch[pos] = a + c;
+            scratch[pos + stride] = a - c;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (uint k = 0; k < 4; ++k) {
+        const size_t idx = lid + k * 256;
+        output[token * 1024 + idx] = scratch[idx];
+    }
+}
+";
+
+pub(super) const fn source_for(kind: OpenClKernelKind) -> &'static str {
+    match kind {
+        OpenClKernelKind::BlockDots => SOURCE,
+        OpenClKernelKind::Gemv4Row => GEMV_4ROW_SOURCE,
+        OpenClKernelKind::Gemv8Row => GEMV_8ROW_SOURCE,
+        OpenClKernelKind::Prefill4Col => PREFILL_4COL_SOURCE,
+        OpenClKernelKind::FwhtLocal1024 => FWHT_LOCAL_1024_SOURCE,
+    }
+}
+
+const fn entry_cstr(kind: OpenClKernelKind) -> &'static CStr {
+    match kind {
+        OpenClKernelKind::BlockDots => c"pq2_q8k_block_dots",
+        OpenClKernelKind::Gemv4Row => c"pq2_q8k_gemv_4row",
+        OpenClKernelKind::Gemv8Row => c"pq2_q8k_gemv_8row",
+        OpenClKernelKind::Prefill4Col => c"pq2_q8k_prefill_4col",
+        OpenClKernelKind::FwhtLocal1024 => c"fwht_local_1024",
+    }
+}
 
 struct Compute {
     context: Context,
@@ -186,7 +334,30 @@ fn object(id: Id, code: i32) -> io::Result<()> {
     if id.is_null() { Err(invalid()) } else { Ok(()) }
 }
 
-fn selected(api: &Api, selection: &OpenClProjectionSelection) -> io::Result<(Id, OpenClDevice)> {
+const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const BLOCK_DOTS_FIXED_COLUMNS: usize = 5120;
+const BLOCK_DOTS_BLOCKS_PER_ROW: usize = 40;
+const FWHT_LOCAL_WORK_SIZE: usize = 256;
+const FWHT_COLUMNS: usize = 1024;
+
+struct LaunchSpec<'a> {
+    selection: &'a OpenClProjectionSelection,
+    family: AdrenoFamily,
+    source: &'static str,
+    entry_point: &'static CStr,
+    extra_uint_args: [Option<u32>; 2],
+    global_work: usize,
+    local_work: Option<usize>,
+    output_len: usize,
+    weights: &'a [u8],
+    codes: &'a [u8],
+}
+
+fn selected_for_family(
+    api: &Api,
+    selection: &OpenClProjectionSelection,
+    family: AdrenoFamily,
+) -> io::Result<(Id, OpenClDevice)> {
     let mut platforms = [std::ptr::null_mut(); MAX_PLATFORMS];
     let mut count = 0;
     // SAFETY: Eight initialized output IDs, a native count and a live loader.
@@ -222,8 +393,7 @@ fn selected(api: &Api, selection: &OpenClProjectionSelection) -> io::Result<(Id,
                     || !device.available
                     || !device.compiler_available
                     || device.address_bits != 64
-                    || !device.name.to_ascii_lowercase().contains("adreno")
-                    || !device.name.to_ascii_lowercase().contains("x2")
+                    || AdrenoFamily::from_device_name(&device.name) != Some(family)
                 {
                     return Err(invalid());
                 }
@@ -231,31 +401,198 @@ fn selected(api: &Api, selection: &OpenClProjectionSelection) -> io::Result<(Id,
             }
         }
     }
-    selected.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "exact Adreno X2 OpenCL selection unavailable",
-        )
+    let unavailable = match family {
+        AdrenoFamily::X1_85 => "exact Adreno X1-85 OpenCL selection unavailable",
+        AdrenoFamily::X2_90 => "exact Adreno X2 OpenCL selection unavailable",
+    };
+    selected.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, unavailable))
+}
+
+fn validate_buffer_caps(
+    weights_len: usize,
+    codes_len: usize,
+    output_len: usize,
+) -> io::Result<usize> {
+    let output_bytes = output_len
+        .checked_mul(size_of::<i32>())
+        .ok_or_else(invalid)?;
+    if weights_len == 0
+        || codes_len == 0
+        || output_bytes == 0
+        || weights_len > MAX_BUFFER_BYTES
+        || codes_len > MAX_BUFFER_BYTES
+        || output_bytes > MAX_BUFFER_BYTES
+    {
+        return Err(invalid());
+    }
+    Ok(output_bytes)
+}
+
+fn build_spec<'a>(
+    selection: &'a OpenClProjectionSelection,
+    family: AdrenoFamily,
+    kind: OpenClKernelKind,
+    rows: usize,
+    columns: usize,
+    tokens: usize,
+    weights: &'a [u8],
+    codes: &'a [u8],
+) -> io::Result<LaunchSpec<'a>> {
+    let (extra_uint_args, global_work, local_work, output_len) = match kind {
+        OpenClKernelKind::BlockDots => {
+            let expected_weights = rows
+                .checked_mul(BLOCK_DOTS_BLOCKS_PER_ROW)
+                .and_then(|blocks| blocks.checked_mul(34))
+                .ok_or_else(invalid)?;
+            let work = rows
+                .checked_mul(BLOCK_DOTS_BLOCKS_PER_ROW)
+                .ok_or_else(invalid)?;
+            if rows == 0
+                || columns != BLOCK_DOTS_FIXED_COLUMNS
+                || tokens != 1
+                || weights.len() != expected_weights
+                || codes.len() != BLOCK_DOTS_FIXED_COLUMNS
+            {
+                return Err(invalid());
+            }
+            ([None, None], work, None, work)
+        }
+        OpenClKernelKind::Gemv4Row | OpenClKernelKind::Gemv8Row => {
+            let row_tile = if kind == OpenClKernelKind::Gemv4Row {
+                4
+            } else {
+                8
+            };
+            if rows == 0
+                || !rows.is_multiple_of(row_tile)
+                || columns == 0
+                || !columns.is_multiple_of(128)
+                || tokens != 1
+            {
+                return Err(invalid());
+            }
+            let blocks_per_row = columns / 128;
+            let blocks_per_row_u32 = u32::try_from(blocks_per_row).map_err(|_| invalid())?;
+            let total_blocks = rows.checked_mul(blocks_per_row).ok_or_else(invalid)?;
+            let expected_weights = total_blocks.checked_mul(34).ok_or_else(invalid)?;
+            if weights.len() != expected_weights || codes.len() != columns {
+                return Err(invalid());
+            }
+            let work = (rows / row_tile)
+                .checked_mul(blocks_per_row)
+                .ok_or_else(invalid)?;
+            ([Some(blocks_per_row_u32), None], work, None, total_blocks)
+        }
+        OpenClKernelKind::Prefill4Col => {
+            if rows == 0
+                || columns == 0
+                || !columns.is_multiple_of(128)
+                || tokens == 0
+                || !tokens.is_multiple_of(4)
+            {
+                return Err(invalid());
+            }
+            let blocks_per_row = columns / 128;
+            let total_blocks = rows.checked_mul(blocks_per_row).ok_or_else(invalid)?;
+            let expected_weights = total_blocks.checked_mul(34).ok_or_else(invalid)?;
+            let expected_codes = tokens.checked_mul(columns).ok_or_else(invalid)?;
+            let output_len = tokens.checked_mul(total_blocks).ok_or_else(invalid)?;
+            let blocks_per_row_u32 = u32::try_from(blocks_per_row).map_err(|_| invalid())?;
+            let total_blocks_u32 = u32::try_from(total_blocks).map_err(|_| invalid())?;
+            if weights.len() != expected_weights || codes.len() != expected_codes {
+                return Err(invalid());
+            }
+            let work = (tokens / 4).checked_mul(total_blocks).ok_or_else(invalid)?;
+            (
+                [Some(blocks_per_row_u32), Some(total_blocks_u32)],
+                work,
+                None,
+                output_len,
+            )
+        }
+        OpenClKernelKind::FwhtLocal1024 => {
+            let expected_codes = tokens
+                .checked_mul(FWHT_COLUMNS * size_of::<i32>())
+                .ok_or_else(invalid)?;
+            let output_len = tokens.checked_mul(FWHT_COLUMNS).ok_or_else(invalid)?;
+            let work = tokens
+                .checked_mul(FWHT_LOCAL_WORK_SIZE)
+                .ok_or_else(invalid)?;
+            if rows != 1
+                || columns != FWHT_COLUMNS
+                || tokens == 0
+                || weights.len() != 4
+                || codes.len() != expected_codes
+            {
+                return Err(invalid());
+            }
+            ([None, None], work, Some(FWHT_LOCAL_WORK_SIZE), output_len)
+        }
+    };
+    let _ = validate_buffer_caps(weights.len(), codes.len(), output_len)?;
+    Ok(LaunchSpec {
+        selection,
+        family,
+        source: source_for(kind),
+        entry_point: entry_cstr(kind),
+        extra_uint_args,
+        global_work,
+        local_work,
+        output_len,
+        weights,
+        codes,
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep the single audited creation, submission, readback and terminal-fence sequence together so object ownership remains reviewable."
-)]
 pub(super) fn run(
     selection: &OpenClProjectionSelection,
     weights: &[u8],
     codes: &[u8],
 ) -> io::Result<OpenClPq2Projection> {
     super::validate_environment()?;
-    if weights.len() != 17_408 * 40 * 34 || codes.len() != 5120 {
-        return Err(invalid());
-    }
+    let spec = build_spec(
+        selection,
+        AdrenoFamily::X2_90,
+        OpenClKernelKind::BlockDots,
+        17_408,
+        BLOCK_DOTS_FIXED_COLUMNS,
+        1,
+        weights,
+        codes,
+    )?;
+    execute(&spec)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Matches the public parameterized OpenCL dispatch boundary without bundling a parameter struct."
+)]
+pub(super) fn run_with_kernel(
+    selection: &OpenClProjectionSelection,
+    family: AdrenoFamily,
+    kind: OpenClKernelKind,
+    rows: usize,
+    columns: usize,
+    tokens: usize,
+    weights: &[u8],
+    codes: &[u8],
+) -> io::Result<OpenClPq2Projection> {
+    super::validate_environment()?;
+    let spec = build_spec(
+        selection, family, kind, rows, columns, tokens, weights, codes,
+    )?;
+    execute(&spec)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the single audited creation, submission, readback and terminal-fence sequence together so object ownership remains reviewable."
+)]
+fn execute(spec: &LaunchSpec<'_>) -> io::Result<OpenClPq2Projection> {
+    let output_bytes = validate_buffer_caps(spec.weights.len(), spec.codes.len(), spec.output_len)?;
     let api = Api::load()?;
-    let (device_id, device) = selected(&api, selection)?;
-    let output_bytes = 17_408 * 40 * size_of::<i32>();
-    if [weights.len(), codes.len(), output_bytes]
+    let (device_id, device) = selected_for_family(&api, spec.selection, spec.family)?;
+    if [spec.weights.len(), spec.codes.len(), output_bytes]
         .iter()
         .any(|&size| {
             u64::try_from(size).map_or(true, |size| size > device.maximum_allocation_bytes)
@@ -290,7 +627,7 @@ pub(super) fn run(
     // queue without profiling, optional flags or out-of-order execution.
     owner.queue = unsafe { (functions.queue)(owner.context, device_id, 0, &raw mut code) };
     object(owner.queue, code)?;
-    for (index, bytes) in [weights, codes].into_iter().enumerate() {
+    for (index, bytes) in [spec.weights, spec.codes].into_iter().enumerate() {
         // SAFETY: COPY_HOST_PTR copies the bounded live input during this call;
         // no host address remains borrowed by the asynchronous queue afterward.
         owner.buffers[index] = unsafe {
@@ -315,8 +652,8 @@ pub(super) fn run(
         )
     };
     object(owner.buffers[2], code)?;
-    let source = SOURCE.as_ptr().cast::<c_char>();
-    let length = SOURCE.len();
+    let source = spec.source.as_ptr().cast::<c_char>();
+    let length = spec.source.len();
     // SAFETY: One source string with an explicit byte length, copied by OpenCL.
     owner.program = unsafe {
         (functions.program)(
@@ -342,7 +679,7 @@ pub(super) fn run(
     })?;
     // SAFETY: Fixed kernel name from the owned successfully built program.
     owner.kernel =
-        unsafe { (functions.kernel)(owner.program, c"pq2_q8k_block_dots".as_ptr(), &raw mut code) };
+        unsafe { (functions.kernel)(owner.program, spec.entry_point.as_ptr(), &raw mut code) };
     object(owner.kernel, code)?;
     for (index, buffer) in (0_u32..3).zip(&owner.buffers) {
         // SAFETY: OpenCL copies one live cl_mem handle of the exact native size.
@@ -355,24 +692,40 @@ pub(super) fn run(
             )
         })?;
     }
-    let work = 17_408 * 40;
-    // SAFETY: One-dimensional fixed complete-block range. No local-size promise,
-    // offsets, event arrays or host pointers; all referenced buffers stay owned.
+    for (slot, extra) in (3_u32..5).zip(spec.extra_uint_args) {
+        if let Some(value) = extra {
+            // SAFETY: OpenCL copies one 32-bit unsigned scalar argument by value.
+            check(unsafe {
+                (functions.argument)(
+                    owner.kernel,
+                    slot,
+                    size_of::<u32>(),
+                    (&raw const value).cast(),
+                )
+            })?;
+        }
+    }
+    let local_ptr = spec
+        .local_work
+        .as_ref()
+        .map_or(std::ptr::null(), |size| &raw const *size);
+    // SAFETY: One-dimensional checked work range and validated optional local size;
+    // all referenced device buffers stay owned until queue drain.
     check(unsafe {
         (functions.enqueue)(
             owner.queue,
             owner.kernel,
             1,
             std::ptr::null(),
-            &raw const work,
-            std::ptr::null(),
+            &raw const spec.global_work,
+            local_ptr,
             0,
             std::ptr::null(),
             std::ptr::null_mut(),
         )
     })?;
     owner.submitted = true;
-    let mut dots = vec![0_i32; work];
+    let mut dots = vec![0_i32; spec.output_len];
     // SAFETY: Blocking read into the full aligned i32 array. Its lifetime spans
     // this call and the following terminal queue fence, including error paths.
     let read = unsafe {
@@ -398,4 +751,202 @@ pub(super) fn run(
         integer_dots: dots,
         cleanup_codes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_selection(device_name: &str) -> OpenClProjectionSelection {
+        OpenClProjectionSelection {
+            platform_name: "Qualcomm Snapdragon".into(),
+            device_name: device_name.into(),
+            driver_version: "OpenCL 3.0 QUALCOMM".into(),
+            vendor_id: 0x5143,
+        }
+    }
+
+    #[test]
+    fn adreno_family_recognition_covers_x1_85_and_x2_90_and_rejects_ambiguous() {
+        assert_eq!(
+            AdrenoFamily::from_device_name("Qualcomm(R) Adreno(TM) X1-85 GPU"),
+            Some(AdrenoFamily::X1_85)
+        );
+        assert_eq!(
+            AdrenoFamily::from_device_name("Qualcomm(R) Adreno(TM) X2-90 GPU"),
+            Some(AdrenoFamily::X2_90)
+        );
+        assert_eq!(
+            AdrenoFamily::from_device_name("Adreno X1"),
+            Some(AdrenoFamily::X1_85)
+        );
+        assert_eq!(
+            AdrenoFamily::from_device_name("Adreno X2"),
+            Some(AdrenoFamily::X2_90)
+        );
+        for rejected in [
+            "",
+            "Adreno GPU",
+            "Adreno X1-85 X2-90",
+            "NVIDIA GeForce X1",
+            "Adreno\nX1-85",
+        ] {
+            assert_eq!(AdrenoFamily::from_device_name(rejected), None);
+        }
+        assert_eq!(
+            AdrenoFamily::from_device_name(&"Adreno X1 ".repeat(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn opencl_kernel_suite_preserves_block_dots_and_stays_pure_cl12_integer() {
+        assert_eq!(
+            crate::opencl_pq2_kernel_source_for(OpenClKernelKind::BlockDots),
+            crate::opencl_pq2_kernel_source()
+        );
+        let kinds = [
+            OpenClKernelKind::BlockDots,
+            OpenClKernelKind::Gemv4Row,
+            OpenClKernelKind::Gemv8Row,
+            OpenClKernelKind::Prefill4Col,
+            OpenClKernelKind::FwhtLocal1024,
+        ];
+        for kind in kinds {
+            let source = crate::opencl_pq2_kernel_source_for(kind);
+            assert!(source.contains(kind.entry_point()));
+            let lower = source.to_ascii_lowercase();
+            for forbidden in ["float", "double", "half", "cl_khr"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "{:?} contains {forbidden}",
+                    kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opencl_kernel_geometry_validation_rejects_unaligned_and_oversized_before_icd() {
+        let selection = dummy_selection("Qualcomm(R) Adreno(TM) X1-85 GPU");
+        let empty = &[];
+        let four = [0_u8; 4];
+        let act_256 = vec![0_u8; 256];
+        let weights_4x2 = vec![0_u8; 4 * 2 * 34];
+
+        assert!(
+            build_spec(
+                &selection,
+                AdrenoFamily::X1_85,
+                OpenClKernelKind::Gemv4Row,
+                3,
+                256,
+                1,
+                &weights_4x2[..3 * 2 * 34],
+                &act_256,
+            )
+            .is_err()
+        );
+        assert!(
+            build_spec(
+                &selection,
+                AdrenoFamily::X1_85,
+                OpenClKernelKind::Gemv8Row,
+                4,
+                256,
+                1,
+                &weights_4x2,
+                &act_256,
+            )
+            .is_err()
+        );
+        assert!(
+            build_spec(
+                &selection,
+                AdrenoFamily::X1_85,
+                OpenClKernelKind::Gemv4Row,
+                4,
+                192,
+                1,
+                empty,
+                empty,
+            )
+            .is_err()
+        );
+        assert!(
+            build_spec(
+                &selection,
+                AdrenoFamily::X1_85,
+                OpenClKernelKind::Prefill4Col,
+                4,
+                256,
+                3,
+                &weights_4x2,
+                &vec![0_u8; 3 * 256],
+            )
+            .is_err()
+        );
+        assert!(
+            build_spec(
+                &selection,
+                AdrenoFamily::X1_85,
+                OpenClKernelKind::FwhtLocal1024,
+                1,
+                512,
+                1,
+                &four,
+                &vec![0_u8; 4096],
+            )
+            .is_err()
+        );
+        assert!(
+            build_spec(
+                &selection,
+                AdrenoFamily::X1_85,
+                OpenClKernelKind::FwhtLocal1024,
+                1,
+                1024,
+                0,
+                &four,
+                empty,
+            )
+            .is_err()
+        );
+
+        let ok_gemv4 = build_spec(
+            &selection,
+            AdrenoFamily::X1_85,
+            OpenClKernelKind::Gemv4Row,
+            4,
+            256,
+            1,
+            &weights_4x2,
+            &act_256,
+        );
+        assert!(ok_gemv4.is_ok());
+        let fwht_codes = vec![0_u8; 2 * 4096];
+        let ok_fwht = build_spec(
+            &selection,
+            AdrenoFamily::X1_85,
+            OpenClKernelKind::FwhtLocal1024,
+            1,
+            1024,
+            2,
+            &four,
+            &fwht_codes,
+        );
+        assert!(ok_fwht.is_ok());
+
+        let public_err = crate::opencl_pq2_projection_with_kernel(
+            &selection,
+            AdrenoFamily::X1_85,
+            OpenClKernelKind::Gemv4Row,
+            3,
+            256,
+            1,
+            &weights_4x2[..3 * 2 * 34],
+            &act_256,
+        );
+        assert!(public_err.is_err());
+    }
 }

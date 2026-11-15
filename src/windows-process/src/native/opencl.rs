@@ -16,12 +16,35 @@ pub(super) const fn kernel_source() -> &'static str {
     projection::SOURCE
 }
 
+pub(super) const fn kernel_source_for(kind: crate::OpenClKernelKind) -> &'static str {
+    projection::source_for(kind)
+}
+
 pub(super) fn project(
     selection: &crate::OpenClProjectionSelection,
     weights: &[u8],
     codes: &[u8],
 ) -> io::Result<crate::OpenClPq2Projection> {
     projection::run(selection, weights, codes)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Forwards explicit OpenCL launch geometry before native loader initialization."
+)]
+pub(super) fn project_with_kernel(
+    selection: &crate::OpenClProjectionSelection,
+    family: crate::AdrenoFamily,
+    kind: crate::OpenClKernelKind,
+    rows: usize,
+    columns: usize,
+    tokens: usize,
+    weights: &[u8],
+    codes: &[u8],
+) -> io::Result<crate::OpenClPq2Projection> {
+    projection::run_with_kernel(
+        selection, family, kind, rows, columns, tokens, weights, codes,
+    )
 }
 
 const MAX_PLATFORMS: usize = 8;

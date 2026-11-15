@@ -414,10 +414,75 @@ pub struct OpenClPq2Projection {
     pub cleanup_codes: [i32; 7],
 }
 
+/// Supported Qualcomm Adreno GPU families on native Windows ARM64 targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdrenoFamily {
+    /// Adreno X1-85 GPU on Snapdragon X Elite (`3` slices, `6` Dual CUs, `1536` FP32 ALUs).
+    X1_85,
+    /// Adreno X2-90 GPU on Snapdragon X2 Elite Extreme.
+    X2_90,
+}
+
+impl AdrenoFamily {
+    /// Recognize Adreno X1-85 or X2-90 GPU device names without enabling automatic selection.
+    #[must_use]
+    pub fn from_device_name(name: &str) -> Option<Self> {
+        if name.is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
+            return None;
+        }
+        let lower = name.to_ascii_lowercase();
+        if !lower.contains("adreno") {
+            return None;
+        }
+        let is_x1 = (lower.contains("x1-85") || lower.contains("x1")) && !lower.contains("x2");
+        let is_x2 = (lower.contains("x2-90") || lower.contains("x2")) && !lower.contains("x1");
+        match (is_x1, is_x2) {
+            (true, false) => Some(Self::X1_85),
+            (false, true) => Some(Self::X2_90),
+            _ => None,
+        }
+    }
+}
+
+/// Pure `OpenCL` C 1.2 integer kernel variant for Adreno `Q2_0`/`Q8_K` and `FWHT` execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenClKernelKind {
+    /// Single-block 128-symbol scalar `PQ2`/`Q8_K` dot product (`pq2_q8k_block_dots`).
+    BlockDots,
+    /// Four-row batched decode GEMV reusing loaded `Q8_K` activations (`pq2_q8k_gemv_4row`).
+    Gemv4Row,
+    /// Eight-row batched decode GEMV for large feed-forward shapes (`pq2_q8k_gemv_8row`).
+    Gemv8Row,
+    /// Four-token batched prefill column GEMV reusing decoded `PQ2` weights (`pq2_q8k_prefill_4col`).
+    Prefill4Col,
+    /// Local-memory 1024-point radix-2 integer Walsh-Hadamard transform (`fwht_local_1024`).
+    FwhtLocal1024,
+}
+
+impl OpenClKernelKind {
+    /// Exact `OpenCL` kernel entry-point symbol for this variant.
+    #[must_use]
+    pub const fn entry_point(self) -> &'static str {
+        match self {
+            Self::BlockDots => "pq2_q8k_block_dots",
+            Self::Gemv4Row => "pq2_q8k_gemv_4row",
+            Self::Gemv8Row => "pq2_q8k_gemv_8row",
+            Self::Prefill4Col => "pq2_q8k_prefill_4col",
+            Self::FwhtLocal1024 => "fwht_local_1024",
+        }
+    }
+}
+
 /// Fixed `OpenCL` C 1.2 source whose digest must be reviewed before pilot execution.
 #[must_use]
 pub const fn opencl_pq2_kernel_source() -> &'static str {
     native::opencl_pq2_kernel_source()
+}
+
+/// Pure `OpenCL` C 1.2 source for a specific Adreno `Q2_0`/`Q8_K` or `FWHT` kernel variant.
+#[must_use]
+pub const fn opencl_pq2_kernel_source_for(kind: OpenClKernelKind) -> &'static str {
+    native::opencl_pq2_kernel_source_for(kind)
 }
 
 /// Execute one fixed K=5120, M=17408 `PQ2/Q8_K` integer projection on Adreno X2.
@@ -444,6 +509,27 @@ pub fn opencl_pq2_projection(
     codes: &[u8],
 ) -> io::Result<OpenClPq2Projection> {
     native::opencl_pq2_projection(selection, weights, codes)
+}
+
+/// Execute a parameterized `OpenCL` C 1.2 `PQ2/Q8_K` or `FWHT` kernel on a selected Adreno GPU.
+///
+/// # Errors
+/// Rejects invalid geometry/buffer bounds (`> 64 MiB` per buffer), environment overrides,
+/// non-ARM64 hosts, mismatched [`AdrenoFamily`], unavailable devices, failed program builds,
+/// submission failures, or terminal readback errors.
+pub fn opencl_pq2_projection_with_kernel(
+    selection: &OpenClProjectionSelection,
+    family: AdrenoFamily,
+    kind: OpenClKernelKind,
+    rows: usize,
+    columns: usize,
+    tokens: usize,
+    weights: &[u8],
+    codes: &[u8],
+) -> io::Result<OpenClPq2Projection> {
+    native::opencl_pq2_projection_with_kernel(
+        selection, family, kind, rows, columns, tokens, weights, codes,
+    )
 }
 
 /// One observed Windows CPU Set; processor indices are relative to `group`.

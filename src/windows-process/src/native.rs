@@ -92,12 +92,35 @@ pub(super) const fn opencl_pq2_kernel_source() -> &'static str {
     opencl::kernel_source()
 }
 
+pub(super) const fn opencl_pq2_kernel_source_for(kind: crate::OpenClKernelKind) -> &'static str {
+    opencl::kernel_source_for(kind)
+}
+
 pub(super) fn opencl_pq2_projection(
     selection: &crate::OpenClProjectionSelection,
     weights: &[u8],
     codes: &[u8],
 ) -> io::Result<crate::OpenClPq2Projection> {
     opencl::project(selection, weights, codes)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Matches the public parameterized OpenCL dispatch boundary without bundling a parameter struct."
+)]
+pub(super) fn opencl_pq2_projection_with_kernel(
+    selection: &crate::OpenClProjectionSelection,
+    family: crate::AdrenoFamily,
+    kind: crate::OpenClKernelKind,
+    rows: usize,
+    columns: usize,
+    tokens: usize,
+    weights: &[u8],
+    codes: &[u8],
+) -> io::Result<crate::OpenClPq2Projection> {
+    opencl::project_with_kernel(
+        selection, family, kind, rows, columns, tokens, weights, codes,
+    )
 }
 
 pub(super) fn cpu_sets() -> io::Result<Vec<crate::CpuSet>> {
