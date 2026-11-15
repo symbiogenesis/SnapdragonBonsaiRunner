@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-artifacts"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bonsai-windows-credentials",
  "bonsai-windows-process",
@@ -501,11 +501,11 @@ dependencies = [
 
 [[package]]
 name = "bonsai-audio"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "bonsai-broker"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-cpu-policy",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-chat"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64ct",
  "bonsai-audio",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-ci"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-windows-process",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-cpu-policy"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-markdown"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "egui",
  "epaint_default_fonts",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-speech-asr"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-cpu-policy",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-speech-service"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-audio",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-speech-tts"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-audio",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-tools"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64ct",
  "bonsai-artifacts",
