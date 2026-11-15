@@ -346,7 +346,7 @@ pub fn validate_provider_pair(
 ///
 /// # Errors
 /// Returns [`io::ErrorKind::Interrupted`] if `expired()` returns `true` before
-/// or during verification, or [`io::Error::other`] on [`ArtifactError`].
+/// or during verification, or [`io::Error`] on [`ArtifactError`].
 pub fn verify_artifact(
     artifact: &Artifact,
     expired: &dyn Fn() -> bool,
