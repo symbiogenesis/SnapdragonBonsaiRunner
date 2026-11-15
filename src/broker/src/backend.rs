@@ -14,16 +14,14 @@ use http::{Response, StatusCode, Version};
 use serde::Deserialize;
 use std::{
     borrow::Cow,
-    io,
+    fmt::NumBuffer,
+    io::{self, IoSlice},
     pin::Pin,
     task::{Context, Poll, ready},
     time::Duration,
 };
 use tokio::{
-    io::{
-        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
-        BufReader, ReadBuf,
-    },
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader, ReadBuf},
     time::{Instant, Sleep},
 };
 
@@ -345,19 +343,24 @@ where
         RequestBody::Empty => ("", &[][..]),
         RequestBody::Json(payload) => ("Content-Type: application/json\r\n", payload.as_ref()),
     };
-    let head = format!(
-        "POST {route} HTTP/1.1\r\nHost: {}\r\nAuthorization: {authorization}\r\n{content_type_header}Accept-Encoding: identity\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        policy.authority,
-        body_bytes.len()
-    );
+    let mut digits = NumBuffer::new();
+    let length = body_bytes.len().format_into(&mut digits).as_bytes();
+    let mut slices = [
+        IoSlice::new(b"POST "),
+        IoSlice::new(route.as_bytes()),
+        IoSlice::new(b" HTTP/1.1\r\nHost: "),
+        IoSlice::new(policy.authority.as_bytes()),
+        IoSlice::new(b"\r\nAuthorization: "),
+        IoSlice::new(authorization.as_bytes()),
+        IoSlice::new(b"\r\n"),
+        IoSlice::new(content_type_header.as_bytes()),
+        IoSlice::new(b"Accept-Encoding: identity\r\nConnection: close\r\nContent-Length: "),
+        IoSlice::new(length),
+        IoSlice::new(b"\r\n\r\n"),
+        IoSlice::new(body_bytes),
+    ];
     write_deadline
-        .timeout(async {
-            stream.write_all(head.as_bytes()).await?;
-            if !body_bytes.is_empty() {
-                stream.write_all(body_bytes).await?;
-            }
-            stream.flush().await
-        })
+        .timeout(wire::write_vectored_all(&mut stream, slices.as_mut_slice()))
         .await
         .map_err(|_| BackendError::Deadline)?
         .map_err(|_| BackendError::Io)?;

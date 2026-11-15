@@ -6,6 +6,7 @@ use std::{
     future::poll_fn,
     rc::Rc,
 };
+use tokio::io::AsyncWriteExt;
 
 const BUFFER_BYTES: usize = 8192;
 

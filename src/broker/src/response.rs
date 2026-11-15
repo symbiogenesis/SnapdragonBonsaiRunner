@@ -27,13 +27,12 @@ const MAX_SSE_READS_PER_GROUP: usize = 32;
 // Three decimal digits per byte cover every usize; include the final CRLF pair.
 const CONTENT_LENGTH_SPACE: usize = 3 * size_of::<usize>() + 4;
 
-// Keep one literal for both formatted JSON heads and compile-time SSE heads.
+// Keep one literal for compile-time response head assembly.
 macro_rules! common_headers {
     () => {
         "Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
     };
 }
-const COMMON_HEADERS: &str = common_headers!();
 const SSE_HEAD: &str = concat!(
     "HTTP/1.1 200 OK\r\n",
     common_headers!(),
@@ -323,8 +322,13 @@ async fn write_buffered_sse_response<W: AsyncWrite + Unpin, R: AsyncBufRead + Un
             let prefix = chunk_prefix(&mut prefix, RESPONSE_BUFFER_BYTES);
             write_vectored_group(
                 client,
-                [prefix, &available[..RESPONSE_BUFFER_BYTES], b"\r\n"],
+                &mut [
+                    IoSlice::new(prefix),
+                    IoSlice::new(&available[..RESPONSE_BUFFER_BYTES]),
+                    IoSlice::new(b"\r\n"),
+                ],
                 deadline,
+                false,
             )
             .await?;
             body.consume(RESPONSE_BUFFER_BYTES);
@@ -359,23 +363,19 @@ async fn write_buffered_sse_response<W: AsyncWrite + Unpin, R: AsyncBufRead + Un
 
 async fn write_vectored_group<W: AsyncWrite + Unpin>(
     client: &mut W,
-    pieces: [&[u8]; 3],
+    slices: &mut [IoSlice<'_>],
     supervisor_deadline: RequestDeadline,
+    shutdown: bool,
 ) -> Result<(), ResponseError> {
     let deadline = supervisor_deadline.earlier(Instant::now() + CLIENT_WRITE_TIMEOUT);
     ensure_time(deadline)?;
     deadline
         .timeout(async {
-            let mut slices = pieces.map(IoSlice::new);
-            let mut remaining = slices.as_mut_slice();
-            while !remaining.is_empty() {
-                let written = client.write_vectored(remaining).await?;
-                if written == 0 {
-                    return Err(std::io::ErrorKind::WriteZero.into());
-                }
-                IoSlice::advance_slices(&mut remaining, written);
+            crate::wire::write_vectored_all(client, slices).await?;
+            if shutdown {
+                client.shutdown().await?;
             }
-            client.flush().await
+            Ok::<_, std::io::Error>(())
         })
         .await
         .map_err(|_| ResponseError::Deadline)?
@@ -431,14 +431,22 @@ async fn write_json_response<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     body: &mut R,
     supervisor_deadline: RequestDeadline,
 ) -> Result<(), ResponseError> {
-    let bytes = collect_json(body, supervisor_deadline).await?;
-    let head = format!(
-        "HTTP/1.1 200 OK\r\n{COMMON_HEADERS}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        bytes.len()
+    const OK_HEAD: &str = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        common_headers!(),
+        "Content-Type: application/json\r\nContent-Length: "
     );
-    write_group(
+    let bytes = collect_json(body, supervisor_deadline).await?;
+    let mut digits = NumBuffer::new();
+    let length = bytes.len().format_into(&mut digits).as_bytes();
+    write_vectored_group(
         client,
-        &[head.as_bytes(), &bytes],
+        &mut [
+            IoSlice::new(OK_HEAD.as_bytes()),
+            IoSlice::new(length),
+            IoSlice::new(b"\r\n\r\n"),
+            IoSlice::new(&bytes),
+        ],
         supervisor_deadline,
         true,
     )

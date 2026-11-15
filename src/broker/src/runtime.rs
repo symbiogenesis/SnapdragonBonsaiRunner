@@ -366,7 +366,7 @@ pub async fn run(
                 report.peak_in_flight = report.peak_in_flight.max(requests.len());
             }
             Event::Completed(index, result) => {
-                let _finished = requests.remove(index);
+                let _finished = requests.swap_remove(index);
                 record(&mut report, result);
             }
             Event::Stop(reason) => {

@@ -6,6 +6,8 @@
 )]
 
 use crate::Rejection;
+use std::io::{self, IoSlice};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub(super) enum LengthError {
     Syntax,
@@ -94,4 +96,19 @@ pub(super) fn singleton_slice<'a>(
         return Err(Rejection::Headers);
     }
     Ok(first)
+}
+
+pub(super) async fn write_vectored_all<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut remaining: &mut [IoSlice<'_>],
+) -> io::Result<()> {
+    while let Some(next) = remaining.iter().position(|slice| !slice.is_empty()) {
+        remaining = &mut remaining[next..];
+        let written = writer.write_vectored(remaining).await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
+    writer.flush().await
 }

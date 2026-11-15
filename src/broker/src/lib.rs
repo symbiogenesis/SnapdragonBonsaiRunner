@@ -377,8 +377,8 @@ impl HeaderSource for [httparse::Header<'_>] {
                 || header
                     .name
                     .as_bytes()
-                    .get(..12)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"x-forwarded-"))
+                    .split_first_chunk::<12>()
+                    .is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case(b"x-forwarded-"))
         })
     }
 }

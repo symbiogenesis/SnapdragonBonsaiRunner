@@ -173,23 +173,19 @@ pub fn select<'a>(
     if exclusion(control, budgets).is_some() || !control.observation.ready_and_admitted {
         return Err("The reviewed CPU control cannot reserve this complete request.".into());
     }
-    // First rank with the previously reviewed admission facts. This validates
-    // IDs and supplies a deterministic reason if live conditions remove the winner.
-    let original: Vec<_> = candidates
-        .iter()
-        .map(|profile| profile.observation)
-        .collect();
-    let preferred = ranking::recommend(&control.observation, &original)?;
+    let mut excluded_any = false;
     let current: Vec<_> = candidates
         .iter()
         .map(|profile| {
             let mut observation = profile.observation;
-            observation.ready_and_admitted &= exclusion(profile, budgets).is_none()
+            let live_ok = exclusion(profile, budgets).is_none()
                 && accepts(profile, reservation)
                 && match intent {
                     Intent::Automatic => true,
                     Intent::Strict(placement) => observation.placement == placement,
                 };
+            excluded_any |= observation.ready_and_admitted && !live_ok;
+            observation.ready_and_admitted &= live_ok;
             observation
         })
         .collect();
@@ -205,13 +201,22 @@ pub fn select<'a>(
             .find(|profile| profile.observation.id == recommendation.profile_id)
             .ok_or("Selected profile is absent from the bounded catalog.")?
     };
-    let fallback_reason = if preferred.profile_id == recommendation.profile_id {
-        None
-    } else {
-        candidates
+    let fallback_reason = if excluded_any {
+        let original: Vec<_> = candidates
             .iter()
-            .find(|profile| profile.observation.id == preferred.profile_id)
-            .and_then(|profile| exclusion(profile, budgets))
+            .map(|profile| profile.observation)
+            .collect();
+        let preferred = ranking::recommend(&control.observation, &original)?;
+        if preferred.profile_id == recommendation.profile_id {
+            None
+        } else {
+            candidates
+                .iter()
+                .find(|profile| profile.observation.id == preferred.profile_id)
+                .and_then(|profile| exclusion(profile, budgets))
+        }
+    } else {
+        None
     };
     Ok(Selection {
         recommendation,

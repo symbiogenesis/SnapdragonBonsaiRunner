@@ -34,7 +34,7 @@ impl JsonCandidateScratch {
     ) -> Result<PendingChat, Rejection> {
         head.check_body_size(body)?;
         self.input
-            .try_reserve_exact(body.len() + simd_json::INPUT_PADDING)
+            .try_reserve(body.len() + simd_json::INPUT_PADDING)
             .map_err(|_| Rejection::ChatSchema)?;
         self.input.extend_from_slice(body);
         self.input
