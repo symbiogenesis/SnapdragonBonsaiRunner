@@ -659,6 +659,10 @@ fn background_generation_keeps_composer_and_conversation_navigation_available() 
             chat.query_by_role_and_label(egui::Role::Button, "Show response")
                 .is_none()
         );
+        assert!(
+            chat.query_by_role_and_label(egui::Role::Button, "Stop")
+                .is_none()
+        );
         let composer_rect = chat
             .get_by_role_and_label(egui::Role::MultilineTextInput, "Message")
             .rect();
@@ -670,6 +674,26 @@ fn background_generation_keeps_composer_and_conversation_navigation_available() 
             .collect();
         assert_eq!(notices.len(), 1);
         assert!(notices[0].top() >= composer_rect.bottom());
+        assert!(
+            chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+                .accesskit_node()
+                .is_disabled()
+        );
+        chat.ctx
+            .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+        chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+            .hover();
+        chat.run();
+        assert!(
+            chat.query_by_label(
+                "Wait for ‘Original question’ to finish responding before sending."
+            )
+            .is_some()
+        );
+        chat.key_press(egui::Key::Escape);
+        chat.run();
+        assert!(chat.state().app.model.busy());
+        assert!(chat.state().commands.try_recv().is_err());
         open_sidebar(&mut chat, size);
         chat.get_by_role_and_label(egui::Role::Button, "Original question")
             .click();

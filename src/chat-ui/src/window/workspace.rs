@@ -254,15 +254,24 @@ impl State {
         }
     }
 
+    pub(super) fn background_generation_title(&self) -> Option<&str> {
+        let owner = self
+            .request_conversation
+            .filter(|_| self.model.busy())
+            .filter(|&owner| owner != self.active_conversation)?;
+        self.conversations
+            .iter()
+            .find(|value| value.id == owner)
+            .map(|conversation| conversation.title.as_str())
+    }
+
+    pub(super) fn active_conversation_busy(&self) -> bool {
+        self.model.busy() && self.background_generation_title().is_none()
+    }
+
     pub(super) fn generation_status(&self) -> String {
-        if let Some(owner) = self.request_conversation
-            && owner != self.active_conversation
-            && let Some(conversation) = self.conversations.iter().find(|value| value.id == owner)
-        {
-            return format!(
-                "Responding in ‘{}’. You can draft here while you wait.",
-                conversation.title
-            );
+        if let Some(title) = self.background_generation_title() {
+            return format!("Responding in ‘{title}’. You can draft here while you wait.");
         }
         format!(
             "{} You can draft your next message while you wait.",

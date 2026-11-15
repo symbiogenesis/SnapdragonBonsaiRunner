@@ -810,7 +810,7 @@ impl State {
             self.focus_composer = true;
         } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            if self.model.busy() {
+            if self.active_conversation_busy() {
                 self.stop_generation();
             } else if self.speaking || self.dictation_requested {
                 self.stop_speech();

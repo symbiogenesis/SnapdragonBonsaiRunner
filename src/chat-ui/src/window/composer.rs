@@ -23,19 +23,26 @@ impl State {
     }
     fn composer_send_controls(&mut self, ui: &mut egui::Ui) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if self.model.busy() {
+            if self.active_conversation_busy() {
                 if ui.button("Stop").clicked() {
                     self.stop_generation();
                 }
-            } else if ui
-                .add_enabled(
-                    self.model.ready() && !self.input.trim().is_empty(),
-                    controls::primary_button(ui, "Send  ↑"),
-                )
-                .on_hover_text("Send message · Enter")
-                .clicked()
-            {
-                self.submit();
+            } else {
+                let can_send =
+                    self.model == super::ModelLifecycle::Ready && !self.input.trim().is_empty();
+                let response = ui
+                    .add_enabled(can_send, controls::primary_button(ui, "Send  ↑"))
+                    .on_hover_text("Send message · Enter");
+                let response = if let Some(title) = self.background_generation_title() {
+                    response.on_disabled_hover_text(format!(
+                        "Wait for ‘{title}’ to finish responding before sending."
+                    ))
+                } else {
+                    response
+                };
+                if response.clicked() {
+                    self.submit();
+                }
             }
             self.microphone_button(ui);
         });

@@ -249,8 +249,9 @@ channel on worker attachment. Late events cannot reopen admission in another pha
 Drafting, browsing and conversation creation remain available during preparation,
 failure and generation. Only one request runs: incoming content, reasoning, stages
 and history belong to its submitting conversation, which cannot be deleted until
-it settles. Stop controls it from any chat; other conversations show a single
-background-response notice below the composer, with no duplicate workspace
+it settles. Stop and Escape-to-stop control generation only while that owner is
+selected; other conversations show a disabled Send button with hover text and a
+single background-response notice below the composer, with no duplicate workspace
 banner or return button.
 Its sidebar row shows an animated vertical activity indicator while generating,
 including thinking and responses received while another conversation is selected;

@@ -227,8 +227,9 @@ chat. A title-only match can have no matching message body.
 
 Only one response runs at a time. While it generates, you can draft, browse or
 create another conversation. Enter cannot queue a second request. Other chats show
-the background-response notice below the composer; select the sidebar row with the
-response indicator to return, and **Stop** controls generation from any conversation.
+the background-response notice below the composer and keep **Send** disabled with
+hover text explaining why; select the sidebar row with the response indicator to
+return, where **Stop** controls generation.
 Completion, rejection and Stop preserve newer drafts. The generating chat cannot
 be deleted until it settles. Switching conversations stops speech and never starts
 playback for a hidden response.
@@ -238,7 +239,7 @@ playback for a hidden response.
 | **Enter / Shift+Enter** | Send when ready / insert a newline. |
 | **Ctrl+F** | Open or focus Find for visible message bodies; excludes reasoning. |
 | **F3 / Shift+F3** | Next / previous Find match; Enter/Shift+Enter does the same while Find is focused. |
-| **Close find / Escape** | Close Find and clear its highlights. A further Escape stops generation or speech when no popup or dialog owns it. |
+| **Close find / Escape** | Close Find and clear its highlights. A further Escape stops generation in the responding chat, or speech, when no popup or dialog owns it. |
 | **Latest / down arrow** | Return to the newest message. |
 | Message **Copy** | Copy exact source text, including Markdown. Assistant responses render supported Markdown natively; selecting text copies its displayed form. Generated links remain inert, HTML stays literal and code never executes. |
 | **Edit and resend / Regenerate** | Create and send a branch using the verified history prefix, preserving the original chat and draft. |
