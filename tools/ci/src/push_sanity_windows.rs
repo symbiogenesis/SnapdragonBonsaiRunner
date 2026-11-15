@@ -902,8 +902,28 @@ mod tests {
     }
 
     #[test]
-    fn push_sanity_unverified_supervisor_blocks_recovery() -> Result<()> {
-        preparation_case("unverified_supervisor_blocks_recovery")
+    fn push_sanity_unverified_supervisor_triggers_preparation() -> Result<()> {
+        preparation_case("unverified_supervisor_triggers_preparation")
+    }
+
+    #[test]
+    fn push_sanity_missing_recovery_receipt_triggers_preparation() -> Result<()> {
+        preparation_case("missing_recovery_receipt_triggers_preparation")
+    }
+
+    #[test]
+    fn push_sanity_missing_recovery_helper_triggers_preparation() -> Result<()> {
+        preparation_case("missing_recovery_helper_triggers_preparation")
+    }
+
+    #[test]
+    fn push_sanity_stale_recovery_source_triggers_preparation() -> Result<()> {
+        preparation_case("stale_recovery_source_triggers_preparation")
+    }
+
+    #[test]
+    fn push_sanity_corrupt_recovery_helper_triggers_preparation() -> Result<()> {
+        preparation_case("corrupt_recovery_helper_triggers_preparation")
     }
 
     #[test]
@@ -922,13 +942,13 @@ mod tests {
     }
 
     #[test]
-    fn push_sanity_collection_recovery_source_blocks_recovery() -> Result<()> {
-        preparation_case("collection_recovery_source_blocks_recovery")
+    fn push_sanity_collection_recovery_source_triggers_preparation() -> Result<()> {
+        preparation_case("collection_recovery_source_triggers_preparation")
     }
 
     #[test]
-    fn push_sanity_collection_recovery_digest_blocks_recovery() -> Result<()> {
-        preparation_case("collection_recovery_digest_blocks_recovery")
+    fn push_sanity_collection_recovery_digest_triggers_preparation() -> Result<()> {
+        preparation_case("collection_recovery_digest_triggers_preparation")
     }
 
     #[test]

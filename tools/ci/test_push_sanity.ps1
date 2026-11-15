@@ -43,9 +43,13 @@ function Invoke-PushRecoveryFixture([string]$CheckerState,[string]$RecoveryState
         if ($CheckerState -ceq 'corrupt') { [IO.File]::AppendAllText($checker,'Changed after receipt publication.') }
         $recoveryReceipt=@{SchemaVersion=1;SourceIdentity=$identities.recovery;Sha256=(Get-FileHash -LiteralPath $recovery -Algorithm SHA256).Hash.ToLowerInvariant()}
         if ($RecoveryState -ceq 'invalid') { $recoveryReceipt.Sha256='0' * 64 }
+        if ($RecoveryState -ceq 'stale') { $recoveryReceipt.SourceIdentity='0' * 64 }
         if ($RecoveryState -ceq 'collection-source') { $recoveryReceipt.SourceIdentity=@($identities.recovery,('0' * 64)) }
         if ($RecoveryState -ceq 'collection-digest') { $recoveryReceipt.Sha256=@($recoveryReceipt.Sha256,('0' * 64)) }
         $recoveryReceipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-recovery.json') -Encoding utf8NoBOM
+        if ($RecoveryState -ceq 'missing-receipt') { [IO.File]::Delete((Join-Path $target 'push-recovery.json')) }
+        if ($RecoveryState -ceq 'missing-image') { [IO.File]::Delete($recovery) }
+        if ($RecoveryState -ceq 'corrupt') { [IO.File]::AppendAllText($recovery,'Changed after recovery receipt publication.') }
         Write-CiFixture $repository 'unrelated-source.txt' 'Uncommitted poison must not reach recovery.'
         $driver=Join-Path $scratch 'recovery-driver.ps1'
         @'
@@ -59,15 +63,18 @@ function git {
     if ($LASTEXITCODE) { throw 'Fixture Git command failed.' }
     if ($args -ccontains 'archive') {
         $global:BonsaiPushRecoveryArchiveCalls++
-        Assert-Ci ($RecoveryState -ceq 'valid') 'An unverified supervisor reached source intake.'
         Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 1
         Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-checker.json'))) 'Recovery retained the old checker receipt during source intake.'
+        if ($RecoveryState -cne 'valid') {
+            Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-recovery.json'))) 'Automatic preparation retained the invalid recovery receipt during source intake.'
+        }
         Assert-Ci (-not ($args -ccontains '--')) 'Recovery selected a partial policy archive.'
         $archive=@($args | Where-Object { $_.StartsWith('--output=',[StringComparison]::Ordinal) })[0].Substring(9)
         $unpacked=Join-Path (Split-Path $Repository -Parent) 'unpacked'
         Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
         Assert-CiEqual ([IO.File]::ReadAllText((Join-Path $unpacked 'unrelated-source.txt'))) 'Committed full-source input.'
         Assert-Ci (Test-Path -LiteralPath (Join-Path $unpacked 'Cargo.toml')) 'Recovery omitted committed build inputs.'
+        if ($RecoveryState -cne 'valid') { throw 'Expected automatic preparation from complete committed source before native execution.' }
         if (-not $RunRecovery) { throw 'Expected complete committed recovery source verified before supervisor execution.' }
     }
 }
@@ -77,8 +84,9 @@ catch { $failure=$_.Exception.Message }
 Assert-Ci ($null -ne $failure) 'Recovery fixture unexpectedly admitted an inert checker.'
 Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-checker.json'))) 'Failed recovery published or retained a checker receipt.'
 if ($RecoveryState -cne 'valid') {
-    Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 0
-    Assert-Ci ($failure.Contains('-Prepare')) 'Invalid supervisor did not explain explicit preparation.'
+    Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 1
+    Assert-CiEqual $failure 'Expected automatic preparation from complete committed source before native execution.'
+    Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $Target 'push-recovery.json'))) 'Failed automatic preparation published or retained a recovery receipt.'
 } elseif ($RunRecovery) {
     Assert-CiEqual $global:BonsaiPushRecoveryArchiveCalls 1
     Assert-Ci ($failure.Contains('bonsai-push-recovery')) 'Failure did not originate from the recovery executable.'
@@ -100,9 +108,13 @@ $cases=[ordered]@{
  collection_checker_digest_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'collection-digest' }
  corrupt_checker_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'corrupt' }
  missing_checker_receipt_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'missing' }
- unverified_supervisor_blocks_recovery={ Invoke-PushRecoveryFixture 'stale' 'invalid' }
- collection_recovery_source_blocks_recovery={ Invoke-PushRecoveryFixture 'stale' 'collection-source' }
- collection_recovery_digest_blocks_recovery={ Invoke-PushRecoveryFixture 'stale' 'collection-digest' }
+ unverified_supervisor_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'invalid' }
+ missing_recovery_receipt_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'missing-receipt' }
+ missing_recovery_helper_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'missing-image' }
+ stale_recovery_source_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'stale' }
+ corrupt_recovery_helper_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'corrupt' }
+ collection_recovery_source_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'collection-source' }
+ collection_recovery_digest_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'collection-digest' }
  failed_automatic_recovery_invalidates_existing_receipt={ Invoke-PushRecoveryFixture 'stale' -RunRecovery }
  ordinary_push_archives_only_committed_policy={
     $scratch=New-CiScratch 'bonsai-push-policy-'
