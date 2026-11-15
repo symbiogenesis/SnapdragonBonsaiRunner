@@ -47,6 +47,7 @@ subtle = "=2.6.1"
 tokio = "=1.54.1"
 ureq = { version = "=3.5.2", default-features = false }
 windows-sys = "=0.61.2"
+zeroize = { version = "=1.9.1", default-features = false }
 zip = { version = "=9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Bounds must fail visibly in optimized builds rather than wrap silently.

@@ -202,9 +202,12 @@ fn path_validation_rejects_aliases_git_and_reparse_ancestors() -> io::Result<()>
 
 #[test]
 fn volatile_scrub_zeroes_the_owned_buffer() {
-    let mut bytes = [0x5a; 64];
-    native::scrub(&mut bytes);
+    let mut secret = Secret::<64>::new();
+    secret.0.fill(0x5a);
+    let mut bytes = [0x5a_u8; 64];
+    bytes.zeroize();
     assert!(bytes.iter().all(|byte| *byte == 0));
+    drop(secret);
 }
 
 #[test]

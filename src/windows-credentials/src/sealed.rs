@@ -6,6 +6,7 @@ use windows_sys::Win32::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
     },
 };
+use zeroize::Zeroize as _;
 
 const MAX_PLAIN: usize = 8 * 1024 * 1024;
 const MAX_SEALED: usize = MAX_PLAIN + 65_536;
@@ -52,7 +53,7 @@ impl Drop for Output {
                     usize::try_from(self.0.cbData).unwrap_or_default(),
                 )
             };
-            super::native::scrub(bytes);
+            bytes.zeroize();
             // SAFETY: DPAPI allocations require LocalFree, exactly once.
             unsafe { LocalFree(self.0.pbData.cast()) };
         }

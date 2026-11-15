@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroize as _;
 
 #[allow(
     unsafe_code,
@@ -426,7 +427,7 @@ impl<const N: usize> Secret<N> {
 
 impl<const N: usize> Drop for Secret<N> {
     fn drop(&mut self) {
-        native::scrub(&mut *self.0);
+        self.0.as_mut_slice().zeroize();
     }
 }
 

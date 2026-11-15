@@ -1,5 +1,5 @@
 //! Audited native boundary: owned handles/LocalFree allocations, bounded token
-//! and descriptor buffers, atomic ACL creation, CSPRNG, and volatile scrubbing.
+//! and descriptor buffers, atomic ACL creation, and CSPRNG.
 
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
@@ -10,7 +10,6 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
-use std::sync::atomic::{Ordering, compiler_fence};
 use windows_sys::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
 };
@@ -421,15 +420,6 @@ pub(super) fn random(buffer: &mut [u8]) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-pub(super) fn scrub(buffer: &mut [u8]) {
-    for byte in buffer {
-        // SAFETY: byte uniquely references valid writable storage. Volatile
-        // stores plus the compiler fence prevent dead-store elimination.
-        unsafe { ptr::write_volatile(byte, 0) };
-    }
-    compiler_fence(Ordering::SeqCst);
 }
 
 #[cfg(test)]
