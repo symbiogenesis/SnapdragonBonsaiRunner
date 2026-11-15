@@ -18,7 +18,7 @@ use windows::{
     Security::Authorization::AppCapabilityAccess::{AppCapability, AppCapabilityAccessStatus},
     Storage::Streams::{DataReader, InMemoryRandomAccessStream},
     Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
-    core::HSTRING,
+    core::h,
 };
 use windows_future::{AsyncStatus, IAsyncAction, IAsyncOperation};
 
@@ -208,7 +208,7 @@ impl Microphone {
     }
 
     fn request_access(&mut self) -> windows::core::Result<()> {
-        let capability = AppCapability::Create(&HSTRING::from("microphone"))?;
+        let capability = AppCapability::Create(h!("microphone"))?;
         let request = capability.RequestAccessAsync()?;
         self.capability = Some(capability);
         self.set_pending(Pending::Permission(request));
@@ -303,16 +303,15 @@ impl Microphone {
         Ok(())
     }
 
-    pub(super) fn poll(&mut self) -> Vec<Event> {
+    pub(super) fn poll(&mut self) -> Option<Event> {
         if !self.lifecycle.requested {
-            return Vec::new();
+            return None;
         }
         match self.advance() {
-            Ok(Some(event)) => vec![event],
-            Ok(None) => Vec::new(),
+            Ok(event) => event,
             Err(message) => {
                 self.stop();
-                vec![Event::Failed(message)]
+                Some(Event::Failed(message))
             }
         }
     }

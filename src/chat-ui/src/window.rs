@@ -1630,7 +1630,7 @@ impl State {
         let Some(microphone) = &mut self.microphone else {
             return;
         };
-        for event in microphone.poll() {
+        if let Some(event) = microphone.poll() {
             self.microphone_event(event);
         }
         if self.speech_status != previous {
