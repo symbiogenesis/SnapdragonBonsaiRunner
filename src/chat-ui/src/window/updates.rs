@@ -271,7 +271,10 @@ fn execute(
         if cancelled.load(Ordering::Acquire) {
             return Err(io::Error::other("Update operation cancelled."));
         }
-        if started.elapsed() >= operation.deadline() {
+        let Some(remaining) = operation.deadline().checked_sub(started.elapsed()) else {
+            return Err(io::Error::other("The update operation timed out."));
+        };
+        if remaining.is_zero() {
             return Err(io::Error::other("The update operation timed out."));
         }
         if fs::metadata(&spec.stdout)?.len() > MAX_OUTPUT
@@ -279,10 +282,12 @@ fn execute(
         {
             return Err(io::Error::other("Update tool output exceeded its limit."));
         }
-        if let Some(code) = child.0.try_wait()? {
+        if let Some(code) = child
+            .0
+            .wait_for_exit(remaining.min(Duration::from_millis(250)))?
+        {
             break Ok(code);
         }
-        thread::sleep(Duration::from_millis(250));
     })();
     child.0.stop(Duration::from_secs(3)).map_err(|error| {
         io::Error::other(format!(
