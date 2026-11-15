@@ -1,12 +1,9 @@
 //! Exact-source prerequisites for production-only release builds.
 
-use std::collections::BTreeSet;
-use std::ffi::OsString;
-#[cfg(feature = "github-api")]
-use std::time::Duration;
-
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 
 use crate::Result;
 
@@ -65,20 +62,15 @@ struct Jobs {
 
 #[cfg(feature = "github-api")]
 fn fetch(agent: &ureq::Agent, token: &str, route: &str) -> Result<Value> {
-    let mut response = agent
-        .get(format!("https://api.github.com/repos/{REPOSITORY}/{route}"))
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "bonsai-release-prerequisites")
-        .call()
-        .map_err(|_| {
-            "Release prerequisite API unavailable; no release builds started.".to_owned()
-        })?;
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|_| "Release prerequisite response unavailable.".to_owned())?;
-    serde_json::from_str(&body).map_err(|_| "Malformed release prerequisite response.".into())
+    super::github_get_json(
+        agent,
+        &format!("https://api.github.com/repos/{REPOSITORY}/{route}"),
+        token,
+        "bonsai-release-prerequisites",
+        "Release prerequisite API unavailable; no release builds started.",
+        "Release prerequisite response unavailable.",
+        "Malformed release prerequisite response.",
+    )
 }
 
 fn latest_run(value: Value, workflow: &str, revision: &str) -> Result<Run> {
@@ -234,17 +226,7 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
 
 #[cfg(feature = "github-api")]
 fn check_workflows_with_api(revision: &str, token: &str) -> Result<String> {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(20)))
-        .https_only(true);
-    #[cfg(windows)]
-    let config = config.tls_config(
-        ureq::tls::TlsConfig::builder()
-            .provider(ureq::tls::TlsProvider::NativeTls)
-            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-            .build(),
-    );
-    let agent = ureq::Agent::new_with_config(config.build());
+    let agent = super::github_agent();
     let mut fetch = |route: &str| fetch(&agent, token, route);
     ["foundation.yml", "source-checks.yml"]
         .into_iter()

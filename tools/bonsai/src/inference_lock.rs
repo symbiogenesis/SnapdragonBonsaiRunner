@@ -185,16 +185,16 @@ fn source_identity(file: &mut File, request: &Request, toolchain: &str) -> crate
     let mut total = 0_u64;
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(|error| error.to_string())?;
-        let name = entry.name().map_err(|error| error.to_string())?;
-        if !name.starts_with(&prefix)
-            || name.contains(['\\', ':'])
-            || name.split('/').any(|part| matches!(part, "." | ".."))
-            || !names.insert(name.to_lowercase())
-            || entry
-                .unix_mode()
-                .is_some_and(|mode| mode & 0o170_000 == 0o120_000)
-            || entry.size() > 512 * MIB
-        {
+        let name = crate::zip_entry::validate_zip_entry(
+            &entry,
+            &crate::zip_entry::ZipEntryPolicy {
+                allow_directories: true,
+                min_size: 0,
+                max_size: 512 * MIB,
+                error: "Unexpected, duplicate or linked source archive entry.",
+            },
+        )?;
+        if !name.starts_with(&prefix) || !names.insert(name.to_lowercase()) {
             return Err("Unexpected, duplicate or linked source archive entry.".into());
         }
         total += entry.size();

@@ -2,7 +2,6 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
 
 use serde_json::Value;
 
@@ -129,34 +128,21 @@ fn fetch_runs(repository: &str, token: &str, workflow: &str) -> Result<Value> {
     let url = format!(
         "https://api.github.com/repos/{repository}/actions/workflows/{encoded}/runs?branch=main&status=success&event=push&per_page=100"
     );
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(20)))
-        .https_only(true);
-    #[cfg(windows)]
-    let config = config.tls_config(
-        ureq::tls::TlsConfig::builder()
-            .provider(ureq::tls::TlsProvider::NativeTls)
-            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-            .build(),
-    );
-    let config = config.build();
-    let mut response = ureq::Agent::new_with_config(config)
-        .get(&url)
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "workspace-ci-impact")
-        .call()
-        .map_err(|_| "Workflow baseline API unavailable.".to_owned())?;
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|_| "Workflow baseline response unavailable.".to_owned())?;
-    serde_json::from_str(&body).map_err(|_| "Malformed workflow baseline response.".into())
+    let agent = super::github_agent();
+    super::github_get_json(
+        &agent,
+        &url,
+        token,
+        "workspace-ci-impact",
+        "Workflow baseline API unavailable.",
+        "Workflow baseline response unavailable.",
+        "Malformed workflow baseline response.",
+    )
 }
 
 #[cfg(not(feature = "github-api"))]
 fn fetch_runs(repository: &str, token: &str, workflow: &str) -> Result<Value> {
-    let _ = (repository, token, workflow, Duration::ZERO);
+    let _ = (repository, token, workflow);
     Err("Workflow baseline API disabled.".into())
 }
 

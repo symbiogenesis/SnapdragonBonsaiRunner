@@ -24,14 +24,7 @@ fn snapshot(target: &Path, tool: &Path, digest: &str) -> crate::Result<std::path
             .create_new(true)
             .open(&temporary)
             .map_err(|error| error.to_string())?;
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            options.share_mode(1).custom_flags(0x0820_0000);
-        }
-        let mut input = options.open(tool).map_err(|error| error.to_string())?;
+        let mut input = crate::bounded_input::open_sequential_file(tool)?;
         std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
         output.sync_all().map_err(|error| error.to_string())?;
         drop(output);

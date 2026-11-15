@@ -254,3 +254,4 @@ mod runtime_probe;
 mod startup_cache;
 mod startup_download;
 mod startup_process;
+mod zip_entry;

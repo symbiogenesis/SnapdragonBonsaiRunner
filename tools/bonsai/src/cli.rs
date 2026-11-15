@@ -1,7 +1,6 @@
 //! Native command input, including direct chat options and bounded JSON streams.
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -46,14 +45,8 @@ fn file_request(path: &Path, maximum: u64) -> crate::Result<Value> {
     if !path.is_absolute() {
         return Err("Request path must be expanded and absolute.".into());
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(1);
-    }
-    let file = options.open(path).map_err(|error| error.to_string())?;
+    bonsai_artifacts::validate_external_path(path).map_err(|error| error.to_string())?;
+    let file = crate::bounded_input::open_regular_file(path)?;
     if file.metadata().map_err(|error| error.to_string())?.len() > maximum {
         return Err(format!("Command request exceeds {maximum} bytes."));
     }
@@ -418,6 +411,26 @@ mod tests {
                 assert!(chat_options(&[first.into(), second.into()]).is_err());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn file_request_rejects_traversal_directories_git_paths_and_oversized_files()
+    -> crate::Result<()> {
+        let scratch = crate::bounded_input::ScratchDir::new("Bonsai-CliRequest")?;
+        let valid = scratch.join("request.json");
+        std::fs::write(&valid, b"{\"ok\":true}").map_err(|error| error.to_string())?;
+        assert_eq!(file_request(&valid, 64)?["ok"], true);
+        assert!(file_request(&valid, 4).is_err());
+        assert!(file_request(Path::new("relative.json"), 64).is_err());
+        assert!(file_request(&scratch.join("..\\request.json"), 64).is_err());
+        assert!(file_request(scratch.path(), 64).is_err());
+        let repo = scratch.join("repo");
+        std::fs::create_dir(&repo).map_err(|error| error.to_string())?;
+        std::fs::create_dir(repo.join(".git")).map_err(|error| error.to_string())?;
+        let inside_git = repo.join("request.json");
+        std::fs::write(&inside_git, b"{}").map_err(|error| error.to_string())?;
+        assert!(file_request(&inside_git, 64).is_err());
         Ok(())
     }
 }

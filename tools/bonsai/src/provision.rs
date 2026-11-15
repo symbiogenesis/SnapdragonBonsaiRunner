@@ -480,21 +480,23 @@ fn extract_inference(
     let mut names = BTreeSet::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
-        let name = entry
-            .name()
-            .map_err(|error| error.to_string())?
-            .into_owned();
-        let expected = files
-            .iter()
-            .find(|file| file.name == name)
-            .ok_or("Unexpected inference archive entry.")?;
-        if !names.insert(name)
-            || entry.size() != expected.bytes
-            || !entry.is_file()
-            || entry
-                .unix_mode()
-                .is_some_and(|mode| mode & 0xf000 == 0xa000)
-        {
+        let expected = {
+            let name = entry.name().map_err(|error| error.to_string())?;
+            files
+                .iter()
+                .find(|file| file.name == name)
+                .ok_or("Unexpected inference archive entry.")?
+        };
+        let name = crate::zip_entry::validate_zip_entry(
+            &entry,
+            &crate::zip_entry::ZipEntryPolicy {
+                allow_directories: false,
+                min_size: expected.bytes,
+                max_size: expected.bytes,
+                error: "Inference archive contains a duplicate, linked or invalid-sized entry.",
+            },
+        )?;
+        if !names.insert(name) {
             return Err(
                 "Inference archive contains a duplicate, linked or invalid-sized entry.".into(),
             );

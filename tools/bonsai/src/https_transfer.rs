@@ -314,7 +314,8 @@ fn metadata_with_redirects(
     let mut body = Vec::new();
     // Preserve Retry-After and rate-limit headers without consuming error bodies.
     if status == 200 {
-        if content_length(&headers)?.is_some_and(|n| n > maximum) {
+        let declared = content_length(&headers)?;
+        if declared.is_some_and(|n| n > maximum) {
             return Err("Update metadata exceeds its byte limit.".into());
         }
         let mut reader = response.body_mut().as_reader();
@@ -326,14 +327,21 @@ fn metadata_with_redirects(
             if count == 0 {
                 break;
             }
-            if u64::try_from(body.len())
+            let next = u64::try_from(body.len())
                 .map_err(|e| e.to_string())?
-                .saturating_add(u64::try_from(count).map_err(|e| e.to_string())?)
-                > maximum
-            {
+                .saturating_add(u64::try_from(count).map_err(|e| e.to_string())?);
+            if next > maximum {
                 return Err("Update metadata exceeds its byte limit.".into());
             }
+            if declared.is_some_and(|expected| next > expected) {
+                return Err("Update metadata length differs from Content-Length.".into());
+            }
             body.extend_from_slice(&buffer[..count]);
+        }
+        if let Some(expected) = declared
+            && u64::try_from(body.len()).map_err(|e| e.to_string())? != expected
+        {
+            return Err("Update metadata response ended before Content-Length.".into());
         }
     }
     Ok(Response {
@@ -738,6 +746,20 @@ mod tests {
                 .err()
                 .is_some_and(|e| e.contains("credential-free"))
         );
+        let (response, _) = fixture(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello",
+            |agent, uri| {
+                Ok(metadata_with(
+                    &agent,
+                    uri,
+                    &[],
+                    Instant::now() + Duration::from_secs(5),
+                    1024,
+                    &AtomicBool::new(false),
+                ))
+            },
+        )?;
+        assert!(response.is_err());
         Ok(())
     }
 

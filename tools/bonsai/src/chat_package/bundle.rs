@@ -55,27 +55,29 @@ fn archive(executable: &Path) -> crate::Result<(ZipArchive<File>, String)> {
     let mut names = std::collections::BTreeSet::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(|error| error.to_string())?;
-        let name = entry.name().map_err(|error| error.to_string())?;
-        let limit = if name == "package.json" {
-            super::MAX_METADATA_BYTES
-        } else if name.starts_with("bin/") {
-            MAX_IMAGE_BYTES
-        } else {
-            16 * 1024 * 1024
+        let limit = {
+            let name = entry.name().map_err(|error| error.to_string())?;
+            if !(FILES.contains(&name.as_ref()) || name == "package.json") {
+                return Err("Invalid bundled package entry.".into());
+            }
+            if name == "package.json" {
+                super::MAX_METADATA_BYTES
+            } else if name.starts_with("bin/") {
+                MAX_IMAGE_BYTES
+            } else {
+                16 * 1024 * 1024
+            }
         };
-        if !(FILES.contains(&name.as_ref()) || name == "package.json")
-            || !names.insert(name.into_owned())
-            || !entry.is_file()
-            || entry.encrypted()
-            || !matches!(
-                entry.compression(),
-                CompressionMethod::Stored | CompressionMethod::Deflated
-            )
-            || entry.size() == 0
-            || entry.size() > limit
-            || (entry.compression() == CompressionMethod::Stored
-                && entry.compressed_size() != entry.size())
-        {
+        let name = crate::zip_entry::validate_zip_entry(
+            &entry,
+            &crate::zip_entry::ZipEntryPolicy {
+                allow_directories: false,
+                min_size: 1,
+                max_size: limit,
+                error: "Invalid bundled package entry.",
+            },
+        )?;
+        if !names.insert(name) {
             return Err("Invalid bundled package entry.".into());
         }
     }

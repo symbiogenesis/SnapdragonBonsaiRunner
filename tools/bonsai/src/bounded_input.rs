@@ -347,6 +347,8 @@ mod tests {
         write_atomic_synced(&json_path, b"\xef\xbb\xbf{\"count\":2}")?;
         let parsed: serde_json::Value = read_regular_json(&json_path, 64, "too big")?;
         assert_eq!(parsed, serde_json::json!({"count": 2}));
+        assert!(super::open_regular_file(&root).is_err());
+        assert!(super::open_sequential_file(&root).is_err());
         drop(scratch);
         assert!(!root.exists());
         Ok(())

@@ -232,6 +232,52 @@ fn action_outputs(plan: &impact::Plan, config: &Value, serialized: &str) -> Resu
     Ok(output)
 }
 
+#[cfg(feature = "github-api")]
+const MAX_GITHUB_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+#[cfg(feature = "github-api")]
+fn github_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .https_only(true)
+        .max_redirects(0)
+        .max_response_header_size(64 * 1024);
+    #[cfg(windows)]
+    let config = config.tls_config(
+        ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::NativeTls)
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .build(),
+    );
+    ureq::Agent::new_with_config(config.build())
+}
+
+#[cfg(feature = "github-api")]
+fn github_get_json(
+    agent: &ureq::Agent,
+    url: &str,
+    token: &str,
+    user_agent: &str,
+    api_error: &str,
+    response_error: &str,
+    malformed_error: &str,
+) -> Result<Value> {
+    let mut response = agent
+        .get(url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", user_agent)
+        .call()
+        .map_err(|_| api_error.to_owned())?;
+    let bytes = impact::workspace::read_bounded_reader(
+        response.body_mut().as_reader(),
+        MAX_GITHUB_RESPONSE_BYTES,
+        response_error,
+    )
+    .map_err(|_| response_error.to_owned())?;
+    serde_json::from_slice(&bytes).map_err(|_| malformed_error.into())
+}
+
 fn native_operation(arguments: &[OsString]) -> Option<Result<String>> {
     match arguments.first()?.to_str()? {
         "push-sanity" => Some(push_sanity::run(arguments)),

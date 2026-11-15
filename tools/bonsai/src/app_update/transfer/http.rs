@@ -101,24 +101,43 @@ fn discovery_cache(
     conditional.then(|| cached(root, slot, url)).flatten()
 }
 
+fn content_encoding(headers: &BTreeMap<String, String>) -> crate::Result<Option<&str>> {
+    let mut found = None;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-encoding") {
+            if found.is_some() {
+                return Err("Ambiguous update metadata content encoding.".into());
+            }
+            found = Some(value.as_str());
+        }
+    }
+    Ok(found)
+}
+
 fn decoded(bytes: &[u8], encoding: Option<&str>) -> crate::Result<Vec<u8>> {
     if u64::try_from(bytes.len()).map_err(|error| error.to_string())? > MAX_METADATA {
         return Err("Update metadata exceeds its byte limit.".into());
     }
-    match encoding.unwrap_or("identity") {
-        "identity" => Ok(bytes.to_vec()),
-        "gzip" => {
-            let mut body = Vec::new();
-            flate2::read::MultiGzDecoder::new(bytes)
-                .take(MAX_METADATA + 1)
-                .read_to_end(&mut body)
-                .map_err(|error| error.to_string())?;
-            if u64::try_from(body.len()).map_err(|error| error.to_string())? > MAX_METADATA {
-                return Err("Expanded update metadata exceeds its byte limit.".into());
-            }
-            Ok(body)
+    let encoding = encoding.map(str::trim).unwrap_or("identity");
+    if encoding.eq_ignore_ascii_case("identity") {
+        Ok(bytes.to_vec())
+    } else if encoding.eq_ignore_ascii_case("gzip") {
+        let mut decoder = flate2::bufread::GzDecoder::new(bytes);
+        let mut body = Vec::new();
+        decoder
+            .by_ref()
+            .take(MAX_METADATA + 1)
+            .read_to_end(&mut body)
+            .map_err(|error| error.to_string())?;
+        if u64::try_from(body.len()).map_err(|error| error.to_string())? > MAX_METADATA {
+            return Err("Expanded update metadata exceeds its byte limit.".into());
         }
-        _ => Err("Unsupported update metadata content encoding.".into()),
+        if !decoder.into_inner().is_empty() {
+            return Err("Update metadata gzip stream has unexpected trailing bytes.".into());
+        }
+        Ok(body)
+    } else {
+        Err("Unsupported update metadata content encoding.".into())
     }
 }
 
@@ -256,10 +275,7 @@ fn response_body(
         return Ok(body.clone());
     }
     super::require_successful_http(response.status)?;
-    decoded(
-        &response.body,
-        response.headers.get("content-encoding").map(String::as_str),
-    )
+    decoded(&response.body, content_encoding(&response.headers)?)
 }
 
 pub(super) fn metadata(
@@ -395,11 +411,30 @@ mod tests {
         };
         let gzip = Some("gzip");
         assert_eq!(decoded(&compress(b"[]")?, gzip)?, b"[]");
+        assert_eq!(decoded(&compress(b"[]")?, Some("GZip"))?, b"[]");
+        assert_eq!(decoded(b"[]", Some("Identity"))?, b"[]");
+        let mut with_trailing = compress(b"[]")?;
+        with_trailing.push(0);
+        assert!(decoded(&with_trailing, gzip).is_err());
+        let mut concatenated = compress(b"[")?;
+        concatenated.extend_from_slice(&compress(b"]")?);
+        assert!(decoded(&concatenated, gzip).is_err());
         assert!(decoded(b"corrupt", gzip).is_err());
         let oversized =
             vec![0; usize::try_from(MAX_METADATA).map_err(|error| error.to_string())? + 1];
         assert!(decoded(&compress(&oversized)?, gzip).is_err());
-        assert!(decoded(b"[]", Some("br")).is_err());
+        for unsupported in ["br", "Br", "DEFLATE"] {
+            assert!(decoded(b"[]", Some(unsupported)).is_err());
+        }
+        let mixed = BTreeMap::from([("Content-Encoding".into(), "GZip".into())]);
+        assert_eq!(content_encoding(&mixed)?, Some("GZip"));
+        let mixed_bad = BTreeMap::from([("Content-Encoding".into(), "Br".into())]);
+        assert!(decoded(b"[]", content_encoding(&mixed_bad)?).is_err());
+        let duplicate = BTreeMap::from([
+            ("Content-Encoding".into(), "gzip".into()),
+            ("content-encoding".into(), "identity".into()),
+        ]);
+        assert!(content_encoding(&duplicate).is_err());
         Ok(())
     }
 
