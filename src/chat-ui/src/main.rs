@@ -127,7 +127,7 @@ fn detect_host_family() -> HostFamily {
     host_family_from_processor_name(&host.processor_name)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 fn configuration(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Result<client::Config, &'static str> {
