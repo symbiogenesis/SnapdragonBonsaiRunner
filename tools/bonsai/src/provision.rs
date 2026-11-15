@@ -19,6 +19,7 @@ type RuntimeObserver<'a> =
 const REFERENCE: &str = include_str!("../../../config/runtime.lock.json");
 const INFERENCE: &str = include_str!("../../../config/prism-inference.lock.json");
 const ADAPTER: &str = include_str!("../../../config/swift-lora.lock.json");
+const MMPROJ: &str = include_str!("../../../config/swift-mmproj.lock.json");
 const MAX_LOCK_BYTES: u64 = 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -45,6 +46,7 @@ struct Request {
 enum Operation {
     Model,
     Adapter,
+    Mmproj,
     Engine,
     Inference,
     Speech,
@@ -268,6 +270,34 @@ fn engine(request: &Request, working: &Path) -> crate::Result<Value> {
 #[cfg(not(windows))]
 fn engine(_request: &Request, _working: &Path) -> crate::Result<Value> {
     Err("Engine provisioning requires Windows.".into())
+}
+
+fn mmproj(request: &Request, working: &Path) -> crate::Result<Value> {
+    let lock = read_lock(None, MMPROJ)?;
+    let pin = &lock["mmproj"];
+    let selected = bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory)?;
+    if pin["bytes"].as_u64() != Some(selected.bytes)
+        || text(pin, "sha256")? != selected.sha256
+        || text(pin, "url")? != selected.url
+        || text(pin, "repository")? != selected.repository
+        || text(pin, "revision")? != selected.revision
+        || text(pin, "filename")? != selected.filename
+    {
+        return Err("Vision projector repository, revision, path and URL disagree.".into());
+    }
+    if request.verify_only {
+        crate::startup_download::verify(&selected.path, selected.bytes, &selected.sha256)?;
+    } else {
+        receive(request, pin, &selected.url, &selected.path, working)?;
+    }
+    Ok(json!({
+        "Status": "verified",
+        "MmprojPath": selected.path,
+        "Repository": selected.repository,
+        "Revision": selected.revision,
+        "Sha256": selected.sha256,
+        "Qualification": "pretrained vision projector artifact integrity only"
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1395,6 +1425,7 @@ pub fn run(value: Value) -> crate::Result<Value> {
     match request.operation {
         Operation::Model => model(&request, &working),
         Operation::Adapter => adapter(&request, &working),
+        Operation::Mmproj => mmproj(&request, &working),
         Operation::Engine => engine(&request, &working),
         Operation::Inference => inference(&request, &working),
         Operation::Speech => crate::native_startup::models(
@@ -1552,6 +1583,7 @@ mod tests {
             json!({"operation": "inference", "includeCapabilities": true, "lockPath": data.join("untrusted.json")}),
             json!({"operation": "model", "includeHelp": true}),
             json!({"operation": "adapter", "lockPath": data.join("untrusted.json")}),
+            json!({"operation": "mmproj", "lockPath": data.join("untrusted.json")}),
             json!({"operation": "speech", "model": "Arbitrary"}),
             json!({"operation": "inference", "arguments": ["--tools"]}),
         ] {
@@ -1587,6 +1619,32 @@ mod tests {
             assert!(model_lock(&invalid).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn mmproj_provisioning_verifies_pin_and_rejects_missing_or_mismatched_file() -> crate::Result<()>
+    {
+        let data = std::env::temp_dir().join(format!(
+            "Bonsai-Provision-Mmproj-{}",
+            crate::startup_process::unique()
+        ));
+        let artifact = bonsai_cpu_policy::swift_mmproj_artifact(&data)?;
+        let missing = run(json!({
+            "operation": "mmproj",
+            "dataDirectory": data,
+            "verifyOnly": true,
+        }));
+        assert!(missing.is_err());
+        fs::create_dir_all(artifact.path.parent().ok_or("Missing mmproj parent.")?)
+            .map_err(|error| error.to_string())?;
+        fs::write(&artifact.path, b"not a valid mmproj gguf").map_err(|error| error.to_string())?;
+        let mismatched = run(json!({
+            "operation": "mmproj",
+            "dataDirectory": data,
+            "verifyOnly": true,
+        }));
+        assert!(mismatched.is_err());
+        fs::remove_dir_all(&data).map_err(|error| error.to_string())
     }
 
     #[test]

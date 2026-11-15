@@ -129,6 +129,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--native-engine" | "--publisher-engine" => ("NativeEngine", true, false),
             "--use-repacked-ptq1" | "--use-original-pq2" => ("UseRepackedPtq1", true, false),
             "--no-abliterate-lora" => ("NoAbliterateLora", true, false),
+            "--no-mmproj" => ("NoMmproj", true, false),
             "--no-tts" => ("NoTts", true, false),
             "--no-speech-models" => ("NoSpeechModels", true, false),
             "--speech-models-only" => ("SpeechModelsOnly", true, false),
@@ -217,6 +218,7 @@ pub fn installed_chat(arguments: &[OsString]) -> crate::Result<Value> {
                 | "NoSpeechModels"
                 | "NoTts"
                 | "NoAbliterateLora"
+                | "NoMmproj"
                 | "UseRepackedPtq1"
                 | "NativeEngine"
                 | "NativeRowWorkers"
@@ -261,11 +263,16 @@ mod tests {
             root.join("user data").into_os_string(),
         ];
         let mut arguments = prefix.clone();
-        arguments.extend(["--no-speech-models".into(), "--publisher-engine".into()]);
+        arguments.extend([
+            "--no-speech-models".into(),
+            "--no-mmproj".into(),
+            "--publisher-engine".into(),
+        ]);
         let request = installed_chat(&arguments)?;
         assert_eq!(request["operation"], "start");
         assert_eq!(request["installationDirectory"], serde_json::json!(root));
         assert_eq!(request["options"]["NativeEngine"], false);
+        assert_eq!(request["options"]["NoMmproj"], true);
         assert_eq!(request["options"]["NoSpeechModels"], true);
         for forbidden in ["--repository-root", "--chat-path", "--broker-path"] {
             let mut arguments = prefix.clone();

@@ -118,6 +118,8 @@ struct Request {
     #[serde(default)]
     no_abliterate_lora: bool,
     #[serde(default)]
+    no_mmproj: bool,
+    #[serde(default)]
     use_repacked_ptq1: bool,
     #[serde(default = "default_native_engine")]
     native_engine: bool,
@@ -678,6 +680,9 @@ fn argument(arguments: &mut Vec<OsString>, name: &str, value: impl Into<OsString
 fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
     if request.no_abliterate_lora {
         arguments.push("--no-abliterate-lora".into());
+    }
+    if request.no_mmproj {
+        arguments.push("--no-mmproj".into());
     }
     arguments.push(if request.use_repacked_ptq1 {
         "--use-repacked-ptq1".into()

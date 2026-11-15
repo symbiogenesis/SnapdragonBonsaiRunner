@@ -180,12 +180,18 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
     }
     let selected = model(request)?;
     let kind = kind(request)?;
+    let mmproj_path = (!request.no_mmproj)
+        .then(|| bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory))
+        .transpose()?
+        .map(|artifact| artifact.path);
     prepare_weights(
         request,
         working,
         |url, path, bytes, hash, working| {
             let stage = if path == selected.path {
                 "model"
+            } else if mmproj_path.as_deref() == Some(path) {
+                "mmproj"
             } else {
                 "adapter"
             };
@@ -245,6 +251,19 @@ fn prepare_weights(
         receive(text(&lock["adapter"], "url")?, &selected.path, selected.bytes, &selected.sha256, working)
             .map_err(|error| format!("Model adapter setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup.", selected.path.display()))?;
     }
+    if !request.no_mmproj {
+        let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory)?;
+        status(
+            working,
+            "mmproj",
+            "Checking vision projector files…",
+            kind,
+            "checking",
+            Some((&mmproj.path, mmproj.bytes)),
+        )?;
+        receive(&mmproj.url, &mmproj.path, mmproj.bytes, &mmproj.sha256, working)
+            .map_err(|error| format!("Vision projector setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup.", mmproj.path.display()))?;
+    }
     status(
         working,
         "ready",
@@ -285,10 +304,10 @@ fn artifact_status(
     phase: crate::startup_download::RepairActivity,
 ) -> crate::Result<()> {
     use crate::startup_download::RepairActivity;
-    let name = if stage == "model" {
-        "Swift model"
-    } else {
-        "model adapter"
+    let name = match stage {
+        "model" => "Swift model",
+        "mmproj" => "vision projector",
+        _ => "model adapter",
     };
     let (activity, message) = match phase {
         RepairActivity::VerifyingExisting if path.exists() => {
@@ -423,8 +442,9 @@ mod tests {
             .map_err(|error| error.to_string())?;
         fs::write(&selected.path, b"intentionally invalid model-free fixture")
             .map_err(|error| error.to_string())?;
-        for adapter in [false, true] {
+        for (adapter, no_mmproj) in [(false, false), (true, false), (true, true)] {
             request.no_abliterate_lora = !adapter;
+            request.no_mmproj = no_mmproj;
             let mut received = Vec::new();
             prepare_weights(
                 &request,
@@ -435,18 +455,29 @@ mod tests {
                 },
                 |_, _, _| Err("PQ2 must use verified download preparation.".into()),
             )?;
-            assert_eq!(received.len(), if adapter { 2 } else { 1 });
+            let expected_count = 1 + usize::from(adapter) + usize::from(!no_mmproj);
+            assert_eq!(received.len(), expected_count);
             assert_eq!(received[0].1, selected.path);
             assert_eq!(received[0].2, selected.bytes);
             assert_eq!(received[0].3, selected.sha256);
+            let mut next_index = 1;
             if adapter {
                 let expected = bonsai_cpu_policy::abliterate_lora_artifact(&data)?;
-                assert_eq!(received[1].1, expected.path);
-                assert_eq!(received[1].2, expected.bytes);
-                assert_eq!(received[1].3, expected.sha256);
+                assert_eq!(received[next_index].1, expected.path);
+                assert_eq!(received[next_index].2, expected.bytes);
+                assert_eq!(received[next_index].3, expected.sha256);
+                next_index += 1;
+            }
+            if !no_mmproj {
+                let expected = bonsai_cpu_policy::swift_mmproj_artifact(&data)?;
+                assert_eq!(received[next_index].1, expected.path);
+                assert_eq!(received[next_index].2, expected.bytes);
+                assert_eq!(received[next_index].3, expected.sha256);
+                assert_eq!(received[next_index].0, expected.url);
             }
         }
         request.no_abliterate_lora = false;
+        request.no_mmproj = false;
         let mut count = 0;
         let error = prepare_weights(
             &request,
@@ -464,6 +495,7 @@ mod tests {
 
         request.use_repacked_ptq1 = true;
         request.no_abliterate_lora = true;
+        request.no_mmproj = true;
         let mut verified = Vec::new();
         prepare_weights(
             &request,
