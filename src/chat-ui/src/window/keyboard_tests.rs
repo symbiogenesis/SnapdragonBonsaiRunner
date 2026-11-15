@@ -226,7 +226,7 @@ fn microphone_cancel_click_wins_over_a_queued_voice_message() {
     app.dictation_requested = true;
     app.dictation_finishing = true;
     app.microphone_generation = Some(7);
-    chat.run();
+    chat.run_steps(2);
     let cancel = chat
         .get_by_role_and_label(egui::Role::Button, "Microphone")
         .rect()

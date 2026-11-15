@@ -1655,6 +1655,7 @@ fn response_speaker_loading_is_cancellable_and_only_failures_open_alerts() -> io
 fn speech_preparation_uses_speaker_progress_without_error_panel() {
     let mut chat = harness([1180.0, 960.0], true);
     chat.state_mut().app.tts_configured = true;
+    chat.state_mut().app.canary_configured = true;
     chat.state_mut().app.speech_checked = false;
     chat.run_steps(8);
     assert!(
@@ -1662,9 +1663,29 @@ fn speech_preparation_uses_speaker_progress_without_error_panel() {
             .accesskit_node()
             .is_disabled()
     );
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Microphone")
+            .accesskit_node()
+            .is_disabled()
+    );
     assert_eq!(chat.state().app.active_alerts(), []);
     assert!(
         chat.query_by_role_and_label(egui::Role::Button, "Copy error")
             .is_none()
+    );
+    chat.state_mut()
+        .app
+        .speech_event(speech::Event::Capabilities {
+            input: true,
+            output: true,
+            issue: None,
+            setup_detail: None,
+        });
+    chat.run();
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Microphone")
+            .accesskit_node()
+            .is_disabled()
     );
 }

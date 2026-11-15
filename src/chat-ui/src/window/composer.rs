@@ -5,14 +5,18 @@ mod microphone;
 
 impl State {
     fn microphone_button(&mut self, ui: &mut egui::Ui) {
+        let preparing = !self.speech_input && self.canary_configured && !self.speech_checked;
         let phase = if self.dictation_finishing {
             microphone::Phase::Finishing
         } else if self.dictation_requested {
             microphone::Phase::Recording
+        } else if preparing {
+            microphone::Phase::Preparing
         } else {
             microphone::Phase::Idle
         };
-        let enabled = self.dictation_requested || (!self.model.busy() && !self.speaking);
+        let enabled =
+            self.dictation_requested || (!preparing && !self.model.busy() && !self.speaking);
         if microphone::button(ui, phase, enabled).clicked() {
             self.toggle_dictation();
         }

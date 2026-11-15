@@ -4,50 +4,49 @@ use super::{controls, egui};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase {
     Idle,
+    Preparing,
     Recording,
     Finishing,
 }
 
 pub(super) fn button(ui: &mut egui::Ui, phase: Phase, enabled: bool) -> egui::Response {
+    let active = matches!(phase, Phase::Recording | Phase::Finishing);
+    let hover_text = match phase {
+        Phase::Finishing => "Cancel voice message · Escape",
+        Phase::Recording => "Finish recording and transcribe · Escape cancels",
+        Phase::Preparing => "Preparing speech automatically.",
+        Phase::Idle => "Record a voice message · Qwen3-ASR 1.7B",
+    };
     let response = ui
         .add_enabled(
             enabled,
             controls::action_button("")
                 .min_size(egui::Vec2::splat(36.0))
-                .selected(phase != Phase::Idle),
+                .selected(active),
         )
         .accessible_name("Microphone")
-        .on_hover_text(match phase {
-            Phase::Finishing => "Cancel voice message · Escape",
-            Phase::Recording => "Finish recording and transcribe · Escape cancels",
-            Phase::Idle => "Record a voice message · Qwen3-ASR 1.7B",
-        });
+        .on_hover_text(hover_text)
+        .on_disabled_hover_text(hover_text);
     let center = response.rect.center();
-    let stroke = if phase != Phase::Idle && response.enabled() {
+    let stroke = if active && response.enabled() {
         ui.visuals().selection.stroke
     } else {
         ui.style().interact(&response).fg_stroke
     };
-    let painter = ui.painter_at(response.rect);
-    if phase == Phase::Finishing {
-        painter.line_segment(
-            [center - egui::vec2(5.0, 5.0), center + egui::vec2(5.0, 5.0)],
-            stroke,
+    if matches!(phase, Phase::Preparing | Phase::Finishing) {
+        egui::Spinner::new().color(stroke.color).paint_at(
+            ui,
+            egui::Rect::from_center_size(center, egui::Vec2::splat(20.0)),
         );
-        painter.line_segment(
-            [
-                center + egui::vec2(-5.0, 5.0),
-                center + egui::vec2(5.0, -5.0),
-            ],
-            stroke,
-        );
-    } else if phase != Phase::Idle {
+    } else if phase == Phase::Recording {
+        let painter = ui.painter_at(response.rect);
         painter.rect_filled(
             egui::Rect::from_center_size(center, egui::Vec2::splat(12.0)),
             2.0,
             stroke.color,
         );
     } else {
+        let painter = ui.painter_at(response.rect);
         painter.rect_stroke(
             egui::Rect::from_center_size(center - egui::vec2(0.0, 3.0), egui::vec2(7.0, 12.0)),
             4.0,
