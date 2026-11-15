@@ -1678,8 +1678,6 @@ fn speech_preparation_uses_speaker_progress_without_error_panel() {
         .speech_event(speech::Event::Capabilities {
             input: true,
             output: true,
-            issue: None,
-            setup_detail: None,
         });
     chat.run();
     assert!(
