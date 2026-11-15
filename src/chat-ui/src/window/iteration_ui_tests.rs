@@ -196,3 +196,81 @@ fn iteration_menu_branches_without_sending_and_continue_keeps_a_draft() {
         .and_then(|conversation| conversation.saved.as_ref());
     assert!(saved.is_some_and(|snapshot| snapshot.input == "Keep my next draft 🌱"));
 }
+
+#[test]
+fn unanswered_stopped_prompt_supports_menu_edit_and_branch_while_preserving_source_draft() {
+    let mut chat = harness([1180.0, 860.0]);
+    let original = chat.state().app.active_conversation;
+    chat.state_mut().app.input = "Unanswered stopped prompt".into();
+    chat.state_mut().app.submit();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { .. })
+    ));
+    let prompt_id = chat
+        .state()
+        .app
+        .transcript
+        .messages
+        .iter()
+        .rfind(|message| message.role == Role::User)
+        .map(|message| message.id)
+        .unwrap_or(0);
+    chat.state_mut()
+        .app
+        .model_event(Event::Stopping("Unanswered stopped prompt".into()));
+    chat.state_mut().app.model_event(Event::Stopped);
+    chat.state_mut().app.input = "Separate composer draft 🌱".into();
+    chat.run();
+
+    // Branch from the unanswered stopped prompt places its text into the new branch composer.
+    open_actions(&mut chat, prompt_id);
+    chat.get_by_role_and_label(egui::Role::Button, "Branch from here")
+        .click();
+    chat.run();
+    assert_ne!(chat.state().app.active_conversation, original);
+    assert_eq!(chat.state().app.committed.len(), 2);
+    assert_eq!(chat.state().app.input, "Unanswered stopped prompt");
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::RestoreChat(history)) if history.len() == 2
+    ));
+
+    // Switch back to the original conversation and use Edit and resend on the unanswered card.
+    chat.state_mut().app.switch_conversation(original);
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::RestoreChat(history)) if history.len() == 2
+    ));
+    chat.run();
+    open_actions(&mut chat, prompt_id);
+    chat.get_by_role_and_label(egui::Role::Button, "Edit and resend")
+        .click();
+    chat.run();
+    if let Some(edit) = chat.state_mut().app.edit_message.as_mut() {
+        assert_eq!(edit.text, "Unanswered stopped prompt");
+        edit.text = "Edited unanswered prompt".into();
+    }
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::Button, "Create branch and send")
+        .click();
+    chat.run();
+    assert_ne!(chat.state().app.active_conversation, original);
+    assert_eq!(chat.state().app.conversations.len(), 3);
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::RestoreChat(history)) if history.len() == 2
+    ));
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { text, .. }) if text == "Edited unanswered prompt"
+    ));
+    let saved = chat
+        .state()
+        .app
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == original)
+        .and_then(|conversation| conversation.saved.as_ref());
+    assert!(saved.is_some_and(|snapshot| snapshot.input == "Separate composer draft 🌱"));
+}

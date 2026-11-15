@@ -49,21 +49,29 @@ impl Message {
         can_send: bool,
         can_branch: bool,
     ) -> MessageOptions {
-        let Some(index) = self.committed_index(history) else {
-            return MessageOptions::default();
-        };
-        MessageOptions {
-            edit: can_send && can_branch && self.role == Role::User,
-            regenerate: can_send
-                && can_branch
-                && self.role == Role::Assistant
-                && index > 0
-                && history[index - 1].role == "user",
-            branch: can_branch,
-            continue_response: can_send
-                && self.role == Role::Assistant
-                && index + 1 == history.len(),
+        if let Some(index) = self.committed_index(history) {
+            return MessageOptions {
+                edit: can_send && can_branch && self.role == Role::User,
+                regenerate: can_send
+                    && can_branch
+                    && self.role == Role::Assistant
+                    && index > 0
+                    && history[index - 1].role == "user",
+                branch: can_branch,
+                continue_response: can_send
+                    && self.role == Role::Assistant
+                    && index + 1 == history.len(),
+            };
         }
+        if self.role == Role::User && self.retry_prefix(history).is_some() {
+            return MessageOptions {
+                edit: can_send && can_branch,
+                regenerate: false,
+                branch: can_branch,
+                continue_response: false,
+            };
+        }
+        MessageOptions::default()
     }
 }
 

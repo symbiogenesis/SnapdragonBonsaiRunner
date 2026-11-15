@@ -53,7 +53,18 @@ impl State {
         match action {
             MessageAction::Retry(id) => self.retry_response(id),
             MessageAction::Edit(id) if self.message_options(id).edit => {
-                let Some(index) = self.transcript.committed_index(id, &self.committed) else {
+                let text = if let Some(index) = self.transcript.committed_index(id, &self.committed)
+                {
+                    self.committed[index].content.to_string()
+                } else if let Some(message) = self
+                    .transcript
+                    .messages
+                    .iter()
+                    .find(|message| message.id == id && message.role == super::Role::User)
+                    && message.retry_prefix(&self.committed).is_some()
+                {
+                    message.body.clone()
+                } else {
                     return;
                 };
                 self.stop_speech();
@@ -61,7 +72,7 @@ impl State {
                 self.edit_message = Some(EditMessage {
                     source_conversation: self.active_conversation,
                     message: id,
-                    text: self.committed[index].content.to_string(),
+                    text,
                     focus: true,
                     limit_notice: false,
                 });
@@ -79,16 +90,26 @@ impl State {
                 }
             }
             MessageAction::Branch(id) if self.message_options(id).branch => {
-                let Some(index) = self.transcript.committed_index(id, &self.committed) else {
-                    return;
-                };
-                // A committed history always contains complete user/assistant
-                // pairs. A user-message branch places that prompt in the draft.
-                let (end, prompt) = if self.committed[index].role == "user" {
-                    (index, self.committed[index].content.to_string())
-                } else {
-                    (index + 1, String::new())
-                };
+                let (end, prompt) =
+                    if let Some(index) = self.transcript.committed_index(id, &self.committed) {
+                        // A committed history always contains complete user/assistant
+                        // pairs. A user-message branch places that prompt in the draft.
+                        if self.committed[index].role == "user" {
+                            (index, self.committed[index].content.to_string())
+                        } else {
+                            (index + 1, String::new())
+                        }
+                    } else if let Some(message) = self
+                        .transcript
+                        .messages
+                        .iter()
+                        .find(|message| message.id == id && message.role == super::Role::User)
+                        && let Some(prefix) = message.retry_prefix(&self.committed)
+                    {
+                        (prefix, message.body.clone())
+                    } else {
+                        return;
+                    };
                 if self.branch_history(end, "Branch") {
                     self.input = prompt;
                     self.place_composer_cursor(self.input.chars().count());
@@ -237,13 +258,23 @@ impl State {
         {
             return;
         }
-        let Some(index) = self
+        let prefix = if let Some(index) = self
             .transcript
             .committed_index(edit.message, &self.committed)
-        else {
+        {
+            index
+        } else if let Some(message) = self
+            .transcript
+            .messages
+            .iter()
+            .find(|message| message.id == edit.message && message.role == super::Role::User)
+            && let Some(prefix) = message.retry_prefix(&self.committed)
+        {
+            prefix
+        } else {
             return;
         };
-        if self.branch_history(index, "Edited") {
+        if self.branch_history(prefix, "Edited") {
             self.input = edit.text;
             self.submit();
         }
