@@ -278,10 +278,11 @@ preparing. Explicit readout retains on-demand loading/authenticated readiness.
 
 Sidebar search and Find share Unicode scalar lowercase matching. Selecting a
 sidebar result opens Find at the trimmed query, including title-only results with
-no body match. Query changes update an open Find without taking focus; unchanged
-queries preserve local Find edits, dismissal and navigation. Find edits/closure
-leave the sidebar filter intact. Ctrl+F precedes text editors, while dialogs/popups
-retain keyboard priority. [Streaming resources](streaming-resources.md#native-chat-and-transcript)
+no body match. Query changes update an open Find without taking focus, and clearing
+the sidebar query closes Find across conversations; unchanged queries preserve local
+Find edits, dismissal and navigation. Find edits/closure leave the sidebar filter
+intact. Ctrl+F precedes text editors, while dialogs/popups retain keyboard priority.
+[Streaming resources](streaming-resources.md#native-chat-and-transcript)
 owns matching, layout invalidation and work bounds.
 
 The Context ring shows approximate reserved occupancy, clamped full; pending

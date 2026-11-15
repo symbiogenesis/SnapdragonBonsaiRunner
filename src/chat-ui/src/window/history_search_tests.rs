@@ -149,20 +149,19 @@ fn find_sync_sidebar_updates_selected_chat_and_clears_without_taking_focus() {
     );
     assert!(chat.get_by_label("No matches").rect().is_positive());
     clear_query(&mut chat);
-    assert_eq!(
-        chat.get_by_role_and_label(egui::Role::TextInput, "Find in conversation")
-            .value()
-            .as_deref(),
-        Some("")
+    assert!(!chat.state().app.transcript.find_open());
+    assert!(
+        chat.query_by_role_and_label(egui::Role::TextInput, "Find in conversation")
+            .is_none()
     );
     type_query(&mut chat, "seed");
+    assert!(chat.state().app.transcript.find_open());
     chat.key_press(egui::Key::Escape);
     chat.run();
-    assert_eq!(
-        chat.get_by_role_and_label(egui::Role::TextInput, "Find in conversation")
-            .value()
-            .as_deref(),
-        Some("")
+    assert!(!chat.state().app.transcript.find_open());
+    assert!(
+        chat.query_by_role_and_label(egui::Role::TextInput, "Find in conversation")
+            .is_none()
     );
     assert!(
         chat.get_by_role_and_label(egui::Role::TextInput, "Search conversations")
@@ -171,6 +170,28 @@ fn find_sync_sidebar_updates_selected_chat_and_clears_without_taking_focus() {
     assert_eq!(chat.state().app.active_conversation, selected);
     assert_eq!(chat.state().app.input, DRAFT);
     assert!(chat.state().commands.try_recv().is_err());
+
+    type_query(&mut chat, "e");
+    chat.get_by_role_and_label(egui::Role::Button, "Garden notes")
+        .click();
+    chat.run();
+    assert!(chat.state().app.transcript.find_open());
+    chat.get_by_role_and_label(egui::Role::Button, "Voyage à Montréal")
+        .click();
+    chat.run();
+    clear_query(&mut chat);
+    assert!(!chat.state().app.transcript.find_open());
+    chat.get_by_role_and_label(egui::Role::Button, "Garden notes")
+        .click();
+    chat.run();
+    assert!(!chat.state().app.transcript.find_open());
+    assert!(
+        chat.query_by_role_and_label(egui::Role::TextInput, "Find in conversation")
+            .is_none()
+    );
+    while let Ok(command) = chat.state().commands.try_recv() {
+        assert!(!matches!(command, Command::Send { .. }));
+    }
 }
 
 #[test]

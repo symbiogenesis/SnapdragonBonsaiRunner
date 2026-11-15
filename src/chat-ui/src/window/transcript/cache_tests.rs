@@ -612,6 +612,7 @@ fn find_sync_live_query_refreshes_highlights_without_resetting_unchanged_matches
             })
     );
     chat.state_mut().sync_find_query("");
+    assert!(!chat.state().find_open());
     chat.run();
     assert!(chat.state().search.matches.is_empty());
     assert!(

@@ -261,7 +261,8 @@ playback for a hidden response.
 | **Retry response** | Retry the identified failed prompt using its existing message card, preserving the composer and cursor. For an interrupted partial answer, retry its original prompt in a new branch. |
 | Message **Reload model** | After teardown completes, reload the model without sending. Select Retry response when ready to retry that turn. |
 
-Sidebar queries update Find without taking focus. Editing or closing Find leaves
+Sidebar queries update Find without taking focus, and clearing the search box
+hides Find across conversations. Editing or closing Find leaves
 the sidebar filter intact. Iteration actions require verified message positions
 and ordinary readiness/context checks; recovered messages without verified
 positions remain copyable and searchable. A locally identified interrupted answer

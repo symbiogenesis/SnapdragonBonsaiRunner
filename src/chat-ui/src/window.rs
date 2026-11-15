@@ -727,7 +727,7 @@ impl State {
         self.stop_speech();
         self.save_conversation();
         self.conversation_notice = None;
-        self.conversation_search.clear();
+        self.clear_conversation_search();
         let id = self.next_conversation;
         self.next_conversation = next;
         self.conversations.insert(0, Conversation::new(id));
@@ -821,6 +821,7 @@ impl State {
             return;
         }
         if self.conversation_search.clear_on_escape(ctx) {
+            self.sync_conversation_find();
             return;
         }
         if self.sidebar_open && ctx.content_rect().width() < navigation::DOCK_THRESHOLD {

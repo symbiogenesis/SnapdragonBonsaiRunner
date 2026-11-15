@@ -226,7 +226,7 @@ impl State {
         branch.title = format!("{title} · {label}");
         branch.renamed = true;
         self.conversations.insert(0, branch);
-        self.conversation_search.clear();
+        self.clear_conversation_search();
         self.transcript = transcript;
         self.committed = history;
         (

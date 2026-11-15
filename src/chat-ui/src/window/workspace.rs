@@ -76,6 +76,23 @@ impl State {
         }
     }
 
+    pub(super) fn sync_conversation_find(&mut self) {
+        let query = self.conversation_search.text.trim();
+        self.transcript.sync_find_query(query);
+        if query.is_empty() {
+            for conversation in &mut self.conversations {
+                if let Some(saved) = conversation.saved.as_mut() {
+                    saved.transcript.close_find();
+                }
+            }
+        }
+    }
+
+    pub(super) fn clear_conversation_search(&mut self) {
+        self.conversation_search.clear();
+        self.sync_conversation_find();
+    }
+
     pub(super) fn take_conversation(&mut self) -> ConversationSnapshot {
         ConversationSnapshot {
             transcript: std::mem::take(&mut self.transcript),

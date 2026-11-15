@@ -16,8 +16,7 @@ impl State {
             self.active_conversation,
             &self.transcript,
         ) {
-            self.transcript
-                .sync_find_query(self.conversation_search.text.trim());
+            self.sync_conversation_find();
             // Drawer input is drawn after the disabled workspace. Refresh Find
             // next frame without taking focus from the sidebar.
             ui.ctx().request_repaint();
