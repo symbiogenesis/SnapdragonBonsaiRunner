@@ -24,9 +24,15 @@ function Remove-CiScratch([string]$Path) {
 function Invoke-CiCases([Collections.IDictionary]$Cases,[string]$SelectedCase) {
     if ($SelectedCase -and -not $Cases.Contains($SelectedCase)) { throw "Unknown named case: $SelectedCase" }
     $selected=@(if ($SelectedCase) { $SelectedCase } else { $Cases.Keys })
+    $caller=$MyInvocation.PSCommandPath
+    $suite=if ($caller) { [IO.Path]::GetFileName($caller) } else { 'ci-fixture' }
     foreach ($name in $selected) {
         try { & $Cases[$name] }
-        catch { [Console]::Error.WriteLine("FAIL ${name}: $($_.Exception.Message)"); throw }
+        catch {
+            $where=if ($_.InvocationInfo -and $_.InvocationInfo.ScriptName) { "$([IO.Path]::GetFileName($_.InvocationInfo.ScriptName)):$($_.InvocationInfo.ScriptLineNumber)" } else { $suite }
+            [Console]::Error.WriteLine("FAIL ${suite}::${name} ($where): $($_.Exception.Message)")
+            throw
+        }
         "PASS $name"
     }
     "$($selected.Count) focused fixture(s) passed."

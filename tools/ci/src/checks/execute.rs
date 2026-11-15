@@ -2,8 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,7 @@ use crate::Result;
 
 const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONSOLE_LOG_BYTES: u64 = 12 * 1024;
+const MAX_HIGHLIGHT_BYTES: usize = 4 * 1024;
 
 fn console_excerpt(bytes: &[u8]) -> String {
     if bytes.is_empty() {
@@ -39,21 +41,78 @@ fn console_excerpt(bytes: &[u8]) -> String {
     excerpt
 }
 
-fn read_log_tail(path: &Path) -> std::io::Result<(bool, Vec<u8>)> {
+fn is_diagnostic_headline(trimmed: &str) -> bool {
+    trimmed.contains("panicked at ")
+        || (trimmed.starts_with("---- ") && trimmed.ends_with(" ----"))
+        || trimmed.starts_with("error[")
+        || trimmed.starts_with("error:")
+        || trimmed == "failures:"
+        || trimmed.starts_with("test result: FAILED")
+}
+
+fn extract_prefix_highlights(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let mut buffered = BufReader::new(reader);
+    let mut raw_line = Vec::new();
+    let mut highlights = Vec::new();
+    let mut context_remaining = 0_u8;
+    while buffered.read_until(b'\n', &mut raw_line)? != 0 {
+        let text = String::from_utf8_lossy(&raw_line);
+        let trimmed = text.trim();
+        let matched = is_diagnostic_headline(trimmed);
+        if matched {
+            context_remaining = 3;
+        }
+        if (matched || context_remaining > 0) && !trimmed.is_empty() {
+            let remaining = MAX_HIGHLIGHT_BYTES.saturating_sub(highlights.len());
+            if remaining == 0 {
+                break;
+            }
+            let slice = if raw_line.len() <= remaining {
+                &raw_line[..]
+            } else {
+                &raw_line[..remaining]
+            };
+            highlights.extend_from_slice(slice);
+            if !highlights.ends_with(b"\n") {
+                highlights.push(b'\n');
+            }
+            if !matched {
+                context_remaining = context_remaining.saturating_sub(1);
+            }
+        }
+        raw_line.clear();
+    }
+    Ok(highlights)
+}
+
+fn read_log_tail(path: &Path) -> std::io::Result<(Vec<u8>, bool, Vec<u8>)> {
     let mut file = File::open(path)?;
     let length = file.metadata()?.len();
     let offset = length.saturating_sub(MAX_CONSOLE_LOG_BYTES);
+    let highlights = if offset != 0 {
+        let prefix = File::open(path)?.take(offset);
+        extract_prefix_highlights(prefix).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
     file.take(MAX_CONSOLE_LOG_BYTES).read_to_end(&mut bytes)?;
-    Ok((offset != 0, bytes))
+    Ok((highlights, offset != 0, bytes))
 }
 
 pub(super) fn write_failure_logs(output: &mut impl std::io::Write, spec: &ToolProcessSpec) {
     for (label, path) in [("stdout", &spec.stdout), ("stderr", &spec.stderr)] {
         let _ = writeln!(output, "{label}: {}", path.display());
         match read_log_tail(path) {
-            Ok((truncated, bytes)) => {
+            Ok((highlights, truncated, bytes)) => {
+                if !highlights.is_empty() {
+                    let _ = writeln!(
+                        output,
+                        "  | [key diagnostic lines earlier in {label} before truncated tail]"
+                    );
+                    let _ = output.write_all(console_excerpt(&highlights).as_bytes());
+                }
                 if truncated {
                     let _ = writeln!(
                         output,
@@ -67,6 +126,53 @@ pub(super) fn write_failure_logs(output: &mut impl std::io::Write, spec: &ToolPr
             }
         }
     }
+}
+
+fn format_step_summary(report: &Value) -> String {
+    let lane = std::env::var("RUST_LANE").unwrap_or_default();
+    let heading = if lane.is_empty() {
+        "### Rust Checks".to_owned()
+    } else {
+        format!("### Rust Checks (`{lane}`)")
+    };
+    let mut out = format!("{heading}\n\n");
+    out.push_str("| Check | Phase | Packages | Status | Exit | Elapsed |\n");
+    out.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    if let Some(checks) = report["Checks"].as_array() {
+        for check in checks {
+            let name = check["Name"].as_str().unwrap_or("unknown");
+            let phase = check["Phase"].as_str().unwrap_or("unknown");
+            let packages = check["Packages"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let status = if check["Passed"] == true {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            let exit = check["ExitCode"]
+                .as_u64()
+                .map_or_else(|| "-".to_owned(), |code| code.to_string());
+            let elapsed = check["ElapsedMilliseconds"]
+                .as_u64()
+                .map_or_else(|| "-".to_owned(), |ms| format!("{}.{:02}s", ms / 1000, (ms % 1000) / 10));
+            let _ = writeln!(
+                out,
+                "| `{name}` | `{phase}` | `{packages}` | `{status}` | `{exit}` | `{elapsed}` |"
+            );
+        }
+    }
+    if let Some(error) = report["Error"].as_str() {
+        let _ = writeln!(out, "\n**Error:** {error}");
+    }
+    out
 }
 
 fn external(path: &Path) -> Result<()> {
@@ -453,6 +559,10 @@ pub(super) fn run(
         Err(error) => report["Error"] = error.clone().into(),
     }
     receipt(&path, &report)?;
+    let _ = crate::command::append_environment_file(
+        "GITHUB_STEP_SUMMARY",
+        &format_step_summary(&report),
+    );
     result?;
     serde_json::to_string(&report).map_err(|error| error.to_string())
 }
@@ -470,6 +580,28 @@ mod tests {
         );
         assert_eq!(console_excerpt(&[0x80, b'\n']), "  | \u{fffd}\n");
         assert_eq!(console_excerpt(&[]), "  | (empty)\n");
+    }
+
+    #[test]
+    fn prefix_highlights_retain_panic_and_compiler_errors_before_large_widget_dump()
+    -> std::io::Result<()> {
+        let mut prefix = String::new();
+        prefix.push_str("running 1 test\n");
+        prefix.push_str("---- window::interaction_tests::case stdout ----\n");
+        prefix.push_str("thread 'main' panicked at src/window.rs:42:9:\n");
+        prefix.push_str("assertion `left == right` failed\n");
+        prefix.push_str("  left: 1\n");
+        prefix.push_str(" right: 2\n");
+        for _ in 0..400 {
+            prefix.push_str("    role: Button, label: \"Make a plan\", hidden: false,\n");
+        }
+        let highlights = extract_prefix_highlights(prefix.as_bytes())?;
+        let text = String::from_utf8_lossy(&highlights);
+        assert!(text.contains("---- window::interaction_tests::case stdout ----"));
+        assert!(text.contains("panicked at src/window.rs:42:9:"));
+        assert!(text.contains("assertion `left == right` failed"));
+        assert!(!text.contains("Make a plan"));
+        Ok(())
     }
 
     #[test]

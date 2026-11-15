@@ -10,7 +10,8 @@ foreach ($call in (Get-Content -LiteralPath $CallsFile -Raw | ConvertFrom-Json -
     # Invoke in a child scope so one script's functions/preferences cannot replace
     # the next script's policy; every path remains in committed checking policy.
     $parameters = $call.parameters
+    $detail = if ($parameters -and $parameters.Count -gt 0) { ' (' + ($parameters | ConvertTo-Json -Compress) + ')' } else { '' }
     $global:LASTEXITCODE = 0
     & (Join-Path $PSScriptRoot $call.script) @parameters
-    if ($LASTEXITCODE) { throw "Push blocked: $($call.script) exited $LASTEXITCODE." }
+    if ($LASTEXITCODE) { throw "Push blocked: $($call.script)$detail exited $LASTEXITCODE." }
 }

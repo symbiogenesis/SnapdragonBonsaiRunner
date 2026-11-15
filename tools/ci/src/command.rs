@@ -97,7 +97,7 @@ fn parse(arguments: &[OsString]) -> Result<Arguments> {
     Ok(parsed)
 }
 
-fn append_environment_file(variable: &str, contents: &str) -> Result<()> {
+pub(in crate::command) fn append_environment_file(variable: &str, contents: &str) -> Result<()> {
     if let Some(path) = std::env::var_os(variable).filter(|path| !path.is_empty()) {
         OpenOptions::new()
             .append(true)
@@ -222,6 +222,10 @@ pub fn run(arguments: &[OsString]) -> Result<String> {
             serde_json::from_str(&std::env::var("CI_NEEDS").map_err(|error| error.to_string())?)
                 .map_err(|error| error.to_string())?;
         let errors = gate::failures(&needs, jobs);
+        append_environment_file(
+            "GITHUB_STEP_SUMMARY",
+            &gate::summary(&workflow, &needs, jobs),
+        )?;
         return if errors.is_empty() {
             Ok("All selected CI groups passed; unselected groups were skipped.".into())
         } else {

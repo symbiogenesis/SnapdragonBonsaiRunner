@@ -267,8 +267,14 @@ jobs:
       - name: Reject an unsuccessful Foundation planner
         if: needs.changes.result != 'success'
         shell: pwsh
+        env:
+          PLANNER_RESULT: ${{ needs.changes.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          throw 'Foundation planner failed, was cancelled, or was skipped; inspect the changes job before qualifying Foundation.'
+          if ($env:GITHUB_STEP_SUMMARY) {
+            "### Foundation Gate Blocked`n`n- Planner (`changes`) result: ``$env:PLANNER_RESULT```n- Run: $env:RUN_URL`n" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8NoBOM
+          }
+          throw "Foundation planner did not succeed (changes.result=$env:PLANNER_RESULT); inspect the changes job at $env:RUN_URL before qualifying Foundation."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
