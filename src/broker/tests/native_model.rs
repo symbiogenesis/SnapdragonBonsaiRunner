@@ -341,12 +341,7 @@ fn native_worker_receipts_require_the_reviewed_memory_context_source() {
         false,
     );
     assert_worker_receipt_case(Some("0.1.27"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(
-        Some("0.1.28"),
-        Some(MEMORY_CONTEXT_REVISION),
-        false,
-        false,
-    );
+    assert_worker_receipt_case(Some("0.1.28"), Some(MEMORY_CONTEXT_REVISION), false, false);
     assert_worker_receipt_case(
         Some("0.1.30"),
         Some(PRIOR_MEMORY_CONTEXT_REVISION),
