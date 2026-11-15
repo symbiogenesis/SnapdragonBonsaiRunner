@@ -306,12 +306,15 @@ fn preflight(request: &Execution, deadline: Instant) -> Result<Vec<(String, u64,
     Ok(identities)
 }
 
-fn execute(
+fn execute<F>(
     request: Execution,
     request_bytes: &[u8],
     request_digest: &str,
     deadline: Instant,
-    mut invoke: impl FnMut(
+    mut invoke: F,
+) -> Result<String>
+where
+    F: FnMut(
         &CommandUnit,
         &[String],
         &str,
@@ -319,7 +322,7 @@ fn execute(
         &BTreeMap<String, String>,
         &Path,
     ) -> Result<u32>,
-) -> Result<String> {
+{
     if hex(&Sha256::digest(request_bytes)) != request_digest
         || request.schema_version != 1
         || request.kind != "explicit-clang-native-source-execution"

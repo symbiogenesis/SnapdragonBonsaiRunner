@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+#[cfg(feature = "github-api")]
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -62,6 +63,7 @@ struct Jobs {
     jobs: Vec<Job>,
 }
 
+#[cfg(feature = "github-api")]
 fn fetch(agent: &ureq::Agent, token: &str, route: &str) -> Result<Value> {
     let mut response = agent
         .get(format!("https://api.github.com/repos/{REPOSITORY}/{route}"))
@@ -230,6 +232,11 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
         .ok()
         .filter(|token| !token.is_empty())
         .ok_or("Release prerequisite lookup requires an Actions read token.")?;
+    check_workflows_with_api(revision, &token)
+}
+
+#[cfg(feature = "github-api")]
+fn check_workflows_with_api(revision: &str, token: &str) -> Result<String> {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .https_only(true);
@@ -241,7 +248,20 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
             .build(),
     );
     let agent = ureq::Agent::new_with_config(config.build());
-    let mut fetch = |route: &str| fetch(&agent, &token, route);
+    let mut fetch = |route: &str| fetch(&agent, token, route);
+    ["foundation.yml", "source-checks.yml"]
+        .into_iter()
+        .map(|workflow| check_workflow(workflow, revision, &mut fetch))
+        .collect::<Result<Vec<_>>>()
+        .map(|summaries| summaries.join("\n"))
+}
+
+#[cfg(not(feature = "github-api"))]
+fn check_workflows_with_api(revision: &str, token: &str) -> Result<String> {
+    let _ = token;
+    let mut fetch = |_: &str| -> Result<Value> {
+        Err("GitHub API support is disabled in this check-only configuration.".into())
+    };
     ["foundation.yml", "source-checks.yml"]
         .into_iter()
         .map(|workflow| check_workflow(workflow, revision, &mut fetch))

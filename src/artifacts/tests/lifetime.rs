@@ -1,6 +1,6 @@
+//! Windows sharing-mode regressions with synthetic files; no executable runs.
 #![cfg(windows)]
 #![forbid(unsafe_code)]
-//! Windows sharing-mode regressions with synthetic files; no executable runs.
 
 use bonsai_artifacts::{ArtifactError, RuntimeSpec, VerifiedFile, VerifiedRuntime};
 use sha2::{Digest, Sha256};

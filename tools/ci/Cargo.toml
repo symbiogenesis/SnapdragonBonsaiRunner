@@ -23,15 +23,21 @@ sha2.workspace = true
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }
 zip.workspace = true
 
+[features]
+default = ["github-api"]
+# Allow offline Windows->Linux target checks of all non-Windows CI code without
+# requiring a Linux C cross-compiler for rustls/ring.
+github-api = ["dep:ureq"]
+
 # Windows uses Schannel and system trust through Rust bindings, avoiding a bundled
 # root set or an additional C/assembly compiler for the native ARM64 CI command.
 [target.'cfg(windows)'.dependencies]
 bonsai-artifacts.workspace = true
 bonsai-windows-process.workspace = true
-ureq = { workspace = true, features = ["native-tls-no-default"] }
+ureq = { workspace = true, features = ["native-tls-no-default"], optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
-ureq = { workspace = true, features = ["rustls"] }
+ureq = { workspace = true, features = ["rustls"], optional = true }
 
 [lints]
 workspace = true

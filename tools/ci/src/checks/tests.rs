@@ -632,6 +632,7 @@ fn workspace_registry_rejects_missing_extra_or_mismatched_packages() -> Result<(
         )
         .map_err(|error| error.to_string())?;
         assert!(verify_workspace_registry(&scratch).is_err());
+        verify_workspace_registry(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
         Ok(())
     })();
     let _ = fs::remove_dir_all(&scratch);

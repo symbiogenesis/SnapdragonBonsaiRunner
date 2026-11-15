@@ -114,6 +114,7 @@ fn valid_repository(repository: &str) -> bool {
         })
 }
 
+#[cfg(feature = "github-api")]
 fn fetch_runs(repository: &str, token: &str, workflow: &str) -> Result<Value> {
     let encoded: String = workflow
         .bytes()
@@ -151,6 +152,12 @@ fn fetch_runs(repository: &str, token: &str, workflow: &str) -> Result<Value> {
         .read_to_string()
         .map_err(|_| "Workflow baseline response unavailable.".to_owned())?;
     serde_json::from_str(&body).map_err(|_| "Malformed workflow baseline response.".into())
+}
+
+#[cfg(not(feature = "github-api"))]
+fn fetch_runs(repository: &str, token: &str, workflow: &str) -> Result<Value> {
+    let _ = (repository, token, workflow, Duration::ZERO);
+    Err("Workflow baseline API disabled.".into())
 }
 
 fn successful_base(root: &Path, workflow: &str, after: &str) -> Option<String> {

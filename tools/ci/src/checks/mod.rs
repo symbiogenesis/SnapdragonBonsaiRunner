@@ -283,6 +283,7 @@ fn registry(root: &Path) -> Result<Vec<Package>> {
     Ok(registry.packages)
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn verify_workspace_registry(root: &Path) -> Result<()> {
     let canonical = root.canonicalize().map_err(|error| error.to_string())?;
     let packages = registry(&canonical)?;
