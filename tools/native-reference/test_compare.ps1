@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(ValueFromRemainingArguments)][string[]]$Name=@(),[string]$ToolPath='')
 . (Join-Path $PSScriptRoot 'compare.ps1') -ToolPath $ToolPath
-function Assert-Rejected([scriptblock]$Action){$rejected=$false;try{& $Action 2>$null|Out-Null}catch{$rejected=$true};Assert-Reference $rejected 'fixture expected rejection'}
+function Assert-Rejected([scriptblock]$Action){$rejected=$false;try{& $Action 2>$null|Out-Null}catch{$global:LASTEXITCODE=0;$rejected=$true};Assert-Reference $rejected 'fixture expected rejection'}
 function Write-FloatFixture([string]$Path,[single[]]$Values){$bytes=[byte[]]::new($Values.Length*4);[Buffer]::BlockCopy($Values,0,$bytes,0,$bytes.Length);[IO.File]::WriteAllBytes($Path,$bytes)}
 function Write-NativeFixture([string]$Path,[bool]$Transposed){
     $memory=[IO.MemoryStream]::new();$writer=[IO.BinaryWriter]::new($memory)
@@ -92,4 +92,5 @@ function Write-ControlFixture([string]$Backend,$Workers,$Operations){Write-Contr
 try {
     $selected=if($Name.Count -gt 0){@($Name|ForEach-Object{($_ -split '\.')[-1]})}elseif($env:GITHUB_ACTIONS -ceq 'true'){@($tests.Keys)}else{throw 'Select a named focused regression locally; complete tests are CI-only.'}
     foreach($case in $selected){Assert-Reference ($tests.Contains($case)) 'unknown focused regression';& $tests[$case];Write-Output "PASS $case"}
+    $global:LASTEXITCODE=0
 }finally{[IO.Directory]::Delete($scratch,$true)}

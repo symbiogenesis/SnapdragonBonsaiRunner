@@ -273,13 +273,18 @@ fn cached_artifact(path: &Path, bytes: u64, sha256: &str) -> crate::Result<Cache
 }
 
 fn repair_parents(path: &Path) -> crate::Result<BTreeMap<PathBuf, File>> {
-    let mut guards = BTreeMap::new();
     #[cfg(windows)]
-    crate::bounded_input::hold_directory_chain(path, &mut guards, false, 3)
-        .map_err(|error| format!("Cannot protect the download folder: {error}"))?;
+    {
+        let mut guards = BTreeMap::new();
+        crate::bounded_input::hold_directory_chain(path, &mut guards, false, 3)
+            .map_err(|error| format!("Cannot protect the download folder: {error}"))?;
+        Ok(guards)
+    }
     #[cfg(not(windows))]
-    let _ = path;
-    Ok(guards)
+    {
+        let _ = path;
+        Ok(BTreeMap::new())
+    }
 }
 
 fn prepare_receive(

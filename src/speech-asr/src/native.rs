@@ -262,8 +262,8 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARCHITECTURE, Cancellation, MAX_SAMPLES, VARIANT, check_cancelled, validate_header,
-        validate_identity, validate_pcm,
+        ARCHITECTURE, Cancellation, MAX_SAMPLES, Path, Recognizer, VARIANT, check_cancelled,
+        validate_header, validate_identity, validate_pcm,
     };
 
     use std::io::{self, Cursor};

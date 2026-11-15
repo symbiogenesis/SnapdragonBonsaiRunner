@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 function Assert($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Reject([scriptblock]$Action, [string]$Pattern = '.') {
     $caught = $false
-    try { & $Action | Out-Null } catch { $caught = $true; Assert ($_.Exception.Message -match $Pattern) "Unexpected rejection: $_" }
+    try { & $Action | Out-Null } catch { $global:LASTEXITCODE = 0; $caught = $true; Assert ($_.Exception.Message -match $Pattern) "Unexpected rejection: $_" }
     Assert $caught 'Expected rejection'
 }
 function Put16([byte[]]$Data, [int]$Offset, [uint16]$Value) { [BitConverter]::GetBytes($Value).CopyTo($Data, $Offset) }
@@ -71,4 +71,5 @@ try {
         }
         Write-Output "PASS $selected"
     }
+    $global:LASTEXITCODE = 0
 } finally { [IO.Directory]::Delete($scratch, $true) }

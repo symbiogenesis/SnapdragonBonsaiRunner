@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(ValueFromRemainingArguments)][string[]]$Name=@())
 . (Join-Path $PSScriptRoot 'audit_retained.ps1')
-function Assert-Rejected([scriptblock]$Action){$rejected=$false;try{& $Action 2>$null|Out-Null}catch{$rejected=$true};Assert-Reference $rejected 'fixture expected rejection'}
+function Assert-Rejected([scriptblock]$Action){$rejected=$false;try{& $Action 2>$null|Out-Null}catch{$global:LASTEXITCODE=0;$rejected=$true};Assert-Reference $rejected 'fixture expected rejection'}
 function New-ProducerFixture{
     $run=@{id=$script:RetainedRun;head_sha=$script:RetainedRevision;head_branch='main';event='workflow_dispatch';run_attempt=1;path=$script:RetainedWorkflow;status='completed';conclusion='success';repository=@{full_name=$script:RetainedRepository;id=1}}
     $artifact=@{id=$script:RetainedArtifact;name=$script:RetainedArtifactName;size_in_bytes=$script:RetainedArchiveBytes;expired=$false;digest=('sha256:'+$script:RetainedArchiveSha);workflow_run=@{id=$script:RetainedRun;head_sha=$script:RetainedRevision;head_branch='main';repository_id=1}}
@@ -45,4 +45,4 @@ $tests=[ordered]@{
         $source=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../../tools/bonsai/src/native_reference/retained.rs'));Assert-Reference ($source.Contains('max_redirects(0)') -and $source.Contains('fresh credential-free request')) 'explicit credential-free redirect boundary missing'
     }
 }
-try{$selected=if($Name.Count){@($Name|ForEach-Object{($_ -split '\.')[-1]})}elseif($env:GITHUB_ACTIONS -ceq 'true'){@($tests.Keys)}else{throw 'Select a named focused regression locally; complete tests are CI-only.'};foreach($case in $selected){Assert-Reference ($tests.Contains($case)) 'unknown focused regression';& $tests[$case];Write-Output "PASS $case"}}finally{[IO.Directory]::Delete($scratch,$true)}
+try{$selected=if($Name.Count){@($Name|ForEach-Object{($_ -split '\.')[-1]})}elseif($env:GITHUB_ACTIONS -ceq 'true'){@($tests.Keys)}else{throw 'Select a named focused regression locally; complete tests are CI-only.'};foreach($case in $selected){Assert-Reference ($tests.Contains($case)) 'unknown focused regression';& $tests[$case];Write-Output "PASS $case"};$global:LASTEXITCODE=0}finally{[IO.Directory]::Delete($scratch,$true)}

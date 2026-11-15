@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'compare.ps1') -ToolPath $ToolPath
 function Expect-Rejection([scriptblock]$Action, [string]$Pattern = '.') {
     $caught = $false
-    try { & $Action | Out-Null } catch { $caught = $true; Assert-Row ($_.Exception.Message -match $Pattern) "Unexpected rejection: $_" }
+    try { & $Action | Out-Null } catch { $global:LASTEXITCODE = 0; $caught = $true; Assert-Row ($_.Exception.Message -match $Pattern) "Unexpected rejection: $_" }
     Assert-Row $caught 'Expected comparison rejection'
 }
 function Write-Records([string]$Directory, $Records) {
@@ -66,4 +66,5 @@ try {
         }
         Write-Output "PASS $selected"
     }
+    $global:LASTEXITCODE = 0
 } finally { [IO.Directory]::Delete($scratch,$true) }
