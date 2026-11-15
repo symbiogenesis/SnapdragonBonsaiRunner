@@ -40,8 +40,13 @@ fn harness_with_preferences(
     };
     builder.build_ui_state(
         |ui, fixture: &mut Fixture| {
-            fixture.app.handle_input_shortcuts(ui.ctx());
-            fixture.app.draw(ui);
+            // `build_ui_state` adds an 8-point widget-test outer margin; match
+            // `eframe::App::ui`, which draws across the full `content_rect`.
+            let content_rect = ui.ctx().content_rect();
+            let mut root = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+            root.set_clip_rect(content_rect);
+            fixture.app.handle_input_shortcuts(root.ctx());
+            fixture.app.draw(&mut root);
         },
         Fixture {
             app,
@@ -320,6 +325,132 @@ fn ergonomics_largest_reader_and_appearance_settings_fit_the_minimum_window() {
     assert!(!chat.state().app.show_settings);
     assert_eq!(chat.state().app.input, "Keep my next thought 🌱");
     assert!(chat.state().commands.try_recv().is_err());
+}
+
+#[test]
+fn workspace_halves_side_padding_and_keeps_conversation_scrollbar_at_window_edge() {
+    for (size, reading_width, expected_padding) in [
+        ([480.0, 480.0], 800_u16, 6.0_f32),
+        ([960.0, 640.0], 800_u16, 12.0_f32),
+        ([1180.0, 640.0], 1_040_u16, 12.0_f32),
+        ([1180.0, 640.0], 800_u16, 12.0_f32),
+    ] {
+        let mut preferences = appearance::Preferences::default();
+        preferences.reading_width = reading_width;
+        let mut chat = harness_with_preferences(size, false, preferences);
+        chat.state_mut().app.transcript.clear();
+        for index in 0..15 {
+            let role = if index % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            chat.state_mut().app.transcript.push(
+                role,
+                format!("Turn {index} line one\nTurn {index} line two"),
+            );
+        }
+        let anchor_body = "Bottom anchor message for padding check.";
+        chat.state_mut()
+            .app
+            .transcript
+            .push(Role::Assistant, anchor_body.into());
+        chat.state_mut().app.transcript.remove_empty_response();
+        chat.run();
+        chat.run_steps(4);
+
+        let nav_right = if size[0] < navigation::DOCK_THRESHOLD {
+            44.0
+        } else {
+            chat.state().app.appearance.sidebar_width
+        };
+        let message_input = chat
+            .get_by_role_and_label(egui::Role::MultilineTextInput, "Message")
+            .rect();
+        let send_button = chat
+            .get_by_role_and_label(egui::Role::Button, "Send  ↑")
+            .rect();
+        let composer_left = message_input.left() - 14.0;
+        let composer_right = send_button.right() + 14.0;
+        let composer_top = message_input.top() - 14.0;
+        if size[0] - nav_right - 2.0 * expected_padding <= f32::from(reading_width) {
+            assert!(
+                (composer_left - nav_right - expected_padding).abs() < 0.5,
+                "size={size:?} composer_left={composer_left} nav_right={nav_right}"
+            );
+            assert!(
+                (size[0] - composer_right - expected_padding).abs() < 0.5,
+                "size={size:?} composer_right={composer_right}"
+            );
+        } else {
+            let left_gap = composer_left - nav_right;
+            let right_gap = size[0] - composer_right;
+            assert!((left_gap - right_gap).abs() < 0.5);
+            assert!(left_gap > expected_padding);
+        }
+
+        let visible_cards: Vec<(egui::Rect, egui::Rect)> = chat
+            .state()
+            .app
+            .transcript
+            .messages
+            .iter()
+            .filter_map(|message| {
+                let actions_label = format!("Actions for message {}", message.id);
+                let body = chat.query_by_label(&message.body)?;
+                let actions = chat.query_by_role_and_label(egui::Role::Button, &actions_label)?;
+                Some((body.rect(), actions.rect()))
+            })
+            .collect();
+        let scrollbar = chat.get_by_role(egui::Role::ScrollBar).rect();
+        assert!(
+            !visible_cards.is_empty(),
+            "size={size:?} expected at least one visible message card"
+        );
+        for (body_rect, actions_rect) in visible_cards {
+            let card_left = body_rect.left() - transcript::MESSAGE_INSET.x;
+            let card_right = actions_rect.right() + transcript::MESSAGE_INSET.x;
+            assert!(
+                (card_left - composer_left).abs() < 0.5,
+                "size={size:?} card_left={card_left} composer_left={composer_left}"
+            );
+            assert!(
+                (card_right - composer_right).abs() < 0.5,
+                "size={size:?} card_right={card_right} composer_right={composer_right}"
+            );
+            assert!(scrollbar.right() > card_right);
+        }
+
+        if let Some(latest) = chat.query_by_role_and_label(egui::Role::Button, "Latest") {
+            let latest_center = latest.rect().center().x;
+            let composer_center = (composer_left + composer_right) * 0.5;
+            assert!(
+                (latest_center - composer_center).abs() < 0.5,
+                "size={size:?} latest_center={latest_center} composer_center={composer_center}"
+            );
+        }
+
+        assert!(
+            (scrollbar.right() - size[0]).abs() < 0.5,
+            "size={size:?} scrollbar={scrollbar:?}"
+        );
+        let context_button = chat
+            .get_by_role_and_label(egui::Role::Button, "Context")
+            .rect();
+        assert!(scrollbar.bottom() < composer_top);
+        assert!(scrollbar.bottom() <= context_button.top());
+
+        chat.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+        chat.run();
+        let find_input = chat
+            .get_by_role_and_label(egui::Role::TextInput, "Find in conversation")
+            .rect();
+        assert!(
+            (find_input.left() - nav_right - expected_padding).abs() < 1.5,
+            "size={size:?} find_left={} nav_right={nav_right}",
+            find_input.left()
+        );
+    }
 }
 
 #[test]

@@ -2048,21 +2048,23 @@ impl State {
     fn draw_workspace(&mut self, ui: &mut egui::Ui) {
         let narrow = ui.available_width() < navigation::DOCK_THRESHOLD;
         self.docked_navigation(ui, narrow);
-        let horizontal_margin = if narrow { 12 } else { 24 };
+        let horizontal_margin = if narrow { 6 } else { 12 };
         let find_open = self.transcript.find_open();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin {
-                left: horizontal_margin,
-                right: horizontal_margin,
+                left: 0,
+                right: 0,
                 top: if find_open { 12 } else { 0 },
                 bottom: 12,
             }))
             .show(ui, |ui| {
-                self.application_notices(ui);
+                horizontal_inset(ui, horizontal_margin, "workspace-notices", |ui| {
+                    self.application_notices(ui);
+                });
                 egui::Panel::bottom("composer-panel")
                     .frame(egui::Frame::new().inner_margin(egui::Margin {
-                        left: 0,
-                        right: 0,
+                        left: horizontal_margin,
+                        right: horizontal_margin,
                         top: 12,
                         bottom: 4,
                     }))
@@ -2070,11 +2072,12 @@ impl State {
                 let empty = self.transcript.messages.is_empty();
                 // Even an empty Find scope advances egui's layout cursor.
                 let closed_find = find_open
-                    && ui
-                        .push_id(("conversation-find", self.active_conversation), |ui| {
+                    && horizontal_inset(ui, horizontal_margin, "workspace-find", |ui| {
+                        ui.push_id(("conversation-find", self.active_conversation), |ui| {
                             self.transcript.search_bar(ui)
                         })
-                        .inner;
+                        .inner
+                    });
                 if closed_find {
                     self.focus_composer = true;
                     ui.ctx().request_repaint();
@@ -2084,6 +2087,7 @@ impl State {
                     .animated(false)
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
+                    .content_margin(egui::Margin::symmetric(horizontal_margin, 0))
                     .show_viewport(ui, |ui, viewport| {
                         let content_top = ui.next_widget_position().y;
                         if empty {
@@ -2208,6 +2212,27 @@ impl State {
             }
         }
     }
+}
+
+/// Apply symmetric horizontal margins without advancing the parent's vertical
+/// cursor when no child widgets allocate height.
+fn horizontal_inset<R>(
+    ui: &mut egui::Ui,
+    margin: i8,
+    id_salt: &'static str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let mut bounds = ui.available_rect_before_wrap();
+    let inset = f32::from(margin);
+    bounds.min.x += inset;
+    bounds.max.x = (bounds.max.x - inset).max(bounds.min.x);
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(id_salt).max_rect(bounds));
+    let result = add_contents(&mut child);
+    let used = child.min_rect();
+    if used.height() > 0.0 {
+        ui.allocate_rect(used, egui::Sense::hover());
+    }
+    result
 }
 
 impl eframe::App for State {
