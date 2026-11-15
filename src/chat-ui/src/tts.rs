@@ -257,6 +257,7 @@ fn transport_failure(failure: Failure) -> Failure {
         Failure::Cancelled => Failure::Cancelled,
         Failure::Message(message) => Failure::Message(match message {
             "Could not connect to the local Qwen3-ASR companion."
+            | "Could not configure the Qwen3-ASR connection."
             | "Could not configure the Qwen3-ASR connection timeout." => {
                 "Could not connect to speech. Use Retry speech setup in Settings > Voice."
             }
