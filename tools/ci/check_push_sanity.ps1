@@ -1,5 +1,5 @@
 #Requires -Version 7.6
-<# Admit a prepared checker; recover its cache once under a verified native supervisor. #>
+<# Admit a prepared checker; recover or prepare helpers under native supervision. #>
 [CmdletBinding()]
 param(
     [string]$Root = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
@@ -9,6 +9,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+$Root = [IO.Path]::GetFullPath($Root)
 function Test-PushHelperReceipt([string]$ReceiptPath, [string]$Image, [string]$SourceIdentity) {
     if (-not (Test-Path -LiteralPath $Image -PathType Leaf) -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $false }
     try {
@@ -66,6 +67,7 @@ try {
     $recoveryTool = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-push-recovery.exe'
     $recoveryReceiptPath = Join-Path $target 'push-recovery.json'
     $recover = -not $Prepare -and -not (Test-PushHelperReceipt $receiptPath $tool $sourceId)
+    $prepareForPush = $false
     if ($Prepare -or $recover) {
         $recoveryInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'src/windows-process')
         $recoveryObjects = @($recoveryInputs | ForEach-Object { $objects[[array]::IndexOf($inputs, $_)] })
@@ -80,8 +82,13 @@ try {
     }
     if ($recover) {
         [IO.File]::Delete($receiptPath)
-        if (-not (Test-PushHelperReceipt $recoveryReceiptPath $recoveryTool $recoveryId)) { throw 'Push blocked: recovery supervisor is missing, stale or invalid; prepare with tools/ci/check_push_sanity.ps1 -Prepare in a declared source-build allowance.' }
-        Write-Host 'Push checker cache is missing, stale or invalid; attempting one bounded offline incremental recovery.'
+        $prepareForPush = -not (Test-PushHelperReceipt $recoveryReceiptPath $recoveryTool $recoveryId)
+        if ($prepareForPush) {
+            [IO.File]::Delete($recoveryReceiptPath)
+            Write-Host 'Push helpers need preparation; automatically running committed -Prepare under native supervision.'
+        } else {
+            Write-Host 'Push checker cache is missing, stale or invalid; attempting one bounded offline incremental recovery.'
+        }
     }
     # A valid checker needs only committed checking policy. Both preparation
     # and recovery snapshot the complete committed Cargo input closure.
@@ -104,7 +111,19 @@ try {
     if ($Prepare -or $recover) {
         . (Join-Path $policy 'scripts/release/Release-Common.ps1')
         $toolchain = Get-ReleaseToolchain $policy
-        if ($Prepare) {
+        if ($prepareForPush) {
+            try {
+                & (Join-Path $policy 'tools/ci/prepare_push_helpers.ps1') -Root $Root -SourceRoot $policy -TargetDirectory $target -ScratchDirectory $scratch -BootstrapMilliseconds $started.ElapsedMilliseconds
+                if (-not (Test-PushHelperReceipt $recoveryReceiptPath $recoveryTool $recoveryId) -or
+                    -not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
+                    throw 'Push blocked: automatic preparation did not produce verified helpers for the original committed source.'
+                }
+            } catch {
+                [IO.File]::Delete($receiptPath)
+                [IO.File]::Delete($recoveryReceiptPath)
+                throw
+            }
+        } elseif ($Prepare) {
             $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = 'true'
             $env:CARGO_BUILD_FINGERPRINT = 'content'
             $env:CARGO_INCREMENTAL = '1'
@@ -148,10 +167,12 @@ try {
             & $recoveryTool --source $policy --target-directory $target --toolchain $toolchain --bootstrap-milliseconds $started.ElapsedMilliseconds
             if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery failed; checker receipt remains invalid.' }
         }
-        @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
-        if (-not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
-            [IO.File]::Delete($receiptPath)
-            throw 'Push blocked: rebuilt checker did not pass receipt verification.'
+        if (-not $prepareForPush) {
+            @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
+            if (-not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
+                [IO.File]::Delete($receiptPath)
+                throw 'Push blocked: rebuilt checker did not pass receipt verification.'
+            }
         }
     }
     if ($Prepare) {
