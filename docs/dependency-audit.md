@@ -137,6 +137,60 @@ threshold. That harness and empty named defect lists do not establish complete
 CommonMark conformance. Runner's supported-subset regressions and native device
 acceptance remain separate obligations in [PLAN.md](../PLAN.md).
 
+### Offline SVG parsing and rasterization
+
+`bonsai-markdown` pins `resvg = "=0.50.0"` (`default-features = false`,
+`features = ["text"]`), resolving `usvg = "=0.50.0"`, `roxmltree = "=0.21.2"`,
+`simplecss = "=0.2.2"`, `svgtypes = "=0.16.2"`, `fontdb = "=0.24.0"` and
+`tiny-skia = "=0.12.0"` alongside in-memory `epaint_default_fonts = "=0.37.0"`.
+`bonsai-chat` has no normal dependency on `bonsai-markdown` or `resvg`; production
+SVG inspection and CPU rasterization execute only inside the offline MXC/PSEC
+`--markdown-worker` process, with no network stack in `bonsai-markdown`'s crate
+graph and kernel-enforced `SandboxNetwork::Offline` denial.
+
+Source review of the pinned closure establishes that the renderer provides **no
+scripting, event, animation, DOM, network or host-font capabilities**:
+
+- `resvg`, `usvg`, `roxmltree`, `simplecss` and `bonsai-markdown` set
+  `#![forbid(unsafe_code)]` (or contain zero `unsafe` tokens). Transitive `unsafe`
+  inside the untrusted worker is confined to SIMD and zero-copy data primitives
+  (`tiny-skia`, `bytemuck`, `yoke`, `stable_deref_trait`, `base64`, `crc32fast`,
+  `zlib-rs`) and never enters the trusted UI process.
+- `usvg` disables `svgz`, `system-fonts`, `memmap-fonts` and `raster-images`; its
+  closed element/attribute tables omit `<script>`, `<foreignObject>`, SMIL
+  `<animate*>`/`<set>`, HTML/media elements and all `on*` event attributes.
+- `fontdb` resolves with empty features (`fs`, `memmap` and `fontconfig` disabled),
+  compiling out filesystem and system-font discovery; only bundled `UBUNTU_LIGHT`
+  and `HACK_REGULAR` bytes are loaded into a shared read-only database.
+- `simplecss` skips all CSS `@`-rules (`@import`, `@font-face`) without fetching
+  URLs, and `roxmltree` runs with `entity_resolver: None`.
+
+Because both model/user SVG inputs and the sandboxed worker are treated as
+untrusted, `src/markdown/src/svg.rs` and `src/markdown/src/svg/policy.rs` enforce
+strict pre- and post-conversion gates rather than relying on `usvg` silently
+ignoring active markup:
+
+- Parses XML via `roxmltree::Document::parse_with_options` with `allow_dtd: false`
+  and `nodes_limit: 4_096` instead of `usvg::Tree::from_data` (which enables DTDs
+  upstream), blocking `<!DOCTYPE ...>` and entity-expansion payloads at the
+  tokenizer boundary, and rejects all XML processing instructions (`<?...?>`).
+- Enforces closed static SVG element (`51` tags) and attribute allowlists and
+  closed namespaces (`svg`, `xlink:href` only, and `xml:space`/`xml:lang` only,
+  blocking `xml:base`, XHTML/MathML/XSLT, `<a>`, `<image>`, `<feImage>` and
+  `<tref>`).
+- Requires every `href`/`xlink:href` and CSS/attribute `url(...)` to be a
+  same-document `#<id>` fragment, rejects `javascript:`/`vbscript:`/`data:`/
+  `http:`/`https:`/`file:`/`blob:` tokens, CSS `@`-rules and CSS backslash escapes,
+  bounds nesting depth (`32`), `feConvolveMatrix` kernels (`8x8`), cycle-free
+  `href` chains and `<use>` DAG expansion (`8,192` visits), and verifies resolved
+  `usvg::Tree` caps (`16,384` nodes, `262,144` path segments, zero `Node::Image`)
+  before `resvg::render`.
+
+Rejected fenced `svg` blocks remain visible as inert `BMD1` code blocks in chat,
+and both `.png` and `.svg` file exports require a validated `BMG1` raster response
+from the offline MXC worker before writing to disk. Repeat this source and feature
+audit before changing any `resvg`/`usvg` pin.
+
 ## JSON selection
 
 Production uses `serde_json`; the optional parser candidate cannot change ordinary

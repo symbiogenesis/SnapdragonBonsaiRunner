@@ -41,17 +41,25 @@ with the headless policy requires native qualification.
 
 ### Markdown parser worker
 
-Assistant Markdown is parsed by one persistent offline MXC/PSEC worker, using a
+Assistant Markdown parsing and inline fenced-`svg` validation/rasterization run in
+one persistent offline MXC/PSEC worker, using a
 separate invocation of the configured headless `bonsai-broker` executable's
 private `--markdown-worker` entry point. It calls the pure Rust `bonsai-markdown`
 library before ordinary broker configuration, model loading, credential access
-or network initialization. The worker image has no native UI/graphics imports:
-reusing the GUI image fails DLL initialization under the required Win32k denial,
-before its private entry point can run. This adds no package executable.
-Anonymous stdin/stdout pipes carry bounded binary requests and render
-descriptions; stderr is a `NUL` sink. Parsing and pipe I/O run outside the UI
-event loop. The trusted parent independently validates UTF-8, spans, style
-flags, sizes and source mappings before constructing native text layout. See the
+or network initialization. Both incoming Markdown/SVG source and the worker
+itself are treated as untrusted: the worker image has no native UI/graphics
+imports (reusing the GUI image fails DLL initialization under required Win32k
+denial before its private entry point can run) and adds no package executable.
+Anonymous stdin/stdout pipes carry bounded binary Markdown (`BSMD0001` ->
+`BMD1`/`BMD2`) and SVG raster (`BSMG0001` -> `BMG1`) frames; stderr is a `NUL`
+sink. Parsing, static-only SVG validation, CPU rasterization and pipe I/O run
+outside the UI event loop. The trusted parent independently validates UTF-8,
+spans, style flags, sizes, monotonic source mappings, `BMD2` intrinsic bounds
+(`1e-3..=1e7`) and `BMG1` bitmap dimensions (`1..=2,560`, at most `4,194,304`
+pixels / `16 MiB`) plus premultiplied-RGBA8 channel invariants (`r, g, b <= a`)
+before constructing native text layout or uploading GPU textures. Any malformed
+frame permanently closes the worker session (`Service::reject`). See the
+[dependency audit](dependency-audit.md#offline-svg-parsing-and-rasterization) and
 [streaming contract](streaming-resources.md#native-chat-and-transcript) for limits.
 
 The launcher prepares and hands off the headless broker image before opening the
@@ -67,7 +75,9 @@ AppContainer and accepts no ordinary broker options.
 
 The broker's ignored production-image regression
 `markdown_production_image_formats_under_native_containment` checks a real sandbox
-handshake and repeated Unicode formatting, independently of UI fixtures that
+handshake, repeated Unicode formatting, `BMD2` segmented SVG extraction, offline
+`BMG1` CPU rasterization, and closed rejection of `<script>` and external-URL SVGs,
+independently of UI fixtures that
 bypass process launch. Failed exchanges retain the child exit state before
 cleanup. `markdown_worker_refuses_direct_invocation_without_stdout` separately
 checks ordinary invocation refusal with no protocol or diagnostic output.
@@ -97,9 +107,12 @@ creation calls remain nonpreemptible.
 
 Unavailable admission, launch failure, malformed output, worker failure or a
 request timeout ends the parser session and leaves complete plain source visible
-in the native chat. There is no in-process parser fallback. Parser results never
-authorize opening generated URLs, fetching images or executing code. Message
-Copy, model history, export and recovery retain the original response bytes.
+in the native chat. There is no in-process parser or SVG-rasterizer fallback in
+production builds. Parser and SVG results never
+authorize opening generated URLs, fetching images or executing code, and both
+`.png` and `.svg` image exports require a validated `BMG1` raster response from
+the offline MXC worker before writing any file to disk. Message
+Copy, model history, conversation export and recovery retain the original response bytes.
 Worker teardown belongs to the native owner's shutdown path; unconfirmed cleanup
 is a failure, not successful containment.
 
@@ -139,7 +152,7 @@ qualification; see [PLAN.md](../PLAN.md#optional-agents).
 
 ## Worker authority
 
-Treat model, tokenizer, adapter, audio and Markdown parsing as compromise entry points,
+Treat model, tokenizer, adapter, audio, Markdown parsing and SVG rendering as compromise entry points,
 even for verified pins. Provisioning/compiler tools are trusted maintenance with
 their existing authority, outside inference policy. Independently managed speech
 companions retain their own permissions.
