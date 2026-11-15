@@ -13,7 +13,9 @@ pub(super) fn decode<'a>(bytes: &[u8], samples: &'a mut Vec<f32>) -> Result<&'a 
         pcm.as_chunks::<2>()
             .0
             .iter()
-            .map(|&sample| f32::from(i16::from_le_bytes(sample)) / 32768.0),
+            // 1.0 / 32_768.0 is exact binary 2^-15, preserving bit-for-bit equality
+            // with division by 32_768.0 across every i16 sample without FP division.
+            .map(|&sample| f32::from(i16::from_le_bytes(sample)) * (1.0 / 32_768.0)),
     );
     Ok(samples)
 }
@@ -82,6 +84,9 @@ mod tests {
             let decoded = decode(&wave, &mut samples)?;
             assert_eq!(decoded.as_ptr(), storage);
             assert_eq!(decoded, &[-1.0, -1.0 / 32768.0, 0.0, 32767.0 / 32768.0]);
+            for (actual, sample) in decoded.iter().zip([i16::MIN, -1, 0, i16::MAX]) {
+                assert_eq!(actual.to_bits(), (f32::from(sample) / 32768.0).to_bits());
+            }
         }
         wave[40..44].copy_from_slice(&7_u32.to_le_bytes());
         assert_eq!(
