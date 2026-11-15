@@ -22,18 +22,20 @@ impl Builder<'_> {
                 Block::Heading(node) => {
                     let mut heading = format.clone();
                     heading.font_id.size = match node.depth {
-                        1 => 22.0,
-                        2 => 20.0,
-                        _ => 18.0,
+                        1 => 28.0,
+                        2 => 24.0,
+                        3 => 21.0,
+                        4 => 19.0,
+                        5 => 17.0,
+                        _ => 16.0,
                     } * (self.normal.font_id.size / 16.0);
                     heading.color = self.visuals.strong_text_color();
                     self.inlines(&node.children, &heading);
                 }
                 Block::BlockQuote(node) => {
-                    let mut quote = format.clone();
-                    quote.italics = true;
-                    self.generated("│ ", &quote);
-                    self.blocks(&node.children, &quote, depth, false);
+                    self.quote_depth += 1;
+                    self.blocks(&node.children, format, depth, false);
+                    self.quote_depth -= 1;
                 }
                 Block::List(node) => {
                     let mut number = node
@@ -45,7 +47,7 @@ impl Builder<'_> {
                         if index != 0 {
                             self.newlines(if node.tight { 1 } else { 2 });
                         }
-                        self.generated(&"  ".repeat(depth), format);
+                        self.generated(&"    ".repeat(depth), format);
                         if node.ordered {
                             self.generated(&format!("{number}. "), format);
                             number = number.saturating_add(1);
@@ -59,7 +61,10 @@ impl Builder<'_> {
                     }
                 }
                 Block::CodeBlock(node) => {
-                    let code = self.code_format(format);
+                    let mut code = Self::code_format(format);
+                    // A finite wire flag lets the trusted UI distinguish a
+                    // code surface from an inline monospace span.
+                    code.font_id.family = egui::FontFamily::Name("Bonsai Code Block".into());
                     // Map each de-indented code line back to its actual source,
                     // excluding the fence/info string and container prefixes.
                     let mut start = node.meta.span.map_or(0, |span| span.start);
@@ -126,9 +131,9 @@ impl Builder<'_> {
         }
     }
 
-    fn code_format(&self, format: &egui::TextFormat) -> egui::TextFormat {
+    fn code_format(format: &egui::TextFormat) -> egui::TextFormat {
         let mut code = format.clone();
-        code.font_id = egui::FontId::monospace(self.normal.font_id.size);
+        code.font_id = egui::FontId::monospace(format.font_id.size);
         code.background = self.visuals.code_bg_color;
         code.italics = false;
         code
@@ -165,7 +170,7 @@ impl Builder<'_> {
                     self.inlines(&node.children, &deleted);
                 }
                 Inline::Code(node) => {
-                    let code = self.code_format(format);
+                    let code = Self::code_format(format);
                     let span = node.meta.span.and_then(|span| {
                         let source = self.source.get(span.start..span.end)?;
                         let width = source.bytes().take_while(|byte| *byte == b'`').count();

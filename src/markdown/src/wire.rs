@@ -10,6 +10,7 @@ const CODE: u8 = 1;
 const ITALIC: u8 = 2;
 const STRONG: u8 = 4;
 const STRIKE: u8 = 8;
+const CODE_BLOCK: u8 = 16;
 
 fn push_count(bytes: &mut Vec<u8>, value: usize) -> Option<()> {
     bytes.extend_from_slice(&u32::try_from(value).ok()?.to_le_bytes());
@@ -22,7 +23,7 @@ fn push_range(bytes: &mut Vec<u8>, range: &Range<usize>) -> Option<()> {
 }
 
 fn font_size(size: f32) -> Option<u8> {
-    [16_u8, 18, 20, 22]
+    [16_u8, 17, 19, 21, 24, 28]
         .into_iter()
         .find(|candidate| f32::from(*candidate).to_bits() == size.to_bits())
 }
@@ -31,6 +32,8 @@ fn flags(format: &egui::TextFormat, visuals: &egui::Visuals) -> u8 {
     let mut flags = 0;
     if format.font_id.family == egui::FontFamily::Monospace {
         flags |= CODE;
+    } else if format.font_id.family == egui::FontFamily::Name("Bonsai Code Block".into()) {
+        flags |= CODE | CODE_BLOCK;
     }
     if format.italics {
         flags |= ITALIC;

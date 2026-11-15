@@ -1,4 +1,4 @@
-use super::{MAX_MARKDOWN_BYTES, parse, serve};
+use super::{MAX_MARKDOWN_BYTES, parse, parse_layout, serve};
 use std::io::{self, Cursor, Read as _};
 
 fn frame(ticket: u64, bytes: &[u8]) -> io::Result<Vec<u8>> {
@@ -88,4 +88,79 @@ fn worker_rejects_invalid_frames_before_emitting_any_rendered_response() -> io::
     }
     assert!(parse(&"x".repeat(MAX_MARKDOWN_BYTES + 1)).is_empty());
     Ok(())
+}
+
+#[test]
+fn markdown_typography_preserves_six_heading_levels_and_inline_code_size() {
+    let source = "# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six\n\n# `heading_code`\n\nBody `body_code`";
+    let layout = parse_layout(source);
+    for (needle, size) in [
+        ("One", 28.0_f32),
+        ("Two", 24.0),
+        ("Three", 21.0),
+        ("Four", 19.0),
+        ("Five", 17.0),
+        ("Six", 16.0),
+        ("heading_code", 28.0),
+        ("body_code", 16.0),
+    ] {
+        let offset = egui::text::ByteIndex(layout.job.text.find(needle).expect("heading text"));
+        let format = layout.job.format_at_byte(offset);
+        assert_eq!(format.font_id.size.to_bits(), size.to_bits(), "{needle}");
+    }
+    // All admitted heading sizes must survive the worker's closed wire format.
+    assert!(!parse(source).is_empty());
+}
+
+#[test]
+fn markdown_typography_prefixes_quote_lines_and_indents_nested_lists() {
+    let source =
+        "> First\n> second\n>\n> Third\n>\n>> Nested\n\n- Parent\n  - Child\n    - Grandchild";
+    let layout = parse_layout(source);
+    assert_eq!(
+        layout.job.text,
+        "│ First\n│ second\n\n│ Third\n\n│ │ Nested\n\n• Parent\n    • Child\n        • Grandchild"
+    );
+    for mapping in &layout.mappings {
+        assert!(mapping.verbatim);
+        assert_eq!(
+            source.get(mapping.source.clone()),
+            layout.job.text.get(mapping.display.clone())
+        );
+    }
+    for pair in layout.mappings.windows(2) {
+        assert!(pair[0].source.end <= pair[1].source.start);
+        assert!(pair[0].display.end <= pair[1].display.start);
+    }
+    let first = egui::text::ByteIndex(layout.job.text.find("First").expect("quote text"));
+    assert!(!layout.job.format_at_byte(first).italics);
+    assert!(!parse(source).is_empty());
+}
+
+#[test]
+fn markdown_typography_marks_code_blocks_separately_from_inline_code() {
+    let source = "```rust\nlet first = 1;\nlet second = 2;\n```\n\nUse `inline`.";
+    let layout = parse_layout(source);
+    let packet = parse(source);
+    let count_offset = 8 + layout.job.text.len();
+    let count = usize::try_from(u32::from_le_bytes(
+        packet[count_offset..count_offset + 4]
+            .try_into()
+            .expect("section count"),
+    ))
+    .expect("native section count");
+    let sections = &packet[count_offset + 4..count_offset + 4 + count * 10];
+    let flags: Vec<_> = sections
+        .chunks_exact(10)
+        .map(|section| section[8])
+        .collect();
+    assert!(flags.contains(&17), "block code must carry CODE|CODE_BLOCK");
+    assert!(flags.contains(&1), "inline code must carry only CODE");
+    assert!(flags.iter().all(|flags| flags & 16 == 0 || flags & 1 != 0));
+    for mapping in &layout.mappings {
+        assert_eq!(
+            source.get(mapping.source.clone()),
+            layout.job.text.get(mapping.display.clone())
+        );
+    }
 }

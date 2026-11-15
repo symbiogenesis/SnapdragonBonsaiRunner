@@ -33,12 +33,29 @@ struct Builder<'a> {
     mappings: Vec<Mapping>,
     visuals: &'a egui::Visuals,
     normal: egui::TextFormat,
+    quote_depth: usize,
     spans: usize,
     limited: bool,
 }
 
 impl Builder<'_> {
     fn append(&mut self, text: &str, source: Option<Range<usize>>, format: &egui::TextFormat) {
+        if text.is_empty() || self.limited {
+            return;
+        }
+        if self.quote_depth != 0
+            && !text.starts_with('\n')
+            && (self.job.text.is_empty() || self.job.text.ends_with('\n'))
+        {
+            // Container markers are presentation text, never part of a source
+            // match. Prefix each authored line rather than only the first one.
+            let prefix = "│ ".repeat(self.quote_depth);
+            self.append_raw(&prefix, None, &self.normal.clone());
+        }
+        self.append_raw(text, source, format);
+    }
+
+    fn append_raw(&mut self, text: &str, source: Option<Range<usize>>, format: &egui::TextFormat) {
         if text.is_empty() || self.limited {
             return;
         }
@@ -129,6 +146,7 @@ fn parse_layout(body: &str) -> Layout {
         mappings: Vec::new(),
         visuals: &visuals,
         normal: normal.clone(),
+        quote_depth: 0,
         spans: 0,
         limited: false,
     };
