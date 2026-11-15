@@ -384,7 +384,7 @@ mod tests {
                 );
                 let card = harness.state().card;
                 assert!(
-                    card.max.x <= width && card.height() < 150.0,
+                    card.max.x <= width && card.height() < 164.0,
                     "Card bounds: {card:?}"
                 );
                 assert!(

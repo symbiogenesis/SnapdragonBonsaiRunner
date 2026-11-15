@@ -71,13 +71,13 @@ fn load() -> egui::FontDefinitions {
     fonts
 }
 
-/// Call before creating the native window; no font files are read by configure.
+/// Call before creating the native window so production configure never hits disk.
 pub(super) fn prepare() {
-    FONTS.get_or_init(load);
+    let _ = FONTS.get_or_init(load);
 }
 
 pub(super) fn configure(ctx: &egui::Context) {
-    ctx.set_fonts(FONTS.get().cloned().unwrap_or_else(fallback));
+    ctx.set_fonts(FONTS.get_or_init(load).clone());
 }
 
 #[cfg(test)]

@@ -2194,7 +2194,9 @@ impl State {
         self.conversation_notices(ui);
         self.alert_panel(ui);
         let can_install = self.can_install_update();
-        if let Some(updates) = &mut self.updates {
+        if !self.show_settings
+            && let Some(updates) = &mut self.updates
+        {
             updates.nudge(ui, can_install);
         }
     }
@@ -2215,7 +2217,12 @@ impl State {
                 horizontal_inset(ui, horizontal_margin, "workspace-notices", |ui| {
                     self.application_notices(ui);
                 });
-                egui::Panel::bottom("composer-panel")
+                let previous_composer_height = egui::containers::panel::PanelState::load(
+                    ui.ctx(),
+                    ui.make_persistent_id("composer-panel"),
+                )
+                .map(|state| state.size().y);
+                let composer = egui::Panel::bottom("composer-panel")
                     .frame(egui::Frame::new().inner_margin(egui::Margin {
                         left: horizontal_margin,
                         right: horizontal_margin,
@@ -2223,6 +2230,12 @@ impl State {
                         bottom: 4,
                     }))
                     .show(ui, |ui| self.composer(ui));
+                // Settle the measured bottom anchor when status or guidance changes height.
+                if previous_composer_height
+                    .is_none_or(|height| (height - composer.response.rect.height()).abs() > 0.5)
+                {
+                    ui.ctx().request_repaint();
+                }
                 let empty = self.transcript.messages.is_empty();
                 // Even an empty Find scope advances egui's layout cursor.
                 let closed_find = find_open

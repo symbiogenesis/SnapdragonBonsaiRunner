@@ -507,12 +507,17 @@ impl Transcript {
     }
 
     pub(super) fn latest_button(&mut self, ui: &mut egui::Ui, viewport: egui::Rect) {
+        let size = Vec2::splat(36.0);
         let rect = egui::Rect::from_center_size(
             egui::pos2(viewport.center().x, viewport.bottom() - 30.0),
-            Vec2::splat(36.0),
+            size,
         );
         let response = ui
-            .place(rect, egui::Button::new("").corner_radius(18))
+            .scope(|ui| {
+                ui.spacing_mut().button_padding = Vec2::ZERO;
+                ui.place(rect, egui::Button::new(()).min_size(size).corner_radius(18))
+            })
+            .inner
             .accessible_name("Latest")
             .on_hover_text("Jump to the latest message");
         let center = response.rect.center();
