@@ -11,11 +11,15 @@ use crate::{Profile, REQUIRED_AVAILABLE_BYTES, hex, policy, require};
 /// consistent with the Windows broker's existing environment policy.
 #[must_use]
 pub fn forbidden_environment_name(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
     ["LLAMA_", "LLAMACPP_", "GGML_", "AIP_", "MTMD_"]
         .iter()
-        .any(|prefix| name.starts_with(prefix))
-        || ["HF_TOKEN", "HF_ENDPOINT", "MODEL_ENDPOINT"].contains(&name.as_str())
+        .any(|prefix| {
+            name.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+        || ["HF_TOKEN", "HF_ENDPOINT", "MODEL_ENDPOINT"]
+            .iter()
+            .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
 }
 
 /// Reject inherited runtime/model override names without accepting their values.

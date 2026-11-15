@@ -34,27 +34,35 @@ impl SnapdragonFamily {
         if name.is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
             return None;
         }
-        let lowercase = name.to_ascii_lowercase();
-        let mut words = lowercase
+        let mut words = name
             .split(|character: char| !character.is_ascii_alphanumeric())
-            .filter(|word| !word.is_empty() && !matches!(*word, "r" | "tm"));
+            .filter(|word| {
+                !word.is_empty()
+                    && !word.eq_ignore_ascii_case("r")
+                    && !word.eq_ignore_ascii_case("tm")
+            });
         let mut word = words.next()?;
-        if word == "qualcomm" {
+        if word.eq_ignore_ascii_case("qualcomm") {
             word = words.next()?;
         }
-        if word != "snapdragon" {
+        if !word.eq_ignore_ascii_case("snapdragon") {
             return None;
         }
-        word = words.next()?;
-        let generation = word;
-        if words.next()? != "elite" {
+        let generation = words.next()?;
+        if !words.next()?.eq_ignore_ascii_case("elite") {
             return None;
         }
-        let extreme = words.next() == Some("extreme");
-        match (generation, extreme) {
-            ("x" | "x1", false) => Some(Self::XElite),
-            ("x2", true) => Some(Self::X2EliteExtreme),
-            _ => None,
+        let extreme = words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("extreme"));
+        if (generation.eq_ignore_ascii_case("x") || generation.eq_ignore_ascii_case("x1"))
+            && !extreme
+        {
+            Some(Self::XElite)
+        } else if generation.eq_ignore_ascii_case("x2") && extreme {
+            Some(Self::X2EliteExtreme)
+        } else {
+            None
         }
     }
 
