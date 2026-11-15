@@ -487,6 +487,7 @@ version = "0.3.2"
 dependencies = [
  "bonsai-windows-credentials",
  "bonsai-windows-process",
+ "hex",
  "serde",
  "sha2",
  "zip",
@@ -545,6 +546,7 @@ version = "0.3.2"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-windows-process",
+ "hex",
  "serde",
  "serde_json",
  "sha2",
@@ -579,6 +581,7 @@ dependencies = [
  "bonsai-windows-process",
  "fearless_simd 1.2.0",
  "half",
+ "hex",
  "serde",
  "serde_json",
  "sha2",
@@ -630,6 +633,7 @@ dependencies = [
  "bonsai-windows-process",
  "flate2",
  "half",
+ "hex",
  "httparse",
  "nix 0.29.0",
  "serde",
@@ -646,6 +650,7 @@ dependencies = [
 name = "bonsai-windows-credentials"
 version = "0.1.4"
 dependencies = [
+ "hex",
  "windows-sys 0.61.2",
 ]
 
@@ -654,6 +659,7 @@ name = "bonsai-windows-process"
 version = "0.1.2"
 dependencies = [
  "flatbuffers",
+ "hex",
  "mxc-sdk",
  "windows-sys 0.61.2",
 ]

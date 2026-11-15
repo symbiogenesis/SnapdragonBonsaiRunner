@@ -308,13 +308,7 @@ fn compare(request: &Request, report: &mut Value) -> io::Result<()> {
         return Err(io::ErrorKind::Interrupted.into());
     }
     report["transcriptBytes"] = transcript.len().into();
-    let mut digest = String::with_capacity(64);
-    for byte in Sha256::digest(transcript.as_bytes()) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        digest.push(char::from(HEX[usize::from(byte >> 4)]));
-        digest.push(char::from(HEX[usize::from(byte & 15)]));
-    }
-    report["transcriptSha256"] = digest.into();
+    report["transcriptSha256"] = hex::encode(Sha256::digest(transcript.as_bytes())).into();
     report["completeReplayPassed"] = true.into();
     report["phase"] = "completed".into();
     Ok(())

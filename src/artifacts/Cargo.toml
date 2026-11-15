@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Offline bounded artifact verification with retained Windows file guards"
 
 [dependencies]
+hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 zip.workspace = true
 

@@ -129,13 +129,7 @@ pub(super) fn digest_until(
 }
 
 pub(super) fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(DIGITS[usize::from(byte & 15)]));
-    }
-    text
+    hex::encode(bytes)
 }
 
 pub(super) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {

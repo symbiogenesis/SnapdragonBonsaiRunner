@@ -42,11 +42,7 @@ fn runtime_stage_cli_rejects_bad_requests_and_returns_offline_receipt() -> TestR
     zip.write_all(&image)?;
     let bytes = zip.finish()?.into_inner();
     fs::write(&archive, &bytes)?;
-    let hash: String = Sha256::digest(&bytes)
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect();
+    let hash = hex::encode(Sha256::digest(&bytes));
     let request = json!({
         "schemaVersion": 1,
         "runtime": {"archivePath": archive, "runtimeDirectory": destination,

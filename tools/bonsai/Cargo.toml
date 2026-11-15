@@ -55,6 +55,7 @@ bonsai-audio.workspace = true
 bonsai-cpu-policy.workspace = true
 flate2.workspace = true
 half.workspace = true
+hex.workspace = true
 httparse.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

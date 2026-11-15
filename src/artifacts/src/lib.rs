@@ -398,11 +398,7 @@ fn check_locked(
 }
 
 fn digest_hex(digest: [u8; 32]) -> String {
-    digest
-        .into_iter()
-        .flat_map(|byte| [byte >> 4, byte & 0x0f])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect()
+    hex::encode(digest)
 }
 /// Hash exactly `expected` bytes from the reader's current position through EOF.
 ///

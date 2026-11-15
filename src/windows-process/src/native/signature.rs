@@ -147,11 +147,7 @@ fn signer(data: &WINTRUST_DATA) -> io::Result<crate::AuthenticodeSigner> {
     if size != 20 {
         return Err(super::invalid("Signer thumbprint length changed."));
     }
-    let thumbprint = digest
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|part| char::from(b"0123456789abcdef"[usize::from(part)]))
-        .collect();
+    let thumbprint = hex::encode(digest);
     Ok(crate::AuthenticodeSigner {
         common_name,
         thumbprint,

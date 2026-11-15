@@ -9,8 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
 #[test]
 fn ffn_plan_dispatches_without_model_or_request_files() -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
@@ -154,15 +152,7 @@ fn large_legacy_in_memory_evidence_remains_accepted()
     let mut evidence = golden["scenarios"][0]["evidence"].clone();
     let mut review = golden["scenarios"][0]["review"].clone();
     let text = "x".repeat(750_000);
-    let digest: String = Sha256::digest(text.as_bytes())
-        .iter()
-        .flat_map(|byte| {
-            [
-                char::from(HEX[usize::from(byte >> 4)]),
-                char::from(HEX[usize::from(byte & 15)]),
-            ]
-        })
-        .collect();
+    let digest = hex::encode(Sha256::digest(text.as_bytes()));
     for sample in evidence["samples"]
         .as_array_mut()
         .ok_or("Missing samples")?

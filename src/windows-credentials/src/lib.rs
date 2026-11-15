@@ -402,24 +402,11 @@ fn create_key(path: &Path, security: &native::Security) -> io::Result<(Secret<64
 }
 
 fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    bytes
-        .iter()
-        .flat_map(|byte| {
-            [
-                char::from(DIGITS[usize::from(byte >> 4)]),
-                char::from(DIGITS[usize::from(byte & 15)]),
-            ]
-        })
-        .collect()
+    hex::encode(bytes)
 }
 
 fn encode_hex(bytes: &[u8; 32], encoded: &mut [u8; 64]) {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    for (byte, output) in bytes.iter().zip(encoded.as_chunks_mut::<2>().0) {
-        output[0] = DIGITS[usize::from(byte >> 4)];
-        output[1] = DIGITS[usize::from(byte & 15)];
-    }
+    let _ = hex::encode_to_slice(bytes, encoded);
 }
 
 // Populate only after allocating: moving an owner then moves a pointer rather

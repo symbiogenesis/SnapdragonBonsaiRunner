@@ -15,11 +15,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const REVISION: &str = "1234567890123456789012345678901234567890";
 
 fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|nibble| char::from(b"0123456789abcdef"[usize::from(nibble)]))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn zip(entries: &[(&str, &[u8])]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
