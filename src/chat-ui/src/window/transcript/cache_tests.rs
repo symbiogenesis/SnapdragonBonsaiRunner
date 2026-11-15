@@ -56,6 +56,10 @@ fn markdown_code_surfaces_reflow_with_unicode_and_preserve_find() -> std::io::Re
         transcript.push(Role::Assistant, source.to_owned());
         let mut chat = Harness::builder()
             .with_size(size)
+            .with_theme(match theme {
+                appearance::Theme::Light => egui::Theme::Light,
+                appearance::Theme::System | appearance::Theme::Dark => egui::Theme::Dark,
+            })
             .with_context_setup(move |context| {
                 crate::window::configure_test_context(context);
                 appearance::Preferences {
@@ -82,6 +86,10 @@ fn markdown_code_surfaces_reflow_with_unicode_and_preserve_find() -> std::io::Re
                 transcript,
             );
         chat.run();
+        assert_eq!(
+            chat.ctx.style_of(chat.ctx.theme()).visuals.dark_mode,
+            theme == appearance::Theme::Dark
+        );
         let before = chat.state().messages[0]
             .cache
             .as_ref()
