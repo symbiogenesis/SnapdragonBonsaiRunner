@@ -1435,10 +1435,6 @@ impl State {
                 }
                 self.output_status(generation, false, message);
             }
-            speech::Event::OutputStatus {
-                generation,
-                message,
-            } => self.output_status(generation, true, message),
             speech::Event::OutputBuffering {
                 generation,
                 buffering,

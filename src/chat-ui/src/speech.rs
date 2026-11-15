@@ -116,10 +116,6 @@ pub(crate) enum Event {
         generation: u64,
         buffering: bool,
     },
-    OutputStatus {
-        generation: u64,
-        message: &'static str,
-    },
 }
 
 struct Envelope {
@@ -428,10 +424,6 @@ fn render(
     if !output.prepared {
         let client = client.ok_or("Read aloud is unavailable. Open Settings > Voice to review speech setup and try again.")?;
         let config = config.ok_or("Qwen3-TTS VoiceDesign has no local configuration.")?;
-        let _sent = events.send(Event::OutputStatus {
-            generation: output.generation,
-            message: "Loading Qwen3-TTS VoiceDesign. Stop speech cancels loading.",
-        });
         let diagnostics = events.clone();
         output.service = match client.start_service(
             config,
@@ -446,10 +438,6 @@ fn render(
             Err(tts::Failure::Message(message)) => return Err(message),
         };
         output.prepared = true;
-        let _sent = events.send(Event::OutputStatus {
-            generation: output.generation,
-            message: "Generating speech with Qwen3-TTS VoiceDesign. Stop speech cancels synthesis.",
-        });
     }
     if output.pipeline.is_none() && output.segments.is_empty() {
         return Ok(!finished);

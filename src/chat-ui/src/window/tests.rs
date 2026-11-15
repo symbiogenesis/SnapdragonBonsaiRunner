@@ -1524,9 +1524,9 @@ fn speech_progress_and_cancellation_do_not_raise_error_alerts() -> io::Result<()
     state.toggle_read_aloud(answer);
     assert!(state.speaking && state.speech_loading);
     assert_eq!(state.active_alerts(), []);
-    state.speech_event(speech::Event::OutputStatus {
+    state.speech_event(speech::Event::Speaking {
         generation: 2,
-        message: "Generating speech.",
+        speaking: true,
     });
     assert_eq!(state.active_alerts(), []);
     state.speech_event(speech::Event::OutputBuffering {

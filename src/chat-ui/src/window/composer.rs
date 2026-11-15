@@ -227,7 +227,7 @@ impl State {
     fn composer_feedback(&self, ui: &mut egui::Ui) {
         // Text-only status should grow with its contents, without
         // reserving the horizontal helper's button-height row.
-        if (self.dictation_requested || self.speaking)
+        if self.dictation_requested
             && (self.audio_file_notice.is_none() || !self.audio_file_active)
             && !self.speech_notice
             && self.help.is_none()

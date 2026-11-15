@@ -1615,6 +1615,10 @@ fn response_speaker_loading_is_cancellable_and_only_failures_open_alerts() -> io
         .click();
     chat.run_steps(8);
     assert!(chat.state().app.speech_loading);
+    assert!(
+        chat.query_by_label("Reading the selected response aloud.")
+            .is_none()
+    );
     assert_eq!(chat.state().app.active_alerts(), []);
     assert!(
         chat.query_by_role_and_label(egui::Role::Button, "Copy error")
