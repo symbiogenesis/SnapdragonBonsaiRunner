@@ -93,6 +93,9 @@ adoption decisions without displacing native daily-use acceptance.
   Include portable maintenance consumer selection and budget/verdict fixtures,
   complete pinned public-ABI source intake before downloads, formatter-config
   push selection and behavior-focused Clippy policy.
+- [ ] Reconcile the native-boundary ledger identity for
+  `tools/bonsai/src/hexagon_tools/public_control/windows.rs` with its reviewed
+  source before publication.
 - [ ] Establish remote enforcement of basic sanity before updating `main`.
   Stage a trusted exact-commit candidate check before activating required-check
   rules, preserve reviewed direct-main promotion without routine pull requests,
