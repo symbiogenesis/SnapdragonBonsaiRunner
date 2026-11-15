@@ -35,20 +35,25 @@ fn read_frame(
 ) -> io::Result<(Ticket, Vec<u8>)> {
     let mut header = [0; HEADER_BYTES];
     input.read_exact(&mut header)?;
-    if header[..8] != magic[..] {
+    let (head_magic, rest) = header
+        .split_first_chunk::<8>()
+        .ok_or_else(|| io::Error::other("Invalid Markdown frame identity"))?;
+    if head_magic != magic {
         return Err(io::Error::other("Invalid Markdown frame identity"));
     }
-    let mut identity = [0; 8];
-    identity.copy_from_slice(&header[8..16]);
-    let mut length = [0; 4];
-    length.copy_from_slice(&header[16..]);
+    let (identity, length) = rest
+        .split_first_chunk::<8>()
+        .ok_or_else(|| io::Error::other("Invalid Markdown frame identity"))?;
+    let length: [u8; 4] = length
+        .try_into()
+        .map_err(|_| io::Error::other("Invalid Markdown frame identity"))?;
     let length = usize::try_from(u32::from_le_bytes(length)).map_err(io::Error::other)?;
     if length > limit {
         return Err(io::Error::other("Oversized Markdown frame"));
     }
     let mut bytes = vec![0; length];
     input.read_exact(&mut bytes)?;
-    Ok((Ticket(u64::from_le_bytes(identity)), bytes))
+    Ok((Ticket(u64::from_le_bytes(*identity)), bytes))
 }
 
 pub(super) fn exchange(

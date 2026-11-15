@@ -421,12 +421,28 @@ fn normalize_wav<'a>(wav: &'a [u8], call: &Call<'_>) -> Result<CanonicalWav<'a>>
     let invalid = Failure::Message(
         "Qwen3-ASR requires a 16 kHz mono 16-bit PCM WAV clip of at most 30 seconds.",
     );
-    if wav.len() < 12
-        || wav.len() > MAX_REQUEST
-        || &wav[..4] != b"RIFF"
-        || &wav[8..12] != b"WAVE"
-        || usize::try_from(u32::from_le_bytes([wav[4], wav[5], wav[6], wav[7]])).ok()
-            != Some(wav.len() - 8)
+    let Some((riff, _)) = wav.split_first_chunk::<12>() else {
+        return Err(invalid);
+    };
+    let [
+        b'R',
+        b'I',
+        b'F',
+        b'F',
+        r0,
+        r1,
+        r2,
+        r3,
+        b'W',
+        b'A',
+        b'V',
+        b'E',
+    ] = *riff
+    else {
+        return Err(invalid);
+    };
+    if wav.len() > MAX_REQUEST
+        || usize::try_from(u32::from_le_bytes([r0, r1, r2, r3])).ok() != Some(wav.len() - 8)
     {
         return Err(invalid);
     }
@@ -437,24 +453,22 @@ fn normalize_wav<'a>(wav: &'a [u8], call: &Call<'_>) -> Result<CanonicalWav<'a>>
     while offset < wav.len() {
         call.check()?;
         chunks += 1;
-        let head_end = offset.checked_add(8).ok_or(invalid)?;
-        if chunks > 128 || head_end > wav.len() {
+        let Some((chunk_header, _)) = wav[offset..].split_first_chunk::<8>() else {
+            return Err(invalid);
+        };
+        if chunks > 128 {
             return Err(invalid);
         }
-        let id = &wav[offset..offset + 4];
-        let length = usize::try_from(u32::from_le_bytes([
-            wav[offset + 4],
-            wav[offset + 5],
-            wav[offset + 6],
-            wav[offset + 7],
-        ]))
-        .map_err(|_| invalid)?;
+        let head_end = offset + 8;
+        let [i0, i1, i2, i3, s0, s1, s2, s3] = *chunk_header;
+        let id = [i0, i1, i2, i3];
+        let length = usize::try_from(u32::from_le_bytes([s0, s1, s2, s3])).map_err(|_| invalid)?;
         let end = head_end.checked_add(length).ok_or(invalid)?;
         let padded_end = end.checked_add(length % 2).ok_or(invalid)?;
         if padded_end > wav.len() {
             return Err(invalid);
         }
-        match id {
+        match &id {
             b"fmt " => {
                 if format || !pcm_format(&wav[head_end..end]) {
                     return Err(invalid);
@@ -483,24 +497,33 @@ fn pcm_format(format: &[u8]) -> bool {
     if format.len() < 16 {
         return false;
     }
-    let u16_at = |at| u16::from_le_bytes([format[at], format[at + 1]]);
-    let u32_at =
-        |at| u32::from_le_bytes([format[at], format[at + 1], format[at + 2], format[at + 3]]);
-    if u16_at(2) != 1
-        || u32_at(4) != SAMPLE_RATE
-        || u32_at(8) != SAMPLE_RATE * 2
-        || u16_at(12) != 2
-        || u16_at(14) != 16
+    let u16_at = |at: usize| {
+        format
+            .get(at..at + 2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_le_bytes)
+    };
+    let u32_at = |at: usize| {
+        format
+            .get(at..at + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    if u16_at(2) != Some(1)
+        || u32_at(4) != Some(SAMPLE_RATE)
+        || u32_at(8) != Some(SAMPLE_RATE * 2)
+        || u16_at(12) != Some(2)
+        || u16_at(14) != Some(16)
     {
         return false;
     }
     match u16_at(0) {
-        1 => format.len() == 16 || (format.len() == 18 && u16_at(16) == 0),
-        0xfffe => {
+        Some(1) => format.len() == 16 || (format.len() == 18 && u16_at(16) == Some(0)),
+        Some(0xfffe) => {
             format.len() == 40
-                && u16_at(16) == 22
-                && u16_at(18) == 16
-                && u32_at(20).count_ones() <= 1
+                && u16_at(16) == Some(22)
+                && u16_at(18) == Some(16)
+                && u32_at(20).is_some_and(|mask| mask.count_ones() <= 1)
                 && format[24..] == [1, 0, 0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]
         }
         _ => false,
