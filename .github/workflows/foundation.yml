@@ -352,6 +352,13 @@ jobs:
           persist-credentials: false
       - name: Use the source-bound maintenance CLI
         uses: $/.github/actions/use-bonsai-tools
+      - name: Release script syntax, adapter, notice, asset and publication controls
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/release/Test-ReleasePrimitives.ps1')
       - name: Swift assessment policy and pinned ARM64 runtime
         shell: pwsh
         run: |

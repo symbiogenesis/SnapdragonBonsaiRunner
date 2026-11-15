@@ -136,7 +136,11 @@
         "config/swift-assessment.lock.json",
         "config/swift-lora.lock.json",
         "config/swift.ptq1-export.json",
-        "config/profiles/**"
+        "config/profiles/**",
+        "scripts/release/**",
+        ".github/release/**",
+        "scripts/Build-WindowsExecutable.ps1",
+        ".github/workflows/release.yml"
       ]
     },
     "integration": {

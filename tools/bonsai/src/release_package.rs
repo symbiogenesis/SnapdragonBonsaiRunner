@@ -236,7 +236,7 @@ fn package(
     resolve(input, true, false)?;
     let (executables, builds) = checked_builds(input, revision)?;
     let notices = resolve(
-        &input.join("release-build-tts/THIRD-PARTY-NOTICES.txt"),
+        &input.join("release-build-maintenance/THIRD-PARTY-NOTICES.txt"),
         false,
         false,
     )?;

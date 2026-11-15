@@ -65,9 +65,11 @@ fan-out, then verifies those prerequisites again before publication. Foundation
 owns formatting, Clippy, documentation and tests. Release's five build-only lanes
 link with the production profile, which differs from Foundation's incremental
 profile; packaging and publication reuse the same-run maintenance tools.
-The TTS lane skips ASR provisioning and still supplies its executable and complete
-third-party notices. Release primitives, package validation and smoke checks
-retain their independent obligations.
+The TTS lane skips ASR provisioning while still supplying the TTS executable;
+`build (maintenance)` collects third-party notices reusing its freshly built
+`bonsai-tools.exe`. `Foundation`'s `release-integration` verifies
+`Test-ReleasePrimitives.ps1` against the same-run CLI bundle, and `Release`
+retains package validation and smoke checks as independent obligations.
 
 Hexagon runs its layout and ranking controls alongside one policy-tool producer.
 Both native builders consume that run's revision/digest-verified CLI. Policy tests,
