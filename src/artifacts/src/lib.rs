@@ -145,10 +145,17 @@ impl VerifiedRuntime {
             return Err(ArtifactError::Configuration);
         }
         let mut handles = Vec::new();
-        hold_ancestors(&spec.archive_path, &mut handles, &mut checkpoint)?;
+        let mut held_ancestors = BTreeSet::new();
+        hold_ancestors(
+            &spec.archive_path,
+            &mut handles,
+            &mut held_ancestors,
+            &mut checkpoint,
+        )?;
         hold_ancestors(
             &spec.runtime_directory.join("llama-server.exe"),
             &mut handles,
+            &mut held_ancestors,
             &mut checkpoint,
         )?;
         let mut archive = open_locked_file(&spec.archive_path)?;
@@ -166,6 +173,7 @@ impl VerifiedRuntime {
             &mut zip,
             &spec.runtime_directory,
             &mut handles,
+            &mut held_ancestors,
             &mut buffer,
             &mut checkpoint,
         )?;
@@ -241,7 +249,8 @@ impl VerifiedFile {
             return Err(ArtifactError::Configuration);
         }
         let mut handles = Vec::new();
-        hold_ancestors(path, &mut handles, &mut checkpoint)?;
+        let mut held_ancestors = BTreeSet::new();
+        hold_ancestors(path, &mut handles, &mut held_ancestors, &mut checkpoint)?;
         let mut file = open_locked_file_with_access(path, true)?;
         let mut buffer = verification_buffer(bytes);
         check_locked(&mut file, bytes, hash, &mut buffer, &mut checkpoint)?;
@@ -307,6 +316,7 @@ fn open_locked_file_with_access(path: &Path, sequential: bool) -> Result<File, A
 fn hold_ancestors(
     path: &Path,
     handles: &mut Vec<File>,
+    held_ancestors: &mut BTreeSet<PathBuf>,
     checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
 ) -> Result<(), ArtifactError> {
     checkpoint()?;
@@ -328,6 +338,9 @@ fn hold_ancestors(
             if contained && ancestor.parent().is_none() {
                 continue;
             }
+            if held_ancestors.contains(ancestor) {
+                continue;
+            }
             let directory = OpenOptions::new()
                 .read(true)
                 .access_mode(if contained { 0x80 } else { 0x81 })
@@ -344,12 +357,13 @@ fn hold_ancestors(
             if !metadata.is_dir() || is_redirect(&metadata) {
                 return Err(ArtifactError::Path);
             }
+            held_ancestors.insert(ancestor.to_path_buf());
             handles.push(directory);
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = handles;
+        let _ = (handles, held_ancestors);
     }
     Ok(())
 }
@@ -547,11 +561,20 @@ fn verify_installation<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     root: &Path,
     handles: &mut Vec<File>,
+    held_ancestors: &mut BTreeSet<PathBuf>,
     buffer: &mut [u8],
     checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
 ) -> Result<(PathBuf, Vec<VerifiedRuntimeFile>), ArtifactError> {
     let installation = inspect_archive(archive, root, checkpoint)?;
-    verify_installed_files(archive, root, installation, handles, buffer, checkpoint)
+    verify_installed_files(
+        archive,
+        root,
+        installation,
+        handles,
+        held_ancestors,
+        buffer,
+        checkpoint,
+    )
 }
 
 fn verify_installed_files<R: Read + Seek>(
@@ -559,6 +582,7 @@ fn verify_installed_files<R: Read + Seek>(
     root: &Path,
     installation: Installation,
     handles: &mut Vec<File>,
+    held_ancestors: &mut BTreeSet<PathBuf>,
     buffer: &mut [u8],
     checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
 ) -> Result<(PathBuf, Vec<VerifiedRuntimeFile>), ArtifactError> {
@@ -587,7 +611,7 @@ fn verify_installed_files<R: Read + Seek>(
     for entry in expected_files.values() {
         checkpoint()?;
         let path = root.join(&entry.name);
-        hold_ancestors(&path, handles, checkpoint)?;
+        hold_ancestors(&path, handles, held_ancestors, checkpoint)?;
         let mut installed = open_locked_file_with_access(&path, true)?;
         let mut source = archive
             .by_index(entry.index)
@@ -710,8 +734,11 @@ fn check_arm64(file: &mut (impl Read + Seek)) -> Result<(), ArtifactError> {
     let mut dos = [0; 64];
     file.read_exact(&mut dos)
         .map_err(|_| ArtifactError::Architecture)?;
-    let offset = u64::from(u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]));
-    if dos[..2] != *b"MZ" || length < 24 || offset > length - 24 {
+    let [b'M', b'Z', .., o0, o1, o2, o3] = dos else {
+        return Err(ArtifactError::Architecture);
+    };
+    let offset = u64::from(u32::from_le_bytes([o0, o1, o2, o3]));
+    if length < 24 || offset > length - 24 {
         return Err(ArtifactError::Architecture);
     }
     file.seek(SeekFrom::Start(offset))
@@ -1084,6 +1111,7 @@ mod tests {
                 &mut archive,
                 &root,
                 &mut handles,
+                &mut BTreeSet::new(),
                 &mut buffer,
                 &mut checkpoint,
             )?
@@ -1099,6 +1127,7 @@ mod tests {
                 &mut archive,
                 &root,
                 &mut handles,
+                &mut BTreeSet::new(),
                 &mut buffer,
                 &mut checkpoint,
             ),

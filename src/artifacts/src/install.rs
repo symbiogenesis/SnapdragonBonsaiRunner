@@ -106,7 +106,13 @@ fn stage_runtime_inner(
     absent(&spec.runtime_directory)?;
 
     let mut archive_handles = Vec::new();
-    hold_ancestors(&spec.archive_path, &mut archive_handles, &mut || Ok(()))?;
+    let mut archive_held = BTreeSet::new();
+    hold_ancestors(
+        &spec.archive_path,
+        &mut archive_handles,
+        &mut archive_held,
+        &mut || Ok(()),
+    )?;
     let mut archive = open_locked_file(&spec.archive_path)?;
     let mut buffer = vec![0; HASH_BUFFER_BYTES];
     check_locked(
@@ -124,6 +130,7 @@ fn stage_runtime_inner(
     hold_ancestors(
         &spec.runtime_directory,
         &mut archive_handles,
+        &mut archive_held,
         &mut || Ok(()),
     )?;
     fs::create_dir(staging).map_err(|_| ArtifactError::Path)?;
@@ -136,12 +143,14 @@ fn stage_runtime_inner(
     let result = (|| {
         extract(&mut zip, staging, &installation, &mut buffer)?;
         let mut staging_handles = Vec::new();
+        let mut staging_held = BTreeSet::new();
         // The same locked ZIP is unchanged since preflight; reuse its inventory.
         let (_, files) = verify_installed_files(
             &mut zip,
             staging,
             installation,
             &mut staging_handles,
+            &mut staging_held,
             &mut buffer,
             &mut || Ok(()),
         )?;
