@@ -523,7 +523,7 @@ mod tests {
     }
 
     fn decode_wave(samples: usize, request_samples: usize) -> io::Result<()> {
-        let _apartment = Apartment::initialize(false).map_err(io::Error::other)?;
+        let _apartment = Apartment::mta().map_err(io::Error::other)?;
         let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "bonsai-sequential-audio-{}-{id}.wav",
