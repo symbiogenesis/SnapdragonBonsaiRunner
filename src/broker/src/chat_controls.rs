@@ -48,11 +48,12 @@ const SPELLINGS: [&str; 33] = [
     reason = "Only the parent request policy uses this private module; a public export violates unreachable_pub."
 )]
 pub(super) fn contains(text: &str) -> bool {
-    text.match_indices('<').any(|(offset, _)| {
-        let remainder = &text[offset..];
+    let bytes = text.as_bytes();
+    memchr::memchr_iter(b'<', bytes).any(|offset| {
+        let remainder = &bytes[offset..];
         SPELLINGS
             .iter()
-            .any(|spelling| remainder.starts_with(spelling))
+            .any(|spelling| remainder.starts_with(spelling.as_bytes()))
     })
 }
 

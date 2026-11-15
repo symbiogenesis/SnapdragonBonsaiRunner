@@ -726,13 +726,11 @@ fn valid_history(messages: &[Message<'_>]) -> bool {
     {
         return false;
     }
-    let turns = if messages[0].role == Role::System {
-        &messages[1..]
-    } else {
-        messages
+    let turns = match messages {
+        [first, rest @ ..] if first.role == Role::System => rest,
+        _ => messages,
     };
-    !turns.is_empty()
-        && turns.len() % 2 == 1
+    !turns.len().is_multiple_of(2)
         && turns.iter().enumerate().all(|(i, m)| {
             m.role
                 == if i.is_multiple_of(2) {

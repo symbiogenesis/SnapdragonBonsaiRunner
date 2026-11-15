@@ -607,14 +607,12 @@ impl<S: AsyncRead + Unpin> BackendBody<S> {
                     digits,
                     cr: false,
                 } if byte.is_ascii_hexdigit() && digits + 3 <= MAX_CHUNK_LINE_BYTES => {
-                    let digit = match byte {
-                        b'0'..=b'9' => byte - b'0',
-                        b'a'..=b'f' => byte - b'a' + 10,
-                        _ => byte - b'A' + 10,
+                    let Some(digit) = char::from(byte).to_digit(16) else {
+                        return this.fail(io::ErrorKind::InvalidData);
                     };
                     let Some(value) = value
                         .checked_mul(16)
-                        .and_then(|n| n.checked_add(usize::from(digit)))
+                        .and_then(|n| usize::try_from(digit).ok().and_then(|d| n.checked_add(d)))
                     else {
                         return this.fail(io::ErrorKind::InvalidData);
                     };

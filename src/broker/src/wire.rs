@@ -34,10 +34,9 @@ pub(super) fn head_end(raw: &[u8], previous: usize) -> Option<usize> {
 }
 
 pub(super) fn valid_line_endings(raw: &[u8]) -> bool {
-    !raw.iter().enumerate().any(|(i, byte)| match byte {
+    !memchr::memchr2_iter(b'\r', b'\n', raw).any(|i| match raw[i] {
         b'\r' => raw.get(i + 1) != Some(&b'\n'),
-        b'\n' => i == 0 || raw[i - 1] != b'\r',
-        _ => false,
+        _ => i == 0 || raw[i - 1] != b'\r',
     })
 }
 
