@@ -63,6 +63,7 @@ function Test-OwnedLanguages([string]$RepositoryRoot) {
                 continue
             }
             $text=[IO.File]::ReadAllText($entry)
+            if ($text.IndexOf('py',[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
             # Most files have no candidate. Scan those in .NET without entering
             # a PowerShell loop for every line; retain exact per-line diagnostics
             # for candidates, including CR-only files and multiline false alarms.
