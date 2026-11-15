@@ -159,3 +159,45 @@ fn native_boundary_keeps_build_vendor_and_historical_data_exclusions_explicit() 
     assert!(verify(&scratch.0, &manifest).is_err());
     Ok(())
 }
+
+#[test]
+fn verify_in_tree_reads_runner_manifest_and_rejects_tamper() -> TestResult {
+    let scratch = Scratch::new()?;
+    let manifest = scratch.fixture()?;
+    let document = serde_json::json!({
+        "schemaVersion": manifest.schema_version,
+        "kind": manifest.kind,
+        "repository": manifest.repository,
+        "sourceRevision": manifest.source_revision,
+        "exclusions": manifest.exclusions.iter().map(|entry| serde_json::json!({
+            "path": entry.path,
+            "reason": entry.reason,
+        })).collect::<Vec<_>>(),
+        "families": manifest.families.iter().map(|family| serde_json::json!({
+            "id": family.id,
+            "obligations": family.obligations,
+            "retirementQualified": family.retirement_qualified,
+        })).collect::<Vec<_>>(),
+        "files": manifest.files.iter().map(|entry| serde_json::json!({
+            "path": entry.path,
+            "bytes": entry.bytes,
+            "sha256": entry.sha256,
+            "family": entry.family,
+        })).collect::<Vec<_>>(),
+        "edges": manifest.edges.iter().map(|entry| serde_json::json!({
+            "path": entry.path,
+            "bytes": entry.bytes,
+            "sha256": entry.sha256,
+            "family": entry.family,
+        })).collect::<Vec<_>>(),
+    });
+    fs::create_dir_all(scratch.0.join("tools/ci"))?;
+    fs::write(
+        scratch.0.join("tools/ci/native-boundary.runner.json"),
+        serde_json::to_vec_pretty(&document)?,
+    )?;
+    assert!(super::verify_in_tree(&scratch.0).is_ok());
+    fs::write(scratch.0.join("adapter.cpp"), b"tampered native source")?;
+    assert!(super::verify_in_tree(&scratch.0).is_err());
+    Ok(())
+}

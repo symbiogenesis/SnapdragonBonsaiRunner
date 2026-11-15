@@ -272,6 +272,16 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     serde_json::to_string_pretty(&verify(root, &manifest)?).map_err(|error| error.to_string())
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn verify_in_tree(root: &Path) -> Result<()> {
+    let path = root.join("tools/ci/native-boundary.runner.json");
+    plain_ancestors(&path)?;
+    let bytes = read_bounded(&path, MAX_DOCUMENT)?;
+    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let _ = verify(root, &manifest)?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "native_boundary_tests.rs"]
 mod tests;

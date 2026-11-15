@@ -25,10 +25,29 @@ $updates = if ([Console]::IsInputRedirected) { [Console]::In.ReadToEnd() } else 
 if (-not $updates.Trim() -and -not $Prepare) { return }
 $started = [Diagnostics.Stopwatch]::StartNew()
 $originalPwsh = $env:BONSAI_PUSH_PWSH_PATH
+$originalTargetDir = $env:BONSAI_PUSH_CARGO_TARGET_DIR
 $originalChecksum = $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS
 $originalFingerprint = $env:CARGO_BUILD_FINGERPRINT
 $originalIncremental = $env:CARGO_INCREMENTAL
 $env:BONSAI_PUSH_PWSH_PATH = [Environment]::ProcessPath
+if ((Test-Path -LiteralPath (Join-Path $Root '.githooks/pre-push') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $Root '.git'))) {
+    $previousNativePref = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        $hooksPath = [string](git -C $Root config --get core.hooksPath 2>$null)
+        $hooksExit = $LASTEXITCODE
+    } finally {
+        $PSNativeCommandUseErrorActionPreference = $previousNativePref
+    }
+    if ($Prepare -and ($hooksExit -ne 0 -or -not $hooksPath.Trim())) {
+        git -C $Root config core.hooksPath .githooks
+        $hooksPath = '.githooks'
+        $hooksExit = 0
+    }
+    if ($hooksExit -ne 0 -or $hooksPath.Trim() -cne '.githooks') {
+        throw "Push blocked: git config core.hooksPath must be '.githooks' (got '$($hooksPath.Trim())'). Run 'git config core.hooksPath .githooks'."
+    }
+}
 Add-Type -AssemblyName System.Windows.Forms
 $power = [Windows.Forms.SystemInformation]::PowerStatus
 Write-Host "Push sanity power before: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown."
@@ -97,6 +116,31 @@ try {
                 $metadata = 'bonsai_push_prepare_' + [guid]::NewGuid().ToString('N')
                 cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
                 cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-windows-process --bin bonsai-push-recovery --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
+                if (Test-Path -LiteralPath (Join-Path $policy 'config/rust-packages.json') -PathType Leaf) {
+                    $manifestPath = Join-Path $policy 'Cargo.toml'
+                    $metadataJson = (& cargo "+$toolchain" metadata --no-deps --format-version 1 --manifest-path $manifestPath --locked --offline) | ConvertFrom-Json
+                    $packages = @($metadataJson.packages | ForEach-Object { $_.name })
+                    $windowsArgs = @("+$toolchain", 'check', '--quiet', '--locked', '--offline', '--manifest-path', $manifestPath)
+                    if ($packages -contains 'bonsai-speech-asr') {
+                        $windowsArgs += @('--workspace', '--exclude', 'bonsai-speech-asr')
+                    } else {
+                        $windowsArgs += '--workspace'
+                    }
+                    $windowsArgs += @('--all-targets', '--target', 'aarch64-pc-windows-msvc', '--target-dir', $target)
+                    & cargo @windowsArgs
+                    if ($packages -contains 'bonsai-speech-asr') {
+                        cargo "+$toolchain" check --quiet --locked --offline --manifest-path $manifestPath --package bonsai-speech-asr --no-default-features --features rust-qualification --all-targets --target aarch64-pc-windows-msvc --target-dir $target
+                    }
+                    $installedTargets = @(& rustup "+$toolchain" target list --installed)
+                    if ($installedTargets -contains 'aarch64-unknown-linux-gnu') {
+                        $portable = @(('bonsai-artifacts', 'bonsai-audio', 'bonsai-cpu-policy', 'bonsai-broker', 'bonsai-markdown', 'bonsai-speech-service') | Where-Object { $packages -contains $_ })
+                        if ($portable.Count -gt 0) {
+                            $linuxArgs = @("+$toolchain", 'check', '--quiet', '--locked', '--offline', '--manifest-path', $manifestPath, '--target', 'aarch64-unknown-linux-gnu', '--target-dir', $target, '--lib')
+                            foreach ($crate in $portable) { $linuxArgs += @('--package', $crate) }
+                            & cargo @linuxArgs
+                        }
+                    }
+                }
             }
             finally { Pop-Location }
             @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-FileHash -LiteralPath $recoveryTool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
@@ -114,6 +158,7 @@ try {
         'Prepared the committed native checker and recovery supervisor; this is not an outgoing-tip validation verdict.'
         return
     }
+    $env:BONSAI_PUSH_CARGO_TARGET_DIR = $target
     $updates | & $tool push-sanity --root $Root --policy-root $policy --bootstrap-milliseconds $started.ElapsedMilliseconds
     if ($LASTEXITCODE) { throw 'Push blocked: source sanity did not pass.' }
 } finally {
@@ -125,6 +170,8 @@ try {
     Write-Host "Push sanity power after: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown; aggregate elapsed=$($started.Elapsed)."
     if ($null -eq $originalPwsh) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH', [NullString]::Value) }
     else { $env:BONSAI_PUSH_PWSH_PATH = $originalPwsh }
+    if ($null -eq $originalTargetDir) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_CARGO_TARGET_DIR', [NullString]::Value) }
+    else { $env:BONSAI_PUSH_CARGO_TARGET_DIR = $originalTargetDir }
     if ($null -eq $originalChecksum) { [Environment]::SetEnvironmentVariable('CARGO_UNSTABLE_CHECKSUM_FRESHNESS', [NullString]::Value) }
     else { $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = $originalChecksum }
     if ($null -eq $originalFingerprint) { [Environment]::SetEnvironmentVariable('CARGO_BUILD_FINGERPRINT', [NullString]::Value) }

@@ -200,6 +200,28 @@ impl Work {
 
     fn checks(&mut self, root: &Path, source: &Path, paths: &[String]) -> Result<()> {
         let plan = selection(paths);
+        if !plan.markdown.is_empty() {
+            super::super::push_markdown::check(source, &plan.markdown)?;
+        }
+        if plan.workspace_registry
+            && (source.join("config/rust-packages.json").exists()
+                || paths.iter().any(|path| {
+                    path == "config/rust-packages.json" || path == ".github/ci/impact.json"
+                }))
+        {
+            super::super::checks::verify_workspace_registry(source)?;
+        }
+        if plan.native_boundary
+            && (source.join("tools/ci/native-boundary.runner.json").exists()
+                || paths
+                    .iter()
+                    .any(|path| path == "tools/ci/native-boundary.runner.json"))
+        {
+            super::super::native_boundary::verify_in_tree(source)?;
+        }
+        if plan.hexagon_locks {
+            verify_hexagon_locks(source, paths)?;
+        }
         let mut calls = vec![ScriptCall {
             script: "check_owned_languages.ps1",
             parameters: BTreeMap::from([("Root", serde_json::json!(source))]),
@@ -249,6 +271,10 @@ impl Work {
             self.format_check(source)?;
         }
         self.script_calls(root, source, &calls)?;
+        #[cfg(not(test))]
+        if plan.rust || plan.workspace_registry || plan.hexagon_locks {
+            self.cargo_checks(source, paths, &plan)?;
+        }
         Ok(())
     }
 
@@ -345,6 +371,28 @@ impl Work {
                 });
             }
         }
+        if plan.cache_closures
+            && source
+                .join(".github/actions/check-rust/action.yml")
+                .is_file()
+            && source
+                .join(".github/actions/bonsai-tools/action.yml")
+                .is_file()
+            && source.join("Cargo.lock").is_file()
+        {
+            for case in [
+                "lane_dependency_and_embedded_closures_hashed",
+                "real_dependency_embedded_closure_hashed",
+            ] {
+                calls.push(ScriptCall {
+                    script: "test_tools_cache_inputs.ps1",
+                    parameters: BTreeMap::from([
+                        ("Case", serde_json::json!(case)),
+                        ("CandidateRoot", serde_json::json!(source)),
+                    ]),
+                });
+            }
+        }
         if plan.source_fixture {
             calls.push(ScriptCall {
                 script: "test_source_checks.ps1",
@@ -358,6 +406,168 @@ impl Work {
             });
         }
         calls
+    }
+
+    #[cfg(not(test))]
+    fn cargo_checks(&mut self, source: &Path, paths: &[String], plan: &Selection) -> Result<()> {
+        if !source.join("config/rust-packages.json").is_file()
+            || !source.join(".github/ci/impact.json").is_file()
+        {
+            return Ok(());
+        }
+        let impact_bytes =
+            fs::read(source.join(".github/ci/impact.json")).map_err(|error| error.to_string())?;
+        let impact_config: serde_json::Value =
+            serde_json::from_slice(&impact_bytes).map_err(|error| error.to_string())?;
+        let impact_plan = crate::impact::select(source, paths, false, &impact_config, "pre-push")?;
+        let affected: BTreeSet<String> = impact_plan.packages.into_iter().collect();
+        let toolchain = super::super::push_format::toolchain(source)?;
+        let target_dir = std::env::var_os("BONSAI_PUSH_CARGO_TARGET_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.directory.join("cargo-target"));
+        fs::create_dir_all(&target_dir).map_err(|error| error.to_string())?;
+        let manifest = source.join("Cargo.toml");
+
+        let base_cargo_args = |subcommand: &str, target: &str| -> Vec<OsString> {
+            vec![
+                format!("+{toolchain}").into(),
+                subcommand.into(),
+                "--quiet".into(),
+                "--locked".into(),
+                "--offline".into(),
+                "--manifest-path".into(),
+                manifest.as_os_str().into(),
+                "--target".into(),
+                target.into(),
+                "--target-dir".into(),
+                target_dir.as_os_str().into(),
+            ]
+        };
+
+        if affected.contains("bonsai-ci") || plan.workspace_registry {
+            let mut routing_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+            routing_args.extend([
+                "-p".into(),
+                "bonsai-ci".into(),
+                "--test".into(),
+                "routing".into(),
+            ]);
+            self.command(source, "cargo.exe", &routing_args, BTreeMap::new())?;
+
+            let mut lib_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+            lib_args.extend([
+                "-p".into(),
+                "bonsai-ci".into(),
+                "--lib".into(),
+                "--".into(),
+                "--skip".into(),
+                "push_sanity_".into(),
+            ]);
+            self.command(source, "cargo.exe", &lib_args, BTreeMap::new())?;
+        }
+
+        if plan.hexagon_locks
+            || (affected.contains("bonsai-tools")
+                && paths.iter().any(|path| path.contains("hexagon")))
+        {
+            let mut hex_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+            hex_args.extend([
+                "-p".into(),
+                "bonsai-tools".into(),
+                "--lib".into(),
+                "hexagon_tools::public_control".into(),
+            ]);
+            self.command(source, "cargo.exe", &hex_args, BTreeMap::new())?;
+        }
+
+        if affected.contains("bonsai-tools")
+            && paths.iter().any(|path| {
+                path == "tools/bonsai/src/release_package.rs"
+                    || path.starts_with("scripts/release/")
+            })
+        {
+            let mut rel_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+            rel_args.extend([
+                "-p".into(),
+                "bonsai-tools".into(),
+                "--lib".into(),
+                "release_package".into(),
+            ]);
+            self.command(source, "cargo.exe", &rel_args, BTreeMap::new())?;
+        }
+
+        let windows_standard: Vec<_> = affected
+            .iter()
+            .filter(|package| package.as_str() != "bonsai-speech-asr")
+            .cloned()
+            .collect();
+        if !windows_standard.is_empty() {
+            let mut args = base_cargo_args("check", "aarch64-pc-windows-msvc");
+            args.push("--all-targets".into());
+            for package in &windows_standard {
+                args.push("-p".into());
+                args.push(package.into());
+            }
+            self.command(source, "cargo.exe", &args, BTreeMap::new())?;
+        }
+
+        if affected.contains("bonsai-speech-asr") {
+            let mut args = base_cargo_args("check", "aarch64-pc-windows-msvc");
+            args.extend([
+                "-p".into(),
+                "bonsai-speech-asr".into(),
+                "--no-default-features".into(),
+                "--features".into(),
+                "rust-qualification".into(),
+                "--all-targets".into(),
+            ]);
+            self.command(source, "cargo.exe", &args, BTreeMap::new())?;
+        }
+
+        const PORTABLE_LINUX_CRATES: [&str; 6] = [
+            "bonsai-artifacts",
+            "bonsai-audio",
+            "bonsai-cpu-policy",
+            "bonsai-broker",
+            "bonsai-markdown",
+            "bonsai-speech-service",
+        ];
+        let linux_affected: Vec<_> = affected
+            .iter()
+            .filter(|package| PORTABLE_LINUX_CRATES.contains(&package.as_str()))
+            .cloned()
+            .collect();
+        if !linux_affected.is_empty() {
+            let installed = self.command(
+                source,
+                "rustup.exe",
+                &[
+                    "target".into(),
+                    "list".into(),
+                    "--installed".into(),
+                    "--toolchain".into(),
+                    toolchain.clone().into(),
+                ],
+                BTreeMap::new(),
+            )?;
+            let installed_text =
+                std::str::from_utf8(&installed).map_err(|error| error.to_string())?;
+            if installed_text
+                .lines()
+                .any(|line| line.trim() == "aarch64-unknown-linux-gnu")
+            {
+                let mut args = base_cargo_args("check", "aarch64-unknown-linux-gnu");
+                args.push("--lib".into());
+                for package in &linux_affected {
+                    args.push("-p".into());
+                    args.push(package.into());
+                }
+                self.command(source, "cargo.exe", &args, BTreeMap::new())?;
+            }
+        }
+
+        Ok(())
     }
 
     #[cfg(test)]
@@ -375,6 +585,150 @@ fn paths(raw: &[u8]) -> Result<Vec<String>> {
                 .map_err(|error| error.to_string())
         })
         .collect()
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn verify_lockfiles_in_dir(dir: &Path, prefix: Option<&str>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".lock.json") {
+            continue;
+        }
+        if let Some(expected_prefix) = prefix
+            && !name.starts_with(expected_prefix)
+        {
+            continue;
+        }
+        if entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            let _: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                format!(
+                    "Push blocked: invalid Hexagon lockfile JSON {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_hexagon_locks(source: &Path, paths: &[String]) -> Result<()> {
+    verify_lockfiles_in_dir(&source.join("tools/hexagon"), None)?;
+    verify_lockfiles_in_dir(&source.join("config"), Some("hexagon-"))?;
+
+    let lock_rel = "tools/hexagon/windows-queue-abi.lock.json";
+    let c_rel = "tools/hexagon/windows_queue_abi.c";
+    let lock_path = source.join(lock_rel);
+    let c_path = source.join(c_rel);
+    if !lock_path.is_file() {
+        if paths.iter().any(|path| path == lock_rel || path == c_rel) || c_path.is_file() {
+            return Err(format!("Push blocked: missing {lock_rel}."));
+        }
+        return Ok(());
+    }
+
+    let raw = fs::read(&lock_path).map_err(|error| error.to_string())?;
+    let document: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|error| format!("Push blocked: invalid {lock_rel}: {error}"))?;
+    if document
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err(format!(
+            "Push blocked: {lock_rel} must declare integer schemaVersion 1."
+        ));
+    }
+    let inputs = document
+        .get("publicInputs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("Push blocked: {lock_rel} must declare publicInputs array."))?;
+    let mut pinned = BTreeSet::new();
+    for input in inputs {
+        let object = input.as_object().ok_or_else(|| {
+            format!("Push blocked: {lock_rel} publicInputs entries must be JSON objects.")
+        })?;
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("Push blocked: {lock_rel} publicInput missing name."))?;
+        if !pinned.insert(name.to_owned()) {
+            return Err(format!(
+                "Push blocked: duplicate publicInput '{name}' in {lock_rel}."
+            ));
+        }
+        let bytes = object
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("Push blocked: {lock_rel} entry '{name}' invalid bytes."))?;
+        let _ = bytes;
+        let sha256 = object
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| is_lower_hex_digest(value))
+            .ok_or_else(|| format!("Push blocked: {lock_rel} entry '{name}' invalid sha256."))?;
+        let _ = sha256;
+        let revision = object
+            .get("revision")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| format!("Push blocked: {lock_rel} entry '{name}' invalid revision."))?;
+        let _ = revision;
+        let url = object
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| value.starts_with("https://"))
+            .ok_or_else(|| format!("Push blocked: {lock_rel} entry '{name}' invalid url."))?;
+        let _ = url;
+    }
+
+    if !pinned.contains("AEEStdDef.h") {
+        return Err(format!(
+            "Push blocked: {lock_rel} must pin transitive public header AEEStdDef.h."
+        ));
+    }
+
+    if c_path.is_file() {
+        let c_text = fs::read_to_string(&c_path).map_err(|error| error.to_string())?;
+        for (index, line) in c_text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(after_include) = trimmed.strip_prefix("#include") {
+                let after = after_include.trim_start();
+                if let Some(quoted) = after.strip_prefix('"')
+                    && let Some((header, _)) = quoted.split_once('"')
+                    && !pinned.contains(header)
+                {
+                    return Err(format!(
+                        "Push blocked: {c_rel}:{} includes \"{header}\" which is missing from {lock_rel}.",
+                        index + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub(super) fn check(
@@ -664,7 +1018,8 @@ mod tests {
                         "tools/ci/test_tools_cache_inputs.ps1".into(),
                     ],
                 )
-                .expect_err("Committed formatting must fail before candidate repair.");
+                .err()
+                .ok_or("Committed formatting must fail before candidate repair.")?;
             assert!(failure.contains("cargo.exe"), "{failure}");
             assert_eq!(
                 fs::read_to_string(rust_source).map_err(|error| error.to_string())?,
@@ -845,6 +1200,50 @@ mod tests {
         })();
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Push fixture cleanup escaped temp.".into());
+        }
+        fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
+        result
+    }
+
+    #[test]
+    fn push_sanity_verify_hexagon_locks_rejects_unpinned_includes() -> Result<()> {
+        let temporary = super::super::canonical_path(std::env::temp_dir())?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch = temporary.join(format!("bonsai-push-hexlock-{nonce}"));
+        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let result = (|| {
+            let policy =
+                super::super::canonical_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+            fs::create_dir_all(scratch.join("tools/hexagon")).map_err(|error| error.to_string())?;
+            fs::copy(
+                policy.join("tools/hexagon/windows-queue-abi.lock.json"),
+                scratch.join("tools/hexagon/windows-queue-abi.lock.json"),
+            )
+            .map_err(|error| error.to_string())?;
+            fs::copy(
+                policy.join("tools/hexagon/windows_queue_abi.c"),
+                scratch.join("tools/hexagon/windows_queue_abi.c"),
+            )
+            .map_err(|error| error.to_string())?;
+            verify_hexagon_locks(&scratch, &["tools/hexagon/windows_queue_abi.c".into()])?;
+
+            fs::write(
+                scratch.join("tools/hexagon/windows_queue_abi.c"),
+                "#include \"dspqueue.h\"\n#include \"unpinned_extra.h\"\n",
+            )
+            .map_err(|error| error.to_string())?;
+            let error =
+                verify_hexagon_locks(&scratch, &["tools/hexagon/windows_queue_abi.c".into()])
+                    .err()
+                    .ok_or("Expected unpinned include failure.")?;
+            assert!(error.contains("unpinned_extra.h"), "{error}");
+            Ok(())
+        })();
+        if scratch.parent() != Some(temporary.as_path()) {
+            return Err("Push hexlock fixture cleanup escaped temp.".into());
         }
         fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
         result

@@ -36,6 +36,10 @@ mod native_boundary;
 #[path = "push_sanity.rs"]
 mod push_sanity;
 
+#[cfg(any(windows, test))]
+#[path = "push_markdown.rs"]
+mod push_markdown;
+
 #[path = "push_format.rs"]
 mod push_format;
 

@@ -1,7 +1,29 @@
 #Requires -Version 7.6
 # Shared native release entry adapter. Importing performs no work.
 Set-StrictMode -Version Latest
+function Assert-RepositoryGitHooks([string]$RepositoryRoot) {
+    if ($env:CI -or $env:GITHUB_ACTIONS) { return }
+    if (-not (Test-Path -LiteralPath (Join-Path $RepositoryRoot '.githooks/pre-push') -PathType Leaf)) { return }
+    if (-not (Test-Path -LiteralPath (Join-Path $RepositoryRoot '.git'))) { return }
+    $previousNativePref = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        $hooksPath = [string](git -C $RepositoryRoot config --get core.hooksPath 2>$null)
+        $hooksExit = $LASTEXITCODE
+    } finally {
+        $PSNativeCommandUseErrorActionPreference = $previousNativePref
+    }
+    if ($hooksExit -ne 0 -or -not $hooksPath.Trim()) {
+        git -C $RepositoryRoot config core.hooksPath .githooks
+        if ($LASTEXITCODE) { throw "Failed to configure git core.hooksPath = '.githooks' in $RepositoryRoot." }
+        return
+    }
+    if ($hooksPath.Trim() -cne '.githooks') {
+        throw "Repository git config core.hooksPath must be '.githooks' (got '$($hooksPath.Trim())'). Run 'git config core.hooksPath .githooks'."
+    }
+}
 function Get-ReleaseToolchain([string]$RepositoryRoot) {
+    Assert-RepositoryGitHooks $RepositoryRoot
     # Cargo's manifest path does not select rustup's compiler outside the checkout.
     $toolchain = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'rust-toolchain.toml') -Raw
     $channel = [regex]::Match($toolchain, '(?m)^channel\s*=\s*"(nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})"\s*$').Groups[1].Value

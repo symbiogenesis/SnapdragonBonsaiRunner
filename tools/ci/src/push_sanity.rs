@@ -45,8 +45,19 @@ struct Selection {
     rust: bool,
     workflows: bool,
     powershell: Vec<String>,
+    markdown: Vec<String>,
     cache_actions: Vec<&'static str>,
+    cache_closures: bool,
+    workspace_registry: bool,
+    native_boundary: bool,
+    hexagon_locks: bool,
     source_fixture: bool,
+}
+
+fn is_native_source(path: &str) -> bool {
+    ["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "m", "mm"]
+        .into_iter()
+        .any(|ext| extension(path, ext))
 }
 
 fn selection(paths: &[String]) -> Selection {
@@ -77,6 +88,11 @@ fn selection(paths: &[String]) -> Selection {
             .filter(|path| extension(path, "ps1") || extension(path, "psm1"))
             .map(|path| (*path).clone())
             .collect(),
+        markdown: owned
+            .iter()
+            .filter(|path| extension(path, "md") || extension(path, "markdown"))
+            .map(|path| (*path).clone())
+            .collect(),
         cache_actions: ["bonsai-tools", "ci-tool"]
             .into_iter()
             .filter(|action| {
@@ -90,6 +106,44 @@ fn selection(paths: &[String]) -> Selection {
                 })
             })
             .collect(),
+        cache_closures: owned.iter().any(|path| {
+            extension(path, "rs")
+                || path.ends_with("Cargo.toml")
+                || path.as_str() == "Cargo.lock"
+                || [
+                    ".github/actions/check-rust/action.yml",
+                    ".github/actions/bonsai-tools/action.yml",
+                    "tools/ci/test_tools_cache_inputs.ps1",
+                    "tools/ci/test_support.ps1",
+                ]
+                .contains(&path.as_str())
+        }),
+        workspace_registry: owned.iter().any(|path| {
+            path.ends_with("Cargo.toml")
+                || path.as_str() == "Cargo.lock"
+                || path.as_str() == "config/rust-packages.json"
+                || path.as_str() == ".github/ci/impact.json"
+                || path.as_str() == "tools/ci/src/checks/mod.rs"
+                || path.as_str() == "tools/ci/src/impact.rs"
+                || path.as_str() == "tools/ci/src/workspace.rs"
+        }),
+        native_boundary: owned.iter().any(|path| {
+            is_native_source(path)
+                || extension(path, "rs")
+                || path.ends_with("Cargo.toml")
+                || path.as_str() == "Cargo.lock"
+                || path.ends_with("CMakeLists.txt")
+                || path.as_str() == "tools/ci/native-boundary.runner.json"
+                || path.starts_with(".github/workflows/")
+                || path.starts_with("tools/hexagon/")
+                || path.starts_with("tools/native-reference/")
+        }),
+        hexagon_locks: owned.iter().any(|path| {
+            path.starts_with("tools/hexagon/")
+                || path.starts_with("tools/bonsai/src/hexagon_tools")
+                || path.starts_with("tools/bonsai/src/hexagon_policy")
+                || path.starts_with("config/hexagon-")
+        }),
         source_fixture: owned.iter().any(|path| {
             [
                 ".github/workflows/source-checks.yml",
@@ -214,13 +268,46 @@ mod tests {
 
     #[test]
     fn push_sanity_selects_syntax_without_style_checks_for_docs_or_vendors() {
-        let paths = ["README.md", "third_party/library/invalid.rs"].map(String::from);
-        assert_eq!(selection(&paths), Selection::default());
+        let paths = [
+            "README.md",
+            "third_party/library/invalid.rs",
+            "third_party/library/ignored.md",
+        ]
+        .map(String::from);
+        assert_eq!(
+            selection(&paths),
+            Selection {
+                markdown: vec!["README.md".into()],
+                ..Selection::default()
+            }
+        );
         let paths = ["scripts/file with spaces.ps1", "src/audio/src/lib.rs"].map(String::from);
         let plan = selection(&paths);
         assert!(plan.rust);
+        assert!(plan.cache_closures);
+        assert!(plan.native_boundary);
         assert!(!plan.workflows);
+        assert!(plan.markdown.is_empty());
         assert_eq!(plan.powershell, ["scripts/file with spaces.ps1"]);
+    }
+
+    #[test]
+    fn push_sanity_selects_registry_boundary_cache_closures_and_hexagon_locks() {
+        let registry = selection(&["config/rust-packages.json".into()]);
+        assert!(registry.workspace_registry);
+        assert!(!registry.rust);
+
+        let closure = selection(&[".github/actions/check-rust/action.yml".into()]);
+        assert!(closure.workflows);
+        assert!(closure.cache_closures);
+
+        let native = selection(&["tools/native-reference/helper.cpp".into()]);
+        assert!(native.native_boundary);
+        assert!(!native.rust);
+
+        let hexagon = selection(&["tools/hexagon/windows-queue-abi.lock.json".into()]);
+        assert!(hexagon.hexagon_locks);
+        assert!(hexagon.native_boundary);
     }
 
     #[test]
