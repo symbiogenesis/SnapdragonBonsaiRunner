@@ -1,7 +1,7 @@
 //! Source-only Cargo workspace graph discovery.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use toml::Value;
 
@@ -226,11 +226,11 @@ fn resolve(path: &Path) -> crate::Result<PathBuf> {
         .ok_or_else(|| format!("Cannot resolve {}", path.display()))?;
     let mut result = resolve(parent)?;
     match path.components().next_back() {
-        Some(std::path::Component::ParentDir) => {
+        Some(Component::ParentDir) => {
             result.pop();
         }
-        Some(std::path::Component::CurDir) => (),
-        Some(std::path::Component::Normal(name)) => result.push(name),
+        Some(Component::CurDir) => (),
+        Some(Component::Normal(name)) => result.push(name),
         _ => return Err(format!("Cannot resolve {}", path.display())),
     }
     Ok(result)
@@ -325,4 +325,262 @@ pub(crate) fn read(root: &Path) -> crate::Result<Workspace> {
         }
     }
     Ok(Workspace { packages, reverse })
+}
+
+pub(crate) fn is_link(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub(crate) fn read_bounded_until_reader<R: std::io::Read, F: FnMut() -> crate::Result<()>>(
+    mut reader: R,
+    limit: u64,
+    exceeded: &str,
+    mut checkpoint: F,
+) -> crate::Result<Vec<u8>> {
+    checkpoint()?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        checkpoint()?;
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if count == 0 {
+            break;
+        }
+        if u64::try_from(bytes.len())
+            .map_err(|error| error.to_string())?
+            .checked_add(u64::try_from(count).map_err(|error| error.to_string())?)
+            .is_none_or(|length| length > limit)
+        {
+            return Err(exceeded.into());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    checkpoint()?;
+    Ok(bytes)
+}
+
+pub(crate) fn read_bounded_reader<R: std::io::Read>(
+    reader: R,
+    limit: u64,
+    exceeded: &str,
+) -> crate::Result<Vec<u8>> {
+    read_bounded_until_reader(reader, limit, exceeded, || Ok(()))
+}
+
+pub(crate) fn read_bounded(path: &Path, limit: u64, exceeded: &str) -> crate::Result<Vec<u8>> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file.", path.display()));
+    }
+    if metadata.len() > limit {
+        return Err(exceeded.into());
+    }
+    read_bounded_reader(file, limit, exceeded)
+}
+
+pub(crate) fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+pub(crate) fn validate_repo_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && path.is_ascii()
+        && !path.bytes().any(|byte| byte.is_ascii_control())
+        && !path.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
+        && path.split('/').all(|part| {
+            let stem = part.split('.').next().unwrap_or_default();
+            let reserved = ["CON", "PRN", "AUX", "NUL"]
+                .iter()
+                .any(|name| stem.eq_ignore_ascii_case(name))
+                || matches!(
+                    stem.as_bytes(),
+                    [prefix @ .., b'1'..=b'9']
+                        if prefix.eq_ignore_ascii_case(b"COM")
+                            || prefix.eq_ignore_ascii_case(b"LPT")
+                );
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.ends_with(['.', ' '])
+                && !reserved
+        })
+        && Path::new(path)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+}
+
+pub(crate) fn is_dated_nightly_channel(channel: &str) -> bool {
+    channel.len() == 18
+        && channel.starts_with("nightly-")
+        && channel.bytes().enumerate().skip(8).all(|(index, byte)| {
+            if matches!(index, 12 | 15) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+}
+
+#[cfg(windows)]
+pub(crate) fn pinned_toolchain_channel(root: &Path) -> crate::Result<String> {
+    let bytes = read_bounded(
+        &root.join("rust-toolchain.toml"),
+        16 * 1024,
+        "Toolchain manifest exceeds its byte bound.",
+    )?;
+    let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let pin: Value = toml::from_str(&text).map_err(|error| error.to_string())?;
+    pin.get("toolchain")
+        .and_then(|value| value.get("channel"))
+        .and_then(Value::as_str)
+        .filter(|channel| is_dated_nightly_channel(channel))
+        .map(str::to_owned)
+        .ok_or_else(|| "Toolchain pin requires a dated nightly channel.".into())
+}
+
+pub(crate) fn paths_overlap(a: &Path, b: &Path) -> bool {
+    let normalized = |path: &Path| {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_uppercase()
+    };
+    let a = normalized(a);
+    let b = normalized(b);
+    a == b || a.starts_with(&(b.clone() + "\\")) || b.starts_with(&(a + "\\"))
+}
+
+#[cfg(test)]
+pub(crate) struct ScratchDir(pub(crate) PathBuf);
+
+#[cfg(test)]
+impl ScratchDir {
+    pub(crate) fn new(prefix: &str) -> crate::Result<Self> {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let canonical = std::fs::canonicalize(std::env::temp_dir()).map_err(|e| e.to_string())?;
+        // Use ordinary drive syntax on Windows so process controls that reject \\?\ work seamlessly.
+        let base_text = canonical.to_string_lossy();
+        let base = PathBuf::from(
+            base_text
+                .strip_prefix("\\\\?\\")
+                .filter(|stripped| stripped.as_bytes().get(1) == Some(&b':'))
+                .unwrap_or(&base_text),
+        );
+        let root = base.join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).map_err(|error| error.to_string())?;
+        Ok(Self(root))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<Path> for ScratchDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for ScratchDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if let Ok(parent) = std::fs::canonicalize(std::env::temp_dir())
+            && let Ok(target) = std::fs::canonicalize(&self.0)
+            && target.parent() == Some(parent.as_path())
+            && std::fs::symlink_metadata(&self.0)
+                .is_ok_and(|metadata| metadata.is_dir() && !is_link(&metadata))
+        {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        ScratchDir, is_dated_nightly_channel, is_lower_hex, paths_overlap, read_bounded,
+        validate_repo_relative_path,
+    };
+
+    #[test]
+    fn shared_workspace_validators_and_scratch_dir_enforce_bounds() -> crate::Result<()> {
+        assert!(is_lower_hex(&"0123456789abcdef".repeat(4), 64));
+        assert!(!is_lower_hex(&"0123456789ABCDEF".repeat(4), 64));
+        assert!(is_dated_nightly_channel("nightly-2026-11-12"));
+        assert!(!is_dated_nightly_channel("nightly-2026-11"));
+        assert!(validate_repo_relative_path("tools/ci/src/lib.rs"));
+        assert!(!validate_repo_relative_path("../escape.rs"));
+        assert!(!validate_repo_relative_path("a/LPT1.txt"));
+        assert!(paths_overlap(
+            Path::new(r"C:\src\repo"),
+            Path::new("c:/src/repo/target")
+        ));
+        assert!(!paths_overlap(
+            Path::new(r"C:\src\repo"),
+            Path::new(r"C:\src\repo-target")
+        ));
+
+        let scratch = ScratchDir::new("Bonsai-WorkspaceHelper")?;
+        let root = scratch.path().to_path_buf();
+        let file = scratch.join("bounded.txt");
+        std::fs::write(&file, b"hello").map_err(|error| error.to_string())?;
+        assert_eq!(read_bounded(&file, 5, "too big")?, b"hello");
+        assert!(read_bounded(&file, 4, "too big").is_err());
+        drop(scratch);
+        assert!(!root.exists());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_toolchain_channel_reads_dated_nightly_channel() -> crate::Result<()> {
+        let scratch = ScratchDir::new("Bonsai-ToolchainChannel")?;
+        std::fs::write(
+            scratch.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly-2026-11-12\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            super::pinned_toolchain_channel(scratch.path())?,
+            "nightly-2026-11-12"
+        );
+        Ok(())
+    }
 }

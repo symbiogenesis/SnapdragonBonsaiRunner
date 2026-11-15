@@ -564,14 +564,11 @@ fn verify_unit(
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
-    if arguments.len() != 5 || arguments[1] != "--manifest" || arguments[3] != "--expected-sha256" {
-        return Err(USAGE.into());
-    }
-    let path = arguments[2].to_str().ok_or(USAGE)?;
-    let expected = arguments[4]
-        .to_str()
-        .filter(|value| lower_hex(value, 64))
-        .ok_or(USAGE)?;
+    let mut cursor = crate::command::ArgCursor::new(arguments, USAGE);
+    cursor.skip_command()?;
+    let path = cursor.expect_value("--manifest")?;
+    let expected = cursor.expect_hex("--expected-sha256", 64)?;
+    cursor.finish()?;
     path_key(path)?;
     let bytes = read_bounded(Path::new(path), MAX_DOCUMENT)?;
     verify_manifest_bytes(&bytes, expected)

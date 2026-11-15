@@ -8,8 +8,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fs::{self, File, OpenOptions},
-    io::{Read as _, Write as _},
+    fs::{self, File},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -34,17 +33,7 @@ fn clocks() -> crate::Result<(u64, u64)> {
 
 fn write_json(path: &Path, value: &Value) -> crate::Result<()> {
     external(path)?;
-    let temporary = path.with_extension(format!("{}.partial", crate::startup_process::unique()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(|error| error.to_string())?;
-    serde_json::to_writer_pretty(&mut file, value).map_err(|error| error.to_string())?;
-    file.write_all(b"\n")
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    fs::rename(temporary, path).map_err(|error| error.to_string())
+    crate::bounded_input::write_pretty_json_atomic(path, value)
 }
 
 fn ci_guard(hosted: bool) -> crate::Result<()> {
@@ -75,25 +64,13 @@ fn digest(path: &Path) -> crate::Result<(u64, String)> {
     if bytes == 0 || bytes > 134_217_728 {
         return Err("Sandbox packaged file exceeds its bound.".into());
     }
-    let mut hash = crate::identity::Hasher::new()?;
-    let mut buffer = vec![0; 65_536];
-    let mut total = 0;
-    loop {
-        crate::startup_cancel::checkpoint()?;
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        total += u64::try_from(count).map_err(|error| error.to_string())?;
-        if total > bytes {
-            return Err("Sandbox file grew during hashing.".into());
-        }
-        hash.update(&buffer[..count])?;
-    }
-    if total != bytes {
-        return Err("Sandbox file changed during hashing.".into());
-    }
-    Ok((bytes, hash.finalize_hex()?))
+    let (_, hash) = crate::identity::hash_reader_checked(
+        &mut file,
+        Some(bytes),
+        None,
+        &mut crate::startup_cancel::checkpoint,
+    )?;
+    Ok((bytes, hash))
 }
 
 fn compile(

@@ -121,34 +121,12 @@ fn native_archive_inventory_rejects_symlinks_corruption_and_invalid_pins() -> Te
 #[test]
 fn native_archive_inventory_binds_reviewed_pin_and_original_archive() -> TestResult {
     use sha2::{Digest as _, Sha256};
-    use std::{
-        ffi::OsString,
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{ffi::OsString, fs};
 
-    // Cleanup happens on both a successful assertion and unwinding. Never follow
-    // a substituted scratch root or recursively remove outside the owned parent.
-    struct Scratch(std::path::PathBuf, std::path::PathBuf);
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            if self.0.parent() == Some(self.1.as_path()) && super::plain_ancestors(&self.0).is_ok()
-            {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-    }
-    let temporary_root = fs::canonicalize(std::env::temp_dir())?;
-    let root = temporary_root.join(format!(
-        "Bonsai-ArchiveInventory-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    ));
-    fs::create_dir(&root)?;
-    let scratch = Scratch(root, temporary_root);
+    let scratch = crate::impact::workspace::ScratchDir::new("Bonsai-ArchiveInventory")?;
     let bytes = fixture(&[("source-revision/source.cpp", b"abc")])?;
-    let archive_path = scratch.0.join("source.zip");
-    let pin_path = scratch.0.join("pin.json");
+    let archive_path = scratch.join("source.zip");
+    let pin_path = scratch.join("pin.json");
     let pin = serde_json::json!({"schemaVersion":1,"repository":"https://example.invalid/source","revision":"a".repeat(40),"archiveRoot":"source-revision","archiveBytes":bytes.len(),"archiveSha256":super::hex(&Sha256::digest(&bytes))});
     let pin_bytes = serde_json::to_vec(&pin)?;
     fs::write(&archive_path, &bytes)?;

@@ -1344,13 +1344,6 @@ fn paths(raw: &[u8]) -> Result<Vec<String>> {
         .collect()
 }
 
-fn is_lower_hex_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
-
 fn verify_lockfiles_in_dir(dir: &Path, prefix: Option<&str>) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
@@ -1441,7 +1434,7 @@ fn verify_hexagon_locks(source: &Path, paths: &[String]) -> Result<()> {
         let sha256 = object
             .get("sha256")
             .and_then(serde_json::Value::as_str)
-            .filter(|value| is_lower_hex_digest(value))
+            .filter(|value| crate::impact::workspace::is_lower_hex(value, 64))
             .ok_or_else(|| format!("Push blocked: {lock_rel} entry '{name}' invalid sha256."))?;
         let _ = sha256;
         let revision = object

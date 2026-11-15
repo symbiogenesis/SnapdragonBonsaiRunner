@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -85,17 +84,7 @@ fn native() -> Result<()> {
 }
 fn save(path: &Path, value: &Value) -> Result<()> {
     resolve(path, false, true)?;
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    output
-        .write_all(&bytes)
-        .and_then(|()| output.sync_all())
-        .map_err(|error| error.to_string())
+    crate::bounded_input::write_pretty_json_new(path, value)
 }
 fn command(executable: &Path, arguments: &Value, seconds: u64, build: bool) -> Result<Value> {
     let result = crate::release_tool::run(

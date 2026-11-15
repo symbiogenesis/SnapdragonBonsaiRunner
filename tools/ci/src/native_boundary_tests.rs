@@ -1,25 +1,16 @@
 //! Miniature independent file-set, tamper and qualification-refusal controls.
 
 use super::{Entry, Exclusion, Family, Manifest, digest, ordinary_path, verify};
-use std::{
-    fs,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use crate::impact::workspace::ScratchDir;
+use std::fs;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-struct Scratch(PathBuf);
+struct Scratch(ScratchDir);
 
 impl Scratch {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = fs::canonicalize(std::env::temp_dir())?.join(format!(
-            "Bonsai-NativeBoundary-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::create_dir(&path)?;
-        Ok(Self(path))
+        Ok(Self(ScratchDir::new("Bonsai-NativeBoundary")?))
     }
 
     fn fixture(&self) -> Result<Manifest, Box<dyn std::error::Error>> {
@@ -54,12 +45,6 @@ impl Scratch {
             files: vec![entry("adapter.cpp")?],
             edges: vec![entry("CMakeLists.txt")?],
         })
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

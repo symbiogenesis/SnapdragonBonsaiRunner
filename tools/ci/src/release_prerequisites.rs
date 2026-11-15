@@ -213,14 +213,11 @@ fn check_workflow(
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
-    if arguments.len() != 3 || arguments[1] != "--revision" {
-        return Err(USAGE.into());
-    }
-    let revision = arguments[2].to_str().ok_or(USAGE)?;
-    if revision.len() != 40
-        || !revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    let mut cursor = super::ArgCursor::new(arguments, USAGE);
+    cursor.skip_command()?;
+    let revision = cursor.expect_value("--revision")?;
+    cursor.finish()?;
+    if !crate::impact::workspace::is_lower_hex(revision, 40)
         || std::env::var("GITHUB_REPOSITORY").as_deref() != Ok(REPOSITORY)
     {
         return Err(

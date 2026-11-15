@@ -1,7 +1,7 @@
 //! Native GGUF inspection/export entry points and hosted independent fixtures.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -216,39 +216,29 @@ fn resolve(explicit: Option<PathBuf>, data: Option<PathBuf>) -> crate::Result<To
             .join(text(&runtime["asset"], "filename")?),
         &runtime["asset"],
     )?];
-    let mut names = BTreeSet::new();
-    for file in runtime["files"]
+    let pins = runtime["files"]
         .as_array()
-        .ok_or("Missing compiled inference inventory.")?
-    {
+        .ok_or("Missing compiled inference inventory.")?;
+    let mut specs = Vec::with_capacity(pins.len());
+    let mut has_gguf = false;
+    for file in pins {
         let name = text(file, "name")?;
-        if !names.insert(name) || Path::new(name).components().count() != 1 {
-            return Err("Invalid compiled inference inventory.".into());
+        if name == "bonsai-gguf.exe" {
+            has_gguf = true;
         }
-        let path = directory.join(name);
-        guards.push(verify(&path, file)?);
-        if Path::new(name)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
-        {
-            crate::startup_cache::assert_arm64(&path)?;
-        }
+        specs.push(crate::provision::InstalledInferenceFile {
+            name,
+            bytes: count(file, "bytes")?,
+            sha256: text(file, "sha256")?,
+        });
     }
-    let entries = fs::read_dir(&directory)
-        .map_err(|error| error.to_string())?
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|error| error.to_string())?;
-    if entries.len() != names.len()
-        || entries.iter().any(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_none_or(|name| !names.contains(name))
-        })
-    {
-        return Err("Installed inference files differ from the locked inventory.".into());
-    }
-    if !names.contains("bonsai-gguf.exe") {
+    guards.extend(crate::provision::verify_installed_inference(
+        &directory,
+        specs,
+        &mut || Ok(()),
+        "Installed inference files differ from the locked inventory.",
+    )?);
+    if !has_gguf {
         return Err("The pinned inference release has no GGUF executable.".into());
     }
     Ok(Tool {

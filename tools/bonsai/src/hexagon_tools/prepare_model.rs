@@ -1,13 +1,13 @@
 //! Model-free packaging of an already built, exact-source owner probe.
 use super::{plain, write_json};
 use crate::{Result, bounded_input, hexagon_policy, identity, startup_process};
-use bonsai_artifacts::{hash_reader, is_redirect, validate_external_path};
+use bonsai_artifacts::{is_redirect, validate_external_path};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fs::{self, File},
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -55,24 +55,14 @@ fn require(valid: bool, message: &str) -> Result<()> {
 
 fn pin(path: &Path) -> Result<Value> {
     plain(path)?;
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    require(
-        metadata.is_file() && !is_redirect(&metadata),
-        "Source identity requires an ordinary file.",
-    )?;
-    let digest = hash_reader(&mut file, metadata.len(), &mut vec![0; 65536], &mut || {
-        Ok(())
-    })
-    .map_err(|error| error.to_string())?;
-    Ok(json!({"bytes":metadata.len(),"sha256":digest}))
+    let mut file = bounded_input::open_regular_file(path)?;
+    let bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    let (_, digest) = identity::hash_reader_checked(&mut file, Some(bytes), None, &mut || Ok(()))?;
+    Ok(json!({"bytes":bytes,"sha256":digest}))
 }
 fn read(path: &Path) -> Result<Value> {
-    let raw = bounded_input::read(
-        File::open(path).map_err(|error| error.to_string())?,
-        1_048_576,
-    )
-    .map_err(|error| error.into_message("Control JSON exceeds its byte bound."))?;
+    let raw =
+        bounded_input::read_regular_file(path, 1_048_576, "Control JSON exceeds its byte bound.")?;
     hexagon_policy::data_json(std::str::from_utf8(&raw).map_err(|error| error.to_string())?)
 }
 fn revision(git: &Path, source: &Path, scratch: &Path) -> Result<String> {

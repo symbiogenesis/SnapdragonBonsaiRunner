@@ -1,13 +1,13 @@
 //! Offline review of an independently selected Prism release and its exact source.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::identity::{Hasher, is_lower_hex};
-use bonsai_artifacts::{hash_reader, open_locked_file, validate_external_path};
+use bonsai_artifacts::{open_locked_file, validate_external_path};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zip::ZipArchive;
@@ -80,20 +80,13 @@ fn open_input(path: &Path, maximum: u64) -> crate::Result<File> {
 }
 
 fn bounded_bytes(reader: &mut impl Read, maximum: u64) -> crate::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .take(maximum + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if u64::try_from(bytes.len()).map_err(|error| error.to_string())? > maximum {
-        return Err("Release review input exceeded its byte bound.".into());
-    }
-    Ok(bytes)
+    crate::bounded_input::read(reader, maximum)
+        .map_err(|error| error.into_message("Release review input exceeded its byte bound."))
 }
 
 fn digest(reader: &mut impl Read, expected: u64) -> crate::Result<String> {
-    let mut buffer = vec![0; 65536].into_boxed_slice();
-    hash_reader(reader, expected, &mut buffer, &mut || Ok(())).map_err(|error| error.to_string())
+    crate::identity::hash_reader_checked(reader, Some(expected), None, &mut || Ok(()))
+        .map(|(_, digest)| digest)
 }
 
 fn validate_receipt(request: &Request, receipt: &Receipt) -> crate::Result<String> {
@@ -232,19 +225,9 @@ fn source_identity(file: &mut File, request: &Request, toolchain: &str) -> crate
             }
         } else {
             let channel = quoted_field(text, "toolchain", "channel")?;
-            let date = channel
-                .strip_prefix("nightly-")
+            let valid = crate::source_build::parse_nightly_channel(channel)
                 .ok_or("The source compiler pin is not an exact nightly.")?;
-            if date.len() != 10
-                || !date.bytes().enumerate().all(|(index, byte)| {
-                    if index == 4 || index == 7 {
-                        byte == b'-'
-                    } else {
-                        byte.is_ascii_digit()
-                    }
-                })
-                || toolchain != format!("{channel}-{TARGET}")
-            {
+            if toolchain != format!("{valid}-{TARGET}") {
                 return Err("The source compiler pin differs from the release receipt.".into());
             }
         }
@@ -368,19 +351,7 @@ fn write_new(path: &Path, value: &Value) -> crate::Result<()> {
             .ok_or("Candidate output needs a parent directory.")?,
     )
     .map_err(|error| error.to_string())?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(0).custom_flags(0x0020_0000);
-    }
-    let mut output = options.open(path).map_err(|error| error.to_string())?;
-    serde_json::to_writer_pretty(&mut output, value).map_err(|error| error.to_string())?;
-    output
-        .write_all(b"\n")
-        .and_then(|()| output.sync_all())
-        .map_err(|error| error.to_string())
+    crate::bounded_input::write_pretty_json_new(path, value)
 }
 
 /// Verify a reviewed source/archive pair and publish a new candidate lock only.
@@ -400,12 +371,13 @@ pub fn run(value: Value) -> crate::Result<Value> {
     if fs::exists(&request.output_path).map_err(|error| error.to_string())? {
         return Err("Use a new candidate lock output file.".into());
     }
-    let mut receipt_file = open_input(&request.receipt_path, MIB)?;
-    let encoded = bounded_bytes(&mut receipt_file, MIB)?;
-    let encoded = encoded
-        .strip_prefix(&[0xef, 0xbb, 0xbf])
-        .unwrap_or(&encoded);
-    let receipt: Value = serde_json::from_slice(encoded).map_err(|error| error.to_string())?;
+    let receipt_file = open_input(&request.receipt_path, MIB)?;
+    let encoded = crate::bounded_input::read_open_file(
+        receipt_file,
+        MIB,
+        "Release review input exceeded its byte bound.",
+    )?;
+    let receipt: Value = crate::bounded_input::read_json_bytes(&encoded)?;
     if !receipt.is_object()
         || !receipt["Archive"].is_object()
         || receipt["Files"]

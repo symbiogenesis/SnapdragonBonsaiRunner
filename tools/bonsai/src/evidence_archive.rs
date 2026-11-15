@@ -229,13 +229,14 @@ fn read_manifest(
     hold_directories(directory, &mut directories)?;
     let path = directory.join(MANIFEST);
     let input = open_locked_file(&path).map_err(safe_error)?;
-    let mut bytes = Vec::new();
-    input
-        .take(MANIFEST_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(safe_error)?;
+    let bytes = crate::bounded_input::read(input, MANIFEST_LIMIT).map_err(|error| match error {
+        crate::bounded_input::Error::Bound => {
+            "Evidence manifest differs from its independently retained identity.".into()
+        }
+        crate::bounded_input::Error::Io(error) => safe_error(error),
+    })?;
     let length = u64::try_from(bytes.len()).map_err(|_| "Evidence manifest length overflow.")?;
-    if length > MANIFEST_LIMIT || sha256(&bytes) != digest {
+    if sha256(&bytes) != digest {
         return Err("Evidence manifest differs from its independently retained identity.".into());
     }
     let guard = VerifiedFile::verify(&path, length, digest).map_err(safe_error)?;
@@ -327,30 +328,7 @@ fn create(path: &Path) -> crate::Result<File> {
 fn hold_directories(path: &Path, handles: &mut BTreeMap<PathBuf, File>) -> crate::Result<()> {
     external(path)?;
     // Hold ancestors from the root down before opening each descendant.
-    let ancestors = path.ancestors().collect::<Vec<_>>();
-    for ancestor in ancestors.into_iter().rev() {
-        if handles.contains_key(ancestor) {
-            continue;
-        }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            options
-                // Metadata-only handles do not prevent directory rename on the
-                // qualified host. LIST_DIRECTORY makes the sharing denial real.
-                .access_mode(0x81)
-                .share_mode(1)
-                .custom_flags(0x0220_0000);
-        }
-        let directory = options.open(ancestor).map_err(safe_error)?;
-        let metadata = directory.metadata().map_err(safe_error)?;
-        if !metadata.is_dir() || bonsai_artifacts::is_redirect(&metadata) {
-            return Err("Evidence destination ancestry must contain ordinary directories.".into());
-        }
-        handles.insert(ancestor.to_owned(), directory);
-    }
+    crate::bounded_input::hold_directory_chain(path, handles, true, 1).map_err(safe_error)?;
     external(path)?;
     Ok(())
 }
@@ -576,33 +554,6 @@ mod tests {
     }
 
     #[cfg(windows)]
-    struct Scratch(PathBuf);
-
-    #[cfg(windows)]
-    impl Scratch {
-        fn new() -> crate::Result<Self> {
-            let path = std::env::temp_dir().join(format!(
-                "Bonsai-Evidence-{}",
-                crate::startup_process::unique()
-            ));
-            external(&path)?;
-            fs::create_dir(&path).map_err(|error| error.to_string())?;
-            Ok(Self(path))
-        }
-    }
-
-    #[cfg(windows)]
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            // Only this freshly created child of the resolved temporary directory.
-            if self.0.parent() == Some(std::env::temp_dir().as_path()) && external(&self.0).is_ok()
-            {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-    }
-
-    #[cfg(windows)]
     fn seal(root: &Path) -> crate::Result<Value> {
         let source = root.join("source");
         fs::create_dir(&source).map_err(|error| error.to_string())?;
@@ -628,14 +579,14 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn evidence_archive_output_directory_guards_deny_replacement() -> crate::Result<()> {
-        let root = Scratch::new()?;
-        let child = root.0.join("destination");
+        let root = crate::bounded_input::ScratchDir::new("Bonsai-Evidence")?;
+        let child = root.join("destination");
         fs::create_dir(&child).map_err(|error| error.to_string())?;
         let mut guards = BTreeMap::new();
         hold_directories(&child, &mut guards)?;
-        assert!(fs::rename(&child, root.0.join("replaced")).is_err());
+        assert!(fs::rename(&child, root.join("replaced")).is_err());
         drop(guards);
-        fs::rename(child, root.0.join("replaced")).map_err(|error| error.to_string())?;
+        fs::rename(child, root.join("replaced")).map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -643,43 +594,43 @@ mod tests {
     #[cfg(windows)]
     fn evidence_archive_retrieves_exact_losing_bytes_without_original_runner() -> crate::Result<()>
     {
-        let root = Scratch::new()?;
-        let report = seal(&root.0)?;
+        let root = crate::bounded_input::ScratchDir::new("Bonsai-Evidence")?;
+        let report = seal(root.path())?;
         let digest = report["manifestSha256"]
             .as_str()
             .ok_or("Missing manifest digest.")?;
         assert_eq!(report["integrityVerified"], true);
         assert_eq!(report["qualificationGranted"], false);
         assert_eq!(report["files"], 2);
-        assert!(!root.0.join("archive/not-selected.txt").exists());
+        assert!(!root.join("archive/not-selected.txt").exists());
         let restored = run(
-            json!({"operation":"restore","directory":root.0.join("archive"),
-            "manifestSha256":digest,"outputDirectory":root.0.join("retrieved")}),
+            json!({"operation":"restore","directory":root.join("archive"),
+            "manifestSha256":digest,"outputDirectory":root.join("retrieved")}),
         )?;
         assert_eq!(restored["identities"], report["identities"]);
         // The independently retained digest works after the source capture is gone.
-        fs::rename(root.0.join("source"), root.0.join("unavailable-source"))
+        fs::rename(root.join("source"), root.join("unavailable-source"))
             .map_err(|error| error.to_string())?;
         assert_eq!(
             run(
-                json!({"operation":"verify","directory":root.0.join("retrieved"),
+                json!({"operation":"verify","directory":root.join("retrieved"),
             "manifestSha256":digest})
             )?["manifestSha256"],
             digest
         );
         assert_eq!(
-            fs::read(root.0.join("retrieved/observations/no-go.json"))
+            fs::read(root.join("retrieved/observations/no-go.json"))
                 .map_err(|error| error.to_string())?,
             b"{\"passed\":false}\r\n"
         );
         assert_eq!(
-            fs::read(root.0.join("archive").join(MANIFEST)).map_err(|error| error.to_string())?,
-            fs::read(root.0.join("retrieved").join(MANIFEST)).map_err(|error| error.to_string())?
+            fs::read(root.join("archive").join(MANIFEST)).map_err(|error| error.to_string())?,
+            fs::read(root.join("retrieved").join(MANIFEST)).map_err(|error| error.to_string())?
         );
         assert!(
             run(
-                json!({"operation":"restore","directory":root.0.join("archive"),
-            "manifestSha256":digest,"outputDirectory":root.0.join("retrieved")})
+                json!({"operation":"restore","directory":root.join("archive"),
+            "manifestSha256":digest,"outputDirectory":root.join("retrieved")})
             )
             .is_err()
         );
@@ -689,21 +640,21 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn evidence_archive_rejects_changed_missing_extra_and_unanchored_bytes() -> crate::Result<()> {
-        let root = Scratch::new()?;
-        let report = seal(&root.0)?;
-        let request = json!({"operation":"verify","directory":root.0.join("archive"),"manifestSha256":report["manifestSha256"]});
-        let path = root.0.join("archive/observations/no-go.json");
+        let root = crate::bounded_input::ScratchDir::new("Bonsai-Evidence")?;
+        let report = seal(root.path())?;
+        let request = json!({"operation":"verify","directory":root.join("archive"),"manifestSha256":report["manifestSha256"]});
+        let path = root.join("archive/observations/no-go.json");
         fs::write(&path, b"{\"passed\":true }\r\n").map_err(|error| error.to_string())?;
         assert!(run(request.clone()).is_err());
         fs::write(&path, b"{\"passed\":false}\r\n").map_err(|error| error.to_string())?;
-        fs::write(root.0.join("archive/extra.json"), []).map_err(|error| error.to_string())?;
+        fs::write(root.join("archive/extra.json"), []).map_err(|error| error.to_string())?;
         assert!(run(request.clone()).is_err());
-        fs::remove_file(root.0.join("archive/extra.json")).map_err(|error| error.to_string())?;
-        fs::remove_file(root.0.join("archive/empty.log")).map_err(|error| error.to_string())?;
+        fs::remove_file(root.join("archive/extra.json")).map_err(|error| error.to_string())?;
+        fs::remove_file(root.join("archive/empty.log")).map_err(|error| error.to_string())?;
         assert!(run(request.clone()).is_err());
-        fs::write(root.0.join("archive/empty.log"), []).map_err(|error| error.to_string())?;
-        assert!(run(json!({"operation":"verify","directory":root.0.join("archive"),"manifestSha256":"0".repeat(64)})).is_err());
-        let manifest = root.0.join("archive").join(MANIFEST);
+        fs::write(root.join("archive/empty.log"), []).map_err(|error| error.to_string())?;
+        assert!(run(json!({"operation":"verify","directory":root.join("archive"),"manifestSha256":"0".repeat(64)})).is_err());
+        let manifest = root.join("archive").join(MANIFEST);
         let mut bytes = fs::read(&manifest).map_err(|error| error.to_string())?;
         bytes.push(b' ');
         fs::write(manifest, bytes).map_err(|error| error.to_string())?;

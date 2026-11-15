@@ -5,7 +5,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use bonsai_artifacts::{ArtifactError, hash_reader, open_locked_file};
+use bonsai_artifacts::open_locked_file;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -61,10 +61,8 @@ fn verify_digest(
     if file.metadata().map_err(|error| error.to_string())?.len() != bytes {
         return Err("PTQ1 packing artifact length differs from its compiled identity.".into());
     }
-    let actual = hash_reader(file, bytes, &mut vec![0; BUFFER_BYTES], &mut || {
-        deadline.check().map_err(|_| ArtifactError::Cancelled)
-    })
-    .map_err(|error| error.to_string())?;
+    let (_, actual) =
+        crate::identity::hash_reader_checked(file, Some(bytes), None, &mut || deadline.check())?;
     deadline.check()?;
     if actual != hash {
         return Err("PTQ1 packing artifact SHA-256 differs from its compiled identity.".into());

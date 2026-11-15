@@ -82,13 +82,9 @@ struct Check {
 }
 
 fn parse(arguments: &[OsString]) -> Result<Options> {
-    let mut values = arguments.iter();
+    let mut cursor = crate::command::ArgCursor::new(arguments, USAGE);
     let mut options = Options {
-        command: values
-            .next()
-            .and_then(|value| value.to_str())
-            .ok_or(USAGE)?
-            .into(),
+        command: cursor.skip_command()?.into(),
         root: std::env::var_os("GITHUB_WORKSPACE")
             .map_or_else(std::env::current_dir, |path| Ok(path.into()))
             .map_err(|error| error.to_string())?,
@@ -106,8 +102,7 @@ fn parse(arguments: &[OsString]) -> Result<Options> {
     };
     let mut extra_phases = Vec::new();
     let mut full_tests = false;
-    while let Some(option) = values.next() {
-        let option = option.to_str().ok_or(USAGE)?;
+    while let Some(option) = cursor.next_flag()? {
         if options.command == "rust-select" && option != "--root" {
             return Err(USAGE.into());
         }
@@ -119,10 +114,7 @@ fn parse(arguments: &[OsString]) -> Result<Options> {
             }
             "--build" => extra_phases.push("build".into()),
             "--github-release" => options.github_release = true,
-            _ => {
-                let value = values.next().ok_or(USAGE)?;
-                parse_value(&mut options, option, value)?;
-            }
+            _ => parse_value(&mut options, option, cursor.next_os()?)?,
         }
     }
     if options.phases.is_empty() {
@@ -227,9 +219,11 @@ fn identifier(value: &str) -> bool {
 }
 
 fn registry(root: &Path) -> Result<Vec<Package>> {
-    let registry: Registry = serde_json::from_slice(
-        &fs::read(root.join("config/rust-packages.json")).map_err(|error| error.to_string())?,
-    )
+    let registry: Registry = serde_json::from_slice(&crate::impact::workspace::read_bounded(
+        &root.join("config/rust-packages.json"),
+        4 * 1024 * 1024,
+        "Rust package registry exceeds its byte bound.",
+    )?)
     .map_err(|error| error.to_string())?;
     let mut names = BTreeSet::new();
     for package in &registry.packages {

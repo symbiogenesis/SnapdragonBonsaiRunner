@@ -97,15 +97,10 @@ struct WorkflowReceipt {
     sources: Vec<Source>,
 }
 
+use crate::impact::workspace::is_lower_hex as lower_hex;
+
 fn require(condition: bool, message: &str) -> Result<()> {
     condition.then_some(()).ok_or_else(|| message.into())
-}
-
-fn lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn packages_match(packages: &[String]) -> bool {
@@ -384,13 +379,13 @@ fn output_fixtures() -> Result<u32> {
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
-    require(
-        arguments.len() == 3 && arguments[1] == "--json",
-        "Use native-acceptance-guard --json REQUEST.",
-    )?;
-    let request = arguments[2]
-        .to_str()
-        .ok_or("Guard request must be UTF-8.")?;
+    const USAGE: &str = "Use native-acceptance-guard --json REQUEST.";
+    let mut cursor = super::ArgCursor::new(arguments, USAGE);
+    cursor.skip_command()?;
+    cursor.expect_flag("--json")?;
+    let request_os = cursor.next_os()?;
+    cursor.finish()?;
+    let request = request_os.to_str().ok_or("Guard request must be UTF-8.")?;
     require(
         request.len() <= 1024 * 1024,
         "Guard request exceeds its one-MiB bound.",

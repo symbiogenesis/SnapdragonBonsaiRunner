@@ -2,14 +2,14 @@
 
 use super::{plain, write_json};
 use crate::{Result, startup_process};
-use bonsai_artifacts::validate_external_path;
 #[cfg(any(windows, test))]
-use bonsai_artifacts::{hash_reader, is_redirect};
+use bonsai_artifacts::is_redirect;
+use bonsai_artifacts::validate_external_path;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(any(windows, test))]
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 #[cfg(any(windows, test))]
 use std::io::Seek as _;
 use std::path::{Path, PathBuf};
@@ -85,16 +85,9 @@ fn package(path: Option<&Path>) -> Result<Value> {
         if bytes > 128 * 1024 * 1024 || total > 256 * 1024 * 1024 {
             return Err("Package hashing exceeds its per-file or aggregate byte bound.".into());
         }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            options.share_mode(1).custom_flags(0x0020_0000);
-        }
-        let mut file = options.open(&path).map_err(|error| error.to_string())?;
-        let digest = hash_reader(&mut file, bytes, &mut vec![0; 65_536], &mut || Ok(()))
-            .map_err(|error| error.to_string())?;
+        let mut file = crate::bounded_input::open_regular_file(&path)?;
+        let (_, digest) =
+            crate::identity::hash_reader_checked(&mut file, Some(bytes), None, &mut || Ok(()))?;
         file.rewind().map_err(|error| error.to_string())?;
         let extension = path
             .extension()

@@ -111,49 +111,16 @@ fn ordinary(path: &Path) -> crate::Result<()> {
 }
 
 pub(crate) fn input_file(path: &Path) -> crate::Result<fs::File> {
-    if !path.is_absolute()
-        || path
-            .to_str()
-            .is_none_or(|value| value.contains(['%', '\0']))
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-    {
-        return Err("Build inputs must use expanded absolute paths.".into());
-    }
-    for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor).map_err(|error| error.to_string())?;
-        if is_redirect(&metadata) {
-            return Err("Build inputs must not traverse redirected paths.".into());
-        }
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(1).custom_flags(0x0020_0000);
-    }
-    let file = options.open(path).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file() || is_redirect(&metadata) {
-        return Err("Build inputs must be ordinary files.".into());
-    }
-    Ok(file)
+    crate::bounded_input::open_plain_regular_file(path)
 }
 
 fn read_json(path: &Path) -> crate::Result<Value> {
-    let file = input_file(path)?;
-    let mut bytes = Vec::new();
-    file.take(u64::try_from(RECEIPT_LIMIT + 1).map_err(|error| error.to_string())?)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() > RECEIPT_LIMIT {
-        return Err("Build input exceeds its fixed byte bound.".into());
-    }
+    let limit = u64::try_from(RECEIPT_LIMIT).map_err(|error| error.to_string())?;
+    let bytes = crate::bounded_input::read_open_file(
+        input_file(path)?,
+        limit,
+        "Build input exceeds its fixed byte bound.",
+    )?;
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 

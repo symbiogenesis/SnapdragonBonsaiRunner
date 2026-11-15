@@ -45,19 +45,23 @@ pub(crate) fn channel(repository: &Path) -> crate::Result<String> {
             (name.trim() == "channel").then(|| value.trim().trim_matches('"'))
         })
         .ok_or("Source builds require the repository-pinned Rust compiler.")?;
-    if value.len() != 18
-        || !value.starts_with("nightly-")
-        || !value[8..].bytes().enumerate().all(|(index, byte)| {
+    let value = parse_nightly_channel(value)
+        .ok_or("Source builds require a dated nightly compiler pin.")?;
+    Ok(format!("{value}-aarch64-pc-windows-msvc"))
+}
+
+/// Validates and returns an exact `nightly-YYYY-MM-DD` toolchain channel pin.
+pub(crate) fn parse_nightly_channel(channel: &str) -> Option<&str> {
+    let date = channel.strip_prefix("nightly-")?;
+    (date.len() == 10
+        && date.bytes().enumerate().all(|(index, byte)| {
             if matches!(index, 4 | 7) {
                 byte == b'-'
             } else {
                 byte.is_ascii_digit()
             }
-        })
-    {
-        return Err("Source builds require a dated nightly compiler pin.".into());
-    }
-    Ok(format!("{value}-aarch64-pc-windows-msvc"))
+        }))
+    .then_some(channel)
 }
 
 pub(crate) fn cache_key(repository: &Path, channel: &str) -> String {

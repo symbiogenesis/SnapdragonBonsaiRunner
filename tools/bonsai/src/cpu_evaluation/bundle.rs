@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Read as _,
     path::{Component, Path, PathBuf},
 };
 
@@ -184,7 +183,7 @@ fn bytes(path: &Path, maximum: u64) -> Result<Vec<u8>> {
         .map_err(|error| error.into_message("Input grew beyond bound."))
 }
 fn json_bytes(raw: &[u8]) -> Result<Value> {
-    super::source_comparison::json_bytes(raw.strip_prefix(&[239, 187, 191]).unwrap_or(raw))
+    super::source_comparison::json_bytes(crate::bounded_input::strip_utf8_bom(raw))
 }
 fn read(path: &Path) -> Result<Value> {
     let value = json_bytes(&bytes(path, 4_194_304)?)?;
@@ -194,16 +193,8 @@ fn read(path: &Path) -> Result<Value> {
 fn digest(path: &Path) -> Result<String> {
     reject_redirects(path)?;
     let mut file = crate::build_tools::input_file(path)?;
-    let mut hasher = crate::identity::Hasher::new()?;
-    let mut buffer = vec![0; 65_536].into_boxed_slice();
-    loop {
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count])?;
-    }
-    hasher.finalize_hex()
+    crate::identity::hash_reader_checked(&mut file, None, None, &mut || Ok(()))
+        .map(|(_, digest)| digest)
 }
 fn checked(root: &Path, reference: &Value, seen: &mut BTreeSet<PathBuf>) -> Result<Value> {
     keys(reference, &["path", "sha256"])?;

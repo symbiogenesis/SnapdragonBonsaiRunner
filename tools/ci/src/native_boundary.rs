@@ -9,6 +9,7 @@ use super::native_source_inventory::{
     digest, lower_hex, plain_ancestors, plain_metadata, read_bounded,
 };
 use crate::Result;
+use crate::impact::workspace::validate_repo_relative_path as ordinary_path;
 
 const USAGE: &str =
     "Usage: bonsai-ci native-boundary-verify --root PATH --manifest PATH --expected-sha256 SHA256";
@@ -52,31 +53,6 @@ struct Manifest {
     families: Vec<Family>,
     files: Vec<Entry>,
     edges: Vec<Entry>,
-}
-
-fn ordinary_path(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 1024
-        && value.is_ascii()
-        && !value.bytes().any(|byte| byte.is_ascii_control())
-        && !value.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
-        && value.split('/').all(|part| {
-            let stem = part.split('.').next().unwrap_or_default();
-            let reserved = ["CON", "PRN", "AUX", "NUL"]
-                .iter()
-                .any(|name| stem.eq_ignore_ascii_case(name))
-                || matches!(
-                    stem.as_bytes(),
-                    [prefix @ .., b'1'..=b'9']
-                        if prefix.eq_ignore_ascii_case(b"COM")
-                            || prefix.eq_ignore_ascii_case(b"LPT")
-                );
-            !part.is_empty()
-                && part != "."
-                && part != ".."
-                && !part.ends_with(['.', ' '])
-                && !reserved
-        })
 }
 
 fn native_path(path: &Path) -> bool {
@@ -249,19 +225,12 @@ fn verify(root: &Path, manifest: &Manifest) -> Result<serde_json::Value> {
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
-    if arguments.len() != 7
-        || arguments[1] != "--root"
-        || arguments[3] != "--manifest"
-        || arguments[5] != "--expected-sha256"
-    {
-        return Err(USAGE.into());
-    }
-    let root = Path::new(&arguments[2]);
-    let path = Path::new(&arguments[4]);
-    let expected = arguments[6]
-        .to_str()
-        .filter(|value| lower_hex(value, 64))
-        .ok_or(USAGE)?;
+    let mut cursor = super::ArgCursor::new(arguments, USAGE);
+    cursor.skip_command()?;
+    let root = cursor.expect_path("--root")?;
+    let path = cursor.expect_path("--manifest")?;
+    let expected = cursor.expect_hex("--expected-sha256", 64)?;
+    cursor.finish()?;
     if !path.is_absolute() {
         return Err("Native boundary requires an absolute manifest path.".into());
     }

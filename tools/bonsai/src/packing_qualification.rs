@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::{Read as _, Write as _},
+    io::Read as _,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -110,33 +110,13 @@ fn external(path: &Path) -> crate::Result<()> {
     validate_external_path(path).map_err(|error| error.to_string())
 }
 
-struct Temporary(PathBuf);
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
 fn save(path: &Path, value: &Value) -> crate::Result<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_RECEIPT {
         return Err("Packing qualification receipt exceeds one MiB.".into());
     }
     external(path)?;
-    let temporary =
-        Temporary(path.with_extension(format!("{}.tmp", crate::startup_process::unique())));
-    external(&temporary.0)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary.0)
-        .map_err(|error| error.to_string())?;
-    output
-        .write_all(&bytes)
-        .and_then(|()| output.sync_all())
-        .map_err(|error| error.to_string())?;
-    drop(output);
-    fs::rename(&temporary.0, path).map_err(|error| error.to_string())
+    crate::bounded_input::write_atomic_synced(path, &bytes)
 }
 
 fn partial(path: &Path, expected: u64) -> Value {
@@ -209,44 +189,23 @@ fn runtime_directory(data: &Path, runtime: &Value) -> crate::Result<PathBuf> {
 }
 
 fn retained_runtime(directory: &Path, runtime: &Value) -> crate::Result<Vec<VerifiedFile>> {
-    external(directory)?;
     let pins = runtime["files"]
         .as_array()
         .ok_or("Missing runtime inventory.")?;
-    let mut names = BTreeSet::new();
-    let mut guards = Vec::new();
+    let mut specs = Vec::with_capacity(pins.len());
     for pin in pins {
-        let name = text(pin, "name")?;
-        if !names.insert(name) || Path::new(name).components().count() != 1 {
-            return Err("Invalid runtime inventory.".into());
-        }
-        let path = directory.join(name);
-        guards.push(
-            VerifiedFile::verify(&path, count(pin, "bytes")?, text(pin, "sha256")?)
-                .map_err(|error| error.to_string())?,
-        );
-        if Path::new(name)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
-        {
-            crate::startup_cache::assert_arm64(&path)?;
-        }
+        specs.push(crate::provision::InstalledInferenceFile {
+            name: text(pin, "name")?,
+            bytes: count(pin, "bytes")?,
+            sha256: text(pin, "sha256")?,
+        });
     }
-    let entries = fs::read_dir(directory)
-        .map_err(|error| error.to_string())?
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|error| error.to_string())?;
-    if entries.len() != names.len()
-        || entries.iter().any(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_none_or(|name| !names.contains(name))
-        })
-    {
-        return Err("Installed inference inventory differs from its compiled lock.".into());
-    }
-    Ok(guards)
+    crate::provision::verify_installed_inference(
+        directory,
+        specs,
+        &mut || Ok(()),
+        "Installed inference inventory differs from its compiled lock.",
+    )
 }
 
 fn stage_runtime(data: &Path, runtime: &Value, archive_path: &Path) -> crate::Result<()> {

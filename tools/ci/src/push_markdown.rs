@@ -526,33 +526,13 @@ fn verify_destination(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
-
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
-            let path = fs::canonicalize(std::env::temp_dir())?.join(format!(
-                "Bonsai-PushMarkdown-{}-{}",
-                std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-            ));
-            fs::create_dir(&path)?;
-            Ok(Self(path))
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    type Scratch = crate::impact::workspace::ScratchDir;
 
     #[test]
     fn push_markdown_detects_unclosed_fences_and_ignores_code_links() -> TestResult {
-        let scratch = Scratch::new()?;
+        let scratch = Scratch::new("Bonsai-PushMarkdown")?;
         fs::create_dir_all(scratch.0.join("docs"))?;
         fs::write(scratch.0.join("docs/real.md"), "# Real\n")?;
         fs::write(

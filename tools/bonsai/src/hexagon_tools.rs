@@ -5,11 +5,11 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Seek as _, Write as _};
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bonsai_artifacts::{hash_reader, is_redirect, validate_external_path};
+use bonsai_artifacts::{is_redirect, validate_external_path};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -149,40 +149,18 @@ fn plain(path: &Path) -> Result<()> {
 
 fn hold(path: &Path, maximum: u64) -> Result<(File, String)> {
     plain(path)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(1).custom_flags(0x0020_0000);
-    }
-    let mut file = options.open(path).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file()
-        || is_redirect(&metadata)
-        || metadata.len() == 0
-        || metadata.len() > maximum
-    {
+    let mut file = crate::bounded_input::open_regular_file(path)?;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    if length == 0 || length > maximum {
         return Err("Hexagon input exceeds its fixed file bound.".into());
     }
-    let digest = hash_reader(&mut file, metadata.len(), &mut vec![0; 65_536], &mut || {
-        Ok(())
-    })
-    .map_err(|error| error.to_string())?;
+    let (_, digest) = identity::hash_reader_checked(&mut file, Some(length), None, &mut || Ok(()))?;
     file.rewind().map_err(|error| error.to_string())?;
     Ok((file, digest))
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    serde_json::to_writer_pretty(&mut file, value).map_err(|error| error.to_string())?;
-    file.write_all(b"\n")
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())
+    crate::bounded_input::write_pretty_json_new(path, value)
 }
 
 impl Context {

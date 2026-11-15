@@ -1,12 +1,7 @@
 //! Typed shared regression selection with complete admission before execution.
 use crate::Result;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet,
-    ffi::OsString,
-    io::Read as _,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, ffi::OsString, path::PathBuf};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -42,17 +37,6 @@ struct Control {
     expected_passed: Option<u32>,
 }
 
-fn normalized(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_uppercase()
-}
-fn overlapping(a: &Path, b: &Path) -> bool {
-    let a = normalized(a);
-    let b = normalized(b);
-    a == b || a.starts_with(&(b.clone() + "\\")) || b.starts_with(&(a + "\\"))
-}
 fn name(value: &str, colon: bool) -> bool {
     value.len() <= 1024
         && value
@@ -67,7 +51,7 @@ fn plan(request: &Request) -> Result<Vec<Control>> {
     if !request.root.is_absolute()
         || !request.target_directory.is_absolute()
         || request.target_directory.to_string_lossy().contains('%')
-        || overlapping(&request.root, &request.target_directory)
+        || crate::impact::workspace::paths_overlap(&request.root, &request.target_directory)
     {
         return Err("Regression build outputs must be external and not overlap source.".into());
     }
@@ -82,20 +66,12 @@ fn plan(request: &Request) -> Result<Vec<Control>> {
     {
         return Err("Invalid regression package.".into());
     }
-    let date = request
+    let channel = request
         .toolchain
-        .strip_prefix("nightly-")
-        .and_then(|s| s.strip_suffix("-aarch64-pc-windows-msvc"))
+        .strip_suffix("-aarch64-pc-windows-msvc")
+        .filter(|value| value.starts_with("nightly-"))
         .ok_or("An explicit native compiler is required.")?;
-    if date.len() != 10
-        || !date.bytes().enumerate().all(|(index, b)| {
-            if [4, 7].contains(&index) {
-                b == b'-'
-            } else {
-                b.is_ascii_digit()
-            }
-        })
-    {
+    if !crate::impact::workspace::is_dated_nightly_channel(channel) {
         return Err("Invalid native compiler pin.".into());
     }
     match request.target_kind.as_str() {
@@ -278,30 +254,38 @@ fn execute(request: &Request, controls: &[Control]) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn raw_stdout(path: &Path) -> Result<String> {
+fn raw_stdout(path: &std::path::Path) -> Result<String> {
     String::from_utf8(super::execute::read_log(path)?).map_err(|error| error.to_string())
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
-    let mut raw = Vec::new();
-    match &arguments[1..] {
-        [option, source] if option == "--request" && source == "-" => {
-            std::io::stdin()
-                .take(1_048_577)
-                .read_to_end(&mut raw)
-                .map_err(|e| e.to_string())?;
+    const USAGE: &str = "Use native-regressions --request - or --json OBJECT.";
+    let mut cursor = crate::command::ArgCursor::new(arguments, USAGE);
+    cursor.skip_command()?;
+    let raw = match cursor.next_str()? {
+        "--request" => {
+            cursor.expect_flag("-")?;
+            crate::impact::workspace::read_bounded_reader(
+                std::io::stdin(),
+                1_048_576,
+                "Regression request exceeds byte bound.",
+            )?
         }
-        [option, source] if option == "--json" => raw.extend_from_slice(
-            source
+        "--json" => {
+            let bytes = cursor
+                .next_os()?
                 .to_str()
                 .ok_or("Regression request must be Unicode.")?
-                .as_bytes(),
-        ),
-        _ => return Err("Use native-regressions --request - or --json OBJECT.".into()),
-    }
-    if raw.len() > 1_048_576 {
-        return Err("Regression request exceeds byte bound.".into());
-    }
+                .as_bytes()
+                .to_vec();
+            if bytes.len() > 1_048_576 {
+                return Err("Regression request exceeds byte bound.".into());
+            }
+            bytes
+        }
+        _ => return Err(USAGE.into()),
+    };
+    cursor.finish()?;
     let request: Request = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     let controls = plan(&request)?;
     if request.plan_only {
@@ -323,19 +307,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn captured_stdout_preserves_whitespace_before_result_admission() -> Result<()> {
-        use std::{
-            fs,
-            io::Write as _,
-            time::{SystemTime, UNIX_EPOCH},
-        };
-        let serial = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "bonsai-regression-output-{}-{serial}",
-            std::process::id()
-        ));
+        use std::{fs, io::Write as _};
+        let scratch = crate::impact::workspace::ScratchDir::new("bonsai-regression-output")?;
+        let path = scratch.join("output.txt");
         let raw = "  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
         fs::OpenOptions::new()
             .write(true)
@@ -344,7 +318,6 @@ mod tests {
             .and_then(|mut file| file.write_all(raw.as_bytes()))
             .map_err(|e| e.to_string())?;
         let output = raw_stdout(&path)?;
-        fs::remove_file(path).map_err(|e| e.to_string())?;
         assert_eq!(output, raw);
         assert!(selected(&plan(&fixture())?, |_| Ok((0, output.clone()))).is_err());
         Ok(())

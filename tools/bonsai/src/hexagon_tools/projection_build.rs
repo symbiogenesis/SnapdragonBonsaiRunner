@@ -299,28 +299,8 @@ mod tests {
         use crate::{startup_cache, startup_process};
         use std::time::Duration;
 
-        struct Scratch(PathBuf);
-
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                if let Ok(parent) = fs::canonicalize(std::env::temp_dir())
-                    && let Ok(target) = fs::canonicalize(&self.0)
-                    && target.parent() == Some(parent.as_path())
-                    && fs::symlink_metadata(&self.0)
-                        .is_ok_and(|metadata| !bonsai_artifacts::is_redirect(&metadata))
-                {
-                    let _ = fs::remove_dir_all(&self.0);
-                }
-            }
-        }
-
-        fn fixture() -> Result<Scratch> {
-            let path = std::env::temp_dir().join(format!(
-                "Bonsai projection Cargo {}",
-                startup_process::unique()
-            ));
-            fs::create_dir(&path).map_err(|error| error.to_string())?;
-            let scratch = Scratch(path);
+        fn fixture() -> Result<crate::bounded_input::ScratchDir> {
+            let scratch = crate::bounded_input::ScratchDir::new("Bonsai projection Cargo")?;
             for (name, source) in [
                 (
                     "Cargo.toml",
@@ -385,7 +365,7 @@ mod tests {
                 ),
                 ("support/sha2/src/lib.rs", "pub fn marker() {}\n"),
             ] {
-                let path = scratch.0.join(name);
+                let path = scratch.join(name);
                 fs::create_dir_all(path.parent().ok_or("Missing fixture directory.")?)
                     .and_then(|()| fs::write(path, source))
                     .map_err(|error| error.to_string())?;
@@ -479,8 +459,8 @@ mod tests {
                     "linker-flavor=lld-link"
                 ]
             );
-            let target = scratch.0.join("target");
-            check_fixture_dependencies(&cargo, &scratch.0, &target, &environment)?;
+            let target = scratch.join("target");
+            check_fixture_dependencies(&cargo, scratch.path(), &target, &environment)?;
             let built = startup_process::run_strict(
                 cargo.as_os_str(),
                 &[
@@ -493,10 +473,10 @@ mod tests {
                     "--target-dir".into(),
                     target.clone().into_os_string(),
                 ],
-                &scratch.0,
+                scratch.path(),
                 &environment,
                 Duration::from_secs(45),
-                &scratch.0.join("cargo-build.txt"),
+                &scratch.join("cargo-build.txt"),
             )?;
             assert_eq!(built.code, 0, "{}", built.stderr);
             let executable = target
@@ -506,10 +486,10 @@ mod tests {
             let checked = startup_process::run_strict(
                 executable.as_os_str(),
                 &[],
-                &scratch.0,
+                scratch.path(),
                 &BTreeMap::new(),
                 Duration::from_secs(5),
-                &scratch.0.join("control.txt"),
+                &scratch.join("control.txt"),
             )?;
             assert_eq!(checked.code, 0, "{}", checked.stderr);
             Ok(())

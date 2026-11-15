@@ -2,25 +2,17 @@
 
 use super::*;
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::fs;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-struct Scratch(PathBuf);
+struct Scratch(crate::impact::workspace::ScratchDir);
 
 impl Scratch {
     fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let path = fs::canonicalize(std::env::temp_dir())?.join(format!(
-            "Bonsai-NativeCollect-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::create_dir(&path)?;
-        Ok(Self(path))
+        Ok(Self(crate::impact::workspace::ScratchDir::new(
+            "Bonsai-NativeCollect",
+        )?))
     }
 
     fn path(&self, name: &str) -> String {
@@ -70,7 +62,7 @@ impl Scratch {
         fs::write(
             self.path("compile_commands.json"),
             serde_json::to_vec(&json!([{
-                "directory":self.0, "file":self.path("input.c"), "arguments":arguments,
+                "directory":self.0.path(), "file":self.path("input.c"), "arguments":arguments,
                 "output":self.path("input.obj")
             }]))?,
         )?;
@@ -78,7 +70,7 @@ impl Scratch {
             "path":self.path("intermediate"), "origin":"generated", "generation":{
                 "generator":self.path("generate"),
                 "arguments":[self.path("generate"), self.path("value")],
-                "workingDirectory":self.0, "exitCode":0,
+                "workingDirectory":self.0.path(), "exitCode":0,
                 "inputs":[{"path":self.path("value"), "origin":"source"}]
             }
         });
@@ -86,11 +78,11 @@ impl Scratch {
             "path":self.path("generated.h"), "origin":"generated", "generation":{
                 "generator":self.path("generate"),
                 "arguments":[self.path("generate"), self.path("intermediate")],
-                "workingDirectory":self.0, "exitCode":0, "inputs":[intermediate]
+                "workingDirectory":self.0.path(), "exitCode":0, "inputs":[intermediate]
             }
         });
         let unit = json!({
-            "source":self.path("input.c"), "workingDirectory":self.0,
+            "source":self.path("input.c"), "workingDirectory":self.0.path(),
             "arguments":arguments, "preprocessingArguments":[self.path("clang"),
                 "-E", self.path("input.c"), "-o", self.path("input.i")],
             "compilerExitCode":0, "preprocessorExitCode":0,
@@ -105,18 +97,6 @@ impl Scratch {
             "configuration":"literal collection control", "compiler":self.path("clang"),
             "compilationDatabase":self.path("compile_commands.json"), "units":[unit]
         }))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Ok(parent) = fs::canonicalize(std::env::temp_dir())
-            && self.0.parent() == Some(parent.as_path())
-            && fs::symlink_metadata(&self.0)
-                .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-        {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
 }
 
@@ -178,7 +158,7 @@ fn native_source_collect_clang_cl_retains_original_database_arguments() -> TestR
     fs::write(
         scratch.path("compile_commands.json"),
         serde_json::to_vec(&json!([{
-            "directory":scratch.0, "file":scratch.path("input.c"), "arguments":arguments,
+            "directory":scratch.0.path(), "file":scratch.path("input.c"), "arguments":arguments,
             "output":scratch.path("input.obj")
         }]))?,
     )?;

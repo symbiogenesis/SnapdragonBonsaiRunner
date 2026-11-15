@@ -20,27 +20,13 @@ pub(super) fn selected(arguments: &[OsString]) -> bool {
 
 #[cfg(windows)]
 pub(super) fn toolchain(root: &Path) -> Result<String> {
-    let pin: toml::Value = toml::from_str(
-        &std::fs::read_to_string(root.join("rust-toolchain.toml"))
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let channel = pin
-        .get("toolchain")
-        .and_then(|value| value.get("channel"))
-        .and_then(toml::Value::as_str)
-        .filter(|channel| {
-            channel.len() == 18
-                && channel.starts_with("nightly-")
-                && channel.bytes().enumerate().skip(8).all(|(index, byte)| {
-                    if matches!(index, 12 | 15) {
-                        byte == b'-'
-                    } else {
-                        byte.is_ascii_digit()
-                    }
-                })
-        })
-        .ok_or("Push formatting requires the outgoing source's dated compiler pin.")?;
+    let channel = crate::impact::workspace::pinned_toolchain_channel(root).map_err(|error| {
+        if error == "Toolchain pin requires a dated nightly channel." {
+            "Push formatting requires the outgoing source's dated compiler pin.".into()
+        } else {
+            error
+        }
+    })?;
     Ok(format!("{channel}-aarch64-pc-windows-msvc"))
 }
 

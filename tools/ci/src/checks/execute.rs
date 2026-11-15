@@ -365,14 +365,11 @@ fn digest(path: &Path) -> Result<String> {
 
 pub(super) fn read_log(path: &Path) -> Result<Vec<u8>> {
     let file = File::open(path).map_err(|error| error.to_string())?;
-    let mut bytes = Vec::new();
-    file.take(MAX_LOG_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if u64::try_from(bytes.len()).map_err(|error| error.to_string())? > MAX_LOG_BYTES {
-        return Err("Rust command output exceeded its byte limit.".into());
-    }
-    Ok(bytes)
+    crate::impact::workspace::read_bounded_reader(
+        file,
+        MAX_LOG_BYTES,
+        "Rust command output exceeded its byte limit.",
+    )
 }
 
 pub(in crate::command) fn command(

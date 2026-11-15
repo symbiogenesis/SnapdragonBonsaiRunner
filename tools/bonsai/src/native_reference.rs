@@ -1,8 +1,7 @@
 //! Bounded native-reference format admission and complete-state comparisons.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize as _;
@@ -117,32 +116,12 @@ fn decode(bytes: &[u8]) -> crate::Result<Value> {
 }
 
 fn read(path: &Path, maximum: u64) -> crate::Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    require(
-        metadata.is_file() && !redirected(&metadata),
-        "redirected or non-file reference input",
-    )?;
-    require(
-        metadata.len() <= maximum,
-        "reference input exceeds byte bound",
-    )?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(1);
+    let file = crate::bounded_input::open_regular_file(path)?;
+    if file.metadata().map_err(|error| error.to_string())?.len() > maximum {
+        return Err("reference input exceeds byte bound".into());
     }
-    let file = options.open(path).map_err(|error| error.to_string())?;
-    let mut bytes = Vec::new();
-    file.take(maximum + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    require(
-        u64::try_from(bytes.len()).map_err(|error| error.to_string())? <= maximum,
-        "reference input grew beyond byte bound",
-    )?;
-    Ok(bytes)
+    crate::bounded_input::read(file, maximum)
+        .map_err(|error| error.into_message("reference input grew beyond byte bound"))
 }
 
 fn read_json(path: &Path, maximum: u64) -> crate::Result<Value> {
@@ -168,17 +147,7 @@ fn read_match(
 }
 
 fn write_json(path: &Path, value: &Value) -> crate::Result<()> {
-    let temporary = path.with_extension(format!("{}.partial", crate::startup_process::unique()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| error.to_string())?;
-    serde_json::to_writer_pretty(&mut file, value).map_err(|error| error.to_string())?;
-    file.write_all(b"\n")
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    fs::rename(&temporary, path).map_err(|error| error.to_string())
+    crate::bounded_input::write_pretty_json_atomic(path, value)
 }
 
 fn digest(path: &Path) -> crate::Result<String> {
@@ -190,17 +159,7 @@ fn digest_reader(
     file: &mut File,
     checkpoint: &mut dyn FnMut() -> crate::Result<()>,
 ) -> crate::Result<String> {
-    let mut hash = crate::identity::Hasher::new()?;
-    let mut buffer = vec![0_u8; 1_048_576];
-    loop {
-        checkpoint()?;
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count])?;
-    }
-    hash.finalize_hex()
+    crate::identity::hash_reader_checked(file, None, None, checkpoint).map(|(_, digest)| digest)
 }
 
 fn redirected(metadata: &fs::Metadata) -> bool {
@@ -522,15 +481,7 @@ pub fn run(request: &Value) -> crate::Result<Value> {
         _ => return Err("Unknown native reference operation.".into()),
     };
     if let Some(output) = output {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(output)
-            .map_err(|error| error.to_string())?;
-        serde_json::to_writer_pretty(&mut file, &report).map_err(|error| error.to_string())?;
-        file.write_all(b"\n")
-            .and_then(|()| file.sync_all())
-            .map_err(|error| error.to_string())?;
+        crate::bounded_input::write_pretty_json_new(Path::new(output), &report)?;
     }
     Ok(report)
 }

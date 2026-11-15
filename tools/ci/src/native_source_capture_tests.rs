@@ -4,22 +4,13 @@ use super::*;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-struct Scratch(PathBuf);
+struct Scratch(crate::impact::workspace::ScratchDir);
 
 impl Scratch {
     fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let temp = fs::canonicalize(std::env::temp_dir())?;
-        let temp_text = temp.to_string_lossy();
-        // Native process ownership deliberately rejects verbatim path prefixes;
-        // use the same ordinary drive syntax required of real capture callers.
-        let temp = PathBuf::from(temp_text.strip_prefix("\\\\?\\").unwrap_or(&temp_text));
-        let root = temp.join(format!(
-            "Bonsai-NativeExecution-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
-        ));
-        fs::create_dir(&root)?;
-        Ok(Self(root))
+        Ok(Self(crate::impact::workspace::ScratchDir::new(
+            "Bonsai-NativeExecution",
+        )?))
     }
 
     fn path(&self, name: &str) -> String {
@@ -43,7 +34,7 @@ impl Scratch {
             "outputDirectory":output, "environment":{},
             "clock":{"startedUnixMilliseconds":1000,"startedTick":1000,"tickFrequency":1000,"maximumSeconds":300,"estimatedTotalSeconds":240},
             "units":[{
-                "source":self.path("source.c"), "workingDirectory":self.0,
+                "source":self.path("source.c"), "workingDirectory":self.0.path(),
                 "arguments":[self.path("clang-cl.exe"),"--target=aarch64-pc-windows-msvc","/MD","/c",
                     format!("/Fo{}",path("source.obj")), "/clang:-MD",
                     format!("/clang:-MF{}",path("source.d")),
@@ -54,17 +45,6 @@ impl Scratch {
                 "inputs":[{"path":self.path("source.c"),"origin":"source"}]
             }]
         }))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if fs::canonicalize(&self.0).is_ok_and(|path| {
-            fs::canonicalize(std::env::temp_dir())
-                .is_ok_and(|temp| path.parent() == Some(temp.as_path()))
-        }) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
 }
 

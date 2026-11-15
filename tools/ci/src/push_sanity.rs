@@ -1,7 +1,6 @@
 //! Bounded source sanity against Git's immutable outgoing ref tips.
 
 use std::ffi::OsString;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
@@ -230,36 +229,31 @@ pub(super) fn canonical_path(path: PathBuf) -> Result<PathBuf> {
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
-    if !matches!(arguments.len(), 3 | 5 | 7)
-        || arguments[1] != "--root"
-        || (arguments.len() >= 5 && arguments[3] != "--policy-root")
-        || (arguments.len() == 7 && arguments[5] != "--bootstrap-milliseconds")
-    {
-        return Err(USAGE.into());
+    let mut cursor = super::ArgCursor::new(arguments, USAGE);
+    cursor.skip_command()?;
+    let root = canonical_path(PathBuf::from(cursor.expect_path("--root")?))?;
+    let mut policy = None;
+    let mut bootstrap_milliseconds = 0_u64;
+    if let Some(flag) = cursor.next_flag()? {
+        if flag != "--policy-root" {
+            return Err(USAGE.into());
+        }
+        policy = Some(canonical_path(cursor.next_path()?)?);
     }
-    let root = canonical_path(PathBuf::from(&arguments[2]))?;
-    let policy = if arguments.len() >= 5 {
-        canonical_path(PathBuf::from(&arguments[4]))?
-    } else {
-        root.clone()
-    };
-    let bootstrap_milliseconds = if arguments.len() == 7 {
-        arguments[6]
-            .to_str()
-            .ok_or(USAGE)?
-            .parse::<u64>()
-            .map_err(|_| USAGE)?
-    } else {
-        0
-    };
-    let mut input = String::new();
-    std::io::stdin()
-        .take(65537)
-        .read_to_string(&mut input)
-        .map_err(|error| error.to_string())?;
-    if input.len() > 65536 {
-        return Err("Push blocked: ref-update input exceeds 64 KiB.".into());
+    if let Some(flag) = cursor.next_flag()? {
+        if flag != "--bootstrap-milliseconds" {
+            return Err(USAGE.into());
+        }
+        bootstrap_milliseconds = cursor.next_u64()?;
     }
+    cursor.finish()?;
+    let policy = policy.unwrap_or_else(|| root.clone());
+    let input = String::from_utf8(crate::impact::workspace::read_bounded_reader(
+        std::io::stdin(),
+        65536,
+        "Push blocked: ref-update input exceeds 64 KiB.",
+    )?)
+    .map_err(|error| error.to_string())?;
     let updates = updates(&input)?;
     if updates.is_empty() {
         return Ok("No outgoing source tips (deletions only).".into());

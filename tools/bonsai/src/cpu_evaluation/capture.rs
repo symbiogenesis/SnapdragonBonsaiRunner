@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, test))]
-use std::{fs, io::Write as _, time::Duration};
+use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
@@ -148,14 +148,9 @@ fn maintenance_identity<'a>(
 #[cfg(any(windows, test))]
 fn read_json(path: &Path, maximum: u64) -> crate::Result<Value> {
     let file = bonsai_artifacts::open_locked_file(path).map_err(|error| error.to_string())?;
-    require(
-        file.metadata().map_err(|error| error.to_string())?.len() <= maximum,
-        "X2 evidence exceeds its pre-read bound.",
-    )?;
-    let bytes = crate::bounded_input::read(file, maximum)
-        .map_err(|error| error.into_message("X2 evidence grew beyond its byte bound."))?;
-    serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
-        .map_err(|error| error.to_string())
+    let bytes =
+        crate::bounded_input::read_open_file(file, maximum, "X2 evidence exceeds its byte bound.")?;
+    crate::bounded_input::read_json_bytes(&bytes)
 }
 
 #[cfg(any(windows, test))]
@@ -166,27 +161,7 @@ fn save(path: &Path, value: &Value) -> crate::Result<()> {
         bytes.len() <= 16 * 1024 * 1024,
         "X2 evidence exceeds its publication bound.",
     )?;
-    let temporary = path.with_extension(format!("{}.tmp", crate::startup_process::unique()));
-    let result = (|| {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            options.share_mode(0);
-        }
-        let mut file = options
-            .open(&temporary)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&bytes).map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        drop(file);
-        fs::rename(&temporary, path).map_err(|error| error.to_string())
-    })();
-    if external(&temporary).is_ok() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
+    crate::bounded_input::write_atomic_synced(path, &bytes)
 }
 
 #[cfg(any(windows, test))]

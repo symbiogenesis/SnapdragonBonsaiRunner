@@ -1,6 +1,6 @@
 //! Package creation and single-writer activation; no package code is executed.
 
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 
 use super::{FILES, Manifest, PackageFile, Selected, Selection, Value, fs};
 use std::fs::OpenOptions;
@@ -37,9 +37,8 @@ pub(super) fn create_file(path: &Path) -> crate::Result<fs::File> {
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> crate::Result<()> {
-    let mut file = create_file(path)?;
-    file.write_all(bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())
+    external(path)?;
+    crate::bounded_input::write_new_synced(path, bytes)
 }
 
 fn copy_new(source: &Path, destination: &Path, limit: u64) -> crate::Result<()> {

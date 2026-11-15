@@ -1,23 +1,22 @@
 //! Literal link/package fixtures; these are not captures of compiler execution.
 
 use super::*;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-struct Scratch(PathBuf);
+struct Scratch(crate::bounded_input::ScratchDir);
 
 impl Scratch {
     fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
         // The real command intentionally accepts ordinary disk paths, not
         // canonical Windows namespace paths (\\?\C:\...).
-        let path = std::env::temp_dir().join(format!(
-            "Bonsai-NativeLink-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::create_dir(&path)?;
-        Ok(Self(path))
+        Ok(Self(crate::bounded_input::ScratchDir::new(
+            "Bonsai-NativeLink",
+        )?))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.path()
     }
 
     fn file(
@@ -40,19 +39,6 @@ impl Scratch {
         value: &Value,
     ) -> std::result::Result<Identity, Box<dyn std::error::Error>> {
         self.file(name, &serde_json::to_vec(value)?)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Ok(parent) = fs::canonicalize(std::env::temp_dir())
-            && let Ok(target) = fs::canonicalize(&self.0)
-            && target.parent() == Some(parent.as_path())
-            && fs::symlink_metadata(&self.0)
-                .is_ok_and(|metadata| !bonsai_artifacts::is_redirect(&metadata))
-        {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
 }
 
@@ -260,7 +246,7 @@ fn fixture(scratch: &Scratch) -> std::result::Result<Capture, Box<dyn std::error
             "compilationDatabaseSha256":"c".repeat(64),"translationUnits":1
         }),
     )?;
-    fs::create_dir(scratch.0.join("package"))?;
+    fs::create_dir(scratch.path().join("package"))?;
     let output = scratch.file("linked.exe", &image())?;
     let packaged = scratch.file("package/service.exe", &image())?;
     let capture = Capture {
@@ -270,7 +256,7 @@ fn fixture(scratch: &Scratch) -> std::result::Result<Capture, Box<dyn std::error
         source_receipt: receipt,
         linker: linker.clone(),
         links: vec![Link {
-            working_directory: scratch.0.clone(),
+            working_directory: scratch.path().to_path_buf(),
             arguments: vec![
                 linker.path.to_str().ok_or("NonUTF8 scratch")?.into(),
                 "/nodefaultlib".into(),
@@ -296,7 +282,7 @@ fn fixture(scratch: &Scratch) -> std::result::Result<Capture, Box<dyn std::error
             normal_imports: vec!["kernel32.dll".into()],
             delay_imports: vec!["bcrypt.dll".into()],
         }],
-        package_directory: scratch.0.join("package"),
+        package_directory: scratch.path().join("package"),
         package_files: vec![PackageFile {
             name: "service.exe".into(),
             bytes: packaged.bytes,
@@ -1022,7 +1008,7 @@ fn native_link_rejects_missing_extra_or_changed_package_bytes() -> TestResult {
         verify(&manifest, &mut Intake::default()),
         "Native link package has missing or extra entries.",
     );
-    fs::remove_file(scratch.0.join("package/extra.txt"))?;
+    fs::remove_file(scratch.path().join("package/extra.txt"))?;
     let original = manifest.package_files[0].sha256.clone();
     manifest.package_files[0].sha256 = "d".repeat(64);
     rejected(
@@ -1036,7 +1022,7 @@ fn native_link_rejects_missing_extra_or_changed_package_bytes() -> TestResult {
         "Artifact length or SHA-256 differs from the compiled lock.",
     );
     manifest.links[0].output.sha256 = manifest.package_files[0].sha256.clone();
-    fs::remove_file(scratch.0.join("package/service.exe"))?;
+    fs::remove_file(scratch.path().join("package/service.exe"))?;
     rejected(
         verify(&manifest, &mut Intake::default()),
         "Artifact storage could not be opened safely.",

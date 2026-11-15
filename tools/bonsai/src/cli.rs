@@ -31,14 +31,9 @@ pub(crate) fn bounded_json_error(error: &serde_json::Error) -> String {
 }
 
 fn decode(reader: impl Read, maximum: u64) -> crate::Result<Value> {
-    let mut bytes = Vec::new();
-    reader
-        .take(maximum + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if u64::try_from(bytes.len()).map_err(|error| error.to_string())? > maximum {
-        return Err(format!("Command request exceeds {maximum} bytes."));
-    }
+    let bytes = crate::bounded_input::read(reader, maximum).map_err(|error| {
+        error.into_message(&format!("Command request exceeds {maximum} bytes."))
+    })?;
     let request: Value =
         serde_json::from_slice(&bytes).map_err(|error| bounded_json_error(&error))?;
     if !request.is_object() {
@@ -65,16 +60,12 @@ fn file_request(path: &Path, maximum: u64) -> crate::Result<Value> {
     decode(file, maximum)
 }
 
-/// Reads one JSON object from an absolute file, inline JSON, or standard input.
+/// Reads a command's JSON request object from `--request -`, `--request PATH`, or `--json OBJECT`
+/// within the caller-provided byte bound.
 ///
 /// # Errors
-/// Rejects unknown options, trailing arguments, non-object JSON and oversized input.
-pub fn request(command: &str, arguments: &[OsString]) -> crate::Result<Value> {
-    let maximum = match command {
-        "qualification" => MAX_QUALIFICATION_REQUEST_BYTES,
-        "weight-patch" => MAX_WEIGHT_PATCH_REQUEST_BYTES,
-        _ => MAX_REQUEST_BYTES,
-    };
+/// Rejects malformed options, non-Unicode inline JSON, unsafe paths, or non-object/oversized JSON.
+pub fn json_request(arguments: &[OsString], maximum: u64) -> crate::Result<Value> {
     match arguments {
         [option, source] if option == "--request" && source == "-" => {
             decode(std::io::stdin().lock(), maximum)
@@ -89,6 +80,19 @@ pub fn request(command: &str, arguments: &[OsString]) -> crate::Result<Value> {
         ),
         _ => Err("Use --request ABSOLUTE_JSON_PATH, --request -, or --json JSON_OBJECT.".into()),
     }
+}
+
+/// Parses command JSON input from stdin, an expanded absolute file path, or inline JSON.
+///
+/// # Errors
+/// Rejects malformed options, non-Unicode inline JSON, unsafe paths, or oversized/non-object JSON.
+pub fn request(command: &str, arguments: &[OsString]) -> crate::Result<Value> {
+    let maximum = match command {
+        "qualification" => MAX_QUALIFICATION_REQUEST_BYTES,
+        "weight-patch" => MAX_WEIGHT_PATCH_REQUEST_BYTES,
+        _ => MAX_REQUEST_BYTES,
+    };
+    json_request(arguments, maximum)
 }
 
 fn repository() -> crate::Result<PathBuf> {

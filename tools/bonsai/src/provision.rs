@@ -97,19 +97,11 @@ fn read_lock(path: Option<&Path>, compiled: &str) -> crate::Result<Value> {
         if !path.is_absolute() {
             return Err("LockPath must be expanded and absolute.".into());
         }
-        let file = fs::File::open(path).map_err(|error| error.to_string())?;
-        if file.metadata().map_err(|error| error.to_string())?.len() > MAX_LOCK_BYTES {
-            return Err("Artifact lock exceeds its byte bound.".into());
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_LOCK_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        if u64::try_from(bytes.len()).map_err(|error| error.to_string())? > MAX_LOCK_BYTES {
-            return Err("Artifact lock exceeds its byte bound.".into());
-        }
-        serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
-            .map_err(|error| error.to_string())?
+        crate::bounded_input::read_regular_json(
+            path,
+            MAX_LOCK_BYTES,
+            "Artifact lock exceeds its byte bound.",
+        )?
     } else {
         serde_json::from_str(compiled).map_err(|error| error.to_string())?
     };
@@ -377,35 +369,80 @@ fn inference_lock(lock: &Value) -> crate::Result<Vec<InferenceFile>> {
     Ok(files)
 }
 
-fn verify_inference(
-    lock: &Value,
-    files: &[InferenceFile],
+/// Pinned runtime entry verified by [`verify_installed_inference`].
+pub(crate) struct InstalledInferenceFile<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: &'a str,
+}
+
+/// Verifies an installed inference directory's exact inventory, digests and ARM64 PE headers.
+pub(crate) fn verify_installed_inference<'a>(
     destination: &Path,
-) -> crate::Result<Value> {
+    files: impl IntoIterator<Item = InstalledInferenceFile<'a>>,
+    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    inventory_error: &str,
+) -> crate::Result<Vec<bonsai_artifacts::VerifiedFile>> {
     validate_external_path(destination).map_err(|error| error.to_string())?;
+    let mut specs = Vec::new();
+    let mut names = BTreeSet::new();
+    for file in files {
+        if !names.insert(file.name) || Path::new(file.name).components().count() != 1 {
+            return Err("Invalid compiled inference inventory.".into());
+        }
+        specs.push(file);
+    }
     let entries = fs::read_dir(destination)
         .map_err(|error| error.to_string())?
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|error| error.to_string())?;
-    if entries.len() != files.len()
+    if entries.len() != names.len()
         || entries.iter().any(|entry| {
-            !files
-                .iter()
-                .any(|file| entry.file_name() == std::ffi::OsStr::new(&file.name))
+            entry
+                .file_name()
+                .to_str()
+                .is_none_or(|name| !names.contains(name))
         })
     {
-        return Err("Installed inference inventory differs from its lock.".into());
+        return Err(inventory_error.into());
     }
-    for file in files {
-        let path = destination.join(&file.name);
-        crate::startup_download::verify(&path, file.bytes, &file.sha256)?;
-        if Path::new(&file.name)
+    let mut guards = Vec::with_capacity(specs.len());
+    for file in specs {
+        let path = destination.join(file.name);
+        guards.push(
+            bonsai_artifacts::VerifiedFile::verify_with(
+                &path,
+                file.bytes,
+                file.sha256,
+                &mut || checkpoint().map_err(|_| bonsai_artifacts::ArtifactError::Cancelled),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        if Path::new(file.name)
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
         {
             crate::startup_cache::assert_arm64(&path)?;
         }
     }
+    Ok(guards)
+}
+
+fn verify_inference(
+    lock: &Value,
+    files: &[InferenceFile],
+    destination: &Path,
+) -> crate::Result<Value> {
+    let _guards = verify_installed_inference(
+        destination,
+        files.iter().map(|file| InstalledInferenceFile {
+            name: &file.name,
+            bytes: file.bytes,
+            sha256: &file.sha256,
+        }),
+        &mut || Ok(()),
+        "Installed inference inventory differs from its lock.",
+    )?;
     Ok(
         json!({"Package": lock["package"], "Version": lock["version"], "Commit": lock["commit"], "Target": lock["target"],
         "Directory": destination, "Executable": destination.join("prism-inference.exe"),
@@ -429,9 +466,8 @@ fn extract_inference(
     if file.metadata().map_err(|error| error.to_string())?.len() != bytes {
         return Err("Inference archive length differs from its lock.".into());
     }
-    let digest =
-        bonsai_artifacts::hash_reader(&mut file, bytes, &mut vec![0; 65536], &mut || Ok(()))
-            .map_err(|error| error.to_string())?;
+    let (_, digest) =
+        crate::identity::hash_reader_checked(&mut file, Some(bytes), None, &mut || Ok(()))?;
     if digest != text(pin, "sha256")? {
         return Err("Inference archive SHA-256 differs from its lock.".into());
     }

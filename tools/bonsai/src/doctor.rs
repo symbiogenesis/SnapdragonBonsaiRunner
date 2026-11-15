@@ -2,8 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -382,14 +381,7 @@ pub fn run(value: Value) -> crate::Result<Value> {
         "EvidenceDirectory": working, "ElapsedMilliseconds": started.elapsed().as_millis(), "Gaps": gaps,
         "Qualification": "Inventory only; engine correctness, backend readiness, performance and daily security remain unqualified."});
     if let Some(path) = request.output_path {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|error| error.to_string())?;
-        serde_json::to_writer_pretty(&mut file, &report).map_err(|error| error.to_string())?;
-        file.write_all(b"\n").map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
+        crate::bounded_input::write_pretty_json_new(&path, &report)?;
     }
     Ok(report)
 }

@@ -4,25 +4,17 @@ use super::{
     Generation, GenerationInput, Identity, Input, Origin, Unit, Verification, dependency_rule,
     verify_unit,
 };
-use std::{
-    fs,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::fs;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-struct Scratch(PathBuf);
+struct Scratch(crate::impact::workspace::ScratchDir);
 
 impl Scratch {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let root = fs::canonicalize(std::env::temp_dir())?.join(format!(
-            "Bonsai-NativeClosure-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::create_dir(&root)?;
-        Ok(Self(root))
+        Ok(Self(crate::impact::workspace::ScratchDir::new(
+            "Bonsai-NativeClosure",
+        )?))
     }
 
     fn file(&self, name: &str, bytes: &[u8]) -> Result<Identity, Box<dyn std::error::Error>> {
@@ -98,18 +90,6 @@ impl Scratch {
                 },
             ],
         })
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Ok(parent) = fs::canonicalize(std::env::temp_dir())
-            && self.0.parent() == Some(parent.as_path())
-            && fs::symlink_metadata(&self.0)
-                .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-        {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
 }
 

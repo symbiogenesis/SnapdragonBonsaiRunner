@@ -6,15 +6,14 @@
 
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Seek as _, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use bonsai_artifacts::{
-    ArtifactError, hash_reader, is_redirect, open_locked_file, validate_external_path,
-};
+use bonsai_artifacts::{is_redirect, open_locked_file, validate_external_path};
 
 thread_local! {
     static REPAIR_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -83,11 +82,8 @@ fn digest_matches(file: &mut File, bytes: u64, sha256: &str) -> crate::Result<bo
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|error| error.to_string())?;
-    let mut buffer = vec![0; 1024 * 1024];
-    let hash = hash_reader(file, bytes, &mut buffer, &mut || {
-        repair_checkpoint().map_err(|_| ArtifactError::Cancelled)
-    })
-    .map_err(|error| error.to_string())?;
+    let (_, hash) =
+        crate::identity::hash_reader_checked(file, Some(bytes), None, &mut repair_checkpoint)?;
     Ok(hash.eq_ignore_ascii_case(sha256))
 }
 
@@ -276,32 +272,48 @@ fn cached_artifact(path: &Path, bytes: u64, sha256: &str) -> crate::Result<Cache
     }
 }
 
-fn repair_parents(path: &Path) -> crate::Result<Vec<File>> {
+fn repair_parents(path: &Path) -> crate::Result<BTreeMap<PathBuf, File>> {
+    let mut guards = BTreeMap::new();
     #[cfg(windows)]
-    let mut guards = Vec::new();
-    #[cfg(not(windows))]
-    let guards = Vec::new();
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        for parent in path.ancestors().skip(1) {
-            let directory = OpenOptions::new()
-                .read(true)
-                .access_mode(0x81)
-                .share_mode(3)
-                .custom_flags(0x0220_0000)
-                .open(parent)
-                .map_err(|error| format!("Cannot protect the download folder: {error}"))?;
-            let metadata = directory.metadata().map_err(|error| error.to_string())?;
-            if !metadata.is_dir() || is_redirect(&metadata) {
-                return Err("The download folder is redirected or is not a directory.".into());
-            }
-            guards.push(directory);
-        }
-    }
+    crate::bounded_input::hold_directory_chain(path, &mut guards, false, 3)
+        .map_err(|error| format!("Cannot protect the download folder: {error}"))?;
     #[cfg(not(windows))]
     let _ = path;
     Ok(guards)
+}
+
+fn prepare_receive(
+    uri: &str,
+    path: &Path,
+    bytes: u64,
+    sha256: &str,
+    working: &Path,
+    create_error: Option<&str>,
+    hold_parents: bool,
+) -> crate::Result<(BTreeMap<PathBuf, File>, File, PathBuf)> {
+    repair_checkpoint()?;
+    expected(bytes, sha256)?;
+    download_uri(uri)?;
+    validate_external_path(path).map_err(|error| error.to_string())?;
+    validate_external_path(working).map_err(|error| error.to_string())?;
+    fs::create_dir_all(path.parent().ok_or("Artifact has no parent directory.")?).map_err(
+        |error| match create_error {
+            Some(prefix) => format!("{prefix}: {error}"),
+            None => error.to_string(),
+        },
+    )?;
+    fs::create_dir_all(working).map_err(|error| error.to_string())?;
+    let parents = if hold_parents {
+        validate_external_path(path).map_err(|error| error.to_string())?;
+        repair_parents(path)?
+    } else {
+        BTreeMap::new()
+    };
+    path.file_name().ok_or("Artifact has no filename.")?;
+    let lock = path.with_added_extension("download.lock");
+    let guard = crate::startup_cache::lock_file(&lock)?;
+    let partial = path.with_added_extension("partial");
+    Ok((parents, guard, partial))
 }
 
 fn repair_file(path: &Path) -> crate::Result<File> {
@@ -499,20 +511,15 @@ fn receive_repair_observed_with(
     transfer: impl FnMut(&str, &Path, u64, u64, &Path) -> crate::Result<()>,
     observe: &mut dyn FnMut(RepairActivity) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    repair_checkpoint()?;
-    expected(bytes, sha256)?;
-    download_uri(uri)?;
-    validate_external_path(path).map_err(|error| error.to_string())?;
-    validate_external_path(working).map_err(|error| error.to_string())?;
-    fs::create_dir_all(path.parent().ok_or("Artifact has no parent directory.")?)
-        .map_err(|error| format!("Cannot create the model download folder: {error}"))?;
-    fs::create_dir_all(working).map_err(|error| error.to_string())?;
-    validate_external_path(path).map_err(|error| error.to_string())?;
-    let _parents = repair_parents(path)?;
-    path.file_name().ok_or("Artifact has no filename.")?;
-    let lock = path.with_added_extension("download.lock");
-    let _guard = crate::startup_cache::lock_file(&lock)?;
-    let partial = path.with_added_extension("partial");
+    let (_parents, _guard, partial) = prepare_receive(
+        uri,
+        path,
+        bytes,
+        sha256,
+        working,
+        Some("Cannot create the model download folder"),
+        true,
+    )?;
     observe(RepairActivity::VerifyingExisting)?;
     let original = match cached_artifact(path, bytes, sha256)? {
         CachedArtifact::Verified => return remove_redundant_download(&partial),
@@ -560,18 +567,8 @@ fn receive_with(
     working: &Path,
     mut transfer: impl FnMut(&str, &Path, u64, u64, &Path) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    repair_checkpoint()?;
-    expected(bytes, sha256)?;
-    download_uri(uri)?;
-    validate_external_path(path).map_err(|error| error.to_string())?;
-    validate_external_path(working).map_err(|error| error.to_string())?;
-    fs::create_dir_all(path.parent().ok_or("Artifact has no parent directory.")?)
-        .map_err(|error| error.to_string())?;
-    fs::create_dir_all(working).map_err(|error| error.to_string())?;
-    path.file_name().ok_or("Artifact has no filename.")?;
-    let lock = path.with_added_extension("download.lock");
-    let _guard = crate::startup_cache::lock_file(&lock)?;
-    let partial = path.with_added_extension("partial");
+    let (_parents, _guard, partial) =
+        prepare_receive(uri, path, bytes, sha256, working, None, false)?;
     if path.exists() {
         verify(path, bytes, sha256)?;
         return remove_redundant_download(&partial);

@@ -9,7 +9,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{Read as _, Write as _},
     path::{Component, Path, PathBuf},
 };
 
@@ -42,40 +41,20 @@ pub(crate) fn lock_file(path: &Path) -> crate::Result<File> {
 }
 
 fn source_file(path: &Path) -> crate::Result<File> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if !metadata.is_file() || is_redirect(&metadata) {
-        return Err("Build inputs must be ordinary files.".into());
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(1).custom_flags(0x0820_0000);
-    }
-    let file = options.open(path).map_err(|error| error.to_string())?;
-    // Check the object actually opened, rather than only the earlier path probe.
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file() || is_redirect(&metadata) {
-        return Err("Build inputs must be ordinary files.".into());
-    }
-    Ok(file)
+    crate::bounded_input::open_sequential_file(path)
+        .map_err(|_| "Build inputs must be ordinary files.".into())
 }
 
 pub(crate) fn digest_file(path: &Path) -> crate::Result<String> {
     crate::startup_cancel::checkpoint()?;
     let mut file = source_file(path)?;
-    let mut hash = Hasher::new()?;
-    let mut buffer = vec![0; 65536];
-    loop {
-        crate::startup_cancel::checkpoint()?;
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count])?;
-    }
-    hash.finalize_hex()
+    crate::identity::hash_reader_checked(
+        &mut file,
+        None,
+        None,
+        &mut crate::startup_cancel::checkpoint,
+    )
+    .map(|(_, digest)| digest)
 }
 
 pub(crate) fn assert_arm64(path: &Path) -> crate::Result<()> {
@@ -740,14 +719,11 @@ fn read_receipt(
     outputs: &BTreeMap<String, PathBuf>,
 ) -> crate::Result<()> {
     validate_external_path(receipt).map_err(|error| error.to_string())?;
-    let mut data = Vec::new();
-    source_file(receipt)?
-        .take(65537)
-        .read_to_end(&mut data)
-        .map_err(|error| error.to_string())?;
-    if data.len() > 65536 {
-        return Err("Build receipt is too large.".into());
-    }
+    let data = crate::bounded_input::read_open_file(
+        source_file(receipt)?,
+        65536,
+        "Build receipt is too large.",
+    )?;
     let record: Receipt = serde_json::from_slice(&data).map_err(|error| error.to_string())?;
     if record.version != 2
         || record.identity != identity
@@ -863,14 +839,6 @@ pub(crate) fn remove_abandoned_receipts(receipt: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-struct TemporaryReceipt(PathBuf);
-
-impl Drop for TemporaryReceipt {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
 pub(crate) fn write_receipt(
     receipt: &Path,
     identity: String,
@@ -897,26 +865,8 @@ pub(crate) fn write_receipt(
         fingerprint,
         outputs,
     };
-    let temporary = receipt.with_file_name(format!(
-        "{}.{}.tmp",
-        receipt
-            .file_name()
-            .ok_or("Missing receipt name.")?
-            .to_string_lossy(),
-        crate::startup_process::unique()
-    ));
-    validate_external_path(&temporary).map_err(|error| error.to_string())?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| error.to_string())?;
-    let temporary = TemporaryReceipt(temporary);
     let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    drop(file);
-    fs::rename(&temporary.0, receipt).map_err(|error| error.to_string())
+    crate::bounded_input::write_atomic_synced(receipt, &bytes)
 }
 
 #[cfg(test)]

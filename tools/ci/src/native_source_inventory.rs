@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, Metadata},
     io::Read as _,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
     time::Instant,
 };
 
@@ -51,24 +51,9 @@ struct Inventory {
     files: Vec<Entry>,
 }
 
-fn is_link(metadata: &Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
 pub(super) fn plain_metadata(path: &Path) -> Result<Metadata> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if is_link(&metadata) {
+    if crate::impact::workspace::is_link(&metadata) {
         return Err("Native source inventory rejects symbolic links and reparse points.".into());
     }
     Ok(metadata)
@@ -146,34 +131,16 @@ pub(super) fn read_bounded_until(
     if !metadata.is_file() || metadata.len() > limit {
         return Err("Native inventory input is not a bounded regular file.".into());
     }
-    let mut bytes = Vec::new();
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let mut buffer = [0; 16 * 1024];
-    loop {
-        checkpoint(deadline)?;
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        if u64::try_from(bytes.len())
-            .map_err(|error| error.to_string())?
-            .checked_add(u64::try_from(count).map_err(|error| error.to_string())?)
-            .is_none_or(|length| length > limit)
-        {
-            return Err("Native inventory input grew beyond its byte bound.".into());
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-    checkpoint(deadline)?;
-    Ok(bytes)
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    crate::impact::workspace::read_bounded_until_reader(
+        file,
+        limit,
+        "Native inventory input grew beyond its byte bound.",
+        || checkpoint(deadline),
+    )
 }
 
-pub(super) fn lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+pub(super) use crate::impact::workspace::is_lower_hex as lower_hex;
 
 fn checked_entries(inventory: &Inventory) -> Result<BTreeMap<&str, &Entry>> {
     if inventory.schema_version != 1
@@ -317,13 +284,11 @@ fn lock_matches(root: &Path, inventory: &Inventory) -> Result<()> {
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
-    if arguments.len() != 7 {
-        return Err(USAGE.into());
-    }
+    let mut cursor = super::ArgCursor::new(arguments, USAGE);
+    cursor.skip_command()?;
     let mut paths = BTreeMap::new();
-    for pair in arguments[1..].as_chunks::<2>().0 {
-        let key = pair[0].to_str().ok_or(USAGE)?;
-        let value = PathBuf::from(&pair[1]);
+    while let Some(key) = cursor.next_flag()? {
+        let value = cursor.next_path()?;
         if !["--root", "--source", "--archive"].contains(&key)
             || !value.is_absolute()
             || paths.insert(key, value).is_some()
@@ -363,34 +328,22 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{Inventory, checked_entries, digest, files, lock_matches, verify};
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use crate::impact::workspace::ScratchDir;
+    use std::fs;
 
-    struct Scratch(PathBuf);
+    struct Scratch(ScratchDir);
 
     impl Scratch {
         fn new() -> Result<Self, Box<dyn std::error::Error>> {
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let root = fs::canonicalize(std::env::temp_dir())?.join(format!(
-                "Bonsai-NativeInventory-{}-{nonce}",
-                std::process::id()
-            ));
-            fs::create_dir(&root)?;
-            Ok(Self(root))
+            Ok(Self(ScratchDir::new("Bonsai-NativeInventory")?))
         }
     }
 
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            if let Ok(parent) = fs::canonicalize(std::env::temp_dir())
-                && self.0.parent() == Some(parent.as_path())
-                && fs::symlink_metadata(&self.0).is_ok_and(|metadata| !super::is_link(&metadata))
-            {
-                let _ = fs::remove_dir_all(&self.0);
-            }
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0.0
         }
     }
 

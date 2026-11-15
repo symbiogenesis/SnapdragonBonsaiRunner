@@ -5,7 +5,6 @@ use std::{
     ffi::OsString,
     fs::File,
     io::{Read as _, Seek},
-    path::{Component, Path},
 };
 
 use serde::Deserialize;
@@ -14,6 +13,7 @@ use zip::{CompressionMethod, ZipArchive};
 
 use super::native_source_inventory::{hex, lower_hex, plain_ancestors, read_bounded};
 use crate::Result;
+use crate::impact::workspace::validate_repo_relative_path as portable_path;
 
 const USAGE: &str = "Usage: bonsai-ci native-archive-inventory --archive PATH --pin PATH --expected-pin-sha256 SHA256";
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
@@ -30,34 +30,6 @@ struct Pin {
     archive_root: String,
     archive_bytes: u64,
     archive_sha256: String,
-}
-
-// Reject platform-dependent names even though nothing is extracted. This makes
-// an inventory usable by a future Windows replay consumer without aliases.
-fn portable_path(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 1024
-        && name.is_ascii()
-        && !name.bytes().any(|byte| byte.is_ascii_control())
-        && !name.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
-        && name.split('/').all(|part| {
-            let stem = part
-                .split('.')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_uppercase();
-            !part.is_empty()
-                && part != "."
-                && part != ".."
-                && !part.ends_with(['.', ' '])
-                && !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-                && !((stem.starts_with("COM") || stem.starts_with("LPT"))
-                    && stem.len() == 4
-                    && matches!(stem.as_bytes()[3], b'1'..=b'9'))
-        })
-        && Path::new(name)
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)))
 }
 
 fn validate_pin(pin: &Pin) -> Result<()> {
@@ -183,19 +155,12 @@ fn inventory<R: std::io::Read + Seek>(reader: R, pin: &Pin) -> Result<serde_json
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
-    if arguments.len() != 7
-        || arguments[1] != "--archive"
-        || arguments[3] != "--pin"
-        || arguments[5] != "--expected-pin-sha256"
-    {
-        return Err(USAGE.into());
-    }
-    let archive = Path::new(&arguments[2]);
-    let pin_path = Path::new(&arguments[4]);
-    let expected = arguments[6]
-        .to_str()
-        .filter(|value| lower_hex(value, 64))
-        .ok_or(USAGE)?;
+    let mut cursor = super::ArgCursor::new(arguments, USAGE);
+    cursor.skip_command()?;
+    let archive = cursor.expect_path("--archive")?;
+    let pin_path = cursor.expect_path("--pin")?;
+    let expected = cursor.expect_hex("--expected-pin-sha256", 64)?;
+    cursor.finish()?;
     for path in [archive, pin_path] {
         if !path.is_absolute() {
             return Err(USAGE.into());

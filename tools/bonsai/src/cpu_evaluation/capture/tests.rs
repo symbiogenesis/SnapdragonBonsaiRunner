@@ -177,11 +177,7 @@ fn records_reject_bad_capture_identity_and_retain_output_attribution() -> crate:
 #[test]
 fn atomic_phase_evidence_survives_failed_publication_and_enforces_read_bounds() -> crate::Result<()>
 {
-    let directory = std::env::temp_dir().join(format!(
-        "Bonsai-X2Report-{}",
-        crate::startup_process::unique()
-    ));
-    fs::create_dir(&directory).map_err(|error| error.to_string())?;
+    let directory = crate::bounded_input::ScratchDir::new("Bonsai-X2Report")?;
     let path = directory.join("cpu-evaluation.json");
     save(
         &path,
@@ -193,6 +189,5 @@ fn atomic_phase_evidence_survives_failed_publication_and_enforces_read_bounds() 
     assert!(read_json(&path, 1).is_err());
     assert!(save(&path, &json!({"oversized":"x".repeat(16*1024*1024)})).is_err());
     assert_eq!(read_json(&path, 1024)?, failed);
-    fs::remove_dir_all(directory).map_err(|error| error.to_string())?;
     Ok(())
 }

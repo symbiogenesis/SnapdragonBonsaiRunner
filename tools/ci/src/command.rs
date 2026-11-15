@@ -1,9 +1,9 @@
 //! Command parsing and GitHub Actions output contracts.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -56,12 +56,87 @@ struct Arguments {
     full: bool,
 }
 
+pub(crate) struct ArgCursor<'a> {
+    items: std::slice::Iter<'a, OsString>,
+    usage: &'a str,
+}
+
+impl<'a> ArgCursor<'a> {
+    pub(crate) fn new(arguments: &'a [OsString], usage: &'a str) -> Self {
+        Self {
+            items: arguments.iter(),
+            usage,
+        }
+    }
+
+    pub(crate) fn skip_command(&mut self) -> Result<&'a str> {
+        self.next_str()
+    }
+
+    pub(crate) fn next_os(&mut self) -> Result<&'a OsStr> {
+        self.items
+            .next()
+            .map(OsString::as_os_str)
+            .ok_or_else(|| self.usage.into())
+    }
+
+    pub(crate) fn next_str(&mut self) -> Result<&'a str> {
+        self.next_os()?.to_str().ok_or_else(|| self.usage.into())
+    }
+
+    pub(crate) fn next_flag(&mut self) -> Result<Option<&'a str>> {
+        match self.items.next() {
+            Some(flag) => flag.to_str().map(Some).ok_or_else(|| self.usage.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn next_path(&mut self) -> Result<PathBuf> {
+        Ok(PathBuf::from(self.next_os()?))
+    }
+
+    pub(crate) fn next_u64(&mut self) -> Result<u64> {
+        self.next_str()?
+            .parse::<u64>()
+            .map_err(|_| self.usage.into())
+    }
+
+    pub(crate) fn expect_flag(&mut self, expected: &str) -> Result<()> {
+        if self.next_str()? != expected {
+            return Err(self.usage.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn expect_value(&mut self, flag: &str) -> Result<&'a str> {
+        self.expect_flag(flag)?;
+        self.next_str()
+    }
+
+    pub(crate) fn expect_path(&mut self, flag: &str) -> Result<&'a Path> {
+        self.expect_flag(flag)?;
+        Ok(Path::new(self.next_os()?))
+    }
+
+    pub(crate) fn expect_hex(&mut self, flag: &str, length: usize) -> Result<&'a str> {
+        let value = self.expect_value(flag)?;
+        if !impact::workspace::is_lower_hex(value, length) {
+            return Err(self.usage.into());
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        if self.items.next().is_some() {
+            return Err(self.usage.into());
+        }
+        Ok(())
+    }
+}
+
 fn parse(arguments: &[OsString]) -> Result<Arguments> {
-    let mut values = arguments.iter();
-    let command = values
-        .next()
-        .and_then(|value| value.to_str())
-        .ok_or(USAGE)?;
+    let mut cursor = ArgCursor::new(arguments, USAGE);
+    let command = cursor.next_str()?;
     if !["impact", "gate"].contains(&command) {
         return Err(USAGE.into());
     }
@@ -70,24 +145,22 @@ fn parse(arguments: &[OsString]) -> Result<Arguments> {
         after: "HEAD".into(),
         ..Arguments::default()
     };
-    while let Some(option) = values.next() {
+    while let Some(option) = cursor.next_flag()? {
         if option == "--full" && command == "impact" {
             parsed.full = true;
             continue;
         }
-        let option = option.to_str().ok_or(USAGE)?;
         if !["--root", "--config", "--workflow", "--before", "--after"].contains(&option)
             || (command == "gate" && ["--before", "--after"].contains(&option))
         {
             return Err(USAGE.into());
         }
-        let value = values.next().ok_or(USAGE)?;
         match option {
-            "--root" => parsed.root = Some(value.into()),
-            "--config" => parsed.config = Some(value.into()),
-            "--workflow" => parsed.workflow = Some(value.to_str().ok_or(USAGE)?.into()),
-            "--before" => parsed.before = value.to_str().ok_or(USAGE)?.into(),
-            "--after" => parsed.after = value.to_str().ok_or(USAGE)?.into(),
+            "--root" => parsed.root = Some(cursor.next_path()?),
+            "--config" => parsed.config = Some(cursor.next_path()?),
+            "--workflow" => parsed.workflow = Some(cursor.next_str()?.into()),
+            "--before" => parsed.before = cursor.next_str()?.into(),
+            "--after" => parsed.after = cursor.next_str()?.into(),
             _ => return Err(USAGE.into()),
         }
     }
@@ -270,7 +343,7 @@ pub fn run(arguments: &[OsString]) -> Result<String> {
 }
 
 #[cfg(test)]
-fn workspace_root_from(runtime: Option<&std::ffi::OsStr>, compile_time: &str) -> PathBuf {
+fn workspace_root_from(runtime: Option<&OsStr>, compile_time: &str) -> PathBuf {
     runtime
         .filter(|path| !path.is_empty())
         .map_or_else(|| PathBuf::from(compile_time), PathBuf::from)

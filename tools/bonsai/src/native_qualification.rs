@@ -1,10 +1,5 @@
 //! Fixed numerical/row captures and source request attribution under original owner deadlines.
 
-#[cfg(any(windows, test))]
-use std::fs;
-use std::fs::OpenOptions;
-#[cfg(any(windows, test))]
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -131,20 +126,11 @@ fn read_bounded(path: &Path, limit: u64) -> crate::Result<Vec<u8>> {
     if !path.is_absolute() {
         return Err("Qualification paths must be expanded and absolute.".into());
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(1).custom_flags(0x0020_0000);
-    }
-    let file = options.open(path).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file() || bonsai_artifacts::is_redirect(&metadata) || metadata.len() > limit {
-        return Err("Qualification input exceeds its ordinary-file byte bound.".into());
-    }
-    crate::bounded_input::read(file, limit)
-        .map_err(|error| error.into_message("Qualification input grew beyond its byte bound."))
+    crate::bounded_input::read_regular_file(
+        path,
+        limit,
+        "Qualification input exceeds its ordinary-file byte bound.",
+    )
 }
 
 fn read_json(path: &Path, limit: u64) -> crate::Result<Value> {
@@ -278,27 +264,7 @@ pub(crate) fn save_report(path: &Path, report: &Value) -> crate::Result<()> {
     if u64::try_from(bytes.len()).map_err(|error| error.to_string())? > LIMIT {
         return Err("Numerical qualification receipt exceeds its fixed byte bound.".into());
     }
-    let temporary = path.with_extension(format!("{}.tmp", crate::native_startup::nonce()?));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            options.share_mode(0);
-        }
-        let mut file = options
-            .open(&temporary)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&bytes).map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        drop(file);
-        fs::rename(&temporary, path).map_err(|error| error.to_string())
-    })();
-    if temporary.exists() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::bounded_input::write_atomic_synced(path, &bytes)
 }
 
 #[cfg(any(windows, test))]

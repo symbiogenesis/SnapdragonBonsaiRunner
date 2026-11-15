@@ -264,8 +264,8 @@ mod windows {
         prepared, scalar,
     };
     use bonsai_windows_process::{OpenClProjectionSelection, ProcessSpec};
-    use std::fs::{self, File, OpenOptions};
-    use std::io::{Read as _, Write as _};
+    use std::fs::{self, File};
+    use std::io::Read as _;
     use std::path::Path;
 
     fn power() -> Value {
@@ -288,14 +288,7 @@ mod windows {
     }
 
     fn publish(path: &Path, bytes: &[u8]) -> crate::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|error| error.to_string())?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| error.to_string())
+        crate::bounded_input::write_new_synced(path, bytes)
     }
 
     fn output_identity(path: &Path, bytes: &[u8]) -> Value {
