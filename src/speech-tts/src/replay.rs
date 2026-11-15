@@ -242,7 +242,7 @@ impl<R: Read> Replay<R> {
             .voices
             .0
             .as_ref()
-            .is_some_and(|(key, _)| key == &profile);
+            .is_some_and(|(key, _)| &**key == profile);
         if request_digest(text, voice)? != self.request
             || synthesizer.threads != self.workers
             || retained != self.retained_voice

@@ -99,7 +99,7 @@ fn warm_synthesizer() -> io::Result<Synthesizer> {
     };
     Ok(Synthesizer {
         voices: VoiceCache(Some((
-            c"warm".to_owned(),
+            Box::from("warm"),
             Voice {
                 talker: prompt_fixture(true)?,
                 reference: Reference {
@@ -273,7 +273,7 @@ fn synthesis_observer_rejected_input_preserves_warm_voice_reference_and_stream_s
                 .voices
                 .0
                 .as_ref()
-                .is_some_and(|(key, _)| key.as_c_str() == c"warm")
+                .is_some_and(|(key, _)| &**key == "warm")
         );
         assert!(synthesizer.codec.primed.is_some());
         assert_eq!(synthesizer.codec.state.audio.pos, 7);

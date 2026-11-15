@@ -7,7 +7,6 @@
 #![cfg(windows)]
 
 use std::{
-    ffi::{CStr, CString},
     fmt, io,
     path::{Path, PathBuf},
 };
@@ -201,7 +200,7 @@ struct Voice {
 // playback mode and chunk boundaries. Replacing a profile releases its model
 // before constructing the next one; acquisition failures cannot fall back to
 // an unrelated voice or retain two loaded models.
-struct VoiceCache<T>(Option<(CString, T)>);
+struct VoiceCache<T>(Option<(Box<str>, T)>);
 
 // The waveform allocation is independent of its model context.
 // Keep its owner until synchronous Base extraction returns, including failures,
@@ -222,17 +221,17 @@ fn finish_voice_bootstrap<D, B, S: AsRef<[f32]>, R>(
 impl<T> VoiceCache<T> {
     fn get_or_create(
         &mut self,
-        profile: &CStr,
+        profile: &str,
         create: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<&mut T> {
         if let Some((key, voice)) = self.0.as_mut()
-            && key.as_c_str() == profile
+            && &**key == profile
         {
             return Ok(voice);
         }
         self.0 = None;
         let voice = create()?;
-        Ok(&mut self.0.insert((profile.to_owned(), voice)).1)
+        Ok(&mut self.0.insert((Box::from(profile), voice)).1)
     }
 }
 
@@ -272,7 +271,7 @@ impl Synthesizer {
         threads: Option<usize>,
     ) -> io::Result<Self> {
         for path in [model, codec, voice_model] {
-            let _ = model_path(path)?;
+            model_path(path)?;
         }
         let threads = select_threads(threads, std::thread::available_parallelism()?.get())?;
         let mut codec_weights = weights::Weights::open(codec)?;
@@ -296,7 +295,7 @@ impl Synthesizer {
 
     fn voice(
         &mut self,
-        profile: &CStr,
+        profile: &str,
         cancel: &CancelHook<'_>,
         observe: &Observer<'_>,
     ) -> io::Result<&mut Voice> {
@@ -315,7 +314,6 @@ impl Synthesizer {
                 None => load_talker(model_path, "voice_design", *threads)
                     .map_err(|error| SynthesisStage::DesignModel.failure(error))?,
             };
-            let profile = profile.to_str().map_err(io::Error::other)?;
             let mut codes = Vec::new();
             talker
                 .generate_observed(
@@ -543,7 +541,7 @@ impl Synthesizer {
         };
         let synthesizer = &mut *guard.synthesizer;
         let result = (|| {
-            let _ = synthesizer.voice(&profile, &cancel, &observe)?;
+            let _ = synthesizer.voice(profile, &cancel, &observe)?;
             let Self { voices, codec, .. } = synthesizer;
             let (_, voice) = voices.0.as_mut().ok_or_else(invalid_audio)?;
             (cancel.borrow_mut())().map_err(|error| SynthesisStage::CodecPriming.failure(error))?;
@@ -560,7 +558,7 @@ impl Synthesizer {
             voice
                 .talker
                 .generate_observed(
-                    text.to_str().map_err(io::Error::other)?,
+                    text,
                     None,
                     Some(&voice.reference),
                     &mut |frame| {
@@ -634,7 +632,7 @@ fn select_threads(requested: Option<usize>, available: usize) -> io::Result<usiz
     Ok(count)
 }
 
-fn model_path(path: &Path) -> io::Result<CString> {
+fn model_path(path: &Path) -> io::Result<()> {
     if !path.is_absolute() || !path.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -647,27 +645,29 @@ fn model_path(path: &Path) -> io::Result<CString> {
             "Native speech requires UTF-8 paths.",
         )
     })?;
-    CString::new(text).map_err(|_| {
-        io::Error::new(
+    if text.as_bytes().contains(&0) {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Native speech requires regular file paths.",
-        )
-    })
+        ));
+    }
+    Ok(())
 }
 
-fn bounded_input(text: &str, maximum: usize) -> io::Result<CString> {
+fn bounded_input(text: &str, maximum: usize) -> io::Result<&str> {
     if text.trim().is_empty() || text.chars().take(maximum + 1).count() > maximum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Speech text or voice description exceeds its bound.",
         ));
     }
-    CString::new(text).map_err(|_| {
-        io::Error::new(
+    if text.as_bytes().contains(&0) {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Speech text and voice descriptions cannot contain NUL.",
-        )
-    })
+        ));
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -815,13 +815,13 @@ mod tests {
             "Second paragraph.\n\nA line break.",
             "Another message.",
         ] {
-            assert_eq!(cache.get_or_create(c"Warm narrator", acquire)?.identity, 1);
+            assert_eq!(cache.get_or_create("Warm narrator", acquire)?.identity, 1);
         }
         assert_eq!(acquisitions.get(), 1);
-        assert_eq!(cache.get_or_create(c"Clear alto", acquire)?.identity, 2);
+        assert_eq!(cache.get_or_create("Clear alto", acquire)?.identity, 2);
         assert!(
             cache
-                .get_or_create(c"New profile", || Err(io::Error::other(
+                .get_or_create("New profile", || Err(io::Error::other(
                     "synthetic acquisition failure"
                 )))
                 .is_err()
@@ -831,7 +831,7 @@ mod tests {
             cache.0.is_none(),
             "Failed voice acquisition left an unrelated fallback"
         );
-        assert_eq!(cache.get_or_create(c"Warm narrator", acquire)?.identity, 3);
+        assert_eq!(cache.get_or_create("Warm narrator", acquire)?.identity, 3);
         drop(cache);
         assert_eq!(alive.get(), 0);
         Ok(())
@@ -881,13 +881,7 @@ mod tests {
             (MAX_TEXT, "界".repeat(MAX_TEXT)),
             (MAX_VOICE, "🎙".repeat(MAX_VOICE)),
         ] {
-            assert_eq!(
-                bounded_input(&text, limit)
-                    .ok()
-                    .as_ref()
-                    .map(std::ffi::CString::as_bytes),
-                Some(text.as_bytes())
-            );
+            assert_eq!(bounded_input(&text, limit).ok(), Some(text.as_str()));
             assert!(bounded_input(&(text + "x"), limit).is_err());
         }
         assert!(bounded_input(" \n\t", MAX_TEXT).is_err());
