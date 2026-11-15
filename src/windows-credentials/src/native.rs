@@ -149,7 +149,7 @@ pub(super) fn is_app_container() -> io::Result<bool> {
         GetTokenInformation(
             token.as_raw_handle(),
             TokenIsAppContainer,
-            ptr::from_mut(&mut value).cast(),
+            (&raw mut value).cast(),
             4,
             &raw mut returned,
         )
@@ -187,6 +187,7 @@ fn current_sid() -> io::Result<(String, bool)> {
         .map_err(io::Error::other)?
         .div_ceil(size_of::<usize>());
     let mut buffer = vec![0_usize; word_count];
+    let mut returned = 0_u32;
     // SAFETY: usize storage provides TOKEN_USER alignment and at least bytes
     // initialized bytes. The OS writes a token structure whose SID stays in it.
     if unsafe {
@@ -195,17 +196,24 @@ fn current_sid() -> io::Result<(String, bool)> {
             TokenUser,
             buffer.as_mut_ptr().cast(),
             bytes,
-            &raw mut bytes,
+            &raw mut returned,
         )
     } == 0
     {
         return Err(io::Error::last_os_error());
     }
-    if usize::try_from(bytes).map_err(io::Error::other)? < size_of::<TOKEN_USER>() {
+    if returned > bytes
+        || usize::try_from(returned).map_err(io::Error::other)? < size_of::<TOKEN_USER>()
+    {
         return Err(io::Error::other("Windows returned a truncated token user."));
     }
     // SAFETY: successful TokenUser query initialized an aligned TOKEN_USER.
     let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    if user.User.Sid.is_null() {
+        return Err(io::Error::other(
+            "Windows returned an empty token user SID.",
+        ));
+    }
     // SAFETY: user.User.Sid points to a valid SID inside the live TokenUser buffer.
     let is_system = unsafe { IsWellKnownSid(user.User.Sid, WinLocalSystemSid) } != 0;
     let mut sid = ptr::null_mut();
@@ -269,16 +277,66 @@ fn ace_count(acl: *mut ACL) -> io::Result<u32> {
 }
 
 fn ace_bytes<'a>(_owner: &'a Allocation, acl: *mut ACL, index: u32) -> io::Result<&'a [u8]> {
+    if acl.is_null() || !acl.is_aligned() {
+        return Err(io::Error::other(
+            "Windows returned a malformed credential ACL.",
+        ));
+    }
+    // SAFETY: non-null, aligned ACL header resides in the allocation owned by `_owner`.
+    let acl_header = unsafe { &*acl };
+    let acl_size = usize::from(acl_header.AclSize);
+    if acl_size < size_of::<ACL>() {
+        return Err(io::Error::other(
+            "Windows returned a truncated credential ACL.",
+        ));
+    }
     let mut ace = ptr::null_mut();
     // SAFETY: index is bounded by the ACL's returned ACE count; acl stays live
     // for at least `'a` because its owning Allocation is borrowed by `_owner`.
     if unsafe { GetAce(acl, index, &raw mut ace) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: GetAce returns a complete ACE beginning with an aligned ACE_HEADER.
-    let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-    // SAFETY: the valid ACE's header gives the complete in-ACL byte length.
-    Ok(unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), usize::from(header.AceSize)) })
+    let ace_header_ptr = ace.cast::<ACE_HEADER>();
+    if ace_header_ptr.is_null() || !ace_header_ptr.is_aligned() {
+        return Err(io::Error::other(
+            "Windows returned a malformed access entry.",
+        ));
+    }
+    let acl_start = acl.cast::<u8>().addr();
+    let Some(acl_end) = acl_start.checked_add(acl_size) else {
+        return Err(io::Error::other(
+            "Credential ACL byte range overflows address space.",
+        ));
+    };
+    let Some(min_ace_start) = acl_start.checked_add(size_of::<ACL>()) else {
+        return Err(io::Error::other(
+            "Credential ACL byte range overflows address space.",
+        ));
+    };
+    let ace_start = ace.cast::<u8>().addr();
+    if ace_start < min_ace_start
+        || ace_start
+            .checked_add(size_of::<ACE_HEADER>())
+            .is_none_or(|header_end| header_end > acl_end)
+    {
+        return Err(io::Error::other(
+            "Windows returned an out-of-bounds access entry header.",
+        ));
+    }
+    // SAFETY: ace_header_ptr is aligned and verified to lie within [min_ace_start, acl_end).
+    let header = unsafe { &*ace_header_ptr };
+    let ace_size = usize::from(header.AceSize);
+    if ace_size < size_of::<ACE_HEADER>()
+        || ace_start
+            .checked_add(ace_size)
+            .is_none_or(|ace_end| ace_end > acl_end)
+    {
+        return Err(io::Error::other(
+            "Windows returned an out-of-bounds access entry.",
+        ));
+    }
+    // SAFETY: ace is verified to span [ace_start, ace_start + ace_size) within the live ACL.
+    Ok(unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_size) })
 }
 
 fn verify_descriptors(expected: &Allocation, actual: &Allocation) -> io::Result<()> {
@@ -431,4 +489,24 @@ pub(super) fn noninheritable(file: &File) -> io::Result<bool> {
         return Err(io::Error::last_os_error());
     }
     Ok(flags & HANDLE_FLAG_INHERIT == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ace_bytes_rejects_null_and_truncated_acls() -> io::Result<()> {
+        let security = Security::new(false)?;
+        assert!(ace_bytes(&security.0, ptr::null_mut(), 0).is_err());
+        let mut truncated = ACL {
+            AclRevision: 2,
+            Sbz1: 0,
+            AclSize: 4,
+            AceCount: 0,
+            Sbz2: 0,
+        };
+        assert!(ace_bytes(&security.0, &raw mut truncated, 0).is_err());
+        Ok(())
+    }
 }

@@ -1,5 +1,6 @@
 //! User-scoped Windows encryption for optional private conversation recovery.
-use std::{io, ptr};
+use std::ops::Deref;
+use std::{fmt, io, ptr};
 use windows_sys::Win32::{
     Foundation::LocalFree,
     Security::Cryptography::{
@@ -11,6 +12,37 @@ use zeroize::Zeroize as _;
 const MAX_PLAIN: usize = 8 * 1024 * 1024;
 const MAX_SEALED: usize = MAX_PLAIN + 65_536;
 const PURPOSE: &[u8] = b"SwiftBonsai2.ChatRecovery.v1";
+
+/// Owned DPAPI plaintext buffer that zeroizes its contents when dropped.
+pub struct ZeroizingBytes(Vec<u8>);
+
+impl Deref for ZeroizingBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for ZeroizingBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ZeroizingBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ZeroizingBytes")
+            .field(&self.0.len())
+            .finish()
+    }
+}
+
+impl Drop for ZeroizingBytes {
+    fn drop(&mut self) {
+        self.0.as_mut_slice().zeroize();
+    }
+}
 
 /// Encrypts bounded conversation data for the current Windows user with DPAPI.
 ///
@@ -24,13 +56,23 @@ pub fn protect_private_data(data: &[u8]) -> io::Result<Vec<u8>> {
     transform(data, true)
 }
 
+/// Authenticates and decrypts this application's DPAPI conversation data into a
+/// zeroizing buffer.
+///
+/// # Errors
+/// Rejects empty, oversized, corrupted or inaccessible encrypted data, including
+/// data protected for another Windows user. Plaintext is bounded to 8 MiB.
+pub fn unprotect_private_data_zeroizing(data: &[u8]) -> io::Result<ZeroizingBytes> {
+    transform(data, false).map(ZeroizingBytes)
+}
+
 /// Authenticates and decrypts this application's DPAPI conversation data.
 ///
 /// # Errors
 /// Rejects empty, oversized, corrupted or inaccessible encrypted data, including
 /// data protected for another Windows user. Plaintext is bounded to 8 MiB.
 pub fn unprotect_private_data(data: &[u8]) -> io::Result<Vec<u8>> {
-    transform(data, false)
+    unprotect_private_data_zeroizing(data).map(|mut bytes| std::mem::take(&mut bytes.0))
 }
 
 fn borrowed(data: &[u8]) -> io::Result<CRYPT_INTEGER_BLOB> {
@@ -125,12 +167,19 @@ mod tests {
         let mut sealed = protect_private_data(plain)?;
         assert!(!sealed.windows(plain.len()).any(|window| window == plain));
         assert_eq!(unprotect_private_data(&sealed)?, plain);
+        let zeroized = unprotect_private_data_zeroizing(&sealed)?;
+        assert_eq!(&*zeroized, plain);
+        assert_eq!(zeroized.as_ref(), plain);
+        assert!(!format!("{zeroized:?}").contains("private draft"));
+        drop(zeroized);
         if let Some(last) = sealed.last_mut() {
             *last ^= 1;
         }
         assert!(unprotect_private_data(&sealed).is_err());
+        assert!(unprotect_private_data_zeroizing(&sealed).is_err());
         assert!(protect_private_data(&[]).is_err());
         assert!(unprotect_private_data(b"not a Windows protected blob").is_err());
+        assert!(unprotect_private_data_zeroizing(b"not a Windows protected blob").is_err());
         assert!(protect_private_data(&vec![0; MAX_PLAIN + 1]).is_err());
         Ok(())
     }

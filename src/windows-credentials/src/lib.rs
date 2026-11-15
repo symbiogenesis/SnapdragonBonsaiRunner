@@ -26,7 +26,9 @@ mod native;
 )]
 mod sealed;
 
-pub use sealed::{protect_private_data, unprotect_private_data};
+pub use sealed::{
+    ZeroizingBytes, protect_private_data, unprotect_private_data, unprotect_private_data_zeroizing,
+};
 
 #[allow(
     unsafe_code,
@@ -221,7 +223,7 @@ impl PrivateCredentials {
         let backend_path = directory.join("backend.key");
         let (frontend_key, frontend_handle) = create_key(&frontend_path, &file_security)?;
         let (backend_key, backend_handle) = create_key(&backend_path, &file_security)?;
-        if frontend_key.0 == backend_key.0 {
+        if constant_time_eq_64(&frontend_key.0, &backend_key.0) {
             return Err(io::Error::other(
                 "The random source returned duplicate credentials.",
             ));
@@ -394,12 +396,20 @@ fn create_key(path: &Path, security: &native::Security) -> io::Result<(Secret<64
     let mut actual = Secret::<64>::new();
     reader.read_exact(&mut *actual.0)?;
     let mut extra = Secret::<1>::new();
-    if actual.0 != secret.0 || reader.read(&mut *extra.0)? != 0 {
+    if !constant_time_eq_64(&actual.0, &secret.0) || reader.read(&mut *extra.0)? != 0 {
         return Err(io::Error::other(
             "Credential content changed before publication.",
         ));
     }
     Ok((secret, reader))
+}
+
+fn constant_time_eq_64(lhs: &[u8; 64], rhs: &[u8; 64]) -> bool {
+    let mut diff = 0_u8;
+    for (&a, &b) in lhs.iter().zip(rhs.iter()) {
+        diff |= std::hint::black_box(a ^ b);
+    }
+    diff == 0
 }
 
 fn hex(bytes: &[u8]) -> String {
