@@ -25,6 +25,9 @@ struct CachedBlob {
     modified_ns: u128,
 }
 
+const PUSH_CACHE_INCREMENTAL_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const PUSH_CACHE_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 struct Work {
     directory: PathBuf,
     started: Instant,
@@ -820,6 +823,67 @@ impl Work {
         }
     }
 
+    fn directory_bytes(root: &Path) -> u64 {
+        let mut total = 0_u64;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let kind = meta.file_type();
+                if kind.is_symlink() {
+                    continue;
+                }
+                if kind.is_dir() {
+                    stack.push(entry.path());
+                } else if kind.is_file() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+        total
+    }
+
+    fn prune_target_cache(
+        target_dir: &Path,
+        incremental_limit: u64,
+        hard_limit: u64,
+    ) -> Result<()> {
+        let initial = Self::directory_bytes(target_dir);
+        if initial <= incremental_limit {
+            return Ok(());
+        }
+        for relative in [
+            "debug/incremental",
+            "aarch64-pc-windows-msvc/debug/incremental",
+            "aarch64-unknown-linux-gnu/debug/incremental",
+        ] {
+            Self::remove_entry(&target_dir.join(relative))?;
+        }
+        let after_incremental = Self::directory_bytes(target_dir);
+        if after_incremental <= hard_limit {
+            return Ok(());
+        }
+        // Multi-toolchain accumulation exceeded the hard bound: drop cached
+        // dependency units while preserving verified helper binaries, receipts,
+        // source blob state and the held `.bonsai-source.lock` file.
+        for relative in [
+            "debug",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-pc-windows-msvc/debug/deps",
+            "aarch64-pc-windows-msvc/debug/build",
+            "aarch64-pc-windows-msvc/debug/examples",
+            "aarch64-pc-windows-msvc/debug/.fingerprint",
+        ] {
+            Self::remove_entry(&target_dir.join(relative))?;
+        }
+        Ok(())
+    }
+
     fn format_check(&mut self, source: &Path) -> Result<()> {
         let toolchain = super::super::push_format::toolchain(source)?;
         #[cfg(test)]
@@ -1507,6 +1571,13 @@ pub(super) fn check(
             let changed_paths: Vec<String> = paths.iter().cloned().collect();
             if let Some(target_dir) = cache_target.as_ref() {
                 let _cache_lock = work.lock_source_cache(target_dir)?;
+                if number == 0 {
+                    Work::prune_target_cache(
+                        target_dir,
+                        PUSH_CACHE_INCREMENTAL_LIMIT_BYTES,
+                        PUSH_CACHE_HARD_LIMIT_BYTES,
+                    )?;
+                }
                 let stable_source = Work::stable_source_dir(target_dir)?;
                 work.sync_commit(root, commit, number, target_dir, &stable_source)?;
                 work.checks(policy, &stable_source, &changed_paths)?;
@@ -2054,6 +2125,95 @@ mod tests {
         })();
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Push sync test fixture cleanup escaped temp.".into());
+        }
+        if scratch.exists() {
+            Work::remove_entry(&scratch)?;
+        }
+        result
+    }
+
+    #[test]
+    fn prune_target_cache_trims_incremental_before_deps_and_keeps_receipts() -> Result<()> {
+        let temporary = std::env::temp_dir();
+        let scratch = temporary.join(format!("bonsai-push-prune-test-{}", std::process::id()));
+        if scratch.exists() {
+            Work::remove_entry(&scratch)?;
+        }
+        let result = (|| -> Result<()> {
+            let win_debug = scratch.join("aarch64-pc-windows-msvc/debug");
+            fs::create_dir_all(win_debug.join("incremental/session-1"))
+                .map_err(|error| error.to_string())?;
+            fs::create_dir_all(win_debug.join("deps")).map_err(|error| error.to_string())?;
+            fs::create_dir_all(scratch.join("debug/incremental"))
+                .map_err(|error| error.to_string())?;
+            fs::create_dir_all(scratch.join("aarch64-unknown-linux-gnu/debug/deps"))
+                .map_err(|error| error.to_string())?;
+
+            fs::write(scratch.join(".bonsai-source.lock"), b"lock")
+                .map_err(|error| error.to_string())?;
+            fs::write(scratch.join(".bonsai-source-blobs.json"), b"{}")
+                .map_err(|error| error.to_string())?;
+            fs::write(scratch.join("push-checker.json"), b"{\"SchemaVersion\":1}")
+                .map_err(|error| error.to_string())?;
+            fs::write(scratch.join("push-recovery.json"), b"{\"SchemaVersion\":1}")
+                .map_err(|error| error.to_string())?;
+            fs::write(win_debug.join("bonsai-ci.exe"), b"checker-bytes")
+                .map_err(|error| error.to_string())?;
+            fs::write(
+                win_debug.join("bonsai-push-recovery.exe"),
+                b"recovery-bytes",
+            )
+            .map_err(|error| error.to_string())?;
+            fs::write(win_debug.join("deps/libdep.rmeta"), &[b'd'; 400])
+                .map_err(|error| error.to_string())?;
+            fs::write(
+                win_debug.join("incremental/session-1/work.bin"),
+                &[b'i'; 700],
+            )
+            .map_err(|error| error.to_string())?;
+            fs::write(scratch.join("debug/incremental/host.bin"), &[b'h'; 200])
+                .map_err(|error| error.to_string())?;
+            fs::write(
+                scratch.join("aarch64-unknown-linux-gnu/debug/deps/linux.rmeta"),
+                &[b'l'; 300],
+            )
+            .map_err(|error| error.to_string())?;
+
+            // Stage 1: exceeds incremental_limit (1000), drops incremental/ but stays <= hard_limit (1200).
+            Work::prune_target_cache(&scratch, 1000, 1200)?;
+            assert!(!win_debug.join("incremental").exists());
+            assert!(!scratch.join("debug/incremental").exists());
+            assert!(win_debug.join("deps/libdep.rmeta").is_file());
+            assert!(
+                scratch
+                    .join("aarch64-unknown-linux-gnu/debug/deps/linux.rmeta")
+                    .is_file()
+            );
+            assert!(win_debug.join("bonsai-ci.exe").is_file());
+            assert!(scratch.join("push-checker.json").is_file());
+
+            // Stage 2: tightening hard_limit (200) drops deps/host/linux caches while keeping helpers & receipts.
+            Work::prune_target_cache(&scratch, 100, 200)?;
+            assert!(!win_debug.join("deps").exists());
+            assert!(!scratch.join("debug").exists());
+            assert!(!scratch.join("aarch64-unknown-linux-gnu").exists());
+            assert_eq!(
+                fs::read(win_debug.join("bonsai-ci.exe")).map_err(|error| error.to_string())?,
+                b"checker-bytes"
+            );
+            assert_eq!(
+                fs::read(win_debug.join("bonsai-push-recovery.exe"))
+                    .map_err(|error| error.to_string())?,
+                b"recovery-bytes"
+            );
+            assert!(scratch.join("push-checker.json").is_file());
+            assert!(scratch.join("push-recovery.json").is_file());
+            assert!(scratch.join(".bonsai-source.lock").is_file());
+            assert!(scratch.join(".bonsai-source-blobs.json").is_file());
+            Ok(())
+        })();
+        if scratch.parent() != Some(temporary.as_path()) {
+            return Err("Push prune test fixture cleanup escaped temp.".into());
         }
         if scratch.exists() {
             Work::remove_entry(&scratch)?;

@@ -829,6 +829,10 @@ under `<target>-source` (coordinated via an exclusive `.bonsai-source.lock` file
 so Cargo paths and unchanged-file timestamps and fingerprints remain warm across runs;
 outgoing tip snapshots passed to `push-sanity` synchronize into `<target>-source`
 for the same content-fingerprint and incremental Cargo cache reuse.
+Under `.bonsai-source.lock`, `push-sanity` bounds the shared `<target>` cache by
+pruning `incremental/` directories above 6 GiB and resetting accumulated dependency
+generations above 10 GiB while preserving verified helper binaries, receipts and
+`.bonsai-source-blobs.json`.
 The native checker groups each tip's selected PowerShell calls into one supervised
 process, invoking each trusted script in a child scope and rejecting a failed call before
 starting another. Source-language scanning filters whole files with the existing

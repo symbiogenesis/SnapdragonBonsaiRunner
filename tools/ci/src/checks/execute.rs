@@ -18,6 +18,54 @@ use crate::Result;
 const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONSOLE_LOG_BYTES: u64 = 12 * 1024;
 const MAX_HIGHLIGHT_BYTES: usize = 4 * 1024;
+const MAX_SUMMARY_FAILURES: usize = 16;
+
+pub(crate) fn describe_exit_code(code: u32) -> String {
+    if code < 0x8000_0000 {
+        return code.to_string();
+    }
+    let label = match code {
+        0x8000_0003 => Some("STATUS_BREAKPOINT"),
+        0xC000_0005 => Some("STATUS_ACCESS_VIOLATION"),
+        0xC000_001D => Some("STATUS_ILLEGAL_INSTRUCTION"),
+        0xC000_0094 => Some("STATUS_INTEGER_DIVIDE_BY_ZERO"),
+        0xC000_00FD => Some("STATUS_STACK_OVERFLOW"),
+        0xC000_0135 => Some("STATUS_DLL_NOT_FOUND"),
+        0xC000_013A => Some("STATUS_CONTROL_C_EXIT"),
+        0xC000_0142 => Some("STATUS_DLL_INIT_FAILED"),
+        0xC000_0374 => Some("STATUS_HEAP_CORRUPTION"),
+        0xC000_0409 => Some("STATUS_STACK_BUFFER_OVERRUN / __fastfail"),
+        _ => None,
+    };
+    match label {
+        Some(name) => format!("{code} (0x{code:08X}: {name})"),
+        None => format!("{code} (0x{code:08X})"),
+    }
+}
+
+fn sanitize_console_line(line: &str) -> String {
+    let mut sanitized = String::with_capacity(line.len());
+    for character in line.chars() {
+        sanitized.push(if character.is_control() && character != '\t' {
+            '\u{fffd}'
+        } else {
+            character
+        });
+    }
+    sanitized
+}
+
+fn flush_repeated_line(excerpt: &mut String, previous: &str, count: usize) {
+    if count == 2 {
+        let _ = writeln!(excerpt, "  | {previous}");
+    } else if count >= 3 {
+        let _ = writeln!(
+            excerpt,
+            "  | [previous line repeated {} more times]",
+            count - 1
+        );
+    }
+}
 
 fn console_excerpt(bytes: &[u8]) -> String {
     if bytes.is_empty() {
@@ -25,20 +73,34 @@ fn console_excerpt(bytes: &[u8]) -> String {
     }
     let text = String::from_utf8_lossy(bytes);
     let mut excerpt = String::new();
+    let mut previous: Option<String> = None;
+    let mut repeat_count = 0_usize;
     for line in text.lines() {
         // Captured output must not become a GitHub workflow command or emit
         // terminal control sequences. Preserve the original bytes in artifacts.
-        excerpt.push_str("  | ");
-        for character in line.chars() {
-            excerpt.push(if character.is_control() && character != '\t' {
-                '\u{fffd}'
-            } else {
-                character
-            });
+        let sanitized = sanitize_console_line(line);
+        if previous.as_deref() == Some(sanitized.as_str()) {
+            repeat_count += 1;
+            continue;
         }
-        excerpt.push('\n');
+        if let Some(prev) = previous.take() {
+            flush_repeated_line(&mut excerpt, &prev, repeat_count);
+        }
+        let _ = writeln!(excerpt, "  | {sanitized}");
+        previous = Some(sanitized);
+        repeat_count = 1;
+    }
+    if let Some(prev) = previous {
+        flush_repeated_line(&mut excerpt, &prev, repeat_count);
     }
     excerpt
+}
+
+fn is_failed_test_line(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("test ")
+        .and_then(|rest| rest.split_once(" ... "))
+        .is_some_and(|(_, outcome)| outcome == "FAILED" || outcome.starts_with("FAILED "))
 }
 
 fn is_diagnostic_headline(trimmed: &str) -> bool {
@@ -48,6 +110,59 @@ fn is_diagnostic_headline(trimmed: &str) -> bool {
         || trimmed.starts_with("error:")
         || trimmed == "failures:"
         || trimmed.starts_with("test result: FAILED")
+        || is_failed_test_line(trimmed)
+}
+
+fn summarize_test_failure(stdout: &str, code: u32) -> (Vec<String>, Option<String>) {
+    let mut failed_tests = Vec::new();
+    let mut suite_expected: Option<usize> = None;
+    let mut suite_completed = 0_usize;
+    let mut suite_last_test: Option<String> = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("running ")
+            && let Some(count_str) = rest
+                .strip_suffix(" tests")
+                .or_else(|| rest.strip_suffix(" test"))
+            && let Ok(expected) = count_str.parse::<usize>()
+        {
+            suite_expected = Some(expected);
+            suite_completed = 0;
+            suite_last_test = None;
+            continue;
+        }
+        if trimmed.starts_with("test result:") {
+            suite_expected = None;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("test ")
+            && let Some((name, outcome)) = rest.split_once(" ... ")
+        {
+            if outcome == "FAILED" || outcome.starts_with("FAILED ") {
+                if !failed_tests.iter().any(|existing| existing == name) {
+                    failed_tests.push(name.to_owned());
+                }
+                suite_completed += 1;
+                suite_last_test = Some(name.to_owned());
+            } else if outcome == "ok"
+                || outcome.starts_with("ok ")
+                || outcome == "ignored"
+                || outcome.starts_with("ignored ")
+            {
+                suite_completed += 1;
+                suite_last_test = Some(name.to_owned());
+            }
+        }
+    }
+    let crash_diagnostic = suite_expected.map(|expected| {
+        let last = suite_last_test
+            .map_or_else(String::new, |name| format!(" (last completed: `{name}`)"));
+        format!(
+            "Test binary terminated before `test result:` ({}) after {suite_completed}/{expected} completed tests{last}; the crashing test was in-flight under concurrent libtest execution.",
+            describe_exit_code(code)
+        )
+    });
+    (failed_tests, crash_diagnostic)
 }
 
 pub(crate) fn extract_prefix_highlights(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
@@ -157,9 +272,10 @@ fn format_step_summary(report: &Value) -> String {
             } else {
                 "FAIL"
             };
-            let exit = check["ExitCode"]
-                .as_u64()
-                .map_or_else(|| "-".to_owned(), |code| code.to_string());
+            let exit = check["ExitCode"].as_u64().map_or_else(
+                || "-".to_owned(),
+                |code| u32::try_from(code).map_or_else(|_| code.to_string(), describe_exit_code),
+            );
             let elapsed = check["ElapsedMilliseconds"].as_u64().map_or_else(
                 || "-".to_owned(),
                 |ms| format!("{}.{:02}s", ms / 1000, (ms % 1000) / 10),
@@ -168,6 +284,33 @@ fn format_step_summary(report: &Value) -> String {
                 out,
                 "| `{name}` | `{phase}` | `{packages}` | `{status}` | `{exit}` | `{elapsed}` |"
             );
+        }
+        for check in checks {
+            let name = check["Name"].as_str().unwrap_or("unknown");
+            if let Some(crash) = check["CrashDiagnostic"].as_str() {
+                let _ = writeln!(out, "\n- **`{name}` crash:** {crash}");
+            }
+            if let Some(failed_tests) = check["FailedTests"].as_array()
+                && !failed_tests.is_empty()
+            {
+                let shown: Vec<_> = failed_tests
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(MAX_SUMMARY_FAILURES)
+                    .map(|case| format!("`{case}`"))
+                    .collect();
+                let extra = failed_tests.len().saturating_sub(shown.len());
+                let suffix = if extra == 0 {
+                    String::new()
+                } else {
+                    format!(" (+{extra} more)")
+                };
+                let _ = writeln!(
+                    out,
+                    "\n- **`{name}` failed tests:** {}{suffix}",
+                    shown.join(", ")
+                );
+            }
         }
     }
     if let Some(error) = report["Error"].as_str() {
@@ -339,7 +482,8 @@ pub(in crate::command) fn command_with_deadline(
     if code != 0 {
         let _ = writeln!(
             output,
-            "Command failed with exit code {code}; log: {}",
+            "Command failed with exit code {}; log: {}",
+            describe_exit_code(code),
             log.display()
         );
         write_failure_logs(&mut output, spec);
@@ -438,6 +582,17 @@ impl Execution<'_> {
                 .into();
             if let Ok((code, stdout)) = &result {
                 record["ExitCode"] = (*code).into();
+                if check.phase == "test" && *code != 0 {
+                    let (failed_tests, crash_diagnostic) = summarize_test_failure(stdout, *code);
+                    if !failed_tests.is_empty() {
+                        record["FailedTests"] = failed_tests.into();
+                    }
+                    if let Some(crash) = crash_diagnostic {
+                        let _ =
+                            writeln!(std::io::stderr().lock(), "  | [crash diagnostic] {crash}");
+                        record["CrashDiagnostic"] = crash.into();
+                    }
+                }
                 match super::focused_test_result(check, *code, stdout) {
                     Ok(passed) => {
                         record["Passed"] = (*code == 0).into();
@@ -613,5 +768,82 @@ mod tests {
         assert!(distinct(&root, &root.join("nested")).is_err());
         assert!(distinct(&root.join("nested"), &root).is_err());
         assert!(distinct(Path::new("relative"), &root).is_err());
+    }
+
+    #[test]
+    fn exit_codes_decode_windows_ntstatus_and_preserve_small_codes() {
+        assert_eq!(describe_exit_code(1), "1");
+        assert_eq!(describe_exit_code(101), "101");
+        assert_eq!(
+            describe_exit_code(0xC000_0409),
+            "3221226505 (0xC0000409: STATUS_STACK_BUFFER_OVERRUN / __fastfail)"
+        );
+        assert_eq!(
+            describe_exit_code(0xC000_0005),
+            "3221225477 (0xC0000005: STATUS_ACCESS_VIOLATION)"
+        );
+        assert_eq!(describe_exit_code(0xDEAD_BEEF), "3735928559 (0xDEADBEEF)");
+    }
+
+    #[test]
+    fn console_excerpt_collapses_consecutive_duplicate_lines() {
+        let mut noisy = String::new();
+        noisy.push_str("alpha\n");
+        noisy.push_str("pair\npair\n");
+        for _ in 0..5 {
+            noisy.push_str("Local model request failed: connection refused\n");
+        }
+        noisy.push_str("omega\n");
+        assert_eq!(
+            console_excerpt(noisy.as_bytes()),
+            concat!(
+                "  | alpha\n",
+                "  | pair\n",
+                "  | pair\n",
+                "  | Local model request failed: connection refused\n",
+                "  | [previous line repeated 4 more times]\n",
+                "  | omega\n",
+            )
+        );
+    }
+
+    #[test]
+    fn step_summary_surfaces_failed_tests_and_aborted_suite_crash() -> Result<()> {
+        let stdout = concat!(
+            "running 3 tests\n",
+            "test alpha ... ok <0.001s>\n",
+            "test beta ... FAILED <0.004s>\n",
+            "test result: ok. 0 passed; 0 failed\n",
+            "running 79 tests\n",
+            "test asr::first ... ok <0.010s>\n",
+            "test asr::seventy_eighth ... ok <0.015s>\n",
+        );
+        let (failed, crash) = summarize_test_failure(stdout, 0xC000_0409);
+        assert_eq!(failed, vec!["beta".to_owned()]);
+        let crash_text = crash.ok_or("expected mid-suite crash diagnostic")?;
+        assert!(crash_text.contains("STATUS_STACK_BUFFER_OVERRUN"));
+        assert!(crash_text.contains("2/79 completed tests"));
+        assert!(crash_text.contains("asr::seventy_eighth"));
+
+        let report = json!({
+            "Checks": [{
+                "Name": "bonsai-speech-asr-test",
+                "Phase": "test",
+                "Packages": ["bonsai-speech-asr"],
+                "Passed": false,
+                "ExitCode": 0xC000_0409_u32,
+                "ElapsedMilliseconds": 41_910_u64,
+                "FailedTests": failed,
+                "CrashDiagnostic": crash_text,
+            }],
+            "Error": "Rust checks failed: bonsai-speech-asr-test."
+        });
+        let summary = format_step_summary(&report);
+        assert!(
+            summary.contains("3221226505 (0xC0000409: STATUS_STACK_BUFFER_OVERRUN / __fastfail)")
+        );
+        assert!(summary.contains("**`bonsai-speech-asr-test` crash:**"));
+        assert!(summary.contains("**`bonsai-speech-asr-test` failed tests:** `beta`"));
+        Ok(())
     }
 }
