@@ -190,7 +190,7 @@ pub struct PrivateCredentials {
     backend_key: Secret<64>,
     _directory_handle: File,
     _frontend_handle: File,
-    _backend_handle: File,
+    _backend_handle: Option<File>,
 }
 
 impl PrivateCredentials {
@@ -206,6 +206,23 @@ impl PrivateCredentials {
     /// Returns an error for an unsafe/nonexisting parent, random-source failure,
     /// creation collision, unexpected ACLs, or file I/O failure.
     pub fn create(parent: &Path) -> io::Result<Self> {
+        Self::create_inner(parent, true)
+    }
+
+    /// Creates a fresh randomized private directory with `frontend.key` on disk
+    /// and a distinct 256-bit backend credential kept solely in process memory.
+    ///
+    /// Used for offline contained workers that receive their backend bearer key
+    /// over a parent-owned pipe rather than opening a `backend.key` file on disk.
+    ///
+    /// # Errors
+    /// Returns an error for an unsafe/nonexisting parent, random-source failure,
+    /// creation collision, unexpected ACLs, or file I/O failure.
+    pub fn create_frontend_only(parent: &Path) -> io::Result<Self> {
+        Self::create_inner(parent, false)
+    }
+
+    fn create_inner(parent: &Path, create_backend_file: bool) -> io::Result<Self> {
         validate_external_path(parent)?;
         if !fs::metadata(parent)?.is_dir() {
             return Err(invalid("Credential parent must be an existing directory."));
@@ -222,7 +239,12 @@ impl PrivateCredentials {
         let frontend_path = directory.join("frontend.key");
         let backend_path = directory.join("backend.key");
         let (frontend_key, frontend_handle) = create_key(&frontend_path, &file_security)?;
-        let (backend_key, backend_handle) = create_key(&backend_path, &file_security)?;
+        let (backend_key, backend_handle) = if create_backend_file {
+            let (key, handle) = create_key(&backend_path, &file_security)?;
+            (key, Some(handle))
+        } else {
+            (random_hex_secret()?, None)
+        };
         if constant_time_eq_64(&frontend_key.0, &backend_key.0) {
             return Err(io::Error::other(
                 "The random source returned duplicate credentials.",
@@ -252,10 +274,16 @@ impl PrivateCredentials {
         &self.frontend_path
     }
 
-    /// Returns the backend credential file path.
+    /// Returns the backend credential file path (present on disk only when `has_backend_file()` is true).
     #[must_use]
     pub fn backend_path(&self) -> &Path {
         &self.backend_path
+    }
+
+    /// Returns whether a protected `backend.key` file exists and is held open on disk.
+    #[must_use]
+    pub const fn has_backend_file(&self) -> bool {
+        self._backend_handle.is_some()
     }
 
     /// Borrows the frontend secret. Callers must not log or debug-format it.
@@ -380,14 +408,19 @@ fn check_existing(path: &Path) -> io::Result<bool> {
     Ok(metadata.is_dir())
 }
 
-fn create_key(path: &Path, security: &native::Security) -> io::Result<(Secret<64>, File)> {
-    // CREATE_NEW and the protected ACL precede generation of this file's secret.
-    let mut writer = native::create_file(path, security)?;
-    security.verify(&writer)?;
+fn random_hex_secret() -> io::Result<Secret<64>> {
     let mut random = Secret::<32>::new();
     native::random(&mut *random.0)?;
     let mut secret = Secret::<64>::new();
     encode_hex(&random.0, &mut secret.0);
+    Ok(secret)
+}
+
+fn create_key(path: &Path, security: &native::Security) -> io::Result<(Secret<64>, File)> {
+    // CREATE_NEW and the protected ACL precede generation of this file's secret.
+    let mut writer = native::create_file(path, security)?;
+    security.verify(&writer)?;
+    let secret = random_hex_secret()?;
     writer.write_all(&*secret.0)?;
     writer.sync_all()?;
     drop(writer);

@@ -110,11 +110,15 @@ fn credentials_have_protected_acls_distinct_keys_and_retained_readers() -> io::R
     let directory_security = native::Security::new(true)?;
     let file_security = native::Security::new(false)?;
     directory_security.verify(&credentials._directory_handle)?;
+    let backend_handle = credentials
+        ._backend_handle
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing backend key handle"))?;
     file_security.verify(&credentials._frontend_handle)?;
-    file_security.verify(&credentials._backend_handle)?;
+    file_security.verify(backend_handle)?;
     assert!(native::noninheritable(&credentials._directory_handle)?);
     assert!(native::noninheritable(&credentials._frontend_handle)?);
-    assert!(native::noninheritable(&credentials._backend_handle)?);
+    assert!(native::noninheritable(backend_handle)?);
     for path in [credentials.frontend_path(), credentials.backend_path()] {
         // ReadAllText-style readers can open while retained handles are live.
         let mut on_disk = Secret::<64>::new();
@@ -233,5 +237,30 @@ fn path_validation_rejects_win32_device_aliases_and_control_characters() -> io::
         validate_external_path(&lane.join(component))?;
         assert!(!reserved_component(component));
     }
+    Ok(())
+}
+
+#[test]
+fn frontend_only_credentials_generate_in_memory_backend_key_without_backend_file() -> io::Result<()>
+{
+    let lane = test_lane("frontend-only")?;
+    let credentials = PrivateCredentials::create_frontend_only(&lane)?;
+    assert!(!credentials.has_backend_file());
+    assert!(credentials.frontend_path().exists());
+    assert!(!credentials.backend_path().exists());
+    assert_eq!(fs::read_dir(credentials.directory())?.count(), 1);
+    for key in [credentials.frontend_key(), credentials.backend_key()] {
+        assert_eq!(key.len(), 64);
+        assert!(
+            key.bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        );
+    }
+    assert_ne!(credentials.frontend_key(), credentials.backend_key());
+
+    let retained = RetainedCredential::open(credentials.frontend_path())?;
+    assert_eq!(retained.as_hex(), credentials.frontend_key());
+    drop(retained);
+    drop(credentials);
     Ok(())
 }
