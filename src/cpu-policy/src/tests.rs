@@ -354,6 +354,14 @@ fn family_thread_budgets_and_speculation_arguments_stay_bounded() -> Result<(), 
         hardware::SnapdragonFamily::X2EliteExtreme.default_thread_budget(),
         (6, 6)
     );
+    assert_eq!(
+        hardware::SnapdragonFamily::XElite.default_speech_asr_budget(),
+        (8, 10)
+    );
+    assert_eq!(
+        hardware::SnapdragonFamily::X2EliteExtreme.default_speech_asr_budget(),
+        (8, 16)
+    );
 
     let x1_args = completion_arguments_for_family(
         "C:\\models\\Swift.gguf",

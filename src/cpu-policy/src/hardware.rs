@@ -88,6 +88,20 @@ impl SnapdragonFamily {
         }
     }
 
+    /// Default `(decode, batch)` CPU thread budget for Qwen3-ASR 1.7B on this family.
+    ///
+    /// Snapdragon X Elite uses `8` single-token decode/session threads across two
+    /// Oryon clusters and `10` batch threads (`12 - 2`, reserving two cores for the
+    /// UI and audio capture) across compute-dense frontend, CNN, encoder and prefill
+    /// phases; X2 Elite Extreme uses `(8, 16)`.
+    #[must_use]
+    pub const fn default_speech_asr_budget(self) -> (u16, u16) {
+        match self {
+            Self::XElite => (8, 10),
+            Self::X2EliteExtreme => (8, 16),
+        }
+    }
+
     /// Check an evidence label against the observed name when present.
     ///
     /// Only legacy X1 receipts may omit the processor observation. Newer family
