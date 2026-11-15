@@ -106,14 +106,19 @@ Release analysis passed. Native bridge compilation and complete owning acceptanc
 remain pending. Separate independent Rust providers for `threadpool.hpp` (`test-barrier`),
 `batch_allocator.hpp` (`test-batch-alloc`), `allocation.hpp` (`test-alloc`),
 `quantization.hpp` (`test-quant-type-selection`), top-level `unicode-*` dispatch in
-`bridge.cpp` (`test-unicode`), `arena_graph.hpp` (`test-moe-weighted-reduce`), and
-`tensor_graph.hpp` (`test-col2im-1d`, `test-dfly-fusion`, `test-rope`) additionally pass
-their focused `reference_*` unit tests and Release ARM64 Clippy, removing those six C++
-headers and leaving 29 checked-in C++ files (plus 2 C ABI files = 31 total native files);
-complete Prism suite, native bridge compilation and owning hosted acceptance remain pending.
+`bridge.cpp` (`test-unicode`), `arena_graph.hpp` (`test-moe-weighted-reduce`),
+`tensor_graph.hpp` (`test-col2im-1d`, `test-dfly-fusion`, `test-rope`),
+`gguf.hpp` (`test-gguf`), `sampling.hpp` (`test-sampling`), `grammar.hpp`
+(`test-llama-grammar`, `test-gbnf-validator`, `test-grammar-integration`), and
+`json_schema.hpp` (`test-json-schema-to-grammar`, `test-grammar-integration`)
+additionally pass their focused `reference_*` unit tests and Release ARM64
+Clippy, removing those ten C++ headers and leaving 25 checked-in C++ files (plus
+2 C ABI files = 27 total native files; 28 cross-repo including Runner's 1 C
+file); complete Prism suite, native bridge compilation and owning hosted
+acceptance remain pending.
 
 The [checked-in boundary verifier](../tools/ci/README.md#checked-in-native-retirement-boundary)
-now binds Runner's remaining C file and the reviewed Prism snapshot's 29 C++
+now binds Runner's remaining C file and the reviewed Prism snapshot's 25 C++
 files plus coupled C ABI source/header and migrated Rust assertion/provider edges.
 Exact per-file families and declared
 compiler/provider/contracts identities preserve the green-ID baseline and both
