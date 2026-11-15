@@ -95,11 +95,19 @@ impl Work {
             environment,
         })
         .map_err(|error| format!("Cannot start {program} in {}: {error}", root.display()))?;
+        const AGGREGATE_BUDGET: Duration = Duration::from_secs(270);
+        const OUTPUT_CHECK_INTERVAL: Duration = Duration::from_millis(25);
         let code = loop {
-            if let Some(code) = child.try_wait().map_err(|error| error.to_string())? {
+            let wait = AGGREGATE_BUDGET
+                .saturating_sub(self.started.elapsed())
+                .min(OUTPUT_CHECK_INTERVAL);
+            if let Some(code) = child
+                .wait_for_exit(wait)
+                .map_err(|error| error.to_string())?
+            {
                 break code;
             }
-            if self.started.elapsed() >= Duration::from_secs(270)
+            if self.started.elapsed() >= AGGREGATE_BUDGET
                 || [&stdout, &stderr].into_iter().any(|path| {
                     fs::metadata(path).is_ok_and(|metadata| metadata.len() > 4 * 1024 * 1024)
                 })
@@ -112,7 +120,6 @@ impl Work {
                         .into(),
                 );
             }
-            std::thread::sleep(Duration::from_millis(2));
         };
         child
             .stop(Duration::from_secs(5))

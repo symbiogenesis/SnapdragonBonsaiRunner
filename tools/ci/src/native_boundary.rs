@@ -59,19 +59,21 @@ fn ordinary_path(value: &str) -> bool {
         && !value.bytes().any(|byte| byte.is_ascii_control())
         && !value.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
         && value.split('/').all(|part| {
-            let stem = part
-                .split('.')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_uppercase();
+            let stem = part.split('.').next().unwrap_or_default();
+            let reserved = ["CON", "PRN", "AUX", "NUL"]
+                .iter()
+                .any(|name| stem.eq_ignore_ascii_case(name))
+                || matches!(
+                    stem.as_bytes(),
+                    [prefix @ .., b'1'..=b'9']
+                        if prefix.eq_ignore_ascii_case(b"COM")
+                            || prefix.eq_ignore_ascii_case(b"LPT")
+                );
             !part.is_empty()
                 && part != "."
                 && part != ".."
                 && !part.ends_with(['.', ' '])
-                && !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-                && !((stem.starts_with("COM") || stem.starts_with("LPT"))
-                    && stem.len() == 4
-                    && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+                && !reserved
         })
 }
 
@@ -80,7 +82,8 @@ fn native_path(path: &Path) -> bool {
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             ["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "m", "mm"]
-                .contains(&extension.to_ascii_lowercase().as_str())
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         })
 }
 
