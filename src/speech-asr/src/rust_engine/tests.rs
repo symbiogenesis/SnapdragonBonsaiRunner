@@ -131,6 +131,7 @@ pub(crate) fn recognizer(eos: u32) -> io::Result<RustRecognizer> {
         decoder: Arc::new(model).session(),
         prompt_tokens,
         context: 512,
+        batch_threads: 1,
     })
 }
 
@@ -412,4 +413,17 @@ fn rust_asr_observer_unwind_and_post_observation_cancel_clear_complete_state() -
     assert_cleared(&recognizer);
     assert_eq!(recognizer.transcribe(&[0.0; 201])?, "");
     Ok(())
+}
+
+#[test]
+fn rust_asr_engine_rejects_invalid_thread_budgets_before_opening_model() {
+    let path = Path::new(r"C:\missing\qwen3-asr-1.7b-q8_0.gguf");
+    for invalid_threads in [0, 257] {
+        assert_eq!(
+            RustRecognizer::load_with_threads(path, Some(invalid_threads))
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+    }
 }

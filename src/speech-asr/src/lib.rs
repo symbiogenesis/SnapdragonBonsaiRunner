@@ -11,9 +11,12 @@ pub mod frontend;
 mod intake;
 #[cfg(feature = "native-engine")]
 mod native;
+mod packed;
 pub mod protocol;
 pub mod replay;
+mod row_workers;
 pub mod rust_engine;
+mod threads;
 pub mod tokenizer;
 
 #[cfg(feature = "native-engine")]

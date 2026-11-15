@@ -199,3 +199,61 @@ fn rust_asr_frontend_checkpoint_tables_drive_full_mel_major_pipeline() -> io::Re
     );
     Ok(())
 }
+
+#[test]
+fn rust_asr_frontend_four_frame_simd_and_parallel_match_scalar_bits() -> io::Result<()> {
+    let frontend = frontend()?;
+    for samples in [201, 640, 800, 1440, 2720] {
+        let mut pcm = Vec::with_capacity(samples);
+        for idx in 0..samples {
+            let t = f64::from(u16::try_from(idx).map_err(|_| invalid())?);
+            let sample = (0.45 * (t * 0.071).sin() + 0.35 * (t * 0.293).cos()).clamp(-1.0, 1.0);
+            pcm.push(rounded(sample));
+        }
+        let mut padded = zeroes(pcm.len() + 2 * PAD)?;
+        padded[PAD..PAD + pcm.len()].copy_from_slice(&pcm);
+        reflect_edges(&mut padded, pcm.len());
+        let frames = pcm.len() / HOP_LENGTH;
+        let mut scalar_values = zeroes(MEL_BINS * frames)?;
+        let mut s_input = [0.0_f32; 2 * FFT_SIZE];
+        let mut s_output = [0.0_f32; 8 * FFT_SIZE];
+        let mut s_power = [0.0_f32; FREQUENCIES];
+        let mut s_frame = [0.0_f32; MEL_BINS];
+        for frame in 0..frames {
+            compute_single_frame(
+                &frontend,
+                &padded,
+                frame,
+                &mut s_input,
+                &mut s_output,
+                &mut s_power,
+                &mut s_frame,
+            );
+            for mel in 0..MEL_BINS {
+                scalar_values[mel * frames + frame] = s_frame[mel];
+            }
+        }
+        normalize(&mut scalar_values, &mut || false)?;
+
+        for workers in [1, 2, 4, 8] {
+            let actual = frontend.compute_with_threads(&pcm, workers, || false)?;
+            assert_eq!(actual.frames(), frames);
+            assert_eq!(actual.values().len(), scalar_values.len());
+            for (index, (got, want)) in actual.values().iter().zip(&scalar_values).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "frontend bit mismatch for samples={samples}, workers={workers}, element={index}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        frontend
+            .compute_with_threads(&[0.0; 201], 0, || false)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    Ok(())
+}

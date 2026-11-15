@@ -1,7 +1,6 @@
 //! Retained native control engine, enabled only by the default native-engine feature.
 
 use crate::{MAX_CLIP_SECONDS, SAMPLE_RATE, intake, protocol};
-use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 use std::{
     fs::OpenOptions,
     io::{self, Read},
@@ -51,15 +50,32 @@ pub struct Recognizer {
 }
 
 impl Recognizer {
-    /// Load the selected Qwen3-ASR 1.7B GGUF on CPU, without downloading anything.
+    /// Load the selected Qwen3-ASR 1.7B GGUF on CPU using default thread policy, without downloading anything.
     ///
     /// # Errors
     /// Rejects relative paths, malformed or unexpected model headers, a different
     /// model identity/audio contract, unavailable memory, and native load faults.
     pub fn load(path: &Path) -> io::Result<Self> {
+        Self::load_with_threads(path, None)
+    }
+
+    /// Load the selected Qwen3-ASR 1.7B GGUF on CPU with an optional thread budget, without downloading anything.
+    ///
+    /// `None` selects the host-bounded ASR native session budget (up to 8 Oryon
+    /// threads across two clusters on Snapdragon X1/X2); `Some(n)` validates `1..=256`.
+    ///
+    /// # Errors
+    /// Rejects relative paths, invalid thread budgets, malformed or unexpected model
+    /// headers, a different model identity/audio contract, unavailable memory, and
+    /// native load faults.
+    pub fn load_with_threads(path: &Path, threads: Option<usize>) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid("Use an absolute, verified Qwen3-ASR model path."));
         }
+        let n_threads = crate::threads::select_native_threads(
+            threads,
+            std::thread::available_parallelism()?.get(),
+        )?;
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(windows)]
@@ -105,7 +121,7 @@ impl Recognizer {
         )?;
         let session = model
             .session_with(&SessionOptions {
-                n_threads: 4,
+                n_threads,
                 n_ctx: 8192,
                 ..SessionOptions::default()
             })
@@ -172,29 +188,8 @@ fn check_cancelled(cancellation: &Cancellation) -> io::Result<()> {
     Ok(())
 }
 
-#[expect(
-    clippy::inline_always,
-    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
-)]
-#[inline(always)]
-fn pcm_in_unit_range_simd<S: Simd>(simd: S, pcm: &[f32]) -> bool {
-    let min_v = f32x4::splat(simd, -1.0_f32);
-    let max_v = f32x4::splat(simd, 1.0_f32);
-    let (chunks, tail) = pcm.as_chunks::<4>();
-    for chunk in chunks {
-        let v = f32x4::from_slice(simd, chunk);
-        let valid = v.simd_ge(min_v) & v.simd_le(max_v);
-        if !valid.all_true() {
-            return false;
-        }
-    }
-    tail.iter()
-        .all(|sample| sample.is_finite() && (-1.0..=1.0).contains(sample))
-}
-
 fn validate_pcm(pcm: &[f32]) -> io::Result<()> {
-    let level = Level::new();
-    let in_range = dispatch!(level, simd => pcm_in_unit_range_simd(simd, pcm));
+    let in_range = crate::packed::pcm_in_unit_range(pcm);
     if pcm.is_empty() || pcm.len() > MAX_SAMPLES || !in_range {
         return Err(invalid(
             "Qwen3-ASR requires bounded, finite mono 16 kHz samples normalized to [-1, 1].",
@@ -348,5 +343,18 @@ mod tests {
         }
         header.extend(129_u64.to_le_bytes());
         assert!(validate_header(&mut Cursor::new(header)).is_err());
+    }
+
+    #[test]
+    fn qwen_asr_rejects_invalid_thread_budgets_before_opening_model() {
+        let path = Path::new(r"C:\missing\qwen3-asr-1.7b-q8_0.gguf");
+        for invalid_threads in [0, 257] {
+            assert_eq!(
+                Recognizer::load_with_threads(path, Some(invalid_threads))
+                    .err()
+                    .map(|error| error.kind()),
+                Some(io::ErrorKind::InvalidInput)
+            );
+        }
     }
 }

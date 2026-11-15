@@ -115,6 +115,7 @@ fn rust_asr_encoder_convolution_half_operands_and_every_stage_narrowing() -> io:
     let Encoder {
         config,
         mut weights,
+        ..
     } = fixture()?;
     let mut kernel = vec![0.0; 9];
     // Binary16 ties: 16 + 2^-7 rounds down to even 16, whereas
@@ -178,6 +179,7 @@ fn rust_asr_encoder_convolution_half_boundaries_and_finite_overflow() -> io::Res
     let Encoder {
         config,
         mut weights,
+        ..
     } = fixture()?;
     let mut kernel = vec![0.0; 9];
     kernel[4] = 65_520.0;
@@ -266,6 +268,146 @@ fn rust_asr_encoder_failure_cancellation_and_replay() -> io::Result<()> {
     assert_eq!(
         encoder.encode_mel(&[0.0], 1, &mut || false)?.values(),
         &[2.0, -3.0]
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_asr_encoder_batched_parallel_matches_scalar_bits() -> io::Result<()> {
+    fn f32_linear(input: usize, output: usize, seed: usize) -> io::Result<Linear> {
+        let mut weights = Vec::with_capacity(input * output);
+        let denom = f32::from(u16::try_from(input).unwrap_or(1));
+        for row in 0..output {
+            for col in 0..input {
+                let v = ((row * 17 + col * 23 + seed) % 15).cast_signed() - 7;
+                weights.push(f32::from(i8::try_from(v).unwrap_or(0)) / (4.0 * denom));
+            }
+        }
+        let bias = (0..output)
+            .map(|i| {
+                let v = ((i * 11 + seed) % 9).cast_signed() - 4;
+                f32::from(i8::try_from(v).unwrap_or(0)) * 0.03125
+            })
+            .collect();
+        Ok(Linear {
+            weights: Projection::f32(input, output, weights)?,
+            bias,
+        })
+    }
+
+    fn q8_linear(input: usize, output: usize, seed: usize) -> io::Result<Linear> {
+        let blocks_per_row = input / 32;
+        let mut bytes = Vec::with_capacity(output * blocks_per_row * 34);
+        let scales = [0x3800_u16, 0x3400, 0x3C00, 0xB600];
+        for row in 0..output {
+            for blk in 0..blocks_per_row {
+                bytes.extend_from_slice(&scales[(row + blk + seed) % scales.len()].to_le_bytes());
+                for elem in 0..32_u8 {
+                    let v = ((row * 13 + blk * 29 + usize::from(elem) * 7 + seed) % 19)
+                        .cast_signed()
+                        - 9;
+                    bytes.push(i8::try_from(v).unwrap_or(0).cast_unsigned());
+                }
+            }
+        }
+        let bias = (0..output)
+            .map(|i| {
+                let v = ((i * 7 + seed) % 11).cast_signed() - 5;
+                f32::from(i8::try_from(v).unwrap_or(0)) * 0.02
+            })
+            .collect();
+        Ok(Linear {
+            weights: Projection::q8(input, output, bytes)?,
+            bias,
+        })
+    }
+
+    let c = Config {
+        mel_bins: 8,
+        channels: 4,
+        hidden: 32,
+        heads: 4,
+        intermediate: 64,
+        output: 16,
+        window: 5,
+        max_positions: 2,
+    };
+    let build = |threads: usize| -> io::Result<Encoder> {
+        let mut blocks = Vec::with_capacity(2);
+        for layer in 0..2 {
+            let norm_at = |offset: usize| Norm {
+                weight: (0..c.hidden)
+                    .map(|i| 0.85 + f32::from(u8::try_from((i + offset) % 7).unwrap_or(0)) * 0.04)
+                    .collect(),
+                bias: (0..c.hidden)
+                    .map(|i| {
+                        f32::from(i8::try_from(((i + offset) % 5).cast_signed() - 2).unwrap_or(0))
+                            * 0.02
+                    })
+                    .collect(),
+            };
+            blocks.push(Block {
+                attention_norm: norm_at(1 + layer),
+                ffn_norm: norm_at(3 + layer),
+                query: q8_linear(c.hidden, c.hidden, 10 + layer)?,
+                key: f32_linear(c.hidden, c.hidden, 20 + layer)?,
+                value: q8_linear(c.hidden, c.hidden, 30 + layer)?,
+                attention_out: f32_linear(c.hidden, c.hidden, 40 + layer)?,
+                ffn_in: q8_linear(c.hidden, c.intermediate, 50 + layer)?,
+                ffn_out: q8_linear(c.intermediate, c.hidden, 60 + layer)?,
+            });
+        }
+        Encoder::new(
+            c,
+            Weights {
+                convolutions: [
+                    f32_linear(9, c.channels, 1)?,
+                    f32_linear(9 * c.channels, c.channels, 2)?,
+                    f32_linear(9 * c.channels, c.channels, 3)?,
+                ],
+                convolution_out: Projection::f32(
+                    c.channels,
+                    c.hidden,
+                    (0..c.channels * c.hidden)
+                        .map(|i| {
+                            f32::from(i8::try_from((i % 7).cast_signed() - 3).unwrap_or(0)) * 0.05
+                        })
+                        .collect(),
+                )?,
+                blocks,
+                output_norm: norm(c.hidden),
+                output_in: q8_linear(c.hidden, c.hidden, 70)?,
+                output_out: f32_linear(c.hidden, c.output, 80)?,
+            },
+        )?
+        .with_threads(threads)
+    };
+
+    let frames = 19;
+    let mut mel = Vec::with_capacity(c.mel_bins * frames);
+    for idx in 0..(c.mel_bins * frames) {
+        let v = ((idx * 13 + 5) % 21).cast_signed() - 10;
+        mel.push(f32::from(i8::try_from(v).unwrap_or(0)) * 0.05);
+    }
+
+    let serial = build(1)?;
+    let expected = serial.encode_mel(&mel, frames, &mut || false)?;
+    for workers in [2, 4] {
+        let parallel = build(workers)?;
+        let actual = parallel.encode_mel(&mel, frames, &mut || false)?;
+        assert_eq!(actual.rows(), expected.rows());
+        assert_eq!(actual.width(), expected.width());
+        for (idx, (got, want)) in actual.values().iter().zip(expected.values()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "encoder bit mismatch for workers={workers}, element={idx}"
+            );
+        }
+    }
+    assert_eq!(
+        serial.with_threads(0).err().map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
     );
     Ok(())
 }

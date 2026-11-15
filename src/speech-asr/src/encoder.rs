@@ -13,7 +13,9 @@
 use crate::{
     decoder::{Projection, binary16_operand},
     frontend::{Frontend, MelSpectrogram},
+    packed::{self, PreparedBatch},
     protocol::EncoderLayout,
+    row_workers, threads,
 };
 use std::io::{self, Read, Seek};
 
@@ -72,13 +74,28 @@ impl Linear {
         }
         finite(&self.bias)
     }
-    fn apply(&self, input: &[f32], cancel: &mut impl FnMut() -> bool) -> io::Result<Vec<f32>> {
-        let mut output = self.weights.multiply(input, cancel)?;
-        for (value, bias) in output.iter_mut().zip(&self.bias) {
-            *value += *bias;
-        }
-        finite(&output)?;
-        Ok(output)
+
+    fn apply_batch_prepared(
+        &self,
+        prepared: &PreparedBatch,
+        raw_input: &[f32],
+        workers: usize,
+        scratch: &mut Vec<f32>,
+        output: &mut [f32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        let out_width = self.bias.len();
+        self.weights
+            .multiply_batch_prepared_into(prepared, raw_input, workers, scratch, output, cancel)?;
+        let bias = &self.bias;
+        row_workers::try_run_aligned(output, workers, out_width, &|_, slice| {
+            for row in slice.chunks_exact_mut(out_width) {
+                for (value, b) in row.iter_mut().zip(bias) {
+                    *value += *b;
+                }
+            }
+            finite(slice)
+        })
     }
 }
 
@@ -97,7 +114,8 @@ impl Norm {
         finite(&self.weight)?;
         finite(&self.bias)
     }
-    fn apply(&self, row: &[f32]) -> io::Result<Vec<f32>> {
+
+    fn apply_into(&self, row: &[f32], dst: &mut [f32]) -> io::Result<()> {
         let mean = row.iter().sum::<f32>() / scalar(row.len());
         let variance = row
             .iter()
@@ -111,14 +129,39 @@ impl Norm {
             return Err(invalid());
         }
         let scale = 1.0 / (variance + 0.000_01).sqrt();
-        let output: Vec<_> = row
-            .iter()
-            .zip(&self.weight)
-            .zip(&self.bias)
-            .map(|((value, weight), bias)| (((*value - mean) * scale) * *weight) + *bias)
-            .collect();
-        finite(&output)?;
+        for ((out, value), (weight, bias)) in dst
+            .iter_mut()
+            .zip(row)
+            .zip(self.weight.iter().zip(&self.bias))
+        {
+            *out = (((*value - mean) * scale) * *weight) + *bias;
+        }
+        finite(dst)
+    }
+
+    #[cfg(test)]
+    fn apply(&self, row: &[f32]) -> io::Result<Vec<f32>> {
+        let mut output = zeros(row.len())?;
+        self.apply_into(row, &mut output)?;
         Ok(output)
+    }
+
+    fn apply_batch(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        width: usize,
+        workers: usize,
+    ) -> io::Result<()> {
+        row_workers::try_run_aligned(output, workers, width, &|elem_off, slice| {
+            for (src_row, dst_row) in input[elem_off..elem_off + slice.len()]
+                .chunks_exact(width)
+                .zip(slice.chunks_exact_mut(width))
+            {
+                self.apply_into(src_row, dst_row)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -183,9 +226,20 @@ pub struct Weights {
 pub struct Encoder {
     config: Config,
     weights: Weights,
+    sinusoids: Vec<f32>,
+    threads: usize,
 }
 
 impl Encoder {
+    /// Configure bounded worker threads for encoder convolutions, projections, and attention.
+    ///
+    /// # Errors
+    /// Rejects thread counts outside `1..=256`.
+    pub fn with_threads(mut self, threads: usize) -> io::Result<Self> {
+        self.threads = threads::validate_thread_count(threads)?;
+        Ok(self)
+    }
+
     /// Decoder width of each complete audio row.
     #[must_use]
     pub const fn output_width(&self) -> usize {
@@ -252,7 +306,13 @@ impl Encoder {
         weights.output_norm.validate(c.hidden)?;
         weights.output_in.validate(c.hidden, c.hidden)?;
         weights.output_out.validate(c.hidden, c.output)?;
-        Ok(Self { config, weights })
+        let sinusoids = build_sinusoids(layout.rows_per_chunk, c.hidden)?;
+        Ok(Self {
+            config,
+            weights,
+            sinusoids,
+            threads: 1,
+        })
     }
 
     /// Compute frontend features and every encoder row for one bounded clip.
@@ -265,7 +325,7 @@ impl Encoder {
         pcm: &[f32],
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Encoded> {
-        let mel = frontend.compute(pcm, &mut *cancel)?;
+        let mel = frontend.compute_with_threads(pcm, self.threads, &mut *cancel)?;
         self.encode(&mel, cancel)
     }
 
@@ -299,15 +359,16 @@ impl Encoder {
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Encoded> {
         let c = self.config;
+        let workers = self.threads;
         let layout = EncoderLayout::new(frames, c.window)?;
         if mel.len() != c.mel_bins * frames {
             return Err(invalid());
         }
         finite(mel)?;
         check(cancel)?;
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(layout.audio_rows)
-            .map_err(io::Error::other)?;
+        let mut rows = zeros(layout.audio_rows * c.hidden)?;
+        let mut conv_scratch = Vec::new();
+        let mut row_offset = 0;
         for chunk in 0..layout.chunks {
             check(cancel)?;
             let real = if chunk + 1 == layout.chunks {
@@ -323,7 +384,16 @@ impl Encoder {
             }
             let (mut width, mut height, mut channels) = (layout.mel_per_chunk, c.mel_bins, 1);
             for convolution in &self.weights.convolutions {
-                image = convolve(convolution, &image, width, height, channels, cancel)?;
+                image = convolve_with_threads(
+                    convolution,
+                    &image,
+                    width,
+                    height,
+                    channels,
+                    workers,
+                    &mut conv_scratch,
+                    cancel,
+                )?;
                 width = width.div_ceil(2);
                 height = height.div_ceil(2);
                 channels = c.channels;
@@ -333,36 +403,94 @@ impl Encoder {
             } else {
                 layout.rows_per_chunk
             };
-            for time in 0..retained {
-                check(cancel)?;
-                let mut flattened = zeros(channels * height)?;
-                for channel in 0..channels {
-                    for frequency in 0..height {
-                        flattened[channel * height + frequency] =
-                            image[(channel * height + frequency) * width + time];
+            if retained > 0 {
+                let flat_dim = channels * height;
+                let mut flat_in = zeros(retained * flat_dim)?;
+                for time in 0..retained {
+                    check(cancel)?;
+                    let dst = &mut flat_in[time * flat_dim..(time + 1) * flat_dim];
+                    for channel in 0..channels {
+                        for frequency in 0..height {
+                            dst[channel * height + frequency] =
+                                image[(channel * height + frequency) * width + time];
+                        }
                     }
                 }
-                let mut row = self.weights.convolution_out.multiply(&flattened, cancel)?;
-                position_add(&mut row, time)?;
-                rows.push(row);
+                let prepared = PreparedBatch::new(&flat_in, retained, flat_dim);
+                let chunk_rows =
+                    &mut rows[row_offset * c.hidden..(row_offset + retained) * c.hidden];
+                self.weights.convolution_out.multiply_batch_prepared_into(
+                    &prepared,
+                    &flat_in,
+                    workers,
+                    &mut conv_scratch,
+                    chunk_rows,
+                    cancel,
+                )?;
+                for (row, sin_row) in chunk_rows
+                    .chunks_exact_mut(c.hidden)
+                    .zip(self.sinusoids.chunks_exact(c.hidden))
+                {
+                    for (dst, &sin_val) in row.iter_mut().zip(sin_row) {
+                        *dst += sin_val;
+                    }
+                    finite(row)?;
+                }
+                row_offset += retained;
             }
         }
+
+        let num_rows = layout.audio_rows;
+        let mut norm_buf = zeros(num_rows * c.hidden)?;
+        let mut q = zeros(num_rows * c.hidden)?;
+        let mut k = zeros(num_rows * c.hidden)?;
+        let mut v = zeros(num_rows * c.hidden)?;
+        let mut attn_out = zeros(num_rows * c.hidden)?;
+        let mut proj = zeros(num_rows * c.hidden)?;
+        let mut ffn_buf = zeros(num_rows * c.intermediate)?;
         for block in &self.weights.blocks {
-            rows = transform(block, &rows, c, cancel)?;
+            transform_block(
+                block,
+                &mut rows,
+                &mut norm_buf,
+                &mut q,
+                &mut k,
+                &mut v,
+                &mut attn_out,
+                &mut proj,
+                &mut ffn_buf,
+                &mut conv_scratch,
+                num_rows,
+                c,
+                workers,
+                cancel,
+            )?;
         }
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(layout.audio_rows * c.output)
-            .map_err(io::Error::other)?;
-        for row in &rows {
-            check(cancel)?;
-            let normalized = self.weights.output_norm.apply(row)?;
-            let mut projected = self.weights.output_in.apply(&normalized, cancel)?;
-            gelu(&mut projected)?;
-            values.extend(self.weights.output_out.apply(&projected, cancel)?);
-        }
+        self.weights
+            .output_norm
+            .apply_batch(&rows, &mut norm_buf, c.hidden, workers)?;
+        let out_in_prepared = PreparedBatch::new(&norm_buf, num_rows, c.hidden);
+        self.weights.output_in.apply_batch_prepared(
+            &out_in_prepared,
+            &norm_buf,
+            workers,
+            &mut conv_scratch,
+            &mut proj,
+            cancel,
+        )?;
+        gelu_parallel(&mut proj, workers, c.hidden)?;
+        let mut values = zeros(num_rows * c.output)?;
+        let out_out_prepared = PreparedBatch::new(&proj, num_rows, c.hidden);
+        self.weights.output_out.apply_batch_prepared(
+            &out_out_prepared,
+            &proj,
+            workers,
+            &mut conv_scratch,
+            &mut values,
+            cancel,
+        )?;
         Ok(Encoded {
-            rows: layout.audio_rows,
+            rows: num_rows,
             width: c.output,
             values,
         })
@@ -393,22 +521,30 @@ impl Encoded {
     }
 }
 
-fn convolve(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Reuses batch convolution scratch buffer across chunked encoder stages."
+)]
+fn convolve_with_threads(
     linear: &Linear,
     input: &[f32],
     width: usize,
     height: usize,
     channels: usize,
+    workers: usize,
+    scratch: &mut Vec<f32>,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Vec<f32>> {
     let (out_width, out_height) = (width.div_ceil(2), height.div_ceil(2));
     let out_channels = linear.bias.len();
-    let mut output = zeros(out_width * out_height * out_channels)?;
-    let mut patch = zeros(9 * channels)?;
+    let total_patches = out_width * out_height;
+    let patch_width = 9 * channels;
+    let mut patches = zeros(total_patches * patch_width)?;
     for y in 0..out_height {
         for x in 0..out_width {
             check(cancel)?;
-            patch.fill(0.0);
+            let patch_offset = (y * out_width + x) * patch_width;
+            let patch = &mut patches[patch_offset..patch_offset + patch_width];
             for channel in 0..channels {
                 for ky in 0..3 {
                     for kx in 0..3 {
@@ -426,23 +562,92 @@ fn convolve(
                     }
                 }
             }
-            let mut values = linear.apply(&patch, cancel)?;
-            gelu(&mut values)?;
-            for (channel, value) in values.into_iter().enumerate() {
-                output[(channel * out_height + y) * out_width + x] = value;
-            }
+        }
+    }
+    let prepared = PreparedBatch::new(&patches, total_patches, patch_width);
+    let mut flat_out = zeros(total_patches * out_channels)?;
+    linear.apply_batch_prepared(&prepared, &patches, workers, scratch, &mut flat_out, cancel)?;
+    gelu_parallel(&mut flat_out, workers, out_channels)?;
+    let mut output = zeros(total_patches * out_channels)?;
+    for (pos, src_row) in flat_out.chunks_exact(out_channels).enumerate() {
+        let y = pos / out_width;
+        let x = pos % out_width;
+        for (channel, &value) in src_row.iter().enumerate() {
+            output[(channel * out_height + y) * out_width + x] = value;
         }
     }
     Ok(output)
 }
 
-fn gelu(values: &mut [f32]) -> io::Result<()> {
-    for value in &mut *values {
-        *value = numerics::gelu(*value);
-    }
-    finite(values)
+#[cfg(test)]
+fn convolve(
+    linear: &Linear,
+    input: &[f32],
+    width: usize,
+    height: usize,
+    channels: usize,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<Vec<f32>> {
+    let mut scratch = Vec::new();
+    convolve_with_threads(
+        linear,
+        input,
+        width,
+        height,
+        channels,
+        1,
+        &mut scratch,
+        cancel,
+    )
 }
 
+fn gelu_parallel(values: &mut [f32], workers: usize, alignment: usize) -> io::Result<()> {
+    row_workers::try_run_aligned(values, workers, alignment, &|_, slice| {
+        for value in &mut *slice {
+            *value = numerics::gelu(*value);
+        }
+        finite(slice)
+    })
+}
+
+fn add_residual_batch(
+    dst: &mut [f32],
+    add: &[f32],
+    workers: usize,
+    width: usize,
+) -> io::Result<()> {
+    row_workers::try_run_aligned(dst, workers, width, &|elem_off, slice| {
+        let end = elem_off + slice.len();
+        for (out, &delta) in slice.iter_mut().zip(&add[elem_off..end]) {
+            *out += delta;
+        }
+        finite(slice)
+    })
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "The pinned sinusoid constructs f64 angles and explicitly rounds sin/cos to f32; bounded dimensions convert exactly."
+)]
+fn build_sinusoids(rows: usize, hidden: usize) -> io::Result<Vec<f32>> {
+    let half = hidden / 2;
+    let logarithm = 10_000.0_f64.ln() / (half - 1) as f64;
+    let mut table = zeros(rows * hidden)?;
+    for position in 0..rows {
+        let row = &mut table[position * hidden..(position + 1) * hidden];
+        for index in 0..half {
+            let angle = position as f64 * (-logarithm * index as f64).exp();
+            row[index] = angle.sin() as f32;
+            row[index + half] = angle.cos() as f32;
+        }
+    }
+    finite(&table)?;
+    Ok(table)
+}
+
+#[cfg(test)]
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
@@ -460,44 +665,189 @@ fn position_add(row: &mut [f32], position: usize) -> io::Result<()> {
     finite(row)
 }
 
-fn transform(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Reuses flat encoder transformer buffers across layers with zero per-layer allocations."
+)]
+fn transform_block(
     block: &Block,
-    rows: &[Vec<f32>],
+    rows: &mut [f32],
+    norm_buf: &mut [f32],
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    attn_out: &mut [f32],
+    proj: &mut [f32],
+    ffn_buf: &mut [f32],
+    scratch: &mut Vec<f32>,
+    num_rows: usize,
     c: Config,
+    workers: usize,
     cancel: &mut impl FnMut() -> bool,
-) -> io::Result<Vec<Vec<f32>>> {
-    let mut queries = Vec::new();
-    let mut keys = Vec::new();
-    let mut values = Vec::new();
-    for row in rows {
+) -> io::Result<()> {
+    check(cancel)?;
+    block
+        .attention_norm
+        .apply_batch(rows, norm_buf, c.hidden, workers)?;
+    let qkv_prepared = PreparedBatch::new(norm_buf, num_rows, c.hidden);
+    block
+        .query
+        .apply_batch_prepared(&qkv_prepared, norm_buf, workers, scratch, q, cancel)?;
+    block
+        .key
+        .apply_batch_prepared(&qkv_prepared, norm_buf, workers, scratch, k, cancel)?;
+    block
+        .value
+        .apply_batch_prepared(&qkv_prepared, norm_buf, workers, scratch, v, cancel)?;
+
+    for _ in 0..(num_rows * c.heads) {
         check(cancel)?;
-        let norm = block.attention_norm.apply(row)?;
-        queries.push(block.query.apply(&norm, cancel)?);
-        keys.push(block.key.apply(&norm, cancel)?);
-        values.push(block.value.apply(&norm, cancel)?);
     }
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(rows.len())
-        .map_err(io::Error::other)?;
-    for (index, row) in rows.iter().enumerate() {
-        let context = attention(&queries[index], &keys, &values, c.heads, cancel)?;
-        let projected = block.attention_out.apply(&context, cancel)?;
-        let mut residual: Vec<_> = row.iter().zip(projected).map(|(a, b)| *a + b).collect();
-        finite(&residual)?;
-        let norm = block.ffn_norm.apply(&residual)?;
-        let mut intermediate = block.ffn_in.apply(&norm, cancel)?;
-        gelu(&mut intermediate)?;
-        let projected = block.ffn_out.apply(&intermediate, cancel)?;
-        for (value, add) in residual.iter_mut().zip(projected) {
-            *value += add;
+    let q_ref = &*q;
+    let k_ref = &*k;
+    let v_ref = &*v;
+    let head_dim = c.hidden / c.heads;
+    let divisor = scalar(head_dim).sqrt();
+    row_workers::try_run_aligned(attn_out, workers, c.hidden, &|elem_off, slice| {
+        let start_row = elem_off / c.hidden;
+        let mut scores = zeros(num_rows)?;
+        for (local_idx, out_row) in slice.chunks_exact_mut(c.hidden).enumerate() {
+            let row_idx = start_row + local_idx;
+            let q_row = &q_ref[row_idx * c.hidden..(row_idx + 1) * c.hidden];
+            for head in 0..c.heads {
+                let offset = head * head_dim;
+                let q_head = &q_row[offset..offset + head_dim];
+                let out_head = &mut out_row[offset..offset + head_dim];
+                attention_head_bidirectional(
+                    q_head,
+                    k_ref,
+                    v_ref,
+                    num_rows,
+                    c.hidden,
+                    offset,
+                    head_dim,
+                    divisor,
+                    &mut scores,
+                    out_head,
+                )?;
+            }
+            finite(out_row)?;
         }
-        finite(&residual)?;
-        output.push(residual);
-    }
-    Ok(output)
+        Ok(())
+    })?;
+
+    let attn_prepared = PreparedBatch::new(attn_out, num_rows, c.hidden);
+    block.attention_out.apply_batch_prepared(
+        &attn_prepared,
+        attn_out,
+        workers,
+        scratch,
+        proj,
+        cancel,
+    )?;
+    add_residual_batch(rows, proj, workers, c.hidden)?;
+
+    block
+        .ffn_norm
+        .apply_batch(rows, norm_buf, c.hidden, workers)?;
+    let ffn_prepared = PreparedBatch::new(norm_buf, num_rows, c.hidden);
+    block.ffn_in.apply_batch_prepared(
+        &ffn_prepared,
+        norm_buf,
+        workers,
+        scratch,
+        ffn_buf,
+        cancel,
+    )?;
+    gelu_parallel(ffn_buf, workers, c.intermediate)?;
+    let ffn_out_prepared = PreparedBatch::new(ffn_buf, num_rows, c.intermediate);
+    block.ffn_out.apply_batch_prepared(
+        &ffn_out_prepared,
+        ffn_buf,
+        workers,
+        scratch,
+        proj,
+        cancel,
+    )?;
+    add_residual_batch(rows, proj, workers, c.hidden)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shares SIMD bidirectional score/value accumulation across transformer blocks and tests."
+)]
+fn attention_head_bidirectional(
+    q_head: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    num_rows: usize,
+    row_width: usize,
+    offset: usize,
+    head_dim: usize,
+    divisor: f32,
+    scores: &mut [f32],
+    out_head: &mut [f32],
+) -> io::Result<()> {
+    let full_quads = num_rows / 4;
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        let k0 = &keys[r * row_width + offset..r * row_width + offset + head_dim];
+        let k1 = &keys[(r + 1) * row_width + offset..(r + 1) * row_width + offset + head_dim];
+        let k2 = &keys[(r + 2) * row_width + offset..(r + 2) * row_width + offset + head_dim];
+        let k3 = &keys[(r + 3) * row_width + offset..(r + 3) * row_width + offset + head_dim];
+        scores[r..r + 4].copy_from_slice(&packed::dot_4keys_seq(q_head, [k0, k1, k2, k3], divisor));
+    }
+    for (row, score) in scores
+        .iter_mut()
+        .enumerate()
+        .take(num_rows)
+        .skip(full_quads * 4)
+    {
+        let k = &keys[row * row_width + offset..row * row_width + offset + head_dim];
+        let mut dot = 0.0_f32;
+        for (q_val, k_val) in q_head.iter().zip(k) {
+            dot += *q_val * *k_val;
+        }
+        *score = dot / divisor;
+    }
+    finite(scores)?;
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut denominator = 0.0;
+    for score in &mut *scores {
+        *score = (*score - max).exp();
+        denominator += *score;
+    }
+    if denominator <= 0.0 || !denominator.is_finite() {
+        return Err(invalid());
+    }
+    out_head.fill(0.0);
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        let v0 = &values[r * row_width + offset..r * row_width + offset + head_dim];
+        let v1 = &values[(r + 1) * row_width + offset..(r + 1) * row_width + offset + head_dim];
+        let v2 = &values[(r + 2) * row_width + offset..(r + 2) * row_width + offset + head_dim];
+        let v3 = &values[(r + 3) * row_width + offset..(r + 3) * row_width + offset + head_dim];
+        let weights = [
+            scores[r] / denominator,
+            scores[r + 1] / denominator,
+            scores[r + 2] / denominator,
+            scores[r + 3] / denominator,
+        ];
+        packed::weighted_value_accum_4(out_head, [v0, v1, v2, v3], weights);
+    }
+    for (row, &score) in scores
+        .iter()
+        .enumerate()
+        .take(num_rows)
+        .skip(full_quads * 4)
+    {
+        let v = &values[row * row_width + offset..row * row_width + offset + head_dim];
+        packed::weighted_value_accum(out_head, v, score / denominator);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn attention(
     query: &[f32],
     keys: &[Vec<f32>],
@@ -505,35 +855,33 @@ fn attention(
     heads: usize,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Vec<f32>> {
-    let width = query.len() / heads;
-    let mut output = zeros(query.len())?;
-    let mut scores = zeros(keys.len())?;
+    let row_width = query.len();
+    let head_dim = row_width / heads;
+    let num_rows = keys.len();
+    let divisor = scalar(head_dim).sqrt();
+    let mut flat_keys = zeros(num_rows * row_width)?;
+    let mut flat_values = zeros(num_rows * row_width)?;
+    for (r, (k_row, v_row)) in keys.iter().zip(values).enumerate() {
+        flat_keys[r * row_width..(r + 1) * row_width].copy_from_slice(k_row);
+        flat_values[r * row_width..(r + 1) * row_width].copy_from_slice(v_row);
+    }
+    let mut output = zeros(row_width)?;
+    let mut scores = zeros(num_rows)?;
     for head in 0..heads {
         check(cancel)?;
-        let range = head * width..(head + 1) * width;
-        for (score, key) in scores.iter_mut().zip(keys) {
-            *score = query[range.clone()]
-                .iter()
-                .zip(&key[range.clone()])
-                .map(|(q, k)| *q * *k)
-                .sum::<f32>()
-                / scalar(width).sqrt();
-        }
-        finite(&scores)?;
-        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut denominator = 0.0;
-        for score in &mut scores {
-            *score = (*score - max).exp();
-            denominator += *score;
-        }
-        if denominator <= 0.0 || !denominator.is_finite() {
-            return Err(invalid());
-        }
-        for (score, value) in scores.iter().zip(values) {
-            for (target, v) in output[range.clone()].iter_mut().zip(&value[range.clone()]) {
-                *target += (*score / denominator) * *v;
-            }
-        }
+        let offset = head * head_dim;
+        attention_head_bidirectional(
+            &query[offset..offset + head_dim],
+            &flat_keys,
+            &flat_values,
+            num_rows,
+            row_width,
+            offset,
+            head_dim,
+            divisor,
+            &mut scores,
+            &mut output[offset..offset + head_dim],
+        )?;
     }
     finite(&output)?;
     Ok(output)

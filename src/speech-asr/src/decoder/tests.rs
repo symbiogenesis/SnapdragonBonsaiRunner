@@ -276,3 +276,180 @@ fn rust_asr_decoder_prefill_omits_unused_heads_and_keeps_final_failure_atomic() 
     );
     Ok(())
 }
+
+#[test]
+fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits() -> io::Result<()>
+{
+    fn q8_projection(input: usize, output: usize, seed: u32) -> io::Result<Projection> {
+        let blocks_per_row = input / 32;
+        let mut bytes = Vec::with_capacity(output * blocks_per_row * 34);
+        let scales = [0x3800_u16, 0x3400, 0x3C00, 0xB800, 0x3600];
+        for row in 0..output {
+            for blk in 0..blocks_per_row {
+                let scale = scales[(row + blk + usize::try_from(seed).unwrap_or(0)) % scales.len()];
+                bytes.extend_from_slice(&scale.to_le_bytes());
+                for elem in 0..32_u8 {
+                    let raw = ((row * 17
+                        + blk * 31
+                        + usize::from(elem) * 13
+                        + usize::try_from(seed).unwrap_or(0))
+                        % 19)
+                        .cast_signed()
+                        - 9;
+                    let q = i8::try_from(raw).unwrap_or(0);
+                    bytes.push(q.cast_unsigned());
+                }
+            }
+        }
+        Projection::q8(input, output, bytes)
+    }
+
+    fn f32_projection(input: usize, output: usize, seed: u32) -> io::Result<Projection> {
+        let mut data = Vec::with_capacity(input * output);
+        for row in 0..output {
+            for col in 0..input {
+                let n = ((row * 19 + col * 29 + usize::try_from(seed).unwrap_or(0)) % 15)
+                    .cast_signed()
+                    - 7;
+                let denom = f32::from(u16::try_from(input).unwrap_or(1));
+                data.push(f32::from(i8::try_from(n).unwrap_or(0)) / (4.0 * denom));
+            }
+        }
+        Projection::f32(input, output, data)
+    }
+
+    let c = Config {
+        hidden: 32,
+        heads: 4,
+        kv_heads: 2,
+        head_dim: 4,
+        intermediate: 64,
+        context: 512,
+        epsilon: 1.0e-5,
+        rope_theta: 1_000_000.0,
+        cache_precision: CachePrecision::F16,
+    };
+    let vocab = 12;
+    let mut emb = vec![0.0_f32; vocab * c.hidden];
+    for col in 0..c.hidden {
+        emb[col] = if col % 2 == 0 { -0.0 } else { 0.0 };
+    }
+    for tok in 1..vocab {
+        for col in 0..c.hidden {
+            let v = ((tok * 11 + col * 7) % 17).cast_signed() - 8;
+            emb[tok * c.hidden + col] = f32::from(i8::try_from(v).unwrap_or(0)) * 0.0625;
+        }
+    }
+    let build_model = |decode_threads: usize, batch_threads: usize| -> io::Result<Arc<Model>> {
+        let mut blocks = Vec::with_capacity(2);
+        for layer in 0..2_u32 {
+            blocks.push(Block {
+                attention_norm: (0..c.hidden)
+                    .map(|i| 0.8 + f32::from(u8::try_from(i % 7).unwrap_or(0)) * 0.05)
+                    .collect(),
+                ffn_norm: (0..c.hidden)
+                    .map(|i| 0.9 + f32::from(u8::try_from(i % 5).unwrap_or(0)) * 0.04)
+                    .collect(),
+                query: q8_projection(c.hidden, c.heads * c.head_dim, 10 + layer)?,
+                key: f32_projection(c.hidden, c.kv_heads * c.head_dim, 20 + layer)?,
+                value: q8_projection(c.hidden, c.kv_heads * c.head_dim, 30 + layer)?,
+                attention_out: f32_projection(c.heads * c.head_dim, c.hidden, 40 + layer)?,
+                query_norm: vec![1.1, 0.95, 1.05, 0.9],
+                key_norm: vec![0.9, 1.05, 1.15, 0.85],
+                gate: q8_projection(c.hidden, c.intermediate, 50 + layer)?,
+                up: f32_projection(c.hidden, c.intermediate, 60 + layer)?,
+                down: q8_projection(c.intermediate, c.hidden, 70 + layer)?,
+            });
+        }
+        Ok(Arc::new(
+            Model::new(
+                c,
+                Projection::f32(c.hidden, vocab, emb.clone())?,
+                blocks,
+                vec![1.05; c.hidden],
+            )?
+            .with_threads(decode_threads, batch_threads)?,
+        ))
+    };
+
+    let serial_model = build_model(1, 1)?;
+    let parallel_model = build_model(4, 6)?;
+    let prompt = PromptTokens::new([0, 1, 2, 3, 4, 5], [6, 7, 8], 9)?.automatic_prompt(4, 512)?;
+    assert_eq!(prompt.ids().len(), 19);
+    let mut audio = vec![0.0_f32; 4 * c.hidden];
+    for (idx, sample) in audio.iter_mut().enumerate() {
+        let v = ((idx * 13 + 3) % 19).cast_signed() - 9;
+        *sample = f32::from(i8::try_from(v).unwrap_or(0)) * 0.05;
+    }
+
+    let mut serial_sess = serial_model.session();
+    let mut expected_logits = Vec::new();
+    for (pos, &id) in prompt.ids().iter().enumerate() {
+        expected_logits = if prompt.audio_rows().contains(&pos) {
+            let start = (pos - prompt.audio_rows().start) * c.hidden;
+            serial_sess.step_audio(&audio[start..start + c.hidden], &mut || false)?
+        } else {
+            serial_sess.step(id, &mut || false)?
+        };
+    }
+
+    let mut parallel_sess = parallel_model.session();
+    let parallel_logits = parallel_sess.prefill(&prompt, &audio, &mut || false)?;
+    assert_eq!(parallel_sess.position(), serial_sess.position());
+    for (got, want) in parallel_logits.iter().zip(&expected_logits) {
+        assert_eq!(got.to_bits(), want.to_bits(), "prefill logit mismatch");
+    }
+    for layer in 0..2 {
+        let (pk, pv) = parallel_sess
+            .cache(layer)
+            .ok_or_else(|| io::Error::other("missing parallel layer"))?;
+        let (sk, sv) = serial_sess
+            .cache(layer)
+            .ok_or_else(|| io::Error::other("missing serial layer"))?;
+        for (i, (got, want)) in pk.iter().zip(sk).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "prefill K bit mismatch layer={layer} i={i}"
+            );
+        }
+        for (i, (got, want)) in pv.iter().zip(sv).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "prefill V bit mismatch layer={layer} i={i}"
+            );
+        }
+    }
+
+    for next_tok in [10_u32, 11, 4] {
+        let want_step = serial_sess.step(next_tok, &mut || false)?;
+        let got_step = parallel_sess.step(next_tok, &mut || false)?;
+        for (got, want) in got_step.iter().zip(&want_step) {
+            assert_eq!(got.to_bits(), want.to_bits(), "decode step logit mismatch");
+        }
+        for layer in 0..2 {
+            let (pk, pv) = parallel_sess
+                .cache(layer)
+                .ok_or_else(|| io::Error::other("missing parallel layer"))?;
+            let (sk, sv) = serial_sess
+                .cache(layer)
+                .ok_or_else(|| io::Error::other("missing serial layer"))?;
+            for (i, (got, want)) in pk.iter().zip(sk).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "decode K mismatch layer={layer} i={i}"
+                );
+            }
+            for (i, (got, want)) in pv.iter().zip(sv).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "decode V mismatch layer={layer} i={i}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

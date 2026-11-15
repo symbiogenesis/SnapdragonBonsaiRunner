@@ -67,6 +67,7 @@ pub struct RustRecognizer {
     decoder: Session,
     prompt_tokens: PromptTokens,
     context: usize,
+    batch_threads: usize,
 }
 
 impl RustRecognizer {
@@ -81,7 +82,7 @@ impl RustRecognizer {
     /// Rejects nonabsolute/reparse/nonregular files, unsupported metadata/storage,
     /// model geometry, nonfinite weights and I/O/allocation failures.
     pub fn load(path: &Path) -> io::Result<Self> {
-        Self::load_cancellable(path, &mut || false)
+        Self::load_with_threads_cancellable(path, None, &mut || false)
     }
 
     /// Load with cooperative checks during tensor intake and stage transitions.
@@ -89,10 +90,37 @@ impl RustRecognizer {
     /// # Errors
     /// Returns [`Self::load`] errors or `Interrupted` on cancellation.
     pub fn load_cancellable(path: &Path, cancel: &mut impl FnMut() -> bool) -> io::Result<Self> {
+        Self::load_with_threads_cancellable(path, None, cancel)
+    }
+
+    /// Load the verified pinned Qwen3-ASR GGUF with an optional CPU thread budget.
+    ///
+    /// `None` uses the Snapdragon X1/X2 cluster-aware ASR policy (`(8, 10)` on
+    /// 12-core X1, `(8, 16)` on 18-core X2); `Some(n)` validates `1..=256`.
+    ///
+    /// # Errors
+    /// Returns [`Self::load`] errors or `InvalidInput` for out-of-range thread counts.
+    pub fn load_with_threads(path: &Path, threads: Option<usize>) -> io::Result<Self> {
+        Self::load_with_threads_cancellable(path, threads, &mut || false)
+    }
+
+    /// Load with an explicit optional thread budget and cooperative cancellation checks.
+    ///
+    /// # Errors
+    /// Returns [`Self::load_with_threads`] errors or `Interrupted` on cancellation.
+    pub fn load_with_threads_cancellable(
+        path: &Path,
+        threads: Option<usize>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<Self> {
         check(cancel)?;
         if !path.is_absolute() {
             return Err(invalid());
         }
+        let (decode_threads, batch_threads) = crate::threads::select_asr_threads(
+            threads,
+            std::thread::available_parallelism()?.get(),
+        )?;
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(windows)]
@@ -116,8 +144,10 @@ impl RustRecognizer {
             crate::intake::tokenizer(&mut file, properties.len(), cancel)?;
         check(cancel)?;
         let (encoder, frontend) = Encoder::load(&mut file, properties.len(), cancel)?;
+        let encoder = encoder.with_threads(batch_threads)?;
         check(cancel)?;
-        let model = Model::load(&mut file, properties.len(), CachePrecision::F16, cancel)?;
+        let model = Model::load(&mut file, properties.len(), CachePrecision::F16, cancel)?
+            .with_threads(decode_threads, batch_threads)?;
         let (hidden, vocabulary, context) = model.dimensions();
         if encoder.output_width() != hidden || tokenizer.vocabulary_size() != vocabulary {
             return Err(invalid());
@@ -130,6 +160,7 @@ impl RustRecognizer {
             decoder: Arc::new(model).session(),
             prompt_tokens,
             context,
+            batch_threads,
         })
     }
 
@@ -182,7 +213,9 @@ impl RustRecognizer {
         self.decoder.reset();
         let guard = ClearSession(&mut self.decoder);
         check(cancel)?;
-        let mel = self.frontend.compute(pcm, &mut *cancel)?;
+        let mel = self
+            .frontend
+            .compute_with_threads(pcm, self.batch_threads, &mut *cancel)?;
         observe(Observation::Frontend(&mel))?;
         check(cancel)?;
         let audio = self.encoder.encode(&mel, cancel)?;

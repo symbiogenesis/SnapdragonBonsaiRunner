@@ -67,7 +67,7 @@ fn run() -> io::Result<()> {
                 &arguments,
                 include_str!("../model.lock.json"),
             )?;
-            let recognizer = RustRecognizer::load(&arguments.model)
+            let recognizer = RustRecognizer::load_with_threads(&arguments.model, arguments.threads)
                 .map_err(|_| io::Error::other("Rust qualification model loading failed."))?;
             bonsai_speech_service::serve_with_ready(
                 RustEngine {

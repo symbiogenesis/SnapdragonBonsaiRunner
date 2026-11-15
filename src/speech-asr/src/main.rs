@@ -52,8 +52,11 @@ fn run() -> io::Result<()> {
                 &arguments,
                 include_str!("../model.lock.json"),
             )?;
-            let recognizer = bonsai_speech_asr::Recognizer::load(&arguments.model)
-                .map_err(|_| io::Error::other("Native Qwen3-ASR model loading failed."))?;
+            let recognizer = bonsai_speech_asr::Recognizer::load_with_threads(
+                &arguments.model,
+                arguments.threads,
+            )
+            .map_err(|_| io::Error::other("Native Qwen3-ASR model loading failed."))?;
             let engine = NativeEngine {
                 recognizer,
                 _models: guards,
