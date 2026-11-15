@@ -18,6 +18,13 @@ struct ScriptCall {
     parameters: BTreeMap<&'static str, serde_json::Value>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CachedBlob {
+    blob: String,
+    len: u64,
+    modified_ns: u128,
+}
+
 struct Work {
     directory: PathBuf,
     started: Instant,
@@ -496,6 +503,277 @@ impl Work {
         let mut name = leaf.to_os_string();
         name.push("-source");
         Ok(target_dir.with_file_name(name))
+    }
+
+    fn modified_ns(metadata: &fs::Metadata) -> Option<u128> {
+        metadata
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_nanos())
+    }
+
+    fn commit_tree_blobs(&mut self, root: &Path, commit: &str) -> Result<BTreeMap<String, String>> {
+        let raw = self.git(root, &["ls-tree", "-r", "-z", "--full-tree", commit])?;
+        let mut blobs = BTreeMap::new();
+        for record in raw
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let text = std::str::from_utf8(record).map_err(|error| error.to_string())?;
+            let Some((header, path)) = text.split_once('\t') else {
+                return Err("Malformed git ls-tree record.".into());
+            };
+            let mut parts = header.split_whitespace();
+            let (Some(mode), Some(kind), Some(oid), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Err("Malformed git ls-tree header.".into());
+            };
+            if mode == "120000" {
+                return Err(format!(
+                    "Push blocked: staged source entry '{path}' cannot be a symlink."
+                ));
+            }
+            if kind != "blob" {
+                return Err(format!(
+                    "Push blocked: unsupported staged source entry '{path}'."
+                ));
+            }
+            blobs.insert(path.to_owned(), format!("{mode}:{oid}"));
+        }
+        Ok(blobs)
+    }
+
+    fn record_stable_blobs(
+        stable_source: &Path,
+        commit_blobs: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, CachedBlob> {
+        let mut recorded = BTreeMap::new();
+        let mut pending = vec![(String::new(), stable_source.to_path_buf())];
+        while let Some((rel_dir, dir_path)) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&dir_path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let name_os = entry.file_name();
+                let Some(name) = name_os.to_str() else {
+                    continue;
+                };
+                let rel_path = if rel_dir.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{rel_dir}/{name}")
+                };
+                if meta.is_dir() {
+                    pending.push((rel_path, entry.path()));
+                } else if meta.is_file()
+                    && let (Some(blob), Some(modified_ns)) =
+                        (commit_blobs.get(&rel_path), Self::modified_ns(&meta))
+                {
+                    recorded.insert(
+                        rel_path,
+                        CachedBlob {
+                            blob: blob.clone(),
+                            len: meta.len(),
+                            modified_ns,
+                        },
+                    );
+                }
+            }
+        }
+        recorded
+    }
+
+    fn sync_commit(
+        &mut self,
+        root: &Path,
+        commit: &str,
+        number: usize,
+        target_dir: &Path,
+        stable_source: &Path,
+    ) -> Result<()> {
+        let state_path = target_dir.join(".bonsai-source-blobs.json");
+        let cached: BTreeMap<String, CachedBlob> = fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let commit_blobs = self.commit_tree_blobs(root, commit)?;
+
+        let mut expected_dirs: BTreeMap<String, BTreeMap<OsString, bool>> = BTreeMap::new();
+        expected_dirs.insert(String::new(), BTreeMap::new());
+        for path in commit_blobs.keys() {
+            let parts: Vec<&str> = path.split('/').collect();
+            let mut parent_rel = String::new();
+            for (idx, part) in parts.iter().enumerate() {
+                let is_dir = idx + 1 < parts.len();
+                expected_dirs
+                    .entry(parent_rel.clone())
+                    .or_default()
+                    .insert(OsString::from(*part), is_dir);
+                if is_dir {
+                    parent_rel = if parent_rel.is_empty() {
+                        (*part).to_owned()
+                    } else {
+                        format!("{parent_rel}/{part}")
+                    };
+                    expected_dirs.entry(parent_rel.clone()).or_default();
+                }
+            }
+        }
+
+        let mut verified: BTreeMap<String, CachedBlob> = BTreeMap::new();
+        let stable_exists = match fs::symlink_metadata(stable_source) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    Self::remove_entry(stable_source)?;
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.to_string()),
+        };
+
+        if stable_exists && !cached.is_empty() {
+            let mut pending = vec![(String::new(), stable_source.to_path_buf())];
+            while let Some((rel_dir, dst_dir)) = pending.pop() {
+                let Some(expected_children) = expected_dirs.get(&rel_dir) else {
+                    continue;
+                };
+                for entry in fs::read_dir(&dst_dir).map_err(|error| error.to_string())? {
+                    let entry = entry.map_err(|error| error.to_string())?;
+                    let name_os = entry.file_name();
+                    let dst_path = entry.path();
+                    let dst_meta = entry.metadata().map_err(|error| error.to_string())?;
+                    let dst_type = dst_meta.file_type();
+                    let matches = expected_children.get(&name_os).is_some_and(|is_dir| {
+                        !dst_type.is_symlink()
+                            && if *is_dir {
+                                dst_type.is_dir()
+                            } else {
+                                dst_type.is_file()
+                            }
+                    });
+                    if !matches {
+                        Self::remove_entry(&dst_path)?;
+                        continue;
+                    }
+                    let Some(name) = name_os.to_str() else {
+                        Self::remove_entry(&dst_path)?;
+                        continue;
+                    };
+                    let rel_path = if rel_dir.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{rel_dir}/{name}")
+                    };
+                    if dst_type.is_dir() {
+                        pending.push((rel_path, dst_path));
+                    } else if let (Some(expected_blob), Some(prev), Some(modified_ns)) = (
+                        commit_blobs.get(&rel_path),
+                        cached.get(&rel_path),
+                        Self::modified_ns(&dst_meta),
+                    ) && prev.blob == *expected_blob
+                        && prev.len == dst_meta.len()
+                        && prev.modified_ns == modified_ns
+                    {
+                        verified.insert(rel_path, prev.clone());
+                    }
+                }
+            }
+        }
+
+        let dirty: Vec<String> = commit_blobs
+            .keys()
+            .filter(|path| !verified.contains_key(*path))
+            .cloned()
+            .collect();
+
+        if dirty.len() > 64 {
+            let staged = self.snapshot(root, commit, number)?;
+            Self::sync_tree(&staged, stable_source)?;
+            Self::remove_entry(&staged)?;
+            verified = Self::record_stable_blobs(stable_source, &commit_blobs);
+        } else if !dirty.is_empty() {
+            fs::create_dir_all(stable_source).map_err(|error| error.to_string())?;
+            let staged = self.directory.join(format!("source-{number}"));
+            fs::create_dir(&staged).map_err(|error| error.to_string())?;
+            let index = self.directory.join(format!("index-{number}"));
+            let environment = BTreeMap::from([(
+                "GIT_INDEX_FILE".into(),
+                index.to_string_lossy().into_owned(),
+            )]);
+            self.command(
+                root,
+                "git.exe",
+                &["read-tree".into(), commit.into()],
+                environment.clone(),
+            )?;
+            let mut checkout_args: Vec<OsString> = vec![
+                "checkout-index".into(),
+                "--force".into(),
+                format!("--prefix={}/", staged.display()).into(),
+                "--".into(),
+            ];
+            checkout_args.extend(dirty.iter().map(OsString::from));
+            self.command(root, "git.exe", &checkout_args, environment)?;
+            for rel_path in &dirty {
+                let src_path = staged.join(rel_path);
+                let dst_path = stable_source.join(rel_path);
+                let src_meta =
+                    fs::symlink_metadata(&src_path).map_err(|error| error.to_string())?;
+                if src_meta.file_type().is_symlink() || !src_meta.is_file() {
+                    return Err(format!(
+                        "Push blocked: staged source entry '{}' must be a regular file.",
+                        src_path.display()
+                    ));
+                }
+                if let Some(parent) = dst_path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                let existing_meta = fs::symlink_metadata(&dst_path).ok();
+                let unchanged = if let Some(dst_meta) = existing_meta.as_ref()
+                    && !dst_meta.file_type().is_symlink()
+                    && dst_meta.is_file()
+                {
+                    Self::files_equal(&dst_path, dst_meta.len(), &src_path, src_meta.len())?
+                } else {
+                    false
+                };
+                if !unchanged {
+                    if let Some(dst_meta) = existing_meta.as_ref() {
+                        Self::clear_readonly_metadata(&dst_path, dst_meta)?;
+                    }
+                    fs::copy(&src_path, &dst_path).map_err(|error| error.to_string())?;
+                }
+                let final_meta =
+                    fs::symlink_metadata(&dst_path).map_err(|error| error.to_string())?;
+                if let (Some(blob), Some(modified_ns)) =
+                    (commit_blobs.get(rel_path), Self::modified_ns(&final_meta))
+                {
+                    verified.insert(
+                        rel_path.clone(),
+                        CachedBlob {
+                            blob: blob.clone(),
+                            len: final_meta.len(),
+                            modified_ns,
+                        },
+                    );
+                }
+            }
+            Self::remove_entry(&staged)?;
+        }
+
+        if let Ok(encoded) = serde_json::to_vec(&verified) {
+            let _ = fs::write(&state_path, encoded);
+        }
+        Ok(())
     }
 
     fn lock_source_cache(&self, target_dir: &Path) -> Result<fs::File> {
@@ -1114,15 +1392,14 @@ pub(super) fn check(
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
         for (number, (commit, paths)) in commits.iter().enumerate() {
-            let staged = work.snapshot(root, commit, number)?;
             let changed_paths: Vec<String> = paths.iter().cloned().collect();
             if let Some(target_dir) = cache_target.as_ref() {
                 let _cache_lock = work.lock_source_cache(target_dir)?;
                 let stable_source = Work::stable_source_dir(target_dir)?;
-                Work::sync_tree(&staged, &stable_source)?;
-                Work::remove_entry(&staged)?;
+                work.sync_commit(root, commit, number, target_dir, &stable_source)?;
                 work.checks(policy, &stable_source, &changed_paths)?;
             } else {
+                let staged = work.snapshot(root, commit, number)?;
                 work.checks(policy, &staged, &changed_paths)?;
             }
         }
