@@ -3,9 +3,13 @@
 
 use super::egui;
 use crate::markdown_service::{self, MAX_RASTER_DIMENSION, Service, Status, Ticket};
-use std::{sync::Arc, time::Duration};
+use base64ct::{Base64, Encoding as _};
+use std::{io::Cursor, sync::Arc, time::Duration};
 
 const MAX_TEXTURES: usize = 24;
+const MAX_PNG_TEXTURES: usize = 32;
+const MAX_PNG_DIMENSION: u32 = 2_048;
+const MAX_PNG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IN_FLIGHT: usize = 8;
 const QUANTUM_PX: u16 = 64;
 const REPAINT_INTERVAL: Duration = Duration::from_millis(16);
@@ -94,11 +98,31 @@ struct Entry {
     state: SlotState,
 }
 
-/// Coordinates bounded offline SVG raster requests and retains up to 24 GPU textures.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PngDomain {
+    RawBytes,
+    DataUrl,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PngKey {
+    domain: PngDomain,
+    hash: u64,
+    len: usize,
+}
+
+struct PngEntry {
+    key: PngKey,
+    last_used: u64,
+    texture: Option<egui::TextureHandle>,
+}
+
+/// Coordinates bounded offline SVG raster requests and retains bounded GPU textures.
 #[derive(Default)]
 pub(super) struct ImageCache {
     service: Option<Arc<Service>>,
     entries: Vec<Entry>,
+    png_entries: Vec<PngEntry>,
     clock: u64,
 }
 
@@ -266,6 +290,70 @@ impl ImageCache {
         }
     }
 
+    /// Returns a GPU texture decoded from bounded PNG bytes (caching decode failures cleanly).
+    pub(super) fn png_bytes_texture(
+        &mut self,
+        ctx: &egui::Context,
+        bytes: &[u8],
+    ) -> Option<egui::TextureHandle> {
+        let key = PngKey {
+            domain: PngDomain::RawBytes,
+            hash: fnv1a64(bytes),
+            len: bytes.len(),
+        };
+        self.cached_png(key, || decode_png_texture(ctx, bytes))
+    }
+
+    /// Returns a GPU texture decoded from a `data:image/png;base64,...` payload.
+    pub(super) fn data_url_texture(
+        &mut self,
+        ctx: &egui::Context,
+        data_url: &str,
+    ) -> Option<egui::TextureHandle> {
+        let key = PngKey {
+            domain: PngDomain::DataUrl,
+            hash: fnv1a64(data_url.as_bytes()),
+            len: data_url.len(),
+        };
+        self.cached_png(key, || {
+            let encoded = data_url.strip_prefix("data:image/png;base64,")?;
+            let decoded = Base64::decode_vec(encoded).ok()?;
+            decode_png_texture(ctx, &decoded)
+        })
+    }
+
+    fn cached_png(
+        &mut self,
+        key: PngKey,
+        decode: impl FnOnce() -> Option<egui::TextureHandle>,
+    ) -> Option<egui::TextureHandle> {
+        self.clock = self.clock.wrapping_add(1);
+        let stamp = self.clock;
+        if let Some(entry) = self.png_entries.iter_mut().find(|entry| entry.key == key) {
+            entry.last_used = stamp;
+            return entry.texture.clone();
+        }
+        let texture = decode();
+        self.png_entries.push(PngEntry {
+            key,
+            last_used: stamp,
+            texture: texture.clone(),
+        });
+        while self.png_entries.len() > MAX_PNG_TEXTURES {
+            if let Some((victim, _)) = self
+                .png_entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            {
+                self.png_entries.swap_remove(victim);
+            } else {
+                break;
+            }
+        }
+        texture
+    }
+
     fn best_fallback(&self, svg: &PrehashedSvg) -> Option<egui::TextureHandle> {
         let mut best: Option<(u64, &egui::TextureHandle)> = None;
         for entry in &self.entries {
@@ -357,6 +445,69 @@ fn quantize_px(points: f32, pixels_per_point: f32) -> u32 {
         bucket = bucket.saturating_add(QUANTUM_PX).min(max_dim_u16);
     }
     u32::from(bucket)
+}
+
+fn decode_png_texture(ctx: &egui::Context, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    if bytes.is_empty() || bytes.len() > MAX_PNG_BYTES {
+        return None;
+    }
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let info = reader.info();
+    if info.width == 0
+        || info.height == 0
+        || info.width > MAX_PNG_DIMENSION
+        || info.height > MAX_PNG_DIMENSION
+    {
+        return None;
+    }
+    let buffer_len = reader.output_buffer_size()?;
+    if buffer_len == 0 || buffer_len > MAX_PNG_BYTES {
+        return None;
+    }
+    let mut pixels = vec![0_u8; buffer_len];
+    let output = reader.next_frame(&mut pixels).ok()?;
+    let frame = &pixels[..output.buffer_size()];
+    let width = usize::try_from(output.width).ok()?;
+    let height = usize::try_from(output.height).ok()?;
+    let pixel_count = width.checked_mul(height)?;
+    let image = match output.color_type {
+        png::ColorType::Rgba => {
+            if frame.len() != pixel_count.checked_mul(4)? {
+                return None;
+            }
+            egui::ColorImage::from_rgba_unmultiplied([width, height], frame)
+        }
+        png::ColorType::Rgb => {
+            if frame.len() != pixel_count.checked_mul(3)? {
+                return None;
+            }
+            egui::ColorImage::from_rgb([width, height], frame)
+        }
+        png::ColorType::Grayscale => {
+            if frame.len() != pixel_count {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4)?);
+            for &gray in frame {
+                rgba.extend_from_slice(&[gray, gray, gray, 255]);
+            }
+            egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba)
+        }
+        png::ColorType::GrayscaleAlpha => {
+            if frame.len() != pixel_count.checked_mul(2)? {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4)?);
+            for pair in frame.chunks_exact(2) {
+                rgba.extend_from_slice(&[pair[0], pair[0], pair[0], pair[1]]);
+            }
+            egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba)
+        }
+        png::ColorType::Indexed => return None,
+    };
+    Some(ctx.load_texture("bonsai-attachment-png", image, egui::TextureOptions::LINEAR))
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -500,6 +651,55 @@ mod tests {
         harness.step();
         assert!(service.unavailable());
         assert!(harness.state().0.is_rejected(&svg));
+        Ok(())
+    }
+
+    #[test]
+    fn png_bytes_and_data_url_textures_decode_and_cache_failures() -> std::io::Result<()> {
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
+            writer
+                .write_image_data(&[
+                    255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+                ])
+                .map_err(std::io::Error::other)?;
+        }
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            Base64::encode_string(&png_bytes)
+        );
+        let mut harness = Harness::builder()
+            .with_size([160.0, 120.0])
+            .with_context_setup(super::super::configure)
+            .build_ui_state(
+                move |ui, cache: &mut ImageCache| {
+                    assert_eq!(
+                        cache
+                            .png_bytes_texture(ui.ctx(), &png_bytes)
+                            .map(|tex| tex.size()),
+                        Some([2, 2])
+                    );
+                    assert_eq!(
+                        cache
+                            .data_url_texture(ui.ctx(), &data_url)
+                            .map(|tex| tex.size()),
+                        Some([2, 2])
+                    );
+                    assert!(cache.png_bytes_texture(ui.ctx(), b"not-png").is_none());
+                    assert!(
+                        cache
+                            .data_url_texture(ui.ctx(), "data:image/jpeg;base64,AAAA")
+                            .is_none()
+                    );
+                },
+                ImageCache::default(),
+            );
+        harness.step();
+        assert_eq!(harness.state().png_entries.len(), 4);
         Ok(())
     }
 }

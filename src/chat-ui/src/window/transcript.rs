@@ -35,6 +35,10 @@ pub(super) enum TranscriptAction {
         intrinsic_size: Vec2,
         suggested_stem: String,
     },
+    InspectAttachment {
+        message_id: u64,
+        index: usize,
+    },
     SaveImage {
         svg: PrehashedSvg,
         suggested_stem: String,
@@ -48,6 +52,8 @@ const MESSAGE_ACTION_SIZE: f32 = 32.0;
 const MESSAGE_CONTENT_GAP: f32 = 6.0;
 pub(super) const MESSAGE_GAP: f32 = 12.0;
 const GENERATING_IMAGE_HEIGHT: f32 = 120.0;
+const ATTACHMENT_CARD_HEIGHT: f32 = 56.0;
+const ATTACHMENT_CARD_GAP: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum Role {
@@ -1047,7 +1053,10 @@ impl Message {
         let Some(cache) = &self.cache else {
             return self.measured_height.unwrap_or(100.0);
         };
-        let content_height = if cache.segments.is_empty() {
+        let has_body_or_pending = !self.body.is_empty() || self.pending;
+        let body_height = if !has_body_or_pending && !self.attachments.is_empty() {
+            0.0
+        } else if cache.segments.is_empty() {
             20.0
         } else if cache.segments.len() == 1 {
             cache.segments[0].height().max(20.0)
@@ -1061,12 +1070,20 @@ impl Message {
             }
             sum
         };
+        let attachments_h = attachments_height(cache.width, &self.attachments);
+        let content_height = if attachments_h > 0.0 && body_height > 0.0 {
+            body_height + MESSAGE_CONTENT_GAP + attachments_h
+        } else if attachments_h > 0.0 {
+            attachments_h
+        } else {
+            body_height
+        };
         // One shared header holds identity and actions for either role. Speech
         // never reserves a separate row, including while it is unavailable.
         let mut height = 2.0_f32.mul_add(MESSAGE_INSET.y, MESSAGE_ACTION_SIZE)
             + MESSAGE_CONTENT_GAP
             + content_height;
-        if self.markdown.failed() {
+        if !self.body.is_empty() && self.markdown.failed() {
             height += MESSAGE_CONTENT_GAP + 60.0;
         }
         if !self.reasoning.is_empty() {
@@ -1157,6 +1174,17 @@ impl Message {
                     child.label(RichText::new(message).small().weak());
                 }
             }
+            if !self.attachments.is_empty()
+                && let Some(inspect) = render_attachments_grid(
+                    &mut child,
+                    self.id,
+                    cache.width,
+                    &self.attachments,
+                    image_cache.as_deref_mut(),
+                )
+            {
+                action = Some(inspect);
+            }
             if !self.reasoning.is_empty() {
                 let label = if self.show_reasoning {
                     "Hide thinking"
@@ -1205,6 +1233,133 @@ fn image_card_layout(width: f32, intrinsic: Vec2) -> (Vec2, Vec2) {
 
 fn generating_card_size(width: f32) -> Vec2 {
     egui::vec2(width.clamp(160.0, 560.0), GENERATING_IMAGE_HEIGHT)
+}
+
+fn attachment_grid_dims(width: f32, count: usize) -> (usize, usize) {
+    if count == 0 {
+        return (1, 0);
+    }
+    let cols = if width >= 420.0 { count.min(2) } else { 1 }.max(1);
+    let rows = count.div_ceil(cols);
+    (cols, rows)
+}
+
+fn attachments_height(width: f32, attachments: &[crate::attachment_import::Attachment]) -> f32 {
+    if attachments.is_empty() {
+        return 0.0;
+    }
+    let (_, rows) = attachment_grid_dims(width, attachments.len());
+    let rows_f = f32::from(u16::try_from(rows).unwrap_or(u16::MAX));
+    let gaps_f = f32::from(u16::try_from(rows.saturating_sub(1)).unwrap_or(u16::MAX));
+    rows_f * ATTACHMENT_CARD_HEIGHT + gaps_f * ATTACHMENT_CARD_GAP
+}
+
+fn render_attachments_grid(
+    ui: &mut egui::Ui,
+    message_id: u64,
+    width: f32,
+    attachments: &[crate::attachment_import::Attachment],
+    mut image_cache: Option<&mut super::image_cache::ImageCache>,
+) -> Option<TranscriptAction> {
+    let height = attachments_height(width, attachments);
+    let (_, grid_rect) = ui.allocate_space(egui::vec2(width.max(1.0), height));
+    let (cols, _) = attachment_grid_dims(width, attachments.len());
+    let cols_f = f32::from(u16::try_from(cols).unwrap_or(1));
+    let gaps_f = f32::from(u16::try_from(cols.saturating_sub(1)).unwrap_or(0));
+    let card_width = ((grid_rect.width() - gaps_f * ATTACHMENT_CARD_GAP) / cols_f).max(64.0);
+    let visuals = ui.visuals().clone();
+    let mut action = None;
+
+    for (index, attachment) in attachments.iter().enumerate() {
+        let col = index % cols;
+        let row = index / cols;
+        let col_f = f32::from(u16::try_from(col).unwrap_or(0));
+        let row_f = f32::from(u16::try_from(row).unwrap_or(0));
+        let card_min = grid_rect.min
+            + egui::vec2(
+                col_f * (card_width + ATTACHMENT_CARD_GAP),
+                row_f * (ATTACHMENT_CARD_HEIGHT + ATTACHMENT_CARD_GAP),
+            );
+        let card_rect =
+            egui::Rect::from_min_size(card_min, egui::vec2(card_width, ATTACHMENT_CARD_HEIGHT));
+        ui.painter().rect(
+            card_rect,
+            8.0,
+            visuals.extreme_bg_color,
+            visuals.widgets.noninteractive.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+
+        let thumb_rect =
+            egui::Rect::from_min_size(card_rect.min + egui::vec2(8.0, 8.0), egui::vec2(40.0, 40.0));
+        ui.painter()
+            .rect_filled(thumb_rect, 6.0, visuals.faint_bg_color);
+        if let Some(png) = attachment.thumbnail_png()
+            && let Some(cache) = image_cache.as_deref_mut()
+            && let Some(tex) = cache.png_bytes_texture(ui.ctx(), png)
+        {
+            let fitted = aspect_fit_rect(thumb_rect, tex.size_vec2());
+            ui.painter().image(
+                tex.id(),
+                fitted,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            let badge = if attachment.is_media() { "IMG" } else { "TXT" };
+            ui.painter().text(
+                thumb_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                badge,
+                FontId::proportional(11.0),
+                visuals.weak_text_color(),
+            );
+        }
+
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(thumb_rect.max.x + 8.0, card_rect.min.y + 8.0),
+            egui::pos2(
+                (card_rect.max.x - 8.0).max(thumb_rect.max.x + 12.0),
+                card_rect.max.y - 6.0,
+            ),
+        );
+        let mut text_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("transcript-attachment-meta", message_id, index))
+                .max_rect(text_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        text_ui.set_clip_rect(text_rect);
+        text_ui.label(
+            RichText::new(super::attachments::truncate_name(attachment.name(), 28))
+                .small()
+                .strong(),
+        );
+        text_ui.label(
+            RichText::new(super::attachments::attachment_summary(attachment))
+                .small()
+                .weak(),
+        );
+
+        if attachment.is_media() {
+            let card_id = ui.make_persistent_id(("transcript-attachment-open", message_id, index));
+            let response = ui
+                .interact(card_rect, card_id, egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::ZoomIn)
+                .on_hover_text("Click to inspect attachment");
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::Role::Button,
+                    true,
+                    format!("Inspect {}", attachment.name()),
+                )
+            });
+            if response.clicked() {
+                action = Some(TranscriptAction::InspectAttachment { message_id, index });
+            }
+        }
+    }
+    action
 }
 
 fn render_text_segment(

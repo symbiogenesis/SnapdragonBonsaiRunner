@@ -37,7 +37,6 @@ use windows::{
 };
 
 /// Maximum number of files accepted from a single multi-file picker selection.
-#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
 pub(crate) const MAX_PICKED_FILES: usize = 8;
 
 const PICKER_CANCELLED: HRESULT = HRESULT::from_win32(ERROR_CANCELLED.0);
@@ -185,7 +184,6 @@ pub(crate) struct DialogSpec<'a> {
 }
 
 /// Declarative configuration for a multi-file modal Open dialog.
-#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
 pub(crate) struct MultiDialogSpec<'a> {
     pub(crate) title: &'a str,
     pub(crate) ok_button_label: &'a str,
@@ -193,7 +191,6 @@ pub(crate) struct MultiDialogSpec<'a> {
 }
 
 /// Classification of multi-file modal Open dialog failures.
-#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MultiDialogError {
     Cancelled,
@@ -417,7 +414,6 @@ pub(crate) const fn dialog_options(
 }
 
 /// Computes sanitized multi-file Open filesystem options while rejecting link dereferencing.
-#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
 pub(crate) const fn multi_open_dialog_options(
     existing: FILEOPENDIALOGOPTIONS,
 ) -> FILEOPENDIALOGOPTIONS {
@@ -433,7 +429,6 @@ pub(crate) const fn multi_open_dialog_options(
     )
 }
 
-#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
 fn validate_picked_count(count: u32) -> Result<u32, MultiDialogError> {
     if count == 0 {
         return Err(MultiDialogError::Cancelled);
@@ -449,7 +444,6 @@ fn validate_picked_count(count: u32) -> Result<u32, MultiDialogError> {
 }
 
 /// Runs a modal multi-file `IFileOpenDialog` on a fresh STA apartment with cross-thread cancel.
-#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
 pub(crate) fn run_multi_open_modal(
     owner: isize,
     cancel: &Cancel,

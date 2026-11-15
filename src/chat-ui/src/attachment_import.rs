@@ -30,18 +30,10 @@ mod text;
 mod worker;
 
 /// Maximum number of attachments permitted on a single prompt message.
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B4/B5 wires attachment state and UI."
-)]
-pub(crate) const MAX_ATTACHMENTS_PER_MESSAGE: usize = 8;
+pub(crate) const MAX_ATTACHMENTS_PER_MESSAGE: usize = crate::com_dialog::MAX_PICKED_FILES;
 /// Maximum byte length accepted for any single UTF-8 text/code file attachment.
 pub(crate) const MAX_TEXT_FILE_BYTES: usize = 256 * 1024;
 /// Maximum combined normalized UTF-8 byte length across all text attachments in one message.
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B4/B5 wires attachment state and UI."
-)]
 pub(crate) const MAX_TOTAL_TEXT_ATTACHMENT_BYTES: usize = 512 * 1024;
 /// Maximum source file byte size accepted before launching an isolated image/video worker.
 pub(crate) const MAX_SOURCE_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
@@ -78,10 +70,6 @@ const MEDIA_FILTERS: [FilterSpec<'static>; 1] = [FilterSpec {
 }];
 
 /// Submenu selection category for the native multi-file attachment picker.
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PickerKind {
     Text,
@@ -170,10 +158,6 @@ impl Attachment {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "Temporary until Step B5 wires thumbnail previews."
-    )]
     pub(crate) fn thumbnail_png(&self) -> Option<&[u8]> {
         match self {
             Self::Text { .. } => None,
@@ -183,10 +167,6 @@ impl Attachment {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "Temporary until Step B5 wires media lightbox inspection."
-    )]
     pub(crate) fn image_data_urls(&self) -> Vec<Arc<str>> {
         match self {
             Self::Text { .. } => Vec::new(),
@@ -198,10 +178,6 @@ impl Attachment {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "Temporary until Step B5 wires video badge counts."
-    )]
     pub(crate) fn frame_count(&self) -> usize {
         self.image_count()
     }
@@ -278,10 +254,6 @@ pub(crate) fn format_user_turn(
 }
 
 /// Result delivered once the native picker and bounded file import finish.
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Dialog cancelled or closed with no files selected.
@@ -302,10 +274,6 @@ pub(crate) struct Shared {
 }
 
 /// Active background native picker + attachment import job.
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 pub(crate) struct Session {
     shared: Arc<Shared>,
     receiver: Receiver<Outcome>,
@@ -313,10 +281,6 @@ pub(crate) struct Session {
     complete: bool,
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 impl Session {
     pub(crate) fn start(
         kind: PickerKind,
@@ -387,10 +351,6 @@ pub(crate) fn run_worker(arguments: &[OsString]) -> std::process::ExitCode {
     worker::run_worker(arguments)
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 pub(crate) fn classify_path(path: &Path) -> Option<FileCategory> {
     let extension = path.extension().and_then(std::ffi::OsStr::to_str)?;
     if TEXT_EXTENSIONS
@@ -414,10 +374,6 @@ pub(crate) fn classify_path(path: &Path) -> Option<FileCategory> {
     None
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 fn run_picker_import(
     kind: PickerKind,
     owner: isize,
@@ -430,10 +386,6 @@ fn run_picker_import(
     let _sent = sender.try_send(outcome);
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 fn picker_and_import(
     kind: PickerKind,
     owner: isize,
@@ -475,10 +427,6 @@ fn picker_and_import(
     import_selected_paths(kind, &paths, remaining_slots, remaining_text_bytes, shared)
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 fn import_selected_paths(
     kind: PickerKind,
     paths: &[PathBuf],
@@ -539,10 +487,6 @@ fn import_selected_paths(
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 fn import_one_path(
     kind: PickerKind,
     path: &Path,

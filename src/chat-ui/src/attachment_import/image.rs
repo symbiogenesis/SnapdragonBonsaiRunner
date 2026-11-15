@@ -185,10 +185,6 @@ pub(super) fn encode_rgba_png(
     Ok(output)
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 pub(super) fn validate_png_bytes(
     bytes: &[u8],
     max_edge: u32,
@@ -213,10 +209,6 @@ pub(super) fn validate_png_bytes(
     Ok((info.width, info.height))
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 pub(super) fn png_to_data_url(png_bytes: &[u8]) -> String {
     format!("data:image/png;base64,{}", Base64::encode_string(png_bytes))
 }

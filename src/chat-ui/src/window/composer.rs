@@ -40,8 +40,11 @@ impl State {
                     self.retry();
                 }
             } else {
+                let has_content =
+                    !self.input.trim().is_empty() || !self.draft_attachments.is_empty();
+                let vision_ok = !self.has_unsent_or_history_media() || self.vision_available;
                 let can_send =
-                    self.model == super::ModelLifecycle::Ready && !self.input.trim().is_empty();
+                    self.model == super::ModelLifecycle::Ready && has_content && vision_ok;
                 let response = ui
                     .add_enabled(can_send, controls::primary_button(ui, "Send  ↑"))
                     .on_hover_text("Send message · Enter");
@@ -51,6 +54,13 @@ impl State {
                         ui.label(format!(
                             "Wait for ‘{title}’ to finish responding before sending."
                         ));
+                    })
+                } else if self.model == super::ModelLifecycle::Ready && has_content && !vision_ok {
+                    response.on_disabled_hover_ui(|ui| {
+                        ui.set_max_width(ui.spacing().tooltip_width);
+                        ui.label(
+                            "Images and videos require the vision projector (mmproj). Remove media attachments or relaunch without --no-mmproj.",
+                        );
                     })
                 } else {
                     response
@@ -79,6 +89,7 @@ impl State {
                     .inner_margin(14)
                     .show(ui, |ui| {
                         let label = self.context_toolbar(ui);
+                        self.composer_attachments(ui);
                         let response = self.composer_editor(ui, label.id);
                         self.composer_enter(ui, &response);
                         self.composer_actions(ui);
@@ -245,7 +256,7 @@ impl State {
         // the audio controls, including with the collapsed rail.
         let separate_send_row = ui.available_width() < 420.0;
         ui.horizontal_wrapped(|ui| {
-            self.audio_file_button(ui);
+            self.attachment_menu_button(ui);
             self.read_aloud_controls(ui);
             if !separate_send_row {
                 self.composer_send_controls(ui);

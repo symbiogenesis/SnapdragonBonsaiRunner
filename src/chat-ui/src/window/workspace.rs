@@ -143,6 +143,7 @@ impl State {
         self.context_history = None;
         self.input.clear();
         self.set_draft_attachments(Vec::new());
+        self.attachment_notice = None;
         self.last_answer.clear();
         self.retained_draft.clear();
         self.stage = None;
@@ -164,6 +165,7 @@ impl State {
         self.context_history = snapshot.context_history;
         self.input = snapshot.input;
         self.set_draft_attachments(snapshot.draft_attachments);
+        self.attachment_notice = None;
         self.last_answer = snapshot.last_answer;
         self.retained_draft = snapshot.retained_draft;
         self.answer_complete = snapshot.answer_complete;

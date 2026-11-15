@@ -5,7 +5,7 @@ use egui_kittest::{
     Harness,
     kittest::{NodeT as _, Queryable as _},
 };
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
 const QUESTION: &str = "I have a few ideas for a short story, but I am not sure where to start.";
 const ANSWER: &str = "Start with the moment something changes.\n\nA quiet bookshop receives a letter addressed to someone who has never existed. Its owner recognizes the handwriting as their own.\n\nWhat draws you in more: the mystery of the letter, or the person who finds it?";
@@ -1408,21 +1408,24 @@ fn real_text_selection_does_not_leak_when_conversation_message_ids_repeat() {
 fn audio_file_plus_is_accessible_and_remains_inside_the_composer() {
     for size in [[1180.0, 860.0], [620.0, 640.0], [480.0, 480.0]] {
         let mut chat = harness(size, false);
-        let add = chat.get_by_role_and_label(egui::Role::Button, "Add audio file");
+        let add = chat.get_by_role_and_label(egui::Role::Button, "Add attachment");
         let microphone = chat.get_by_role_and_label(egui::Role::Button, "Microphone");
         assert!(add.rect().is_positive());
         assert!(add.rect().left() >= 0.0 && add.rect().bottom() <= size[1]);
         assert!(add.rect().center().x < microphone.rect().center().x);
         add.click();
         chat.run();
-        assert!(chat.get_by_label("Audio file setup").rect().is_positive());
         let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size.into());
-        assert!(
-            bounds.contains_rect(
-                chat.get_by_role_and_label(egui::Role::Button, "Close")
-                    .rect()
-            )
-        );
+        let audio = chat.get_by_role_and_label(egui::Role::Button, "Audio files");
+        let text = chat.get_by_role_and_label(egui::Role::Button, "Text files");
+        let media = chat.get_by_role_and_label(egui::Role::Button, "Images and Videos");
+        assert!(audio.accesskit_node().is_disabled());
+        assert!(!text.accesskit_node().is_disabled());
+        assert!(!media.accesskit_node().is_disabled());
+        assert!(chat.get_by_label("ASR unavailable").rect().is_positive());
+        assert!(bounds.contains_rect(audio.rect()));
+        assert!(bounds.contains_rect(text.rect()));
+        assert!(bounds.contains_rect(media.rect()));
         assert!(chat.state().app.microphone.is_none());
         assert!(chat.state().commands.try_recv().is_err());
     }
@@ -1795,4 +1798,304 @@ fn conversation_history_ui_updates_recency_on_draft_edit_starter_prompt_and_rena
         .click();
     chat.run();
     assert_eq!(order(&chat), vec![third, second, first]);
+}
+
+fn test_png_payload(rgba: [u8; 4]) -> io::Result<(Arc<[u8]>, Arc<str>)> {
+    use base64ct::{Base64, Encoding as _};
+
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 2, 2);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(io::Error::other)?;
+        let pixels = [
+            rgba[0], rgba[1], rgba[2], rgba[3], rgba[0], rgba[1], rgba[2], rgba[3], rgba[0],
+            rgba[1], rgba[2], rgba[3], rgba[0], rgba[1], rgba[2], rgba[3],
+        ];
+        writer.write_image_data(&pixels).map_err(io::Error::other)?;
+        writer.finish().map_err(io::Error::other)?;
+    }
+    let data_url: Arc<str> = Arc::from(format!(
+        "data:image/png;base64,{}",
+        Base64::encode_string(&png_bytes)
+    ));
+    let thumbnail_png: Arc<[u8]> = Arc::from(png_bytes);
+    Ok((thumbnail_png, data_url))
+}
+
+fn test_image_attachment(
+    name: &str,
+    rgba: [u8; 4],
+) -> io::Result<crate::attachment_import::Attachment> {
+    let (thumbnail_png, data_url) = test_png_payload(rgba)?;
+    Ok(crate::attachment_import::Attachment::Image {
+        name: name.to_owned(),
+        width: 2,
+        height: 2,
+        data_url,
+        thumbnail_png,
+    })
+}
+
+#[test]
+fn attachment_popup_disables_audio_with_spinner_until_asr_loads() {
+    let mut chat = harness([1180.0, 900.0], false);
+    {
+        let app = &mut chat.state_mut().app;
+        app.preview = false;
+        app.canary_configured = true;
+        app.speech_checked = false;
+        app.audio_file_input = false;
+    }
+    chat.run_steps(8);
+
+    chat.get_by_role_and_label(egui::Role::Button, "Add attachment")
+        .click();
+    chat.run_steps(8);
+
+    let audio = chat.get_by_role_and_label(egui::Role::Button, "Audio files");
+    assert!(audio.accesskit_node().is_disabled());
+    assert!(chat.get_by_label("Loading ASR…").rect().is_positive());
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Text files")
+            .accesskit_node()
+            .is_disabled()
+    );
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Images and Videos")
+            .accesskit_node()
+            .is_disabled()
+    );
+
+    audio.click();
+    chat.run_steps(4);
+    assert!(chat.state().app.audio_import.is_none());
+
+    chat.state_mut()
+        .app
+        .speech_event(speech::Event::Capabilities {
+            input: true,
+            output: false,
+        });
+    chat.run();
+
+    assert!(chat.query_by_label("Loading ASR…").is_none());
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Audio files")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn draft_attachments_stage_while_swift_prepares_without_auto_sending_and_support_removal()
+-> io::Result<()> {
+    let mut chat = harness([1180.0, 900.0], false);
+    chat.state_mut().app.preview = false;
+    chat.state_mut().app.model = ModelLifecycle::Preparing;
+    chat.run_steps(8);
+
+    chat.get_by_role_and_label(egui::Role::Button, "Add attachment")
+        .click();
+    chat.run_steps(8);
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Text files")
+            .accesskit_node()
+            .is_disabled()
+    );
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Images and Videos")
+            .accesskit_node()
+            .is_disabled()
+    );
+    chat.key_press(egui::Key::Escape);
+    chat.run_steps(4);
+
+    let image = test_image_attachment("shot.png", [220, 40, 40, 255])?;
+    let note = crate::attachment_import::Attachment::Text {
+        name: "notes.rs".to_owned(),
+        text: "fn main() {}\n".to_owned(),
+    };
+    let rejected = chat
+        .state_mut()
+        .app
+        .append_draft_attachments(vec![note, image]);
+    assert_eq!(rejected, None);
+    chat.run_steps(8);
+
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Remove notes.rs")
+            .rect()
+            .is_positive()
+    );
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Remove shot.png")
+            .rect()
+            .is_positive()
+    );
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+            .accesskit_node()
+            .is_disabled()
+    );
+    chat.state_mut().app.submit();
+    assert!(chat.state().commands.try_recv().is_err());
+
+    chat.state_mut()
+        .app
+        .model_event(Event::VisionAvailable(true));
+    chat.state_mut().app.model_event(Event::Ready);
+    chat.run();
+
+    // Readiness never auto-sends staged draft attachments.
+    assert!(chat.state().commands.try_recv().is_err());
+    assert_eq!(chat.state().app.draft_attachments.len(), 2);
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Send  ↑")
+            .accesskit_node()
+            .is_disabled()
+    );
+
+    chat.get_by_role_and_label(egui::Role::Button, "Remove shot.png")
+        .click();
+    chat.run();
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Remove shot.png")
+            .is_none()
+    );
+    assert_eq!(chat.state().app.draft_attachments.len(), 1);
+
+    chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+        .click();
+    chat.run_steps(8);
+
+    match chat.state().commands.try_recv() {
+        Ok(Command::Send { text, images, .. }) => {
+            assert!(text.contains("notes.rs"));
+            assert!(text.contains("fn main() {}"));
+            assert!(images.is_empty());
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "expected Command::Send, got {:?}",
+                other.err()
+            )));
+        }
+    }
+    assert!(chat.state().commands.try_recv().is_err());
+    Ok(())
+}
+
+#[test]
+fn media_attachments_require_vision_capability_to_send_and_open_lightbox() -> io::Result<()> {
+    let mut chat = harness([1180.0, 900.0], false);
+    chat.state_mut().app.model = ModelLifecycle::Ready;
+    chat.state_mut().app.vision_available = false;
+
+    let image = test_image_attachment("diagram.png", [40, 180, 90, 255])?;
+    let (thumb_video, frame_one) = test_png_payload([20, 90, 200, 255])?;
+    let (_, frame_two) = test_png_payload([200, 180, 20, 255])?;
+    let video = crate::attachment_import::Attachment::Video {
+        name: "clip.mp4".to_owned(),
+        width: 2,
+        height: 2,
+        duration_ms: 2_500,
+        frames: Arc::from(vec![
+            crate::attachment_import::VideoFrame {
+                timestamp_ms: 0,
+                data_url: frame_one,
+            },
+            crate::attachment_import::VideoFrame {
+                timestamp_ms: 1_250,
+                data_url: frame_two,
+            },
+        ]),
+        thumbnail_png: thumb_video,
+    };
+
+    assert_eq!(
+        chat.state_mut()
+            .app
+            .append_draft_attachments(vec![image, video]),
+        None
+    );
+    chat.run();
+
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+            .accesskit_node()
+            .is_disabled()
+    );
+    chat.state_mut().app.submit();
+    assert!(chat.state().commands.try_recv().is_err());
+
+    // Inspecting a staged video chip opens the media lightbox with frame stepping.
+    chat.get_by_role_and_label(egui::Role::Button, "Inspect clip.mp4")
+        .click();
+    chat.run();
+    assert!(chat.get_by_label("Attachment preview").rect().is_positive());
+    chat.get_by_role_and_label(egui::Role::Button, "Next frame")
+        .click();
+    chat.run();
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Previous frame")
+            .accesskit_node()
+            .is_disabled()
+    );
+    chat.get_by_role_and_label(egui::Role::Button, "Close")
+        .click();
+    chat.run();
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Dialog, "Attachment preview")
+            .is_none()
+    );
+    assert!(chat.state().app.lightbox.is_none());
+
+    chat.state_mut().app.vision_available = true;
+    chat.run();
+    assert!(chat.state().app.vision_available);
+    assert_eq!(chat.state().app.model, ModelLifecycle::Ready);
+    assert!(
+        !chat
+            .get_by_role_and_label(egui::Role::Button, "Send  ↑")
+            .accesskit_node()
+            .is_disabled()
+    );
+
+    chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+        .click();
+    chat.run_steps(8);
+
+    match chat.state().commands.try_recv() {
+        Ok(Command::Send { images, .. }) => {
+            assert_eq!(images.len(), 3);
+            assert!(
+                images
+                    .iter()
+                    .all(|url| url.starts_with("data:image/png;base64,"))
+            );
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "expected Command::Send, got {:?}",
+                other.err()
+            )));
+        }
+    }
+    assert!(chat.state().app.draft_attachments.is_empty());
+
+    // Transcript renders attachment preview buttons that open the lightbox too.
+    chat.get_by_role_and_label(egui::Role::Button, "Inspect diagram.png")
+        .click();
+    chat.run();
+    assert!(chat.get_by_label("Attachment preview").rect().is_positive());
+    Ok(())
 }

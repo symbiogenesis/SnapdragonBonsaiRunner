@@ -19,6 +19,7 @@ use std::{
 
 mod appearance;
 pub(crate) mod atomic_file;
+mod attachments;
 mod audio_files;
 #[cfg(test)]
 mod background_tests;
@@ -198,6 +199,8 @@ struct State {
     speech_input: bool,
     audio_file_input: bool,
     audio_import: Option<crate::audio_import::Session>,
+    attachment_import: Option<crate::attachment_import::Session>,
+    attachment_notice: Option<(String, bool)>,
     audio_file_generation: u64,
     audio_file_active: bool,
     audio_file_notice: Option<String>,
@@ -355,6 +358,8 @@ impl State {
             speech_input: false,
             audio_file_input: false,
             audio_import: None,
+            attachment_import: None,
+            attachment_notice: None,
             audio_file_generation: 0,
             audio_file_active: false,
             audio_file_notice: None,
@@ -724,6 +729,7 @@ impl State {
         }
         self.last_answer.clear();
         self.retained_draft.clear();
+        self.attachment_notice = None;
         self.stage = None;
         self.answer_complete = false;
         self.streaming_svg_filter.reset();
@@ -888,6 +894,21 @@ impl State {
                 "Voice message cancelled.".clone_into(&mut self.speech_status);
             }
         }
+        if self.attachment_import.is_some()
+            && ctx.input_mut(|input| {
+                input.events.iter().any(|event| {
+                    matches!(event, egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if *modifiers == egui::Modifiers::NONE)
+                })
+            })
+        {
+            self.cancel_attachment_import();
+            return;
+        }
         if self.rename_conversation.is_some()
             || self.delete_conversation.is_some()
             || self.edit_message.is_some()
@@ -920,6 +941,7 @@ impl State {
             if self.dictation_requested {
                 self.cancel_microphone();
             }
+            self.cancel_attachment_import();
             self.image_export = None;
         }
         ctx.input(|input| {
@@ -1986,6 +2008,7 @@ impl Drop for State {
         }
         self.appearance_store.take();
         self.audio_paste.take();
+        self.cancel_attachment_import();
         self.updates.take();
         self.pending_config.take();
         self.startup_request.take();
@@ -2429,6 +2452,18 @@ impl State {
                 self.lightbox = Some(lightbox::Lightbox::new(svg, intrinsic_size, suggested_stem));
                 ui.ctx().request_repaint();
             }
+            Some(transcript::TranscriptAction::InspectAttachment { message_id, index }) => {
+                if let Some(attachment) = self
+                    .transcript
+                    .messages
+                    .iter()
+                    .find(|message| message.id == message_id)
+                    .and_then(|message| message.attachments.get(index))
+                {
+                    self.lightbox = lightbox::Lightbox::from_attachment(attachment);
+                    ui.ctx().request_repaint();
+                }
+            }
             Some(transcript::TranscriptAction::SaveImage {
                 svg,
                 suggested_stem,
@@ -2627,7 +2662,7 @@ impl State {
                 self.speech_notice = false;
             }
         }
-        if let Some(lightbox_action) = self.lightbox.as_ref().and_then(|lightbox| {
+        if let Some(lightbox_action) = self.lightbox.as_mut().and_then(|lightbox| {
             lightbox.show(&ctx, &mut self.image_cache, self.image_export.is_some())
         }) {
             match lightbox_action {
@@ -2697,6 +2732,7 @@ impl eframe::App for State {
         self.handle_input_shortcuts(ctx);
         self.handle_audio_paste(ctx);
         self.poll_audio_import();
+        self.poll_attachment_import(ctx);
         self.poll_microphone();
         self.drain_speech_events();
         self.poll_recovery();
@@ -2714,6 +2750,7 @@ impl eframe::App for State {
         let waiting = active_generation
             || self.image_cache.has_pending()
             || self.image_export.is_some()
+            || self.attachment_import.is_some()
             || (!self.preview
                 && (self.model.waiting_model()
                     || self.speaking

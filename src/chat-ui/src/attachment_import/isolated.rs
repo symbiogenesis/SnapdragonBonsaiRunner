@@ -56,17 +56,9 @@ static ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static QUARANTINE: OnceLock<Quarantine> = OnceLock::new();
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 struct ActiveImport<'a>(&'a AtomicBool);
 
 impl<'a> ActiveImport<'a> {
-    #[allow(
-        dead_code,
-        reason = "Temporary until Step B5 wires attachment picker UI."
-    )]
     fn acquire(slot: &'a AtomicBool) -> Result<Self, String> {
         slot.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| Self(slot))
@@ -91,10 +83,6 @@ struct Quarantine {
     _reader: Option<JoinHandle<()>>,
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 fn quarantine(
     source: Selection,
     executable: Selection,
@@ -120,10 +108,6 @@ struct Selection {
 }
 
 impl Selection {
-    #[allow(
-        dead_code,
-        reason = "Temporary until Step B5 wires attachment picker UI."
-    )]
     fn open(path: &Path, enforce_media_cap: bool) -> io::Result<Self> {
         if !path.is_absolute()
             || !matches!(
@@ -180,18 +164,10 @@ impl Selection {
 struct Scratch(Option<PrivateDirectory>);
 
 impl Scratch {
-    #[allow(
-        dead_code,
-        reason = "Temporary until Step B5 wires attachment picker UI."
-    )]
     fn create() -> io::Result<Self> {
         PrivateDirectory::create(&std::env::temp_dir()).map(|directory| Self(Some(directory)))
     }
 
-    #[allow(
-        dead_code,
-        reason = "Temporary until Step B5 wires attachment picker UI."
-    )]
     fn path(&self) -> io::Result<&Path> {
         self.0
             .as_ref()
@@ -223,10 +199,6 @@ impl Drop for Scratch {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 struct Prepared {
     source: Selection,
     executable_guard: Selection,
@@ -235,10 +207,6 @@ struct Prepared {
     policy: SandboxPolicy,
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 fn prepare(path: &Path, kind: MediaKind) -> Result<Prepared, String> {
     let source = Selection::open(path, true).map_err(|_| SOURCE_FAILURE.to_owned())?;
     let executable = std::env::current_exe().map_err(|_| ISOLATION_FAILURE.to_owned())?;
@@ -274,10 +242,6 @@ fn prepare(path: &Path, kind: MediaKind) -> Result<Prepared, String> {
     })
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 pub(super) fn import_media(
     path: &Path,
     kind: MediaKind,
@@ -355,10 +319,6 @@ pub(super) fn import_media(
     result
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 fn await_packet(
     receiver: &Receiver<Result<Attachment, String>>,
     shared: &Shared,
@@ -554,10 +514,6 @@ fn read_frame_png(
     Ok((timestamp_ms, png))
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B5 wires attachment picker UI."
-)]
 pub(super) fn write_error_packet(write: &mut impl Write, code: u64) -> io::Result<()> {
     let mut header = [0_u8; HEADER_BYTES];
     header[..8].copy_from_slice(MAGIC);

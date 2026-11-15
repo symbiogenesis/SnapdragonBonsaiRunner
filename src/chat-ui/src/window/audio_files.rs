@@ -67,12 +67,13 @@ impl State {
         self.start_audio_import(Source::Clipboard);
     }
 
-    fn start_audio_import(&mut self, source: Source) {
+    pub(super) fn start_audio_import(&mut self, source: Source) {
         // A repeated paste must never replace live progress or a retained result.
         if self.model.busy()
             || self.speaking
             || self.dictation_requested
             || self.audio_import.is_some()
+            || self.attachment_import.is_some()
         {
             return;
         }
@@ -489,36 +490,6 @@ impl State {
         });
         #[cfg(not(test))]
         let _ = scroll;
-    }
-
-    pub(super) fn audio_file_button(&mut self, ui: &mut egui::Ui) {
-        let active = self.audio_file_active;
-        let response = ui
-            .add_enabled(
-                active
-                    || (!self.model.busy()
-                        && !self.speaking
-                        && !self.dictation_requested
-                        && self.audio_import.is_none()),
-                action_button(if active { "Cancel audio" } else { "+ Audio file" })
-                    .selected(active),
-            )
-            .accessible_name(if active { "Cancel audio file transcription" } else { "Add audio file" })
-            .on_hover_text(if active {
-                "Cancel audio file transcription - Escape. Your draft and any retained transcript are kept."
-            } else {
-                "Transcribe an MP3, WAV, M4A, AAC, FLAC or WMA file, or paste a file copied from Explorer. The transcript is inserted at the cursor and sent with your draft if the model is ready; otherwise it stays in the draft. Microphone permission is not required. Long recordings are processed in segments."
-            });
-        if response.clicked() {
-            if active {
-                self.cancel_audio_file();
-                self.speech_notice = false;
-            } else {
-                self.start_audio_import(Source::Picker {
-                    owner: self.native_owner.unwrap_or_default(),
-                });
-            }
-        }
     }
 }
 
