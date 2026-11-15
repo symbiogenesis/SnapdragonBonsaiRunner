@@ -99,8 +99,8 @@
     },
     {
       "path": "Cargo.lock",
-      "bytes": 138768,
-      "sha256": "bce7e66d51f785b58afc8dbf353336b46713a0417cdbc35c325ddd46d7217cc0",
+      "bytes": 138782,
+      "sha256": "47824140f9bc7fabddac35e8c49611bfeb4f113e87c331bd7f2f1be8d3abd004",
       "family": "native-asr"
     },
     {
@@ -129,8 +129,8 @@
     },
     {
       "path": "src/cpu-policy/src/lib.rs",
-      "bytes": 28318,
-      "sha256": "9069e4e74b59900168f001c1522efe2e85125206dd4357a158289f887f76cdaf",
+      "bytes": 33164,
+      "sha256": "5d3ec80f6afdad6a0a5edd50bb8045ec89378d6b5f3c6c0d1a16fe5220e1f1ad",
       "family": "msvc-unwind"
     },
     {
@@ -153,8 +153,8 @@
     },
     {
       "path": "src/speech-asr/src/native.rs",
-      "bytes": 13612,
-      "sha256": "b2b8335facf7147f1358b80e27906e33393f310f55691d1364cc2a77dbfca473",
+      "bytes": 13630,
+      "sha256": "49b2e5e706809dcaa2995df1c0447d8d3cd463e71228cfd589a1b5f710aa6474",
       "family": "native-asr"
     },
     {
