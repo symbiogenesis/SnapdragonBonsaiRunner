@@ -137,7 +137,7 @@ impl State {
         let Some(prefix) = message.retry_prefix(&self.committed) else {
             return;
         };
-        if self.model.retryable() {
+        if self.model.reloadable() {
             self.retry();
             return;
         }
@@ -365,12 +365,8 @@ mod tests {
         state.message_action(MessageAction::Retry(prompt));
         assert!(commands.try_recv().is_err());
         state.model_event(client::Event::Stopped);
-        state.message_action(MessageAction::Retry(prompt));
-        assert!(matches!(commands.try_recv(), Ok(Command::Retry)));
-        assert!(commands.try_recv().is_err());
-        state.model_event(client::Event::Starting);
-        state.model_event(client::Event::Ready);
-        assert!(commands.try_recv().is_err());
+        assert_eq!(state.model, ModelLifecycle::Ready);
+        assert!(!state.warning);
         state.message_action(MessageAction::Retry(prompt));
         assert!(
             matches!(commands.try_recv(), Ok(Command::Send { text, .. }) if text == "Same question")
@@ -387,11 +383,19 @@ mod tests {
             (state.composer_cursor, state.pending_cursor),
             (cursor.0, cursor.1)
         );
+        // Genuine backend teardown still requires Reload model before Retry response.
         state.model_event(client::Event::Rejected {
-            message: "Try again later.".into(),
+            message: "The response did not complete.".into(),
             text: "Same question".into(),
-            retry_required: false,
+            retry_required: true,
         });
+        state.model_event(client::Event::Retryable("Select Retry model.".into()));
+        state.message_action(MessageAction::Retry(prompt));
+        assert!(matches!(commands.try_recv(), Ok(Command::Retry)));
+        assert!(commands.try_recv().is_err());
+        state.model_event(client::Event::Starting);
+        state.model_event(client::Event::Ready);
+        assert!(commands.try_recv().is_err());
         state.input = "A newer draft 🌱".into();
         state.message_action(MessageAction::Retry(prompt));
         assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
@@ -410,13 +414,12 @@ mod tests {
         state.model_event(client::Event::Text("Partial answer".into()));
         state.model_event(client::Event::Stopping("Same question".into()));
         state.model_event(client::Event::Stopped);
-        let answer = state.transcript.messages[5].id;
-        state.input = "Keep this draft".into();
-        state.model = ModelLifecycle::Ready;
-        state.restore_selected_history();
+        assert_eq!(state.model, ModelLifecycle::Ready);
         assert!(
             matches!(commands.try_recv(), Ok(Command::RestoreChat(history)) if history.len() == 6)
         );
+        let answer = state.transcript.messages[5].id;
+        state.input = "Keep this draft".into();
         state.message_action(MessageAction::Retry(answer));
         assert_ne!(state.active_conversation, source);
         assert!(
@@ -593,7 +596,6 @@ mod tests {
         state.model_event(client::Event::Text("Partial answer".into()));
         state.input = "New draft".into();
         state.model_event(client::Event::Stopping("Interrupted prompt".into()));
-        state.model_event(client::Event::Stopped);
         let answer = state
             .transcript
             .messages
@@ -606,10 +608,10 @@ mod tests {
                 .last()
                 .is_some_and(|message| message.content.as_ref() == "Partial answer")
         );
-        assert!(state.message_options(answer).branch);
         assert!(!state.message_options(answer).continue_response);
-        state.model = ModelLifecycle::Ready;
-        state.restore_selected_history();
+        state.model_event(client::Event::Stopped);
+        assert_eq!(state.model, ModelLifecycle::Ready);
+        assert!(state.message_options(answer).branch);
         assert!(
             matches!(commands.try_recv(), Ok(Command::RestoreChat(history)) if history.last().is_some_and(|message| message.content.as_ref() == "Partial answer"))
         );

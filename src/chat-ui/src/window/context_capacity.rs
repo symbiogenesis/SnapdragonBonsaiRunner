@@ -51,6 +51,7 @@ impl State {
                     self.model,
                     ModelLifecycle::Generating
                         | ModelLifecycle::Stopping
+                        | ModelLifecycle::StoppingModel
                         | ModelLifecycle::AwaitingTeardown
                 ))
     }

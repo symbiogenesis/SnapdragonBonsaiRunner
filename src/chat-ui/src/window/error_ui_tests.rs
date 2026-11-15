@@ -383,6 +383,92 @@ fn error_reporting_details_own_shortcuts_without_stopping_generation() {
 }
 
 #[test]
+fn intentional_stop_never_raises_model_alert_and_keeps_composer_ready_to_send() {
+    let mut chat = harness([1080.0, 780.0], 16.0);
+    chat.state_mut().app.context_tokens = Some(131_072);
+    chat.state_mut().app.input = "Draft prompt to revise".into();
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+        .click();
+    chat.run();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { .. })
+    ));
+
+    // Intentional Stop before any prose restores the prompt for immediate editing and resending.
+    chat.get_by_role_and_label(egui::Role::Button, "Stop")
+        .click();
+    chat.run();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Stop)
+    ));
+    assert!(chat.query_by_label("Model needs attention").is_none());
+    assert!(chat.query_by_label("1 alert").is_none());
+
+    chat.state_mut()
+        .app
+        .model_event(Event::Stopping("Draft prompt to revise".into()));
+    chat.state_mut().app.model_event(Event::Stopped);
+    chat.run();
+    assert_eq!(chat.state().app.model, ModelLifecycle::Ready);
+    assert_eq!(chat.state().app.context_tokens, Some(131_072));
+    assert!(!chat.state().app.warning);
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert!(chat.query_by_label("Model needs attention").is_none());
+    assert!(chat.query_by_label("1 alert").is_none());
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Retry model")
+            .is_none()
+    );
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Reload model")
+            .is_none()
+    );
+    assert_eq!(chat.state().app.input, "Draft prompt to revise");
+
+    chat.state_mut().app.input = "Revised prompt after stop".into();
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+        .click();
+    chat.run();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { text, .. }) if text == "Revised prompt after stop"
+    ));
+
+    // Intentional Escape stop mid-stream adopts partial prose without alerting or parking.
+    chat.state_mut()
+        .app
+        .model_event(Event::Text("Partial answer".into()));
+    chat.run();
+    chat.key_press(egui::Key::Escape);
+    chat.run();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Stop)
+    ));
+    chat.state_mut()
+        .app
+        .model_event(Event::Stopping("Revised prompt after stop".into()));
+    chat.state_mut().app.model_event(Event::Stopped);
+    chat.run();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::RestoreChat(history)) if history.len() == 2
+    ));
+    assert_eq!(chat.state().app.model, ModelLifecycle::Ready);
+    assert!(!chat.state().app.warning);
+    assert!(chat.query_by_label("Model needs attention").is_none());
+    assert!(chat.query_by_label("1 alert").is_none());
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Send  ↑")
+            .is_some()
+    );
+}
+
+#[test]
 fn error_reporting_capture_when_requested() -> io::Result<()> {
     let Some(directory) = std::env::var_os("BONSAI_ERROR_CAPTURE_DIRECTORY") else {
         return Ok(());

@@ -64,10 +64,14 @@ fn retry_response_button_reloads_then_retries_existing_turn_at_minimum_width() {
             chat.state().commands.try_recv(),
             Ok(Command::Send { .. })
         ));
+        chat.state_mut().app.model_event(Event::Rejected {
+            message: "The response did not complete.".into(),
+            text: "Interrupted question".into(),
+            retry_required: true,
+        });
         chat.state_mut()
             .app
-            .model_event(Event::Stopping("Interrupted question".into()));
-        chat.state_mut().app.model_event(Event::Stopped);
+            .model_event(Event::Retryable("Select Retry model.".into()));
         chat.state_mut().app.input = "Keep my newer draft".into();
         chat.run();
         let reload = chat.get_by_role_and_label(egui::Role::Button, "Reload model");
@@ -94,6 +98,39 @@ fn retry_response_button_reloads_then_retries_existing_turn_at_minimum_width() {
         assert_eq!(chat.state().app.input, "Keep my newer draft");
         assert_eq!(chat.state().app.transcript.messages.len(), 4);
         assert_eq!(chat.state().app.conversations.len(), 1);
+    }
+}
+
+#[test]
+fn intentional_stop_offers_immediate_retry_response_without_reloading_model() {
+    for size in [[1180.0, 860.0], [480.0, 640.0]] {
+        let mut chat = harness(size);
+        chat.state_mut().app.input = "Interrupted question".into();
+        chat.state_mut().app.submit();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Send { .. })
+        ));
+        chat.state_mut()
+            .app
+            .model_event(Event::Stopping("Interrupted question".into()));
+        chat.state_mut().app.model_event(Event::Stopped);
+        chat.state_mut().app.input = "Keep my newer draft".into();
+        chat.run();
+        assert!(chat.query_by_label("Model needs attention").is_none());
+        assert!(
+            chat.query_by_role_and_label(egui::Role::Button, "Reload model")
+                .is_none()
+        );
+        chat.get_by_role_and_label(egui::Role::Button, "Retry response")
+            .click();
+        chat.run();
+        assert!(
+            matches!(chat.state().commands.try_recv(), Ok(Command::Send { text, .. }) if text == "Interrupted question")
+        );
+        assert!(chat.state().commands.try_recv().is_err());
+        assert_eq!(chat.state().app.input, "Keep my newer draft");
+        assert_eq!(chat.state().app.transcript.messages.len(), 4);
     }
 }
 

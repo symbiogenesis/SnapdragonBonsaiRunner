@@ -9,8 +9,10 @@ impl State {
             ("● Replying", "Model responding")
         } else if self.model.ready() {
             ("● Ready", "Model ready")
-        } else if self.model.retryable() {
+        } else if self.model.reloadable() {
             ("● Paused", "Model paused")
+        } else if self.model == super::ModelLifecycle::Stopping {
+            ("◌ Stopping", "Stopping response")
         } else if self.model.stopping() {
             ("◌ Stopping", "Releasing model")
         } else if self.model.waiting_model() {

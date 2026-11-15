@@ -740,7 +740,7 @@ impl State {
     }
 
     fn retry(&mut self) {
-        if !self.model.retryable()
+        if !self.model.reloadable()
             || self
                 .updates
                 .as_ref()
@@ -909,6 +909,7 @@ impl State {
             self.model,
             ModelLifecycle::Generating
                 | ModelLifecycle::Stopping
+                | ModelLifecycle::StoppingModel
                 | ModelLifecycle::AwaitingTeardown
         ) {
             self.with_request_conversation(|state| state.fail_current_conversation(message));
@@ -925,6 +926,7 @@ impl State {
             self.model,
             ModelLifecycle::Generating
                 | ModelLifecycle::Stopping
+                | ModelLifecycle::StoppingModel
                 | ModelLifecycle::AwaitingTeardown
         );
         let adopted = mutating_turn && self.adopt_interrupted();
@@ -973,6 +975,9 @@ impl State {
             // A rejection can queue just before Stop or behind the first
             // teardown notice. Preserve explicit Stop/retry ownership until
             // teardown ends or the worker acknowledges the new attempt.
+            if self.model.stopping() && retry_required {
+                self.model = ModelLifecycle::AwaitingTeardown;
+            }
             if !adopted && self.input.is_empty() && draft_buffer::fits(text) {
                 text.clone_into(&mut self.input);
                 self.place_composer_cursor(self.input.chars().count());
@@ -1040,6 +1045,7 @@ impl State {
             self.model,
             ModelLifecycle::Generating
                 | ModelLifecycle::Stopping
+                | ModelLifecycle::StoppingModel
                 | ModelLifecycle::AwaitingTeardown
         ) || matches!(event, Event::Rejected { .. })
         {
@@ -1058,6 +1064,11 @@ impl State {
                 self.model = ModelLifecycle::Preparing;
                 self.set_status("Preparing your local model…", false);
             }
+            Event::Restarting => {
+                self.context_tokens = None;
+                self.model = ModelLifecycle::Restarting;
+                self.set_status("Restarting the local model…", false);
+            }
             Event::Retryable(message) => {
                 self.fail(&message);
                 self.model = ModelLifecycle::Retryable;
@@ -1067,6 +1078,7 @@ impl State {
                 self.touch_conversation(self.active_or_routed_conversation());
             }
             Event::Stopped => self.stopped_response(),
+            Event::ModelStopped => self.stopped_model(),
             Event::ContextCapacity(tokens) => self.context_tokens = Some(tokens),
             Event::Ready => {
                 self.model = ModelLifecycle::Ready;
@@ -1161,7 +1173,12 @@ impl State {
         if !self.routing_request {
             self.stop_speech();
         }
-        self.model = ModelLifecycle::Stopping;
+        let stopping_model = self.model == ModelLifecycle::StoppingModel;
+        self.model = if stopping_model {
+            ModelLifecycle::StoppingModel
+        } else {
+            ModelLifecycle::Stopping
+        };
         let adopted = self.adopt_interrupted();
         if !adopted && self.input.is_empty() && draft_buffer::fits(text) {
             text.clone_into(&mut self.input);
@@ -1171,13 +1188,26 @@ impl State {
         if !adopted {
             self.retain_draft();
         }
-        self.set_status("Response stopped. Releasing the local model…", false);
+        self.set_status(
+            if stopping_model {
+                "Response stopped. Releasing the local model…"
+            } else {
+                "Stopping the response…"
+            },
+            false,
+        );
     }
 
     fn stopped_response(&mut self) {
-        self.context_tokens = None;
-        self.model = ModelLifecycle::Retryable;
+        self.model = ModelLifecycle::Ready;
         self.set_status(client::STOPPED_MESSAGE, false);
+        self.focus_composer = true;
+    }
+
+    fn stopped_model(&mut self) {
+        self.context_tokens = None;
+        self.model = ModelLifecycle::Stopped;
+        self.set_status("Local model stopped.", false);
         self.focus_composer = true;
     }
 
@@ -1880,7 +1910,7 @@ impl State {
             && self.startup_request.is_none()
             && (matches!(
                 self.model,
-                ModelLifecycle::Ready | ModelLifecycle::Retryable
+                ModelLifecycle::Ready | ModelLifecycle::Stopped | ModelLifecycle::Retryable
             ) || self.setup_stopped_for_update())
     }
 
@@ -1903,13 +1933,25 @@ impl State {
         };
         updates.wait_for_stop();
         self.stop_speech();
-        if self.model.busy() {
-            self.stop_generation();
-        } else if self.model == ModelLifecycle::Ready {
-            if self.commands.send(Command::Stop).is_err() {
+        if matches!(
+            self.model,
+            ModelLifecycle::Generating | ModelLifecycle::Stopping
+        ) {
+            if self.commands.send(Command::StopModel).is_err() {
                 self.fail("The model worker stopped. Close and restart the app before updating.");
             } else {
-                self.model = ModelLifecycle::Stopping;
+                self.with_request_conversation(|state| {
+                    state.model = ModelLifecycle::StoppingModel;
+                    state.transcript.remove_empty_response();
+                    state.set_status("Stopping the local model before updating...", false);
+                    state.touch_conversation(state.active_or_routed_conversation());
+                });
+            }
+        } else if self.model == ModelLifecycle::Ready {
+            if self.commands.send(Command::StopModel).is_err() {
+                self.fail("The model worker stopped. Close and restart the app before updating.");
+            } else {
+                self.model = ModelLifecycle::StoppingModel;
                 self.set_status("Stopping the local model before updating...", false);
             }
         }
@@ -1950,7 +1992,9 @@ impl State {
                 ModelLifecycle::Ready
                     | ModelLifecycle::Generating
                     | ModelLifecycle::Stopping
+                    | ModelLifecycle::StoppingModel
                     | ModelLifecycle::AwaitingTeardown
+                    | ModelLifecycle::Stopped
                     | ModelLifecycle::Retryable
             ) || self.setup_stopped_for_update());
         if can_stop
@@ -1970,7 +2014,7 @@ impl State {
         let Some(updates) = &mut self.updates else {
             return;
         };
-        if self.model == ModelLifecycle::Retryable || setup_stopped {
+        if self.model.reloadable() || setup_stopped {
             updates.finish_stop(true);
         } else if self.model == ModelLifecycle::Unavailable {
             updates.finish_stop(false);
@@ -2112,7 +2156,7 @@ impl State {
         let controls = transcript::MessageControls {
             history: &self.committed,
             can_send: available && !self.preview && self.model == ModelLifecycle::Ready,
-            can_reload: available && !self.preview && self.model.retryable(),
+            can_reload: available && !self.preview && self.model.reloadable(),
             can_branch: available && self.model.workspace_available(),
             speech_loading: self.speaking_message.filter(|_| self.speech_loading),
             speech_preparing: self.tts_configured && !self.speech_checked,

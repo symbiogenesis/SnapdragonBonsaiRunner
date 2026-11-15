@@ -199,12 +199,19 @@ Rebuild after source/compiler changes, and fix an invalid `-ToolPath` or
 `BONSAI_TOOLS_PATH` before retrying. No model/speech setup command is required for
 ordinary source or bundled launches.
 
-**Stop** tears down the owned broker/backend. **Retry model** waits for teardown,
-then repeats identity, artifact and selected-memory admission checks with a fresh instance
-and retained completed turns. Retry explicitly after uncertain transport/protocol
-failures or after freeing RAM. Requests never replay automatically or fall back
-to a smaller profile. Interrupted prompts return only to an empty composer,
-preserving newer drafts; a closed connection alone identifies no token/memory cause.
+**Stop** cancels the active response without raising a model error: on the native
+Rust runtime the broker aborts the active backend stream and resets the single-user
+session in place so the warm model stays immediately ready; on the publisher
+rollback runtime the worker confirms Job teardown and automatically restarts a
+fresh warm instance. Explicit model teardown (such as before installing an
+application update) releases the owned broker/backend cleanly without raising a
+model alert. **Retry model** (after a runtime failure) or **Reload model** (after
+explicit model teardown) waits for confirmed teardown, then repeats identity,
+artifact and selected-memory admission checks with a fresh instance and retained
+completed turns. Retry explicitly after uncertain transport/protocol failures or
+after freeing RAM. Requests never replay automatically or fall back to a smaller
+profile. Interrupted prompts return only to an empty composer, preserving newer
+drafts; a closed connection alone identifies no token/memory cause.
 
 ### Conversations and response settings
 

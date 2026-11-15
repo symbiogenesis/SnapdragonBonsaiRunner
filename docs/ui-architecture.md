@@ -212,7 +212,7 @@ Installed upgrade/rollback acceptance is independent of portable updates.
 | Appearance | System/Light/Dark, with Windows high contrast taking precedence; 14–24-point reading text and 640–1,040-point reading width. Default/minimum window: 1,080×780 / 480×480 points. Sidebar: 216–340 points; below 900 points it becomes a modal drawer. Manual width survives layout changes. |
 | Settings | Native modal with immediate changes and explicit conversation/device scope. Response opens first; narrow/short layouts wrap navigation. Done/Close/Escape restores composer focus. Open selectors consume Escape first; background Send/Find/Stop stay blocked while generation may continue. |
 | Response controls | Per-conversation settings lock during generation. The composer popup exposes Thinking/Extra effort; advanced reply/adapter controls live in Settings. [Application controls](development-guide.md#conversations-and-response-settings) own defaults and actions. |
-| Stop/retry | No generation elapsed-time cutoff. Stop freezes queued updates and wakes network/backpressure waits. Retry requires acknowledged teardown, fresh credentials/diagnostics and repeated artifact/identity/memory admission. Preserve completed turns/newer drafts; never replay or reduce the profile automatically. Completion winning the Stop race must leave transcript and history consistent. |
+| Stop/retry | No generation elapsed-time cutoff. Response Stop freezes queued updates, wakes network/backpressure waits, and restores readiness without raising a model alert (resetting the warm native session in place via authenticated `/reset`, or automatically restarting a fresh warm instance after confirmed Job teardown on publisher rollback). Explicit model teardown (`StopModel`, such as before installing an update) parks cleanly until `Reload model` or shutdown. Retry/reload requires acknowledged teardown, fresh credentials/diagnostics and repeated artifact/identity/memory admission. Preserve completed turns/newer drafts; never replay or reduce the profile automatically. Completion winning the Stop race must leave transcript and history consistent. |
 | Rejections | Only the exact [broker recovery errors](broker-policy.md#native-client-completion-and-recovery) retain readiness and restore input. Other disconnects require explicit Retry and identify no token/memory cause. |
 | Alerts | One shared native panel selects among setup/model/saving/speech/audio/update failures. Each has a two-line summary and source-specific actions. Details provides a bounded scrollable modal; Copy error copies the complete message. Successful progress stays separate. |
 
@@ -250,9 +250,11 @@ supplies no arbitrary fonts, coordinates or theme colors. Windows high contrast
 continues to take precedence. These styles add no separately persisted theme.
 
 The model states are unavailable, preparing, ready, generating, awaiting teardown,
-stopping, retryable and restarting. Send requires acknowledged readiness; Retry
-requires teardown notification and explicit action. Replace the ordered event
-channel on worker attachment. Late events cannot reopen admission in another phase.
+stopping, stopping model, stopped, retryable and restarting. Send requires
+acknowledged readiness; Retry/reload requires teardown notification and explicit
+action (except automatic fresh warm restart after a response stop on the publisher
+rollback runtime). Replace the ordered event channel on worker attachment. Late
+events cannot reopen admission in another phase.
 
 Drafting, browsing and conversation creation remain available during preparation,
 failure and generation. Only one request runs: incoming content, reasoning, stages

@@ -124,6 +124,7 @@ impl EventSender {
                 let _sent = started.send(());
             }
             match commands.recv_timeout(IO_POLL) {
+                Ok(Command::StopModel) => return Err(Failure::ModelStopped),
                 Ok(Command::Stop) => return Err(Failure::Stopped),
                 Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                     return Err(Failure::Shutdown);

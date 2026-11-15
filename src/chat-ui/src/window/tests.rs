@@ -110,6 +110,7 @@ fn application_messages_never_enter_the_conversation() {
 #[test]
 fn stopped_empty_response_leaves_only_conversation_content() {
     let (mut state, commands, _events) = state();
+    state.context_tokens = Some(131_072);
     state.model = ModelLifecycle::Ready;
     state.input = "Keep my question".to_owned();
     state.submit();
@@ -125,14 +126,18 @@ fn stopped_empty_response_leaves_only_conversation_content() {
     assert!(!state.model.retryable());
     state.model_event(Event::Stopped);
     assert!(!state.model.waiting_model());
-    assert!(state.model.retryable());
+    assert_eq!(state.model, ModelLifecycle::Ready);
+    assert!(!state.model.retryable());
+    assert_eq!(state.context_tokens, Some(131_072));
     assert!(!state.warning);
+    assert!(state.active_alerts().is_empty());
     assert_eq!(state.transcript.messages.len(), 1);
 }
 
 #[test]
 fn stop_freezes_queued_output_and_preserves_a_new_composer_draft() {
     let (mut state, commands, events) = state();
+    state.context_tokens = Some(131_072);
     state.model = ModelLifecycle::Ready;
     state.input = "Original question".to_owned();
     state.submit();
@@ -163,10 +168,29 @@ fn stop_freezes_queued_output_and_preserves_a_new_composer_draft() {
     state.model_event(Event::Stopping("Original question".to_owned()));
     assert_eq!(state.input, "My next question");
     state.model_event(Event::Stopped);
+    assert_eq!(state.model, ModelLifecycle::Ready);
+    assert_eq!(state.context_tokens, Some(131_072));
     assert!(!state.warning);
-    state.retry();
-    assert!(matches!(commands.try_recv(), Ok(Command::Retry)));
-    assert!(!state.model.ready());
+    assert!(state.active_alerts().is_empty());
+    assert!(matches!(commands.try_recv(), Ok(Command::RestoreChat(history)) if history.len() == 2));
+    state.submit();
+    assert!(
+        matches!(commands.try_recv(), Ok(Command::Send { text, .. }) if text == "My next question")
+    );
+    // Publisher rollback automatically restarts a fresh warm attempt on Stop
+    // without surfacing a model alert or requiring manual Retry.
+    state.stop_generation();
+    assert!(matches!(commands.try_recv(), Ok(Command::Stop)));
+    state.model_event(Event::Stopping("My next question".to_owned()));
+    state.model_event(Event::Restarting);
+    assert_eq!(state.model, ModelLifecycle::Restarting);
+    assert!(!state.warning);
+    assert!(state.active_alerts().is_empty());
+    state.model_event(Event::Starting);
+    state.model_event(Event::ContextCapacity(131_072));
+    state.model_event(Event::Ready);
+    assert_eq!(state.model, ModelLifecycle::Ready);
+    assert!(!state.warning);
 }
 
 #[test]
@@ -195,7 +219,15 @@ fn queued_rejections_after_stop_preserve_teardown_and_composer_drafts() {
             );
 
             state.drain_events();
-            assert!(state.model.stopping() && state.model.waiting_model());
+            assert!(state.model.waiting_model());
+            assert_eq!(
+                state.model,
+                if retry_required {
+                    ModelLifecycle::AwaitingTeardown
+                } else {
+                    ModelLifecycle::Stopping
+                }
+            );
             assert!(
                 !state.model.ready()
                     && !state.model.busy()
@@ -216,12 +248,27 @@ fn queued_rejections_after_stop_preserve_teardown_and_composer_drafts() {
             assert!(commands.try_recv().is_err());
 
             state.model_event(Event::Stopped);
-            assert!(
-                state.model.retryable() && !state.model.ready() && !state.model.waiting_model()
-            );
-            state.retry();
-            assert!(matches!(commands.try_recv(), Ok(Command::Retry)));
-            assert!(commands.try_recv().is_err());
+            if retry_required {
+                assert_eq!(state.model, ModelLifecycle::AwaitingTeardown);
+                state.model_event(Event::Retryable("Cleanup complete".to_owned()));
+                assert!(
+                    state.model.retryable()
+                        && !state.model.ready()
+                        && !state.model.waiting_model()
+                        && state.warning
+                );
+                state.retry();
+                assert!(matches!(commands.try_recv(), Ok(Command::Retry)));
+                assert!(commands.try_recv().is_err());
+            } else {
+                assert!(
+                    state.model.ready()
+                        && !state.model.retryable()
+                        && !state.model.waiting_model()
+                        && !state.warning
+                );
+                assert!(state.active_alerts().is_empty());
+            }
         }
     }
 }
@@ -255,6 +302,10 @@ fn queued_rejection_after_stop_retains_completed_extra_effort_draft() {
         state.drain_events();
         assert_eq!(state.status, status);
         state.model_event(Event::Stopped);
+        if retry_required {
+            assert_eq!(state.model, ModelLifecycle::AwaitingTeardown);
+            state.model_event(Event::Retryable("Cleanup complete".to_owned()));
+        }
         assert_eq!(
             state.last_answer,
             if retry_required {
@@ -274,8 +325,12 @@ fn queued_rejection_after_stop_retains_completed_extra_effort_draft() {
             }
         );
         assert_eq!(state.committed.len(), if retry_required { 2 } else { 0 });
-        assert!(state.model.retryable() && !state.model.ready());
-        assert_eq!(state.status, client::STOPPED_MESSAGE);
+        if retry_required {
+            assert!(state.model.retryable() && !state.model.ready() && state.warning);
+        } else {
+            assert!(state.model.ready() && !state.model.retryable() && !state.warning);
+            assert_eq!(state.status, client::STOPPED_MESSAGE);
+        }
     }
 }
 
@@ -308,8 +363,9 @@ fn completed_turn_winning_stop_race_keeps_visible_and_committed_answers_consiste
     assert_eq!(state.status, status);
     assert!(!state.model.ready() && !state.model.retryable() && !state.warning);
     state.model_event(Event::Stopped);
-    assert!(state.model.retryable());
+    assert_eq!(state.model, ModelLifecycle::Ready);
     assert!(!state.warning);
+    assert!(state.active_alerts().is_empty());
 }
 
 #[test]

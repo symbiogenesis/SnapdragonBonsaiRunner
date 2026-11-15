@@ -66,7 +66,7 @@ const CONTROL_TOKEN_MESSAGE: &str = "This conversation contains reserved chat ma
 const RATE_LIMIT_MESSAGE: &str =
     "Too many messages were sent in a short time. Wait a moment, then send again.";
 const TEARDOWN_FAILURE_MESSAGE: &str = "The local model's owned processes could not be confirmed stopped. Copy any conversation or drafts you want to keep, then close this app before launching again.";
-pub(crate) const STOPPED_MESSAGE: &str = "Response stopped. Select Retry model to continue. Any usable partial reply remains in the conversation.";
+pub(crate) const STOPPED_MESSAGE: &str = "Response stopped. Ready when you are.";
 /// System instructions prepended to every model turn to enable structured SVG image generation.
 pub(crate) const SYSTEM_PROMPT: &str = "\
 You are Swift Bonsai, a helpful assistant running locally on the user's device. \
@@ -155,6 +155,7 @@ pub(crate) enum Command {
     NewChat,
     RestoreChat(Vec<Message>),
     Stop,
+    StopModel,
     Retry,
     Shutdown,
 }
@@ -163,6 +164,7 @@ pub(crate) enum Command {
 #[derive(Clone)]
 pub(crate) enum Event {
     Starting,
+    Restarting,
     ContextCapacity(usize),
     Ready,
     Text(String),
@@ -173,6 +175,7 @@ pub(crate) enum Event {
     Retryable(String),
     Stopping(String),
     Stopped,
+    ModelStopped,
     Rejected {
         message: String,
         text: String,
@@ -196,6 +199,7 @@ pub(crate) enum Completion {
 enum Failure {
     Shutdown,
     Stopped,
+    ModelStopped,
     Memory,
     NativeRuntime,
     Teardown,
@@ -329,9 +333,18 @@ pub(crate) fn run(config: Config, commands: Receiver<Command>, events: EventSend
                 }
             }
             Err(Failure::Stopped) => {
-                // The complete owned Job has confirmed teardown. A requested stop is
-                // an expected outcome, separate from failure/rejection notices.
-                if !wait_for_retry(&commands, &events, &mut history, &Event::Stopped) {
+                // On the publisher rollback engine (without in-place `/reset`),
+                // the owned Job has confirmed teardown after a response stop;
+                // restart a fresh warm attempt automatically without surfacing
+                // a model failure or waiting for manual Retry.
+                if notify(&events, Event::Restarting).is_err() {
+                    return;
+                }
+            }
+            Err(Failure::ModelStopped) => {
+                // Explicit model teardown (for example before installing an
+                // application update) parks cleanly until Retry or Shutdown.
+                if !wait_for_retry(&commands, &events, &mut history, &Event::ModelStopped) {
                     return;
                 }
             }
@@ -339,7 +352,11 @@ pub(crate) fn run(config: Config, commands: Receiver<Command>, events: EventSend
                 let message = match failure {
                     Failure::Message(message) | Failure::Rejected(message) => message.to_owned(),
                     Failure::NativeRuntime => native_runtime_guidance(&config.data),
-                    Failure::Shutdown | Failure::Memory | Failure::Stopped | Failure::Teardown => {
+                    Failure::Shutdown
+                    | Failure::Memory
+                    | Failure::Stopped
+                    | Failure::ModelStopped
+                    | Failure::Teardown => {
                         return;
                     }
                 };
@@ -405,13 +422,13 @@ fn wait_for_retry(
             // cannot silently retain the previous conversation after Retry.
             Ok(Command::NewChat) => history.clear(),
             Ok(Command::RestoreChat(restored)) => *history = restored,
-            Ok(Command::Stop) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(Command::Stop | Command::StopModel) | Err(RecvTimeoutError::Timeout) => {}
         }
     }
 }
 
 fn runtime_arguments(config: &Config) -> Vec<&'static str> {
-    let mut arguments = Vec::with_capacity(5);
+    let mut arguments = Vec::with_capacity(6);
     if config.use_abliterate_lora {
         arguments.push("--use-abliterate-lora");
     }
@@ -425,6 +442,9 @@ fn runtime_arguments(config: &Config) -> Vec<&'static str> {
     } else {
         "--publisher-engine"
     });
+    if config.native_engine {
+        arguments.push("--reset-on-cancel");
+    }
     arguments.extend([
         "--native-row-workers",
         if config.native_row_workers == 4 {
@@ -484,7 +504,7 @@ fn broker_spec(config: &Config, shutdown_directory: &Path) -> ToolProcessSpec {
         "--backend-port".into(),
         config.backend_port.to_string().into(),
         "--max-waiting".into(),
-        "0".into(),
+        if config.native_engine { "1" } else { "0" }.into(),
         "--owner-shutdown-directory".into(),
         shutdown_directory.as_os_str().to_owned(),
     ]);
@@ -515,7 +535,14 @@ fn serve_broker(
     history: &mut Vec<Message>,
     spec: &ToolProcessSpec,
 ) -> Result<()> {
-    let (key, context_tokens) = wait_ready(broker, config, commands, &spec.stdout, &spec.stderr)?;
+    let (key, context_tokens) = wait_ready(
+        broker,
+        config,
+        commands,
+        history,
+        &spec.stdout,
+        &spec.stderr,
+    )?;
     notify(events, Event::ContextCapacity(context_tokens))?;
     notify(events, Event::Ready)?;
     loop {
@@ -529,7 +556,10 @@ fn serve_broker(
         }
         match commands.recv_timeout(POLL) {
             Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
-            Ok(Command::Stop) => return Err(Failure::Stopped),
+            Ok(Command::StopModel) => return Err(Failure::ModelStopped),
+            // If completion or a recoverable rejection finished just ahead of a
+            // user Stop click, acknowledge Stop without tearing down the warm model.
+            Ok(Command::Stop) => notify(events, Event::Stopped)?,
             Ok(Command::NewChat) => history.clear(),
             Ok(Command::RestoreChat(restored)) => *history = restored,
             Ok(Command::Send {
@@ -572,7 +602,15 @@ fn serve_broker(
                                 generate(config.frontend_port, &key, request, commands, events)
                             }
                         });
-                finish_turn(history, pending, &text, outcome, events, commands)?;
+                finish_turn(
+                    history,
+                    pending,
+                    &text,
+                    outcome,
+                    events,
+                    commands,
+                    config.native_engine,
+                )?;
             }
             Ok(Command::Retry) | Err(RecvTimeoutError::Timeout) => {}
         }
@@ -583,12 +621,13 @@ fn wait_ready(
     broker: &OwnedProcess,
     config: &Config,
     commands: &Receiver<Command>,
+    history: &mut Vec<Message>,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<(String, usize)> {
     let until = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        check_commands(commands)?;
+        check_startup_commands(commands, history)?;
         let output = read_bounded_file(stdout_path, MAX_HEAD)?;
         if let Some(directory) = evidence_directory(&output)? {
             let context_tokens = context_capacity(&output)?.ok_or(Failure::Message(
@@ -813,6 +852,7 @@ fn finish_turn(
     outcome: Result<(Message, Completion)>,
     events: &EventSender,
     commands: &Receiver<Command>,
+    in_place_cancel: bool,
 ) -> Result<()> {
     // Buffered parsing and local validation may finish without touching the
     // socket again. Stop takes precedence until this commit boundary.
@@ -824,9 +864,17 @@ fn finish_turn(
             notify(events, Event::Complete(completion))
         }
         Err(Failure::Shutdown) => Err(Failure::Shutdown),
+        Err(Failure::ModelStopped) => {
+            notify(events, Event::Stopping(text.to_owned()))?;
+            Err(Failure::ModelStopped)
+        }
         Err(Failure::Stopped) => {
             notify(events, Event::Stopping(text.to_owned()))?;
-            Err(Failure::Stopped)
+            if in_place_cancel {
+                notify(events, Event::Stopped)
+            } else {
+                Err(Failure::Stopped)
+            }
         }
         Err(failure) => {
             let message = match failure {
@@ -837,7 +885,9 @@ fn finish_turn(
                 | Failure::Teardown => {
                     "The response did not complete. Review the conversation and retry the model."
                 }
-                Failure::Shutdown | Failure::Stopped => return Err(failure),
+                Failure::Shutdown | Failure::Stopped | Failure::ModelStopped => {
+                    return Err(failure);
+                }
             };
             notify(
                 events,
@@ -908,12 +958,28 @@ fn notify(events: &EventSender, event: Event) -> Result<()> {
     events.send(event).map_err(|()| Failure::Shutdown)
 }
 
+fn check_startup_commands(commands: &Receiver<Command>, history: &mut Vec<Message>) -> Result<()> {
+    loop {
+        match commands.try_recv() {
+            Ok(Command::Shutdown) | Err(TryRecvError::Disconnected) => {
+                return Err(Failure::Shutdown);
+            }
+            Ok(Command::StopModel) => return Err(Failure::ModelStopped),
+            Ok(Command::NewChat) => history.clear(),
+            Ok(Command::RestoreChat(restored)) => *history = restored,
+            Ok(Command::Stop | Command::Send { .. } | Command::Retry) => {}
+            Err(TryRecvError::Empty) => return Ok(()),
+        }
+    }
+}
+
 fn check_commands(commands: &Receiver<Command>) -> Result<()> {
     loop {
         match commands.try_recv() {
             Ok(Command::Shutdown) | Err(TryRecvError::Disconnected) => {
                 return Err(Failure::Shutdown);
             }
+            Ok(Command::StopModel) => return Err(Failure::ModelStopped),
             Ok(Command::Stop) => return Err(Failure::Stopped),
             Ok(
                 Command::Send { .. } | Command::NewChat | Command::RestoreChat(_) | Command::Retry,
@@ -954,6 +1020,7 @@ impl Interruptible<'_> {
         // The socket is nonblocking: wait on the command channel instead of
         // a socket timeout, so Stop/Shutdown wake a stalled read or write.
         match self.commands.recv_timeout(SOCKET_POLL) {
+            Ok(Command::StopModel) => self.interrupted = Some(Failure::ModelStopped),
             Ok(Command::Stop) => self.interrupted = Some(Failure::Stopped),
             Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 self.interrupted = Some(Failure::Shutdown);
@@ -1550,6 +1617,7 @@ mod tests {
                 "--use-abliterate-lora",
                 "--use-original-pq2",
                 "--native-engine",
+                "--reset-on-cancel",
                 "--native-row-workers",
                 "4"
             ]
@@ -1561,6 +1629,7 @@ mod tests {
             [
                 "--use-repacked-ptq1",
                 "--native-engine",
+                "--reset-on-cancel",
                 "--native-row-workers",
                 "4"
             ]
@@ -1571,6 +1640,7 @@ mod tests {
             [
                 "--use-repacked-ptq1",
                 "--native-engine",
+                "--reset-on-cancel",
                 "--native-row-workers",
                 "1"
             ]
@@ -1581,6 +1651,7 @@ mod tests {
             [
                 "--use-original-pq2",
                 "--native-engine",
+                "--reset-on-cancel",
                 "--native-row-workers",
                 "1"
             ]
@@ -1660,7 +1731,7 @@ mod tests {
                     "--backend-port".into(),
                     "8082".into(),
                     "--max-waiting".into(),
-                    "0".into(),
+                    if publisher { "0" } else { "1" }.into(),
                     "--owner-shutdown-directory".into(),
                     control.into_os_string(),
                 ])
@@ -1720,6 +1791,7 @@ mod tests {
             )),
             &events,
             &commands,
+            true,
         )?;
         let Ok(Event::Committed(mut visible)) = incoming.try_recv() else {
             return Err(Failure::Message("Expected committed history."));
@@ -2722,12 +2794,17 @@ mod tests {
                 Err(failure),
                 &events,
                 &commands,
+                true,
             );
-            assert_eq!(result.is_ok(), matches!(failure, Failure::Rejected(_)));
+            assert_eq!(
+                result.is_ok(),
+                matches!(failure, Failure::Rejected(_) | Failure::Stopped)
+            );
             assert_eq!(serialize_request(&history, 4096, false, None)?, original);
             let event = incoming.try_recv();
             if failure == Failure::Stopped {
                 assert!(matches!(event, Ok(Event::Stopping(text)) if text == "Unfinished task 🌱"));
+                assert!(matches!(incoming.try_recv(), Ok(Event::Stopped)));
             } else {
                 assert!(
                     matches!(event, Ok(Event::Rejected { text, retry_required, .. })
@@ -2758,6 +2835,7 @@ mod tests {
             )),
             &events,
             &commands,
+            true,
         )?;
         assert_eq!(history.len(), 4);
         assert_eq!(history[2].content.as_ref(), "Reviewed task");
@@ -2855,6 +2933,7 @@ mod tests {
             Err(super::request_byte_limit()),
             &events,
             &commands,
+            true,
         )?;
         assert_eq!(serialize_request(&history, 1024, false, None)?, original);
         assert!(matches!(

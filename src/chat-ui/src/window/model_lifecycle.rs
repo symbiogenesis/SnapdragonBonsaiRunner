@@ -11,6 +11,8 @@ pub(super) enum ModelLifecycle {
     Generating,
     AwaitingTeardown,
     Stopping,
+    StoppingModel,
+    Stopped,
     Retryable,
 }
 
@@ -28,22 +30,35 @@ impl ModelLifecycle {
         // navigation and drafts remain available. Teardown still settles first.
         matches!(
             self,
-            Self::Unavailable | Self::Preparing | Self::Ready | Self::Generating | Self::Retryable
+            Self::Unavailable
+                | Self::Preparing
+                | Self::Ready
+                | Self::Generating
+                | Self::Stopped
+                | Self::Retryable
         )
     }
 
     pub(super) const fn stopping(self) -> bool {
-        matches!(self, Self::Stopping)
+        matches!(self, Self::Stopping | Self::StoppingModel)
     }
 
     pub(super) const fn retryable(self) -> bool {
         matches!(self, Self::Retryable)
     }
 
+    pub(super) const fn reloadable(self) -> bool {
+        matches!(self, Self::Retryable | Self::Stopped)
+    }
+
     pub(super) const fn waiting_model(self) -> bool {
         matches!(
             self,
-            Self::Preparing | Self::Restarting | Self::AwaitingTeardown | Self::Stopping
+            Self::Preparing
+                | Self::Restarting
+                | Self::AwaitingTeardown
+                | Self::Stopping
+                | Self::StoppingModel
         )
     }
 
@@ -53,6 +68,7 @@ impl ModelLifecycle {
     pub(super) const fn accepts(self, event: &Event) -> bool {
         match event {
             Event::Starting => matches!(self, Self::Preparing | Self::Restarting),
+            Event::Restarting => matches!(self, Self::Stopping),
             Event::ContextCapacity(_) | Event::Ready => matches!(self, Self::Preparing),
             Event::Text(_)
             | Event::Reasoning(_)
@@ -61,19 +77,25 @@ impl ModelLifecycle {
             | Event::RetainedAnswer(_)
             | Event::Complete(_) => matches!(self, Self::Generating),
             Event::Committed(_) | Event::Stopping(_) => {
-                matches!(self, Self::Generating | Self::Stopping)
+                matches!(
+                    self,
+                    Self::Generating | Self::Stopping | Self::StoppingModel
+                )
             }
-            Event::Stopped => matches!(
+            Event::Stopped => matches!(self, Self::Stopping),
+            Event::ModelStopped => matches!(
                 self,
-                Self::Stopping | Self::AwaitingTeardown | Self::Retryable
+                Self::StoppingModel | Self::AwaitingTeardown | Self::Stopped | Self::Retryable
             ),
             Event::Rejected { retry_required, .. } => {
-                matches!(self, Self::Generating | Self::Stopping)
-                    || (*retry_required
-                        && matches!(
-                            self,
-                            Self::AwaitingTeardown | Self::Retryable | Self::Restarting
-                        ))
+                matches!(
+                    self,
+                    Self::Generating | Self::Stopping | Self::StoppingModel
+                ) || (*retry_required
+                    && matches!(
+                        self,
+                        Self::AwaitingTeardown | Self::Stopped | Self::Retryable | Self::Restarting
+                    ))
             }
             Event::Retryable(_) => !matches!(self, Self::Unavailable | Self::Restarting),
             Event::Failed(_) => !matches!(self, Self::Unavailable),

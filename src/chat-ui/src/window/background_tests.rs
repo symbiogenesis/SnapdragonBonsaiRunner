@@ -95,7 +95,9 @@ fn background_stop_completion_race_preserves_both_drafts_and_exact_owner_history
     state.model_event(Event::Committed(completed_history()));
     state.model_event(Event::Stopping("Original question".into()));
     state.model_event(Event::Stopped);
-    assert_eq!(state.model, ModelLifecycle::Retryable);
+    assert_eq!(state.model, ModelLifecycle::Ready);
+    assert!(!state.warning);
+    assert!(matches!(commands.try_recv(), Ok(Command::RestoreChat(history)) if history.is_empty()));
     assert_eq!(state.input, "Browsing draft 🌱");
     assert!(state.transcript.messages.is_empty());
     state.switch_conversation(owner);
@@ -104,6 +106,7 @@ fn background_stop_completion_race_preserves_both_drafts_and_exact_owner_history
     assert_eq!(state.committed.len(), 2);
     assert!(state.transcript.plain_text().contains("Finished answer"));
     assert!(!state.transcript.plain_text().contains("Ignored after Stop"));
+    assert!(matches!(commands.try_recv(), Ok(Command::RestoreChat(history)) if history.len() == 2));
     assert!(commands.try_recv().is_err());
 }
 
@@ -158,9 +161,7 @@ fn background_restart_late_rejection_preserves_global_status_and_visible_draft()
     state.stop_generation();
     assert!(matches!(commands.try_recv(), Ok(Command::Stop)));
     state.model_event(Event::Stopping("Original question".into()));
-    state.model_event(Event::Stopped);
-    state.retry();
-    assert!(matches!(commands.try_recv(), Ok(Command::Retry)));
+    state.model_event(Event::Restarting);
     let status = state.status.clone();
     state.model_event(Event::Rejected {
         message: "Old request could not run".into(),

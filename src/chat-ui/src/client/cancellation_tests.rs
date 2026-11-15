@@ -53,51 +53,62 @@ fn stop_cancels_stalled_headers_and_body_and_closes_the_connection() -> io::Resu
 
 #[test]
 fn stop_wins_over_buffered_completion_and_connection_failure() {
-    let answer = Message {
-        role: "assistant",
-        content: "Completed in a buffer".into(),
-        reasoning_content: None,
-    };
-    for outcome in [
-        Ok((answer, Completion::Finished)),
-        Err(Failure::Message(LOCAL_CONNECTION_CLOSED)),
-    ] {
-        let (commands, incoming) = mpsc::channel();
-        let (events, notifications) = event_channel();
-        assert!(commands.send(Command::Stop).is_ok());
-        let mut history = Vec::new();
-        assert_eq!(
-            finish_turn(
-                &mut history,
-                Vec::new(),
-                "Original prompt",
-                outcome,
-                &events,
-                &incoming
-            ),
-            Err(Failure::Stopped)
-        );
-        assert!(history.is_empty());
-        assert!(
-            matches!(notifications.try_recv(), Ok(Event::Stopping(text)) if text == "Original prompt")
-        );
-        assert!(notifications.try_recv().is_err());
+    for in_place_cancel in [false, true] {
+        let answer = Message {
+            role: "assistant",
+            content: "Completed in a buffer".into(),
+            reasoning_content: None,
+        };
+        for outcome in [
+            Ok((answer, Completion::Finished)),
+            Err(Failure::Message(LOCAL_CONNECTION_CLOSED)),
+        ] {
+            let (commands, incoming) = mpsc::channel();
+            let (events, notifications) = event_channel();
+            assert!(commands.send(Command::Stop).is_ok());
+            let mut history = Vec::new();
+            assert_eq!(
+                finish_turn(
+                    &mut history,
+                    Vec::new(),
+                    "Original prompt",
+                    outcome,
+                    &events,
+                    &incoming,
+                    in_place_cancel,
+                ),
+                if in_place_cancel {
+                    Ok(())
+                } else {
+                    Err(Failure::Stopped)
+                }
+            );
+            assert!(history.is_empty());
+            assert!(
+                matches!(notifications.try_recv(), Ok(Event::Stopping(text)) if text == "Original prompt")
+            );
+            if in_place_cancel {
+                assert!(matches!(notifications.try_recv(), Ok(Event::Stopped)));
+            }
+            assert!(notifications.try_recv().is_err());
+        }
     }
 }
 
 #[test]
-fn stopped_retry_notice_waits_for_explicit_retry_without_failure_events() {
+fn model_stopped_notice_waits_for_explicit_retry_without_failure_events() {
     let (commands, incoming) = mpsc::channel();
     let (events, notifications) = event_channel();
     assert!(commands.send(Command::Stop).is_ok());
+    assert!(commands.send(Command::StopModel).is_ok());
     assert!(commands.send(Command::Retry).is_ok());
     assert!(wait_for_retry(
         &incoming,
         &events,
         &mut Vec::new(),
-        &Event::Stopped
+        &Event::ModelStopped
     ));
-    assert!(matches!(notifications.try_recv(), Ok(Event::Stopped)));
+    assert!(matches!(notifications.try_recv(), Ok(Event::ModelStopped)));
     assert!(notifications.try_recv().is_err());
 }
 
@@ -107,6 +118,7 @@ fn owned_broker_teardown_requires_success_before_preserving_attempt_outcome() {
         Ok(()),
         Err(Failure::Shutdown),
         Err(Failure::Stopped),
+        Err(Failure::ModelStopped),
         Err(Failure::Memory),
         Err(Failure::NativeRuntime),
         Err(Failure::Message("Readiness or transport failed")),
@@ -143,6 +155,7 @@ fn connect_interruptible_honors_prequeued_stop_and_shutdown() -> io::Result<()> 
     ));
     for (command, expected) in [
         (Command::Stop, Failure::Stopped),
+        (Command::StopModel, Failure::ModelStopped),
         (Command::Shutdown, Failure::Shutdown),
     ] {
         let (commands, incoming) = mpsc::channel();

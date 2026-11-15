@@ -1030,9 +1030,13 @@ mod tests {
         harness.run();
         assert!(matches!(
             commands.try_recv(),
-            Ok(crate::client::Command::Stop)
+            Ok(crate::client::Command::StopModel)
         ));
         assert!(commands.try_recv().is_err());
+        assert_eq!(
+            harness.state().model,
+            super::super::ModelLifecycle::StoppingModel
+        );
         assert!(
             harness
                 .state()
@@ -1041,6 +1045,7 @@ mod tests {
                 .is_some_and(|updates| updates.waiting_for_stop && updates.confirmed)
         );
         assert!(harness.query_by_label("Restart to update?").is_none());
+        assert!(harness.query_by_label("Model needs attention").is_none());
         Ok(())
     }
 
@@ -1096,13 +1101,13 @@ mod tests {
         assert!(state.prepare_update_on_close());
         assert!(matches!(
             commands.try_recv(),
-            Ok(crate::client::Command::Stop)
+            Ok(crate::client::Command::StopModel)
         ));
-        assert_eq!(state.model, super::super::ModelLifecycle::Stopping);
+        assert_eq!(state.model, super::super::ModelLifecycle::StoppingModel);
         assert!(state.prepare_update_on_close());
         assert!(
             commands.try_recv().is_err(),
-            "Repeated close cannot send another Stop"
+            "Repeated close cannot send another StopModel"
         );
         let updates = state
             .updates

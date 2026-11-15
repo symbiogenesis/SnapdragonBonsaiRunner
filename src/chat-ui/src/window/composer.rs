@@ -27,6 +27,18 @@ impl State {
                 if ui.button("Stop").clicked() {
                     self.stop_generation();
                 }
+            } else if self.model == super::ModelLifecycle::Stopped {
+                let can_reload = !self.preview
+                    && !self
+                        .updates
+                        .as_ref()
+                        .is_some_and(super::updates::Updates::installing);
+                if ui
+                    .add_enabled(can_reload, controls::primary_button(ui, "Reload model"))
+                    .clicked()
+                {
+                    self.retry();
+                }
             } else {
                 let can_send =
                     self.model == super::ModelLifecycle::Ready && !self.input.trim().is_empty();
@@ -124,8 +136,12 @@ impl State {
             "Draft your next message…"
         } else if self.model.ready() {
             "Ask anything…"
+        } else if matches!(self.model, super::ModelLifecycle::Stopped) {
+            "Reload the model to continue…"
         } else if self.model.retryable() {
             "Retry the model to continue…"
+        } else if matches!(self.model, super::ModelLifecycle::Stopping) {
+            "Write while the response stops…"
         } else if self.model.stopping() {
             "Write while the model stops…"
         } else if self.model.waiting_model() {
