@@ -21,14 +21,16 @@ use windows::{
         IMFSourceReaderCallback, IMFSourceReaderCallback_Impl, MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
         MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
         MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
-        MF_SOURCE_READER_ASYNC_CALLBACK, MF_SOURCE_READERF_ALLEFFECTSREMOVED,
-        MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
-        MF_SOURCE_READERF_ERROR, MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED,
-        MF_SOURCE_READERF_NEWSTREAM, MF_SOURCE_READERF_STREAMTICK, MF_VERSION, MFAudioFormat_PCM,
-        MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio,
-        MFSTARTUP_FULL, MFShutdown, MFStartup,
+        MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ASYNC_CALLBACK,
+        MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
+        MF_SOURCE_READERF_ALLEFFECTSREMOVED, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
+        MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR,
+        MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED, MF_SOURCE_READERF_NEWSTREAM,
+        MF_SOURCE_READERF_STREAMTICK, MF_VERSION, MFAudioFormat_PCM, MFCreateAttributes,
+        MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio, MFSTARTUP_FULL,
+        MFShutdown, MFStartup,
     },
-    core::{HRESULT, PCWSTR, Ref},
+    core::{HRESULT, HSTRING, Ref},
 };
 
 use super::{
@@ -36,22 +38,20 @@ use super::{
     POLL, Shared, check_memory, media_duration,
 };
 
-// These DWORD sentinels are the unsigned ABI representations of the SDK's
-// negative MF_SOURCE_READER_* stream-index constants.
-const AUDIO_STREAM: u32 = 0xffff_fffd;
-const ALL_STREAMS: u32 = 0xffff_fffe;
-const MEDIA_SOURCE: u32 = 0xffff_ffff;
+const AUDIO_STREAM: u32 = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0.cast_unsigned();
+const ALL_STREAMS: u32 = MF_SOURCE_READER_ALL_STREAMS.0.cast_unsigned();
+const MEDIA_SOURCE: u32 = MF_SOURCE_READER_MEDIASOURCE.0.cast_unsigned();
 const FLUSH_LIMIT: Duration = Duration::from_secs(2);
 const DECODE_TIMEOUT: &str = "Windows did not finish decoding the next audio segment. Try converting the recording to WAV. Your draft was kept.";
 const FORMAT_CHANGED: &str = "The recording changed audio format or contains a timeline gap. Try converting it to WAV. Your draft was kept.";
 const DURATION_FAILURE: &str = "Windows could not determine this recording's duration. Try converting it to WAV. Your draft was kept.";
 const CLEANUP_FAILURE: &str = "Windows could not confirm audio decoder shutdown. Restart the app before importing another audio file. Your draft was kept.";
 static ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
-const REJECTED_FLAGS: u32 = MF_SOURCE_READERF_NEWSTREAM.0.unsigned_abs()
-    | MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED.0.unsigned_abs()
-    | MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0.unsigned_abs()
-    | MF_SOURCE_READERF_STREAMTICK.0.unsigned_abs()
-    | MF_SOURCE_READERF_ALLEFFECTSREMOVED.0.unsigned_abs();
+const REJECTED_FLAGS: u32 = MF_SOURCE_READERF_NEWSTREAM.0.cast_unsigned()
+    | MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED.0.cast_unsigned()
+    | MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0.cast_unsigned()
+    | MF_SOURCE_READERF_STREAMTICK.0.cast_unsigned()
+    | MF_SOURCE_READERF_ALLEFFECTSREMOVED.0.cast_unsigned();
 
 struct Frame {
     pcm: Vec<u8>,
@@ -144,7 +144,7 @@ fn callback_frame(
     sample: Option<&IMFSample>,
 ) -> Result<Frame, &'static str> {
     status.ok().map_err(|_| CODEC_FAILURE)?;
-    if flags & MF_SOURCE_READERF_ERROR.0.unsigned_abs() != 0 {
+    if flags & MF_SOURCE_READERF_ERROR.0.cast_unsigned() != 0 {
         return Err(CODEC_FAILURE);
     }
     if flags & REJECTED_FLAGS != 0 {
@@ -152,7 +152,7 @@ fn callback_frame(
     }
     Ok(Frame {
         pcm: sample.map_or_else(|| Ok(Vec::new()), copy_sample)?,
-        eof: flags & MF_SOURCE_READERF_ENDOFSTREAM.0.unsigned_abs() != 0,
+        eof: flags & MF_SOURCE_READERF_ENDOFSTREAM.0.cast_unsigned() != 0,
     })
 }
 
@@ -262,12 +262,12 @@ impl Decoder {
         // thread-safe and callbacks never lend COM interfaces across threads.
         unsafe { attributes.SetUnknown(&MF_SOURCE_READER_ASYNC_CALLBACK, &callback) }
             .map_err(|_| CODEC_FAILURE)?;
-        let name: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let name = HSTRING::from(path.as_os_str());
         check(shared, deadline)?;
         // SAFETY: name is NUL terminated and live for this synchronous local-file
         // open. OS open/configuration/teardown calls cannot be preempted; check
         // the same deadline immediately after they return.
-        let reader = unsafe { MFCreateSourceReaderFromURL(PCWSTR(name.as_ptr()), &attributes) }
+        let reader = unsafe { MFCreateSourceReaderFromURL(&name, &attributes) }
             .map_err(|_| CODEC_FAILURE)?;
         check(shared, deadline)?;
         configure(&reader)?;
@@ -624,7 +624,7 @@ mod tests {
         );
         let eof = callback_frame(
             HRESULT(0),
-            MF_SOURCE_READERF_ENDOFSTREAM.0.unsigned_abs(),
+            MF_SOURCE_READERF_ENDOFSTREAM.0.cast_unsigned(),
             None,
         )
         .map_err(io::Error::other)?;
@@ -632,7 +632,7 @@ mod tests {
         assert!(matches!(
             callback_frame(
                 HRESULT(0),
-                MF_SOURCE_READERF_STREAMTICK.0.unsigned_abs(),
+                MF_SOURCE_READERF_STREAMTICK.0.cast_unsigned(),
                 None
             ),
             Err(FORMAT_CHANGED)

@@ -49,14 +49,14 @@ impl Saved {
     fn from_native(native: &WINDOWPLACEMENT) -> Option<Self> {
         // Minimize/close must not replace the last ordinary geometry or turn a
         // maximized window into a restored window on its next launch.
-        if native.showCmd == SW_SHOWMINIMIZED.unsigned_abs() {
+        if native.showCmd == SW_SHOWMINIMIZED.cast_unsigned() {
             return None;
         }
         let rect = native.rcNormalPosition;
         let saved = Self {
             version: 1,
             normal: [rect.left, rect.top, rect.right, rect.bottom],
-            maximized: native.showCmd == SW_SHOWMAXIMIZED.unsigned_abs(),
+            maximized: native.showCmd == SW_SHOWMAXIMIZED.cast_unsigned(),
         };
         saved.valid().then_some(saved)
     }
@@ -70,7 +70,7 @@ impl Saved {
             } else {
                 SW_SHOWNORMAL
             }
-            .unsigned_abs(),
+            .cast_unsigned(),
             rcNormalPosition: RECT {
                 left,
                 top,
@@ -280,7 +280,7 @@ mod tests {
             };
             let mut native = saved.native()?;
             assert_eq!(Saved::from_native(&native), Some(saved));
-            native.showCmd = SW_SHOWMINIMIZED.unsigned_abs();
+            native.showCmd = SW_SHOWMINIMIZED.cast_unsigned();
             assert!(Saved::from_native(&native).is_none());
         }
         Ok(())
