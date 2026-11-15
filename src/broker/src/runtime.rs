@@ -131,9 +131,9 @@ impl DevelopmentConfig {
         let (backend_file, backend_key) = read_key(&self.backend_key)?;
         let service = LocalChatService::bind(
             self.frontend_port,
-            &frontend_key,
+            frontend_key.as_str()?,
             self.backend_port,
-            &backend_key,
+            backend_key.as_str()?,
             self.max_waiting,
         )
         .await
@@ -184,7 +184,21 @@ fn key_path(value: Option<OsString>) -> Result<PathBuf, ConfigurationError> {
     Ok(value)
 }
 
-pub(crate) fn read_key(path: &Path) -> Result<(File, String), ConfigurationError> {
+pub(crate) struct SecretKey([u8; 64]);
+
+impl SecretKey {
+    fn as_str(&self) -> Result<&str, ConfigurationError> {
+        std::str::from_utf8(&self.0).map_err(|_| ConfigurationError::KeyFormat)
+    }
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        crate::scrub_bytes(&mut self.0);
+    }
+}
+
+pub(crate) fn read_key(path: &Path) -> Result<(File, SecretKey), ConfigurationError> {
     for ancestor in path.ancestors() {
         let metadata = fs::symlink_metadata(ancestor).map_err(|_| ConfigurationError::KeyFile)?;
         if metadata.file_type().is_symlink() {
@@ -223,20 +237,20 @@ pub(crate) fn read_key(path: &Path) -> Result<(File, String), ConfigurationError
     if !metadata.is_file() || metadata.len() != 64 {
         return Err(ConfigurationError::KeyFormat);
     }
-    let mut bytes = [0; 64];
-    file.read_exact(&mut bytes)
+    let mut bytes = SecretKey([0; 64]);
+    file.read_exact(&mut bytes.0)
         .map_err(|_| ConfigurationError::KeyFile)?;
     let mut surplus = [0];
     if file
         .read(&mut surplus)
         .map_err(|_| ConfigurationError::KeyFile)?
         != 0
-        || !crate::configuration::valid_key(&bytes)
+        || !crate::configuration::valid_key(&bytes.0)
     {
         return Err(ConfigurationError::KeyFormat);
     }
-    let key = String::from_utf8(bytes.to_vec()).map_err(|_| ConfigurationError::KeyFormat)?;
-    Ok((file, key))
+    bytes.as_str()?;
+    Ok((file, bytes))
 }
 
 /// Why the bounded runner stopped accepting requests.

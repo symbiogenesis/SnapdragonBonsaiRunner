@@ -307,3 +307,57 @@ fn battery_pass_requires_energy_evidence_and_fallback_reasons_are_value_free() -
     assert!(serde_json::from_value::<FallbackReason>(json!("driver-name:private")).is_err());
     Ok(())
 }
+
+#[test]
+fn hardware_contracts_reject_positional_json_arrays() -> Result<(), String> {
+    let report: Value = parse(RUNTIME)?;
+    assert!(RuntimeCapabilities::from_json("[]").is_err());
+    for (pointer, array) in [
+        (
+            "/runtime",
+            json!(["prism-inference", "0.1.28", ["aarch64", "windows", "msvc"]]),
+        ),
+        ("/runtime/target", json!(["aarch64", "windows", "msvc"])),
+        ("/cpu", json!([true, true])),
+        ("/backends", json!(["unavailable", "unavailable"])),
+    ] {
+        let mut changed = report.clone();
+        *changed
+            .pointer_mut(pointer)
+            .ok_or("Invalid report pointer.")? = array;
+        assert!(
+            RuntimeCapabilities::from_json(&changed.to_string()).is_err(),
+            "{pointer}"
+        );
+    }
+
+    let valid_key = key();
+    assert!(ProfileCompatibilityKey::from_json("[]").is_err());
+    for (pointer, array) in [
+        ("/adapter", json!(["none"])),
+        (
+            "/runtime",
+            json!([
+                "0".repeat(64),
+                "a".repeat(40),
+                ["aarch64", "windows", "msvc"]
+            ]),
+        ),
+        ("/runtime/target", json!(["aarch64", "windows", "msvc"])),
+        ("/workload", json!([8192, 1, 4096, 4096, "fresh"])),
+    ] {
+        let mut changed = valid_key.clone();
+        *changed.pointer_mut(pointer).ok_or("Invalid key pointer.")? = array;
+        assert!(
+            ProfileCompatibilityKey::from_json(&changed.to_string()).is_err(),
+            "{pointer}"
+        );
+    }
+
+    let valid_receipt = receipt(&valid_key);
+    assert!(ProfileEvidence::from_json("[]").is_err());
+    let mut bad_receipt = valid_receipt;
+    bad_receipt["compatibility"] = json!([]);
+    assert!(ProfileEvidence::from_json(&bad_receipt.to_string()).is_err());
+    Ok(())
+}

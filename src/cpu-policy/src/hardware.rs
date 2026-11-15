@@ -120,11 +120,45 @@ impl SnapdragonFamily {
     }
 }
 
+struct Object<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+            type Value = Object<T>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Object)
+            }
+        }
+
+        // Reject positional JSON arrays that Serde's struct derives accept.
+        deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
+    }
+}
+
+fn object<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<T, D::Error> {
+    Object::<T>::deserialize(deserializer).map(|Object(value)| value)
+}
+
 fn parse<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, String> {
     if input.len() > MAX_DOCUMENT_BYTES {
         return Err("Hardware contract exceeds its byte limit.".into());
     }
-    serde_json::from_str(input).map_err(|_| "Invalid hardware contract.".into())
+    serde_json::from_str::<Object<T>>(input)
+        .map(|Object(value)| value)
+        .map_err(|_| "Invalid hardware contract.".into())
 }
 
 fn require(condition: bool) -> Result<(), String> {
@@ -173,6 +207,7 @@ impl RuntimeTarget {
 struct RuntimeIdentity {
     name: String,
     version: String,
+    #[serde(deserialize_with = "object")]
     target: RuntimeTarget,
 }
 
@@ -208,8 +243,11 @@ enum DiscoveryQualification {
 struct RuntimeReport {
     schema_version: u32,
     kind: String,
+    #[serde(deserialize_with = "object")]
     runtime: RuntimeIdentity,
+    #[serde(deserialize_with = "object")]
     cpu: CpuCapabilities,
+    #[serde(deserialize_with = "object")]
     backends: Backends,
     supported_contracts: Vec<String>,
     qualification: DiscoveryQualification,
@@ -297,7 +335,7 @@ impl<'de> Deserialize<'de> for AdapterIdentity {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // Serde's internally tagged unit variants otherwise ignore extra
         // fields, which would conflate explicit absence and an unknown hash.
-        let wire = AdapterWire::deserialize(deserializer)?;
+        let Object(wire) = Object::<AdapterWire>::deserialize(deserializer)?;
         match (wire.kind.as_str(), wire.sha256) {
             ("none", None) => Ok(Self::None),
             ("artifact", Some(sha256)) => Ok(Self::Artifact { sha256 }),
@@ -327,6 +365,7 @@ fn present_digest<'de, D: serde::Deserializer<'de>>(
 struct RuntimeBuild {
     archive_sha256: String,
     source_revision: String,
+    #[serde(deserialize_with = "object")]
     target: RuntimeTarget,
 }
 
@@ -362,12 +401,14 @@ struct ProfileKey {
     objective: Objective,
     model_sha256: String,
     adapter: AdapterIdentity,
+    #[serde(deserialize_with = "object")]
     runtime: RuntimeBuild,
     capability_class_sha256: String,
     backend_driver_sha256: String,
     graph_contract: String,
     state_layout: String,
     settings_sha256: String,
+    #[serde(deserialize_with = "object")]
     workload: Workload,
 }
 
@@ -447,6 +488,7 @@ pub enum Verdict {
 #[serde(deny_unknown_fields)]
 struct Evidence {
     schema_version: u32,
+    #[serde(deserialize_with = "object")]
     compatibility: ProfileKey,
     tested_main_revision: String,
     ci_run_id: String,

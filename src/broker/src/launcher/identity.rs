@@ -140,7 +140,7 @@ struct NativeModel<'a> {
     #[serde(default, borrow, deserialize_with = "present")]
     projection_backend: Option<Text<'a>>,
     #[serde(default, borrow, deserialize_with = "present")]
-    startup_projection: Option<StartupProjection<'a>>,
+    startup_projection: Option<crate::Object<StartupProjection<'a>>>,
 }
 
 #[derive(Deserialize)]
@@ -409,7 +409,13 @@ mod tests {
                 "{field}"
             );
         }
-        for invalid in [json!(null), json!({}), json!("cpu"), json!([])] {
+        for invalid in [
+            json!(null),
+            json!({}),
+            json!("cpu"),
+            json!([]),
+            json!([1, "auto", "cpu", null, 0, 0, 0]),
+        ] {
             let mut candidate = model.clone();
             candidate["startup_projection"] = invalid;
             assert!(

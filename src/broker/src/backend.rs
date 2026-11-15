@@ -5,7 +5,7 @@
 //! counting and generation, prevent bypass, and ensure Drop closes each stream.
 
 use crate::{
-    AdmittedChat, MAX_HEADER_BYTES, MAX_HEADERS, Object, PendingChat, Rejection, configuration,
+    AdmittedChat, MAX_HEADER_BYTES, MAX_HEADERS, Object, PendingChat, Rejection,
     deadline::RequestDeadline,
     response::{MAX_RESPONSE_BYTES, valid_content_type},
     wire,
@@ -67,7 +67,13 @@ pub enum BackendError {
 /// The caller must use a separate random backend key and enforce its protection.
 pub struct BackendPolicy {
     authority: String,
-    authorization: String,
+    authorization: [u8; 71],
+}
+
+impl Drop for BackendPolicy {
+    fn drop(&mut self) {
+        crate::scrub_bytes(&mut self.authorization);
+    }
 }
 
 impl BackendPolicy {
@@ -76,13 +82,20 @@ impl BackendPolicy {
     /// # Errors
     /// Returns [`BackendError::Configuration`] for a privileged port or invalid key.
     pub fn new(port: u16, key: &str) -> Result<Self, BackendError> {
-        if port < 1024 || !configuration::valid_key(key.as_bytes()) {
+        let Some(authorization) = (port >= 1024)
+            .then(|| crate::bearer_header(key.as_bytes()))
+            .flatten()
+        else {
             return Err(BackendError::Configuration);
-        }
+        };
         Ok(Self {
             authority: format!("127.0.0.1:{port}"),
-            authorization: format!("Bearer {key}"),
+            authorization,
         })
+    }
+
+    fn authorization_str(&self) -> Result<&str, BackendError> {
+        std::str::from_utf8(&self.authorization).map_err(|_| BackendError::Configuration)
     }
 }
 
@@ -190,9 +203,10 @@ where
 {
     let write_deadline = deadline.earlier(Instant::now() + WRITE_TIMEOUT);
     ensure_time(write_deadline)?;
+    let authorization = policy.authorization_str()?;
     let head = format!(
-        "POST {RESET_ROUTE} HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        policy.authority, policy.authorization,
+        "POST {RESET_ROUTE} HTTP/1.1\r\nHost: {}\r\nAuthorization: {authorization}\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        policy.authority,
     );
     write_deadline
         .timeout(async {
@@ -315,10 +329,10 @@ where
 {
     let write_deadline = deadline.earlier(Instant::now() + WRITE_TIMEOUT);
     ensure_time(write_deadline)?;
+    let authorization = policy.authorization_str()?;
     let head = format!(
-        "POST {route} HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        "POST {route} HTTP/1.1\r\nHost: {}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
         policy.authority,
-        policy.authorization,
         body.as_ref().len()
     );
     write_deadline

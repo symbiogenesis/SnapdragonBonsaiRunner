@@ -139,6 +139,27 @@ pub struct RequestPolicy {
     context_tokens: usize,
 }
 
+impl Drop for RequestPolicy {
+    fn drop(&mut self) {
+        scrub_bytes(&mut self.authorization);
+    }
+}
+
+pub(crate) fn scrub_bytes(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::hint::black_box(&*bytes);
+}
+
+pub(crate) fn bearer_header(key: &[u8]) -> Option<[u8; 71]> {
+    if !configuration::valid_key(key) {
+        return None;
+    }
+    let mut header = [0; 71];
+    header[..7].copy_from_slice(b"Bearer ");
+    header[7..].copy_from_slice(key);
+    Some(header)
+}
+
 impl RequestPolicy {
     /// The launcher must supply 32 cryptographically random bytes encoded as
     /// lowercase hex. Format validation here cannot establish randomness or ACLs.
@@ -146,13 +167,13 @@ impl RequestPolicy {
     /// # Errors
     /// Returns [`Rejection::Configuration`] for a privileged port or invalid key.
     pub fn new(port: u16, key: &str) -> Result<Self, Rejection> {
-        if port < 1024 || !configuration::valid_key(key.as_bytes()) {
+        let Some(authorization) = (port >= 1024)
+            .then(|| bearer_header(key.as_bytes()))
+            .flatten()
+        else {
             return Err(Rejection::Configuration);
-        }
+        };
         let authority = format!("127.0.0.1:{port}");
-        let mut authorization = [0; 71];
-        authorization[..7].copy_from_slice(b"Bearer ");
-        authorization[7..].copy_from_slice(key.as_bytes());
         Ok(Self {
             origin: format!("http://{authority}"),
             authority,
@@ -199,38 +220,52 @@ impl RequestPolicy {
     /// Returns a value-free [`Rejection`] for invalid credentials, headers, route,
     /// content type, framing or body length.
     pub fn check_head(&self, head: &Parts) -> Result<AuthorizedHead, Rejection> {
-        let headers = &head.headers;
-        if headers.len() > MAX_HEADERS {
-            return Err(Rejection::Headers);
-        }
-        let bytes = headers.iter().try_fold(0usize, |total, (name, value)| {
-            total.checked_add(name.as_str().len() + value.as_bytes().len() + 4)
-        });
-        if bytes.is_none_or(|n| n > MAX_HEADER_BYTES) {
-            return Err(Rejection::Headers);
-        }
-        let auth = singleton(headers, "authorization")?.ok_or(Rejection::Unauthorized)?;
-        if auth.len() != self.authorization.len()
-            || !bool::from(auth.ct_eq(self.authorization.as_slice()))
+        self.check_headers(&head.headers, || {
+            if head.method != Method::POST
+                || head.version != Version::HTTP_11
+                || head.uri.scheme().is_some()
+                || head.uri.authority().is_some()
+                || head.uri.path_and_query().map(PathAndQuery::as_str)
+                    != Some("/v1/chat/completions")
+            {
+                return Err(Rejection::Route);
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn check_wire_headers(
+        &self,
+        headers: &[httparse::Header<'_>],
+    ) -> Result<AuthorizedHead, Rejection> {
+        self.check_headers(headers, || Ok(()))
+    }
+
+    fn check_headers<H: HeaderSource + ?Sized>(
+        &self,
+        headers: &H,
+        check_request_line: impl FnOnce() -> Result<(), Rejection>,
+    ) -> Result<AuthorizedHead, Rejection> {
+        if headers.count() > MAX_HEADERS
+            || headers.encoded_bytes().is_none_or(|n| n > MAX_HEADER_BYTES)
         {
+            return Err(Rejection::Headers);
+        }
+        let auth = headers
+            .singleton("authorization")?
+            .ok_or(Rejection::Unauthorized)?;
+        if !bool::from(auth.ct_eq(self.authorization.as_slice())) {
             return Err(Rejection::Unauthorized);
         }
-        if singleton(headers, "host")? != Some(self.authority.as_bytes()) {
+        if headers.singleton("host")? != Some(self.authority.as_bytes()) {
             return Err(Rejection::Host);
         }
-        if let Some(origin) = singleton(headers, "origin")?
+        if let Some(origin) = headers.singleton("origin")?
             && origin != self.origin.as_bytes()
         {
             return Err(Rejection::Origin);
         }
-        if head.method != Method::POST
-            || head.version != Version::HTTP_11
-            || head.uri.scheme().is_some()
-            || head.uri.authority().is_some()
-            || head.uri.path_and_query().map(PathAndQuery::as_str) != Some("/v1/chat/completions")
-        {
-            return Err(Rejection::Route);
-        }
+        check_request_line()?;
         for name in [
             "transfer-encoding",
             "content-encoding",
@@ -238,29 +273,30 @@ impl RequestPolicy {
             "expect",
             "upgrade",
         ] {
-            if headers.contains_key(name) {
+            if headers.contains(name) {
                 return Err(Rejection::Framing);
             }
         }
-        if headers
-            .keys()
-            .any(|name| name.as_str() == "forwarded" || name.as_str().starts_with("x-forwarded-"))
-        {
+        if headers.has_forwarded() {
             return Err(Rejection::Headers);
         }
-        if let Some(connection) = singleton(headers, "connection")?
+        if let Some(connection) = headers.singleton("connection")?
             && !connection.eq_ignore_ascii_case(b"close")
             && !connection.eq_ignore_ascii_case(b"keep-alive")
         {
             return Err(Rejection::Framing);
         }
-        let content_type = singleton(headers, "content-type")?.ok_or(Rejection::ContentType)?;
+        let content_type = headers
+            .singleton("content-type")?
+            .ok_or(Rejection::ContentType)?;
         if !content_type.eq_ignore_ascii_case(b"application/json")
             && !content_type.eq_ignore_ascii_case(b"application/json; charset=utf-8")
         {
             return Err(Rejection::ContentType);
         }
-        let length = singleton(headers, "content-length")?.ok_or(Rejection::Framing)?;
+        let length = headers
+            .singleton("content-length")?
+            .ok_or(Rejection::Framing)?;
         let length = wire::content_length(length).map_err(|error| match error {
             wire::LengthError::Syntax => Rejection::Framing,
             wire::LengthError::Overflow => Rejection::BodySize,
@@ -274,80 +310,75 @@ impl RequestPolicy {
             context_tokens: self.context_tokens,
         })
     }
+}
 
-    pub(crate) fn check_wire_headers(
-        &self,
-        headers: &[httparse::Header<'_>],
-    ) -> Result<AuthorizedHead, Rejection> {
-        if headers.len() > MAX_HEADERS {
-            return Err(Rejection::Headers);
-        }
-        let bytes = headers.iter().try_fold(0usize, |total, header| {
-            total.checked_add(header.name.len() + header.value.len() + 4)
-        });
-        if bytes.is_none_or(|n| n > MAX_HEADER_BYTES) {
-            return Err(Rejection::Headers);
-        }
-        let auth =
-            wire::singleton_slice(headers, "authorization")?.ok_or(Rejection::Unauthorized)?;
-        if auth.len() != self.authorization.len()
-            || !bool::from(auth.ct_eq(self.authorization.as_slice()))
-        {
-            return Err(Rejection::Unauthorized);
-        }
-        if wire::singleton_slice(headers, "host")? != Some(self.authority.as_bytes()) {
-            return Err(Rejection::Host);
-        }
-        if let Some(origin) = wire::singleton_slice(headers, "origin")?
-            && origin != self.origin.as_bytes()
-        {
-            return Err(Rejection::Origin);
-        }
-        for name in [
-            "transfer-encoding",
-            "content-encoding",
-            "trailer",
-            "expect",
-            "upgrade",
-        ] {
-            if wire::has_header(headers, name) {
-                return Err(Rejection::Framing);
-            }
-        }
-        if headers.iter().any(|header| {
+trait HeaderSource {
+    fn count(&self) -> usize;
+    fn encoded_bytes(&self) -> Option<usize>;
+    fn singleton(&self, name: &'static str) -> Result<Option<&[u8]>, Rejection>;
+    fn contains(&self, name: &'static str) -> bool;
+    fn has_forwarded(&self) -> bool;
+}
+
+fn add_header_bytes(total: usize, name_len: usize, value_len: usize) -> Option<usize> {
+    name_len
+        .checked_add(value_len)
+        .and_then(|pair| pair.checked_add(4))
+        .and_then(|entry| total.checked_add(entry))
+}
+
+impl HeaderSource for HeaderMap {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn encoded_bytes(&self) -> Option<usize> {
+        self.iter().try_fold(0usize, |total, (name, value)| {
+            add_header_bytes(total, name.as_str().len(), value.as_bytes().len())
+        })
+    }
+
+    fn singleton(&self, name: &'static str) -> Result<Option<&[u8]>, Rejection> {
+        singleton(self, name)
+    }
+
+    fn contains(&self, name: &'static str) -> bool {
+        self.contains_key(name)
+    }
+
+    fn has_forwarded(&self) -> bool {
+        self.keys()
+            .any(|name| name.as_str() == "forwarded" || name.as_str().starts_with("x-forwarded-"))
+    }
+}
+
+impl HeaderSource for [httparse::Header<'_>] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn encoded_bytes(&self) -> Option<usize> {
+        self.iter().try_fold(0usize, |total, header| {
+            add_header_bytes(total, header.name.len(), header.value.len())
+        })
+    }
+
+    fn singleton(&self, name: &'static str) -> Result<Option<&[u8]>, Rejection> {
+        wire::singleton_slice(self, name)
+    }
+
+    fn contains(&self, name: &'static str) -> bool {
+        wire::has_header(self, name)
+    }
+
+    fn has_forwarded(&self) -> bool {
+        self.iter().any(|header| {
             header.name.eq_ignore_ascii_case("forwarded")
                 || header
                     .name
+                    .as_bytes()
                     .get(..12)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-forwarded-"))
-        }) {
-            return Err(Rejection::Headers);
-        }
-        if let Some(connection) = wire::singleton_slice(headers, "connection")?
-            && !connection.eq_ignore_ascii_case(b"close")
-            && !connection.eq_ignore_ascii_case(b"keep-alive")
-        {
-            return Err(Rejection::Framing);
-        }
-        let content_type =
-            wire::singleton_slice(headers, "content-type")?.ok_or(Rejection::ContentType)?;
-        if !content_type.eq_ignore_ascii_case(b"application/json")
-            && !content_type.eq_ignore_ascii_case(b"application/json; charset=utf-8")
-        {
-            return Err(Rejection::ContentType);
-        }
-        let length = wire::singleton_slice(headers, "content-length")?.ok_or(Rejection::Framing)?;
-        let length = wire::content_length(length).map_err(|error| match error {
-            wire::LengthError::Syntax => Rejection::Framing,
-            wire::LengthError::Overflow => Rejection::BodySize,
-        })?;
-        if length == 0 || length > MAX_BODY_BYTES {
-            return Err(Rejection::BodySize);
-        }
-        Ok(AuthorizedHead {
-            length,
-            pinned_abliteration: self.pinned_abliteration,
-            context_tokens: self.context_tokens,
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"x-forwarded-"))
         })
     }
 }
@@ -971,6 +1002,65 @@ mod tests {
             chat.messages[1].reasoning_content.as_deref(),
             Some("line\n雪")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unified_header_checks_reject_mismatched_auth_lengths_and_scrub_bytes()
+    -> Result<(), super::Rejection> {
+        use super::{Rejection, RequestPolicy};
+
+        let key = "a".repeat(64);
+        let policy = RequestPolicy::new(8080, &key)?;
+        for bad_auth in [
+            "",
+            "Bearer short",
+            &format!("Bearer {key}0"),
+            &format!("Bearer {}b", "a".repeat(63)),
+        ] {
+            let head = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header("host", "127.0.0.1:8080")
+                .header("authorization", bad_auth)
+                .header("content-type", "application/json")
+                .header("content-length", "2")
+                .body(())
+                .map_err(|_| Rejection::Configuration)?
+                .into_parts()
+                .0;
+            assert_eq!(
+                policy.check_head(&head).err(),
+                Some(Rejection::Unauthorized)
+            );
+
+            let headers = [
+                httparse::Header {
+                    name: "Host",
+                    value: b"127.0.0.1:8080",
+                },
+                httparse::Header {
+                    name: "Authorization",
+                    value: bad_auth.as_bytes(),
+                },
+                httparse::Header {
+                    name: "Content-Type",
+                    value: b"application/json",
+                },
+                httparse::Header {
+                    name: "Content-Length",
+                    value: b"2",
+                },
+            ];
+            assert_eq!(
+                policy.check_wire_headers(&headers).err(),
+                Some(Rejection::Unauthorized)
+            );
+        }
+
+        let mut buf = [0x5Au8; 71];
+        super::scrub_bytes(&mut buf);
+        assert_eq!(buf, [0u8; 71]);
         Ok(())
     }
 }

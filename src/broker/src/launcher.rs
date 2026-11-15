@@ -1145,12 +1145,14 @@ async fn exchange(
 
 fn validate_health(bytes: &[u8]) -> io::Result<()> {
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Health<'a> {
         #[serde(borrow)]
         status: std::borrow::Cow<'a, str>,
     }
     let body = validate_response(bytes, 200)?;
-    let value: Health<'_> = serde_json::from_slice(body).map_err(io::Error::other)?;
+    let crate::Object(value): crate::Object<Health<'_>> =
+        serde_json::from_slice(body).map_err(io::Error::other)?;
     if value.status != "ok" {
         return Err(io::Error::other("Backend is not ready."));
     }
@@ -2107,6 +2109,8 @@ mod tests {
     fn readiness_requires_bounded_complete_unambiguous_json() {
         assert!(validate_health(&response(r#"{"status":"ok"}"#)).is_ok());
         assert!(validate_health(&response(r#"{"status":"loading model"}"#)).is_err());
+        assert!(validate_health(&response(r#"{"status":"ok","extra":true}"#)).is_err());
+        assert!(validate_health(&response(r#"["ok"]"#)).is_err());
         assert!(validate_health(&response(r#"{"status":"ok"}garbage"#)).is_err());
         let complete = response(r#"{"status":"ok"}"#);
         let complete = String::from_utf8_lossy(&complete);
