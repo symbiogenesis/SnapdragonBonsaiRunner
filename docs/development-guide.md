@@ -257,9 +257,9 @@ playback for a hidden response.
 | Message **Copy** | Copy exact source text, including Markdown. Assistant responses render supported Markdown natively; selecting text copies its displayed form. Generated links remain inert, HTML stays literal and code never executes. |
 | **Edit and resend / Regenerate** | Create and send a branch using the verified history prefix, preserving the original chat and draft. |
 | **Branch from here** | Create a branch without sending. A selected user message becomes the new draft. |
-| **Continue response** | Send an explicit continuation for the latest answer in context, preserving the current draft. |
-| **Retry response** | Retry the identified failed prompt using its existing message card, preserving the composer and cursor. For an interrupted partial answer, retry its original prompt in a new branch. |
-| Message **Reload model** | After teardown completes, reload the model without sending. Select Retry response when ready to retry that turn. |
+| **Continue response** | Send an explicit continuation for the latest answer in context, preserving the current draft. Appears directly beneath the latest interrupted or reply-capped answer, and in the latest answer's message menu. |
+| **Retry response** | Retry the identified failed prompt using its existing message card, preserving the composer and cursor. For an interrupted or reply-capped answer, retry its original prompt in a new branch. |
+| Message **Reload model** | After teardown completes, reload the model without sending. Select Continue response or Retry response when ready. |
 
 Sidebar queries update Find without taking focus, and clearing the search box
 hides Find across conversations. Editing or closing Find leaves
@@ -276,14 +276,16 @@ matches to the rendered text. A match entirely within hidden syntax or a hidden
 destination shows that message's source so every result remains visible. Message Copy, export,
 recovery and model history keep the original response bytes.
 
-**Retry response** appears directly beneath an identified unanswered prompt or
-interrupted answer. The original prompt can also remain in the composer for
-editing; Retry response uses the prompt in the conversation and preserves whatever
+**Continue response** and **Retry response** appear directly beneath an identified
+interrupted or reply-length-capped answer, and **Retry response** appears beneath
+an identified unanswered prompt (**Continue response** stays on the latest
+incomplete answer in context). The original prompt can also remain in the composer for
+editing; these controls preserve whatever
 is currently in the composer. An unanswered prompt keeps its existing card when
 retried. Starting a different message removes that prompt's retry control.
-During model preparation or teardown, retry stays disabled. After confirmed
-teardown, the control first offers **Reload model**; reloading never sends a
-message automatically. Once ready, select **Retry response** explicitly.
+During model preparation or teardown, message footer controls stay disabled. After confirmed
+teardown, the card first offers **Reload model**; reloading never sends a
+message automatically. Once ready, select **Continue response** or **Retry response** explicitly.
 
 **Settings** opens a native modal. Changes apply immediately; Done, Close or Escape
 dismisses it and restores composer focus. An open selector consumes Escape first.
@@ -334,9 +336,12 @@ response settings, voice description, transcript and exact completed history in
 `DataDirectory/chat-recovery.dpapi`. User-scoped DPAPI encrypts the bounded 8 MiB
 workspace; a file lock permits one writer per data folder.
 An interrupted reply with a locally identified prompt and visible answer is marked
-**Interrupted** and retained as conversation context. Later prompts can reference it;
+**Interrupted** and retained as conversation context; a reply that reaches the
+selected output cap without retaining a complete Extra effort draft is marked
+**Max length**. Later prompts can reference it;
 its message menu supports Continue response and Branch from here, and its visible
-Retry response control starts a new branch from the original prompt. Stop, failure
+card footer offers Continue response (while it remains the latest turn) alongside
+Retry response, which starts a new branch from the original prompt. Stop, failure
 and recovery never automatically resend the original request. If no usable answer
 exists, a locally identified prompt retains Retry response on its existing card.
 Unbound trailing pairs enter history only

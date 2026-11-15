@@ -274,3 +274,148 @@ fn unanswered_stopped_prompt_supports_menu_edit_and_branch_while_preserving_sour
         .and_then(|conversation| conversation.saved.as_ref());
     assert!(saved.is_some_and(|snapshot| snapshot.input == "Separate composer draft 🌱"));
 }
+
+#[test]
+fn token_limit_response_offers_continue_and_retry_buttons_at_minimum_width() {
+    for size in [[1180.0, 860.0], [480.0, 640.0]] {
+        let mut chat = harness(size);
+        let original = chat.state().app.active_conversation;
+        chat.state_mut().app.input = "Write a long walkthrough".into();
+        chat.state_mut().app.submit();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Send { .. })
+        ));
+        chat.state_mut()
+            .app
+            .model_event(Event::Text("Part one stopped at the reply cap.".into()));
+        let mut committed = chat.state().app.committed.clone();
+        committed.push(client::Message {
+            role: "user",
+            content: "Write a long walkthrough".into(),
+            reasoning_content: None,
+        });
+        committed.push(client::Message {
+            role: "assistant",
+            content: "Part one stopped at the reply cap.".into(),
+            reasoning_content: None,
+        });
+        chat.state_mut()
+            .app
+            .model_event(Event::Committed(committed));
+        chat.state_mut()
+            .app
+            .model_event(Event::Complete(Completion::TokenLimit));
+        chat.state_mut().app.input = "Keep my newer draft 🌱".into();
+        chat.run();
+
+        assert!(chat.query_by_label("Max length").is_some());
+        let continue_rect = chat
+            .get_by_role_and_label(egui::Role::Button, "Continue response")
+            .rect();
+        let retry_rect = chat
+            .get_by_role_and_label(egui::Role::Button, "Retry response")
+            .rect();
+        assert!(continue_rect.left() >= 0.0 && continue_rect.right() <= retry_rect.left());
+        assert!(retry_rect.right() <= size[0]);
+        assert!(continue_rect.height() >= 32.0 && retry_rect.height() >= 32.0);
+
+        chat.get_by_role_and_label(egui::Role::Button, "Continue response")
+            .click();
+        chat.run();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Send { text, .. }) if text.contains("Continue your previous response")
+        ));
+        assert!(chat.state().commands.try_recv().is_err());
+        assert_eq!(chat.state().app.active_conversation, original);
+        assert_eq!(chat.state().app.input, "Keep my newer draft 🌱");
+
+        // Chaining another capped continuation moves Continue response to the newest
+        // message while keeping Retry response on the earlier capped message.
+        let continue_prompt = chat
+            .state()
+            .app
+            .transcript
+            .messages
+            .iter()
+            .rfind(|message| message.role == Role::User)
+            .map(|message| message.body.clone())
+            .unwrap_or_default();
+        chat.state_mut()
+            .app
+            .model_event(Event::Text("Part two also hit the cap.".into()));
+        let mut second_committed = chat.state().app.committed.clone();
+        second_committed.push(client::Message {
+            role: "user",
+            content: continue_prompt.into(),
+            reasoning_content: None,
+        });
+        second_committed.push(client::Message {
+            role: "assistant",
+            content: "Part two also hit the cap.".into(),
+            reasoning_content: None,
+        });
+        chat.state_mut()
+            .app
+            .model_event(Event::Committed(second_committed));
+        chat.state_mut()
+            .app
+            .model_event(Event::Complete(Completion::TokenLimit));
+        chat.run();
+
+        // Exactly one visible Continue response button stays active on the newest turn.
+        chat.get_by_role_and_label(egui::Role::Button, "Continue response")
+            .click();
+        chat.run();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Send { text, .. }) if text.contains("Continue your previous response")
+        ));
+        assert_eq!(chat.state().app.committed.len(), 6);
+        assert_eq!(chat.state().app.input, "Keep my newer draft 🌱");
+    }
+}
+
+#[test]
+fn interrupted_partial_response_offers_visible_continue_and_retry_buttons() {
+    for size in [[1180.0, 860.0], [480.0, 640.0]] {
+        let mut chat = harness(size);
+        chat.state_mut().app.input = "Explain step by step".into();
+        chat.state_mut().app.submit();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Send { .. })
+        ));
+        chat.state_mut()
+            .app
+            .model_event(Event::Text("Step 1 of 3".into()));
+        chat.state_mut()
+            .app
+            .model_event(Event::Stopping("Explain step by step".into()));
+        chat.state_mut().app.model_event(Event::Stopped);
+        chat.state_mut().app.input = "Unsent followup".into();
+        chat.run();
+
+        let continue_rect = chat
+            .get_by_role_and_label(egui::Role::Button, "Continue response")
+            .rect();
+        let retry_rect = chat
+            .get_by_role_and_label(egui::Role::Button, "Retry response")
+            .rect();
+        assert!(continue_rect.left() >= 0.0 && continue_rect.right() <= retry_rect.left());
+        assert!(retry_rect.right() <= size[0]);
+        chat.get_by_role_and_label(egui::Role::Button, "Continue response")
+            .click();
+        chat.run();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::RestoreChat(history)) if history.len() == 4
+        ));
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Send { text, .. }) if text.contains("Continue your previous response")
+        ));
+        assert_eq!(chat.state().app.input, "Unsent followup");
+    }
+}

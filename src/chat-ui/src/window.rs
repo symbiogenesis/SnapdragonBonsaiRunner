@@ -1143,6 +1143,7 @@ impl State {
                         "Review did not finish. Your complete draft is retained."
                     }
                     Completion::TokenLimit => {
+                        self.transcript.mark_token_limit(&self.committed);
                         "Response reached the selected output cap, including thinking. You can ask Swift to continue."
                     }
                 };

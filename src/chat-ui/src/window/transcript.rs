@@ -165,6 +165,10 @@ struct HighlightKey {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Message state tracks orthogonal completion, streaming, and reasoning flags."
+)]
 pub(super) struct Message {
     #[serde(skip)]
     pub(super) id: u64,
@@ -180,6 +184,8 @@ pub(super) struct Message {
     retry_prefix: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(super) interrupted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(super) token_limit: bool,
     #[serde(skip)]
     body_revision: u64,
     reasoning: String,
@@ -334,6 +340,7 @@ impl Transcript {
             turn_prefix: None,
             retry_prefix: None,
             interrupted: false,
+            token_limit: false,
             body_revision: 0,
             reasoning: String::new(),
             pending: role == Role::Assistant,

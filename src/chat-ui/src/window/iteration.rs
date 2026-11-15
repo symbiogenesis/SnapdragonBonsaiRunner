@@ -676,4 +676,65 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn token_limit_marks_only_truncated_replies_and_preserves_marks_across_branches()
+    -> std::io::Result<()> {
+        let entry = |role, content: &str| client::Message {
+            role,
+            content: content.into(),
+            reasoning_content: None,
+        };
+        let (mut state, commands) = fixture();
+        state.input = "Long explanation".into();
+        state.submit();
+        assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
+        state.model_event(client::Event::Text("Truncated part one".into()));
+        let mut committed = state.committed.clone();
+        committed.push(entry("user", "Long explanation"));
+        committed.push(entry("assistant", "Truncated part one"));
+        state.model_event(client::Event::Committed(committed));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+        let capped = state
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| std::io::Error::other("capped answer missing"))?;
+        assert!(capped.token_limit);
+        assert!(capped.can_continue(&state.committed));
+        assert_eq!(capped.retry_prefix(&state.committed), Some(4));
+        let capped_id = capped.id;
+
+        state.message_action(MessageAction::Branch(capped_id));
+        assert!(matches!(commands.try_recv(), Ok(Command::RestoreChat(_))));
+        let branched = state
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| std::io::Error::other("branched capped answer missing"))?;
+        assert!(branched.token_limit);
+        assert!(branched.can_continue(&state.committed));
+
+        // Extra-effort Review hitting TokenLimit while retaining a complete draft
+        // must not mark the retained draft as truncated.
+        state.extra_effort = true;
+        state.input = "Careful answer".into();
+        state.submit();
+        assert!(matches!(commands.try_recv(), Ok(Command::Send { .. })));
+        state.model_event(client::Event::Draft("Complete draft".into()));
+        state.model_event(client::Event::RetainedAnswer("Complete draft".into()));
+        let mut retained = state.committed.clone();
+        retained.push(entry("user", "Careful answer"));
+        retained.push(entry("assistant", "Complete draft"));
+        state.model_event(client::Event::Committed(retained));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+        let final_answer = state
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| std::io::Error::other("retained draft missing"))?;
+        assert!(!final_answer.token_limit);
+        assert!(!final_answer.can_continue(&state.committed));
+        Ok(())
+    }
 }

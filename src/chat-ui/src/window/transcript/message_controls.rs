@@ -10,32 +10,72 @@ impl Message {
         ui: &mut egui::Ui,
         controls: &MessageControls<'_>,
     ) -> Option<MessageAction> {
-        self.retry_prefix(controls.history)?;
-        let (label, help) = if controls.can_reload {
-            (
-                "Reload model",
-                "Reload the model, then select Retry response here. Your message will not be sent automatically.",
-            )
-        } else {
-            (
-                "Retry response",
-                if self.role == Role::User {
-                    "Try this message again without adding another copy to the conversation. Keeps your unsent draft."
+        let has_retry = self.retry_prefix(controls.history).is_some();
+        let has_continue = self.can_continue(controls.history);
+        if !has_retry && !has_continue {
+            return None;
+        }
+        let mut action = None;
+        ui.horizontal(|ui| {
+            if has_continue
+                && ui
+                    .add_enabled(
+                        controls.can_send,
+                        egui::Button::new("Continue response")
+                            .min_size(egui::vec2(0.0, MESSAGE_ACTION_SIZE)),
+                    )
+                    .on_hover_text(
+                        "Ask Swift to continue from where this response stopped. Keeps your unsent draft.",
+                    )
+                    .on_disabled_hover_text(if controls.can_reload {
+                        "Reload the model first, then select Continue response here."
+                    } else {
+                        "Wait for the model to finish preparing or stopping before continuing."
+                    })
+                    .clicked()
+            {
+                action = Some(MessageAction::Continue(self.id));
+            }
+            if has_retry {
+                let (label, help) = if controls.can_reload {
+                    (
+                        "Reload model",
+                        if has_continue {
+                            "Reload the model, then select Continue response or Retry response here. Your message will not be sent automatically."
+                        } else {
+                            "Reload the model, then select Retry response here. Your message will not be sent automatically."
+                        },
+                    )
                 } else {
-                    "Try the original prompt in a new branch. Keeps this partial response and your unsent draft."
-                },
-            )
-        };
-        ui.add_enabled(
-            controls.can_send || controls.can_reload,
-            egui::Button::new(label).min_size(egui::vec2(0.0, MESSAGE_ACTION_SIZE)),
-        )
-        .on_hover_text(help)
-        .on_disabled_hover_text(
-            "Wait for the model to finish preparing or stopping before retrying.",
-        )
-        .clicked()
-        .then_some(MessageAction::Retry(self.id))
+                    (
+                        "Retry response",
+                        if self.role == Role::User {
+                            "Try this message again without adding another copy to the conversation. Keeps your unsent draft."
+                        } else if self.token_limit && !self.interrupted {
+                            "Try the original prompt in a new branch. Keeps this response and your unsent draft."
+                        } else {
+                            "Try the original prompt in a new branch. Keeps this partial response and your unsent draft."
+                        },
+                    )
+                };
+                let retry_enabled = controls.can_reload
+                    || (controls.can_send && (self.role == Role::User || controls.can_branch));
+                if ui
+                    .add_enabled(
+                        retry_enabled,
+                        egui::Button::new(label).min_size(egui::vec2(0.0, MESSAGE_ACTION_SIZE)),
+                    )
+                    .on_hover_text(help)
+                    .on_disabled_hover_text(
+                        "Wait for the model to finish preparing or stopping before retrying.",
+                    )
+                    .clicked()
+                {
+                    action = Some(MessageAction::Retry(self.id));
+                }
+            }
+        });
+        action
     }
 
     pub(super) fn header(
@@ -63,6 +103,11 @@ impl Message {
                 ui.label(RichText::new("Interrupted").small().weak())
                     .on_hover_text(
                         "This partial response is included in the conversation context.",
+                    );
+            } else if self.token_limit {
+                ui.label(RichText::new("Max length").small().weak())
+                    .on_hover_text(
+                        "This response reached the selected reply length limit and is included in the conversation context.",
                     );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

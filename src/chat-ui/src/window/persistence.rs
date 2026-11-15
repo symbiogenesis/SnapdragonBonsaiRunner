@@ -504,6 +504,46 @@ mod tests {
     }
 
     #[test]
+    fn token_limit_recovery_preserves_continue_and_retry_marks_without_replaying() -> io::Result<()>
+    {
+        let mut original = state();
+        original.model = ModelLifecycle::Generating;
+        original.transcript.start_turn("Long prompt".into(), 0);
+        original.transcript.append("Capped response", false);
+        let history = vec![
+            client::Message {
+                role: "user",
+                content: "Long prompt".into(),
+                reasoning_content: None,
+            },
+            client::Message {
+                role: "assistant",
+                content: "Capped response".into(),
+                reasoning_content: None,
+            },
+        ];
+        original.model_event(client::Event::Committed(history));
+        original.model_event(client::Event::Complete(client::Completion::TokenLimit));
+        original.input = "Saved draft".into();
+        let bytes = original.workspace_bytes()?;
+
+        let (commands, incoming) = mpsc::channel();
+        let (_events, events) = client::event_channel();
+        let mut restored = State::create(commands, events, None, None);
+        restored.restore_workspace(&bytes)?;
+        assert!(incoming.try_recv().is_err());
+        let answer = restored
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| io::Error::other("capped answer missing"))?;
+        assert!(answer.token_limit);
+        assert!(answer.can_continue(&restored.committed));
+        assert_eq!(answer.retry_prefix(&restored.committed), Some(0));
+        Ok(())
+    }
+
+    #[test]
     fn recovery_automatically_saves_and_restores_completed_history() -> io::Result<()> {
         let directory = recovery_directory("automatic")?;
         let mut original = state();

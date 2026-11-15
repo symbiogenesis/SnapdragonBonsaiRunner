@@ -12,7 +12,7 @@ impl Message {
                     && !self.body.trim().is_empty()
                     && crate::window::draft_buffer::fits(&self.body)
             })
-        } else if self.interrupted {
+        } else if self.interrupted || self.token_limit {
             self.committed_index(history)
                 .filter(|index| *index > 0 && history[index - 1].role == "user")
                 .map(|index| index - 1)
@@ -21,6 +21,15 @@ impl Message {
             // its card. Ordinary replies need no full text/history comparison.
             None
         }
+    }
+
+    pub(in crate::window) fn can_continue(&self, history: &[client::Message]) -> bool {
+        self.role == Role::Assistant
+            && (self.interrupted || self.token_limit)
+            && history
+                .len()
+                .checked_sub(1)
+                .is_some_and(|last| self.committed_index(history) == Some(last))
     }
 
     fn matches_history(&self, message: &client::Message) -> bool {
@@ -240,6 +249,17 @@ impl Transcript {
         })
     }
 
+    pub(in crate::window) fn mark_token_limit(&mut self, history: &[client::Message]) {
+        let Some(last) = history.len().checked_sub(1) else {
+            return;
+        };
+        if let Some(answer) = self.messages.last_mut().filter(|message| {
+            message.role == Role::Assistant && message.committed_index(history) == Some(last)
+        }) {
+            answer.token_limit = true;
+        }
+    }
+
     pub(in crate::window) fn copy_interrupted_marks(
         &mut self,
         source: &Self,
@@ -249,9 +269,14 @@ impl Transcript {
             let Some(index) = message.committed_index(history) else {
                 continue;
             };
-            message.interrupted = source.messages.iter().any(|original| {
-                original.interrupted && original.committed_index(history) == Some(index)
-            });
+            if let Some(original) = source
+                .messages
+                .iter()
+                .find(|original| original.committed_index(history) == Some(index))
+            {
+                message.interrupted = original.interrupted;
+                message.token_limit = original.token_limit;
+            }
         }
     }
 
@@ -344,16 +369,29 @@ mod tests {
         let answer = &mut transcript.messages[1];
         for _ in 0..8 {
             assert_eq!(answer.retry_prefix(&history), None);
+            assert!(!answer.can_continue(&history));
         }
         assert_eq!(answer.history_checks.get(), 0);
 
         answer.interrupted = true;
         assert_eq!(answer.retry_prefix(&history), Some(0));
-        assert_eq!(answer.history_checks.get(), 1);
+        assert!(answer.can_continue(&history));
+        assert_eq!(answer.history_checks.get(), 2);
+
+        answer.interrupted = false;
+        answer.token_limit = true;
+        assert_eq!(answer.retry_prefix(&history), Some(0));
+        assert!(answer.can_continue(&history));
+        assert_eq!(answer.history_checks.get(), 4);
+
+        let mut extended = history.clone();
+        extended.extend([entry("user", "Followup"), entry("assistant", "Continued")]);
+        assert_eq!(answer.retry_prefix(&extended), Some(0));
+        assert!(!answer.can_continue(&extended));
 
         history[1].reasoning_content = Some("Different reasoning".into());
         assert_eq!(answer.retry_prefix(&history), None);
-        assert_eq!(answer.history_checks.get(), 2);
+        assert!(!answer.can_continue(&history));
         history[1].reasoning_content = Some("Private reasoning".into());
         history[0].role = "assistant";
         assert_eq!(answer.retry_prefix(&history), None);

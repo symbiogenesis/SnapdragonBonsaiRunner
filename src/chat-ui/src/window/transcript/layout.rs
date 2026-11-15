@@ -300,9 +300,10 @@ impl Transcript {
                     .get(self.search.active)
                     .filter(|found| found.message == message.id)
                     .map(|found| found.range.clone());
-                let extra_height = if controls
-                    .is_some_and(|controls| message.retry_prefix(controls.history).is_some())
-                {
+                let extra_height = if controls.is_some_and(|controls| {
+                    message.retry_prefix(controls.history).is_some()
+                        || message.can_continue(controls.history)
+                }) {
                     MESSAGE_CONTENT_GAP + MESSAGE_ACTION_SIZE
                 } else {
                     0.0
