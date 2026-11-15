@@ -30,11 +30,12 @@ fn fallback() -> egui::FontDefinitions {
 
 fn load() -> egui::FontDefinitions {
     let mut fonts = fallback();
-    let Some(directory) = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .filter(|directory| directory.is_absolute())
-        .map(|directory| directory.join("Fonts"))
-    else {
+    let Some(directory) = super::super::platform::fonts_directory().or_else(|| {
+        std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join("Fonts"))
+    }) else {
         return fonts;
     };
     let face = |name| {

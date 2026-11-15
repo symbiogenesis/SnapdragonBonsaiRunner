@@ -1,12 +1,16 @@
 //! Small Windows boundary for system contrast colors and fatal launch errors.
 
+use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, path::PathBuf, ptr};
+
 use eframe::egui::{Color32, Shadow, Stroke, Visuals};
+use windows::{Win32::System::Com::CoTaskMemFree, core::PCWSTR};
 use windows_sys::Win32::{
     Graphics::Gdi::{
         COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
     },
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+        Shell::{FOLDERID_Fonts, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
         WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SystemParametersInfoW},
     },
 };
@@ -112,6 +116,44 @@ fn contrast_visuals(colors: SystemColors) -> Visuals {
     visuals.ime_composition.active_underline_stroke = Stroke::new(2.0, colors.text);
     visuals.ime_composition.inactive_underline_stroke = Stroke::new(1.0, colors.text);
     visuals
+}
+
+struct KnownFolderString(windows_sys::core::PWSTR);
+
+impl Drop for KnownFolderString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: The pointer was allocated by SHGetKnownFolderPath for this owner.
+            unsafe { CoTaskMemFree(Some(self.0.cast())) };
+        }
+    }
+}
+
+/// Resolve the system Fonts folder via the Windows Shell known-folder API.
+#[allow(
+    unsafe_code,
+    reason = "Read-only Windows Shell known-folder query with RAII CoTaskMemFree ownership."
+)]
+pub(super) fn fonts_directory() -> Option<PathBuf> {
+    let mut raw = ptr::null_mut();
+    // SAFETY: FOLDERID_Fonts is a constant GUID reference and raw receives an owned PWSTR.
+    let status = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_Fonts,
+            KF_FLAG_DEFAULT.cast_unsigned(),
+            ptr::null_mut(),
+            &raw mut raw,
+        )
+    };
+    let allocated = KnownFolderString(raw);
+    if status < 0 || allocated.0.is_null() {
+        return None;
+    }
+    let raw_pcwstr = PCWSTR::from_raw(allocated.0);
+    // SAFETY: SHGetKnownFolderPath guarantees a valid NUL-terminated UTF-16 buffer until Drop.
+    let wide = unsafe { raw_pcwstr.as_wide() };
+    let path = PathBuf::from(OsString::from_wide(wide));
+    path.is_absolute().then_some(path)
 }
 
 /// Keep fatal startup failures visible when an egui window cannot be created.
