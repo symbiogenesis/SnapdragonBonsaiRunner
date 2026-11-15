@@ -203,6 +203,20 @@ fn startup_projection_matches(
                 && startup.resident_weight_bytes == 2_888_663_040
                 && (1..=524_288).contains(&startup.host_metadata_bytes)
         }
+        "hexagon-native-q2-partial" => {
+            requested == "auto"
+                && !repacked
+                && matches!(
+                    startup.identity.as_deref(),
+                    Some(
+                        "hexagon-v73-hvx-native-q2-partial-v1-experimental"
+                            | "hexagon-v81-hvx-native-q2-partial-v1-experimental"
+                    )
+                )
+                && (1..168).contains(&startup.resident_tensors)
+                && (1..2_888_663_040).contains(&startup.resident_weight_bytes)
+                && (1..=524_288).contains(&startup.host_metadata_bytes)
+        }
         "external" => {
             requested == "auto"
                 && no_residency
@@ -400,6 +414,71 @@ mod tests {
         assert!(validate_native_identity(&model_response(&ptq1)?, true, true, auto).is_err());
         ptq1["startup_projection"] = projection_startup("cpu");
         assert!(validate_native_identity(&model_response(&ptq1)?, true, true, auto).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_hexagon_projection_startup_accepts_v73_and_v81_bounds()
+    -> Result<(), serde_json::Error> {
+        use crate::inference::{KvCache, Placement};
+        use serde_json::json;
+
+        let (mut model, _) = kv_cache_model(false, true);
+        let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
+        for identity in [
+            "hexagon-v73-hvx-native-q2-partial-v1-experimental",
+            "hexagon-v81-hvx-native-q2-partial-v1-experimental",
+        ] {
+            model["startup_projection"] = json!({
+                "schema_version": 1,
+                "requested": "auto",
+                "effective": "hexagon-native-q2-partial",
+                "identity": identity,
+                "resident_tensors": 144,
+                "resident_weight_bytes": 1_800_000_000_u64,
+                "host_metadata_bytes": 4096,
+            });
+            assert!(
+                validate_native_identity(&model_response(&model)?, false, true, auto).is_ok(),
+                "{identity}"
+            );
+        }
+
+        let cpu = auto.with_placement(Placement::Cpu);
+        let mut cpu_model = model.clone();
+        cpu_model["placement"] = json!("cpu");
+        cpu_model["projection_backend"] = json!("cpu");
+        cpu_model["startup_projection"]["requested"] = json!("cpu");
+        assert!(validate_native_identity(&model_response(&cpu_model)?, false, true, cpu).is_err());
+
+        let (mut ptq1, _) = kv_cache_model(true, true);
+        ptq1["startup_projection"] = model["startup_projection"].clone();
+        assert!(validate_native_identity(&model_response(&ptq1)?, true, true, auto).is_err());
+
+        for (field, value) in [
+            ("identity", json!(null)),
+            (
+                "identity",
+                json!("hexagon-v73-hvx-native-q2-v1-experimental"),
+            ),
+            (
+                "identity",
+                json!("hexagon-hvx-native-q2-resident-v1-experimental"),
+            ),
+            ("resident_tensors", json!(0)),
+            ("resident_tensors", json!(168)),
+            ("resident_weight_bytes", json!(0)),
+            ("resident_weight_bytes", json!(2_888_663_040_u64)),
+            ("host_metadata_bytes", json!(0)),
+            ("host_metadata_bytes", json!(524_289)),
+        ] {
+            let mut candidate = model.clone();
+            candidate["startup_projection"][field] = value;
+            assert!(
+                validate_native_identity(&model_response(&candidate)?, false, true, auto).is_err(),
+                "{field}"
+            );
+        }
         Ok(())
     }
 
