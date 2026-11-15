@@ -338,7 +338,7 @@ fn read_frames(
             }
             Ok(chunk)
         });
-        let terminal = result.as_ref().map_or(true, |chunk| {
+        let terminal = result.as_ref().ok().is_none_or(|chunk| {
             expected_start = chunk.end;
             chunk.last
         });

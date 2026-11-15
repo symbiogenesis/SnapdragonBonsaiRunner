@@ -284,7 +284,9 @@ fn offline_svg_rasterizer_produces_valid_premultiplied_rgba_and_blocks_hrefs() -
         usize::try_from(width * height * 4).map_err(io::Error::other)?
     );
     let mut any_non_zero = false;
-    for px in rgba.chunks_exact(4) {
+    let (pixels, remainder) = rgba.as_chunks::<4>();
+    assert!(remainder.is_empty());
+    for &px in pixels {
         assert!(px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]);
         if px != [0, 0, 0, 0] {
             any_non_zero = true;
@@ -599,5 +601,103 @@ fn persistent_worker_serves_interleaved_markdown_and_svg_raster_requests() -> io
         cursor.read_exact(&mut actual)?;
         assert_eq!(actual, payload);
     }
+    Ok(())
+}
+
+#[test]
+fn svg_policy_rejects_duplicate_ids_and_unbounded_filters() {
+    let too_many_filter_primitives = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><filter id=\"chain\">{}</filter></defs><rect width=\"32\" height=\"32\" filter=\"url(#chain)\"/></svg>",
+        "<feGaussianBlur stdDeviation=\"1\"/>".repeat(17)
+    );
+    let rejected_cases = [
+        (
+            "duplicate id shadowing gradient",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><linearGradient id=\"dup\"><stop offset=\"0%\" stop-color=\"#000\"/></linearGradient><linearGradient id=\"dup\"><stop offset=\"0%\" stop-color=\"#fff\"/></linearGradient></defs><rect width=\"32\" height=\"32\" fill=\"url(#dup)\"/></svg>",
+        ),
+        (
+            "duplicate id across elements",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><g id=\"same\"/><rect id=\"same\" width=\"16\" height=\"16\"/></svg>",
+        ),
+        ("excessive filter primitives", &too_many_filter_primitives),
+        (
+            "oversized unreferenced filter bbox scale",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><filter id=\"huge-raw\" width=\"5000\" height=\"5000\"><feGaussianBlur stdDeviation=\"1\"/></filter></defs><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "oversized userSpaceOnUse filter dimension",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><filter id=\"huge-user\" filterUnits=\"userSpaceOnUse\" width=\"25000\" height=\"32\"><feGaussianBlur stdDeviation=\"1\"/></filter></defs><rect width=\"32\" height=\"32\" filter=\"url(#huge-user)\"/></svg>",
+        ),
+        (
+            "filter exceeding canvas extent",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><filter id=\"wide\" width=\"500%\" height=\"500%\"><feGaussianBlur stdDeviation=\"1\"/></filter></defs><rect width=\"32\" height=\"32\" filter=\"url(#wide)\"/></svg>",
+        ),
+        (
+            "scaled group inflating filter beyond canvas extent",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><filter id=\"f\"><feGaussianBlur stdDeviation=\"1\"/></filter></defs><g transform=\"scale(100)\"><rect width=\"2\" height=\"2\" filter=\"url(#f)\"/></g></svg>",
+        ),
+    ];
+
+    for (label, svg_source) in rejected_cases {
+        assert!(
+            svg::inspect(svg_source).is_none(),
+            "{label} must fail svg::inspect"
+        );
+        assert!(
+            parse(&format!("```svg\n{svg_source}\n```")).starts_with(b"BMD1"),
+            "{label} must remain an inert BMD1 code block"
+        );
+        let packet = rasterize(svg_source, 64, 64);
+        assert_eq!(packet.len(), svg::RASTER_HEADER_BYTES, "{label}");
+        assert_eq!(packet[4], 0, "{label} must return ok = 0 raster header");
+    }
+
+    let bounded_scaled_filter = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><defs><filter id=\"ok-filter\" width=\"150%\" height=\"150%\"><feGaussianBlur stdDeviation=\"1\"/></filter></defs><g transform=\"scale(0.1)\"><rect width=\"300\" height=\"300\" fill=\"#2a9d8f\" filter=\"url(#ok-filter)\"/></g></svg>";
+    assert!(svg::inspect(bounded_scaled_filter).is_some());
+    assert_eq!(rasterize(bounded_scaled_filter, 64, 64)[4], 1);
+}
+
+#[test]
+fn svg_parse_tree_cache_reuses_valid_trees_and_evicts_lru_after_four() -> io::Result<()> {
+    use std::sync::Arc;
+
+    let svg1 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#111\"/></svg>";
+    let svg2 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#222\"/></svg>";
+    let svg3 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#333\"/></svg>";
+    let svg4 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#444\"/></svg>";
+    let svg5 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#555\"/></svg>";
+    let invalid = "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+
+    let results = svg::parse_tree_cache_for_test_roundtrip(&[
+        svg1, svg1, svg2, svg3, svg4, svg2, svg5, invalid, svg2, svg1,
+    ]);
+    let t1_first = results[0]
+        .as_ref()
+        .ok_or_else(|| io::Error::other("svg1 valid"))?;
+    let t1_hit = results[1]
+        .as_ref()
+        .ok_or_else(|| io::Error::other("svg1 hit"))?;
+    assert!(Arc::ptr_eq(t1_first, t1_hit));
+
+    let t2_first = results[2]
+        .as_ref()
+        .ok_or_else(|| io::Error::other("svg2 valid"))?;
+    let t2_promoted = results[5]
+        .as_ref()
+        .ok_or_else(|| io::Error::other("svg2 promoted"))?;
+    assert!(Arc::ptr_eq(t2_first, t2_promoted));
+
+    assert!(results[6].is_some());
+    assert!(results[7].is_none());
+
+    let t2_retained = results[8]
+        .as_ref()
+        .ok_or_else(|| io::Error::other("svg2 retained"))?;
+    assert!(Arc::ptr_eq(t2_first, t2_retained));
+
+    let t1_re_parsed = results[9]
+        .as_ref()
+        .ok_or_else(|| io::Error::other("svg1 re-parsed"))?;
+    assert!(!Arc::ptr_eq(t1_first, t1_re_parsed));
     Ok(())
 }

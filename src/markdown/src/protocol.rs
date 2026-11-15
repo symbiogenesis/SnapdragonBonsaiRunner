@@ -68,9 +68,14 @@ fn read_frame(input: &mut impl Read) -> io::Result<(u64, RequestKind)> {
         let Some((dimensions, svg_bytes)) = bytes.split_first_chunk::<8>() else {
             return Err(io::Error::other("Invalid SVG raster frame"));
         };
-        let (width_bytes, height_bytes) = dimensions.split_at(4);
-        let max_width = u32::from_le_bytes(width_bytes.try_into().map_err(io::Error::other)?);
-        let max_height = u32::from_le_bytes(height_bytes.try_into().map_err(io::Error::other)?);
+        let Some((width_bytes, rest)) = dimensions.split_first_chunk::<4>() else {
+            return Err(io::Error::other("Invalid SVG raster frame"));
+        };
+        let Some((height_bytes, _)) = rest.split_first_chunk::<4>() else {
+            return Err(io::Error::other("Invalid SVG raster frame"));
+        };
+        let max_width = u32::from_le_bytes(*width_bytes);
+        let max_height = u32::from_le_bytes(*height_bytes);
         let svg = std::str::from_utf8(svg_bytes)
             .map_err(io::Error::other)?
             .to_owned();

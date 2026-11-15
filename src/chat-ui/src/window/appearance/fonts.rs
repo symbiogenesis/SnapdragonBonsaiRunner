@@ -1,10 +1,10 @@
 //! Reading faces are loaded once before the native event loop starts.
 use super::egui;
-use std::{fs::File, path::PathBuf, sync::OnceLock};
+use std::{fs::File, path::PathBuf, sync::LazyLock};
 
 const STRONG_FAMILY: &str = "Bonsai Strong";
 const MAX_FONT_BYTES: u64 = 4 * 1024 * 1024;
-static FONTS: OnceLock<egui::FontDefinitions> = OnceLock::new();
+static FONTS: LazyLock<egui::FontDefinitions> = LazyLock::new(load);
 
 fn fallback() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
@@ -73,11 +73,11 @@ fn load() -> egui::FontDefinitions {
 
 /// Call before creating the native window so production configure never hits disk.
 pub(super) fn prepare() {
-    let _ = FONTS.get_or_init(load);
+    let _ = LazyLock::force(&FONTS);
 }
 
 pub(super) fn configure(ctx: &egui::Context) {
-    ctx.set_fonts(FONTS.get_or_init(load).clone());
+    ctx.set_fonts(FONTS.clone());
 }
 
 #[cfg(test)]
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn markdown_native_reading_faces_keep_distinct_weight_and_bundled_fallbacks() {
         prepare();
-        let fonts = FONTS.get().cloned().unwrap_or_else(fallback);
+        let fonts = FONTS.clone();
         let regular = &fonts.families[&egui::FontFamily::Proportional];
         let strong = &fonts.families[&egui::FontFamily::Name(STRONG_FAMILY.into())];
         assert_eq!(regular.first().map(String::as_str), Some("Bonsai Reading"));

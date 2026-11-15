@@ -23,6 +23,22 @@ const MAX_HREF_CHAIN: usize = 16;
 const MAX_CONVOLVE_ENTRIES: usize = 64;
 /// Maximum `feConvolveMatrix` `order` dimension along either axis.
 const MAX_CONVOLVE_ORDER: u32 = 8;
+/// Maximum filter primitives allowed inside a single `<filter>` pipeline.
+const MAX_FILTER_PRIMITIVES: usize = 16;
+/// Maximum total element descendants permitted inside a single `<filter>` subtree.
+const MAX_FILTER_SUBTREE_NODES: usize = 64;
+/// Maximum resolved `usvg::filter::Filter` count across a document tree.
+const MAX_FILTERS: usize = 64;
+/// Maximum total filter primitives evaluated across all resolved filters in a tree.
+const MAX_TOTAL_FILTER_PRIMITIVES: usize = 256;
+/// Maximum raw percentage magnitude permitted for `<filter>` geometry attributes.
+const MAX_FILTER_PERCENT: f32 = 1_000.0;
+/// Maximum raw `objectBoundingBox` scale factor permitted for unitless `<filter>` attributes.
+const MAX_FILTER_BBOX_SCALE: f32 = 10.0;
+/// Maximum raw `<filter>` region extent in SVG user units or CSS pixels.
+const MAX_FILTER_USER_DIMENSION: f32 = 16_384.0;
+/// Maximum multiplier of SVG canvas dimensions permitted for resolved filter regions.
+const MAX_FILTER_CANVAS_MULTIPLIER: f32 = 4.0;
 /// Maximum local fragment identifier byte length (`#<id>`).
 const MAX_ID_BYTES: usize = 128;
 /// Maximum resolved `usvg::Node` count across the tree and defs subroots.
@@ -485,6 +501,81 @@ fn validate_convolve_matrix(node: roxmltree::Node<'_, '_>) -> bool {
     true
 }
 
+fn parse_svg_filter_length(raw: &str) -> Option<(f32, Option<&str>)> {
+    let trimmed = raw.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    if trimmed.is_empty() {
+        return None;
+    }
+    for unit in ["%", "px", "pt", "pc", "mm", "cm", "in", "em", "ex"] {
+        if let Some(prefix) = trimmed.strip_suffix(unit) {
+            let value = prefix.parse::<f32>().ok()?;
+            return value.is_finite().then_some((value, Some(unit)));
+        }
+    }
+    let value = trimmed.parse::<f32>().ok()?;
+    value.is_finite().then_some((value, None))
+}
+
+fn validate_filter_dimension(raw: &str, object_bbox: bool, non_negative: bool) -> bool {
+    let Some((value, unit)) = parse_svg_filter_length(raw) else {
+        return false;
+    };
+    if non_negative && value < 0.0 {
+        return false;
+    }
+    let abs_val = value.abs();
+    match unit {
+        Some("%") => abs_val <= MAX_FILTER_PERCENT,
+        None if object_bbox => abs_val <= MAX_FILTER_BBOX_SCALE,
+        None | Some("px") => abs_val <= MAX_FILTER_USER_DIMENSION,
+        Some("pt") => abs_val * 1.34 <= MAX_FILTER_USER_DIMENSION,
+        Some("pc" | "em" | "ex") => abs_val * 16.0 <= MAX_FILTER_USER_DIMENSION,
+        Some("mm") => abs_val * 3.8 <= MAX_FILTER_USER_DIMENSION,
+        Some("cm") => abs_val * 38.0 <= MAX_FILTER_USER_DIMENSION,
+        Some("in") => abs_val * 96.0 <= MAX_FILTER_USER_DIMENSION,
+        Some(_) => false,
+    }
+}
+
+fn validate_filter_element(node: roxmltree::Node<'_, '_>) -> bool {
+    let object_bbox = node.attribute("filterUnits").is_none_or(|units| {
+        units.trim_matches(|ch: char| ch.is_ascii_whitespace()) == "objectBoundingBox"
+    });
+    if let Some(units) = node.attribute("filterUnits") {
+        let trimmed = units.trim_matches(|ch: char| ch.is_ascii_whitespace());
+        if trimmed != "objectBoundingBox" && trimmed != "userSpaceOnUse" {
+            return false;
+        }
+    }
+    for (attr_name, non_negative) in [
+        ("x", false),
+        ("y", false),
+        ("width", true),
+        ("height", true),
+    ] {
+        if let Some(attr_val) = node.attribute(attr_name)
+            && !validate_filter_dimension(attr_val, object_bbox, non_negative)
+        {
+            return false;
+        }
+    }
+    let mut direct_primitives = 0_usize;
+    for child in node.children().filter(|child| child.is_element()) {
+        if !matches!(child.tag_name().name(), "title" | "desc") {
+            direct_primitives += 1;
+            if direct_primitives > MAX_FILTER_PRIMITIVES {
+                return false;
+            }
+        }
+    }
+    let descendants = node
+        .descendants()
+        .skip(1)
+        .filter(|descendant| descendant.is_element())
+        .count();
+    descendants <= MAX_FILTER_SUBTREE_NODES
+}
+
 fn validate_element_and_index<'a, 'input>(
     node: roxmltree::Node<'a, 'input>,
     depth: u32,
@@ -547,7 +638,9 @@ fn validate_element_and_index<'a, 'input>(
             if trimmed_id != attr_val || !is_valid_id(trimmed_id) {
                 return false;
             }
-            id_map.entry(trimmed_id).or_insert(node);
+            if id_map.insert(trimmed_id, node).is_some() {
+                return false;
+            }
         } else if attr.namespace().is_none() && attr_name == "style" {
             if matches!(tag_name, "title" | "desc" | "style") || !validate_css_text(attr_val) {
                 return false;
@@ -588,6 +681,9 @@ fn validate_element_and_index<'a, 'input>(
             }
         }
         return true;
+    }
+    if tag_name == "filter" && !validate_filter_element(node) {
+        return false;
     }
     if tag_name == "feConvolveMatrix" && !validate_convolve_matrix(node) {
         return false;
@@ -734,14 +830,54 @@ pub(super) fn validate_untrusted_xml(doc: &roxmltree::Document<'_>) -> bool {
     validate_use_expansion(svg_root, 1, &id_map, &mut active_targets, &mut budget)
 }
 
+fn validate_resolved_filter_rect(
+    rect: usvg::NonZeroRect,
+    transform: usvg::Transform,
+    canvas_size: usvg::Size,
+) -> bool {
+    let Some(transformed) = rect.transform(transform) else {
+        return false;
+    };
+    let max_w = canvas_size.width() * MAX_FILTER_CANVAS_MULTIPLIER;
+    let max_h = canvas_size.height() * MAX_FILTER_CANVAS_MULTIPLIER;
+    let max_x = canvas_size.width() * (MAX_FILTER_CANVAS_MULTIPLIER + 1.0);
+    let max_y = canvas_size.height() * (MAX_FILTER_CANVAS_MULTIPLIER + 1.0);
+    transformed.x().is_finite()
+        && transformed.y().is_finite()
+        && transformed.width().is_finite()
+        && transformed.height().is_finite()
+        && transformed.x().abs() <= max_x
+        && transformed.y().abs() <= max_y
+        && transformed.width() <= max_w
+        && transformed.height() <= max_h
+}
+
 fn validate_group_bounds(
     group: &usvg::Group,
     depth: u32,
     nodes_budget: &mut usize,
     segments_budget: &mut usize,
+    canvas_size: usvg::Size,
 ) -> bool {
     if depth > MAX_SVG_DEPTH + 4 {
         return false;
+    }
+    let abs_transform = group.abs_transform();
+    for filter in group.filters() {
+        let primitives = filter.primitives();
+        if primitives.len() > MAX_FILTER_PRIMITIVES {
+            return false;
+        }
+        if !validate_resolved_filter_rect(filter.rect(), abs_transform, canvas_size) {
+            return false;
+        }
+        for primitive in primitives {
+            if matches!(primitive.kind(), usvg::filter::Kind::Image(_))
+                || !validate_resolved_filter_rect(primitive.rect(), abs_transform, canvas_size)
+            {
+                return false;
+            }
+        }
     }
     for child in group.children() {
         if *nodes_budget == 0 {
@@ -750,7 +886,13 @@ fn validate_group_bounds(
         *nodes_budget -= 1;
         match child {
             usvg::Node::Group(sub) => {
-                if !validate_group_bounds(sub, depth + 1, nodes_budget, segments_budget) {
+                if !validate_group_bounds(
+                    sub,
+                    depth + 1,
+                    nodes_budget,
+                    segments_budget,
+                    canvas_size,
+                ) {
                     return false;
                 }
             }
@@ -767,6 +909,7 @@ fn validate_group_bounds(
                     depth + 1,
                     nodes_budget,
                     segments_budget,
+                    canvas_size,
                 ) {
                     return false;
                 }
@@ -780,23 +923,63 @@ fn validate_group_bounds(
 
 /// Verifies post-conversion `usvg::Tree` invariants before CPU rasterization.
 pub(super) fn validate_resolved_tree(tree: &usvg::Tree) -> bool {
-    let mut nodes_budget = MAX_RENDER_NODES;
-    let mut segments_budget = MAX_PATH_SEGMENTS;
-    if !validate_group_bounds(tree.root(), 1, &mut nodes_budget, &mut segments_budget) {
+    let filters = tree.filters();
+    if filters.len() > MAX_FILTERS {
         return false;
     }
-    for clip in tree.clip_paths() {
-        if !validate_group_bounds(clip.root(), 1, &mut nodes_budget, &mut segments_budget) {
+    let mut total_primitives = 0_usize;
+    for filter in filters {
+        let primitives = filter.primitives();
+        if primitives.len() > MAX_FILTER_PRIMITIVES {
+            return false;
+        }
+        total_primitives = total_primitives.saturating_add(primitives.len());
+        if total_primitives > MAX_TOTAL_FILTER_PRIMITIVES {
+            return false;
+        }
+        if primitives
+            .iter()
+            .any(|primitive| matches!(primitive.kind(), usvg::filter::Kind::Image(_)))
+        {
             return false;
         }
     }
-    for mask in tree.masks() {
-        if !validate_group_bounds(mask.root(), 1, &mut nodes_budget, &mut segments_budget) {
-            return false;
-        }
+
+    let canvas_size = tree.size();
+    if !filters.is_empty()
+        && (!canvas_size.width().is_finite()
+            || !canvas_size.height().is_finite()
+            || canvas_size.width() <= 0.0
+            || canvas_size.height() <= 0.0)
+    {
+        return false;
     }
-    for pattern in tree.patterns() {
-        if !validate_group_bounds(pattern.root(), 1, &mut nodes_budget, &mut segments_budget) {
+
+    let mut nodes_budget = MAX_RENDER_NODES;
+    let mut segments_budget = MAX_PATH_SEGMENTS;
+    if !validate_group_bounds(
+        tree.root(),
+        1,
+        &mut nodes_budget,
+        &mut segments_budget,
+        canvas_size,
+    ) {
+        return false;
+    }
+    for subroot in tree
+        .clip_paths()
+        .iter()
+        .map(|clip| clip.root())
+        .chain(tree.masks().iter().map(|mask| mask.root()))
+        .chain(tree.patterns().iter().map(|pattern| pattern.root()))
+    {
+        if !validate_group_bounds(
+            subroot,
+            1,
+            &mut nodes_budget,
+            &mut segments_budget,
+            canvas_size,
+        ) {
             return false;
         }
     }

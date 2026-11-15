@@ -5,7 +5,11 @@ mod policy;
 #[cfg(test)]
 pub(crate) use policy::{ALLOWED_ATTRIBUTES, ALLOWED_ELEMENTS};
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::VecDeque,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::{Arc, LazyLock, Mutex},
+};
 
 /// Maximum UTF-8 byte length accepted for a single inline SVG document.
 pub const MAX_SVG_BYTES: usize = 256 * 1024;
@@ -19,6 +23,7 @@ pub const MAX_RASTER_PIXELS: usize = 4_194_304;
 pub(crate) const RASTER_MAGIC: &[u8; 4] = b"BMG1";
 /// Byte length of the raster header (`BMG1` + `ok:u8` + `width:u32` + `height:u32`).
 pub(crate) const RASTER_HEADER_BYTES: usize = 13;
+const PARSE_TREE_CACHE_CAPACITY: usize = 4;
 
 struct EmbeddedFonts {
     database: Arc<resvg::usvg::fontdb::Database>,
@@ -26,8 +31,7 @@ struct EmbeddedFonts {
 }
 
 fn load_embedded_fonts() -> &'static EmbeddedFonts {
-    static FONTS: OnceLock<EmbeddedFonts> = OnceLock::new();
-    FONTS.get_or_init(|| {
+    static FONTS: LazyLock<EmbeddedFonts> = LazyLock::new(|| {
         let mut database = resvg::usvg::fontdb::Database::new();
         database.load_font_data(epaint_default_fonts::UBUNTU_LIGHT.to_vec());
         let sans_family = database
@@ -53,7 +57,8 @@ fn load_embedded_fonts() -> &'static EmbeddedFonts {
             database: Arc::new(database),
             default_family: sans_family,
         }
-    })
+    });
+    &FONTS
 }
 
 fn locked_options() -> Option<resvg::usvg::Options<'static>> {
@@ -85,14 +90,70 @@ fn locked_options() -> Option<resvg::usvg::Options<'static>> {
     })
 }
 
-fn parse_tree(svg: &str) -> Option<resvg::usvg::Tree> {
-    let trimmed = svg.trim();
-    if trimmed.is_empty()
-        || svg.len() > MAX_SVG_BYTES
-        || trimmed.as_bytes().starts_with(&[0x1f, 0x8b])
-    {
-        return None;
+struct CachedTree {
+    hash: u64,
+    svg: Box<str>,
+    tree: Arc<resvg::usvg::Tree>,
+}
+
+struct ParseTreeCache {
+    capacity: usize,
+    entries: VecDeque<CachedTree>,
+}
+
+impl ParseTreeCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::with_capacity(capacity),
+        }
     }
+
+    fn key_hash(svg: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        svg.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn get(&mut self, hash: u64, svg: &str) -> Option<Arc<resvg::usvg::Tree>> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|entry| entry.hash == hash && &*entry.svg == svg)?;
+        let entry = self.entries.remove(pos)?;
+        let tree = Arc::clone(&entry.tree);
+        self.entries.push_back(entry);
+        Some(tree)
+    }
+
+    fn insert(
+        &mut self,
+        hash: u64,
+        svg: &str,
+        tree: Arc<resvg::usvg::Tree>,
+    ) -> Arc<resvg::usvg::Tree> {
+        if let Some(existing) = self.get(hash, svg) {
+            return existing;
+        }
+        if self.capacity == 0 {
+            return tree;
+        }
+        while self.entries.len() >= self.capacity {
+            let _ = self.entries.pop_front();
+        }
+        self.entries.push_back(CachedTree {
+            hash,
+            svg: svg.into(),
+            tree: Arc::clone(&tree),
+        });
+        tree
+    }
+}
+
+static PARSE_TREE_CACHE: LazyLock<Mutex<ParseTreeCache>> =
+    LazyLock::new(|| Mutex::new(ParseTreeCache::new(PARSE_TREE_CACHE_CAPACITY)));
+
+fn parse_validated_tree(trimmed: &str) -> Option<Arc<resvg::usvg::Tree>> {
     let xml = resvg::usvg::roxmltree::Document::parse_with_options(
         trimmed,
         resvg::usvg::roxmltree::ParsingOptions {
@@ -107,7 +168,48 @@ fn parse_tree(svg: &str) -> Option<resvg::usvg::Tree> {
     }
     let options = locked_options()?;
     let tree = resvg::usvg::Tree::from_xmltree(&xml, &options).ok()?;
-    policy::validate_resolved_tree(&tree).then_some(tree)
+    policy::validate_resolved_tree(&tree).then(|| Arc::new(tree))
+}
+
+fn parse_tree_with_cache(
+    cache: &Mutex<ParseTreeCache>,
+    svg: &str,
+) -> Option<Arc<resvg::usvg::Tree>> {
+    let trimmed = svg.trim();
+    if trimmed.is_empty()
+        || svg.len() > MAX_SVG_BYTES
+        || trimmed.as_bytes().starts_with(&[0x1f, 0x8b])
+    {
+        return None;
+    }
+    let hash = ParseTreeCache::key_hash(trimmed);
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = guard.get(hash, trimmed) {
+            return Some(cached);
+        }
+    }
+    let parsed = parse_validated_tree(trimmed)?;
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Some(guard.insert(hash, trimmed, parsed))
+}
+
+fn parse_tree(svg: &str) -> Option<Arc<resvg::usvg::Tree>> {
+    parse_tree_with_cache(&PARSE_TREE_CACHE, svg)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_tree_cache_for_test_roundtrip(
+    svgs: &[&str],
+) -> Vec<Option<Arc<resvg::usvg::Tree>>> {
+    let cache = Mutex::new(ParseTreeCache::new(PARSE_TREE_CACHE_CAPACITY));
+    svgs.iter()
+        .map(|svg| parse_tree_with_cache(&cache, svg))
+        .collect()
 }
 
 /// Validates SVG syntax/structure offline and returns finite positive `(width, height)`.
@@ -215,7 +317,7 @@ pub fn rasterize(svg: &str, max_width: u32, max_height: u32) -> Vec<u8> {
         return failed_packet();
     };
     resvg::render(
-        &tree,
+        &*tree,
         resvg::tiny_skia::Transform::from_scale(sx, sy),
         &mut pixmap.as_mut(),
     );

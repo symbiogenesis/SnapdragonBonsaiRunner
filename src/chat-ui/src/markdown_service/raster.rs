@@ -64,9 +64,12 @@ pub(crate) fn decode_raster(bytes: &[u8]) -> Result<Option<DecodedRaster<'_>>, I
             if payload.len() != expected_len {
                 return Err(InvalidRasterWire);
             }
-            for chunk in payload.chunks_exact(4) {
-                let alpha = chunk[3];
-                if chunk[0] > alpha || chunk[1] > alpha || chunk[2] > alpha {
+            let (pixels, remainder) = payload.as_chunks::<4>();
+            if !remainder.is_empty() {
+                return Err(InvalidRasterWire);
+            }
+            for &[r, g, b, alpha] in pixels {
+                if r > alpha || g > alpha || b > alpha {
                     return Err(InvalidRasterWire);
                 }
             }
