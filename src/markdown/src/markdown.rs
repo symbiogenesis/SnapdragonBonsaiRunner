@@ -146,7 +146,9 @@ impl Builder<'_> {
             }
             match inline {
                 Inline::Text(node) => self.value(&node.value, node.meta.span, format),
-                Inline::Escape(node) => self.value(&node.value.to_string(), node.meta.span, format),
+                Inline::Escape(node) => {
+                    self.value(node.value.encode_utf8(&mut [0; 4]), node.meta.span, format)
+                }
                 Inline::CharacterReference(node) => {
                     if let Some(value) = node.value() {
                         self.value(&value, node.meta.span, format);

@@ -168,10 +168,8 @@ fn markdown_typography_marks_code_blocks_separately_from_inline_code() -> io::Re
     let sections = packet
         .get(count_offset + 4..count_offset + 4 + count * 10)
         .ok_or_else(|| io::Error::other("Missing style sections"))?;
-    let flags: Vec<_> = sections
-        .chunks_exact(10)
-        .map(|section| section[8])
-        .collect();
+    let (chunks, _) = sections.as_chunks::<10>();
+    let flags: Vec<_> = chunks.iter().map(|section| section[8]).collect();
     assert!(flags.contains(&17), "block code must carry CODE|CODE_BLOCK");
     assert!(flags.contains(&1), "inline code must carry only CODE");
     assert!(flags.iter().all(|flags| flags & 16 == 0 || flags & 1 != 0));

@@ -18,20 +18,25 @@ fn write_frame(output: &mut impl Write, ticket: u64, bytes: &[u8]) -> io::Result
 fn read_frame(input: &mut impl Read) -> io::Result<(u64, Vec<u8>)> {
     let mut header = [0; HEADER_BYTES];
     input.read_exact(&mut header)?;
-    if header[..8] != REQUEST_MAGIC[..] {
+    let Some((magic, rest)) = header.split_first_chunk::<8>() else {
+        return Err(io::Error::other("Invalid Markdown frame identity"));
+    };
+    if magic[..] != REQUEST_MAGIC[..] {
         return Err(io::Error::other("Invalid Markdown frame identity"));
     }
-    let mut identity = [0; 8];
-    identity.copy_from_slice(&header[8..16]);
-    let mut length = [0; 4];
-    length.copy_from_slice(&header[16..]);
-    let length = usize::try_from(u32::from_le_bytes(length)).map_err(io::Error::other)?;
+    let Some((identity, rest)) = rest.split_first_chunk::<8>() else {
+        return Err(io::Error::other("Invalid Markdown frame identity"));
+    };
+    let Some((length, &[])) = rest.split_first_chunk::<4>() else {
+        return Err(io::Error::other("Invalid Markdown frame length"));
+    };
+    let length = usize::try_from(u32::from_le_bytes(*length)).map_err(io::Error::other)?;
     if length > super::MAX_MARKDOWN_BYTES {
         return Err(io::Error::other("Oversized Markdown frame"));
     }
     let mut bytes = vec![0; length];
     input.read_exact(&mut bytes)?;
-    Ok((u64::from_le_bytes(identity), bytes))
+    Ok((u64::from_le_bytes(*identity), bytes))
 }
 
 /// Serves bounded binary Markdown frames until input, output or parsing fails.
