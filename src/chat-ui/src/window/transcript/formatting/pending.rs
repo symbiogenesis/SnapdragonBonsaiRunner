@@ -262,14 +262,16 @@ mod tests {
         let mut transcript = Transcript::default();
         transcript.push(Role::Assistant, source.to_owned());
         transcript.messages[0].markdown.asynchronous_fixture = true;
-        let mut chat = Harness::builder().build_ui_state(
-            |ui, transcript: &mut Transcript| {
-                egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
-                    transcript.show(ui, 600.0, viewport, None, false);
-                });
-            },
-            transcript,
-        );
+        let mut chat = Harness::builder()
+            .with_context_setup(crate::window::configure_test_context)
+            .build_ui_state(
+                |ui, transcript: &mut Transcript| {
+                    egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
+                        transcript.show(ui, 600.0, viewport, None, false);
+                    });
+                },
+                transcript,
+            );
         chat.step();
         chat.step();
         chat.step();
