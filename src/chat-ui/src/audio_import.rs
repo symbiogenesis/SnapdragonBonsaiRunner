@@ -23,8 +23,23 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use windows::Win32::System::WinRT::{
-    RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize,
+use windows::{
+    Win32::{
+        Foundation::{ERROR_CANCELLED, HWND as ComHwnd},
+        System::{
+            Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree},
+            Ole::IOleWindow,
+            WinRT::{RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
+        },
+        UI::Shell::{
+            Common::COMDLG_FILTERSPEC, FDE_OVERWRITE_RESPONSE, FDE_SHAREVIOLATION_RESPONSE,
+            FDEOR_DEFAULT, FDESVR_DEFAULT, FILEOPENDIALOGOPTIONS, FOS_ALLOWMULTISELECT,
+            FOS_DONTADDTORECENT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
+            FOS_PATHMUSTEXIST, FileOpenDialog, IFileDialog, IFileDialogEvents,
+            IFileDialogEvents_Impl, IFileOpenDialog, IShellItem, SIGDN_FILESYSPATH,
+        },
+    },
+    core::{HRESULT, Interface, PWSTR, Ref, w},
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
@@ -35,15 +50,9 @@ use windows_sys::Win32::{
         Ole::CF_HDROP,
     },
     UI::{
-        Controls::Dialogs::{
-            CommDlgExtendedError, GetOpenFileNameW, OFN_DONTADDTORECENT, OFN_ENABLEHOOK,
-            OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
-        },
         Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_INSERT, VK_SHIFT},
         Shell::{DefSubclassProc, DragQueryFileW, RemoveWindowSubclass, SetWindowSubclass},
-        WindowsAndMessaging::{
-            GetParent, PostMessageW, WM_CLOSE, WM_INITDIALOG, WM_KEYDOWN, WM_NCDESTROY,
-        },
+        WindowsAndMessaging::{PostMessageW, WM_CLOSE, WM_KEYDOWN, WM_NCDESTROY},
     },
 };
 
@@ -294,16 +303,23 @@ impl Drop for Session {
         }
     }
 }
+const PICKER_UNAVAILABLE: &str =
+    "The audio file picker could not open. Try pasting a copied file instead.";
+const AUDIO_FILTER: [COMDLG_FILTERSPEC; 1] = [COMDLG_FILTERSPEC {
+    pszName: w!("Audio files (*.mp3;*.wav;*.m4a;*.aac;*.flac;*.wma)"),
+    pszSpec: w!("*.mp3;*.wav;*.m4a;*.aac;*.flac;*.wma"),
+}];
+
 fn close_dialog(dialog: isize) {
     if dialog != 0 {
-        // SAFETY: The hook publishes its picker HWND. Posting lets that thread
-        // close its dialog; no synchronous cross-thread message wait is used.
+        // SAFETY: IFileDialogEvents publishes the picker's top-level IOleWindow HWND.
+        // Posting lets that STA thread close its dialog without blocking the caller.
         unsafe { PostMessageW(dialog as HWND, WM_CLOSE, 0, 0) };
     }
 }
 fn import(
     source: Source,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     sender: &SyncSender<ImportResult>,
     next: &Receiver<()>,
 ) -> Result<(), &'static str> {
@@ -334,69 +350,198 @@ fn supported_path(path: &Path) -> bool {
                 .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
 }
-fn pick_file(owner: isize, shared: &Shared) -> Result<Option<PathBuf>, &'static str> {
-    // Shell dialogs use an STA. It is released before the codec worker's MTA.
-    let _apartment = Apartment::initialize(true)?;
-    let mut name = vec![0_u16; 32_768];
-    let filter: Vec<u16> = "Audio files (*.mp3;*.wav;*.m4a;*.aac;*.flac;*.wma)\0*.mp3;*.wav;*.m4a;*.aac;*.flac;*.wma\0\0".encode_utf16().collect();
-    let title: Vec<u16> = "Add audio prompt\0".encode_utf16().collect();
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: u32::try_from(size_of::<OPENFILENAMEW>()).map_err(|_| CODEC_FAILURE)?,
-        hwndOwner: owner as HWND,
-        lpstrFile: name.as_mut_ptr(),
-        nMaxFile: 32_768,
-        lpstrFilter: filter.as_ptr(),
-        lpstrTitle: title.as_ptr(),
-        Flags: OFN_DONTADDTORECENT
-            | OFN_ENABLEHOOK
-            | OFN_EXPLORER
-            | OFN_FILEMUSTEXIST
-            | OFN_NOCHANGEDIR
-            | OFN_PATHMUSTEXIST,
-        lpfnHook: Some(picker_hook),
-        lCustData: std::ptr::from_ref(shared) as isize,
-        ..OPENFILENAMEW::default()
-    };
-    // SAFETY: All pointers refer to owned buffers live for this synchronous call;
-    // no multiselect is requested and Shared outlives every picker hook callback.
-    let selected = unsafe { GetOpenFileNameW(&raw mut dialog) };
-    shared.dialog.store(0, Ordering::Release);
+const fn picker_options(existing: FILEOPENDIALOGOPTIONS) -> FILEOPENDIALOGOPTIONS {
+    FILEOPENDIALOGOPTIONS(
+        (existing.0
+            | FOS_DONTADDTORECENT.0
+            | FOS_FILEMUSTEXIST.0
+            | FOS_FORCEFILESYSTEM.0
+            | FOS_NOCHANGEDIR.0
+            | FOS_PATHMUSTEXIST.0)
+            & !FOS_ALLOWMULTISELECT.0,
+    )
+}
+const fn picker_cancelled_hresult() -> HRESULT {
+    HRESULT::from_win32(ERROR_CANCELLED.0)
+}
+fn classify_picker_show(
+    result: windows::core::Result<()>,
+    cancelled: bool,
+) -> Result<bool, &'static str> {
+    if cancelled {
+        return Err(CANCELLED);
+    }
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.code() == picker_cancelled_hresult() => Ok(false),
+        Err(_) => Err(PICKER_UNAVAILABLE),
+    }
+}
+struct ShellPath(PWSTR);
+impl Drop for ShellPath {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: IShellItem::GetDisplayName allocates its returned PWSTR with CoTaskMemAlloc.
+            unsafe { CoTaskMemFree(Some(self.0.0.cast())) };
+        }
+    }
+}
+#[allow(
+    trivial_casts,
+    clippy::ref_as_ptr,
+    clippy::inline_always,
+    reason = "windows-implement generates COM vtable casts and inline adapters; isolate its expansion from handwritten picker code."
+)]
+mod picker_events {
+    use super::{Arc, IFileDialogEvents, Shared};
+
+    #[windows::core::implement(IFileDialogEvents)]
+    pub(super) struct DialogEvents {
+        pub(super) shared: Arc<Shared>,
+    }
+}
+use picker_events::{DialogEvents, DialogEvents_Impl};
+
+impl DialogEvents_Impl {
+    fn observe_dialog(&self, dialog: Option<&IFileDialog>) {
+        let Some(dialog) = dialog else {
+            return;
+        };
+        if let Ok(window) = dialog.cast::<IOleWindow>() {
+            // SAFETY: The Shell dialog outlives this synchronous callback on its owning STA thread.
+            if let Ok(hwnd) = unsafe { window.GetWindow() } {
+                let raw = hwnd.0 as isize;
+                if raw != 0 {
+                    self.shared.dialog.store(raw, Ordering::Release);
+                }
+            }
+        }
+        if self.shared.cancelled.load(Ordering::Acquire) {
+            // SAFETY: Cancelling from an event callback on the owning STA thread closes the dialog cleanly.
+            let _closed = unsafe { dialog.Close(picker_cancelled_hresult()) };
+        }
+    }
+}
+#[allow(
+    non_snake_case,
+    reason = "The COM dialog events trait uses SDK method names."
+)]
+impl IFileDialogEvents_Impl for DialogEvents_Impl {
+    fn OnFileOk(&self, pfd: Ref<'_, IFileDialog>) -> windows::core::Result<()> {
+        self.observe_dialog(pfd.as_ref());
+        Ok(())
+    }
+
+    fn OnFolderChanging(
+        &self,
+        pfd: Ref<'_, IFileDialog>,
+        _psifolder: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        self.observe_dialog(pfd.as_ref());
+        Ok(())
+    }
+
+    fn OnFolderChange(&self, pfd: Ref<'_, IFileDialog>) -> windows::core::Result<()> {
+        self.observe_dialog(pfd.as_ref());
+        Ok(())
+    }
+
+    fn OnSelectionChange(&self, pfd: Ref<'_, IFileDialog>) -> windows::core::Result<()> {
+        self.observe_dialog(pfd.as_ref());
+        Ok(())
+    }
+
+    fn OnShareViolation(
+        &self,
+        pfd: Ref<'_, IFileDialog>,
+        _psi: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<FDE_SHAREVIOLATION_RESPONSE> {
+        self.observe_dialog(pfd.as_ref());
+        Ok(FDESVR_DEFAULT)
+    }
+
+    fn OnTypeChange(&self, pfd: Ref<'_, IFileDialog>) -> windows::core::Result<()> {
+        self.observe_dialog(pfd.as_ref());
+        Ok(())
+    }
+
+    fn OnOverwrite(
+        &self,
+        pfd: Ref<'_, IFileDialog>,
+        _psi: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<FDE_OVERWRITE_RESPONSE> {
+        self.observe_dialog(pfd.as_ref());
+        Ok(FDEOR_DEFAULT)
+    }
+}
+struct AdviseGuard<'a> {
+    dialog: &'a IFileOpenDialog,
+    cookie: u32,
+    shared: &'a Shared,
+}
+impl Drop for AdviseGuard<'_> {
+    fn drop(&mut self) {
+        self.shared.dialog.store(0, Ordering::Release);
+        // SAFETY: Unadvise balances the live Advise cookie on this dialog before it drops.
+        let _unadvised = unsafe { self.dialog.Unadvise(self.cookie) };
+    }
+}
+fn pick_file(owner: isize, shared: &Arc<Shared>) -> Result<Option<PathBuf>, &'static str> {
     if shared.cancelled.load(Ordering::Acquire) {
         return Err(CANCELLED);
     }
-    if selected == 0 {
-        // SAFETY: The immediately preceding common-dialog call ran on this thread.
-        return if unsafe { CommDlgExtendedError() } == 0 {
-            Ok(None)
-        } else {
-            Err("The audio file picker could not open. Try pasting a copied file instead.")
-        };
+    // Shell dialogs use an STA. It is declared first so every COM interface and
+    // Shell-allocated string drops before RoUninitialize tears down the STA.
+    let _apartment = Apartment::initialize(true)?;
+    // SAFETY: In-process COM activation on this STA-initialized worker thread.
+    let dialog: IFileOpenDialog =
+        unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|_| PICKER_UNAVAILABLE)?;
+    // SAFETY: Valid COM dialog pointer on its owning STA thread.
+    let existing = unsafe { dialog.GetOptions() }.map_err(|_| PICKER_UNAVAILABLE)?;
+    // SAFETY: Valid COM dialog pointer receiving sanitized single-file flags.
+    unsafe { dialog.SetOptions(picker_options(existing)) }.map_err(|_| PICKER_UNAVAILABLE)?;
+    // SAFETY: AUDIO_FILTER holds static UTF-16 literals valid for the dialog lifetime.
+    unsafe { dialog.SetFileTypes(&AUDIO_FILTER) }.map_err(|_| PICKER_UNAVAILABLE)?;
+    // SAFETY: Sets the active 1-based filter index after configuring AUDIO_FILTER.
+    unsafe { dialog.SetFileTypeIndex(1) }.map_err(|_| PICKER_UNAVAILABLE)?;
+    // SAFETY: Static UTF-16 dialog title remains valid for the synchronous call.
+    unsafe { dialog.SetTitle(w!("Add audio prompt")) }.map_err(|_| PICKER_UNAVAILABLE)?;
+    let events: IFileDialogEvents = DialogEvents {
+        shared: Arc::clone(shared),
     }
-    let length = name
-        .iter()
-        .position(|&unit| unit == 0)
-        .ok_or(CODEC_FAILURE)?;
-    Ok(Some(PathBuf::from(OsString::from_wide(&name[..length]))))
-}
-unsafe extern "system" fn picker_hook(
-    hwnd: HWND,
-    message: u32,
-    _: WPARAM,
-    detail: LPARAM,
-) -> usize {
-    if message == WM_INITDIALOG {
-        // SAFETY: The OS supplies our live OPENFILENAMEW with WM_INITDIALOG.
-        let dialog = unsafe { &*(detail as *const OPENFILENAMEW) };
-        // SAFETY: lCustData borrows Shared for the entire GetOpenFileNameW call.
-        let shared = unsafe { &*(dialog.lCustData as *const Shared) };
-        // SAFETY: Explorer-style hooks receive a child of the real picker dialog.
-        let parent = unsafe { GetParent(hwnd) };
-        shared.dialog.store(parent as isize, Ordering::Release);
-        if shared.cancelled.load(Ordering::Acquire) {
-            close_dialog(parent as isize);
-        }
+    .into();
+    // SAFETY: Registers live agile COM event handler for the duration of Show via AdviseGuard.
+    let cookie = unsafe { dialog.Advise(&events) }.map_err(|_| PICKER_UNAVAILABLE)?;
+    let advise_guard = AdviseGuard {
+        dialog: &dialog,
+        cookie,
+        shared,
+    };
+    if shared.cancelled.load(Ordering::Acquire) {
+        return Err(CANCELLED);
     }
-    0
+    let owner_hwnd = (owner != 0).then_some(ComHwnd(owner as *mut core::ffi::c_void));
+    // SAFETY: Modal dialog runs on its STA worker thread; owner HWND is null or caller's window.
+    let show_result = unsafe { dialog.Show(owner_hwnd) };
+    drop(advise_guard);
+    if !classify_picker_show(show_result, shared.cancelled.load(Ordering::Acquire))? {
+        return Ok(None);
+    }
+    // SAFETY: Show returned S_OK with FOS_FILEMUSTEXIST and single selection enforced.
+    let item: IShellItem = unsafe { dialog.GetResult() }.map_err(|_| CODEC_FAILURE)?;
+    // SAFETY: Valid IShellItem; ShellPath frees the returned CoTaskMemAlloc string on drop.
+    let path_ptr =
+        ShellPath(unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.map_err(|_| CODEC_FAILURE)?);
+    if path_ptr.0.is_null() {
+        return Err(CODEC_FAILURE);
+    }
+    // SAFETY: Non-null NUL-terminated UTF-16 buffer owned by ShellPath through this slice read.
+    let wide = unsafe { path_ptr.0.as_wide() };
+    if wide.is_empty() {
+        return Err(CODEC_FAILURE);
+    }
+    Ok(Some(PathBuf::from(OsString::from_wide(wide))))
 }
 struct Clipboard;
 impl Drop for Clipboard {
@@ -587,8 +732,11 @@ fn check_memory(required: u64) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANCELLED, CHUNK_WORKING_BYTES, Chunk, ImportResult, MAX_SAMPLES, MEMORY_FAILURE, Ordering,
-        Session, Shared, admit_memory, decode_chunks, media_duration, supported_path,
+        CANCELLED, CHUNK_WORKING_BYTES, Chunk, FILEOPENDIALOGOPTIONS, FOS_ALLOWMULTISELECT,
+        FOS_DONTADDTORECENT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
+        FOS_PATHMUSTEXIST, HRESULT, ImportResult, MAX_SAMPLES, MEMORY_FAILURE, Ordering,
+        PICKER_UNAVAILABLE, Session, Shared, admit_memory, classify_picker_show, decode_chunks,
+        media_duration, picker_cancelled_hresult, picker_options, supported_path,
     };
     use std::{
         io,
@@ -597,6 +745,7 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+    use windows::Win32::UI::Shell::FOS_STRICTFILETYPES;
     #[test]
     fn formats_are_case_insensitive_and_audio_only() {
         for name in [
@@ -823,6 +972,44 @@ mod tests {
         assert_eq!(extra_decode, Err(mpsc::RecvTimeoutError::Timeout));
         assert!(decoded.try_recv().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn picker_options_and_cancellation_classification_preserve_single_file_contract() {
+        let options = picker_options(FILEOPENDIALOGOPTIONS(
+            FOS_ALLOWMULTISELECT.0 | FOS_STRICTFILETYPES.0,
+        ));
+        assert!(options.contains(FOS_DONTADDTORECENT));
+        assert!(options.contains(FOS_FILEMUSTEXIST));
+        assert!(options.contains(FOS_FORCEFILESYSTEM));
+        assert!(options.contains(FOS_NOCHANGEDIR));
+        assert!(options.contains(FOS_PATHMUSTEXIST));
+        assert!(options.contains(FOS_STRICTFILETYPES));
+        assert!(!options.contains(FOS_ALLOWMULTISELECT));
+
+        assert_eq!(classify_picker_show(Ok(()), false), Ok(true));
+        assert_eq!(
+            classify_picker_show(
+                Err(windows::core::Error::from(picker_cancelled_hresult())),
+                false
+            ),
+            Ok(false)
+        );
+        assert_eq!(classify_picker_show(Ok(()), true), Err(CANCELLED));
+        assert_eq!(
+            classify_picker_show(
+                Err(windows::core::Error::from(picker_cancelled_hresult())),
+                true
+            ),
+            Err(CANCELLED)
+        );
+        assert_eq!(
+            classify_picker_show(
+                Err(windows::core::Error::from(HRESULT(-2_147_467_259))),
+                false
+            ),
+            Err(PICKER_UNAVAILABLE)
+        );
     }
 
     #[test]
