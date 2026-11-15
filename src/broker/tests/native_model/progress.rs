@@ -261,23 +261,6 @@ impl Drop for Receipt<'_> {
 
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "The parent and sibling acceptance modules share only this bounded observer."
-)]
-pub(super) async fn exchange(
-    port: u16,
-    credential: &str,
-    body: &Value,
-    evidence: &Path,
-    report: &mut Value,
-    label: &str,
-) -> Vec<u8> {
-    try_exchange(port, credential, body, evidence, report, label)
-        .await
-        .unwrap()
-}
-
-#[expect(
-    clippy::redundant_pub_crate,
     reason = "Sibling acceptance code retains transport failure before performing owned cleanup."
 )]
 pub(super) async fn try_exchange(

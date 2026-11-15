@@ -1309,8 +1309,6 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 - [ ] Update unfulfilled `#[expect(clippy::used_underscore_binding)]` attributes in
   [credentials tests](src/windows-credentials/src/tests.rs) under `nightly-2026-11-12`.
-- [ ] Gate or wire up unused `pub(super) async fn exchange` in
-  [broker progress helper](src/broker/tests/native_model/progress.rs).
 
 ## Survey ideas outside the current laptop backlog
 
