@@ -6,10 +6,36 @@
 )]
 
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{self, Read},
+    os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::Path,
 };
+
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// Opens an existing regular, non-reparse file without following leaf symlinks, returning `None`
+/// when `path` does not exist.
+pub(crate) fn open_regular_optional(path: &Path) -> io::Result<Option<File>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Target must be an ordinary non-reparse file.",
+        ));
+    }
+    Ok(Some(file))
+}
 
 /// Read at most one byte past the limit; `None` means the input exceeded it.
 pub(crate) fn read(reader: impl Read, limit: u64) -> io::Result<Option<Vec<u8>>> {
@@ -18,6 +44,15 @@ pub(crate) fn read(reader: impl Read, limit: u64) -> io::Result<Option<Vec<u8>>>
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)?;
     Ok((u64::try_from(bytes.len()).map_err(io::Error::other)? <= limit).then_some(bytes))
+}
+
+/// Reads at most `limit` bytes from a regular non-reparse file if it exists (`FILE_FLAG_OPEN_REPARSE_POINT`).
+/// Returns `Ok(None)` when missing or when `bytes.len() > limit`.
+pub(crate) fn read_regular_optional(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let Some(file) = open_regular_optional(path)? else {
+        return Ok(None);
+    };
+    read(file, limit)
 }
 
 /// Decode bounded UTF-8 output with the owning worker's overflow diagnostic.
@@ -107,6 +142,29 @@ mod tests {
             .err()
             .ok_or_else(|| io::Error::other("Missing input was accepted"))?;
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        std::fs::remove_dir(directory)
+    }
+
+    #[test]
+    fn regular_optional_reads_bounded_file_handles_absent_oversize_and_rejects_directories()
+    -> io::Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("BonsaiBoundedReg-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&directory)?;
+        let missing = directory.join("missing.bin");
+        assert_eq!(read_regular_optional(&missing, 8)?, None);
+
+        let file = directory.join("data.bin");
+        std::fs::write(&file, b"abcd")?;
+        assert_eq!(read_regular_optional(&file, 4)?, Some(b"abcd".to_vec()));
+        assert_eq!(read_regular_optional(&file, 3)?, None);
+        assert!(read_regular_optional(&directory, 8).is_err());
+
+        std::fs::remove_file(file)?;
         std::fs::remove_dir(directory)
     }
 }

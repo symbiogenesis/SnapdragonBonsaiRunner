@@ -1,18 +1,7 @@
 //! Encrypted device-wide preferences, independent of conversation saving.
-use super::{State, VOICE_LIMIT};
+use super::{State, VOICE_LIMIT, coalescing_store::CoalescingStore};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    io,
-    path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
-};
+use std::{io, path::Path, time::Duration};
 
 const MAX_BYTES: usize = 8_192;
 const MAX_SEALED: u64 = 73_728;
@@ -30,51 +19,22 @@ pub(super) struct Opened {
     load_failed: bool,
 }
 
-pub(super) struct Store {
-    latest: Option<String>,
-    pending: Arc<Mutex<Option<String>>>,
-    wake: Option<SyncSender<()>>,
-    failed: Arc<AtomicBool>,
-    retry: Arc<AtomicBool>,
-    last_attempt: Instant,
-    worker: Option<JoinHandle<()>>,
-}
+pub(super) struct Store(CoalescingStore<String>);
 
 impl Store {
     pub(super) fn open(data: &Path) -> io::Result<Opened> {
         let path = data.join("chat-profile.dpapi");
         bonsai_windows_credentials::validate_external_path(&path)?;
         let (saved, load_failed) = read(&path).map_or((None, true), |saved| (saved, false));
-        let pending = Arc::new(Mutex::new(None::<String>));
-        let queued = Arc::clone(&pending);
-        let failed = Arc::new(AtomicBool::new(false));
-        let reported = Arc::clone(&failed);
-        let retry = Arc::new(AtomicBool::new(false));
-        let retry_requested = Arc::clone(&retry);
-        let (wake, incoming) = mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("swift-chat-profile".to_owned())
-            .spawn(move || {
-                while incoming.recv().is_ok() {
-                    let voice = queued.lock().ok().and_then(|mut pending| pending.take());
-                    if let Some(voice) = voice
-                        && save(&path, &voice).is_err()
-                    {
-                        reported.store(true, Ordering::Release);
-                        retry_requested.store(true, Ordering::Release);
-                    }
-                }
-            })?;
+        let store = CoalescingStore::spawn(
+            "swift-chat-profile",
+            "Profile saving worker stopped.",
+            saved.clone(),
+            Some(Duration::from_secs(3)),
+            move |voice| save(&path, &voice),
+        )?;
         Ok(Opened {
-            store: Self {
-                latest: saved.clone(),
-                pending,
-                wake: Some(wake),
-                failed,
-                retry,
-                last_attempt: Instant::now(),
-                worker: Some(worker),
-            },
+            store: Self(store),
             saved,
             load_failed,
         })
@@ -84,38 +44,11 @@ impl Store {
         if voice.chars().count() > VOICE_LIMIT {
             return Err(io::Error::other("Voice profile exceeds its size limit."));
         }
-        if self.latest.as_deref() == Some(voice)
-            && (!self.retry.load(Ordering::Acquire)
-                || self.last_attempt.elapsed() < Duration::from_secs(3))
-        {
-            return Ok(());
-        }
-        self.retry.store(false, Ordering::Release);
-        *self
-            .pending
-            .lock()
-            .map_err(|_| io::Error::other("Profile saving worker stopped."))? =
-            Some(voice.to_owned());
-        if let Some(wake) = &self.wake {
-            match wake.try_send(()) {
-                Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
-                Err(mpsc::TrySendError::Disconnected(())) => {
-                    return Err(io::Error::other("Profile saving worker stopped."));
-                }
-            }
-        }
-        self.latest = Some(voice.to_owned());
-        self.last_attempt = Instant::now();
-        Ok(())
-    }
-}
-
-impl Drop for Store {
-    fn drop(&mut self) {
-        self.wake.take();
-        if let Some(worker) = self.worker.take() {
-            let _joined = worker.join();
-        }
+        self.0.queue_by(
+            voice,
+            |latest, candidate| latest == candidate,
+            str::to_owned,
+        )
     }
 }
 
@@ -128,7 +61,7 @@ impl State {
                 } else if opened.load_failed {
                     // Establish a baseline without replacing unreadable bytes.
                     // Only a subsequent explicit voice edit may replace them.
-                    opened.store.latest = Some(self.voice_profile.clone());
+                    opened.store.0.set_latest(Some(self.voice_profile.clone()));
                     self.record("Could not restore your voice profile. The existing file is preserved until you change the voice in Settings.");
                 }
                 // Missing profiles migrate the voice restored from older workspaces.
@@ -143,7 +76,7 @@ impl State {
         let Some(store) = &mut self.profile_store else {
             return;
         };
-        let failed = store.failed.swap(false, Ordering::Acquire);
+        let failed = store.0.take_error();
         if store.queue(&self.voice_profile).is_err() || failed {
             self.record(
                 "Could not save your voice profile. Your conversations are saved separately.",
@@ -153,10 +86,8 @@ impl State {
 }
 
 fn read(path: &Path) -> io::Result<Option<String>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(file) = crate::bounded_file::open_regular_optional(path)? else {
+        return Ok(None);
     };
     let sealed = crate::bounded_file::read(file, MAX_SEALED)?
         .ok_or_else(|| io::Error::other("Saved profile exceeds its storage bound."))?;
@@ -208,7 +139,7 @@ mod tests {
     }
 
     fn state() -> State {
-        let (commands, _incoming) = mpsc::channel();
+        let (commands, _incoming) = std::sync::mpsc::channel();
         let (_events, incoming) = crate::client::event_channel();
         let mut state = State::create(commands, incoming, None, None);
         state.preview = false;

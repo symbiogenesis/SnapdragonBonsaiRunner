@@ -8,7 +8,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek as _, Write},
     os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -351,10 +351,8 @@ fn set_saving_disabled(lock: &mut File, disabled: bool) -> io::Result<()> {
 }
 
 fn read(path: &Path) -> io::Result<Option<crate::scrub::ScrubbingBytes>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(file) = crate::bounded_file::open_regular_optional(path)? else {
+        return Ok(None);
     };
     if file.metadata()?.len() > MAX_SEALED {
         return Err(io::Error::other(
@@ -379,40 +377,19 @@ fn save(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
         .map_err(|error| Failure::at("checking the storage path", &error))?;
     let sealed = bonsai_windows_credentials::protect_private_data(bytes)
         .map_err(|error| Failure::at("encrypting the workspace", &error))?;
-    let temporary = temporary_path(path);
-    bonsai_windows_credentials::validate_external_path(&temporary)
-        .map_err(|error| Failure::at("checking the temporary storage path", &error))?;
-    // A unique create-new sibling receives ciphertext only. The old recovery
-    // file survives failed encryption/writes and is replaced only after sync.
-    let mut created = false;
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| Failure::at("creating the encrypted snapshot", &error))?;
-        created = true;
-        file.write_all(&sealed)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| Failure::at("writing the encrypted snapshot", &error))?;
-        drop(file);
-        bonsai_windows_credentials::validate_external_path(path)
-            .map_err(|error| Failure::at("checking the storage path", &error))?;
-        fs::rename(&temporary, path)
-            .map_err(|error| Failure::at("replacing the encrypted snapshot", &error))
-    })();
-    if result.is_err() && created {
-        let _removed = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    path.with_extension(format!("{}.{stamp}.pending", std::process::id()))
+    // A unique create-new sibling receives ciphertext only; atomic replacement
+    // preserves the prior snapshot on any write/sync/revalidation failure.
+    crate::window::atomic_file::replace_staged(path, &sealed).map_err(|failure| {
+        use crate::window::atomic_file::Stage;
+        let stage = match failure.stage {
+            Stage::ValidatePath | Stage::RevalidatePath => "checking the storage path",
+            Stage::ValidateTemporary => "checking the temporary storage path",
+            Stage::CreateTemporary => "creating the encrypted snapshot",
+            Stage::WriteTemporary => "writing the encrypted snapshot",
+            Stage::Replace => "replacing the encrypted snapshot",
+        };
+        Failure::at(stage, &failure.error)
+    })
 }
 
 fn erase(path: &Path) -> io::Result<()> {

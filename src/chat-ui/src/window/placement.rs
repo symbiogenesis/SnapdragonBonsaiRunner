@@ -1,18 +1,11 @@
 //! Native window geometry, saved independently of encrypted conversation content.
 
-use super::State;
+use super::{State, coalescing_store::CoalescingStore};
 use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::File,
     io,
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
-    },
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
@@ -84,11 +77,7 @@ impl Saved {
 
 pub(super) struct Placement {
     restored: Option<Saved>,
-    latest: Option<Saved>,
-    pending: Arc<Mutex<Option<Saved>>>,
-    wake: Option<SyncSender<()>>,
-    failed: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    store: CoalescingStore<Saved>,
     last_observed: Option<Instant>,
 }
 
@@ -97,28 +86,16 @@ impl Placement {
         let path = data.join("chat-window.json");
         bonsai_windows_credentials::validate_external_path(&path)?;
         let restored = read(&path).unwrap_or_default();
-        let pending = Arc::new(Mutex::new(None));
-        let queued = Arc::clone(&pending);
-        let failed = Arc::new(AtomicBool::new(false));
-        let reported = Arc::clone(&failed);
-        let (wake, incoming) = mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("swift-chat-window".to_owned())
-            .spawn(move || {
-                while incoming.recv().is_ok() {
-                    let saved = queued.lock().ok().and_then(|mut pending| pending.take());
-                    if let Some(saved) = saved {
-                        reported.store(save(&path, saved).is_err(), Ordering::Release);
-                    }
-                }
-            })?;
+        let store = CoalescingStore::spawn(
+            "swift-chat-window",
+            "Window saving worker stopped.",
+            restored,
+            None,
+            move |saved| save(&path, saved),
+        )?;
         Ok(Self {
             restored,
-            latest: restored,
-            pending,
-            wake: Some(wake),
-            failed,
-            worker: Some(worker),
+            store,
             last_observed: None,
         })
     }
@@ -172,33 +149,13 @@ impl Placement {
     }
 
     fn queue(&mut self, saved: Saved) -> io::Result<()> {
-        if self.latest == Some(saved) {
-            return Ok(());
-        }
-        *self
-            .pending
-            .lock()
-            .map_err(|_| io::Error::other("Window saving worker stopped."))? = Some(saved);
-        self.latest = Some(saved);
-        if let Some(wake) = &self.wake {
-            let _queued = wake.try_send(());
-        }
-        Ok(())
+        self.store.queue(saved)
     }
 }
 
 // Integer-to-pointer conversion is confined to the audited native call sites.
 const fn hwnd(value: isize) -> HWND {
     std::ptr::without_provenance_mut(value.cast_unsigned())
-}
-
-impl Drop for Placement {
-    fn drop(&mut self) {
-        self.wake.take();
-        if let Some(worker) = self.worker.take() {
-            let _joined = worker.join();
-        }
-    }
 }
 
 impl State {
@@ -222,9 +179,9 @@ impl State {
 
     pub(super) fn poll_placement(&mut self, frame: &eframe::Frame, closing: bool) {
         if let Some(placement) = &mut self.placement {
-            let write_failed = placement.failed.swap(false, Ordering::Acquire);
+            let write_failed = placement.store.take_error();
             if write_failed {
-                placement.latest = None;
+                placement.store.set_latest(None);
             }
             let failed = placement.observe(frame, closing).is_err() || write_failed;
             if failed {
@@ -237,12 +194,7 @@ impl State {
 }
 
 fn read(path: &Path) -> io::Result<Option<Saved>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let Some(bytes) = crate::bounded_file::read(file, MAX_BYTES)? else {
+    let Some(bytes) = crate::bounded_file::read_regular_optional(path, MAX_BYTES)? else {
         return Ok(None);
     };
     Ok(serde_json::from_slice::<Saved>(&bytes)

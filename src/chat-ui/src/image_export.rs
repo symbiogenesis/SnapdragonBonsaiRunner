@@ -317,7 +317,7 @@ fn await_raster(
 }
 
 fn write_export(path: &Path, bytes: &[u8]) -> Outcome {
-    match atomic_file::replace(path, bytes) {
+    match atomic_file::replace_user_export_file(path, bytes) {
         Ok(()) => Outcome::Saved(path.to_path_buf()),
         Err(_) => Outcome::Failed(SAVE_WRITE_FAILED),
     }
@@ -551,6 +551,38 @@ mod tests {
         assert!(service.unavailable());
         assert!(!svg_target.exists());
         assert_eq!(fs::read_dir(&dir)?.count(), 0);
+        fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn svg_export_supports_git_directories_percent_names_and_multi_dot_extensions() -> io::Result<()>
+    {
+        let dir = unique_test_dir("win11-path")?;
+        let git_dir = dir.join(".git");
+        fs::create_dir(&git_dir)?;
+        let target = git_dir.join("budget 100%.v2.svg");
+        let svg: Arc<str> = Arc::from(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="#2a9d8f"/></svg>"##,
+        );
+        let ctx = egui::Context::default();
+        let mut export = Export::start_with_selection(
+            &ctx,
+            Selection {
+                path: target.clone(),
+                format: Format::Svg,
+            },
+            Arc::clone(&svg),
+        )?;
+        match wait_outcome(&mut export) {
+            Outcome::Saved(saved) => assert_eq!(saved, target),
+            _ => {
+                return Err(io::Error::other(
+                    "expected Saved outcome for .git/%/multi-dot export",
+                ));
+            }
+        }
+        assert_eq!(fs::read_to_string(&target)?, &*svg);
+        assert_eq!(fs::read_dir(&git_dir)?.count(), 1);
         fs::remove_dir_all(dir)
     }
 }

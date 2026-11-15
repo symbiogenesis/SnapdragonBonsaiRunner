@@ -1,19 +1,8 @@
 //! Device-wide reading preferences, independent of conversation recovery.
-use super::{egui, platform};
+use super::{coalescing_store::CoalescingStore, egui, platform};
 use egui::{Color32, FontId};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    io,
-    path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
-};
+use std::{io, path::Path, time::Duration};
 
 const MAX_BYTES: u64 = 4_096;
 
@@ -185,101 +174,39 @@ struct Saved {
     preferences: Preferences,
 }
 
-pub(super) struct Store {
-    latest: Preferences,
-    pending: Arc<Mutex<Option<Preferences>>>,
-    wake: Option<SyncSender<()>>,
-    failed: Arc<AtomicBool>,
-    retry: Arc<AtomicBool>,
-    last_attempt: Instant,
-    worker: Option<JoinHandle<()>>,
-}
+pub(super) struct Store(CoalescingStore<Preferences>);
 
 impl Store {
     pub(super) fn open(data: &Path) -> io::Result<(Self, Preferences)> {
         let path = data.join("chat-appearance.json");
         bonsai_windows_credentials::validate_external_path(&path)?;
         let preferences = read(&path).unwrap_or_default();
-        let pending = Arc::new(Mutex::new(None));
-        let queued = Arc::clone(&pending);
-        let failed = Arc::new(AtomicBool::new(false));
-        let reported = Arc::clone(&failed);
-        let retry = Arc::new(AtomicBool::new(false));
-        let retry_requested = Arc::clone(&retry);
-        let (wake, incoming) = mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("swift-chat-appearance".to_owned())
-            .spawn(move || {
-                while incoming.recv().is_ok() {
-                    let preferences = queued.lock().ok().and_then(|mut pending| pending.take());
-                    if let Some(preferences) = preferences
-                        && save(&path, preferences).is_err()
-                    {
-                        reported.store(true, Ordering::Release);
-                        retry_requested.store(true, Ordering::Release);
-                    }
-                }
-            })?;
-        Ok((
-            Self {
-                latest: preferences,
-                pending,
-                wake: Some(wake),
-                failed,
-                retry,
-                last_attempt: Instant::now(),
-                worker: Some(worker),
-            },
-            preferences,
-        ))
+        let store = CoalescingStore::spawn(
+            "swift-chat-appearance",
+            "Appearance saving worker stopped.",
+            Some(preferences),
+            Some(Duration::from_secs(3)),
+            move |preferences| save(&path, preferences),
+        )?;
+        Ok((Self(store), preferences))
     }
 
     pub(super) fn queue(&mut self, preferences: Preferences) -> io::Result<()> {
         if !preferences.valid() {
             return Err(io::Error::other("Invalid appearance preferences."));
         }
-        if preferences == self.latest
-            && (!self.retry.load(Ordering::Acquire)
-                || self.last_attempt.elapsed() < Duration::from_secs(3))
-        {
-            return Ok(());
-        }
-        self.retry.store(false, Ordering::Release);
-        *self
-            .pending
-            .lock()
-            .map_err(|_| io::Error::other("Appearance saving worker stopped."))? =
-            Some(preferences);
-        if let Some(wake) = &self.wake {
-            match wake.try_send(()) {
-                Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
-                Err(mpsc::TrySendError::Disconnected(())) => {
-                    return Err(io::Error::other("Appearance saving worker stopped."));
-                }
-            }
-        }
-        self.latest = preferences;
-        self.last_attempt = Instant::now();
-        Ok(())
+        self.0.queue(preferences)
     }
 
     pub(super) fn take_error(&self) -> bool {
-        self.failed.swap(false, Ordering::Acquire)
-    }
-}
-
-impl Drop for Store {
-    fn drop(&mut self) {
-        self.wake.take();
-        if let Some(worker) = self.worker.take() {
-            let _joined = worker.join();
-        }
+        self.0.take_error()
     }
 }
 
 fn read(path: &Path) -> io::Result<Preferences> {
-    let bytes = crate::bounded_file::read(File::open(path)?, MAX_BYTES)?
-        .ok_or_else(|| io::Error::other("Appearance settings exceed their size limit."))?;
+    let bytes = crate::bounded_file::read_regular_optional(path, MAX_BYTES)?.ok_or_else(|| {
+        io::Error::other("Appearance settings are unavailable or exceed their size limit.")
+    })?;
     let saved: Saved = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     if saved.version != 1 || !saved.preferences.valid() {
         return Err(io::Error::other("Invalid appearance settings."));

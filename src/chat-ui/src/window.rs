@@ -23,6 +23,7 @@ mod audio_files;
 #[cfg(test)]
 mod background_tests;
 mod branding;
+mod coalescing_store;
 mod composer;
 mod composer_insertion;
 #[cfg(test)]
