@@ -17,14 +17,17 @@ pub(super) struct HeaderEnd {
 impl HeaderEnd {
     /// Receives the same growing buffer until its first complete header ending.
     pub(super) fn find(&mut self, bytes: &[u8]) -> Option<usize> {
-        for (offset, window) in bytes[self.next..].array_windows().enumerate() {
+        let window = &bytes[self.next..];
+        if let Some(offset) = memchr::memmem::find(window, b"\r\n\r\n") {
             #[cfg(test)]
             {
-                self.comparisons += 1;
+                self.comparisons += offset + 1;
             }
-            if window == b"\r\n\r\n" {
-                return Some(self.next + offset + 4);
-            }
+            return Some(self.next + offset + 4);
+        }
+        #[cfg(test)]
+        {
+            self.comparisons += window.len().saturating_sub(3);
         }
         // Only these trailing bytes can begin a delimiter spanning the next read.
         self.next = bytes.len().saturating_sub(3);

@@ -143,10 +143,7 @@ impl<F: FnMut(&mut [u8]) -> Result<usize>> Buffered<F> {
         }
         let available = &self.buffer[self.start..self.end];
         let bounded = &available[..available.len().min(MAX_HEAD)];
-        if let Some(offset) = bounded
-            .array_windows()
-            .position(|window| window == b"\r\n\r\n")
-        {
+        if let Some(offset) = memchr::memmem::find(bounded, b"\r\n\r\n") {
             let end = self.start + offset + 4;
             let head = &self.buffer[self.start..end];
             self.start = end;

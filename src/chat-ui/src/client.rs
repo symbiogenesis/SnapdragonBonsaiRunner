@@ -1304,10 +1304,7 @@ fn read_head<R: Read>(reader: &mut BufReader<R>) -> Result<(Framing, ResponseKin
         return Err(Failure::Message(LOCAL_CONNECTION_CLOSED));
     }
     let window = &available[..available.len().min(MAX_HEAD)];
-    if let Some(offset) = window
-        .array_windows()
-        .position(|bytes| bytes == b"\r\n\r\n")
-    {
+    if let Some(offset) = memchr::memmem::find(window, b"\r\n\r\n") {
         let end = offset + 4;
         let parsed = parse_head(&window[..end]);
         reader.consume(end);
