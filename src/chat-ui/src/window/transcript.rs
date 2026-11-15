@@ -819,7 +819,7 @@ impl Message {
         let code_panels = formatting::code_panels(&body);
         (body, layout.source_map, code_panels)
     }
-    fn height(&self) -> f32 {
+    pub(super) fn height(&self) -> f32 {
         let Some(cache) = &self.cache else {
             return self.measured_height.unwrap_or(100.0);
         };
