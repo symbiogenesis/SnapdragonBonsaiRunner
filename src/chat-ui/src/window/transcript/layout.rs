@@ -277,17 +277,11 @@ impl Transcript {
         if cache.body_revision != message.body_revision {
             return None;
         }
-        let display = cache.source_map.offset(matched.start);
-        let characters = cache.body.job.text.get(..display)?.chars().count();
         Some(
             MESSAGE_INSET.y
                 + MESSAGE_ACTION_SIZE
                 + MESSAGE_CONTENT_GAP
-                + cache
-                    .body
-                    .pos_from_cursor(egui::text::CCursor::new(characters))
-                    .center()
-                    .y,
+                + cache.text_offset_y(matched.start)?,
         )
     }
 
@@ -532,8 +526,9 @@ mod tests {
         assert_eq!(message.body.get(target.range.clone()), Some("needle"));
         assert!(message.cache.as_ref().is_some_and(|cache| {
             cache.selected.as_ref() == Some(&target.range)
-                && cache.body.job.text == message.body
-                && !cache.underline.is_empty()
+                && cache.first_text().is_some_and(|text| {
+                    text.body.job.text == message.body && !text.underline.is_empty()
+                })
         }));
         let bytes = serde_json::to_value(transcript);
         assert!(bytes.is_ok_and(|value| value.as_object().is_some_and(|object| object.len() == 1)));
@@ -617,17 +612,14 @@ mod tests {
         let cursor_y = |scene: &Scene| -> Result<f32, &'static str> {
             let message = &scene.transcript.messages[10];
             let cache = message.cache.as_ref().ok_or("Expected Find galley")?;
-            let display = cache.source_map.offset(target.range.start);
-            let characters = cache.body.job.text[..display].chars().count();
+            let offset_y = cache
+                .text_offset_y(target.range.start)
+                .ok_or("Expected Find cursor offset")?;
             Ok(top(scene, 10)
                 + MESSAGE_INSET.y
                 + MESSAGE_ACTION_SIZE
                 + MESSAGE_CONTENT_GAP
-                + cache
-                    .body
-                    .pos_from_cursor(egui::text::CCursor::new(characters))
-                    .center()
-                    .y)
+                + offset_y)
         };
         let before = cursor_y(chat.state())?;
         assert!((0.0..320.0).contains(&before));

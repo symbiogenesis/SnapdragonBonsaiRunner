@@ -6,15 +6,36 @@ use super::{
 use std::{ops::Range, sync::Arc};
 
 const MAGIC: &[u8; 4] = b"BMD1";
+const MAGIC_SEGMENTED: &[u8; 4] = b"BMD2";
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SVG_IMAGES: usize = 8;
+const MAX_SEGMENTS: usize = 2 * MAX_SVG_IMAGES + 1;
 const SECTION_BYTES: usize = 10;
 const MAPPING_BYTES: usize = 17;
+const SEGMENT_TEXT: u8 = 0;
+const SEGMENT_IMAGE: u8 = 1;
 const CODE: u8 = 1;
 const ITALIC: u8 = 2;
 const STRONG: u8 = 4;
 const STRIKE: u8 = 8;
 const CODE_BLOCK: u8 = 16;
 const KNOWN_FLAGS: u8 = CODE | ITALIC | STRONG | STRIKE | CODE_BLOCK;
+
+#[derive(Clone)]
+pub(super) struct ImageBlock {
+    pub(super) source_range: Range<usize>,
+    pub(super) intrinsic_width: f32,
+    pub(super) intrinsic_height: f32,
+}
+
+pub(super) enum Segment {
+    Text(Layout),
+    Image(ImageBlock),
+}
+
+pub(in crate::window::transcript) struct Document {
+    pub(super) segments: Vec<Segment>,
+}
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -33,8 +54,12 @@ impl<'a> Reader<'a> {
         self.take(1)?.first().copied()
     }
 
+    fn bits(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
     fn count(&mut self) -> Option<usize> {
-        usize::try_from(u32::from_le_bytes(self.take(4)?.try_into().ok()?)).ok()
+        usize::try_from(self.bits()?).ok()
     }
 
     fn range(&mut self) -> Option<Range<usize>> {
@@ -174,22 +199,21 @@ fn content_range(text: &str, range: &Range<usize>, previous_end: usize) -> bool 
         && text.is_char_boundary(range.end)
 }
 
-/// The trusted decoder accepts no native objects, coordinates, actionable
-/// paths/URLs or arbitrary style parameters. All strings remain display text.
-/// Source maps establish safe offsets, not truth of an untrusted parser's
-/// Markdown interpretation or normalized content.
-pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Layout> {
-    if source.len() > MAX_MARKDOWN_BYTES || bytes.len() > MAX_FRAME_BYTES {
-        return None;
-    }
-    let mut reader = Reader { bytes, position: 0 };
-    if reader.take(MAGIC.len())? != MAGIC {
-        return None;
-    }
+fn decode_text_segment(
+    source: &str,
+    reader: &mut Reader<'_>,
+    visuals: &egui::Visuals,
+    previous_source_end: &mut usize,
+    rendered_bytes: &mut usize,
+    span_count: &mut usize,
+    text_budget: usize,
+    aggregate_spans: bool,
+) -> Option<Layout> {
     let text_len = reader.count()?;
     // An untrusted worker cannot inflate hundreds of tiny messages to a MiB
     // each. This also bounds aggregate parsed text by retained source bytes.
-    if text_len > MAX_RENDERED_BYTES || text_len > source.len().saturating_mul(4) {
+    *rendered_bytes = rendered_bytes.checked_add(text_len)?;
+    if *rendered_bytes > text_budget {
         return None;
     }
     let text = std::str::from_utf8(reader.take(text_len)?).ok()?;
@@ -202,7 +226,6 @@ pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Layout> {
     {
         return None;
     }
-    let visuals = egui::Visuals::dark();
     let mut job = egui::text::LayoutJob {
         text: String::with_capacity(text_len),
         sections: Vec::with_capacity(section_count),
@@ -216,7 +239,7 @@ pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Layout> {
         if range.start != display_end || !content_range(text, &range, display_end) {
             return None;
         }
-        let format = text_format(flags, size, &visuals)?;
+        let format = text_format(flags, size, visuals)?;
         job.append(text.get(range.clone())?, 0.0, format);
         display_end = range.end;
     }
@@ -225,12 +248,19 @@ pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Layout> {
     }
     let mapping_count = reader.count()?;
     if mapping_count > MAX_STYLE_SPANS
-        || reader.remaining() != mapping_count.checked_mul(MAPPING_BYTES)?
+        || reader.remaining() < mapping_count.checked_mul(MAPPING_BYTES)?
     {
         return None;
     }
+    if aggregate_spans {
+        *span_count = span_count
+            .checked_add(section_count)?
+            .checked_add(mapping_count)?;
+        if *span_count > MAX_STYLE_SPANS {
+            return None;
+        }
+    }
     let mut entries = Vec::with_capacity(mapping_count);
-    let mut previous_source_end = 0;
     let mut previous_display_end = 0;
     for _ in 0..mapping_count {
         let source_range = reader.range()?;
@@ -240,13 +270,13 @@ pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Layout> {
             1 => true,
             _ => return None,
         };
-        if !content_range(source, &source_range, previous_source_end)
+        if !content_range(source, &source_range, *previous_source_end)
             || !content_range(text, &display_range, previous_display_end)
             || (verbatim && source.get(source_range.clone())? != text.get(display_range.clone())?)
         {
             return None;
         }
-        previous_source_end = source_range.end;
+        *previous_source_end = source_range.end;
         previous_display_end = display_range.end;
         entries.push(Mapping {
             source: source_range,
@@ -263,6 +293,104 @@ pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Layout> {
     })
 }
 
+fn decode_image_segment(
+    source: &str,
+    reader: &mut Reader<'_>,
+    previous_source_end: &mut usize,
+    images: &mut usize,
+) -> Option<ImageBlock> {
+    if *images >= MAX_SVG_IMAGES {
+        return None;
+    }
+    *images += 1;
+    let source_range = reader.range()?;
+    let intrinsic_width = f32::from_bits(reader.bits()?);
+    let intrinsic_height = f32::from_bits(reader.bits()?);
+    if !content_range(source, &source_range, *previous_source_end)
+        || !intrinsic_width.is_finite()
+        || !intrinsic_height.is_finite()
+        || intrinsic_width <= 0.0
+        || intrinsic_height <= 0.0
+    {
+        return None;
+    }
+    *previous_source_end = source_range.end;
+    Some(ImageBlock {
+        source_range,
+        intrinsic_width,
+        intrinsic_height,
+    })
+}
+
+/// The trusted decoder accepts no native objects, coordinates, actionable
+/// paths/URLs or arbitrary style parameters. All strings remain display text.
+/// Source maps establish safe offsets, not truth of an untrusted parser's
+/// Markdown interpretation or normalized content.
+pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Document> {
+    if source.len() > MAX_MARKDOWN_BYTES || bytes.len() > MAX_FRAME_BYTES {
+        return None;
+    }
+    let mut reader = Reader { bytes, position: 0 };
+    let magic = reader.take(MAGIC.len())?;
+    let visuals = egui::Visuals::dark();
+    let text_budget = MAX_RENDERED_BYTES.min(source.len().saturating_mul(4));
+    let mut previous_source_end = 0;
+    let mut rendered_bytes = 0;
+    let mut span_count = 0;
+    if magic == MAGIC {
+        let layout = decode_text_segment(
+            source,
+            &mut reader,
+            &visuals,
+            &mut previous_source_end,
+            &mut rendered_bytes,
+            &mut span_count,
+            text_budget,
+            false,
+        )?;
+        if reader.remaining() != 0 {
+            return None;
+        }
+        return Some(Document {
+            segments: vec![Segment::Text(layout)],
+        });
+    }
+    if magic != MAGIC_SEGMENTED {
+        return None;
+    }
+    let segment_count = reader.count()?;
+    if segment_count == 0 || segment_count > MAX_SEGMENTS {
+        return None;
+    }
+    let mut images = 0;
+    let mut segments = Vec::with_capacity(segment_count);
+    for _ in 0..segment_count {
+        match reader.byte()? {
+            SEGMENT_TEXT => segments.push(Segment::Text(decode_text_segment(
+                source,
+                &mut reader,
+                &visuals,
+                &mut previous_source_end,
+                &mut rendered_bytes,
+                &mut span_count,
+                text_budget,
+                true,
+            )?)),
+            SEGMENT_IMAGE => segments.push(Segment::Image(decode_image_segment(
+                source,
+                &mut reader,
+                &mut previous_source_end,
+                &mut images,
+            )?)),
+            _ => return None,
+        }
+    }
+    if reader.remaining() != 0 {
+        return None;
+    }
+    Some(Document { segments })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,9 +398,27 @@ mod tests {
     type Section = (u32, u32, u8, u8);
     type Map = (u32, u32, u32, u32, u8);
 
-    fn packet(text: &str, sections: &[Section], mappings: &[Map]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"BMD1");
+    enum TestSegment<'a> {
+        Text {
+            text: &'a str,
+            sections: &'a [Section],
+            mappings: &'a [Map],
+        },
+        Image {
+            source: Range<u32>,
+            width: f32,
+            height: f32,
+        },
+    }
+
+    fn first_text(document: Document) -> Option<Layout> {
+        match document.segments.into_iter().next()? {
+            Segment::Text(layout) => Some(layout),
+            Segment::Image(_) => None,
+        }
+    }
+
+    fn push_text_body(bytes: &mut Vec<u8>, text: &str, sections: &[Section], mappings: &[Map]) {
         bytes.extend_from_slice(&u32::try_from(text.len()).unwrap_or_default().to_le_bytes());
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(
@@ -296,6 +442,44 @@ mod tests {
             }
             bytes.push(*verbatim);
         }
+    }
+
+    fn packet(text: &str, sections: &[Section], mappings: &[Map]) -> Vec<u8> {
+        let mut bytes = Vec::from(*b"BMD1");
+        push_text_body(&mut bytes, text, sections, mappings);
+        bytes
+    }
+
+    fn bmd2_packet(segments: &[TestSegment<'_>]) -> Vec<u8> {
+        let mut bytes = Vec::from(*b"BMD2");
+        bytes.extend_from_slice(
+            &u32::try_from(segments.len())
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        for segment in segments {
+            match segment {
+                TestSegment::Text {
+                    text,
+                    sections,
+                    mappings,
+                } => {
+                    bytes.push(SEGMENT_TEXT);
+                    push_text_body(&mut bytes, text, sections, mappings);
+                }
+                TestSegment::Image {
+                    source,
+                    width,
+                    height,
+                } => {
+                    bytes.push(SEGMENT_IMAGE);
+                    bytes.extend_from_slice(&source.start.to_le_bytes());
+                    bytes.extend_from_slice(&source.end.to_le_bytes());
+                    bytes.extend_from_slice(&width.to_bits().to_le_bytes());
+                    bytes.extend_from_slice(&height.to_bits().to_le_bytes());
+                }
+            }
+        }
         bytes
     }
 
@@ -311,11 +495,15 @@ mod tests {
     fn markdown_wire_round_trip_preserves_unicode_styles_and_normalized_maps()
     -> Result<(), &'static str> {
         let source = "**界** &amp;";
-        let first = decode(source, &fixture()).ok_or("Valid independent fixture was rejected.")?;
+        let first = decode(source, &fixture())
+            .and_then(first_text)
+            .ok_or("Valid independent fixture was rejected.")?;
         assert_eq!(first.job.text, "界 &");
         assert_eq!(first.source_map.range(2..5), 0..3);
         assert_eq!(first.source_map.range(8..13), 4..5);
-        let second = decode(source, &encode(&first)).ok_or("Encoded layout was rejected.")?;
+        let second = decode(source, &encode(&first))
+            .and_then(first_text)
+            .ok_or("Encoded layout was rejected.")?;
         assert_eq!(second.job.text, first.job.text);
         assert_eq!(second.job.sections, first.job.sections);
         assert_eq!(second.source_map.entries.len(), 3);
@@ -382,7 +570,9 @@ mod tests {
             assert!(decode("heading", &bytes).is_some());
         }
         let bytes = packet("code", &[(0, 4, CODE | CODE_BLOCK, 16)], &[(0, 4, 0, 4, 1)]);
-        let layout = decode("code", &bytes).ok_or("Valid block style rejected")?;
+        let layout = decode("code", &bytes)
+            .and_then(first_text)
+            .ok_or("Valid block style rejected")?;
         assert_eq!(
             layout.job.sections[0].format.font_id.family,
             egui::FontFamily::Name(super::super::presentation::CODE_BLOCK.into())
@@ -425,5 +615,92 @@ mod tests {
             assert!(decode("ab", &packet("ab", &[(0, 2, 0, 16)], &maps)).is_none());
         }
         assert!(decode("", &packet("injected", &[(0, 8, 0, 16)], &[])).is_none());
+    }
+
+    #[test]
+    fn markdown_bmd2_decodes_segmented_images_and_rejects_invalid_segments()
+    -> Result<(), &'static str> {
+        let source = "Hi\n\n```svg\n<svg/>\n```\n\nBye";
+        let image_start = u32::try_from("Hi\n\n".len()).map_err(|_| "offset overflow")?;
+        let image_end = image_start
+            + u32::try_from("```svg\n<svg/>\n```".len()).map_err(|_| "offset overflow")?;
+        let bye_start = image_end + 2;
+        let bye_end = u32::try_from(source.len()).map_err(|_| "offset overflow")?;
+        let valid = bmd2_packet(&[
+            TestSegment::Text {
+                text: "Hi",
+                sections: &[(0, 2, 0, 16)],
+                mappings: &[(0, 2, 0, 2, 1)],
+            },
+            TestSegment::Image {
+                source: image_start..image_end,
+                width: 320.0,
+                height: 240.0,
+            },
+            TestSegment::Text {
+                text: "Bye",
+                sections: &[(0, 3, 0, 16)],
+                mappings: &[(bye_start, bye_end, 0, 3, 1)],
+            },
+        ]);
+        let doc = decode(source, &valid).ok_or("Valid BMD2 document rejected")?;
+        assert_eq!(doc.segments.len(), 3);
+        assert!(matches!(
+            &doc.segments[1],
+            Segment::Image(image)
+                if &source[image.source_range.clone()] == "```svg\n<svg/>\n```"
+                    && (image.intrinsic_width - 320.0).abs() < f32::EPSILON
+                    && (image.intrinsic_height - 240.0).abs() < f32::EPSILON
+        ));
+
+        // Non-monotonic text after image must fail.
+        assert!(
+            decode(
+                source,
+                &bmd2_packet(&[
+                    TestSegment::Image {
+                        source: image_start..image_end,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                    TestSegment::Text {
+                        text: "Hi",
+                        sections: &[(0, 2, 0, 16)],
+                        mappings: &[(0, 2, 0, 2, 1)],
+                    },
+                ])
+            )
+            .is_none()
+        );
+
+        // Non-finite, zero, negative, and > MAX_SVG_IMAGES segments must fail.
+        for bad_dims in [
+            (0.0, 100.0),
+            (100.0, -1.0),
+            (f32::NAN, 100.0),
+            (100.0, f32::INFINITY),
+        ] {
+            assert!(
+                decode(
+                    source,
+                    &bmd2_packet(&[TestSegment::Image {
+                        source: image_start..image_end,
+                        width: bad_dims.0,
+                        height: bad_dims.1,
+                    }])
+                )
+                .is_none()
+            );
+        }
+        assert!(decode(source, &bmd2_packet(&[])).is_none());
+        let too_many_segments: Vec<_> = (0..18)
+            .map(|_| TestSegment::Text {
+                text: "",
+                sections: &[],
+                mappings: &[],
+            })
+            .collect();
+        assert!(decode(source, &bmd2_packet(&too_many_segments)).is_none());
+        Ok(())
     }
 }

@@ -39,6 +39,9 @@ mod graphics;
 mod history_search;
 #[cfg(test)]
 mod history_search_tests;
+mod image_cache;
+#[cfg(test)]
+mod image_ui_tests;
 #[cfg(test)]
 mod interaction_tests;
 mod iteration;
@@ -203,6 +206,7 @@ struct State {
     show_audio_transcript: bool,
     native_owner: Option<isize>,
     audio_paste: Option<crate::audio_import::PasteHook>,
+    image_cache: image_cache::ImageCache,
     speech_output: bool,
     canary_configured: bool,
     tts_configured: bool,
@@ -351,6 +355,7 @@ impl State {
             show_audio_transcript: false,
             native_owner: None,
             audio_paste: None,
+            image_cache: image_cache::ImageCache::default(),
             speech_output: false,
             canary_configured: false,
             tts_configured: false,
@@ -2027,6 +2032,7 @@ impl State {
             self.speaking_message,
             self.speech_output,
             Some(controls),
+            Some(&mut self.image_cache),
         ) {
             Some(transcript::TranscriptAction::ReadAloud(id)) => self.toggle_read_aloud(id),
             Some(transcript::TranscriptAction::Message(action)) => self.message_action(action),
@@ -2129,6 +2135,7 @@ impl State {
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
+        self.image_cache.poll(ui.ctx());
         // Disable the workspace on the first modal frame too: egui's modal
         // focus layer is otherwise inherited only from the preceding pass.
         let drawer = self.sidebar_open && ui.available_width() < navigation::DOCK_THRESHOLD;
@@ -2270,6 +2277,7 @@ impl eframe::App for State {
         self.poll_recovery();
         self.poll_appearance(ctx);
         self.poll_profile();
+        self.image_cache.poll(ctx);
         if self.last_theme_check.elapsed() >= Duration::from_secs(1) {
             self.appearance.apply(ctx);
             self.last_theme_check = Instant::now();
@@ -2278,6 +2286,7 @@ impl eframe::App for State {
         // WinRT state machine is polled only during an explicit capture session.
         let active_generation = !self.preview && self.model.busy();
         let waiting = active_generation
+            || self.image_cache.has_pending()
             || (!self.preview
                 && (self.model.waiting_model()
                     || self.speaking

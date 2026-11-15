@@ -289,13 +289,6 @@ pub(super) fn strip_svg_fences(text: &str) -> String {
 /// If `text` currently ends inside an unclosed top-level ```` ```svg ```` / ```` ~~~svg ````
 /// block, returns `(visible_prefix, true)` where `visible_prefix` is the slice of `text`
 /// preceding the unclosed SVG fence line. Otherwise returns `(text, false)`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Consumed by streaming image placeholder layout in the UI layer."
-    )
-)]
 pub(super) fn split_streaming_svg(text: &str) -> (&str, bool) {
     let mut state = FenceState::Outside;
     let mut offset = 0usize;

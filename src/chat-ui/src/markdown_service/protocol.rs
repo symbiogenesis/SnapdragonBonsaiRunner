@@ -1,11 +1,12 @@
 //! Fixed bounded framing, independent of the untrusted parser's output format.
-use super::{MAX_OUTPUT_BYTES, Request, Ticket};
+use super::{MAX_OUTPUT_BYTES, Request, RequestKind, Ticket, raster::MAX_RASTER_OUTPUT_BYTES};
 use std::{
     io::{self, Read, Write},
     sync::mpsc::{Receiver, SyncSender},
 };
 
-const REQUEST_MAGIC: &[u8; 8] = b"BSMD0001";
+const MARKDOWN_REQUEST_MAGIC: &[u8; 8] = b"BSMD0001";
+const RASTER_REQUEST_MAGIC: &[u8; 8] = b"BSMG0001";
 const RESPONSE_MAGIC: &[u8; 8] = b"BSMR0001";
 const HEADER_BYTES: usize = 20;
 
@@ -25,6 +26,27 @@ fn write_frame(
     output.write_all(&ticket.0.to_le_bytes())?;
     output.write_all(&length.to_le_bytes())?;
     output.write_all(bytes)?;
+    output.flush()
+}
+
+fn write_raster_frame(
+    output: &mut impl Write,
+    ticket: Ticket,
+    max_width: u32,
+    max_height: u32,
+    svg: &[u8],
+) -> io::Result<()> {
+    let payload_len = svg
+        .len()
+        .checked_add(8)
+        .ok_or_else(|| io::Error::other("Oversized SVG raster frame"))?;
+    let length = u32::try_from(payload_len).map_err(io::Error::other)?;
+    output.write_all(RASTER_REQUEST_MAGIC)?;
+    output.write_all(&ticket.0.to_le_bytes())?;
+    output.write_all(&length.to_le_bytes())?;
+    output.write_all(&max_width.to_le_bytes())?;
+    output.write_all(&max_height.to_le_bytes())?;
+    output.write_all(svg)?;
     output.flush()
 }
 
@@ -69,17 +91,35 @@ pub(super) fn exchange(
         return;
     }
     while let Ok(request) = commands.recv() {
-        if write_frame(
-            &mut input,
-            REQUEST_MAGIC,
-            request.ticket,
-            request.source.as_bytes(),
-        )
-        .is_err()
-        {
+        let (wrote, max_output) = match &request.kind {
+            RequestKind::Markdown(source) => (
+                write_frame(
+                    &mut input,
+                    MARKDOWN_REQUEST_MAGIC,
+                    request.ticket,
+                    source.as_bytes(),
+                ),
+                MAX_OUTPUT_BYTES,
+            ),
+            RequestKind::Rasterize {
+                max_width,
+                max_height,
+                svg,
+            } => (
+                write_raster_frame(
+                    &mut input,
+                    request.ticket,
+                    *max_width,
+                    *max_height,
+                    svg.as_bytes(),
+                ),
+                MAX_RASTER_OUTPUT_BYTES,
+            ),
+        };
+        if wrote.is_err() {
             return;
         }
-        let Ok((ticket, bytes)) = read_frame(&mut output, RESPONSE_MAGIC, MAX_OUTPUT_BYTES) else {
+        let Ok((ticket, bytes)) = read_frame(&mut output, RESPONSE_MAGIC, max_output) else {
             return;
         };
         if ticket != request.ticket || events.send(Event::Response(ticket, bytes)).is_err() {
@@ -130,7 +170,7 @@ mod tests {
         commands
             .send(Request {
                 ticket: Ticket(1),
-                source: Arc::from("界"),
+                kind: RequestKind::Markdown(Arc::from("界")),
             })
             .map_err(io::Error::other)?;
         drop(commands);
@@ -144,8 +184,50 @@ mod tests {
         );
         assert!(matches!(received.try_recv(), Ok(Event::Ready)));
         assert!(received.try_recv().is_err());
-        let mut expected = header(REQUEST_MAGIC, 1, 3);
+        let mut expected = header(MARKDOWN_REQUEST_MAGIC, 1, 3);
         expected.extend_from_slice("界".as_bytes());
+        assert_eq!(requests, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn markdown_protocol_frames_svg_raster_requests_and_large_responses() -> io::Result<()> {
+        let payload = vec![0x5A_u8; MAX_OUTPUT_BYTES + 64];
+        let payload_len = u32::try_from(payload.len()).map_err(io::Error::other)?;
+        let mut responses = header(RESPONSE_MAGIC, 0, 0);
+        responses.extend_from_slice(&header(RESPONSE_MAGIC, 7, payload_len));
+        responses.extend_from_slice(&payload);
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let svg = "<svg/>";
+        commands
+            .send(Request {
+                ticket: Ticket(7),
+                kind: RequestKind::Rasterize {
+                    max_width: 512,
+                    max_height: 256,
+                    svg: Arc::from(svg),
+                },
+            })
+            .map_err(io::Error::other)?;
+        drop(commands);
+        let (events, received) = mpsc::sync_channel(2);
+        let mut requests = Vec::new();
+        exchange(
+            &mut requests,
+            &mut Cursor::new(responses),
+            &receiver,
+            &events,
+        );
+        assert!(matches!(received.try_recv(), Ok(Event::Ready)));
+        let Ok(Event::Response(ticket, body)) = received.try_recv() else {
+            return Err(io::Error::other("Missing raster response"));
+        };
+        assert_eq!(ticket, Ticket(7));
+        assert_eq!(body, payload);
+        let mut expected = header(RASTER_REQUEST_MAGIC, 7, 8 + 6);
+        expected.extend_from_slice(&512_u32.to_le_bytes());
+        expected.extend_from_slice(&256_u32.to_le_bytes());
+        expected.extend_from_slice(svg.as_bytes());
         assert_eq!(requests, expected);
         Ok(())
     }

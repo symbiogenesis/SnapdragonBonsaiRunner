@@ -1,11 +1,11 @@
 //! Per-message asynchronous parser state. Production never parses in the UI.
-use super::{Layout, MAX_MARKDOWN_BYTES, egui, wire};
+use super::{MAX_MARKDOWN_BYTES, egui, wire};
 use std::sync::Arc;
 
 #[derive(Default)]
 pub(in crate::window::transcript) struct Pending {
     revision: Option<u64>,
-    parsed: Option<Arc<Layout>>,
+    parsed: Option<Arc<wire::Document>>,
     parsed_source: Option<Arc<str>>,
     failed: bool,
     cleanup_failed: bool,
@@ -21,7 +21,7 @@ impl Pending {
     pub(in crate::window::transcript) fn parsed_for(
         &self,
         source: &str,
-    ) -> Option<(&Layout, usize)> {
+    ) -> Option<(&wire::Document, usize)> {
         let parsed = self.parsed.as_deref()?;
         let prefix = self.parsed_source.as_deref()?;
         source.starts_with(prefix).then_some((parsed, prefix.len()))
@@ -44,6 +44,16 @@ impl Pending {
             self.ticket_source = None;
             self.request_source = None;
             return true;
+        }
+        if self.parsed_source.as_deref() == Some(source) {
+            self.request_source = None;
+            self.failed = false;
+            return false;
+        }
+        if self.ticket_source.as_deref() == Some(source) {
+            self.request_source = None;
+            self.failed = false;
+            return false;
         }
         let preserves_parsed = self
             .parsed_source
@@ -84,6 +94,12 @@ impl Pending {
             return false;
         }
         self.revision = Some(revision);
+        if !source.is_empty()
+            && source.len() <= MAX_MARKDOWN_BYTES
+            && self.parsed_source.as_deref() == Some(source)
+        {
+            return false;
+        }
         // Headless UI fixtures exercise the same validated DTO without starting
         // real sandboxes. Native containment remains an independent gate.
         let layout = (source.len() <= MAX_MARKDOWN_BYTES)
@@ -292,7 +308,8 @@ mod tests {
                 chat.state().transcript.messages[0]
                     .cache
                     .as_ref()
-                    .map(|cache| cache.body.job.text.as_str()),
+                    .and_then(crate::window::transcript::LayoutCache::first_text)
+                    .map(|text| text.body.job.text.as_str()),
                 Some(source)
             );
             assert!(
@@ -328,7 +345,8 @@ mod tests {
                 message
                     .cache
                     .as_ref()
-                    .map(|cache| cache.body.job.text.as_str()),
+                    .and_then(crate::window::transcript::LayoutCache::first_text)
+                    .map(|text| text.body.job.text.as_str()),
                 Some(if failed {
                     source
                 } else {

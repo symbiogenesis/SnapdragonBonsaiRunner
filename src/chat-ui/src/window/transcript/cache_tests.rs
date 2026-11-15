@@ -94,15 +94,18 @@ fn markdown_code_surfaces_reflow_with_unicode_and_preserve_find() -> std::io::Re
             .cache
             .as_ref()
             .ok_or_else(|| std::io::Error::other("Missing formatted cache"))?;
-        assert_eq!(before.code_panels.len(), 2);
-        assert!(before.code_panels.iter().all(|panel| {
+        let before_text = before
+            .first_text()
+            .ok_or_else(|| std::io::Error::other("Missing formatted text segment"))?;
+        assert_eq!(before_text.code_panels.len(), 2);
+        assert!(before_text.code_panels.iter().all(|panel| {
             panel.is_finite()
                 && panel.left() == 0.0
                 && panel.width() == before.width
                 && panel.height() >= 24.0
         }));
-        assert!(before.code_panels[0].height() > before.code_panels[1].height());
-        let panels = before.code_panels.clone();
+        assert!(before_text.code_panels[0].height() > before_text.code_panels[1].height());
+        let panels = before_text.code_panels.clone();
         if let Some(directory) = &capture {
             chat.render()
                 .map_err(std::io::Error::other)?
@@ -114,7 +117,11 @@ fn markdown_code_surfaces_reflow_with_unicode_and_preserve_find() -> std::io::Re
         let message = &chat.state().messages[0];
         assert_eq!(message.body, source);
         assert_eq!(
-            message.cache.as_ref().map(|cache| &cache.code_panels),
+            message
+                .cache
+                .as_ref()
+                .and_then(LayoutCache::first_text)
+                .map(|text| &text.code_panels),
             Some(&panels)
         );
         assert_active_underline_matches_glyphs(message);
@@ -250,20 +257,25 @@ fn reader_size_reflows_styled_text_reasoning_and_find_once() {
         assert!(message.cache.is_some(), "Expected a reader layout cache");
         return;
     };
-    assert!(cache.body.job.text.contains("Heading 界"));
-    assert!(cache.body.job.text.contains("Use needle here."));
-    assert!(!cache.body.job.text.contains('`'));
+    let Some(text) = cache.first_text() else {
+        assert!(
+            cache.first_text().is_some(),
+            "Expected text segment in cache"
+        );
+        return;
+    };
+    assert!(text.body.job.text.contains("Heading 界"));
+    assert!(text.body.job.text.contains("Use needle here."));
+    assert!(!text.body.job.text.contains('`'));
     assert!(
-        cache
-            .body
+        text.body
             .job
             .sections
             .iter()
             .any(|section| { section.format.font_id == FontId::monospace(24.0) })
     );
     assert!(
-        cache
-            .body
+        text.body
             .job
             .sections
             .iter()
@@ -400,7 +412,8 @@ fn highlighted_layout_cache_keeps_constant_size_keys_during_streaming_and_naviga
     let body = chat.state().messages[0]
         .cache
         .as_ref()
-        .map(|cache| Arc::clone(&cache.body));
+        .and_then(LayoutCache::first_text)
+        .map(|text| Arc::clone(&text.body));
     let underline_layouts = chat.state().messages[0].underline_layouts;
     chat.state_mut().search.active = highlights - 1;
     chat.state_mut().search.revision += 1;
@@ -419,11 +432,12 @@ fn highlighted_layout_cache_keeps_constant_size_keys_during_streaming_and_naviga
             .cache
             .as_ref()
             .is_some_and(|cache| {
-                body.as_ref()
-                    .is_some_and(|body| Arc::ptr_eq(body, &cache.body))
-                    && cache.selected.as_ref()
-                        == Some(&((highlights - 1) * 4..(highlights - 1) * 4 + 3))
-                    && !cache.underline.is_empty()
+                body.as_ref().is_some_and(|body| {
+                    cache.first_text().is_some_and(|text| {
+                        Arc::ptr_eq(body, &text.body) && !text.underline.is_empty()
+                    })
+                }) && cache.selected.as_ref()
+                    == Some(&((highlights - 1) * 4..(highlights - 1) * 4 + 3))
             })
     );
     chat.run();
@@ -446,19 +460,23 @@ fn assert_active_underline_matches_glyphs(message: &Message) {
         assert!(cache.selected.is_some(), "Expected an active Find result");
         return;
     };
-    let selected = cache.source_map.range(selected.clone());
-    let start = cache.body.job.text[..selected.start].chars().count();
-    let end = start + cache.body.job.text[selected].chars().count();
+    let Some(text) = cache.first_text() else {
+        assert!(cache.first_text().is_some(), "Expected text segment");
+        return;
+    };
+    let selected = text.source_map.range(selected.clone());
+    let start = text.body.job.text[..selected.start].chars().count();
+    let end = start + text.body.job.text[selected].chars().count();
     let stroke = egui::Stroke::new(2.0, cache.highlight_color);
     let mut offset = 0;
     let mut selected_glyphs = 0;
-    for row in &cache.body.rows {
+    for row in &text.body.rows {
         for (index, glyph) in row.glyphs.iter().enumerate() {
             let mut y = glyph.logical_rect().bottom();
             stroke.round_center_to_pixel(cache.pixels_per_point, &mut y);
             let left = egui::pos2(glyph.pos.x, y) + row.pos.to_vec2();
             let right = egui::pos2(glyph.max_x(), y) + row.pos.to_vec2();
-            let underlined = cache.underline.iter().any(|line| {
+            let underlined = text.underline.iter().any(|line| {
                 line[0].y.to_bits() == left.y.to_bits()
                     && line[0].x <= left.x
                     && line[1].x >= right.x
@@ -475,8 +493,8 @@ fn assert_active_underline_matches_glyphs(message: &Message) {
         }
         offset += row.char_count_including_newline().0;
     }
-    assert_ne!(cache.underline.len(), 0);
-    assert!(cache.underline.len() <= selected_glyphs);
+    assert_ne!(text.underline.len(), 0);
+    assert!(text.underline.len() <= selected_glyphs);
 }
 
 #[test]
@@ -491,30 +509,31 @@ fn markdown_find_maps_unicode_source_and_reuses_display_layout_on_navigation()
     assert_eq!(chat.state().search.matches.len(), 2);
     let message = &chat.state().messages[0];
     let cache = message.cache.as_ref().ok_or("Expected rendered layout")?;
+    let text = cache.first_text().ok_or("Expected text segment")?;
     assert_eq!(message.body, source);
     assert!(chat.state().plain_text().contains(source));
-    assert!(cache.body.job.text.contains("A needle 🌱 and needle 界."));
-    assert!(!cache.body.job.text.contains("**"));
-    assert!(!cache.body.job.text.contains('`'));
+    assert!(text.body.job.text.contains("A needle 🌱 and needle 界."));
+    assert!(!text.body.job.text.contains("**"));
+    assert!(!text.body.job.text.contains('`'));
     for found in &chat.state().search.matches {
         assert_eq!(source.get(found.range.clone()), Some("needle"));
         assert_eq!(
-            cache
-                .body
+            text.body
                 .job
                 .text
-                .get(cache.source_map.range(found.range.clone())),
+                .get(text.source_map.range(found.range.clone())),
             Some("needle")
         );
     }
     assert_active_underline_matches_glyphs(message);
-    let galley = Arc::clone(&cache.body);
+    let galley = Arc::clone(&text.body);
     let initial_underlines = message.underline_layouts;
     chat.state_mut().search.active = 1;
     chat.run();
     let message = &chat.state().messages[0];
     let cache = message.cache.as_ref().ok_or("Expected retained layout")?;
-    assert!(Arc::ptr_eq(&galley, &cache.body));
+    let text = cache.first_text().ok_or("Expected retained text segment")?;
+    assert!(Arc::ptr_eq(&galley, &text.body));
     assert_eq!(message.body_layouts, 1);
     assert_eq!(message.underline_layouts, initial_underlines + 1);
     assert_active_underline_matches_glyphs(message);
@@ -537,9 +556,10 @@ fn active_find_underline_maps_unicode_wrapping_and_newlines_without_relayout() {
         chat.state().messages[0]
             .cache
             .as_ref()
-            .is_some_and(|cache| {
-                cache.underline.len() >= 3
-                    && cache
+            .and_then(LayoutCache::first_text)
+            .is_some_and(|text| {
+                text.underline.len() >= 3
+                    && text
                         .body
                         .job
                         .sections
@@ -598,7 +618,12 @@ fn find_sync_live_query_refreshes_highlights_without_resetting_unchanged_matches
         chat.state().messages[0]
             .cache
             .as_ref()
-            .is_some_and(|cache| { cache.highlights.count == 0 && cache.underline.is_empty() })
+            .is_some_and(|cache| {
+                cache.highlights.count == 0
+                    && cache
+                        .first_text()
+                        .is_some_and(|text| text.underline.is_empty())
+            })
     );
 }
 
@@ -683,7 +708,12 @@ fn highlight_identity_tracks_same_length_queries_replacement_and_result_eviction
         chat.state().messages[0]
             .cache
             .as_ref()
-            .is_some_and(|cache| { cache.selected.is_none() && cache.underline.is_empty() })
+            .is_some_and(|cache| {
+                cache.selected.is_none()
+                    && cache
+                        .first_text()
+                        .is_some_and(|text| text.underline.is_empty())
+            })
     );
     assert!(
         chat.state().messages[1]
@@ -714,10 +744,12 @@ fn highlight_identity_tracks_same_length_queries_replacement_and_result_eviction
     chat.run();
     assert_eq!(layout_counts(chat.state()), vec![3, 4]);
     assert!(chat.state().messages.iter().all(|message| {
-        message
-            .cache
-            .as_ref()
-            .is_some_and(|cache| cache.highlights.count == 0 && cache.underline.is_empty())
+        message.cache.as_ref().is_some_and(|cache| {
+            cache.highlights.count == 0
+                && cache
+                    .first_text()
+                    .is_some_and(|text| text.underline.is_empty())
+        })
     }));
     chat.state_mut().search.query = "cat".to_owned();
     chat.state_mut().search.invalidate();
