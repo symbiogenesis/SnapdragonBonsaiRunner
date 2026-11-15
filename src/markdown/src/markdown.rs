@@ -61,7 +61,7 @@ impl Builder<'_> {
                     }
                 }
                 Block::CodeBlock(node) => {
-                    let mut code = Self::code_format(format);
+                    let mut code = self.code_format(format);
                     // A finite wire flag lets the trusted UI distinguish a
                     // code surface from an inline monospace span.
                     code.font_id.family = egui::FontFamily::Name("Bonsai Code Block".into());
@@ -131,7 +131,7 @@ impl Builder<'_> {
         }
     }
 
-    fn code_format(format: &egui::TextFormat) -> egui::TextFormat {
+    fn code_format(&self, format: &egui::TextFormat) -> egui::TextFormat {
         let mut code = format.clone();
         code.font_id = egui::FontId::monospace(format.font_id.size);
         code.background = self.visuals.code_bg_color;
@@ -170,7 +170,7 @@ impl Builder<'_> {
                     self.inlines(&node.children, &deleted);
                 }
                 Inline::Code(node) => {
-                    let code = Self::code_format(format);
+                    let code = self.code_format(format);
                     let span = node.meta.span.and_then(|span| {
                         let source = self.source.get(span.start..span.end)?;
                         let width = source.bytes().take_while(|byte| *byte == b'`').count();

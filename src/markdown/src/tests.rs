@@ -91,7 +91,7 @@ fn worker_rejects_invalid_frames_before_emitting_any_rendered_response() -> io::
 }
 
 #[test]
-fn markdown_typography_preserves_six_heading_levels_and_inline_code_size() {
+fn markdown_typography_preserves_six_heading_levels_and_inline_code_size() -> io::Result<()> {
     let source = "# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six\n\n# `heading_code`\n\nBody `body_code`";
     let layout = parse_layout(source);
     for (needle, size) in [
@@ -104,16 +104,23 @@ fn markdown_typography_preserves_six_heading_levels_and_inline_code_size() {
         ("heading_code", 28.0),
         ("body_code", 16.0),
     ] {
-        let offset = egui::text::ByteIndex(layout.job.text.find(needle).expect("heading text"));
+        let offset = egui::text::ByteIndex(
+            layout
+                .job
+                .text
+                .find(needle)
+                .ok_or_else(|| io::Error::other("Missing heading text"))?,
+        );
         let format = layout.job.format_at_byte(offset);
         assert_eq!(format.font_id.size.to_bits(), size.to_bits(), "{needle}");
     }
     // All admitted heading sizes must survive the worker's closed wire format.
     assert!(!parse(source).is_empty());
+    Ok(())
 }
 
 #[test]
-fn markdown_typography_prefixes_quote_lines_and_indents_nested_lists() {
+fn markdown_typography_prefixes_quote_lines_and_indents_nested_lists() -> io::Result<()> {
     let source =
         "> First\n> second\n>\n> Third\n>\n>> Nested\n\n- Parent\n  - Child\n    - Grandchild";
     let layout = parse_layout(source);
@@ -132,24 +139,35 @@ fn markdown_typography_prefixes_quote_lines_and_indents_nested_lists() {
         assert!(pair[0].source.end <= pair[1].source.start);
         assert!(pair[0].display.end <= pair[1].display.start);
     }
-    let first = egui::text::ByteIndex(layout.job.text.find("First").expect("quote text"));
+    let first = egui::text::ByteIndex(
+        layout
+            .job
+            .text
+            .find("First")
+            .ok_or_else(|| io::Error::other("Missing quote text"))?,
+    );
     assert!(!layout.job.format_at_byte(first).italics);
     assert!(!parse(source).is_empty());
+    Ok(())
 }
 
 #[test]
-fn markdown_typography_marks_code_blocks_separately_from_inline_code() {
+fn markdown_typography_marks_code_blocks_separately_from_inline_code() -> io::Result<()> {
     let source = "```rust\nlet first = 1;\nlet second = 2;\n```\n\nUse `inline`.";
     let layout = parse_layout(source);
     let packet = parse(source);
     let count_offset = 8 + layout.job.text.len();
     let count = usize::try_from(u32::from_le_bytes(
-        packet[count_offset..count_offset + 4]
+        packet
+            .get(count_offset..count_offset + 4)
+            .ok_or_else(|| io::Error::other("Missing section count"))?
             .try_into()
-            .expect("section count"),
+            .map_err(io::Error::other)?,
     ))
-    .expect("native section count");
-    let sections = &packet[count_offset + 4..count_offset + 4 + count * 10];
+    .map_err(io::Error::other)?;
+    let sections = packet
+        .get(count_offset + 4..count_offset + 4 + count * 10)
+        .ok_or_else(|| io::Error::other("Missing style sections"))?;
     let flags: Vec<_> = sections
         .chunks_exact(10)
         .map(|section| section[8])
@@ -163,4 +181,5 @@ fn markdown_typography_marks_code_blocks_separately_from_inline_code() {
             layout.job.text.get(mapping.display.clone())
         );
     }
+    Ok(())
 }
