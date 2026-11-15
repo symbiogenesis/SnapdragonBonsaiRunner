@@ -1,10 +1,24 @@
-//! Fixed binary framing for the persistent offline worker.
+//! Fixed binary framing for the persistent offline parser and SVG rasterizer worker.
 use std::io::{self, Read, Write};
 
-const REQUEST_MAGIC: &[u8; 8] = b"BSMD0001";
+const MARKDOWN_MAGIC: &[u8; 8] = b"BSMD0001";
+const RASTER_MAGIC: &[u8; 8] = b"BSMG0001";
 const RESPONSE_MAGIC: &[u8; 8] = b"BSMR0001";
 const HEADER_BYTES: usize = 20;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RASTER_REQUEST_BYTES: usize = 8 + super::svg::MAX_SVG_BYTES;
+// Four bytes per pixel (premultiplied RGBA8) plus the 13-byte BMG1 header.
+const MAX_RASTER_OUTPUT_BYTES: usize =
+    super::svg::RASTER_HEADER_BYTES + super::svg::MAX_RASTER_PIXELS * 4;
+
+enum RequestKind {
+    Markdown(String),
+    Rasterize {
+        max_width: u32,
+        max_height: u32,
+        svg: String,
+    },
+}
 
 fn write_frame(output: &mut impl Write, ticket: u64, bytes: &[u8]) -> io::Result<()> {
     let length = u32::try_from(bytes.len()).map_err(io::Error::other)?;
@@ -15,31 +29,63 @@ fn write_frame(output: &mut impl Write, ticket: u64, bytes: &[u8]) -> io::Result
     output.flush()
 }
 
-fn read_frame(input: &mut impl Read) -> io::Result<(u64, Vec<u8>)> {
+fn read_frame(input: &mut impl Read) -> io::Result<(u64, RequestKind)> {
     let mut header = [0; HEADER_BYTES];
     input.read_exact(&mut header)?;
     let Some((magic, rest)) = header.split_first_chunk::<8>() else {
         return Err(io::Error::other("Invalid Markdown frame identity"));
     };
-    if magic[..] != REQUEST_MAGIC[..] {
+    let is_markdown = magic[..] == MARKDOWN_MAGIC[..];
+    let is_raster = !is_markdown && magic[..] == RASTER_MAGIC[..];
+    if !is_markdown && !is_raster {
         return Err(io::Error::other("Invalid Markdown frame identity"));
     }
     let Some((identity, rest)) = rest.split_first_chunk::<8>() else {
         return Err(io::Error::other("Invalid Markdown frame identity"));
     };
+    let ticket = u64::from_le_bytes(*identity);
+    if ticket == 0 {
+        return Err(io::Error::other("Invalid Markdown request identity"));
+    }
     let Some((length, &[])) = rest.split_first_chunk::<4>() else {
         return Err(io::Error::other("Invalid Markdown frame length"));
     };
     let length = usize::try_from(u32::from_le_bytes(*length)).map_err(io::Error::other)?;
-    if length > super::MAX_MARKDOWN_BYTES {
+    let limit = if is_markdown {
+        super::MAX_MARKDOWN_BYTES
+    } else {
+        MAX_RASTER_REQUEST_BYTES
+    };
+    if length > limit || (is_raster && length < 8) {
         return Err(io::Error::other("Oversized Markdown frame"));
     }
     let mut bytes = vec![0; length];
     input.read_exact(&mut bytes)?;
-    Ok((u64::from_le_bytes(*identity), bytes))
+    if is_markdown {
+        let source = String::from_utf8(bytes).map_err(io::Error::other)?;
+        Ok((ticket, RequestKind::Markdown(source)))
+    } else {
+        let Some((dimensions, svg_bytes)) = bytes.split_first_chunk::<8>() else {
+            return Err(io::Error::other("Invalid SVG raster frame"));
+        };
+        let (width_bytes, height_bytes) = dimensions.split_at(4);
+        let max_width = u32::from_le_bytes(width_bytes.try_into().map_err(io::Error::other)?);
+        let max_height = u32::from_le_bytes(height_bytes.try_into().map_err(io::Error::other)?);
+        let svg = std::str::from_utf8(svg_bytes)
+            .map_err(io::Error::other)?
+            .to_owned();
+        Ok((
+            ticket,
+            RequestKind::Rasterize {
+                max_width,
+                max_height,
+                svg,
+            },
+        ))
+    }
 }
 
-/// Serves bounded binary Markdown frames until input, output or parsing fails.
+/// Serves bounded binary Markdown and SVG raster frames until input, output or parsing fails.
 ///
 /// The caller must establish native containment and own its pipes and lifetime
 /// before invoking this function. A zero-ticket empty response announces ready;
@@ -51,15 +97,26 @@ fn read_frame(input: &mut impl Read) -> io::Result<(u64, Vec<u8>)> {
 pub fn serve(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
     write_frame(output, 0, &[])?;
     loop {
-        let (ticket, bytes) = read_frame(input)?;
-        if ticket == 0 {
-            return Err(io::Error::other("Invalid Markdown request identity"));
+        let (ticket, request) = read_frame(input)?;
+        match request {
+            RequestKind::Markdown(source) => {
+                let rendered = super::parse(&source);
+                if rendered.len() > MAX_OUTPUT_BYTES {
+                    return Err(io::Error::other("Oversized Markdown result"));
+                }
+                write_frame(output, ticket, &rendered)?;
+            }
+            RequestKind::Rasterize {
+                max_width,
+                max_height,
+                svg,
+            } => {
+                let raster = super::svg::rasterize(&svg, max_width, max_height);
+                if raster.len() > MAX_RASTER_OUTPUT_BYTES {
+                    return Err(io::Error::other("Oversized SVG raster result"));
+                }
+                write_frame(output, ticket, &raster)?;
+            }
         }
-        let source = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
-        let rendered = super::parse(source);
-        if rendered.len() > MAX_OUTPUT_BYTES {
-            return Err(io::Error::other("Oversized Markdown result"));
-        }
-        write_frame(output, ticket, &rendered)?;
     }
 }

@@ -53,6 +53,7 @@ not evidence of a browser frontend.
 | `windows`, `windows-future` | Compatible WinRT microphone permission/capture; distinct from windows-sys. Retain future 0.3.2 with windows 0.62.2; 0.100 is incompatible. |
 | `eframe`, `wgpu` | Native UI, accessibility, clipboard, fallback/system fonts and all three explicit Windows backends. |
 | `markdown-syntax` | Exact `=0.7.2`, default features disabled: dependency-free Markdown AST parsing for native response rendering. No HTML renderer or web frontend. See [Markdown parsing](#native-markdown-parsing) for the reviewed scope and limits. |
+| `resvg` | Exact `=0.50.0`, defaults disabled, `text` feature only (no `svgz`, `raster-images`, `system-fonts` or `memmap-fonts`): dual MIT/Apache-2.0 pure Rust SVG rasterization inside the offline `--markdown-worker` container, using bundled `epaint_default_fonts` with external/data `href` resolvers disabled. |
 | `egui_kittest`, `egui_system_font_provider` | Test harness/font checks; capture-only splitting offers little while production needs graphics. |
 | `toml` | CI-only manifest parsing with parse/serde/std features. |
 | `ureq` | Synchronous HTTPS for native provisioning, updates and CI. Reuse the workspace pin with defaults, automatic compression and cookies disabled; Windows selects Schannel and system trust through native-tls-no-default and PlatformVerifier, portable checks select Rustls. No new async runtime is required. |
@@ -108,10 +109,12 @@ MIT/Apache-2.0; the registry checksum in [Cargo.lock](../Cargo.lock) binds the e
 reviewed bytes. Repeat the source and dependency review before changing this pin.
 
 The [offline MXC parser worker](sandboxing.md#markdown-parser-worker) consumes the
-owned AST and absolute UTF-8 spans. The trusted UI validates bounded binary render
-descriptions before native egui text layout, without generating HTML. MXC reuses
-the application's existing process boundary; the broker image hosts this separate
-worker without adding another packaged executable or initializing its ordinary service.
+owned AST, absolute UTF-8 spans and validated top-level fenced `svg` blocks. The
+trusted UI validates bounded `BMD1`/`BMD2` render descriptions and `BMG1`
+rasterized RGBA8 packets before native egui layout and GPU texture upload,
+without generating HTML. MXC reuses the application's existing process boundary;
+the broker image hosts this separate worker without adding another packaged
+executable or initializing its ordinary service.
 Unavailable or failed worker parsing leaves plain source visible; there is no
 in-process parser fallback. Headings, emphasis/strong/strikethrough, code,
 lists/task lists, quotes, text-column tables and thematic breaks form the supported

@@ -1,6 +1,6 @@
 //! Render only the documented native subset; other constructs retain source.
-use super::Builder;
-use markdown_syntax::{Block, CodeBlockKind, Inline};
+use super::{Builder, ImageBlock};
+use markdown_syntax::{Block, CodeBlock, CodeBlockKind, FenceMarker, Inline};
 
 impl Builder<'_> {
     pub(super) fn blocks(
@@ -13,6 +13,15 @@ impl Builder<'_> {
         for (index, block) in blocks.iter().enumerate() {
             if self.limited {
                 return;
+            }
+            if depth == 0
+                && self.quote_depth == 0
+                && self.images_emitted < super::svg::MAX_SVG_IMAGES
+                && let Block::CodeBlock(node) = block
+                && let Some(image) = self.extract_svg_image(node)
+            {
+                self.push_image(image);
+                continue;
             }
             if index != 0 {
                 self.newlines(if tight { 1 } else { 2 });
@@ -129,6 +138,52 @@ impl Builder<'_> {
                 _ => self.literal(block.span(), format),
             }
         }
+    }
+
+    fn extract_svg_image(&self, node: &CodeBlock) -> Option<ImageBlock> {
+        let CodeBlockKind::Fenced { marker, length } = node.kind else {
+            return None;
+        };
+        let language = node.info.as_deref()?.split_whitespace().next()?;
+        if !language.eq_ignore_ascii_case("svg") {
+            return None;
+        }
+        let span = node.meta.span?;
+        let block = self.source.get(span.start..span.end)?;
+        let open_end_rel = block.find('\n')? + 1;
+        let content_start = span.start.checked_add(open_end_rel)?;
+        let after_open = block.get(open_end_rel..)?;
+        let without_trailing_nl = after_open.strip_suffix('\n').unwrap_or(after_open);
+        let without_trailing_nl = without_trailing_nl
+            .strip_suffix('\r')
+            .unwrap_or(without_trailing_nl);
+        let last_line_start_rel = without_trailing_nl.rfind('\n').map_or(0, |pos| pos + 1);
+        let last_line = without_trailing_nl.get(last_line_start_rel..)?;
+        let marker_char = match marker {
+            FenceMarker::Backtick => '`',
+            FenceMarker::Tilde => '~',
+        };
+        let trimmed = last_line.trim_start_matches(' ');
+        let leading_spaces = last_line.len() - trimmed.len();
+        let fence_count = trimmed.chars().take_while(|ch| *ch == marker_char).count();
+        let after_fence = trimmed.get(fence_count..)?;
+        if leading_spaces > 3
+            || fence_count < length
+            || !after_fence.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            return None;
+        }
+        let content_end = content_start.checked_add(last_line_start_rel)?;
+        if content_start >= content_end {
+            return None;
+        }
+        let svg = self.source.get(content_start..content_end)?;
+        let (intrinsic_width, intrinsic_height) = super::svg::inspect(svg)?;
+        Some(ImageBlock {
+            source: content_start..content_end,
+            intrinsic_width,
+            intrinsic_height,
+        })
     }
 
     fn code_format(&self, format: &egui::TextFormat) -> egui::TextFormat {

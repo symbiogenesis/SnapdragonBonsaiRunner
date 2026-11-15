@@ -1,16 +1,18 @@
-//! Bounded inert Markdown packets without a window, graphics backend or OS API.
+//! Bounded inert Markdown packets and offline SVG rasterization without UI or OS APIs.
 #![forbid(unsafe_code)]
 
 use std::ops::Range;
 
 mod markdown;
 mod protocol;
+mod svg;
 mod wire;
 
 #[cfg(test)]
 mod tests;
 
 pub use protocol::serve;
+pub use svg::{MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS, MAX_SVG_BYTES, MAX_SVG_IMAGES, rasterize};
 
 const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
 const MAX_STYLE_SPANS: usize = 16_384;
@@ -27,14 +29,32 @@ struct Layout {
     mappings: Vec<Mapping>,
 }
 
+struct ImageBlock {
+    source: Range<usize>,
+    intrinsic_width: f32,
+    intrinsic_height: f32,
+}
+
+enum Segment {
+    Text(Layout),
+    Image(ImageBlock),
+}
+
+struct DocumentLayout {
+    segments: Vec<Segment>,
+}
+
 struct Builder<'a> {
     source: &'a str,
     job: egui::text::LayoutJob,
     mappings: Vec<Mapping>,
+    segments: Vec<Segment>,
     visuals: &'a egui::Visuals,
     normal: egui::TextFormat,
     quote_depth: usize,
     spans: usize,
+    rendered_bytes: usize,
+    images_emitted: usize,
     limited: bool,
 }
 
@@ -60,10 +80,12 @@ impl Builder<'_> {
             return;
         }
         self.spans += 1;
-        if self.spans > MAX_STYLE_SPANS || self.job.text.len() + text.len() > MAX_RENDERED_BYTES {
+        let next_bytes = self.rendered_bytes.saturating_add(text.len());
+        if self.spans > MAX_STYLE_SPANS || next_bytes > MAX_RENDERED_BYTES {
             self.limited = true;
             return;
         }
+        self.rendered_bytes = next_bytes;
         let display_start = self.job.text.len();
         self.job.append(text, 0.0, format.clone());
         if let Some(source) = source.filter(|range| !range.is_empty()) {
@@ -73,6 +95,21 @@ impl Builder<'_> {
                 display: display_start..display_start + text.len(),
             });
         }
+    }
+
+    fn flush_text(&mut self) {
+        if self.job.text.is_empty() && self.mappings.is_empty() {
+            return;
+        }
+        let job = std::mem::take(&mut self.job);
+        let mappings = std::mem::take(&mut self.mappings);
+        self.segments.push(Segment::Text(Layout { job, mappings }));
+    }
+
+    fn push_image(&mut self, image: ImageBlock) {
+        self.flush_text();
+        self.images_emitted += 1;
+        self.segments.push(Segment::Image(image));
     }
 
     fn generated(&mut self, text: &str, format: &egui::TextFormat) {
@@ -134,7 +171,20 @@ fn plain(body: &str, normal: egui::TextFormat) -> Layout {
     }
 }
 
+#[cfg(test)]
 fn parse_layout(body: &str) -> Layout {
+    let visuals = egui::Visuals::dark();
+    let normal = egui::TextFormat::simple(egui::FontId::proportional(16.0), visuals.text_color());
+    let mut doc = parse_document(body);
+    if doc.segments.len() == 1
+        && let Some(Segment::Text(layout)) = doc.segments.pop()
+    {
+        return layout;
+    }
+    plain(body, normal)
+}
+
+fn parse_document(body: &str) -> DocumentLayout {
     let visuals = egui::Visuals::dark();
     let normal = egui::TextFormat::simple(egui::FontId::proportional(16.0), visuals.text_color());
     let mut builder = Builder {
@@ -144,27 +194,37 @@ fn parse_layout(body: &str) -> Layout {
             ..Default::default()
         },
         mappings: Vec::new(),
+        segments: Vec::new(),
         visuals: &visuals,
         normal: normal.clone(),
         quote_depth: 0,
         spans: 0,
+        rendered_bytes: 0,
+        images_emitted: 0,
         limited: false,
     };
     let parsed = markdown_syntax::parse(body);
     builder.blocks(&parsed.document.children, &normal, 0, false);
-    if body.ends_with('\n') {
+    if body.ends_with('\n') && (builder.segments.is_empty() || !builder.job.text.is_empty()) {
         builder.newlines(1);
     }
     if builder.limited {
-        return plain(body, normal);
+        return DocumentLayout {
+            segments: vec![Segment::Text(plain(body, normal))],
+        };
     }
-    Layout {
-        job: builder.job,
-        mappings: builder.mappings,
+    if builder.segments.is_empty() || !builder.job.text.is_empty() || !builder.mappings.is_empty() {
+        builder.segments.push(Segment::Text(Layout {
+            job: builder.job,
+            mappings: builder.mappings,
+        }));
+    }
+    DocumentLayout {
+        segments: builder.segments,
     }
 }
 
-/// Parses bounded Markdown into an inert `BMD1` render-description packet.
+/// Parses bounded Markdown into an inert `BMD1` or `BMD2` render-description packet.
 ///
 /// Production callers run this only in the owned offline parser process. The
 /// trusted parent must independently validate every returned field. Inputs over
@@ -175,5 +235,5 @@ pub fn parse(source: &str) -> Vec<u8> {
     if source.len() > MAX_MARKDOWN_BYTES {
         return Vec::new();
     }
-    wire::encode(&parse_layout(source))
+    wire::encode(&parse_document(source))
 }

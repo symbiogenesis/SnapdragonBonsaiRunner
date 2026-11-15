@@ -1,4 +1,7 @@
-use super::{MAX_MARKDOWN_BYTES, parse, parse_layout, serve};
+use super::{
+    MAX_MARKDOWN_BYTES, MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS, MAX_SVG_IMAGES, Segment, parse,
+    parse_document, parse_layout, rasterize, serve, svg,
+};
 use std::io::{self, Cursor, Read as _};
 
 fn frame(ticket: u64, bytes: &[u8]) -> io::Result<Vec<u8>> {
@@ -10,6 +13,20 @@ fn frame(ticket: u64, bytes: &[u8]) -> io::Result<Vec<u8>> {
             .to_le_bytes(),
     );
     frame.extend_from_slice(bytes);
+    Ok(frame)
+}
+
+fn raster_frame(ticket: u64, max_w: u32, max_h: u32, svg: &[u8]) -> io::Result<Vec<u8>> {
+    let mut frame = b"BSMG0001".to_vec();
+    frame.extend_from_slice(&ticket.to_le_bytes());
+    let len = svg
+        .len()
+        .checked_add(8)
+        .ok_or_else(|| io::Error::other("len overflow"))?;
+    frame.extend_from_slice(&u32::try_from(len).map_err(io::Error::other)?.to_le_bytes());
+    frame.extend_from_slice(&max_w.to_le_bytes());
+    frame.extend_from_slice(&max_h.to_le_bytes());
+    frame.extend_from_slice(svg);
     Ok(frame)
 }
 
@@ -73,10 +90,14 @@ fn worker_rejects_invalid_frames_before_emitting_any_rendered_response() -> io::
     );
     let mut truncated = frame(1, b"text")?;
     truncated.pop();
+    let short_raster = frame(2, b"tiny")?;
+    let mut bad_raster = short_raster.clone();
+    bad_raster[..8].copy_from_slice(b"BSMG0001");
     for request in [
         bad_magic,
         oversized,
         truncated,
+        bad_raster,
         frame(0, b"text")?,
         frame(1, &[0xff])?,
     ] {
@@ -178,6 +199,149 @@ fn markdown_typography_marks_code_blocks_separately_from_inline_code() -> io::Re
             source.get(mapping.source.clone()),
             layout.job.text.get(mapping.display.clone())
         );
+    }
+    Ok(())
+}
+
+const SAMPLE_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 200 100\"><rect width=\"200\" height=\"100\" fill=\"#204080\"/><circle cx=\"100\" cy=\"50\" r=\"35\" fill=\"#ffaa22\"/><text x=\"100\" y=\"55\" text-anchor=\"middle\" font-size=\"18\" fill=\"#ffffff\">Hi</text></svg>";
+
+#[test]
+fn segmented_markdown_extracts_top_level_svg_and_preserves_monotonic_source_maps() -> io::Result<()>
+{
+    let source = format!("Intro **text**:\n\n```svg\n{SAMPLE_SVG}\n```\n\nOutro note.\n");
+    let doc = parse_document(&source);
+    assert_eq!(doc.segments.len(), 3);
+    let Segment::Text(before) = &doc.segments[0] else {
+        return Err(io::Error::other("expected leading text segment"));
+    };
+    assert_eq!(before.job.text, "Intro text:");
+    let Segment::Image(img) = &doc.segments[1] else {
+        return Err(io::Error::other("expected image segment"));
+    };
+    assert_eq!(source[img.source.clone()].trim(), SAMPLE_SVG);
+    assert!((img.intrinsic_width - 200.0).abs() < 0.01);
+    assert!((img.intrinsic_height - 100.0).abs() < 0.01);
+    let Segment::Text(after) = &doc.segments[2] else {
+        return Err(io::Error::other("expected trailing text segment"));
+    };
+    assert_eq!(after.job.text, "Outro note.\n");
+    let before_last = before
+        .mappings
+        .last()
+        .ok_or_else(|| io::Error::other("missing leading source map"))?;
+    let after_first = after
+        .mappings
+        .first()
+        .ok_or_else(|| io::Error::other("missing trailing source map"))?;
+    assert!(before_last.source.end <= img.source.start);
+    assert!(img.source.end <= after_first.source.start);
+
+    let packet = parse(&source);
+    assert!(packet.starts_with(b"BMD2"));
+    Ok(())
+}
+
+#[test]
+fn svg_fallback_keeps_nested_unclosed_invalid_and_excess_blocks_as_code() {
+    // Nested inside blockquote stays code (`BMD1`)
+    let quoted = format!("> ```svg\n> {SAMPLE_SVG}\n> ```");
+    assert!(parse(&quoted).starts_with(b"BMD1"));
+
+    // Unclosed fence stays code (`BMD1`)
+    let unclosed = format!("```svg\n{SAMPLE_SVG}");
+    assert!(parse(&unclosed).starts_with(b"BMD1"));
+
+    // Malformed XML stays code (`BMD1`)
+    assert!(parse("```svg\n<svg><broken\n```").starts_with(b"BMD1"));
+
+    // Tagged xml stays code (`BMD1`)
+    let xml = format!("```xml\n{SAMPLE_SVG}\n```");
+    assert!(parse(&xml).starts_with(b"BMD1"));
+
+    // At most MAX_SVG_IMAGES are extracted; a 9th becomes a code block
+    let many = format!("```svg\n{SAMPLE_SVG}\n```\n\n").repeat(MAX_SVG_IMAGES + 1);
+    let doc = parse_document(&many);
+    let image_count = doc
+        .segments
+        .iter()
+        .filter(|seg| matches!(seg, Segment::Image(_)))
+        .count();
+    assert_eq!(image_count, MAX_SVG_IMAGES);
+    assert!(matches!(doc.segments.last(), Some(Segment::Text(_))));
+}
+
+#[test]
+fn offline_svg_rasterizer_produces_valid_premultiplied_rgba_and_blocks_hrefs() -> io::Result<()> {
+    let packet = rasterize(SAMPLE_SVG, 400, 400);
+    assert!(packet.starts_with(svg::RASTER_MAGIC));
+    assert_eq!(packet[4], 1);
+    let width = u32::from_le_bytes(packet[5..9].try_into().map_err(io::Error::other)?);
+    let height = u32::from_le_bytes(packet[9..13].try_into().map_err(io::Error::other)?);
+    assert_eq!((width, height), (400, 200));
+    let rgba = &packet[svg::RASTER_HEADER_BYTES..];
+    assert_eq!(
+        rgba.len(),
+        usize::try_from(width * height * 4).map_err(io::Error::other)?
+    );
+    let mut any_non_zero = false;
+    for px in rgba.chunks_exact(4) {
+        assert!(px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]);
+        if px != [0, 0, 0, 0] {
+            any_non_zero = true;
+        }
+    }
+    assert!(any_non_zero);
+
+    // Pixel ceiling check (MAX_RASTER_DIMENSION x MAX_RASTER_DIMENSION exceeds MAX_RASTER_PIXELS)
+    let square = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><rect width=\"100\" height=\"100\" fill=\"red\"/></svg>";
+    let capped = rasterize(square, MAX_RASTER_DIMENSION, MAX_RASTER_DIMENSION);
+    assert_eq!(capped[4], 1);
+    let cw = u32::from_le_bytes(capped[5..9].try_into().map_err(io::Error::other)?);
+    let ch = u32::from_le_bytes(capped[9..13].try_into().map_err(io::Error::other)?);
+    assert!(usize::try_from(cw * ch).map_err(io::Error::other)? <= MAX_RASTER_PIXELS);
+
+    // Embedded data image href is ignored cleanly via closed ImageHrefResolver
+    let with_data_img = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><image href=\"data:image/png;base64,iVBORw0KGgo=\" width=\"64\" height=\"64\"/><rect width=\"10\" height=\"10\" fill=\"#00ff00\"/></svg>";
+    let data_packet = rasterize(with_data_img, 64, 64);
+    assert_eq!(data_packet[4], 1);
+
+    // Invalid SVG or zero dimension returns ok = 0 packet
+    for bad in [rasterize("<not svg", 64, 64), rasterize(SAMPLE_SVG, 0, 64)] {
+        assert_eq!(bad.len(), svg::RASTER_HEADER_BYTES);
+        assert_eq!(bad[4], 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn persistent_worker_serves_interleaved_markdown_and_svg_raster_requests() -> io::Result<()> {
+    let mut requests = frame(1, "**界**".as_bytes())?;
+    requests.extend(raster_frame(2, 160, 160, SAMPLE_SVG.as_bytes())?);
+    let mut output = Vec::new();
+    assert_eq!(
+        serve(&mut Cursor::new(requests), &mut output)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::UnexpectedEof)
+    );
+    let expected_raster = rasterize(SAMPLE_SVG, 160, 160);
+    let mut cursor = Cursor::new(output);
+    let expected_first = parse("**界**");
+    let expected_payloads: Vec<(u64, &[u8])> =
+        vec![(0, &[]), (1, &expected_first), (2, &expected_raster)];
+    for (ticket, payload) in expected_payloads {
+        let mut header = [0; 20];
+        cursor.read_exact(&mut header)?;
+        assert_eq!(&header[..8], b"BSMR0001");
+        assert_eq!(&header[8..16], &ticket.to_le_bytes());
+        let len = u32::from_le_bytes(header[16..].try_into().map_err(io::Error::other)?);
+        assert_eq!(
+            usize::try_from(len).map_err(io::Error::other)?,
+            payload.len()
+        );
+        let mut actual = vec![0; payload.len()];
+        cursor.read_exact(&mut actual)?;
+        assert_eq!(actual, payload);
     }
     Ok(())
 }
