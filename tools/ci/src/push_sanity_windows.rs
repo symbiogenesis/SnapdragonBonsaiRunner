@@ -699,7 +699,9 @@ impl Work {
             ("CARGO_INCREMENTAL".to_string(), "1".to_string()),
         ]);
 
-        let workspace = crate::impact::workspace::read(source)?;
+        let workspace = crate::impact::workspace::read(
+            &source.canonicalize().map_err(|error| error.to_string())?,
+        )?;
         let debug_dir = target_dir.join("aarch64-pc-windows-msvc").join("debug");
         let saved_helpers: Vec<(PathBuf, Vec<u8>)> = [
             ("push-checker.json", "bonsai-ci.exe"),
