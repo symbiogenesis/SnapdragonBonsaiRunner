@@ -45,7 +45,11 @@ impl State {
             }
         }
         self.recovery_dirty = true;
-        self.record(&self.speech_status.clone());
+        Self::record_into(
+            &mut self.diagnostics,
+            &mut self.diagnostics_revision,
+            &self.speech_status,
+        );
     }
 
     pub(super) fn stream_answer(&mut self, text: String) {

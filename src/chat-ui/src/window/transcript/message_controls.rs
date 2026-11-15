@@ -155,10 +155,10 @@ impl Message {
             controls::quiet_button("⋯").min_size(egui::Vec2::splat(MESSAGE_ACTION_SIZE)),
         )
         .ui(ui, |ui| self.iteration_menu(ui, controls));
-        let name = format!("Actions for message {}", self.id);
-        response
-            .accessible_name(&name)
-            .on_hover_text("Message actions");
+        response.ctx.accesskit_node_builder(response.id, |builder| {
+            builder.set_label(format!("Actions for message {}", self.id));
+        });
+        response.on_hover_text("Message actions");
         menu.and_then(|response| response.inner)
     }
 

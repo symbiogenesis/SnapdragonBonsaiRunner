@@ -1,5 +1,6 @@
 //! Conversation-only messages with cached layout and viewport culling.
 //! Application diagnostics never enter this model.
+use crate::window::image_cache::PrehashedSvg;
 use eframe::egui::{self, Color32, FontId, RichText, Vec2};
 use std::{ops::Range, sync::Arc};
 
@@ -30,12 +31,12 @@ pub(super) enum TranscriptAction {
     ReadAloud(u64),
     Message(super::iteration::MessageAction),
     OpenLightbox {
-        svg: Arc<str>,
+        svg: PrehashedSvg,
         intrinsic_size: Vec2,
         suggested_stem: String,
     },
     SaveImage {
-        svg: Arc<str>,
+        svg: PrehashedSvg,
         suggested_stem: String,
     },
 }
@@ -64,7 +65,7 @@ pub(super) struct TextSegmentCache {
 pub(super) enum CachedSegment {
     Text(TextSegmentCache),
     Image {
-        svg: Arc<str>,
+        svg: PrehashedSvg,
         intrinsic_size: Vec2,
         preview_size: Vec2,
         card_size: Vec2,
@@ -1220,6 +1221,10 @@ pub(super) fn aspect_fit_rect(bounds: egui::Rect, texture_size: Vec2) -> egui::R
     egui::Rect::from_center_size(bounds.center(), size)
 }
 
+fn suggested_image_stem(index: usize) -> String {
+    format!("bonsai-image-{}", index + 1)
+}
+
 fn render_image_card(
     ui: &mut egui::Ui,
     message_id: u64,
@@ -1237,7 +1242,6 @@ fn render_image_card(
     else {
         return None;
     };
-    let suggested_stem = format!("bonsai-image-{}", index + 1);
     let (card_rect, _) = ui.allocate_exact_size(*card_size, egui::Sense::hover());
     let visuals = ui.visuals().clone();
     ui.painter().rect(
@@ -1289,7 +1293,7 @@ fn render_image_card(
                     .weak(),
             );
             preview_ui.label(
-                RichText::new(svg.as_ref())
+                RichText::new(&**svg)
                     .monospace()
                     .small()
                     .color(visuals.weak_text_color()),
@@ -1312,9 +1316,9 @@ fn render_image_card(
     });
     if preview_response.double_clicked() {
         action = Some(TranscriptAction::OpenLightbox {
-            svg: Arc::clone(svg),
+            svg: svg.clone(),
             intrinsic_size: *intrinsic_size,
-            suggested_stem: suggested_stem.clone(),
+            suggested_stem: suggested_image_stem(*index),
         });
     }
 
@@ -1343,8 +1347,8 @@ fn render_image_card(
     });
     if save_button.clicked() {
         action = Some(TranscriptAction::SaveImage {
-            svg: Arc::clone(svg),
-            suggested_stem: suggested_stem.clone(),
+            svg: svg.clone(),
+            suggested_stem: suggested_image_stem(*index),
         });
     }
 
@@ -1356,9 +1360,9 @@ fn render_image_card(
     });
     if expand_button.clicked() {
         action = Some(TranscriptAction::OpenLightbox {
-            svg: Arc::clone(svg),
+            svg: svg.clone(),
             intrinsic_size: *intrinsic_size,
-            suggested_stem,
+            suggested_stem: suggested_image_stem(*index),
         });
     }
 

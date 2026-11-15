@@ -22,9 +22,13 @@ const NEXT_TURN_FRAMING_TOKENS: usize = 16;
 const EFFORT_PLANNING_TOKENS: usize = 192;
 const OUTPUT_CAPS: [u32; 4] = [512, 1_024, 2_048, 4_096];
 
+static SYSTEM_PROMPT_TOKENS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    text_tokens(crate::client::SYSTEM_PROMPT).saturating_add(MESSAGE_FRAMING_TOKENS)
+});
+
 /// Approximate token cost of the fixed system instruction turn sent with every request.
 pub(crate) fn system_prompt_tokens() -> usize {
-    text_tokens(crate::client::SYSTEM_PROMPT).saturating_add(MESSAGE_FRAMING_TOKENS)
+    *SYSTEM_PROMPT_TOKENS
 }
 
 /// Advisory presentation state, never an admission decision.

@@ -46,9 +46,12 @@ impl State {
                     .add_enabled(can_send, controls::primary_button(ui, "Send  ↑"))
                     .on_hover_text("Send message · Enter");
                 let response = if let Some(title) = self.background_generation_title() {
-                    response.on_disabled_hover_text(format!(
-                        "Wait for ‘{title}’ to finish responding before sending."
-                    ))
+                    response.on_disabled_hover_ui(|ui| {
+                        ui.set_max_width(ui.spacing().tooltip_width);
+                        ui.label(format!(
+                            "Wait for ‘{title}’ to finish responding before sending."
+                        ));
+                    })
                 } else {
                     response
                 };
@@ -263,16 +266,20 @@ impl State {
         {
             error_ui::summary(ui, &self.speech_status);
         }
-        let status: Option<std::borrow::Cow<'_, str>> = if self.model.busy() {
-            Some(self.generation_status().into())
+        if self.model.busy() {
+            let status = self.generation_status();
+            let preview = truncate_chars(&status, 320);
+            ui.add(egui::Label::new(RichText::new(preview).small().weak()).truncate());
         } else if !self.model.ready() && !self.warning && self.setup.error.is_none() {
-            Some(self.status.as_str().into())
-        } else {
-            None
-        };
-        if let Some(status) = status {
-            let preview: String = status.chars().take(320).collect();
+            let preview = truncate_chars(&self.status, 320);
             ui.add(egui::Label::new(RichText::new(preview).small().weak()).truncate());
         }
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => &text[..end],
+        None => text,
     }
 }

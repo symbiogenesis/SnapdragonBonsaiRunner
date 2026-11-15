@@ -15,39 +15,45 @@ pub(super) fn body_format(size: f32, visuals: &egui::Visuals) -> egui::TextForma
 }
 
 pub(super) fn text_format(
-    source: &egui::TextFormat,
+    span: super::wire::StyleSpan,
     size: f32,
     visuals: &egui::Visuals,
-    template: &egui::Visuals,
 ) -> egui::TextFormat {
-    let mut format = source.clone();
-    let strong = source.color == template.strong_text_color();
-    let code_block = block_code(source);
-    let code = code_block || source.font_id.family == egui::FontFamily::Monospace;
-    format.font_id.size *= size / 16.0;
-    if strong && !code {
-        format.font_id.family = egui::FontFamily::Name("Bonsai Strong".into());
-    }
-    format.color = if strong {
+    let strong = span.is_strong();
+    let code_block = span.is_code_block();
+    let code = code_block || span.is_code();
+    let font_size = f32::from(span.size()) * (size / 16.0);
+    let family = if code_block {
+        egui::FontFamily::Name(CODE_BLOCK.into())
+    } else if code {
+        egui::FontFamily::Monospace
+    } else if strong {
+        egui::FontFamily::Name("Bonsai Strong".into())
+    } else {
+        egui::FontFamily::Proportional
+    };
+    let color = if strong {
         visuals.strong_text_color()
     } else {
         visuals.text_color()
     };
+    let mut format = egui::TextFormat::simple(egui::FontId::new(font_size, family), color);
     format.background = if code && !code_block {
         visuals.code_bg_color
     } else {
         egui::Color32::TRANSPARENT
     };
     format.expand_bg = if code { 2.0 } else { 1.0 };
-    format.line_height = Some(if source.font_id.size > 16.0 {
-        format.font_id.size * 1.3
+    format.line_height = Some(if span.size() > 16 {
+        font_size * 1.3
     } else if code {
         size * 1.5
     } else {
         size * 1.55
     });
-    if format.strikethrough.width > 0.0 {
-        format.strikethrough.color = format.color;
+    format.italics = span.is_italic();
+    if span.is_strike() {
+        format.strikethrough = egui::Stroke::new(1.0, color);
     }
     format
 }

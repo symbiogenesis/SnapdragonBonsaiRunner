@@ -118,7 +118,11 @@ impl State {
         {
             self.audio_file_notice = Some(self.speech_status.clone());
         }
-        self.record(&self.speech_status.clone());
+        Self::record_into(
+            &mut self.diagnostics,
+            &mut self.diagnostics_revision,
+            &self.speech_status,
+        );
     }
 
     pub(super) fn poll_audio_import(&mut self) {
@@ -181,7 +185,11 @@ impl State {
         if self.audio_file_active || self.audio_file_error {
             self.audio_file_notice = Some(self.speech_status.clone());
         }
-        self.record(&self.speech_status.clone());
+        Self::record_into(
+            &mut self.diagnostics,
+            &mut self.diagnostics_revision,
+            &self.speech_status,
+        );
     }
 
     pub(super) fn cancel_audio_file(&mut self) {

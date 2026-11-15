@@ -528,7 +528,11 @@ impl State {
         self.setup.speech_error = Some(error.to_string());
         "Speech setup could not finish. Text chat is still available. Select Retry speech setup."
             .clone_into(&mut self.speech_status);
-        self.record(&self.speech_status.clone());
+        Self::record_into(
+            &mut self.diagnostics,
+            &mut self.diagnostics_revision,
+            &self.speech_status,
+        );
         self.record(&error.to_string());
     }
 
@@ -628,17 +632,23 @@ impl State {
         self.warning = warning;
     }
 
-    fn record(&mut self, message: &str) {
-        if self
-            .diagnostics
+    fn record_into(diagnostics: &mut VecDeque<String>, revision: &mut u64, message: &str) {
+        if diagnostics
             .back()
             .is_none_or(|previous| previous != message)
         {
-            self.diagnostics
-                .push_back(message.chars().take(MAX_DIAGNOSTIC_CHARS).collect());
-            self.diagnostics.retain_back(MAX_DIAGNOSTICS);
-            self.diagnostics_revision = self.diagnostics_revision.wrapping_add(1);
+            diagnostics.push_back(message.chars().take(MAX_DIAGNOSTIC_CHARS).collect());
+            diagnostics.retain_back(MAX_DIAGNOSTICS);
+            *revision = revision.wrapping_add(1);
         }
+    }
+
+    fn record(&mut self, message: &str) {
+        Self::record_into(
+            &mut self.diagnostics,
+            &mut self.diagnostics_revision,
+            message,
+        );
     }
 
     fn submit(&mut self) {
@@ -1425,7 +1435,11 @@ impl State {
                     .clone_into(&mut self.speech_status);
             }
         }
-        self.record(&self.speech_status.clone());
+        Self::record_into(
+            &mut self.diagnostics,
+            &mut self.diagnostics_revision,
+            &self.speech_status,
+        );
     }
 
     fn finish_dictation(&mut self) {
@@ -1467,7 +1481,11 @@ impl State {
                 "Describe the voice in Settings before reading aloud."
                     .clone_into(&mut self.speech_status);
                 self.open_settings(settings::Page::Voice);
-                self.record(&self.speech_status.clone());
+                Self::record_into(
+                    &mut self.diagnostics,
+                    &mut self.diagnostics_revision,
+                    &self.speech_status,
+                );
                 return;
             }
             self.stop_speech();
@@ -1488,7 +1506,11 @@ impl State {
             message.clone_into(&mut self.speech_status);
             self.open_voice_setup();
         }
-        self.record(&self.speech_status.clone());
+        Self::record_into(
+            &mut self.diagnostics,
+            &mut self.diagnostics_revision,
+            &self.speech_status,
+        );
     }
 
     const fn microphone_help(&self) -> &'static str {
@@ -1638,7 +1660,11 @@ impl State {
             speech::Event::Status(_) => {}
         }
         if self.speech_status != previous {
-            self.record(&self.speech_status.clone());
+            Self::record_into(
+                &mut self.diagnostics,
+                &mut self.diagnostics_revision,
+                &self.speech_status,
+            );
         }
     }
 
@@ -1800,15 +1826,21 @@ impl State {
         if self.audio_file_active {
             return;
         }
-        let previous = self.speech_status.clone();
-        let Some(microphone) = &mut self.microphone else {
+        let Some(event) = self
+            .microphone
+            .as_mut()
+            .and_then(microphone::Microphone::poll)
+        else {
             return;
         };
-        if let Some(event) = microphone.poll() {
-            self.microphone_event(event);
-        }
+        let previous = self.speech_status.clone();
+        self.microphone_event(event);
         if self.speech_status != previous {
-            self.record(&self.speech_status.clone());
+            Self::record_into(
+                &mut self.diagnostics,
+                &mut self.diagnostics_revision,
+                &self.speech_status,
+            );
         }
     }
 
@@ -2269,7 +2301,7 @@ impl State {
             Some(transcript::TranscriptAction::SaveImage {
                 svg,
                 suggested_stem,
-            }) => self.start_image_export(ui.ctx(), svg, suggested_stem),
+            }) => self.start_image_export(ui.ctx(), svg.into_arc(), suggested_stem),
             None => {}
         }
     }
@@ -2382,8 +2414,6 @@ impl State {
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
-        self.image_cache.poll(ui.ctx());
-        self.poll_image_export(ui.ctx());
         // Disable the workspace on the first modal frame too: egui's modal
         // focus layer is otherwise inherited only from the preceding pass.
         let drawer = self.sidebar_open && ui.available_width() < navigation::DOCK_THRESHOLD;
@@ -2477,7 +2507,7 @@ impl State {
                 lightbox::LightboxAction::Save {
                     svg,
                     suggested_stem,
-                } => self.start_image_export(&ctx, svg, suggested_stem),
+                } => self.start_image_export(&ctx, svg.into_arc(), suggested_stem),
             }
         }
     }

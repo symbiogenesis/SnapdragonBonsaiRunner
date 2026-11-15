@@ -4,10 +4,9 @@
 use super::{
     controls,
     egui::{self, Color32, RichText, Vec2},
-    image_cache::{ImageCache, RasterSlot},
+    image_cache::{ImageCache, PrehashedSvg, RasterSlot},
     transcript::aspect_fit_rect,
 };
-use std::sync::Arc;
 
 const HEADER_HEIGHT: f32 = 36.0;
 const MODAL_PADDING: f32 = 16.0;
@@ -15,7 +14,7 @@ const CANVAS_PADDING: f32 = 8.0;
 
 /// Active full-window lightbox modal state for one generated image.
 pub(super) struct Lightbox {
-    svg: Arc<str>,
+    svg: PrehashedSvg,
     intrinsic_size: Vec2,
     suggested_stem: String,
 }
@@ -26,14 +25,14 @@ pub(super) enum LightboxAction {
     Close,
     /// Start exporting the viewed SVG via the native Save dialog.
     Save {
-        svg: Arc<str>,
+        svg: PrehashedSvg,
         suggested_stem: String,
     },
 }
 
 impl Lightbox {
     /// Creates a lightbox viewer for the selected inline image.
-    pub(super) fn new(svg: Arc<str>, intrinsic_size: Vec2, suggested_stem: String) -> Self {
+    pub(super) fn new(svg: PrehashedSvg, intrinsic_size: Vec2, suggested_stem: String) -> Self {
         Self {
             svg,
             intrinsic_size,
@@ -125,7 +124,7 @@ impl Lightbox {
                                     .on_hover_text("Save image as PNG or SVG");
                                 if save.clicked() {
                                     action = Some(LightboxAction::Save {
-                                        svg: Arc::clone(&self.svg),
+                                        svg: self.svg.clone(),
                                         suggested_stem: self.suggested_stem.clone(),
                                     });
                                 }
@@ -184,7 +183,7 @@ impl Lightbox {
                             .show(&mut fallback_ui, |ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(self.svg.as_ref())
+                                        RichText::new(&*self.svg)
                                             .monospace()
                                             .small()
                                             .color(visuals.weak_text_color()),

@@ -67,7 +67,9 @@ pub(super) fn button(ui: &mut egui::Ui, phase: Phase, enabled: bool) -> egui::Re
             (7.0, -2.0),
         ]
         .map(|(x, y)| center + egui::vec2(x, y));
-        painter.add(egui::Shape::line(cradle.to_vec(), stroke));
+        for pair in cradle.windows(2) {
+            painter.line_segment([pair[0], pair[1]], stroke);
+        }
         painter.line_segment(
             [
                 center + egui::vec2(0.0, 7.0),

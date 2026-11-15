@@ -1,8 +1,7 @@
 //! The parser can return only bounded, inert text and native style choices.
 //! Every field is checked again in the trusted process before egui sees it.
-use super::{
-    Layout, MAX_MARKDOWN_BYTES, MAX_RENDERED_BYTES, MAX_STYLE_SPANS, Mapping, SourceMap, egui,
-};
+use super::{MAX_MARKDOWN_BYTES, MAX_RENDERED_BYTES, MAX_STYLE_SPANS, Mapping, SourceMap};
+use crate::window::image_cache::PrehashedSvg;
 use std::{ops::Range, sync::Arc};
 
 const MAGIC: &[u8; 4] = b"BMD1";
@@ -21,15 +20,66 @@ const STRIKE: u8 = 8;
 const CODE_BLOCK: u8 = 16;
 const KNOWN_FLAGS: u8 = CODE | ITALIC | STRONG | STRIKE | CODE_BLOCK;
 
+/// Validated byte span and bitflag style run decoded from a worker packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StyleSpan {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    flags: u8,
+    size: u8,
+}
+
+impl StyleSpan {
+    #[cfg(test)]
+    pub(super) const fn plain(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            flags: 0,
+            size: 16,
+        }
+    }
+
+    pub(super) const fn is_code(self) -> bool {
+        self.flags & CODE != 0
+    }
+
+    pub(super) const fn is_code_block(self) -> bool {
+        self.flags & CODE_BLOCK != 0
+    }
+
+    pub(super) const fn is_italic(self) -> bool {
+        self.flags & ITALIC != 0
+    }
+
+    pub(super) const fn is_strong(self) -> bool {
+        self.flags & STRONG != 0
+    }
+
+    pub(super) const fn is_strike(self) -> bool {
+        self.flags & STRIKE != 0
+    }
+
+    pub(super) const fn size(self) -> u8 {
+        self.size
+    }
+}
+
+pub(super) struct TextSegment {
+    pub(super) text: String,
+    pub(super) spans: Vec<StyleSpan>,
+    pub(super) source_map: Arc<SourceMap>,
+}
+
 #[derive(Clone)]
 pub(super) struct ImageBlock {
-    pub(super) source_range: Range<usize>,
+    pub(super) svg: PrehashedSvg,
     pub(super) intrinsic_width: f32,
     pub(super) intrinsic_height: f32,
 }
 
 pub(super) enum Segment {
-    Text(Layout),
+    Text(TextSegment),
     Image(ImageBlock),
 }
 
@@ -71,124 +121,10 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[cfg(test)]
-fn push_count(bytes: &mut Vec<u8>, value: usize) -> Option<()> {
-    bytes.extend_from_slice(&u32::try_from(value).ok()?.to_le_bytes());
-    Some(())
-}
-
-#[cfg(test)]
-fn push_range(bytes: &mut Vec<u8>, range: &Range<usize>) -> Option<()> {
-    push_count(bytes, range.start)?;
-    push_count(bytes, range.end)
-}
-
-#[cfg(test)]
-fn font_size(size: f32) -> Option<u8> {
-    [16_u8, 17, 18, 19, 20, 21, 22, 24, 28]
-        .into_iter()
-        .find(|candidate| f32::from(*candidate).to_bits() == size.to_bits())
-}
-
-#[cfg(test)]
-fn flags(format: &egui::TextFormat, visuals: &egui::Visuals) -> u8 {
-    let mut flags = 0;
-    if format.font_id.family == egui::FontFamily::Monospace {
-        flags |= CODE;
-    }
-    if matches!(&format.font_id.family, egui::FontFamily::Name(name) if name.as_ref() == super::presentation::CODE_BLOCK)
-    {
-        flags |= CODE | CODE_BLOCK;
-    }
-    if format.italics {
-        flags |= ITALIC;
-    }
-    if format.color == visuals.strong_text_color() {
-        flags |= STRONG;
-    }
-    if format.strikethrough.width > 0.0 {
-        flags |= STRIKE;
-    }
-    flags
-}
-
-#[cfg(test)]
-fn encode_checked(layout: &Layout) -> Option<Vec<u8>> {
-    let text = &layout.job.text;
-    let sections = &layout.job.sections;
-    let mappings = &layout.source_map.entries;
-    if text.len() > MAX_RENDERED_BYTES
-        || sections.len() > MAX_STYLE_SPANS
-        || mappings.len() > MAX_STYLE_SPANS
-    {
-        return None;
-    }
-    let length = 16_usize
-        .checked_add(text.len())?
-        .checked_add(sections.len().checked_mul(SECTION_BYTES)?)?
-        .checked_add(mappings.len().checked_mul(MAPPING_BYTES)?)?;
-    if length > MAX_FRAME_BYTES {
-        return None;
-    }
-    let visuals = egui::Visuals::dark();
-    let mut bytes = Vec::with_capacity(length);
-    bytes.extend_from_slice(MAGIC);
-    push_count(&mut bytes, text.len())?;
-    bytes.extend_from_slice(text.as_bytes());
-    push_count(&mut bytes, sections.len())?;
-    for section in sections {
-        push_count(&mut bytes, section.byte_range.start.0)?;
-        push_count(&mut bytes, section.byte_range.end.0)?;
-        bytes.push(flags(&section.format, &visuals));
-        bytes.push(font_size(section.format.font_id.size)?);
-    }
-    push_count(&mut bytes, mappings.len())?;
-    for mapping in mappings {
-        push_range(&mut bytes, &mapping.source)?;
-        push_range(&mut bytes, &mapping.display)?;
-        bytes.push(u8::from(mapping.verbatim));
-    }
-    Some(bytes)
-}
-
-/// Encoding runs only in the untrusted parser process. An invalid layout is
-/// represented by a rejected empty payload rather than a partial message.
-#[cfg(test)]
-pub(super) fn encode(layout: &Layout) -> Vec<u8> {
-    encode_checked(layout).unwrap_or_default()
-}
-
-fn text_format(flags: u8, size: u8, visuals: &egui::Visuals) -> Option<egui::TextFormat> {
-    if flags & !KNOWN_FLAGS != 0
-        || (flags & CODE_BLOCK != 0 && flags & CODE == 0)
-        || ![16, 17, 18, 19, 20, 21, 22, 24, 28].contains(&size)
-    {
-        return None;
-    }
-    let color = if flags & STRONG != 0 {
-        visuals.strong_text_color()
-    } else {
-        visuals.text_color()
-    };
-    let font = if flags & CODE_BLOCK != 0 {
-        egui::FontId::new(
-            f32::from(size),
-            egui::FontFamily::Name(super::presentation::CODE_BLOCK.into()),
-        )
-    } else if flags & CODE != 0 {
-        egui::FontId::monospace(f32::from(size))
-    } else {
-        egui::FontId::proportional(f32::from(size))
-    };
-    let mut format = egui::TextFormat::simple(font, color);
-    if flags & CODE != 0 {
-        format.background = visuals.code_bg_color;
-    }
-    format.italics = flags & ITALIC != 0;
-    if flags & STRIKE != 0 {
-        format.strikethrough = egui::Stroke::new(1.0, color);
-    }
-    Some(format)
+fn valid_style(flags: u8, size: u8) -> bool {
+    flags & !KNOWN_FLAGS == 0
+        && (flags & CODE_BLOCK == 0 || flags & CODE != 0)
+        && [16, 17, 18, 19, 20, 21, 22, 24, 28].contains(&size)
 }
 
 fn content_range(text: &str, range: &Range<usize>, previous_end: usize) -> bool {
@@ -202,13 +138,12 @@ fn content_range(text: &str, range: &Range<usize>, previous_end: usize) -> bool 
 fn decode_text_segment(
     source: &str,
     reader: &mut Reader<'_>,
-    visuals: &egui::Visuals,
     previous_source_end: &mut usize,
     rendered_bytes: &mut usize,
     span_count: &mut usize,
     text_budget: usize,
     aggregate_spans: bool,
-) -> Option<Layout> {
+) -> Option<TextSegment> {
     let text_len = reader.count()?;
     // An untrusted worker cannot inflate hundreds of tiny messages to a MiB
     // each. This also bounds aggregate parsed text by retained source bytes.
@@ -226,21 +161,24 @@ fn decode_text_segment(
     {
         return None;
     }
-    let mut job = egui::text::LayoutJob {
-        text: String::with_capacity(text_len),
-        sections: Vec::with_capacity(section_count),
-        ..Default::default()
-    };
+    let mut spans = Vec::with_capacity(section_count);
     let mut display_end = 0;
     for _ in 0..section_count {
         let range = reader.range()?;
         let flags = reader.byte()?;
         let size = reader.byte()?;
-        if range.start != display_end || !content_range(text, &range, display_end) {
+        if range.start != display_end
+            || !content_range(text, &range, display_end)
+            || !valid_style(flags, size)
+        {
             return None;
         }
-        let format = text_format(flags, size, visuals)?;
-        job.append(text.get(range.clone())?, 0.0, format);
+        spans.push(StyleSpan {
+            start: range.start,
+            end: range.end,
+            flags,
+            size,
+        });
         display_end = range.end;
     }
     if display_end != text.len() {
@@ -284,8 +222,9 @@ fn decode_text_segment(
             verbatim,
         });
     }
-    Some(Layout {
-        job,
+    Some(TextSegment {
+        text: text.to_owned(),
+        spans,
         source_map: Arc::new(SourceMap {
             entries,
             display_bytes: text_len,
@@ -315,9 +254,10 @@ fn decode_image_segment(
     {
         return None;
     }
+    let svg = PrehashedSvg::from_str(source.get(source_range.clone())?);
     *previous_source_end = source_range.end;
     Some(ImageBlock {
-        source_range,
+        svg,
         intrinsic_width,
         intrinsic_height,
     })
@@ -333,16 +273,14 @@ pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Document> {
     }
     let mut reader = Reader { bytes, position: 0 };
     let magic = reader.take(MAGIC.len())?;
-    let visuals = egui::Visuals::dark();
     let text_budget = MAX_RENDERED_BYTES.min(source.len().saturating_mul(4));
     let mut previous_source_end = 0;
     let mut rendered_bytes = 0;
     let mut span_count = 0;
     if magic == MAGIC {
-        let layout = decode_text_segment(
+        let segment = decode_text_segment(
             source,
             &mut reader,
-            &visuals,
             &mut previous_source_end,
             &mut rendered_bytes,
             &mut span_count,
@@ -353,7 +291,7 @@ pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Document> {
             return None;
         }
         return Some(Document {
-            segments: vec![Segment::Text(layout)],
+            segments: vec![Segment::Text(segment)],
         });
     }
     if magic != MAGIC_SEGMENTED {
@@ -370,7 +308,6 @@ pub(super) fn decode(source: &str, bytes: &[u8]) -> Option<Document> {
             SEGMENT_TEXT => segments.push(Segment::Text(decode_text_segment(
                 source,
                 &mut reader,
-                &visuals,
                 &mut previous_source_end,
                 &mut rendered_bytes,
                 &mut span_count,
@@ -412,9 +349,9 @@ mod tests {
         },
     }
 
-    fn first_text(document: Document) -> Option<Layout> {
+    fn first_text(document: Document) -> Option<TextSegment> {
         match document.segments.into_iter().next()? {
-            Segment::Text(layout) => Some(layout),
+            Segment::Text(segment) => Some(segment),
             Segment::Image(_) => None,
         }
     }
@@ -493,21 +430,32 @@ mod tests {
     }
 
     #[test]
-    fn markdown_wire_round_trip_preserves_unicode_styles_and_normalized_maps()
-    -> Result<(), &'static str> {
+    fn markdown_wire_decodes_unicode_styles_and_normalized_maps() -> Result<(), &'static str> {
         let source = "**界** &amp;";
-        let first = decode(source, &fixture())
+        let segment = decode(source, &fixture())
             .and_then(first_text)
             .ok_or("Valid independent fixture was rejected.")?;
-        assert_eq!(first.job.text, "界 &");
-        assert_eq!(first.source_map.range(2..5), 0..3);
-        assert_eq!(first.source_map.range(8..13), 4..5);
-        let second = decode(source, &encode(&first))
-            .and_then(first_text)
-            .ok_or("Encoded layout was rejected.")?;
-        assert_eq!(second.job.text, first.job.text);
-        assert_eq!(second.job.sections, first.job.sections);
-        assert_eq!(second.source_map.entries.len(), 3);
+        assert_eq!(segment.text, "界 &");
+        assert_eq!(
+            segment.spans,
+            [
+                StyleSpan {
+                    start: 0,
+                    end: 3,
+                    flags: STRONG,
+                    size: 22,
+                },
+                StyleSpan {
+                    start: 3,
+                    end: 5,
+                    flags: 0,
+                    size: 16,
+                },
+            ]
+        );
+        assert_eq!(segment.source_map.range(2..5), 0..3);
+        assert_eq!(segment.source_map.range(8..13), 4..5);
+        assert_eq!(segment.source_map.entries.len(), 3);
         assert!(decode("", &packet("", &[], &[])).is_some());
         Ok(())
     }
@@ -571,14 +519,19 @@ mod tests {
             assert!(decode("heading", &bytes).is_some());
         }
         let bytes = packet("code", &[(0, 4, CODE | CODE_BLOCK, 16)], &[(0, 4, 0, 4, 1)]);
-        let layout = decode("code", &bytes)
+        let segment = decode("code", &bytes)
             .and_then(first_text)
             .ok_or("Valid block style rejected")?;
         assert_eq!(
-            layout.job.sections[0].format.font_id.family,
-            egui::FontFamily::Name(super::super::presentation::CODE_BLOCK.into())
+            segment.spans,
+            [StyleSpan {
+                start: 0,
+                end: 4,
+                flags: CODE | CODE_BLOCK,
+                size: 16,
+            }]
         );
-        assert_eq!(encode(&layout), bytes);
+        assert!(segment.spans[0].is_code_block() && segment.spans[0].is_code());
         for flags in [CODE_BLOCK, CODE_BLOCK | STRONG, 32, 255] {
             assert!(decode("code", &packet("code", &[(0, 4, flags, 16)], &[])).is_none());
         }
@@ -649,7 +602,7 @@ mod tests {
         assert!(matches!(
             &doc.segments[1],
             Segment::Image(image)
-                if &source[image.source_range.clone()] == "```svg\n<svg/>\n```"
+                if &*image.svg == "```svg\n<svg/>\n```"
                     && (image.intrinsic_width - 320.0).abs() < f32::EPSILON
                     && (image.intrinsic_height - 240.0).abs() < f32::EPSILON
         ));

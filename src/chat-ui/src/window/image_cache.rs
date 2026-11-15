@@ -10,6 +10,56 @@ const MAX_IN_FLIGHT: usize = 8;
 const QUANTUM_PX: u16 = 64;
 const REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 
+/// Immutable SVG source string paired with its precomputed FNV-1a hash.
+#[derive(Clone, Debug)]
+pub(in crate::window) struct PrehashedSvg {
+    svg: Arc<str>,
+    hash: u64,
+}
+
+impl PrehashedSvg {
+    /// Stores `svg` alongside a once-computed FNV-1a content hash.
+    pub(in crate::window) fn from_str(svg: &str) -> Self {
+        Self {
+            hash: fnv1a64(svg.as_bytes()),
+            svg: Arc::from(svg),
+        }
+    }
+
+    /// Returns the precomputed FNV-1a hash of the UTF-8 SVG payload.
+    pub(in crate::window) const fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    /// Consumes this handle and yields the underlying shared SVG string.
+    pub(in crate::window) fn into_arc(self) -> Arc<str> {
+        self.svg
+    }
+
+    /// Compares two SVG handles, checking precomputed hashes and pointer identity first.
+    pub(in crate::window) fn same_content(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && self.svg.len() == other.svg.len()
+            && (Arc::ptr_eq(&self.svg, &other.svg) || self.svg.as_ref() == other.svg.as_ref())
+    }
+}
+
+impl PartialEq for PrehashedSvg {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_content(other)
+    }
+}
+
+impl Eq for PrehashedSvg {}
+
+impl std::ops::Deref for PrehashedSvg {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.svg
+    }
+}
+
 /// Presentation state for a requested SVG texture at a target physical pixel size.
 pub(super) enum RasterSlot {
     /// Texture at the quantized target resolution is ready on the GPU.
@@ -39,7 +89,7 @@ enum SlotState {
 
 struct Entry {
     key: Key,
-    svg: Arc<str>,
+    svg: PrehashedSvg,
     last_used: u64,
     state: SlotState,
 }
@@ -99,12 +149,9 @@ impl ImageCache {
     }
 
     /// Returns whether `svg` already failed offline validation or rasterization.
-    pub(super) fn is_rejected(&self, svg: &Arc<str>) -> bool {
-        let hash = fnv1a64(svg.as_bytes());
+    pub(super) fn is_rejected(&self, svg: &PrehashedSvg) -> bool {
         self.entries.iter().any(|entry| {
-            entry.key.hash == hash
-                && entry.key.len == svg.len()
-                && same_svg(&entry.svg, svg)
+            entry.svg.same_content(svg)
                 && matches!(entry.state, SlotState::Unrenderable | SlotState::Failed)
         })
     }
@@ -113,15 +160,14 @@ impl ImageCache {
     pub(super) fn get_or_request(
         &mut self,
         ctx: &egui::Context,
-        svg: &Arc<str>,
+        svg: &PrehashedSvg,
         target_points: egui::Vec2,
     ) -> RasterSlot {
         let pixels_per_point = ctx.pixels_per_point();
         let max_width = quantize_px(target_points.x, pixels_per_point);
         let max_height = quantize_px(target_points.y, pixels_per_point);
-        let hash = fnv1a64(svg.as_bytes());
         let key = Key {
-            hash,
+            hash: svg.hash(),
             len: svg.len(),
             max_width,
             max_height,
@@ -133,13 +179,13 @@ impl ImageCache {
         if let Some(index) = self
             .entries
             .iter()
-            .position(|entry| entry.key == key && same_svg(&entry.svg, svg))
+            .position(|entry| entry.key == key && entry.svg.same_content(svg))
         {
             self.entries[index].last_used = stamp;
             return match &self.entries[index].state {
                 SlotState::Ready(texture) => RasterSlot::Ready(texture.clone()),
                 SlotState::Pending(_) => RasterSlot::Loading {
-                    fallback: self.best_fallback(hash, svg),
+                    fallback: self.best_fallback(svg),
                 },
                 SlotState::Unrenderable | SlotState::Failed => RasterSlot::FallbackSource,
             };
@@ -147,16 +193,11 @@ impl ImageCache {
 
         // If any exact SVG entry already proved unrenderable or failed at a valid size,
         // avoid re-submitting identical failing payloads across resizes.
-        if self.entries.iter().any(|entry| {
-            entry.key.hash == hash
-                && entry.key.len == svg.len()
-                && same_svg(&entry.svg, svg)
-                && matches!(entry.state, SlotState::Unrenderable | SlotState::Failed)
-        }) {
+        if self.is_rejected(svg) {
             return RasterSlot::FallbackSource;
         }
 
-        let fallback = self.best_fallback(hash, svg);
+        let fallback = self.best_fallback(svg);
         if self.service.is_none() {
             self.service = Service::get(ctx);
         }
@@ -177,7 +218,7 @@ impl ImageCache {
             };
             self.entries.push(Entry {
                 key,
-                svg: Arc::clone(svg),
+                svg: svg.clone(),
                 last_used: stamp,
                 state,
             });
@@ -199,11 +240,11 @@ impl ImageCache {
             return RasterSlot::Loading { fallback };
         }
 
-        let ticket = service.request_raster(Arc::clone(svg), max_width, max_height);
+        let ticket = service.request_raster(Arc::clone(&svg.svg), max_width, max_height);
         if ticket.admitted() {
             self.entries.push(Entry {
                 key,
-                svg: Arc::clone(svg),
+                svg: svg.clone(),
                 last_used: stamp,
                 state: SlotState::Pending(ticket),
             });
@@ -212,7 +253,7 @@ impl ImageCache {
         } else if service.unavailable() {
             self.entries.push(Entry {
                 key,
-                svg: Arc::clone(svg),
+                svg: svg.clone(),
                 last_used: stamp,
                 state: SlotState::Failed,
             });
@@ -225,12 +266,10 @@ impl ImageCache {
         }
     }
 
-    fn best_fallback(&self, hash: u64, svg: &Arc<str>) -> Option<egui::TextureHandle> {
+    fn best_fallback(&self, svg: &PrehashedSvg) -> Option<egui::TextureHandle> {
         let mut best: Option<(u64, &egui::TextureHandle)> = None;
         for entry in &self.entries {
-            if entry.key.hash == hash
-                && entry.key.len == svg.len()
-                && same_svg(&entry.svg, svg)
+            if entry.svg.same_content(svg)
                 && let SlotState::Ready(texture) = &entry.state
             {
                 let area = u64::from(entry.key.max_width) * u64::from(entry.key.max_height);
@@ -302,10 +341,6 @@ fn create_texture(
     Some(ctx.load_texture("bonsai-svg", image, egui::TextureOptions::LINEAR))
 }
 
-fn same_svg(left: &Arc<str>, right: &Arc<str>) -> bool {
-    Arc::ptr_eq(left, right) || left.as_ref() == right.as_ref()
-}
-
 fn quantize_px(points: f32, pixels_per_point: f32) -> u32 {
     let max_dim_u16 = u16::try_from(MAX_RASTER_DIMENSION).unwrap_or(2_560);
     let target = if points.is_finite()
@@ -361,10 +396,10 @@ mod tests {
                         return;
                     }
                     cache.poll(ui.ctx());
-                    let valid: Arc<str> = Arc::from(
+                    let valid = PrehashedSvg::from_str(
                         r#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"><rect width="120" height="80" fill="teal"/></svg>"#,
                     );
-                    let invalid: Arc<str> = Arc::from("<not-svg>");
+                    let invalid = PrehashedSvg::from_str("<not-svg>");
                     match cache.get_or_request(ui.ctx(), &valid, egui::vec2(200.0, 120.0)) {
                         RasterSlot::Ready(tex) => {
                             let [w, h] = tex.size();
@@ -424,7 +459,7 @@ mod tests {
             .build_ui_state(
                 |ui, cache: &mut ImageCache| {
                     for i in 0..30 {
-                        let svg: Arc<str> = Arc::from(format!(
+                        let svg = PrehashedSvg::from_str(&format!(
                             r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="{i}" cy="16" r="8"/></svg>"#
                         ));
                         let _ = cache.get_or_request(ui.ctx(), &svg, egui::vec2(64.0, 64.0));
@@ -439,10 +474,10 @@ mod tests {
     #[test]
     fn malformed_bmg1_response_rejects_worker_session_and_marks_svg_rejected() -> std::io::Result<()>
     {
-        let svg: Arc<str> = Arc::from(
+        let svg = PrehashedSvg::from_str(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="teal"/></svg>"#,
         );
-        let test_svg = Arc::clone(&svg);
+        let test_svg = svg.clone();
         let mut harness = Harness::builder()
             .with_size([240.0, 180.0])
             .with_context_setup(super::super::configure)

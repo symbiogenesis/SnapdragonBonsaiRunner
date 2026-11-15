@@ -1,6 +1,7 @@
 //! Bounded native Markdown presentation; original message bytes stay in history.
 #![forbid(unsafe_code)]
 use super::{egui, search};
+use crate::window::image_cache::PrehashedSvg;
 use std::{ops::Range, sync::Arc};
 
 mod pending;
@@ -103,7 +104,7 @@ pub(super) struct Layout {
 pub(super) enum BodySegment {
     Text(Layout),
     Image {
-        svg: Arc<str>,
+        svg: PrehashedSvg,
         intrinsic_size: egui::Vec2,
     },
 }
@@ -146,22 +147,27 @@ fn plain(
 }
 
 #[cfg(test)]
-fn parse_layout(body: &str) -> Layout {
-    let fallback = || {
-        let visuals = egui::Visuals::dark();
-        plain(
-            body,
-            600.0,
-            egui::TextFormat::simple(egui::FontId::proportional(16.0), visuals.text_color()),
-            &visuals,
-            &[],
-        )
+fn parse_layout(body: &str) -> wire::TextSegment {
+    let fallback = || wire::TextSegment {
+        text: body.to_owned(),
+        spans: (!body.is_empty())
+            .then_some(wire::StyleSpan::plain(0, body.len()))
+            .into_iter()
+            .collect(),
+        source_map: Arc::new(SourceMap {
+            entries: vec![Mapping {
+                source: 0..body.len(),
+                display: 0..body.len(),
+                verbatim: true,
+            }],
+            display_bytes: body.len(),
+        }),
     };
     let Some(doc) = wire::decode(body, &parse_wire(body)) else {
         return fallback();
     };
     match doc.segments.into_iter().next() {
-        Some(wire::Segment::Text(layout)) => layout,
+        Some(wire::Segment::Text(segment)) => segment,
         _ => fallback(),
     }
 }
@@ -201,7 +207,7 @@ fn append_tail_slice(
     }
 }
 
-fn compute_tail_start(body: &str, prefix_len: usize, parsed: Option<&Layout>) -> usize {
+fn compute_tail_start(body: &str, prefix_len: usize, parsed: Option<&wire::TextSegment>) -> usize {
     if prefix_len >= body.len() {
         return prefix_len;
     }
@@ -219,7 +225,6 @@ fn compute_tail_start(body: &str, prefix_len: usize, parsed: Option<&Layout>) ->
         .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
         .count();
     let emitted_ws = parsed
-        .job
         .text
         .bytes()
         .rev()
@@ -235,7 +240,7 @@ fn render_parsed_text_segment(
     text_size: f32,
     visuals: &egui::Visuals,
     matches: &[search::Match],
-    parsed: &Layout,
+    parsed: &wire::TextSegment,
     tail_start: usize,
     append_tail: bool,
 ) -> Layout {
@@ -245,22 +250,21 @@ fn render_parsed_text_segment(
         .filter(|found| found.range.end <= tail_start)
         .map(|found| parsed.source_map.range(found.range.clone()))
         .collect();
-    let template = egui::Visuals::dark();
     let tail_len = if append_tail && tail_start < body_prefix.len() {
         body_prefix.len() - tail_start
     } else {
         0
     };
     let mut job = egui::text::LayoutJob {
-        text: String::with_capacity(parsed.job.text.len() + tail_len),
+        text: String::with_capacity(parsed.text.len() + tail_len),
         ..Default::default()
     };
     job.wrap.max_width = width;
     let mut next_match = 0;
-    for section in &parsed.job.sections {
-        let format = presentation::text_format(&section.format, text_size, visuals, &template);
-        let mut cursor = section.byte_range.start.0;
-        let end = section.byte_range.end.0;
+    for &span in &parsed.spans {
+        let format = presentation::text_format(span, text_size, visuals);
+        let mut cursor = span.start;
+        let end = span.end;
         while cursor < end {
             while highlights
                 .get(next_match)
@@ -279,12 +283,7 @@ fn render_parsed_text_segment(
                 effective.background = visuals.selection.bg_fill;
                 effective.color = visuals.selection.stroke.color;
             }
-            presentation::append(
-                &mut job,
-                &parsed.job.text[cursor..until],
-                effective,
-                text_size,
-            );
+            presentation::append(&mut job, &parsed.text[cursor..until], effective, text_size);
             cursor = until;
         }
     }
@@ -325,14 +324,14 @@ fn render_parsed_text_segment(
 }
 
 #[cfg(test)]
-pub(super) fn layout_job(
+fn layout_job(
     body: &str,
     structured: bool,
     width: f32,
     text_size: f32,
     visuals: &egui::Visuals,
     matches: &[search::Match],
-    parsed: Option<(&Layout, usize)>,
+    parsed: Option<(&wire::TextSegment, usize)>,
 ) -> Layout {
     let normal = presentation::body_format(text_size, visuals);
     let Some((parsed, prefix_len)) = parsed.filter(|_| structured) else {
@@ -472,9 +471,8 @@ pub(super) fn layout_document(
                 }
             }
             wire::Segment::Image(image) => {
-                let svg: Arc<str> = Arc::from(&effective_body[image.source_range.clone()]);
                 rendered.push(BodySegment::Image {
-                    svg,
+                    svg: image.svg.clone(),
                     intrinsic_size: egui::vec2(image.intrinsic_width, image.intrinsic_height),
                 });
             }
