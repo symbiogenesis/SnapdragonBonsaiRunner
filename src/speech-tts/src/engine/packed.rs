@@ -44,18 +44,26 @@ impl<S: Simd> Dot<S> {
     }
 
     #[inline(always)]
+    fn load_inputs(simd: S, input: &[f32]) -> [f32x4<S>; 4] {
+        [
+            f32x4::from_slice(simd, &input[0..4]),
+            f32x4::from_slice(simd, &input[4..8]),
+            f32x4::from_slice(simd, &input[8..12]),
+            f32x4::from_slice(simd, &input[12..16]),
+        ]
+    }
+
+    #[inline(always)]
+    fn push_loaded(&mut self, weights: [f32x4<S>; 4], inputs: [f32x4<S>; 4]) {
+        self.even = weights[0].mul_add(inputs[0], self.even);
+        self.odd = weights[1].mul_add(inputs[1], self.odd);
+        self.even = weights[2].mul_add(inputs[2], self.even);
+        self.odd = weights[3].mul_add(inputs[3], self.odd);
+    }
+
+    #[inline(always)]
     fn push(&mut self, simd: S, weights: [f32x4<S>; 4], input: &[f32]) {
-        for (pair, weights) in weights.as_chunks::<2>().0.iter().enumerate() {
-            let offset = pair * 8;
-            self.even = weights[0].mul_add(
-                f32x4::from_slice(simd, &input[offset..offset + 4]),
-                self.even,
-            );
-            self.odd = weights[1].mul_add(
-                f32x4::from_slice(simd, &input[offset + 4..offset + 8]),
-                self.odd,
-            );
-        }
+        self.push_loaded(weights, Self::load_inputs(simd, input));
     }
 
     #[inline(always)]
@@ -143,6 +151,98 @@ fn q6_k<S: Simd>(simd: S, source: &[u8], input: &[f32]) -> f32 {
     dot.finish()
 }
 
+#[inline(always)]
+fn q8_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
+    let scales = sources.map(|source| f32x4::splat(simd, half(source)));
+    let mut dots = std::array::from_fn(|_| Dot::new(simd));
+    for part in 0..2 {
+        let offset = part * 16;
+        let inputs = Dot::load_inputs(simd, &input[offset..offset + 16]);
+        for row_index in 0..4 {
+            let quants = u8x16::from_slice(simd, &sources[row_index][2 + offset..2 + offset + 16]);
+            let weights = signed_lanes(simd, quants).map(|quant| scales[row_index] * quant);
+            dots[row_index].push_loaded(weights, inputs);
+        }
+    }
+    dots.map(Dot::finish)
+}
+
+#[inline(always)]
+fn q4_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
+    let row_scales_min = sources.map(|source| (half(source), half(&source[2..]), &source[4..16]));
+    let mut dots = std::array::from_fn(|_| Dot::new(simd));
+    for group in 0..8 {
+        let params = row_scales_min.map(|(scale, minimum, scales)| {
+            let (s, m) = if group < 4 {
+                (scales[group] & 63, scales[group + 4] & 63)
+            } else {
+                (
+                    (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4),
+                    (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
+                )
+            };
+            (
+                f32x4::splat(simd, scale * f32::from(s)),
+                f32x4::splat(simd, minimum * f32::from(m)),
+            )
+        });
+        for part in 0..2 {
+            let input_start = group * 32 + part * 16;
+            let inputs = Dot::load_inputs(simd, &input[input_start..input_start + 16]);
+            let start = 16 + (group / 2) * 32 + part * 16;
+            for row_index in 0..4 {
+                let packed = u8x16::from_slice(simd, &sources[row_index][start..start + 16]);
+                let quants = if group % 2 == 0 {
+                    packed & u8x16::splat(simd, 15)
+                } else {
+                    packed >> 4
+                };
+                let (multiplier, offset) = params[row_index];
+                // Separate multiply/subtract preserves decode_block's rounding.
+                let weights = unsigned_lanes(simd, quants).map(|quant| multiplier * quant - offset);
+                dots[row_index].push_loaded(weights, inputs);
+            }
+        }
+    }
+    dots.map(Dot::finish)
+}
+
+#[inline(always)]
+fn q6_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
+    let scales = sources.map(|source| half(&source[208..]));
+    let mut dots = std::array::from_fn(|_| Dot::new(simd));
+    for half_index in 0..2 {
+        for quarter in 0..4 {
+            for part in 0..2 {
+                let input_start = half_index * 128 + quarter * 32 + part * 16;
+                let inputs = Dot::load_inputs(simd, &input[input_start..input_start + 16]);
+                let low_start = half_index * 64 + (quarter % 2) * 32 + part * 16;
+                let high_start = 128 + half_index * 32 + part * 16;
+                let shift = [0, 2, 4, 6][quarter];
+                let scale_index = 192 + half_index * 8 + quarter * 2 + part;
+                for row_index in 0..4 {
+                    let source = sources[row_index];
+                    let packed = u8x16::from_slice(simd, &source[low_start..low_start + 16]);
+                    let low = if quarter < 2 {
+                        packed & u8x16::splat(simd, 15)
+                    } else {
+                        packed >> 4
+                    };
+                    let high = u8x16::from_slice(simd, &source[high_start..high_start + 16]);
+                    let high = (high >> shift) & u8x16::splat(simd, 3);
+                    let quants = low | (high << 4);
+                    let subscale = i8::from_le_bytes([source[scale_index]]);
+                    let multiplier = f32x4::splat(simd, scales[row_index] * f32::from(subscale));
+                    let weights = unsigned_lanes(simd, quants)
+                        .map(|quant| multiplier * (quant - f32x4::splat(simd, 32.0)));
+                    dots[row_index].push_loaded(weights, inputs);
+                }
+            }
+        }
+    }
+    dots.map(Dot::finish)
+}
+
 // Interleave four ordinary floating-point rows, retaining one output per SIMD
 // lane. Each lane still adds its products from left to right without FMA, so
 // this removes the scalar accumulation bottleneck without changing its bits.
@@ -189,6 +289,34 @@ pub(super) fn rows<S: Simd>(
                 sum += products;
             }
             sum.store_slice(output);
+            processed += 4;
+        }
+    } else if matches!(kind, 8 | 12 | 14) {
+        let blocks = input.len() / block;
+        for output in destination.as_chunks_mut::<4>().0 {
+            let row0 = processed * row_bytes;
+            for block_index in 0..blocks {
+                let source_offset = block_index * size;
+                let input_offset = block_index * block;
+                let row_slices = [
+                    &source[row0 + source_offset..row0 + source_offset + size],
+                    &source
+                        [row0 + row_bytes + source_offset..row0 + row_bytes + source_offset + size],
+                    &source[row0 + 2 * row_bytes + source_offset
+                        ..row0 + 2 * row_bytes + source_offset + size],
+                    &source[row0 + 3 * row_bytes + source_offset
+                        ..row0 + 3 * row_bytes + source_offset + size],
+                ];
+                let values = &input[input_offset..input_offset + block];
+                let block_sums = match kind {
+                    8 => q8_four(simd, row_slices, values),
+                    12 => q4_k_four(simd, row_slices, values),
+                    _ => q6_k_four(simd, row_slices, values),
+                };
+                for (dst, add) in output.iter_mut().zip(block_sums) {
+                    *dst += add;
+                }
+            }
             processed += 4;
         }
     }
@@ -503,6 +631,53 @@ mod tests {
                         "GGUF type {kind}",
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_four_row_quantized_tiles_match_per_row_bits_across_tails_and_bias() -> io::Result<()>
+    {
+        let level = Level::new();
+        let initial_pool = [-0.0_f32, 0.0, -0.75, 1.25, 0.5, -0.25, 2.5, -1.5, 0.125];
+        for kind in [8, 12, 14] {
+            let (block, size) = packed_layout(kind)?;
+            let width = block * 3;
+            let row_bytes = width / block * size;
+            let input: Vec<f32> = (0..width)
+                .map(|index| (f32::from(i16::try_from(index % 41).unwrap_or(0)) - 20.0) * 0.0625)
+                .collect();
+            for row_count in 1..=9 {
+                let mut bytes: Vec<u8> = (0..row_bytes * row_count)
+                    .map(|index| {
+                        u8::try_from((index * 67 + 19 + row_count * 11) % 256).unwrap_or(0)
+                    })
+                    .collect();
+                for (index, source) in bytes.chunks_exact_mut(size).enumerate() {
+                    let scale = [0x3555_u16, 0xb955, 0x3c00, 0x8000][index % 4];
+                    match kind {
+                        8 => source[..2].copy_from_slice(&scale.to_le_bytes()),
+                        12 => {
+                            source[..2].copy_from_slice(&scale.to_le_bytes());
+                            source[2..4].copy_from_slice(&0x2c01_u16.to_le_bytes());
+                        }
+                        14 => source[208..].copy_from_slice(&scale.to_le_bytes()),
+                        _ => return Err(io::Error::other("Unsupported quantized test type.")),
+                    }
+                }
+                let mut actual = initial_pool[..row_count].to_vec();
+                dispatch!(level, simd => super::rows(simd, kind, &bytes, &input, &mut actual));
+                let mut expected = initial_pool[..row_count].to_vec();
+                for (row_slice, slot) in bytes.chunks_exact(row_bytes).zip(&mut expected) {
+                    *slot =
+                        dispatch!(level, simd => super::row(simd, kind, row_slice, &input, *slot));
+                }
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "GGUF type {kind}, rows {row_count}",
+                );
             }
         }
         Ok(())
