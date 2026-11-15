@@ -357,12 +357,12 @@ const fn byte_encoder() -> [[u8; 2]; 256] {
             codepoint
         };
         // Every GPT-2 byte spelling is an ASCII or two-byte UTF-8 codepoint.
-        let [low, _] = codepoint.to_le_bytes();
-        if codepoint < 128 {
-            result[byte] = [low, 0];
-        } else {
-            let [lead, _] = (0xc0 | (codepoint >> 6)).to_le_bytes();
-            result[byte] = [lead, 0x80 | (low & 0x3f)];
+        let [low, high] = codepoint.to_le_bytes();
+        if let Some(character) = char::from_u32(u32::from_le_bytes([low, high, 0, 0])) {
+            let mut utf8 = [0_u8; 4];
+            let _ = character.encode_utf8(&mut utf8);
+            let [first, second, ..] = utf8;
+            result[byte] = [first, second];
         }
         byte += 1;
     }

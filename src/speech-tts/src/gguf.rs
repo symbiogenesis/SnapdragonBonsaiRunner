@@ -253,12 +253,8 @@ fn skip_bytes(reader: &mut impl Read, count: u64) -> io::Result<()> {
     if count == 0 {
         return Ok(());
     }
-    let mut skipped = 0_u64;
-    let mut scratch = [0_u8; 1024];
-    while skipped < count {
-        let step = usize::try_from((count - skipped).min(1024)).map_err(|_| invalid())?;
-        reader.read_exact(&mut scratch[..step])?;
-        skipped += u64::try_from(step).map_err(|_| invalid())?;
+    if io::copy(&mut reader.take(count), &mut io::sink())? != count {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
     }
     Ok(())
 }

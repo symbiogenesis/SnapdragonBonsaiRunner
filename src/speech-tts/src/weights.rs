@@ -284,7 +284,9 @@ impl Weights {
             );
         }
         let position = reader.stream_position()?;
-        let data = position.checked_add(alignment - 1).ok_or_else(invalid)? / alignment * alignment;
+        let data = position
+            .checked_next_multiple_of(alignment)
+            .ok_or_else(invalid)?;
         if data > length {
             return Err(invalid());
         }
@@ -301,7 +303,7 @@ impl Weights {
             ranges.push((tensor.offset, end));
         }
         ranges.sort_unstable();
-        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        if ranges.array_windows().any(|[left, right]| left.1 > right.0) {
             return Err(invalid());
         }
         Ok(Self {

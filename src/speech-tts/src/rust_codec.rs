@@ -1500,7 +1500,7 @@ mod tests {
             bytes.extend(0_u32.to_le_bytes()); // Independent ordinary F32 fixture.
             bytes.extend(offset.to_le_bytes());
         }
-        bytes.resize(bytes.len().div_ceil(32) * 32, 0);
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
         for value in 0_u16..7 * 96 {
             bytes.extend(f32::from(value).to_le_bytes());
         }

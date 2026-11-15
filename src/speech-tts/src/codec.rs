@@ -1445,12 +1445,12 @@ impl CodecStateCache {
         }
         let state = prime()?;
         self.stamp = self.stamp.saturating_add(1);
-        let mut lru_idx = 0_usize;
-        for i in 1..CODEC_SNAP_SLOTS {
-            if self.slots[i].stamp < self.slots[lru_idx].stamp {
-                lru_idx = i;
-            }
-        }
+        let lru_idx = self
+            .slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, slot)| slot.stamp)
+            .map_or(0, |(idx, _)| idx);
         self.slots[lru_idx] = CodecStateSnap {
             key,
             stamp: self.stamp,
@@ -1472,12 +1472,12 @@ impl CodecStateCache {
             existing.stamp = self.stamp;
             return;
         }
-        let mut lru_idx = 0_usize;
-        for i in 1..CODEC_SNAP_SLOTS {
-            if self.slots[i].stamp < self.slots[lru_idx].stamp {
-                lru_idx = i;
-            }
-        }
+        let lru_idx = self
+            .slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, slot)| slot.stamp)
+            .map_or(0, |(idx, _)| idx);
         self.slots[lru_idx] = CodecStateSnap {
             key,
             stamp: self.stamp,
