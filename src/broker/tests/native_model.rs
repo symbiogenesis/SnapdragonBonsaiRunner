@@ -215,27 +215,6 @@ fn reviewed_memory_context_release(version: Option<&str>, revision: Option<&str>
 
 fn native_four_worker_release(version: Option<&str>, revision: Option<&str>) -> bool {
     reviewed_memory_context_release(version, revision)
-        || matches!(
-            version,
-            Some(
-                "0.1.9"
-                    | "0.1.10"
-                    | "0.1.11"
-                    | "0.1.12"
-                    | "0.1.13"
-                    | "0.1.14"
-                    | "0.1.15"
-                    | "0.1.16"
-                    | "0.1.17"
-                    | "0.1.18"
-                    | "0.1.19"
-                    | "0.1.20"
-                    | "0.1.21"
-                    | "0.1.22"
-                    | "0.1.23"
-                    | "0.1.25"
-            )
-        )
 }
 
 fn worker_readiness_receipt(
@@ -245,30 +224,10 @@ fn worker_readiness_receipt(
     verified: bool,
 ) -> Value {
     // These reviewed owners require a matching field from the instantiated graph.
-    // Historical versions may omit it, and later versions need another review.
-    // A configured argument or a receipt written before start cannot supply it.
-    let observed = (reviewed_memory_context_release(version, revision)
-        || matches!(
-            version,
-            Some(
-                "0.1.11"
-                    | "0.1.12"
-                    | "0.1.13"
-                    | "0.1.14"
-                    | "0.1.15"
-                    | "0.1.16"
-                    | "0.1.17"
-                    | "0.1.18"
-                    | "0.1.19"
-                    | "0.1.20"
-                    | "0.1.21"
-                    | "0.1.22"
-                    | "0.1.23"
-                    | "0.1.25"
-            )
-        ))
-        && matches!(expected, 1 | 4)
-        && verified;
+    // Historical versions without reviewed revisions cannot supply it, and later
+    // versions need another review. Configured arguments cannot supply it.
+    let observed =
+        reviewed_memory_context_release(version, revision) && matches!(expected, 1 | 4) && verified;
     json!({"configuredNativeRowWorkers":expected, "verifiedReadinessObserved":verified,
         "rowWorkerReadinessVersion":version,"rowWorkerReadinessRevision":revision,
         "rowWorkerCountIndependentlyObserved":observed,
@@ -319,66 +278,20 @@ fn assert_worker_receipt_case(
 
 #[test]
 fn native_worker_receipts_require_exact_release_and_verified_readiness() {
-    for version in ["0.1.9", "0.1.10"] {
-        assert_worker_receipt_case(Some(version), None, true, false);
-    }
-    for version in [
-        "0.1.11", "0.1.12", "0.1.13", "0.1.14", "0.1.15", "0.1.16", "0.1.17", "0.1.18", "0.1.19",
-        "0.1.20", "0.1.21", "0.1.22", "0.1.23", "0.1.25",
-    ] {
-        assert_worker_receipt_case(Some(version), None, true, true);
-    }
     for version in [
         "0.1.8",
-        "0.1.24",
+        "0.1.9",
+        "0.1.10",
+        "0.1.11",
+        "0.1.25",
         "0.1.26",
-        "v0.1.22",
-        "0.1.22-dev",
-        "0.1.22.0",
-        "0.1.022",
-        "v0.1.21",
-        "0.1.21-dev",
-        "0.1.21.0",
-        "0.1.021",
-        "v0.1.20",
-        "0.1.20-dev",
-        "0.1.20.0",
-        "0.1.020",
-        "v0.1.19",
-        "0.1.19-dev",
-        "0.1.19.0",
-        "0.1.019",
-        "v0.1.18",
-        "0.1.18-dev",
-        "0.1.18.0",
-        "0.1.018",
-        "v0.1.17",
-        "0.1.17-dev",
-        "0.1.17.0",
-        "0.1.017",
-        "v0.1.16",
-        "0.1.16-dev",
-        "0.1.16.0",
-        "0.1.016",
-        "v0.1.15",
-        "0.1.15-dev",
-        "0.1.15.0",
-        "0.1.015",
-        "v0.1.14",
-        "0.1.14-dev",
-        "0.1.14.0",
-        "0.1.014",
-        "v0.1.13",
-        "0.1.13-dev",
-        "0.1.13.0",
-        "0.1.013",
-        "v0.1.12",
-        "0.1.12-dev",
-        "0.1.12.0",
-        "v0.1.11",
-        "0.1.11-dev",
-        "0.1.11.0",
-        "0.1.011",
+        "0.1.27",
+        "0.1.28",
+        "0.1.29",
+        "v0.1.28",
+        "0.1.28-dev",
+        "0.1.28.0",
+        "0.1.028",
         "",
     ] {
         assert_worker_receipt_case(Some(version), None, false, false);
@@ -444,24 +357,6 @@ fn native_worker_receipts_read_the_compiled_release_identity() {
         reviewed_memory_context_release(
             runtime_lock["version"].as_str(),
             runtime_lock["commit"].as_str(),
-        ) || matches!(
-            runtime_lock["version"].as_str(),
-            Some(
-                "0.1.11"
-                    | "0.1.12"
-                    | "0.1.13"
-                    | "0.1.14"
-                    | "0.1.15"
-                    | "0.1.16"
-                    | "0.1.17"
-                    | "0.1.18"
-                    | "0.1.19"
-                    | "0.1.20"
-                    | "0.1.21"
-                    | "0.1.22"
-                    | "0.1.23"
-                    | "0.1.25"
-            )
         )
     );
 }

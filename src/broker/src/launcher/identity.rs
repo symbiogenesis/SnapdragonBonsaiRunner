@@ -493,7 +493,7 @@ mod tests {
             for adapter in [false, true] {
                 let (mut model, _) = kv_cache_model(repacked, adapter);
                 let auto =
-                    WorkerReadiness::for_version("0.1.25", 4).with_kv_cache(Some(KvCache::Rsq4));
+                    WorkerReadiness::for_version("0.1.27", 4).with_kv_cache(Some(KvCache::Rsq4));
                 let cpu = auto.with_placement(Placement::Cpu);
                 assert!(
                     validate_native_identity(&model_response(&model)?, repacked, adapter, auto)
@@ -555,7 +555,7 @@ mod tests {
                 }
             }
         }
-        let cpu = WorkerReadiness::for_version("0.1.25", 4).with_placement(Placement::Cpu);
+        let cpu = WorkerReadiness::for_version("0.1.27", 4).with_placement(Placement::Cpu);
         for extra in [
             "\"placement\":\"cpu\",\"projection_backend\":\"cpu\",\"placement\":\"cpu\"",
             "\"placement\":\"cpu\",\"projection_backend\":\"cpu\",\"projection_backend\":\"cpu\"",
@@ -580,7 +580,7 @@ mod tests {
                     let graph = graph.replace("kv-rsq4-", &format!("kv-{}-", policy.name()));
                     model["kv_cache"] = json!(policy.name());
                     model["startup_graph_identity"] = json!(graph);
-                    let f16 = WorkerReadiness::for_version("0.1.25", 4);
+                    let f16 = WorkerReadiness::for_version("0.1.27", 4);
                     let selected = f16.with_kv_cache(Some(policy));
                     let bytes = model_response(&model)?;
                     assert!(validate_native_identity(&bytes, repacked, adapter, selected).is_ok());
@@ -666,53 +666,14 @@ mod tests {
             ("0.1.8", true),
             ("0.1.9", true),
             ("0.1.10", true),
+            ("0.1.7", false),
             ("0.1.11", false),
-            ("0.1.12", false),
-            ("0.1.13", false),
-            ("0.1.14", false),
-            ("0.1.14-dev", false),
-            ("v0.1.14", false),
-            ("0.1.14.0", false),
-            ("0.1.014", false),
-            ("0.1.15", false),
-            ("0.1.15-dev", false),
-            ("v0.1.15", false),
-            ("0.1.15.0", false),
-            ("0.1.015", false),
-            ("0.1.16", false),
-            ("0.1.16-dev", false),
-            ("v0.1.16", false),
-            ("0.1.16.0", false),
-            ("0.1.016", false),
-            ("0.1.17", false),
-            ("0.1.17-dev", false),
-            ("v0.1.17", false),
-            ("0.1.17.0", false),
-            ("0.1.017", false),
-            ("0.1.18", false),
-            ("0.1.18-dev", false),
-            ("v0.1.18", false),
-            ("0.1.18.0", false),
-            ("0.1.018", false),
-            ("0.1.19", false),
-            ("0.1.19-dev", false),
-            ("v0.1.19", false),
-            ("0.1.19.0", false),
-            ("0.1.019", false),
-            ("0.1.20", false),
-            ("0.1.20-dev", false),
-            ("v0.1.20", false),
-            ("0.1.20.0", false),
-            ("0.1.020", false),
-            ("0.1.21", false),
-            ("0.1.21-dev", false),
-            ("v0.1.21", false),
-            ("0.1.21.0", false),
-            ("0.1.021", false),
-            ("0.1.22", false),
-            ("1.0.0", false),
-            ("0.1.010", false),
+            ("0.1.27", false),
+            ("0.1.10-dev", false),
             ("v0.1.10", false),
+            ("0.1.10.0", false),
+            ("0.1.010", false),
+            ("1.0.0", false),
             ("", false),
         ] {
             for expected in [1, 4] {
@@ -741,7 +702,7 @@ mod tests {
 
     #[test]
     fn prompt_reuse_readiness_must_match_the_explicit_request_exactly() {
-        let reset = WorkerReadiness::for_version("0.1.14", 4);
+        let reset = WorkerReadiness::for_version("0.1.27", 4);
         let latest = reset.with_prompt_reuse(true);
         assert!(validate_native_identity(&response(Some("4")), false, false, reset).is_ok());
         assert!(validate_native_identity(&response(Some("4")), false, false, latest).is_err());
@@ -771,10 +732,7 @@ mod tests {
     -> Result<(), serde_json::Error> {
         use serde_json::json;
 
-        for version in [
-            "0.1.11", "0.1.12", "0.1.13", "0.1.14", "0.1.15", "0.1.16", "0.1.17", "0.1.18",
-            "0.1.19", "0.1.20", "0.1.21", "0.1.22",
-        ] {
+        for version in ["0.1.11", "0.1.27"] {
             for repacked in [false, true] {
                 for adapter in [false, true] {
                     for expected in [1, 4] {
@@ -829,10 +787,7 @@ mod tests {
 
     #[test]
     fn worker_readiness_rejects_coercion_unbounded_counts_and_duplicate_fields() {
-        for version in [
-            "0.1.10", "0.1.11", "0.1.12", "0.1.13", "0.1.14", "0.1.15", "0.1.16", "0.1.17",
-            "0.1.18", "0.1.19", "0.1.20", "0.1.21", "0.1.22", "0.1.22",
-        ] {
+        for version in ["0.1.10", "0.1.11", "0.1.27"] {
             let policy = WorkerReadiness::for_version(version, 4);
             for invalid in [
                 "null",
@@ -892,9 +847,9 @@ mod context_tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-        let selected = WorkerReadiness::for_version("0.1.25", 1).with_context_tokens(16384);
+        let selected = WorkerReadiness::for_version("0.1.27", 1).with_context_tokens(16384);
         assert!(validate_native_identity(wire.as_bytes(), false, false, selected).is_ok());
-        let legacy = WorkerReadiness::for_version("0.1.25", 1);
+        let legacy = WorkerReadiness::for_version("0.1.27", 1);
         assert!(validate_native_identity(wire.as_bytes(), false, false, legacy).is_err());
     }
 }

@@ -21,10 +21,6 @@ pub(super) const ADAPTER_SHA256: &str =
 pub(super) const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 
-// Source review enables the policy; actual use still requires the separately
-// verified released executable in LOCK. Newer versions need another source review.
-const TURBOQUANT_REVISION: &str = "99bab71270b1e6a6fb6d47eec2e34b8097cdcd4c";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KvCache {
     F16,
@@ -97,12 +93,9 @@ fn reviewed_release_matches(release: &ReleasePin, identity: Option<(&str, &str)>
 }
 
 fn turboquant_supported(release: &ReleasePin, memory_release: Option<(&str, &str)>) -> bool {
-    (release.version == "0.1.25" && release.commit == TURBOQUANT_REVISION)
-        || (release.version == "0.1.24"
-            && release.commit == "8d2b3067e5f17369f579857a180c01a422a58211")
-        // M1/M2 review includes the selected K4/V4 cache and its source-bound
-        // readiness contract; delivery must retain the ordinary cache default.
-        || reviewed_release_matches(release, memory_release)
+    // M1/M2 review includes the selected K4/V4 cache and its source-bound
+    // readiness contract; delivery must retain the ordinary cache default.
+    reviewed_release_matches(release, memory_release)
 }
 
 fn select_kv_cache(
@@ -254,30 +247,7 @@ fn row_workers_supported(
     workers: u8,
     memory_release: Option<(&str, &str)>,
 ) -> Result<(), LaunchError> {
-    if workers == 1
-        || (workers == 4
-            && (reviewed_release_matches(release, memory_release)
-                || matches!(
-                    release.version.as_str(),
-                    "0.1.9"
-                        | "0.1.10"
-                        | "0.1.11"
-                        | "0.1.12"
-                        | "0.1.13"
-                        | "0.1.14"
-                        | "0.1.15"
-                        | "0.1.16"
-                        | "0.1.17"
-                        | "0.1.18"
-                        | "0.1.19"
-                        | "0.1.20"
-                        | "0.1.21"
-                        | "0.1.22"
-                        | "0.1.23"
-                        | "0.1.24"
-                        | "0.1.25"
-                )))
-    {
+    if workers == 1 || (workers == 4 && reviewed_release_matches(release, memory_release)) {
         Ok(())
     } else {
         Err(LaunchError::Artifacts)
@@ -356,29 +326,7 @@ pub(super) fn pinned_version() -> Result<String, LaunchError> {
 fn prompt_reuse_supported(release: &ReleasePin, latest: bool) -> Result<(), LaunchError> {
     // Capability is bound to reviewed source and immutable released bytes. A
     // later version must be reviewed explicitly, even if its CLI looks similar.
-    if !latest
-        || turboquant_supported(release, MEMORY_CONTEXT_RELEASE)
-        || (release.version == "0.1.14"
-            && release.commit == "9e8ea3e2c042ab0c3f1a8e9596ff155e202c3c57")
-        || (release.version == "0.1.15"
-            && release.commit == "730be3acc7f8893af1397ec85f71da7fee80c3be")
-        || (release.version == "0.1.16"
-            && release.commit == "88d812b563c930c20843f8d88f1b27a849db50a5")
-        || (release.version == "0.1.17"
-            && release.commit == "958fd4a8bc3feb2ae1f923d15d279eb191a4fd6f")
-        || (release.version == "0.1.18"
-            && release.commit == "c4cfe40eedd3d7913a225cfa494ac596c948c9c9")
-        || (release.version == "0.1.19"
-            && release.commit == "951cc88486fdc5609a3aa57aad3b9e92216de2b1")
-        || (release.version == "0.1.20"
-            && release.commit == "3a22fefc497da3d571c07bba072f270fc9c4b135")
-        || (release.version == "0.1.21"
-            && release.commit == "90eb97481a8df532cc0375660a1533bb0c5fe4cb")
-        || (release.version == "0.1.22"
-            && release.commit == "6b4f4520b465e5feb665a71af64e7b0e21eb750a")
-        || (release.version == "0.1.23"
-            && release.commit == "055c7430cb4771dfddb24ddaa30494af6ad182da")
-    {
+    if !latest || turboquant_supported(release, MEMORY_CONTEXT_RELEASE) {
         Ok(())
     } else {
         Err(LaunchError::Artifacts)
@@ -417,12 +365,9 @@ mod tests {
         let mut pin = release(LOCK)?;
         assert_eq!(select_placement(&pin, Placement::Cpu)?, Placement::Cpu);
         for (version, commit) in [
-            ("0.1.25", TURBOQUANT_REVISION),
-            ("0.1.26", TURBOQUANT_REVISION),
-            ("0.1.26", "0000000000000000000000000000000000000000"),
-            ("0.1.27", "0000000000000000000000000000000000000000"),
-            ("0.1.28", "0000000000000000000000000000000000000000"),
             ("0.1.27", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
+            ("0.1.29", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
+            ("0.1.28", "0000000000000000000000000000000000000000"),
             ("0.1.28", "1429a33772089dfd3a50a96c698b9dbe0b36836a"),
         ] {
             pin.version = version.into();
@@ -475,26 +420,20 @@ mod tests {
             select_kv_cache(&pin, Some(KvCache::Rsq4))?,
             Some(KvCache::Rsq4)
         );
-        pin.version = "0.1.23".into();
-        pin.commit = "055c7430cb4771dfddb24ddaa30494af6ad182da".into();
-        assert_eq!(select_kv_cache(&pin, None)?, None);
-        assert_eq!(select_kv_cache(&pin, Some(KvCache::F16))?, None);
-        assert_eq!(
-            select_kv_cache(&pin, Some(KvCache::Rsq4)),
-            Err(LaunchError::NativeRuntime)
-        );
-        pin.version = "0.1.25".into();
-        pin.commit = "0".repeat(40);
-        assert_eq!(
-            select_kv_cache(&pin, Some(KvCache::Rsq4)),
-            Err(LaunchError::NativeRuntime)
-        );
-        pin.commit = TURBOQUANT_REVISION.into();
-        pin.version = "0.1.26".into();
-        assert_eq!(
-            select_kv_cache(&pin, Some(KvCache::Rsq4)),
-            Err(LaunchError::NativeRuntime)
-        );
+        for (version, commit) in [
+            ("0.1.27", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
+            ("0.1.29", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
+            ("0.1.28", "0000000000000000000000000000000000000000"),
+        ] {
+            pin.version = version.into();
+            pin.commit = commit.into();
+            assert_eq!(select_kv_cache(&pin, None)?, None);
+            assert_eq!(select_kv_cache(&pin, Some(KvCache::F16))?, None);
+            assert_eq!(
+                select_kv_cache(&pin, Some(KvCache::Rsq4)),
+                Err(LaunchError::NativeRuntime)
+            );
+        }
         Ok(())
     }
 
@@ -534,10 +473,9 @@ mod tests {
             KvCache::Rsq4K3v
         );
         for (version, commit) in [
-            ("0.1.25", TURBOQUANT_REVISION),
-            ("0.1.24", "8d2b3067e5f17369f579857a180c01a422a58211"),
-            ("0.1.26", TURBOQUANT_REVISION),
-            ("0.1.26", "0000000000000000000000000000000000000000"),
+            ("0.1.27", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
+            ("0.1.29", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
+            ("0.1.28", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -558,51 +496,16 @@ mod tests {
     fn latest_prompt_reuse_requires_exact_reviewed_release_source() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
         assert!(prompt_reuse_supported(&pin, true).is_ok());
-        pin.commit = "0".repeat(40);
-        assert_eq!(
-            prompt_reuse_supported(&pin, true),
-            Err(LaunchError::Artifacts)
-        );
-        assert!(prompt_reuse_supported(&pin, false).is_ok());
-        pin.commit = "9e8ea3e2c042ab0c3f1a8e9596ff155e202c3c57".into();
         for version in [
-            "0.1.13",
-            "0.1.15",
-            "0.1.16",
-            "0.1.17",
-            "0.1.18",
-            "0.1.19",
-            "0.1.20",
-            "0.1.21",
-            "0.1.22",
-            "0.1.23",
-            "0.1.22-dev",
-            "v0.1.22",
-            "0.1.022",
-            "0.1.21-dev",
-            "v0.1.21",
-            "0.1.021",
-            "0.1.20-dev",
-            "v0.1.20",
-            "0.1.020",
-            "0.1.19-dev",
-            "v0.1.19",
-            "0.1.019",
-            "0.1.18-dev",
-            "v0.1.18",
-            "0.1.018",
-            "0.1.17-dev",
-            "v0.1.17",
-            "0.1.017",
-            "0.1.16-dev",
-            "v0.1.16",
-            "0.1.016",
-            "0.1.15-dev",
-            "v0.1.15",
-            "0.1.015",
-            "0.1.14-dev",
-            "v0.1.14",
-            "0.1.014",
+            "0.1.25",
+            "0.1.27",
+            "0.1.29",
+            "0.1.28-dev",
+            "v0.1.28",
+            "0.1.28.0",
+            "0.1.028",
+            "",
+            "latest",
         ] {
             pin.version = version.into();
             assert_eq!(
@@ -611,6 +514,13 @@ mod tests {
             );
             assert!(prompt_reuse_supported(&pin, false).is_ok());
         }
+        pin = release(LOCK)?;
+        pin.commit = "0".repeat(40);
+        assert_eq!(
+            prompt_reuse_supported(&pin, true),
+            Err(LaunchError::Artifacts)
+        );
+        assert!(prompt_reuse_supported(&pin, false).is_ok());
         Ok(())
     }
 
@@ -667,89 +577,41 @@ mod tests {
     #[test]
     fn four_row_workers_require_the_reviewed_parallel_release() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
-        pin.version = "0.1.8".into();
         assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
-        for version in [
-            "0.1.9", "0.1.10", "0.1.11", "0.1.12", "0.1.13", "0.1.14", "0.1.15", "0.1.16",
-            "0.1.17", "0.1.18", "0.1.19", "0.1.20", "0.1.21", "0.1.22", "0.1.23", "0.1.24",
-            "0.1.25",
-        ] {
-            pin.version = version.into();
-            assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
-            assert!(row_workers_supported(&pin, 4, MEMORY_CONTEXT_RELEASE).is_ok());
-            for workers in [0, 2, 3, 5, 16, 255] {
-                assert_eq!(
-                    row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE),
-                    Err(LaunchError::Artifacts)
-                );
-            }
-        }
-        pin.version = "0.1.28".into();
         assert!(row_workers_supported(&pin, 4, MEMORY_CONTEXT_RELEASE).is_ok());
-        pin.commit = "0".repeat(40);
+        for workers in [0, 2, 3, 5, 16, 255] {
+            assert_eq!(
+                row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE),
+                Err(LaunchError::Artifacts)
+            );
+        }
         for version in [
             "0.1.8",
-            "0.1.26",
+            "0.1.9",
+            "0.1.25",
             "0.1.27",
-            "0.1.28",
-            "0.1.22-dev",
-            "v0.1.22",
-            "0.1.22.0",
-            "0.1.022",
-            "0.1.21-dev",
-            "v0.1.21",
-            "0.1.21.0",
-            "0.1.021",
-            "0.1.20-dev",
-            "v0.1.20",
-            "0.1.20.0",
-            "0.1.020",
-            "0.1.19-dev",
-            "v0.1.19",
-            "0.1.19.0",
-            "0.1.019",
-            "0.1.18-dev",
-            "v0.1.18",
-            "0.1.18.0",
-            "0.1.018",
-            "0.1.17-dev",
-            "v0.1.17",
-            "0.1.17.0",
-            "0.1.017",
-            "0.1.16-dev",
-            "v0.1.16",
-            "0.1.16.0",
-            "0.1.016",
-            "0.1.15-dev",
-            "v0.1.15",
-            "0.1.15.0",
-            "0.1.015",
-            "0.1.14-dev",
-            "v0.1.14",
-            "0.1.14.0",
-            "0.1.014",
-            "0.1.13-dev",
-            "v0.1.13",
-            "0.1.13.0",
-            "0.1.013",
-            "0.1.9-dev",
-            "0.1.10-dev",
-            "0.1.11-dev",
-            "0.1.12-dev",
-            "v0.1.12",
-            "v0.1.11",
-            "v0.1.10",
-            "0.1.12.0",
-            "0.1.10.0",
+            "0.1.29",
+            "0.1.28-dev",
+            "v0.1.28",
+            "0.1.28.0",
+            "0.1.028",
             "",
             "latest",
         ] {
             pin.version = version.into();
+            assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
             assert_eq!(
                 row_workers_supported(&pin, 4, MEMORY_CONTEXT_RELEASE),
                 Err(LaunchError::Artifacts)
             );
         }
+        pin = release(LOCK)?;
+        pin.commit = "0".repeat(40);
+        assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
+        assert_eq!(
+            row_workers_supported(&pin, 4, MEMORY_CONTEXT_RELEASE),
+            Err(LaunchError::Artifacts)
+        );
         Ok(())
     }
 
@@ -772,7 +634,7 @@ mod tests {
         for identity in [
             None,
             Some(("0.1.27", "1111111111111111111111111111111111111111")),
-            Some(("0.1.26", TURBOQUANT_REVISION)),
+            Some(("0.1.26", "0000000000000000000000000000000000000000")),
         ] {
             assert!(!reviewed_release_matches(&pin, identity));
             assert!(!turboquant_supported(&pin, identity));
