@@ -28,12 +28,17 @@ use windows::{
         UI::Shell::{
             Common::COMDLG_FILTERSPEC, FILEOPENDIALOGOPTIONS, FOS_ALLOWMULTISELECT,
             FOS_DONTADDTORECENT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
-            FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_STRICTFILETYPES, FileOpenDialog,
-            FileSaveDialog, IFileDialog, IShellItem, SIGDN_FILESYSPATH,
+            FOS_NODEREFERENCELINKS, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_STRICTFILETYPES,
+            FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IShellItem,
+            IShellItemArray, SIGDN_FILESYSPATH,
         },
     },
-    core::{AgileReference, Error, HRESULT, PCWSTR, PWSTR},
+    core::{AgileReference, Error, HRESULT, Interface as _, PCWSTR, PWSTR},
 };
+
+/// Maximum number of files accepted from a single multi-file picker selection.
+#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
+pub(crate) const MAX_PICKED_FILES: usize = 8;
 
 const PICKER_CANCELLED: HRESULT = HRESULT::from_win32(ERROR_CANCELLED.0);
 const POLL: Duration = Duration::from_millis(10);
@@ -179,6 +184,23 @@ pub(crate) struct DialogSpec<'a> {
     pub(crate) filters: &'a [FilterSpec<'a>],
 }
 
+/// Declarative configuration for a multi-file modal Open dialog.
+#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
+pub(crate) struct MultiDialogSpec<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) ok_button_label: &'a str,
+    pub(crate) filters: &'a [FilterSpec<'a>],
+}
+
+/// Classification of multi-file modal Open dialog failures.
+#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MultiDialogError {
+    Cancelled,
+    TooManyFiles { selected: usize, max: usize },
+    Failed,
+}
+
 /// Accepted path and 1-based selected filter index returned by `run_modal`.
 pub(crate) struct DialogSelection {
     pub(crate) path: PathBuf,
@@ -298,29 +320,7 @@ impl<'a> ModalDialog<'a> {
         let options = dialog_options(existing, matches!(spec.mode, DialogMode::Save { .. }));
         // SAFETY: Applies sanitized single-file filesystem flags on the owning STA thread.
         unsafe { inner.SetOptions(options) }.map_err(|_| DialogError::Unavailable)?;
-        if !spec.filters.is_empty() {
-            let wide_filters: Vec<(Vec<u16>, Vec<u16>)> = spec
-                .filters
-                .iter()
-                .map(|filter| {
-                    (
-                        encode_wide_nul(filter.name),
-                        encode_wide_nul(filter.pattern),
-                    )
-                })
-                .collect();
-            let com_filters: Vec<COMDLG_FILTERSPEC> = wide_filters
-                .iter()
-                .map(|(name, pattern)| COMDLG_FILTERSPEC {
-                    pszName: PCWSTR(name.as_ptr()),
-                    pszSpec: PCWSTR(pattern.as_ptr()),
-                })
-                .collect();
-            // SAFETY: `wide_filters` remains alive and NUL-terminated during SetFileTypes.
-            unsafe { inner.SetFileTypes(&com_filters) }.map_err(|_| DialogError::Unavailable)?;
-            // SAFETY: Selects the first 1-based entry configured in `com_filters`.
-            unsafe { inner.SetFileTypeIndex(1) }.map_err(|_| DialogError::Unavailable)?;
-        }
+        configure_filters_and_title(&inner, spec.filters, spec.title)?;
         if let DialogMode::Save {
             default_extension,
             default_file_name,
@@ -335,9 +335,6 @@ impl<'a> ModalDialog<'a> {
             unsafe { inner.SetFileName(PCWSTR(name.as_ptr())) }
                 .map_err(|_| DialogError::Unavailable)?;
         }
-        let title = encode_wide_nul(spec.title);
-        // SAFETY: `title` remains alive and NUL-terminated during SetTitle.
-        unsafe { inner.SetTitle(PCWSTR(title.as_ptr())) }.map_err(|_| DialogError::Unavailable)?;
         Ok(Self {
             inner,
             _apartment: apartment,
@@ -419,6 +416,141 @@ pub(crate) const fn dialog_options(
     )
 }
 
+/// Computes sanitized multi-file Open filesystem options while rejecting link dereferencing.
+#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
+pub(crate) const fn multi_open_dialog_options(
+    existing: FILEOPENDIALOGOPTIONS,
+) -> FILEOPENDIALOGOPTIONS {
+    FILEOPENDIALOGOPTIONS(
+        existing.0
+            | FOS_ALLOWMULTISELECT.0
+            | FOS_DONTADDTORECENT.0
+            | FOS_FILEMUSTEXIST.0
+            | FOS_FORCEFILESYSTEM.0
+            | FOS_NOCHANGEDIR.0
+            | FOS_NODEREFERENCELINKS.0
+            | FOS_PATHMUSTEXIST.0,
+    )
+}
+
+#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
+fn validate_picked_count(count: u32) -> Result<u32, MultiDialogError> {
+    if count == 0 {
+        return Err(MultiDialogError::Cancelled);
+    }
+    let selected = usize::try_from(count).unwrap_or(usize::MAX);
+    if selected > MAX_PICKED_FILES {
+        return Err(MultiDialogError::TooManyFiles {
+            selected,
+            max: MAX_PICKED_FILES,
+        });
+    }
+    Ok(count)
+}
+
+/// Runs a modal multi-file `IFileOpenDialog` on a fresh STA apartment with cross-thread cancel.
+#[allow(dead_code, reason = "Temporary until Step B5 wires multi-file picker.")]
+pub(crate) fn run_multi_open_modal(
+    owner: isize,
+    cancel: &Cancel,
+    cancelled: &AtomicBool,
+    spec: &MultiDialogSpec<'_>,
+) -> Result<Vec<PathBuf>, MultiDialogError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(MultiDialogError::Cancelled);
+    }
+    let apartment = Apartment::sta().map_err(|_| MultiDialogError::Failed)?;
+    // SAFETY: In-process COM activation of IFileOpenDialog on the caller's STA thread.
+    let open_dialog: IFileOpenDialog =
+        unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|_| MultiDialogError::Failed)?;
+    let base: IFileDialog = open_dialog.cast().map_err(|_| MultiDialogError::Failed)?;
+    // SAFETY: Valid IFileDialog interface on its owning STA thread.
+    let existing = unsafe { base.GetOptions() }.map_err(|_| MultiDialogError::Failed)?;
+    let options = multi_open_dialog_options(existing);
+    // SAFETY: Applies multi-file filesystem flags on the owning STA thread.
+    unsafe { base.SetOptions(options) }.map_err(|_| MultiDialogError::Failed)?;
+    configure_filters_and_title(&base, spec.filters, spec.title)
+        .map_err(|_| MultiDialogError::Failed)?;
+    if !spec.ok_button_label.is_empty() {
+        let label = encode_wide_nul(spec.ok_button_label);
+        // SAFETY: `label` remains alive and NUL-terminated during SetOkButtonLabel.
+        unsafe { base.SetOkButtonLabel(PCWSTR(label.as_ptr())) }
+            .map_err(|_| MultiDialogError::Failed)?;
+    }
+    let modal = ModalDialog {
+        inner: base,
+        _apartment: &apartment,
+    };
+    let active = ActiveDialog::publish(cancel, cancelled, &modal).map_err(|error| match error {
+        DialogError::Cancelled => MultiDialogError::Cancelled,
+        DialogError::Unavailable | DialogError::ResultInvalid => MultiDialogError::Failed,
+    })?;
+    let show_result = modal.show(NonZeroIsize::new(owner));
+    drop(active);
+    match classify_picker_show(show_result, cancelled.load(Ordering::Acquire)) {
+        Ok(true) => {}
+        Ok(false) | Err(DialogError::Cancelled) => return Err(MultiDialogError::Cancelled),
+        Err(DialogError::Unavailable | DialogError::ResultInvalid) => {
+            return Err(MultiDialogError::Failed);
+        }
+    }
+    // SAFETY: Dialog accepted cleanly on the owning STA thread; fetch IShellItemArray results.
+    let results: IShellItemArray =
+        unsafe { open_dialog.GetResults() }.map_err(|_| MultiDialogError::Failed)?;
+    // SAFETY: Valid IShellItemArray owned on the STA thread.
+    let count = validate_picked_count(
+        unsafe { results.GetCount() }.map_err(|_| MultiDialogError::Failed)?,
+    )?;
+    let capacity = usize::try_from(count).unwrap_or(MAX_PICKED_FILES);
+    let mut paths = Vec::with_capacity(capacity);
+    for index in 0..count {
+        // SAFETY: `index` is strictly below `count` from GetCount on this STA thread.
+        let item: IShellItem =
+            unsafe { results.GetItemAt(index) }.map_err(|_| MultiDialogError::Failed)?;
+        // SAFETY: Resolves the filesystem path for a selected item; CoTaskMemString frees it.
+        let raw = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
+            .map_err(|_| MultiDialogError::Failed)?;
+        let path = CoTaskMemString::from_pwstr(raw)
+            .into_path_buf()
+            .ok_or(MultiDialogError::Failed)?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn configure_filters_and_title(
+    inner: &IFileDialog,
+    filters: &[FilterSpec<'_>],
+    title: &str,
+) -> Result<(), DialogError> {
+    if !filters.is_empty() {
+        let wide_filters: Vec<(Vec<u16>, Vec<u16>)> = filters
+            .iter()
+            .map(|filter| {
+                (
+                    encode_wide_nul(filter.name),
+                    encode_wide_nul(filter.pattern),
+                )
+            })
+            .collect();
+        let com_filters: Vec<COMDLG_FILTERSPEC> = wide_filters
+            .iter()
+            .map(|(name, pattern)| COMDLG_FILTERSPEC {
+                pszName: PCWSTR(name.as_ptr()),
+                pszSpec: PCWSTR(pattern.as_ptr()),
+            })
+            .collect();
+        // SAFETY: `wide_filters` remains alive and NUL-terminated during SetFileTypes.
+        unsafe { inner.SetFileTypes(&com_filters) }.map_err(|_| DialogError::Unavailable)?;
+        // SAFETY: Selects the first 1-based entry configured in `com_filters`.
+        unsafe { inner.SetFileTypeIndex(1) }.map_err(|_| DialogError::Unavailable)?;
+    }
+    let title = encode_wide_nul(title);
+    // SAFETY: `title` remains alive and NUL-terminated during SetTitle.
+    unsafe { inner.SetTitle(PCWSTR(title.as_ptr())) }.map_err(|_| DialogError::Unavailable)
+}
+
 /// Classifies `IFileDialog::Show` completion while giving external cancellation priority.
 pub(crate) fn classify_picker_show(
     result: windows::core::Result<()>,
@@ -451,5 +583,52 @@ fn close_dialog(dialog: AgileReference<IFileDialog>, showing: &AtomicBool) {
         if showing.load(Ordering::Acquire) {
             thread::sleep(POLL);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_open_options_enable_multiselect_and_link_safety() {
+        let flags = multi_open_dialog_options(FILEOPENDIALOGOPTIONS(0));
+        for required in [
+            FOS_ALLOWMULTISELECT,
+            FOS_DONTADDTORECENT,
+            FOS_FILEMUSTEXIST,
+            FOS_FORCEFILESYSTEM,
+            FOS_NOCHANGEDIR,
+            FOS_NODEREFERENCELINKS,
+            FOS_PATHMUSTEXIST,
+        ] {
+            assert_ne!(flags.0 & required.0, 0);
+        }
+    }
+
+    #[test]
+    fn multi_open_count_validation_enforces_zero_and_upper_bound() {
+        let filters = [FilterSpec {
+            name: "Images",
+            pattern: "*.png;*.jpg",
+        }];
+        let spec = MultiDialogSpec {
+            title: "Attach files",
+            ok_button_label: "Attach",
+            filters: &filters,
+        };
+        assert_eq!(spec.title, "Attach files");
+        assert_eq!(spec.ok_button_label, "Attach");
+        assert_eq!(spec.filters.len(), 1);
+        assert_eq!(validate_picked_count(0), Err(MultiDialogError::Cancelled));
+        assert_eq!(validate_picked_count(1), Ok(1));
+        assert_eq!(validate_picked_count(8), Ok(8));
+        assert_eq!(
+            validate_picked_count(9),
+            Err(MultiDialogError::TooManyFiles {
+                selected: 9,
+                max: MAX_PICKED_FILES,
+            })
+        );
     }
 }
