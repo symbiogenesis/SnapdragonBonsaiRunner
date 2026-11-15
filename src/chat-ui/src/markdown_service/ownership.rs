@@ -8,7 +8,7 @@ use std::{
     io,
     os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::{Component, Path, Prefix},
-    sync::Mutex,
+    sync::OnceLock,
     thread::JoinHandle,
 };
 
@@ -132,13 +132,11 @@ struct Quarantine {
     _reader: Option<JoinHandle<()>>,
 }
 
-static QUARANTINE: Mutex<Option<Quarantine>> = Mutex::new(None);
+static QUARANTINE: OnceLock<Quarantine> = OnceLock::new();
 
 pub(super) fn quarantine(prepared: Prepared, reader: Option<JoinHandle<()>>) {
     ADMISSION_CLOSED.store(true, Ordering::Release);
-    *QUARANTINE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Quarantine {
+    QUARANTINE.get_or_init(|| Quarantine {
         _prepared: prepared,
         _reader: reader,
     });

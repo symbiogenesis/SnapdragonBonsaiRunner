@@ -11,7 +11,7 @@ use std::{
     os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::{Component, Path},
     sync::{
-        Mutex,
+        OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
@@ -45,7 +45,7 @@ const CLEANUP_FAILURE: &str = "Windows could not confirm isolated audio decoder 
 const SOURCE_FAILURE: &str = "Choose a nonempty regular audio file on a local drive. The file must stay unchanged until transcription finishes. Your draft was kept.";
 static ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-static QUARANTINE: Mutex<Option<Quarantine>> = Mutex::new(None);
+static QUARANTINE: OnceLock<Quarantine> = OnceLock::new();
 
 struct ActiveImport<'a>(&'a AtomicBool);
 
@@ -82,9 +82,7 @@ fn quarantine(
     reader: Option<JoinHandle<()>>,
 ) {
     ADMISSION_CLOSED.store(true, Ordering::Release);
-    *QUARANTINE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Quarantine {
+    QUARANTINE.get_or_init(|| Quarantine {
         _source: source,
         _executable: executable,
         _scratch: scratch,
