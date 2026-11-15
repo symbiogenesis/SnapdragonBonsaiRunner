@@ -91,6 +91,7 @@ mod tests {
             length: declared_length,
             pinned_abliteration: pinned,
             context_tokens: crate::CONTEXT_TOKENS,
+            vision: false,
         };
         let summarize =
             |chat: crate::PendingChat| (chat.body, chat.max_completion_tokens, chat.stream);
@@ -140,6 +141,7 @@ mod tests {
                         length: oversized.len(),
                         pinned_abliteration: false,
                         context_tokens: crate::CONTEXT_TOKENS,
+                        vision: false,
                     },
                     &oversized,
                 )

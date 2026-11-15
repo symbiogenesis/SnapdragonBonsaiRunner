@@ -7,7 +7,8 @@
 
 use bonsai_broker::{
     CONTEXT_TOKENS, MAX_BODY_BYTES, MAX_COMPLETION_TOKENS, MAX_CONTENT_PARTS, MAX_MESSAGES,
-    MODEL_ALIAS, PendingChat, Rejection, RequestPolicy, TEMPLATE_MARGIN_TOKENS,
+    MAX_MULTIMODAL_BODY_BYTES, MAX_REQUEST_IMAGES, MODEL_ALIAS, PendingChat, Rejection,
+    RequestPolicy, TEMPLATE_MARGIN_TOKENS,
 };
 use http::{HeaderValue, Method, Request, Version, request::Parts};
 
@@ -802,4 +803,137 @@ fn staged_long_context_intake_preserves_unicode_and_exact_reply_reservations() {
             Err(Rejection::ContextLimit)
         ));
     }
+}
+
+#[test]
+fn vision_policy_advertises_modalities_and_admits_bounded_user_images() {
+    let text_only = policy();
+    assert_eq!(text_only.capabilities().input_modalities, &["text"]);
+    assert_eq!(text_only.max_body_bytes(), MAX_BODY_BYTES);
+
+    let vision = policy().with_vision(true);
+    assert_eq!(vision.capabilities().input_modalities, &["text", "image"]);
+    assert_eq!(vision.max_body_bytes(), MAX_MULTIMODAL_BODY_BYTES);
+
+    let valid = serde_json::to_vec(&serde_json::json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe "},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}}
+            ]
+        }]
+    }))
+    .unwrap();
+    assert!(matches!(
+        text_only
+            .check_head(&head(valid.len()))
+            .unwrap()
+            .prepare(&valid),
+        Err(Rejection::ChatSchema)
+    ));
+    let admitted = vision
+        .check_head(&head(valid.len()))
+        .unwrap()
+        .prepare(&valid)
+        .unwrap()
+        .admit(|_| Ok(64))
+        .unwrap();
+    let canonical: serde_json::Value = serde_json::from_slice(admitted.backend_body()).unwrap();
+    assert_eq!(
+        canonical["messages"][0]["content"],
+        serde_json::json!([
+            {"type": "text", "text": "Describe "},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}}
+        ])
+    );
+
+    // Control tokens in accompanying text parts must still be rejected.
+    let control = serde_json::to_vec(&serde_json::json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<|image_pad|>"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}
+            ]
+        }]
+    }))
+    .unwrap();
+    assert!(matches!(
+        vision
+            .check_head(&head(control.len()))
+            .unwrap()
+            .prepare(&control),
+        Err(Rejection::ChatControlTokens)
+    ));
+
+    // Images on non-user roles and remote or malformed URLs are rejected.
+    for invalid in [
+        serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}]},
+                {"role": "user", "content": "hi"}
+            ]
+        }),
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}]},
+                {"role": "user", "content": "more"}
+            ]
+        }),
+        serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "http://127.0.0.1/img.png"}}]}]
+        }),
+        serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,"}}]}]
+        }),
+        serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,bad!"}}]}]
+        }),
+    ] {
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        assert!(matches!(
+            vision
+                .check_head(&head(bytes.len()))
+                .unwrap()
+                .prepare(&bytes),
+            Err(Rejection::ChatSchema)
+        ));
+    }
+
+    // Total image count across messages is capped at MAX_REQUEST_IMAGES (24).
+    let ok_images = vec![
+        serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}});
+        MAX_REQUEST_IMAGES
+    ];
+    let ok_body = serde_json::to_vec(&serde_json::json!({
+        "messages": [{"role": "user", "content": ok_images}]
+    }))
+    .unwrap();
+    assert!(
+        vision
+            .check_head(&head(ok_body.len()))
+            .unwrap()
+            .prepare(&ok_body)
+            .is_ok()
+    );
+
+    let excess_images = vec![
+        serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}});
+        MAX_REQUEST_IMAGES + 1
+    ];
+    let excess_body = serde_json::to_vec(&serde_json::json!({
+        "messages": [{"role": "user", "content": excess_images}]
+    }))
+    .unwrap();
+    assert!(matches!(
+        vision
+            .check_head(&head(excess_body.len()))
+            .unwrap()
+            .prepare(&excess_body),
+        Err(Rejection::ChatSchema)
+    ));
 }

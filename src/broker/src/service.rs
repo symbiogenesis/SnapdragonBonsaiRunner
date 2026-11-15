@@ -138,6 +138,17 @@ impl LocalChatService {
         self.policy.context_tokens
     }
 
+    /// Whether this service admits bounded multimodal image parts alongside text.
+    #[must_use]
+    pub const fn vision_enabled(&self) -> bool {
+        self.policy.vision
+    }
+
+    /// Enable bounded multimodal image parts on this service's frontend policy.
+    pub const fn enable_vision(&mut self) {
+        self.policy.vision = true;
+    }
+
     /// The owned launcher binds admission to the same context used by the child.
     #[cfg(windows)]
     pub(crate) fn select_context_tokens(

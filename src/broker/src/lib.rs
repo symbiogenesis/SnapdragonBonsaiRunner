@@ -52,6 +52,12 @@ mod chat_controls;
 /// worker frames and tokenizer input independently; a larger selected token
 /// capacity does not authorize larger serialized requests.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Largest accepted multimodal client or canonical backend request body in bytes.
+pub const MAX_MULTIMODAL_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Largest accepted number of image parts across all messages in one request.
+pub const MAX_REQUEST_IMAGES: usize = 24;
+/// Largest accepted decoded image payload size per `image_url` data URI.
+pub const MAX_IMAGE_DATA_BYTES: usize = 12 * 1024 * 1024;
 /// Largest accepted HTTP header block in bytes.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Largest accepted number of HTTP header fields, including duplicates.
@@ -69,11 +75,11 @@ pub const CONTEXT_TOKENS: usize = 8192;
 /// Context reserved for template accounting differences.
 pub const TEMPLATE_MARGIN_TOKENS: usize = 64;
 
-/// Declared inference capabilities of the broker's verified text-only profile.
+/// Declared inference capabilities of a verified broker profile.
 ///
 /// Native speech recognition/synthesis belongs to the desktop client and does
-/// not expand these model capabilities. Media parts remain rejected until a
-/// verified matching model/projector and exact media-token admission exist.
+/// not expand these model capabilities. Media parts remain rejected unless a
+/// verified matching model/projector and vision context admission are active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ModelCapabilities {
     /// Stable public model alias; this never selects a caller-provided model.
@@ -137,6 +143,7 @@ pub struct RequestPolicy {
     authorization: [u8; 71], // "Bearer " + 64 lowercase hex characters
     pinned_abliteration: bool,
     context_tokens: usize,
+    pub(crate) vision: bool,
 }
 
 impl Drop for RequestPolicy {
@@ -180,6 +187,7 @@ impl RequestPolicy {
             authorization,
             pinned_abliteration: false,
             context_tokens: CONTEXT_TOKENS,
+            vision: false,
         })
     }
 
@@ -203,10 +211,32 @@ impl RequestPolicy {
         Ok(policy)
     }
 
+    /// Enable or disable bounded multimodal image inputs for this session policy.
+    #[must_use]
+    pub const fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
+    }
+
+    /// Maximum serialized client or canonical backend body length admitted.
+    #[must_use]
+    pub const fn max_body_bytes(&self) -> usize {
+        if self.vision {
+            MAX_MULTIMODAL_BODY_BYTES
+        } else {
+            MAX_BODY_BYTES
+        }
+    }
+
     /// Capabilities for the owner's actual immutable context selection.
     #[must_use]
     pub const fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities {
+            input_modalities: if self.vision {
+                &["text", "image"]
+            } else {
+                &["text"]
+            },
             context_tokens: self.context_tokens,
             ..MODEL_CAPABILITIES
         }
@@ -301,13 +331,14 @@ impl RequestPolicy {
             wire::LengthError::Syntax => Rejection::Framing,
             wire::LengthError::Overflow => Rejection::BodySize,
         })?;
-        if length == 0 || length > MAX_BODY_BYTES {
+        if length == 0 || length > self.max_body_bytes() {
             return Err(Rejection::BodySize);
         }
         Ok(AuthorizedHead {
             length,
             pinned_abliteration: self.pinned_abliteration,
             context_tokens: self.context_tokens,
+            vision: self.vision,
         })
     }
 }
@@ -397,6 +428,7 @@ pub struct AuthorizedHead {
     length: usize,
     pinned_abliteration: bool,
     context_tokens: usize,
+    vision: bool,
 }
 
 impl AuthorizedHead {
@@ -433,8 +465,16 @@ impl AuthorizedHead {
         json_candidate_parser::JsonCandidateScratch::default().prepare(self, body)
     }
 
+    const fn max_body_bytes(&self) -> usize {
+        if self.vision {
+            MAX_MULTIMODAL_BODY_BYTES
+        } else {
+            MAX_BODY_BYTES
+        }
+    }
+
     const fn check_body_size(&self, body: &[u8]) -> Result<(), Rejection> {
-        if body.len() != self.length || body.len() > MAX_BODY_BYTES {
+        if body.len() != self.length || body.len() > self.max_body_bytes() {
             Err(Rejection::BodySize)
         } else {
             Ok(())
@@ -442,11 +482,11 @@ impl AuthorizedHead {
     }
 
     fn prepare_chat(self, chat: &ClientChat<'_>) -> Result<PendingChat, Rejection> {
-        if !valid_history(&chat.messages) {
+        if !valid_history(&chat.messages) || !valid_multimodal(&chat.messages, self.vision) {
             return Err(Rejection::ChatSchema);
         }
         if chat.messages.iter().any(|message| {
-            chat_controls::contains(&message.content)
+            message.content.contains_control_tokens()
                 || message
                     .reasoning_content
                     .as_deref()
@@ -467,28 +507,31 @@ impl AuthorizedHead {
             }]
         });
         let max_completion_tokens = chat.max_completion_tokens;
-        let body = request_buffer::serialize(&BackendChat {
-            messages: &chat.messages,
-            max_completion_tokens,
-            stream: chat.stream,
-            lora,
-            n: 1,
-            cache_prompt: false,
-            n_cache_reuse: 0,
-            ignore_eos: false,
-            temperature: 1.0,
-            top_p: 0.95,
-            top_k: 20,
-            min_p: 0.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repeat_penalty: 1.0,
-            chat_template_kwargs: ChatTemplateKwargs {
-                enable_thinking: chat.enable_thinking,
-                reasoning_effort: "xhigh",
-                preserve_thinking: true,
+        let body = request_buffer::serialize_with_limit(
+            &BackendChat {
+                messages: &chat.messages,
+                max_completion_tokens,
+                stream: chat.stream,
+                lora,
+                n: 1,
+                cache_prompt: false,
+                n_cache_reuse: 0,
+                ignore_eos: false,
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+                min_p: 0.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                repeat_penalty: 1.0,
+                chat_template_kwargs: ChatTemplateKwargs {
+                    enable_thinking: chat.enable_thinking,
+                    reasoning_effort: "xhigh",
+                    preserve_thinking: true,
+                },
             },
-        })?;
+            self.max_body_bytes(),
+        )?;
         Ok(PendingChat {
             body,
             max_completion_tokens,
@@ -534,7 +577,41 @@ const fn default_stream() -> bool {
     true
 }
 
-/// Text only; strings resembling URLs remain plain text and are never fetched.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart<'a> {
+    Text { text: Cow<'a, str> },
+    ImageUrl { image_url: ImageUrl<'a> },
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(Debug))]
+struct ImageUrl<'a> {
+    url: Cow<'a, str>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(untagged)]
+enum MessageContent<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<ContentPart<'a>>),
+}
+
+impl MessageContent<'_> {
+    fn contains_control_tokens(&self) -> bool {
+        match self {
+            Self::Text(text) => chat_controls::contains(text),
+            Self::Parts(parts) => parts.iter().any(|part| match part {
+                ContentPart::Text { text } => chat_controls::contains(text),
+                ContentPart::ImageUrl { .. } => false,
+            }),
+        }
+    }
+}
+
+/// Text plus optional bounded base64 image data URLs when vision is active.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Message<'a> {
@@ -542,7 +619,7 @@ struct Message<'a> {
     // JSON text without escapes can be borrowed until canonical serialization;
     // escaped text still uses Serde's owned decoding without changing its bytes.
     #[serde(borrow, deserialize_with = "deserialize_content")]
-    content: Cow<'a, str>,
+    content: MessageContent<'a>,
     #[serde(
         default,
         borrow,
@@ -572,60 +649,160 @@ fn deserialize_model<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D
     deserializer.deserialize_str(ModelVisitor)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawImageUrl<'a> {
+    #[serde(borrow)]
+    url: Cow<'a, str>,
+}
+
+fn deserialize_optional_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Cow<'de, str>>, D::Error> {
+    #[derive(Deserialize)]
+    struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
+    Text::deserialize(deserializer).map(|Text(text)| Some(text))
+}
+
+fn deserialize_optional_image_url<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Object<RawImageUrl<'de>>>, D::Error> {
+    Object::<RawImageUrl<'de>>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContentPart<'a> {
+    #[serde(borrow, rename = "type")]
+    kind: Cow<'a, str>,
+    #[serde(default, borrow, deserialize_with = "deserialize_optional_text")]
+    text: Option<Cow<'a, str>>,
+    #[serde(default, borrow, deserialize_with = "deserialize_optional_image_url")]
+    image_url: Option<Object<RawImageUrl<'a>>>,
+}
+
+const fn base64_sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn validate_image_data_url(url: &str) -> bool {
+    let Some(encoded) = url
+        .strip_prefix("data:image/png;base64,")
+        .or_else(|| url.strip_prefix("data:image/jpeg;base64,"))
+    else {
+        return false;
+    };
+    let bytes = encoded.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let pad = if bytes.ends_with(b"==") {
+        2
+    } else if bytes.ends_with(b"=") {
+        1
+    } else {
+        0
+    };
+    let core = &bytes[..bytes.len() - pad];
+    if core.iter().any(|&byte| base64_sextet(byte).is_none()) {
+        return false;
+    }
+    if pad > 0 {
+        let Some(last_sextet) = core.last().copied().and_then(base64_sextet) else {
+            return false;
+        };
+        let mask = if pad == 2 { 0x0f } else { 0x03 };
+        if last_sextet & mask != 0 {
+            return false;
+        }
+    }
+    let decoded = (bytes.len() / 4) * 3 - pad;
+    (1..=MAX_IMAGE_DATA_BYTES).contains(&decoded)
+}
+
 fn deserialize_content<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Cow<'de, str>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct TextPart<'a> {
-        #[serde(borrow, rename = "type")]
-        kind: Cow<'a, str>,
-        #[serde(borrow)]
-        text: Cow<'a, str>,
-    }
-
+) -> Result<MessageContent<'de>, D::Error> {
     struct ContentVisitor;
     impl<'de> de::Visitor<'de> for ContentVisitor {
-        type Value = Cow<'de, str>;
+        type Value = MessageContent<'de>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a string or bounded nonempty array of text objects")
+            formatter.write_str("a string or bounded nonempty array of content objects")
         }
 
         fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
-            Ok(Cow::Borrowed(value))
+            Ok(MessageContent::Text(Cow::Borrowed(value)))
         }
 
         fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-            Ok(Cow::Owned(value.to_owned()))
+            Ok(MessageContent::Text(Cow::Owned(value.to_owned())))
         }
 
         fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-            Ok(Cow::Owned(value))
+            Ok(MessageContent::Text(Cow::Owned(value)))
         }
 
         fn visit_seq<A: de::SeqAccess<'de>>(
             self,
             mut sequence: A,
         ) -> Result<Self::Value, A::Error> {
-            let mut content = String::new();
-            let mut count = 0;
+            let mut parts = Vec::new();
+            let mut has_image = false;
             while let Some(Object(part)) =
-                sequence.next_element_seed(BoundedElement::<Object<TextPart<'de>>> {
-                    within_limit: count < MAX_CONTENT_PARTS,
+                sequence.next_element_seed(BoundedElement::<Object<RawContentPart<'de>>> {
+                    within_limit: parts.len() < MAX_CONTENT_PARTS,
                     marker: PhantomData,
                 })?
             {
-                if part.kind != "text" {
-                    return Err(de::Error::custom("unsupported content part"));
+                match part.kind.as_ref() {
+                    "text" => {
+                        let Some(text) = part.text else {
+                            return Err(de::Error::custom("missing text field"));
+                        };
+                        if part.image_url.is_some() {
+                            return Err(de::Error::custom("unexpected image_url on text part"));
+                        }
+                        parts.push(ContentPart::Text { text });
+                    }
+                    "image_url" => {
+                        if part.text.is_some() {
+                            return Err(de::Error::custom("unexpected text on image_url part"));
+                        }
+                        let Some(Object(RawImageUrl { url })) = part.image_url else {
+                            return Err(de::Error::custom("missing image_url field"));
+                        };
+                        if !validate_image_data_url(&url) {
+                            return Err(de::Error::custom("unsupported image data URL"));
+                        }
+                        has_image = true;
+                        parts.push(ContentPart::ImageUrl {
+                            image_url: ImageUrl { url },
+                        });
+                    }
+                    _ => return Err(de::Error::custom("unsupported content part")),
                 }
-                content.push_str(&part.text);
-                count += 1;
             }
-            if count == 0 {
+            if parts.is_empty() {
                 return Err(de::Error::custom("empty content parts"));
             }
-            Ok(Cow::Owned(content))
+            if !has_image {
+                let mut combined = String::new();
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        combined.push_str(&text);
+                    }
+                }
+                return Ok(MessageContent::Text(Cow::Owned(combined)));
+            }
+            Ok(MessageContent::Parts(parts))
         }
     }
 
@@ -773,6 +950,26 @@ fn valid_history(messages: &[Message<'_>]) -> bool {
         })
 }
 
+fn valid_multimodal(messages: &[Message<'_>], vision: bool) -> bool {
+    let mut total_images = 0usize;
+    for message in messages {
+        if let MessageContent::Parts(parts) = &message.content {
+            if !vision || message.role != Role::User {
+                return false;
+            }
+            for part in parts {
+                if matches!(part, ContentPart::ImageUrl { .. }) {
+                    total_images = total_images.saturating_add(1);
+                    if total_images > MAX_REQUEST_IMAGES {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Exposes canonical bytes only to a trusted counter before context admission.
 pub struct PendingChat {
     body: Vec<u8>,
@@ -876,7 +1073,8 @@ mod abliteration_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientChat, Cow, MAX_CONTENT_PARTS, MAX_MESSAGES, Message, Object, Role, valid_history,
+        ClientChat, ContentPart, Cow, MAX_CONTENT_PARTS, MAX_MESSAGES, Message, MessageContent,
+        Object, Role, valid_history, validate_image_data_url,
     };
     use std::assert_matches;
 
@@ -900,7 +1098,7 @@ mod tests {
                     spelling.push(letter);
                     messages.push(Message {
                         role,
-                        content: Cow::Borrowed(""),
+                        content: MessageContent::Text(Cow::Borrowed("")),
                         reasoning_content: None,
                     });
                 }
@@ -924,7 +1122,7 @@ mod tests {
         assert!(
             chat.messages
                 .iter()
-                .all(|message| message.content == "kept")
+                .all(|message| message.content == MessageContent::Text(Cow::Borrowed("kept")))
         );
         let large = format!(
             r#"{{"role":"user","content":"{}"}}"#,
@@ -959,7 +1157,10 @@ mod tests {
         let prefix = format!("{{\"messages\":[{{\"role\":\"user\",\"content\":[{parts}");
         let body = format!("{prefix}]}}]}}");
         let Object(chat): Object<ClientChat<'_>> = serde_json::from_str(&body)?;
-        assert_eq!(chat.messages[0].content, "x".repeat(MAX_CONTENT_PARTS));
+        assert_eq!(
+            chat.messages[0].content,
+            MessageContent::Text(Cow::Owned("x".repeat(MAX_CONTENT_PARTS)))
+        );
         let large = format!(r#"{{"type":"text","text":"{}"}}"#, r"\u0078".repeat(8192));
         for excess in ["null", "[]", r#"{"text":"\u"#, r#"{"unknown":[[["#, &large] {
             let body = format!("{prefix},{excess}]}}]}}");
@@ -982,9 +1183,46 @@ mod tests {
         let Object(chat): Object<ClientChat<'_>> = serde_json::from_slice(
             br#"{"messages":[{"role":"user","content":"plain text"},{"role":"assistant","content":"line\n\u96ea"}]}"#,
         )?;
-        assert_matches!(chat.messages[0].content, Cow::Borrowed("plain text"));
-        assert_matches!(chat.messages[1].content, Cow::Owned(_));
-        assert_eq!(chat.messages[1].content, "line\n雪");
+        assert_matches!(
+            chat.messages[0].content,
+            MessageContent::Text(Cow::Borrowed("plain text"))
+        );
+        assert_matches!(
+            chat.messages[1].content,
+            MessageContent::Text(Cow::Owned(_))
+        );
+        assert_eq!(
+            chat.messages[1].content,
+            MessageContent::Text(Cow::Borrowed("line\n雪"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_data_url_validator_enforces_mime_prefix_and_canonical_base64()
+    -> Result<(), serde_json::Error> {
+        assert!(validate_image_data_url("data:image/png;base64,eA=="));
+        assert!(validate_image_data_url("data:image/jpeg;base64,AAAA"));
+        for bad in [
+            "",
+            "http://127.0.0.1/a.png",
+            "data:image/gif;base64,AAAA",
+            "data:image/png;base64,",
+            "data:image/png;base64,AAA",
+            "data:image/png;base64,AAA!",
+            "data:image/png;base64,eB==",
+            "data:image/png;base64,AA=A",
+        ] {
+            assert!(!validate_image_data_url(bad), "unexpectedly accepted {bad}");
+        }
+        let Object(chat): Object<ClientChat<'_>> = serde_json::from_slice(
+            br#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,eA=="}}]}]}"#,
+        )?;
+        assert!(matches!(
+            chat.messages[0].content,
+            MessageContent::Parts(ref parts)
+                if matches!(parts.as_slice(), [ContentPart::Text { .. }, ContentPart::ImageUrl { .. }])
+        ));
         Ok(())
     }
 

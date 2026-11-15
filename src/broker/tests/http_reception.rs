@@ -6,7 +6,8 @@
 )]
 
 use bonsai_broker::{
-    MAX_BODY_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, Rejection, RequestPolicy,
+    MAX_BODY_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, MAX_MULTIMODAL_BODY_BYTES, Rejection,
+    RequestPolicy,
     reception::{HEADER_TIMEOUT, INTAKE_TIMEOUT, ReceiveError, receive_chat},
 };
 use std::{
@@ -376,6 +377,33 @@ fn complete_body_does_not_wait_for_peer_eof() {
         drop(received);
         let mut byte = [0];
         assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    });
+}
+
+#[test]
+fn vision_reception_admits_bodies_above_text_cap_up_to_multimodal_cap() {
+    run(async {
+        let mut payload = "A".repeat(MAX_BODY_BYTES + 4096);
+        // Ensure valid 4-char multiple base64 with trailing canonical quantum.
+        while !payload.len().is_multiple_of(4) {
+            payload.push('A');
+        }
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{payload}"}}}}]}}]}}"#
+        );
+        assert!(body.len() > MAX_BODY_BYTES && body.len() < MAX_MULTIMODAL_BODY_BYTES);
+        let text_stream = ProbeRead::new(wire(body.as_bytes(), ""), 65_536);
+        assert!(matches!(
+            receive_chat(text_stream, &policy(), deadline()).await,
+            Err(ReceiveError::Policy(Rejection::BodySize))
+        ));
+        let vision_policy = policy().with_vision(true);
+        let vision_stream = ProbeRead::new(wire(body.as_bytes(), ""), 65_536);
+        assert!(
+            receive_chat(vision_stream, &vision_policy, deadline())
+                .await
+                .is_ok()
+        );
     });
 }
 

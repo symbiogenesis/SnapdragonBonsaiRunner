@@ -12,6 +12,7 @@ fn canonical(body: &[u8], candidate: bool, pinned: bool) -> Result<Vec<u8>, Reje
         length: body.len(),
         pinned_abliteration: pinned,
         context_tokens: crate::CONTEXT_TOKENS,
+        vision: false,
     };
     if candidate {
         head.prepare_simd_json(body)
@@ -43,6 +44,7 @@ fn reused_canonical(
                 length: body.len(),
                 pinned_abliteration: pinned,
                 context_tokens: crate::CONTEXT_TOKENS,
+                vision: false,
             },
             body,
         )

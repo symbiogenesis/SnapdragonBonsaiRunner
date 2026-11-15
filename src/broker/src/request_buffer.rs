@@ -5,18 +5,30 @@
     reason = "Keep the canonical serializer explicitly crate scoped."
 )]
 
-use crate::{MAX_BODY_BYTES, Rejection};
+#[cfg(test)]
+use crate::MAX_BODY_BYTES;
+use crate::Rejection;
 use std::io::{self, Write};
 
-#[derive(Default)]
 struct Buffer {
     bytes: Vec<u8>,
+    limit: usize,
     exceeded: bool,
+}
+
+impl Buffer {
+    const fn with_limit(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
 }
 
 impl Write for Buffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_BODY_BYTES - self.bytes.len() {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
             self.exceeded = true;
             return Err(io::Error::other(
                 "Canonical request exceeds its byte limit.",
@@ -27,9 +39,10 @@ impl Write for Buffer {
             // Vec's ordinary geometric growth can reserve nearly twice the
             // accepted body size. Cap every requested allocation, including
             // the final write that will be rejected for fixed policy overhead.
+            let min_cap = 128.min(self.limit);
             let target = needed
                 .max(self.bytes.capacity().saturating_mul(2))
-                .clamp(128, MAX_BODY_BYTES);
+                .clamp(min_cap, self.limit);
             self.bytes
                 .try_reserve_exact(target - self.bytes.len())
                 .map_err(|_| io::Error::other("Could not allocate canonical request."))?;
@@ -43,8 +56,16 @@ impl Write for Buffer {
     }
 }
 
+#[cfg(test)]
 pub(super) fn serialize(value: &impl serde::Serialize) -> Result<Vec<u8>, Rejection> {
-    let mut output = Buffer::default();
+    serialize_with_limit(value, MAX_BODY_BYTES)
+}
+
+pub(super) fn serialize_with_limit(
+    value: &impl serde::Serialize,
+    limit: usize,
+) -> Result<Vec<u8>, Rejection> {
+    let mut output = Buffer::with_limit(limit);
     serde_json::to_writer(&mut output, value).map_err(|_| {
         if output.exceeded {
             Rejection::BodySize
@@ -61,7 +82,7 @@ mod tests {
 
     #[test]
     fn canonical_buffer_caps_growth_and_rejects_without_retaining_excess() -> io::Result<()> {
-        let mut output = Buffer::default();
+        let mut output = Buffer::with_limit(MAX_BODY_BYTES);
         // Awkward writes make ordinary Vec doubling overshoot the power-of-two
         // body limit on its final growth, rather than landing exactly on it.
         let chunk = [b'x'; 4093];
