@@ -16,14 +16,14 @@ use std::{
     future::poll_fn,
     io,
     net::{Ipv4Addr, SocketAddrV4},
-    pin::pin,
+    pin::{Pin, pin},
     sync::atomic::{AtomicBool, Ordering},
-    task::Poll,
+    task::{Context, Poll},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    io::ReadBuf,
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpSocket, TcpStream},
     time::{Instant, timeout_at},
 };
@@ -60,7 +60,89 @@ pub enum ServiceError {
     Request(ServeError),
 }
 
-/// Numeric-loopback listener, immutable backend and bounded admission gate.
+/// Active backend stream over loopback TCP or the offline anonymous pipe.
+enum BackendStream {
+    Loopback(TcpStream),
+    #[cfg(windows)]
+    Pipe(crate::pipe_transport::PipeStream),
+}
+
+impl AsyncRead for BackendStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Loopback(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(windows)]
+            Self::Pipe(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BackendStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Loopback(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(windows)]
+            Self::Pipe(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Loopback(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(windows)]
+            Self::Pipe(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Loopback(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(windows)]
+            Self::Pipe(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+enum BackendEndpoint {
+    Loopback(LoopbackBackend),
+    #[cfg(windows)]
+    Pipe(crate::pipe_transport::PipeBackend),
+}
+
+impl BackendEndpoint {
+    fn policy(&self) -> &BackendPolicy {
+        match self {
+            Self::Loopback(backend) => backend.policy(),
+            #[cfg(windows)]
+            Self::Pipe(backend) => backend.policy(),
+        }
+    }
+
+    async fn connect(&self, deadline: Instant) -> Result<BackendStream, BackendError> {
+        match self {
+            Self::Loopback(backend) => backend.connect(deadline).await.map(BackendStream::Loopback),
+            #[cfg(windows)]
+            Self::Pipe(backend) => backend.connect(deadline).await.map(BackendStream::Pipe),
+        }
+    }
+
+    #[cfg(windows)]
+    const fn require_process(&mut self, process_id: u32) {
+        if let Self::Loopback(backend) = self {
+            backend.require_process(process_id);
+        }
+    }
+}
+
+/// Numeric-loopback or offline-pipe service listener, immutable backend and bounded admission gate.
 ///
 /// Bind is explicit and requires a Tokio runtime with I/O and time enabled.
 /// No task, process, key file, UI, retry or restart is created. The application
@@ -68,7 +150,7 @@ pub enum ServiceError {
 pub struct LocalChatService {
     listener: TcpListener,
     policy: RequestPolicy,
-    backend: LoopbackBackend,
+    backend: BackendEndpoint,
     gate: RequestGate,
     port: u16,
     capacity: usize,
@@ -97,22 +179,72 @@ impl LocalChatService {
         backend_key: &str,
         max_waiting: usize,
     ) -> Result<Self, ServiceError> {
+        let backend = LoopbackBackend::new(backend_port, backend_key)
+            .map_err(|_| ServiceError::Configuration)?;
+        Self::bind_endpoint(
+            port,
+            frontend_key,
+            Some(backend_port),
+            backend_key,
+            BackendEndpoint::Loopback(backend),
+            max_waiting,
+        )
+    }
+
+    /// Bind only `127.0.0.1` for the frontend while reaching an offline worker over pipes.
+    ///
+    /// Port zero requests an OS-assigned frontend port; other frontend ports
+    /// must be unprivileged. Keys are never generated or logged here. The
+    /// caller supplies an already authenticated offline `PipeBackend`.
+    ///
+    /// # Errors
+    /// Returns a value-free [`ServiceError`] for invalid policy or bind failure.
+    #[cfg(windows)]
+    #[expect(
+        clippy::unused_async,
+        reason = "Preserve the existing asynchronous service-binding API."
+    )]
+    pub async fn bind_pipe(
+        port: u16,
+        frontend_key: &str,
+        backend_key: &str,
+        backend: crate::pipe_transport::PipeBackend,
+        max_waiting: usize,
+    ) -> Result<Self, ServiceError> {
+        LoopbackBackend::new(crate::pipe_transport::BROKER_PIPE_HOST_PORT, backend_key)
+            .map_err(|_| ServiceError::Configuration)?;
+        Self::bind_endpoint(
+            port,
+            frontend_key,
+            None,
+            backend_key,
+            BackendEndpoint::Pipe(backend),
+            max_waiting,
+        )
+    }
+
+    fn bind_endpoint(
+        port: u16,
+        frontend_key: &str,
+        forbidden_port: Option<u16>,
+        backend_key: &str,
+        backend: BackendEndpoint,
+        max_waiting: usize,
+    ) -> Result<Self, ServiceError> {
         if (port != 0 && port < 1024)
-            || port == backend_port
+            || forbidden_port == Some(port)
             || bool::from(frontend_key.as_bytes().ct_eq(backend_key.as_bytes()))
         {
             return Err(ServiceError::Configuration);
         }
         // Validate every non-I/O input before binding a socket.
         RequestPolicy::new(1024, frontend_key).map_err(|_| ServiceError::Configuration)?;
-        let backend = LoopbackBackend::new(backend_port, backend_key)
-            .map_err(|_| ServiceError::Configuration)?;
         let gate = RequestGate::new(max_waiting).map_err(ServiceError::Gate)?;
         let listener = bound_loopback_socket(port)
             .and_then(|socket| socket.listen(1024))
             .map_err(|_| ServiceError::Io)?;
         let port = listener.local_addr().map_err(|_| ServiceError::Io)?.port();
-        if port < 1024 || port == backend_port {
+        if port < 1024 || forbidden_port == Some(port) {
             return Err(ServiceError::Configuration);
         }
         Ok(Self {
@@ -390,7 +522,7 @@ impl AcceptedChat<'_> {
 // connection. Mark before the second attempt, including cancellation of connect.
 // Drop runs even when the caller cancels AcceptedChat::serve externally.
 struct GenerationAttempt<'a> {
-    backend: &'a LoopbackBackend,
+    backend: &'a BackendEndpoint,
     gate: &'a RequestGate,
     counted: AtomicBool,
     generation: AtomicBool,
@@ -398,13 +530,13 @@ struct GenerationAttempt<'a> {
 }
 
 impl BackendConnector for GenerationAttempt<'_> {
-    type Stream = TcpStream;
+    type Stream = BackendStream;
 
     fn policy(&self) -> &BackendPolicy {
         self.backend.policy()
     }
 
-    async fn connect(&self, deadline: Instant) -> Result<TcpStream, BackendError> {
+    async fn connect(&self, deadline: Instant) -> Result<BackendStream, BackendError> {
         if self.counted.swap(true, Ordering::Relaxed) {
             self.generation.store(true, Ordering::Relaxed);
         }

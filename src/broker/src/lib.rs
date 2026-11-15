@@ -24,6 +24,8 @@ pub mod launch_policy;
 pub mod launcher;
 #[cfg(windows)]
 pub mod owner_shutdown;
+#[cfg(windows)]
+pub mod pipe_transport;
 pub mod reception;
 mod request_buffer;
 pub mod response;
