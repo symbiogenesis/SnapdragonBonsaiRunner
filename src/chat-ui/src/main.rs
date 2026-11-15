@@ -33,7 +33,7 @@ mod recovery;
 #[cfg(windows)]
 #[allow(
     unsafe_code,
-    reason = "Audited native WAV playback boundary; owned buffers live until playback completes."
+    reason = "Audited event-driven WASAPI playback boundary using owned COM interfaces and staging buffers."
 )]
 mod speech;
 #[cfg(windows)]

@@ -392,8 +392,8 @@ adoption decisions without displacing native daily-use acceptance.
   streaming Markdown prefix-layout retention without UI parsing and incremental TTS
   segmentation).
 - [ ] Qualify actual-model [streaming/audio resources](docs/streaming-resources.md):
-  ready prefixes, chat/speech overlap, PCM/WinMM reuse, final-storage intake,
-  fragmented framing, caps/tails/truncation, failed writes, driver refusal,
+  ready prefixes, chat/speech overlap, PCM/WASAPI reuse, final-storage intake,
+  fragmented framing, caps/tails/truncation, failed writes, device invalidation,
   Stop/recovery, task latency and peak memory.
 - [ ] Qualify all 33 Swift control-token spellings in real template/tokenizer
   sessions, including escaped/split content, history/reasoning and lookalikes;

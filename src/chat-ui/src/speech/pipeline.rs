@@ -2,16 +2,29 @@
 
 use super::{Arc, AtomicU64, JoinHandle, Ordering, Receiver, VecDeque, io, mpsc, thread, tts};
 use std::{
-    cell::UnsafeCell,
     sync::{
+        Condvar, Mutex,
         atomic::AtomicBool,
         mpsc::{SyncSender, TrySendError},
     },
     time::{Duration, Instant},
 };
-use windows_sys::Win32::Media::Audio::{
-    HWAVEOUT, WAVEFORMATEX, WAVEHDR, waveOutClose, waveOutOpen, waveOutPause, waveOutPrepareHeader,
-    waveOutReset, waveOutRestart, waveOutUnprepareHeader, waveOutWrite,
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, HANDLE, RPC_E_CHANGED_MODE, WAIT_OBJECT_0},
+        Media::Audio::{
+            AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, ActivateAudioInterfaceAsync,
+            IActivateAudioInterfaceCompletionHandler, IAudioClient, IAudioRenderClient,
+            WAVEFORMATEX,
+        },
+        System::{
+            Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
+            Threading::{CreateEventW, WaitForSingleObject},
+        },
+    },
+    core::{HRESULT, Interface, PCWSTR, w},
 };
 
 const AUDIO_FAILURE: tts::Failure =
@@ -28,10 +41,10 @@ pub(super) const PACKET_BYTES_48K: usize = 9_600;
 // Five milliseconds at the largest supported rate. Hold only this tail so exact
 // packet-aligned segment endings can also reach silence without losing samples.
 const MAX_EDGE_BYTES: usize = PACKET_BYTES_48K / 20;
-const PREFETCH_PACKETS: usize = 160; // 16 seconds / 768,000 bytes at 24 kHz, outside WinMM.
+const PREFETCH_PACKETS: usize = 160; // 16 seconds / 768,000 bytes at 24 kHz, outside WASAPI.
 const PLAYBACK_PACKETS: usize = 8;
-// Only released packets enter this pool. Full queues discard excess buffers,
-// keeping retained spare PCM capacity to one WinMM queue.
+// Only packets fully written into WASAPI enter this pool. Full queues discard
+// excess buffers, keeping retained spare PCM capacity bounded to one playback queue.
 const RECYCLED_PACKETS: usize = PLAYBACK_PACKETS;
 // The Rust codec emits one 80 ms frame per callback. Observe three packet
 // intervals before starting, retaining four packets to absorb callback jitter.
@@ -532,7 +545,7 @@ fn consume_at_rate(
         generation,
         current,
         stop,
-        &mut WaveOutput::open_with_rate(recycle, sample_rate)?,
+        &mut WasapiOutput::open_with_rate(recycle, sample_rate)?,
         playing,
     )
 }
@@ -543,6 +556,7 @@ trait Output {
     fn reap(&mut self) -> Result<(), tts::Failure>;
     fn pause(&mut self) -> Result<(), tts::Failure>;
     fn start(&mut self) -> Result<(), tts::Failure>;
+    fn wait(&mut self, _timeout: Duration) {}
 }
 
 #[cfg(test)]
@@ -586,8 +600,8 @@ fn consume_with_progress(
             && pending.is_none()
             && !finished
         {
-            // A late consumer wake can find WinMM empty while the producer has
-            // already queued more audio. Refill before latching slow synthesis;
+            // A late consumer wake can find the WASAPI buffer empty while the producer
+            // has already queued more audio. Refill before latching slow synthesis;
             // otherwise scheduler jitter buffers the rest of a healthy segment.
             (pending, finished) =
                 refill_queued(incoming, &mut buffered, generation, current, stop)?;
@@ -655,7 +669,7 @@ fn consume_with_progress(
             None => {}
         }
         if pending.is_some() || finished {
-            thread::sleep(POLL);
+            output.wait(POLL);
         }
     }
 }
@@ -692,7 +706,7 @@ fn refill_queued(
 }
 
 // At most one 120-second clip of application staging, plus the 16-second
-// producer channel and 800 ms WinMM queue. Slow synthesis waits for a validated
+// producer channel and 800 ms WASAPI queue. Slow synthesis waits for a validated
 // segment instead of repeatedly playing short bursts separated by silence.
 #[derive(Default)]
 #[expect(
@@ -797,219 +811,503 @@ impl Buffered {
     }
 }
 
-struct Buffer {
-    // WinMM mutates this descriptor until unprepare releases it. No Rust reference
-    // to the WAVEHDR itself exists while the driver owns it.
-    header: UnsafeCell<WAVEHDR>,
-    pcm: Vec<u8>,
-}
+const DEVINTERFACE_AUDIO_RENDER_PATH: PCWSTR = w!("{e6327cad-dcec-4949-ae8a-991e976a79d2}");
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+const WASAPI_BUFFER_HNS: i64 = 8_000_000;
+const WASAPI_STREAM_FLAGS: u32 = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+    | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+const ACTIVATE_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct PlaybackBuffers {
-    // WinMM retains these addresses. Moving the boxes never moves the headers.
-    queued: VecDeque<Box<Buffer>>,
-    // Only successfully unprepared, empty descriptors enter this bounded pool.
-    #[expect(
-        clippy::vec_box,
-        reason = "Reused WinMM descriptors must keep their original stable addresses."
-    )]
-    spare: Vec<Box<Buffer>>,
-    max_packet_bytes: usize,
-}
-
-impl Default for PlaybackBuffers {
-    fn default() -> Self {
-        Self::with_max_packet_bytes(PACKET_BYTES)
+const fn normalize_sample_rate(sample_rate: u32) -> u32 {
+    if sample_rate == SAMPLE_RATE_48K {
+        SAMPLE_RATE_48K
+    } else {
+        SAMPLE_RATE
     }
 }
 
-impl PlaybackBuffers {
-    const fn with_max_packet_bytes(max_packet_bytes: usize) -> Self {
-        Self {
-            queued: VecDeque::new(),
-            spare: Vec::new(),
-            max_packet_bytes,
+const fn float_wave_format(sample_rate: u32) -> WAVEFORMATEX {
+    let rate = normalize_sample_rate(sample_rate);
+    WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+        nChannels: 1,
+        nSamplesPerSec: rate,
+        nAvgBytesPerSec: rate * 4,
+        nBlockAlign: 4,
+        wBitsPerSample: 32,
+        cbSize: 0,
+    }
+}
+
+fn pcm16_to_f32(sample: [u8; 2]) -> f32 {
+    f32::from(i16::from_le_bytes(sample)) * (1.0 / 32_768.0)
+}
+
+#[allow(
+    trivial_casts,
+    clippy::ref_as_ptr,
+    clippy::inline_always,
+    reason = "windows::core::implement macro expands COM vtable casts and inline methods."
+)]
+mod activation {
+    use std::sync::{Arc, Condvar, Mutex};
+    use windows::{
+        Win32::Media::Audio::{
+            IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+            IActivateAudioInterfaceCompletionHandler_Impl,
+        },
+        core::{Ref, Result as WinResult, implement},
+    };
+
+    #[implement(IActivateAudioInterfaceCompletionHandler)]
+    pub(super) struct Handler(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Handler {
+        pub(super) fn new(state: Arc<(Mutex<bool>, Condvar)>) -> Self {
+            Self(state)
         }
     }
 
-    fn take(&mut self, mut pcm: Vec<u8>) -> Result<Box<Buffer>, tts::Failure> {
-        if self.queued.len() >= PLAYBACK_PACKETS
+    impl IActivateAudioInterfaceCompletionHandler_Impl for Handler_Impl {
+        fn ActivateCompleted(
+            &self,
+            _activateoperation: Ref<'_, IActivateAudioInterfaceAsyncOperation>,
+        ) -> WinResult<()> {
+            let (lock, cvar) = &*self.0;
+            if let Ok(mut done) = lock.lock() {
+                *done = true;
+            }
+            cvar.notify_all();
+            Ok(())
+        }
+    }
+}
+
+struct ComApartment {
+    owns_apartment: bool,
+}
+
+impl ComApartment {
+    fn enter() -> Result<Self, tts::Failure> {
+        // SAFETY: Initializing COM on this playback worker thread for async device activation.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr.is_ok() {
+            Ok(Self {
+                owns_apartment: true,
+            })
+        } else if hr == RPC_E_CHANGED_MODE {
+            Ok(Self {
+                owns_apartment: false,
+            })
+        } else {
+            Err(AUDIO_FAILURE)
+        }
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.owns_apartment {
+            // SAFETY: Matches the successful `CoInitializeEx` on this worker thread.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+struct EventHandle(HANDLE);
+
+impl EventHandle {
+    fn new_auto_reset() -> Result<Self, tts::Failure> {
+        // SAFETY: Null security attributes and null name create a local auto-reset event.
+        unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+            .map(Self)
+            .map_err(|_| AUDIO_FAILURE)
+    }
+
+    fn wait(&self, timeout_ms: u32) -> bool {
+        // SAFETY: `self.0` stays a valid kernel event handle until `EventHandle::drop`.
+        unsafe { WaitForSingleObject(self.0, timeout_ms) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for EventHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is an exclusively owned handle created by `CreateEventW`.
+        let _closed = unsafe { CloseHandle(self.0) };
+    }
+}
+
+enum StreamError {
+    Invalidated,
+    Failed,
+}
+
+fn classify_wasapi_error(error: &windows::core::Error) -> StreamError {
+    if error.code() == AUDCLNT_E_DEVICE_INVALIDATED {
+        StreamError::Invalidated
+    } else {
+        StreamError::Failed
+    }
+}
+
+struct RenderStaging {
+    pending: VecDeque<Vec<u8>>,
+    front_offset_bytes: usize,
+    recycle: SyncSender<Vec<u8>>,
+    max_packet_bytes: usize,
+    packet_frames: u32,
+}
+
+impl RenderStaging {
+    fn new(recycle: SyncSender<Vec<u8>>, sample_rate: u32) -> Result<Self, tts::Failure> {
+        let rate = normalize_sample_rate(sample_rate);
+        let max_packet_bytes = packet_bytes_for_rate(rate);
+        let packet_frames = u32::try_from(max_packet_bytes / 2).map_err(|_| AUDIO_FAILURE)?;
+        Ok(Self {
+            pending: VecDeque::new(),
+            front_offset_bytes: 0,
+            recycle,
+            max_packet_bytes,
+            packet_frames,
+        })
+    }
+
+    fn enqueue(&mut self, pcm: Vec<u8>) -> Result<(), tts::Failure> {
+        if self.pending.len() >= PLAYBACK_PACKETS
             || pcm.is_empty()
             || pcm.len() > self.max_packet_bytes
             || !pcm.len().is_multiple_of(2)
         {
             return Err(AUDIO_FAILURE);
         }
-        let header = WAVEHDR {
-            lpData: pcm.as_mut_ptr(),
-            dwBufferLength: u32::try_from(pcm.len()).map_err(|_| AUDIO_FAILURE)?,
-            ..WAVEHDR::default()
-        };
-        let mut buffer = self.spare.pop().unwrap_or_else(|| {
-            Box::new(Buffer {
-                header: UnsafeCell::new(WAVEHDR::default()),
-                pcm: Vec::new(),
-            })
-        });
-        // The driver has released this descriptor (or has never seen it).
-        *buffer.header.get_mut() = header;
-        buffer.pcm = pcm;
-        Ok(buffer)
-    }
-
-    fn reap(
-        &mut self,
-        mut unprepare: impl FnMut(*mut WAVEHDR) -> u32,
-        returned: &SyncSender<Vec<u8>>,
-    ) -> Result<(), tts::Failure> {
-        while let Some(buffer) = self.queued.front() {
-            match unprepare(buffer.header.get()) {
-                0 => {
-                    if let Some(mut buffer) = self.queued.pop_front() {
-                        // Successful unprepare releases both native addresses.
-                        // Remove every stale driver field and PCM pointer before reuse.
-                        *buffer.header.get_mut() = WAVEHDR::default();
-                        recycle(returned, std::mem::take(&mut buffer.pcm));
-                        if self.spare.len() < PLAYBACK_PACKETS {
-                            self.spare.push(buffer);
-                        }
-                    }
-                }
-                33 => break, // WAVERR_STILLPLAYING: retain both allocations.
-                _ => return Err(AUDIO_FAILURE),
-            }
-        }
+        self.pending.push_back(pcm);
         Ok(())
     }
 
-    fn drain(
-        &mut self,
-        mut unprepare: impl FnMut(*mut WAVEHDR) -> u32,
-        mut retain: impl FnMut(Box<Buffer>),
-    ) -> bool {
-        let mut released = true;
-        while let Some(buffer) = self.queued.pop_front() {
-            if unprepare(buffer.header.get()) != 0 {
-                retain(buffer);
-                released = false;
+    fn pending_frames(&self) -> u32 {
+        let mut total_bytes = 0usize;
+        for (index, packet) in self.pending.iter().enumerate() {
+            let offset = if index == 0 {
+                self.front_offset_bytes.min(packet.len())
+            } else {
+                0
+            };
+            total_bytes = total_bytes.saturating_add(packet.len().saturating_sub(offset));
+        }
+        u32::try_from(total_bytes / 2).unwrap_or(u32::MAX)
+    }
+
+    fn queued_packets(&self, padding_frames: u32) -> usize {
+        let total_frames = padding_frames.saturating_add(self.pending_frames());
+        let packet_frames = self.packet_frames.max(1);
+        usize::try_from(total_frames.div_ceil(packet_frames))
+            .unwrap_or(usize::MAX)
+            .max(self.pending.len())
+    }
+
+    fn write_into(&self, dst: &mut [u8]) -> Result<u32, tts::Failure> {
+        let (slots, rem) = dst.as_chunks_mut::<4>();
+        if !rem.is_empty() {
+            return Err(AUDIO_FAILURE);
+        }
+        let mut written = 0u32;
+        let mut slot_iter = slots.iter_mut();
+        for (index, packet) in self.pending.iter().enumerate() {
+            let offset = if index == 0 {
+                self.front_offset_bytes.min(packet.len())
+            } else {
+                0
+            };
+            let slice = packet.get(offset..).ok_or(AUDIO_FAILURE)?;
+            let (samples, trailing) = slice.as_chunks::<2>();
+            if !trailing.is_empty() {
+                return Err(AUDIO_FAILURE);
+            }
+            for sample in samples {
+                let Some(slot) = slot_iter.next() else {
+                    return Ok(written);
+                };
+                *slot = pcm16_to_f32(*sample).to_le_bytes();
+                written = written.saturating_add(1);
             }
         }
-        released
+        Ok(written)
+    }
+
+    fn consume_frames(&mut self, frames: u32) {
+        let mut remaining_bytes = usize::try_from(frames)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2);
+        while remaining_bytes > 0 {
+            let Some(front) = self.pending.front() else {
+                self.front_offset_bytes = 0;
+                break;
+            };
+            let avail = front.len().saturating_sub(self.front_offset_bytes);
+            if remaining_bytes < avail {
+                self.front_offset_bytes = self.front_offset_bytes.saturating_add(remaining_bytes);
+                break;
+            }
+            remaining_bytes = remaining_bytes.saturating_sub(avail);
+            self.front_offset_bytes = 0;
+            if let Some(packet) = self.pending.pop_front() {
+                recycle(&self.recycle, packet);
+            }
+        }
     }
 }
 
-struct WaveOutput {
-    handle: HWAVEOUT,
-    buffers: PlaybackBuffers,
-    header_bytes: u32,
-    recycle: SyncSender<Vec<u8>>,
+fn activate_default_render_client() -> Result<IAudioClient, tts::Failure> {
+    let state = Arc::new((Mutex::new(false), Condvar::new()));
+    let handler: IActivateAudioInterfaceCompletionHandler =
+        activation::Handler::new(Arc::clone(&state)).into();
+    // SAFETY: `DEVINTERFACE_AUDIO_RENDER_PATH` and `IAudioClient::IID` are static valid constants,
+    // and `handler` is an agile COM callback object kept alive through the call.
+    let operation = unsafe {
+        ActivateAudioInterfaceAsync(
+            DEVINTERFACE_AUDIO_RENDER_PATH,
+            &IAudioClient::IID,
+            None,
+            &handler,
+        )
+    }
+    .map_err(|_| AUDIO_FAILURE)?;
+    let (lock, cvar) = &*state;
+    let guard = lock.lock().map_err(|_| AUDIO_FAILURE)?;
+    let (guard, timeout) = cvar
+        .wait_timeout_while(guard, ACTIVATE_TIMEOUT, |done| !*done)
+        .map_err(|_| AUDIO_FAILURE)?;
+    if timeout.timed_out() && !*guard {
+        return Err(AUDIO_FAILURE);
+    }
+    let mut activate_result = HRESULT(0);
+    let mut unknown = None;
+    // SAFETY: Activation completed; both out-parameters are initialized writable slots.
+    unsafe { operation.GetActivateResult(&raw mut activate_result, &raw mut unknown) }
+        .map_err(|_| AUDIO_FAILURE)?;
+    activate_result.ok().map_err(|_| AUDIO_FAILURE)?;
+    unknown
+        .ok_or(AUDIO_FAILURE)?
+        .cast()
+        .map_err(|_| AUDIO_FAILURE)
 }
 
-impl WaveOutput {
+// Drop `render` and `client` before closing `event` so WASAPI never observes a closed handle.
+struct WasapiStream {
+    render: IAudioRenderClient,
+    client: IAudioClient,
+    event: EventHandle,
+    buffer_frames: u32,
+}
+
+impl WasapiStream {
+    fn open(sample_rate: u32) -> Result<Self, tts::Failure> {
+        let client = activate_default_render_client()?;
+        let format = float_wave_format(sample_rate);
+        let event = EventHandle::new_auto_reset()?;
+        // SAFETY: `format` is a valid complete `WAVEFORMATEX` descriptor for shared-mode init.
+        unsafe {
+            client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                WASAPI_STREAM_FLAGS,
+                WASAPI_BUFFER_HNS,
+                0,
+                &raw const format,
+                None,
+            )
+        }
+        .map_err(|_| AUDIO_FAILURE)?;
+        // SAFETY: `client` is initialized.
+        let buffer_frames = unsafe { client.GetBufferSize() }.map_err(|_| AUDIO_FAILURE)?;
+        // SAFETY: `event.0` remains owned until after `client` and `render` drop.
+        unsafe { client.SetEventHandle(event.0) }.map_err(|_| AUDIO_FAILURE)?;
+        // SAFETY: `client` is initialized in render mode.
+        let render: IAudioRenderClient =
+            unsafe { client.GetService() }.map_err(|_| AUDIO_FAILURE)?;
+        Ok(Self {
+            render,
+            client,
+            event,
+            buffer_frames,
+        })
+    }
+
+    fn padding_frames(&self) -> Result<u32, StreamError> {
+        // SAFETY: `self.client` is an initialized shared-mode `IAudioClient`.
+        unsafe { self.client.GetCurrentPadding() }.map_err(|err| classify_wasapi_error(&err))
+    }
+
+    fn start(&self) -> Result<(), StreamError> {
+        // SAFETY: `self.client` is an initialized shared-mode `IAudioClient`.
+        unsafe { self.client.Start() }.map_err(|err| classify_wasapi_error(&err))
+    }
+
+    fn stop(&self) -> Result<(), StreamError> {
+        // SAFETY: `self.client` is an initialized shared-mode `IAudioClient`.
+        unsafe { self.client.Stop() }.map_err(|err| classify_wasapi_error(&err))
+    }
+
+    fn release_buffer(&self, frames: u32) -> Result<(), StreamError> {
+        // SAFETY: `frames` matches samples written between `GetBuffer` and `ReleaseBuffer`.
+        unsafe { self.render.ReleaseBuffer(frames, 0) }.map_err(|err| classify_wasapi_error(&err))
+    }
+
+    fn flush(&self, staging: &mut RenderStaging) -> Result<u32, StreamError> {
+        let padding = self.padding_frames()?;
+        let available = self.buffer_frames.saturating_sub(padding);
+        let to_write = available.min(staging.pending_frames());
+        if to_write == 0 {
+            return Ok(padding);
+        }
+        let byte_len = usize::try_from(to_write)
+            .map_err(|_| StreamError::Failed)?
+            .checked_mul(size_of::<f32>())
+            .ok_or(StreamError::Failed)?;
+        // SAFETY: `to_write` is nonzero and within available WASAPI buffer frames.
+        let ptr = unsafe { self.render.GetBuffer(to_write) }
+            .map_err(|err| classify_wasapi_error(&err))?;
+        if ptr.is_null() {
+            let _released = self.release_buffer(0);
+            return Err(StreamError::Failed);
+        }
+        // SAFETY: `GetBuffer(to_write)` returns `byte_len` writable bytes until `ReleaseBuffer`.
+        let dst = unsafe { std::slice::from_raw_parts_mut(ptr, byte_len) };
+        let Ok(written) = staging.write_into(dst) else {
+            let _released = self.release_buffer(0);
+            return Err(StreamError::Failed);
+        };
+        self.release_buffer(written)?;
+        staging.consume_frames(written);
+        Ok(padding.saturating_add(written))
+    }
+}
+
+impl Drop for WasapiStream {
+    fn drop(&mut self) {
+        // SAFETY: Best-effort stop before releasing COM interfaces and closing the event handle.
+        let _stopped = unsafe { self.client.Stop() };
+        // SAFETY: Best-effort reset clears any queued unplayed frames on teardown.
+        let _reset = unsafe { self.client.Reset() };
+    }
+}
+
+// Keep `_apartment` last so `WasapiStream` drops all COM interfaces before `CoUninitialize`.
+struct WasapiOutput {
+    stream: Option<WasapiStream>,
+    staging: RenderStaging,
+    sample_rate: u32,
+    started: bool,
+    last_padding_frames: u32,
+    _apartment: ComApartment,
+}
+
+impl WasapiOutput {
     fn open_with_rate(
         recycle: SyncSender<Vec<u8>>,
         sample_rate: u32,
     ) -> Result<Self, tts::Failure> {
-        let rate = if sample_rate == SAMPLE_RATE_48K {
-            SAMPLE_RATE_48K
-        } else {
-            SAMPLE_RATE
-        };
-        let format = WAVEFORMATEX {
-            wFormatTag: 1,
-            nChannels: 1,
-            nSamplesPerSec: rate,
-            nAvgBytesPerSec: rate * 2,
-            nBlockAlign: 2,
-            wBitsPerSample: 16,
-            cbSize: 0,
-        };
-        let mut handle = std::ptr::null_mut();
-        // SAFETY: Writable handle output and complete fixed PCM descriptor live through the call;
-        // CALLBACK_NULL registers no callback or user-data pointer.
-        if unsafe { waveOutOpen(&raw mut handle, u32::MAX, &raw const format, 0, 0, 0) } != 0 {
-            return Err(AUDIO_FAILURE);
-        }
+        let rate = normalize_sample_rate(sample_rate);
+        let apartment = ComApartment::enter()?;
+        let stream = WasapiStream::open(rate)?;
         Ok(Self {
-            handle,
-            buffers: PlaybackBuffers::with_max_packet_bytes(packet_bytes_for_rate(rate)),
-            header_bytes: u32::try_from(size_of::<WAVEHDR>()).map_err(|_| AUDIO_FAILURE)?,
-            recycle,
+            stream: Some(stream),
+            staging: RenderStaging::new(recycle, rate)?,
+            sample_rate: rate,
+            started: false,
+            last_padding_frames: 0,
+            _apartment: apartment,
         })
     }
-}
 
-impl Output for WaveOutput {
-    fn queued(&self) -> usize {
-        self.buffers.queued.len()
-    }
-
-    fn pause(&mut self) -> Result<(), tts::Failure> {
-        // SAFETY: This thread exclusively owns a live WinMM handle. Pausing
-        // retains queued headers and PCM until restart/reset releases them.
-        if unsafe { waveOutPause(self.handle) } == 0 {
-            Ok(())
-        } else {
-            Err(AUDIO_FAILURE)
-        }
-    }
-
-    fn start(&mut self) -> Result<(), tts::Failure> {
-        // SAFETY: The live handle and queued buffers remain exclusively owned.
-        if unsafe { waveOutRestart(self.handle) } == 0 {
-            Ok(())
-        } else {
-            Err(AUDIO_FAILURE)
-        }
-    }
-
-    fn push(&mut self, pcm: Vec<u8>) -> Result<(), tts::Failure> {
-        let buffer = self.buffers.take(pcm)?;
-        // SAFETY: This exclusive boxed header and its owned PCM allocation remain stable until
-        // unprepare confirms release; the descriptor size matches the native ABI.
-        if unsafe { waveOutPrepareHeader(self.handle, buffer.header.get(), self.header_bytes) } != 0
-        {
+    fn reopen_stream(&mut self) -> Result<(), tts::Failure> {
+        self.stream = None;
+        self.last_padding_frames = 0;
+        let stream = WasapiStream::open(self.sample_rate)?;
+        let padding = stream.flush(&mut self.staging).map_err(|_| AUDIO_FAILURE)?;
+        self.last_padding_frames = padding;
+        if self.started && stream.start().is_err() {
             return Err(AUDIO_FAILURE);
         }
-        self.buffers.queued.push_back(buffer);
-        let buffer = self.buffers.queued.back().ok_or(AUDIO_FAILURE)?;
-        // SAFETY: The prepared header and PCM remain owned by buffers until the driver releases them.
-        if unsafe { waveOutWrite(self.handle, buffer.header.get(), self.header_bytes) } != 0 {
-            return Err(AUDIO_FAILURE);
-        }
+        self.stream = Some(stream);
         Ok(())
     }
 
-    fn reap(&mut self) -> Result<(), tts::Failure> {
-        self.buffers.reap(
-            |header| {
-                // SAFETY: The submitted header remains boxed and owned by buffers.
-                // Unprepare tests release without reading driver-written flags in Rust.
-                unsafe { waveOutUnprepareHeader(self.handle, header, self.header_bytes) }
-            },
-            &self.recycle,
-        )
+    fn run_with_reopen(
+        &mut self,
+        mut op: impl FnMut(&WasapiStream, &mut RenderStaging, &mut u32) -> Result<(), StreamError>,
+    ) -> Result<(), tts::Failure> {
+        let first = if let Some(stream) = &self.stream {
+            op(stream, &mut self.staging, &mut self.last_padding_frames)
+        } else {
+            Err(StreamError::Invalidated)
+        };
+        match first {
+            Ok(()) => Ok(()),
+            Err(StreamError::Failed) => Err(AUDIO_FAILURE),
+            Err(StreamError::Invalidated) => {
+                self.reopen_stream()?;
+                let stream = self.stream.as_ref().ok_or(AUDIO_FAILURE)?;
+                match op(stream, &mut self.staging, &mut self.last_padding_frames) {
+                    Ok(()) => Ok(()),
+                    Err(StreamError::Invalidated | StreamError::Failed) => Err(AUDIO_FAILURE),
+                }
+            }
+        }
     }
 }
 
-impl Drop for WaveOutput {
-    fn drop(&mut self) {
-        // SAFETY: This thread exclusively owns the live handle; reset stops playback and returns
-        // queued buffers before unprepare and release. No callbacks can outlive these buffers.
-        let reset = unsafe { waveOutReset(self.handle) };
-        let released = self.buffers.drain(
-            |header| {
-                // SAFETY: The header remains allocated while asking the driver to release it.
-                unsafe { waveOutUnprepareHeader(self.handle, header, self.header_bytes) }
-            },
-            |buffer| {
-                // An abnormal driver refusal cannot justify freeing memory still owned by WinMM.
-                // This bounded allocation survives to process exit instead of becoming dangling.
-                let _retained = Box::leak(buffer);
-            },
-        );
-        if reset == 0 && released {
-            // SAFETY: Reset succeeded and all prepared buffers have been released.
-            let _closed = unsafe { waveOutClose(self.handle) };
+impl Output for WasapiOutput {
+    fn queued(&self) -> usize {
+        let padding = self
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.padding_frames().ok())
+            .unwrap_or(self.last_padding_frames);
+        self.staging.queued_packets(padding)
+    }
+
+    fn pause(&mut self) -> Result<(), tts::Failure> {
+        self.started = false;
+        self.run_with_reopen(|stream, _, last_padding| {
+            stream.stop()?;
+            *last_padding = stream.padding_frames()?;
+            Ok(())
+        })
+    }
+
+    fn start(&mut self) -> Result<(), tts::Failure> {
+        self.started = true;
+        self.run_with_reopen(|stream, staging, last_padding| {
+            *last_padding = stream.flush(staging)?;
+            stream.start()?;
+            Ok(())
+        })
+    }
+
+    fn push(&mut self, pcm: Vec<u8>) -> Result<(), tts::Failure> {
+        self.staging.enqueue(pcm)?;
+        self.run_with_reopen(|stream, staging, last_padding| {
+            *last_padding = stream.flush(staging)?;
+            Ok(())
+        })
+    }
+
+    fn reap(&mut self) -> Result<(), tts::Failure> {
+        self.run_with_reopen(|stream, staging, last_padding| {
+            *last_padding = stream.flush(staging)?;
+            Ok(())
+        })
+    }
+
+    fn wait(&mut self, timeout: Duration) {
+        if self.started
+            && let Some(stream) = &self.stream
+        {
+            let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+            let _signaled = stream.event.wait(timeout_ms);
+        } else {
+            thread::sleep(timeout);
         }
     }
 }
@@ -1686,156 +1984,190 @@ mod tests {
     }
 
     #[test]
-    fn playback_descriptors_reuse_released_allocations_and_clear_native_fields()
+    fn wasapi_float_format_and_render_route_match_windows_audio_contract() -> Result<(), Failure> {
+        use windows::{Win32::Media::Audio::DEVINTERFACE_AUDIO_RENDER, core::GUID};
+
+        assert_eq!(
+            DEVINTERFACE_AUDIO_RENDER,
+            GUID::from_u128(0xe632_7cad_dcec_4949_ae8a_991e_976a_79d2)
+        );
+        let expected_path: Vec<u16> = "{e6327cad-dcec-4949-ae8a-991e976a79d2}"
+            .encode_utf16()
+            .collect();
+        // SAFETY: `DEVINTERFACE_AUDIO_RENDER_PATH` is a static null-terminated UTF-16 literal.
+        let actual_path = unsafe { super::DEVINTERFACE_AUDIO_RENDER_PATH.as_wide() };
+        assert_eq!(actual_path, expected_path);
+
+        for (requested_rate, expected_rate) in [
+            (SAMPLE_RATE, SAMPLE_RATE),
+            (SAMPLE_RATE_48K, SAMPLE_RATE_48K),
+            (16_000, SAMPLE_RATE),
+        ] {
+            let format = super::float_wave_format(requested_rate);
+            assert_eq!({ format.wFormatTag }, super::WAVE_FORMAT_IEEE_FLOAT);
+            assert_eq!({ format.nChannels }, 1);
+            assert_eq!({ format.nSamplesPerSec }, expected_rate);
+            assert_eq!({ format.nAvgBytesPerSec }, expected_rate * 4);
+            assert_eq!({ format.nBlockAlign }, 4);
+            assert_eq!({ format.wBitsPerSample }, 32);
+            assert_eq!({ format.cbSize }, 0);
+        }
+
+        let (sender, _returned) = mpsc::sync_channel(PLAYBACK_PACKETS);
+        let mut staging = super::RenderStaging::new(sender, SAMPLE_RATE)?;
+        let mut pcm = Vec::new();
+        for sample in [i16::MIN, 0, i16::MAX] {
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        staging.enqueue(pcm)?;
+        let mut dst = vec![0u8; 12];
+        assert_eq!(staging.write_into(&mut dst)?, 3);
+        let decoded: Vec<u32> = dst
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes).to_bits())
+            .collect();
+        assert_eq!(
+            decoded,
+            vec![
+                (-1.0_f32).to_bits(),
+                0.0_f32.to_bits(),
+                (f32::from(i16::MAX) * (1.0 / 32_768.0)).to_bits(),
+            ]
+        );
+        assert!(staging.write_into(&mut [0u8; 2]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn wasapi_staging_recycles_rendered_packets_immediately_and_bounds_overflow()
     -> Result<(), Failure> {
         let (sender, returned) = mpsc::sync_channel(PLAYBACK_PACKETS);
-        let mut buffers = super::PlaybackBuffers::default();
+        let mut staging = super::RenderStaging::new(sender, SAMPLE_RATE)?;
+        for invalid in [Vec::new(), vec![0], vec![0; PACKET_BYTES + 2]] {
+            assert!(staging.enqueue(invalid).is_err());
+            assert!(staging.pending.is_empty());
+        }
+
         let mut addresses = Vec::new();
-        for _ in 0..PLAYBACK_PACKETS {
-            let mut buffer = buffers.take(vec![7; PACKET_BYTES])?;
-            addresses.push(buffer.header.get());
-            // Simulate fields written during preparation/playback before putting
-            // this descriptor in the fake driver's queue. No audio device is used.
-            let header = buffer.header.get_mut();
-            header.dwBytesRecorded = u32::MAX;
-            header.dwFlags = u32::MAX;
-            header.dwLoops = u32::MAX;
-            header.dwUser = usize::MAX;
-            header.lpNext = std::ptr::dangling_mut();
-            header.reserved = usize::MAX;
-            buffers.queued.push_back(buffer);
+        for index in 0..PLAYBACK_PACKETS {
+            let mut packet = Vec::with_capacity(PACKET_BYTES);
+            let value = i16::try_from(index + 1).map_err(|_| super::AUDIO_FAILURE)?;
+            for _ in 0..(PACKET_BYTES / 2) {
+                packet.extend_from_slice(&value.to_le_bytes());
+            }
+            addresses.push(packet.as_ptr());
+            staging.enqueue(packet)?;
         }
-        for _ in 0..16 {
-            buffers.reap(
-                |header| {
-                    assert!(addresses.contains(&header));
-                    0
-                },
-                &sender,
-            )?;
-            assert!(buffers.queued.is_empty());
-            assert_eq!(buffers.spare.len(), PLAYBACK_PACKETS);
-            assert_eq!(returned.try_iter().count(), PLAYBACK_PACKETS);
-            for invalid in [Vec::new(), vec![0], vec![0; PACKET_BYTES + 2]] {
-                assert!(buffers.take(invalid).is_err());
-                assert_eq!(buffers.spare.len(), PLAYBACK_PACKETS);
-            }
-            for buffer in &mut buffers.spare {
-                assert_eq!(buffer.pcm, b"");
-                assert_eq!(buffer.pcm.capacity(), 0);
-                let header = buffer.header.get_mut();
-                assert!(header.lpData.is_null());
-                assert_eq!({ header.dwBufferLength }, 0);
-                assert_eq!({ header.dwBytesRecorded }, 0);
-                assert_eq!({ header.dwFlags }, 0);
-                assert_eq!({ header.dwLoops }, 0);
-                assert_eq!({ header.dwUser }, 0);
-                assert!(header.lpNext.is_null());
-                assert_eq!({ header.reserved }, 0);
-            }
-            for index in 0..PLAYBACK_PACKETS {
-                let bytes = if index == 0 { 42 } else { PACKET_BYTES };
-                let mut pcm = Vec::with_capacity(PACKET_BYTES);
-                pcm.resize(bytes, 3);
-                let pcm_address = pcm.as_ptr();
-                let mut buffer = buffers.take(pcm)?;
-                assert!(addresses.contains(&buffer.header.get()));
-                let header = buffer.header.get_mut();
-                assert_eq!(header.lpData.cast_const(), pcm_address);
-                assert_eq!(usize::try_from(header.dwBufferLength).ok(), Some(bytes));
-                assert_eq!(buffer.pcm, vec![3; bytes]);
-                buffers.queued.push_back(buffer);
-            }
-            assert!(buffers.spare.is_empty());
-            // Rejection cannot consume a spare descriptor or exceed the native
-            // queue bound, even when a caller bypasses the consume loop.
-            assert!(buffers.take(vec![0; 2]).is_err());
-            assert_eq!(buffers.queued.len(), PLAYBACK_PACKETS);
-            assert_eq!(
-                buffers.queued.front().map(|buffer| buffer.pcm.len()),
-                Some(42)
-            );
+        // Rejection cannot bypass the queue cap or drop already-staged PCM.
+        assert!(staging.enqueue(vec![0; PACKET_BYTES]).is_err());
+        assert_eq!(staging.pending.len(), PLAYBACK_PACKETS);
+        assert_eq!(staging.queued_packets(0), PLAYBACK_PACKETS);
+
+        // Partial write advances within the front packet without prematurely recycling it.
+        let mut partial = vec![0u8; 2_000 * 4];
+        assert_eq!(staging.write_into(&mut partial)?, 2_000);
+        staging.consume_frames(2_000);
+        assert_eq!(staging.pending.len(), PLAYBACK_PACKETS);
+        assert_eq!(staging.front_offset_bytes, 4_000);
+        assert!(returned.try_recv().is_err());
+
+        // Finishing the front packet plus two full packets recycles all three allocations.
+        let remaining_frames = 400 + 2 * 2_400;
+        let mut batch = vec![0u8; remaining_frames * 4];
+        assert_eq!(
+            staging.write_into(&mut batch)?,
+            u32::try_from(remaining_frames).map_err(|_| super::AUDIO_FAILURE)?
+        );
+        staging.consume_frames(u32::try_from(remaining_frames).map_err(|_| super::AUDIO_FAILURE)?);
+        assert_eq!(staging.pending.len(), PLAYBACK_PACKETS - 3);
+        assert_eq!(staging.front_offset_bytes, 0);
+        let recycled_addrs: Vec<_> = returned
+            .try_iter()
+            .map(|pkt| (pkt.as_ptr(), pkt.capacity(), pkt.len()))
+            .collect();
+        assert_eq!(recycled_addrs.len(), 3);
+        for (index, (addr, cap, len)) in recycled_addrs.into_iter().enumerate() {
+            assert_eq!(addr, addresses[index]);
+            assert_eq!(cap, PACKET_BYTES);
+            assert_eq!(len, 0);
         }
         Ok(())
     }
 
     #[test]
-    fn playback_descriptors_keep_driver_owned_storage_on_unprepare_refusal() -> Result<(), Failure>
-    {
+    fn wasapi_ceiling_padding_retains_partial_tails_and_recovers_unwritten_frames_on_invalidation()
+    -> Result<(), Failure> {
         let (sender, returned) = mpsc::sync_channel(PLAYBACK_PACKETS);
-        let mut buffers = super::PlaybackBuffers::default();
-        let buffer = buffers.take(vec![9; PACKET_BYTES])?;
-        let header = buffer.header.get();
-        let pcm = buffer.pcm.as_ptr();
-        buffers.queued.push_back(buffer);
-        for result in [33, 1] {
-            assert_eq!(
-                buffers.reap(
-                    |address| {
-                        assert_eq!(address, header);
-                        result
-                    },
-                    &sender
-                ),
-                if result == 33 {
-                    Ok(())
-                } else {
-                    Err(super::AUDIO_FAILURE)
-                }
-            );
-            assert_eq!(buffers.queued.len(), 1);
-            assert!(buffers.spare.is_empty());
-            assert!(returned.try_recv().is_err());
-            let retained = buffers.queued.front().ok_or(super::AUDIO_FAILURE)?;
-            assert_eq!(retained.header.get(), header);
-            assert_eq!(retained.pcm.as_ptr(), pcm);
-            assert_eq!(retained.pcm, vec![9; PACKET_BYTES]);
-        }
-        buffers.reap(|_| 0, &sender)?;
-        assert_eq!(buffers.spare.len(), 1);
-        assert_eq!(returned.try_recv().ok().map(|pcm| pcm.as_ptr()), Some(pcm));
-        Ok(())
-    }
+        let mut staging = super::RenderStaging::new(sender, SAMPLE_RATE)?;
+        let packet_frames = staging.packet_frames;
 
-    #[test]
-    fn playback_descriptor_teardown_quarantines_only_refused_active_buffers() -> Result<(), Failure>
-    {
-        let (sender, returned) = mpsc::sync_channel(PLAYBACK_PACKETS);
-        let mut buffers = super::PlaybackBuffers::default();
-        // Establish one spare descriptor. Teardown must never ask the driver to
-        // unprepare it again or quarantine already released storage.
-        let spare = buffers.take(vec![1; PACKET_BYTES])?;
-        let spare_address = spare.header.get();
-        buffers.queued.push_back(spare);
-        buffers.reap(|_| 0, &sender)?;
-        assert!(returned.try_recv().is_ok());
-        let mut active = Vec::new();
-        for _ in 0..3 {
-            let buffer = super::PlaybackBuffers::default().take(vec![8; PACKET_BYTES])?;
-            active.push((buffer.header.get(), buffer.pcm.as_ptr()));
-            buffers.queued.push_back(buffer);
+        // Even a single unplayed tail frame keeps queued_packets >= 1 until padding hits 0.
+        assert_eq!(staging.queued_packets(0), 0);
+        assert_eq!(staging.queued_packets(1), 1);
+        assert_eq!(staging.queued_packets(packet_frames), 1);
+        assert_eq!(staging.queued_packets(packet_frames + 1), 2);
+
+        // Enqueue 3 packets with distinct samples, write 1.5 packets cleanly, and simulate an
+        // invalidated device failing ReleaseBuffer before consume_frames commits the next chunk.
+        let mut expected_f32 = Vec::new();
+        for packet_idx in 0..3 {
+            let mut pkt = Vec::with_capacity(PACKET_BYTES);
+            let sample = i16::try_from((packet_idx + 1) * 100).map_err(|_| super::AUDIO_FAILURE)?;
+            for _ in 0..(PACKET_BYTES / 2) {
+                pkt.extend_from_slice(&sample.to_le_bytes());
+            }
+            staging.enqueue(pkt)?;
         }
-        let mut calls = 0;
-        let mut quarantined = Vec::new();
-        assert!(!buffers.drain(
-            |header| {
-                assert_ne!(header, spare_address);
-                assert_eq!(header, active[calls].0);
-                calls += 1;
-                u32::from(calls != 2)
-            },
-            |buffer| quarantined.push(buffer)
-        ));
-        assert_eq!(calls, 3);
-        assert!(buffers.queued.is_empty());
-        assert_eq!(buffers.spare.len(), 1);
-        assert_eq!(quarantined.len(), 2);
-        drop(buffers);
-        for (buffer, index) in quarantined.iter().zip([0, 2]) {
-            assert_eq!(buffer.header.get(), active[index].0);
-            assert_eq!(buffer.pcm.as_ptr(), active[index].1);
-            assert_eq!(buffer.pcm, vec![8; PACKET_BYTES]);
-        }
+
+        let first_frames = 3_600usize; // 1.5 packets
+        let mut first_buf = vec![0u8; first_frames * 4];
+        assert_eq!(staging.write_into(&mut first_buf)?, 3_600);
+        staging.consume_frames(3_600);
+        expected_f32.extend(
+            first_buf
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b)),
+        );
+        assert_eq!(returned.try_iter().count(), 1);
+
+        // Simulate write_into filling a buffer followed by ReleaseBuffer returning
+        // AUDCLNT_E_DEVICE_INVALIDATED before consume_frames is called: staging retains all 3,600 frames.
+        let mut aborted_buf = vec![0u8; 3_600 * 4];
+        assert_eq!(staging.write_into(&mut aborted_buf)?, 3_600);
+        // Do NOT call consume_frames on failure; verify recovery onto a fresh stream gets every frame.
+        assert_eq!(staging.pending_frames(), 3_600);
+        assert_eq!(staging.queued_packets(0), 2);
+
+        let mut recovered_buf = vec![0u8; 3_600 * 4];
+        assert_eq!(staging.write_into(&mut recovered_buf)?, 3_600);
+        staging.consume_frames(3_600);
+        expected_f32.extend(
+            recovered_buf
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b)),
+        );
+        assert_eq!(staging.pending_frames(), 0);
+        assert_eq!(staging.queued_packets(0), 0);
+        assert_eq!(returned.try_iter().count(), 2);
+        assert_eq!(expected_f32.len(), 7_200);
+        assert_eq!(
+            expected_f32[0].to_bits(),
+            (f32::from(100i16) * (1.0 / 32_768.0)).to_bits()
+        );
+        assert_eq!(
+            expected_f32[2_400].to_bits(),
+            (f32::from(200i16) * (1.0 / 32_768.0)).to_bits()
+        );
+        assert_eq!(
+            expected_f32[4_800].to_bits(),
+            (f32::from(300i16) * (1.0 / 32_768.0)).to_bits()
+        );
         Ok(())
     }
 

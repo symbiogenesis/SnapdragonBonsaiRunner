@@ -269,7 +269,7 @@ Use Rust [owned/borrowed handle types](https://doc.rust-lang.org/std/os/windows/
 `File`, socket and process owners; transfer fresh Win32 handles into owners
 immediately and borrow raw handles only for a call. Pseudo handles stay borrowed.
 Match allocator-specific destructors: credentials use `LocalFree`, WinRT uses its
-bindings, and audio retains waveOut headers/buffers until driver release.
+bindings, and speech audio drops COM render interfaces before closing its WASAPI event handle.
 
 `src/windows-process` creates hidden suspended processes with explicit executable,
 working directory and quoted arguments. Creation attributes assign an unnamed
@@ -338,8 +338,4 @@ can suit explicit background work, but response generation/playback needs device
 latency/power evidence. Current configurable thread budgets reserve CPU capacity;
 they establish neither optimal topology nor performance.
 
-WinMM waveOut playback retains stable headers/buffers, bounded buffering,
-stop/reset and unprepare-before-free ordering. Microsoft
-[recommends newer audio APIs](https://learn.microsoft.com/en-us/windows/win32/multimedia/waveform-functions);
-WASAPI/AudioGraph migration still needs device-change, suspend/resume,
-cancellation and latency qualification.
+Event-driven shared-mode WASAPI playback (`IAudioClient` / `IAudioRenderClient` activated via `ActivateAudioInterfaceAsync` on `DEVINTERFACE_AUDIO_RENDER` with `AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`) converts PCM16 packets directly to `f32`, bounds staging, stops/resets on drop before `CoUninitialize`, and reopens cleanly on `AUDCLNT_E_DEVICE_INVALIDATED`; end-to-end device-change, suspend/resume, cancellation and latency qualification remain open under real audio hardware.
