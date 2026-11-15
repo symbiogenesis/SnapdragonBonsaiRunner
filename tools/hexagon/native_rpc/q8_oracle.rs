@@ -4,6 +4,12 @@
 //! ordered scalar F64 projection with caller-declared error limits. It measures
 //! projection error, without emulating HVX activation quantization or QF16.
 //!
+//! `Q8HvxQuantizationOracle` additionally models the pinned `0x2008` binary16
+//! activation scale and reciprocal stage in IEEE-754 binary16 RNE with ordered
+//! `F64`-to-`F32` block projection under caller-declared tolerances, without
+//! emulating HVX `QF16`/`QF32`, the `hvx_vec_inverse_f16` LUT polynomial,
+//! `hvx_vec_i16_from_hf_rnd_sat`, or per-block `F32` accumulation.
+//!
 //! The pinned `quantize_block_f32_q8_0_tiled` converts each 32-value group to
 //! half, multiplies its absolute maximum by half 0x2008, and uses the half
 //! inverse before rounding to signed codes. Integer inputs with magnitude at
@@ -449,6 +455,405 @@ fn exact_sum(units: i64) -> Result<f32, Error> {
     // Exact normal power-of-two scaling; zero remains positive as in the
     // DSP accumulator initialized to positive zero before its first addition.
     Ok(rounded * (1.0 / 256.0))
+}
+
+const F16_ONE_OVER_127_BITS: u16 = 0x2008;
+
+/// Independent HVX `0x2008` half-quantization and Q8 projection oracle.
+///
+/// Models the `0x2008` (`129/16384`) binary16 activation scale and reciprocal
+/// stage of the pinned `quantize_block_f32_q8_0_tiled` kernel on each 32-value
+/// F32 group: IEEE-754 binary16 RNE narrowing, `amax * 0x2008` binary16 RNE
+/// scale `d` (zero only when narrowed `amax == 0`), IEEE-754 binary16 RNE
+/// reciprocal `1/d` and lane products, and RNE clamped signed `i8` codes
+/// (`-127..=127`). Outputs are compared against ordered `F64` block
+/// accumulation (`w_q * a_q * (d_w * d_a)`) narrowed to `F32` within fixed
+/// caller-reviewed finite tolerances. This does not emulate HVX `QF16`/`QF32`,
+/// the `hvx_vec_inverse_f16` LUT polynomial, `hvx_vec_i16_from_hf_rnd_sat`, or
+/// per-block `F32` reduction, and grants no device or speech acceptance.
+pub struct Q8HvxQuantizationOracle<'a> {
+    projection: Q8Matmul,
+    weights: &'a [u8],
+    activation: &'a [f32],
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+    expected: Box<[f32]>,
+    quantized_scales: Box<[u16]>,
+    quantized_codes: Box<[i8]>,
+}
+
+impl<'a> Q8HvxQuantizationOracle<'a> {
+    /// Validate inputs, quantize activations through the pinned `0x2008`
+    /// binary16 RNE model, and prepare expected projections without a budget.
+    ///
+    /// # Errors
+    /// Rejects non-finite/overflowing inputs, invalid tolerances, nonzero-`amax`
+    /// scale underflow or subreciprocal overflow (`d < 0x0101`), allocation
+    /// failure, unrepresentable F32 expected values, and mismatched extents.
+    pub fn new(
+        projection: Q8Matmul,
+        weights: &'a [u8],
+        activation: &'a [f32],
+        absolute_tolerance: f64,
+        relative_tolerance: f64,
+    ) -> Result<Self, Error> {
+        Self::new_with_control(
+            projection,
+            weights,
+            activation,
+            absolute_tolerance,
+            relative_tolerance,
+            || Ok(()),
+        )
+    }
+
+    /// Validate inputs and prepare expected HVX-quantized projections while
+    /// polling the caller-owned deadline and cancellation control callback.
+    ///
+    /// `check` follows [`Q8ReferenceOracle::new_with_control`]'s inherited-clock
+    /// contract, polling before intake/allocation, once per 32-lane block and
+    /// before return. Refusal returns no partially built oracle.
+    ///
+    /// # Errors
+    /// Rejects control cancellation/expiry, malformed inputs, F16 overflow,
+    /// nonzero-`amax` scale underflow or subreciprocal overflow (`d < 0x0101`),
+    /// allocation failure, and unrepresentable F32 expected projections before
+    /// native submission.
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "The independent quantized reference preserves separate block scale product and addition rounding"
+    )]
+    pub fn new_with_control(
+        projection: Q8Matmul,
+        weights: &'a [u8],
+        activation: &'a [f32],
+        absolute_tolerance: f64,
+        relative_tolerance: f64,
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        check()?;
+        if weights.len() != projection.weight_bytes()
+            || activation.len() != projection.columns() * projection.batch()
+            || !absolute_tolerance.is_finite()
+            || !(0.0..=f64::from(f32::MAX)).contains(&absolute_tolerance)
+            || !relative_tolerance.is_finite()
+            || !(0.0..=1.0).contains(&relative_tolerance)
+        {
+            return Err(Error::Contract);
+        }
+        for block in activation.as_chunks::<32>().0 {
+            check()?;
+            if block.iter().any(|value| !value.is_finite()) {
+                return Err(Error::Contract);
+            }
+        }
+        for block in weights.as_chunks::<34>().0 {
+            check()?;
+            reference_scale(u16::from_le_bytes([block[0], block[1]]))?;
+        }
+        check()?;
+        let blocks = projection.columns() / 32;
+        let row_bytes = blocks * 34;
+        let total_act_blocks = projection.batch() * blocks;
+        let mut quantized_scales = Vec::new();
+        quantized_scales
+            .try_reserve_exact(total_act_blocks)
+            .map_err(|_| Error::Contract)?;
+        let mut quantized_codes = Vec::new();
+        quantized_codes
+            .try_reserve_exact(activation.len())
+            .map_err(|_| Error::Contract)?;
+        let mut expected = Vec::new();
+        expected
+            .try_reserve_exact(projection.rows() * projection.batch())
+            .map_err(|_| Error::Contract)?;
+        let inv_127 = reference_scale(F16_ONE_OVER_127_BITS)?;
+        for group in activation.as_chunks::<32>().0 {
+            check()?;
+            let mut half_lanes = [0_u16; 32];
+            let mut amax = 0.0_f64;
+            for (index, &value) in group.iter().enumerate() {
+                let h = f32_to_f16_bits(value)?;
+                half_lanes[index] = h;
+                amax = amax.max(reference_scale(h & 0x7fff)?);
+            }
+            let (d_bits, id_bits) = if amax == 0.0 {
+                (0_u16, 0_u16)
+            } else {
+                let d_bits = f64_to_f16_bits(amax * inv_127)?;
+                let d_scale = reference_scale(d_bits)?;
+                if d_scale == 0.0 {
+                    return Err(Error::Contract);
+                }
+                let id_bits = f64_to_f16_bits(1.0 / d_scale)?;
+                (d_bits, id_bits)
+            };
+            quantized_scales.push(d_bits);
+            for h in half_lanes {
+                if id_bits == 0 {
+                    quantized_codes.push(0);
+                } else {
+                    let scaled_bits =
+                        f64_to_f16_bits(reference_scale(h)? * reference_scale(id_bits)?)?;
+                    quantized_codes.push(quantized_code(reference_scale(scaled_bits)?));
+                }
+            }
+        }
+        for vector in 0..projection.batch() {
+            let act_scale_base = vector * blocks;
+            let act_code_base = vector * projection.columns();
+            for row in 0..projection.rows() {
+                let row_weights = &weights[row * row_bytes..(row + 1) * row_bytes];
+                let mut total = 0.0_f64;
+                for block in 0..blocks {
+                    check()?;
+                    let weight_block = &row_weights[block * 34..(block + 1) * 34];
+                    let weight_scale =
+                        reference_scale(u16::from_le_bytes([weight_block[0], weight_block[1]]))?;
+                    let act_scale = reference_scale(quantized_scales[act_scale_base + block])?;
+                    let act_codes = &quantized_codes
+                        [act_code_base + block * 32..act_code_base + (block + 1) * 32];
+                    let mut dot = 0_i32;
+                    for (lane, &weight_byte) in weight_block[2..34].iter().enumerate() {
+                        let w = i32::from(i8::from_ne_bytes([weight_byte]));
+                        let a = i32::from(act_codes[lane]);
+                        dot += w * a;
+                    }
+                    total += f64::from(dot) * (weight_scale * act_scale);
+                    if !total.is_finite() {
+                        return Err(Error::Contract);
+                    }
+                }
+                expected.push(narrow_expected(total)?);
+            }
+        }
+        check()?;
+        Ok(Self {
+            projection,
+            weights,
+            activation,
+            absolute_tolerance,
+            relative_tolerance,
+            expected: expected.into_boxed_slice(),
+            quantized_scales: quantized_scales.into_boxed_slice(),
+            quantized_codes: quantized_codes.into_boxed_slice(),
+        })
+    }
+
+    /// Exact selected matrix and immutable solver mapping.
+    #[must_use]
+    pub const fn projection(&self) -> Q8Matmul {
+        self.projection
+    }
+
+    /// Prepared `0x2008`-scaled binary16 block scale bits, one `u16` per 32-lane block.
+    #[must_use]
+    pub const fn quantized_scales(&self) -> &[u16] {
+        &self.quantized_scales
+    }
+
+    /// Prepared RNE clamped signed `i8` activation codes after half reciprocal scaling.
+    #[must_use]
+    pub const fn quantized_codes(&self) -> &[i8] {
+        &self.quantized_codes
+    }
+
+    /// Expected F32 projection values from the quantized activation model.
+    #[must_use]
+    pub const fn expected(&self) -> &[f32] {
+        &self.expected
+    }
+
+    /// Review complete returned F32 projection outputs against fixed tolerances.
+    ///
+    /// # Errors
+    /// Rejects shape mismatches, non-finite outputs and tolerance violations.
+    pub fn review(&self, output: &[f32]) -> Result<(), Error> {
+        self.review_with_control(output, || Ok(()))
+    }
+
+    /// Review complete returned F32 projection outputs while polling the control callback.
+    ///
+    /// # Errors
+    /// Rejects cancellation/expiry, malformed extents, non-finite outputs and tolerance violations.
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "The declared tolerance formula preserves separate multiply/add rounding"
+    )]
+    pub fn review_with_control(
+        &self,
+        output: &[f32],
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        check()?;
+        if output.len() != self.expected.len() {
+            return Err(Error::Contract);
+        }
+        for (&actual, &expected) in output.iter().zip(&self.expected) {
+            check()?;
+            if !actual.is_finite() {
+                return Err(Error::Contract);
+            }
+            let delta = (f64::from(actual) - f64::from(expected)).abs();
+            let limit =
+                self.absolute_tolerance + self.relative_tolerance * f64::from(expected).abs();
+            if delta > limit {
+                return Err(Error::Contract);
+            }
+        }
+        check()
+    }
+
+    /// Submit original borrowed inputs and publish outputs only after review passes.
+    ///
+    /// # Errors
+    /// Rejects transport failure or failed output review before publication.
+    pub fn submit(&self, transport: &mut dyn Q8Submitter, output: &mut [f32]) -> Result<(), Error> {
+        self.submit_with_control(transport, output, || Ok(()))
+    }
+
+    /// Submit original borrowed inputs with bounded control polling through review.
+    ///
+    /// # Errors
+    /// Rejects early cancellation/expiry, transport refusal or failed review before publication.
+    pub fn submit_with_control(
+        &self,
+        transport: &mut dyn Q8Submitter,
+        output: &mut [f32],
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        check()?;
+        let mut oracle = |candidate: &[f32]| self.review_with_control(candidate, &mut check);
+        transport.submit(self.weights, self.activation, output, &mut oracle)
+    }
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Finite binary16 scaled lane is rounded ties-to-even and clamped to -127..=127"
+)]
+fn quantized_code(scaled: f64) -> i8 {
+    scaled.round_ties_even().clamp(-127.0, 127.0) as i8
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Finite F64 reference within +/-f32::MAX narrows to IEEE-754 F32 RNE"
+)]
+fn narrow_expected(total: f64) -> Result<f32, Error> {
+    if !total.is_finite() || total.abs() > f64::from(f32::MAX) {
+        return Err(Error::Contract);
+    }
+    Ok(total as f32)
+}
+
+fn f32_to_f16_bits(value: f32) -> Result<u16, Error> {
+    if !value.is_finite() {
+        return Err(Error::Contract);
+    }
+    let bits = value.to_bits();
+    let sign = if (bits & 0x8000_0000) != 0 {
+        0x8000_u16
+    } else {
+        0
+    };
+    let exp = i32::try_from((bits >> 23) & 0xff).map_err(|_| Error::Contract)?;
+    let frac = bits & 0x7f_ffff;
+    if exp == 0 {
+        return Ok(sign);
+    }
+    let mut unbiased = exp - 127;
+    if unbiased >= -14 {
+        let mut mant = frac >> 13;
+        let rem = frac & 0x1fff;
+        if rem > 0x1000 || (rem == 0x1000 && (mant & 1) == 1) {
+            mant += 1;
+            if mant == 1024 {
+                mant = 0;
+                unbiased += 1;
+            }
+        }
+        if unbiased > 15 {
+            return Err(Error::Contract);
+        }
+        let exp_bits = u16::try_from(unbiased + 15).map_err(|_| Error::Contract)?;
+        let mant_bits = u16::try_from(mant).map_err(|_| Error::Contract)?;
+        return Ok(sign | (exp_bits << 10) | mant_bits);
+    }
+    if unbiased < -25 {
+        return Ok(sign);
+    }
+    let sig = 0x80_0000 | frac;
+    let shift = u32::try_from(-14 - unbiased + 13).map_err(|_| Error::Contract)?;
+    let half = 1_u32 << (shift - 1);
+    let mask = (1_u32 << shift) - 1;
+    let mut mant = sig >> shift;
+    let rem = sig & mask;
+    if rem > half || (rem == half && (mant & 1) == 1) {
+        mant += 1;
+    }
+    if mant == 1024 {
+        return Ok(sign | 0x0400);
+    }
+    let mant_bits = u16::try_from(mant).map_err(|_| Error::Contract)?;
+    Ok(sign | mant_bits)
+}
+
+fn f64_to_f16_bits(value: f64) -> Result<u16, Error> {
+    if !value.is_finite() {
+        return Err(Error::Contract);
+    }
+    // f64 inputs here exceed binary16 precision only beyond 11 bits; converting
+    // directly using IEEE-754 RNE on the 53-bit significand avoids double rounding.
+    let bits = value.to_bits();
+    let sign = if (bits & 0x8000_0000_0000_0000) != 0 {
+        0x8000_u16
+    } else {
+        0
+    };
+    let exp = i32::try_from((bits >> 52) & 0x7ff).map_err(|_| Error::Contract)?;
+    let frac = bits & 0xf_ffff_ffff_ffff;
+    if exp == 0 {
+        return Ok(sign);
+    }
+    let mut unbiased = exp - 1023;
+    if unbiased >= -14 {
+        let mut mant = u32::try_from(frac >> 42).map_err(|_| Error::Contract)?;
+        let rem = frac & 0x3ff_ffff_ffff;
+        let half = 0x200_0000_0000_u64;
+        if rem > half || (rem == half && (mant & 1) == 1) {
+            mant += 1;
+            if mant == 1024 {
+                mant = 0;
+                unbiased += 1;
+            }
+        }
+        if unbiased > 15 {
+            return Err(Error::Contract);
+        }
+        let exp_bits = u16::try_from(unbiased + 15).map_err(|_| Error::Contract)?;
+        let mant_bits = u16::try_from(mant).map_err(|_| Error::Contract)?;
+        return Ok(sign | (exp_bits << 10) | mant_bits);
+    }
+    if unbiased < -25 {
+        return Ok(sign);
+    }
+    let sig = 0x10_0000_0000_0000_u64 | frac;
+    let shift = u32::try_from(-14 - unbiased + 42).map_err(|_| Error::Contract)?;
+    let half = 1_u64 << (shift - 1);
+    let mask = (1_u64 << shift) - 1;
+    let mut mant = u32::try_from(sig >> shift).map_err(|_| Error::Contract)?;
+    let rem = sig & mask;
+    if rem > half || (rem == half && (mant & 1) == 1) {
+        mant += 1;
+    }
+    if mant == 1024 {
+        return Ok(sign | 0x0400);
+    }
+    let mant_bits = u16::try_from(mant).map_err(|_| Error::Contract)?;
+    Ok(sign | mant_bits)
 }
 
 #[cfg(test)]

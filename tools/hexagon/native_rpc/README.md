@@ -202,7 +202,21 @@ speech tolerances. Device numerical acceptance must separately establish useful
 reviewed limits and the actual signed path; loaded-DSP and usable-VTCM admission
 remain independent prerequisites.
 
-Both oracles expose `new_with_control`, `review_with_control` and
+`Q8HvxQuantizationOracle` additionally models the pinned
+`quantize_block_f32_q8_0_tiled` `0x2008` (`129/16384`) binary16 activation
+scale and reciprocal stage in IEEE-754 binary16 RNE: each 32-value F32 group is
+narrowed via binary16 RNE, `amax` is multiplied by `0x2008` to form half scale
+`d` (zero only when narrowed `amax == 0`), nonzero scales invert in binary16
+RNE and scale lanes to RNE clamped signed `i8` codes before ordered `F64`-to-`F32`
+block projection comparison under caller-reviewed finite limits. It rejects F16
+overflow and nonzero-`amax` scale underflow or subreciprocal overflow (`d <
+0x0101`). Four `q8_hvx_` controls verify `0x2008` scaling, non-anchor tolerance
+review, overflow/underflow and corrupt-publication rejection, and control
+refusal without emulating HVX `QF16`/`QF32`, the `hvx_vec_inverse_f16` LUT
+polynomial, `hvx_vec_i16_from_hf_rnd_sat`, or per-block `F32` reduction, or
+claiming device/speech acceptance.
+
+All three oracles expose `new_with_control`, `review_with_control` and
 `submit_with_control` for bounded work. The same caller-owned cancellation and
 original absolute work deadline, including cleanup reserve, must cover input
 validation, expected-value preparation, native setup/submission and every output

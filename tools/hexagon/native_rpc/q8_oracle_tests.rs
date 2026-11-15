@@ -480,3 +480,242 @@ fn q8_control_late_refusal_prevents_exact_and_tolerance_publication() -> Result<
     }
     Ok(())
 }
+
+struct ControlledSubmitter<'a> {
+    weights: &'a [u8],
+    activation: &'a [f32],
+    values: Vec<f32>,
+    corrupt: Option<usize>,
+    calls: u32,
+}
+
+impl Q8Submitter for ControlledSubmitter<'_> {
+    fn submit(
+        &mut self,
+        weights: &[u8],
+        activation: &[f32],
+        output: &mut [f32],
+        oracle: &mut dyn FnMut(&[f32]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        assert!(std::ptr::eq(weights, self.weights));
+        assert!(std::ptr::eq(activation, self.activation));
+        self.calls += 1;
+        let mut candidate = self.values.clone();
+        if let Some(index) = self.corrupt {
+            candidate[index] += 1.0;
+        }
+        oracle(&candidate)?;
+        output.copy_from_slice(&candidate);
+        Ok(())
+    }
+}
+
+#[test]
+fn q8_hvx_quantization_uses_0x2008_half_scale_and_preserves_anchor_codes() -> Result<(), Error> {
+    let projection = Q8Matmul::new(128, 32, 1, 512 * 1024)?;
+    let mut weights = vec![0_u8; projection.weight_bytes()];
+    weights[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    weights[2] = 0x80; // -128 signed weight code
+    weights[3] = 1;
+    weights[4] = 2;
+    weights[5] = 3;
+    let mut activation = vec![0.0_f32; 128];
+    activation[0] = 127.0;
+    activation[1] = -4.0;
+    activation[2] = 0.5; // exact RNE half-to-even tie -> 0
+    activation[3] = 1.5; // exact RNE half-to-even tie -> 2
+    activation[64] = -0.0;
+    let oracle = Q8HvxQuantizationOracle::new(projection, &weights, &activation, 0.0, 0.0)?;
+    assert_eq!(oracle.projection(), projection);
+    assert_eq!(oracle.quantized_scales()[0], 0x3c00);
+    assert_eq!(oracle.quantized_scales()[2], 0x0000);
+    assert_eq!(oracle.quantized_codes()[0], 127);
+    assert_eq!(oracle.quantized_codes()[1], -4);
+    assert_eq!(oracle.quantized_codes()[2], 0);
+    assert_eq!(oracle.quantized_codes()[3], 2);
+    // -128 * 127 + 1 * (-4) + 2 * 0 + 3 * 2 = -16254
+    assert_eq!(oracle.expected()[0], -16_254.0);
+    assert_eq!(oracle.expected()[1], 0.0);
+    let mut exact = vec![0.0_f32; 32];
+    exact[0] = -16_254.0;
+    exact[1] = -0.0;
+    oracle.review(&exact)?;
+    exact[0] = -16_253.5;
+    assert!(oracle.review(&exact).is_err());
+    Ok(())
+}
+
+#[test]
+fn q8_hvx_non_anchor_scales_model_quantization_error_within_reviewed_tolerance() -> Result<(), Error>
+{
+    let projection = Q8Matmul::new(128, 32, 1, 512 * 1024)?;
+    let mut weights = vec![0_u8; projection.weight_bytes()];
+    weights[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    weights[2] = 1;
+    let mut activation = vec![0.0_f32; 128];
+    activation[0] = 1.0;
+    let h_oracle = Q8HvxQuantizationOracle::new(projection, &weights, &activation, 0.0, 0.0)?;
+    assert_eq!(h_oracle.quantized_scales()[0], 0x2008);
+    assert_eq!(h_oracle.quantized_codes()[0], 127);
+    assert_eq!(h_oracle.expected()[0], 127.0 * (129.0 / 16384.0));
+    let wide = Q8HvxQuantizationOracle::new(projection, &weights, &activation, 0.000_2, 0.0)?;
+    let mut unquantized_scalar = vec![0.0_f32; 32];
+    unquantized_scalar[0] = 1.0;
+    wide.review(&unquantized_scalar)?;
+    let strict = Q8HvxQuantizationOracle::new(projection, &weights, &activation, 0.000_01, 0.0)?;
+    assert!(strict.review(&unquantized_scalar).is_err());
+
+    let mut transport = ControlledSubmitter {
+        weights: &weights,
+        activation: &activation,
+        values: unquantized_scalar,
+        corrupt: None,
+        calls: 0,
+    };
+    let mut output = [77.0_f32; 32];
+    wide.submit(&mut transport, &mut output)?;
+    assert_eq!(transport.calls, 1);
+    assert_eq!(output[0], 1.0);
+    assert!(output[1..].iter().all(|&value| value == 0.0));
+    Ok(())
+}
+
+#[test]
+fn q8_hvx_rejects_half_overflow_subreciprocal_overflow_and_corrupt_publication() -> Result<(), Error>
+{
+    let projection = Q8Matmul::new(128, 32, 1, 512 * 1024)?;
+    let mut weights = vec![0_u8; projection.weight_bytes()];
+    let mut f16_overflow = vec![0.0_f32; 128];
+    f16_overflow[0] = 65_520.0;
+    assert!(Q8HvxQuantizationOracle::new(projection, &weights, &f16_overflow, 0.0, 0.0).is_err());
+
+    let mut subreciprocal_overflow = vec![0.0_f32; 128];
+    subreciprocal_overflow[0] = 1.0e-3;
+    assert!(
+        Q8HvxQuantizationOracle::new(projection, &weights, &subreciprocal_overflow, 0.0, 0.0)
+            .is_err()
+    );
+
+    let mut scale_underflow = vec![0.0_f32; 128];
+    scale_underflow[0] = 2.0_f32.powi(-24);
+    assert!(
+        Q8HvxQuantizationOracle::new(projection, &weights, &scale_underflow, 0.0, 0.0).is_err()
+    );
+
+    let mut activation = vec![0.0_f32; 128];
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        activation[127] = invalid;
+        assert!(Q8HvxQuantizationOracle::new(projection, &weights, &activation, 0.0, 0.0).is_err());
+    }
+    activation[127] = 0.0;
+
+    let end = weights.len();
+    for half in [0x7c00_u16, 0x7e00, 0xfc00] {
+        weights[end - 34..end - 32].copy_from_slice(&half.to_le_bytes());
+        assert!(Q8HvxQuantizationOracle::new(projection, &weights, &activation, 0.0, 0.0).is_err());
+    }
+    weights[end - 34..end - 32].copy_from_slice(&0_u16.to_le_bytes());
+
+    for (absolute, relative) in [
+        (-1.0, 0.0),
+        (f64::NAN, 0.0),
+        (f64::MAX, 0.0),
+        (0.0, -0.1),
+        (0.0, f64::NAN),
+        (0.0, 1.01),
+    ] {
+        assert!(
+            Q8HvxQuantizationOracle::new(projection, &weights, &activation, absolute, relative)
+                .is_err()
+        );
+    }
+    assert!(
+        Q8HvxQuantizationOracle::new(
+            projection,
+            &weights[..weights.len() - 1],
+            &activation,
+            0.0,
+            0.0
+        )
+        .is_err()
+    );
+    assert!(
+        Q8HvxQuantizationOracle::new(projection, &weights, &activation[..127], 0.0, 0.0).is_err()
+    );
+    assert!(narrow_expected(f64::from(f32::MAX) + 2.0_f64.powi(102)).is_err());
+    assert!(narrow_expected(f64::INFINITY).is_err());
+
+    let oracle = Q8HvxQuantizationOracle::new(projection, &weights, &activation, 0.0, 0.0)?;
+    let mut output = [55.0_f32; 32];
+    let mut transport = ControlledSubmitter {
+        weights: &weights,
+        activation: &activation,
+        values: vec![0.0_f32; 32],
+        corrupt: Some(3),
+        calls: 0,
+    };
+    assert!(oracle.submit(&mut transport, &mut output).is_err());
+    assert_eq!(transport.calls, 1);
+    assert_eq!(output, [55.0; 32]);
+    Ok(())
+}
+
+#[test]
+fn q8_hvx_control_stops_before_quantization_and_refuses_late_review() -> Result<(), Error> {
+    let projection = Q8Matmul::new(128, 32, 1, 512 * 1024)?;
+    let weights = vec![0_u8; projection.weight_bytes()];
+    let activation = vec![0.0_f32; 128];
+    let mut polls = 0_usize;
+    let stopped = Q8HvxQuantizationOracle::new_with_control(
+        projection,
+        &weights,
+        &activation,
+        0.0,
+        0.0,
+        || {
+            polls += 1;
+            if polls == 2 {
+                Err(Error::Contract)
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(stopped.is_err());
+    assert_eq!(polls, 2);
+
+    let oracle = Q8HvxQuantizationOracle::new(projection, &weights, &activation, 0.0, 0.0)?;
+    let mut output = [99.0_f32; 32];
+    let mut transport = ControlledSubmitter {
+        weights: &weights,
+        activation: &activation,
+        values: vec![0.0_f32; 32],
+        corrupt: None,
+        calls: 0,
+    };
+    assert!(
+        oracle
+            .submit_with_control(&mut transport, &mut output, || Err(Error::Contract))
+            .is_err()
+    );
+    assert_eq!(transport.calls, 0);
+    assert_eq!(output, [99.0; 32]);
+
+    let mut review_polls = 0_usize;
+    assert!(
+        oracle
+            .submit_with_control(&mut transport, &mut output, || {
+                review_polls += 1;
+                if review_polls == 6 {
+                    Err(Error::Contract)
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(review_polls, 6);
+    assert_eq!(transport.calls, 1);
+    assert_eq!(output, [99.0; 32]);
+    Ok(())
+}

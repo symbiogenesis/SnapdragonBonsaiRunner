@@ -411,6 +411,17 @@
     "ttsPrefillOrSharedKvQualified": false,
     "profileEligible": false
   },
+  "q8HvxQuantizationOracle": {
+    "status": "independent-hvx-0x2008-half-quantization-model-no-device-or-speech-qualification",
+    "api": "Q8HvxQuantizationOracle::new; review; submit; new_with_control; review_with_control; submit_with_control; projection; quantized_scales; quantized_codes; expected",
+    "quantizationModel": "32-lane IEEE-754 binary16 RNE narrowing; amax * 0x2008 half scale d (zero only when narrowed amax==0); IEEE binary16 RNE reciprocal 1/d and lane products; RNE clamped signed i8 codes; ordered F64 block projection narrowed to F32; no HVX QF16/QF32 or LUT-polynomial inverse emulation",
+    "acceptance": "caller-reviewed fixed finite absolute (0..=f32::MAX) and relative (0..=1) tolerances; rejects F16 overflow, nonzero-amax scale underflow or subreciprocal overflow, and unrepresentable F32 expected values before native submit",
+    "controls": "four-q8_hvx_-literal-controls-no-driver-DSP-or-model-execution",
+    "nativeQuantizationParityQualified": false,
+    "signedPackageDeviceQualified": false,
+    "ttsPrefillOrSharedKvQualified": false,
+    "profileEligible": false
+  },
   "windowsAbi": [
     "https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryserviceconfigw",
     "https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw",
