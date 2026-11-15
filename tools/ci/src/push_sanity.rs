@@ -52,6 +52,11 @@ struct Selection {
     native_boundary: bool,
     hexagon_locks: bool,
     source_fixture: bool,
+    foundation_handoff: bool,
+    device_concurrency: bool,
+    ci_bootstrap_cache: bool,
+    rust_toolchain_fixture: bool,
+    incremental_ci_fixture: bool,
 }
 
 fn is_native_source(path: &str) -> bool {
@@ -113,6 +118,7 @@ fn selection(paths: &[String]) -> Selection {
                 || [
                     ".github/actions/check-rust/action.yml",
                     ".github/actions/bonsai-tools/action.yml",
+                    ".github/actions/ci-tool/action.yml",
                     "tools/ci/test_tools_cache_inputs.ps1",
                     "tools/ci/test_support.ps1",
                 ]
@@ -151,6 +157,57 @@ fn selection(paths: &[String]) -> Selection {
                 ".github/workflows/source-checks.yml",
                 "tools/ci/select_source_checks.ps1",
                 "tools/ci/test_source_checks.ps1",
+                "tools/ci/test_support.ps1",
+            ]
+            .contains(&path.as_str())
+        }),
+        foundation_handoff: owned.iter().any(|path| {
+            [
+                ".github/workflows/foundation.yml",
+                ".github/workflows/release.yml",
+                ".github/ci/impact.json",
+                "config/rust-packages.json",
+                ".github/actions/check-rust/action.yml",
+                ".github/actions/use-bonsai-tools/action.yml",
+                "tools/ci/src/checks/mod.rs",
+                "tools/ci/test_foundation_handoff.ps1",
+                "tools/ci/test_support.ps1",
+            ]
+            .contains(&path.as_str())
+        }),
+        device_concurrency: owned.iter().any(|path| {
+            [
+                ".github/workflows/native-runtime-acceptance.yml",
+                ".github/workflows/native-ptq1-numerics.yml",
+                ".github/workflows/x2-cpu-evaluation.yml",
+                ".github/workflows/cpu-bundle-comparison.yml",
+                ".github/workflows/tts-evaluation.yml",
+                "tools/ci/test_device_concurrency.ps1",
+                "tools/ci/test_support.ps1",
+            ]
+            .contains(&path.as_str())
+        }),
+        ci_bootstrap_cache: owned.iter().any(|path| {
+            [
+                ".github/actions/ci-tool/action.yml",
+                "tools/ci/native_ci_cache.ps1",
+                "tools/ci/test_native_ci_cache.ps1",
+                "tools/ci/test_support.ps1",
+            ]
+            .contains(&path.as_str())
+        }),
+        rust_toolchain_fixture: owned.iter().any(|path| {
+            [
+                ".github/actions/rust-toolchain/action.yml",
+                "tools/ci/test_rust_toolchain.ps1",
+                "tools/ci/test_support.ps1",
+            ]
+            .contains(&path.as_str())
+        }),
+        incremental_ci_fixture: owned.iter().any(|path| {
+            [
+                ".github/actions/check-rust/action.yml",
+                "tools/ci/test_incremental_ci.ps1",
                 "tools/ci/test_support.ps1",
             ]
             .contains(&path.as_str())
@@ -326,12 +383,27 @@ mod tests {
         assert!(!plan.source_fixture);
         let plan = selection(&[".github/actions/ci-tool/action.yml".into()]);
         assert_eq!(plan.cache_actions, ["ci-tool"]);
+        assert!(plan.cache_closures && plan.ci_bootstrap_cache);
         let plan = selection(&["tools/ci/test_support.ps1".into()]);
         assert_eq!(plan.cache_actions, ["bonsai-tools", "ci-tool"]);
-        assert!(plan.source_fixture);
+        assert!(
+            plan.source_fixture
+                && plan.foundation_handoff
+                && plan.device_concurrency
+                && plan.ci_bootstrap_cache
+                && plan.rust_toolchain_fixture
+                && plan.incremental_ci_fixture
+        );
         let plan = selection(&[".github/workflows/source-checks.yml".into()]);
         assert!(plan.workflows && plan.source_fixture);
         assert_eq!(plan.cache_actions, Vec::<&str>::new());
+        assert!(selection(&[".github/workflows/foundation.yml".into()]).foundation_handoff);
+        assert!(selection(&[".github/workflows/x2-cpu-evaluation.yml".into()]).device_concurrency);
+        assert!(
+            selection(&[".github/actions/rust-toolchain/action.yml".into()]).rust_toolchain_fixture
+        );
+        let check_rust = selection(&[".github/actions/check-rust/action.yml".into()]);
+        assert!(check_rust.foundation_handoff && check_rust.incremental_ci_fixture);
     }
 
     #[test]

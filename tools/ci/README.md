@@ -823,7 +823,7 @@ A separate temporary Git index materializes each tip without changing the
 owner's index or working files. Unstaged fixes cannot conceal a broken commit.
 
 Pushes with a valid checker resolve its ordered input identities in one Git command
-and extract only the eight committed checking-policy scripts and their support.
+and extract only the committed checking-policy scripts and their support.
 Preparation and automatic recovery extract the committed source and synchronize it
 under `<target>-source` (coordinated via an exclusive `.bonsai-source.lock` file lock)
 so Cargo paths and unchanged-file timestamps and fingerprints remain warm across runs;
@@ -848,13 +848,17 @@ The screen checks owned-language policy, parses changed PowerShell without
 executing it, checks workspace Rust formatting when Rust/build inputs or root/nested
 `rustfmt.toml` / `.rustfmt.toml` configurations change,
 and validates workflow startup plus Actions syntax when YAML/action inputs
-change. Named cache-environment controls independently exercise both cache
-actions, and source-routing controls exercise the selected source adapter.
+change. Named cache-environment, cache-closure, CI orchestration, toolchain and
+source-routing controls exercise the selected candidate workflows and actions.
+Affected Rust packages (including embedded lock/asset inputs) also run Windows
+ARM64 Clippy across all targets (`--all-features` on standard crates and
+`rust-qualification` on `bonsai-speech-asr`) plus `aarch64-unknown-linux-gnu`
+Clippy across all targets on portable crates and `bonsai-ci` (`--no-default-features`).
 Trusted assertions and support come from committed checking policy; adapter
 inputs come from each immutable outgoing snapshot, including non-HEAD/historical
 tips. Candidate fixture scripts cannot replace those assertions. Basic
 syntax/format/workflow checks also inspect every outgoing snapshot. It adds no PowerShell style rules, model work, full test suite,
-dependency audit or benchmark. Foundation retains compilation, analyzers and
+dependency audit or benchmark. Foundation retains Release compilation, analyzers and
 complete tests; this screen does not establish their verdicts.
 
 Prerequisites are native Windows ARM64, PowerShell 7.6+, Git, the pinned Rust

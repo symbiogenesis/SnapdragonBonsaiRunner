@@ -160,7 +160,7 @@ $cases=[ordered]@{
         $repository=Join-Path $scratch 'repository'; $target=Join-Path $scratch 'target'
         $inputs=@('Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo','tools/ci','src/artifacts','src/windows-process','src/windows-credentials','scripts/release/Release-Common.ps1')
         foreach ($path in @('Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo/fixture.txt','src/artifacts/fixture.txt','src/windows-process/fixture.txt','src/windows-credentials/fixture.txt','scripts/release/Release-Common.ps1','unrelated-source.txt')) { Write-CiFixture $repository $path 'Inert committed source; no compiler consumer.' }
-        $policy=@('check_push_snapshot.ps1','check_owned_languages.ps1','check_powershell_syntax.ps1','check_workflow_startup.ps1','check_workflow_syntax.ps1','test_tools_cache_inputs.ps1','test_source_checks.ps1','test_support.ps1')
+        $policy=@('check_push_snapshot.ps1','check_owned_languages.ps1','check_powershell_syntax.ps1','check_workflow_startup.ps1','check_workflow_syntax.ps1','native_ci_cache.ps1','test_device_concurrency.ps1','test_foundation_handoff.ps1','test_incremental_ci.ps1','test_native_ci_cache.ps1','test_rust_toolchain.ps1','test_tools_cache_inputs.ps1','test_source_checks.ps1','test_support.ps1')
         foreach ($name in $policy) { Write-CiFixture $repository "tools/ci/$name" "Committed checking policy: $name" }
         & git -C $repository init --quiet
         if ($LASTEXITCODE) { throw 'Cannot initialize policy archive fixture.' }
@@ -189,7 +189,7 @@ function git {
         $archive=@($args | Where-Object { $_.StartsWith('--output=',[StringComparison]::Ordinal) })[0].Substring(9)
         $unpacked=Join-Path (Split-Path $Repository -Parent) 'unpacked'
         Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
-        $expected=@('check_push_snapshot.ps1','check_owned_languages.ps1','check_powershell_syntax.ps1','check_workflow_startup.ps1','check_workflow_syntax.ps1','test_tools_cache_inputs.ps1','test_source_checks.ps1','test_support.ps1')
+        $expected=@('check_push_snapshot.ps1','check_owned_languages.ps1','check_powershell_syntax.ps1','check_workflow_startup.ps1','check_workflow_syntax.ps1','native_ci_cache.ps1','test_device_concurrency.ps1','test_foundation_handoff.ps1','test_incremental_ci.ps1','test_native_ci_cache.ps1','test_rust_toolchain.ps1','test_tools_cache_inputs.ps1','test_source_checks.ps1','test_support.ps1')
         $actual=@(Get-ChildItem -LiteralPath $unpacked -File -Recurse | ForEach-Object { [IO.Path]::GetRelativePath($unpacked,$_.FullName).Replace('\','/') })
         Assert-CiSet $actual @($expected | ForEach-Object { "tools/ci/$_" })
         foreach ($name in $expected) { Assert-CiEqual ([IO.File]::ReadAllText((Join-Path $unpacked "tools/ci/$name"))) "Committed checking policy: $name" }

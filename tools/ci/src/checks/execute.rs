@@ -50,7 +50,7 @@ fn is_diagnostic_headline(trimmed: &str) -> bool {
         || trimmed.starts_with("test result: FAILED")
 }
 
-fn extract_prefix_highlights(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+pub(crate) fn extract_prefix_highlights(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
     let mut buffered = BufReader::new(reader);
     let mut raw_line = Vec::new();
     let mut highlights = Vec::new();
@@ -160,9 +160,10 @@ fn format_step_summary(report: &Value) -> String {
             let exit = check["ExitCode"]
                 .as_u64()
                 .map_or_else(|| "-".to_owned(), |code| code.to_string());
-            let elapsed = check["ElapsedMilliseconds"]
-                .as_u64()
-                .map_or_else(|| "-".to_owned(), |ms| format!("{}.{:02}s", ms / 1000, (ms % 1000) / 10));
+            let elapsed = check["ElapsedMilliseconds"].as_u64().map_or_else(
+                || "-".to_owned(),
+                |ms| format!("{}.{:02}s", ms / 1000, (ms % 1000) / 10),
+            );
             let _ = writeln!(
                 out,
                 "| `{name}` | `{phase}` | `{packages}` | `{status}` | `{exit}` | `{elapsed}` |"

@@ -1,7 +1,7 @@
 #Requires -Version 7.6
-param([string]$Case)
+param([string]$Case,[string]$CandidateRoot)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
-$repository = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$repository = if ($CandidateRoot) { (Resolve-Path -LiteralPath $CandidateRoot).ProviderPath } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
 $action = [IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml'))
 $steps = Get-CiActionSteps $action
 $execution = @($steps.Values | Where-Object { $_ -cmatch '(?m)^      id: rust-check\s*$' })

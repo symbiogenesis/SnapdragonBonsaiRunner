@@ -149,9 +149,25 @@ impl Work {
         if code != 0 {
             let mut detail = output;
             detail.extend(fs::read(&stderr).map_err(|error| error.to_string())?);
-            let excerpt = String::from_utf8_lossy(&detail[detail.len().saturating_sub(8192)..]);
+            let tail_start = detail.len().saturating_sub(8192);
+            let highlights = if tail_start > 0 {
+                super::super::checks::execute::extract_prefix_highlights(&detail[..tail_start])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let prefix = if highlights.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "[key diagnostic lines before truncated tail]\n{}\n[final 8192 bytes]\n",
+                    String::from_utf8_lossy(&highlights).trim_end()
+                )
+            };
+            let excerpt = String::from_utf8_lossy(&detail[tail_start..]);
             return Err(format!(
-                "Push blocked: {program} {arguments:?} exited {code}.\n{excerpt}"
+                "Push blocked: {program} {arguments:?} exited {code} after {:.2?}.\n{prefix}{excerpt}",
+                command_started.elapsed()
             ));
         }
         Ok(output)
@@ -286,9 +302,7 @@ impl Work {
         }
         self.script_calls(root, source, &calls)?;
         #[cfg(not(test))]
-        if plan.rust || plan.workspace_registry || plan.hexagon_locks {
-            self.cargo_checks(source, paths, &plan)?;
-        }
+        self.cargo_checks(source, paths, &plan)?;
         Ok(())
     }
 
@@ -932,6 +946,21 @@ impl Work {
                 });
             }
         }
+        if plan.cache_closures
+            && source.join(".github/actions/ci-tool/action.yml").is_file()
+            && source.join("Cargo.lock").is_file()
+        {
+            calls.push(ScriptCall {
+                script: "test_tools_cache_inputs.ps1",
+                parameters: BTreeMap::from([
+                    (
+                        "Case",
+                        serde_json::json!("ci_tool_dependency_and_embedded_closure_hashed"),
+                    ),
+                    ("CandidateRoot", serde_json::json!(source)),
+                ]),
+            });
+        }
         if plan.source_fixture {
             calls.push(ScriptCall {
                 script: "test_source_checks.ps1",
@@ -942,6 +971,72 @@ impl Work {
                     ),
                     ("CandidateRoot", serde_json::json!(source)),
                 ]),
+            });
+        }
+        if plan.foundation_handoff
+            && [
+                ".github/workflows/foundation.yml",
+                ".github/workflows/release.yml",
+                ".github/ci/impact.json",
+                "config/rust-packages.json",
+                ".github/actions/check-rust/action.yml",
+                ".github/actions/use-bonsai-tools/action.yml",
+                "tools/ci/src/checks/mod.rs",
+            ]
+            .into_iter()
+            .all(|path| source.join(path).is_file())
+        {
+            calls.push(ScriptCall {
+                script: "test_foundation_handoff.ps1",
+                parameters: BTreeMap::from([("CandidateRoot", serde_json::json!(source))]),
+            });
+        }
+        if plan.device_concurrency
+            && [
+                ".github/workflows/native-runtime-acceptance.yml",
+                ".github/workflows/native-ptq1-numerics.yml",
+                ".github/workflows/x2-cpu-evaluation.yml",
+                ".github/workflows/cpu-bundle-comparison.yml",
+                ".github/workflows/tts-evaluation.yml",
+            ]
+            .into_iter()
+            .all(|path| source.join(path).is_file())
+        {
+            calls.push(ScriptCall {
+                script: "test_device_concurrency.ps1",
+                parameters: BTreeMap::from([("CandidateRoot", serde_json::json!(source))]),
+            });
+        }
+        if plan.ci_bootstrap_cache && source.join(".github/actions/ci-tool/action.yml").is_file() {
+            calls.push(ScriptCall {
+                script: "test_native_ci_cache.ps1",
+                parameters: BTreeMap::from([
+                    (
+                        "Case",
+                        serde_json::json!("bootstrap_codegen_overrides_stay_in_coordinator_build"),
+                    ),
+                    ("CandidateRoot", serde_json::json!(source)),
+                ]),
+            });
+        }
+        if plan.rust_toolchain_fixture
+            && source
+                .join(".github/actions/rust-toolchain/action.yml")
+                .is_file()
+        {
+            calls.push(ScriptCall {
+                script: "test_rust_toolchain.ps1",
+                parameters: BTreeMap::from([("CandidateRoot", serde_json::json!(source))]),
+            });
+        }
+        if plan.incremental_ci_fixture
+            && source
+                .join(".github/actions/check-rust/action.yml")
+                .is_file()
+        {
+            calls.push(ScriptCall {
+                script: "test_incremental_ci.ps1",
+                parameters: BTreeMap::from([("CandidateRoot", serde_json::json!(source))]),
             });
         }
         calls
@@ -960,6 +1055,9 @@ impl Work {
             serde_json::from_slice(&impact_bytes).map_err(|error| error.to_string())?;
         let impact_plan = crate::impact::select(source, paths, false, &impact_config, "pre-push")?;
         let affected: BTreeSet<String> = impact_plan.packages.into_iter().collect();
+        if affected.is_empty() && !plan.workspace_registry && !plan.hexagon_locks {
+            return Ok(());
+        }
         let toolchain = super::super::push_format::toolchain(source)?;
         let target_dir = std::env::var_os("BONSAI_PUSH_CARGO_TARGET_DIR")
             .filter(|value| !value.is_empty())
@@ -1065,7 +1163,8 @@ impl Work {
                 .iter()
                 .any(|package| package.as_str() != "bonsai-speech-asr")
             {
-                let mut args = base_cargo_args("check", "aarch64-pc-windows-msvc");
+                let mut args = base_cargo_args("clippy", "aarch64-pc-windows-msvc");
+                args.push("--all-features".into());
                 args.push("--all-targets".into());
                 for package in workspace
                     .packages
@@ -1075,11 +1174,12 @@ impl Work {
                     args.push("-p".into());
                     args.push(package.into());
                 }
+                args.extend(["--".into(), "-D".into(), "warnings".into()]);
                 self.command(source, "cargo.exe", &args, cargo_env.clone())?;
             }
 
             if affected.contains("bonsai-speech-asr") {
-                let mut args = base_cargo_args("check", "aarch64-pc-windows-msvc");
+                let mut args = base_cargo_args("clippy", "aarch64-pc-windows-msvc");
                 args.extend([
                     "-p".into(),
                     "bonsai-speech-asr".into(),
@@ -1087,6 +1187,9 @@ impl Work {
                     "--features".into(),
                     "rust-qualification".into(),
                     "--all-targets".into(),
+                    "--".into(),
+                    "-D".into(),
+                    "warnings".into(),
                 ]);
                 self.command(source, "cargo.exe", &args, cargo_env.clone())?;
             }
@@ -1099,9 +1202,12 @@ impl Work {
                 "bonsai-markdown",
                 "bonsai-speech-service",
             ];
-            let linux_affected = affected
+            let linux_portable_affected = affected
                 .iter()
                 .any(|package| PORTABLE_LINUX_CRATES.contains(&package.as_str()));
+            let linux_ci_affected = (affected.contains("bonsai-ci") || plan.workspace_registry)
+                && workspace.packages.contains_key("bonsai-ci");
+            let linux_affected = linux_portable_affected || linux_ci_affected;
             let has_linux_target = if !linux_affected {
                 false
             } else if let Some(rustlib) = Self::toolchain_root(&toolchain)
@@ -1129,16 +1235,32 @@ impl Work {
                     .any(|line| line.trim() == "aarch64-unknown-linux-gnu")
             };
             if has_linux_target {
-                let mut args = base_cargo_args("check", "aarch64-unknown-linux-gnu");
-                args.push("--lib".into());
-                for package in PORTABLE_LINUX_CRATES
-                    .into_iter()
-                    .filter(|package| workspace.packages.contains_key(*package))
-                {
-                    args.push("-p".into());
-                    args.push(package.into());
+                if linux_portable_affected {
+                    let mut args = base_cargo_args("clippy", "aarch64-unknown-linux-gnu");
+                    args.push("--all-targets".into());
+                    for package in PORTABLE_LINUX_CRATES
+                        .into_iter()
+                        .filter(|package| workspace.packages.contains_key(*package))
+                    {
+                        args.push("-p".into());
+                        args.push(package.into());
+                    }
+                    args.extend(["--".into(), "-D".into(), "warnings".into()]);
+                    self.command(source, "cargo.exe", &args, cargo_env.clone())?;
                 }
-                self.command(source, "cargo.exe", &args, cargo_env)?;
+                if linux_ci_affected {
+                    let mut args = base_cargo_args("clippy", "aarch64-unknown-linux-gnu");
+                    args.extend([
+                        "-p".into(),
+                        "bonsai-ci".into(),
+                        "--no-default-features".into(),
+                        "--all-targets".into(),
+                        "--".into(),
+                        "-D".into(),
+                        "warnings".into(),
+                    ]);
+                    self.command(source, "cargo.exe", &args, cargo_env)?;
+                }
             }
 
             Ok(())
@@ -1713,6 +1835,7 @@ mod tests {
             // An outgoing candidate cannot replace trusted fixture assertions
             // or support with its own successful or failing script.
             for name in [
+                "test_native_ci_cache",
                 "test_tools_cache_inputs",
                 "test_source_checks",
                 "test_support",

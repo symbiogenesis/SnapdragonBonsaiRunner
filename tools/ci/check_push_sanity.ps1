@@ -218,6 +218,12 @@ try {
             'tools/ci/check_powershell_syntax.ps1',
             'tools/ci/check_workflow_startup.ps1',
             'tools/ci/check_workflow_syntax.ps1',
+            'tools/ci/native_ci_cache.ps1',
+            'tools/ci/test_device_concurrency.ps1',
+            'tools/ci/test_foundation_handoff.ps1',
+            'tools/ci/test_incremental_ci.ps1',
+            'tools/ci/test_native_ci_cache.ps1',
+            'tools/ci/test_rust_toolchain.ps1',
             'tools/ci/test_tools_cache_inputs.ps1',
             'tools/ci/test_source_checks.ps1',
             'tools/ci/test_support.ps1')

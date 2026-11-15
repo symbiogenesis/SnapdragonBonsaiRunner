@@ -1,7 +1,7 @@
 #Requires -Version 7.6
-param([string]$Case)
+param([string]$Case,[string]$CandidateRoot)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
-$repository=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$repository=if ($CandidateRoot) { (Resolve-Path -LiteralPath $CandidateRoot).ProviderPath } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
 $jobs=Get-CiJobBlocks ([IO.File]::ReadAllText((Join-Path $repository '.github/workflows/foundation.yml')))
 $config=[IO.File]::ReadAllText((Join-Path $repository '.github/ci/impact.json')) | ConvertFrom-Json -AsHashtable
 function Assert-FoundationPlannerGuard([string]$Job) {

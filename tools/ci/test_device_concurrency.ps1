@@ -1,7 +1,7 @@
 #Requires -Version 7.6
-param([string]$Case)
+param([string]$Case,[string]$CandidateRoot)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
-$repository=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$repository=if ($CandidateRoot) { (Resolve-Path -LiteralPath $CandidateRoot).ProviderPath } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
 $workflows=@{}
 foreach ($name in @('native-runtime-acceptance','native-ptq1-numerics','x2-cpu-evaluation','cpu-bundle-comparison','tts-evaluation')) {
     $workflows[$name]=[IO.File]::ReadAllText((Join-Path $repository ".github/workflows/$name.yml")).Replace("`r`n","`n")

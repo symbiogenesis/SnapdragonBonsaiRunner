@@ -1,5 +1,5 @@
 #Requires -Version 7.6
-param([string]$Case)
+param([string]$Case,[string]$CandidateRoot)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
 . (Join-Path $PSScriptRoot 'native_ci_cache.ps1')
 $source='a'*64; $image='win11-arm64-fixture-image'; $compilerIdentity="rustc fixture`nhost: aarch64-pc-windows-msvc`n"
@@ -15,7 +15,7 @@ function Invoke-CacheFixture([scriptblock]$Work) {
 function Update-CacheFixture([string]$Root,[string]$Field,$Value) { $path=Join-Path $Root 'receipt.json'; $receipt=[IO.File]::ReadAllText($path) | ConvertFrom-Json -AsHashtable; $receipt[$Field]=$Value; [IO.File]::WriteAllText($path,($receipt | ConvertTo-Json)) }
 $cases=[ordered]@{
  bootstrap_codegen_overrides_stay_in_coordinator_build={
-    $repository=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+    $repository=if ($CandidateRoot) { (Resolve-Path -LiteralPath $CandidateRoot).ProviderPath } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
     $action=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/ci-tool/action.yml')).Replace("`r`n","`n")
     $steps=Get-CiActionSteps $action
     $build=$steps['Build the CI executable only after its inputs change']
