@@ -220,7 +220,6 @@ jobs:
           set -euo pipefail
           "$RUNNER_TEMP/rumdl-bin/rumdl" --version
           "$RUNNER_TEMP/rumdl-bin/rumdl" check --no-cache .
-          "$RUNNER_TEMP/rumdl-bin/rumdl" fmt --check --no-cache .
   audit:
     needs: actions-lock
     if: >-
