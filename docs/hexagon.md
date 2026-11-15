@@ -37,6 +37,14 @@ lifetimes, resources or performance.
 Multi-token prefill packets batch independent `N = 1` operations; a true
 `N > 1` matrix solver remains separate work.
 
+For X1/`HTP v73`, Prism `bonsai-hexagon-native` and `bonsai-hexagon-runtime`
+also implement `HtpArchProfile::v73_default` (supporting partial secondary
+arenas), `X1_V73_MAX_NPU_LAYERS = 27`, `plan_x1_v73_three_processor_placement`
+(`168` NPU `Q2_0` + `232` GPU `Q2_0` projections), `CompositeTelemetry`,
+`CompositeProjectionExecutor`, and `HybridPrefillCoordinator`. These are
+source-level placements and executors pending physical X1 hardware parity and
+end-to-end serving qualification.
+
 ## Resident packets and prefill
 
 The native-Q2 executor submits the existing gate/up, SwiGLU, optional supported

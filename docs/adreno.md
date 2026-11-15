@@ -192,11 +192,19 @@ application default uses the separate Rust release lock.
 
 Local Prism `bonsai-hexagon-runtime` also provides `plan_three_processor_placement`
 (`HeterogeneousPlacementPlan`, `AdrenoQ2KernelKind::WgslSubgroupShuffle` /
-`OpenClSubgroupBlockRead`), partitioning `blk.0..=blk.26` (`168` `PQ2_0` projections,
-`2,888,663,040` bytes) onto Hexagon NPU `native-q2` and `blk.27..=blk.63` (`232` `PQ2_0`
-projections, `3,967,856,640` bytes) onto Adreno X2-90 `Q2_0+FWHT` while keeping GDN/attention
-state and `lm_head` on CPU. This is a placement plan, not Adreno dispatch or
-qualified application admission.
+`OpenClSubgroupBlockRead`) and `plan_x1_v73_three_processor_placement`
+(`X1_V73_MAX_NPU_LAYERS = 27`), partitioning `blk.0..=blk.26` (`168` `PQ2_0`
+projections, `2,888,663,040` bytes) onto Hexagon NPU `native-q2` and
+`blk.27..=blk.63` (`232` `PQ2_0` projections, `3,967,856,640` bytes) onto Adreno
+X2-90 / X1-85 `Q2_0+FWHT` while keeping GDN/attention state and `lm_head` on CPU,
+alongside `CompositeProjectionExecutor`, `CompositeTelemetry`, and
+`HybridPrefillCoordinator`. In the Runner repository,
+`src/windows-process/src/native/opencl/projection.rs` adds
+`AdrenoFamily::{X1_85, X2_90}` and pure OpenCL C 1.2 integer `OpenClKernelKind`
+variants (`BlockDots`, `Gemv4Row`, `Gemv8Row`, `Prefill4Col`, `FwhtLocal1024`)
+via `opencl_pq2_kernel_source_for` and `opencl_pq2_projection_with_kernel`.
+These are source-level placements, executors, and kernel sources, not physical
+X1/X2 Adreno hardware parity or qualified application serving admission.
 
 The opt-in [standalone original-PQ2 OpenCL pilot](adreno-pilot.md) implements one
 real Swift FFN-gate shape with exact per-128 integer dots and CPU ordered-FMA

@@ -660,8 +660,9 @@ inventory.
 | Activation quantizers | Preserve maxima/ties, clipping, scales, rounding and rejection |
 | Floating reductions/RMS/attention/recurrent work | Rounded f32 products and specified f64 accumulation; reassociation has a separate numerical contract |
 | Prefill tiles | Bounded causal/state scheduling; faster matvec alone does not batch graph execution |
-| Isolated `bonsai-neon-dot` (`SDOT`/`SMMLA`) & `u8x16` `PTQ1_0` | Safe boundary crate (`tools/neon-dot`) wrapping ARMv8.2-A `vdotq_s32` (`dotprod`) and `vmmlaq_s32` (`i8mm` `2x2` row-by-token tiles) behind runtime feature checks, plus non-widening `u8x16` base-3 division-by-multiplication `PTQ1_0` trit unpacking (`dot_ptq1_q80_block`, `dot_ptq1_q8k`) |
-| Fused `RMSNorm + Sign*FWHT` & `SwiGLU + Sign*FWHT` | Single-pass 16-register NEON block helpers (`rms_norm_signed_fwht_in_place`, `swiglu_signed_fwht_into`) eliminating intermediate scratch round-trips; last-layer state-only prefill (`Evaluation::full_attention_kv_only`, `Evaluation::recurrent_attention_state_only`) skips dead output-proj/FFN on `layer 63`; `parallel_tile` uses a spin-then-park completion barrier |
+| Isolated `bonsai-neon-dot` (`SDOT`/`SMMLA`) & `u8x16` `PTQ1_0` | Safe boundary crate (`tools/neon-dot`) wrapping ARMv8.2-A `vdotq_s32` (`dotprod`) and `vmmlaq_s32` (`i8mm` `2x2` row-by-token tiles) behind runtime feature checks, plus `16`-row `PQ2`/`Q8_0`/`PTQ1` SIMD tiles and non-widening `u8x16` base-3 division-by-multiplication `PTQ1_0` trit unpacking (`dot_ptq1_q80_block`, `dot_ptq1_q8k`) |
+| Fused `RMSNorm + Sign*FWHT`, `SwiGLU + Sign*FWHT` & GDN/Attention | Single-pass 16-register NEON block helpers (`rms_norm_signed_fwht_in_place`, `swiglu_signed_fwht_into`) plus Prism fused GDN causal-conv + clamped-L2 normalization and X1 `3`-head/`2`-head grouped attention & `[token][head]` F16-packed `4`-head decode; last-layer state-only prefill (`Evaluation::full_attention_kv_only`, `Evaluation::recurrent_attention_state_only`) skips dead output-proj/FFN on `layer 63`; `parallel_tile` uses a spin-then-park completion barrier |
+| `speech-tts` 4-row SIMD tiles & X1 thread/speculation policy | `Dot::load_inputs`, `Dot::push_loaded`, `q8_four`, `q4_k_four`, and `q6_k_four` 4-row `rows()` tiles (`kind in 8 \| 12 \| 14`) in `src/speech-tts/src/engine/packed.rs`; `SnapdragonFamily::default_thread_budget` (`(8, 12)` X1, `(6, 6)` X2) and `SpeculationPolicy` / `completion_arguments_for_family` in `src/cpu-policy/src/`; Prism server `--cpu-family x1\|x2` (`8`/`6` row-workers), `--spec-type none\|suffix`, and `--draft-max 1..=8` |
 
 The explicit `Pq2LutExecutor` connects bounded LUT preparation to matvec and graph
 execution; it is not automatically selected. Cross-token Vec-LUT remains a
@@ -814,6 +815,10 @@ Performance execution remains [CI-only](validation.md).
 
 The Rust maintenance planner selects only `6/6` decode/prefill threads against the unchanged
 `4/4` control. These are thread counts without affinity pinning; Windows chooses placement.
+For X1 evaluation (`12..=256` logical processors), `tools/bonsai/src/cpu_evaluation.rs`
+also defines `"runner-x1-cpu-evaluation-plan"` with `d8-p12` matching the
+`SnapdragonFamily::default_thread_budget` `(8, 12)` X1 policy in `bonsai-cpu-policy`
+(source-level planning only; physical X1 hardware qualification remains open).
 One fixed short synthetic creative-writing prompt runs in two reversed pairs: at most four fresh processes, a 16-token cap and a 45-second process deadline. OS file cache is not flushed. Other thread budgets and long prompts remain in PLAN.
 
 All bootstrap, setup, verification, preflight, model loading, comparison and

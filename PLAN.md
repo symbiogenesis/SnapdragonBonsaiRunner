@@ -1104,6 +1104,11 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   exact input/kernel/device identities, every-block scalar replay and terminal
   cleanup. Prepare a separately locked Vulkan candidate under the
   [Adreno contract](docs/adreno.md); neither path admits GPU serving yet.
+  Implemented in source: `AdrenoFamily::{X1_85, X2_90}` and
+  `OpenClKernelKind::{BlockDots, Gemv4Row, Gemv8Row, Prefill4Col, FwhtLocal1024}`
+  via `opencl_pq2_kernel_source_for` and `opencl_pq2_projection_with_kernel` in
+  `src/windows-process/src/native/opencl/projection.rs` (awaiting physical X1
+  hardware parity and GPU serving qualification).
 - [ ] Bind operation support, effective placement, fallback and transfer ledgers
   to selected graph shapes. Qualify PQ2/PTQ1 and no-/approved-LoRA independently,
   including full-state lifecycle and resources.
@@ -1129,6 +1134,12 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Qualify the implemented six-arena/168-projection `native-q2` placement:
   exact selected tensors, adapter/full-state parity, arena admission, load costs,
   fallback, persistent lifecycle and complete-request benefit under [Hexagon policy](docs/hexagon.md).
+- [ ] Qualify the implemented `HTP v73` X1 composite placement and telemetry in
+  physical X1 hardware runs: Prism `bonsai-hexagon-native` (`HtpArchProfile::v73_default`,
+  partial secondary arenas), `bonsai-hexagon-runtime` (`X1_V73_MAX_NPU_LAYERS = 27`,
+  `plan_x1_v73_three_processor_placement` partitioning `168` NPU `Q2_0` + `232`
+  GPU `Q2_0` projections), `CompositeProjectionExecutor`, `CompositeTelemetry`,
+  and `HybridPrefillCoordinator` under [Hexagon policy](docs/hexagon.md).
 - [ ] Qualify the pinned model-thread initialization/readiness handshake
   and `startup_projection` facts, including failed initialization, CPU/external
   executors, actual resident counts/bytes and Runner's bounded observation
@@ -1263,6 +1274,14 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 - [ ] **#23 — Weight-stationary multirow decode.** Evaluate reusing quantized
   activation blocks across multiple output rows on X1/X2, measuring register
   pressure and L1/L2 cache behavior while preserving per-block reduction order.
+  Implemented in source (physical X1 throughput, parity and power qualification
+  open): Prism `16`-row `PQ2`/`Q8_0`/`PTQ1` SIMD tiles, X1 `3`-head/`2`-head
+  grouped attention and `[token][head]` F16-packed `4`-head decode,
+  `bonsai-speech-tts` `4`-row `Q8_0`/`Q4_K`/`Q6_K` SIMD tiles in
+  `src/speech-tts/src/engine/packed.rs`, X1 `(8, 12)` thread budget /
+  `SpeculationPolicy` / `"runner-x1-cpu-evaluation-plan"` (`d8-p12`) in
+  `cpu-policy` / `bonsai-tools`, and Prism server `--cpu-family x1|x2`,
+  `--spec-type none|suffix`, and `--draft-max 1..=8`.
 - [ ] **#24 — Token-count projection crossover tuning.** Benchmark separate 1-token
   decode, short verification block (`2`–`9`) and larger prefill tile crossovers with
   odd-tail retention, keeping any rounding change behind an explicit profile gate.
@@ -1272,7 +1291,8 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 - [ ] **#27 — Fused GDN `conv1d + SiLU + ClampedL2` pass.** Evaluate fusing causal
   3-tap convolution, `SiLU` and `ClampedL2` Q/K normalization alongside joined BF16
   alpha/beta to cut intermediate traversals while preserving exact `ClampedL2`
-  numerics.
+  numerics. Implemented in source in Prism (`bonsai-neon-dot` / graph kernels;
+  physical X1 hardware measurements and parity qualification remain open).
 - [ ] **#29 — Consumer-layout attention probabilities and tail balancing.** Emit FP16
   attention probabilities directly in consumer layout and split oversized final
   head/token tasks without changing the FP16 boundary or reduction order under
