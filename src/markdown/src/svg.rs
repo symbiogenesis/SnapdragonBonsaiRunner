@@ -1,5 +1,10 @@
 //! Bounded offline SVG validation and CPU rasterization via `resvg`.
 
+mod policy;
+
+#[cfg(test)]
+pub(crate) use policy::{ALLOWED_ATTRIBUTES, ALLOWED_ELEMENTS};
+
 use std::sync::{Arc, OnceLock};
 
 /// Maximum UTF-8 byte length accepted for a single inline SVG document.
@@ -51,21 +56,33 @@ fn load_embedded_fonts() -> &'static EmbeddedFonts {
     })
 }
 
-fn locked_options() -> resvg::usvg::Options<'static> {
+fn locked_options() -> Option<resvg::usvg::Options<'static>> {
     let fonts = load_embedded_fonts();
-    resvg::usvg::Options {
+    let default_size = resvg::usvg::Size::from_wh(100.0, 100.0)?;
+    Some(resvg::usvg::Options {
         resources_dir: None,
+        dpi: 96.0,
         font_family: fonts.default_family.clone(),
-        fontdb: Arc::clone(&fonts.database),
-        max_depth: 128,
-        // Disallow any external or embedded raster `<image href=...>` resolution
-        // inside the offline parser container.
+        font_size: 12.0,
+        languages: vec!["en".to_owned()],
+        shape_rendering: resvg::usvg::ShapeRendering::GeometricPrecision,
+        text_rendering: resvg::usvg::TextRendering::OptimizeLegibility,
+        image_rendering: resvg::usvg::ImageRendering::OptimizeQuality,
+        default_size,
+        // Disallow all external or data-URI `<image>` resolution as defense in depth
+        // behind `policy::validate_untrusted_xml` (which already rejects `<image>`).
         image_href_resolver: resvg::usvg::ImageHrefResolver {
             resolve_data: Box::new(|_, _, _| None),
             resolve_string: Box::new(|_, _| None),
         },
-        ..Default::default()
-    }
+        font_resolver: resvg::usvg::FontResolver {
+            select_font: resvg::usvg::FontResolver::default_font_selector(),
+            select_fallback: resvg::usvg::FontResolver::default_fallback_selector(),
+        },
+        fontdb: Arc::clone(&fonts.database),
+        style_sheet: None,
+        max_depth: policy::MAX_SVG_DEPTH,
+    })
 }
 
 fn parse_tree(svg: &str) -> Option<resvg::usvg::Tree> {
@@ -76,7 +93,21 @@ fn parse_tree(svg: &str) -> Option<resvg::usvg::Tree> {
     {
         return None;
     }
-    resvg::usvg::Tree::from_data(trimmed.as_bytes(), &locked_options()).ok()
+    let xml = resvg::usvg::roxmltree::Document::parse_with_options(
+        trimmed,
+        resvg::usvg::roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: policy::MAX_XML_NODES,
+            entity_resolver: None,
+        },
+    )
+    .ok()?;
+    if !policy::validate_untrusted_xml(&xml) {
+        return None;
+    }
+    let options = locked_options()?;
+    let tree = resvg::usvg::Tree::from_xmltree(&xml, &options).ok()?;
+    policy::validate_resolved_tree(&tree).then_some(tree)
 }
 
 /// Validates SVG syntax/structure offline and returns finite positive `(width, height)`.

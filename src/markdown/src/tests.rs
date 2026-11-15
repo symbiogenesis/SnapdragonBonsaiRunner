@@ -300,16 +300,272 @@ fn offline_svg_rasterizer_produces_valid_premultiplied_rgba_and_blocks_hrefs() -
     let ch = u32::from_le_bytes(capped[9..13].try_into().map_err(io::Error::other)?);
     assert!(usize::try_from(cw * ch).map_err(io::Error::other)? <= MAX_RASTER_PIXELS);
 
-    // Embedded data image href is ignored cleanly via closed ImageHrefResolver
+    // `<image>` elements (including `data:` and external URLs) are rejected outright.
     let with_data_img = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><image href=\"data:image/png;base64,iVBORw0KGgo=\" width=\"64\" height=\"64\"/><rect width=\"10\" height=\"10\" fill=\"#00ff00\"/></svg>";
     let data_packet = rasterize(with_data_img, 64, 64);
-    assert_eq!(data_packet[4], 1);
+    assert_eq!(data_packet.len(), svg::RASTER_HEADER_BYTES);
+    assert_eq!(data_packet[4], 0);
+    assert!(svg::inspect(with_data_img).is_none());
 
     // Invalid SVG or zero dimension returns ok = 0 packet
     for bad in [rasterize("<not svg", 64, 64), rasterize(SAMPLE_SVG, 0, 64)] {
         assert_eq!(bad.len(), svg::RASTER_HEADER_BYTES);
         assert_eq!(bad[4], 0);
     }
+    Ok(())
+}
+
+#[test]
+fn svg_allowlists_are_strictly_sorted_and_exclude_active_constructs() {
+    for pair in svg::ALLOWED_ELEMENTS.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "ALLOWED_ELEMENTS unsorted at {} >= {}",
+            pair[0],
+            pair[1]
+        );
+    }
+    for pair in svg::ALLOWED_ATTRIBUTES.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "ALLOWED_ATTRIBUTES unsorted at {} >= {}",
+            pair[0],
+            pair[1]
+        );
+    }
+    for forbidden_tag in [
+        "a",
+        "animate",
+        "animateColor",
+        "animateMotion",
+        "animateTransform",
+        "audio",
+        "canvas",
+        "cursor",
+        "discard",
+        "embed",
+        "feImage",
+        "foreignObject",
+        "handler",
+        "iframe",
+        "image",
+        "listener",
+        "metadata",
+        "mpath",
+        "object",
+        "script",
+        "set",
+        "tref",
+        "video",
+        "view",
+    ] {
+        assert!(
+            svg::ALLOWED_ELEMENTS.binary_search(&forbidden_tag).is_err(),
+            "forbidden tag {forbidden_tag} must not be in ALLOWED_ELEMENTS"
+        );
+    }
+    for attr in svg::ALLOWED_ATTRIBUTES {
+        assert!(
+            !attr
+                .as_bytes()
+                .get(..2)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"on")),
+            "event attribute {attr} must not be in ALLOWED_ATTRIBUTES"
+        );
+    }
+}
+
+#[test]
+fn untrusted_svg_policy_rejects_scripts_events_dtds_urls_css_escapes_and_use_bombs() {
+    let mut use_bomb = String::from(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><defs><rect id=\"l0\" width=\"2\" height=\"2\" fill=\"red\"/>",
+    );
+    for level in 1..=5 {
+        let prev = level - 1;
+        use_bomb.push_str(&format!("<g id=\"l{level}\">"));
+        for _ in 0..10 {
+            use_bomb.push_str(&format!("<use href=\"#l{prev}\"/>"));
+        }
+        use_bomb.push_str("</g>");
+    }
+    use_bomb.push_str("</defs><use href=\"#l5\"/></svg>");
+
+    let mut too_deep =
+        String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\">");
+    for _ in 0..36 {
+        too_deep.push_str("<g>");
+    }
+    too_deep.push_str("<rect width=\"5\" height=\"5\"/>");
+    for _ in 0..36 {
+        too_deep.push_str("</g>");
+    }
+    too_deep.push_str("</svg>");
+
+    let oversized_kernel = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><filter id=\"f\"><feConvolveMatrix order=\"9 9\" kernelMatrix=\"{}\"/></filter></defs><rect width=\"32\" height=\"32\" filter=\"url(#f)\"/></svg>",
+        "1 ".repeat(81)
+    );
+
+    let hostile_cases: &[(&str, &str)] = &[
+        (
+            "script tag",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><script>alert(1)</script><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "event attribute",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\" onload=\"alert(1)\"><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "uppercase event attribute",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\" ONCLICK=\"evil()\"/></svg>",
+        ),
+        (
+            "foreignObject",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><foreignObject width=\"32\" height=\"32\">body</foreignObject></svg>",
+        ),
+        (
+            "foreign namespace",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xhtml=\"http://www.w3.org/1999/xhtml\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "xml:base rewrite",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xml:base=\"https://evil.test/\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "xlink:actuate",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 32 32\"><defs><rect id=\"r\" width=\"10\" height=\"10\"/></defs><use xlink:href=\"#r\" xlink:actuate=\"onLoad\"/></svg>",
+        ),
+        (
+            "anchor hyperlink",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><a href=\"javascript:alert(1)\"><rect width=\"32\" height=\"32\"/></a></svg>",
+        ),
+        (
+            "SMIL animate",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\"><animate attributeName=\"x\" from=\"0\" to=\"10\" dur=\"1s\"/></rect></svg>",
+        ),
+        (
+            "SMIL set",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\"><set attributeName=\"fill\" to=\"red\"/></rect></svg>",
+        ),
+        (
+            "DTD billion laughs",
+            "<!DOCTYPE svg [<!ENTITY lol \"lol\"><!ENTITY lol2 \"&lol;&lol;\">]><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><text x=\"0\" y=\"16\">&lol2;</text></svg>",
+        ),
+        (
+            "external DOCTYPE",
+            "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\"><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "processing instruction",
+            "<?xml-stylesheet type=\"text/xsl\" href=\"https://evil.test/x.xsl\"?><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "external image",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><image href=\"https://evil.test/p.png\" width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "feImage",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><filter id=\"f\"><feImage href=\"#r\"/></filter></defs><rect id=\"r\" width=\"32\" height=\"32\" filter=\"url(#f)\"/></svg>",
+        ),
+        (
+            "external use href",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><use href=\"https://evil.test/icons.svg#a\"/></svg>",
+        ),
+        (
+            "scheme-relative use href",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><use href=\"//evil.test/icons.svg#a\"/></svg>",
+        ),
+        (
+            "CSS @import",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><style>@import url(\"https://evil.test/a.css\");</style><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "CSS @font-face",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><style>@font-face { font-family: x; src: url(https://evil.test/x.ttf); }</style><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "CSS backslash escape",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><style>\\40 import \"https://evil.test/a.css\";</style><rect width=\"32\" height=\"32\"/></svg>",
+        ),
+        (
+            "external paint url",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\" fill=\"url(https://evil.test/p.svg#g)\"/></svg>",
+        ),
+        (
+            "inline style external url",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\" style=\"fill: url(/*c*/ //evil.test/p.svg#g)\"/></svg>",
+        ),
+        (
+            "cyclic use",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><g id=\"a\"><use href=\"#b\"/></g><g id=\"b\"><use href=\"#a\"/></g></defs><use href=\"#a\"/></svg>",
+        ),
+        (
+            "cyclic gradient",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><defs><linearGradient id=\"g1\" href=\"#g2\"/><linearGradient id=\"g2\" href=\"#g1\"/></defs><rect width=\"32\" height=\"32\" fill=\"url(#g1)\"/></svg>",
+        ),
+        ("use DAG amplification", &use_bomb),
+        ("excessive nesting depth", &too_deep),
+        ("oversized convolve kernel", &oversized_kernel),
+    ];
+
+    for (label, svg_source) in hostile_cases {
+        assert!(
+            svg::inspect(svg_source).is_none(),
+            "{label} must fail svg::inspect"
+        );
+        let markdown = format!("```svg\n{svg_source}\n```");
+        assert!(
+            parse(&markdown).starts_with(b"BMD1"),
+            "{label} must remain an inert BMD1 code block"
+        );
+        let raster = rasterize(svg_source, 64, 64);
+        assert_eq!(raster.len(), svg::RASTER_HEADER_BYTES, "{label}");
+        assert_eq!(raster[4], 0, "{label} must return ok = 0 raster header");
+    }
+}
+
+#[test]
+fn rich_static_svg_diagrams_with_defs_gradients_styles_use_and_filters_render() -> io::Result<()> {
+    let diagram = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" role="img" aria-label="Pipeline diagram" viewBox="0 0 240 120">
+  <title>Static Pipeline</title>
+  <desc>Bounded offline vector diagram</desc>
+  <defs>
+    <linearGradient id="base-grad">
+      <stop offset="0%" stop-color="#1d3557"/>
+      <stop offset="100%" stop-color="#457b9d"/>
+    </linearGradient>
+    <linearGradient id="derived-grad" href="#base-grad" x1="0" y1="0" x2="1" y2="1"/>
+    <clipPath id="card-clip">
+      <rect x="8" y="8" width="224" height="104" rx="12"/>
+    </clipPath>
+    <filter id="soft-shadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+    <g id="node-pill">
+      <rect width="72" height="36" rx="8" class="pill"/>
+    </g>
+  </defs>
+  <style type="text/css">
+    /* Safe internal styles */
+    .bg { fill: url(#derived-grad); }
+    .pill { fill: #a8dadc; stroke: #f1faee; stroke-width: 2; }
+  </style>
+  <g clip-path="url(#card-clip)">
+    <rect width="240" height="120" class="bg"/>
+    <use href="#node-pill" x="24" y="42" filter="url(#soft-shadow)"/>
+    <use xlink:href="#node-pill" x="144" y="42"/>
+    <line x1="96" y1="60" x2="144" y2="60" stroke="#f1faee" stroke-width="3"/>
+    <text x="60" y="65" text-anchor="middle" font-size="13" fill="#1d3557">MXC</text>
+    <text x="180" y="65" text-anchor="middle" font-size="13" fill="#1d3557">UI</text>
+  </g>
+</svg>"##;
+
+    let (w, h) = svg::inspect(diagram).ok_or_else(|| io::Error::other("expected valid SVG"))?;
+    assert!((w - 240.0).abs() < 0.01 && (h - 120.0).abs() < 0.01);
+    let packet = rasterize(diagram, 240, 120);
+    assert_eq!(packet[4], 1);
+    assert!(parse(&format!("```svg\n{diagram}\n```")).starts_with(b"BMD2"));
     Ok(())
 }
 
