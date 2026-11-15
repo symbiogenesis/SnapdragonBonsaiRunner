@@ -122,23 +122,25 @@ fn release_identity(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn parse_version_part<T: std::str::FromStr>(part: &str) -> Option<T> {
+    (!part.is_empty()
+        && !(part.len() > 1 && part.starts_with('0'))
+        && part.bytes().all(|byte| byte.is_ascii_digit()))
+    .then(|| part.parse().ok())
+    .flatten()
+}
+
 fn parse_version(text: &str) -> Option<(u8, u8, u16)> {
-    if text.len() > 13
-        || text.split('.').any(|part| {
-            part.is_empty()
-                || (part.len() > 1 && part.starts_with('0'))
-                || !part.bytes().all(|byte| byte.is_ascii_digit())
-        })
-    {
+    if text.len() > 13 {
         return None;
     }
-    let mut parts = text.split('.');
-    let parsed = (
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    );
-    parts.next().is_none().then_some(parsed)
+    let (major, rest) = text.split_once('.')?;
+    let (minor, patch) = rest.split_once('.')?;
+    Some((
+        parse_version_part(major)?,
+        parse_version_part(minor)?,
+        parse_version_part(patch)?,
+    ))
 }
 
 fn newer_version(text: &str) -> bool {

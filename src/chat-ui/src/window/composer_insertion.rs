@@ -19,17 +19,33 @@ impl<'a> Plan<'a> {
         text: &'a str,
         limit: usize,
     ) -> Option<Self> {
-        let length = input.chars().count();
-        let range = selection.map_or(length..length, |range| {
-            range.start.min(range.end).min(length)..range.start.max(range.end).min(length)
-        });
-        let byte_index = |index| {
-            input
-                .char_indices()
-                .nth(index)
-                .map_or(input.len(), |(byte, _)| byte)
+        let (length, range, bytes) = match selection {
+            None => {
+                let length = input.chars().count();
+                (length, length..length, input.len()..input.len())
+            }
+            Some(selection) => {
+                let raw_start = selection.start.min(selection.end);
+                let raw_end = selection.start.max(selection.end);
+                let mut length = 0;
+                let mut start_byte = input.len();
+                let mut end_byte = input.len();
+                for (byte, _) in input.char_indices() {
+                    if length == raw_start {
+                        start_byte = byte;
+                    }
+                    if length == raw_end {
+                        end_byte = byte;
+                    }
+                    length += 1;
+                }
+                (
+                    length,
+                    raw_start.min(length)..raw_end.min(length),
+                    start_byte..end_byte,
+                )
+            }
         };
-        let bytes = byte_index(range.start)..byte_index(range.end);
         let prefix = if input[..bytes.start]
             .chars()
             .next_back()
