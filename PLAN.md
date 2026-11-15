@@ -568,8 +568,9 @@ adoption decisions without displacing native daily-use acceptance.
   adapter/model parity, cancellation and unwind. Measure retained cross-model
   capacities and codec-callback overlap with complete X1/X2 request latency and
   process resources under the [speech storage contract](docs/streaming-resources.md#native-speech-generation-and-streaming).
-  The local check stopped at preexisting Windows-process dependency lints before
-  compiling this candidate; all named regressions remain pending.
+  Local `cargo +nightly-2026-11-12 clippy --locked --offline --release -p bonsai-speech-tts --all-targets --all-features -- -D warnings`
+  and the three named workspace unit tests passed locally on Windows ARM64;
+  complete workspace/CI acceptance remains pending.
 - [ ] After ordinary Q4 acceptance, evaluate a verified 48 kHz decoder only with
   compatible locked weights, license, reference-audio/PCM/UI changes and listening
   acceptance.
