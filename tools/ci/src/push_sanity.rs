@@ -129,6 +129,8 @@ fn selection(paths: &[String]) -> Selection {
         }),
         native_boundary: owned.iter().any(|path| {
             is_native_source(path)
+                || path.as_str() == ".gitattributes"
+                || path.ends_with("/.gitattributes")
                 || extension(path, "rs")
                 || path.ends_with("Cargo.toml")
                 || path.as_str() == "Cargo.lock"
@@ -304,6 +306,12 @@ mod tests {
         let native = selection(&["tools/native-reference/helper.cpp".into()]);
         assert!(native.native_boundary);
         assert!(!native.rust);
+
+        for path in [".gitattributes", "tools/bonsai/.gitattributes"] {
+            let attributes = selection(&[path.into()]);
+            assert!(attributes.native_boundary, "{path}");
+            assert!(!attributes.rust, "{path}");
+        }
 
         let hexagon = selection(&["tools/hexagon/windows-queue-abi.lock.json".into()]);
         assert!(hexagon.hexagon_locks);

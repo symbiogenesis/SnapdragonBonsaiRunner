@@ -22,3 +22,6 @@ tools/hexagon/public-qaic-wire.expected.json text eol=lf
 tools/hexagon/public_idl_control.rs text eol=lf
 tools/hexagon/windows_queue_abi.* text eol=lf
 tools/hexagon/windows-queue-abi.lock.json text eol=lf
+
+# Preserve the reviewed native-boundary identity across Windows checkouts.
+tools/bonsai/src/hexagon_tools/public_control/windows.rs text eol=lf
