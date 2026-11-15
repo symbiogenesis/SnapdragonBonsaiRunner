@@ -414,3 +414,13 @@ final-Snake control checks both finite saturation endpoints. DAC output must be
 finite before clipping: an overflowing final projection cannot become apparently
 valid full-scale PCM. These small synthetic weights do not supply pinned-codec
 observations, listening acceptance or a model-performance verdict.
+
+Four additional `codec_reference_` mathematical controls cover complete miniature
+Mimi and decoder transformer layers: biased LayerNorm, erf GELU, signed layer
+scales, RoPE positions, SwiGLU, final RMSNorm/projection and committed sliding-window
+KV. Separate nonuniform grouped-attention answers use literal probability ratios
+`1:2:4` and `1:4:16`; expected outputs do not call serving numerical helpers.
+Mimi LayerNorm rejects invalid parameters and finite reduction/output overflow
+instead of publishing apparently valid bias-only values after infinite variance.
+Successful finite arithmetic keeps its existing operation order. These controls
+remain synthetic; original pinned-weight observations and S1 acceptance are open.
