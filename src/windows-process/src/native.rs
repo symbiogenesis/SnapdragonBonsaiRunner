@@ -5,19 +5,20 @@ pub(super) mod maintenance;
 
 use std::ffi::{OsStr, c_void};
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{
     AsRawHandle as _, AsRawSocket as _, AsSocket, FromRawHandle as _, FromRawSocket as _,
-    OwnedHandle, OwnedSocket,
+    OwnedHandle, OwnedSocket, RawHandle,
 };
 use std::path::Path;
 use std::ptr::{self, null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
@@ -48,7 +49,7 @@ use windows_sys::Win32::System::ProcessStatus::{
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
     BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, GetProcessMitigationPolicy, GetProcessTimes,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
@@ -248,7 +249,17 @@ pub(super) fn process_creation_time(id: u32) -> io::Result<u64> {
     creation_file_time(&handle)
 }
 
+pub(super) fn current_creation_time() -> io::Result<u64> {
+    // SAFETY: GetCurrentProcess returns the current-process pseudo handle without ownership.
+    let process = unsafe { GetCurrentProcess() };
+    creation_file_time_raw(process)
+}
+
 fn creation_file_time(handle: &OwnedHandle) -> io::Result<u64> {
+    creation_file_time_raw(handle.as_raw_handle())
+}
+
+fn creation_file_time_raw(handle: RawHandle) -> io::Result<u64> {
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -257,7 +268,7 @@ fn creation_file_time(handle: &OwnedHandle) -> io::Result<u64> {
     // independently allocated writable values for this synchronous call.
     check(unsafe {
         GetProcessTimes(
-            handle.as_raw_handle(),
+            handle,
             &raw mut creation,
             &raw mut exit,
             &raw mut kernel,
@@ -1094,7 +1105,7 @@ pub(super) fn bind_exclusive_loopback_listener(
         sin_port: port.to_be(),
         sin_addr: IN_ADDR {
             S_un: IN_ADDR_0 {
-                S_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                S_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
             },
         },
         sin_zero: [0; 8],
@@ -1195,7 +1206,7 @@ pub(super) fn listener_process_id(port: u16) -> io::Result<Option<u32>> {
             let local_addr = row[1];
             let port_bytes = row[2].to_ne_bytes();
             let owning_pid = row[5];
-            if local_addr.to_ne_bytes() == [127, 0, 0, 1]
+            if Ipv4Addr::from(local_addr.to_ne_bytes()) == Ipv4Addr::LOCALHOST
                 && u16::from_be_bytes([port_bytes[0], port_bytes[1]]) == port
                 && owner.replace(owning_pid).is_some()
             {
@@ -1294,7 +1305,7 @@ fn standard_streams(
         // handle avoids granting codecs an unbounded disk-log sink.
         let error = standard_file(
             OsStr::new("NUL"),
-            0x4000_0000,
+            GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             OPEN_EXISTING,
         )?;
@@ -1302,7 +1313,7 @@ fn standard_streams(
     }
     let input = standard_file(
         OsStr::new("NUL"),
-        0x8000_0000,
+        GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         OPEN_EXISTING,
     )?;
@@ -1315,13 +1326,13 @@ fn standard_streams(
             input,
             standard_file(
                 spec.stdout.as_os_str(),
-                0x4000_0000,
+                GENERIC_WRITE,
                 FILE_SHARE_READ,
                 CREATE_NEW,
             )?,
             standard_file(
                 spec.stderr.as_os_str(),
-                0x4000_0000,
+                GENERIC_WRITE,
                 FILE_SHARE_READ,
                 CREATE_NEW,
             )?,
@@ -1533,7 +1544,7 @@ impl Drop for CreationAttributes {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::TcpListener;
 
     use windows_sys::Win32::Networking::WinSock::{getsockopt, socket};
 

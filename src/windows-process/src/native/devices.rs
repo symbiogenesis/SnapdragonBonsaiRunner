@@ -8,9 +8,9 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SPDRP_MFG, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
     SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, SetupDiOpenDevRegKey,
 };
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Registry::{
-    HKEY, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW,
+    HKEY, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW,
 };
 
 struct Set(HDEVINFO);
@@ -51,7 +51,7 @@ fn property(set: &Set, entry: &SP_DEVINFO_DATA, property: u32) -> Option<String>
             ptr::null_mut(),
         )
     };
-    (read != 0 && kind == 1)
+    (read != 0 && kind == REG_SZ)
         .then(|| text(&buffer).ok())
         .flatten()
 }
@@ -100,7 +100,7 @@ pub(crate) fn inventory(class: &str) -> io::Result<Vec<crate::DeviceInventoryEnt
         // SAFETY: set is live and entry has its initialized exact structure size.
         if unsafe { SetupDiEnumDeviceInfo(set.0, index, &raw mut entry) } == 0 {
             let error = io::Error::last_os_error();
-            return if error.raw_os_error() == Some(259) {
+            return if error.raw_os_error() == i32::try_from(ERROR_NO_MORE_ITEMS).ok() {
                 Ok(devices)
             } else {
                 Err(error)

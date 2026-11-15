@@ -6,7 +6,9 @@ use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 
 use crate::{OpenClDevice, OpenClInventory, OpenClPlatform};
 
@@ -81,10 +83,10 @@ fn bounded_count(count: u32, maximum: usize) -> io::Result<usize> {
 
 fn text(bytes: &[u8], written: usize) -> io::Result<String> {
     let bytes = bytes.get(..written).ok_or_else(invalid)?;
-    let Some((&0, bytes)) = bytes.split_last() else {
-        return Err(invalid());
-    };
-    let value = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+    let value = CStr::from_bytes_with_nul(bytes)
+        .map_err(|_| invalid())?
+        .to_str()
+        .map_err(|_| invalid())?;
     if value.chars().any(char::is_control) {
         return Err(invalid());
     }
@@ -151,8 +153,13 @@ impl Api {
         let wide_path: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
         // SAFETY: An absolute NUL-terminated system path is selected. The flags
         // restrict dependency search to the loader's directory and System32.
-        let handle =
-            unsafe { LoadLibraryExW(wide_path.as_ptr(), std::ptr::null_mut(), 0x100 | 0x800) };
+        let handle = unsafe {
+            LoadLibraryExW(
+                wide_path.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
         if handle.is_null() {
             return Err(io::Error::other("system OpenCL loader unavailable"));
         }
@@ -296,8 +303,14 @@ impl Api {
 fn validate_environment() -> io::Result<()> {
     if !cfg!(target_arch = "aarch64")
         || std::env::vars_os().any(|(name, _)| {
-            let name = name.to_string_lossy().to_ascii_uppercase();
-            name.starts_with("OCL_") || name.starts_with("OPENCL_") || name.starts_with("CL_")
+            let bytes = name.as_encoded_bytes();
+            [b"OCL_".as_slice(), b"OPENCL_".as_slice(), b"CL_".as_slice()]
+                .iter()
+                .any(|prefix| {
+                    bytes
+                        .get(..prefix.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                })
         })
     {
         return Err(io::Error::new(

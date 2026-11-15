@@ -4,7 +4,7 @@ use std::io;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::SYSTEMTIME;
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, SYSTEMTIME};
 use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -57,25 +57,27 @@ pub(crate) fn has_running_process(names: &[&str]) -> io::Result<bool> {
             .iter()
             .position(|unit| *unit == 0)
             .ok_or_else(|| super::invalid("Unterminated process name."))?;
-        let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-        if names
-            .iter()
-            .any(|selected| name.eq_ignore_ascii_case(selected))
-        {
+        let exe_units = &entry.szExeFile[..end];
+        if names.iter().any(|selected| {
+            exe_units.len() == selected.len()
+                && exe_units.iter().zip(selected.bytes()).all(|(&unit, byte)| {
+                    u8::try_from(unit).is_ok_and(|ascii| ascii.eq_ignore_ascii_case(&byte))
+                })
+        }) {
             return Ok(true);
         }
         // SAFETY: The same owned snapshot and initialized entry remain live for the next record.
         found = unsafe { Process32NextW(snapshot.as_raw_handle(), &raw mut entry) };
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() != Some(18) {
+    if error.raw_os_error() != i32::try_from(ERROR_NO_MORE_FILES).ok() {
         return Err(error);
     }
     Ok(false)
 }
 
 pub(crate) fn current_creation_time() -> io::Result<u64> {
-    super::process_creation_time(std::process::id())
+    super::current_creation_time()
 }
 
 pub(crate) fn utc_now() -> String {

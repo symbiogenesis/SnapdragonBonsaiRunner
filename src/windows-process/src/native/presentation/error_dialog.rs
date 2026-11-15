@@ -8,6 +8,7 @@ use windows_sys::{
             DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
             LibraryLoader::GetModuleHandleW,
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
+            Ole::CF_UNICODETEXT,
         },
         UI::WindowsAndMessaging::{
             BS_DEFPUSHBUTTON, DLGTEMPLATE, DS_CENTER, DS_MODALFRAME, DS_SETFONT,
@@ -195,9 +196,9 @@ fn copy(dialog: HWND, text: &[u16]) -> bool {
     if unsafe { EmptyClipboard() } == 0 {
         return false;
     }
-    // SAFETY: Format 13 is CF_UNICODETEXT; unlocked movable storage contains
+    // SAFETY: CF_UNICODETEXT accepts unlocked movable storage containing
     // terminated UTF-16. Ownership transfers only when this call succeeds.
-    if unsafe { SetClipboardData(13, allocation.0) }.is_null() {
+    if unsafe { SetClipboardData(u32::from(CF_UNICODETEXT), allocation.0) }.is_null() {
         return false;
     }
     allocation.0 = ptr::null_mut();

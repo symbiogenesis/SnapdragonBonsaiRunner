@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 
 use crate::{
     VulkanAdapter, VulkanInstanceModules, VulkanInventory, VulkanModuleFileCandidate,
@@ -386,19 +388,17 @@ fn check(result: i32) -> io::Result<()> {
 }
 
 fn text(bytes: &[c_char]) -> io::Result<String> {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(invalid)?;
-    let bytes: Vec<_> = bytes[..end]
-        .iter()
-        .map(|byte| byte.cast_unsigned())
-        .collect();
-    let text = String::from_utf8(bytes).map_err(|_| invalid())?;
+    // SAFETY: `c_char` and `u8` have identical 1-byte layout with no invalid
+    // bit patterns; scanning up to NUL reads only initialized slice elements.
+    let bytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), bytes.len()) };
+    let text = CStr::from_bytes_until_nul(bytes)
+        .map_err(|_| invalid())?
+        .to_str()
+        .map_err(|_| invalid())?;
     if text.chars().any(char::is_control) {
         return Err(invalid());
     }
-    Ok(text)
+    Ok(text.to_owned())
 }
 
 struct Library(HMODULE);
@@ -438,7 +438,13 @@ impl Loader {
         // SAFETY: An absolute NUL-terminated system-directory path is selected,
         // with search flags restricting dependencies to the loader's directory and
         // System32. Installed graphics loader/ICDs remain the operator trust boundary.
-        let handle = unsafe { LoadLibraryExW(wide_path.as_ptr(), null_mut(), 0x100 | 0x800) };
+        let handle = unsafe {
+            LoadLibraryExW(
+                wide_path.as_ptr(),
+                null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
         if handle.is_null() {
             return Err(io::Error::other("system Vulkan loader unavailable"));
         }
@@ -915,9 +921,9 @@ fn adapter(
 pub(super) fn query() -> io::Result<VulkanInventory> {
     if !cfg!(target_arch = "aarch64")
         || std::env::vars_os().any(|(name, _)| {
-            name.to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("VK_")
+            name.as_encoded_bytes()
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"VK_"))
         })
     {
         return Err(failure(

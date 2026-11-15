@@ -9,6 +9,7 @@ use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
 use windows_sys::Win32::Security::Cryptography::{
     CERT_NAME_ATTR_TYPE, CERT_SHA1_HASH_PROP_ID, CertGetCertificateContextProperty,
     CertGetNameStringW, szOID_COMMON_NAME,
@@ -190,7 +191,19 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
             .iter()
             .position(|unit| *unit == 0)
             .ok_or_else(|| super::invalid("Unterminated module name."))?;
-        if String::from_utf16_lossy(&entry.szModule[..name_end]).eq_ignore_ascii_case(basename) {
+        let module_units = &entry.szModule[..name_end];
+        let matches_basename = if basename.is_ascii() {
+            module_units.len() == basename.len()
+                && module_units
+                    .iter()
+                    .zip(basename.bytes())
+                    .all(|(&unit, byte)| {
+                        u8::try_from(unit).is_ok_and(|ascii| ascii.eq_ignore_ascii_case(&byte))
+                    })
+        } else {
+            String::from_utf16_lossy(module_units).eq_ignore_ascii_case(basename)
+        };
+        if matches_basename {
             let path_end = entry
                 .szExePath
                 .iter()
@@ -202,7 +215,7 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
         found = unsafe { Module32NextW(snapshot.as_raw_handle(), &raw mut entry) };
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() != Some(18) {
+    if error.raw_os_error() != i32::try_from(ERROR_NO_MORE_FILES).ok() {
         return Err(error);
     }
     Ok(paths)

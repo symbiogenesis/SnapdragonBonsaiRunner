@@ -22,35 +22,53 @@ mod policy {
         let Some(channel) = value.strip_suffix("-aarch64-pc-windows-msvc") else {
             return false;
         };
-        channel.len() == 18
-            && channel.starts_with("nightly-")
-            && channel.bytes().enumerate().skip(8).all(|(index, byte)| {
-                if matches!(index, 12 | 15) {
-                    byte == b'-'
-                } else {
-                    byte.is_ascii_digit()
-                }
-            })
+        let Some(date) = channel.strip_prefix("nightly-") else {
+            return false;
+        };
+        matches!(
+            date.as_bytes(),
+            [
+                y0, y1, y2, y3,
+                b'-',
+                m0, m1,
+                b'-',
+                d0, d1,
+            ] if [y0, y1, y2, y3, m0, m1, d0, d1]
+                .into_iter()
+                .all(u8::is_ascii_digit)
+        )
     }
 
     pub(super) fn arguments(values: &[OsString]) -> Result<Arguments, String> {
-        if values.len() != 8
-            || values[0] != "--source"
-            || values[2] != "--target-directory"
-            || values[4] != "--toolchain"
-            || values[6] != "--bootstrap-milliseconds"
+        let [
+            flag_source,
+            source_arg,
+            flag_target,
+            target_arg,
+            flag_toolchain,
+            toolchain_arg,
+            flag_elapsed,
+            elapsed_arg,
+        ] = values
+        else {
+            return Err(USAGE.into());
+        };
+        if flag_source != "--source"
+            || flag_target != "--target-directory"
+            || flag_toolchain != "--toolchain"
+            || flag_elapsed != "--bootstrap-milliseconds"
         {
             return Err(USAGE.into());
         }
-        let source = PathBuf::from(&values[1]);
-        let target = PathBuf::from(&values[3]);
-        let selected = values[5].to_str().filter(|value| toolchain(value));
+        let source = PathBuf::from(source_arg);
+        let target = PathBuf::from(target_arg);
+        let selected = toolchain_arg.to_str().filter(|value| toolchain(value));
         if !source.is_absolute() || !target.is_absolute() || selected.is_none() {
             return Err(
                 "Recovery requires absolute paths and the dated native ARM64 compiler pin.".into(),
             );
         }
-        let elapsed = values[7]
+        let elapsed = elapsed_arg
             .to_str()
             .ok_or(USAGE)?
             .parse::<u64>()
@@ -112,18 +130,17 @@ mod policy {
                 in_toolchain = line == "[toolchain]";
                 continue;
             }
-            if in_toolchain {
-                if let Some((key, value)) = line.split_once('=') {
-                    if key.trim() == "channel" {
-                        if channel.is_some() {
-                            return false;
-                        }
-                        channel = value
-                            .trim()
-                            .strip_prefix('"')
-                            .and_then(|v| v.strip_suffix('"'));
-                    }
+            if in_toolchain
+                && let Some((key, value)) = line.split_once('=')
+                && key.trim() == "channel"
+            {
+                if channel.is_some() {
+                    return false;
                 }
+                channel = value
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'));
             }
         }
         channel.is_some_and(|channel| {
@@ -201,15 +218,19 @@ mod native {
             .map_err(|error| format!("Cannot start owned checker recovery {name}: {error}"))?;
             let result: Result<u32, String> = (|| {
                 loop {
-                    if self.started.elapsed() >= self.limit
+                    let elapsed = self.started.elapsed();
+                    if elapsed >= self.limit
                         || self.output.saturating_add(output_bytes(&stdout, &stderr)?) > MAX_OUTPUT
                     {
                         return Err("Push checker recovery exceeded its original time/output allowance; push blocked.".into());
                     }
-                    if let Some(code) = child.try_wait().map_err(|error| error.to_string())? {
+                    let slice = (self.limit - elapsed).min(Duration::from_millis(20));
+                    if let Some(code) = child
+                        .wait_for_exit(slice)
+                        .map_err(|error| error.to_string())?
+                    {
                         return Ok(code);
                     }
-                    std::thread::sleep(Duration::from_millis(20));
                 }
             })();
             let stopped = child
@@ -345,7 +366,8 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
+            let _ =
+                std::io::Write::write_fmt(&mut std::io::stderr().lock(), format_args!("{error}\n"));
             ExitCode::FAILURE
         }
     }
@@ -404,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_admits_only_ordered_native_compiler_arguments() {
+    fn recovery_admits_only_ordered_native_compiler_arguments() -> Result<(), String> {
         let root = if cfg!(windows) {
             "C:/recovery"
         } else {
@@ -423,7 +445,7 @@ mod tests {
         .into_iter()
         .map(OsString::from)
         .collect();
-        let parsed = policy::arguments(&values).expect("native arguments");
+        let parsed = policy::arguments(&values).map_err(|error| error.to_string())?;
         assert_eq!(parsed.source, PathBuf::from(root));
         assert_eq!(parsed.target, PathBuf::from(root));
         assert_eq!(parsed.elapsed, 17);
@@ -442,6 +464,7 @@ mod tests {
             assert!(policy::arguments(&poisoned_values).is_err());
         }
         assert!(policy::arguments(&values[..6]).is_err());
+        Ok(())
     }
 
     #[test]

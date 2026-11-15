@@ -1343,12 +1343,38 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+fn starts_with_ignore_ascii_case(bytes: &[u8], prefix: &[u8]) -> bool {
+    bytes
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn ends_with_ignore_ascii_case(bytes: &[u8], suffix: &[u8]) -> bool {
+    bytes.len().checked_sub(suffix.len()).is_some_and(|start| {
+        bytes
+            .get(start..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+    })
+}
+
 fn forbidden_environment_name(name: &OsStr) -> bool {
-    let name = name.to_string_lossy().to_ascii_uppercase();
-    ["LLAMA_", "LLAMACPP_", "GGML_", "AIP_", "MTMD_"]
+    let bytes = name.as_encoded_bytes();
+    [
+        b"LLAMA_".as_slice(),
+        b"LLAMACPP_".as_slice(),
+        b"GGML_".as_slice(),
+        b"AIP_".as_slice(),
+        b"MTMD_".as_slice(),
+    ]
+    .iter()
+    .any(|prefix| starts_with_ignore_ascii_case(bytes, prefix))
+        || [
+            b"HF_TOKEN".as_slice(),
+            b"HF_ENDPOINT".as_slice(),
+            b"MODEL_ENDPOINT".as_slice(),
+        ]
         .iter()
-        .any(|prefix| name.starts_with(prefix))
-        || ["HF_TOKEN", "HF_ENDPOINT", "MODEL_ENDPOINT"].contains(&name.as_str())
+        .any(|exact| bytes.eq_ignore_ascii_case(exact))
 }
 
 /// Checks ambient credential variable names without creating a native environment.
@@ -1376,49 +1402,50 @@ fn validate_sandbox_environment_name(name: &OsStr) -> io::Result<()> {
 }
 
 fn credential_environment_name(name: &OsStr) -> bool {
-    let name = name.to_string_lossy().to_ascii_uppercase();
+    let bytes = name.as_encoded_bytes();
     [
-        "_TOKEN",
-        "_SECRET",
-        "_PASSWORD",
-        "_API_KEY",
-        "_PRIVATE_KEY",
-        "_ACCESS_KEY",
-        "_CONNECTION_STRING",
-        "_CONNECTIONSTRING",
-        "_DATABASE_URL",
-        "_REDIS_URL",
+        b"_TOKEN".as_slice(),
+        b"_SECRET".as_slice(),
+        b"_PASSWORD".as_slice(),
+        b"_API_KEY".as_slice(),
+        b"_PRIVATE_KEY".as_slice(),
+        b"_ACCESS_KEY".as_slice(),
+        b"_CONNECTION_STRING".as_slice(),
+        b"_CONNECTIONSTRING".as_slice(),
+        b"_DATABASE_URL".as_slice(),
+        b"_REDIS_URL".as_slice(),
     ]
     .iter()
-    .any(|suffix| name.ends_with(suffix))
+    .any(|suffix| ends_with_ignore_ascii_case(bytes, suffix))
         || [
-            "TOKEN",
-            "SECRET",
-            "PASSWORD",
-            "API_KEY",
-            "PRIVATE_KEY",
-            "ACCESS_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AZURE_OPENAI_KEY",
-            "AZURE_STORAGE_KEY",
-            "AZURE_STORAGE_CONNECTION_STRING",
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "CONNECTION_STRING",
-            "CONNECTIONSTRING",
-            "DATABASE_URL",
-            "REDIS_URL",
-        ]
-        .contains(&name.as_str())
-        || [
-            "CONNECTIONSTRINGS__",
-            "SQLCONNSTR_",
-            "SQLAZURECONNSTR_",
-            "MYSQLCONNSTR_",
-            "CUSTOMCONNSTR_",
-            "POSTGRESQLCONNSTR_",
+            b"TOKEN".as_slice(),
+            b"SECRET".as_slice(),
+            b"PASSWORD".as_slice(),
+            b"API_KEY".as_slice(),
+            b"PRIVATE_KEY".as_slice(),
+            b"ACCESS_KEY".as_slice(),
+            b"AWS_ACCESS_KEY_ID".as_slice(),
+            b"AZURE_OPENAI_KEY".as_slice(),
+            b"AZURE_STORAGE_KEY".as_slice(),
+            b"AZURE_STORAGE_CONNECTION_STRING".as_slice(),
+            b"GOOGLE_APPLICATION_CREDENTIALS".as_slice(),
+            b"CONNECTION_STRING".as_slice(),
+            b"CONNECTIONSTRING".as_slice(),
+            b"DATABASE_URL".as_slice(),
+            b"REDIS_URL".as_slice(),
         ]
         .iter()
-        .any(|prefix| name.starts_with(prefix))
+        .any(|exact| bytes.eq_ignore_ascii_case(exact))
+        || [
+            b"CONNECTIONSTRINGS__".as_slice(),
+            b"SQLCONNSTR_".as_slice(),
+            b"SQLAZURECONNSTR_".as_slice(),
+            b"MYSQLCONNSTR_".as_slice(),
+            b"CUSTOMCONNSTR_".as_slice(),
+            b"POSTGRESQLCONNSTR_".as_slice(),
+        ]
+        .iter()
+        .any(|prefix| starts_with_ignore_ascii_case(bytes, prefix))
 }
 
 fn validate_path(path: &Path) -> io::Result<()> {
@@ -1458,33 +1485,32 @@ fn validate_path(path: &Path) -> io::Result<()> {
 }
 
 fn reserved_device(name: &OsStr) -> bool {
-    let text = name.to_string_lossy();
-    let base = text
-        .split('.')
+    let mut base = name
+        .as_encoded_bytes()
+        .split(|&byte| byte == b'.')
         .next()
-        .unwrap_or_default()
-        .trim_end_matches(' ');
-    let base = base.to_ascii_uppercase();
-    matches!(
-        base.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) || (base.starts_with("COM") || base.starts_with("LPT"))
-        && matches!(
-            base.get(3..),
-            Some(
-                "1" | "2"
-                    | "3"
-                    | "4"
-                    | "5"
-                    | "6"
-                    | "7"
-                    | "8"
-                    | "9"
-                    | "\u{b9}"
-                    | "\u{b2}"
-                    | "\u{b3}"
-            )
-        )
+        .unwrap_or_default();
+    while let Some(trimmed) = base.strip_suffix(b" ") {
+        base = trimmed;
+    }
+    [
+        b"CON".as_slice(),
+        b"PRN".as_slice(),
+        b"AUX".as_slice(),
+        b"NUL".as_slice(),
+        b"CONIN$".as_slice(),
+        b"CONOUT$".as_slice(),
+    ]
+    .iter()
+    .any(|reserved| base.eq_ignore_ascii_case(reserved))
+        || (starts_with_ignore_ascii_case(base, b"COM")
+            || starts_with_ignore_ascii_case(base, b"LPT"))
+            && base.get(3..).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    [b'1'..=b'9'] | [0xc2, 0xb9] | [0xc2, 0xb2] | [0xc2, 0xb3]
+                )
+            })
 }
 
 fn command_line(executable: &Path, arguments: &[OsString]) -> io::Result<Vec<u16>> {

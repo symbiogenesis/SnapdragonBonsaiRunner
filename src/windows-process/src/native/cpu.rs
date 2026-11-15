@@ -4,14 +4,18 @@ use std::collections::BTreeSet;
 use std::{io, ptr, slice};
 
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
-use windows_sys::Win32::System::SystemInformation::GetSystemCpuSetInformation;
+use windows_sys::Win32::System::SystemInformation::{
+    CpuSetInformation, GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
+    SYSTEM_CPU_SET_INFORMATION_ALLOCATED, SYSTEM_CPU_SET_INFORMATION_ALLOCATED_TO_TARGET_PROCESS,
+    SYSTEM_CPU_SET_INFORMATION_PARKED, SYSTEM_CPU_SET_INFORMATION_REALTIME,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::CpuSet;
 
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
-const KNOWN_RECORD_BYTES: usize = 32;
+const KNOWN_RECORD_BYTES: usize = size_of::<SYSTEM_CPU_SET_INFORMATION>();
 const MAX_ATTEMPTS: usize = 3;
 
 fn invalid(message: &str) -> io::Error {
@@ -101,52 +105,64 @@ fn parse(bytes: &[u8]) -> io::Result<Vec<CpuSet>> {
     let mut records = 0;
     while !remaining.is_empty() {
         records += 1;
+        let Some(size_bytes) = remaining.first_chunk::<4>().copied() else {
+            return Err(invalid("Windows CPU Set record count or header is invalid"));
+        };
         if records > MAX_RECORDS || remaining.len() < 8 {
             return Err(invalid("Windows CPU Set record count or header is invalid"));
         }
-        let size = usize::try_from(u32::from_le_bytes([
-            remaining[0],
-            remaining[1],
-            remaining[2],
-            remaining[3],
-        ]))
-        .map_err(|_| invalid("Windows CPU Set record size exceeds platform bounds"))?;
+        let size = usize::try_from(u32::from_le_bytes(size_bytes))
+            .map_err(|_| invalid("Windows CPU Set record size exceeds platform bounds"))?;
         if size < 8 || size > remaining.len() {
             return Err(invalid("Windows CPU Set record size is invalid"));
         }
         let (record, next) = remaining.split_at(size);
         remaining = next;
-        // CPU_SET_INFORMATION_TYPE::CpuSetInformation is zero. Other types
-        // are deliberately skipped according to Microsoft's expansion contract.
-        if record[4..8] != [0, 0, 0, 0] {
+        let record_type = record
+            .get(4..8)
+            .and_then(|bytes| bytes.first_chunk::<4>().copied())
+            .map(i32::from_le_bytes);
+        if record_type != Some(CpuSetInformation) {
             continue;
         }
         if record.len() < KNOWN_RECORD_BYTES {
             return Err(invalid("Windows CPU Set record is truncated"));
         }
-        let id = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        let group = u16::from_le_bytes([record[12], record[13]]);
-        let logical_processor_index = record[14];
-        if logical_processor_index >= 64
-            || !ids.insert(id)
-            || !processors.insert((group, logical_processor_index))
+        // SAFETY: `record` has at least `size_of::<SYSTEM_CPU_SET_INFORMATION>()`
+        // bytes and `read_unaligned` handles arbitrary byte-slice alignment.
+        let info = unsafe {
+            record
+                .as_ptr()
+                .cast::<SYSTEM_CPU_SET_INFORMATION>()
+                .read_unaligned()
+        };
+        // SAFETY: Checked `info.Type == CpuSetInformation` above, selecting the `CpuSet` variant.
+        let cpu = unsafe { info.Anonymous.CpuSet };
+        if cpu.LogicalProcessorIndex >= 64
+            || !ids.insert(cpu.Id)
+            || !processors.insert((cpu.Group, cpu.LogicalProcessorIndex))
         {
             return Err(invalid("Windows CPU Set identity is invalid or duplicated"));
         }
-        let flags = record[19];
+        // SAFETY: Reading the plain-integer `AllFlags` union member of `CpuSet`.
+        let flags = u32::from(unsafe { cpu.Anonymous1.AllFlags });
+        // SAFETY: Reading the plain-integer `SchedulingClass` union member of `CpuSet`.
+        let scheduling_class = unsafe { cpu.Anonymous2.SchedulingClass };
         result.push(CpuSet {
-            id,
-            group,
-            logical_processor_index,
-            core_index: record[15],
-            last_level_cache_index: record[16],
-            numa_node_index: record[17],
-            efficiency_class: record[18],
-            scheduling_class: record[20],
-            parked: flags & 1 != 0,
-            allocated: flags & 2 != 0,
-            allocated_to_target_process: flags & 4 != 0,
-            real_time: flags & 8 != 0,
+            id: cpu.Id,
+            group: cpu.Group,
+            logical_processor_index: cpu.LogicalProcessorIndex,
+            core_index: cpu.CoreIndex,
+            last_level_cache_index: cpu.LastLevelCacheIndex,
+            numa_node_index: cpu.NumaNodeIndex,
+            efficiency_class: cpu.EfficiencyClass,
+            scheduling_class,
+            parked: flags & SYSTEM_CPU_SET_INFORMATION_PARKED != 0,
+            allocated: flags & SYSTEM_CPU_SET_INFORMATION_ALLOCATED != 0,
+            allocated_to_target_process: flags
+                & SYSTEM_CPU_SET_INFORMATION_ALLOCATED_TO_TARGET_PROCESS
+                != 0,
+            real_time: flags & SYSTEM_CPU_SET_INFORMATION_REALTIME != 0,
         });
     }
     if result.is_empty() {

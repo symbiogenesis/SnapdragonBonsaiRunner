@@ -1,18 +1,18 @@
 //! Parent-owned, size-bounded captures for untrusted worker standard streams.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, FILE_SHARE_READ};
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::System::Threading::TerminateProcess;
 
-use super::{anonymous_pipe, check, standard_file};
+use super::anonymous_pipe;
 
 // This is a hard retained-file bound, independently of how often the broker
 // samples resources. The pipe and stack buffer provide bounded backpressure.
@@ -51,16 +51,17 @@ pub(super) fn prepare(
 }
 
 fn pending(path: &Path, label: &'static str) -> io::Result<(OwnedHandle, PendingCapture)> {
-    let file = standard_file(path.as_os_str(), 0x4000_0000, FILE_SHARE_READ, CREATE_NEW)?;
-    // SAFETY: This fresh parent-owned file is live; clearing inheritance keeps
-    // the untrusted worker from receiving a seekable, unbounded disk sink.
-    check(unsafe { SetHandleInformation(file.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) })?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)?;
     let (reader, writer) = anonymous_pipe(false)?;
     Ok((
         writer,
         PendingCapture {
             reader: reader.into(),
-            file: file.into(),
+            file,
             label,
         },
     ))

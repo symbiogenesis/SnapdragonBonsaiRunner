@@ -6,6 +6,7 @@ use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 use std::ptr;
 
+use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -160,7 +161,7 @@ fn snapshot_metadata(ids: &[u32]) -> io::Result<BTreeMap<u32, (u32, String)>> {
         found = unsafe { Process32NextW(snapshot.as_raw_handle(), &raw mut entry) };
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() != Some(18) {
+    if error.raw_os_error() != i32::try_from(ERROR_NO_MORE_FILES).ok() {
         return Err(error);
     }
     Ok(metadata)
