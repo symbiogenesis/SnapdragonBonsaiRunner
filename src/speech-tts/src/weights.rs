@@ -517,7 +517,9 @@ pub(crate) fn validate_packed(kind: u32, bytes: &[u8]) -> io::Result<()> {
     }
     for block in bytes.chunks_exact(size) {
         let finite = match kind {
-            0 => f32::from_le_bytes([block[0], block[1], block[2], block[3]]).is_finite(),
+            0 => block
+                .first_chunk::<4>()
+                .is_some_and(|raw| f32::from_le_bytes(*raw).is_finite()),
             1 | 8 => half(block).is_finite(),
             12 => half(block).is_finite() && half(&block[2..]).is_finite(),
             14 => half(&block[208..]).is_finite(),
@@ -537,12 +539,18 @@ pub(crate) fn validate_packed(kind: u32, bytes: &[u8]) -> io::Result<()> {
 )]
 pub(crate) fn decode_block(kind: u32, source: &[u8], destination: &mut [f32]) {
     match kind {
-        0 => destination[0] = f32::from_le_bytes([source[0], source[1], source[2], source[3]]),
+        0 => {
+            if let Some(raw) = source.first_chunk::<4>() {
+                destination[0] = f32::from_le_bytes(*raw);
+            }
+        }
         1 => destination[0] = half(source),
         8 => {
-            let scale = half(source);
-            for (value, byte) in destination.iter_mut().zip(&source[2..]) {
-                *value = scale * f32::from(i8::from_le_bytes([*byte]));
+            if let Some((scale_bytes, q_bytes)) = source.split_first_chunk::<2>() {
+                let scale = half(scale_bytes);
+                for (value, byte) in destination.iter_mut().zip(q_bytes) {
+                    *value = scale * f32::from(i8::from_le_bytes([*byte]));
+                }
             }
         }
         12 => {
@@ -627,7 +635,7 @@ mod tests {
             bytes.extend(kind.to_le_bytes());
             bytes.extend(offset.to_le_bytes());
         }
-        bytes.resize(bytes.len().div_ceil(32) * 32, 0);
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
         bytes.extend(payload);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -963,7 +971,7 @@ mod tests {
         bytes.extend(1_u64.to_le_bytes());
         bytes.extend(0_u32.to_le_bytes());
         bytes.extend(tensor_offset.to_le_bytes());
-        let padded = bytes.len().div_ceil(alignment) * alignment;
+        let padded = bytes.len().next_multiple_of(alignment);
         bytes.resize(
             padded + usize::try_from(tensor_offset).map_err(|_| invalid())? + 4,
             0,

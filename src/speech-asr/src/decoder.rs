@@ -94,7 +94,7 @@ impl Projection {
         }
         let mut values = zeros(count)?;
         for (value, bytes) in values.iter_mut().zip(bytes.as_chunks::<2>().0) {
-            *value = half(u16::from_le_bytes([bytes[0], bytes[1]]))?;
+            *value = half(u16::from_le_bytes(*bytes))?;
         }
         Self::f32(input, output, values)
     }
@@ -128,7 +128,8 @@ impl Projection {
             return Err(invalid());
         }
         for block in data.as_chunks::<34>().0 {
-            let _ = half(u16::from_le_bytes([block[0], block[1]]))?;
+            let [s0, s1, ..] = *block;
+            let _ = half(u16::from_le_bytes([s0, s1]))?;
         }
         Ok(Self {
             input,

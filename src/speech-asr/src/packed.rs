@@ -975,9 +975,10 @@ mod tests {
                 let weights = if is_q8 {
                     let row_bytes = input / 32 * 34;
                     let mut bytes = vec![0_u8; row_bytes * output];
-                    for (blk_idx, block) in bytes.chunks_exact_mut(34).enumerate() {
-                        block[..2].copy_from_slice(&scales[blk_idx % scales.len()].to_le_bytes());
-                        for (q_idx, byte) in block[2..].iter_mut().enumerate() {
+                    for (blk_idx, block) in bytes.as_chunks_mut::<34>().0.iter_mut().enumerate() {
+                        let [s0, s1, qs @ ..] = block;
+                        [*s0, *s1] = scales[blk_idx % scales.len()].to_le_bytes();
+                        for (q_idx, byte) in qs.iter_mut().enumerate() {
                             let val = i8::try_from(
                                 ((blk_idx * 17 + q_idx * 13) % 251).cast_signed() - 125,
                             )

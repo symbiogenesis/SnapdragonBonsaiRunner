@@ -167,8 +167,8 @@ mod tests {
             assert!(!ranges.is_empty() && ranges.len() <= 3);
             ranges.sort_unstable();
             assert_eq!(ranges[0].0, 0);
-            for pair in ranges.windows(2) {
-                assert_eq!(pair[0].0 + pair[0].1, pair[1].0);
+            for [left, right] in ranges.array_windows() {
+                assert_eq!(left.0 + left.1, right.0);
             }
             assert_eq!(ranges.last().map(|(start, len)| start + len), Some(53));
         }

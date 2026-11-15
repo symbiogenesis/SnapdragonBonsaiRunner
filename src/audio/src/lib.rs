@@ -90,15 +90,36 @@ fn validate_canonical_pcm16_fmt(
     sample_rate: u32,
     byte_rate: u32,
 ) -> Result<(), WavError> {
-    let Ok(fmt) = <&[u8; 16]>::try_from(body) else {
+    let Some((
+        &[
+            a0,
+            a1,
+            c0,
+            c1,
+            r0,
+            r1,
+            r2,
+            r3,
+            b0,
+            b1,
+            b2,
+            b3,
+            ba0,
+            ba1,
+            bps0,
+            bps1,
+        ],
+        [],
+    )) = body.split_first_chunk::<16>()
+    else {
         return Err(WavError::UnsupportedFormat);
     };
-    let audio_format = u16::from_le_bytes([fmt[0], fmt[1]]);
-    let channels = u16::from_le_bytes([fmt[2], fmt[3]]);
-    let rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
-    let actual_byte_rate = u32::from_le_bytes([fmt[8], fmt[9], fmt[10], fmt[11]]);
-    let block_align = u16::from_le_bytes([fmt[12], fmt[13]]);
-    let bits_per_sample = u16::from_le_bytes([fmt[14], fmt[15]]);
+    let audio_format = u16::from_le_bytes([a0, a1]);
+    let channels = u16::from_le_bytes([c0, c1]);
+    let rate = u32::from_le_bytes([r0, r1, r2, r3]);
+    let actual_byte_rate = u32::from_le_bytes([b0, b1, b2, b3]);
+    let block_align = u16::from_le_bytes([ba0, ba1]);
+    let bits_per_sample = u16::from_le_bytes([bps0, bps1]);
     if audio_format != 1
         || channels != 1
         || rate != sample_rate
@@ -130,13 +151,27 @@ pub fn mono_pcm16_data_checked(
     let byte_rate = sample_rate
         .checked_mul(2)
         .ok_or(WavError::UnsupportedFormat)?;
-    let Some((riff_head, _)) = wave.split_first_chunk::<12>() else {
+    let Some((
+        &[
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            r0,
+            r1,
+            r2,
+            r3,
+            b'W',
+            b'A',
+            b'V',
+            b'E',
+        ],
+        _,
+    )) = wave.split_first_chunk::<12>()
+    else {
         return Err(WavError::InvalidRiffHeader);
     };
-    if &riff_head[..4] != b"RIFF" || &riff_head[8..12] != b"WAVE" {
-        return Err(WavError::InvalidRiffHeader);
-    }
-    let riff_size = u32::from_le_bytes([riff_head[4], riff_head[5], riff_head[6], riff_head[7]]);
+    let riff_size = u32::from_le_bytes([r0, r1, r2, r3]);
     if usize::try_from(riff_size).ok() != Some(wave.len() - 8) {
         return Err(WavError::InvalidRiffHeader);
     }
@@ -359,7 +394,7 @@ mod tests {
             let wave = fixture(rate);
             assert_eq!(
                 mono_pcm16_header(rate, 2).as_ref(),
-                wave[..44].try_into().ok()
+                wave.first_chunk::<44>()
             );
             assert_eq!(mono_pcm16_data(&wave, rate, maximum), Some(&wave[44..]));
             assert!(mono_pcm16_data(&wave, rate, 1).is_none());

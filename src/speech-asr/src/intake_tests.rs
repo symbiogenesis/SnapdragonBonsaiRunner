@@ -66,7 +66,7 @@ fn wire(
         output.extend(kind.to_le_bytes());
         output.extend(offset.to_le_bytes());
     }
-    output.resize(output.len().div_ceil(32) * 32 + data, 0);
+    output.resize(output.len().next_multiple_of(32) + data, 0);
     output
 }
 
