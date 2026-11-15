@@ -6,10 +6,6 @@ use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
 use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
     JobObjectBasicProcessIdList, QueryInformationJobObject,
@@ -24,7 +20,7 @@ pub(super) fn observe(process: &super::NativeProcess) -> String {
         QueryInformationJobObject(
             process.job.as_raw_handle(),
             JobObjectBasicAccountingInformation,
-            ptr::from_mut(&mut accounting).cast(),
+            (&raw mut accounting).cast(),
             super::win_size::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(),
             ptr::null_mut(),
         )
@@ -57,26 +53,30 @@ pub(super) fn observe(process: &super::NativeProcess) -> String {
 
 fn raw_members(process: &super::NativeProcess) -> (String, Vec<u32>) {
     const CAPACITY: usize = 64;
-    let header_units = 8_usize.div_ceil(size_of::<usize>());
+    let header_units = super::job_process_list_header_units();
     let mut storage = vec![0_usize; header_units + CAPACITY];
-    // SAFETY: The usize-aligned initialized allocation contains the two DWORD
-    // counts plus exactly CAPACITY pointer-sized IDs. Only one bounded query is
-    // made; ERROR_MORE_DATA preserves partial raw diagnostic data without retry.
+    let Ok(bytes) = u32::try_from(size_of_val(storage.as_slice())) else {
+        return (
+            "query_ok=false,win32=None,header_valid=false".into(),
+            Vec::new(),
+        );
+    };
+    // SAFETY: The usize-aligned initialized allocation contains the
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST header plus exactly CAPACITY pointer-sized IDs.
+    // Only one bounded query is made; ERROR_MORE_DATA preserves partial diagnostic data.
     let result = unsafe {
         QueryInformationJobObject(
             process.job.as_raw_handle(),
             JobObjectBasicProcessIdList,
             storage.as_mut_ptr().cast(),
-            super::win_size::<[usize; 64]>() + 8,
+            bytes,
             ptr::null_mut(),
         )
     };
     let error = (result == 0).then(io::Error::last_os_error);
     let error_code = error.as_ref().and_then(io::Error::raw_os_error);
     let valid = result != 0 || error_code == i32::try_from(super::ERROR_MORE_DATA).ok();
-    // SAFETY: Initialized storage always includes the aligned eight-byte header.
-    // A non-success/non-MORE_DATA query labels its fields unknown below.
-    let [assigned, listed] = unsafe { ptr::read(storage.as_ptr().cast::<[u32; 2]>()) };
+    let (assigned, listed) = super::decode_job_process_list_header(&storage);
     let count = if valid {
         usize::try_from(listed).unwrap_or(CAPACITY).min(CAPACITY)
     } else {
@@ -125,44 +125,23 @@ fn retained_members(process: &super::NativeProcess) -> io::Result<Vec<(u32, u32)
 }
 
 fn snapshot_metadata(ids: &[u32]) -> io::Result<BTreeMap<u32, (u32, String)>> {
-    // SAFETY: This read-only snapshot has no pointer arguments and returns a
-    // fresh handle, closed by OwnedHandle on every success/error path.
-    let snapshot = super::owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
-    let mut entry = PROCESSENTRY32W {
-        dwSize: super::win_size::<PROCESSENTRY32W>(),
-        ..PROCESSENTRY32W::default()
-    };
     let mut metadata = BTreeMap::new();
-    // SAFETY: The live snapshot and correctly sized writable entry remain owned.
-    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &raw mut entry) };
-    let mut count = 0;
-    while found != 0 {
-        count += 1;
-        if count > 16_384 {
-            return Err(super::invalid(
-                "Fixture process snapshot exceeds its diagnostic bound.",
-            ));
-        }
-        if ids.contains(&entry.th32ProcessID) {
-            let end = entry
-                .szExeFile
-                .iter()
-                .position(|unit| *unit == 0)
-                .ok_or_else(|| super::invalid("Unterminated fixture process basename."))?;
-            let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-            let basename = Path::new(&name)
-                .file_name()
-                .ok_or_else(|| super::invalid("Missing fixture process basename."))?
-                .to_string_lossy()
-                .into_owned();
-            metadata.insert(entry.th32ProcessID, (entry.th32ParentProcessID, basename));
-        }
-        // SAFETY: The same owned snapshot and initialized writable entry remain live.
-        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &raw mut entry) };
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() != i32::try_from(ERROR_NO_MORE_FILES).ok() {
-        return Err(error);
-    }
+    super::for_each_process(
+        "Fixture process snapshot exceeds its diagnostic bound.",
+        |entry| {
+            if ids.contains(&entry.th32ProcessID) {
+                let exe_units =
+                    super::utf16_z(&entry.szExeFile, "Unterminated fixture process basename.")?;
+                let name = String::from_utf16_lossy(exe_units);
+                let basename = Path::new(&name)
+                    .file_name()
+                    .ok_or_else(|| super::invalid("Missing fixture process basename."))?
+                    .to_string_lossy()
+                    .into_owned();
+                metadata.insert(entry.th32ProcessID, (entry.th32ParentProcessID, basename));
+            }
+            Ok(true)
+        },
+    )?;
     Ok(metadata)
 }

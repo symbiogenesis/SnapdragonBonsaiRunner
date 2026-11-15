@@ -1,15 +1,10 @@
 //! Bounded `OpenCL` 1.x information queries; callers own the driver-call deadline.
 
-use std::ffi::{CStr, OsString, c_void};
+use std::ffi::{CStr, c_void};
 use std::io;
-use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
-};
-
+use super::library::SystemLibrary;
 use crate::{OpenClDevice, OpenClInventory, OpenClPlatform};
 
 mod projection;
@@ -108,66 +103,26 @@ fn extensions(value: &str) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
-struct Library(HMODULE);
-
-impl Drop for Library {
-    fn drop(&mut self) {
-        // SAFETY: This object uniquely owns the successful LoadLibraryExW result.
-        // All function pointers and platform/device observations are out of use.
-        let _ = unsafe { FreeLibrary(self.0) };
-    }
-}
-
-impl Library {
-    fn symbol(&self, name: &CStr) -> io::Result<unsafe extern "system" fn() -> isize> {
-        // SAFETY: This module is owned and live; name is a NUL-terminated fixed
-        // OpenCL symbol. The pointer is used only while this library remains live.
-        unsafe { GetProcAddress(self.0, name.as_ptr().cast()) }.ok_or_else(invalid)
-    }
-}
-
 struct Api {
     platforms: Platforms,
     platform_info: PlatformInfo,
     devices: Devices,
     device_info: DeviceInfo,
     path: PathBuf,
-    _library: Library,
+    _library: SystemLibrary,
 }
 
 impl Api {
     fn load() -> io::Result<Self> {
-        let mut directory = vec![0_u16; 32768];
-        // SAFETY: The advertised writable directory array is live for this call.
-        let count = unsafe {
-            windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
-                directory.as_mut_ptr(),
-                32768,
-            )
-        };
-        let count = bounded_count(count, directory.len() - 1)?;
-        if count == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let path = PathBuf::from(OsString::from_wide(&directory[..count])).join("OpenCL.dll");
-        let wide_path: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: An absolute NUL-terminated system path is selected. The flags
-        // restrict dependency search to the loader's directory and System32.
-        let handle = unsafe {
-            LoadLibraryExW(
-                wide_path.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
-        if handle.is_null() {
-            return Err(io::Error::other("system OpenCL loader unavailable"));
-        }
-        let library = Library(handle);
-        let platforms = library.symbol(c"clGetPlatformIDs")?;
-        let platform_info = library.symbol(c"clGetPlatformInfo")?;
-        let devices = library.symbol(c"clGetDeviceIDs")?;
-        let device_info = library.symbol(c"clGetDeviceInfo")?;
+        let library =
+            SystemLibrary::load_system32("OpenCL.dll", "system OpenCL loader unavailable")?;
+        let path = library.path().to_path_buf();
+        let platforms = library.symbol(c"clGetPlatformIDs").map_err(|_| invalid())?;
+        let platform_info = library
+            .symbol(c"clGetPlatformInfo")
+            .map_err(|_| invalid())?;
+        let devices = library.symbol(c"clGetDeviceIDs").map_err(|_| invalid())?;
+        let device_info = library.symbol(c"clGetDeviceInfo").map_err(|_| invalid())?;
         // SAFETY: The exact OpenCL 1.0 symbol has the Platforms ABI declared in
         // Khronos cl.h. The library stays owned for every function-pointer use.
         let platforms = unsafe {

@@ -46,61 +46,107 @@ fn compare(left: &[u16], right: &[u16]) -> io::Result<Ordering> {
     }
 }
 
-pub(super) fn build(
-    inherited: impl IntoIterator<Item = (OsString, OsString)>,
-    overlay: &BTreeMap<String, String>,
-) -> io::Result<Vec<u16>> {
-    let mut entries: Vec<(Vec<u16>, Vec<u16>)> = inherited
-        .into_iter()
-        .map(|(name, value)| (name.encode_wide().collect(), value.encode_wide().collect()))
-        .collect();
-    let mut replaced: Vec<Vec<u16>> = Vec::new();
-    for (name, value) in overlay {
-        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
-            return Err(invalid("invalid child environment entry"));
-        }
-        let name: Vec<_> = name.encode_utf16().collect();
-        for protected in PROTECTED {
-            if compare(&name, &protected.encode_utf16().collect::<Vec<_>>())?.is_eq() {
-                return Err(invalid(
-                    "startup cannot replace a Windows system/profile environment variable",
-                ));
+fn is_protected(name: &[u16]) -> io::Result<bool> {
+    let mut stack = [0_u16; 32];
+    for protected in PROTECTED {
+        let mut len = 0;
+        for unit in protected.encode_utf16() {
+            if let Some(slot) = stack.get_mut(len) {
+                *slot = unit;
+                len += 1;
             }
         }
-        for prior in &replaced {
-            if compare(&name, prior)?.is_eq() {
-                return Err(invalid(
-                    "duplicate case-insensitive child environment override",
-                ));
-            }
+        if compare(name, &stack[..len])?.is_eq() {
+            return Ok(true);
         }
-        replaced.push(name.clone());
-        let mut retained = Vec::with_capacity(entries.len() + 1);
-        for entry in entries {
-            if !compare(&name, &entry.0)?.is_eq() {
-                retained.push(entry);
-            }
-        }
-        retained.push((name, value.encode_utf16().collect()));
-        entries = retained;
     }
+    Ok(false)
+}
+
+fn sort_entries(entries: &mut [(Vec<u16>, Vec<u16>)]) -> io::Result<()> {
     let mut comparison_error = None;
-    entries.sort_by(|left, right| match compare(&left.0, &right.0) {
-        Ok(order) => order,
-        Err(error) => {
-            comparison_error = Some(error);
-            Ordering::Equal
+    entries.sort_by(|left, right| {
+        if comparison_error.is_some() {
+            return Ordering::Equal;
+        }
+        match compare(&left.0, &right.0) {
+            Ok(order) => order,
+            Err(error) => {
+                comparison_error = Some(error);
+                Ordering::Equal
+            }
         }
     });
     if let Some(error) = comparison_error {
         return Err(error);
     }
+    Ok(())
+}
+
+fn push_entry(block: &mut Vec<u16>, name: &[u16], value: &[u16]) {
+    block.extend_from_slice(name);
+    block.push(u16::from(b'='));
+    block.extend_from_slice(value);
+    block.push(0);
+}
+
+pub(super) fn build(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    overlay: &BTreeMap<String, String>,
+) -> io::Result<Vec<u16>> {
+    let mut overrides = Vec::with_capacity(overlay.len());
+    for (name, value) in overlay {
+        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+            return Err(invalid("invalid child environment entry"));
+        }
+        let name: Vec<_> = name.encode_utf16().collect();
+        if is_protected(&name)? {
+            return Err(invalid(
+                "startup cannot replace a Windows system/profile environment variable",
+            ));
+        }
+        overrides.push((name, value.encode_utf16().collect()));
+    }
+    sort_entries(&mut overrides)?;
+    for pair in overrides.windows(2) {
+        if compare(&pair[0].0, &pair[1].0)?.is_eq() {
+            return Err(invalid(
+                "duplicate case-insensitive child environment override",
+            ));
+        }
+    }
+
+    let mut entries: Vec<(Vec<u16>, Vec<u16>)> = inherited
+        .into_iter()
+        .map(|(name, value)| (name.encode_wide().collect(), value.encode_wide().collect()))
+        .collect();
+    sort_entries(&mut entries)?;
+
     let mut block = Vec::new();
-    for (name, value) in entries {
-        block.extend(name);
-        block.push(61);
-        block.extend(value);
-        block.push(0);
+    let mut inherited_index = 0;
+    let mut override_index = 0;
+    while inherited_index < entries.len() && override_index < overrides.len() {
+        let entry = &entries[inherited_index];
+        let replacement = &overrides[override_index];
+        match compare(&entry.0, &replacement.0)? {
+            Ordering::Less => {
+                push_entry(&mut block, &entry.0, &entry.1);
+                inherited_index += 1;
+            }
+            Ordering::Equal => {
+                inherited_index += 1;
+            }
+            Ordering::Greater => {
+                push_entry(&mut block, &replacement.0, &replacement.1);
+                override_index += 1;
+            }
+        }
+    }
+    for (name, value) in &entries[inherited_index..] {
+        push_entry(&mut block, name, value);
+    }
+    for (name, value) in &overrides[override_index..] {
+        push_entry(&mut block, name, value);
     }
     if block.is_empty() {
         block.push(0);

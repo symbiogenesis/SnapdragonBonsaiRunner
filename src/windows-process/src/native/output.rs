@@ -6,8 +6,9 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
 use windows_sys::Win32::System::Threading::TerminateProcess;
@@ -33,8 +34,30 @@ struct PendingCapture {
 
 pub(super) struct PendingCaptures([PendingCapture; 2]);
 
+struct DoneSignal(Arc<(Mutex<bool>, Condvar)>);
+
+impl DoneSignal {
+    fn new() -> Arc<(Mutex<bool>, Condvar)> {
+        Arc::new((Mutex::new(false), Condvar::new()))
+    }
+
+    fn signal(target: &(Mutex<bool>, Condvar)) {
+        if let Ok(mut finished) = target.0.lock() {
+            *finished = true;
+            target.1.notify_all();
+        }
+    }
+}
+
+impl Drop for DoneSignal {
+    fn drop(&mut self) {
+        Self::signal(&self.0);
+    }
+}
+
 struct Capture {
     result: Arc<AtomicU8>,
+    done: Arc<(Mutex<bool>, Condvar)>,
     thread: Mutex<Option<JoinHandle<()>>>,
     label: &'static str,
 }
@@ -84,11 +107,14 @@ impl PendingCaptures {
 impl PendingCapture {
     fn start(self, process: OwnedHandle) -> Capture {
         let result = Arc::new(AtomicU8::new(PENDING));
+        let done = DoneSignal::new();
         let published = Arc::clone(&result);
+        let done_worker = Arc::clone(&done);
         let label = self.label;
         let thread = thread::Builder::new()
             .name(format!("sandbox-{label}-capture"))
             .spawn(move || {
+                let _signal = DoneSignal(done_worker);
                 let Self {
                     mut reader,
                     mut file,
@@ -108,15 +134,17 @@ impl PendingCapture {
                 drop(process);
                 published.store(status, Ordering::Release);
             });
-        let thread = thread.map_or_else(
-            |_| {
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(_) => {
                 result.store(THREAD_FAILED, Ordering::Release);
+                DoneSignal::signal(&done);
                 None
-            },
-            Some,
-        );
+            }
+        };
         Capture {
             result,
+            done,
             thread: Mutex::new(thread),
             label,
         }
@@ -129,6 +157,15 @@ impl Captures {
         let stdout = self.0[0].finished()?;
         let stderr = self.0[1].finished()?;
         Ok(stdout && stderr)
+    }
+
+    pub(super) fn wait_until(&self, deadline: Instant) -> io::Result<bool> {
+        for capture in &self.0 {
+            if !capture.wait_until(deadline)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn check(&self) -> io::Result<()> {
@@ -161,6 +198,41 @@ impl Capture {
         if handle.as_ref().is_some_and(|thread| !thread.is_finished()) {
             return Ok(false);
         }
+        if let Some(thread) = handle.take()
+            && thread.join().is_err()
+        {
+            self.result.store(THREAD_FAILED, Ordering::Release);
+        }
+        drop(handle);
+        Ok(true)
+    }
+
+    fn wait_until(&self, deadline: Instant) -> io::Result<bool> {
+        {
+            let (lock, signal) = &*self.done;
+            let mut finished = lock
+                .lock()
+                .map_err(|_| io::Error::other("sandbox capture completion lock was poisoned"))?;
+            while !*finished {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Ok(false);
+                };
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                let (guard, timeout) = signal.wait_timeout(finished, remaining).map_err(|_| {
+                    io::Error::other("sandbox capture completion lock was poisoned")
+                })?;
+                finished = guard;
+                if timeout.timed_out() && !*finished {
+                    return Ok(false);
+                }
+            }
+        }
+        let mut handle = self
+            .thread
+            .lock()
+            .map_err(|_| io::Error::other("sandbox capture ownership was poisoned"))?;
         if let Some(thread) = handle.take()
             && thread.join().is_err()
         {
@@ -253,26 +325,28 @@ mod tests {
 
     #[test]
     fn sandbox_capture_observes_panicked_drain_before_worker_exit() -> io::Result<()> {
-        let thread = thread::spawn(|| {
+        let done = DoneSignal::new();
+        let done_worker = Arc::clone(&done);
+        let thread = thread::spawn(move || {
+            let _signal = DoneSignal(done_worker);
             std::panic::resume_unwind(Box::new("synthetic capture panic"));
         });
         let captures = Captures([
             Capture {
                 result: Arc::new(AtomicU8::new(PENDING)),
+                done,
                 thread: Mutex::new(Some(thread)),
                 label: "stdout",
             },
             Capture {
                 result: Arc::new(AtomicU8::new(COMPLETE)),
+                done: Arc::new((Mutex::new(true), Condvar::new())),
                 thread: Mutex::new(None),
                 label: "stderr",
             },
         ]);
-        let started = std::time::Instant::now();
-        while captures.check().is_ok() {
-            assert!(started.elapsed() < std::time::Duration::from_secs(5));
-            thread::sleep(std::time::Duration::from_millis(1));
-        }
+        assert!(captures.wait_until(Instant::now() + std::time::Duration::from_secs(5))?);
+        assert!(captures.check().is_err());
         assert!(captures.finished()?);
         assert_eq!(captures.0[0].result.load(Ordering::Acquire), THREAD_FAILED);
         Ok(())

@@ -303,15 +303,31 @@ fn within(path: &Path, root: &Path) -> io::Result<bool> {
 }
 
 fn windows_directory() -> io::Result<PathBuf> {
-    let mut buffer = vec![0_u16; 32_768];
-    // SAFETY: The writable UTF-16 allocation has exactly the supplied capacity.
-    let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), 32_768) };
+    let mut stack = [0_u16; 260];
+    // SAFETY: The stack UTF-16 buffer has its advertised element capacity.
+    let length = unsafe { GetWindowsDirectoryW(stack.as_mut_ptr(), 260) };
     let length =
         usize::try_from(length).map_err(|_| invalid("Windows directory length overflow"))?;
-    if length == 0 || length >= buffer.len() {
+    if length == 0 {
         return Err(io::Error::last_os_error());
     }
-    let windows = PathBuf::from(OsString::from_wide(&buffer[..length]));
+    let windows = if length < stack.len() {
+        PathBuf::from(OsString::from_wide(&stack[..length]))
+    } else if length <= 32_768 {
+        let mut buffer = vec![0_u16; length];
+        let capacity = u32::try_from(buffer.len())
+            .map_err(|_| invalid("Windows directory length overflow"))?;
+        // SAFETY: The writable UTF-16 allocation has exactly the supplied capacity.
+        let actual = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), capacity) };
+        let actual =
+            usize::try_from(actual).map_err(|_| invalid("Windows directory length overflow"))?;
+        if actual == 0 || actual >= buffer.len() {
+            return Err(io::Error::last_os_error());
+        }
+        PathBuf::from(OsString::from_wide(&buffer[..actual]))
+    } else {
+        return Err(invalid("Windows directory exceeds its bound"));
+    };
     validate_local_path(&windows)?;
     Ok(windows)
 }

@@ -2,17 +2,16 @@
 
 use std::ffi::{CStr, FromBytesUntilNulError, OsString};
 use std::io;
-use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::windows::ffi::OsStringExt as _;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 
 use ash::vk::{self, Handle as _};
 
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
-};
+use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
+use super::library::SystemLibrary;
 use crate::{
     VulkanAdapter, VulkanInstanceModules, VulkanInventory, VulkanModuleFileCandidate,
     VulkanQueryFailure, WindowsGraphicsAdapterCount,
@@ -127,18 +126,29 @@ fn module_snapshot(
     if capture_paths {
         for index in file_candidate_indices(before, &names) {
             let (name, module) = &names[index];
-            let mut buffer = vec![0_u16; 32768];
+            let mut stack = [0_u16; 260];
             // SAFETY: The process/opaque module handle came from this snapshot;
             // Win32 validates unload races. The buffer has its advertised size.
             let length =
-                unsafe { K32GetModuleFileNameExW(process, *module, buffer.as_mut_ptr(), 32768) };
-            let path = usize::try_from(length)
-                .ok()
-                .filter(|length| *length > 0 && *length < buffer.len())
-                .and_then(|length| {
-                    let path = PathBuf::from(OsString::from_wide(&buffer[..length]));
-                    path.is_absolute().then_some(path)
-                });
+                unsafe { K32GetModuleFileNameExW(process, *module, stack.as_mut_ptr(), 260) };
+            let path = usize::try_from(length).ok().and_then(|length| {
+                let path = if length > 0 && length < stack.len() {
+                    Some(PathBuf::from(OsString::from_wide(&stack[..length])))
+                } else if length >= stack.len() - 1 {
+                    let mut heap = vec![0_u16; 32768];
+                    // SAFETY: Same live snapshot module handle and bounded 32768-unit heap buffer.
+                    let full = unsafe {
+                        K32GetModuleFileNameExW(process, *module, heap.as_mut_ptr(), 32768)
+                    };
+                    usize::try_from(full)
+                        .ok()
+                        .filter(|full| *full > 0 && *full < heap.len())
+                        .map(|full| PathBuf::from(OsString::from_wide(&heap[..full])))
+                } else {
+                    None
+                };
+                path.filter(|path| path.is_absolute())
+            });
             candidates.push(VulkanModuleFileCandidate {
                 name: name.clone(),
                 path,
@@ -175,57 +185,18 @@ fn text(c_str: Result<&CStr, FromBytesUntilNulError>) -> io::Result<String> {
     Ok(text.to_owned())
 }
 
-struct Library(HMODULE);
-
-impl Drop for Library {
-    fn drop(&mut self) {
-        // SAFETY: This wrapper uniquely owns the LoadLibraryExW module handle and
-        // drops only after any Vulkan instance and its function pointers are gone.
-        let _ = unsafe { FreeLibrary(self.0) };
-    }
-}
-
 struct Loader {
     entry: ash::Entry,
-    _library: Library,
+    _library: SystemLibrary,
 }
 
 impl Loader {
     fn load() -> io::Result<Self> {
-        let mut buffer = vec![0_u16; 32768];
-        // SAFETY: The writable buffer has the advertised size and remains live for
-        // the call. GetSystemDirectoryW retains no pointers.
-        let count = unsafe {
-            windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
-                buffer.as_mut_ptr(),
-                32768,
-            )
-        };
-        let count = usize::try_from(count).map_err(|_| invalid())?;
-        if count == 0 || count >= buffer.len() {
-            return Err(io::Error::last_os_error());
-        }
-        let path = PathBuf::from(OsString::from_wide(&buffer[..count])).join("vulkan-1.dll");
-        let wide_path: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: An absolute NUL-terminated system-directory path is selected,
-        // with search flags restricting dependencies to the loader's directory and
-        // System32. Installed graphics loader/ICDs remain the operator trust boundary.
-        let handle = unsafe {
-            LoadLibraryExW(
-                wide_path.as_ptr(),
-                null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
-        if handle.is_null() {
-            return Err(io::Error::other("system Vulkan loader unavailable"));
-        }
-        let library = Library(handle);
-        // SAFETY: The module is owned and live; the fixed Vulkan loader symbol is
-        // NUL-terminated and used only while `library` remains live.
-        let proc_addr =
-            unsafe { GetProcAddress(library.0, c"vkGetInstanceProcAddr".as_ptr().cast()) }
-                .ok_or_else(|| io::Error::other("system Vulkan loader unavailable"))?;
+        let library =
+            SystemLibrary::load_system32("vulkan-1.dll", "system Vulkan loader unavailable")?;
+        let proc_addr = library
+            .symbol(c"vkGetInstanceProcAddr")
+            .map_err(|_| io::Error::other("system Vulkan loader unavailable"))?;
         // SAFETY: `vkGetInstanceProcAddr` has the exact Khronos Vulkan 1.0 ABI.
         let get_instance_proc_addr = unsafe {
             std::mem::transmute::<unsafe extern "system" fn() -> isize, vk::PFN_vkGetInstanceProcAddr>(

@@ -28,12 +28,9 @@ impl Drop for Key {
     }
 }
 fn text(buffer: &[u16]) -> io::Result<String> {
-    let end = buffer
-        .iter()
-        .position(|unit| *unit == 0)
-        .ok_or_else(|| super::invalid("Unterminated device property."))?;
-    let text = String::from_utf16(&buffer[..end])
-        .map_err(|_| super::invalid("Invalid device property UTF-16."))?;
+    let units = super::utf16_z(buffer, "Unterminated device property.")?;
+    let text =
+        String::from_utf16(units).map_err(|_| super::invalid("Invalid device property UTF-16."))?;
     if text.chars().any(char::is_control) {
         return Err(super::invalid(
             "Device property contains control characters.",

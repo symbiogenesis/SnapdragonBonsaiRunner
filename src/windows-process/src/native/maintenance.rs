@@ -1,14 +1,10 @@
 //! Small operating-system observations for native maintenance commands.
 
 use std::io;
-use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, SYSTEMTIME};
+use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::SystemInformation::GetSystemTime;
 
@@ -37,43 +33,21 @@ pub(crate) fn has_running_process(names: &[&str]) -> io::Result<bool> {
             "Process-name selection exceeds its fixed bound.",
         ));
     }
-    // SAFETY: A process-only snapshot takes no caller pointers and returns a fresh handle.
-    let snapshot = super::owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
-    let mut entry = PROCESSENTRY32W {
-        dwSize: u32::try_from(size_of::<PROCESSENTRY32W>())
-            .map_err(|_| super::invalid("Process entry size overflow."))?,
-        ..PROCESSENTRY32W::default()
-    };
-    // SAFETY: snapshot remains owned; entry is correctly sized and writable.
-    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &raw mut entry) };
-    let mut count = 0;
-    while found != 0 {
-        count += 1;
-        if count > 16_384 {
-            return Err(super::invalid("Process inventory exceeds its fixed bound."));
-        }
-        let end = entry
-            .szExeFile
-            .iter()
-            .position(|unit| *unit == 0)
-            .ok_or_else(|| super::invalid("Unterminated process name."))?;
-        let exe_units = &entry.szExeFile[..end];
+    let mut matched = false;
+    super::for_each_process("Process inventory exceeds its fixed bound.", |entry| {
+        let exe_units = super::utf16_z(&entry.szExeFile, "Unterminated process name.")?;
         if names.iter().any(|selected| {
             exe_units.len() == selected.len()
                 && exe_units.iter().zip(selected.bytes()).all(|(&unit, byte)| {
                     u8::try_from(unit).is_ok_and(|ascii| ascii.eq_ignore_ascii_case(&byte))
                 })
         }) {
-            return Ok(true);
+            matched = true;
+            return Ok(false);
         }
-        // SAFETY: The same owned snapshot and initialized entry remain live for the next record.
-        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &raw mut entry) };
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() != i32::try_from(ERROR_NO_MORE_FILES).ok() {
-        return Err(error);
-    }
-    Ok(false)
+        Ok(true)
+    })?;
+    Ok(matched)
 }
 
 pub(crate) fn current_creation_time() -> io::Result<u64> {

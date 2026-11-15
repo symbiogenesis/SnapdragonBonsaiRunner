@@ -1,5 +1,6 @@
 //! Fixed native startup failure UI, independent of graphics initialization.
 
+use std::borrow::Cow;
 use std::ptr;
 use windows_sys::{
     Win32::{
@@ -40,13 +41,17 @@ fn terminated(text: &str) -> Vec<u16> {
         .collect()
 }
 
-fn preview(message: &str, limit: usize) -> String {
-    let mut characters = message.chars();
-    let mut text: String = characters.by_ref().take(limit).collect();
-    if characters.next().is_some() {
-        text.push_str("\n\n[Preview shortened. Copy error includes the complete message.]");
+fn preview(message: &str, limit: usize) -> Cow<'_, str> {
+    const SUFFIX: &str = "\n\n[Preview shortened. Copy error includes the complete message.]";
+    match message.char_indices().nth(limit) {
+        Some((end, _)) => {
+            let mut text = String::with_capacity(end + SUFFIX.len());
+            text.push_str(&message[..end]);
+            text.push_str(SUFFIX);
+            Cow::Owned(text)
+        }
+        None => Cow::Borrowed(message),
     }
-    text
 }
 
 pub(super) fn show(message: &str) {
@@ -55,7 +60,7 @@ pub(super) fn show(message: &str) {
         preview: terminated(&preview(message, PREVIEW_CHARS)),
     };
     let template = template();
-    let parameter = isize::try_from(ptr::from_ref(&contents).expose_provenance());
+    let parameter = isize::try_from((&raw const contents).expose_provenance());
     // SAFETY: A null name requests this process's module without transferring ownership.
     let instance = unsafe { GetModuleHandleW(ptr::null()) };
     let result = parameter.map_or(-1, |parameter| {
@@ -412,5 +417,9 @@ mod tests {
         assert_eq!(full.iter().filter(|unit| **unit == 0).count(), 1);
         assert!(String::from_utf16_lossy(&full).ends_with("\\0tail\0"));
         assert_eq!(preview("Short error", PREVIEW_CHARS), "Short error");
+        assert!(matches!(
+            preview("Short error", PREVIEW_CHARS),
+            Cow::Borrowed("Short error")
+        ));
     }
 }

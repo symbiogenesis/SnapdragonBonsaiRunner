@@ -12,13 +12,13 @@ use std::os::windows::io::{
     OwnedHandle, OwnedSocket, RawHandle,
 };
 use std::path::Path;
-use std::ptr::{self, null, null_mut};
+use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES,
+    FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
@@ -33,14 +33,17 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::ProcessStatus::{
@@ -72,6 +75,7 @@ mod host;
 mod isa;
 #[cfg(feature = "test-probe")]
 mod job_probe;
+mod library;
 mod opencl;
 mod output;
 mod power;
@@ -80,6 +84,85 @@ pub(super) mod presentation;
 pub(super) mod replacement;
 pub(super) mod signature;
 mod vulkan;
+
+pub(super) fn utf16_z<'a>(units: &'a [u16], unterminated: &'static str) -> io::Result<&'a [u16]> {
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or_else(|| invalid(unterminated))?;
+    Ok(&units[..end])
+}
+
+pub(super) fn for_each_process(
+    limit_message: &'static str,
+    mut visitor: impl FnMut(&PROCESSENTRY32W) -> io::Result<bool>,
+) -> io::Result<()> {
+    // SAFETY: A process-only snapshot takes no caller pointers and returns a fresh handle.
+    let snapshot = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: win_size::<PROCESSENTRY32W>(),
+        ..PROCESSENTRY32W::default()
+    };
+    // SAFETY: snapshot remains owned; entry is correctly sized and writable.
+    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &raw mut entry) };
+    let mut count = 0;
+    while found != 0 {
+        count += 1;
+        if count > 16_384 {
+            return Err(invalid(limit_message));
+        }
+        if !visitor(&entry)? {
+            return Ok(());
+        }
+        // SAFETY: The same owned snapshot and initialized entry remain live.
+        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &raw mut entry) };
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != i32::try_from(ERROR_NO_MORE_FILES).ok() {
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(super) const fn job_process_list_header_units() -> usize {
+    const HEADER_BYTES: usize =
+        std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+    HEADER_BYTES.div_ceil(size_of::<usize>())
+}
+
+pub(super) fn decode_job_process_list_header(storage: &[usize]) -> (u32, u32) {
+    const HEADER_BYTES: usize =
+        std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+    const ASSIGNED_AT: usize =
+        std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, NumberOfAssignedProcesses);
+    const LISTED_AT: usize =
+        std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, NumberOfProcessIdsInList);
+    const {
+        assert!(HEADER_BYTES == 8);
+        assert!(ASSIGNED_AT + size_of::<u32>() <= HEADER_BYTES);
+        assert!(LISTED_AT + size_of::<u32>() <= HEADER_BYTES);
+    }
+    let mut header = [0_u8; HEADER_BYTES];
+    for (slot, chunk) in storage
+        .iter()
+        .zip(header.as_chunks_mut::<{ size_of::<usize>() }>().0)
+    {
+        *chunk = slot.to_ne_bytes();
+    }
+    let assigned = u32::from_ne_bytes([
+        header[ASSIGNED_AT],
+        header[ASSIGNED_AT + 1],
+        header[ASSIGNED_AT + 2],
+        header[ASSIGNED_AT + 3],
+    ]);
+    let listed = u32::from_ne_bytes([
+        header[LISTED_AT],
+        header[LISTED_AT + 1],
+        header[LISTED_AT + 2],
+        header[LISTED_AT + 3],
+    ]);
+    (assigned, listed)
+}
 
 pub(super) fn vulkan_inventory() -> io::Result<crate::VulkanInventory> {
     vulkan::query()
@@ -529,7 +612,7 @@ impl NativeProcess {
                     | CREATE_UNICODE_ENVIRONMENT,
                 environment.map_or(null(), |block| block.as_ptr().cast()),
                 directory.as_ptr(),
-                ptr::from_ref(&startup.StartupInfo),
+                &raw const startup.StartupInfo,
                 &raw mut info,
             )
         })?;
@@ -591,17 +674,22 @@ impl NativeProcess {
         let Some(code) = self.root_wait_for_exit(timeout)? else {
             return Ok(None);
         };
-        while !self.captures_finished()? {
-            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+        if let Some(captures) = &self.captures {
+            let Some(deadline) = started.checked_add(timeout) else {
                 return Ok(None);
             };
-            if remaining.is_zero() {
+            if !captures.wait_until(deadline)? {
                 return Ok(None);
             }
-            std::thread::sleep(remaining.min(Duration::from_millis(1)));
         }
         self.check_captures()?;
         Ok(Some(code))
+    }
+
+    fn captures_finished(&self) -> io::Result<bool> {
+        self.captures
+            .as_ref()
+            .map_or(Ok(true), output::Captures::finished)
     }
 
     fn check_captures(&self) -> io::Result<()> {
@@ -616,12 +704,6 @@ impl NativeProcess {
             return Err(io::Error::new(error.kind(), format!("{error}; {status}")));
         }
         Ok(())
-    }
-
-    fn captures_finished(&self) -> io::Result<bool> {
-        self.captures
-            .as_ref()
-            .map_or(Ok(true), output::Captures::finished)
     }
 
     fn root_wait_for_exit(&self, timeout: Duration) -> io::Result<Option<u32>> {
@@ -652,7 +734,7 @@ impl NativeProcess {
             QueryInformationJobObject(
                 self.job.as_raw_handle(),
                 JobObjectBasicAccountingInformation,
-                ptr::from_mut(&mut accounting).cast(),
+                (&raw mut accounting).cast(),
                 win_size::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(),
                 null_mut(),
             )
@@ -701,15 +783,15 @@ impl NativeProcess {
 
     fn members(&self) -> io::Result<Vec<OwnedHandle>> {
         const MAX_MEMBERS: usize = 65_536;
-        let header_units = 8_usize.div_ceil(size_of::<usize>());
+        let header_units = job_process_list_header_units();
         let mut capacity = 64;
         for _ in 0..8 {
             let mut storage = vec![0_usize; header_units + capacity];
             let bytes = u32::try_from(size_of_val(storage.as_slice()))
                 .map_err(|_| invalid("Job process list is too large"))?;
-            // SAFETY: The usize-aligned allocation contains the two u32 header
-            // fields and `capacity` pointer-sized IDs. The class and exact
-            // writable byte length agree, and the Job handle remains owned.
+            // SAFETY: The usize-aligned allocation contains the
+            // JOBOBJECT_BASIC_PROCESS_ID_LIST header and `capacity` pointer-sized
+            // IDs. The class, writable byte length, and live Job handle agree.
             let result = unsafe {
                 QueryInformationJobObject(
                     self.job.as_raw_handle(),
@@ -727,25 +809,7 @@ impl NativeProcess {
                 capacity = (capacity * 2).min(MAX_MEMBERS);
                 continue;
             }
-            let mut header_bytes = [0_u8; 8];
-            for (slot, chunk) in storage[..header_units]
-                .iter()
-                .zip(header_bytes.as_chunks_mut::<{ size_of::<usize>() }>().0)
-            {
-                *chunk = slot.to_ne_bytes();
-            }
-            let assigned = u32::from_ne_bytes([
-                header_bytes[0],
-                header_bytes[1],
-                header_bytes[2],
-                header_bytes[3],
-            ]);
-            let listed = u32::from_ne_bytes([
-                header_bytes[4],
-                header_bytes[5],
-                header_bytes[6],
-                header_bytes[7],
-            ]);
+            let (assigned, listed) = decode_job_process_list_header(&storage);
             let assigned =
                 usize::try_from(assigned).map_err(|_| invalid("Job process count overflow"))?;
             let listed =
@@ -812,7 +876,7 @@ impl NativeProcess {
             QueryInformationJobObject(
                 self.job.as_raw_handle(),
                 JobObjectExtendedLimitInformation,
-                ptr::from_mut(&mut limits).cast(),
+                (&raw mut limits).cast(),
                 win_size::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
                 null_mut(),
             )
@@ -830,7 +894,7 @@ impl NativeProcess {
         check(unsafe {
             K32GetProcessMemoryInfo(
                 self.process.as_raw_handle(),
-                ptr::from_mut(&mut counters).cast(),
+                (&raw mut counters).cast(),
                 win_size::<PROCESS_MEMORY_COUNTERS_EX>(),
             )
         })?;
@@ -870,7 +934,7 @@ fn require_mitigation(
         GetProcessMitigationPolicy(
             process.as_raw_handle(),
             policy,
-            ptr::from_mut(&mut flags).cast(),
+            (&raw mut flags).cast(),
             size_of::<u32>(),
         )
     })?;
@@ -959,19 +1023,19 @@ fn terminate_failed_start(
     }
     // Closing the parent's child endpoints precedes this call. Captures then
     // drain through EOF and join using the remainder of the same allowance.
-    while let Some(captures) = captures
-        && !captures.finished()?
-    {
-        let remaining = Duration::from_secs(10)
-            .checked_sub(started.elapsed())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "failed worker capture cleanup timed out",
-                )
-            })?;
-        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    if let Some(captures) = captures {
+        let Some(deadline) = started.checked_add(Duration::from_secs(10)) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "failed worker capture cleanup timed out",
+            ));
+        };
+        if !captures.wait_until(deadline)? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "failed worker capture cleanup timed out",
+            ));
+        }
     }
     Ok(())
 }
@@ -1051,7 +1115,7 @@ pub(super) fn require_exclusive_address(socket: &impl AsSocket) -> io::Result<()
             handle,
             SOL_SOCKET,
             SO_EXCLUSIVEADDRUSE,
-            ptr::from_ref(&enabled).cast(),
+            (&raw const enabled).cast(),
             i32::try_from(size_of_val(&enabled))
                 .map_err(|_| io::Error::other("socket option size overflow"))?,
         )
@@ -1115,7 +1179,7 @@ pub(super) fn bind_exclusive_loopback_listener(
     if unsafe {
         bind(
             raw,
-            ptr::from_ref(&address).cast(),
+            (&raw const address).cast(),
             i32::try_from(size_of_val(&address))
                 .map_err(|_| io::Error::other("socket address size overflow"))?,
         )
@@ -1369,7 +1433,7 @@ fn launch_job(spec: &LaunchSpec<'_>) -> io::Result<OwnedHandle> {
         SetInformationJobObject(
             job.as_raw_handle(),
             JobObjectExtendedLimitInformation,
-            ptr::from_ref(&limits).cast(),
+            (&raw const limits).cast(),
             win_size::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
         )
     })?;
@@ -1495,7 +1559,7 @@ impl CreationAttributes {
         if let Some(mitigations) = value.mitigations.as_ref() {
             value.update(
                 PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
-                ptr::from_ref(mitigations.as_ref()).cast(),
+                (&raw const **mitigations).cast(),
                 size_of_val(mitigations.as_ref()),
             )?;
         }
@@ -1504,7 +1568,7 @@ impl CreationAttributes {
             // The value and owning PSEC handle stay live through CreateProcessW.
             value.update(
                 0x0023 | 0x0002_0000,
-                ptr::from_ref(environment.as_ref()).cast(),
+                (&raw const **environment).cast(),
                 size_of::<HANDLE>(),
             )?;
         }
@@ -1591,7 +1655,7 @@ mod tests {
                 handle,
                 SOL_SOCKET,
                 SO_EXCLUSIVEADDRUSE,
-                ptr::from_mut(&mut enabled).cast(),
+                (&raw mut enabled).cast(),
                 &raw mut bytes,
             )
         };

@@ -27,17 +27,6 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 
 pub(crate) fn verify(file: &File, path: &Path) -> io::Result<crate::AuthenticodeSigner> {
-    if !path.is_absolute() || path.as_os_str().encode_wide().any(|unit| unit == 0) {
-        return Err(super::invalid(
-            "Signature verification requires an absolute path.",
-        ));
-    }
-    // Installed catalog membership takes precedence, matching Windows' signature
-    // observation boundary for driver files that have no embedded signature.
-    catalog::verify(file, path).or_else(|_| embedded(file, path))
-}
-
-fn embedded(file: &File, path: &Path) -> io::Result<crate::AuthenticodeSigner> {
     let mut wide: Vec<_> = path.as_os_str().encode_wide().collect();
     if !path.is_absolute() || wide.contains(&0) {
         return Err(super::invalid(
@@ -45,6 +34,50 @@ fn embedded(file: &File, path: &Path) -> io::Result<crate::AuthenticodeSigner> {
         ));
     }
     wide.push(0);
+    // Installed catalog membership takes precedence, matching Windows' signature
+    // observation boundary for driver files that have no embedded signature.
+    catalog::verify(file, &wide).or_else(|_| embedded(file, &wide))
+}
+
+pub(super) fn verify_wintrust(
+    choice: u32,
+    subject: WINTRUST_DATA_0,
+    rejected_message: &'static str,
+    close_message: &'static str,
+) -> io::Result<crate::AuthenticodeSigner> {
+    let mut data = WINTRUST_DATA {
+        cbStruct: u32::try_from(size_of::<WINTRUST_DATA>())
+            .map_err(|_| super::invalid("Trust structure overflow."))?,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: choice,
+        Anonymous: subject,
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+        ..WINTRUST_DATA::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    // SAFETY: Caller keeps the selected subject and backing buffers live through
+    // synchronous verification and matching provider-state closure.
+    let status =
+        unsafe { WinVerifyTrust(ptr::null_mut(), &raw mut action, (&raw mut data).cast()) };
+    let result = if status == 0 {
+        signer(&data)
+    } else {
+        Err(super::invalid(rejected_message))
+    };
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    // SAFETY: Matching provider state and backing buffers remain live.
+    // Closure is mandatory even after a rejected verification.
+    let closed =
+        unsafe { WinVerifyTrust(ptr::null_mut(), &raw mut action, (&raw mut data).cast()) };
+    if closed != 0 {
+        return Err(super::invalid(close_message));
+    }
+    result
+}
+
+fn embedded(file: &File, wide: &[u16]) -> io::Result<crate::AuthenticodeSigner> {
     let mut info = WINTRUST_FILE_INFO {
         cbStruct: u32::try_from(size_of::<WINTRUST_FILE_INFO>())
             .map_err(|_| super::invalid("Trust structure overflow."))?,
@@ -52,38 +85,14 @@ fn embedded(file: &File, path: &Path) -> io::Result<crate::AuthenticodeSigner> {
         hFile: file.as_raw_handle(),
         pgKnownSubject: ptr::null_mut(),
     };
-    let mut data = WINTRUST_DATA {
-        cbStruct: u32::try_from(size_of::<WINTRUST_DATA>())
-            .map_err(|_| super::invalid("Trust structure overflow."))?,
-        dwUIChoice: WTD_UI_NONE,
-        fdwRevocationChecks: WTD_REVOKE_NONE,
-        dwUnionChoice: WTD_CHOICE_FILE,
-        Anonymous: WINTRUST_DATA_0 {
+    verify_wintrust(
+        WTD_CHOICE_FILE,
+        WINTRUST_DATA_0 {
             pFile: &raw mut info,
         },
-        dwStateAction: WTD_STATEACTION_VERIFY,
-        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
-        ..WINTRUST_DATA::default()
-    };
-    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    // SAFETY: data, info, UTF-16 path and the borrowed file remain live throughout
-    // verification and state closure. UI and network retrieval are disabled.
-    let status =
-        unsafe { WinVerifyTrust(ptr::null_mut(), &raw mut action, (&raw mut data).cast()) };
-    let result = if status == 0 {
-        signer(&data)
-    } else {
-        Err(super::invalid("Authenticode trust verification failed."))
-    };
-    data.dwStateAction = WTD_STATEACTION_CLOSE;
-    // SAFETY: The matching provider state and all input allocations are still live.
-    // Closure is mandatory even after a rejected verification.
-    let closed =
-        unsafe { WinVerifyTrust(ptr::null_mut(), &raw mut action, (&raw mut data).cast()) };
-    if closed != 0 {
-        return Err(super::invalid("Authenticode provider state did not close."));
-    }
-    result
+        "Authenticode trust verification failed.",
+        "Authenticode provider state did not close.",
+    )
 }
 
 fn signer(data: &WINTRUST_DATA) -> io::Result<crate::AuthenticodeSigner> {
@@ -187,12 +196,7 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
                 "Process module inventory exceeds its bound.",
             ));
         }
-        let name_end = entry
-            .szModule
-            .iter()
-            .position(|unit| *unit == 0)
-            .ok_or_else(|| super::invalid("Unterminated module name."))?;
-        let module_units = &entry.szModule[..name_end];
+        let module_units = super::utf16_z(&entry.szModule, "Unterminated module name.")?;
         let matches_basename = if basename.is_ascii() {
             module_units.len() == basename.len()
                 && module_units
@@ -205,12 +209,8 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
             String::from_utf16_lossy(module_units).eq_ignore_ascii_case(basename)
         };
         if matches_basename {
-            let path_end = entry
-                .szExePath
-                .iter()
-                .position(|unit| *unit == 0)
-                .ok_or_else(|| super::invalid("Unterminated module path."))?;
-            paths.push(std::ffi::OsString::from_wide(&entry.szExePath[..path_end]).into());
+            let path_units = super::utf16_z(&entry.szExePath, "Unterminated module path.")?;
+            paths.push(std::ffi::OsString::from_wide(path_units).into());
         }
         // SAFETY: The same snapshot and initialized writable record remain live.
         found = unsafe { Module32NextW(snapshot.as_raw_handle(), &raw mut entry) };

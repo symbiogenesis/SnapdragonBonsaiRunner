@@ -4,9 +4,7 @@
 
 use std::fs::File;
 use std::io;
-use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::AsRawHandle as _;
-use std::path::Path;
 use std::ptr;
 use windows_sys::Win32::Security::Cryptography::Catalog::{
     CATALOG_INFO, CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2,
@@ -14,10 +12,7 @@ use windows_sys::Win32::Security::Cryptography::Catalog::{
     CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext,
 };
 use windows_sys::Win32::Security::WinTrust::{
-    DRIVER_ACTION_VERIFY, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_CATALOG_INFO, WINTRUST_DATA,
-    WINTRUST_DATA_0, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_CATALOG,
-    WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
-    WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
+    DRIVER_ACTION_VERIFY, WINTRUST_CATALOG_INFO, WINTRUST_DATA_0, WTD_CHOICE_CATALOG,
 };
 
 struct Admin(isize);
@@ -38,11 +33,7 @@ impl Drop for Catalog<'_> {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep catalog verification and provider state closure in one auditable lifetime scope."
-)]
-pub(super) fn verify(file: &File, path: &Path) -> io::Result<crate::AuthenticodeSigner> {
+pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::AuthenticodeSigner> {
     let mut admin = 0;
     let subsystem = DRIVER_ACTION_VERIFY;
     let algorithm = windows_sys::core::w!("SHA256");
@@ -105,7 +96,6 @@ pub(super) fn verify(file: &File, path: &Path) -> io::Result<crate::Authenticode
         .map(|part| u16::from(b"0123456789ABCDEF"[usize::from(part)]))
         .collect();
     member.push(0);
-    let filename: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
     let mut catalog_info = WINTRUST_CATALOG_INFO {
         cbStruct: u32::try_from(size_of::<WINTRUST_CATALOG_INFO>())
             .map_err(|_| super::super::invalid("Catalog trust structure overflow."))?,
@@ -118,39 +108,12 @@ pub(super) fn verify(file: &File, path: &Path) -> io::Result<crate::Authenticode
         hCatAdmin: admin.0,
         ..WINTRUST_CATALOG_INFO::default()
     };
-    let mut data = WINTRUST_DATA {
-        cbStruct: u32::try_from(size_of::<WINTRUST_DATA>())
-            .map_err(|_| super::super::invalid("Catalog trust structure overflow."))?,
-        dwUIChoice: WTD_UI_NONE,
-        fdwRevocationChecks: WTD_REVOKE_NONE,
-        dwUnionChoice: WTD_CHOICE_CATALOG,
-        Anonymous: WINTRUST_DATA_0 {
+    super::verify_wintrust(
+        WTD_CHOICE_CATALOG,
+        WINTRUST_DATA_0 {
             pCatalog: &raw mut catalog_info,
         },
-        dwStateAction: WTD_STATEACTION_VERIFY,
-        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
-        ..WINTRUST_DATA::default()
-    };
-    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    // SAFETY: Every input buffer, administrator, catalog and retained file remains
-    // live through synchronous verification and the matching provider-state close.
-    let status =
-        unsafe { WinVerifyTrust(ptr::null_mut(), &raw mut action, (&raw mut data).cast()) };
-    let result = if status == 0 {
-        super::signer(&data)
-    } else {
-        Err(super::super::invalid(
-            "Installed catalog trust or membership was rejected.",
-        ))
-    };
-    data.dwStateAction = WTD_STATEACTION_CLOSE;
-    // SAFETY: The original trust state and all backing buffers are still live.
-    let closed =
-        unsafe { WinVerifyTrust(ptr::null_mut(), &raw mut action, (&raw mut data).cast()) };
-    if closed != 0 {
-        return Err(super::super::invalid(
-            "Installed catalog trust state did not close.",
-        ));
-    }
-    result
+        "Installed catalog trust or membership was rejected.",
+        "Installed catalog trust state did not close.",
+    )
 }
