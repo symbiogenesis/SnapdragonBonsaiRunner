@@ -824,7 +824,11 @@ owner's index or working files. Unstaged fixes cannot conceal a broken commit.
 
 Pushes with a valid checker resolve its ordered input identities in one Git command
 and extract only the eight committed checking-policy scripts and their support.
-Preparation and automatic recovery extract the complete committed build source.
+Preparation and automatic recovery extract the committed source and synchronize it
+under `<target>-source` (coordinated via an exclusive `.bonsai-source.lock` file lock)
+so Cargo paths and unchanged-file timestamps and fingerprints remain warm across runs;
+outgoing tip snapshots passed to `push-sanity` synchronize into `<target>-source`
+for the same content-fingerprint and incremental Cargo cache reuse.
 The native checker groups each tip's selected PowerShell calls into one supervised
 process, invoking each trusted script in a child scope and rejecting a failed call before
 starting another. Source-language scanning filters whole files with the existing
@@ -883,10 +887,12 @@ receipt admission rejects array-valued identity or digest fields, and every help
 is verified before execution. The recovery helper's independent
 identity covers the root manifest, lockfile, compiler pin, `.cargo` and
 `src/windows-process`, so ordinary `tools/ci` changes can invalidate the checker
-without invalidating its recovery supervisor. Explicit preparation invalidates
-the previous receipts and makes two target-specific `cargo rustc` calls, one for
-each binary, with a fresh invocation metadata nonce. This forces binary
-recompilation and relinking while preserving dependency and library artifacts.
+without invalidating its recovery supervisor. Explicit preparation synchronizes
+`<target>-source` and makes two target-specific `cargo rustc` calls, one for
+each binary, with a fresh invocation metadata nonce and content-fingerprint
+caching enabled, without duplicating workspace check builds that `push-sanity`
+runs per outgoing tip. This forces binary recompilation and relinking while
+preserving dependency, unchanged-source timestamp, and library artifacts.
 A failed build cannot admit previous helper bytes. An explicit preparation's
 caller must enforce the declared source-build allowance.
 

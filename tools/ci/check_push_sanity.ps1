@@ -22,6 +22,121 @@ function Test-PushHelperReceipt([string]$ReceiptPath, [string]$Image, [string]$S
             $receipt.Sha256 -ceq (Get-FileHash -LiteralPath $Image -Algorithm SHA256).Hash.ToLowerInvariant()
     } catch { return $false }
 }
+function Lock-PushSourceCache([string]$Target, [Diagnostics.Stopwatch]$Started) {
+    [void][IO.Directory]::CreateDirectory($Target)
+    $lockPath = Join-Path $Target '.bonsai-source.lock'
+    while ($true) {
+        try {
+            return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        } catch [IO.IOException] {
+            if ($Started.Elapsed.TotalSeconds -ge 270) {
+                throw 'Push blocked: timed out waiting for the source cache lock.'
+            }
+            [Threading.Thread]::Sleep(10)
+        }
+    }
+}
+function Remove-PushCacheEntry([IO.FileSystemInfo]$Entry) {
+    if ($Entry.Attributes -band [IO.FileAttributes]::ReadOnly) {
+        $Entry.Attributes = $Entry.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
+    }
+    if ($Entry -is [IO.DirectoryInfo] -and -not ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        $stack = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
+        $dirs = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
+        $stack.Push($Entry)
+        while ($stack.Count -gt 0) {
+            $dir = $stack.Pop()
+            $dirs.Push($dir)
+            foreach ($child in $dir.EnumerateFileSystemInfos()) {
+                if ($child.Attributes -band [IO.FileAttributes]::ReadOnly) {
+                    $child.Attributes = $child.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
+                }
+                if ($child -is [IO.DirectoryInfo] -and -not ($child.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    $stack.Push($child)
+                } else {
+                    $child.Delete()
+                }
+            }
+        }
+        while ($dirs.Count -gt 0) {
+            $dirs.Pop().Delete()
+        }
+    } else {
+        $Entry.Delete()
+    }
+}
+function Sync-PushSourceTree([string]$Source, [string]$Destination) {
+    $srcRoot = [IO.DirectoryInfo]::new($Source)
+    if ($srcRoot.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "Push blocked: source tree root '$Source' cannot be a symlink."
+    }
+    if ([IO.File]::Exists($Destination)) {
+        Remove-PushCacheEntry ([IO.FileInfo]::new($Destination))
+    } elseif ([IO.Directory]::Exists($Destination)) {
+        $dstRootInfo = [IO.DirectoryInfo]::new($Destination)
+        if ($dstRootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Remove-PushCacheEntry $dstRootInfo
+        }
+    }
+    [void][IO.Directory]::CreateDirectory($Destination)
+    $pending = [Collections.Generic.Stack[object[]]]::new()
+    $pending.Push(@($srcRoot, [IO.DirectoryInfo]::new($Destination)))
+    while ($pending.Count -gt 0) {
+        $pair = $pending.Pop()
+        $srcDir = [IO.DirectoryInfo]$pair[0]
+        $dstDir = [IO.DirectoryInfo]$pair[1]
+        $srcMap = [Collections.Generic.Dictionary[string, IO.FileSystemInfo]]::new([StringComparer]::Ordinal)
+        foreach ($entry in $srcDir.EnumerateFileSystemInfos()) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Push blocked: staged source entry '$($entry.FullName)' cannot be a symlink."
+            }
+            $srcMap[$entry.Name] = $entry
+        }
+        $kept = [Collections.Generic.Dictionary[string, IO.FileSystemInfo]]::new([StringComparer]::Ordinal)
+        foreach ($dstEntry in @($dstDir.EnumerateFileSystemInfos())) {
+            [IO.FileSystemInfo]$matched = $null
+            if (-not $srcMap.TryGetValue($dstEntry.Name, [ref]$matched) -or
+                ($dstEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                (($dstEntry -is [IO.DirectoryInfo]) -ne ($matched -is [IO.DirectoryInfo]))) {
+                Remove-PushCacheEntry $dstEntry
+            } else {
+                $kept[$dstEntry.Name] = $dstEntry
+            }
+        }
+        foreach ($item in $srcMap.GetEnumerator()) {
+            $name = $item.Key
+            $srcEntry = $item.Value
+            $dstPath = Join-Path $dstDir.FullName $name
+            [IO.FileSystemInfo]$dstEntry = $null
+            $hasKept = $kept.TryGetValue($name, [ref]$dstEntry)
+            if ($srcEntry -is [IO.DirectoryInfo]) {
+                if (-not $hasKept) {
+                    [void][IO.Directory]::CreateDirectory($dstPath)
+                }
+                $pending.Push(@($srcEntry, [IO.DirectoryInfo]::new($dstPath)))
+            } else {
+                $srcFile = [IO.FileInfo]$srcEntry
+                $same = $false
+                if ($hasKept) {
+                    $dstFile = [IO.FileInfo]$dstEntry
+                    if ($srcFile.Length -eq $dstFile.Length) {
+                        $srcBytes = [IO.File]::ReadAllBytes($srcFile.FullName)
+                        $dstBytes = [IO.File]::ReadAllBytes($dstFile.FullName)
+                        if ([Linq.Enumerable]::SequenceEqual[byte]($srcBytes, $dstBytes)) {
+                            $same = $true
+                        }
+                    }
+                    if (-not $same -and ($dstFile.Attributes -band [IO.FileAttributes]::ReadOnly)) {
+                        $dstFile.Attributes = $dstFile.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
+                    }
+                }
+                if (-not $same) {
+                    [void]$srcFile.CopyTo($dstPath, $true)
+                }
+            }
+        }
+    }
+}
 $updates = if (-not $Prepare -and [Console]::IsInputRedirected) { [Console]::In.ReadToEnd() } else { '' }
 if (-not $updates.Trim() -and -not $Prepare) { return }
 $started = [Diagnostics.Stopwatch]::StartNew()
@@ -49,18 +164,19 @@ if ((Test-Path -LiteralPath (Join-Path $Root '.githooks/pre-push') -PathType Lea
         throw "Push blocked: git config core.hooksPath must be '.githooks' (got '$($hooksPath.Trim())'). Run 'git config core.hooksPath .githooks'."
     }
 }
-Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Windows.Forms, System.IO.Compression.FileSystem
 $power = [Windows.Forms.SystemInformation]::PowerStatus
 Write-Host "Push sanity power before: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown."
 $target = [IO.Path]::GetFullPath($TargetDirectory)
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('bonsai-push-bootstrap-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($scratch)
 try {
-    $head = (git -C $Root rev-parse --verify HEAD).Trim()
     $inputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'tools/ci', 'src/artifacts', 'src/windows-process', 'src/windows-credentials', 'scripts/release/Release-Common.ps1')
-    $revisions = @($inputs | ForEach-Object { '{0}:{1}' -f $head, $_ })
-    $objects = @(git -C $Root rev-parse @revisions)
-    if ($objects.Count -ne $inputs.Count -or @($objects | Where-Object { $_ -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' }).Count) { throw 'Push blocked: committed checker input identities are incomplete.' }
+    $revisions = @('HEAD') + @($inputs | ForEach-Object { 'HEAD:' + $_ })
+    $resolved = @(git -C $Root rev-parse @revisions)
+    if ($resolved.Count -ne ($inputs.Count + 1) -or @($resolved | Where-Object { $_ -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' }).Count) { throw 'Push blocked: committed checker input identities are incomplete.' }
+    $head = $resolved[0].Trim()
+    $objects = @($resolved[1..$inputs.Count])
     $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
     $tool = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
     $receiptPath = Join-Path $target 'push-checker.json'
@@ -107,7 +223,7 @@ try {
             'tools/ci/test_support.ps1')
     }
     git @archiveArguments
-    Expand-Archive -LiteralPath $archive -DestinationPath $policy
+    [IO.Compression.ZipFile]::ExtractToDirectory($archive, $policy, $true)
     if ($Prepare -or $recover) {
         . (Join-Path $policy 'scripts/release/Release-Common.ps1')
         $toolchain = Get-ReleaseToolchain $policy
@@ -123,49 +239,35 @@ try {
                 [IO.File]::Delete($recoveryReceiptPath)
                 throw
             }
-        } elseif ($Prepare) {
-            $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = 'true'
-            $env:CARGO_BUILD_FINGERPRINT = 'content'
-            $env:CARGO_INCREMENTAL = '1'
-            Push-Location -LiteralPath $policy
-            try {
-                # Extra target-only rustc arguments dirty these binary units,
-                # even if their cached output bytes were externally changed.
-                # Dependencies retain their normal fingerprints and cache.
-                $metadata = 'bonsai_push_prepare_' + [guid]::NewGuid().ToString('N')
-                cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
-                cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $policy 'Cargo.toml') --package bonsai-windows-process --bin bonsai-push-recovery --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
-                if (Test-Path -LiteralPath (Join-Path $policy 'config/rust-packages.json') -PathType Leaf) {
-                    $manifestPath = Join-Path $policy 'Cargo.toml'
-                    $metadataJson = (& cargo "+$toolchain" metadata --no-deps --format-version 1 --manifest-path $manifestPath --locked --offline) | ConvertFrom-Json
-                    $packages = @($metadataJson.packages | ForEach-Object { $_.name })
-                    $windowsArgs = @("+$toolchain", 'check', '--quiet', '--locked', '--offline', '--manifest-path', $manifestPath)
-                    if ($packages -contains 'bonsai-speech-asr') {
-                        $windowsArgs += @('--workspace', '--exclude', 'bonsai-speech-asr')
-                    } else {
-                        $windowsArgs += '--workspace'
-                    }
-                    $windowsArgs += @('--all-targets', '--target', 'aarch64-pc-windows-msvc', '--target-dir', $target)
-                    & cargo @windowsArgs
-                    if ($packages -contains 'bonsai-speech-asr') {
-                        cargo "+$toolchain" check --quiet --locked --offline --manifest-path $manifestPath --package bonsai-speech-asr --no-default-features --features rust-qualification --all-targets --target aarch64-pc-windows-msvc --target-dir $target
-                    }
-                    $installedTargets = @(& rustup "+$toolchain" target list --installed)
-                    if ($installedTargets -contains 'aarch64-unknown-linux-gnu') {
-                        $portable = @(('bonsai-artifacts', 'bonsai-audio', 'bonsai-cpu-policy', 'bonsai-broker', 'bonsai-markdown', 'bonsai-speech-service') | Where-Object { $packages -contains $_ })
-                        if ($portable.Count -gt 0) {
-                            $linuxArgs = @("+$toolchain", 'check', '--quiet', '--locked', '--offline', '--manifest-path', $manifestPath, '--target', 'aarch64-unknown-linux-gnu', '--target-dir', $target, '--lib')
-                            foreach ($crate in $portable) { $linuxArgs += @('--package', $crate) }
-                            & cargo @linuxArgs
-                        }
-                    }
-                }
-            }
-            finally { Pop-Location }
-            @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-FileHash -LiteralPath $recoveryTool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
         } else {
-            & $recoveryTool --source $policy --target-directory $target --toolchain $toolchain --bootstrap-milliseconds $started.ElapsedMilliseconds
-            if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery failed; checker receipt remains invalid.' }
+            $stableSource = [IO.Path]::TrimEndingDirectorySeparator($target) + '-source'
+            $cacheLock = Lock-PushSourceCache $target $started
+            try {
+                Sync-PushSourceTree $policy $stableSource
+                if ($Prepare) {
+                    $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = 'true'
+                    $env:CARGO_BUILD_FINGERPRINT = 'content'
+                    $env:CARGO_INCREMENTAL = '1'
+                    Push-Location -LiteralPath $stableSource
+                    try {
+                        # Extra target-only rustc arguments dirty these binary units,
+                        # even if their cached output bytes were externally changed.
+                        # Dependencies retain their normal fingerprints and cache.
+                        $metadata = 'bonsai_push_prepare_' + [guid]::NewGuid().ToString('N')
+                        cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $stableSource 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
+                        if ($LASTEXITCODE) { throw 'Push blocked: bonsai-ci build failed during preparation.' }
+                        cargo "+$toolchain" rustc --quiet --locked --offline --manifest-path (Join-Path $stableSource 'Cargo.toml') --package bonsai-windows-process --bin bonsai-push-recovery --target aarch64-pc-windows-msvc --target-dir $target -- -C "metadata=$metadata"
+                        if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery build failed during preparation.' }
+                    }
+                    finally { Pop-Location }
+                    @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-FileHash -LiteralPath $recoveryTool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
+                } else {
+                    & $recoveryTool --source $stableSource --target-directory $target --toolchain $toolchain --bootstrap-milliseconds $started.ElapsedMilliseconds
+                    if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery failed; checker receipt remains invalid.' }
+                }
+            } finally {
+                if ($null -ne $cacheLock) { $cacheLock.Dispose() }
+            }
         }
         if (-not $prepareForPush) {
             @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
@@ -179,6 +281,9 @@ try {
         'Prepared the committed native checker and recovery supervisor; this is not an outgoing-tip validation verdict.'
         return
     }
+    $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = 'true'
+    $env:CARGO_BUILD_FINGERPRINT = 'content'
+    $env:CARGO_INCREMENTAL = '1'
     $env:BONSAI_PUSH_CARGO_TARGET_DIR = $target
     $updates | & $tool push-sanity --root $Root --policy-root $policy --bootstrap-milliseconds $started.ElapsedMilliseconds
     if ($LASTEXITCODE) { throw 'Push blocked: source sanity did not pass.' }

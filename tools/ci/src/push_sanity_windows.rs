@@ -112,7 +112,7 @@ impl Work {
                         .into(),
                 );
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(2));
         };
         child
             .stop(Duration::from_secs(5))
@@ -278,26 +278,274 @@ impl Work {
         Ok(())
     }
 
+    #[cfg(not(test))]
+    fn toolchain_root(toolchain: &str) -> Option<PathBuf> {
+        let rustup_home = std::env::var_os("RUSTUP_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| PathBuf::from(home).join(".rustup"))
+            })?;
+        let toolchains = rustup_home.join("toolchains");
+        [
+            toolchains.join(format!("{toolchain}-aarch64-pc-windows-msvc")),
+            toolchains.join(toolchain),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+    }
+
+    #[expect(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows-only helper clearing FILE_ATTRIBUTE_READONLY before replacing or removing cached files"
+    )]
+    fn clear_readonly(path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn remove_entry(path: &Path) -> Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        Self::clear_readonly(path)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return fs::remove_dir(path)
+                .or_else(|_| fs::remove_file(path))
+                .map_err(|error| error.to_string());
+        }
+        if !file_type.is_dir() {
+            return fs::remove_file(path).map_err(|error| error.to_string());
+        }
+        let mut stack = vec![path.to_path_buf()];
+        let mut dirs = Vec::new();
+        while let Some(dir) = stack.pop() {
+            dirs.push(dir.clone());
+            for entry in fs::read_dir(&dir).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let child = entry.path();
+                Self::clear_readonly(&child)?;
+                let child_type = entry.file_type().map_err(|error| error.to_string())?;
+                if child_type.is_symlink() {
+                    fs::remove_dir(&child)
+                        .or_else(|_| fs::remove_file(&child))
+                        .map_err(|error| error.to_string())?;
+                } else if child_type.is_dir() {
+                    stack.push(child);
+                } else {
+                    fs::remove_file(&child).map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        while let Some(dir) = dirs.pop() {
+            fs::remove_dir(&dir).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn files_equal(left: &Path, right: &Path, right_len: u64) -> Result<bool> {
+        let left_meta = fs::symlink_metadata(left).map_err(|error| error.to_string())?;
+        if left_meta.file_type().is_symlink() || !left_meta.is_file() {
+            return Ok(false);
+        }
+        if left_meta.len() != right_len {
+            return Ok(false);
+        }
+        let mut left_file = fs::File::open(left).map_err(|error| error.to_string())?;
+        let mut right_file = fs::File::open(right).map_err(|error| error.to_string())?;
+        let mut left_buf = [0_u8; 32_768];
+        let mut right_buf = [0_u8; 32_768];
+        loop {
+            let left_read = std::io::Read::read(&mut left_file, &mut left_buf)
+                .map_err(|error| error.to_string())?;
+            if left_read == 0 {
+                let mut trailing = [0_u8; 1];
+                let extra = std::io::Read::read(&mut right_file, &mut trailing)
+                    .map_err(|error| error.to_string())?;
+                return Ok(extra == 0);
+            }
+            let mut right_filled = 0;
+            while right_filled < left_read {
+                let Some(dest_slice) = right_buf.get_mut(right_filled..left_read) else {
+                    return Err("Internal buffer slice out of bounds during comparison.".into());
+                };
+                let chunk = std::io::Read::read(&mut right_file, dest_slice)
+                    .map_err(|error| error.to_string())?;
+                if chunk == 0 {
+                    return Ok(false);
+                }
+                right_filled += chunk;
+            }
+            if left_buf.get(..left_read) != right_buf.get(..left_read) {
+                return Ok(false);
+            }
+        }
+    }
+
+    fn sync_tree(source: &Path, destination: &Path) -> Result<()> {
+        let source_meta = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+        if source_meta.file_type().is_symlink() || !source_meta.is_dir() {
+            return Err(format!(
+                "Push blocked: source tree root '{}' must be a directory.",
+                source.display()
+            ));
+        }
+        match fs::symlink_metadata(destination) {
+            Ok(dest_meta) => {
+                if dest_meta.file_type().is_symlink() || !dest_meta.is_dir() {
+                    Self::remove_entry(destination)?;
+                    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+        while let Some((src_dir, dst_dir)) = pending.pop() {
+            let mut src_entries: BTreeMap<OsString, (PathBuf, bool, u64)> = BTreeMap::new();
+            for entry in fs::read_dir(&src_dir).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let file_type = entry.file_type().map_err(|error| error.to_string())?;
+                if file_type.is_symlink() {
+                    return Err(format!(
+                        "Push blocked: staged source entry '{}' cannot be a symlink.",
+                        entry.path().display()
+                    ));
+                }
+                let len = if file_type.is_dir() {
+                    0
+                } else if file_type.is_file() {
+                    entry.metadata().map_err(|error| error.to_string())?.len()
+                } else {
+                    return Err(format!(
+                        "Push blocked: unsupported staged source entry '{}'.",
+                        entry.path().display()
+                    ));
+                };
+                src_entries.insert(entry.file_name(), (entry.path(), file_type.is_dir(), len));
+            }
+            let mut kept: BTreeMap<OsString, PathBuf> = BTreeMap::new();
+            for entry in fs::read_dir(&dst_dir).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let name = entry.file_name();
+                let dst_path = entry.path();
+                let dst_type = entry.file_type().map_err(|error| error.to_string())?;
+                let matches = src_entries.get(&name).is_some_and(|(_, is_dir, _)| {
+                    !dst_type.is_symlink() && dst_type.is_dir() == *is_dir
+                });
+                if matches {
+                    kept.insert(name, dst_path);
+                } else {
+                    Self::remove_entry(&dst_path)?;
+                }
+            }
+            for (name, (src_path, is_dir, src_len)) in src_entries {
+                let dst_path = dst_dir.join(&name);
+                let has_kept = kept.contains_key(&name);
+                if is_dir {
+                    if !has_kept {
+                        fs::create_dir_all(&dst_path).map_err(|error| error.to_string())?;
+                    }
+                    pending.push((src_path, dst_path));
+                } else {
+                    let unchanged = has_kept && Self::files_equal(&dst_path, &src_path, src_len)?;
+                    if !unchanged {
+                        if has_kept {
+                            Self::clear_readonly(&dst_path)?;
+                        }
+                        fs::copy(&src_path, &dst_path).map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stable_source_dir(target_dir: &Path) -> Result<PathBuf> {
+        let leaf = target_dir
+            .file_name()
+            .ok_or("Push cargo target directory must have a directory name.")?;
+        let mut name = leaf.to_os_string();
+        name.push("-source");
+        Ok(target_dir.with_file_name(name))
+    }
+
+    fn lock_source_cache(&self, target_dir: &Path) -> Result<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::create_dir_all(target_dir).map_err(|error| error.to_string())?;
+        let lock_path = target_dir.join(".bonsai-source.lock");
+        loop {
+            match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&lock_path)
+            {
+                Ok(file) => return Ok(file),
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(32 | 33))
+                        || error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    if self.started.elapsed() >= Duration::from_secs(270) {
+                        return Err(
+                            "Push blocked: timed out waiting for the source cache lock.".into()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
     fn format_check(&mut self, source: &Path) -> Result<()> {
         let toolchain = super::super::push_format::toolchain(source)?;
         #[cfg(test)]
         let environment = BTreeMap::new();
         #[cfg(not(test))]
         let environment = {
-            let image = self.command(
-                source,
-                "rustup.exe",
-                &[
-                    "which".into(),
-                    "--toolchain".into(),
-                    toolchain.clone().into(),
-                    "rustfmt".into(),
-                ],
-                BTreeMap::new(),
-            )?;
-            let image = std::str::from_utf8(&image)
-                .map_err(|error| error.to_string())?
-                .trim();
+            let direct = Self::toolchain_root(&toolchain)
+                .map(|root| root.join("bin").join("rustfmt.exe"))
+                .filter(|path| path.is_file());
+            let image = if let Some(path) = direct {
+                super::canonical_path(path)?
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| "Formatter binary path must be UTF-8.".to_string())?
+            } else {
+                let output = self.command(
+                    source,
+                    "rustup.exe",
+                    &[
+                        "which".into(),
+                        "--toolchain".into(),
+                        toolchain.clone().into(),
+                        "rustfmt".into(),
+                    ],
+                    BTreeMap::new(),
+                )?;
+                std::str::from_utf8(&output)
+                    .map_err(|error| error.to_string())?
+                    .trim()
+                    .to_string()
+            };
             let adapter = std::env::current_exe().map_err(|error| error.to_string())?;
             let remaining = 270_000_u128
                 .checked_sub(self.started.elapsed().as_millis())
@@ -311,7 +559,7 @@ impl Work {
                         .ok_or("Formatter adapter path must be UTF-8.")?
                         .into(),
                 ),
-                (super::super::push_format::IMAGE.into(), image.into()),
+                (super::super::push_format::IMAGE.into(), image),
                 (
                     super::super::push_format::BUDGET.into(),
                     remaining.to_string(),
@@ -427,7 +675,16 @@ impl Work {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.directory.join("cargo-target"));
         fs::create_dir_all(&target_dir).map_err(|error| error.to_string())?;
+        let target_dir = super::canonical_path(target_dir)?;
         let manifest = source.join("Cargo.toml");
+        let cargo_env = BTreeMap::from([
+            (
+                "CARGO_UNSTABLE_CHECKSUM_FRESHNESS".to_string(),
+                "true".to_string(),
+            ),
+            ("CARGO_BUILD_FINGERPRINT".to_string(), "content".to_string()),
+            ("CARGO_INCREMENTAL".to_string(), "1".to_string()),
+        ]);
 
         let base_cargo_args = |subcommand: &str, target: &str| -> Vec<OsString> {
             vec![
@@ -446,25 +703,18 @@ impl Work {
         };
 
         if affected.contains("bonsai-ci") || plan.workspace_registry {
-            let mut routing_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
-            routing_args.extend([
-                "-p".into(),
-                "bonsai-ci".into(),
-                "--test".into(),
-                "routing".into(),
-            ]);
-            self.command(source, "cargo.exe", &routing_args, BTreeMap::new())?;
-
-            let mut lib_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
-            lib_args.extend([
+            let mut test_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+            test_args.extend([
                 "-p".into(),
                 "bonsai-ci".into(),
                 "--lib".into(),
+                "--test".into(),
+                "routing".into(),
                 "--".into(),
                 "--skip".into(),
                 "push_sanity_".into(),
             ]);
-            self.command(source, "cargo.exe", &lib_args, BTreeMap::new())?;
+            self.command(source, "cargo.exe", &test_args, cargo_env.clone())?;
         }
 
         if plan.hexagon_locks
@@ -478,7 +728,7 @@ impl Work {
                 "--lib".into(),
                 "hexagon_tools::public_control".into(),
             ]);
-            self.command(source, "cargo.exe", &hex_args, BTreeMap::new())?;
+            self.command(source, "cargo.exe", &hex_args, cargo_env.clone())?;
         }
 
         if affected.contains("bonsai-tools")
@@ -494,7 +744,7 @@ impl Work {
                 "--lib".into(),
                 "release_package".into(),
             ]);
-            self.command(source, "cargo.exe", &rel_args, BTreeMap::new())?;
+            self.command(source, "cargo.exe", &rel_args, cargo_env.clone())?;
         }
 
         let windows_standard: Vec<_> = affected
@@ -509,7 +759,7 @@ impl Work {
                 args.push("-p".into());
                 args.push(package.into());
             }
-            self.command(source, "cargo.exe", &args, BTreeMap::new())?;
+            self.command(source, "cargo.exe", &args, cargo_env.clone())?;
         }
 
         if affected.contains("bonsai-speech-asr") {
@@ -522,7 +772,7 @@ impl Work {
                 "rust-qualification".into(),
                 "--all-targets".into(),
             ]);
-            self.command(source, "cargo.exe", &args, BTreeMap::new())?;
+            self.command(source, "cargo.exe", &args, cargo_env.clone())?;
         }
 
         const PORTABLE_LINUX_CRATES: [&str; 6] = [
@@ -538,7 +788,14 @@ impl Work {
             .filter(|package| PORTABLE_LINUX_CRATES.contains(&package.as_str()))
             .cloned()
             .collect();
-        if !linux_affected.is_empty() {
+        let has_linux_target = if linux_affected.is_empty() {
+            false
+        } else if let Some(rustlib) = Self::toolchain_root(&toolchain)
+            .map(|root| root.join("lib").join("rustlib"))
+            .filter(|path| path.is_dir())
+        {
+            rustlib.join("aarch64-unknown-linux-gnu").is_dir()
+        } else {
             let installed = self.command(
                 source,
                 "rustup.exe",
@@ -553,18 +810,18 @@ impl Work {
             )?;
             let installed_text =
                 std::str::from_utf8(&installed).map_err(|error| error.to_string())?;
-            if installed_text
+            installed_text
                 .lines()
                 .any(|line| line.trim() == "aarch64-unknown-linux-gnu")
-            {
-                let mut args = base_cargo_args("check", "aarch64-unknown-linux-gnu");
-                args.push("--lib".into());
-                for package in &linux_affected {
-                    args.push("-p".into());
-                    args.push(package.into());
-                }
-                self.command(source, "cargo.exe", &args, BTreeMap::new())?;
+        };
+        if has_linux_target {
+            let mut args = base_cargo_args("check", "aarch64-unknown-linux-gnu");
+            args.push("--lib".into());
+            for package in &linux_affected {
+                args.push("-p".into());
+                args.push(package.into());
             }
+            self.command(source, "cargo.exe", &args, cargo_env)?;
         }
 
         Ok(())
@@ -807,9 +1064,21 @@ pub(super) fn check(
             };
             commits.entry(commit).or_default().extend(paths(&changed)?);
         }
+        let cache_target = std::env::var_os("BONSAI_PUSH_CARGO_TARGET_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         for (number, (commit, paths)) in commits.iter().enumerate() {
-            let source = work.snapshot(root, commit, number)?;
-            work.checks(policy, &source, &paths.iter().cloned().collect::<Vec<_>>())?;
+            let staged = work.snapshot(root, commit, number)?;
+            let changed_paths: Vec<String> = paths.iter().cloned().collect();
+            if let Some(target_dir) = cache_target.as_ref() {
+                let _cache_lock = work.lock_source_cache(target_dir)?;
+                let stable_source = Work::stable_source_dir(target_dir)?;
+                Work::sync_tree(&staged, &stable_source)?;
+                Work::remove_entry(&staged)?;
+                work.checks(policy, &stable_source, &changed_paths)?;
+            } else {
+                work.checks(policy, &staged, &changed_paths)?;
+            }
         }
         Ok(format!(
             "Push sanity passed for {} immutable outgoing source tip(s); hosted compilation, tests and release acceptance remain separate.",
@@ -1276,6 +1545,88 @@ mod tests {
             return Err("Push hexlock fixture cleanup escaped temp.".into());
         }
         fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
+        result
+    }
+
+    #[test]
+    fn push_sanity_sync_tree_preserves_unchanged_files_and_repairs_mutations() -> Result<()> {
+        let temporary = std::env::temp_dir();
+        let scratch = temporary.join(format!("bonsai-push-sync-test-{}", std::process::id()));
+        if scratch.exists() {
+            Work::remove_entry(&scratch)?;
+        }
+        let result = (|| -> Result<()> {
+            let src = scratch.join("src");
+            let dst = scratch.join("dst");
+            fs::create_dir_all(src.join("nested")).map_err(|error| error.to_string())?;
+            fs::write(src.join("keep.txt"), b"unchanged").map_err(|error| error.to_string())?;
+            fs::write(src.join("nested").join("modify.txt"), b"expected")
+                .map_err(|error| error.to_string())?;
+            fs::write(src.join("RenameMe.txt"), b"case").map_err(|error| error.to_string())?;
+
+            Work::sync_tree(&src, &dst)?;
+
+            let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            {
+                let keep_file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(dst.join("keep.txt"))
+                    .map_err(|error| error.to_string())?;
+                keep_file
+                    .set_times(fs::FileTimes::new().set_modified(old_time))
+                    .map_err(|error| error.to_string())?;
+            }
+
+            fs::write(dst.join("nested").join("modify.txt"), b"corrupted")
+                .map_err(|error| error.to_string())?;
+            let mut lock_ro = fs::metadata(dst.join("nested").join("modify.txt"))
+                .map_err(|error| error.to_string())?
+                .permissions();
+            lock_ro.set_readonly(true);
+            fs::set_permissions(dst.join("nested").join("modify.txt"), lock_ro)
+                .map_err(|error| error.to_string())?;
+
+            fs::write(dst.join("extra.txt"), b"extra").map_err(|error| error.to_string())?;
+            fs::create_dir_all(dst.join("extra_dir")).map_err(|error| error.to_string())?;
+            fs::write(dst.join("extra_dir").join("stale.txt"), b"stale")
+                .map_err(|error| error.to_string())?;
+            fs::remove_file(dst.join("RenameMe.txt")).map_err(|error| error.to_string())?;
+            fs::write(dst.join("renameme.txt"), b"case").map_err(|error| error.to_string())?;
+
+            Work::sync_tree(&src, &dst)?;
+
+            let observed_time = fs::metadata(dst.join("keep.txt"))
+                .map_err(|error| error.to_string())?
+                .modified()
+                .map_err(|error| error.to_string())?;
+            if observed_time != old_time {
+                return Err("Unchanged file modified time was altered during sync_tree.".into());
+            }
+            let repaired = fs::read(dst.join("nested").join("modify.txt"))
+                .map_err(|error| error.to_string())?;
+            if repaired != b"expected" {
+                return Err("Mutated readonly file was not repaired during sync_tree.".into());
+            }
+            if dst.join("extra.txt").exists() || dst.join("extra_dir").exists() {
+                return Err("Extra stale entries were not removed during sync_tree.".into());
+            }
+            let mut names = Vec::new();
+            for entry in fs::read_dir(&dst).map_err(|error| error.to_string())? {
+                names.push(entry.map_err(|error| error.to_string())?.file_name());
+            }
+            if !names.contains(&OsString::from("RenameMe.txt"))
+                || names.contains(&OsString::from("renameme.txt"))
+            {
+                return Err(format!("Case-only rename was not repaired: {names:?}"));
+            }
+            Ok(())
+        })();
+        if scratch.parent() != Some(temporary.as_path()) {
+            return Err("Push sync test fixture cleanup escaped temp.".into());
+        }
+        if scratch.exists() {
+            Work::remove_entry(&scratch)?;
+        }
         result
     }
 }
