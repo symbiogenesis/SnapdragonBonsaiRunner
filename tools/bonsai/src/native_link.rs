@@ -448,7 +448,7 @@ fn verify_inputs(
 }
 
 fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
-    if ![1, 2, 3, 4].contains(&manifest.schema_version)
+    if ![1, 2, 3, 4, 5].contains(&manifest.schema_version)
         || manifest.kind != "selected-lld-arm64-link-package"
         || !(1..=128).contains(&manifest.links.len())
     {
@@ -508,6 +508,11 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
                 return Err("Native link PE imports differ from the reviewed inventory.".into());
             }
             for name in actual {
+                if manifest.schema_version >= 5
+                    && let Some(boundary) = boundary.as_mut()
+                {
+                    boundary.import_module(&name)?;
+                }
                 if systems.contains(&name) {
                     imported_systems.insert(name);
                 } else if !package.contains_key(&name) {
@@ -550,7 +555,7 @@ fn verify(manifest: &Capture, intake: &mut Intake) -> Result<Value> {
         }
     }
     let boundary = boundary
-        .map(runtime_boundary::Boundary::finish)
+        .map(|boundary| boundary.finish(intake))
         .transpose()?;
     let expected_images: BTreeSet<_> = package
         .keys()
