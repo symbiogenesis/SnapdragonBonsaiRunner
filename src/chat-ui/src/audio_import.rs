@@ -360,15 +360,15 @@ fn clipboard_file() -> Result<Option<PathBuf>, &'static str> {
         &name[..name.len() - 1],
     ))))
 }
-pub(super) struct Apartment(PhantomData<Rc<()>>);
+pub(crate) struct Apartment(PhantomData<Rc<()>>);
 impl Apartment {
-    pub(super) fn sta() -> windows::core::Result<Self> {
+    pub(crate) fn sta() -> windows::core::Result<Self> {
         // SAFETY: This worker owns this single-threaded apartment and its COM objects.
         unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }?;
         Ok(Self(PhantomData))
     }
 
-    pub(super) fn mta() -> windows::core::Result<Self> {
+    pub(crate) fn mta() -> windows::core::Result<Self> {
         // SAFETY: This worker owns this multithreaded apartment and its WinRT objects.
         unsafe { RoInitialize(RO_INIT_MULTITHREADED) }?;
         Ok(Self(PhantomData))

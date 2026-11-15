@@ -11,17 +11,19 @@ use std::time::Duration;
 
 impl State {
     pub(super) fn prepare_audio_paste(&mut self, frame: &eframe::Frame) {
-        if self.preview || self.native_owner.is_some() {
+        if self.native_owner.is_none()
+            && let Ok(handle) = frame.window_handle()
+            && let RawWindowHandle::Win32(handle) = handle.as_raw()
+        {
+            self.native_owner = Some(handle.hwnd.get());
+        }
+        if self.preview || self.audio_paste.is_some() || self.audio_paste_checked {
             return;
         }
-        let Ok(handle) = frame.window_handle() else {
+        let Some(owner) = self.native_owner else {
             return;
         };
-        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-            return;
-        };
-        let owner = handle.hwnd.get();
-        self.native_owner = Some(owner);
+        self.audio_paste_checked = true;
         match audio_import::PasteHook::new(owner) {
             Ok(hook) => self.audio_paste = Some(hook),
             Err(_) => {

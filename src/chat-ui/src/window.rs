@@ -18,7 +18,7 @@ use std::{
 };
 
 mod appearance;
-mod atomic_file;
+pub(crate) mod atomic_file;
 mod audio_files;
 #[cfg(test)]
 mod background_tests;
@@ -206,7 +206,9 @@ struct State {
     show_audio_transcript: bool,
     native_owner: Option<isize>,
     audio_paste: Option<crate::audio_import::PasteHook>,
+    audio_paste_checked: bool,
     image_cache: image_cache::ImageCache,
+    image_export: Option<crate::image_export::Export>,
     speech_output: bool,
     canary_configured: bool,
     tts_configured: bool,
@@ -355,7 +357,9 @@ impl State {
             show_audio_transcript: false,
             native_owner: None,
             audio_paste: None,
+            audio_paste_checked: false,
             image_cache: image_cache::ImageCache::default(),
+            image_export: None,
             speech_output: false,
             canary_configured: false,
             tts_configured: false,
@@ -824,8 +828,11 @@ impl State {
     }
 
     fn handle_input_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.dictation_requested && ctx.input(|input| input.viewport().close_requested()) {
-            self.cancel_microphone();
+        if ctx.input(|input| input.viewport().close_requested()) {
+            if self.dictation_requested {
+                self.cancel_microphone();
+            }
+            self.image_export = None;
         }
         ctx.input(|input| {
             for event in &input.events {
@@ -2012,6 +2019,51 @@ impl State {
         });
     }
 
+    fn start_image_export(
+        &mut self,
+        ctx: &egui::Context,
+        svg: std::sync::Arc<str>,
+        suggested_stem: String,
+    ) {
+        if self.image_export.is_some() {
+            return;
+        }
+        let owner = self.native_owner.unwrap_or(0);
+        match crate::image_export::Export::start(ctx, owner, svg, suggested_stem) {
+            Ok(export) => {
+                self.image_export = Some(export);
+                self.set_status("Choose where to save the image…", false);
+            }
+            Err(_) => {
+                self.set_status("Could not open the image save dialog.", true);
+            }
+        }
+    }
+
+    fn poll_image_export(&mut self, ctx: &egui::Context) {
+        let Some(export) = &mut self.image_export else {
+            return;
+        };
+        match export.poll() {
+            crate::image_export::Outcome::Pending => {}
+            crate::image_export::Outcome::Cancelled => {
+                self.image_export = None;
+                self.set_status("Image save cancelled.", false);
+                ctx.request_repaint();
+            }
+            crate::image_export::Outcome::Saved(path) => {
+                self.image_export = None;
+                self.set_status(&format!("Saved image to {}.", path.display()), false);
+                ctx.request_repaint();
+            }
+            crate::image_export::Outcome::Failed(message) => {
+                self.image_export = None;
+                self.set_status(message, true);
+                ctx.request_repaint();
+            }
+        }
+    }
+
     fn show_transcript(&mut self, ui: &mut egui::Ui, width: f32, viewport: egui::Rect) {
         let available = !self
             .updates
@@ -2024,6 +2076,7 @@ impl State {
             can_branch: available && self.model.workspace_available(),
             speech_loading: self.speaking_message.filter(|_| self.speech_loading),
             speech_preparing: self.tts_configured && !self.speech_checked,
+            export_busy: self.image_export.is_some(),
         };
         match self.transcript.show_with_actions(
             ui,
@@ -2036,6 +2089,10 @@ impl State {
         ) {
             Some(transcript::TranscriptAction::ReadAloud(id)) => self.toggle_read_aloud(id),
             Some(transcript::TranscriptAction::Message(action)) => self.message_action(action),
+            Some(transcript::TranscriptAction::SaveImage {
+                svg,
+                suggested_stem,
+            }) => self.start_image_export(ui.ctx(), svg, suggested_stem),
             None => {}
         }
     }
@@ -2136,6 +2193,7 @@ impl State {
 
     fn draw(&mut self, ui: &mut egui::Ui) {
         self.image_cache.poll(ui.ctx());
+        self.poll_image_export(ui.ctx());
         // Disable the workspace on the first modal frame too: egui's modal
         // focus layer is otherwise inherited only from the preceding pass.
         let drawer = self.sidebar_open && ui.available_width() < navigation::DOCK_THRESHOLD;
@@ -2278,6 +2336,7 @@ impl eframe::App for State {
         self.poll_appearance(ctx);
         self.poll_profile();
         self.image_cache.poll(ctx);
+        self.poll_image_export(ctx);
         if self.last_theme_check.elapsed() >= Duration::from_secs(1) {
             self.appearance.apply(ctx);
             self.last_theme_check = Instant::now();
@@ -2287,6 +2346,7 @@ impl eframe::App for State {
         let active_generation = !self.preview && self.model.busy();
         let waiting = active_generation
             || self.image_cache.has_pending()
+            || self.image_export.is_some()
             || (!self.preview
                 && (self.model.waiting_model()
                     || self.speaking

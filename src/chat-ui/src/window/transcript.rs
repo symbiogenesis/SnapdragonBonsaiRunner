@@ -14,7 +14,7 @@ mod search;
 #[derive(Clone, Copy)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "Message actions and speech have independent availability gates."
+    reason = "Message actions, speech and image export have independent availability gates."
 )]
 pub(super) struct MessageControls<'a> {
     pub(super) history: &'a [super::client::Message],
@@ -23,11 +23,16 @@ pub(super) struct MessageControls<'a> {
     pub(super) can_branch: bool,
     pub(super) speech_loading: Option<u64>,
     pub(super) speech_preparing: bool,
+    pub(super) export_busy: bool,
 }
 
 pub(super) enum TranscriptAction {
     ReadAloud(u64),
     Message(super::iteration::MessageAction),
+    SaveImage {
+        svg: Arc<str>,
+        suggested_stem: String,
+    },
 }
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -57,6 +62,7 @@ pub(super) enum CachedSegment {
         svg: Arc<str>,
         preview_size: Vec2,
         card_size: Vec2,
+        index: usize,
     },
     GeneratingImage {
         card_size: Vec2,
@@ -937,6 +943,7 @@ impl Message {
             self.markdown.parsed_for(parse_slice),
             streaming_visible_prefix,
         );
+        let mut image_index = 0_usize;
         let mut cached = Vec::with_capacity(body_segments.len() + usize::from(show_generating));
         for segment in body_segments {
             match segment {
@@ -959,7 +966,9 @@ impl Message {
                         svg,
                         preview_size,
                         card_size,
+                        index: image_index,
                     });
+                    image_index += 1;
                 }
             }
         }
@@ -1040,6 +1049,7 @@ impl Message {
         child.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
         child.spacing_mut().interact_size.y = MESSAGE_ACTION_SIZE;
         let mut action = self.header(&mut child, controls, speaking_message, speech_enabled);
+        let export_busy = controls.is_some_and(|c| c.export_busy);
         if let Some(cache) = &self.cache {
             if self.body.is_empty() && self.pending {
                 child.label(RichText::new("Responding…").weak().italics());
@@ -1060,13 +1070,15 @@ impl Message {
                             }
                         }
                         CachedSegment::Image { .. } => {
-                            render_image_card(
+                            if let Some(card_action) = render_image_card(
                                 &mut child,
                                 self.id,
-                                seg_index,
                                 segment,
                                 image_cache.as_deref_mut(),
-                            );
+                                export_busy,
+                            ) {
+                                action = Some(card_action);
+                            }
                         }
                         CachedSegment::GeneratingImage { card_size } => {
                             render_generating_card(&mut child, *card_size);
@@ -1124,7 +1136,7 @@ fn image_card_layout(width: f32, intrinsic: Vec2) -> (Vec2, Vec2) {
     let preview_w = (iw * scale).clamp(96.0, max_preview_w).round();
     let preview_h = (ih * scale).clamp(72.0, max_preview_h).round();
     let card_w = (preview_w + 16.0).min(card_max_w);
-    let card_h = 8.0 + preview_h + 8.0;
+    let card_h = 8.0 + preview_h + MESSAGE_CONTENT_GAP + MESSAGE_ACTION_SIZE + 8.0;
     (egui::vec2(preview_w, preview_h), egui::vec2(card_w, card_h))
 }
 
@@ -1188,18 +1200,20 @@ fn aspect_fit_rect(bounds: egui::Rect, texture_size: Vec2) -> egui::Rect {
 fn render_image_card(
     ui: &mut egui::Ui,
     message_id: u64,
-    segment_index: usize,
     segment: &CachedSegment,
     image_cache: Option<&mut super::image_cache::ImageCache>,
-) {
+    export_busy: bool,
+) -> Option<TranscriptAction> {
     let CachedSegment::Image {
         svg,
         preview_size,
         card_size,
+        index,
     } = segment
     else {
-        return;
+        return None;
     };
+    let suggested_stem = format!("bonsai-image-{}", index + 1);
     let (card_rect, _) = ui.allocate_exact_size(*card_size, egui::Sense::hover());
     let visuals = ui.visuals().clone();
     ui.painter().rect(
@@ -1258,10 +1272,42 @@ fn render_image_card(
         }
     }
 
-    let preview_id = ui.make_persistent_id(("svg-preview", message_id, segment_index));
+    let preview_id = ui.make_persistent_id(("svg-preview", message_id, *index));
     let preview_response = ui.interact(preview_rect, preview_id, egui::Sense::hover());
     preview_response
         .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, "Generated image"));
+
+    let mut action = None;
+    let footer_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            card_rect.min.x + 8.0,
+            preview_rect.max.y + MESSAGE_CONTENT_GAP,
+        ),
+        egui::pos2(card_rect.max.x - 8.0, card_rect.max.y - 8.0),
+    );
+    let mut footer = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("svg-footer", message_id, *index))
+            .max_rect(footer_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    let save_button = footer
+        .add_enabled(
+            !export_busy,
+            super::controls::quiet_button("Save…").min_size(egui::vec2(0.0, MESSAGE_ACTION_SIZE)),
+        )
+        .on_hover_text("Save image as PNG or SVG");
+    save_button.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, !export_busy, "Save generated image")
+    });
+    if save_button.clicked() {
+        action = Some(TranscriptAction::SaveImage {
+            svg: Arc::clone(svg),
+            suggested_stem,
+        });
+    }
+
+    action
 }
 
 fn render_generating_card(ui: &mut egui::Ui, card_size: Vec2) {

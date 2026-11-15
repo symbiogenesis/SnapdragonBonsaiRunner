@@ -69,6 +69,11 @@ fn assistant_svg_renders_inline_card_and_preserves_raw_source() {
             .rect()
             .is_positive()
     );
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Save generated image")
+            .rect()
+            .is_positive()
+    );
     assert!(chat.query_by_label(SVG_DIAGRAM).is_none());
     assert!(chat.get_by_label("Before diagram.").rect().is_positive());
     assert!(chat.get_by_label("After diagram.").rect().is_positive());

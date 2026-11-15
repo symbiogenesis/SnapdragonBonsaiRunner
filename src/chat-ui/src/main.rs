@@ -25,6 +25,12 @@ mod context;
 #[cfg(windows)]
 mod http;
 #[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "Audited native IFileSaveDialog COM boundary confined to image_export::picker."
+)]
+mod image_export;
+#[cfg(windows)]
 mod markdown_service;
 #[cfg(windows)]
 mod native_speech;

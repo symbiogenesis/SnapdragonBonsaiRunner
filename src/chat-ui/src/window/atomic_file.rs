@@ -8,7 +8,7 @@ use std::{
 };
 
 // Serialization, encryption and storage limits belong to the individual stores.
-pub(super) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     bonsai_windows_credentials::validate_external_path(path)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

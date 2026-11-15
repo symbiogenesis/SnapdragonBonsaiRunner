@@ -54,6 +54,7 @@ not evidence of a browser frontend.
 | `eframe`, `wgpu` | Native UI, accessibility, clipboard, fallback/system fonts and all three explicit Windows backends. |
 | `markdown-syntax` | Exact `=0.7.2`, default features disabled: dependency-free Markdown AST parsing for native response rendering. No HTML renderer or web frontend. See [Markdown parsing](#native-markdown-parsing) for the reviewed scope and limits. |
 | `resvg` | Exact `=0.50.0`, defaults disabled, `text` feature only (no `svgz`, `raster-images`, `system-fonts` or `memmap-fonts`): dual MIT/Apache-2.0 pure Rust SVG rasterization inside the offline `--markdown-worker` container, using bundled `epaint_default_fonts` with external/data `href` resolvers disabled. |
+| `png` | Exact `=0.18.1`, `default-features = false`: dual MIT/Apache-2.0 pure Rust PNG encoder already in `Cargo.lock`, used in `bonsai-chat` for user-initiated `IFileSaveDialog` PNG export of rasterized generated SVGs. |
 | `egui_kittest`, `egui_system_font_provider` | Test harness/font checks; capture-only splitting offers little while production needs graphics. |
 | `toml` | CI-only manifest parsing with parse/serde/std features. |
 | `ureq` | Synchronous HTTPS for native provisioning, updates and CI. Reuse the workspace pin with defaults, automatic compression and cookies disabled; Windows selects Schannel and system trust through native-tls-no-default and PlatformVerifier, portable checks select Rustls. No new async runtime is required. |
