@@ -414,7 +414,10 @@ impl State {
     fn markdown_preparing(&self, ctx: &egui::Context) -> bool {
         self.markdown_image.as_ref().is_some_and(|image| {
             crate::markdown_service::Service::configure(ctx, image);
-            crate::markdown_service::Service::get(ctx).is_some_and(|service| service.warm_up())
+            crate::markdown_service::Service::get(ctx).is_some_and(|service| {
+                service.warm_up()
+                    || (!service.unavailable() && self.transcript.presentation_pending(ctx))
+            })
         })
     }
 
@@ -422,8 +425,8 @@ impl State {
         if (self.startup_request.is_some() || self.pending_config.is_some())
             && self.markdown_preparing(ctx)
         {
-            // Let the small parser handshake finish before model preparation
-            // competes for CPU and disk. Drafting and recovery remain available.
+            // Present the visible restored answers before model preparation
+            // competes for CPU and disk. A handshake alone has no styled text.
             ctx.request_repaint_after(Duration::from_millis(16));
             return;
         }
@@ -2113,7 +2116,11 @@ impl State {
                                 });
                             });
                         }
+                        viewport.top()
                     });
+                if (scroll.inner - scroll.state.clamped_offset().y).abs() >= 0.5 {
+                    self.transcript.invalidate_presentation();
+                }
                 if !empty
                     && scroll.content_size.y
                         - scroll.inner_rect.height()
@@ -2476,7 +2483,9 @@ mod startup_tests {
         fixture_with_broker(false)
     }
 
-    fn fixture_with_broker(prepared: bool) -> io::Result<(crate::startup::Request, PathBuf)> {
+    pub(super) fn fixture_with_broker(
+        prepared: bool,
+    ) -> io::Result<(crate::startup::Request, PathBuf)> {
         let directory = std::env::temp_dir().join(format!(
             "Bonsai-UI-Startup-{}-{}",
             std::process::id(),
@@ -2509,70 +2518,6 @@ mod startup_tests {
             directory.clone().into_os_string(),
         ];
         Ok((crate::startup::Request::parse(&arguments)?, directory))
-    }
-
-    #[test]
-    fn model_preparation_waits_for_markdown_handshake_or_terminal_failure() -> io::Result<()> {
-        for ready in [true, false] {
-            let (request, directory) = fixture_with_broker(true)?;
-            let context = egui::Context::default();
-            let settle = crate::markdown_service::Service::startup_fixture(&context);
-            let (commands, _incoming) = mpsc::channel();
-            let (events, incoming_events) = client::event_channel();
-            let mut state = State::pending_startup(commands, incoming_events, request);
-            drop(events);
-            state.input = "Draft while formatting starts".into();
-            state.poll_startup(&context);
-            state.drain_events();
-            assert!(state.startup_request.is_some());
-            assert!(state.startup.is_none() && state.worker.is_none() && state.speech.is_none());
-            assert!(!state.warning && state.model.waiting_model());
-            assert_eq!(state.input, "Draft while formatting starts");
-            assert!(state.markdown_preparing(&context));
-            // The direct executable path also defers both the client and speech
-            // discovery, and has no live event producer while it is waiting.
-            state.startup_request.take();
-            state.pending_config = Some(Config {
-                broker: directory.join("nonadjacent-parser/broker.exe"),
-                data: directory.clone(),
-                evidence: directory.clone(),
-                frontend_port: 5173,
-                backend_port: 8081,
-                use_abliterate_lora: false,
-                use_repacked_ptq1: false,
-                native_engine: true,
-                native_row_workers: 4,
-                latest_prompt_reuse: false,
-                kv_cache: None,
-                placement: None,
-                canary: None,
-                qwen_tts: None,
-            });
-            state.poll_startup(&context);
-            state.drain_events();
-            assert!(state.pending_config.is_some());
-            assert!(state.worker.is_none() && state.speech.is_none());
-            assert!(!state.warning && state.model.waiting_model());
-            settle(ready);
-            assert!(!state.markdown_preparing(&context));
-            // The production starter is deliberately not called by this inert
-            // control: readiness must release the gate for either outcome.
-            state.pending_config.take();
-            drop(state);
-            drop(settle);
-            drop(context);
-            fs::remove_dir_all(directory)?;
-        }
-        let (request, directory) = fixture()?;
-        let (commands, _incoming) = mpsc::channel();
-        let (_events, incoming_events) = client::event_channel();
-        let state = State::pending_startup(commands, incoming_events, request);
-        let context = egui::Context::default();
-        assert!(!state.markdown_preparing(&context));
-        assert!(crate::markdown_service::Service::get(&context).is_none());
-        drop(state);
-        fs::remove_dir_all(directory)?;
-        Ok(())
     }
 
     #[test]

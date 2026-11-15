@@ -185,8 +185,8 @@ only forwards to Rust and propagates its exit code; it builds or provisions noth
 
 The launcher prepares the UI and headless broker image before opening the window.
 The native window warms the Markdown worker before Swift or TTS preparation,
-while drafting and browsing remain available. Its handshake or terminal parser
-failure releases model setup; parser failure keeps plain source visible without
+while drafting and browsing remain available. The first formatted viewport or
+terminal parser failure releases model setup; failure keeps plain source visible without
 retrying. Preparation then verifies/provisions the pinned runtime. Models and
 adapters use compiled locks. Explicit PTQ1 is verify-only. Speech preparation
 continues independently, with at most two artifact workers and below-normal CPU

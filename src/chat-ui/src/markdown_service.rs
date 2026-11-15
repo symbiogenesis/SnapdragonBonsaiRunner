@@ -154,25 +154,13 @@ impl Service {
         context: &egui::Context,
     ) -> impl Fn() -> std::io::Result<Arc<str>> + use<> {
         let (service, pending) = Self::inert(context);
+        service.shared.ready();
         move || {
             let request = pending.try_recv().map_err(std::io::Error::other)?;
             service
                 .shared
                 .complete(request.ticket, bonsai_markdown::parse(&request.source));
             Ok(request.source)
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn startup_fixture(context: &egui::Context) -> impl Fn(bool) + use<> {
-        let (service, pending) = Self::inert(context);
-        move |ready| {
-            let _retain_requests = &pending;
-            if ready {
-                service.shared.ready();
-            } else {
-                service.shared.fail();
-            }
         }
     }
 

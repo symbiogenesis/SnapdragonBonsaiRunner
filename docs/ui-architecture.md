@@ -68,8 +68,9 @@ The launcher checks/builds presentation and the headless broker image before
 opening the window. The UI warms the Markdown parser before starting Swift or
 speech preparation, without waiting for a response to request formatting.
 Drafting and browsing remain available during its asynchronous handshake.
-Readiness or terminal parser failure releases model setup; failure leaves source
-visible and never retries the parser. An owned preparation worker then
+The first formatted viewport or terminal parser failure releases model setup;
+offscreen responses do not delay it. Failure leaves source visible without a
+parser retry. An owned preparation worker then
 verifies/provisions the selected pinned Rust runtime and hands off text chat.
 Speech artifact preparation, companion builds and fresh speech credentials continue separately
 while Swift loads and serves text chat. A speech preparation failure leaves text

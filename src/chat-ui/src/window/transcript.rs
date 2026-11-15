@@ -144,6 +144,10 @@ pub(super) struct Transcript {
     search: search::Search,
     #[serde(skip)]
     viewport: layout::Viewport,
+    // Startup waits for a completed presentation frame of the visible rows,
+    // without draining formatting work for the rest of the saved conversation.
+    #[serde(skip)]
+    presentation: Option<(u64, bool)>,
     #[cfg(test)]
     #[serde(skip)]
     trim_message_visits: usize,
@@ -181,6 +185,17 @@ impl<'de> serde::Deserialize<'de> for Transcript {
 }
 
 impl Transcript {
+    pub(super) fn invalidate_presentation(&mut self) {
+        self.presentation = None;
+    }
+
+    pub(super) fn presentation_pending(&self, ctx: &egui::Context) -> bool {
+        !self.messages.is_empty()
+            && self
+                .presentation
+                .is_none_or(|(frame, pending)| pending || frame >= ctx.cumulative_frame_nr())
+    }
+
     pub(super) const fn history_revision(&self) -> u64 {
         self.history_revision
     }
@@ -200,6 +215,7 @@ impl Transcript {
         self.text_bytes = 0;
         self.search = search::Search::default();
         self.viewport = layout::Viewport::default();
+        self.presentation = None;
     }
 
     pub(super) fn remove_empty_response(&mut self) {
@@ -216,6 +232,7 @@ impl Transcript {
     }
 
     pub(super) fn push(&mut self, role: Role, body: String) {
+        self.presentation = None;
         self.history_revision = self.history_revision.wrapping_add(1);
         self.search.invalidate();
         self.next_id = self.next_id.wrapping_add(1);
@@ -470,6 +487,7 @@ impl Transcript {
         self.search.refresh(&self.messages);
         let width = width.max(120.0);
         let rows = self.prepare_layout(ui, width, viewport, controls.as_ref());
+        let mut presentation_pending = false;
         for (message, row) in self.messages.iter_mut().zip(rows.messages) {
             let (rect, _) =
                 ui.allocate_exact_size(Vec2::new(width, row.height), egui::Sense::hover());
@@ -488,7 +506,12 @@ impl Transcript {
                 .cache
                 .as_ref()
                 .is_some_and(|cache| cache.body_revision == message.body_revision);
-            if (row.ready || retained) && (ui.is_rect_visible(rect) || target.is_some()) {
+            let visible = ui.is_rect_visible(rect) || target.is_some();
+            if visible {
+                presentation_pending |=
+                    !row.ready || (message.role == Role::Assistant && message.markdown.changed());
+            }
+            if (row.ready || retained) && visible {
                 let (found_rect, message_action) = message.show(
                     ui,
                     rect,
@@ -507,6 +530,7 @@ impl Transcript {
             }
             ui.add_space((MESSAGE_GAP - ui.spacing().item_spacing.y).max(0.0));
         }
+        self.presentation = Some((ui.ctx().cumulative_frame_nr(), presentation_pending));
         if rows.correction != 0.0 {
             ui.scroll_with_delta_animation(
                 egui::vec2(0.0, -rows.correction),

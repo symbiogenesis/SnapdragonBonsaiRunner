@@ -241,7 +241,9 @@ adoption decisions without displacing native daily-use acceptance.
   parsing without native UI/graphics imports, and the six-key minimal environment
   with private `LOCALAPPDATA` in owning native acceptance. Verify recovered
   responses format before model preparation and after model setup failures using
-  the launcher's prepared image, including explicit nonadjacent broker paths and
+  the launcher's prepared image, including explicit nonadjacent broker paths,
+  initial bottom scrolling, offscreen backlogs and the under-one-second rendering
+  target. Require the first formatted viewport before Swift/TTS work and
   unchanged-source asynchronous layout invalidation and repaint after request
   admission in an idle window. Include the source launch's
   early broker build and preserved source-lock provenance; explicit parser warmup

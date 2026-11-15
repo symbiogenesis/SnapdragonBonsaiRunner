@@ -216,7 +216,7 @@ mod tests {
     use super::*;
     use crate::{
         markdown_service::Service,
-        window::transcript::{Role, Transcript},
+        window::{State, client, mpsc, startup_tests, transcript::Role},
     };
     use egui_kittest::Harness;
 
@@ -257,58 +257,96 @@ mod tests {
     }
 
     #[test]
-    fn markdown_async_configuration_formats_unchanged_restored_source() -> std::io::Result<()> {
+    fn markdown_async_configuration_formats_before_model_preparation() -> std::io::Result<()> {
         let source = "# Heading 界\n\nA **bold** answer 🌱.";
-        let mut transcript = Transcript::default();
-        transcript.push(Role::Assistant, source.to_owned());
-        transcript.messages[0].markdown.asynchronous_fixture = true;
-        let mut chat = Harness::builder()
-            .with_context_setup(crate::window::configure_test_context)
-            .build_ui_state(
-                |ui, transcript: &mut Transcript| {
-                    egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
-                        transcript.show(ui, 600.0, viewport, None, false);
-                    });
-                },
-                transcript,
+        for failed in [false, true] {
+            let (request, directory) = startup_tests::fixture_with_broker(true)?;
+            let (commands, _incoming) = mpsc::channel();
+            let (events, incoming_events) = client::event_channel();
+            let mut state = State::pending_startup(commands, incoming_events, request);
+            drop(events);
+            state.input = "Draft while formatting starts".into();
+            state.transcript.push(Role::Assistant, source.to_owned());
+            state
+                .transcript
+                .push(Role::Assistant, "**Offscreen**".into());
+            for message in &mut state.transcript.messages {
+                message.markdown.asynchronous_fixture = true;
+            }
+            let mut chat = Harness::builder()
+                .with_size([640.0, 80.0])
+                .with_context_setup(crate::window::configure_test_context)
+                .build_ui_state(
+                    |ui, state: &mut State| {
+                        egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
+                            state.transcript.show(ui, 600.0, viewport, None, false);
+                        });
+                    },
+                    state,
+                );
+            chat.step();
+            chat.step();
+            chat.step();
+            assert!(!chat.state().transcript.messages[0].markdown.failed());
+            assert_eq!(
+                chat.state().transcript.messages[0]
+                    .cache
+                    .as_ref()
+                    .map(|cache| cache.body.job.text.as_str()),
+                Some(source)
             );
-        chat.step();
-        chat.step();
-        chat.step();
-        assert!(!chat.state().messages[0].markdown.failed());
-        assert_eq!(
-            chat.state().messages[0]
-                .cache
-                .as_ref()
-                .map(|cache| cache.body.job.text.as_str()),
-            Some(source)
-        );
-        assert!(
-            chat.output()
-                .viewport_output
-                .get(&egui::ViewportId::ROOT)
-                .is_some_and(|output| output.repaint_delay > std::time::Duration::from_millis(16))
-        );
-        let respond = Service::fixture(&chat.ctx);
-        chat.step();
-        assert!(
-            chat.output()
-                .viewport_output
-                .get(&egui::ViewportId::ROOT)
-                .is_some_and(|output| output.repaint_delay <= std::time::Duration::from_millis(16))
-        );
-        assert_eq!(&*respond()?, source);
-        chat.step();
-        let message = &chat.state().messages[0];
-        assert_eq!(
-            message
-                .cache
-                .as_ref()
-                .map(|cache| cache.body.job.text.as_str()),
-            Some("Heading 界\n\nA bold answer 🌱.")
-        );
-        assert_eq!(message.body, source);
-        assert!(!message.markdown.failed());
+            assert!(
+                chat.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                    > std::time::Duration::from_millis(16)
+            );
+            let respond = Service::fixture(&chat.ctx);
+            chat.step();
+            let context = chat.ctx.clone();
+            chat.state_mut().poll_startup(&context);
+            chat.state_mut().drain_events();
+            assert!(chat.state().startup_request.is_some());
+            assert!(chat.state().startup.is_none() && chat.state().worker.is_none());
+            assert!(!chat.state().warning && chat.state().speech.is_none());
+            assert_eq!(chat.state().input, "Draft while formatting starts");
+            assert!(chat.state().markdown_preparing(&context));
+            assert!(
+                chat.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                    <= std::time::Duration::from_millis(16)
+            );
+            if failed {
+                Service::get(&context)
+                    .ok_or_else(|| std::io::Error::other("Missing parser"))?
+                    .reject();
+            } else {
+                assert_eq!(&*respond()?, source);
+                // Receiving a packet is insufficient: apply it and draw a frame.
+                assert!(chat.state().markdown_preparing(&context));
+            }
+            chat.step();
+            let message = &chat.state().transcript.messages[0];
+            assert_eq!(
+                message
+                    .cache
+                    .as_ref()
+                    .map(|cache| cache.body.job.text.as_str()),
+                Some(if failed {
+                    source
+                } else {
+                    "Heading 界\n\nA bold answer 🌱."
+                })
+            );
+            assert_eq!(message.body, source);
+            assert_eq!(message.markdown.failed(), failed);
+            assert!(!chat.state().markdown_preparing(&context));
+            if !failed {
+                assert!(chat.state().transcript.messages[1].markdown.changed());
+                assert_eq!(&*respond()?, "**Offscreen**");
+            }
+            drop(chat);
+            drop(respond);
+            drop(context);
+            std::fs::remove_dir_all(directory)?;
+        }
         Ok(())
     }
 }

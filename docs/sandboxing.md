@@ -56,7 +56,7 @@ flags, sizes and source mappings before constructing native text layout. See the
 
 The launcher prepares and hands off the headless broker image before opening the
 UI. An explicit warmup starts the persistent worker without a source request;
-Swift and speech setup wait asynchronously for its handshake or terminal failure.
+Swift and speech setup wait for the first formatted viewport or terminal failure.
 Direct configured launches use the same ordering. Parser failure leaves source
 visible and allows model setup to continue without a parser retry. Formatting
 uses the exact configured path, including explicit source-launch broker paths.
