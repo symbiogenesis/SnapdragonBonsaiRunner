@@ -22,6 +22,11 @@ const NEXT_TURN_FRAMING_TOKENS: usize = 16;
 const EFFORT_PLANNING_TOKENS: usize = 192;
 const OUTPUT_CAPS: [u32; 4] = [512, 1_024, 2_048, 4_096];
 
+/// Approximate token cost of the fixed system instruction turn sent with every request.
+pub(crate) fn system_prompt_tokens() -> usize {
+    text_tokens(crate::client::SYSTEM_PROMPT).saturating_add(MESSAGE_FRAMING_TOKENS)
+}
+
 /// Advisory presentation state, never an admission decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Pressure {
@@ -56,7 +61,9 @@ impl Estimate {
         extra_effort: bool,
         capacity: Option<usize>,
     ) -> Self {
-        let draft = text_tokens(draft.trim()).saturating_add(NEXT_TURN_FRAMING_TOKENS);
+        let draft = text_tokens(draft.trim())
+            .saturating_add(NEXT_TURN_FRAMING_TOKENS)
+            .saturating_add(system_prompt_tokens());
         let workflow = if extra_effort {
             EFFORT_PLANNING_TOKENS
         } else {
@@ -190,7 +197,11 @@ mod tests {
 
     #[test]
     fn response_reservation_and_exact_boundary_remain_distinct_from_estimation() {
-        let history = CONTEXT_TOKENS - RESERVE_TOKENS - NEXT_TURN_FRAMING_TOKENS - 512;
+        let history = CONTEXT_TOKENS
+            - RESERVE_TOKENS
+            - NEXT_TURN_FRAMING_TOKENS
+            - system_prompt_tokens()
+            - 512;
         let fits = Estimate::new(history, "", 512, false, Some(CONTEXT_TOKENS));
         assert_eq!(fits.total, CONTEXT_TOKENS);
         assert_eq!(fits.pressure(), Pressure::Near);
@@ -200,6 +211,7 @@ mod tests {
         assert_eq!(over.pressure(), Pressure::Over);
         assert_eq!(over.overflow(), 1);
         assert_eq!(over.suggested_cap(), None);
+        assert!(system_prompt_tokens() > MESSAGE_FRAMING_TOKENS);
     }
 
     #[test]

@@ -125,6 +125,7 @@ impl State {
         self.retained_draft.clear();
         self.stage = None;
         self.answer_complete = false;
+        self.streaming_svg_filter.reset();
         self.extra_effort = false;
         self.enable_thinking = false;
         self.streaming_read_aloud = false;

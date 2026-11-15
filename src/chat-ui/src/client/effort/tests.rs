@@ -45,7 +45,7 @@ fn effort_working_material_keeps_json_bytes_and_rejects_oversized_temporaries() 
     let request: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| Failure::Message("Could not decode staged working material."))?;
     assert!(
-        request["messages"][2]["content"]
+        request["messages"][3]["content"]
             .as_str()
             .is_some_and(|content| {
                 content.ends_with(&format!("Generated working material (JSON):\n{expected}"))
@@ -95,8 +95,9 @@ fn effort_applies_thinking_selection_to_every_stage() -> Result<()> {
                 let request: serde_json::Value = serde_json::from_slice(&body)
                     .map_err(|_| Failure::Message("invalid thinking stage JSON"))?;
                 assert_eq!(request["enable_thinking"], enable_thinking);
+                assert_eq!(request["messages"][0]["role"], "system");
                 assert_eq!(
-                    request["messages"][1]["reasoning_content"],
+                    request["messages"][2]["reasoning_content"],
                     "Preserved prior reasoning"
                 );
                 calls += 1;
@@ -161,13 +162,14 @@ fn effort_stages_use_fresh_original_context() -> Result<()> {
     for request in &requests {
         assert_eq!(request["max_completion_tokens"], 2048);
         assert_eq!(request["abliteration_scale"], serde_json::json!(1.3));
-        assert_eq!(request["messages"].as_array().map(Vec::len), Some(3));
+        assert_eq!(request["messages"].as_array().map(Vec::len), Some(4));
+        assert_eq!(request["messages"][0]["role"], "system");
         assert_eq!(
-            request["messages"][1]["reasoning_content"],
+            request["messages"][2]["reasoning_content"],
             "Preserved prior reasoning"
         );
         assert!(
-            request["messages"][2]["content"]
+            request["messages"][3]["content"]
                 .as_str()
                 .is_some_and(|text| {
                     text.starts_with(pending[2].content.as_ref())
@@ -175,12 +177,12 @@ fn effort_stages_use_fresh_original_context() -> Result<()> {
                 })
         );
     }
-    let draft_prompt = requests[1]["messages"][2]["content"]
+    let draft_prompt = requests[1]["messages"][3]["content"]
         .as_str()
         .unwrap_or_default();
     assert!(draft_prompt.contains("Plan: quiet rhythm."));
     assert!(!draft_prompt.contains("The green sea slept."));
-    let review_prompt = requests[2]["messages"][2]["content"]
+    let review_prompt = requests[2]["messages"][3]["content"]
         .as_str()
         .unwrap_or_default();
     assert!(review_prompt.contains("Plan: quiet rhythm."));

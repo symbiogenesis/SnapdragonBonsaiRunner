@@ -67,6 +67,16 @@ const RATE_LIMIT_MESSAGE: &str =
     "Too many messages were sent in a short time. Wait a moment, then send again.";
 const TEARDOWN_FAILURE_MESSAGE: &str = "The local model's owned processes could not be confirmed stopped. Copy any conversation or drafts you want to keep, then close this app before launching again.";
 pub(crate) const STOPPED_MESSAGE: &str = "Response stopped. Select Retry model to continue. Any usable partial reply remains in the conversation.";
+/// System instructions prepended to every model turn to enable structured SVG image generation.
+pub(crate) const SYSTEM_PROMPT: &str = "\
+You are Swift Bonsai, a helpful assistant running locally on the user's device. \
+When the user asks you to generate, draw, illustrate, create, or edit an image, artwork, diagram, or icon, \
+include a complete, self-contained `<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 WIDTH HEIGHT\">...</svg>` document \
+inside a top-level ```svg fenced code block. \
+Use clean vector geometry, shapes, paths, gradients, and explicit `viewBox` dimensions; \
+never include `<script>` elements, event-handler attributes, or external URLs or `<image href>`. \
+If the user explicitly asks to inspect raw SVG markup or source code, use a ```xml block instead. \
+For all ordinary requests, respond normally without emitting an ```svg block.";
 
 pub(crate) const DEFAULT_ABLITERATION_SCALE: f32 = 1.3;
 
@@ -230,9 +240,41 @@ impl<'de> Deserialize<'de> for Message {
     }
 }
 
+struct SystemMessageRef;
+
+impl Serialize for SystemMessageRef {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut state = serializer.serialize_struct("Message", 2)?;
+        state.serialize_field("role", "system")?;
+        state.serialize_field("content", SYSTEM_PROMPT)?;
+        state.end()
+    }
+}
+
+struct RequestMessages<'a>(&'a [Message]);
+
+impl Serialize for RequestMessages<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+        let mut seq = serializer.serialize_seq(Some(self.0.len().saturating_add(1)))?;
+        seq.serialize_element(&SystemMessageRef)?;
+        for message in self.0 {
+            seq.serialize_element(message)?;
+        }
+        seq.end()
+    }
+}
+
 #[derive(Serialize)]
 struct ChatRequest<'a> {
-    messages: &'a [Message],
+    messages: RequestMessages<'a>,
     max_completion_tokens: u32,
     stream: bool,
     enable_thinking: bool,
@@ -832,14 +874,14 @@ fn serialize_request(
             "Choose an output budget between 1 and 4,096 tokens.",
         ));
     }
-    if history.len() > 128 {
+    if history.len() > 127 {
         return Err(Failure::Rejected(
-            "This conversation reached the 128-message limit. Select New conversation before sending again.",
+            "This conversation reached the 127-message limit. Select New conversation before sending again.",
         ));
     }
     crate::bounded_json::to_vec(
         &ChatRequest {
-            messages: history,
+            messages: RequestMessages(history),
             max_completion_tokens,
             stream: true,
             enable_thinking,
@@ -1716,8 +1758,11 @@ mod tests {
             let request: serde_json::Value = serde_json::from_slice(&body)
                 .map_err(|_| Failure::Message("invalid thinking request JSON"))?;
             assert_eq!(request["enable_thinking"], enable_thinking);
+            assert_eq!(request["messages"][0]["role"], "system");
+            assert_eq!(request["messages"][0]["content"], super::SYSTEM_PROMPT);
+            assert!(request["messages"][0].get("reasoning_content").is_none());
             assert_eq!(
-                request["messages"][1]["reasoning_content"],
+                request["messages"][2]["reasoning_content"],
                 "Retained prior reasoning"
             );
             assert_eq!(request["max_completion_tokens"], 4096);
@@ -1847,8 +1892,11 @@ mod tests {
         )?;
         let json: serde_json::Value =
             serde_json::from_slice(&request).map_err(|_| Failure::Message("test request JSON"))?;
-        assert_eq!(json["messages"][1]["reasoning_content"], "Consider 🌱");
+        assert_eq!(json["messages"][0]["role"], "system");
+        assert_eq!(json["messages"][0]["content"], super::SYSTEM_PROMPT);
         assert!(json["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(json["messages"][2]["reasoning_content"], "Consider 🌱");
+        assert!(json["messages"][1].get("reasoning_content").is_none());
         assert_eq!(json["max_completion_tokens"], 4096);
         assert_eq!(json["stream"], true);
         assert_eq!(json.as_object().map(serde_json::Map::len), Some(4));
@@ -2757,9 +2805,10 @@ mod tests {
                 assert!(body.len() <= super::MAX_REQUEST);
                 let json: serde_json::Value = serde_json::from_slice(&body)
                     .map_err(|_| Failure::Message("Long request roundtrip failed."))?;
-                assert_eq!(json["messages"][2]["content"], text);
+                assert_eq!(json["messages"][0]["role"], "system");
+                assert_eq!(json["messages"][3]["content"], text);
                 assert_eq!(
-                    json["messages"][1]["reasoning_content"],
+                    json["messages"][2]["reasoning_content"],
                     history[1].reasoning_content.as_deref().unwrap_or_default()
                 );
                 assert_eq!(json["enable_thinking"], thinking);
@@ -2835,8 +2884,9 @@ mod tests {
                 Err(Failure::Rejected(_))
             ));
         }
+        assert!(serialize_request(&vec![history[0].clone(); 127], 4096, false, None).is_ok());
         assert!(matches!(
-            serialize_request(&vec![history[0].clone(); 129], 4096, false, None),
+            serialize_request(&vec![history[0].clone(); 128], 4096, false, None),
             Err(Failure::Rejected(_))
         ));
         let oversized = [Message {

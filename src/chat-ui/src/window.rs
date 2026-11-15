@@ -71,6 +71,7 @@ mod settings;
 mod settings_ui_tests;
 mod setup;
 mod sidebar_status;
+mod svg_fence;
 #[cfg(test)]
 mod tests;
 mod transcript;
@@ -223,6 +224,7 @@ struct State {
     streaming_read_aloud: bool,
     streaming_active: bool,
     streaming_suppressed: bool,
+    streaming_svg_filter: svg_fence::StreamingSvgFilter,
     answer_complete: bool,
     last_answer: String,
     retained_draft: String,
@@ -369,6 +371,7 @@ impl State {
             streaming_read_aloud: false,
             streaming_active: false,
             streaming_suppressed: false,
+            streaming_svg_filter: svg_fence::StreamingSvgFilter::new(),
             answer_complete: false,
             last_answer: String::new(),
             retained_draft: String::new(),
@@ -649,6 +652,7 @@ impl State {
         self.retained_draft.clear();
         self.stage = None;
         self.answer_complete = false;
+        self.streaming_svg_filter.reset();
         let max_completion_tokens = OUTPUT_TOKENS
             .get(self.output_budget)
             .copied()
@@ -1056,7 +1060,14 @@ impl State {
             Event::Committed(history) => self.commit_history(history),
             Event::Complete(completion) => {
                 if self.streaming_active {
+                    if let Some(tail) = self.streaming_svg_filter.finish()
+                        && !tail.is_empty()
+                    {
+                        self.speech_command(speech::Command::AppendStream { text: tail });
+                    }
                     self.speech_command(speech::Command::FinishStream);
+                } else {
+                    self.streaming_svg_filter.reset();
                 }
                 self.transcript.remove_empty_response();
                 self.model = ModelLifecycle::Ready;
@@ -1187,6 +1198,7 @@ impl State {
         self.speaking_message = None;
         self.streaming_active = false;
         self.streaming_suppressed = true;
+        self.streaming_svg_filter.reset();
     }
 
     fn cancel_microphone(&mut self) {
@@ -1280,9 +1292,9 @@ impl State {
             self.stop_speech();
             return;
         }
-        if self.transcript.speech_text(message_id).is_none() {
+        let Some(text) = self.transcript.speech_text(message_id) else {
             return;
-        }
+        };
         self.speech_notice = false;
         if self.speech_output {
             let voice_description = self.voice_profile.trim().to_owned();
@@ -1293,9 +1305,6 @@ impl State {
                 self.record(&self.speech_status.clone());
                 return;
             }
-            let Some(text) = self.transcript.speech_text(message_id).map(str::to_owned) else {
-                return;
-            };
             self.stop_speech();
             if self.speech_command(speech::Command::Speak {
                 text,

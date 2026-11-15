@@ -453,11 +453,11 @@ impl Transcript {
         self.search.close_on_escape(ctx)
     }
 
-    pub(super) fn speech_text(&self, id: u64) -> Option<&str> {
+    pub(super) fn speech_text(&self, id: u64) -> Option<String> {
         self.messages
             .iter()
-            .find(|message| message.id == id && message.can_speak())
-            .map(|message| message.body.as_str())
+            .find(|message| message.id == id)
+            .and_then(Message::speech_body)
     }
 
     #[cfg(test)]
@@ -551,8 +551,25 @@ impl Message {
         self.body.len().saturating_add(self.reasoning.len())
     }
 
+    fn speech_body(&self) -> Option<String> {
+        if self.role != Role::Assistant || self.pending {
+            return None;
+        }
+        let spoken = super::svg_fence::strip_svg_fences(&self.body);
+        let trimmed = spoken.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
     fn can_speak(&self) -> bool {
-        self.role == Role::Assistant && !self.pending && !self.body.trim().is_empty()
+        if self.role != Role::Assistant || self.pending {
+            return false;
+        }
+        if !self.body.contains("```") && !self.body.contains("~~~") {
+            return !self.body.trim().is_empty();
+        }
+        !super::svg_fence::strip_svg_fences(&self.body)
+            .trim()
+            .is_empty()
     }
 
     fn speaker(

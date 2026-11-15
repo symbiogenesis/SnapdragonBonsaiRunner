@@ -60,6 +60,10 @@ impl State {
         {
             return;
         }
+        let super::svg_fence::FilteredDelta::Forward(text) = self.streaming_svg_filter.push(text)
+        else {
+            return;
+        };
         if !self.streaming_active {
             if !self.valid_voice() {
                 self.streaming_suppressed = true;
@@ -82,6 +86,7 @@ impl State {
     }
 
     pub(super) fn replace_streaming_stage(&mut self) {
+        self.streaming_svg_filter.reset();
         if self.streaming_active {
             self.stop_speech();
             self.streaming_suppressed = false;
@@ -249,6 +254,45 @@ mod tests {
         assert!(!state.streaming_read_aloud);
         state.model_event(client::Event::Text(" continues silently".to_owned()));
         assert!(commands.recv_timeout(Duration::from_millis(20)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn svg_fences_are_stripped_from_streaming_read_aloud_and_replay_text() -> io::Result<()> {
+        let (mut state, commands) = fixture()?;
+        state.toggle_streaming_read_aloud();
+        for chunk in [
+            "Here is an emblem:\n\n",
+            "```svg\n<svg viewBox=\"0 0 10 10\">",
+            "<circle cx=\"5\" cy=\"5\" r=\"4\"/></svg>\n```\n\n",
+            "All set.",
+        ] {
+            state.model_event(client::Event::Text(chunk.to_owned()));
+        }
+        state.model_event(client::Event::Complete(client::Completion::Finished));
+        let mut spoken = String::new();
+        while let Ok(command) = commands.recv_timeout(Duration::from_millis(50)) {
+            if let speech::Command::AppendStream { text } = command {
+                spoken.push_str(&text);
+            }
+        }
+        assert_eq!(spoken, "Here is an emblem:\n\n\nAll set.");
+        assert!(!spoken.contains("<svg"));
+        assert!(!spoken.contains("circle"));
+
+        let message_id = state.transcript.messages[0].id;
+        assert_eq!(
+            state.transcript.speech_text(message_id).as_deref(),
+            Some("Here is an emblem:\n\nAll set.")
+        );
+
+        state.model = ModelLifecycle::Generating;
+        state
+            .transcript
+            .push(Role::Assistant, "```svg\n<svg/>\n```".to_owned());
+        state.model_event(client::Event::Complete(client::Completion::Finished));
+        let svg_only_id = state.transcript.messages[1].id;
+        assert_eq!(state.transcript.speech_text(svg_only_id), None);
         Ok(())
     }
 }
