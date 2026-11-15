@@ -75,21 +75,50 @@ fn markdown_worker_refuses_direct_invocation_without_stdout() -> io::Result<()> 
     ])
 }
 
-fn response(output: &mut File, ticket: u64, expected: &[u8]) -> io::Result<()> {
+fn read_response_payload(output: &mut File, ticket: u64) -> io::Result<Vec<u8>> {
     let mut header = [0; 20];
     output.read_exact(&mut header)?;
     assert_eq!(&header[..8], b"BSMR0001");
     assert_eq!(&header[8..16], &ticket.to_le_bytes());
-    assert_eq!(
-        &header[16..],
-        &u32::try_from(expected.len())
-            .map_err(io::Error::other)?
-            .to_le_bytes()
-    );
-    let mut bytes = vec![0; expected.len()];
+    let length = usize::try_from(u32::from_le_bytes(
+        header[16..].try_into().map_err(io::Error::other)?,
+    ))
+    .map_err(io::Error::other)?;
+    let mut bytes = vec![0; length];
     output.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn response(output: &mut File, ticket: u64, expected: &[u8]) -> io::Result<()> {
+    let bytes = read_response_payload(output, ticket)?;
     assert_eq!(bytes, expected);
     Ok(())
+}
+
+fn send_markdown(input: &mut File, ticket: u64, source: &str) -> io::Result<()> {
+    input.write_all(b"BSMD0001")?;
+    input.write_all(&ticket.to_le_bytes())?;
+    input.write_all(
+        &u32::try_from(source.len())
+            .map_err(io::Error::other)?
+            .to_le_bytes(),
+    )?;
+    input.write_all(source.as_bytes())?;
+    input.flush()
+}
+
+fn send_raster(input: &mut File, ticket: u64, max_w: u32, max_h: u32, svg: &str) -> io::Result<()> {
+    let body_len = 8_usize
+        .checked_add(svg.len())
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or_else(|| io::Error::other("SVG raster frame overflow"))?;
+    input.write_all(b"BSMG0001")?;
+    input.write_all(&ticket.to_le_bytes())?;
+    input.write_all(&body_len.to_le_bytes())?;
+    input.write_all(&max_w.to_le_bytes())?;
+    input.write_all(&max_h.to_le_bytes())?;
+    input.write_all(svg.as_bytes())?;
+    input.flush()
 }
 
 fn exchange(mut input: File, mut output: File) -> io::Result<()> {
@@ -109,13 +138,50 @@ fn exchange(mut input: File, mut output: File) -> io::Result<()> {
     }
     expected.push(1);
     for ticket in [1_u64, 2] {
-        input.write_all(b"BSMD0001")?;
-        input.write_all(&ticket.to_le_bytes())?;
-        input.write_all(&7_u32.to_le_bytes())?;
-        input.write_all(source.as_bytes())?;
-        input.flush()?;
+        send_markdown(&mut input, ticket, source)?;
         response(&mut output, ticket, &expected)?;
     }
+
+    // Verify offline segmented SVG extraction (`BMD2`) and `BMG1` CPU rasterization
+    // inside the network-denied MXC AppContainer, plus closed rejection of scripted
+    // and external-URL SVGs without tearing down the persistent worker.
+    let safe_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 32\"><rect width=\"64\" height=\"32\" fill=\"#2a9d8f\"/></svg>";
+    send_markdown(
+        &mut input,
+        3,
+        &format!("Diagram:\n\n```svg\n{safe_svg}\n```"),
+    )?;
+    let segmented = read_response_payload(&mut output, 3)?;
+    assert!(segmented.starts_with(b"BMD2"));
+
+    send_raster(&mut input, 4, 64, 32, safe_svg)?;
+    let raster = read_response_payload(&mut output, 4)?;
+    assert!(raster.starts_with(b"BMG1"));
+    assert_eq!(raster.get(4).copied(), Some(1));
+    assert_eq!(&raster[5..9], &64_u32.to_le_bytes());
+    assert_eq!(&raster[9..13], &32_u32.to_le_bytes());
+    let pixels = &raster[13..];
+    assert_eq!(pixels.len(), 64 * 32 * 4);
+    assert!(
+        pixels
+            .chunks_exact(4)
+            .all(|px| px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3])
+    );
+    assert!(pixels.chunks_exact(4).any(|px| px != [0, 0, 0, 0]));
+
+    let hostile_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 32\"><script>alert(1)</script><image href=\"https://example.invalid/p.png\" width=\"64\" height=\"32\"/></svg>";
+    send_markdown(&mut input, 5, &format!("```svg\n{hostile_svg}\n```"))?;
+    let fallback_code = read_response_payload(&mut output, 5)?;
+    assert!(fallback_code.starts_with(b"BMD1"));
+
+    send_raster(&mut input, 6, 64, 32, hostile_svg)?;
+    let mut rejected_header = b"BMG1".to_vec();
+    rejected_header.extend_from_slice(&[0; 9]);
+    response(&mut output, 6, &rejected_header)?;
+
+    // Confirm persistent worker remains healthy after rejecting untrusted SVGs.
+    send_markdown(&mut input, 7, source)?;
+    response(&mut output, 7, &expected)?;
     Ok(())
 }
 
