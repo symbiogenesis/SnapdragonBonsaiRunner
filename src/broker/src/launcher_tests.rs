@@ -131,13 +131,14 @@ fn owned_ready_backend_stops_with_service() -> io::Result<()> {
             Ok(())
         );
         assert_eq!(listener_process_id(port)?, Some(process.id()));
-        assert!(healthy(port, process.id()).await);
+        assert!(healthy(port, credentials.backend_key(), process.id()).await);
         assert!(authenticated(port, credentials.backend_key(), process.id()).await);
         let wrong_key = if credentials.backend_key().starts_with('0') {
             "1".repeat(64)
         } else {
             "0".repeat(64)
         };
+        assert!(!healthy(port, &wrong_key, process.id()).await);
         assert!(!authenticated(port, &wrong_key, process.id()).await);
         let mut service = LocalChatService::bind(
             0,
@@ -307,7 +308,7 @@ fn serve_probe(stream: &mut BlockingStream, key: &str) -> io::Result<()> {
     let authorized = request
         .split("\r\n")
         .any(|line| line == format!("Authorization: Bearer {key}"));
-    let (status, body) = if request.starts_with("GET /health HTTP/1.1\r\n") {
+    let (status, body) = if request.starts_with("GET /health HTTP/1.1\r\n") && authorized {
         ("200 OK", r#"{"status":"ok"}"#)
     } else if request.starts_with("GET /v1/models HTTP/1.1\r\n") && authorized {
         ("200 OK", r#"{"data":[]}"#)

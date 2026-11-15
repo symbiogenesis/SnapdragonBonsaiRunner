@@ -1036,7 +1036,7 @@ async fn wait_ready_models(
             guard(process, limit)?;
             match listener_process_id(port).map_err(|_| LaunchError::Backend)? {
                 Some(pid) if pid != process.id() => return Err(LaunchError::Backend),
-                Some(_) if healthy(port, process.id()).await => {
+                Some(_) if healthy(port, key, process.id()).await => {
                     if let Some(models) = authenticated_models(port, key, process.id()).await {
                         owner(process, port)?;
                         guard(process, limit)?;
@@ -1075,21 +1075,26 @@ async fn wait_ready(
         .map(|_| ())
 }
 
-async fn healthy(port: u16, process_id: u32) -> bool {
-    timeout(Duration::from_secs(1), health_exchange(port, process_id))
-        .await
-        .is_ok_and(|result| result.is_ok())
+async fn healthy(port: u16, key: &str, process_id: u32) -> bool {
+    timeout(
+        Duration::from_secs(1),
+        health_exchange(port, key, process_id),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
 }
 
-async fn health_exchange(port: u16, process_id: u32) -> io::Result<()> {
-    // /health is public in the pinned engine; avoid sending the bearer secret needlessly.
-    validate_health(&exchange(port, "/health", None, process_id).await?)
+async fn health_exchange(port: u16, key: &str, process_id: u32) -> io::Result<()> {
+    // The native Swift worker requires the bearer credential on every route,
+    // including /health; the publisher engine ignores it on public /health.
+    validate_health(&exchange(port, "/health", Some(key), process_id).await?)
 }
 
 async fn authenticated_models(port: u16, key: &str, process_id: u32) -> Option<Vec<u8>> {
     timeout(Duration::from_secs(2), async {
-        // /health is public in the pinned engine. A protected endpoint must
-        // reject missing credentials and accept this newly generated key.
+        // Publisher /health is public while native /health requires the key.
+        // Either way, /v1/models must reject missing credentials and accept
+        // this newly generated key.
         let denied = exchange(port, "/v1/models", None, process_id).await?;
         validate_response(&denied, 401)?;
         let allowed = exchange(port, "/v1/models", Some(key), process_id).await?;

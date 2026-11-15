@@ -439,11 +439,12 @@ and containment contracts.
 
 No frontend opens before a ten-minute startup deadline, complete bounded health
 response, authenticated `/v1/models` checks and listener PID matching the owned
-process. `/health` is public, so `/v1/models` must reject a missing key and accept
-the generated key. Probes have bounded headers/body, strict framing and short
-absolute I/O deadlines. Count/generation connections check the listener PID
-before and after connecting. Same-user/admin interference remains outside this
-development assurance.
+process. Publisher `/health` is public while native `/health` requires the bearer
+key, so readiness authenticates `/health` and requires `/v1/models` to reject a
+missing key and accept the generated key. Probes have bounded headers/body,
+strict framing and short absolute I/O deadlines. Count/generation connections
+check the listener PID before and after connecting. Same-user/admin interference
+remains outside this development assurance.
 
 Startup and serving monitor process exit, private bytes, working set and the
 4 GiB physical reserve; serving also checks listener ownership. Guard failure
