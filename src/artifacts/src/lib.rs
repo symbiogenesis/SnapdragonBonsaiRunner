@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
 };
 use zip::ZipArchive;
@@ -320,13 +320,19 @@ fn hold_ancestors(
     checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
 ) -> Result<(), ArtifactError> {
     checkpoint()?;
-    validate_read_path(path)?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         let contained =
             bonsai_windows_credentials::is_app_container().map_err(|_| ArtifactError::Path)?;
-        for ancestor in path.ancestors().skip(1) {
+        if contained {
+            validate_read_path(path)?;
+        } else {
+            bonsai_windows_credentials::validate_external_path(path)
+                .map_err(|_| ArtifactError::Path)?;
+        }
+        let chain: Vec<&Path> = path.ancestors().skip(1).collect();
+        for ancestor in chain.into_iter().rev() {
             checkpoint()?;
             // The host owner retains its root guard. A contained reader lacks
             // root metadata rights; granting the volume root would broaden its
@@ -335,10 +341,7 @@ fn hold_ancestors(
             // request FILE_LIST_DIRECTORY: FILE_READ_ATTRIBUTES alone does not
             // make Windows enforce denied-delete sharing for ancestor renames.
             // No contained listing or volume-root authority is added.
-            if contained && ancestor.parent().is_none() {
-                continue;
-            }
-            if held_ancestors.contains(ancestor) {
+            if (contained && ancestor.parent().is_none()) || held_ancestors.contains(ancestor) {
                 continue;
             }
             let directory = OpenOptions::new()
@@ -363,6 +366,7 @@ fn hold_ancestors(
     }
     #[cfg(not(windows))]
     {
+        validate_read_path(path)?;
         let _ = (handles, held_ancestors);
     }
     Ok(())
@@ -370,11 +374,13 @@ fn hold_ancestors(
 
 fn validate_read_path(path: &Path) -> Result<(), ArtifactError> {
     #[cfg(windows)]
-    if bonsai_windows_credentials::is_app_container().map_err(|_| ArtifactError::Path)? {
-        return bonsai_windows_credentials::validate_read_path(path)
-            .map_err(|_| ArtifactError::Path);
+    {
+        bonsai_windows_credentials::validate_read_path(path).map_err(|_| ArtifactError::Path)
     }
-    validate_external_path(path).map_err(|_| ArtifactError::Path)
+    #[cfg(not(windows))]
+    {
+        validate_external_path(path)
+    }
 }
 
 fn check_locked(
@@ -400,22 +406,14 @@ fn check_locked(
 fn digest_hex(digest: [u8; 32]) -> String {
     hex::encode(digest)
 }
-/// Hash exactly `expected` bytes from the reader's current position through EOF.
-///
-/// The caller supplies a reusable, nonempty read buffer and a cancellation
-/// checkpoint invoked before every read. The lowercase SHA-256 covers the exact
-/// bytes read, without text decoding or newline normalization. This function
-/// retries interrupted reads after checking cancellation again; it neither
-/// rewinds nor locks the reader.
-///
-/// # Errors
-/// Rejects an empty buffer, unavailable native hashing, read or hash failures,
-/// short or long streams, byte-count overflow, and checkpoint errors.
-pub fn hash_reader(
+fn stream_and_hash_bounded(
     reader: &mut impl Read,
+    mut writer: Option<&mut dyn Write>,
     expected: u64,
     buffer: &mut [u8],
     checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
+    read_error: ArtifactError,
+    write_error: ArtifactError,
 ) -> Result<String, ArtifactError> {
     if buffer.is_empty() {
         return Err(ArtifactError::Configuration);
@@ -434,31 +432,80 @@ pub fn hash_reader(
         let count = match reader.read(buffer) {
             Ok(count) => count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(ArtifactError::Identity),
+            Err(_) => return Err(read_error),
         };
         if count == 0 {
             break;
         }
         total = total
-            .checked_add(u64::try_from(count).map_err(|_| ArtifactError::Identity)?)
-            .ok_or(ArtifactError::Identity)?;
+            .checked_add(u64::try_from(count).map_err(|_| read_error)?)
+            .ok_or(read_error)?;
         if total > expected {
-            return Err(ArtifactError::Identity);
+            return Err(read_error);
         }
+        let chunk = &buffer[..count];
         #[cfg(windows)]
-        hash.update(&buffer[..count])
-            .map_err(|_| ArtifactError::Identity)?;
+        hash.update(chunk).map_err(|_| read_error)?;
         #[cfg(not(windows))]
-        hash.update(&buffer[..count]);
+        hash.update(chunk);
+        if let Some(output) = writer.as_deref_mut() {
+            output.write_all(chunk).map_err(|_| write_error)?;
+        }
     }
     if total != expected {
-        return Err(ArtifactError::Identity);
+        return Err(read_error);
     }
     #[cfg(windows)]
-    let digest = hash.finish().map_err(|_| ArtifactError::Identity)?;
+    let digest = hash.finish().map_err(|_| read_error)?;
     #[cfg(not(windows))]
     let digest = hash.finalize().into();
     Ok(digest_hex(digest))
+}
+
+pub(crate) fn copy_and_hash_bounded(
+    source: &mut impl Read,
+    output: &mut impl Write,
+    expected: u64,
+    buffer: &mut [u8],
+    checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
+) -> Result<String, ArtifactError> {
+    stream_and_hash_bounded(
+        source,
+        Some(output),
+        expected,
+        buffer,
+        checkpoint,
+        ArtifactError::Archive,
+        ArtifactError::Installation,
+    )
+}
+
+/// Hash exactly `expected` bytes from the reader's current position through EOF.
+///
+/// The caller supplies a reusable, nonempty read buffer and a cancellation
+/// checkpoint invoked before every read. The lowercase SHA-256 covers the exact
+/// bytes read, without text decoding or newline normalization. This function
+/// retries interrupted reads after checking cancellation again; it neither
+/// rewinds nor locks the reader.
+///
+/// # Errors
+/// Rejects an empty buffer, unavailable native hashing, read or hash failures,
+/// short or long streams, byte-count overflow, and checkpoint errors.
+pub fn hash_reader(
+    reader: &mut impl Read,
+    expected: u64,
+    buffer: &mut [u8],
+    checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
+) -> Result<String, ArtifactError> {
+    stream_and_hash_bounded(
+        reader,
+        None,
+        expected,
+        buffer,
+        checkpoint,
+        ArtifactError::Identity,
+        ArtifactError::Identity,
+    )
 }
 
 struct Entry {
@@ -734,7 +781,7 @@ fn check_arm64(file: &mut (impl Read + Seek)) -> Result<(), ArtifactError> {
         return Err(ArtifactError::Architecture);
     };
     let offset = u64::from(u32::from_le_bytes([o0, o1, o2, o3]));
-    if length < 24 || offset > length - 24 {
+    if offset < 64 || length < 24 || offset > length - 24 {
         return Err(ArtifactError::Architecture);
     }
     file.seek(SeekFrom::Start(offset))
@@ -745,6 +792,8 @@ fn check_arm64(file: &mut (impl Read + Seek)) -> Result<(), ArtifactError> {
     if pe != [b'P', b'E', 0, 0, 0x64, 0xaa] {
         return Err(ArtifactError::Architecture);
     }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ArtifactError::Architecture)?;
     Ok(())
 }
 
@@ -814,7 +863,7 @@ pub fn is_redirect(metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Write};
+    use std::io::Cursor;
 
     #[test]
     fn names_reject_windows_aliases_and_redirects() {
@@ -1139,7 +1188,9 @@ mod tests {
         image[..2].copy_from_slice(b"MZ");
         image[60..64].copy_from_slice(&64_u32.to_le_bytes());
         image[64..70].copy_from_slice(&[b'P', b'E', 0, 0, 0x64, 0xaa]);
-        assert!(check_arm64(&mut Cursor::new(&image)).is_ok());
+        let mut cursor = Cursor::new(&image);
+        assert!(check_arm64(&mut cursor).is_ok());
+        assert_eq!(cursor.position(), 0);
         image[68] = 0x4c;
         assert_eq!(
             check_arm64(&mut Cursor::new(&image)),
@@ -1147,5 +1198,113 @@ mod tests {
         );
         image[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(check_arm64(&mut Cursor::new(&image)).is_err());
+
+        let mut overlapping = vec![0; 128];
+        overlapping[..2].copy_from_slice(b"MZ");
+        overlapping[8..14].copy_from_slice(&[b'P', b'E', 0, 0, 0x64, 0xaa]);
+        overlapping[60..64].copy_from_slice(&8_u32.to_le_bytes());
+        assert_eq!(
+            check_arm64(&mut Cursor::new(&overlapping)),
+            Err(ArtifactError::Architecture)
+        );
+    }
+
+    #[test]
+    fn copy_and_hash_bounded_streams_writes_and_rejects_bad_lengths() {
+        let mut buffer = [0_u8; 4];
+        let mut out = Vec::new();
+        let digest = copy_and_hash_bounded(
+            &mut Cursor::new(b"abcdef"),
+            &mut out,
+            6,
+            &mut buffer,
+            &mut || Ok(()),
+        );
+        assert_eq!(out, b"abcdef");
+        assert_eq!(
+            digest,
+            Ok("bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721".into())
+        );
+        out.clear();
+        assert_eq!(
+            copy_and_hash_bounded(
+                &mut Cursor::new(b"abcdef"),
+                &mut out,
+                7,
+                &mut buffer,
+                &mut || Ok(()),
+            ),
+            Err(ArtifactError::Archive)
+        );
+        out.clear();
+        assert_eq!(
+            copy_and_hash_bounded(
+                &mut Cursor::new(b"abcdef"),
+                &mut out,
+                5,
+                &mut buffer,
+                &mut || Ok(()),
+            ),
+            Err(ArtifactError::Archive)
+        );
+
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            copy_and_hash_bounded(
+                &mut Cursor::new(b"abc"),
+                &mut FailingWriter,
+                3,
+                &mut buffer,
+                &mut || Ok(()),
+            ),
+            Err(ArtifactError::Installation)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hold_ancestors_opens_top_down_and_validates_regular_read_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "SwiftBonsai-ancestors-check-{}-{nonce}",
+            std::process::id()
+        ));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested)?;
+        let first = nested.join("first.bin");
+        let second = nested.join("second.bin");
+        fs::write(&first, b"1")?;
+        fs::write(&second, b"2")?;
+        assert!(validate_read_path(&first).is_ok());
+        assert_eq!(validate_read_path(&nested), Err(ArtifactError::Path));
+        assert_eq!(
+            validate_read_path(&nested.join("missing.bin")),
+            Err(ArtifactError::Path)
+        );
+
+        let mut handles = Vec::new();
+        let mut held = BTreeSet::new();
+        hold_ancestors(&first, &mut handles, &mut held, &mut || Ok(()))?;
+        let held_count = handles.len();
+        assert!(held.contains(&nested));
+        assert!(held.contains(&root));
+        hold_ancestors(&second, &mut handles, &mut held, &mut || Ok(()))?;
+        assert_eq!(handles.len(), held_count);
+
+        drop(handles);
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

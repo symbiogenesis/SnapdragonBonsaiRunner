@@ -2,13 +2,13 @@
 
 use super::{
     ArtifactError, HASH_BUFFER_BYTES, Installation, RuntimeSpec, VerifiedRuntimeFile, check_arm64,
-    check_locked, enumerate_installation, hold_ancestors, inspect_archive, open_locked_file,
-    validate_external_path, verify_installed_files,
+    check_locked, copy_and_hash_bounded, enumerate_installation, hold_ancestors, inspect_archive,
+    open_locked_file, validate_external_path,
 };
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -141,19 +141,21 @@ fn stage_runtime_inner(
         )
     });
     let result = (|| {
-        extract(&mut zip, staging, &installation, &mut buffer)?;
-        let mut staging_handles = Vec::new();
-        let mut staging_held = BTreeSet::new();
-        // The same locked ZIP is unchanged since preflight; reuse its inventory.
-        let (_, files) = verify_installed_files(
-            &mut zip,
+        let (files, _staging_handles) = extract(&mut zip, staging, &installation, &mut buffer)?;
+        let mut installed_files = BTreeSet::new();
+        let mut installed_directories = BTreeSet::new();
+        enumerate_installation(
             staging,
-            installation,
-            &mut staging_handles,
-            &mut staging_held,
-            &mut buffer,
+            staging,
+            &mut installed_files,
+            &mut installed_directories,
             &mut || Ok(()),
         )?;
+        if !installed_files.iter().eq(installation.files.keys())
+            || installed_directories != installation.directories
+        {
+            return Err(ArtifactError::Installation);
+        }
         Ok(files)
     })();
     result.map_err(|error| RuntimeStagingError {
@@ -195,12 +197,14 @@ fn extract<R: Read + Seek>(
     staging: &Path,
     installation: &Installation,
     buffer: &mut [u8],
-) -> Result<(), ArtifactError> {
+) -> Result<(Vec<VerifiedRuntimeFile>, Vec<File>), ArtifactError> {
     for directory in &installation.directories {
         let path = staging.join(directory);
         validate_external_path(&path)?;
         fs::create_dir_all(path).map_err(|_| ArtifactError::Installation)?;
     }
+    let mut files = Vec::with_capacity(installation.files.len());
+    let mut handles = Vec::with_capacity(installation.files.len());
     for entry in installation.files.values() {
         let path = staging.join(&entry.name);
         validate_external_path(&path)?;
@@ -217,41 +221,25 @@ fn extract<R: Read + Seek>(
         let mut output = options
             .open(&path)
             .map_err(|_| ArtifactError::Installation)?;
-        copy_bounded(&mut source, &mut output, entry.bytes, buffer)?;
+        let sha256 = copy_and_hash_bounded(
+            &mut source,
+            &mut output,
+            entry.bytes,
+            buffer,
+            &mut || Ok(()),
+        )?;
         output.sync_all().map_err(|_| ArtifactError::Installation)?;
         if path.extension().is_some_and(|extension| {
             extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll")
         }) {
             check_arm64(&mut output)?;
         }
+        files.push(VerifiedRuntimeFile {
+            path,
+            bytes: entry.bytes,
+            sha256,
+        });
+        handles.push(output);
     }
-    Ok(())
-}
-
-fn copy_bounded(
-    source: &mut impl Read,
-    output: &mut File,
-    expected: u64,
-    buffer: &mut [u8],
-) -> Result<(), ArtifactError> {
-    let mut total = 0_u64;
-    loop {
-        let count = source.read(buffer).map_err(|_| ArtifactError::Archive)?;
-        if count == 0 {
-            break;
-        }
-        total = total
-            .checked_add(u64::try_from(count).map_err(|_| ArtifactError::Archive)?)
-            .ok_or(ArtifactError::Archive)?;
-        if total > expected {
-            return Err(ArtifactError::Archive);
-        }
-        output
-            .write_all(&buffer[..count])
-            .map_err(|_| ArtifactError::Installation)?;
-    }
-    if total != expected {
-        return Err(ArtifactError::Archive);
-    }
-    Ok(())
+    Ok((files, handles))
 }
