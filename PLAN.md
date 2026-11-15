@@ -228,6 +228,10 @@ adoption decisions without displacing native daily-use acceptance.
   matches, malformed/streaming input and bounded plain-source fallback. Keep
   native accessibility, X1/X2 responsiveness and complete CommonMark claims
   separate from focused supported-subset checks.
+  Include native regular/bold reading faces, all six heading sizes, line/paragraph
+  spacing, nested list/quote prefixes and full-width code surfaces in Light, Dark
+  and Windows high contrast, including width/DPI/reading-size reflow and Find
+  highlights over code. Focused source controls do not establish device acceptance.
 - [ ] Qualify the persistent offline Markdown worker's MXC/PSEC admission and
   denial controls, one-process/memory limits, bounded binary IPC and trusted-parent
   validation. Cover malformed/stale results, queue backpressure, worker exits and
@@ -1302,10 +1306,6 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 ### Pre-existing `main` verification housekeeping
 
-- [ ] Fix `format_at(&layout.job, "old")` in
-  [formatting tests](src/chat-ui/src/window/transcript/formatting/tests.rs)
-  (`markdown_renders_native_headings_emphasis_and_literal_code`), where
-  `job.text.find("old")` matches `"old"` inside `"bold"` instead of `"~~old~~"`.
 - [ ] Update unfulfilled `#[expect(clippy::used_underscore_binding)]` attributes in
   [credentials tests](src/windows-credentials/src/tests.rs) under `nightly-2026-11-12`.
 - [ ] Gate or wire up unused `pub(super) async fn exchange` in

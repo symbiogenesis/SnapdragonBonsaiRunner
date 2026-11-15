@@ -138,6 +138,7 @@ fn palette(theme: egui::Theme) -> egui::Visuals {
         visuals.window_fill = Color32::from_rgb(27, 33, 31);
         visuals.extreme_bg_color = Color32::from_rgb(24, 30, 28);
         visuals.faint_bg_color = Color32::from_rgb(35, 43, 39);
+        visuals.code_bg_color = Color32::from_rgb(35, 43, 40);
         visuals.selection.bg_fill = Color32::from_rgb(154, 182, 150);
         visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(17, 31, 21));
         visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 51, 46);

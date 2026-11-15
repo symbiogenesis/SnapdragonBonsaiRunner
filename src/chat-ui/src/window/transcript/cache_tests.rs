@@ -6,6 +6,7 @@ fn harness(transcript: Transcript) -> Harness<'static, Transcript> {
     Harness::builder()
         .with_theme(egui::Theme::Dark)
         .with_context_setup(|context| {
+            crate::window::appearance::configure_fonts(context);
             context.add_font_provider(crate::window::test_font_provider());
         })
         .build_ui_state(
@@ -26,6 +27,93 @@ fn layout_counts(transcript: &Transcript) -> Vec<usize> {
         .iter()
         .map(|message| message.body_layouts)
         .collect()
+}
+
+#[test]
+fn markdown_code_surfaces_reflow_with_unicode_and_preserve_find() -> std::io::Result<()> {
+    use crate::window::appearance;
+    appearance::prepare_fonts();
+    let capture =
+        std::env::var_os("BONSAI_MARKDOWN_CAPTURE_DIRECTORY").map(std::path::PathBuf::from);
+    if let Some(directory) = &capture {
+        bonsai_windows_credentials::validate_external_path(directory)?;
+        std::fs::create_dir_all(directory)?;
+    }
+    let source = "# A clearer reading experience\n\nMarkdown should make a response **easy to scan**, with *emphasis* where it helps and **bold with *nested emphasis***.\n\n## A little structure\n\n- Comfortable spacing between lines\n- Clear hierarchy for lists\n  - Nested details stay together\n\n> A short quotation can span several lines.\n> Keep its visual rhythm consistent.\n\n```rust\nlet greeting = \"Hello, 界 🌱\";\n\nprintln!(\"{greeting}\");\n```\n\nUse `inline code` within a sentence.\n\n```text\nA second block\n```";
+    for (name, size, theme) in [
+        (
+            "markdown-light.png",
+            [760.0, 940.0],
+            appearance::Theme::Light,
+        ),
+        (
+            "markdown-dark-narrow.png",
+            [480.0, 1_100.0],
+            appearance::Theme::Dark,
+        ),
+    ] {
+        let mut transcript = Transcript::default();
+        transcript.push(Role::Assistant, source.to_owned());
+        let mut chat = Harness::builder()
+            .with_size(size)
+            .with_context_setup(move |context| {
+                crate::window::configure_test_context(context);
+                appearance::Preferences {
+                    theme,
+                    ..Default::default()
+                }
+                .apply(context);
+            })
+            .build_ui_state(
+                |ui, transcript: &mut Transcript| {
+                    egui::ScrollArea::vertical().animated(false).show_viewport(
+                        ui,
+                        |ui, viewport| {
+                            transcript.show(
+                                ui,
+                                ui.available_width().min(700.0),
+                                viewport,
+                                None,
+                                true,
+                            )
+                        },
+                    );
+                },
+                transcript,
+            );
+        chat.run();
+        let before = chat.state().messages[0]
+            .cache
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Missing formatted cache"))?;
+        assert_eq!(before.code_panels.len(), 2);
+        assert!(before.code_panels.iter().all(|panel| {
+            panel.is_finite()
+                && panel.left() == 0.0
+                && panel.width() == before.width
+                && panel.height() >= 24.0
+        }));
+        assert!(before.code_panels[0].height() > before.code_panels[1].height());
+        let panels = before.code_panels.clone();
+        if let Some(directory) = &capture {
+            chat.render()
+                .map_err(std::io::Error::other)?
+                .save(directory.join(name))
+                .map_err(std::io::Error::other)?;
+        }
+        chat.state_mut().find_query("greeting");
+        chat.run();
+        let message = &chat.state().messages[0];
+        assert_eq!(message.body, source);
+        assert_eq!(
+            message.cache.as_ref().map(|cache| &cache.code_panels),
+            Some(&panels)
+        );
+        assert_active_underline_matches_glyphs(message);
+        chat.run();
+        assert_eq!(chat.state().messages[0].body, source);
+    }
+    Ok(())
 }
 
 #[test]
@@ -171,7 +259,7 @@ fn reader_size_reflows_styled_text_reasoning_and_find_once() {
             .job
             .sections
             .iter()
-            .any(|section| { section.format.font_id.size.to_bits() == 33.0_f32.to_bits() })
+            .any(|section| { section.format.font_id.size.to_bits() == 42.0_f32.to_bits() })
     );
     assert!(cache.reasoning.as_ref().is_some_and(|reasoning| {
         reasoning.job.text == "Visible reasoning 🌱"

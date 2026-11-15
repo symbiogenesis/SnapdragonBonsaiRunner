@@ -13,7 +13,8 @@ const CODE: u8 = 1;
 const ITALIC: u8 = 2;
 const STRONG: u8 = 4;
 const STRIKE: u8 = 8;
-const KNOWN_FLAGS: u8 = CODE | ITALIC | STRONG | STRIKE;
+const CODE_BLOCK: u8 = 16;
+const KNOWN_FLAGS: u8 = CODE | ITALIC | STRONG | STRIKE | CODE_BLOCK;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -59,7 +60,7 @@ fn push_range(bytes: &mut Vec<u8>, range: &Range<usize>) -> Option<()> {
 
 #[cfg(test)]
 fn font_size(size: f32) -> Option<u8> {
-    [16_u8, 18, 20, 22]
+    [16_u8, 17, 18, 19, 20, 21, 22, 24, 28]
         .into_iter()
         .find(|candidate| f32::from(*candidate).to_bits() == size.to_bits())
 }
@@ -69,6 +70,10 @@ fn flags(format: &egui::TextFormat, visuals: &egui::Visuals) -> u8 {
     let mut flags = 0;
     if format.font_id.family == egui::FontFamily::Monospace {
         flags |= CODE;
+    }
+    if matches!(&format.font_id.family, egui::FontFamily::Name(name) if name.as_ref() == super::presentation::CODE_BLOCK)
+    {
+        flags |= CODE | CODE_BLOCK;
     }
     if format.italics {
         flags |= ITALIC;
@@ -129,7 +134,10 @@ pub(super) fn encode(layout: &Layout) -> Vec<u8> {
 }
 
 fn text_format(flags: u8, size: u8, visuals: &egui::Visuals) -> Option<egui::TextFormat> {
-    if flags & !KNOWN_FLAGS != 0 || ![16, 18, 20, 22].contains(&size) {
+    if flags & !KNOWN_FLAGS != 0
+        || (flags & CODE_BLOCK != 0 && flags & CODE == 0)
+        || ![16, 17, 18, 19, 20, 21, 22, 24, 28].contains(&size)
+    {
         return None;
     }
     let color = if flags & STRONG != 0 {
@@ -137,7 +145,12 @@ fn text_format(flags: u8, size: u8, visuals: &egui::Visuals) -> Option<egui::Tex
     } else {
         visuals.text_color()
     };
-    let font = if flags & CODE != 0 {
+    let font = if flags & CODE_BLOCK != 0 {
+        egui::FontId::new(
+            f32::from(size),
+            egui::FontFamily::Name(super::presentation::CODE_BLOCK.into()),
+        )
+    } else if flags & CODE != 0 {
         egui::FontId::monospace(f32::from(size))
     } else {
         egui::FontId::proportional(f32::from(size))
@@ -345,6 +358,7 @@ mod tests {
         let source = "界";
         for section in [
             (0, 3, 16, 16),
+            (0, 3, 32, 16),
             (0, 3, 0, 255),
             (1, 3, 0, 16),
             (0, 1, 0, 16),
@@ -359,6 +373,34 @@ mod tests {
         let mut invalid_utf8 = packet(source, &[(0, 3, 0, 16)], &[]);
         invalid_utf8[8] = 255;
         assert!(decode(source, &invalid_utf8).is_none());
+    }
+
+    #[test]
+    fn markdown_wire_admits_only_fixed_code_block_and_heading_styles() -> Result<(), &'static str> {
+        for size in [16, 17, 19, 21, 24, 28] {
+            let bytes = packet("heading", &[(0, 7, STRONG, size)], &[(0, 7, 0, 7, 1)]);
+            assert!(decode("heading", &bytes).is_some());
+        }
+        let bytes = packet("code", &[(0, 4, CODE | CODE_BLOCK, 16)], &[(0, 4, 0, 4, 1)]);
+        let layout = decode("code", &bytes).ok_or("Valid block style rejected")?;
+        assert_eq!(
+            layout.job.sections[0].format.font_id.family,
+            egui::FontFamily::Name(super::super::presentation::CODE_BLOCK.into())
+        );
+        assert_eq!(encode(&layout), bytes);
+        for flags in [CODE_BLOCK, CODE_BLOCK | STRONG, 32, 255] {
+            assert!(decode("code", &packet("code", &[(0, 4, flags, 16)], &[])).is_none());
+        }
+        for size in [0, 15, 23, 29, 255] {
+            assert!(
+                decode(
+                    "code",
+                    &packet("code", &[(0, 4, CODE | CODE_BLOCK, size)], &[])
+                )
+                .is_none()
+            );
+        }
+        Ok(())
     }
 
     #[test]

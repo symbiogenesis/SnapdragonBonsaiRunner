@@ -411,6 +411,7 @@ mod tests {
             .with_size([640.0, 320.0])
             .with_theme(egui::Theme::Dark)
             .with_context_setup(|context| {
+                crate::window::appearance::configure_fonts(context);
                 context.add_font_provider(crate::window::test_font_provider());
                 context.style_mut_of(egui::Theme::Dark, |style| {
                     style.scroll_animation = egui::style::ScrollAnimation::none();

@@ -63,6 +63,7 @@ struct LayoutCache {
     highlight_color: Color32,
     reasoning_bytes: usize,
     body: Arc<egui::Galley>,
+    code_panels: Vec<egui::Rect>,
     // Find retains source byte ranges; the galley contains rendered Markdown.
     source_map: Arc<formatting::SourceMap>,
     reasoning: Option<Arc<egui::Galley>>,
@@ -692,12 +693,12 @@ impl Message {
         let (previous_body, previous_reasoning, previous_underline) =
             self.cache.take().map_or((None, None, Vec::new()), |cache| {
                 (
-                    Some((cache.body, cache.source_map)),
+                    Some((cache.body, cache.source_map, cache.code_panels)),
                     cache.reasoning,
                     cache.underline,
                 )
             });
-        let (body, source_map) = if body_unchanged && let Some(body) = previous_body {
+        let (body, source_map, code_panels) = if body_unchanged && let Some(body) = previous_body {
             body
         } else {
             #[cfg(test)]
@@ -754,6 +755,7 @@ impl Message {
             highlight_color,
             reasoning_bytes: self.reasoning.len(),
             body,
+            code_panels,
             source_map,
             reasoning,
         })
@@ -796,7 +798,11 @@ impl Message {
         width: f32,
         text_size: f32,
         matches: &[search::Match],
-    ) -> (Arc<egui::Galley>, Arc<formatting::SourceMap>) {
+    ) -> (
+        Arc<egui::Galley>,
+        Arc<formatting::SourceMap>,
+        Vec<egui::Rect>,
+    ) {
         #[cfg(test)]
         self.highlight_range_visits
             .set(self.highlight_range_visits.get() + matches.len());
@@ -809,10 +815,9 @@ impl Message {
             matches,
             self.markdown.parsed_for(&self.body),
         );
-        (
-            ui.fonts_mut(|fonts| fonts.layout_job(layout.job)),
-            layout.source_map,
-        )
+        let body = ui.fonts_mut(|fonts| fonts.layout_job(layout.job));
+        let code_panels = formatting::code_panels(&body);
+        (body, layout.source_map, code_panels)
     }
     fn height(&self) -> f32 {
         let Some(cache) = &self.cache else {
@@ -868,8 +873,29 @@ impl Message {
             if self.body.is_empty() && self.pending {
                 child.label(RichText::new("Responding…").weak().italics());
             } else if !self.body.is_empty() {
+                // Reserve the paint slot before selectable text, so code surfaces
+                // remain behind glyphs, selection and Find highlights.
+                let code_surface = child.painter().add(egui::Shape::Noop);
                 let response =
                     child.add(egui::Label::new(Arc::clone(&cache.body)).selectable(true));
+                child.painter().set(
+                    code_surface,
+                    egui::Shape::Vec(
+                        cache
+                            .code_panels
+                            .iter()
+                            .map(|panel| {
+                                egui::Shape::rect_filled(
+                                    panel
+                                        .translate(response.rect.min.to_vec2())
+                                        .expand2(egui::vec2(6.0, 3.0)),
+                                    6.0,
+                                    child.visuals().code_bg_color,
+                                )
+                            })
+                            .collect(),
+                    ),
+                );
                 for line in &cache.underline {
                     child.painter().line_segment(
                         line.map(|point| point + response.rect.min.to_vec2()),

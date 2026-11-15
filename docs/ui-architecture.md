@@ -229,6 +229,18 @@ The UI creates native egui text widgets from admitted results.
 Unavailable or failed parsing leaves complete plain source visible and ends the
 parser session; parsing never falls back into the trusted UI process.
 
+Markdown uses the current appearance theme and reading size: six heading sizes,
+native bold faces for headings/emphasis/table headers, comfortable line leading
+and compact paragraph gaps. Matched Windows Segoe UI regular/bold faces load once
+before the window starts, with bundled fonts and system-script fallback. Nested
+lists indent and quotes repeat their marker on authored lines. Inline code has
+a compact background; code blocks use rounded full-width native surfaces behind
+selectable text and Find highlights. Surface bounds share the galley's cache and
+reflow with width, DPI and reading size. A fixed code-block style bit and closed
+heading-size allowlist remain subject to trusted-parent validation; the worker
+supplies no arbitrary fonts, coordinates or theme colors. Windows high contrast
+continues to take precedence. These styles add no separately persisted theme.
+
 The model states are unavailable, preparing, ready, generating, awaiting teardown,
 stopping, retryable and restarting. Send requires acknowledged readiness; Retry
 requires teardown notification and explicit action. Replace the ordered event

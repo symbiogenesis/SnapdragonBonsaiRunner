@@ -4,6 +4,7 @@ use super::{egui, search};
 use std::{ops::Range, sync::Arc};
 
 mod pending;
+mod presentation;
 mod wire;
 pub(super) use pending::Pending;
 #[cfg(test)]
@@ -150,8 +151,7 @@ pub(super) fn layout_job(
     matches: &[search::Match],
     parsed: Option<(&Layout, usize)>,
 ) -> Layout {
-    let normal =
-        egui::TextFormat::simple(egui::FontId::proportional(text_size), visuals.text_color());
+    let normal = presentation::body_format(text_size, visuals);
     let Some((parsed, prefix_len)) = parsed.filter(|_| structured) else {
         return plain(body, width, normal, visuals, matches);
     };
@@ -203,21 +203,7 @@ pub(super) fn layout_job(
     job.wrap.max_width = width;
     let mut next_match = 0;
     for section in &parsed.job.sections {
-        let mut format = section.format.clone();
-        format.font_id.size *= text_size / 16.0;
-        format.color = if format.color == template.strong_text_color() {
-            visuals.strong_text_color()
-        } else {
-            visuals.text_color()
-        };
-        format.background = if format.background == template.code_bg_color {
-            visuals.code_bg_color
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-        if format.strikethrough.width > 0.0 {
-            format.strikethrough.color = format.color;
-        }
+        let format = presentation::text_format(&section.format, text_size, visuals, &template);
         let mut cursor = section.byte_range.start.0;
         let end = section.byte_range.end.0;
         while cursor < end {
@@ -238,7 +224,12 @@ pub(super) fn layout_job(
                 effective.background = visuals.selection.bg_fill;
                 effective.color = visuals.selection.stroke.color;
             }
-            job.append(&parsed.job.text[cursor..until], 0.0, effective);
+            presentation::append(
+                &mut job,
+                &parsed.job.text[cursor..until],
+                effective,
+                text_size,
+            );
             cursor = until;
         }
     }
@@ -250,16 +241,21 @@ pub(super) fn layout_job(
             .filter(|found| found.range.start >= tail_start)
         {
             if cursor < found.range.start {
-                job.append(&body[cursor..found.range.start], 0.0, normal.clone());
+                presentation::append(
+                    &mut job,
+                    &body[cursor..found.range.start],
+                    normal.clone(),
+                    text_size,
+                );
             }
             let mut highlighted = normal.clone();
             highlighted.background = visuals.selection.bg_fill;
             highlighted.color = visuals.selection.stroke.color;
-            job.append(&body[found.range.clone()], 0.0, highlighted);
+            presentation::append(&mut job, &body[found.range.clone()], highlighted, text_size);
             cursor = found.range.end;
         }
         if cursor < body.len() {
-            job.append(&body[cursor..], 0.0, normal);
+            presentation::append(&mut job, &body[cursor..], normal, text_size);
         }
         let mut entries: Vec<Mapping> = parsed
             .source_map
@@ -284,4 +280,8 @@ pub(super) fn layout_job(
         Arc::clone(&parsed.source_map)
     };
     Layout { job, source_map }
+}
+
+pub(super) fn code_panels(galley: &egui::Galley) -> Vec<egui::Rect> {
+    presentation::code_panels(galley)
 }

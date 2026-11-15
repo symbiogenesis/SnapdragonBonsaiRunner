@@ -24,25 +24,112 @@ fn format_at<'a>(job: &'a egui::text::LayoutJob, needle: &str) -> Option<&'a egu
 
 #[test]
 fn markdown_renders_native_headings_emphasis_and_literal_code() {
-    let source = "# Heading 界\n\nUse **bold** and *emphasis*, ~~old~~ and `let 界 = 1;`.\n\n```rust\nfn main() {}\n```\n";
+    let source = "# Heading 界\n\nUse **bold** and *emphasis*, ~~obsolete~~ and `let 界 = 1;`.\n\n```rust\nfn main() {}\n```\n";
     let layout = render(source, &[]);
     assert_eq!(
         layout.job.text,
-        "Heading 界\n\nUse bold and emphasis, old and let 界 = 1;.\n\nfn main() {}\n"
+        "Heading 界\n\nUse bold and emphasis, obsolete and let 界 = 1;.\n\nfn main() {}\n"
     );
     assert!(
         format_at(&layout.job, "Heading")
-            .is_some_and(|format| format.font_id.size.to_bits() == 22.0_f32.to_bits())
+            .is_some_and(|format| format.font_id.size.to_bits() == 28.0_f32.to_bits())
     );
     assert!(format_at(&layout.job, "emphasis").is_some_and(|format| format.italics));
-    assert!(format_at(&layout.job, "old").is_some_and(|format| format.strikethrough.width > 0.0));
-    for needle in ["let 界", "fn main"] {
-        assert!(
-            format_at(&layout.job, needle).is_some_and(|format| format.font_id.family
-                == egui::FontFamily::Monospace
-                && format.background == egui::Visuals::dark().code_bg_color)
+    assert!(
+        format_at(&layout.job, "obsolete").is_some_and(|format| format.strikethrough.width > 0.0)
+    );
+    assert!(format_at(&layout.job, "let 界").is_some_and(|format| {
+        format.font_id.family == egui::FontFamily::Monospace
+            && format.background == egui::Visuals::dark().code_bg_color
+    }));
+    assert!(format_at(&layout.job, "fn main").is_some_and(|format| {
+        format.font_id.family == egui::FontFamily::Name(presentation::CODE_BLOCK.into())
+            && format.background == egui::Color32::TRANSPARENT
+    }));
+}
+
+#[test]
+fn markdown_reading_theme_preserves_weight_spacing_scaling_and_find_colors()
+-> Result<(), &'static str> {
+    let source = "## Heading\n\nBody **bold** and ***both*** with `code`.\n\n```\nblock\n```";
+    let parsed = parse_layout(source);
+    for mut visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+        // A contrast theme may deliberately give strong and normal text the
+        // same ink. Font weight still has to distinguish bold and headings.
+        visuals.override_text_color = Some(egui::Color32::YELLOW);
+        for size in [14.0, 24.0] {
+            let layout = layout_job(
+                source,
+                true,
+                240.0,
+                size,
+                &visuals,
+                &[],
+                Some((&parsed, source.len())),
+            );
+            for needle in ["Heading", "bold", "both"] {
+                let format = format_at(&layout.job, needle).ok_or("Missing styled text")?;
+                assert_eq!(
+                    format.font_id.family,
+                    egui::FontFamily::Name("Bonsai Strong".into())
+                );
+                assert_eq!(format.color, visuals.strong_text_color());
+            }
+            assert!(format_at(&layout.job, "both").is_some_and(|format| format.italics));
+            assert_eq!(
+                format_at(&layout.job, "Heading").map(|format| format.font_id.size),
+                Some(size * 1.5)
+            );
+            assert_eq!(
+                format_at(&layout.job, "Body").and_then(|format| format.line_height),
+                Some(size * 1.55)
+            );
+            assert_eq!(
+                format_at(&layout.job, "code").map(|format| format.background),
+                Some(visuals.code_bg_color)
+            );
+            assert_eq!(
+                format_at(&layout.job, "block").map(|format| format.background),
+                Some(egui::Color32::TRANSPARENT)
+            );
+            assert!(
+                layout
+                    .job
+                    .sections
+                    .iter()
+                    .any(|section| section.format.line_height == Some(size * 0.65))
+            );
+        }
+        let start = source.find("bold").ok_or("Missing source match")?;
+        let found = [search::Match {
+            message: 1,
+            range: start..start + 4,
+        }];
+        let layout = layout_job(
+            source,
+            true,
+            240.0,
+            16.0,
+            &visuals,
+            &found,
+            Some((&parsed, source.len())),
+        );
+        let bold = format_at(&layout.job, "bold").ok_or("Missing highlighted bold")?;
+        assert_eq!(
+            bold.font_id.family,
+            egui::FontFamily::Name("Bonsai Strong".into())
+        );
+        assert_eq!(bold.color, visuals.selection.stroke.color);
+        assert_eq!(bold.background, visuals.selection.bg_fill);
+        assert_eq!(
+            layout
+                .job
+                .text
+                .get(layout.source_map.range(start..start + 4)),
+            Some("bold")
         );
     }
+    Ok(())
 }
 
 #[test]
@@ -184,6 +271,10 @@ fn markdown_theme_changes_invalidate_only_assistant_layouts() {
     transcript.push(Role::Assistant, "**bold** `code`".to_owned());
     let mut chat = Harness::builder()
         .with_theme(egui::Theme::Dark)
+        .with_context_setup(|context| {
+            crate::window::appearance::configure_fonts(context);
+            context.add_font_provider(crate::window::test_font_provider());
+        })
         .build_ui_state(
             |ui, transcript: &mut Transcript| {
                 for message in &mut transcript.messages {
