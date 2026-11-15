@@ -703,7 +703,7 @@ impl State {
             self.transcript.start_turn(text, self.committed.len());
         }
         self.request_conversation = Some(self.active_conversation);
-        self.recovery_dirty = true;
+        self.touch_conversation(self.active_conversation);
         self.input.clear();
         self.place_composer_cursor(0);
         self.model = ModelLifecycle::Generating;
@@ -730,7 +730,7 @@ impl State {
         self.conversation_search.clear();
         let id = self.next_conversation;
         self.next_conversation = next;
-        self.conversations.push(Conversation::new(id));
+        self.conversations.insert(0, Conversation::new(id));
         self.active_conversation = id;
         self.clear_conversation();
         self.recovery_dirty = true;
@@ -771,6 +771,7 @@ impl State {
             state.model = ModelLifecycle::Stopping;
             state.transcript.remove_empty_response();
             state.set_status("Stopping the response…", false);
+            state.touch_conversation(state.active_or_routed_conversation());
         });
     }
 
@@ -920,17 +921,21 @@ impl State {
         if !self.routing_request {
             self.stop_speech();
         }
-        let adopted = matches!(
+        let mutating_turn = matches!(
             self.model,
             ModelLifecycle::Generating
                 | ModelLifecycle::Stopping
                 | ModelLifecycle::AwaitingTeardown
-        ) && self.adopt_interrupted();
+        );
+        let adopted = mutating_turn && self.adopt_interrupted();
         self.context_tokens = None;
         self.model = ModelLifecycle::Unavailable;
         self.transcript.remove_empty_response();
         if !adopted && !self.transcript.latest_interrupted(&self.committed) {
             self.retain_draft();
+        }
+        if mutating_turn {
+            self.touch_conversation(self.active_or_routed_conversation());
         }
         self.set_status(message, true);
     }
@@ -942,6 +947,7 @@ impl State {
         {
             // A worker can reject a queued Send after announcing teardown.
             // Restore its prompt only to the conversation that sent it.
+            let mut restored = false;
             if let Some(saved) = self
                 .conversations
                 .iter_mut()
@@ -951,6 +957,10 @@ impl State {
                 && draft_buffer::fits(text)
             {
                 text.clone_into(&mut saved.input);
+                restored = true;
+            }
+            if restored {
+                self.touch_conversation(id);
             }
             return;
         }
@@ -958,6 +968,7 @@ impl State {
         if !retry_required {
             self.transcript.interrupt_turn(self.committed.len());
         }
+        self.touch_conversation(self.active_or_routed_conversation());
         if self.model.stopping() || self.model == ModelLifecycle::Restarting {
             // A rejection can queue just before Stop or behind the first
             // teardown notice. Preserve explicit Stop/retry ownership until
@@ -1051,7 +1062,10 @@ impl State {
                 self.fail(&message);
                 self.model = ModelLifecycle::Retryable;
             }
-            Event::Stopping(text) => self.stopping_response(&text),
+            Event::Stopping(text) => {
+                self.stopping_response(&text);
+                self.touch_conversation(self.active_or_routed_conversation());
+            }
             Event::Stopped => self.stopped_response(),
             Event::ContextCapacity(tokens) => self.context_tokens = Some(tokens),
             Event::Ready => {
@@ -1070,8 +1084,12 @@ impl State {
                 self.answer_complete = false;
                 self.transcript.stage();
                 self.set_status(label, false);
+                self.touch_conversation(self.active_or_routed_conversation());
             }
-            Event::Draft(text) => self.retained_draft = text,
+            Event::Draft(text) => {
+                self.retained_draft = text;
+                self.touch_conversation(self.active_or_routed_conversation());
+            }
             Event::Text(text) | Event::RetainedAnswer(text) => {
                 self.last_answer.push_str(&text);
                 self.transcript.append(&text, false);
@@ -1079,9 +1097,16 @@ impl State {
                 self.stage
                     .unwrap_or("Writing…")
                     .clone_into(&mut self.status);
+                self.touch_conversation(self.active_or_routed_conversation());
             }
-            Event::Reasoning(text) => self.transcript.append(&text, true),
-            Event::Committed(history) => self.commit_history(history),
+            Event::Reasoning(text) => {
+                self.transcript.append(&text, true);
+                self.touch_conversation(self.active_or_routed_conversation());
+            }
+            Event::Committed(history) => {
+                self.commit_history(history);
+                self.touch_conversation(self.active_or_routed_conversation());
+            }
             Event::Complete(completion) => {
                 if self.streaming_active {
                     if let Some(tail) = self.streaming_svg_filter.finish()
@@ -1109,6 +1134,7 @@ impl State {
                     }
                 };
                 self.set_status(message, completion == Completion::TokenLimit);
+                self.touch_conversation(self.active_or_routed_conversation());
             }
             Event::Failed(message) => self.fail(&message),
         }
@@ -1651,6 +1677,7 @@ impl State {
         };
         let cursor = plan.apply(&mut self.input);
         self.place_composer_cursor(cursor);
+        self.touch_conversation(self.active_conversation);
         true
     }
 
@@ -2025,6 +2052,7 @@ impl State {
                 {
                     prompt.clone_into(&mut self.input);
                     self.place_composer_cursor(self.input.chars().count());
+                    self.touch_conversation(self.active_conversation);
                     self.focus_composer = true;
                 }
             }

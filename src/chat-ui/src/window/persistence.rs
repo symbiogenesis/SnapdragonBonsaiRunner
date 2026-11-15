@@ -207,7 +207,7 @@ impl State {
         })
     }
 
-    fn restore_workspace(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub(super) fn restore_workspace(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.len() > 8 * 1024 * 1024 {
             return Err(io::Error::other("Saved workspace is too large."));
         }

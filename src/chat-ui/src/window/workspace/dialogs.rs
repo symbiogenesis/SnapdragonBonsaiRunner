@@ -25,7 +25,7 @@ impl State {
                 {
                     title.trim().clone_into(&mut conversation.title);
                     conversation.renamed = true;
-                    self.recovery_dirty = true;
+                    self.touch_conversation(id);
                 }
             }
             Decision::Cancel => {}

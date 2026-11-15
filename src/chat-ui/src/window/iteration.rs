@@ -204,7 +204,7 @@ impl State {
         let mut branch = Conversation::new(self.active_conversation);
         branch.title = format!("{title} · {label}");
         branch.renamed = true;
-        self.conversations.push(branch);
+        self.conversations.insert(0, branch);
         self.conversation_search.clear();
         self.transcript = transcript;
         self.committed = history;
@@ -427,7 +427,8 @@ mod tests {
         );
         assert!(commands.try_recv().is_err());
         assert_eq!(state.committed.len(), 4);
-        assert!(state.conversations[0].saved.as_ref().is_some_and(|saved| {
+        assert_eq!(state.conversations[0].id, state.active_conversation);
+        assert!(state.conversations[1].saved.as_ref().is_some_and(|saved| {
             saved.input == "Keep this draft"
                 && saved.committed[5].content.as_ref() == "Partial answer"
         }));
@@ -448,7 +449,8 @@ mod tests {
         assert!(
             matches!(commands.try_recv(), Ok(Command::Send { text, enable_thinking: true, extra_effort: true, max_completion_tokens: 1024, abliteration_scale, .. }) if text == "Same question" && (abliteration_scale - 1.4).abs() < f32::EPSILON)
         );
-        let original = state.conversations[0].saved.as_ref();
+        assert_eq!(state.conversations[0].id, state.active_conversation);
+        let original = state.conversations[1].saved.as_ref();
         assert!(original.is_some_and(
             |saved| saved.committed.len() == 4 && saved.input == "Unsent source draft 🌱"
         ));
@@ -478,8 +480,9 @@ mod tests {
             matches!(commands.try_recv(), Ok(Command::Send { text, .. }) if text == "Revised question")
         );
         assert!(state.committed.is_empty());
+        assert_eq!(state.conversations[0].id, state.active_conversation);
         assert!(
-            state.conversations[0]
+            state.conversations[1]
                 .saved
                 .as_ref()
                 .is_some_and(|saved| saved.committed.len() == 4)
@@ -615,8 +618,9 @@ mod tests {
         assert!(
             matches!(commands.try_recv(), Ok(Command::RestoreChat(history)) if history.last().is_some_and(|message| message.content.as_ref() == "Partial answer"))
         );
+        assert_eq!(state.conversations[0].id, state.active_conversation);
         assert!(
-            state.conversations[0]
+            state.conversations[1]
                 .saved
                 .as_ref()
                 .is_some_and(|saved| saved.input == "New draft")

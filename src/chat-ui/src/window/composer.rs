@@ -142,7 +142,9 @@ impl State {
         label: egui::Id,
     ) -> (egui::Response, Option<egui::Rect>) {
         let response = output.response.response.labelled_by(label);
-        self.recovery_dirty |= response.changed();
+        if response.changed() {
+            self.touch_conversation(self.active_conversation);
+        }
         self.composer_id = Some(response.id);
         let pending_cursor = self.pending_cursor.take();
         let cursor = pending_cursor.or(output.cursor_range);

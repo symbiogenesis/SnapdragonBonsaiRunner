@@ -160,7 +160,7 @@ fn conversation_actions_delete_an_inactive_row_without_switching_the_active_draf
             Ok(Command::NewChat)
         ));
         let active = chat.state().app.active_conversation;
-        chat.state_mut().app.conversations[1].title = "Current conversation".to_owned();
+        chat.state_mut().app.conversations[0].title = "Current conversation".to_owned();
         chat.state_mut().app.input = "Continue this draft".to_owned();
         open_sidebar(&mut chat, size);
         chat.run();
@@ -756,7 +756,7 @@ fn conversation_progress_follows_the_response_owner_and_clears_when_generation_e
 
             chat.state_mut().app.new_chat();
             let browsing = chat.state().app.active_conversation;
-            chat.state_mut().app.conversations[1].title = "Browsing conversation".into();
+            chat.state_mut().app.conversations[0].title = "Browsing conversation".into();
             chat.state_mut().app.input = "Keep this draft".into();
             chat.state_mut()
                 .app
@@ -1142,7 +1142,7 @@ fn capture_chat_layouts_when_requested() -> io::Result<()> {
         } else if name == "sidebar-many.png" {
             for index in 1..128 {
                 chat.state_mut().app.new_chat();
-                chat.state_mut().app.conversations[index].title =
+                chat.state_mut().app.conversations[0].title =
                     format!("Conversation {index}: a longer title to browse");
             }
         } else if matches!(
@@ -1733,4 +1733,66 @@ fn speech_preparation_uses_speaker_progress_without_error_panel() {
             .accesskit_node()
             .is_disabled()
     );
+}
+
+#[test]
+fn conversation_history_ui_updates_recency_on_draft_edit_starter_prompt_and_rename() {
+    let mut chat = harness([1180.0, 860.0], false);
+    let first = chat.state().app.active_conversation;
+    chat.state_mut().app.conversations[0].title = "First chat".into();
+    chat.state_mut().app.new_chat();
+    let second = chat.state().app.active_conversation;
+    chat.state_mut().app.conversations[0].title = "Second chat".into();
+    chat.state_mut().app.new_chat();
+    let third = chat.state().app.active_conversation;
+    chat.state_mut().app.conversations[0].title = "Third chat".into();
+    chat.run();
+
+    let order = |chat: &Harness<'_, Fixture>| {
+        chat.state()
+            .app
+            .conversations
+            .iter()
+            .map(|conversation| conversation.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(&chat), vec![third, second, first]);
+
+    // Selecting a conversation to view it does not change recency order.
+    chat.get_by_role_and_label(egui::Role::Button, "First chat")
+        .click();
+    chat.run();
+    assert_eq!(chat.state().app.active_conversation, first);
+    assert_eq!(order(&chat), vec![third, second, first]);
+
+    // Starter prompt populates the draft and promotes `first`.
+    chat.get_by_role_and_label(egui::Role::Button, "Explore an idea")
+        .click();
+    chat.run();
+    assert_eq!(order(&chat), vec![first, third, second]);
+
+    // Viewing `second` leaves order unchanged until typing in the composer.
+    chat.get_by_role_and_label(egui::Role::Button, "Second chat")
+        .click();
+    chat.run();
+    assert_eq!(order(&chat), vec![first, third, second]);
+    chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message")
+        .type_text("A new note");
+    chat.run();
+    assert_eq!(order(&chat), vec![second, first, third]);
+
+    // Cancelling a rename leaves order unchanged; confirming promotes `third`.
+    chat.state_mut().app.rename_conversation = Some((third, "Renamed third".into()));
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::Button, "Cancel")
+        .click();
+    chat.run();
+    assert_eq!(order(&chat), vec![second, first, third]);
+
+    chat.state_mut().app.rename_conversation = Some((third, "Renamed third".into()));
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::Button, "Save name")
+        .click();
+    chat.run();
+    assert_eq!(order(&chat), vec![third, second, first]);
 }

@@ -24,7 +24,7 @@ fn fixture() -> Fixture {
     app.transcript.remove_empty_response();
     app.input = "An unfinished gardening draft".into();
     app.new_chat();
-    app.conversations[1].title = "Voyage à Montréal".into();
+    app.conversations[0].title = "Voyage à Montréal".into();
     app.transcript
         .push(Role::User, "Walk beside the river.".into());
     app.transcript.push(Role::Assistant, String::new());
@@ -34,7 +34,7 @@ fn fixture() -> Fixture {
     app.transcript.remove_empty_response();
     app.input = "Unsent Cobalt itinerary".into();
     app.new_chat();
-    app.conversations[2].title = "Notebook".into();
+    app.conversations[0].title = "Notebook".into();
     app.transcript.push(Role::User, "Watch a seedling.".into());
     app.transcript.push(Role::Assistant, String::new());
     app.input = DRAFT.into();
@@ -250,7 +250,7 @@ fn find_sync_sidebar_and_find_share_unicode_and_long_phrase_matching() {
             .replace_response(&format!("Ο{query} then Ο{query}"), None);
         chat.run();
         type_query(&mut chat, query);
-        assert_eq!(chat.state().app.conversation_search.rows, [2]);
+        assert_eq!(chat.state().app.conversation_search.rows, [0]);
         chat.get_by_role_and_label(egui::Role::Button, "Notebook")
             .click();
         chat.run();
@@ -297,7 +297,7 @@ fn conversation_history_filters_unicode_titles_and_inactive_messages_as_you_type
     let mut chat = harness([1180.0, 860.0]);
     let active = chat.state().app.active_conversation;
     type_query(&mut chat, "éL");
-    assert_eq!(chat.state().app.conversation_search.rows, [0]);
+    assert_eq!(chat.state().app.conversation_search.rows, [2]);
     assert!(
         chat.query_by_role_and_label(egui::Role::Button, "Garden notes")
             .is_some()
@@ -307,7 +307,7 @@ fn conversation_history_filters_unicode_titles_and_inactive_messages_as_you_type
             .is_none()
     );
     type_query(&mut chat, "AN");
-    assert_eq!(chat.state().app.conversation_search.rows, [0]);
+    assert_eq!(chat.state().app.conversation_search.rows, [2]);
     clear_query(&mut chat);
     type_query(&mut chat, "MONTRÉAL");
     assert_eq!(chat.state().app.conversation_search.rows, [1]);
@@ -331,7 +331,7 @@ fn conversation_history_equivalent_folded_queries_reuse_scans_and_keep_raw_chang
         app.active_conversation,
         &app.transcript,
     ));
-    assert_eq!(app.conversation_search.rows, [2]);
+    assert_eq!(app.conversation_search.rows, [0]);
     assert!(app.conversation_search.take_scroll_reset());
     let scans: Vec<_> = app
         .conversations
@@ -347,7 +347,7 @@ fn conversation_history_equivalent_folded_queries_reuse_scans_and_keep_raw_chang
             app.active_conversation,
             &app.transcript,
         ));
-        assert_eq!(app.conversation_search.rows, [2]);
+        assert_eq!(app.conversation_search.rows, [0]);
         assert!(app.conversation_search.take_scroll_reset());
         assert_eq!(
             app.conversations
@@ -378,7 +378,7 @@ fn conversation_history_equivalent_folded_queries_reuse_scans_and_keep_raw_chang
 fn conversation_history_matches_never_cross_source_boundaries() -> io::Result<()> {
     let mut fixture = fixture();
     let app = &mut fixture.app;
-    for (index, title, bodies) in [(0, "nee", ["dle", "nee"]), (1, "dle", ["dle", "unrelated"])] {
+    for (index, title, bodies) in [(2, "nee", ["dle", "nee"]), (1, "dle", ["dle", "unrelated"])] {
         let conversation = &mut app.conversations[index];
         title.clone_into(&mut conversation.title);
         let saved = conversation
@@ -417,8 +417,8 @@ fn conversation_history_matches_never_cross_source_boundaries() -> io::Result<()
         app.active_conversation,
         &app.transcript,
     );
-    assert_eq!(app.conversation_search.rows, [2]);
-    app.conversations[0]
+    assert_eq!(app.conversation_search.rows, [0]);
+    app.conversations[2]
         .saved
         .as_mut()
         .ok_or_else(|| io::Error::other("Saved conversation missing"))?
@@ -462,21 +462,21 @@ fn conversation_history_reuses_matches_and_refreshes_streams_renames_and_replace
     );
     chat.state_mut().app.transcript.append("A NEW LEAF", false);
     chat.run();
-    assert_eq!(chat.state().app.conversation_search.rows, [2]);
-    assert_eq!(chat.state().app.conversations[0].search.scans, scans[0]);
+    assert_eq!(chat.state().app.conversation_search.rows, [0]);
+    assert_eq!(chat.state().app.conversations[0].search.scans, scans[0] + 1);
     assert_eq!(chat.state().app.conversations[1].search.scans, scans[1]);
-    assert_eq!(chat.state().app.conversations[2].search.scans, scans[2] + 1);
-    chat.state_mut().app.conversations[0].title = "New leaf archive".into();
+    assert_eq!(chat.state().app.conversations[2].search.scans, scans[2]);
+    chat.state_mut().app.conversations[2].title = "New leaf archive".into();
     chat.run();
     assert_eq!(chat.state().app.conversation_search.rows, [0, 2]);
-    assert_eq!(chat.state().app.conversations[0].search.scans, scans[0] + 1);
+    assert_eq!(chat.state().app.conversations[2].search.scans, scans[2] + 1);
     chat.state_mut()
         .app
         .transcript
         .replace_response("Other words", None);
     chat.run();
-    assert_eq!(chat.state().app.conversation_search.rows, [0]);
-    assert_eq!(chat.state().app.conversations[2].search.scans, scans[2] + 2);
+    assert_eq!(chat.state().app.conversation_search.rows, [2]);
+    assert_eq!(chat.state().app.conversations[0].search.scans, scans[0] + 2);
 }
 
 #[test]
@@ -565,7 +565,7 @@ fn conversation_history_large_history_selects_offscreen_results_by_stable_identi
     for index in 3..80 {
         let app = &mut chat.state_mut().app;
         app.new_chat();
-        app.conversations[index].title = if index == 57 {
+        app.conversations[0].title = if index == 22 {
             "Needle far in history".into()
         } else {
             format!("Conversation {index}")
@@ -573,7 +573,7 @@ fn conversation_history_large_history_selects_offscreen_results_by_stable_identi
         app.input = format!("Draft {index}");
     }
     let target = chat.state().app.conversations[57].id;
-    let original = chat.state().app.conversations[0].id;
+    let original = chat.state().app.conversations[1].id;
     let selected = chat.state().app.active_conversation;
     while chat.state().commands.try_recv().is_ok() {}
     chat.run();
@@ -592,7 +592,7 @@ fn conversation_history_large_history_selects_offscreen_results_by_stable_identi
         .click();
     chat.run();
     assert_eq!(chat.state().app.active_conversation, target);
-    assert_eq!(chat.state().app.input, "Draft 57");
+    assert_eq!(chat.state().app.input, "Draft 22");
     while let Ok(command) = chat.state().commands.try_recv() {
         assert!(!matches!(command, Command::Send { .. }));
     }

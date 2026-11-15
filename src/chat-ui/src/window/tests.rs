@@ -908,7 +908,8 @@ fn conversation_workspace_preserves_drafts_settings_and_exact_committed_turns() 
     state.new_chat();
     assert!(matches!(commands.try_recv(), Ok(Command::NewChat)));
     assert_eq!(state.conversations.len(), 2);
-    assert_eq!(state.conversations[0].title, "A garden story");
+    assert_eq!(state.conversations[0].id, state.active_conversation);
+    assert_eq!(state.conversations[1].title, "A garden story");
     assert!(state.transcript.messages.is_empty());
     assert!(state.committed.is_empty());
     assert_eq!(state.input, "");
@@ -1572,5 +1573,96 @@ fn speech_progress_and_cancellation_do_not_raise_error_alerts() -> io::Result<()
         [],
         "A new attempt replaces the old failure."
     );
+    Ok(())
+}
+
+#[test]
+fn conversation_history_orders_by_most_recent_update_and_ignores_viewing() -> io::Result<()> {
+    let (mut state, commands, _events) = state();
+    state.model = ModelLifecycle::Ready;
+    let first = state.active_conversation;
+    state.conversations[0].title = "First".into();
+    state.new_chat();
+    let second = state.active_conversation;
+    state.conversations[0].title = "Second".into();
+    state.new_chat();
+    let third = state.active_conversation;
+    state.conversations[0].title = "Third".into();
+    let order = |state: &State| {
+        state
+            .conversations
+            .iter()
+            .map(|conversation| conversation.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(&state), vec![third, second, first]);
+
+    // Viewing/switching alone must never reorder conversation history.
+    state.switch_conversation(first);
+    assert_eq!(order(&state), vec![third, second, first]);
+    state.switch_conversation(second);
+    assert_eq!(order(&state), vec![third, second, first]);
+
+    // Dictation/draft insertion updates recency of the edited conversation.
+    assert!(state.insert_dictation("Updated draft"));
+    assert_eq!(order(&state), vec![second, third, first]);
+
+    // Sending in `first` promotes `first`, and background streaming keeps `first`
+    // at index 0 while preserving its saved snapshot even after switching away.
+    state.switch_conversation(first);
+    assert_eq!(order(&state), vec![second, third, first]);
+    state.input = "First prompt".into();
+    state.submit();
+    assert_eq!(order(&state), vec![first, second, third]);
+    state.switch_conversation(third);
+    assert_eq!(order(&state), vec![first, second, third]);
+
+    // Draft edit in `third` promotes `third` above `first`, then a background
+    // stream token in `first` promotes `first` back to index 0 without losing
+    // either conversation's saved state.
+    assert!(state.insert_dictation("Third draft"));
+    assert_eq!(order(&state), vec![third, first, second]);
+    state.model_event(Event::Text("Background token".into()));
+    assert_eq!(order(&state), vec![first, third, second]);
+    state.model_event(Event::Committed(vec![
+        client::Message {
+            role: "user",
+            content: "First prompt".into(),
+            reasoning_content: None,
+        },
+        client::Message {
+            role: "assistant",
+            content: "Background token".into(),
+            reasoning_content: None,
+        },
+    ]));
+    state.model_event(Event::Complete(Completion::Finished));
+    assert_eq!(order(&state), vec![first, third, second]);
+    assert_eq!(state.active_conversation, third);
+    assert_eq!(state.input, "Third draft");
+    let first_saved = state
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == first)
+        .and_then(|conversation| conversation.saved.as_ref());
+    assert!(
+        first_saved.is_some_and(
+            |saved| saved.last_answer == "Background token" && saved.committed.len() == 2
+        )
+    );
+
+    // Recovery serialization/deserialization preserves exact recency order.
+    let bytes = state.workspace_bytes()?;
+    let (mut restored, _restored_commands, _restored_events) = self::state();
+    restored.restore_workspace(&bytes)?;
+    assert_eq!(order(&restored), vec![first, third, second]);
+    assert_eq!(restored.active_conversation, third);
+
+    // Deleting the selected conversation switches to the most recently updated
+    // remaining conversation (`first`).
+    while commands.try_recv().is_ok() {}
+    state.remove_conversation(third);
+    assert_eq!(state.active_conversation, first);
+    assert_eq!(order(&state), vec![first, second]);
     Ok(())
 }

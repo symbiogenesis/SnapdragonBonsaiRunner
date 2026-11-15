@@ -160,6 +160,34 @@ impl State {
         self.focus_composer = true;
     }
 
+    pub(super) fn active_or_routed_conversation(&self) -> u64 {
+        if self.routing_request {
+            self.request_conversation
+                .unwrap_or(self.active_conversation)
+        } else {
+            self.active_conversation
+        }
+    }
+
+    pub(super) fn touch_conversation(&mut self, id: u64) {
+        if self
+            .conversations
+            .first()
+            .is_some_and(|value| value.id == id)
+        {
+            self.recovery_dirty = true;
+            return;
+        }
+        if let Some(index) = self
+            .conversations
+            .iter()
+            .position(|conversation| conversation.id == id)
+        {
+            self.conversations[..=index].rotate_right(1);
+            self.recovery_dirty = true;
+        }
+    }
+
     // Event routing swaps only conversation content. The actual selection, Find
     // state in its transcript, and live composer cursor/focus stay with the user.
     pub(super) fn with_request_conversation(&mut self, action: impl FnOnce(&mut Self)) {
@@ -214,7 +242,13 @@ impl State {
             )
         });
         self.swap_conversation(&mut saved);
-        self.conversations[index].saved = Some(saved);
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|value| value.id == owner)
+        {
+            conversation.saved = Some(saved);
+        }
         (
             self.composer_cursor,
             self.pending_cursor,
@@ -311,16 +345,14 @@ impl State {
     }
 
     pub(super) fn remove_conversation(&mut self, id: u64) {
-        if !self.can_remove_conversation(id) {
+        if !self.can_remove_conversation(id)
+            || !self
+                .conversations
+                .iter()
+                .any(|conversation| conversation.id == id)
+        {
             return;
         }
-        let Some(index) = self
-            .conversations
-            .iter()
-            .position(|conversation| conversation.id == id)
-        else {
-            return;
-        };
         if id == self.active_conversation {
             if let Some(next) = self
                 .conversations
@@ -339,13 +371,14 @@ impl State {
                 self.active_conversation = self.next_conversation;
                 self.next_conversation = self.next_conversation.saturating_add(1);
                 self.conversations
-                    .push(Conversation::new(self.active_conversation));
+                    .insert(0, Conversation::new(self.active_conversation));
                 if self.model.ready() {
                     self.set_status("Ready for a new conversation.", false);
                 }
             }
         }
-        self.conversations.remove(index);
+        self.conversations
+            .retain(|conversation| conversation.id != id);
         self.recovery_dirty = true;
         self.conversation_notice = Some("Conversation deleted.");
     }
