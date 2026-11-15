@@ -104,5 +104,14 @@ $cases=[ordered]@{
     Assert-Ci ($checks.Contains("'tools/runtime-candidates/test_pe_closure.ps1') -ToolPath (Join-Path `$env:RUNNER_TEMP 'SwiftBonsai-CheckedTools/bonsai-tools.exe')")) 'PE fixtures must consume the same-run source-bound native CLI.'
     $selection=($checks -split [regex]::Escape($step),2)[1] -split '      - name:',2; Assert-Ci ($selection[0] -cnotmatch '(?m)^\s+if:')
  }
+ check_rust_enforces_non_incremental_production_release_codegen={
+    $action=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml'))
+    Assert-Ci ($action -cnotmatch '(?m)^\s+incremental:\s*$') 'check-rust must not expose an incremental Release input.'
+    Assert-Ci ($action.Contains("`$env:CARGO_INCREMENTAL = '0'")) 'check-rust must disable ambient CARGO_INCREMENTAL.'
+    Assert-Ci ($action.Contains("`$env:CARGO_PROFILE_RELEASE_INCREMENTAL = 'false'")) 'check-rust must enforce non-incremental Release codegen.'
+    Assert-Ci (-not $action.Contains("`$env:CARGO_PROFILE_RELEASE_INCREMENTAL = 'true'"))
+    $workflow=[IO.File]::ReadAllText((Join-Path $repository '.github/workflows/foundation.yml'))
+    Assert-Ci ($workflow -cnotmatch '(?m)^\s+incremental:') 'Foundation must use the production Release codegen profile.'
+ }
 }
 Invoke-CiCases $cases $Case

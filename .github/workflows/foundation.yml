@@ -68,7 +68,6 @@ jobs:
           pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_native_ci_cache.ps1"
           pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_tools_cache_inputs.ps1"
           pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_rust_toolchain.ps1"
-          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_incremental_ci.ps1"
           pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/cpu-bundle/test_cpu_bundle.ps1"
       - name: Check CI selection and gate regressions
         id: ci-regressions
@@ -117,7 +116,6 @@ jobs:
       - uses: $/.github/actions/check-rust
         with:
           lane: ${{ matrix.lane }}
-          incremental: 'true'
           packages: ${{ matrix.lane == 'ui' && '["bonsai-chat"]' || '["bonsai-broker","bonsai-markdown","bonsai-speech-service"]' }}
           affected: ${{ needs.changes.outputs.packages }}
   maintenance:
@@ -134,7 +132,6 @@ jobs:
         uses: $/.github/actions/check-rust
         with:
           lane: maintenance
-          incremental: 'true'
           packages: '["bonsai-artifacts","bonsai-audio","bonsai-cpu-policy","bonsai-windows-process","bonsai-windows-credentials","bonsai-ci"]'
           affected: ${{ needs.changes.outputs.packages }}
   tools-package:
@@ -152,7 +149,6 @@ jobs:
         uses: $/.github/actions/check-rust
         with:
           lane: tools
-          incremental: 'true'
           packages: '["bonsai-tools"]'
           affected: ${{ needs.changes.outputs.packages }}
           build-only: 'true'
@@ -204,7 +200,6 @@ jobs:
         uses: $/.github/actions/check-rust
         with:
           lane: tools
-          incremental: 'true'
           packages: '["bonsai-tools"]'
           affected: ${{ needs.changes.outputs.packages }}
       - name: Use the current run's source-bound maintenance CLI
@@ -237,7 +232,6 @@ jobs:
       - uses: $/.github/actions/check-rust
         with:
           lane: asr
-          incremental: 'true'
           packages: '["bonsai-speech-asr"]'
           affected: ${{ needs.changes.outputs.packages }}
   speech-tts:
@@ -254,7 +248,6 @@ jobs:
       - uses: $/.github/actions/check-rust
         with:
           lane: tts
-          incremental: 'true'
           packages: '["bonsai-speech-tts"]'
           affected: ${{ needs.changes.outputs.packages }}
   # Preserve the required check name; only the planner may authorize skips.

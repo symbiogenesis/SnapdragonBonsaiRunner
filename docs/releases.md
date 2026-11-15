@@ -106,8 +106,8 @@ block Release before its build fan-out. The gate repeats before publication.
 
 Foundation owns formatting, analyzers, documentation and tests. Windows Release
 consumes that verdict and builds five production lanes on hosted Windows ARM64,
-without repeating those checks. Its production profile remains independent of
-Foundation's incremental profile. Packaging and publication reuse the maintenance
+without repeating those checks. Both workflows use the same non-incremental
+`[profile.release]` codegen. Packaging and publication reuse the maintenance
 lane's same-run, revision/digest-verified native tools instead of rebuilding them.
 Release retains its own primitive/argument controls, source checks, notices,
 packaging and executable smoke checks. It verifies source-bound receipts and notices,

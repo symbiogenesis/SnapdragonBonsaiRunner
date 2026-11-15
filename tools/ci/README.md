@@ -45,13 +45,13 @@ can restore the current source's producer build before falling back to earlier
 source outputs, then save their richer analyzer/test outputs under their own key.
 All selected checks execute even on exact hits; cache saves remain optional.
 
-Foundation also enables incremental Release compilation with 16 code generation
-units for its workspace and local path crates. Their per-crate incremental data
-stays in each lane's existing compiler cache, allowing source edits to reuse
-unchanged work within a crate. Optimization level, overflow checks, static CRT,
-strict analyzers and complete tests stay required. The action defaults incremental
-compilation off for publication Release and other callers. Cold tracking overhead,
-cache transfer size and net hosted elapsed time still need owner acceptance.
+Foundation and Release share Cargo's standard non-incremental `[profile.release]`
+codegen (`opt-level = 3`, `codegen-units = 16`, `incremental = false`, overflow
+checks enabled, static CRT). Incremental Release compilation is explicitly disabled
+in `check-rust` because `rustc` incremental + `opt-level = 3` on
+`aarch64-pc-windows-msvc` miscompiles cross-CGU SEH `.xdata` unwind tables
+(`0xc0000409`) and diverges from published binaries. Dependency artifacts remain
+cached per lane in `CARGO_TARGET_DIR`.
 
 A TTS-only source edit selects its Rust lane without scheduling the maintenance CLI
 producer. ASR still selects that producer for its native source preparation. Changes
@@ -63,8 +63,8 @@ and gate regressions before producing a plan. Windows Release requires successfu
 Foundation and Source checks for its exact main-push source before the build
 fan-out, then verifies those prerequisites again before publication. Foundation
 owns formatting, Clippy, documentation and tests. Release's five build-only lanes
-link with the production profile, which differs from Foundation's incremental
-profile; packaging and publication reuse the same-run maintenance tools.
+link with the same non-incremental production `[profile.release]` codegen;
+packaging and publication reuse the same-run maintenance tools.
 The TTS lane skips ASR provisioning while still supplying the TTS executable;
 `build (maintenance)` collects third-party notices reusing its freshly built
 `bonsai-tools.exe`. `Foundation`'s `release-integration` verifies

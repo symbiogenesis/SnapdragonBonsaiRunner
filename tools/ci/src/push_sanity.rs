@@ -56,7 +56,6 @@ struct Selection {
     device_concurrency: bool,
     ci_bootstrap_cache: bool,
     rust_toolchain_fixture: bool,
-    incremental_ci_fixture: bool,
 }
 
 fn is_native_source(path: &str) -> bool {
@@ -200,14 +199,6 @@ fn selection(paths: &[String]) -> Selection {
             [
                 ".github/actions/rust-toolchain/action.yml",
                 "tools/ci/test_rust_toolchain.ps1",
-                "tools/ci/test_support.ps1",
-            ]
-            .contains(&path.as_str())
-        }),
-        incremental_ci_fixture: owned.iter().any(|path| {
-            [
-                ".github/actions/check-rust/action.yml",
-                "tools/ci/test_incremental_ci.ps1",
                 "tools/ci/test_support.ps1",
             ]
             .contains(&path.as_str())
@@ -392,7 +383,6 @@ mod tests {
                 && plan.device_concurrency
                 && plan.ci_bootstrap_cache
                 && plan.rust_toolchain_fixture
-                && plan.incremental_ci_fixture
         );
         let plan = selection(&[".github/workflows/source-checks.yml".into()]);
         assert!(plan.workflows && plan.source_fixture);
@@ -403,7 +393,7 @@ mod tests {
             selection(&[".github/actions/rust-toolchain/action.yml".into()]).rust_toolchain_fixture
         );
         let check_rust = selection(&[".github/actions/check-rust/action.yml".into()]);
-        assert!(check_rust.foundation_handoff && check_rust.incremental_ci_fixture);
+        assert!(check_rust.foundation_handoff);
     }
 
     #[test]

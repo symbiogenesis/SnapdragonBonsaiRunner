@@ -1029,16 +1029,6 @@ impl Work {
                 parameters: BTreeMap::from([("CandidateRoot", serde_json::json!(source))]),
             });
         }
-        if plan.incremental_ci_fixture
-            && source
-                .join(".github/actions/check-rust/action.yml")
-                .is_file()
-        {
-            calls.push(ScriptCall {
-                script: "test_incremental_ci.ps1",
-                parameters: BTreeMap::from([("CandidateRoot", serde_json::json!(source))]),
-            });
-        }
         calls
     }
 
