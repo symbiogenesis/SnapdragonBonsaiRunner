@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "prism",
-  "sourceRevision": "f08722fbf78a6674576a4bc2ec855274ae2328b9",
+  "sourceRevision": "f061cbae59d2e8072060b7f6c23b04f2dd79fef3",
   "exclusions": [
     {
       "path": ".git",
@@ -28,14 +28,14 @@
     {
       "id": "common-allocation",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/allocation.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-alloc.cpp allocation/view/aliasing/multi-backend/alignment contract through tests/upstream_prism/reference_allocation.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
     {
       "id": "common-arena-graph",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/arena_graph.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-moe-weighted-reduce and arena-graph layout/placement/bounds contract through tests/upstream_prism/reference_arena_graph.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -70,14 +70,14 @@
     {
       "id": "common-batch-allocator",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/batch_allocator.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-batch-alloc contract, equal-split/mrope/position/coupling invariant through tests/upstream_prism/reference_batch_allocator.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
     {
       "id": "common-bridge",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/bridge.cpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every remaining common handler in tools/prism/upstream/common/bridge.cpp under the exact catalog and migration inventory; top-level unicode-* dispatch (test-unicode) moved to tests/upstream_prism/reference_unicode.rs. Remaining handlers and required green IDs must pass before retiring bridge.cpp."
       ],
       "retirementQualified": false
     },
@@ -259,7 +259,7 @@
     {
       "id": "common-quantization",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/quantization.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-quant-type-selection model/tensor/exclude/tied/MoE rule through tests/upstream_prism/reference_quantization.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -280,14 +280,14 @@
     {
       "id": "common-tensor-graph",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/tensor_graph.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-col2im-1d, test-dfly-fusion and test-rope contract through tests/upstream_prism/reference_tensor_graph.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
     {
       "id": "common-threadpool",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/threadpool.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-barrier schedule, DAG dependency and timed-yield contract through tests/upstream_prism/reference_threadpool.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -336,18 +336,6 @@
       "family": "common-action-file"
     },
     {
-      "path": "tools/prism/upstream/common/allocation.hpp",
-      "bytes": 18686,
-      "sha256": "bd077698d38e599eeab3f3690f756b717b941a7a213eff9fac778ee20e0e8838",
-      "family": "common-allocation"
-    },
-    {
-      "path": "tools/prism/upstream/common/arena_graph.hpp",
-      "bytes": 6731,
-      "sha256": "ebe0ef150d538cd728cb7009b84038fb8af26d0907454d9d35fc83bfb5962364",
-      "family": "common-arena-graph"
-    },
-    {
       "path": "tools/prism/upstream/common/arg_parser.hpp",
       "bytes": 8531,
       "sha256": "48aecb9c07fb32225b2f35071430d9760892bd6a4efc3d63d1e2dfd668688fca",
@@ -372,15 +360,9 @@
       "family": "common-backend-session"
     },
     {
-      "path": "tools/prism/upstream/common/batch_allocator.hpp",
-      "bytes": 15904,
-      "sha256": "45cff2ac3645a8487b0bac1057a0f77f9b79189e785b0ff8c0f923e750530d73",
-      "family": "common-batch-allocator"
-    },
-    {
       "path": "tools/prism/upstream/common/bridge.cpp",
-      "bytes": 14219,
-      "sha256": "05f55ef4976df70a37391e780b38d8d8e5f2f335c91f9b1da8833b0b96572a6a",
+      "bytes": 10951,
+      "sha256": "5f6faa10ae242d0fa3a232279e962f94a76ba876efdae462b16c3a8db6618dc4",
       "family": "common-bridge"
     },
     {
@@ -516,28 +498,10 @@
       "family": "common-public-c-abi"
     },
     {
-      "path": "tools/prism/upstream/common/quantization.hpp",
-      "bytes": 8334,
-      "sha256": "d2b00806fbc915558e205ce9732e9e649ca173a1810ee49a0bc3ecbbe9d80983",
-      "family": "common-quantization"
-    },
-    {
       "path": "tools/prism/upstream/common/sampling.hpp",
       "bytes": 15586,
       "sha256": "4c577b442710ac605598000ab234fb4e9224db941ca84d59537bd9218e3241d5",
       "family": "common-sampling"
-    },
-    {
-      "path": "tools/prism/upstream/common/tensor_graph.hpp",
-      "bytes": 19707,
-      "sha256": "23c2a703d9f3d246fafcda0e3af7e1581631192f0826c6f83abe2c3bb594209a",
-      "family": "common-tensor-graph"
-    },
-    {
-      "path": "tools/prism/upstream/common/threadpool.hpp",
-      "bytes": 9450,
-      "sha256": "9d07e3277e17cf8f25e9ec636327ce3bbbce018bc25ddb27a193ed80e31ad00a",
-      "family": "common-threadpool"
     },
     {
       "path": "tools/prism/upstream/common/vocab.hpp",
@@ -555,8 +519,8 @@
   "edges": [
     {
       "path": "Cargo.lock",
-      "bytes": 55797,
-      "sha256": "805931c183d3c975a46ae3152bd7ce0dd8ecd65c5f80c48eedc3f4c3ad7d0f79",
+      "bytes": 53680,
+      "sha256": "5202940ba95bcd217193a2abb68a49bb505587e573d28fed83da3230b2561fd4",
       "family": "external-native"
     },
     {
@@ -591,9 +555,15 @@
     },
     {
       "path": "tests/Test-PrismUpstream.ps1",
-      "bytes": 37499,
-      "sha256": "a41c86a298b31803b95bde6d470e9ab8ee54a33194102db7aa83f916643d1e13",
+      "bytes": 37544,
+      "sha256": "c76a8869114ecf216ef9073f024ab6643d39bf04ec7733decea4b8cc704ae30c",
       "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/allocation.rs",
+      "bytes": 35757,
+      "sha256": "e4517019f3a550a6b61e3bdbc11d03e025dc8a4c0fab3d169e3a0a11a65380d8",
+      "family": "common-allocation"
     },
     {
       "path": "tests/upstream_prism/backend-ops-geometries.json",
@@ -608,9 +578,21 @@
       "family": "upstream-contracts"
     },
     {
+      "path": "tests/upstream_prism/barrier.rs",
+      "bytes": 15145,
+      "sha256": "f5e81aea683285787f7c5eb71f23e509da274d4519734eb2236ebfcc2af98cac",
+      "family": "common-threadpool"
+    },
+    {
+      "path": "tests/upstream_prism/batch_allocator.rs",
+      "bytes": 37210,
+      "sha256": "34ef97c6ba12ea0ef86a8feecaf4710bf705b63bb6d3666e01aa55849c163144",
+      "family": "common-batch-allocator"
+    },
+    {
       "path": "tests/upstream_prism/common.rs",
-      "bytes": 7407,
-      "sha256": "afee16dc910ec3703d2d922d362e1bf5c13868bf21f9fa60d8d52c96faee0e98",
+      "bytes": 7396,
+      "sha256": "85c4d34fc2262ff8d12c5a2cfe3aaebf5570c1cf4d0cf051b02e2f2fef3fc8a5",
       "family": "upstream-contracts"
     },
     {
@@ -633,8 +615,8 @@
     },
     {
       "path": "tests/upstream_prism/harness.rs",
-      "bytes": 30864,
-      "sha256": "f057b423401c32698f3f4afc251a173f6c00a854c770f7aaa2cacb2a9c420c76",
+      "bytes": 31105,
+      "sha256": "e71487455087d6379437261f63f2efb6d5048908b5a36d1e54cd38d7bcb02f01",
       "family": "upstream-contracts"
     },
     {
@@ -642,6 +624,12 @@
       "bytes": 2989,
       "sha256": "7f158151896f92460a9d3c2c1612daa042f582f85b7eb64a8f25c85737e979e8",
       "family": "common-concurrency"
+    },
+    {
+      "path": "tests/upstream_prism/moe_reduce.rs",
+      "bytes": 9072,
+      "sha256": "d6c8b44bda920fe2301781ad627d0d0310886ba03c9eac24a605f61dda8db2a6",
+      "family": "common-arena-graph"
     },
     {
       "path": "tests/upstream_prism/mtmd.rs",
@@ -656,6 +644,18 @@
       "family": "common-mtmd-chunks"
     },
     {
+      "path": "tests/upstream_prism/numerics.rs",
+      "bytes": 22812,
+      "sha256": "f524b72be3f78b7f7b4d202a859733aa9c648f33f0ac4bba32c7dcb0fd362a7c",
+      "family": "common-tensor-graph"
+    },
+    {
+      "path": "tests/upstream_prism/quant_selection.rs",
+      "bytes": 30778,
+      "sha256": "fd29c2076b2a99d040a587ddd51d78db74b47152e1cd46a5315cc922d0c862bf",
+      "family": "common-quantization"
+    },
+    {
       "path": "tests/upstream_prism/reasoning-budget-cases.json",
       "bytes": 4098,
       "sha256": "c5d4d241e022d504ae9c2162014267c9a0da538cc88add1992888617953562fb",
@@ -666,6 +666,24 @@
       "bytes": 32707,
       "sha256": "a6728070bf1f1112680dce036f078bcdce3a8263f62fef93f0c0a7d54f8d5aff",
       "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reference_allocation.rs",
+      "bytes": 63381,
+      "sha256": "1a3fd305762bb9c69c59ede40bf4c51af60236c44b6be6a9fc8211bd03b440ef",
+      "family": "common-allocation"
+    },
+    {
+      "path": "tests/upstream_prism/reference_arena_graph.rs",
+      "bytes": 33331,
+      "sha256": "ebd20abf8cb227809de36a02dbbb33c5d01b0101dbfafc9f34f4f2800ad6dae1",
+      "family": "common-arena-graph"
+    },
+    {
+      "path": "tests/upstream_prism/reference_batch_allocator.rs",
+      "bytes": 61788,
+      "sha256": "ef7fdbffd9286d3725c100fb254990b74cebcdbf2a9d618a961f16e634955b32",
+      "family": "common-batch-allocator"
     },
     {
       "path": "tests/upstream_prism/reference_grammar_parser.rs",
@@ -693,15 +711,39 @@
     },
     {
       "path": "tests/upstream_prism/reference_provider.rs",
-      "bytes": 9077,
-      "sha256": "67baf0027b105011560121b00b1f67a92e11b84c3acab7172e39c11ab900b54a",
+      "bytes": 11324,
+      "sha256": "7213cc348ff65ea0af344089818035190c232f64258a73a195f29b7a6c174f36",
       "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reference_quantization.rs",
+      "bytes": 43740,
+      "sha256": "ccd8a88be675a7cfb63a4b7d3a04652d68809ac767bf37f86376088c980834d0",
+      "family": "common-quantization"
     },
     {
       "path": "tests/upstream_prism/reference_reasoning.rs",
       "bytes": 17855,
       "sha256": "097295b3ab74d33c7e40840b8b52b627928af2e5ae932e834d6aa378b164ef6f",
       "family": "common-reasoning-budget"
+    },
+    {
+      "path": "tests/upstream_prism/reference_tensor_graph.rs",
+      "bytes": 68808,
+      "sha256": "fcf2c3a645fbf9b945f4bf5b73bcf8ea2df7fd243f97c62bea6864c5a0307e50",
+      "family": "common-tensor-graph"
+    },
+    {
+      "path": "tests/upstream_prism/reference_threadpool.rs",
+      "bytes": 28556,
+      "sha256": "b66bc660c253e8bd265da638a9af8722fd422a4f1b2c4b92a94656339db8ccde",
+      "family": "common-threadpool"
+    },
+    {
+      "path": "tests/upstream_prism/reference_unicode.rs",
+      "bytes": 18629,
+      "sha256": "d2cfbafca18a9a0d3770e184b0485b8f7f691f9cb575ed49ea68becf7aec49ec",
+      "family": "common-bridge"
     },
     {
       "path": "tools/codec-probe/Cargo.toml",
@@ -783,8 +825,8 @@
     },
     {
       "path": "tools/prism/upstream/common/CMakeLists.txt",
-      "bytes": 5117,
-      "sha256": "f2c38f76904f1b38f6ebac48fa308949fb4aa301f2ad72f3bdd2a26f57e237dc",
+      "bytes": 5017,
+      "sha256": "8613ef71009dd00f62c1bdfdbebbb52f00c1eaa84893772fda2b1ad6995a9c61",
       "family": "native-build"
     },
     {
@@ -795,8 +837,8 @@
     },
     {
       "path": "tools/prism/upstream/migration.json",
-      "bytes": 43791,
-      "sha256": "c46322df41c1a370ccd2a5c5c404eb458dd13bf17df83d709b2ab93b46a256b0",
+      "bytes": 44162,
+      "sha256": "2e9c6edb6472a60f84e0a8a7a99dadf9e6199f3cd91bd8461c297f4efb010aec",
       "family": "upstream-contracts"
     },
     {

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "runner",
-  "sourceRevision": "8f6ecae2359753a11505e748f8caeab9a90f2d8b",
+  "sourceRevision": "1dfa247513e8058cef63cae7ef1fdd2ccf2886f8",
   "exclusions": [
     {
       "path": ".git",

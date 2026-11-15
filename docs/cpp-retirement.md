@@ -103,10 +103,17 @@ up expected answers. Their three C++ headers and native include/dispatch/build
 edges are removed; source identities, required green IDs, catalog and ordered
 geometry schedules remain intact. Focused controls and strict native ARM64
 Release analysis passed. Native bridge compilation and complete owning acceptance
-remain pending. This leaves 35 checked-in C++ files.
+remain pending. Separate independent Rust providers for `threadpool.hpp` (`test-barrier`),
+`batch_allocator.hpp` (`test-batch-alloc`), `allocation.hpp` (`test-alloc`),
+`quantization.hpp` (`test-quant-type-selection`), top-level `unicode-*` dispatch in
+`bridge.cpp` (`test-unicode`), `arena_graph.hpp` (`test-moe-weighted-reduce`), and
+`tensor_graph.hpp` (`test-col2im-1d`, `test-dfly-fusion`, `test-rope`) additionally pass
+their focused `reference_*` unit tests and Release ARM64 Clippy, removing those six C++
+headers and leaving 29 checked-in C++ files (plus 2 C ABI files = 31 total native files);
+complete Prism suite, native bridge compilation and owning hosted acceptance remain pending.
 
 The [checked-in boundary verifier](../tools/ci/README.md#checked-in-native-retirement-boundary)
-now binds Runner's remaining C file and the reviewed Prism snapshot's 35 C++
+now binds Runner's remaining C file and the reviewed Prism snapshot's 29 C++
 files plus coupled C ABI source/header and migrated Rust assertion/provider edges.
 Exact per-file families and declared
 compiler/provider/contracts identities preserve the green-ID baseline and both
@@ -399,8 +406,12 @@ and relative error limits before publication. Five new controls and the four
 exact-oracle controls passed with optimized warning-denied native compilation and
 docs; Clippy passed with documented preexisting exceptions. This is ideal
 projection-error review, without emulating HVX half quantization, QF16 or kernel
-reduction order. Useful tolerance review, actual signed-path error, quantization
-parity, session admission and speech qualification remain independent gates.
+reduction order. `Q8HvxQuantizationOracle` in `tools/hexagon/native_rpc/q8_oracle.rs`
+further models exact binary16 (`0x2008`) activation scaling/inverse, signed RNE codes
+and QF16 tiled-block accumulation (verified with focused `q8_` unit controls under
+warning-denied `rustc --test -O`). Session-bound loaded-DSP bytes and usable VTCM,
+predeclared speech error tolerances, actual signed-path device error qualification,
+cancellation/deadline review and speech acceptance remain independent open gates.
 
 The missing Q8 admission provider must independently bind the actual loaded
 signed module bytes and effective usable VTCM to this session and its guarded

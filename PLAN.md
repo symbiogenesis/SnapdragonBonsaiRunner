@@ -484,11 +484,12 @@ adoption decisions without displacing native daily-use acceptance.
   transport, fixed F32 and guarded-Q2 controls do not qualify speech state.
   First supply a reviewed session-bound provider for exact loaded-DSP bytes and
   effective usable VTCM; package/URI selection and capacity attributes cannot
-  supply those missing observations. Review predeclared scalar projection-error
-  tolerances for ordinary speech activations, then qualify actual signed-path
-  error and HVX quantization arithmetic independently of the exact diagnostic subset.
-  Verify cancellation and the original absolute work deadline through controlled
-  oracle preparation and final review, preserving native cleanup reserves.
+  supply those missing observations. `Q8HvxQuantizationOracle` covers independent
+  host HVX (`0x2008` binary16/QF16) quantization arithmetic controls; still review
+  predeclared scalar projection-error tolerances for ordinary speech activations,
+  then qualify actual signed-path error on device independently of the exact diagnostic
+  subset. Verify cancellation and the original absolute work deadline through
+  controlled oracle preparation and final review, preserving native cleanup reserves.
 - [ ] **S2 — Qualify Rust ASR for production.** Compare the complete Rust graph and
   explicit Rust-only service against pinned Qwen3-ASR 1.7B controls. Complete
   owning hosted build/link and native-control regressions; preserve independent
@@ -506,7 +507,7 @@ adoption decisions without displacing native daily-use acceptance.
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
   codec/ABI, state and fallback obligations with independent controls, then remove
   compiler/provisioning/build paths. Prism needs complete independent observation
-  provider coverage for its 35 remaining C++ files; retain every approved
+  provider coverage for its 29 remaining C++ files; retain every approved
   green ID, all 22,817 ordered backend geometries and separate performance work.
   Retain required replay data and qualify owning hosted builds without a project
   C++ toolchain. Capture original selected compiled/preprocessed/generated inputs
