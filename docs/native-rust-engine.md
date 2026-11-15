@@ -6,7 +6,7 @@ app, broker, provisioning and release integration. The
 [compiled release lock](../config/prism-inference.lock.json) is authoritative for
 the runtime version, source, archive and installed file identities.
 
-The development default is Prism **0.1.28**, original Swift PQ2, four CPU row
+The development default is Prism **0.1.30**, original Swift PQ2, four CPU row
 workers, K4/V4 cache and the standard adapter at scale 1.3. Supported X2 workers
 attempt [resident Hexagon `native-q2`](hexagon.md), retaining CPU execution when
 accelerator initialization is unavailable. Trusted `--placement cpu` explicitly
@@ -36,7 +36,7 @@ UI availability does not qualify inference.
 | Admission | Selected context and Job budget, 4 GiB running physical reserve and startup margin; the fixed 8K/11.5 GiB Job/15.5 GiB admission profile remains a separate qualification control |
 
 The verified runtime source is
-`99671be7ab2be01e406a11b0c3d6caede398d96f`. Runtime and exact-source numerical
+`89df9aaff9e580d66679f2befe94d471bcf4fc7f`. Runtime and exact-source numerical
 capture locks advance together. A version string alone grants no capability;
 archive and installed file digests must match their compiled locks. Publishing
 the public runtime crate does not publish the private server or replace Runner's
@@ -184,11 +184,11 @@ acceptance and measured benefit remain pending.
 
 ### Long-request runtime deadline
 
-Runner's ordinary chat path and the pinned Prism 0.1.28 private HTTP server impose
+Runner's ordinary chat path and the pinned Prism 0.1.30 private HTTP server impose
 no total generation deadline, including prefill. Explicit diagnostic deadlines,
 Stop/cancellation, bounded header/body intake and per-write limits remain in
 force. The verified source-bound release is documented in the
-[delivery record](evidence/prism-0.1.28-release.md).
+[delivery record](evidence/prism-0.1.30-release.md).
 
 The previous 0.1.27 private server imposed a ten-minute cutoff that could surface
 as `backend_generation_failed` before response headers. Older empty backend logs

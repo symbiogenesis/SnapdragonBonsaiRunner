@@ -24,9 +24,9 @@ impl WorkerReadiness {
             // Only these reviewed historical releases omit this identity. A
             // later pin must report its graph's effective worker budget.
             legacy_missing_allowed: matches!(version, "0.1.8" | "0.1.9" | "0.1.10"),
-            // This reviewed release waits for model-thread initialization and
-            // always publishes its completed placement/residency observation.
-            projection_startup_required: version == "0.1.28",
+            // Reviewed releases wait for model-thread initialization and
+            // always publish their completed placement/residency observation.
+            projection_startup_required: matches!(version, "0.1.28" | "0.1.30"),
             latest_prompt_reuse: false,
             vision: false,
             kv_cache: None,
@@ -178,7 +178,7 @@ fn startup_projection_matches(
 ) -> bool {
     let Some(startup) = &model.startup_projection else {
         // Historical releases, including 0.1.27, predate this observation.
-        // The reviewed 0.1.28 tuple must identify completed initialization.
+        // The reviewed 0.1.28 and 0.1.30 tuples must identify completed initialization.
         return !workers.projection_startup_required;
     };
     let requested = if workers.placement == crate::inference::Placement::Cpu {
@@ -382,7 +382,7 @@ mod tests {
         let (mut model, _) = kv_cache_model(false, true);
         let legacy = WorkerReadiness::for_version("0.1.27", 4).with_kv_cache(Some(KvCache::Rsq4));
         assert!(validate_native_identity(&model_response(&model)?, false, true, legacy).is_ok());
-        let auto = WorkerReadiness::for_version("0.1.28", 4).with_kv_cache(Some(KvCache::Rsq4));
+        let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
         assert!(validate_native_identity(&model_response(&model)?, false, true, auto).is_err());
         for effective in ["cpu", "hexagon-native-q2"] {
             model["startup_projection"] = projection_startup(effective);
@@ -409,7 +409,7 @@ mod tests {
         use crate::inference::KvCache;
         use serde_json::json;
         let (model, _) = kv_cache_model(false, false);
-        let auto = WorkerReadiness::for_version("0.1.28", 4).with_kv_cache(Some(KvCache::Rsq4));
+        let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
         for (field, value) in [
             ("schema_version", json!(2)),
             ("schema_version", json!(true)),
@@ -491,7 +491,7 @@ mod tests {
         use crate::inference::KvCache;
         use serde_json::json;
         let (mut model, _) = kv_cache_model(false, false);
-        let auto = WorkerReadiness::for_version("0.1.28", 4).with_kv_cache(Some(KvCache::Rsq4));
+        let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
         model["startup_projection"] = projection_startup("external");
         for identity in ["", " ", "bad\nidentity", &"x".repeat(257)] {
             model["startup_projection"]["identity"] = json!(identity);

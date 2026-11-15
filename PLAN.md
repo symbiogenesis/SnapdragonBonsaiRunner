@@ -146,7 +146,7 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify Prism's Foundation scheduling and source-package/Hexagon caches
   on matching hosted images, preserving complete correctness, mutation, packaging
   and independent ABI/SDK obligations.
-- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.28.**
+- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.30.**
   Complete actual-model, state, resource, quality and device acceptance using
   the source-bound package identities in the [distribution guide](docs/releases.md).
   Model-free release checks leave these development-runtime gates pending.
@@ -1236,12 +1236,13 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 ### Repin, CI and device qualification of landed screening controls
 
-- [ ] Publish a Foundation release bundle from reviewed `prism-inference` `main`
-  (`0.1.29` working tree, including `129fae8..c0893f8`) and repin Runner past
-  `Prism 0.1.28` under the [distribution guide](docs/releases.md) so installed and
-  daily-use builds consume the new runtime checkpoints, GDN guards, memory ledger
-  and worker cancellation (`#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`,
-  `#25`–`#26`, `#28`, `#30`–`#34`, `#36`, `#45`–`#51`).
+- [x] Publish a Foundation release bundle from reviewed `prism-inference` `main`
+  (`0.1.30`, `89df9aaff9e580d66679f2befe94d471bcf4fc7f`, including
+  `129fae8..c0893f8`) and repin Runner past `Prism 0.1.28` under the
+  [distribution guide](docs/releases.md) so installed and daily-use builds consume
+  the new runtime checkpoints, GDN guards, memory ledger and worker cancellation
+  (`#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#25`–`#26`, `#28`,
+  `#30`–`#34`, `#36`, `#45`–`#51`).
 - [ ] Complete hosted `source-checks` and `foundation` compiler, strict Release
   analyzer and full regression-suite verdicts in both repositories under
   [promotion criteria](docs/validation.md#promotion-criteria); local merge checks

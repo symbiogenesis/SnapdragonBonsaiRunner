@@ -1,6 +1,6 @@
 # Swift artifacts, memory and PTQ1
 
-**Original PQ2 on native Rust Prism 0.1.28 is the development default**, with four
+**Original PQ2 on native Rust Prism 0.1.30 is the development default**, with four
 CPU row workers, standard adapter scale 1.3 and [X2 NPU placement](hexagon.md) when initialization
 succeeds. `--publisher-engine` explicitly selects rollback; PTQ1 remains opt-in.
 Creative quality, performance and daily-service isolation remain unqualified.
@@ -407,7 +407,7 @@ comparison uses source `73bfe6cc485554822f80c473a3c0c4f25e80f41b`.
 
 ### Native allocation candidates
 
-The source-bound Prism 0.1.28 bundle includes redundant-storage removals without
+The source-bound Prism 0.1.30 bundle includes redundant-storage removals without
 changing the selected model weights, cache precision, floating-point operations
 or worker count. These source-derived payload counts do not establish measured
 process savings or authorize lower conservative admission charges.

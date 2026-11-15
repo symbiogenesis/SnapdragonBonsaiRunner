@@ -1,7 +1,7 @@
 # Hexagon deployment and execution contracts
 
-Runner pins [Prism 0.1.28](../config/prism-inference.lock.json), source
-`99671be7ab2be01e406a11b0c3d6caede398d96f`. On Windows ARM64 Snapdragon X2 (`v81`),
+Runner pins [Prism 0.1.30](../config/prism-inference.lock.json), source
+`89df9aaff9e580d66679f2befe94d471bcf4fc7f`. On Windows ARM64 Snapdragon X2 (`v81`),
 `prism-inference-server` selects experimental `native-q2` resident NPU acceleration
 when the verified signed GenieX v0.10.0 package and CDSP driver are available.
 The expected DSP file is `<data_directory>/hexagon/runtime/libggml-htp-v81.so`.
@@ -24,10 +24,10 @@ for this fixed development policy. Full-model X1/X2 qualification and the
 with interactive/battery objectives remain separate work in [PLAN.md](../PLAN.md#hexagon-npu).
 `native-q2` uses
 bounded floating-point tolerance; it does not promise the bitwise PQ2/Q8_K
-parity of the independent block-preserving controls. Prism 0.1.28 completes a
+parity of the independent block-preserving controls. Prism 0.1.30 completes a
 model-thread initialization handshake before authenticated serving readiness
 and reports a versioned `startup_projection` observation. Runner requires that
-object for the reviewed 0.1.28 source, with consistent requested/effective
+object for the reviewed 0.1.30 source, with consistent requested/effective
 placement, the fixed
 168-tensor/2,888,663,040-byte resident layout and bounded host metadata; CPU and
 external observations cannot assert resident weights. Explicit legacy 0.1.27
@@ -107,7 +107,7 @@ Native/fallback compiled controls, production linking, full-model state/adapters
 cancellation/resources and source-bound device acceptance remain required.
 The earlier [local source check](cpu-kernels.md#current-source-comparison-admission)
 failed during supervisor setup before compiled controls. The source-bound
-0.1.28 binary delivery does not supply that missing independent control acceptance.
+0.1.30 binary delivery does not supply that missing independent control acceptance.
 
 Guarded/model-probe whole-request reservation and explicit partial placement
 already exist in source. Their terminal 24,000-attempt policy remains separate

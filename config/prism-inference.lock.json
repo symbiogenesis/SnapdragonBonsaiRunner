@@ -1,33 +1,33 @@
 {
   "Source": {
-    "Bytes": 5140796,
-    "Commit": "99671be7ab2be01e406a11b0c3d6caede398d96f",
+    "Bytes": 5380762,
+    "Commit": "89df9aaff9e580d66679f2befe94d471bcf4fc7f",
     "Repository": "https://github.com/symbiogenesis/prism-inference",
-    "Sha256": "12eb6a3ecc9bc7ae28ed0be93bf3be86807a7435168fd88b1f4871ce2719cbcd",
-    "Url": "https://github.com/symbiogenesis/prism-inference/archive/99671be7ab2be01e406a11b0c3d6caede398d96f.zip"
+    "Sha256": "83e4077e4abb058dd103ada4e3fdd3812debf7a49aa9ccf745f0cff61acc11a6",
+    "Url": "https://github.com/symbiogenesis/prism-inference/archive/89df9aaff9e580d66679f2befe94d471bcf4fc7f.zip"
   },
   "asset": {
-    "bytes": 6311275,
-    "filename": "prism-inference-0.1.28-aarch64-pc-windows-msvc.zip",
-    "sha256": "2e789c53fb6ce82c34558a96e7cda5defba87b6bae4307772dbeb282ecb4864c",
-    "url": "https://github.com/symbiogenesis/prism-inference/releases/download/v0.1.28/prism-inference-0.1.28-aarch64-pc-windows-msvc.zip"
+    "bytes": 6880056,
+    "filename": "prism-inference-0.1.30-aarch64-pc-windows-msvc.zip",
+    "sha256": "7f2b09b6872530279d7c5607945fc5c36e118b83e496832984fef37c06df6747",
+    "url": "https://github.com/symbiogenesis/prism-inference/releases/download/v0.1.30/prism-inference-0.1.30-aarch64-pc-windows-msvc.zip"
   },
-  "commit": "99671be7ab2be01e406a11b0c3d6caede398d96f",
+  "commit": "89df9aaff9e580d66679f2befe94d471bcf4fc7f",
   "files": [
     {
-      "bytes": 537088,
+      "bytes": 541696,
       "name": "bonsai-gguf.exe",
-      "sha256": "259c591e2ae7df3c67cb66182acf5edc804e5cb9f0095cf78ba2805e11c010f7"
+      "sha256": "7b027c01467d248eb2d8e481849a00ae8a3c2db73af76c9ac112f85491c8255a"
     },
     {
-      "bytes": 3576320,
+      "bytes": 3951616,
       "name": "bonsai-swift-worker.exe",
-      "sha256": "9b40b2265573fa704ed9b39008544ee9884707fb1f65135b5c5e29656afdbadd"
+      "sha256": "2ed9d411411574533993d470889f5934ecd636bcc81fb323d19a3d89a38aeb80"
     },
     {
-      "bytes": 606208,
+      "bytes": 683520,
       "name": "bonsai-token-worker.exe",
-      "sha256": "ee0b6654861cd6a0b66e0e57c7947f7f015bc27e39e92c8831aa1c6a1df2ce7f"
+      "sha256": "9c36ac087e3c9f84654e9e0284c6dd593ad97ffced6e016647e381b32f1d2674"
     },
     {
       "bytes": 1087,
@@ -45,14 +45,14 @@
       "sha256": "e3b6278bbba57b0bb62cb830facd20c2ca347fdbd655be87b83a78b2a4d42a6b"
     },
     {
-      "bytes": 4482560,
+      "bytes": 4908544,
       "name": "prism-inference-server.exe",
-      "sha256": "6b48dcf05c89a3e7a80e3c4b084d3cbbade0c5701656d75fe04b1a827162c2a4"
+      "sha256": "c17ee6d7bbc20f9b3dc6119b99e0d2a038619732ad51a1aaa95a0a68e834353d"
     },
     {
-      "bytes": 2990080,
+      "bytes": 3142656,
       "name": "prism-inference.exe",
-      "sha256": "87e04b967cc22d4941c78016346b8c91230b4fb2e5aed0c3afb230d95b6c7b54"
+      "sha256": "a9c8e4ddccf5ccfa24bb5bb5692b9f3bc8fc92ae8a132889be0f00d02b5caa10"
     },
     {
       "bytes": 1099,
@@ -61,9 +61,9 @@
     }
   ],
   "package": "prism-inference",
-  "release": "v0.1.28",
+  "release": "v0.1.30",
   "repository": "https://github.com/symbiogenesis/prism-inference",
   "schemaVersion": 1,
   "target": "aarch64-pc-windows-msvc",
-  "version": "0.1.28"
+  "version": "0.1.30"
 }

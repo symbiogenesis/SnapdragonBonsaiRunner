@@ -2274,10 +2274,14 @@ mod tests {
             Some(LaunchError::Arguments)
         );
 
-        // Native 0.1.28 remains text-only regardless of --no-mmproj.
+        // Native 0.1.30 supports vision unless --no-mmproj opts out.
+        let mut native_opt_out = swift.clone();
+        native_opt_out.push("--no-mmproj".into());
         let native = LaunchConfig::parse(swift)?;
-        assert!(!native.runtime_supports_vision()?);
-        assert!(native.mmproj_guard()?.is_none());
+        assert!(native.runtime_supports_vision()?);
+        let parsed_native_opt_out = LaunchConfig::parse(native_opt_out)?;
+        assert!(!parsed_native_opt_out.runtime_supports_vision()?);
+        assert!(parsed_native_opt_out.mmproj_guard()?.is_none());
 
         // Real temp data directory: missing mmproj falls back cleanly to None;
         // wrong bytes at the locked mmproj path fails closed with Artifacts.
