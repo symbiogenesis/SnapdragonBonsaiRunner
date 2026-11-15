@@ -877,7 +877,14 @@ mod context_tests {
     }
 
     #[test]
-    fn readiness_enforces_vision_projector_and_image_token_identity() {
+    fn readiness_enforces_vision_projector_and_image_token_identity() -> Result<(), String> {
+        let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&std::env::temp_dir())?;
+        assert_eq!(
+            crate::inference::MMPROJ_SHA256,
+            "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903"
+        );
+        assert_eq!(crate::inference::MMPROJ_SHA256, mmproj.sha256);
+
         let with_vision = serde_json::json!({"data":[{
             "id":"Swift-Bonsai-2-PQ2_0", "object":"model",
             "model_sha256":crate::inference::MODEL_SHA256,
@@ -902,6 +909,26 @@ mod context_tests {
             validate_native_identity(vision_wire.as_bytes(), false, false, expect_text).is_err()
         );
 
+        let mismatched_vision = serde_json::json!({"data":[{
+            "id":"Swift-Bonsai-2-PQ2_0", "object":"model",
+            "model_sha256":crate::inference::MODEL_SHA256,
+            "template_sha256":crate::inference::TEMPLATE_SHA256,
+            "runtime":"prism-inference", "context_tokens":8192,
+            "seed":42, "row_workers":1,
+            "vision":true,
+            "mmproj_sha256":"28e6426fe933262e362bfbe3054f973d9deac116f49e7e342d1a7748b44c1904",
+            "image_max_tokens":1024
+        }]})
+        .to_string();
+        let mismatched_wire = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{mismatched_vision}",
+            mismatched_vision.len()
+        );
+        assert!(
+            validate_native_identity(mismatched_wire.as_bytes(), false, false, expect_vision)
+                .is_err()
+        );
+
         let text_body = serde_json::json!({"data":[{
             "id":"Swift-Bonsai-2-PQ2_0", "object":"model",
             "model_sha256":crate::inference::MODEL_SHA256,
@@ -918,5 +945,6 @@ mod context_tests {
         assert!(
             validate_native_identity(text_wire.as_bytes(), false, false, expect_vision).is_err()
         );
+        Ok(())
     }
 }

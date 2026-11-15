@@ -21,7 +21,7 @@ pub(super) const ADAPTER_SHA256: &str =
 pub(super) const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 pub(super) const MMPROJ_SHA256: &str =
-    "28e6426fe933262e362bfbe3054f973d9deac116f49e7e342d1a7748b44c1904";
+    "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KvCache {
@@ -680,6 +680,16 @@ mod tests {
         assert!(prompt_reuse_supported(&pin, false).is_ok());
         assert!(vision_supported()?);
         assert!(!vision_release_matches(&pin));
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_adapter_and_mmproj_digests_match_policy_locks() -> Result<(), String> {
+        let data = std::env::temp_dir();
+        let adapter = bonsai_cpu_policy::abliterate_lora_artifact(&data)?;
+        let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&data)?;
+        assert_eq!(ADAPTER_SHA256, adapter.sha256);
+        assert_eq!(MMPROJ_SHA256, mmproj.sha256);
         Ok(())
     }
 }
