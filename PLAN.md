@@ -1336,11 +1336,6 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   sustained versus burst clock/power modes on X1/X2 using complete-answer latency,
   energy/charge delta and thermal comfort rather than peak microbenchmark clocks.
 
-### Pre-existing `main` verification housekeeping
-
-- [ ] Update unfulfilled `#[expect(clippy::used_underscore_binding)]` attributes in
-  [credentials tests](src/windows-credentials/src/tests.rs) under `nightly-2026-11-12`.
-
 ## Survey ideas outside the current laptop backlog
 
 - [ ] **F1 — Conditional research.** After a useful verifier and compatible
