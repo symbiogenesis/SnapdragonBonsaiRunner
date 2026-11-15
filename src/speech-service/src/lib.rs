@@ -15,6 +15,7 @@ use std::{io, net::Ipv4Addr, path::Path};
 mod credentials;
 mod http;
 pub mod launch;
+pub mod replay_harness;
 mod request;
 mod watchdog;
 mod wave;

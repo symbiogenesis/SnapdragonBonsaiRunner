@@ -171,15 +171,80 @@ struct TransformerState {
     layers: Vec<KvState>,
 }
 
-// Append without evicting until the complete transformer position succeeds.
-// Rollback only needs original lengths, never a second copy of the KV tensors.
-struct TransformerAppend<'a> {
-    state: &'a mut TransformerState,
+pub(crate) trait KvTarget {
+    type Guard;
+    fn commit(&mut self, guard: Self::Guard);
+    fn rollback(&mut self, guard: Self::Guard);
+}
+
+pub(crate) fn rollback_kv_slices(
+    keys: &mut Vec<f32>,
+    values: &mut Vec<f32>,
+    (saved_keys, saved_values): (usize, usize),
+) {
+    keys.truncate(saved_keys);
+    values.truncate(saved_values);
+}
+
+// Keep appended KV positions provisional until the enclosing step commits; rollback
+// only needs original slice lengths, never a second copy of the KV tensors.
+pub(crate) struct KvAppend<'a, T: KvTarget> {
+    pub(crate) state: &'a mut T,
+    guard: Option<T::Guard>,
+}
+
+impl<'a, T: KvTarget> KvAppend<'a, T> {
+    pub(crate) const fn from_guard(state: &'a mut T, guard: T::Guard) -> Self {
+        Self {
+            state,
+            guard: Some(guard),
+        }
+    }
+
+    pub(crate) fn commit(mut self) {
+        if let Some(guard) = self.guard.take() {
+            self.state.commit(guard);
+        }
+    }
+}
+
+impl<T: KvTarget> Drop for KvAppend<'_, T> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            self.state.rollback(guard);
+        }
+    }
+}
+
+struct TransformerGuard {
     lengths: Vec<(usize, usize)>,
     next: usize,
     keep: Option<usize>,
-    committed: bool,
 }
+
+impl KvTarget for TransformerState {
+    type Guard = TransformerGuard;
+
+    fn commit(&mut self, guard: Self::Guard) {
+        if let Some(keep) = guard.keep {
+            for layer in &mut self.layers {
+                let discard = layer.keys.len().saturating_sub(keep);
+                layer.keys.drain(..discard);
+                layer.values.drain(..discard);
+            }
+        }
+        self.position = guard.next;
+    }
+
+    fn rollback(&mut self, guard: Self::Guard) {
+        for (layer, &saved) in self.layers.iter_mut().zip(&guard.lengths) {
+            rollback_kv_slices(&mut layer.keys, &mut layer.values, saved);
+        }
+        self.layers.truncate(guard.lengths.len());
+    }
+}
+
+type TransformerAppend<'a> = KvAppend<'a, TransformerState>;
 
 impl<'a> TransformerAppend<'a> {
     fn new(
@@ -203,41 +268,31 @@ impl<'a> TransformerAppend<'a> {
         {
             return Err(invalid());
         }
-        Ok(Self {
-            lengths: state
-                .layers
-                .iter()
-                .map(|layer| (layer.keys.len(), layer.values.len()))
-                .collect(),
+        let lengths = state
+            .layers
+            .iter()
+            .map(|layer| (layer.keys.len(), layer.values.len()))
+            .collect();
+        Ok(Self::from_guard(
             state,
-            next,
-            keep,
-            committed: false,
-        })
-    }
-
-    fn commit(mut self) {
-        if let Some(keep) = self.keep {
-            for layer in &mut self.state.layers {
-                let discard = layer.keys.len().saturating_sub(keep);
-                layer.keys.drain(..discard);
-                layer.values.drain(..discard);
-            }
-        }
-        self.state.position = self.next;
-        self.committed = true;
+            TransformerGuard {
+                lengths,
+                next,
+                keep,
+            },
+        ))
     }
 }
 
-impl Drop for TransformerAppend<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            for (layer, &(keys, values)) in self.state.layers.iter_mut().zip(&self.lengths) {
-                layer.keys.truncate(keys);
-                layer.values.truncate(values);
-            }
-            self.state.layers.truncate(self.lengths.len());
-        }
+fn zero_workspace(values: &mut Vec<f32>, length: usize) {
+    values.clear();
+    values.resize(length, 0.0);
+}
+
+fn zero_workspace_group(group: &mut Vec<Vec<f32>>, lengths: impl ExactSizeIterator<Item = usize>) {
+    group.resize_with(lengths.len(), Vec::new);
+    for (slot, length) in group.iter_mut().zip(lengths) {
+        zero_workspace(slot, length);
     }
 }
 
@@ -576,8 +631,10 @@ fn append_attention(
     let total = state.keys.len() / stride;
     let frames = window.map_or(total, |window| total.min(window));
     let first = total - frames;
-    let mut output = vec![0.0; query.len()];
-    let mut scores = vec![0.0; frames];
+    let mut output = Vec::new();
+    zero_workspace(&mut output, query.len());
+    let mut scores = Vec::new();
+    zero_workspace(&mut scores, frames);
     let scale = 1.0 / count_float(width)?.sqrt();
     for head in 0..heads {
         let kv_head = head / (heads / kv_heads);
@@ -1079,48 +1136,44 @@ impl Codec {
     }
 
     pub(crate) fn reset(&mut self) {
-        self.state = DecodeState {
-            audio: CodecStreamState {
-                pre_conv: vec![0.0; self.pre.stream_context_frames() * self.pre.in_c],
-                upsample_dw: self
-                    .upsample
-                    .iter()
-                    .map(|stage| vec![0.0; (stage.block.kernel - 1) * stage.block.channels])
-                    .collect(),
-                dac_pre: vec![
-                    0.0;
-                    self.dac.conv_pre.stream_context_frames() * self.dac.conv_pre.in_c
-                ],
-                dac_carry: self
-                    .dac
-                    .blocks
-                    .iter()
-                    .map(|block| {
-                        vec![0.0; block.trans_conv.carry_frames() * block.trans_conv.out_c]
-                    })
-                    .collect(),
-                dac_ru: self
-                    .dac
-                    .blocks
-                    .iter()
-                    .map(|block| {
-                        std::array::from_fn(|index| {
-                            vec![
-                                0.0;
-                                block.res_units[index].conv1.stream_context_frames()
-                                    * block.res_units[index].conv1.in_c
-                            ]
-                        })
-                    })
-                    .collect(),
-                dac_post: vec![
-                    0.0;
-                    self.dac.conv_post.stream_context_frames() * self.dac.conv_post.in_c
-                ],
-                ..CodecStreamState::default()
-            },
-            transformer: TransformerState::default(),
-        };
+        let audio = &mut self.state.audio;
+        audio.pos = 0;
+        zero_workspace(
+            &mut audio.pre_conv,
+            self.pre.stream_context_frames() * self.pre.in_c,
+        );
+        zero_workspace_group(
+            &mut audio.upsample_dw,
+            self.upsample
+                .iter()
+                .map(|stage| (stage.block.kernel - 1) * stage.block.channels),
+        );
+        zero_workspace(
+            &mut audio.dac_pre,
+            self.dac.conv_pre.stream_context_frames() * self.dac.conv_pre.in_c,
+        );
+        zero_workspace_group(
+            &mut audio.dac_carry,
+            self.dac
+                .blocks
+                .iter()
+                .map(|block| block.trans_conv.carry_frames() * block.trans_conv.out_c),
+        );
+        audio
+            .dac_ru
+            .resize_with(self.dac.blocks.len(), Default::default);
+        for (slot, block) in audio.dac_ru.iter_mut().zip(&self.dac.blocks) {
+            for (buf, unit) in slot.iter_mut().zip(&block.res_units) {
+                zero_workspace(buf, unit.conv1.stream_context_frames() * unit.conv1.in_c);
+            }
+        }
+        zero_workspace(
+            &mut audio.dac_post,
+            self.dac.conv_post.stream_context_frames() * self.dac.conv_post.in_c,
+        );
+        audio.kv_k.clear();
+        audio.kv_v.clear();
+        self.state.transformer = TransformerState::default();
     }
 
     pub(crate) fn decode_cancellable(

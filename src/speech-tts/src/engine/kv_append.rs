@@ -4,14 +4,20 @@
 use std::io;
 
 use super::LayerKvCache;
+use crate::rust_codec::{KvTarget, rollback_kv_slices};
 
-pub(super) struct KvAppend<'a> {
-    cache: &'a mut LayerKvCache,
-    keys: usize,
-    values: usize,
-    positions: usize,
-    committed: bool,
+impl KvTarget for LayerKvCache {
+    type Guard = (usize, usize, usize);
+
+    fn commit(&mut self, _: Self::Guard) {}
+
+    fn rollback(&mut self, (keys, values, positions): Self::Guard) {
+        rollback_kv_slices(&mut self.k, &mut self.v, (keys, values));
+        self.seq_len = positions;
+    }
 }
+
+pub(super) struct KvAppend<'a>(crate::rust_codec::KvAppend<'a, LayerKvCache>);
 
 impl<'a> KvAppend<'a> {
     pub(super) fn new(
@@ -27,35 +33,19 @@ impl<'a> KvAppend<'a> {
             .v
             .try_reserve(values.len())
             .map_err(io::Error::other)?;
-        let append = Self {
-            keys: cache.k.len(),
-            values: cache.v.len(),
-            positions: cache.seq_len,
-            cache,
-            committed: false,
-        };
-        append.cache.k.extend_from_slice(keys);
-        append.cache.v.extend_from_slice(values);
-        append.cache.seq_len = next;
-        Ok(append)
+        let guard = (cache.k.len(), cache.v.len(), cache.seq_len);
+        cache.k.extend_from_slice(keys);
+        cache.v.extend_from_slice(values);
+        cache.seq_len = next;
+        Ok(Self(crate::rust_codec::KvAppend::from_guard(cache, guard)))
     }
 
     pub(super) const fn cache(&self) -> &LayerKvCache {
-        self.cache
+        self.0.state
     }
 
-    pub(super) fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for KvAppend<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.cache.k.truncate(self.keys);
-            self.cache.v.truncate(self.values);
-            self.cache.seq_len = self.positions;
-        }
+    pub(super) fn commit(self) {
+        self.0.commit();
     }
 }
 

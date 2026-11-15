@@ -1,62 +1,36 @@
 //! Verified file intake and deadline handoff for one complete Rust replay.
 
-use bonsai_artifacts::{ArtifactError, VerifiedFile, open_locked_file};
+use bonsai_artifacts::open_locked_file;
 use bonsai_speech_asr::{
     replay::{Binding, Provider, Replay, Tolerance, Tolerances},
     rust_engine::{ARITHMETIC_IDENTITY, RustRecognizer},
 };
-use serde::Deserialize;
-use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
-use std::{
-    ffi::OsString,
-    io::{self, Read as _, Write as _},
-    path::{Path, PathBuf},
+#[cfg(test)]
+use bonsai_speech_service::replay_harness::arguments;
+use bonsai_speech_service::replay_harness::{
+    Artifact, ClockSpec, Identity as HarnessIdentity, ReplayRunConfig, Rule, bounded_bytes,
+    hexadecimal, invalid, power_snapshot, run_replay, validate_provider_pair, verify_artifact,
+    verify_candidate_image,
 };
+use serde::Deserialize;
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
+use std::{io, path::PathBuf};
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Identity {
-    revision: String,
-    compiler: String,
-    target: String,
-    executable_sha256: String,
-    arithmetic: String,
-}
+#[serde(transparent)]
+struct Identity(HarnessIdentity);
 
 impl Identity {
     fn provider(&self) -> io::Result<Provider<'_>> {
+        let parsed = self.0.parse()?;
         Ok(Provider {
-            revision: hexadecimal(&self.revision)?,
-            compiler: &self.compiler,
-            target: &self.target,
-            executable: hexadecimal(&self.executable_sha256)?,
-            arithmetic: &self.arithmetic,
+            revision: parsed.revision,
+            compiler: parsed.compiler,
+            target: parsed.target,
+            executable: parsed.executable,
+            arithmetic: parsed.arithmetic,
         })
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Artifact {
-    path: PathBuf,
-    bytes: u64,
-    sha256: String,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-enum Rule {
-    Bits,
-    Finite { absolute: f32, relative: f32 },
-}
-
-impl Rule {
-    const fn tolerance(&self) -> Tolerance {
-        match *self {
-            Self::Bits => Tolerance::Bits,
-            Self::Finite { absolute, relative } => Tolerance::Finite { absolute, relative },
-        }
     }
 }
 
@@ -70,13 +44,19 @@ struct Rules {
 }
 
 impl Rules {
-    const fn tolerances(&self) -> Tolerances {
-        Tolerances {
-            frontend: self.frontend.tolerance(),
-            encoder: self.encoder.tolerance(),
-            logits: self.logits.tolerance(),
-            cache: self.cache.tolerance(),
-        }
+    fn tolerances(&self) -> io::Result<Tolerances> {
+        let map = |rule: Rule| {
+            rule.map(Tolerance::Bits, |absolute, relative| Tolerance::Finite {
+                absolute,
+                relative,
+            })
+        };
+        Ok(Tolerances {
+            frontend: map(self.frontend)?,
+            encoder: map(self.encoder)?,
+            logits: map(self.logits)?,
+            cache: map(self.cache)?,
+        })
     }
 }
 
@@ -97,134 +77,33 @@ struct Request {
     estimated_seconds: u64,
 }
 
-fn invalid() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "Invalid source-bound ASR replay request.",
-    )
-}
-
-fn hexadecimal<const N: usize>(text: &str) -> io::Result<[u8; N]> {
-    if text.len() != N * 2
-        || !text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(invalid());
-    }
-    let mut bytes = [0; N];
-    for (output, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
-        let nibble = |byte: u8| {
-            if byte.is_ascii_digit() {
-                byte - b'0'
-            } else {
-                byte - b'a' + 10
-            }
-        };
-        *output = nibble(pair[0]) * 16 + nibble(pair[1]);
-    }
-    if bytes.iter().all(|byte| *byte == 0) {
-        return Err(invalid());
-    }
-    Ok(bytes)
-}
-
-fn arguments(arguments: impl IntoIterator<Item = OsString>) -> io::Result<(PathBuf, String)> {
-    let mut arguments = arguments.into_iter();
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--request")) {
-        return Err(invalid());
-    }
-    let path = PathBuf::from(arguments.next().ok_or_else(invalid)?);
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--sha256")) {
-        return Err(invalid());
-    }
-    let digest = arguments
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .ok_or_else(invalid)?;
-    let _bytes: [u8; 32] = hexadecimal(&digest)?;
-    if arguments.next().is_some() || !path.is_absolute() {
-        return Err(invalid());
-    }
-    Ok((path, digest))
-}
-
 fn power() -> Value {
-    bonsai_windows_process::power_status().map_or_else(
-        |_| bonsai_cpu_policy::power::unknown_snapshot(),
-        |status| {
-            bonsai_cpu_policy::power::observed_snapshot(
-                status.ac_online,
-                status.battery_saver,
-                status.battery_percent,
-            )
-        },
+    power_snapshot(
+        bonsai_cpu_policy::power::observed_snapshot,
+        bonsai_cpu_policy::power::unknown_snapshot,
     )
 }
 
 impl Request {
-    fn admit_clock(&self, now: u64, frequency: u64) -> io::Result<()> {
-        let allowance = self
-            .work_deadline_tick
-            .checked_sub(self.owner_started_tick)
-            .ok_or_else(invalid)?;
-        let maximum = frequency.checked_mul(270).ok_or_else(invalid)?;
-        let estimate = frequency
-            .checked_mul(self.estimated_seconds)
-            .ok_or_else(invalid)?;
-        let remaining = self
-            .work_deadline_tick
-            .checked_sub(now)
-            .ok_or_else(invalid)?;
-        if self.schema_version != 1
-            || frequency == 0
-            || frequency != self.clock_frequency
-            || self.owner_started_tick == 0
-            || self.owner_started_tick > now
-            || now >= self.work_deadline_tick
-            || allowance > maximum
-            || estimate > remaining
-            || !(1..=240).contains(&self.estimated_seconds)
-            || self.fixed_work.trim().is_empty()
-            || self.fixed_work.len() > 1024
-            || self.fixed_work.chars().any(char::is_control)
-        {
-            return Err(invalid());
+    fn clock_spec(&self) -> ClockSpec<'_> {
+        ClockSpec {
+            schema_version: self.schema_version,
+            owner_started_tick: self.owner_started_tick,
+            work_deadline_tick: self.work_deadline_tick,
+            clock_frequency: self.clock_frequency,
+            fixed_work: &self.fixed_work,
+            estimated_seconds: self.estimated_seconds,
         }
-        Ok(())
+    }
+
+    #[cfg(test)]
+    fn admit_clock(&self, now: u64, frequency: u64) -> io::Result<()> {
+        self.clock_spec().admit(now, frequency)
     }
 
     fn expired(&self) -> bool {
-        bonsai_windows_process::monotonic_ticks().map_or(true, |(tick, frequency)| {
-            frequency != self.clock_frequency
-                || tick < self.owner_started_tick
-                || tick >= self.work_deadline_tick
-        })
+        self.clock_spec().expired()
     }
-
-    fn verify(&self, artifact: &Artifact) -> io::Result<VerifiedFile> {
-        VerifiedFile::verify_with(&artifact.path, artifact.bytes, &artifact.sha256, || {
-            if self.expired() {
-                Err(ArtifactError::Cancelled)
-            } else {
-                Ok(())
-            }
-        })
-        .map_err(io::Error::other)
-    }
-}
-
-fn bounded_bytes(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
-    let file = open_locked_file(path).map_err(io::Error::other)?;
-    if file.metadata()?.len() > maximum {
-        return Err(invalid());
-    }
-    let mut bytes = Vec::new();
-    file.take(maximum + 1).read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).map_err(|_| invalid())? > maximum {
-        return Err(invalid());
-    }
-    Ok(bytes)
 }
 
 fn pcm(bytes: &[u8]) -> io::Result<Vec<f32>> {
@@ -248,33 +127,20 @@ fn pcm(bytes: &[u8]) -> io::Result<Vec<f32>> {
 
 fn compare(request: &Request, report: &mut Value) -> io::Result<()> {
     bonsai_speech_service::launch::require_native_host()?;
-    let (tick, frequency) = bonsai_windows_process::monotonic_ticks()?;
-    request.admit_clock(tick, frequency)?;
-    report["fixedWork"] = request.fixed_work.clone().into();
-    report["estimatedSeconds"] = request.estimated_seconds.into();
-    report["ownerStartedTick"] = request.owner_started_tick.into();
-    report["workDeadlineTick"] = request.work_deadline_tick.into();
-    report["clockFrequency"] = frequency.into();
-    let reference = request.reference.provider()?;
-    let candidate = request.candidate.provider()?;
-    if candidate.arithmetic != ARITHMETIC_IDENTITY
-        || reference.arithmetic == ARITHMETIC_IDENTITY
-        || reference.executable == candidate.executable
-        || candidate.target != "aarch64-pc-windows-msvc"
-        || request.pcm.bytes < 201 * 4
+    request.clock_spec().admit_and_record(report)?;
+    let reference = request.reference.0.parse()?;
+    let candidate = request.candidate.0.parse()?;
+    validate_provider_pair(&reference, &candidate, ARITHMETIC_IDENTITY)?;
+    if request.pcm.bytes < 201 * 4
         || request.pcm.bytes > 480_000 * 4
         || request.packet.bytes == 0
         || request.packet.bytes > 16 * 1024 * 1024 * 1024
     {
         return Err(invalid());
     }
-    report["phase"] = "verify-candidate-image".into();
-    let image = std::env::current_exe()?;
-    let image_guard = request.verify(&Artifact {
-        bytes: image.metadata()?.len(),
-        path: image,
-        sha256: request.candidate.executable_sha256.clone(),
-    })?;
+    let expired = || request.expired();
+    let image_guard =
+        verify_candidate_image(&request.candidate.0.executable_sha256, &expired, report)?;
     let pin: Value =
         serde_json::from_str(include_str!("../../model.lock.json")).map_err(io::Error::other)?;
     let model = Artifact {
@@ -283,20 +149,20 @@ fn compare(request: &Request, report: &mut Value) -> io::Result<()> {
         sha256: pin["sha256"].as_str().ok_or_else(invalid)?.to_owned(),
     };
     report["phase"] = "verify-pinned-model".into();
-    let model_guard = request.verify(&model)?;
+    let model_guard = verify_artifact(&model, &expired)?;
     report["phase"] = "verify-original-pcm".into();
-    let pcm_guard = request.verify(&request.pcm)?;
+    let pcm_guard = verify_artifact(&request.pcm, &expired)?;
     report["phase"] = "verify-original-packet".into();
-    let packet_guard = request.verify(&request.packet)?;
+    let packet_guard = verify_artifact(&request.packet, &expired)?;
     let samples = pcm(&bounded_bytes(pcm_guard.path(), 480_000 * 4)?)?;
     let binding = Binding {
-        reference,
-        candidate,
+        reference: request.reference.provider()?,
+        candidate: request.candidate.provider()?,
         model: hexadecimal(&model.sha256)?,
         pcm: hexadecimal(&request.pcm.sha256)?,
     };
     let input = open_locked_file(packet_guard.path()).map_err(io::Error::other)?;
-    let replay = Replay::new(input, &binding, request.tolerances.tolerances())?;
+    let replay = Replay::new(input, &binding, request.tolerances.tolerances()?)?;
     report["phase"] = "load-rust-model".into();
     let mut recognizer =
         RustRecognizer::load_cancellable(model_guard.path(), &mut || request.expired())?;
@@ -319,41 +185,15 @@ fn compare(request: &Request, report: &mut Value) -> io::Result<()> {
     reason = "Keep this binary entry adapter private to its parent module."
 )]
 pub(super) fn run() -> io::Result<bool> {
-    let before = power();
-    let mut report = json!({"schemaVersion":1,"provider":"bonsai-asr-replay","passed":false,
-        "completeReplayPassed":false,"productionQualified":false,"nativeRetirementQualified":false,
-        "performanceComparisonEligible":false,"phase":"request-intake","powerBefore":before,
-        "powerScope":"This consumer entry/exit only; owner aggregate setup, reference arm and retention observations remain required.",
-        "cleanup":"Rust-owned tensors and verified-file guards drop on every result or unwind; external owner must enforce process lifetime."});
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
-        let (path, digest) = arguments(std::env::args_os().skip(1))?;
-        let bytes = bounded_bytes(&path, 64 * 1024)?;
-        if <[u8; 32]>::from(Sha256::digest(&bytes)) != hexadecimal::<32>(&digest)? {
-            return Err(invalid());
-        }
-        report["requestSha256"] = digest.into();
-        let request: Request = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        compare(&request, &mut report)
-    }));
-    let passed = matches!(result, Ok(Ok(())));
-    report["failureKind"] = match &result {
-        Ok(Ok(())) => Value::Null,
-        Ok(Err(error)) => format!("{:?}", error.kind()).into(),
-        Err(_) => "unwind".into(),
+    let config = ReplayRunConfig {
+        provider: "bonsai-asr-replay",
+        power_scope: "This consumer entry/exit only; owner aggregate setup, reference arm and retention observations remain required.",
+        cleanup: "Rust-owned tensors and verified-file guards drop on every result or unwind; external owner must enforce process lifetime.",
+        sha256: &|bytes| Sha256::digest(bytes).into(),
+        power: &power,
+        compare_power: &bonsai_cpu_policy::power::compare_endpoints,
     };
-    report["passed"] = passed.into();
-    report["status"] = if passed {
-        "complete-replay-passed"
-    } else {
-        "failed-or-incomplete"
-    }
-    .into();
-    report["powerAfter"] = power();
-    report["powerConditions"] =
-        bonsai_cpu_policy::power::compare_endpoints(&report["powerBefore"], &report["powerAfter"]);
-    serde_json::to_writer(io::stdout().lock(), &report)?;
-    writeln!(io::stdout().lock())?;
-    Ok(passed)
+    run_replay(&config, compare)
 }
 
 #[cfg(test)]
