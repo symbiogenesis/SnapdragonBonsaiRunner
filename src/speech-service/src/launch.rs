@@ -70,9 +70,9 @@ pub fn require_native_host() -> io::Result<()> {
 
 /// Parse the exact fixed companion command line without opening model contents.
 ///
-/// `--version` must appear alone. ASR accepts `--model`, `--token-file` and an
-/// optional `--port`; TTS additionally requires `--codec` and `--voice-model`,
-/// and accepts bounded `--threads` and pinned `--quantization Q8_0|Q4_K_M`.
+/// `--version` must appear alone. ASR accepts `--model`, `--token-file`, optional
+/// `--port` and bounded `--threads`; TTS additionally requires `--codec` and
+/// `--voice-model`, and accepts bounded `--threads` and pinned `--quantization Q8_0|Q4_K_M`.
 /// Every supplied path must already name an external regular non-reparse file.
 ///
 /// # Errors
@@ -120,7 +120,9 @@ pub fn parse(kind: Kind, arguments: impl IntoIterator<Item = OsString>) -> io::R
                 }
                 port = Some(text.parse::<u16>().map_err(|_| invalid_arguments())?);
             }
-            Some("--threads") if kind == Kind::QwenTts && threads.is_none() => {
+            Some("--threads")
+                if matches!(kind, Kind::Canary | Kind::QwenTts) && threads.is_none() =>
+            {
                 let value = arguments.next().ok_or_else(invalid_arguments)?;
                 let text = value.to_str().ok_or_else(invalid_arguments)?;
                 if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -475,6 +477,28 @@ mod tests {
             let mut invalid = values.clone();
             invalid.extend(extra.into_iter().map(OsString::from));
             assert!(parse(Kind::QwenTts, invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn asr_cli_accepts_bounded_threads_and_rejects_invalid_thread_counts() -> io::Result<()> {
+        let (_, values) = fixture()?;
+        let mut tuned = values.clone();
+        tuned.extend(["--threads", "8"].map(OsString::from));
+        let Command::Serve(arguments) = parse(Kind::Canary, tuned)? else {
+            return Err(io::Error::other("Expected ASR settings."));
+        };
+        assert_eq!(arguments.threads, Some(8));
+        for extra in [
+            vec!["--threads", "0"],
+            vec!["--threads", "257"],
+            vec!["--threads", "+8"],
+            vec!["--threads", "4", "--threads", "8"],
+        ] {
+            let mut invalid = values.clone();
+            invalid.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(Kind::Canary, invalid).is_err());
         }
         Ok(())
     }
