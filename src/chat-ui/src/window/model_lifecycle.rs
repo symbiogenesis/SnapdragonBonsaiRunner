@@ -69,7 +69,9 @@ impl ModelLifecycle {
         match event {
             Event::Starting => matches!(self, Self::Preparing | Self::Restarting),
             Event::Restarting => matches!(self, Self::Stopping),
-            Event::ContextCapacity(_) | Event::Ready => matches!(self, Self::Preparing),
+            Event::ContextCapacity(_) | Event::VisionAvailable(_) | Event::Ready => {
+                matches!(self, Self::Preparing)
+            }
             Event::Text(_)
             | Event::Reasoning(_)
             | Event::Stage(_)

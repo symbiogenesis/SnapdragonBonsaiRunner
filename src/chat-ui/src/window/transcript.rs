@@ -175,6 +175,8 @@ pub(super) struct Message {
     pub(super) id: u64,
     pub(super) role: Role,
     pub(super) body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) attachments: Vec<crate::attachment_import::Attachment>,
     #[serde(default)]
     history_index: Option<usize>,
     // Identifies a live turn across recovery without guessing from duplicate text.
@@ -303,6 +305,10 @@ impl Transcript {
                     .saturating_add(message.body.len())
                     .saturating_add(message.reasoning.len())
             }) <= MAX_BYTES
+            && self.messages.iter().all(|message| {
+                (message.role == Role::User || message.attachments.is_empty())
+                    && valid_attachments(&message.attachments)
+            })
     }
 
     pub(super) fn clear(&mut self) {
@@ -328,6 +334,15 @@ impl Transcript {
     }
 
     pub(super) fn push(&mut self, role: Role, body: String) {
+        self.push_with_attachments(role, body, Vec::new());
+    }
+
+    pub(super) fn push_with_attachments(
+        &mut self,
+        role: Role,
+        body: String,
+        attachments: Vec<crate::attachment_import::Attachment>,
+    ) {
         self.presentation = None;
         self.history_revision = self.history_revision.wrapping_add(1);
         self.search.invalidate();
@@ -337,6 +352,7 @@ impl Transcript {
             id: self.next_id,
             role,
             body,
+            attachments,
             history_index: None,
             turn_prefix: None,
             retry_prefix: None,
@@ -663,6 +679,29 @@ impl Transcript {
         }
         action
     }
+}
+
+pub(super) fn valid_attachments(attachments: &[crate::attachment_import::Attachment]) -> bool {
+    if attachments.len() > crate::attachment_import::MAX_ATTACHMENTS_PER_MESSAGE {
+        return false;
+    }
+    let mut total_text_bytes = 0_usize;
+    let mut total_images = 0_usize;
+    for attachment in attachments {
+        total_text_bytes = total_text_bytes.saturating_add(attachment.text_bytes());
+        total_images = total_images.saturating_add(attachment.image_count());
+        if total_text_bytes > crate::attachment_import::MAX_TOTAL_TEXT_ATTACHMENT_BYTES
+            || total_images > crate::client::MAX_REQUEST_IMAGES
+        {
+            return false;
+        }
+        if let crate::attachment_import::Attachment::Video { frames, .. } = attachment
+            && frames.len() > crate::attachment_import::MAX_VIDEO_KEYFRAMES
+        {
+            return false;
+        }
+    }
+    true
 }
 
 impl Message {

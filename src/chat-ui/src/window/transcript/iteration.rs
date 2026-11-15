@@ -9,7 +9,7 @@ impl Message {
                 *prefix == history.len()
                     && prefix.is_multiple_of(2)
                     && self.history_index.is_none()
-                    && !self.body.trim().is_empty()
+                    && (!self.body.trim().is_empty() || !self.attachments.is_empty())
                     && crate::window::draft_buffer::fits(&self.body)
             })
         } else if self.interrupted || self.token_limit {
@@ -32,16 +32,32 @@ impl Message {
                 .is_some_and(|last| self.committed_index(history) == Some(last))
     }
 
+    pub(in crate::window) const fn matches_turn_prefix(&self, prefix: usize) -> bool {
+        self.history_index.is_none()
+            && (matches!(self.turn_prefix, Some(value) if value == prefix)
+                || matches!(self.retry_prefix, Some(value) if value == prefix))
+    }
+
     fn matches_history(&self, message: &client::Message) -> bool {
         #[cfg(test)]
         self.history_checks.set(self.history_checks.get() + 1);
-        message.role
-            == match self.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            }
-            && self.body == message.content.as_ref()
-            && self.reasoning == message.reasoning_content.as_deref().unwrap_or_default()
+        let expected_role = match self.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        if message.role != expected_role
+            || self.reasoning != message.reasoning_content.as_deref().unwrap_or_default()
+        {
+            return false;
+        }
+        if self.role == Role::User && !self.attachments.is_empty() {
+            let (expected_text, expected_images) =
+                crate::attachment_import::format_user_turn(&self.body, &self.attachments);
+            expected_text == message.content.as_ref()
+                && expected_images.as_ref() == message.images.as_ref()
+        } else {
+            message.images.is_empty() && self.body == message.content.as_ref()
+        }
     }
 
     pub(in crate::window) fn committed_index(&self, history: &[client::Message]) -> Option<usize> {
@@ -86,10 +102,19 @@ impl Message {
 
 impl Transcript {
     pub(in crate::window) fn start_turn(&mut self, prompt: String, prefix: usize) {
+        self.start_turn_with_attachments(prompt, Vec::new(), prefix);
+    }
+
+    pub(in crate::window) fn start_turn_with_attachments(
+        &mut self,
+        prompt: String,
+        attachments: Vec<crate::attachment_import::Attachment>,
+        prefix: usize,
+    ) {
         for message in &mut self.messages {
             message.retry_prefix = None;
         }
-        self.push(Role::User, prompt);
+        self.push_with_attachments(Role::User, prompt, attachments);
         if let Some(message) = self.messages.last_mut() {
             message.turn_prefix = Some(prefix);
         }
@@ -178,8 +203,11 @@ impl Transcript {
         let answer_index = prompt_index + 1 + answer_offset;
         let prompt = &self.messages[prompt_index];
         let answer = &self.messages[answer_index];
-        if prompt.body.is_empty()
-            || prompt.body.len() > 1024 * 1024
+        let (prompt_content, prompt_images) =
+            crate::attachment_import::format_user_turn(&prompt.body, &prompt.attachments);
+        if (prompt_content.is_empty() && prompt_images.is_empty())
+            || prompt_content.len() > 1024 * 1024
+            || prompt_images.len() > client::MAX_REQUEST_IMAGES
             || answer.body.len() > 1024 * 1024
             || answer.reasoning.len() > 1024 * 1024
         {
@@ -187,14 +215,16 @@ impl Transcript {
         }
         history.push(client::Message {
             role: "user",
-            content: prompt.body.as_str().into(),
+            content: prompt_content.into(),
             reasoning_content: None,
+            images: prompt_images,
         });
         history.push(client::Message {
             role: "assistant",
             content: answer.body.as_str().into(),
             reasoning_content: (!answer.reasoning.is_empty())
                 .then(|| answer.reasoning.as_str().into()),
+            images: std::sync::Arc::default(),
         });
         for message in &mut self.messages[prompt_index..] {
             if message.turn_prefix == Some(prefix) {
@@ -286,8 +316,9 @@ impl Transcript {
         source: &Self,
         history: &[client::Message],
     ) {
+        let mut attachments_restored = false;
         for message in &mut self.messages {
-            let Some(index) = message.committed_index(history) else {
+            let Some(index) = message.history_index.filter(|&index| index < history.len()) else {
                 continue;
             };
             if let Some(original) = source
@@ -297,7 +328,25 @@ impl Transcript {
             {
                 message.interrupted = original.interrupted;
                 message.token_limit = original.token_limit;
+                if message.role == Role::User && !original.attachments.is_empty() {
+                    self.text_bytes = self
+                        .text_bytes
+                        .saturating_sub(message.body.len())
+                        .saturating_add(original.body.len());
+                    message.body = original.body.clone();
+                    message.attachments = original.attachments.clone();
+                    message.body_revision = message.body_revision.wrapping_add(1);
+                    message.cache = None;
+                    attachments_restored = true;
+                } else if !message.matches_history(&history[index]) {
+                    message.interrupted = false;
+                    message.token_limit = false;
+                }
             }
+        }
+        if attachments_restored {
+            self.history_revision = self.history_revision.wrapping_add(1);
+            self.search.invalidate();
         }
     }
 
@@ -322,6 +371,7 @@ impl Transcript {
                 left.role == right.role
                     && left.content == right.content
                     && left.reasoning_content == right.reasoning_content
+                    && left.images == right.images
             })
         {
             return;
@@ -379,6 +429,7 @@ mod tests {
             role,
             content: text.into(),
             reasoning_content: None,
+            images: std::sync::Arc::default(),
         }
     }
 

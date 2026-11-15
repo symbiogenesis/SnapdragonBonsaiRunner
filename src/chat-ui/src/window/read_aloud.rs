@@ -350,11 +350,13 @@ mod tests {
             client::Message {
                 role: "user",
                 content: "Read a two-part story".into(),
+                images: std::sync::Arc::default(),
                 reasoning_content: None,
             },
             client::Message {
                 role: "assistant",
                 content: "First part. ".into(),
+                images: std::sync::Arc::default(),
                 reasoning_content: None,
             },
         ];
@@ -381,11 +383,13 @@ mod tests {
         second_committed.push(client::Message {
             role: "user",
             content: crate::window::iteration::CONTINUE_PROMPT.into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         second_committed.push(client::Message {
             role: "assistant",
             content: "Second part.".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         state.model_event(client::Event::Committed(second_committed));

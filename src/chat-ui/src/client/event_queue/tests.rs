@@ -35,6 +35,7 @@ fn stream_entries_and_payload_are_bounded_and_lifecycle_order_is_retained() -> R
             role: "assistant",
             content: "Committed".into(),
             reasoning_content: None,
+            images: Arc::default(),
         }]))
         .map_err(|()| Failure::Shutdown)?;
     sender

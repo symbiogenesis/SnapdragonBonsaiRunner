@@ -24,11 +24,13 @@ fn completed_history() -> Vec<client::Message> {
         client::Message {
             role: "user",
             content: "Original question".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
         client::Message {
             role: "assistant",
             content: "Finished answer".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: Some("Reasoning".into()),
         },
     ]

@@ -50,6 +50,8 @@ const MAX_BODY: usize = 4 * 1024 * 1024;
 // worker frames and tokenizer retain independent 1 MiB limits; increasing only
 // the desktop HTTP limit would admit requests the selected runtime cannot use.
 const MAX_REQUEST: usize = 1024 * 1024;
+const MAX_MULTIMODAL_REQUEST: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_IMAGES: usize = 24;
 const MAX_EVENT: usize = 1024 * 1024;
 const MAX_ERROR_BODY: usize = 256;
 const READ_SIZE: usize = 8192;
@@ -149,6 +151,7 @@ pub(crate) struct Config {
 pub(crate) enum Command {
     Send {
         text: String,
+        images: Arc<[Arc<str>]>,
         max_completion_tokens: u32,
         extra_effort: bool,
         enable_thinking: bool,
@@ -168,6 +171,7 @@ pub(crate) enum Event {
     Starting,
     Restarting,
     ContextCapacity(usize),
+    VisionAvailable(bool),
     Ready,
     Text(String),
     Reasoning(String),
@@ -211,6 +215,10 @@ enum Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
+fn images_empty(images: &Arc<[Arc<str>]>) -> bool {
+    images.is_empty()
+}
+
 #[derive(Clone, Serialize)]
 pub(crate) struct Message {
     pub(crate) role: &'static str,
@@ -219,6 +227,8 @@ pub(crate) struct Message {
     pub(crate) content: Arc<str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_content: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "images_empty")]
+    pub(crate) images: Arc<[Arc<str>]>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -231,6 +241,8 @@ impl<'de> Deserialize<'de> for Message {
             role: String,
             content: String,
             reasoning_content: Option<String>,
+            #[serde(default)]
+            images: Vec<String>,
         }
         let stored = StoredMessage::deserialize(deserializer)?;
         let role = match stored.role.as_str() {
@@ -238,10 +250,22 @@ impl<'de> Deserialize<'de> for Message {
             "assistant" => "assistant",
             _ => return Err(serde::de::Error::custom("Unsupported conversation role.")),
         };
+        if role != "user" && !stored.images.is_empty() {
+            return Err(serde::de::Error::custom(
+                "Only user messages may carry attached images.",
+            ));
+        }
+        if stored.images.len() > MAX_REQUEST_IMAGES {
+            return Err(serde::de::Error::custom(
+                "Conversation message exceeds maximum attached image count.",
+            ));
+        }
+        let images: Vec<Arc<str>> = stored.images.into_iter().map(Arc::from).collect();
         Ok(Self {
             role,
             content: stored.content.into(),
             reasoning_content: stored.reasoning_content.map(Into::into),
+            images: images.into(),
         })
     }
 }
@@ -261,6 +285,54 @@ impl Serialize for SystemMessageRef {
     }
 }
 
+#[derive(Serialize)]
+struct WireImageUrl<'a> {
+    url: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireContentPart<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: WireImageUrl<'a> },
+}
+
+struct WireContent<'a>(&'a Message);
+
+impl Serialize for WireContent<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+        if self.0.images.is_empty() {
+            return serializer.serialize_str(self.0.content.as_ref());
+        }
+        let has_text = !self.0.content.is_empty();
+        let len = self.0.images.len().saturating_add(usize::from(has_text));
+        let mut seq = serializer.serialize_seq(Some(len))?;
+        for url in self.0.images.iter() {
+            seq.serialize_element(&WireContentPart::ImageUrl {
+                image_url: WireImageUrl { url: url.as_ref() },
+            })?;
+        }
+        if has_text {
+            seq.serialize_element(&WireContentPart::Text {
+                text: self.0.content.as_ref(),
+            })?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+struct WireMessage<'a> {
+    role: &'a str,
+    content: WireContent<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
+}
+
 struct RequestMessages<'a>(&'a [Message]);
 
 impl Serialize for RequestMessages<'_> {
@@ -272,7 +344,11 @@ impl Serialize for RequestMessages<'_> {
         let mut seq = serializer.serialize_seq(Some(self.0.len().saturating_add(1)))?;
         seq.serialize_element(&SystemMessageRef)?;
         for message in self.0 {
-            seq.serialize_element(message)?;
+            seq.serialize_element(&WireMessage {
+                role: message.role,
+                content: WireContent(message),
+                reasoning_content: message.reasoning_content.as_deref(),
+            })?;
         }
         seq.end()
     }
@@ -540,7 +616,7 @@ fn serve_broker(
     history: &mut Vec<Message>,
     spec: &ToolProcessSpec,
 ) -> Result<()> {
-    let (key, context_tokens) = wait_ready(
+    let (key, context_tokens, vision_available) = wait_ready(
         broker,
         config,
         commands,
@@ -549,6 +625,7 @@ fn serve_broker(
         &spec.stderr,
     )?;
     notify(events, Event::ContextCapacity(context_tokens))?;
+    notify(events, Event::VisionAvailable(vision_available))?;
     notify(events, Event::Ready)?;
     loop {
         if broker
@@ -569,19 +646,26 @@ fn serve_broker(
             Ok(Command::RestoreChat(restored)) => *history = restored,
             Ok(Command::Send {
                 text,
+                images,
                 max_completion_tokens,
                 extra_effort,
                 enable_thinking,
                 abliteration_scale,
             }) => {
-                if text.trim().is_empty() {
+                if text.trim().is_empty() && images.is_empty() {
                     continue;
                 }
+                let normalized_text = if text.trim().is_empty() {
+                    String::new()
+                } else {
+                    text
+                };
                 let mut pending = history.clone();
                 pending.push(Message {
                     role: "user",
-                    content: text.as_str().into(),
+                    content: normalized_text.as_str().into(),
                     reasoning_content: None,
+                    images,
                 });
                 let scale = config.use_abliterate_lora.then_some(abliteration_scale);
                 let outcome =
@@ -616,7 +700,7 @@ fn serve_broker(
                 finish_turn(
                     history,
                     pending,
-                    &text,
+                    &normalized_text,
                     outcome,
                     events,
                     commands,
@@ -635,7 +719,7 @@ fn wait_ready(
     history: &mut Vec<Message>,
     stdout_path: &Path,
     stderr_path: &Path,
-) -> Result<(RetainedCredential, usize)> {
+) -> Result<(RetainedCredential, usize, bool)> {
     let until = Instant::now() + STARTUP_TIMEOUT;
     loop {
         check_startup_commands(commands, history)?;
@@ -644,8 +728,9 @@ fn wait_ready(
             let context_tokens = context_capacity(&output)?.ok_or(Failure::Message(
                 "The broker did not report its selected context capacity. Rebuild the broker and retry.",
             ))?;
+            let vision_available = input_modalities(&output)?.unwrap_or(false);
             let key = read_api_key(&config.evidence, &directory)?;
-            return Ok((key, context_tokens));
+            return Ok((key, context_tokens, vision_available));
         }
         if broker
             .try_wait()
@@ -847,6 +932,34 @@ fn context_capacity(output: &[u8]) -> Result<Option<usize>> {
     Ok(capacity)
 }
 
+fn input_modalities(output: &[u8]) -> Result<Option<bool>> {
+    let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&output[..=end])
+        .map_err(|_| Failure::Message("Broker startup output was not valid UTF-8."))?;
+    let mut vision = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("Input modalities: ") {
+            let parsed = match value {
+                "text, image" => true,
+                "text" => false,
+                _ => {
+                    return Err(Failure::Message(
+                        "The broker reported unsupported input modalities.",
+                    ));
+                }
+            };
+            if vision.replace(parsed).is_some() {
+                return Err(Failure::Message(
+                    "The broker reported input modalities more than once.",
+                ));
+            }
+        }
+    }
+    Ok(vision)
+}
+
 fn evidence_directory(output: &[u8]) -> Result<Option<PathBuf>> {
     let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
         return Ok(None);
@@ -958,6 +1071,20 @@ fn serialize_request(
             "This conversation reached the 127-message limit. Select New conversation before sending again.",
         ));
     }
+    let total_images = history
+        .iter()
+        .map(|message| message.images.len())
+        .fold(0_usize, usize::saturating_add);
+    if total_images > MAX_REQUEST_IMAGES {
+        return Err(Failure::Rejected(
+            "This conversation reached the 24-image limit, including video keyframes. Remove media attachments or select New conversation before sending again.",
+        ));
+    }
+    let limit = if total_images > 0 {
+        MAX_MULTIMODAL_REQUEST
+    } else {
+        MAX_REQUEST
+    };
     crate::bounded_json::to_vec(
         &ChatRequest {
             messages: RequestMessages(history),
@@ -966,11 +1093,15 @@ fn serialize_request(
             enable_thinking,
             abliteration_scale,
         },
-        MAX_REQUEST,
+        limit,
     )
     .map_err(|error| {
         if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
-            request_byte_limit()
+            if total_images > 0 {
+                multimodal_request_byte_limit()
+            } else {
+                request_byte_limit()
+            }
         } else {
             Failure::Message("Could not prepare the chat request.")
         }
@@ -980,6 +1111,12 @@ fn serialize_request(
 const fn request_byte_limit() -> Failure {
     Failure::Rejected(
         "This conversation exceeded the 1 MiB request limit, including history and text escaping. Shorten your message or select New conversation. Your draft is kept.",
+    )
+}
+
+const fn multimodal_request_byte_limit() -> Failure {
+    Failure::Rejected(
+        "This conversation exceeded the 16 MiB multimodal request limit, including attached images and history. Remove some media attachments or select New conversation. Your draft is kept.",
     )
 }
 
@@ -1172,6 +1309,7 @@ fn exchange(
             role: "assistant",
             content: text.into(),
             reasoning_content: (!reasoning.is_empty()).then(|| reasoning.into()),
+            images: Arc::default(),
         },
         completion,
     ))
@@ -1554,12 +1692,14 @@ mod tests {
             role: "assistant",
             content: "A completed answer 🌱".repeat(8192).into(),
             reasoning_content: Some("Retained reasoning 雨".repeat(8192).into()),
+            images: Arc::default(),
         };
         let mut history = vec![
             Message {
                 role: "user",
                 content: "The original task".into(),
                 reasoning_content: None,
+                images: Arc::default(),
             },
             prior.clone(),
         ];
@@ -1573,6 +1713,7 @@ mod tests {
             role: "user",
             content: "A new task".into(),
             reasoning_content: None,
+            images: Arc::default(),
         });
         assert_eq!(history.len(), 2);
         let (_commands, commands) = mpsc::channel();
@@ -1586,6 +1727,7 @@ mod tests {
                     role: "assistant",
                     content: "The new answer".into(),
                     reasoning_content: None,
+                    images: Arc::default(),
                 },
                 Completion::Finished,
             )),
@@ -1613,16 +1755,19 @@ mod tests {
                 role: "user",
                 content: "Write a garden scene.".into(),
                 reasoning_content: None,
+                images: super::Arc::default(),
             },
             Message {
                 role: "assistant",
                 content: "The garden grew quiet.".into(),
                 reasoning_content: Some("Retained prior reasoning".into()),
+                images: super::Arc::default(),
             },
             Message {
                 role: "user",
                 content: "Continue.".into(),
                 reasoning_content: None,
+                images: super::Arc::default(),
             },
         ];
         for enable_thinking in [false, true] {
@@ -1650,6 +1795,7 @@ mod tests {
             role: "user",
             content: "Write a garden scene.".into(),
             reasoning_content: None,
+            images: super::Arc::default(),
         }];
         for scale in [0.0, super::DEFAULT_ABLITERATION_SCALE, 2.0] {
             let body = serialize_request(&history, 4096, false, Some(scale))?;
@@ -1746,16 +1892,19 @@ mod tests {
                     role: "user",
                     content: "Begin".into(),
                     reasoning_content: None,
+                    images: super::Arc::default(),
                 },
                 Message {
                     role: "assistant",
                     content: text.into(),
                     reasoning_content: Some(reasoning.into()),
+                    images: super::Arc::default(),
                 },
                 Message {
                     role: "user",
                     content: "Continue".into(),
                     reasoning_content: None,
+                    images: super::Arc::default(),
                 },
             ],
             4096,
@@ -2506,6 +2655,7 @@ mod tests {
             role: "user",
             content: "Previous conversation must not survive New conversation".into(),
             reasoning_content: None,
+            images: super::Arc::default(),
         }];
         assert_eq!(
             startup_failure(b"Development backend launch failed: Memory.", false),
@@ -2521,6 +2671,7 @@ mod tests {
             commands
                 .send(Command::Send {
                     text: "Never automatically replay this message".into(),
+                    images: super::Arc::default(),
                     max_completion_tokens: 4096,
                     extra_effort: false,
                     enable_thinking: false,
@@ -2562,11 +2713,13 @@ mod tests {
                 role: "user",
                 content: "Earlier task".into(),
                 reasoning_content: None,
+                images: super::Arc::default(),
             },
             Message {
                 role: "assistant",
                 content: "Earlier completed answer".into(),
                 reasoning_content: Some("Retained reasoning".into()),
+                images: super::Arc::default(),
             },
         ];
         let original = serialize_request(&history, 4096, false, None)?;
@@ -2586,6 +2739,7 @@ mod tests {
                 role: "user",
                 content: "Unfinished task 🌱".into(),
                 reasoning_content: None,
+                images: super::Arc::default(),
             });
             let result = finish_turn(
                 &mut history,
@@ -2620,6 +2774,7 @@ mod tests {
             role: "user",
             content: "Reviewed task".into(),
             reasoning_content: None,
+            images: super::Arc::default(),
         });
         finish_turn(
             &mut history,
@@ -2630,6 +2785,7 @@ mod tests {
                     role: "assistant",
                     content: "New complete answer".into(),
                     reasoning_content: None,
+                    images: super::Arc::default(),
                 },
                 Completion::Finished,
             )),
@@ -2665,16 +2821,19 @@ mod tests {
                     role: "user",
                     content: "Keep the approved scene.".into(),
                     reasoning_content: None,
+                    images: super::Arc::default(),
                 },
                 Message {
                     role: "assistant",
                     content: "Understood.".into(),
                     reasoning_content: Some("Prior reasoning: \u{96e8}\\\n".into()),
+                    images: super::Arc::default(),
                 },
                 Message {
                     role: "user",
                     content: text.as_str().into(),
                     reasoning_content: None,
+                    images: super::Arc::default(),
                 },
             ];
             for thinking in [false, true] {
@@ -2705,11 +2864,13 @@ mod tests {
                 role: "user",
                 content: "Saved task".into(),
                 reasoning_content: None,
+                images: super::Arc::default(),
             },
             Message {
                 role: "assistant",
                 content: "Saved answer".into(),
                 reasoning_content: Some("Saved reasoning".into()),
+                images: super::Arc::default(),
             },
         ];
         let original = serialize_request(&history, 1024, false, None)?;
@@ -2721,6 +2882,7 @@ mod tests {
             role: "user",
             content: text.as_str().into(),
             reasoning_content: None,
+            images: super::Arc::default(),
         });
         let failure = serialize_request(&pending, 1024, false, None);
         assert_eq!(failure.err(), Some(super::request_byte_limit()));
@@ -2750,6 +2912,7 @@ mod tests {
             role: "user",
             content: "Task".into(),
             reasoning_content: None,
+            images: super::Arc::default(),
         }];
         for budget in [1, 512, 1024, 2048, 4096] {
             let body = serialize_request(&history, budget, false, None)?;
@@ -2772,11 +2935,128 @@ mod tests {
             role: "user",
             content: "x".repeat(super::MAX_REQUEST).into(),
             reasoning_content: None,
+            images: super::Arc::default(),
         }];
         assert!(matches!(
             serialize_request(&oversized, 4096, false, None),
             Err(Failure::Rejected(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_input_modalities_recognizes_text_and_vision_declarations() {
+        use super::input_modalities;
+        assert_eq!(
+            input_modalities(b"Input modalities: text, image\n"),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            input_modalities(b"Input modalities: text\r\n"),
+            Ok(Some(false))
+        );
+        assert_eq!(input_modalities(b"Context tokens: 8192\n"), Ok(None));
+        assert_eq!(
+            input_modalities(b"other output\nInput modalities: text, imag"),
+            Ok(None)
+        );
+        for invalid in ["", "image", "text, audio", "text, image, audio", "text "] {
+            assert!(input_modalities(format!("Input modalities: {invalid}\n").as_bytes()).is_err());
+        }
+        assert!(input_modalities(b"Input modalities: text\nInput modalities: text\n").is_err());
+        assert!(
+            input_modalities(b"Input modalities: text\nInput modalities: text, image\n").is_err()
+        );
+    }
+
+    #[test]
+    fn multimodal_request_serializes_image_parts_and_enforces_24_image_and_16_mib_limits()
+    -> Result<(), Failure> {
+        use super::Arc;
+
+        let image_url: Arc<str> = Arc::from("data:image/png;base64,AAAA");
+        let with_caption = [Message {
+            role: "user",
+            content: "Describe this".into(),
+            reasoning_content: None,
+            images: Arc::from([Arc::clone(&image_url)]),
+        }];
+        let json_bytes = serde_json::to_vec(&with_caption[0])
+            .map_err(|_| Failure::Message("serialize stored multimodal message"))?;
+        let restored: Message = serde_json::from_slice(&json_bytes)
+            .map_err(|_| Failure::Message("deserialize stored multimodal message"))?;
+        assert_eq!(restored.images.as_ref(), &[Arc::clone(&image_url)]);
+
+        assert!(
+            serde_json::from_slice::<Message>(
+                br#"{"role":"assistant","content":"hi","images":["data:image/png;base64,AAAA"]}"#,
+            )
+            .is_err()
+        );
+
+        let body = serialize_request(&with_caption, 512, false, None)?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| Failure::Message("test multimodal JSON"))?;
+        assert_eq!(
+            json["messages"][1]["content"],
+            serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "text", "text": "Describe this"}
+            ])
+        );
+
+        let image_only = [Message {
+            role: "user",
+            content: "".into(),
+            reasoning_content: None,
+            images: Arc::from([Arc::clone(&image_url)]),
+        }];
+        let body = serialize_request(&image_only, 512, false, None)?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| Failure::Message("image-only JSON"))?;
+        assert_eq!(
+            json["messages"][1]["content"],
+            serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ])
+        );
+
+        let large_image: Arc<str> = Arc::from(format!(
+            "data:image/png;base64,{}",
+            "A".repeat(2 * 1024 * 1024)
+        ));
+        let two_mib_turn = [Message {
+            role: "user",
+            content: "Large image".into(),
+            reasoning_content: None,
+            images: Arc::from([large_image]),
+        }];
+        assert!(serialize_request(&two_mib_turn, 512, false, None).is_ok());
+
+        let too_many_images = [Message {
+            role: "user",
+            content: "Too many".into(),
+            reasoning_content: None,
+            images: vec![Arc::clone(&image_url); super::MAX_REQUEST_IMAGES + 1].into(),
+        }];
+        assert!(matches!(
+            serialize_request(&too_many_images, 512, false, None),
+            Err(Failure::Rejected(_))
+        ));
+
+        let oversized_multimodal = [Message {
+            role: "user",
+            content: "".into(),
+            reasoning_content: None,
+            images: Arc::from([Arc::from(format!(
+                "data:image/png;base64,{}",
+                "A".repeat(super::MAX_MULTIMODAL_REQUEST)
+            ))]),
+        }];
+        assert_eq!(
+            serialize_request(&oversized_multimodal, 512, false, None).err(),
+            Some(super::multimodal_request_byte_limit())
+        );
         Ok(())
     }
 

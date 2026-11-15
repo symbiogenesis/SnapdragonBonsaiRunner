@@ -13,6 +13,8 @@ use crate::client::Message;
 pub(crate) const MAX_CONTEXT_TOKENS: usize = 262_144;
 /// Exact broker policy reserve, separate from the estimated rendered prompt.
 pub(crate) const RESERVE_TOKENS: usize = 64;
+/// Heuristic per-image vision token budget aligned with `cpu_policy::DEFAULT_IMAGE_MAX_TOKENS`.
+pub(crate) const IMAGE_TOKENS: usize = 1_024;
 
 const MESSAGE_FRAMING_TOKENS: usize = 8;
 const NEXT_TURN_FRAMING_TOKENS: usize = 16;
@@ -65,7 +67,20 @@ impl Estimate {
         extra_effort: bool,
         capacity: Option<usize>,
     ) -> Self {
+        Self::with_images(history, draft, 0, output_cap, extra_effort, capacity)
+    }
+
+    /// Combine a cached committed-history estimate with the current draft, images and options.
+    pub(crate) fn with_images(
+        history: usize,
+        draft: &str,
+        draft_images: usize,
+        output_cap: u32,
+        extra_effort: bool,
+        capacity: Option<usize>,
+    ) -> Self {
         let draft = text_tokens(draft.trim())
+            .saturating_add(draft_images.saturating_mul(IMAGE_TOKENS))
             .saturating_add(NEXT_TURN_FRAMING_TOKENS)
             .saturating_add(system_prompt_tokens());
         let workflow = if extra_effort {
@@ -148,6 +163,7 @@ pub(crate) fn history_tokens(history: &[Message]) -> usize {
         total
             .saturating_add(MESSAGE_FRAMING_TOKENS)
             .saturating_add(text_tokens(&message.content))
+            .saturating_add(message.images.len().saturating_mul(IMAGE_TOKENS))
             .saturating_add(message.reasoning_content.as_deref().map_or(0, text_tokens))
     })
 }
@@ -239,6 +255,7 @@ mod tests {
             role: "assistant",
             content: "Visible answer".into(),
             reasoning_content: None,
+            images: std::sync::Arc::default(),
         }];
         let visible = history_tokens(&messages);
         messages[0].reasoning_content = Some("Retained reasoning 雨".into());
@@ -279,5 +296,29 @@ mod tests {
         assert_eq!(estimate.pressure(), Pressure::Over);
         assert_eq!(estimate.remaining(), 0);
         assert_eq!(estimate.suggested_cap(), None);
+    }
+
+    #[test]
+    fn image_tokens_count_for_draft_and_committed_history() {
+        let text_only = Estimate::with_images(0, "Describe", 0, 512, false, Some(CONTEXT_TOKENS));
+        let two_images = Estimate::with_images(0, "Describe", 2, 512, false, Some(CONTEXT_TOKENS));
+        assert_eq!(two_images.draft - text_only.draft, 2 * IMAGE_TOKENS);
+        assert_eq!(two_images.total - text_only.total, 2 * IMAGE_TOKENS);
+
+        let messages = [Message {
+            role: "user",
+            content: "".into(),
+            reasoning_content: None,
+            images: vec![
+                std::sync::Arc::from("data:image/png;base64,AAAA"),
+                std::sync::Arc::from("data:image/png;base64,BBBB"),
+                std::sync::Arc::from("data:image/png;base64,CCCC"),
+            ]
+            .into(),
+        }];
+        assert_eq!(
+            history_tokens(&messages),
+            MESSAGE_FRAMING_TOKENS + 3 * IMAGE_TOKENS
+        );
     }
 }

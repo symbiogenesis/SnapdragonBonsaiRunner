@@ -28,6 +28,7 @@ pub(super) struct EditMessage {
     pub(super) source_conversation: u64,
     pub(super) message: u64,
     pub(super) text: String,
+    pub(super) attachments: Vec<crate::attachment_import::Attachment>,
     focus: bool,
     limit_notice: bool,
 }
@@ -53,26 +54,39 @@ impl State {
         match action {
             MessageAction::Retry(id) => self.retry_response(id),
             MessageAction::Edit(id) if self.message_options(id).edit => {
-                let text = if let Some(index) = self.transcript.committed_index(id, &self.committed)
-                {
-                    self.committed[index].content.to_string()
-                } else if let Some(message) = self
+                let Some(transcript_message) = self
                     .transcript
                     .messages
                     .iter()
                     .find(|message| message.id == id && message.role == super::Role::User)
-                    && message.retry_prefix(&self.committed).is_some()
-                {
-                    message.body.clone()
-                } else {
+                else {
                     return;
                 };
+                let (text, attachments) =
+                    if let Some(index) = self.transcript.committed_index(id, &self.committed) {
+                        if transcript_message.attachments.is_empty() {
+                            (self.committed[index].content.to_string(), Vec::new())
+                        } else {
+                            (
+                                transcript_message.body.clone(),
+                                transcript_message.attachments.clone(),
+                            )
+                        }
+                    } else if transcript_message.retry_prefix(&self.committed).is_some() {
+                        (
+                            transcript_message.body.clone(),
+                            transcript_message.attachments.clone(),
+                        )
+                    } else {
+                        return;
+                    };
                 self.stop_speech();
                 self.help = None;
                 self.edit_message = Some(EditMessage {
                     source_conversation: self.active_conversation,
                     message: id,
                     text,
+                    attachments,
                     focus: true,
                     limit_notice: false,
                 });
@@ -83,21 +97,41 @@ impl State {
                     return;
                 };
                 let prompt_index = index - 1;
-                let prompt = self.committed[prompt_index].content.to_string();
+                let (prompt, attachments) = self
+                    .transcript
+                    .messages
+                    .iter()
+                    .find(|message| message.committed_index(&self.committed) == Some(prompt_index))
+                    .filter(|message| !message.attachments.is_empty())
+                    .map_or_else(
+                        || (self.committed[prompt_index].content.to_string(), Vec::new()),
+                        |message| (message.body.clone(), message.attachments.clone()),
+                    );
                 if self.branch_history(prompt_index, "Regenerated") {
                     self.input = prompt;
+                    self.set_draft_attachments(attachments);
                     self.submit();
                 }
             }
             MessageAction::Branch(id) if self.message_options(id).branch => {
-                let (end, prompt) =
+                let (end, prompt, attachments) =
                     if let Some(index) = self.transcript.committed_index(id, &self.committed) {
                         // A committed history always contains complete user/assistant
                         // pairs. A user-message branch places that prompt in the draft.
                         if self.committed[index].role == "user" {
-                            (index, self.committed[index].content.to_string())
+                            let (body, attachments) = self
+                                .transcript
+                                .messages
+                                .iter()
+                                .find(|message| message.id == id)
+                                .filter(|message| !message.attachments.is_empty())
+                                .map_or_else(
+                                    || (self.committed[index].content.to_string(), Vec::new()),
+                                    |message| (message.body.clone(), message.attachments.clone()),
+                                );
+                            (index, body, attachments)
                         } else {
-                            (index + 1, String::new())
+                            (index + 1, String::new(), Vec::new())
                         }
                     } else if let Some(message) = self
                         .transcript
@@ -106,12 +140,13 @@ impl State {
                         .find(|message| message.id == id && message.role == super::Role::User)
                         && let Some(prefix) = message.retry_prefix(&self.committed)
                     {
-                        (prefix, message.body.clone())
+                        (prefix, message.body.clone(), message.attachments.clone())
                     } else {
                         return;
                     };
                 if self.branch_history(end, "Branch") {
                     self.input = prompt;
+                    self.set_draft_attachments(attachments);
                     self.place_composer_cursor(self.input.chars().count());
                 }
             }
@@ -119,6 +154,7 @@ impl State {
                 // Continue is an explicit ordinary followup, not an automatic
                 // replay or modification of an already committed answer.
                 let draft = std::mem::replace(&mut self.input, CONTINUE_PROMPT.to_owned());
+                let draft_attachments = self.take_draft_attachments();
                 let cursor = (
                     self.composer_cursor,
                     self.pending_cursor,
@@ -127,6 +163,7 @@ impl State {
                 self.restore_selected_history();
                 self.submit();
                 self.input = draft;
+                self.set_draft_attachments(draft_attachments);
                 (
                     self.composer_cursor,
                     self.pending_cursor,
@@ -185,6 +222,7 @@ impl State {
             .commands
             .send(Command::Send {
                 text: CONTINUE_PROMPT.to_owned(),
+                images: std::sync::Arc::default(),
                 max_completion_tokens,
                 extra_effort: self.extra_effort,
                 enable_thinking: self.enable_thinking,
@@ -250,7 +288,9 @@ impl State {
             return;
         }
         let prompt = message.body.clone();
+        let prompt_attachments = message.attachments.clone();
         let draft = std::mem::replace(&mut self.input, prompt);
+        let draft_attachments = self.replace_draft_attachments(prompt_attachments);
         let cursor = (
             self.composer_cursor,
             self.pending_cursor,
@@ -261,6 +301,7 @@ impl State {
             self.submit_turn(Some(id));
         }
         self.input = draft;
+        self.set_draft_attachments(draft_attachments);
         (
             self.composer_cursor,
             self.pending_cursor,
@@ -333,7 +374,7 @@ impl State {
     fn resend_edited_message(&mut self, edit: EditMessage) {
         if edit.source_conversation != self.active_conversation
             || !self.message_options(edit.message).edit
-            || edit.text.trim().is_empty()
+            || (edit.text.trim().is_empty() && edit.attachments.is_empty())
             || edit.text.chars().count() > INPUT_LIMIT
         {
             return;
@@ -354,8 +395,22 @@ impl State {
         } else {
             return;
         };
+        if !self.vision_available
+            && (edit
+                .attachments
+                .iter()
+                .any(crate::attachment_import::Attachment::is_media)
+                || self.history_has_media_up_to(prefix))
+        {
+            self.set_status(
+                "Images and videos require the vision projector (mmproj). Remove media attachments or relaunch without --no-mmproj.",
+                true,
+            );
+            return;
+        }
         if self.branch_history(prefix, "Edited") {
             self.input = edit.text;
+            self.set_draft_attachments(edit.attachments);
             self.submit();
         }
     }
@@ -400,6 +455,16 @@ impl State {
             if edit.limit_notice {
                 ui.label(super::draft_buffer::LIMIT_MESSAGE);
             }
+            if !edit.attachments.is_empty() {
+                ui.label(
+                    super::RichText::new(format!(
+                        "{} attached context item(s) preserved.",
+                        edit.attachments.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
             if !enabled {
                 ui.label("Return to the source conversation and wait until the model is ready to resend.");
             }
@@ -407,7 +472,7 @@ impl State {
             ui.horizontal(|ui| {
                 confirmed = ui
                     .add_enabled(
-                        enabled && !edit.text.trim().is_empty(),
+                        enabled && (!edit.text.trim().is_empty() || !edit.attachments.is_empty()),
                         egui::Button::new("Create branch and send"),
                     )
                     .clicked();
@@ -445,6 +510,7 @@ mod tests {
         .map(|(role, content)| client::Message {
             role,
             content: content.into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         })
         .collect();
@@ -763,6 +829,7 @@ mod tests {
         let entry = |role, content: &str| client::Message {
             role,
             content: content.into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         };
         let (mut state, commands) = fixture();
@@ -825,6 +892,7 @@ mod tests {
         let entry = |role, content: &str| client::Message {
             role,
             content: content.into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         };
         let (mut state, commands) = fixture();
@@ -894,6 +962,7 @@ mod tests {
         let entry = |role, content: &str| client::Message {
             role,
             content: content.into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         };
         let (mut state, commands) = fixture();
@@ -945,6 +1014,7 @@ mod tests {
         thinking_only.push(client::Message {
             role: "assistant",
             content: "".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: Some("All budget spent thinking".into()),
         });
         state.model_event(client::Event::Committed(thinking_only));
@@ -1008,11 +1078,13 @@ mod tests {
         owner_history.push(client::Message {
             role: "user",
             content: "Background walkthrough".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         owner_history.push(client::Message {
             role: "assistant",
             content: "Background part one.".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         state.model_event(client::Event::Committed(owner_history.clone()));
@@ -1034,11 +1106,13 @@ mod tests {
         owner_history.push(client::Message {
             role: "user",
             content: CONTINUE_PROMPT.into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         owner_history.push(client::Message {
             role: "assistant",
             content: "Background part two.".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         state.model_event(client::Event::Committed(owner_history));

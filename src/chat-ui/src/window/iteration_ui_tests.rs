@@ -23,11 +23,13 @@ fn harness(size: [f32; 2]) -> Harness<'static, Fixture> {
         client::Message {
             role: "user",
             content: "Original question".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
         client::Message {
             role: "assistant",
             content: "Original answer".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
     ];
@@ -293,11 +295,13 @@ fn token_limit_response_offers_continue_and_retry_buttons_at_minimum_width() {
         committed.push(client::Message {
             role: "user",
             content: "Write a long walkthrough".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         committed.push(client::Message {
             role: "assistant",
             content: "Part one stopped at the reply cap.".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         chat.state_mut()
@@ -351,11 +355,13 @@ fn token_limit_response_offers_continue_and_retry_buttons_at_minimum_width() {
         second_committed.push(client::Message {
             role: "user",
             content: continue_prompt.into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         second_committed.push(client::Message {
             role: "assistant",
             content: "Part two also hit the cap.".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         });
         chat.state_mut()
@@ -440,11 +446,13 @@ fn token_limit_automatically_continues_without_alerting_while_context_window_has
     committed.push(client::Message {
         role: "user",
         content: "Write a comprehensive guide".into(),
+        images: std::sync::Arc::default(),
         reasoning_content: None,
     });
     committed.push(client::Message {
         role: "assistant",
         content: "Section 1 hit the reply cap.".into(),
+        images: std::sync::Arc::default(),
         reasoning_content: None,
     });
     chat.state_mut()
@@ -472,11 +480,13 @@ fn token_limit_automatically_continues_without_alerting_while_context_window_has
     final_committed.push(client::Message {
         role: "user",
         content: iteration::CONTINUE_PROMPT.into(),
+        images: std::sync::Arc::default(),
         reasoning_content: None,
     });
     final_committed.push(client::Message {
         role: "assistant",
         content: "Section 2 completed the guide.".into(),
+        images: std::sync::Arc::default(),
         reasoning_content: None,
     });
     chat.state_mut()

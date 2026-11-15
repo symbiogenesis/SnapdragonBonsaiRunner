@@ -8,6 +8,7 @@ fn message(role: &'static str, content: &str) -> Message {
         role,
         content: content.into(),
         reasoning_content: None,
+        images: std::sync::Arc::default(),
     }
 }
 
@@ -18,6 +19,7 @@ fn task() -> Vec<Message> {
             role: "assistant",
             content: "Understood.".into(),
             reasoning_content: Some("Preserved prior reasoning".into()),
+            images: std::sync::Arc::default(),
         },
         message(
             "user",

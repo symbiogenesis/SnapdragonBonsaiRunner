@@ -138,8 +138,11 @@ struct State {
     updates: Option<updates::Updates>,
     update_exit: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     model: ModelLifecycle,
+    vision_available: bool,
     preview: bool,
     input: String,
+    draft_attachments: Vec<crate::attachment_import::Attachment>,
+    draft_attachments_revision: u64,
     transcript: Transcript,
     committed: Vec<client::Message>,
     context_tokens: Option<usize>,
@@ -292,8 +295,11 @@ impl State {
             updates: None,
             update_exit: None,
             model: ModelLifecycle::Unavailable,
+            vision_available: false,
             preview: true,
             input: String::new(),
+            draft_attachments: Vec::new(),
+            draft_attachments_revision: 0,
             transcript: Transcript::default(),
             committed: Vec::new(),
             context_tokens: None,
@@ -651,6 +657,41 @@ impl State {
         );
     }
 
+    pub(super) fn set_draft_attachments(
+        &mut self,
+        attachments: Vec<crate::attachment_import::Attachment>,
+    ) {
+        self.draft_attachments = attachments;
+        self.draft_attachments_revision = self.draft_attachments_revision.wrapping_add(1);
+    }
+
+    pub(super) fn take_draft_attachments(&mut self) -> Vec<crate::attachment_import::Attachment> {
+        self.draft_attachments_revision = self.draft_attachments_revision.wrapping_add(1);
+        std::mem::take(&mut self.draft_attachments)
+    }
+
+    pub(super) fn replace_draft_attachments(
+        &mut self,
+        attachments: Vec<crate::attachment_import::Attachment>,
+    ) -> Vec<crate::attachment_import::Attachment> {
+        self.draft_attachments_revision = self.draft_attachments_revision.wrapping_add(1);
+        std::mem::replace(&mut self.draft_attachments, attachments)
+    }
+
+    pub(super) fn history_has_media_up_to(&self, prefix: usize) -> bool {
+        self.committed
+            .iter()
+            .take(prefix)
+            .any(|message| !message.images.is_empty())
+    }
+
+    pub(super) fn has_unsent_or_history_media(&self) -> bool {
+        self.draft_attachments
+            .iter()
+            .any(crate::attachment_import::Attachment::is_media)
+            || self.history_has_media_up_to(self.committed.len())
+    }
+
     fn submit(&mut self) {
         self.submit_turn(None);
     }
@@ -663,7 +704,16 @@ impl State {
             );
             return;
         }
-        if self.model != ModelLifecycle::Ready || self.input.trim().is_empty() {
+        if self.model != ModelLifecycle::Ready
+            || (self.input.trim().is_empty() && self.draft_attachments.is_empty())
+        {
+            return;
+        }
+        if !self.vision_available && self.has_unsent_or_history_media() {
+            self.set_status(
+                "Images and videos require the vision projector (mmproj). Remove media attachments or relaunch without --no-mmproj.",
+                true,
+            );
             return;
         }
         let text = self.input.trim().to_owned();
@@ -681,10 +731,13 @@ impl State {
             .get(self.output_budget)
             .copied()
             .unwrap_or(4096);
+        let (wire_text, images) =
+            crate::attachment_import::format_user_turn(&text, &self.draft_attachments);
         if self
             .commands
             .send(Command::Send {
-                text: text.clone(),
+                text: wire_text,
+                images,
                 max_completion_tokens,
                 extra_effort: self.extra_effort,
                 enable_thinking: self.enable_thinking,
@@ -702,7 +755,14 @@ impl State {
             && !conversation.renamed
             && self.transcript.messages.is_empty()
         {
-            conversation.title = text
+            let title_source = if text.is_empty() {
+                self.draft_attachments
+                    .first()
+                    .map_or("Attachment", crate::attachment_import::Attachment::name)
+            } else {
+                text.as_str()
+            };
+            conversation.title = title_source
                 .split_whitespace()
                 .flat_map(|word| std::iter::once(' ').chain(word.chars()))
                 .skip(1)
@@ -712,7 +772,9 @@ impl State {
         if let Some(id) = retry {
             self.transcript.restart_turn(id, self.committed.len());
         } else {
-            self.transcript.start_turn(text, self.committed.len());
+            let attachments = self.take_draft_attachments();
+            self.transcript
+                .start_turn_with_attachments(text, attachments, self.committed.len());
         }
         self.request_conversation = Some(self.active_conversation);
         self.auto_continuing = false;
@@ -767,6 +829,7 @@ impl State {
         }
         self.stop_speech();
         self.context_tokens = None;
+        self.vision_available = false;
         self.model = ModelLifecycle::Restarting;
         self.set_status("Restarting the local model…", false);
     }
@@ -979,6 +1042,7 @@ impl State {
             self.restore_committed_last_answer();
         }
         self.context_tokens = None;
+        self.vision_available = false;
         self.model = ModelLifecycle::Unavailable;
         self.transcript.remove_empty_response();
         if !adopted && !auto_continuing && !self.transcript.latest_interrupted(&self.committed) {
@@ -1005,11 +1069,16 @@ impl State {
                     .iter_mut()
                     .find(|conversation| conversation.id == id)
                     .and_then(|conversation| conversation.saved.as_mut())
-                    && saved.input.is_empty()
-                    && draft_buffer::fits(text)
                 {
-                    text.clone_into(&mut saved.input);
-                    restored = true;
+                    let mut revision = 0_u64;
+                    restored = restore_rejected_draft_for(
+                        &mut saved.input,
+                        &mut saved.draft_attachments,
+                        &mut revision,
+                        &saved.transcript,
+                        saved.committed.len(),
+                        text,
+                    );
                 }
                 if restored {
                     self.touch_conversation(id);
@@ -1032,8 +1101,17 @@ impl State {
             if self.model.stopping() && retry_required {
                 self.model = ModelLifecycle::AwaitingTeardown;
             }
-            if !adopted && !auto_continuing && self.input.is_empty() && draft_buffer::fits(text) {
-                text.clone_into(&mut self.input);
+            if !adopted
+                && !auto_continuing
+                && restore_rejected_draft_for(
+                    &mut self.input,
+                    &mut self.draft_attachments,
+                    &mut self.draft_attachments_revision,
+                    &self.transcript,
+                    self.committed.len(),
+                    text,
+                )
+            {
                 self.place_composer_cursor(self.input.chars().count());
             }
             if !adopted && !auto_continuing {
@@ -1061,8 +1139,17 @@ impl State {
             ModelLifecycle::Ready
         };
         self.transcript.remove_empty_response();
-        if !adopted && !auto_continuing && self.input.is_empty() && draft_buffer::fits(text) {
-            text.clone_into(&mut self.input);
+        if !adopted
+            && !auto_continuing
+            && restore_rejected_draft_for(
+                &mut self.input,
+                &mut self.draft_attachments,
+                &mut self.draft_attachments_revision,
+                &self.transcript,
+                self.committed.len(),
+                text,
+            )
+        {
             self.place_composer_cursor(self.input.chars().count());
         }
         if !adopted && !auto_continuing {
@@ -1138,12 +1225,14 @@ impl State {
             Event::Starting => {
                 self.auto_continuing = false;
                 self.context_tokens = None;
+                self.vision_available = false;
                 self.model = ModelLifecycle::Preparing;
                 self.set_status("Preparing your local model…", false);
             }
             Event::Restarting => {
                 self.auto_continuing = false;
                 self.context_tokens = None;
+                self.vision_available = false;
                 self.model = ModelLifecycle::Restarting;
                 self.set_status("Restarting the local model…", false);
             }
@@ -1158,6 +1247,7 @@ impl State {
             Event::Stopped => self.stopped_response(),
             Event::ModelStopped => self.stopped_model(),
             Event::ContextCapacity(tokens) => self.context_tokens = Some(tokens),
+            Event::VisionAvailable(available) => self.vision_available = available,
             Event::Ready => {
                 self.auto_continuing = false;
                 self.model = ModelLifecycle::Ready;
@@ -1270,8 +1360,14 @@ impl State {
             if auto_continuing {
                 self.transcript.discard_turn(self.committed.len());
                 self.restore_committed_last_answer();
-            } else if self.input.is_empty() && draft_buffer::fits(text) {
-                text.clone_into(&mut self.input);
+            } else if restore_rejected_draft_for(
+                &mut self.input,
+                &mut self.draft_attachments,
+                &mut self.draft_attachments_revision,
+                &self.transcript,
+                self.committed.len(),
+                text,
+            ) {
                 self.place_composer_cursor(self.input.chars().count());
             }
         }
@@ -1299,6 +1395,7 @@ impl State {
     fn stopped_model(&mut self) {
         self.auto_continuing = false;
         self.context_tokens = None;
+        self.vision_available = false;
         self.model = ModelLifecycle::Stopped;
         self.set_status("Local model stopped.", false);
         self.focus_composer = true;
@@ -1907,6 +2004,40 @@ impl Drop for State {
         if let Some(worker) = self.worker.take() {
             let _joined = worker.join();
         }
+    }
+}
+
+fn restore_rejected_draft_for(
+    input: &mut String,
+    draft_attachments: &mut Vec<crate::attachment_import::Attachment>,
+    draft_attachments_revision: &mut u64,
+    transcript: &Transcript,
+    prefix: usize,
+    wire_text: &str,
+) -> bool {
+    if let Some(turn_user) = transcript
+        .messages
+        .iter()
+        .rfind(|message| message.role == Role::User && message.matches_turn_prefix(prefix))
+        && !turn_user.attachments.is_empty()
+    {
+        let mut restored = false;
+        if input.is_empty() && !turn_user.body.is_empty() && draft_buffer::fits(&turn_user.body) {
+            turn_user.body.clone_into(input);
+            restored = true;
+        }
+        if draft_attachments.is_empty() {
+            draft_attachments.clone_from(&turn_user.attachments);
+            *draft_attachments_revision = draft_attachments_revision.wrapping_add(1);
+            restored = true;
+        }
+        return restored;
+    }
+    if input.is_empty() && draft_buffer::fits(wire_text) {
+        wire_text.clone_into(input);
+        true
+    } else {
+        false
     }
 }
 

@@ -100,6 +100,10 @@ struct WorkspaceView<'a> {
     voice_profile: &'a str,
 }
 
+fn attachments_empty(attachments: &[crate::attachment_import::Attachment]) -> bool {
+    attachments.is_empty()
+}
+
 #[derive(serde::Serialize)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -109,6 +113,8 @@ struct ActiveView<'a> {
     transcript: &'a Transcript,
     committed: &'a [client::Message],
     input: &'a str,
+    #[serde(skip_serializing_if = "attachments_empty")]
+    draft_attachments: &'a [crate::attachment_import::Attachment],
     last_answer: &'a str,
     retained_draft: &'a str,
     answer_complete: bool,
@@ -158,6 +164,7 @@ impl State {
             || !valid_parts(
                 &self.transcript,
                 &self.input,
+                &self.draft_attachments,
                 self.output_budget,
                 &self.status,
                 &self.last_answer,
@@ -183,6 +190,7 @@ impl State {
                 transcript: &self.transcript,
                 committed: &self.committed,
                 input: &self.input,
+                draft_attachments: &self.draft_attachments,
                 last_answer: &self.last_answer,
                 retained_draft: &self.retained_draft,
                 answer_complete: self.answer_complete,
@@ -353,6 +361,7 @@ fn valid_snapshot(saved: &ConversationSnapshot) -> bool {
         && valid_parts(
             &saved.transcript,
             &saved.input,
+            &saved.draft_attachments,
             saved.output_budget,
             &saved.status,
             &saved.last_answer,
@@ -361,9 +370,14 @@ fn valid_snapshot(saved: &ConversationSnapshot) -> bool {
         )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Validation checks every active/saved conversation field uniformly."
+)]
 fn valid_parts(
     transcript: &Transcript,
     input: &str,
+    draft_attachments: &[crate::attachment_import::Attachment],
     output_budget: usize,
     status: &str,
     last_answer: &str,
@@ -371,6 +385,7 @@ fn valid_parts(
     committed: &[client::Message],
 ) -> bool {
     transcript.valid_saved()
+        && super::transcript::valid_attachments(draft_attachments)
         && super::draft_buffer::fits(input)
         && output_budget < OUTPUT_TOKENS.len()
         && status.len() <= MAX_DIAGNOSTIC_CHARS * 4
@@ -378,13 +393,19 @@ fn valid_parts(
         && retained_draft.len() <= 4 * 1024 * 1024
         && committed.len() <= 128
         && committed.len().is_multiple_of(2)
+        && committed
+            .iter()
+            .map(|message| message.images.len())
+            .fold(0_usize, usize::saturating_add)
+            <= client::MAX_REQUEST_IMAGES
         && committed.iter().enumerate().all(|(index, message)| {
-            message.role
-                == if index.is_multiple_of(2) {
-                    "user"
-                } else {
-                    "assistant"
-                }
+            let expected_role = if index.is_multiple_of(2) {
+                "user"
+            } else {
+                "assistant"
+            };
+            message.role == expected_role
+                && (message.role == "user" || message.images.is_empty())
                 && message.content.len() <= 1024 * 1024
                 && message
                     .reasoning_content
@@ -515,11 +536,13 @@ mod tests {
                 role: "user",
                 content: "Long prompt".into(),
                 reasoning_content: None,
+                images: std::sync::Arc::default(),
             },
             client::Message {
                 role: "assistant",
                 content: "Capped response".into(),
                 reasoning_content: None,
+                images: std::sync::Arc::default(),
             },
         ];
         original.model_event(client::Event::Committed(history));
@@ -1224,6 +1247,103 @@ mod tests {
         std::fs::remove_file(path)?;
         std::fs::remove_file(directory.join("chat-recovery.lock"))?;
         std::fs::remove_dir(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn multimodal_attachments_and_legacy_v1_workspaces_roundtrip_cleanly() -> io::Result<()> {
+        use crate::attachment_import::{Attachment, VideoFrame, format_user_turn};
+        use std::sync::Arc;
+
+        let mut original = state();
+        let draft_text = Attachment::Text {
+            name: "notes.txt".to_owned(),
+            text: "draft notes".to_owned(),
+        };
+        let committed_image = Attachment::Image {
+            name: "diagram.png".to_owned(),
+            width: 64,
+            height: 64,
+            data_url: Arc::from("data:image/png;base64,AAAA"),
+            thumbnail_png: Arc::from([1_u8, 2, 3]),
+        };
+        let committed_video = Attachment::Video {
+            name: "clip.mp4".to_owned(),
+            width: 32,
+            height: 24,
+            duration_ms: 1_500,
+            frames: Arc::from([VideoFrame {
+                timestamp_ms: 500,
+                data_url: Arc::from("data:image/png;base64,BBBB"),
+            }]),
+            thumbnail_png: Arc::from([4_u8, 5]),
+        };
+        let attachments = vec![committed_image.clone(), committed_video.clone()];
+        let (wire_text, wire_images) = format_user_turn("Analyze these", &attachments);
+        original.transcript.start_turn_with_attachments(
+            "Analyze these".to_owned(),
+            attachments.clone(),
+            0,
+        );
+        original.transcript.append("Both look clear.", false);
+        let history = vec![
+            client::Message {
+                role: "user",
+                content: wire_text.into(),
+                reasoning_content: None,
+                images: wire_images.clone(),
+            },
+            client::Message {
+                role: "assistant",
+                content: "Both look clear.".into(),
+                reasoning_content: None,
+                images: Arc::default(),
+            },
+        ];
+        original.model_event(client::Event::Committed(history));
+        original.model_event(client::Event::Complete(client::Completion::Finished));
+        original.input = "Follow up".to_owned();
+        original.set_draft_attachments(vec![draft_text.clone()]);
+
+        let bytes = original.workspace_bytes()?;
+        let mut restored = state();
+        restored.restore_workspace(&bytes)?;
+        assert_eq!(restored.draft_attachments, vec![draft_text]);
+        assert_eq!(restored.committed.len(), 2);
+        assert_eq!(restored.committed[0].images.as_ref(), wire_images.as_ref());
+        assert_eq!(restored.transcript.messages[0].body, "Analyze these");
+        assert_eq!(restored.transcript.messages[0].attachments, attachments);
+        assert_eq!(
+            restored.transcript.messages[0].committed_index(&restored.committed),
+            Some(0)
+        );
+
+        // Legacy v1 JSON without `draft_attachments`, `attachments`, or `images` must load cleanly.
+        let mut legacy_json: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if let Some(active) = legacy_json["active"].as_object_mut() {
+            active.remove("draft_attachments");
+            active["committed"] = serde_json::json!([
+                {"role": "user", "content": "Legacy prompt"},
+                {"role": "assistant", "content": "Legacy answer", "reasoning_content": null}
+            ]);
+            active["transcript"] = serde_json::json!({
+                "messages": [
+                    {"role": "User", "body": "Legacy prompt", "reasoning": "", "history_index": 0},
+                    {"role": "Assistant", "body": "Legacy answer", "reasoning": "", "history_index": 1}
+                ]
+            });
+        }
+        let legacy_bytes = serde_json::to_vec(&legacy_json).map_err(io::Error::other)?;
+        let mut legacy_restored = state();
+        legacy_restored.restore_workspace(&legacy_bytes)?;
+        assert!(legacy_restored.draft_attachments.is_empty());
+        assert!(legacy_restored.committed[0].images.is_empty());
+        assert!(
+            legacy_restored.transcript.messages[0]
+                .attachments
+                .is_empty()
+        );
         Ok(())
     }
 }

@@ -151,10 +151,6 @@ pub(crate) enum Attachment {
     },
 }
 
-#[allow(
-    dead_code,
-    reason = "Temporary until Step B4/B5 wires attachment inspection."
-)]
 impl Attachment {
     pub(crate) fn name(&self) -> &str {
         match self {
@@ -162,6 +158,22 @@ impl Attachment {
         }
     }
 
+    pub(crate) const fn is_media(&self) -> bool {
+        matches!(self, Self::Image { .. } | Self::Video { .. })
+    }
+
+    pub(crate) fn image_count(&self) -> usize {
+        match self {
+            Self::Text { .. } => 0,
+            Self::Image { .. } => 1,
+            Self::Video { frames, .. } => frames.len(),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Temporary until Step B5 wires thumbnail previews."
+    )]
     pub(crate) fn thumbnail_png(&self) -> Option<&[u8]> {
         match self {
             Self::Text { .. } => None,
@@ -171,6 +183,10 @@ impl Attachment {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Temporary until Step B5 wires media lightbox inspection."
+    )]
     pub(crate) fn image_data_urls(&self) -> Vec<Arc<str>> {
         match self {
             Self::Text { .. } => Vec::new(),
@@ -182,12 +198,12 @@ impl Attachment {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Temporary until Step B5 wires video badge counts."
+    )]
     pub(crate) fn frame_count(&self) -> usize {
-        match self {
-            Self::Text { .. } => 0,
-            Self::Image { .. } => 1,
-            Self::Video { frames, .. } => frames.len(),
-        }
+        self.image_count()
     }
 
     pub(crate) fn text_bytes(&self) -> usize {
@@ -196,6 +212,69 @@ impl Attachment {
             Self::Image { .. } | Self::Video { .. } => 0,
         }
     }
+}
+
+fn longest_backtick_run(text: &str) -> usize {
+    let mut best = 0_usize;
+    let mut current = 0_usize;
+    for ch in text.chars() {
+        if ch == '`' {
+            current += 1;
+            best = best.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    best
+}
+
+/// Formats one user turn's caption and attachments into broker prompt text and ordered image URLs.
+pub(crate) fn format_user_turn(
+    caption: &str,
+    attachments: &[Attachment],
+) -> (String, Arc<[Arc<str>]>) {
+    if attachments.is_empty() {
+        return (caption.to_owned(), Arc::default());
+    }
+    let mut sections = Vec::new();
+    let mut images = Vec::new();
+    for attachment in attachments {
+        match attachment {
+            Attachment::Text { name, text } => {
+                let fence = "`".repeat(longest_backtick_run(text).max(2) + 1);
+                if text.ends_with('\n') {
+                    sections.push(format!("File: {name}\n{fence}\n{text}{fence}"));
+                } else {
+                    sections.push(format!("File: {name}\n{fence}\n{text}\n{fence}"));
+                }
+            }
+            Attachment::Image { data_url, .. } => {
+                images.push(Arc::clone(data_url));
+            }
+            Attachment::Video { name, frames, .. } => {
+                let mut timestamps = Vec::with_capacity(frames.len());
+                for frame in frames.iter() {
+                    images.push(Arc::clone(&frame.data_url));
+                    timestamps.push(format!(
+                        "{}.{}s",
+                        frame.timestamp_ms / 1000,
+                        (frame.timestamp_ms % 1000) / 100
+                    ));
+                }
+                if !frames.is_empty() {
+                    sections.push(format!(
+                        "Video: {name} ({} keyframes: {})",
+                        frames.len(),
+                        timestamps.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    if !caption.is_empty() {
+        sections.push(caption.to_owned());
+    }
+    (sections.join("\n\n"), images.into())
 }
 
 /// Result delivered once the native picker and bounded file import finish.
@@ -535,7 +614,7 @@ mod base64_bytes {
 mod tests {
     use super::{
         Attachment, FileCategory, MAX_TOTAL_TEXT_ATTACHMENT_BYTES, MediaKind, Outcome, PickerKind,
-        Shared, VideoFrame, classify_path, import_selected_paths,
+        Shared, VideoFrame, classify_path, format_user_turn, import_selected_paths,
     };
     use std::{fs, io, path::Path, sync::Arc};
 
@@ -640,5 +719,59 @@ mod tests {
         assert!(notice.is_some());
         fs::remove_dir_all(directory)?;
         Ok(())
+    }
+
+    #[test]
+    fn format_user_turn_builds_dynamic_text_fences_video_metadata_and_ordered_images() {
+        assert_eq!(
+            format_user_turn("Plain prompt", &[]),
+            ("Plain prompt".to_owned(), Arc::default())
+        );
+
+        let image_only = Attachment::Image {
+            name: "photo.png".to_owned(),
+            width: 32,
+            height: 32,
+            data_url: Arc::from("data:image/png;base64,AAAA"),
+            thumbnail_png: Arc::from([1_u8, 2]),
+        };
+        let (text, images) = format_user_turn("", std::slice::from_ref(&image_only));
+        assert_eq!(text, "");
+        assert_eq!(images.as_ref(), &[Arc::from("data:image/png;base64,AAAA")]);
+
+        let fenced_text = Attachment::Text {
+            name: "snippet.md".to_owned(),
+            text: "before\n```rust\nlet x = 1;\n```\nafter".to_owned(),
+        };
+        let video = Attachment::Video {
+            name: "demo.mp4".to_owned(),
+            width: 64,
+            height: 48,
+            duration_ms: 2_500,
+            frames: Arc::from([
+                VideoFrame {
+                    timestamp_ms: 0,
+                    data_url: Arc::from("data:image/png;base64,BBBB"),
+                },
+                VideoFrame {
+                    timestamp_ms: 1_540,
+                    data_url: Arc::from("data:image/png;base64,CCCC"),
+                },
+            ]),
+            thumbnail_png: Arc::from([3_u8]),
+        };
+        let (text, images) = format_user_turn("Inspect these", &[fenced_text, image_only, video]);
+        assert_eq!(
+            text,
+            "File: snippet.md\n````\nbefore\n```rust\nlet x = 1;\n```\nafter\n````\n\nVideo: demo.mp4 (2 keyframes: 0.0s, 1.5s)\n\nInspect these"
+        );
+        assert_eq!(
+            images.as_ref(),
+            &[
+                Arc::from("data:image/png;base64,AAAA"),
+                Arc::from("data:image/png;base64,BBBB"),
+                Arc::from("data:image/png;base64,CCCC"),
+            ]
+        );
     }
 }

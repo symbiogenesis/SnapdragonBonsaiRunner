@@ -5,6 +5,7 @@ use crate::context::{self, Estimate, Pressure};
 #[derive(Default)]
 pub(super) struct DraftCache {
     text: String,
+    attachments_revision: u64,
     estimate: Option<Estimate>,
     extra_effort: bool,
 }
@@ -20,18 +21,33 @@ impl State {
             && estimate.output == usize::try_from(output).unwrap_or(usize::MAX)
             && self.context_draft.extra_effort == self.extra_effort
             && estimate.capacity == self.context_tokens
+            && self.context_draft.attachments_revision == self.draft_attachments_revision
             && self.context_draft.text == self.input
         {
             return estimate;
         }
-        let estimate = Estimate::new(
-            history,
-            &self.input,
-            output,
-            self.extra_effort,
-            self.context_tokens,
-        );
+        let estimate = if self.draft_attachments.is_empty() {
+            Estimate::new(
+                history,
+                &self.input,
+                output,
+                self.extra_effort,
+                self.context_tokens,
+            )
+        } else {
+            let (formatted_text, images) =
+                crate::attachment_import::format_user_turn(&self.input, &self.draft_attachments);
+            Estimate::with_images(
+                history,
+                &formatted_text,
+                images.len(),
+                output,
+                self.extra_effort,
+                self.context_tokens,
+            )
+        };
         self.input.clone_into(&mut self.context_draft.text);
+        self.context_draft.attachments_revision = self.draft_attachments_revision;
         self.context_draft.extra_effort = self.extra_effort;
         self.context_draft.estimate = Some(estimate);
         estimate

@@ -57,11 +57,13 @@ fn history(text: &str) -> Vec<client::Message> {
         client::Message {
             role: "user",
             content: text.into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
         client::Message {
             role: "assistant",
             content: "Answer".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: Some("Retained reasoning".into()),
         },
     ]

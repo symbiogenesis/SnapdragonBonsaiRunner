@@ -58,6 +58,7 @@ fn stop_wins_over_buffered_completion_and_connection_failure() {
             role: "assistant",
             content: "Completed in a buffer".into(),
             reasoning_content: None,
+            images: Arc::default(),
         };
         for outcome in [
             Ok((answer, Completion::Finished)),

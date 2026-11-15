@@ -18,6 +18,8 @@ pub(super) struct ConversationSnapshot {
     #[serde(skip)]
     pub(super) context_history: Option<usize>,
     pub(super) input: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) draft_attachments: Vec<crate::attachment_import::Attachment>,
     pub(super) last_answer: String,
     pub(super) retained_draft: String,
     pub(super) answer_complete: bool,
@@ -94,11 +96,13 @@ impl State {
     }
 
     pub(super) fn take_conversation(&mut self) -> ConversationSnapshot {
+        self.draft_attachments_revision = self.draft_attachments_revision.wrapping_add(1);
         ConversationSnapshot {
             transcript: std::mem::take(&mut self.transcript),
             committed: std::mem::take(&mut self.committed),
             context_history: self.context_history.take(),
             input: std::mem::take(&mut self.input),
+            draft_attachments: std::mem::take(&mut self.draft_attachments),
             last_answer: std::mem::take(&mut self.last_answer),
             retained_draft: std::mem::take(&mut self.retained_draft),
             answer_complete: self.answer_complete,
@@ -138,6 +142,7 @@ impl State {
         self.committed.clear();
         self.context_history = None;
         self.input.clear();
+        self.set_draft_attachments(Vec::new());
         self.last_answer.clear();
         self.retained_draft.clear();
         self.stage = None;
@@ -158,6 +163,7 @@ impl State {
         self.committed = snapshot.committed;
         self.context_history = snapshot.context_history;
         self.input = snapshot.input;
+        self.set_draft_attachments(snapshot.draft_attachments);
         self.last_answer = snapshot.last_answer;
         self.retained_draft = snapshot.retained_draft;
         self.answer_complete = snapshot.answer_complete;
@@ -283,6 +289,8 @@ impl State {
         std::mem::swap(&mut self.committed, &mut saved.committed);
         std::mem::swap(&mut self.context_history, &mut saved.context_history);
         std::mem::swap(&mut self.input, &mut saved.input);
+        std::mem::swap(&mut self.draft_attachments, &mut saved.draft_attachments);
+        self.draft_attachments_revision = self.draft_attachments_revision.wrapping_add(1);
         std::mem::swap(&mut self.last_answer, &mut saved.last_answer);
         std::mem::swap(&mut self.retained_draft, &mut saved.retained_draft);
         std::mem::swap(&mut self.answer_complete, &mut saved.answer_complete);

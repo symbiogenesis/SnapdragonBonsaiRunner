@@ -347,11 +347,13 @@ fn completed_turn_winning_stop_race_keeps_visible_and_committed_answers_consiste
         client::Message {
             role: "user",
             content: "A question".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
         client::Message {
             role: "assistant",
             content: "Complete answer".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: Some("Complete reasoning".into()),
         },
     ]));
@@ -807,11 +809,13 @@ fn conversation_workspace_loading_restores_only_the_selected_history_at_readines
         client::Message {
             role: "user",
             content: "Completed question".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
         client::Message {
             role: "assistant",
             content: "Completed answer".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: Some("Retained reasoning".into()),
         },
     ];
@@ -860,6 +864,7 @@ fn conversation_workspace_loading_deletion_clears_recovered_history_before_ready
     state.committed.push(client::Message {
         role: "user",
         content: "Deleted history".into(),
+        images: std::sync::Arc::default(),
         reasoning_content: None,
     });
     state.input = "Deleted draft".into();
@@ -945,11 +950,13 @@ fn conversation_workspace_preserves_drafts_settings_and_exact_committed_turns() 
         client::Message {
             role: "user",
             content: "A garden story".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
         client::Message {
             role: "assistant",
             content: "Complete story".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: Some("Private reasoning".into()),
         },
     ]));
@@ -1684,11 +1691,13 @@ fn conversation_history_orders_by_most_recent_update_and_ignores_viewing() -> io
         client::Message {
             role: "user",
             content: "First prompt".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
         client::Message {
             role: "assistant",
             content: "Background token".into(),
+            images: std::sync::Arc::default(),
             reasoning_content: None,
         },
     ]));
