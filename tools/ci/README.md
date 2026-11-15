@@ -780,6 +780,9 @@ dependencies already cached:
 pwsh -NoLogo -NoProfile -File tools/ci/check_push_sanity.ps1 -Prepare
 ```
 
+Explicit preparation ignores standard input, so an open redirected input stream
+cannot block it before the build starts.
+
 Preparation selects the explicit Windows ARM64 target and matching output paths,
 so inherited Cargo target settings cannot cause old host binaries to be receipted.
 Each receipt records committed Git input identities and the executable digest;

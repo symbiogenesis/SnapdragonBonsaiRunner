@@ -66,8 +66,9 @@ adoption decisions without displacing native daily-use acceptance.
   Qualify the final snapshot-config regression and complete push adapter, preparation
   receipt/invalidation, packaged-shell and historical-tip/output-bound controls
   in owning CI; local focused controls do not establish complete acceptance. Keep
-  initial helper preparation explicit and externally supervised in Rust within
-  its declared allowance. Qualify one-attempt automatic checker recovery through
+  initial helper preparation explicit, independent of redirected standard input
+  and externally supervised in Rust within its declared allowance. Qualify
+  one-attempt automatic checker recovery through
   the independently source/digest-bound native supervisor: missing/stale/corrupt
   checker receipts, array-valued receipt-field rejection, unchanged fast path,
   recovery-helper rejection, nonce-driven corrupted linked-output regeneration,

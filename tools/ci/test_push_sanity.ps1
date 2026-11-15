@@ -168,7 +168,24 @@ catch { if ($_.Exception.Message -cne 'Expected committed policy archive verifie
         & git -C $repository -c user.name=Fixture -c user.email=fixture@example.invalid -c core.hooksPath= -c commit.gpgsign=false commit --quiet -m fixture
         if ($LASTEXITCODE) { throw 'Cannot commit fresh preparation fixture.' }
         Assert-Ci (-not (Test-Path -LiteralPath $target)) 'Fresh preparation target already exists.'
-        Assert-CiReject { & $adapter -Root $repository -TargetDirectory $target -Prepare } 'Cold-start reached committed bootstrap; Cargo must not run.'
+        $driver=Join-Path $scratch 'prepare-driver.ps1'
+        @'
+#Requires -Version 7.6
+param([string]$Adapter,[string]$Repository,[string]$Target,[string]$Support)
+. $Support
+Assert-Ci ([Console]::IsInputRedirected) 'Preparation fixture requires redirected stdin.'
+$originalInput=[Console]::In
+$unreadableInput=[IO.StringReader]::new('Preparation must ignore this stream.')
+$unreadableInput.Dispose()
+try {
+    # Any read fails immediately, exposing open-pipe hangs without hanging CI.
+    [Console]::SetIn($unreadableInput)
+    Assert-CiReject { & $Adapter -Root $Repository -TargetDirectory $Target -Prepare } 'Cold-start reached committed bootstrap; Cargo must not run.'
+} finally { [Console]::SetIn($originalInput) }
+'Preparation ignored redirected stdin and reached committed bootstrap.'
+'@ | Set-Content -LiteralPath $driver -Encoding utf8NoBOM
+        'Unused redirected input.' | & ([Environment]::ProcessPath) -NoLogo -NoProfile -NonInteractive -File $driver -Adapter $adapter -Repository $repository -Target $target -Support (Join-Path $PSScriptRoot 'test_support.ps1')
+        if ($LASTEXITCODE) { throw 'Redirected-input preparation fixture failed.' }
         Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $target 'push-checker.json'))) 'Failed fresh preparation published a receipt.'
     } finally { Remove-CiScratch $scratch }
  }

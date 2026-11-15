@@ -21,7 +21,7 @@ function Test-PushHelperReceipt([string]$ReceiptPath, [string]$Image, [string]$S
             $receipt.Sha256 -ceq (Get-FileHash -LiteralPath $Image -Algorithm SHA256).Hash.ToLowerInvariant()
     } catch { return $false }
 }
-$updates = if ([Console]::IsInputRedirected) { [Console]::In.ReadToEnd() } else { '' }
+$updates = if (-not $Prepare -and [Console]::IsInputRedirected) { [Console]::In.ReadToEnd() } else { '' }
 if (-not $updates.Trim() -and -not $Prepare) { return }
 $started = [Diagnostics.Stopwatch]::StartNew()
 $originalPwsh = $env:BONSAI_PUSH_PWSH_PATH
