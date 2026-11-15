@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "prism",
-  "sourceRevision": "4f8ec12f09875c258681dde90fc20f869f492807",
+  "sourceRevision": "f2a8f2ac72cdcff5bbd6c3a48b72579d32ea1dcf",
   "exclusions": [
     {
       "path": ".git",
@@ -133,7 +133,7 @@
     {
       "id": "common-concurrency",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/concurrency.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve test-log.cpp's eight original concurrent workers, 8,000 records, per-thread Windows random schedules, timestamp/prefix toggles and join/flush/free smoke contract through independent bounded-channel Rust observations and the separate production Rust logger. Preserve the required reference green ID and reject writer/teardown failures. The C++ header/include/dispatch/CMake edge is retired; output-content/native replay and whole-repository retirement are not claimed. Owning hosted acceptance remains separate."
       ],
       "retirementQualified": false
     },
@@ -379,8 +379,8 @@
     },
     {
       "path": "tools/prism/upstream/common/bridge.cpp",
-      "bytes": 15323,
-      "sha256": "c3b7268a71598461b32fdd9ff2a6da7e64c68ceaa602fa3a7bf5a287a46e4b0a",
+      "bytes": 14897,
+      "sha256": "e88513fcbc7dc0c928cac840b8fff7cfa8e16047a420a6f43e72aeab952d8e7b",
       "family": "common-bridge"
     },
     {
@@ -424,12 +424,6 @@
       "bytes": 12780,
       "sha256": "ef02c447f88e4c49c4efee53824086343ec1ea8dbb52837faec5541aeb216619",
       "family": "common-codec-buffers"
-    },
-    {
-      "path": "tools/prism/upstream/common/concurrency.hpp",
-      "bytes": 5060,
-      "sha256": "d3e59da30f741f10a16d18b04463288c44e952c19a6e967a31b1ad8bbc19d74a",
-      "family": "common-concurrency"
     },
     {
       "path": "tools/prism/upstream/common/context_graph.hpp",
@@ -579,14 +573,14 @@
   "edges": [
     {
       "path": "Cargo.lock",
-      "bytes": 54992,
-      "sha256": "d7ef72d1bad3d3b5f5afebc00d4417fe5ee5eeb8f461b98730fb9791fd2df85b",
+      "bytes": 53680,
+      "sha256": "5202940ba95bcd217193a2abb68a49bb505587e573d28fed83da3230b2561fd4",
       "family": "external-native"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 5730,
-      "sha256": "8d8009b88dc135dc4b632ddf2b6808446e075784cd312800beac7806879379e0",
+      "bytes": 5753,
+      "sha256": "a9a7dffd5c05bf6c4076f0af6fd96441d7838bc3b7b08b2ab3539b73d9228dce",
       "family": "external-native"
     },
     {
@@ -639,9 +633,15 @@
     },
     {
       "path": "tests/upstream_prism/harness.rs",
-      "bytes": 30755,
-      "sha256": "c55273bf9f61a2eaba16c41584818bb101773397d9476e953206884905a2a0ed",
+      "bytes": 30779,
+      "sha256": "7799a988e12805044b4a2d5f213a9f0910d3652b016bd802f8c3e172236ac7ad",
       "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/logging.rs",
+      "bytes": 2989,
+      "sha256": "7f158151896f92460a9d3c2c1612daa042f582f85b7eb64a8f25c85737e979e8",
+      "family": "common-concurrency"
     },
     {
       "path": "tests/upstream_prism/reasoning-budget-cases.json",
@@ -656,9 +656,15 @@
       "family": "upstream-contracts"
     },
     {
+      "path": "tests/upstream_prism/reference_logging.rs",
+      "bytes": 12379,
+      "sha256": "1d7bb6a71f3882034aba49634b8b3acfea3eafb4e8199ecda397fb9d5287d372",
+      "family": "common-concurrency"
+    },
+    {
       "path": "tests/upstream_prism/reference_provider.rs",
-      "bytes": 7871,
-      "sha256": "21074aa88b6e05ee06171f7415c14d5b6bbca90f1cb70879fda3c7f93b321d70",
+      "bytes": 8143,
+      "sha256": "d099d0c1a807982f852fd4d1fc8eb6df3ba1aabb2ba21743128cb191d18acf30",
       "family": "upstream-contracts"
     },
     {
@@ -747,8 +753,8 @@
     },
     {
       "path": "tools/prism/upstream/common/CMakeLists.txt",
-      "bytes": 5177,
-      "sha256": "4660d1ff53fd04d3d8d90b8492046829fc300c1dcbb64efdcd14e19e03bc843e",
+      "bytes": 5161,
+      "sha256": "5b0baecd3225cfa16e372a8828407f1a74388275705effc2c1c813313f5985b1",
       "family": "native-build"
     },
     {
@@ -759,8 +765,8 @@
     },
     {
       "path": "tools/prism/upstream/migration.json",
-      "bytes": 43498,
-      "sha256": "98a4396b6c537ad0edca656224312590b9d030c2e48d192ebc375aa16570734f",
+      "bytes": 43549,
+      "sha256": "caaf90bd5b900a2e6c9ab854722c3e418e91a52bf29cbfb23f6658f7cfe29196",
       "family": "upstream-contracts"
     },
     {

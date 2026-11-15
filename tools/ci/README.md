@@ -381,7 +381,7 @@ provenance. Inventory
 acceptance supplies no native-model or hosted compiler verdict.
 
 The manifests enumerate Runner's remaining Windows queue ABI C control and
-Prism's 39 C++ files plus its coupled C ABI source/header. Each file belongs to an
+Prism's 38 C++ files plus its coupled C ABI source/header. Each file belongs to an
 explicit replacement family.
 Additional identities bind operative compiler/provisioning/dispatcher/cache/
 packaging paths and immutable catalog, migration, required-green-ID and complete
