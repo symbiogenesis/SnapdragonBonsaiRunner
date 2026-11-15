@@ -663,7 +663,8 @@ fn inference_request(request: &Request, working: &Path) -> Value {
         provision["lockPath"] = json!(
             request
                 .repository_root
-                .join("config/prism-inference.lock.json")
+                .join("config")
+                .join("prism-inference.lock.json")
         );
     }
     provision

@@ -315,7 +315,9 @@ fn structured_fit_input_hash_and_receipt_omit_output_path_and_report_metrics() -
         &baseline["diagnostics"]["development"],
         &baseline["sourceOrderF32Diagnostics"]["development"],
     ] {
-        assert!(number(&section["worstRowRelativeL2Error"])? < 1e-10);
+        // With `ridge = 1e-6`, squared error is O(ridge^2) (~1.5e-13) while
+        // unsquared relative L2 error is O(ridge) (~3.9e-7).
+        assert!(number(&section["worstRowRelativeL2Error"])? < 1e-5);
         assert!(number(&section["meanCosineSimilarity"])? > 0.999_999);
         assert!(number(&section["minCosineSimilarity"])? > 0.999_999);
         assert!((0.0..=1.0).contains(&number(&section["meanCandidateEnergyEntropy"])?));

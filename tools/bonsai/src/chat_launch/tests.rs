@@ -708,7 +708,9 @@ fn native_window_handoff_prepares_images_before_model_downloads_and_keys() -> cr
             (!prebuilt_broker)
                 .then(|| fixture
                     .root
-                    .join("repository/config/prism-inference.lock.json"))
+                    .join("repository")
+                    .join("config")
+                    .join("prism-inference.lock.json"))
                 .map(|path| json!(path))
                 .as_ref()
         );

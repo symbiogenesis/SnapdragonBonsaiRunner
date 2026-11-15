@@ -2,7 +2,8 @@
 
 use std::cell::Cell;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -11,6 +12,16 @@ use super::super::tests::condition_boundaries;
 use super::{Request, capture_with};
 use crate::Result;
 use crate::qualification::{capture::save, digest, read_json};
+
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+struct TempFixture(PathBuf);
+
+impl Drop for TempFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 fn admission(plan: &Value) -> Value {
     let fixed = &plan["Policy"];
@@ -21,15 +32,17 @@ fn admission(plan: &Value) -> Value {
         "AvailableMemoryFloorBytes": fixed["AvailableMemoryFloorBytes"], "AvailablePhysicalBytesAtAdmission": 20_u64 * 1024 * 1024 * 1024})
 }
 
-fn fixture() -> Result<(Request, Value)> {
+fn fixture() -> Result<(Request, Value, TempFixture)> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
+    let seq = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
-        "Bonsai-ScreenFixture-{}-{stamp}",
+        "Bonsai-ScreenFixture-{}-{stamp}-{seq}",
         std::process::id()
     ));
+    let guard = TempFixture(root.clone());
     let data = root.join("data");
     let evidence = root.join("evidence");
     fs::create_dir_all(&data).map_err(|error| error.to_string())?;
@@ -69,6 +82,7 @@ fn fixture() -> Result<(Request, Value)> {
         request,
         json!({"githubActions": true, "runUrl": "https://github.com/symbiogenesis/SwiftBonsai2Runner/actions/runs/123",
         "runnerArchitecture": "Arm64", "deviceModel": "Snapdragon X Elite", "runnerName": "synthetic-runner", "sourceRevision": "a".repeat(40)}),
+        guard,
     ))
 }
 
@@ -139,7 +153,7 @@ fn completed(native: &Value, count: usize) -> Result<Value> {
 
 #[test]
 fn screen_capture_uses_fourteen_bounded_processes_without_promoting() -> Result<()> {
-    let (request, context) = fixture()?;
+    let (request, context, _fixture) = fixture()?;
     let receipt = capture_with(&request, &context, |native| completed(&native, 14))?;
     assert_eq!(receipt["Status"], "capture-completed");
     assert_eq!(receipt["ScreenStatus"], "continue");
@@ -160,7 +174,7 @@ fn screen_capture_uses_fourteen_bounded_processes_without_promoting() -> Result<
 
 #[test]
 fn x2_screen_capture_rejects_x1_context_before_native_execution() -> Result<()> {
-    let (mut request, mut context) = fixture()?;
+    let (mut request, mut context, _fixture) = fixture()?;
     request.processor_name = "Snapdragon(R) X2 Elite Extreme - X2E-96-100".into();
     assert!(
         capture_with(&request, &context, |_| Err(
@@ -187,7 +201,7 @@ fn x2_screen_capture_rejects_x1_context_before_native_execution() -> Result<()> 
 
 #[test]
 fn screen_capture_retains_completed_prefix_on_native_failure() -> Result<()> {
-    let (request, context) = fixture()?;
+    let (request, context, _fixture) = fixture()?;
     assert!(
         capture_with(&request, &context, |native| {
             completed(&native, 1)?;
@@ -211,7 +225,7 @@ fn screen_capture_retains_completed_prefix_on_native_failure() -> Result<()> {
 
 #[test]
 fn screen_capture_preflight_and_setup_fail_without_starting_models() -> Result<()> {
-    let (mut request, context) = fixture()?;
+    let (mut request, context, _fixture) = fixture()?;
     request.ptq1_admission["ArtifactSha256"] = json!("0".repeat(64));
     let invoked = Cell::new(false);
     assert!(
@@ -228,7 +242,7 @@ fn screen_capture_preflight_and_setup_fail_without_starting_models() -> Result<(
             .join("screen-evidence.json")
             .exists()
     );
-    let (request, context) = fixture()?;
+    let (request, context, _fixture) = fixture()?;
     fs::remove_file(
         request.adapter["AdapterPath"]
             .as_str()

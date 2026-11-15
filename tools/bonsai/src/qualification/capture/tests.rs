@@ -2,6 +2,8 @@
 
 use std::cell::Cell;
 use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -10,16 +12,27 @@ use super::{Context, Request, capture_with, digest, read_json, save};
 use crate::Result;
 
 const TEXT: &str = "\u{feff}caf\u{e9} \u{1f331} [end of text]\r\n\n";
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
-fn fixture() -> Result<(Request, Context)> {
+struct TempFixture(PathBuf);
+
+impl Drop for TempFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fixture() -> Result<(Request, Context, TempFixture)> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
+    let seq = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
-        "SwiftBonsai-CaptureFixture-{}-{stamp}",
+        "SwiftBonsai-CaptureFixture-{}-{stamp}-{seq}",
         std::process::id()
     ));
+    let guard = TempFixture(root.clone());
     let data = root.join("data");
     let evidence = root.join("evidence");
     fs::create_dir_all(&data).map_err(|error| error.to_string())?;
@@ -66,6 +79,7 @@ fn fixture() -> Result<(Request, Context)> {
             runner_name: "synthetic-runner".into(),
             source_revision: Some("a".repeat(40)),
         },
+        guard,
     ))
 }
 
@@ -121,7 +135,7 @@ fn completed(request: &Value, count: usize, failed: bool) -> Result<Value> {
 
 #[test]
 fn x2_capture_records_extreme_instead_of_legacy_x1_label() -> Result<()> {
-    let (mut request, context) = fixture()?;
+    let (mut request, context, _fixture) = fixture()?;
     request.processor_name = "Snapdragon(R) X2 Elite Extreme - X2E-96-100".into();
     let receipt = capture_with(&request, &context, |native| completed(&native, 28, false))?;
     assert_eq!(receipt["DeviceModel"], "Snapdragon X2 Elite Extreme");
@@ -138,19 +152,12 @@ fn x2_capture_records_extreme_instead_of_legacy_x1_label() -> Result<()> {
         read_json(&request.evidence_directory.join("qualification.json"))?["Execution"]["deviceModel"],
         "Snapdragon X2 Elite Extreme"
     );
-    fs::remove_dir_all(
-        request
-            .evidence_directory
-            .parent()
-            .ok_or("Missing fixture root.")?,
-    )
-    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
 #[test]
 fn capture_completion_preserves_exact_responses_and_pending_proofs() -> Result<()> {
-    let (request, context) = fixture()?;
+    let (request, context, _fixture) = fixture()?;
     let result = capture_with(&request, &context, |native| completed(&native, 28, false))?;
     assert_eq!(result["Status"], "capture-completed");
     assert_eq!(result["QualificationStatus"], "pending");
@@ -183,7 +190,7 @@ fn capture_completion_preserves_exact_responses_and_pending_proofs() -> Result<(
 
 #[test]
 fn capture_failure_retains_completed_prefix_and_ignores_uncommitted_stdout() -> Result<()> {
-    let (request, context) = fixture()?;
+    let (request, context, _fixture) = fixture()?;
     let result = capture_with(&request, &context, |native| {
         completed(&native, 1, true)?;
         let next = std::path::Path::new(
@@ -220,7 +227,7 @@ fn capture_failure_retains_completed_prefix_and_ignores_uncommitted_stdout() -> 
 
 #[test]
 fn capture_setup_failure_saves_initial_and_failed_evidence_without_supervision() -> Result<()> {
-    let (request, context) = fixture()?;
+    let (request, context, _fixture) = fixture()?;
     fs::remove_file(
         request.adapter["AdapterPath"]
             .as_str()
@@ -249,7 +256,7 @@ fn capture_setup_failure_saves_initial_and_failed_evidence_without_supervision()
 #[test]
 fn capture_rejects_mismatched_runtime_or_admission_before_supervision() -> Result<()> {
     for field in ["admission", "lock", "runtime", "adapter"] {
-        let (mut request, context) = fixture()?;
+        let (mut request, context, _fixture) = fixture()?;
         match field {
             "admission" => request.admission["ArtifactSha256"] = json!("0".repeat(64)),
             "lock" => request.lock["model"]["revision"] = json!("0".repeat(40)),
@@ -272,7 +279,7 @@ fn capture_rejects_mismatched_runtime_or_admission_before_supervision() -> Resul
 
 #[test]
 fn app_scale_capture_uses_separate_contract_and_retains_pending_proofs() -> Result<()> {
-    let (mut request, context) = fixture()?;
+    let (mut request, context, _fixture) = fixture()?;
     request.qualification_profile = crate::qualification::QualificationProfile::AppScale;
     let result = capture_with(&request, &context, |native| {
         assert!(
