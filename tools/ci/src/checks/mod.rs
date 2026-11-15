@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 
 #[cfg(windows)]
-mod execute;
+pub(super) mod execute;
 mod regressions;
 #[cfg(test)]
 mod tests;

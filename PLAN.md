@@ -506,17 +506,18 @@ adoption decisions without displacing native daily-use acceptance.
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
   codec/ABI, state and fallback obligations with independent controls, then remove
   compiler/provisioning/build paths. Prism needs complete independent observation
-  provider coverage for its 39 remaining C++ files; retain every approved
+  provider coverage for its 35 remaining C++ files; retain every approved
   green ID, all 22,817 ordered backend geometries and separate performance work.
   Retain required replay data and qualify owning hosted builds without a project
   C++ toolchain. Capture original selected compiled/preprocessed/generated inputs
   and the complete schema-3 compilation database beyond ASR's registry inventory;
   run source and [link/package verification](tools/bonsai/README.md#selected-native-link-and-package-capture)
   on those actual captures in owning CI.
-  Qualify the retained-artifact source manifest collector on actual owning-build
-  artifacts; retain original supported Clang/clang-cl argument arrays at execution,
-  with explicit outputs and complete dependencies. Do not rewrite shell command
-  strings or historical relative-output databases into admitted evidence.
+  Qualify the retained-artifact collector and explicit live compiler-capture route
+  on actual owning-build selections; retain original supported Clang/clang-cl
+  argument arrays at execution, with explicit outputs and complete dependencies.
+  Do not rewrite shell command strings or historical relative-output databases
+  into admitted evidence.
   Inventory the restored original publisher archive identity in owning CI after
   fresh exact-byte intake. Retain the failed `prism-engine` HTTP 404 outcome and
   its original pin; do not substitute archive bytes or reopen that completed
@@ -525,9 +526,10 @@ adoption decisions without displacing native daily-use acceptance.
   with a qualified Rust provider while preserving preparation-peer recovery,
   worker draining and scoped cleanup. Static CRT linkage alone does not retire
   the embedded C++ exception runtime; a blanket abort profile changes recovery.
-  Qualify schema-4 COFF, exact-image PE runtime-symbol and retained ordinal/forwarder
-  observations on actual link/package inputs. Keep provider replacement, selected
-  library members and source ancestry separate from those observations.
+  Qualify schema-5 COFF, exact-image PE runtime-symbol, retained ordinal/forwarder
+  and recursive dependency-import observations on actual link/package inputs.
+  Keep provider replacement, selected library members, API-set routing and source
+  ancestry separate from those observations.
 
 ## Creative quality, adapters and memory
 

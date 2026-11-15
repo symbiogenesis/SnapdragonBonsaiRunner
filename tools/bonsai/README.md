@@ -328,13 +328,13 @@ Every `Identity` uses the same three fields; unknown fields reject.
 
 | Manifest field | Required original retained value |
 | --- | --- |
-| `schemaVersion`, `kind` | `1` (historical link/package scope), `2` (also inspect COFF runtime symbols), `3` (also inspect PE imported symbols) or `4` (also resolve original import/export routes), `selected-lld-arm64-link-package`. |
+| `schemaVersion`, `kind` | `1` (historical link/package scope), `2` (also inspect COFF runtime symbols), `3` (also inspect PE imported symbols), `4` (also resolve original import/export routes) or `5` (also traverse retained dependency imports), `selected-lld-arm64-link-package`. |
 | `sourceManifest`, `sourceReceipt` | Identities of the original schema-3 source manifest and separately reviewed source-verifier JSON receipt. Their manifest/source/compiler/database/count identities must match. |
 | `linker` | Exact original `lld-link` executable identity; no compiler/linker is executed by verification. |
 | `links` | Nonempty array of original successful invocations, at most 128. |
 | `packageDirectory`, `packageFiles` | Absolute existing flat directory and complete `{name, bytes, sha256}` file inventory, at most 4,096. Names are lowercase plain basenames. No directories, redirects, missing or extra files are admitted. |
 | `systemImports` | Exact distinct lowercase DLL basenames of imports deliberately outside the package. Every name must actually be imported; packaged-file collisions reject. |
-| `dependencyImages` | Schema 4 only: explicit `{module, identity}` entries for retained external DLLs needed to resolve every original import and its forwarders. At most 128; `module` is a lowercase DLL basename matching the identity path's filename, ignoring case. Entries must be distinct, used and separate from package images. Omit for historical schemas. |
+| `dependencyImages` | Schemas 4 and 5: explicit `{module, identity}` entries for retained external DLLs needed to resolve every original import and its forwarders; schema 5 additionally requires their recursive imports. At most 128; `module` is a lowercase DLL basename matching the identity path's filename, ignoring case. Entries must be distinct, used and separate from package images. Omit for earlier schemas. |
 
 Each link has `workingDirectory`, full `arguments` starting with the exact linker
 path, `exitCode: 0`, `inputs`, `output` identity, `packageName`, `normalImports`
@@ -371,7 +371,7 @@ inputs / 8,192 arguments, each at most 16 KiB. These bounds do not extend an
 owner-device workload allowance. Retain only the original selection needed by the
 owning replay consumer under the evidence-retention policy.
 
-Schemas 2 through 4 additionally parse every distinct supplied input as native ARM64 COFF:
+Schemas 2 through 5 additionally parse every distinct supplied input as native ARM64 COFF:
 ordinary and bigobj objects, short import objects, and ordinary MSVC archives.
 Thin archives, LLVM bitcode/LTO and other anonymous object formats reject rather
 than becoming empty symbol observations. Archives are inspected member by member;
@@ -393,7 +393,7 @@ listed symbol family was not observed in supported records. This is a fixed
 diagnostic family, not an exhaustive C++ code detector or a provider allowlist.
 Schema 1 retains its original replay scope with `coffRuntimeSymbolsChecked: false`.
 
-Schemas 3 and 4 also visit each linked/package image's original PE32+ normal and delay
+Schemas 3 through 5 also visit each linked/package image's original PE32+ normal and delay
 lookup tables. `peRuntimeImportsChecked: true` and `peRuntimeImportImages` bind
 the package name, length and SHA-256 to the named-import count, `knownCppEhImports`
 and every `ordinalImports` observation. Each observation retains the DLL and
@@ -413,7 +413,7 @@ inside the existing image bound. Names are visited without accumulating unknown
 name strings. Schemas 1 and 2 preserve their earlier DLL-name scope with
 `peRuntimeImportsChecked: false`; they do not acquire imported-symbol coverage.
 
-Schema 4 resolves every original named and ordinal normal/delay import against
+Schemas 4 and 5 resolve every original named and ordinal normal/delay import against
 the exact packaged or explicitly retained provider image's export table. It
 follows original `MODULE.name` and `MODULE.#ordinal` forwarders, appending `.dll`
 to the original module token and preserving exact exported symbol case. It does
@@ -430,7 +430,7 @@ Aliases sharing one ordinal are preserved, so an ordinal or ordinary alias canno
 hide an observed C++ EH export name.
 
 `ordinalImportTargetsResolved` and `forwardedImportTargetsResolved` are true only
-for a successful schema-4 capture. `runtimeImportBoundary.images` retains each
+for a successful schema-4 or schema-5 capture. `runtimeImportBoundary.images` retains each
 used provider's module, path, length, SHA-256 and package/dependency location.
 Every route retains its original importing package image, DLL, delay flag and
 name/ordinal, followed by each provider-image digest, requested symbol, export
@@ -443,12 +443,23 @@ Export bounds are 65,536 addresses and names per image, 4,096 bytes per name or
 forwarder and 16 MiB aggregate export text per image. Resolution allows 32 stages
 per route, 65,536 original imports, 262,144 aggregate stages and 16 MiB aggregate
 observed route text. Dependency images share existing image and intake limits.
-`apiSetRoutingQualified`, `recursiveDependencyImportsChecked` and
-`providerImplementationLanguageQualified` remain false: this resolves supplied
-original import routes, without inspecting each external DLL's own imports,
-authenticating the OS loader's selected images, qualifying a runtime provider or
-proving which delayed routes ran. Actual retained toolchain/package inputs and
-independent provider/recovery acceptance remain required.
+Schema 5 follows each used external dependency's own normal and delay imports,
+including images reached only through forwarders. It rereads each image under the
+same digest/byte/guard checks, keeping one dependency image in memory at a time.
+Missing providers, API-set routes and malformed import tables reject; mutual DLL
+imports are visited once per image. The existing aggregate route, hop, text and
+intake limits also cover this traversal. Even an import descriptor with no symbols
+requires its retained provider. `recursiveDependencyImportsChecked` is true only
+for schema 5; earlier schemas keep their original scope. `dependencyImportImages`
+binds each traversed module's digest/length and imported-module list. Transitive
+routes identify `dependencyModule` and `importerLocation: "retained-dependency"`;
+packaged routes retain `packageName` and add `importerLocation: "package"`.
+
+`apiSetRoutingQualified` and `providerImplementationLanguageQualified` remain
+false. Retained-byte traversal does not authenticate the OS loader's selected
+images, qualify a runtime provider or prove which delayed routes ran. Actual
+toolchain/package inputs and independent provider/recovery acceptance remain
+required; `systemDependencyClosureChecked` also remains false.
 
 The receipt declares `sourceClosureReexecuted: false` and
 `independentSourceReceiptReviewRequired: true`. Hashing a caller-supplied receipt

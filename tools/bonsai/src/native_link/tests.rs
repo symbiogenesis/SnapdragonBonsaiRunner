@@ -612,6 +612,244 @@ fn native_link_schema_four_rejects_malformed_exports_forwarders_and_changed_byte
     Ok(())
 }
 
+fn clear_imports(bytes: &mut [u8]) {
+    for offset in [0x98 + 120, 0x98 + 112 + 13 * 8] {
+        put32(bytes, offset, 0);
+        put32(bytes, offset + 4, 0);
+    }
+    bytes[0x400..0xa00].fill(0);
+}
+
+// One original ordinal import, independent from the export fixture at 0xa00.
+fn ordinal_dependency(bytes: &mut [u8], module: &str, ordinal: u16, delayed: bool) -> TestResult {
+    clear_imports(bytes);
+    let (descriptor, name, lookup, address) = if delayed {
+        put32(bytes, 0x98 + 112 + 13 * 8, 0x1200);
+        put32(bytes, 0x98 + 116 + 13 * 8, 64);
+        put32(bytes, 0x600, 1);
+        (0x600, 0x700, 0x900, 0x940)
+    } else {
+        put32(bytes, 0x98 + 120, 0x1000);
+        put32(bytes, 0x98 + 124, 40);
+        (0x400, 0x500, 0x800, 0x840)
+    };
+    let rva = |offset: usize| u32::try_from(offset + 0xc00);
+    if delayed {
+        put32(bytes, descriptor + 4, rva(name)?);
+        put32(bytes, descriptor + 12, rva(address)?);
+        put32(bytes, descriptor + 16, rva(lookup)?);
+    } else {
+        put32(bytes, descriptor, rva(lookup)?);
+        put32(bytes, descriptor + 12, rva(name)?);
+        put32(bytes, descriptor + 16, rva(address)?);
+    }
+    bytes[name..name + module.len()].copy_from_slice(module.as_bytes());
+    for offset in [lookup, address] {
+        bytes[offset..offset + 8]
+            .copy_from_slice(&((1_u64 << 63) | u64::from(ordinal)).to_le_bytes());
+    }
+    Ok(())
+}
+
+fn recursive_fixture(
+    scratch: &Scratch,
+) -> std::result::Result<Capture, Box<dyn std::error::Error>> {
+    let mut capture = runtime_fixture(scratch)?;
+    capture.schema_version = 5;
+    for item in &mut capture.dependency_images {
+        let mut bytes = fs::read(&item.identity.path)?;
+        clear_imports(&mut bytes);
+        item.identity = scratch.file(&item.module, &bytes)?;
+    }
+    Ok(capture)
+}
+
+#[test]
+fn native_link_schema_five_traverses_dependency_imports_and_forwarded_providers() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = recursive_fixture(&scratch)?;
+    let mut kernel = fs::read(&capture.dependency_images[0].identity.path)?;
+    ordinal_dependency(&mut kernel, "middle.dll", 5, false)?;
+    dependency(&scratch, &mut capture, "kernel32.dll", &kernel)?;
+    let mut middle = export_image(5, &[], &[Some("terminal.__CxxFrameHandler4")])?;
+    ordinal_dependency(&mut middle, "leaf.dll", 11, true)?;
+    dependency(&scratch, &mut capture, "middle.dll", &middle)?;
+    for (module, base, name) in [
+        ("terminal.dll", 9, "__CxxFrameHandler4"),
+        ("leaf.dll", 11, "__CxxFrameHandler3"),
+        ("tail.dll", 13, "__std_exception_copy"),
+    ] {
+        let mut bytes = export_image(base, &[(name, 0)], &[None])?;
+        clear_imports(&mut bytes);
+        if module == "terminal.dll" {
+            // This provider is reached only through a forwarder; its own
+            // imports must extend the traversal rather than terminating it.
+            ordinal_dependency(&mut bytes, "tail.dll", 13, false)?;
+        }
+        dependency(&scratch, &mut capture, module, &bytes)?;
+    }
+    let receipt = verify(&capture, &mut Intake::default())?;
+    let boundary = &receipt["runtimeImportBoundary"];
+    assert_eq!(boundary["recursiveDependencyImportsChecked"], true);
+    let checked = boundary["dependencyImportImages"]
+        .as_array()
+        .ok_or("Missing dependency imports")?;
+    assert_eq!(checked.len(), 6);
+    let routes = boundary["routes"].as_array().ok_or("Missing routes")?;
+    assert_eq!(routes.len(), 8);
+    let route = routes
+        .iter()
+        .find(|r| r["dependencyModule"] == "kernel32.dll")
+        .ok_or("Missing transitive route")?;
+    assert_eq!(route["packageName"], Value::Null);
+    assert_eq!(route["importerLocation"], "retained-dependency");
+    assert_eq!(route["knownCppEhNames"], json!(["__CxxFrameHandler4"]));
+    assert_eq!(route["stages"][1]["module"], "terminal.dll");
+    let route = routes
+        .iter()
+        .find(|r| r["dependencyModule"] == "middle.dll")
+        .ok_or("Missing delay route")?;
+    assert_eq!(route["delayed"], true);
+    assert_eq!(route["knownCppEhNames"], json!(["__CxxFrameHandler3"]));
+    let route = routes
+        .iter()
+        .find(|r| r["dependencyModule"] == "terminal.dll")
+        .ok_or("Missing forwarded provider imports")?;
+    assert_eq!(route["knownCppEhNames"], json!(["__std_exception_copy"]));
+    assert_eq!(routes[0]["importerLocation"], "package");
+    for field in [
+        "systemDependencyClosureChecked",
+        "cppRuntimeAbsenceQualified",
+        "nativeRetirementQualified",
+    ] {
+        assert_eq!(receipt[field], false);
+    }
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_five_checks_mutual_imports_once_without_changing_schema_four() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = recursive_fixture(&scratch)?;
+    for (module, target, ordinal) in [
+        ("kernel32.dll", "bcrypt.dll", 23),
+        ("bcrypt.dll", "kernel32.dll", 17),
+    ] {
+        let mut bytes = fs::read(
+            &capture
+                .dependency_images
+                .iter()
+                .find(|d| d.module == module)
+                .ok_or("Missing fixture")?
+                .identity
+                .path,
+        )?;
+        ordinal_dependency(&mut bytes, target, ordinal, false)?;
+        dependency(&scratch, &mut capture, module, &bytes)?;
+    }
+    let receipt = verify(&capture, &mut Intake::default())?;
+    assert_eq!(
+        receipt["runtimeImportBoundary"]["dependencyImportImages"]
+            .as_array()
+            .ok_or("Missing imports")?
+            .len(),
+        2
+    );
+    assert_eq!(
+        receipt["runtimeImportBoundary"]["routes"]
+            .as_array()
+            .ok_or("Missing routes")?
+            .len(),
+        7
+    );
+    capture.schema_version = 4;
+    let historical = verify(&capture, &mut Intake::default())?;
+    assert_eq!(
+        historical["runtimeImportBoundary"]["recursiveDependencyImportsChecked"],
+        false
+    );
+    assert_eq!(
+        historical["runtimeImportBoundary"]["dependencyImportImages"],
+        Value::Null
+    );
+    assert_eq!(
+        historical["runtimeImportBoundary"]["routes"]
+            .as_array()
+            .ok_or("Missing historical routes")?
+            .len(),
+        5
+    );
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_five_rejects_missing_apiset_and_malformed_dependency_imports() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = recursive_fixture(&scratch)?;
+    let kernel = fs::read(&capture.dependency_images[0].identity.path)?;
+    for (target, expected) in [
+        (
+            "absent.dll",
+            "Native link dependency import lacks a retained provider image: absent.dll",
+        ),
+        (
+            "api-ms-example.dll",
+            "Native link runtime route requires separately qualified API-set routing.",
+        ),
+    ] {
+        let mut bytes = kernel.clone();
+        ordinal_dependency(&mut bytes, target, 17, false)?;
+        dependency(&scratch, &mut capture, "kernel32.dll", &bytes)?;
+        rejected(verify(&capture, &mut Intake::default()), expected);
+    }
+    let mut bytes = kernel;
+    ordinal_dependency(&mut bytes, "bcrypt.dll", 23, true)?;
+    // Nonzero IAT terminator must reject, even for a delayed dependency import.
+    bytes[0x948] = 1;
+    dependency(&scratch, &mut capture, "kernel32.dll", &bytes)?;
+    assert!(verify(&capture, &mut Intake::default()).is_err());
+    capture.schema_version = 4;
+    assert!(verify(&capture, &mut Intake::default()).is_ok());
+    Ok(())
+}
+
+#[test]
+fn native_link_schema_five_requires_and_traverses_zero_symbol_descriptors() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut capture = recursive_fixture(&scratch)?;
+    let mut kernel = fs::read(&capture.dependency_images[0].identity.path)?;
+    ordinal_dependency(&mut kernel, "zero.dll", 1, false)?;
+    // Empty lookup and IAT still leave an original import descriptor/module.
+    kernel[0x800..0x808].fill(0);
+    kernel[0x840..0x848].fill(0);
+    dependency(&scratch, &mut capture, "kernel32.dll", &kernel)?;
+    rejected(
+        verify(&capture, &mut Intake::default()),
+        "Native link dependency import lacks a retained provider image: zero.dll",
+    );
+    let mut zero = export_image(1, &[], &[None])?;
+    ordinal_dependency(&mut zero, "bcrypt.dll", 23, true)?;
+    dependency(&scratch, &mut capture, "zero.dll", &zero)?;
+    let receipt = verify(&capture, &mut Intake::default())?;
+    let boundary = &receipt["runtimeImportBoundary"];
+    assert_eq!(
+        boundary["dependencyImportImages"]
+            .as_array()
+            .ok_or("Missing dependencies")?
+            .len(),
+        3
+    );
+    let routes = boundary["routes"].as_array().ok_or("Missing routes")?;
+    assert_eq!(routes.len(), 6);
+    let route = routes
+        .iter()
+        .find(|r| r["dependencyModule"] == "zero.dll")
+        .ok_or("Empty descriptor bypassed dependency traversal")?;
+    assert_eq!(route["delayed"], true);
+    assert_eq!(route["knownCppEhNames"], json!(["__CxxFrameHandler3"]));
+    Ok(())
+}
+
 #[test]
 fn native_link_schema_three_uses_only_unbound_iat_when_lookup_is_absent() -> TestResult {
     let scratch = Scratch::new()?;

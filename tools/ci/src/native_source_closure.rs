@@ -5,13 +5,19 @@ use std::{
     ffi::OsString,
     fs,
     path::Path,
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::native_source_inventory::{digest, hex, lower_hex, plain_ancestors, read_bounded};
+use super::native_source_inventory::{
+    checkpoint, digest_until, hex, lower_hex, plain_ancestors, read_bounded, read_bounded_until,
+};
 use crate::Result;
+
+#[cfg(test)]
+use super::native_source_inventory::digest;
 
 const USAGE: &str =
     "Usage: bonsai-ci native-closure-verify --manifest PATH --expected-sha256 SHA256";
@@ -54,7 +60,7 @@ struct Input {
     generation: Option<Generation>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 enum Origin {
     Source,
@@ -127,16 +133,24 @@ fn path_key(path: &str) -> Result<String> {
     Ok(key)
 }
 
-fn verify_identity(identity: &Identity, total: &mut u64) -> Result<String> {
+#[derive(Default)]
+struct Verification {
+    bytes: u64,
+    deadline: Option<Instant>,
+}
+
+fn verify_identity(identity: &Identity, total: &mut Verification) -> Result<String> {
+    checkpoint(total.deadline)?;
     if !lower_hex(&identity.sha256, 64) || identity.bytes > MAX_FILE {
         return Err("Native closure has an invalid file identity.".into());
     }
-    *total = total
+    total.bytes = total
+        .bytes
         .checked_add(identity.bytes)
         .filter(|bytes| *bytes <= MAX_TOTAL)
         .ok_or("Native closure exceeded its aggregate byte bound.")?;
     let key = path_key(&identity.path)?;
-    let (bytes, sha256) = digest(Path::new(&identity.path), MAX_FILE)?;
+    let (bytes, sha256) = digest_until(Path::new(&identity.path), MAX_FILE, total.deadline)?;
     if bytes != identity.bytes || sha256 != identity.sha256 {
         return Err(format!(
             "Native closure file identity changed: {}",
@@ -335,7 +349,7 @@ fn verify_command(unit: &Unit, compiler: &str) -> Result<()> {
 fn verify_input(
     input: &Input,
     schema_version: u32,
-    total: &mut u64,
+    total: &mut Verification,
     ancestors: &mut BTreeSet<String>,
     compiler_outputs: &[&str],
 ) -> Result<(String, usize)> {
@@ -365,7 +379,7 @@ fn verify_generation(
     input: &Input,
     output: &str,
     schema_version: u32,
-    total: &mut u64,
+    total: &mut Verification,
     ancestors: &mut BTreeSet<String>,
     compiler_outputs: &[&str],
 ) -> Result<usize> {
@@ -422,7 +436,7 @@ fn verify_generation(
     Ok(count)
 }
 
-fn verify_compilation_database(manifest: &Manifest, total: &mut u64) -> Result<()> {
+fn verify_compilation_database(manifest: &Manifest, total: &mut Verification) -> Result<()> {
     let Some(identity) = &manifest.compilation_database else {
         return if manifest.schema_version >= 3 {
             Err("Native closure schema 3 requires its complete compilation database.".into())
@@ -437,7 +451,7 @@ fn verify_compilation_database(manifest: &Manifest, total: &mut u64) -> Result<(
         return Err("Native compilation database exceeds its document bound.".into());
     }
     verify_identity(identity, total)?;
-    let bytes = read_bounded(Path::new(&identity.path), MAX_DOCUMENT)?;
+    let bytes = read_bounded_until(Path::new(&identity.path), MAX_DOCUMENT, total.deadline)?;
     if u64::try_from(bytes.len()).map_err(|error| error.to_string())? != identity.bytes
         || hex(&Sha256::digest(&bytes)) != identity.sha256
     {
@@ -450,6 +464,7 @@ fn verify_compilation_database(manifest: &Manifest, total: &mut u64) -> Result<(
     }
     let mut remaining = BTreeMap::new();
     for unit in &manifest.units {
+        checkpoint(total.deadline)?;
         let key = (
             path_key(&unit.working_directory)?,
             path_key(&unit.source)?,
@@ -460,6 +475,7 @@ fn verify_compilation_database(manifest: &Manifest, total: &mut u64) -> Result<(
         }
     }
     for entry in &entries {
+        checkpoint(total.deadline)?;
         let directory = path_key(&entry.directory)?;
         let source = path_key(&entry.file)?;
         if !arguments_valid(&entry.arguments, &manifest.compiler.path) {
@@ -479,7 +495,13 @@ fn verify_compilation_database(manifest: &Manifest, total: &mut u64) -> Result<(
     Ok(())
 }
 
-fn verify_unit(unit: &Unit, compiler: &str, schema_version: u32, total: &mut u64) -> Result<usize> {
+fn verify_unit(
+    unit: &Unit,
+    compiler: &str,
+    schema_version: u32,
+    total: &mut Verification,
+) -> Result<usize> {
+    checkpoint(total.deadline)?;
     verify_command(unit, compiler)?;
     path_key(&unit.working_directory)?;
     if !Path::new(&unit.working_directory).is_dir() {
@@ -495,9 +517,10 @@ fn verify_unit(unit: &Unit, compiler: &str, schema_version: u32, total: &mut u64
     {
         return Err("Native closure requires distinct nonempty compilation outputs.".into());
     }
-    let text = String::from_utf8(read_bounded(
+    let text = String::from_utf8(read_bounded_until(
         Path::new(&unit.dependencies.path),
         MAX_DOCUMENT,
+        total.deadline,
     )?)
     .map_err(|error| error.to_string())?;
     if u64::try_from(text.len()).map_err(|error| error.to_string())? != unit.dependencies.bytes
@@ -511,6 +534,7 @@ fn verify_unit(unit: &Unit, compiler: &str, schema_version: u32, total: &mut u64
     }
     let mut expected = BTreeSet::new();
     for dependency in dependencies {
+        checkpoint(total.deadline)?;
         if !expected.insert(path_key(&dependency)?) {
             return Err("Native dependency report contains duplicate/aliased inputs.".into());
         }
@@ -554,6 +578,15 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
 }
 
 fn verify_manifest_bytes(bytes: &[u8], expected: &str) -> Result<String> {
+    verify_manifest_bytes_until(bytes, expected, None)
+}
+
+fn verify_manifest_bytes_until(
+    bytes: &[u8],
+    expected: &str,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    checkpoint(deadline)?;
     if hex(&Sha256::digest(bytes)) != expected {
         return Err("Native closure manifest differs from its reviewed SHA-256.".into());
     }
@@ -577,7 +610,7 @@ fn verify_manifest_bytes(bytes: &[u8], expected: &str) -> Result<String> {
     {
         return Err("Unsupported native source closure identity or bounds.".into());
     }
-    let mut total = 0;
+    let mut total = Verification { bytes: 0, deadline };
     verify_identity(&manifest.compiler, &mut total)?;
     verify_compilation_database(&manifest, &mut total)?;
     let mut generated = 0;
@@ -593,6 +626,7 @@ fn verify_manifest_bytes(bytes: &[u8], expected: &str) -> Result<String> {
             &mut total,
         )?;
     }
+    checkpoint(deadline)?;
     Ok(serde_json::json!({
         "schemaVersion": 1, "kind": "selected-native-source-closure-verification", "passed": true,
         "manifestSha256": expected, "sourceRevision": manifest.source_revision,
@@ -602,7 +636,7 @@ fn verify_manifest_bytes(bytes: &[u8], expected: &str) -> Result<String> {
         "recursiveGenerationProvenanceChecked": manifest.schema_version >= 2,
         "selectedBuildInventoryChecked": manifest.schema_version >= 3,
         "compilationDatabaseSha256": manifest.compilation_database.map(|identity| identity.sha256),
-        "generatedInputs": generated, "checkedBytesIncludingRepeatedInputs": total,
+        "generatedInputs": generated, "checkedBytesIncludingRepeatedInputs": total.bytes,
         "freshCompilerExecution": false, "completeBuildClosureQualified": false,
         "binaryLinkageQualified": false, "inferenceParityQualified": false,
         "nativeRetirementQualified": false
@@ -612,6 +646,10 @@ fn verify_manifest_bytes(bytes: &[u8], expected: &str) -> Result<String> {
 
 pub(super) fn collect(arguments: &[OsString]) -> Result<String> {
     collector::run(arguments)
+}
+
+pub(super) fn capture(arguments: &[OsString]) -> Result<String> {
+    collector::capture(arguments)
 }
 
 #[path = "native_source_collect.rs"]

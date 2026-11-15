@@ -2,17 +2,21 @@
 
 use super::{
     Generation, GenerationInput, Identity, Input, MAX_DOCUMENT, MAX_FILE, MAX_TOTAL, Manifest,
-    Origin, Unit, digest, hex, lower_hex, path_key, read_bounded, verify_manifest_bytes,
+    Origin, Unit, checkpoint, digest_until, hex, lower_hex, path_key, read_bounded,
+    verify_manifest_bytes_until,
 };
 use crate::Result;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use std::{ffi::OsString, path::Path};
+use std::{ffi::OsString, path::Path, time::Instant};
+
+#[cfg(test)]
+use super::verify_manifest_bytes;
 
 const USAGE: &str =
     "Usage: bonsai-ci native-closure-collect --request PATH --expected-sha256 SHA256";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CaptureGeneration {
     generator: String,
@@ -22,7 +26,7 @@ struct CaptureGeneration {
     inputs: Vec<CaptureInput>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CaptureInput {
     path: String,
@@ -62,12 +66,14 @@ struct Request {
 struct Intake {
     total: u64,
     records: usize,
+    deadline: Option<Instant>,
 }
 
 impl Intake {
     fn identity(&mut self, path: String, limit: u64) -> Result<Identity> {
+        checkpoint(self.deadline)?;
         path_key(&path)?;
-        let (bytes, sha256) = digest(Path::new(&path), limit)?;
+        let (bytes, sha256) = digest_until(Path::new(&path), limit, self.deadline)?;
         self.total = self
             .total
             .checked_add(bytes)
@@ -81,6 +87,7 @@ impl Intake {
     }
 
     fn inputs(&mut self, inputs: Vec<CaptureInput>, depth: usize) -> Result<Vec<Input>> {
+        checkpoint(self.deadline)?;
         if depth >= 64 || !(1..=8192).contains(&inputs.len()) {
             return Err("Native closure collection exceeds its input/depth bounds.".into());
         }
@@ -126,6 +133,11 @@ impl Intake {
 }
 
 fn assemble(request: Request) -> Result<String> {
+    assemble_until(request, None)
+}
+
+fn assemble_until(request: Request, deadline: Option<Instant>) -> Result<String> {
+    checkpoint(deadline)?;
     if request.schema_version != 1
         || request.kind != "selected-clang-native-source-collection"
         || request.target != "aarch64-pc-windows-msvc"
@@ -134,7 +146,10 @@ fn assemble(request: Request) -> Result<String> {
     {
         return Err("Unsupported native source collection identity or bounds.".into());
     }
-    let mut intake = Intake::default();
+    let mut intake = Intake {
+        deadline,
+        ..Intake::default()
+    };
     let compiler = intake.identity(request.compiler, MAX_FILE)?;
     let compilation_database = Some(intake.identity(request.compilation_database, MAX_DOCUMENT)?);
     let units = request
@@ -176,8 +191,10 @@ fn assemble(request: Request) -> Result<String> {
     // original inputs, rejects changed identities on its verification pass,
     // and checks the exact
     // compiler dependency set, complete database and recursive provenance.
-    verify_manifest_bytes(&bytes, &hex(&Sha256::digest(&bytes)))?;
-    String::from_utf8(bytes).map_err(|error| error.to_string())
+    verify_manifest_bytes_until(&bytes, &hex(&Sha256::digest(&bytes)), deadline)?;
+    let result = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    checkpoint(deadline)?;
+    Ok(result)
 }
 
 pub(super) fn run(arguments: &[OsString]) -> Result<String> {
@@ -197,6 +214,13 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     let request: Request = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     assemble(request)
 }
+
+pub(super) fn capture(arguments: &[OsString]) -> Result<String> {
+    execution::run(arguments)
+}
+
+#[path = "native_source_capture.rs"]
+mod execution;
 
 #[cfg(test)]
 #[path = "native_source_collect_tests.rs"]

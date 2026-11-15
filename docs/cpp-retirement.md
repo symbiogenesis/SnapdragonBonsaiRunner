@@ -69,7 +69,7 @@ fixtures exercise a test-only cache and do not qualify current serving graphs.
 
 Use Prism's [migration inventory](https://github.com/symbiogenesis/prism-inference/blob/main/tools/prism/upstream/migration.json)
 for the file-level provider list. The native boundary under
-`tools/prism/upstream/common/` includes `bridge.cpp`, its 38 C++ headers and coupled
+`tools/prism/upstream/common/` includes `bridge.cpp`, its 34 C++ headers and coupled
 `public_c_abi.h`/`public_c_abi.c`. Retire each route only after its numerical,
 text/API, model/session or concurrency assertions have independent replacements;
 remove the final dispatcher after every provider has migrated.
@@ -83,10 +83,30 @@ and UTF-8 boundary behavior. The reasoning C++ header and both families' native
 include/dispatch/build edges are removed. Original source IDs, required reference
 green IDs, catalog and ordered geometry schedules remain intact; reports disclose
 the independent providers and do not claim native replay. Owning hosted acceptance
-and the remaining 39 C++ files stay separate gates.
+and the remaining provider families stay separate gates.
+
+The concurrent logger reference now uses independent Rust bounded-channel
+producers and an owned consumer, separately from production's shared writer.
+It preserves the original eight-worker Windows random schedule, 8,000 messages,
+format toggles, joins, flush/free and required `test-log.cpp` green ID; the
+source has no output-content assertions. Its C++ header and native include,
+dispatch and build edges are removed. Three focused controls and strict native
+ARM64 Release analysis passed. Remaining native bridge compilation and owning
+hosted acceptance stay pending; the catalog and both geometry schedules are
+unchanged.
+
+Independent Rust MTMD tiling/grouping, chunk wire/lifetime and grammar-parser
+providers additionally preserve all 29, 46 and 274 original assertions respectively.
+They use separate integer-lattice/run grouping, bounded wire decoding and
+lexer/AST/lowering implementations, without calling production Rust or looking
+up expected answers. Their three C++ headers and native include/dispatch/build
+edges are removed; source identities, required green IDs, catalog and ordered
+geometry schedules remain intact. Focused controls and strict native ARM64
+Release analysis passed. Native bridge compilation and complete owning acceptance
+remain pending. This leaves 35 checked-in C++ files.
 
 The [checked-in boundary verifier](../tools/ci/README.md#checked-in-native-retirement-boundary)
-now binds Runner's remaining C file and the reviewed Prism snapshot's 39 C++
+now binds Runner's remaining C file and the reviewed Prism snapshot's 35 C++
 files plus coupled C ABI source/header and migrated Rust assertion/provider edges.
 Exact per-file families and declared
 compiler/provider/contracts identities preserve the green-ID baseline and both
@@ -166,6 +186,18 @@ unknown options, extra sources, shell-command databases and response files rejec
 Actual owning-build instrumentation and original captures remain required;
 historical shell commands or relative outputs cannot be rewritten into evidence.
 Rehashing is not an atomic snapshot or continuous file-stability proof.
+
+The explicit [`native-closure-capture`](../tools/ci/README.md#explicit-live-compiler-capture)
+route can execute a newly reviewed supported Clang/clang-cl selection, retaining
+the original request, argument arrays, actual completed statuses and required
+source artifacts before collector/verifier handoff. Its inherited absolute clock
+covers supervised compiler processes and deadline-aware intake, hashing and
+verification; failures leave later phases explicitly unattempted. Source/compiler
+hashes are endpoint observations, and effective source/configuration and complete
+owning-build selection still require independent review. This route does not
+instrument CMake or supply historical missing captures. Actual owning captures,
+original generated-input provenance, link closure and hosted acceptance remain
+pending; synchronous OS I/O and retention require the external owner's supervision.
 
 The Rust [`native-archive-inventory` command](../tools/ci/README.md#immutable-external-source-archives)
 also expands pinned external source ZIPs into complete sorted member identities,
@@ -331,6 +363,14 @@ cannot become apparently valid full-scale PCM. Strict Release analysis/docs and
 one existing streaming regression also passed. These synthetic weights do not
 supply independent pinned-model codec/PCM observations or listening acceptance.
 
+Four further codec controls use closed-form miniature Mimi/decoder layers,
+nonuniform grouped/window attention and state-preserving normalization refusal.
+Mimi LayerNorm now rejects finite-input reduction or output overflow before
+apparently valid bias-only results can commit, preserving valid arithmetic order.
+Nine selected regressions, strict native ARM64 Release analysis and docs passed.
+These mathematical controls supply no missing pinned-model/native observations
+or S1 acceptance.
+
 The [native Q8 projection adapter](../tools/hexagon/native_rpc/README.md#q8-matrix-preparation-and-immutable-placement)
 connects immutable host dispatch to signed-queue ABI calls, exact FD mapping,
 correlated completions and mandatory independent output review. Failed or
@@ -430,8 +470,14 @@ aliases. Missing, cyclic, malformed and API-set routes reject; no loader search 
 host DLL substitution supplies a missing provider. Historical replay is preserved.
 These observations do not establish which archive members reached the
 shipped image, complete runtime/source ancestry, or absence of embedded C++.
+Schema 5 additionally traverses each used retained dependency's normal/delay
+imports, including forwarder-only providers and zero-symbol descriptors, under
+the same aggregate limits. Missing, API-set and malformed routes reject;
+mutual DLL imports are visited once. Four focused controls and strict native
+ARM64 Release analysis passed. Historical schemas retain their earlier scope.
 `cppRuntimeAbsenceQualified` and `nativeRetirementQualified` remain false;
 compiler/sysroot provider replacement and recovery acceptance are still required.
 Literal link/parser controls cover the supported subset; no actual
-toolchain/runtime artifact was inspected. Recursive dependency imports, API-set
-routing and provider implementation language remain unqualified.
+toolchain/runtime artifact was inspected. Actual recursive dependency captures,
+API-set routing, OS loader selection and provider implementation language remain
+unqualified.

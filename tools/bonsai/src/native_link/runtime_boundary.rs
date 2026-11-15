@@ -57,9 +57,28 @@ pub(super) struct Boundary {
     routes: Vec<Value>,
     hops: usize,
     text_bytes: usize,
+    recursive: bool,
 }
 
 impl Boundary {
+    pub(super) fn import_module(&mut self, module: &str) -> Result<()> {
+        if !safe_name(module) || !extension(module, "dll") {
+            return Err("Native link dependency import has an unsupported module name.".into());
+        }
+        if module.starts_with("api-") || module.starts_with("ext-") {
+            return Err(
+                "Native link runtime route requires separately qualified API-set routing.".into(),
+            );
+        }
+        if !self.providers.contains_key(module) {
+            return Err(format!(
+                "Native link dependency import lacks a retained provider image: {module}"
+            ));
+        }
+        self.used.insert(module.into());
+        Ok(())
+    }
+
     pub(super) fn prepare(
         manifest: &Capture,
         package: &BTreeMap<String, Identity>,
@@ -98,11 +117,12 @@ impl Boundary {
                 );
             }
             let image = crate::pe_closure::parse_image(intake.read(identity, IMAGE_LIMIT)?)?;
+            let exports = symbol_exports::inspect(&image)?;
             providers.insert(
                 module.to_owned(),
                 Provider {
                     identity: identity.clone(),
-                    exports: symbol_exports::inspect(&image)?,
+                    exports,
                     external,
                 },
             );
@@ -113,6 +133,7 @@ impl Boundary {
             routes: Vec::new(),
             hops: 0,
             text_bytes: 0,
+            recursive: manifest.schema_version >= 5,
         })
     }
 
@@ -201,14 +222,72 @@ impl Boundary {
                 break;
             }
         }
-        self.routes.push(json!({
+        let mut route = json!({
             "packageName":importer,"module":module,"delayed":delayed,
             "importSymbol":original.value(),"stages":stages,"knownCppEhNames":known
-        }));
+        });
+        if self.recursive {
+            route["importerLocation"] = if self.providers.get(importer).is_some_and(|p| p.external)
+            {
+                // An external dependency is not a packaged image.
+                let object = route.as_object_mut().ok_or("Missing native import route")?;
+                object.remove("packageName");
+                object.insert("dependencyModule".into(), importer.into());
+                "retained-dependency".into()
+            } else {
+                "package".into()
+            };
+        }
+        self.routes.push(route);
         Ok(())
     }
 
-    pub(super) fn finish(self) -> Result<Value> {
+    fn dependency_imports(&mut self, intake: &mut Intake) -> Result<Vec<Value>> {
+        let mut checked = Vec::new();
+        let mut visited = BTreeSet::new();
+        if !self.recursive {
+            return Ok(checked);
+        }
+        // New forwarder/import targets extend `used`; each external image is
+        // visited once, so legitimate mutual DLL imports cannot restart traversal.
+        loop {
+            let next = self
+                .used
+                .iter()
+                .find(|module| {
+                    !visited.contains(*module)
+                        && self.providers.get(*module).is_some_and(|p| p.external)
+                })
+                .cloned();
+            let Some(module) = next else { break };
+            visited.insert(module.clone());
+            let identity = self
+                .providers
+                .get(&module)
+                .ok_or("Missing import provider")?
+                .identity
+                .clone();
+            // Reverify under the same intake/guards, keeping only one external
+            // image in memory while traversing its original import records.
+            let image = crate::pe_closure::parse_image(intake.read(&identity, IMAGE_LIMIT)?)?;
+            let mut modules = BTreeSet::new();
+            for delayed in [false, true] {
+                for target in crate::pe_closure::imports(&image, delayed)? {
+                    self.import_module(&target)?;
+                    modules.insert(target);
+                }
+                crate::pe_closure::visit_import_symbols(&image, delayed, |target, symbol| {
+                    self.observe(&module, target, delayed, &symbol)
+                })?;
+            }
+            checked.push(json!({"module":module,"bytes":identity.bytes,
+                "sha256":identity.sha256,"importedModules":modules}));
+        }
+        Ok(checked)
+    }
+
+    pub(super) fn finish(mut self, intake: &mut Intake) -> Result<Value> {
+        let dependency_imports = self.dependency_imports(intake)?;
         if self
             .providers
             .iter()
@@ -228,8 +307,12 @@ impl Boundary {
                     "location":if provider.external {"retained-dependency"} else {"package"}})
             })
             .collect();
-        Ok(json!({"images":images,"routes":self.routes,
-            "apiSetRoutingQualified":false,"recursiveDependencyImportsChecked":false,
-            "providerImplementationLanguageQualified":false}))
+        let mut result = json!({"images":images,"routes":self.routes,
+            "apiSetRoutingQualified":false,"recursiveDependencyImportsChecked":self.recursive,
+            "providerImplementationLanguageQualified":false});
+        if self.recursive {
+            result["dependencyImportImages"] = dependency_imports.into();
+        }
+        Ok(result)
     }
 }

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "prism",
-  "sourceRevision": "4f8ec12f09875c258681dde90fc20f869f492807",
+  "sourceRevision": "f08722fbf78a6674576a4bc2ec855274ae2328b9",
   "exclusions": [
     {
       "path": ".git",
@@ -133,7 +133,7 @@
     {
       "id": "common-concurrency",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/concurrency.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve test-log.cpp's eight original concurrent workers, 8,000 records, per-thread Windows random schedules, timestamp/prefix toggles and join/flush/free smoke contract through independent bounded-channel Rust observations and the separate production Rust logger. Preserve the required reference green ID and reject writer/teardown failures. The C++ header/include/dispatch/CMake edge is retired; output-content/native replay and whole-repository retirement are not claimed. Owning hosted acceptance remains separate."
       ],
       "retirementQualified": false
     },
@@ -182,7 +182,7 @@
     {
       "id": "common-grammar-parser",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/grammar_parser.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve all 274 original grammar-parser assertions across 17 valid and six invalid variants, exact symbol/rule order, Unicode, repetition lowering and failure state using an independent Rust AST provider. The native header/include/dispatch/CMake route is retired; keep required reference green IDs and owning hosted acceptance separate from native replay or full retirement."
       ],
       "retirementQualified": false
     },
@@ -224,14 +224,14 @@
     {
       "id": "common-mtmd",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/mtmd.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve all 29 original LFM2 tiling and temporal-grouping assertions, ties-to-even alignment, strict area thresholds, ordered image/audio/text boundaries and separately counted bitmap survivors through the independent nearest-lattice/run-partition Rust provider. Keep typed bounds and owned request lifetime. The native header/include/dispatch/CMake route is retired; no model, native replay, device or complete retirement verdict is claimed."
       ],
       "retirementQualified": false
     },
     {
       "id": "common-mtmd-chunks",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/mtmd_chunks.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve all 46 original public MTMD chunk conditions, source-defined factory metadata, wire lengths/positions, save query and tiny/truncated failures, complete roundtrip identity and owned/null reload lifecycle through a separate Rust wire-recipe/cursor decoder. The native header/include/dispatch/CMake route is retired; preserve original source and required reference identities, and keep owning hosted and full-retirement acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -379,8 +379,8 @@
     },
     {
       "path": "tools/prism/upstream/common/bridge.cpp",
-      "bytes": 15323,
-      "sha256": "c3b7268a71598461b32fdd9ff2a6da7e64c68ceaa602fa3a7bf5a287a46e4b0a",
+      "bytes": 14219,
+      "sha256": "05f55ef4976df70a37391e780b38d8d8e5f2f335c91f9b1da8833b0b96572a6a",
       "family": "common-bridge"
     },
     {
@@ -426,12 +426,6 @@
       "family": "common-codec-buffers"
     },
     {
-      "path": "tools/prism/upstream/common/concurrency.hpp",
-      "bytes": 5060,
-      "sha256": "d3e59da30f741f10a16d18b04463288c44e952c19a6e967a31b1ad8bbc19d74a",
-      "family": "common-concurrency"
-    },
-    {
       "path": "tools/prism/upstream/common/context_graph.hpp",
       "bytes": 2463,
       "sha256": "516d8844ab188d7bf2f679d2396b5d5f53b3a178e3fa6a1da40ea0cd83b8d2da",
@@ -468,12 +462,6 @@
       "family": "common-grammar"
     },
     {
-      "path": "tools/prism/upstream/common/grammar_parser.hpp",
-      "bytes": 2559,
-      "sha256": "12e39a281c4d84a0cfdab071b308e106c452277e31545e16a78f78c6764116df",
-      "family": "common-grammar-parser"
-    },
-    {
       "path": "tools/prism/upstream/common/jinja.hpp",
       "bytes": 13643,
       "sha256": "d623795d4d70a4faa81205407a32927a08156b64071a98691ef409d389250fe3",
@@ -502,18 +490,6 @@
       "bytes": 44001,
       "sha256": "316755d7728ff406e7c0ff604ef52235208ed5cae080e7b5160cd6b1dd13134d",
       "family": "common-model-runtime"
-    },
-    {
-      "path": "tools/prism/upstream/common/mtmd.hpp",
-      "bytes": 6424,
-      "sha256": "fbfb84d5000e8f439f9377563e2514bdf05639d7f576fb0321fc3fd35b4fe126",
-      "family": "common-mtmd"
-    },
-    {
-      "path": "tools/prism/upstream/common/mtmd_chunks.hpp",
-      "bytes": 10062,
-      "sha256": "75a1d212b5306cc40ab38813a60cb457d69c8dc79e46a5ca98b80484c8a4f603",
-      "family": "common-mtmd-chunks"
     },
     {
       "path": "tools/prism/upstream/common/optimizer.hpp",
@@ -579,14 +555,14 @@
   "edges": [
     {
       "path": "Cargo.lock",
-      "bytes": 54992,
-      "sha256": "d7ef72d1bad3d3b5f5afebc00d4417fe5ee5eeb8f461b98730fb9791fd2df85b",
+      "bytes": 55797,
+      "sha256": "805931c183d3c975a46ae3152bd7ce0dd8ecd65c5f80c48eedc3f4c3ad7d0f79",
       "family": "external-native"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 5730,
-      "sha256": "8d8009b88dc135dc4b632ddf2b6808446e075784cd312800beac7806879379e0",
+      "bytes": 5753,
+      "sha256": "a9a7dffd5c05bf6c4076f0af6fd96441d7838bc3b7b08b2ab3539b73d9228dce",
       "family": "external-native"
     },
     {
@@ -614,6 +590,12 @@
       "family": "native-build"
     },
     {
+      "path": "tests/Test-PrismUpstream.ps1",
+      "bytes": 37499,
+      "sha256": "a41c86a298b31803b95bde6d470e9ab8ee54a33194102db7aa83f916643d1e13",
+      "family": "upstream-contracts"
+    },
+    {
       "path": "tests/upstream_prism/backend-ops-geometries.json",
       "bytes": 2360032,
       "sha256": "8eb986e0a2cf7694b98a03f24f8ed4e5aabf6407ce60dcc502cab0682434549d",
@@ -633,15 +615,45 @@
     },
     {
       "path": "tests/upstream_prism/engine.rs",
-      "bytes": 21780,
-      "sha256": "5385d75bd3e1f2adc6f68c2a968a37b28a0a2eebd34ea6f7f7b27d451a63369f",
+      "bytes": 22059,
+      "sha256": "43334f1899416363d9ca62982dc8925e01dd6b6323bcaff7ab1171038f0f271e",
       "family": "upstream-contracts"
     },
     {
+      "path": "tests/upstream_prism/grammar-parser-cases.json",
+      "bytes": 22079,
+      "sha256": "e99f45b9c0cd0a3139c82f48fbf98c9767b119eff7a6a616b84e48ab6ba06842",
+      "family": "common-grammar-parser"
+    },
+    {
+      "path": "tests/upstream_prism/grammar_parser.rs",
+      "bytes": 10874,
+      "sha256": "9c2c290e3029c127dcb66c9e01490fd35a34482f7df1c433fd4be631cd2e090a",
+      "family": "common-grammar-parser"
+    },
+    {
       "path": "tests/upstream_prism/harness.rs",
-      "bytes": 30755,
-      "sha256": "c55273bf9f61a2eaba16c41584818bb101773397d9476e953206884905a2a0ed",
+      "bytes": 30864,
+      "sha256": "f057b423401c32698f3f4afc251a173f6c00a854c770f7aaa2cacb2a9c420c76",
       "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/logging.rs",
+      "bytes": 2989,
+      "sha256": "7f158151896f92460a9d3c2c1612daa042f582f85b7eb64a8f25c85737e979e8",
+      "family": "common-concurrency"
+    },
+    {
+      "path": "tests/upstream_prism/mtmd.rs",
+      "bytes": 8444,
+      "sha256": "8b117e884a1e12de9a4f54e1741b0e4ca18d9ac5e646ead913b943c4e46c1521",
+      "family": "common-mtmd"
+    },
+    {
+      "path": "tests/upstream_prism/mtmd_chunks.rs",
+      "bytes": 10450,
+      "sha256": "aaa1b20dc59ad3cce6336db2c4ef9f42ff2770ebadd25b958237c66bda3b856c",
+      "family": "common-mtmd-chunks"
     },
     {
       "path": "tests/upstream_prism/reasoning-budget-cases.json",
@@ -656,9 +668,33 @@
       "family": "upstream-contracts"
     },
     {
+      "path": "tests/upstream_prism/reference_grammar_parser.rs",
+      "bytes": 24221,
+      "sha256": "951058632f0538db2b6ff724f3030a9d152b9117d850f4bf346d73631d17f2e7",
+      "family": "common-grammar-parser"
+    },
+    {
+      "path": "tests/upstream_prism/reference_logging.rs",
+      "bytes": 12379,
+      "sha256": "1d7bb6a71f3882034aba49634b8b3acfea3eafb4e8199ecda397fb9d5287d372",
+      "family": "common-concurrency"
+    },
+    {
+      "path": "tests/upstream_prism/reference_mtmd.rs",
+      "bytes": 13407,
+      "sha256": "a351d81157f7140df12563dad10ca6cb69e1e47fe3b07fb1523ca8a742492a43",
+      "family": "common-mtmd"
+    },
+    {
+      "path": "tests/upstream_prism/reference_mtmd_chunks.rs",
+      "bytes": 24614,
+      "sha256": "76babf1eb80b1d6f13107f036cb4ed1463e150048a700c26d41e3b7582ea27ea",
+      "family": "common-mtmd-chunks"
+    },
+    {
       "path": "tests/upstream_prism/reference_provider.rs",
-      "bytes": 7871,
-      "sha256": "21074aa88b6e05ee06171f7415c14d5b6bbca90f1cb70879fda3c7f93b321d70",
+      "bytes": 9077,
+      "sha256": "67baf0027b105011560121b00b1f67a92e11b84c3acab7172e39c11ab900b54a",
       "family": "upstream-contracts"
     },
     {
@@ -747,8 +783,8 @@
     },
     {
       "path": "tools/prism/upstream/common/CMakeLists.txt",
-      "bytes": 5177,
-      "sha256": "4660d1ff53fd04d3d8d90b8492046829fc300c1dcbb64efdcd14e19e03bc843e",
+      "bytes": 5117,
+      "sha256": "f2c38f76904f1b38f6ebac48fa308949fb4aa301f2ad72f3bdd2a26f57e237dc",
       "family": "native-build"
     },
     {
@@ -759,8 +795,8 @@
     },
     {
       "path": "tools/prism/upstream/migration.json",
-      "bytes": 43498,
-      "sha256": "98a4396b6c537ad0edca656224312590b9d030c2e48d192ebc375aa16570734f",
+      "bytes": 43791,
+      "sha256": "c46322df41c1a370ccd2a5c5c404eb458dd13bf17df83d709b2ab93b46a256b0",
       "family": "upstream-contracts"
     },
     {

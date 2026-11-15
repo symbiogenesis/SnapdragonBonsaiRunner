@@ -497,7 +497,17 @@ fn normalize(
     let Some(bias) = bias else {
         return rms_norm(input, weight, eps);
     };
-    if input.is_empty() || input.len() != weight.len() || input.len() != bias.len() {
+    if input.is_empty()
+        || input.len() != weight.len()
+        || input.len() != bias.len()
+        || !eps.is_finite()
+        || eps <= 0.0
+        || input
+            .iter()
+            .chain(weight)
+            .chain(bias)
+            .any(|value| !value.is_finite())
+    {
         return Err(invalid());
     }
     let count = count_float(input.len())?;
@@ -507,13 +517,23 @@ fn normalize(
         .map(|value| (value - mean) * (value - mean))
         .sum::<f32>()
         / count;
-    let inv = 1.0 / (variance + eps).sqrt();
-    Ok(input
+    let denominator = variance + eps;
+    // A finite input can overflow the original F32 reduction. An infinite
+    // variance would otherwise yield zero scale and apparently valid output.
+    if !mean.is_finite() || !variance.is_finite() || !denominator.is_finite() {
+        return Err(invalid());
+    }
+    let inv = 1.0 / denominator.sqrt();
+    let output: Vec<_> = input
         .iter()
         .zip(weight)
         .zip(bias)
         .map(|((&value, &scale), &offset)| ((value - mean) * inv).mul_add(scale, offset))
-        .collect())
+        .collect();
+    if output.iter().any(|value| !value.is_finite()) {
+        return Err(invalid());
+    }
+    Ok(output)
 }
 
 #[expect(
@@ -1307,6 +1327,10 @@ impl Speaker {
 #[cfg(test)]
 #[path = "rust_codec/transaction_tests.rs"]
 mod transaction_tests;
+
+#[cfg(test)]
+#[path = "rust_codec/independent_tests.rs"]
+mod independent_tests;
 
 #[cfg(test)]
 #[path = "rust_codec/synthesis_tests.rs"]

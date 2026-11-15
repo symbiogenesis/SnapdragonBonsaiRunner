@@ -1,7 +1,8 @@
 //! Independent dependency syntax and closure omission/tamper controls.
 
 use super::{
-    Generation, GenerationInput, Identity, Input, Origin, Unit, dependency_rule, verify_unit,
+    Generation, GenerationInput, Identity, Input, Origin, Unit, Verification, dependency_rule,
+    verify_unit,
 };
 use std::{
     fs,
@@ -160,19 +161,22 @@ fn native_source_closure_rejects_ambiguous_or_multiple_make_rules() {
 fn native_source_closure_exact_generated_inputs_and_tampering() -> TestResult {
     let scratch = Scratch::new()?;
     let mut unit = scratch.unit()?;
-    assert_eq!(verify_unit(&unit, "clang", 1, &mut 0)?, 1);
+    assert_eq!(
+        verify_unit(&unit, "clang", 1, &mut Verification::default())?,
+        1
+    );
     let header = unit.inputs.pop().ok_or("Missing header fixture")?;
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     unit.inputs.push(header);
     unit.inputs.push(Input {
         identity: scratch.file("unused.h", b"unused")?,
         origin: Origin::Source,
         generation: None,
     });
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     unit.inputs.pop();
     fs::write(&unit.inputs[1].identity.path, b"#define VALUE 8\n")?;
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     Ok(())
 }
 
@@ -181,24 +185,24 @@ fn native_source_closure_rejects_partial_flags_and_lost_generation() -> TestResu
     let scratch = Scratch::new()?;
     let mut unit = scratch.unit()?;
     unit.arguments.push("-MMD".into());
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     unit.arguments.pop();
     unit.arguments.push("@hidden.rsp".into());
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     unit.arguments.pop();
     unit.arguments.push("-o".into());
     unit.arguments.push(unit.object.path.clone());
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     unit.arguments.pop();
     unit.arguments.pop();
     unit.preprocessing_arguments.push("-DCHANGED=1".into());
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     unit.preprocessing_arguments.pop();
     unit.arguments[1] = "-E".into();
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     unit.arguments[1] = "-c".into();
     unit.inputs[1].generation = None;
-    assert!(verify_unit(&unit, "clang", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 1, &mut Verification::default()).is_err());
     Ok(())
 }
 
@@ -243,13 +247,19 @@ fn clang_cl_unit(scratch: &Scratch) -> Result<Unit, Box<dyn std::error::Error>> 
 fn native_source_closure_clang_cl_original_arrays_and_split_outputs() -> TestResult {
     let scratch = Scratch::new()?;
     let mut unit = clang_cl_unit(&scratch)?;
-    assert_eq!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0)?, 1);
+    assert_eq!(
+        verify_unit(&unit, "clang-cl.exe", 1, &mut Verification::default())?,
+        1
+    );
     unit.arguments[11] = "/Fo".into();
     unit.arguments.insert(12, unit.object.path.clone());
     unit.preprocessing_arguments[9] = "/Fi".into();
     unit.preprocessing_arguments
         .insert(10, unit.preprocessed.path.clone());
-    assert_eq!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0)?, 1);
+    assert_eq!(
+        verify_unit(&unit, "clang-cl.exe", 1, &mut Verification::default())?,
+        1
+    );
     Ok(())
 }
 
@@ -286,29 +296,29 @@ fn native_source_closure_clang_cl_rejects_partial_hidden_or_changed_configuratio
         unit.arguments.insert(1, option.into());
         unit.preprocessing_arguments.insert(1, option.into());
         assert!(
-            verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err(),
+            verify_unit(&unit, "clang-cl.exe", 1, &mut Verification::default()).is_err(),
             "{option}"
         );
     }
     for position in [8, 9, 10, 11, 12] {
         let mut unit = clang_cl_unit(&scratch)?;
         unit.arguments.remove(position);
-        assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+        assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut Verification::default()).is_err());
     }
     let mut unit = clang_cl_unit(&scratch)?;
     unit.preprocessing_arguments[4] = "/clang:-march=armv8-a".into();
-    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut Verification::default()).is_err());
     let mut unit = clang_cl_unit(&scratch)?;
     unit.arguments.insert(1, format!("/Fo{}", unit.object.path));
-    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut Verification::default()).is_err());
     let mut unit = clang_cl_unit(&scratch)?;
     unit.arguments.push(unit.source.clone());
-    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut Verification::default()).is_err());
     let mut unit = clang_cl_unit(&scratch)?;
     let extra = scratch.file("additional.c", b"int hidden;\n")?;
     unit.arguments.insert(1, extra.path.clone());
     unit.preprocessing_arguments.insert(1, extra.path);
-    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang-cl.exe", 1, &mut Verification::default()).is_err());
     Ok(())
 }
 
@@ -346,11 +356,14 @@ fn recursive_unit(scratch: &Scratch) -> Result<Unit, Box<dyn std::error::Error>>
 fn native_source_closure_recursive_generation_binds_transitive_bytes() -> TestResult {
     let scratch = Scratch::new()?;
     let unit = recursive_unit(&scratch)?;
-    assert_eq!(verify_unit(&unit, "clang", 2, &mut 0)?, 2);
+    assert_eq!(
+        verify_unit(&unit, "clang", 2, &mut Verification::default())?,
+        2
+    );
     // This source is not a compiler dependency or direct generator input. Its
     // bytes still determine the intermediate that produced the included header.
     fs::write(scratch.0.join("value.txt"), b"8\n")?;
-    assert!(verify_unit(&unit, "clang", 2, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 2, &mut Verification::default()).is_err());
     Ok(())
 }
 
@@ -360,7 +373,7 @@ fn native_source_closure_recursive_generation_rejects_missing_or_failed_steps() 
     let unit = scratch.unit()?;
     // Legacy immediate-input captures retain their old scope; they cannot stand
     // in for the stricter recursive schema merely by changing the version.
-    assert!(verify_unit(&unit, "clang", 2, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 2, &mut Verification::default()).is_err());
     let mut unit = recursive_unit(&scratch)?;
     let generation = unit.inputs[1]
         .generation
@@ -374,7 +387,7 @@ fn native_source_closure_recursive_generation_rejects_missing_or_failed_steps() 
         .as_mut()
         .ok_or("Missing nested generation")?
         .exit_code = Some(1);
-    assert!(verify_unit(&unit, "clang", 2, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 2, &mut Verification::default()).is_err());
     let mut unit = recursive_unit(&scratch)?;
     let generation = unit.inputs[1]
         .generation
@@ -384,14 +397,14 @@ fn native_source_closure_recursive_generation_rejects_missing_or_failed_steps() 
         return Err("Missing intermediate fixture".into());
     };
     intermediate.generation = None;
-    assert!(verify_unit(&unit, "clang", 2, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 2, &mut Verification::default()).is_err());
     let mut unit = recursive_unit(&scratch)?;
     unit.inputs[1]
         .generation
         .as_mut()
         .ok_or("Missing generation")?
         .working_directory = None;
-    assert!(verify_unit(&unit, "clang", 2, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 2, &mut Verification::default()).is_err());
     Ok(())
 }
 
@@ -416,7 +429,7 @@ fn native_source_closure_recursive_generation_rejects_ancestor_aliases() -> Test
         origin: Origin::Source,
         generation: None,
     })];
-    assert!(verify_unit(&unit, "clang", 2, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 2, &mut Verification::default()).is_err());
     let mut unit = recursive_unit(&scratch)?;
     let object = scratch.file("source.obj", b"independent object identity")?;
     let generation = unit.inputs[1]
@@ -435,7 +448,7 @@ fn native_source_closure_recursive_generation_rejects_ancestor_aliases() -> Test
         origin: Origin::Source,
         generation: None,
     })];
-    assert!(verify_unit(&unit, "clang", 2, &mut 0).is_err());
+    assert!(verify_unit(&unit, "clang", 2, &mut Verification::default()).is_err());
     Ok(())
 }
 
@@ -588,21 +601,21 @@ fn native_source_closure_inventory_rejects_omitted_extra_changed_and_duplicate_u
 {
     let scratch = Scratch::new()?;
     let mut manifest = inventory_manifest(&scratch)?;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     let entry = compilation(&manifest.units[0]);
     database(&scratch, &mut manifest, &serde_json::json!([entry]))?;
-    super::verify_compilation_database(&manifest, &mut 0)?;
+    super::verify_compilation_database(&manifest, &mut Verification::default())?;
     database(&scratch, &mut manifest, &serde_json::json!([]))?;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     database(&scratch, &mut manifest, &serde_json::json!([entry, entry]))?;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     let mut changed = entry.clone();
     changed["arguments"]
         .as_array_mut()
         .ok_or("Missing arguments")?
         .push("-DOTHER_CONFIGURATION=1".into());
     database(&scratch, &mut manifest, &serde_json::json!([changed]))?;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     database(&scratch, &mut manifest, &serde_json::json!([entry]))?;
     // The count alone is insufficient: repeated invocations cannot fill a
     // missing distinct configuration even when the translation unit is shared.
@@ -628,17 +641,22 @@ fn native_source_closure_inventory_rejects_omitted_extra_changed_and_duplicate_u
     second
         .preprocessing_arguments
         .push("-DOTHER_CONFIGURATION=1".into());
-    verify_unit(&second, &manifest.compiler.path, 3, &mut 0)?;
+    verify_unit(
+        &second,
+        &manifest.compiler.path,
+        3,
+        &mut Verification::default(),
+    )?;
     manifest.units.push(second);
     database(&scratch, &mut manifest, &serde_json::json!([entry, entry]))?;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     let second_entry = compilation(&manifest.units[1]);
     database(
         &scratch,
         &mut manifest,
         &serde_json::json!([second_entry, entry]),
     )?;
-    super::verify_compilation_database(&manifest, &mut 0)?;
+    super::verify_compilation_database(&manifest, &mut Verification::default())?;
     Ok(())
 }
 
@@ -650,7 +668,7 @@ fn native_source_closure_inventory_rejects_shell_output_tamper_and_legacy_claims
     let mut changed = entry.clone();
     changed["output"] = manifest.units[0].preprocessed.path.clone().into();
     database(&scratch, &mut manifest, &serde_json::json!([changed]))?;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     let mut changed = entry.clone();
     changed
         .as_object_mut()
@@ -658,13 +676,13 @@ fn native_source_closure_inventory_rejects_shell_output_tamper_and_legacy_claims
         .remove("arguments");
     changed["command"] = "clang source.c -o source.obj".into();
     database(&scratch, &mut manifest, &serde_json::json!([changed]))?;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     database(&scratch, &mut manifest, &serde_json::json!([entry]))?;
     manifest.schema_version = 2;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     manifest.schema_version = 3;
     fs::write(scratch.0.join("compile_commands.json"), b"[]")?;
-    assert!(super::verify_compilation_database(&manifest, &mut 0).is_err());
+    assert!(super::verify_compilation_database(&manifest, &mut Verification::default()).is_err());
     Ok(())
 }
 
