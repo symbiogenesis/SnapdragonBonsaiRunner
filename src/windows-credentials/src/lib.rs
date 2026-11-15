@@ -129,8 +129,8 @@ impl RetainedCredential {
         validate_read_path(path)?;
         let mut reader = fs::OpenOptions::new()
             .read(true)
-            .share_mode(1) // FILE_SHARE_READ; deny write and delete sharing.
-            .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT.
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ) // Deny write/delete sharing.
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         let metadata = reader.metadata()?;
         if !metadata.is_file()
@@ -288,11 +288,13 @@ fn validate_path_inner(path: &Path, check_root: bool) -> io::Result<()> {
         .ok_or_else(|| invalid("Path must be valid Unicode."))?;
     let normalized = spelling.replace('/', "\\");
     let normalized = normalized.trim_end_matches('\\');
-    let bytes = normalized.as_bytes();
-    if bytes.len() <= 3
-        || !bytes[0].is_ascii_alphabetic()
-        || bytes[1] != b':'
-        || bytes[2] != b'\\'
+    let &[drive, b':', b'\\', ..] = normalized.as_bytes() else {
+        return Err(invalid(
+            "Use an expanded absolute local-drive path below the drive root.",
+        ));
+    };
+    if normalized.len() <= 3
+        || !drive.is_ascii_alphabetic()
         || normalized.contains(['\0', '%'])
         || normalized[2..].contains(':')
     {
@@ -338,20 +340,22 @@ fn reserved_component(component: &str) -> bool {
         .split('.')
         .next()
         .unwrap_or_default()
-        .trim_end_matches(' ')
-        .to_ascii_uppercase();
-    matches!(
-        base.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) || base
-        .strip_prefix("COM")
-        .or_else(|| base.strip_prefix("LPT"))
-        .is_some_and(|suffix| {
-            // Win32 also treats ISO-8859-1 superscript 1, 2 and 3 as
-            // device digits, including when followed by an extension.
-            (suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
-                || matches!(suffix, "\u{b9}" | "\u{b2}" | "\u{b3}")
-        })
+        .trim_end_matches(' ');
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|reserved| base.eq_ignore_ascii_case(reserved))
+        || base
+            .get(..3)
+            .filter(|prefix| {
+                prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT")
+            })
+            .and_then(|_| base.get(3..))
+            .is_some_and(|suffix| {
+                // Win32 also treats ISO-8859-1 superscript 1, 2 and 3 as
+                // device digits, including when followed by an extension.
+                matches!(suffix.as_bytes(), [b'1'..=b'9'])
+                    || matches!(suffix, "\u{b9}" | "\u{b2}" | "\u{b3}")
+            })
 }
 
 fn check_existing(path: &Path) -> io::Result<bool> {

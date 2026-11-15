@@ -3,7 +3,8 @@
 use std::{ffi::c_void, io, ptr, ptr::NonNull};
 
 use windows_sys::Win32::Security::Cryptography::{
-    BCRYPT_SHA256_ALG_HANDLE, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptHashData,
+    BCRYPT_SHA256_ALG_HANDLE, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptHash,
+    BCryptHashData,
 };
 
 /// A streaming SHA-256 hash using the Windows CNG provider's CPU dispatch.
@@ -70,6 +71,29 @@ impl Sha256 {
     /// # Errors
     /// Returns a provider allocation, update or finalization failure.
     pub fn digest_bytes(bytes: &[u8]) -> io::Result<[u8; 32]> {
+        if let Ok(length) = u32::try_from(bytes.len()) {
+            let mut digest = [0_u8; 32];
+            let input = if bytes.is_empty() {
+                ptr::null()
+            } else {
+                bytes.as_ptr()
+            };
+            // SAFETY: BCRYPT_SHA256_ALG_HANDLE is the OS SHA-256 pseudo-handle,
+            // input is readable for length bytes (or null when empty), and
+            // digest is writable for the exact 32-byte SHA-256 output size.
+            check(unsafe {
+                BCryptHash(
+                    BCRYPT_SHA256_ALG_HANDLE,
+                    ptr::null(),
+                    0,
+                    input,
+                    length,
+                    digest.as_mut_ptr(),
+                    32,
+                )
+            })?;
+            return Ok(digest);
+        }
         let mut hasher = Self::new()?;
         for chunk in bytes.chunks(0x4000_0000) {
             hasher.update(chunk)?;
@@ -113,11 +137,25 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert_eq!(
+            super::super::hex(&Sha256::digest_bytes(b"")?),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
             digest(&[b"", b"a", b"", b"bc", b""])?,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
+            super::super::hex(&Sha256::digest_bytes(b"abc")?),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
             digest(&[b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"])?,
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            super::super::hex(&Sha256::digest_bytes(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )?),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
         let block = [b'a'; 1000];

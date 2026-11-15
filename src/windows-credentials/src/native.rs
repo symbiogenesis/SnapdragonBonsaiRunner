@@ -2,12 +2,14 @@
 //! and descriptor buffers, atomic ACL creation, CSPRNG, and volatile scrubbing.
 
 use std::ffi::c_void;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr::{self, NonNull};
+use std::sync::OnceLock;
 use std::sync::atomic::{Ordering, compiler_fence};
 use windows_sys::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
@@ -22,16 +24,17 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, EqualSid,
     GetAce, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorOwner, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+    GetSecurityDescriptorOwner, GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
     PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-    TokenIsAppContainer, TokenUser,
+    TokenIsAppContainer, TokenUser, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, GetDriveTypeW,
-    OPEN_EXISTING, READ_CONTROL,
+    READ_CONTROL,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE};
 
 pub(super) const REPARSE_ATTRIBUTE: u32 = FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -61,9 +64,9 @@ pub(super) struct Security(Allocation);
 
 impl Security {
     pub(super) fn new(directory: bool) -> io::Result<Self> {
-        let owner = current_sid()?;
+        let (owner, is_system) = current_sid()?;
         let inheritance = if directory { "OICI" } else { "" };
-        let system = if owner == "S-1-5-18" {
+        let system = if is_system {
             String::new()
         } else {
             format!("(A;{inheritance};FA;;;SY)")
@@ -87,9 +90,9 @@ impl Security {
         Ok(Self(Allocation::from_raw(descriptor)?))
     }
 
-    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+    const fn attributes(&self) -> SECURITY_ATTRIBUTES {
         SECURITY_ATTRIBUTES {
-            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or_default(),
+            nLength: win_size::<SECURITY_ATTRIBUTES>(),
             lpSecurityDescriptor: self.0.pointer(),
             bInheritHandle: 0,
         }
@@ -117,7 +120,7 @@ impl Security {
             ));
         }
         let actual = Allocation::from_raw(descriptor)?;
-        verify_descriptors(self.0.pointer(), actual.pointer())
+        verify_descriptors(&self.0, &actual)
     }
 }
 
@@ -134,6 +137,10 @@ fn current_token() -> io::Result<OwnedHandle> {
 }
 
 pub(super) fn is_app_container() -> io::Result<bool> {
+    static APP_CONTAINER: OnceLock<bool> = OnceLock::new();
+    if let Some(&cached) = APP_CONTAINER.get() {
+        return Ok(cached);
+    }
     let token = current_token()?;
     let mut value = 0_u32;
     let mut returned = 0_u32;
@@ -156,10 +163,12 @@ pub(super) fn is_app_container() -> io::Result<bool> {
             "Windows returned an invalid container token flag.",
         ));
     }
-    Ok(value != 0)
+    let flag = value != 0;
+    let _ = APP_CONTAINER.set(flag);
+    Ok(flag)
 }
 
-fn current_sid() -> io::Result<String> {
+fn current_sid() -> io::Result<(String, bool)> {
     let token = current_token()?;
     let mut bytes = 0;
     // SAFETY: the null/zero buffer requests its required length; token is live.
@@ -198,6 +207,8 @@ fn current_sid() -> io::Result<String> {
     }
     // SAFETY: successful TokenUser query initialized an aligned TOKEN_USER.
     let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    // SAFETY: user.User.Sid points to a valid SID inside the live TokenUser buffer.
+    let is_system = unsafe { IsWellKnownSid(user.User.Sid, WinLocalSystemSid) } != 0;
     let mut sid = ptr::null_mut();
     // SAFETY: the SID pointer refers into the still-live token information buffer.
     if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut sid) } == 0 {
@@ -215,9 +226,9 @@ fn current_sid() -> io::Result<String> {
     }
     // SAFETY: the scanned prefix is inside the live NUL-terminated allocation.
     let result = String::from_utf16(unsafe { std::slice::from_raw_parts(sid, length) })
-        .map_err(io::Error::other);
+        .map_err(io::Error::other)?;
     drop(allocation);
-    result
+    Ok((result, is_system))
 }
 
 fn descriptor_parts(descriptor: PSECURITY_DESCRIPTOR) -> io::Result<(*mut c_void, *mut ACL)> {
@@ -248,7 +259,7 @@ fn ace_count(acl: *mut ACL) -> io::Result<u32> {
         GetAclInformation(
             acl,
             (&raw mut information).cast(),
-            u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).unwrap_or_default(),
+            win_size::<ACL_SIZE_INFORMATION>(),
             AclSizeInformation,
         )
     } == 0
@@ -258,33 +269,31 @@ fn ace_count(acl: *mut ACL) -> io::Result<u32> {
     Ok(information.AceCount)
 }
 
-fn ace_bytes(acl: *mut ACL, index: u32) -> io::Result<Vec<u8>> {
+fn ace_bytes<'a>(_owner: &'a Allocation, acl: *mut ACL, index: u32) -> io::Result<&'a [u8]> {
     let mut ace = ptr::null_mut();
-    // SAFETY: index is bounded by the ACL's returned ACE count; acl is live.
+    // SAFETY: index is bounded by the ACL's returned ACE count; acl stays live
+    // for at least `'a` because its owning Allocation is borrowed by `_owner`.
     if unsafe { GetAce(acl, index, &raw mut ace) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: GetAce returns a complete ACE beginning with an aligned ACE_HEADER.
     let header = unsafe { &*ace.cast::<ACE_HEADER>() };
     // SAFETY: the valid ACE's header gives the complete in-ACL byte length.
-    Ok(
-        unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), usize::from(header.AceSize)) }
-            .to_vec(),
-    )
+    Ok(unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), usize::from(header.AceSize)) })
 }
 
-fn verify_descriptors(
-    expected: PSECURITY_DESCRIPTOR,
-    actual: PSECURITY_DESCRIPTOR,
-) -> io::Result<()> {
+fn verify_descriptors(expected: &Allocation, actual: &Allocation) -> io::Result<()> {
     let mut control = 0;
     let mut revision = 0;
     // SAFETY: actual is a live OS-returned descriptor; output slots are valid.
-    if unsafe { GetSecurityDescriptorControl(actual, &raw mut control, &raw mut revision) } == 0 {
+    if unsafe {
+        GetSecurityDescriptorControl(actual.pointer(), &raw mut control, &raw mut revision)
+    } == 0
+    {
         return Err(io::Error::last_os_error());
     }
-    let (expected_owner, expected_dacl) = descriptor_parts(expected)?;
-    let (actual_owner, actual_dacl) = descriptor_parts(actual)?;
+    let (expected_owner, expected_dacl) = descriptor_parts(expected.pointer())?;
+    let (actual_owner, actual_dacl) = descriptor_parts(actual.pointer())?;
     // SAFETY: both owner SID pointers come from live valid descriptors.
     if control & SE_DACL_PROTECTED == 0 || unsafe { EqualSid(expected_owner, actual_owner) } == 0 {
         return Err(io::Error::other(
@@ -298,7 +307,7 @@ fn verify_descriptors(
         ));
     }
     for index in 0..count {
-        if ace_bytes(expected_dacl, index)? != ace_bytes(actual_dacl, index)? {
+        if ace_bytes(expected, expected_dacl, index)? != ace_bytes(actual, actual_dacl, index)? {
             return Err(io::Error::other(
                 "Credential DACL differs from the requested access rules.",
             ));
@@ -314,8 +323,8 @@ fn wide(path: &Path) -> Vec<u16> {
 pub(super) fn validate_local_drive(root: &Path) -> io::Result<()> {
     let root = wide(root);
     // SAFETY: root is a live NUL-terminated absolute drive root.
-    // DRIVE_REMOVABLE=2, DRIVE_FIXED=3, DRIVE_RAMDISK=6 (WinBase.h).
-    if matches!(unsafe { GetDriveTypeW(root.as_ptr()) }, 2 | 3 | 6) {
+    let drive_type = unsafe { GetDriveTypeW(root.as_ptr()) };
+    if matches!(drive_type, DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_RAMDISK) {
         Ok(())
     } else {
         Err(super::invalid(
@@ -355,34 +364,35 @@ pub(super) fn create_file(path: &Path, security: &Security) -> io::Result<File> 
 }
 
 pub(super) fn open_reader(path: &Path, directory: bool) -> io::Result<File> {
-    let path = wide(path);
     let flags = FILE_FLAG_OPEN_REPARSE_POINT
         | if directory {
             FILE_FLAG_BACKUP_SEMANTICS
         } else {
             FILE_ATTRIBUTE_NORMAL
         };
-    // SAFETY: path is live and NUL-terminated. No inheritable attributes are
-    // supplied. Share-read denies subsequent write/delete opens while held.
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            GENERIC_READ | READ_CONTROL,
-            FILE_SHARE_READ,
-            ptr::null(),
-            OPEN_EXISTING,
-            flags,
-            ptr::null_mut(),
-        )
-    };
-    let file = file_from_handle(handle)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .access_mode(GENERIC_READ | READ_CONTROL)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(flags)
+        .open(path)?;
     if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(super::invalid("Credential object became a reparse point."));
     }
     Ok(file)
 }
 
-use std::os::windows::fs::MetadataExt;
+const fn win_size<T>() -> u32 {
+    // Fixed Win32 structures here are far smaller than u32::MAX.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::as_conversions,
+        reason = "Fixed Win32 structure sizes fit in their u32 byte-count fields."
+    )]
+    {
+        size_of::<T>() as u32
+    }
+}
 
 fn file_from_handle(handle: *mut c_void) -> io::Result<File> {
     if handle == INVALID_HANDLE_VALUE {
