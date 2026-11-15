@@ -493,13 +493,12 @@ async fn initial_owner(
         adapter_request_budget_expired(profile, evidence, report);
         false
     });
-    let prefix = if boundaries
-        && deadline.saturating_duration_since(tokio::time::Instant::now()) > NEXT_OWNER_RESERVE
-    {
-        cancellation_before_deadline(port, &credential, evidence, deadline, report).await
-    } else {
-        None
-    };
+    let prefix =
+        if boundaries && bonsai_broker::deadline::remaining_until(deadline) > NEXT_OWNER_RESERVE {
+            cancellation_before_deadline(port, &credential, evidence, deadline, report).await
+        } else {
+            None
+        };
     if let Some((_, text)) = &prefix {
         report["serviceIntegrationWorkload"]["terminalObservedBeforeStop"] = json!(text.is_none());
     }
@@ -553,7 +552,7 @@ async fn fresh_owner(
     previous_credential: &str,
     report: &mut Value,
 ) -> bool {
-    if deadline.saturating_duration_since(tokio::time::Instant::now()) <= NEXT_OWNER_RESERVE {
+    if bonsai_broker::deadline::remaining_until(deadline) <= NEXT_OWNER_RESERVE {
         report["serviceIntegrationWorkload"]["pendingReason"] =
             json!("insufficient-fresh-owner-and-cleanup-reserve");
         save_acceptance_report(evidence, report);

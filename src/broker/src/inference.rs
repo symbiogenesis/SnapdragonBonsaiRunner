@@ -176,10 +176,7 @@ struct File {
 }
 
 fn hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    crate::configuration::hex(value.as_bytes(), length)
 }
 
 fn release(input: &str) -> Result<ReleasePin, LaunchError> {

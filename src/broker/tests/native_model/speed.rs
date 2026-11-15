@@ -147,7 +147,7 @@ async fn paired_requests(
 ) {
     power::begin(report);
     for profile in [&SERIAL, &PQ2_ADAPTER_ROW4_PROFILE] {
-        if deadline.saturating_duration_since(tokio::time::Instant::now()) <= NEXT_OWNER_RESERVE {
+        if bonsai_broker::deadline::remaining_until(deadline) <= NEXT_OWNER_RESERVE {
             report["pendingReason"] = json!("insufficient-next-owner-and-cleanup-reserve");
             save_acceptance_report(evidence, report);
             break;
@@ -396,7 +396,7 @@ fn native_speed_profile_shares_deadline_and_rejects_extra_workloads() {
         );
         assert!(!started);
         assert_eq!(
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            bonsai_broker::deadline::remaining_until(deadline),
             STOP_WAIT
         );
     });

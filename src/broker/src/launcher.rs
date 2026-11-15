@@ -696,23 +696,25 @@ impl LaunchConfig {
         let process =
             self.start_process(&specification, &artifacts, adapter.as_ref(), &credentials)?;
         startup_timing.phase(StartupPhase::AuthenticatedReadiness);
-        let startup = wait_ready(
+        let models = match wait_ready_models(
             &process,
             self.backend_port,
             credentials.backend_key(),
             specification.memory_limit_bytes,
             shutdown,
         )
-        .await;
-        if let Err(error) = startup {
-            note_startup_failure(StartupStage::AuthenticatedReadiness, error, &process);
-            process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-            return Err(error);
-        }
+        .await
+        {
+            Ok(models) => models,
+            Err(error) => {
+                note_startup_failure(StartupStage::AuthenticatedReadiness, error, &process);
+                process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+                return Err(error);
+            }
+        };
         if self.native_engine {
             startup_timing.phase(StartupPhase::NativeIdentity);
-            self.confirm_native_identity(&process, &credentials, context_tokens)
-                .await?;
+            self.confirm_native_identity(&process, &models, context_tokens)?;
         }
         startup_timing.phase(StartupPhase::FrontendBinding);
         let service = self
@@ -764,21 +766,26 @@ impl LaunchConfig {
         Ok(service)
     }
 
-    async fn confirm_native_identity(
+    fn confirm_native_identity(
         &self,
         process: &OwnedProcess,
-        credentials: &PrivateCredentials,
+        models: &[u8],
         context_tokens: usize,
     ) -> Result<(), LaunchError> {
-        if !native_identity(
-            self.backend_port,
-            credentials.backend_key(),
-            process.id(),
-            self,
-            context_tokens,
-        )
-        .await
-        {
+        let valid = crate::inference::pinned_version().is_ok_and(|version| {
+            validate_native_identity(
+                models,
+                self.uses_repacked_ptq1(),
+                self.use_abliterate_lora,
+                WorkerReadiness::for_version(&version, self.native_row_workers)
+                    .with_prompt_reuse(self.latest_prompt_reuse)
+                    .with_kv_cache(self.kv_cache)
+                    .with_placement(self.placement)
+                    .with_context_tokens(context_tokens),
+            )
+            .is_ok()
+        });
+        if !valid {
             note_startup_failure(StartupStage::NativeIdentity, LaunchError::Backend, process);
             process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
             return Err(LaunchError::Backend);
@@ -1017,25 +1024,24 @@ fn owner(process: &OwnedProcess, port: u16) -> Result<(), LaunchError> {
     Ok(())
 }
 
-async fn wait_ready(
+async fn wait_ready_models(
     process: &OwnedProcess,
     port: u16,
     key: &str,
     limit: usize,
     shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<(), LaunchError> {
+) -> Result<Vec<u8>, LaunchError> {
     let startup = async {
         loop {
             guard(process, limit)?;
             match listener_process_id(port).map_err(|_| LaunchError::Backend)? {
                 Some(pid) if pid != process.id() => return Err(LaunchError::Backend),
-                Some(_)
-                    if healthy(port, key, process.id()).await
-                        && authenticated(port, key, process.id()).await =>
-                {
-                    owner(process, port)?;
-                    guard(process, limit)?;
-                    return Ok(());
+                Some(_) if healthy(port, process.id()).await => {
+                    if let Some(models) = authenticated_models(port, key, process.id()).await {
+                        owner(process, port)?;
+                        guard(process, limit)?;
+                        return Ok(models);
+                    }
                 }
                 _ => {}
             }
@@ -1056,45 +1062,31 @@ async fn wait_ready(
     .await
 }
 
-async fn healthy(port: u16, key: &str, process_id: u32) -> bool {
-    timeout(
-        Duration::from_secs(1),
-        health_exchange(port, key, process_id),
-    )
-    .await
-    .is_ok_and(|result| result.is_ok())
-}
-
-async fn native_identity(
+#[cfg(test)]
+async fn wait_ready(
+    process: &OwnedProcess,
     port: u16,
     key: &str,
-    process_id: u32,
-    config: &LaunchConfig,
-    context_tokens: usize,
-) -> bool {
-    timeout(Duration::from_secs(2), async {
-        let version = crate::inference::pinned_version()
-            .map_err(|_| io::Error::other("native runtime pin mismatch"))?;
-        validate_native_identity(
-            &exchange(port, "/v1/models", Some(key), process_id).await?,
-            config.uses_repacked_ptq1(),
-            config.use_abliterate_lora,
-            WorkerReadiness::for_version(&version, config.native_row_workers)
-                .with_prompt_reuse(config.latest_prompt_reuse)
-                .with_kv_cache(config.kv_cache)
-                .with_placement(config.placement)
-                .with_context_tokens(context_tokens),
-        )
-    })
-    .await
-    .is_ok_and(|result| result.is_ok())
+    limit: usize,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<(), LaunchError> {
+    wait_ready_models(process, port, key, limit, shutdown)
+        .await
+        .map(|_| ())
 }
 
-async fn health_exchange(port: u16, key: &str, process_id: u32) -> io::Result<()> {
-    validate_health(&exchange(port, "/health", Some(key), process_id).await?)
+async fn healthy(port: u16, process_id: u32) -> bool {
+    timeout(Duration::from_secs(1), health_exchange(port, process_id))
+        .await
+        .is_ok_and(|result| result.is_ok())
 }
 
-async fn authenticated(port: u16, key: &str, process_id: u32) -> bool {
+async fn health_exchange(port: u16, process_id: u32) -> io::Result<()> {
+    // /health is public in the pinned engine; avoid sending the bearer secret needlessly.
+    validate_health(&exchange(port, "/health", None, process_id).await?)
+}
+
+async fn authenticated_models(port: u16, key: &str, process_id: u32) -> Option<Vec<u8>> {
     timeout(Duration::from_secs(2), async {
         // /health is public in the pinned engine. A protected endpoint must
         // reject missing credentials and accept this newly generated key.
@@ -1106,10 +1098,16 @@ async fn authenticated(port: u16, key: &str, process_id: u32) -> bool {
         if !models.get("data").is_some_and(serde_json::Value::is_array) {
             return Err(io::Error::other("Backend authentication probe failed."));
         }
-        Ok::<(), io::Error>(())
+        Ok::<Vec<u8>, io::Error>(allowed)
     })
     .await
-    .is_ok_and(|result| result.is_ok())
+    .ok()
+    .and_then(Result::ok)
+}
+
+#[cfg(test)]
+async fn authenticated(port: u16, key: &str, process_id: u32) -> bool {
+    authenticated_models(port, key, process_id).await.is_some()
 }
 
 async fn exchange(
@@ -1175,25 +1173,17 @@ fn validate_response(bytes: &[u8], status: u16) -> io::Result<&[u8]> {
     {
         return Err(invalid());
     }
-    let mut length = None;
-    let mut content_type = None;
-    for header in response.headers {
-        if header.name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err(invalid());
-        }
-        if header.name.eq_ignore_ascii_case("content-length") {
-            if length.is_some() {
-                return Err(invalid());
-            }
-            length = Some(crate::wire::content_length(header.value).map_err(|_| invalid())?);
-        }
-        if header.name.eq_ignore_ascii_case("content-type") {
-            if content_type.is_some() {
-                return Err(invalid());
-            }
-            content_type = Some(header.value);
-        }
+    let headers = &*response.headers;
+    if crate::wire::has_header(headers, "transfer-encoding") {
+        return Err(invalid());
     }
+    let length = crate::wire::singleton_slice(headers, "content-length")
+        .map_err(|_| invalid())?
+        .map(crate::wire::content_length)
+        .transpose()
+        .map_err(|_| invalid())?;
+    let content_type =
+        crate::wire::singleton_slice(headers, "content-type").map_err(|_| invalid())?;
     let body = &bytes[head..];
     if body.len() > 4096
         || length != Some(body.len())

@@ -131,7 +131,7 @@ fn owned_ready_backend_stops_with_service() -> io::Result<()> {
             Ok(())
         );
         assert_eq!(listener_process_id(port)?, Some(process.id()));
-        assert!(healthy(port, credentials.backend_key(), process.id()).await);
+        assert!(healthy(port, process.id()).await);
         assert!(authenticated(port, credentials.backend_key(), process.id()).await);
         let wrong_key = if credentials.backend_key().starts_with('0') {
             "1".repeat(64)

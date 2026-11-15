@@ -25,27 +25,14 @@ use tokio::{
     time::{Instant, Sleep, sleep, timeout},
 };
 
-// Synthetic, intentionally different public and backend credentials.
-const CLIENT_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const BACKEND_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+mod support;
+use support::{BACKEND_KEY, CLIENT_KEY, deadline, run};
+
 const COUNT: &[u8] = br#"{"input_tokens":100,"object":"response.input_tokens"}"#;
 const CONTEXT_ERROR: &[u8] = br#"{"error":{"code":"context_length_exceeded"}}"#;
 
-fn run(test: impl Future<Output = ()>) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap()
-        .block_on(test);
-}
-
 fn policy() -> BackendPolicy {
     BackendPolicy::new(8081, BACKEND_KEY).unwrap()
-}
-
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_mins(1)
 }
 
 fn pending(stream: bool) -> PendingChat {

@@ -456,7 +456,7 @@ async fn paired_responses(
 }
 
 fn can_start_owner(deadline: tokio::time::Instant) -> bool {
-    deadline.saturating_duration_since(tokio::time::Instant::now()) > NEXT_OWNER_RESERVE
+    bonsai_broker::deadline::remaining_until(deadline) > NEXT_OWNER_RESERVE
 }
 
 fn record_cpu_placement(sample: &mut Value, verified: bool) {
@@ -896,7 +896,7 @@ fn native_representation_profile_is_explicit_and_keeps_original_deadline() {
         );
         assert!(!started);
         assert_eq!(
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            bonsai_broker::deadline::remaining_until(deadline),
             STOP_WAIT
         );
     });
@@ -1008,7 +1008,7 @@ fn native_representation_profiles_leave_skipped_arms_pending_at_original_deadlin
                     "insufficient-next-owner-and-cleanup-reserve"
                 );
                 assert_eq!(
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    bonsai_broker::deadline::remaining_until(deadline),
                     NEXT_OWNER_RESERVE
                 );
                 let retained: Value =

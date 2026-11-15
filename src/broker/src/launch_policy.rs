@@ -7,7 +7,7 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::LazyLock,
 };
 
 const LOCK_JSON: &str = include_str!("../../../config/runtime.lock.json");
@@ -272,6 +272,13 @@ impl LaunchPlan {
 
 // Struct deserialization rejects duplicate and unknown fields. Object wrappers
 // also reject Serde's positional-array representation at every object boundary.
+// Avoid `#[serde(flatten)]` here because flattening buffers keys and weakens duplicate rejection.
+fn parse_json_object<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, PolicyError> {
+    let super::Object(value): super::Object<T> =
+        serde_json::from_str(input).map_err(|_| PolicyError::Configuration)?;
+    Ok(value)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Pins {
@@ -282,6 +289,56 @@ pub(crate) struct Pins {
     fallback: super::Object<Fallback>,
     qualification: super::Object<Qualification>,
 }
+
+#[derive(PartialEq, Eq)]
+struct ModelPinFields<'a> {
+    repository: &'a str,
+    revision: &'a str,
+    filename: &'a str,
+    bytes: u64,
+    sha256: &'a str,
+    digest_source: &'a str,
+    license: &'a str,
+    architecture: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelPinCommon {
+    repository: String,
+    revision: String,
+    filename: String,
+    bytes: u64,
+    sha256: String,
+    digest_source: String,
+    license: String,
+    architecture: String,
+}
+
+impl ModelPinCommon {
+    fn fields(&self) -> ModelPinFields<'_> {
+        ModelPinFields {
+            repository: &self.repository,
+            revision: &self.revision,
+            filename: &self.filename,
+            bytes: self.bytes,
+            sha256: &self.sha256,
+            digest_source: &self.digest_source,
+            license: &self.license,
+            architecture: &self.architecture,
+        }
+    }
+
+    fn into_artifact(self) -> ModelArtifact {
+        ModelArtifact {
+            revision: self.revision,
+            filename: self.filename,
+            bytes: self.bytes,
+            sha256: self.sha256,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ModelPin {
@@ -295,6 +352,31 @@ pub(crate) struct ModelPin {
     architecture: String,
     expected_metadata: super::Object<Metadata>,
 }
+
+impl ModelPin {
+    fn fields(&self) -> ModelPinFields<'_> {
+        ModelPinFields {
+            repository: &self.repository,
+            revision: &self.revision,
+            filename: &self.filename,
+            bytes: self.bytes,
+            sha256: &self.sha256,
+            digest_source: &self.digest_source,
+            license: &self.license,
+            architecture: &self.architecture,
+        }
+    }
+
+    fn into_artifact(self) -> ModelArtifact {
+        ModelArtifact {
+            revision: self.revision,
+            filename: self.filename,
+            bytes: self.bytes,
+            sha256: self.sha256,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Metadata {
@@ -309,6 +391,20 @@ struct Metadata {
     ssm_group_count: u32,
     ssm_convolution_kernel: u32,
 }
+
+#[derive(PartialEq, Eq)]
+struct RuntimePinFields<'a> {
+    repository: &'a str,
+    commit: &'a str,
+    release: &'a str,
+    license: &'a str,
+    asset_filename: &'a str,
+    asset_bytes: u64,
+    asset_sha256: &'a str,
+    asset_url: &'a str,
+    asset_digest_source: &'a str,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimePin {
@@ -318,6 +414,23 @@ pub(crate) struct RuntimePin {
     license: String,
     pub(crate) asset: super::Object<AssetPin>,
 }
+
+impl RuntimePin {
+    fn fields(&self) -> RuntimePinFields<'_> {
+        RuntimePinFields {
+            repository: &self.repository,
+            commit: &self.commit,
+            release: &self.release,
+            license: &self.license,
+            asset_filename: &self.asset.filename,
+            asset_bytes: self.asset.bytes,
+            asset_sha256: &self.asset.sha256,
+            asset_url: &self.asset.url,
+            asset_digest_source: &self.asset.digest_source,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AssetPin {
@@ -369,57 +482,46 @@ pub(crate) struct ModelArtifact {
 }
 
 pub(crate) fn reviewed_pins(profile: LaunchProfile) -> Result<ReviewedPins, PolicyError> {
-    static REFERENCE_CPU: OnceLock<Result<ReviewedPins, PolicyError>> = OnceLock::new();
-    static SWIFT_PQ2: OnceLock<Result<ReviewedPins, PolicyError>> = OnceLock::new();
-    let cached = match profile {
-        LaunchProfile::ReferenceCpu => REFERENCE_CPU.get_or_init(|| {
-            let pins = parse_pins(LOCK_JSON)?;
-            validate_profile(PROFILE_JSON)?;
-            Ok(ReviewedPins {
-                model: ModelArtifact {
-                    revision: pins.model.0.revision,
-                    filename: pins.model.0.filename,
-                    bytes: pins.model.0.bytes,
-                    sha256: pins.model.0.sha256,
-                },
-                runtime: pins.runtime,
-            })
-        }),
-        LaunchProfile::SwiftPq2Assessment => {
-            SWIFT_PQ2.get_or_init(|| parse_swift_pins(SWIFT_LOCK_JSON))
-        }
-    };
-    cached.clone()
+    static REFERENCE_CPU: LazyLock<Result<ReviewedPins, PolicyError>> = LazyLock::new(|| {
+        let pins = parse_pins(LOCK_JSON)?;
+        validate_profile(PROFILE_JSON)?;
+        Ok(ReviewedPins {
+            model: pins.model.0.into_artifact(),
+            runtime: pins.runtime,
+        })
+    });
+    static SWIFT_PQ2: LazyLock<Result<ReviewedPins, PolicyError>> =
+        LazyLock::new(|| parse_swift_pins(SWIFT_LOCK_JSON));
+    match profile {
+        LaunchProfile::ReferenceCpu => REFERENCE_CPU.clone(),
+        LaunchProfile::SwiftPq2Assessment => SWIFT_PQ2.clone(),
+    }
+}
+
+fn select_ptq1(profile: LaunchProfile) -> Result<SelectedModel, PolicyError> {
+    let lock = serde_json::from_str(SWIFT_LOCK_JSON).map_err(|_| PolicyError::Configuration)?;
+    let evidence =
+        serde_json::from_str(PTQ1_EXPORT_JSON).map_err(|_| PolicyError::Configuration)?;
+    let selected =
+        bonsai_cpu_policy::select_artifact(&lock, profile.cpu_profile(), true, Some(&evidence))
+            .map_err(|_| PolicyError::Configuration)?;
+    serde_json::from_value(selected).map_err(|_| PolicyError::Configuration)
 }
 
 pub(crate) fn reviewed_pins_for_representation(
     profile: LaunchProfile,
     use_repacked_ptq1: bool,
 ) -> Result<ReviewedPins, PolicyError> {
-    static PTQ1_REFERENCE_CPU: OnceLock<Result<SelectedModel, PolicyError>> = OnceLock::new();
-    static PTQ1_SWIFT_PQ2: OnceLock<Result<SelectedModel, PolicyError>> = OnceLock::new();
+    static PTQ1_REFERENCE_CPU: LazyLock<Result<SelectedModel, PolicyError>> =
+        LazyLock::new(|| select_ptq1(LaunchProfile::ReferenceCpu));
+    static PTQ1_SWIFT_PQ2: LazyLock<Result<SelectedModel, PolicyError>> =
+        LazyLock::new(|| select_ptq1(LaunchProfile::SwiftPq2Assessment));
     let mut pins = reviewed_pins(profile)?;
     if use_repacked_ptq1 {
-        let cache = match profile {
-            LaunchProfile::ReferenceCpu => &PTQ1_REFERENCE_CPU,
-            LaunchProfile::SwiftPq2Assessment => &PTQ1_SWIFT_PQ2,
+        let selected = match profile {
+            LaunchProfile::ReferenceCpu => PTQ1_REFERENCE_CPU.clone()?,
+            LaunchProfile::SwiftPq2Assessment => PTQ1_SWIFT_PQ2.clone()?,
         };
-        let selected = cache
-            .get_or_init(|| {
-                let lock = serde_json::from_str(SWIFT_LOCK_JSON)
-                    .map_err(|_| PolicyError::Configuration)?;
-                let evidence = serde_json::from_str(PTQ1_EXPORT_JSON)
-                    .map_err(|_| PolicyError::Configuration)?;
-                let selected = bonsai_cpu_policy::select_artifact(
-                    &lock,
-                    profile.cpu_profile(),
-                    true,
-                    Some(&evidence),
-                )
-                .map_err(|_| PolicyError::Configuration)?;
-                serde_json::from_value(selected).map_err(|_| PolicyError::Configuration)
-            })
-            .clone()?;
         pins.model.filename = selected.filename;
         pins.model.bytes = selected.bytes;
         pins.model.sha256 = selected.sha256;
@@ -440,21 +542,9 @@ struct SelectedModel {
 struct SwiftPins {
     schema_version: u8,
     decision: String,
-    model: super::Object<SwiftModelPin>,
+    model: super::Object<ModelPinCommon>,
     runtime: super::Object<RuntimePin>,
     qualification: super::Object<SwiftQualification>,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SwiftModelPin {
-    repository: String,
-    revision: String,
-    filename: String,
-    bytes: u64,
-    sha256: String,
-    digest_source: String,
-    license: String,
-    architecture: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -469,33 +559,33 @@ struct SwiftQualification {
 }
 
 fn parse_swift_pins(input: &str) -> Result<ReviewedPins, PolicyError> {
-    let super::Object(pins): super::Object<SwiftPins> =
-        serde_json::from_str(input).map_err(|_| PolicyError::Configuration)?;
-    let m = &pins.model;
-    let r = &pins.runtime;
+    let pins: SwiftPins = parse_json_object(input)?;
     let q = &pins.qualification;
     if pins.schema_version != 1
         || pins.decision != "docs/swift-memory.md"
-        || m.repository != "ukisai/Swift-Bonsai-2-GGUF"
-        || m.revision != "a3bdac086bbb6b04d87d0108d18943b5f63868f7"
-        || m.filename != "Swift-Bonsai-2-PQ2_0.gguf"
-        || m.bytes != 7_206_168_928
-        || m.sha256 != "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5"
-        || m.digest_source
-            != "https://huggingface.co/api/models/ukisai/Swift-Bonsai-2-GGUF/revision/a3bdac086bbb6b04d87d0108d18943b5f63868f7?blobs=true"
-        || m.license != "Apache-2.0"
-        || m.architecture != "qwen35"
-        || r.repository != "https://github.com/PrismML-Eng/llama.cpp.git"
-        || r.commit != "73bfe6cc485554822f80c473a3c0c4f25e80f41b"
-        || r.release != "prism-b10787-73bfe6c"
-        || r.license != "MIT"
-        || r.asset.filename != "llama-prism-b10787-73bfe6c-bin-win-cpu-arm64.zip"
-        || r.asset.bytes != 12_412_126
-        || r.asset.sha256 != "cc808b33d35c72a3bd5c69a0d609d422426feb9dce23868e77992b6c33b8ddb3"
-        || r.asset.url
-            != "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10787-73bfe6c/llama-prism-b10787-73bfe6c-bin-win-cpu-arm64.zip"
-        || r.asset.digest_source
-            != "https://api.github.com/repos/PrismML-Eng/llama.cpp/releases/tags/prism-b10787-73bfe6c"
+        || pins.model.fields()
+            != (ModelPinFields {
+                repository: "ukisai/Swift-Bonsai-2-GGUF",
+                revision: "a3bdac086bbb6b04d87d0108d18943b5f63868f7",
+                filename: "Swift-Bonsai-2-PQ2_0.gguf",
+                bytes: 7_206_168_928,
+                sha256: "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
+                digest_source: "https://huggingface.co/api/models/ukisai/Swift-Bonsai-2-GGUF/revision/a3bdac086bbb6b04d87d0108d18943b5f63868f7?blobs=true",
+                license: "Apache-2.0",
+                architecture: "qwen35",
+            })
+        || pins.runtime.fields()
+            != (RuntimePinFields {
+                repository: "https://github.com/PrismML-Eng/llama.cpp.git",
+                commit: "73bfe6cc485554822f80c473a3c0c4f25e80f41b",
+                release: "prism-b10787-73bfe6c",
+                license: "MIT",
+                asset_filename: "llama-prism-b10787-73bfe6c-bin-win-cpu-arm64.zip",
+                asset_bytes: 12_412_126,
+                asset_sha256: "cc808b33d35c72a3bd5c69a0d609d422426feb9dce23868e77992b6c33b8ddb3",
+                asset_url: "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10787-73bfe6c/llama-prism-b10787-73bfe6c-bin-win-cpu-arm64.zip",
+                asset_digest_source: "https://api.github.com/repos/PrismML-Eng/llama.cpp/releases/tags/prism-b10787-73bfe6c",
+            })
         || q.purpose != "owner-prioritized Swift memory and exact ternary repacking assessment"
         || q.model_download != "verified-size-and-sha256-2026-10-23"
         || q.full_gguf_inspection != "config/swift.metadata.json"
@@ -508,35 +598,29 @@ fn parse_swift_pins(input: &str) -> Result<ReviewedPins, PolicyError> {
         return Err(PolicyError::Configuration);
     }
     Ok(ReviewedPins {
-        model: ModelArtifact {
-            revision: pins.model.0.revision,
-            filename: pins.model.0.filename,
-            bytes: pins.model.0.bytes,
-            sha256: pins.model.0.sha256,
-        },
+        model: pins.model.0.into_artifact(),
         runtime: pins.runtime,
     })
 }
 
 fn parse_pins(input: &str) -> Result<Pins, PolicyError> {
-    let super::Object(pins): super::Object<Pins> =
-        serde_json::from_str(input).map_err(|_| PolicyError::Configuration)?;
-    let m = &pins.model;
-    let r = &pins.runtime;
-    let metadata = &m.expected_metadata;
+    let pins: Pins = parse_json_object(input)?;
+    let metadata = &pins.model.expected_metadata;
     let f = &pins.fallback;
     let q = &pins.qualification;
     if pins.schema_version != 1
         || pins.decision != "docs/model-selection.md"
-        || m.repository != "unsloth/Qwen3.8-27B-GGUF"
-        || m.revision != "4ca720788d1e01f1bff70c033e0d0028fd02e502"
-        || m.filename != "Qwen3.8-27B-UD-Q3_K_XL.gguf"
-        || m.bytes != 13_146_393_504
-        || m.sha256 != "8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e"
-        || m.digest_source
-            != "https://huggingface.co/api/models/unsloth/Qwen3.8-27B-GGUF/revision/4ca720788d1e01f1bff70c033e0d0028fd02e502?blobs=true"
-        || m.license != "Apache-2.0"
-        || m.architecture != "qwen35"
+        || pins.model.fields()
+            != (ModelPinFields {
+                repository: "unsloth/Qwen3.8-27B-GGUF",
+                revision: "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+                filename: "Qwen3.8-27B-UD-Q3_K_XL.gguf",
+                bytes: 13_146_393_504,
+                sha256: "8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e",
+                digest_source: "https://huggingface.co/api/models/unsloth/Qwen3.8-27B-GGUF/revision/4ca720788d1e01f1bff70c033e0d0028fd02e502?blobs=true",
+                license: "Apache-2.0",
+                architecture: "qwen35",
+            })
         || [
             metadata.block_count_including_mtp,
             metadata.mtp_blocks,
@@ -549,17 +633,18 @@ fn parse_pins(input: &str) -> Result<Pins, PolicyError> {
             metadata.ssm_group_count,
             metadata.ssm_convolution_kernel,
         ] != [65, 1, 4, 4, 256, 256, 128, 6144, 16, 4]
-        || r.repository != "https://github.com/ggml-org/llama.cpp.git"
-        || r.commit != "36e36e63a54fc8f85b95e9c499a022b597e478dd"
-        || r.release != "b11840"
-        || r.license != "MIT"
-        || r.asset.filename != "llama-b11840-bin-win-cpu-arm64.zip"
-        || r.asset.bytes != 12_781_980
-        || r.asset.sha256 != "9bfdb90329cd190c8286e5e53ed74391f8455c7cf7a6370725817440dd7ff085"
-        || r.asset.url
-            != "https://github.com/ggml-org/llama.cpp/releases/download/b11840/llama-b11840-bin-win-cpu-arm64.zip"
-        || r.asset.digest_source
-            != "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/b11840"
+        || pins.runtime.fields()
+            != (RuntimePinFields {
+                repository: "https://github.com/ggml-org/llama.cpp.git",
+                commit: "36e36e63a54fc8f85b95e9c499a022b597e478dd",
+                release: "b11840",
+                license: "MIT",
+                asset_filename: "llama-b11840-bin-win-cpu-arm64.zip",
+                asset_bytes: 12_781_980,
+                asset_sha256: "9bfdb90329cd190c8286e5e53ed74391f8455c7cf7a6370725817440dd7ff085",
+                asset_url: "https://github.com/ggml-org/llama.cpp/releases/download/b11840/llama-b11840-bin-win-cpu-arm64.zip",
+                asset_digest_source: "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/b11840",
+            })
         || f.repository != "google/gemma-4-12B-it-qat-q4_0-gguf"
         || f.revision != "29d097773436b69ff9feafd636ab4cf873786537"
         || f.filename != "gemma-4-12b-it-qat-q4_0.gguf"
@@ -605,8 +690,7 @@ struct Profile {
     remaining_gates: Vec<String>,
 }
 fn validate_profile(input: &str) -> Result<(), PolicyError> {
-    let super::Object(p): super::Object<Profile> =
-        serde_json::from_str(input).map_err(|_| PolicyError::Configuration)?;
+    let p: Profile = parse_json_object(input)?;
     if p.schema_version != 1
         || p.name != "reference-cpu"
         || p.status != "development-only-unqualified"

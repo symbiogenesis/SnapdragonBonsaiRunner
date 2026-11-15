@@ -25,21 +25,13 @@ use tokio::{
     time::Instant,
 };
 
-const CLIENT_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const BACKEND_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+mod support;
+use support::{BACKEND_KEY, CLIENT_KEY, run};
+
 const COUNT: &[u8] = br#"{"input_tokens":100,"object":"response.input_tokens"}"#;
 const TEXT: &str = "Keep rain, snow ☃, and the voice.\nNext line.";
 const JSON: &[u8] = "{\"choices\":[{\"text\":\"rain ☃\"}]}".as_bytes();
 const SSE: &[u8] = "data: {\"text\":\"rain ☃\"}\n\ndata: [DONE]\n\n".as_bytes();
-
-fn run(test: impl Future<Output = ()>) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap()
-        .block_on(test);
-}
 
 fn request(stream: bool) -> Vec<u8> {
     let body = serde_json::to_vec(&serde_json::json!({

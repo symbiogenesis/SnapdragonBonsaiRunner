@@ -27,16 +27,8 @@ use tokio::{
     time::{Instant, Sleep, sleep, timeout},
 };
 
-const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-fn run(test: impl Future<Output = ()>) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap()
-        .block_on(test);
-}
+mod support;
+use support::{CLIENT_KEY as KEY, deadline, run};
 
 fn admitted(stream: bool) -> AdmittedChat {
     let body =
@@ -61,10 +53,6 @@ fn admitted(stream: bool) -> AdmittedChat {
         .unwrap()
         .admit(|_| Ok(100))
         .unwrap()
-}
-
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_mins(1)
 }
 
 #[derive(Default)]

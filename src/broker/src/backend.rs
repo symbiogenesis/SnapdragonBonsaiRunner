@@ -121,21 +121,13 @@ where
     let (status, body) =
         exchange(stream, &pending.body, false, COUNT_ROUTE, policy, deadline).await?;
     let context_rejected = status == StatusCode::PAYLOAD_TOO_LARGE;
-    // Read directly into the final allocation, keeping one byte for the
-    // oversized-body probe without allowing unbounded read_to_end growth.
-    let limit = u64::try_from(MAX_COUNT_BYTES + 1).map_err(|_| BackendError::CountSchema)?;
-    let mut body = body.take(limit);
-    let mut bytes = Vec::with_capacity(MAX_COUNT_BYTES + 1);
-    body.read_to_end(&mut bytes).await.map_err(|error| {
-        if error.kind() == io::ErrorKind::TimedOut {
-            BackendError::Deadline
-        } else {
-            BackendError::Body
-        }
-    })?;
-    if bytes.len() > MAX_COUNT_BYTES {
-        return Err(BackendError::CountSchema);
-    }
+    let bytes = read_bounded_body(
+        body,
+        MAX_COUNT_BYTES,
+        MAX_COUNT_BYTES + 1,
+        BackendError::CountSchema,
+    )
+    .await?;
     if context_rejected {
         let Object(rejection): Object<CountRejection<'_>> =
             serde_json::from_slice(&bytes).map_err(|_| BackendError::CountSchema)?;
@@ -194,54 +186,23 @@ struct ResetAck<'a> {
 /// Sends an empty authenticated `POST /reset` without `Content-Type` and requires
 /// a framed `200 OK` JSON `{"status":"ok"}` acknowledgement within `deadline`.
 pub(crate) async fn reset_backend<S>(
-    mut stream: S,
+    stream: S,
     policy: &BackendPolicy,
     deadline: RequestDeadline,
 ) -> Result<(), BackendError>
 where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
-    let write_deadline = deadline.earlier(Instant::now() + WRITE_TIMEOUT);
-    ensure_time(write_deadline)?;
-    let authorization = policy.authorization_str()?;
-    let head = format!(
-        "POST {RESET_ROUTE} HTTP/1.1\r\nHost: {}\r\nAuthorization: {authorization}\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        policy.authority,
-    );
-    write_deadline
-        .timeout(async {
-            stream.write_all(head.as_bytes()).await?;
-            stream.flush().await
-        })
-        .await
-        .map_err(|_| BackendError::Deadline)?
-        .map_err(|_| BackendError::Io)?;
-    ensure_time(write_deadline)?;
-
-    let mut reader = BufReader::with_capacity(8192, stream);
-    let (_, framing) = read_head(&mut reader, false, false, deadline).await?;
-    ensure_time(deadline)?;
-    let body = BackendBody {
-        reader: Some(reader),
-        framing,
-        remaining_budget: MAX_RESPONSE_BYTES,
-        metadata_bytes: 0,
+    let (_, body) = send_exchange::<_, &[u8]>(
+        stream,
+        RequestBody::Empty,
+        false,
+        RESET_ROUTE,
+        policy,
         deadline,
-        timer: deadline.timer(),
-    };
-    let limit = u64::try_from(MAX_COUNT_BYTES + 1).map_err(|_| BackendError::Metadata)?;
-    let mut body = body.take(limit);
-    let mut bytes = Vec::with_capacity(64);
-    body.read_to_end(&mut bytes).await.map_err(|error| {
-        if error.kind() == io::ErrorKind::TimedOut {
-            BackendError::Deadline
-        } else {
-            BackendError::Body
-        }
-    })?;
-    if bytes.len() > MAX_COUNT_BYTES {
-        return Err(BackendError::Metadata);
-    }
+    )
+    .await?;
+    let bytes = read_bounded_body(body, MAX_COUNT_BYTES, 64, BackendError::Metadata).await?;
     let Object(ack): Object<ResetAck<'_>> =
         serde_json::from_slice(&bytes).map_err(|_| BackendError::Metadata)?;
     ensure_time(deadline)?;
@@ -316,9 +277,59 @@ where
     Ok(body)
 }
 
+enum RequestBody<B> {
+    Empty,
+    Json(B),
+}
+
+async fn read_bounded_body<S: AsyncRead + Unpin>(
+    body: BackendBody<S>,
+    max_bytes: usize,
+    initial_capacity: usize,
+    oversize_error: BackendError,
+) -> Result<Vec<u8>, BackendError> {
+    // Keep one sentinel byte past the limit without allowing unbounded read_to_end growth.
+    let limit = u64::try_from(max_bytes + 1).map_err(|_| oversize_error)?;
+    let mut body = body.take(limit);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    body.read_to_end(&mut bytes).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            BackendError::Deadline
+        } else {
+            BackendError::Body
+        }
+    })?;
+    if bytes.len() > max_bytes {
+        return Err(oversize_error);
+    }
+    Ok(bytes)
+}
+
 async fn exchange<S, B: AsRef<[u8]>>(
-    mut stream: S,
+    stream: S,
     body: B,
+    streaming: bool,
+    route: &str,
+    policy: &BackendPolicy,
+    deadline: RequestDeadline,
+) -> Result<(StatusCode, BackendBody<S>), BackendError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    send_exchange(
+        stream,
+        RequestBody::Json(body),
+        streaming,
+        route,
+        policy,
+        deadline,
+    )
+    .await
+}
+
+async fn send_exchange<S, B: AsRef<[u8]>>(
+    mut stream: S,
+    body: RequestBody<B>,
     streaming: bool,
     route: &str,
     policy: &BackendPolicy,
@@ -330,15 +341,21 @@ where
     let write_deadline = deadline.earlier(Instant::now() + WRITE_TIMEOUT);
     ensure_time(write_deadline)?;
     let authorization = policy.authorization_str()?;
+    let (content_type_header, body_bytes) = match &body {
+        RequestBody::Empty => ("", &[][..]),
+        RequestBody::Json(payload) => ("Content-Type: application/json\r\n", payload.as_ref()),
+    };
     let head = format!(
-        "POST {route} HTTP/1.1\r\nHost: {}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        "POST {route} HTTP/1.1\r\nHost: {}\r\nAuthorization: {authorization}\r\n{content_type_header}Accept-Encoding: identity\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
         policy.authority,
-        body.as_ref().len()
+        body_bytes.len()
     );
     write_deadline
         .timeout(async {
             stream.write_all(head.as_bytes()).await?;
-            stream.write_all(body.as_ref()).await?;
+            if !body_bytes.is_empty() {
+                stream.write_all(body_bytes).await?;
+            }
             stream.flush().await
         })
         .await

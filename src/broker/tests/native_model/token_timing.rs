@@ -112,7 +112,7 @@ async fn paired_capture(
 ) {
     power::begin(report);
     for repacked in [false, true] {
-        if deadline.saturating_duration_since(tokio::time::Instant::now()) <= NEXT_OWNER_RESERVE {
+        if bonsai_broker::deadline::remaining_until(deadline) <= NEXT_OWNER_RESERVE {
             report["pendingReason"] = json!("insufficient-next-owner-and-cleanup-reserve");
             break;
         }

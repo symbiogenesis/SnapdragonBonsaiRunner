@@ -21,27 +21,17 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 
-const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+mod support;
+use support::{CLIENT_KEY as KEY, deadline, run};
+
 // Literal JSON whitespace newlines must never be inspected as HTTP head bytes.
 const CHAT: &[u8] = br#"{
     "messages":[{"role":"user","content":"Draft a scene.\nKeep the rain."}],
     "max_completion_tokens":128
 }"#;
 
-fn run(test: impl Future<Output = ()>) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap()
-        .block_on(test);
-}
-
 fn policy() -> RequestPolicy {
     RequestPolicy::new(8080, KEY).unwrap()
-}
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_mins(1)
 }
 
 fn head(length: usize, extra: &str) -> String {

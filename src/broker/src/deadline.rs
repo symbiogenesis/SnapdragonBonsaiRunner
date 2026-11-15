@@ -47,6 +47,12 @@ impl RequestDeadline {
     }
 }
 
+/// Remaining monotonic duration before `deadline`, or zero once reached.
+#[must_use]
+pub fn remaining_until(deadline: Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 impl From<Instant> for RequestDeadline {
     fn from(deadline: Instant) -> Self {
         Self(Some(deadline))

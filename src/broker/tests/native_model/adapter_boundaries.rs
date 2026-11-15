@@ -138,9 +138,7 @@ async fn boundary_requests(
     for &phase in &phases[..required] {
         report["phase"] = json!(phase);
         report["scaleBoundaryWorkload"]["phase"] = json!(phase);
-        if deadline.saturating_duration_since(tokio::time::Instant::now())
-            <= ADAPTER_LIFECYCLE_RESERVE
-        {
+        if bonsai_broker::deadline::remaining_until(deadline) <= ADAPTER_LIFECYCLE_RESERVE {
             report["scaleBoundaryWorkload"]["pendingReason"] =
                 json!("insufficient-request-and-cleanup-reserve");
             save_acceptance_report(evidence, report);

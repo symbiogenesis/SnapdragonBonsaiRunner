@@ -9,18 +9,8 @@ use bonsai_broker::scheduler::{GateError, MAX_WAITING, RequestGate};
 use std::{future::poll_fn, pin::pin, task::Poll, time::Duration};
 use tokio::time::{Instant, advance};
 
-fn run(test: impl Future<Output = ()>) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap()
-        .block_on(test);
-}
-
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_mins(1)
-}
+mod support;
+use support::{deadline, run};
 
 #[test]
 fn waiting_limit_rejects_invalid_configuration() {

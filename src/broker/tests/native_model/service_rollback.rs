@@ -63,11 +63,11 @@ fn rollback_verified(rollback: &Value) -> bool {
 
 fn can_start_rollback(deadline: tokio::time::Instant, report: &Value) -> bool {
     ptq1_owners_reaped(report)
-        && deadline.saturating_duration_since(tokio::time::Instant::now()) > NEXT_OWNER_RESERVE
+        && bonsai_broker::deadline::remaining_until(deadline) > NEXT_OWNER_RESERVE
 }
 
 fn ptq1_service_deadline(deadline: tokio::time::Instant) -> Option<tokio::time::Instant> {
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let remaining = bonsai_broker::deadline::remaining_until(deadline);
     // A successful PTQ1 sequence must still admit its required fresh owner.
     // Reject before loading any model if even that existing floor cannot fit
     // after withholding the original-PQ2 startup/request/cleanup/hash tail.

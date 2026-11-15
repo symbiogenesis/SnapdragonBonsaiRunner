@@ -937,7 +937,7 @@ async fn acceptance(
     history_and_context_acceptance(port, &credential, evidence, report).await;
     let extended_enabled = optional_workload_enabled(
         workloads.extended_history,
-        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        bonsai_broker::deadline::remaining_until(deadline),
     );
     if extended_enabled {
         report["phase"] = json!("bounded-history-and-same-owner-reuse");
@@ -949,7 +949,7 @@ async fn acceptance(
     save_acceptance_report(evidence, report);
     let stalled_enabled = optional_workload_enabled(
         workloads.stalled_consumer,
-        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        bonsai_broker::deadline::remaining_until(deadline),
     );
     let stalled = if stalled_enabled {
         report["phase"] = json!("stalled-consumer-first-content-and-pause");
@@ -1887,9 +1887,7 @@ async fn required_adapter_scale_history(
         "scale-change-back-with-history",
     ] {
         report["scaleHistoryWorkload"]["phase"] = json!(phase);
-        if deadline.saturating_duration_since(tokio::time::Instant::now())
-            <= ADAPTER_LIFECYCLE_RESERVE
-        {
+        if bonsai_broker::deadline::remaining_until(deadline) <= ADAPTER_LIFECYCLE_RESERVE {
             report["scaleHistoryWorkload"]["reason"] = json!("insufficient-owned-cleanup-reserve");
             save_acceptance_report(evidence, report);
             return false;
@@ -2056,7 +2054,7 @@ async fn adapter_work_before_cleanup<T>(
     deadline: tokio::time::Instant,
     work: impl Future<Output = T>,
 ) -> Option<T> {
-    if deadline.saturating_duration_since(tokio::time::Instant::now()) <= STOP_WAIT {
+    if bonsai_broker::deadline::remaining_until(deadline) <= STOP_WAIT {
         return None;
     }
     tokio::time::timeout_at(deadline - STOP_WAIT, work)
@@ -2143,7 +2141,7 @@ async fn adapter_requests(
     // Optional requests share this one aggregate budget; no matrix or restart
     // can continue in another job. Preserve a conservative teardown reserve.
     if profile.optional_requests
-        && deadline.saturating_duration_since(tokio::time::Instant::now()) > OPTIONAL_RESERVE
+        && bonsai_broker::deadline::remaining_until(deadline) > OPTIONAL_RESERVE
     {
         report["phase"] = json!("optional-scale-zero");
         save_acceptance_report(evidence, report);
@@ -2165,7 +2163,7 @@ async fn adapter_requests(
             save_acceptance_report(evidence, report);
             return false;
         }
-        if deadline.saturating_duration_since(tokio::time::Instant::now()) > OPTIONAL_RESERVE {
+        if bonsai_broker::deadline::remaining_until(deadline) > OPTIONAL_RESERVE {
             report["phase"] = json!("optional-invalid-scale-and-reuse");
             save_acceptance_report(evidence, report);
             let mut body =
@@ -3226,7 +3224,7 @@ fn native_adapter_request_budget_drops_inflight_work_before_owned_cleanup() {
             // begins Stop; no request is started inside the cleanup reserve.
             assert!(dropped.get());
             assert_eq!(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                bonsai_broker::deadline::remaining_until(deadline),
                 allowance.min(STOP_WAIT)
             );
         }
@@ -3236,7 +3234,7 @@ fn native_adapter_request_budget_drops_inflight_work_before_owned_cleanup() {
             Some(7)
         );
         assert_eq!(
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            bonsai_broker::deadline::remaining_until(deadline),
             CASE_BUDGET
         );
     });

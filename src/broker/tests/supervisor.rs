@@ -26,25 +26,13 @@ use tokio::{
     time::{Instant, Sleep, sleep_until},
 };
 
-const CLIENT_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const BACKEND_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const COUNT: &[u8] = br#"{"input_tokens":100,"object":"response.input_tokens"}"#;
+mod support;
+use support::{BACKEND_KEY, CLIENT_KEY, deadline, run};
 
-fn run(test: impl Future<Output = ()>) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap()
-        .block_on(test);
-}
+const COUNT: &[u8] = br#"{"input_tokens":100,"object":"response.input_tokens"}"#;
 
 fn policy() -> RequestPolicy {
     RequestPolicy::new(8080, CLIENT_KEY).unwrap()
-}
-
-fn deadline() -> Instant {
-    Instant::now() + Duration::from_mins(1)
 }
 
 fn request(stream: bool) -> Vec<u8> {

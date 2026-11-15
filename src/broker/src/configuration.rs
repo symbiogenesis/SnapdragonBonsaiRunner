@@ -16,9 +16,13 @@ pub(super) fn decimal_u16(value: Option<OsString>) -> Option<u16> {
     value.parse().ok()
 }
 
-pub(super) fn valid_key(bytes: &[u8]) -> bool {
-    bytes.len() == 64
+pub(super) fn hex(bytes: &[u8], length: usize) -> bool {
+    bytes.len() == length
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+pub(super) fn valid_key(bytes: &[u8]) -> bool {
+    hex(bytes, 64)
 }
