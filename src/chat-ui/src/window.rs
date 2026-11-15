@@ -1203,6 +1203,7 @@ impl State {
             import.cancel();
         }
         self.audio_file_active = false;
+        self.audio_file_progress = None;
         if let Some(session) = &self.speech {
             session.set_input_generation(None);
         }

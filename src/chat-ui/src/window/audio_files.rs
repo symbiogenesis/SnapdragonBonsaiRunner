@@ -86,34 +86,28 @@ impl State {
                 "Audio files will be available after speech preparation completes."
                     .clone_into(&mut self.speech_status);
             }
+        } else if let Ok(import) = audio_import::Session::start(source) {
+            // Disjoint from microphone generations and speech's NO_INPUT
+            // sentinel, even after the counter wraps.
+            self.audio_file_generation =
+                self.audio_file_generation.wrapping_add(1) & ((1_u64 << 62) - 1);
+            let generation = (1_u64 << 63) | self.audio_file_generation;
+            if let Some(session) = &self.speech {
+                session.set_input_generation(Some(generation));
+            }
+            self.audio_import = Some(import);
+            self.audio_file_active = true;
+            self.audio_file_error = false;
+            self.audio_file_progress = None;
+            self.microphone_generation = Some(generation);
+            self.dictation_requested = true;
+            self.dictation_finishing = true;
+            "Choose an audio file. Its transcript is inserted at the cursor and sent with your draft when the model is ready; otherwise it stays in the draft. Cancel or Escape stops import."
+                .clone_into(&mut self.speech_status);
+            self.focus_composer = true;
         } else {
-            if self.dictation_requested || self.audio_import.is_some() {
-                self.cancel_microphone();
-            }
-            if let Ok(import) = audio_import::Session::start(source) {
-                // Disjoint from microphone generations and speech's NO_INPUT
-                // sentinel, even after the counter wraps.
-                self.audio_file_generation =
-                    self.audio_file_generation.wrapping_add(1) & ((1_u64 << 62) - 1);
-                let generation = (1_u64 << 63) | self.audio_file_generation;
-                if let Some(session) = &self.speech {
-                    session.set_input_generation(Some(generation));
-                }
-                self.audio_import = Some(import);
-                self.audio_file_active = true;
-                self.audio_file_error = false;
-                self.audio_file_progress = None;
-                self.microphone_generation = Some(generation);
-                self.dictation_requested = true;
-                self.dictation_finishing = true;
-                "Choose an audio file. Its transcript is inserted at the cursor and sent with your draft when the model is ready; otherwise it stays in the draft. Cancel or Escape stops import."
-                    .clone_into(&mut self.speech_status);
-                self.focus_composer = true;
-            } else {
-                self.audio_file_error = true;
-                "Could not open audio input. Your draft was kept."
-                    .clone_into(&mut self.speech_status);
-            }
+            self.audio_file_error = true;
+            "Could not open audio input. Your draft was kept.".clone_into(&mut self.speech_status);
         }
         if self.audio_file_active
             || (self.audio_file_input && self.audio_file_error)
@@ -170,7 +164,7 @@ impl State {
                     .clone_into(&mut self.speech_status);
             }
             Ok(None) => {
-                self.cancel_microphone();
+                self.cancel_audio_file();
                 self.audio_import.take();
                 "No audio file selected. Your draft was kept.".clone_into(&mut self.speech_status);
             }
@@ -181,17 +175,25 @@ impl State {
                 self.audio_file_error = true;
             }
         }
-        self.audio_file_notice = Some(self.speech_status.clone());
+        if self.audio_file_active || self.audio_file_error {
+            self.audio_file_notice = Some(self.speech_status.clone());
+        }
         self.record(&self.speech_status.clone());
     }
 
     pub(super) fn cancel_audio_file(&mut self) {
         self.cancel_microphone();
-        self.audio_file_notice = Some(if self.audio_file_transcript.is_empty() {
-            "Audio transcription cancelled. No message was sent. Your draft was kept.".to_owned()
-        } else {
+        self.audio_file_notice = (!self.audio_file_transcript.is_empty()).then(|| {
             "Audio transcription cancelled. No message was sent. Your draft was kept. The retained transcript is available to view or copy.".to_owned()
         });
+    }
+
+    fn clear_audio_file_status(&mut self) {
+        self.audio_file_notice = None;
+        self.audio_file_transcript.clear();
+        self.audio_file_progress = None;
+        self.audio_file_error = false;
+        self.show_audio_transcript = false;
     }
 
     pub(super) fn fail_audio_file(&mut self, message: &str) {
@@ -262,11 +264,7 @@ impl State {
             .accessible_name("Dismiss audio status")
             .clicked()
         {
-            self.audio_file_notice = None;
-            self.audio_file_transcript.clear();
-            self.audio_file_progress = None;
-            self.audio_file_error = false;
-            self.show_audio_transcript = false;
+            self.clear_audio_file_status();
         }
     }
 
@@ -349,11 +347,7 @@ impl State {
                         .accessible_name("Dismiss audio status")
                         .clicked()
                     {
-                        self.audio_file_notice = None;
-                        self.audio_file_transcript.clear();
-                        self.audio_file_progress = None;
-                        self.audio_file_error = false;
-                        self.show_audio_transcript = false;
+                        self.clear_audio_file_status();
                     }
                 });
             });
@@ -673,20 +667,23 @@ mod tests {
     #[test]
     fn audio_file_failure_cancellation_and_switch_preserve_drafts_and_ignore_late_results()
     -> io::Result<()> {
-        for action in 0..3 {
+        for action in 0..4 {
             let (mut state, _speech_commands, requests) = fixture()?;
             state.model = ModelLifecycle::Ready;
             state.input = "Existing draft".into();
+            state.audio_file_notice = Some("Choose an audio file.".into());
             match action {
                 0 => state
                     .audio_import_result(Err("Unsupported or corrupt audio. Your draft was kept.")),
-                1 => state.cancel_microphone(),
+                1 => state.audio_import_result(Ok(None)),
+                2 => state.cancel_audio_file(),
                 _ => state.new_chat(),
             }
             state.audio_import_result(Ok(Some(chunk(vec![1, 2]))));
             state.accept_transcript(1_u64 << 63, "Late audio transcript");
             assert!(!state.audio_file_active);
-            if action < 2 {
+            assert_eq!(state.audio_file_notice.is_some(), action == 0);
+            if action < 3 {
                 assert_eq!(state.input, "Existing draft");
             } else {
                 assert_eq!(state.input, "");
@@ -775,6 +772,14 @@ mod tests {
     #[test]
     fn audio_file_notice_does_not_replace_later_microphone_recording_feedback() -> io::Result<()> {
         let (mut state, _speech_commands, _requests) = fixture()?;
+        state.audio_file_notice = Some("Recognizing speech".to_owned());
+        state.cancel_audio_file();
+        assert!(state.audio_file_notice.is_none());
+
+        state.audio_file_active = true;
+        state.dictation_requested = true;
+        state.microphone_generation = Some(1_u64 << 63);
+        state.audio_file_part(1_u64 << 63, "First segment");
         state.cancel_audio_file();
         state.dictation_requested = true;
         state.speech_event(speech::Event::Listening(true));
@@ -845,6 +850,8 @@ mod tests {
             assert_eq!(state.audio_file_transcript, "Previous transcript");
             assert_eq!(state.input, "Keep draft");
             assert!(!state.audio_file_active);
+            assert_eq!(state.audio_file_error, rejected);
+            assert!(state.audio_file_notice.is_some());
             assert!(requests.try_recv().is_err());
         }
         let (mut state, speech_commands, requests) = fixture()?;

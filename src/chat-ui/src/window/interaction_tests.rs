@@ -1593,15 +1593,22 @@ fn audio_file_progress_is_generation_bound_and_metadata_never_finishes_import() 
     assert_eq!(app.audio_file_progress, Some(progress));
     assert!(app.audio_file_active);
     app.cancel_audio_file();
-    let cancelled = app.audio_file_notice.clone();
+    assert!(app.audio_file_notice.is_none());
+    assert!(app.audio_file_progress.is_none());
     app.speech_event(speech::Event::FileProgress {
         generation: 7,
         progress: Some(progress),
     });
     app.speech_event(speech::Event::FileFinished { generation: 7 });
-    assert_eq!(app.audio_file_notice, cancelled);
+    assert!(app.audio_file_notice.is_none());
     assert!(app.pending_voice_transcript.is_none());
     assert!(chat.state().commands.try_recv().is_err());
+    chat.run();
+    assert!(chat.query_by_label("Audio transcription").is_none());
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Dismiss audio status")
+            .is_none()
+    );
 }
 
 #[test]
