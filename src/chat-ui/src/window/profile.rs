@@ -160,7 +160,9 @@ fn read(path: &Path) -> io::Result<Option<String>> {
     };
     let sealed = crate::bounded_file::read(file, MAX_SEALED)?
         .ok_or_else(|| io::Error::other("Saved profile exceeds its storage bound."))?;
-    let bytes = bonsai_windows_credentials::unprotect_private_data(&sealed)?;
+    let bytes = crate::scrub::ScrubbingBytes::new(
+        bonsai_windows_credentials::unprotect_private_data(&sealed)?,
+    );
     if bytes.len() > MAX_BYTES {
         return Err(io::Error::other("Saved profile exceeds its size limit."));
     }
@@ -173,11 +175,13 @@ fn read(path: &Path) -> io::Result<Option<String>> {
 
 fn save(path: &Path, voice: &str) -> io::Result<()> {
     bonsai_windows_credentials::validate_external_path(path)?;
-    let bytes = serde_json::to_vec(&Saved {
-        version: 1,
-        voice_profile: voice.to_owned(),
-    })
-    .map_err(io::Error::other)?;
+    let bytes = crate::scrub::ScrubbingBytes::new(
+        serde_json::to_vec(&Saved {
+            version: 1,
+            voice_profile: voice.to_owned(),
+        })
+        .map_err(io::Error::other)?,
+    );
     if voice.chars().count() > VOICE_LIMIT || bytes.len() > MAX_BYTES {
         return Err(io::Error::other("Voice profile exceeds its size limit."));
     }

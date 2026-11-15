@@ -1,254 +1,215 @@
 //! Strict bounded chunk framing for the documented local PCM stream.
 
-use super::{Failure, MAX_HEAD, Result, response_status};
+use super::{Failure, Result};
+use crate::http::{AllowedFraming, BodyPolicy, BodyReader, HeadPolicy, TransportError};
+use std::io;
 
 const MAX_PCM: usize = 48_000 * 2 * 120;
+#[cfg(test)]
 const INVALID: Failure = Failure::Message("The local speech stream was incomplete or invalid.");
+
+struct PcmSource<R, C> {
+    read: R,
+    check: C,
+    failure: Option<Failure>,
+}
+
+impl<R, C> PcmSource<R, C>
+where
+    C: FnMut() -> Result<()>,
+{
+    fn poll(&mut self) -> Result<()> {
+        (self.check)()
+    }
+
+    fn check(&mut self) -> io::Result<()> {
+        if let Err(failure) = (self.check)() {
+            self.failure = Some(failure);
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Local PCM check cancelled",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<R, C> io::Read for PcmSource<R, C>
+where
+    R: FnMut(&mut [u8]) -> Result<usize>,
+    C: FnMut() -> Result<()>,
+{
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        let count = match (self.read)(bytes) {
+            Ok(count) => count,
+            Err(failure) => {
+                self.failure = Some(failure);
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Local PCM read failed",
+                ));
+            }
+        };
+        self.check()?;
+        Ok(count)
+    }
+}
 
 pub(super) fn decode(
     read: impl FnMut(&mut [u8]) -> Result<usize>,
-    mut check: impl FnMut() -> Result<()>,
+    check: impl FnMut() -> Result<()>,
     mut sink: impl FnMut(&[u8]) -> Result<()>,
+    map_error: fn(TransportError) -> Failure,
 ) -> Result<()> {
-    let mut reader = Buffered::new(read);
-    reader.read_head(&mut check)?;
-    let mut total = 0_usize;
+    let stream_error = |transport| {
+        if matches!(transport, TransportError::Status(_)) {
+            map_error(transport)
+        } else {
+            map_error(TransportError::InvalidChunkFraming)
+        }
+    };
+    let head_policy = HeadPolicy {
+        framing: AllowedFraming::ChunkedOnly,
+        require_connection_close: true,
+        allow_htab: false,
+    };
+    let body_policy = BodyPolicy {
+        chunk_line_limit: 10,
+        max_body: MAX_PCM,
+        require_even_chunks: true,
+        require_non_empty: true,
+    };
+    let mut source = PcmSource {
+        read,
+        check,
+        failure: None,
+    };
+    // Run caller cancellation check before initial socket header fill.
+    source.poll()?;
+    let (_head, mut body) = match BodyReader::new(
+        &mut source,
+        16_384,
+        head_policy,
+        |code| {
+            if code == 200 {
+                Ok(MAX_PCM)
+            } else {
+                Err(TransportError::Status(code))
+            }
+        },
+        |_, value| value.eq_ignore_ascii_case(b"audio/pcm"),
+        body_policy,
+    ) {
+        Ok(parts) => parts,
+        Err(transport) => {
+            return Err(source
+                .failure
+                .take()
+                .unwrap_or_else(|| stream_error(transport)));
+        }
+    };
+    let mut carry: Option<u8> = None;
     loop {
-        let mut line = [0; 10];
-        let mut count = 0;
-        while !line[..count].ends_with(b"\r\n") {
-            check()?;
-            if count == line.len() {
-                return Err(INVALID);
+        body.inner_mut().poll()?;
+        match body.next_payload() {
+            Ok(Some(bytes)) => {
+                let mut rest = bytes;
+                if let Some(first) = carry.take()
+                    && let Some((&second, tail)) = rest.split_first()
+                {
+                    sink(&[first, second])?;
+                    rest = tail;
+                }
+                let even = rest.len() & !1;
+                if even != 0 {
+                    sink(&rest[..even])?;
+                }
+                if rest.len() > even {
+                    carry = Some(rest[even]);
+                }
             }
-            line[count] = reader.byte()?;
-            count += 1;
-        }
-        let digits = &line[..count - 2];
-        if digits.is_empty() || !digits.iter().all(u8::is_ascii_hexdigit) {
-            return Err(INVALID);
-        }
-        let length = usize::from_str_radix(std::str::from_utf8(digits).map_err(|_| INVALID)?, 16)
-            .map_err(|_| INVALID)?;
-        if length == 0 {
-            let mut end = [0; 2];
-            reader.exact(&mut end)?;
-            check()?;
-            if end != *b"\r\n" || total == 0 || reader.fill()? {
-                return Err(INVALID);
+            Ok(None) => {
+                if carry.is_some() {
+                    return Err(stream_error(TransportError::InvalidChunkFraming));
+                }
+                return body.verify_eof().map_err(|transport| {
+                    body.inner_mut()
+                        .failure
+                        .take()
+                        .unwrap_or_else(|| stream_error(transport))
+                });
             }
-            check()?;
-            return Ok(());
-        }
-        total = total
-            .checked_add(length)
-            .filter(|&value| value <= MAX_PCM)
-            .ok_or(INVALID)?;
-        if !length.is_multiple_of(2) {
-            return Err(INVALID);
-        }
-        let mut remaining = length;
-        while remaining != 0 {
-            check()?;
-            let samples = reader.pcm(remaining, &mut check)?;
-            sink(samples)?;
-            remaining -= samples.len();
-        }
-        let mut end = [0; 2];
-        reader.exact(&mut end)?;
-        check()?;
-        if end != *b"\r\n" {
-            return Err(INVALID);
-        }
-    }
-}
-
-// Metadata and PCM share the same fixed storage. Byte-at-a-time framing never
-// becomes byte-at-a-time socket I/O, and available audio never waits for a full
-// buffer. The explicit guard in decode still observes cancellation while data
-// is already buffered.
-struct Buffered<F> {
-    read: F,
-    buffer: [u8; 16_384],
-    start: usize,
-    end: usize,
-    sample: [u8; 2],
-}
-
-impl<F: FnMut(&mut [u8]) -> Result<usize>> Buffered<F> {
-    const fn new(read: F) -> Self {
-        Self {
-            read,
-            buffer: [0; 16_384],
-            start: 0,
-            end: 0,
-            sample: [0; 2],
-        }
-    }
-
-    fn fill(&mut self) -> Result<bool> {
-        if self.start == self.end {
-            self.start = 0;
-            self.end = (self.read)(&mut self.buffer)?;
-            if self.end > self.buffer.len() {
-                return Err(INVALID);
+            Err(transport) => {
+                return Err(body
+                    .inner_mut()
+                    .failure
+                    .take()
+                    .unwrap_or_else(|| stream_error(transport)));
             }
         }
-        Ok(self.start != self.end)
-    }
-
-    fn byte(&mut self) -> Result<u8> {
-        if !self.fill()? {
-            return Err(INVALID);
-        }
-        let byte = self.buffer[self.start];
-        self.start += 1;
-        Ok(byte)
-    }
-
-    // Lend only whole PCM16 samples within the current HTTP chunk. Advancing
-    // the cursor before returning keeps framing and refill bookkeeping private;
-    // the borrow prevents another read until the caller finishes with this span.
-    fn pcm(&mut self, maximum: usize, check: &mut impl FnMut() -> Result<()>) -> Result<&[u8]> {
-        if maximum < 2 || !maximum.is_multiple_of(2) || !self.fill()? {
-            return Err(INVALID);
-        }
-        check()?;
-        let count = maximum.min(self.end - self.start) & !1;
-        if count != 0 {
-            let start = self.start;
-            self.start += count;
-            return Ok(&self.buffer[start..self.start]);
-        }
-        // A read can split a single sample. Join only those two bytes, without
-        // waiting for any additional payload or its trailing framing to arrive.
-        let first = self.byte()?;
-        let second = self.byte()?;
-        check()?;
-        self.sample = [first, second];
-        Ok(&self.sample)
-    }
-
-    fn exact(&mut self, bytes: &mut [u8]) -> Result<()> {
-        for byte in bytes {
-            *byte = self.byte()?;
-        }
-        Ok(())
-    }
-
-    fn read_head(&mut self, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
-        check()?;
-        if !self.fill()? {
-            return Err(INVALID);
-        }
-        let available = &self.buffer[self.start..self.end];
-        let bounded = &available[..available.len().min(MAX_HEAD)];
-        if let Some(offset) = memchr::memmem::find(bounded, b"\r\n\r\n") {
-            let end = self.start + offset + 4;
-            let head = &self.buffer[self.start..end];
-            self.start = end;
-            return validate_head(head);
-        }
-        let mut head = Vec::with_capacity(bounded.len());
-        head.extend_from_slice(bounded);
-        self.start += bounded.len();
-        while !head.ends_with(b"\r\n\r\n") {
-            check()?;
-            if head.len() == MAX_HEAD {
-                return Err(INVALID);
-            }
-            head.push(self.byte()?);
-        }
-        validate_head(&head)
-    }
-}
-
-fn validate_head(head: &[u8]) -> Result<()> {
-    if head.iter().enumerate().any(|(i, &byte)| {
-        (byte == b'\n' && (i == 0 || head[i - 1] != b'\r'))
-            || (byte == b'\r' && head.get(i + 1) != Some(&b'\n'))
-    }) {
-        return Err(INVALID);
-    }
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut parsed = httparse::Response::new(&mut headers);
-    if parsed.parse(head).ok() != Some(httparse::Status::Complete(head.len()))
-        || parsed.version != Some(1)
-    {
-        return Err(INVALID);
-    }
-    response_status(parsed.code)?;
-    let mut media = false;
-    let mut chunked = false;
-    let mut close = false;
-    for (i, header) in parsed.headers.iter().enumerate() {
-        if parsed.headers[..i]
-            .iter()
-            .any(|other| other.name.eq_ignore_ascii_case(header.name))
-            || ["content-length", "content-encoding", "trailer", "upgrade"]
-                .iter()
-                .any(|name| header.name.eq_ignore_ascii_case(name))
-            || header.value.iter().any(|&b| b < 32 || b == 127)
-        {
-            return Err(INVALID);
-        }
-        if header.name.eq_ignore_ascii_case("content-type") {
-            media = header.value.eq_ignore_ascii_case(b"audio/pcm");
-        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = header.value.eq_ignore_ascii_case(b"chunked");
-        } else if header.name.eq_ignore_ascii_case("connection") {
-            close = header.value.eq_ignore_ascii_case(b"close");
-        }
-    }
-    if media && chunked && close {
-        Ok(())
-    } else {
-        Err(INVALID)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Buffered, Failure, INVALID, MAX_PCM, decode};
+    use super::{Failure, INVALID, MAX_PCM};
+    use crate::canary::map_asr_transport;
     use std::{cell::Cell, io::Read};
 
     const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: audio/pcm\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
 
+    fn decode(
+        read: impl FnMut(&mut [u8]) -> super::Result<usize>,
+        check: impl FnMut() -> super::Result<()>,
+        sink: impl FnMut(&[u8]) -> super::Result<()>,
+    ) -> super::Result<()> {
+        super::decode(read, check, sink, map_asr_transport)
+    }
+
     #[test]
-    fn pcm_span_lends_ready_samples_without_consuming_chunk_framing() -> Result<(), Failure> {
-        let mut source = b"\x01\x80\r\n".as_slice();
-        let reads = Cell::new(0);
-        let mut reader = Buffered::new(|bytes: &mut [u8]| {
-            reads.set(reads.get() + 1);
-            source.read(bytes).map_err(|_| Failure::Cancelled)
-        });
-        let buffer = reader.buffer.as_ptr();
-        let span = reader.pcm(2, &mut || Ok(()))?;
-        assert_eq!(span, [1, 128]);
-        assert_eq!(span.as_ptr(), buffer);
-        assert_eq!(reads.get(), 1);
-        let mut ending = [0; 2];
-        reader.exact(&mut ending)?;
-        assert_eq!(ending, *b"\r\n");
-        assert_eq!(reads.get(), 1);
-        assert_eq!(reader.pcm(2, &mut || Ok(())), Err(INVALID));
-        assert_eq!(reads.get(), 2);
-        Ok(())
+    fn pcm_span_lends_ready_samples_without_consuming_chunk_framing() {
+        let bytes = [HEAD, b"2\r\n\x01\x80"].concat();
+        let mut reader = bytes.as_slice();
+        let mut delivered = Vec::new();
+        let result = decode(
+            |data| reader.read(data).map_err(|_| Failure::Cancelled),
+            || Ok(()),
+            |chunk| {
+                delivered.extend_from_slice(chunk);
+                Ok(())
+            },
+        );
+        assert_eq!(delivered, [1, 128]);
+        assert_eq!(result, Err(INVALID));
     }
 
     #[test]
     fn pcm_split_sample_observes_cancellation_before_refill() {
+        let bytes = [HEAD, b"2\r\n\x01"].concat();
+        let mut reader = bytes.as_slice();
         let reads = Cell::new(0);
-        let mut reader = Buffered::new(|bytes: &mut [u8]| {
-            reads.set(reads.get() + 1);
-            bytes[0] = 1;
-            Ok(1)
-        });
-        assert_eq!(
-            reader.pcm(2, &mut || Err(Failure::Cancelled)),
-            Err(Failure::Cancelled)
+        let cancelled = Cell::new(false);
+        let result = decode(
+            |data| {
+                reads.set(reads.get() + 1);
+                let count = reader.read(data).map_err(|_| Failure::Cancelled)?;
+                if count == 0 {
+                    cancelled.set(true);
+                }
+                Ok(count)
+            },
+            || {
+                if cancelled.get() {
+                    Err(Failure::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
         );
-        assert_eq!(reads.get(), 1);
+        assert_eq!(result, Err(Failure::Cancelled));
+        assert_eq!(reads.get(), 2);
     }
 
     #[test]

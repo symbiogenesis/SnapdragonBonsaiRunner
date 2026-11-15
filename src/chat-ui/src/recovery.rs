@@ -21,7 +21,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEALED: u64 = 8 * 1024 * 1024 + 65_536;
 
 enum Command {
-    Save(u64, Vec<u8>, SnapshotSlot),
+    Save(u64, crate::scrub::ScrubbingBytes, SnapshotSlot),
     Erase(u64),
     Fence(SyncSender<()>),
     Shutdown,
@@ -100,7 +100,7 @@ pub(crate) struct Recovery {
 
 pub(crate) struct Opened {
     pub(crate) store: Recovery,
-    pub(crate) saved: Option<Vec<u8>>,
+    pub(crate) saved: Option<crate::scrub::ScrubbingBytes>,
     pub(crate) load_failed: bool,
     pub(crate) saving_disabled: bool,
 }
@@ -191,7 +191,7 @@ impl Recovery {
         let Some(slot) = SnapshotSlot::reserve(&self.snapshot_occupied) else {
             return Ok(false);
         };
-        let bytes = encode()?;
+        let bytes = crate::scrub::ScrubbingBytes::new(encode()?);
         if bytes.is_empty() || bytes.len() > MAX_BYTES {
             return Ok(false);
         }
@@ -350,7 +350,7 @@ fn set_saving_disabled(lock: &mut File, disabled: bool) -> io::Result<()> {
     lock.sync_all()
 }
 
-fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
+fn read(path: &Path) -> io::Result<Option<crate::scrub::ScrubbingBytes>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -363,7 +363,9 @@ fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
     let sealed = crate::bounded_file::read(file, MAX_SEALED)?
         .ok_or_else(|| io::Error::other("Saved conversations exceed their storage bound."))?;
-    bonsai_windows_credentials::unprotect_private_data(&sealed).map(Some)
+    bonsai_windows_credentials::unprotect_private_data(&sealed)
+        .map(crate::scrub::ScrubbingBytes::new)
+        .map(Some)
 }
 
 fn save(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
@@ -468,7 +470,10 @@ mod tests {
             store.events.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(Event::Saved(_))
         ));
-        assert_eq!(read(&path)?, Some(b"New unsaved private draft".to_vec()));
+        assert_eq!(
+            read(&path)?.as_deref(),
+            Some(b"New unsaved private draft".as_slice())
+        );
         drop(store);
         fs::remove_file(path)?;
         fs::remove_file(directory.join("chat-recovery.lock"))?;
@@ -558,7 +563,7 @@ mod tests {
         else {
             return Err(io::Error::other("Expected the final workspace."));
         };
-        assert_eq!(bytes, b"Final workspace");
+        assert_eq!(&*bytes, b"Final workspace");
         Ok(())
     }
 
@@ -629,14 +634,14 @@ mod tests {
             store.events.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(Event::Saved(_))
         ));
-        assert_eq!(read(&path)?, Some(text));
+        assert_eq!(read(&path)?.as_deref(), Some(text.as_slice()));
         let replacement = b"Revised draft".to_vec();
         store.finish_with(|| Some(replacement.clone()));
         assert!(matches!(
             store.events.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(Event::Saved(_))
         ));
-        assert_eq!(read(&path)?, Some(replacement));
+        assert_eq!(read(&path)?.as_deref(), Some(replacement.as_slice()));
         assert!(store.erase());
         assert!(matches!(
             store.events.recv_timeout(std::time::Duration::from_secs(5)),

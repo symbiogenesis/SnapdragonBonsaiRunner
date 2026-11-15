@@ -1215,7 +1215,9 @@ mod tests {
         assert!(state.workspace_bytes().is_err());
         drop(state);
         assert_eq!(std::fs::read(&path)?, valid);
-        let plain = bonsai_windows_credentials::unprotect_private_data(&valid)?;
+        let plain = crate::scrub::ScrubbingBytes::new(
+            bonsai_windows_credentials::unprotect_private_data(&valid)?,
+        );
         let mut recovered = self::state();
         recovered.restore_workspace(&plain)?;
         assert_eq!(recovered.input, "Last valid draft");

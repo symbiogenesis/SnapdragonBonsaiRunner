@@ -14,8 +14,8 @@ use serde::Deserialize;
 use std::{
     borrow::Cow,
     collections::HashSet,
-    io::{IoSlice, Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
+    io::{IoSlice, Read},
+    net::TcpStream,
     path::PathBuf,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -27,7 +27,8 @@ const CLIP_SECONDS: u32 = 30;
 const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_RESPONSE: usize = 64 * 1024;
 const MAX_WAVE_RESPONSE: usize = 5_760_044;
-const MAX_HEAD: usize = 16 * 1024;
+#[cfg(test)]
+const MAX_HEAD: usize = crate::http::MAX_HEAD;
 const MAX_TEXT: usize = 32768;
 const IO_POLL: Duration = Duration::from_millis(250);
 const CONNECT_POLL: Duration = Duration::from_millis(50);
@@ -208,9 +209,10 @@ impl Client {
                 Some(&content_type),
                 &body.parts(),
                 call,
+                map_asr_transport,
             )?
         };
-        let response = read_response(&mut stream, call, Media::Json)?;
+        let response = read_response(&mut stream, call, Media::Json, map_asr_transport)?;
         call.check()?;
         let transcript: Transcript<'_> = serde_json::from_slice(&response).map_err(|_| {
             Failure::Message("The Qwen3-ASR companion returned an invalid transcription.")
@@ -240,50 +242,53 @@ impl Client {
         expected: Media,
         call: &Call<'_>,
     ) -> Result<Vec<u8>> {
-        let mut stream = self.connection(method, route, content_type, body, call)?;
-        read_response(&mut stream, call, expected)
-    }
-
-    pub(crate) fn stream_pcm(
-        &self,
-        body: &[u8],
-        call: &Call<'_>,
-        sink: impl FnMut(&[u8]) -> Result<()>,
-    ) -> Result<()> {
-        let mut stream = self.connection(
-            "POST",
-            "/v1/audio/speech",
-            Some("application/json"),
+        self.exchange_with(
+            method,
+            route,
+            content_type,
             body,
+            expected,
             call,
-        )?;
-        pcm::decode(
-            |bytes| loop {
-                call.check()?;
-                let result = stream.read(bytes);
-                call.check()?;
-                match result {
-                    Ok(count) => break Ok(count),
-                    Err(error) if retry_poll(&error) => {}
-                    Err(_) => {
-                        break Err(Failure::Message("The local speech stream was interrupted."));
-                    }
-                }
-            },
-            || call.check(),
-            sink,
+            map_asr_transport,
         )
     }
 
-    fn connection(
+    pub(crate) fn exchange_with(
         &self,
         method: &str,
         route: &str,
         content_type: Option<&str>,
         body: &[u8],
+        expected: Media,
         call: &Call<'_>,
-    ) -> Result<TcpStream> {
-        self.connection_parts(method, route, content_type, &[body], call)
+        map_error: fn(crate::http::TransportError) -> Failure,
+    ) -> Result<Vec<u8>> {
+        let mut stream =
+            self.connection_parts(method, route, content_type, &[body], call, map_error)?;
+        read_response(&mut stream, call, expected, map_error)
+    }
+
+    pub(crate) fn stream_pcm_with(
+        &self,
+        body: &[u8],
+        call: &Call<'_>,
+        map_error: fn(crate::http::TransportError) -> Failure,
+        sink: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut stream = self.connection_parts(
+            "POST",
+            "/v1/audio/speech",
+            Some("application/json"),
+            &[body],
+            call,
+            map_error,
+        )?;
+        pcm::decode(
+            |bytes| read(&mut stream, bytes, call, map_error, true),
+            || call.check(),
+            sink,
+            map_error,
+        )
     }
 
     fn connection_parts(
@@ -293,41 +298,47 @@ impl Client {
         content_type: Option<&str>,
         body: &[&[u8]],
         call: &Call<'_>,
+        map_error: fn(crate::http::TransportError) -> Failure,
     ) -> Result<TcpStream> {
         call.check()?;
-        let length = request_length(body).ok_or(Failure::Message(
-            "The Qwen3-ASR request exceeded its size limit.",
-        ))?;
+        let length = request_length(body)
+            .ok_or_else(|| map_error(crate::http::TransportError::UploadSize))?;
         // One header and at most four multipart slices fit on the stack. Windows
         // gathers these borrowed slices in WSASend, without a second PCM copy.
         let mut buffers = [IoSlice::new(&[]); 5];
         let Some(buffers) = buffers.get_mut(..body.len() + 1) else {
-            return Err(Failure::Message(
-                "The Qwen3-ASR request exceeded its size limit.",
-            ));
+            return Err(map_error(crate::http::TransportError::UploadSize));
         };
-        let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port));
         let timeout = IO_POLL.min(call.until.saturating_duration_since(Instant::now()));
-        let mut stream = connect_cancellable(address, timeout, call)?;
+        let mut stream = crate::http::connect_loopback(
+            self.port,
+            timeout,
+            "canary-connect",
+            || CONNECT_POLL.min(call.until.saturating_duration_since(Instant::now())),
+            || call.check(),
+        )
+        .map_err(|error| map_http(error, map_error))?;
         call.check()?;
         stream
             .set_nodelay(true)
             .and_then(|()| stream.set_read_timeout(Some(IO_POLL)))
             .and_then(|()| stream.set_write_timeout(Some(IO_POLL)))
-            .map_err(|_| Failure::Message("Could not configure the Qwen3-ASR connection."))?;
-        let media =
-            content_type.map_or_else(String::new, |media| format!("Content-Type: {media}\r\n"));
-        let head = format!(
-            "{method} {route} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nContent-Length: {}\r\n{media}Connection: close\r\n\r\n",
+            .map_err(|_| map_error(crate::http::TransportError::Configure))?;
+        let head = crate::http::bearer_request_head(
+            method,
+            route,
             self.port,
             self.key.as_hex(),
-            length
+            content_type,
+            true,
+            length,
         );
-        buffers[0] = IoSlice::new(head.as_bytes());
+        buffers[0] = IoSlice::new(&head);
         for (buffer, part) in buffers[1..].iter_mut().zip(body) {
             *buffer = IoSlice::new(part);
         }
-        write_all_vectored(&mut stream, buffers, call)?;
+        crate::http::write_all_vectored(&mut stream, buffers, || call.check(), || call.check())
+            .map_err(|error| map_http(error, map_error))?;
         Ok(stream)
     }
 }
@@ -633,215 +644,160 @@ fn request_length(parts: &[&[u8]]) -> Option<usize> {
     })
 }
 
+fn map_http(
+    error: crate::http::Error<Failure>,
+    map_error: fn(crate::http::TransportError) -> Failure,
+) -> Failure {
+    match error {
+        crate::http::Error::Interrupted(failure) => failure,
+        crate::http::Error::Transport(transport) => map_error(transport),
+    }
+}
+
+pub(super) const fn map_asr_transport(error: crate::http::TransportError) -> Failure {
+    use crate::http::TransportError;
+    Failure::Message(match error {
+        TransportError::Status(code) => return response_status(Some(code)),
+        TransportError::Connect => "Could not connect to the local Qwen3-ASR companion.",
+        TransportError::Configure => "Could not configure the Qwen3-ASR connection.",
+        TransportError::UploadSize => "The Qwen3-ASR request exceeded its size limit.",
+        TransportError::UploadClosed => "The Qwen3-ASR connection closed during upload.",
+        TransportError::UploadInterrupted => "The Qwen3-ASR upload was interrupted.",
+        TransportError::HeadOverflow => "The Qwen3-ASR response header exceeded its limit.",
+        TransportError::InvalidHead
+        | TransportError::DuplicateHeader
+        | TransportError::UnsupportedEncoding
+        | TransportError::UnsupportedMedia
+        | TransportError::InvalidLength
+        | TransportError::UnsupportedFraming
+        | TransportError::UnexpectedStatus => {
+            "The Qwen3-ASR companion returned unsupported HTTP framing."
+        }
+        TransportError::ResponseClosed => {
+            "The Qwen3-ASR response ended before its framing completed."
+        }
+        TransportError::ResponseInterrupted => "The Qwen3-ASR response was interrupted.",
+        TransportError::LengthExceeded => "The Qwen3-ASR response exceeded its declared length.",
+        TransportError::Allocation => "Could not allocate the bounded local speech response.",
+        TransportError::LineOverflow
+        | TransportError::InvalidChunkEnding
+        | TransportError::InvalidChunkFraming
+        | TransportError::InvalidChunkSize
+        | TransportError::BodyLimitExceeded
+        | TransportError::UnsupportedTrailers
+        | TransportError::TrailingBytes => "The local speech stream was incomplete or invalid.",
+    })
+}
+
+#[cfg(test)]
 fn write_all_vectored(
-    stream: &mut impl Write,
-    mut buffers: &mut [IoSlice<'_>],
+    stream: &mut impl std::io::Write,
+    buffers: &mut [IoSlice<'_>],
     call: &Call<'_>,
 ) -> Result<()> {
-    IoSlice::advance_slices(&mut buffers, 0);
-    while !buffers.is_empty() {
-        call.check()?;
-        let result = stream.write_vectored(buffers);
-        call.check()?;
-        match result {
-            Ok(0) => {
-                return Err(Failure::Message(
-                    "The Qwen3-ASR connection closed during upload.",
-                ));
-            }
-            Ok(count) => IoSlice::advance_slices(&mut buffers, count),
-            Err(error) if retry_poll(&error) => {}
-            Err(_) => return Err(Failure::Message("The Qwen3-ASR upload was interrupted.")),
-        }
-    }
-    call.check()
+    crate::http::write_all_vectored(stream, buffers, || call.check(), || call.check())
+        .map_err(|error| map_http(error, map_asr_transport))
 }
 
-fn connect_cancellable(address: SocketAddr, limit: Duration, call: &Call<'_>) -> Result<TcpStream> {
-    call.check()?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    if std::thread::Builder::new()
-        .name("canary-connect".into())
-        .spawn(move || {
-            let _sent = sender.send(TcpStream::connect_timeout(&address, limit));
-        })
-        .is_err()
-    {
-        let stream = TcpStream::connect_timeout(&address, limit)
-            .map_err(|_| Failure::Message("Could not connect to the local Qwen3-ASR companion."))?;
-        call.check()?;
-        return Ok(stream);
-    }
-    loop {
-        call.check()?;
-        let step = CONNECT_POLL.min(call.until.saturating_duration_since(Instant::now()));
-        match receiver.recv_timeout(step) {
-            Ok(result) => {
-                call.check()?;
-                return result.map_err(|_| {
-                    Failure::Message("Could not connect to the local Qwen3-ASR companion.")
-                });
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                call.check()?;
-                return Err(Failure::Message(
-                    "Could not connect to the local Qwen3-ASR companion.",
-                ));
-            }
-        }
-    }
-}
-
-fn read(stream: &mut TcpStream, bytes: &mut [u8], call: &Call<'_>) -> Result<usize> {
+fn read(
+    stream: &mut TcpStream,
+    bytes: &mut [u8],
+    call: &Call<'_>,
+    map_error: fn(crate::http::TransportError) -> Failure,
+    allow_eof: bool,
+) -> Result<usize> {
     loop {
         call.check()?;
         let result = stream.read(bytes);
         call.check()?;
         match result {
             Ok(0) => {
-                return Err(Failure::Message(
-                    "The Qwen3-ASR response ended before its framing completed.",
-                ));
+                if allow_eof {
+                    return Ok(0);
+                }
+                return Err(map_error(crate::http::TransportError::ResponseClosed));
             }
             Ok(count) => return Ok(count),
-            Err(error) if retry_poll(&error) => {}
-            Err(_) => return Err(Failure::Message("The Qwen3-ASR response was interrupted.")),
+            Err(error) if crate::http::retry_poll(&error) => {}
+            Err(_) => {
+                return Err(map_error(crate::http::TransportError::ResponseInterrupted));
+            }
         }
     }
 }
 
-fn retry_poll(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::Interrupted
-    )
-}
-
-fn read_response(stream: &mut TcpStream, call: &Call<'_>, expected: Media) -> Result<Vec<u8>> {
-    let mut received = Vec::new();
-    let mut buffer = [0; 4096];
-    let mut header_end = crate::http::HeaderEnd::default();
-    let end = loop {
-        if let Some(end) = header_end.find(&received) {
-            break end;
-        }
-        if received.len() >= MAX_HEAD {
-            return Err(Failure::Message(
-                "The Qwen3-ASR response header exceeded its limit.",
-            ));
-        }
-        let size = buffer.len().min(MAX_HEAD - received.len());
-        let count = read(stream, &mut buffer[..size], call)?;
-        received.extend_from_slice(&buffer[..count]);
-    };
-    let length = response_length(&received[..end], expected)?;
-    let body = response_body(received, end, length, |bytes| read(stream, bytes, call))?;
+fn read_response(
+    stream: &mut TcpStream,
+    call: &Call<'_>,
+    expected: Media,
+    map_error: fn(crate::http::TransportError) -> Failure,
+) -> Result<Vec<u8>> {
+    let (received, end) = crate::http::read_head_bytes(|bytes| {
+        read(stream, bytes, call, map_error, false).map_err(crate::http::Error::Interrupted)
+    })
+    .map_err(|error| map_http(error, map_error))?;
+    let length = response_length_with(&received[..end], expected, map_error)?;
+    let body = crate::http::read_exact_body(received, end, length, |bytes| {
+        read(stream, bytes, call, map_error, false).map_err(crate::http::Error::Interrupted)
+    })
+    .map_err(|error| map_http(error, map_error))?;
     call.check()?;
     Ok(body)
 }
 
+#[cfg(test)]
 fn response_body(
-    mut received: Vec<u8>,
+    received: Vec<u8>,
     end: usize,
     length: usize,
     mut read: impl FnMut(&mut [u8]) -> Result<usize>,
 ) -> Result<Vec<u8>> {
-    let prefix = received.len() - end;
-    if prefix > length {
-        return Err(Failure::Message(
-            "The Qwen3-ASR response exceeded its declared length.",
-        ));
-    }
-    // Keep the authorized header allocation, moving only coalesced payload.
-    // Read the rest directly into its final storage instead of copying every
-    // socket read through a staging buffer, including complete TTS WAV clips.
-    received.copy_within(end.., 0);
-    received.truncate(prefix);
-    received
-        .try_reserve_exact(length - prefix)
-        .map_err(|_| Failure::Message("Could not allocate the bounded local speech response."))?;
-    received.resize(length, 0);
-    let mut filled = prefix;
-    while filled < length {
-        let count = read(&mut received[filled..])?;
-        if count == 0 {
-            return Err(Failure::Message(
-                "The Qwen3-ASR response ended before its framing completed.",
-            ));
-        }
-        filled += count;
-    }
-    Ok(received)
+    crate::http::read_exact_body(received, end, length, |bytes| {
+        read(bytes).map_err(crate::http::Error::Interrupted)
+    })
+    .map_err(|error| map_http(error, map_asr_transport))
 }
 
+#[cfg(test)]
 fn response_length(head: &[u8], expected: Media) -> Result<usize> {
-    let invalid = Failure::Message("The Qwen3-ASR companion returned unsupported HTTP framing.");
-    if !head.starts_with(b"HTTP/1.1 ")
-        || head.iter().enumerate().any(|(index, &byte)| {
-            (byte == b'\n' && (index == 0 || head[index - 1] != b'\r'))
-                || (byte == b'\r' && head.get(index + 1) != Some(&b'\n'))
-        })
-    {
-        return Err(invalid);
-    }
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut response = httparse::Response::new(&mut headers);
-    if response.parse(head).ok() != Some(httparse::Status::Complete(head.len()))
-        || response.version != Some(1)
-    {
-        return Err(invalid);
-    }
-    response_status(response.code)?;
-    let mut length = None;
-    let mut media = false;
-    for (index, header) in response.headers.iter().enumerate() {
-        if response.headers[..index]
-            .iter()
-            .any(|previous| previous.name.eq_ignore_ascii_case(header.name))
-            || [
-                "transfer-encoding",
-                "content-encoding",
-                "trailer",
-                "upgrade",
-            ]
-            .iter()
-            .any(|name| header.name.eq_ignore_ascii_case(name))
-        {
-            return Err(invalid);
-        }
-        if header.name.eq_ignore_ascii_case("content-length") {
-            if header.value.is_empty() || !header.value.iter().all(u8::is_ascii_digit) {
-                return Err(invalid);
+    response_length_with(head, expected, map_asr_transport)
+}
+
+fn response_length_with(
+    head: &[u8],
+    expected: Media,
+    map_error: fn(crate::http::TransportError) -> Failure,
+) -> Result<usize> {
+    let policy = crate::http::HeadPolicy {
+        framing: crate::http::AllowedFraming::LengthOnly,
+        require_connection_close: false,
+        allow_htab: true,
+    };
+    let parsed = crate::http::ResponseHead::parse(
+        head,
+        policy,
+        |code| {
+            if code == 200 {
+                Ok(expected.limit())
+            } else {
+                Err(crate::http::TransportError::Status(code))
             }
-            length = std::str::from_utf8(header.value)
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|&value| value <= expected.limit());
-            if length.is_none() {
-                return Err(invalid);
-            }
-        } else if header.name.eq_ignore_ascii_case("content-type") {
-            media = expected.accepts(header.value);
-        } else if header.name.eq_ignore_ascii_case("connection")
-            && !header.value.eq_ignore_ascii_case(b"close")
-        {
-            return Err(invalid);
+        },
+        |_, value| expected.accepts(value),
+    )
+    .map_err(map_error)?;
+    match parsed.framing {
+        crate::http::Framing::Length(length) => Ok(length),
+        crate::http::Framing::Chunked => {
+            Err(map_error(crate::http::TransportError::UnsupportedFraming))
         }
     }
-    if !media {
-        return Err(invalid);
-    }
-    length.ok_or(invalid)
 }
 
 // Never include a server-controlled reason phrase or response body in errors.
 // Both buffered audio and PCM expose the same fixed, actionable distinctions.
-const fn response_status(code: Option<u16>) -> Result<()> {
+pub(super) const fn response_status(code: Option<u16>) -> Failure {
     let message = match code {
-        Some(200) => return Ok(()),
         Some(400) => {
             "The speech service rejected the request (HTTP 400). Use Retry speech setup in Settings > Voice if this repeats."
         }
@@ -877,7 +833,7 @@ const fn response_status(code: Option<u16>) -> Result<()> {
             "The speech service rejected the request with an unexpected HTTP status. Use Retry speech setup in Settings > Voice."
         }
     };
-    Err(Failure::Message(message))
+    Failure::Message(message)
 }
 
 #[cfg(test)]
@@ -1043,7 +999,14 @@ mod tests {
         let current = AtomicU64::new(1);
         let call = Call::new(1, &current, Duration::from_secs(5));
         assert!(matches!(
-            client.connection_parts("POST", "/v1/audio/transcriptions", None, &[&[][..]; 5], &call),
+            client.connection_parts(
+                "POST",
+                "/v1/audio/transcriptions",
+                None,
+                &[&[][..]; 5],
+                &call,
+                super::map_asr_transport,
+            ),
             Err(Failure::Message(message)) if message.contains("size limit")
         ));
         assert!(

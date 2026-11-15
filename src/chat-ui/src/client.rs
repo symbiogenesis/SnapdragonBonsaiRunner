@@ -6,6 +6,7 @@
     reason = "The window and worker share a deliberately crate-private command boundary"
 )]
 
+use bonsai_windows_credentials::RetainedCredential;
 use bonsai_windows_process::{OwnedProcess, ToolProcessSpec};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,7 +14,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs::File,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, IoSlice, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
     sync::{
@@ -588,7 +589,7 @@ fn serve_broker(
                                 drop(request);
                                 effort::run(
                                     config.frontend_port,
-                                    &key,
+                                    key.as_hex(),
                                     &pending,
                                     ResponseOptions {
                                         max_completion_tokens,
@@ -599,7 +600,13 @@ fn serve_broker(
                                     events,
                                 )
                             } else {
-                                generate(config.frontend_port, &key, request, commands, events)
+                                generate(
+                                    config.frontend_port,
+                                    key.as_hex(),
+                                    request,
+                                    commands,
+                                    events,
+                                )
                             }
                         });
                 finish_turn(
@@ -624,7 +631,7 @@ fn wait_ready(
     history: &mut Vec<Message>,
     stdout_path: &Path,
     stderr_path: &Path,
-) -> Result<(String, usize)> {
+) -> Result<(RetainedCredential, usize)> {
     let until = Instant::now() + STARTUP_TIMEOUT;
     loop {
         check_startup_commands(commands, history)?;
@@ -633,32 +640,8 @@ fn wait_ready(
             let context_tokens = context_capacity(&output)?.ok_or(Failure::Message(
                 "The broker did not report its selected context capacity. Rebuild the broker and retry.",
             ))?;
-            let parent = config
-                .evidence
-                .canonicalize()
-                .map_err(|_| Failure::Message("The app evidence directory is unavailable."))?;
-            let directory = directory
-                .canonicalize()
-                .map_err(|_| Failure::Message("The broker credential directory is unavailable."))?;
-            if directory == parent || !directory.starts_with(&parent) {
-                return Err(Failure::Message(
-                    "The broker reported an unexpected credential location.",
-                ));
-            }
-            let key = read_bounded_file(&directory.join("frontend.key"), 64)?;
-            if key.len() != 64
-                || !key.iter().all(u8::is_ascii_hexdigit)
-                || key.iter().any(u8::is_ascii_uppercase)
-            {
-                return Err(Failure::Message(
-                    "The broker frontend credential has an invalid format.",
-                ));
-            }
-            return String::from_utf8(key)
-                .map(|key| (key, context_tokens))
-                .map_err(|_| {
-                    Failure::Message("The broker frontend credential has an invalid format.")
-                });
+            let key = read_api_key(&config.evidence, &directory)?;
+            return Ok((key, context_tokens));
         }
         if broker
             .try_wait()
@@ -675,6 +658,48 @@ fn wait_ready(
         }
         thread::sleep(POLL);
     }
+}
+
+fn read_api_key(parent: &Path, reported: &Path) -> Result<RetainedCredential> {
+    let parent = parent
+        .canonicalize()
+        .map_err(|_| Failure::Message("The app evidence directory is unavailable."))?;
+    let directory = reported
+        .canonicalize()
+        .map_err(|_| Failure::Message("The broker credential directory is unavailable."))?;
+    if directory == parent || !directory.starts_with(&parent) {
+        return Err(Failure::Message(
+            "The broker reported an unexpected credential location.",
+        ));
+    }
+    // Resolve canonical short/relative segments while stripping the Windows `\\?\`
+    // drive verbatim prefix so `RetainedCredential::open` admits valid local drives.
+    let key_path = strip_verbatim_drive(&directory).join("frontend.key");
+    RetainedCredential::open(&key_path).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
+        ) {
+            Failure::Message("The broker frontend credential has an invalid format.")
+        } else {
+            Failure::Message("A broker diagnostic or credential file is unavailable.")
+        }
+    })
+}
+
+fn strip_verbatim_drive(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_owned();
+    };
+    if let Some(stripped) = text.strip_prefix(r"\\?\")
+        && matches!(
+            stripped.as_bytes(),
+            [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()
+        )
+    {
+        return PathBuf::from(stripped);
+    }
+    path.to_owned()
 }
 
 fn model_verification_message(diagnostic: &str) -> Option<&'static str> {
@@ -991,92 +1016,56 @@ fn check_commands(commands: &Receiver<Command>) -> Result<()> {
 
 // Generation has no elapsed-time cutoff. Every socket operation still observes
 // the same Stop/Shutdown channel, including while no response bytes arrive.
-struct Interruptible<'a> {
-    stream: TcpStream,
-    commands: &'a Receiver<Command>,
-    interrupted: Option<Failure>,
-}
-
-impl Interruptible<'_> {
-    fn check(&mut self) -> io::Result<()> {
-        if self.interrupted.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "Native chat request interrupted",
-            ));
-        }
-        let result = check_commands(self.commands);
-        if let Err(failure) = result {
-            self.interrupted = Some(failure);
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "Native chat request interrupted",
-            ));
-        }
-        Ok(())
-    }
-
-    fn wait(&mut self) -> io::Result<()> {
-        // The socket is nonblocking: wait on the command channel instead of
-        // a socket timeout, so Stop/Shutdown wake a stalled read or write.
-        match self.commands.recv_timeout(SOCKET_POLL) {
-            Ok(Command::StopModel) => self.interrupted = Some(Failure::ModelStopped),
-            Ok(Command::Stop) => self.interrupted = Some(Failure::Stopped),
-            Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                self.interrupted = Some(Failure::Shutdown);
-            }
-            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
-        }
-        self.check()
+const fn map_http_error(error: crate::http::Error<Failure>) -> Failure {
+    match error {
+        crate::http::Error::Interrupted(failure) => failure,
+        crate::http::Error::Transport(transport) => map_transport(transport),
     }
 }
 
-impl Read for Interruptible<'_> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        loop {
-            self.check()?;
-            match self.stream.read(bytes) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    self.wait()?;
-                }
-                result => {
-                    self.check()?;
-                    return result;
-                }
-            }
+const fn map_transport(error: crate::http::TransportError) -> Failure {
+    use crate::http::TransportError;
+    Failure::Message(match error {
+        TransportError::Connect => "Could not connect to the model service on this computer.",
+        TransportError::Configure => "Could not configure the local connection.",
+        TransportError::UploadSize
+        | TransportError::UploadClosed
+        | TransportError::UploadInterrupted => {
+            "Could not send your message to the model on this computer."
         }
-    }
-}
-
-impl Write for Interruptible<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        loop {
-            self.check()?;
-            match self.stream.write(bytes) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    self.wait()?;
-                }
-                result => {
-                    self.check()?;
-                    return result;
-                }
-            }
+        TransportError::HeadOverflow => "The local response header exceeded its limit.",
+        TransportError::InvalidHead => {
+            "The model on this computer returned a reply the app could not read."
         }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
+        TransportError::DuplicateHeader => "The local response repeated a framing header.",
+        TransportError::UnsupportedEncoding => "Encoded local responses are unsupported.",
+        TransportError::UnsupportedMedia => {
+            "The local model returned a reply format the app could not read."
+        }
+        TransportError::InvalidLength => "The response length is invalid or exceeded its limit.",
+        TransportError::UnsupportedFraming
+        | TransportError::LengthExceeded
+        | TransportError::TrailingBytes => {
+            "The local response had unsupported or conflicting framing."
+        }
+        TransportError::ResponseClosed => LOCAL_CONNECTION_CLOSED,
+        TransportError::ResponseInterrupted => {
+            "The connection to the model on this computer was interrupted before a complete reply was received."
+        }
+        TransportError::LineOverflow => {
+            "The local model returned reply metadata larger than the app can accept."
+        }
+        TransportError::InvalidChunkEnding => "The local response had invalid chunk endings.",
+        TransportError::InvalidChunkFraming => "The local response had invalid chunk framing.",
+        TransportError::InvalidChunkSize => "The local chunk size was invalid.",
+        TransportError::BodyLimitExceeded | TransportError::Allocation => {
+            "The response exceeded its four-megabyte limit."
+        }
+        TransportError::UnsupportedTrailers => "Response trailers are unsupported.",
+        TransportError::Status(_) | TransportError::UnexpectedStatus => {
+            "The local model rejected the request without reporting a recognized reason."
+        }
+    })
 }
 
 fn connect_interruptible(
@@ -1084,39 +1073,14 @@ fn connect_interruptible(
     connect_timeout: Duration,
     commands: &Receiver<Command>,
 ) -> Result<TcpStream> {
-    check_commands(commands)?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    if thread::Builder::new()
-        .name("chat-connect".into())
-        .spawn(move || {
-            let _sent = sender.send(TcpStream::connect_timeout(&address, connect_timeout));
-        })
-        .is_err()
-    {
-        let connected = TcpStream::connect_timeout(&address, connect_timeout);
-        check_commands(commands)?;
-        return connected.map_err(|_| {
-            Failure::Message("Could not connect to the model service on this computer.")
-        });
-    }
-    loop {
-        check_commands(commands)?;
-        match receiver.recv_timeout(IO_POLL) {
-            Ok(connected) => {
-                check_commands(commands)?;
-                return connected.map_err(|_| {
-                    Failure::Message("Could not connect to the model service on this computer.")
-                });
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                check_commands(commands)?;
-                return Err(Failure::Message(
-                    "Could not connect to the model service on this computer.",
-                ));
-            }
-        }
-    }
+    crate::http::connect_socket(
+        address,
+        connect_timeout,
+        "chat-connect",
+        || IO_POLL,
+        || check_commands(commands),
+    )
+    .map_err(map_http_error)
 }
 
 fn generate(
@@ -1135,14 +1099,18 @@ fn generate(
     stream
         .set_nonblocking(true)
         .map_err(|_| Failure::Message("Could not configure the local connection."))?;
-    let mut connection = Interruptible {
-        stream,
-        commands,
-        interrupted: None,
-    };
+    let mut connection = crate::http::PollStream::new(stream, |phase| match phase {
+        crate::http::PollPhase::Check => check_commands(commands),
+        crate::http::PollPhase::Wait => match commands.recv_timeout(SOCKET_POLL) {
+            Ok(Command::StopModel) => Err(Failure::ModelStopped),
+            Ok(Command::Stop) => Err(Failure::Stopped),
+            Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => Err(Failure::Shutdown),
+            Ok(_) | Err(RecvTimeoutError::Timeout) => check_commands(commands),
+        },
+    });
     let outcome = exchange(&mut connection, port, key, request, events, commands);
     let _checked = connection.check();
-    connection.interrupted.map_or(outcome, Err)
+    connection.take_interrupted().map_or(outcome, Err)
 }
 
 fn exchange(
@@ -1153,18 +1121,29 @@ fn exchange(
     events: &EventSender,
     commands: &Receiver<Command>,
 ) -> Result<(Message, Completion)> {
-    let header = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        request.as_ref().len()
-    );
-    // Keep the sending half open: the broker interprets half-close as abandonment.
-    connection
-        .write_all(header.as_bytes())
-        .and_then(|()| connection.write_all(request.as_ref()))
-        .and_then(|()| connection.flush())
-        .map_err(|_| {
+    {
+        let head = crate::http::bearer_request_head(
+            "POST",
+            "/v1/chat/completions",
+            port,
+            key,
+            Some("application/json"),
+            false,
+            request.as_ref().len(),
+        );
+        // Keep the sending half open: the broker interprets half-close as abandonment.
+        let mut slices = [IoSlice::new(&head), IoSlice::new(request.as_ref())];
+        crate::http::write_all_vectored(
+            connection,
+            &mut slices,
+            || check_commands(commands),
+            || check_commands(commands),
+        )
+        .map_err(map_http_error)?;
+        connection.flush().map_err(|_| {
             Failure::Message("Could not send your message to the model on this computer.")
         })?;
+    }
     // The canonical request is no longer needed once sent. Release its
     // allocation before response headers or streaming backpressure can wait.
     drop(request);
@@ -1192,12 +1171,6 @@ fn exchange(
         },
         completion,
     ))
-}
-
-#[derive(Clone, Copy)]
-enum Framing {
-    Chunked,
-    Length(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -1236,29 +1209,76 @@ impl ResponseKind {
     }
 }
 
+const fn response_kind(code: u16) -> Result<ResponseKind> {
+    match code {
+        200 => Ok(ResponseKind::Stream),
+        400 => Ok(ResponseKind::RequestError),
+        413 => Ok(ResponseKind::ContextError),
+        429 => Ok(ResponseKind::RateError),
+        502 => Ok(ResponseKind::BackendError),
+        _ => Err(Failure::Message(
+            "The local model rejected the request without reporting a recognized reason.",
+        )),
+    }
+}
+
+const RESPONSE_HEAD_POLICY: crate::http::HeadPolicy = crate::http::HeadPolicy {
+    framing: crate::http::AllowedFraming::LengthOrChunked,
+    require_connection_close: false,
+    allow_htab: true,
+};
+
+const fn status_limit(code: u16) -> std::result::Result<usize, crate::http::TransportError> {
+    match code {
+        200 => Ok(MAX_BODY),
+        400 | 413 | 429 | 502 => Ok(MAX_ERROR_BODY),
+        _ => Err(crate::http::TransportError::UnexpectedStatus),
+    }
+}
+
+fn accept_media(code: u16, value: &[u8]) -> bool {
+    match code {
+        200 => crate::http::utf8_media_type(value, "text/event-stream"),
+        400 | 413 | 429 | 502 => value.eq_ignore_ascii_case(b"application/json"),
+        _ => false,
+    }
+}
+
+fn validate_response_head(head: crate::http::ResponseHead) -> Result<ResponseKind> {
+    let kind = response_kind(head.code)?;
+    if matches!(kind, ResponseKind::RateError)
+        && head.retry_after != crate::http::RetryAfter::OneSecond
+    {
+        return Err(Failure::Message(
+            "The local model returned an unrecognized retry delay.",
+        ));
+    }
+    Ok(kind)
+}
+
 struct HttpBody<R> {
-    reader: BufReader<R>,
-    framing: Framing,
-    remaining: usize,
-    total: usize,
-    done: bool,
-    chunk_ending: bool,
-    borrowed: usize,
+    reader: crate::http::BodyReader<R>,
 }
 
 impl<R: Read> HttpBody<R> {
     fn new(reader: R) -> Result<Self> {
-        let mut reader = BufReader::with_capacity(READ_SIZE, reader);
-        let (framing, kind) = read_head(&mut reader)?;
-        let mut body = Self {
-            reader,
-            framing,
-            remaining: 0,
-            total: 0,
-            done: false,
-            chunk_ending: false,
-            borrowed: 0,
+        let body_policy = crate::http::BodyPolicy {
+            chunk_line_limit: 32,
+            max_body: MAX_BODY,
+            require_even_chunks: false,
+            require_non_empty: false,
         };
+        let (head, reader) = crate::http::BodyReader::new(
+            reader,
+            READ_SIZE,
+            RESPONSE_HEAD_POLICY,
+            status_limit,
+            accept_media,
+            body_policy,
+        )
+        .map_err(map_transport)?;
+        let kind = validate_response_head(head)?;
+        let mut body = Self { reader };
         if !matches!(kind, ResponseKind::Stream) {
             return Err(body.failure(kind)?);
         }
@@ -1290,251 +1310,22 @@ impl<R: Read> HttpBody<R> {
         kind.failure(&envelope.error.code).ok_or(invalid)
     }
 
-    // A payload borrows the reader's one buffer. Consume it on the next call,
-    // after every parser/sink borrow has ended, before touching HTTP metadata.
     fn next_payload(&mut self) -> Result<Option<&[u8]>> {
-        self.reader.consume(self.borrowed);
-        self.borrowed = 0;
-        if self.done {
-            return Ok(None);
-        }
-        let remaining = match self.framing {
-            Framing::Length(length) => length - self.total,
-            Framing::Chunked => {
-                self.prepare_chunk()?;
-                self.remaining
-            }
-        };
-        if remaining == 0 {
-            self.done = true;
-            return Ok(None);
-        }
-        // One successful fill releases its ready prefix immediately. Never wait
-        // for a full buffer, the declared payload, or trailing chunk framing.
-        // fill_buf leaves Interrupted visible to the cancellation boundary.
-        let available = self.reader.fill_buf().map_err(|_| {
-            Failure::Message("The connection to the model on this computer was interrupted before a complete reply was received.")
-        })?;
-        if available.is_empty() {
-            return Err(Failure::Message(LOCAL_CONNECTION_CLOSED));
-        }
-        let count = available.len().min(remaining);
-        self.total += count;
-        if matches!(self.framing, Framing::Chunked) {
-            self.remaining -= count;
-            self.chunk_ending = self.remaining == 0;
-        }
-        self.borrowed = count;
-        Ok(Some(&available[..count]))
+        self.reader.next_payload().map_err(map_transport)
     }
 
-    fn prepare_chunk(&mut self) -> Result<()> {
-        if self.remaining == 0 {
-            if self.chunk_ending {
-                let mut ending = [0; 2];
-                read_exact(&mut self.reader, &mut ending)?;
-                if ending != *b"\r\n" {
-                    return Err(Failure::Message(
-                        "The local response had invalid chunk endings.",
-                    ));
-                }
-                self.chunk_ending = false;
-            }
-            let mut line = [0; 32];
-            let line = read_line(&mut self.reader, &mut line)?;
-            if line.is_empty() || !line.iter().all(u8::is_ascii_hexdigit) {
-                return Err(Failure::Message(
-                    "The local response had invalid chunk framing.",
-                ));
-            }
-            let text = std::str::from_utf8(line)
-                .map_err(|_| Failure::Message("The local chunk size was invalid."))?;
-            self.remaining = usize::from_str_radix(text, 16)
-                .map_err(|_| Failure::Message("The local chunk size was invalid."))?;
-            if self.remaining > MAX_BODY - self.total {
-                return Err(Failure::Message(
-                    "The response exceeded its four-megabyte limit.",
-                ));
-            }
-            if self.remaining == 0 {
-                if !read_line(&mut self.reader, &mut [0; 2])?.is_empty() {
-                    return Err(Failure::Message("Response trailers are unsupported."));
-                }
-                self.done = true;
-            }
-        }
-        Ok(())
+    #[cfg(test)]
+    fn buffer_ptr(&self) -> *const u8 {
+        self.reader.buffer_ptr()
     }
 }
 
-fn read_exact(reader: &mut impl Read, bytes: &mut [u8]) -> Result<()> {
-    // Do not use Read::read_exact: it retries Interrupted and could hide a
-    // Shutdown/Stop request from the interruptible socket until another read.
-    let mut filled = 0;
-    while filled < bytes.len() {
-        let count = reader.read(&mut bytes[filled..]).map_err(|_| {
-            Failure::Message("The connection to the model on this computer was interrupted before a complete reply was received.")
-        })?;
-        if count == 0 {
-            return Err(Failure::Message(LOCAL_CONNECTION_CLOSED));
-        }
-        filled += count;
-    }
-    Ok(())
-}
-
-fn read_byte(reader: &mut impl Read) -> Result<u8> {
-    let mut byte = [0];
-    read_exact(reader, &mut byte)?;
-    Ok(byte[0])
-}
-
-fn read_line<'a>(reader: &mut impl Read, bytes: &'a mut [u8]) -> Result<&'a [u8]> {
-    let mut length = 0;
-    loop {
-        if length == bytes.len() {
-            return Err(Failure::Message(
-                "The local model returned reply metadata larger than the app can accept.",
-            ));
-        }
-        bytes[length] = read_byte(reader)?;
-        length += 1;
-        if bytes[..length].ends_with(b"\r\n") {
-            return Ok(&bytes[..length - 2]);
-        }
-    }
-}
-
-fn read_head<R: Read>(reader: &mut BufReader<R>) -> Result<(Framing, ResponseKind)> {
-    let available = reader.fill_buf().map_err(|_| {
-        Failure::Message("The connection to the model on this computer was interrupted before a complete reply was received.")
-    })?;
-    if available.is_empty() {
-        return Err(Failure::Message(LOCAL_CONNECTION_CLOSED));
-    }
-    let window = &available[..available.len().min(MAX_HEAD)];
-    if let Some(offset) = memchr::memmem::find(window, b"\r\n\r\n") {
-        let end = offset + 4;
-        let parsed = parse_head(&window[..end]);
-        reader.consume(end);
-        return parsed;
-    }
-    if available.len() >= MAX_HEAD {
-        return Err(Failure::Message(
-            "The local response header exceeded its limit.",
-        ));
-    }
-    let mut head = available.to_vec();
-    let consumed = head.len();
-    reader.consume(consumed);
-    while !head.ends_with(b"\r\n\r\n") {
-        if head.len() == MAX_HEAD {
-            return Err(Failure::Message(
-                "The local response header exceeded its limit.",
-            ));
-        }
-        head.push(read_byte(reader)?);
-    }
-    parse_head(&head)
-}
-
-fn parse_head(head: &[u8]) -> Result<(Framing, ResponseKind)> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut response = httparse::Response::new(&mut headers);
-    if !matches!(response.parse(head), Ok(httparse::Status::Complete(_)))
-        || response.version != Some(1)
-    {
-        return Err(Failure::Message(
-            "The model on this computer returned a reply the app could not read.",
-        ));
-    }
-    let kind = match response.code {
-        Some(200) => ResponseKind::Stream,
-        Some(400) => ResponseKind::RequestError,
-        Some(413) => ResponseKind::ContextError,
-        Some(429) => ResponseKind::RateError,
-        Some(502) => ResponseKind::BackendError,
-        _ => {
-            return Err(Failure::Message(
-                "The local model rejected the request without reporting a recognized reason.",
-            ));
-        }
-    };
-    let mut content_type = None;
-    let mut length = None;
-    let mut transfer = None;
-    let mut retry_after = None;
-    for header in response.headers {
-        let field = if header.name.eq_ignore_ascii_case("content-type") {
-            Some(&mut content_type)
-        } else if header.name.eq_ignore_ascii_case("content-length") {
-            Some(&mut length)
-        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
-            Some(&mut transfer)
-        } else if header.name.eq_ignore_ascii_case("retry-after") {
-            Some(&mut retry_after)
-        } else {
-            None
-        };
-        if let Some(field) = field
-            && field.replace(header.value).is_some()
-        {
-            return Err(Failure::Message(
-                "The local response repeated a framing header.",
-            ));
-        }
-        if header.name.eq_ignore_ascii_case("content-encoding") {
-            return Err(Failure::Message("Encoded local responses are unsupported."));
-        }
-    }
-    if matches!(kind, ResponseKind::RateError) && retry_after != Some(b"1".as_slice()) {
-        return Err(Failure::Message(
-            "The local model returned an unrecognized retry delay.",
-        ));
-    }
-    let valid_media = match kind {
-        ResponseKind::Stream => content_type
-            .is_some_and(|value| crate::http::utf8_media_type(value, "text/event-stream")),
-        ResponseKind::ContextError
-        | ResponseKind::RequestError
-        | ResponseKind::RateError
-        | ResponseKind::BackendError => {
-            content_type.is_some_and(|value| value.eq_ignore_ascii_case(b"application/json"))
-        }
-    };
-    if !valid_media {
-        return Err(Failure::Message(
-            "The local model returned a reply format the app could not read.",
-        ));
-    }
-    let framing = match (length, transfer) {
-        (None, Some(value)) if value.eq_ignore_ascii_case(b"chunked") => Framing::Chunked,
-        (Some(value), None) if !value.is_empty() && value.iter().all(u8::is_ascii_digit) => {
-            let length = std::str::from_utf8(value)
-                .ok()
-                .and_then(|text| text.parse::<usize>().ok())
-                .filter(|length| {
-                    *length
-                        <= match kind {
-                            ResponseKind::Stream => MAX_BODY,
-                            ResponseKind::ContextError
-                            | ResponseKind::RequestError
-                            | ResponseKind::RateError
-                            | ResponseKind::BackendError => MAX_ERROR_BODY,
-                        }
-                })
-                .ok_or(Failure::Message(
-                    "The response length is invalid or exceeded its limit.",
-                ))?;
-            Framing::Length(length)
-        }
-        _ => {
-            return Err(Failure::Message(
-                "The local response had unsupported or conflicting framing.",
-            ));
-        }
-    };
-    Ok((framing, kind))
+#[cfg(test)]
+fn parse_head(head: &[u8]) -> Result<ResponseKind> {
+    let parsed =
+        crate::http::ResponseHead::parse(head, RESPONSE_HEAD_POLICY, status_limit, accept_media)
+            .map_err(map_transport)?;
+    validate_response_head(parsed)
 }
 
 #[cfg(test)]
@@ -2015,7 +1806,7 @@ mod tests {
             let wire =
                 format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{framing}{payload}");
             let mut body = HttpBody::new(wire.as_bytes())?;
-            let expected = body.reader.buffer().as_ptr().wrapping_add(offset);
+            let expected = body.buffer_ptr().wrapping_add(offset);
             let bytes = body
                 .next_payload()?
                 .ok_or(Failure::Message("Buffered payload was not lent"))?;
@@ -2977,6 +2768,64 @@ mod tests {
             serialize_request(&oversized, 4096, false, None),
             Err(Failure::Rejected(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn read_api_key_requires_containment_and_retained_lowercase_hex_credential() -> io::Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("Bonsai-ReadApiKey-{}-{stamp}", std::process::id()));
+        let evidence = root.join("evidence");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&evidence)?;
+        std::fs::create_dir(&outside)?;
+        let creds = bonsai_windows_credentials::PrivateCredentials::create(&evidence)?;
+        let opened = super::read_api_key(&evidence, creds.directory())
+            .map_err(|_| io::Error::other("Valid contained credential was rejected"))?;
+        assert_eq!(opened.as_hex(), creds.frontend_key());
+
+        let escaping = super::read_api_key(&evidence, &outside);
+        assert_eq!(
+            escaping.err(),
+            Some(Failure::Message(
+                "The broker reported an unexpected credential location."
+            ))
+        );
+
+        let same_dir = super::read_api_key(&evidence, &evidence);
+        assert_eq!(
+            same_dir.err(),
+            Some(Failure::Message(
+                "The broker reported an unexpected credential location."
+            ))
+        );
+
+        let missing_dir = evidence.join("missing");
+        std::fs::create_dir(&missing_dir)?;
+        assert_eq!(
+            super::read_api_key(&evidence, &missing_dir).err(),
+            Some(Failure::Message(
+                "A broker diagnostic or credential file is unavailable."
+            ))
+        );
+
+        let malformed_dir = evidence.join("malformed");
+        std::fs::create_dir(&malformed_dir)?;
+        std::fs::write(malformed_dir.join("frontend.key"), b"not-a-valid-key")?;
+        assert_eq!(
+            super::read_api_key(&evidence, &malformed_dir).err(),
+            Some(Failure::Message(
+                "The broker frontend credential has an invalid format."
+            ))
+        );
+
+        drop(opened);
+        drop(creds);
+        let _removed = std::fs::remove_dir_all(root);
         Ok(())
     }
 }

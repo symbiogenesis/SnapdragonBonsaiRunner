@@ -65,10 +65,19 @@ impl Client {
 
     fn ready_for(&self, generation: u64, current: &AtomicU64) -> Result<(), Failure> {
         let call = Call::new(generation, current, READY_LIMIT);
-        let result = self.0.exchange("GET", "/health", None, &[], Media::Json, &call)
-            .map_err(transport_failure)
+        let result = self
+            .0
+            .exchange_with(
+                "GET",
+                "/health",
+                None,
+                &[],
+                Media::Json,
+                &call,
+                map_tts_transport,
+            )
             .and_then(|bytes| {
-                call.check().map_err(transport_failure)?;
+                call.check()?;
                 let health: Health<'_> = serde_json::from_slice(&bytes).map_err(|_| {
                     Failure::Message("Speech returned invalid capabilities. Use Retry speech setup in Settings > Voice.")
                 })?;
@@ -88,7 +97,7 @@ impl Client {
                 self.2.store(health.sample_rate, Ordering::Release);
                 Ok(())
             });
-        call.check().map_err(transport_failure).and(result)
+        call.check().and(result)
     }
 
     /// Launch in an owned Job, then authenticate readiness before any text request.
@@ -100,7 +109,7 @@ impl Client {
         diagnostics: Option<DiagnosticSink>,
     ) -> Result<Option<Service>, Failure> {
         let call = Call::new(generation, current, Duration::from_mins(15));
-        call.check().map_err(transport_failure)?;
+        call.check()?;
         let Some(launch) = &config.launch else {
             self.ready_for(generation, current)?;
             return Ok(None);
@@ -132,7 +141,7 @@ impl Client {
     ) -> Result<Vec<u8>, Failure> {
         let call = Call::new(generation, current, SYNTHESIS_LIMIT);
         let result = self.synthesize_clip(text, voice, &call);
-        call.check().map_err(transport_failure).and(result)
+        call.check().and(result)
     }
 
     /// Stream fixed PCM; companions without PCM support use validated WAV output.
@@ -146,7 +155,7 @@ impl Client {
         mut sink: impl FnMut(&[u8]) -> Result<(), Failure>,
     ) -> Result<(), Failure> {
         let call = Call::cancellable(generation, current, cancelled, SYNTHESIS_LIMIT);
-        call.check().map_err(transport_failure)?;
+        call.check()?;
         if !bounded_text(text, MAX_TEXT) || !bounded_text(voice, MAX_VOICE) {
             return Err(Failure::Message(
                 "The speech text or voice description exceeded its limit.",
@@ -162,17 +171,16 @@ impl Client {
             })
             .map_err(|_| Failure::Message("Could not prepare the Qwen TTS request."))?;
             self.0
-                .stream_pcm(&body, &call, &mut sink)
-                .map_err(transport_failure)
+                .stream_pcm_with(&body, &call, map_tts_transport, &mut sink)
         } else {
             let wav = self.synthesize_clip(text, voice, &call)?;
             for chunk in wav[44..].chunks(16_384) {
-                call.check().map_err(transport_failure)?;
+                call.check()?;
                 sink(chunk)?;
             }
             Ok(())
         };
-        call.check().map_err(transport_failure).and(result)
+        call.check().and(result)
     }
 
     fn synthesize_clip(
@@ -181,7 +189,7 @@ impl Client {
         voice: &str,
         call: &Call<'_>,
     ) -> Result<Vec<u8>, Failure> {
-        call.check().map_err(transport_failure)?;
+        call.check()?;
         if !bounded_text(text, MAX_TEXT) {
             return Err(Failure::Message(
                 "Read-aloud clips require 1 through 2,048 plain-text characters.",
@@ -200,21 +208,19 @@ impl Client {
             response_format: "wav",
         })
         .map_err(|_| Failure::Message("Could not prepare the Qwen TTS request."))?;
-        call.check().map_err(transport_failure)?;
-        let wav = self
-            .0
-            .exchange(
-                "POST",
-                "/v1/audio/speech",
-                Some("application/json"),
-                &body,
-                Media::Wave,
-                call,
-            )
-            .map_err(transport_failure)?;
-        call.check().map_err(transport_failure)?;
+        call.check()?;
+        let wav = self.0.exchange_with(
+            "POST",
+            "/v1/audio/speech",
+            Some("application/json"),
+            &body,
+            Media::Wave,
+            call,
+            map_tts_transport,
+        )?;
+        call.check()?;
         validate_wav(&wav)?;
-        call.check().map_err(transport_failure)?;
+        call.check()?;
         Ok(wav)
     }
 }
@@ -252,41 +258,43 @@ fn bounded_text(text: &str, limit: usize) -> bool {
     !text.trim().is_empty() && !text.contains('\0') && text.chars().take(limit + 1).count() <= limit
 }
 
-fn transport_failure(failure: Failure) -> Failure {
-    match failure {
-        Failure::Cancelled => Failure::Cancelled,
-        Failure::Message(message) => Failure::Message(match message {
-            "Could not connect to the local Qwen3-ASR companion."
-            | "Could not configure the Qwen3-ASR connection."
-            | "Could not configure the Qwen3-ASR connection timeout." => {
-                "Could not connect to speech. Use Retry speech setup in Settings > Voice."
-            }
-            "The Qwen3-ASR request exceeded its time limit." => {
-                "Speech generation exceeded its time limit. Select the response's speaker button to try again."
-            }
-            "The Qwen3-ASR request exceeded its size limit." => {
-                "The speech request exceeded its size limit. Try reading a shorter response."
-            }
-            "The Qwen3-ASR connection closed during upload."
-            | "The Qwen3-ASR upload was interrupted." => {
-                "The speech request was interrupted. Select the response's speaker button to try again."
-            }
-            "The Qwen3-ASR response ended before its framing completed."
-            | "The Qwen3-ASR response was interrupted."
-            | "The local speech stream was interrupted."
-            | "The local speech stream was incomplete or invalid." => {
-                "Speech ended before a complete audio stream arrived. Try the speaker button again; if this repeats, use Retry speech setup in Settings > Voice."
-            }
-            "The Qwen3-ASR response header exceeded its limit."
-            | "The Qwen3-ASR response exceeded its declared length."
-            | "The Qwen3-ASR companion returned unsupported HTTP framing." => {
-                "Speech returned an unsupported response. Use Retry speech setup in Settings > Voice."
-            }
-            // The transport only creates static, value-free messages. Preserve
-            // its HTTP distinctions and the playback sink's original failure.
-            other => other,
-        }),
-    }
+const fn map_tts_transport(error: crate::http::TransportError) -> Failure {
+    use crate::http::TransportError;
+    Failure::Message(match error {
+        TransportError::Status(code) => return canary::response_status(Some(code)),
+        TransportError::Connect | TransportError::Configure => {
+            "Could not connect to speech. Use Retry speech setup in Settings > Voice."
+        }
+        TransportError::UploadSize => {
+            "The speech request exceeded its size limit. Try reading a shorter response."
+        }
+        TransportError::UploadClosed | TransportError::UploadInterrupted => {
+            "The speech request was interrupted. Select the response's speaker button to try again."
+        }
+        TransportError::HeadOverflow
+        | TransportError::InvalidHead
+        | TransportError::DuplicateHeader
+        | TransportError::UnsupportedEncoding
+        | TransportError::UnsupportedMedia
+        | TransportError::InvalidLength
+        | TransportError::UnsupportedFraming
+        | TransportError::LengthExceeded
+        | TransportError::UnexpectedStatus => {
+            "Speech returned an unsupported response. Use Retry speech setup in Settings > Voice."
+        }
+        TransportError::ResponseClosed
+        | TransportError::ResponseInterrupted
+        | TransportError::LineOverflow
+        | TransportError::InvalidChunkEnding
+        | TransportError::InvalidChunkFraming
+        | TransportError::InvalidChunkSize
+        | TransportError::BodyLimitExceeded
+        | TransportError::UnsupportedTrailers
+        | TransportError::TrailingBytes => {
+            "Speech ended before a complete audio stream arrived. Try the speaker button again; if this repeats, use Retry speech setup in Settings > Voice."
+        }
+        TransportError::Allocation => "Could not allocate the bounded local speech response.",
+    })
 }
 
 fn validate_wav(wav: &[u8]) -> Result<(), Failure> {

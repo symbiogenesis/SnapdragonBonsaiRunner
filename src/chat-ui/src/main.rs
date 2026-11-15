@@ -39,6 +39,8 @@ mod native_speech;
 #[cfg(windows)]
 mod recovery;
 #[cfg(windows)]
+mod scrub;
+#[cfg(windows)]
 #[allow(
     unsafe_code,
     reason = "Audited event-driven WASAPI playback boundary using owned COM interfaces and staging buffers."
