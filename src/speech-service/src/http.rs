@@ -321,9 +321,9 @@ fn read(peer: &mut TcpStream, buffer: &mut [u8], until: Instant) -> Result<usize
 }
 
 fn parse_head(bytes: &[u8], port: u16, key: &[u8; 64], kind: Kind) -> Result<Head, Error> {
-    if bytes.iter().enumerate().any(|(index, byte)| {
-        (*byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
-            || (*byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+    if memchr::memchr2_iter(b'\r', b'\n', bytes).any(|index| {
+        (bytes[index] == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
+            || (bytes[index] == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
     }) {
         return Err(Error::bad("invalid_headers"));
     }
@@ -391,10 +391,7 @@ fn parse_head(bytes: &[u8], port: u16, key: &[u8; 64], kind: Kind) -> Result<Hea
     {
         return Err(Error::bad("unsupported_connection"));
     }
-    let first_end = bytes
-        .array_windows()
-        .position(|window| window == b"\r\n")
-        .ok_or(Error::bad("invalid_headers"))?;
+    let first_end = memchr::memmem::find(bytes, b"\r\n").ok_or(Error::bad("invalid_headers"))?;
     let first_line = &bytes[..first_end];
     let health = first_line == b"GET /health HTTP/1.1";
     let post_request_line: &[u8] = match kind {
