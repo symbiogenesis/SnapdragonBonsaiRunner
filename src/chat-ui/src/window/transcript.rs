@@ -32,10 +32,10 @@ pub(super) enum TranscriptAction {
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const MAX_MESSAGES: usize = 512;
-const MESSAGE_INSET: Vec2 = Vec2::new(16.0, 12.0);
+pub(super) const MESSAGE_INSET: Vec2 = Vec2::new(16.0, 12.0);
 const MESSAGE_ACTION_SIZE: f32 = 32.0;
 const MESSAGE_CONTENT_GAP: f32 = 6.0;
-const MESSAGE_GAP: f32 = 12.0;
+pub(super) const MESSAGE_GAP: f32 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum Role {

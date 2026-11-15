@@ -2091,9 +2091,7 @@ impl State {
                         if empty {
                             self.empty_state(ui);
                         } else {
-                            if find_open {
-                                ui.add_space(20.0);
-                            }
+                            ui.add_space(transcript::MESSAGE_GAP);
                             let width = ui.available_width().min(self.appearance.column_width());
                             let margin = ((ui.available_width() - width) * 0.5).max(0.0);
                             ui.horizontal(|ui| {

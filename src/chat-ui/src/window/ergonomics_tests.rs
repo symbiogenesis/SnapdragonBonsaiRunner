@@ -89,6 +89,27 @@ fn conversation_tools_leave_room_for_messages_and_keep_find_and_navigation_acces
             chat.query_by_role_and_label(egui::Role::Button, "Find")
                 .is_none()
         );
+        let first_action = format!(
+            "Actions for message {}",
+            chat.state().app.transcript.messages[0].id
+        );
+        let second_action = format!(
+            "Actions for message {}",
+            chat.state().app.transcript.messages[1].id
+        );
+        let first_top = chat
+            .get_by_role_and_label(egui::Role::Button, &first_action)
+            .rect()
+            .top()
+            - transcript::MESSAGE_INSET.y;
+        let first_bottom = first_top + chat.state().app.transcript.messages[0].height();
+        let second_top = chat
+            .get_by_role_and_label(egui::Role::Button, &second_action)
+            .rect()
+            .top()
+            - transcript::MESSAGE_INSET.y;
+        assert!((first_top - transcript::MESSAGE_GAP).abs() < 0.5);
+        assert!((second_top - first_bottom - first_top).abs() < 0.5);
         assert!(
             chat.get_by_label("Help me make a little room to think.")
                 .rect()
