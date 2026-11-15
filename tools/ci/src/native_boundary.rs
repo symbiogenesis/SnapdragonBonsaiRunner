@@ -5,7 +5,9 @@ use std::{collections::BTreeSet, ffi::OsString, fs, path::Path};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use super::native_source_inventory::{digest, lower_hex, plain_ancestors, read_bounded};
+use super::native_source_inventory::{
+    digest, lower_hex, plain_ancestors, plain_metadata, read_bounded,
+};
 use crate::Result;
 
 const USAGE: &str =
@@ -120,8 +122,7 @@ fn discover(root: &Path, exclusions: &[Exclusion]) -> Result<BTreeSet<String>> {
             if !ordinary_path(&relative) {
                 return Err("Native boundary scan found a nonportable path.".into());
             }
-            plain_ancestors(&path)?;
-            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            let metadata = plain_metadata(&path)?;
             if metadata.is_dir() {
                 if relative.split('/').count() > 64 {
                     return Err("Native boundary scan exceeded its depth bound.".into());

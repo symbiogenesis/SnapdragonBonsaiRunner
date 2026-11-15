@@ -175,7 +175,16 @@ fn execute(image: &Path, arguments: &[OsString], milliseconds: u64) -> Result<St
             {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            let wait = work_limit
+                .saturating_sub(started.elapsed())
+                .min(Duration::from_millis(25));
+            if let Some((child, _, _, code)) =
+                jobs.iter_mut().find(|(_, _, _, code)| code.is_none())
+            {
+                *code = child
+                    .wait_for_exit(wait)
+                    .map_err(|error| error.to_string())?;
+            }
         }
     })();
     let cleanup_started = Instant::now();
@@ -246,6 +255,7 @@ fn execute(image: &Path, arguments: &[OsString], milliseconds: u64) -> Result<St
 
 #[cfg(windows)]
 fn shared_configuration(arguments: &[OsString], working: &Path) -> bool {
+    let mut clean_dirs = std::collections::BTreeSet::new();
     arguments[..arguments.len() - 3].iter().all(|argument| {
         let Ok(root) = super::push_sanity::canonical_path(PathBuf::from(argument)) else {
             return false;
@@ -253,14 +263,22 @@ fn shared_configuration(arguments: &[OsString], working: &Path) -> bool {
         if !root.starts_with(working) {
             return false;
         }
-        root.ancestors()
+        for parent in root
+            .ancestors()
             .skip(1)
             .take_while(|parent| *parent != working)
-            .all(|parent| {
-                !["rustfmt.toml", ".rustfmt.toml"]
+        {
+            if !clean_dirs.contains(parent) {
+                if ["rustfmt.toml", ".rustfmt.toml"]
                     .iter()
                     .any(|name| parent.join(name).is_file())
-            })
+                {
+                    return false;
+                }
+                clean_dirs.insert(parent.to_path_buf());
+            }
+        }
+        true
     })
 }
 

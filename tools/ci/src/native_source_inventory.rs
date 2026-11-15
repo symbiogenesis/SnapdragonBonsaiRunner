@@ -66,7 +66,7 @@ fn is_link(metadata: &Metadata) -> bool {
     }
 }
 
-fn plain_metadata(path: &Path) -> Result<Metadata> {
+pub(super) fn plain_metadata(path: &Path) -> Result<Metadata> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if is_link(&metadata) {
         return Err("Native source inventory rejects symbolic links and reparse points.".into());

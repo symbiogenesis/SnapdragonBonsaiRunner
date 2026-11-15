@@ -308,8 +308,7 @@ impl Work {
         clippy::permissions_set_readonly_false,
         reason = "Windows-only helper clearing FILE_ATTRIBUTE_READONLY before replacing or removing cached files"
     )]
-    fn clear_readonly(path: &Path) -> Result<()> {
-        let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    fn clear_readonly_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
         if metadata.file_type().is_symlink() {
             return Ok(());
         }
@@ -327,7 +326,7 @@ impl Work {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
-        Self::clear_readonly(path)?;
+        Self::clear_readonly_metadata(path, &metadata)?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             return fs::remove_dir(path)
@@ -344,8 +343,9 @@ impl Work {
             for entry in fs::read_dir(&dir).map_err(|error| error.to_string())? {
                 let entry = entry.map_err(|error| error.to_string())?;
                 let child = entry.path();
-                Self::clear_readonly(&child)?;
-                let child_type = entry.file_type().map_err(|error| error.to_string())?;
+                let child_meta = entry.metadata().map_err(|error| error.to_string())?;
+                Self::clear_readonly_metadata(&child, &child_meta)?;
+                let child_type = child_meta.file_type();
                 if child_type.is_symlink() {
                     fs::remove_dir(&child)
                         .or_else(|_| fs::remove_file(&child))
@@ -363,12 +363,8 @@ impl Work {
         Ok(())
     }
 
-    fn files_equal(left: &Path, right: &Path, right_len: u64) -> Result<bool> {
-        let left_meta = fs::symlink_metadata(left).map_err(|error| error.to_string())?;
-        if left_meta.file_type().is_symlink() || !left_meta.is_file() {
-            return Ok(false);
-        }
-        if left_meta.len() != right_len {
+    fn files_equal(left: &Path, left_len: u64, right: &Path, right_len: u64) -> Result<bool> {
+        if left_len != right_len {
             return Ok(false);
         }
         let mut left_file = fs::File::open(left).map_err(|error| error.to_string())?;
@@ -446,34 +442,44 @@ impl Work {
                 };
                 src_entries.insert(entry.file_name(), (entry.path(), file_type.is_dir(), len));
             }
-            let mut kept: BTreeMap<OsString, PathBuf> = BTreeMap::new();
+            let mut kept: BTreeMap<OsString, fs::Metadata> = BTreeMap::new();
             for entry in fs::read_dir(&dst_dir).map_err(|error| error.to_string())? {
                 let entry = entry.map_err(|error| error.to_string())?;
                 let name = entry.file_name();
                 let dst_path = entry.path();
-                let dst_type = entry.file_type().map_err(|error| error.to_string())?;
+                let dst_meta = entry.metadata().map_err(|error| error.to_string())?;
+                let dst_type = dst_meta.file_type();
                 let matches = src_entries.get(&name).is_some_and(|(_, is_dir, _)| {
-                    !dst_type.is_symlink() && dst_type.is_dir() == *is_dir
+                    !dst_type.is_symlink()
+                        && if *is_dir {
+                            dst_type.is_dir()
+                        } else {
+                            dst_type.is_file()
+                        }
                 });
                 if matches {
-                    kept.insert(name, dst_path);
+                    kept.insert(name, dst_meta);
                 } else {
                     Self::remove_entry(&dst_path)?;
                 }
             }
             for (name, (src_path, is_dir, src_len)) in src_entries {
                 let dst_path = dst_dir.join(&name);
-                let has_kept = kept.contains_key(&name);
+                let kept_meta = kept.get(&name);
                 if is_dir {
-                    if !has_kept {
+                    if kept_meta.is_none() {
                         fs::create_dir_all(&dst_path).map_err(|error| error.to_string())?;
                     }
                     pending.push((src_path, dst_path));
                 } else {
-                    let unchanged = has_kept && Self::files_equal(&dst_path, &src_path, src_len)?;
+                    let unchanged = if let Some(dst_meta) = kept_meta {
+                        Self::files_equal(&dst_path, dst_meta.len(), &src_path, src_len)?
+                    } else {
+                        false
+                    };
                     if !unchanged {
-                        if has_kept {
-                            Self::clear_readonly(&dst_path)?;
+                        if let Some(dst_meta) = kept_meta {
+                            Self::clear_readonly_metadata(&dst_path, dst_meta)?;
                         }
                         fs::copy(&src_path, &dst_path).map_err(|error| error.to_string())?;
                     }
@@ -693,6 +699,23 @@ impl Work {
             ("CARGO_INCREMENTAL".to_string(), "1".to_string()),
         ]);
 
+        let workspace = crate::impact::workspace::read(source)?;
+        let debug_dir = target_dir.join("aarch64-pc-windows-msvc").join("debug");
+        let saved_helpers: Vec<(PathBuf, Vec<u8>)> = [
+            ("push-checker.json", "bonsai-ci.exe"),
+            ("push-recovery.json", "bonsai-push-recovery.exe"),
+        ]
+        .into_iter()
+        .filter_map(|(receipt, binary)| {
+            if target_dir.join(receipt).is_file() {
+                let path = debug_dir.join(binary);
+                fs::read(&path).ok().map(|bytes| (path, bytes))
+            } else {
+                None
+            }
+        })
+        .collect();
+
         let base_cargo_args = |subcommand: &str, target: &str| -> Vec<OsString> {
             vec![
                 format!("+{toolchain}").into(),
@@ -709,129 +732,143 @@ impl Work {
             ]
         };
 
-        if affected.contains("bonsai-ci") || plan.workspace_registry {
-            let mut test_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
-            test_args.extend([
-                "-p".into(),
-                "bonsai-ci".into(),
-                "--lib".into(),
-                "--test".into(),
-                "routing".into(),
-                "--".into(),
-                "--skip".into(),
-                "push_sanity_".into(),
-            ]);
-            self.command(source, "cargo.exe", &test_args, cargo_env.clone())?;
-        }
-
-        if plan.hexagon_locks
-            || (affected.contains("bonsai-tools")
-                && paths.iter().any(|path| path.contains("hexagon")))
-        {
-            let mut hex_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
-            hex_args.extend([
-                "-p".into(),
-                "bonsai-tools".into(),
-                "--lib".into(),
-                "hexagon_tools::public_control".into(),
-            ]);
-            self.command(source, "cargo.exe", &hex_args, cargo_env.clone())?;
-        }
-
-        if affected.contains("bonsai-tools")
-            && paths.iter().any(|path| {
-                path == "tools/bonsai/src/release_package.rs"
-                    || path.starts_with("scripts/release/")
-            })
-        {
-            let mut rel_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
-            rel_args.extend([
-                "-p".into(),
-                "bonsai-tools".into(),
-                "--lib".into(),
-                "release_package".into(),
-            ]);
-            self.command(source, "cargo.exe", &rel_args, cargo_env.clone())?;
-        }
-
-        let windows_standard: Vec<_> = affected
-            .iter()
-            .filter(|package| package.as_str() != "bonsai-speech-asr")
-            .cloned()
-            .collect();
-        if !windows_standard.is_empty() {
-            let mut args = base_cargo_args("check", "aarch64-pc-windows-msvc");
-            args.push("--all-targets".into());
-            for package in &windows_standard {
-                args.push("-p".into());
-                args.push(package.into());
+        let result = (|| -> Result<()> {
+            if affected.contains("bonsai-ci") || plan.workspace_registry {
+                let mut test_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+                test_args.extend([
+                    "-p".into(),
+                    "bonsai-ci".into(),
+                    "--lib".into(),
+                    "--test".into(),
+                    "routing".into(),
+                    "--".into(),
+                    "--skip".into(),
+                    "push_sanity_".into(),
+                ]);
+                self.command(source, "cargo.exe", &test_args, cargo_env.clone())?;
             }
-            self.command(source, "cargo.exe", &args, cargo_env.clone())?;
-        }
 
-        if affected.contains("bonsai-speech-asr") {
-            let mut args = base_cargo_args("check", "aarch64-pc-windows-msvc");
-            args.extend([
-                "-p".into(),
-                "bonsai-speech-asr".into(),
-                "--no-default-features".into(),
-                "--features".into(),
-                "rust-qualification".into(),
-                "--all-targets".into(),
-            ]);
-            self.command(source, "cargo.exe", &args, cargo_env.clone())?;
-        }
-
-        const PORTABLE_LINUX_CRATES: [&str; 6] = [
-            "bonsai-artifacts",
-            "bonsai-audio",
-            "bonsai-cpu-policy",
-            "bonsai-broker",
-            "bonsai-markdown",
-            "bonsai-speech-service",
-        ];
-        let linux_affected: Vec<_> = affected
-            .iter()
-            .filter(|package| PORTABLE_LINUX_CRATES.contains(&package.as_str()))
-            .cloned()
-            .collect();
-        let has_linux_target = if linux_affected.is_empty() {
-            false
-        } else if let Some(rustlib) = Self::toolchain_root(&toolchain)
-            .map(|root| root.join("lib").join("rustlib"))
-            .filter(|path| path.is_dir())
-        {
-            rustlib.join("aarch64-unknown-linux-gnu").is_dir()
-        } else {
-            let installed = self.command(
-                source,
-                "rustup.exe",
-                &[
-                    "target".into(),
-                    "list".into(),
-                    "--installed".into(),
-                    "--toolchain".into(),
-                    toolchain.clone().into(),
-                ],
-                BTreeMap::new(),
-            )?;
-            let installed_text =
-                std::str::from_utf8(&installed).map_err(|error| error.to_string())?;
-            installed_text
-                .lines()
-                .any(|line| line.trim() == "aarch64-unknown-linux-gnu")
-        };
-        if has_linux_target {
-            let mut args = base_cargo_args("check", "aarch64-unknown-linux-gnu");
-            args.push("--lib".into());
-            for package in &linux_affected {
-                args.push("-p".into());
-                args.push(package.into());
+            if plan.hexagon_locks
+                || (affected.contains("bonsai-tools")
+                    && paths.iter().any(|path| path.contains("hexagon")))
+            {
+                let mut hex_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+                hex_args.extend([
+                    "-p".into(),
+                    "bonsai-tools".into(),
+                    "--lib".into(),
+                    "hexagon_tools::public_control".into(),
+                ]);
+                self.command(source, "cargo.exe", &hex_args, cargo_env.clone())?;
             }
-            self.command(source, "cargo.exe", &args, cargo_env)?;
+
+            if affected.contains("bonsai-tools")
+                && paths.iter().any(|path| {
+                    path == "tools/bonsai/src/release_package.rs"
+                        || path.starts_with("scripts/release/")
+                })
+            {
+                let mut rel_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+                rel_args.extend([
+                    "-p".into(),
+                    "bonsai-tools".into(),
+                    "--lib".into(),
+                    "release_package".into(),
+                ]);
+                self.command(source, "cargo.exe", &rel_args, cargo_env.clone())?;
+            }
+
+            // Always check the complete standard Windows workspace set when any
+            // standard package is affected so Cargo resolves one invariant
+            // unified feature graph and never thrashes cached dependency units.
+            if affected
+                .iter()
+                .any(|package| package.as_str() != "bonsai-speech-asr")
+            {
+                let mut args = base_cargo_args("check", "aarch64-pc-windows-msvc");
+                args.push("--all-targets".into());
+                for package in workspace
+                    .packages
+                    .keys()
+                    .filter(|package| package.as_str() != "bonsai-speech-asr")
+                {
+                    args.push("-p".into());
+                    args.push(package.into());
+                }
+                self.command(source, "cargo.exe", &args, cargo_env.clone())?;
+            }
+
+            if affected.contains("bonsai-speech-asr") {
+                let mut args = base_cargo_args("check", "aarch64-pc-windows-msvc");
+                args.extend([
+                    "-p".into(),
+                    "bonsai-speech-asr".into(),
+                    "--no-default-features".into(),
+                    "--features".into(),
+                    "rust-qualification".into(),
+                    "--all-targets".into(),
+                ]);
+                self.command(source, "cargo.exe", &args, cargo_env.clone())?;
+            }
+
+            const PORTABLE_LINUX_CRATES: [&str; 6] = [
+                "bonsai-artifacts",
+                "bonsai-audio",
+                "bonsai-cpu-policy",
+                "bonsai-broker",
+                "bonsai-markdown",
+                "bonsai-speech-service",
+            ];
+            let linux_affected = affected
+                .iter()
+                .any(|package| PORTABLE_LINUX_CRATES.contains(&package.as_str()));
+            let has_linux_target = if !linux_affected {
+                false
+            } else if let Some(rustlib) = Self::toolchain_root(&toolchain)
+                .map(|root| root.join("lib").join("rustlib"))
+                .filter(|path| path.is_dir())
+            {
+                rustlib.join("aarch64-unknown-linux-gnu").is_dir()
+            } else {
+                let installed = self.command(
+                    source,
+                    "rustup.exe",
+                    &[
+                        "target".into(),
+                        "list".into(),
+                        "--installed".into(),
+                        "--toolchain".into(),
+                        toolchain.clone().into(),
+                    ],
+                    BTreeMap::new(),
+                )?;
+                let installed_text =
+                    std::str::from_utf8(&installed).map_err(|error| error.to_string())?;
+                installed_text
+                    .lines()
+                    .any(|line| line.trim() == "aarch64-unknown-linux-gnu")
+            };
+            if has_linux_target {
+                let mut args = base_cargo_args("check", "aarch64-unknown-linux-gnu");
+                args.push("--lib".into());
+                for package in PORTABLE_LINUX_CRATES
+                    .into_iter()
+                    .filter(|package| workspace.packages.contains_key(*package))
+                {
+                    args.push("-p".into());
+                    args.push(package.into());
+                }
+                self.command(source, "cargo.exe", &args, cargo_env)?;
+            }
+
+            Ok(())
+        })();
+
+        for (path, bytes) in saved_helpers {
+            let _ = fs::write(path, bytes);
         }
 
-        Ok(())
+        result
     }
 
     #[cfg(test)]

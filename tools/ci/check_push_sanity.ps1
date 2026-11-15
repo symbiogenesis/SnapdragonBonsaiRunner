@@ -122,7 +122,7 @@ function Sync-PushSourceTree([string]$Source, [string]$Destination) {
                     if ($srcFile.Length -eq $dstFile.Length) {
                         $srcBytes = [IO.File]::ReadAllBytes($srcFile.FullName)
                         $dstBytes = [IO.File]::ReadAllBytes($dstFile.FullName)
-                        if ([Linq.Enumerable]::SequenceEqual[byte]($srcBytes, $dstBytes)) {
+                        if ([Convert]::ToBase64String($srcBytes) -ceq [Convert]::ToBase64String($dstBytes)) {
                             $same = $true
                         }
                     }
@@ -285,8 +285,16 @@ try {
     $env:CARGO_BUILD_FINGERPRINT = 'content'
     $env:CARGO_INCREMENTAL = '1'
     $env:BONSAI_PUSH_CARGO_TARGET_DIR = $target
-    $updates | & $tool push-sanity --root $Root --policy-root $policy --bootstrap-milliseconds $started.ElapsedMilliseconds
-    if ($LASTEXITCODE) { throw 'Push blocked: source sanity did not pass.' }
+    $scratchTool = Join-Path $scratch 'bonsai-ci.exe'
+    [IO.File]::Copy($tool, $scratchTool, $true)
+    try {
+        $updates | & $scratchTool push-sanity --root $Root --policy-root $policy --bootstrap-milliseconds $started.ElapsedMilliseconds
+        if ($LASTEXITCODE) { throw 'Push blocked: source sanity did not pass.' }
+    } finally {
+        if ((Test-Path -LiteralPath $receiptPath -PathType Leaf) -and -not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
+            [IO.File]::Copy($scratchTool, $tool, $true)
+        }
+    }
 } finally {
     $temporary = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) + [IO.Path]::DirectorySeparatorChar
     $absolute = [IO.Path]::GetFullPath($scratch)

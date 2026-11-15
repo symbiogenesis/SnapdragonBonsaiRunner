@@ -39,27 +39,38 @@ function Test-OwnedLanguages([string]$RepositoryRoot) {
     $commandPredicate=[Delegate]::CreateDelegate([Func[Management.Automation.Language.Ast,bool]],
         [Management.Automation.Language.CommandAst], [type].GetMethod('IsInstanceOfType',[type[]]@([object])))
     $linePolicy=[regex]::new((@(
-        '^\s*(?:-\s*)?(?:run:\s*)?(?:&\s*)?[''"]?(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?(?:\s|[''"]|$)'
-        '^\s*shell:\s*[''"]?python(?:[23](?:\.[0-9]+)*)?(?:\s|[''"]|$)'
-        '^\s*(?:-\s*)?uses:\s*[''"]?actions/setup-python@'
+        '^\s*(?:(?:-\s*)?(?:run:\s*)?(?:&\s*)?[''"]?(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?(?:\s|[''"]|$)|shell:\s*[''"]?python(?:[23](?:\.[0-9]+)*)?(?:\s|[''"]|$)|(?:-\s*)?uses:\s*[''"]?actions/setup-python@)'
         '(?:Command::new|startup_process::resolve|::resolve)\([^;]*["''](?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?["'']'
-    ) -join '|'),[Text.RegularExpressions.RegexOptions]'IgnoreCase,Multiline')
-    $rustPolicy=[regex]::new('(?is)(?:Command::new|(?:startup_process::)?resolve)\(\s*(?:OsStr::new\(\s*)?"(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?"')
-    $pending=[Collections.Generic.Stack[string]]::new(); $pending.Push([IO.Path]::GetFullPath($RepositoryRoot))
+    ) -join '|'),[Text.RegularExpressions.RegexOptions]'IgnoreCase,Multiline,Compiled')
+    $rustPolicy=[regex]::new('(?is)(?:Command::new|(?:startup_process::)?resolve)\(\s*(?:OsStr::new\(\s*)?"(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?"',[Text.RegularExpressions.RegexOptions]::Compiled)
+    $rootPath=[IO.Path]::GetFullPath($RepositoryRoot)
+    $pending=[Collections.Generic.Stack[IO.DirectoryInfo]]::new(); $pending.Push([IO.DirectoryInfo]::new($rootPath))
     while ($pending.Count) {
         $directory=$pending.Pop()
-        foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
-            $relative=[IO.Path]::GetRelativePath($RepositoryRoot,$entry).Replace('\','/')
-            $attributes=[IO.File]::GetAttributes($entry)
-            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-            if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
-                if ($relative -cin @('.git','.worktrees','target','third_party') -or [IO.Path]::GetFileName($entry) -ceq 'target') { continue }; $pending.Push($entry); continue
+        $isRoot=$directory.FullName -ceq $rootPath
+        foreach ($info in $directory.EnumerateFileSystemInfos()) {
+            if (($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ($info -is [IO.DirectoryInfo]) {
+                if ($info.Name -ceq 'target' -or ($isRoot -and $info.Name -cin @('.git','.worktrees','third_party'))) { continue }; $pending.Push($info); continue
             }
-            $extension=[IO.Path]::GetExtension($entry)
-            if ($extension -in @('.py','.pyc','.pyo','.pyw')) { $errors.Add("${relative}: owned Python code/runtime bytecode is prohibited"); continue }
-            if ($extension -notin @('.ps1','.psm1','.rs','.yml','.yaml','.sh') -and $relative -cne '.githooks/pre-commit') { continue }
+            $entry=$info.FullName
+            $extension=$info.Extension
+            if ($extension -in @('.py','.pyc','.pyo','.pyw')) {
+                $relative=[IO.Path]::GetRelativePath($rootPath,$entry).Replace('\','/')
+                $errors.Add("${relative}: owned Python code/runtime bytecode is prohibited"); continue
+            }
+            if ($extension -notin @('.ps1','.psm1','.rs','.yml','.yaml','.sh')) {
+                if ($info.Name -cne 'pre-commit') { continue }
+                $relative=[IO.Path]::GetRelativePath($rootPath,$entry).Replace('\','/')
+                if ($relative -cne '.githooks/pre-commit') { continue }
+            } else {
+                $relative=$null
+            }
             if ($extension -in @('.ps1','.psm1')) {
-                foreach ($lineNumber in (Get-PowerShellPythonCalls $entry $commandPredicate)) { $errors.Add("${relative}:${lineNumber}: Python execution is prohibited") }
+                foreach ($lineNumber in (Get-PowerShellPythonCalls $entry $commandPredicate)) {
+                    if ($null -eq $relative) { $relative=[IO.Path]::GetRelativePath($rootPath,$entry).Replace('\','/') }
+                    $errors.Add("${relative}:${lineNumber}: Python execution is prohibited")
+                }
                 continue
             }
             $text=[IO.File]::ReadAllText($entry)
@@ -67,14 +78,19 @@ function Test-OwnedLanguages([string]$RepositoryRoot) {
             # Most files have no candidate. Scan those in .NET without entering
             # a PowerShell loop for every line; retain exact per-line diagnostics
             # for candidates, including CR-only files and multiline false alarms.
-            if ($linePolicy.IsMatch($text.Replace("`r","`n"))) {
+            $normalized=if ($text.IndexOf("`r") -ge 0) { $text.Replace("`r`n","`n").Replace("`r","`n") } else { $text }
+            if ($linePolicy.IsMatch($normalized)) {
+                if ($null -eq $relative) { $relative=[IO.Path]::GetRelativePath($rootPath,$entry).Replace('\','/') }
                 $lineNumber=0
                 foreach ($line in [IO.File]::ReadAllLines($entry)) {
                     $lineNumber++
                     if ($linePolicy.IsMatch($line)) { $errors.Add("${relative}:${lineNumber}: Python execution/setup is prohibited") }
                 }
             }
-            if ($extension -ieq '.rs' -and $rustPolicy.IsMatch($text)) { $errors.Add("${relative}: Python runtime process resolution is prohibited") }
+            if ($extension -ieq '.rs' -and $rustPolicy.IsMatch($text)) {
+                if ($null -eq $relative) { $relative=[IO.Path]::GetRelativePath($rootPath,$entry).Replace('\','/') }
+                $errors.Add("${relative}: Python runtime process resolution is prohibited")
+            }
         }
     }
     return ,$errors.ToArray()
