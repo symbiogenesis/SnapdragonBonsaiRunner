@@ -6,8 +6,6 @@
 
 use std::{
     io,
-    marker::PhantomData,
-    rc::Rc,
     time::{Duration, Instant},
 };
 use windows::{
@@ -17,7 +15,6 @@ use windows::{
     },
     Security::Authorization::AppCapabilityAccess::{AppCapability, AppCapabilityAccessStatus},
     Storage::Streams::{DataReader, InMemoryRandomAccessStream},
-    Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
     core::h,
 };
 use windows_future::{AsyncStatus, IAsyncAction, IAsyncOperation};
@@ -38,26 +35,6 @@ pub(super) enum Event {
     Recording { generation: u64 },
     Clip { generation: u64, wav: Vec<u8> },
     Failed(&'static str),
-}
-
-struct Apartment(PhantomData<Rc<()>>);
-impl Apartment {
-    fn initialize() -> io::Result<Self> {
-        // SAFETY: This guard is created on the native UI thread before microphone
-        // activation and cannot cross threads. winit also uses an STA on Windows;
-        // this successful WinRT initialization has its own balanced guard.
-        unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }.map_err(|_| {
-            io::Error::other("The UI thread cannot initialize Windows microphone access.")
-        })?;
-        Ok(Self(PhantomData))
-    }
-}
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        // SAFETY: All capture objects have been closed on this same thread before
-        // this guard releases its successful RoInitialize call.
-        unsafe { RoUninitialize() };
-    }
 }
 
 #[derive(Default)]
@@ -177,11 +154,14 @@ pub(super) struct Microphone {
     pending_since: Instant,
     recording_since: Option<Instant>,
     checked_access: Instant,
-    _apartment: Apartment,
+    _apartment: crate::com_dialog::Apartment,
 }
 
 impl Microphone {
     pub(super) fn new() -> io::Result<Self> {
+        let apartment = crate::com_dialog::Apartment::sta().map_err(|_| {
+            io::Error::other("The UI thread cannot initialize Windows microphone access.")
+        })?;
         Ok(Self {
             lifecycle: Lifecycle::default(),
             capability: None,
@@ -190,7 +170,7 @@ impl Microphone {
             pending_since: Instant::now(),
             recording_since: None,
             checked_access: Instant::now(),
-            _apartment: Apartment::initialize()?,
+            _apartment: apartment,
         })
     }
 

@@ -11,7 +11,7 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, RPC_E_CHANGED_MODE, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         Media::Audio::{
             AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -19,10 +19,7 @@ use windows::{
             IActivateAudioInterfaceCompletionHandler, IAudioClient, IAudioRenderClient,
             WAVEFORMATEX,
         },
-        System::{
-            Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
-            Threading::{CreateEventW, WaitForSingleObject},
-        },
+        System::Threading::{CreateEventW, WaitForSingleObject},
     },
     core::{HRESULT, Interface, PCWSTR, w},
 };
@@ -884,37 +881,6 @@ mod activation {
     }
 }
 
-struct ComApartment {
-    owns_apartment: bool,
-}
-
-impl ComApartment {
-    fn enter() -> Result<Self, tts::Failure> {
-        // SAFETY: Initializing COM on this playback worker thread for async device activation.
-        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if hr.is_ok() {
-            Ok(Self {
-                owns_apartment: true,
-            })
-        } else if hr == RPC_E_CHANGED_MODE {
-            Ok(Self {
-                owns_apartment: false,
-            })
-        } else {
-            Err(AUDIO_FAILURE)
-        }
-    }
-}
-
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        if self.owns_apartment {
-            // SAFETY: Matches the successful `CoInitializeEx` on this worker thread.
-            unsafe { CoUninitialize() };
-        }
-    }
-}
-
 struct EventHandle(HANDLE);
 
 impl EventHandle {
@@ -1199,7 +1165,7 @@ struct WasapiOutput {
     sample_rate: u32,
     started: bool,
     last_padding_frames: u32,
-    _apartment: ComApartment,
+    _apartment: crate::com_dialog::Apartment,
 }
 
 impl WasapiOutput {
@@ -1208,7 +1174,8 @@ impl WasapiOutput {
         sample_rate: u32,
     ) -> Result<Self, tts::Failure> {
         let rate = normalize_sample_rate(sample_rate);
-        let apartment = ComApartment::enter()?;
+        let apartment =
+            crate::com_dialog::Apartment::com_mta_or_existing().map_err(|_| AUDIO_FAILURE)?;
         let stream = WasapiStream::open(rate)?;
         Ok(Self {
             stream: Some(stream),

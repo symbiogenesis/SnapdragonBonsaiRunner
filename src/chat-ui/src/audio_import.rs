@@ -1,9 +1,5 @@
 //! Native file selection, clipboard paste and bounded audio conversion.
 #![expect(
-    clippy::as_conversions,
-    reason = "Win32 HWND and callback cookies preserve their pointer-sized address bits."
-)]
-#![expect(
     clippy::redundant_pub_crate,
     reason = "Only the window uses this native boundary."
 )]
@@ -22,9 +18,6 @@ use std::{
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
-};
-use windows::Win32::System::WinRT::{
-    RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize,
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
@@ -81,6 +74,10 @@ struct PasteState {
     owner: AtomicIsize,
     pending: AtomicBool,
 }
+const fn hwnd(value: isize) -> HWND {
+    std::ptr::without_provenance_mut(value.cast_unsigned())
+}
+
 /// UI-thread hook: winit consumes file-paste keys without emitting an egui event.
 pub(crate) struct PasteHook {
     state: Option<Box<PasteState>>,
@@ -92,11 +89,11 @@ impl PasteHook {
             owner: AtomicIsize::new(owner),
             pending: AtomicBool::new(false),
         });
-        let cookie = std::ptr::from_ref(state.as_ref()) as usize;
+        let cookie = std::ptr::from_ref(state.as_ref()).expose_provenance();
         // SAFETY: eframe supplies its HWND on its owning UI thread. The boxed
         // callback state remains live at a stable address until subclass removal.
         let installed =
-            unsafe { SetWindowSubclass(owner as HWND, Some(paste_window_proc), cookie, cookie) };
+            unsafe { SetWindowSubclass(hwnd(owner), Some(paste_window_proc), cookie, cookie) };
         if installed == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -118,11 +115,11 @@ impl Drop for PasteHook {
         };
         let owner = state.owner.load(Ordering::Acquire);
         if owner != 0 {
-            let cookie = std::ptr::from_ref(state.as_ref()) as usize;
+            let cookie = std::ptr::from_ref(state.as_ref()).addr();
             // SAFETY: This !Send guard removes its subclass on the owning UI
             // thread. Destruction clears HWND before this removal is necessary.
             let removed =
-                unsafe { RemoveWindowSubclass(owner as HWND, Some(paste_window_proc), cookie) };
+                unsafe { RemoveWindowSubclass(hwnd(owner), Some(paste_window_proc), cookie) };
             if removed == 0 {
                 // A failed removal leaves callback ownership uncertain. Retain
                 // this one small allocation so any later callback stays valid.
@@ -141,7 +138,7 @@ unsafe extern "system" fn paste_window_proc(
 ) -> LRESULT {
     // SAFETY: The stable boxed state outlives its subclass; callbacks and Drop
     // run on this same window thread, so removal precedes freeing this pointer.
-    let state = unsafe { &*(data as *const PasteState) };
+    let state = unsafe { &*std::ptr::with_exposed_provenance::<PasteState>(data) };
     if message == WM_KEYDOWN && detail & (1 << 30) == 0 {
         // SAFETY: GetKeyState only queries process keyboard state.
         let control = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
@@ -360,26 +357,6 @@ fn clipboard_file() -> Result<Option<PathBuf>, &'static str> {
         &name[..name.len() - 1],
     ))))
 }
-pub(crate) struct Apartment(PhantomData<Rc<()>>);
-impl Apartment {
-    pub(crate) fn sta() -> windows::core::Result<Self> {
-        // SAFETY: This worker owns this single-threaded apartment and its COM objects.
-        unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }?;
-        Ok(Self(PhantomData))
-    }
-
-    pub(crate) fn mta() -> windows::core::Result<Self> {
-        // SAFETY: This worker owns this multithreaded apartment and its WinRT objects.
-        unsafe { RoInitialize(RO_INIT_MULTITHREADED) }?;
-        Ok(Self(PhantomData))
-    }
-}
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        // SAFETY: Balance successful initialization on this same worker thread.
-        unsafe { RoUninitialize() };
-    }
-}
 pub(crate) fn run_worker(arguments: &[OsString]) -> std::process::ExitCode {
     isolated::run_worker(arguments)
 }
@@ -389,7 +366,7 @@ fn convert_with(
     shared: &Shared,
     deliver: &mut impl FnMut(Chunk) -> Result<bool, &'static str>,
 ) -> Result<(), &'static str> {
-    let _apartment = Apartment::mta().map_err(|_| CODEC_FAILURE)?;
+    let _apartment = crate::com_dialog::Apartment::mta().map_err(|_| CODEC_FAILURE)?;
     check_memory(CHUNK_WORKING_BYTES)?;
     let mut decoder = Decoder::open(path, shared, Instant::now() + CONVERSION_LIMIT)?;
     let total = decoder.total();

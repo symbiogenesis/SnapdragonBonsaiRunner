@@ -50,10 +50,6 @@ mod iteration_ui_tests;
 #[cfg(test)]
 mod keyboard_tests;
 mod lightbox;
-#[allow(
-    unsafe_code,
-    reason = "Audited UI-thread WinRT microphone initialization and teardown."
-)]
 mod microphone;
 mod model_lifecycle;
 mod navigation;

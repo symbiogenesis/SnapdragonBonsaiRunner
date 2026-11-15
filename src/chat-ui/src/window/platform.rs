@@ -1,9 +1,8 @@
 //! Small Windows boundary for system contrast colors and fatal launch errors.
 
-use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, path::PathBuf, ptr};
+use std::{path::PathBuf, ptr};
 
 use eframe::egui::{Color32, Shadow, Stroke, Visuals};
-use windows::{Win32::System::Com::CoTaskMemFree, core::PCWSTR};
 use windows_sys::Win32::{
     Graphics::Gdi::{
         COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
@@ -118,21 +117,10 @@ fn contrast_visuals(colors: SystemColors) -> Visuals {
     visuals
 }
 
-struct KnownFolderString(windows_sys::core::PWSTR);
-
-impl Drop for KnownFolderString {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: The pointer was allocated by SHGetKnownFolderPath for this owner.
-            unsafe { CoTaskMemFree(Some(self.0.cast())) };
-        }
-    }
-}
-
 /// Resolve the system Fonts folder via the Windows Shell known-folder API.
 #[allow(
     unsafe_code,
-    reason = "Read-only Windows Shell known-folder query with RAII CoTaskMemFree ownership."
+    reason = "Read-only Windows Shell known-folder query with RAII CoTaskMemString ownership."
 )]
 pub(super) fn fonts_directory() -> Option<PathBuf> {
     let mut raw = ptr::null_mut();
@@ -145,15 +133,11 @@ pub(super) fn fonts_directory() -> Option<PathBuf> {
             &raw mut raw,
         )
     };
-    let allocated = KnownFolderString(raw);
-    if status < 0 || allocated.0.is_null() {
+    let allocated = crate::com_dialog::CoTaskMemString::from_raw(raw);
+    if status < 0 {
         return None;
     }
-    let raw_pcwstr = PCWSTR::from_raw(allocated.0);
-    // SAFETY: SHGetKnownFolderPath guarantees a valid NUL-terminated UTF-16 buffer until Drop.
-    let wide = unsafe { raw_pcwstr.as_wide() };
-    let path = PathBuf::from(OsString::from_wide(wide));
-    path.is_absolute().then_some(path)
+    allocated.into_path_buf().filter(|path| path.is_absolute())
 }
 
 /// Keep fatal startup failures visible when an egui window cannot be created.

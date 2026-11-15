@@ -503,7 +503,7 @@ mod tests {
         MAX_SAMPLES, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_STREAMTICK, PcmBuffer,
         Shared, callback_frame,
     };
-    use crate::audio_import::Apartment;
+    use crate::com_dialog::Apartment;
     use std::{
         fs,
         io::{self, Write},
