@@ -260,6 +260,68 @@ pub fn completion_arguments(model_path: &str, profile: Profile) -> Result<Vec<St
     Ok(arguments)
 }
 
+/// Speculative decoding mode forwarded to the native inference backend.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpeculationPolicy {
+    /// Disable speculative decoding (`--spec-type none`).
+    #[default]
+    None,
+    /// Enable prompt-suffix speculative drafting (`--spec-type suffix --draft-max <1..=8>`).
+    Suffix {
+        /// Maximum candidate draft tokens per step (`1..=8`).
+        draft_max: u8,
+    },
+}
+
+/// Build fixed CPU completion arguments tuned for a Snapdragon processor family and speculation policy.
+///
+/// Updates `--threads` and `--threads-batch` from [`hardware::SnapdragonFamily::default_thread_budget`]
+/// and appends `--spec-type` (plus `--draft-max` when [`SpeculationPolicy::Suffix`] is selected).
+///
+/// # Errors
+/// Rejects empty or NUL-containing model paths, missing thread controls, or `draft_max` outside `1..=8`.
+pub fn completion_arguments_for_family(
+    model_path: &str,
+    profile: Profile,
+    family: hardware::SnapdragonFamily,
+    speculation: SpeculationPolicy,
+) -> Result<Vec<String>, String> {
+    let mut arguments = completion_arguments(model_path, profile)?;
+    let (decode_threads, prefill_threads) = family.default_thread_budget();
+    for (flag, value) in [
+        ("--threads", decode_threads),
+        ("--threads-batch", prefill_threads),
+    ] {
+        let index = arguments
+            .iter()
+            .position(|argument| argument == flag)
+            .ok_or_else(|| "Common CPU prefix is missing a thread control.".to_owned())?;
+        let slot = arguments
+            .get_mut(index + 1)
+            .ok_or_else(|| "Incomplete CPU thread control.".to_owned())?;
+        *slot = value.to_string();
+    }
+    match speculation {
+        SpeculationPolicy::None => {
+            arguments.extend(["--spec-type".into(), "none".into()]);
+        }
+        SpeculationPolicy::Suffix { draft_max } => {
+            require(
+                (1..=8).contains(&draft_max),
+                "Speculative draft bound must be 1..=8.",
+            )?;
+            arguments.extend([
+                "--spec-type".into(),
+                "suffix".into(),
+                "--draft-max".into(),
+                draft_max.to_string(),
+            ]);
+        }
+    }
+    Ok(arguments)
+}
+
 fn check_arguments(
     model_path: &str,
     profile: Profile,

@@ -33,9 +33,9 @@ impl Threads {
     }
 }
 
-fn candidates(available: u16) -> Vec<Threads> {
+fn candidates(family: SnapdragonFamily, available: u16) -> Vec<Threads> {
     // One candidate is the entire owner-device screen, not a slice of a matrix.
-    std::iter::once((6, 6))
+    std::iter::once(family.default_thread_budget())
         .filter(|(decode, prefill)| *decode <= available && *prefill <= available)
         .map(|(decode, prefill)| Threads { decode, prefill })
         .collect()
@@ -149,13 +149,28 @@ pub fn run(request: Value) -> Result<Value> {
         return conditions::compare(request);
     }
     let request: Request = serde_json::from_value(request).map_err(|error| error.to_string())?;
-    if request.operation != "plan"
-        || SnapdragonFamily::from_processor_name(&request.processor_name)
-            != Some(SnapdragonFamily::X2EliteExtreme)
-        || !(6..=256).contains(&request.logical_processors)
-    {
-        return Err("CPU screening requires observed X2 Elite Extreme identity and 6..256 logical processors.".into());
-    }
+    let (family, kind) = if request.operation != "plan" {
+        return Err("CPU screening requires operation \"plan\".".into());
+    } else {
+        match SnapdragonFamily::from_processor_name(&request.processor_name) {
+            Some(SnapdragonFamily::X2EliteExtreme)
+                if (6..=256).contains(&request.logical_processors) =>
+            {
+                (
+                    SnapdragonFamily::X2EliteExtreme,
+                    "runner-x2-cpu-evaluation-plan",
+                )
+            }
+            Some(SnapdragonFamily::XElite) if (12..=256).contains(&request.logical_processors) => {
+                (SnapdragonFamily::XElite, "runner-x1-cpu-evaluation-plan")
+            }
+            _ => {
+                return Err(
+                    "CPU screening requires observed X1 Elite (12..256 logical processors) or X2 Elite Extreme (6..256 logical processors).".into(),
+                );
+            }
+        }
+    };
     let cpu = bonsai_cpu_policy::run(json!({
         "operation": "plan", "dataDirectory": request.data_directory,
         "profile": "swift-pq2-assessment", "useAbliterateLora": true, "useRepackedPtq1": false,
@@ -163,7 +178,7 @@ pub fn run(request: Value) -> Result<Value> {
     let model = cpu["ModelPath"]
         .as_str()
         .ok_or("Missing compiled CPU model path.")?;
-    let candidates = candidates(request.logical_processors);
+    let candidates = candidates(family, request.logical_processors);
     let workloads = workloads();
     let baseline = Threads {
         decode: 4,
@@ -196,8 +211,8 @@ pub fn run(request: Value) -> Result<Value> {
         }
     }
     Ok(json!({
-        "SchemaVersion": 1, "Kind": "runner-x2-cpu-evaluation-plan", "ModelProcessStarted": false,
-        "DeviceModel": SnapdragonFamily::X2EliteExtreme.device_model(),
+        "SchemaVersion": 1, "Kind": kind, "ModelProcessStarted": false,
+        "DeviceModel": family.device_model(),
         "ProcessorName": request.processor_name, "LogicalProcessors": request.logical_processors,
         "CpuPlan": cpu, "Candidates": candidates.iter().map(|threads| json!({
             "Id": threads.id(), "DecodeThreads": threads.decode, "PrefillThreads": threads.prefill,
@@ -328,13 +343,39 @@ mod tests {
         for count in [0, 4, 257] {
             assert!(run(request(count)).is_err());
         }
-        for name in ["Snapdragon X Elite", "Snapdragon X2 Elite", "Unknown CPU"] {
+        for name in ["Snapdragon X Plus", "Snapdragon X2 Elite", "Unknown CPU"] {
             let mut input = request(18);
             input["processorName"] = name.into();
             assert!(run(input).is_err());
         }
+        let mut x1_under_minimum = request(8);
+        x1_under_minimum["processorName"] = "Snapdragon X Elite".into();
+        assert!(run(x1_under_minimum).is_err());
         let mut input = request(18);
         input["poll"] = 50.into();
         assert!(run(input).is_err());
+    }
+
+    #[test]
+    fn x1_elite_screen_plans_d8_p12_candidate_and_rejects_sub_twelve_cores() -> Result<()> {
+        let mut x1 = request(12);
+        x1["processorName"] = "Snapdragon(R) X Elite - X1E80100 - Qualcomm Oryon(TM) CPU".into();
+        let plan = run(x1.clone())?;
+        assert_eq!(plan["Kind"], "runner-x1-cpu-evaluation-plan");
+        assert_eq!(plan["DeviceModel"], "Snapdragon X Elite");
+        let candidates = plan["Candidates"].as_array().ok_or("Missing candidates.")?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["Id"], "d8-p12");
+        assert_eq!(candidates[0]["DecodeThreads"], 8);
+        assert_eq!(candidates[0]["PrefillThreads"], 12);
+        let schedule = plan["Schedule"].as_array().ok_or("Missing schedule.")?;
+        assert_eq!(schedule.len(), 4);
+        assert_eq!(schedule[0]["CandidateId"], "d8-p12");
+        assert_eq!(schedule[1]["DecodeThreads"], 8);
+        assert_eq!(schedule[1]["PrefillThreads"], 12);
+
+        x1["logicalProcessors"] = 11.into();
+        assert!(run(x1).is_err());
+        Ok(())
     }
 }

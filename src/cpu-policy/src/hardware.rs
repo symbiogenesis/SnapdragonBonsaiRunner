@@ -67,6 +67,19 @@ impl SnapdragonFamily {
         }
     }
 
+    /// Conservative default `(decode, prefill)` CPU thread budget for this family.
+    ///
+    /// Snapdragon X Elite uses `8` decode threads across two Oryon clusters to avoid
+    /// three-cluster coherency splitting on `67 GB/s` LPDDR5x while prefilling across all
+    /// `12` homogeneous Oryon cores; X2 Elite Extreme uses symmetric `(6, 6)`.
+    #[must_use]
+    pub const fn default_thread_budget(self) -> (u16, u16) {
+        match self {
+            Self::XElite => (8, 12),
+            Self::X2EliteExtreme => (6, 6),
+        }
+    }
+
     /// Check an evidence label against the observed name when present.
     ///
     /// Only legacy X1 receipts may omit the processor observation. Newer family

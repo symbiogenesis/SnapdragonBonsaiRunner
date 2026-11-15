@@ -343,3 +343,68 @@ fn swift_development_budget_keeps_four_gib_reserve_for_every_artifact() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn family_thread_budgets_and_speculation_arguments_stay_bounded() -> Result<(), String> {
+    assert_eq!(
+        hardware::SnapdragonFamily::XElite.default_thread_budget(),
+        (8, 12)
+    );
+    assert_eq!(
+        hardware::SnapdragonFamily::X2EliteExtreme.default_thread_budget(),
+        (6, 6)
+    );
+
+    let x1_args = completion_arguments_for_family(
+        "C:\\models\\Swift.gguf",
+        Profile::SwiftPq2Assessment,
+        hardware::SnapdragonFamily::XElite,
+        SpeculationPolicy::Suffix { draft_max: 4 },
+    )?;
+    for (flag, expected) in [
+        ("--threads", "8"),
+        ("--threads-batch", "12"),
+        ("--spec-type", "suffix"),
+        ("--draft-max", "4"),
+    ] {
+        let index = x1_args
+            .iter()
+            .position(|argument| argument == flag)
+            .ok_or_else(|| format!("missing flag {flag}"))?;
+        assert_eq!(x1_args.get(index + 1).map(String::as_str), Some(expected));
+    }
+
+    let x2_none = completion_arguments_for_family(
+        "C:\\models\\Swift.gguf",
+        Profile::SwiftPq2Assessment,
+        hardware::SnapdragonFamily::X2EliteExtreme,
+        SpeculationPolicy::None,
+    )?;
+    for (flag, expected) in [
+        ("--threads", "6"),
+        ("--threads-batch", "6"),
+        ("--spec-type", "none"),
+    ] {
+        let index = x2_none
+            .iter()
+            .position(|argument| argument == flag)
+            .ok_or_else(|| format!("missing flag {flag}"))?;
+        assert_eq!(x2_none.get(index + 1).map(String::as_str), Some(expected));
+    }
+    assert!(!x2_none.iter().any(|argument| argument == "--draft-max"));
+
+    for bad_draft in [0_u8, 9_u8] {
+        assert!(
+            completion_arguments_for_family(
+                "C:\\models\\Swift.gguf",
+                Profile::SwiftPq2Assessment,
+                hardware::SnapdragonFamily::XElite,
+                SpeculationPolicy::Suffix {
+                    draft_max: bad_draft,
+                },
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}
