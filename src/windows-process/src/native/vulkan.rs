@@ -1,10 +1,12 @@
 //! Bounded read-only Vulkan queries. The caller owns the driver-call deadline.
 
-use std::ffi::{CStr, OsString, c_char};
+use std::ffi::{CStr, FromBytesUntilNulError, OsString};
 use std::io;
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
+
+use ash::vk::{self, Handle as _};
 
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{
@@ -21,231 +23,6 @@ const MAX_QUEUES: usize = 64;
 const MAX_EXTENSIONS: usize = 1024;
 const MAX_MODULES: usize = 256;
 const MAX_MODULE_NAME: usize = 260;
-
-mod vk {
-    use std::ffi::{c_char, c_void};
-
-    pub(super) const API_VERSION_1_0: u32 = 1 << 22;
-    pub(super) const API_VERSION_1_1: u32 = (1 << 22) | (1 << 12);
-    pub(super) const API_VERSION_1_2: u32 = (1 << 22) | (2 << 12);
-    pub(super) const API_VERSION_1_3: u32 = (1 << 22) | (3 << 12);
-
-    pub(super) const SUCCESS: i32 = 0;
-    #[cfg(test)]
-    pub(super) const INCOMPLETE: i32 = 5;
-    #[cfg(test)]
-    pub(super) const ERROR_INCOMPATIBLE_DRIVER: i32 = -9;
-
-    pub(super) const STRUCTURE_TYPE_APPLICATION_INFO: i32 = 0;
-    pub(super) const STRUCTURE_TYPE_INSTANCE_CREATE_INFO: i32 = 1;
-    pub(super) const STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2: i32 = 1_000_059_000;
-    pub(super) const STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2: i32 = 1_000_059_001;
-    pub(super) const STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: i32 =
-        1_000_082_000;
-    pub(super) const STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: i32 = 1_000_094_000;
-    pub(super) const STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: i32 =
-        1_000_280_000;
-
-    pub(super) const PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: i32 = 1;
-    pub(super) const PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: i32 = 2;
-    pub(super) const PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: i32 = 3;
-    pub(super) const PHYSICAL_DEVICE_TYPE_CPU: i32 = 4;
-
-    pub(super) const QUEUE_COMPUTE_BIT: u32 = 0x0000_0002;
-    pub(super) const MEMORY_HEAP_DEVICE_LOCAL_BIT: u32 = 0x0000_0001;
-
-    pub(super) type Instance = *mut c_void;
-    pub(super) type PhysicalDevice = *mut c_void;
-    pub(super) type VoidFunction = unsafe extern "system" fn();
-    pub(super) type GetInstanceProcAddr =
-        unsafe extern "system" fn(Instance, *const c_char) -> Option<VoidFunction>;
-    pub(super) type EnumerateInstanceVersion = unsafe extern "system" fn(*mut u32) -> i32;
-    pub(super) type CreateInstance =
-        unsafe extern "system" fn(*const InstanceCreateInfo, *const c_void, *mut Instance) -> i32;
-    pub(super) type DestroyInstance = unsafe extern "system" fn(Instance, *const c_void);
-    pub(super) type EnumeratePhysicalDevices =
-        unsafe extern "system" fn(Instance, *mut u32, *mut PhysicalDevice) -> i32;
-    pub(super) type GetPhysicalDeviceProperties =
-        unsafe extern "system" fn(PhysicalDevice, *mut PhysicalDeviceProperties);
-    pub(super) type EnumerateDeviceExtensionProperties = unsafe extern "system" fn(
-        PhysicalDevice,
-        *const c_char,
-        *mut u32,
-        *mut ExtensionProperties,
-    ) -> i32;
-    pub(super) type GetPhysicalDeviceQueueFamilyProperties =
-        unsafe extern "system" fn(PhysicalDevice, *mut u32, *mut QueueFamilyProperties);
-    pub(super) type GetPhysicalDeviceMemoryProperties =
-        unsafe extern "system" fn(PhysicalDevice, *mut PhysicalDeviceMemoryProperties);
-    pub(super) type GetPhysicalDeviceFeatures2 =
-        unsafe extern "system" fn(PhysicalDevice, *mut PhysicalDeviceFeatures2);
-    pub(super) type GetPhysicalDeviceProperties2 =
-        unsafe extern "system" fn(PhysicalDevice, *mut PhysicalDeviceProperties2);
-
-    #[repr(C)]
-    pub(super) struct ApplicationInfo {
-        pub(super) s_type: i32,
-        pub(super) p_next: *const c_void,
-        pub(super) p_application_name: *const c_char,
-        pub(super) application_version: u32,
-        pub(super) p_engine_name: *const c_char,
-        pub(super) engine_version: u32,
-        pub(super) api_version: u32,
-    }
-
-    #[repr(C)]
-    pub(super) struct InstanceCreateInfo {
-        pub(super) s_type: i32,
-        pub(super) p_next: *const c_void,
-        pub(super) flags: u32,
-        pub(super) p_application_info: *const ApplicationInfo,
-        pub(super) enabled_layer_count: u32,
-        pub(super) pp_enabled_layer_names: *const *const c_char,
-        pub(super) enabled_extension_count: u32,
-        pub(super) pp_enabled_extension_names: *const *const c_char,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub(super) struct PhysicalDeviceProperties {
-        pub(super) api_version: u32,
-        pub(super) driver_version: u32,
-        pub(super) vendor_id: u32,
-        pub(super) device_id: u32,
-        pub(super) device_type: i32,
-        pub(super) device_name: [c_char; 256],
-        pub(super) pipeline_cache_uuid: [u8; 16],
-        pub(super) limits: [u64; 63],
-        pub(super) sparse_properties: [u32; 5],
-    }
-
-    impl Default for PhysicalDeviceProperties {
-        fn default() -> Self {
-            Self {
-                api_version: 0,
-                driver_version: 0,
-                vendor_id: 0,
-                device_id: 0,
-                device_type: 0,
-                device_name: [0; 256],
-                pipeline_cache_uuid: [0; 16],
-                limits: [0; 63],
-                sparse_properties: [0; 5],
-            }
-        }
-    }
-
-    #[repr(C)]
-    pub(super) struct PhysicalDeviceProperties2 {
-        pub(super) s_type: i32,
-        pub(super) p_next: *mut c_void,
-        pub(super) properties: PhysicalDeviceProperties,
-    }
-
-    #[repr(C)]
-    pub(super) struct PhysicalDeviceFeatures2 {
-        pub(super) s_type: i32,
-        pub(super) p_next: *mut c_void,
-        pub(super) features: [u32; 55],
-    }
-
-    #[repr(C)]
-    pub(super) struct PhysicalDeviceShaderFloat16Int8Features {
-        pub(super) s_type: i32,
-        pub(super) p_next: *mut c_void,
-        pub(super) shader_float16: u32,
-        pub(super) shader_int8: u32,
-    }
-
-    #[repr(C)]
-    pub(super) struct PhysicalDeviceShaderIntegerDotProductFeatures {
-        pub(super) s_type: i32,
-        pub(super) p_next: *mut c_void,
-        pub(super) shader_integer_dot_product: u32,
-    }
-
-    #[repr(C)]
-    pub(super) struct PhysicalDeviceSubgroupProperties {
-        pub(super) s_type: i32,
-        pub(super) p_next: *mut c_void,
-        pub(super) subgroup_size: u32,
-        pub(super) supported_stages: u32,
-        pub(super) supported_operations: u32,
-        pub(super) quad_operations_in_all_stages: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub(super) struct ExtensionProperties {
-        pub(super) extension_name: [c_char; 256],
-        pub(super) spec_version: u32,
-    }
-
-    impl Default for ExtensionProperties {
-        fn default() -> Self {
-            Self {
-                extension_name: [0; 256],
-                spec_version: 0,
-            }
-        }
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct Extent3D {
-        pub(super) width: u32,
-        pub(super) height: u32,
-        pub(super) depth: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct QueueFamilyProperties {
-        pub(super) queue_flags: u32,
-        pub(super) queue_count: u32,
-        pub(super) timestamp_valid_bits: u32,
-        pub(super) min_image_transfer_granularity: Extent3D,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct MemoryType {
-        pub(super) property_flags: u32,
-        pub(super) heap_index: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct MemoryHeap {
-        pub(super) size: u64,
-        pub(super) flags: u32,
-        pub(super) reserved: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct PhysicalDeviceMemoryProperties {
-        pub(super) type_count: u32,
-        pub(super) types: [MemoryType; 32],
-        pub(super) heap_count: u32,
-        pub(super) heaps: [MemoryHeap; 16],
-    }
-
-    const _: () = {
-        assert!(size_of::<ApplicationInfo>() == 48);
-        assert!(size_of::<InstanceCreateInfo>() == 64);
-        assert!(size_of::<PhysicalDeviceProperties>() == 824);
-        assert!(size_of::<PhysicalDeviceProperties2>() == 840);
-        assert!(size_of::<PhysicalDeviceFeatures2>() == 240);
-        assert!(size_of::<PhysicalDeviceShaderFloat16Int8Features>() == 24);
-        assert!(size_of::<PhysicalDeviceShaderIntegerDotProductFeatures>() == 24);
-        assert!(size_of::<PhysicalDeviceSubgroupProperties>() == 32);
-        assert!(size_of::<ExtensionProperties>() == 260);
-        assert!(size_of::<QueueFamilyProperties>() == 24);
-        assert!(size_of::<MemoryHeap>() == 16);
-        assert!(size_of::<PhysicalDeviceMemoryProperties>() == 520);
-    };
-}
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "unsupported Vulkan inventory")
@@ -373,13 +150,13 @@ fn module_snapshot(
     Some((basenames, candidates))
 }
 
-fn check(result: i32) -> io::Result<()> {
-    if result == vk::SUCCESS {
+fn check(result: vk::Result) -> io::Result<()> {
+    if result == vk::Result::SUCCESS {
         Ok(())
     } else {
         Err(failure(
             "device-query",
-            Some(result),
+            Some(result.as_raw()),
             None,
             None,
             io::ErrorKind::Other,
@@ -387,11 +164,8 @@ fn check(result: i32) -> io::Result<()> {
     }
 }
 
-fn text(bytes: &[c_char]) -> io::Result<String> {
-    // SAFETY: `c_char` and `u8` have identical 1-byte layout with no invalid
-    // bit patterns; scanning up to NUL reads only initialized slice elements.
-    let bytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), bytes.len()) };
-    let text = CStr::from_bytes_until_nul(bytes)
+fn text(c_str: Result<&CStr, FromBytesUntilNulError>) -> io::Result<String> {
+    let text = c_str
         .map_err(|_| invalid())?
         .to_str()
         .map_err(|_| invalid())?;
@@ -412,9 +186,7 @@ impl Drop for Library {
 }
 
 struct Loader {
-    get_instance_proc_addr: vk::GetInstanceProcAddr,
-    enumerate_instance_version: Option<vk::EnumerateInstanceVersion>,
-    create_instance: vk::CreateInstance,
+    entry: ash::Entry,
     _library: Library,
 }
 
@@ -456,66 +228,49 @@ impl Loader {
                 .ok_or_else(|| io::Error::other("system Vulkan loader unavailable"))?;
         // SAFETY: `vkGetInstanceProcAddr` has the exact Khronos Vulkan 1.0 ABI.
         let get_instance_proc_addr = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, vk::GetInstanceProcAddr>(
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, vk::PFN_vkGetInstanceProcAddr>(
                 proc_addr,
             )
         };
-        // SAFETY: Global loader commands use a null VkInstance and NUL-terminated name.
-        let enumerate_instance_version =
-            unsafe { get_instance_proc_addr(null_mut(), c"vkEnumerateInstanceVersion".as_ptr()) }
-                .map(|function| {
-                    // SAFETY: Exact `vkEnumerateInstanceVersion` symbol and Khronos ABI.
-                    unsafe {
-                        std::mem::transmute::<vk::VoidFunction, vk::EnumerateInstanceVersion>(
-                            function,
-                        )
-                    }
-                });
-        // SAFETY: Global loader command lookup with null VkInstance.
-        let create_fn = unsafe { get_instance_proc_addr(null_mut(), c"vkCreateInstance".as_ptr()) }
-            .ok_or_else(|| io::Error::other("system Vulkan loader unavailable"))?;
-        // SAFETY: Exact `vkCreateInstance` symbol and Khronos ABI.
-        let create_instance =
-            unsafe { std::mem::transmute::<vk::VoidFunction, vk::CreateInstance>(create_fn) };
+        // SAFETY: Global loader command lookup uses a null VkInstance and NUL-terminated name.
+        if unsafe { get_instance_proc_addr(vk::Instance::null(), c"vkCreateInstance".as_ptr()) }
+            .is_none()
+        {
+            return Err(io::Error::other("system Vulkan loader unavailable"));
+        }
+        // SAFETY: `get_instance_proc_addr` has been resolved from the live
+        // `vulkan-1.dll`, `vkCreateInstance` is verified non-null, and `library`
+        // outlives `entry`.
+        let entry = unsafe {
+            ash::Entry::from_static_fn(ash::StaticFn {
+                get_instance_proc_addr,
+            })
+        };
         Ok(Self {
-            get_instance_proc_addr,
-            enumerate_instance_version,
-            create_instance,
+            entry,
             _library: library,
         })
     }
 
     fn instance_version(&self) -> Result<u32, i32> {
-        let Some(enumerate) = self.enumerate_instance_version else {
-            return Ok(vk::API_VERSION_1_0);
-        };
-        let mut version = vk::API_VERSION_1_0;
-        // SAFETY: Writable u32 output for the global instance version query.
-        let status = unsafe { enumerate(&raw mut version) };
-        if status == vk::SUCCESS {
-            Ok(version)
-        } else {
-            Err(status)
+        // SAFETY: `try_enumerate_instance_version` probes `vkEnumerateInstanceVersion`
+        // with a null instance and falls back to `Ok(None)` on Vulkan 1.0 loaders.
+        match unsafe { self.entry.try_enumerate_instance_version() } {
+            Ok(Some(version)) => Ok(version),
+            Ok(None) => Ok(vk::API_VERSION_1_0),
+            Err(status) => Err(status.as_raw()),
         }
     }
 
-    fn instance_symbol(&self, instance: vk::Instance, name: &CStr) -> io::Result<vk::VoidFunction> {
+    fn has_instance_symbol(&self, instance: vk::Instance, name: &CStr) -> io::Result<()> {
+        let get_instance_proc_addr = self.entry.static_fn().get_instance_proc_addr;
         // SAFETY: Valid live VkInstance and NUL-terminated Vulkan command name.
-        unsafe { (self.get_instance_proc_addr)(instance, name.as_ptr()) }.ok_or_else(invalid)
+        let symbol = unsafe { get_instance_proc_addr(instance, name.as_ptr()) };
+        symbol.ok_or_else(invalid).map(|_| ())
     }
 }
 
-struct Instance {
-    handle: vk::Instance,
-    destroy: vk::DestroyInstance,
-    enumerate_physical_devices: vk::EnumeratePhysicalDevices,
-    get_physical_device_properties: vk::GetPhysicalDeviceProperties,
-    enumerate_device_extension_properties: vk::EnumerateDeviceExtensionProperties,
-    get_physical_device_queue_family_properties: vk::GetPhysicalDeviceQueueFamilyProperties,
-    get_physical_device_memory_properties: vk::GetPhysicalDeviceMemoryProperties,
-    get_physical_device_features2: Option<vk::GetPhysicalDeviceFeatures2>,
-    get_physical_device_properties2: Option<vk::GetPhysicalDeviceProperties2>,
-}
+struct Instance(ash::Instance);
 
 const fn graphics_count_result(status: i32, count: u32) -> WindowsGraphicsAdapterCount {
     WindowsGraphicsAdapterCount {
@@ -587,7 +342,7 @@ impl Drop for Instance {
     fn drop(&mut self) {
         // SAFETY: This wrapper uniquely owns the instance, creates no children,
         // and is dropped before the Loader providing its function pointers.
-        unsafe { (self.destroy)(self.handle, null()) };
+        unsafe { self.0.destroy_instance(None) };
     }
 }
 
@@ -596,31 +351,16 @@ fn create_instance(
     loader_api: u32,
     application_api: u32,
 ) -> io::Result<(Instance, VulkanInstanceModules)> {
-    let application = vk::ApplicationInfo {
-        s_type: vk::STRUCTURE_TYPE_APPLICATION_INFO,
-        p_next: null(),
-        p_application_name: c"bonsai-inventory".as_ptr(),
-        application_version: 0,
-        p_engine_name: null(),
-        engine_version: 0,
-        api_version: application_api,
-    };
-    let create = vk::InstanceCreateInfo {
-        s_type: vk::STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        p_next: null(),
-        flags: 0,
-        p_application_info: &raw const application,
-        enabled_layer_count: 0,
-        pp_enabled_layer_names: null(),
-        enabled_extension_count: 0,
-        pp_enabled_extension_names: null(),
-    };
+    let application = vk::ApplicationInfo::default()
+        .application_name(c"bonsai-inventory")
+        .api_version(application_api);
+    let create = vk::InstanceCreateInfo::default().application_info(&application);
     let before = module_snapshot(None, false).map(|(names, _)| names);
-    let mut raw_instance: vk::Instance = null_mut();
+    let mut raw_instance = vk::Instance::null();
+    let create_fn = loader.entry.fp_v1_0().create_instance;
     // SAFETY: Initialized create structures have live pointers; no layers or
     // extensions are requested. The instance is destroyed before its Loader.
-    let status =
-        unsafe { (loader.create_instance)(&raw const create, null(), &raw mut raw_instance) };
+    let status = unsafe { create_fn(&raw const create, null(), &raw mut raw_instance) };
     let after = module_snapshot(before.as_deref(), true);
     let (after, file_candidates) = after.map_or((None, None), |(names, candidates)| {
         (Some(names), Some(candidates))
@@ -630,82 +370,46 @@ fn create_instance(
         after,
         file_candidates,
     };
-    if status != vk::SUCCESS || raw_instance.is_null() {
+    if status != vk::Result::SUCCESS || raw_instance.is_null() {
         return Err(io::Error::other(VulkanQueryFailure {
             stage: "instance-creation",
-            vulkan_result: Some(status),
+            vulkan_result: Some(status.as_raw()),
             loader_api_version: Some(loader_api),
             application_api_version: Some(application_api),
             instance_modules: Some(modules),
             graphics_adapter_count: Some(graphics_adapter_count()),
         }));
     }
-    // SAFETY: Exact `vkDestroyInstance` symbol and Khronos ABI.
-    let destroy = unsafe {
-        std::mem::transmute::<vk::VoidFunction, vk::DestroyInstance>(
-            loader.instance_symbol(raw_instance, c"vkDestroyInstance")?,
-        )
-    };
-    let mut instance = Instance {
-        handle: raw_instance,
-        destroy,
-        enumerate_physical_devices: unsafe {
-            // SAFETY: Exact `vkEnumeratePhysicalDevices` symbol and Khronos ABI.
-            std::mem::transmute::<vk::VoidFunction, vk::EnumeratePhysicalDevices>(
-                loader.instance_symbol(raw_instance, c"vkEnumeratePhysicalDevices")?,
-            )
-        },
-        get_physical_device_properties: unsafe {
-            // SAFETY: Exact `vkGetPhysicalDeviceProperties` symbol and Khronos ABI.
-            std::mem::transmute::<vk::VoidFunction, vk::GetPhysicalDeviceProperties>(
-                loader.instance_symbol(raw_instance, c"vkGetPhysicalDeviceProperties")?,
-            )
-        },
-        enumerate_device_extension_properties: unsafe {
-            // SAFETY: Exact `vkEnumerateDeviceExtensionProperties` symbol and Khronos ABI.
-            std::mem::transmute::<vk::VoidFunction, vk::EnumerateDeviceExtensionProperties>(
-                loader.instance_symbol(raw_instance, c"vkEnumerateDeviceExtensionProperties")?,
-            )
-        },
-        get_physical_device_queue_family_properties: unsafe {
-            // SAFETY: Exact `vkGetPhysicalDeviceQueueFamilyProperties` symbol and Khronos ABI.
-            std::mem::transmute::<vk::VoidFunction, vk::GetPhysicalDeviceQueueFamilyProperties>(
-                loader
-                    .instance_symbol(raw_instance, c"vkGetPhysicalDeviceQueueFamilyProperties")?,
-            )
-        },
-        get_physical_device_memory_properties: unsafe {
-            // SAFETY: Exact `vkGetPhysicalDeviceMemoryProperties` symbol and Khronos ABI.
-            std::mem::transmute::<vk::VoidFunction, vk::GetPhysicalDeviceMemoryProperties>(
-                loader.instance_symbol(raw_instance, c"vkGetPhysicalDeviceMemoryProperties")?,
-            )
-        },
-        get_physical_device_features2: None,
-        get_physical_device_properties2: None,
-    };
+    loader.has_instance_symbol(raw_instance, c"vkDestroyInstance")?;
+    // SAFETY: `raw_instance` is a live owned VkInstance and `vkDestroyInstance`
+    // was verified non-null; remaining required symbols are verified before use.
+    let instance = Instance(unsafe { ash::Instance::load(loader.entry.static_fn(), raw_instance) });
+    for name in [
+        c"vkEnumeratePhysicalDevices",
+        c"vkGetPhysicalDeviceProperties",
+        c"vkEnumerateDeviceExtensionProperties",
+        c"vkGetPhysicalDeviceQueueFamilyProperties",
+        c"vkGetPhysicalDeviceMemoryProperties",
+    ] {
+        loader.has_instance_symbol(instance.0.handle(), name)?;
+    }
     if application_api >= vk::API_VERSION_1_1 {
-        // SAFETY: Exact Vulkan 1.1 `vkGetPhysicalDeviceFeatures2` and `vkGetPhysicalDeviceProperties2` ABIs.
-        instance.get_physical_device_features2 = Some(unsafe {
-            std::mem::transmute::<vk::VoidFunction, vk::GetPhysicalDeviceFeatures2>(
-                loader.instance_symbol(raw_instance, c"vkGetPhysicalDeviceFeatures2")?,
-            )
-        });
-        // SAFETY: Exact Vulkan 1.1 `vkGetPhysicalDeviceProperties2` symbol and Khronos ABI.
-        instance.get_physical_device_properties2 = Some(unsafe {
-            std::mem::transmute::<vk::VoidFunction, vk::GetPhysicalDeviceProperties2>(
-                loader.instance_symbol(raw_instance, c"vkGetPhysicalDeviceProperties2")?,
-            )
-        });
+        for name in [
+            c"vkGetPhysicalDeviceFeatures2",
+            c"vkGetPhysicalDeviceProperties2",
+        ] {
+            loader.has_instance_symbol(instance.0.handle(), name)?;
+        }
     }
     Ok((instance, modules))
 }
 
-const fn device_type(kind: i32) -> (&'static str, bool) {
+const fn device_type(kind: vk::PhysicalDeviceType) -> (&'static str, bool) {
     match kind {
-        vk::PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => ("integrated-gpu", true),
-        vk::PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => ("discrete-gpu", true),
-        vk::PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => ("virtual-gpu", false),
-        vk::PHYSICAL_DEVICE_TYPE_CPU => ("cpu", false),
+        vk::PhysicalDeviceType::INTEGRATED_GPU => ("integrated-gpu", true),
+        vk::PhysicalDeviceType::DISCRETE_GPU => ("discrete-gpu", true),
+        vk::PhysicalDeviceType::VIRTUAL_GPU => ("virtual-gpu", false),
+        vk::PhysicalDeviceType::CPU => ("cpu", false),
         _ => ("other", false),
     }
 }
@@ -750,61 +454,37 @@ fn features(
     else {
         return Features::default();
     };
-    let (Some(get_features2), Some(get_properties2)) = (
-        instance.get_physical_device_features2,
-        instance.get_physical_device_properties2,
-    ) else {
-        return Features::default();
-    };
-    let mut half = vk::PhysicalDeviceShaderFloat16Int8Features {
-        s_type: vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
-        p_next: null_mut(),
-        shader_float16: 0,
-        shader_int8: 0,
-    };
-    let mut dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures {
-        s_type: vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
-        p_next: null_mut(),
-        shader_integer_dot_product: 0,
-    };
-    let mut features = vk::PhysicalDeviceFeatures2 {
-        s_type: vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        p_next: null_mut(),
-        features: [0; 55],
-    };
+    let mut half = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+    let mut dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default();
     if supports_half {
-        half.p_next = features.p_next;
-        features.p_next = (&raw mut half).cast();
+        features = features.push_next(&mut half);
     }
     if supports_dot {
-        dot.p_next = features.p_next;
-        features.p_next = (&raw mut dot).cast();
+        features = features.push_next(&mut dot);
     }
-    // SAFETY: Vulkan 1.1 query with a valid live device. Only supported core
-    // or advertised extension feature structures are chained and stay live.
-    unsafe { get_features2(device, &raw mut features) };
-    let mut subgroup = vk::PhysicalDeviceSubgroupProperties {
-        s_type: vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
-        p_next: null_mut(),
-        subgroup_size: 0,
-        supported_stages: 0,
-        supported_operations: 0,
-        quad_operations_in_all_stages: 0,
+    // SAFETY: Vulkan 1.1 query with a valid live device and verified 1.1 entry
+    // point. Only supported core or advertised extension structures are chained.
+    unsafe {
+        instance
+            .0
+            .get_physical_device_features2(device, &mut features)
     };
-    let mut properties2 = vk::PhysicalDeviceProperties2 {
-        s_type: vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-        p_next: (&raw mut subgroup).cast(),
-        properties: vk::PhysicalDeviceProperties::default(),
-    };
+    let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
     // SAFETY: Both structures are supported core 1.1 structures and live
     // throughout the read-only properties query against this valid device.
-    unsafe { get_properties2(device, &raw mut properties2) };
+    unsafe {
+        instance
+            .0
+            .get_physical_device_properties2(device, &mut properties2)
+    };
     Features {
         float16: supports_half.then_some(half.shader_float16 != 0),
         integer_dot: supports_dot.then_some(dot.shader_integer_dot_product != 0),
         subgroup_size: Some(subgroup.subgroup_size),
-        subgroup_operations: Some(subgroup.supported_operations),
-        subgroup_stages: Some(subgroup.supported_stages),
+        subgroup_operations: Some(subgroup.supported_operations.as_raw()),
+        subgroup_stages: Some(subgroup.supported_stages.as_raw()),
     }
 }
 
@@ -813,21 +493,16 @@ fn adapter(
     device: vk::PhysicalDevice,
     application_api: u32,
 ) -> io::Result<VulkanAdapter> {
-    let mut properties = vk::PhysicalDeviceProperties::default();
     // SAFETY: device was enumerated from this live instance; the read-only
     // query initializes `properties` and retains no borrowed storage.
-    unsafe { (instance.get_physical_device_properties)(device, &raw mut properties) };
+    let properties = unsafe { instance.0.get_physical_device_properties(device) };
     let mut extensions = vec![vk::ExtensionProperties::default(); MAX_EXTENSIONS];
     let mut count = u32::try_from(extensions.len()).map_err(|_| invalid())?;
+    let enumerate_extensions = instance.0.fp_v1_0().enumerate_device_extension_properties;
     // SAFETY: Valid instance/device, no layer filter, initialized output storage
     // for count entries. The driver may only write that many entries.
     check(unsafe {
-        (instance.enumerate_device_extension_properties)(
-            device,
-            null(),
-            &raw mut count,
-            extensions.as_mut_ptr(),
-        )
+        enumerate_extensions(device, null(), &raw mut count, extensions.as_mut_ptr())
     })?;
     let count = usize::try_from(count).map_err(|_| invalid())?;
     if count > extensions.len() {
@@ -836,57 +511,48 @@ fn adapter(
     extensions.truncate(count);
     let mut extensions: Vec<_> = extensions
         .iter()
-        .map(|extension| text(&extension.extension_name))
+        .map(|extension| text(extension.extension_name_as_c_str()))
         .collect::<io::Result<_>>()?;
     extensions.sort_unstable();
 
     let mut queues = [vk::QueueFamilyProperties::default(); MAX_QUEUES];
     let mut queue_count = 0;
+    let get_queue_families = instance
+        .0
+        .fp_v1_0()
+        .get_physical_device_queue_family_properties;
     // SAFETY: Valid device and writable count; null storage requests only count.
-    unsafe {
-        (instance.get_physical_device_queue_family_properties)(
-            device,
-            &raw mut queue_count,
-            null_mut(),
-        );
-    };
+    unsafe { get_queue_families(device, &raw mut queue_count, null_mut()) };
     if usize::try_from(queue_count).map_err(|_| invalid())? > queues.len() {
         return Err(invalid());
     }
     // SAFETY: The bounded initialized output array accommodates the queried
     // count. Vulkan writes at most the input count and retains no pointers.
-    unsafe {
-        (instance.get_physical_device_queue_family_properties)(
-            device,
-            &raw mut queue_count,
-            queues.as_mut_ptr(),
-        );
-    };
+    unsafe { get_queue_families(device, &raw mut queue_count, queues.as_mut_ptr()) };
     let queue_count = usize::try_from(queue_count).map_err(|_| invalid())?;
     let compute_queues = queues
         .get(..queue_count)
         .ok_or_else(invalid)?
         .iter()
         .enumerate()
-        .filter(|(_, queue)| queue.queue_flags & vk::QUEUE_COMPUTE_BIT != 0)
+        .filter(|(_, queue)| queue.queue_flags.contains(vk::QueueFlags::COMPUTE))
         .map(|(index, queue)| u32::try_from(index).map(|index| (index, queue.queue_count)))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| invalid())?;
 
-    let mut memory = vk::PhysicalDeviceMemoryProperties::default();
     // SAFETY: Valid device from this live instance. Returned fixed-size memory
     // properties are fully initialized by Vulkan and do not borrow driver data.
-    unsafe { (instance.get_physical_device_memory_properties)(device, &raw mut memory) };
-    let heaps = usize::try_from(memory.heap_count).map_err(|_| invalid())?;
+    let memory = unsafe { instance.0.get_physical_device_memory_properties(device) };
+    let heaps = usize::try_from(memory.memory_heap_count).map_err(|_| invalid())?;
     let memory_heaps = memory
-        .heaps
+        .memory_heaps
         .get(..heaps)
         .ok_or_else(invalid)?
         .iter()
         .map(|heap| {
             (
                 heap.size,
-                heap.flags & vk::MEMORY_HEAP_DEVICE_LOCAL_BIT != 0,
+                heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
             )
         })
         .collect();
@@ -900,7 +566,7 @@ fn adapter(
     );
     let (device_type, hardware_gpu) = device_type(properties.device_type);
     Ok(VulkanAdapter {
-        name: text(&properties.device_name)?,
+        name: text(properties.device_name_as_c_str())?,
         vendor_id: properties.vendor_id,
         device_id: properties.device_id,
         driver_version: properties.driver_version,
@@ -948,17 +614,17 @@ pub(super) fn query() -> io::Result<VulkanInventory> {
     let application_api = loader_api_version.min(vk::API_VERSION_1_3);
     let (instance, instance_modules) =
         create_instance(&loader, loader_api_version, application_api)?;
-    let mut devices: [vk::PhysicalDevice; MAX_ADAPTERS] = [null_mut(); MAX_ADAPTERS];
+    let mut devices = [vk::PhysicalDevice::null(); MAX_ADAPTERS];
     let mut count = u32::try_from(devices.len()).map_err(|_| invalid())?;
+    let handle = instance.0.handle();
+    let enumerate_devices = instance.0.fp_v1_0().enumerate_physical_devices;
     // SAFETY: Valid instance and initialized storage for the advertised count.
     // SUCCESS is required; INCOMPLETE rejects rather than growing without bound.
-    let result = unsafe {
-        (instance.enumerate_physical_devices)(instance.handle, &raw mut count, devices.as_mut_ptr())
-    };
-    if result != vk::SUCCESS {
+    let result = unsafe { enumerate_devices(handle, &raw mut count, devices.as_mut_ptr()) };
+    if result != vk::Result::SUCCESS {
         return Err(failure(
             "physical-device-enumeration",
-            Some(result),
+            Some(result.as_raw()),
             Some(loader_api_version),
             Some(application_api),
             io::ErrorKind::Other,
@@ -1038,7 +704,7 @@ mod tests {
 
     #[test]
     fn vulkan_failure_payload_preserves_raw_results_and_unknown_versions() -> io::Result<()> {
-        let error = check(vk::ERROR_INCOMPATIBLE_DRIVER)
+        let error = check(vk::Result::ERROR_INCOMPATIBLE_DRIVER)
             .err()
             .ok_or_else(invalid)?;
         let context = error
@@ -1076,19 +742,19 @@ mod tests {
 
     #[test]
     fn vulkan_names_and_device_types_preserve_unqualified_boundaries() -> io::Result<()> {
-        assert!(check(vk::SUCCESS).is_ok());
-        assert!(check(vk::INCOMPLETE).is_err());
-        assert!(check(vk::ERROR_INCOMPATIBLE_DRIVER).is_err());
-        assert_eq!(text(&[65, 0, 66])?, "A");
-        assert!(text(&[65, 66]).is_err());
-        assert!(text(&[10, 0]).is_err());
-        assert_eq!(device_type(vk::PHYSICAL_DEVICE_TYPE_CPU), ("cpu", false));
+        assert!(check(vk::Result::SUCCESS).is_ok());
+        assert!(check(vk::Result::INCOMPLETE).is_err());
+        assert!(check(vk::Result::ERROR_INCOMPATIBLE_DRIVER).is_err());
+        assert_eq!(text(CStr::from_bytes_until_nul(b"A\0B"))?, "A");
+        assert!(text(CStr::from_bytes_until_nul(b"AB")).is_err());
+        assert!(text(CStr::from_bytes_until_nul(b"\n\0")).is_err());
+        assert_eq!(device_type(vk::PhysicalDeviceType::CPU), ("cpu", false));
         assert_eq!(
-            device_type(vk::PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU),
+            device_type(vk::PhysicalDeviceType::VIRTUAL_GPU),
             ("virtual-gpu", false)
         );
         assert_eq!(
-            device_type(vk::PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU),
+            device_type(vk::PhysicalDeviceType::INTEGRATED_GPU),
             ("integrated-gpu", true)
         );
         Ok(())

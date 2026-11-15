@@ -11,6 +11,7 @@ categories = ["os::windows-apis"]
 description = "Windows Job ownership and bounded native process lifecycle for Bonsai"
 
 [target.'cfg(windows)'.dependencies]
+ash.workspace = true
 flatbuffers = "=25.12.19"
 hex.workspace = true
 mxc-sdk = { version = "=1.0.1", default-features = false }
