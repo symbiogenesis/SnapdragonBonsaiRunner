@@ -435,7 +435,7 @@ fn clipboard_file() -> Result<Option<PathBuf>, &'static str> {
         &name[..name.len() - 1],
     ))))
 }
-struct Apartment;
+struct Apartment(PhantomData<Rc<()>>);
 impl Apartment {
     fn initialize(single_threaded: bool) -> Result<Self, &'static str> {
         // SAFETY: This fresh worker owns this apartment and all its WinRT objects.
@@ -447,7 +447,7 @@ impl Apartment {
             })
         }
         .map_err(|_| CODEC_FAILURE)?;
-        Ok(Self)
+        Ok(Self(PhantomData))
     }
 }
 impl Drop for Apartment {
