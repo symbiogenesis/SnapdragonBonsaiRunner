@@ -225,18 +225,11 @@ fn extent(input: usize, output: usize) -> io::Result<usize> {
 }
 
 fn half(bits: u16) -> io::Result<f32> {
-    let sign = u32::from(bits & 0x8000) << 16;
-    let exponent = (bits >> 10) & 31;
-    let mantissa = bits & 1023;
-    if exponent == 31 {
+    let value = half::f16::from_bits(bits);
+    if !value.is_finite() {
         return Err(invalid());
     }
-    Ok(if exponent == 0 {
-        let value = f32::from(mantissa) * 0.000_000_059_604_645;
-        if sign == 0 { value } else { -value }
-    } else {
-        f32::from_bits(sign | ((u32::from(exponent) + 112) << 23) | (u32::from(mantissa) << 13))
-    })
+    Ok(value.to_f32())
 }
 
 /// Cache scalar policy, selected explicitly when creating a decoder model.
@@ -264,30 +257,11 @@ pub(super) fn binary16_operand(value: f32) -> io::Result<f32> {
     if !value.is_finite() {
         return Err(invalid());
     }
-    let bits = value.to_bits();
-    let sign = bits & 0x8000_0000;
-    let exponent = (bits >> 23) & 255;
-    if exponent < 102 {
-        return Ok(f32::from_bits(sign));
-    }
-    if exponent < 113 {
-        let shift = 126 - exponent;
-        let significand = (bits & 0x007f_ffff) | 0x0080_0000;
-        let truncated = significand >> shift;
-        let remainder = significand & ((1 << shift) - 1);
-        let midpoint = 1 << (shift - 1);
-        let rounded = truncated
-            + u32::from(remainder > midpoint || (remainder == midpoint && truncated & 1 != 0));
-        let rounded =
-            f32::from(u16::try_from(rounded).map_err(|_| invalid())?) * 0.000_000_059_604_645;
-        return Ok(if sign == 0 { rounded } else { -rounded });
-    }
-    let rounded = bits.wrapping_add(0x0fff + ((bits >> 13) & 1)) & 0xffff_e000;
-    let result = f32::from_bits(rounded);
-    if exponent > 142 || result.abs() > 65_504.0 || !result.is_finite() {
+    let narrowed = half::f16::from_f32(value);
+    if !narrowed.is_finite() {
         Err(invalid())
     } else {
-        Ok(result)
+        Ok(narrowed.to_f32())
     }
 }
 

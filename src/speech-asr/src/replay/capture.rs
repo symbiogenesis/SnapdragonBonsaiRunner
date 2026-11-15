@@ -45,18 +45,15 @@ impl CacheValues<'_> {
             Self::F32(values) => values[index].to_bits(),
             Self::F16(values) => {
                 let bits = values[index];
-                let sign = u32::from(bits & 0x8000) << 16;
-                let exponent = (bits >> 10) & 31;
-                let mantissa = bits & 1023;
-                sign | if exponent == 0 {
-                    (f32::from(mantissa) * 0.000_000_059_604_645).to_bits()
+                let value = half::f16::from_bits(bits);
+                if value.is_nan() {
+                    // Hardware `FCVT` and `half::f16::to_f32()` quiet signaling NaNs;
+                    // capture verification requires preserving unquieted NaN payload bits.
+                    (u32::from(bits & 0x8000) << 16)
+                        | 0x7f80_0000
+                        | (u32::from(bits & 0x03ff) << 13)
                 } else {
-                    let exponent = if exponent == 31 {
-                        255
-                    } else {
-                        u32::from(exponent) + 112
-                    };
-                    (exponent << 23) | (u32::from(mantissa) << 13)
+                    value.to_f32().to_bits()
                 }
             }
         }

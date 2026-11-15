@@ -99,14 +99,14 @@
     },
     {
       "path": "Cargo.lock",
-      "bytes": 133240,
-      "sha256": "89ff8ec60b8ff3ce6dad13f15d62b219133953a80882cffa6acddbfdb9122c97",
+      "bytes": 133270,
+      "sha256": "921cf91f2a284dff350ca57571c320ca6b37d5b590fc249442eed2dcba1ffc6e",
       "family": "native-asr"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 4426,
-      "sha256": "47476eab20a3dde3dc615dae264860a788b5c5eb43ee2a7fcb76a451c6c341eb",
+      "bytes": 4443,
+      "sha256": "37a70a09a252dd495f01dfbe62b8dccad371706238ed0b3d2760271fad04f91f",
       "family": "msvc-unwind"
     },
     {
@@ -135,8 +135,8 @@
     },
     {
       "path": "src/speech-asr/Cargo.toml",
-      "bytes": 1797,
-      "sha256": "411608fc9dc644a42d82b1e2bc69e7474d0d4dfa86f1b5cf6500fa976596611c",
+      "bytes": 1820,
+      "sha256": "80142942e1a8403a20f5cfc2523f11717f49628d8fa67fa2b26f6087055388d6",
       "family": "native-asr"
     },
     {

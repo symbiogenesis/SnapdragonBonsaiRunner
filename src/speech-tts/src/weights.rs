@@ -414,18 +414,7 @@ pub(crate) fn packed_layout(kind: u32) -> io::Result<(usize, usize)> {
 }
 
 pub(crate) fn half(bytes: &[u8]) -> f32 {
-    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
-    let fraction = u32::from(bits & 1023);
-    let exponent = u32::from((bits >> 10) & 31);
-    let sign = u32::from(bits & 0x8000) << 16;
-    match exponent {
-        0 => {
-            let value = f32::from(u16::try_from(fraction).unwrap_or(0)) * (1.0 / 16_777_216.0);
-            if sign == 0 { value } else { -value }
-        }
-        31 => f32::from_bits(sign | 0x7f80_0000 | (fraction << 13)),
-        _ => f32::from_bits(sign | ((exponent + 112) << 23) | (fraction << 13)),
-    }
+    half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32()
 }
 
 pub(crate) fn validate_packed(kind: u32, bytes: &[u8]) -> io::Result<()> {

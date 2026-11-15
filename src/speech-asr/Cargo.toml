@@ -37,6 +37,7 @@ bonsai-artifacts = { workspace = true, optional = true }
 bonsai-cpu-policy = { workspace = true, optional = true }
 bonsai-speech-service = { workspace = true, optional = true }
 fearless_simd = { workspace = true, optional = true }
+half.workspace = true
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 sha2.workspace = true
