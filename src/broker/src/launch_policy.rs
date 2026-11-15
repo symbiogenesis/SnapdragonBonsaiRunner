@@ -7,6 +7,7 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 const LOCK_JSON: &str = include_str!("../../../config/runtime.lock.json");
@@ -308,7 +309,7 @@ struct Metadata {
     ssm_group_count: u32,
     ssm_convolution_kernel: u32,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimePin {
     repository: String,
@@ -317,7 +318,7 @@ pub(crate) struct RuntimePin {
     license: String,
     pub(crate) asset: super::Object<AssetPin>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AssetPin {
     pub(crate) filename: String,
@@ -354,10 +355,12 @@ impl<T> std::ops::Deref for super::Object<T> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ReviewedPins {
     pub(crate) model: ModelArtifact,
     pub(crate) runtime: super::Object<RuntimePin>,
 }
+#[derive(Clone)]
 pub(crate) struct ModelArtifact {
     pub(crate) revision: String,
     pub(crate) filename: String,
@@ -366,8 +369,10 @@ pub(crate) struct ModelArtifact {
 }
 
 pub(crate) fn reviewed_pins(profile: LaunchProfile) -> Result<ReviewedPins, PolicyError> {
-    match profile {
-        LaunchProfile::ReferenceCpu => {
+    static REFERENCE_CPU: OnceLock<Result<ReviewedPins, PolicyError>> = OnceLock::new();
+    static SWIFT_PQ2: OnceLock<Result<ReviewedPins, PolicyError>> = OnceLock::new();
+    let cached = match profile {
+        LaunchProfile::ReferenceCpu => REFERENCE_CPU.get_or_init(|| {
             let pins = parse_pins(LOCK_JSON)?;
             validate_profile(PROFILE_JSON)?;
             Ok(ReviewedPins {
@@ -379,25 +384,42 @@ pub(crate) fn reviewed_pins(profile: LaunchProfile) -> Result<ReviewedPins, Poli
                 },
                 runtime: pins.runtime,
             })
+        }),
+        LaunchProfile::SwiftPq2Assessment => {
+            SWIFT_PQ2.get_or_init(|| parse_swift_pins(SWIFT_LOCK_JSON))
         }
-        LaunchProfile::SwiftPq2Assessment => parse_swift_pins(SWIFT_LOCK_JSON),
-    }
+    };
+    cached.clone()
 }
 
 pub(crate) fn reviewed_pins_for_representation(
     profile: LaunchProfile,
     use_repacked_ptq1: bool,
 ) -> Result<ReviewedPins, PolicyError> {
+    static PTQ1_REFERENCE_CPU: OnceLock<Result<SelectedModel, PolicyError>> = OnceLock::new();
+    static PTQ1_SWIFT_PQ2: OnceLock<Result<SelectedModel, PolicyError>> = OnceLock::new();
     let mut pins = reviewed_pins(profile)?;
     if use_repacked_ptq1 {
-        let lock = serde_json::from_str(SWIFT_LOCK_JSON).map_err(|_| PolicyError::Configuration)?;
-        let evidence =
-            serde_json::from_str(PTQ1_EXPORT_JSON).map_err(|_| PolicyError::Configuration)?;
-        let selected =
-            bonsai_cpu_policy::select_artifact(&lock, profile.cpu_profile(), true, Some(&evidence))
+        let cache = match profile {
+            LaunchProfile::ReferenceCpu => &PTQ1_REFERENCE_CPU,
+            LaunchProfile::SwiftPq2Assessment => &PTQ1_SWIFT_PQ2,
+        };
+        let selected = cache
+            .get_or_init(|| {
+                let lock = serde_json::from_str(SWIFT_LOCK_JSON)
+                    .map_err(|_| PolicyError::Configuration)?;
+                let evidence = serde_json::from_str(PTQ1_EXPORT_JSON)
+                    .map_err(|_| PolicyError::Configuration)?;
+                let selected = bonsai_cpu_policy::select_artifact(
+                    &lock,
+                    profile.cpu_profile(),
+                    true,
+                    Some(&evidence),
+                )
                 .map_err(|_| PolicyError::Configuration)?;
-        let selected: SelectedModel =
-            serde_json::from_value(selected).map_err(|_| PolicyError::Configuration)?;
+                serde_json::from_value(selected).map_err(|_| PolicyError::Configuration)
+            })
+            .clone()?;
         pins.model.filename = selected.filename;
         pins.model.bytes = selected.bytes;
         pins.model.sha256 = selected.sha256;
@@ -405,7 +427,7 @@ pub(crate) fn reviewed_pins_for_representation(
     Ok(pins)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 struct SelectedModel {
     filename: String,

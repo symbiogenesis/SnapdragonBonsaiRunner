@@ -648,6 +648,7 @@ impl<'de> Deserialize<'de> for Role {
 
 // Serde's derived structs accept positional arrays. Demand an object, then
 // delegate its streaming map directly to the derive without losing duplicate keys.
+#[derive(Clone)]
 struct Object<T>(T);
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
