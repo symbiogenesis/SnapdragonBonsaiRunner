@@ -30,12 +30,15 @@ pub fn finite_sample_count(samples: &[f32], previous: usize, maximum: usize) -> 
 /// mono samples, independently of their two-byte representation.
 #[must_use]
 pub fn mono_pcm16_data(wave: &[u8], sample_rate: u32, maximum_samples: u32) -> Option<&[u8]> {
-    let samples = wave.len().checked_sub(44)? / 2;
-    if samples == 0 || u32::try_from(samples).ok()? > maximum_samples {
+    let (header, payload) = wave.split_first_chunk::<44>()?;
+    if payload.is_empty() || !payload.len().is_multiple_of(2) {
         return None;
     }
-    let expected = mono_pcm16_header(sample_rate, samples)?;
-    (wave.len() == samples * 2 + 44 && wave[..44] == expected).then_some(&wave[44..])
+    let samples = payload.len() / 2;
+    if u32::try_from(samples).ok()? > maximum_samples {
+        return None;
+    }
+    (*header == mono_pcm16_header(sample_rate, samples)?).then_some(payload)
 }
 
 /// Builds the exact 44-byte header for a nonempty mono PCM16 WAV clip.

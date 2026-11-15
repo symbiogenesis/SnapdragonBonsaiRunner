@@ -21,11 +21,11 @@ pub fn pcm16_pause_boundary(
     sample_rate: u32,
     minimum_samples: usize,
 ) -> Option<usize> {
-    if data.is_empty() || !data.len().is_multiple_of(2) || sample_rate == 0 || minimum_samples == 0
-    {
+    let (pcm, remainder) = data.as_chunks::<2>();
+    if pcm.is_empty() || !remainder.is_empty() || sample_rate == 0 || minimum_samples == 0 {
         return None;
     }
-    let samples = data.len() / 2;
+    let samples = pcm.len();
     let rate = usize::try_from(sample_rate).ok()?;
     let window = (rate / 10).max(2);
     if samples <= minimum_samples || samples < window {
@@ -39,15 +39,17 @@ pub fn pcm16_pause_boundary(
     let step = (rate / 100).max(1);
     // A u32 rate bounds a 100 ms window to fewer than 430 million samples.
     // Even i16::MIN squared across that window fits comfortably in u64.
-    let mut energy: u64 = (first..first + window)
-        .map(|index| sample_energy(data, index))
+    let mut energy: u64 = pcm[first..first + window]
+        .iter()
+        .copied()
+        .map(sample_energy)
         .sum();
     let mut quietest = energy;
     let mut loudest = energy;
     let mut boundary = first + half;
     for index in first + window..samples {
-        energy -= sample_energy(data, index - window);
-        energy += sample_energy(data, index);
+        energy -= sample_energy(pcm[index - window]);
+        energy += sample_energy(pcm[index]);
         let start = index + 1 - window;
         if (start - first).is_multiple_of(step) || index + 1 == samples {
             loudest = loudest.max(energy);
@@ -69,10 +71,8 @@ pub fn pcm16_pause_boundary(
     }
 }
 
-fn sample_energy(data: &[u8], index: usize) -> u64 {
-    let offset = index * 2;
-    let sample = i16::from_le_bytes([data[offset], data[offset + 1]]);
-    u64::from(sample.unsigned_abs()).pow(2)
+fn sample_energy(sample: [u8; 2]) -> u64 {
+    u64::from(i16::from_le_bytes(sample).unsigned_abs()).pow(2)
 }
 
 #[cfg(test)]
