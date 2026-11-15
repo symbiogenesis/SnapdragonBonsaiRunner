@@ -163,6 +163,39 @@ impl Service {
     }
 
     #[cfg(test)]
+    pub(crate) fn custom_responder<T: FnMut(&str, Option<(u32, u32)>) -> Vec<u8> + 'static>(
+        context: &egui::Context,
+        mut reply: T,
+    ) -> (
+        Arc<Self>,
+        impl FnMut() -> std::io::Result<Arc<str>> + use<T>,
+    ) {
+        let (service, pending) = Self::inert(context);
+        service.shared.ready();
+        let responder_service = Arc::clone(&service);
+        let step = move || {
+            let request = pending.try_recv().map_err(std::io::Error::other)?;
+            match request.kind {
+                RequestKind::Markdown(source) => {
+                    let payload = reply(&source, None);
+                    responder_service.shared.complete(request.ticket, payload);
+                    Ok(source)
+                }
+                RequestKind::Rasterize {
+                    max_width,
+                    max_height,
+                    svg,
+                } => {
+                    let payload = reply(&svg, Some((max_width, max_height)));
+                    responder_service.shared.complete(request.ticket, payload);
+                    Ok(svg)
+                }
+            }
+        };
+        (service, step)
+    }
+
+    #[cfg(test)]
     pub(crate) fn fixture(
         context: &egui::Context,
     ) -> impl Fn() -> std::io::Result<Arc<str>> + use<> {

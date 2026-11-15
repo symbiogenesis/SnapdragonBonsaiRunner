@@ -246,3 +246,40 @@ fn find_match_inside_svg_falls_back_to_raw_source_and_restores_image_on_close() 
         .is_positive()
     );
 }
+
+#[test]
+fn scripted_or_external_url_svg_stays_visible_code_block_without_image_card() {
+    let hostile = concat!(
+        "Untrusted diagram:\n\n```svg\n",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"100\" onload=\"evil()\">",
+        "<script>alert(1)</script>",
+        "<image href=\"https://evil.test/beacon.png\" width=\"200\" height=\"100\"/>",
+        "<rect width=\"200\" height=\"100\" fill=\"#2a9d8f\"/>",
+        "</svg>\n```\n\nEnd.",
+    );
+    let mut chat = harness([1080.0, 780.0], |app| {
+        app.transcript
+            .push(Role::User, "Draw a diagram.".to_owned());
+        app.transcript.push(Role::Assistant, hostile.to_owned());
+        app.transcript.remove_empty_response();
+        app.last_answer = hostile.to_owned();
+        app.answer_complete = true;
+    });
+    chat.run();
+
+    assert!(
+        chat.query_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand.",
+        )
+        .is_none()
+    );
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Save generated image")
+            .is_none()
+    );
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Expand generated image")
+            .is_none()
+    );
+}

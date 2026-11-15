@@ -98,6 +98,17 @@ impl ImageCache {
             .any(|entry| matches!(entry.state, SlotState::Pending(_)))
     }
 
+    /// Returns whether `svg` already failed offline validation or rasterization.
+    pub(super) fn is_rejected(&self, svg: &Arc<str>) -> bool {
+        let hash = fnv1a64(svg.as_bytes());
+        self.entries.iter().any(|entry| {
+            entry.key.hash == hash
+                && entry.key.len == svg.len()
+                && same_svg(&entry.svg, svg)
+                && matches!(entry.state, SlotState::Unrenderable | SlotState::Failed)
+        })
+    }
+
     /// Returns a GPU texture for `svg` sized for `target_points`, scheduling rasterization if needed.
     pub(super) fn get_or_request(
         &mut self,
@@ -423,5 +434,37 @@ mod tests {
             );
         harness.step();
         assert_eq!(harness.state().entries.len(), MAX_TEXTURES);
+    }
+
+    #[test]
+    fn malformed_bmg1_response_rejects_worker_session_and_marks_svg_rejected() -> std::io::Result<()>
+    {
+        let svg: Arc<str> = Arc::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="teal"/></svg>"#,
+        );
+        let test_svg = Arc::clone(&svg);
+        let mut harness = Harness::builder()
+            .with_size([240.0, 180.0])
+            .with_context_setup(super::super::configure)
+            .build_ui_state(
+                move |ui, (cache, armed): &mut (ImageCache, bool)| {
+                    if !*armed {
+                        return;
+                    }
+                    cache.poll(ui.ctx());
+                    let _ = cache.get_or_request(ui.ctx(), &test_svg, egui::vec2(128.0, 128.0));
+                },
+                (ImageCache::default(), false),
+            );
+        let (service, mut step) =
+            Service::custom_responder(&harness.ctx, |_, _| b"FORGED-BMG1-BYTES".to_vec());
+        harness.state_mut().1 = true;
+        harness.step();
+        assert!(!service.unavailable());
+        assert_eq!(&*step()?, &*svg);
+        harness.step();
+        assert!(service.unavailable());
+        assert!(harness.state().0.is_rejected(&svg));
+        Ok(())
     }
 }

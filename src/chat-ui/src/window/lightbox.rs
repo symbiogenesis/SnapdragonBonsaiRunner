@@ -115,9 +115,11 @@ impl Lightbox {
                                 if buttons.add(controls::action_button("Close")).clicked() {
                                     action = Some(LightboxAction::Close);
                                 }
+                                let save_enabled =
+                                    !export_busy && !image_cache.is_rejected(&self.svg);
                                 let save = buttons
                                     .add_enabled(
-                                        !export_busy,
+                                        save_enabled,
                                         controls::quiet_button("Save image…"),
                                     )
                                     .on_hover_text("Save image as PNG or SVG");

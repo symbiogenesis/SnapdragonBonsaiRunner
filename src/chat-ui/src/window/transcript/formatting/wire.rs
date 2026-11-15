@@ -293,6 +293,9 @@ fn decode_text_segment(
     })
 }
 
+const MIN_INTRINSIC_DIM: f32 = 1.0e-3;
+const MAX_INTRINSIC_DIM: f32 = 1.0e7;
+
 fn decode_image_segment(
     source: &str,
     reader: &mut Reader<'_>,
@@ -307,10 +310,8 @@ fn decode_image_segment(
     let intrinsic_width = f32::from_bits(reader.bits()?);
     let intrinsic_height = f32::from_bits(reader.bits()?);
     if !content_range(source, &source_range, *previous_source_end)
-        || !intrinsic_width.is_finite()
-        || !intrinsic_height.is_finite()
-        || intrinsic_width <= 0.0
-        || intrinsic_height <= 0.0
+        || !(MIN_INTRINSIC_DIM..=MAX_INTRINSIC_DIM).contains(&intrinsic_width)
+        || !(MIN_INTRINSIC_DIM..=MAX_INTRINSIC_DIM).contains(&intrinsic_height)
     {
         return None;
     }
@@ -673,12 +674,14 @@ mod tests {
             .is_none()
         );
 
-        // Non-finite, zero, negative, and > MAX_SVG_IMAGES segments must fail.
+        // Non-finite, zero, negative, extreme float, and > MAX_SVG_IMAGES segments must fail.
         for bad_dims in [
             (0.0, 100.0),
             (100.0, -1.0),
             (f32::NAN, 100.0),
             (100.0, f32::INFINITY),
+            (f32::MIN_POSITIVE, 100.0),
+            (100.0, f32::MAX),
         ] {
             assert!(
                 decode(

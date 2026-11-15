@@ -1237,6 +1237,7 @@ fn render_image_card(
         .rect_filled(preview_rect, 6.0, visuals.extreme_bg_color);
 
     let slot = image_cache.map(|cache| cache.get_or_request(ui.ctx(), svg, *preview_size));
+    let is_fallback = matches!(slot, Some(super::image_cache::RasterSlot::FallbackSource));
     match slot {
         Some(
             super::image_cache::RasterSlot::Ready(tex)
@@ -1314,14 +1315,15 @@ fn render_image_card(
             .max_rect(footer_rect)
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
+    let save_enabled = !export_busy && !is_fallback;
     let save_button = footer
         .add_enabled(
-            !export_busy,
+            save_enabled,
             super::controls::quiet_button("Save…").min_size(egui::vec2(0.0, MESSAGE_ACTION_SIZE)),
         )
         .on_hover_text("Save image as PNG or SVG");
     save_button.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::Role::Button, !export_busy, "Save generated image")
+        egui::WidgetInfo::labeled(egui::Role::Button, save_enabled, "Save generated image")
     });
     if save_button.clicked() {
         action = Some(TranscriptAction::SaveImage {

@@ -1,4 +1,4 @@
-//! Asynchronous native image export (PNG via sandboxed rasterization or raw SVG source).
+//! Asynchronous native image export gated on offline MXC SVG sandbox validation.
 #![deny(unsafe_code)]
 
 use std::{
@@ -26,9 +26,9 @@ use picker::{Format, Selection};
 
 const EXPORT_RASTER_DIM: u32 = 2_048;
 const POLL: Duration = Duration::from_millis(10);
-const RASTER_UNAVAILABLE: &str = "Image rasterization is unavailable. Choose SVG format to save.";
-const RASTER_FAILED: &str = "The image could not be rasterized to PNG.";
-const UNRENDERABLE_IMAGE: &str = "This SVG could not be rendered as a PNG. Save as SVG instead.";
+const RASTER_UNAVAILABLE: &str = "Offline SVG sandbox is unavailable; image export was blocked.";
+const RASTER_FAILED: &str = "The offline SVG sandbox failed to validate or rasterize this image.";
+const UNRENDERABLE_IMAGE: &str = "This SVG failed static safety validation and cannot be exported.";
 const SAVE_WRITE_FAILED: &str = "Could not write the selected image file.";
 
 #[derive(Default)]
@@ -267,7 +267,16 @@ fn run_worker(
         Ok(Some(Selection {
             path,
             format: Format::Svg,
-        })) => write_export(&path, svg.as_bytes()),
+        })) => {
+            // Never write untrusted SVG markup to disk unless the offline MXC worker
+            // accepted and rasterized the exact payload under the static-SVG policy.
+            match await_raster(shared, raster_rx).and_then(|packet| verify_validated_bmg1(&packet))
+            {
+                Ok(()) => write_export(&path, svg.as_bytes()),
+                Err(message) if message == picker::CANCELLED => Outcome::Cancelled,
+                Err(message) => Outcome::Failed(message),
+            }
+        }
         Ok(Some(Selection {
             path,
             format: Format::Png,
@@ -282,6 +291,13 @@ fn run_worker(
         Err(message) if message == picker::CANCELLED => Outcome::Cancelled,
         Err(message) => Outcome::Failed(message),
     }
+}
+
+fn verify_validated_bmg1(packet: &[u8]) -> Result<(), &'static str> {
+    let _decoded = markdown_service::decode_raster(packet)
+        .map_err(|_| RASTER_FAILED)?
+        .ok_or(UNRENDERABLE_IMAGE)?;
+    Ok(())
 }
 
 fn await_raster(
@@ -456,11 +472,14 @@ mod tests {
     }
 
     #[test]
-    fn unrenderable_svg_fails_png_cleanly_while_svg_source_save_succeeds() -> io::Result<()> {
+    fn unrenderable_or_scripted_svg_blocks_both_png_and_svg_exports() -> io::Result<()> {
         let dir = unique_test_dir("unrenderable")?;
         let png_target = dir.join("broken.png");
-        let svg_target = dir.join("broken.svg");
+        let svg_target = dir.join("scripted.svg");
         let broken: Arc<str> = Arc::from("<not-valid-svg>");
+        let scripted: Arc<str> = Arc::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><script>alert(1)</script><rect width="64" height="64"/></svg>"#,
+        );
         let ctx = egui::Context::default();
 
         let mut png_export = Export::start_with_selection(
@@ -476,7 +495,6 @@ mod tests {
             _ => return Err(io::Error::other("expected PNG failure on invalid SVG")),
         }
         assert!(!png_target.exists());
-        assert_eq!(fs::read_dir(&dir)?.count(), 0);
 
         let mut svg_export = Export::start_with_selection(
             &ctx,
@@ -484,13 +502,55 @@ mod tests {
                 path: svg_target.clone(),
                 format: Format::Svg,
             },
-            Arc::clone(&broken),
+            Arc::clone(&scripted),
         )?;
         match wait_outcome(&mut svg_export) {
-            Outcome::Saved(saved) => assert_eq!(saved, svg_target),
-            _ => return Err(io::Error::other("expected raw SVG save to succeed")),
+            Outcome::Failed(message) => assert_eq!(message, UNRENDERABLE_IMAGE),
+            _ => {
+                return Err(io::Error::other(
+                    "expected SVG save failure on scripted SVG",
+                ));
+            }
         }
-        assert_eq!(fs::read_to_string(&svg_target)?, &*broken);
+        assert!(!svg_target.exists());
+        assert_eq!(fs::read_dir(&dir)?.count(), 0);
+        fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn malformed_worker_packet_rejects_session_and_blocks_svg_export() -> io::Result<()> {
+        let dir = unique_test_dir("forged")?;
+        let svg_target = dir.join("forged.svg");
+        let svg: Arc<str> = Arc::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="teal"/></svg>"#,
+        );
+        let ctx = egui::Context::default();
+        // Forged non-premultiplied RGBA8 (`r = 250 > a = 10`) from a compromised worker.
+        let (service, mut step) = Service::custom_responder(&ctx, |_, _| {
+            let mut bad = b"BMG1".to_vec();
+            bad.push(1);
+            bad.extend_from_slice(&1_u32.to_le_bytes());
+            bad.extend_from_slice(&1_u32.to_le_bytes());
+            bad.extend_from_slice(&[250, 0, 0, 10]);
+            bad
+        });
+
+        let mut export = Export::start_with_selection(
+            &ctx,
+            Selection {
+                path: svg_target.clone(),
+                format: Format::Svg,
+            },
+            Arc::clone(&svg),
+        )?;
+        assert_eq!(&*step()?, &*svg);
+        match wait_outcome(&mut export) {
+            Outcome::Failed(message) => assert_eq!(message, RASTER_FAILED),
+            _ => return Err(io::Error::other("expected forged worker packet to fail")),
+        }
+        assert!(service.unavailable());
+        assert!(!svg_target.exists());
+        assert_eq!(fs::read_dir(&dir)?.count(), 0);
         fs::remove_dir_all(dir)
     }
 }
