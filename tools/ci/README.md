@@ -770,11 +770,20 @@ dependency audit or benchmark. Foundation retains compilation, analyzers and
 complete tests; this screen does not establish their verdicts.
 
 Prerequisites are native Windows ARM64, PowerShell 7.6+, Git, the pinned Rust
-toolchain and prepared source/digest-bound helpers. Missing prerequisites fail
-closed. Initial preparation builds both `bonsai-ci.exe` and
+toolchain and cached locked dependencies. A valid checker requires no maintenance
+executable. When both the checker and its recovery supervisor need repair, the
+hook automatically prepares them through an independently trusted prebuilt
+`bonsai-tools.exe`. It selects `BONSAI_TOOLS_PATH`, then
+`aarch64-pc-windows-msvc/release/bonsai-tools.exe` or `release/bonsai-tools.exe`
+under `%LOCALAPPDATA%\SwiftBonsai2\build\maintenance`, then `bonsai-tools.exe` on
+PATH. This maintenance executable is a provisioning
+prerequisite with the required `release-tool` capability; it is not required to
+match current `HEAD` source. An unavailable or unsupported maintenance executable
+fails closed; automatic bootstrap compilation is not attempted.
+
+Explicit preparation remains available. It builds both `bonsai-ci.exe` and
 `bonsai-push-recovery.exe` from committed source. Run it in a predeclared
-source-build allowance under external Rust process-tree supervision, with locked
-dependencies already cached:
+source-build allowance under external Rust process-tree supervision:
 
 ```powershell
 pwsh -NoLogo -NoProfile -File tools/ci/check_push_sanity.ps1 -Prepare
@@ -794,8 +803,8 @@ without invalidating its recovery supervisor. Explicit preparation invalidates
 the previous receipts and makes two target-specific `cargo rustc` calls, one for
 each binary, with a fresh invocation metadata nonce. This forces binary
 recompilation and relinking while preserving dependency and library artifacts.
-A failed build cannot admit previous helper bytes. Its caller must enforce the
-declared source-build allowance.
+A failed build cannot admit previous helper bytes. An explicit preparation's
+caller must enforce the declared source-build allowance.
 
 A missing, stale or corrupt checker or checker receipt triggers one automatic
 recovery attempt. The hook removes the invalid checker receipt before verifying
@@ -812,9 +821,24 @@ unchanged dependency artifacts across fresh archive paths. A successful build
 publishes the new checker receipt; the hook verifies it and resumes immutable
 outgoing-tip checks, passing all elapsed preparation time into the existing
 aggregate deadline. A failed build, exhausted allowance or unavailable dependency
-blocks the push without another attempt. Missing, stale or corrupt
-recovery-helper bytes or receipt require
-explicit `-Prepare`; an invalid checker is never used as the recovery authority.
+blocks the push without another attempt.
+
+When recovery-helper bytes or their receipt are missing, stale or corrupt, the
+hook instead makes one full preparation attempt. The maintenance tool's existing
+native `release-tool invoke` operation owns an absolute CMD batch that starts
+packaged PowerShell normally inside its Job and calls the archived committed
+adapter with `-Prepare`. `buildCommand` remains false, preserving the native
+timeout even in a hosted release environment. The timeout is at most 180 seconds,
+shrinks with the original elapsed time and retains 35 seconds before the
+270-second work deadline for subsequent checking and cleanup. The hook retains
+the original outgoing ref updates and passes the outer elapsed time into the
+checker after preparation; preparation cannot renew the push allowance.
+Successful preparation must verify both source/digest-bound receipts against the
+outer invocation's committed input identities before checking resumes. A failed
+native invocation or failed receipt verification invalidates both receipts and
+blocks the push without another attempt. Existing binary and dependency artifacts
+remain available for diagnosis and reuse; an invalid checker is never used as
+the recovery authority.
 
 A valid checker keeps the policy-only fast path and does not compile. Recovery
 fetches no Cargo dependencies and cannot renew an expired clock. Neither recovery
@@ -822,7 +846,9 @@ nor explicit preparation supplies an outgoing-tip verdict or authorizes a push.
 Owning CI still qualifies complete preparation and recovery receipts, invalidation,
 typed receipt-field rejection, nonce-driven corrupted-output regeneration,
 dependency/library reuse, legacy-cache compatibility, shared deadlines,
-process-tree cleanup, snapshots and batched script controls.
+process-tree cleanup, snapshots and batched script controls. It also qualifies
+full automatic preparation admission, maintenance prerequisite failures, both
+receipt checks, original-ref continuation and budget/failure invalidation.
 Local focused checks do not establish that CI verdict.
 `BONSAI_ACTIONLINT_PATH` can supply the reviewed actionlint 1.7.12 executable for
 an offline syntax check. Otherwise, the checker caches its pinned archive under
