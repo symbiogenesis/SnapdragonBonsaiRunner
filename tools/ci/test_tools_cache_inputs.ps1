@@ -60,16 +60,24 @@ function Get-RequiredToolsFiles([string]$Root,[string[]]$Packages=@('tools/bonsa
     foreach ($name in @('Cargo.toml','Cargo.lock','rust-toolchain.toml')) { [void]$files.Add((Join-Path $Root $name)) }
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $Root '.cargo') -File -Recurse) { [void]$files.Add($file.FullName) }
     $closure=@($Packages | ForEach-Object { Get-CargoPackageClosure $Root $_ } | ForEach-Object { $_ } | Sort-Object -Unique)
+    if (-not (Get-Variable -Name requiredPackageFilesCache -Scope Script -ErrorAction SilentlyContinue)) { $script:requiredPackageFilesCache = @{} }
     foreach ($package in $closure) {
-        [void]$files.Add((Join-Path $package 'Cargo.toml')); $sources=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($file in Get-ChildItem -LiteralPath $package -File -Filter '*.rs' -Recurse) { [void]$sources.Add($file.FullName) }
-        # Binaries may explicitly point outside the package directory.
-        foreach ($match in [regex]::Matches([IO.File]::ReadAllText((Join-Path $package 'Cargo.toml')),'(?m)^path\s*=\s*"([^"\\]+\.rs)"\s*$')) { [void]$sources.Add([IO.Path]::GetFullPath((Join-Path $package $match.Groups[1].Value))) }
-        foreach ($source in $sources) {
-            [void]$files.Add($source); $relative=[IO.Path]::GetRelativePath($package,$source).Replace('\','/')
-            if ('tests' -cin ($relative -split '/') -or $source -cmatch '(?:_tests|tests)\.rs$') { continue }
-            foreach ($embedded in @(Get-CargoEmbeddedFiles $package $source)) { [void]$files.Add($embedded) }
+        $cacheKey = "$Root`n$package"
+        $packageFiles = $script:requiredPackageFilesCache[$cacheKey]
+        if ($null -eq $packageFiles) {
+            $packageFiles = [Collections.Generic.List[string]]::new()
+            $packageFiles.Add((Join-Path $package 'Cargo.toml')); $sources=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($file in Get-ChildItem -LiteralPath $package -File -Filter '*.rs' -Recurse) { [void]$sources.Add($file.FullName) }
+            # Binaries may explicitly point outside the package directory.
+            foreach ($match in [regex]::Matches([IO.File]::ReadAllText((Join-Path $package 'Cargo.toml')),'(?m)^path\s*=\s*"([^"\\]+\.rs)"\s*$')) { [void]$sources.Add([IO.Path]::GetFullPath((Join-Path $package $match.Groups[1].Value))) }
+            foreach ($source in $sources) {
+                $packageFiles.Add($source); $relative=[IO.Path]::GetRelativePath($package,$source).Replace('\','/')
+                if ('tests' -cin ($relative -split '/') -or $source -cmatch '(?:_tests|tests)\.rs$') { continue }
+                foreach ($embedded in @(Get-CargoEmbeddedFiles $package $source)) { $packageFiles.Add($embedded) }
+            }
+            $script:requiredPackageFilesCache[$cacheKey] = $packageFiles
         }
+        foreach ($entry in $packageFiles) { [void]$files.Add($entry) }
     }
     foreach ($file in $files) { $relative=[IO.Path]::GetRelativePath($Root,[IO.Path]::GetFullPath($file)).Replace('\','/'); if ($relative.StartsWith('../',[StringComparison]::Ordinal)) { throw 'Embedded build input escaped repository' }; $relative }
 }
@@ -79,7 +87,8 @@ function Get-ToolsHashPatterns {
     return @([regex]::Matches($Matches[1],'''([^'']+)''') | ForEach-Object { $_.Groups[1].Value })
 }
 function Get-UncoveredToolsFiles([string[]]$Files,[string[]]$Patterns) {
-    foreach ($file in $Files) { $covered=$false; foreach ($pattern in $Patterns) { if ([Management.Automation.WildcardPattern]::new($pattern,[Management.Automation.WildcardOptions]::CultureInvariant).IsMatch($file)) { $covered=$true; break } }; if (-not $covered) { $file } }
+    $compiled = @($Patterns | ForEach-Object { [Management.Automation.WildcardPattern]::new($_,[Management.Automation.WildcardOptions]::CultureInvariant) })
+    foreach ($file in $Files) { $covered=$false; foreach ($wildcard in $compiled) { if ($wildcard.IsMatch($file)) { $covered=$true; break } }; if (-not $covered) { $file } }
 }
 function Get-LaneCachePatterns([string]$Lane) {
     $action=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/check-rust/action.yml')).Replace("`r`n","`n")
