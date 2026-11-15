@@ -44,6 +44,7 @@ impl State {
             || self.delete_conversation.is_some()
             || self.show_settings
             || self.show_audio_transcript
+            || self.lightbox.is_some()
             || self.alerts.details.is_some()
             || self.edit_message.is_some()
             || self.help.is_some()

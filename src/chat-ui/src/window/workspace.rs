@@ -126,6 +126,7 @@ impl State {
         self.stage = None;
         self.answer_complete = false;
         self.streaming_svg_filter.reset();
+        self.lightbox = None;
         self.extra_effort = false;
         self.enable_thinking = false;
         self.streaming_read_aloud = false;

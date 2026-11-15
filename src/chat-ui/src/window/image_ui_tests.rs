@@ -1,4 +1,4 @@
-//! End-to-end egui UI tests for inline generated SVG bubbles, streaming, and Find fallback.
+//! End-to-end egui UI tests for inline generated SVG bubbles, streaming, Find fallback, and Lightbox.
 #![forbid(unsafe_code)]
 
 use super::*;
@@ -14,7 +14,7 @@ After diagram."##;
 
 struct Fixture {
     app: State,
-    _commands: Receiver<Command>,
+    commands: Receiver<Command>,
     _events: client::EventSender,
 }
 
@@ -28,7 +28,7 @@ impl Fixture {
         app.status = "Ready when you are.".to_owned();
         Self {
             app,
-            _commands: incoming,
+            commands: incoming,
             _events: events,
         }
     }
@@ -65,7 +65,15 @@ fn assistant_svg_renders_inline_card_and_preserves_raw_source() {
     chat.run();
 
     assert!(
-        chat.get_by_role_and_label(egui::Role::Image, "Generated image")
+        chat.get_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand."
+        )
+        .rect()
+        .is_positive()
+    );
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Expand generated image")
             .rect()
             .is_positive()
     );
@@ -97,8 +105,11 @@ fn streaming_open_svg_fence_shows_generating_card_until_closed() {
 
     assert!(chat.get_by_label("Generating image…").rect().is_positive());
     assert!(
-        chat.query_by_role_and_label(egui::Role::Image, "Generated image")
-            .is_none()
+        chat.query_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand.",
+        )
+        .is_none()
     );
 
     chat.state_mut().app.transcript.append(
@@ -111,9 +122,81 @@ fn streaming_open_svg_fence_shows_generating_card_until_closed() {
 
     assert!(chat.query_by_label("Generating image…").is_none());
     assert!(
-        chat.get_by_role_and_label(egui::Role::Image, "Generated image")
+        chat.get_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand."
+        )
+        .rect()
+        .is_positive()
+    );
+}
+
+#[test]
+fn double_click_and_expand_open_near_full_window_lightbox_and_escape_preserves_draft() {
+    let mut chat = harness([1080.0, 780.0], |app| {
+        app.model = ModelLifecycle::Generating;
+        app.request_conversation = Some(app.active_conversation);
+        app.input = "Keep this unsent draft".to_owned();
+        app.transcript
+            .push(Role::User, "Create an image.".to_owned());
+        app.transcript.push(Role::Assistant, SVG_DIAGRAM.to_owned());
+        app.transcript.remove_empty_response();
+    });
+    chat.run();
+
+    {
+        let preview = chat.get_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand.",
+        );
+        preview.click();
+    }
+    chat.step();
+    {
+        let preview = chat.get_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand.",
+        );
+        preview.click();
+    }
+    chat.run();
+
+    let dialog_rect = chat
+        .get_by_role_and_label(egui::Role::Dialog, "Expanded generated image")
+        .rect();
+    assert!(dialog_rect.width() >= 1080.0 * 0.90);
+    assert!(dialog_rect.height() >= 780.0 * 0.88);
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Save image…")
             .rect()
             .is_positive()
+    );
+
+    chat.key_press(egui::Key::Escape);
+    chat.run();
+
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Dialog, "Expanded generated image")
+            .is_none()
+    );
+    assert_eq!(chat.state().app.input, "Keep this unsent draft");
+    assert!(chat.state().commands.try_recv().is_err());
+
+    chat.get_by_role_and_label(egui::Role::Button, "Expand generated image")
+        .click();
+    chat.run();
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Dialog, "Expanded generated image")
+            .rect()
+            .is_positive()
+    );
+
+    chat.get_by_role_and_label(egui::Role::Button, "Close")
+        .click();
+    chat.run();
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Dialog, "Expanded generated image")
+            .is_none()
     );
 }
 
@@ -127,9 +210,12 @@ fn find_match_inside_svg_falls_back_to_raw_source_and_restores_image_on_close() 
     });
     chat.run();
     assert!(
-        chat.get_by_role_and_label(egui::Role::Image, "Generated image")
-            .rect()
-            .is_positive()
+        chat.get_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand."
+        )
+        .rect()
+        .is_positive()
     );
 
     chat.state_mut().app.transcript.focus_find();
@@ -140,8 +226,11 @@ fn find_match_inside_svg_falls_back_to_raw_source_and_restores_image_on_close() 
 
     assert!(chat.get_by_label("1 of 1").rect().is_positive());
     assert!(
-        chat.query_by_role_and_label(egui::Role::Image, "Generated image")
-            .is_none()
+        chat.query_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand.",
+        )
+        .is_none()
     );
 
     chat.key_press(egui::Key::Escape);
@@ -149,8 +238,11 @@ fn find_match_inside_svg_falls_back_to_raw_source_and_restores_image_on_close() 
 
     assert!(chat.query_by_label("Find in conversation").is_none());
     assert!(
-        chat.get_by_role_and_label(egui::Role::Image, "Generated image")
-            .rect()
-            .is_positive()
+        chat.get_by_role_and_label(
+            egui::Role::Image,
+            "Generated image. Double-click to expand."
+        )
+        .rect()
+        .is_positive()
     );
 }

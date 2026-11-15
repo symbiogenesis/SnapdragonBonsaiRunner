@@ -49,6 +49,7 @@ mod iteration;
 mod iteration_ui_tests;
 #[cfg(test)]
 mod keyboard_tests;
+mod lightbox;
 #[allow(
     unsafe_code,
     reason = "Audited UI-thread WinRT microphone initialization and teardown."
@@ -208,6 +209,7 @@ struct State {
     audio_paste: Option<crate::audio_import::PasteHook>,
     audio_paste_checked: bool,
     image_cache: image_cache::ImageCache,
+    lightbox: Option<lightbox::Lightbox>,
     image_export: Option<crate::image_export::Export>,
     speech_output: bool,
     canary_configured: bool,
@@ -359,6 +361,7 @@ impl State {
             audio_paste: None,
             audio_paste_checked: false,
             image_cache: image_cache::ImageCache::default(),
+            lightbox: None,
             image_export: None,
             speech_output: false,
             canary_configured: false,
@@ -775,9 +778,16 @@ impl State {
         if self.update_confirmation_visible() {
             return;
         }
-        // The transcript viewer owns Escape and all background shortcuts, even
-        // on its first frame. Closing it must not also cancel or stop a request.
+        // The transcript viewer and lightbox own Escape and background shortcuts,
+        // even on their first frame. Closing them must not cancel or stop a request.
         if self.show_audio_transcript || self.alerts.details.is_some() {
+            return;
+        }
+        if self.lightbox.is_some() {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.lightbox = None;
+                ctx.request_repaint();
+            }
             return;
         }
         // Voice cancellation takes effect before overlays consume Escape. Keep
@@ -853,6 +863,7 @@ impl State {
             && self.edit_message.is_none()
             && !self.show_settings
             && !self.show_audio_transcript
+            && self.lightbox.is_none()
             && self.alerts.details.is_none()
             && !egui::Popup::is_any_open(ctx)
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::N))
@@ -861,6 +872,7 @@ impl State {
         }
         if !self.show_settings
             && !self.show_audio_transcript
+            && self.lightbox.is_none()
             && self.alerts.details.is_none()
             && self.rename_conversation.is_none()
             && self.delete_conversation.is_none()
@@ -2089,6 +2101,14 @@ impl State {
         ) {
             Some(transcript::TranscriptAction::ReadAloud(id)) => self.toggle_read_aloud(id),
             Some(transcript::TranscriptAction::Message(action)) => self.message_action(action),
+            Some(transcript::TranscriptAction::OpenLightbox {
+                svg,
+                intrinsic_size,
+                suggested_stem,
+            }) => {
+                self.lightbox = Some(lightbox::Lightbox::new(svg, intrinsic_size, suggested_stem));
+                ui.ctx().request_repaint();
+            }
             Some(transcript::TranscriptAction::SaveImage {
                 svg,
                 suggested_stem,
@@ -2201,6 +2221,7 @@ impl State {
         ui.add_enabled_ui(
             !self.show_settings
                 && !self.show_audio_transcript
+                && self.lightbox.is_none()
                 && self.alerts.details.is_none()
                 && !update_confirmation
                 && !drawer,
@@ -2275,6 +2296,20 @@ impl State {
                 self.speech_notice = false;
             }
         }
+        if let Some(lightbox_action) = self.lightbox.as_ref().and_then(|lightbox| {
+            lightbox.show(&ctx, &mut self.image_cache, self.image_export.is_some())
+        }) {
+            match lightbox_action {
+                lightbox::LightboxAction::Close => {
+                    self.lightbox = None;
+                    ctx.request_repaint();
+                }
+                lightbox::LightboxAction::Save {
+                    svg,
+                    suggested_stem,
+                } => self.start_image_export(&ctx, svg, suggested_stem),
+            }
+        }
     }
 }
 
@@ -2312,6 +2347,7 @@ impl eframe::App for State {
             || (was_busy && !self.model.busy() && self.model.ready()))
             && !self.show_settings
             && !self.show_audio_transcript
+            && self.lightbox.is_none()
             && self.alerts.details.is_none()
             && ctx.memory(|memory| {
                 memory

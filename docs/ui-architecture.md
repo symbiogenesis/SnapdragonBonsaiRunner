@@ -204,7 +204,7 @@ Installed upgrade/rollback acceptance is independent of portable updates.
 | Component | Contract |
 | --- | --- |
 | Workspace | Each conversation owns its draft, response settings, visible transcript and exact committed history. Creation/branching has no count cap; encoded recovery and per-conversation message bounds still apply. Transcript eviction never changes model history. |
-| Presentation | Assistant answers render supported Markdown with native Rust text widgets; user messages stay literal. Generated links and image labels remain inert, HTML stays literal and code never executes. Bounded parsing and styling fall back to source text. Message Copy, export, recovery and model history retain exact source; selection copies displayed text. Find searches source and maps matches to rendered text, showing source when a match lacks an exact displayed mapping. |
+| Presentation | Assistant answers render supported Markdown and standalone `` ```svg `` blocks with native Rust widgets; user messages stay literal. Generated links and external image labels remain inert, HTML stays literal and scripts or event attributes never execute. Bounded parsing, offline SVG rasterization, bounded progressive GPU texture caching, full-window Lightbox inspection, native PNG/SVG file export, and Find-hit source fallback keep Copy, speech fence stripping, recovery and model history tied to exact source. |
 | Message iteration | Edit/Regenerate branch the verified history prefix, preserving the original draft. Branch creates without sending; Continue is explicit. Identified interrupted answers can enter history; intermediate effort drafts cannot. |
 | Response retry | A visible Retry response control belongs to the identified failed prompt or interrupted answer. Retrying an unanswered prompt reuses its existing transcript card and preserves the composer and cursor; retrying a partial answer creates a branch from its original prompt, preserving the source conversation and draft. After confirmed teardown, Reload model only restores readiness; a separate Retry response action sends the prompt. |
 | Recovery | User-scoped DPAPI, atomic bounded saves, one writer/data folder and persistent opt-out. Restore never replays requests or starts capture/playback. Preserve unreadable bytes until an explicit save. See [recovery operation](development-guide.md#optional-recovery-and-preview). |
@@ -216,18 +216,26 @@ Installed upgrade/rollback acceptance is independent of portable updates.
 | Rejections | Only the exact [broker recovery errors](broker-policy.md#native-client-completion-and-recovery) retain readiness and restore input. Other disconnects require explicit Retry and identify no token/memory cause. |
 | Alerts | One shared native panel selects among setup/model/saving/speech/audio/update failures. Each has a two-line summary and source-specific actions. Details provides a bounded scrollable modal; Copy error copies the complete message. Successful progress stays separate. |
 
-Markdown parsing uses a persistent [offline native sandbox worker](sandboxing.md#markdown-parser-worker),
-with bounded background pipe I/O and trusted-parent validation of its render
-description. The pure Rust `bonsai-markdown` library runs in a separate private
+Markdown parsing and offline SVG rasterization use the same persistent [offline native sandbox worker](sandboxing.md#markdown-parser-worker),
+with bounded background pipe I/O and trusted-parent validation (`BMD2` segmented
+parse responses and `BSMG0001`/`BMG1` premultiplied RGBA8 raster packets). The
+pure Rust `bonsai-markdown` and `resvg` libraries run in a separate private
 `--markdown-worker` invocation of the configured headless broker image, before
 model, credential or network setup. The GUI image cannot initialize under the
 worker's required Win32k denial. The prepared broker path starts one parser
 handshake before model setup, including for direct configured launches. No
 synthetic source request is needed. Older source launchers without that handoff
 retain deferred formatting until their configured broker is prepared.
-The UI creates native egui text widgets from admitted results.
-Unavailable or failed parsing leaves complete plain source visible and ends the
-parser session; parsing never falls back into the trusted UI process.
+The UI creates native egui text widgets and inline image cards from admitted
+results; incomplete streamed `` ```svg `` fences show a bounded placeholder until
+closed, while unrenderable SVGs fall back cleanly to source without scripts,
+event attributes, external URLs or UI-thread XML parsing. Unavailable or failed
+parsing leaves complete plain source visible and ends the session; parsing and
+rasterization never fall back into the trusted production UI process. A bounded
+progressive 24-texture GPU cache (`ImageCache`) sharpens previews on demand,
+double-clicking or `Expand` opens the near-full-window Lightbox (~94%×92%
+viewport, dismissed by `Escape`, `Close`, or scrim click), and `Save` writes
+`.png` or `.svg` files atomically via the native `IFileSaveDialog`.
 
 Markdown uses the current appearance theme and reading size: six heading sizes,
 native bold faces for headings/emphasis/table headers, comfortable line leading

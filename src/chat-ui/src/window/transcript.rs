@@ -29,6 +29,11 @@ pub(super) struct MessageControls<'a> {
 pub(super) enum TranscriptAction {
     ReadAloud(u64),
     Message(super::iteration::MessageAction),
+    OpenLightbox {
+        svg: Arc<str>,
+        intrinsic_size: Vec2,
+        suggested_stem: String,
+    },
     SaveImage {
         svg: Arc<str>,
         suggested_stem: String,
@@ -60,6 +65,7 @@ pub(super) enum CachedSegment {
     Text(TextSegmentCache),
     Image {
         svg: Arc<str>,
+        intrinsic_size: Vec2,
         preview_size: Vec2,
         card_size: Vec2,
         index: usize,
@@ -964,6 +970,7 @@ impl Message {
                     let (preview_size, card_size) = image_card_layout(width, intrinsic_size);
                     cached.push(CachedSegment::Image {
                         svg,
+                        intrinsic_size,
                         preview_size,
                         card_size,
                         index: image_index,
@@ -1186,7 +1193,7 @@ fn render_text_segment(
     })
 }
 
-fn aspect_fit_rect(bounds: egui::Rect, texture_size: Vec2) -> egui::Rect {
+pub(super) fn aspect_fit_rect(bounds: egui::Rect, texture_size: Vec2) -> egui::Rect {
     let tw = texture_size.x.max(1.0);
     let th = texture_size.y.max(1.0);
     let scale = (bounds.width() / tw).min(bounds.height() / th);
@@ -1206,6 +1213,7 @@ fn render_image_card(
 ) -> Option<TranscriptAction> {
     let CachedSegment::Image {
         svg,
+        intrinsic_size,
         preview_size,
         card_size,
         index,
@@ -1272,12 +1280,27 @@ fn render_image_card(
         }
     }
 
-    let preview_id = ui.make_persistent_id(("svg-preview", message_id, *index));
-    let preview_response = ui.interact(preview_rect, preview_id, egui::Sense::hover());
-    preview_response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, "Generated image"));
-
     let mut action = None;
+    let preview_id = ui.make_persistent_id(("svg-preview", message_id, *index));
+    let preview_response = ui
+        .interact(preview_rect, preview_id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::ZoomIn)
+        .on_hover_text("Double-click to view larger");
+    preview_response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::Role::Image,
+            true,
+            "Generated image. Double-click to expand.",
+        )
+    });
+    if preview_response.double_clicked() {
+        action = Some(TranscriptAction::OpenLightbox {
+            svg: Arc::clone(svg),
+            intrinsic_size: *intrinsic_size,
+            suggested_stem: suggested_stem.clone(),
+        });
+    }
+
     let footer_rect = egui::Rect::from_min_max(
         egui::pos2(
             card_rect.min.x + 8.0,
@@ -1303,6 +1326,20 @@ fn render_image_card(
     if save_button.clicked() {
         action = Some(TranscriptAction::SaveImage {
             svg: Arc::clone(svg),
+            suggested_stem: suggested_stem.clone(),
+        });
+    }
+
+    let expand_button = footer
+        .add(super::controls::quiet_button("Expand").min_size(egui::vec2(0.0, MESSAGE_ACTION_SIZE)))
+        .on_hover_text("Open image in full-window view");
+    expand_button.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, true, "Expand generated image")
+    });
+    if expand_button.clicked() {
+        action = Some(TranscriptAction::OpenLightbox {
+            svg: Arc::clone(svg),
+            intrinsic_size: *intrinsic_size,
             suggested_stem,
         });
     }
