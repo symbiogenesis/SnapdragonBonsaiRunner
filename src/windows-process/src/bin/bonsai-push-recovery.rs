@@ -157,10 +157,12 @@ mod native {
     use std::ffi::OsString;
     use std::fs;
     use std::io::Write as _;
+    use std::os::windows::fs::MetadataExt as _;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
     fn canonical(path: &Path) -> Result<PathBuf, String> {
         let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
@@ -178,12 +180,18 @@ mod native {
             .ok_or_else(|| "Recovery requires cargo.exe on PATH.".into())
     }
 
+    fn ensure_regular_file(path: &Path) -> Result<u64, String> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if !metadata.file_type().is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err("Checker recovery output path became a redirect or non-file.".into());
+        }
+        Ok(metadata.len())
+    }
+
     fn output_bytes(stdout: &Path, stderr: &Path) -> Result<u64, String> {
-        fs::metadata(stdout)
-            .and_then(|output| {
-                fs::metadata(stderr).map(|errors| output.len().saturating_add(errors.len()))
-            })
-            .map_err(|error| error.to_string())
+        Ok(ensure_regular_file(stdout)?.saturating_add(ensure_regular_file(stderr)?))
     }
 
     struct Work<'a> {
@@ -250,6 +258,8 @@ mod native {
                     "Push checker recovery exceeded its final output bound; push blocked.".into(),
                 );
             }
+            let _ = ensure_regular_file(&stdout)?;
+            let _ = ensure_regular_file(&stderr)?;
             let output = fs::read(&stdout).map_err(|error| error.to_string())?;
             let errors = fs::read(&stderr).map_err(|error| error.to_string())?;
             if code != 0 {
@@ -329,6 +339,20 @@ mod native {
         )
     }
 
+    struct ScratchGuard<'a> {
+        path: &'a Path,
+        parent: &'a Path,
+        disarmed: bool,
+    }
+
+    impl Drop for ScratchGuard<'_> {
+        fn drop(&mut self) {
+            if !self.disarmed && self.path.parent() == Some(self.parent) {
+                let _ = fs::remove_dir_all(self.path);
+            }
+        }
+    }
+
     pub(super) fn run() -> Result<(), String> {
         let started = Instant::now();
         let arguments = policy::arguments(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
@@ -343,10 +367,22 @@ mod native {
             std::process::id()
         ));
         fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let mut guard = ScratchGuard {
+            path: &scratch,
+            parent: &temporary,
+            disarmed: false,
+        };
+        let scratch_meta = fs::symlink_metadata(&scratch).map_err(|error| error.to_string())?;
+        if !scratch_meta.file_type().is_dir()
+            || scratch_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err("Checker recovery scratch directory became a redirect.".into());
+        }
         let result = execute(&arguments, started, &scratch);
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Checker recovery cleanup escaped temporary storage.".into());
         }
+        guard.disarmed = true;
         let cleanup = fs::remove_dir_all(&scratch)
             .map_err(|error| format!("Checker recovery capture cleanup failed: {error}"));
         match (result, cleanup) {

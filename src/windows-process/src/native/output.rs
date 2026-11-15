@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
 use windows_sys::Win32::System::Threading::TerminateProcess;
 
 use super::anonymous_pipe;
@@ -55,6 +55,7 @@ fn pending(path: &Path, label: &'static str) -> io::Result<(OwnedHandle, Pending
         .write(true)
         .create_new(true)
         .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let (reader, writer) = anonymous_pipe(false)?;
     Ok((

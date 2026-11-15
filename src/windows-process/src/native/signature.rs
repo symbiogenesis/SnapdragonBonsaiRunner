@@ -132,6 +132,11 @@ fn signer(data: &WINTRUST_DATA) -> io::Result<crate::AuthenticodeSigner> {
     }
     let common_name = String::from_utf16(&common_name[..end])
         .map_err(|_| super::invalid("Signer name is not valid UTF-16."))?;
+    if common_name.chars().any(char::is_control) {
+        return Err(super::invalid(
+            "Signer common name contains control characters.",
+        ));
+    }
     let mut digest = [0_u8; 20];
     let mut size = 20_u32;
     // SAFETY: context remains live; digest and size are writable for SHA-1's

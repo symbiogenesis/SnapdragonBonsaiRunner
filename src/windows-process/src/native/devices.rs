@@ -32,12 +32,19 @@ fn text(buffer: &[u16]) -> io::Result<String> {
         .iter()
         .position(|unit| *unit == 0)
         .ok_or_else(|| super::invalid("Unterminated device property."))?;
-    String::from_utf16(&buffer[..end])
-        .map_err(|_| super::invalid("Invalid device property UTF-16."))
+    let text = String::from_utf16(&buffer[..end])
+        .map_err(|_| super::invalid("Invalid device property UTF-16."))?;
+    if text.chars().any(char::is_control) {
+        return Err(super::invalid(
+            "Device property contains control characters.",
+        ));
+    }
+    Ok(text)
 }
 fn property(set: &Set, entry: &SP_DEVINFO_DATA, property: u32) -> Option<String> {
     let mut buffer = [0_u16; 2048];
     let mut kind = 0;
+    let mut required = 0_u32;
     // SAFETY: The live set/entry are borrowed and the property destination is
     // writable for exactly the bounded UTF-16 array's byte size.
     let read = unsafe {
@@ -48,12 +55,16 @@ fn property(set: &Set, entry: &SP_DEVINFO_DATA, property: u32) -> Option<String>
             &raw mut kind,
             buffer.as_mut_ptr().cast(),
             4096,
-            ptr::null_mut(),
+            &raw mut required,
         )
     };
-    (read != 0 && kind == REG_SZ)
-        .then(|| text(&buffer).ok())
-        .flatten()
+    if read == 0 || kind != REG_SZ || required < 2 || required % 2 != 0 {
+        return None;
+    }
+    let units = usize::try_from(required / 2)
+        .ok()
+        .filter(|units| *units <= buffer.len())?;
+    text(&buffer[..units]).ok()
 }
 fn registry(key: &Key, name: &str) -> Option<String> {
     let name: Vec<_> = name.encode_utf16().chain([0]).collect();
@@ -72,7 +83,13 @@ fn registry(key: &Key, name: &str) -> Option<String> {
             &raw mut size,
         )
     };
-    (status == 0).then(|| text(&buffer).ok()).flatten()
+    if status != 0 || size < 2 || size % 2 != 0 {
+        return None;
+    }
+    let units = usize::try_from(size / 2)
+        .ok()
+        .filter(|units| *units <= buffer.len())?;
+    text(&buffer[..units]).ok()
 }
 
 pub(crate) fn inventory(class: &str) -> io::Result<Vec<crate::DeviceInventoryEntry>> {
@@ -144,4 +161,22 @@ pub(crate) fn inventory(class: &str) -> io::Result<Vec<crate::DeviceInventoryEnt
         });
     }
     Err(super::invalid("Device inventory bound was exceeded."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text;
+
+    #[test]
+    fn device_text_rejects_control_characters_and_invalid_utf16() {
+        assert_eq!(
+            text(&[u16::from(b'Q'), u16::from(b'u'), 0]).ok().as_deref(),
+            Some("Qu")
+        );
+        for control in [0x0001_u16, 0x000A, 0x000D, 0x001B, 0x007F] {
+            assert!(text(&[u16::from(b'A'), control, u16::from(b'B'), 0]).is_err());
+        }
+        assert!(text(&[u16::from(b'A'), u16::from(b'B')]).is_err());
+        assert!(text(&[0xD800_u16, 0]).is_err());
+    }
 }
