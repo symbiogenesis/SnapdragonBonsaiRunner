@@ -125,12 +125,30 @@ pub(super) fn read_log(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(super) fn command(
+pub(in crate::command) fn command(
     spec: &ToolProcessSpec,
     allowance: Option<Duration>,
     log: &Path,
 ) -> Result<(u32, String)> {
-    if allowance.is_some_and(|duration| duration.is_zero()) {
+    command_with_deadline(
+        spec,
+        allowance.map(|duration| Instant::now() + duration),
+        &[],
+        &[],
+        false,
+        log,
+    )
+}
+
+pub(in crate::command) fn command_with_deadline(
+    spec: &ToolProcessSpec,
+    deadline: Option<Instant>,
+    removed: &[String],
+    watched: &[(PathBuf, u64)],
+    reject_survivors: bool,
+    log: &Path,
+) -> Result<(u32, String)> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err("Rust check aggregate deadline expired.".into());
     }
     let mut output = std::io::stderr().lock();
@@ -141,15 +159,18 @@ pub(super) fn command(
         spec.arguments,
         log.display()
     );
-    let child = OwnedProcess::start_tool(spec).map_err(|error| error.to_string())?;
-    let started = Instant::now();
+    let child =
+        OwnedProcess::start_tool_with_removed(spec, removed).map_err(|error| error.to_string())?;
     let code = loop {
         if let Some(code) = child.try_wait().map_err(|error| error.to_string())? {
             break code;
         }
-        if allowance.is_some_and(|duration| started.elapsed() >= duration)
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
             || [&spec.stdout, &spec.stderr].into_iter().any(|path| {
                 !fs::metadata(path).is_ok_and(|metadata| metadata.len() <= MAX_LOG_BYTES)
+            })
+            || watched.iter().any(|(path, limit)| {
+                fs::metadata(path).is_ok_and(|metadata| metadata.len() > *limit)
             })
         {
             child
@@ -161,9 +182,42 @@ pub(super) fn command(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    let survivors = if reject_survivors {
+        // Root signaling can precede final Job accounting or normal child exit.
+        // This short drain shares the original deadline; it is never a new
+        // command allowance. Remaining members still force failure and teardown.
+        let grace = Instant::now();
+        Some(loop {
+            let active = child
+                .active_processes()
+                .map_err(|error| error.to_string())?;
+            if active == 0
+                || grace.elapsed() >= Duration::from_millis(250)
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                break active;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        })
+    } else {
+        None
+    };
     child
         .stop(Duration::from_secs(5))
         .map_err(|error| error.to_string())?;
+    if survivors.is_some_and(|count| count != 0) {
+        return Err(
+            "Compiler root exited with surviving owned descendants; capture rejected.".into(),
+        );
+    }
+    if watched
+        .iter()
+        .any(|(path, limit)| fs::metadata(path).is_ok_and(|metadata| metadata.len() > *limit))
+    {
+        return Err(
+            "Compiler output exceeded its declared artifact bound; capture rejected.".into(),
+        );
+    }
     let stdout = read_log(&spec.stdout)?;
     let stderr = read_log(&spec.stderr)?;
     let mut combined = OpenOptions::new()

@@ -354,6 +354,90 @@ The source receipt explicitly
 leaves complete-build, linkage, inference and retirement qualification false.
 Retain only the selected bytes needed by that consumer, under the evidence policy.
 
+#### Explicit live compiler capture
+
+`native-closure-capture` executes a newly reviewed, explicit Clang/clang-cl
+selection on native Windows, then passes its original outputs to the existing
+schema-3 collector and verifier:
+
+```powershell
+& $reviewedCiTool native-closure-capture --request $executionRequest --expected-sha256 $reviewedExecutionSha256
+```
+
+Its strict request has `schemaVersion: 1`,
+`kind: explicit-clang-native-source-execution`, `sourceRevision`, `target`,
+`configuration`, `compiler` (the reviewed absolute path, byte length and SHA-256),
+`outputDirectory`, `environment`, `clock` and `units`. Each unit uses the
+collector's `source`, `workingDirectory`, `arguments`, `preprocessingArguments`,
+`dependencies`, `preprocessed`, `object` and classified recursive `inputs` fields.
+It accepts no supplied compiler/preprocessor exit codes. Both original argument
+arrays start with the exact pinned compiler path and must already select the
+matching supported configuration, explicit actions and absolute outputs. The
+command forwards those arrays without rewriting them. Generated-input provenance
+is supplied original evidence; this command executes no generators.
+
+`outputDirectory` must be new; all declared compiler outputs are distinct direct
+files there. Existing evidence is never reused or overwritten. `environment`
+permits only explicit `INCLUDE`, `LIB`, `PATH`, `TEMP`, `TMP` and `SystemRoot`
+overrides. Inherited compiler injection variables, including `CL`, `_CL_`,
+`CCC_OVERRIDE_OPTIONS`, header-search variables and inherited `INCLUDE`, are
+removed before those overrides. Unrelated inherited system environment remains;
+this is not proof of complete effective compiler configuration.
+
+The original `clock` contains `startedUnixMilliseconds`, `startedTick`,
+`tickFrequency`, `maximumSeconds`, `estimatedTotalSeconds` and optional
+`budgetReason`. Windows counter values must come from the owner's original
+native performance-counter clock. Admission charges the larger wall/counter
+elapsed cost, including setup, using integer ceilings. One absolute local work
+deadline covers intake, every command, hashing and verification; hash/read loops
+poll it between 16 KiB reads, including recursive collector/verifier passes. Thirty seconds
+remain for owned teardown, retention and exit. The maximum is 900 seconds;
+allowances above the default 300 require a nonblank predeclared reason and a
+conservative estimate within that allowance. This does not authorize a trial,
+extend a narrower owning workload or reopen a historical deadline. The external
+owner retains supervision and aggregate/per-arm power observations; missing power
+stays explicitly null in this receipt. Synchronous OS reads, path queries,
+bounded JSON operations and receipt flushes cannot be preempted by cooperative
+checks; the external owner must supervise the entire prebuilt helper under the
+original deadline, including preparation and final publication/cleanup.
+
+Before execution, the command retains exact request bytes and writes the original
+argument-array database. Each invocation has a durable journal before dispatch.
+The final `capture.json` records every selected compile/preprocess phase,
+including unattempted work, actual returned root codes and unknown start/completion
+when the supervisor cannot establish them. A failure stops the remaining
+selection. Native Job supervision rejects surviving compiler descendants, enforces
+the original work deadline and bounds logs and declared output files. Empty
+reserved outputs and passing compiler chatter are removed; completed journals
+are consolidated into the final receipt. Empty/oversized declared outputs are
+discarded with byte counts; failure diagnostics retain their original nonblank
+stdout/stderr instead of a duplicate combined log. Interrupted invocations retain their
+journals without a success claim.
+
+Success retains the original `.d`, preprocessed and object files, exact
+`request.json`, argument-array database, `manifest.json`, `verification.json` and
+one execution receipt. The request is bounded at 8 MiB; existing manifest/input
+bounds remain effective. Source/compiler endpoint identities must agree before
+and after execution; these are endpoint hashes, without continuously retained
+immutable compiler/input guards. `sourceRevision`, target and configuration
+remain producer claims; selected overrides and removed variable names do not
+capture the complete inherited environment. Observed command completion from the
+supplied path does not authenticate which compiler bytes were mapped at launch.
+Retain the selected
+original source/generated/toolchain inputs required by independent replay,
+including their provenance and notices. Review an explicit retained file
+selection; do not archive the complete output tree or unrelated build source.
+The `native_source_capture_` controls
+use synthetic compiler outputs plus a native failed-root/deadline fixture; they
+provide no authentic C++ build or model observations.
+
+This is an opt-in explicit selection, with no CMake launcher or automatic ASR
+build instrumentation. Its generated database covers only that selection.
+Complete owning-build selection, actual original captures, compiler target and
+configuration, link/package closure and no-project-C++ hosted builds remain
+separate gates. Neither command execution nor collector success qualifies
+inference parity or native retirement.
+
 ### Checked-in native retirement boundary
 
 `native-boundary-verify` checks every owned checked-in C/C++/Objective-C source

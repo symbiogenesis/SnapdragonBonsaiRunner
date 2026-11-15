@@ -6,6 +6,7 @@ use std::{
     fs::{self, File, Metadata},
     io::Read as _,
     path::{Component, Path, PathBuf},
+    time::Instant,
 };
 
 use serde::Deserialize;
@@ -83,6 +84,22 @@ pub(super) fn plain_ancestors(path: &Path) -> Result<()> {
 }
 
 pub(super) fn digest(path: &Path, limit: u64) -> Result<(u64, String)> {
+    digest_until(path, limit, None)
+}
+
+pub(super) fn checkpoint(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("Native source operation exceeded its original work deadline.".into());
+    }
+    Ok(())
+}
+
+pub(super) fn digest_until(
+    path: &Path,
+    limit: u64,
+    deadline: Option<Instant>,
+) -> Result<(u64, String)> {
+    checkpoint(deadline)?;
     let before = plain_metadata(path)?;
     if !before.is_file() || before.len() > limit {
         return Err("Native inventory input is not a bounded regular file.".into());
@@ -92,6 +109,7 @@ pub(super) fn digest(path: &Path, limit: u64) -> Result<(u64, String)> {
     let mut length = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
+        checkpoint(deadline)?;
         let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
         if count == 0 {
             break;
@@ -103,6 +121,7 @@ pub(super) fn digest(path: &Path, limit: u64) -> Result<(u64, String)> {
         hash.update(&buffer[..count]);
     }
     let after = plain_metadata(path)?;
+    checkpoint(deadline)?;
     if length != before.len() || length != after.len() {
         return Err("Native inventory input length changed during hashing.".into());
     }
@@ -120,19 +139,38 @@ pub(super) fn hex(bytes: &[u8]) -> String {
 }
 
 pub(super) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_bounded_until(path, limit, None)
+}
+
+pub(super) fn read_bounded_until(
+    path: &Path,
+    limit: u64,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>> {
+    checkpoint(deadline)?;
     let metadata = plain_metadata(path)?;
     if !metadata.is_file() || metadata.len() > limit {
         return Err("Native inventory input is not a bounded regular file.".into());
     }
     let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(|error| error.to_string())?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if u64::try_from(bytes.len()).map_err(|error| error.to_string())? > limit {
-        return Err("Native inventory input grew beyond its byte bound.".into());
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        checkpoint(deadline)?;
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        if u64::try_from(bytes.len())
+            .map_err(|error| error.to_string())?
+            .checked_add(u64::try_from(count).map_err(|error| error.to_string())?)
+            .is_none_or(|length| length > limit)
+        {
+            return Err("Native inventory input grew beyond its byte bound.".into());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
     }
+    checkpoint(deadline)?;
     Ok(bytes)
 }
 

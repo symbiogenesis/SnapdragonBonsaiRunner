@@ -167,6 +167,7 @@ fn native_operation(arguments: &[OsString]) -> Option<Result<String>> {
         "native-archive-inventory" => Some(native_archive_inventory::run(arguments)),
         "native-closure-verify" => Some(native_source_closure::run(arguments)),
         "native-closure-collect" => Some(native_source_closure::collect(arguments)),
+        "native-closure-capture" => Some(native_source_closure::capture(arguments)),
         "native-source-verify" => Some(native_source_inventory::run(arguments)),
         "native-acceptance-guard" => Some(native_acceptance_guard::run(arguments)),
         "native-regressions" => Some(checks::regressions(arguments)),
@@ -195,7 +196,7 @@ pub fn run(arguments: &[OsString]) -> Result<String> {
     }
     if arguments.len() == 1 && arguments[0] == "--help" {
         return Ok(format!(
-            "{USAGE}\n       bonsai-ci rust-select|rust-plan|rust-check (see tools/ci/README.md)\n       bonsai-ci release-prerequisites --revision SHA\n       bonsai-ci native-acceptance-guard --json REQUEST\n       bonsai-ci native-regressions --request -\n       bonsai-ci native-source-verify --root PATH --source PATH --archive PATH\n       bonsai-ci native-archive-inventory --archive PATH --pin PATH --expected-pin-sha256 SHA256\n       bonsai-ci native-closure-collect --request PATH --expected-sha256 SHA256\n       bonsai-ci native-closure-verify --manifest PATH --expected-sha256 SHA256\n       bonsai-ci native-boundary-verify --root PATH --manifest PATH --expected-sha256 SHA256"
+            "{USAGE}\n       bonsai-ci rust-select|rust-plan|rust-check (see tools/ci/README.md)\n       bonsai-ci release-prerequisites --revision SHA\n       bonsai-ci native-acceptance-guard --json REQUEST\n       bonsai-ci native-regressions --request -\n       bonsai-ci native-source-verify --root PATH --source PATH --archive PATH\n       bonsai-ci native-archive-inventory --archive PATH --pin PATH --expected-pin-sha256 SHA256\n       bonsai-ci native-closure-collect --request PATH --expected-sha256 SHA256\n       bonsai-ci native-closure-capture --request PATH --expected-sha256 SHA256\n       bonsai-ci native-closure-verify --manifest PATH --expected-sha256 SHA256\n       bonsai-ci native-boundary-verify --root PATH --manifest PATH --expected-sha256 SHA256"
         ));
     }
     let arguments = parse(arguments)?;
