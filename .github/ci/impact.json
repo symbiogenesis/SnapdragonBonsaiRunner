@@ -38,6 +38,9 @@
       "config/profiles/reference-cpu.json",
       "config/prism-inference.lock.json"
     ],
+    "bonsai-chat": [
+      "config/prism-inference.lock.json"
+    ],
     "bonsai-tools": [
       "tools/native-reference/reference_numerics.rs",
       "LICENSE",
@@ -49,9 +52,18 @@
       "config/swift-lora.qualification.json",
       "config/swift-lora.app-qualification.json",
       "config/swift.metadata.json",
+      "config/model.metadata.json",
+      "config/hexagon-dispatch.lock.json",
+      "config/hexagon-signed-q2-candidate.lock.json",
       "tests/fixtures/lora-qualification-v1.json",
+      "src/chat-ui/assets/bonsai.ico",
+      "src/chat-ui/assets/bonsai.svg",
       "src/speech-asr/model.lock.json",
       "src/speech-tts/model*.lock.json",
+      "tools/qwen-tts/model.lock.json",
+      "tools/hexagon/diagnostic.manifest",
+      "tools/hexagon/public-qaic-wire.expected.json",
+      ".github/workflows/ptq1-packing-qualification.yml",
       "config/native-speech.lock.json",
       "config/prism-inference.lock.json"
     ]

@@ -86,6 +86,11 @@ function Get-ToolsHashPatterns {
     if ($text -cnotmatch 'TOOLS_SOURCE_ID: \$\{\{ hashFiles\((.*)\) \}\}') { throw 'Missing exact packaged-tool source hash.' }
     return @([regex]::Matches($Matches[1],'''([^'']+)''') | ForEach-Object { $_.Groups[1].Value })
 }
+function Get-CiToolHashPatterns {
+    $text=[IO.File]::ReadAllText((Join-Path $repository '.github/actions/ci-tool/action.yml'))
+    if ($text -cnotmatch 'CI_SOURCE_ID: \$\{\{ hashFiles\((.*)\) \}\}') { throw 'Missing exact CI-tool source hash.' }
+    return @([regex]::Matches($Matches[1],'''([^'']+)''') | ForEach-Object { $_.Groups[1].Value })
+}
 function Get-UncoveredToolsFiles([string[]]$Files,[string[]]$Patterns) {
     $compiled = @($Patterns | ForEach-Object { [Management.Automation.WildcardPattern]::new($_,[Management.Automation.WildcardOptions]::CultureInvariant) })
     foreach ($file in $Files) { $covered=$false; foreach ($wildcard in $compiled) { if ($wildcard.IsMatch($file)) { $covered=$true; break } }; if (-not $covered) { $file } }
@@ -171,6 +176,7 @@ $cases=[ordered]@{
     foreach ($mode in @('false','')) { $checks=Invoke-LanePhaseFixture $mode; Assert-Ci ('--full-tests' -cin $checks); Assert-Ci ('--build' -cin $checks); Assert-Ci ('--phase' -cnotin $checks) }
  }
  real_dependency_embedded_closure_hashed={ $files=@(Get-RequiredToolsFiles $repository); Assert-CiEqual @(Get-UncoveredToolsFiles $files (Get-ToolsHashPatterns)) @(); foreach ($file in $files) { Assert-Ci (Test-Path -LiteralPath (Join-Path $repository $file) -PathType Leaf) $file } }
+ ci_tool_dependency_and_embedded_closure_hashed={ $files=@(Get-RequiredToolsFiles $repository @('tools/ci')); Assert-CiEqual @(Get-UncoveredToolsFiles $files (Get-CiToolHashPatterns)) @(); foreach ($file in $files) { Assert-Ci (Test-Path -LiteralPath (Join-Path $repository $file) -PathType Leaf) $file } }
  missing_audio_and_embedded_input_detected={ $files=@(Get-RequiredToolsFiles $repository); $patterns=Get-ToolsHashPatterns; foreach ($path in @('src/audio/src/lib.rs','src/speech-asr/model.lock.json','src/speech-tts/model.lock.json','tools/qwen-tts/model.lock.json','tools/hexagon/diagnostic.manifest','src/chat-ui/assets/bonsai.ico','LICENSE','NOTICE')) { Assert-Ci ($path -cin $files) $path; $reduced=@($patterns | Where-Object { -not [Management.Automation.WildcardPattern]::new($_).IsMatch($path) }); Assert-Ci ($path -cin @(Get-UncoveredToolsFiles $files $reduced)) $path } }
  traversal_and_literals_use_manifest_owner={
     $scratch=New-CiScratch 'bonsai-cache-closure-'

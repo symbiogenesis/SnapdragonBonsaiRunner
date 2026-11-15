@@ -556,6 +556,256 @@ fn runner_ci_dependency_checks_remain_independent_of_cli_production() -> TestRes
     Ok(())
 }
 
+fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_rust_sources(&path, out)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn parse_rust_string_prefix(s: &str) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if let Some(rest) = s.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = rest.char_indices();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '\\' {
+                if let Some((_, escaped)) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if ch == '"' {
+                return Some((out, 1 + idx + 1));
+            } else {
+                out.push(ch);
+            }
+        }
+        return None;
+    }
+    if bytes.first() == Some(&b'r') {
+        let mut hashes = 0;
+        while bytes.get(1 + hashes) == Some(&b'#') {
+            hashes += 1;
+        }
+        if bytes.get(1 + hashes) == Some(&b'"') {
+            let start = 2 + hashes;
+            let closing = format!("\"{}", "#".repeat(hashes));
+            if let Some(end_rel) = s[start..].find(&closing) {
+                return Some((
+                    s[start..start + end_rel].to_owned(),
+                    start + end_rel + closing.len(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn extract_quoted_argument(text: &str, needle: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &text[i..];
+        if rest.starts_with("//") {
+            i += rest.find('\n').map_or(rest.len(), |n| n + 1);
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let mut depth = 1_usize;
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && depth > 0 {
+                if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            i = j;
+            continue;
+        }
+        if rest.starts_with("b\"") {
+            if let Some((_, consumed)) = parse_rust_string_prefix(&rest[1..]) {
+                i += 1 + consumed;
+                continue;
+            }
+        }
+        if rest.starts_with("br#") || rest.starts_with("br\"") {
+            if let Some((_, consumed)) = parse_rust_string_prefix(&rest[1..]) {
+                i += 1 + consumed;
+                continue;
+            }
+        }
+        if (bytes[i] == b'"' || bytes[i] == b'r')
+            && let Some((_, consumed)) = parse_rust_string_prefix(rest)
+        {
+            i += consumed;
+            continue;
+        }
+        let char_lit_start = if rest.starts_with("b'") {
+            Some(2)
+        } else if bytes[i] == b'\'' {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(prefix_len) = char_lit_start {
+            let tail = &rest[prefix_len..];
+            if let Some(after_esc) = tail.strip_prefix('\\') {
+                let mut chars = after_esc.char_indices();
+                if let Some((_, _)) = chars.next()
+                    && let Some((q_idx, '\'')) = chars.next()
+                {
+                    i += prefix_len + 1 + q_idx + 1;
+                    continue;
+                }
+            } else {
+                let mut chars = tail.char_indices();
+                if let Some((_, first)) = chars.next()
+                    && first != '\''
+                    && let Some((q_idx, '\'')) = chars.next()
+                {
+                    i += prefix_len + q_idx + 1;
+                    continue;
+                }
+            }
+        }
+        if rest.starts_with(needle) {
+            let prev_ident = i > 0
+                && !needle.starts_with('.')
+                && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if !prev_ident {
+                let after = &rest[needle.len()..];
+                let trimmed = after.trim_start();
+                if let Some((val, _)) = parse_rust_string_prefix(trimmed) {
+                    results.push(val);
+                } else if let Some(concat_body) = trimmed.strip_prefix("concat!")
+                    && let Some(env_pos) = concat_body.find("env!(\"CARGO_MANIFEST_DIR\"),")
+                {
+                    let tail =
+                        concat_body[env_pos + "env!(\"CARGO_MANIFEST_DIR\"),".len()..].trim_start();
+                    if let Some((val, _)) = parse_rust_string_prefix(tail) {
+                        results.push(format!("$MANIFEST${val}"));
+                    }
+                }
+                i += needle.len();
+                continue;
+            }
+        }
+        i += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    results
+}
+
+#[test]
+fn runner_ci_every_embedded_file_selects_its_owning_package() -> TestResult {
+    let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+    let config: Value = serde_json::from_slice(&fs::read(root.join(".github/ci/impact.json"))?)?;
+    let registry: Value =
+        serde_json::from_slice(&fs::read(root.join("config/rust-packages.json"))?)?;
+    let packages = registry["Packages"]
+        .as_array()
+        .ok_or("Missing registered packages")?;
+    for pkg in packages {
+        let name = pkg["Name"].as_str().ok_or("Missing package name")?;
+        let manifest_rel = pkg["Manifest"].as_str().ok_or("Missing package manifest")?;
+        let manifest_path = root.join(manifest_rel);
+        let pkg_dir = manifest_path.parent().ok_or("Missing package directory")?;
+        let pkg_rel = pkg_dir
+            .strip_prefix(&root)?
+            .to_str()
+            .ok_or("Non-UTF-8 package directory")?
+            .replace('\\', "/");
+        let mut sources = Vec::new();
+        collect_rust_sources(pkg_dir, &mut sources)?;
+        let manifest_text = fs::read_to_string(&manifest_path)?;
+        for line in manifest_text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("path = \"")
+                && let Some(rel) = rest.strip_suffix('"')
+                && Path::new(rel)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext == "rs")
+            {
+                sources.push(fs::canonicalize(pkg_dir.join(rel))?);
+            }
+        }
+        let mut external_inputs = std::collections::BTreeSet::new();
+        for source in sources {
+            let source_rel = source
+                .strip_prefix(&root)?
+                .to_str()
+                .ok_or("Non-UTF-8 source path")?
+                .replace('\\', "/");
+            if !source_rel.starts_with(&format!("{pkg_rel}/")) {
+                external_inputs.insert(source_rel.clone());
+            }
+            let content = fs::read_to_string(&source)?;
+            let source_parent = source.parent().ok_or("Missing source parent")?;
+            for needle in ["include_str!(", "include_bytes!("] {
+                for raw in extract_quoted_argument(&content, needle) {
+                    let resolved = if let Some(suffix) = raw.strip_prefix("$MANIFEST$") {
+                        let candidate = pkg_dir.join(suffix.trim_start_matches('/'));
+                        fs::canonicalize(&candidate).map_err(|err| {
+                            format!("{source_rel} -> {}: {err}", candidate.display())
+                        })?
+                    } else {
+                        let candidate = source_parent.join(&raw);
+                        fs::canonicalize(&candidate).map_err(|err| {
+                            format!("{source_rel} -> {}: {err}", candidate.display())
+                        })?
+                    };
+                    let rel = resolved
+                        .strip_prefix(&root)?
+                        .to_str()
+                        .ok_or("Non-UTF-8 embedded path")?
+                        .replace('\\', "/");
+                    if !rel.starts_with(&format!("{pkg_rel}/")) {
+                        external_inputs.insert(rel);
+                    }
+                }
+            }
+            if source.file_name().and_then(|n| n.to_str()) == Some("build.rs") {
+                for raw in extract_quoted_argument(&content, ".set_icon(") {
+                    let resolved = fs::canonicalize(pkg_dir.join(raw))?;
+                    let rel = resolved
+                        .strip_prefix(&root)?
+                        .to_str()
+                        .ok_or("Non-UTF-8 icon path")?
+                        .replace('\\', "/");
+                    if !rel.starts_with(&format!("{pkg_rel}/")) {
+                        external_inputs.insert(rel);
+                    }
+                }
+            }
+        }
+        for external in external_inputs {
+            let plan = impact::select(
+                &root,
+                std::slice::from_ref(&external),
+                false,
+                &config,
+                "embedded input check",
+            )?;
+            assert!(
+                plan.packages.iter().any(|selected| selected == name),
+                "External input {external} embedded by {name} did not select {name} (selected: {:?})",
+                plan.packages
+            );
+        }
+    }
+    Ok(())
+}
+
 fn needs(selected: bool, result: &str) -> Value {
     json!({
         "changes": {"result": "success", "outputs": {

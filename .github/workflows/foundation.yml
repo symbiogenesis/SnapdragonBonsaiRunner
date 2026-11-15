@@ -42,6 +42,7 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/SwiftBonsai-CI" >> "$GITHUB_ENV"
       - uses: $/.github/actions/rust-toolchain
+        id: compiler
         with:
           toolchain: nightly-2026-11-12-aarch64-unknown-linux-gnu
           components: ''
@@ -54,10 +55,11 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ${{ env.CARGO_TARGET_DIR }}
-          key: ci-tool-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-nightly-2026-11-12-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-${{ hashFiles('tools/ci/**') }}
+          key: ci-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-${{ steps.compiler.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-${{ hashFiles('tools/ci/**', 'tools/bonsai/**', 'tools/cpu-bundle/**', 'src/artifacts/**', 'src/audio/**', 'src/cpu-policy/**') }}
           restore-keys: |
-            ci-tool-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-nightly-2026-11-12-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-
-            ci-tool-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-nightly-2026-11-12-
+            ci-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-${{ steps.compiler.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-${{ hashFiles('tools/ci/**') }}-
+            ci-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-${{ steps.compiler.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**') }}-
+            ci-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-${{ steps.compiler.outputs.compiler-identity }}-
       - name: Check CI orchestration fixtures
         working-directory: ${{ runner.temp }}
         run: |
