@@ -336,7 +336,16 @@ fn download(data: &Path, artifact: Artifact) -> crate::Result<Value> {
     };
     crate::startup_download::receive(&uri, &path, length, digest, &working)?;
     if matches!(artifact, Artifact::Runtime) {
+        crate::provision::cleanup_obsolete_inference_downloads(
+            data,
+            text(&runtime["asset"], "filename")?,
+        )?;
         stage_runtime(data, &runtime, &path)?;
+        crate::provision::cleanup_obsolete_inference_installations(
+            data,
+            text(&runtime, "commit")?,
+            text(&runtime, "target")?,
+        )?;
     }
     Ok(json!({"status":"verified"}))
 }

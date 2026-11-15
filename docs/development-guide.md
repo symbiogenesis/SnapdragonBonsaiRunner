@@ -770,9 +770,12 @@ partials are quarantined before one fresh retry; a second digest failure stops.
 Cancellation and deadlines stop the complete owned transfer. Failed transfers and
 publication retain recovery bytes. A verified final artifact permits cleanup of its
 redundant partial under the download lock; persistent lock sentinels stay in place.
-Automatic runtime repair removes recognized invalid backups only after the selected
-installation verifies, preserving unknown layouts, valid immutable revisions and
-explicit rollback selections. Failed current-attempt extraction files are removed
+Verified Prism Inference downloads also remove superseded `prism-inference`
+archives, partials and idle download locks, and verified installations remove
+superseded `inference/<commit>/` revisions whose contents match the admitted
+runtime inventory. Automatic runtime repair removes recognized invalid backups
+only after the selected installation verifies, preserving unknown layouts,
+publisher rollback selections and active locks. Failed current-attempt extraction files are removed
 after local handles close; the pinned archive and original error remain available
 for diagnosis. Cleanup failures identify the retained stage and preserve both
 errors. The low-level `stage_runtime` API retains its explicit inspection contract;

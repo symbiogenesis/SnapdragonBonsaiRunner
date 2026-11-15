@@ -285,34 +285,51 @@ struct InferenceFile {
     sha256: String,
 }
 
-fn inference_lock(lock: &Value) -> crate::Result<Vec<InferenceFile>> {
-    const REQUIRED: [&str; 4] = [
-        "prism-inference.exe",
-        "bonsai-token-worker.exe",
-        "bonsai-swift-worker.exe",
-        "prism-inference-server.exe",
-    ];
-    const OPTIONAL: [&str; 5] = [
-        "bonsai-gguf.exe",
-        "LICENSE",
-        "NOTICE",
-        "PRISM-LICENSE.txt",
-        "CAMELID-LICENSE.txt",
-    ];
-    let version = text(lock, "version")?;
+const INFERENCE_REQUIRED: [&str; 4] = [
+    "prism-inference.exe",
+    "bonsai-token-worker.exe",
+    "bonsai-swift-worker.exe",
+    "prism-inference-server.exe",
+];
+
+const INFERENCE_OPTIONAL: [&str; 5] = [
+    "bonsai-gguf.exe",
+    "LICENSE",
+    "NOTICE",
+    "PRISM-LICENSE.txt",
+    "CAMELID-LICENSE.txt",
+];
+
+fn prism_inference_version(version: &str) -> bool {
     let numbers = version
         .split_once('-')
         .map_or(version, |(numbers, _)| numbers);
     let parts: Vec<_> = numbers.split('.').collect();
-    if lock["schemaVersion"] != 1
-        || lock["package"] != "prism-inference"
-        || parts.len() != 3
-        || parts
+    parts.len() == 3
+        && parts
             .iter()
-            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
-        || !version
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && version
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte))
+}
+
+fn prism_inference_download_archive(name: &str) -> Option<&str> {
+    let archive = name
+        .strip_suffix(".partial")
+        .or_else(|| name.strip_suffix(".download.lock"))
+        .unwrap_or(name);
+    let version = archive
+        .strip_prefix("prism-inference-")
+        .and_then(|rest| rest.strip_suffix("-aarch64-pc-windows-msvc.zip"))?;
+    prism_inference_version(version).then_some(archive)
+}
+
+fn inference_lock(lock: &Value) -> crate::Result<Vec<InferenceFile>> {
+    let version = text(lock, "version")?;
+    if lock["schemaVersion"] != 1
+        || lock["package"] != "prism-inference"
+        || !prism_inference_version(version)
         || lock["repository"] != "https://github.com/symbiogenesis/prism-inference"
         || !is_lower_hex(text(lock, "commit")?, 40)
         || lock["target"] != "aarch64-pc-windows-msvc"
@@ -341,7 +358,8 @@ fn inference_lock(lock: &Value) -> crate::Result<Vec<InferenceFile>> {
     let mut names = BTreeSet::new();
     let mut total = 0_u64;
     for file in &files {
-        if !REQUIRED.contains(&file.name.as_str()) && !OPTIONAL.contains(&file.name.as_str())
+        if !INFERENCE_REQUIRED.contains(&file.name.as_str())
+            && !INFERENCE_OPTIONAL.contains(&file.name.as_str())
             || !names.insert(file.name.as_str())
             || file.bytes == 0
             || file.bytes > 512 * 1024 * 1024
@@ -351,7 +369,7 @@ fn inference_lock(lock: &Value) -> crate::Result<Vec<InferenceFile>> {
         }
         total += file.bytes;
     }
-    if total > 1024 * 1024 * 1024 || REQUIRED.iter().any(|name| !names.contains(name)) {
+    if total > 1024 * 1024 * 1024 || INFERENCE_REQUIRED.iter().any(|name| !names.contains(name)) {
         return Err(
             "Inference release requires all four executables within its size bound.".into(),
         );
@@ -497,22 +515,23 @@ fn prepare_inference_stage(
 fn inference(request: &Request, working: &Path) -> crate::Result<Value> {
     let lock = read_lock(request.lock_path.as_deref(), INFERENCE)?;
     let files = inference_lock(&lock)?;
+    let commit = text(&lock, "commit")?;
+    let target = text(&lock, "target")?;
+    let pin = &lock["asset"];
+    let filename = text(pin, "filename")?;
     let destination = request
         .data_directory
         .join("inference")
-        .join(text(&lock, "commit")?)
-        .join(text(&lock, "target")?);
+        .join(commit)
+        .join(target);
     validate_external_path(&destination).map_err(|error| error.to_string())?;
     if !destination.exists() {
         if request.verify_only {
             return Err("Prism Inference is not installed.".into());
         }
-        let pin = &lock["asset"];
-        let archive = request
-            .data_directory
-            .join("downloads")
-            .join(text(pin, "filename")?);
+        let archive = request.data_directory.join("downloads").join(filename);
         receive(request, pin, text(pin, "url")?, &archive, working)?;
+        cleanup_obsolete_inference_downloads(&request.data_directory, filename)?;
         let parent = destination
             .parent()
             .ok_or("Inference installation has no parent.")?;
@@ -527,6 +546,10 @@ fn inference(request: &Request, working: &Path) -> crate::Result<Value> {
         })?;
     }
     let mut installed = verify_inference(&lock, &files, &destination)?;
+    if !request.verify_only {
+        cleanup_obsolete_inference_downloads(&request.data_directory, filename)?;
+        cleanup_obsolete_inference_installations(&request.data_directory, commit, target)?;
+    }
     if request.include_capabilities {
         let discovered = capabilities(&request.data_directory)?;
         installed["Capabilities"] = discovered["Capabilities"].clone();
@@ -622,6 +645,11 @@ fn generated_runtime_scratch(name: &str, destination: &Path) -> bool {
         })
 }
 
+fn generated_inference_staging(name: &str) -> bool {
+    name.strip_prefix(".staging-")
+        .is_some_and(runtime_scratch_suffix)
+}
+
 // The selected installation has already passed full verification and the caller
 // still owns its setup lock. A repair backup has no replay or rollback consumer
 // after that point. Never sweep immutable installations, arbitrary names, unknown
@@ -657,6 +685,163 @@ fn cleanup_invalid_runtime_directories(
         fs::remove_dir_all(&path).map_err(|error| {
             format!(
                 "Cannot remove invalid runtime cache at {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+// Call only after the selected Prism Inference archive or installation is verified.
+// Removes superseded prism-inference release archives and their download sidecars
+// while preserving the active release, publisher rollback archives, redirects,
+// non-files and any archive whose download lock or file handle is currently held.
+pub(crate) fn cleanup_obsolete_inference_downloads(
+    data_directory: &Path,
+    current_filename: &str,
+) -> crate::Result<()> {
+    let downloads = data_directory.join("downloads");
+    validate_external_path(&downloads).map_err(|error| error.to_string())?;
+    let metadata = match fs::symlink_metadata(&downloads) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_dir() || is_redirect(&metadata) {
+        return Err("Runtime download cache must be an ordinary local directory.".into());
+    }
+    let mut files = Vec::new();
+    let mut locks = Vec::new();
+    for entry in fs::read_dir(&downloads).map_err(|error| error.to_string())? {
+        crate::startup_cancel::checkpoint()?;
+        let entry = entry.map_err(|error| error.to_string())?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(archive) = prism_inference_download_archive(&name).map(str::to_owned) else {
+            continue;
+        };
+        if archive == current_filename {
+            continue;
+        }
+        if name.ends_with(".download.lock") {
+            locks.push((archive, entry.path()));
+        } else {
+            files.push((archive, entry.path()));
+        }
+    }
+    for (archive, path) in files.into_iter().chain(locks) {
+        crate::startup_cancel::checkpoint()?;
+        validate_external_path(&path).map_err(|error| error.to_string())?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !is_redirect(&metadata) => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        let lock_path = downloads.join(format!("{archive}.download.lock"));
+        if lock_path != path
+            && fs::symlink_metadata(&lock_path).is_ok()
+            && open_locked_file(&lock_path).is_err()
+        {
+            crate::startup_cancel::checkpoint()?;
+            continue;
+        }
+        let Ok(readable) = open_locked_file(&path) else {
+            crate::startup_cancel::checkpoint()?;
+            continue;
+        };
+        drop(readable);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Cannot remove obsolete Prism Inference download at {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_obsolete_inference_commit(
+    commit_directory: &Path,
+    target: &str,
+    admitted_files: &BTreeSet<PathBuf>,
+) -> crate::Result<()> {
+    crate::startup_cancel::checkpoint()?;
+    validate_external_path(commit_directory).map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(commit_directory).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || is_redirect(&metadata) {
+        return Err("Obsolete inference commit must be an ordinary local directory.".into());
+    }
+    let target_directory = commit_directory.join(target);
+    for entry in fs::read_dir(commit_directory).map_err(|error| error.to_string())? {
+        crate::startup_cancel::checkpoint()?;
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        validate_external_path(&path).map_err(|error| error.to_string())?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if is_redirect(&metadata) {
+            return Err("Obsolete inference commit contains a redirected entry.".into());
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err("Obsolete inference commit contains a non-UTF-8 entry.".into());
+        };
+        if metadata.is_file() && name == ".chat-runtime-setup.lock" {
+            let _readable = open_locked_file(&path).map_err(|error| error.to_string())?;
+        } else if metadata.is_dir()
+            && (name == target
+                || generated_runtime_scratch(&name, &target_directory)
+                || generated_inference_staging(&name))
+        {
+            validate_repair_tree(&path, &path, admitted_files, &BTreeSet::new())?;
+        } else {
+            return Err("Obsolete inference commit contains an unexpected entry.".into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn cleanup_obsolete_inference_installations(
+    data_directory: &Path,
+    current_commit: &str,
+    target: &str,
+) -> crate::Result<()> {
+    let inference_root = data_directory.join("inference");
+    validate_external_path(&inference_root).map_err(|error| error.to_string())?;
+    let metadata = match fs::symlink_metadata(&inference_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_dir() || is_redirect(&metadata) {
+        return Err("Inference runtime cache must be an ordinary local directory.".into());
+    }
+    let admitted_files: BTreeSet<PathBuf> = INFERENCE_REQUIRED
+        .into_iter()
+        .chain(INFERENCE_OPTIONAL)
+        .map(PathBuf::from)
+        .collect();
+    for entry in fs::read_dir(&inference_root).map_err(|error| error.to_string())? {
+        crate::startup_cancel::checkpoint()?;
+        let entry = entry.map_err(|error| error.to_string())?;
+        let Some(commit) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if commit == current_commit || !is_lower_hex(&commit, 40) {
+            continue;
+        }
+        let path = entry.path();
+        if validate_obsolete_inference_commit(&path, target, &admitted_files).is_err() {
+            crate::startup_cancel::checkpoint()?;
+            continue;
+        }
+        fs::remove_dir_all(&path).map_err(|error| {
+            format!(
+                "Cannot remove obsolete Prism Inference installation at {}: {error}",
                 path.display()
             )
         })?;
@@ -769,11 +954,15 @@ fn repair_inference(
 ) -> crate::Result<Value> {
     let lock = read_lock(request.lock_path.as_deref(), INFERENCE)?;
     let files = inference_lock(&lock)?;
+    let commit = text(&lock, "commit")?;
+    let target = text(&lock, "target")?;
+    let pin = &lock["asset"];
+    let filename = text(pin, "filename")?;
     let destination = request
         .data_directory
         .join("inference")
-        .join(text(&lock, "commit")?)
-        .join(text(&lock, "target")?);
+        .join(commit)
+        .join(target);
     validate_external_path(&destination).map_err(|error| error.to_string())?;
     let parent = destination
         .parent()
@@ -787,6 +976,8 @@ fn repair_inference(
         && let Ok(installed) = verify_inference(&lock, &files, &destination)
     {
         cleanup_invalid_runtime_directories(&destination, &expected)?;
+        cleanup_obsolete_inference_downloads(&request.data_directory, filename)?;
+        cleanup_obsolete_inference_installations(&request.data_directory, commit, target)?;
         return Ok(installed);
     }
     if destination.exists() {
@@ -797,11 +988,7 @@ fn repair_inference(
             &BTreeSet::new(),
         )?;
     }
-    let pin = &lock["asset"];
-    let archive = request
-        .data_directory
-        .join("downloads")
-        .join(text(pin, "filename")?);
+    let archive = request.data_directory.join("downloads").join(filename);
     let archive_bytes = pin["bytes"]
         .as_u64()
         .ok_or("Missing runtime archive length.")?;
@@ -813,6 +1000,7 @@ fn repair_inference(
         working,
         &mut |activity| observe(activity, Some((&archive, archive_bytes))),
     )?;
+    cleanup_obsolete_inference_downloads(&request.data_directory, filename)?;
     observe(RepairActivity::Publishing, None)?;
     // Available space already excludes the retained invalid installation and
     // the downloaded archive. Only the fresh expanded staging files are added.
@@ -824,6 +1012,7 @@ fn repair_inference(
     observe(RepairActivity::VerifyingExisting, None)?;
     let installed = verify_inference(&lock, &files, &destination)?;
     cleanup_invalid_runtime_directories(&destination, &expected)?;
+    cleanup_obsolete_inference_installations(&request.data_directory, commit, target)?;
     Ok(installed)
 }
 
@@ -1457,6 +1646,22 @@ mod tests {
             .map_err(|error| error.to_string())?
             .into_inner();
         let filename = "prism-inference-0.1.0-aarch64-pc-windows-msvc.zip";
+        let old_archive = root
+            .join("downloads")
+            .join("prism-inference-0.0.9-aarch64-pc-windows-msvc.zip");
+        let old_partial = root
+            .join("downloads")
+            .join("prism-inference-0.0.9-aarch64-pc-windows-msvc.zip.partial");
+        let old_lock = root
+            .join("downloads")
+            .join("prism-inference-0.0.9-aarch64-pc-windows-msvc.zip.download.lock");
+        let publisher_archive = root
+            .join("downloads")
+            .join("llama-prism-b10787-73bfe6c-bin-win-cpu-arm64.zip");
+        fs::write(&old_archive, b"old archive").map_err(|error| error.to_string())?;
+        fs::write(&old_partial, b"old partial").map_err(|error| error.to_string())?;
+        fs::write(&old_lock, []).map_err(|error| error.to_string())?;
+        fs::write(&publisher_archive, b"publisher archive").map_err(|error| error.to_string())?;
         fs::write(root.join("downloads").join(filename), &bytes)
             .map_err(|error| error.to_string())?;
         let lock = json!({"schemaVersion": 1, "package": "prism-inference", "version": "0.1.0",
@@ -1474,9 +1679,15 @@ mod tests {
         let mut request = json!({"operation": "inference", "dataDirectory": root, "lockPath": lock_path, "verifyOnly": true});
         assert!(run(request.clone()).is_err());
         assert!(!root.join("inference").exists());
+        assert!(old_archive.is_file());
         request["verifyOnly"] = json!(false);
         let installed = run(request.clone())?;
         assert_eq!(installed["Verified"], true);
+        assert!(!old_archive.exists());
+        assert!(!old_partial.exists());
+        assert!(!old_lock.exists());
+        assert!(root.join("downloads").join(filename).is_file());
+        assert!(publisher_archive.is_file());
         request["verifyOnly"] = json!(true);
         assert_eq!(run(request.clone())?["Directory"], installed["Directory"]);
         let worker = Path::new(text(&installed, "SwiftWorker")?);
@@ -1799,6 +2010,92 @@ mod tests {
         snapshot_entries(&snapshot, false)?;
         fs::write(root.join("unreviewed.bin"), []).map_err(|error| error.to_string())?;
         assert!(snapshot_entries(&snapshot, true).is_err());
+        fs::remove_dir_all(root).map_err(|error| error.to_string())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn obsolete_prism_inference_downloads_and_installations_are_cleared_after_verified_upgrade()
+    -> crate::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "Bonsai-ObsoleteInferenceCleanup-{}",
+            crate::startup_process::unique()
+        ));
+        let downloads = root.join("downloads");
+        let inference = root.join("inference");
+        fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
+        fs::create_dir_all(&inference).map_err(|error| error.to_string())?;
+
+        let current_archive = "prism-inference-0.1.28-aarch64-pc-windows-msvc.zip";
+        let old_archive = downloads.join("prism-inference-0.1.27-aarch64-pc-windows-msvc.zip");
+        let old_partial =
+            downloads.join("prism-inference-0.1.27-aarch64-pc-windows-msvc.zip.partial");
+        let old_lock =
+            downloads.join("prism-inference-0.1.27-aarch64-pc-windows-msvc.zip.download.lock");
+        let locked_archive = downloads.join("prism-inference-0.1.26-aarch64-pc-windows-msvc.zip");
+        let locked_sentinel =
+            downloads.join("prism-inference-0.1.26-aarch64-pc-windows-msvc.zip.download.lock");
+        let directory_at_archive_name =
+            downloads.join("prism-inference-0.1.25-aarch64-pc-windows-msvc.zip");
+        let publisher = downloads.join("llama-prism-b10787-73bfe6c-bin-win-cpu-arm64.zip");
+        let current = downloads.join(current_archive);
+        let current_lock = downloads.join(format!("{current_archive}.download.lock"));
+
+        for path in [
+            &old_archive,
+            &old_partial,
+            &old_lock,
+            &locked_archive,
+            &publisher,
+            &current,
+            &current_lock,
+        ] {
+            fs::write(path, b"archive").map_err(|error| error.to_string())?;
+        }
+        fs::create_dir(&directory_at_archive_name).map_err(|error| error.to_string())?;
+        let held_download_lock = crate::startup_cache::lock_file(&locked_sentinel)?;
+
+        cleanup_obsolete_inference_downloads(&root, current_archive)?;
+        assert!(!old_archive.exists());
+        assert!(!old_partial.exists());
+        assert!(!old_lock.exists());
+        assert!(locked_archive.is_file());
+        assert!(locked_sentinel.is_file());
+        assert!(directory_at_archive_name.is_dir());
+        assert!(publisher.is_file());
+        assert!(current.is_file());
+        assert!(current_lock.is_file());
+
+        drop(held_download_lock);
+        cleanup_obsolete_inference_downloads(&root, current_archive)?;
+        assert!(!locked_archive.exists());
+        assert!(!locked_sentinel.exists());
+
+        let current_commit = "99671be7ab2be01e406a11b0c3d6caede398d96f";
+        let old_commit = "1429a33772089dfd3a50a96c698b9dbe0b36836a";
+        let owner_commit = "abcdef0123456789abcdef0123456789abcdef01";
+        let target = "aarch64-pc-windows-msvc";
+
+        let current_dir = inference.join(current_commit).join(target);
+        let old_dir = inference.join(old_commit).join(target);
+        let owner_dir = inference.join(owner_commit).join(target);
+        for dir in [&current_dir, &old_dir, &owner_dir] {
+            fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+            fs::write(dir.join("prism-inference.exe"), b"exe")
+                .map_err(|error| error.to_string())?;
+        }
+        fs::write(
+            inference.join(old_commit).join(".chat-runtime-setup.lock"),
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(owner_dir.join("owner.txt"), b"keep").map_err(|error| error.to_string())?;
+
+        cleanup_obsolete_inference_installations(&root, current_commit, target)?;
+        assert!(current_dir.join("prism-inference.exe").is_file());
+        assert!(!inference.join(old_commit).exists());
+        assert!(owner_dir.join("owner.txt").is_file());
+
         fs::remove_dir_all(root).map_err(|error| error.to_string())
     }
 }
