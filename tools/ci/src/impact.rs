@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 #[path = "workspace.rs"]
-mod workspace;
+pub(crate) mod workspace;
 
 /// The complete routing decision consumed by CI jobs and the aggregate gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

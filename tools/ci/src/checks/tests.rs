@@ -91,7 +91,8 @@ fn restricted_features_remain_separate_and_formatting_has_no_features() -> Resul
 fn production_batches_preserve_explicit_package_coverage_and_release_policy() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let packages = registry(&root)?;
-    assert_eq!(packages.len(), 12);
+    verify_workspace_registry(&root)?;
+    assert!(packages.len() >= 13);
     for group in ["All", "Broker"] {
         for profile in ["Foundation", "Compatibility", "Native"] {
             let mut cli = vec![
@@ -531,4 +532,108 @@ fn release_deadlines_require_the_explicit_exact_hosted_workflow() {
         }
     }
     assert!(!github_release_context(|_| String::new()));
+}
+
+#[test]
+fn workspace_registry_rejects_missing_extra_or_mismatched_packages() -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let scratch =
+        std::env::temp_dir().join(format!("bonsai-ci-registry-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
+    let result = (|| {
+        let create_crate = |directory: &str, name: &str| -> Result<()> {
+            let dir = scratch.join(directory);
+            fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+            fs::write(
+                dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+            )
+            .map_err(|error| error.to_string())
+        };
+        create_crate("crates/alpha", "crate-alpha")?;
+        create_crate("crates/beta", "crate-beta")?;
+        create_crate("crates/extra", "crate-extra")?;
+        fs::create_dir_all(scratch.join("config")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(scratch.join(".github/ci")).map_err(|error| error.to_string())?;
+        fs::write(
+            scratch.join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let valid_registry = serde_json::json!({
+            "Packages": [
+                {"Name": "crate-alpha", "Manifest": "crates/alpha/Cargo.toml", "Group": "Broker", "Features": ["*"]},
+                {"Name": "crate-beta", "Manifest": "crates/beta/Cargo.toml", "Group": "Broker", "Features": ["*"]}
+            ]
+        });
+        let write_registry = |value: &serde_json::Value| -> Result<()> {
+            fs::write(
+                scratch.join("config/rust-packages.json"),
+                serde_json::to_vec(value).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let valid_impact = serde_json::json!({
+            "groups": {
+                "all": {"packages": ["crate-alpha", "crate-beta"]}
+            }
+        });
+        let impact_path = scratch.join(".github/ci/impact.json");
+        fs::write(
+            &impact_path,
+            serde_json::to_vec(&valid_impact).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        write_registry(&valid_registry)?;
+        verify_workspace_registry(&scratch)?;
+
+        // Missing workspace member in rust-packages.json
+        write_registry(&serde_json::json!({
+            "Packages": [
+                {"Name": "crate-alpha", "Manifest": "crates/alpha/Cargo.toml", "Group": "Broker", "Features": ["*"]}
+            ]
+        }))?;
+        assert!(verify_workspace_registry(&scratch).is_err());
+
+        // Extra crate in rust-packages.json not in workspace members
+        write_registry(&serde_json::json!({
+            "Packages": [
+                {"Name": "crate-alpha", "Manifest": "crates/alpha/Cargo.toml", "Group": "Broker", "Features": ["*"]},
+                {"Name": "crate-beta", "Manifest": "crates/beta/Cargo.toml", "Group": "Broker", "Features": ["*"]},
+                {"Name": "crate-extra", "Manifest": "crates/extra/Cargo.toml", "Group": "Broker", "Features": ["*"]}
+            ]
+        }))?;
+        assert!(verify_workspace_registry(&scratch).is_err());
+
+        // Mismatched manifest directory while package.name happens to match
+        write_registry(&valid_registry)?;
+        create_crate("crates/beta-alias", "crate-beta")?;
+        write_registry(&serde_json::json!({
+            "Packages": [
+                {"Name": "crate-alpha", "Manifest": "crates/alpha/Cargo.toml", "Group": "Broker", "Features": ["*"]},
+                {"Name": "crate-beta", "Manifest": "crates/beta-alias/Cargo.toml", "Group": "Broker", "Features": ["*"]}
+            ]
+        }))?;
+        assert!(verify_workspace_registry(&scratch).is_err());
+
+        // impact.json references unknown package
+        write_registry(&valid_registry)?;
+        fs::write(
+            &impact_path,
+            serde_json::to_vec(&serde_json::json!({
+                "groups": {"all": {"packages": ["crate-missing"]}}
+            }))
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(verify_workspace_registry(&scratch).is_err());
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&scratch);
+    result
 }

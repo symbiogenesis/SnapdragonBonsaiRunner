@@ -5,15 +5,15 @@ use std::path::{Path, PathBuf};
 
 use toml::Value;
 
-pub(super) struct Package {
-    pub(super) path: PathBuf,
-    pub(super) directory: String,
+pub(crate) struct Package {
+    pub(crate) path: PathBuf,
+    pub(crate) directory: String,
     manifest: Value,
 }
 
-pub(super) struct Workspace {
-    pub(super) packages: BTreeMap<String, Package>,
-    pub(super) reverse: BTreeMap<String, BTreeSet<String>>,
+pub(crate) struct Workspace {
+    pub(crate) packages: BTreeMap<String, Package>,
+    pub(crate) reverse: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn manifest(path: &Path) -> crate::Result<Value> {
@@ -236,7 +236,7 @@ fn resolve(path: &Path) -> crate::Result<PathBuf> {
     Ok(result)
 }
 
-pub(super) fn read(root: &Path) -> crate::Result<Workspace> {
+pub(crate) fn read(root: &Path) -> crate::Result<Workspace> {
     let root_manifest = manifest(&root.join("Cargo.toml"))?;
     let settings = root_manifest.get("workspace");
     let excludes = strings(

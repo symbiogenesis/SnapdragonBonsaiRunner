@@ -283,6 +283,64 @@ fn registry(root: &Path) -> Result<Vec<Package>> {
     Ok(registry.packages)
 }
 
+pub(crate) fn verify_workspace_registry(root: &Path) -> Result<()> {
+    let canonical = root.canonicalize().map_err(|error| error.to_string())?;
+    let packages = registry(&canonical)?;
+    let workspace = crate::impact::workspace::read(&canonical)?;
+    let mut manifests = BTreeSet::new();
+    let mut registered_names = BTreeSet::new();
+    for package in &packages {
+        if !manifests.insert(package.manifest.as_str()) {
+            return Err(format!(
+                "Duplicate manifest in config/rust-packages.json: {}",
+                package.manifest
+            ));
+        }
+        registered_names.insert(package.name.clone());
+    }
+    let workspace_names: BTreeSet<String> = workspace.packages.keys().cloned().collect();
+    if registered_names != workspace_names {
+        let missing: Vec<_> = workspace_names
+            .difference(&registered_names)
+            .cloned()
+            .collect();
+        let extra: Vec<_> = registered_names
+            .difference(&workspace_names)
+            .cloned()
+            .collect();
+        return Err(format!(
+            "Workspace members mismatch config/rust-packages.json (missing={missing:?}, extra={extra:?})."
+        ));
+    }
+    for package in &packages {
+        let member = workspace.packages.get(&package.name).ok_or_else(|| {
+            format!(
+                "Package {} missing from workspace after set equality check.",
+                package.name
+            )
+        })?;
+        let expected_manifest = if member.directory == "." {
+            "Cargo.toml".to_owned()
+        } else {
+            format!("{}/Cargo.toml", member.directory)
+        };
+        if package.manifest != expected_manifest {
+            return Err(format!(
+                "Package {} manifest {} differs from workspace member {}.",
+                package.name, package.manifest, expected_manifest
+            ));
+        }
+    }
+    let impact_path = canonical.join(".github/ci/impact.json");
+    if impact_path.is_file() {
+        let impact_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&impact_path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        crate::impact::select(&canonical, &[], true, &impact_value, "workspace validation")?;
+    }
+    Ok(())
+}
+
 fn select<'a>(packages: &'a [Package], names: &[String], group: &str) -> Result<Vec<&'a Package>> {
     let selected: Vec<_> = packages
         .iter()
