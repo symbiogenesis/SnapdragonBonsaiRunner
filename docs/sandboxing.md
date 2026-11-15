@@ -175,6 +175,17 @@ The owned-worker policy grants:
   requires completed capture threads within its existing absolute allowance.
   Offline binary-pipe decoder/parser workers keep protocol stdout and a `NUL`
   stderr sink.
+- For broker-pipe inference workers (`OwnedProcess::start_sandboxed_broker_pipe`),
+  `SandboxNetwork::Offline` denies both host loopback and external egress,
+  replacing the loopback socket and on-disk `backend.key` with anonymous
+  `(stdin, stdout)` protocol pipes, a `0`-byte `backend.stdout` sentinel, and
+  parent-drained `16 MiB` `backend.stderr`. Child startup uses a fixed 6-entry
+  minimal environment (`SystemRoot`, `windir`, `SystemDrive`, `LOCALAPPDATA`,
+  `TEMP`, `TMP`) without inheriting ambient caller variables, verifies
+  `TokenIsAppContainer` and `GetAppContainerFolderPath` in the kernel before
+  `ResumeThread`, and enforces a `64 MiB` / `1_024`-entry private storage
+  ceiling across `writable_directory` and OS-managed AppContainer storage via
+  `private_storage_usage` and `check_private_storage_budget`.
 - Windows' own private PSEC temporary storage. Windows can replace the requested
   child TEMP/TMP with `Packages/sandbox.{id}/AC/Temp`; supplied scratch is not the
   sole writable location, and effective TEMP must not be claimed to equal cwd.
@@ -216,10 +227,12 @@ policy, while daily-service isolation remains unqualified under the
 Explicit availability probes require PSEC 1.1 and container-hosted loopback, then
 create/dispose a real minimal environment; versions or exports alone are
 insufficient. Ordinary launches admit the complete policy once, without that
-throwaway preflight. HTTP workers require host-loopback support; offline decoder/parser workers
-require PSEC 1.1 without requesting or probing loopback authority. There are no audit/learning modes,
+throwaway preflight. HTTP workers require host-loopback support; offline decoder/parser and broker-pipe workers
+require PSEC 1.1 (`native_sandbox_offline_available()`) without requesting or probing loopback authority. There are no audit/learning modes,
 SDK backend dispatch, DACL augmentation, global loopback exemptions or weaker
-fallbacks. Host Firewall restrictions remain independent.
+fallbacks. Host Firewall restrictions remain independent. The launcher's
+`--require-broker-pipe` flag fails closed unless `BROKER_PIPE_RELEASE` pins a
+separately reviewed `--broker-pipe` release.
 
 The supported [Rust V1 spawn API](https://github.com/microsoft/mxc/blob/v1.0.1/docs/api-reference/rust/v1/api.md)
 cannot accept Runner's existing Job and suspended-launch contract. The audited
@@ -265,10 +278,14 @@ runtime and artifact identities. Distinguish portable parser/policy checks from
 actual native enforcement and actual-model acceptance. Model-free native fixtures
 cover file and hard-link denial, retained artifact/key guards, separate private
 temp storage, child-process denial, exact listener identity, external TCP denial
-and worker teardown after abrupt owner death. They do not qualify real
-model/adapter/speech loading, cancellation under load, broker-only transport,
-performance or sustained comfort; [PLAN.md](../PLAN.md) owns
-that acceptance. Native admission errors and pending qualification are not passes.
+and worker teardown after abrupt owner death. The separate isolated
+`inference-authority-v1` `sandbox-qualification` workload targets three
+model-free broker-pipe PSEC controls (`180` estimated seconds: offline authority
+and egress denial, `64 MiB`/`1_024`-entry private storage ceiling across
+scratch and AppContainer temp, and abrupt owner termination); its CI acceptance,
+reviewed `--broker-pipe` release pinning and real model/adapter/speech loading,
+cancellation under load, throughput and sustained comfort remain open in
+[PLAN.md](../PLAN.md). Native admission errors and pending qualification are not passes.
 
 The public API still rejects tools, arbitrary executables, dynamic runtime
 selection and unsupported media. Model output remains inert text. Future plugins

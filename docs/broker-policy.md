@@ -411,6 +411,7 @@ executables, models, profile JSON and overrides. The default is `reference-cpu`;
 | `--use-repacked-ptq1` | Only the pinned current-weight export; missing/altered bytes reject. Publisher and native Rust Swift support are explicit; full end-to-end qualification remains separate. |
 | `--use-abliterate-lora` | Only the pinned adapter on publisher or native Rust Swift; enables bounded per-request scale with verified readiness. Reject for reference. The app requests it by default (`bonsai-tools chat --no-abliterate-lora` opts out); direct broker launch omits it. |
 | `--reset-on-cancel` | Opt-in in-place `POST /reset` recovery on client-cancelled generation; reviewed native Rust Swift releases only. Default omits it so direct broker callers still close admission on abandoned generation. |
+| `--require-broker-pipe` | Require offline anonymous `(stdin, stdout)` pipe transport between broker and sandboxed native Rust Swift worker (`--require-native-sandbox` and native Rust Swift engine only). Fails closed until `BROKER_PIPE_RELEASE` pins a reviewed `--broker-pipe` release; uses `PrivateCredentials::create_frontend_only` with no `backend.key` file on disk, `SB2PIPE1`/`SB2OKAY1` authenticated pipe framing, `/health` and `/v1/models` readiness, optional `KIND_RESET` stream recovery with `--reset-on-cancel`, and `64 MiB` / `1_024`-entry private storage monitoring. |
 | `--check-only` | Verify policy/artifacts and report admission without credentials or a process. |
 
 [Runtime selection](development-guide.md#runtime-selection) lists app options.
@@ -426,8 +427,11 @@ retained through backend shutdown; missing or altered files fail startup.
 Artifact verification attests neither source-to-binary builds nor restricted execution.
 
 Safe broker code delegates Win32 ownership to `bonsai-windows-process` and protected
-keys to `bonsai-windows-credentials`. Fresh protected evidence holds two keys and
-stdout/stderr. Reference admission is 22 GiB available / 18 GiB service.
+keys to `bonsai-windows-credentials`. Fresh protected evidence holds two keys (or
+only `frontend.key` when a frontend-only broker-pipe session avoids writing
+`backend.key` on disk; `startup-diagnostics` treats a missing `backend.key` as
+optional while still rejecting malformed, oversized or reparse `backend.key`
+files) and stdout/stderr. Reference admission is 22 GiB available / 18 GiB service.
 Swift serving uses the [memory-selected launch budget](swift-memory.md#memory-selected-serving-context);
 the separate fixed-8K qualification controls use 15.5 / 11.5 GiB.
 All paths retain 4 GiB physical reserve. Batch/microbatch is 256/128

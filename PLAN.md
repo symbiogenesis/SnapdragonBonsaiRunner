@@ -373,7 +373,16 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Establish [restricted inference authority](docs/sandboxing.md#worker-authority):
   approved read-only artifacts, bounded private cache/temp, denied unrelated
   files/credentials and egress, broker-only communication and no same-user bypass.
-  Qualify MXC loading, atomic Job limits and exact identity without weaker fallback.
+  Offline `--broker-pipe` transport (`SB2PIPE1`/`SB2OKAY1`, `KIND_SERVER_READY`,
+  `KIND_RESET`), `PrivateCredentials::create_frontend_only`,
+  `OwnedProcess::start_sandboxed_broker_pipe` (`SandboxNetwork::Offline`, 6-entry
+  minimal environment, pre-resume kernel `TokenIsAppContainer`/`GetAppContainerFolderPath`
+  verification, `64 MiB`/`1_024`-entry private storage ceiling), the fail-closed
+  `BROKER_PIPE_RELEASE` gate, and `inference-authority-v1` fixture/tooling
+  support exist in source; qualifying `inference-authority-v1` in sandbox CI
+  (after a closed local Case 1 fixture failure repaired without retry), pinning a
+  reviewed `--broker-pipe` release, and qualifying actual-model MXC loading, atomic
+  Job limits and exact identity without weaker fallback remain open.
 - [ ] Qualify trusted-host artifact ancestor sharing and nested rename/DELETE
   regressions through native/AppContainer integration; host guards must outlive
   contained readers and preserve their narrower rights. Compare Codex's
