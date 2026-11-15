@@ -9,7 +9,9 @@ Before `Recognizer::load`, the service must verify and retain the Q8_0 file in
 `model.lock.json`. Rust first checks the bounded GGUF metadata, tokenizer tables,
 complete required tensor catalog and aligned, nonoverlapping file ranges while
 holding a read-only file guard. The native library then maps it, verifies architecture `qwen3_asr`, variant
-`qwen3-asr-1.7b` and audio capabilities, then reuses one four-thread session with
+`qwen3-asr-1.7b` and audio capabilities, then reuses one session (defaulting to
+up to eight threads across two Oryon clusters on Snapdragon X1/X2 via
+`Recognizer::load_with_threads`, or bounded `--threads 1..=256`) with
 an 8,192-token decoder context. It accepts up to thirty seconds of normalized
 mono 16 kHz audio, detects language automatically and returns complete text.
 Cancellation discards partial text. The backend checks cancellation before
@@ -194,8 +196,12 @@ Windows ARM64 host requirement as the retained control service:
 cargo build --locked --package bonsai-speech-asr --no-default-features --features rust-qualification --bin bonsai-asr-rust-qualification --release
 ```
 
-Its CLI accepts the ordinary ASR `--model`, `--token-file` and optional `--port`
-arguments. `--version` identifies `bonsai-asr-rust-qualification`, the independent
+Its CLI accepts the ordinary ASR `--model`, `--token-file`, optional `--port`
+and optional `--threads 1..=256` arguments (`RustRecognizer::load_with_threads`
+defaults to `(8, 10)` decode/batch threads on 12-core X1 and `(8, 16)` on
+18-core X2 while keeping `ARITHMETIC_IDENTITY` unchanged via bit-exact non-FMA
+`fearless_simd` `1x4` / `4x8` tiles, 4-frame `mixed_fft_4`, batched encoder and
+causal prefill, and `row_workers`). `--version` identifies `bonsai-asr-rust-qualification`, the independent
 scalar arithmetic identity and `ProductionQualified: false`; it cannot match the
 production binary identity used by provisioning. The application neither builds
 nor selects this binary automatically. It performs no native inference or

@@ -1278,10 +1278,13 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   open): Prism `16`-row `PQ2`/`Q8_0`/`PTQ1` SIMD tiles, X1 `3`-head/`2`-head
   grouped attention and `[token][head]` F16-packed `4`-head decode,
   `bonsai-speech-tts` `4`-row `Q8_0`/`Q4_K`/`Q6_K` SIMD tiles in
-  `src/speech-tts/src/engine/packed.rs`, X1 `(8, 12)` thread budget /
-  `SpeculationPolicy` / `"runner-x1-cpu-evaluation-plan"` (`d8-p12`) in
-  `cpu-policy` / `bonsai-tools`, and Prism server `--cpu-family x1|x2`,
-  `--spec-type none|suffix`, and `--draft-max 1..=8`.
+  `src/speech-tts/src/engine/packed.rs`, `bonsai-speech-asr` bit-exact non-FMA
+  `1x4`/`4x8` `F32`/`Q8_0` SIMD tiles, 4-frame `mixed_fft_4` frontend, batched
+  encoder/causal prefill and `row_workers` in `src/speech-asr/src/`, X1 `(8, 12)`
+  TTS / `(8, 10)` ASR thread budgets / `SpeculationPolicy` /
+  `"runner-x1-cpu-evaluation-plan"` (`d8-p12`) in `cpu-policy` / `bonsai-tools`,
+  and Prism server `--cpu-family x1|x2`, `--spec-type none|suffix`, and
+  `--draft-max 1..=8`.
 - [ ] **#24 — Token-count projection crossover tuning.** Benchmark separate 1-token
   decode, short verification block (`2`–`9`) and larger prefill tile crossovers with
   odd-tail retention, keeping any rounding change behind an explicit profile gate.
@@ -1404,7 +1407,11 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   [dependency audit](docs/dependency-audit.md).
 - [ ] Integrate candidate speech SIMD projections, parallel projections,
   four-frame streaming and FastConformer transpose into serving before model
-  qualification; qualify direct `memchr` transport scans independently.
+  qualification (source support implemented for `bonsai-speech-tts` and
+  `bonsai-speech-asr` `--threads` / X1 cluster-aware budgets, bit-exact non-FMA
+  SIMD kernels, 4-frame frontend and batched causal prefill/encoder; model and
+  device qualification remain open); qualify direct `memchr` transport scans
+  independently.
 - [ ] Qualify [SIMD-JSON tape reuse](docs/dependency-audit.md#current-candidate-and-pending-gate)
   in owning main-only CI: Unicode/duplicates/unknowns/shapes/bounds/canonical bytes,
   at least 5% lower equal-weight geometric-mean time and no case over 5% slower in
