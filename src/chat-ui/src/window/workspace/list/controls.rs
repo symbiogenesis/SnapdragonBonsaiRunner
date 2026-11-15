@@ -19,15 +19,10 @@ pub(super) struct Availability {
     pub(super) delete: bool,
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "Selection, response activity, focus and clipboard availability are independent row presentation inputs."
-)]
 pub(super) struct Row<'a> {
     pub(super) conversation: &'a Conversation,
     pub(super) active: bool,
     pub(super) responding: bool,
-    pub(super) reveal: bool,
     pub(super) copy_available: bool,
     pub(super) availability: Availability,
 }
@@ -83,10 +78,6 @@ impl Row<'_> {
                         ui.add_sized([ui.available_width().max(40.0), ROW_HEIGHT], button)
                     })
                     .inner;
-                // Pending composer focus during generation must not repaint forever.
-                if self.active && self.reveal {
-                    response.scroll_to_me(Some(egui::Align::Center));
-                }
                 if response.on_hover_text(&self.conversation.title).clicked() {
                     action = Some(Action::Select(self.conversation.id));
                 }
@@ -239,6 +230,15 @@ pub(super) fn list_heading(ui: &mut egui::Ui, shown: usize, total: usize, filter
         );
     });
     ui.add_space(2.0);
+}
+
+pub(super) fn pinned_divider(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [rect.left_center(), rect.right_center()],
+        ui.visuals().widgets.noninteractive.bg_stroke,
+    );
 }
 
 pub(super) fn empty_list(ui: &mut egui::Ui) {

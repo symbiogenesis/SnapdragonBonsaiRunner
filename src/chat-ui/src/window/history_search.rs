@@ -12,6 +12,7 @@ pub(super) struct Search {
     previous: String,
     query: Arc<Query>,
     pub(super) rows: Vec<usize>,
+    pub(super) scrollable_rows: Vec<usize>,
     reset_scroll: bool,
 }
 
@@ -84,6 +85,16 @@ impl Search {
             }
         }
         changed
+    }
+
+    pub(super) fn update_scrollable(&mut self, pinned: &[usize]) {
+        self.scrollable_rows.clear();
+        self.scrollable_rows.extend(
+            self.rows
+                .iter()
+                .copied()
+                .filter(|index| !pinned.contains(index)),
+        );
     }
 }
 
@@ -192,17 +203,6 @@ impl Query {
 // lowercase expansions, so sidebar body results have identical highlights.
 fn lowercase(text: &str) -> String {
     text.chars().flat_map(char::to_lowercase).collect()
-}
-
-// egui itself uses f32 for scroll offsets. Precision loss far beyond the visible
-// row range can affect positioning, but never conversation identity or selection.
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    reason = "Convert the virtual row position to egui's floating-point scroll coordinates."
-)]
-pub(super) fn row_offset(index: usize, stride: f32) -> f32 {
-    index as f32 * stride
 }
 
 #[cfg(test)]
