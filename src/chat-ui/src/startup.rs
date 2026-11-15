@@ -586,6 +586,7 @@ mod tests {
             frontend_port: 5173,
             backend_port: 8081,
             use_abliterate_lora: false,
+            no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: true,
             native_row_workers: 4,

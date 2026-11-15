@@ -134,6 +134,7 @@ pub(crate) struct Config {
     pub(crate) frontend_port: u16,
     pub(crate) backend_port: u16,
     pub(crate) use_abliterate_lora: bool,
+    pub(crate) no_mmproj: bool,
     pub(crate) use_repacked_ptq1: bool,
     pub(crate) native_engine: bool,
     pub(crate) native_row_workers: u8,
@@ -429,9 +430,12 @@ fn wait_for_retry(
 }
 
 fn runtime_arguments(config: &Config) -> Vec<&'static str> {
-    let mut arguments = Vec::with_capacity(6);
+    let mut arguments = Vec::with_capacity(8);
     if config.use_abliterate_lora {
         arguments.push("--use-abliterate-lora");
+    }
+    if config.no_mmproj {
+        arguments.push("--no-mmproj");
     }
     arguments.push(if config.use_repacked_ptq1 {
         "--use-repacked-ptq1"
@@ -1376,6 +1380,7 @@ mod tests {
             frontend_port: 5173,
             backend_port: 8081,
             use_abliterate_lora: true,
+            no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: false,
             native_row_workers: 1,
@@ -1447,6 +1452,9 @@ mod tests {
                 "1"
             ]
         );
+        config.no_mmproj = true;
+        assert!(runtime_arguments(&config).contains(&"--no-mmproj"));
+        config.no_mmproj = false;
         for policy in [
             super::KvCache::Rsq4,
             super::KvCache::F16,
@@ -1491,6 +1499,7 @@ mod tests {
             frontend_port: 5174,
             backend_port: 8082,
             use_abliterate_lora: true,
+            no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: true,
             native_row_workers: 4,

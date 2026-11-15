@@ -73,7 +73,7 @@ fn status(report: Report, data: &Path) -> Option<Status> {
     if !matches!(report.schema_version, 1 | 2)
         || !matches!(
             report.stage.as_str(),
-            "model" | "adapter" | "runtime" | "ready"
+            "model" | "adapter" | "mmproj" | "runtime" | "ready"
         )
         || report.message.is_empty()
         || report.message.len() > 512
@@ -88,6 +88,7 @@ fn status(report: Report, data: &Path) -> Option<Status> {
             "runtime" => (Activity::Preparing, "Preparing the runtime…"),
             "ready" => (Activity::Ready, "Starting your local model…"),
             "adapter" => (Activity::Checking, "Preparing model adapter files…"),
+            "mmproj" => (Activity::Checking, "Preparing Swift vision encoder files…"),
             _ => (Activity::Checking, "Preparing Swift model files…"),
         };
         (activity, message.to_owned(), None)
@@ -209,6 +210,23 @@ mod tests {
             expected_bytes: None,
         };
         assert!(status(make(), &data).is_some());
+        let mut mmproj = make();
+        mmproj.stage = "mmproj".into();
+        mmproj.message = "Downloading Swift vision encoder…".into();
+        assert!(status(mmproj, &data).is_some());
+        let mmproj_legacy = Report {
+            schema_version: 1,
+            stage: "mmproj".into(),
+            message: "Checking vision files…".into(),
+            kind: None,
+            activity: None,
+            artifact_path: None,
+            expected_bytes: None,
+        };
+        assert_eq!(
+            status(mmproj_legacy, &data).map(|parsed| parsed.activity),
+            Some(Activity::Checking)
+        );
         let mut unknown = make();
         unknown.stage = "unreviewed".into();
         assert!(status(unknown, &data).is_none());

@@ -7,6 +7,8 @@
 )]
 
 #[cfg(windows)]
+mod attachment_import;
+#[cfg(windows)]
 #[allow(
     unsafe_code,
     reason = "Audited native file picker, file clipboard and Windows audio conversion boundary."
@@ -72,6 +74,7 @@ fn configuration(
     let mut tts_voice_model = None;
     let (mut tts_quantization, mut tts_threads) = (None, None);
     let mut no_abliterate_lora = false;
+    let mut no_mmproj = false;
     let mut use_repacked_ptq1 = None;
     let mut native_engine = None;
     let mut native_row_workers = None;
@@ -81,6 +84,7 @@ fn configuration(
     while let Some(option) = args.next() {
         match option.to_str() {
             Some("--no-abliterate-lora") if !no_abliterate_lora => no_abliterate_lora = true,
+            Some("--no-mmproj") if !no_mmproj => no_mmproj = true,
             Some("--use-repacked-ptq1") if use_repacked_ptq1.is_none() => {
                 use_repacked_ptq1 = Some(true);
             }
@@ -226,7 +230,7 @@ fn configuration(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
@@ -292,6 +296,7 @@ fn configuration(
         frontend_port: frontend_port.unwrap_or(5173),
         backend_port: backend_port.unwrap_or(8081),
         use_abliterate_lora: !no_abliterate_lora,
+        no_mmproj,
         use_repacked_ptq1: use_repacked_ptq1.unwrap_or(false),
         native_engine,
         native_row_workers,
@@ -385,6 +390,12 @@ fn main() -> std::process::ExitCode {
         .is_some_and(|argument| argument == "--audio-import-worker")
     {
         return audio_import::run_worker(&args);
+    }
+    if args
+        .first()
+        .is_some_and(|argument| argument == "--attachment-import-worker")
+    {
+        return attachment_import::run_worker(&args);
     }
     let result = if args.len() == 1 && args[0] == "--preview" {
         window::run_preview().map(|()| false)
@@ -790,12 +801,19 @@ mod tests {
         let mut duplicate_native = native.clone();
         duplicate_native.push("--native-engine".into());
         assert!(configuration(duplicate_native).is_err());
+        let mut mmproj_disabled = native.clone();
+        mmproj_disabled.push("--no-mmproj".into());
+        let no_vision = configuration(mmproj_disabled.clone()).map_err(io::Error::other)?;
+        assert!(no_vision.no_mmproj);
+        mmproj_disabled.push("--no-mmproj".into());
+        assert!(configuration(mmproj_disabled).is_err());
         native.push("--use-repacked-ptq1".into());
         assert!(configuration(native).is_ok_and(|config| config.use_repacked_ptq1));
         let mut disabled = args;
         disabled.push("--no-abliterate-lora".into());
         let opted_out = configuration(disabled.clone()).map_err(io::Error::other)?;
         assert!(!opted_out.use_abliterate_lora);
+        assert!(!opted_out.no_mmproj);
         disabled.push("--no-abliterate-lora".into());
         assert!(configuration(disabled).is_err());
         // Neither mode requires adapter bytes at UI parsing time; the broker

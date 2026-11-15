@@ -526,6 +526,7 @@ dependencies = [
 name = "bonsai-chat"
 version = "0.3.2"
 dependencies = [
+ "base64ct",
  "bonsai-audio",
  "bonsai-markdown",
  "bonsai-windows-credentials",
