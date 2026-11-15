@@ -101,11 +101,148 @@ fn compiler(control: &mut Control, report: &mut Value) -> Result<PathBuf> {
     report["compiler"] = json!({"selectedFiles":selected,"toolsVersion":tool_version,"windowsSdkVersion":sdk_version,"target":"aarch64-pc-windows-msvc","scope":"selected native compiler/linker components; not-complete-OS-closure"});
     Ok(compiler)
 }
+fn verify_queue_abi_pin(root: &Path, pin: &Value, public: &Value) -> Result<()> {
+    let public_inputs = list(pin, "publicInputs")?;
+    let mut by_name = BTreeMap::new();
+    for item in public_inputs {
+        let name = string(item, "name")?;
+        let bytes = item["bytes"]
+            .as_u64()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| format!("Invalid byte count for public input {name}."))?;
+        let digest = string(item, "sha256")?;
+        require(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "Public input sha256 must be lowercase hex.",
+        )?;
+        let repository = string(item, "repository")?;
+        let revision = string(item, "revision")?;
+        let path = string(item, "path")?;
+        let url = string(item, "url")?;
+        require(
+            url == format!("https://raw.githubusercontent.com/{repository}/{revision}/{path}"),
+            "Public input URL must match pinned repository, revision and path.",
+        )?;
+        let _ = bytes;
+        require(
+            by_name.insert(name, item).is_none(),
+            "Duplicate public input in windows-queue-abi.lock.json.",
+        )?;
+    }
+    for required_header in ["AEEStdDef.h", "dspqueue.h", "htp-ops.h"] {
+        require(
+            by_name.contains_key(required_header),
+            "Missing required header in windows-queue-abi.lock.json.",
+        )?;
+    }
+    for header in list(&public["wireCapture"], "headers")? {
+        let name = string(header, "name")?;
+        if let Some(pinned) = by_name.get(name) {
+            fields_equal(pinned, header, &["name", "bytes", "sha256", "url"])?;
+        }
+    }
+    let c_source = String::from_utf8(read(
+        &root.join("tools/hexagon/windows_queue_abi.c"),
+        1_048_576,
+    )?)
+    .map_err(|error| error.to_string())?;
+    for line in c_source.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("#include") else {
+            continue;
+        };
+        let trimmed = rest.trim_start();
+        if let Some(quoted) = trimmed.strip_prefix('"') {
+            let header = quoted
+                .split('"')
+                .next()
+                .filter(|name| !name.is_empty() && !name.contains(['\\', '/']))
+                .ok_or("Invalid local #include in windows_queue_abi.c.")?;
+            require(
+                by_name.contains_key(header),
+                "windows_queue_abi.c includes a header missing from windows-queue-abi.lock.json.",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_staged_header_includes(inputs: &Path) -> Result<()> {
+    const STANDARD_HEADERS: &[&str] = &[
+        "assert.h",
+        "ctype.h",
+        "errno.h",
+        "float.h",
+        "inttypes.h",
+        "limits.h",
+        "math.h",
+        "stdalign.h",
+        "stdarg.h",
+        "stdatomic.h",
+        "stdbool.h",
+        "stddef.h",
+        "stdint.h",
+        "stdio.h",
+        "stdlib.h",
+        "stdnoreturn.h",
+        "string.h",
+        "time.h",
+        "wchar.h",
+    ];
+    for entry in fs::read_dir(inputs).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let is_header = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("h"));
+        if !is_header
+            || !entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+        {
+            continue;
+        }
+        let text = String::from_utf8(read(&path, 1_048_576)?).map_err(|error| error.to_string())?;
+        for line in text.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("#include") else {
+                continue;
+            };
+            let trimmed = rest.trim_start();
+            let (include_name, system) = if let Some(quoted) = trimmed.strip_prefix('"') {
+                (quoted.split('"').next().unwrap_or_default(), false)
+            } else if let Some(angled) = trimmed.strip_prefix('<') {
+                (angled.split('>').next().unwrap_or_default(), true)
+            } else {
+                continue;
+            };
+            if include_name.is_empty()
+                || include_name.contains(['\\', '/'])
+                || (system && STANDARD_HEADERS.contains(&include_name))
+            {
+                continue;
+            }
+            require(
+                inputs.join(include_name).is_file(),
+                &format!(
+                    "Staged public header {} includes missing header {include_name}.",
+                    entry.file_name().to_string_lossy()
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn inputs(control: &Control, pin: &Value, report: &mut Value) -> Result<PathBuf> {
     let public = json_file(&control.source("public-qaic.lock.json"), 1_048_576)?;
     // Check the complete retained source closure before spending network or
     // compiler work. The portable policy fixtures exercise this same intake.
     report["retainedWireReplay"] = retained::verify(&control.root, &public)?;
+    verify_queue_abi_pin(&control.root, pin, &public)?;
     let inputs = control.output.join("inputs");
     let retained = control.review.join("inputs");
     directory(&inputs)?;
@@ -116,6 +253,7 @@ fn inputs(control: &Control, pin: &Value, report: &mut Value) -> Result<PathBuf>
         let name = string(input, "name")?;
         copy(&inputs.join(name), &retained.join(format!("{name}.txt")))?;
     }
+    verify_staged_header_includes(&inputs)?;
     let archive = control
         .root
         .join("docs/evidence/hexagon-public-qaic-41171859264");
@@ -563,5 +701,60 @@ mod tests {
         changed["wireCapture"]["headers"][0]["sha256"] = json!("0".repeat(64));
         assert!(retained::verify(root, &changed).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn windows_queue_abi_pin_matches_wire_headers_and_c_includes() -> Result<()> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("Fixture workspace root is unavailable.")?;
+        let pin = json_file(
+            &root.join("tools/hexagon/windows-queue-abi.lock.json"),
+            1_048_576,
+        )?;
+        let public = json_file(&root.join("tools/hexagon/public-qaic.lock.json"), 1_048_576)?;
+        verify_queue_abi_pin(root, &pin, &public)?;
+
+        let mut missing_aeestddef = pin.clone();
+        missing_aeestddef["publicInputs"]
+            .as_array_mut()
+            .ok_or("Expected publicInputs array.")?
+            .retain(|item| item["name"] != "AEEStdDef.h");
+        assert!(verify_queue_abi_pin(root, &missing_aeestddef, &public).is_err());
+
+        let mut mutated_sha = pin;
+        mutated_sha["publicInputs"][0]["sha256"] = json!("0".repeat(64));
+        assert!(verify_queue_abi_pin(root, &mut mutated_sha, &public).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_headers_reject_missing_transitive_public_includes() -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!(
+            "bonsai-staged-headers-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
+        let result = (|| {
+            fs::write(
+                scratch.join("dspqueue.h"),
+                "#include <stdlib.h>\n#include <AEEStdDef.h>\n",
+            )
+            .map_err(|error| error.to_string())?;
+            assert!(verify_staged_header_includes(&scratch).is_err());
+            fs::write(
+                scratch.join("AEEStdDef.h"),
+                "#include <stdbool.h>\n#include <stdint.h>\n",
+            )
+            .map_err(|error| error.to_string())?;
+            verify_staged_header_includes(&scratch)
+        })();
+        let _ = fs::remove_dir_all(&scratch);
+        result
     }
 }

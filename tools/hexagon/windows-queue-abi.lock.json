@@ -8,6 +8,15 @@
   "sdkEquivalenceQualified": false,
   "publicInputs": [
     {
+      "name": "AEEStdDef.h",
+      "bytes": 7999,
+      "sha256": "319a834050e0a53eaecaef0c54d84dab3133ea340de5f68d9f213a7d5463ed3d",
+      "repository": "qualcomm/fastrpc",
+      "revision": "a56e9d4de3614a8d8f4b0e15ff561350c4b686e3",
+      "path": "inc/AEEStdDef.h",
+      "url": "https://raw.githubusercontent.com/qualcomm/fastrpc/a56e9d4de3614a8d8f4b0e15ff561350c4b686e3/inc/AEEStdDef.h"
+    },
+    {
       "name": "dspqueue.h",
       "bytes": 24632,
       "sha256": "571c74ce3651042873b0e93eb53baa7d9ec0963665355933d4a8518272e1e2a3",

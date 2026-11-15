@@ -70,6 +70,16 @@ jobs:
         with:
           toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
           components: ''
+      - name: Cache Cargo registry and public ABI supervisor outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/SwiftBonsai-Public-ABI-Tools
+          key: hexagon-public-abi-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'tools/bonsai/**', 'tools/native-reference/**', 'tools/hexagon/**', 'tools/qwen-tts/**', 'src/audio/**', 'src/artifacts/**', 'src/cpu-policy/**', 'src/chat-ui/assets/**', 'src/speech-asr/model.lock.json', 'src/speech-tts/model.lock.json', 'src/windows-*/**', 'LICENSE', 'NOTICE') }}
+          restore-keys: |
+            hexagon-public-abi-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.image-identity }}-${{ steps.rust.outputs.compiler-identity }}-
       - name: Compare native public queue ABI and replay independent wire observations
         shell: pwsh
         working-directory: ${{ runner.temp }}

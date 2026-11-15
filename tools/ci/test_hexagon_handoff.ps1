@@ -28,11 +28,11 @@ $cases=[ordered]@{
  }
  caches_exclude_fresh_bundles_and_evidence={
     foreach ($fragment in @("CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'",'CARGO_BUILD_FINGERPRINT: content')) { Assert-Ci ($workflow.Contains($fragment)) }
-    foreach ($name in @('checked-policy','ranking-controls','controls','artifact-binder')) { $caches=Get-HexagonCaches $jobs[$name]; Assert-CiEqual $caches.Count 1; $paths=($caches[0] -split 'path: \|',2)[1] -split '          key:',2; Assert-Ci ($paths[0] -notmatch '(?i)(?:bundle|prepared|evidence|receipt|checkedtools)'); Assert-Ci (-not $paths[0].Contains('GITHUB_WORKSPACE')) }
+    foreach ($name in @('checked-policy','ranking-controls','controls','artifact-binder','public-native-abi')) { $caches=Get-HexagonCaches $jobs[$name]; Assert-CiEqual $caches.Count 1; $paths=($caches[0] -split 'path: \|',2)[1] -split '          key:',2; Assert-Ci ($paths[0] -notmatch '(?i)(?:bundle|prepared|evidence|receipt|checkedtools)'); Assert-Ci (-not $paths[0].Contains('GITHUB_WORKSPACE')) }
     Assert-Ci ((Get-HexagonCaches $jobs['checked-policy'])[0].Contains('${{ env.BONSAI_TOOLS_TARGET }}'))
     foreach ($fragment in @('BONSAI_TOOLS_SOURCE_ID','BONSAI_TOOLS_CACHE_HOST')) { Assert-Ci ($jobs['checked-policy'].Contains($fragment)) }
     foreach ($fragment in @('needs.checked-policy.outputs.target-cache-key','needs.checked-policy.outputs.image-identity == steps.rust.outputs.image-identity','needs.checked-policy.outputs.compiler-identity == steps.rust.outputs.compiler-identity')) { Assert-Ci ($jobs.controls.Contains($fragment)) }
-    foreach ($name in @('ranking-controls','controls','artifact-binder')) { foreach ($fragment in @('steps.rust.outputs.image-identity','steps.rust.outputs.compiler-identity')) { Assert-Ci ($jobs[$name].Contains($fragment)) } }
+    foreach ($name in @('ranking-controls','controls','artifact-binder','public-native-abi')) { foreach ($fragment in @('steps.rust.outputs.image-identity','steps.rust.outputs.compiler-identity')) { Assert-Ci ($jobs[$name].Contains($fragment)) } }
  }
  native_builds_and_artifacts_fresh={
     foreach ($fragment in @("operation = 'build-dispatch'","BONSAI_TOOLS_TARGET=`$(Join-Path `$env:RUNNER_TEMP 'SwiftBonsai-PackagedTools')")) { Assert-Ci ($jobs.controls.Contains($fragment)) }

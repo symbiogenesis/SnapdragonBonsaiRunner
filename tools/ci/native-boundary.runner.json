@@ -93,8 +93,8 @@
     },
     {
       "path": ".github/workflows/hexagon-qualification.yml",
-      "bytes": 30145,
-      "sha256": "23155d8a43e999e7de31cd8ab6cbdc10f82f842b9b53056ec504642dc5725b54",
+      "bytes": 31184,
+      "sha256": "c171a381c0422b0fc76ba0c956633854968d057eeb5c5fc56348879e749d2575",
       "family": "hexagon-windows-abi"
     },
     {
@@ -189,8 +189,8 @@
     },
     {
       "path": "tools/bonsai/src/hexagon_tools/public_control/windows.rs",
-      "bytes": 23304,
-      "sha256": "61786f060565bfb2e0c8b5649b423d9c9ddba4fbcec7ee1d1def8327d964c081",
+      "bytes": 29893,
+      "sha256": "af723ddf3a18d97ebee1d8813ba80d74e459b2498d463c19eca3a73047e9b85a",
       "family": "hexagon-qaic"
     },
     {
