@@ -3,22 +3,22 @@
 
 pub(super) mod maintenance;
 
-use std::ffi::{OsStr, c_void};
+use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::net::Ipv4Addr;
-use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::io::{
     AsRawHandle as _, AsRawSocket as _, AsSocket, FromRawHandle as _, FromRawSocket as _,
     OwnedHandle, OwnedSocket, RawHandle,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES,
     FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    LocalFree, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
@@ -28,11 +28,17 @@ use windows_sys::Win32::Networking::WinSock::{
     SOCKADDR_IN, SOCKET_ERROR, SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
     WSADATA, WSAGetLastError, WSASocketW, WSAStartup, bind, listen, setsockopt,
 };
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::Isolation::GetAppContainerFolderPath;
+use windows_sys::Win32::Security::{
+    GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_QUERY,
+    TokenAppContainerSid, TokenIsAppContainer,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -54,7 +60,7 @@ use windows_sys::Win32::System::Threading::{
     BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, GetProcessMitigationPolicy, GetProcessTimes,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION, PROCESS_MITIGATION_POLICY,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ProcessExtensionPointDisablePolicy,
@@ -235,6 +241,10 @@ pub(super) fn sandbox_available() -> io::Result<()> {
     containment::available()
 }
 
+pub(super) fn offline_sandbox_available() -> io::Result<()> {
+    containment::offline_available()
+}
+
 pub(super) fn tool_environment(
     overlay: &std::collections::BTreeMap<String, String>,
 ) -> io::Result<Option<Vec<u16>>> {
@@ -409,6 +419,18 @@ mod parent_tests {
     }
 }
 
+enum PipeMode {
+    None,
+    BinaryStdio {
+        input: OwnedHandle,
+        output: OwnedHandle,
+    },
+    BrokerStdio {
+        input: OwnedHandle,
+        output: OwnedHandle,
+    },
+}
+
 pub(super) struct NativeProcess {
     // Drop order closes the Job before the root process handle.
     job: OwnedHandle,
@@ -420,6 +442,7 @@ pub(super) struct NativeProcess {
     // Capture threads own process handles, never a Job handle that could keep
     // kill-on-close from taking effect after an abrupt owner exit.
     captures: Option<output::Captures>,
+    private_roots: Vec<PathBuf>,
 }
 
 impl NativeProcess {
@@ -437,6 +460,7 @@ impl NativeProcess {
             command,
             None,
             None,
+            PipeMode::None,
             None,
         )
     }
@@ -455,6 +479,7 @@ impl NativeProcess {
             command,
             None,
             None,
+            PipeMode::None,
             None,
         )
     }
@@ -480,7 +505,8 @@ impl NativeProcess {
             command,
             Some(&environment),
             Some(containment),
-            None,
+            PipeMode::None,
+            Some(policy.writable_directory.clone()),
         )
     }
 
@@ -509,6 +535,37 @@ impl NativeProcess {
         )
     }
 
+    pub(super) fn start_sandboxed_broker_pipe(
+        spec: &ProcessSpec,
+        command: Vec<u16>,
+        policy: &SandboxPolicy,
+    ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
+        let environment = containment::minimal_child_environment(policy)?;
+        let containment = containment::Environment::create(spec, policy, SandboxNetwork::Offline)?;
+        let (child_input, parent_input) = anonymous_pipe(true)?;
+        let (parent_output, child_output) = anonymous_pipe(false)?;
+        let process = Self::launch(
+            &LaunchSpec {
+                executable: &spec.executable,
+                working_directory: &spec.working_directory,
+                stdout: &spec.stdout,
+                stderr: &spec.stderr,
+                limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
+                priority_class: None,
+                mitigation_profile: MitigationProfile::Headless,
+            },
+            command,
+            Some(&environment),
+            Some(containment),
+            PipeMode::BrokerStdio {
+                input: child_input,
+                output: child_output,
+            },
+            Some(policy.writable_directory.clone()),
+        )?;
+        Ok((process, parent_input.into(), parent_output.into()))
+    }
+
     fn start_sandboxed_piped_with_environment(
         spec: &ProcessSpec,
         command: Vec<u16>,
@@ -532,7 +589,11 @@ impl NativeProcess {
             command,
             Some(environment),
             Some(containment),
-            Some((child_input, child_output)),
+            PipeMode::BinaryStdio {
+                input: child_input,
+                output: child_output,
+            },
+            Some(policy.writable_directory.clone()),
         )?;
         Ok((process, parent_input.into(), parent_output.into()))
     }
@@ -559,6 +620,7 @@ impl NativeProcess {
             command,
             environment,
             None,
+            PipeMode::None,
             None,
         )
     }
@@ -568,7 +630,8 @@ impl NativeProcess {
         mut command: Vec<u16>,
         environment: Option<&[u16]>,
         containment: Option<containment::Environment>,
-        pipes: Option<(OwnedHandle, OwnedHandle)>,
+        pipes: PipeMode,
+        writable_root: Option<PathBuf>,
     ) -> io::Result<Self> {
         let executable = wide(spec.executable.as_os_str());
         let directory = wide(spec.working_directory.as_os_str());
@@ -629,7 +692,7 @@ impl NativeProcess {
                 return Err(error);
             }
         };
-        let start = captures
+        let appcontainer_folder = match captures
             .as_ref()
             .map_or(Ok(()), output::Captures::check)
             .and_then(|()| {
@@ -640,15 +703,24 @@ impl NativeProcess {
                     spec.mitigation_profile,
                     containment.is_some(),
                 )
-            });
-        if let Err(error) = start {
-            // PSEC may broker process creation rather than inheriting JOB_LIST.
-            // Any failure before confirmed ownership must terminate this exact
-            // retained root, even when closing our Job cannot reach it yet.
-            drop([input, output, error_output]);
-            terminate_failed_start(&process, captures.as_ref())
-                .map_err(crate::unconfirmed_start_cleanup)?;
-            return Err(error);
+            }) {
+            Ok(folder) => folder,
+            Err(error) => {
+                // PSEC may broker process creation rather than inheriting JOB_LIST.
+                // Any failure before confirmed ownership must terminate this exact
+                // retained root, even when closing our Job cannot reach it yet.
+                drop([input, output, error_output]);
+                terminate_failed_start(&process, captures.as_ref())
+                    .map_err(crate::unconfirmed_start_cleanup)?;
+                return Err(error);
+            }
+        };
+        let mut private_roots = Vec::new();
+        if let Some(root) = writable_root {
+            private_roots.push(root);
+        }
+        if let Some(folder) = appcontainer_folder {
+            private_roots.push(folder);
         }
         Ok(Self {
             job,
@@ -657,11 +729,16 @@ impl NativeProcess {
             containment,
             stop_attempt: cleanup::StopAttempt::default(),
             captures,
+            private_roots,
         })
     }
 
     pub(super) const fn id(&self) -> u32 {
         self.id
+    }
+
+    pub(super) fn private_roots(&self) -> &[PathBuf] {
+        &self.private_roots
     }
 
     pub(super) fn try_wait(&self) -> io::Result<Option<u32>> {
@@ -949,13 +1026,168 @@ fn require_mitigation(
     Ok(())
 }
 
+struct LocalAllocString(*mut u16);
+
+impl Drop for LocalAllocString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: The string buffer was allocated by ConvertSidToStringSidW.
+            let _ = unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+}
+
+struct CoTaskWideString(*mut u16);
+
+impl Drop for CoTaskWideString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: The path buffer was allocated by GetAppContainerFolderPath.
+            unsafe { CoTaskMemFree(self.0.cast()) };
+        }
+    }
+}
+
+fn verify_appcontainer_and_folder(process: &OwnedHandle) -> io::Result<Option<PathBuf>> {
+    const HR_FILE_NOT_FOUND: i32 = i32::from_ne_bytes(0x8007_0002_u32.to_ne_bytes());
+    const HR_PATH_NOT_FOUND: i32 = i32::from_ne_bytes(0x8007_0003_u32.to_ne_bytes());
+    const MAX_FOLDER_UNITS: usize = 32_768;
+
+    let mut raw_token = null_mut();
+    // SAFETY: Retained process handle stays live; writable token slot is local.
+    check(unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &raw mut raw_token) })?;
+    let token = owned(raw_token)?;
+
+    let mut is_appcontainer = 0_u32;
+    let mut returned = 0_u32;
+    // SAFETY: Token is opened for TOKEN_QUERY; TokenIsAppContainer returns one DWORD.
+    check(unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenIsAppContainer,
+            (&raw mut is_appcontainer).cast(),
+            win_size::<u32>(),
+            &raw mut returned,
+        )
+    })?;
+    if is_appcontainer == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "contained worker token is not an AppContainer",
+        ));
+    }
+
+    let mut needed = 0_u32;
+    // SAFETY: Sizing query uses null buffer and valid writable byte count.
+    let sized = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenAppContainerSid,
+            null_mut(),
+            0,
+            &raw mut needed,
+        )
+    };
+    if sized != 0 || needed == 0 || needed > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid AppContainer SID token size",
+        ));
+    }
+    let sizing_error = io::Error::last_os_error();
+    if sizing_error.raw_os_error() != i32::try_from(ERROR_INSUFFICIENT_BUFFER).ok() {
+        return Err(sizing_error);
+    }
+    let words = usize::try_from(needed)
+        .map_err(|_| invalid("AppContainer SID size overflow"))?
+        .div_ceil(size_of::<u64>());
+    let mut storage = vec![0_u64; words];
+    let buffer_bytes = u32::try_from(size_of_val(storage.as_slice()))
+        .map_err(|_| invalid("AppContainer SID buffer overflow"))?;
+    // SAFETY: `storage` is 8-byte aligned and writable for `buffer_bytes`.
+    check(unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenAppContainerSid,
+            storage.as_mut_ptr().cast(),
+            buffer_bytes,
+            &raw mut needed,
+        )
+    })?;
+    if usize::try_from(needed)
+        .ok()
+        .is_none_or(|n| n < size_of::<TOKEN_APPCONTAINER_INFORMATION>())
+        || size_of_val(storage.as_slice()) < size_of::<TOKEN_APPCONTAINER_INFORMATION>()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "truncated AppContainer SID token information",
+        ));
+    }
+    // SAFETY: `storage` is aligned for u64 (8 bytes) and contains initialized
+    // TOKEN_APPCONTAINER_INFORMATION bytes from GetTokenInformation.
+    let info = unsafe { std::ptr::read(storage.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()) };
+    if info.TokenAppContainer.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "missing AppContainer SID",
+        ));
+    }
+
+    let mut sid_wide: *mut u16 = null_mut();
+    // SAFETY: `info.TokenAppContainer` points into live `storage`; `sid_wide` is writable.
+    check(unsafe { ConvertSidToStringSidW(info.TokenAppContainer, &raw mut sid_wide) })?;
+    let sid_wide = LocalAllocString(sid_wide);
+    if sid_wide.0.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "null AppContainer SID string",
+        ));
+    }
+
+    let mut folder_wide: *mut u16 = null_mut();
+    // SAFETY: `sid_wide.0` is a live NUL-terminated UTF-16 SID string.
+    let hr = unsafe { GetAppContainerFolderPath(sid_wide.0, &raw mut folder_wide) };
+    let folder_wide = CoTaskWideString(folder_wide);
+    if hr == HR_FILE_NOT_FOUND || hr == HR_PATH_NOT_FOUND {
+        return Ok(None);
+    }
+    if hr < 0 {
+        return Err(io::Error::from_raw_os_error(hr));
+    }
+    if folder_wide.0.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "missing AppContainer folder path",
+        ));
+    }
+
+    let mut cursor: *const u16 = folder_wide.0;
+    let mut units = Vec::new();
+    for _ in 0..MAX_FOLDER_UNITS {
+        // SAFETY: `cursor` points to the next in-bounds UTF-16 code unit of
+        // the NUL-terminated buffer retained by `CoTaskWideString`.
+        let unit = unsafe { *cursor };
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        // SAFETY: `unit != 0`, so the terminating NUL lies at or beyond `add(1)`.
+        cursor = unsafe { cursor.add(1) };
+    }
+    if units.is_empty() || units.len() >= MAX_FOLDER_UNITS {
+        return Err(invalid("invalid AppContainer folder path"));
+    }
+    Ok(Some(PathBuf::from(OsString::from_wide(&units))))
+}
+
 fn resume_owned(
     process: &OwnedHandle,
     thread: &OwnedHandle,
     job: &OwnedHandle,
     mitigation_profile: MitigationProfile,
     native_containment: bool,
-) -> io::Result<()> {
+) -> io::Result<Option<PathBuf>> {
     let assigned = !process_in_job(process, job)?;
     if assigned {
         // SAFETY: The retained root was requested suspended and has not been
@@ -965,6 +1197,12 @@ fn resume_owned(
             return Err(io::Error::other("worker did not enter its required Job"));
         }
     }
+    let appcontainer_folder = if native_containment {
+        Some(verify_appcontainer_and_folder(process)?)
+    } else {
+        None
+    }
+    .flatten();
     // Native PSEC's creation broker can omit JOB_LIST. Suspended-root Job
     // assignment above is mandatory; the one-process cap denies child creation
     // for both native and ordinary workers before their first instruction.
@@ -987,7 +1225,7 @@ fn resume_owned(
     // the returned count to be exactly one detects ignored suspension or extra
     // suspension before accepting a running, fully owned worker.
     match unsafe { ResumeThread(thread.as_raw_handle()) } {
-        1 => Ok(()),
+        1 => Ok(appcontainer_folder),
         u32::MAX => Err(io::Error::last_os_error()),
         _ => Err(io::Error::other(
             "worker initial suspension was not preserved",
@@ -1361,19 +1599,26 @@ mod pipe_tests {
 
 fn standard_streams(
     spec: &LaunchSpec<'_>,
-    pipes: Option<(OwnedHandle, OwnedHandle)>,
+    pipes: PipeMode,
     bounded_logs: bool,
 ) -> io::Result<([OwnedHandle; 3], Option<output::PendingCaptures>)> {
-    if let Some((input, output)) = pipes {
-        // Binary pipe workers report bounded errors in their protocol. A NUL
-        // handle avoids granting codecs an unbounded disk-log sink.
-        let error = standard_file(
-            OsStr::new("NUL"),
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            OPEN_EXISTING,
-        )?;
-        return Ok(([input, output, error], None));
+    match pipes {
+        PipeMode::BinaryStdio { input, output } => {
+            // Binary pipe workers report bounded errors in their protocol. A NUL
+            // handle avoids granting codecs an unbounded disk-log sink.
+            let error = standard_file(
+                OsStr::new("NUL"),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+            )?;
+            return Ok(([input, output, error], None));
+        }
+        PipeMode::BrokerStdio { input, output } => {
+            let (error, captures) = output::prepare_stderr(spec.stdout, spec.stderr)?;
+            return Ok(([input, output, error], Some(captures)));
+        }
+        PipeMode::None => {}
     }
     let input = standard_file(
         OsStr::new("NUL"),

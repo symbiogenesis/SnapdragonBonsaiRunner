@@ -57,6 +57,11 @@ fn main() -> io::Result<()> {
         "nested-mitigations" => nested_mitigations()?,
         "sandbox-files" => sandbox_files(&args)?,
         "sandbox-offline-pipes" => offline_probe(&args)?,
+        "sandbox-broker-pipe" => broker_pipe_probe(&args)?,
+        "sandbox-broker-pipe-storage" => broker_pipe_storage_probe()?,
+        "sandbox-broker-pipe-owner" => broker_pipe_owner()?,
+        "sandbox-broker-pipe-wait" => broker_pipe_wait()?,
+        "sandbox-broker-pipe-temp-denied" => broker_pipe_temp_denied(&args)?,
         "sandbox-connect-allowed" => sandbox_connect(&args, true)?,
         "sandbox-connect-denied" => sandbox_connect(&args, false)?,
         "sandbox-temp-denied" => sandbox_temp_denied(&args)?,
@@ -711,5 +716,222 @@ fn error_policy(mode: &str) -> io::Result<()> {
         }
     }
     fs::write("owner-error-mode-after.txt", error_mode().to_string())?;
+    Ok(())
+}
+
+fn broker_pipe_temp() -> io::Result<()> {
+    let directory = std::env::temp_dir();
+    if !directory.is_absolute() {
+        return Err(io::Error::other("sandbox temporary directory is relative"));
+    }
+    let expected: Vec<String> = directory
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    for name in ["TEMP", "TMP"] {
+        let value = std::env::var_os(name)
+            .ok_or_else(|| io::Error::other("sandbox temporary variable is missing"))?;
+        let actual: Vec<String> = Path::new(&value)
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .collect();
+        if actual != expected {
+            return Err(io::Error::other("sandbox TEMP/TMP disagree"));
+        }
+    }
+    let file = directory.join("sandbox-private-temp.txt");
+    fs::write(&file, "private kernel temp")?;
+    if fs::read_to_string(&file)? != "private kernel temp" {
+        return Err(io::Error::other(
+            "sandbox temporary file round-trip changed",
+        ));
+    }
+    fs::write("kernel-temp-path.txt", file.to_string_lossy().as_bytes())
+}
+
+fn broker_pipe_temp_denied(args: &[OsString]) -> io::Result<()> {
+    if fs::read(argument(args, 1)?).is_ok() {
+        return Err(io::Error::other(
+            "sandbox read another worker's private temp",
+        ));
+    }
+    broker_pipe_temp()
+}
+
+fn broker_pipe_authority(args: &[OsString]) -> io::Result<()> {
+    offline_authority(args)?;
+    let external: SocketAddr = ([192_u8, 0, 2, 1], 9).into();
+    let denied = TcpStream::connect_timeout(&external, Duration::from_secs(2));
+    if !denied.is_err_and(|error| error.raw_os_error() == Some(WSAEACCES)) {
+        return Err(io::Error::other(
+            "broker-pipe worker external TCP egress was not denied by policy",
+        ));
+    }
+    if mitigation_flags(windows_sys::Win32::System::Threading::ProcessSystemCallDisablePolicy)? & 1
+        != 1
+    {
+        return Err(io::Error::other(
+            "broker-pipe worker lacked Win32k syscall disable mitigation",
+        ));
+    }
+    for forbidden in ["BONSAI_SANDBOX_PROBE_PATH", "CARGO_TARGET_DIR"] {
+        if std::env::var_os(forbidden).is_some() {
+            return Err(io::Error::other(format!(
+                "broker-pipe worker inherited forbidden variable {forbidden}"
+            )));
+        }
+    }
+    for (key, _) in std::env::vars_os() {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if [
+            "_TOKEN",
+            "_SECRET",
+            "_PASSWORD",
+            "_API_KEY",
+            "_PRIVATE_KEY",
+            "_ACCESS_KEY",
+            "_CONNECTION_STRING",
+            "_CONNECTIONSTRING",
+            "_DATABASE_URL",
+            "_REDIS_URL",
+        ]
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
+            || ["HF_TOKEN", "HF_ENDPOINT", "MODEL_ENDPOINT"]
+                .iter()
+                .any(|exact| upper == *exact)
+            || ["LLAMA_", "LLAMACPP_", "GGML_", "AIP_", "MTMD_"]
+                .iter()
+                .any(|prefix| upper.starts_with(prefix))
+        {
+            return Err(io::Error::other(format!(
+                "broker-pipe worker inherited credential or override variable {upper}"
+            )));
+        }
+    }
+    if std::env::var_os("SystemRoot").is_none() || std::env::var_os("LOCALAPPDATA").is_none() {
+        return Err(io::Error::other(
+            "broker-pipe worker lacked minimal SystemRoot/LOCALAPPDATA environment",
+        ));
+    }
+    broker_pipe_temp()
+}
+
+fn broker_pipe_probe(args: &[OsString]) -> io::Result<()> {
+    if let Err(error) = broker_pipe_authority(args) {
+        fs::write("broker-pipe-error.txt", error.to_string())?;
+        return Err(error);
+    }
+    let mut err = io::stderr().lock();
+    err.write_all(b"broker-pipe-stderr-marker\n")?;
+    err.flush()?;
+    drop(err);
+
+    let mut payload = Vec::new();
+    io::stdin().lock().take(131_080).read_to_end(&mut payload)?;
+    if payload.len() != 131_079 {
+        return Err(io::Error::other("broker-pipe input length or EOF changed"));
+    }
+    let mut output = io::stdout().lock();
+    output.write_all(b"SB2OKAY1")?;
+    output.write_all(&payload)?;
+    output.flush()
+}
+
+fn broker_pipe_storage_probe() -> io::Result<()> {
+    broker_pipe_temp()?;
+    let mut cmd = [0_u8; 1];
+    let mut input = io::stdin().lock();
+    loop {
+        match input.read(&mut cmd) {
+            Ok(0) => break,
+            Ok(_) => match cmd[0] {
+                b'1' => {
+                    fs::write("scratch-cache.bin", vec![0x41_u8; 8_192])?;
+                    fs::write(
+                        std::env::temp_dir().join("temp-cache.bin"),
+                        vec![0x42_u8; 4_096],
+                    )?;
+                    let mut output = io::stdout().lock();
+                    output.write_all(b"phase1\n")?;
+                    output.flush()?;
+                }
+                b'2' => {
+                    let burst = std::env::temp_dir().join("burst");
+                    fs::create_dir(&burst)?;
+                    for index in 0..1_030_usize {
+                        fs::write(burst.join(format!("f{index}.tmp")), [])?;
+                    }
+                    let mut output = io::stdout().lock();
+                    output.write_all(b"phase2\n")?;
+                    output.flush()?;
+                }
+                b'3' => break,
+                other => {
+                    return Err(io::Error::other(format!(
+                        "unexpected storage probe command byte {other}"
+                    )));
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn broker_pipe_owner() -> io::Result<()> {
+    let directory = std::env::current_dir()?;
+    let scratch = directory.join("scratch");
+    fs::create_dir(&scratch)?;
+    let executable = std::env::current_exe()?;
+    let (process, _child_stdin, mut child_stdout) = OwnedProcess::start_sandboxed_broker_pipe(
+        &ProcessSpec {
+            executable: executable.clone(),
+            arguments: vec![OsString::from("sandbox-broker-pipe-wait")],
+            working_directory: scratch.clone(),
+            stdout: directory.join("owned.stdout"),
+            stderr: directory.join("owned.stderr"),
+            memory_limit_bytes: 256 * 1024 * 1024,
+            active_process_limit: 1,
+        },
+        &SandboxPolicy {
+            readonly_paths: vec![executable],
+            writable_directory: scratch,
+        },
+    )?;
+    let mut alive = [0_u8; 6];
+    child_stdout.read_exact(&mut alive)?;
+    if &alive != b"alive\n" {
+        return Err(io::Error::other(
+            "unexpected alive marker from broker-pipe worker",
+        ));
+    }
+    fs::write(
+        "sandbox-broker-pipe-owner-ready.tmp",
+        format!(
+            "{}\n{}\n",
+            process.id(),
+            process_creation_file_time(process.id())?
+        ),
+    )?;
+    fs::rename(
+        "sandbox-broker-pipe-owner-ready.tmp",
+        "sandbox-broker-pipe-owner-ready.txt",
+    )?;
+    wait_forever();
+    Ok(())
+}
+
+fn broker_pipe_wait() -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    output.write_all(b"alive\n")?;
+    output.flush()?;
+    drop(output);
+    let mut err = io::stderr().lock();
+    err.write_all(b"stderr-alive\n")?;
+    err.flush()?;
+    drop(err);
+    wait_forever();
     Ok(())
 }

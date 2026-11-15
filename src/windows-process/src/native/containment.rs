@@ -97,6 +97,18 @@ pub(super) fn available() -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn offline_available() -> io::Result<()> {
+    let api = available_api(SandboxNetwork::Offline)?;
+    let environment = api
+        .create(
+            &policy_bytes(Vec::new(), None, SandboxNetwork::Offline),
+            TERMINATE_ON_CLOSE,
+        )
+        .map_err(native_error)?;
+    drop(environment);
+    Ok(())
+}
+
 fn available_api(network: SandboxNetwork) -> io::Result<ProcessSecurityEnvironmentApi> {
     let api = ProcessSecurityEnvironmentApi::load().map_err(native_error)?;
     if !api.supports_version(1, 1).map_err(native_error)? {

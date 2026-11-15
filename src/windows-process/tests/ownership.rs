@@ -14,8 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bonsai_windows_process::{
-    OwnedProcess, ParentProcess, ProcessSpec, SandboxNetwork, SandboxPolicy, ToolProcessSpec,
+    MAX_WORKER_PRIVATE_STORAGE_BYTES, MAX_WORKER_PRIVATE_STORAGE_ENTRIES, OwnedProcess,
+    ParentProcess, ProcessSpec, SandboxNetwork, SandboxPolicy, ToolProcessSpec,
     available_memory_bytes, listener_process_id, native_sandbox_available,
+    native_sandbox_offline_available,
 };
 
 // Hosted packages retain the exact probe next to their checked test binaries.
@@ -127,6 +129,15 @@ fn sandbox_rejects_invalid_grants_before_creating_evidence() -> io::Result<()> {
             assert!(!spec.stdout.exists());
             assert!(!spec.stderr.exists());
         }
+        let error = OwnedProcess::start_sandboxed_broker_pipe(&spec, &policy)
+            .err()
+            .ok_or_else(|| {
+                io::Error::other("invalid sandbox policy launched a broker-pipe worker")
+            })?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(reason), "{error}");
+        assert!(!spec.stdout.exists());
+        assert!(!spec.stderr.exists());
     }
     Ok(())
 }
@@ -151,6 +162,13 @@ fn piped_sandbox_rejects_process_count_before_creating_streams() -> io::Result<(
         assert!(!spec.stdout.exists());
         assert!(!spec.stderr.exists());
     }
+    let error = OwnedProcess::start_sandboxed_broker_pipe(&spec, &policy)
+        .err()
+        .ok_or_else(|| io::Error::other("multi-process broker-pipe sandbox policy was accepted"))?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("single-process"));
+    assert!(!spec.stdout.exists());
+    assert!(!spec.stderr.exists());
     Ok(())
 }
 
@@ -1021,5 +1039,243 @@ fn headless_error_policy_applies_to_root_and_descendants_only() -> io::Result<()
         fs::read_to_string(lane.path.join("owner-error-mode-after.txt"))?,
         "0"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires a native Windows PSEC v1.1 host."]
+fn native_sandbox_broker_pipe_enforces_offline_inference_authority() -> io::Result<()> {
+    native_sandbox_offline_available()?;
+    let lane = Lane::new("broker-pipe")?;
+    let scratch = lane.path.join("scratch");
+    fs::create_dir(&scratch)?;
+    let approved = lane.path.join("approved-model.mxc");
+    let unrelated = lane.path.join("unrelated.key");
+    fs::write(&approved, "approved audio input")?;
+    fs::write(&unrelated, "unrelated credential")?;
+    // Trusted host controls prove write/read and loopback accept work outside containment.
+    drop(fs::OpenOptions::new().write(true).open(&approved)?);
+    let sentinel = fs::File::open(&unrelated)?;
+    assert_eq!(fs::read_to_string(&unrelated)?, "unrelated credential");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = listener.local_addr()?;
+    drop(TcpStream::connect_timeout(
+        &endpoint,
+        Duration::from_secs(1),
+    )?);
+    drop(listener.accept()?);
+
+    let mut spec = lane.spec(vec![
+        OsString::from("sandbox-broker-pipe"),
+        approved.clone().into_os_string(),
+        unrelated.clone().into_os_string(),
+        OsString::from(endpoint.port().to_string()),
+        OsString::from(inheritable_file_identity(&sentinel)?),
+    ]);
+    spec.working_directory.clone_from(&scratch);
+    spec.active_process_limit = 1;
+    let (process, mut input, output) = OwnedProcess::start_sandboxed_broker_pipe(
+        &spec,
+        &SandboxPolicy {
+            readonly_paths: vec![spec.executable.clone(), approved.clone()],
+            writable_directory: scratch.clone(),
+        },
+    )?;
+    assert_eq!(process.active_processes()?, 1);
+    let expected = (0..=255_u8).cycle().take(131_079).collect::<Vec<_>>();
+    let payload = expected.clone();
+    let exchange = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+        input.write_all(&payload)?;
+        drop(input);
+        let mut response = Vec::new();
+        output.take(131_088).read_to_end(&mut response)?;
+        Ok(response)
+    });
+    let exit = process.wait_for_exit(TIMEOUT);
+    let stopped = process.stop(TIMEOUT);
+    stopped?;
+    let response = exchange
+        .join()
+        .map_err(|_| io::Error::other("broker-pipe fixture panicked"))?;
+    assert_eq!(
+        exit?,
+        Some(0),
+        "{} | {}",
+        fs::read_to_string(scratch.join("broker-pipe-error.txt")).unwrap_or_default(),
+        fs::read_to_string(&spec.stderr).unwrap_or_default()
+    );
+    let response = response?;
+    assert_eq!(process.active_processes()?, 0);
+    assert_eq!(response.len(), 8 + expected.len());
+    assert_eq!(&response[..8], b"SB2OKAY1");
+    assert_eq!(&response[8..], expected.as_slice());
+    assert_eq!(fs::read_to_string(&approved)?, "approved audio input");
+    assert_eq!(fs::read_to_string(&unrelated)?, "unrelated credential");
+    assert!(spec.stdout.exists());
+    assert_eq!(fs::metadata(&spec.stdout)?.len(), 0);
+    assert!(fs::read_to_string(&spec.stderr)?.contains("broker-pipe-stderr-marker"));
+
+    let first_temp = fs::read_to_string(scratch.join("kernel-temp-path.txt"))?;
+    assert_eq!(fs::read_to_string(&first_temp)?, "private kernel temp");
+    let second_lane = Lane::new("broker-pipe-other-temp")?;
+    let second_scratch = second_lane.path.join("scratch");
+    fs::create_dir(&second_scratch)?;
+    let mut second_spec = second_lane.spec(vec![
+        OsString::from("sandbox-broker-pipe-temp-denied"),
+        OsString::from(&first_temp),
+    ]);
+    second_spec.working_directory.clone_from(&second_scratch);
+    second_spec.active_process_limit = 1;
+    let (second_process, second_input, second_output) = OwnedProcess::start_sandboxed_broker_pipe(
+        &second_spec,
+        &SandboxPolicy {
+            readonly_paths: vec![second_spec.executable.clone()],
+            writable_directory: second_scratch.clone(),
+        },
+    )?;
+    drop((second_input, second_output));
+    let second_exit = second_process.wait_for_exit(TIMEOUT);
+    second_process.stop(TIMEOUT)?;
+    assert_eq!(
+        second_exit?,
+        Some(0),
+        "{}",
+        fs::read_to_string(&second_spec.stderr).unwrap_or_default()
+    );
+    assert_ne!(
+        fs::read_to_string(second_scratch.join("kernel-temp-path.txt"))?,
+        first_temp
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires a native Windows PSEC v1.1 host."]
+fn native_sandbox_broker_pipe_private_storage_budget_caps_scratch_and_temp() -> io::Result<()> {
+    native_sandbox_offline_available()?;
+    let lane = Lane::new("broker-pipe-storage")?;
+    let scratch = lane.path.join("scratch");
+    fs::create_dir(&scratch)?;
+    let mut spec = lane.spec(vec![OsString::from("sandbox-broker-pipe-storage")]);
+    spec.working_directory.clone_from(&scratch);
+    spec.active_process_limit = 1;
+    let (process, mut input, mut output) = OwnedProcess::start_sandboxed_broker_pipe(
+        &spec,
+        &SandboxPolicy {
+            readonly_paths: vec![spec.executable.clone()],
+            writable_directory: scratch,
+        },
+    )?;
+
+    input.write_all(b"1")?;
+    input.flush()?;
+    let mut ack = [0_u8; 7];
+    output.read_exact(&mut ack)?;
+    assert_eq!(&ack, b"phase1\n");
+
+    let (bytes, entries) = process.private_storage_usage()?;
+    assert!(bytes >= 12_288, "observed private storage bytes: {bytes}");
+    assert!(entries >= 2, "observed private storage entries: {entries}");
+    process.check_private_storage_budget(
+        MAX_WORKER_PRIVATE_STORAGE_BYTES,
+        MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
+    )?;
+    let byte_error = process
+        .check_private_storage_budget(10_000, MAX_WORKER_PRIVATE_STORAGE_ENTRIES)
+        .err()
+        .ok_or_else(|| io::Error::other("tight private byte budget unexpectedly passed"))?;
+    assert_eq!(byte_error.kind(), io::ErrorKind::InvalidInput);
+
+    input.write_all(b"2")?;
+    input.flush()?;
+    output.read_exact(&mut ack)?;
+    assert_eq!(&ack, b"phase2\n");
+
+    let entry_error = process
+        .check_private_storage_budget(
+            MAX_WORKER_PRIVATE_STORAGE_BYTES,
+            MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("private storage entry burst did not fail budget"))?;
+    assert_eq!(entry_error.kind(), io::ErrorKind::InvalidInput);
+
+    input.write_all(b"3")?;
+    input.flush()?;
+    drop((input, output));
+    let exit = process.wait_for_exit(TIMEOUT);
+    process.stop(TIMEOUT)?;
+    assert_eq!(
+        exit?,
+        Some(0),
+        "{}",
+        fs::read_to_string(&spec.stderr).unwrap_or_default()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires a native Windows PSEC v1.1 host."]
+fn native_sandbox_broker_pipe_abrupt_owner_death_ends_worker() -> io::Result<()> {
+    native_sandbox_offline_available()?;
+    let lane = Lane::new("broker-pipe-owner-death")?;
+    let mut owner = Command::new(probe_executable())
+        .arg("sandbox-broker-pipe-owner")
+        .current_dir(&lane.path)
+        .creation_flags(0x0800_0000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(fs::File::create_new(
+            lane.path.join("owner.stdout"),
+        )?))
+        .stderr(Stdio::from(fs::File::create_new(
+            lane.path.join("owner.stderr"),
+        )?))
+        .spawn()?;
+    let ready_path = lane.path.join("sandbox-broker-pipe-owner-ready.txt");
+    let observed = (|| {
+        until(|| {
+            if ready_path.exists() {
+                return Ok(true);
+            }
+            if let Some(status) = owner.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "broker-pipe sandbox owner exited {status}: {}",
+                    fs::read_to_string(lane.path.join("owner.stderr"))?
+                )));
+            }
+            Ok(false)
+        })?;
+        let identity = fs::read_to_string(&ready_path)?;
+        let mut fields = identity.lines();
+        let id = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing broker-pipe worker PID"))?
+            .parse::<u32>()
+            .map_err(io::Error::other)?;
+        let creation = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing broker-pipe worker creation time"))?
+            .parse::<u64>()
+            .map_err(io::Error::other)?;
+        let tracked = ParentProcess::open(id, creation)?;
+        tracked.ensure_alive()?;
+        let owned_stdout = lane.path.join("owned.stdout");
+        if !owned_stdout.exists() || fs::metadata(&owned_stdout)?.len() != 0 {
+            return Err(io::Error::other(
+                "expected 0-byte owned.stdout sentinel under broker-pipe",
+            ));
+        }
+        Ok::<_, io::Error>(tracked)
+    })();
+    let killed = owner.kill();
+    let waited = owner.wait();
+    let tracked = observed?;
+    killed?;
+    let _status = waited?;
+    until(|| match tracked.ensure_alive() {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(true),
+        Err(error) => Err(error),
+    })?;
     Ok(())
 }

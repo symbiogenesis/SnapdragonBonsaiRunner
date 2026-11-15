@@ -32,7 +32,7 @@ struct PendingCapture {
     label: &'static str,
 }
 
-pub(super) struct PendingCaptures([PendingCapture; 2]);
+pub(super) struct PendingCaptures(Vec<PendingCapture>);
 
 struct DoneSignal(Arc<(Mutex<bool>, Condvar)>);
 
@@ -62,7 +62,7 @@ struct Capture {
     label: &'static str,
 }
 
-pub(super) struct Captures([Capture; 2]);
+pub(super) struct Captures(Vec<Capture>);
 
 pub(super) fn prepare(
     stdout: &Path,
@@ -70,7 +70,24 @@ pub(super) fn prepare(
 ) -> io::Result<([OwnedHandle; 2], PendingCaptures)> {
     let (output, stdout) = pending(stdout, "stdout")?;
     let (error, stderr) = pending(stderr, "stderr")?;
-    Ok(([output, error], PendingCaptures([stdout, stderr])))
+    Ok(([output, error], PendingCaptures(vec![stdout, stderr])))
+}
+
+pub(super) fn prepare_stderr(
+    stdout: &Path,
+    stderr: &Path,
+) -> io::Result<(OwnedHandle, PendingCaptures)> {
+    // Keep a 0-byte stdout sentinel on disk while protocol traffic uses pipes.
+    drop(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(stdout)?,
+    );
+    let (error, stderr) = pending(stderr, "stderr")?;
+    Ok((error, PendingCaptures(vec![stderr])))
 }
 
 fn pending(path: &Path, label: &'static str) -> io::Result<(OwnedHandle, PendingCapture)> {
@@ -93,14 +110,17 @@ fn pending(path: &Path, label: &'static str) -> io::Result<(OwnedHandle, Pending
 
 impl PendingCaptures {
     pub(super) fn start(self, process: &OwnedHandle) -> io::Result<Captures> {
-        let [stdout, stderr] = self.0;
         // Finish fallible handle duplication before any reader thread exists.
-        let stdout_process = process.try_clone()?;
-        let stderr_process = process.try_clone()?;
-        Ok(Captures([
-            stdout.start(stdout_process),
-            stderr.start(stderr_process),
-        ]))
+        let mut paired = Vec::with_capacity(self.0.len());
+        for capture in self.0 {
+            paired.push((capture, process.try_clone()?));
+        }
+        Ok(Captures(
+            paired
+                .into_iter()
+                .map(|(capture, cloned)| capture.start(cloned))
+                .collect(),
+        ))
     }
 }
 
@@ -153,10 +173,14 @@ impl PendingCapture {
 
 impl Captures {
     pub(super) fn finished(&self) -> io::Result<bool> {
-        // Always visit both captures, even if the first is still draining.
-        let stdout = self.0[0].finished()?;
-        let stderr = self.0[1].finished()?;
-        Ok(stdout && stderr)
+        // Always visit every capture, even if an earlier one is still draining.
+        let mut all_finished = true;
+        for capture in &self.0 {
+            if !capture.finished()? {
+                all_finished = false;
+            }
+        }
+        Ok(all_finished)
     }
 
     pub(super) fn wait_until(&self, deadline: Instant) -> io::Result<bool> {
@@ -331,7 +355,7 @@ mod tests {
             let _signal = DoneSignal(done_worker);
             std::panic::resume_unwind(Box::new("synthetic capture panic"));
         });
-        let captures = Captures([
+        let captures = Captures(vec![
             Capture {
                 result: Arc::new(AtomicU8::new(PENDING)),
                 done,

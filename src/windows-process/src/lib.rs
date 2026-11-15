@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::fs::MetadataExt as _;
 use std::os::windows::io::AsSocket;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -798,6 +799,17 @@ pub enum SandboxNetwork {
     Offline,
 }
 
+/// Maximum aggregate private storage permitted across a contained worker's scratch
+/// directory and Windows-managed AppContainer storage folder (64 MiB).
+pub const MAX_WORKER_PRIVATE_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum filesystem entries permitted across a contained worker's scratch
+/// directory and Windows-managed AppContainer storage folder.
+pub const MAX_WORKER_PRIVATE_STORAGE_ENTRIES: usize = 1_024;
+
+const MAX_STORAGE_DEPTH: usize = 16;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
 /// Requires native PSEC 1.1, host-loopback ingress and security-environment creation.
 ///
 /// This never changes host ACLs, firewall settings or installed Windows features.
@@ -812,6 +824,18 @@ pub enum SandboxNetwork {
 pub fn native_sandbox_available() -> io::Result<()> {
     validate_sandbox_environment()?;
     native::sandbox_available()
+}
+
+/// Requires native PSEC 1.1 offline containment without host loopback or parent environment filtering.
+///
+/// Used by broker-pipe inference workers whose environment is constructed from a minimal
+/// six-variable whitelist and whose communication uses parent-owned anonymous pipes.
+///
+/// # Errors
+/// Returns `Unsupported` when the native contract is unavailable, or a native failure
+/// when the host cannot create an offline restricted security environment.
+pub fn native_sandbox_offline_available() -> io::Result<()> {
+    native::offline_sandbox_available()
 }
 
 /// Startup compiler/tool inputs with a child-only inherited-environment overlay.
@@ -990,6 +1014,33 @@ impl OwnedProcess {
         let command = command_line(&spec.executable, &spec.arguments)?;
         let (process, input, output) =
             native::NativeProcess::start_sandboxed_piped_minimal(spec, command, policy)?;
+        Ok((Self(process), input, output))
+    }
+
+    /// Starts an offline broker-pipe inference worker with minimal environment and bounded `stderr`.
+    ///
+    /// Returns the owned worker plus parent stdin writer and parent stdout reader pipes.
+    /// The worker enters an offline `AppContainer` (`SandboxNetwork::Offline`), inherits only
+    /// `stdin`, `stdout`, and a bounded parent-drained `stderr` capture (`spec.stderr`, 16 MiB)
+    /// while creating a 0-byte `spec.stdout` sentinel, and receives only the minimal
+    /// six-variable Windows environment (`SystemRoot`, `windir`, `SystemDrive`, `LOCALAPPDATA`,
+    /// `TEMP`, `TMP`). Before resuming the worker thread, native verification confirms
+    /// one-process Job membership, `Win32k` denial, `TokenIsAppContainer != 0`, and resolves the
+    /// OS AppContainer folder path for private-storage accounting alongside
+    /// `policy.writable_directory`.
+    ///
+    /// # Errors
+    /// Returns invalid launch/grant paths, reparse paths, overlapping read/write
+    /// grants, unavailable offline native PSEC support, AppContainer verification failure,
+    /// or failed native creation.
+    pub fn start_sandboxed_broker_pipe(
+        spec: &ProcessSpec,
+        policy: &SandboxPolicy,
+    ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
+        Self::validate_sandboxed(spec, std::iter::empty())?;
+        let command = command_line(&spec.executable, &spec.arguments)?;
+        let (process, input, output) =
+            native::NativeProcess::start_sandboxed_broker_pipe(spec, command, policy)?;
         Ok((Self(process), input, output))
     }
 
@@ -1217,6 +1268,169 @@ impl OwnedProcess {
     pub fn memory_usage(&self) -> io::Result<ProcessMemory> {
         self.0.memory_usage()
     }
+
+    /// Measures aggregate bytes and entries across this worker's private storage roots.
+    ///
+    /// Includes the configured `writable_directory` and, when present on a natively
+    /// contained worker, its kernel-resolved OS AppContainer storage folder. Traversal is
+    /// iterative, bounded to depth 16, and rejects reparse points without following links.
+    ///
+    /// # Errors
+    /// Rejects non-directory roots, reparse points, traversal exceeding depth 16, or
+    /// unexpected filesystem errors while scanning private storage.
+    pub fn private_storage_usage(&self) -> io::Result<(u64, usize)> {
+        measure_private_roots(self.0.private_roots(), u64::MAX, usize::MAX)
+    }
+
+    /// Checks this worker's private scratch and OS AppContainer storage against caps.
+    ///
+    /// Returns the observed `(bytes, entries)` pair when within `max_bytes` and
+    /// `max_entries`. Traversal is iterative, ignores missing roots as zero usage, and
+    /// fails closed on any reparse point or excessive directory nesting.
+    ///
+    /// # Errors
+    /// Rejects exceeded byte or entry caps (`InvalidData` / `FileTooLarge`), reparse
+    /// points, depth over 16, or non-directory roots.
+    pub fn check_private_storage_budget(
+        &self,
+        max_bytes: u64,
+        max_entries: usize,
+    ) -> io::Result<(u64, usize)> {
+        measure_private_roots(self.0.private_roots(), max_bytes, max_entries)
+    }
+}
+
+/// Checks an explicit list of private worker roots against byte and entry limits.
+///
+/// # Errors
+/// Rejects exceeded byte or entry caps (`InvalidInput`), reparse points
+/// (`PermissionDenied`), depth over 16, or non-directory roots.
+pub fn check_private_storage_roots(
+    roots: &[PathBuf],
+    max_bytes: u64,
+    max_entries: usize,
+) -> io::Result<(u64, usize)> {
+    measure_private_roots(roots, max_bytes, max_entries)
+}
+
+fn normalize_root_component(component: Component<'_>) -> Option<String> {
+    match component {
+        Component::Prefix(prefix) => {
+            Some(prefix.as_os_str().to_string_lossy().to_ascii_lowercase())
+        }
+        Component::RootDir => Some("\\".to_owned()),
+        Component::Normal(part) => Some(part.to_string_lossy().to_ascii_lowercase()),
+        Component::CurDir | Component::ParentDir => None,
+    }
+}
+
+fn lexical_root_contains(parent: &Path, child: &Path) -> bool {
+    let Some(parent_parts) = parent
+        .components()
+        .map(normalize_root_component)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Some(child_parts) = child
+        .components()
+        .map(normalize_root_component)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    child_parts.len() >= parent_parts.len() && child_parts[..parent_parts.len()] == parent_parts[..]
+}
+
+fn validate_non_reparse_dir(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+        Ok(meta) => {
+            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || !meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private storage root must be an ordinary non-reparse directory",
+                ));
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn deduplicated_roots(roots: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let mut active = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !validate_non_reparse_dir(root)? {
+            continue;
+        }
+        if active
+            .iter()
+            .any(|existing: &PathBuf| lexical_root_contains(existing, root))
+        {
+            continue;
+        }
+        active.retain(|existing| !lexical_root_contains(root, existing));
+        active.push(root.clone());
+    }
+    Ok(active)
+}
+
+fn measure_private_roots(
+    roots: &[PathBuf],
+    max_bytes: u64,
+    max_entries: usize,
+) -> io::Result<(u64, usize)> {
+    let scan_roots = deduplicated_roots(roots)?;
+    let mut total_bytes = 0_u64;
+    let mut total_entries = 0_usize;
+    let mut stack = Vec::new();
+    for root in scan_roots {
+        stack.push((root, 0_usize));
+        while let Some((dir, depth)) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for entry_result in entries {
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                let path = entry.path();
+                let meta = match std::fs::symlink_metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "private storage must not contain symbolic links or reparse points",
+                    ));
+                }
+                total_entries = total_entries
+                    .checked_add(1)
+                    .filter(|count| *count <= max_entries)
+                    .ok_or_else(|| invalid("private storage entry count exceeded budget"))?;
+                if meta.is_dir() {
+                    let next_depth = depth
+                        .checked_add(1)
+                        .filter(|value| *value <= MAX_STORAGE_DEPTH)
+                        .ok_or_else(|| invalid("private storage directory depth exceeded bound"))?;
+                    stack.push((path, next_depth));
+                } else {
+                    total_bytes = total_bytes
+                        .checked_add(meta.len())
+                        .filter(|bytes| *bytes <= max_bytes)
+                        .ok_or_else(|| invalid("private storage byte usage exceeded budget"))?;
+                }
+            }
+        }
+    }
+    Ok((total_bytes, total_entries))
 }
 
 fn validate_process(spec: &ProcessSpec) -> io::Result<()> {
@@ -1814,5 +2028,112 @@ fn sandbox_environment_classifies_credential_names_without_changing_environment(
         "PASSWORD_POLICY",
     ] {
         assert!(!credential_environment_name(OsStr::new(name)), "{name}");
+    }
+}
+
+#[cfg(test)]
+mod storage_budget_tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempTree(PathBuf);
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            if let Ok(entries) = fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Ok(meta) = fs::symlink_metadata(&path)
+                        && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    {
+                        let _ = fs::remove_dir(&path);
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_tree(label: &str) -> io::Result<TempTree> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "Bonsai-StorageBudget-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path)?;
+        Ok(TempTree(path))
+    }
+
+    #[test]
+    fn private_storage_budget_tracks_missing_nested_bytes_entries_depth_and_reparse()
+    -> io::Result<()> {
+        let missing = std::env::temp_dir().join("Bonsai-Nonexistent-Storage-Root-For-Budget-Test");
+        assert_eq!(measure_private_roots(&[missing], 1024, 16)?, (0, 0));
+
+        let tree = temp_tree("caps")?;
+        let root = &tree.0;
+        let nested = root.join("sub");
+        fs::create_dir(&nested)?;
+        fs::write(nested.join("a.bin"), vec![1_u8; 64])?;
+        // Duplicate or ancestor-contained roots must not double count entries or bytes.
+        assert_eq!(
+            measure_private_roots(&[root.clone(), nested.clone(), root.clone()], 128, 8)?,
+            (64, 2)
+        );
+
+        // Byte cap rejection
+        let err = measure_private_roots(std::slice::from_ref(root), 32, 8).err();
+        assert_eq!(
+            err.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput)
+        );
+
+        // Entry count rejection
+        let err = measure_private_roots(std::slice::from_ref(root), 1024, 1).err();
+        assert_eq!(
+            err.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput)
+        );
+
+        // Depth > MAX_STORAGE_DEPTH rejection
+        let deep = temp_tree("deep")?;
+        let mut cursor = deep.0.clone();
+        for level in 0..=MAX_STORAGE_DEPTH {
+            cursor = cursor.join(format!("d{level}"));
+            fs::create_dir(&cursor)?;
+        }
+        let err = measure_private_roots(std::slice::from_ref(&deep.0), 1024, 1024).err();
+        assert_eq!(
+            err.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput)
+        );
+
+        // Directory junction (reparse point) rejection without following into target
+        let target = temp_tree("target")?;
+        fs::write(target.0.join("secret.txt"), b"outside")?;
+        let junction_parent = temp_tree("junction")?;
+        let junction_path = junction_parent.0.join("link");
+        let comspec =
+            std::env::var_os("ComSpec").ok_or_else(|| io::Error::other("missing ComSpec"))?;
+        let status = Command::new(comspec)
+            .arg("/d")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction_path)
+            .arg(&target.0)
+            .status()?;
+        assert!(status.success(), "mklink /J failed in test fixture");
+        let err = measure_private_roots(std::slice::from_ref(&junction_parent.0), 1024, 16).err();
+        assert_eq!(
+            err.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+        Ok(())
     }
 }
