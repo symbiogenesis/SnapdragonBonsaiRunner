@@ -94,14 +94,13 @@ fn preflight(data: &Path, model: &Model) -> crate::Result<()> {
     }
     #[cfg(windows)]
     {
-        let partial = model.path.with_file_name(format!(
-            "{}.partial",
-            model
-                .path
-                .file_name()
-                .ok_or("Missing model filename.")?
-                .to_string_lossy()
-        ));
+        let mut partial_name = model
+            .path
+            .file_name()
+            .ok_or("Missing model filename.")?
+            .to_os_string();
+        partial_name.push(".partial");
+        let partial = model.path.with_file_name(partial_name);
         external(&partial)?;
         let downloaded = fs::symlink_metadata(&partial)
             .ok()

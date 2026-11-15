@@ -18,20 +18,20 @@ pub(super) enum Error {
 pub(super) fn machine(reader: &mut (impl Read + Seek), length: u64) -> Result<u16, Error> {
     let mut dos = [0; 64];
     reader.read_exact(&mut dos).map_err(Error::DosRead)?;
-    if &dos[..2] != b"MZ" {
+    let [b'M', b'Z', .., o0, o1, o2, o3] = dos else {
         return Err(Error::DosSignature);
-    }
-    let offset = u64::from(u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]));
+    };
+    let offset = u64::from(u32::from_le_bytes([o0, o1, o2, o3]));
     if offset < 64 || offset.checked_add(24).is_none_or(|end| end > length) {
         return Err(Error::Offset);
     }
     reader.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
     let mut pe = [0; 6];
     reader.read_exact(&mut pe).map_err(Error::Io)?;
-    if &pe[..4] != b"PE\0\0" {
+    let [b'P', b'E', 0, 0, m0, m1] = pe else {
         return Err(Error::PeSignature);
-    }
-    Ok(u16::from_le_bytes([pe[4], pe[5]]))
+    };
+    Ok(u16::from_le_bytes([m0, m1]))
 }
 
 #[cfg(test)]

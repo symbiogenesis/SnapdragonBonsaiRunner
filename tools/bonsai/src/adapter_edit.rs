@@ -124,12 +124,14 @@ fn prune(bytes: &[u8], numerator: usize, denominator: usize) -> Result<Pruned> {
     }
     let keep = (values.len() * numerator).div_ceil(denominator);
     let mut indices: Vec<_> = (0..values.len()).collect();
-    indices.sort_unstable_by(|&left, &right| {
-        values[right]
-            .abs()
-            .total_cmp(&values[left].abs())
-            .then_with(|| left.cmp(&right))
-    });
+    if keep > 0 && keep < indices.len() {
+        let _ = indices.select_nth_unstable_by(keep - 1, |&left, &right| {
+            values[right]
+                .abs()
+                .total_cmp(&values[left].abs())
+                .then_with(|| left.cmp(&right))
+        });
+    }
     let mut retained = vec![false; values.len()];
     for &index in &indices[..keep] {
         retained[index] = true;

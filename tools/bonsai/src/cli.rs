@@ -26,13 +26,7 @@ pub(crate) fn bounded_json_error(error: &serde_json::Error) -> String {
         error.line(),
         error.column()
     );
-    if message.len() > MAX_JSON_PARSE_ERROR_BYTES {
-        let mut end = MAX_JSON_PARSE_ERROR_BYTES;
-        while end > 0 && !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        message.truncate(end);
-    }
+    message.truncate(message.floor_char_boundary(MAX_JSON_PARSE_ERROR_BYTES));
     message
 }
 
