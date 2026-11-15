@@ -1223,9 +1223,6 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 ### Repin, CI and device qualification of landed screening controls
 
-- [ ] Refresh the local [push guard](tools/ci/README.md#local-push-guard) receipt
-  (`tools/ci/check_push_sanity.ps1 -Prepare` within its declared allowance) before
-  pushing outgoing tips, accounting for the `tools/source-sanity` analyzer update.
 - [ ] Publish a Foundation release bundle from reviewed `prism-inference` `main`
   (`0.1.29` working tree, including `129fae8..c0893f8`) and repin Runner past
   `Prism 0.1.28` under the [distribution guide](docs/releases.md) so installed and
