@@ -355,7 +355,7 @@ pub(super) fn decoder(
     let index = read_index(source, length, cancel)?;
     model::validate(&index)?;
     check_cancel(cancel)?;
-    decoder::load(index, source, precision, cancel)
+    decoder::load(&index, source, precision, cancel)
 }
 
 pub(super) fn encoder(
@@ -366,7 +366,7 @@ pub(super) fn encoder(
     let index = read_index(source, length, cancel)?;
     model::validate(&index)?;
     check_cancel(cancel)?;
-    encoder::load(index, source, cancel)
+    encoder::load(&index, source, cancel)
 }
 
 pub(super) fn tokenizer(
@@ -377,6 +377,36 @@ pub(super) fn tokenizer(
     let mut index = read_index(source, length, cancel)?;
     model::validate(&index)?;
     check_cancel(cancel)?;
+    load_tokenizer(&mut index, cancel)
+}
+
+pub(super) fn load_artifacts(
+    source: &mut (impl Read + Seek),
+    length: u64,
+    precision: crate::decoder::CachePrecision,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<(
+    crate::tokenizer::Tokenizer,
+    crate::protocol::PromptTokens,
+    crate::encoder::Encoder,
+    crate::frontend::Frontend,
+    crate::decoder::Model,
+)> {
+    let mut index = read_index(source, length, cancel)?;
+    model::validate(&index)?;
+    check_cancel(cancel)?;
+    let (tokenizer, prompt_tokens) = load_tokenizer(&mut index, cancel)?;
+    check_cancel(cancel)?;
+    let (encoder, frontend) = encoder::load(&index, source, cancel)?;
+    check_cancel(cancel)?;
+    let decoder = decoder::load(&index, source, precision, cancel)?;
+    Ok((tokenizer, prompt_tokens, encoder, frontend, decoder))
+}
+
+fn load_tokenizer(
+    index: &mut Index,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<(crate::tokenizer::Tokenizer, crate::protocol::PromptTokens)> {
     if let Some(Value::Text(pre)) = index.metadata.get("tokenizer.ggml.pre")
         && !matches!(pre.as_str(), "" | "qwen2")
     {
@@ -399,7 +429,7 @@ pub(super) fn tokenizer(
         u32::try_from(eos).map_err(|_| invalid())?,
     )?;
     check_cancel(cancel)?;
-    let prompt = model::prompt_tokens(&index, &tokenizer)?;
+    let prompt = model::prompt_tokens(index, &tokenizer)?;
     Ok((tokenizer, prompt))
 }
 

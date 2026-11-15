@@ -221,8 +221,8 @@ Additional client/speech cancellation and parsing source controls (screening ite
   validates finite non-negative `temperature` and finite logits before greedy or `top_p_mask`
   sorting, fixes `greedy_argmax -> Option<usize>` on empty/`NaN`/`+inf`/all-`-inf` vectors,
   applies `repetition_penalty` before the `temperature == 0.0` greedy shortcut, and scales
-  shifted logits in `f64`; `gguf.rs` and `weights.rs` enforce `TYPE_BOOL <= 1`, valid
-  UTF-8 with no interior NUL bytes, reject signed `INT32` for `general.alignment` while
+  shifted logits in `f64`; `weights.rs` enforces `TYPE_BOOL <= 1`, valid
+  UTF-8 with no interior NUL bytes, positive `INT32` or `UINT32` `general.alignment` while
   requiring power-of-two alignment `<= 1_048_576`, duplicate key/tensor rejection, positive
   dimensions and checked extents; `tokenizer/scanner.rs` advances and backs up across
   multibyte Unicode whitespace (`\u{00A0}`, `\u{2000}`, `\u{3000}`) on full UTF-8 scalar

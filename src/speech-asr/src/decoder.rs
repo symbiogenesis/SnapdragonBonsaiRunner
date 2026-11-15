@@ -48,11 +48,7 @@ fn zeros(count: usize) -> io::Result<Vec<f32>> {
 }
 
 fn finite(values: &[f32]) -> io::Result<()> {
-    if values.iter().all(|value| value.is_finite()) {
-        Ok(())
-    } else {
-        Err(invalid())
-    }
+    packed::ensure_finite(values, invalid)
 }
 
 /// GGUF row-major F32 or `Q8_0` projection, retaining compressed Q8 weights.
@@ -1036,13 +1032,8 @@ fn norm_weights(weights: &[f32], width: usize) -> io::Result<()> {
     finite(weights)
 }
 
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    reason = "Admitted decoder dimensions and positions are at most 65,536 and exactly representable in f32."
-)]
 const fn scalar(value: usize) -> f32 {
-    value as f32
+    packed::scalar_f32(value)
 }
 
 fn rms_into(input: &[f32], weights: &[f32], epsilon: f32, output: &mut [f32]) -> io::Result<()> {
@@ -1085,13 +1076,7 @@ fn add_residual_batch(
     workers: usize,
     width: usize,
 ) -> io::Result<()> {
-    row_workers::try_run_aligned(dst, workers, width, &|elem_off, dst_slice| {
-        let end = elem_off + dst_slice.len();
-        for (out, &delta) in dst_slice.iter_mut().zip(&add[elem_off..end]) {
-            *out += delta;
-        }
-        finite(dst_slice)
-    })
+    packed::add_residual_batch(dst, add, workers, width, invalid)
 }
 
 fn normalize_heads(values: &mut [f32], weights: &[f32], c: Config) -> io::Result<()> {
@@ -1222,73 +1207,20 @@ fn attend_head_causal(
     scores: &mut [f32],
     out_head: &mut [f32],
 ) -> io::Result<()> {
-    let full_quads = history_rows / 4;
-    for quad in 0..full_quads {
-        let r = quad * 4;
-        let k0 = &state_keys[r * kv_width + offset..r * kv_width + offset + head_dim];
-        let k1 = &state_keys[(r + 1) * kv_width + offset..(r + 1) * kv_width + offset + head_dim];
-        let k2 = &state_keys[(r + 2) * kv_width + offset..(r + 2) * kv_width + offset + head_dim];
-        let k3 = &state_keys[(r + 3) * kv_width + offset..(r + 3) * kv_width + offset + head_dim];
-        scores[r..r + 4].copy_from_slice(&packed::dot_4keys_seq(q_head, [k0, k1, k2, k3], divisor));
-    }
-    for (row, score) in scores
-        .iter_mut()
-        .enumerate()
-        .take(history_rows)
-        .skip(full_quads * 4)
-    {
-        let k = &state_keys[row * kv_width + offset..row * kv_width + offset + head_dim];
-        let mut dot = 0.0_f32;
-        for (q_elem, k_elem) in q_head.iter().zip(k) {
-            dot += *q_elem * *k_elem;
-        }
-        *score = dot / divisor;
-    }
-    if let Some(k) = cur_key {
-        let mut dot = 0.0_f32;
-        for (q_elem, k_elem) in q_head.iter().zip(k) {
-            dot += *q_elem * *k_elem;
-        }
-        scores[history_rows] = dot / divisor;
-    }
-    finite(scores)?;
-    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
-    for score in &mut *scores {
-        *score = (*score - maximum).exp();
-        sum += *score;
-    }
-    if !sum.is_finite() || sum <= 0.0 {
-        return Err(invalid());
-    }
-    out_head.fill(0.0);
-    for quad in 0..full_quads {
-        let r = quad * 4;
-        let v0 = &state_values[r * kv_width + offset..r * kv_width + offset + head_dim];
-        let v1 = &state_values[(r + 1) * kv_width + offset..(r + 1) * kv_width + offset + head_dim];
-        let v2 = &state_values[(r + 2) * kv_width + offset..(r + 2) * kv_width + offset + head_dim];
-        let v3 = &state_values[(r + 3) * kv_width + offset..(r + 3) * kv_width + offset + head_dim];
-        let weights = [
-            scores[r] / sum,
-            scores[r + 1] / sum,
-            scores[r + 2] / sum,
-            scores[r + 3] / sum,
-        ];
-        packed::weighted_value_accum_4(out_head, [v0, v1, v2, v3], weights);
-    }
-    for (row, &score) in scores
-        .iter()
-        .enumerate()
-        .take(history_rows)
-        .skip(full_quads * 4)
-    {
-        let v = &state_values[row * kv_width + offset..row * kv_width + offset + head_dim];
-        packed::weighted_value_accum(out_head, v, score / sum);
-    }
-    if let Some(v) = cur_val {
-        packed::weighted_value_accum(out_head, v, scores[history_rows] / sum);
-    }
-    Ok(())
+    packed::attend_head(
+        q_head,
+        state_keys,
+        state_values,
+        history_rows,
+        kv_width,
+        offset,
+        head_dim,
+        divisor,
+        cur_key.zip(cur_val),
+        scores,
+        out_head,
+        invalid,
+    )
 }
 
 #[expect(

@@ -59,7 +59,13 @@ pub(super) struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// Load bounded pinned tokenizer tables from an already opened GGUF.
+    pub(super) fn from_weights(weights: &crate::weights::Weights) -> io::Result<Self> {
+        loading::from_weights(weights)
+    }
+
     /// Load bounded pinned tokenizer tables without a native metadata API.
+    #[cfg(test)]
     pub(super) fn load(path: &std::path::Path) -> io::Result<Self> {
         loading::load(path)
     }

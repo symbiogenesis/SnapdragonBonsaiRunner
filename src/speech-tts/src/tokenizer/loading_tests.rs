@@ -7,7 +7,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
-use crate::gguf::invalid;
+use crate::weights::invalid;
 
 use super::{MERGES, Metadata, SPECIAL_KEYS, TOKENS, Tokenizer, candidate, tables};
 

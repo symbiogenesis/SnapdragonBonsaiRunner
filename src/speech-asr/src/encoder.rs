@@ -29,11 +29,7 @@ fn invalid() -> io::Error {
     )
 }
 fn finite(values: &[f32]) -> io::Result<()> {
-    if values.iter().all(|value| value.is_finite()) {
-        Ok(())
-    } else {
-        Err(invalid())
-    }
+    packed::ensure_finite(values, invalid)
 }
 fn check(cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
     if cancel() {
@@ -51,13 +47,8 @@ fn zeros(count: usize) -> io::Result<Vec<f32>> {
     values.resize(count, 0.0);
     Ok(values)
 }
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    reason = "All admitted encoder dimensions and positions are bounded by 65,536 and exactly representable as f32."
-)]
 const fn scalar(value: usize) -> f32 {
-    value as f32
+    packed::scalar_f32(value)
 }
 
 /// A biased row-major linear projection.
@@ -616,13 +607,7 @@ fn add_residual_batch(
     workers: usize,
     width: usize,
 ) -> io::Result<()> {
-    row_workers::try_run_aligned(dst, workers, width, &|elem_off, slice| {
-        let end = elem_off + slice.len();
-        for (out, &delta) in slice.iter_mut().zip(&add[elem_off..end]) {
-            *out += delta;
-        }
-        finite(slice)
-    })
+    packed::add_residual_batch(dst, add, workers, width, invalid)
 }
 
 #[allow(
@@ -788,63 +773,10 @@ fn attention_head_bidirectional(
     scores: &mut [f32],
     out_head: &mut [f32],
 ) -> io::Result<()> {
-    let full_quads = num_rows / 4;
-    for quad in 0..full_quads {
-        let r = quad * 4;
-        let k0 = &keys[r * row_width + offset..r * row_width + offset + head_dim];
-        let k1 = &keys[(r + 1) * row_width + offset..(r + 1) * row_width + offset + head_dim];
-        let k2 = &keys[(r + 2) * row_width + offset..(r + 2) * row_width + offset + head_dim];
-        let k3 = &keys[(r + 3) * row_width + offset..(r + 3) * row_width + offset + head_dim];
-        scores[r..r + 4].copy_from_slice(&packed::dot_4keys_seq(q_head, [k0, k1, k2, k3], divisor));
-    }
-    for (row, score) in scores
-        .iter_mut()
-        .enumerate()
-        .take(num_rows)
-        .skip(full_quads * 4)
-    {
-        let k = &keys[row * row_width + offset..row * row_width + offset + head_dim];
-        let mut dot = 0.0_f32;
-        for (q_val, k_val) in q_head.iter().zip(k) {
-            dot += *q_val * *k_val;
-        }
-        *score = dot / divisor;
-    }
-    finite(scores)?;
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut denominator = 0.0;
-    for score in &mut *scores {
-        *score = (*score - max).exp();
-        denominator += *score;
-    }
-    if denominator <= 0.0 || !denominator.is_finite() {
-        return Err(invalid());
-    }
-    out_head.fill(0.0);
-    for quad in 0..full_quads {
-        let r = quad * 4;
-        let v0 = &values[r * row_width + offset..r * row_width + offset + head_dim];
-        let v1 = &values[(r + 1) * row_width + offset..(r + 1) * row_width + offset + head_dim];
-        let v2 = &values[(r + 2) * row_width + offset..(r + 2) * row_width + offset + head_dim];
-        let v3 = &values[(r + 3) * row_width + offset..(r + 3) * row_width + offset + head_dim];
-        let weights = [
-            scores[r] / denominator,
-            scores[r + 1] / denominator,
-            scores[r + 2] / denominator,
-            scores[r + 3] / denominator,
-        ];
-        packed::weighted_value_accum_4(out_head, [v0, v1, v2, v3], weights);
-    }
-    for (row, &score) in scores
-        .iter()
-        .enumerate()
-        .take(num_rows)
-        .skip(full_quads * 4)
-    {
-        let v = &values[row * row_width + offset..row * row_width + offset + head_dim];
-        packed::weighted_value_accum(out_head, v, score / denominator);
-    }
-    Ok(())
+    packed::attend_head(
+        q_head, keys, values, num_rows, row_width, offset, head_dim, divisor, None, scores,
+        out_head, invalid,
+    )
 }
 
 #[cfg(test)]

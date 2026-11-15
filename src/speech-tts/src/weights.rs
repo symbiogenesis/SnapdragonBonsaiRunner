@@ -16,16 +16,14 @@ use std::{
     path::Path,
 };
 
-use crate::{
-    engine::{LinearProjection, WeightQuantization},
-    gguf::{read_u32, read_u64},
-};
+use crate::engine::{LinearProjection, WeightQuantization};
 
 const MAX_ITEMS: u64 = 131_072;
 const MAX_METADATA_BYTES: usize = 128 * 1024 * 1024;
+const MAX_RETAINED_STRING_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-fn invalid() -> io::Error {
+pub(crate) fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         "Invalid or unsupported speech GGUF weights.",
@@ -39,6 +37,7 @@ enum Metadata {
     F32(f32),
     String(String),
     U32Array(Vec<u32>),
+    StringArray(Vec<Box<[u8]>>),
     Other,
 }
 
@@ -110,14 +109,34 @@ fn skip(reader: &mut (impl Read + Seek), bytes: u64, length: u64) -> io::Result<
     Ok(())
 }
 
+fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
+    let mut bytes = [0_u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
+    let mut bytes = [0_u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 fn scalar_width(kind: u32) -> io::Result<u64> {
-    crate::gguf::scalar_width(kind).ok_or_else(invalid)
+    match kind {
+        0 | 1 | 7 => Ok(1),
+        2 | 3 => Ok(2),
+        4 | 5 | 6 => Ok(4),
+        10..=12 => Ok(8),
+        _ => Err(invalid()),
+    }
 }
 
 fn metadata_value(
     reader: &mut (impl Read + Seek),
     length: u64,
     budget: &mut usize,
+    retained_bytes: &mut usize,
+    retain_strings: bool,
 ) -> io::Result<Metadata> {
     Ok(match read_u32(reader)? {
         4 => Metadata::U32(read_u32(reader)?),
@@ -164,15 +183,37 @@ fn metadata_value(
                 validate_bool_bytes(reader, count)?;
                 Metadata::Other
             } else if kind == 8 {
-                // These are predominantly tokenizer tokens and merge rules.
-                // Validate every byte without allocating a new String for each
-                // discarded entry; the tokenizer loads its own bounded tables.
-                let mut scratch = Vec::new();
-                for _ in 0..count {
-                    text_bytes(reader, budget, 16 * 1024 * 1024, &mut scratch)?;
-                    let _ = std::str::from_utf8(&scratch).map_err(|_| invalid())?;
+                if retain_strings {
+                    let count = usize::try_from(count).map_err(|_| invalid())?;
+                    let remaining = length.saturating_sub(reader.stream_position()?);
+                    if count.checked_mul(8).is_none_or(|min_bytes| {
+                        u64::try_from(min_bytes).unwrap_or(u64::MAX) > remaining
+                    }) {
+                        return Err(invalid());
+                    }
+                    let mut values = Vec::new();
+                    values.try_reserve_exact(count).map_err(|_| invalid())?;
+                    for _ in 0..count {
+                        let mut item = Vec::new();
+                        text_bytes(reader, budget, 16 * 1024 * 1024, &mut item)?;
+                        let _ = std::str::from_utf8(&item).map_err(|_| invalid())?;
+                        *retained_bytes = retained_bytes
+                            .checked_add(item.len())
+                            .filter(|&total| total <= MAX_RETAINED_STRING_BYTES)
+                            .ok_or_else(invalid)?;
+                        values.push(item.into_boxed_slice());
+                    }
+                    Metadata::StringArray(values)
+                } else {
+                    // Validate discarded string arrays without allocating a String
+                    // per entry; only tokenizer token and merge arrays are retained.
+                    let mut scratch = Vec::new();
+                    for _ in 0..count {
+                        text_bytes(reader, budget, 16 * 1024 * 1024, &mut scratch)?;
+                        let _ = std::str::from_utf8(&scratch).map_err(|_| invalid())?;
+                    }
+                    Metadata::Other
                 }
-                Metadata::Other
             } else {
                 skip(
                     reader,
@@ -189,8 +230,71 @@ fn metadata_value(
     })
 }
 
+fn read_header(
+    reader: &mut (impl Read + Seek),
+    length: u64,
+    allow_zero_tensors: bool,
+) -> io::Result<(BTreeMap<String, Metadata>, u64, u64, usize)> {
+    let mut magic = [0; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != b"GGUF" || !matches!(read_u32(reader)?, 2 | 3) {
+        return Err(invalid());
+    }
+    let tensor_count = read_u64(reader)?;
+    let metadata_count = read_u64(reader)?;
+    if (!allow_zero_tensors && tensor_count == 0)
+        || tensor_count > MAX_ITEMS
+        || metadata_count > MAX_ITEMS
+    {
+        return Err(invalid());
+    }
+    let mut budget = MAX_METADATA_BYTES;
+    let mut retained_bytes = 0_usize;
+    let mut metadata = BTreeMap::new();
+    for _ in 0..metadata_count {
+        let key = text(reader, &mut budget, 65_536)?;
+        if key.is_empty() || key.contains('\0') || metadata.contains_key(&key) {
+            return Err(invalid());
+        }
+        let retain_strings = matches!(
+            key.as_str(),
+            "tokenizer.ggml.tokens" | "tokenizer.ggml.merges"
+        );
+        let value = metadata_value(
+            reader,
+            length,
+            &mut budget,
+            &mut retained_bytes,
+            retain_strings,
+        )?;
+        metadata.insert(key, value);
+    }
+    let alignment = match metadata.get("general.alignment") {
+        None => 32,
+        Some(Metadata::U32(value)) if value.is_power_of_two() && *value <= 1_048_576 => {
+            u64::from(*value)
+        }
+        Some(Metadata::I32(value))
+            if *value > 0 && value.unsigned_abs().is_power_of_two() && *value <= 1_048_576 =>
+        {
+            u64::from(value.unsigned_abs())
+        }
+        _ => return Err(invalid()),
+    };
+    Ok((metadata, tensor_count, alignment, budget))
+}
+
 impl Weights {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_policy(path, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_metadata(path: &Path) -> io::Result<Self> {
+        Self::open_with_policy(path, true)
+    }
+
+    fn open_with_policy(path: &Path, allow_zero_tensors: bool) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid());
         }
@@ -214,37 +318,13 @@ impl Weights {
                 return Err(invalid());
             }
         }
-        Self::read(file, properties.len())
+        Self::read(file, properties.len(), allow_zero_tensors)
     }
 
-    fn read(file: File, length: u64) -> io::Result<Self> {
+    fn read(file: File, length: u64, allow_zero_tensors: bool) -> io::Result<Self> {
         let mut reader = BufReader::with_capacity(256 * 1024, file);
-        let mut magic = [0; 4];
-        reader.read_exact(&mut magic)?;
-        if &magic != b"GGUF" || !matches!(read_u32(&mut reader)?, 2 | 3) {
-            return Err(invalid());
-        }
-        let tensor_count = read_u64(&mut reader)?;
-        let metadata_count = read_u64(&mut reader)?;
-        if tensor_count == 0 || tensor_count > MAX_ITEMS || metadata_count > MAX_ITEMS {
-            return Err(invalid());
-        }
-        let mut budget = MAX_METADATA_BYTES;
-        let mut metadata = BTreeMap::new();
-        for _ in 0..metadata_count {
-            let key = text(&mut reader, &mut budget, 65_536)?;
-            if key.is_empty() || key.contains('\0') || metadata.contains_key(&key) {
-                return Err(invalid());
-            }
-            metadata.insert(key, metadata_value(&mut reader, length, &mut budget)?);
-        }
-        let alignment = match metadata.get("general.alignment") {
-            None => 32,
-            Some(Metadata::U32(value)) if value.is_power_of_two() && *value <= 1_048_576 => {
-                u64::from(*value)
-            }
-            _ => return Err(invalid()),
-        };
+        let (metadata, tensor_count, alignment, mut budget) =
+            read_header(&mut reader, length, allow_zero_tensors)?;
         let mut tensors = BTreeMap::new();
         for _ in 0..tensor_count {
             let name = text(&mut reader, &mut budget, 65_536)?;
@@ -283,34 +363,47 @@ impl Weights {
                 },
             );
         }
-        let position = reader.stream_position()?;
-        let data = position
-            .checked_next_multiple_of(alignment)
-            .ok_or_else(invalid)?;
-        if data > length {
-            return Err(invalid());
-        }
-        let mut ranges = Vec::with_capacity(tensors.len());
-        for tensor in tensors.values_mut() {
-            tensor.offset = data.checked_add(tensor.offset).ok_or_else(invalid)?;
-            let end = tensor
-                .offset
-                .checked_add(u64::try_from(tensor.bytes).map_err(|_| invalid())?)
+        if !tensors.is_empty() {
+            let position = reader.stream_position()?;
+            let data = position
+                .checked_next_multiple_of(alignment)
                 .ok_or_else(invalid)?;
-            if tensor.offset < data || end > length {
+            if data > length {
                 return Err(invalid());
             }
-            ranges.push((tensor.offset, end));
-        }
-        ranges.sort_unstable();
-        if ranges.array_windows().any(|[left, right]| left.1 > right.0) {
-            return Err(invalid());
+            let mut ranges = Vec::with_capacity(tensors.len());
+            for tensor in tensors.values_mut() {
+                tensor.offset = data.checked_add(tensor.offset).ok_or_else(invalid)?;
+                let end = tensor
+                    .offset
+                    .checked_add(u64::try_from(tensor.bytes).map_err(|_| invalid())?)
+                    .ok_or_else(invalid)?;
+                if tensor.offset < data || end > length {
+                    return Err(invalid());
+                }
+                ranges.push((tensor.offset, end));
+            }
+            ranges.sort_unstable();
+            if ranges.array_windows().any(|[left, right]| left.1 > right.0) {
+                return Err(invalid());
+            }
         }
         Ok(Self {
             file: reader.into_inner(),
             metadata,
             tensors,
         })
+    }
+
+    pub(crate) fn metadata_contains(&self, key: &str) -> bool {
+        self.metadata.contains_key(key)
+    }
+
+    pub(crate) fn string_array(&self, key: &str) -> io::Result<&[Box<[u8]>]> {
+        match self.metadata.get(key) {
+            Some(Metadata::StringArray(values)) => Ok(values.as_slice()),
+            _ => Err(invalid()),
+        }
     }
 
     pub(crate) fn u32(&self, key: &str) -> io::Result<u32> {
@@ -595,11 +688,24 @@ mod tests {
         }
         let length = u64::try_from(bytes.len()).map_err(|_| invalid())?;
         let mut budget = MAX_METADATA_BYTES;
-        let value = metadata_value(&mut io::Cursor::new(&bytes), length, &mut budget)?;
+        let mut retained = 0;
+        let value = metadata_value(
+            &mut io::Cursor::new(&bytes),
+            length,
+            &mut budget,
+            &mut retained,
+            false,
+        )?;
         assert!(matches!(value, Metadata::U32Array(values) if values == [8,5,4,3]));
         bytes[16..20].copy_from_slice(&(-1_i32).to_le_bytes());
         assert!(matches!(
-            metadata_value(&mut io::Cursor::new(bytes), length, &mut budget)?,
+            metadata_value(
+                &mut io::Cursor::new(bytes),
+                length,
+                &mut budget,
+                &mut retained,
+                false,
+            )?,
             Metadata::Other
         ));
         Ok(())
@@ -623,19 +729,37 @@ mod tests {
         let length = u64::try_from(bytes.len()).map_err(|_| invalid())?;
         let required: usize = strings.iter().map(|spelling| spelling.len()).sum();
         let mut budget = required;
+        let mut retained = 0;
         assert!(matches!(
-            metadata_value(&mut io::Cursor::new(&bytes), length, &mut budget)?,
+            metadata_value(
+                &mut io::Cursor::new(&bytes),
+                length,
+                &mut budget,
+                &mut retained,
+                false,
+            )?,
             Metadata::Other
         ));
         assert_eq!(budget, 0);
         budget = required - 1;
-        assert!(metadata_value(&mut io::Cursor::new(&bytes), length, &mut budget).is_err());
+        assert!(
+            metadata_value(
+                &mut io::Cursor::new(&bytes),
+                length,
+                &mut budget,
+                &mut retained,
+                false,
+            )
+            .is_err()
+        );
         budget = required;
         assert!(
             metadata_value(
                 &mut io::Cursor::new(&bytes[..bytes.len() - 1]),
                 length - 1,
                 &mut budget,
+                &mut retained,
+                false,
             )
             .is_err()
         );
@@ -643,7 +767,16 @@ mod tests {
         let unicode = 16 + 8 + strings[0].len() + 8;
         bytes[unicode] = 0xff;
         budget = required;
-        assert!(metadata_value(&mut io::Cursor::new(bytes), length, &mut budget).is_err());
+        assert!(
+            metadata_value(
+                &mut io::Cursor::new(bytes),
+                length,
+                &mut budget,
+                &mut retained,
+                false,
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -860,10 +993,16 @@ mod tests {
         let nul_str_file = single_tensor_gguf(&[(b"s", 8, &nul_str)], 32, 0)?;
         assert!(Weights::open(&nul_str_file.0).is_err());
 
-        // Signed INT32 general.alignment rejected even when positive.
-        let signed_align =
+        // Positive power-of-two INT32 general.alignment accepted; non-positive, non-power-of-two,
+        // and > 1_048_576 rejected.
+        let positive_i32_align =
             single_tensor_gguf(&[(b"general.alignment", 5, &32_i32.to_le_bytes())], 32, 0)?;
-        assert!(Weights::open(&signed_align.0).is_err());
+        assert!(Weights::open(&positive_i32_align.0).is_ok());
+        for bad_i32 in [0_i32, -32, 3, 2_097_152] {
+            let file =
+                single_tensor_gguf(&[(b"general.alignment", 5, &bad_i32.to_le_bytes())], 32, 0)?;
+            assert!(Weights::open(&file.0).is_err());
+        }
 
         // Non-power-of-two and > 1_048_576 general.alignment rejected; 1_048_576 accepted.
         for bad_align in [0_u32, 3, 2_097_152] {
@@ -892,5 +1031,131 @@ mod tests {
         )?;
         assert!(Weights::open(&dup_key.0).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn retains_tokenizer_string_arrays_and_requires_tensors_for_weights_open() -> io::Result<()> {
+        let mut str_arr = Vec::new();
+        str_arr.extend(8_u32.to_le_bytes());
+        str_arr.extend(2_u64.to_le_bytes());
+        push_kv_str(&mut str_arr, b"alpha")?;
+        push_kv_str(&mut str_arr, b"beta")?;
+
+        let mut other_arr = Vec::new();
+        other_arr.extend(8_u32.to_le_bytes());
+        other_arr.extend(1_u64.to_le_bytes());
+        push_kv_str(&mut other_arr, b"ignored")?;
+
+        let file = single_tensor_gguf(
+            &[
+                (b"tokenizer.ggml.tokens", 9, &str_arr),
+                (b"tokenizer.ggml.merges", 9, &str_arr),
+                (b"other.strings", 9, &other_arr),
+            ],
+            32,
+            0,
+        )?;
+        let weights = Weights::open(&file.0)?;
+        assert_eq!(
+            weights.string_array("tokenizer.ggml.tokens")?,
+            [b"alpha".as_slice().into(), b"beta".as_slice().into()]
+        );
+        assert_eq!(
+            weights.string_array("tokenizer.ggml.merges")?,
+            [b"alpha".as_slice().into(), b"beta".as_slice().into()]
+        );
+        assert!(weights.string_array("other.strings").is_err());
+
+        let zero_tensor = {
+            let mut bytes = b"GGUF".to_vec();
+            bytes.extend(3_u32.to_le_bytes());
+            bytes.extend(0_u64.to_le_bytes());
+            bytes.extend(0_u64.to_le_bytes());
+            write_raw_gguf(&bytes)?
+        };
+        assert!(Weights::open(&zero_tensor.0).is_err());
+        assert!(Weights::open_metadata(&zero_tensor.0).is_ok());
+        Ok(())
+    }
+
+    fn gguf_header(kv_count: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(b"GGUF");
+        out.extend(3_u32.to_le_bytes());
+        out.extend(0_u64.to_le_bytes());
+        out.extend(kv_count.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn rejects_invalid_bool_scalar_and_bool_array() {
+        let mut valid = gguf_header(2);
+        let _ = push_kv_str(&mut valid, b"flag");
+        valid.extend(7_u32.to_le_bytes());
+        valid.push(1);
+        let _ = push_kv_str(&mut valid, b"flags");
+        valid.extend(9_u32.to_le_bytes());
+        valid.extend(7_u32.to_le_bytes());
+        valid.extend(2_u64.to_le_bytes());
+        valid.extend([0_u8, 1_u8]);
+        let len = u64::try_from(valid.len()).unwrap_or(u64::MAX);
+        assert!(read_header(&mut io::Cursor::new(&valid), len, true).is_ok());
+
+        let mut bad_scalar = gguf_header(1);
+        let _ = push_kv_str(&mut bad_scalar, b"flag");
+        bad_scalar.extend(7_u32.to_le_bytes());
+        bad_scalar.push(2);
+        let len = u64::try_from(bad_scalar.len()).unwrap_or(u64::MAX);
+        assert!(read_header(&mut io::Cursor::new(&bad_scalar), len, true).is_err());
+
+        let mut bad_array = gguf_header(1);
+        let _ = push_kv_str(&mut bad_array, b"flags");
+        bad_array.extend(9_u32.to_le_bytes());
+        bad_array.extend(7_u32.to_le_bytes());
+        bad_array.extend(2_u64.to_le_bytes());
+        bad_array.extend([0_u8, 255_u8]);
+        let len = u64::try_from(bad_array.len()).unwrap_or(u64::MAX);
+        assert!(read_header(&mut io::Cursor::new(&bad_array), len, true).is_err());
+    }
+
+    #[test]
+    fn rejects_non_utf8_embedded_nul_strings_and_duplicate_keys() {
+        let mut dup = gguf_header(2);
+        for val in [1_u32, 2_u32] {
+            let _ = push_kv_str(&mut dup, b"k");
+            dup.extend(4_u32.to_le_bytes());
+            dup.extend(val.to_le_bytes());
+        }
+        let len = u64::try_from(dup.len()).unwrap_or(u64::MAX);
+        assert!(read_header(&mut io::Cursor::new(&dup), len, true).is_err());
+
+        for bad_key in [b"\xff".as_slice(), b"a\0b".as_slice()] {
+            let mut data = gguf_header(1);
+            let _ = push_kv_str(&mut data, bad_key);
+            data.extend(4_u32.to_le_bytes());
+            data.extend(1_u32.to_le_bytes());
+            let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            assert!(read_header(&mut io::Cursor::new(&data), len, true).is_err());
+        }
+
+        for bad_val in [b"\xfe\xff".as_slice(), b"ok\0tail".as_slice()] {
+            let mut data = gguf_header(1);
+            let _ = push_kv_str(&mut data, b"s");
+            data.extend(8_u32.to_le_bytes());
+            let _ = push_kv_str(&mut data, bad_val);
+            let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            assert!(read_header(&mut io::Cursor::new(&data), len, true).is_err());
+        }
+
+        for bad_elem in [b"\x80".as_slice(), b"tok\0suffix".as_slice()] {
+            let mut data = gguf_header(1);
+            let _ = push_kv_str(&mut data, b"tokens");
+            data.extend(9_u32.to_le_bytes());
+            data.extend(8_u32.to_le_bytes());
+            data.extend(1_u64.to_le_bytes());
+            let _ = push_kv_str(&mut data, bad_elem);
+            let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            assert!(read_header(&mut io::Cursor::new(&data), len, true).is_err());
+        }
     }
 }

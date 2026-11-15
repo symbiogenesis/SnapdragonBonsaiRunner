@@ -57,11 +57,10 @@ fn next_length(text: &str) -> usize {
         && !whitespace(next)
         && !letter(next)
         && !number(next)
-        && flags(first) & 0xff != 0
     {
         let mut end = punctuation_start;
         for ch in text[punctuation_start..].chars() {
-            if whitespace(ch) || letter(ch) || number(ch) || flags(ch).trailing_zeros() >= 8 {
+            if whitespace(ch) || letter(ch) || number(ch) {
                 break;
             }
             end += ch.len_utf8();

@@ -1,44 +1,42 @@
 //! Decode admitted source-bound tensor ranges into the independent Rust decoder.
 
-use super::{Index, Value, invalid};
+use super::{Index, invalid};
 use crate::decoder::{Block, CachePrecision, Config, Model, Projection};
 use std::io::{self, Read, Seek, SeekFrom};
 
 pub(super) struct Loader<'a, R> {
-    pub(super) index: Index,
+    pub(super) index: &'a Index,
     pub(super) source: &'a mut R,
     pub(super) remaining: u64,
 }
 
-impl<R: Read + Seek> Loader<'_, R> {
-    fn count(&self, suffix: &str) -> io::Result<usize> {
-        match self
-            .index
-            .metadata
-            .get(&format!("stt.qwen3_asr.decoder.{suffix}"))
-        {
-            Some(Value::Integer { value, .. }) => usize::try_from(*value).map_err(|_| invalid()),
-            _ => Err(invalid()),
+impl<'a, R: Read + Seek> Loader<'a, R> {
+    pub(super) const fn new(index: &'a Index, source: &'a mut R) -> Self {
+        Self {
+            index,
+            source,
+            remaining: 8 * 1024 * 1024 * 1024,
         }
     }
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "GGUF F32 metadata was widened exactly by the admitted reader; reconstruct the original finite scalar."
-    )]
-    #[allow(
-        clippy::as_conversions,
-        reason = "This conversion restores a verified finite GGUF F32 scalar after exact widening."
-    )]
-    fn scalar(&self, suffix: &str) -> io::Result<f32> {
-        match self
-            .index
-            .metadata
-            .get(&format!("stt.qwen3_asr.decoder.{suffix}"))
-        {
-            Some(Value::Float { kind: 6, value }) if value.is_finite() => Ok(*value as f32),
-            _ => Err(invalid()),
+    pub(super) fn optional_vector(
+        &mut self,
+        name: &str,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<Option<Vec<f32>>> {
+        if self.index.tensors.contains_key(name) {
+            self.vector(name, cancel).map(Some)
+        } else {
+            Ok(None)
         }
+    }
+
+    fn count(&self, suffix: &str) -> io::Result<usize> {
+        self.index.count("stt.qwen3_asr.decoder", suffix)
+    }
+
+    fn scalar(&self, suffix: &str) -> io::Result<f32> {
+        self.index.scalar("stt.qwen3_asr.decoder", suffix)
     }
 
     pub(super) fn bytes(
@@ -137,16 +135,12 @@ impl<R: Read + Seek> Loader<'_, R> {
 }
 
 pub(super) fn load<R: Read + Seek>(
-    index: Index,
+    index: &Index,
     source: &mut R,
     precision: CachePrecision,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Model> {
-    let mut loader = Loader {
-        index,
-        source,
-        remaining: 8 * 1024 * 1024 * 1024,
-    };
+    let mut loader = Loader::new(index, source);
     let config = Config {
         hidden: loader.count("hidden_size")?,
         heads: loader.count("n_heads")?,
@@ -244,11 +238,12 @@ mod tests {
             );
         }
         let mut source = Cursor::new(bytes);
+        let index = Index {
+            metadata: BTreeMap::new(),
+            tensors,
+        };
         let mut loader = Loader {
-            index: Index {
-                metadata: BTreeMap::new(),
-                tensors,
-            },
+            index: &index,
             source: &mut source,
             remaining: 128,
         };
@@ -301,8 +296,9 @@ mod tests {
             ] {
                 let length = u64::try_from(bytes.len()).map_err(|_| super::invalid())?;
                 let mut source = Cursor::new(bytes);
+                let index = one_tensor(shape, kind, length);
                 let mut loader = Loader {
-                    index: one_tensor(shape, kind, length),
+                    index: &index,
                     source: &mut source,
                     remaining: length,
                 };
@@ -317,8 +313,9 @@ mod tests {
             bytes[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
             bytes[2..6].copy_from_slice(&[1, 255, 127, 128]);
             let mut source = Cursor::new(bytes);
+            let index = one_tensor(shape, 8, 34);
             let mut loader = Loader {
-                index: one_tensor(shape, 8, 34),
+                index: &index,
                 source: &mut source,
                 remaining: 34,
             };
@@ -331,8 +328,9 @@ mod tests {
         }
         // A genuinely nonunit third axis is not a matrix and must fail before I/O.
         let mut source = Cursor::new(Vec::<u8>::new());
+        let index = one_tensor(&[2, 1, 2], 0, 16);
         let mut loader = Loader {
-            index: one_tensor(&[2, 1, 2], 0, 16),
+            index: &index,
             source: &mut source,
             remaining: 16,
         };
@@ -364,8 +362,9 @@ mod tests {
             ] {
                 let length = u64::try_from(bytes.len()).map_err(|_| super::invalid())?;
                 let mut source = Cursor::new(bytes);
+                let index = one_tensor(shape, kind, length);
                 let mut loader = Loader {
-                    index: one_tensor(shape, kind, length),
+                    index: &index,
                     source: &mut source,
                     remaining: length,
                 };
@@ -375,8 +374,9 @@ mod tests {
             }
         }
         let mut source = Cursor::new(Vec::<u8>::new());
+        let index = one_tensor(&[3], 0, 12);
         let mut loader = Loader {
-            index: one_tensor(&[3], 0, 12),
+            index: &index,
             source: &mut source,
             remaining: 12,
         };

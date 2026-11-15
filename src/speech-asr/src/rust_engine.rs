@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    decoder::{CachePrecision, Model, Session},
+    decoder::{CachePrecision, Session},
     encoder::{Encoded, Encoder},
     frontend::{Frontend, MelSpectrogram},
     protocol::{DecodeStop, Prompt, PromptTokens, completed_transcript},
@@ -140,14 +140,15 @@ impl RustRecognizer {
                 return Err(invalid());
             }
         }
-        let (tokenizer, prompt_tokens) =
-            crate::intake::tokenizer(&mut file, properties.len(), cancel)?;
-        check(cancel)?;
-        let (encoder, frontend) = Encoder::load(&mut file, properties.len(), cancel)?;
+        let (tokenizer, prompt_tokens, encoder, frontend, model) = crate::intake::load_artifacts(
+            &mut file,
+            properties.len(),
+            CachePrecision::F16,
+            cancel,
+        )?;
         let encoder = encoder.with_threads(batch_threads)?;
         check(cancel)?;
-        let model = Model::load(&mut file, properties.len(), CachePrecision::F16, cancel)?
-            .with_threads(decode_threads, batch_threads)?;
+        let model = model.with_threads(decode_threads, batch_threads)?;
         let (hidden, vocabulary, context) = model.dimensions();
         if encoder.output_width() != hidden || tokenizer.vocabulary_size() != vocabulary {
             return Err(invalid());

@@ -21,7 +21,6 @@ pub mod codec;
 #[cfg(test)]
 mod decode_graph;
 pub mod engine;
-mod gguf;
 mod numerics;
 pub mod observation;
 mod philox;
@@ -245,7 +244,7 @@ fn load_talker(path: &Path, kind: &str, threads: usize) -> io::Result<rust_talke
             "Unsupported speech model architecture.",
         ));
     }
-    let tokenizer = tokenizer::Tokenizer::load(path)?;
+    let tokenizer = tokenizer::Tokenizer::from_weights(&weights)?;
     rust_talker::Talker::load(&mut weights, tokenizer, threads)
 }
 
@@ -377,7 +376,7 @@ impl Synthesizer {
                         .map_err(|error| SynthesisStage::ReferenceEncoding.failure(error))?;
                     (cancel.borrow_mut())()
                         .map_err(|error| SynthesisStage::BaseTokenizer.failure(error))?;
-                    let tokenizer = tokenizer::Tokenizer::load(voice_model_path)
+                    let tokenizer = tokenizer::Tokenizer::from_weights(weights)
                         .map_err(|error| SynthesisStage::BaseTokenizer.failure(error))?;
                     (cancel.borrow_mut())()
                         .map_err(|error| SynthesisStage::BaseModel.failure(error))?;

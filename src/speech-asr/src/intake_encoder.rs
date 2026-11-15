@@ -1,22 +1,12 @@
 //! Source-bound CNN/encoder and exact supported frontend metadata intake.
 
-use super::{Index, Value, decoder::Loader, invalid};
+use super::{Index, decoder::Loader, invalid};
 use crate::{
     encoder::{Block, Config, Encoder, Linear, Norm, Weights},
     frontend::Frontend,
     protocol::EncoderLayout,
 };
 use std::io::{self, Read, Seek};
-
-fn count(index: &Index, suffix: &str) -> io::Result<usize> {
-    match index
-        .metadata
-        .get(&format!("stt.qwen3_asr.encoder.{suffix}"))
-    {
-        Some(Value::Integer { value, .. }) => usize::try_from(*value).map_err(|_| invalid()),
-        _ => Err(invalid()),
-    }
-}
 
 #[expect(
     clippy::float_cmp,
@@ -28,8 +18,7 @@ fn frontend_metadata(index: &Index) -> io::Result<()> {
         ("window", "hann_periodic"),
         ("normalize", "per_utterance"),
     ] {
-        if !matches!(index.metadata.get(&format!("stt.frontend.{key}")), Some(Value::Text(value)) if value == expected)
-        {
+        if index.text(&format!("stt.frontend.{key}"))? != expected {
             return Err(invalid());
         }
     }
@@ -40,8 +29,7 @@ fn frontend_metadata(index: &Index) -> io::Result<()> {
         ("win_length", 400),
         ("hop_length", 160),
     ] {
-        if !matches!(index.metadata.get(&format!("stt.frontend.{key}")), Some(Value::Integer { value, .. }) if *value == expected)
-        {
+        if index.integer(&format!("stt.frontend.{key}"))? != expected {
             return Err(invalid());
         }
     }
@@ -51,22 +39,20 @@ fn frontend_metadata(index: &Index) -> io::Result<()> {
         ("f_min", 0.0),
         ("f_max", 8000.0),
     ] {
-        if !matches!(index.metadata.get(&format!("stt.frontend.{key}")), Some(Value::Float { value, .. }) if *value == expected)
-        {
+        if index.float(&format!("stt.frontend.{key}"))? != expected {
             return Err(invalid());
         }
     }
     for (key, expected) in [("pad_mode", "reflect"), ("mel_norm", "slaney")] {
-        match index.metadata.get(&format!("stt.frontend.{key}")) {
-            None => {}
-            Some(Value::Text(value)) if value == expected => {}
-            _ => return Err(invalid()),
+        let full = format!("stt.frontend.{key}");
+        if index.metadata.contains_key(&full) && index.text(&full)? != expected {
+            return Err(invalid());
         }
     }
-    match index.metadata.get("stt.frontend.center") {
-        None | Some(Value::Boolean(true)) => Ok(()),
-        _ => Err(invalid()),
+    if !index.boolean("stt.frontend.center", true)? {
+        return Err(invalid());
     }
+    Ok(())
 }
 
 fn linear<R: Read + Seek>(
@@ -91,22 +77,23 @@ fn norm<R: Read + Seek>(
 }
 
 pub(super) fn load<R: Read + Seek>(
-    index: Index,
+    index: &Index,
     source: &mut R,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<(Encoder, Frontend)> {
-    frontend_metadata(&index)?;
+    frontend_metadata(index)?;
+    let count = |suffix| index.count("stt.qwen3_asr.encoder", suffix);
     let c = Config {
-        mel_bins: count(&index, "num_mel_bins")?,
-        channels: count(&index, "downsample_hidden")?,
-        hidden: count(&index, "d_model")?,
-        heads: count(&index, "n_heads")?,
-        intermediate: count(&index, "ffn_dim")?,
-        output: count(&index, "output_dim")?,
-        window: count(&index, "n_window")?,
-        max_positions: count(&index, "max_source_positions")?,
+        mel_bins: count("num_mel_bins")?,
+        channels: count("downsample_hidden")?,
+        hidden: count("d_model")?,
+        heads: count("n_heads")?,
+        intermediate: count("ffn_dim")?,
+        output: count("output_dim")?,
+        window: count("n_window")?,
+        max_positions: count("max_source_positions")?,
     };
-    let layers = count(&index, "n_layers")?;
+    let layers = count("n_layers")?;
     // Reject weight-sized hostile allocations before tensor reads.
     if c.mel_bins != 128
         || !(1..=1024).contains(&c.channels)
@@ -122,21 +109,9 @@ pub(super) fn load<R: Read + Seek>(
     {
         return Err(invalid());
     }
-    let mut loader = Loader {
-        index,
-        source,
-        remaining: 8 * 1024 * 1024 * 1024,
-    };
-    let window = if loader.index.tensors.contains_key("frontend.window") {
-        Some(loader.vector("frontend.window", cancel)?)
-    } else {
-        None
-    };
-    let bank = if loader.index.tensors.contains_key("frontend.mel_filterbank") {
-        Some(loader.vector("frontend.mel_filterbank", cancel)?)
-    } else {
-        None
-    };
+    let mut loader = Loader::new(index, source);
+    let window = loader.optional_vector("frontend.window", cancel)?;
+    let bank = loader.optional_vector("frontend.mel_filterbank", cancel)?;
     let frontend = Frontend::from_checkpoint(window.as_deref(), bank.as_deref())?;
     let mut convolutions = Vec::new();
     for layer in 0..3 {

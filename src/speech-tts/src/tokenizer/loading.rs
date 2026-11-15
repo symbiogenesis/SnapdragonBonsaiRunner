@@ -1,9 +1,11 @@
 //! Safe metadata intake shared by serving and retained tokenizer controls.
 #![forbid(unsafe_code)]
 
-use std::{io, path::Path};
+use std::io;
+#[cfg(test)]
+use std::path::Path;
 
-use crate::gguf::{Gguf, invalid};
+use crate::weights::{Weights, invalid};
 
 use super::Tokenizer;
 
@@ -16,6 +18,15 @@ const SPECIAL_KEYS: [&[u8]; 5] = [
     b"qwen3-tts.text.tts_bos_id",
     b"qwen3-tts.text.tts_eos_id",
 ];
+const ALL_KEYS: [&[u8]; 7] = [
+    TOKENS,
+    MERGES,
+    SPECIAL_KEYS[0],
+    SPECIAL_KEYS[1],
+    SPECIAL_KEYS[2],
+    SPECIAL_KEYS[3],
+    SPECIAL_KEYS[4],
+];
 
 trait Metadata {
     fn find(&self, name: &[u8]) -> Option<usize>;
@@ -24,21 +35,33 @@ trait Metadata {
     fn u32_value(&self, key: usize) -> io::Result<u32>;
 }
 
-impl Metadata for Gguf {
+fn key_name(key: usize) -> io::Result<&'static str> {
+    ALL_KEYS
+        .get(key)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .ok_or_else(invalid)
+}
+
+impl Metadata for Weights {
     fn find(&self, name: &[u8]) -> Option<usize> {
-        Self::find(self, name)
+        let index = ALL_KEYS.iter().position(|key| *key == name)?;
+        let key = std::str::from_utf8(name).ok()?;
+        self.metadata_contains(key).then_some(index)
     }
 
     fn string_count(&self, key: usize) -> io::Result<usize> {
-        Self::string_count(self, key)
+        Ok(self.string_array(key_name(key)?)?.len())
     }
 
     fn string(&self, key: usize, index: usize) -> io::Result<&[u8]> {
-        Self::string(self, key, index)
+        self.string_array(key_name(key)?)?
+            .get(index)
+            .map(Box::as_ref)
+            .ok_or_else(invalid)
     }
 
     fn u32_value(&self, key: usize) -> io::Result<u32> {
-        Self::u32_value(self, key)
+        self.u32(key_name(key)?)
     }
 }
 
@@ -99,8 +122,13 @@ fn candidate(metadata: &impl Metadata) -> io::Result<Tokenizer> {
     Ok(owner)
 }
 
+pub(super) fn from_weights(weights: &Weights) -> io::Result<Tokenizer> {
+    candidate(weights)
+}
+
+#[cfg(test)]
 pub(super) fn load(path: &Path) -> io::Result<Tokenizer> {
-    let metadata = Gguf::open(path)?;
+    let metadata = Weights::open_metadata(path)?;
     candidate(&metadata)
 }
 

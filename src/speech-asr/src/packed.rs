@@ -777,6 +777,135 @@ fn weighted_value_accum_simd<S: Simd>(simd: S, out: &mut [f32], value: &[f32], w
     }
 }
 
+/// Convert a bounded dimension or position to `f32`.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "Admitted encoder/decoder dimensions and positions are bounded by 65,536 and convert exactly."
+)]
+pub(super) const fn scalar_f32(value: usize) -> f32 {
+    value as f32
+}
+
+/// Verify every slice element is finite, mapping failures with `invalid`.
+pub(super) fn ensure_finite(
+    values: &[f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    if values.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
+/// Add `add` into `dst` element-wise across row workers and validate finiteness.
+pub(super) fn add_residual_batch(
+    dst: &mut [f32],
+    add: &[f32],
+    workers: usize,
+    width: usize,
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    row_workers::try_run_aligned(dst, workers, width, &|elem_off, slice| {
+        let end = elem_off + slice.len();
+        for (out, &delta) in slice.iter_mut().zip(&add[elem_off..end]) {
+            *out += delta;
+        }
+        ensure_finite(slice, invalid)
+    })
+}
+
+/// Evaluate one attention head over cached/history rows plus an optional current key/value pair.
+///
+/// Preserves exact left-to-right quad dot/accumulation order and scalar tail summation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared single-head attention kernel reuses caller score/output storage without allocating."
+)]
+pub(super) fn attend_head(
+    q_head: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    history_rows: usize,
+    row_width: usize,
+    offset: usize,
+    head_dim: usize,
+    divisor: f32,
+    current_kv: Option<(&[f32], &[f32])>,
+    scores: &mut [f32],
+    out_head: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    let full_quads = history_rows / 4;
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        let k0 = &keys[r * row_width + offset..r * row_width + offset + head_dim];
+        let k1 = &keys[(r + 1) * row_width + offset..(r + 1) * row_width + offset + head_dim];
+        let k2 = &keys[(r + 2) * row_width + offset..(r + 2) * row_width + offset + head_dim];
+        let k3 = &keys[(r + 3) * row_width + offset..(r + 3) * row_width + offset + head_dim];
+        scores[r..r + 4].copy_from_slice(&dot_4keys_seq(q_head, [k0, k1, k2, k3], divisor));
+    }
+    for (row, score) in scores
+        .iter_mut()
+        .enumerate()
+        .take(history_rows)
+        .skip(full_quads * 4)
+    {
+        let k = &keys[row * row_width + offset..row * row_width + offset + head_dim];
+        let mut dot = 0.0_f32;
+        for (q_elem, k_elem) in q_head.iter().zip(k) {
+            dot += *q_elem * *k_elem;
+        }
+        *score = dot / divisor;
+    }
+    if let Some((k, _)) = current_kv {
+        let mut dot = 0.0_f32;
+        for (q_elem, k_elem) in q_head.iter().zip(k) {
+            dot += *q_elem * *k_elem;
+        }
+        scores[history_rows] = dot / divisor;
+    }
+    ensure_finite(scores, invalid)?;
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0;
+    for score in &mut *scores {
+        *score = (*score - max).exp();
+        sum += *score;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(invalid());
+    }
+    out_head.fill(0.0);
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        let v0 = &values[r * row_width + offset..r * row_width + offset + head_dim];
+        let v1 = &values[(r + 1) * row_width + offset..(r + 1) * row_width + offset + head_dim];
+        let v2 = &values[(r + 2) * row_width + offset..(r + 2) * row_width + offset + head_dim];
+        let v3 = &values[(r + 3) * row_width + offset..(r + 3) * row_width + offset + head_dim];
+        let weights = [
+            scores[r] / sum,
+            scores[r + 1] / sum,
+            scores[r + 2] / sum,
+            scores[r + 3] / sum,
+        ];
+        weighted_value_accum_4(out_head, [v0, v1, v2, v3], weights);
+    }
+    for (row, &score) in scores
+        .iter()
+        .enumerate()
+        .take(history_rows)
+        .skip(full_quads * 4)
+    {
+        let v = &values[row * row_width + offset..row * row_width + offset + head_dim];
+        weighted_value_accum(out_head, v, score / sum);
+    }
+    if let Some((_, v)) = current_kv {
+        weighted_value_accum(out_head, v, scores[history_rows] / sum);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

@@ -5,6 +5,32 @@ use crate::{protocol::PromptTokens, tokenizer::Tokenizer};
 use std::io;
 
 impl Index {
+    pub(super) fn integer(&self, key: &str) -> io::Result<u64> {
+        match self.metadata.get(key) {
+            Some(Value::Integer { value, .. }) => Ok(*value),
+            _ => Err(invalid()),
+        }
+    }
+
+    pub(super) fn count(&self, prefix: &str, suffix: &str) -> io::Result<usize> {
+        usize::try_from(self.integer(&format!("{prefix}.{suffix}"))?).map_err(|_| invalid())
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "GGUF F32 metadata was widened exactly by the admitted reader; reconstruct the original finite scalar."
+    )]
+    #[allow(
+        clippy::as_conversions,
+        reason = "This conversion restores a verified finite GGUF F32 scalar after exact widening."
+    )]
+    pub(super) fn scalar(&self, prefix: &str, suffix: &str) -> io::Result<f32> {
+        match self.metadata.get(&format!("{prefix}.{suffix}")) {
+            Some(Value::Float { kind: 6, value }) if value.is_finite() => Ok(*value as f32),
+            _ => Err(invalid()),
+        }
+    }
+
     fn uint(&self, key: &str) -> io::Result<u64> {
         match self.metadata.get(key) {
             Some(Value::Integer { kind: 4, value })
@@ -25,21 +51,21 @@ impl Index {
         }
     }
 
-    fn text(&self, key: &str) -> io::Result<&str> {
+    pub(super) fn text(&self, key: &str) -> io::Result<&str> {
         match self.metadata.get(key) {
             Some(Value::Text(value)) => Ok(value),
             _ => Err(invalid()),
         }
     }
 
-    fn float(&self, key: &str) -> io::Result<f64> {
+    pub(super) fn float(&self, key: &str) -> io::Result<f64> {
         match self.metadata.get(key) {
             Some(Value::Float { kind: 6, value }) if value.is_finite() => Ok(*value),
             _ => Err(invalid()),
         }
     }
 
-    fn boolean(&self, key: &str, default: bool) -> io::Result<bool> {
+    pub(super) fn boolean(&self, key: &str, default: bool) -> io::Result<bool> {
         match self.metadata.get(key) {
             None => Ok(default),
             Some(Value::Boolean(value)) => Ok(*value),
