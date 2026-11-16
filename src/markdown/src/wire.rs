@@ -35,17 +35,19 @@ fn font_size(size: f32) -> Option<u8> {
         .find(|candidate| f32::from(*candidate).to_bits() == size.to_bits())
 }
 
-fn flags(format: &egui::TextFormat, visuals: &egui::Visuals) -> u8 {
+fn flags(format: &egui::TextFormat, strong_text_color: egui::Color32) -> u8 {
     let mut flags = 0;
-    if format.font_id.family == egui::FontFamily::Monospace {
-        flags |= CODE;
-    } else if format.font_id.family == egui::FontFamily::Name("Bonsai Code Block".into()) {
-        flags |= CODE | CODE_BLOCK;
+    match &format.font_id.family {
+        egui::FontFamily::Monospace => flags |= CODE,
+        egui::FontFamily::Name(name) if name.as_ref() == super::CODE_BLOCK_FONT_NAME => {
+            flags |= CODE | CODE_BLOCK;
+        }
+        _ => {}
     }
     if format.italics {
         flags |= ITALIC;
     }
-    if format.color == visuals.strong_text_color() {
+    if format.color == strong_text_color {
         flags |= STRONG;
     }
     if format.strikethrough.width > 0.0 {
@@ -64,7 +66,7 @@ fn text_section_bytes(layout: &Layout) -> Option<usize> {
 fn encode_text_section(
     bytes: &mut Vec<u8>,
     layout: &Layout,
-    visuals: &egui::Visuals,
+    strong_text_color: egui::Color32,
     previous_source_end: &mut usize,
 ) -> Option<()> {
     let text = &layout.job.text;
@@ -76,7 +78,7 @@ fn encode_text_section(
     for section in sections {
         push_count(bytes, section.byte_range.start.0)?;
         push_count(bytes, section.byte_range.end.0)?;
-        bytes.push(flags(&section.format, visuals));
+        bytes.push(flags(&section.format, strong_text_color));
         bytes.push(font_size(section.format.font_id.size)?);
     }
     push_count(bytes, mappings.len())?;
@@ -126,11 +128,16 @@ fn encode_single(layout: &Layout) -> Option<Vec<u8>> {
     if length > MAX_FRAME_BYTES {
         return None;
     }
-    let visuals = egui::Visuals::dark();
+    let strong_text_color = super::theme().strong_text_color;
     let mut bytes = Vec::with_capacity(length);
     bytes.extend_from_slice(MAGIC);
     let mut previous_source_end = 0;
-    encode_text_section(&mut bytes, layout, &visuals, &mut previous_source_end)?;
+    encode_text_section(
+        &mut bytes,
+        layout,
+        strong_text_color,
+        &mut previous_source_end,
+    )?;
     Some(bytes)
 }
 
@@ -163,7 +170,7 @@ fn encode_segmented(segments: &[Segment]) -> Option<Vec<u8>> {
     {
         return None;
     }
-    let visuals = egui::Visuals::dark();
+    let strong_text_color = super::theme().strong_text_color;
     let mut bytes = Vec::with_capacity(length);
     bytes.extend_from_slice(MAGIC_SEGMENTED);
     push_count(&mut bytes, segments.len())?;
@@ -172,7 +179,12 @@ fn encode_segmented(segments: &[Segment]) -> Option<Vec<u8>> {
         match segment {
             Segment::Text(layout) => {
                 bytes.push(SEGMENT_TEXT);
-                encode_text_section(&mut bytes, layout, &visuals, &mut previous_source_end)?;
+                encode_text_section(
+                    &mut bytes,
+                    layout,
+                    strong_text_color,
+                    &mut previous_source_end,
+                )?;
             }
             Segment::Image(image) => {
                 encode_image_segment(&mut bytes, image, &mut previous_source_end)?;

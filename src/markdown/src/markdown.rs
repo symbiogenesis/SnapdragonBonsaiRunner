@@ -1,8 +1,36 @@
 //! Render only the documented native subset; other constructs retain source.
-use super::{Builder, ImageBlock};
+use super::{Builder, CODE_BLOCK_FONT_NAME, ImageBlock};
 use markdown_syntax::{Block, CodeBlock, CodeBlockKind, FenceMarker, Inline};
+use std::sync::OnceLock;
+
+const INDENT_UNIT: &str = "    ";
+const INDENT_BLOCK: &str = "                                ";
+
+fn code_block_font_family() -> &'static egui::FontFamily {
+    static FAMILY: OnceLock<egui::FontFamily> = OnceLock::new();
+    FAMILY.get_or_init(|| egui::FontFamily::Name(CODE_BLOCK_FONT_NAME.into()))
+}
 
 impl Builder<'_> {
+    fn emit_ordered_marker(&mut self, mut number: u64, format: &egui::TextFormat) {
+        let mut buf = [b' '; 24];
+        buf[23] = b' ';
+        buf[22] = b'.';
+        let mut pos = 22;
+        loop {
+            pos -= 1;
+            let digit = u8::try_from(number % 10).unwrap_or(0);
+            buf[pos] = b'0' + digit;
+            number /= 10;
+            if number == 0 {
+                break;
+            }
+        }
+        if let Ok(marker) = std::str::from_utf8(&buf[pos..24]) {
+            self.generated(marker, format);
+        }
+    }
+
     pub(super) fn blocks(
         &mut self,
         blocks: &[Block],
@@ -11,12 +39,12 @@ impl Builder<'_> {
         tight: bool,
     ) {
         for (index, block) in blocks.iter().enumerate() {
-            if self.limited {
+            if self.out.limited {
                 return;
             }
             if depth == 0
-                && self.quote_depth == 0
-                && self.images_emitted < super::svg::MAX_SVG_IMAGES
+                && self.out.quote_depth == 0
+                && self.out.images_emitted < super::svg::MAX_SVG_IMAGES
                 && let Block::CodeBlock(node) = block
                 && let Some(image) = self.extract_svg_image(node)
             {
@@ -37,14 +65,14 @@ impl Builder<'_> {
                         4 => 19.0,
                         5 => 17.0,
                         _ => 16.0,
-                    } * (self.normal.font_id.size / 16.0);
-                    heading.color = self.visuals.strong_text_color();
+                    } * (self.theme.normal.font_id.size / 16.0);
+                    heading.color = self.theme.strong_text_color;
                     self.inlines(&node.children, &heading);
                 }
                 Block::BlockQuote(node) => {
-                    self.quote_depth += 1;
+                    self.out.quote_depth += 1;
                     self.blocks(&node.children, format, depth, false);
-                    self.quote_depth -= 1;
+                    self.out.quote_depth -= 1;
                 }
                 Block::List(node) => {
                     let mut number = node
@@ -56,9 +84,9 @@ impl Builder<'_> {
                         if index != 0 {
                             self.newlines(if node.tight { 1 } else { 2 });
                         }
-                        self.generated(&"    ".repeat(depth), format);
+                        self.generated_repeated(INDENT_UNIT, INDENT_BLOCK, depth, format);
                         if node.ordered {
-                            self.generated(&format!("{number}. "), format);
+                            self.emit_ordered_marker(number, format);
                             number = number.saturating_add(1);
                         } else {
                             self.generated("• ", format);
@@ -73,7 +101,7 @@ impl Builder<'_> {
                     let mut code = self.code_format(format);
                     // A finite wire flag lets the trusted UI distinguish a
                     // code surface from an inline monospace span.
-                    code.font_id.family = egui::FontFamily::Name("Bonsai Code Block".into());
+                    code.font_id.family = code_block_font_family().clone();
                     // Map each de-indented code line back to its actual source,
                     // excluding the fence/info string and container prefixes.
                     let mut start = node.meta.span.map_or(0, |span| span.start);
@@ -87,7 +115,7 @@ impl Builder<'_> {
                     }
                     for line in node.value.split_inclusive('\n') {
                         let Some(rest) = self.source.get(start..end) else {
-                            self.limited = true;
+                            self.out.limited = true;
                             return;
                         };
                         let physical_end = rest.find('\n').map_or(end, |offset| start + offset + 1);
@@ -102,7 +130,7 @@ impl Builder<'_> {
                                 // Split indentation tabs can synthesize spaces.
                                 // Keep exact source rather than search later lines
                                 // repeatedly or associate text with the wrong line.
-                                self.limited = true;
+                                self.out.limited = true;
                                 return;
                             };
                             self.append(value, Some(range), &code);
@@ -121,7 +149,7 @@ impl Builder<'_> {
                         }
                         let mut cell_format = format.clone();
                         if row_index == 0 {
-                            cell_format.color = self.visuals.strong_text_color();
+                            cell_format.color = self.theme.strong_text_color;
                         }
                         for (cell_index, cell) in row.cells.iter().enumerate() {
                             if cell_index != 0 {
@@ -189,14 +217,14 @@ impl Builder<'_> {
     fn code_format(&self, format: &egui::TextFormat) -> egui::TextFormat {
         let mut code = format.clone();
         code.font_id = egui::FontId::monospace(format.font_id.size);
-        code.background = self.visuals.code_bg_color;
+        code.background = self.theme.code_bg_color;
         code.italics = false;
         code
     }
 
     fn inlines(&mut self, inlines: &[Inline], format: &egui::TextFormat) {
         for inline in inlines {
-            if self.limited {
+            if self.out.limited {
                 return;
             }
             match inline {
@@ -218,7 +246,7 @@ impl Builder<'_> {
                 }
                 Inline::Strong(node) => {
                     let mut strong = format.clone();
-                    strong.color = self.visuals.strong_text_color();
+                    strong.color = self.theme.strong_text_color;
                     self.inlines(&node.children, &strong);
                 }
                 Inline::Delete(node) => {

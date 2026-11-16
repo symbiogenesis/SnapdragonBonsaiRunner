@@ -701,3 +701,50 @@ fn svg_parse_tree_cache_reuses_valid_trees_and_evicts_lru_after_four() -> io::Re
     assert!(!Arc::ptr_eq(t1_first, t1_re_parsed));
     Ok(())
 }
+
+#[test]
+fn nested_quotes_deep_ordered_lists_and_multiline_code_coalesce_sections() -> io::Result<()> {
+    let quoted = parse_layout("> > one\n> > two");
+    assert_eq!(quoted.job.text, "│ │ one\n│ │ two");
+
+    let deep_quote = parse_layout(&format!("{}deep quote", "> ".repeat(10)));
+    assert_eq!(
+        deep_quote.job.text,
+        format!("{}deep quote", "│ ".repeat(10))
+    );
+
+    let ordered = parse_layout("12. top\n13. second\n14. third");
+    assert_eq!(ordered.job.text, "12. top\n13. second\n14. third");
+
+    let mut deep = String::new();
+    for level in 1..=10 {
+        deep.push_str(&"  ".repeat(level - 1));
+        if level == 10 {
+            deep.push_str("1. leaf\n");
+        } else {
+            deep.push_str("- branch\n");
+        }
+    }
+    let list_layout = parse_layout(&deep);
+    assert!(
+        list_layout
+            .job
+            .text
+            .contains(&format!("{}1. leaf", "    ".repeat(9))),
+        "unexpected list text: {:?}",
+        list_layout.job.text
+    );
+
+    let code_source = "```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```";
+    let code_layout = parse_layout(code_source);
+    assert_eq!(code_layout.job.text, "let a = 1;\nlet b = 2;\nlet c = 3;\n");
+    assert_eq!(code_layout.job.sections.len(), 1);
+    for mapping in &code_layout.mappings {
+        assert_eq!(
+            code_source.get(mapping.source.clone()),
+            code_layout.job.text.get(mapping.display.clone())
+        );
+    }
+    assert!(parse(code_source).starts_with(b"BMD1"));
+    Ok(())
+}
