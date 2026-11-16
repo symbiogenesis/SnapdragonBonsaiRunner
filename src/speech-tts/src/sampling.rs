@@ -353,11 +353,8 @@ fn msvc_nth_element<T: Copy, F: Fn(T, T) -> bool>(mut slice: &mut [T], mut nth: 
 }
 
 /// Reusable buffers for repeated [`sample_top_k_p_with_scratch`] calls.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "Sampler policy is private to the speech crate and captured-observation replay."
-)]
-pub(super) struct SamplerScratch {
+#[derive(Default)]
+pub(crate) struct SamplerScratch {
     seen: Vec<u8>,
     top_k: Vec<f32>,
     top_p: Vec<TokenProb>,
@@ -365,12 +362,29 @@ pub(super) struct SamplerScratch {
 
 impl SamplerScratch {
     /// Pre-allocate scratch sized for `vocab` vocabulary entries.
-    pub(super) fn new(vocab: usize) -> Self {
+    pub(crate) fn new(vocab: usize) -> Self {
         Self {
             seen: vec![0; vocab],
             top_k: Vec::with_capacity(vocab),
             top_p: Vec::with_capacity(vocab),
         }
+    }
+
+    /// Clear logical lengths across reusable sampler scratch while retaining capacities.
+    pub(crate) fn clear(&mut self) {
+        self.seen.clear();
+        self.top_k.clear();
+        self.top_p.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.seen.is_empty() && self.top_k.is_empty() && self.top_p.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seen_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.seen
     }
 }
 
@@ -492,11 +506,7 @@ pub(super) fn top_p_mask(logits: &mut [f32], top_p: f32) {
 }
 
 /// Execute the full pinned `sample_top_k_p` chain with caller-owned scratch buffers.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "Sampler policy is private to the speech crate and captured-observation replay."
-)]
-pub(super) fn sample_top_k_p_with_scratch(
+pub(crate) fn sample_top_k_p_with_scratch(
     logits: &mut [f32],
     params: SampleTopKPParams,
     history: &[i32],
@@ -531,6 +541,7 @@ pub(super) fn sample_top_k_p_with_scratch(
 /// Empty vocabularies, negative or non-finite temperatures, non-finite logits,
 /// and all-masked distributions return `None` rather than publishing an
 /// invalid or masked token.
+#[cfg(test)]
 #[expect(
     clippy::redundant_pub_crate,
     reason = "Sampler policy is private to the speech crate and captured-observation replay."

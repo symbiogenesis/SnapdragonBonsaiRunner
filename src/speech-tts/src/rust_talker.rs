@@ -14,7 +14,7 @@ use crate::{
     engine::{
         CodePredictorModel, DecoupledSamplingParams, LayerKvCache, LinearProjection,
         QwenDecoderLayer, TOTAL_CODE_GROUPS, decoder_workspace::DecoderWorkspace,
-        predictor_workspace::PredictorWorkspace, rms_norm,
+        predictor_workspace::PredictorWorkspace, rms_norm_into,
     },
     sampling::{self, SampleTopKPParams},
     tokenizer::Tokenizer,
@@ -27,9 +27,10 @@ const MAX_NEW_TOKENS: usize = 1500;
 const MAX_CONTEXT: usize = 4096;
 const MAX_REFERENCE_FRAMES: usize = 375;
 // A retained snapshot and its restored request copy together consume at most
-// 16 MiB. Ordinary request KV growth remains subject to the existing budget.
-const MAX_PREFILL_ROWS: usize = 64;
-const MAX_PREFILL_CACHE_BYTES: usize = 8 * 1024 * 1024;
+// 96 MiB (~211 prefix rows for 1.7B Talker). Ordinary request KV growth remains
+// subject to the existing budget.
+const MAX_PREFILL_ROWS: usize = 256;
+const MAX_PREFILL_CACHE_BYTES: usize = 48 * 1024 * 1024;
 
 pub(crate) struct Reference {
     pub(crate) speaker: Vec<f32>,
@@ -183,6 +184,7 @@ pub(crate) struct Talker {
     threads: usize,
     base: bool,
     prefill_cache: Option<PrefillCache>,
+    workspace: Option<PredictorWorkspace>,
 }
 
 struct Prompt {
@@ -438,6 +440,7 @@ impl Talker {
             threads,
             base,
             prefill_cache: None,
+            workspace: None,
         };
         result.tts_pad = result.project_text(result.specials.text_pad)?;
         result.tts_bos = result.project_text(result.specials.text_bos)?;
@@ -589,11 +592,25 @@ impl Talker {
         cancel: &mut dyn FnMut() -> io::Result<()>,
         workspace: &mut DecoderWorkspace,
     ) -> io::Result<Vec<f32>> {
-        let mut hidden = row.to_vec();
+        let mut hidden = Vec::with_capacity(row.len());
+        self.forward_into(row, caches, cancel, workspace, &mut hidden)?;
+        Ok(hidden)
+    }
+
+    fn forward_into(
+        &self,
+        row: &[f32],
+        caches: &mut [LayerKvCache],
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+        workspace: &mut DecoderWorkspace,
+        out: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        let mut h_a = row.to_vec();
+        let mut h_b = vec![0.0_f32; row.len()];
         for (layer, cache) in self.layers.iter().zip(caches) {
             cancel()?;
-            hidden = layer.forward_step_reusing(
-                &hidden,
+            layer.forward_step_into(
+                &h_a,
                 self.geometry.heads,
                 self.geometry.kv_heads,
                 self.geometry.head_dim,
@@ -603,9 +620,11 @@ impl Talker {
                 None,
                 self.threads,
                 workspace,
+                &mut h_b,
             )?;
+            std::mem::swap(&mut h_a, &mut h_b);
         }
-        rms_norm(&hidden, &self.norm, self.geometry.norm_eps)
+        rms_norm_into(&h_a, &self.norm, self.geometry.norm_eps, out)
     }
 
     #[cfg(test)]
@@ -632,6 +651,7 @@ impl Talker {
         // Take the snapshot before prompt construction: every failure, including
         // cancelled projection or sink output, discards all reusable KV state.
         let mut prefill_cache = self.prefill_cache.take();
+        let mut predictor_workspace = self.workspace.take().unwrap_or_default();
         let result = self.generate_inner(
             text,
             instruct,
@@ -639,8 +659,11 @@ impl Talker {
             sink,
             cancel,
             &mut prefill_cache,
+            &mut predictor_workspace,
             observe,
         );
+        predictor_workspace.decoder().clear();
+        self.workspace = Some(predictor_workspace);
         if result.is_ok() {
             self.prefill_cache = prefill_cache;
         }
@@ -705,6 +728,7 @@ impl Talker {
         sink: &mut dyn FnMut([i32; TOTAL_CODE_GROUPS]) -> io::Result<()>,
         cancel: &mut dyn FnMut() -> io::Result<()>,
         prefill_cache: &mut Option<PrefillCache>,
+        predictor_workspace: &mut PredictorWorkspace,
         observe: &mut dyn FnMut(crate::observation::TalkerObservation<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
         use crate::observation::TalkerObservation;
@@ -716,7 +740,6 @@ impl Talker {
             trailing: &prompt.trailing,
             cacheable_rows: prompt.cacheable_rows,
         })?;
-        let mut predictor_workspace = PredictorWorkspace::default();
         let (mut caches, mut hidden) = self.prefill(
             &prompt,
             prefill_cache,
@@ -724,6 +747,7 @@ impl Talker {
             predictor_workspace.decoder(),
         )?;
         let mut history = Vec::with_capacity(MAX_NEW_TOKENS);
+        let mut logits = Vec::with_capacity(self.geometry.vocab);
         // The sampler marks vocabulary entries while applying repetition
         // penalties after the first frame; its workspace is caller-owned.
         let mut scratch = sampling::SamplerScratch::new(self.geometry.vocab);
@@ -739,9 +763,8 @@ impl Talker {
         params.subtalker_top_p = 1.0;
         for step in 0..MAX_NEW_TOKENS {
             cancel()?;
-            let mut logits = self
-                .head
-                .forward_vec_parallel(&hidden, None, self.threads)?;
+            self.head
+                .forward_vec_into(&hidden, None, None, self.threads, &mut logits)?;
             observe(TalkerObservation::Logits {
                 frame: step,
                 hidden: &hidden,
@@ -788,7 +811,7 @@ impl Talker {
                 subsequence,
                 self.threads,
                 cancel,
-                &mut predictor_workspace,
+                predictor_workspace,
                 &mut |observation| {
                     observe(TalkerObservation::Predictor {
                         frame: step,
@@ -816,7 +839,13 @@ impl Talker {
             let mut next = self.sum_codes(&frame)?;
             let overlay = prompt.trailing.get(step).unwrap_or(&self.tts_pad);
             add(&mut next, overlay)?;
-            hidden = self.forward(&next, &mut caches, cancel, predictor_workspace.decoder())?;
+            self.forward_into(
+                &next,
+                &mut caches,
+                cancel,
+                predictor_workspace.decoder(),
+                &mut hidden,
+            )?;
         }
         Err(invalid(
             "Speech reached its token ceiling before a complete end marker.",
@@ -961,6 +990,7 @@ pub(crate) mod tests {
             threads: 1,
             base,
             prefill_cache: None,
+            workspace: None,
         })
     }
 
@@ -1071,7 +1101,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prefix_snapshot_checks_bitwise_identity_row_and_byte_caps() {
-        assert_eq!(PrefillCache::row_limit(2048, 8 * 128, 28), Some(35));
+        assert_eq!(PrefillCache::row_limit(2048, 8 * 128, 28), Some(211));
         assert_eq!(PrefillCache::row_limit(2048, usize::MAX, 28), None);
         let rows = [vec![0.0]];
         let snapshot = PrefillCache::capture(&rows, &[], &[1.0]);

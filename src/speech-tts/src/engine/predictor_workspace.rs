@@ -8,11 +8,12 @@
 use std::io;
 
 use super::{LayerKvCache, decoder_workspace::DecoderWorkspace};
+use crate::sampling::SamplerScratch;
 
 #[derive(Default)]
 pub(crate) struct PredictorWorkspace {
     layers: Vec<LayerKvCache>,
-    seen: Vec<u8>,
+    sampler: SamplerScratch,
     decoder: DecoderWorkspace,
 }
 
@@ -23,7 +24,7 @@ impl PredictorWorkspace {
             layer.v.clear();
             layer.seq_len = 0;
         }
-        self.seen.clear();
+        self.sampler.clear();
         self.decoder.clear();
     }
 
@@ -45,8 +46,14 @@ impl PredictorWorkspace {
 pub(super) struct Frame<'a>(&'a mut PredictorWorkspace);
 
 impl Frame<'_> {
-    pub(super) fn buffers(&mut self) -> (&mut [LayerKvCache], &mut Vec<u8>, &mut DecoderWorkspace) {
-        (&mut self.0.layers, &mut self.0.seen, &mut self.0.decoder)
+    pub(super) fn buffers(
+        &mut self,
+    ) -> (
+        &mut [LayerKvCache],
+        &mut SamplerScratch,
+        &mut DecoderWorkspace,
+    ) {
+        (&mut self.0.layers, &mut self.0.sampler, &mut self.0.decoder)
     }
 }
 
@@ -67,14 +74,14 @@ mod tests {
         let mut workspace = PredictorWorkspace::default();
         let allocations = {
             let mut frame = workspace.frame(2)?;
-            let (layers, seen, decoder) = frame.buffers();
+            let (layers, sampler, decoder) = frame.buffers();
             decoder.norm.extend_from_slice(&[f32::NAN; 16]);
             for (index, layer) in layers.iter_mut().enumerate() {
                 layer.k.extend_from_slice(&[-0.0, 0.25, 0.5, 0.75]);
                 layer.v.extend_from_slice(&[1.0, 1.25, 1.5, 1.75]);
                 layer.seq_len = index + 1;
             }
-            seen.extend_from_slice(&[1; 8]);
+            sampler.seen_mut().extend_from_slice(&[1; 8]);
             layers
                 .iter()
                 .map(|layer| {
@@ -93,12 +100,12 @@ mod tests {
                 .iter()
                 .all(|layer| layer.k.is_empty() && layer.v.is_empty() && layer.seq_len == 0)
         );
-        assert_eq!(workspace.seen, Vec::<u8>::new());
+        assert!(workspace.sampler.is_empty());
         assert_eq!(workspace.decoder.norm, Vec::<f32>::new());
         assert_eq!(workspace.decoder.norm.capacity(), 16);
         let interrupted = std::panic::catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
             let mut frame = workspace.frame(2)?;
-            let (layers, seen, decoder) = frame.buffers();
+            let (layers, sampler, decoder) = frame.buffers();
             assert_eq!(decoder.norm, Vec::<f32>::new());
             decoder.norm.extend_from_slice(&[f32::NAN; 16]);
             for (layer, allocation) in layers.iter_mut().zip(&allocations) {
@@ -115,7 +122,7 @@ mod tests {
                 layer.v.extend_from_slice(&[3.0; 4]);
                 layer.seq_len = 2;
             }
-            seen.extend_from_slice(&[1; 8]);
+            sampler.seen_mut().extend_from_slice(&[1; 8]);
             std::panic::resume_unwind(Box::new("injected predictor fault"));
         }));
         assert!(interrupted.is_err());
@@ -125,7 +132,7 @@ mod tests {
                 .iter()
                 .all(|layer| layer.k.is_empty() && layer.v.is_empty() && layer.seq_len == 0)
         );
-        assert_eq!(workspace.seen, Vec::<u8>::new());
+        assert!(workspace.sampler.is_empty());
         assert_eq!(workspace.decoder.norm, Vec::<f32>::new());
         assert_eq!(workspace.decoder.norm.capacity(), 16);
         drop(workspace.frame(1)?);

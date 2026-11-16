@@ -1015,7 +1015,12 @@ pub fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> io::Result<Vec<f32>>
     Ok(out)
 }
 
-fn rms_norm_into(input: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) -> io::Result<()> {
+pub(crate) fn rms_norm_into(
+    input: &[f32],
+    weight: &[f32],
+    eps: f32,
+    out: &mut Vec<f32>,
+) -> io::Result<()> {
     if input.is_empty() || input.len() != weight.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1083,6 +1088,37 @@ fn rope_head_simd<S: Simd>(simd: S, lo: &mut [f32], hi: &mut [f32], cos: &[f32],
     }
 }
 
+fn compute_rope_tables(head_dim: usize, pos: usize, theta: f32, cos: &mut [f32], sin: &mut [f32]) {
+    let half = head_dim / 2;
+    let hd_f = usize_to_f32(head_dim);
+    let pos_f = usize_to_f32(pos);
+    for i in 0..half {
+        let exponent = usize_to_f32(2 * i) / hd_f;
+        let freq = pos_f / theta.powf(exponent);
+        let (sin_v, cos_v) = freq.sin_cos();
+        cos[i] = cos_v;
+        sin[i] = sin_v;
+    }
+}
+
+fn apply_rope_neox_with_tables(
+    heads: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    cos: &[f32],
+    sin: &[f32],
+) {
+    let half = head_dim / 2;
+    let level = Level::new();
+    dispatch!(level, simd => {
+        for h in 0..num_heads {
+            let slice = &mut heads[h * head_dim..(h + 1) * head_dim];
+            let (lo, hi) = slice.split_at_mut(half);
+            rope_head_simd(simd, lo, hi, cos, sin);
+        }
+    });
+}
+
 /// Apply 1D NEOX-style half-split `RoPE` (or collapsed 3D `MRoPE` when all 3 axes share `pos`)
 /// in place over `[num_heads, head_dim]`, precomputing `(sin, cos)` once across all heads.
 pub fn apply_rope_neox_in_place(
@@ -1099,26 +1135,19 @@ pub fn apply_rope_neox_in_place(
         ));
     }
     let half = head_dim / 2;
-    let hd_f = usize_to_f32(head_dim);
-    let pos_f = usize_to_f32(pos);
-    let mut cos_table = Vec::with_capacity(half);
-    let mut sin_table = Vec::with_capacity(half);
-    for i in 0..half {
-        let exponent = usize_to_f32(2 * i) / hd_f;
-        let freq = pos_f / theta.powf(exponent);
-        let (sin_v, cos_v) = freq.sin_cos();
-        cos_table.push(cos_v);
-        sin_table.push(sin_v);
+    if half <= 128 {
+        let mut cos_stack = [0.0_f32; 128];
+        let mut sin_stack = [0.0_f32; 128];
+        let cos_table = &mut cos_stack[..half];
+        let sin_table = &mut sin_stack[..half];
+        compute_rope_tables(head_dim, pos, theta, cos_table, sin_table);
+        apply_rope_neox_with_tables(heads, num_heads, head_dim, cos_table, sin_table);
+    } else {
+        let mut cos_table = vec![0.0_f32; half];
+        let mut sin_table = vec![0.0_f32; half];
+        compute_rope_tables(head_dim, pos, theta, &mut cos_table, &mut sin_table);
+        apply_rope_neox_with_tables(heads, num_heads, head_dim, &cos_table, &sin_table);
     }
-
-    let level = Level::new();
-    dispatch!(level, simd => {
-        for h in 0..num_heads {
-            let slice = &mut heads[h * head_dim..(h + 1) * head_dim];
-            let (lo, hi) = slice.split_at_mut(half);
-            rope_head_simd(simd, lo, hi, &cos_table, &sin_table);
-        }
-    });
     Ok(())
 }
 
@@ -1225,7 +1254,6 @@ impl QwenDecoderLayer {
     /// Evaluate with utterance-owned temporaries and the same transactional KV append.
     #[expect(
         clippy::too_many_arguments,
-        clippy::too_many_lines,
         reason = "Keep GQA geometry, transactional cache and request-owned temporary storage explicit."
     )]
     pub(crate) fn forward_step_reusing(
@@ -1241,6 +1269,43 @@ impl QwenDecoderLayer {
         workers: usize,
         workspace: &mut decoder_workspace::DecoderWorkspace,
     ) -> io::Result<Vec<f32>> {
+        let mut output = vec![0.0_f32; input.len()];
+        self.forward_step_into(
+            input,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_theta,
+            rms_eps,
+            kv,
+            adapter,
+            workers,
+            workspace,
+            &mut output,
+        )?;
+        Ok(output)
+    }
+
+    /// Evaluate into a caller-owned output slice with zero per-layer heap allocations.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "Keep GQA geometry, transactional cache and request-owned temporary storage explicit."
+    )]
+    pub(crate) fn forward_step_into(
+        &self,
+        input: &[f32],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        rms_eps: f32,
+        kv: &mut LayerKvCache,
+        adapter: Option<&TalkerLoraAdapter>,
+        workers: usize,
+        workspace: &mut decoder_workspace::DecoderWorkspace,
+        output: &mut [f32],
+    ) -> io::Result<()> {
         if !(1..=256).contains(&workers) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1260,6 +1325,7 @@ impl QwenDecoderLayer {
             .checked_mul(head_dim)
             .ok_or_else(invalid_geometry)?;
         if input.is_empty()
+            || output.len() != input.len()
             || num_q_heads == 0
             || num_kv_heads == 0
             || !num_q_heads.is_multiple_of(num_kv_heads)
@@ -1302,6 +1368,7 @@ impl QwenDecoderLayer {
             projected,
             gate,
             up,
+            residual: x_res,
         } = workspace;
         rms_norm_into(input, &self.attn_norm_w, rms_eps, h_norm)?;
         let patch = |proj: &LinearProjection| adapter.and_then(|a| a.patches.get(&proj.name));
@@ -1368,8 +1435,19 @@ impl QwenDecoderLayer {
         }
 
         let pos = kv.seq_len;
-        apply_rope_neox_in_place(q, num_q_heads, head_dim, pos, rope_theta)?;
-        apply_rope_neox_in_place(k, num_kv_heads, head_dim, pos, rope_theta)?;
+        let half = head_dim / 2;
+        if half <= 128 {
+            let mut cos_stack = [0.0_f32; 128];
+            let mut sin_stack = [0.0_f32; 128];
+            let cos_table = &mut cos_stack[..half];
+            let sin_table = &mut sin_stack[..half];
+            compute_rope_tables(head_dim, pos, rope_theta, cos_table, sin_table);
+            apply_rope_neox_with_tables(q, num_q_heads, head_dim, cos_table, sin_table);
+            apply_rope_neox_with_tables(k, num_kv_heads, head_dim, cos_table, sin_table);
+        } else {
+            apply_rope_neox_in_place(q, num_q_heads, head_dim, pos, rope_theta)?;
+            apply_rope_neox_in_place(k, num_kv_heads, head_dim, pos, rope_theta)?;
+        }
 
         // Attention may read this provisional position, but later projection,
         // adapter or numerical failure must not publish it for the next call.
@@ -1383,48 +1461,89 @@ impl QwenDecoderLayer {
 
         decoder_workspace::resize(attn_out, query_width)?;
         attn_out.fill(0.0);
-        decoder_workspace::resize(scores, total_seq)?;
         let level = Level::new();
 
-        dispatch!(level, simd => {
-            for qh in 0..num_q_heads {
-                let kvh = qh / gqa_ratio;
-                let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
-                let mut max_score = f32::NEG_INFINITY;
-                for (t, score_slot) in scores.iter_mut().enumerate() {
-                    let k_vec =
-                        &kv.k[t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
-                    let s = f32_dot_simd(simd, q_vec, k_vec) * scale;
-                    *score_slot = s;
-                    if s > max_score {
-                        max_score = s;
+        if gqa_ratio > 1 && gqa_ratio <= 8 {
+            decoder_workspace::resize(scores, gqa_ratio * total_seq)?;
+            dispatch!(level, simd => {
+                for kvh in 0..num_kv_heads {
+                    let kv_head_off = kvh * head_dim;
+                    let qh_base = kvh * gqa_ratio;
+                    let mut max_scores = [f32::NEG_INFINITY; 8];
+                    for t in 0..total_seq {
+                        let k_vec = &kv.k[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
+                        for (g, max_slot) in max_scores[..gqa_ratio].iter_mut().enumerate() {
+                            let qh = qh_base + g;
+                            let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
+                            let s = f32_dot_simd(simd, q_vec, k_vec) * scale;
+                            scores[g * total_seq + t] = s;
+                            if s > *max_slot {
+                                *max_slot = s;
+                            }
+                        }
+                    }
+                    let mut inv_sums = [0.0_f32; 8];
+                    for g in 0..gqa_ratio {
+                        let max_score = max_scores[g];
+                        let mut sum_exp = 0.0_f32;
+                        for s in &mut scores[g * total_seq..(g + 1) * total_seq] {
+                            *s = (*s - max_score).exp();
+                            sum_exp += *s;
+                        }
+                        inv_sums[g] = 1.0_f32 / sum_exp.max(1e-12_f32);
+                    }
+                    for t in 0..total_seq {
+                        let v_vec = &kv.v[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
+                        for (g, &inv_sum) in inv_sums[..gqa_ratio].iter().enumerate() {
+                            let qh = qh_base + g;
+                            let w = scores[g * total_seq + t] * inv_sum;
+                            let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
+                            axpy_simd(simd, w, v_vec, out_head);
+                        }
                     }
                 }
-                let mut sum_exp = 0.0_f32;
-                for s in &mut *scores {
-                    *s = (*s - max_score).exp();
-                    sum_exp += *s;
+            });
+        } else {
+            decoder_workspace::resize(scores, total_seq)?;
+            dispatch!(level, simd => {
+                for qh in 0..num_q_heads {
+                    let kvh = qh / gqa_ratio;
+                    let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
+                    let mut max_score = f32::NEG_INFINITY;
+                    for (t, score_slot) in scores.iter_mut().enumerate() {
+                        let k_vec = &kv.k
+                            [t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
+                        let s = f32_dot_simd(simd, q_vec, k_vec) * scale;
+                        *score_slot = s;
+                        if s > max_score {
+                            max_score = s;
+                        }
+                    }
+                    let mut sum_exp = 0.0_f32;
+                    for s in &mut *scores {
+                        *s = (*s - max_score).exp();
+                        sum_exp += *s;
+                    }
+                    let inv_sum = 1.0_f32 / sum_exp.max(1e-12_f32);
+                    let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
+                    for (t, &prob_unnorm) in scores.iter().enumerate() {
+                        let w = prob_unnorm * inv_sum;
+                        let v_vec = &kv.v
+                            [t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
+                        axpy_simd(simd, w, v_vec, out_head);
+                    }
                 }
-                let inv_sum = 1.0_f32 / sum_exp.max(1e-12_f32);
-                let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
-                for (t, &prob_unnorm) in scores.iter().enumerate() {
-                    let w = prob_unnorm * inv_sum;
-                    let v_vec =
-                        &kv.v[t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
-                    axpy_simd(simd, w, v_vec, out_head);
-                }
-            }
-        });
+            });
+        }
 
         self.o_proj
             .forward_vec_into(attn_out, None, patch(&self.o_proj), workers, projected)?;
-        let mut x_res: Vec<f32> = input
-            .iter()
-            .zip(projected.iter())
-            .map(|(&a, &b)| a + b)
-            .collect();
+        decoder_workspace::resize(x_res, input.len())?;
+        for ((dst, &a), &b) in x_res.iter_mut().zip(input.iter()).zip(projected.iter()) {
+            *dst = a + b;
+        }
 
-        rms_norm_into(&x_res, &self.ffn_norm_w, rms_eps, h_norm)?;
+        rms_norm_into(x_res, &self.ffn_norm_w, rms_eps, h_norm)?;
         let gate_sig = self.gate_proj.hadamard_signature();
         let up_sig = self.up_proj.hadamard_signature();
         let shared_ffn_folded = if let Some((signs, block)) = gate_sig
@@ -1454,7 +1573,7 @@ impl QwenDecoderLayer {
         }
         self.down_proj
             .forward_vec_into(gate, None, patch(&self.down_proj), workers, projected)?;
-        dispatch!(level, simd => axpy_simd(simd, 1.0_f32, projected, &mut x_res));
+        dispatch!(level, simd => axpy_simd(simd, 1.0_f32, projected, x_res));
         if x_res.iter().any(|value| !value.is_finite()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1462,7 +1581,8 @@ impl QwenDecoderLayer {
             ));
         }
         append.commit();
-        Ok(x_res)
+        output.copy_from_slice(x_res);
+        Ok(())
     }
 }
 
@@ -1498,17 +1618,19 @@ pub struct CodePredictorModel {
 }
 
 impl CodePredictorModel {
-    fn project_in_parallel<'a>(
+    fn project_in_parallel_into(
         &self,
-        raw: &'a [f32],
+        raw: &[f32],
         workers: usize,
-    ) -> io::Result<std::borrow::Cow<'a, [f32]>> {
-        self.mtp_proj
-            .as_ref()
-            .map_or(Ok(std::borrow::Cow::Borrowed(raw)), |proj| {
-                proj.forward_vec_parallel(raw, None, workers)
-                    .map(std::borrow::Cow::Owned)
-            })
+        out: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        if let Some(proj) = &self.mtp_proj {
+            proj.forward_vec_into(raw, None, None, workers, out)
+        } else {
+            out.clear();
+            out.extend_from_slice(raw);
+            Ok(())
+        }
     }
     /// Predict all 15 acoustic codes (`c1..=c15`) for one frame given `talker_hidden`,
     /// semantic `c0`, `talker_codec_embd`, and decoupled `subtalker_*` sampling parameters.
@@ -1616,7 +1738,7 @@ impl CodePredictorModel {
         // Clear logical state even when admission below rejects. The guard also
         // clears partial frames on cancellation, numerical errors and unwind.
         let mut frame = workspace.frame(self.layers.len())?;
-        let (kv_caches, seen_scratch, decoder_workspace) = frame.buffers();
+        let (kv_caches, sampler_scratch, decoder_workspace) = frame.buffers();
         if !(1..=256).contains(&workers) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1650,11 +1772,14 @@ impl CodePredictorModel {
 
         // Step 0 prefill: position 0 = talker_hidden, position 1 = embed(c0)
         cancel()?;
-        let mut h = self.project_in_parallel(talker_hidden, workers)?;
+        let mut h_a = Vec::with_capacity(self.hidden_size);
+        let mut h_b = Vec::with_capacity(self.hidden_size);
+        self.project_in_parallel_into(talker_hidden, workers, &mut h_a)?;
+        h_b.resize(h_a.len(), 0.0);
         for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
             cancel()?;
-            h = std::borrow::Cow::Owned(layer.forward_step_reusing(
-                &h,
+            layer.forward_step_into(
+                &h_a,
                 self.num_q_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -1664,18 +1789,23 @@ impl CodePredictorModel {
                 None,
                 workers,
                 decoder_workspace,
-            )?);
+                &mut h_b,
+            )?;
+            std::mem::swap(&mut h_a, &mut h_b);
         }
 
         observe(PredictorObservation::Prefill { cache: kv_caches })?;
         let mut next_raw = c0_emb;
+        let mut normed = Vec::with_capacity(self.hidden_size);
+        let mut logits = Vec::with_capacity(self.vocab_size);
         for g in 0..NUM_ACOUSTIC_CODEBOOKS {
             cancel()?;
-            let mut h_step = self.project_in_parallel(next_raw, workers)?;
+            self.project_in_parallel_into(next_raw, workers, &mut h_a)?;
+            h_b.resize(h_a.len(), 0.0);
             for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
                 cancel()?;
-                h_step = std::borrow::Cow::Owned(layer.forward_step_reusing(
-                    &h_step,
+                layer.forward_step_into(
+                    &h_a,
                     self.num_q_heads,
                     self.num_kv_heads,
                     self.head_dim,
@@ -1685,10 +1815,12 @@ impl CodePredictorModel {
                     None,
                     workers,
                     decoder_workspace,
-                )?);
+                    &mut h_b,
+                )?;
+                std::mem::swap(&mut h_a, &mut h_b);
             }
-            let normed = rms_norm(&h_step, &self.norm_w, self.rms_norm_eps)?;
-            let mut logits = self.lm_heads[g].forward_vec_parallel(&normed, None, workers)?;
+            rms_norm_into(&h_a, &self.norm_w, self.rms_norm_eps, &mut normed)?;
+            self.lm_heads[g].forward_vec_into(&normed, None, None, workers, &mut logits)?;
             observe(PredictorObservation::Logits {
                 codebook: g,
                 hidden: &normed,
@@ -1696,7 +1828,7 @@ impl CodePredictorModel {
                 cache: kv_caches,
             })?;
             cancel()?;
-            let sampled_idx = sampling::sample_top_k_p(
+            let sampled_idx = sampling::sample_top_k_p_with_scratch(
                 &mut logits,
                 sampling::SampleTopKPParams {
                     temperature: params.subtalker_temperature,
@@ -1709,7 +1841,7 @@ impl CodePredictorModel {
                         .wrapping_add(i64::try_from(g).unwrap_or(0)),
                 },
                 &[],
-                seen_scratch,
+                sampler_scratch,
                 None,
             )
             .ok_or_else(|| {

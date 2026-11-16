@@ -19,10 +19,11 @@ pub(crate) struct DecoderWorkspace {
     pub(super) projected: Vec<f32>,
     pub(super) gate: Vec<f32>,
     pub(super) up: Vec<f32>,
+    pub(super) residual: Vec<f32>,
 }
 
 impl DecoderWorkspace {
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.norm.clear();
         self.q.clear();
         self.k.clear();
@@ -32,13 +33,14 @@ impl DecoderWorkspace {
         self.projected.clear();
         self.gate.clear();
         self.up.clear();
+        self.residual.clear();
     }
 }
 
 pub(super) fn resize(values: &mut Vec<f32>, length: usize) -> io::Result<()> {
-    if length > values.len() {
+    if length > values.capacity() {
         values
-            .try_reserve_exact(length - values.len())
+            .try_reserve(length - values.len())
             .map_err(io::Error::other)?;
     }
     values.resize(length, 0.0);
@@ -51,7 +53,7 @@ mod tests {
     use crate::engine::{LayerKvCache, LinearProjection, QwenDecoderLayer, WeightQuantization};
     use std::io;
 
-    fn buffers(workspace: &mut DecoderWorkspace) -> [&mut Vec<f32>; 9] {
+    fn buffers(workspace: &mut DecoderWorkspace) -> [&mut Vec<f32>; 10] {
         [
             &mut workspace.norm,
             &mut workspace.q,
@@ -62,6 +64,7 @@ mod tests {
             &mut workspace.projected,
             &mut workspace.gate,
             &mut workspace.up,
+            &mut workspace.residual,
         ]
     }
 
