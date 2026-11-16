@@ -17,6 +17,22 @@ struct Buffer {
 }
 
 impl Buffer {
+    fn with_hint_and_limit(hint: usize, limit: usize) -> Result<Self, Rejection> {
+        let initial = hint.min(limit);
+        let mut bytes = Vec::new();
+        if initial > 0 {
+            bytes
+                .try_reserve_exact(initial)
+                .map_err(|_| Rejection::BodySize)?;
+        }
+        Ok(Self {
+            bytes,
+            limit,
+            exceeded: false,
+        })
+    }
+
+    #[cfg(test)]
     const fn with_limit(limit: usize) -> Self {
         Self {
             bytes: Vec::new(),
@@ -58,14 +74,15 @@ impl Write for Buffer {
 
 #[cfg(test)]
 pub(super) fn serialize(value: &impl serde::Serialize) -> Result<Vec<u8>, Rejection> {
-    serialize_with_limit(value, MAX_BODY_BYTES)
+    serialize_with_hint_and_limit(value, 0, MAX_BODY_BYTES)
 }
 
-pub(super) fn serialize_with_limit(
+pub(super) fn serialize_with_hint_and_limit(
     value: &impl serde::Serialize,
+    hint: usize,
     limit: usize,
 ) -> Result<Vec<u8>, Rejection> {
-    let mut output = Buffer::with_limit(limit);
+    let mut output = Buffer::with_hint_and_limit(hint, limit)?;
     serde_json::to_writer(&mut output, value).map_err(|_| {
         if output.exceeded {
             Rejection::BodySize
@@ -110,6 +127,30 @@ mod tests {
         );
         assert_eq!(
             serialize(&"x".repeat(MAX_BODY_BYTES - 1)),
+            Err(Rejection::BodySize)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_buffer_hint_preallocates_within_limit_and_rejects_excess() -> Result<(), Rejection>
+    {
+        let buffer = Buffer::with_hint_and_limit(512, 1024)?;
+        assert!(buffer.bytes.capacity() >= 512);
+        assert!(buffer.bytes.capacity() <= 1024);
+
+        let clamped = Buffer::with_hint_and_limit(8192, 1024)?;
+        assert_eq!(clamped.bytes.capacity(), 1024);
+
+        let payload = "hinted-json-payload-雪";
+        let hinted = serialize_with_hint_and_limit(&payload, 64, 256)?;
+        let expected = serialize(&payload)?;
+        assert_eq!(hinted, expected);
+        assert!(hinted.capacity() >= 64);
+        assert!(hinted.capacity() <= 256);
+
+        assert_eq!(
+            serialize_with_hint_and_limit(&"x".repeat(65), 128, 64),
             Err(Rejection::BodySize)
         );
         Ok(())

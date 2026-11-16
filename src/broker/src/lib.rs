@@ -509,7 +509,7 @@ impl AuthorizedHead {
             }]
         });
         let max_completion_tokens = chat.max_completion_tokens;
-        let body = request_buffer::serialize_with_limit(
+        let body = request_buffer::serialize_with_hint_and_limit(
             &BackendChat {
                 messages: &chat.messages,
                 max_completion_tokens,
@@ -532,6 +532,7 @@ impl AuthorizedHead {
                     preserve_thinking: true,
                 },
             },
+            self.length.saturating_add(256),
             self.max_body_bytes(),
         )?;
         Ok(PendingChat {
