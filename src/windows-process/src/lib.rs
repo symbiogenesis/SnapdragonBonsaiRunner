@@ -2136,4 +2136,18 @@ mod storage_budget_tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn listener_process_id_reports_owned_loopback_socket_and_closed_port() -> io::Result<()> {
+        assert_eq!(
+            listener_process_id(0).err().map(|err| err.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        assert_eq!(listener_process_id(port)?, Some(std::process::id()));
+        drop(listener);
+        assert_eq!(listener_process_id(port)?, None);
+        Ok(())
+    }
 }

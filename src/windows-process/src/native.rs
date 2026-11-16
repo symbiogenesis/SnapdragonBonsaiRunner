@@ -1436,31 +1436,18 @@ pub(super) fn bind_exclusive_loopback_listener(
 
 pub(super) fn listener_process_id(port: u16) -> io::Result<Option<u32>> {
     const TCP_ROW_WORDS: usize = 6;
+    const INITIAL_TCP_TABLE_BYTES: u32 = 4096;
     const _: () = {
         assert!(size_of::<MIB_TCPROW_OWNER_PID>() == TCP_ROW_WORDS * size_of::<u32>());
         assert!(std::mem::offset_of!(MIB_TCPROW_OWNER_PID, dwLocalAddr) == 4);
         assert!(std::mem::offset_of!(MIB_TCPROW_OWNER_PID, dwLocalPort) == 8);
         assert!(std::mem::offset_of!(MIB_TCPROW_OWNER_PID, dwOwningPid) == 20);
     };
-    let mut bytes = 0;
-    // SAFETY: The documented size-query call uses null storage and a valid size
-    // pointer; IPv4 and the PID-listener table class are compatible.
-    let result = unsafe {
-        GetExtendedTcpTable(
-            null_mut(),
-            &raw mut bytes,
-            0,
-            u32::from(AF_INET),
-            TCP_TABLE_OWNER_PID_LISTENER,
-            0,
-        )
-    };
-    if result != ERROR_INSUFFICIENT_BUFFER {
-        return Err(table_error(result));
-    }
-    // Retry boundedly if listeners change between sizing and reading. Bound both
-    // bytes and entry counts before reading the variable-length native table.
-    for _ in 0..4 {
+    let mut bytes = INITIAL_TCP_TABLE_BYTES;
+    // Start with a 4 KiB buffer so typical listener tables succeed on the
+    // first syscall without a guaranteed ERROR_INSUFFICIENT_BUFFER probe.
+    // Retry boundedly if listeners exceed 4 KiB or change while reading.
+    for _ in 0..5 {
         if !(4..=16_777_216).contains(&bytes) {
             return Err(io::Error::other("invalid TCP table size"));
         }
@@ -1470,7 +1457,7 @@ pub(super) fn listener_process_id(port: u16) -> io::Result<Option<u32>> {
         let mut returned = u32::try_from(size_of_val(storage.as_slice()))
             .map_err(|_| io::Error::other("TCP table size overflow"))?;
         // SAFETY: The aligned allocation is writable for `returned` bytes and
-        // stays live; the same IPv4/class query produced the sizing request.
+        // stays live for the duration of the IPv4 PID-listener table query.
         let result = unsafe {
             GetExtendedTcpTable(
                 storage.as_mut_ptr().cast(),
