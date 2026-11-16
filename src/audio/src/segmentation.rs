@@ -75,9 +75,90 @@ fn sample_energy(sample: [u8; 2]) -> u64 {
     u64::from(i16::from_le_bytes(sample).unsigned_abs()).pow(2)
 }
 
+/// Adaptive pause boundary selection combining the quiet-RMS baseline with
+/// [`crate::VoiceActivityDetector`] so steady low-frequency noise does not mask
+/// real pauses between speech segments.
+///
+/// Falls back to [`pcm16_pause_boundary`] when the sample rate is outside
+/// `8/16/32/48 kHz` or when the payload already contains a clear quiet pause.
+#[must_use]
+pub fn pcm16_pause_boundary_adaptive(
+    data: &[u8],
+    sample_rate: u32,
+    minimum_samples: usize,
+) -> Option<usize> {
+    let baseline = pcm16_pause_boundary(data, sample_rate, minimum_samples)?;
+    let (pcm, _) = data.as_chunks::<2>();
+    let samples = pcm.len();
+    if baseline < samples || samples <= minimum_samples {
+        return Some(baseline);
+    }
+
+    let Some(mut vad) = crate::vad::VoiceActivityDetector::new(crate::vad::VadConfig {
+        sample_rate,
+        frame_ms: 20,
+        aggressiveness: 2,
+        hangover_frames: 4,
+    }) else {
+        return Some(baseline);
+    };
+
+    let frame_len = vad.frame_samples();
+    let frame_count = samples / frame_len;
+    if frame_count < 4 || frame_len > 960 {
+        return Some(baseline);
+    }
+
+    let mut frame_buf = [0_i16; 960];
+    let mut statuses = Vec::with_capacity(frame_count);
+    for frame_idx in 0..frame_count {
+        let start = frame_idx * frame_len;
+        for (dst, &bytes) in frame_buf[..frame_len]
+            .iter_mut()
+            .zip(pcm[start..start + frame_len].iter())
+        {
+            *dst = i16::from_le_bytes(bytes);
+        }
+        statuses.push(
+            vad.process_frame(&frame_buf[..frame_len])
+                .unwrap_or(crate::vad::VadFrameStatus::Silence),
+        );
+    }
+
+    if statuses.last() == Some(&crate::vad::VadFrameStatus::Silence) {
+        return Some(samples);
+    }
+
+    let mut best_cut = None;
+    let mut idx = 0;
+    let mut seen_speech = false;
+    while idx < statuses.len() {
+        if statuses[idx] != crate::vad::VadFrameStatus::Silence {
+            if statuses[idx] == crate::vad::VadFrameStatus::Speech {
+                seen_speech = true;
+            }
+            idx += 1;
+            continue;
+        }
+        let run_start = idx;
+        while idx < statuses.len() && statuses[idx] == crate::vad::VadFrameStatus::Silence {
+            idx += 1;
+        }
+        let run_len = idx - run_start;
+        if seen_speech && run_len >= 2 && idx < statuses.len() {
+            let mid = ((run_start + idx) * frame_len) / 2;
+            if mid >= minimum_samples && mid <= samples - frame_len {
+                best_cut = Some(mid);
+            }
+        }
+    }
+
+    Some(best_cut.unwrap_or(samples))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::pcm16_pause_boundary;
+    use super::{pcm16_pause_boundary, pcm16_pause_boundary_adaptive};
 
     fn pcm(samples: &[i16]) -> Vec<u8> {
         samples
@@ -171,5 +252,35 @@ mod tests {
         assert_eq!(pcm16_pause_boundary(&[0, 0, 0], 16_000, 1), None);
         assert_eq!(pcm16_pause_boundary(&[0, 0], 0, 1), None);
         assert_eq!(pcm16_pause_boundary(&[0, 0], 16_000, 0), None);
+    }
+
+    #[test]
+    fn adaptive_pause_boundary_finds_speech_pause_over_steady_hum() {
+        let mut samples = vec![0_i16; 32_000];
+        let mut t = 0_usize;
+        for sample in &mut samples {
+            let sec = f64::from(u16::try_from(t % 16_000).unwrap_or(0)) / 16_000.0
+                + f64::from(u8::try_from(t / 16_000).unwrap_or(0));
+            // Steady -26 dBFS hum (~1_600 peak, ~1_130 RMS) well above 256 scalar limit.
+            let hum = (1_600.0 * (2.0 * std::f64::consts::PI * 120.0 * sec).sin()).round();
+            let speech = if (11_200..22_400).contains(&t) || (25_600..32_000).contains(&t) {
+                (4_800.0 * (2.0 * std::f64::consts::PI * 520.0 * sec).sin()).round()
+            } else {
+                0.0
+            };
+            #[allow(
+                clippy::as_conversions,
+                clippy::cast_possible_truncation,
+                reason = "Bounded test waveform sums convert cleanly to i16."
+            )]
+            let combined = (hum + speech).clamp(-32767.0, 32767.0) as i16;
+            *sample = combined;
+            t += 1;
+        }
+        let bytes = pcm(&samples);
+        // Scalar baseline rejects all pauses because steady hum exceeds 256 RMS.
+        assert_eq!(pcm16_pause_boundary(&bytes, 16_000, 20_000), Some(32_000));
+        let adaptive = pcm16_pause_boundary_adaptive(&bytes, 16_000, 20_000).unwrap_or_default();
+        assert!((22_400..=25_600).contains(&adaptive));
     }
 }

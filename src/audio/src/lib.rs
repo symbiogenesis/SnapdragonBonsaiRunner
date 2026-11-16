@@ -9,8 +9,10 @@
 use std::{error::Error, fmt};
 
 mod segmentation;
+mod vad;
 
-pub use segmentation::pcm16_pause_boundary;
+pub use segmentation::{pcm16_pause_boundary, pcm16_pause_boundary_adaptive};
+pub use vad::{VadConfig, VadFrameStatus, VoiceActivityDetector};
 
 /// Descriptive error returned by checked WAV framing and PCM16 conversion helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

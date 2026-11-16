@@ -33,7 +33,7 @@ pub(super) fn pause_segment(
     let boundary = if last {
         samples
     } else {
-        bonsai_audio::pcm16_pause_boundary(pending, 16_000, MIN_PAUSE_SAMPLES.min(samples))
+        bonsai_audio::pcm16_pause_boundary_adaptive(pending, 16_000, MIN_PAUSE_SAMPLES.min(samples))
             .ok_or(CODEC_FAILURE)?
     };
     let bytes = boundary * 2;
