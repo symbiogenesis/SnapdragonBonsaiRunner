@@ -32,11 +32,11 @@ pub use sealed::{
 
 #[allow(
     unsafe_code,
-    reason = "Audited CNG SHA-256 boundary owns its hash handle and borrows input only during each call."
+    reason = "Audited CNG SHA-256 and read-only file-mapping boundary owns handles/views and borrows bytes only per call."
 )]
 mod hash;
 
-pub use hash::Sha256;
+pub use hash::{MIN_MAPPED_HASH_BYTES, Sha256, try_hash_locked_file_mapped};
 
 /// Queries the actual Windows process token, without trusting an environment flag.
 ///

@@ -252,8 +252,7 @@ impl VerifiedFile {
         let mut held_ancestors = BTreeSet::new();
         hold_ancestors(path, &mut handles, &mut held_ancestors, &mut checkpoint)?;
         let mut file = open_locked_file_with_access(path, true)?;
-        let mut buffer = verification_buffer(bytes);
-        check_locked(&mut file, bytes, hash, &mut buffer, &mut checkpoint)?;
+        check_locked_preferred(&mut file, bytes, hash, &mut checkpoint)?;
         handles.push(file);
         Ok(Self {
             path: path.to_owned(),
@@ -383,6 +382,70 @@ fn validate_read_path(path: &Path) -> Result<(), ArtifactError> {
     }
 }
 
+fn finish_locked_check(
+    file: &mut File,
+    digest: &str,
+    expected_hash: &str,
+) -> Result<(), ArtifactError> {
+    if digest != expected_hash {
+        return Err(ArtifactError::Identity);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ArtifactError::Identity)?;
+    Ok(())
+}
+
+fn try_check_locked_mapped(
+    file: &mut File,
+    bytes: u64,
+    hash: &str,
+    checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
+) -> Result<bool, ArtifactError> {
+    checkpoint()?;
+    if file.metadata().map_err(|_| ArtifactError::Identity)?.len() != bytes {
+        return Err(ArtifactError::Identity);
+    }
+    #[cfg(windows)]
+    {
+        if let Some(digest) = bonsai_windows_credentials::try_hash_locked_file_mapped(
+            file,
+            bytes,
+            checkpoint,
+            |_| ArtifactError::Identity,
+        )? {
+            finish_locked_check(file, &digest_hex(digest), hash)?;
+            return Ok(true);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (file, bytes, hash);
+    Ok(false)
+}
+
+fn check_locked_preferred(
+    file: &mut File,
+    bytes: u64,
+    hash: &str,
+    checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    if try_check_locked_mapped(file, bytes, hash, checkpoint)? {
+        return Ok(());
+    }
+    let mut buffer = verification_buffer(bytes);
+    check_locked_buffered(file, bytes, hash, &mut buffer, checkpoint)
+}
+
+fn check_locked_buffered(
+    file: &mut File,
+    bytes: u64,
+    hash: &str,
+    buffer: &mut [u8],
+    checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    let digest = hash_reader(file, bytes, buffer, checkpoint)?;
+    finish_locked_check(file, &digest, hash)
+}
+
 fn check_locked(
     file: &mut File,
     bytes: u64,
@@ -390,17 +453,10 @@ fn check_locked(
     buffer: &mut [u8],
     checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
 ) -> Result<(), ArtifactError> {
-    checkpoint()?;
-    if file.metadata().map_err(|_| ArtifactError::Identity)?.len() != bytes {
-        return Err(ArtifactError::Identity);
+    if try_check_locked_mapped(file, bytes, hash, checkpoint)? {
+        return Ok(());
     }
-    let digest = hash_reader(file, bytes, buffer, checkpoint)?;
-    if digest != hash {
-        return Err(ArtifactError::Identity);
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| ArtifactError::Identity)?;
-    Ok(())
+    check_locked_buffered(file, bytes, hash, buffer, checkpoint)
 }
 
 fn digest_hex(digest: [u8; 32]) -> String {
@@ -1293,6 +1349,60 @@ mod tests {
         assert_eq!(handles.len(), held_count);
 
         drop(handles);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_file_mapped_path_accepts_rejects_tamper_and_cancels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "SwiftBonsai-mapped-verify-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root)?;
+        let file_path = root.join("large-artifact.gguf");
+        let len = usize::try_from(bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES)? + 4_096;
+        let mut payload = vec![0x5a_u8; len];
+        payload[0] = 0x11;
+        payload[len - 1] = 0x99;
+        fs::write(&file_path, &payload)?;
+        let expected_hash = hex::encode(Sha256::digest(&payload));
+
+        let mut total_checks = 0_usize;
+        let guard =
+            VerifiedFile::verify_with(&file_path, u64::try_from(len)?, &expected_hash, || {
+                total_checks += 1;
+                Ok(())
+            })?;
+        drop(guard);
+        assert!(total_checks >= 5);
+
+        let mut checks = 0_usize;
+        assert_eq!(
+            VerifiedFile::verify_with(&file_path, u64::try_from(len)?, &expected_hash, || {
+                checks += 1;
+                if checks >= total_checks {
+                    Err(ArtifactError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            })
+            .err(),
+            Some(ArtifactError::Cancelled)
+        );
+
+        payload[len - 1] ^= 0x01;
+        fs::write(&file_path, &payload)?;
+        assert_eq!(
+            VerifiedFile::verify(&file_path, u64::try_from(len)?, &expected_hash).err(),
+            Some(ArtifactError::Identity)
+        );
+
         fs::remove_dir_all(root)?;
         Ok(())
     }

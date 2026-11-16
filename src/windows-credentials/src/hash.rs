@@ -1,8 +1,144 @@
 //! Streaming SHA-256 through Windows' CPU-dispatched CNG implementation.
 
-use std::{io, ptr};
+use std::{
+    ffi::c_void,
+    fs::File,
+    io,
+    os::windows::io::AsRawHandle,
+    ptr::{self, NonNull},
+};
 
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY,
+    PrefetchVirtualMemory, UnmapViewOfFile, WIN32_MEMORY_RANGE_ENTRY,
+};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+/// Minimum regular-file length (`4 MiB`) that uses read-only section mapping,
+/// prefetching, and chunked CNG updates instead of buffered `Read` hashing.
+pub const MIN_MAPPED_HASH_BYTES: u64 = 4 * 1024 * 1024;
+const MAPPED_HASH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const MAPPED_PREFETCH_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+
+struct MappingHandle(HANDLE);
+
+impl Drop for MappingHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was returned non-null by `CreateFileMappingW` and outlives `_view`.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct MappedView(NonNull<u8>);
+
+impl Drop for MappedView {
+    fn drop(&mut self) {
+        let address = MEMORY_MAPPED_VIEW_ADDRESS {
+            Value: self.0.as_ptr().cast(),
+        };
+        // SAFETY: `self.0` was returned by `MapViewOfFile` and is unmapped once on Drop.
+        unsafe { UnmapViewOfFile(address) };
+    }
+}
+
+struct ReadOnlyMapping {
+    // Field drop order matters: unmap view before closing the section handle.
+    view: MappedView,
+    _mapping: MappingHandle,
+    len: usize,
+}
+
+impl ReadOnlyMapping {
+    fn open(file: &File, expected_bytes: u64) -> Option<Self> {
+        if expected_bytes < MIN_MAPPED_HASH_BYTES {
+            return None;
+        }
+        let Ok(metadata) = file.metadata() else {
+            return None;
+        };
+        if !metadata.is_file() || metadata.len() != expected_bytes {
+            return None;
+        }
+        let len = usize::try_from(expected_bytes).ok()?;
+        // SAFETY: `file` is a valid regular file handle; zero max size maps the whole file read-only.
+        let handle = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                ptr::null(),
+                PAGE_READONLY,
+                0,
+                0,
+                ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return None;
+        }
+        let mapping = MappingHandle(handle);
+        // SAFETY: `mapping.0` is a valid read-only section covering `len` bytes at offset zero.
+        let view_addr = unsafe { MapViewOfFile(mapping.0, FILE_MAP_READ, 0, 0, len) };
+        let base = NonNull::new(view_addr.Value.cast::<u8>())?;
+        Some(Self {
+            view: MappedView(base),
+            _mapping: mapping,
+            len,
+        })
+    }
+
+    const fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `self.view.0` points to `self.len` read-only mapped bytes valid until `Drop`.
+        unsafe { std::slice::from_raw_parts(self.view.0.as_ptr(), self.len) }
+    }
+}
+
+fn prefetch_window(window: &[u8]) {
+    if window.is_empty() {
+        return;
+    }
+    let mut entry = WIN32_MEMORY_RANGE_ENTRY {
+        VirtualAddress: window.as_ptr().cast_mut().cast::<c_void>(),
+        NumberOfBytes: window.len(),
+    };
+    // SAFETY: `GetCurrentProcess` returns the pseudo-handle for the current process.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: `process` is the calling process pseudo-handle and `entry` points to one live range.
+    let _ = unsafe { PrefetchVirtualMemory(process, 1, &raw mut entry, 0) };
+}
+
+/// Hash a read-locked regular file of `expected_bytes` via a read-only section
+/// view, `PrefetchVirtualMemory`, and `4 MiB` chunked CNG updates, invoking
+/// `checkpoint` before mapping and before each prefetch/update step.
+///
+/// Returns `Ok(None)` when `expected_bytes < MIN_MAPPED_HASH_BYTES`, the length
+/// mismatches or overflows `usize`, or section/view creation is unsupported so
+/// callers can fall back to buffered `Read` hashing without losing cancellation.
+///
+/// # Errors
+/// Returns `checkpoint` errors immediately after releasing the mapped view or
+/// CNG hashing failures converted by `map_io_error`.
+pub fn try_hash_locked_file_mapped<E>(
+    file: &File,
+    expected_bytes: u64,
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+    mut map_io_error: impl FnMut(io::Error) -> E,
+) -> Result<Option<[u8; 32]>, E> {
+    checkpoint()?;
+    let Some(mapping) = ReadOnlyMapping::open(file, expected_bytes) else {
+        return Ok(None);
+    };
+    let mut hasher = Sha256::new().map_err(&mut map_io_error)?;
+    for window in mapping.as_bytes().chunks(MAPPED_PREFETCH_WINDOW_BYTES) {
+        checkpoint()?;
+        prefetch_window(window);
+        for chunk in window.chunks(MAPPED_HASH_CHUNK_BYTES) {
+            checkpoint()?;
+            hasher.update(chunk).map_err(&mut map_io_error)?;
+        }
+    }
+    hasher.finish().map(Some).map_err(map_io_error)
+}
 
 /// A streaming SHA-256 hash using Windows' CPU-dispatched CNG implementation.
 ///
@@ -128,6 +264,75 @@ mod tests {
             super::super::hex(&hash.finish()?),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_file_hashing_matches_cng_digest_and_honors_cancellation() -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "SwiftBonsai-mapped-hash-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        let len = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)? + 12_345;
+        let payload: Vec<u8> = (0..len)
+            .map(|i| u8::try_from((i.wrapping_mul(31) ^ (i >> 8)) & 0xff).unwrap_or(0))
+            .collect();
+        std::fs::write(&path, &payload)?;
+
+        let expected = Sha256::digest_bytes(&payload)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+            .open(&path)?;
+
+        // Below threshold returns Ok(None) for buffered fallback.
+        assert_eq!(
+            try_hash_locked_file_mapped(
+                &file,
+                MIN_MAPPED_HASH_BYTES - 1,
+                &mut || Ok::<(), io::Error>(()),
+                |e| e
+            )?,
+            None
+        );
+
+        let mut checks = 0_usize;
+        let actual = try_hash_locked_file_mapped(
+            &file,
+            u64::try_from(len).map_err(io::Error::other)?,
+            &mut || {
+                checks += 1;
+                Ok::<(), io::Error>(())
+            },
+            |e| e,
+        )?;
+        assert_eq!(actual, Some(expected));
+        assert!(checks >= 4);
+
+        let mut cancel_checks = 0_usize;
+        let cancelled = try_hash_locked_file_mapped(
+            &file,
+            u64::try_from(len).map_err(io::Error::other)?,
+            &mut || {
+                cancel_checks += 1;
+                if cancel_checks >= 3 {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+                } else {
+                    Ok(())
+                }
+            },
+            |e| e,
+        );
+        assert!(cancelled.is_err());
+
+        drop(file);
+        std::fs::remove_file(path)?;
         Ok(())
     }
 }
