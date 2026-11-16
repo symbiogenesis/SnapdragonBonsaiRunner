@@ -440,11 +440,10 @@ fn encode_video_sample(
     // SAFETY: Valid live IMFSample converting to a contiguous locked buffer.
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }.map_err(|_| ERR_DECODE)?;
     let locked = LockedBuffer::lock(&buffer)?;
-    let rgba =
-        image::bgrx_stride_to_rgba(locked.bytes, src_w, src_h, stride).map_err(|_| ERR_DECODE)?;
-    drop(locked);
     let scaled =
-        image::downscale_rgba(&rgba, src_w, src_h, dst_w, dst_h).map_err(|_| ERR_DECODE)?;
+        image::downscale_bgrx_stride_to_rgba(locked.bytes, src_w, src_h, stride, dst_w, dst_h)
+            .map_err(|_| ERR_DECODE)?;
+    drop(locked);
     let png_bytes = image::encode_rgba_png(&scaled, dst_w, dst_h, MAX_MODEL_PNG_BYTES)
         .map_err(|_| ERR_MEMORY)?;
     let thumbnail = if with_thumbnail {
