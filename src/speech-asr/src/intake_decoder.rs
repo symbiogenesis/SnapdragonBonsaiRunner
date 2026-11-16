@@ -65,23 +65,68 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
         Ok((tensor.kind, bytes))
     }
 
+    fn stream_tensor_values(
+        &mut self,
+        name: &str,
+        expected_kind: u32,
+        elem_bytes: usize,
+        cancel: &mut impl FnMut() -> bool,
+        mut decode_chunk: impl FnMut(&[u8], &mut Vec<f32>) -> io::Result<()>,
+    ) -> io::Result<Vec<f32>> {
+        let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
+        let elem_bytes_u64 = u64::try_from(elem_bytes).map_err(|_| invalid())?;
+        if tensor.kind != expected_kind || !tensor.bytes.is_multiple_of(elem_bytes_u64) {
+            return Err(invalid());
+        }
+        self.remaining = self
+            .remaining
+            .checked_sub(tensor.bytes)
+            .ok_or_else(invalid)?;
+        let byte_count = usize::try_from(tensor.bytes).map_err(|_| invalid())?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(byte_count / elem_bytes)
+            .map_err(io::Error::other)?;
+        self.source.seek(SeekFrom::Start(tensor.offset))?;
+        let mut scratch = [0_u8; 64 * 1024];
+        let max_step = (scratch.len() / elem_bytes) * elem_bytes;
+        let mut read_bytes = 0_usize;
+        while read_bytes < byte_count {
+            if cancel() {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let step = (byte_count - read_bytes).min(max_step);
+            self.source.read_exact(&mut scratch[..step])?;
+            decode_chunk(&scratch[..step], &mut values)?;
+            read_bytes += step;
+        }
+        Ok(values)
+    }
+
     pub(super) fn vector(
         &mut self,
         name: &str,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Vec<f32>> {
-        let (kind, bytes) = self.bytes(name, cancel)?;
-        if kind != 0 || !bytes.len().is_multiple_of(4) {
-            return Err(invalid());
-        }
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(bytes.len() / 4)
-            .map_err(io::Error::other)?;
-        for &bytes in bytes.as_chunks::<4>().0 {
-            values.push(f32::from_le_bytes(bytes));
-        }
-        Ok(values)
+        self.stream_tensor_values(name, 0, 4, cancel, |chunk, values| {
+            for &raw in chunk.as_chunks::<4>().0 {
+                values.push(f32::from_le_bytes(raw));
+            }
+            Ok(())
+        })
+    }
+
+    fn f16_vector(
+        &mut self,
+        name: &str,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<Vec<f32>> {
+        self.stream_tensor_values(name, 1, 2, cancel, |chunk, values| {
+            for &raw in chunk.as_chunks::<2>().0 {
+                values.push(decode_f16(u16::from_le_bytes(raw))?);
+            }
+            Ok(())
+        })
     }
 
     pub(super) fn projection(
@@ -100,7 +145,7 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
         }
         match tensor.kind {
             0 => Projection::f32(input, output, self.vector(name, cancel)?),
-            1 => Projection::f16(input, output, &self.bytes(name, cancel)?.1),
+            1 => Projection::f32(input, output, self.f16_vector(name, cancel)?),
             8 => Projection::q8(input, output, self.bytes(name, cancel)?.1),
             _ => Err(invalid()),
         }
@@ -128,10 +173,18 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
             usize::try_from(tensor.shape.get(3).copied().unwrap_or(1)).map_err(|_| invalid())?;
         match tensor.kind {
             0 => Projection::f32(input, output, self.vector(name, cancel)?),
-            1 => Projection::f16(input, output, &self.bytes(name, cancel)?.1),
+            1 => Projection::f32(input, output, self.f16_vector(name, cancel)?),
             _ => Err(invalid()),
         }
     }
+}
+
+fn decode_f16(bits: u16) -> io::Result<f32> {
+    let value = half::f16::from_bits(bits);
+    if !value.is_finite() {
+        return Err(invalid());
+    }
+    Ok(value.to_f32())
 }
 
 pub(super) fn load<R: Read + Seek>(

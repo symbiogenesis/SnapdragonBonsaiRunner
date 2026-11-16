@@ -617,7 +617,9 @@ fn rust_asr_intake_pinned_model_index() -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(1).custom_flags(0x0020_0000);
+        options
+            .share_mode(1)
+            .custom_flags(0x0020_0000 | 0x0800_0000);
     }
     let mut file = options.open(path)?;
     let metadata = file.metadata()?;

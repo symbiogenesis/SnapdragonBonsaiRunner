@@ -126,7 +126,10 @@ impl RustRecognizer {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt as _;
-            options.share_mode(1).custom_flags(0x0020_0000);
+            // Combine FILE_FLAG_OPEN_REPARSE_POINT with FILE_FLAG_SEQUENTIAL_SCAN.
+            options
+                .share_mode(1)
+                .custom_flags(0x0020_0000 | 0x0800_0000);
         }
         let mut file = options.open(path)?;
         let properties = file.metadata()?;
