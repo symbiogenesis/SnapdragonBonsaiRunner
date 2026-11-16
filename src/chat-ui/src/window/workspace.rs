@@ -144,8 +144,8 @@ impl State {
         self.input.clear();
         self.set_draft_attachments(Vec::new());
         self.attachment_notice = None;
-        self.last_answer.clear();
-        self.retained_draft.clear();
+        super::clear_and_shrink_buffer(&mut self.last_answer);
+        super::clear_and_shrink_buffer(&mut self.retained_draft);
         self.stage = None;
         self.answer_complete = false;
         self.streaming_svg_filter.reset();

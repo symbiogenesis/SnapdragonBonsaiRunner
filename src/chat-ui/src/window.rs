@@ -246,6 +246,20 @@ struct State {
     last_theme_check: Instant,
 }
 
+const BUFFER_HIGH_WATER_BYTES: usize = 64 * 1024;
+const BUFFER_RETAINED_BYTES: usize = 4 * 1024;
+
+fn clear_and_shrink_buffer(text: &mut String) {
+    text.clear();
+    shrink_excess_buffer(text);
+}
+
+fn shrink_excess_buffer(text: &mut String) {
+    if text.capacity() > BUFFER_HIGH_WATER_BYTES && text.len() <= BUFFER_HIGH_WATER_BYTES / 2 {
+        text.shrink_to(text.len().max(BUFFER_RETAINED_BYTES));
+    }
+}
+
 impl State {
     fn create(
         commands: Sender<Command>,
@@ -737,8 +751,8 @@ impl State {
         } else {
             self.stop_speech_output();
         }
-        self.last_answer.clear();
-        self.retained_draft.clear();
+        clear_and_shrink_buffer(&mut self.last_answer);
+        clear_and_shrink_buffer(&mut self.retained_draft);
         self.attachment_notice = None;
         self.stage = None;
         self.answer_complete = false;
@@ -1020,6 +1034,7 @@ impl State {
             .filter(|entry| entry.role == "assistant")
         {
             answer.content.as_ref().clone_into(&mut self.last_answer);
+            shrink_excess_buffer(&mut self.last_answer);
             self.answer_complete = !self.transcript.latest_interrupted(&self.committed);
         }
     }
@@ -1293,7 +1308,7 @@ impl State {
             Event::Stage(label) => {
                 self.replace_streaming_stage();
                 self.stage = Some(label);
-                self.last_answer.clear();
+                clear_and_shrink_buffer(&mut self.last_answer);
                 self.answer_complete = false;
                 self.transcript.stage();
                 self.set_status(label, false);
@@ -1369,6 +1384,7 @@ impl State {
             self.transcript
                 .replace_response(&answer.content, answer.reasoning_content.as_deref());
             answer.content.as_ref().clone_into(&mut self.last_answer);
+            shrink_excess_buffer(&mut self.last_answer);
             self.answer_complete = true;
         }
         self.transcript.bind_committed(&self.committed, &history);
@@ -3354,6 +3370,47 @@ mod startup_tests {
             speech::Command::Speak { text, voice_description }
                 if text == "Recovered answer to read aloud." && voice_description == state.voice_profile
         ));
+        drop(state);
+        fs::remove_dir_all(&directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn high_water_answer_and_draft_buffers_shrink_on_clear_and_short_restore() -> io::Result<()> {
+        let (request, directory) = fixture()?;
+        let (commands, _incoming) = mpsc::channel();
+        let (_events, incoming_events) = client::event_channel();
+        let mut state = State::pending_startup(commands, incoming_events, request);
+
+        state.last_answer = "a".repeat(256 * 1024);
+        state.retained_draft = "d".repeat(256 * 1024);
+        assert!(state.last_answer.capacity() > BUFFER_HIGH_WATER_BYTES);
+        assert!(state.retained_draft.capacity() > BUFFER_HIGH_WATER_BYTES);
+
+        state.clear_conversation();
+        assert!(state.last_answer.is_empty());
+        assert!(state.retained_draft.is_empty());
+        assert!(state.last_answer.capacity() <= BUFFER_HIGH_WATER_BYTES);
+        assert!(state.retained_draft.capacity() <= BUFFER_HIGH_WATER_BYTES);
+
+        state.last_answer = "b".repeat(256 * 1024);
+        state.committed.push(client::Message {
+            role: "assistant",
+            content: "short".into(),
+            reasoning_content: None,
+            images: std::sync::Arc::from([]),
+        });
+        state.restore_committed_last_answer();
+        assert_eq!(state.last_answer, "short");
+        assert!(state.last_answer.capacity() <= BUFFER_HIGH_WATER_BYTES);
+
+        // Steady-state capacity below high-water is preserved across clears.
+        let mut moderate = String::with_capacity(8 * 1024);
+        moderate.push_str("moderate");
+        let kept_cap = moderate.capacity();
+        clear_and_shrink_buffer(&mut moderate);
+        assert_eq!(moderate.capacity(), kept_cap);
+
         drop(state);
         fs::remove_dir_all(&directory)?;
         Ok(())

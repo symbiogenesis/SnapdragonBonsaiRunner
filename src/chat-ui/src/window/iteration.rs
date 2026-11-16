@@ -233,8 +233,8 @@ impl State {
             self.fail("The model worker stopped. Close and restart the app.");
             return true;
         }
-        self.last_answer.clear();
-        self.retained_draft.clear();
+        super::clear_and_shrink_buffer(&mut self.last_answer);
+        super::clear_and_shrink_buffer(&mut self.retained_draft);
         self.stage = None;
         self.answer_complete = false;
         if !self.streaming_active {
