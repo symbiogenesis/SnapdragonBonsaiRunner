@@ -181,10 +181,19 @@ pub(crate) struct Talker {
     tts_pad: Vec<f32>,
     tts_bos: Vec<f32>,
     tts_eos: Vec<f32>,
+    reference_text_rows: Vec<Vec<f32>>,
     threads: usize,
     base: bool,
     prefill_cache: Option<PrefillCache>,
+    reference_cache: Option<ReferencePromptCache>,
     workspace: Option<PredictorWorkspace>,
+}
+
+#[derive(Clone)]
+struct ReferencePromptCache {
+    codes: Vec<[i32; TOTAL_CODE_GROUPS]>,
+    text_rows: Vec<Vec<f32>>,
+    codec_rows: Vec<Vec<f32>>,
 }
 
 struct Prompt {
@@ -456,14 +465,21 @@ impl Talker {
             tts_pad: Vec::new(),
             tts_bos: Vec::new(),
             tts_eos: Vec::new(),
+            reference_text_rows: Vec::new(),
             threads,
             base,
             prefill_cache: None,
+            reference_cache: None,
             workspace: None,
         };
         result.tts_pad = result.project_text(result.specials.text_pad)?;
         result.tts_bos = result.project_text(result.specials.text_bos)?;
         result.tts_eos = result.project_text(result.specials.text_eos)?;
+        if base {
+            result.reference_text_rows = result
+                .project_reference_text_rows(&mut || Ok(()))
+                .unwrap_or_default();
+        }
         Ok(result)
     }
 
@@ -518,11 +534,93 @@ impl Talker {
         Ok(ids)
     }
 
+    fn project_reference_text_rows(
+        &self,
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<Vec<f32>>> {
+        let reference_ids = self.framed_ids(REFERENCE_TEXT)?;
+        let reference_body = &reference_ids[3..reference_ids.len() - 5];
+        let mut text_rows = Vec::with_capacity(reference_body.len());
+        for &id in reference_body {
+            cancel()?;
+            text_rows.push(self.project_text(id)?);
+        }
+        Ok(text_rows)
+    }
+
+    fn resolve_reference_icl(
+        &self,
+        reference: &Reference,
+        body: &[i32],
+        cache_slot: Option<&mut Option<ReferencePromptCache>>,
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, usize)> {
+        let existing = match cache_slot.as_deref() {
+            Some(slot) => slot.as_ref(),
+            None => self.reference_cache.as_ref(),
+        };
+        let (text_rows, cached_ref_text) = if !self.reference_text_rows.is_empty() {
+            (self.reference_text_rows.clone(), None)
+        } else if let Some(cached) = existing.filter(|c| !c.text_rows.is_empty()) {
+            (cached.text_rows.clone(), Some(cached.text_rows.clone()))
+        } else {
+            let computed = self.project_reference_text_rows(cancel)?;
+            (computed.clone(), Some(computed))
+        };
+        let ref_text_count = text_rows.len();
+        let mut full_text_rows = Vec::with_capacity(ref_text_count + body.len() + 1);
+        full_text_rows.extend(text_rows);
+        for &id in body {
+            cancel()?;
+            full_text_rows.push(self.project_text(id)?);
+        }
+        full_text_rows.push(self.tts_eos.clone());
+
+        let codec_rows = if let Some(cached) = existing.filter(|c| c.codes == reference.codes) {
+            cached.codec_rows.clone()
+        } else {
+            let mut rows = Vec::with_capacity(reference.codes.len() + 1);
+            rows.push(self.codec_row(self.specials.bos)?);
+            for frame in &reference.codes {
+                cancel()?;
+                rows.push(self.sum_codes(frame)?);
+            }
+            rows
+        };
+
+        if let Some(slot) = cache_slot {
+            let need_update = slot.as_ref().is_none_or(|c| {
+                c.codes != reference.codes
+                    || (self.reference_text_rows.is_empty() && c.text_rows.is_empty())
+            });
+            if need_update {
+                *slot = Some(ReferencePromptCache {
+                    codes: reference.codes.clone(),
+                    text_rows: cached_ref_text.unwrap_or_default(),
+                    codec_rows: codec_rows.clone(),
+                });
+            }
+        }
+        Ok((full_text_rows, codec_rows, ref_text_count))
+    }
+
+    #[cfg(test)]
     fn prompt(
         &self,
         text: &str,
         instruct: Option<&str>,
         reference: Option<&Reference>,
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Prompt> {
+        self.prompt_with_cache(text, instruct, reference, None, cancel)
+    }
+
+    fn prompt_with_cache(
+        &self,
+        text: &str,
+        instruct: Option<&str>,
+        reference: Option<&Reference>,
+        reference_cache: Option<&mut Option<ReferencePromptCache>>,
         cancel: &mut dyn FnMut() -> io::Result<()>,
     ) -> io::Result<Prompt> {
         if self.base != reference.is_some() || (self.base && instruct.is_some()) {
@@ -577,22 +675,11 @@ impl Talker {
         let body = &ids[3..ids.len() - 5];
         let mut cacheable_rows = 0;
         let trailing = if let Some(reference) = reference {
-            let reference_ids = self.framed_ids(REFERENCE_TEXT)?;
-            let reference_body = &reference_ids[3..reference_ids.len() - 5];
-            let mut text_rows = Vec::new();
-            for &id in reference_body.iter().chain(body) {
-                cancel()?;
-                text_rows.push(self.project_text(id)?);
-            }
-            text_rows.push(self.tts_eos.clone());
-            let mut codec_rows = vec![self.codec_row(self.specials.bos)?];
-            for frame in &reference.codes {
-                cancel()?;
-                codec_rows.push(self.sum_codes(frame)?);
-            }
+            let (text_rows, codec_rows, ref_text_count) =
+                self.resolve_reference_icl(reference, body, reference_cache, cancel)?;
             let aligned = align_icl(text_rows, codec_rows, &self.tts_pad)?;
             cacheable_rows =
-                (rows.len() + reference_body.len().min(aligned.rows.len())).min(MAX_PREFILL_ROWS);
+                (rows.len() + ref_text_count.min(aligned.rows.len())).min(MAX_PREFILL_ROWS);
             rows.extend(aligned.rows);
             aligned.trailing
         } else {
@@ -671,9 +758,10 @@ impl Talker {
         cancel: &mut dyn FnMut() -> io::Result<()>,
         observe: &mut dyn FnMut(crate::observation::TalkerObservation<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
-        // Take the snapshot before prompt construction: every failure, including
-        // cancelled projection or sink output, discards all reusable KV state.
+        // Take the snapshots before prompt construction: every failure, including
+        // cancelled projection or sink output, discards all reusable state.
         let mut prefill_cache = self.prefill_cache.take();
+        let mut reference_cache = self.reference_cache.take();
         let mut predictor_workspace = self.workspace.take().unwrap_or_default();
         let result = self.generate_inner(
             text,
@@ -682,6 +770,7 @@ impl Talker {
             sink,
             cancel,
             &mut prefill_cache,
+            &mut reference_cache,
             &mut predictor_workspace,
             observe,
         );
@@ -689,6 +778,7 @@ impl Talker {
         self.workspace = Some(predictor_workspace);
         if result.is_ok() {
             self.prefill_cache = prefill_cache;
+            self.reference_cache = reference_cache;
         }
         result
     }
@@ -802,13 +892,15 @@ impl Talker {
         sink: &mut dyn FnMut([i32; TOTAL_CODE_GROUPS]) -> io::Result<()>,
         cancel: &mut dyn FnMut() -> io::Result<()>,
         prefill_cache: &mut Option<PrefillCache>,
+        reference_cache: &mut Option<ReferencePromptCache>,
         predictor_workspace: &mut PredictorWorkspace,
         observe: &mut dyn FnMut(crate::observation::TalkerObservation<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
         use crate::observation::TalkerObservation;
 
         cancel()?;
-        let prompt = self.prompt(text, instruct, reference, cancel)?;
+        let prompt =
+            self.prompt_with_cache(text, instruct, reference, Some(reference_cache), cancel)?;
         observe(TalkerObservation::Prompt {
             rows: &prompt.rows,
             trailing: &prompt.trailing,
@@ -1076,9 +1168,11 @@ pub(crate) mod tests {
             tts_pad: vec![100.0],
             tts_bos: vec![200.0],
             tts_eos: vec![300.0],
+            reference_text_rows: Vec::new(),
             threads: 1,
             base,
             prefill_cache: None,
+            reference_cache: None,
             workspace: None,
         })
     }
@@ -1721,5 +1815,73 @@ pub(crate) mod tests {
         assert!(embedding_row(&[1.0, 2.0], 2, -1).is_err());
         assert!(embedding_row(&[1.0, 2.0], 2, 1).is_err());
         assert!(embedding_row(&[1.0], usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn cached_reference_prompt_matches_cold_prompt_bits_and_skips_recomputation()
+    -> std::io::Result<()> {
+        let mut talker = prompt_fixture(true)?;
+        let reference = Reference {
+            speaker: vec![6000.0],
+            codes: vec![[6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+        };
+        let mut cold_polls = 0;
+        let cold = talker.prompt("x", None, Some(&reference), &mut || {
+            cold_polls += 1;
+            Ok(())
+        })?;
+        assert!(talker.reference_cache.is_none());
+
+        let mut cache_slot = None;
+        let _ = talker.prompt_with_cache(
+            "x",
+            None,
+            Some(&reference),
+            Some(&mut cache_slot),
+            &mut || Ok(()),
+        )?;
+        assert!(cache_slot.is_some());
+        talker.reference_cache = cache_slot;
+
+        let mut warm_polls = 0;
+        let warm = talker.prompt("x", None, Some(&reference), &mut || {
+            warm_polls += 1;
+            Ok(())
+        })?;
+        assert!(
+            warm_polls < cold_polls,
+            "warm polls {warm_polls} should be less than cold polls {cold_polls}"
+        );
+        let row_bits = |rows: &[Vec<f32>]| -> Vec<Vec<u32>> {
+            rows.iter()
+                .map(|r| r.iter().map(|v| v.to_bits()).collect())
+                .collect()
+        };
+        assert_eq!(row_bits(&warm.rows), row_bits(&cold.rows));
+        assert_eq!(row_bits(&warm.trailing), row_bits(&cold.trailing));
+        assert_eq!(warm.cacheable_rows, cold.cacheable_rows);
+
+        // Changing reference.codes must invalidate the cached codec rows cleanly.
+        let reference_changed = Reference {
+            speaker: vec![6000.0],
+            codes: vec![[7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+        };
+        let mut cache_mut = talker.reference_cache.take();
+        let warm_changed = talker.prompt_with_cache(
+            "x",
+            None,
+            Some(&reference_changed),
+            Some(&mut cache_mut),
+            &mut || Ok(()),
+        )?;
+        talker.reference_cache = None;
+        let cold_changed = talker.prompt("x", None, Some(&reference_changed), &mut || Ok(()))?;
+        assert_eq!(row_bits(&warm_changed.rows), row_bits(&cold_changed.rows));
+        assert_eq!(
+            row_bits(&warm_changed.trailing),
+            row_bits(&cold_changed.trailing)
+        );
+        assert_eq!(warm_changed.cacheable_rows, cold_changed.cacheable_rows);
+        Ok(())
     }
 }
