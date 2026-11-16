@@ -84,6 +84,69 @@ fn part(hash: &mut Hasher, bytes: &[u8]) -> crate::Result<()> {
     hash.update(bytes)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildScope {
+    All,
+    Chat,
+    Speech,
+}
+
+impl BuildScope {
+    fn from_identity(identity: &str) -> Self {
+        if identity.starts_with("crt-static-v1\nchat\n") {
+            return Self::Chat;
+        }
+        if identity.starts_with("crt-static-v1\n") {
+            let mut has_speech_pkg = false;
+            let mut all_speech_pkgs = true;
+            for line in identity.lines().rev() {
+                if !line.starts_with("bonsai-") {
+                    break;
+                }
+                if matches!(line, "bonsai-speech-asr" | "bonsai-speech-tts") {
+                    has_speech_pkg = true;
+                } else {
+                    all_speech_pkgs = false;
+                }
+            }
+            if has_speech_pkg && all_speech_pkgs {
+                return Self::Speech;
+            }
+        }
+        Self::All
+    }
+
+    fn excludes_non_manifest_in(self, root: &Path, path: &Path) -> bool {
+        if self == Self::All {
+            return false;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        let mut parts = relative.components();
+        let Some(first) = parts.next().and_then(|c| c.as_os_str().to_str()) else {
+            return false;
+        };
+        let second = parts.next().and_then(|c| c.as_os_str().to_str());
+        match self {
+            Self::All => false,
+            Self::Chat => {
+                first == "tools"
+                    || (first == "src"
+                        && matches!(second, Some("speech-asr" | "speech-tts" | "speech-service")))
+            }
+            Self::Speech => {
+                (first == "src" && matches!(second, Some("chat-ui" | "broker" | "markdown")))
+                    || (first == "tools"
+                        && matches!(
+                            second,
+                            Some("bonsai" | "ci" | "hexagon" | "native-reference" | "validation")
+                        ))
+            }
+        }
+    }
+}
+
 fn non_build_input(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
@@ -110,7 +173,17 @@ fn non_build_input(root: &Path, path: &Path) -> bool {
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1")))
 }
 
+#[cfg(test)]
 fn enumerate(root: &Path, directory: &Path, files: &mut BTreeSet<PathBuf>) -> crate::Result<()> {
+    enumerate_scoped(root, directory, BuildScope::All, files)
+}
+
+fn enumerate_scoped(
+    root: &Path,
+    directory: &Path,
+    scope: BuildScope,
+    files: &mut BTreeSet<PathBuf>,
+) -> crate::Result<()> {
     crate::startup_cancel::checkpoint()?;
     for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
@@ -133,9 +206,15 @@ fn enumerate(root: &Path, directory: &Path, files: &mut BTreeSet<PathBuf>) -> cr
             return Err("Reparse-point build inputs are unsupported.".into());
         }
         if metadata.is_dir() {
-            enumerate(root, &path, files)?;
+            enumerate_scoped(root, &path, scope, files)?;
         } else if metadata.is_file() {
-            files.insert(path);
+            if !scope.excludes_non_manifest_in(root, &path)
+                || path
+                    .file_name()
+                    .is_some_and(|file_name| file_name == "Cargo.toml")
+            {
+                files.insert(path);
+            }
         } else {
             return Err("Build inputs must be ordinary files or directories.".into());
         }
@@ -641,7 +720,12 @@ fn fingerprint_with(
         }
     }
     let mut files = BTreeSet::new();
-    enumerate(repository, repository, &mut files)?;
+    enumerate_scoped(
+        repository,
+        repository,
+        BuildScope::from_identity(identity),
+        &mut files,
+    )?;
     let mut digests = BTreeMap::new();
     let mut supported = embedded_inputs_with_digests(repository, &mut files, Some(&mut digests))?;
     let mut hash = Hasher::new()?;
@@ -1248,5 +1332,119 @@ mod tests {
         fs::write(&receipt, "{").map_err(|error| error.to_string())?;
         assert!(!matches(&receipt, "variant", "fingerprint", &outputs));
         Ok(())
+    }
+
+    #[test]
+    fn chat_and_speech_fingerprints_ignore_unrelated_package_sources_but_track_manifests()
+    -> crate::Result<()> {
+        let (scratch, repo) = fixture()?;
+        for dir in [
+            "src/chat-ui/src",
+            "src/broker/src",
+            "src/markdown/src",
+            "src/audio/src",
+            "src/speech-asr/src",
+            "src/speech-tts/src",
+            "src/speech-service/src",
+            "tools/bonsai/src",
+            "tools/ci/src",
+        ] {
+            fs::create_dir_all(repo.join(dir)).map_err(|error| error.to_string())?;
+        }
+        for (path, content) in [
+            (
+                "src/chat-ui/Cargo.toml",
+                "[package]\nname = 'bonsai-chat'\n",
+            ),
+            ("src/chat-ui/src/main.rs", "fn main() {}"),
+            (
+                "src/broker/Cargo.toml",
+                "[package]\nname = 'bonsai-broker'\n",
+            ),
+            ("src/broker/src/lib.rs", "pub fn broker() {}"),
+            ("src/markdown/src/lib.rs", "pub fn md() {}"),
+            ("src/audio/src/lib.rs", "pub fn audio() {}"),
+            (
+                "src/speech-asr/Cargo.toml",
+                "[package]\nname = 'bonsai-speech-asr'\n",
+            ),
+            ("src/speech-asr/src/lib.rs", "pub fn asr() {}"),
+            (
+                "src/speech-tts/Cargo.toml",
+                "[package]\nname = 'bonsai-speech-tts'\n",
+            ),
+            ("src/speech-tts/src/lib.rs", "pub fn tts() {}"),
+            ("src/speech-service/src/lib.rs", "pub fn service() {}"),
+            ("tools/bonsai/src/lib.rs", "pub fn tools() {}"),
+            ("tools/ci/src/lib.rs", "pub fn ci() {}"),
+        ] {
+            fs::write(repo.join(path), content).map_err(|error| error.to_string())?;
+        }
+
+        let env = BTreeMap::new();
+        let chat_id = "crt-static-v1\nchat\nnightly-2026-11-12-aarch64-pc-windows-msvc\naarch64-pc-windows-msvc\nbonsai-broker\nbonsai-chat";
+        let speech_id = "crt-static-v1\n{\"Engine\":\"rust-qwen-tts-v1\"}\nnightly-2026-11-12-aarch64-pc-windows-msvc\naarch64-pc-windows-msvc\nbonsai-speech-asr\nbonsai-speech-tts";
+        assert_eq!(BuildScope::from_identity(chat_id), BuildScope::Chat);
+        assert_eq!(BuildScope::from_identity(speech_id), BuildScope::Speech);
+        assert_eq!(BuildScope::from_identity("test"), BuildScope::All);
+
+        let chat_before = fingerprint_with(&repo, &scratch, chat_id, &env)?;
+        let speech_before = fingerprint_with(&repo, &scratch, speech_id, &env)?;
+        assert!(chat_before.is_some() && speech_before.is_some());
+
+        // Speech or tool source edits must not invalidate pre-window chat builds.
+        for unrelated in [
+            "src/speech-asr/src/lib.rs",
+            "src/speech-tts/src/lib.rs",
+            "src/speech-service/src/lib.rs",
+            "tools/bonsai/src/lib.rs",
+            "tools/ci/src/lib.rs",
+        ] {
+            fs::write(repo.join(unrelated), "modified unrelated source")
+                .map_err(|error| error.to_string())?;
+        }
+        assert_eq!(
+            chat_before,
+            fingerprint_with(&repo, &scratch, chat_id, &env)?
+        );
+        let speech_after_asr_edit = fingerprint_with(&repo, &scratch, speech_id, &env)?;
+        assert_ne!(speech_before, speech_after_asr_edit);
+
+        // Chat/broker/markdown source edits must not invalidate speech builds.
+        for chat_only in [
+            "src/chat-ui/src/main.rs",
+            "src/broker/src/lib.rs",
+            "src/markdown/src/lib.rs",
+        ] {
+            fs::write(repo.join(chat_only), "modified chat source")
+                .map_err(|error| error.to_string())?;
+        }
+        assert_eq!(
+            speech_after_asr_edit,
+            fingerprint_with(&repo, &scratch, speech_id, &env)?
+        );
+        let chat_after_ui_edit = fingerprint_with(&repo, &scratch, chat_id, &env)?;
+        assert_ne!(chat_before, chat_after_ui_edit);
+
+        // Shared crate edits (e.g. src/audio) invalidate both.
+        fs::write(repo.join("src/audio/src/lib.rs"), "modified shared audio")
+            .map_err(|error| error.to_string())?;
+        assert_ne!(
+            chat_after_ui_edit,
+            fingerprint_with(&repo, &scratch, chat_id, &env)?
+        );
+        assert_ne!(
+            speech_after_asr_edit,
+            fingerprint_with(&repo, &scratch, speech_id, &env)?
+        );
+
+        // External path dependency in any workspace Cargo.toml still disables reuse.
+        fs::write(
+            repo.join("src/speech-asr/Cargo.toml"),
+            "[package]\nname = 'bonsai-speech-asr'\n[dependencies]\noutside = { path = '../../../outside' }\n",
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(fingerprint_with(&repo, &scratch, chat_id, &env)?.is_none());
+        fs::remove_dir_all(&scratch).map_err(|error| error.to_string())
     }
 }

@@ -174,6 +174,12 @@ fn static_runtime_environment(environment: &mut BTreeMap<String, String>) -> cra
     Ok(())
 }
 
+fn default_build_jobs() -> String {
+    std::thread::available_parallelism()
+        .map_or(4, |parallelism| parallelism.get().clamp(4, 12))
+        .to_string()
+}
+
 pub(crate) fn cached_build(
     spec: &BuildSpec,
     prepare: impl FnOnce() -> crate::Result<BTreeMap<String, String>>,
@@ -250,7 +256,7 @@ fn cached_build_with(
     environment.insert("CARGO_UNSTABLE_CHECKSUM_FRESHNESS".into(), "true".into());
     environment
         .entry("CARGO_BUILD_JOBS".into())
-        .or_insert_with(|| "4".into());
+        .or_insert_with(default_build_jobs);
     let arguments = cargo_arguments(spec);
     let log = spec
         .working_directory
