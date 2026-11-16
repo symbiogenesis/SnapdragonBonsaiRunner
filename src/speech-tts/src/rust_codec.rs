@@ -490,25 +490,17 @@ impl Transformer {
                 self.eps,
                 &mut scratch.normalized,
             )?;
-            layer.q.forward_vec_into(
+            LinearProjection::forward_triple_into(
+                &layer.q,
+                &layer.k,
+                &layer.v,
                 &scratch.normalized,
+                None,
                 None,
                 None,
                 self.threads,
                 &mut scratch.q,
-            )?;
-            layer.k.forward_vec_into(
-                &scratch.normalized,
-                None,
-                None,
-                self.threads,
                 &mut scratch.k,
-            )?;
-            layer.v.forward_vec_into(
-                &scratch.normalized,
-                None,
-                None,
-                self.threads,
                 &mut scratch.v,
             )?;
             apply_rope_neox_with_tables(
@@ -559,25 +551,28 @@ impl Transformer {
                 self.eps,
                 &mut scratch.normalized,
             )?;
-            layer.up.forward_vec_into(
-                &scratch.normalized,
-                None,
-                None,
-                self.threads,
-                &mut scratch.up,
-            )?;
             if let Some(gate) = &layer.gate {
-                gate.forward_vec_into(
+                LinearProjection::forward_pair_into(
+                    &layer.up,
+                    gate,
                     &scratch.normalized,
                     None,
                     None,
                     self.threads,
+                    &mut scratch.up,
                     &mut scratch.gate,
                 )?;
                 for (value, &gate) in scratch.up.iter_mut().zip(&scratch.gate) {
                     *value *= gate / (1.0 + (-gate).exp());
                 }
             } else {
+                layer.up.forward_vec_into(
+                    &scratch.normalized,
+                    None,
+                    None,
+                    self.threads,
+                    &mut scratch.up,
+                )?;
                 for value in &mut scratch.up {
                     *value = gelu_erf(*value);
                 }
