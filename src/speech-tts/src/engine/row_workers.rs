@@ -17,10 +17,10 @@ enum CachedTeam {
 }
 
 impl CachedTeam {
-    const fn worker_count(&self) -> usize {
+    const fn needs_rebuild(&self, requested: usize) -> bool {
         match self {
-            Self::Ready(team) => team.workers.len(),
-            Self::Unavailable(count) => *count,
+            Self::Ready(team) => team.workers.len() < requested,
+            Self::Unavailable(count) => *count != requested,
         }
     }
 }
@@ -83,11 +83,19 @@ pub(crate) fn run_aligned<F>(
 ) where
     F: Fn(usize, &mut [f32]) + Sync,
 {
-    let worker_count = worker_count.clamp(1, 18).min(out.len().max(1));
-    if worker_count <= 1 || out.len() < 4 || rayon::current_thread_index().is_some() {
+    let requested = worker_count.clamp(1, 18);
+    if requested <= 1 || out.len() < 4 || rayon::current_thread_index().is_some() {
         compute_slice(0, out);
         return;
     }
+    let alignment = alignment.max(1).min(out.len());
+    let groups = out.len().div_ceil(alignment);
+    if groups < 2 {
+        compute_slice(0, out);
+        return;
+    }
+    let active_workers = requested.min(groups);
+    let chunk_rows = groups.div_ceil(active_workers) * alignment;
 
     let completed = TEAM.with(|slot| {
         let Ok(mut team) = slot.try_borrow_mut() else {
@@ -95,14 +103,14 @@ pub(crate) fn run_aligned<F>(
         };
         if team
             .as_ref()
-            .is_none_or(|team| team.worker_count() != worker_count)
+            .is_none_or(|team| team.needs_rebuild(requested))
         {
-            // Release the old team before creating another, retaining the
-            // selected bound even when a caller changes its worker count.
+            // Release the old team only when growing beyond its worker count
+            // or changing unavailable fallback requests, keeping warm larger pools.
             *team = None;
             *team = Some(
-                OwnedTeam::build(worker_count)
-                    .map_or_else(|_| CachedTeam::Unavailable(worker_count), CachedTeam::Ready),
+                OwnedTeam::build(requested)
+                    .map_or_else(|_| CachedTeam::Unavailable(requested), CachedTeam::Ready),
             );
         }
         let Some(CachedTeam::Ready(team)) = team.as_ref() else {
@@ -111,8 +119,6 @@ pub(crate) fn run_aligned<F>(
         let Some(pool) = team.pool.as_ref() else {
             return false;
         };
-        let alignment = alignment.max(1).min(out.len());
-        let chunk_rows = out.len().div_ceil(alignment).div_ceil(worker_count) * alignment;
         pool.install(|| {
             out.par_chunks_mut(chunk_rows)
                 .enumerate()
@@ -244,5 +250,49 @@ mod tests {
         TEAM.with(|slot| {
             assert!(matches!(*slot.borrow(), Some(CachedTeam::Unavailable(3))));
         });
+    }
+
+    #[test]
+    fn projection_workers_retain_pool_across_smaller_slices_and_group_counts() -> io::Result<()> {
+        fn team_ids(worker_count: usize) -> io::Result<HashSet<ThreadId>> {
+            let barrier = Barrier::new(worker_count);
+            let ids = Mutex::new(HashSet::new());
+            let mut rows = vec![0.0_f32; worker_count * 4];
+            run(&mut rows, worker_count, &|_, output| {
+                ids.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(thread::current().id());
+                barrier.wait();
+                output.fill(1.0);
+            });
+            ids.into_inner()
+                .map_err(|_| io::Error::other("Thread IDs poisoned."))
+        }
+
+        let team = OwnedTeam::build(8).map_err(io::Error::other)?;
+        TEAM.with(|slot| *slot.borrow_mut() = Some(CachedTeam::Ready(team)));
+        let initial = team_ids(8)?;
+        assert_eq!(initial.len(), 8);
+
+        for alignment in [2_usize, 4] {
+            let mut small = [0.0_f32; 6];
+            let seen = Mutex::new(HashSet::new());
+            run_aligned(&mut small, 8, alignment, &|offset, slice| {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(thread::current().id());
+                for (i, slot) in slice.iter_mut().enumerate() {
+                    *slot = f32::from(u16::try_from(offset + i).unwrap_or(0));
+                }
+            });
+            assert_eq!(small, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+            let seen = seen
+                .into_inner()
+                .map_err(|_| io::Error::other("Seen IDs poisoned."))?;
+            assert!(seen.is_subset(&initial));
+        }
+
+        assert_eq!(team_ids(8)?, initial);
+        Ok(())
     }
 }
