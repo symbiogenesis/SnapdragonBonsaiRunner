@@ -161,17 +161,23 @@ pub(super) const fn horizontal_whitespace(character: char) -> bool {
 
 fn abbreviation(prefix: &str) -> bool {
     let word = prefix
-        .rsplit(|character: char| !character.is_alphabetic() && character != '.')
+        .rsplit(|character: char| !character.is_alphanumeric() && character != '.')
         .next()
         .unwrap_or_default();
-    let initials = word.split('.').all(|part| {
-        let mut characters = part.chars();
-        characters.next().is_some_and(char::is_alphabetic) && characters.next().is_none()
-    });
-    initials
-        || ["Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "St", "vs"]
-            .iter()
-            .any(|title| word.eq_ignore_ascii_case(title))
+    let single_upper_initial =
+        !word.contains('.') && word.len() == 1 && word.as_bytes()[0].is_ascii_uppercase();
+    let dotted_initial = word.contains('.')
+        && word
+            .split('.')
+            .all(|part| part.len() == 1 && part.as_bytes()[0].is_ascii_alphabetic());
+    single_upper_initial
+        || dotted_initial
+        || [
+            "Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "St", "vs", "etc", "Fig", "Inc", "Ltd",
+            "Co", "No", "Vol", "Ph.D",
+        ]
+        .iter()
+        .any(|title| word.eq_ignore_ascii_case(title))
 }
 
 fn include_non_speakable_tail(text: &str, limit: usize, end: usize, complete: bool) -> usize {
@@ -299,5 +305,33 @@ mod tests {
         let input = format!("{preferred}{}", "下一段".repeat(20));
         assert_eq!(clip_boundary(&input), preferred.len());
         assert_eq!(preferred.chars().count(), super::super::MAX_SEGMENT);
+    }
+
+    #[test]
+    fn abbreviations_keep_titles_and_dotted_initials_together_without_stalling_on_units_or_cjk() {
+        for (input, expected_end) in [
+            ("Wait 10s. Next step.", Some("Wait 10s.".len())),
+            ("Section 2a. Continue.", Some("Section 2a.".len())),
+            ("Note option a. Next.", Some("Note option a.".len())),
+            ("好. Next.", Some("好.".len())),
+            (
+                "Dr. J. R. R. Tolkien wrote it. Next.",
+                Some("Dr. J. R. R. Tolkien wrote it.".len()),
+            ),
+            (
+                "Use e.g. apples, etc. for pie. Done.",
+                Some("Use e.g. apples, etc. for pie.".len()),
+            ),
+            (
+                "See Fig. 1 for Ph.D. results. End.",
+                Some("See Fig. 1 for Ph.D. results.".len()),
+            ),
+        ] {
+            assert_eq!(
+                super::sentence_boundary(input, input.len(), false),
+                expected_end,
+                "input={input:?}"
+            );
+        }
     }
 }
