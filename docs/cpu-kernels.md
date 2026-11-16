@@ -1059,7 +1059,7 @@ pending; source parallelism supplies no measured acceleration verdict.
   unpacking, preserving bit-exact binary32 parity with `unpack()` across all five K-quant kinds.
 - **Pending qualification gates**: These land source implementations and unit parity controls
   only; owning hosted CI and actual-model `fp64`/teacher-forced/WER/human-listening and X1/X2
-  device qualification remain open in [PLAN.md](../PLAN.md#L527).
+  device qualification remain open in [PLAN.md](../PLAN.md#complete-c-retirement).
 
 [fearless]: https://docs.rs/fearless_simd/1.1.0/fearless_simd/
 [target-feature]: https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute

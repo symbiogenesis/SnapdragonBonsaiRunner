@@ -952,7 +952,7 @@ fn oversized_composer_paste_keeps_selection_text_and_working_undo_redo() -> io::
         egui::text::CCursorRange::one(egui::text::CCursor::new(0)),
         "Older draft".to_owned(),
     );
-    let mut undoer = editor.undoer();
+    let mut undoer = egui::util::undoer::Undoer::default();
     undoer.add_undo(&older);
     undoer.add_undo(&(selection, draft.to_owned()));
     editor.set_undoer(undoer);
