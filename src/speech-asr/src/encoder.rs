@@ -733,15 +733,22 @@ fn transform_block(
         .attention_norm
         .apply_batch(rows, norm_buf, c.hidden, workers)?;
     prepared.prepare_into(norm_buf, num_rows, c.hidden);
-    block
-        .query
-        .apply_batch_prepared(prepared, norm_buf, workers, scratch, q, cancel)?;
-    block
-        .key
-        .apply_batch_prepared(prepared, norm_buf, workers, scratch, k, cancel)?;
-    block
-        .value
-        .apply_batch_prepared(prepared, norm_buf, workers, scratch, v, cancel)?;
+    Projection::multiply_batch_triple_into(
+        &block.query.weights,
+        &block.key.weights,
+        &block.value.weights,
+        prepared,
+        norm_buf,
+        workers,
+        scratch,
+        q,
+        k,
+        v,
+        cancel,
+    )?;
+    add_batch_bias(q, &block.query.bias, workers)?;
+    add_batch_bias(k, &block.key.bias, workers)?;
+    add_batch_bias(v, &block.value.bias, workers)?;
 
     for _ in 0..(num_rows * c.heads) {
         check(cancel)?;
@@ -860,6 +867,21 @@ fn attention(
     }
     finite(&output)?;
     Ok(output)
+}
+
+fn add_batch_bias(out: &mut [f32], bias: &[f32], workers: usize) -> io::Result<()> {
+    let out_width = bias.len();
+    if out_width == 0 {
+        return finite(out);
+    }
+    row_workers::try_run_aligned(out, workers, out_width, &|_, slice| {
+        for row in slice.chunks_exact_mut(out_width) {
+            for (value, &b) in row.iter_mut().zip(bias) {
+                *value += b;
+            }
+        }
+        finite(slice)
+    })
 }
 
 #[cfg(test)]

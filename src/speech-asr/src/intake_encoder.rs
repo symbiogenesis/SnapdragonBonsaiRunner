@@ -81,6 +81,26 @@ pub(super) fn load<R: Read + Seek>(
     source: &mut R,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<(Encoder, Frontend)> {
+    let mut loader = Loader::new(index, source);
+    load_with_loader(index, &mut loader, cancel)
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+pub(super) fn load_mapped(
+    index: &Index,
+    mapping: &std::sync::Arc<bonsai_windows_process::MappedFile>,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<(Encoder, Frontend)> {
+    let mut cursor = io::Cursor::new(mapping.as_slice());
+    let mut loader = Loader::new_mapped(index, &mut cursor, mapping);
+    load_with_loader(index, &mut loader, cancel)
+}
+
+fn load_with_loader<R: Read + Seek>(
+    index: &Index,
+    loader: &mut Loader<'_, R>,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<(Encoder, Frontend)> {
     frontend_metadata(index)?;
     let count = |suffix| index.count("stt.qwen3_asr.encoder", suffix);
     let c = Config {
@@ -109,7 +129,6 @@ pub(super) fn load<R: Read + Seek>(
     {
         return Err(invalid());
     }
-    let mut loader = Loader::new(index, source);
     let window = loader.optional_vector("frontend.window", cancel)?;
     let bank = loader.optional_vector("frontend.mel_filterbank", cancel)?;
     let frontend = Frontend::from_checkpoint(window.as_deref(), bank.as_deref())?;
@@ -125,23 +144,23 @@ pub(super) fn load<R: Read + Seek>(
     for layer in 0..layers {
         let prefix = format!("enc.blocks.{layer}.");
         blocks.push(Block {
-            attention_norm: norm(&mut loader, &(prefix.clone() + "norm_attn"), cancel)?,
-            ffn_norm: norm(&mut loader, &(prefix.clone() + "norm_ffn"), cancel)?,
-            query: linear(&mut loader, &(prefix.clone() + "attn.q"), cancel)?,
-            key: linear(&mut loader, &(prefix.clone() + "attn.k"), cancel)?,
-            value: linear(&mut loader, &(prefix.clone() + "attn.v"), cancel)?,
-            attention_out: linear(&mut loader, &(prefix.clone() + "attn.out"), cancel)?,
-            ffn_in: linear(&mut loader, &(prefix.clone() + "ffn.fc1"), cancel)?,
-            ffn_out: linear(&mut loader, &(prefix + "ffn.fc2"), cancel)?,
+            attention_norm: norm(loader, &(prefix.clone() + "norm_attn"), cancel)?,
+            ffn_norm: norm(loader, &(prefix.clone() + "norm_ffn"), cancel)?,
+            query: linear(loader, &(prefix.clone() + "attn.q"), cancel)?,
+            key: linear(loader, &(prefix.clone() + "attn.k"), cancel)?,
+            value: linear(loader, &(prefix.clone() + "attn.v"), cancel)?,
+            attention_out: linear(loader, &(prefix.clone() + "attn.out"), cancel)?,
+            ffn_in: linear(loader, &(prefix.clone() + "ffn.fc1"), cancel)?,
+            ffn_out: linear(loader, &(prefix + "ffn.fc2"), cancel)?,
         });
     }
     let weights = Weights {
         convolutions: convolutions.try_into().map_err(|_| invalid())?,
         convolution_out: loader.projection("enc.conv_out.weight", cancel)?,
         blocks,
-        output_norm: norm(&mut loader, "enc.ln_post", cancel)?,
-        output_in: linear(&mut loader, "enc.proj1", cancel)?,
-        output_out: linear(&mut loader, "enc.proj2", cancel)?,
+        output_norm: norm(loader, "enc.ln_post", cancel)?,
+        output_in: linear(loader, "enc.proj1", cancel)?,
+        output_out: linear(loader, "enc.proj2", cancel)?,
     };
     Ok((Encoder::new(c, weights)?, frontend))
 }

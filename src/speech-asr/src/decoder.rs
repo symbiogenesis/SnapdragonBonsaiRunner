@@ -15,6 +15,7 @@
 use crate::{
     packed::{self, PreparedBatch, WeightMatrix, WeightSlice},
     protocol::Prompt,
+    replay::{CacheValues, LayerCache},
     row_workers, threads,
 };
 use std::{
@@ -51,7 +52,32 @@ fn finite(values: &[f32]) -> io::Result<()> {
     packed::ensure_finite(values, invalid)
 }
 
-/// GGUF row-major F32 or `Q8_0` projection, retaining compressed Q8 weights.
+/// Borrowed owned-or-mmap byte backing for quantized projections.
+pub(super) enum WeightBytes {
+    Owned(Vec<u8>),
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    Mapped {
+        _mapping: Arc<bonsai_windows_process::MappedFile>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl WeightBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes.as_slice(),
+            #[cfg(all(windows, feature = "rust-qualification"))]
+            Self::Mapped {
+                _mapping,
+                offset,
+                len,
+            } => &_mapping.as_slice()[*offset..*offset + *len],
+        }
+    }
+}
+
+/// GGUF row-major F32, `Q8_0`, `Q4_K`, or `Q6_K` projection, retaining compressed weights.
 pub struct Projection {
     input: usize,
     output: usize,
@@ -60,7 +86,9 @@ pub struct Projection {
 
 enum Storage {
     Float(Vec<f32>),
-    Q8(Vec<u8>),
+    Q8(WeightBytes),
+    Q4K(WeightBytes),
+    Q6K(WeightBytes),
 }
 
 impl Projection {
@@ -117,17 +145,19 @@ impl Projection {
 
     /// Admit `Q8_0` blocks: little-endian half scale followed by 32 signed bytes.
     ///
-    /// Activations stay F32; this is a separately identified scalar path rather
-    /// than GGML's activation-requantizing optimized matrix multiplication.
-    ///
     /// # Errors
     /// Rejects incomplete blocks, wrong byte length or nonfinite half scales.
     pub fn q8(input: usize, output: usize, data: Vec<u8>) -> io::Result<Self> {
+        Self::q8_bytes(input, output, WeightBytes::Owned(data))
+    }
+
+    pub(super) fn q8_bytes(input: usize, output: usize, data: WeightBytes) -> io::Result<Self> {
         let count = extent(input, output)?;
-        if !input.is_multiple_of(32) || data.len() != count / 32 * 34 {
+        let bytes = data.as_slice();
+        if !input.is_multiple_of(32) || bytes.len() != count / 32 * 34 {
             return Err(invalid());
         }
-        for block in data.as_chunks::<34>().0 {
+        for block in bytes.as_chunks::<34>().0 {
             let [s0, s1, ..] = *block;
             let _ = half(u16::from_le_bytes([s0, s1]))?;
         }
@@ -135,6 +165,56 @@ impl Projection {
             input,
             output,
             data: Storage::Q8(data),
+        })
+    }
+
+    /// Admit `Q4_K` super-blocks (`144` bytes per `256` elements).
+    ///
+    /// # Errors
+    /// Rejects misaligned dimensions, incomplete blocks, wrong byte length or nonfinite half scales.
+    pub fn q4_k(input: usize, output: usize, data: Vec<u8>) -> io::Result<Self> {
+        Self::q4_k_bytes(input, output, WeightBytes::Owned(data))
+    }
+
+    pub(super) fn q4_k_bytes(input: usize, output: usize, data: WeightBytes) -> io::Result<Self> {
+        let count = extent(input, output)?;
+        let bytes = data.as_slice();
+        if !input.is_multiple_of(256) || bytes.len() != count / 256 * 144 {
+            return Err(invalid());
+        }
+        for block in bytes.as_chunks::<144>().0 {
+            let [d0, d1, m0, m1, ..] = *block;
+            let _ = half(u16::from_le_bytes([d0, d1]))?;
+            let _ = half(u16::from_le_bytes([m0, m1]))?;
+        }
+        Ok(Self {
+            input,
+            output,
+            data: Storage::Q4K(data),
+        })
+    }
+
+    /// Admit `Q6_K` super-blocks (`210` bytes per `256` elements).
+    ///
+    /// # Errors
+    /// Rejects misaligned dimensions, incomplete blocks, wrong byte length or nonfinite half scales.
+    pub fn q6_k(input: usize, output: usize, data: Vec<u8>) -> io::Result<Self> {
+        Self::q6_k_bytes(input, output, WeightBytes::Owned(data))
+    }
+
+    pub(super) fn q6_k_bytes(input: usize, output: usize, data: WeightBytes) -> io::Result<Self> {
+        let count = extent(input, output)?;
+        let bytes = data.as_slice();
+        if !input.is_multiple_of(256) || bytes.len() != count / 256 * 210 {
+            return Err(invalid());
+        }
+        for block in bytes.as_chunks::<210>().0 {
+            let _ = half(u16::from_le_bytes([block[208], block[209]]))?;
+        }
+        Ok(Self {
+            input,
+            output,
+            data: Storage::Q6K(data),
         })
     }
 
@@ -146,7 +226,8 @@ impl Projection {
             Storage::Float(values) => {
                 output.copy_from_slice(&values[row * self.input..(row + 1) * self.input]);
             }
-            Storage::Q8(bytes) => {
+            Storage::Q8(raw) => {
+                let bytes = raw.as_slice();
                 let row_bytes = self.input / 32 * 34;
                 for (block, target) in bytes[row * row_bytes..(row + 1) * row_bytes]
                     .as_chunks::<34>()
@@ -161,6 +242,16 @@ impl Projection {
                     }
                 }
             }
+            Storage::Q4K(raw) => {
+                let bytes = raw.as_slice();
+                let row_bytes = self.input / 256 * 144;
+                packed::decode_q4_k_row(&bytes[row * row_bytes..(row + 1) * row_bytes], output);
+            }
+            Storage::Q6K(raw) => {
+                let bytes = raw.as_slice();
+                let row_bytes = self.input / 256 * 210;
+                packed::decode_q6_k_row(&bytes[row * row_bytes..(row + 1) * row_bytes], output);
+            }
         }
         finite(output)
     }
@@ -168,7 +259,9 @@ impl Projection {
     pub(super) fn as_weight_matrix(&self) -> WeightMatrix<'_> {
         let data = match &self.data {
             Storage::Float(values) => WeightSlice::Float(values),
-            Storage::Q8(bytes) => WeightSlice::Q8(bytes),
+            Storage::Q8(bytes) => WeightSlice::Q8(bytes.as_slice()),
+            Storage::Q4K(bytes) => WeightSlice::Q4K(bytes.as_slice()),
+            Storage::Q6K(bytes) => WeightSlice::Q6K(bytes.as_slice()),
         };
         WeightMatrix {
             input: self.input,
@@ -240,6 +333,160 @@ impl Projection {
         finite(out)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fuses two sibling projections sharing `input` and activation quantization into one worker pass."
+    )]
+    pub(super) fn multiply_pair_into(
+        p0: &Self,
+        p1: &Self,
+        input: &[f32],
+        workers: usize,
+        out0: &mut [f32],
+        out1: &mut [f32],
+        scratch: &mut Vec<f32>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        if input.len() != p0.input
+            || input.len() != p1.input
+            || out0.len() != p0.output
+            || out1.len() != p1.output
+        {
+            return Err(invalid());
+        }
+        finite(input)?;
+        for _ in 0..(p0.output + p1.output) {
+            check(cancel)?;
+        }
+        let mut targets = [
+            (p0.as_weight_matrix(), &mut *out0),
+            (p1.as_weight_matrix(), &mut *out1),
+        ];
+        packed::multiply_single_group_into(&mut targets, input, workers, scratch);
+        finite(out0)?;
+        finite(out1)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fuses three sibling projections (`q+k+v`) sharing `input` and activation quantization into one worker pass."
+    )]
+    pub(super) fn multiply_triple_into(
+        p0: &Self,
+        p1: &Self,
+        p2: &Self,
+        input: &[f32],
+        workers: usize,
+        out0: &mut [f32],
+        out1: &mut [f32],
+        out2: &mut [f32],
+        scratch: &mut Vec<f32>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        if input.len() != p0.input
+            || input.len() != p1.input
+            || input.len() != p2.input
+            || out0.len() != p0.output
+            || out1.len() != p1.output
+            || out2.len() != p2.output
+        {
+            return Err(invalid());
+        }
+        finite(input)?;
+        for _ in 0..(p0.output + p1.output + p2.output) {
+            check(cancel)?;
+        }
+        let mut targets = [
+            (p0.as_weight_matrix(), &mut *out0),
+            (p1.as_weight_matrix(), &mut *out1),
+            (p2.as_weight_matrix(), &mut *out2),
+        ];
+        packed::multiply_single_group_into(&mut targets, input, workers, scratch);
+        finite(out0)?;
+        finite(out1)?;
+        finite(out2)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fuses two sibling batched projections (`gate+up`) sharing `prepared` and quantized activations."
+    )]
+    pub(super) fn multiply_batch_pair_into(
+        p0: &Self,
+        p1: &Self,
+        prepared: &PreparedBatch,
+        raw_input: &[f32],
+        workers: usize,
+        scratch: &mut Vec<f32>,
+        out0: &mut [f32],
+        out1: &mut [f32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        let batch = prepared.batch();
+        if prepared.input() != p0.input
+            || prepared.input() != p1.input
+            || raw_input.len() != batch.checked_mul(p0.input).ok_or_else(invalid)?
+            || out0.len() != batch.checked_mul(p0.output).ok_or_else(invalid)?
+            || out1.len() != batch.checked_mul(p1.output).ok_or_else(invalid)?
+        {
+            return Err(invalid());
+        }
+        finite(raw_input)?;
+        for _ in 0..(batch + p0.output + batch + p1.output) {
+            check(cancel)?;
+        }
+        let mut targets = [
+            (p0.as_weight_matrix(), &mut *out0),
+            (p1.as_weight_matrix(), &mut *out1),
+        ];
+        packed::multiply_batch_group_into(&mut targets, prepared, raw_input, workers, scratch);
+        finite(out0)?;
+        finite(out1)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fuses three sibling batched projections (`q+k+v`) sharing `prepared` and quantized activations."
+    )]
+    pub(super) fn multiply_batch_triple_into(
+        p0: &Self,
+        p1: &Self,
+        p2: &Self,
+        prepared: &PreparedBatch,
+        raw_input: &[f32],
+        workers: usize,
+        scratch: &mut Vec<f32>,
+        out0: &mut [f32],
+        out1: &mut [f32],
+        out2: &mut [f32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        let batch = prepared.batch();
+        if prepared.input() != p0.input
+            || prepared.input() != p1.input
+            || prepared.input() != p2.input
+            || raw_input.len() != batch.checked_mul(p0.input).ok_or_else(invalid)?
+            || out0.len() != batch.checked_mul(p0.output).ok_or_else(invalid)?
+            || out1.len() != batch.checked_mul(p1.output).ok_or_else(invalid)?
+            || out2.len() != batch.checked_mul(p2.output).ok_or_else(invalid)?
+        {
+            return Err(invalid());
+        }
+        finite(raw_input)?;
+        for _ in 0..(batch + p0.output + batch + p1.output + batch + p2.output) {
+            check(cancel)?;
+        }
+        let mut targets = [
+            (p0.as_weight_matrix(), &mut *out0),
+            (p1.as_weight_matrix(), &mut *out1),
+            (p2.as_weight_matrix(), &mut *out2),
+        ];
+        packed::multiply_batch_group_into(&mut targets, prepared, raw_input, workers, scratch);
+        finite(out0)?;
+        finite(out1)?;
+        finite(out2)
+    }
+
     /// Compute every output row with a cancellation check before each row.
     ///
     /// # Errors
@@ -281,6 +528,7 @@ pub enum CachePrecision {
     F16,
 }
 
+#[cfg(test)]
 fn cache_value(value: f32, precision: CachePrecision) -> io::Result<f32> {
     if !value.is_finite() {
         return Err(invalid());
@@ -389,7 +637,7 @@ impl Model {
     /// Load the complete decoder from an admitted Qwen3-ASR GGUF index.
     ///
     /// The caller owns digest verification and immutable artifact guards. This
-    /// reads decoder weights only, accepting `F32/F16/Q8_0` projections and F32
+    /// reads decoder weights only, accepting `F32/F16/Q8_0/Q4_K/Q6_K` projections and F32
     /// normalization vectors. It does not execute inference or an encoder.
     ///
     /// # Errors
@@ -471,23 +719,158 @@ impl Model {
     /// Create an empty session bound to this exact immutable model owner.
     #[must_use]
     pub fn session(self: &Arc<Self>) -> Session {
+        let precision = self.config.cache_precision;
         Session {
             model: Arc::clone(self),
             position: 0,
             layers: (0..self.blocks.len())
-                .map(|_| LayerState {
-                    keys: Vec::new(),
-                    values: Vec::new(),
-                })
+                .map(|_| LayerState::new(precision))
                 .collect(),
             workspace: DecoderWorkspace::default(),
         }
     }
 }
 
+enum LayerKv {
+    F32 { keys: Vec<f32>, values: Vec<f32> },
+    F16 { keys: Vec<u16>, values: Vec<u16> },
+}
+
 struct LayerState {
-    keys: Vec<f32>,
-    values: Vec<f32>,
+    data: LayerKv,
+}
+
+impl LayerState {
+    const fn new(precision: CachePrecision) -> Self {
+        Self {
+            data: match precision {
+                CachePrecision::F32 => LayerKv::F32 {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                },
+                CachePrecision::F16 => LayerKv::F16 {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                },
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn from_f32(keys: Vec<f32>, values: Vec<f32>) -> Self {
+        Self {
+            data: LayerKv::F32 { keys, values },
+        }
+    }
+
+    fn clear_bounded(&mut self, retain_cap: usize) {
+        match &mut self.data {
+            LayerKv::F32 { keys, values } => {
+                clear_bounded(keys, retain_cap);
+                clear_bounded(values, retain_cap);
+            }
+            LayerKv::F16 { keys, values } => {
+                clear_bounded(keys, retain_cap);
+                clear_bounded(values, retain_cap);
+            }
+        }
+    }
+
+    fn reserve_extra(&mut self, extra_kv: usize) -> io::Result<()> {
+        match &mut self.data {
+            LayerKv::F32 { keys, values } => {
+                if keys.capacity() < keys.len().saturating_add(extra_kv) {
+                    keys.try_reserve(extra_kv).map_err(io::Error::other)?;
+                }
+                if values.capacity() < values.len().saturating_add(extra_kv) {
+                    values.try_reserve(extra_kv).map_err(io::Error::other)?;
+                }
+            }
+            LayerKv::F16 { keys, values } => {
+                if keys.capacity() < keys.len().saturating_add(extra_kv) {
+                    keys.try_reserve(extra_kv).map_err(io::Error::other)?;
+                }
+                if values.capacity() < values.len().saturating_add(extra_kv) {
+                    values.try_reserve(extra_kv).map_err(io::Error::other)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_prefill(&mut self, kv_total: usize) -> io::Result<()> {
+        match &mut self.data {
+            LayerKv::F32 { keys, values } => {
+                keys.clear();
+                values.clear();
+                keys.try_reserve_exact(kv_total).map_err(io::Error::other)?;
+                values
+                    .try_reserve_exact(kv_total)
+                    .map_err(io::Error::other)?;
+                keys.resize(kv_total, 0.0);
+                values.resize(kv_total, 0.0);
+            }
+            LayerKv::F16 { keys, values } => {
+                keys.clear();
+                values.clear();
+                keys.try_reserve_exact(kv_total).map_err(io::Error::other)?;
+                values
+                    .try_reserve_exact(kv_total)
+                    .map_err(io::Error::other)?;
+                keys.resize(kv_total, 0);
+                values.resize(kv_total, 0);
+            }
+        }
+        Ok(())
+    }
+
+    fn write_batch(&mut self, src_k: &[f32], src_v: &[f32]) -> io::Result<()> {
+        match &mut self.data {
+            LayerKv::F32 { keys, values } => {
+                finite(src_k)?;
+                finite(src_v)?;
+                keys.copy_from_slice(src_k);
+                values.copy_from_slice(src_v);
+            }
+            LayerKv::F16 { keys, values } => {
+                if !packed::narrow_f32_to_f16_slice(src_k, keys)
+                    || !packed::narrow_f32_to_f16_slice(src_v, values)
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn as_layer_cache(&self) -> LayerCache<'_> {
+        match &self.data {
+            LayerKv::F32 { keys, values } => LayerCache {
+                keys: CacheValues::F32(keys.as_slice()),
+                values: CacheValues::F32(values.as_slice()),
+            },
+            LayerKv::F16 { keys, values } => LayerCache {
+                keys: CacheValues::F16(keys.as_slice()),
+                values: CacheValues::F16(values.as_slice()),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn key_capacity(&self) -> usize {
+        match &self.data {
+            LayerKv::F32 { keys, .. } => keys.capacity(),
+            LayerKv::F16 { keys, .. } => keys.capacity(),
+        }
+    }
+
+    #[cfg(test)]
+    fn value_capacity(&self) -> usize {
+        match &self.data {
+            LayerKv::F32 { values, .. } => values.capacity(),
+            LayerKv::F16 { values, .. } => values.capacity(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -497,6 +880,8 @@ struct DecoderWorkspace {
     single_q: Vec<f32>,
     single_k: Vec<f32>,
     single_v: Vec<f32>,
+    single_k_f16: Vec<u16>,
+    single_v_f16: Vec<u16>,
     single_attn: Vec<f32>,
     single_proj: Vec<f32>,
     single_gate: Vec<f32>,
@@ -504,6 +889,8 @@ struct DecoderWorkspace {
     single_scores: Vec<f32>,
     single_provisional_keys: Vec<f32>,
     single_provisional_values: Vec<f32>,
+    single_provisional_keys_f16: Vec<u16>,
+    single_provisional_values_f16: Vec<u16>,
     batch_a: Vec<f32>,
     batch_norm: Vec<f32>,
     batch_q: Vec<f32>,
@@ -538,6 +925,8 @@ impl DecoderWorkspace {
         self.single_q.clear();
         self.single_k.clear();
         self.single_v.clear();
+        self.single_k_f16.clear();
+        self.single_v_f16.clear();
         self.single_attn.clear();
         self.single_proj.clear();
         self.single_gate.clear();
@@ -545,6 +934,8 @@ impl DecoderWorkspace {
         clear_bounded(&mut self.single_scores, retain_pos);
         self.single_provisional_keys.clear();
         self.single_provisional_values.clear();
+        self.single_provisional_keys_f16.clear();
+        self.single_provisional_values_f16.clear();
         clear_bounded(&mut self.batch_a, retain_pos.saturating_mul(c.hidden));
         clear_bounded(&mut self.batch_norm, retain_pos.saturating_mul(c.hidden));
         clear_bounded(&mut self.batch_q, retain_pos.saturating_mul(q_width));
@@ -569,14 +960,18 @@ impl DecoderWorkspace {
     }
 }
 
-fn ensure_len(buffer: &mut Vec<f32>, len: usize) -> io::Result<()> {
+fn ensure_len_t<T: Default + Clone>(buffer: &mut Vec<T>, len: usize) -> io::Result<()> {
     if buffer.capacity() < len {
         buffer
             .try_reserve(len - buffer.len())
             .map_err(io::Error::other)?;
     }
-    buffer.resize(len, 0.0);
+    buffer.resize(len, T::default());
     Ok(())
+}
+
+fn ensure_len(buffer: &mut Vec<f32>, len: usize) -> io::Result<()> {
+    ensure_len_t(buffer, len)
 }
 
 /// One isolated mutable decoder session; no cache is shared between sessions.
@@ -600,12 +995,10 @@ impl Session {
         self.position
     }
 
-    /// Borrow complete layer K/V in `[position, kv_head, head_dim]` order.
+    /// Borrow complete layer K/V in `[position, kv_head, head_dim]` order (`F16` or `F32`).
     #[must_use]
-    pub fn cache(&self, layer: usize) -> Option<(&[f32], &[f32])> {
-        self.layers
-            .get(layer)
-            .map(|state| (state.keys.as_slice(), state.values.as_slice()))
+    pub fn cache(&self, layer: usize) -> Option<LayerCache<'_>> {
+        self.layers.get(layer).map(LayerState::as_layer_cache)
     }
 
     /// Discard every layer's K/V and the position, retaining bounded reusable
@@ -617,8 +1010,7 @@ impl Session {
             .saturating_mul(c.kv_heads)
             .saturating_mul(c.head_dim);
         for layer in &mut self.layers {
-            clear_bounded(&mut layer.keys, kv_retain);
-            clear_bounded(&mut layer.values, kv_retain);
+            layer.clear_bounded(kv_retain);
         }
         self.workspace.clear_bounded(c);
         self.position = 0;
@@ -630,15 +1022,7 @@ impl Session {
         let kv_width = c.kv_heads.checked_mul(c.head_dim).ok_or_else(invalid)?;
         let extra_kv = additional.checked_mul(kv_width).ok_or_else(invalid)?;
         for state in &mut self.layers {
-            if state.keys.capacity() < state.keys.len().saturating_add(extra_kv) {
-                state.keys.try_reserve(extra_kv).map_err(io::Error::other)?;
-            }
-            if state.values.capacity() < state.values.len().saturating_add(extra_kv) {
-                state
-                    .values
-                    .try_reserve(extra_kv)
-                    .map_err(io::Error::other)?;
-            }
+            state.reserve_extra(extra_kv)?;
         }
         let scores_len = self.position.saturating_add(additional).max(1);
         if self.workspace.single_scores.capacity() < scores_len {
@@ -732,16 +1116,30 @@ impl Session {
         ensure_len(&mut ws.single_up, c.intermediate)?;
         ensure_len(&mut ws.single_scores, self.position + 1)?;
         let prov_total = self.layers.len() * kv_width;
-        ensure_len(&mut ws.single_provisional_keys, prov_total)?;
-        ensure_len(&mut ws.single_provisional_values, prov_total)?;
+        if matches!(c.cache_precision, CachePrecision::F16) {
+            ensure_len_t(&mut ws.single_k_f16, kv_width)?;
+            ensure_len_t(&mut ws.single_v_f16, kv_width)?;
+            ensure_len_t(&mut ws.single_provisional_keys_f16, prov_total)?;
+            ensure_len_t(&mut ws.single_provisional_values_f16, prov_total)?;
+        } else {
+            ensure_len(&mut ws.single_provisional_keys, prov_total)?;
+            ensure_len(&mut ws.single_provisional_values, prov_total)?;
+        }
 
         for (layer_idx, (block, state)) in model.blocks.iter().zip(&self.layers).enumerate() {
             check(cancel)?;
             forward_into(block, state, model, self.position, ws, cancel)?;
-            ws.single_provisional_keys[layer_idx * kv_width..(layer_idx + 1) * kv_width]
-                .copy_from_slice(&ws.single_k);
-            ws.single_provisional_values[layer_idx * kv_width..(layer_idx + 1) * kv_width]
-                .copy_from_slice(&ws.single_v);
+            if matches!(c.cache_precision, CachePrecision::F16) {
+                ws.single_provisional_keys_f16[layer_idx * kv_width..(layer_idx + 1) * kv_width]
+                    .copy_from_slice(&ws.single_k_f16);
+                ws.single_provisional_values_f16[layer_idx * kv_width..(layer_idx + 1) * kv_width]
+                    .copy_from_slice(&ws.single_v_f16);
+            } else {
+                ws.single_provisional_keys[layer_idx * kv_width..(layer_idx + 1) * kv_width]
+                    .copy_from_slice(&ws.single_k);
+                ws.single_provisional_values[layer_idx * kv_width..(layer_idx + 1) * kv_width]
+                    .copy_from_slice(&ws.single_v);
+            }
         }
         rms_into(
             &ws.single_hidden,
@@ -758,23 +1156,27 @@ impl Session {
         };
         check(cancel)?;
         for state in &mut self.layers {
-            if state.keys.capacity() < state.keys.len() + kv_width {
-                state.keys.try_reserve(kv_width).map_err(io::Error::other)?;
-            }
-            if state.values.capacity() < state.values.len() + kv_width {
-                state
-                    .values
-                    .try_reserve(kv_width)
-                    .map_err(io::Error::other)?;
-            }
+            state.reserve_extra(kv_width)?;
         }
         for (layer_idx, state) in self.layers.iter_mut().enumerate() {
-            let k_slice =
-                &ws.single_provisional_keys[layer_idx * kv_width..(layer_idx + 1) * kv_width];
-            let v_slice =
-                &ws.single_provisional_values[layer_idx * kv_width..(layer_idx + 1) * kv_width];
-            state.keys.extend_from_slice(k_slice);
-            state.values.extend_from_slice(v_slice);
+            match &mut state.data {
+                LayerKv::F32 { keys, values } => {
+                    let k_slice = &ws.single_provisional_keys
+                        [layer_idx * kv_width..(layer_idx + 1) * kv_width];
+                    let v_slice = &ws.single_provisional_values
+                        [layer_idx * kv_width..(layer_idx + 1) * kv_width];
+                    keys.extend_from_slice(k_slice);
+                    values.extend_from_slice(v_slice);
+                }
+                LayerKv::F16 { keys, values } => {
+                    let k_slice = &ws.single_provisional_keys_f16
+                        [layer_idx * kv_width..(layer_idx + 1) * kv_width];
+                    let v_slice = &ws.single_provisional_values_f16
+                        [layer_idx * kv_width..(layer_idx + 1) * kv_width];
+                    keys.extend_from_slice(k_slice);
+                    values.extend_from_slice(v_slice);
+                }
+            }
         }
         self.position += 1;
         Ok(logits)
@@ -869,18 +1271,7 @@ fn prefill_inner(
 
     let kv_total = total * kv_width;
     for state in &mut *layers {
-        state.keys.clear();
-        state.values.clear();
-        state
-            .keys
-            .try_reserve_exact(kv_total)
-            .map_err(io::Error::other)?;
-        state
-            .values
-            .try_reserve_exact(kv_total)
-            .map_err(io::Error::other)?;
-        state.keys.resize(kv_total, 0.0);
-        state.values.resize(kv_total, 0.0);
+        state.prepare_prefill(kv_total)?;
     }
 
     let divisor = scalar(c.head_dim).sqrt();
@@ -898,27 +1289,16 @@ fn prefill_inner(
             workers,
         )?;
         ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
-        block.query.multiply_batch_prepared_into(
+        Projection::multiply_batch_triple_into(
+            &block.query,
+            &block.key,
+            &block.value,
             &ws.prepared,
             &ws.batch_norm,
             workers,
             &mut ws.transposed_scratch,
             &mut ws.batch_q,
-            cancel,
-        )?;
-        block.key.multiply_batch_prepared_into(
-            &ws.prepared,
-            &ws.batch_norm,
-            workers,
-            &mut ws.transposed_scratch,
             &mut ws.batch_k,
-            cancel,
-        )?;
-        block.value.multiply_batch_prepared_into(
-            &ws.prepared,
-            &ws.batch_norm,
-            workers,
-            &mut ws.transposed_scratch,
             &mut ws.batch_v,
             cancel,
         )?;
@@ -932,41 +1312,21 @@ fn prefill_inner(
             Ok(())
         })?;
 
-        let raw_k = &ws.batch_k;
-        row_workers::try_run_aligned(&mut state.keys, workers, kv_width, &|elem_off, k_slice| {
+        row_workers::try_run_aligned(&mut ws.batch_k, workers, kv_width, &|elem_off, k_slice| {
             let start_pos = elem_off / kv_width;
-            let end = elem_off + k_slice.len();
-            k_slice.copy_from_slice(&raw_k[elem_off..end]);
             for (local_pos, k_row) in k_slice.chunks_exact_mut(kv_width).enumerate() {
                 normalize_heads(k_row, &block.key_norm, c)?;
                 rope_with_inv_freq(k_row, &model.inv_freq, c, start_pos + local_pos)?;
-                for value in k_row {
-                    *value = cache_value(*value, c.cache_precision)?;
-                }
             }
             Ok(())
         })?;
 
-        let raw_v = &ws.batch_v;
-        row_workers::try_run_aligned(
-            &mut state.values,
-            workers,
-            kv_width,
-            &|elem_off, v_slice| {
-                let end = elem_off + v_slice.len();
-                for (dst, &src) in v_slice.iter_mut().zip(&raw_v[elem_off..end]) {
-                    *dst = cache_value(src, c.cache_precision)?;
-                }
-                Ok(())
-            },
-        )?;
+        state.write_batch(&ws.batch_k, &ws.batch_v)?;
 
         for _ in 0..(total * c.heads) {
             check(cancel)?;
         }
         let queries = &ws.batch_q;
-        let cached_keys = &state.keys;
-        let cached_values = &state.values;
         row_workers::try_run_aligned(
             &mut ws.batch_attn,
             workers,
@@ -988,8 +1348,7 @@ fn prefill_inner(
                         let out_head = &mut out_row[head * c.head_dim..(head + 1) * c.head_dim];
                         attend_head_causal(
                             q_head,
-                            cached_keys,
-                            cached_values,
+                            state,
                             None,
                             None,
                             history_rows,
@@ -1027,12 +1386,16 @@ fn prefill_inner(
             ensure_len(&mut ws.single_proj, hidden)?;
             let last_row = &mut ws.batch_a[last_offset..last_offset + hidden];
             rms_into(last_row, &block.ffn_norm, c.epsilon, &mut ws.single_norm)?;
-            block
-                .gate
-                .multiply_into(&ws.single_norm, workers, &mut ws.single_gate, cancel)?;
-            block
-                .up
-                .multiply_into(&ws.single_norm, workers, &mut ws.single_up, cancel)?;
+            Projection::multiply_pair_into(
+                &block.gate,
+                &block.up,
+                &ws.single_norm,
+                workers,
+                &mut ws.single_gate,
+                &mut ws.single_up,
+                &mut ws.transposed_scratch,
+                cancel,
+            )?;
             for (gate, &up) in ws.single_gate.iter_mut().zip(&ws.single_up) {
                 *gate = (*gate / (1.0 + (-*gate).exp())) * up;
             }
@@ -1054,19 +1417,14 @@ fn prefill_inner(
                 workers,
             )?;
             ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
-            block.gate.multiply_batch_prepared_into(
+            Projection::multiply_batch_pair_into(
+                &block.gate,
+                &block.up,
                 &ws.prepared,
                 &ws.batch_norm,
                 workers,
                 &mut ws.transposed_scratch,
                 &mut ws.batch_gate,
-                cancel,
-            )?;
-            block.up.multiply_batch_prepared_into(
-                &ws.prepared,
-                &ws.batch_norm,
-                workers,
-                &mut ws.transposed_scratch,
                 &mut ws.batch_up,
                 cancel,
             )?;
@@ -1225,24 +1583,33 @@ fn forward_into(
         c.epsilon,
         &mut ws.single_norm,
     )?;
-    block
-        .query
-        .multiply_into(&ws.single_norm, workers, &mut ws.single_q, cancel)?;
-    block
-        .key
-        .multiply_into(&ws.single_norm, workers, &mut ws.single_k, cancel)?;
-    block
-        .value
-        .multiply_into(&ws.single_norm, workers, &mut ws.single_v, cancel)?;
+    Projection::multiply_triple_into(
+        &block.query,
+        &block.key,
+        &block.value,
+        &ws.single_norm,
+        workers,
+        &mut ws.single_q,
+        &mut ws.single_k,
+        &mut ws.single_v,
+        &mut ws.transposed_scratch,
+        cancel,
+    )?;
     normalize_heads(&mut ws.single_q, &block.query_norm, c)?;
     normalize_heads(&mut ws.single_k, &block.key_norm, c)?;
     rope_with_inv_freq(&mut ws.single_q, &model.inv_freq, c, position)?;
     rope_with_inv_freq(&mut ws.single_k, &model.inv_freq, c, position)?;
-    for value in &mut ws.single_k {
-        *value = cache_value(*value, c.cache_precision)?;
-    }
-    for value in &mut ws.single_v {
-        *value = cache_value(*value, c.cache_precision)?;
+    if matches!(c.cache_precision, CachePrecision::F16) {
+        if !packed::narrow_f32_to_f16_slice(&ws.single_k, &mut ws.single_k_f16)
+            || !packed::narrow_f32_to_f16_slice(&ws.single_v, &mut ws.single_v_f16)
+        {
+            return Err(invalid());
+        }
+        packed::widen_f16_slice(&ws.single_k_f16, &mut ws.single_k);
+        packed::widen_f16_slice(&ws.single_v_f16, &mut ws.single_v);
+    } else {
+        finite(&ws.single_k)?;
+        finite(&ws.single_v)?;
     }
     attend_into(
         &ws.single_q,
@@ -1268,12 +1635,16 @@ fn forward_into(
         c.epsilon,
         &mut ws.single_norm,
     )?;
-    block
-        .gate
-        .multiply_into(&ws.single_norm, workers, &mut ws.single_gate, cancel)?;
-    block
-        .up
-        .multiply_into(&ws.single_norm, workers, &mut ws.single_up, cancel)?;
+    Projection::multiply_pair_into(
+        &block.gate,
+        &block.up,
+        &ws.single_norm,
+        workers,
+        &mut ws.single_gate,
+        &mut ws.single_up,
+        &mut ws.transposed_scratch,
+        cancel,
+    )?;
     for (gate, &up) in ws.single_gate.iter_mut().zip(&ws.single_up) {
         *gate = (*gate / (1.0 + (-*gate).exp())) * up;
     }
@@ -1293,8 +1664,7 @@ fn forward_into(
 )]
 fn attend_head_causal(
     q_head: &[f32],
-    state_keys: &[f32],
-    state_values: &[f32],
+    state: &LayerState,
     cur_key: Option<&[f32]>,
     cur_val: Option<&[f32]>,
     history_rows: usize,
@@ -1305,20 +1675,36 @@ fn attend_head_causal(
     scores: &mut [f32],
     out_head: &mut [f32],
 ) -> io::Result<()> {
-    packed::attend_head(
-        q_head,
-        state_keys,
-        state_values,
-        history_rows,
-        kv_width,
-        offset,
-        head_dim,
-        divisor,
-        cur_key.zip(cur_val),
-        scores,
-        out_head,
-        invalid,
-    )
+    match &state.data {
+        LayerKv::F32 { keys, values } => packed::attend_head(
+            q_head,
+            keys,
+            values,
+            history_rows,
+            kv_width,
+            offset,
+            head_dim,
+            divisor,
+            cur_key.zip(cur_val),
+            scores,
+            out_head,
+            invalid,
+        ),
+        LayerKv::F16 { keys, values } => packed::attend_head_f16(
+            q_head,
+            keys,
+            values,
+            history_rows,
+            kv_width,
+            offset,
+            head_dim,
+            divisor,
+            cur_key.zip(cur_val),
+            scores,
+            out_head,
+            invalid,
+        ),
+    }
 }
 
 #[expect(
@@ -1348,8 +1734,7 @@ fn attend_into(
         let out_head = &mut output[head * c.head_dim..(head + 1) * c.head_dim];
         attend_head_causal(
             q_head,
-            &state.keys,
-            &state.values,
+            state,
             Some(&keys[offset..offset + c.head_dim]),
             Some(&values[offset..offset + c.head_dim]),
             position,

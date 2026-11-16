@@ -2,13 +2,20 @@
 #![forbid(unsafe_code)]
 
 use crate::threads::MAX_WORKERS;
+#[cfg(all(windows, feature = "rust-qualification"))]
+use bonsai_windows_process::RowWorkerPool;
+#[cfg(not(all(windows, feature = "rust-qualification")))]
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use std::{cell::RefCell, io, sync::Mutex, thread::JoinHandle};
+#[cfg(not(all(windows, feature = "rust-qualification")))]
+use std::thread::JoinHandle;
+use std::{cell::RefCell, io, sync::Mutex};
 
 thread_local! {
     // Each calling serving thread owns its worker team across requests; dropping
     // that thread or switching worker count releases the previous team first.
     static TEAM: RefCell<Option<CachedTeam>> = const { RefCell::new(None) };
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    static IN_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 enum CachedTeam {
@@ -17,19 +24,39 @@ enum CachedTeam {
 }
 
 impl CachedTeam {
-    const fn needs_rebuild(&self, worker_count: usize) -> bool {
+    fn needs_rebuild(&self, worker_count: usize) -> bool {
         match self {
-            Self::Ready(team) => team.workers.len() < worker_count,
+            Self::Ready(team) => team.worker_count() < worker_count,
             Self::Unavailable(count) => *count != worker_count,
         }
     }
 }
 
+#[cfg(all(windows, feature = "rust-qualification"))]
+struct OwnedTeam {
+    pool: RowWorkerPool,
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+impl OwnedTeam {
+    fn build(worker_count: usize) -> io::Result<Self> {
+        Ok(Self {
+            pool: RowWorkerPool::new(worker_count, "asr-row")?,
+        })
+    }
+
+    fn worker_count(&self) -> usize {
+        self.pool.worker_count()
+    }
+}
+
+#[cfg(not(all(windows, feature = "rust-qualification")))]
 struct OwnedTeam {
     pool: Option<ThreadPool>,
     workers: Vec<JoinHandle<()>>,
 }
 
+#[cfg(not(all(windows, feature = "rust-qualification")))]
 impl OwnedTeam {
     fn build(worker_count: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
         let mut team = Self {
@@ -49,8 +76,13 @@ impl OwnedTeam {
         team.pool = Some(pool);
         Ok(team)
     }
+
+    const fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
 }
 
+#[cfg(not(all(windows, feature = "rust-qualification")))]
 impl Drop for OwnedTeam {
     fn drop(&mut self) {
         // Dropping the pool signals every worker thread to exit before joining.
@@ -61,6 +93,66 @@ impl Drop for OwnedTeam {
     }
 }
 
+#[cfg(all(windows, feature = "rust-qualification"))]
+struct WorkerFlagGuard(bool);
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+impl WorkerFlagGuard {
+    fn enter() -> Self {
+        Self(IN_WORKER.with(|flag| flag.replace(true)))
+    }
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+impl Drop for WorkerFlagGuard {
+    fn drop(&mut self) {
+        IN_WORKER.with(|flag| flag.set(self.0));
+    }
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn with_team<R>(
+    worker_count: usize,
+    total_len: usize,
+    alignment: usize,
+    action: impl FnOnce(&RowWorkerPool, usize) -> R,
+) -> Option<R> {
+    let worker_count = worker_count.clamp(1, MAX_WORKERS);
+    let alignment = alignment.max(1);
+    if worker_count <= 1
+        || total_len == 0
+        || rayon::current_thread_index().is_some()
+        || IN_WORKER.with(std::cell::Cell::get)
+    {
+        return None;
+    }
+    let groups = total_len.div_ceil(alignment);
+    if groups < 2 {
+        return None;
+    }
+    let active_workers = worker_count.min(groups);
+    TEAM.with(|slot| {
+        let Ok(mut team) = slot.try_borrow_mut() else {
+            return None;
+        };
+        if team
+            .as_ref()
+            .is_none_or(|cached| cached.needs_rebuild(worker_count))
+        {
+            *team = None;
+            *team = Some(
+                OwnedTeam::build(worker_count)
+                    .map_or_else(|_| CachedTeam::Unavailable(worker_count), CachedTeam::Ready),
+            );
+        }
+        let CachedTeam::Ready(owned) = team.as_ref()? else {
+            return None;
+        };
+        Some(action(&owned.pool, active_workers))
+    })
+}
+
+#[cfg(not(all(windows, feature = "rust-qualification")))]
 fn with_team<R>(
     worker_count: usize,
     total_len: usize,
@@ -113,15 +205,37 @@ pub(super) fn run_aligned<F>(
 ) where
     F: Fn(usize, &mut [f32]) + Sync,
 {
-    let done = with_team(worker_count, out.len(), alignment, |pool, chunk_len| {
-        pool.install(|| {
-            out.par_chunks_mut(chunk_len)
-                .enumerate()
-                .for_each(|(index, slice)| compute_slice(index * chunk_len, slice));
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        let eff_align = alignment.max(1);
+        let done = with_team(
+            worker_count,
+            out.len(),
+            eff_align,
+            |pool, active_workers| {
+                let run = |offset: usize, slice: &mut [f32]| {
+                    let _guard = WorkerFlagGuard::enter();
+                    compute_slice(offset, slice);
+                };
+                pool.run_aligned(out, active_workers, eff_align, &run);
+            },
+        );
+        if done.is_none() {
+            compute_slice(0, out);
+        }
+    }
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    {
+        let done = with_team(worker_count, out.len(), alignment, |pool, chunk_len| {
+            pool.install(|| {
+                out.par_chunks_mut(chunk_len)
+                    .enumerate()
+                    .for_each(|(index, slice)| compute_slice(index * chunk_len, slice));
+            });
         });
-    });
-    if done.is_none() {
-        compute_slice(0, out);
+        if done.is_none() {
+            compute_slice(0, out);
+        }
     }
 }
 
@@ -136,13 +250,17 @@ pub(super) fn try_run_aligned<F>(
 where
     F: Fn(usize, &mut [f32]) -> io::Result<()> + Sync,
 {
-    if let Some(result) = with_team(worker_count, out.len(), alignment, |pool, chunk_len| {
-        let failure: Mutex<Option<(usize, io::Error)>> = Mutex::new(None);
-        pool.install(|| {
-            out.par_chunks_mut(chunk_len)
-                .enumerate()
-                .for_each(|(index, slice)| {
-                    let offset = index * chunk_len;
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        let eff_align = alignment.max(1);
+        if let Some(result) = with_team(
+            worker_count,
+            out.len(),
+            eff_align,
+            |pool, active_workers| {
+                let failure: Mutex<Option<(usize, io::Error)>> = Mutex::new(None);
+                let run = |offset: usize, slice: &mut [f32]| {
+                    let _guard = WorkerFlagGuard::enter();
                     if let Err(error) = compute_slice(offset, slice) {
                         let mut guard = failure
                             .lock()
@@ -151,19 +269,53 @@ where
                             *guard = Some((offset, error));
                         }
                     }
-                });
-        });
-        match failure
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            Some((_, error)) => Err(error),
-            None => Ok(()),
+                };
+                pool.run_aligned(out, active_workers, eff_align, &run);
+                match failure
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                {
+                    Some((_, error)) => Err(error),
+                    None => Ok(()),
+                }
+            },
+        ) {
+            result
+        } else {
+            compute_slice(0, out)
         }
-    }) {
-        result
-    } else {
-        compute_slice(0, out)
+    }
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    {
+        if let Some(result) = with_team(worker_count, out.len(), alignment, |pool, chunk_len| {
+            let failure: Mutex<Option<(usize, io::Error)>> = Mutex::new(None);
+            pool.install(|| {
+                out.par_chunks_mut(chunk_len)
+                    .enumerate()
+                    .for_each(|(index, slice)| {
+                        let offset = index * chunk_len;
+                        if let Err(error) = compute_slice(offset, slice) {
+                            let mut guard = failure
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if guard.as_ref().is_none_or(|(prev, _)| offset < *prev) {
+                                *guard = Some((offset, error));
+                            }
+                        }
+                    });
+            });
+            match failure
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                Some((_, error)) => Err(error),
+                None => Ok(()),
+            }
+        }) {
+            result
+        } else {
+            compute_slice(0, out)
+        }
     }
 }
 

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "provider": "rust-complete-asr-qualification-consumer",
   "scope": "opt-in-gguf-tokenizer-frontend-cnn-transformer-causal-decoder-and-complete-transcript-pipeline",
-  "arithmeticIdentity": "rust-asr-scalar-f32-v2-f16-conv-kv-f64-erfc-gelu",
+  "arithmeticIdentity": "rust-asr-sdot-i8mm-v3-f16-kv-minimax-gelu",
   "applicationDefault": "native-transcribe-cpp-unchanged-pending-qualification",
   "nativeFallback": false,
   "buildBoundary": {

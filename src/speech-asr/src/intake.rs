@@ -380,6 +380,7 @@ pub(super) fn tokenizer(
     load_tokenizer(&mut index, cancel)
 }
 
+#[cfg(not(all(windows, feature = "rust-qualification")))]
 pub(super) fn load_artifacts(
     source: &mut (impl Read + Seek),
     length: u64,
@@ -400,6 +401,31 @@ pub(super) fn load_artifacts(
     let (encoder, frontend) = encoder::load(&index, source, cancel)?;
     check_cancel(cancel)?;
     let decoder = decoder::load(&index, source, precision, cancel)?;
+    Ok((tokenizer, prompt_tokens, encoder, frontend, decoder))
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+pub(super) fn load_artifacts_mapped(
+    mapping: &std::sync::Arc<bonsai_windows_process::MappedFile>,
+    precision: crate::decoder::CachePrecision,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<(
+    crate::tokenizer::Tokenizer,
+    crate::protocol::PromptTokens,
+    crate::encoder::Encoder,
+    crate::frontend::Frontend,
+    crate::decoder::Model,
+)> {
+    let length = u64::try_from(mapping.len()).map_err(|_| invalid())?;
+    let mut cursor = io::Cursor::new(mapping.as_slice());
+    let mut index = read_index(&mut cursor, length, cancel)?;
+    model::validate(&index)?;
+    check_cancel(cancel)?;
+    let (tokenizer, prompt_tokens) = load_tokenizer(&mut index, cancel)?;
+    check_cancel(cancel)?;
+    let (encoder, frontend) = encoder::load_mapped(&index, mapping, cancel)?;
+    check_cancel(cancel)?;
+    let decoder = decoder::load_mapped(&index, mapping, precision, cancel)?;
     Ok((tokenizer, prompt_tokens, encoder, frontend, decoder))
 }
 

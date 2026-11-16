@@ -15,7 +15,7 @@ use crate::{
 use std::{fs::OpenOptions, io, path::Path, sync::Arc};
 
 /// Independent arithmetic identity; not the native GGML/flash-attention identity.
-pub const ARITHMETIC_IDENTITY: &str = "rust-asr-scalar-f32-v2-f16-conv-kv-f64-erfc-gelu";
+pub const ARITHMETIC_IDENTITY: &str = "rust-asr-sdot-i8mm-v3-f16-kv-minimax-gelu";
 
 /// Borrowed numerical observations for an independently retained replay packet.
 ///
@@ -131,7 +131,10 @@ impl RustRecognizer {
                 .share_mode(1)
                 .custom_flags(0x0020_0000 | 0x0800_0000);
         }
+        #[cfg(not(all(windows, feature = "rust-qualification")))]
         let mut file = options.open(path)?;
+        #[cfg(all(windows, feature = "rust-qualification"))]
+        let file = options.open(path)?;
         let properties = file.metadata()?;
         if !properties.is_file() {
             return Err(invalid());
@@ -143,6 +146,13 @@ impl RustRecognizer {
                 return Err(invalid());
             }
         }
+        #[cfg(all(windows, feature = "rust-qualification"))]
+        let (tokenizer, prompt_tokens, encoder, frontend, model) = {
+            let mapping = Arc::new(bonsai_windows_process::MappedFile::from_file(&file)?);
+            drop(file);
+            crate::intake::load_artifacts_mapped(&mapping, CachePrecision::F16, cancel)?
+        };
+        #[cfg(not(all(windows, feature = "rust-qualification")))]
         let (tokenizer, prompt_tokens, encoder, frontend, model) = crate::intake::load_artifacts(
             &mut file,
             properties.len(),

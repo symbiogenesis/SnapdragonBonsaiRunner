@@ -312,6 +312,42 @@ impl<R: Read> Replay<R> {
         Ok(())
     }
 
+    fn cache_values(
+        &mut self,
+        actual: CacheValues<'_>,
+        tolerance: Tolerance,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        match actual {
+            CacheValues::F32(values) => self.floats(values, tolerance, cancel),
+            CacheValues::F16(words) => {
+                self.number(words.len())?;
+                let mut widened = [0.0_f32; 4096];
+                for (chunk_index, chunk) in words.chunks(4096).enumerate() {
+                    if cancel() {
+                        return Err(io::ErrorKind::Interrupted.into());
+                    }
+                    let slice = &mut widened[..chunk.len()];
+                    crate::packed::widen_f16_slice(chunk, slice);
+                    for (index, &value) in slice.iter().enumerate() {
+                        let mut raw = [0; 4];
+                        self.input.read_exact(&mut raw)?;
+                        if !tolerance.accepts(f32::from_le_bytes(raw), value) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "ASR replay numerical mismatch at element {}.",
+                                    chunk_index * 4096 + index
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn observe(
         &mut self,
         event: Observation<'_>,
@@ -394,9 +430,9 @@ impl<R: Read> Replay<R> {
                 self.number(state.layer_count())?;
                 for layer in 0..state.layer_count() {
                     self.number(layer)?;
-                    let (keys, values) = state.cache(layer).ok_or_else(invalid)?;
-                    self.floats(keys, self.tolerance.cache, cancel)?;
-                    self.floats(values, self.tolerance.cache, cancel)?;
+                    let cache = state.cache(layer).ok_or_else(invalid)?;
+                    self.cache_values(cache.keys, self.tolerance.cache, cancel)?;
+                    self.cache_values(cache.values, self.tolerance.cache, cancel)?;
                 }
                 self.layers = Some(state.layer_count());
                 self.generation = self.generation.checked_add(1).ok_or_else(invalid)?;

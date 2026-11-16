@@ -1,21 +1,43 @@
 //! Decode admitted source-bound tensor ranges into the independent Rust decoder.
 
 use super::{Index, invalid};
-use crate::decoder::{Block, CachePrecision, Config, Model, Projection};
+use crate::decoder::{Block, CachePrecision, Config, Model, Projection, WeightBytes};
 use std::io::{self, Read, Seek, SeekFrom};
 
 pub(super) struct Loader<'a, R> {
     pub(super) index: &'a Index,
     pub(super) source: &'a mut R,
     pub(super) remaining: u64,
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    pub(super) mapping: Option<&'a std::sync::Arc<bonsai_windows_process::MappedFile>>,
 }
 
 impl<'a, R: Read + Seek> Loader<'a, R> {
     pub(super) const fn new(index: &'a Index, source: &'a mut R) -> Self {
+        Self::with_limit(index, source, 8 * 1024 * 1024 * 1024)
+    }
+
+    const fn with_limit(index: &'a Index, source: &'a mut R, remaining: u64) -> Self {
+        Self {
+            index,
+            source,
+            remaining,
+            #[cfg(all(windows, feature = "rust-qualification"))]
+            mapping: None,
+        }
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    pub(super) const fn new_mapped(
+        index: &'a Index,
+        source: &'a mut R,
+        mapping: &'a std::sync::Arc<bonsai_windows_process::MappedFile>,
+    ) -> Self {
         Self {
             index,
             source,
             remaining: 8 * 1024 * 1024 * 1024,
+            mapping: Some(mapping),
         }
     }
 
@@ -63,6 +85,40 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
             self.source.read_exact(&mut bytes[start..end])?;
         }
         Ok((tensor.kind, bytes))
+    }
+
+    fn projection_bytes(
+        &mut self,
+        name: &str,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<(u32, WeightBytes)> {
+        #[cfg(all(windows, feature = "rust-qualification"))]
+        if let Some(mapping) = self.mapping {
+            let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
+            self.remaining = self
+                .remaining
+                .checked_sub(tensor.bytes)
+                .ok_or_else(invalid)?;
+            if cancel() {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let offset = usize::try_from(tensor.offset).map_err(|_| invalid())?;
+            let len = usize::try_from(tensor.bytes).map_err(|_| invalid())?;
+            let end = offset.checked_add(len).ok_or_else(invalid)?;
+            if end > mapping.len() {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            return Ok((
+                tensor.kind,
+                WeightBytes::Mapped {
+                    _mapping: std::sync::Arc::clone(mapping),
+                    offset,
+                    len,
+                },
+            ));
+        }
+        let (kind, raw) = self.bytes(name, cancel)?;
+        Ok((kind, WeightBytes::Owned(raw)))
     }
 
     fn stream_tensor_values(
@@ -146,7 +202,9 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
         match tensor.kind {
             0 => Projection::f32(input, output, self.vector(name, cancel)?),
             1 => Projection::f32(input, output, self.f16_vector(name, cancel)?),
-            8 => Projection::q8(input, output, self.bytes(name, cancel)?.1),
+            8 => Projection::q8_bytes(input, output, self.projection_bytes(name, cancel)?.1),
+            12 => Projection::q4_k_bytes(input, output, self.projection_bytes(name, cancel)?.1),
+            14 => Projection::q6_k_bytes(input, output, self.projection_bytes(name, cancel)?.1),
             _ => Err(invalid()),
         }
     }
@@ -194,6 +252,26 @@ pub(super) fn load<R: Read + Seek>(
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Model> {
     let mut loader = Loader::new(index, source);
+    load_with_loader(&mut loader, precision, cancel)
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+pub(super) fn load_mapped(
+    index: &Index,
+    mapping: &std::sync::Arc<bonsai_windows_process::MappedFile>,
+    precision: CachePrecision,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<Model> {
+    let mut cursor = io::Cursor::new(mapping.as_slice());
+    let mut loader = Loader::new_mapped(index, &mut cursor, mapping);
+    load_with_loader(&mut loader, precision, cancel)
+}
+
+fn load_with_loader<R: Read + Seek>(
+    loader: &mut Loader<'_, R>,
+    precision: CachePrecision,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<Model> {
     let config = Config {
         hidden: loader.count("hidden_size")?,
         heads: loader.count("n_heads")?,
@@ -295,11 +373,7 @@ mod tests {
             metadata: BTreeMap::new(),
             tensors,
         };
-        let mut loader = Loader {
-            index: &index,
-            source: &mut source,
-            remaining: 128,
-        };
+        let mut loader = Loader::with_limit(&index, &mut source, 128);
         for name in ["float", "half"] {
             let projection = loader.projection(name, &mut || false)?;
             assert_eq!(
@@ -316,6 +390,62 @@ mod tests {
         assert!(loader.projection("missing", &mut || false).is_err());
         assert!(loader.projection("quant", &mut || true).is_err());
         assert!(Projection::f16(1, 1, &[0]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rust_asr_decoder_wire_kquant_projections() -> io::Result<()> {
+        let mut q4 = vec![0_u8; 144];
+        q4[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes()); // d = 1.0
+        q4[4] = 1; // group 0 scale = 1
+        q4[16..48].fill(0x01); // elements 0..32 low nibble = 1
+        let mut q6 = vec![0_u8; 210];
+        q6[0..16].fill(0x01);
+        q6[128..144].fill(0x02);
+        q6[192] = 1; // scale[0] = 1 (elements 0..16), remaining scales = 0
+        q6[208..210].copy_from_slice(&0x3c00_u16.to_le_bytes()); // d = 1.0
+
+        let mut source_bytes = Vec::new();
+        source_bytes.extend_from_slice(&q4);
+        source_bytes.extend_from_slice(&q6);
+        let tensors = BTreeMap::from([
+            (
+                "q4k".into(),
+                Tensor {
+                    shape: vec![256, 1],
+                    kind: 12,
+                    offset: 0,
+                    bytes: 144,
+                },
+            ),
+            (
+                "q6k".into(),
+                Tensor {
+                    shape: vec![256, 1],
+                    kind: 14,
+                    offset: 144,
+                    bytes: 210,
+                },
+            ),
+        ]);
+        let index = Index {
+            metadata: BTreeMap::new(),
+            tensors,
+        };
+        let mut cursor = Cursor::new(source_bytes);
+        let mut loader = Loader::new(&index, &mut cursor);
+        assert_eq!(
+            loader
+                .projection("q4k", &mut || false)?
+                .multiply(&[1.0; 256], &mut || false)?,
+            [32.0]
+        );
+        assert_eq!(
+            loader
+                .projection("q6k", &mut || false)?
+                .multiply(&[1.0; 256], &mut || false)?,
+            [16.0]
+        );
         Ok(())
     }
 
@@ -350,11 +480,7 @@ mod tests {
                 let length = u64::try_from(bytes.len()).map_err(|_| super::invalid())?;
                 let mut source = Cursor::new(bytes);
                 let index = one_tensor(shape, kind, length);
-                let mut loader = Loader {
-                    index: &index,
-                    source: &mut source,
-                    remaining: length,
-                };
+                let mut loader = Loader::with_limit(&index, &mut source, length);
                 let projection = loader.projection("weight", &mut || false)?;
                 assert_eq!(projection.dimensions(), (2, 1));
                 assert_eq!(projection.multiply(&[5.0, 6.0], &mut || false)?, [-7.0]);
@@ -367,11 +493,7 @@ mod tests {
             bytes[2..6].copy_from_slice(&[1, 255, 127, 128]);
             let mut source = Cursor::new(bytes);
             let index = one_tensor(shape, 8, 34);
-            let mut loader = Loader {
-                index: &index,
-                source: &mut source,
-                remaining: 34,
-            };
+            let mut loader = Loader::with_limit(&index, &mut source, 34);
             assert_eq!(
                 loader
                     .projection("weight", &mut || false)?
@@ -382,11 +504,7 @@ mod tests {
         // A genuinely nonunit third axis is not a matrix and must fail before I/O.
         let mut source = Cursor::new(Vec::<u8>::new());
         let index = one_tensor(&[2, 1, 2], 0, 16);
-        let mut loader = Loader {
-            index: &index,
-            source: &mut source,
-            remaining: 16,
-        };
+        let mut loader = Loader::with_limit(&index, &mut source, 16);
         assert!(loader.projection("weight", &mut || false).is_err());
         assert_eq!(source.position(), 0);
         Ok(())
@@ -416,11 +534,7 @@ mod tests {
                 let length = u64::try_from(bytes.len()).map_err(|_| super::invalid())?;
                 let mut source = Cursor::new(bytes);
                 let index = one_tensor(shape, kind, length);
-                let mut loader = Loader {
-                    index: &index,
-                    source: &mut source,
-                    remaining: length,
-                };
+                let mut loader = Loader::with_limit(&index, &mut source, length);
                 let projection = loader.convolution("weight", &mut || false)?;
                 assert_eq!(projection.dimensions(), (9, 1));
                 assert_eq!(projection.multiply(&[1.0; 9], &mut || false)?, [5.0]);
@@ -428,11 +542,7 @@ mod tests {
         }
         let mut source = Cursor::new(Vec::<u8>::new());
         let index = one_tensor(&[3], 0, 12);
-        let mut loader = Loader {
-            index: &index,
-            source: &mut source,
-            remaining: 12,
-        };
+        let mut loader = Loader::with_limit(&index, &mut source, 12);
         assert!(loader.convolution("weight", &mut || false).is_err());
         assert_eq!(source.position(), 0);
         Ok(())

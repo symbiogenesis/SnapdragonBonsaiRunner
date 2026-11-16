@@ -9,6 +9,8 @@
     reason = "Non-fused multiply and add preserve exact left-to-right scalar f32 bit parity."
 )]
 
+#[cfg(all(windows, feature = "rust-qualification"))]
+use bonsai_windows_process::quant_kernels::{self, Arm64QuantCaps, Q8_0ActBlock, Q8_KActBlock};
 use std::sync::OnceLock;
 
 use crate::row_workers;
@@ -20,11 +22,13 @@ pub(super) fn simd_level() -> Level {
     *SIMD_LEVEL.get_or_init(Level::new)
 }
 
-/// Borrowed weight slice for row-major `F32` or `Q8_0` matrices.
+/// Borrowed weight slice for row-major `F32`, `Q8_0`, `Q4_K`, or `Q6_K` matrices.
 #[derive(Clone, Copy)]
 pub(super) enum WeightSlice<'a> {
     Float(&'a [f32]),
     Q8(&'a [u8]),
+    Q4K(&'a [u8]),
+    Q6K(&'a [u8]),
 }
 
 /// Borrowed matrix geometry paired with its row-major weight slice.
@@ -149,6 +153,85 @@ fn half_scale(bytes: &[u8]) -> f32 {
     half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32()
 }
 
+#[inline]
+pub(super) fn unpack_q4_k_scale_min(group: usize, packed: &[u8]) -> (u8, u8) {
+    if group < 4 {
+        (packed[group] & 63, packed[group + 4] & 63)
+    } else {
+        (
+            (packed[group + 4] & 15) | ((packed[group - 4] >> 6) << 4),
+            (packed[group + 4] >> 4) | ((packed[group] >> 6) << 4),
+        )
+    }
+}
+
+/// Decode one row of `Q4_K` super-blocks (`144` bytes / `256` elements) into `out`.
+pub(super) fn decode_q4_k_row(row_bytes: &[u8], out: &mut [f32]) {
+    for (block, dst_block) in row_bytes
+        .as_chunks::<144>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<256>().0)
+    {
+        let d = half_scale(&block[0..2]);
+        let dmin = half_scale(&block[2..4]);
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        for chunk_idx in 0..4 {
+            let (s_lo, m_lo) = unpack_q4_k_scale_min(chunk_idx * 2, scales);
+            let (s_hi, m_hi) = unpack_q4_k_scale_min(chunk_idx * 2 + 1, scales);
+            let sc_lo = d * f32::from(s_lo);
+            let min_lo = dmin * f32::from(m_lo);
+            let sc_hi = d * f32::from(s_hi);
+            let min_hi = dmin * f32::from(m_hi);
+            let q_chunk = &qs[chunk_idx * 32..(chunk_idx + 1) * 32];
+            let dst_lo = &mut dst_block[chunk_idx * 64..chunk_idx * 64 + 32];
+            for (dst, &q) in dst_lo.iter_mut().zip(q_chunk) {
+                *dst = sc_lo * f32::from(q & 0x0f) - min_lo;
+            }
+            let dst_hi = &mut dst_block[chunk_idx * 64 + 32..chunk_idx * 64 + 64];
+            for (dst, &q) in dst_hi.iter_mut().zip(q_chunk) {
+                *dst = sc_hi * f32::from(q >> 4) - min_hi;
+            }
+        }
+    }
+}
+
+/// Decode one row of `Q6_K` super-blocks (`210` bytes / `256` elements) into `out`.
+pub(super) fn decode_q6_k_row(row_bytes: &[u8], out: &mut [f32]) {
+    for (block, dst_block) in row_bytes
+        .as_chunks::<210>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<256>().0)
+    {
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d = half_scale(&block[208..210]);
+        for n128 in 0..2 {
+            let ql_s = &ql[n128 * 64..];
+            let qh_s = &qh[n128 * 32..];
+            let sc_s = &scales[n128 * 8..];
+            let dst_s = &mut dst_block[n128 * 128..];
+            for l in 0..32 {
+                let is = l / 16;
+                let ql0 = ql_s[l];
+                let ql1 = ql_s[l + 32];
+                let qh_v = qh_s[l];
+                let q1 = i16::from((ql0 & 0x0f) | ((qh_v & 3) << 4)) - 32;
+                let q2 = i16::from((ql1 & 0x0f) | (((qh_v >> 2) & 3) << 4)) - 32;
+                let q3 = i16::from((ql0 >> 4) | (((qh_v >> 4) & 3) << 4)) - 32;
+                let q4 = i16::from((ql1 >> 4) | (((qh_v >> 6) & 3) << 4)) - 32;
+                dst_s[l] = (d * f32::from(sc_s[is].cast_signed())) * f32::from(q1);
+                dst_s[l + 32] = (d * f32::from(sc_s[is + 2].cast_signed())) * f32::from(q2);
+                dst_s[l + 64] = (d * f32::from(sc_s[is + 4].cast_signed())) * f32::from(q3);
+                dst_s[l + 96] = (d * f32::from(sc_s[is + 6].cast_signed())) * f32::from(q4);
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn signed_lanes<S: Simd>(simd: S, bytes: u8x16<S>) -> [f32x4<S>; 4] {
     let (lo, hi) = simd.widen_i8x16(bytes.bitcast());
@@ -265,6 +348,75 @@ fn single_f32_1row(row: &[f32], input: &[f32]) -> f32 {
     acc
 }
 
+fn dot_q4_k_row_scalar(row_bytes: &[u8], input: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
+    for (block, in_block) in row_bytes
+        .as_chunks::<144>()
+        .0
+        .iter()
+        .zip(input.as_chunks::<256>().0)
+    {
+        let d = half_scale(&block[0..2]);
+        let dmin = half_scale(&block[2..4]);
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        for chunk_idx in 0..4 {
+            let (s_lo, m_lo) = unpack_q4_k_scale_min(chunk_idx * 2, scales);
+            let (s_hi, m_hi) = unpack_q4_k_scale_min(chunk_idx * 2 + 1, scales);
+            let sc_lo = d * f32::from(s_lo);
+            let min_lo = dmin * f32::from(m_lo);
+            let sc_hi = d * f32::from(s_hi);
+            let min_hi = dmin * f32::from(m_hi);
+            let q_chunk = &qs[chunk_idx * 32..(chunk_idx + 1) * 32];
+            let in_lo = &in_block[chunk_idx * 64..chunk_idx * 64 + 32];
+            for (&q, &a) in q_chunk.iter().zip(in_lo) {
+                sum += (sc_lo * f32::from(q & 0x0f) - min_lo) * a;
+            }
+            let in_hi = &in_block[chunk_idx * 64 + 32..chunk_idx * 64 + 64];
+            for (&q, &a) in q_chunk.iter().zip(in_hi) {
+                sum += (sc_hi * f32::from(q >> 4) - min_hi) * a;
+            }
+        }
+    }
+    sum
+}
+
+fn dot_q6_k_row_scalar(row_bytes: &[u8], input: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
+    for (block, in_block) in row_bytes
+        .as_chunks::<210>()
+        .0
+        .iter()
+        .zip(input.as_chunks::<256>().0)
+    {
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d = half_scale(&block[208..210]);
+        for n128 in 0..2 {
+            let ql_s = &ql[n128 * 64..];
+            let qh_s = &qh[n128 * 32..];
+            let sc_s = &scales[n128 * 8..];
+            let in_s = &in_block[n128 * 128..];
+            for l in 0..32 {
+                let is = l / 16;
+                let ql0 = ql_s[l];
+                let ql1 = ql_s[l + 32];
+                let qh_v = qh_s[l];
+                let q1 = i16::from((ql0 & 0x0f) | ((qh_v & 3) << 4)) - 32;
+                let q2 = i16::from((ql1 & 0x0f) | (((qh_v >> 2) & 3) << 4)) - 32;
+                let q3 = i16::from((ql0 >> 4) | (((qh_v >> 4) & 3) << 4)) - 32;
+                let q4 = i16::from((ql1 >> 4) | (((qh_v >> 6) & 3) << 4)) - 32;
+                sum += ((d * f32::from(sc_s[is].cast_signed())) * f32::from(q1)) * in_s[l];
+                sum += ((d * f32::from(sc_s[is + 2].cast_signed())) * f32::from(q2)) * in_s[l + 32];
+                sum += ((d * f32::from(sc_s[is + 4].cast_signed())) * f32::from(q3)) * in_s[l + 64];
+                sum += ((d * f32::from(sc_s[is + 6].cast_signed())) * f32::from(q4)) * in_s[l + 96];
+            }
+        }
+    }
+    sum
+}
+
 #[inline(always)]
 fn single_rows_simd<S: Simd>(
     simd: S,
@@ -311,20 +463,255 @@ fn single_rows_simd<S: Simd>(
                 *dst = single_q8_1row(simd, &data[off..off + row_bytes], input);
             }
         }
+        WeightSlice::Q4K(data) => {
+            let row_bytes = width / 256 * 144;
+            for (local_idx, dst) in out.iter_mut().enumerate() {
+                let off = (start_row + local_idx) * row_bytes;
+                *dst = dot_q4_k_row_scalar(&data[off..off + row_bytes], input);
+            }
+        }
+        WeightSlice::Q6K(data) => {
+            let row_bytes = width / 256 * 210;
+            for (local_idx, dst) in out.iter_mut().enumerate() {
+                let off = (start_row + local_idx) * row_bytes;
+                *dst = dot_q6_k_row_scalar(&data[off..off + row_bytes], input);
+            }
+        }
     }
 }
 
-/// Bit-exact matrix-vector multiplication across `1x4` SIMD tiles and `row_workers`.
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn single_rows_quant_arm64(
+    caps: Arm64QuantCaps,
+    weights: WeightMatrix<'_>,
+    start_row: usize,
+    act_q8_0: &[Q8_0ActBlock],
+    act_q8_k: &[Q8_KActBlock],
+    out: &mut [f32],
+) {
+    let width = weights.input;
+    let mut processed = 0;
+    match weights.data {
+        WeightSlice::Q8(data) => {
+            let row_bytes = width / 32 * 34;
+            for dst in out.as_chunks_mut::<4>().0 {
+                let row0 = (start_row + processed) * row_bytes;
+                let row_slices = [
+                    &data[row0..row0 + row_bytes],
+                    &data[row0 + row_bytes..row0 + 2 * row_bytes],
+                    &data[row0 + 2 * row_bytes..row0 + 3 * row_bytes],
+                    &data[row0 + 3 * row_bytes..row0 + 4 * row_bytes],
+                ];
+                *dst = quant_kernels::dot_q8_0_4rows(caps, row_slices, act_q8_0);
+                processed += 4;
+            }
+            for (local_idx, dst) in out[processed..].iter_mut().enumerate() {
+                let off = (start_row + processed + local_idx) * row_bytes;
+                *dst = quant_kernels::dot_q8_0_row(caps, &data[off..off + row_bytes], act_q8_0);
+            }
+        }
+        WeightSlice::Q4K(data) => {
+            let row_bytes = width / 256 * 144;
+            for dst in out.as_chunks_mut::<4>().0 {
+                let row0 = (start_row + processed) * row_bytes;
+                let row_slices = [
+                    &data[row0..row0 + row_bytes],
+                    &data[row0 + row_bytes..row0 + 2 * row_bytes],
+                    &data[row0 + 2 * row_bytes..row0 + 3 * row_bytes],
+                    &data[row0 + 3 * row_bytes..row0 + 4 * row_bytes],
+                ];
+                *dst = quant_kernels::dot_q4_k_4rows(caps, row_slices, act_q8_k);
+                processed += 4;
+            }
+            for (local_idx, dst) in out[processed..].iter_mut().enumerate() {
+                let off = (start_row + processed + local_idx) * row_bytes;
+                *dst = quant_kernels::dot_q4_k_row(caps, &data[off..off + row_bytes], act_q8_k);
+            }
+        }
+        WeightSlice::Q6K(data) => {
+            let row_bytes = width / 256 * 210;
+            for dst in out.as_chunks_mut::<4>().0 {
+                let row0 = (start_row + processed) * row_bytes;
+                let row_slices = [
+                    &data[row0..row0 + row_bytes],
+                    &data[row0 + row_bytes..row0 + 2 * row_bytes],
+                    &data[row0 + 2 * row_bytes..row0 + 3 * row_bytes],
+                    &data[row0 + 3 * row_bytes..row0 + 4 * row_bytes],
+                ];
+                *dst = quant_kernels::dot_q6_k_4rows(caps, row_slices, act_q8_k);
+                processed += 4;
+            }
+            for (local_idx, dst) in out[processed..].iter_mut().enumerate() {
+                let off = (start_row + processed + local_idx) * row_bytes;
+                *dst = quant_kernels::dot_q6_k_row(caps, &data[off..off + row_bytes], act_q8_k);
+            }
+        }
+        WeightSlice::Float(_) => {}
+    }
+}
+
+/// Bit-exact matrix-vector multiplication across `1x4` SIMD tiles (or ARM64 `SDOT` kernels) and `row_workers`.
 pub(super) fn multiply_single_into(
     weights: WeightMatrix<'_>,
     input: &[f32],
     workers: usize,
     out: &mut [f32],
 ) {
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        if !matches!(weights.data, WeightSlice::Float(_)) {
+            let caps = Arm64QuantCaps::detect();
+            let mut act_q8_0 = Vec::new();
+            let mut act_q8_k = Vec::new();
+            match weights.data {
+                WeightSlice::Q8(_) => {
+                    act_q8_0.resize(
+                        weights.input / 32,
+                        Q8_0ActBlock {
+                            d: 0.0,
+                            qs: [0; 32],
+                        },
+                    );
+                    quant_kernels::quantize_row_q8_0(input, &mut act_q8_0);
+                }
+                WeightSlice::Q4K(_) | WeightSlice::Q6K(_) => {
+                    act_q8_k.resize(
+                        weights.input / 256,
+                        Q8_KActBlock {
+                            d: 0.0,
+                            qs: [0; 256],
+                            bsums: [0; 16],
+                        },
+                    );
+                    quant_kernels::quantize_row_q8_k(input, &mut act_q8_k);
+                }
+                WeightSlice::Float(_) => {}
+            }
+            row_workers::run_aligned(out, workers, 4, &|start_row, slice| {
+                single_rows_quant_arm64(caps, weights, start_row, &act_q8_0, &act_q8_k, slice);
+            });
+            return;
+        }
+    }
     let level = simd_level();
     row_workers::run_aligned(out, workers, 4, &|start_row, slice| {
         dispatch!(level, simd => single_rows_simd(simd, weights, start_row, input, slice));
     });
+}
+
+/// Execute multiple sibling projections sharing `input` (`query + key + value` or `gate + up`)
+/// in one quantized activation pass and one worker barrier when `workers > 1`.
+pub(super) fn multiply_single_group_into(
+    targets: &mut [(WeightMatrix<'_>, &mut [f32])],
+    input: &[f32],
+    workers: usize,
+    scratch: &mut Vec<f32>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    if targets.len() == 1 {
+        let (weights, out) = &mut targets[0];
+        multiply_single_into(*weights, input, workers, out);
+        return;
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    let (caps, act_q8_0, act_q8_k) = {
+        let caps = Arm64QuantCaps::detect();
+        let needs_q8_0 = targets
+            .iter()
+            .any(|(w, _)| matches!(w.data, WeightSlice::Q8(_)));
+        let needs_q8_k = targets
+            .iter()
+            .any(|(w, _)| matches!(w.data, WeightSlice::Q4K(_) | WeightSlice::Q6K(_)));
+        let mut q8_0 = Vec::new();
+        let mut q8_k = Vec::new();
+        if needs_q8_0 {
+            q8_0.resize(
+                input.len() / 32,
+                Q8_0ActBlock {
+                    d: 0.0,
+                    qs: [0; 32],
+                },
+            );
+            quant_kernels::quantize_row_q8_0(input, &mut q8_0);
+        }
+        if needs_q8_k {
+            q8_k.resize(
+                input.len() / 256,
+                Q8_KActBlock {
+                    d: 0.0,
+                    qs: [0; 256],
+                    bsums: [0; 16],
+                },
+            );
+            quant_kernels::quantize_row_q8_k(input, &mut q8_k);
+        }
+        (caps, q8_0, q8_k)
+    };
+
+    let level = simd_level();
+    if workers <= 1 {
+        for (weights, out) in targets.iter_mut() {
+            #[cfg(all(windows, feature = "rust-qualification"))]
+            if !matches!(weights.data, WeightSlice::Float(_)) {
+                single_rows_quant_arm64(caps, *weights, 0, &act_q8_0, &act_q8_k, out);
+                continue;
+            }
+            dispatch!(level, simd => single_rows_simd(simd, *weights, 0, input, out));
+        }
+        return;
+    }
+
+    let mut offsets = [0_usize; 4];
+    let mut padded_total = 0_usize;
+    for (idx, (weights, _)) in targets.iter().enumerate() {
+        offsets[idx] = padded_total;
+        padded_total += weights.output.next_multiple_of(4);
+    }
+    scratch.resize(padded_total, 0.0);
+    let matrices: [WeightMatrix<'_>; 4] = [
+        targets[0].0,
+        targets[1].0,
+        targets.get(2).map_or(targets[0].0, |t| t.0),
+        targets.get(3).map_or(targets[0].0, |t| t.0),
+    ];
+    let count = targets.len();
+    row_workers::run_aligned(scratch, workers, 4, &|chunk_start, slice| {
+        let chunk_end = chunk_start + slice.len();
+        for t_idx in 0..count {
+            let t_start = offsets[t_idx];
+            let t_end = t_start + matrices[t_idx].output;
+            let lo = chunk_start.max(t_start);
+            let hi = chunk_end.min(t_end);
+            if lo >= hi {
+                continue;
+            }
+            let local_row = lo - t_start;
+            let dst = &mut slice[lo - chunk_start..hi - chunk_start];
+            #[cfg(all(windows, feature = "rust-qualification"))]
+            if !matches!(matrices[t_idx].data, WeightSlice::Float(_)) {
+                single_rows_quant_arm64(
+                    caps,
+                    matrices[t_idx],
+                    local_row,
+                    &act_q8_0,
+                    &act_q8_k,
+                    dst,
+                );
+                continue;
+            }
+            dispatch!(
+                level,
+                simd => single_rows_simd(simd, matrices[t_idx], local_row, input, dst)
+            );
+        }
+    });
+    for (idx, (_, out)) in targets.iter_mut().enumerate() {
+        let start = offsets[idx];
+        out.copy_from_slice(&scratch[start..start + out.len()]);
+    }
 }
 
 // Compute all `num_quads` quads for a 4-row block, storing each row `r`'s quad `q` at
@@ -637,6 +1024,40 @@ fn batch_rows_simd<S: Simd>(
                 );
             }
         }
+        WeightSlice::Q4K(data) => {
+            let row_bytes = width / 256 * 144;
+            let mut pos_in = vec![0.0_f32; width];
+            for (local_idx, row_out) in transposed_slice.chunks_exact_mut(row_stride).enumerate() {
+                let r_off = (start_row + local_idx) * row_bytes;
+                let w_row = &data[r_off..r_off + row_bytes];
+                for q in 0..num_quads {
+                    let q_slice = &quads[q * width..(q + 1) * width];
+                    for lane in 0..4 {
+                        for (dst, src) in pos_in.iter_mut().zip(q_slice) {
+                            *dst = src[lane];
+                        }
+                        row_out[q * 4 + lane] = dot_q4_k_row_scalar(w_row, &pos_in);
+                    }
+                }
+            }
+        }
+        WeightSlice::Q6K(data) => {
+            let row_bytes = width / 256 * 210;
+            let mut pos_in = vec![0.0_f32; width];
+            for (local_idx, row_out) in transposed_slice.chunks_exact_mut(row_stride).enumerate() {
+                let r_off = (start_row + local_idx) * row_bytes;
+                let w_row = &data[r_off..r_off + row_bytes];
+                for q in 0..num_quads {
+                    let q_slice = &quads[q * width..(q + 1) * width];
+                    for lane in 0..4 {
+                        for (dst, src) in pos_in.iter_mut().zip(q_slice) {
+                            *dst = src[lane];
+                        }
+                        row_out[q * 4 + lane] = dot_q6_k_row_scalar(w_row, &pos_in);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -692,17 +1113,276 @@ fn scatter_quads_simd<S: Simd>(
     }
 }
 
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn quantize_batch_activations(
+    weights: &[WeightMatrix<'_>],
+    raw_input: &[f32],
+    batch: usize,
+    width: usize,
+) -> (Arm64QuantCaps, Vec<Q8_0ActBlock>, Vec<Q8_KActBlock>) {
+    let caps = Arm64QuantCaps::detect();
+    let needs_q8_0 = weights.iter().any(|w| matches!(w.data, WeightSlice::Q8(_)));
+    let needs_q8_k = weights
+        .iter()
+        .any(|w| matches!(w.data, WeightSlice::Q4K(_) | WeightSlice::Q6K(_)));
+    let mut act_q8_0 = Vec::new();
+    let mut act_q8_k = Vec::new();
+    if needs_q8_0 {
+        let blocks = width / 32;
+        act_q8_0.resize(
+            batch * blocks,
+            Q8_0ActBlock {
+                d: 0.0,
+                qs: [0; 32],
+            },
+        );
+        for t in 0..batch {
+            quant_kernels::quantize_row_q8_0(
+                &raw_input[t * width..(t + 1) * width],
+                &mut act_q8_0[t * blocks..(t + 1) * blocks],
+            );
+        }
+    }
+    if needs_q8_k {
+        let blocks = width / 256;
+        act_q8_k.resize(
+            batch * blocks,
+            Q8_KActBlock {
+                d: 0.0,
+                qs: [0; 256],
+                bsums: [0; 16],
+            },
+        );
+        for t in 0..batch {
+            quant_kernels::quantize_row_q8_k(
+                &raw_input[t * width..(t + 1) * width],
+                &mut act_q8_k[t * blocks..(t + 1) * blocks],
+            );
+        }
+    }
+    (caps, act_q8_0, act_q8_k)
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn batch_rows_quant_arm64(
+    caps: Arm64QuantCaps,
+    weights: WeightMatrix<'_>,
+    start_row: usize,
+    batch: usize,
+    act_q8_0: &[Q8_0ActBlock],
+    act_q8_k: &[Q8_KActBlock],
+    transposed_slice: &mut [f32],
+) {
+    let width = weights.input;
+    let mut processed = 0_usize;
+    match weights.data {
+        WeightSlice::Q8(data) => {
+            let blocks = width / 32;
+            let row_bytes = blocks * 34;
+            for chunk in transposed_slice.chunks_exact_mut(4 * batch) {
+                let r0 = (start_row + processed) * row_bytes;
+                let row_slices = [
+                    &data[r0..r0 + row_bytes],
+                    &data[r0 + row_bytes..r0 + 2 * row_bytes],
+                    &data[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
+                    &data[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
+                ];
+                let mut t = 0_usize;
+                while t + 1 < batch {
+                    let res = quant_kernels::gemm_q8_0_4x2(
+                        caps,
+                        row_slices,
+                        &act_q8_0[t * blocks..(t + 1) * blocks],
+                        &act_q8_0[(t + 1) * blocks..(t + 2) * blocks],
+                    );
+                    for (r, pair) in res.iter().enumerate() {
+                        chunk[r * batch + t] = pair[0];
+                        chunk[r * batch + t + 1] = pair[1];
+                    }
+                    t += 2;
+                }
+                if t < batch {
+                    let res = quant_kernels::dot_q8_0_4rows(
+                        caps,
+                        row_slices,
+                        &act_q8_0[t * blocks..(t + 1) * blocks],
+                    );
+                    for (r, &v) in res.iter().enumerate() {
+                        chunk[r * batch + t] = v;
+                    }
+                }
+                processed += 4;
+            }
+            for (local_idx, row_out) in transposed_slice[processed * batch..]
+                .chunks_exact_mut(batch)
+                .enumerate()
+            {
+                let off = (start_row + processed + local_idx) * row_bytes;
+                let w_row = &data[off..off + row_bytes];
+                for (t, dst) in row_out.iter_mut().enumerate() {
+                    *dst = quant_kernels::dot_q8_0_row(
+                        caps,
+                        w_row,
+                        &act_q8_0[t * blocks..(t + 1) * blocks],
+                    );
+                }
+            }
+        }
+        WeightSlice::Q4K(data) => {
+            let blocks = width / 256;
+            let row_bytes = blocks * 144;
+            for chunk in transposed_slice.chunks_exact_mut(4 * batch) {
+                let r0 = (start_row + processed) * row_bytes;
+                let row_slices = [
+                    &data[r0..r0 + row_bytes],
+                    &data[r0 + row_bytes..r0 + 2 * row_bytes],
+                    &data[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
+                    &data[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
+                ];
+                let mut t = 0_usize;
+                while t + 1 < batch {
+                    let res = quant_kernels::gemm_q4_k_4x2(
+                        caps,
+                        row_slices,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                        &act_q8_k[(t + 1) * blocks..(t + 2) * blocks],
+                    );
+                    for (r, pair) in res.iter().enumerate() {
+                        chunk[r * batch + t] = pair[0];
+                        chunk[r * batch + t + 1] = pair[1];
+                    }
+                    t += 2;
+                }
+                if t < batch {
+                    let res = quant_kernels::dot_q4_k_4rows(
+                        caps,
+                        row_slices,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                    );
+                    for (r, &v) in res.iter().enumerate() {
+                        chunk[r * batch + t] = v;
+                    }
+                }
+                processed += 4;
+            }
+            for (local_idx, row_out) in transposed_slice[processed * batch..]
+                .chunks_exact_mut(batch)
+                .enumerate()
+            {
+                let off = (start_row + processed + local_idx) * row_bytes;
+                let w_row = &data[off..off + row_bytes];
+                for (t, dst) in row_out.iter_mut().enumerate() {
+                    *dst = quant_kernels::dot_q4_k_row(
+                        caps,
+                        w_row,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                    );
+                }
+            }
+        }
+        WeightSlice::Q6K(data) => {
+            let blocks = width / 256;
+            let row_bytes = blocks * 210;
+            for chunk in transposed_slice.chunks_exact_mut(4 * batch) {
+                let r0 = (start_row + processed) * row_bytes;
+                let row_slices = [
+                    &data[r0..r0 + row_bytes],
+                    &data[r0 + row_bytes..r0 + 2 * row_bytes],
+                    &data[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
+                    &data[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
+                ];
+                let mut t = 0_usize;
+                while t + 1 < batch {
+                    let res = quant_kernels::gemm_q6_k_4x2(
+                        caps,
+                        row_slices,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                        &act_q8_k[(t + 1) * blocks..(t + 2) * blocks],
+                    );
+                    for (r, pair) in res.iter().enumerate() {
+                        chunk[r * batch + t] = pair[0];
+                        chunk[r * batch + t + 1] = pair[1];
+                    }
+                    t += 2;
+                }
+                if t < batch {
+                    let res = quant_kernels::dot_q6_k_4rows(
+                        caps,
+                        row_slices,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                    );
+                    for (r, &v) in res.iter().enumerate() {
+                        chunk[r * batch + t] = v;
+                    }
+                }
+                processed += 4;
+            }
+            for (local_idx, row_out) in transposed_slice[processed * batch..]
+                .chunks_exact_mut(batch)
+                .enumerate()
+            {
+                let off = (start_row + processed + local_idx) * row_bytes;
+                let w_row = &data[off..off + row_bytes];
+                for (t, dst) in row_out.iter_mut().enumerate() {
+                    *dst = quant_kernels::dot_q6_k_row(
+                        caps,
+                        w_row,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                    );
+                }
+            }
+        }
+        WeightSlice::Float(_) => {}
+    }
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn scatter_rows_to_batch(transposed: &[f32], output: usize, batch: usize, out: &mut [f32]) {
+    for t in 0..batch {
+        let dst = &mut out[t * output..(t + 1) * output];
+        for (r, slot) in dst.iter_mut().enumerate() {
+            *slot = transposed[r * batch + t];
+        }
+    }
+}
+
 /// Bit-exact matrix multiplication for a pre-transposed batch `[batch, input]`
-/// using `4x8` / `4x4` SIMD tiles (with zero-padded partial trailing quads) and `row_workers`.
+/// using `4x8` / `4x4` SIMD tiles (or ARM64 `I8MM`/`SDOT` kernels) and `row_workers`.
 pub(super) fn multiply_batch_prepared_into(
     weights: WeightMatrix<'_>,
     prepared: &PreparedBatch,
-    _raw_input: &[f32],
+    raw_input: &[f32],
     workers: usize,
     transposed_scratch: &mut Vec<f32>,
     out: &mut [f32],
 ) {
     let output = weights.output;
+    let batch = prepared.batch;
+    let _ = raw_input;
+    if batch == 0 || output == 0 {
+        return;
+    }
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    if !matches!(weights.data, WeightSlice::Float(_)) {
+        if batch == 1 {
+            multiply_single_into(weights, raw_input, workers, out);
+            return;
+        }
+        let (caps, act_q8_0, act_q8_k) =
+            quantize_batch_activations(&[weights], raw_input, batch, weights.input);
+        let needed = output * batch;
+        if transposed_scratch.len() < needed {
+            transposed_scratch.resize(needed, 0.0);
+        }
+        let transposed = &mut transposed_scratch[..needed];
+        row_workers::run_aligned(transposed, workers, 4 * batch, &|elem_off, slice| {
+            let start_row = elem_off / batch;
+            batch_rows_quant_arm64(caps, weights, start_row, batch, &act_q8_0, &act_q8_k, slice);
+        });
+        scatter_rows_to_batch(transposed, output, batch, out);
+        return;
+    }
+
     let num_quads = prepared.num_quads;
     let level = simd_level();
     if num_quads > 0 && output > 0 {
@@ -740,6 +1420,108 @@ pub(super) fn multiply_batch_prepared_into(
                 }
             }
         }
+    }
+}
+
+/// Compute batched sibling projections sharing `prepared` / `raw_input` (`query + key + value`
+/// or `gate + up`) in one quantized activation pass and unified worker pass.
+pub(super) fn multiply_batch_group_into(
+    targets: &mut [(WeightMatrix<'_>, &mut [f32])],
+    prepared: &PreparedBatch,
+    raw_input: &[f32],
+    workers: usize,
+    transposed_scratch: &mut Vec<f32>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    if targets.len() == 1 {
+        let (weights, out) = &mut targets[0];
+        multiply_batch_prepared_into(
+            *weights,
+            prepared,
+            raw_input,
+            workers,
+            transposed_scratch,
+            out,
+        );
+        return;
+    }
+    let batch = prepared.batch;
+    if batch == 0 {
+        return;
+    }
+    if batch == 1 {
+        multiply_single_group_into(targets, raw_input, workers, transposed_scratch);
+        return;
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        let matrices: Vec<WeightMatrix<'_>> = targets.iter().map(|(w, _)| *w).collect();
+        let all_quant = matrices
+            .iter()
+            .all(|w| !matches!(w.data, WeightSlice::Float(_)));
+        if all_quant {
+            let (caps, act_q8_0, act_q8_k) =
+                quantize_batch_activations(&matrices, raw_input, batch, prepared.input);
+            let mut offsets = [0_usize; 4];
+            let mut padded_rows = 0_usize;
+            for (idx, w) in matrices.iter().enumerate() {
+                offsets[idx] = padded_rows;
+                padded_rows += w.output.next_multiple_of(4);
+            }
+            let needed = padded_rows * batch;
+            if transposed_scratch.len() < needed {
+                transposed_scratch.resize(needed, 0.0);
+            }
+            let transposed = &mut transposed_scratch[..needed];
+            row_workers::run_aligned(transposed, workers, 4 * batch, &|elem_off, slice| {
+                let start_row_global = elem_off / batch;
+                let end_row_global = start_row_global + slice.len() / batch;
+                for (idx, w) in matrices.iter().enumerate() {
+                    let t_start = offsets[idx];
+                    let t_end = t_start + w.output;
+                    let lo = start_row_global.max(t_start);
+                    let hi = end_row_global.min(t_end);
+                    if lo >= hi {
+                        continue;
+                    }
+                    let slice_lo = (lo - start_row_global) * batch;
+                    let slice_hi = (hi - start_row_global) * batch;
+                    batch_rows_quant_arm64(
+                        caps,
+                        *w,
+                        lo - t_start,
+                        batch,
+                        &act_q8_0,
+                        &act_q8_k,
+                        &mut slice[slice_lo..slice_hi],
+                    );
+                }
+            });
+            for (idx, (w, out)) in targets.iter_mut().enumerate() {
+                let elem_off = offsets[idx] * batch;
+                scatter_rows_to_batch(
+                    &transposed[elem_off..elem_off + w.output * batch],
+                    w.output,
+                    batch,
+                    out,
+                );
+            }
+            return;
+        }
+    }
+
+    for (weights, out) in targets.iter_mut() {
+        multiply_batch_prepared_into(
+            *weights,
+            prepared,
+            raw_input,
+            workers,
+            transposed_scratch,
+            out,
+        );
     }
 }
 
@@ -963,11 +1745,173 @@ pub(super) fn attend_head(
     Ok(())
 }
 
+/// Narrow finite `f32` values into IEEE binary16 words (`FCVTN` SIMD on ARM64 Windows),
+/// returning `false` on non-finite input, length mismatch, or overflow past finite `f16` range.
+pub(super) fn narrow_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) -> bool {
+    if src.len() != dst.len() {
+        return false;
+    }
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        quant_kernels::narrow_f32_slice_to_f16(src, dst)
+    }
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    {
+        for (&value, slot) in src.iter().zip(dst.iter_mut()) {
+            if !value.is_finite() {
+                return false;
+            }
+            let narrowed = half::f16::from_f32(value);
+            if !narrowed.is_finite() {
+                return false;
+            }
+            *slot = narrowed.to_bits();
+        }
+        true
+    }
+}
+
+/// Widen IEEE binary16 words into `f32` values (`FCVTL` SIMD on ARM64 Windows).
+pub(super) fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
+    let n = src.len().min(dst.len());
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        let (src8, src_rem) = src[..n].as_chunks::<8>();
+        let (dst8, dst_rem) = dst[..n].as_chunks_mut::<8>();
+        for (s, d) in src8.iter().zip(dst8.iter_mut()) {
+            let [lo, hi] = quant_kernels::widen_f16_eight(s);
+            d[..4].copy_from_slice(&lo);
+            d[4..].copy_from_slice(&hi);
+        }
+        for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
+            *slot = half::f16::from_bits(bits).to_f32();
+        }
+    }
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    {
+        for (&bits, slot) in src[..n].iter().zip(dst[..n].iter_mut()) {
+            *slot = half::f16::from_bits(bits).to_f32();
+        }
+    }
+}
+
+/// Evaluate one attention head over packed `u16` (`F16`) cached KV storage without
+/// retaining a shadow `f32` cache, producing identical bits to `attend_head`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared single-head attention kernel reuses caller score/output storage without allocations."
+)]
+pub(super) fn attend_head_f16(
+    q_head: &[f32],
+    keys: &[u16],
+    values: &[u16],
+    history_rows: usize,
+    row_width: usize,
+    offset: usize,
+    head_dim: usize,
+    divisor: f32,
+    current_kv: Option<(&[f32], &[f32])>,
+    scores: &mut [f32],
+    out_head: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    if head_dim > 256 || q_head.len() != head_dim || out_head.len() != head_dim {
+        return Err(invalid());
+    }
+    let mut k_buf = [[0.0_f32; 256]; 4];
+    let full_quads = history_rows / 4;
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        for row_off in 0..4 {
+            let src = &keys
+                [(r + row_off) * row_width + offset..(r + row_off) * row_width + offset + head_dim];
+            widen_f16_slice(src, &mut k_buf[row_off][..head_dim]);
+        }
+        let k_refs = [
+            &k_buf[0][..head_dim],
+            &k_buf[1][..head_dim],
+            &k_buf[2][..head_dim],
+            &k_buf[3][..head_dim],
+        ];
+        scores[r..r + 4].copy_from_slice(&dot_4keys_seq(q_head, k_refs, divisor));
+    }
+    for (row, score) in scores
+        .iter_mut()
+        .enumerate()
+        .take(history_rows)
+        .skip(full_quads * 4)
+    {
+        let src = &keys[row * row_width + offset..row * row_width + offset + head_dim];
+        widen_f16_slice(src, &mut k_buf[0][..head_dim]);
+        let mut dot = 0.0_f32;
+        for (q_elem, &k_elem) in q_head.iter().zip(&k_buf[0][..head_dim]) {
+            dot += *q_elem * k_elem;
+        }
+        *score = dot / divisor;
+    }
+    if let Some((k, _)) = current_kv {
+        let mut dot = 0.0_f32;
+        for (q_elem, k_elem) in q_head.iter().zip(k) {
+            dot += *q_elem * *k_elem;
+        }
+        scores[history_rows] = dot / divisor;
+    }
+    ensure_finite(scores, invalid)?;
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0;
+    for score in &mut *scores {
+        *score = (*score - max).exp();
+        sum += *score;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(invalid());
+    }
+    out_head.fill(0.0);
+    let mut v_buf = [[0.0_f32; 256]; 4];
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        for row_off in 0..4 {
+            let src = &values
+                [(r + row_off) * row_width + offset..(r + row_off) * row_width + offset + head_dim];
+            widen_f16_slice(src, &mut v_buf[row_off][..head_dim]);
+        }
+        let v_refs = [
+            &v_buf[0][..head_dim],
+            &v_buf[1][..head_dim],
+            &v_buf[2][..head_dim],
+            &v_buf[3][..head_dim],
+        ];
+        let weights = [
+            scores[r] / sum,
+            scores[r + 1] / sum,
+            scores[r + 2] / sum,
+            scores[r + 3] / sum,
+        ];
+        weighted_value_accum_4(out_head, v_refs, weights);
+    }
+    for (row, &score) in scores
+        .iter()
+        .enumerate()
+        .take(history_rows)
+        .skip(full_quads * 4)
+    {
+        let src = &values[row * row_width + offset..row * row_width + offset + head_dim];
+        widen_f16_slice(src, &mut v_buf[0][..head_dim]);
+        weighted_value_accum(out_head, &v_buf[0][..head_dim], score / sum);
+    }
+    if let Some((_, v)) = current_kv {
+        weighted_value_accum(out_head, v, scores[history_rows] / sum);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PreparedBatch, WeightMatrix, WeightSlice, dot_4keys_seq, multiply_batch_prepared_into,
-        multiply_single_into, weighted_value_accum, weighted_value_accum_4,
+        PreparedBatch, WeightMatrix, WeightSlice, attend_head, attend_head_f16, decode_q4_k_row,
+        decode_q6_k_row, dot_4keys_seq, multiply_batch_group_into, multiply_batch_prepared_into,
+        multiply_single_group_into, multiply_single_into, narrow_f32_to_f16_slice,
+        weighted_value_accum, weighted_value_accum_4, widen_f16_slice,
     };
     use std::io;
 
@@ -997,7 +1941,74 @@ mod tests {
                         }
                     }
                 }
+                WeightSlice::Q4K(data) => {
+                    let row_bytes = weights.input / 256 * 144;
+                    *target = super::dot_q4_k_row_scalar(
+                        &data[row * row_bytes..(row + 1) * row_bytes],
+                        input,
+                    );
+                }
+                WeightSlice::Q6K(data) => {
+                    let row_bytes = weights.input / 256 * 210;
+                    *target = super::dot_q6_k_row_scalar(
+                        &data[row * row_bytes..(row + 1) * row_bytes],
+                        input,
+                    );
+                }
             }
+        }
+        output
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    fn scalar_q8_x_q8_reference(weights: WeightMatrix<'_>, input: &[f32]) -> Vec<f32> {
+        let WeightSlice::Q8(data) = weights.data else {
+            return scalar_multiply_reference(weights, input);
+        };
+        let row_bytes = weights.input / 32 * 34;
+        let mut act_blocks = Vec::with_capacity(weights.input / 32);
+        for chunk in input.as_chunks::<32>().0 {
+            let amax = chunk.iter().copied().fold(0.0_f32, |m, v| m.max(v.abs()));
+            if amax == 0.0 || !amax.is_finite() {
+                act_blocks.push((0.0_f32, [0_i32; 32]));
+                continue;
+            }
+            let d = amax / 127.0_f32;
+            let inv_d = 127.0_f32 / amax;
+            let mut qs = [0_i32; 32];
+            for (dst, &val) in qs.iter_mut().zip(chunk) {
+                let scaled = (val * inv_d).round_ties_even().clamp(-127.0, 127.0);
+                let mag = (0_u8..=127)
+                    .find(|&c| f32::from(c) == scaled.abs())
+                    .unwrap_or(0);
+                *dst = if scaled < 0.0 {
+                    -i32::from(mag)
+                } else {
+                    i32::from(mag)
+                };
+            }
+            act_blocks.push((d, qs));
+        }
+        let mut output = vec![0.0_f32; weights.output];
+        for (row, target) in output.iter_mut().enumerate() {
+            let mut sum = 0.0_f32;
+            for (w_blk, (act_d, act_qs)) in data[row * row_bytes..(row + 1) * row_bytes]
+                .as_chunks::<34>()
+                .0
+                .iter()
+                .zip(&act_blocks)
+            {
+                let w_d = half::f16::from_le_bytes([w_blk[0], w_blk[1]]).to_f32();
+                let mut idot = 0_i32;
+                for (&wb, &ab) in w_blk[2..].iter().zip(act_qs) {
+                    idot += i32::from(wb.cast_signed()) * ab;
+                }
+                let hi = i16::try_from(idot.div_euclid(65_536)).unwrap_or(0);
+                let lo = u16::try_from(idot.rem_euclid(65_536)).unwrap_or(0);
+                let idot_f32 = f32::from(hi) * 65_536.0_f32 + f32::from(lo);
+                sum += w_d * (*act_d * idot_f32);
+            }
+            *target = sum;
         }
         output
     }
@@ -1065,18 +2076,9 @@ mod tests {
                         ));
                     }
                     let expected_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+                    let mut worker1_batch_bits: Option<Vec<u32>> = None;
 
                     for workers in [1_usize, 3, 8] {
-                        if batch == 1 {
-                            let mut single_out = vec![0.0_f32; output];
-                            multiply_single_into(weights, &raw_input, workers, &mut single_out);
-                            let actual_bits: Vec<u32> =
-                                single_out.iter().map(|v| v.to_bits()).collect();
-                            assert_eq!(
-                                actual_bits, expected_bits,
-                                "single q8={is_q8} out={output} workers={workers}"
-                            );
-                        }
                         let prepared = PreparedBatch::new(&raw_input, batch, input);
                         let mut batch_out = vec![0.0_f32; batch * output];
                         let mut scratch = Vec::new();
@@ -1088,15 +2090,227 @@ mod tests {
                             &mut scratch,
                             &mut batch_out,
                         );
-                        let actual_bits: Vec<u32> = batch_out.iter().map(|v| v.to_bits()).collect();
+                        let batch_bits: Vec<u32> = batch_out.iter().map(|v| v.to_bits()).collect();
+                        if let Some(prev) = &worker1_batch_bits {
+                            assert_eq!(
+                                &batch_bits, prev,
+                                "worker invariance q8={is_q8} out={output} batch={batch} workers={workers}"
+                            );
+                        } else {
+                            worker1_batch_bits = Some(batch_bits.clone());
+                        }
+                        let mut all_single_bits = Vec::with_capacity(batch * output);
+                        let mut single_out = vec![0.0_f32; output];
+                        for pos in 0..batch {
+                            multiply_single_into(
+                                weights,
+                                &raw_input[pos * input..(pos + 1) * input],
+                                workers,
+                                &mut single_out,
+                            );
+                            all_single_bits.extend(single_out.iter().map(|v| v.to_bits()));
+                        }
                         assert_eq!(
-                            actual_bits, expected_bits,
-                            "batch q8={is_q8} out={output} batch={batch} workers={workers}"
+                            all_single_bits, batch_bits,
+                            "single vs batch q8={is_q8} out={output} batch={batch} workers={workers}"
                         );
+                        #[cfg(not(all(windows, feature = "rust-qualification")))]
+                        assert_eq!(
+                            batch_bits, expected_bits,
+                            "exact bits q8={is_q8} out={output} batch={batch} workers={workers}"
+                        );
+                        #[cfg(all(windows, feature = "rust-qualification"))]
+                        if !is_q8 {
+                            assert_eq!(
+                                batch_bits, expected_bits,
+                                "exact bits q8={is_q8} out={output} batch={batch} workers={workers}"
+                            );
+                        } else {
+                            let mut q8_ref = Vec::with_capacity(batch * output);
+                            for pos in 0..batch {
+                                q8_ref.extend(scalar_q8_x_q8_reference(
+                                    weights,
+                                    &raw_input[pos * input..(pos + 1) * input],
+                                ));
+                            }
+                            let q8_ref_bits: Vec<u32> =
+                                q8_ref.iter().map(|v| v.to_bits()).collect();
+                            assert_eq!(
+                                batch_bits, q8_ref_bits,
+                                "exact Q8xQ8 bits out={output} batch={batch} workers={workers}"
+                            );
+                            for (&got, &want) in batch_out.iter().zip(&expected) {
+                                let tol = 2.5_f32.max(want.abs() * 0.02);
+                                assert!(
+                                    (got - want).abs() <= tol,
+                                    "q8={is_q8} out={output} batch={batch} got={got} want={want}"
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_q4_k_q6_k_fused_groups_and_f16_kv_match_reference() -> io::Result<()> {
+        let input = 256_usize;
+        let out_a = 9_usize;
+        let out_b = 5_usize;
+        let mut q4 = vec![0_u8; out_a * 144];
+        for (row, block) in q4.chunks_exact_mut(144).enumerate() {
+            block[0..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (i, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = u8::try_from((row * 7 + i * 3 + 1) % 31).unwrap_or(1);
+            }
+            for (i, byte) in block[16..].iter_mut().enumerate() {
+                *byte = u8::try_from((row * 13 + i * 5) % 256).unwrap_or(0);
+            }
+        }
+        let mut q6 = vec![0_u8; out_b * 210];
+        for (row, block) in q6.chunks_exact_mut(210).enumerate() {
+            block[208..210].copy_from_slice(&0x3800_u16.to_le_bytes());
+            for (i, byte) in block[..192].iter_mut().enumerate() {
+                *byte = u8::try_from((row * 11 + i * 9) % 256).unwrap_or(0);
+            }
+            for (i, byte) in block[192..208].iter_mut().enumerate() {
+                let sc = i8::try_from(((row * 3 + i) % 15).cast_signed() - 7).unwrap_or(0);
+                *byte = sc.cast_unsigned();
+            }
+        }
+
+        let mut dec4 = vec![0.0_f32; input];
+        decode_q4_k_row(&q4[..144], &mut dec4);
+        let unit = vec![1.0_f32; input];
+        assert!(
+            (dec4.iter().sum::<f32>() - super::dot_q4_k_row_scalar(&q4[..144], &unit)).abs() < 1e-3
+        );
+        let mut dec6 = vec![0.0_f32; input];
+        decode_q6_k_row(&q6[..210], &mut dec6);
+        assert!(
+            (dec6.iter().sum::<f32>() - super::dot_q6_k_row_scalar(&q6[..210], &unit)).abs() < 1e-3
+        );
+
+        let wm4 = WeightMatrix {
+            input,
+            output: out_a,
+            data: WeightSlice::Q4K(&q4),
+        };
+        let wm6 = WeightMatrix {
+            input,
+            output: out_b,
+            data: WeightSlice::Q6K(&q6),
+        };
+        let batch = 5_usize;
+        let raw_in: Vec<f32> = (0..batch * input)
+            .map(|i| (f32::from(u16::try_from(i % 29).unwrap_or(0)) - 14.0) * 0.03125)
+            .collect();
+        let prepared = PreparedBatch::new(&raw_in, batch, input);
+
+        let mut exp_a = vec![0.0_f32; batch * out_a];
+        let mut exp_b = vec![0.0_f32; batch * out_b];
+        let mut scratch = Vec::new();
+        multiply_batch_prepared_into(wm4, &prepared, &raw_in, 1, &mut scratch, &mut exp_a);
+        multiply_batch_prepared_into(wm6, &prepared, &raw_in, 1, &mut scratch, &mut exp_b);
+
+        for workers in [1_usize, 4] {
+            let mut got_a = vec![0.0_f32; batch * out_a];
+            let mut got_b = vec![0.0_f32; batch * out_b];
+            multiply_batch_group_into(
+                &mut [(wm4, &mut got_a), (wm6, &mut got_b)],
+                &prepared,
+                &raw_in,
+                workers,
+                &mut scratch,
+            );
+            assert_eq!(
+                got_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                exp_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                got_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                exp_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+
+            let mut s_a = vec![0.0_f32; out_a];
+            let mut s_b = vec![0.0_f32; out_b];
+            multiply_single_group_into(
+                &mut [(wm4, &mut s_a), (wm6, &mut s_b)],
+                &raw_in[..input],
+                workers,
+                &mut scratch,
+            );
+            assert_eq!(
+                s_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                exp_a[..out_a]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                s_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                exp_b[..out_b]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Verify F16 KV narrow/widen and attend_head_f16 match attend_head bit-for-bit.
+        let src_kv: Vec<f32> = (0..120_usize)
+            .map(|i| {
+                if i % 11 == 0 {
+                    -0.0
+                } else {
+                    (f32::from(u8::try_from(i % 19).unwrap_or(0)) - 9.0) * 0.125
+                }
+            })
+            .collect();
+        let mut f16_bits = vec![0_u16; src_kv.len()];
+        assert!(narrow_f32_to_f16_slice(&src_kv, &mut f16_bits));
+        let mut f32_cache = vec![0.0_f32; src_kv.len()];
+        widen_f16_slice(&f16_bits, &mut f32_cache);
+        let q_head = vec![0.25_f32; 8];
+        let mut s_a = [0.0_f32; 6];
+        let mut s_b = [0.0_f32; 6];
+        let mut out_a = [0.0_f32; 8];
+        let mut out_b = [0.0_f32; 8];
+        let inv = || io::Error::other("err");
+        attend_head(
+            &q_head,
+            &f32_cache,
+            &f32_cache,
+            5,
+            16,
+            8,
+            8,
+            8.0_f32.sqrt(),
+            Some((&q_head, &q_head)),
+            &mut s_a,
+            &mut out_a,
+            inv,
+        )?;
+        attend_head_f16(
+            &q_head,
+            &f16_bits,
+            &f16_bits,
+            5,
+            16,
+            8,
+            8,
+            8.0_f32.sqrt(),
+            Some((&q_head, &q_head)),
+            &mut s_b,
+            &mut out_b,
+            inv,
+        )?;
+        assert_eq!(
+            out_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            out_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
         Ok(())
     }
 

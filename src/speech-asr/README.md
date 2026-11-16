@@ -339,7 +339,7 @@ describe required reviewed values, rather than supplying replay evidence):
     "compiler": "exact candidate compiler identity",
     "target": "aarch64-pc-windows-msvc",
     "executableSha256": "64 lowercase hexadecimal digest characters for this replay executable",
-    "arithmetic": "rust-asr-scalar-f32-v2-f16-conv-kv-f64-erfc-gelu"
+    "arithmetic": "rust-asr-sdot-i8mm-v3-f16-kv-minimax-gelu"
   },
   "model": "C:\\Models\\Qwen3-ASR-1.7B-Q8_0.gguf",
   "pcm": { "path": "C:\\Replay\\original.f32le", "bytes": 804, "sha256": "reviewed digest" },

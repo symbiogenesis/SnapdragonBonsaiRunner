@@ -108,10 +108,7 @@ fn rust_asr_decoder_uniform_attention_and_grouped_head_mapping() -> io::Result<(
     };
     // Zero Q produces uniform probabilities. Heads 0/1 share KV0; 2/3
     // share KV1, while each has a distinct output range.
-    let old = LayerState {
-        keys: vec![0.0; 4],
-        values: vec![1.0, 3.0, 10.0, 30.0],
-    };
+    let old = LayerState::from_f32(vec![0.0; 4], vec![1.0, 3.0, 10.0, 30.0]);
     let output = attend(
         &[0.0; 8],
         &[0.0; 4],
@@ -125,6 +122,22 @@ fn rust_asr_decoder_uniform_attention_and_grouped_head_mapping() -> io::Result<(
     Ok(())
 }
 
+fn cache_vecs(cache: Option<crate::replay::LayerCache<'_>>) -> Option<(Vec<f32>, Vec<f32>)> {
+    cache.map(|c| (c.keys.to_f32_vec(), c.values.to_f32_vec()))
+}
+
+fn cache_f16_ptrs(
+    cache: Option<crate::replay::LayerCache<'_>>,
+) -> Option<(*const u16, *const u16)> {
+    let c = cache?;
+    match (c.keys, c.values) {
+        (crate::replay::CacheValues::F16(k), crate::replay::CacheValues::F16(v)) => {
+            Some((k.as_ptr(), v.as_ptr()))
+        }
+        _ => None,
+    }
+}
+
 #[test]
 fn rust_asr_decoder_full_block_logits_complete_cache_and_reset() -> io::Result<()> {
     let model = model()?;
@@ -133,18 +146,21 @@ fn rust_asr_decoder_full_block_logits_complete_cache_and_reset() -> io::Result<(
     let expected = 1.5 / 5.25_f32.sqrt();
     assert_eq!(logits, [expected, expected]);
     assert_eq!(session.position(), 1);
-    assert_eq!(session.cache(0), Some((&[0.0, 0.0][..], &[0.5, 0.5][..])));
+    assert_eq!(
+        cache_vecs(session.cache(0)),
+        Some((vec![0.0, 0.0], vec![0.5, 0.5]))
+    );
     assert_eq!(
         session.step_audio(&[-1.0, -1.0], &mut || false)?,
         [-0.5, -0.5]
     );
     assert_eq!(
-        session.cache(0),
-        Some((&[0.0; 4][..], &[0.5, 0.5, -0.5, -0.5][..]))
+        cache_vecs(session.cache(0)),
+        Some((vec![0.0; 4], vec![0.5, 0.5, -0.5, -0.5]))
     );
     session.reset();
     assert_eq!(session.position(), 0);
-    assert_eq!(session.cache(0), Some((&[][..], &[][..])));
+    assert_eq!(cache_vecs(session.cache(0)), Some((Vec::new(), Vec::new())));
     assert_eq!(session.step_audio(&[1.0, 1.0], &mut || false)?, logits);
     // A separate session cannot inherit the first session's positions or KV.
     assert_eq!(model.session().position(), 0);
@@ -155,10 +171,8 @@ fn rust_asr_decoder_full_block_logits_complete_cache_and_reset() -> io::Result<(
 fn rust_asr_decoder_failures_cancellation_and_unwind_preserve_committed_bits() -> io::Result<()> {
     let mut session = model()?.session();
     let _ = session.step_audio(&[1.0, 1.0], &mut || false)?;
-    let (keys, values) = session
-        .cache(0)
-        .ok_or_else(|| io::Error::other("missing test layer"))?;
-    let original = (keys.to_vec(), values.to_vec());
+    let original =
+        cache_vecs(session.cache(0)).ok_or_else(|| io::Error::other("missing test layer"))?;
     assert!(
         session
             .step_audio(&[f32::MAX, f32::MAX], &mut || false)
@@ -184,10 +198,7 @@ fn rust_asr_decoder_failures_cancellation_and_unwind_preserve_committed_bits() -
     }));
     assert!(unwind.is_err());
     assert_eq!(session.position(), 1);
-    assert_eq!(
-        session.cache(0),
-        Some((original.0.as_slice(), original.1.as_slice()))
-    );
+    assert_eq!(cache_vecs(session.cache(0)), Some(original));
     Ok(())
 }
 
@@ -208,7 +219,10 @@ fn rust_asr_decoder_prompt_audio_injection_and_failed_prefill_reset() -> io::Res
         };
     }
     assert_eq!(logits, expected);
-    assert_eq!(prefilled.cache(0), independent.cache(0));
+    assert_eq!(
+        cache_vecs(prefilled.cache(0)),
+        cache_vecs(independent.cache(0))
+    );
     let mut calls = 0;
     assert!(
         prefilled
@@ -219,7 +233,10 @@ fn rust_asr_decoder_prompt_audio_injection_and_failed_prefill_reset() -> io::Res
             .is_err()
     );
     assert_eq!(prefilled.position(), 0);
-    assert_eq!(prefilled.cache(0), Some((&[][..], &[][..])));
+    assert_eq!(
+        cache_vecs(prefilled.cache(0)),
+        Some((Vec::new(), Vec::new()))
+    );
     Ok(())
 }
 
@@ -240,25 +257,19 @@ fn rust_asr_decoder_prefill_omits_unused_heads_and_keeps_final_failure_atomic() 
         [0.0; 2]
     );
     assert_eq!(session.position(), 16);
-    let (_, values) = session
-        .cache(0)
-        .ok_or_else(|| io::Error::other("missing test layer"))?;
+    let (_, values) =
+        cache_vecs(session.cache(0)).ok_or_else(|| io::Error::other("missing test layer"))?;
     let mut expected_values = [0.0; 32];
     expected_values[18..20].copy_from_slice(&[0.5; 2]);
     assert_eq!(values, expected_values);
 
     // A requested step still evaluates that head, fails before append and
     // leaves every previously committed K/V bit unchanged.
-    let (keys, values) = session
-        .cache(0)
-        .ok_or_else(|| io::Error::other("missing test layer"))?;
-    let original = (keys.to_vec(), values.to_vec());
+    let original =
+        cache_vecs(session.cache(0)).ok_or_else(|| io::Error::other("missing test layer"))?;
     assert!(session.step_audio(&[1.0, 1.0], &mut || false).is_err());
     assert_eq!(session.position(), 16);
-    assert_eq!(
-        session.cache(0),
-        Some((original.0.as_slice(), original.1.as_slice()))
-    );
+    assert_eq!(cache_vecs(session.cache(0)), Some(original));
 
     // Selecting that nonzero token at the final prompt position must still
     // evaluate the failing head and reset all earlier successful prompt rows.
@@ -269,7 +280,7 @@ fn rust_asr_decoder_prefill_omits_unused_heads_and_keeps_final_failure_atomic() 
             .is_err()
     );
     assert_eq!(session.position(), 0);
-    assert_eq!(session.cache(0), Some((&[][..], &[][..])));
+    assert_eq!(cache_vecs(session.cache(0)), Some((Vec::new(), Vec::new())));
     assert_eq!(
         session.prefill(&prompt, &[1.0, 1.0], &mut || false)?,
         [0.0; 2]
@@ -398,10 +409,8 @@ fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits(
     parallel_sess.reserve_decode(3)?;
     let reserved_ptrs: Vec<_> = (0..2)
         .map(|layer| {
-            let (pk, pv) = parallel_sess
-                .cache(layer)
-                .ok_or_else(|| io::Error::other("missing parallel layer"))?;
-            Ok((pk.as_ptr(), pv.as_ptr()))
+            cache_f16_ptrs(parallel_sess.cache(layer))
+                .ok_or_else(|| io::Error::other("missing parallel layer"))
         })
         .collect::<io::Result<Vec<_>>>()?;
     assert_eq!(parallel_sess.position(), serial_sess.position());
@@ -409,20 +418,18 @@ fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits(
         assert_eq!(got.to_bits(), want.to_bits(), "prefill logit mismatch");
     }
     for layer in 0..2 {
-        let (pk, pv) = parallel_sess
-            .cache(layer)
+        let (pk, pv) = cache_vecs(parallel_sess.cache(layer))
             .ok_or_else(|| io::Error::other("missing parallel layer"))?;
-        let (sk, sv) = serial_sess
-            .cache(layer)
+        let (sk, sv) = cache_vecs(serial_sess.cache(layer))
             .ok_or_else(|| io::Error::other("missing serial layer"))?;
-        for (i, (got, want)) in pk.iter().zip(sk).enumerate() {
+        for (i, (got, want)) in pk.iter().zip(&sk).enumerate() {
             assert_eq!(
                 got.to_bits(),
                 want.to_bits(),
                 "prefill K bit mismatch layer={layer} i={i}"
             );
         }
-        for (i, (got, want)) in pv.iter().zip(sv).enumerate() {
+        for (i, (got, want)) in pv.iter().zip(&sv).enumerate() {
             assert_eq!(
                 got.to_bits(),
                 want.to_bits(),
@@ -438,21 +445,22 @@ fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits(
             assert_eq!(got.to_bits(), want.to_bits(), "decode step logit mismatch");
         }
         for (layer, &(k_ptr, v_ptr)) in reserved_ptrs.iter().enumerate() {
-            let (pk, pv) = parallel_sess
-                .cache(layer)
+            assert_eq!(
+                cache_f16_ptrs(parallel_sess.cache(layer)),
+                Some((k_ptr, v_ptr))
+            );
+            let (pk, pv) = cache_vecs(parallel_sess.cache(layer))
                 .ok_or_else(|| io::Error::other("missing parallel layer"))?;
-            assert_eq!((pk.as_ptr(), pv.as_ptr()), (k_ptr, v_ptr));
-            let (sk, sv) = serial_sess
-                .cache(layer)
+            let (sk, sv) = cache_vecs(serial_sess.cache(layer))
                 .ok_or_else(|| io::Error::other("missing serial layer"))?;
-            for (i, (got, want)) in pk.iter().zip(sk).enumerate() {
+            for (i, (got, want)) in pk.iter().zip(&sk).enumerate() {
                 assert_eq!(
                     got.to_bits(),
                     want.to_bits(),
                     "decode K mismatch layer={layer} i={i}"
                 );
             }
-            for (i, (got, want)) in pv.iter().zip(sv).enumerate() {
+            for (i, (got, want)) in pv.iter().zip(&sv).enumerate() {
                 assert_eq!(
                     got.to_bits(),
                     want.to_bits(),
@@ -514,11 +522,11 @@ fn rust_asr_session_reset_retains_normal_capacity_and_shrinks_bursts() -> io::Re
         .map(|i| (f32::from(u16::try_from(i % 19).unwrap_or(0)) - 9.0) * 0.05)
         .collect();
     let baseline_logits = session.prefill(&normal_prompt, &normal_audio, &mut || false)?;
-    let normal_kv_cap = session.layers[0].keys.capacity();
+    let normal_kv_cap = session.layers[0].key_capacity();
     let normal_gate_cap = session.workspace.batch_gate.capacity();
     let normal_quads_cap = session.workspace.prepared.quads_capacity();
     session.reset();
-    assert_eq!(session.layers[0].keys.capacity(), normal_kv_cap);
+    assert_eq!(session.layers[0].key_capacity(), normal_kv_cap);
     assert_eq!(session.workspace.batch_gate.capacity(), normal_gate_cap);
     assert_eq!(
         session.workspace.prepared.quads_capacity(),
@@ -530,14 +538,14 @@ fn rust_asr_session_reset_retains_normal_capacity_and_shrinks_bursts() -> io::Re
     let burst_prompt = tokens.automatic_prompt(burst_rows, c.context)?;
     let burst_audio = vec![0.025_f32; burst_rows * c.hidden];
     let _ = session.prefill(&burst_prompt, &burst_audio, &mut || false)?;
-    let burst_kv_cap = session.layers[0].keys.capacity();
+    let burst_kv_cap = session.layers[0].key_capacity();
     let burst_gate_cap = session.workspace.batch_gate.capacity();
     let burst_quads_cap = session.workspace.prepared.quads_capacity();
     assert!(burst_kv_cap > normal_kv_cap * 2);
     assert!(burst_gate_cap > super::RETAIN_POSITIONS * c.intermediate * 2);
     session.reset();
-    assert!(session.layers[0].keys.capacity() < burst_kv_cap);
-    assert!(session.layers[0].values.capacity() < burst_kv_cap);
+    assert!(session.layers[0].key_capacity() < burst_kv_cap);
+    assert!(session.layers[0].value_capacity() < burst_kv_cap);
     assert!(session.workspace.batch_gate.capacity() < burst_gate_cap);
     assert!(session.workspace.batch_up.capacity() < burst_gate_cap);
     assert!(session.workspace.prepared.quads_capacity() < burst_quads_cap);

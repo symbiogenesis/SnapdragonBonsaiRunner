@@ -143,7 +143,13 @@ pub(crate) fn assert_cleared(recognizer: &RustRecognizer) {
     assert_eq!(recognizer.decoder.position(), 0);
     assert_eq!(recognizer.decoder.layer_count(), 2);
     for layer in 0..recognizer.decoder.layer_count() {
-        assert_eq!(recognizer.decoder.cache(layer), Some((&[][..], &[][..])));
+        assert_eq!(
+            recognizer
+                .decoder
+                .cache(layer)
+                .map(|c| (c.keys.is_empty(), c.values.is_empty())),
+            Some((true, true))
+        );
     }
 }
 
@@ -184,7 +190,12 @@ fn rust_asr_engine_complete_rust_pipeline_eos_and_fresh_replay() -> io::Result<(
     // CNN, transformer, audio injection, causal stack and tied EOS head.
     assert_eq!(recognizer.transcribe(&[0.0; 201])?, "");
     assert_eq!(recognizer.decoder.position(), 0);
-    assert_eq!(recognizer.decoder.cache(0), Some((&[][..], &[][..])));
+    assert!(
+        recognizer
+            .decoder
+            .cache(0)
+            .is_some_and(|c| c.keys.is_empty() && c.values.is_empty())
+    );
     assert_eq!(recognizer.transcribe(&[0.0; 201])?, "");
     assert_eq!(recognizer.decoder.position(), 0);
     Ok(())
@@ -215,7 +226,12 @@ fn rust_asr_engine_missing_eos_and_cancel_invalid_pcm_unwind_reset() -> io::Resu
     }));
     assert!(unwind.is_err());
     assert_eq!(recognizer.decoder.position(), 0);
-    assert_eq!(recognizer.decoder.cache(0), Some((&[][..], &[][..])));
+    assert!(
+        recognizer
+            .decoder
+            .cache(0)
+            .is_some_and(|c| c.keys.is_empty() && c.values.is_empty())
+    );
     Ok(())
 }
 
@@ -266,9 +282,11 @@ fn rust_asr_observer_complete_boundaries_logits_and_all_committed_cache_bits() -
                 assert_eq!(state.position(), 16);
                 assert_eq!(state.layer_count(), 2);
                 for layer in 0..state.layer_count() {
-                    let (keys, values) = state
+                    let cache = state
                         .cache(layer)
                         .ok_or_else(|| io::Error::other("missing observed layer"))?;
+                    let keys = cache.keys.to_f32_vec();
+                    let values = cache.values.to_f32_vec();
                     // IEEE zero signs follow the independently known unit-
                     // radian RoPE quadrants: x=0*cos-0*sin, y=0*sin+0*cos.
                     let mut expected_keys = [0.0_f32; 32];
@@ -334,9 +352,11 @@ fn rust_asr_observer_every_generation_step_is_observed_before_failed_request_res
                     assert_eq!(token, 0);
                     assert_eq!(logits.len(), 11);
                     for layer in 0..state.layer_count() {
-                        let (keys, values) = state
+                        let cache = state
                             .cache(layer)
                             .ok_or_else(|| io::Error::other("missing observed layer"))?;
+                        let keys = cache.keys.to_f32_vec();
+                        let values = cache.values.to_f32_vec();
                         assert_eq!(keys.len(), 2 * state.position());
                         assert_eq!(values.len(), keys.len());
                         assert!(keys.iter().all(|value| *value == 0.0));

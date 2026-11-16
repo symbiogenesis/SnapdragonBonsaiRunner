@@ -33,10 +33,31 @@ pub enum CacheValues<'a> {
 }
 
 impl CacheValues<'_> {
-    const fn len(self) -> usize {
+    /// Number of scalar elements retained by this cache view.
+    #[must_use]
+    pub const fn len(self) -> usize {
         match self {
             Self::F32(values) => values.len(),
             Self::F16(values) => values.len(),
+        }
+    }
+
+    /// Whether this cache view contains zero scalars.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Widen committed cache scalars into a caller-owned `f32` vector.
+    #[must_use]
+    pub fn to_f32_vec(self) -> Vec<f32> {
+        match self {
+            Self::F32(values) => values.to_vec(),
+            Self::F16(words) => {
+                let mut out = vec![0.0_f32; words.len()];
+                crate::packed::widen_f16_slice(words, &mut out);
+                out
+            }
         }
     }
 
