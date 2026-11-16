@@ -171,9 +171,9 @@ fn context_capacity_cache_tracks_equal_length_edits_and_committed_replacement() 
         .push(Role::Assistant, "uncommitted".repeat(1_000));
     assert_eq!(app.context_estimate(), committed);
     // No copy or fresh estimate is needed for an unchanged draft/history.
-    let allocation = app.context_draft.text.as_ptr();
+    let allocation = app.context_draft.units.cached_ptr();
     assert_eq!(app.context_estimate(), committed);
-    assert_eq!(app.context_draft.text.as_ptr(), allocation);
+    assert_eq!(app.context_draft.units.cached_ptr(), allocation);
 }
 
 #[test]

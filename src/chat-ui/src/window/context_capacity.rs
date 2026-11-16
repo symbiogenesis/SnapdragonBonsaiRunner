@@ -4,7 +4,9 @@ use crate::context::{self, Estimate, Pressure};
 
 #[derive(Default)]
 pub(super) struct DraftCache {
-    text: String,
+    units: context::IncrementalDraftUnits,
+    attachment_input: String,
+    has_attachments: bool,
     attachments_revision: u64,
     estimate: Option<Estimate>,
     extra_effort: bool,
@@ -16,20 +18,29 @@ impl State {
             .context_history
             .get_or_insert_with(|| context::history_tokens(&self.committed));
         let output = self.selected_output_cap();
+        let draft_matches = if self.draft_attachments.is_empty() {
+            !self.context_draft.has_attachments && self.context_draft.units.matches(&self.input)
+        } else {
+            self.context_draft.has_attachments && self.context_draft.attachment_input == self.input
+        };
         if let Some(estimate) = self.context_draft.estimate
             && estimate.history == history
             && estimate.output == usize::try_from(output).unwrap_or(usize::MAX)
             && self.context_draft.extra_effort == self.extra_effort
             && estimate.capacity == self.context_tokens
             && self.context_draft.attachments_revision == self.draft_attachments_revision
-            && self.context_draft.text == self.input
+            && draft_matches
         {
             return estimate;
         }
         let estimate = if self.draft_attachments.is_empty() {
-            Estimate::new(
+            self.context_draft.has_attachments = false;
+            self.context_draft.attachment_input = String::new();
+            let draft_tokens = self.context_draft.units.tokens(&self.input);
+            Estimate::from_draft_tokens(
                 history,
-                &self.input,
+                draft_tokens,
+                0,
                 output,
                 self.extra_effort,
                 self.context_tokens,
@@ -37,16 +48,19 @@ impl State {
         } else {
             let (formatted_text, images) =
                 crate::attachment_import::format_user_turn(&self.input, &self.draft_attachments);
-            Estimate::with_images(
+            self.context_draft.has_attachments = true;
+            self.input
+                .clone_into(&mut self.context_draft.attachment_input);
+            let draft_tokens = self.context_draft.units.tokens(&formatted_text);
+            Estimate::from_draft_tokens(
                 history,
-                &formatted_text,
+                draft_tokens,
                 images.len(),
                 output,
                 self.extra_effort,
                 self.context_tokens,
             )
         };
-        self.input.clone_into(&mut self.context_draft.text);
         self.context_draft.attachments_revision = self.draft_attachments_revision;
         self.context_draft.extra_effort = self.extra_effort;
         self.context_draft.estimate = Some(estimate);

@@ -79,7 +79,26 @@ impl Estimate {
         extra_effort: bool,
         capacity: Option<usize>,
     ) -> Self {
-        let draft = text_tokens(draft.trim())
+        Self::from_draft_tokens(
+            history,
+            text_tokens(draft.trim()),
+            draft_images,
+            output_cap,
+            extra_effort,
+            capacity,
+        )
+    }
+
+    /// Combine cached history, precomputed trimmed-draft tokens, images and options.
+    pub(crate) fn from_draft_tokens(
+        history: usize,
+        trimmed_draft_tokens: usize,
+        draft_images: usize,
+        output_cap: u32,
+        extra_effort: bool,
+        capacity: Option<usize>,
+    ) -> Self {
+        let draft = trimmed_draft_tokens
             .saturating_add(draft_images.saturating_mul(IMAGE_TOKENS))
             .saturating_add(NEXT_TURN_FRAMING_TOKENS)
             .saturating_add(system_prompt_tokens());
@@ -171,8 +190,8 @@ pub(crate) fn history_tokens(history: &[Message]) -> usize {
 // Eighth-token weights avoid per-character floating point and rounding drift.
 // Prose has cheaper spaces; punctuation/digits make code and numeric material
 // denser. Non-ASCII scripts and emoji must not inherit English chars/4 behavior.
-fn text_tokens(text: &str) -> usize {
-    let units = text.chars().fold(0_usize, |total, character| {
+pub(crate) fn text_units(text: &str) -> usize {
+    text.chars().fold(0_usize, |total, character| {
         let weight = if character.is_ascii_alphabetic() {
             2
         } else if character.is_ascii_digit() {
@@ -192,8 +211,81 @@ fn text_tokens(text: &str) -> usize {
             character.len_utf8() * 4
         };
         total.saturating_add(weight)
-    });
+    })
+}
+
+pub(crate) const fn units_to_tokens(units: usize) -> usize {
     units.div_ceil(8)
+}
+
+fn text_tokens(text: &str) -> usize {
+    units_to_tokens(text_units(text))
+}
+
+/// Incrementally maintains eighth-token units for trimmed draft text by scanning
+/// only the changed interior span between shared UTF-8 prefix and suffix slices.
+#[derive(Default)]
+pub(crate) struct IncrementalDraftUnits {
+    prev_trimmed: String,
+    trimmed_units: usize,
+}
+
+impl IncrementalDraftUnits {
+    #[cfg(test)]
+    pub(crate) fn cached_ptr(&self) -> *const u8 {
+        self.prev_trimmed.as_ptr()
+    }
+
+    pub(crate) fn matches(&self, draft: &str) -> bool {
+        self.prev_trimmed == draft.trim()
+    }
+
+    pub(crate) fn tokens(&mut self, draft: &str) -> usize {
+        let trimmed = draft.trim();
+        if self.prev_trimmed == trimmed {
+            return units_to_tokens(self.trimmed_units);
+        }
+        let old_bytes = self.prev_trimmed.as_bytes();
+        let new_bytes = trimmed.as_bytes();
+        let mut prefix = old_bytes
+            .iter()
+            .zip(new_bytes.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while prefix > 0
+            && (!self.prev_trimmed.is_char_boundary(prefix) || !trimmed.is_char_boundary(prefix))
+        {
+            prefix -= 1;
+        }
+        let max_suffix = old_bytes
+            .len()
+            .saturating_sub(prefix)
+            .min(new_bytes.len().saturating_sub(prefix));
+        let mut suffix = old_bytes[old_bytes.len() - max_suffix..]
+            .iter()
+            .rev()
+            .zip(new_bytes[new_bytes.len() - max_suffix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while suffix > 0
+            && (!self.prev_trimmed.is_char_boundary(old_bytes.len() - suffix)
+                || !trimmed.is_char_boundary(new_bytes.len() - suffix))
+        {
+            suffix -= 1;
+        }
+
+        let old_mid_end = old_bytes.len().saturating_sub(suffix);
+        let new_mid_end = new_bytes.len().saturating_sub(suffix);
+        let old_units = text_units(&self.prev_trimmed[prefix..old_mid_end]);
+        let new_units = text_units(&trimmed[prefix..new_mid_end]);
+        self.trimmed_units = self
+            .trimmed_units
+            .saturating_sub(old_units)
+            .saturating_add(new_units);
+        self.prev_trimmed
+            .replace_range(prefix..old_mid_end, &trimmed[prefix..new_mid_end]);
+        units_to_tokens(self.trimmed_units)
+    }
 }
 
 #[cfg(test)]
@@ -320,5 +412,27 @@ mod tests {
             history_tokens(&messages),
             MESSAGE_FRAMING_TOKENS + 3 * IMAGE_TOKENS
         );
+    }
+
+    #[test]
+    fn incremental_draft_units_exactly_matches_full_trim_scan() {
+        let mut tracker = IncrementalDraftUnits::default();
+        let samples = [
+            "",
+            "   \n\t ",
+            "hello world",
+            "  hello world!  ",
+            "hello 👋 world! 界",
+            "hello 👋 updated 🌍 mid 界",
+            "prefix hello 👋 updated 🌍 mid 界",
+            "prefix hello 🌍 mid",
+            "\t\n中文テスト 🌱🚀 café 12345 []{}",
+            "  中文🌱🚀 café  ",
+            "",
+        ];
+        for sample in samples {
+            assert_eq!(tracker.tokens(sample), text_tokens(sample.trim()));
+            assert!(tracker.matches(sample));
+        }
     }
 }
