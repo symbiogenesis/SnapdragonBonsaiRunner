@@ -488,3 +488,365 @@ fn swift_mmproj_lock_and_server_arguments_enforce_identity_and_path_bounds() -> 
     }
     Ok(())
 }
+
+#[test]
+fn weight_packing_ptq1_delta_and_default_shape_conservation_hold() -> Result<(), String> {
+    assert_eq!(
+        context::SwiftWeightPacking::Pq2_0.weight_bytes(),
+        7_206_168_928
+    );
+    assert_eq!(
+        context::SwiftWeightPacking::Ptq1_0.weight_bytes(),
+        5_946_648_928
+    );
+    let delta = context::SwiftWeightPacking::Pq2_0.weight_bytes()
+        - context::SwiftWeightPacking::Ptq1_0.weight_bytes();
+    assert_eq!(delta, 1_259_520_000);
+
+    let default_shape =
+        context::SwiftExecutionShape::for_profile(context::SwiftContextProfile::NativeRsq4);
+    assert_eq!(
+        default_shape.weights_and_fixed_runtime_bytes,
+        context::FIXED_RUNTIME_BYTES
+    );
+    assert_eq!(default_shape.evictable_mapped_weight_bytes, 0);
+    assert_eq!(default_shape.live_kv_copies, 2);
+    assert_eq!(default_shape.reuse_recurrent_copies, 1);
+
+    let ptq1 =
+        default_shape.with_weight_packing_calibrated(context::SwiftWeightPacking::Ptq1_0);
+    assert_eq!(
+        default_shape.weights_and_fixed_runtime_bytes - ptq1.weights_and_fixed_runtime_bytes,
+        1_259_520_000
+    );
+    assert_eq!(
+        ptq1.with_weight_packing_calibrated(context::SwiftWeightPacking::Pq2_0),
+        default_shape
+    );
+    assert_eq!(
+        ptq1.with_weight_packing_calibrated(context::SwiftWeightPacking::Ptq1_0),
+        ptq1
+    );
+    Ok(())
+}
+
+#[test]
+fn mapped_weights_commit_credit_keeps_physical_ram_honest_and_validates_bounds() -> Result<(), String>
+{
+    let gib = 1024 * 1024 * 1024_u64;
+    let profile = context::SwiftContextProfile::NativeRsq4;
+    let base = context::SwiftExecutionShape::for_profile(profile);
+    let mapped_bytes = context::SwiftWeightPacking::Ptq1_0.weight_bytes();
+    let credited = base
+        .with_mapped_weights_commit_credit(mapped_bytes)
+        .ok_or_else(|| "valid mapped weight credit must succeed".to_owned())?;
+
+    assert!(
+        base.with_mapped_weights_commit_credit(base.weights_and_fixed_runtime_bytes)
+            .is_some()
+    );
+    assert!(
+        base.with_mapped_weights_commit_credit(base.weights_and_fixed_runtime_bytes + 1)
+            .is_none()
+    );
+    assert!(base.with_mapped_weights_commit_credit(u64::MAX).is_none());
+
+    let base_bd = base
+        .breakdown(8_192)
+        .ok_or_else(|| "missing base breakdown".to_owned())?;
+    let cred_bd = credited
+        .breakdown(8_192)
+        .ok_or_else(|| "missing credited breakdown".to_owned())?;
+    assert_eq!(
+        cred_bd.total_footprint_bytes(),
+        base_bd.total_footprint_bytes()
+    );
+    assert_eq!(
+        base_bd
+            .job_commit_bytes()
+            .and_then(|job| job.checked_sub(cred_bd.job_commit_bytes()?)),
+        Some(mapped_bytes)
+    );
+    assert_eq!(
+        base_bd.private_job_commit_with_mapped_credit(mapped_bytes),
+        cred_bd.job_commit_bytes()
+    );
+    assert_eq!(
+        cred_bd.private_job_commit_with_mapped_credit(0),
+        base_bd.job_commit_bytes()
+    );
+    assert!(
+        cred_bd
+            .private_job_commit_with_mapped_credit(cred_bd.weights_and_fixed_runtime_bytes)
+            .is_some()
+    );
+    assert!(
+        cred_bd
+            .private_job_commit_with_mapped_credit(cred_bd.weights_and_fixed_runtime_bytes + 1)
+            .is_none()
+    );
+    assert!(cred_bd.private_job_commit_with_mapped_credit(u64::MAX).is_none());
+
+    let (base_plan, _) =
+        context::SwiftContextPlan::for_execution_shape(20 * gib, profile, &base)?;
+    let (cred_plan, _) =
+        context::SwiftContextPlan::for_execution_shape(20 * gib, profile, &credited)?;
+    assert_eq!(cred_plan.context_tokens, base_plan.context_tokens);
+    assert_eq!(
+        cred_plan.required_available_bytes,
+        base_plan.required_available_bytes
+    );
+    assert_eq!(
+        base_plan
+            .memory_limit_bytes
+            .checked_sub(cred_plan.memory_limit_bytes)
+            .and_then(|delta| u64::try_from(delta).ok()),
+        Some(mapped_bytes)
+    );
+    Ok(())
+}
+
+#[test]
+fn hexagon_host_deduplication_enforces_prefill_guard_and_conserves_physical_bytes()
+-> Result<(), String> {
+    assert_eq!(context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES, 2_888_663_040);
+    let profile = context::SwiftContextProfile::NativeRsq4;
+    let base = context::SwiftExecutionShape::for_profile(profile);
+
+    let tiled = base
+        .with_tiled_prefill_tokens(8, 8_192)
+        .ok_or_else(|| "tiled prefill shape must build".to_owned())?;
+    assert!(
+        tiled
+            .with_hexagon_host_deduplication(
+                context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+                context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+            )
+            .is_none()
+    );
+    let mut manual_scratch = base;
+    manual_scratch.tile_prefill_scratch_bytes = 1;
+    assert!(manual_scratch.with_hexagon_host_deduplication(0, 0).is_none());
+
+    assert!(
+        base.with_hexagon_host_deduplication(
+            context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 1,
+            context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 1,
+        )
+        .is_none()
+    );
+
+    let mut small_weights = base;
+    small_weights.weights_and_fixed_runtime_bytes =
+        context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES - 1;
+    assert!(
+        small_weights
+            .with_hexagon_host_deduplication(
+                context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+                context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+            )
+            .is_none()
+    );
+
+    let over_mapped = base
+        .with_mapped_weights_commit_credit(base.weights_and_fixed_runtime_bytes)
+        .ok_or_else(|| "full mapped credit".to_owned())?;
+    assert!(
+        over_mapped
+            .with_hexagon_host_deduplication(
+                context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+                context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+            )
+            .is_none()
+    );
+
+    let mut overflow_arena = base;
+    overflow_arena.accelerator_resident_arena_bytes = u64::MAX - 10;
+    assert!(overflow_arena.with_hexagon_host_deduplication(11, 0).is_none());
+
+    let arena_bytes = context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 64 * 1024 * 1024;
+    let dedup = base
+        .with_hexagon_host_deduplication(
+            arena_bytes,
+            context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+        )
+        .ok_or_else(|| "valid hexagon dedup must succeed".to_owned())?;
+    let base_bd = base
+        .breakdown(8_192)
+        .ok_or_else(|| "missing base breakdown".to_owned())?;
+    let dedup_bd = dedup
+        .breakdown(8_192)
+        .ok_or_else(|| "missing dedup breakdown".to_owned())?;
+    assert_eq!(
+        base_bd
+            .job_commit_bytes()
+            .and_then(|job| job.checked_sub(dedup_bd.job_commit_bytes()?)),
+        Some(context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES)
+    );
+    assert_eq!(dedup_bd.accelerator_bytes(), Some(arena_bytes));
+    assert_eq!(
+        dedup_bd
+            .total_footprint_bytes()
+            .and_then(|total| total.checked_sub(base_bd.total_footprint_bytes()?)),
+        Some(64 * 1024 * 1024)
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_branch_checkpoint_slots_enforce_zero_to_eight_bounds_and_monotonicity() -> Result<(), String>
+{
+    assert_eq!(context::MAX_REUSABLE_BRANCH_CHECKPOINTS, 8);
+    let gib = 1024 * 1024 * 1024_u64;
+    let profile = context::SwiftContextProfile::NativeRsq4;
+    let base = context::SwiftExecutionShape::for_profile(profile);
+
+    assert!(base.with_branch_reuse_checkpoints(9).is_none());
+    assert!(base.with_branch_reuse_checkpoints(u8::MAX).is_none());
+
+    let mut prev_recurrent = 0_u64;
+    let mut prev_tokens = usize::MAX;
+    for slots in 0..=context::MAX_REUSABLE_BRANCH_CHECKPOINTS {
+        let shaped = base
+            .with_branch_reuse_checkpoints(slots)
+            .ok_or_else(|| format!("branch slots {slots} must be valid"))?;
+        assert_eq!(shaped.reuse_recurrent_copies, slots);
+        let recurrent = shaped
+            .recurrent_checkpoint_bytes()
+            .ok_or_else(|| "recurrent checkpoint overflow".to_owned())?;
+        assert_eq!(
+            recurrent,
+            (2 + u64::from(slots)) * context::RECURRENT_BYTES
+        );
+        if slots > 0 {
+            assert_eq!(recurrent - prev_recurrent, context::RECURRENT_BYTES);
+        }
+        prev_recurrent = recurrent;
+
+        let (plan, _) =
+            context::SwiftContextPlan::for_execution_shape(18 * gib, profile, &shaped)?;
+        assert!(plan.context_tokens <= prev_tokens);
+        prev_tokens = plan.context_tokens;
+    }
+    Ok(())
+}
+
+#[test]
+fn cow_kv_admission_saves_over_four_gib_at_262144_k4v4_and_preserves_reserves_and_state_caps()
+-> Result<(), String> {
+    let gib = 1024 * 1024 * 1024_u64;
+    let full_profile = context::SwiftContextProfile::NativeRsq4Full;
+    let rollback_shape = context::SwiftExecutionShape::for_profile(full_profile);
+    let append_only_shape = rollback_shape.with_append_only_cow_kv_admission();
+    assert_eq!(append_only_shape.live_kv_copies, 1);
+
+    let rollback_bd = rollback_shape
+        .breakdown(context::MODEL_CONTEXT_TOKENS)
+        .ok_or_else(|| "missing rollback breakdown".to_owned())?;
+    let append_bd = append_only_shape
+        .breakdown(context::MODEL_CONTEXT_TOKENS)
+        .ok_or_else(|| "missing append-only breakdown".to_owned())?;
+
+    let rollback_tail_cow_saving = rollback_bd.live_kv_bytes - rollback_bd.physical_cow_kv_bytes;
+    assert_eq!(
+        rollback_tail_cow_saving,
+        262_080 * context::RSQ4_KV_BYTES_PER_TOKEN
+    );
+    assert_eq!(rollback_tail_cow_saving, 4_428_103_680);
+
+    let append_only_saving = rollback_bd.live_kv_bytes - append_bd.physical_cow_kv_bytes;
+    assert_eq!(
+        append_only_saving,
+        262_144 * context::RSQ4_KV_BYTES_PER_TOKEN
+    );
+    assert_eq!(append_only_saving, 4_429_185_024);
+    assert!(append_only_saving > 4 * gib);
+
+    // At 20 GiB available RAM, 2x rollback cannot fit 262,144 tokens, whereas CoW admits full 262,144.
+    let baseline_20g = context::SwiftContextPlan::for_profile(20 * gib, full_profile)?;
+    assert!(baseline_20g.context_tokens < context::MODEL_CONTEXT_TOKENS);
+
+    let cow_append_20g = context::SwiftContextPlan::for_append_only_cow_shape(
+        20 * gib,
+        full_profile,
+        &append_only_shape,
+    )?;
+    assert_eq!(cow_append_20g.context_tokens, context::MODEL_CONTEXT_TOKENS);
+    assert!(cow_append_20g.required_available_bytes + context::STARTUP_RESERVE_BYTES <= 20 * gib);
+
+    let cow_rollback_20g = context::SwiftContextPlan::for_append_only_cow_shape(
+        20 * gib,
+        full_profile,
+        &rollback_shape,
+    )?;
+    assert_eq!(
+        cow_rollback_20g.context_tokens,
+        context::MODEL_CONTEXT_TOKENS
+    );
+    assert_eq!(
+        cow_rollback_20g.required_available_bytes - cow_append_20g.required_available_bytes,
+        u64::try_from(context::KV_COW_PAGE_TOKENS)
+            .map_err(|error| error.to_string())?
+            * context::RSQ4_KV_BYTES_PER_TOKEN
+    );
+
+    // Monotonicity across available RAM and enforcement of HOST_RESERVE_BYTES.
+    let mut prev_ctx = 0_usize;
+    for avail_gib in 16..=24_u64 {
+        let plan = context::SwiftContextPlan::for_append_only_cow_shape(
+            avail_gib * gib,
+            full_profile,
+            &append_only_shape,
+        )?;
+        assert!(plan.context_tokens >= prev_ctx);
+        prev_ctx = plan.context_tokens;
+        assert_eq!(
+            plan.required_available_bytes
+                - u64::try_from(plan.memory_limit_bytes).map_err(|error| error.to_string())?,
+            context::HOST_RESERVE_BYTES
+        );
+        assert!(plan.required_available_bytes + context::STARTUP_RESERVE_BYTES <= avail_gib * gib);
+    }
+
+    // Ordinary NativeRsq4 retains its 4 GiB state cap (241,664 tokens) even under unlimited RAM.
+    let capped = context::SwiftContextPlan::for_append_only_cow_shape(
+        u64::MAX,
+        context::SwiftContextProfile::NativeRsq4,
+        &context::SwiftExecutionShape::for_profile(context::SwiftContextProfile::NativeRsq4)
+            .with_append_only_cow_kv_admission(),
+    )?;
+    assert_eq!(capped.context_tokens, 241_664);
+
+    // Minimum admission boundary and invalid zero-KV-copy rejection.
+    let min_kv = append_only_shape
+        .physical_cow_kv_bytes(context::MIN_CONTEXT_TOKENS)
+        .ok_or_else(|| "missing min cow kv".to_owned())?;
+    let min_fixed = append_only_shape
+        .breakdown(0)
+        .and_then(|bd| bd.physical_cow_footprint_bytes())
+        .ok_or_else(|| "missing min fixed".to_owned())?;
+    let minimum =
+        context::HOST_RESERVE_BYTES + context::STARTUP_RESERVE_BYTES + min_fixed + min_kv;
+    assert!(
+        context::SwiftContextPlan::for_append_only_cow_shape(
+            minimum - 1,
+            full_profile,
+            &append_only_shape,
+        )
+        .is_err()
+    );
+    let min_plan = context::SwiftContextPlan::for_append_only_cow_shape(
+        minimum,
+        full_profile,
+        &append_only_shape,
+    )?;
+    assert_eq!(min_plan.context_tokens, context::MIN_CONTEXT_TOKENS);
+
+    let mut zero_kv = append_only_shape;
+    zero_kv.live_kv_copies = 0;
+    assert!(
+        context::SwiftContextPlan::for_append_only_cow_shape(24 * gib, full_profile, &zero_kv)
+            .is_err()
+    );
+    Ok(())
+}

@@ -42,6 +42,11 @@ pub const RSQ4_FULL_STATE_LIMIT_BYTES: u64 =
 pub const CONTEXT_PAGE_TOKENS: usize = 256;
 /// Number of tokens sealed into each immutable copy-on-write KV cache page.
 pub const KV_COW_PAGE_TOKENS: usize = 64;
+/// Resident PQ2 projection bytes offloaded to Hexagon NPU (`blk.0..=26`, 168 projections)
+/// eligible for host CPU weight deduplication when CPU tiled prefill is disabled.
+pub const HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES: u64 = 2_888_663_040;
+/// Maximum reusable multi-branch recurrent checkpoint slots admitted per session.
+pub const MAX_REUSABLE_BRANCH_CHECKPOINTS: u8 = 8;
 /// Swift's largest projection activation/output width (FFN intermediate width).
 pub const SWIFT_MAX_LAYER_WIDTH: usize = 17_408;
 /// Bounded task-slice and error-descriptor reserve for parallel tiled prefill.
@@ -188,6 +193,26 @@ impl SwiftKvCacheFormat {
     }
 }
 
+/// Model weight packing representation used to calibrate host weight footprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwiftWeightPacking {
+    /// Pinned source PQ2.0 mixed-precision packing (`7_206_168_928` bytes).
+    Pq2_0,
+    /// Derived repacked PTQ1.0 weights (`5_946_648_928` bytes; `1_259_520_000` bytes smaller).
+    Ptq1_0,
+}
+
+impl SwiftWeightPacking {
+    /// Exact pinned GGUF weight byte length for this packing format.
+    #[must_use]
+    pub const fn weight_bytes(self) -> u64 {
+        match self {
+            Self::Pq2_0 => crate::SWIFT_WEIGHT_BYTES,
+            Self::Ptq1_0 => crate::PTQ1_WEIGHT_BYTES,
+        }
+    }
+}
+
 /// Explicit worst-case runtime, checkpoint, scratch, and accelerator shape for
 /// Swift admission accounting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +221,9 @@ pub struct SwiftExecutionShape {
     pub kv_format: SwiftKvCacheFormat,
     /// Model weights and fixed runtime allowance charged inside the Job commit limit.
     pub weights_and_fixed_runtime_bytes: u64,
+    /// OS-evictable read-only `MapViewOfFile` weight section bytes credited against
+    /// private Windows Job commit while remaining charged in physical RAM admission.
+    pub evictable_mapped_weight_bytes: u64,
     /// Live active recurrent/convolution state copies (`RECURRENT_BYTES` each).
     pub active_recurrent_copies: u8,
     /// Live rollback recurrent/convolution checkpoint copies (`RECURRENT_BYTES` each).
@@ -241,6 +269,7 @@ impl SwiftExecutionShape {
         Self {
             kv_format: SwiftKvCacheFormat::from_profile(profile),
             weights_and_fixed_runtime_bytes: FIXED_RUNTIME_BYTES,
+            evictable_mapped_weight_bytes: 0,
             active_recurrent_copies: 1,
             rollback_recurrent_copies: 1,
             reuse_recurrent_copies: 1,
@@ -256,6 +285,86 @@ impl SwiftExecutionShape {
             accelerator_staging_bytes: 0,
             allocator_fragmentation_margin_bytes: 0,
         }
+    }
+
+    /// Calibrate [`Self::weights_and_fixed_runtime_bytes`] for `packing` relative
+    /// to [`FIXED_RUNTIME_BYTES`], subtracting `1_259_520_000` bytes (`PQ2 - PTQ1`)
+    /// when [`SwiftWeightPacking::Ptq1_0`] is selected.
+    #[must_use]
+    pub const fn with_weight_packing_calibrated(mut self, packing: SwiftWeightPacking) -> Self {
+        const PQ2_TO_PTQ1_DELTA_BYTES: u64 = crate::SWIFT_WEIGHT_BYTES - crate::PTQ1_WEIGHT_BYTES;
+        self.weights_and_fixed_runtime_bytes = match packing {
+            SwiftWeightPacking::Pq2_0 => FIXED_RUNTIME_BYTES,
+            SwiftWeightPacking::Ptq1_0 => FIXED_RUNTIME_BYTES - PQ2_TO_PTQ1_DELTA_BYTES,
+        };
+        self
+    }
+
+    /// Credit `mapped_weight_bytes` of OS-evictable read-only `MapViewOfFile` weight
+    /// section pages out of private Windows Job commit while keeping
+    /// [`SwiftMemoryBreakdown::total_footprint_bytes`] honest for physical RAM admission.
+    ///
+    /// Returns `None` if `mapped_weight_bytes > self.weights_and_fixed_runtime_bytes`.
+    #[must_use]
+    pub fn with_mapped_weights_commit_credit(mut self, mapped_weight_bytes: u64) -> Option<Self> {
+        if mapped_weight_bytes > self.weights_and_fixed_runtime_bytes {
+            return None;
+        }
+        self.evictable_mapped_weight_bytes = mapped_weight_bytes;
+        Some(self)
+    }
+
+    /// Release `released_host_pq2_bytes` of Hexagon-resident `PQ2_0` projection
+    /// weights from host CPU memory while adding `resident_arena_bytes` to
+    /// [`Self::accelerator_resident_arena_bytes`].
+    ///
+    /// Returns `None` when CPU tiled prefill scratch is nonzero (since CPU tiled
+    /// prefill retains host weights), when `released_host_pq2_bytes` exceeds
+    /// [`HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES`] or [`Self::weights_and_fixed_runtime_bytes`],
+    /// when remaining host weight allowance would fall below
+    /// [`Self::evictable_mapped_weight_bytes`], or on `u64` arithmetic overflow.
+    #[must_use]
+    pub fn with_hexagon_host_deduplication(
+        mut self,
+        resident_arena_bytes: u64,
+        released_host_pq2_bytes: u64,
+    ) -> Option<Self> {
+        if self.tile_prefill_scratch_bytes != 0
+            || released_host_pq2_bytes > HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES
+        {
+            return None;
+        }
+        let remaining_weights = self
+            .weights_and_fixed_runtime_bytes
+            .checked_sub(released_host_pq2_bytes)?;
+        if remaining_weights < self.evictable_mapped_weight_bytes {
+            return None;
+        }
+        self.weights_and_fixed_runtime_bytes = remaining_weights;
+        self.accelerator_resident_arena_bytes = self
+            .accelerator_resident_arena_bytes
+            .checked_add(resident_arena_bytes)?;
+        Some(self)
+    }
+
+    /// Reserve `branch_slots` (`0..=8`) prompt-reuse recurrent/convolution checkpoint
+    /// slots (`RECURRENT_BYTES` per slot).
+    ///
+    /// Returns `None` when `branch_slots > MAX_REUSABLE_BRANCH_CHECKPOINTS`.
+    #[must_use]
+    pub const fn with_branch_reuse_checkpoints(mut self, branch_slots: u8) -> Option<Self> {
+        if branch_slots > MAX_REUSABLE_BRANCH_CHECKPOINTS {
+            return None;
+        }
+        self.reuse_recurrent_copies = branch_slots;
+        Some(self)
+    }
+
+    /// Set [`Self::live_kv_copies`] to `1` for append-only copy-on-write KV admission.
+    #[must_use]
+    pub const fn with_append_only_cow_kv_admission(mut self) -> Self {
+        self.live_kv_copies = 1;
+        self
     }
 
     /// Total live recurrent/convolution checkpoint bytes across active, rollback,
@@ -345,6 +454,7 @@ impl SwiftExecutionShape {
         let execution_scratch_bytes = self.execution_scratch_bytes()?;
         Some(SwiftMemoryBreakdown {
             weights_and_fixed_runtime_bytes: self.weights_and_fixed_runtime_bytes,
+            evictable_mapped_weight_bytes: self.evictable_mapped_weight_bytes,
             recurrent_checkpoint_bytes,
             live_kv_bytes,
             physical_cow_kv_bytes,
@@ -362,6 +472,9 @@ impl SwiftExecutionShape {
 pub struct SwiftMemoryBreakdown {
     /// Model weights and fixed runtime allowance (`a`).
     pub weights_and_fixed_runtime_bytes: u64,
+    /// OS-evictable read-only `MapViewOfFile` weight section bytes credited against
+    /// private Windows Job commit while remaining included in physical RAM admission.
+    pub evictable_mapped_weight_bytes: u64,
     /// Live recurrent/convolution checkpoint copies across active, rollback, and reuse (`b`).
     pub recurrent_checkpoint_bytes: u64,
     /// Live KV cache copies and per-token bookkeeping for the selected context (`c`).
@@ -379,16 +492,33 @@ pub struct SwiftMemoryBreakdown {
 }
 
 impl SwiftMemoryBreakdown {
-    /// Complete host private memory subject to the Windows Job commit ceiling
-    /// (`weights + fixed runtime + recurrent copies + live KV + scratch + fragmentation`),
-    /// excluding external accelerator resident arena and staging allocations.
+    /// Host private memory subject to the Windows Job commit ceiling after
+    /// crediting `evictable_mapped_bytes` of OS-evictable read-only `MapViewOfFile`
+    /// weight section pages.
+    ///
+    /// Returns `None` if `evictable_mapped_bytes > self.weights_and_fixed_runtime_bytes`
+    /// or on arithmetic overflow. Physical RAM admission via
+    /// [`Self::total_footprint_bytes`] continues to charge full weights.
     #[must_use]
-    pub fn job_commit_bytes(&self) -> Option<u64> {
+    pub fn private_job_commit_with_mapped_credit(
+        &self,
+        evictable_mapped_bytes: u64,
+    ) -> Option<u64> {
         self.weights_and_fixed_runtime_bytes
+            .checked_sub(evictable_mapped_bytes)?
             .checked_add(self.recurrent_checkpoint_bytes)?
             .checked_add(self.live_kv_bytes)?
             .checked_add(self.execution_scratch_bytes)?
             .checked_add(self.allocator_fragmentation_margin_bytes)
+    }
+
+    /// Complete host private memory subject to the Windows Job commit ceiling
+    /// (`weights - evictable_mapped + fixed runtime + recurrent copies + live KV + scratch + fragmentation`),
+    /// excluding external accelerator resident arena, staging allocations, and
+    /// OS-evictable mapped weight pages.
+    #[must_use]
+    pub fn job_commit_bytes(&self) -> Option<u64> {
+        self.private_job_commit_with_mapped_credit(self.evictable_mapped_weight_bytes)
     }
 
     /// Expected steady-state physical footprint when immutable `64`-token `KV`
@@ -412,11 +542,12 @@ impl SwiftMemoryBreakdown {
             .checked_add(self.accelerator_staging_bytes)
     }
 
-    /// Combined physical RAM ledger across Windows Job commit and unified
+    /// Combined physical RAM ledger across host weights/commit and unified
     /// accelerator reservations, excluding [`HOST_RESERVE_BYTES`].
     #[must_use]
     pub fn total_footprint_bytes(&self) -> Option<u64> {
         self.job_commit_bytes()?
+            .checked_add(self.evictable_mapped_weight_bytes)?
             .checked_add(self.accelerator_bytes()?)
     }
 }
@@ -547,6 +678,87 @@ impl SwiftContextPlan {
             required_available_bytes,
         };
         Ok((plan, breakdown))
+    }
+
+    /// Select the largest page-aligned context admitted under copy-on-write `KV`
+    /// accounting for an explicit [`SwiftExecutionShape`].
+    ///
+    /// Charges [`SwiftExecutionShape::physical_cow_kv_bytes`] (`1` shared copy plus
+    /// `<= 64`-token unsealed tail per extra live KV copy) alongside recurrent,
+    /// scratch, fragmentation, weight, and accelerator footprints while still
+    /// enforcing [`HOST_RESERVE_BYTES`], [`STARTUP_RESERVE_BYTES`], and
+    /// `profile.state_limit_bytes()`.
+    ///
+    /// # Errors
+    /// Rejects zero live KV copies, invalid mapped commit credit, insufficient
+    /// memory, or arithmetic overflow.
+    pub fn for_append_only_cow_shape(
+        available_bytes: u64,
+        profile: SwiftContextProfile,
+        shape: &SwiftExecutionShape,
+    ) -> Result<Self, String> {
+        if shape.live_kv_copies == 0 {
+            return Err(insufficient());
+        }
+        let zero_context = shape.breakdown(0).ok_or_else(insufficient)?;
+        // Enforce mapped credit bounds (`evictable_mapped <= weights`) even though
+        // physical RAM admission continues to charge full host weights.
+        let _ = zero_context.job_commit_bytes().ok_or_else(insufficient)?;
+        let fixed_physical = zero_context
+            .physical_cow_footprint_bytes()
+            .ok_or_else(insufficient)?;
+        let kv_per_token = shape.kv_format.kv_bytes_per_token();
+        let bookkeeping_per_token = shape
+            .score_rows_per_token
+            .checked_mul(4)
+            .and_then(|scores| scores.checked_add(shape.per_token_metadata_bytes))
+            .ok_or_else(insufficient)?;
+        let per_cow_token = kv_per_token
+            .checked_add(bookkeeping_per_token)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(insufficient)?;
+        let extra_copies = u64::from(shape.live_kv_copies - 1);
+        let cow_tail_tokens = u64::try_from(KV_COW_PAGE_TOKENS).map_err(|_| insufficient())?;
+        let unsealed_tail_bytes = extra_copies
+            .checked_mul(cow_tail_tokens)
+            .and_then(|tokens| tokens.checked_mul(kv_per_token))
+            .ok_or_else(insufficient)?;
+        let allocation = available_bytes
+            .checked_sub(HOST_RESERVE_BYTES)
+            .and_then(|bytes| bytes.checked_sub(STARTUP_RESERVE_BYTES))
+            .and_then(|bytes| bytes.checked_sub(fixed_physical))
+            .and_then(|bytes| bytes.checked_sub(unsealed_tail_bytes))
+            .ok_or_else(insufficient)?;
+        let state_allocation = profile
+            .state_limit_bytes()
+            .checked_sub(RECURRENT_BYTES)
+            .ok_or_else(insufficient)?;
+        let tokens =
+            (allocation / per_cow_token).min(state_allocation / profile.state_bytes_per_token());
+        let tokens = usize::try_from(tokens)
+            .map_err(|_| insufficient())?
+            .min(MODEL_CONTEXT_TOKENS);
+        let context_tokens = tokens / CONTEXT_PAGE_TOKENS * CONTEXT_PAGE_TOKENS;
+        if context_tokens < MIN_CONTEXT_TOKENS {
+            return Err(insufficient());
+        }
+        let breakdown = shape.breakdown(context_tokens).ok_or_else(insufficient)?;
+        let physical_cow = breakdown
+            .physical_cow_footprint_bytes()
+            .ok_or_else(insufficient)?;
+        let accelerator = breakdown.accelerator_bytes().ok_or_else(insufficient)?;
+        let cow_job_commit = physical_cow
+            .checked_sub(accelerator)
+            .and_then(|host| host.checked_sub(breakdown.evictable_mapped_weight_bytes))
+            .ok_or_else(insufficient)?;
+        let required_available_bytes = physical_cow
+            .checked_add(HOST_RESERVE_BYTES)
+            .ok_or_else(insufficient)?;
+        Ok(Self {
+            context_tokens,
+            memory_limit_bytes: usize::try_from(cow_job_commit).map_err(|_| insufficient())?,
+            required_available_bytes,
+        })
     }
 
     /// Derive a context plan for `profile`, reserving [`crate::MMPROJ_RESERVE_BYTES`]
