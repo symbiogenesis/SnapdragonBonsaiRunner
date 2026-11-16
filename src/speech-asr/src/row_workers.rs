@@ -17,10 +17,10 @@ enum CachedTeam {
 }
 
 impl CachedTeam {
-    const fn worker_count(&self) -> usize {
+    const fn needs_rebuild(&self, worker_count: usize) -> bool {
         match self {
-            Self::Ready(team) => team.workers.len(),
-            Self::Unavailable(count) => *count,
+            Self::Ready(team) => team.workers.len() < worker_count,
+            Self::Unavailable(count) => *count != worker_count,
         }
     }
 }
@@ -76,16 +76,18 @@ fn with_team<R>(
     if groups < 2 {
         return None;
     }
-    let chunk_len = groups.div_ceil(worker_count) * alignment;
+    let active_workers = worker_count.min(groups);
+    let chunk_len = groups.div_ceil(active_workers) * alignment;
     TEAM.with(|slot| {
         let Ok(mut team) = slot.try_borrow_mut() else {
             return None;
         };
         if team
             .as_ref()
-            .is_none_or(|cached| cached.worker_count() != worker_count)
+            .is_none_or(|cached| cached.needs_rebuild(worker_count))
         {
-            // Release any prior team before constructing its replacement.
+            // Release any prior team only when growing beyond its worker count
+            // or changing unavailable fallback requests, keeping warm batch pools across decode.
             *team = None;
             *team = Some(
                 OwnedTeam::build(worker_count)
@@ -282,6 +284,48 @@ mod tests {
         TEAM.with(|slot| {
             assert!(matches!(*slot.borrow(), Some(CachedTeam::Unavailable(4))));
         });
+        Ok(())
+    }
+
+    #[test]
+    fn asr_workers_retain_batch_pool_during_smaller_decode_slices() -> io::Result<()> {
+        fn team_ids(worker_count: usize) -> io::Result<HashSet<ThreadId>> {
+            let barrier = Barrier::new(worker_count);
+            let ids = Mutex::new(HashSet::new());
+            let mut rows = vec![0.0_f32; worker_count * 4];
+            run_aligned(&mut rows, worker_count, 4, &|_, output| {
+                ids.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(thread::current().id());
+                barrier.wait();
+                output.fill(1.0);
+            });
+            ids.into_inner()
+                .map_err(|_| io::Error::other("Thread IDs poisoned."))
+        }
+
+        let team = OwnedTeam::build(8).map_err(io::Error::other)?;
+        TEAM.with(|slot| *slot.borrow_mut() = Some(CachedTeam::Ready(team)));
+        let initial = team_ids(8)?;
+        assert_eq!(initial.len(), 8);
+
+        let mut decode_buf = [0.0_f32; 16];
+        let chunks = Mutex::new(Vec::new());
+        run_aligned(&mut decode_buf, 4, 2, &|offset, slice| {
+            chunks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((offset, slice.len(), thread::current().id()));
+            for (i, slot) in slice.iter_mut().enumerate() {
+                *slot = f32::from(u16::try_from(offset + i).unwrap_or(0));
+            }
+        });
+        let chunks = chunks
+            .into_inner()
+            .map_err(|_| io::Error::other("Chunks poisoned."))?;
+        assert!(!chunks.is_empty() && chunks.len() <= 4);
+        assert!(chunks.iter().all(|(_, _, id)| initial.contains(id)));
+        assert_eq!(team_ids(8)?, initial);
         Ok(())
     }
 }
