@@ -243,9 +243,53 @@ fn q6_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
     dots.map(Dot::finish)
 }
 
+#[inline(always)]
+fn transpose_4x4<S: Simd>(simd: S, rows: [f32x4<S>; 4]) -> [f32x4<S>; 4] {
+    let t0 = simd.zip_low_f32x4(rows[0], rows[1]);
+    let t1 = simd.zip_high_f32x4(rows[0], rows[1]);
+    let t2 = simd.zip_low_f32x4(rows[2], rows[3]);
+    let t3 = simd.zip_high_f32x4(rows[2], rows[3]);
+    let c0: f32x4<S> = simd.zip_low_u64x2(t0.bitcast(), t2.bitcast()).bitcast();
+    let c1: f32x4<S> = simd.zip_high_u64x2(t0.bitcast(), t2.bitcast()).bitcast();
+    let c2: f32x4<S> = simd.zip_low_u64x2(t1.bitcast(), t3.bitcast()).bitcast();
+    let c3: f32x4<S> = simd.zip_high_u64x2(t1.bitcast(), t3.bitcast()).bitcast();
+    [c0, c1, c2, c3]
+}
+
+#[inline(always)]
+fn read_f32_le(bytes: &[u8]) -> f32 {
+    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+#[inline(always)]
+fn load_f32x4_le<S: Simd>(simd: S, source: &[u8]) -> f32x4<S> {
+    f32x4::from_slice(
+        simd,
+        &[
+            read_f32_le(&source[0..4]),
+            read_f32_le(&source[4..8]),
+            read_f32_le(&source[8..12]),
+            read_f32_le(&source[12..16]),
+        ],
+    )
+}
+
+#[inline(always)]
+fn load_f16x4<S: Simd>(simd: S, source: &[u8]) -> f32x4<S> {
+    f32x4::from_slice(
+        simd,
+        &[
+            half(&source[0..2]),
+            half(&source[2..4]),
+            half(&source[4..6]),
+            half(&source[6..8]),
+        ],
+    )
+}
+
 // Interleave four ordinary floating-point rows, retaining one output per SIMD
 // lane. Each lane still adds its products from left to right without FMA, so
-// this removes the scalar accumulation bottleneck without changing its bits.
+// this removes the scalar cross-row gather bottleneck without changing its bits.
 #[inline(always)]
 pub(super) fn rows<S: Simd>(
     simd: S,
@@ -268,23 +312,63 @@ pub(super) fn rows<S: Simd>(
     let row_bytes = input.len() / block * size;
     let mut processed = 0;
     if matches!(kind, 0 | 1) {
+        let col_chunks = input.len() / 4;
+        let tail_start = col_chunks * 4;
         for output in destination.as_chunks_mut::<4>().0 {
             let start = processed * row_bytes;
+            let r0 = &source[start..start + row_bytes];
+            let r1 = &source[start + row_bytes..start + 2 * row_bytes];
+            let r2 = &source[start + 2 * row_bytes..start + 3 * row_bytes];
+            let r3 = &source[start + 3 * row_bytes..start + 4 * row_bytes];
             let mut sum = f32x4::from_slice(simd, output);
-            for (column, &value) in input.iter().enumerate() {
-                let weights = f32x4::from_fn(simd, |lane| {
-                    let offset = start + lane * row_bytes + column * size;
-                    if kind == 0 {
-                        f32::from_le_bytes([
-                            source[offset],
-                            source[offset + 1],
-                            source[offset + 2],
-                            source[offset + 3],
-                        ])
-                    } else {
-                        half(&source[offset..])
-                    }
-                });
+            for chunk_idx in 0..col_chunks {
+                let col_base = chunk_idx * 4;
+                let b_base = col_base * size;
+                let row_vecs = if kind == 0 {
+                    [
+                        load_f32x4_le(simd, &r0[b_base..b_base + 16]),
+                        load_f32x4_le(simd, &r1[b_base..b_base + 16]),
+                        load_f32x4_le(simd, &r2[b_base..b_base + 16]),
+                        load_f32x4_le(simd, &r3[b_base..b_base + 16]),
+                    ]
+                } else {
+                    [
+                        load_f16x4(simd, &r0[b_base..b_base + 8]),
+                        load_f16x4(simd, &r1[b_base..b_base + 8]),
+                        load_f16x4(simd, &r2[b_base..b_base + 8]),
+                        load_f16x4(simd, &r3[b_base..b_base + 8]),
+                    ]
+                };
+                let cols = transpose_4x4(simd, row_vecs);
+                let in4 = &input[col_base..col_base + 4];
+                for k in 0..4 {
+                    let products = cols[k] * f32x4::splat(simd, in4[k]);
+                    sum += products;
+                }
+            }
+            for (tail_idx, &value) in input[tail_start..].iter().enumerate() {
+                let b_off = (tail_start + tail_idx) * size;
+                let weights = if kind == 0 {
+                    f32x4::from_slice(
+                        simd,
+                        &[
+                            read_f32_le(&r0[b_off..b_off + 4]),
+                            read_f32_le(&r1[b_off..b_off + 4]),
+                            read_f32_le(&r2[b_off..b_off + 4]),
+                            read_f32_le(&r3[b_off..b_off + 4]),
+                        ],
+                    )
+                } else {
+                    f32x4::from_slice(
+                        simd,
+                        &[
+                            half(&r0[b_off..]),
+                            half(&r1[b_off..]),
+                            half(&r2[b_off..]),
+                            half(&r3[b_off..]),
+                        ],
+                    )
+                };
                 let products = weights * f32x4::splat(simd, value);
                 sum += products;
             }
@@ -678,6 +762,50 @@ mod tests {
                     expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                     "GGUF type {kind}, rows {row_count}",
                 );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_four_row_float_and_half_tiles_match_per_row_bits_across_widths() -> io::Result<()> {
+        let level = Level::new();
+        let initial_pool = [-0.0_f32, 0.0, -0.75, 1.25, 0.5, -0.25, 2.5, -1.5, 0.125];
+        let half_bits = [0x3555_u16, 0xb955, 0x3c00, 0x8000, 0x3c01, 0xbc00, 0x0400];
+        for kind in [0_u32, 1] {
+            let size = if kind == 0 { 4 } else { 2 };
+            for width in [1_usize, 4, 7, 16, 35] {
+                let row_bytes = width * size;
+                let input: Vec<f32> = (0..width)
+                    .map(|idx| {
+                        (f32::from(i16::try_from((idx * 5) % 37).unwrap_or(0)) - 18.0) * 0.0625
+                    })
+                    .collect();
+                for row_count in [1_usize, 4, 5, 8, 9] {
+                    let mut bytes = Vec::with_capacity(row_count * row_bytes);
+                    for row_idx in 0..row_count {
+                        for col_idx in 0..width {
+                            let bits = half_bits[(row_idx * 3 + col_idx * 5) % half_bits.len()];
+                            if kind == 0 {
+                                let val = crate::weights::half(&bits.to_le_bytes());
+                                bytes.extend_from_slice(&val.to_le_bytes());
+                            } else {
+                                bytes.extend_from_slice(&bits.to_le_bytes());
+                            }
+                        }
+                    }
+                    let mut actual = initial_pool[..row_count].to_vec();
+                    dispatch!(level, simd => super::rows(simd, kind, &bytes, &input, &mut actual));
+                    let mut expected = initial_pool[..row_count].to_vec();
+                    for (row_slice, slot) in bytes.chunks_exact(row_bytes).zip(&mut expected) {
+                        *slot = dispatch!(level, simd => super::row(simd, kind, row_slice, &input, *slot));
+                    }
+                    assert_eq!(
+                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "GGUF type {kind}, width {width}, rows {row_count}",
+                    );
+                }
             }
         }
         Ok(())
