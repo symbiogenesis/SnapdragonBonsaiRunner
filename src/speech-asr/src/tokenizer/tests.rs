@@ -135,3 +135,19 @@ fn rust_asr_tokenizer_bounds_and_bad_tables_publish_nothing() -> io::Result<()> 
     assert_eq!(tokenizer.eos(), 0);
     Ok(())
 }
+
+#[test]
+fn rust_asr_tokenizer_pair_index_chains_non_vocab_intermediate_and_first_wins() -> io::Result<()> {
+    // "ab" is absent from tokens yet must chain via synthetic symbol ID into "abc".
+    let tokenizer = fixture(&["abc"], &["a b", "ab c"])?;
+    assert_eq!(tokenizer.encode("abc abc")?, [256, u32::from(b' '), 256]);
+
+    // First occurrence of duplicate merge ("b c" at rank 0) wins before "a b" at rank 1.
+    let tokenizer = fixture(&["bc", "ab"], &["b c", "a b", "b c"])?;
+    assert_eq!(tokenizer.encode("abc")?, [u32::from(b'a'), 256]);
+
+    // Missing base byte glyph rejects cleanly instead of silently dropping bytes.
+    let incomplete = Tokenizer::from_tables(vec!["a".into()], vec!["a b".into()], 0)?;
+    assert!(incomplete.encode("ab").is_err());
+    Ok(())
+}

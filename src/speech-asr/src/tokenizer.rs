@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    cmp::{Ordering, Reverse},
+    cmp::Reverse,
     collections::BinaryHeap,
     io::{self, Read, Seek},
 };
@@ -22,6 +22,8 @@ const MAX_ENTRIES: usize = 262_144;
 const MAX_SPELLING: usize = 4096;
 const MAX_TABLE: usize = 64 * 1024 * 1024;
 const MAX_PROBES: usize = 64 * 1024 * 1024;
+const UNMAPPED_SYMBOL: u32 = u32::MAX;
+const NO_MERGE_RANK: u32 = u32::MAX;
 
 fn invalid() -> io::Error {
     io::Error::new(
@@ -65,7 +67,7 @@ struct MergeEntry {
     start: u32,
     left_len: u16,
     total_len: u16,
-    rank: usize,
+    rank: u32,
 }
 
 fn span_bytes(arena: &[u8], span: TokenSpan) -> &[u8] {
@@ -83,26 +85,113 @@ fn merge_parts(arena: &[u8], entry: MergeEntry) -> (&[u8], &[u8]) {
     (left, right)
 }
 
-fn cmp_merge_parts(
-    arena: &[u8],
-    entry: MergeEntry,
-    query_left: &[u8],
-    query_right: &[u8],
-) -> Ordering {
-    let (left, right) = merge_parts(arena, entry);
-    left.cmp(query_left).then_with(|| right.cmp(query_right))
+fn merge_combined(arena: &[u8], entry: MergeEntry) -> &[u8] {
+    let start = usize::try_from(entry.start).unwrap_or(arena.len());
+    let total_end = start.saturating_add(usize::from(entry.total_len));
+    arena.get(start..total_end).unwrap_or(&[])
+}
+
+fn hash_pair(left: u32, right: u32) -> usize {
+    let mut x = (u64::from(left) << 32) | u64::from(right);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    let folded = (x ^ (x >> 32)) & 0xffff_ffff;
+    let [b0, b1, b2, b3, ..] = folded.to_le_bytes();
+    usize::from(b0) | (usize::from(b1) << 8) | (usize::from(b2) << 16) | (usize::from(b3) << 24)
+}
+
+#[derive(Clone, Copy)]
+struct PairSlot {
+    left: u32,
+    right: u32,
+    rank: u32,
+    merged: u32,
+}
+
+impl Default for PairSlot {
+    fn default() -> Self {
+        Self {
+            left: UNMAPPED_SYMBOL,
+            right: UNMAPPED_SYMBOL,
+            rank: NO_MERGE_RANK,
+            merged: UNMAPPED_SYMBOL,
+        }
+    }
+}
+
+struct PairTable {
+    slots: Vec<PairSlot>,
+    mask: usize,
+}
+
+impl PairTable {
+    fn with_capacity(entries: usize) -> io::Result<Self> {
+        if entries == 0 {
+            return Ok(Self {
+                slots: Vec::new(),
+                mask: 0,
+            });
+        }
+        let cap = entries
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(invalid)?
+            .max(16);
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(cap).map_err(io::Error::other)?;
+        slots.resize(cap, PairSlot::default());
+        Ok(Self {
+            slots,
+            mask: cap - 1,
+        })
+    }
+
+    fn insert(&mut self, left: u32, right: u32, rank: u32, merged: u32) {
+        let mut idx = hash_pair(left, right) & self.mask;
+        loop {
+            let slot = &mut self.slots[idx];
+            if slot.left == UNMAPPED_SYMBOL || (slot.left == left && slot.right == right) {
+                *slot = PairSlot {
+                    left,
+                    right,
+                    rank,
+                    merged,
+                };
+                return;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    fn get(&self, left: u32, right: u32) -> (u32, u32) {
+        if self.slots.is_empty() {
+            return (NO_MERGE_RANK, UNMAPPED_SYMBOL);
+        }
+        let mut idx = hash_pair(left, right) & self.mask;
+        loop {
+            let slot = self.slots[idx];
+            if slot.left == UNMAPPED_SYMBOL {
+                return (NO_MERGE_RANK, UNMAPPED_SYMBOL);
+            }
+            if slot.left == left && slot.right == right {
+                return (slot.rank, slot.merged);
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
 }
 
 #[derive(Default)]
 struct WordScratch {
-    encoded: Vec<u8>,
     symbols: Vec<Symbol>,
     queue: Queue,
 }
 
 impl WordScratch {
     fn clear(&mut self) {
-        self.encoded.clear();
         self.symbols.clear();
         self.queue.clear();
     }
@@ -113,8 +202,9 @@ pub struct Tokenizer {
     token_arena: Vec<u8>,
     token_spans: Vec<TokenSpan>,
     vocab_sorted: Vec<u32>,
-    merge_arena: Vec<u8>,
-    merges: Vec<MergeEntry>,
+    vocab_cap: u32,
+    pair_table: PairTable,
+    byte_symbols: [u32; 256],
     eos: u32,
 }
 
@@ -155,109 +245,35 @@ impl Tokenizer {
             return Err(invalid());
         }
         let mut charged = 0_usize;
-        let token_bytes_hint: usize = tokens.iter().map(String::len).sum();
-        let mut token_arena = Vec::new();
-        token_arena
-            .try_reserve_exact(token_bytes_hint.min(MAX_TABLE))
-            .map_err(io::Error::other)?;
-        let mut token_spans = Vec::new();
-        token_spans
-            .try_reserve_exact(tokens.len())
-            .map_err(io::Error::other)?;
-        let mut vocab_sorted = Vec::new();
-        vocab_sorted
-            .try_reserve_exact(tokens.len())
-            .map_err(io::Error::other)?;
-        for (id, piece) in tokens.iter().enumerate() {
-            charge(&mut charged, piece)?;
-            let start = u32::try_from(token_arena.len()).map_err(|_| invalid())?;
-            let len = u16::try_from(piece.len()).map_err(|_| invalid())?;
-            token_arena.extend_from_slice(piece.as_bytes());
-            token_spans.push(TokenSpan { start, len });
-            vocab_sorted.push(u32::try_from(id).map_err(|_| invalid())?);
-        }
-        drop(tokens);
-        vocab_sorted.sort_unstable_by(|&a, &b| {
-            let a_bytes = span_bytes(&token_arena, token_spans[usize::try_from(a).unwrap_or(0)]);
-            let b_bytes = span_bytes(&token_arena, token_spans[usize::try_from(b).unwrap_or(0)]);
-            a_bytes.cmp(b_bytes).then_with(|| a.cmp(&b))
-        });
-        vocab_sorted.dedup_by(|later, earlier| {
-            let earlier_bytes = span_bytes(
-                &token_arena,
-                token_spans[usize::try_from(*earlier).unwrap_or(0)],
-            );
-            let later_bytes = span_bytes(
-                &token_arena,
-                token_spans[usize::try_from(*later).unwrap_or(0)],
-            );
-            earlier_bytes == later_bytes
-        });
-
-        let mut merge_arena = Vec::new();
-        let merge_bytes_hint: usize = lines.iter().map(String::len).sum();
-        merge_arena
-            .try_reserve_exact(merge_bytes_hint.min(MAX_TABLE))
-            .map_err(io::Error::other)?;
-        let mut merges = Vec::new();
-        merges
-            .try_reserve_exact(lines.len())
-            .map_err(io::Error::other)?;
-        for (rank, line) in lines.into_iter().enumerate() {
-            charge(&mut charged, &line)?;
-            let split = line
-                .as_bytes()
-                .get(1..)
-                .and_then(|rest| rest.iter().position(|&byte| byte == b' '))
-                .map(|offset| offset + 1)
-                .ok_or_else(invalid)?;
-            if line.contains('\u{1f}') {
-                return Err(invalid());
-            }
-            let bytes = line.as_bytes();
-            let left = &bytes[..split];
-            let right = &bytes[split + 1..];
-            let start = u32::try_from(merge_arena.len()).map_err(|_| invalid())?;
-            let left_len = u16::try_from(left.len()).map_err(|_| invalid())?;
-            let total_len = u16::try_from(left.len() + right.len()).map_err(|_| invalid())?;
-            merge_arena.extend_from_slice(left);
-            merge_arena.extend_from_slice(right);
-            merges.push(MergeEntry {
-                start,
-                left_len,
-                total_len,
-                rank,
-            });
-        }
-        merges.sort_unstable_by(|&a, &b| {
-            let (a_left, a_right) = merge_parts(&merge_arena, a);
-            let (b_left, b_right) = merge_parts(&merge_arena, b);
-            a_left
-                .cmp(b_left)
-                .then_with(|| a_right.cmp(b_right))
-                .then_with(|| a.rank.cmp(&b.rank))
-        });
-        merges.dedup_by(|later, earlier| {
-            merge_parts(&merge_arena, *earlier) == merge_parts(&merge_arena, *later)
-        });
+        let (token_arena, token_spans, vocab_sorted) = build_vocab_tables(tokens, &mut charged)?;
+        let (merge_arena, merges) = build_merge_entries(lines, &mut charged)?;
+        let vocab_cap = u32::try_from(token_spans.len()).map_err(|_| invalid())?;
+        let (pair_table, byte_symbols) = build_pair_index(
+            &token_arena,
+            &token_spans,
+            &vocab_sorted,
+            vocab_cap,
+            &merge_arena,
+            &merges,
+        )?;
         Ok(Self {
             token_arena,
             token_spans,
             vocab_sorted,
-            merge_arena,
-            merges,
+            vocab_cap,
+            pair_table,
+            byte_symbols,
             eos,
         })
     }
 
     fn find_bytes(&self, piece: &[u8]) -> Option<u32> {
-        self.vocab_sorted
-            .binary_search_by(|&id| {
-                let span = self.token_spans[usize::try_from(id).unwrap_or(0)];
-                span_bytes(&self.token_arena, span).cmp(piece)
-            })
-            .ok()
-            .map(|idx| self.vocab_sorted[idx])
+        find_vocab_bytes(
+            &self.token_arena,
+            &self.token_spans,
+            &self.vocab_sorted,
+            piece,
+        )
     }
 
     /// Resolve a literal encoded vocabulary spelling, retaining first occurrence.
@@ -302,38 +318,22 @@ impl Tokenizer {
     ) -> io::Result<()> {
         scratch.clear();
         scratch
-            .encoded
-            .try_reserve(word.len().saturating_mul(2))
-            .map_err(io::Error::other)?;
-        scratch
             .symbols
             .try_reserve(word.len())
             .map_err(io::Error::other)?;
-        let mut glyph_buf = [0_u8; 4];
         for (start, &byte) in word.iter().enumerate() {
-            let enc_start = scratch.encoded.len();
-            scratch
-                .encoded
-                .extend_from_slice(byte_glyph(byte).encode_utf8(&mut glyph_buf).as_bytes());
             scratch.symbols.push(Symbol {
                 raw_start: start,
                 raw_end: start + 1,
-                enc_start,
-                enc_end: scratch.encoded.len(),
+                sym: self.byte_symbols[usize::from(byte)],
                 previous: start.checked_sub(1),
                 next: (start + 1 < word.len()).then_some(start + 1),
             });
         }
         for left in 0..word.len().saturating_sub(1) {
-            self.enqueue(
-                &scratch.encoded,
-                &scratch.symbols,
-                left,
-                &mut scratch.queue,
-                probes,
-            )?;
+            self.enqueue(&scratch.symbols, left, &mut scratch.queue, probes)?;
         }
-        while let Some(Reverse((_, left, right, middle, end))) = scratch.queue.pop() {
+        while let Some(Reverse((_, left, right, middle, end, merged_sym))) = scratch.queue.pop() {
             if scratch.symbols[left].raw_end != middle
                 || scratch.symbols[right].raw_start != middle
                 || scratch.symbols[right].raw_end != end
@@ -342,43 +342,32 @@ impl Tokenizer {
                 continue;
             }
             scratch.symbols[left].raw_end = end;
-            scratch.symbols[left].enc_end = scratch.symbols[right].enc_end;
+            scratch.symbols[left].sym = merged_sym;
             scratch.symbols[left].next = scratch.symbols[right].next;
             scratch.symbols[right].raw_end = scratch.symbols[right].raw_start;
             if let Some(next) = scratch.symbols[left].next {
                 scratch.symbols[next].previous = Some(left);
             }
             if let Some(previous) = scratch.symbols[left].previous {
-                self.enqueue(
-                    &scratch.encoded,
-                    &scratch.symbols,
-                    previous,
-                    &mut scratch.queue,
-                    probes,
-                )?;
+                self.enqueue(&scratch.symbols, previous, &mut scratch.queue, probes)?;
             }
-            self.enqueue(
-                &scratch.encoded,
-                &scratch.symbols,
-                left,
-                &mut scratch.queue,
-                probes,
-            )?;
+            self.enqueue(&scratch.symbols, left, &mut scratch.queue, probes)?;
         }
         for symbol in scratch
             .symbols
             .iter()
             .filter(|symbol| symbol.raw_end > symbol.raw_start)
         {
-            if let Some(id) = self.find_bytes(&scratch.encoded[symbol.enc_start..symbol.enc_end]) {
-                push_id(output, id)?;
+            if symbol.sym < self.vocab_cap {
+                push_id(output, symbol.sym)?;
             } else {
                 for &byte in &word[symbol.raw_start..symbol.raw_end] {
-                    let glyph = byte_glyph(byte);
-                    let id = self
-                        .find_bytes(glyph.encode_utf8(&mut glyph_buf).as_bytes())
-                        .ok_or_else(invalid)?;
-                    push_id(output, id)?;
+                    let byte_sym = self.byte_symbols[usize::from(byte)];
+                    if byte_sym < self.vocab_cap {
+                        push_id(output, byte_sym)?;
+                    } else {
+                        return Err(invalid());
+                    }
                 }
             }
         }
@@ -387,7 +376,6 @@ impl Tokenizer {
 
     fn enqueue(
         &self,
-        encoded: &[u8],
         symbols: &[Symbol],
         left: usize,
         queue: &mut Queue,
@@ -400,18 +388,11 @@ impl Tokenizer {
         *probes = probes
             .checked_sub(b.raw_end - a.raw_start)
             .ok_or_else(invalid)?;
-        let query_left = &encoded[a.enc_start..a.enc_end];
-        let query_right = &encoded[b.enc_start..b.enc_end];
-        if let Ok(idx) = self.merges.binary_search_by(|&entry| {
-            cmp_merge_parts(&self.merge_arena, entry, query_left, query_right)
-        }) {
-            queue.push(Reverse((
-                self.merges[idx].rank,
-                left,
-                right,
-                a.raw_end,
-                b.raw_end,
-            )));
+        if a.sym != UNMAPPED_SYMBOL && b.sym != UNMAPPED_SYMBOL {
+            let (rank, merged) = self.pair_table.get(a.sym, b.sym);
+            if rank != NO_MERGE_RANK {
+                queue.push(Reverse((rank, left, right, a.raw_end, b.raw_end, merged)));
+            }
         }
         Ok(())
     }
@@ -472,12 +453,217 @@ impl Tokenizer {
 struct Symbol {
     raw_start: usize,
     raw_end: usize,
-    enc_start: usize,
-    enc_end: usize,
+    sym: u32,
     previous: Option<usize>,
     next: Option<usize>,
 }
-type Queue = BinaryHeap<Reverse<(usize, usize, usize, usize, usize)>>;
+type Queue = BinaryHeap<Reverse<(u32, usize, usize, usize, usize, u32)>>;
+
+fn find_vocab_bytes(
+    token_arena: &[u8],
+    token_spans: &[TokenSpan],
+    vocab_sorted: &[u32],
+    piece: &[u8],
+) -> Option<u32> {
+    vocab_sorted
+        .binary_search_by(|&id| {
+            let span = token_spans[usize::try_from(id).unwrap_or(0)];
+            span_bytes(token_arena, span).cmp(piece)
+        })
+        .ok()
+        .map(|idx| vocab_sorted[idx])
+}
+
+fn build_vocab_tables(
+    tokens: Vec<String>,
+    charged: &mut usize,
+) -> io::Result<(Vec<u8>, Vec<TokenSpan>, Vec<u32>)> {
+    let token_bytes_hint: usize = tokens.iter().map(String::len).sum();
+    let mut token_arena = Vec::new();
+    token_arena
+        .try_reserve_exact(token_bytes_hint.min(MAX_TABLE))
+        .map_err(io::Error::other)?;
+    let mut token_spans = Vec::new();
+    token_spans
+        .try_reserve_exact(tokens.len())
+        .map_err(io::Error::other)?;
+    let mut vocab_sorted = Vec::new();
+    vocab_sorted
+        .try_reserve_exact(tokens.len())
+        .map_err(io::Error::other)?;
+    for (id, piece) in tokens.iter().enumerate() {
+        charge(charged, piece)?;
+        let start = u32::try_from(token_arena.len()).map_err(|_| invalid())?;
+        let len = u16::try_from(piece.len()).map_err(|_| invalid())?;
+        token_arena.extend_from_slice(piece.as_bytes());
+        token_spans.push(TokenSpan { start, len });
+        vocab_sorted.push(u32::try_from(id).map_err(|_| invalid())?);
+    }
+    vocab_sorted.sort_unstable_by(|&a, &b| {
+        let a_bytes = span_bytes(&token_arena, token_spans[usize::try_from(a).unwrap_or(0)]);
+        let b_bytes = span_bytes(&token_arena, token_spans[usize::try_from(b).unwrap_or(0)]);
+        a_bytes.cmp(b_bytes).then_with(|| a.cmp(&b))
+    });
+    vocab_sorted.dedup_by(|later, earlier| {
+        let earlier_bytes = span_bytes(
+            &token_arena,
+            token_spans[usize::try_from(*earlier).unwrap_or(0)],
+        );
+        let later_bytes = span_bytes(
+            &token_arena,
+            token_spans[usize::try_from(*later).unwrap_or(0)],
+        );
+        earlier_bytes == later_bytes
+    });
+    Ok((token_arena, token_spans, vocab_sorted))
+}
+
+fn build_merge_entries(
+    lines: Vec<String>,
+    charged: &mut usize,
+) -> io::Result<(Vec<u8>, Vec<MergeEntry>)> {
+    let mut merge_arena = Vec::new();
+    let merge_bytes_hint: usize = lines.iter().map(String::len).sum();
+    merge_arena
+        .try_reserve_exact(merge_bytes_hint.min(MAX_TABLE))
+        .map_err(io::Error::other)?;
+    let mut merges = Vec::new();
+    merges
+        .try_reserve_exact(lines.len())
+        .map_err(io::Error::other)?;
+    for (rank, line) in lines.into_iter().enumerate() {
+        charge(charged, &line)?;
+        let split = line
+            .as_bytes()
+            .get(1..)
+            .and_then(|rest| rest.iter().position(|&byte| byte == b' '))
+            .map(|offset| offset + 1)
+            .ok_or_else(invalid)?;
+        if line.contains('\u{1f}') {
+            return Err(invalid());
+        }
+        let bytes = line.as_bytes();
+        let left = &bytes[..split];
+        let right = &bytes[split + 1..];
+        let start = u32::try_from(merge_arena.len()).map_err(|_| invalid())?;
+        let left_len = u16::try_from(left.len()).map_err(|_| invalid())?;
+        let total_len = u16::try_from(left.len() + right.len()).map_err(|_| invalid())?;
+        merge_arena.extend_from_slice(left);
+        merge_arena.extend_from_slice(right);
+        merges.push(MergeEntry {
+            start,
+            left_len,
+            total_len,
+            rank: u32::try_from(rank).map_err(|_| invalid())?,
+        });
+    }
+    merges.sort_unstable_by(|&a, &b| {
+        let (a_left, a_right) = merge_parts(&merge_arena, a);
+        let (b_left, b_right) = merge_parts(&merge_arena, b);
+        a_left
+            .cmp(b_left)
+            .then_with(|| a_right.cmp(b_right))
+            .then_with(|| a.rank.cmp(&b.rank))
+    });
+    merges.dedup_by(|later, earlier| {
+        merge_parts(&merge_arena, *earlier) == merge_parts(&merge_arena, *later)
+    });
+    Ok((merge_arena, merges))
+}
+
+fn resolve_symbol(
+    token_arena: &[u8],
+    token_spans: &[TokenSpan],
+    vocab_sorted: &[u32],
+    extras: &[&[u8]],
+    vocab_cap: u32,
+    key: &[u8],
+) -> u32 {
+    find_vocab_bytes(token_arena, token_spans, vocab_sorted, key).unwrap_or_else(|| {
+        extras
+            .binary_search(&key)
+            .ok()
+            .and_then(|idx| u32::try_from(idx).ok())
+            .and_then(|offset| vocab_cap.checked_add(offset))
+            .unwrap_or(UNMAPPED_SYMBOL)
+    })
+}
+
+fn build_pair_index(
+    token_arena: &[u8],
+    token_spans: &[TokenSpan],
+    vocab_sorted: &[u32],
+    vocab_cap: u32,
+    merge_arena: &[u8],
+    merges: &[MergeEntry],
+) -> io::Result<(PairTable, [u32; 256])> {
+    let mut extras = Vec::new();
+    for &entry in merges {
+        let (left, right) = merge_parts(merge_arena, entry);
+        if find_vocab_bytes(token_arena, token_spans, vocab_sorted, left).is_none() {
+            extras.try_reserve(1).map_err(io::Error::other)?;
+            extras.push(left);
+        }
+        if find_vocab_bytes(token_arena, token_spans, vocab_sorted, right).is_none() {
+            extras.try_reserve(1).map_err(io::Error::other)?;
+            extras.push(right);
+        }
+    }
+    extras.sort_unstable();
+    extras.dedup();
+    let total_symbols = token_spans
+        .len()
+        .checked_add(extras.len())
+        .and_then(|count| u32::try_from(count).ok())
+        .filter(|&count| count < UNMAPPED_SYMBOL);
+    if total_symbols.is_none() {
+        return Err(invalid());
+    }
+    let mut pair_table = PairTable::with_capacity(merges.len())?;
+    for &entry in merges {
+        let (left, right) = merge_parts(merge_arena, entry);
+        let left_sym = resolve_symbol(
+            token_arena,
+            token_spans,
+            vocab_sorted,
+            &extras,
+            vocab_cap,
+            left,
+        );
+        let right_sym = resolve_symbol(
+            token_arena,
+            token_spans,
+            vocab_sorted,
+            &extras,
+            vocab_cap,
+            right,
+        );
+        let merged = resolve_symbol(
+            token_arena,
+            token_spans,
+            vocab_sorted,
+            &extras,
+            vocab_cap,
+            merge_combined(merge_arena, entry),
+        );
+        pair_table.insert(left_sym, right_sym, entry.rank, merged);
+    }
+    let mut byte_symbols = [UNMAPPED_SYMBOL; 256];
+    let mut glyph_buf = [0_u8; 4];
+    for (byte, slot) in byte_symbols.iter_mut().enumerate() {
+        let byte_val = u8::try_from(byte).unwrap_or(0);
+        let encoded = byte_glyph(byte_val).encode_utf8(&mut glyph_buf);
+        *slot = resolve_symbol(
+            token_arena,
+            token_spans,
+            vocab_sorted,
+            &extras,
+            vocab_cap,
+            encoded.as_bytes(),
+        );
+    }
+    Ok((pair_table, byte_symbols))
+}
 
 fn charge(total: &mut usize, piece: &str) -> io::Result<()> {
     if piece.len() > MAX_SPELLING {

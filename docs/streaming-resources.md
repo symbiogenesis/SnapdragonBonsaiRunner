@@ -226,7 +226,11 @@ Additional client/speech cancellation and parsing source controls (screening ite
   requiring power-of-two alignment `<= 1_048_576`, duplicate key/tensor rejection, positive
   dimensions and checked extents; `tokenizer/scanner.rs` advances and backs up across
   multibyte Unicode whitespace (`\u{00A0}`, `\u{2000}`, `\u{3000}`) on full UTF-8 scalar
-  boundaries via `codepoint`.
+  boundaries via `codepoint`. Both `src/speech-tts/src/tokenizer.rs` and
+  `src/speech-asr/src/tokenizer.rs` build O(1) open-addressed `(u32, u32)` BPE symbol-pair
+  tables (`PairTable`) at <= 50% load factor (retaining synthetic symbol IDs for non-vocab
+  intermediate merges and raw/base byte fallback), and `speech-tts` pairs special scanning
+  with a `special_first_bytes: [u64; 4]` bitmap fast skip.
 
 ## Evidence limits
 
