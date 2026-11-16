@@ -82,12 +82,16 @@ mod isa;
 #[cfg(feature = "test-probe")]
 mod job_probe;
 mod library;
+pub(super) mod mmap;
 mod opencl;
 mod output;
 mod power;
 mod power_policy;
 pub(super) mod presentation;
+#[cfg(target_arch = "aarch64")]
+mod quant_aarch64;
 pub(super) mod replacement;
+pub(super) mod row_pool;
 pub(super) mod signature;
 mod vulkan;
 
@@ -1835,6 +1839,244 @@ impl Drop for CreationAttributes {
             // all backing storage/attribute values remain live during deletion.
             unsafe { DeleteProcThreadAttributeList(self.address()) };
         }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(super) fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
+    quant_aarch64::widen_f16_four(bits)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(super) fn widen_f16_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
+    quant_aarch64::widen_f16_eight(bits)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(super) fn narrow_f32_slice_to_f16(src: &[f32], dst: &mut [u16]) -> bool {
+    quant_aarch64::narrow_f32_slice_to_f16(src, dst)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(super) fn quantize_row_q8_0(input: &[f32], out: &mut [crate::quant_kernels::Q8_0ActBlock]) {
+    quant_aarch64::quantize_row_q8_0(input, out);
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(super) fn quantize_row_q8_k(input: &[f32], out: &mut [crate::quant_kernels::Q8_KActBlock]) {
+    quant_aarch64::quantize_row_q8_k(input, out);
+}
+
+pub(super) fn quant_dot_q8_0_row(
+    w_row: &[u8],
+    act: &[crate::quant_kernels::Q8_0ActBlock],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.2 `dotprod` support on this CPU.
+        Some(unsafe { quant_aarch64::dot_q8_0_row_dotprod(w_row, act) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (w_row, act);
+        None
+    }
+}
+
+pub(super) fn quant_dot_q8_0_4rows(
+    rows: [&[u8]; 4],
+    act: &[crate::quant_kernels::Q8_0ActBlock],
+) -> Option<[f32; 4]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.2 `dotprod` support on this CPU.
+        Some(unsafe { quant_aarch64::dot_q8_0_4rows_dotprod(rows, act) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (rows, act);
+        None
+    }
+}
+
+pub(super) fn quant_gemm_q8_0_4x2(
+    rows: [&[u8]; 4],
+    act0: &[crate::quant_kernels::Q8_0ActBlock],
+    act1: &[crate::quant_kernels::Q8_0ActBlock],
+) -> Option<[[f32; 2]; 4]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().i8mm {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.6 `i8mm` (`smmla`) support on this CPU.
+        Some(unsafe { quant_aarch64::gemm_q8_0_4x2_i8mm(rows, act0, act1) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (rows, act0, act1);
+        None
+    }
+}
+
+pub(super) fn quant_dot_q4_k_row(
+    w_row: &[u8],
+    act: &[crate::quant_kernels::Q8_KActBlock],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.2 `dotprod` support on this CPU.
+        Some(unsafe { quant_aarch64::dot_q4_k_row_dotprod(w_row, act) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (w_row, act);
+        None
+    }
+}
+
+pub(super) fn quant_dot_q4_k_4rows(
+    rows: [&[u8]; 4],
+    act: &[crate::quant_kernels::Q8_KActBlock],
+) -> Option<[f32; 4]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.2 `dotprod` support on this CPU.
+        Some(unsafe { quant_aarch64::dot_q4_k_4rows_dotprod(rows, act) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (rows, act);
+        None
+    }
+}
+
+pub(super) fn quant_gemm_q4_k_4x2(
+    rows: [&[u8]; 4],
+    act0: &[crate::quant_kernels::Q8_KActBlock],
+    act1: &[crate::quant_kernels::Q8_KActBlock],
+) -> Option<[[f32; 2]; 4]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().i8mm {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.6 `i8mm` (`smmla`) support on this CPU.
+        Some(unsafe { quant_aarch64::gemm_q4_k_4x2_i8mm(rows, act0, act1) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (rows, act0, act1);
+        None
+    }
+}
+
+pub(super) fn quant_dot_q4_k_repacked8(
+    strip: &[u8],
+    act: &[crate::quant_kernels::Q8_KActBlock],
+) -> Option<[f32; 8]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.2 `dotprod` support on this CPU.
+        Some(unsafe { quant_aarch64::dot_q4_k_repacked8_dotprod(strip, act) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (strip, act);
+        None
+    }
+}
+
+pub(super) fn quant_gemm_q4_k_repacked8_8x2(
+    strip: &[u8],
+    act0: &[crate::quant_kernels::Q8_KActBlock],
+    act1: &[crate::quant_kernels::Q8_KActBlock],
+) -> Option<[[f32; 2]; 8]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().i8mm {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.6 `i8mm` (`smmla`) support on this CPU.
+        Some(unsafe { quant_aarch64::gemm_q4_k_repacked8_8x2_i8mm(strip, act0, act1) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (strip, act0, act1);
+        None
+    }
+}
+
+pub(super) fn quant_dot_q6_k_row(
+    w_row: &[u8],
+    act: &[crate::quant_kernels::Q8_KActBlock],
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.2 `dotprod` support on this CPU.
+        Some(unsafe { quant_aarch64::dot_q6_k_row_dotprod(w_row, act) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (w_row, act);
+        None
+    }
+}
+
+pub(super) fn quant_dot_q6_k_4rows(
+    rows: [&[u8]; 4],
+    act: &[crate::quant_kernels::Q8_KActBlock],
+) -> Option<[f32; 4]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.2 `dotprod` support on this CPU.
+        Some(unsafe { quant_aarch64::dot_q6_k_4rows_dotprod(rows, act) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (rows, act);
+        None
+    }
+}
+
+pub(super) fn quant_gemm_q6_k_4x2(
+    rows: [&[u8]; 4],
+    act0: &[crate::quant_kernels::Q8_KActBlock],
+    act1: &[crate::quant_kernels::Q8_KActBlock],
+) -> Option<[[f32; 2]; 4]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !crate::quant_kernels::Arm64QuantCaps::detect().i8mm {
+            return None;
+        }
+        // SAFETY: Runtime probe confirmed ARMv8.6 `i8mm` (`smmla`) support on this CPU.
+        Some(unsafe { quant_aarch64::gemm_q6_k_4x2_i8mm(rows, act0, act1) })
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (rows, act0, act1);
+        None
     }
 }
 

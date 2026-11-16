@@ -26,6 +26,85 @@ use std::time::Duration;
 )]
 mod native;
 
+pub mod quant_kernels;
+
+/// Read-only memory-mapped file view backed by an owned Win32 section object.
+pub struct MappedFile(native::mmap::NativeMappedFile);
+
+impl MappedFile {
+    /// Map an ordinary non-empty file read-only into memory and prefetch its pages.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Self::from_file(&file)
+    }
+
+    /// Map an open read-only file handle into memory and prefetch its pages.
+    pub fn from_file(file: &std::fs::File) -> io::Result<Self> {
+        native::mmap::map_readonly_file(file).map(Self)
+    }
+
+    /// Borrow the mapped bytes as an immutable slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    /// Return the mapped byte length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.as_slice().len()
+    }
+
+    /// Return whether the mapped slice is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.as_slice().is_empty()
+    }
+}
+
+impl AsRef<[u8]> for MappedFile {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// Persistent spin-then-park worker pool using the calling thread as worker 0.
+pub struct RowWorkerPool(native::row_pool::NativeRowWorkerPool);
+
+impl RowWorkerPool {
+    /// Create a worker pool with `worker_count` total participants (including caller).
+    pub fn new(worker_count: usize, name_prefix: &str) -> io::Result<Self> {
+        native::row_pool::NativeRowWorkerPool::new(worker_count, name_prefix).map(Self)
+    }
+
+    /// Total worker count participating in work partitions.
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.0.worker_count()
+    }
+
+    /// Partition `out` across up to `active_workers` along `alignment`-element boundaries.
+    pub fn run_aligned<F>(
+        &self,
+        out: &mut [f32],
+        active_workers: usize,
+        alignment: usize,
+        compute: &F,
+    ) where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        self.0.run_aligned(out, active_workers, alignment, compute);
+    }
+
+    /// Partition `out` across up to `active_workers` with single-element granularity.
+    pub fn run<F>(&self, out: &mut [f32], active_workers: usize, compute: &F)
+    where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        self.0.run_aligned(out, active_workers, 1, compute);
+    }
+}
+
 /// Reuses the calling terminal for a graphical executable's command-line mode.
 ///
 /// Redirected standard output is preserved. No console is ever allocated; an
@@ -2148,6 +2227,60 @@ mod storage_budget_tests {
         assert_eq!(listener_process_id(port)?, Some(std::process::id()));
         drop(listener);
         assert_eq!(listener_process_id(port)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_file_maps_regular_file_and_rejects_empty_and_directories() -> io::Result<()> {
+        let tree = temp_tree("mmap")?;
+        let data_path = tree.0.join("weights.bin");
+        let payload: Vec<u8> = (0..=255_u8).cycle().take(4096 + 17).collect();
+        fs::write(&data_path, &payload)?;
+        let mapped = MappedFile::open(&data_path)?;
+        assert_eq!(mapped.len(), payload.len());
+        assert!(!mapped.is_empty());
+        assert_eq!(mapped.as_slice(), payload.as_slice());
+
+        let empty_path = tree.0.join("empty.bin");
+        fs::write(&empty_path, b"")?;
+        assert!(MappedFile::open(&empty_path).is_err());
+
+        let dir_handle = fs::File::open(&tree.0);
+        if let Ok(file) = dir_handle {
+            assert!(MappedFile::from_file(&file).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn row_worker_pool_executes_aligned_and_nested_tasks_deterministically() -> io::Result<()> {
+        let pool = RowWorkerPool::new(4, "test-row-pool")?;
+        assert_eq!(pool.worker_count(), 4);
+        let mut out = vec![0.0_f32; 65];
+        pool.run_aligned(&mut out, 4, 8, &|offset, slice| {
+            for (idx, slot) in slice.iter_mut().enumerate() {
+                let global = offset + idx;
+                *slot = u16::try_from(global).map_or(0.0, f32::from);
+            }
+        });
+        for (idx, &val) in out.iter().enumerate() {
+            assert_eq!(val, u16::try_from(idx).map_or(0.0, f32::from));
+        }
+
+        // Verify nested pool invocation runs inline on the worker without deadlock.
+        let mut outer = vec![0.0_f32; 16];
+        pool.run_aligned(&mut outer, 4, 4, &|offset, slice| {
+            let mut inner = vec![0.0_f32; slice.len()];
+            pool.run(&mut inner, 4, &|inner_off, inner_slice| {
+                for (i, slot) in inner_slice.iter_mut().enumerate() {
+                    *slot = u16::try_from(offset + inner_off + i).map_or(0.0, f32::from) + 1.0;
+                }
+            });
+            slice.copy_from_slice(&inner);
+        });
+        for (idx, &val) in outer.iter().enumerate() {
+            assert_eq!(val, u16::try_from(idx).map_or(0.0, f32::from) + 1.0);
+        }
         Ok(())
     }
 }
