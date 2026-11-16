@@ -256,6 +256,7 @@ fn decode_audio(
     observe(Observation::Prompt(&prompt))?;
     check(cancel)?;
     let mut logits = session.prefill(&prompt, audio.values(), cancel)?;
+    session.reserve_decode(budget)?;
     let mut generated = Vec::new();
     generated
         .try_reserve_exact(budget)

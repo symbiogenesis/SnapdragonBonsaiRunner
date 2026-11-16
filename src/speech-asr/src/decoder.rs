@@ -138,12 +138,6 @@ impl Projection {
         })
     }
 
-    fn row(&self, row: usize) -> io::Result<Vec<f32>> {
-        let mut output = zeros(self.input)?;
-        self.row_into(row, &mut output)?;
-        Ok(output)
-    }
-
     fn row_into(&self, row: usize, output: &mut [f32]) -> io::Result<()> {
         if row >= self.output || output.len() != self.input {
             return Err(invalid());
@@ -554,7 +548,7 @@ impl DecoderWorkspace {
 fn ensure_len(buffer: &mut Vec<f32>, len: usize) -> io::Result<()> {
     if buffer.capacity() < len {
         buffer
-            .try_reserve_exact(len - buffer.len())
+            .try_reserve(len - buffer.len())
             .map_err(io::Error::other)?;
     }
     buffer.resize(len, 0.0);
@@ -600,6 +594,33 @@ impl Session {
         self.position = 0;
     }
 
+    /// Pre-reserve capacity for `additional` decode tokens without exact per-step reallocations.
+    pub(crate) fn reserve_decode(&mut self, additional: usize) -> io::Result<()> {
+        let c = self.model.config;
+        let kv_width = c.kv_heads.checked_mul(c.head_dim).ok_or_else(invalid)?;
+        let extra_kv = additional.checked_mul(kv_width).ok_or_else(invalid)?;
+        for state in &mut self.layers {
+            if state.keys.capacity() < state.keys.len().saturating_add(extra_kv) {
+                state.keys.try_reserve(extra_kv).map_err(io::Error::other)?;
+            }
+            if state.values.capacity() < state.values.len().saturating_add(extra_kv) {
+                state
+                    .values
+                    .try_reserve(extra_kv)
+                    .map_err(io::Error::other)?;
+            }
+        }
+        let scores_len = self.position.saturating_add(additional).max(1);
+        if self.workspace.single_scores.capacity() < scores_len {
+            let needed = scores_len - self.workspace.single_scores.len();
+            self.workspace
+                .single_scores
+                .try_reserve(needed)
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
     /// Decode a vocabulary embedding and publish one complete position.
     ///
     /// # Errors
@@ -615,11 +636,16 @@ impl Session {
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Vec<f32>> {
         check(cancel)?;
-        let row = self
-            .model
+        let c = self.model.config;
+        if self.position >= c.context {
+            return Err(invalid());
+        }
+        ensure_len(&mut self.workspace.single_hidden, c.hidden)?;
+        let token_id = usize::try_from(id).map_err(|_| invalid())?;
+        self.model
             .embedding
-            .row(usize::try_from(id).map_err(|_| invalid())?)?;
-        self.advance(&row, project_logits, cancel)
+            .row_into(token_id, &mut self.workspace.single_hidden)?;
+        self.advance_prepared(project_logits, cancel)
     }
 
     /// Decode one encoder row or token embedding, then return tied-head logits.
@@ -645,18 +671,27 @@ impl Session {
         project_logits: bool,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Vec<f32>> {
-        let model = &self.model;
-        let c = model.config;
+        let c = self.model.config;
         if self.position >= c.context || row.len() != c.hidden {
             return Err(invalid());
         }
         finite(row)?;
+        ensure_len(&mut self.workspace.single_hidden, c.hidden)?;
+        self.workspace.single_hidden.copy_from_slice(row);
+        self.advance_prepared(project_logits, cancel)
+    }
+
+    fn advance_prepared(
+        &mut self,
+        project_logits: bool,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<Vec<f32>> {
+        let model = &self.model;
+        let c = model.config;
         check(cancel)?;
         let kv_width = c.kv_heads * c.head_dim;
         let q_width = c.heads * c.head_dim;
         let ws = &mut self.workspace;
-        ensure_len(&mut ws.single_hidden, c.hidden)?;
-        ws.single_hidden.copy_from_slice(row);
         ensure_len(&mut ws.single_norm, c.hidden)?;
         ensure_len(&mut ws.single_q, q_width)?;
         ensure_len(&mut ws.single_k, kv_width)?;
@@ -693,14 +728,15 @@ impl Session {
         };
         check(cancel)?;
         for state in &mut self.layers {
-            state
-                .keys
-                .try_reserve_exact(kv_width)
-                .map_err(io::Error::other)?;
-            state
-                .values
-                .try_reserve_exact(kv_width)
-                .map_err(io::Error::other)?;
+            if state.keys.capacity() < state.keys.len() + kv_width {
+                state.keys.try_reserve(kv_width).map_err(io::Error::other)?;
+            }
+            if state.values.capacity() < state.values.len() + kv_width {
+                state
+                    .values
+                    .try_reserve(kv_width)
+                    .map_err(io::Error::other)?;
+            }
         }
         for (layer_idx, state) in self.layers.iter_mut().enumerate() {
             let k_slice =
@@ -819,7 +855,9 @@ fn prefill_inner(
 
     let divisor = scalar(c.head_dim).sqrt();
     let gqa_group = c.heads / c.kv_heads;
-    for (block, state) in model.blocks.iter().zip(layers.iter_mut()) {
+    let last_layer = model.blocks.len() - 1;
+    let last_offset = (total - 1) * hidden;
+    for (layer_idx, (block, state)) in model.blocks.iter().zip(layers.iter_mut()).enumerate() {
         check(cancel)?;
         rms_batch(
             &ws.batch_a,
@@ -950,69 +988,95 @@ fn prefill_inner(
         )?;
         add_residual_batch(&mut ws.batch_a, &ws.batch_proj, workers, hidden)?;
 
-        rms_batch(
-            &ws.batch_a,
-            &mut ws.batch_norm,
-            &block.ffn_norm,
-            c.epsilon,
-            hidden,
-            workers,
-        )?;
-        ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
-        block.gate.multiply_batch_prepared_into(
-            &ws.prepared,
-            &ws.batch_norm,
-            workers,
-            &mut ws.transposed_scratch,
-            &mut ws.batch_gate,
-            cancel,
-        )?;
-        block.up.multiply_batch_prepared_into(
-            &ws.prepared,
-            &ws.batch_norm,
-            workers,
-            &mut ws.transposed_scratch,
-            &mut ws.batch_up,
-            cancel,
-        )?;
-        let up_all = &ws.batch_up;
-        row_workers::try_run_aligned(
-            &mut ws.batch_gate,
-            workers,
-            c.intermediate,
-            &|elem_off, gate_slice| {
-                let end = elem_off + gate_slice.len();
-                for (gate, &up) in gate_slice.iter_mut().zip(&up_all[elem_off..end]) {
-                    *gate = (*gate / (1.0 + (-*gate).exp())) * up;
-                }
-                finite(gate_slice)
-            },
-        )?;
-        ws.prepared
-            .prepare_into(&ws.batch_gate, total, c.intermediate);
-        block.down.multiply_batch_prepared_into(
-            &ws.prepared,
-            &ws.batch_gate,
-            workers,
-            &mut ws.transposed_scratch,
-            &mut ws.batch_proj,
-            cancel,
-        )?;
-        add_residual_batch(&mut ws.batch_a, &ws.batch_proj, workers, hidden)?;
+        if layer_idx == last_layer {
+            // Only the final prompt token feeds output_norm and tied lm_head;
+            // every layer's K/V cache is already committed above (slice_last_before_ffn).
+            ensure_len(&mut ws.single_norm, hidden)?;
+            ensure_len(&mut ws.single_gate, c.intermediate)?;
+            ensure_len(&mut ws.single_up, c.intermediate)?;
+            ensure_len(&mut ws.single_proj, hidden)?;
+            let last_row = &mut ws.batch_a[last_offset..last_offset + hidden];
+            rms_into(last_row, &block.ffn_norm, c.epsilon, &mut ws.single_norm)?;
+            block
+                .gate
+                .multiply_into(&ws.single_norm, workers, &mut ws.single_gate, cancel)?;
+            block
+                .up
+                .multiply_into(&ws.single_norm, workers, &mut ws.single_up, cancel)?;
+            for (gate, &up) in ws.single_gate.iter_mut().zip(&ws.single_up) {
+                *gate = (*gate / (1.0 + (-*gate).exp())) * up;
+            }
+            finite(&ws.single_gate)?;
+            block
+                .down
+                .multiply_into(&ws.single_gate, workers, &mut ws.single_proj, cancel)?;
+            for (out, &value) in last_row.iter_mut().zip(&ws.single_proj) {
+                *out += value;
+            }
+            finite(last_row)?;
+        } else {
+            rms_batch(
+                &ws.batch_a,
+                &mut ws.batch_norm,
+                &block.ffn_norm,
+                c.epsilon,
+                hidden,
+                workers,
+            )?;
+            ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
+            block.gate.multiply_batch_prepared_into(
+                &ws.prepared,
+                &ws.batch_norm,
+                workers,
+                &mut ws.transposed_scratch,
+                &mut ws.batch_gate,
+                cancel,
+            )?;
+            block.up.multiply_batch_prepared_into(
+                &ws.prepared,
+                &ws.batch_norm,
+                workers,
+                &mut ws.transposed_scratch,
+                &mut ws.batch_up,
+                cancel,
+            )?;
+            let up_all = &ws.batch_up;
+            row_workers::try_run_aligned(
+                &mut ws.batch_gate,
+                workers,
+                c.intermediate,
+                &|elem_off, gate_slice| {
+                    let end = elem_off + gate_slice.len();
+                    for (gate, &up) in gate_slice.iter_mut().zip(&up_all[elem_off..end]) {
+                        *gate = (*gate / (1.0 + (-*gate).exp())) * up;
+                    }
+                    finite(gate_slice)
+                },
+            )?;
+            ws.prepared
+                .prepare_into(&ws.batch_gate, total, c.intermediate);
+            block.down.multiply_batch_prepared_into(
+                &ws.prepared,
+                &ws.batch_gate,
+                workers,
+                &mut ws.transposed_scratch,
+                &mut ws.batch_proj,
+                cancel,
+            )?;
+            add_residual_batch(&mut ws.batch_a, &ws.batch_proj, workers, hidden)?;
+        }
     }
 
-    rms_batch(
-        &ws.batch_a,
-        &mut ws.batch_norm,
+    ensure_len(&mut ws.single_norm, hidden)?;
+    rms_into(
+        &ws.batch_a[last_offset..last_offset + hidden],
         &model.output_norm,
         c.epsilon,
-        hidden,
-        workers,
+        &mut ws.single_norm,
     )?;
-    let last_norm = &ws.batch_norm[(total - 1) * hidden..total * hidden];
     let logits = model
         .embedding
-        .multiply_with_threads(last_norm, workers, cancel)?;
+        .multiply_with_threads(&ws.single_norm, workers, cancel)?;
     check(cancel)?;
     Ok(logits)
 }

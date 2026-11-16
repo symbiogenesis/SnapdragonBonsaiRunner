@@ -395,6 +395,15 @@ fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits(
 
     let mut parallel_sess = parallel_model.session();
     let parallel_logits = parallel_sess.prefill(&prompt, &audio, &mut || false)?;
+    parallel_sess.reserve_decode(3)?;
+    let reserved_ptrs: Vec<_> = (0..2)
+        .map(|layer| {
+            let (pk, pv) = parallel_sess
+                .cache(layer)
+                .ok_or_else(|| io::Error::other("missing parallel layer"))?;
+            Ok((pk.as_ptr(), pv.as_ptr()))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     assert_eq!(parallel_sess.position(), serial_sess.position());
     for (got, want) in parallel_logits.iter().zip(&expected_logits) {
         assert_eq!(got.to_bits(), want.to_bits(), "prefill logit mismatch");
@@ -428,10 +437,11 @@ fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits(
         for (got, want) in got_step.iter().zip(&want_step) {
             assert_eq!(got.to_bits(), want.to_bits(), "decode step logit mismatch");
         }
-        for layer in 0..2 {
+        for (layer, &(k_ptr, v_ptr)) in reserved_ptrs.iter().enumerate() {
             let (pk, pv) = parallel_sess
                 .cache(layer)
                 .ok_or_else(|| io::Error::other("missing parallel layer"))?;
+            assert_eq!((pk.as_ptr(), pv.as_ptr()), (k_ptr, v_ptr));
             let (sk, sv) = serial_sess
                 .cache(layer)
                 .ok_or_else(|| io::Error::other("missing serial layer"))?;
