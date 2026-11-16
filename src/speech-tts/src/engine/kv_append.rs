@@ -34,8 +34,20 @@ impl<'a> KvAppend<'a> {
             .try_reserve(values.len())
             .map_err(io::Error::other)?;
         let guard = (cache.k.len(), cache.v.len(), cache.seq_len);
-        cache.k.extend_from_slice(keys);
-        cache.v.extend_from_slice(values);
+        let k_start = cache.k.len();
+        let v_start = cache.v.len();
+        cache.k.resize(k_start + keys.len(), 0);
+        cache.v.resize(v_start + values.len(), 0);
+        if !crate::engine::narrow_f32_slice(keys, &mut cache.k[k_start..])
+            || !crate::engine::narrow_f32_slice(values, &mut cache.v[v_start..])
+        {
+            cache.k.truncate(k_start);
+            cache.v.truncate(v_start);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Speech KV activation exceeds finite IEEE binary16 range.",
+            ));
+        }
         cache.seq_len = next;
         Ok(Self(crate::rust_codec::KvAppend::from_guard(cache, guard)))
     }
@@ -58,8 +70,8 @@ mod tests {
     #[test]
     fn decoder_kv_append_rolls_back_on_unwind_and_commits_only_explicitly() -> io::Result<()> {
         let mut cache = LayerKvCache {
-            k: vec![-0.0, 0.25],
-            v: vec![0.5, -0.75],
+            k: vec![0x8000, 0x3400],
+            v: vec![0x3800, 0xba00],
             seq_len: 1,
         };
         let interrupted = std::panic::catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
@@ -68,15 +80,12 @@ mod tests {
             std::panic::resume_unwind(Box::new("injected decoder fault"));
         }));
         assert!(interrupted.is_err());
-        assert_eq!(
-            cache.k.iter().map(|n| n.to_bits()).collect::<Vec<_>>(),
-            [0x8000_0000, 0x3e80_0000]
-        );
-        assert_eq!(cache.v, [0.5, -0.75]);
+        assert_eq!(cache.k, [0x8000_u16, 0x3400]);
+        assert_eq!(cache.v, [0x3800_u16, 0xba00]);
         assert_eq!(cache.seq_len, 1);
         KvAppend::new(&mut cache, &[1.0, 2.0], &[3.0, 4.0])?.commit();
-        assert_eq!(cache.k, [-0.0, 0.25, 1.0, 2.0]);
-        assert_eq!(cache.v, [0.5, -0.75, 3.0, 4.0]);
+        assert_eq!(cache.k, [0x8000_u16, 0x3400, 0x3c00, 0x4000]);
+        assert_eq!(cache.v, [0x3800_u16, 0xba00, 0x4200, 0x4400]);
         assert_eq!(cache.seq_len, 2);
         cache.seq_len = usize::MAX;
         assert!(KvAppend::new(&mut cache, &[5.0], &[6.0]).is_err());

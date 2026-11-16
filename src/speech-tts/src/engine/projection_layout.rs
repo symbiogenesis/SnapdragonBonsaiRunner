@@ -106,6 +106,23 @@ pub(super) fn validate(
         WeightQuantization::MappedPacked { ggml_type, bytes } => {
             validate_packed_bytes(*ggml_type, bytes.as_slice(), input, output)
         }
+        #[cfg(windows)]
+        WeightQuantization::RepackedQ4K8 { bytes } => {
+            let message = "Invalid 8-row repacked Q4_K projection size.";
+            if !output.is_multiple_of(8) || !input.is_multiple_of(256) {
+                return Err(invalid(message));
+            }
+            let strips = output / 8;
+            let blocks_per_row = input / 256;
+            let strip_bytes = blocks_per_row
+                .checked_mul(bonsai_windows_process::quant_kernels::Q4_K_REPACK8_BLOCK_BYTES)
+                .ok_or_else(|| invalid(message))?;
+            rows(strip_bytes, strips, bytes.len(), message)?;
+            Ok(Layout {
+                groups_per_row: blocks_per_row,
+                bytes_per_row: strip_bytes,
+            })
+        }
         WeightQuantization::PQ2_0 {
             group_size,
             scales,

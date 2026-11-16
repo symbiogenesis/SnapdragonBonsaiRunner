@@ -276,15 +276,31 @@ fn load_f32x4_le<S: Simd>(simd: S, source: &[u8]) -> f32x4<S> {
 
 #[inline(always)]
 fn load_f16x4<S: Simd>(simd: S, source: &[u8]) -> f32x4<S> {
-    f32x4::from_slice(
-        simd,
-        &[
-            half(&source[0..2]),
-            half(&source[2..4]),
-            half(&source[4..6]),
-            half(&source[6..8]),
-        ],
-    )
+    #[cfg(windows)]
+    {
+        let bits = [
+            u16::from_le_bytes([source[0], source[1]]),
+            u16::from_le_bytes([source[2], source[3]]),
+            u16::from_le_bytes([source[4], source[5]]),
+            u16::from_le_bytes([source[6], source[7]]),
+        ];
+        f32x4::from_slice(
+            simd,
+            &bonsai_windows_process::quant_kernels::widen_f16_four(&bits),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        f32x4::from_slice(
+            simd,
+            &[
+                half(&source[0..2]),
+                half(&source[2..4]),
+                half(&source[4..6]),
+                half(&source[6..8]),
+            ],
+        )
+    }
 }
 
 // Interleave four ordinary floating-point rows, retaining one output per SIMD
@@ -654,19 +670,36 @@ mod tests {
                     };
                 }
             }
+            let mut baseline_bits = None;
             for workers in [1, 3, 18] {
                 let actual = projection.forward_vec_parallel(&input, None, workers)?;
-                assert_eq!(
-                    actual
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>(),
-                    expected
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>(),
-                    "GGUF type {kind}, workers {workers}",
-                );
+                let actual_bits: Vec<u32> = actual.iter().map(|value| value.to_bits()).collect();
+                if matches!(kind, 0 | 1) || cfg!(not(windows)) {
+                    assert_eq!(
+                        actual_bits,
+                        expected
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        "GGUF type {kind}, workers {workers}",
+                    );
+                } else {
+                    if let Some(prev) = &baseline_bits {
+                        assert_eq!(
+                            &actual_bits, prev,
+                            "worker invariance GGUF type {kind}, workers {workers}"
+                        );
+                    } else {
+                        baseline_bits = Some(actual_bits);
+                    }
+                    for (act, exp) in actual.iter().zip(&expected) {
+                        let tol = 0.08 * exp.abs().max(1.0);
+                        assert!(
+                            (*act - *exp).abs() <= tol,
+                            "GGUF type {kind}, workers {workers}: actual={act} expected={exp}",
+                        );
+                    }
+                }
             }
         }
         Ok(())

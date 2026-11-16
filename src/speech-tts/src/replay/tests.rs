@@ -99,13 +99,13 @@ fn cache_packet(bytes: &mut Vec<u8>, positions: usize) -> io::Result<()> {
 fn caches(positions: usize) -> Vec<LayerKvCache> {
     vec![
         LayerKvCache {
-            k: [0.0, -0.0].repeat(positions),
-            v: [1.0, 2.0].repeat(positions),
+            k: [0x0000_u16, 0x8000].repeat(positions),
+            v: [0x3c00_u16, 0x4000].repeat(positions),
             seq_len: positions,
         },
         LayerKvCache {
-            k: [3.0, 4.0].repeat(positions),
-            v: [-5.0, 6.0].repeat(positions),
+            k: [0x4200_u16, 0x4400].repeat(positions),
+            v: [0xc500_u16, 0x4600].repeat(positions),
             seq_len: positions,
         },
     ]
@@ -478,12 +478,22 @@ fn tts_capture_borrows_original_contiguous_prompts_and_all_layer_views() -> io::
             logits,
             cache: Cache::Rust(layers),
         } => {
-            let layers: Vec<_> = layers
+            let owned: Vec<(Vec<f32>, Vec<f32>, usize)> = layers
                 .iter()
-                .map(|layer| LayerCache {
-                    keys: &layer.k,
-                    values: &layer.v,
-                    positions: layer.seq_len,
+                .map(|layer| {
+                    let mut k = vec![0.0_f32; layer.k.len()];
+                    let mut v = vec![0.0_f32; layer.v.len()];
+                    crate::engine::widen_f16_slice(&layer.k, &mut k);
+                    crate::engine::widen_f16_slice(&layer.v, &mut v);
+                    (k, v, layer.seq_len)
+                })
+                .collect();
+            let layers: Vec<_> = owned
+                .iter()
+                .map(|(k, v, seq_len)| LayerCache {
+                    keys: k,
+                    values: v,
+                    positions: *seq_len,
                 })
                 .collect();
             capture.observe(
@@ -503,12 +513,22 @@ fn tts_capture_borrows_original_contiguous_prompts_and_all_layer_views() -> io::
             frame,
             cache: Cache::Rust(layers),
         } => {
-            let layers: Vec<_> = layers
+            let owned: Vec<(Vec<f32>, Vec<f32>, usize)> = layers
                 .iter()
-                .map(|layer| LayerCache {
-                    keys: &layer.k,
-                    values: &layer.v,
-                    positions: layer.seq_len,
+                .map(|layer| {
+                    let mut k = vec![0.0_f32; layer.k.len()];
+                    let mut v = vec![0.0_f32; layer.v.len()];
+                    crate::engine::widen_f16_slice(&layer.k, &mut k);
+                    crate::engine::widen_f16_slice(&layer.v, &mut v);
+                    (k, v, layer.seq_len)
+                })
+                .collect();
+            let layers: Vec<_> = owned
+                .iter()
+                .map(|(k, v, seq_len)| LayerCache {
+                    keys: k,
+                    values: v,
+                    positions: *seq_len,
                 })
                 .collect();
             capture.observe(

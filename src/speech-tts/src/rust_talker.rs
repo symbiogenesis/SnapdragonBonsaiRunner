@@ -206,13 +206,20 @@ fn copy_f32(values: &[f32]) -> Option<Vec<f32>> {
     Some(copy)
 }
 
+fn copy_u16(values: &[u16]) -> Option<Vec<u16>> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(values.len()).ok()?;
+    copy.extend_from_slice(values);
+    Some(copy)
+}
+
 fn copy_layers(layers: &[LayerKvCache]) -> Option<Vec<LayerKvCache>> {
     let mut copy = Vec::new();
     copy.try_reserve_exact(layers.len()).ok()?;
     for layer in layers {
         copy.push(LayerKvCache {
-            k: copy_f32(&layer.k)?,
-            v: copy_f32(&layer.v)?,
+            k: copy_u16(&layer.k)?,
+            v: copy_u16(&layer.v)?,
             seq_len: layer.seq_len,
         });
     }
@@ -228,7 +235,7 @@ impl PrefillCache {
         let per_row = kv_width
             .checked_mul(layers)?
             .checked_mul(2)?
-            .checked_mul(size_of::<f32>())?
+            .checked_mul(size_of::<u16>())?
             .checked_add(hidden_bytes)?
             .checked_add(size_of::<Vec<f32>>())?;
         Some(
@@ -253,7 +260,7 @@ impl PrefillCache {
                     .k
                     .len()
                     .checked_add(layer.v.len())?
-                    .checked_mul(size_of::<f32>())?,
+                    .checked_mul(size_of::<u16>())?,
             )?;
         }
         Some(bytes)
@@ -297,7 +304,7 @@ impl PrefillCache {
                     .k
                     .capacity()
                     .checked_add(layer.v.capacity())?
-                    .checked_mul(size_of::<f32>())?,
+                    .checked_mul(size_of::<u16>())?,
             )?;
         }
         Some(bytes)
@@ -405,6 +412,19 @@ impl Talker {
                 predictor_geometry.vocab,
             )?);
         }
+        let mut cp_layers = predictor_geometry.load_layers(weights, "code_pred")?;
+        #[cfg(windows)]
+        {
+            for layer in &mut cp_layers {
+                layer.q_proj.repack_q4_k_if_aligned();
+                layer.k_proj.repack_q4_k_if_aligned();
+                layer.v_proj.repack_q4_k_if_aligned();
+                layer.o_proj.repack_q4_k_if_aligned();
+                layer.gate_proj.repack_q4_k_if_aligned();
+                layer.up_proj.repack_q4_k_if_aligned();
+                layer.down_proj.repack_q4_k_if_aligned();
+            }
+        }
         let predictor = CodePredictorModel {
             hidden_size: predictor_geometry.hidden,
             num_q_heads: predictor_geometry.heads,
@@ -415,7 +435,7 @@ impl Talker {
             rope_theta: predictor_geometry.rope_theta,
             rms_norm_eps: predictor_geometry.norm_eps,
             mtp_proj,
-            layers: predictor_geometry.load_layers(weights, "code_pred")?,
+            layers: cp_layers,
             norm_w: weights
                 .tensor_f32("code_pred.output_norm.weight", &[predictor_geometry.hidden])?,
             codec_embeddings,
@@ -600,18 +620,6 @@ impl Talker {
         })
     }
 
-    fn forward(
-        &self,
-        row: &[f32],
-        caches: &mut [LayerKvCache],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
-        workspace: &mut DecoderWorkspace,
-    ) -> io::Result<Vec<f32>> {
-        let mut hidden = Vec::with_capacity(row.len());
-        self.forward_into(row, caches, cancel, workspace, &mut hidden)?;
-        Ok(hidden)
-    }
-
     fn forward_into(
         &self,
         row: &[f32],
@@ -685,12 +693,60 @@ impl Talker {
         result
     }
 
+    fn forward_batch_range(
+        &self,
+        rows: &[Vec<f32>],
+        caches: &mut [LayerKvCache],
+        final_ffn_last_only: bool,
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Vec<f32>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let seq_len = rows.len();
+        let hidden = self.geometry.hidden;
+        let mut cur = Vec::with_capacity(seq_len * hidden);
+        for row in rows {
+            cur.extend_from_slice(row);
+        }
+        let mut next = Vec::with_capacity(cur.len());
+        let last_layer = self.layers.len().saturating_sub(1);
+        for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
+            cancel()?;
+            let slice_ffn = final_ffn_last_only && layer_idx == last_layer;
+            layer.forward_batch_into(
+                &cur,
+                seq_len,
+                self.geometry.heads,
+                self.geometry.kv_heads,
+                self.geometry.head_dim,
+                self.geometry.rope_theta,
+                self.geometry.norm_eps,
+                cache,
+                None,
+                self.threads,
+                slice_ffn,
+                &mut next,
+            )?;
+            std::mem::swap(&mut cur, &mut next);
+        }
+        let last_start = (seq_len - 1) * hidden;
+        let mut normed = Vec::with_capacity(hidden);
+        rms_norm_into(
+            &cur[last_start..],
+            &self.norm,
+            self.geometry.norm_eps,
+            &mut normed,
+        )?;
+        Ok(normed)
+    }
+
     fn prefill(
         &self,
         prompt: &Prompt,
         snapshot: &mut Option<PrefillCache>,
         cancel: &mut dyn FnMut() -> io::Result<()>,
-        workspace: &mut DecoderWorkspace,
+        _workspace: &mut DecoderWorkspace,
     ) -> io::Result<(Vec<LayerKvCache>, Vec<f32>)> {
         cancel()?;
         let prefix = prompt
@@ -714,19 +770,22 @@ impl Talker {
         if !reused {
             *snapshot = None;
         }
-        let (mut caches, mut hidden) = restored
+        let (mut caches, _cached_hidden) = restored
             .unwrap_or_else(|| (vec![LayerKvCache::default(); self.layers.len()], Vec::new()));
-        for (position, row) in prompt
-            .rows
-            .iter()
-            .enumerate()
-            .skip(if reused { prefix } else { 0 })
-        {
-            hidden = self.forward(row, &mut caches, cancel, workspace)?;
-            if !reused && prefix != 0 && position + 1 == prefix {
-                *snapshot = PrefillCache::capture(&prompt.rows[..prefix], &caches, &hidden);
+        let hidden = if reused {
+            self.forward_batch_range(&prompt.rows[prefix..], &mut caches, true, cancel)?
+        } else if prefix > 0 && prefix < prompt.rows.len() {
+            let prefix_hidden =
+                self.forward_batch_range(&prompt.rows[..prefix], &mut caches, true, cancel)?;
+            *snapshot = PrefillCache::capture(&prompt.rows[..prefix], &caches, &prefix_hidden);
+            self.forward_batch_range(&prompt.rows[prefix..], &mut caches, true, cancel)?
+        } else {
+            let full_hidden = self.forward_batch_range(&prompt.rows, &mut caches, true, cancel)?;
+            if prefix != 0 && prefix == prompt.rows.len() {
+                *snapshot = PrefillCache::capture(&prompt.rows[..prefix], &caches, &full_hidden);
             }
-        }
+            full_hidden
+        };
         Ok((caches, hidden))
     }
 
@@ -1086,7 +1145,7 @@ pub(crate) mod tests {
             },
             &mut workspace,
         )?;
-        assert_eq!((cold_calls, warm_calls), (4, 2));
+        assert_eq!((cold_calls, warm_calls), (3, 2));
         let bits = |values: &[f32]| {
             values
                 .iter()
@@ -1100,8 +1159,8 @@ pub(crate) mod tests {
                 assert_eq!(a.0.len(), b.0.len());
                 for (a, b) in a.0.iter().zip(&b.0) {
                     assert_eq!(a.seq_len, b.seq_len);
-                    assert_eq!(bits(&a.k), bits(&b.k));
-                    assert_eq!(bits(&a.v), bits(&b.v));
+                    assert_eq!(a.k, b.k);
+                    assert_eq!(a.v, b.v);
                 }
             };
         assert_state(&cold, &warm);
@@ -1131,7 +1190,8 @@ pub(crate) mod tests {
 
     #[test]
     fn prefix_snapshot_checks_bitwise_identity_row_and_byte_caps() {
-        assert_eq!(PrefillCache::row_limit(2048, 8 * 128, 28), Some(211));
+        assert_eq!(PrefillCache::row_limit(2048, 8 * 128, 28), Some(256));
+        assert_eq!(PrefillCache::row_limit(2048, 16 * 128, 28), Some(211));
         assert_eq!(PrefillCache::row_limit(2048, usize::MAX, 28), None);
         let rows = [vec![0.0]];
         let snapshot = PrefillCache::capture(&rows, &[], &[1.0]);
@@ -1377,7 +1437,13 @@ pub(crate) mod tests {
                             assert_eq!(layer.seq_len, prompt_len + frame);
                             assert_eq!(layer.k.len(), 2 * layer.seq_len);
                             assert_eq!(layer.v.len(), 2 * layer.seq_len);
-                            assert!(layer.k.iter().chain(&layer.v).all(|n| n.is_finite()));
+                            assert!(
+                                layer
+                                    .k
+                                    .iter()
+                                    .chain(&layer.v)
+                                    .all(|n| (*n & 0x7c00) != 0x7c00)
+                            );
                         }
                         // Reserved-token suppression has not yet replaced raw logits.
                         assert_eq!(logits[1025], 0.0);

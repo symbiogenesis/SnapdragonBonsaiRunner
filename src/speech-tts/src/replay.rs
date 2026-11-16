@@ -329,6 +329,28 @@ impl<R: Read> Replay<R> {
         Ok(())
     }
 
+    fn floats_f16(
+        &mut self,
+        actual: &[u16],
+        tolerance: Tolerance,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        self.number(actual.len())?;
+        let mut widened = [0.0_f32; 256];
+        for chunk in actual.chunks(256) {
+            check_cancel(cancel)?;
+            crate::engine::widen_f16_slice(chunk, &mut widened[..chunk.len()]);
+            for &value in &widened[..chunk.len()] {
+                let mut raw = [0; 4];
+                self.input.read_exact(&mut raw)?;
+                if !tolerance.accepts(f32::from_le_bytes(raw), value) {
+                    return Err(invalid());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn cache(
         &mut self,
         actual: &[LayerKvCache],
@@ -339,8 +361,8 @@ impl<R: Read> Replay<R> {
             check_cancel(cancel)?;
             self.number(index)?;
             self.number(layer.seq_len)?;
-            self.floats(&layer.k, self.tolerance.cache, cancel)?;
-            self.floats(&layer.v, self.tolerance.cache, cancel)?;
+            self.floats_f16(&layer.k, self.tolerance.cache, cancel)?;
+            self.floats_f16(&layer.v, self.tolerance.cache, cancel)?;
         }
         Ok(())
     }

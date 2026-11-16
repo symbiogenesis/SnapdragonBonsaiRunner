@@ -77,8 +77,8 @@ mod tests {
             let (layers, sampler, decoder) = frame.buffers();
             decoder.norm.extend_from_slice(&[f32::NAN; 16]);
             for (index, layer) in layers.iter_mut().enumerate() {
-                layer.k.extend_from_slice(&[-0.0, 0.25, 0.5, 0.75]);
-                layer.v.extend_from_slice(&[1.0, 1.25, 1.5, 1.75]);
+                layer.k.extend_from_slice(&[0x8000, 0x3400, 0x3800, 0x3a00]);
+                layer.v.extend_from_slice(&[0x3c00, 0x3e00, 0x3f00, 0x3fc0]);
                 layer.seq_len = index + 1;
             }
             sampler.seen_mut().extend_from_slice(&[1; 8]);
@@ -118,8 +118,8 @@ mod tests {
                     ),
                     *allocation
                 );
-                layer.k.extend_from_slice(&[2.0; 4]);
-                layer.v.extend_from_slice(&[3.0; 4]);
+                layer.k.extend_from_slice(&[0x4000; 4]);
+                layer.v.extend_from_slice(&[0x4200; 4]);
                 layer.seq_len = 2;
             }
             sampler.seen_mut().extend_from_slice(&[1; 8]);

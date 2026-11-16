@@ -102,8 +102,8 @@ mod tests {
 
     fn cache() -> LayerKvCache {
         LayerKvCache {
-            k: vec![0.0, 0.0],
-            v: vec![-0.5, 0.25],
+            k: vec![0x0000, 0x0000],
+            v: vec![0xb800, 0x3400],
             seq_len: 1,
         }
     }
@@ -142,8 +142,8 @@ mod tests {
                 );
                 assert!(output[2..].iter().all(|value| *value == 0.0));
                 assert_eq!(cache.seq_len, 2);
-                assert_eq!(cache.k, [0.0; 4]);
-                assert_eq!(cache.v, [-0.5, 0.25, 0.25, -0.75]);
+                assert_eq!(cache.k, [0x0000_u16; 4]);
+                assert_eq!(cache.v, [0xb800_u16, 0x3400, 0x3400, 0xba00]);
                 assert_eq!(
                     buffers(&mut workspace).map(|values| (values.as_ptr(), values.capacity())),
                     allocations
@@ -189,8 +189,8 @@ mod tests {
                 .is_err()
         );
         assert_eq!(cache.seq_len, 1);
-        assert_eq!(cache.k, [0.0; 2]);
-        assert_eq!(cache.v, [-0.5, 0.25]);
+        assert_eq!(cache.k, [0x0000_u16; 2]);
+        assert_eq!(cache.v, [0xb800_u16, 0x3400]);
         layer.down_proj.bias = Some(vec![0.5, -0.25]);
         let output = layer.forward_step_reusing(
             &[0.25, -0.5],

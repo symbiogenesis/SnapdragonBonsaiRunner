@@ -234,6 +234,12 @@ pub enum WeightQuantization {
         /// Zero-copy slice inside a read-only memory-mapped GGUF file.
         bytes: MappedSlice,
     },
+    /// 8-row repacked `Q4_K` matrix tuned for `SDOT` / `I8MM` kernels (`out_dim % 8 == 0`).
+    #[cfg(windows)]
+    RepackedQ4K8 {
+        /// Repacked 8-row `Q4_K` superblock strips (`1184` bytes per 8x256 tile).
+        bytes: Vec<u8>,
+    },
     /// 32-element block-quantized `Q8_0` weights.
     Q8_0 {
         /// Quantized 32-weight blocks.
@@ -667,11 +673,9 @@ pub struct LoraProjectionPatch {
 }
 
 impl LoraProjectionPatch {
-    /// Add `scale * alpha_over_rank * (lora_b @ (lora_a @ x))` onto `output` (`[out_dim]`).
-    /// When `scale == 0.0`, returns immediately without touching `output` (0-ULP identity).
-    pub fn apply(&self, input: &[f32], output: &mut [f32]) -> io::Result<()> {
-        if input.len() != self.in_dim
-            || output.len() != self.out_dim
+    pub(crate) fn validate(&self, in_dim: usize, out_dim: usize) -> io::Result<()> {
+        if in_dim != self.in_dim
+            || out_dim != self.out_dim
             || self.lora_a.len() != self.rank * self.in_dim
             || self.lora_b.len() != self.out_dim * self.rank
         {
@@ -680,6 +684,13 @@ impl LoraProjectionPatch {
                 "Invalid LoRA projection patch dimensions.",
             ));
         }
+        Ok(())
+    }
+
+    /// Add `scale * alpha_over_rank * (lora_b @ (lora_a @ x))` onto `output` (`[out_dim]`).
+    /// When `scale == 0.0`, returns immediately without touching `output` (0-ULP identity).
+    pub fn apply(&self, input: &[f32], output: &mut [f32]) -> io::Result<()> {
+        self.validate(input.len(), output.len())?;
         if self.scale == 0.0_f32 {
             return Ok(());
         }
@@ -892,7 +903,9 @@ impl LinearProjection {
             | WeightQuantization::Q8_0 { .. }
             | WeightQuantization::Packed { .. } => None,
             #[cfg(windows)]
-            WeightQuantization::MappedPacked { .. } => None,
+            WeightQuantization::MappedPacked { .. } | WeightQuantization::RepackedQ4K8 { .. } => {
+                None
+            }
         }
     }
 
@@ -965,6 +978,20 @@ impl LinearProjection {
         let level = Level::new();
 
         if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
+            #[cfg(windows)]
+            if dispatch_packed_quant_kernels(
+                ggml_type,
+                bytes,
+                self.in_dim,
+                input,
+                worker_count,
+                out,
+            ) {
+                if let Some(patch) = lora {
+                    patch.apply(input, out)?;
+                }
+                return Ok(());
+            }
             let row_bytes = layout.bytes_per_row;
             let compute_slice = |row_offset: usize, destination: &mut [f32]| {
                 dispatch!(level, simd => {
@@ -987,6 +1014,15 @@ impl LinearProjection {
                         io::ErrorKind::InvalidData,
                         "Unreachable mapped packed weight branch.",
                     ));
+                }
+                #[cfg(windows)]
+                WeightQuantization::RepackedQ4K8 { bytes } => {
+                    if !dispatch_repacked_q4_k(bytes, self.in_dim, input, worker_count, out) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "Repacked Q4_K weights require ARM64 dotprod support.",
+                        ));
+                    }
                 }
                 WeightQuantization::F32(w) => {
                     let in_dim = self.in_dim;
@@ -1097,6 +1133,715 @@ impl LinearProjection {
         }
         Ok(())
     }
+
+    /// Convert eligible `Q4_K` projections (`out_dim % 8 == 0`, `in_dim % 256 == 0`) to
+    /// interleaved 8-row layout tuned for ARM64 `SDOT` / `I8MM` kernels.
+    #[cfg(windows)]
+    pub fn repack_q4_k_if_aligned(&mut self) {
+        if !bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod
+            || !self.out_dim.is_multiple_of(8)
+            || !self.in_dim.is_multiple_of(256)
+        {
+            return;
+        }
+        let Some((12, bytes)) = self.weight.packed_slice() else {
+            return;
+        };
+        if let Some(repacked) = bonsai_windows_process::quant_kernels::repack_q4_k_8rows(
+            bytes,
+            self.in_dim,
+            self.out_dim,
+        ) {
+            self.weight = WeightQuantization::RepackedQ4K8 { bytes: repacked };
+        }
+    }
+
+    /// Fuse two sibling projections sharing `input` (e.g. `gate + up`) so activation
+    /// quantization and worker barrier orchestration execute once.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves per-projection optional LoRA patches and distinct pre-allocated output buffers."
+    )]
+    pub fn forward_pair_into(
+        proj_a: &Self,
+        proj_b: &Self,
+        input: &[f32],
+        lora_a: Option<&LoraProjectionPatch>,
+        lora_b: Option<&LoraProjectionPatch>,
+        threads: usize,
+        out_a: &mut Vec<f32>,
+        out_b: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        let mut targets = [(proj_a, lora_a, out_a), (proj_b, lora_b, out_b)];
+        forward_group_into(&mut targets, input, threads)
+    }
+
+    /// Fuse three sibling projections sharing `input` (`attn_q + attn_k + attn_v`) so activation
+    /// quantization and worker barrier orchestration execute once.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves per-projection optional LoRA patches and distinct pre-allocated output buffers."
+    )]
+    pub fn forward_triple_into(
+        proj_a: &Self,
+        proj_b: &Self,
+        proj_c: &Self,
+        input: &[f32],
+        lora_a: Option<&LoraProjectionPatch>,
+        lora_b: Option<&LoraProjectionPatch>,
+        lora_c: Option<&LoraProjectionPatch>,
+        threads: usize,
+        out_a: &mut Vec<f32>,
+        out_b: &mut Vec<f32>,
+        out_c: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        let mut targets = [
+            (proj_a, lora_a, out_a),
+            (proj_b, lora_b, out_b),
+            (proj_c, lora_c, out_c),
+        ];
+        forward_group_into(&mut targets, input, threads)
+    }
+
+    /// Project a sequence of `seq_len` vectors (`[seq_len * in_dim]`) into `out`
+    /// (`[seq_len * out_dim]`), using `I8MM` (`SMMLA`) `4x2`/`8x2` tiles on ARM64 Windows.
+    pub fn forward_batch_into(
+        &self,
+        inputs: &[f32],
+        seq_len: usize,
+        lora: Option<&LoraProjectionPatch>,
+        threads: usize,
+        out: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        if !(1..=256).contains(&threads) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid CPU worker count.",
+            ));
+        }
+        let expected_in = seq_len.checked_mul(self.in_dim).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Batch input length overflow.")
+        })?;
+        if inputs.len() != expected_in {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Batch projection input length mismatch.",
+            ));
+        }
+        if seq_len == 0 {
+            out.clear();
+            return Ok(());
+        }
+        if seq_len == 1 {
+            return self.forward_vec_into(inputs, None, lora, threads, out);
+        }
+        let _layout = projection_layout::validate(self.in_dim, self.out_dim, &self.weight)?;
+        let expected_out = seq_len.checked_mul(self.out_dim).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Batch output length overflow.")
+        })?;
+        if let Some(bias) = &self.bias
+            && bias.len() != self.out_dim
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Projection bias length mismatch.",
+            ));
+        }
+        if let Some(patch) = lora {
+            patch.validate(self.in_dim, self.out_dim)?;
+        }
+        out.resize(expected_out, 0.0);
+
+        #[cfg(windows)]
+        if dispatch_batch_quant_kernels(self, inputs, seq_len, threads, out)? {
+            if let Some(patch) = lora {
+                for t in 0..seq_len {
+                    patch.apply(
+                        &inputs[t * self.in_dim..(t + 1) * self.in_dim],
+                        &mut out[t * self.out_dim..(t + 1) * self.out_dim],
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut row_scratch = Vec::with_capacity(self.out_dim);
+        for t in 0..seq_len {
+            self.forward_vec_into(
+                &inputs[t * self.in_dim..(t + 1) * self.in_dim],
+                None,
+                lora,
+                threads,
+                &mut row_scratch,
+            )?;
+            out[t * self.out_dim..(t + 1) * self.out_dim].copy_from_slice(&row_scratch);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod quant_dispatch {
+    use std::cell::RefCell;
+
+    use bonsai_windows_process::quant_kernels::{
+        Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+        Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows,
+        dot_q4_k_repacked8, dot_q4_k_row, dot_q6_k_4rows, dot_q6_k_row, dot_q8_0_4rows,
+        dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x2, gemm_q6_k_4x2, gemm_q8_0_4x2,
+        quantize_row_q8_0, quantize_row_q8_k,
+    };
+
+    use super::{LinearProjection, WeightQuantization, run_row_chunks_aligned};
+
+    thread_local! {
+        static ACT_Q8_0: RefCell<Vec<Q8_0ActBlock>> = const { RefCell::new(Vec::new()) };
+        static ACT_Q8_K: RefCell<Vec<Q8_KActBlock>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn with_q8_0_act<R>(input: &[f32], action: impl FnOnce(&[Q8_0ActBlock]) -> R) -> R {
+        let blocks = input.len() / Q8_0_BLOCK_ELEMENTS;
+        ACT_Q8_0.with(|cell| {
+            if let Ok(mut buf) = cell.try_borrow_mut() {
+                buf.resize(blocks, Q8_0ActBlock::default());
+                quantize_row_q8_0(input, &mut buf[..blocks]);
+                action(&buf[..blocks])
+            } else {
+                let mut fallback = vec![Q8_0ActBlock::default(); blocks];
+                quantize_row_q8_0(input, &mut fallback);
+                action(&fallback)
+            }
+        })
+    }
+
+    pub(super) fn with_q8_k_act<R>(input: &[f32], action: impl FnOnce(&[Q8_KActBlock]) -> R) -> R {
+        let blocks = input.len() / QK_K;
+        ACT_Q8_K.with(|cell| {
+            if let Ok(mut buf) = cell.try_borrow_mut() {
+                buf.resize(blocks, Q8_KActBlock::default());
+                quantize_row_q8_k(input, &mut buf[..blocks]);
+                action(&buf[..blocks])
+            } else {
+                let mut fallback = vec![Q8_KActBlock::default(); blocks];
+                quantize_row_q8_k(input, &mut fallback);
+                action(&fallback)
+            }
+        })
+    }
+
+    pub(super) fn add_packed_rows(
+        ggml_type: u32,
+        bytes: &[u8],
+        in_dim: usize,
+        caps: Arm64QuantCaps,
+        q8_act: &[Q8_0ActBlock],
+        qk_act: &[Q8_KActBlock],
+        start_row: usize,
+        dst: &mut [f32],
+    ) {
+        let (block, elem_bytes) = match ggml_type {
+            8 => (Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES),
+            12 => (QK_K, Q4_K_BLOCK_BYTES),
+            14 => (QK_K, Q6_K_BLOCK_BYTES),
+            _ => return,
+        };
+        let row_bytes = (in_dim / block) * elem_bytes;
+        let mut processed = 0_usize;
+        if start_row.is_multiple_of(4) || dst.len() >= 4 {
+            for quad in dst.chunks_exact_mut(4) {
+                let r0 = (start_row + processed) * row_bytes;
+                let row_refs = [
+                    &bytes[r0..r0 + row_bytes],
+                    &bytes[r0 + row_bytes..r0 + 2 * row_bytes],
+                    &bytes[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
+                    &bytes[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
+                ];
+                let sums = match ggml_type {
+                    8 => dot_q8_0_4rows(caps, row_refs, q8_act),
+                    12 => dot_q4_k_4rows(caps, row_refs, qk_act),
+                    _ => dot_q6_k_4rows(caps, row_refs, qk_act),
+                };
+                for (slot, add) in quad.iter_mut().zip(sums) {
+                    *slot += add;
+                }
+                processed += 4;
+            }
+        }
+        for (local, slot) in dst[processed..].iter_mut().enumerate() {
+            let off = (start_row + processed + local) * row_bytes;
+            let row = &bytes[off..off + row_bytes];
+            *slot += match ggml_type {
+                8 => dot_q8_0_row(caps, row, q8_act),
+                12 => dot_q4_k_row(caps, row, qk_act),
+                _ => dot_q6_k_row(caps, row, qk_act),
+            };
+        }
+    }
+
+    pub(super) fn dispatch_packed_quant_kernels(
+        ggml_type: u32,
+        bytes: &[u8],
+        in_dim: usize,
+        input: &[f32],
+        worker_count: usize,
+        out: &mut [f32],
+    ) -> bool {
+        if !matches!(ggml_type, 8 | 12 | 14) {
+            return false;
+        }
+        let caps = Arm64QuantCaps::detect();
+        if !caps.dotprod {
+            return false;
+        }
+        if ggml_type == 8 {
+            with_q8_0_act(input, |act| {
+                run_row_chunks_aligned(out, worker_count, 4, |start_row, dst| {
+                    add_packed_rows(8, bytes, in_dim, caps, act, &[], start_row, dst);
+                });
+            });
+        } else {
+            with_q8_k_act(input, |act| {
+                run_row_chunks_aligned(out, worker_count, 4, |start_row, dst| {
+                    add_packed_rows(ggml_type, bytes, in_dim, caps, &[], act, start_row, dst);
+                });
+            });
+        }
+        true
+    }
+
+    pub(super) fn add_repacked_rows(
+        bytes: &[u8],
+        in_dim: usize,
+        caps: Arm64QuantCaps,
+        qk_act: &[Q8_KActBlock],
+        start_row: usize,
+        dst: &mut [f32],
+    ) {
+        let strip_bytes = (in_dim / QK_K) * Q4_K_REPACK8_BLOCK_BYTES;
+        let mut idx = 0_usize;
+        while idx < dst.len() {
+            let abs_row = start_row + idx;
+            let strip_idx = abs_row / 8;
+            let lane = abs_row % 8;
+            let strip = &bytes[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
+            let vals = dot_q4_k_repacked8(caps, strip, qk_act);
+            let take = (8 - lane).min(dst.len() - idx);
+            for k in 0..take {
+                dst[idx + k] += vals[lane + k];
+            }
+            idx += take;
+        }
+    }
+
+    pub(super) fn dispatch_repacked_q4_k(
+        bytes: &[u8],
+        in_dim: usize,
+        input: &[f32],
+        worker_count: usize,
+        out: &mut [f32],
+    ) -> bool {
+        let caps = Arm64QuantCaps::detect();
+        if !caps.dotprod {
+            return false;
+        }
+        with_q8_k_act(input, |act| {
+            run_row_chunks_aligned(out, worker_count, 8, |start_row, dst| {
+                add_repacked_rows(bytes, in_dim, caps, act, start_row, dst);
+            });
+        });
+        true
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) enum GroupKind<'a> {
+        Packed { ggml_type: u32, bytes: &'a [u8] },
+        Repacked(&'a [u8]),
+    }
+
+    pub(super) fn classify_group_proj(proj: &LinearProjection) -> Option<GroupKind<'_>> {
+        if let Some((ggml_type, bytes)) = proj.weight.packed_slice()
+            && matches!(ggml_type, 8 | 12 | 14)
+        {
+            return Some(GroupKind::Packed { ggml_type, bytes });
+        }
+        if let WeightQuantization::RepackedQ4K8 { bytes } = &proj.weight {
+            return Some(GroupKind::Repacked(bytes));
+        }
+        None
+    }
+
+    pub(super) fn dispatch_batch_quant_kernels(
+        proj: &LinearProjection,
+        inputs: &[f32],
+        seq_len: usize,
+        worker_count: usize,
+        out: &mut [f32],
+    ) -> std::io::Result<bool> {
+        let caps = Arm64QuantCaps::detect();
+        if !caps.dotprod {
+            return Ok(false);
+        }
+        let Some(kind) = classify_group_proj(proj) else {
+            return Ok(false);
+        };
+        let in_dim = proj.in_dim;
+        let out_dim = proj.out_dim;
+        let mut transposed = vec![0.0_f32; out_dim * seq_len];
+        if let Some(bias) = &proj.bias {
+            for (r, row) in transposed.chunks_exact_mut(seq_len).enumerate() {
+                row.fill(bias[r]);
+            }
+        }
+        let worker_count = worker_count.clamp(1, 18).min(out_dim.max(1));
+
+        match kind {
+            GroupKind::Packed {
+                ggml_type: 8,
+                bytes,
+            } => {
+                let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
+                let row_bytes = blocks_per_tok * Q8_0_BLOCK_BYTES;
+                let mut acts = vec![Q8_0ActBlock::default(); seq_len * blocks_per_tok];
+                for t in 0..seq_len {
+                    quantize_row_q8_0(
+                        &inputs[t * in_dim..(t + 1) * in_dim],
+                        &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+                    );
+                }
+                let align = 4 * seq_len;
+                run_row_chunks_aligned(&mut transposed, worker_count, align, |flat_off, dst| {
+                    let start_row = flat_off / seq_len;
+                    let rows_here = dst.len() / seq_len;
+                    let mut processed = 0_usize;
+                    while processed + 4 <= rows_here {
+                        let r0 = (start_row + processed) * row_bytes;
+                        let row_refs = [
+                            &bytes[r0..r0 + row_bytes],
+                            &bytes[r0 + row_bytes..r0 + 2 * row_bytes],
+                            &bytes[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
+                            &bytes[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
+                        ];
+                        let mut t = 0_usize;
+                        while t + 1 < seq_len {
+                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                            let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
+                            let tile = gemm_q8_0_4x2(caps, row_refs, a0, a1);
+                            for r in 0..4 {
+                                let base = (processed + r) * seq_len + t;
+                                dst[base] += tile[r][0];
+                                dst[base + 1] += tile[r][1];
+                            }
+                            t += 2;
+                        }
+                        if t < seq_len {
+                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                            let col = dot_q8_0_4rows(caps, row_refs, a0);
+                            for r in 0..4 {
+                                dst[(processed + r) * seq_len + t] += col[r];
+                            }
+                        }
+                        processed += 4;
+                    }
+                    for local_r in processed..rows_here {
+                        let off = (start_row + local_r) * row_bytes;
+                        let w_row = &bytes[off..off + row_bytes];
+                        let base = local_r * seq_len;
+                        for t in 0..seq_len {
+                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                            dst[base + t] += dot_q8_0_row(caps, w_row, a0);
+                        }
+                    }
+                });
+            }
+            GroupKind::Packed { ggml_type, bytes } => {
+                let blocks_per_tok = in_dim / QK_K;
+                let elem_bytes = if ggml_type == 12 {
+                    Q4_K_BLOCK_BYTES
+                } else {
+                    Q6_K_BLOCK_BYTES
+                };
+                let row_bytes = blocks_per_tok * elem_bytes;
+                let mut acts = vec![Q8_KActBlock::default(); seq_len * blocks_per_tok];
+                for t in 0..seq_len {
+                    quantize_row_q8_k(
+                        &inputs[t * in_dim..(t + 1) * in_dim],
+                        &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+                    );
+                }
+                let align = 4 * seq_len;
+                run_row_chunks_aligned(&mut transposed, worker_count, align, |flat_off, dst| {
+                    let start_row = flat_off / seq_len;
+                    let rows_here = dst.len() / seq_len;
+                    let mut processed = 0_usize;
+                    while processed + 4 <= rows_here {
+                        let r0 = (start_row + processed) * row_bytes;
+                        let row_refs = [
+                            &bytes[r0..r0 + row_bytes],
+                            &bytes[r0 + row_bytes..r0 + 2 * row_bytes],
+                            &bytes[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
+                            &bytes[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
+                        ];
+                        let mut t = 0_usize;
+                        while t + 1 < seq_len {
+                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                            let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
+                            let tile = if ggml_type == 12 {
+                                gemm_q4_k_4x2(caps, row_refs, a0, a1)
+                            } else {
+                                gemm_q6_k_4x2(caps, row_refs, a0, a1)
+                            };
+                            for r in 0..4 {
+                                let base = (processed + r) * seq_len + t;
+                                dst[base] += tile[r][0];
+                                dst[base + 1] += tile[r][1];
+                            }
+                            t += 2;
+                        }
+                        if t < seq_len {
+                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                            let col = if ggml_type == 12 {
+                                dot_q4_k_4rows(caps, row_refs, a0)
+                            } else {
+                                dot_q6_k_4rows(caps, row_refs, a0)
+                            };
+                            for r in 0..4 {
+                                dst[(processed + r) * seq_len + t] += col[r];
+                            }
+                        }
+                        processed += 4;
+                    }
+                    for local_r in processed..rows_here {
+                        let off = (start_row + local_r) * row_bytes;
+                        let w_row = &bytes[off..off + row_bytes];
+                        let base = local_r * seq_len;
+                        for t in 0..seq_len {
+                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                            dst[base + t] += if ggml_type == 12 {
+                                dot_q4_k_row(caps, w_row, a0)
+                            } else {
+                                dot_q6_k_row(caps, w_row, a0)
+                            };
+                        }
+                    }
+                });
+            }
+            GroupKind::Repacked(bytes) => {
+                let blocks_per_tok = in_dim / QK_K;
+                let strip_bytes = blocks_per_tok * Q4_K_REPACK8_BLOCK_BYTES;
+                let mut acts = vec![Q8_KActBlock::default(); seq_len * blocks_per_tok];
+                for t in 0..seq_len {
+                    quantize_row_q8_k(
+                        &inputs[t * in_dim..(t + 1) * in_dim],
+                        &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+                    );
+                }
+                let align = 8 * seq_len;
+                run_row_chunks_aligned(&mut transposed, worker_count, align, |flat_off, dst| {
+                    let start_row = flat_off / seq_len;
+                    let strips_here = (dst.len() / seq_len) / 8;
+                    for s in 0..strips_here {
+                        let strip_idx = (start_row / 8) + s;
+                        let strip = &bytes[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
+                        let row_base = s * 8;
+                        let mut t = 0_usize;
+                        while t + 1 < seq_len {
+                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                            let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
+                            let tile = gemm_q4_k_repacked8_8x2(caps, strip, a0, a1);
+                            for r in 0..8 {
+                                let base = (row_base + r) * seq_len + t;
+                                dst[base] += tile[r][0];
+                                dst[base + 1] += tile[r][1];
+                            }
+                            t += 2;
+                        }
+                        if t < seq_len {
+                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                            let col = dot_q4_k_repacked8(caps, strip, a0);
+                            for r in 0..8 {
+                                dst[(row_base + r) * seq_len + t] += col[r];
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        for r in 0..out_dim {
+            let row = &transposed[r * seq_len..(r + 1) * seq_len];
+            for (t, &val) in row.iter().enumerate() {
+                out[t * out_dim + r] = val;
+            }
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(windows)]
+use quant_dispatch::{
+    dispatch_batch_quant_kernels, dispatch_packed_quant_kernels, dispatch_repacked_q4_k,
+};
+
+#[cfg(windows)]
+fn run_row_chunks_aligned<F>(out: &mut [f32], worker_count: usize, alignment: usize, compute: F)
+where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    row_workers::run_aligned(out, worker_count, alignment, &compute);
+}
+
+fn forward_group_into(
+    targets: &mut [(
+        &LinearProjection,
+        Option<&LoraProjectionPatch>,
+        &mut Vec<f32>,
+    )],
+    input: &[f32],
+    threads: usize,
+) -> io::Result<()> {
+    if !(1..=256).contains(&threads) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid CPU worker count.",
+        ));
+    }
+    let mut total_out = 0_usize;
+    for (proj, lora, out) in targets.iter_mut() {
+        let _layout = projection_layout::validate(proj.in_dim, proj.out_dim, &proj.weight)?;
+        if input.len() != proj.in_dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Projection input dimension mismatch.",
+            ));
+        }
+        if let Some(bias) = &proj.bias
+            && bias.len() != proj.out_dim
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Projection bias length mismatch.",
+            ));
+        }
+        if let Some(patch) = *lora {
+            patch.validate(proj.in_dim, proj.out_dim)?;
+        }
+        out.resize(proj.out_dim, 0.0);
+        total_out = total_out.saturating_add(proj.out_dim);
+    }
+
+    #[cfg(windows)]
+    if threads > 1 && total_out >= 8 {
+        let caps = bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect();
+        let all_packed = caps.dotprod
+            && targets
+                .iter()
+                .all(|(p, _, _)| quant_dispatch::classify_group_proj(p).is_some());
+        if all_packed {
+            struct Segment<'a> {
+                start: usize,
+                len: usize,
+                in_dim: usize,
+                kind: quant_dispatch::GroupKind<'a>,
+            }
+            let mut combined = vec![0.0_f32; total_out];
+            let mut segments = Vec::with_capacity(targets.len());
+            let mut need_q8 = false;
+            let mut need_qk = false;
+            let mut cursor = 0_usize;
+            for (proj, _, _) in targets.iter() {
+                let Some(kind) = quant_dispatch::classify_group_proj(proj) else {
+                    break;
+                };
+                match kind {
+                    quant_dispatch::GroupKind::Packed { ggml_type: 8, .. } => need_q8 = true,
+                    _ => need_qk = true,
+                }
+                if let Some(bias) = &proj.bias {
+                    combined[cursor..cursor + proj.out_dim].copy_from_slice(bias);
+                }
+                segments.push(Segment {
+                    start: cursor,
+                    len: proj.out_dim,
+                    in_dim: proj.in_dim,
+                    kind,
+                });
+                cursor += proj.out_dim;
+            }
+            if segments.len() == targets.len() {
+                let q8_opt = need_q8.then(|| {
+                    let blocks = input.len() / 32;
+                    let mut buf = vec![
+                        bonsai_windows_process::quant_kernels::Q8_0ActBlock::default(
+                        );
+                        blocks
+                    ];
+                    bonsai_windows_process::quant_kernels::quantize_row_q8_0(input, &mut buf);
+                    buf
+                });
+                let qk_opt = need_qk.then(|| {
+                    let blocks = input.len() / 256;
+                    let mut buf = vec![
+                        bonsai_windows_process::quant_kernels::Q8_KActBlock::default(
+                        );
+                        blocks
+                    ];
+                    bonsai_windows_process::quant_kernels::quantize_row_q8_k(input, &mut buf);
+                    buf
+                });
+                let q8_slice = q8_opt.as_deref().unwrap_or(&[]);
+                let qk_slice = qk_opt.as_deref().unwrap_or(&[]);
+                let alignment = if segments.iter().all(|s| s.len.is_multiple_of(8)) {
+                    8
+                } else if segments.iter().all(|s| s.len.is_multiple_of(4)) {
+                    4
+                } else {
+                    1
+                };
+                let workers = threads.clamp(1, 18).min(total_out);
+                run_row_chunks_aligned(&mut combined, workers, alignment, |global_row, dst| {
+                    let chunk_end = global_row + dst.len();
+                    for seg in &segments {
+                        let seg_end = seg.start + seg.len;
+                        let ov_start = global_row.max(seg.start);
+                        let ov_end = chunk_end.min(seg_end);
+                        if ov_start >= ov_end {
+                            continue;
+                        }
+                        let dst_slice = &mut dst[ov_start - global_row..ov_end - global_row];
+                        let local_row = ov_start - seg.start;
+                        match seg.kind {
+                            quant_dispatch::GroupKind::Packed { ggml_type, bytes } => {
+                                quant_dispatch::add_packed_rows(
+                                    ggml_type, bytes, seg.in_dim, caps, q8_slice, qk_slice,
+                                    local_row, dst_slice,
+                                );
+                            }
+                            quant_dispatch::GroupKind::Repacked(bytes) => {
+                                quant_dispatch::add_repacked_rows(
+                                    bytes, seg.in_dim, caps, qk_slice, local_row, dst_slice,
+                                );
+                            }
+                        }
+                    }
+                });
+                let mut offset = 0_usize;
+                for (proj, lora, out) in targets.iter_mut() {
+                    let len = proj.out_dim;
+                    out.copy_from_slice(&combined[offset..offset + len]);
+                    if let Some(patch) = *lora {
+                        patch.apply(input, out)?;
+                    }
+                    offset += len;
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    for (proj, lora, out) in targets.iter_mut() {
+        proj.forward_vec_into(input, None, *lora, threads, out)?;
+    }
+    Ok(())
 }
 
 fn run_row_chunks<F>(out: &mut [f32], worker_count: usize, compute_slice: F)
@@ -1328,12 +2073,70 @@ pub struct QwenDecoderLayer {
 /// Per-layer KV cache storing past key/value vectors (`[seq_len, num_kv_heads * head_dim]`).
 #[derive(Clone, Debug, Default)]
 pub struct LayerKvCache {
-    /// Cached keys `[seq_len * num_kv_heads * head_dim]`.
-    pub k: Vec<f32>,
-    /// Cached values `[seq_len * num_kv_heads * head_dim]`.
-    pub v: Vec<f32>,
+    /// Cached `F16` keys (`[seq_len * num_kv_heads * head_dim]`).
+    pub k: Vec<u16>,
+    /// Cached `F16` values (`[seq_len * num_kv_heads * head_dim]`).
+    pub v: Vec<u16>,
     /// Number of cached token positions.
     pub seq_len: usize,
+}
+
+/// Widen `IEEE binary16` `u16` elements into `f32` (`dst.len() == src.len()`), using ARM64 `FCVTL`
+/// on Windows when available.
+pub(crate) fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
+    let count = src.len().min(dst.len());
+    #[cfg(windows)]
+    {
+        let mut idx = 0_usize;
+        for (chunk, out_chunk) in src[..count]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(dst[..count].as_chunks_mut::<8>().0.iter_mut())
+        {
+            let [lo, hi] = bonsai_windows_process::quant_kernels::widen_f16_eight(chunk);
+            out_chunk[..4].copy_from_slice(&lo);
+            out_chunk[4..].copy_from_slice(&hi);
+            idx += 8;
+        }
+        if idx + 4 <= count {
+            let chunk = [src[idx], src[idx + 1], src[idx + 2], src[idx + 3]];
+            let widened = bonsai_windows_process::quant_kernels::widen_f16_four(&chunk);
+            dst[idx..idx + 4].copy_from_slice(&widened);
+            idx += 4;
+        }
+        for i in idx..count {
+            dst[i] = crate::weights::half(&src[i].to_le_bytes());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        for (s, d) in src[..count].iter().zip(dst[..count].iter_mut()) {
+            *d = crate::weights::half(&s.to_le_bytes());
+        }
+    }
+}
+
+/// Narrow `f32` values into `IEEE binary16` `u16` bits (`dst.len() == src.len()`), returning
+/// `false` if any input is non-finite or overflows binary16 range (`|x| >= 65520`).
+pub(crate) fn narrow_f32_slice(src: &[f32], dst: &mut [u16]) -> bool {
+    if src.len() != dst.len() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        bonsai_windows_process::quant_kernels::narrow_f32_slice_to_f16(src, dst)
+    }
+    #[cfg(not(windows))]
+    {
+        for (&val, slot) in src.iter().zip(dst.iter_mut()) {
+            if !val.is_finite() || val.abs() >= 65_520.0 {
+                return false;
+            }
+            *slot = half::f16::from_f32(val).to_bits();
+        }
+        true
+    }
 }
 
 impl QwenDecoderLayer {
@@ -1544,27 +2347,56 @@ impl QwenDecoderLayer {
             })
         };
 
-        self.q_proj.forward_vec_into(
-            h_norm,
-            qkv_fold_for(q_sig),
-            patch(&self.q_proj),
-            workers,
-            q,
-        )?;
-        self.k_proj.forward_vec_into(
-            h_norm,
-            qkv_fold_for(k_sig),
-            patch(&self.k_proj),
-            workers,
-            k,
-        )?;
-        self.v_proj.forward_vec_into(
-            h_norm,
-            qkv_fold_for(v_sig),
-            patch(&self.v_proj),
-            workers,
-            v,
-        )?;
+        if shared_qkv_folded.is_none()
+            && !matches!(
+                self.q_proj.weight,
+                WeightQuantization::PQ2_0 { .. } | WeightQuantization::PTQ1_0 { .. }
+            )
+            && !matches!(
+                self.k_proj.weight,
+                WeightQuantization::PQ2_0 { .. } | WeightQuantization::PTQ1_0 { .. }
+            )
+            && !matches!(
+                self.v_proj.weight,
+                WeightQuantization::PQ2_0 { .. } | WeightQuantization::PTQ1_0 { .. }
+            )
+        {
+            LinearProjection::forward_triple_into(
+                &self.q_proj,
+                &self.k_proj,
+                &self.v_proj,
+                h_norm,
+                patch(&self.q_proj),
+                patch(&self.k_proj),
+                patch(&self.v_proj),
+                workers,
+                q,
+                k,
+                v,
+            )?;
+        } else {
+            self.q_proj.forward_vec_into(
+                h_norm,
+                qkv_fold_for(q_sig),
+                patch(&self.q_proj),
+                workers,
+                q,
+            )?;
+            self.k_proj.forward_vec_into(
+                h_norm,
+                qkv_fold_for(k_sig),
+                patch(&self.k_proj),
+                workers,
+                k,
+            )?;
+            self.v_proj.forward_vec_into(
+                h_norm,
+                qkv_fold_for(v_sig),
+                patch(&self.v_proj),
+                workers,
+                v,
+            )?;
+        }
 
         for h in 0..num_q_heads {
             rms_norm_in_place(
@@ -1610,78 +2442,20 @@ impl QwenDecoderLayer {
         attn_out.fill(0.0);
         let level = Level::new();
 
-        if gqa_ratio > 1 && gqa_ratio <= 8 {
-            decoder_workspace::resize(scores, gqa_ratio * total_seq)?;
-            dispatch!(level, simd => {
-                for kvh in 0..num_kv_heads {
-                    let kv_head_off = kvh * head_dim;
-                    let qh_base = kvh * gqa_ratio;
-                    let mut max_scores = [f32::NEG_INFINITY; 8];
-                    for t in 0..total_seq {
-                        let k_vec = &kv.k[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
-                        for (g, max_slot) in max_scores[..gqa_ratio].iter_mut().enumerate() {
-                            let qh = qh_base + g;
-                            let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
-                            let s = f32_dot_simd(simd, q_vec, k_vec) * scale;
-                            scores[g * total_seq + t] = s;
-                            if s > *max_slot {
-                                *max_slot = s;
-                            }
-                        }
-                    }
-                    let mut inv_sums = [0.0_f32; 8];
-                    for g in 0..gqa_ratio {
-                        let max_score = max_scores[g];
-                        let mut sum_exp = 0.0_f32;
-                        for s in &mut scores[g * total_seq..(g + 1) * total_seq] {
-                            *s = (*s - max_score).exp();
-                            sum_exp += *s;
-                        }
-                        inv_sums[g] = 1.0_f32 / sum_exp.max(1e-12_f32);
-                    }
-                    for t in 0..total_seq {
-                        let v_vec = &kv.v[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
-                        for (g, &inv_sum) in inv_sums[..gqa_ratio].iter().enumerate() {
-                            let qh = qh_base + g;
-                            let w = scores[g * total_seq + t] * inv_sum;
-                            let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
-                            axpy_simd(simd, w, v_vec, out_head);
-                        }
-                    }
-                }
-            });
-        } else {
-            decoder_workspace::resize(scores, total_seq)?;
-            dispatch!(level, simd => {
-                for qh in 0..num_q_heads {
-                    let kvh = qh / gqa_ratio;
-                    let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
-                    let mut max_score = f32::NEG_INFINITY;
-                    for (t, score_slot) in scores.iter_mut().enumerate() {
-                        let k_vec = &kv.k
-                            [t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
-                        let s = f32_dot_simd(simd, q_vec, k_vec) * scale;
-                        *score_slot = s;
-                        if s > max_score {
-                            max_score = s;
-                        }
-                    }
-                    let mut sum_exp = 0.0_f32;
-                    for s in &mut *scores {
-                        *s = (*s - max_score).exp();
-                        sum_exp += *s;
-                    }
-                    let inv_sum = 1.0_f32 / sum_exp.max(1e-12_f32);
-                    let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
-                    for (t, &prob_unnorm) in scores.iter().enumerate() {
-                        let w = prob_unnorm * inv_sum;
-                        let v_vec = &kv.v
-                            [t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
-                        axpy_simd(simd, w, v_vec, out_head);
-                    }
-                }
-            });
-        }
+        attend_query_f16(
+            level,
+            q,
+            kv,
+            total_seq,
+            kv_stride,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            gqa_ratio,
+            scale,
+            scores,
+            attn_out,
+        )?;
 
         self.o_proj
             .forward_vec_into(attn_out, None, patch(&self.o_proj), workers, projected)?;
@@ -1700,20 +2474,42 @@ impl QwenDecoderLayer {
         } else {
             None
         };
-        self.gate_proj.forward_vec_into(
-            h_norm,
-            shared_ffn_folded.as_deref(),
-            patch(&self.gate_proj),
-            workers,
-            gate,
-        )?;
-        self.up_proj.forward_vec_into(
-            h_norm,
-            shared_ffn_folded.as_deref(),
-            patch(&self.up_proj),
-            workers,
-            up,
-        )?;
+        if shared_ffn_folded.is_none()
+            && !matches!(
+                self.gate_proj.weight,
+                WeightQuantization::PQ2_0 { .. } | WeightQuantization::PTQ1_0 { .. }
+            )
+            && !matches!(
+                self.up_proj.weight,
+                WeightQuantization::PQ2_0 { .. } | WeightQuantization::PTQ1_0 { .. }
+            )
+        {
+            LinearProjection::forward_pair_into(
+                &self.gate_proj,
+                &self.up_proj,
+                h_norm,
+                patch(&self.gate_proj),
+                patch(&self.up_proj),
+                workers,
+                gate,
+                up,
+            )?;
+        } else {
+            self.gate_proj.forward_vec_into(
+                h_norm,
+                shared_ffn_folded.as_deref(),
+                patch(&self.gate_proj),
+                workers,
+                gate,
+            )?;
+            self.up_proj.forward_vec_into(
+                h_norm,
+                shared_ffn_folded.as_deref(),
+                patch(&self.up_proj),
+                workers,
+                up,
+            )?;
+        }
         for (g, &u) in gate.iter_mut().zip(up.iter()) {
             let silu = *g / (1.0_f32 + (-*g).exp());
             *g = silu * u;
@@ -1731,6 +2527,447 @@ impl QwenDecoderLayer {
         output.copy_from_slice(x_res);
         Ok(())
     }
+
+    /// Evaluate `seq_len` causal prompt tokens in batched GEMM mode (`seq_len >= 1`).
+    ///
+    /// When `final_ffn_last_only` is `true`, only the last token (`seq_len - 1`) executes the
+    /// MLP/SwiGLU block because downstream logits read only that final hidden vector.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "Batched prefill executes GEMM QKV/O/FFN, causal RoPE/attention, and atomic KV commits."
+    )]
+    pub(crate) fn forward_batch_into(
+        &self,
+        inputs: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        rms_eps: f32,
+        kv: &mut LayerKvCache,
+        adapter: Option<&TalkerLoraAdapter>,
+        workers: usize,
+        final_ffn_last_only: bool,
+        output: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        let invalid_geometry =
+            || io::Error::new(io::ErrorKind::InvalidInput, "Invalid GQA geometry.");
+        if !(1..=256).contains(&workers) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid CPU worker count.",
+            ));
+        }
+        if seq_len == 0 {
+            return Err(invalid_geometry());
+        }
+        let hidden = self.attn_norm_w.len();
+        if hidden == 0
+            || inputs.len() != seq_len.checked_mul(hidden).ok_or_else(invalid_geometry)?
+        {
+            return Err(invalid_geometry());
+        }
+        if seq_len == 1 {
+            output.resize(hidden, 0.0);
+            let mut ws = decoder_workspace::DecoderWorkspace::default();
+            return self.forward_step_into(
+                inputs,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                rope_theta,
+                rms_eps,
+                kv,
+                adapter,
+                workers,
+                &mut ws,
+                output,
+            );
+        }
+        let Some(query_width) = num_q_heads.checked_mul(head_dim) else {
+            return Err(invalid_geometry());
+        };
+        let Some(kv_width) = num_kv_heads.checked_mul(head_dim) else {
+            return Err(invalid_geometry());
+        };
+        if num_q_heads == 0
+            || num_kv_heads == 0
+            || head_dim == 0
+            || !head_dim.is_multiple_of(2)
+            || !num_q_heads.is_multiple_of(num_kv_heads)
+            || rope_theta <= 0.0
+            || rms_eps <= 0.0
+            || self.ffn_norm_w.len() != hidden
+            || self.q_norm_w.len() != head_dim
+            || self.k_norm_w.len() != head_dim
+            || self.q_proj.in_dim != hidden
+            || self.q_proj.out_dim != query_width
+            || self.k_proj.in_dim != hidden
+            || self.k_proj.out_dim != kv_width
+            || self.v_proj.in_dim != hidden
+            || self.v_proj.out_dim != kv_width
+            || self.o_proj.in_dim != query_width
+            || self.o_proj.out_dim != hidden
+            || self.gate_proj.in_dim != hidden
+            || self.up_proj.in_dim != hidden
+            || self.gate_proj.out_dim == 0
+            || self.gate_proj.out_dim != self.up_proj.out_dim
+            || self.down_proj.in_dim != self.gate_proj.out_dim
+            || self.down_proj.out_dim != hidden
+            || kv.seq_len.checked_mul(kv_width) != Some(kv.k.len())
+            || kv.k.len() != kv.v.len()
+        {
+            return Err(invalid_geometry());
+        }
+
+        struct KvBatchGuard<'a> {
+            kv: &'a mut LayerKvCache,
+            orig_k: usize,
+            orig_v: usize,
+            orig_seq: usize,
+            committed: bool,
+        }
+        impl Drop for KvBatchGuard<'_> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    self.kv.k.truncate(self.orig_k);
+                    self.kv.v.truncate(self.orig_v);
+                    self.kv.seq_len = self.orig_seq;
+                }
+            }
+        }
+
+        let initial_seq = kv.seq_len;
+        let next_seq = initial_seq
+            .checked_add(seq_len)
+            .ok_or_else(invalid_geometry)?;
+        let append_elems = seq_len.checked_mul(kv_width).ok_or_else(invalid_geometry)?;
+        let orig_k = kv.k.len();
+        let orig_v = kv.v.len();
+        kv.k.try_reserve(append_elems).map_err(io::Error::other)?;
+        kv.v.try_reserve(append_elems).map_err(io::Error::other)?;
+        let mut guard = KvBatchGuard {
+            kv,
+            orig_k,
+            orig_v,
+            orig_seq: initial_seq,
+            committed: false,
+        };
+
+        let mut h_norm = vec![0.0_f32; seq_len * hidden];
+        let mut row_norm = Vec::with_capacity(hidden);
+        for t in 0..seq_len {
+            rms_norm_into(
+                &inputs[t * hidden..(t + 1) * hidden],
+                &self.attn_norm_w,
+                rms_eps,
+                &mut row_norm,
+            )?;
+            h_norm[t * hidden..(t + 1) * hidden].copy_from_slice(&row_norm);
+        }
+
+        let patch = |proj: &LinearProjection| adapter.and_then(|a| a.patches.get(&proj.name));
+        let mut q_all = Vec::new();
+        let mut k_all = Vec::new();
+        let mut v_all = Vec::new();
+        self.q_proj.forward_batch_into(
+            &h_norm,
+            seq_len,
+            patch(&self.q_proj),
+            workers,
+            &mut q_all,
+        )?;
+        self.k_proj.forward_batch_into(
+            &h_norm,
+            seq_len,
+            patch(&self.k_proj),
+            workers,
+            &mut k_all,
+        )?;
+        self.v_proj.forward_batch_into(
+            &h_norm,
+            seq_len,
+            patch(&self.v_proj),
+            workers,
+            &mut v_all,
+        )?;
+
+        let half = head_dim / 2;
+        let mut cos_buf = vec![0.0_f32; half];
+        let mut sin_buf = vec![0.0_f32; half];
+        for t in 0..seq_len {
+            let q_tok = &mut q_all[t * query_width..(t + 1) * query_width];
+            for h in 0..num_q_heads {
+                rms_norm_in_place(
+                    &mut q_tok[h * head_dim..(h + 1) * head_dim],
+                    &self.q_norm_w,
+                    rms_eps,
+                )?;
+            }
+            let k_tok = &mut k_all[t * kv_width..(t + 1) * kv_width];
+            for h in 0..num_kv_heads {
+                rms_norm_in_place(
+                    &mut k_tok[h * head_dim..(h + 1) * head_dim],
+                    &self.k_norm_w,
+                    rms_eps,
+                )?;
+            }
+            compute_rope_tables(
+                head_dim,
+                initial_seq + t,
+                rope_theta,
+                &mut cos_buf,
+                &mut sin_buf,
+            );
+            apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, &cos_buf, &sin_buf);
+            apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, &cos_buf, &sin_buf);
+        }
+
+        guard.kv.k.resize(orig_k + append_elems, 0);
+        guard.kv.v.resize(orig_v + append_elems, 0);
+        if !narrow_f32_slice(&k_all, &mut guard.kv.k[orig_k..])
+            || !narrow_f32_slice(&v_all, &mut guard.kv.v[orig_v..])
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Batched KV activation exceeds finite IEEE binary16 range.",
+            ));
+        }
+        guard.kv.seq_len = next_seq;
+
+        let level = Level::new();
+        let gqa_ratio = num_q_heads / num_kv_heads;
+        let scale = 1.0_f32 / usize_to_f32(head_dim).sqrt();
+        let mut attn_seq = vec![0.0_f32; seq_len * query_width];
+        let mut scores = Vec::new();
+        for t in 0..seq_len {
+            let q_tok = &q_all[t * query_width..(t + 1) * query_width];
+            let out_tok = &mut attn_seq[t * query_width..(t + 1) * query_width];
+            attend_query_f16(
+                level,
+                q_tok,
+                guard.kv,
+                initial_seq + t + 1,
+                kv_width,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                gqa_ratio,
+                scale,
+                &mut scores,
+                out_tok,
+            )?;
+        }
+
+        let mut projected = Vec::new();
+        self.o_proj.forward_batch_into(
+            &attn_seq,
+            seq_len,
+            patch(&self.o_proj),
+            workers,
+            &mut projected,
+        )?;
+        output.resize(inputs.len(), 0.0);
+        for ((dst, &inp), &proj) in output.iter_mut().zip(inputs).zip(&projected) {
+            *dst = inp + proj;
+        }
+
+        if final_ffn_last_only {
+            let last_start = (seq_len - 1) * hidden;
+            rms_norm_into(
+                &output[last_start..],
+                &self.ffn_norm_w,
+                rms_eps,
+                &mut row_norm,
+            )?;
+            let mut gate = Vec::new();
+            let mut up = Vec::new();
+            LinearProjection::forward_pair_into(
+                &self.gate_proj,
+                &self.up_proj,
+                &row_norm,
+                patch(&self.gate_proj),
+                patch(&self.up_proj),
+                workers,
+                &mut gate,
+                &mut up,
+            )?;
+            for (g, &u) in gate.iter_mut().zip(up.iter()) {
+                let silu = *g / (1.0_f32 + (-*g).exp());
+                *g = silu * u;
+            }
+            self.down_proj.forward_vec_into(
+                &gate,
+                None,
+                patch(&self.down_proj),
+                workers,
+                &mut projected,
+            )?;
+            for (dst, &val) in output[last_start..].iter_mut().zip(&projected) {
+                *dst += val;
+            }
+        } else {
+            for t in 0..seq_len {
+                rms_norm_into(
+                    &output[t * hidden..(t + 1) * hidden],
+                    &self.ffn_norm_w,
+                    rms_eps,
+                    &mut row_norm,
+                )?;
+                h_norm[t * hidden..(t + 1) * hidden].copy_from_slice(&row_norm);
+            }
+            let mut gate_all = Vec::new();
+            let mut up_all = Vec::new();
+            self.gate_proj.forward_batch_into(
+                &h_norm,
+                seq_len,
+                patch(&self.gate_proj),
+                workers,
+                &mut gate_all,
+            )?;
+            self.up_proj.forward_batch_into(
+                &h_norm,
+                seq_len,
+                patch(&self.up_proj),
+                workers,
+                &mut up_all,
+            )?;
+            for (g, &u) in gate_all.iter_mut().zip(up_all.iter()) {
+                let silu = *g / (1.0_f32 + (-*g).exp());
+                *g = silu * u;
+            }
+            self.down_proj.forward_batch_into(
+                &gate_all,
+                seq_len,
+                patch(&self.down_proj),
+                workers,
+                &mut projected,
+            )?;
+            for (dst, &val) in output.iter_mut().zip(&projected) {
+                *dst += val;
+            }
+        }
+
+        if output.iter().any(|v| !v.is_finite()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Nonfinite speech batched decoder output.",
+            ));
+        }
+        guard.committed = true;
+        Ok(())
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared F16 KV attention kernel used by both single-step decode and batched prefill."
+)]
+fn attend_query_f16(
+    level: Level,
+    q: &[f32],
+    kv: &LayerKvCache,
+    total_seq: usize,
+    kv_stride: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    gqa_ratio: usize,
+    scale: f32,
+    scores: &mut Vec<f32>,
+    attn_out: &mut [f32],
+) -> io::Result<()> {
+    let mut stack_buf = [0.0_f32; 256];
+    let mut heap_buf = if head_dim > stack_buf.len() {
+        vec![0.0_f32; head_dim]
+    } else {
+        Vec::new()
+    };
+    let head_buf: &mut [f32] = if head_dim <= stack_buf.len() {
+        &mut stack_buf[..head_dim]
+    } else {
+        &mut heap_buf[..head_dim]
+    };
+
+    if gqa_ratio > 1 && gqa_ratio <= 8 {
+        decoder_workspace::resize(scores, gqa_ratio * total_seq)?;
+        dispatch!(level, simd => {
+            for kvh in 0..num_kv_heads {
+                let kv_head_off = kvh * head_dim;
+                let qh_base = kvh * gqa_ratio;
+                let mut max_scores = [f32::NEG_INFINITY; 8];
+                for t in 0..total_seq {
+                    let k_bits = &kv.k[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
+                    widen_f16_slice(k_bits, head_buf);
+                    for (g, max_slot) in max_scores[..gqa_ratio].iter_mut().enumerate() {
+                        let qh = qh_base + g;
+                        let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
+                        let s = f32_dot_simd(simd, q_vec, head_buf) * scale;
+                        scores[g * total_seq + t] = s;
+                        if s > *max_slot {
+                            *max_slot = s;
+                        }
+                    }
+                }
+                let mut inv_sums = [0.0_f32; 8];
+                for g in 0..gqa_ratio {
+                    let max_score = max_scores[g];
+                    let mut sum_exp = 0.0_f32;
+                    for s in &mut scores[g * total_seq..(g + 1) * total_seq] {
+                        *s = (*s - max_score).exp();
+                        sum_exp += *s;
+                    }
+                    inv_sums[g] = 1.0_f32 / sum_exp.max(1e-12_f32);
+                }
+                for t in 0..total_seq {
+                    let v_bits = &kv.v[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
+                    widen_f16_slice(v_bits, head_buf);
+                    for (g, &inv_sum) in inv_sums[..gqa_ratio].iter().enumerate() {
+                        let qh = qh_base + g;
+                        let w = scores[g * total_seq + t] * inv_sum;
+                        let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
+                        axpy_simd(simd, w, head_buf, out_head);
+                    }
+                }
+            }
+        });
+    } else {
+        decoder_workspace::resize(scores, total_seq)?;
+        dispatch!(level, simd => {
+            for qh in 0..num_q_heads {
+                let kvh = qh / gqa_ratio;
+                let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
+                let mut max_score = f32::NEG_INFINITY;
+                for (t, score_slot) in scores.iter_mut().enumerate() {
+                    let k_bits =
+                        &kv.k[t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
+                    widen_f16_slice(k_bits, head_buf);
+                    let s = f32_dot_simd(simd, q_vec, head_buf) * scale;
+                    *score_slot = s;
+                    if s > max_score {
+                        max_score = s;
+                    }
+                }
+                let mut sum_exp = 0.0_f32;
+                for s in &mut *scores {
+                    *s = (*s - max_score).exp();
+                    sum_exp += *s;
+                }
+                let inv_sum = 1.0_f32 / sum_exp.max(1e-12_f32);
+                let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
+                for (t, &prob_unnorm) in scores.iter().enumerate() {
+                    let w = prob_unnorm * inv_sum;
+                    let v_bits =
+                        &kv.v[t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
+                    widen_f16_slice(v_bits, head_buf);
+                    axpy_simd(simd, w, head_buf, out_head);
+                }
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Pure-Rust 5-layer `CodePredictor` predicting acoustic codebooks `1..=15` per frame.
@@ -2317,13 +3554,7 @@ mod tests {
         let step = |layer: &QwenDecoderLayer, cache: &mut LayerKvCache, workers| {
             layer.forward_step_parallel(&[0.2; 4], 2, 2, 2, 1_000_000.0, 1e-6, cache, None, workers)
         };
-        let bits = |cache: &LayerKvCache| {
-            (
-                cache.seq_len,
-                cache.k.iter().map(|n| n.to_bits()).collect::<Vec<_>>(),
-                cache.v.iter().map(|n| n.to_bits()).collect::<Vec<_>>(),
-            )
-        };
+        let bits = |cache: &LayerKvCache| (cache.seq_len, cache.k.clone(), cache.v.clone());
         let mut before = LayerKvCache::default();
         let _ = step(layer, &mut before, 1)?;
         let mut expected = before.clone();
@@ -2394,8 +3625,8 @@ mod tests {
             assert_eq!(cache.seq_len, 0);
         }
         let mut cache = LayerKvCache {
-            k: vec![-0.0],
-            v: vec![0.5],
+            k: vec![0x8000],
+            v: vec![0x3800],
             seq_len: 1,
         };
         assert!(
@@ -2403,9 +3634,80 @@ mod tests {
                 .forward_step(&[0.2; 4], 2, 2, 2, 1_000_000.0, 1e-6, &mut cache, None)
                 .is_err()
         );
-        assert_eq!(cache.k[0].to_bits(), 0x8000_0000);
-        assert_eq!(cache.v, [0.5]);
+        assert_eq!(cache.k, [0x8000_u16]);
+        assert_eq!(cache.v, [0x3800_u16]);
         assert_eq!(cache.seq_len, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn batched_prefill_matches_sequential_steps_and_final_ffn_last_row() -> std::io::Result<()> {
+        let model = code_predictor_fixture()?;
+        let layer = &model.layers[0];
+        let inputs = [
+            0.1_f32, -0.2, 0.3, 0.4, -0.5, 0.25, 0.15, -0.35, 0.2, 0.6, -0.1, 0.05,
+        ];
+        let seq_len = 3_usize;
+        let mut seq_kv = LayerKvCache::default();
+        let mut seq_out = Vec::with_capacity(inputs.len());
+        for t in 0..seq_len {
+            let step = layer.forward_step_parallel(
+                &inputs[t * 4..(t + 1) * 4],
+                2,
+                2,
+                2,
+                1_000_000.0,
+                1e-6,
+                &mut seq_kv,
+                None,
+                3,
+            )?;
+            seq_out.extend_from_slice(&step);
+        }
+
+        let mut batch_kv = LayerKvCache::default();
+        let mut batch_out = Vec::new();
+        layer.forward_batch_into(
+            &inputs,
+            seq_len,
+            2,
+            2,
+            2,
+            1_000_000.0,
+            1e-6,
+            &mut batch_kv,
+            None,
+            3,
+            false,
+            &mut batch_out,
+        )?;
+        assert_eq!(batch_kv.seq_len, seq_kv.seq_len);
+        assert_eq!(batch_kv.k, seq_kv.k);
+        assert_eq!(batch_kv.v, seq_kv.v);
+        for (a, b) in batch_out.iter().zip(&seq_out) {
+            assert!((a - b).abs() < 1e-5, "batch={a} vs seq={b}");
+        }
+
+        let mut sliced_kv = LayerKvCache::default();
+        let mut sliced_out = Vec::new();
+        layer.forward_batch_into(
+            &inputs,
+            seq_len,
+            2,
+            2,
+            2,
+            1_000_000.0,
+            1e-6,
+            &mut sliced_kv,
+            None,
+            3,
+            true,
+            &mut sliced_out,
+        )?;
+        let last_start = (seq_len - 1) * 4;
+        for (a, b) in sliced_out[last_start..].iter().zip(&seq_out[last_start..]) {
+            assert!((a - b).abs() < 1e-5, "last-row batch={a} vs seq={b}");
+        }
         Ok(())
     }
 

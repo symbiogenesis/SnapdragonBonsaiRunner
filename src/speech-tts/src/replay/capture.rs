@@ -115,6 +115,16 @@ pub enum Cache<'a> {
     Rust(&'a [LayerKvCache]),
 }
 
+#[derive(Clone, Copy)]
+enum LayerView<'a> {
+    F32(LayerCache<'a>),
+    F16 {
+        keys: &'a [u16],
+        values: &'a [u16],
+        positions: usize,
+    },
+}
+
 impl<'a> Cache<'a> {
     const fn len(self) -> usize {
         match self {
@@ -123,10 +133,10 @@ impl<'a> Cache<'a> {
         }
     }
 
-    fn layer(self, index: usize) -> LayerCache<'a> {
+    fn view(self, index: usize) -> LayerView<'a> {
         match self {
-            Self::Original(layers) => layers[index],
-            Self::Rust(layers) => LayerCache {
+            Self::Original(layers) => LayerView::F32(layers[index]),
+            Self::Rust(layers) => LayerView::F16 {
                 keys: &layers[index].k,
                 values: &layers[index].v,
                 positions: layers[index].seq_len,
@@ -710,17 +720,34 @@ impl<W: Write> CaptureWriter<W> {
         self.number(cache.len())?;
         for index in 0..cache.len() {
             check_cancel(cancel)?;
-            let layer = cache.layer(index);
-            if layer.positions != positions
-                || layer.keys.len() != values
-                || layer.values.len() != values
-            {
-                return Err(invalid());
-            }
             self.number(index)?;
             self.number(positions)?;
-            self.floats(layer.keys, cancel)?;
-            self.floats(layer.values, cancel)?;
+            match cache.view(index) {
+                LayerView::F32(layer) => {
+                    if layer.positions != positions
+                        || layer.keys.len() != values
+                        || layer.values.len() != values
+                    {
+                        return Err(invalid());
+                    }
+                    self.floats(layer.keys, cancel)?;
+                    self.floats(layer.values, cancel)?;
+                }
+                LayerView::F16 {
+                    keys,
+                    values: v_bits,
+                    positions: layer_positions,
+                } => {
+                    if layer_positions != positions
+                        || keys.len() != values
+                        || v_bits.len() != values
+                    {
+                        return Err(invalid());
+                    }
+                    self.floats_f16(keys, cancel)?;
+                    self.floats_f16(v_bits, cancel)?;
+                }
+            }
         }
         Ok(())
     }
@@ -754,6 +781,19 @@ impl<W: Write> CaptureWriter<W> {
         for chunk in values.chunks(4096) {
             check_cancel(cancel)?;
             for value in chunk {
+                self.output.write_all(&value.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn floats_f16(&mut self, values: &[u16], cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
+        self.number(values.len())?;
+        let mut widened = [0.0_f32; 256];
+        for chunk in values.chunks(256) {
+            check_cancel(cancel)?;
+            crate::engine::widen_f16_slice(chunk, &mut widened[..chunk.len()]);
+            for value in &widened[..chunk.len()] {
                 self.output.write_all(&value.to_le_bytes())?;
             }
         }

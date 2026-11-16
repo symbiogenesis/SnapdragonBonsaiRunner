@@ -181,9 +181,9 @@ pub(crate) trait KvTarget {
     fn rollback(&mut self, guard: Self::Guard);
 }
 
-pub(crate) fn rollback_kv_slices(
-    keys: &mut Vec<f32>,
-    values: &mut Vec<f32>,
+pub(crate) fn rollback_kv_slices<T>(
+    keys: &mut Vec<T>,
+    values: &mut Vec<T>,
     (saved_keys, saved_values): (usize, usize),
 ) {
     keys.truncate(saved_keys);
