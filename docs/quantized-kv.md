@@ -116,7 +116,11 @@ X1 and X2 share a runtime-detected 128-bit NEON execution path with an explicit
 scalar reference. There is no SKU-specific timing or thread-count tuning.
 The pinned 0.1.30 source distributes independent query heads over the existing
 private row-worker pool. Each head retains its score, softmax, value and inverse
-transform order; joined workers return the earliest failing head chunk. The
+transform order; joined workers return the earliest failing head chunk. Post-0.1.30
+`prism-inference` `main` source (pending a reviewed release repin and X1/X2
+qualification) adds bit-exact `G in {2, 3, 6}` grouped GQA packed-KV decode and
+tiled-prefill attention (`PreparedQueryGroup` / `ValueGroupAccumulator`) running on
+the zero-allocation spin-then-park `NativeRowPool`. The
 path adds no cache expansion or second pool, and cancellation retains the
 ordinary synchronous-token boundary. Complete-model state/adapter/recovery,
 resource and matched request-time qualification remain required; binary delivery
@@ -134,8 +138,10 @@ by sharing surrounding projections while retaining causal per-token quantized
 attention and encoded append. The same route supplies each target-verification
 position. It adds no FP16 history expansion or additional worker pool. Ordinary
 sequential ingestion remains supported, and triangular GDN stays a separate FP16
-profile. Neither tile nor sampled suffix selection is exposed by ordinary Runner
-launch policy; runtime source presence does not activate them.
+profile. Explicit `--cpu-prefill-tokens 8|16|32` tile selection (paired with exact
+`--cpu-prefill-scratch-bytes` reservation and `:cpu-tiled-ffn-v1:{tokens}` readiness)
+is wired end-to-end in Runner's native launch path and omitted by default; sampled
+suffix speculation remains outside Runner launch policy.
 
 Full-context admission must charge packed records and scales, page tables,
 retained checkpoint pages/tails, transform/codebook storage and scratch. Keep

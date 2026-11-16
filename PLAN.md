@@ -457,9 +457,13 @@ adoption decisions without displacing native daily-use acceptance.
   immutable logits and BPE/special parsing under the
   [engine contract](docs/native-rust-engine.md) and
   [Hexagon execution contract](docs/hexagon.md).
-- [ ] Qualify 8/16/32-token CPU prefill, distinct `gdn-wy-f32-v1` arithmetic,
-  selected-cache service consumers and independent packed-KV head workers:
-  scratch/admission, complete state, adapters, cancellation and whole-request benefit.
+- [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32` (wired end-to-end against
+  pinned `0.1.30`, plus post-`0.1.30` Prism `main` `NativeRowPool` and `6:1`
+  grouped GQA packed-KV decode/tile attention awaiting repin), expose and qualify
+  distinct `gdn-wy-f32-v1` arithmetic, decouple CPU tiled prefill from resident
+  Hexagon decode (`mixed-phase handoff`) once qualified, and verify selected-cache
+  service consumers and independent packed-KV head workers: scratch/admission,
+  complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
   online-softmax work only if selected-context attention is a measured bottleneck.
 - [ ] Qualify explicit [latest-prefix reuse](docs/native-rust-engine.md#latest-prefix-reuse) across service,
@@ -529,40 +533,26 @@ adoption decisions without displacing native daily-use acceptance.
   independent replay.
   Qualify the prebuilt source-bound replay consumer with actual independent
   packets, matching provider identities and the original owner clock/power scope.
-- [ ] **S3 — Speech & kernel Tier 2 performance, memory, and reliability lifts**
-  (updating `ARITHMETIC_IDENTITY` and keeping `#![forbid(unsafe_code)]` on
-  `speech-tts`/`speech-asr` crate roots by isolating `unsafe` intrinsics and Win32
-  FFI inside an audited boundary crate; source implementations and unit parity controls
-  have landed across `bonsai-windows-process`, `bonsai-audio`, `bonsai-chat`,
-  `bonsai-speech-tts`, `bonsai-speech-asr`, and sibling `prism-inference`, while
-  compiled CI and actual-model `fp64`/teacher-forced/WER/listening & X1/X2 device
-  qualification gates remain pending):
-  - [x] Add checked ARM64 `DOTPROD` (`SDOT` / `vdotq_s32`) + `I8MM` (`SMMLA` /
-    `vmmlaq_s32`) quantized matmul kernels (`Q8_0 × Q8_0`, `Q4_K × Q8_K`,
-    `Q6_K × Q8_K`, 8-row `Q4_K` load-time repack, plus `prism-inference`
-    `kquants.rs` direct 8-lane packed `dot()`) replacing per-call non-FMA `f32` weight widening.
-  - [x] Add verified-handle read-only GGUF `CreateFileMappingW` + `MapViewOfFile` +
-    `PrefetchVirtualMemory` in `bonsai-windows-process` (replacing >2 GB private
-    committed heap copies and buffered `ReadFile` loops), on-demand packed
-    `codec_embd` row lookup (~265 MiB saved), and lazy Mimi codec encoder
-    loading (dropping encoder weights outside VoiceDesign->Base bootstrap).
-  - [x] Replace per-op Rayon `pool.install` barriers with a low-overhead
-    spin-then-park `AtomicUsize` worker pool (calling thread as worker 0), add
-    adjacent `gate+up`/`QKV` projection fusion, batched Talker prefill GEMM, and
-    true `u16` `F16` KV cache storage (replacing `Vec<f32>` in `speech-asr` and `speech-tts`).
-  - [x] Land `speech-tts` DSP/streaming upgrades: vectorized + parallel
-    `SnakeBeta` (`sin`), `qwentts.cpp` dyadic `1 -> 2 -> 4 -> 8` streaming codec
-    chunk ramp, pre-permuted `[IC, K*OC]` `CausalTransConv1d`, tail-12 priming +
-    persistent `CodecWorkspace`, ring-buffer `TransformerState`, warm `Voice` retention across
-    cooperative Stop/skip cancellation, and 1024-pt real FFT + GEMM `TdnnConv1d` +
-    decomposed `AttentiveStatPool` in `speaker_encoder.rs`.
-  - [x] Land `speech-asr` and `audio` frontend/encoder/reliability upgrades: vectorized
-    `f32x4` minimax `erf` GELU (replacing the 128/256-step `f64` incomplete-gamma loop),
-    radix-2/5 400-pt FFT + `FrontendScratch`, `Q4_K`/`Q6_K` decoder intake support,
-    `cu_seqlens` windowed encoder + live 8s (`128,000`-sample) incremental `LiveCapture`
-    prefill, short-clip (`<= 1.5s`) `Languages: <Name>.` hint, multi-`<asr_text>` /
-    budget-stop repetition trimming, and `bonsai-audio` sub-band adaptive VAD + pause
-    boundary segmentation.
+- [ ] **S3 — Qualify speech & kernel Tier 2 performance, memory, and reliability lifts.**
+  Source implementations and unit parity controls have landed across
+  `bonsai-windows-process`, `bonsai-audio`, `bonsai-chat`, `bonsai-speech-tts`,
+  `bonsai-speech-asr`, and sibling `prism-inference` (updating `ARITHMETIC_IDENTITY`
+  while keeping `#![forbid(unsafe_code)]` on `speech-tts`/`speech-asr` crate roots
+  by isolating `unsafe` intrinsics and Win32 FFI inside `bonsai-windows-process`),
+  covering: checked ARM64 `DOTPROD`/`I8MM` kernels (`Q8_0 × Q8_0`, `Q4_K × Q8_K`,
+  `Q6_K × Q8_K`, 8-row `Q4_K` load-time repack, and direct 8-lane `kquants::dot`);
+  verified-handle read-only GGUF `MapViewOfFile` + `PrefetchVirtualMemory`, on-demand
+  `codec_embd` row lookup, and lazy Mimi encoder loading; spin-then-park
+  `AtomicUsize` `RowWorkerPool`, adjacent `gate+up`/`QKV` fusion, batched Talker
+  prefill, and `u16` F16 KV storage; `speech-tts` vectorized/parallel `SnakeBeta`,
+  dyadic `1 -> 2 -> 4 -> 8` streaming codec ramp, pre-permuted `CausalTransConv1d`,
+  tail-12 priming + `CodecWorkspace`, ring-buffer `TransformerState`, warm `Voice`
+  retention, and 1024-pt real FFT / GEMM `TdnnConv1d` / decomposed `AttentiveStatPool`;
+  and `speech-asr` / `audio` `f32x4` minimax `erf` GELU, radix-2/5 400-pt FFT,
+  `Q4_K`/`Q6_K` decoder intake, windowed `cu_seqlens` + 8s `LiveCapture` prefill,
+  short-clip language hints, repetition trimming, and sub-band adaptive VAD.
+  Complete compiled CI, actual-model `fp64`/teacher-forced/WER/listening, and
+  X1/X2 device qualification gates before promotion.
 - [ ] Retire the remaining Windows queue ABI, ASR, Prism reference and publisher
   native/DLL families
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
@@ -1318,13 +1308,16 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 ### Repin, CI and device qualification of landed screening controls
 
-- [x] Publish a Foundation release bundle from reviewed `prism-inference` `main`
-  (`0.1.30`, `89df9aaff9e580d66679f2befe94d471bcf4fc7f`, including
-  `129fae8..c0893f8`) and repin Runner past `Prism 0.1.28` under the
-  [distribution guide](docs/releases.md) so installed and daily-use builds consume
-  the new runtime checkpoints, GDN guards, memory ledger and worker cancellation
-  (`#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#25`–`#26`, `#28`,
-  `#30`–`#34`, `#36`, `#45`–`#51`).
+- [ ] Publish a reviewed Foundation release bundle from `prism-inference` `main`
+  past `0.1.30` (`633624f` zero-copy `MappedSlice` GGUF + 8-worker payload
+  validation, `3cba373` spin-then-park `NativeRowPool`, `cc629e7` bit-exact
+  `G in {2, 3, 6}` grouped GQA packed-KV decode/tile attention, and `244578e`
+  `adapter_affects_any` external FFN/SwiGLU LoRA unlocking alongside `e9cb947`..`71f44bd`)
+  and repin [config/prism-inference.lock.json](config/prism-inference.lock.json)
+  under the [distribution guide](docs/releases.md) so installed and daily-use builds
+  consume them alongside the `0.1.30` runtime checkpoints, GDN guards, memory ledger
+  and worker cancellation (`#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#25`–`#26`,
+  `#28`, `#30`–`#34`, `#36`, `#45`–`#51`).
 - [ ] Complete hosted `source-checks` and `foundation` compiler, strict Release
   analyzer and full regression-suite verdicts in both repositories under
   [promotion criteria](docs/validation.md#promotion-criteria); local merge checks
@@ -1364,13 +1357,15 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   `FILE_FLAG_NO_BUFFERING` handle with logical seek semantics, CNG digest continuity
   and explicit buffered fallback only if cold model loading is I/O-bound and beats
   the existing mapped path.
-- [ ] **#18 — Owned tensor-range mapping, read-only Swift views and host/NPU
-  deduplication.** Merge owned tensor byte ranges and map verified immutable Swift
-  CPU spans via read-only `MapViewOfFile` (shifting ~5.5–6.7 GiB out of private
-  Windows Job commit into evictable file-backed pages while retaining the
-  physical-RAM watchdog), and unmap/exclude the `2,888,663,040` bytes (`~2.69 GiB`)
-  of CPU-side `blk.0..=26` spans once sealed into resident Hexagon FastRPC arenas,
-  preserving Windows handle/reparse guards and explicit NPU-fault recovery.
+- [ ] **#18 — Owned tensor-range mapping, Job-commit credit and host/NPU
+  deduplication.** Whole-file read-only `MapViewOfFile` (`>= 4 MiB` `MappedSlice`
+  tensor views in `prism-inference` `main` `633624f`) is implemented in source
+  pending release repin; extend to selective tensor-range mapping, credit
+  evictable file-backed residency versus private Windows Job commit (`~5.5–6.7 GiB`)
+  in Runner's admission planner while retaining the physical-RAM watchdog, and
+  unmap/exclude the `2,888,663,040` bytes (`~2.69 GiB`) of CPU-side `blk.0..=26`
+  spans once sealed into resident Hexagon FastRPC arenas, preserving Windows
+  handle/reparse guards and explicit NPU-fault recovery.
 - [ ] **#21 — Calibrated K-cache mean centering.** Evaluate subtracting a
   per-layer/head/channel key mean on rotated `K4` only after `K1` baseline
   attribution, with separate center-vector storage/identity accounting and held-out

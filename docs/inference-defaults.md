@@ -1,8 +1,10 @@
 # Inference defaults and quality evidence
 
 Chat preserves the native template and publisher's evaluated sampler, with thinking
-off by default. The development default is Rust Prism 0.1.30, original Swift PQ2, four CPU
-row workers and standard adapter scale 1.3. `--publisher-engine` selects publisher rollback;
+off by default. The development default is Rust Prism 0.1.30, original Swift PQ2, eight CPU
+row workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (four when the host
+family is unknown or in fixed-four qualification controls) and standard adapter scale 1.3.
+`--publisher-engine` selects publisher rollback;
 PTQ1 remains opt-in. The worker attempts [X2 NPU acceleration](hexagon.md), retaining
 CPU execution if initialization is unavailable.
 
@@ -25,7 +27,7 @@ acceptance remain pending.
 | Attention / recurrent state | K4/V4 (`rsq4`) in the 0.1.30 development pin; F32 recurrent/convolution state | Owner-selected approximate cache; measured quality/memory qualification remains pending, with explicit FP16 recovery |
 | Context handling | Exact rendered token count; reject overflow | Preserve supplied history rather than silently shifting or truncating it |
 | RoPE | Model metadata, no override | Context extension can change short-context behavior |
-| Cache reuse / speculation | Disabled by default | Explicit [latest-prefix reuse](native-rust-engine.md#latest-prefix-reuse) is available for native launches; speculation is outside Runner serving. Neither is an established quality improvement. |
+| Prompt tiles, cache reuse & speculation | Disabled by default | Explicit [`--cpu-prefill-tokens 8\|16\|32`](native-rust-engine.md#swift-cpu-supported-subset) and [`--prompt-reuse latest`](native-rust-engine.md#latest-prefix-reuse) are available for native launches; speculation remains outside Runner serving. None is an established quality/performance default. |
 
 CPU checks, server plans and the Rust development launcher pass sampler/reasoning arguments
 explicitly. The pinned completion renderer nevertheless omits template kwargs: its single-turn
