@@ -460,12 +460,15 @@ new anchor. Exact Find navigation waits for current geometry. Native selection,
 streaming, conversation switches and width/DPI/font changes retain independent
 device acceptance under [validation](validation.md).
 
-Ferrite's grouped edit operations suggest a byte-bounded undo log in place of
-complete draft snapshots. Any change must preserve whole-edit rejection, cursor
-and undo restoration, IME composition and atomic source insertion. Keep independent
-byte limits for retained operations and transaction scratch. cosmic-text supplies
+`draft_buffer.rs` implements a Ferrite-style byte-bounded inverse-operation
+undo/redo log (`<= 1_048_576` retained bytes, `<= 64` groups, independent
+transaction scratch capped at `4 * INPUT_LIMIT + 4_096` bytes, `max_undos: 0` on
+`egui::TextEditState`, `TextFingerprint` invalidation, and single-group IME
+preedit-to-commit batching) in place of full-draft snapshots while preserving
+whole-edit overflow rejection, cursor and undo restoration, and atomic source
+insertion. Candidate improvements remaining unimplemented: `cosmic-text` supplies
 multilingual and bidirectional editing cases rather than a selected replacement
-text engine. A draft comparison using similar would calculate Unicode-aware diffs
+text engine; and a draft comparison using `similar` would calculate Unicode-aware diffs
 in bounded, cancellable background work; presentation and explicit user acceptance
 must retain source text and branch ownership, without silently merging drafts.
 
