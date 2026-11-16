@@ -1,5 +1,11 @@
 //! Explicit message iteration preserves the source conversation and exact history.
-use super::{Command, Conversation, INPUT_LIMIT, ModelLifecycle, State, Transcript, egui};
+use super::{
+    Command, Conversation, INPUT_LIMIT, ModelLifecycle, State, Transcript,
+    branch_diff::{
+        BranchDiffJob, BranchDiffOrigin, BranchDiffSource, DiffOp, UnicodeDiff,
+    },
+    egui,
+};
 
 pub(super) const CONTINUE_PROMPT: &str = "Continue your previous response from where it stopped, without repeating what you already wrote.";
 
@@ -27,10 +33,51 @@ pub(super) struct MessageOptions {
 pub(super) struct EditMessage {
     pub(super) source_conversation: u64,
     pub(super) message: u64,
+    pub(super) original_text: String,
     pub(super) text: String,
     pub(super) attachments: Vec<crate::attachment_import::Attachment>,
     focus: bool,
     limit_notice: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ComparisonSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ComparisonAcceptanceTarget {
+    ActiveDraft {
+        conversation_id: u64,
+    },
+    NewBranchDraft {
+        source_conversation: u64,
+        history_prefix: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AcceptComparisonReplacement {
+    pub(super) generation: u64,
+    pub(super) side: ComparisonSide,
+    pub(super) target: ComparisonAcceptanceTarget,
+}
+
+pub(super) struct BranchComparison {
+    pub(super) job: BranchDiffJob,
+    pub(super) target: ComparisonAcceptanceTarget,
+    announced_ready: bool,
+}
+
+impl BranchComparison {
+    pub(super) fn is_running(&self) -> bool {
+        self.job.is_running()
+    }
+
+    pub(super) const fn generation(&self) -> u64 {
+        self.job.generation()
+    }
 }
 
 impl State {
@@ -85,6 +132,7 @@ impl State {
                 self.edit_message = Some(EditMessage {
                     source_conversation: self.active_conversation,
                     message: id,
+                    original_text: text.clone(),
                     text,
                     attachments,
                     focus: true,
@@ -415,12 +463,240 @@ impl State {
         }
     }
 
+    pub(super) fn cancel_branch_comparison(&mut self) {
+        if let Some(comparison) = self.branch_comparison.take() {
+            comparison.job.cancel();
+        }
+    }
+
+    pub(super) fn poll_branch_comparison(&mut self, ctx: &egui::Context) {
+        let Some(comparison) = self.branch_comparison.as_mut() else {
+            return;
+        };
+        if comparison.job.poll().is_some() && !comparison.announced_ready {
+            comparison.announced_ready = true;
+            ctx.request_repaint();
+        }
+    }
+
+    pub(super) fn start_branch_comparison(
+        &mut self,
+        left: BranchDiffSource,
+        right: BranchDiffSource,
+        target: ComparisonAcceptanceTarget,
+        ctx: Option<&egui::Context>,
+    ) -> bool {
+        self.cancel_branch_comparison();
+        self.branch_diff_generation = self.branch_diff_generation.wrapping_add(1);
+        let generation = self.branch_diff_generation;
+        let repaint = ctx
+            .cloned()
+            .or_else(|| self.repaint_ctx.clone())
+            .map(|repaint_ctx| -> std::sync::Arc<dyn Fn() + Send + Sync> {
+                std::sync::Arc::new(move || repaint_ctx.request_repaint())
+            });
+        match BranchDiffJob::start(generation, left, right, repaint) {
+            Ok(job) => {
+                self.branch_comparison = Some(BranchComparison {
+                    job,
+                    target,
+                    announced_ready: false,
+                });
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+                true
+            }
+            Err(_) => {
+                self.set_status("Could not start branch comparison worker.", true);
+                false
+            }
+        }
+    }
+
+    pub(super) fn compare_message_with_draft(
+        &mut self,
+        message_id: u64,
+        ctx: Option<&egui::Context>,
+    ) -> bool {
+        let Some(message) = self
+            .transcript
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+        else {
+            return false;
+        };
+        let left = BranchDiffSource {
+            origin: BranchDiffOrigin::Message {
+                conversation_id: self.active_conversation,
+                message_id,
+                history_index: message.committed_index(&self.committed),
+            },
+            title: if message.role == super::Role::User {
+                "Selected prompt".to_owned()
+            } else {
+                "Selected response".to_owned()
+            },
+            text: message.body.clone(),
+        };
+        let right = BranchDiffSource {
+            origin: BranchDiffOrigin::Draft {
+                conversation_id: self.active_conversation,
+            },
+            title: "Current draft".to_owned(),
+            text: self.input.clone(),
+        };
+        self.start_branch_comparison(
+            left,
+            right,
+            ComparisonAcceptanceTarget::ActiveDraft {
+                conversation_id: self.active_conversation,
+            },
+            ctx,
+        )
+    }
+
+    fn conversation_last_message_source(
+        &self,
+        conversation_id: u64,
+    ) -> Option<BranchDiffSource> {
+        let (title, transcript, committed) = if conversation_id == self.active_conversation {
+            let title = self
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == conversation_id)
+                .map_or("Active branch", |conversation| conversation.title.as_str());
+            (title, &self.transcript, &self.committed)
+        } else {
+            let conversation = self
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == conversation_id)?;
+            let saved = conversation.saved.as_ref()?;
+            (
+                conversation.title.as_str(),
+                &saved.transcript,
+                &saved.committed,
+            )
+        };
+        let message = transcript
+            .messages
+            .iter()
+            .rfind(|message| message.role == super::Role::Assistant)
+            .or_else(|| transcript.messages.last())?;
+        Some(BranchDiffSource {
+            origin: BranchDiffOrigin::Message {
+                conversation_id,
+                message_id: message.id,
+                history_index: message.committed_index(committed),
+            },
+            title: title.to_owned(),
+            text: message.body.clone(),
+        })
+    }
+
+    pub(super) fn compare_conversations_last_answer(
+        &mut self,
+        left_conversation: u64,
+        right_conversation: u64,
+        target: ComparisonAcceptanceTarget,
+        ctx: Option<&egui::Context>,
+    ) -> bool {
+        let Some(left) = self.conversation_last_message_source(left_conversation) else {
+            return false;
+        };
+        let Some(right) = self.conversation_last_message_source(right_conversation) else {
+            return false;
+        };
+        self.start_branch_comparison(left, right, target, ctx)
+    }
+
+    pub(super) fn accept_comparison_replacement(
+        &mut self,
+        acceptance: AcceptComparisonReplacement,
+    ) -> bool {
+        let Some(comparison) = self.branch_comparison.as_mut() else {
+            return false;
+        };
+        if comparison.job.generation() != acceptance.generation
+            || comparison.target != acceptance.target
+        {
+            return false;
+        }
+        let Some(outcome) = comparison.job.poll() else {
+            return false;
+        };
+        let Ok(diff) = outcome.result.as_ref() else {
+            return false;
+        };
+        if diff.reconstruct_left() != outcome.left_source.text
+            || diff.reconstruct_right() != outcome.right_source.text
+        {
+            return false;
+        }
+        let chosen_text = match acceptance.side {
+            ComparisonSide::Left => outcome.left_source.text.clone(),
+            ComparisonSide::Right => outcome.right_source.text.clone(),
+        };
+        if chosen_text.chars().count() > INPUT_LIMIT {
+            self.set_status(super::draft_buffer::LIMIT_MESSAGE, true);
+            return false;
+        }
+
+        match acceptance.target {
+            ComparisonAcceptanceTarget::ActiveDraft { conversation_id } => {
+                if self.active_conversation != conversation_id {
+                    return false;
+                }
+                self.input = chosen_text;
+                self.place_composer_cursor(self.input.chars().count());
+                self.touch_conversation(conversation_id);
+                self.branch_comparison = None;
+                self.edit_message = None;
+                self.focus_composer = true;
+                true
+            }
+            ComparisonAcceptanceTarget::NewBranchDraft {
+                source_conversation,
+                history_prefix,
+            } => {
+                if self.active_conversation != source_conversation
+                    || !self.branch_history(history_prefix, "Compared")
+                {
+                    return false;
+                }
+                self.input = chosen_text;
+                self.set_draft_attachments(Vec::new());
+                self.place_composer_cursor(self.input.chars().count());
+                self.branch_comparison = None;
+                self.edit_message = None;
+                self.focus_composer = true;
+                true
+            }
+        }
+    }
+
     pub(super) fn iteration_dialog(&mut self, ctx: &egui::Context) {
+        if self.branch_comparison.is_some() {
+            self.branch_comparison_dialog(ctx);
+            return;
+        }
         let Some(mut edit) = self.edit_message.take() else {
             return;
         };
         let mut confirmed = false;
         let mut cancelled = false;
+        let mut compare_requested = false;
+        let mut compare_draft_requested = false;
+        let mut compare_branch_target: Option<u64> = None;
+        let other_branch_id = self
+            .conversations
+            .iter()
+            .find(|conversation| {
+                conversation.id != edit.source_conversation && conversation.saved.is_some()
+            })
+            .map(|conversation| conversation.id);
         let enabled = edit.source_conversation == self.active_conversation
             && self.message_options(edit.message).edit;
         let modal = egui::Modal::new(egui::Id::unique("edit-and-resend")).show(ctx, |ui| {
@@ -469,24 +745,296 @@ impl State {
                 ui.label("Return to the source conversation and wait until the model is ready to resend.");
             }
             ui.add_space(12.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 confirmed = ui
                     .add_enabled(
                         enabled && (!edit.text.trim().is_empty() || !edit.attachments.is_empty()),
                         egui::Button::new("Create branch and send"),
                     )
                     .clicked();
+                compare_requested = ui
+                    .add_enabled(
+                        edit.text != edit.original_text,
+                        egui::Button::new("Compare changes"),
+                    )
+                    .on_hover_text(
+                        "Inspect Unicode word and newline changes before replacing or branching.",
+                    )
+                    .clicked();
+                if ui
+                    .button("Compare with draft")
+                    .on_hover_text("Compare this message against the active composer draft.")
+                    .clicked()
+                {
+                    compare_draft_requested = true;
+                }
+                if let Some(other_id) = other_branch_id
+                    && ui
+                        .button("Compare previous branch")
+                        .on_hover_text(
+                            "Compare the latest response from the previous branch against this conversation.",
+                        )
+                        .clicked()
+                {
+                    compare_branch_target = Some(other_id);
+                }
                 cancelled = ui.button("Cancel").clicked();
             });
         });
         if confirmed {
             self.resend_edited_message(edit);
+        } else if compare_requested {
+            let history_index = self.transcript.committed_index(edit.message, &self.committed);
+            let history_prefix = history_index.or_else(|| {
+                self.transcript
+                    .messages
+                    .iter()
+                    .find(|message| message.id == edit.message && message.role == super::Role::User)
+                    .and_then(|message| message.retry_prefix(&self.committed))
+            });
+            let left = BranchDiffSource {
+                origin: BranchDiffOrigin::Message {
+                    conversation_id: edit.source_conversation,
+                    message_id: edit.message,
+                    history_index,
+                },
+                title: "Original prompt".to_owned(),
+                text: edit.original_text.clone(),
+            };
+            let right = BranchDiffSource {
+                origin: BranchDiffOrigin::Snapshot {
+                    conversation_id: edit.source_conversation,
+                    label: "Edited prompt".to_owned(),
+                },
+                title: "Edited prompt".to_owned(),
+                text: edit.text.clone(),
+            };
+            let source_conversation = edit.source_conversation;
+            let target = match history_prefix {
+                Some(prefix) if self.model.workspace_available() => {
+                    ComparisonAcceptanceTarget::NewBranchDraft {
+                        source_conversation,
+                        history_prefix: prefix,
+                    }
+                }
+                _ => ComparisonAcceptanceTarget::ActiveDraft {
+                    conversation_id: source_conversation,
+                },
+            };
+            self.edit_message = Some(edit);
+            self.start_branch_comparison(left, right, target, Some(ctx));
+        } else if compare_draft_requested {
+            let message_id = edit.message;
+            self.edit_message = Some(edit);
+            self.compare_message_with_draft(message_id, Some(ctx));
+        } else if let Some(other_id) = compare_branch_target {
+            let source_conversation = edit.source_conversation;
+            self.edit_message = Some(edit);
+            self.compare_conversations_last_answer(
+                other_id,
+                source_conversation,
+                ComparisonAcceptanceTarget::ActiveDraft {
+                    conversation_id: source_conversation,
+                },
+                Some(ctx),
+            );
         } else if !cancelled && !modal.should_close() {
             self.edit_message = Some(edit);
         } else {
             self.focus_composer = true;
         }
     }
+
+    fn branch_comparison_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut comparison) = self.branch_comparison.take() else {
+            return;
+        };
+        let mut dismiss = false;
+        let mut accepted: Option<AcceptComparisonReplacement> = None;
+        let generation = comparison.generation();
+        let target = comparison.target;
+        let left_title = comparison.job.left_source().title.clone();
+        let right_title = comparison.job.right_source().title.clone();
+        let outcome = comparison.job.poll().cloned();
+
+        let modal = egui::Modal::new(egui::Id::unique("branch-diff-comparison")).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 80.0).clamp(280.0, 640.0));
+            ui.heading("Compare branch and draft");
+            ui.label(
+                super::RichText::new(format!("Left: {left_title}  ·  Right: {right_title}"))
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(8.0);
+
+            match outcome.as_ref().map(|item| &item.result) {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Comparing Unicode text off-thread…");
+                    });
+                    ui.add_space(12.0);
+                    if ui.button("Cancel comparison").clicked() {
+                        dismiss = true;
+                    }
+                }
+                Some(Err(error)) => {
+                    ui.label(
+                        super::RichText::new(error.to_string())
+                            .color(ui.visuals().error_fg_color),
+                    );
+                    ui.add_space(12.0);
+                    if ui.button("Close").clicked() {
+                        dismiss = true;
+                    }
+                }
+                Some(Ok(diff)) => {
+                    let summary = if diff.has_changes() {
+                        format!(
+                            "{} unchanged · +{} inserted · -{} deleted",
+                            diff.equal_tokens, diff.inserted_tokens, diff.deleted_tokens
+                        )
+                    } else {
+                        "No text differences found.".to_owned()
+                    };
+                    ui.label(super::RichText::new(summary).small().weak());
+                    ui.add_space(6.0);
+                    let preview_height = (ctx.content_rect().height() - 280.0).clamp(100.0, 340.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("branch-diff-preview")
+                        .max_height(preview_height)
+                        .show(ui, |ui| {
+                            let (job, truncated) = build_diff_layout_job(diff, ui);
+                            ui.add(egui::Label::new(job).wrap());
+                            if truncated {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    super::RichText::new(
+                                        "Diff preview truncated for responsiveness; full text applies on acceptance.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                        });
+                    ui.add_space(12.0);
+                    let (left_label, right_label, can_accept) = match target {
+                        ComparisonAcceptanceTarget::ActiveDraft { conversation_id } => (
+                            "Use left in draft",
+                            "Use right in draft",
+                            self.active_conversation == conversation_id,
+                        ),
+                        ComparisonAcceptanceTarget::NewBranchDraft {
+                            source_conversation,
+                            history_prefix,
+                        } => (
+                            "Branch with left draft",
+                            "Branch with right draft",
+                            self.active_conversation == source_conversation
+                                && self.model.workspace_available()
+                                && history_prefix <= self.committed.len()
+                                && history_prefix.is_multiple_of(2),
+                        ),
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(can_accept, egui::Button::new(left_label))
+                            .clicked()
+                        {
+                            accepted = Some(AcceptComparisonReplacement {
+                                generation,
+                                side: ComparisonSide::Left,
+                                target,
+                            });
+                        }
+                        if ui
+                            .add_enabled(can_accept, egui::Button::new(right_label))
+                            .clicked()
+                        {
+                            accepted = Some(AcceptComparisonReplacement {
+                                generation,
+                                side: ComparisonSide::Right,
+                                target,
+                            });
+                        }
+                        if ui.button("Dismiss comparison").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                }
+            }
+        });
+
+        if dismiss || modal.should_close() {
+            comparison.job.cancel();
+            self.focus_composer = true;
+        } else if let Some(acceptance) = accepted {
+            self.branch_comparison = Some(comparison);
+            if !self.accept_comparison_replacement(acceptance) {
+                self.focus_composer = true;
+            }
+        } else {
+            self.branch_comparison = Some(comparison);
+        }
+    }
+}
+
+fn safe_prefix_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = 0_usize;
+    for (idx, ch) in text.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &text[..end]
+}
+
+fn build_diff_layout_job(diff: &UnicodeDiff, ui: &egui::Ui) -> (egui::text::LayoutJob, bool) {
+    const MAX_PREVIEW_SPANS: usize = 1_024;
+    const MAX_PREVIEW_BYTES: usize = 64 * 1024;
+
+    let visuals = ui.visuals();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let equal_fmt = egui::TextFormat::simple(font.clone(), visuals.text_color());
+    let mut delete_fmt = egui::TextFormat::simple(font.clone(), visuals.error_fg_color);
+    delete_fmt.background = visuals.faint_bg_color;
+    delete_fmt.strikethrough = egui::Stroke::new(1.0, visuals.error_fg_color);
+
+    let insert_color = visuals.selection.stroke.color;
+    let mut insert_fmt = egui::TextFormat::simple(font, insert_color);
+    insert_fmt.background = visuals.selection.bg_fill;
+    insert_fmt.underline = egui::Stroke::new(1.0, insert_color);
+
+    let mut job = egui::text::LayoutJob::default();
+    let mut truncated = false;
+    let mut remaining_bytes = MAX_PREVIEW_BYTES;
+
+    for (idx, span) in diff.spans.iter().enumerate() {
+        if idx >= MAX_PREVIEW_SPANS || remaining_bytes == 0 {
+            truncated = true;
+            break;
+        }
+        let slice = safe_prefix_utf8(&span.text, remaining_bytes);
+        if slice.len() < span.text.len() {
+            truncated = true;
+        }
+        if slice.is_empty() {
+            break;
+        }
+        remaining_bytes = remaining_bytes.saturating_sub(slice.len());
+        let format = match span.op {
+            DiffOp::Equal => equal_fmt.clone(),
+            DiffOp::Delete => delete_fmt.clone(),
+            DiffOp::Insert => insert_fmt.clone(),
+        };
+        job.append(slice, 0.0, format);
+    }
+    (job, truncated)
 }
 
 #[cfg(test)]

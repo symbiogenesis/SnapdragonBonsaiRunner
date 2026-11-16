@@ -23,6 +23,7 @@ mod attachments;
 mod audio_files;
 #[cfg(test)]
 mod background_tests;
+mod branch_diff;
 mod branding;
 mod coalescing_store;
 mod composer;
@@ -160,6 +161,8 @@ struct State {
     rename_conversation: Option<(u64, String)>,
     delete_conversation: Option<u64>,
     edit_message: Option<iteration::EditMessage>,
+    branch_comparison: Option<iteration::BranchComparison>,
+    branch_diff_generation: u64,
     conversation_notice: Option<&'static str>,
     recovery: Option<crate::recovery::Recovery>,
     placement: Option<placement::Placement>,
@@ -334,6 +337,8 @@ impl State {
             rename_conversation: None,
             delete_conversation: None,
             edit_message: None,
+            branch_comparison: None,
+            branch_diff_generation: 0,
             conversation_notice: None,
             recovery: None,
             placement: None,
@@ -936,6 +941,7 @@ impl State {
         if self.rename_conversation.is_some()
             || self.delete_conversation.is_some()
             || self.edit_message.is_some()
+            || self.branch_comparison.is_some()
             || self.show_settings
             || egui::Popup::is_any_open(ctx)
         {
@@ -966,6 +972,7 @@ impl State {
                 self.cancel_microphone();
             }
             self.cancel_attachment_import();
+            self.cancel_branch_comparison();
             self.image_export = None;
         }
         ctx.input(|input| {
@@ -985,6 +992,7 @@ impl State {
         if self.rename_conversation.is_none()
             && self.delete_conversation.is_none()
             && self.edit_message.is_none()
+            && self.branch_comparison.is_none()
             && !self.show_settings
             && !self.show_audio_transcript
             && self.lightbox.is_none()
@@ -1001,6 +1009,7 @@ impl State {
             && self.rename_conversation.is_none()
             && self.delete_conversation.is_none()
             && self.edit_message.is_none()
+            && self.branch_comparison.is_none()
             && !egui::Popup::is_any_open(ctx)
         {
             // Run before the sidebar and composer text editors consume Ctrl+F.
@@ -1897,6 +1906,7 @@ impl State {
             && self.rename_conversation.is_none()
             && self.delete_conversation.is_none()
             && self.edit_message.is_none()
+            && self.branch_comparison.is_none()
             && !self.show_settings
             && !self.show_audio_transcript
             && self.alerts.details.is_none()
@@ -2035,6 +2045,7 @@ impl Drop for State {
         self.appearance_store.take();
         self.audio_paste.take();
         self.cancel_attachment_import();
+        self.branch_comparison.take();
         self.updates.take();
         self.pending_config.take();
         self.startup_request.take();
@@ -2615,6 +2626,7 @@ impl State {
                 && !self.show_audio_transcript
                 && self.lightbox.is_none()
                 && self.alerts.details.is_none()
+                && self.branch_comparison.is_none()
                 && !update_confirmation
                 && !drawer,
             |ui| {
@@ -2744,6 +2756,7 @@ impl eframe::App for State {
             && !self.show_audio_transcript
             && self.lightbox.is_none()
             && self.alerts.details.is_none()
+            && self.branch_comparison.is_none()
             && ctx.memory(|memory| {
                 memory
                     .focused()
@@ -2762,6 +2775,7 @@ impl eframe::App for State {
         self.handle_audio_paste(ctx);
         self.poll_audio_import();
         self.poll_attachment_import(ctx);
+        self.poll_branch_comparison(ctx);
         self.poll_microphone();
         self.drain_speech_events();
         self.poll_recovery();
@@ -2780,6 +2794,10 @@ impl eframe::App for State {
             || self.image_cache.has_pending()
             || self.image_export.is_some()
             || self.attachment_import.is_some()
+            || self
+                .branch_comparison
+                .as_ref()
+                .is_some_and(iteration::BranchComparison::is_running)
             || (!self.preview
                 && (self.model.waiting_model()
                     || self.speaking

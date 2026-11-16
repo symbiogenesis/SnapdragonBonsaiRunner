@@ -502,3 +502,275 @@ fn token_limit_automatically_continues_without_alerting_while_context_window_has
     assert_eq!(chat.state().app.input, "Draft for after completion 🌱");
     assert!(chat.state().commands.try_recv().is_err());
 }
+
+fn wait_for_branch_diff(chat: &mut Harness<'_, Fixture>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        chat.step();
+        if chat
+            .state()
+            .app
+            .branch_comparison
+            .as_ref()
+            .is_none_or(|comparison| !comparison.is_running())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "branch diff comparison timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    chat.run();
+}
+
+#[test]
+fn branch_comparison_modal_completes_off_thread_and_preserves_source_on_dismiss() {
+    for size in [[1180.0, 860.0], [480.0, 640.0]] {
+        let mut chat = harness(size);
+        let original = chat.state().app.active_conversation;
+        open_actions(&mut chat, 1);
+        chat.get_by_role_and_label(egui::Role::Button, "Edit and resend")
+            .click();
+        chat.run();
+        if let Some(edit) = chat.state_mut().app.edit_message.as_mut() {
+            edit.text = "Original question\r\nUpdated with 日本語 🌱".into();
+        }
+        chat.run();
+        chat.get_by_role_and_label(egui::Role::Button, "Compare changes")
+            .click();
+        wait_for_branch_diff(&mut chat);
+
+        assert!(chat.state().app.branch_comparison.is_some());
+        assert!(chat.query_by_label("Compare branch and draft").is_some());
+        // Unaccepted comparison never mutates draft, history, or branches.
+        assert_eq!(chat.state().app.active_conversation, original);
+        assert_eq!(chat.state().app.conversations.len(), 1);
+        assert_eq!(chat.state().app.input, "Keep my next draft 🌱");
+        assert_eq!(chat.state().app.committed.len(), 2);
+
+        chat.get_by_role_and_label(egui::Role::Button, "Dismiss comparison")
+            .click();
+        chat.run();
+        assert!(chat.state().app.branch_comparison.is_none());
+        // Dismissing comparison returns safely to the edit dialog without changing drafts/history.
+        assert!(chat.state().app.edit_message.is_some());
+        assert_eq!(chat.state().app.active_conversation, original);
+        assert_eq!(chat.state().app.conversations.len(), 1);
+        assert_eq!(chat.state().app.input, "Keep my next draft 🌱");
+        assert_eq!(chat.state().app.committed.len(), 2);
+        assert!(chat.state().commands.try_recv().is_err());
+
+        chat.key_press(egui::Key::Escape);
+        chat.run();
+        assert!(chat.state().app.edit_message.is_none());
+        assert_eq!(chat.state().app.input, "Keep my next draft 🌱");
+    }
+}
+
+#[test]
+fn branch_comparison_requires_explicit_acceptance_for_draft_and_new_branch() {
+    // ActiveDraft acceptance replaces only the draft after explicit button click.
+    let mut chat = harness([1180.0, 860.0]);
+    let original = chat.state().app.active_conversation;
+    let answer_id = chat.state().app.transcript.messages[1].id;
+    let ctx = chat.ctx.clone();
+    assert!(chat.state_mut().app.compare_message_with_draft(answer_id, Some(&ctx)));
+    wait_for_branch_diff(&mut chat);
+    assert_eq!(chat.state().app.input, "Keep my next draft 🌱");
+    assert_eq!(chat.state().app.committed.len(), 2);
+
+    // Reject stale generation acceptance cleanly.
+    let generation = chat
+        .state()
+        .app
+        .branch_comparison
+        .as_ref()
+        .map_or(0, iteration::BranchComparison::generation);
+    assert!(!chat.state_mut().app.accept_comparison_replacement(
+        iteration::AcceptComparisonReplacement {
+            generation: generation.wrapping_add(99),
+            side: iteration::ComparisonSide::Left,
+            target: iteration::ComparisonAcceptanceTarget::ActiveDraft {
+                conversation_id: original,
+            },
+        }
+    ));
+    assert_eq!(chat.state().app.input, "Keep my next draft 🌱");
+
+    chat.get_by_role_and_label(egui::Role::Button, "Use left in draft")
+        .click();
+    chat.run();
+    assert!(chat.state().app.branch_comparison.is_none());
+    assert_eq!(chat.state().app.input, "Original answer");
+    assert_eq!(chat.state().app.active_conversation, original);
+    assert_eq!(chat.state().app.committed.len(), 2);
+    assert!(chat.state().commands.try_recv().is_err());
+
+    // NewBranchDraft acceptance creates a new branch with the accepted snapshot draft while
+    // preserving the original conversation's history and unsent draft untouched.
+    chat.state_mut().app.input = "Source draft preserved 🚀".into();
+    let left = branch_diff::BranchDiffSource {
+        origin: branch_diff::BranchDiffOrigin::Message {
+            conversation_id: original,
+            message_id: answer_id,
+            history_index: Some(1),
+        },
+        title: "Original branch".to_owned(),
+        text: "Original answer\r\n日本語".to_owned(),
+    };
+    let right = branch_diff::BranchDiffSource {
+        origin: branch_diff::BranchDiffOrigin::Snapshot {
+            conversation_id: original,
+            label: "Alternate draft".to_owned(),
+        },
+        title: "Alternate branch".to_owned(),
+        text: "Alternate answer\r\n🚀".to_owned(),
+    };
+    assert!(chat.state_mut().app.start_branch_comparison(
+        left,
+        right,
+        iteration::ComparisonAcceptanceTarget::NewBranchDraft {
+            source_conversation: original,
+            history_prefix: 2,
+        },
+        Some(&ctx),
+    ));
+    wait_for_branch_diff(&mut chat);
+    assert_eq!(chat.state().app.conversations.len(), 1);
+    assert_eq!(chat.state().app.input, "Source draft preserved 🚀");
+
+    chat.get_by_role_and_label(egui::Role::Button, "Branch with right draft")
+        .click();
+    chat.run();
+    assert!(chat.state().app.branch_comparison.is_none());
+    assert_ne!(chat.state().app.active_conversation, original);
+    assert_eq!(chat.state().app.conversations.len(), 2);
+    assert_eq!(chat.state().app.input, "Alternate answer\r\n🚀");
+    assert_eq!(chat.state().app.committed.len(), 2);
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::RestoreChat(history)) if history.len() == 2
+    ));
+    assert!(chat.state().commands.try_recv().is_err());
+
+    let saved_original = chat
+        .state()
+        .app
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == original)
+        .and_then(|conversation| conversation.saved.as_ref());
+    assert!(saved_original.is_some_and(|snapshot| {
+        snapshot.input == "Source draft preserved 🚀"
+            && snapshot.committed.len() == 2
+            && snapshot.committed[1].content.as_ref() == "Original answer"
+    }));
+}
+
+#[test]
+fn branch_comparison_oversized_error_offers_no_acceptance_and_keeps_draft_intact() {
+    let mut chat = harness([1180.0, 860.0]);
+    let original = chat.state().app.active_conversation;
+    let ctx = chat.ctx.clone();
+    let left = branch_diff::BranchDiffSource {
+        origin: branch_diff::BranchDiffOrigin::Draft {
+            conversation_id: original,
+        },
+        title: "Oversized".to_owned(),
+        text: "x".repeat(INPUT_LIMIT * 4 + 1),
+    };
+    let right = branch_diff::BranchDiffSource {
+        origin: branch_diff::BranchDiffOrigin::Draft {
+            conversation_id: original,
+        },
+        title: "Current draft".to_owned(),
+        text: "Keep my next draft 🌱".to_owned(),
+    };
+    assert!(chat.state_mut().app.start_branch_comparison(
+        left,
+        right,
+        iteration::ComparisonAcceptanceTarget::ActiveDraft {
+            conversation_id: original,
+        },
+        Some(&ctx),
+    ));
+    wait_for_branch_diff(&mut chat);
+
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Use left in draft")
+            .is_none()
+    );
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Use right in draft")
+            .is_none()
+    );
+    let generation = chat
+        .state()
+        .app
+        .branch_comparison
+        .as_ref()
+        .map_or(0, iteration::BranchComparison::generation);
+    assert!(!chat.state_mut().app.accept_comparison_replacement(
+        iteration::AcceptComparisonReplacement {
+            generation,
+            side: iteration::ComparisonSide::Right,
+            target: iteration::ComparisonAcceptanceTarget::ActiveDraft {
+                conversation_id: original,
+            },
+        }
+    ));
+
+    chat.get_by_role_and_label(egui::Role::Button, "Close")
+        .click();
+    chat.run();
+    assert!(chat.state().app.branch_comparison.is_none());
+    assert_eq!(chat.state().app.input, "Keep my next draft 🌱");
+    assert_eq!(chat.state().app.committed.len(), 2);
+}
+
+#[test]
+fn branch_comparison_escape_and_previous_branch_comparison_preserve_sources() {
+    let mut chat = harness([1180.0, 860.0]);
+    let original = chat.state().app.active_conversation;
+    // Create a branch so two distinct conversations exist.
+    open_actions(&mut chat, 2);
+    chat.get_by_role_and_label(egui::Role::Button, "Branch from here")
+        .click();
+    chat.run();
+    let branch = chat.state().app.active_conversation;
+    assert_ne!(branch, original);
+    while chat.state().commands.try_recv().is_ok() {}
+
+    chat.state_mut().app.input = "Branch draft before compare".into();
+    open_actions(&mut chat, 1);
+    chat.get_by_role_and_label(egui::Role::Button, "Edit and resend")
+        .click();
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::Button, "Compare previous branch")
+        .click();
+    wait_for_branch_diff(&mut chat);
+    assert!(chat.query_by_label("Compare branch and draft").is_some());
+
+    // Pressing Ctrl+N or Escape while comparison modal is open must not open a new chat
+    // and Escape must only dismiss the comparison modal.
+    chat.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::N);
+    chat.run();
+    assert_eq!(chat.state().app.conversations.len(), 2);
+    chat.key_press(egui::Key::Escape);
+    chat.run();
+    assert!(chat.state().app.branch_comparison.is_none());
+    assert!(chat.state().app.edit_message.is_some());
+    assert_eq!(chat.state().app.active_conversation, branch);
+    assert_eq!(chat.state().app.input, "Branch draft before compare");
+    assert!(chat.state().commands.try_recv().is_err());
+
+    // Close edit dialog and verify "Compare with draft" path too.
+    chat.get_by_role_and_label(egui::Role::Button, "Compare with draft")
+        .click();
+    wait_for_branch_diff(&mut chat);
+    assert!(chat.query_by_label("Compare branch and draft").is_some());
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss comparison")
+        .click();
+    chat.run();
+    assert!(chat.state().app.branch_comparison.is_none());
+    assert_eq!(chat.state().app.input, "Branch draft before compare");
+}
