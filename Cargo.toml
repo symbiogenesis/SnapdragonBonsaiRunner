@@ -29,6 +29,7 @@ repository = "https://github.com/symbiogenesis/SwiftBonsai2Runner"
 ash = { version = "=0.38.0", default-features = false }
 base64ct = { version = "=1.8.3", default-features = false, features = ["alloc"] }
 bonsai-artifacts = { path = "src/artifacts" }
+bonsai-gguf = { version = "=0.1.7", default-features = false }
 bonsai-native-hash = "=0.1.4"
 bonsai-neon-dot = "=0.1.6"
 bonsai-ternary = "=0.1.4"

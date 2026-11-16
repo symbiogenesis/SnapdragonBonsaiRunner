@@ -155,21 +155,7 @@ fn half_scale(bytes: &[u8]) -> f32 {
 
 #[inline]
 pub(super) const fn unpack_q4_k_scale_min(group: usize, packed: &[u8]) -> (u8, u8) {
-    #[cfg(all(windows, feature = "rust-qualification"))]
-    {
-        quant_kernels::unpack_q4_k_scale_min(group, packed)
-    }
-    #[cfg(not(all(windows, feature = "rust-qualification")))]
-    {
-        if group < 4 {
-            (packed[group] & 63, packed[group + 4] & 63)
-        } else {
-            (
-                (packed[group + 4] & 15) | ((packed[group - 4] >> 6) << 4),
-                (packed[group + 4] >> 4) | ((packed[group] >> 6) << 4),
-            )
-        }
-    }
+    bonsai_ternary::unpack_q4_k_scale_min(group, packed)
 }
 
 /// Decode one row of `Q4_K` super-blocks (`144` bytes / `256` elements) into `out`.
@@ -1756,75 +1742,18 @@ pub(super) fn attend_head(
 /// when `value` is nonfinite or rounds to infinity (`|value| >= 65520`).
 #[inline]
 pub(super) fn checked_float_to_half(value: f32) -> Option<u16> {
-    #[cfg(all(windows, feature = "rust-qualification"))]
-    {
-        quant_kernels::checked_float_to_half(value)
-    }
-    #[cfg(not(all(windows, feature = "rust-qualification")))]
-    {
-        if (value.to_bits() & 0x7fff_ffff) >= 0x477f_f000 {
-            return None;
-        }
-        let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
-        let bits = value.to_bits();
-        let doubled = bits.wrapping_add(bits);
-        let exponent_bias = (doubled & 0xff00_0000).max(0x7100_0000);
-        base += f32::from_bits((exponent_bias >> 1) + 0x0780_0000);
-        let rounded = base.to_bits();
-        let magnitude = ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff);
-        let word = ((bits >> 16) & 0x8000) | magnitude;
-        let [lo, hi, _, _] = word.to_le_bytes();
-        Some(u16::from_le_bytes([lo, hi]))
-    }
+    bonsai_ternary::checked_float_to_half(value)
 }
 
 /// Narrow finite `f32` values into IEEE binary16 words (`FCVTN` SIMD on ARM64 Windows),
 /// returning `false` on non-finite input, length mismatch, or overflow past finite `f16` range.
 pub(super) fn narrow_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) -> bool {
-    if src.len() != dst.len() {
-        return false;
-    }
-    #[cfg(all(windows, feature = "rust-qualification"))]
-    {
-        quant_kernels::narrow_f32_slice_to_f16(src, dst)
-    }
-    #[cfg(not(all(windows, feature = "rust-qualification")))]
-    {
-        for (&value, slot) in src.iter().zip(dst.iter_mut()) {
-            let Some(bits) = checked_float_to_half(value) else {
-                return false;
-            };
-            *slot = bits;
-        }
-        true
-    }
+    bonsai_neon_dot::narrow_f32_slice_checked(src, dst)
 }
 
 /// Widen IEEE binary16 words into `f32` values (`FCVTL` SIMD on ARM64 Windows).
 pub(super) fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
-    #[cfg(all(windows, feature = "rust-qualification"))]
-    {
-        quant_kernels::widen_f16_slice(src, dst);
-    }
-    #[cfg(not(all(windows, feature = "rust-qualification")))]
-    {
-        let n = src.len().min(dst.len());
-        let (src8, src_tail) = src[..n].as_chunks::<8>();
-        let (dst8, dst_tail) = dst[..n].as_chunks_mut::<8>();
-        for (s, d) in src8.iter().zip(dst8.iter_mut()) {
-            let [lo, hi] = bonsai_neon_dot::widen_f16_eight(s);
-            d[..4].copy_from_slice(&lo);
-            d[4..].copy_from_slice(&hi);
-        }
-        let (src4, src_rem) = src_tail.as_chunks::<4>();
-        let (dst4, dst_rem) = dst_tail.as_chunks_mut::<4>();
-        if let (Some(s), Some(d)) = (src4.first(), dst4.first_mut()) {
-            *d = bonsai_neon_dot::widen_f16_four(s);
-        }
-        for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
-            *slot = bonsai_ternary::half_to_float(bits);
-        }
-    }
+    bonsai_neon_dot::widen_f16_slice(src, dst);
 }
 
 /// Evaluate one attention head over packed `u16` (`F16`) cached KV storage without

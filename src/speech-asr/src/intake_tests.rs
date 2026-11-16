@@ -1,6 +1,6 @@
 //! Independently assembled GGUF wire/layout cases; no native engine or model.
 
-use super::{Index, Reader, Tensor, Value, invalid, model, validate};
+use super::{Index, Tensor, Value, invalid, model, validate};
 use std::io::{self, Cursor};
 
 fn text(output: &mut Vec<u8>, value: &str) {
@@ -72,13 +72,7 @@ fn wire(
 
 fn parse(bytes: Vec<u8>) -> io::Result<Index> {
     let length = u64::try_from(bytes.len()).map_err(|_| invalid())?;
-    Reader {
-        source: Cursor::new(bytes),
-        length,
-        remaining: super::MAX_METADATA,
-        cancel: &mut || false,
-    }
-    .index()
+    super::read_index(&mut Cursor::new(bytes), length, &mut || false)
 }
 
 #[test]
@@ -354,28 +348,40 @@ fn rust_asr_intake_prompt_preserves_declared_audio_ids_with_duplicate_spellings(
 
 #[test]
 fn rust_asr_intake_charges_empty_string_arrays_and_skipped_scalars() {
-    let mut reader = Reader {
-        source: Cursor::new(strings(&["", ""])),
-        length: 32,
-        remaining: 63,
-        cancel: &mut || false,
-    };
-    // Two empty strings still own two String objects and their length words.
-    assert!(reader.value().is_err());
-    let mut reader = Reader {
-        source: Cursor::new(
-            [
-                9_u32.to_le_bytes().as_slice(),
-                5_u32.to_le_bytes().as_slice(),
-                100_u64.to_le_bytes().as_slice(),
-            ]
-            .concat(),
-        ),
-        length: 16,
-        remaining: 64,
-        cancel: &mut || false,
-    };
-    assert!(reader.value().is_err());
+    let bytes = wire(&[("t", strings(&["", ""]))], &[("w", &[1], 0, 0)], 4);
+    let length = u64::try_from(bytes.len()).unwrap_or_default();
+    let required = 128 + (1 + 32) + 2 * size_of::<String>() + 2 * 32 + 512 + (1 + 32);
+    assert!(
+        super::read_index_with_budget(&mut Cursor::new(&bytes), length, required - 1, &mut || {
+            false
+        },)
+        .is_err()
+    );
+    assert!(
+        super::read_index_with_budget(&mut Cursor::new(&bytes), length, required, &mut || false,)
+            .is_ok()
+    );
+
+    let mut skipped = [
+        9_u32.to_le_bytes().as_slice(),
+        5_u32.to_le_bytes().as_slice(),
+        100_u64.to_le_bytes().as_slice(),
+    ]
+    .concat();
+    skipped.resize(skipped.len() + 400, 0);
+    let bytes = wire(&[("k", skipped)], &[("w", &[1], 0, 0)], 4);
+    let length = u64::try_from(bytes.len()).unwrap_or_default();
+    let required = 128 + (1 + 32) + 400 + 512 + (1 + 32);
+    assert!(
+        super::read_index_with_budget(&mut Cursor::new(&bytes), length, required - 1, &mut || {
+            false
+        },)
+        .is_err()
+    );
+    assert!(
+        super::read_index_with_budget(&mut Cursor::new(&bytes), length, required, &mut || false,)
+            .is_ok()
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -60,232 +60,134 @@ pub(crate) struct Weights {
     stream_buf: Vec<u8>,
 }
 
-fn text(reader: &mut impl Read, budget: &mut usize, limit: usize) -> io::Result<String> {
-    let mut bytes = Vec::new();
-    text_bytes(reader, budget, limit, &mut bytes)?;
-    String::from_utf8(bytes).map_err(|_| invalid())
+const ALLOWED_TTS_TENSORS: &[u32] = &[0, 1, 8, 12, 14];
+
+fn retain_tts_strings(key: &str) -> bool {
+    matches!(key, "tokenizer.ggml.tokens" | "tokenizer.ggml.merges")
 }
 
-fn text_bytes(
-    reader: &mut impl Read,
-    budget: &mut usize,
-    limit: usize,
-    bytes: &mut Vec<u8>,
-) -> io::Result<()> {
-    let length = usize::try_from(read_u64(reader)?).map_err(|_| invalid())?;
-    if length > limit || length > *budget {
-        return Err(invalid());
-    }
-    *budget -= length;
-    bytes.clear();
-    bytes.try_reserve_exact(length).map_err(|_| invalid())?;
-    bytes.resize(length, 0);
-    reader.read_exact(bytes)?;
-    if bytes.contains(&0) {
-        return Err(invalid());
-    }
-    Ok(())
+const fn retain_tts_scalar_arrays(_key: &str, element_type_id: u32) -> bool {
+    matches!(element_type_id, 4 | 5)
 }
 
-fn validate_bool_bytes(reader: &mut impl Read, count: u64) -> io::Result<()> {
-    let mut read = 0_u64;
-    let mut scratch = [0_u8; 1024];
-    while read < count {
-        let step = usize::try_from((count - read).min(1024)).map_err(|_| invalid())?;
-        reader.read_exact(&mut scratch[..step])?;
-        if scratch[..step].iter().any(|&byte| byte > 1) {
-            return Err(invalid());
-        }
-        read += u64::try_from(step).map_err(|_| invalid())?;
-    }
-    Ok(())
-}
-
-fn skip(reader: &mut (impl Read + Seek), bytes: u64, length: u64) -> io::Result<()> {
-    let end = reader
-        .stream_position()?
-        .checked_add(bytes)
-        .ok_or_else(invalid)?;
-    if end > length {
-        return Err(invalid());
-    }
-    reader.seek(SeekFrom::Start(end))?;
-    Ok(())
-}
-
-fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
-    let mut bytes = [0_u8; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
-    let mut bytes = [0_u8; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn scalar_width(kind: u32) -> io::Result<u64> {
-    match kind {
-        0 | 1 | 7 => Ok(1),
-        2 | 3 => Ok(2),
-        4 | 5 | 6 => Ok(4),
-        10..=12 => Ok(8),
-        _ => Err(invalid()),
+fn tts_index_policy(
+    allow_zero_tensors: bool,
+    metadata_budget: usize,
+) -> bonsai_gguf::IndexPolicy<'static> {
+    bonsai_gguf::IndexPolicy {
+        allow_v2: true,
+        allow_zero_tensors,
+        allow_zero_metadata: true,
+        max_file_bytes: MAX_FILE_BYTES,
+        max_tensors: MAX_ITEMS,
+        max_metadata: MAX_ITEMS,
+        metadata_budget,
+        max_key_bytes: 65_536,
+        max_string_bytes: 16 * 1024 * 1024,
+        max_array_string_bytes: 16 * 1024 * 1024,
+        max_retained_string_array_bytes: Some(MAX_RETAINED_STRING_BYTES),
+        max_array_items: 1_000_000,
+        max_alignment: 1_048_576,
+        allow_positive_i32_alignment: true,
+        reject_nonfinite_floats: true,
+        reject_interior_nul_keys: true,
+        reject_interior_nul_strings: true,
+        kv_overhead_bytes: 0,
+        string_overhead_bytes: 0,
+        tensor_overhead_bytes: 0,
+        charge_string_array_slots: false,
+        charge_skipped_scalar_arrays: false,
+        prism_dialect: false,
+        allowed_tensor_types: Some(ALLOWED_TTS_TENSORS),
+        retain_string_array: retain_tts_strings,
+        retain_scalar_array: retain_tts_scalar_arrays,
     }
 }
 
-fn metadata_value(
-    reader: &mut (impl Read + Seek),
-    length: u64,
-    budget: &mut usize,
-    retained_bytes: &mut usize,
-    retain_strings: bool,
-) -> io::Result<Metadata> {
-    Ok(match read_u32(reader)? {
-        4 => Metadata::U32(read_u32(reader)?),
-        5 => Metadata::I32(i32::from_le_bytes(read_u32(reader)?.to_le_bytes())),
-        6 => {
-            let value = f32::from_bits(read_u32(reader)?);
-            if !value.is_finite() {
-                return Err(invalid());
-            }
-            Metadata::F32(value)
-        }
-        7 => {
-            let mut byte = [0_u8; 1];
-            reader.read_exact(&mut byte)?;
-            if byte[0] > 1 {
-                return Err(invalid());
-            }
-            Metadata::Other
-        }
-        8 => Metadata::String(text(reader, budget, 16 * 1024 * 1024)?),
-        9 => {
-            let kind = read_u32(reader)?;
-            let count = read_u64(reader)?;
-            if count > 1_000_000 {
-                return Err(invalid());
-            }
-            if kind == 4 || kind == 5 {
-                let count = usize::try_from(count).map_err(|_| invalid())?;
-                let bytes = count.checked_mul(4).ok_or_else(invalid)?;
-                if bytes > *budget {
-                    return Err(invalid());
-                }
-                *budget -= bytes;
-                let mut values = Vec::with_capacity(count);
-                for _ in 0..count {
-                    values.push(read_u32(reader)?);
-                }
-                if kind == 5 && values.iter().any(|value| *value > i32::MAX.unsigned_abs()) {
-                    Metadata::Other
-                } else {
-                    Metadata::U32Array(values)
-                }
-            } else if kind == 7 {
-                validate_bool_bytes(reader, count)?;
-                Metadata::Other
-            } else if kind == 8 {
-                if retain_strings {
-                    let count = usize::try_from(count).map_err(|_| invalid())?;
-                    let remaining = length.saturating_sub(reader.stream_position()?);
-                    if count.checked_mul(8).is_none_or(|min_bytes| {
-                        u64::try_from(min_bytes).unwrap_or(u64::MAX) > remaining
-                    }) {
-                        return Err(invalid());
-                    }
-                    let mut values = Vec::new();
-                    values.try_reserve_exact(count).map_err(|_| invalid())?;
-                    for _ in 0..count {
-                        let mut item = Vec::new();
-                        text_bytes(reader, budget, 16 * 1024 * 1024, &mut item)?;
-                        let _ = std::str::from_utf8(&item).map_err(|_| invalid())?;
-                        *retained_bytes = retained_bytes
-                            .checked_add(item.len())
-                            .filter(|&total| total <= MAX_RETAINED_STRING_BYTES)
-                            .ok_or_else(invalid)?;
-                        values.push(item.into_boxed_slice());
-                    }
-                    Metadata::StringArray(values)
-                } else {
-                    // Validate discarded string arrays without allocating a String
-                    // per entry; only tokenizer token and merge arrays are retained.
-                    let mut scratch = Vec::new();
-                    for _ in 0..count {
-                        text_bytes(reader, budget, 16 * 1024 * 1024, &mut scratch)?;
-                        let _ = std::str::from_utf8(&scratch).map_err(|_| invalid())?;
-                    }
-                    Metadata::Other
-                }
-            } else {
-                skip(
-                    reader,
-                    count.checked_mul(scalar_width(kind)?).ok_or_else(invalid)?,
-                    length,
-                )?;
-                Metadata::Other
-            }
-        }
-        kind => {
-            skip(reader, scalar_width(kind)?, length)?;
-            Metadata::Other
-        }
-    })
+fn map_tts_metadata(entry: bonsai_gguf::IndexValue) -> Metadata {
+    use bonsai_gguf::{IndexValue, MetadataArray, MetadataValue};
+    match entry {
+        IndexValue::Metadata(meta) => match meta {
+            MetadataValue::U32(value) => Metadata::U32(value),
+            MetadataValue::I32(value) => Metadata::I32(value),
+            MetadataValue::F32(value) => Metadata::F32(value),
+            MetadataValue::String(value) => Metadata::String(value),
+            MetadataValue::Array(MetadataArray::U32(values)) => Metadata::U32Array(values),
+            MetadataValue::Array(MetadataArray::I32(values)) => values
+                .into_iter()
+                .map(|value| u32::try_from(value).ok())
+                .collect::<Option<Vec<u32>>>()
+                .map_or(Metadata::Other, Metadata::U32Array),
+            MetadataValue::Array(MetadataArray::String(values)) => Metadata::StringArray(
+                values
+                    .into_iter()
+                    .map(|value| value.into_bytes().into_boxed_slice())
+                    .collect(),
+            ),
+            _ => Metadata::Other,
+        },
+        IndexValue::SkippedArray { .. } => Metadata::Other,
+    }
 }
 
-fn read_header(
-    reader: &mut (impl Read + Seek),
+struct ParsedWeightsIndex {
+    metadata: BTreeMap<String, Metadata>,
+    tensors: BTreeMap<String, Tensor>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained for GGUF budget accounting assertions in unit tests."
+        )
+    )]
+    remaining_budget: usize,
+}
+
+fn parse_index(
+    source: &mut (impl Read + Seek),
     length: u64,
     allow_zero_tensors: bool,
-) -> io::Result<(BTreeMap<String, Metadata>, u64, u64, usize)> {
-    let mut magic = [0; 4];
-    reader.read_exact(&mut magic)?;
-    if &magic != b"GGUF" || !matches!(read_u32(reader)?, 2 | 3) {
-        return Err(invalid());
-    }
-    let tensor_count = read_u64(reader)?;
-    let metadata_count = read_u64(reader)?;
-    if (!allow_zero_tensors && tensor_count == 0)
-        || tensor_count > MAX_ITEMS
-        || metadata_count > MAX_ITEMS
-    {
-        return Err(invalid());
-    }
-    let mut budget = MAX_METADATA_BYTES;
-    let mut retained_bytes = 0_usize;
-    let mut metadata = BTreeMap::new();
-    for _ in 0..metadata_count {
-        let key = text(reader, &mut budget, 65_536)?;
-        if key.is_empty() || metadata.contains_key(&key) {
-            return Err(invalid());
+    budget: usize,
+) -> io::Result<ParsedWeightsIndex> {
+    let parsed = bonsai_gguf::read_index(
+        source,
+        length,
+        &tts_index_policy(allow_zero_tensors, budget),
+    )
+    .map_err(|err| {
+        if err.kind() == io::ErrorKind::InvalidData {
+            invalid()
+        } else {
+            err
         }
-        let retain_strings = matches!(
-            key.as_str(),
-            "tokenizer.ggml.tokens" | "tokenizer.ggml.merges"
+    })?;
+    let metadata = parsed
+        .metadata
+        .into_iter()
+        .map(|(key, value)| (key, map_tts_metadata(value)))
+        .collect();
+    let mut tensors = BTreeMap::new();
+    for (name, tensor) in parsed.tensors {
+        let mut shape = Vec::with_capacity(tensor.dimensions.len());
+        for dim in tensor.dimensions {
+            shape.push(usize::try_from(dim).map_err(|_| invalid())?);
+        }
+        let bytes = usize::try_from(tensor.bytes).map_err(|_| invalid())?;
+        tensors.insert(
+            name,
+            Tensor {
+                shape,
+                kind: tensor.type_id,
+                offset: tensor.offset,
+                bytes,
+            },
         );
-        let value = metadata_value(
-            reader,
-            length,
-            &mut budget,
-            &mut retained_bytes,
-            retain_strings,
-        )?;
-        metadata.insert(key, value);
     }
-    let alignment = match metadata.get("general.alignment") {
-        None => 32,
-        Some(Metadata::U32(value)) if value.is_power_of_two() && *value <= 1_048_576 => {
-            u64::from(*value)
-        }
-        Some(Metadata::I32(value))
-            if *value > 0 && value.unsigned_abs().is_power_of_two() && *value <= 1_048_576 =>
-        {
-            u64::from(value.unsigned_abs())
-        }
-        _ => return Err(invalid()),
-    };
-    Ok((metadata, tensor_count, alignment, budget))
+    Ok(ParsedWeightsIndex {
+        metadata,
+        tensors,
+        remaining_budget: parsed.remaining_budget,
+    })
 }
 
 impl Weights {
@@ -333,70 +235,15 @@ impl Weights {
         )
     }
 
-    fn read(path: PathBuf, file: File, length: u64, allow_zero_tensors: bool) -> io::Result<Self> {
-        let mut reader = BufReader::with_capacity(256 * 1024, file);
-        let (metadata, tensor_count, alignment, mut budget) =
-            read_header(&mut reader, length, allow_zero_tensors)?;
-        let mut tensors = BTreeMap::new();
-        for _ in 0..tensor_count {
-            let name = text(&mut reader, &mut budget, 65_536)?;
-            let dimensions = read_u32(&mut reader)?;
-            if name.is_empty() || tensors.contains_key(&name) || !(1..=4).contains(&dimensions) {
-                return Err(invalid());
-            }
-            let mut shape = Vec::new();
-            let mut elements = 1_usize;
-            for _ in 0..dimensions {
-                let size = usize::try_from(read_u64(&mut reader)?).map_err(|_| invalid())?;
-                if size == 0 {
-                    return Err(invalid());
-                }
-                elements = elements.checked_mul(size).ok_or_else(invalid)?;
-                shape.push(size);
-            }
-            let kind = read_u32(&mut reader)?;
-            let offset = read_u64(&mut reader)?;
-            let (block, bytes) = packed_layout(kind)?;
-            if !shape[0].is_multiple_of(block) || !offset.is_multiple_of(alignment) {
-                return Err(invalid());
-            }
-            let bytes = (elements / block).checked_mul(bytes).ok_or_else(invalid)?;
-            tensors.insert(
-                name,
-                Tensor {
-                    shape,
-                    kind,
-                    offset,
-                    bytes,
-                },
-            );
-        }
-        if !tensors.is_empty() {
-            let position = reader.stream_position()?;
-            let data = position
-                .checked_next_multiple_of(alignment)
-                .ok_or_else(invalid)?;
-            if data > length {
-                return Err(invalid());
-            }
-            let mut ranges = Vec::with_capacity(tensors.len());
-            for tensor in tensors.values_mut() {
-                tensor.offset = data.checked_add(tensor.offset).ok_or_else(invalid)?;
-                let end = tensor
-                    .offset
-                    .checked_add(u64::try_from(tensor.bytes).map_err(|_| invalid())?)
-                    .ok_or_else(invalid)?;
-                if tensor.offset < data || end > length {
-                    return Err(invalid());
-                }
-                ranges.push((tensor.offset, end));
-            }
-            ranges.sort_unstable();
-            if ranges.array_windows().any(|[left, right]| left.1 > right.0) {
-                return Err(invalid());
-            }
-        }
-        let file = reader.into_inner();
+    fn read(
+        path: PathBuf,
+        mut file: File,
+        length: u64,
+        allow_zero_tensors: bool,
+    ) -> io::Result<Self> {
+        let ParsedWeightsIndex {
+            metadata, tensors, ..
+        } = parse_index(&mut file, length, allow_zero_tensors, MAX_METADATA_BYTES)?;
         #[cfg(windows)]
         let mapped = if tensors.is_empty() {
             None
@@ -604,21 +451,7 @@ pub(crate) fn half(bytes: &[u8]) -> f32 {
 
 #[inline]
 pub(crate) const fn unpack_q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
-    #[cfg(windows)]
-    {
-        bonsai_windows_process::quant_kernels::unpack_q4_k_scale_min(group, scales)
-    }
-    #[cfg(not(windows))]
-    {
-        if group < 4 {
-            (scales[group] & 63, scales[group + 4] & 63)
-        } else {
-            (
-                (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4),
-                (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
-            )
-        }
-    }
+    bonsai_ternary::unpack_q4_k_scale_min(group, scales)
 }
 
 pub(crate) fn validate_packed(kind: u32, bytes: &[u8]) -> io::Result<()> {
@@ -791,7 +624,9 @@ mod tests {
     #[test]
     fn gguf_integer_metadata_accepts_nonnegative_signed_rates_and_rejects_negative_rates()
     -> io::Result<()> {
-        let mut bytes = Vec::new();
+        let mut bytes = gguf_header(1);
+        let _ = push_kv_str(&mut bytes, b"k");
+        let value_offset = bytes.len();
         bytes.extend(9_u32.to_le_bytes());
         bytes.extend(5_u32.to_le_bytes());
         bytes.extend(4_u64.to_le_bytes());
@@ -799,33 +634,32 @@ mod tests {
             bytes.extend(value.to_le_bytes());
         }
         let length = u64::try_from(bytes.len()).map_err(|_| invalid())?;
-        let mut budget = MAX_METADATA_BYTES;
-        let mut retained = 0;
-        let value = metadata_value(
+        let parsed = parse_index(
             &mut io::Cursor::new(&bytes),
             length,
-            &mut budget,
-            &mut retained,
-            false,
+            true,
+            MAX_METADATA_BYTES,
         )?;
-        assert!(matches!(value, Metadata::U32Array(values) if values == [8,5,4,3]));
-        bytes[16..20].copy_from_slice(&(-1_i32).to_le_bytes());
         assert!(matches!(
-            metadata_value(
-                &mut io::Cursor::new(bytes),
-                length,
-                &mut budget,
-                &mut retained,
-                false,
-            )?,
-            Metadata::Other
+            parsed.metadata.get("k"),
+            Some(Metadata::U32Array(values)) if values == &[8, 5, 4, 3]
         ));
+        bytes[value_offset + 16..value_offset + 20].copy_from_slice(&(-1_i32).to_le_bytes());
+        let parsed = parse_index(
+            &mut io::Cursor::new(bytes),
+            length,
+            true,
+            MAX_METADATA_BYTES,
+        )?;
+        assert!(matches!(parsed.metadata.get("k"), Some(Metadata::Other)));
         Ok(())
     }
 
     #[test]
     fn discarded_tokenizer_arrays_preserve_utf8_budget_and_truncation_checks() -> io::Result<()> {
-        let mut bytes = Vec::new();
+        let mut bytes = gguf_header(1);
+        let _ = push_kv_str(&mut bytes, b"k");
+        let value_offset = bytes.len();
         bytes.extend(9_u32.to_le_bytes());
         bytes.extend(8_u32.to_le_bytes());
         bytes.extend(3_u64.to_le_bytes());
@@ -839,56 +673,24 @@ mod tests {
             bytes.extend(spelling.bytes());
         }
         let length = u64::try_from(bytes.len()).map_err(|_| invalid())?;
-        let required: usize = strings.iter().map(|spelling| spelling.len()).sum();
-        let mut budget = required;
-        let mut retained = 0;
-        assert!(matches!(
-            metadata_value(
-                &mut io::Cursor::new(&bytes),
-                length,
-                &mut budget,
-                &mut retained,
-                false,
-            )?,
-            Metadata::Other
-        ));
-        assert_eq!(budget, 0);
-        budget = required - 1;
+        let required: usize = 1 + strings.iter().map(|spelling| spelling.len()).sum::<usize>();
+        let parsed = parse_index(&mut io::Cursor::new(&bytes), length, true, required)?;
+        assert!(matches!(parsed.metadata.get("k"), Some(Metadata::Other)));
+        assert_eq!(parsed.remaining_budget, 0);
+        assert!(parse_index(&mut io::Cursor::new(&bytes), length, true, required - 1).is_err());
         assert!(
-            metadata_value(
-                &mut io::Cursor::new(&bytes),
-                length,
-                &mut budget,
-                &mut retained,
-                false,
-            )
-            .is_err()
-        );
-        budget = required;
-        assert!(
-            metadata_value(
+            parse_index(
                 &mut io::Cursor::new(&bytes[..bytes.len() - 1]),
                 length - 1,
-                &mut budget,
-                &mut retained,
-                false,
+                true,
+                required,
             )
             .is_err()
         );
         // Corrupt the multibyte spelling while leaving lengths and bounds valid.
-        let unicode = 16 + 8 + strings[0].len() + 8;
+        let unicode = value_offset + 16 + 8 + strings[0].len() + 8;
         bytes[unicode] = 0xff;
-        budget = required;
-        assert!(
-            metadata_value(
-                &mut io::Cursor::new(bytes),
-                length,
-                &mut budget,
-                &mut retained,
-                false,
-            )
-            .is_err()
-        );
+        assert!(parse_index(&mut io::Cursor::new(bytes), length, true, required).is_err());
         Ok(())
     }
 
@@ -1211,14 +1013,22 @@ mod tests {
         valid.extend(2_u64.to_le_bytes());
         valid.extend([0_u8, 1_u8]);
         let len = u64::try_from(valid.len()).unwrap_or(u64::MAX);
-        assert!(read_header(&mut io::Cursor::new(&valid), len, true).is_ok());
+        assert!(parse_index(&mut io::Cursor::new(&valid), len, true, MAX_METADATA_BYTES).is_ok());
 
         let mut bad_scalar = gguf_header(1);
         let _ = push_kv_str(&mut bad_scalar, b"flag");
         bad_scalar.extend(7_u32.to_le_bytes());
         bad_scalar.push(2);
         let len = u64::try_from(bad_scalar.len()).unwrap_or(u64::MAX);
-        assert!(read_header(&mut io::Cursor::new(&bad_scalar), len, true).is_err());
+        assert!(
+            parse_index(
+                &mut io::Cursor::new(&bad_scalar),
+                len,
+                true,
+                MAX_METADATA_BYTES
+            )
+            .is_err()
+        );
 
         let mut bad_array = gguf_header(1);
         let _ = push_kv_str(&mut bad_array, b"flags");
@@ -1227,7 +1037,15 @@ mod tests {
         bad_array.extend(2_u64.to_le_bytes());
         bad_array.extend([0_u8, 255_u8]);
         let len = u64::try_from(bad_array.len()).unwrap_or(u64::MAX);
-        assert!(read_header(&mut io::Cursor::new(&bad_array), len, true).is_err());
+        assert!(
+            parse_index(
+                &mut io::Cursor::new(&bad_array),
+                len,
+                true,
+                MAX_METADATA_BYTES
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1239,7 +1057,7 @@ mod tests {
             dup.extend(val.to_le_bytes());
         }
         let len = u64::try_from(dup.len()).unwrap_or(u64::MAX);
-        assert!(read_header(&mut io::Cursor::new(&dup), len, true).is_err());
+        assert!(parse_index(&mut io::Cursor::new(&dup), len, true, MAX_METADATA_BYTES).is_err());
 
         for bad_key in [b"\xff".as_slice(), b"a\0b".as_slice()] {
             let mut data = gguf_header(1);
@@ -1247,7 +1065,9 @@ mod tests {
             data.extend(4_u32.to_le_bytes());
             data.extend(1_u32.to_le_bytes());
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            assert!(read_header(&mut io::Cursor::new(&data), len, true).is_err());
+            assert!(
+                parse_index(&mut io::Cursor::new(&data), len, true, MAX_METADATA_BYTES).is_err()
+            );
         }
 
         for bad_val in [b"\xfe\xff".as_slice(), b"ok\0tail".as_slice()] {
@@ -1256,7 +1076,9 @@ mod tests {
             data.extend(8_u32.to_le_bytes());
             let _ = push_kv_str(&mut data, bad_val);
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            assert!(read_header(&mut io::Cursor::new(&data), len, true).is_err());
+            assert!(
+                parse_index(&mut io::Cursor::new(&data), len, true, MAX_METADATA_BYTES).is_err()
+            );
         }
 
         for bad_elem in [b"\x80".as_slice(), b"tok\0suffix".as_slice()] {
@@ -1267,7 +1089,9 @@ mod tests {
             data.extend(1_u64.to_le_bytes());
             let _ = push_kv_str(&mut data, bad_elem);
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            assert!(read_header(&mut io::Cursor::new(&data), len, true).is_err());
+            assert!(
+                parse_index(&mut io::Cursor::new(&data), len, true, MAX_METADATA_BYTES).is_err()
+            );
         }
     }
 

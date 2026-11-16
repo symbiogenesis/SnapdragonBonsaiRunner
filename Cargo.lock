@@ -574,6 +574,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bonsai-gguf"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "111c6148f4ef061e33fc30e4b4dae4fef60ba53586bca61ad5c775fb77311a7c"
+dependencies = [
+ "bonsai-native-hash",
+ "hex",
+]
+
+[[package]]
 name = "bonsai-markdown"
 version = "0.3.3"
 dependencies = [
@@ -608,6 +618,7 @@ version = "0.3.3"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-cpu-policy",
+ "bonsai-gguf",
  "bonsai-native-hash",
  "bonsai-neon-dot",
  "bonsai-speech-service",
@@ -644,6 +655,7 @@ dependencies = [
  "bonsai-artifacts",
  "bonsai-audio",
  "bonsai-cpu-policy",
+ "bonsai-gguf",
  "bonsai-native-hash",
  "bonsai-neon-dot",
  "bonsai-speech-service",

@@ -10,7 +10,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, Read, Seek},
 };
 
 #[path = "intake_decoder.rs"]
@@ -56,12 +56,7 @@ struct Index {
     tensors: BTreeMap<String, Tensor>,
 }
 
-struct Reader<'a, R> {
-    source: R,
-    length: u64,
-    remaining: usize,
-    cancel: &'a mut dyn FnMut() -> bool,
-}
+const LINEAR_TYPES: &[u32] = &[0, 1, 2, 3, 6, 7, 8, 12, 13, 14, 30];
 
 fn check_cancel(cancel: &mut (impl FnMut() -> bool + ?Sized)) -> io::Result<()> {
     if cancel() {
@@ -71,230 +66,33 @@ fn check_cancel(cancel: &mut (impl FnMut() -> bool + ?Sized)) -> io::Result<()> 
     }
 }
 
-impl<R: Read + Seek> Reader<'_, R> {
-    fn bytes<const N: usize>(&mut self) -> io::Result<[u8; N]> {
-        check_cancel(self.cancel)?;
-        let mut bytes = [0; N];
-        self.source.read_exact(&mut bytes)?;
-        Ok(bytes)
-    }
-
-    fn u32(&mut self) -> io::Result<u32> {
-        Ok(u32::from_le_bytes(self.bytes()?))
-    }
-
-    fn u64(&mut self) -> io::Result<u64> {
-        Ok(u64::from_le_bytes(self.bytes()?))
-    }
-
-    fn charge(&mut self, bytes: usize) -> io::Result<()> {
-        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(invalid)?;
-        Ok(())
-    }
-
-    fn text(&mut self, limit: usize) -> io::Result<String> {
-        let count = usize::try_from(self.u64()?).map_err(|_| invalid())?;
-        if count > limit {
-            return Err(invalid());
-        }
-        self.charge(count.checked_add(32).ok_or_else(invalid)?)?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(count).map_err(|_| invalid())?;
-        bytes.resize(count, 0);
-        check_cancel(self.cancel)?;
-        self.source.read_exact(&mut bytes)?;
-        String::from_utf8(bytes).map_err(|_| invalid())
-    }
-
-    fn skip(&mut self, bytes: u64) -> io::Result<()> {
-        check_cancel(self.cancel)?;
-        let end = self
-            .source
-            .stream_position()?
-            .checked_add(bytes)
-            .ok_or_else(invalid)?;
-        if end > self.length {
-            return Err(invalid());
-        }
-        self.source.seek(SeekFrom::Start(end))?;
-        Ok(())
-    }
-
-    fn value(&mut self) -> io::Result<Value> {
-        let kind = self.u32()?;
-        Ok(match kind {
-            0 => Value::Integer {
-                kind,
-                value: u64::from(self.bytes::<1>()?[0]),
-            },
-            1 => signed(kind, i64::from(i8::from_le_bytes(self.bytes()?))),
-            2 => Value::Integer {
-                kind,
-                value: u64::from(u16::from_le_bytes(self.bytes()?)),
-            },
-            3 => signed(kind, i64::from(i16::from_le_bytes(self.bytes()?))),
-            4 => Value::Integer {
-                kind,
-                value: u64::from(self.u32()?),
-            },
-            5 => signed(kind, i64::from(i32::from_le_bytes(self.bytes()?))),
-            6 => Value::Float {
-                kind,
-                value: f64::from(f32::from_bits(self.u32()?)),
-            },
-            7 => match self.bytes::<1>()?[0] {
-                0 => Value::Boolean(false),
-                1 => Value::Boolean(true),
-                _ => return Err(invalid()),
-            },
-            8 => Value::Text(self.text(65_536)?),
-            9 => self.array()?,
-            10 => Value::Integer {
-                kind,
-                value: self.u64()?,
-            },
-            11 => signed(kind, i64::from_le_bytes(self.bytes()?)),
-            12 => Value::Float {
-                kind,
-                value: f64::from_bits(self.u64()?),
-            },
-            _ => return Err(invalid()),
-        })
-    }
-
-    fn array(&mut self) -> io::Result<Value> {
-        let kind = self.u32()?;
-        let count = self.u64()?;
-        if count > MAX_ITEMS {
-            return Err(invalid());
-        }
-        let count = usize::try_from(count).map_err(|_| invalid())?;
-        if kind == 8 {
-            self.charge(count.checked_mul(size_of::<String>()).ok_or_else(invalid)?)?;
-            let mut strings = Vec::new();
-            strings.try_reserve_exact(count).map_err(|_| invalid())?;
-            for _ in 0..count {
-                strings.push(self.text(4096)?);
-            }
-            return Ok(Value::Strings(strings));
-        }
-        let width = match kind {
-            0 | 1 | 7 => 1,
-            2 | 3 => 2,
-            4..=6 => 4,
-            10..=12 => 8,
-            // GGUF prohibits arrays of arrays.
-            _ => return Err(invalid()),
-        };
-        let bytes = count.checked_mul(width).ok_or_else(invalid)?;
-        self.charge(bytes)?;
-        if kind == 7 {
-            for _ in 0..count {
-                if self.bytes::<1>()?[0] > 1 {
-                    return Err(invalid());
-                }
-            }
-        } else {
-            self.skip(u64::try_from(bytes).map_err(|_| invalid())?)?;
-        }
-        Ok(Value::Array { kind, count })
-    }
-
-    fn index(&mut self) -> io::Result<Index> {
-        if self.bytes::<8>()? != *b"GGUF\x03\0\0\0" {
-            return Err(invalid());
-        }
-        let tensors = self.u64()?;
-        let metadata = self.u64()?;
-        if !(1..=8192).contains(&tensors) || !(1..=65_536).contains(&metadata) {
-            return Err(invalid());
-        }
-        let mut values = BTreeMap::new();
-        for _ in 0..metadata {
-            self.charge(128)?;
-            let name = self.text(1024)?;
-            if name.is_empty() || name.contains('\0') || values.contains_key(&name) {
-                return Err(invalid());
-            }
-            values.insert(name, self.value()?);
-        }
-        let alignment = match values.get("general.alignment") {
-            None => 32,
-            Some(Value::Integer { kind: 4, value })
-                if value.is_power_of_two() && *value <= 4096 =>
-            {
-                *value
-            }
-            _ => return Err(invalid()),
-        };
-        let mut entries = BTreeMap::new();
-        for _ in 0..tensors {
-            self.charge(512)?;
-            let name = self.text(1024)?;
-            let dimensions = self.u32()?;
-            if name.is_empty()
-                || name.contains('\0')
-                || entries.contains_key(&name)
-                || !(1..=4).contains(&dimensions)
-            {
-                return Err(invalid());
-            }
-            let mut shape = Vec::new();
-            let mut elements = 1_u64;
-            for _ in 0..dimensions {
-                let dimension = self.u64()?;
-                if dimension == 0 {
-                    return Err(invalid());
-                }
-                elements = elements.checked_mul(dimension).ok_or_else(invalid)?;
-                shape.push(dimension);
-            }
-            let kind = self.u32()?;
-            let offset = self.u64()?;
-            let (block, width) = layout(kind)?;
-            if !shape[0].is_multiple_of(block) || !offset.is_multiple_of(alignment) {
-                return Err(invalid());
-            }
-            let bytes = (elements / block).checked_mul(width).ok_or_else(invalid)?;
-            entries.insert(
-                name,
-                Tensor {
-                    shape,
-                    kind,
-                    offset,
-                    bytes,
-                },
-            );
-        }
-        let end = self.source.stream_position()?;
-        let data = end
-            .checked_next_multiple_of(alignment)
-            .ok_or_else(invalid)?;
-        if data > self.length {
-            return Err(invalid());
-        }
-        let mut ranges = Vec::with_capacity(entries.len());
-        for tensor in entries.values_mut() {
-            check_cancel(self.cancel)?;
-            tensor.offset = data.checked_add(tensor.offset).ok_or_else(invalid)?;
-            let end = tensor
-                .offset
-                .checked_add(tensor.bytes)
-                .ok_or_else(invalid)?;
-            if end > self.length {
-                return Err(invalid());
-            }
-            ranges.push((tensor.offset, end));
-        }
-        ranges.sort_unstable();
-        if ranges.array_windows().any(|[left, right]| left.1 > right.0) {
-            return Err(invalid());
-        }
-        check_cancel(self.cancel)?;
-        Ok(Index {
-            metadata: values,
-            tensors: entries,
-        })
+const fn asr_index_policy(metadata_budget: usize) -> bonsai_gguf::IndexPolicy<'static> {
+    bonsai_gguf::IndexPolicy {
+        allow_v2: false,
+        allow_zero_tensors: false,
+        allow_zero_metadata: false,
+        max_file_bytes: MAX_FILE_BYTES,
+        max_tensors: 8192,
+        max_metadata: 65_536,
+        metadata_budget,
+        max_key_bytes: 1024,
+        max_string_bytes: 65_536,
+        max_array_string_bytes: 4096,
+        max_retained_string_array_bytes: None,
+        max_array_items: MAX_ITEMS,
+        max_alignment: 4096,
+        allow_positive_i32_alignment: false,
+        reject_nonfinite_floats: false,
+        reject_interior_nul_keys: true,
+        reject_interior_nul_strings: false,
+        kv_overhead_bytes: 128,
+        string_overhead_bytes: 32,
+        tensor_overhead_bytes: 512,
+        charge_string_array_slots: true,
+        charge_skipped_scalar_arrays: true,
+        prism_dialect: false,
+        allowed_tensor_types: Some(LINEAR_TYPES),
+        ..bonsai_gguf::IndexPolicy::new()
     }
 }
 
@@ -305,20 +103,44 @@ fn signed(kind: u32, value: i64) -> Value {
     u64::try_from(value).map_or(Value::Other, |value| Value::Integer { kind, value })
 }
 
-// Source-defined GGML block widths for the native ASR linear allowlist.
-fn layout(kind: u32) -> io::Result<(u64, u64)> {
-    match kind {
-        0 => Ok((1, 4)),
-        1 | 30 => Ok((1, 2)),
-        2 => Ok((32, 18)),
-        3 => Ok((32, 20)),
-        6 => Ok((32, 22)),
-        7 => Ok((32, 24)),
-        8 => Ok((32, 34)),
-        12 => Ok((256, 144)),
-        13 => Ok((256, 176)),
-        14 => Ok((256, 210)),
-        _ => Err(invalid()),
+fn map_index_value(entry: bonsai_gguf::IndexValue) -> Value {
+    use bonsai_gguf::{IndexValue, MetadataArray, MetadataValue};
+    match entry {
+        IndexValue::Metadata(meta) => match meta {
+            MetadataValue::U8(v) => Value::Integer {
+                kind: 0,
+                value: u64::from(v),
+            },
+            MetadataValue::I8(v) => signed(1, i64::from(v)),
+            MetadataValue::U16(v) => Value::Integer {
+                kind: 2,
+                value: u64::from(v),
+            },
+            MetadataValue::I16(v) => signed(3, i64::from(v)),
+            MetadataValue::U32(v) => Value::Integer {
+                kind: 4,
+                value: u64::from(v),
+            },
+            MetadataValue::I32(v) => signed(5, i64::from(v)),
+            MetadataValue::F32(v) => Value::Float {
+                kind: 6,
+                value: f64::from(v),
+            },
+            MetadataValue::Bool(v) => Value::Boolean(v),
+            MetadataValue::String(v) => Value::Text(v),
+            MetadataValue::U64(v) => Value::Integer { kind: 10, value: v },
+            MetadataValue::I64(v) => signed(11, v),
+            MetadataValue::F64(v) => Value::Float { kind: 12, value: v },
+            MetadataValue::Array(MetadataArray::String(v)) => Value::Strings(v),
+            MetadataValue::Array(_) => Value::Other,
+        },
+        IndexValue::SkippedArray {
+            element_type_id,
+            count,
+        } => Value::Array {
+            kind: element_type_id,
+            count,
+        },
     }
 }
 
@@ -332,18 +154,45 @@ fn read_index(
     length: u64,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Index> {
-    check_cancel(cancel)?;
-    if !(24..=MAX_FILE_BYTES).contains(&length) {
-        return Err(invalid());
-    }
-    source.seek(SeekFrom::Start(0))?;
-    let mut reader = Reader {
-        source: BufReader::with_capacity(256 * 1024, source),
-        length,
-        remaining: MAX_METADATA,
-        cancel,
-    };
-    reader.index()
+    read_index_with_budget(source, length, MAX_METADATA, cancel)
+}
+
+fn read_index_with_budget(
+    source: &mut (impl Read + Seek),
+    length: u64,
+    budget: usize,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<Index> {
+    let parsed =
+        bonsai_gguf::read_index_cancellable(source, length, &asr_index_policy(budget), cancel)
+            .map_err(|err| {
+                if err.kind() == io::ErrorKind::InvalidData {
+                    invalid()
+                } else {
+                    err
+                }
+            })?;
+    let metadata = parsed
+        .metadata
+        .into_iter()
+        .map(|(key, value)| (key, map_index_value(value)))
+        .collect();
+    let tensors = parsed
+        .tensors
+        .into_iter()
+        .map(|(name, tensor)| {
+            (
+                name,
+                Tensor {
+                    shape: tensor.dimensions,
+                    kind: tensor.type_id,
+                    offset: tensor.offset,
+                    bytes: tensor.bytes,
+                },
+            )
+        })
+        .collect();
+    Ok(Index { metadata, tensors })
 }
 
 pub(super) fn decoder(
