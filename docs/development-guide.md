@@ -219,12 +219,10 @@ Each conversation keeps its own draft and response settings. Use the sidebar to
 switch chats, create a new one, or rename, copy and delete through a row's actions
 menu. Conversations are ordered by most recent update—creating or branching a
 chat, sending or receiving messages, editing a draft or confirming a rename moves
-that conversation to the top, while viewing a chat alone preserves order. Any
-generating conversation is pinned at the very top of the sidebar and the selected
-conversation stays pinned directly below it (or at the top when idle), so scrolling
-the history list affects only non-active conversations. Deleting the last chat
-creates an empty one. Creation and branching have no count cap; the encrypted
-workspace still has an 8 MiB saving budget and per-conversation message safeguards.
+that conversation to the top, while viewing a chat alone preserves order. Deleting
+the last chat creates an empty one. Creation and branching have no count cap; the
+encrypted workspace still has an 8 MiB saving budget and per-conversation message
+safeguards.
 
 Drag the sidebar's inner edge to resize it. Its toggle or **Ctrl+Shift+B** hides
 and reopens it. Narrow windows use a drawer that closes on selection, backdrop
@@ -232,8 +230,7 @@ click or Escape. Width and docked visibility are saved separately from chats.
 
 **Search conversations** filters titles and visible message bodies by Unicode
 case-insensitive substring, excluding reasoning and drafts. Filtering preserves
-the selected chat and draft, and keeps pinned responding and selected rows visible
-above the scrollable results even when they do not match the query. Clear or Escape in the focused field clears the
+the selected chat and draft. Clear or Escape in the focused field clears the
 query before dismissing the drawer or stopping generation. New conversations and
 branches clear it; the query is not saved. Selecting a result opens Find in that
 chat. A title-only match can have no matching message body.

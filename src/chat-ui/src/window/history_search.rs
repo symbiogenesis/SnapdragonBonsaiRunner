@@ -12,7 +12,6 @@ pub(super) struct Search {
     previous: String,
     query: Arc<Query>,
     pub(super) rows: Vec<usize>,
-    pub(super) scrollable_rows: Vec<usize>,
     reset_scroll: bool,
 }
 
@@ -85,16 +84,6 @@ impl Search {
             }
         }
         changed
-    }
-
-    pub(super) fn update_scrollable(&mut self, pinned: &[usize]) {
-        self.scrollable_rows.clear();
-        self.scrollable_rows.extend(
-            self.rows
-                .iter()
-                .copied()
-                .filter(|index| !pinned.contains(index)),
-        );
     }
 }
 
