@@ -5,6 +5,10 @@
 
 /// Swift's verified training context; available memory may select less.
 pub const MODEL_CONTEXT_TOKENS: usize = 262_144;
+/// Swift vocabulary entry count used for speculative verification logits bounds.
+pub const SWIFT_VOCAB_SIZE: usize = 248_320;
+/// Minimum selected-profile state/checkpoint reservation (`1 GiB`).
+pub const STATE_MEMORY_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 /// Physical RAM retained for Windows and other applications.
 pub const HOST_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Selection-only slack for startup allocations between observation and child admission.
@@ -98,6 +102,40 @@ pub fn swift_tiled_prefill_scratch_bytes(
     let ctx = u64::try_from(context_tokens).ok()?;
     let scores = ctx.checked_mul(per_ctx)?;
     fixed.checked_add(scores)
+}
+
+/// Conservative selected-profile state/checkpoint budget (`bytes`) for
+/// `context_tokens` and `kv_format`, matching Prism's `selected_state_budget`.
+#[must_use]
+pub fn swift_selected_state_budget_bytes(
+    context_tokens: usize,
+    kv_format: SwiftKvCacheFormat,
+) -> Option<u64> {
+    if context_tokens == 0 {
+        return None;
+    }
+    let per_token = kv_format.kv_bytes_per_token().checked_add(96 + 128)?;
+    let total = u64::try_from(context_tokens)
+        .ok()?
+        .checked_mul(per_token)?
+        .checked_add(RECURRENT_BYTES)?;
+    Some(total.max(STATE_MEMORY_FLOOR_BYTES))
+}
+
+/// Conservative logits verification scratch (`bytes`) required by Prism's
+/// `Qwen35::tiled_verification_scratch_bytes` for an explicit `8`, `16`, or `32`-token
+/// CPU tiled prefill configuration.
+#[must_use]
+pub fn swift_tiled_verification_scratch_bytes(prefill_tokens: usize) -> Option<u64> {
+    if !matches!(prefill_tokens, 8 | 16 | 32) {
+        return None;
+    }
+    let rows = u64::try_from(prefill_tokens.min(8)).ok()?;
+    let vocab = u64::try_from(SWIFT_VOCAB_SIZE).ok()?;
+    let row_vecs = rows.checked_mul(24)?;
+    rows.checked_mul(vocab)?
+        .checked_mul(4)?
+        .checked_add(row_vecs)
 }
 
 /// Immutable cache and execution layout used to admit one Swift model lifetime.
@@ -923,6 +961,310 @@ impl SwiftContextPlan {
         }
         let (plan, breakdown) = Self::for_execution_shape(available_bytes, profile, shape)?;
         Ok((plan, breakdown, false))
+    }
+}
+
+/// Sparse prompt-reuse checkpoint selection for calibrated CoW admission.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SwiftCalibratedReuse {
+    /// No prompt-reuse checkpoints retained beyond live and rollback state.
+    #[default]
+    Disabled,
+    /// Retain `1..=8` sparse latest-branch checkpoints.
+    Latest {
+        /// Number of retained sparse checkpoints (`1..=8`).
+        checkpoints: u8,
+        /// Optional explicit checkpoint byte override validated against `checkpoints * state_budget`.
+        checkpoint_bytes: Option<usize>,
+    },
+    /// Retain prompt-end checkpoint plus `1..=8` sparse latest-branch checkpoints.
+    PromptEndAndLatest {
+        /// Number of retained latest checkpoints (`1..=8`), adding 1 prompt-end slot (`2..=9` total).
+        checkpoints: u8,
+        /// Optional explicit checkpoint byte override validated against `checkpoints * state_budget`.
+        checkpoint_bytes: Option<usize>,
+    },
+}
+
+/// Session execution shape inputs for calibrated CoW context planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SwiftCalibratedOptions {
+    /// Weight packing representation calibrating host fixed bytes and mapped credit.
+    pub weight_packing: SwiftWeightPacking,
+    /// Whether verified multimodal vision (`mmproj`) should be admitted if RAM allows.
+    pub request_vision: bool,
+    /// Optional CPU tiled prefill token batch (`8`, `16`, or `32`).
+    pub prefill_tokens: Option<usize>,
+    /// Whether chunkwise WY `F32` GDN prefill is enabled (requires FP16 KV and prefill tiles).
+    pub chunkwise_gdn_wy_f32: bool,
+    /// Optional suffix speculative draft token cap (`1..=8`; incompatible with vision and WY GDN).
+    pub speculation_tokens: Option<u8>,
+    /// Prompt-reuse checkpoint mode and sparse slot budget.
+    pub prompt_reuse: SwiftCalibratedReuse,
+}
+
+/// Calibrated representation- and CoW-aware Swift admission result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SwiftCalibratedPlan {
+    /// Selected context, private Windows Job commit ceiling, and physical admission threshold.
+    pub context_plan: SwiftContextPlan,
+    /// Physical CoW process working-set ceiling (`physical_cow [+ MMPROJ_RESERVE_BYTES]`).
+    pub working_set_limit_bytes: usize,
+    /// Whether multimodal vision projector headroom was admitted.
+    pub vision_admitted: bool,
+    /// Additive CPU tiled prefill scratch bytes when `prefill_tokens` is `Some`.
+    pub prefill_scratch_bytes: Option<usize>,
+    /// Paired `(verification_scratch_bytes, speculative_checkpoint_bytes)` when speculating.
+    pub speculation_reserves: Option<(usize, usize)>,
+}
+
+fn validate_calibrated_reuse(
+    reuse: SwiftCalibratedReuse,
+) -> Result<(u64, u64, Option<usize>), String> {
+    match reuse {
+        SwiftCalibratedReuse::Disabled => Ok((0, 0, None)),
+        SwiftCalibratedReuse::Latest {
+            checkpoints,
+            checkpoint_bytes,
+        } => {
+            if !(1..=MAX_REUSABLE_BRANCH_CHECKPOINTS).contains(&checkpoints)
+                || checkpoint_bytes == Some(0)
+            {
+                return Err(insufficient());
+            }
+            let slots = u64::from(checkpoints);
+            Ok((slots, slots, checkpoint_bytes))
+        }
+        SwiftCalibratedReuse::PromptEndAndLatest {
+            checkpoints,
+            checkpoint_bytes,
+        } => {
+            if !(1..=MAX_REUSABLE_BRANCH_CHECKPOINTS).contains(&checkpoints)
+                || checkpoint_bytes == Some(0)
+            {
+                return Err(insufficient());
+            }
+            let min_slots = u64::from(checkpoints);
+            let slots = min_slots.checked_add(1).ok_or_else(insufficient)?;
+            Ok((slots, min_slots, checkpoint_bytes))
+        }
+    }
+}
+
+fn eval_calibrated_cow_at(
+    available_bytes: u64,
+    profile: SwiftContextProfile,
+    options: SwiftCalibratedOptions,
+    context_tokens: usize,
+    reuse_slots: u64,
+    min_checkpoint_slots: u64,
+    explicit_checkpoint_bytes: Option<usize>,
+    include_mmproj: bool,
+) -> Option<SwiftCalibratedPlan> {
+    let kv_format = SwiftKvCacheFormat::from_profile(profile);
+    let ctx = u64::try_from(context_tokens).ok()?;
+    let state_bytes = ctx
+        .checked_mul(profile.state_bytes_per_token())?
+        .checked_add(RECURRENT_BYTES)?;
+    if state_bytes > profile.state_limit_bytes() {
+        return None;
+    }
+
+    let state_budget = swift_selected_state_budget_bytes(context_tokens, kv_format)?;
+    if let Some(explicit) = explicit_checkpoint_bytes {
+        let explicit_u64 = u64::try_from(explicit).ok()?;
+        let min_state_charge = min_checkpoint_slots.checked_mul(state_budget)?;
+        if explicit_u64 < min_state_charge {
+            return None;
+        }
+    }
+
+    let fixed_bytes = match options.weight_packing {
+        SwiftWeightPacking::Pq2_0 => FIXED_RUNTIME_BYTES,
+        SwiftWeightPacking::Ptq1_0 => {
+            FIXED_RUNTIME_BYTES - (crate::SWIFT_WEIGHT_BYTES - crate::PTQ1_WEIGHT_BYTES)
+        }
+    };
+    let base_recurrent = 2_u64
+        .checked_add(u64::from(options.speculation_tokens.is_some()))?
+        .checked_mul(RECURRENT_BYTES)?;
+    let min_reuse_bytes = reuse_slots.checked_mul(RECURRENT_BYTES)?;
+    let reuse_recurrent = explicit_checkpoint_bytes.map_or(Some(min_reuse_bytes), |explicit| {
+        u64::try_from(explicit)
+            .ok()
+            .map(|bytes| bytes.max(min_reuse_bytes))
+    })?;
+    let recurrent_bytes = base_recurrent.checked_add(reuse_recurrent)?;
+
+    let kv_bytes = kv_format.kv_bytes_per_token();
+    let cow_kv = ctx
+        .checked_mul(kv_bytes.checked_add(96 + 128)?)?
+        .checked_add(
+            u64::try_from(context_tokens.min(KV_COW_PAGE_TOKENS))
+                .ok()?
+                .checked_mul(kv_bytes)?,
+        )?;
+
+    let prefill_scratch_u64 = match options.prefill_tokens {
+        Some(tokens) => Some(swift_tiled_prefill_scratch_bytes(
+            tokens,
+            context_tokens,
+            kv_format,
+        )?),
+        None => None,
+    };
+    let verify_scratch_u64 = if options.speculation_tokens.is_some() {
+        let prefill = options.prefill_tokens?;
+        Some(swift_tiled_verification_scratch_bytes(prefill)?)
+    } else {
+        None
+    };
+    let total_scratch = prefill_scratch_u64
+        .unwrap_or(0)
+        .checked_add(verify_scratch_u64.unwrap_or(0))?;
+
+    let physical_cow = fixed_bytes
+        .checked_add(recurrent_bytes)?
+        .checked_add(cow_kv)?
+        .checked_add(total_scratch)?;
+    let mmproj_reserve = if include_mmproj {
+        crate::MMPROJ_RESERVE_BYTES
+    } else {
+        0
+    };
+    let working_set_u64 = physical_cow.checked_add(mmproj_reserve)?;
+    let admission_threshold = working_set_u64
+        .checked_add(HOST_RESERVE_BYTES)?
+        .checked_add(STARTUP_RESERVE_BYTES)?;
+    if admission_threshold > available_bytes {
+        return None;
+    }
+
+    let private_job_commit = working_set_u64.checked_sub(options.weight_packing.weight_bytes())?;
+    let required_available_bytes = working_set_u64.checked_add(HOST_RESERVE_BYTES)?;
+    let prefill_scratch_bytes = match prefill_scratch_u64 {
+        Some(bytes) => Some(usize::try_from(bytes).ok()?),
+        None => None,
+    };
+    let speculation_reserves = match verify_scratch_u64 {
+        Some(verify) => Some((
+            usize::try_from(verify).ok()?,
+            usize::try_from(state_budget).ok()?,
+        )),
+        None => None,
+    };
+
+    Some(SwiftCalibratedPlan {
+        context_plan: SwiftContextPlan {
+            context_tokens,
+            memory_limit_bytes: usize::try_from(private_job_commit).ok()?,
+            required_available_bytes,
+        },
+        working_set_limit_bytes: usize::try_from(working_set_u64).ok()?,
+        vision_admitted: include_mmproj,
+        prefill_scratch_bytes,
+        speculation_reserves,
+    })
+}
+
+/// Input parameters and constructor for calibrated CoW context planning.
+impl SwiftContextPlan {
+    /// Select the largest page-aligned context admitted under Prism's calibrated
+    /// representation- and CoW-aware physical policy while crediting OS-evictable
+    /// read-only mapped weight pages out of the private Windows Job commit ceiling.
+    ///
+    /// Falls back cleanly to text-only execution (`vision_admitted = false`) when
+    /// available RAM fits text-only execution without [`crate::MMPROJ_RESERVE_BYTES`],
+    /// or when CPU speculation is active (since speculation and mmproj are mutually
+    /// exclusive).
+    ///
+    /// # Errors
+    /// Rejects non-native profiles, invalid tile/speculation/GDN combinations,
+    /// undersized explicit checkpoint reserves, insufficient RAM, or overflow.
+    pub fn for_calibrated_execution(
+        available_bytes: u64,
+        profile: SwiftContextProfile,
+        options: SwiftCalibratedOptions,
+    ) -> Result<SwiftCalibratedPlan, String> {
+        if profile == SwiftContextProfile::PublisherF16 {
+            return Err(insufficient());
+        }
+        let kv_format = SwiftKvCacheFormat::from_profile(profile);
+        if let Some(tokens) = options.prefill_tokens
+            && !matches!(tokens, 8 | 16 | 32)
+        {
+            return Err(insufficient());
+        }
+        if options.chunkwise_gdn_wy_f32
+            && (options.prefill_tokens.is_none()
+                || kv_format != SwiftKvCacheFormat::F16
+                || options.speculation_tokens.is_some())
+        {
+            return Err(insufficient());
+        }
+        if let Some(spec_tokens) = options.speculation_tokens
+            && (!(1..=8).contains(&spec_tokens)
+                || options.prefill_tokens.is_none()
+                || options.chunkwise_gdn_wy_f32)
+        {
+            return Err(insufficient());
+        }
+        let (reuse_slots, min_checkpoint_slots, explicit_checkpoint_bytes) =
+            validate_calibrated_reuse(options.prompt_reuse)?;
+
+        let max_state_tokens_u64 = profile
+            .state_limit_bytes()
+            .checked_sub(RECURRENT_BYTES)
+            .ok_or_else(insufficient)?
+            / profile.state_bytes_per_token();
+        let max_state_tokens = usize::try_from(max_state_tokens_u64)
+            .unwrap_or(MODEL_CONTEXT_TOKENS)
+            .min(MODEL_CONTEXT_TOKENS);
+        let min_pages = MIN_CONTEXT_TOKENS / CONTEXT_PAGE_TOKENS;
+        let max_pages = max_state_tokens / CONTEXT_PAGE_TOKENS;
+        if min_pages > max_pages {
+            return Err(insufficient());
+        }
+
+        let search = |include_mmproj: bool| -> Option<SwiftCalibratedPlan> {
+            let mut best = eval_calibrated_cow_at(
+                available_bytes,
+                profile,
+                options,
+                min_pages * CONTEXT_PAGE_TOKENS,
+                reuse_slots,
+                min_checkpoint_slots,
+                explicit_checkpoint_bytes,
+                include_mmproj,
+            )?;
+            let mut lo = min_pages + 1;
+            let mut hi = max_pages;
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                if let Some(plan) = eval_calibrated_cow_at(
+                    available_bytes,
+                    profile,
+                    options,
+                    mid * CONTEXT_PAGE_TOKENS,
+                    reuse_slots,
+                    min_checkpoint_slots,
+                    explicit_checkpoint_bytes,
+                    include_mmproj,
+                ) {
+                    best = plan;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            Some(best)
+        };
+
+        let try_vision = options.request_vision && options.speculation_tokens.is_none();
+        if try_vision && let Some(plan) = search(true) {
+            return Ok(plan);
+        }
+        search(false).ok_or_else(insufficient)
     }
 }
 

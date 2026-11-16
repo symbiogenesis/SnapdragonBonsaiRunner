@@ -562,7 +562,10 @@ fn footprint_diagnostics_enforce_branch_checkpoint_dedup_and_mapped_bounds()
                 estimate.steady_state_physical_bytes - prev_physical,
                 RECURRENT_BYTES
             );
-            assert!(format_footprint_diagnostic(&estimate).contains(&format!("{branches} branch checkpoints")));
+            assert!(
+                format_footprint_diagnostic(&estimate)
+                    .contains(&format!("{branches} branch checkpoints"))
+            );
         }
         prev_physical = estimate.steady_state_physical_bytes;
     }
@@ -619,5 +622,29 @@ fn footprint_diagnostics_enforce_branch_checkpoint_dedup_and_mapped_bounds()
         })
         .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn context_details_popover_renders_live_footprint_diagnostic() -> Result<(), &'static str> {
+    let mut chat = harness([620.0, 640.0], "Question");
+    chat.state_mut().app.context_tokens = Some(262_144);
+    chat.get_by_role_and_label(egui::Role::Button, "Context")
+        .click();
+    chat.run();
+    let expected = format_footprint_diagnostic(
+        &estimate_runtime_footprint(PlannerRuntimeShape {
+            context_tokens: 262_144,
+            weight_packing: WeightPacking::Pq2_0,
+            kv_layout: KvCacheLayout::Rsq4,
+            kv_sharing: KvSharingMode::CowRollback,
+            evictable_mapped_weight_bytes: WeightPacking::Pq2_0.weight_bytes(),
+            npu_resident_arena_bytes: 0,
+            npu_released_host_pq2_bytes: 0,
+            branch_checkpoints: 1,
+        })
+        .ok_or("valid default footprint")?,
+    );
+    assert!(chat.query_by_label(expected.as_str()).is_some());
     Ok(())
 }

@@ -127,8 +127,10 @@ pub struct LaunchPlan {
     pub key_file: PathBuf,
     /// Available memory admission threshold, including the host reserve.
     pub required_available_bytes: u64,
-    /// Job memory ceiling in bytes.
+    /// Job private-commit memory ceiling in bytes.
     pub memory_limit_bytes: usize,
+    /// Process working-set memory ceiling in bytes (including mapped read-only weight sections).
+    pub working_set_limit_bytes: usize,
     /// Immutable prompt, response and template bound selected for the model.
     pub context_tokens: usize,
     /// Optional native CPU tiled-prefill selection `(tokens, scratch_bytes)`.
@@ -137,19 +139,19 @@ pub struct LaunchPlan {
 impl LaunchPlan {
     /// Base process memory limit passed to the native child's `--memory-limit-bytes`.
     ///
-    /// When `mmproj` is enabled, [`bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_vision`]
-    /// includes [`bonsai_cpu_policy::MMPROJ_RESERVE_BYTES`] in [`Self::memory_limit_bytes`]
-    /// for the Windows Job commit limit, while the native child adds its own 768 MiB
-    /// vision reserve on top of `--memory-limit-bytes + 4 GiB` during startup admission.
+    /// When `mmproj` is enabled, the planner includes [`bonsai_cpu_policy::MMPROJ_RESERVE_BYTES`]
+    /// in [`Self::working_set_limit_bytes`] (and [`Self::memory_limit_bytes`]), while the native
+    /// child adds its own 768 MiB vision reserve on top of `--memory-limit-bytes + 4 GiB`
+    /// during startup admission.
     #[must_use]
     pub fn native_child_memory_limit_bytes(&self) -> usize {
         if self.mmproj.is_some() {
             usize::try_from(bonsai_cpu_policy::MMPROJ_RESERVE_BYTES)
                 .ok()
-                .and_then(|reserve| self.memory_limit_bytes.checked_sub(reserve))
-                .unwrap_or(self.memory_limit_bytes)
+                .and_then(|reserve| self.working_set_limit_bytes.checked_sub(reserve))
+                .unwrap_or(self.working_set_limit_bytes)
         } else {
-            self.memory_limit_bytes
+            self.working_set_limit_bytes
         }
     }
 
@@ -172,7 +174,19 @@ impl LaunchPlan {
         *argument = context.context_tokens.to_string().into();
         self.context_tokens = context.context_tokens;
         self.memory_limit_bytes = context.memory_limit_bytes;
+        self.working_set_limit_bytes = context.memory_limit_bytes;
         self.required_available_bytes = context.required_available_bytes;
+        Ok(())
+    }
+
+    /// Apply a calibrated CoW Swift context splitting private Job commit from physical working set.
+    #[cfg(windows)]
+    pub(crate) fn select_calibrated_swift_context(
+        &mut self,
+        calibrated: &bonsai_cpu_policy::context::SwiftCalibratedPlan,
+    ) -> Result<(), PolicyError> {
+        self.select_swift_context(calibrated.context_plan)?;
+        self.working_set_limit_bytes = calibrated.working_set_limit_bytes;
         Ok(())
     }
 
@@ -318,6 +332,7 @@ impl LaunchPlan {
             key_file: key_file.to_path_buf(),
             required_available_bytes: profile.required_available_bytes(),
             memory_limit_bytes: profile.memory_limit_bytes(),
+            working_set_limit_bytes: profile.memory_limit_bytes(),
             context_tokens: crate::CONTEXT_TOKENS,
             cpu_prefill: None,
         })

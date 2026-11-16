@@ -533,13 +533,6 @@ const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> =
 const CPU_SPECULATION_RELEASE: Option<(&str, &str)> =
     Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Wired into default admission promotion in follow-up commit."
-    )
-)]
 pub(super) fn calibrated_cow_admission_supported() -> Result<bool, LaunchError> {
     let pin = release(LOCK)?;
     Ok(reviewed_release_matches(

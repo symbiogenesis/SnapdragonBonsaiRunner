@@ -231,6 +231,7 @@ fn owned_ready_backend_stops_with_service() -> io::Result<()> {
             _mmproj: None,
             _native_executable: None,
             memory_limit_bytes: PROBE_MEMORY,
+            working_set_limit_bytes: PROBE_MEMORY,
             backend_port: port,
             storage_budget: None,
         };
@@ -643,6 +644,7 @@ fn broker_pipe_launched_service_serves_cancels_resets_and_avoids_backend_key_fil
             &pipe_backend,
             credentials.backend_key(),
             PROBE_MEMORY,
+            PROBE_MEMORY,
             Some((
                 MAX_WORKER_PRIVATE_STORAGE_BYTES,
                 MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
@@ -675,6 +677,7 @@ fn broker_pipe_launched_service_serves_cancels_resets_and_avoids_backend_key_fil
             _mmproj: None,
             _native_executable: None,
             memory_limit_bytes: PROBE_MEMORY,
+            working_set_limit_bytes: PROBE_MEMORY,
             backend_port: 0,
             storage_budget: Some((
                 MAX_WORKER_PRIVATE_STORAGE_BYTES,
@@ -776,6 +779,7 @@ fn launched_service_stops_with_sandbox_error_when_storage_budget_exceeded() -> i
             _mmproj: None,
             _native_executable: None,
             memory_limit_bytes: PROBE_MEMORY,
+            working_set_limit_bytes: PROBE_MEMORY,
             backend_port: 0,
             storage_budget: Some((128, 16)),
         };

@@ -459,12 +459,55 @@ impl LaunchConfig {
         }
     }
 
+    fn calibrated_context_plan(
+        &self,
+        available_bytes: u64,
+        request_vision: bool,
+    ) -> Result<bonsai_cpu_policy::context::SwiftCalibratedPlan, LaunchError> {
+        use bonsai_cpu_policy::context::{
+            SwiftCalibratedOptions, SwiftCalibratedReuse, SwiftContextPlan, SwiftWeightPacking,
+        };
+        let weight_packing = if self.uses_repacked_ptq1() {
+            SwiftWeightPacking::Ptq1_0
+        } else {
+            SwiftWeightPacking::Pq2_0
+        };
+        let prompt_reuse = if self.latest_prompt_reuse {
+            SwiftCalibratedReuse::Latest {
+                checkpoints: 1,
+                checkpoint_bytes: None,
+            }
+        } else {
+            SwiftCalibratedReuse::Disabled
+        };
+        SwiftContextPlan::for_calibrated_execution(
+            available_bytes,
+            self.swift_context_profile()?,
+            SwiftCalibratedOptions {
+                weight_packing,
+                request_vision,
+                prefill_tokens: self.cpu_prefill_tokens.map(usize::from),
+                chunkwise_gdn_wy_f32: false,
+                speculation_tokens: None,
+                prompt_reuse,
+            },
+        )
+        .map_err(|_| LaunchError::Memory)
+    }
+
     // Call only after the exact released runtime's context and cache-accounting
     // contract is admitted. Cache selection remains immutable through retry.
     fn swift_context_plan(
         &self,
         available_bytes: u64,
     ) -> Result<bonsai_cpu_policy::context::SwiftContextPlan, LaunchError> {
+        if self.native_engine
+            && crate::inference::calibrated_cow_admission_supported().unwrap_or(false)
+        {
+            return Ok(self
+                .calibrated_context_plan(available_bytes, false)?
+                .context_plan);
+        }
         let (plan, _) = bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_prefill(
             available_bytes,
             self.swift_context_profile()?,
@@ -715,6 +758,12 @@ impl LaunchConfig {
                 OsString::from("--memory-limit-bytes"),
                 OsString::from(plan.native_child_memory_limit_bytes().to_string()),
             ]);
+            if crate::inference::calibrated_cow_admission_supported().unwrap_or(false) {
+                arguments.extend([
+                    OsString::from("--admission-policy"),
+                    OsString::from("calibrated-cow"),
+                ]);
+            }
         }
         if self.native_row_workers > 1 {
             arguments.extend([
@@ -1020,39 +1069,59 @@ impl LaunchConfig {
                 preflight_frontend_port(self.frontend_port)?;
             }
             let mut active_mmproj = mmproj_artifact.clone();
+            let calibrated_admission = self.native_engine
+                && crate::inference::calibrated_cow_admission_supported().unwrap_or(false);
             if memory_context_supported {
                 let raw_available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
                 let retry_margin = u64::try_from(attempt)
                     .unwrap_or(0)
                     .saturating_mul(bonsai_cpu_policy::context::STARTUP_RESERVE_BYTES);
                 let available = raw_available.saturating_sub(retry_margin);
-                let profile = self.swift_context_profile()?;
-                let (context, vision_admitted, prefill_scratch) =
-                    match bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
-                        available,
-                        profile,
-                        active_mmproj.is_some(),
-                        self.cpu_prefill_tokens.map(usize::from),
-                    ) {
-                        Ok(result) => result,
-                        Err(_) if attempt > 0 => {
-                            // If the extra retry margin pushed below minimum context, try raw available RAM.
-                            bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
-                                raw_available,
-                                profile,
-                                active_mmproj.is_some(),
-                                self.cpu_prefill_tokens.map(usize::from),
-                            )
-                            .map_err(|_| LaunchError::Memory)?
-                        }
-                        Err(_) => return Err(LaunchError::Memory),
-                    };
-                if !vision_admitted {
-                    active_mmproj = None;
+                if calibrated_admission {
+                    let calibrated =
+                        match self.calibrated_context_plan(available, active_mmproj.is_some()) {
+                            Ok(result) => result,
+                            Err(_) if attempt > 0 => self
+                                .calibrated_context_plan(raw_available, active_mmproj.is_some())?,
+                            Err(_) => return Err(LaunchError::Memory),
+                        };
+                    if !calibrated.vision_admitted {
+                        active_mmproj = None;
+                    }
+                    plan.select_calibrated_swift_context(&calibrated)
+                        .map_err(|_| LaunchError::Policy)?;
+                    plan.cpu_prefill = self
+                        .cpu_prefill_tokens
+                        .zip(calibrated.prefill_scratch_bytes);
+                } else {
+                    let profile = self.swift_context_profile()?;
+                    let (context, vision_admitted, prefill_scratch) =
+                        match bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
+                            available,
+                            profile,
+                            active_mmproj.is_some(),
+                            self.cpu_prefill_tokens.map(usize::from),
+                        ) {
+                            Ok(result) => result,
+                            Err(_) if attempt > 0 => {
+                                // If the extra retry margin pushed below minimum context, try raw available RAM.
+                                bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
+                                    raw_available,
+                                    profile,
+                                    active_mmproj.is_some(),
+                                    self.cpu_prefill_tokens.map(usize::from),
+                                )
+                                .map_err(|_| LaunchError::Memory)?
+                            }
+                            Err(_) => return Err(LaunchError::Memory),
+                        };
+                    if !vision_admitted {
+                        active_mmproj = None;
+                    }
+                    plan.select_swift_context(context)
+                        .map_err(|_| LaunchError::Policy)?;
+                    plan.cpu_prefill = self.cpu_prefill_tokens.zip(prefill_scratch);
                 }
-                plan.select_swift_context(context)
-                    .map_err(|_| LaunchError::Policy)?;
-                plan.cpu_prefill = self.cpu_prefill_tokens.zip(prefill_scratch);
             }
             if let Some(artifact) = &active_mmproj {
                 plan.enable_swift_mmproj(artifact.clone())
@@ -1062,6 +1131,7 @@ impl LaunchConfig {
             let active_mmproj_guard = vision_enabled.then(|| mmproj_file.as_ref()).flatten();
             let context_tokens = plan.context_tokens;
             let cpu_prefill = plan.cpu_prefill;
+            let working_set_limit_bytes = plan.working_set_limit_bytes;
             if let Err(error) = admit(plan.required_available_bytes) {
                 drop(reservation);
                 if error == LaunchError::Memory && attempt + 1 < max_attempts {
@@ -1092,6 +1162,7 @@ impl LaunchConfig {
             if let Err(guard_error) = guard(
                 &process,
                 specification.memory_limit_bytes,
+                working_set_limit_bytes,
                 storage_budget,
                 Some(worker_root.as_path()),
             ) {
@@ -1136,6 +1207,7 @@ impl LaunchConfig {
                         &pipe_backend,
                         credentials.backend_key(),
                         specification.memory_limit_bytes,
+                        working_set_limit_bytes,
                         storage_budget,
                         Some(worker_root.as_path()),
                         shutdown.as_mut(),
@@ -1150,6 +1222,7 @@ impl LaunchConfig {
                     self.backend_port,
                     credentials.backend_key(),
                     specification.memory_limit_bytes,
+                    working_set_limit_bytes,
                     storage_budget,
                     Some(worker_root.as_path()),
                     shutdown.as_mut(),
@@ -1210,6 +1283,7 @@ impl LaunchConfig {
                 _mmproj: vision_enabled.then_some(mmproj_file).flatten(),
                 _native_executable: native_executable,
                 memory_limit_bytes: specification.memory_limit_bytes,
+                working_set_limit_bytes,
                 backend_port: if broker_pipe { 0 } else { self.backend_port },
                 storage_budget,
             });
@@ -1537,6 +1611,7 @@ pub struct LaunchedService {
     _mmproj: Option<bonsai_artifacts::VerifiedFile>,
     _native_executable: Option<bonsai_artifacts::VerifiedFile>,
     memory_limit_bytes: usize,
+    working_set_limit_bytes: usize,
     backend_port: u16,
     storage_budget: Option<(u64, usize)>,
 }
@@ -1586,6 +1661,7 @@ impl LaunchedService {
                 let status = guard(
                     &self.process,
                     self.memory_limit_bytes,
+                    self.working_set_limit_bytes,
                     self.storage_budget,
                     Some(worker_root.as_path()),
                 )
@@ -1740,7 +1816,8 @@ fn check_storage_budget(
 
 fn guard(
     process: &OwnedProcess,
-    limit: usize,
+    private_limit: usize,
+    working_set_limit: usize,
     storage_budget: Option<(u64, usize)>,
     worker_root: Option<&std::path::Path>,
 ) -> Result<(ProcessMemory, u64), LaunchError> {
@@ -1752,7 +1829,7 @@ fn guard(
         return Err(LaunchError::Backend);
     }
     let memory = process.memory_usage().map_err(|_| LaunchError::Memory)?;
-    if memory.private_bytes > limit || memory.working_set_bytes > limit {
+    if memory.private_bytes > private_limit || memory.working_set_bytes > working_set_limit {
         return Err(LaunchError::Memory);
     }
     check_storage_budget(process, storage_budget, worker_root)?;
@@ -1814,20 +1891,33 @@ async fn wait_ready_models(
     process: &OwnedProcess,
     port: u16,
     key: &str,
-    limit: usize,
+    private_limit: usize,
+    working_set_limit: usize,
     storage_budget: Option<(u64, usize)>,
     worker_root: Option<&std::path::Path>,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Vec<u8>, LaunchError> {
     run_startup_with_timeout(shutdown, async {
         loop {
-            guard(process, limit, storage_budget, worker_root)?;
+            guard(
+                process,
+                private_limit,
+                working_set_limit,
+                storage_budget,
+                worker_root,
+            )?;
             match listener_process_id(port).map_err(|_| LaunchError::Backend)? {
                 Some(pid) if pid != process.id() => return Err(LaunchError::Backend),
                 Some(_) if healthy(port, key, process.id()).await => {
                     if let Some(models) = authenticated_models(port, key, process.id()).await {
                         owner(process, port)?;
-                        guard(process, limit, storage_budget, worker_root)?;
+                        guard(
+                            process,
+                            private_limit,
+                            working_set_limit,
+                            storage_budget,
+                            worker_root,
+                        )?;
                         return Ok(models);
                     }
                 }
@@ -1843,13 +1933,20 @@ async fn wait_ready_models_pipe(
     process: &OwnedProcess,
     backend: &crate::pipe_transport::PipeBackend,
     key: &str,
-    limit: usize,
+    private_limit: usize,
+    working_set_limit: usize,
     storage_budget: Option<(u64, usize)>,
     worker_root: Option<&std::path::Path>,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Vec<u8>, LaunchError> {
     run_startup_with_timeout(shutdown, async {
-        guard(process, limit, storage_budget, worker_root)?;
+        guard(
+            process,
+            private_limit,
+            working_set_limit,
+            storage_budget,
+            worker_root,
+        )?;
         {
             let ready_deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
             let mut ready = pin!(backend.wait_server_ready(ready_deadline));
@@ -1858,13 +1955,25 @@ async fn wait_ready_models_pipe(
                 if let Poll::Ready(result) = ready.as_mut().poll(cx) {
                     return Poll::Ready(match result {
                         Ok(()) => Ok(()),
-                        Err(_) => Err(guard(process, limit, storage_budget, worker_root)
-                            .err()
-                            .unwrap_or(LaunchError::Backend)),
+                        Err(_) => Err(guard(
+                            process,
+                            private_limit,
+                            working_set_limit,
+                            storage_budget,
+                            worker_root,
+                        )
+                        .err()
+                        .unwrap_or(LaunchError::Backend)),
                     });
                 }
                 while tick.poll_tick(cx).is_ready() {
-                    if let Err(error) = guard(process, limit, storage_budget, worker_root) {
+                    if let Err(error) = guard(
+                        process,
+                        private_limit,
+                        working_set_limit,
+                        storage_budget,
+                        worker_root,
+                    ) {
                         return Poll::Ready(Err(error));
                     }
                 }
@@ -1872,24 +1981,48 @@ async fn wait_ready_models_pipe(
             })
             .await?;
         }
-        guard(process, limit, storage_budget, worker_root)?;
+        guard(
+            process,
+            private_limit,
+            working_set_limit,
+            storage_budget,
+            worker_root,
+        )?;
         let health = pipe_exchange(backend, "/health", Some(key))
             .await
             .and_then(|bytes| validate_health(&bytes))
             .is_ok();
         if !health {
-            return Err(guard(process, limit, storage_budget, worker_root)
-                .err()
-                .unwrap_or(LaunchError::Backend));
+            return Err(guard(
+                process,
+                private_limit,
+                working_set_limit,
+                storage_budget,
+                worker_root,
+            )
+            .err()
+            .unwrap_or(LaunchError::Backend));
         }
         let models = pipe_authenticated_models(backend, key)
             .await
             .ok_or_else(|| {
-                guard(process, limit, storage_budget, worker_root)
-                    .err()
-                    .unwrap_or(LaunchError::Backend)
+                guard(
+                    process,
+                    private_limit,
+                    working_set_limit,
+                    storage_budget,
+                    worker_root,
+                )
+                .err()
+                .unwrap_or(LaunchError::Backend)
             })?;
-        guard(process, limit, storage_budget, worker_root)?;
+        guard(
+            process,
+            private_limit,
+            working_set_limit,
+            storage_budget,
+            worker_root,
+        )?;
         Ok(models)
     })
     .await
@@ -1903,7 +2036,7 @@ async fn wait_ready(
     limit: usize,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<(), LaunchError> {
-    wait_ready_models(process, port, key, limit, None, None, shutdown)
+    wait_ready_models(process, port, key, limit, limit, None, None, shutdown)
         .await
         .map(|_| ())
 }
@@ -2750,21 +2883,19 @@ mod tests {
         // The exact reviewed release implements paired launch flags and the
         // selected-cache accounting contract. Other identities remain rejected.
         assert!(config.memory_context_supported()?);
-        let available = 20 * 1024 * 1024 * 1024;
+        let gib = 1024 * 1024 * 1024_u64;
+        let available = 20 * gib;
+        // Under promoted 0.1.32 calibrated-CoW admission, full 262,144 K4/V4 context fits at 20 GiB,
+        // while constrained 18 GiB scales back cleanly below 262,144.
+        let packed_18g = config.swift_context_plan(18 * gib)?;
+        assert!(packed_18g.context_tokens < 262_144);
         let packed = config.swift_context_plan(available)?;
-        assert_eq!(packed.context_tokens, 149_760);
-        // Only the exact reviewed Swift K4/V4 state scope reaches the model
-        // ceiling; its ordinary process and host charges remain funded.
+        assert_eq!(packed.context_tokens, 262_144);
         assert!(crate::inference::full_context_supported()?);
-        assert_eq!(
-            config
-                .swift_context_plan(24 * 1024 * 1024 * 1024)?
-                .context_tokens,
-            262_144
-        );
+        assert_eq!(config.swift_context_plan(24 * gib)?.context_tokens, 262_144);
         config.kv_cache = Some(KvCache::Rsq4K3v);
         let capacity = config.swift_context_plan(available)?;
-        assert_eq!(capacity.context_tokens, 170_240);
+        assert_eq!(capacity.context_tokens, 262_144);
         assert!(config.memory_context_supported()?);
         config.kv_cache = Some(KvCache::F16);
         let f16 = config.swift_context_plan(available)?;
@@ -3724,6 +3855,56 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn calibrated_cow_default_admission_credits_mapped_weights_and_splits_child_limits()
+    -> Result<(), LaunchError> {
+        let mut args = arguments();
+        args.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        let config = LaunchConfig::parse(args)?;
+        let gib = 1024 * 1024 * 1024_u64;
+        let calibrated = config.calibrated_context_plan(24 * gib, true)?;
+        assert_eq!(calibrated.context_plan.context_tokens, 262_144);
+        assert!(calibrated.vision_admitted);
+        assert!(calibrated.context_plan.memory_limit_bytes < calibrated.working_set_limit_bytes);
+
+        let data = std::env::temp_dir().join("Bonsai-calibrated-cow-args");
+        let key = data.join("backend.key");
+        let mmproj =
+            bonsai_cpu_policy::swift_mmproj_artifact(&data).map_err(|_| LaunchError::Policy)?;
+        let mut plan = super::LaunchPlan::for_profile_with_options(
+            &data,
+            8081,
+            &key,
+            LaunchProfile::SwiftPq2Assessment,
+            true,
+            false,
+        )
+        .map_err(|_| LaunchError::Policy)?;
+        plan.select_calibrated_swift_context(&calibrated)
+            .map_err(|_| LaunchError::Policy)?;
+        plan.enable_swift_mmproj(mmproj)
+            .map_err(|_| LaunchError::Policy)?;
+
+        let mmproj_reserve = usize::try_from(bonsai_cpu_policy::MMPROJ_RESERVE_BYTES)
+            .map_err(|_| LaunchError::Memory)?;
+        assert_eq!(
+            plan.native_child_memory_limit_bytes() + mmproj_reserve,
+            plan.working_set_limit_bytes
+        );
+
+        let child = config.native_arguments(&plan, None);
+        assert!(
+            child
+                .array_windows::<2>()
+                .any(|pair| pair[0] == "--admission-policy" && pair[1] == "calibrated-cow")
+        );
+        assert!(child.array_windows::<2>().any(|pair| {
+            pair[0] == "--memory-limit-bytes"
+                && pair[1] == plan.native_child_memory_limit_bytes().to_string().as_str()
+        }));
         Ok(())
     }
 }

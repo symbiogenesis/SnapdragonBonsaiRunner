@@ -513,8 +513,7 @@ fn weight_packing_ptq1_delta_and_default_shape_conservation_hold() -> Result<(),
     assert_eq!(default_shape.live_kv_copies, 2);
     assert_eq!(default_shape.reuse_recurrent_copies, 1);
 
-    let ptq1 =
-        default_shape.with_weight_packing_calibrated(context::SwiftWeightPacking::Ptq1_0);
+    let ptq1 = default_shape.with_weight_packing_calibrated(context::SwiftWeightPacking::Ptq1_0);
     assert_eq!(
         default_shape.weights_and_fixed_runtime_bytes - ptq1.weights_and_fixed_runtime_bytes,
         1_259_520_000
@@ -531,8 +530,8 @@ fn weight_packing_ptq1_delta_and_default_shape_conservation_hold() -> Result<(),
 }
 
 #[test]
-fn mapped_weights_commit_credit_keeps_physical_ram_honest_and_validates_bounds() -> Result<(), String>
-{
+fn mapped_weights_commit_credit_keeps_physical_ram_honest_and_validates_bounds()
+-> Result<(), String> {
     let gib = 1024 * 1024 * 1024_u64;
     let profile = context::SwiftContextProfile::NativeRsq4;
     let base = context::SwiftExecutionShape::for_profile(profile);
@@ -585,10 +584,13 @@ fn mapped_weights_commit_credit_keeps_physical_ram_honest_and_validates_bounds()
             .private_job_commit_with_mapped_credit(cred_bd.weights_and_fixed_runtime_bytes + 1)
             .is_none()
     );
-    assert!(cred_bd.private_job_commit_with_mapped_credit(u64::MAX).is_none());
+    assert!(
+        cred_bd
+            .private_job_commit_with_mapped_credit(u64::MAX)
+            .is_none()
+    );
 
-    let (base_plan, _) =
-        context::SwiftContextPlan::for_execution_shape(20 * gib, profile, &base)?;
+    let (base_plan, _) = context::SwiftContextPlan::for_execution_shape(20 * gib, profile, &base)?;
     let (cred_plan, _) =
         context::SwiftContextPlan::for_execution_shape(20 * gib, profile, &credited)?;
     assert_eq!(cred_plan.context_tokens, base_plan.context_tokens);
@@ -609,7 +611,10 @@ fn mapped_weights_commit_credit_keeps_physical_ram_honest_and_validates_bounds()
 #[test]
 fn hexagon_host_deduplication_enforces_prefill_guard_and_conserves_physical_bytes()
 -> Result<(), String> {
-    assert_eq!(context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES, 2_888_663_040);
+    assert_eq!(
+        context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+        2_888_663_040
+    );
     let profile = context::SwiftContextProfile::NativeRsq4;
     let base = context::SwiftExecutionShape::for_profile(profile);
 
@@ -626,7 +631,11 @@ fn hexagon_host_deduplication_enforces_prefill_guard_and_conserves_physical_byte
     );
     let mut manual_scratch = base;
     manual_scratch.tile_prefill_scratch_bytes = 1;
-    assert!(manual_scratch.with_hexagon_host_deduplication(0, 0).is_none());
+    assert!(
+        manual_scratch
+            .with_hexagon_host_deduplication(0, 0)
+            .is_none()
+    );
 
     assert!(
         base.with_hexagon_host_deduplication(
@@ -662,7 +671,11 @@ fn hexagon_host_deduplication_enforces_prefill_guard_and_conserves_physical_byte
 
     let mut overflow_arena = base;
     overflow_arena.accelerator_resident_arena_bytes = u64::MAX - 10;
-    assert!(overflow_arena.with_hexagon_host_deduplication(11, 0).is_none());
+    assert!(
+        overflow_arena
+            .with_hexagon_host_deduplication(11, 0)
+            .is_none()
+    );
 
     let arena_bytes = context::HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 64 * 1024 * 1024;
     let dedup = base
@@ -694,8 +707,8 @@ fn hexagon_host_deduplication_enforces_prefill_guard_and_conserves_physical_byte
 }
 
 #[test]
-fn multi_branch_checkpoint_slots_enforce_zero_to_eight_bounds_and_monotonicity() -> Result<(), String>
-{
+fn multi_branch_checkpoint_slots_enforce_zero_to_eight_bounds_and_monotonicity()
+-> Result<(), String> {
     assert_eq!(context::MAX_REUSABLE_BRANCH_CHECKPOINTS, 8);
     let gib = 1024 * 1024 * 1024_u64;
     let profile = context::SwiftContextProfile::NativeRsq4;
@@ -714,17 +727,13 @@ fn multi_branch_checkpoint_slots_enforce_zero_to_eight_bounds_and_monotonicity()
         let recurrent = shaped
             .recurrent_checkpoint_bytes()
             .ok_or_else(|| "recurrent checkpoint overflow".to_owned())?;
-        assert_eq!(
-            recurrent,
-            (2 + u64::from(slots)) * context::RECURRENT_BYTES
-        );
+        assert_eq!(recurrent, (2 + u64::from(slots)) * context::RECURRENT_BYTES);
         if slots > 0 {
             assert_eq!(recurrent - prev_recurrent, context::RECURRENT_BYTES);
         }
         prev_recurrent = recurrent;
 
-        let (plan, _) =
-            context::SwiftContextPlan::for_execution_shape(18 * gib, profile, &shaped)?;
+        let (plan, _) = context::SwiftContextPlan::for_execution_shape(18 * gib, profile, &shaped)?;
         assert!(plan.context_tokens <= prev_tokens);
         prev_tokens = plan.context_tokens;
     }
@@ -785,8 +794,7 @@ fn cow_kv_admission_saves_over_four_gib_at_262144_k4v4_and_preserves_reserves_an
     );
     assert_eq!(
         cow_rollback_20g.required_available_bytes - cow_append_20g.required_available_bytes,
-        u64::try_from(context::KV_COW_PAGE_TOKENS)
-            .map_err(|error| error.to_string())?
+        u64::try_from(context::KV_COW_PAGE_TOKENS).map_err(|error| error.to_string())?
             * context::RSQ4_KV_BYTES_PER_TOKEN
     );
 
@@ -825,8 +833,7 @@ fn cow_kv_admission_saves_over_four_gib_at_262144_k4v4_and_preserves_reserves_an
         .breakdown(0)
         .and_then(|bd| bd.physical_cow_footprint_bytes())
         .ok_or_else(|| "missing min fixed".to_owned())?;
-    let minimum =
-        context::HOST_RESERVE_BYTES + context::STARTUP_RESERVE_BYTES + min_fixed + min_kv;
+    let minimum = context::HOST_RESERVE_BYTES + context::STARTUP_RESERVE_BYTES + min_fixed + min_kv;
     assert!(
         context::SwiftContextPlan::for_append_only_cow_shape(
             minimum - 1,
@@ -847,6 +854,141 @@ fn cow_kv_admission_saves_over_four_gib_at_262144_k4v4_and_preserves_reserves_an
     assert!(
         context::SwiftContextPlan::for_append_only_cow_shape(24 * gib, full_profile, &zero_kv)
             .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn calibrated_cow_execution_matches_prism_accounting_across_packings_reuse_and_speculation()
+-> Result<(), String> {
+    use context::{
+        CONTEXT_PAGE_TOKENS, FIXED_RUNTIME_BYTES, HOST_RESERVE_BYTES, RECURRENT_BYTES,
+        STARTUP_RESERVE_BYTES, STATE_MEMORY_FLOOR_BYTES, SwiftCalibratedOptions,
+        SwiftCalibratedReuse, SwiftContextPlan, SwiftContextProfile, SwiftWeightPacking,
+        swift_selected_state_budget_bytes, swift_tiled_prefill_scratch_bytes,
+        swift_tiled_verification_scratch_bytes,
+    };
+
+    let gib = 1024 * 1024 * 1024_u64;
+    let pq2_options = SwiftCalibratedOptions {
+        weight_packing: SwiftWeightPacking::Pq2_0,
+        request_vision: true,
+        prefill_tokens: None,
+        chunkwise_gdn_wy_f32: false,
+        speculation_tokens: None,
+        prompt_reuse: SwiftCalibratedReuse::Disabled,
+    };
+    let pq2_24g = SwiftContextPlan::for_calibrated_execution(
+        24 * gib,
+        SwiftContextProfile::NativeRsq4Full,
+        pq2_options,
+    )?;
+    assert_eq!(pq2_24g.context_plan.context_tokens, 262_144);
+    assert!(pq2_24g.vision_admitted);
+    let expected_cow_physical_pq2 = FIXED_RUNTIME_BYTES
+        + 2 * RECURRENT_BYTES
+        + 262_144 * 17_120
+        + 64 * 16_896
+        + MMPROJ_RESERVE_BYTES;
+    assert_eq!(
+        u64::try_from(pq2_24g.working_set_limit_bytes).map_err(|e| e.to_string())?,
+        expected_cow_physical_pq2
+    );
+    assert_eq!(
+        u64::try_from(pq2_24g.context_plan.memory_limit_bytes).map_err(|e| e.to_string())?,
+        expected_cow_physical_pq2 - SWIFT_WEIGHT_BYTES
+    );
+    assert_eq!(
+        pq2_24g.context_plan.required_available_bytes,
+        expected_cow_physical_pq2 + HOST_RESERVE_BYTES
+    );
+
+    // PTQ1 calibrates fixed bytes down by 1_259_520_000 and credits PTQ1_WEIGHT_BYTES from Job commit.
+    let ptq1_options = SwiftCalibratedOptions {
+        weight_packing: SwiftWeightPacking::Ptq1_0,
+        request_vision: false,
+        prefill_tokens: Some(16),
+        chunkwise_gdn_wy_f32: false,
+        speculation_tokens: Some(4),
+        prompt_reuse: SwiftCalibratedReuse::PromptEndAndLatest {
+            checkpoints: 2,
+            checkpoint_bytes: None,
+        },
+    };
+    let ptq1_plan = SwiftContextPlan::for_calibrated_execution(
+        24 * gib,
+        SwiftContextProfile::NativeRsq4Full,
+        ptq1_options,
+    )?;
+    assert!(!ptq1_plan.vision_admitted);
+    let scratch = ptq1_plan
+        .prefill_scratch_bytes
+        .ok_or_else(|| "missing prefill scratch".to_owned())?;
+    let (verify_scratch, checkpoint_bytes) = ptq1_plan
+        .speculation_reserves
+        .ok_or_else(|| "missing speculation reserves".to_owned())?;
+    assert_eq!(verify_scratch, 7_946_432);
+    assert_eq!(
+        u64::try_from(scratch).ok(),
+        swift_tiled_prefill_scratch_bytes(
+            16,
+            ptq1_plan.context_plan.context_tokens,
+            context::SwiftKvCacheFormat::Rsq4,
+        )
+    );
+    assert_eq!(
+        u64::try_from(checkpoint_bytes).ok(),
+        swift_selected_state_budget_bytes(
+            ptq1_plan.context_plan.context_tokens,
+            context::SwiftKvCacheFormat::Rsq4,
+        )
+    );
+    assert!(
+        checkpoint_bytes >= usize::try_from(STATE_MEMORY_FLOOR_BYTES).map_err(|e| e.to_string())?
+    );
+    let ctx = u64::try_from(ptq1_plan.context_plan.context_tokens).map_err(|e| e.to_string())?;
+    // Base 3 recurrent copies (active + rollback + verify) + (2 + 1) reuse copies = 6 total.
+    let expected_physical_ptq1 = (FIXED_RUNTIME_BYTES - (SWIFT_WEIGHT_BYTES - PTQ1_WEIGHT_BYTES))
+        + 6 * RECURRENT_BYTES
+        + ctx * 17_120
+        + 64 * 16_896
+        + u64::try_from(scratch).map_err(|e| e.to_string())?
+        + swift_tiled_verification_scratch_bytes(16).ok_or_else(|| "missing verify".to_owned())?;
+    assert_eq!(
+        u64::try_from(ptq1_plan.working_set_limit_bytes).map_err(|e| e.to_string())?,
+        expected_physical_ptq1
+    );
+    assert_eq!(
+        u64::try_from(ptq1_plan.context_plan.memory_limit_bytes).map_err(|e| e.to_string())?,
+        expected_physical_ptq1 - PTQ1_WEIGHT_BYTES
+    );
+    assert!(ptq1_plan.context_plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 24 * gib);
+    assert!(ptq1_plan.context_plan.context_tokens % CONTEXT_PAGE_TOKENS == 0);
+
+    // Invalid option pairings reject cleanly.
+    assert!(
+        SwiftContextPlan::for_calibrated_execution(
+            24 * gib,
+            SwiftContextProfile::NativeRsq4Full,
+            SwiftCalibratedOptions {
+                chunkwise_gdn_wy_f32: true,
+                prefill_tokens: Some(8),
+                ..pq2_options
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        SwiftContextPlan::for_calibrated_execution(
+            24 * gib,
+            SwiftContextProfile::NativeF16,
+            SwiftCalibratedOptions {
+                chunkwise_gdn_wy_f32: true,
+                prefill_tokens: Some(8),
+                ..pq2_options
+            },
+        )
+        .is_ok()
     );
     Ok(())
 }

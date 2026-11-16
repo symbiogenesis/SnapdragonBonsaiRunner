@@ -206,6 +206,24 @@ impl State {
             );
         }
         ui.label(RichText::new("Capacity is selected when the model starts. Closing memory-heavy apps before the next model start or Retry may leave room for a larger window. This model's current capacity stays fixed.").small().weak());
+        if let Some(capacity) = estimate.capacity
+            && let Some(footprint) = estimate_runtime_footprint(PlannerRuntimeShape {
+                context_tokens: capacity,
+                weight_packing: WeightPacking::Pq2_0,
+                kv_layout: KvCacheLayout::Rsq4,
+                kv_sharing: KvSharingMode::CowRollback,
+                evictable_mapped_weight_bytes: WeightPacking::Pq2_0.weight_bytes(),
+                npu_resident_arena_bytes: 0,
+                npu_released_host_pq2_bytes: 0,
+                branch_checkpoints: 1,
+            })
+        {
+            ui.label(
+                RichText::new(format_footprint_diagnostic(&footprint))
+                    .small()
+                    .weak(),
+            );
+        }
         if !pending && estimate.pressure() != Pressure::Comfortable {
             if estimate.suggested_cap().is_some() {
                 ui.label("A smaller reply limit could leave more room for this message.");
@@ -374,72 +392,31 @@ fn tokens(amount: usize) -> String {
     formatted
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const FIXED_RUNTIME_BYTES: u64 = 11 * 1024 * 1024 * 1024;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const PQ2_WEIGHT_BYTES: u64 = 7_206_168_928;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const PTQ1_WEIGHT_BYTES: u64 = 5_946_648_928;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const PQ2_TO_PTQ1_SAVING_BYTES: u64 = PQ2_WEIGHT_BYTES - PTQ1_WEIGHT_BYTES;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES: u64 = 2_888_663_040;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const RECURRENT_BYTES: u64 = 156_893_184;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const ACTIVE_AND_ROLLBACK_RECURRENT_COPIES: u64 = 2;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const MAX_REUSABLE_BRANCH_CHECKPOINTS: u8 = 8;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const KV_COW_PAGE_TOKENS: usize = 64;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
-)]
 const SEQUENTIAL_KV_BOOKKEEPING_BYTES_PER_TOKEN: u64 = 24 * 4 + 128;
 
 /// Weight packing option surfaced by context capacity footprint diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 pub(super) enum WeightPacking {
     Pq2_0,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Alternative weight packing variant covered by footprint tests."
+        )
+    )]
     Ptq1_0,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 impl WeightPacking {
     pub(super) const fn label(self) -> &'static str {
         match self {
@@ -465,20 +442,26 @@ impl WeightPacking {
 
 /// Attention KV layout surfaced by context capacity footprint diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 pub(super) enum KvCacheLayout {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Alternative KV layout variant covered by footprint tests."
+        )
+    )]
     F16,
     Rsq4,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Alternative KV layout variant covered by footprint tests."
+        )
+    )]
     Rsq4K3v,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 impl KvCacheLayout {
     pub(super) const fn label(self) -> &'static str {
         match self {
@@ -499,20 +482,26 @@ impl KvCacheLayout {
 
 /// KV cache sharing mode between active and rollback histories.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 pub(super) enum KvSharingMode {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Alternative KV sharing mode covered by footprint tests."
+        )
+    )]
     DivergentRollback,
     CowRollback,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Alternative KV sharing mode covered by footprint tests."
+        )
+    )]
     AppendOnlyCow,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 impl KvSharingMode {
     pub(super) const fn label(self) -> &'static str {
         match self {
@@ -525,10 +514,6 @@ impl KvSharingMode {
 
 /// Input parameters for pure steady-state physical RAM vs private Job commit diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 pub(super) struct PlannerRuntimeShape {
     pub(super) context_tokens: usize,
     pub(super) weight_packing: WeightPacking,
@@ -542,10 +527,6 @@ pub(super) struct PlannerRuntimeShape {
 
 /// Computed steady-state physical RAM and private Windows Job commit estimates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 pub(super) struct PlannerFootprintEstimate {
     pub(super) context_tokens: usize,
     pub(super) weight_packing: WeightPacking,
@@ -563,7 +544,10 @@ pub(super) struct PlannerFootprintEstimate {
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+    expect(
+        dead_code,
+        reason = "Pure planner diagnostics exercised by context_capacity tests."
+    )
 )]
 impl PlannerFootprintEstimate {
     pub(super) const fn physical_savings_over(&self, baseline: &Self) -> u64 {
@@ -584,10 +568,6 @@ impl PlannerFootprintEstimate {
 /// Returns `None` when `branch_checkpoints > 8`, when NPU PQ2 host deduplication
 /// is requested with non-PQ2 weights or exceeds `2_888_663_040` bytes, when
 /// `evictable_mapped_weight_bytes` exceeds remaining host weights/runtime, or on overflow.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 pub(super) fn estimate_runtime_footprint(
     shape: PlannerRuntimeShape,
 ) -> Option<PlannerFootprintEstimate> {
@@ -647,10 +627,6 @@ pub(super) fn estimate_runtime_footprint(
 }
 
 /// Format an integer byte count in binary `GiB` rounded to two decimal places.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 pub(super) fn format_gib_bytes(bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
     let hundredths = (u128::from(bytes) * 100 + u128::from(GIB / 2)) / u128::from(GIB);
@@ -660,10 +636,6 @@ pub(super) fn format_gib_bytes(bytes: u64) -> String {
 }
 
 /// Format a compact diagnostic summary contrasting steady-state physical RAM vs private Job commit.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
-)]
 pub(super) fn format_footprint_diagnostic(estimate: &PlannerFootprintEstimate) -> String {
     let mut parts = vec![
         estimate.weight_packing.label().to_owned(),
