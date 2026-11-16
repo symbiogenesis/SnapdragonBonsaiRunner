@@ -11,13 +11,16 @@
 
 use std::io;
 
+use fearless_simd::{Level, dispatch, f32x4, prelude::*};
+
 use crate::{
     SAMPLE_RATE,
     codec::{
         CausalConv1d, CausalTransConv1d, CodecStreamState, ConvNeXtBlock, DacBlock, DacDecoder,
         DacResUnit, PadMode, RvqDecoder, RvqEncodeSide, RvqGroup, SnakeBeta, TOKENIZER_HOP_24K,
     },
-    engine::{LinearProjection, apply_rope_neox_in_place, rms_norm_in_place},
+    engine::{LinearProjection, rms_norm_in_place},
+    numerics::usize_to_f32,
     speaker_encoder::{
         AttentiveStatPool, AudioMelConfig, EcapaSpeakerEncoder, MelSpectrogramExtractor,
         SeRes2NetBlock, SqueezeExcitation, TdnnConv1d,
@@ -477,6 +480,7 @@ impl Transformer {
         if scratch.hidden.len() != self.hidden || input.iter().any(|value| !value.is_finite()) {
             return Err(invalid());
         }
+        scratch.prepare_rope_tables(self.head_dim, state.position, self.theta)?;
         for (layer, cache) in self.layers.iter().zip(&mut state.layers) {
             normalize_into(
                 &scratch.hidden,
@@ -506,19 +510,19 @@ impl Transformer {
                 self.threads,
                 &mut scratch.v,
             )?;
-            apply_rope_neox_in_place(
+            apply_rope_neox_with_tables(
                 &mut scratch.q,
                 self.heads,
                 self.head_dim,
-                state.position,
-                self.theta,
+                &scratch.rope_cos,
+                &scratch.rope_sin,
             )?;
-            apply_rope_neox_in_place(
+            apply_rope_neox_with_tables(
                 &mut scratch.k,
                 self.kv_heads,
                 self.head_dim,
-                state.position,
-                self.theta,
+                &scratch.rope_cos,
+                &scratch.rope_sin,
             )?;
             append_attention_into(
                 &scratch.q,
@@ -626,6 +630,105 @@ struct CodecTransformerScratch {
     projected: Vec<f32>,
     up: Vec<f32>,
     gate: Vec<f32>,
+    rope_denoms: Vec<f32>,
+    rope_denoms_key: Option<(usize, u32)>,
+    rope_cos: Vec<f32>,
+    rope_sin: Vec<f32>,
+}
+
+impl CodecTransformerScratch {
+    fn prepare_rope_tables(&mut self, head_dim: usize, pos: usize, theta: f32) -> io::Result<()> {
+        if head_dim == 0 || !head_dim.is_multiple_of(2) {
+            return Err(invalid());
+        }
+        let half = head_dim / 2;
+        let key = (head_dim, theta.to_bits());
+        if self.rope_denoms_key != Some(key) {
+            let hd_f = usize_to_f32(head_dim);
+            self.rope_denoms.clear();
+            self.rope_denoms.reserve(half);
+            for i in 0..half {
+                let exponent = usize_to_f32(2 * i) / hd_f;
+                self.rope_denoms.push(theta.powf(exponent));
+            }
+            self.rope_denoms_key = Some(key);
+        }
+        self.rope_cos.clear();
+        self.rope_sin.clear();
+        self.rope_cos.reserve(half);
+        self.rope_sin.reserve(half);
+        let pos_f = usize_to_f32(pos);
+        for &denom in &self.rope_denoms {
+            let freq = pos_f / denom;
+            let (sin_v, cos_v) = freq.sin_cos();
+            self.rope_cos.push(cos_v);
+            self.rope_sin.push(sin_v);
+        }
+        Ok(())
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn rope_head_simd<S: Simd>(simd: S, lo: &mut [f32], hi: &mut [f32], cos: &[f32], sin: &[f32]) {
+    let (lo_chunks, lo_tail) = lo.as_chunks_mut::<4>();
+    let (hi_chunks, hi_tail) = hi.as_chunks_mut::<4>();
+    let (cos_chunks, cos_tail) = cos.as_chunks::<4>();
+    let (sin_chunks, sin_tail) = sin.as_chunks::<4>();
+    for (((lo_c, hi_c), cos_c), sin_c) in lo_chunks
+        .iter_mut()
+        .zip(hi_chunks.iter_mut())
+        .zip(cos_chunks.iter())
+        .zip(sin_chunks.iter())
+    {
+        let x0 = f32x4::from_slice(simd, lo_c);
+        let x1 = f32x4::from_slice(simd, hi_c);
+        let cv = f32x4::from_slice(simd, cos_c);
+        let sv = f32x4::from_slice(simd, sin_c);
+        x0.mul_add(cv, -(x1 * sv)).store_slice(lo_c);
+        x0.mul_add(sv, x1 * cv).store_slice(hi_c);
+    }
+    for (((x0_ref, x1_ref), &cos_v), &sin_v) in lo_tail
+        .iter_mut()
+        .zip(hi_tail.iter_mut())
+        .zip(cos_tail.iter())
+        .zip(sin_tail.iter())
+    {
+        let x0 = *x0_ref;
+        let x1 = *x1_ref;
+        *x0_ref = x0.mul_add(cos_v, -x1 * sin_v);
+        *x1_ref = x0.mul_add(sin_v, x1 * cos_v);
+    }
+}
+
+fn apply_rope_neox_with_tables(
+    heads: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    cos: &[f32],
+    sin: &[f32],
+) -> io::Result<()> {
+    let half = head_dim / 2;
+    if head_dim == 0
+        || !head_dim.is_multiple_of(2)
+        || cos.len() != half
+        || sin.len() != half
+        || heads.len() != num_heads * head_dim
+    {
+        return Err(invalid());
+    }
+    let level = Level::new();
+    dispatch!(level, simd => {
+        for h in 0..num_heads {
+            let slice = &mut heads[h * head_dim..(h + 1) * head_dim];
+            let (lo, hi) = slice.split_at_mut(half);
+            rope_head_simd(simd, lo, hi, cos, sin);
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1838,6 +1941,42 @@ mod tests {
             (2.0, 1.954_499_7),
         ] {
             assert!((gelu_erf(input) - expected).abs() < 3e-7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codec_transformer_reused_rope_matches_per_layer_rope_bits() -> std::io::Result<()> {
+        let mut scratch = super::CodecTransformerScratch::default();
+        for (head_dim, num_heads, theta) in [(6_usize, 3_usize, 10_000.0_f32), (16, 4, 1_000_000.0)]
+        {
+            for pos in [0_usize, 1, 7, 15, 73] {
+                scratch.prepare_rope_tables(head_dim, pos, theta)?;
+                let original: Vec<f32> = (0..num_heads * head_dim)
+                    .map(|i| (f32::from(u16::try_from(i % 23).unwrap_or(0)) - 11.0) * 0.0625)
+                    .collect();
+                let mut expected = original.clone();
+                crate::engine::apply_rope_neox_in_place(
+                    &mut expected,
+                    num_heads,
+                    head_dim,
+                    pos,
+                    theta,
+                )?;
+                let mut actual = original;
+                super::apply_rope_neox_with_tables(
+                    &mut actual,
+                    num_heads,
+                    head_dim,
+                    &scratch.rope_cos,
+                    &scratch.rope_sin,
+                )?;
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "head_dim {head_dim} pos {pos}"
+                );
+            }
         }
         Ok(())
     }
