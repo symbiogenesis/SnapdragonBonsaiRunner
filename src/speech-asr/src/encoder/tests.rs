@@ -1,8 +1,8 @@
 //! Hand-calculated convolution, normalization, attention, sinusoid and tail controls.
 
 use super::{
-    Block, Config, Encoder, Linear, Norm, Projection, Weights, attention, convolve, numerics,
-    position_add,
+    Block, Config, Encoder, Linear, Norm, Projection, Weights, attention, convolve,
+    convolve_with_threads, numerics, position_add,
 };
 use std::io;
 
@@ -408,6 +408,63 @@ fn rust_asr_encoder_batched_parallel_matches_scalar_bits() -> io::Result<()> {
     assert_eq!(
         serial.with_threads(0).err().map(|error| error.kind()),
         Some(io::ErrorKind::InvalidInput)
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_asr_encoder_parallel_conv_matches_sequential_bits() -> io::Result<()> {
+    let width = 17_usize;
+    let height = 13_usize;
+    let channels = 4_usize;
+    let out_channels = 9_usize;
+    let patch_width = 9 * channels;
+    let weight_vals: Vec<f32> = (0..patch_width * out_channels)
+        .map(|i| (f32::from(u16::try_from(i % 29).unwrap_or(0)) - 14.0) * 0.03125)
+        .collect();
+    let bias: Vec<f32> = (0..out_channels)
+        .map(|i| (f32::from(u8::try_from(i % 7).unwrap_or(0)) - 3.0) * 0.0625)
+        .collect();
+    let mut layer = Linear {
+        weights: Projection::f32(patch_width, out_channels, weight_vals)?,
+        bias,
+    };
+    layer.weights.round_convolution_weights()?;
+    let input: Vec<f32> = (0..channels * height * width)
+        .map(|i| (f32::from(u16::try_from(i % 37).unwrap_or(0)) - 18.0) * 0.05)
+        .collect();
+    let expected = convolve(&layer, &input, width, height, channels, &mut || false)?;
+    for workers in [2_usize, 4, 8] {
+        let actual = convolve_with_threads(
+            &layer,
+            &input,
+            width,
+            height,
+            channels,
+            workers,
+            &mut || false,
+        )?;
+        assert_eq!(
+            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "conv bit mismatch for workers={workers}"
+        );
+    }
+
+    let mut overflow_input = input;
+    let mid = overflow_input.len() / 2;
+    overflow_input[mid] = 65_520.0;
+    assert!(
+        convolve_with_threads(
+            &layer,
+            &overflow_input,
+            width,
+            height,
+            channels,
+            4,
+            &mut || { false }
+        )
+        .is_err()
     );
     Ok(())
 }
