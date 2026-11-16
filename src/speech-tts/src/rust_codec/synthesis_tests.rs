@@ -97,6 +97,8 @@ fn warm_synthesizer() -> io::Result<Synthesizer> {
         }),
         primed: Some((vec![[0; 16]], state.clone())),
         state,
+        transformer_scratch: super::CodecTransformerScratch::default(),
+        decode_scratch: crate::codec::CodecDecodeScratch::default(),
     };
     Ok(Synthesizer {
         voices: VoiceCache(Some((

@@ -11,11 +11,82 @@
     reason = "Internal codec and convolution shape checks return io::ErrorKind::InvalidInput."
 )]
 
-use std::io;
+use std::{cell::RefCell, io};
 
 use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 
 use crate::{SAMPLE_RATE, SAMPLE_RATE_48K, engine::row_workers, numerics::usize_to_f32};
+
+thread_local! {
+    static WORKER_PATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static CONVNEXT_SCRATCH: RefCell<(Vec<f32>, Vec<f32>)> =
+        const { RefCell::new((Vec::new(), Vec::new())) };
+}
+
+fn with_worker_patch<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    WORKER_PATCH.with(|slot| {
+        if let Ok(mut buf) = slot.try_borrow_mut() {
+            if buf.len() < len {
+                buf.resize(len, 0.0_f32);
+            }
+            f(&mut buf[..len])
+        } else {
+            let mut buf = vec![0.0_f32; len];
+            f(&mut buf)
+        }
+    })
+}
+
+fn with_convnext_scratch<R>(
+    c: usize,
+    mid_c: usize,
+    f: impl FnOnce(&mut [f32], &mut [f32]) -> R,
+) -> R {
+    CONVNEXT_SCRATCH.with(|slot| {
+        if let Ok(mut bufs) = slot.try_borrow_mut() {
+            let (y, mid) = &mut *bufs;
+            if y.len() < c {
+                y.resize(c, 0.0_f32);
+            }
+            if mid.len() < mid_c {
+                mid.resize(mid_c, 0.0_f32);
+            }
+            f(&mut y[..c], &mut mid[..mid_c])
+        } else {
+            let mut y = vec![0.0_f32; c];
+            let mut mid = vec![0.0_f32; mid_c];
+            f(&mut y, &mut mid)
+        }
+    })
+}
+
+/// Reusable `DacDecoder` frame buffers inside [`CodecDecodeScratch`].
+#[derive(Default)]
+pub(crate) struct DacDecodeScratch {
+    conv_ext: Vec<f32>,
+    dac_a: Vec<f32>,
+    dac_b: Vec<f32>,
+    res_buf: Vec<f32>,
+    block_buf: Vec<f32>,
+    audio: Vec<f32>,
+}
+
+/// Reusable frame-decoding buffers across `RvqDecoder`, `CausalConv1d`,
+/// `CausalTransConv1d`, `ConvNeXtBlock`, and `DacDecoder` stages.
+#[derive(Default)]
+pub struct CodecDecodeScratch {
+    rvq_sem_codes: Vec<i32>,
+    rvq_aco_codes: Vec<i32>,
+    rvq_sum_emb: Vec<f32>,
+    pub(crate) rvq_sem_out: Vec<f32>,
+    rvq_aco_out: Vec<f32>,
+    pub(crate) conv_ext: Vec<f32>,
+    pub(crate) trans_carry: Vec<f32>,
+    pub(crate) pre_out: Vec<f32>,
+    pub(crate) upsample_a: Vec<f32>,
+    pub(crate) upsample_b: Vec<f32>,
+    pub(crate) dac: DacDecodeScratch,
+}
 
 fn frame_workers(threads: usize, frames: usize, work: usize) -> usize {
     if frames <= 1 || work < 65_536 {
@@ -573,7 +644,8 @@ impl CausalConv1d {
         let ideal_len = (out_frames - 1) * self.stride + k_eff - pad_left;
         let extra_pad = ideal_len.saturating_sub(frames);
         if pad_left == 0 && extra_pad == 0 {
-            let out = self.compute_frames(input, out_frames, self.stride, threads);
+            let mut out = Vec::new();
+            self.compute_frames_into(input, out_frames, self.stride, threads, &mut out);
             return Ok((out, out_frames));
         }
         let padded_len = pad_left + frames + extra_pad;
@@ -593,7 +665,8 @@ impl CausalConv1d {
             }
         }
 
-        let out = self.compute_frames(&padded, out_frames, self.stride, threads);
+        let mut out = Vec::new();
+        self.compute_frames_into(&padded, out_frames, self.stride, threads, &mut out);
         Ok((out, out_frames))
     }
 
@@ -615,6 +688,21 @@ impl CausalConv1d {
         state: &mut [f32],
         threads: usize,
     ) -> io::Result<Vec<f32>> {
+        let mut ext = Vec::new();
+        let mut out = Vec::new();
+        self.forward_stream_into(input, frames, state, threads, &mut ext, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn forward_stream_into(
+        &self,
+        input: &[f32],
+        frames: usize,
+        state: &mut [f32],
+        threads: usize,
+        ext_scratch: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) -> io::Result<()> {
         let ctx_frames = self.stream_context_frames();
         if self.stride != 1
             || self.in_c == 0
@@ -629,27 +717,35 @@ impl CausalConv1d {
             ));
         }
         if ctx_frames == 0 {
-            return Ok(self.compute_frames(input, frames, 1, threads));
+            self.compute_frames_into(input, frames, 1, threads, out);
+            return Ok(());
         }
-        let ext_frames = ctx_frames + frames;
-        let mut ext = Vec::with_capacity(ext_frames * self.in_c);
-        ext.extend_from_slice(state);
-        ext.extend_from_slice(input);
+        let ext_len = (ctx_frames + frames) * self.in_c;
+        ext_scratch.clear();
+        if ext_scratch.capacity() < ext_len {
+            ext_scratch.reserve(ext_len - ext_scratch.capacity());
+        }
+        ext_scratch.extend_from_slice(state);
+        ext_scratch.extend_from_slice(input);
 
         let tail_start = frames * self.in_c;
-        state.copy_from_slice(&ext[tail_start..]);
+        state.copy_from_slice(&ext_scratch[tail_start..]);
 
-        Ok(self.compute_frames(&ext, frames, 1, threads))
+        self.compute_frames_into(ext_scratch, frames, 1, threads, out);
+        Ok(())
     }
 
-    fn compute_frames(
+    fn compute_frames_into(
         &self,
         ext: &[f32],
         out_frames: usize,
         stride: usize,
         threads: usize,
-    ) -> Vec<f32> {
-        let mut out = vec![0.0_f32; out_frames * self.out_c];
+        out: &mut Vec<f32>,
+    ) {
+        let out_len = out_frames * self.out_c;
+        out.clear();
+        out.resize(out_len, 0.0_f32);
         let level = Level::new();
         let bias = self.bias.as_deref();
         let work = out_frames.saturating_mul(self.weight.len());
@@ -660,26 +756,27 @@ impl CausalConv1d {
         // four-row dot products, bias and accumulation order as frame splitting.
         if out_frames < threads.clamp(1, 18) && work >= 65_536 && self.out_c >= 4 {
             let width = self.in_c * self.kernel;
-            let mut patch = vec![0.0; width];
-            for (frame, out_row) in out.chunks_exact_mut(self.out_c).enumerate() {
-                let first = frame * stride;
-                for (ic, row) in patch.chunks_exact_mut(self.kernel).enumerate() {
-                    for (k, value) in row.iter_mut().enumerate() {
-                        *value = ext[(first + k * self.dilation) * self.in_c + ic];
+            with_worker_patch(width, |patch| {
+                for (frame, out_row) in out.chunks_exact_mut(self.out_c).enumerate() {
+                    let first = frame * stride;
+                    for (ic, row) in patch.chunks_exact_mut(self.kernel).enumerate() {
+                        for (k, value) in row.iter_mut().enumerate() {
+                            *value = ext[(first + k * self.dilation) * self.in_c + ic];
+                        }
                     }
+                    row_workers::run_aligned(out_row, threads, 4, &|offset, rows| {
+                        let weights = &self.weight[offset * width..(offset + rows.len()) * width];
+                        let bias = bias.map(|values| &values[offset..offset + rows.len()]);
+                        dispatch!(
+                            level,
+                            simd => matvec_4rows_simd(simd, weights, patch, bias, rows)
+                        );
+                    });
                 }
-                row_workers::run_aligned(out_row, threads, 4, &|offset, rows| {
-                    let weights = &self.weight[offset * width..(offset + rows.len()) * width];
-                    let bias = bias.map(|values| &values[offset..offset + rows.len()]);
-                    dispatch!(
-                        level,
-                        simd => matvec_4rows_simd(simd, weights, &patch, bias, rows)
-                    );
-                });
-            }
-            return out;
+            });
+            return;
         }
-        row_workers::run_aligned(&mut out, workers, self.out_c, &|offset, output| {
+        row_workers::run_aligned(out, workers, self.out_c, &|offset, output| {
             let first_frame = offset / self.out_c;
             if self.kernel == 1 {
                 for (frame, out_row) in output.chunks_exact_mut(self.out_c).enumerate() {
@@ -692,23 +789,23 @@ impl CausalConv1d {
                 }
                 return;
             }
-            let mut patch = vec![0.0_f32; self.in_c * self.kernel];
-            for (frame, out_row) in output.chunks_exact_mut(self.out_c).enumerate() {
-                let t_in_base = (first_frame + frame) * stride;
-                for ic in 0..self.in_c {
-                    let p_base = ic * self.kernel;
-                    for k in 0..self.kernel {
-                        let t_in = t_in_base + k * self.dilation;
-                        patch[p_base + k] = ext[t_in * self.in_c + ic];
+            with_worker_patch(self.in_c * self.kernel, |patch| {
+                for (frame, out_row) in output.chunks_exact_mut(self.out_c).enumerate() {
+                    let t_in_base = (first_frame + frame) * stride;
+                    for ic in 0..self.in_c {
+                        let p_base = ic * self.kernel;
+                        for k in 0..self.kernel {
+                            let t_in = t_in_base + k * self.dilation;
+                            patch[p_base + k] = ext[t_in * self.in_c + ic];
+                        }
                     }
+                    dispatch!(
+                        level,
+                        simd => matvec_4rows_simd(simd, &self.weight, patch, bias, out_row)
+                    );
                 }
-                dispatch!(
-                    level,
-                    simd => matvec_4rows_simd(simd, &self.weight, &patch, bias, out_row)
-                );
-            }
+            });
         });
-        out
     }
 }
 
@@ -749,9 +846,25 @@ impl CausalTransConv1d {
         frames: usize,
         threads: usize,
     ) -> io::Result<(Vec<f32>, usize)> {
-        let mut carry = vec![0.0_f32; self.carry_frames() * self.out_c];
-        let out = self.forward_stream_parallel(input, frames, &mut carry, threads)?;
-        Ok((out, frames * self.stride))
+        let mut carry = Vec::new();
+        let mut out = Vec::new();
+        let out_frames = self.forward_into(input, frames, threads, &mut carry, &mut out)?;
+        Ok((out, out_frames))
+    }
+
+    pub(crate) fn forward_into(
+        &self,
+        input: &[f32],
+        frames: usize,
+        threads: usize,
+        carry_scratch: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) -> io::Result<usize> {
+        let carry_len = self.carry_frames() * self.out_c;
+        carry_scratch.clear();
+        carry_scratch.resize(carry_len, 0.0_f32);
+        self.forward_stream_into(input, frames, &mut carry_scratch[..carry_len], threads, out)?;
+        Ok(frames * self.stride)
     }
 
     /// Stateful streaming causal transposed convolution updating `carry` (`[kernel - stride, out_c]`).
@@ -772,6 +885,19 @@ impl CausalTransConv1d {
         carry: &mut [f32],
         threads: usize,
     ) -> io::Result<Vec<f32>> {
+        let mut raw = Vec::new();
+        self.forward_stream_into(input, frames, carry, threads, &mut raw)?;
+        Ok(raw)
+    }
+
+    pub(crate) fn forward_stream_into(
+        &self,
+        input: &[f32],
+        frames: usize,
+        carry: &mut [f32],
+        threads: usize,
+        raw: &mut Vec<f32>,
+    ) -> io::Result<()> {
         let trim = self.carry_frames();
         if frames == 0
             || self.in_c == 0
@@ -790,7 +916,8 @@ impl CausalTransConv1d {
         }
         let emit = frames * self.stride;
         let raw_frames = emit + trim;
-        let mut raw = vec![0.0_f32; raw_frames * self.out_c];
+        raw.clear();
+        raw.resize(raw_frames * self.out_c, 0.0_f32);
         if trim > 0 {
             raw[..trim * self.out_c].copy_from_slice(carry);
         }
@@ -798,7 +925,7 @@ impl CausalTransConv1d {
         let level = Level::new();
         let work = frames.saturating_mul(self.weight.len());
         let workers = frame_workers(threads, raw_frames, work);
-        row_workers::run_aligned(&mut raw, workers, self.out_c, &|offset, output| {
+        row_workers::run_aligned(raw, workers, self.out_c, &|offset, output| {
             let first_frame = offset / self.out_c;
             let end_frame = first_frame + output.len() / self.out_c;
             let first_source = first_frame
@@ -840,7 +967,7 @@ impl CausalTransConv1d {
                 dispatch!(level, simd => add_slice_in_place_simd(simd, row, bias));
             }
         }
-        Ok(raw)
+        Ok(())
     }
 }
 
@@ -952,19 +1079,64 @@ impl DacResUnit {
         conv1_state: &mut [f32],
         threads: usize,
     ) -> io::Result<Vec<f32>> {
-        let mut h = input.to_vec();
-        self.act1.apply_in_place_parallel(&mut h, frames, threads)?;
-        let mut h = self
-            .conv1
-            .forward_stream_parallel(&h, frames, conv1_state, threads)?;
-        self.act2.apply_in_place_parallel(&mut h, frames, threads)?;
+        let mut h = Vec::new();
+        h.extend_from_slice(input);
+        let mut conv_ext = Vec::new();
+        let mut res_buf = Vec::new();
+        let mut block_buf = Vec::new();
+        self.forward_stream_into(
+            &mut h,
+            frames,
+            conv1_state,
+            threads,
+            &mut conv_ext,
+            &mut res_buf,
+            &mut block_buf,
+        )?;
+        Ok(h)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Reuses caller-owned convolution and residual scratch buffers across all DAC residual units."
+    )]
+    fn forward_stream_into(
+        &self,
+        input_and_out: &mut Vec<f32>,
+        frames: usize,
+        conv1_state: &mut [f32],
+        threads: usize,
+        conv_ext: &mut Vec<f32>,
+        res_buf: &mut Vec<f32>,
+        block_buf: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        res_buf.clear();
+        res_buf.extend_from_slice(input_and_out);
+        self.act1
+            .apply_in_place_parallel(res_buf, frames, threads)?;
+        self.conv1.forward_stream_into(
+            res_buf,
+            frames,
+            conv1_state,
+            threads,
+            conv_ext,
+            block_buf,
+        )?;
+        self.act2
+            .apply_in_place_parallel(block_buf, frames, threads)?;
         let mut dummy_state = [];
-        let mut out = self
-            .conv2
-            .forward_stream_parallel(&h, frames, &mut dummy_state, threads)?;
+        self.conv2.forward_stream_into(
+            block_buf,
+            frames,
+            &mut dummy_state,
+            threads,
+            conv_ext,
+            res_buf,
+        )?;
         let level = Level::new();
-        dispatch!(level, simd => add_slice_in_place_simd(simd, &mut out, input));
-        Ok(out)
+        dispatch!(level, simd => add_slice_in_place_simd(simd, res_buf, input_and_out));
+        std::mem::swap(input_and_out, res_buf);
+        Ok(())
     }
 }
 
@@ -1000,17 +1172,51 @@ impl DacBlock {
         ru_states: &mut [Vec<f32>; 3],
         threads: usize,
     ) -> io::Result<(Vec<f32>, usize)> {
-        let mut h = input.to_vec();
+        let mut conv_ext = Vec::new();
+        let mut block_buf = Vec::new();
+        let mut res_buf = Vec::new();
+        let mut out = Vec::new();
+        let out_frames = self.forward_stream_into(
+            input,
+            frames,
+            carry,
+            ru_states,
+            threads,
+            &mut conv_ext,
+            &mut block_buf,
+            &mut res_buf,
+            &mut out,
+        )?;
+        Ok((out, out_frames))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Reuses caller-owned block and residual scratch buffers across DAC upsample stages."
+    )]
+    fn forward_stream_into(
+        &self,
+        input: &[f32],
+        frames: usize,
+        carry: &mut [f32],
+        ru_states: &mut [Vec<f32>; 3],
+        threads: usize,
+        conv_ext: &mut Vec<f32>,
+        block_buf: &mut Vec<f32>,
+        res_buf: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) -> io::Result<usize> {
+        block_buf.clear();
+        block_buf.extend_from_slice(input);
         self.snake1
-            .apply_in_place_parallel(&mut h, frames, threads)?;
-        let mut h = self
-            .trans_conv
-            .forward_stream_parallel(&h, frames, carry, threads)?;
+            .apply_in_place_parallel(block_buf, frames, threads)?;
+        self.trans_conv
+            .forward_stream_into(block_buf, frames, carry, threads, out)?;
         let out_frames = frames * self.trans_conv.stride;
         for (ru, st) in self.res_units.iter().zip(ru_states.iter_mut()) {
-            h = ru.forward_stream_parallel(&h, out_frames, st, threads)?;
+            ru.forward_stream_into(out, out_frames, st, threads, conv_ext, res_buf, block_buf)?;
         }
-        Ok((h, out_frames))
+        Ok(out_frames)
     }
 }
 
@@ -1060,6 +1266,21 @@ impl ConvNeXtBlock {
         dw_state: &mut [f32],
         threads: usize,
     ) -> io::Result<Vec<f32>> {
+        let mut ext_buf = Vec::new();
+        let mut out = Vec::new();
+        self.forward_stream_into(input, frames, dw_state, threads, &mut ext_buf, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn forward_stream_into(
+        &self,
+        input: &[f32],
+        frames: usize,
+        dw_state: &mut [f32],
+        threads: usize,
+        ext_buf: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) -> io::Result<()> {
         let c = self.channels;
         let k = self.kernel;
         let ctx_len = k.saturating_sub(1);
@@ -1076,55 +1297,58 @@ impl ConvNeXtBlock {
                 "Invalid ConvNeXtBlock dimensions.",
             ));
         }
-        let ext_owned;
         let ext: &[f32] = if ctx_len == 0 {
             input
         } else {
-            let mut buf = Vec::with_capacity((ctx_len + frames) * c);
-            buf.extend_from_slice(dw_state);
-            buf.extend_from_slice(input);
-            dw_state.copy_from_slice(&buf[frames * c..]);
-            ext_owned = buf;
-            &ext_owned
+            let ext_len = (ctx_len + frames) * c;
+            ext_buf.clear();
+            if ext_buf.capacity() < ext_len {
+                ext_buf.reserve(ext_len - ext_buf.capacity());
+            }
+            ext_buf.extend_from_slice(dw_state);
+            ext_buf.extend_from_slice(input);
+            dw_state.copy_from_slice(&ext_buf[frames * c..]);
+            ext_buf
         };
 
         let inv_c = 1.0_f32 / usize_to_f32(c);
         let mid_c = self.pwconv1_b.len();
-        let mut out = input.to_vec();
+        out.clear();
+        out.extend_from_slice(input);
         let level = Level::new();
         let work = frames.saturating_mul(self.pwconv1_w.len() + self.pwconv2_w.len());
         let workers = frame_workers(threads, frames, work);
-        row_workers::run_aligned(&mut out, workers, c, &|offset, output| {
-            let mut y = vec![0.0_f32; c];
-            let mut mid = vec![0.0_f32; mid_c];
-            for (frame, out_row) in output.chunks_exact_mut(c).enumerate() {
-                let t = offset / c + frame;
-                dispatch!(
-                level,
-                simd => convnext_frame_simd(
-                    simd,
-                    ext,
-                    t,
-                    c,
-                    k,
-                    inv_c,
-                    &self.dw_weight,
-                    &self.dw_bias,
-                    &self.norm_w,
-                    &self.norm_b,
-                    &self.pwconv1_w,
-                    &self.pwconv1_b,
-                    &self.pwconv2_w,
-                    &self.pwconv2_b,
-                    &self.gamma,
-                    &mut y,
-                    &mut mid,
-                    out_row,
-                )
-                );
-            }
+        row_workers::run_aligned(out, workers, c, &|offset, output| {
+            with_convnext_scratch(c, mid_c, |y, mid| {
+                for (frame, out_row) in output.chunks_exact_mut(c).enumerate() {
+                    let t = offset / c + frame;
+                    dispatch!(
+                        level,
+                        simd => convnext_frame_simd(
+                            simd,
+                            ext,
+                            t,
+                            c,
+                            k,
+                            inv_c,
+                            &self.dw_weight,
+                            &self.dw_bias,
+                            &self.norm_w,
+                            &self.norm_b,
+                            &self.pwconv1_w,
+                            &self.pwconv1_b,
+                            &self.pwconv2_w,
+                            &self.pwconv2_b,
+                            &self.gamma,
+                            y,
+                            mid,
+                            out_row,
+                        )
+                    );
+                }
+            });
         });
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -1148,6 +1372,19 @@ pub struct RvqGroup {
 impl RvqGroup {
     /// Decode `[frames, num_codebooks]` time-first codes into `[frames, hidden_dim]`.
     pub fn decode(&self, codes: &[i32], frames: usize) -> io::Result<Vec<f32>> {
+        let mut sum_emb = Vec::new();
+        let mut out = Vec::new();
+        self.decode_into(codes, frames, &mut sum_emb, &mut out)?;
+        Ok(out)
+    }
+
+    fn decode_into(
+        &self,
+        codes: &[i32],
+        frames: usize,
+        sum_emb: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) -> io::Result<()> {
         if codes.len() != frames * self.num_codebooks
             || self.codebooks.len() != self.num_codebooks
             || self.out_proj_w.len() != self.hidden_dim * self.codebook_dim
@@ -1157,8 +1394,10 @@ impl RvqGroup {
                 "Invalid RVQ group decode dimensions.",
             ));
         }
-        let mut out = vec![0.0_f32; frames * self.hidden_dim];
-        let mut sum_emb = vec![0.0_f32; self.codebook_dim];
+        out.clear();
+        out.resize(frames * self.hidden_dim, 0.0_f32);
+        sum_emb.clear();
+        sum_emb.resize(self.codebook_dim, 0.0_f32);
         let level = Level::new();
         for t in 0..frames {
             sum_emb.fill(0.0_f32);
@@ -1174,15 +1413,15 @@ impl RvqGroup {
                 }
                 let row =
                     &self.codebooks[k][idx * self.codebook_dim..(idx + 1) * self.codebook_dim];
-                dispatch!(level, simd => add_slice_in_place_simd(simd, &mut sum_emb, row));
+                dispatch!(level, simd => add_slice_in_place_simd(simd, sum_emb, row));
             }
             let out_row = &mut out[t * self.hidden_dim..(t + 1) * self.hidden_dim];
             dispatch!(
                 level,
-                simd => matvec_4rows_simd(simd, &self.out_proj_w, &sum_emb, None, out_row)
+                simd => matvec_4rows_simd(simd, &self.out_proj_w, sum_emb, None, out_row)
             );
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -1198,6 +1437,17 @@ pub struct RvqDecoder {
 impl RvqDecoder {
     /// Decode `[frames, 16]` time-first codes into `[frames, 512]`.
     pub fn decode(&self, codes: &[i32], frames: usize) -> io::Result<Vec<f32>> {
+        let mut scratch = CodecDecodeScratch::default();
+        self.decode_into(codes, frames, &mut scratch)?;
+        Ok(scratch.rvq_sem_out)
+    }
+
+    pub(crate) fn decode_into(
+        &self,
+        codes: &[i32],
+        frames: usize,
+        scratch: &mut CodecDecodeScratch,
+    ) -> io::Result<()> {
         let k_sem = self.semantic.num_codebooks;
         let k_aco = self.acoustic.num_codebooks;
         let total_k = k_sem + k_aco;
@@ -1207,18 +1457,56 @@ impl RvqDecoder {
                 "Invalid RvqDecoder input codes.",
             ));
         }
-        let mut sem_codes = Vec::with_capacity(frames * k_sem);
-        let mut aco_codes = Vec::with_capacity(frames * k_aco);
-        for t in 0..frames {
-            let row = &codes[t * total_k..(t + 1) * total_k];
-            sem_codes.extend_from_slice(&row[..k_sem]);
-            aco_codes.extend_from_slice(&row[k_sem..]);
+        if frames == 1 {
+            self.semantic.decode_into(
+                &codes[..k_sem],
+                1,
+                &mut scratch.rvq_sum_emb,
+                &mut scratch.rvq_sem_out,
+            )?;
+            self.acoustic.decode_into(
+                &codes[k_sem..],
+                1,
+                &mut scratch.rvq_sum_emb,
+                &mut scratch.rvq_aco_out,
+            )?;
+        } else {
+            scratch.rvq_sem_codes.clear();
+            scratch.rvq_aco_codes.clear();
+            if scratch.rvq_sem_codes.capacity() < frames * k_sem {
+                scratch
+                    .rvq_sem_codes
+                    .reserve(frames * k_sem - scratch.rvq_sem_codes.capacity());
+            }
+            if scratch.rvq_aco_codes.capacity() < frames * k_aco {
+                scratch
+                    .rvq_aco_codes
+                    .reserve(frames * k_aco - scratch.rvq_aco_codes.capacity());
+            }
+            for t in 0..frames {
+                let row = &codes[t * total_k..(t + 1) * total_k];
+                scratch.rvq_sem_codes.extend_from_slice(&row[..k_sem]);
+                scratch.rvq_aco_codes.extend_from_slice(&row[k_sem..]);
+            }
+            self.semantic.decode_into(
+                &scratch.rvq_sem_codes,
+                frames,
+                &mut scratch.rvq_sum_emb,
+                &mut scratch.rvq_sem_out,
+            )?;
+            self.acoustic.decode_into(
+                &scratch.rvq_aco_codes,
+                frames,
+                &mut scratch.rvq_sum_emb,
+                &mut scratch.rvq_aco_out,
+            )?;
         }
-        let mut h_sem = self.semantic.decode(&sem_codes, frames)?;
-        let h_aco = self.acoustic.decode(&aco_codes, frames)?;
         let level = Level::new();
-        dispatch!(level, simd => add_slice_in_place_simd(simd, &mut h_sem, &h_aco));
-        Ok(h_sem)
+        dispatch!(
+            level,
+            simd => add_slice_in_place_simd(simd, &mut scratch.rvq_sem_out, &scratch.rvq_aco_out)
+        );
+        Ok(())
     }
 }
 
@@ -1571,32 +1859,78 @@ impl DacDecoder {
         state: &mut CodecStreamState,
         threads: usize,
     ) -> io::Result<Vec<f32>> {
+        let mut scratch = CodecDecodeScratch::default();
+        self.forward_stream_with_scratch(input, frames, state, threads, &mut scratch)?;
+        Ok(scratch.dac.audio)
+    }
+
+    /// Decode into `scratch` reusing all intermediate buffers across streaming frames.
+    pub fn forward_stream_with_scratch<'a>(
+        &self,
+        input: &[f32],
+        frames: usize,
+        state: &mut CodecStreamState,
+        threads: usize,
+        scratch: &'a mut CodecDecodeScratch,
+    ) -> io::Result<&'a [f32]> {
+        self.forward_stream_with_dac_scratch(input, frames, state, threads, &mut scratch.dac)
+    }
+
+    pub(crate) fn forward_stream_with_dac_scratch<'a>(
+        &self,
+        input: &[f32],
+        frames: usize,
+        state: &mut CodecStreamState,
+        threads: usize,
+        scratch: &'a mut DacDecodeScratch,
+    ) -> io::Result<&'a [f32]> {
         if state.dac_carry.len() != self.blocks.len() || state.dac_ru.len() != self.blocks.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "DAC streaming state block count mismatch.",
             ));
         }
-        let mut h =
-            self.conv_pre
-                .forward_stream_parallel(input, frames, &mut state.dac_pre, threads)?;
+        let DacDecodeScratch {
+            conv_ext,
+            dac_a,
+            dac_b,
+            res_buf,
+            block_buf,
+            audio,
+        } = scratch;
+        self.conv_pre.forward_stream_into(
+            input,
+            frames,
+            &mut state.dac_pre,
+            threads,
+            conv_ext,
+            dac_a,
+        )?;
         let mut cur_frames = frames;
         for (i, blk) in self.blocks.iter().enumerate() {
-            let (next_h, next_f) = blk.forward_stream_parallel(
-                &h,
+            cur_frames = blk.forward_stream_into(
+                dac_a,
                 cur_frames,
                 &mut state.dac_carry[i],
                 &mut state.dac_ru[i],
                 threads,
+                conv_ext,
+                block_buf,
+                res_buf,
+                dac_b,
             )?;
-            h = next_h;
-            cur_frames = next_f;
+            std::mem::swap(dac_a, dac_b);
         }
         self.snake_post
-            .apply_in_place_parallel(&mut h, cur_frames, threads)?;
-        let mut audio =
-            self.conv_post
-                .forward_stream_parallel(&h, cur_frames, &mut state.dac_post, threads)?;
+            .apply_in_place_parallel(dac_a, cur_frames, threads)?;
+        self.conv_post.forward_stream_into(
+            dac_a,
+            cur_frames,
+            &mut state.dac_post,
+            threads,
+            conv_ext,
+            audio,
+        )?;
         // Clamping infinity would turn a failed graph into apparently valid
         // full-scale PCM before Codec's final finite-output admission.
         if audio.iter().any(|sample| !sample.is_finite()) {
@@ -1605,10 +1939,10 @@ impl DacDecoder {
                 "Invalid DAC numerical result.",
             ));
         }
-        for sample in &mut audio {
+        for sample in audio.iter_mut() {
             *sample = sample.clamp(-1.0_f32, 1.0_f32);
         }
-        Ok(audio)
+        Ok(audio.as_slice())
     }
 }
 
@@ -2248,6 +2582,114 @@ mod tests {
             cn_par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             cn_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dac_decode_with_poisoned_scratch_matches_fresh_bits() -> std::io::Result<()> {
+        let dac = DacDecoder {
+            conv_pre: CausalConv1d {
+                out_c: 8,
+                in_c: 4,
+                kernel: 7,
+                dilation: 1,
+                stride: 1,
+                pad_mode: PadMode::Constant,
+                weight: vec![0.03; 8 * 4 * 7],
+                bias: Some(vec![0.01; 8]),
+            },
+            blocks: vec![DacBlock {
+                snake1: SnakeBeta::from_log_params(&[0.1; 8], &[0.0; 8])?,
+                trans_conv: CausalTransConv1d {
+                    in_c: 8,
+                    out_c: 4,
+                    kernel: 4,
+                    stride: 2,
+                    weight: vec![0.05; 8 * 4 * 4],
+                    bias: Some(vec![-0.02; 4]),
+                },
+                res_units: std::array::from_fn(|u| DacResUnit {
+                    act1: SnakeBeta {
+                        a: vec![1.0; 4],
+                        inv_b: vec![0.5; 4],
+                    },
+                    conv1: CausalConv1d {
+                        out_c: 4,
+                        in_c: 4,
+                        kernel: 7,
+                        dilation: [1, 3, 9][u],
+                        stride: 1,
+                        pad_mode: PadMode::Constant,
+                        weight: vec![0.02; 4 * 4 * 7],
+                        bias: Some(vec![0.01; 4]),
+                    },
+                    act2: SnakeBeta {
+                        a: vec![0.8; 4],
+                        inv_b: vec![0.6; 4],
+                    },
+                    conv2: CausalConv1d {
+                        out_c: 4,
+                        in_c: 4,
+                        kernel: 1,
+                        dilation: 1,
+                        stride: 1,
+                        pad_mode: PadMode::Constant,
+                        weight: vec![-0.03; 4 * 4],
+                        bias: Some(vec![0.0; 4]),
+                    },
+                }),
+            }],
+            snake_post: SnakeBeta::from_log_params(&[0.0; 4], &[0.1; 4])?,
+            conv_post: CausalConv1d {
+                out_c: 1,
+                in_c: 4,
+                kernel: 7,
+                dilation: 1,
+                stride: 1,
+                pad_mode: PadMode::Constant,
+                weight: vec![0.04; 4 * 7],
+                bias: Some(vec![0.0]),
+            },
+        };
+        let make_state = || CodecStreamState {
+            pos: 0,
+            pre_conv: Vec::new(),
+            upsample_dw: Vec::new(),
+            dac_pre: vec![0.0; 6 * 4],
+            dac_carry: vec![vec![0.0; 2 * 4]],
+            dac_ru: vec![[vec![0.0; 6 * 4], vec![0.0; 18 * 4], vec![0.0; 54 * 4]]],
+            dac_post: vec![0.0; 6 * 4],
+            kv_k: Vec::new(),
+            kv_v: Vec::new(),
+        };
+        let mut seq_state = make_state();
+        let mut scratch_state = make_state();
+        let mut scratch = super::CodecDecodeScratch {
+            conv_ext: vec![f32::NAN; 512],
+            trans_carry: vec![f32::NAN; 64],
+            dac: super::DacDecodeScratch {
+                conv_ext: vec![f32::NAN; 512],
+                dac_a: vec![f32::NAN; 256],
+                dac_b: vec![f32::NAN; 256],
+                res_buf: vec![f32::NAN; 256],
+                block_buf: vec![f32::NAN; 256],
+                audio: vec![f32::NAN; 64],
+            },
+            ..super::CodecDecodeScratch::default()
+        };
+        for step in 0..3_usize {
+            let input: Vec<f32> = (0..2 * 4)
+                .map(|i| (f32::from(u8::try_from((i + step * 3) % 11).unwrap_or(0)) - 5.0) * 0.1)
+                .collect();
+            let expected = dac.forward_stream_parallel(&input, 2, &mut seq_state, 2)?;
+            let actual =
+                dac.forward_stream_with_scratch(&input, 2, &mut scratch_state, 2, &mut scratch)?;
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "step {step}"
+            );
+        }
         Ok(())
     }
 }

@@ -16,8 +16,9 @@ use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 use crate::{
     SAMPLE_RATE,
     codec::{
-        CausalConv1d, CausalTransConv1d, CodecStreamState, ConvNeXtBlock, DacBlock, DacDecoder,
-        DacResUnit, PadMode, RvqDecoder, RvqEncodeSide, RvqGroup, SnakeBeta, TOKENIZER_HOP_24K,
+        CausalConv1d, CausalTransConv1d, CodecDecodeScratch, CodecStreamState, ConvNeXtBlock,
+        DacBlock, DacDecoder, DacResUnit, PadMode, RvqDecoder, RvqEncodeSide, RvqGroup, SnakeBeta,
+        TOKENIZER_HOP_24K,
     },
     engine::{LinearProjection, rms_norm_in_place},
     numerics::usize_to_f32,
@@ -1204,6 +1205,8 @@ pub(crate) struct Codec {
     encoder: Option<Encoder>,
     state: DecodeState,
     primed: Option<(Vec<[i32; 16]>, DecodeState)>,
+    transformer_scratch: CodecTransformerScratch,
+    decode_scratch: CodecDecodeScratch,
 }
 
 impl Codec {
@@ -1365,6 +1368,8 @@ impl Codec {
                 transformer: TransformerState::default(),
             },
             primed: None,
+            transformer_scratch: CodecTransformerScratch::default(),
+            decode_scratch: CodecDecodeScratch::default(),
         };
         codec.reset();
         Ok(codec)
@@ -1444,50 +1449,70 @@ impl Codec {
             return Err(invalid());
         }
         let mut output = Vec::with_capacity(codes.len() * TOKENIZER_HOP_24K);
-        let mut transformer_scratch = CodecTransformerScratch::default();
         // Execute one frame at a time so emission chunk boundaries cannot alter
         // attention windows, convolution context, or floating-point grouping.
         for row in codes {
             cancel()?;
-            let latent = self.quantizer.decode(row, 1)?;
-            let latent = self.pre.forward_stream_parallel(
-                &latent,
+            self.quantizer
+                .decode_into(row, 1, &mut self.decode_scratch)?;
+            self.pre.forward_stream_into(
+                &self.decode_scratch.rvq_sem_out,
                 1,
                 &mut self.state.audio.pre_conv,
                 self.threads,
+                &mut self.decode_scratch.conv_ext,
+                &mut self.decode_scratch.pre_out,
             )?;
             let latent = self.transformer.step_with_scratch(
-                &latent,
+                &self.decode_scratch.pre_out,
                 &mut self.state.transformer,
-                &mut transformer_scratch,
+                &mut self.transformer_scratch,
             )?;
             let mut frames = 1;
-            let mut upsampled: Option<Vec<f32>> = None;
+            let mut has_upsampled = false;
             for (stage, context) in self.upsample.iter().zip(&mut self.state.audio.upsample_dw) {
                 cancel()?;
-                let input = upsampled.as_deref().unwrap_or(latent);
-                let (next, next_frames) =
-                    stage.conv.forward_parallel(input, frames, self.threads)?;
-                upsampled = Some(stage.block.forward_stream_parallel(
-                    &next,
+                let input = if has_upsampled {
+                    self.decode_scratch.upsample_b.as_slice()
+                } else {
+                    latent
+                };
+                let next_frames = stage.conv.forward_into(
+                    input,
+                    frames,
+                    self.threads,
+                    &mut self.decode_scratch.trans_carry,
+                    &mut self.decode_scratch.upsample_a,
+                )?;
+                stage.block.forward_stream_into(
+                    &self.decode_scratch.upsample_a,
                     next_frames,
                     context,
                     self.threads,
-                )?);
+                    &mut self.decode_scratch.conv_ext,
+                    &mut self.decode_scratch.upsample_b,
+                )?;
+                has_upsampled = true;
                 frames = next_frames;
             }
             cancel()?;
-            let samples = self.dac.forward_stream_parallel(
-                upsampled.as_deref().unwrap_or(latent),
+            let dac_input = if has_upsampled {
+                self.decode_scratch.upsample_b.as_slice()
+            } else {
+                latent
+            };
+            let samples = self.dac.forward_stream_with_dac_scratch(
+                dac_input,
                 frames,
                 &mut self.state.audio,
                 self.threads,
+                &mut self.decode_scratch.dac,
             )?;
             if samples.len() != TOKENIZER_HOP_24K || !samples.iter().all(|value| value.is_finite())
             {
                 return Err(invalid());
             }
-            output.extend(samples);
+            output.extend_from_slice(samples);
             self.state.audio.pos = self.state.audio.pos.checked_add(1).ok_or_else(invalid)?;
         }
         Ok(output)
