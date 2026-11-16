@@ -27,6 +27,7 @@ const MAX_SPELLING_BYTES: usize = 4096;
 const MAX_SPECIALS: usize = 64;
 const MAX_MERGE_PROBES: usize = 64 * 1024 * 1024;
 const UNASSIGNED_REVERSE: u32 = u32::MAX;
+const UNMAPPED_SYMBOL: u32 = u32::MAX;
 const NO_MERGE_RANK: i32 = i32::MAX;
 
 fn invalid(message: &'static str) -> io::Error {
@@ -141,13 +142,6 @@ impl FlatTable {
             .map(|idx| self.entries[idx].value)
     }
 
-    fn get_pair_sorted(&self, left: &[u8], right: &[u8]) -> Option<i32> {
-        self.entries
-            .binary_search_by(|entry| cmp_pair_key(self.entry_bytes(*entry), left, right))
-            .ok()
-            .map(|idx| self.entries[idx].value)
-    }
-
     #[cfg(test)]
     fn get_unsorted_rev(&self, key: &[u8]) -> Option<i32> {
         self.entries
@@ -158,16 +152,37 @@ impl FlatTable {
     }
 }
 
-fn cmp_pair_key(stored: &[u8], left: &[u8], right: &[u8]) -> Ordering {
-    let prefix = left.len().min(stored.len());
-    match stored[..prefix].cmp(&left[..prefix]) {
-        Ordering::Equal if prefix < left.len() || stored.len() == left.len() => Ordering::Less,
-        Ordering::Equal => match stored[left.len()].cmp(&b' ') {
-            Ordering::Equal => stored[left.len() + 1..].cmp(right),
-            other => other,
-        },
+fn cmp_concat(candidate: &[u8], left: &[u8], right: &[u8]) -> Ordering {
+    let prefix = candidate.len().min(left.len());
+    match candidate[..prefix].cmp(&left[..prefix]) {
+        Ordering::Equal => {
+            if candidate.len() < left.len() {
+                Ordering::Less
+            } else {
+                candidate[left.len()..].cmp(right)
+            }
+        }
         other => other,
     }
+}
+
+fn split_merge_pair(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let split = bytes.iter().position(|&byte| byte == b' ')?;
+    let left = &bytes[..split];
+    let right = &bytes[split + 1..];
+    (!left.is_empty() && !right.is_empty() && !right.contains(&b' ')).then_some((left, right))
+}
+
+fn hash_pair(left: u32, right: u32) -> usize {
+    let mut x = (u64::from(left) << 32) | u64::from(right);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    let folded = (x ^ (x >> 32)) & 0xffff_ffff;
+    let [b0, b1, b2, b3, ..] = folded.to_le_bytes();
+    usize::from(b0) | (usize::from(b1) << 8) | (usize::from(b2) << 16) | (usize::from(b3) << 24)
 }
 
 #[derive(Clone, Copy)]
@@ -177,6 +192,8 @@ struct Symbol {
     prev: usize,
     next: usize,
     active: bool,
+    sym: u32,
+    next_merged: u32,
 }
 
 impl Symbol {
@@ -213,12 +230,103 @@ pub(super) fn pretokenize(text: &[u8]) -> io::Result<Vec<&[u8]>> {
     scanner::pretokenize(text)
 }
 
+#[derive(Clone, Copy)]
+struct PairSlot {
+    left: u32,
+    right: u32,
+    rank: i32,
+    merged: u32,
+}
+
+impl Default for PairSlot {
+    fn default() -> Self {
+        Self {
+            left: UNMAPPED_SYMBOL,
+            right: UNMAPPED_SYMBOL,
+            rank: NO_MERGE_RANK,
+            merged: UNMAPPED_SYMBOL,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PairTable {
+    slots: Vec<PairSlot>,
+    mask: usize,
+}
+
+impl PairTable {
+    fn with_capacity(entries: usize) -> io::Result<Self> {
+        if entries == 0 {
+            return Ok(Self::default());
+        }
+        let cap = entries
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(|| invalid("Qwen tokenizer pair table exceeds its bound."))?
+            .max(16);
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(cap).map_err(io::Error::other)?;
+        slots.resize(cap, PairSlot::default());
+        Ok(Self {
+            slots,
+            mask: cap - 1,
+        })
+    }
+
+    fn insert(&mut self, left: u32, right: u32, rank: i32, merged: u32) {
+        let mut idx = hash_pair(left, right) & self.mask;
+        loop {
+            let slot = &mut self.slots[idx];
+            if slot.left == UNMAPPED_SYMBOL || (slot.left == left && slot.right == right) {
+                *slot = PairSlot {
+                    left,
+                    right,
+                    rank,
+                    merged,
+                };
+                return;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    fn get(&self, left: u32, right: u32) -> (i32, u32) {
+        if self.slots.is_empty() {
+            return (NO_MERGE_RANK, UNMAPPED_SYMBOL);
+        }
+        let mut idx = hash_pair(left, right) & self.mask;
+        loop {
+            let slot = self.slots[idx];
+            if slot.left == UNMAPPED_SYMBOL {
+                return (NO_MERGE_RANK, UNMAPPED_SYMBOL);
+            }
+            if slot.left == left && slot.right == right {
+                return (slot.rank, slot.merged);
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+}
+
+fn mark_special_first_byte(bitmap: &mut [u64; 4], byte: u8) {
+    bitmap[usize::from(byte >> 6)] |= 1_u64 << (byte & 63);
+}
+
+fn has_special_first_byte(bitmap: &[u64; 4], byte: u8) -> bool {
+    (bitmap[usize::from(byte >> 6)] & (1_u64 << (byte & 63))) != 0
+}
+
 /// One context's immutable finalized vocabulary and merge policy.
 pub(super) struct Tokenizer {
     vocabulary: FlatTable,
     merges: FlatTable,
+    pair_table: PairTable,
+    byte_symbols: [u32; 256],
+    vocab_cap: u32,
     reverse: Vec<u32>,
     specials: Vec<(Vec<u8>, i32)>,
+    special_first_bytes: [u64; 4],
     eos: i32,
     table_bytes: usize,
     max_merge_bytes: usize,
@@ -262,8 +370,12 @@ impl Tokenizer {
         Self {
             vocabulary: FlatTable::default(),
             merges: FlatTable::default(),
+            pair_table: PairTable::default(),
+            byte_symbols: [UNMAPPED_SYMBOL; 256],
+            vocab_cap: 0,
             reverse: Vec::new(),
             specials: Vec::new(),
+            special_first_bytes: [0; 4],
             eos: -1,
             table_bytes: 0,
             max_merge_bytes: 0,
@@ -322,7 +434,7 @@ impl Tokenizer {
         self.insert(bytes, rank, true)
     }
 
-    /// Build native-compatible reverse slots and register the end-of-text token.
+    /// Build native-compatible reverse slots, pair lookup index, and register end-of-text.
     pub(super) fn finish(&mut self) -> io::Result<()> {
         if self.finished {
             return Err(invalid("Qwen tokenizer tables were already finalized."));
@@ -344,7 +456,11 @@ impl Tokenizer {
                     .map_err(|_| invalid("Invalid Qwen vocabulary index."))?;
             }
         }
+        let (pair_table, byte_symbols, vocab_cap) = self.build_pair_index()?;
         self.reverse = reverse;
+        self.pair_table = pair_table;
+        self.byte_symbols = byte_symbols;
+        self.vocab_cap = vocab_cap;
         self.eos = self.vocabulary.get_sorted(b"<|endoftext|>").unwrap_or(-1);
         if self.eos >= 0 {
             self.add_special(b"<|endoftext|>", self.eos)?;
@@ -353,12 +469,107 @@ impl Tokenizer {
         Ok(())
     }
 
-    /// Register a nonempty spelling; the first registration of each spelling wins.
-    pub(super) fn add_special(&mut self, bytes: &[u8], id: i32) -> io::Result<()> {
-        Self::insert_special(&mut self.specials, bytes, id)
+    fn lookup_vocab_index(vocabulary: &FlatTable, key: &[u8]) -> Option<u32> {
+        vocabulary
+            .entries
+            .binary_search_by(|entry| vocabulary.entry_bytes(*entry).cmp(key))
+            .ok()
+            .and_then(|idx| u32::try_from(idx).ok())
     }
 
-    fn insert_special(specials: &mut Vec<(Vec<u8>, i32)>, bytes: &[u8], id: i32) -> io::Result<()> {
+    fn resolve_symbol(&self, key: &[u8], extras: &[&[u8]], vocab_cap: u32) -> u32 {
+        Self::lookup_vocab_index(&self.vocabulary, key).unwrap_or_else(|| {
+            extras
+                .binary_search(&key)
+                .ok()
+                .and_then(|idx| u32::try_from(idx).ok())
+                .and_then(|offset| vocab_cap.checked_add(offset))
+                .unwrap_or(UNMAPPED_SYMBOL)
+        })
+    }
+
+    fn resolve_concat_symbol(
+        &self,
+        left: &[u8],
+        right: &[u8],
+        extras: &[&[u8]],
+        vocab_cap: u32,
+    ) -> u32 {
+        if let Ok(idx) = self
+            .vocabulary
+            .entries
+            .binary_search_by(|entry| cmp_concat(self.vocabulary.entry_bytes(*entry), left, right))
+        {
+            return u32::try_from(idx).unwrap_or(UNMAPPED_SYMBOL);
+        }
+        if let Ok(idx) = extras.binary_search_by(|candidate| cmp_concat(candidate, left, right)) {
+            return u32::try_from(idx)
+                .ok()
+                .and_then(|offset| vocab_cap.checked_add(offset))
+                .unwrap_or(UNMAPPED_SYMBOL);
+        }
+        UNMAPPED_SYMBOL
+    }
+
+    fn build_pair_index(&self) -> io::Result<(PairTable, [u32; 256], u32)> {
+        let vocab_cap = u32::try_from(self.vocabulary.entries.len())
+            .map_err(|_| invalid("Invalid Qwen vocabulary index."))?;
+        let mut extras = Vec::new();
+        let mut valid_merges = 0_usize;
+        for entry in &self.merges.entries {
+            if let Some((left, right)) = split_merge_pair(self.merges.entry_bytes(*entry)) {
+                valid_merges += 1;
+                if Self::lookup_vocab_index(&self.vocabulary, left).is_none() {
+                    extras.try_reserve(1).map_err(io::Error::other)?;
+                    extras.push(left);
+                }
+                if Self::lookup_vocab_index(&self.vocabulary, right).is_none() {
+                    extras.try_reserve(1).map_err(io::Error::other)?;
+                    extras.push(right);
+                }
+            }
+        }
+        extras.sort_unstable();
+        extras.dedup();
+        let total_symbols = self
+            .vocabulary
+            .entries
+            .len()
+            .checked_add(extras.len())
+            .and_then(|count| u32::try_from(count).ok())
+            .filter(|&count| count < UNMAPPED_SYMBOL);
+        if total_symbols.is_none() {
+            return Err(invalid("Qwen tokenizer symbol space exceeded."));
+        }
+        let mut pair_table = PairTable::with_capacity(valid_merges)?;
+        for entry in &self.merges.entries {
+            if let Some((left, right)) = split_merge_pair(self.merges.entry_bytes(*entry)) {
+                let left_sym = self.resolve_symbol(left, &extras, vocab_cap);
+                let right_sym = self.resolve_symbol(right, &extras, vocab_cap);
+                let merged = self.resolve_concat_symbol(left, right, &extras, vocab_cap);
+                pair_table.insert(left_sym, right_sym, entry.value, merged);
+            }
+        }
+        let mut byte_symbols = [UNMAPPED_SYMBOL; 256];
+        for (byte, slot) in byte_symbols.iter_mut().enumerate() {
+            let spelling = BYTE_ENCODER[byte];
+            let width = if spelling[1] == 0 { 1 } else { 2 };
+            *slot = self.resolve_symbol(&spelling[..width], &extras, vocab_cap);
+        }
+        Ok((pair_table, byte_symbols, vocab_cap))
+    }
+
+    /// Register a nonempty spelling; the first registration of each spelling wins.
+    pub(super) fn add_special(&mut self, bytes: &[u8], id: i32) -> io::Result<()> {
+        Self::insert_special(&mut self.specials, &mut self.special_first_bytes, bytes, id)
+    }
+
+    fn insert_special(
+        specials: &mut Vec<(Vec<u8>, i32)>,
+        first_bytes: &mut [u64; 4],
+        bytes: &[u8],
+        id: i32,
+    ) -> io::Result<()> {
         if specials.iter().any(|(spelling, _)| spelling == bytes) {
             return Ok(());
         }
@@ -367,6 +578,7 @@ impl Tokenizer {
         }
         let owned = copy_bytes(bytes)?;
         specials.try_reserve(1).map_err(io::Error::other)?;
+        mark_special_first_byte(first_bytes, bytes[0]);
         specials.push((owned, id));
         Ok(())
     }
@@ -393,7 +605,12 @@ impl Tokenizer {
             return Ok(());
         }
         // Specials copy into independent owned storage from the immutable vocabulary arena.
-        Self::insert_special(&mut self.specials, spelling, id)
+        Self::insert_special(
+            &mut self.specials,
+            &mut self.special_first_bytes,
+            spelling,
+            id,
+        )
     }
 
     fn encode_segment(
@@ -414,6 +631,37 @@ impl Tokenizer {
         Ok(())
     }
 
+    fn find_next_special(&self, text: &[u8], position: usize) -> Option<(usize, usize)> {
+        let first_offset = text[position..]
+            .iter()
+            .position(|&byte| has_special_first_byte(&self.special_first_bytes, byte))?;
+        let scan_start = position + first_offset;
+        let mut best: Option<(usize, usize)> = None;
+        for (index, (spelling, _)) in self.specials.iter().enumerate() {
+            let search_end = if let Some((previous, _)) = best {
+                if previous == scan_start {
+                    break;
+                }
+                previous
+                    .saturating_sub(1)
+                    .saturating_add(spelling.len())
+                    .min(text.len())
+            } else {
+                text.len()
+            };
+            if let Some(offset) = text[scan_start..search_end]
+                .windows(spelling.len())
+                .position(|window| window == spelling)
+            {
+                let found = scan_start + offset;
+                if best.is_none_or(|(previous, _)| found < previous) {
+                    best = Some((found, index));
+                }
+            }
+        }
+        best
+    }
+
     /// Encode valid UTF-8 using the pinned byte scanner, special order and merges.
     ///
     /// Tables, input, output and merge work have explicit limits. Invalid or
@@ -430,40 +678,21 @@ impl Tokenizer {
         ids.try_reserve_exact(text.len() * 2 + 1)
             .map_err(io::Error::other)?;
         let mut scratch = ChunkScratch::default();
-        let mut position = 0;
         let mut probes = 0;
-        while position < text.len() {
-            let mut best: Option<(usize, usize)> = None;
-            for (index, (spelling, _)) in self.specials.iter().enumerate() {
-                let search_end = if let Some((previous, _)) = best {
-                    if previous == position {
-                        break;
-                    }
-                    previous
-                        .saturating_sub(1)
-                        .saturating_add(spelling.len())
-                        .min(text.len())
-                } else {
-                    text.len()
+        if self.specials.is_empty() {
+            self.encode_segment(text, &mut ids, &mut probes, &mut scratch)?;
+        } else {
+            let mut position = 0;
+            while position < text.len() {
+                let Some((found, index)) = self.find_next_special(text, position) else {
+                    self.encode_segment(&text[position..], &mut ids, &mut probes, &mut scratch)?;
+                    break;
                 };
-                if let Some(offset) = text[position..search_end]
-                    .windows(spelling.len())
-                    .position(|window| window == spelling)
-                {
-                    let found = position + offset;
-                    if best.is_none_or(|(previous, _)| found < previous) {
-                        best = Some((found, index));
-                    }
-                }
+                self.encode_segment(&text[position..found], &mut ids, &mut probes, &mut scratch)?;
+                let (spelling, id) = &self.specials[index];
+                ids.push(*id);
+                position = found + spelling.len();
             }
-            let Some((found, index)) = best else {
-                self.encode_segment(&text[position..], &mut ids, &mut probes, &mut scratch)?;
-                break;
-            };
-            self.encode_segment(&text[position..found], &mut ids, &mut probes, &mut scratch)?;
-            let (spelling, id) = &self.specials[index];
-            ids.push(*id);
-            position = found + spelling.len();
         }
         if add_eos && self.eos >= 0 {
             ids.push(self.eos);
@@ -471,36 +700,33 @@ impl Tokenizer {
         Ok(ids)
     }
 
-    fn lookup_merge_rank(&self, left: &[u8], right: &[u8], probes: &mut usize) -> io::Result<i32> {
+    fn lookup_merge_pair(
+        &self,
+        left_sym: u32,
+        right_sym: u32,
+        left_len: usize,
+        right_len: usize,
+        probes: &mut usize,
+    ) -> io::Result<(i32, u32)> {
         *probes += 1;
         if *probes > MAX_MERGE_PROBES {
             return Err(invalid("Qwen tokenizer merge work exceeds its bound."));
         }
-        if left.len() + right.len() + 1 > self.max_merge_bytes {
-            return Ok(NO_MERGE_RANK);
+        if left_sym == UNMAPPED_SYMBOL
+            || right_sym == UNMAPPED_SYMBOL
+            || left_len + right_len + 1 > self.max_merge_bytes
+        {
+            return Ok((NO_MERGE_RANK, UNMAPPED_SYMBOL));
         }
-        Ok(self
-            .merges
-            .get_pair_sorted(left, right)
-            .unwrap_or(NO_MERGE_RANK))
+        Ok(self.pair_table.get(left_sym, right_sym))
     }
 
-    fn encode_chunk(
+    fn init_chunk_symbols(
         &self,
         chunk: &[u8],
-        ids: &mut Vec<i32>,
         probes: &mut usize,
         scratch: &mut ChunkScratch,
     ) -> io::Result<()> {
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        if let [byte] = chunk {
-            let spelling = BYTE_ENCODER[usize::from(*byte)];
-            let width = if spelling[1] == 0 { 1 } else { 2 };
-            self.emit_piece(&spelling[..width], ids);
-            return Ok(());
-        }
         scratch.clear();
         let count = chunk.len();
         scratch
@@ -529,17 +755,27 @@ impl Tokenizer {
                     usize::MAX
                 },
                 active: true,
+                sym: self.byte_symbols[usize::from(byte)],
+                next_merged: UNMAPPED_SYMBOL,
             });
             scratch.ranks.push(NO_MERGE_RANK);
         }
         for index in 0..count - 1 {
             let right_idx = index + 1;
-            let rank = self.lookup_merge_rank(
-                &scratch.encoded[scratch.symbols[index].span()],
-                &scratch.encoded[scratch.symbols[right_idx].span()],
+            let (left_sym, left_span) = (scratch.symbols[index].sym, scratch.symbols[index].span());
+            let (right_sym, right_span) = (
+                scratch.symbols[right_idx].sym,
+                scratch.symbols[right_idx].span(),
+            );
+            let (rank, merged) = self.lookup_merge_pair(
+                left_sym,
+                right_sym,
+                left_span.len(),
+                right_span.len(),
                 probes,
             )?;
             scratch.ranks[index] = rank;
+            scratch.symbols[index].next_merged = merged;
             if rank != NO_MERGE_RANK {
                 scratch.heap.push(Reverse((
                     rank,
@@ -549,6 +785,62 @@ impl Tokenizer {
                 )));
             }
         }
+        Ok(())
+    }
+
+    fn refresh_neighbor_pair(
+        &self,
+        left_idx: usize,
+        right_idx: usize,
+        probes: &mut usize,
+        scratch: &mut ChunkScratch,
+    ) -> io::Result<()> {
+        let (left_sym, left_span) = (
+            scratch.symbols[left_idx].sym,
+            scratch.symbols[left_idx].span(),
+        );
+        let (right_sym, right_span) = (
+            scratch.symbols[right_idx].sym,
+            scratch.symbols[right_idx].span(),
+        );
+        let (rank, merged) = self.lookup_merge_pair(
+            left_sym,
+            right_sym,
+            left_span.len(),
+            right_span.len(),
+            probes,
+        )?;
+        scratch.ranks[left_idx] = rank;
+        scratch.symbols[left_idx].next_merged = merged;
+        if rank != NO_MERGE_RANK {
+            scratch.heap.push(Reverse((
+                rank,
+                left_idx,
+                scratch.symbols[left_idx].end,
+                scratch.symbols[right_idx].end,
+            )));
+        }
+        Ok(())
+    }
+
+    fn encode_chunk(
+        &self,
+        chunk: &[u8],
+        ids: &mut Vec<i32>,
+        probes: &mut usize,
+        scratch: &mut ChunkScratch,
+    ) -> io::Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if let [byte] = chunk {
+            let sym = self.byte_symbols[usize::from(*byte)];
+            let spelling = BYTE_ENCODER[usize::from(*byte)];
+            let width = if spelling[1] == 0 { 1 } else { 2 };
+            self.emit_symbol(sym, &spelling[..width], ids);
+            return Ok(());
+        }
+        self.init_chunk_symbols(chunk, probes, scratch)?;
         while let Some(Reverse((rank, left, exp_left_end, exp_right_end))) = scratch.heap.pop() {
             if !scratch.symbols[left].active
                 || scratch.symbols[left].end != exp_left_end
@@ -561,8 +853,10 @@ impl Tokenizer {
                 continue;
             }
             let after = scratch.symbols[right].next;
+            let merged_sym = scratch.symbols[left].next_merged;
             scratch.symbols[left].end = exp_right_end;
             scratch.symbols[left].next = after;
+            scratch.symbols[left].sym = merged_sym;
             if after != usize::MAX {
                 scratch.symbols[after].prev = left;
             }
@@ -570,55 +864,35 @@ impl Tokenizer {
             scratch.symbols[right].prev = usize::MAX;
             scratch.symbols[right].next = usize::MAX;
             scratch.ranks[right] = NO_MERGE_RANK;
+            scratch.symbols[right].next_merged = UNMAPPED_SYMBOL;
 
             let prev = scratch.symbols[left].prev;
             if prev != usize::MAX {
-                let prev_rank = self.lookup_merge_rank(
-                    &scratch.encoded[scratch.symbols[prev].span()],
-                    &scratch.encoded[scratch.symbols[left].span()],
-                    probes,
-                )?;
-                scratch.ranks[prev] = prev_rank;
-                if prev_rank != NO_MERGE_RANK {
-                    scratch.heap.push(Reverse((
-                        prev_rank,
-                        prev,
-                        scratch.symbols[prev].end,
-                        scratch.symbols[left].end,
-                    )));
-                }
+                self.refresh_neighbor_pair(prev, left, probes, scratch)?;
             }
             if after != usize::MAX {
-                let next_rank = self.lookup_merge_rank(
-                    &scratch.encoded[scratch.symbols[left].span()],
-                    &scratch.encoded[scratch.symbols[after].span()],
-                    probes,
-                )?;
-                scratch.ranks[left] = next_rank;
-                if next_rank != NO_MERGE_RANK {
-                    scratch.heap.push(Reverse((
-                        next_rank,
-                        left,
-                        scratch.symbols[left].end,
-                        scratch.symbols[after].end,
-                    )));
-                }
+                self.refresh_neighbor_pair(left, after, probes, scratch)?;
             } else {
                 scratch.ranks[left] = NO_MERGE_RANK;
+                scratch.symbols[left].next_merged = UNMAPPED_SYMBOL;
             }
         }
         let mut cursor = 0;
         while cursor != usize::MAX {
             let symbol = scratch.symbols[cursor];
-            self.emit_piece(&scratch.encoded[symbol.span()], ids);
+            self.emit_symbol(symbol.sym, &scratch.encoded[symbol.span()], ids);
             cursor = symbol.next;
         }
         Ok(())
     }
 
-    fn emit_piece(&self, piece: &[u8], ids: &mut Vec<i32>) {
-        if let Some(id) = self.vocabulary.get_sorted(piece) {
-            ids.push(id);
+    fn emit_symbol(&self, sym: u32, piece: &[u8], ids: &mut Vec<i32>) {
+        if sym < self.vocab_cap
+            && let Some(entry) = usize::try_from(sym)
+                .ok()
+                .and_then(|idx| self.vocabulary.entries.get(idx))
+        {
+            ids.push(entry.value);
         } else {
             // Native fallback probes the raw bytes of the encoded spelling,
             // not the original input bytes or the GPT-2 byte encoder again.
@@ -662,3 +936,70 @@ const fn byte_encoder() -> [[u8; 2]; 256] {
 }
 
 const BYTE_ENCODER: [[u8; 2]; 256] = byte_encoder();
+
+#[cfg(test)]
+mod tests {
+    use super::Tokenizer;
+    use std::io;
+
+    #[test]
+    fn pair_index_chains_non_vocab_intermediate_merges() -> io::Result<()> {
+        let mut tokenizer = Tokenizer::new();
+        for (idx, piece) in [b"a".as_slice(), b"b", b"c", b"abc", b"\xC4\xA0"]
+            .into_iter()
+            .enumerate()
+        {
+            tokenizer.add_token(piece, i32::try_from(idx).map_err(io::Error::other)?)?;
+        }
+        // "ab" is not in the vocabulary yet must still chain to "abc".
+        tokenizer.add_merge(b"a b", 0)?;
+        tokenizer.add_merge(b"ab c", 1)?;
+        tokenizer.finish()?;
+
+        assert_eq!(tokenizer.encode(b"abc abc", false)?, [3, 4, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn pair_index_honors_last_wins_merges_and_raw_byte_fallback() -> io::Result<()> {
+        let mut tokenizer = Tokenizer::new();
+        for (idx, piece) in [b"a".as_slice(), b"b", b"c", b"ab"].into_iter().enumerate() {
+            tokenizer.add_token(piece, i32::try_from(idx).map_err(io::Error::other)?)?;
+        }
+        // "b c" overrides an earlier worse rank and wins before "a b"; because "bc" is not in
+        // vocab, raw-byte fallback decomposes the merged piece into ['b', 'c'].
+        tokenizer.add_merge(b"b c", 5)?;
+        tokenizer.add_merge(b"a b", 1)?;
+        tokenizer.add_merge(b"b c", 0)?;
+        tokenizer.finish()?;
+
+        assert_eq!(tokenizer.encode(b"abc", false)?, [0, 1, 2]);
+        assert_eq!(tokenizer.encode(b"ab", false)?, [3]);
+        Ok(())
+    }
+
+    #[test]
+    fn special_first_byte_bitmap_skips_prose_and_tracks_post_finish_additions() -> io::Result<()> {
+        let mut tokenizer = Tokenizer::new();
+        for (idx, piece) in [
+            b"h".as_slice(),
+            b"i",
+            b"hi",
+            b"<|endoftext|>",
+            b"<|talk|>",
+            b"!tag",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tokenizer.add_token(piece, i32::try_from(idx).map_err(io::Error::other)?)?;
+        }
+        tokenizer.add_merge(b"h i", 0)?;
+        tokenizer.finish()?;
+        tokenizer.add_special_id(4)?;
+        tokenizer.add_special(b"!tag", 5)?;
+
+        assert_eq!(tokenizer.encode(b"hi!tag<|talk|>", true)?, [2, 5, 4, 3]);
+        Ok(())
+    }
+}
