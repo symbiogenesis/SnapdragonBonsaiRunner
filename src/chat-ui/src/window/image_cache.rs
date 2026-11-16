@@ -8,6 +8,7 @@ use std::{io::Cursor, sync::Arc, time::Duration};
 
 const MAX_TEXTURES: usize = 24;
 const MAX_PNG_TEXTURES: usize = 32;
+const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PNG_DIMENSION: u32 = 2_048;
 const MAX_PNG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IN_FLIGHT: usize = 8;
@@ -95,6 +96,7 @@ struct Entry {
     key: Key,
     svg: PrehashedSvg,
     last_used: u64,
+    bytes: usize,
     state: SlotState,
 }
 
@@ -114,7 +116,13 @@ struct PngKey {
 struct PngEntry {
     key: PngKey,
     last_used: u64,
+    bytes: usize,
     texture: Option<egui::TextureHandle>,
+}
+
+fn texture_bytes(texture: &egui::TextureHandle) -> usize {
+    let [width, height] = texture.size();
+    width.saturating_mul(height).saturating_mul(4)
 }
 
 /// Coordinates bounded offline SVG raster requests and retains bounded GPU textures.
@@ -137,6 +145,7 @@ impl ImageCache {
         };
         let mut any_pending = false;
         let mut any_changed = false;
+        let mut clock = self.clock;
         for entry in &mut self.entries {
             let SlotState::Pending(ticket) = entry.state else {
                 continue;
@@ -147,16 +156,24 @@ impl ImageCache {
                 }
                 Status::Ready(bytes) => {
                     service.release(ticket);
+                    clock = clock.wrapping_add(1);
+                    entry.last_used = clock;
                     entry.state = upload_from_packet(ctx, &service, &bytes);
+                    entry.bytes = match &entry.state {
+                        SlotState::Ready(texture) => texture_bytes(texture),
+                        _ => 0,
+                    };
                     any_changed = true;
                 }
                 Status::Failed => {
                     service.release(ticket);
                     entry.state = SlotState::Failed;
+                    entry.bytes = 0;
                     any_changed = true;
                 }
             }
         }
+        self.clock = clock;
         if any_changed {
             self.evict_finished();
             ctx.request_repaint();
@@ -236,14 +253,17 @@ impl ImageCache {
                 Ok(None) => SlotState::Unrenderable,
                 Err(_) => SlotState::Failed,
             };
-            let result = match &state {
-                SlotState::Ready(texture) => RasterSlot::Ready(texture.clone()),
-                _ => RasterSlot::FallbackSource,
+            let (bytes, result) = match &state {
+                SlotState::Ready(texture) => {
+                    (texture_bytes(texture), RasterSlot::Ready(texture.clone()))
+                }
+                _ => (0, RasterSlot::FallbackSource),
             };
             self.entries.push(Entry {
                 key,
                 svg: svg.clone(),
                 last_used: stamp,
+                bytes,
                 state,
             });
             self.evict_finished();
@@ -270,6 +290,7 @@ impl ImageCache {
                 key,
                 svg: svg.clone(),
                 last_used: stamp,
+                bytes: 0,
                 state: SlotState::Pending(ticket),
             });
             ctx.request_repaint_after(REPAINT_INTERVAL);
@@ -279,6 +300,7 @@ impl ImageCache {
                 key,
                 svg: svg.clone(),
                 last_used: stamp,
+                bytes: 0,
                 state: SlotState::Failed,
             });
             self.evict_finished();
@@ -334,23 +356,14 @@ impl ImageCache {
             return entry.texture.clone();
         }
         let texture = decode();
+        let bytes = texture.as_ref().map_or(0, texture_bytes);
         self.png_entries.push(PngEntry {
             key,
             last_used: stamp,
+            bytes,
             texture: texture.clone(),
         });
-        while self.png_entries.len() > MAX_PNG_TEXTURES {
-            if let Some((victim, _)) = self
-                .png_entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.last_used)
-            {
-                self.png_entries.swap_remove(victim);
-            } else {
-                break;
-            }
-        }
+        self.evict_excess();
         texture
     }
 
@@ -369,7 +382,25 @@ impl ImageCache {
         best.map(|(_, texture)| texture.clone())
     }
 
+    fn total_texture_bytes(&self) -> usize {
+        let svg_bytes: usize = self
+            .entries
+            .iter()
+            .map(|entry| entry.bytes)
+            .fold(0_usize, usize::saturating_add);
+        let png_bytes: usize = self
+            .png_entries
+            .iter()
+            .map(|entry| entry.bytes)
+            .fold(0_usize, usize::saturating_add);
+        svg_bytes.saturating_add(png_bytes)
+    }
+
     fn evict_finished(&mut self) {
+        self.evict_excess();
+    }
+
+    fn evict_excess(&mut self) {
         loop {
             let finished_count = self
                 .entries
@@ -389,6 +420,56 @@ impl ImageCache {
                 break;
             };
             self.entries.swap_remove(victim);
+        }
+        while self.png_entries.len() > MAX_PNG_TEXTURES {
+            if let Some((victim, _)) = self
+                .png_entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            {
+                self.png_entries.swap_remove(victim);
+            } else {
+                break;
+            }
+        }
+        self.evict_over_byte_budget(MAX_CACHE_BYTES);
+    }
+
+    fn evict_over_byte_budget(&mut self, max_bytes: usize) {
+        while self.total_texture_bytes() > max_bytes {
+            let best_svg = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.bytes > 0 && !matches!(entry.state, SlotState::Pending(_))
+                })
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(idx, entry)| (idx, entry.last_used));
+            let best_png = self
+                .png_entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.bytes > 0)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(idx, entry)| (idx, entry.last_used));
+            match (best_svg, best_png) {
+                (Some((svg_idx, svg_ts)), Some((png_idx, png_ts))) => {
+                    if svg_ts <= png_ts {
+                        self.entries.swap_remove(svg_idx);
+                    } else {
+                        self.png_entries.swap_remove(png_idx);
+                    }
+                }
+                (Some((svg_idx, _)), None) => {
+                    self.entries.swap_remove(svg_idx);
+                }
+                (None, Some((png_idx, _))) => {
+                    self.png_entries.swap_remove(png_idx);
+                }
+                (None, None) => break,
+            }
         }
     }
 }
@@ -700,6 +781,66 @@ mod tests {
             );
         harness.step();
         assert_eq!(harness.state().png_entries.len(), 4);
+        Ok(())
+    }
+
+    fn gray_2048_png(pixel_seed: u8) -> std::io::Result<Vec<u8>> {
+        let mut png_bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut png_bytes, 2_048, 2_048);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
+        let mut pixels = vec![pixel_seed; 2_048 * 2_048];
+        pixels[0] = pixel_seed.wrapping_add(1);
+        writer
+            .write_image_data(&pixels)
+            .map_err(std::io::Error::other)?;
+        writer.finish().map_err(std::io::Error::other)?;
+        Ok(png_bytes)
+    }
+
+    #[test]
+    fn image_cache_enforces_64_mib_byte_cap_via_lru_eviction() -> std::io::Result<()> {
+        let pngs = [
+            gray_2048_png(10)?,
+            gray_2048_png(20)?,
+            gray_2048_png(30)?,
+            gray_2048_png(40)?,
+            gray_2048_png(50)?,
+        ];
+        let hashes: Vec<u64> = pngs.iter().map(|bytes| fnv1a64(bytes)).collect();
+        let svg = PrehashedSvg::from_str(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="navy"/></svg>"#,
+        );
+        let svg_for_ui = svg.clone();
+        let pngs_for_ui = pngs.clone();
+        let mut harness = Harness::builder()
+            .with_size([160.0, 120.0])
+            .with_context_setup(super::super::configure)
+            .build_ui_state(
+                move |ui, cache: &mut ImageCache| {
+                    let _ = cache.get_or_request(ui.ctx(), &svg_for_ui, egui::vec2(64.0, 64.0));
+                    for png in &pngs_for_ui[0..4] {
+                        assert!(cache.png_bytes_texture(ui.ctx(), png).is_some());
+                    }
+                    // Refresh entry 0 so entry 1 becomes the LRU before pushing the 5th 16 MiB PNG.
+                    assert!(cache.png_bytes_texture(ui.ctx(), &pngs_for_ui[0]).is_some());
+                    assert!(cache.png_bytes_texture(ui.ctx(), &pngs_for_ui[4]).is_some());
+                    // Negative-cache zero-byte entries remain without displacing GPU textures.
+                    assert!(cache.png_bytes_texture(ui.ctx(), b"not-png").is_none());
+                },
+                ImageCache::default(),
+            );
+        harness.step();
+        let state = harness.state();
+        assert_eq!(state.total_texture_bytes(), MAX_CACHE_BYTES);
+        assert!(state.entries.is_empty());
+        assert!(state.png_entries.iter().any(|e| e.key.hash == hashes[0]));
+        assert!(!state.png_entries.iter().any(|e| e.key.hash == hashes[1]));
+        assert!(state.png_entries.iter().any(|e| e.key.hash == hashes[2]));
+        assert!(state.png_entries.iter().any(|e| e.key.hash == hashes[3]));
+        assert!(state.png_entries.iter().any(|e| e.key.hash == hashes[4]));
+        assert!(state.png_entries.iter().any(|e| e.bytes == 0));
         Ok(())
     }
 }
