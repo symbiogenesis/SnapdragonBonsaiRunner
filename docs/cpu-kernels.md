@@ -1015,6 +1015,31 @@ failure. Owning hosted analysis, production linking, complete-model parity,
 ARM64 code generation/resources and matched X2 complete-request benefit remain
 pending; source parallelism supplies no measured acceleration verdict.
 
+## Speech kernel, mapping, and K-quant source controls (pending model/device qualification)
+
+- **Audited `bonsai-windows-process` primitives**: `bonsai-windows-process` isolates
+  checked ARM64 `SDOT` (`vdotq_s32`) and `I8MM` (`smmla`) matrix/dot kernels
+  (`Q8_0 × Q8_0`, `Q4_K × Q8_K`, 8-row `Q4_K` repacking, `Q6_K × Q8_K`), NEON `FCVTN`/`FCVTL`
+  binary16 KV narrowing/widening, a spin-then-park `AtomicUsize` `RowWorkerPool`
+  (caller as worker 0), and read-only `MappedFile` (`CreateFileMappingW` + `MapViewOfFile` +
+  `PrefetchVirtualMemory`), allowing `bonsai-speech-tts` and `bonsai-speech-asr` crate roots
+  to keep `#![forbid(unsafe_code)]`.
+- **Speech arithmetic identities and graph lifts**: `bonsai-speech-tts` uses
+  `rust-tts-sdot-i8mm-v3-f16-kv-snake-rfft` (zero-copy mmap weight slices, packed `codec_embd`,
+  lazy Mimi encoder, `gate+up`/QKV fusion, batched Talker prefill, `u16` F16 KV, vectorized
+  `SnakeBeta`, `col2im_1d` `CausalTransConv1d`, tail-12 priming, dyadic `1 -> 2 -> 4 -> 8`
+  streaming ramp, warm cancel, and 1024-pt real FFT speaker encoder). `bonsai-speech-asr`
+  uses `rust-asr-sdot-i8mm-v3-f16-kv-minimax-gelu` (mmap intake under `rust-qualification`,
+  `Q4_K`/`Q6_K` + `Q8_0` kernels, QKV fusion, `u16` F16 KV, `f32x4` minimax `erf`-GELU,
+  radix-2/5 400-pt FFT, `cu_seqlens` windowed encoder, 8s incremental `LiveCapture` prefill,
+  short-clip language hints, and repetition trimming).
+- **Prism direct 8-lane `kquants::dot`**: `prism-inference/src/kernels/kquants.rs` evaluates
+  8-lane `i32` block dots directly from packed `Q2_K`–`Q6_K` bytes without temporary block
+  unpacking, preserving bit-exact binary32 parity with `unpack()` across all five K-quant kinds.
+- **Pending qualification gates**: These land source implementations and unit parity controls
+  only; owning hosted CI and actual-model `fp64`/teacher-forced/WER/human-listening and X1/X2
+  device qualification remain open in [PLAN.md](../PLAN.md#L527).
+
 [fearless]: https://docs.rs/fearless_simd/1.1.0/fearless_simd/
 [target-feature]: https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute
 [detection]: https://doc.rust-lang.org/std/arch/macro.is_aarch64_feature_detected.html

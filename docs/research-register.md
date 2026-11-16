@@ -517,6 +517,8 @@ independent listening or complete-answer review.
 
 Clean-room boundary note: test-only reference oracles (`prism-inference/tests/upstream_prism/reference_*.rs`) intentionally remain independent implementations of production Prism so conformance checks cannot share engine bugs. By contrast, production speech and runtime crates (`speech-tts`, `speech-asr`, `prism-inference` runtime) have no non-trivial cleanliness barrier against adopting permissive hardware-native SIMD, memory mapping, or DSP algorithms, provided changes update the declared `ARITHMETIC_IDENTITY` (where float rounding changes) and pass stagewise `fp64`/teacher-forced/WER/listening acceptance.
 
+Implementation status (2026-11-15): The Tier 2 `qwentts.cpp`, `transcribe.cpp`, `ignis`, and `moshi-core` mechanisms above — plus `bonsai-audio` sub-band adaptive VAD / pause boundary segmentation, `bonsai-windows-process` ARM64 `SDOT`/`I8MM`, `MappedFile`, and spin-park `RowWorkerPool`, and `prism-inference` direct 8-lane packed `kquants::dot` — have been wired into Rust source with unit parity tests under `rust-tts-sdot-i8mm-v3-f16-kv-snake-rfft` and `rust-asr-sdot-i8mm-v3-f16-kv-minimax-gelu`. Compiled CI, actual-model WER/listening acceptance, and Snapdragon X1/X2 device benchmarks remain pending.
+
 ### Reliability and distribution references
 
 These sources inform [validation](validation.md), [file publication](sandboxing.md#files-locks-and-publication)
