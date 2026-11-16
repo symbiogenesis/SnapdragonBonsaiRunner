@@ -18,10 +18,22 @@ pub(super) const REPACKED_PTQ1_SHA256: &str =
     "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5";
 pub(super) const ADAPTER_SHA256: &str =
     "f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42";
+pub(super) const ADAPTER_PQ2_EXECUTION_SHA256: &str =
+    "73d7c72c706b7e310bafb314f70564fd1d006d56ff742bff7372f9f47223b9e6";
+pub(super) const ADAPTER_REPACKED_PTQ1_EXECUTION_SHA256: &str =
+    "f7f50497a217f23cbeafc49781fedce3a8437aa629ad98740aaf53b892b4b81a";
 pub(super) const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 pub(super) const MMPROJ_SHA256: &str =
     "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903";
+
+pub(super) const fn adapter_execution_sha256(repacked: bool) -> &'static str {
+    if repacked {
+        ADAPTER_REPACKED_PTQ1_EXECUTION_SHA256
+    } else {
+        ADAPTER_PQ2_EXECUTION_SHA256
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KvCache {
@@ -712,6 +724,27 @@ mod tests {
         assert_eq!(ADAPTER_SHA256, adapter.sha256);
         assert_eq!(MMPROJ_SHA256, mmproj.sha256);
         Ok(())
+    }
+
+    #[test]
+    fn adapter_execution_digests_are_pinned_lowercase_hex_and_distinct() {
+        let pq2 = adapter_execution_sha256(false);
+        let ptq1 = adapter_execution_sha256(true);
+        assert_eq!(pq2, ADAPTER_PQ2_EXECUTION_SHA256);
+        assert_eq!(ptq1, ADAPTER_REPACKED_PTQ1_EXECUTION_SHA256);
+        assert!(hex(pq2, 64));
+        assert!(hex(ptq1, 64));
+        assert_ne!(pq2, ptq1);
+        for artifact in [
+            MODEL_SHA256,
+            REPACKED_PTQ1_SHA256,
+            ADAPTER_SHA256,
+            TEMPLATE_SHA256,
+            MMPROJ_SHA256,
+        ] {
+            assert_ne!(pq2, artifact);
+            assert_ne!(ptq1, artifact);
+        }
     }
 
     #[test]

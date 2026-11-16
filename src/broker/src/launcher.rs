@@ -7,7 +7,9 @@
 mod identity;
 mod startup;
 
-use identity::{WorkerReadiness, validate_native_identity};
+#[cfg(test)]
+use identity::validate_native_identity;
+use identity::{NativeIdentityError, WorkerReadiness, validate_native_identity_detailed};
 use startup::StartupTimer;
 
 pub use startup::{StartupPhase, StartupProgress};
@@ -929,6 +931,9 @@ impl LaunchConfig {
             } else {
                 Some(bound_loopback_socket(self.backend_port).map_err(|_| LaunchError::Port)?)
             };
+            if attempt == 0 {
+                preflight_frontend_port(self.frontend_port)?;
+            }
             let mut active_mmproj = mmproj_artifact.clone();
             if memory_context_supported {
                 let raw_available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
@@ -995,19 +1000,18 @@ impl LaunchConfig {
                 &credentials,
                 broker_pipe,
             )?;
-            if guard(
+            if let Err(guard_error) = guard(
                 &process,
                 specification.memory_limit_bytes,
                 storage_budget,
                 Some(worker_root.as_path()),
-            )
-            .is_err()
-            {
-                // Keep sandbox storage rejections distinct if the check tripped right after spawn.
-                let err =
+            ) {
+                // Keep sandbox storage rejections distinct if the check tripped right after spawn,
+                // without discarding Memory or Sandbox errors returned by guard itself.
+                let storage_error =
                     check_storage_budget(&process, storage_budget, Some(worker_root.as_path()))
-                        .err()
-                        .unwrap_or(LaunchError::Backend);
+                        .err();
+                let err = classify_initial_guard_error(guard_error, storage_error);
                 let status = wait_briefly_for_exit(&process, err);
                 process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
                 let (refined, child_stage) =
@@ -1173,26 +1177,48 @@ impl LaunchConfig {
         context_tokens: usize,
         vision_enabled: bool,
     ) -> Result<(), LaunchError> {
-        let valid = crate::inference::pinned_version().is_ok_and(|version| {
-            validate_native_identity(
-                models,
-                self.uses_repacked_ptq1(),
-                self.use_abliterate_lora,
-                WorkerReadiness::for_version(&version, self.native_row_workers)
-                    .with_prompt_reuse(self.latest_prompt_reuse)
-                    .with_vision(vision_enabled)
-                    .with_kv_cache(self.kv_cache)
-                    .with_placement(self.placement)
-                    .with_context_tokens(context_tokens),
-            )
-            .is_ok()
-        });
-        if !valid {
+        let verification = crate::inference::pinned_version()
+            .map_err(|_| NativeIdentityError::ReleasePin)
+            .and_then(|version| {
+                validate_native_identity_detailed(
+                    models,
+                    self.uses_repacked_ptq1(),
+                    self.use_abliterate_lora,
+                    WorkerReadiness::for_version(&version, self.native_row_workers)
+                        .with_prompt_reuse(self.latest_prompt_reuse)
+                        .with_vision(vision_enabled)
+                        .with_kv_cache(self.kv_cache)
+                        .with_placement(self.placement)
+                        .with_context_tokens(context_tokens),
+                )
+            });
+        if let Err(mismatch) = verification {
             note_startup_failure(StartupStage::NativeIdentity, LaunchError::Backend, process);
+            let _result = write_native_identity_failure(&mut io::stderr().lock(), mismatch);
             process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
             return Err(LaunchError::Backend);
         }
         Ok(())
+    }
+}
+
+fn preflight_frontend_port(port: u16) -> Result<(), LaunchError> {
+    if port != 0 {
+        drop(bound_loopback_socket(port).map_err(|_| LaunchError::Service)?);
+    }
+    Ok(())
+}
+
+const fn classify_initial_guard_error(
+    guard_error: LaunchError,
+    storage_error: Option<LaunchError>,
+) -> LaunchError {
+    if matches!(guard_error, LaunchError::Backend)
+        && let Some(storage_error) = storage_error
+    {
+        storage_error
+    } else {
+        guard_error
     }
 }
 
@@ -1229,9 +1255,14 @@ impl ChildStartupStage {
     }
 }
 
+const MAX_CHILD_STDERR_CLASSIFY_BYTES: u64 = 65_536;
+
 fn parse_child_startup_failure(stderr: &[u8]) -> Option<ChildStartupStage> {
-    let text = std::str::from_utf8(stderr).ok()?;
-    for line in text.lines() {
+    for raw_line in stderr.split(|&byte| byte == b'\n') {
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            continue;
+        };
         let Some(rest) = line.strip_prefix("private-inference-startup-failed stage=") else {
             continue;
         };
@@ -1274,7 +1305,9 @@ fn classify_child_startup_stderr(stderr_path: &std::path::Path) -> Option<ChildS
     use std::io::Read as _;
     let file = std::fs::File::open(stderr_path).ok()?;
     let mut bytes = Vec::with_capacity(256);
-    file.take(4096).read_to_end(&mut bytes).ok()?;
+    file.take(MAX_CHILD_STDERR_CLASSIFY_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
     parse_child_startup_failure(&bytes)
 }
 
@@ -1374,6 +1407,17 @@ fn write_startup_failure(
         Ok(None) => writeln!(output, "running"),
         Err(_) => writeln!(output, "status-unavailable"),
     }
+}
+
+fn write_native_identity_failure(
+    output: &mut impl io::Write,
+    error: NativeIdentityError,
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "Native identity verification failed: reason={}.",
+        error.reason()
+    )
 }
 
 fn write_sandbox_failure(output: &mut impl io::Write, error: &io::Error) -> io::Result<()> {
@@ -3259,6 +3303,111 @@ mod tests {
         assert!(dir.join("frontend.key").is_file());
         assert!(dir.join("backend.key").is_file());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_identity_failure_evidence_emits_closed_value_free_reasons() -> std::io::Result<()> {
+        use super::{NativeIdentityError, write_native_identity_failure};
+
+        let all = [
+            (NativeIdentityError::ReleasePin, "release-pin"),
+            (NativeIdentityError::Framing, "framing"),
+            (NativeIdentityError::Schema, "schema"),
+            (NativeIdentityError::Model, "model"),
+            (NativeIdentityError::ContextTokens, "context-tokens"),
+            (NativeIdentityError::RowWorkers, "row-workers"),
+            (NativeIdentityError::PromptReuse, "prompt-reuse"),
+            (NativeIdentityError::KvCacheGraph, "kv-cache-graph"),
+            (NativeIdentityError::Placement, "placement"),
+            (NativeIdentityError::StartupProjection, "startup-projection"),
+            (NativeIdentityError::Adapter, "adapter"),
+            (NativeIdentityError::Vision, "vision"),
+        ];
+        for (variant, expected_reason) in all {
+            assert_eq!(variant.reason(), expected_reason);
+            let mut buffer = Vec::new();
+            write_native_identity_failure(&mut buffer, variant)?;
+            assert_eq!(
+                String::from_utf8(buffer).map_err(std::io::Error::other)?,
+                format!("Native identity verification failed: reason={expected_reason}.\n")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn initial_guard_error_preserves_memory_and_sandbox_classifications() {
+        use super::classify_initial_guard_error;
+
+        assert_eq!(
+            classify_initial_guard_error(LaunchError::Memory, None),
+            LaunchError::Memory
+        );
+        assert_eq!(
+            classify_initial_guard_error(LaunchError::Memory, Some(LaunchError::Sandbox)),
+            LaunchError::Memory
+        );
+        assert_eq!(
+            classify_initial_guard_error(LaunchError::Sandbox, None),
+            LaunchError::Sandbox
+        );
+        assert_eq!(
+            classify_initial_guard_error(LaunchError::Backend, Some(LaunchError::Sandbox)),
+            LaunchError::Sandbox
+        );
+        assert_eq!(
+            classify_initial_guard_error(LaunchError::Backend, None),
+            LaunchError::Backend
+        );
+    }
+
+    #[test]
+    fn child_startup_stderr_classification_tolerates_invalid_utf8_and_long_preambles()
+    -> std::io::Result<()> {
+        use super::{ChildStartupStage, parse_child_startup_failure, refine_backend_startup_error};
+
+        let mut payload = vec![0xFF_u8, 0xFE, b'\n'];
+        payload.extend(std::iter::repeat_n(b'a', 12_000));
+        payload.push(b'\n');
+        payload.extend_from_slice(
+            b"private-inference-startup-failed stage=memory errorKind=Other osCode=none\r\n",
+        );
+        assert_eq!(
+            parse_child_startup_failure(&payload),
+            Some(ChildStartupStage::Memory)
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "Bonsai-long-stderr-classify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(std::io::Error::other)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir)?;
+        let stderr_path = dir.join("backend.stderr");
+        std::fs::write(&stderr_path, &payload)?;
+        assert_eq!(
+            refine_backend_startup_error(LaunchError::Backend, &stderr_path),
+            (LaunchError::Memory, Some(ChildStartupStage::Memory))
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn occupied_frontend_port_is_rejected_as_service_error() -> std::io::Result<()> {
+        use super::preflight_frontend_port;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        assert_eq!(preflight_frontend_port(0), Ok(()));
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = occupied.local_addr()?.port();
+        assert_eq!(preflight_frontend_port(port), Err(LaunchError::Service));
+        drop(occupied);
+        assert_eq!(preflight_frontend_port(port), Ok(()));
         Ok(())
     }
 }

@@ -1,7 +1,54 @@
 //! Exact readiness for the explicitly selected native representation and adapter.
 
 use serde::{Deserialize, Deserializer};
-use std::{borrow::Cow, io, ops::Deref};
+use std::{borrow::Cow, ops::Deref};
+
+/// Value-free reason why a native child's `/v1/models` readiness failed verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NativeIdentityError {
+    ReleasePin,
+    Framing,
+    Schema,
+    Model,
+    ContextTokens,
+    RowWorkers,
+    PromptReuse,
+    KvCacheGraph,
+    Placement,
+    StartupProjection,
+    Adapter,
+    Vision,
+}
+
+impl NativeIdentityError {
+    pub(super) const fn reason(self) -> &'static str {
+        match self {
+            Self::ReleasePin => "release-pin",
+            Self::Framing => "framing",
+            Self::Schema => "schema",
+            Self::Model => "model",
+            Self::ContextTokens => "context-tokens",
+            Self::RowWorkers => "row-workers",
+            Self::PromptReuse => "prompt-reuse",
+            Self::KvCacheGraph => "kv-cache-graph",
+            Self::Placement => "placement",
+            Self::StartupProjection => "startup-projection",
+            Self::Adapter => "adapter",
+            Self::Vision => "vision",
+        }
+    }
+}
+
+fn prism_zero_one_patch(version: &str) -> Option<u32> {
+    let patch = version.strip_prefix("0.1.")?;
+    if patch.is_empty()
+        || !patch.bytes().all(|byte| byte.is_ascii_digit())
+        || (patch.len() > 1 && patch.starts_with('0'))
+    {
+        return None;
+    }
+    patch.parse::<u32>().ok()
+}
 
 /// The selected private projection-worker budget, separate from execution evidence.
 #[derive(Clone, Copy)]
@@ -10,6 +57,7 @@ pub(super) struct WorkerReadiness {
     context_tokens: usize,
     legacy_missing_allowed: bool,
     projection_startup_required: bool,
+    adapter_execution_digest_required: bool,
     latest_prompt_reuse: bool,
     vision: bool,
     kv_cache: Option<crate::inference::KvCache>,
@@ -18,20 +66,39 @@ pub(super) struct WorkerReadiness {
 
 impl WorkerReadiness {
     pub(super) fn for_version(version: &str, expected: u8) -> Self {
+        let patch = prism_zero_one_patch(version);
         Self {
             expected,
             context_tokens: crate::CONTEXT_TOKENS,
             // Only these reviewed historical releases omit this identity. A
             // later pin must report its graph's effective worker budget.
             legacy_missing_allowed: matches!(version, "0.1.8" | "0.1.9" | "0.1.10"),
-            // Reviewed releases wait for model-thread initialization and
+            // Reviewed 0.1.28+ releases wait for model-thread initialization and
             // always publish their completed placement/residency observation.
-            projection_startup_required: matches!(version, "0.1.28" | "0.1.30"),
+            projection_startup_required: patch.is_some_and(|number| number >= 28),
+            // Prism 0.1.29+ binds the compiled rank-one adapter execution digest
+            // inside `startup_graph_identity` (`:sha256=<64-hex>`).
+            adapter_execution_digest_required: patch.is_none_or(|number| number >= 29),
             latest_prompt_reuse: false,
             vision: false,
             kv_cache: None,
             placement: crate::inference::Placement::Auto,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn allows_missing_row_workers(self) -> bool {
+        self.legacy_missing_allowed
+    }
+
+    #[cfg(test)]
+    pub(super) const fn requires_projection_startup(self) -> bool {
+        self.projection_startup_required
+    }
+
+    #[cfg(test)]
+    pub(super) const fn requires_adapter_execution_digest(self) -> bool {
+        self.adapter_execution_digest_required
     }
 
     pub(super) const fn with_prompt_reuse(mut self, latest: bool) -> Self {
@@ -233,6 +300,7 @@ fn startup_projection_matches(
 fn cache_identity_matches(
     model: &NativeModel<'_>,
     workers: WorkerReadiness,
+    repacked: bool,
     adapter: bool,
 ) -> bool {
     let Some(policy @ (crate::inference::KvCache::Rsq4 | crate::inference::KvCache::Rsq4K3v)) =
@@ -247,14 +315,23 @@ fn cache_identity_matches(
     );
     if adapter {
         use std::fmt::Write as _;
-        if write!(
-            identity,
-            ":rank-one-lora-v1:{}:{:08x}",
-            crate::inference::ADAPTER_SHA256,
-            1.3_f32.to_bits()
-        )
-        .is_err()
-        {
+        let write_result = if workers.adapter_execution_digest_required {
+            write!(
+                identity,
+                ":rank-one-lora-v1:{}:sha256={}:{:08x}",
+                crate::inference::ADAPTER_SHA256,
+                crate::inference::adapter_execution_sha256(repacked),
+                1.3_f32.to_bits()
+            )
+        } else {
+            write!(
+                identity,
+                ":rank-one-lora-v1:{}:{:08x}",
+                crate::inference::ADAPTER_SHA256,
+                1.3_f32.to_bits()
+            )
+        };
+        if write_result.is_err() {
             return false;
         }
     }
@@ -262,15 +339,15 @@ fn cache_identity_matches(
         && model.startup_graph_identity.as_deref() == Some(identity.as_str())
 }
 
-pub(super) fn validate_native_identity(
+pub(super) fn validate_native_identity_detailed(
     bytes: &[u8],
     repacked: bool,
     adapter: bool,
     workers: WorkerReadiness,
-) -> io::Result<()> {
-    let body = super::validate_response(bytes, 200)?;
+) -> Result<(), NativeIdentityError> {
+    let body = super::validate_response(bytes, 200).map_err(|_| NativeIdentityError::Framing)?;
     let crate::Object(models): crate::Object<Models<'_>> =
-        serde_json::from_slice(body).map_err(io::Error::other)?;
+        serde_json::from_slice(body).map_err(|_| NativeIdentityError::Schema)?;
     let [crate::Object(model)] = &models.data;
     let (id, hash, representation) = if repacked {
         (
@@ -285,19 +362,53 @@ pub(super) fn validate_native_identity(
             "PQ2_0",
         )
     };
-    let extensions_match = if repacked || adapter {
+    let weight_representation_matches = if repacked || adapter {
         model.weight_representation.as_deref() == Some(representation)
-            && matches!(&model.adapter_sha256, AdapterIdentity::Present(value)
-                if value.as_deref() == adapter.then_some(crate::inference::ADAPTER_SHA256))
+    } else {
+        model.weight_representation.is_none()
+    };
+    if &*model.id != id
+        || &*model.object != "model"
+        || &*model.model_sha256 != hash
+        || &*model.template_sha256 != crate::inference::TEMPLATE_SHA256
+        || &*model.runtime != "prism-inference"
+        || model.seed != 42
+        || !weight_representation_matches
+    {
+        return Err(NativeIdentityError::Model);
+    }
+    if model.context_tokens != workers.context_tokens {
+        return Err(NativeIdentityError::ContextTokens);
+    }
+    if !workers.accepts(model.row_workers) {
+        return Err(NativeIdentityError::RowWorkers);
+    }
+    if model.prompt_reuse.as_deref() != workers.latest_prompt_reuse.then_some("latest") {
+        return Err(NativeIdentityError::PromptReuse);
+    }
+    let adapter_matches = if repacked || adapter {
+        matches!(&model.adapter_sha256, AdapterIdentity::Present(value)
+            if value.as_deref() == adapter.then_some(crate::inference::ADAPTER_SHA256))
             && model.supports_abliteration_scale == Some(adapter)
             && model.abliteration_scale_range == adapter.then_some([0, 2])
     } else {
-        model.weight_representation.is_none()
-            && matches!(&model.adapter_sha256, AdapterIdentity::Absent)
+        matches!(&model.adapter_sha256, AdapterIdentity::Absent)
             && model.supports_abliteration_scale.is_none()
             && model.abliteration_scale_range.is_none()
     };
+    if !adapter_matches {
+        return Err(NativeIdentityError::Adapter);
+    }
+    if !cache_identity_matches(model, workers, repacked, adapter) {
+        return Err(NativeIdentityError::KvCacheGraph);
+    }
     let placement = (workers.placement == crate::inference::Placement::Cpu).then_some("cpu");
+    if model.placement.as_deref() != placement || model.projection_backend.as_deref() != placement {
+        return Err(NativeIdentityError::Placement);
+    }
+    if !startup_projection_matches(model, workers, repacked) {
+        return Err(NativeIdentityError::StartupProjection);
+    }
     let vision_match = if workers.vision {
         model.vision == Some(true)
             && model.mmproj_sha256.as_deref() == Some(crate::inference::MMPROJ_SHA256)
@@ -307,32 +418,39 @@ pub(super) fn validate_native_identity(
             && model.mmproj_sha256.is_none()
             && model.image_max_tokens.is_none()
     };
-    if &*model.id != id
-        || &*model.object != "model"
-        || &*model.model_sha256 != hash
-        || &*model.template_sha256 != crate::inference::TEMPLATE_SHA256
-        || &*model.runtime != "prism-inference"
-        || model.context_tokens != workers.context_tokens
-        || model.seed != 42
-        || !workers.accepts(model.row_workers)
-        || model.prompt_reuse.as_deref() != workers.latest_prompt_reuse.then_some("latest")
-        || !cache_identity_matches(model, workers, adapter)
-        || model.placement.as_deref() != placement
-        || model.projection_backend.as_deref() != placement
-        || !startup_projection_matches(model, workers, repacked)
-        || !extensions_match
-        || !vision_match
-    {
-        return Err(io::Error::other("native model readiness identity mismatch"));
+    if !vision_match {
+        return Err(NativeIdentityError::Vision);
     }
     Ok(())
 }
 
 #[cfg(test)]
+pub(super) fn validate_native_identity(
+    bytes: &[u8],
+    repacked: bool,
+    adapter: bool,
+    workers: WorkerReadiness,
+) -> std::io::Result<()> {
+    validate_native_identity_detailed(bytes, repacked, adapter, workers)
+        .map_err(|error| std::io::Error::other(error.reason()))
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{WorkerReadiness, validate_native_identity};
+    use super::{
+        NativeIdentityError, WorkerReadiness, validate_native_identity,
+        validate_native_identity_detailed,
+    };
 
     fn kv_cache_model(repacked: bool, adapter: bool) -> (serde_json::Value, String) {
+        kv_cache_model_for_version("0.1.27", repacked, adapter)
+    }
+
+    fn kv_cache_model_for_version(
+        version: &str,
+        repacked: bool,
+        adapter: bool,
+    ) -> (serde_json::Value, String) {
         use serde_json::json;
         let hash = if repacked {
             crate::inference::REPACKED_PTQ1_SHA256
@@ -343,8 +461,17 @@ mod tests {
             "{hash}:qwen35-text-v1:nonflash-f16:kv-rsq4-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1"
         );
         if adapter {
+            let execution_digest = WorkerReadiness::for_version(version, 4)
+                .requires_adapter_execution_digest()
+                .then(|| {
+                    format!(
+                        ":sha256={}",
+                        crate::inference::adapter_execution_sha256(repacked)
+                    )
+                })
+                .unwrap_or_default();
             graph = format!(
-                "{graph}:rank-one-lora-v1:{}:3fa66666",
+                "{graph}:rank-one-lora-v1:{}{execution_digest}:3fa66666",
                 crate::inference::ADAPTER_SHA256
             );
         }
@@ -393,11 +520,26 @@ mod tests {
     fn projection_startup_binds_completed_residency_and_requested_policy()
     -> Result<(), serde_json::Error> {
         use crate::inference::{KvCache, Placement};
-        let (mut model, _) = kv_cache_model(false, true);
+        let (legacy_model, _) = kv_cache_model(false, true);
         let legacy = WorkerReadiness::for_version("0.1.27", 4).with_kv_cache(Some(KvCache::Rsq4));
-        assert!(validate_native_identity(&model_response(&model)?, false, true, legacy).is_ok());
+        assert!(
+            validate_native_identity(&model_response(&legacy_model)?, false, true, legacy).is_ok()
+        );
+
+        let (mut model, _) = kv_cache_model_for_version("0.1.30", false, true);
         let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
         assert!(validate_native_identity(&model_response(&model)?, false, true, auto).is_err());
+        let mut legacy_with_startup = legacy_model;
+        legacy_with_startup["startup_projection"] = projection_startup("cpu");
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&legacy_with_startup)?,
+                false,
+                true,
+                auto,
+            ),
+            Err(NativeIdentityError::KvCacheGraph)
+        );
         for effective in ["cpu", "hexagon-native-q2"] {
             model["startup_projection"] = projection_startup(effective);
             assert!(validate_native_identity(&model_response(&model)?, false, true, auto).is_ok());
@@ -409,7 +551,7 @@ mod tests {
         model["startup_projection"] = projection_startup("cpu");
         model["startup_projection"]["requested"] = serde_json::json!("cpu");
         assert!(validate_native_identity(&model_response(&model)?, false, true, cpu).is_ok());
-        let (mut ptq1, _) = kv_cache_model(true, true);
+        let (mut ptq1, _) = kv_cache_model_for_version("0.1.30", true, true);
         ptq1["startup_projection"] = projection_startup("hexagon-native-q2");
         assert!(validate_native_identity(&model_response(&ptq1)?, true, true, auto).is_err());
         ptq1["startup_projection"] = projection_startup("cpu");
@@ -423,7 +565,7 @@ mod tests {
         use crate::inference::{KvCache, Placement};
         use serde_json::json;
 
-        let (mut model, _) = kv_cache_model(false, true);
+        let (mut model, _) = kv_cache_model_for_version("0.1.30", false, true);
         let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
         for identity in [
             "hexagon-v73-hvx-native-q2-partial-v1-experimental",
@@ -451,7 +593,7 @@ mod tests {
         cpu_model["startup_projection"]["requested"] = json!("cpu");
         assert!(validate_native_identity(&model_response(&cpu_model)?, false, true, cpu).is_err());
 
-        let (mut ptq1, _) = kv_cache_model(true, true);
+        let (mut ptq1, _) = kv_cache_model_for_version("0.1.30", true, true);
         ptq1["startup_projection"] = model["startup_projection"].clone();
         assert!(validate_native_identity(&model_response(&ptq1)?, true, true, auto).is_err());
 
@@ -1064,6 +1206,367 @@ mod context_tests {
         assert!(
             validate_native_identity(text_wire.as_bytes(), false, false, expect_vision).is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_release_version_enforces_all_current_readiness_and_start_chat_combinations()
+    -> Result<(), String> {
+        use super::{NativeIdentityError, validate_native_identity_detailed};
+        use crate::inference::{KvCache, Placement};
+        use serde_json::json;
+
+        for (version, legacy_workers, proj_required, exec_digest_required) in [
+            ("0.1.8", true, false, false),
+            ("0.1.10", true, false, false),
+            ("0.1.11", false, false, false),
+            ("0.1.27", false, false, false),
+            ("0.1.28", false, true, false),
+            ("0.1.29", false, true, true),
+            ("0.1.30", false, true, true),
+            ("0.1.31", false, true, true),
+            ("1.0.0", false, false, true),
+            ("0.1.030", false, false, true),
+            ("0.1.30-dev", false, false, true),
+        ] {
+            let w = WorkerReadiness::for_version(version, 4);
+            assert_eq!(w.allows_missing_row_workers(), legacy_workers, "{version}");
+            assert_eq!(w.requires_projection_startup(), proj_required, "{version}");
+            assert_eq!(
+                w.requires_adapter_execution_digest(),
+                exec_digest_required,
+                "{version}"
+            );
+        }
+
+        let pinned = crate::inference::pinned_version().map_err(|err| format!("{err:?}"))?;
+        let base_policy = WorkerReadiness::for_version(&pinned, 4);
+        assert!(!base_policy.allows_missing_row_workers());
+        assert!(base_policy.requires_projection_startup());
+        assert!(base_policy.requires_adapter_execution_digest());
+
+        let build_payload = |repacked: bool,
+                             adapter: bool,
+                             vision: bool,
+                             kv_cache: KvCache,
+                             placement: Placement,
+                             row_workers: u8,
+                             prompt_reuse: bool,
+                             context_tokens: usize,
+                             effective: &str| {
+            let hash = if repacked {
+                crate::inference::REPACKED_PTQ1_SHA256
+            } else {
+                crate::inference::MODEL_SHA256
+            };
+            let requested = if placement == Placement::Cpu {
+                "cpu"
+            } else {
+                "auto"
+            };
+            let startup_projection = match effective {
+                "hexagon-native-q2" => json!({
+                    "schema_version": 1,
+                    "requested": requested,
+                    "effective": "hexagon-native-q2",
+                    "identity": "hexagon-hvx-native-q2-resident-v1-experimental",
+                    "resident_tensors": 168,
+                    "resident_weight_bytes": 2_888_663_040_u64,
+                    "host_metadata_bytes": 4096,
+                }),
+                "hexagon-native-q2-partial" => json!({
+                    "schema_version": 1,
+                    "requested": requested,
+                    "effective": "hexagon-native-q2-partial",
+                    "identity": "hexagon-v73-hvx-native-q2-partial-v1-experimental",
+                    "resident_tensors": 144,
+                    "resident_weight_bytes": 1_800_000_000_u64,
+                    "host_metadata_bytes": 4096,
+                }),
+                _ => json!({
+                    "schema_version": 1,
+                    "requested": requested,
+                    "effective": "cpu",
+                    "identity": null,
+                    "resident_tensors": 0,
+                    "resident_weight_bytes": 0,
+                    "host_metadata_bytes": 0,
+                }),
+            };
+            let mut model = json!({
+                "id": if repacked { "Swift-Bonsai-2-current-repacked-PTQ1_0" } else { "Swift-Bonsai-2-PQ2_0" },
+                "object": "model",
+                "model_sha256": hash,
+                "template_sha256": crate::inference::TEMPLATE_SHA256,
+                "runtime": "prism-inference",
+                "context_tokens": context_tokens,
+                "seed": 42,
+                "row_workers": row_workers,
+                "startup_projection": startup_projection,
+            });
+            if placement == Placement::Cpu {
+                model["placement"] = json!("cpu");
+                model["projection_backend"] = json!("cpu");
+            }
+            if repacked || adapter {
+                model["weight_representation"] = json!(if repacked {
+                    "current-repacked-PTQ1_0"
+                } else {
+                    "PQ2_0"
+                });
+                model["adapter_sha256"] =
+                    json!(adapter.then_some(crate::inference::ADAPTER_SHA256));
+                model["supports_abliteration_scale"] = json!(adapter);
+                if adapter {
+                    model["abliteration_scale_range"] = json!([0, 2]);
+                }
+            }
+            if vision {
+                model["vision"] = json!(true);
+                model["mmproj_sha256"] = json!(crate::inference::MMPROJ_SHA256);
+                model["image_max_tokens"] = json!(bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS);
+            }
+            if prompt_reuse {
+                model["prompt_reuse"] = json!("latest");
+            }
+            if kv_cache != KvCache::F16 {
+                let mut graph = format!(
+                    "{hash}:qwen35-text-v1:nonflash-f16:kv-{}-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1",
+                    kv_cache.name()
+                );
+                if adapter {
+                    graph.push_str(&format!(
+                        ":rank-one-lora-v1:{}:sha256={}:3fa66666",
+                        crate::inference::ADAPTER_SHA256,
+                        crate::inference::adapter_execution_sha256(repacked)
+                    ));
+                }
+                model["kv_cache"] = json!(kv_cache.name());
+                model["startup_graph_identity"] = json!(graph);
+            }
+            model
+        };
+
+        let wire = |model: &serde_json::Value| -> Result<Vec<u8>, String> {
+            let body = serde_json::to_string(&json!({ "data": [model] }))
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes())
+        };
+
+        for repacked in [false, true] {
+            for adapter in [false, true] {
+                for vision in [false, true] {
+                    for kv_cache in [KvCache::F16, KvCache::Rsq4] {
+                        for placement in [Placement::Auto, Placement::Cpu] {
+                            for row_workers in [1_u8, 4, 8, 12] {
+                                for prompt_reuse in [false, true] {
+                                    for context_tokens in [8_192_usize, 32_768] {
+                                        for effective in [
+                                            "cpu",
+                                            "hexagon-native-q2",
+                                            "hexagon-native-q2-partial",
+                                        ] {
+                                            if effective != "cpu"
+                                                && (placement == Placement::Cpu || repacked)
+                                            {
+                                                continue;
+                                            }
+                                            let model = build_payload(
+                                                repacked,
+                                                adapter,
+                                                vision,
+                                                kv_cache,
+                                                placement,
+                                                row_workers,
+                                                prompt_reuse,
+                                                context_tokens,
+                                                effective,
+                                            );
+                                            let policy =
+                                                WorkerReadiness::for_version(&pinned, row_workers)
+                                                    .with_vision(vision)
+                                                    .with_kv_cache(Some(kv_cache))
+                                                    .with_placement(placement)
+                                                    .with_prompt_reuse(prompt_reuse)
+                                                    .with_context_tokens(context_tokens);
+                                            let bytes = wire(&model)?;
+                                            assert_eq!(
+                                                validate_native_identity_detailed(
+                                                    &bytes, repacked, adapter, policy,
+                                                ),
+                                                Ok(()),
+                                                "repacked={repacked} adapter={adapter} vision={vision} kv={kv_cache:?} placement={placement:?} workers={row_workers} reuse={prompt_reuse} ctx={context_tokens} eff={effective}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify the Start-Chat default combination rejects tampered/legacy execution digests and classifies every mismatch variant.
+        let default_policy = WorkerReadiness::for_version(&pinned, 4)
+            .with_vision(true)
+            .with_kv_cache(Some(KvCache::Rsq4))
+            .with_placement(Placement::Auto)
+            .with_prompt_reuse(false)
+            .with_context_tokens(32_768);
+        let default_model = build_payload(
+            false,
+            true,
+            true,
+            KvCache::Rsq4,
+            Placement::Auto,
+            4,
+            false,
+            32_768,
+            "hexagon-native-q2",
+        );
+
+        let pq2_digest = crate::inference::adapter_execution_sha256(false);
+        let ptq1_digest = crate::inference::adapter_execution_sha256(true);
+        let valid_graph = default_model["startup_graph_identity"]
+            .as_str()
+            .ok_or("Missing graph identity")?;
+        for bad_graph in [
+            valid_graph.replace(&format!(":sha256={pq2_digest}"), ""),
+            valid_graph.replace(pq2_digest, ptq1_digest),
+            valid_graph.replace(pq2_digest, &pq2_digest.to_ascii_uppercase()),
+            valid_graph.replace(pq2_digest, &pq2_digest[..63]),
+            valid_graph.replace(pq2_digest, &format!("{pq2_digest}a")),
+        ] {
+            let mut mutated = default_model.clone();
+            mutated["startup_graph_identity"] = json!(bad_graph);
+            assert_eq!(
+                validate_native_identity_detailed(&wire(&mutated)?, false, true, default_policy),
+                Err(NativeIdentityError::KvCacheGraph)
+            );
+        }
+
+        // Swapping PQ2 vs PTQ1 execution digest in PTQ1 mode is also rejected.
+        let ptq1_policy =
+            WorkerReadiness::for_version(&pinned, 4).with_kv_cache(Some(KvCache::Rsq4));
+        let ptq1_model = build_payload(
+            true,
+            true,
+            false,
+            KvCache::Rsq4,
+            Placement::Auto,
+            4,
+            false,
+            8_192,
+            "cpu",
+        );
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&ptq1_model)?, true, true, ptq1_policy),
+            Ok(())
+        );
+        let mut ptq1_wrong_exec = ptq1_model;
+        ptq1_wrong_exec["startup_graph_identity"] = json!(
+            ptq1_wrong_exec["startup_graph_identity"]
+                .as_str()
+                .ok_or("Missing PTQ1 graph")?
+                .replace(ptq1_digest, pq2_digest)
+        );
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&ptq1_wrong_exec)?, true, true, ptq1_policy),
+            Err(NativeIdentityError::KvCacheGraph)
+        );
+
+        assert_eq!(
+            validate_native_identity_detailed(
+                b"HTTP/1.1 500 Internal\r\n\r\n",
+                false,
+                true,
+                default_policy
+            ),
+            Err(NativeIdentityError::Framing)
+        );
+        assert_eq!(
+            validate_native_identity_detailed(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                false,
+                true,
+                default_policy,
+            ),
+            Err(NativeIdentityError::Schema)
+        );
+
+        let mut wrong_model = default_model.clone();
+        wrong_model["seed"] = json!(99);
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&wrong_model)?, false, true, default_policy),
+            Err(NativeIdentityError::Model)
+        );
+
+        let mut wrong_context = default_model.clone();
+        wrong_context["context_tokens"] = json!(8192);
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&wrong_context)?, false, true, default_policy),
+            Err(NativeIdentityError::ContextTokens)
+        );
+
+        let mut wrong_workers = default_model.clone();
+        wrong_workers["row_workers"] = json!(8);
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&wrong_workers)?, false, true, default_policy),
+            Err(NativeIdentityError::RowWorkers)
+        );
+
+        let mut wrong_reuse = default_model.clone();
+        wrong_reuse["prompt_reuse"] = json!("latest");
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&wrong_reuse)?, false, true, default_policy),
+            Err(NativeIdentityError::PromptReuse)
+        );
+
+        let mut wrong_adapter = default_model.clone();
+        wrong_adapter["adapter_sha256"] = json!("0".repeat(64));
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&wrong_adapter)?, false, true, default_policy),
+            Err(NativeIdentityError::Adapter)
+        );
+
+        let mut wrong_placement = default_model.clone();
+        wrong_placement["placement"] = json!("cpu");
+        assert_eq!(
+            validate_native_identity_detailed(
+                &wire(&wrong_placement)?,
+                false,
+                true,
+                default_policy,
+            ),
+            Err(NativeIdentityError::Placement)
+        );
+
+        let mut wrong_projection = default_model.clone();
+        if let Some(object) = wrong_projection.as_object_mut() {
+            object.remove("startup_projection");
+        }
+        assert_eq!(
+            validate_native_identity_detailed(
+                &wire(&wrong_projection)?,
+                false,
+                true,
+                default_policy,
+            ),
+            Err(NativeIdentityError::StartupProjection)
+        );
+
+        let mut wrong_vision = default_model;
+        wrong_vision["vision"] = json!(false);
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&wrong_vision)?, false, true, default_policy),
+            Err(NativeIdentityError::Vision)
+        );
+
         Ok(())
     }
 }
