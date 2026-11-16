@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bonsai_artifacts::{is_redirect, open_locked_file, validate_external_path};
+use bonsai_artifacts::{is_redirect, validate_external_path};
 
 thread_local! {
     static REPAIR_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -96,7 +96,7 @@ fn check(file: &mut File, bytes: u64, sha256: &str) -> crate::Result<()> {
 }
 
 fn open_read(path: &Path) -> crate::Result<File> {
-    open_locked_file(path).map_err(|error| error.to_string())
+    crate::bounded_input::open_locked_file_sequential(path).map_err(|error| error.to_string())
 }
 
 /// Verifies a complete pinned artifact without downloading or modifying it.

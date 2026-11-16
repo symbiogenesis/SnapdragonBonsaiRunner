@@ -89,7 +89,8 @@ fn prepare<'a>(
         )
     };
     external(&executable)?;
-    let mut file = open_locked_file(&executable).map_err(|error| error.to_string())?;
+    let mut file = crate::bounded_input::open_locked_file_sequential(&executable)
+        .map_err(|error| error.to_string())?;
     crate::startup_cache::assert_arm64(&executable)?;
     let executable_bytes = file.metadata().map_err(|error| error.to_string())?.len();
     let executable_sha256 = hash_reader(

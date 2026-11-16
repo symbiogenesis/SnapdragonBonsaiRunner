@@ -5,7 +5,6 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use bonsai_artifacts::open_locked_file;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -257,8 +256,10 @@ pub fn run(value: Value) -> crate::Result<Value> {
     let receipt: Value =
         serde_json::from_str(include_str!("../../../config/swift.ptq1-export.json"))
             .map_err(|error| error.to_string())?;
-    let mut source = open_locked_file(&request.source_path).map_err(|error| error.to_string())?;
-    let mut output = open_locked_file(&request.output_path).map_err(|error| error.to_string())?;
+    let mut source = crate::bounded_input::open_locked_file_sequential(&request.source_path)
+        .map_err(|error| error.to_string())?;
+    let mut output = crate::bounded_input::open_locked_file_sequential(&request.output_path)
+        .map_err(|error| error.to_string())?;
     for (file, bytes, hash) in [
         (
             &mut source,

@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
+    io::{Read as _, Seek as _, SeekFrom},
     path::{Component, Path, PathBuf},
 };
 
@@ -57,10 +58,8 @@ pub(crate) fn digest_file(path: &Path) -> crate::Result<String> {
     .map(|(_, digest)| digest)
 }
 
-pub(crate) fn assert_arm64(path: &Path) -> crate::Result<()> {
-    let mut file = source_file(path)?;
-    let length = file.metadata().map_err(|error| error.to_string())?.len();
-    let machine = crate::pe_machine::machine(&mut file, length).map_err(|error| match error {
+pub(crate) fn assert_arm64_file(file: &mut File, length: u64) -> crate::Result<()> {
+    let machine = crate::pe_machine::machine(file, length).map_err(|error| match error {
         crate::pe_machine::Error::DosRead(_) | crate::pe_machine::Error::DosSignature => {
             "Invalid executable DOS header.".into()
         }
@@ -72,6 +71,12 @@ pub(crate) fn assert_arm64(path: &Path) -> crate::Result<()> {
         return Err("Expected a native ARM64 PE image.".into());
     }
     Ok(())
+}
+
+pub(crate) fn assert_arm64(path: &Path) -> crate::Result<()> {
+    let mut file = source_file(path)?;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    assert_arm64_file(&mut file, length)
 }
 
 fn part(hash: &mut Hasher, bytes: &[u8]) -> crate::Result<()> {
@@ -379,7 +384,16 @@ fn include_expression<'a>(
     Some(Cow::Owned(value))
 }
 
+#[cfg(test)]
 fn embedded_inputs(repository: &Path, files: &mut BTreeSet<PathBuf>) -> crate::Result<bool> {
+    embedded_inputs_with_digests(repository, files, None)
+}
+
+fn embedded_inputs_with_digests(
+    repository: &Path,
+    files: &mut BTreeSet<PathBuf>,
+    mut digests: Option<&mut BTreeMap<PathBuf, String>>,
+) -> crate::Result<bool> {
     let mut pending = files
         .iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
@@ -391,7 +405,15 @@ fn embedded_inputs(repository: &Path, files: &mut BTreeSet<PathBuf>) -> crate::R
         if !parsed.insert(file.clone()) {
             continue;
         }
-        let source = fs::read_to_string(&file).map_err(|error| error.to_string())?;
+        crate::startup_cancel::checkpoint()?;
+        let mut reader = source_file(&file)?;
+        let mut source = String::new();
+        reader
+            .read_to_string(&mut source)
+            .map_err(|error| error.to_string())?;
+        if let Some(digests) = digests.as_deref_mut() {
+            digests.insert(file.clone(), crate::identity::sha256(source.as_bytes()));
+        }
         if !source.contains("include") {
             continue;
         }
@@ -620,7 +642,8 @@ fn fingerprint_with(
     }
     let mut files = BTreeSet::new();
     enumerate(repository, repository, &mut files)?;
-    let mut supported = embedded_inputs(repository, &mut files)?;
+    let mut digests = BTreeMap::new();
+    let mut supported = embedded_inputs_with_digests(repository, &mut files, Some(&mut digests))?;
     let mut hash = Hasher::new()?;
     part(&mut hash, b"bonsai-rust-startup-v2")?;
     part(&mut hash, repository_name.as_bytes())?;
@@ -633,13 +656,22 @@ fn fingerprint_with(
             return Ok(None);
         };
         part(&mut hash, relative.as_bytes())?;
-        part(&mut hash, digest_file(&file)?.as_bytes())?;
         if file.file_name().is_some_and(|name| name == "Cargo.toml") {
-            supported &= !external_dependencies(
-                &fs::read_to_string(&file).map_err(|error| error.to_string())?,
-                &file,
-                repository,
-            );
+            crate::startup_cancel::checkpoint()?;
+            let mut reader = source_file(&file)?;
+            let mut content = String::new();
+            reader
+                .read_to_string(&mut content)
+                .map_err(|error| error.to_string())?;
+            part(
+                &mut hash,
+                crate::identity::sha256(content.as_bytes()).as_bytes(),
+            )?;
+            supported &= !external_dependencies(&content, &file, repository);
+        } else if let Some(digest) = digests.get(&file) {
+            part(&mut hash, digest.as_bytes())?;
+        } else {
+            part(&mut hash, digest_file(&file)?.as_bytes())?;
         }
     }
     for (name, value) in environment {
@@ -738,10 +770,23 @@ fn read_receipt(
             .outputs
             .get(name)
             .ok_or("Build output is missing from receipt.")?;
-        if output.path != *path || output.sha256 != digest_file(path)? {
+        if output.path != *path {
             return Err("Build output digest or path changed.".into());
         }
-        assert_arm64(path)?;
+        crate::startup_cancel::checkpoint()?;
+        let mut file = source_file(path)?;
+        let (length, digest) = crate::identity::hash_reader_checked(
+            &mut file,
+            None,
+            None,
+            &mut crate::startup_cancel::checkpoint,
+        )?;
+        if output.sha256 != digest {
+            return Err("Build output digest or path changed.".into());
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
+        assert_arm64_file(&mut file, length)?;
     }
     Ok(())
 }
@@ -849,12 +894,23 @@ pub(crate) fn write_receipt(
     let outputs = outputs
         .iter()
         .map(|(name, path)| {
-            assert_arm64(path)?;
+            crate::startup_cancel::checkpoint()?;
+            let mut file = source_file(path)?;
+            let length = file.metadata().map_err(|error| error.to_string())?.len();
+            assert_arm64_file(&mut file, length)?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| error.to_string())?;
+            let (_, sha256) = crate::identity::hash_reader_checked(
+                &mut file,
+                Some(length),
+                None,
+                &mut crate::startup_cancel::checkpoint,
+            )?;
             Ok((
                 name.clone(),
                 Output {
                     path: path.clone(),
-                    sha256: digest_file(path)?,
+                    sha256,
                 },
             ))
         })

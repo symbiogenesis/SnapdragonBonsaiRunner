@@ -104,6 +104,21 @@ pub(super) fn open_sequential_file(path: &Path) -> crate::Result<File> {
     open_regular_file_with(path, true)
 }
 
+/// Opens an ordinary validated external file for sequential locked reading.
+///
+/// Mirrors [`bonsai_artifacts::open_locked_file`] path and sharing guards while
+/// setting `FILE_FLAG_SEQUENTIAL_SCAN` on Windows for streaming reads.
+pub(crate) fn open_locked_file_sequential(
+    path: &Path,
+) -> Result<File, bonsai_artifacts::ArtifactError> {
+    #[cfg(windows)]
+    bonsai_windows_credentials::validate_read_path(path)
+        .map_err(|_| bonsai_artifacts::ArtifactError::Path)?;
+    #[cfg(not(windows))]
+    bonsai_artifacts::validate_external_path(path)?;
+    open_regular_file_with(path, true).map_err(|_| bonsai_artifacts::ArtifactError::Path)
+}
+
 pub(super) fn open_plain_regular_file(path: &Path) -> crate::Result<File> {
     validate_plain_absolute(path)?;
     open_regular_file(path)
@@ -349,6 +364,15 @@ mod tests {
         assert_eq!(parsed, serde_json::json!({"count": 2}));
         assert!(super::open_regular_file(&root).is_err());
         assert!(super::open_sequential_file(&root).is_err());
+        assert!(super::open_locked_file_sequential(&root).is_err());
+        let mut locked =
+            super::open_locked_file_sequential(&json_path).map_err(|error| error.to_string())?;
+        let mut content = Vec::new();
+        locked
+            .read_to_end(&mut content)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(content, b"\xef\xbb\xbf{\"count\":2}");
+        drop(locked);
         drop(scratch);
         assert!(!root.exists());
         Ok(())

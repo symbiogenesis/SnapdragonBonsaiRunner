@@ -100,8 +100,8 @@ impl Context<'_> {
 
     fn execute(&mut self, pin: &Value, bundle: &Path, mut artifacts: Value) -> crate::Result<()> {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        let mut guard =
-            bonsai_artifacts::open_locked_file(&executable).map_err(|error| error.to_string())?;
+        let mut guard = crate::bounded_input::open_locked_file_sequential(&executable)
+            .map_err(|error| error.to_string())?;
         let length = guard.metadata().map_err(|error| error.to_string())?.len();
         let digest =
             bonsai_artifacts::hash_reader(&mut guard, length, &mut vec![0; 65_536], &mut || {

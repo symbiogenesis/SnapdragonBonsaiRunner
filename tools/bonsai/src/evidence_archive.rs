@@ -377,7 +377,9 @@ fn copy(directory: &Path, output: &Path, bytes: &[u8], manifest: &Manifest) -> c
             hold_directories(&parent, &mut directory_guards)?;
         }
         let path = output.join(&entry.path);
-        let mut source = open_locked_file(&directory.join(&entry.path)).map_err(safe_error)?;
+        let mut source =
+            crate::bounded_input::open_locked_file_sequential(&directory.join(&entry.path))
+                .map_err(safe_error)?;
         let mut destination = create(&path)?;
         let mut digest = Hasher::new()?;
         let mut remaining = entry.bytes;

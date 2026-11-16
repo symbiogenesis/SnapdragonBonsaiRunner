@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::identity::{Hasher, is_lower_hex};
-use bonsai_artifacts::{open_locked_file, validate_external_path};
+use bonsai_artifacts::validate_external_path;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zip::ZipArchive;
@@ -71,7 +71,8 @@ fn numeric_identity(value: &Value, expected: &str) -> bool {
 }
 
 fn open_input(path: &Path, maximum: u64) -> crate::Result<File> {
-    let file = open_locked_file(path).map_err(|error| error.to_string())?;
+    let file = crate::bounded_input::open_locked_file_sequential(path)
+        .map_err(|error| error.to_string())?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if metadata.len() == 0 || metadata.len() > maximum {
         return Err("Release review input is not a bounded regular file.".into());

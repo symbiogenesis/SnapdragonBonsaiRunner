@@ -59,7 +59,8 @@ fn ci_guard(hosted: bool) -> crate::Result<()> {
 }
 
 fn digest(path: &Path) -> crate::Result<(u64, String)> {
-    let mut file = bonsai_artifacts::open_locked_file(path).map_err(|error| error.to_string())?;
+    let mut file = crate::bounded_input::open_locked_file_sequential(path)
+        .map_err(|error| error.to_string())?;
     let bytes = file.metadata().map_err(|error| error.to_string())?.len();
     if bytes == 0 || bytes > 134_217_728 {
         return Err("Sandbox packaged file exceeds its bound.".into());
