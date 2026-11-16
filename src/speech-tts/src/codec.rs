@@ -867,20 +867,49 @@ impl SnakeBeta {
 
     /// Apply `y = x + sin^2(a * x) * inv_b` in place over `[frames, channels]` time-first data.
     pub fn apply_in_place(&self, data: &mut [f32], frames: usize) -> io::Result<()> {
+        self.apply_in_place_parallel(data, frames, 1)
+    }
+
+    /// Apply `y = x + sin^2(a * x) * inv_b` in place over `[frames, channels]` time-first data
+    /// using up to `threads` reusable frame workers.
+    pub fn apply_in_place_parallel(
+        &self,
+        data: &mut [f32],
+        frames: usize,
+        threads: usize,
+    ) -> io::Result<()> {
         let channels = self.a.len();
-        if data.len() != frames * channels {
+        if self.inv_b.len() != channels || frames.checked_mul(channels) != Some(data.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "SnakeBeta input shape mismatch.",
             ));
         }
-        for t in 0..frames {
-            let row = &mut data[t * channels..(t + 1) * channels];
-            for c in 0..channels {
-                let x = row[c];
-                let s = (self.a[c] * x).sin();
-                row[c] = (s * s).mul_add(self.inv_b[c], x);
+        if frames == 0 || channels == 0 {
+            return Ok(());
+        }
+        let apply_row = |row: &mut [f32]| {
+            for ((slot, &a), &inv_b) in row.iter_mut().zip(&self.a).zip(&self.inv_b) {
+                let x = *slot;
+                let s = (a * x).sin();
+                *slot = (s * s).mul_add(inv_b, x);
             }
+        };
+        let workers = if frames <= 1 || data.len() < 4096 {
+            1
+        } else {
+            threads.clamp(1, 18)
+        };
+        if workers <= 1 {
+            for row in data.chunks_exact_mut(channels) {
+                apply_row(row);
+            }
+        } else {
+            row_workers::run_aligned(data, workers, channels, &|_, slice| {
+                for row in slice.chunks_exact_mut(channels) {
+                    apply_row(row);
+                }
+            });
         }
         Ok(())
     }
@@ -919,11 +948,11 @@ impl DacResUnit {
         threads: usize,
     ) -> io::Result<Vec<f32>> {
         let mut h = input.to_vec();
-        self.act1.apply_in_place(&mut h, frames)?;
+        self.act1.apply_in_place_parallel(&mut h, frames, threads)?;
         let mut h = self
             .conv1
             .forward_stream_parallel(&h, frames, conv1_state, threads)?;
-        self.act2.apply_in_place(&mut h, frames)?;
+        self.act2.apply_in_place_parallel(&mut h, frames, threads)?;
         let mut dummy_state = [];
         let mut out = self
             .conv2
@@ -967,7 +996,8 @@ impl DacBlock {
         threads: usize,
     ) -> io::Result<(Vec<f32>, usize)> {
         let mut h = input.to_vec();
-        self.snake1.apply_in_place(&mut h, frames)?;
+        self.snake1
+            .apply_in_place_parallel(&mut h, frames, threads)?;
         let mut h = self
             .trans_conv
             .forward_stream_parallel(&h, frames, carry, threads)?;
@@ -1552,7 +1582,8 @@ impl DacDecoder {
             h = next_h;
             cur_frames = next_f;
         }
-        self.snake_post.apply_in_place(&mut h, cur_frames)?;
+        self.snake_post
+            .apply_in_place_parallel(&mut h, cur_frames, threads)?;
         let mut audio =
             self.conv_post
                 .forward_stream_parallel(&h, cur_frames, &mut state.dac_post, threads)?;
@@ -2092,6 +2123,34 @@ mod tests {
             vec![1.0]
         );
         assert_eq!(cache.restore(10).map(|s| s.pre_conv), Some(vec![1.0]));
+        Ok(())
+    }
+
+    #[test]
+    fn snake_beta_parallel_matches_sequential_bits() -> std::io::Result<()> {
+        let channels = 96_usize;
+        let frames = 65_usize;
+        let alpha: Vec<f32> = (0..channels)
+            .map(|c| (f32::from(u8::try_from(c % 17).unwrap_or(0)) - 8.0) * 0.05)
+            .collect();
+        let beta: Vec<f32> = (0..channels)
+            .map(|c| (f32::from(u8::try_from((c * 3) % 19).unwrap_or(0)) - 9.0) * 0.04)
+            .collect();
+        let snake = SnakeBeta::from_log_params(&alpha, &beta)?;
+        let original: Vec<f32> = (0..frames * channels)
+            .map(|i| (f32::from(u16::try_from(i % 97).unwrap_or(0)) - 48.0) * 0.03125)
+            .collect();
+        let mut seq = original.clone();
+        snake.apply_in_place(&mut seq, frames)?;
+        for threads in [2_usize, 4, 18] {
+            let mut par = original.clone();
+            snake.apply_in_place_parallel(&mut par, frames, threads)?;
+            assert_eq!(
+                par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "threads {threads}",
+            );
+        }
         Ok(())
     }
 }
