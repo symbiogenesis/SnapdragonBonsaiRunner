@@ -463,3 +463,93 @@ fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits(
     }
     Ok(())
 }
+
+#[test]
+fn rust_asr_session_reset_retains_normal_capacity_and_shrinks_bursts() -> io::Result<()> {
+    let c = Config {
+        hidden: 16,
+        heads: 2,
+        kv_heads: 1,
+        head_dim: 8,
+        intermediate: 32,
+        context: 1024,
+        epsilon: 1e-6,
+        rope_theta: 10_000.0,
+        cache_precision: CachePrecision::F32,
+    };
+    let make_f32 = |input, output, salt| -> io::Result<Projection> {
+        let values: Vec<f32> = (0..input * output)
+            .map(|i| (f32::from(u16::try_from((i + salt) % 23).unwrap_or(0)) - 11.0) * 0.03125)
+            .collect();
+        Projection::f32(input, output, values)
+    };
+    let mut blocks = Vec::new();
+    for layer in 0..2_usize {
+        blocks.push(Block {
+            attention_norm: vec![1.0; c.hidden],
+            ffn_norm: vec![1.0; c.hidden],
+            query: make_f32(c.hidden, c.heads * c.head_dim, 1 + layer)?,
+            key: make_f32(c.hidden, c.kv_heads * c.head_dim, 2 + layer)?,
+            value: make_f32(c.hidden, c.kv_heads * c.head_dim, 3 + layer)?,
+            attention_out: make_f32(c.heads * c.head_dim, c.hidden, 4 + layer)?,
+            query_norm: vec![1.0; c.head_dim],
+            key_norm: vec![1.0; c.head_dim],
+            gate: make_f32(c.hidden, c.intermediate, 5 + layer)?,
+            up: make_f32(c.hidden, c.intermediate, 6 + layer)?,
+            down: make_f32(c.intermediate, c.hidden, 7 + layer)?,
+        });
+    }
+    let model = Arc::new(Model::new(
+        c,
+        make_f32(c.hidden, 16, 10)?,
+        blocks,
+        vec![1.0; c.hidden],
+    )?);
+    let tokens = PromptTokens::new([0, 1, 2, 3, 4, 5], [6, 7, 8], 9)?;
+
+    // 1. Normal utterance (<= 128 tokens) retains capacities unchanged across reset.
+    let mut session = model.session();
+    let normal_prompt = tokens.automatic_prompt(8, c.context)?;
+    let normal_audio: Vec<f32> = (0..8 * c.hidden)
+        .map(|i| (f32::from(u16::try_from(i % 19).unwrap_or(0)) - 9.0) * 0.05)
+        .collect();
+    let baseline_logits = session.prefill(&normal_prompt, &normal_audio, &mut || false)?;
+    let normal_kv_cap = session.layers[0].keys.capacity();
+    let normal_gate_cap = session.workspace.batch_gate.capacity();
+    let normal_quads_cap = session.workspace.prepared.quads_capacity();
+    session.reset();
+    assert_eq!(session.layers[0].keys.capacity(), normal_kv_cap);
+    assert_eq!(session.workspace.batch_gate.capacity(), normal_gate_cap);
+    assert_eq!(
+        session.workspace.prepared.quads_capacity(),
+        normal_quads_cap
+    );
+
+    // 2. High-water burst (> 2 * 128 tokens) grows capacities, then shrinks on reset.
+    let burst_rows = 300_usize;
+    let burst_prompt = tokens.automatic_prompt(burst_rows, c.context)?;
+    let burst_audio = vec![0.025_f32; burst_rows * c.hidden];
+    let _ = session.prefill(&burst_prompt, &burst_audio, &mut || false)?;
+    let burst_kv_cap = session.layers[0].keys.capacity();
+    let burst_gate_cap = session.workspace.batch_gate.capacity();
+    let burst_quads_cap = session.workspace.prepared.quads_capacity();
+    assert!(burst_kv_cap > normal_kv_cap * 2);
+    assert!(burst_gate_cap > super::RETAIN_POSITIONS * c.intermediate * 2);
+    session.reset();
+    assert!(session.layers[0].keys.capacity() < burst_kv_cap);
+    assert!(session.layers[0].values.capacity() < burst_kv_cap);
+    assert!(session.workspace.batch_gate.capacity() < burst_gate_cap);
+    assert!(session.workspace.batch_up.capacity() < burst_gate_cap);
+    assert!(session.workspace.prepared.quads_capacity() < burst_quads_cap);
+
+    // 3. Post-shrink inference matches baseline bits identically.
+    let after_logits = session.prefill(&normal_prompt, &normal_audio, &mut || false)?;
+    assert_eq!(
+        after_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        baseline_logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}

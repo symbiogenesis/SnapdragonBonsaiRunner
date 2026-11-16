@@ -52,11 +52,19 @@ impl PreparedBatch {
         prepared
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(super) fn clear_bounded(&mut self, max_retain: usize) {
         self.input = 0;
         self.batch = 0;
         self.num_quads = 0;
         self.quads.clear();
+        if self.quads.capacity() > max_retain.saturating_mul(2) {
+            self.quads.shrink_to(max_retain);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn quads_capacity(&self) -> usize {
+        self.quads.capacity()
     }
 
     pub(super) fn prepare_into(&mut self, raw_input: &[f32], batch: usize, input: usize) {

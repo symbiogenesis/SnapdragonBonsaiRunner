@@ -517,8 +517,22 @@ struct DecoderWorkspace {
     prepared: PreparedBatch,
 }
 
+const RETAIN_POSITIONS: usize = 128;
+
+fn clear_bounded<T>(values: &mut Vec<T>, retain_cap: usize) {
+    values.clear();
+    if values.capacity() > retain_cap.saturating_mul(2) {
+        values.shrink_to(retain_cap);
+    }
+}
+
 impl DecoderWorkspace {
-    fn clear(&mut self) {
+    fn clear_bounded(&mut self, c: Config) {
+        let retain_pos = RETAIN_POSITIONS.min(c.context.max(1));
+        let q_width = c.heads.saturating_mul(c.head_dim);
+        let kv_width = c.kv_heads.saturating_mul(c.head_dim);
+        let max_proj_out = c.intermediate.max(q_width).max(c.hidden);
+        let max_proj_in = c.intermediate.max(q_width).max(c.hidden);
         self.single_hidden.clear();
         self.single_norm.clear();
         self.single_q.clear();
@@ -528,20 +542,30 @@ impl DecoderWorkspace {
         self.single_proj.clear();
         self.single_gate.clear();
         self.single_up.clear();
-        self.single_scores.clear();
+        clear_bounded(&mut self.single_scores, retain_pos);
         self.single_provisional_keys.clear();
         self.single_provisional_values.clear();
-        self.batch_a.clear();
-        self.batch_norm.clear();
-        self.batch_q.clear();
-        self.batch_k.clear();
-        self.batch_v.clear();
-        self.batch_attn.clear();
-        self.batch_proj.clear();
-        self.batch_gate.clear();
-        self.batch_up.clear();
-        self.transposed_scratch.clear();
-        self.prepared.clear();
+        clear_bounded(&mut self.batch_a, retain_pos.saturating_mul(c.hidden));
+        clear_bounded(&mut self.batch_norm, retain_pos.saturating_mul(c.hidden));
+        clear_bounded(&mut self.batch_q, retain_pos.saturating_mul(q_width));
+        clear_bounded(&mut self.batch_k, retain_pos.saturating_mul(kv_width));
+        clear_bounded(&mut self.batch_v, retain_pos.saturating_mul(kv_width));
+        clear_bounded(&mut self.batch_attn, retain_pos.saturating_mul(q_width));
+        clear_bounded(&mut self.batch_proj, retain_pos.saturating_mul(c.hidden));
+        clear_bounded(
+            &mut self.batch_gate,
+            retain_pos.saturating_mul(c.intermediate),
+        );
+        clear_bounded(
+            &mut self.batch_up,
+            retain_pos.saturating_mul(c.intermediate),
+        );
+        clear_bounded(
+            &mut self.transposed_scratch,
+            retain_pos.saturating_mul(max_proj_out),
+        );
+        self.prepared
+            .clear_bounded((retain_pos / 4).max(1).saturating_mul(max_proj_in));
     }
 }
 
@@ -584,13 +608,19 @@ impl Session {
             .map(|state| (state.keys.as_slice(), state.values.as_slice()))
     }
 
-    /// Discard every layer's K/V and the position, preserving reusable capacity.
+    /// Discard every layer's K/V and the position, retaining bounded reusable
+    /// capacity while shrinking oversized buffers from high-water bursts.
     pub fn reset(&mut self) {
+        let c = self.model.config;
+        let kv_retain = RETAIN_POSITIONS
+            .min(c.context.max(1))
+            .saturating_mul(c.kv_heads)
+            .saturating_mul(c.head_dim);
         for layer in &mut self.layers {
-            layer.keys.clear();
-            layer.values.clear();
+            clear_bounded(&mut layer.keys, kv_retain);
+            clear_bounded(&mut layer.values, kv_retain);
         }
-        self.workspace.clear();
+        self.workspace.clear_bounded(c);
         self.position = 0;
     }
 
