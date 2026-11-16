@@ -57,6 +57,7 @@ pub(crate) struct Weights {
     mapped: Option<std::sync::Arc<bonsai_windows_process::MappedFile>>,
     metadata: BTreeMap<String, Metadata>,
     tensors: BTreeMap<String, Tensor>,
+    stream_buf: Vec<u8>,
 }
 
 fn text(reader: &mut impl Read, budget: &mut usize, limit: usize) -> io::Result<String> {
@@ -256,7 +257,7 @@ fn read_header(
     let mut metadata = BTreeMap::new();
     for _ in 0..metadata_count {
         let key = text(reader, &mut budget, 65_536)?;
-        if key.is_empty() || key.contains('\0') || metadata.contains_key(&key) {
+        if key.is_empty() || metadata.contains_key(&key) {
             return Err(invalid());
         }
         let retain_strings = matches!(
@@ -307,7 +308,10 @@ impl Weights {
         {
             use std::os::windows::fs::OpenOptionsExt as _;
             // Read sharing only: replacements and writes cannot race loading.
-            options.share_mode(1).custom_flags(0x0020_0000);
+            // Combine FILE_FLAG_OPEN_REPARSE_POINT with FILE_FLAG_SEQUENTIAL_SCAN.
+            options
+                .share_mode(1)
+                .custom_flags(0x0020_0000 | 0x0800_0000);
         }
         let file = options.open(path)?;
         let properties = file.metadata()?;
@@ -337,11 +341,7 @@ impl Weights {
         for _ in 0..tensor_count {
             let name = text(&mut reader, &mut budget, 65_536)?;
             let dimensions = read_u32(&mut reader)?;
-            if name.is_empty()
-                || name.contains('\0')
-                || tensors.contains_key(&name)
-                || !(1..=4).contains(&dimensions)
-            {
+            if name.is_empty() || tensors.contains_key(&name) || !(1..=4).contains(&dimensions) {
                 return Err(invalid());
             }
             let mut shape = Vec::new();
@@ -412,6 +412,7 @@ impl Weights {
             mapped,
             metadata,
             tensors,
+            stream_buf: Vec::new(),
         })
     }
 
@@ -485,19 +486,66 @@ impl Weights {
     }
 
     pub(crate) fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
-        let (kind, bytes) = self.tensor_bytes(name, shape)?;
+        let tensor = self.tensors.get(name).ok_or_else(invalid)?;
+        if tensor.shape != shape {
+            return Err(invalid());
+        }
+        let kind = tensor.kind;
+        let offset = tensor.offset;
+        let tensor_bytes = tensor.bytes;
         let (block, size) = packed_layout(kind)?;
-        let count = (bytes.len() / size)
-            .checked_mul(block)
-            .ok_or_else(invalid)?;
+        if !tensor_bytes.is_multiple_of(size) {
+            return Err(invalid());
+        }
+        let total_blocks = tensor_bytes / size;
+        let count = total_blocks.checked_mul(block).ok_or_else(invalid)?;
         let mut output = Vec::new();
         output.try_reserve_exact(count).map_err(|_| invalid())?;
         output.resize(count, 0.0);
-        for (source, destination) in bytes.chunks_exact(size).zip(output.chunks_exact_mut(block)) {
-            decode_block(kind, source, destination);
+        #[cfg(windows)]
+        if let Some(mapped) = &self.mapped {
+            let start = usize::try_from(offset).map_err(|_| invalid())?;
+            let end = start.checked_add(tensor_bytes).ok_or_else(invalid)?;
+            let bytes = mapped.as_slice().get(start..end).ok_or_else(invalid)?;
+            for (source, destination) in
+                bytes.chunks_exact(size).zip(output.chunks_exact_mut(block))
+            {
+                decode_block(kind, source, destination);
+            }
+            if output.iter().any(|value| !value.is_finite()) {
+                return Err(invalid());
+            }
+            return Ok(output);
         }
-        if output.iter().any(|value| !value.is_finite()) {
-            return Err(invalid());
+        self.file.seek(SeekFrom::Start(offset))?;
+        let max_chunk_blocks = (64 * 1024 / size).max(1);
+        let chunk_bytes = total_blocks.min(max_chunk_blocks) * size;
+        if self.stream_buf.len() < chunk_bytes {
+            self.stream_buf
+                .try_reserve_exact(chunk_bytes - self.stream_buf.len())
+                .map_err(|_| invalid())?;
+            self.stream_buf.resize(chunk_bytes, 0);
+        }
+        let mut out_offset = 0;
+        let mut blocks_left = total_blocks;
+        while blocks_left > 0 {
+            let step_blocks = blocks_left.min(max_chunk_blocks);
+            let step_bytes = step_blocks * size;
+            let buf = &mut self.stream_buf[..step_bytes];
+            self.file.read_exact(buf)?;
+            let out_step = step_blocks * block;
+            let dest_slice = &mut output[out_offset..out_offset + out_step];
+            for (source, destination) in buf
+                .chunks_exact(size)
+                .zip(dest_slice.chunks_exact_mut(block))
+            {
+                decode_block(kind, source, destination);
+            }
+            if dest_slice.iter().any(|value| !value.is_finite()) {
+                return Err(invalid());
+            }
+            out_offset += out_step;
+            blocks_left -= step_blocks;
         }
         Ok(output)
     }
@@ -1209,5 +1257,38 @@ mod tests {
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
             assert!(read_header(&mut io::Cursor::new(&data), len, true).is_err());
         }
+    }
+
+    #[test]
+    fn mapped_and_streamed_tensor_f32_match_bits_across_multi_chunk_reads() -> io::Result<()> {
+        let count = 20_000_usize; // 80_000 bytes (> 64 KiB chunk boundary)
+        let mut payload = Vec::with_capacity(count * 4);
+        let mut expected = Vec::with_capacity(count);
+        for index in 0..count {
+            let value = f32::from(u16::try_from(index % 251).unwrap_or(0)) * 0.25 - 31.0;
+            expected.push(value);
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let file = fixture(
+            &[("big", &[u64::try_from(count).map_err(|_| invalid())?], 0, 0)],
+            &payload,
+        )?;
+        let mut loaded = Weights::open(&file.0)?;
+        let mapped_out = loaded.tensor_f32("big", &[count])?;
+        assert_eq!(
+            mapped_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        #[cfg(windows)]
+        {
+            loaded.mapped = None;
+        }
+        let streamed_out = loaded.tensor_f32("big", &[count])?;
+        assert_eq!(
+            streamed_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(loaded.stream_buf.len() >= 64 * 1024);
+        Ok(())
     }
 }
