@@ -435,3 +435,189 @@ fn context_capacity_escape_closes_details_before_stopping_generation() {
         Ok(client::Command::Stop)
     ));
 }
+
+#[test]
+fn footprint_diagnostics_surface_ptq1_cow_npu_dedup_and_mapped_commit_split()
+-> Result<(), &'static str> {
+    let pq2_divergent = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 262_144,
+        weight_packing: WeightPacking::Pq2_0,
+        kv_layout: KvCacheLayout::Rsq4,
+        kv_sharing: KvSharingMode::DivergentRollback,
+        evictable_mapped_weight_bytes: 0,
+        npu_resident_arena_bytes: 0,
+        npu_released_host_pq2_bytes: 0,
+        branch_checkpoints: 1,
+    })
+    .ok_or("valid PQ2 divergent baseline")?;
+
+    let ptq1_cow = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 262_144,
+        weight_packing: WeightPacking::Ptq1_0,
+        kv_layout: KvCacheLayout::Rsq4,
+        kv_sharing: KvSharingMode::CowRollback,
+        evictable_mapped_weight_bytes: WeightPacking::Ptq1_0.weight_bytes(),
+        npu_resident_arena_bytes: 0,
+        npu_released_host_pq2_bytes: 0,
+        branch_checkpoints: 1,
+    })
+    .ok_or("valid PTQ1 CoW estimate")?;
+
+    assert_eq!(WeightPacking::Pq2_0.weight_bytes(), 7_206_168_928);
+    assert_eq!(WeightPacking::Ptq1_0.weight_bytes(), 5_946_648_928);
+    assert_eq!(
+        pq2_divergent.kv_bytes - ptq1_cow.kv_bytes,
+        262_080 * KvCacheLayout::Rsq4.bytes_per_token()
+    );
+    assert_eq!(
+        ptq1_cow.physical_savings_over(&pq2_divergent),
+        1_259_520_000 + 262_080 * 16_896
+    );
+    assert_eq!(
+        ptq1_cow.steady_state_physical_bytes - ptq1_cow.private_job_commit_bytes,
+        WeightPacking::Ptq1_0.weight_bytes()
+    );
+
+    let ptq1_append_only = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 262_144,
+        weight_packing: WeightPacking::Ptq1_0,
+        kv_layout: KvCacheLayout::Rsq4,
+        kv_sharing: KvSharingMode::AppendOnlyCow,
+        evictable_mapped_weight_bytes: 0,
+        npu_resident_arena_bytes: 0,
+        npu_released_host_pq2_bytes: 0,
+        branch_checkpoints: 1,
+    })
+    .ok_or("valid PTQ1 append-only CoW estimate")?;
+    assert_eq!(
+        ptq1_cow.kv_bytes - ptq1_append_only.kv_bytes,
+        64 * KvCacheLayout::Rsq4.bytes_per_token()
+    );
+
+    let npu_dedup = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 131_072,
+        weight_packing: WeightPacking::Pq2_0,
+        kv_layout: KvCacheLayout::Rsq4K3v,
+        kv_sharing: KvSharingMode::CowRollback,
+        evictable_mapped_weight_bytes: 0,
+        npu_resident_arena_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 32 * 1024 * 1024,
+        npu_released_host_pq2_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+        branch_checkpoints: 1,
+    })
+    .ok_or("valid NPU dedup estimate")?;
+    let cpu_same = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 131_072,
+        weight_packing: WeightPacking::Pq2_0,
+        kv_layout: KvCacheLayout::Rsq4K3v,
+        kv_sharing: KvSharingMode::CowRollback,
+        evictable_mapped_weight_bytes: 0,
+        npu_resident_arena_bytes: 0,
+        npu_released_host_pq2_bytes: 0,
+        branch_checkpoints: 1,
+    })
+    .ok_or("valid CPU comparison estimate")?;
+    assert_eq!(
+        npu_dedup.job_commit_savings_over(&cpu_same),
+        HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES
+    );
+    assert_eq!(
+        npu_dedup.steady_state_physical_bytes - cpu_same.steady_state_physical_bytes,
+        32 * 1024 * 1024
+    );
+
+    let ptq1_diag = format_footprint_diagnostic(&ptq1_cow);
+    assert!(ptq1_diag.contains("PTQ1_0"));
+    assert!(ptq1_diag.contains("K4/V4 CoW KV"));
+    assert!(ptq1_diag.contains("Est. physical"));
+    assert!(ptq1_diag.contains("Job commit"));
+    assert!(ptq1_diag.contains("mapped"));
+    assert!(ptq1_diag.contains("1 branch checkpoint"));
+
+    let npu_diag = format_footprint_diagnostic(&npu_dedup);
+    assert!(npu_diag.contains("PQ2_0"));
+    assert!(npu_diag.contains("K4/V3 CoW KV"));
+    assert!(npu_diag.contains("NPU dedup -2.69 GiB host / +2.72 GiB arena"));
+    assert_eq!(format_gib_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    Ok(())
+}
+
+#[test]
+fn footprint_diagnostics_enforce_branch_checkpoint_dedup_and_mapped_bounds()
+-> Result<(), &'static str> {
+    let mut prev_physical = 0_u64;
+    for branches in 1..=MAX_REUSABLE_BRANCH_CHECKPOINTS {
+        let estimate = estimate_runtime_footprint(PlannerRuntimeShape {
+            context_tokens: 65_536,
+            weight_packing: WeightPacking::Ptq1_0,
+            kv_layout: KvCacheLayout::F16,
+            kv_sharing: KvSharingMode::CowRollback,
+            evictable_mapped_weight_bytes: 0,
+            npu_resident_arena_bytes: 0,
+            npu_released_host_pq2_bytes: 0,
+            branch_checkpoints: branches,
+        })
+        .ok_or("valid branch checkpoint count")?;
+        if branches > 1 {
+            assert_eq!(
+                estimate.steady_state_physical_bytes - prev_physical,
+                RECURRENT_BYTES
+            );
+            assert!(format_footprint_diagnostic(&estimate).contains(&format!("{branches} branch checkpoints")));
+        }
+        prev_physical = estimate.steady_state_physical_bytes;
+    }
+
+    assert!(
+        estimate_runtime_footprint(PlannerRuntimeShape {
+            context_tokens: 65_536,
+            weight_packing: WeightPacking::Ptq1_0,
+            kv_layout: KvCacheLayout::Rsq4,
+            kv_sharing: KvSharingMode::CowRollback,
+            evictable_mapped_weight_bytes: 0,
+            npu_resident_arena_bytes: 0,
+            npu_released_host_pq2_bytes: 0,
+            branch_checkpoints: 9,
+        })
+        .is_none()
+    );
+    assert!(
+        estimate_runtime_footprint(PlannerRuntimeShape {
+            context_tokens: 65_536,
+            weight_packing: WeightPacking::Ptq1_0,
+            kv_layout: KvCacheLayout::Rsq4,
+            kv_sharing: KvSharingMode::CowRollback,
+            evictable_mapped_weight_bytes: 0,
+            npu_resident_arena_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+            npu_released_host_pq2_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+            branch_checkpoints: 1,
+        })
+        .is_none()
+    );
+    assert!(
+        estimate_runtime_footprint(PlannerRuntimeShape {
+            context_tokens: 65_536,
+            weight_packing: WeightPacking::Pq2_0,
+            kv_layout: KvCacheLayout::Rsq4,
+            kv_sharing: KvSharingMode::CowRollback,
+            evictable_mapped_weight_bytes: 0,
+            npu_resident_arena_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 1,
+            npu_released_host_pq2_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 1,
+            branch_checkpoints: 1,
+        })
+        .is_none()
+    );
+    assert!(
+        estimate_runtime_footprint(PlannerRuntimeShape {
+            context_tokens: 65_536,
+            weight_packing: WeightPacking::Ptq1_0,
+            kv_layout: KvCacheLayout::Rsq4,
+            kv_sharing: KvSharingMode::CowRollback,
+            evictable_mapped_weight_bytes: WeightPacking::Ptq1_0.fixed_runtime_bytes() + 1,
+            npu_resident_arena_bytes: 0,
+            npu_released_host_pq2_bytes: 0,
+            branch_checkpoints: 1,
+        })
+        .is_none()
+    );
+    Ok(())
+}

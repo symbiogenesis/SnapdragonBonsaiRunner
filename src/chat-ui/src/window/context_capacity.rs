@@ -374,5 +374,337 @@ fn tokens(amount: usize) -> String {
     formatted
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const FIXED_RUNTIME_BYTES: u64 = 11 * 1024 * 1024 * 1024;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const PQ2_WEIGHT_BYTES: u64 = 7_206_168_928;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const PTQ1_WEIGHT_BYTES: u64 = 5_946_648_928;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const PQ2_TO_PTQ1_SAVING_BYTES: u64 = PQ2_WEIGHT_BYTES - PTQ1_WEIGHT_BYTES;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES: u64 = 2_888_663_040;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const RECURRENT_BYTES: u64 = 156_893_184;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const ACTIVE_AND_ROLLBACK_RECURRENT_COPIES: u64 = 2;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const MAX_REUSABLE_BRANCH_CHECKPOINTS: u8 = 8;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const KV_COW_PAGE_TOKENS: usize = 64;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Aligned policy constant used by planner diagnostics and tests.")
+)]
+const SEQUENTIAL_KV_BOOKKEEPING_BYTES_PER_TOKEN: u64 = 24 * 4 + 128;
+
+/// Weight packing option surfaced by context capacity footprint diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+pub(super) enum WeightPacking {
+    Pq2_0,
+    Ptq1_0,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+impl WeightPacking {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Pq2_0 => "PQ2_0",
+            Self::Ptq1_0 => "PTQ1_0",
+        }
+    }
+
+    pub(super) const fn weight_bytes(self) -> u64 {
+        match self {
+            Self::Pq2_0 => PQ2_WEIGHT_BYTES,
+            Self::Ptq1_0 => PTQ1_WEIGHT_BYTES,
+        }
+    }
+
+    pub(super) const fn fixed_runtime_bytes(self) -> u64 {
+        match self {
+            Self::Pq2_0 => FIXED_RUNTIME_BYTES,
+            Self::Ptq1_0 => FIXED_RUNTIME_BYTES - PQ2_TO_PTQ1_SAVING_BYTES,
+        }
+    }
+}
+
+/// Attention KV layout surfaced by context capacity footprint diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+pub(super) enum KvCacheLayout {
+    F16,
+    Rsq4,
+    Rsq4K3v,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+impl KvCacheLayout {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::F16 => "F16",
+            Self::Rsq4 => "K4/V4",
+            Self::Rsq4K3v => "K4/V3",
+        }
+    }
+
+    pub(super) const fn bytes_per_token(self) -> u64 {
+        match self {
+            Self::F16 => 65_536,
+            Self::Rsq4 => 16_896,
+            Self::Rsq4K3v => 14_848,
+        }
+    }
+}
+
+/// KV cache sharing mode between active and rollback histories.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+pub(super) enum KvSharingMode {
+    DivergentRollback,
+    CowRollback,
+    AppendOnlyCow,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+impl KvSharingMode {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::DivergentRollback => "2x KV",
+            Self::CowRollback => "CoW KV",
+            Self::AppendOnlyCow => "Append-only CoW KV",
+        }
+    }
+}
+
+/// Input parameters for pure steady-state physical RAM vs private Job commit diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+pub(super) struct PlannerRuntimeShape {
+    pub(super) context_tokens: usize,
+    pub(super) weight_packing: WeightPacking,
+    pub(super) kv_layout: KvCacheLayout,
+    pub(super) kv_sharing: KvSharingMode,
+    pub(super) evictable_mapped_weight_bytes: u64,
+    pub(super) npu_resident_arena_bytes: u64,
+    pub(super) npu_released_host_pq2_bytes: u64,
+    pub(super) branch_checkpoints: u8,
+}
+
+/// Computed steady-state physical RAM and private Windows Job commit estimates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+pub(super) struct PlannerFootprintEstimate {
+    pub(super) context_tokens: usize,
+    pub(super) weight_packing: WeightPacking,
+    pub(super) kv_layout: KvCacheLayout,
+    pub(super) kv_sharing: KvSharingMode,
+    pub(super) steady_state_physical_bytes: u64,
+    pub(super) private_job_commit_bytes: u64,
+    pub(super) evictable_mapped_bytes: u64,
+    pub(super) kv_bytes: u64,
+    pub(super) recurrent_bytes: u64,
+    pub(super) npu_arena_bytes: u64,
+    pub(super) npu_released_host_bytes: u64,
+    pub(super) branch_checkpoints: u8,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+impl PlannerFootprintEstimate {
+    pub(super) const fn physical_savings_over(&self, baseline: &Self) -> u64 {
+        baseline
+            .steady_state_physical_bytes
+            .saturating_sub(self.steady_state_physical_bytes)
+    }
+
+    pub(super) const fn job_commit_savings_over(&self, baseline: &Self) -> u64 {
+        baseline
+            .private_job_commit_bytes
+            .saturating_sub(self.private_job_commit_bytes)
+    }
+}
+
+/// Compute estimated steady-state physical RAM and private Job commit for `shape`.
+///
+/// Returns `None` when `branch_checkpoints > 8`, when NPU PQ2 host deduplication
+/// is requested with non-PQ2 weights or exceeds `2_888_663_040` bytes, when
+/// `evictable_mapped_weight_bytes` exceeds remaining host weights/runtime, or on overflow.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+pub(super) fn estimate_runtime_footprint(
+    shape: PlannerRuntimeShape,
+) -> Option<PlannerFootprintEstimate> {
+    if shape.branch_checkpoints > MAX_REUSABLE_BRANCH_CHECKPOINTS
+        || shape.npu_released_host_pq2_bytes > HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES
+    {
+        return None;
+    }
+    if shape.npu_released_host_pq2_bytes > 0 && shape.weight_packing != WeightPacking::Pq2_0 {
+        return None;
+    }
+    let host_weights_and_fixed = shape
+        .weight_packing
+        .fixed_runtime_bytes()
+        .checked_sub(shape.npu_released_host_pq2_bytes)?;
+    if shape.evictable_mapped_weight_bytes > host_weights_and_fixed {
+        return None;
+    }
+    let kv_bytes = if shape.context_tokens == 0 {
+        0
+    } else {
+        let ctx = u64::try_from(shape.context_tokens).ok()?;
+        let kv_per_token = shape.kv_layout.bytes_per_token();
+        let bookkeeping = ctx.checked_mul(SEQUENTIAL_KV_BOOKKEEPING_BYTES_PER_TOKEN)?;
+        let kv_payload = match shape.kv_sharing {
+            KvSharingMode::DivergentRollback => ctx.checked_mul(2)?.checked_mul(kv_per_token)?,
+            KvSharingMode::CowRollback => {
+                let tail = u64::try_from(shape.context_tokens.min(KV_COW_PAGE_TOKENS)).ok()?;
+                ctx.checked_add(tail)?.checked_mul(kv_per_token)?
+            }
+            KvSharingMode::AppendOnlyCow => ctx.checked_mul(kv_per_token)?,
+        };
+        kv_payload.checked_add(bookkeeping)?
+    };
+    let recurrent_copies =
+        ACTIVE_AND_ROLLBACK_RECURRENT_COPIES.checked_add(u64::from(shape.branch_checkpoints))?;
+    let recurrent_bytes = recurrent_copies.checked_mul(RECURRENT_BYTES)?;
+    let host_total = host_weights_and_fixed
+        .checked_add(recurrent_bytes)?
+        .checked_add(kv_bytes)?;
+    let private_job_commit_bytes = host_total.checked_sub(shape.evictable_mapped_weight_bytes)?;
+    let steady_state_physical_bytes = host_total.checked_add(shape.npu_resident_arena_bytes)?;
+    Some(PlannerFootprintEstimate {
+        context_tokens: shape.context_tokens,
+        weight_packing: shape.weight_packing,
+        kv_layout: shape.kv_layout,
+        kv_sharing: shape.kv_sharing,
+        steady_state_physical_bytes,
+        private_job_commit_bytes,
+        evictable_mapped_bytes: shape.evictable_mapped_weight_bytes,
+        kv_bytes,
+        recurrent_bytes,
+        npu_arena_bytes: shape.npu_resident_arena_bytes,
+        npu_released_host_bytes: shape.npu_released_host_pq2_bytes,
+        branch_checkpoints: shape.branch_checkpoints,
+    })
+}
+
+/// Format an integer byte count in binary `GiB` rounded to two decimal places.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+pub(super) fn format_gib_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let hundredths = (u128::from(bytes) * 100 + u128::from(GIB / 2)) / u128::from(GIB);
+    let whole = hundredths / 100;
+    let frac = hundredths % 100;
+    format!("{whole}.{frac:02} GiB")
+}
+
+/// Format a compact diagnostic summary contrasting steady-state physical RAM vs private Job commit.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Pure planner diagnostics exercised by context_capacity tests.")
+)]
+pub(super) fn format_footprint_diagnostic(estimate: &PlannerFootprintEstimate) -> String {
+    let mut parts = vec![
+        estimate.weight_packing.label().to_owned(),
+        format!(
+            "{} {}",
+            estimate.kv_layout.label(),
+            estimate.kv_sharing.label()
+        ),
+    ];
+    if estimate.npu_released_host_bytes > 0 || estimate.npu_arena_bytes > 0 {
+        parts.push(format!(
+            "NPU dedup -{} host / +{} arena",
+            format_gib_bytes(estimate.npu_released_host_bytes),
+            format_gib_bytes(estimate.npu_arena_bytes)
+        ));
+    }
+    parts.push(format!(
+        "Est. physical {}",
+        format_gib_bytes(estimate.steady_state_physical_bytes)
+    ));
+    let commit = if estimate.evictable_mapped_bytes > 0 {
+        format!(
+            "Job commit {} ({} mapped)",
+            format_gib_bytes(estimate.private_job_commit_bytes),
+            format_gib_bytes(estimate.evictable_mapped_bytes)
+        )
+    } else {
+        format!(
+            "Job commit {}",
+            format_gib_bytes(estimate.private_job_commit_bytes)
+        )
+    };
+    parts.push(commit);
+    let branch_label = if estimate.branch_checkpoints == 1 {
+        "1 branch checkpoint".to_owned()
+    } else {
+        format!("{} branch checkpoints", estimate.branch_checkpoints)
+    };
+    parts.push(branch_label);
+    parts.join(" · ")
+}
+
 #[cfg(test)]
 mod tests;
