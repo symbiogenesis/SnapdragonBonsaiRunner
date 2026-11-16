@@ -7,20 +7,18 @@
 )]
 
 use core::arch::aarch64::{
-    float32x4_t, int8x16_t, int16x8_t, int32x4_t, uint8x16_t, uint16x4_t, uint16x8_t, vabsq_f32,
-    vaddq_s32, vaddvq_s16, vaddvq_s32, vand_u16, vandq_u8, vandq_u16, vcombine_s8, vcombine_s16,
-    vcvt_f16_f32, vcvt_f32_f16, vcvt_high_f32_f16, vcvtnq_s32_f32, vdotq_s32, vdup_n_u16,
-    vdupq_n_f32, vdupq_n_s8, vdupq_n_s32, vdupq_n_u8, vdupq_n_u16, vget_high_s8, vget_low_f16,
-    vget_low_s8, vld1_u16, vld1q_f32, vld1q_s8, vld1q_s32, vld1q_u8, vld1q_u16, vmaxq_f32,
-    vmaxq_s8, vmaxv_u16, vmaxvq_f32, vmaxvq_u16, vmulq_f32, vmulq_s32, vorrq_u8, vpaddlq_s8,
-    vpaddq_s32, vqmovn_s16, vqmovn_s32, vreinterpret_u16_f16, vreinterpretq_f16_u16,
-    vreinterpretq_s8_u8, vshlq_n_u8, vshrq_n_u8, vst1_u16, vst1q_f32, vst1q_s8, vst1q_s32,
-    vsubq_s8,
+    float32x4_t, int8x16_t, int16x8_t, int32x4_t, uint8x16_t, uint16x4_t, vabsq_f32, vaddq_s32,
+    vaddvq_s16, vaddvq_s32, vand_u16, vandq_u8, vcombine_s8, vcombine_s16, vcvt_f16_f32,
+    vcvtnq_s32_f32, vdotq_s32, vdup_n_u16, vdupq_n_f32, vdupq_n_s8, vdupq_n_s32, vdupq_n_u8,
+    vget_high_s8, vget_low_s8, vld1q_f32, vld1q_s8, vld1q_s32, vld1q_u8, vmaxq_f32, vmaxq_s8,
+    vmaxv_u16, vmaxvq_f32, vmulq_f32, vmulq_s32, vorrq_u8, vpaddlq_s8, vqmovn_s16, vqmovn_s32,
+    vreinterpret_u16_f16, vreinterpretq_s8_u8, vshlq_n_u8, vshrq_n_u8, vst1_u16, vst1q_s8,
+    vst1q_s32, vsubq_s8,
 };
 
 use crate::quant_kernels::{
-    Q4_K_REPACK8_BLOCK_BYTES, Q8_0ActBlock, Q8_KActBlock, f16_bits_to_f32, f64_to_f32, i32_to_f32,
-    scalar_widen_f16, unpack_q4_k_scale_min,
+    Q4_K_REPACK8_BLOCK_BYTES, Q8_0ActBlock, Q8_KActBlock, f16_bits_to_f32, f64_to_f32,
+    unpack_q4_k_scale_min,
 };
 
 #[inline]
@@ -32,30 +30,9 @@ fn load_f32x4(values: &[f32; 4]) -> float32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn store_f32x4(vec: float32x4_t, out: &mut [f32; 4]) {
-    // SAFETY: `out` is a unique mutable 4-element `f32` array.
-    unsafe { vst1q_f32(out.as_mut_ptr(), vec) };
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn load_u16x4(bits: &[u16; 4]) -> uint16x4_t {
-    // SAFETY: `bits` is a live 4-element `u16` array.
-    unsafe { vld1_u16(bits.as_ptr()) }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
 fn store_u16x4(vec: uint16x4_t, out: &mut [u16; 4]) {
     // SAFETY: `out` is a unique mutable 4-element `u16` array.
     unsafe { vst1_u16(out.as_mut_ptr(), vec) };
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn load_u16x8(bits: &[u16; 8]) -> uint16x8_t {
-    // SAFETY: `bits` is a live 8-element `u16` array.
-    unsafe { vld1q_u16(bits.as_ptr()) }
 }
 
 #[inline]
@@ -91,52 +68,6 @@ fn store_s32x4(vec: int32x4_t, out: &mut [i32; 4]) {
 fn load_s32x4(values: &[i32; 4]) -> int32x4_t {
     // SAFETY: `values` is a live 4-element `i32` array.
     unsafe { vld1q_s32(values.as_ptr()) }
-}
-
-#[cfg(target_feature = "neon")]
-#[inline]
-pub(crate) fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
-    // SAFETY: Compiled only for targets with baseline ARM64 NEON; `bits` is fixed-size.
-    unsafe { widen_f16_four_neon(bits) }
-}
-
-#[cfg(target_feature = "neon")]
-#[inline]
-#[target_feature(enable = "neon")]
-fn widen_f16_four_neon(bits: &[u16; 4]) -> [f32; 4] {
-    use core::arch::aarch64::vreinterpret_f16_u16;
-    let raw = load_u16x4(bits);
-    if vmaxv_u16(vand_u16(raw, vdup_n_u16(0x7fff))) >= 0x7c00 {
-        return bits.map(scalar_widen_f16);
-    }
-    let widened = vcvt_f32_f16(vreinterpret_f16_u16(raw));
-    let mut output = [0.0_f32; 4];
-    store_f32x4(widened, &mut output);
-    output
-}
-
-#[cfg(target_feature = "neon")]
-#[inline]
-pub(crate) fn widen_f16_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
-    // SAFETY: Compiled only for targets with baseline ARM64 NEON; `bits` is fixed-size.
-    unsafe { widen_f16_eight_neon(bits) }
-}
-
-#[cfg(target_feature = "neon")]
-#[inline]
-#[target_feature(enable = "neon")]
-fn widen_f16_eight_neon(bits: &[u16; 8]) -> [[f32; 4]; 2] {
-    let raw = load_u16x8(bits);
-    if vmaxvq_u16(vandq_u16(raw, vdupq_n_u16(0x7fff))) >= 0x7c00 {
-        return crate::quant_kernels::portable_widen_f16_eight(bits);
-    }
-    let half = vreinterpretq_f16_u16(raw);
-    let first = vcvt_f32_f16(vget_low_f16(half));
-    let second = vcvt_high_f32_f16(half);
-    let mut output = [[0.0_f32; 4]; 2];
-    store_f32x4(first, &mut output[0]);
-    store_f32x4(second, &mut output[1]);
-    output
 }
 
 #[cfg(target_feature = "neon")]
@@ -283,187 +214,6 @@ fn smmla_s32(mut acc: int32x4_t, w: int8x16_t, a: int8x16_t) -> int32x4_t {
 fn dot32_s8_vec(w0: int8x16_t, w1: int8x16_t, a0: int8x16_t, a1: int8x16_t) -> int32x4_t {
     let acc0 = vdotq_s32(vdupq_n_s32(0), w0, a0);
     vdotq_s32(acc0, w1, a1)
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn q8_block_quants(block: &[u8; 34]) -> (&[u8; 16], &[u8; 16], f32) {
-    let w_d = f16_bits_to_f32([block[0], block[1]]);
-    let q0 = &block[2..18].as_chunks::<16>().0[0];
-    let q1 = &block[18..34].as_chunks::<16>().0[0];
-    (q0, q1, w_d)
-}
-
-#[target_feature(enable = "neon,dotprod")]
-pub(crate) fn dot_q8_0_row_dotprod(w_row: &[u8], act: &[Q8_0ActBlock]) -> f32 {
-    let mut sum = 0.0_f32;
-    for (wb, ab) in w_row.as_chunks::<34>().0.iter().zip(act.iter()) {
-        let (q0, q1, w_d) = q8_block_quants(wb);
-        let a_halves = ab.qs.as_chunks::<16>().0;
-        let dot_v = dot32_s8_vec(
-            vreinterpretq_s8_u8(load_u8x16(q0)),
-            vreinterpretq_s8_u8(load_u8x16(q1)),
-            load_s8x16(&a_halves[0]),
-            load_s8x16(&a_halves[1]),
-        );
-        let int_sum = vaddvq_s32(dot_v);
-        sum += w_d * (ab.d * i32_to_f32(int_sum));
-    }
-    sum
-}
-
-#[target_feature(enable = "neon,dotprod")]
-pub(crate) fn dot_q8_0_4rows_dotprod(rows: [&[u8]; 4], act: &[Q8_0ActBlock]) -> [f32; 4] {
-    let mut acc = [0.0_f32; 4];
-    let r0 = rows[0].as_chunks::<34>().0;
-    let r1 = rows[1].as_chunks::<34>().0;
-    let r2 = rows[2].as_chunks::<34>().0;
-    let r3 = rows[3].as_chunks::<34>().0;
-    for (idx, ab) in act.iter().enumerate() {
-        let a_halves = ab.qs.as_chunks::<16>().0;
-        let a0 = load_s8x16(&a_halves[0]);
-        let a1 = load_s8x16(&a_halves[1]);
-
-        let (b0_0, b0_1, d0) = q8_block_quants(&r0[idx]);
-        let (b1_0, b1_1, d1) = q8_block_quants(&r1[idx]);
-        let (b2_0, b2_1, d2) = q8_block_quants(&r2[idx]);
-        let (b3_0, b3_1, d3) = q8_block_quants(&r3[idx]);
-
-        let v0 = dot32_s8_vec(
-            vreinterpretq_s8_u8(load_u8x16(b0_0)),
-            vreinterpretq_s8_u8(load_u8x16(b0_1)),
-            a0,
-            a1,
-        );
-        let v1 = dot32_s8_vec(
-            vreinterpretq_s8_u8(load_u8x16(b1_0)),
-            vreinterpretq_s8_u8(load_u8x16(b1_1)),
-            a0,
-            a1,
-        );
-        let v2 = dot32_s8_vec(
-            vreinterpretq_s8_u8(load_u8x16(b2_0)),
-            vreinterpretq_s8_u8(load_u8x16(b2_1)),
-            a0,
-            a1,
-        );
-        let v3 = dot32_s8_vec(
-            vreinterpretq_s8_u8(load_u8x16(b3_0)),
-            vreinterpretq_s8_u8(load_u8x16(b3_1)),
-            a0,
-            a1,
-        );
-
-        let h01 = vpaddq_s32(v0, v1);
-        let h23 = vpaddq_s32(v2, v3);
-        let mut sums = [0_i32; 4];
-        store_s32x4(vpaddq_s32(h01, h23), &mut sums);
-
-        acc[0] += d0 * (ab.d * i32_to_f32(sums[0]));
-        acc[1] += d1 * (ab.d * i32_to_f32(sums[1]));
-        acc[2] += d2 * (ab.d * i32_to_f32(sums[2]));
-        acc[3] += d3 * (ab.d * i32_to_f32(sums[3]));
-    }
-    acc
-}
-
-#[target_feature(enable = "neon,i8mm")]
-pub(crate) fn gemm_q8_0_4x2_i8mm(
-    rows: [&[u8]; 4],
-    act0: &[Q8_0ActBlock],
-    act1: &[Q8_0ActBlock],
-) -> [[f32; 2]; 4] {
-    let mut acc = [[0.0_f32; 2]; 4];
-    let r0 = rows[0].as_chunks::<34>().0;
-    let r1 = rows[1].as_chunks::<34>().0;
-    let r2 = rows[2].as_chunks::<34>().0;
-    let r3 = rows[3].as_chunks::<34>().0;
-    for (idx, (ab0, ab1)) in act0.iter().zip(act1.iter()).enumerate() {
-        let a0_h = ab0.qs.as_chunks::<16>().0;
-        let a1_h = ab1.qs.as_chunks::<16>().0;
-        let a0_0 = load_s8x16(&a0_h[0]);
-        let a0_1 = load_s8x16(&a0_h[1]);
-        let a1_0 = load_s8x16(&a1_h[0]);
-        let a1_1 = load_s8x16(&a1_h[1]);
-
-        let a_01_lo = vcombine_s8(vget_low_s8(a0_0), vget_low_s8(a1_0));
-        let a_01_hi = vcombine_s8(vget_high_s8(a0_0), vget_high_s8(a1_0));
-        let a_23_lo = vcombine_s8(vget_low_s8(a0_1), vget_low_s8(a1_1));
-        let a_23_hi = vcombine_s8(vget_high_s8(a0_1), vget_high_s8(a1_1));
-
-        let (b0_0, b0_1, d0) = q8_block_quants(&r0[idx]);
-        let (b1_0, b1_1, d1) = q8_block_quants(&r1[idx]);
-        let (b2_0, b2_1, d2) = q8_block_quants(&r2[idx]);
-        let (b3_0, b3_1, d3) = q8_block_quants(&r3[idx]);
-
-        let w0_0 = vreinterpretq_s8_u8(load_u8x16(b0_0));
-        let w0_1 = vreinterpretq_s8_u8(load_u8x16(b0_1));
-        let w1_0 = vreinterpretq_s8_u8(load_u8x16(b1_0));
-        let w1_1 = vreinterpretq_s8_u8(load_u8x16(b1_1));
-        let w2_0 = vreinterpretq_s8_u8(load_u8x16(b2_0));
-        let w2_1 = vreinterpretq_s8_u8(load_u8x16(b2_1));
-        let w3_0 = vreinterpretq_s8_u8(load_u8x16(b3_0));
-        let w3_1 = vreinterpretq_s8_u8(load_u8x16(b3_1));
-
-        let mut s01 = vdupq_n_s32(0);
-        s01 = smmla_s32(
-            s01,
-            vcombine_s8(vget_low_s8(w0_0), vget_low_s8(w1_0)),
-            a_01_lo,
-        );
-        s01 = smmla_s32(
-            s01,
-            vcombine_s8(vget_high_s8(w0_0), vget_high_s8(w1_0)),
-            a_01_hi,
-        );
-        s01 = smmla_s32(
-            s01,
-            vcombine_s8(vget_low_s8(w0_1), vget_low_s8(w1_1)),
-            a_23_lo,
-        );
-        s01 = smmla_s32(
-            s01,
-            vcombine_s8(vget_high_s8(w0_1), vget_high_s8(w1_1)),
-            a_23_hi,
-        );
-
-        let mut s23 = vdupq_n_s32(0);
-        s23 = smmla_s32(
-            s23,
-            vcombine_s8(vget_low_s8(w2_0), vget_low_s8(w3_0)),
-            a_01_lo,
-        );
-        s23 = smmla_s32(
-            s23,
-            vcombine_s8(vget_high_s8(w2_0), vget_high_s8(w3_0)),
-            a_01_hi,
-        );
-        s23 = smmla_s32(
-            s23,
-            vcombine_s8(vget_low_s8(w2_1), vget_low_s8(w3_1)),
-            a_23_lo,
-        );
-        s23 = smmla_s32(
-            s23,
-            vcombine_s8(vget_high_s8(w2_1), vget_high_s8(w3_1)),
-            a_23_hi,
-        );
-
-        let mut q01 = [0_i32; 4];
-        let mut q23 = [0_i32; 4];
-        store_s32x4(s01, &mut q01);
-        store_s32x4(s23, &mut q23);
-
-        acc[0][0] += d0 * (ab0.d * i32_to_f32(q01[0]));
-        acc[0][1] += d0 * (ab1.d * i32_to_f32(q01[1]));
-        acc[1][0] += d1 * (ab0.d * i32_to_f32(q01[2]));
-        acc[1][1] += d1 * (ab1.d * i32_to_f32(q01[3]));
-        acc[2][0] += d2 * (ab0.d * i32_to_f32(q23[0]));
-        acc[2][1] += d2 * (ab1.d * i32_to_f32(q23[1]));
-        acc[3][0] += d3 * (ab0.d * i32_to_f32(q23[2]));
-        acc[3][1] += d3 * (ab1.d * i32_to_f32(q23[3]));
-    }
-    acc
 }
 
 #[target_feature(enable = "neon,dotprod")]
@@ -776,8 +526,8 @@ pub(crate) fn dot_q4_k_repacked8_dotprod(strip: &[u8], act: &[Q8_KActBlock]) -> 
                 sumi[r] += d_lo * i32::from(sc_lo[r]) + d_hi * i32::from(sc_hi[r]);
             }
         }
-        let d_w = widen_f16_eight_neon(&d_f16);
-        let dmin_w = widen_f16_eight_neon(&dmin_f16);
+        let d_w = bonsai_neon_dot::widen_f16_eight(&d_f16);
+        let dmin_w = bonsai_neon_dot::widen_f16_eight(&dmin_f16);
         for r in 0..8 {
             let dw = f64::from(d_w[r / 4][r % 4]) * d_act;
             let dm = f64::from(dmin_w[r / 4][r % 4]) * d_act;
@@ -887,8 +637,8 @@ pub(crate) fn gemm_q4_k_repacked8_8x2_i8mm(
                 sum_pairs[pair] = vaddq_s32(sum_pairs[pair], vmulq_s32(hi_acc[pair], sv_hi));
             }
         }
-        let d_w = widen_f16_eight_neon(&d_f16);
-        let dmin_w = widen_f16_eight_neon(&dmin_f16);
+        let d_w = bonsai_neon_dot::widen_f16_eight(&d_f16);
+        let dmin_w = bonsai_neon_dot::widen_f16_eight(&dmin_f16);
         for pair in 0..4 {
             let mut vals = [0_i32; 4];
             store_s32x4(sum_pairs[pair], &mut vals);

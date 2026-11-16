@@ -361,6 +361,36 @@ impl NativeRowWorkerPool {
 
         self.shared.drain_chunks(task);
     }
+
+    pub(crate) fn try_run_aligned<F>(
+        &self,
+        out: &mut [f32],
+        active_workers: usize,
+        alignment: usize,
+        compute: &F,
+    ) -> io::Result<()>
+    where
+        F: Fn(usize, &mut [f32]) -> io::Result<()> + Sync,
+    {
+        let failure: Mutex<Option<(usize, io::Error)>> = Mutex::new(None);
+        self.run_aligned(out, active_workers, alignment, &|offset, slice| {
+            if let Err(error) = compute(offset, slice) {
+                let mut guard = failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.as_ref().is_none_or(|(prev, _)| offset < *prev) {
+                    *guard = Some((offset, error));
+                }
+            }
+        });
+        match failure
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some((_, error)) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for NativeRowWorkerPool {

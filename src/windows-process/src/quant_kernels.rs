@@ -1,8 +1,6 @@
 //! Safe public boundary for ARM64 `SDOT` / `I8MM` / `FCVTL` / `FCVTN` quantized
 //! kernels with runtime CPU feature detection and exact portable fallbacks.
 
-use std::sync::atomic::{AtomicU8, Ordering};
-
 /// Block size (in elements) of GGML `Q8_0` blocks.
 pub const Q8_0_BLOCK_ELEMENTS: usize = 32;
 /// Byte size of one GGML `Q8_0` block (`f16` scale + 32 `i8` quants).
@@ -15,13 +13,6 @@ pub const Q4_K_BLOCK_BYTES: usize = 144;
 pub const Q6_K_BLOCK_BYTES: usize = 210;
 /// Byte size of one repacked 8-row `Q4_K` superblock strip (`16+16+64+64+1024`).
 pub const Q4_K_REPACK8_BLOCK_BYTES: usize = 1184;
-
-const STATE_UNINIT: u8 = 0;
-const STATE_DOTPROD_BIT: u8 = 1;
-const STATE_I8MM_BIT: u8 = 2;
-const STATE_INIT_FLAG: u8 = 0x80;
-
-static CACHED_CAPS: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 
 /// Detected ARM64 optional quantized dot-product and matrix-multiply capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,26 +27,10 @@ impl Arm64QuantCaps {
     /// Returns runtime OS-verified ARM64 `dotprod` / `i8mm` capabilities (cached process-wide).
     #[must_use]
     pub fn detect() -> Self {
-        let cached = CACHED_CAPS.load(Ordering::Relaxed);
-        if (cached & STATE_INIT_FLAG) != 0 {
-            return Self {
-                dotprod: (cached & STATE_DOTPROD_BIT) != 0,
-                i8mm: (cached & STATE_I8MM_BIT) != 0,
-            };
+        Self {
+            dotprod: bonsai_neon_dot::has_dotprod(),
+            i8mm: bonsai_neon_dot::has_i8mm(),
         }
-        let detected = crate::arm64_isa().map_or(Self::portable(), |isa| Self {
-            dotprod: isa.dotprod,
-            i8mm: isa.dotprod && isa.i8mm,
-        });
-        let bits = STATE_INIT_FLAG
-            | if detected.dotprod {
-                STATE_DOTPROD_BIT
-            } else {
-                0
-            }
-            | if detected.i8mm { STATE_I8MM_BIT } else { 0 };
-        CACHED_CAPS.store(bits, Ordering::Relaxed);
-        detected
     }
 
     /// Returns a capability set with optional `dotprod` and `i8mm` disabled for fallback controls.
@@ -134,31 +109,8 @@ pub(crate) fn quantize_i8_scalar(value: f32) -> i8 {
 }
 
 #[inline]
-pub(crate) fn scalar_widen_f16(bits: u16) -> f32 {
-    let sign = u32::from(bits & 0x8000) << 16;
-    let mut mantissa = u32::from(bits & 0x03ff);
-    let mut exponent = u32::from((bits >> 10) & 0x1f);
-    if exponent == 0 {
-        if mantissa == 0 {
-            return f32::from_bits(sign);
-        }
-        exponent = 113;
-        while mantissa & 0x0400 == 0 {
-            mantissa <<= 1;
-            exponent -= 1;
-        }
-        mantissa &= 0x03ff;
-    } else if exponent == 31 {
-        exponent = 255;
-    } else {
-        exponent += 112;
-    }
-    f32::from_bits(sign | (exponent << 23) | (mantissa << 13))
-}
-
-#[inline]
 pub(crate) fn f16_bits_to_f32(bytes: [u8; 2]) -> f32 {
-    scalar_widen_f16(u16::from_le_bytes(bytes))
+    bonsai_ternary::half_to_float(u16::from_le_bytes(bytes))
 }
 
 #[inline]
@@ -203,13 +155,6 @@ pub(crate) fn scalar_narrow_f32_to_f16(value: f32) -> Option<u16> {
 }
 
 #[inline]
-pub(crate) fn portable_widen_f16_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
-    std::array::from_fn(|group| {
-        std::array::from_fn(|lane| scalar_widen_f16(bits[group * 4 + lane]))
-    })
-}
-
-#[inline]
 pub(crate) fn unpack_q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
     if group < 4 {
         (scales[group] & 63, scales[group + 4] & 63)
@@ -224,27 +169,13 @@ pub(crate) fn unpack_q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
 /// Widens four IEEE binary16 bit patterns using baseline ARM64 `FCVTL` for finite inputs.
 #[must_use]
 pub fn widen_f16_four(bits: &[u16; 4]) -> [f32; 4] {
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    {
-        crate::native::widen_f16_four(bits)
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-    {
-        bits.map(scalar_widen_f16)
-    }
+    bonsai_neon_dot::widen_f16_four(bits)
 }
 
 /// Widens eight IEEE binary16 bit patterns using baseline ARM64 `FCVTL`/`FCVTL2` for finite inputs.
 #[must_use]
 pub fn widen_f16_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    {
-        crate::native::widen_f16_eight(bits)
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-    {
-        portable_widen_f16_eight(bits)
-    }
+    bonsai_neon_dot::widen_f16_eight(bits)
 }
 
 /// Narrows finite `f32` values into IEEE binary16 bits, rejecting nonfinite or overflowing elements.
@@ -357,14 +288,16 @@ pub fn dot_q8_0_row(caps: Arm64QuantCaps, w_row: &[u8], act: &[Q8_0ActBlock]) ->
     if w_row.len() != act.len() * Q8_0_BLOCK_BYTES {
         return 0.0;
     }
-    #[cfg(target_arch = "aarch64")]
-    if caps.dotprod
-        && let Some(sum) = crate::native::quant_dot_q8_0_row(w_row, act)
-    {
+    if caps.dotprod {
+        let mut sum = 0.0_f32;
+        for (wb, ab) in w_row.as_chunks::<34>().0.iter().zip(act.iter()) {
+            let w_d = f16_bits_to_f32([wb[0], wb[1]]);
+            let w_quants = &wb[2..].as_chunks::<32>().0[0];
+            let int_sum = bonsai_neon_dot::dot_q8_0_block(w_quants, &ab.qs);
+            sum += w_d * (ab.d * i32_to_f32(int_sum));
+        }
         return sum;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = caps;
     portable_dot_q8_0_row(w_row, act)
 }
 
@@ -375,14 +308,24 @@ pub fn dot_q8_0_4rows(caps: Arm64QuantCaps, rows: [&[u8]; 4], act: &[Q8_0ActBloc
     if rows.iter().any(|row| row.len() != expected) {
         return [0.0; 4];
     }
-    #[cfg(target_arch = "aarch64")]
-    if caps.dotprod
-        && let Some(sums) = crate::native::quant_dot_q8_0_4rows(rows, act)
-    {
-        return sums;
+    if caps.dotprod {
+        let mut acc = [0.0_f32; 4];
+        let r0 = rows[0].as_chunks::<34>().0;
+        let r1 = rows[1].as_chunks::<34>().0;
+        let r2 = rows[2].as_chunks::<34>().0;
+        let r3 = rows[3].as_chunks::<34>().0;
+        for (idx, ab) in act.iter().enumerate() {
+            let blocks = [&r0[idx], &r1[idx], &r2[idx], &r3[idx]];
+            let d_bits: [u16; 4] = blocks.map(|b| u16::from_le_bytes([b[0], b[1]]));
+            let d_vals = bonsai_neon_dot::widen_f16_four(&d_bits);
+            for row_idx in 0..4 {
+                let w_quants = &blocks[row_idx][2..].as_chunks::<32>().0[0];
+                let int_sum = bonsai_neon_dot::dot_q8_0_block(w_quants, &ab.qs);
+                acc[row_idx] += d_vals[row_idx] * (ab.d * i32_to_f32(int_sum));
+            }
+        }
+        return acc;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = caps;
     rows.map(|row| portable_dot_q8_0_row(row, act))
 }
 
@@ -398,11 +341,24 @@ pub fn gemm_q8_0_4x2(
     if act0.len() != act1.len() || rows.iter().any(|row| row.len() != expected) {
         return [[0.0; 2]; 4];
     }
-    #[cfg(target_arch = "aarch64")]
-    if caps.i8mm
-        && let Some(tile) = crate::native::quant_gemm_q8_0_4x2(rows, act0, act1)
-    {
-        return tile;
+    if caps.i8mm {
+        let mut acc = [[0.0_f32; 2]; 4];
+        let r0 = rows[0].as_chunks::<34>().0;
+        let r1 = rows[1].as_chunks::<34>().0;
+        let r2 = rows[2].as_chunks::<34>().0;
+        let r3 = rows[3].as_chunks::<34>().0;
+        for (idx, (ab0, ab1)) in act0.iter().zip(act1.iter()).enumerate() {
+            let blocks = [&r0[idx], &r1[idx], &r2[idx], &r3[idx]];
+            let w_quants = blocks.map(|b| &b[2..].as_chunks::<32>().0[0]);
+            let tile = bonsai_neon_dot::smmla_q8_0_4x2(w_quants, [&ab0.qs, &ab1.qs]);
+            let d_bits: [u16; 4] = blocks.map(|b| u16::from_le_bytes([b[0], b[1]]));
+            let d_vals = bonsai_neon_dot::widen_f16_four(&d_bits);
+            for row_idx in 0..4 {
+                acc[row_idx][0] += d_vals[row_idx] * (ab0.d * i32_to_f32(tile[row_idx][0]));
+                acc[row_idx][1] += d_vals[row_idx] * (ab1.d * i32_to_f32(tile[row_idx][1]));
+            }
+        }
+        return acc;
     }
     let col0 = dot_q8_0_4rows(caps, rows, act0);
     let col1 = dot_q8_0_4rows(caps, rows, act1);
@@ -877,7 +833,7 @@ mod tests {
         for bits in 0..=u16::MAX {
             let four =
                 std::array::from_fn(|i| bits.wrapping_add(u16::from(i.to_le_bytes()[0]) * 17));
-            let expected4 = four.map(scalar_widen_f16);
+            let expected4 = four.map(bonsai_ternary::half_to_float);
             assert_eq!(
                 widen_f16_four(&four).map(f32::to_bits),
                 expected4.map(f32::to_bits)
@@ -885,10 +841,12 @@ mod tests {
             let eight =
                 std::array::from_fn(|i| bits.wrapping_add(u16::from(i.to_le_bytes()[0]) * 8191));
             let actual8 = widen_f16_eight(&eight).map(|g| g.map(f32::to_bits));
-            assert_eq!(
-                actual8,
-                portable_widen_f16_eight(&eight).map(|g| g.map(f32::to_bits))
-            );
+            let expected8: [[u32; 4]; 2] = std::array::from_fn(|group| {
+                std::array::from_fn(|lane| {
+                    bonsai_ternary::half_to_float(eight[group * 4 + lane]).to_bits()
+                })
+            });
+            assert_eq!(actual8, expected8);
             let mag = bits & 0x7fff;
             if mag < 0x7c00 {
                 let widened = widen_f16_four(&[bits, bits ^ 0x8000, 0x0000, 0x8000]);

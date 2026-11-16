@@ -96,6 +96,25 @@ impl RowWorkerPool {
         self.0.run_aligned(out, active_workers, alignment, compute);
     }
 
+    /// Fallible counterpart to [`Self::run_aligned`], joining every chunk and returning
+    /// the smallest-`offset` error deterministically when any slice fails.
+    ///
+    /// # Errors
+    /// Propagates the smallest-`offset` I/O error returned by `compute`.
+    pub fn try_run_aligned<F>(
+        &self,
+        out: &mut [f32],
+        active_workers: usize,
+        alignment: usize,
+        compute: &F,
+    ) -> io::Result<()>
+    where
+        F: Fn(usize, &mut [f32]) -> io::Result<()> + Sync,
+    {
+        self.0
+            .try_run_aligned(out, active_workers, alignment, compute)
+    }
+
     /// Partition `out` across up to `active_workers` with single-element granularity.
     pub fn run<F>(&self, out: &mut [f32], active_workers: usize, compute: &F)
     where
@@ -2281,6 +2300,25 @@ mod storage_budget_tests {
         for (idx, &val) in outer.iter().enumerate() {
             assert_eq!(val, u16::try_from(idx).map_or(0.0, f32::from) + 1.0);
         }
+
+        let mut fallible = vec![0.0_f32; 32];
+        pool.try_run_aligned(&mut fallible, 4, 8, &|offset, slice| {
+            for (idx, slot) in slice.iter_mut().enumerate() {
+                *slot = u16::try_from(offset + idx).map_or(0.0, f32::from);
+            }
+            Ok(())
+        })?;
+        for (idx, &val) in fallible.iter().enumerate() {
+            assert_eq!(val, u16::try_from(idx).map_or(0.0, f32::from));
+        }
+
+        let err = pool.try_run_aligned(&mut fallible, 4, 8, &|offset, _slice| {
+            if offset >= 8 {
+                return Err(io::Error::other(format!("fail-{offset}")));
+            }
+            Ok(())
+        });
+        assert_eq!(err.err().map(|e| e.to_string()), Some("fail-8".to_owned()));
         Ok(())
     }
 }
