@@ -21,6 +21,18 @@ struct Reply {
     done: bool,
 }
 
+const LINE_DATA_HIGH_WATER_BYTES: usize = 16 * 1024;
+const LINE_DATA_RETAINED_BYTES: usize = 4 * 1024;
+const EVENT_HIGH_WATER_BYTES: usize = 1024;
+const EVENT_RETAINED_BYTES: usize = 128;
+
+fn clear_and_shrink(buffer: &mut Vec<u8>, high_water: usize, retained: usize) {
+    buffer.clear();
+    if buffer.capacity() > high_water {
+        buffer.shrink_to(retained);
+    }
+}
+
 #[derive(Default)]
 struct Framer {
     bom_bytes: u8,
@@ -172,8 +184,16 @@ impl Framer {
     // or enqueue its text before the next call recycles that storage.
     fn next_event(&mut self, bytes: &mut &[u8]) -> Result<Option<Frame<'_>>> {
         if self.dispatched {
-            self.data.clear();
-            self.event.clear();
+            clear_and_shrink(
+                &mut self.data,
+                LINE_DATA_HIGH_WATER_BYTES,
+                LINE_DATA_RETAINED_BYTES,
+            );
+            clear_and_shrink(
+                &mut self.event,
+                EVENT_HIGH_WATER_BYTES,
+                EVENT_RETAINED_BYTES,
+            );
             self.dispatched = false;
         }
         while !bytes.is_empty() {
@@ -243,14 +263,22 @@ impl Framer {
             self.after_cr = byte == b'\r';
             if self.line.is_empty() {
                 if self.data.is_empty() {
-                    self.event.clear();
+                    clear_and_shrink(
+                        &mut self.event,
+                        EVENT_HIGH_WATER_BYTES,
+                        EVENT_RETAINED_BYTES,
+                    );
                 } else {
                     self.data.pop();
                     return Ok(true);
                 }
             } else {
                 self.process_line()?;
-                self.line.clear();
+                clear_and_shrink(
+                    &mut self.line,
+                    LINE_DATA_HIGH_WATER_BYTES,
+                    LINE_DATA_RETAINED_BYTES,
+                );
             }
         } else {
             if self.line.len() == MAX_EVENT {
@@ -284,7 +312,11 @@ impl Framer {
                 self.data.push(b'\n');
             }
             b"event" => {
-                self.event.clear();
+                clear_and_shrink(
+                    &mut self.event,
+                    EVENT_HIGH_WATER_BYTES,
+                    EVENT_RETAINED_BYTES,
+                );
                 self.event.extend_from_slice(value);
             }
             // id/retry affect reconnection only. Requests are never replayed:
@@ -575,6 +607,37 @@ mod tests {
             assert_eq!(frame.data, b"accepted");
             assert!(framer.next_event(&mut bytes)?.is_none());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn framer_shrinks_oversized_line_data_and_event_buffers_after_burst() -> Result<()> {
+        let mut framer = Framer::default();
+        let big_event = vec![b'e'; 4 * 1024];
+        let big_payload = vec![b'x'; 64 * 1024];
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"event: ");
+        wire.extend_from_slice(&big_event);
+        wire.extend_from_slice(b"\ndata: ");
+        wire.extend_from_slice(&big_payload);
+        wire.extend_from_slice(b"\n\n");
+        let mut slice = wire.as_slice();
+        let frame = framer
+            .next_event(&mut slice)?
+            .ok_or(Failure::Message("Missing oversized frame"))?;
+        assert_eq!(frame.data.len(), 64 * 1024);
+        assert_eq!(frame.event.len(), 4 * 1024);
+        assert!(framer.line.capacity() <= LINE_DATA_HIGH_WATER_BYTES);
+
+        let mut follow_up = b"event: message\ndata: ok\n\n".as_slice();
+        let frame = framer
+            .next_event(&mut follow_up)?
+            .ok_or(Failure::Message("Missing follow-up frame"))?;
+        assert_eq!(frame.event, b"message");
+        assert_eq!(frame.data, b"ok");
+        assert!(framer.line.capacity() <= LINE_DATA_HIGH_WATER_BYTES);
+        assert!(framer.data.capacity() <= LINE_DATA_HIGH_WATER_BYTES);
+        assert!(framer.event.capacity() <= EVENT_HIGH_WATER_BYTES);
         Ok(())
     }
 }
