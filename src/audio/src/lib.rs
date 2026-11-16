@@ -8,9 +8,15 @@
 
 use std::{error::Error, fmt};
 
+mod loudness;
 mod segmentation;
 mod vad;
 
+pub use loudness::{
+    LoudnessError, LoudnessMatchedListeningWav, LoudnessObservation, MAX_LOUDNESS_SAMPLE_RATE,
+    MIN_LOUDNESS_SAMPLE_RATE, build_loudness_matched_listening_wav, measure_loudness_f32,
+    measure_loudness_mono_pcm16_wav,
+};
 pub use segmentation::{pcm16_pause_boundary, pcm16_pause_boundary_adaptive};
 pub use vad::{VadConfig, VadFrameStatus, VoiceActivityDetector};
 
@@ -274,6 +280,32 @@ pub fn mono_pcm16_header_checked(
         return Err(WavError::InvalidSamples);
     }
     mono_pcm16_header(sample_rate, samples.len()).ok_or(WavError::InvalidSamples)
+}
+
+/// Frames finite normalized `f32` samples into a canonical mono PCM16 WAV byte vector.
+///
+/// # Errors
+/// Returns [`WavError::InvalidSamples`] when samples are empty, non-finite, exceed
+/// `maximum_samples`, or cannot be framed at `sample_rate`, or
+/// [`WavError::AllocationFailed`] / [`WavError::BufferTooSmall`] if the buffer cannot be reserved.
+pub fn mono_pcm16_wav_bytes(
+    samples: &[f32],
+    sample_rate: u32,
+    maximum_samples: usize,
+) -> Result<Vec<u8>, WavError> {
+    let header = mono_pcm16_header_checked(samples, sample_rate, maximum_samples)?;
+    let pcm_bytes = samples.len().checked_mul(2).ok_or(WavError::BufferTooSmall)?;
+    let total_bytes = header
+        .len()
+        .checked_add(pcm_bytes)
+        .ok_or(WavError::BufferTooSmall)?;
+    let mut wave = Vec::new();
+    wave.try_reserve_exact(total_bytes)
+        .map_err(|_| WavError::AllocationFailed)?;
+    wave.extend_from_slice(&header);
+    wave.resize(total_bytes, 0);
+    encode_pcm16le_into(samples, &mut wave[44..])?;
+    Ok(wave)
 }
 
 /// Decodes little-endian signed 16-bit PCM bytes into normalized `f32` samples.
