@@ -295,7 +295,7 @@ fn synthesis_observer_completed_guard_resets_stream_but_retains_warm_reuse() -> 
     let mut synthesizer = warm_synthesizer()?;
     drop(SynthesisGuard {
         synthesizer: &mut synthesizer,
-        complete: true,
+        retain_warm: true,
     });
     assert!(synthesizer.voices.0.is_some());
     assert!(synthesizer.codec.primed.is_some());
@@ -304,7 +304,7 @@ fn synthesis_observer_completed_guard_resets_stream_but_retains_warm_reuse() -> 
 }
 
 #[test]
-fn synthesis_stream_cancellable_stops_before_priming_and_discards_warm_reuse() -> io::Result<()> {
+fn synthesis_stream_cancellable_stops_before_priming_and_retains_warm_reuse() -> io::Result<()> {
     let mut synthesizer = warm_synthesizer()?;
     let mut checks = 0_usize;
     let mut delivered = 0_usize;
@@ -323,6 +323,13 @@ fn synthesis_stream_cancellable_stops_before_priming_and_discards_warm_reuse() -
     assert!(result.is_err_and(|error| error.kind() == io::ErrorKind::Interrupted));
     assert_eq!(checks, 1);
     assert_eq!(delivered, 0);
+    assert!(synthesizer.voices.0.is_some());
+    assert!(synthesizer.codec.primed.is_some());
+    assert_stream_reset(&synthesizer.codec);
+
+    // Non-cooperative failures (without cancel returning an error) still discard warm reuse.
+    let err = synthesizer.synthesize_stream("hello", "warm", &mut |_| Ok(()));
+    assert!(err.is_err());
     assert!(synthesizer.voices.0.is_none());
     assert!(synthesizer.codec.primed.is_none());
     assert_stream_reset(&synthesizer.codec);

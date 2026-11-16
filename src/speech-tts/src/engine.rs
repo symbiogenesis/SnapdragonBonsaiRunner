@@ -74,6 +74,15 @@ impl StreamChunkConfig {
         }
     }
 
+    /// Dyadic latency ramp (`1 -> 2 -> 4 -> 8` frames) for `80` ms TTFA converging to `640` ms chunks.
+    #[must_use]
+    pub const fn dyadic_ramp() -> Self {
+        Self {
+            first_chunk_frames: 1,
+            steady_chunk_frames: 8,
+        }
+    }
+
     /// Validate that both first and steady chunk sizes lie within `MIN_STREAM_CHUNK_FRAMES..=MAX_STREAM_CHUNK_FRAMES`.
     pub fn validate(self) -> io::Result<Self> {
         if self.first_chunk_frames < MIN_STREAM_CHUNK_FRAMES
@@ -97,6 +106,19 @@ impl StreamChunkConfig {
         } else {
             self.steady_chunk_frames
         }
+    }
+
+    /// Progressive target frame count (`first -> 2*first -> 4*first -> steady`, capped at `steady`).
+    #[must_use]
+    pub const fn dyadic_frames_for_chunk(self, chunk_index: usize) -> usize {
+        let cap = self.steady_chunk_frames;
+        let scaled = match chunk_index {
+            0 => self.first_chunk_frames,
+            1 => self.first_chunk_frames.saturating_mul(2),
+            2 => self.first_chunk_frames.saturating_mul(4),
+            _ => cap,
+        };
+        if scaled < cap { scaled } else { cap }
     }
 }
 /// Total RVQ codebooks per 12.5 Hz frame (`1` semantic + `15` acoustic = `16`).
@@ -3931,6 +3953,11 @@ mod tests {
         assert_eq!(
             super::StreamChunkConfig::standard_8_frame().frames_for_chunk(0),
             8
+        );
+        let dyadic = super::StreamChunkConfig::dyadic_ramp().validate()?;
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(|idx| dyadic.dyadic_frames_for_chunk(idx)),
+            [1, 2, 4, 8, 8]
         );
 
         let proj_par = LinearProjection::new(

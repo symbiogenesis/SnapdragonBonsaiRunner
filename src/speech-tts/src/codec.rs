@@ -85,6 +85,8 @@ pub struct CodecDecodeScratch {
     pub(crate) pre_out: Vec<f32>,
     pub(crate) upsample_a: Vec<f32>,
     pub(crate) upsample_b: Vec<f32>,
+    pub(crate) flat_codes: Vec<i32>,
+    pub(crate) latents: Vec<f32>,
     pub(crate) dac: DacDecodeScratch,
 }
 
@@ -306,33 +308,126 @@ fn trans_conv1d_scatter_frame_simd<S: Simd>(
     raw_window: &mut [f32],
 ) {
     let oc_quads = out_c / 4;
-    for (ic, &x) in in_row.iter().enumerate() {
-        let xv = f32x4::splat(simd, x);
-        let ic_w_base = ic * out_c * kernel;
+    let oc_k_stride = out_c * kernel;
+    let (in_quads, in_rem) = in_row.as_chunks::<4>();
+    let tail_ic_start = in_quads.len() * 4;
+    for k in kernel_range.clone() {
+        let dst_row_off = (k - kernel_range.start) * out_c;
         for q_idx in 0..oc_quads {
             let oc_base = q_idx * 4;
-            let w0 = &weight[ic_w_base + oc_base * kernel..ic_w_base + (oc_base + 1) * kernel];
-            let w1 =
-                &weight[ic_w_base + (oc_base + 1) * kernel..ic_w_base + (oc_base + 2) * kernel];
-            let w2 =
-                &weight[ic_w_base + (oc_base + 2) * kernel..ic_w_base + (oc_base + 3) * kernel];
-            let w3 =
-                &weight[ic_w_base + (oc_base + 3) * kernel..ic_w_base + (oc_base + 4) * kernel];
-            for k in kernel_range.clone() {
-                let dst_base = (k - kernel_range.start) * out_c + oc_base;
-                let dst = &mut raw_window[dst_base..dst_base + 4];
-                let wv = f32x4::from_slice(simd, &[w0[k], w1[k], w2[k], w3[k]]);
-                let rv = f32x4::from_slice(simd, dst);
-                xv.mul_add(wv, rv).store_slice(dst);
+            let dst = &mut raw_window[dst_row_off + oc_base..dst_row_off + oc_base + 4];
+            let mut rv = f32x4::from_slice(simd, dst);
+            let oc_off = oc_base * kernel + k;
+            for (ic_q, &[x0, x1, x2, x3]) in in_quads.iter().enumerate() {
+                let ic = ic_q * 4;
+                let w_quad = |idx: usize| -> f32x4<S> {
+                    let b = idx * oc_k_stride + oc_off;
+                    f32x4::from_slice(
+                        simd,
+                        &[
+                            weight[b],
+                            weight[b + kernel],
+                            weight[b + 2 * kernel],
+                            weight[b + 3 * kernel],
+                        ],
+                    )
+                };
+                // Retain exact t -> ic -> FMA accumulation order while keeping
+                // the 4-channel accumulator live in one SIMD register.
+                rv = f32x4::splat(simd, x0).mul_add(w_quad(ic), rv);
+                rv = f32x4::splat(simd, x1).mul_add(w_quad(ic + 1), rv);
+                rv = f32x4::splat(simd, x2).mul_add(w_quad(ic + 2), rv);
+                rv = f32x4::splat(simd, x3).mul_add(w_quad(ic + 3), rv);
             }
+            for (rel_ic, &x) in in_rem.iter().enumerate() {
+                let b = (tail_ic_start + rel_ic) * oc_k_stride + oc_off;
+                let wv = f32x4::from_slice(
+                    simd,
+                    &[
+                        weight[b],
+                        weight[b + kernel],
+                        weight[b + 2 * kernel],
+                        weight[b + 3 * kernel],
+                    ],
+                );
+                rv = f32x4::splat(simd, x).mul_add(wv, rv);
+            }
+            rv.store_slice(dst);
         }
         for oc in (oc_quads * 4)..out_c {
-            let w_base = ic_w_base + oc * kernel;
-            for k in kernel_range.clone() {
-                let dst_idx = (k - kernel_range.start) * out_c + oc;
-                raw_window[dst_idx] = x.mul_add(weight[w_base + k], raw_window[dst_idx]);
+            let dst_idx = dst_row_off + oc;
+            let mut sum = raw_window[dst_idx];
+            let oc_off = oc * kernel + k;
+            for (ic, &x) in in_row.iter().enumerate() {
+                sum = x.mul_add(weight[ic * oc_k_stride + oc_off], sum);
+            }
+            raw_window[dst_idx] = sum;
+        }
+    }
+}
+
+#[inline(always)]
+fn snake_beta_row_simd<S: Simd>(simd: S, row: &mut [f32], a: &[f32], inv_b: &[f32]) {
+    // Three Cody-Waite pi parts where PI1/PI2 retain 14 trailing mantissa zero
+    // bits so `k * PI1` and `k * PI2` remain exact in `f32` up to `|k| <= 16_384`
+    // (`|z| <= 32_768`). Because `sin^2(r + k * pi) == sin^2(r)` for every integer
+    // `k`, no quadrant sign correction is needed before squaring `sin(r)`.
+    const INV_PI: f32 = std::f32::consts::FRAC_1_PI;
+    const PI1: f32 = f32::from_bits(0x4049_0000);
+    const PI2: f32 = f32::from_bits(0x3a7d_a000);
+    const PI3: f32 = f32::from_bits(0x3422_2169);
+    const RANGE_LIMIT: f32 = 32_768.0;
+    const C3: f32 = f32::from_bits(0xbe2a_aaab);
+    const C5: f32 = f32::from_bits(0x3c08_8889);
+    const C7: f32 = f32::from_bits(0xb950_0d01);
+    const C9: f32 = f32::from_bits(0x3638_ef1d);
+    const C11: f32 = f32::from_bits(0xb2d7_322b);
+    const C13: f32 = f32::from_bits(0x2f30_9231);
+
+    let inv_pi_v = f32x4::splat(simd, INV_PI);
+    let neg_pi1_v = f32x4::splat(simd, -PI1);
+    let neg_pi2_v = f32x4::splat(simd, -PI2);
+    let neg_pi3_v = f32x4::splat(simd, -PI3);
+    let c3_v = f32x4::splat(simd, C3);
+    let c5_v = f32x4::splat(simd, C5);
+    let c7_v = f32x4::splat(simd, C7);
+    let c9_v = f32x4::splat(simd, C9);
+    let c11_v = f32x4::splat(simd, C11);
+    let c13_v = f32x4::splat(simd, C13);
+
+    let (row_q, row_rem) = row.as_chunks_mut::<4>();
+    let (a_q, a_rem) = a.as_chunks::<4>();
+    let (ib_q, ib_rem) = inv_b.as_chunks::<4>();
+    for ((rq, aq), ibq) in row_q.iter_mut().zip(a_q).zip(ib_q) {
+        let x = f32x4::from_slice(simd, rq);
+        let z = f32x4::from_slice(simd, aq) * x;
+        let z_lanes: [f32; 4] = z.into();
+        if z_lanes.iter().all(|v| v.abs() <= RANGE_LIMIT) {
+            let k = (z * inv_pi_v).round_ties_even();
+            let mut r = neg_pi1_v.mul_add(k, z);
+            r = neg_pi2_v.mul_add(k, r);
+            r = neg_pi3_v.mul_add(k, r);
+            let u = r * r;
+            let mut p = c13_v.mul_add(u, c11_v);
+            p = p.mul_add(u, c9_v);
+            p = p.mul_add(u, c7_v);
+            p = p.mul_add(u, c5_v);
+            p = p.mul_add(u, c3_v);
+            let s = (r * u).mul_add(p, r);
+            let ib = f32x4::from_slice(simd, ibq);
+            (s * s).mul_add(ib, x).store_slice(rq);
+        } else {
+            for ((slot, &a_v), &ib_v) in rq.iter_mut().zip(aq).zip(ibq) {
+                let x_s = *slot;
+                let s = (a_v * x_s).sin();
+                *slot = (s * s).mul_add(ib_v, x_s);
             }
         }
+    }
+    for ((slot, &a_v), &ib_v) in row_rem.iter_mut().zip(a_rem).zip(ib_rem) {
+        let x_s = *slot;
+        let s = (a_v * x_s).sin();
+        *slot = (s * s).mul_add(ib_v, x_s);
     }
 }
 
@@ -1020,13 +1115,7 @@ impl SnakeBeta {
         if frames == 0 || channels == 0 {
             return Ok(());
         }
-        let apply_row = |row: &mut [f32]| {
-            for ((slot, &a), &inv_b) in row.iter_mut().zip(&self.a).zip(&self.inv_b) {
-                let x = *slot;
-                let s = (a * x).sin();
-                *slot = (s * s).mul_add(inv_b, x);
-            }
-        };
+        let level = Level::new();
         let workers = if frames <= 1 || data.len() < 4096 {
             1
         } else {
@@ -1034,12 +1123,12 @@ impl SnakeBeta {
         };
         if workers <= 1 {
             for row in data.chunks_exact_mut(channels) {
-                apply_row(row);
+                dispatch!(level, simd => snake_beta_row_simd(simd, row, &self.a, &self.inv_b));
             }
         } else {
             row_workers::run_aligned(data, workers, channels, &|_, slice| {
                 for row in slice.chunks_exact_mut(channels) {
-                    apply_row(row);
+                    dispatch!(level, simd => snake_beta_row_simd(simd, row, &self.a, &self.inv_b));
                 }
             });
         }
@@ -2494,6 +2583,34 @@ mod tests {
                 seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "threads {threads}",
             );
+        }
+        // Verify SIMD sin^2 accuracy against f64 across signed values, non-quad tail, and fallback.
+        let test_channels = 7_usize;
+        let test_snake = SnakeBeta {
+            a: vec![1.0, 2.5, 100.0, 0.5, 40_000.0, 3.0, 1.25],
+            inv_b: vec![0.25, 0.5, 1.0, 0.75, 0.5, 0.25, 0.8],
+        };
+        let inputs = vec![
+            0.5_f32, -0.75, 327.675, -0.0, 1.0, 10.5, -3.15, -1.5, 1.5, -10.0, 2.0, -2.0, 0.0,
+            0.125,
+        ];
+        let mut actual = inputs.clone();
+        test_snake.apply_in_place(&mut actual, 2)?;
+        for frame in 0..2 {
+            for ch in 0..test_channels {
+                let raw_x = inputs[frame * test_channels + ch];
+                let z = f64::from(test_snake.a[ch] * raw_x);
+                let x = f64::from(raw_x);
+                let ib = f64::from(test_snake.inv_b[ch]);
+                let s = z.sin();
+                let expected = s * s * ib + x;
+                let got = f64::from(actual[frame * test_channels + ch]);
+                let tol = 3.0e-7_f64.max(expected.abs() * 3.0e-7);
+                assert!(
+                    (got - expected).abs() <= tol,
+                    "frame={frame} ch={ch} got={got} expected={expected}"
+                );
+            }
         }
         Ok(())
     }

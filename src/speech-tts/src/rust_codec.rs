@@ -465,9 +465,11 @@ impl Transformer {
         let append = TransformerAppend::new(state, stride, self.window)?;
         let state = &mut *append.state;
         if state.layers.is_empty() {
-            state
-                .layers
-                .resize_with(self.layers.len(), KvState::default);
+            let reserve = self.window.map_or(0, |w| (w + 1).saturating_mul(stride));
+            state.layers.resize_with(self.layers.len(), || KvState {
+                keys: Vec::with_capacity(reserve),
+                values: Vec::with_capacity(reserve),
+            });
         }
         if state.layers.len() != self.layers.len() {
             return Err(invalid());
@@ -1428,6 +1430,151 @@ impl Codec {
         self.decode_stream_cancellable(codes, cancel)
     }
 
+    fn step_codec_batch(
+        &mut self,
+        codes: &[[i32; 16]],
+        run_audio: bool,
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+        mut out: Option<&mut Vec<f32>>,
+    ) -> io::Result<()> {
+        let count = codes.len();
+        if count == 0 {
+            return Ok(());
+        }
+        // Only Qwen3-TTS `kernel == stride` upsample stages are carry-free across
+        // arbitrary batch boundaries; fall back per-frame if any stage carries overlap.
+        if run_audio
+            && count > 1
+            && self
+                .upsample
+                .iter()
+                .any(|stage| stage.conv.carry_frames() != 0)
+        {
+            for row in codes {
+                self.step_codec_batch(std::slice::from_ref(row), true, cancel, out.as_deref_mut())?;
+            }
+            return Ok(());
+        }
+
+        cancel()?;
+        if count == 1 {
+            self.quantizer
+                .decode_into(&codes[0], 1, &mut self.decode_scratch)?;
+        } else {
+            let mut flat = std::mem::take(&mut self.decode_scratch.flat_codes);
+            flat.clear();
+            let needed_codes = count * 16;
+            if flat.capacity() < needed_codes {
+                flat.reserve(needed_codes - flat.capacity());
+            }
+            for row in codes {
+                flat.extend_from_slice(row);
+            }
+            let decoded = self
+                .quantizer
+                .decode_into(&flat, count, &mut self.decode_scratch);
+            self.decode_scratch.flat_codes = flat;
+            decoded?;
+        }
+        self.pre.forward_stream_into(
+            &self.decode_scratch.rvq_sem_out,
+            count,
+            &mut self.state.audio.pre_conv,
+            self.threads,
+            &mut self.decode_scratch.conv_ext,
+            &mut self.decode_scratch.pre_out,
+        )?;
+        let pre_width = self.decode_scratch.pre_out.len() / count;
+        if pre_width == 0 || pre_width * count != self.decode_scratch.pre_out.len() {
+            return Err(invalid());
+        }
+        self.decode_scratch.latents.clear();
+        for t in 0..count {
+            cancel()?;
+            let pre_row = &self.decode_scratch.pre_out[t * pre_width..(t + 1) * pre_width];
+            let latent = self.transformer.step_with_scratch(
+                pre_row,
+                &mut self.state.transformer,
+                &mut self.transformer_scratch,
+            )?;
+            if run_audio {
+                if t == 0 {
+                    let need = count * latent.len();
+                    if self.decode_scratch.latents.capacity() < need {
+                        self.decode_scratch
+                            .latents
+                            .reserve(need - self.decode_scratch.latents.capacity());
+                    }
+                }
+                self.decode_scratch.latents.extend_from_slice(latent);
+            }
+        }
+        if !run_audio {
+            self.state.audio.pos = self
+                .state
+                .audio
+                .pos
+                .checked_add(count)
+                .ok_or_else(invalid)?;
+            return Ok(());
+        }
+
+        let mut frames = count;
+        let mut has_upsampled = false;
+        for (stage, context) in self.upsample.iter().zip(&mut self.state.audio.upsample_dw) {
+            cancel()?;
+            let input = if has_upsampled {
+                self.decode_scratch.upsample_b.as_slice()
+            } else {
+                self.decode_scratch.latents.as_slice()
+            };
+            let next_frames = stage.conv.forward_into(
+                input,
+                frames,
+                self.threads,
+                &mut self.decode_scratch.trans_carry,
+                &mut self.decode_scratch.upsample_a,
+            )?;
+            stage.block.forward_stream_into(
+                &self.decode_scratch.upsample_a,
+                next_frames,
+                context,
+                self.threads,
+                &mut self.decode_scratch.conv_ext,
+                &mut self.decode_scratch.upsample_b,
+            )?;
+            has_upsampled = true;
+            frames = next_frames;
+        }
+        cancel()?;
+        let dac_input = if has_upsampled {
+            self.decode_scratch.upsample_b.as_slice()
+        } else {
+            self.decode_scratch.latents.as_slice()
+        };
+        let samples = self.dac.forward_stream_with_dac_scratch(
+            dac_input,
+            frames,
+            &mut self.state.audio,
+            self.threads,
+            &mut self.decode_scratch.dac,
+        )?;
+        let expected_samples = count.checked_mul(TOKENIZER_HOP_24K).ok_or_else(invalid)?;
+        if samples.len() != expected_samples || !samples.iter().all(|value| value.is_finite()) {
+            return Err(invalid());
+        }
+        if let Some(output) = out {
+            output.extend_from_slice(samples);
+        }
+        self.state.audio.pos = self
+            .state
+            .audio
+            .pos
+            .checked_add(count)
+            .ok_or_else(invalid)?;
+        Ok(())
+    }
+
     pub(crate) fn decode_stream_cancellable(
         &mut self,
         codes: &[[i32; 16]],
@@ -1444,71 +1591,10 @@ impl Codec {
             return Err(invalid());
         }
         let mut output = Vec::with_capacity(codes.len() * TOKENIZER_HOP_24K);
-        // Execute one frame at a time so emission chunk boundaries cannot alter
-        // attention windows, convolution context, or floating-point grouping.
-        for row in codes {
-            cancel()?;
-            self.quantizer
-                .decode_into(row, 1, &mut self.decode_scratch)?;
-            self.pre.forward_stream_into(
-                &self.decode_scratch.rvq_sem_out,
-                1,
-                &mut self.state.audio.pre_conv,
-                self.threads,
-                &mut self.decode_scratch.conv_ext,
-                &mut self.decode_scratch.pre_out,
-            )?;
-            let latent = self.transformer.step_with_scratch(
-                &self.decode_scratch.pre_out,
-                &mut self.state.transformer,
-                &mut self.transformer_scratch,
-            )?;
-            let mut frames = 1;
-            let mut has_upsampled = false;
-            for (stage, context) in self.upsample.iter().zip(&mut self.state.audio.upsample_dw) {
-                cancel()?;
-                let input = if has_upsampled {
-                    self.decode_scratch.upsample_b.as_slice()
-                } else {
-                    latent
-                };
-                let next_frames = stage.conv.forward_into(
-                    input,
-                    frames,
-                    self.threads,
-                    &mut self.decode_scratch.trans_carry,
-                    &mut self.decode_scratch.upsample_a,
-                )?;
-                stage.block.forward_stream_into(
-                    &self.decode_scratch.upsample_a,
-                    next_frames,
-                    context,
-                    self.threads,
-                    &mut self.decode_scratch.conv_ext,
-                    &mut self.decode_scratch.upsample_b,
-                )?;
-                has_upsampled = true;
-                frames = next_frames;
-            }
-            cancel()?;
-            let dac_input = if has_upsampled {
-                self.decode_scratch.upsample_b.as_slice()
-            } else {
-                latent
-            };
-            let samples = self.dac.forward_stream_with_dac_scratch(
-                dac_input,
-                frames,
-                &mut self.state.audio,
-                self.threads,
-                &mut self.decode_scratch.dac,
-            )?;
-            if samples.len() != TOKENIZER_HOP_24K || !samples.iter().all(|value| value.is_finite())
-            {
-                return Err(invalid());
-            }
-            output.extend_from_slice(samples);
-            self.state.audio.pos = self.state.audio.pos.checked_add(1).ok_or_else(invalid)?;
+        // Bound batch size per DAC call so cooperative cancellation stays responsive
+        // during long reference decodes while streaming chunks run in one batch.
+        for chunk in codes.chunks(16) {
+            self.step_codec_batch(chunk, true, cancel, Some(&mut output))?;
         }
         Ok(output)
     }
@@ -1546,10 +1632,14 @@ impl Codec {
             return Ok(());
         }
         self.reset();
-        for row in codes {
-            cancel()?;
-            drop(self.decode_stream_cancellable(std::slice::from_ref(row), cancel)?);
+        // Causal history of `upsample + dac` is strictly `< 8` DAC frames (`<= 12`
+        // codec frames), so priming earlier frames only needs `quantizer + pre + transformer`
+        // before running the final `<= 12` frames through the full audio graph.
+        let audio_start = codes.len().saturating_sub(12);
+        for chunk in codes[..audio_start].chunks(16) {
+            self.step_codec_batch(chunk, false, cancel, None)?;
         }
+        self.step_codec_batch(&codes[audio_start..], true, cancel, None)?;
         self.primed = Some((codes.to_vec(), self.state.clone()));
         Ok(())
     }
@@ -2003,6 +2093,266 @@ mod tests {
                     "head_dim {head_dim} pos {pos}"
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tail_12_prime_and_batched_decode_match_full_decode_bits() -> std::io::Result<()> {
+        use crate::codec::{
+            CausalConv1d, CausalTransConv1d, CodecDecodeScratch, CodecStreamState, DacBlock,
+            DacDecoder, DacResUnit, PadMode, RvqDecoder, RvqGroup, SnakeBeta,
+        };
+        let rvq_group = |num_codebooks: usize| RvqGroup {
+            num_codebooks,
+            codebook_size: 4,
+            codebook_dim: 2,
+            hidden_dim: 2,
+            codebooks: (0..num_codebooks)
+                .map(|b| {
+                    vec![
+                        0.1 + f32::from(u8::try_from(b).unwrap_or(0)) * 0.01,
+                        -0.2,
+                        0.3,
+                        0.4,
+                        -0.15,
+                        0.25,
+                        0.05,
+                        -0.35,
+                    ]
+                })
+                .collect(),
+            out_proj_w: vec![1.0, 0.0, 0.0, 1.0],
+        };
+        let conv = |dilation: usize, gain: f32| CausalConv1d {
+            out_c: 2,
+            in_c: 2,
+            kernel: 3,
+            dilation,
+            stride: 1,
+            pad_mode: PadMode::Constant,
+            weight: vec![gain * 0.25; 2 * 2 * 3],
+            bias: Some(vec![0.01, -0.02]),
+        };
+        let res = |dilation: usize| -> std::io::Result<DacResUnit> {
+            Ok(DacResUnit {
+                act1: SnakeBeta::from_log_params(&[0.1, -0.2], &[0.0, 0.2])?,
+                conv1: conv(dilation, 0.5),
+                act2: SnakeBeta::from_log_params(&[0.2, 0.1], &[-0.1, 0.1])?,
+                conv2: CausalConv1d {
+                    out_c: 2,
+                    in_c: 2,
+                    kernel: 1,
+                    dilation: 1,
+                    stride: 1,
+                    pad_mode: PadMode::Constant,
+                    weight: vec![0.4, -0.1, 0.1, 0.4],
+                    bias: None,
+                },
+            })
+        };
+        let dac_blocks = [8, 5, 4, 3]
+            .into_iter()
+            .map(|stride| -> std::io::Result<DacBlock> {
+                Ok(DacBlock {
+                    snake1: SnakeBeta::from_log_params(&[0.0, 0.1], &[0.0, 0.0])?,
+                    trans_conv: CausalTransConv1d {
+                        in_c: 2,
+                        out_c: 2,
+                        kernel: 2 * stride,
+                        stride,
+                        weight: vec![0.05; 2 * 2 * 2 * stride],
+                        bias: Some(vec![0.0, 0.01]),
+                    },
+                    res_units: [res(1)?, res(3)?, res(9)?],
+                })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let make_codec = || -> std::io::Result<super::Codec> {
+            let upsamples = (0..2)
+                .map(|_| super::Upsample {
+                    conv: CausalTransConv1d {
+                        in_c: 2,
+                        out_c: 2,
+                        kernel: 2,
+                        stride: 2,
+                        weight: vec![0.125; 2 * 2 * 2],
+                        bias: Some(vec![0.0, -0.01]),
+                    },
+                    block: crate::codec::ConvNeXtBlock {
+                        channels: 2,
+                        kernel: 3,
+                        dw_weight: vec![0.05; 2 * 3],
+                        dw_bias: vec![0.0; 2],
+                        norm_w: vec![1.0; 2],
+                        norm_b: vec![0.0; 2],
+                        pwconv1_w: vec![0.02; 8 * 2],
+                        pwconv1_b: vec![0.0; 8],
+                        pwconv2_w: vec![0.02; 2 * 8],
+                        pwconv2_b: vec![0.0; 2],
+                        gamma: vec![0.1; 2],
+                    },
+                })
+                .collect();
+            Ok(super::Codec {
+                threads: 2,
+                weights_path: None,
+                quantizer: RvqDecoder {
+                    semantic: rvq_group(1),
+                    acoustic: rvq_group(15),
+                },
+                pre: conv(1, 0.5),
+                transformer: super::Transformer {
+                    threads: 2,
+                    hidden: 2,
+                    heads: 1,
+                    kv_heads: 1,
+                    head_dim: 2,
+                    window: Some(12),
+                    theta: 10_000.0,
+                    eps: 1e-5,
+                    input: None,
+                    output: None,
+                    final_norm: None,
+                    layers: vec![super::TransformerLayer {
+                        norm: vec![1.0; 2],
+                        norm_bias: None,
+                        q: crate::engine::LinearProjection::new(
+                            "q",
+                            2,
+                            2,
+                            crate::engine::WeightQuantization::F32(vec![0.2, 0.1, -0.1, 0.2]),
+                            None,
+                        )?,
+                        k: crate::engine::LinearProjection::new(
+                            "k",
+                            2,
+                            2,
+                            crate::engine::WeightQuantization::F32(vec![0.1, -0.2, 0.2, 0.1]),
+                            None,
+                        )?,
+                        v: crate::engine::LinearProjection::new(
+                            "v",
+                            2,
+                            2,
+                            crate::engine::WeightQuantization::F32(vec![0.3, 0.0, 0.0, 0.3]),
+                            None,
+                        )?,
+                        output: crate::engine::LinearProjection::new(
+                            "o",
+                            2,
+                            2,
+                            crate::engine::WeightQuantization::F32(vec![0.25, 0.0, 0.0, 0.25]),
+                            None,
+                        )?,
+                        attn_scale: vec![1.0; 2],
+                        ffn_norm: vec![1.0; 2],
+                        ffn_bias: None,
+                        gate: Some(crate::engine::LinearProjection::new(
+                            "g",
+                            2,
+                            2,
+                            crate::engine::WeightQuantization::F32(vec![0.2, 0.0, 0.0, 0.2]),
+                            None,
+                        )?),
+                        up: crate::engine::LinearProjection::new(
+                            "u",
+                            2,
+                            2,
+                            crate::engine::WeightQuantization::F32(vec![0.1, 0.1, -0.1, 0.1]),
+                            None,
+                        )?,
+                        down: crate::engine::LinearProjection::new(
+                            "d",
+                            2,
+                            2,
+                            crate::engine::WeightQuantization::F32(vec![0.2, 0.0, 0.0, 0.2]),
+                            None,
+                        )?,
+                        ffn_scale: vec![1.0; 2],
+                    }],
+                },
+                upsample: upsamples,
+                dac: DacDecoder {
+                    conv_pre: conv(1, 0.4),
+                    blocks: dac_blocks.clone(),
+                    snake_post: SnakeBeta::from_log_params(&[0.0, 0.0], &[0.0, 0.0])?,
+                    conv_post: CausalConv1d {
+                        out_c: 1,
+                        in_c: 2,
+                        kernel: 3,
+                        dilation: 1,
+                        stride: 1,
+                        pad_mode: PadMode::Constant,
+                        weight: vec![0.1; 6],
+                        bias: None,
+                    },
+                },
+                encoder: None,
+                state: super::DecodeState {
+                    audio: CodecStreamState {
+                        pos: 0,
+                        pre_conv: vec![0.0; 4],
+                        upsample_dw: vec![vec![0.0; 4], vec![0.0; 4]],
+                        dac_pre: vec![0.0; 4],
+                        dac_carry: [8, 5, 4, 3].into_iter().map(|s| vec![0.0; s * 2]).collect(),
+                        dac_ru: (0..4)
+                            .map(|_| [vec![0.0; 4], vec![0.0; 12], vec![0.0; 36]])
+                            .collect(),
+                        dac_post: vec![0.0; 4],
+                        ..CodecStreamState::default()
+                    },
+                    transformer: super::TransformerState::default(),
+                },
+                primed: None,
+                transformer_scratch: super::CodecTransformerScratch::default(),
+                decode_scratch: CodecDecodeScratch::default(),
+            })
+        };
+
+        let codes: Vec<[i32; 16]> = (0..20_usize)
+            .map(|t| std::array::from_fn(|b| i32::try_from((t + b) % 4).unwrap_or(0)))
+            .collect();
+        let mut full = make_codec()?;
+        let mut per_frame = Vec::new();
+        for row in &codes {
+            per_frame
+                .extend(full.decode_stream_cancellable(std::slice::from_ref(row), &mut || Ok(()))?);
+        }
+        let mut batched = make_codec()?;
+        let mut dyadic = Vec::new();
+        for (start, len) in [(0, 1), (1, 2), (3, 4), (7, 8), (15, 5)] {
+            dyadic.extend(
+                batched.decode_stream_cancellable(&codes[start..start + len], &mut || Ok(()))?,
+            );
+        }
+        assert_eq!(
+            dyadic.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            per_frame.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        let mut primed = make_codec()?;
+        primed.prime_reference(&codes)?;
+        assert_eq!(primed.state.audio.pos, full.state.audio.pos);
+        assert_eq!(primed.state.audio.pre_conv, full.state.audio.pre_conv);
+        assert_eq!(primed.state.audio.upsample_dw, full.state.audio.upsample_dw);
+        assert_eq!(primed.state.audio.dac_pre, full.state.audio.dac_pre);
+        assert_eq!(primed.state.audio.dac_carry, full.state.audio.dac_carry);
+        assert_eq!(primed.state.audio.dac_ru, full.state.audio.dac_ru);
+        assert_eq!(primed.state.audio.dac_post, full.state.audio.dac_post);
+        assert_eq!(
+            primed.state.transformer.position,
+            full.state.transformer.position
+        );
+        for (a, b) in primed
+            .state
+            .transformer
+            .layers
+            .iter()
+            .zip(&full.state.transformer.layers)
+        {
+            assert_eq!(a.keys, b.keys);
+            assert_eq!(a.values, b.values);
         }
         Ok(())
     }

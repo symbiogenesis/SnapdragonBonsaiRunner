@@ -251,11 +251,19 @@ pub struct MelSpectrogramExtractor {
     hann: Vec<f32>,
     dft_real: Vec<f32>,
     dft_imag: Vec<f32>,
+    fft_bitrev: Vec<usize>,
+    fft_cos: Vec<f32>,
+    fft_sin: Vec<f32>,
     mel_basis: Vec<f32>,
+    mel_extents: Vec<(usize, usize)>,
 }
 
 impl MelSpectrogramExtractor {
-    /// Bake the periodic Hann window, DFT basis, and Slaney triangular mel filterbank.
+    fn use_fft(&self) -> bool {
+        !self.fft_bitrev.is_empty()
+    }
+
+    /// Bake the periodic Hann window, DFT/FFT basis, and Slaney triangular mel filterbank.
     ///
     /// # Errors
     /// Rejects zero `n_fft`, `hop`, `n_mels`, or `n_fft < hop`.
@@ -285,21 +293,52 @@ impl MelSpectrogramExtractor {
             hann.push(0.5_f32 * (1.0_f32 - coefficient(phase.cos())));
         }
 
-        let mut dft_real = vec![0.0_f32; n_freq * cfg.n_fft];
-        let mut dft_imag = vec![0.0_f32; n_freq * cfg.n_fft];
-        for k in 0..n_freq {
-            let kf = f64::from(u32::try_from(k).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "DFT row exceeds u32.")
-            })?);
-            for n in 0..cfg.n_fft {
-                let nf = f64::from(u32::try_from(n).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "DFT column exceeds u32.")
-                })?);
-                let th = two_pi * kf * nf / n_fft_double;
-                dft_real[k * cfg.n_fft + n] = coefficient(th.cos());
-                dft_imag[k * cfg.n_fft + n] = coefficient(-th.sin());
+        let use_fft = cfg.n_fft.is_power_of_two() && cfg.n_fft >= 32;
+        let (dft_real, dft_imag, fft_bitrev, fft_cos, fft_sin) = if use_fft {
+            let half_n = cfg.n_fft / 2;
+            let bits = half_n.trailing_zeros();
+            let mut bitrev = Vec::with_capacity(half_n);
+            for i in 0..half_n {
+                let mut v = i;
+                let mut r = 0_usize;
+                for _ in 0..bits {
+                    r = (r << 1) | (v & 1);
+                    v >>= 1;
+                }
+                bitrev.push(r);
             }
-        }
+            let mut cos_t = Vec::with_capacity(half_n);
+            let mut sin_t = Vec::with_capacity(half_n);
+            for k in 0..half_n {
+                let kf = f64::from(u32::try_from(k).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "FFT twiddle index exceeds u32.",
+                    )
+                })?);
+                let th = two_pi * kf / n_fft_double;
+                cos_t.push(coefficient(th.cos()));
+                sin_t.push(coefficient(-th.sin()));
+            }
+            (Vec::new(), Vec::new(), bitrev, cos_t, sin_t)
+        } else {
+            let mut dft_real = vec![0.0_f32; n_freq * cfg.n_fft];
+            let mut dft_imag = vec![0.0_f32; n_freq * cfg.n_fft];
+            for k in 0..n_freq {
+                let kf = f64::from(u32::try_from(k).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "DFT row exceeds u32.")
+                })?);
+                for n in 0..cfg.n_fft {
+                    let nf = f64::from(u32::try_from(n).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "DFT column exceeds u32.")
+                    })?);
+                    let th = two_pi * kf * nf / n_fft_double;
+                    dft_real[k * cfg.n_fft + n] = coefficient(th.cos());
+                    dft_imag[k * cfg.n_fft + n] = coefficient(-th.sin());
+                }
+            }
+            (dft_real, dft_imag, Vec::new(), Vec::new(), Vec::new())
+        };
 
         let sr_f = usize_to_f32(usize::try_from(cfg.sample_rate).unwrap_or(24_000));
         let fmin = cfg.fmin.max(0.0);
@@ -324,17 +363,28 @@ impl MelSpectrogramExtractor {
         }
 
         let mut mel_basis = vec![0.0_f32; cfg.n_mels * n_freq];
+        let mut mel_extents = Vec::with_capacity(cfg.n_mels);
         for m in 0..cfg.n_mels {
             let lo = hz_pts[m];
             let md = hz_pts[m + 1];
             let hi = hz_pts[m + 2];
             let enorm = 2.0_f32 / (hi - lo).max(1e-9_f32);
+            let row_start = m * n_freq;
             for (k, &f) in fft_freqs.iter().enumerate() {
                 let up = (f - lo) / (md - lo).max(1e-9_f32);
                 let down = (hi - f) / (hi - md).max(1e-9_f32);
                 let w = up.min(down).max(0.0_f32);
-                mel_basis[m * n_freq + k] = w * enorm;
+                mel_basis[row_start + k] = w * enorm;
             }
+            let row = &mel_basis[row_start..row_start + n_freq];
+            let extent = match (
+                row.iter().position(|&w| w != 0.0),
+                row.iter().rposition(|&w| w != 0.0),
+            ) {
+                (Some(first), Some(last)) => (first, last + 1),
+                _ => (0, 0),
+            };
+            mel_extents.push(extent);
         }
 
         Ok(Self {
@@ -343,7 +393,11 @@ impl MelSpectrogramExtractor {
             hann,
             dft_real,
             dft_imag,
+            fft_bitrev,
+            fft_cos,
+            fft_sin,
             mel_basis,
+            mel_extents,
         })
     }
 
@@ -376,9 +430,12 @@ impl MelSpectrogramExtractor {
             ));
         }
         let n_frames = (padded.len() - self.cfg.n_fft) / self.cfg.hop + 1;
-        let work = n_frames
-            .saturating_mul(self.n_freq)
-            .saturating_mul(self.cfg.n_fft);
+        let frame_work = if self.use_fft() {
+            self.cfg.n_fft * 12
+        } else {
+            self.n_freq.saturating_mul(self.cfg.n_fft)
+        };
+        let work = n_frames.saturating_mul(frame_work);
         let workers = if n_frames < 4 || work < 65_536 {
             1
         } else {
@@ -386,18 +443,33 @@ impl MelSpectrogramExtractor {
         };
         let mut log_mel = vec![0.0_f32; self.cfg.n_mels * n_frames];
         let level = Level::new();
+        let half_n = if self.use_fft() {
+            self.cfg.n_fft / 2
+        } else {
+            0
+        };
 
         if workers <= 1 {
             let mut windowed = vec![0.0_f32; self.cfg.n_fft];
+            let mut fft_re = vec![0.0_f32; half_n];
+            let mut fft_im = vec![0.0_f32; half_n];
             let mut mag_frame = vec![0.0_f32; self.n_freq];
             dispatch!(level, simd => {
                 for t in 0..n_frames {
                     let start = t * self.cfg.hop;
                     let frame = &padded[start..start + self.cfg.n_fft];
-                    self.compute_mel_magnitude_simd(simd, frame, &mut windowed, &mut mag_frame);
-                    for m in 0..self.cfg.n_mels {
-                        let basis_row = &self.mel_basis[m * self.n_freq..(m + 1) * self.n_freq];
-                        let sum = f32_dot_simd(simd, basis_row, &mag_frame);
+                    self.compute_mel_magnitude_simd(
+                        simd,
+                        frame,
+                        &mut windowed,
+                        &mut fft_re,
+                        &mut fft_im,
+                        &mut mag_frame,
+                    );
+                    for (m, &(b_start, b_end)) in self.mel_extents.iter().enumerate() {
+                        let basis_row =
+                            &self.mel_basis[m * self.n_freq + b_start..m * self.n_freq + b_end];
+                        let sum = f32_dot_simd(simd, basis_row, &mag_frame[b_start..b_end]);
                         log_mel[m * n_frames + t] = sum.max(1e-5_f32).ln();
                     }
                 }
@@ -413,16 +485,28 @@ impl MelSpectrogramExtractor {
             &|offset, slice| {
                 let first_frame = offset / self.cfg.n_mels;
                 let mut windowed = vec![0.0_f32; self.cfg.n_fft];
+                let mut fft_re = vec![0.0_f32; half_n];
+                let mut fft_im = vec![0.0_f32; half_n];
                 let mut mag_frame = vec![0.0_f32; self.n_freq];
                 dispatch!(level, simd => {
                     for (local_t, frame_out) in slice.chunks_exact_mut(self.cfg.n_mels).enumerate() {
                         let t = first_frame + local_t;
                         let start = t * self.cfg.hop;
                         let frame = &padded[start..start + self.cfg.n_fft];
-                        self.compute_mel_magnitude_simd(simd, frame, &mut windowed, &mut mag_frame);
-                        for (m, dst) in frame_out.iter_mut().enumerate() {
-                            let basis_row = &self.mel_basis[m * self.n_freq..(m + 1) * self.n_freq];
-                            let sum = f32_dot_simd(simd, basis_row, &mag_frame);
+                        self.compute_mel_magnitude_simd(
+                            simd,
+                            frame,
+                            &mut windowed,
+                            &mut fft_re,
+                            &mut fft_im,
+                            &mut mag_frame,
+                        );
+                        for (m, (dst, &(b_start, b_end))) in
+                            frame_out.iter_mut().zip(&self.mel_extents).enumerate()
+                        {
+                            let basis_row =
+                                &self.mel_basis[m * self.n_freq + b_start..m * self.n_freq + b_end];
+                            let sum = f32_dot_simd(simd, basis_row, &mag_frame[b_start..b_end]);
                             *dst = sum.max(1e-5_f32).ln();
                         }
                     }
@@ -447,14 +531,80 @@ impl MelSpectrogramExtractor {
         simd: S,
         frame: &[f32],
         windowed: &mut [f32],
+        fft_re: &mut [f32],
+        fft_im: &mut [f32],
         mag_frame: &mut [f32],
     ) {
         window_frame_simd(simd, frame, &self.hann, windowed);
+        if self.use_fft() {
+            self.real_fft_magnitudes(windowed, fft_re, fft_im, mag_frame);
+            return;
+        }
         for (k, mag_slot) in mag_frame.iter_mut().enumerate() {
             let re_row = &self.dft_real[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
             let im_row = &self.dft_imag[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
             let (re, im) = f32_dot_pair_simd(simd, windowed, re_row, im_row);
             *mag_slot = re.mul_add(re, im.mul_add(im, 1e-9_f32)).sqrt();
+        }
+    }
+
+    fn real_fft_magnitudes(
+        &self,
+        windowed: &[f32],
+        z_re: &mut [f32],
+        z_im: &mut [f32],
+        mag_frame: &mut [f32],
+    ) {
+        let half_n = z_re.len();
+        for (dst_idx, &src_idx) in self.fft_bitrev.iter().enumerate() {
+            z_re[dst_idx] = windowed[2 * src_idx];
+            z_im[dst_idx] = windowed[2 * src_idx + 1];
+        }
+        let mut size = 2_usize;
+        while size <= half_n {
+            let half = size / 2;
+            let tw_step = half_n / half;
+            for block in (0..half_n).step_by(size) {
+                for j in 0..half {
+                    let tw = j * tw_step;
+                    let wr = self.fft_cos[tw];
+                    let wi = self.fft_sin[tw];
+                    let even = block + j;
+                    let odd = even + half;
+                    let xr = z_re[odd];
+                    let xi = z_im[odd];
+                    let tr = wr.mul_add(xr, -wi * xi);
+                    let ti = wr.mul_add(xi, wi * xr);
+                    let er = z_re[even];
+                    let ei = z_im[even];
+                    z_re[even] = er + tr;
+                    z_im[even] = ei + ti;
+                    z_re[odd] = er - tr;
+                    z_im[odd] = ei - ti;
+                }
+            }
+            size <<= 1;
+        }
+        let mag = |re: f32, im: f32| re.mul_add(re, im.mul_add(im, 1e-9_f32)).sqrt();
+        mag_frame[0] = mag(z_re[0] + z_im[0], 0.0);
+        mag_frame[half_n] = mag(z_re[0] - z_im[0], 0.0);
+        let q = half_n / 2;
+        mag_frame[q] = mag(z_re[q], -z_im[q]);
+        for k in 1..q {
+            let rk = z_re[k];
+            let ik = z_im[k];
+            let rm = z_re[half_n - k];
+            let im = z_im[half_n - k];
+            let e_re = 0.5_f32 * (rk + rm);
+            let e_im = 0.5_f32 * (ik - im);
+            let o_re = 0.5_f32 * (ik + im);
+            let o_im = -0.5_f32 * (rk - rm);
+            let wr = self.fft_cos[k];
+            let wi = self.fft_sin[k];
+            let tr = wr.mul_add(o_re, -wi * o_im);
+            let ti = wr.mul_add(o_im, wi * o_re);
+            mag_frame[k] = mag(e_re + tr, e_im + ti);
+            mag_frame[half_n - k] = mag(e_re - tr, ti - e_im);
         }
     }
 }
@@ -606,13 +756,31 @@ impl TdnnConv1d {
                             ic += 1;
                         }
                     } else {
-                        for ic in 0..self.in_c {
-                            let in_row = &padded[ic * padded_frames..(ic + 1) * padded_frames];
-                            let w_base = (oc * self.in_c + ic) * self.kernel;
-                            for k in 0..self.kernel {
-                                let w = self.weight[w_base + k];
-                                let offset = k * self.dilation;
-                                axpy_simd(simd, w, &in_row[offset..offset + frames], out_row);
+                        for k in 0..self.kernel {
+                            let offset = k * self.dilation;
+                            let mut ic = 0;
+                            while ic + 4 <= self.in_c {
+                                let w0 = self.weight[(oc * self.in_c + ic) * self.kernel + k];
+                                let w1 = self.weight[(oc * self.in_c + ic + 1) * self.kernel + k];
+                                let w2 = self.weight[(oc * self.in_c + ic + 2) * self.kernel + k];
+                                let w3 = self.weight[(oc * self.in_c + ic + 3) * self.kernel + k];
+                                let r0 = &padded
+                                    [ic * padded_frames + offset..ic * padded_frames + offset + frames];
+                                let r1 = &padded[(ic + 1) * padded_frames + offset
+                                    ..(ic + 1) * padded_frames + offset + frames];
+                                let r2 = &padded[(ic + 2) * padded_frames + offset
+                                    ..(ic + 2) * padded_frames + offset + frames];
+                                let r3 = &padded[(ic + 3) * padded_frames + offset
+                                    ..(ic + 3) * padded_frames + offset + frames];
+                                axpy4_simd(simd, [w0, w1, w2, w3], r0, r1, r2, r3, out_row);
+                                ic += 4;
+                            }
+                            while ic < self.in_c {
+                                let in_row =
+                                    &padded[ic * padded_frames + offset..ic * padded_frames + offset + frames];
+                                let w = self.weight[(oc * self.in_c + ic) * self.kernel + k];
+                                axpy_simd(simd, w, in_row, out_row);
+                                ic += 1;
                             }
                         }
                     }
@@ -771,9 +939,8 @@ impl AttentiveStatPool {
             ));
         }
         let inv_t = 1.0_f32 / usize_to_f32(frames);
-        let mut cat = vec![0.0_f32; channels * 3 * frames];
-        cat[..channels * frames].copy_from_slice(input);
-
+        let mut means = vec![0.0_f32; channels];
+        let mut stds = vec![0.0_f32; channels];
         for c in 0..channels {
             let row = &input[c * frames..(c + 1) * frames];
             let mean = row.iter().copied().sum::<f32>() * inv_t;
@@ -785,46 +952,119 @@ impl AttentiveStatPool {
                 })
                 .sum::<f32>()
                 * inv_t;
-            let std = (var + 1e-12_f32).sqrt();
-            cat[(channels + c) * frames..(channels + c + 1) * frames].fill(mean);
-            cat[(2 * channels + c) * frames..(2 * channels + c + 1) * frames].fill(std);
+            means[c] = mean;
+            stds[c] = (var + 1e-12_f32).sqrt();
         }
 
         // Upstream applies TDNN (with ReLU), then tanh, then 1x1 conv.
-        let mut attn = self.tdnn.forward_parallel(&cat, frames, true, threads)?;
+        // For k=1 TDNN over [input, broadcast(mean), broadcast(std)], fold the
+        // constant mean/std contributions into per-channel bias instead of allocating
+        // a 3*C*T concatenated activation buffer.
+        let mut attn = if self.tdnn.kernel == 1
+            && self.tdnn.weight.len() == self.tdnn.out_c * channels * 3
+            && self.tdnn.bias.len() == self.tdnn.out_c
+        {
+            let hidden = self.tdnn.out_c;
+            let mut folded_w = Vec::with_capacity(hidden * channels);
+            let mut folded_b = Vec::with_capacity(hidden);
+            for oc in 0..hidden {
+                let row = &self.tdnn.weight[oc * channels * 3..(oc + 1) * channels * 3];
+                let w_x = &row[..channels];
+                let w_mean = &row[channels..2 * channels];
+                let w_std = &row[2 * channels..];
+                folded_w.extend_from_slice(w_x);
+                let mut b = self.tdnn.bias[oc];
+                for (&w, &m) in w_mean.iter().zip(&means) {
+                    b = w.mul_add(m, b);
+                }
+                for (&w, &s) in w_std.iter().zip(&stds) {
+                    b = w.mul_add(s, b);
+                }
+                folded_b.push(b);
+            }
+            let x_proj = TdnnConv1d {
+                out_c: hidden,
+                in_c: channels,
+                kernel: 1,
+                dilation: 1,
+                weight: folded_w,
+                bias: folded_b,
+            };
+            x_proj.forward_parallel(input, frames, true, threads)?
+        } else {
+            let mut cat = vec![0.0_f32; channels * 3 * frames];
+            cat[..channels * frames].copy_from_slice(input);
+            for c in 0..channels {
+                cat[(channels + c) * frames..(channels + c + 1) * frames].fill(means[c]);
+                cat[(2 * channels + c) * frames..(2 * channels + c + 1) * frames].fill(stds[c]);
+            }
+            self.tdnn.forward_parallel(&cat, frames, true, threads)?
+        };
         for v in &mut attn {
             *v = v.tanh();
         }
         let scores = self.conv.forward_parallel(&attn, frames, false, threads)?;
 
         let mut stats = vec![0.0_f32; channels * 2];
-        let mut weights = Vec::with_capacity(frames);
-        for c in 0..channels {
-            let s_row = &scores[c * frames..(c + 1) * frames];
+        let workers = if channels <= 1 || channels.saturating_mul(frames) < 16_384 {
+            1
+        } else {
+            threads.clamp(1, 18)
+        };
+        let pool_channel = |c: usize, s_row: &[f32], w_row: &mut [f32]| -> (f32, f32) {
             let x_row = &input[c * frames..(c + 1) * frames];
             let max_s = s_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            weights.clear();
             let mut w_sum = 0.0_f32;
-            for &s in s_row {
+            for (dst, &s) in w_row.iter_mut().zip(s_row) {
                 let w = (s - max_s).exp();
-                weights.push(w);
+                *dst = w;
                 w_sum += w;
             }
             let inv_w = 1.0_f32 / w_sum.max(1e-12_f32);
-            for w in &mut weights {
+            for w in &mut *w_row {
                 *w *= inv_w;
             }
             let mut w_mean = 0.0_f32;
-            for (&w, &x) in weights.iter().zip(x_row.iter()) {
+            for (&w, &x) in w_row.iter().zip(x_row.iter()) {
                 w_mean = w.mul_add(x, w_mean);
             }
             let mut w_var = 0.0_f32;
-            for (&w, &x) in weights.iter().zip(x_row.iter()) {
+            for (&w, &x) in w_row.iter().zip(x_row.iter()) {
                 let d = x - w_mean;
                 w_var = w.mul_add(d * d, w_var);
             }
-            stats[c] = w_mean;
-            stats[channels + c] = (w_var + 1e-12_f32).sqrt();
+            (w_mean, (w_var + 1e-12_f32).sqrt())
+        };
+        if workers <= 1 {
+            let mut w_row = vec![0.0_f32; frames];
+            for (c, s_row) in scores.chunks_exact(frames).enumerate() {
+                let (w_mean, w_std) = pool_channel(c, s_row, &mut w_row);
+                stats[c] = w_mean;
+                stats[channels + c] = w_std;
+            }
+        } else {
+            let mut channel_means_vars = vec![0.0_f32; channels * 2];
+            row_workers::run_aligned(
+                &mut channel_means_vars,
+                workers,
+                2,
+                &|stat_off, out_pairs| {
+                    let first_c = stat_off / 2;
+                    let c_count = out_pairs.len() / 2;
+                    let sc = &scores[first_c * frames..(first_c + c_count) * frames];
+                    let mut w_row = vec![0.0_f32; frames];
+                    for (local_c, s_row) in sc.chunks_exact(frames).enumerate() {
+                        let c = first_c + local_c;
+                        let (w_mean, w_std) = pool_channel(c, s_row, &mut w_row);
+                        out_pairs[local_c * 2] = w_mean;
+                        out_pairs[local_c * 2 + 1] = w_std;
+                    }
+                },
+            );
+            for c in 0..channels {
+                stats[c] = channel_means_vars[c * 2];
+                stats[channels + c] = channel_means_vars[c * 2 + 1];
+            }
         }
         Ok(stats)
     }
@@ -1176,6 +1416,56 @@ mod tests {
                 seq_xvec.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "xvec threads {threads}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mel_real_fft_matches_direct_dft_and_omits_matrix_for_1024() -> std::io::Result<()> {
+        for n_fft in [64_usize, 1024] {
+            let extractor = MelSpectrogramExtractor::new(AudioMelConfig {
+                sample_rate: 24_000,
+                n_fft,
+                hop: 256.min(n_fft / 2),
+                n_mels: 32,
+                fmin: 0.0,
+                fmax: 12_000.0,
+            })?;
+            assert!(extractor.dft_real.is_empty());
+            assert!(extractor.dft_imag.is_empty());
+
+            let frame: Vec<f32> = (0..n_fft)
+                .map(|i| {
+                    let t = f32::from(u16::try_from(i % 137).unwrap_or(0));
+                    (t * 0.17).sin() * 0.6 + (t * 0.43).cos() * 0.35
+                })
+                .collect();
+            let mut windowed = vec![0.0_f32; n_fft];
+            for (dst, (&s, &w)) in windowed.iter_mut().zip(frame.iter().zip(&extractor.hann)) {
+                *dst = s * w;
+            }
+            let mut fft_re = vec![0.0_f32; n_fft / 2];
+            let mut fft_im = vec![0.0_f32; n_fft / 2];
+            let mut mag = vec![0.0_f32; extractor.n_freq];
+            extractor.real_fft_magnitudes(&windowed, &mut fft_re, &mut fft_im, &mut mag);
+
+            let n_fft_f64 = f64::from(u32::try_from(n_fft).unwrap_or(0));
+            let two_pi = 2.0_f64 * core::f64::consts::PI;
+            for (k, &got_mag) in mag.iter().enumerate() {
+                let mut re = 0.0_f64;
+                let mut im = 0.0_f64;
+                let kf = f64::from(u32::try_from(k).unwrap_or(0));
+                for (n, &w) in windowed.iter().enumerate() {
+                    let th = two_pi * kf * f64::from(u32::try_from(n).unwrap_or(0)) / n_fft_f64;
+                    re += f64::from(w) * th.cos();
+                    im -= f64::from(w) * th.sin();
+                }
+                let ref_mag = (re * re + im * im + 1e-9_f64).sqrt();
+                assert!(
+                    (f64::from(got_mag) - ref_mag).abs() <= 1e-4,
+                    "n_fft={n_fft} k={k} got={got_mag} ref={ref_mag}"
+                );
+            }
         }
         Ok(())
     }

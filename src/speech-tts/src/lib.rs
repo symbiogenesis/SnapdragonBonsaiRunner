@@ -169,20 +169,40 @@ pub struct Synthesizer {
 }
 
 // A callback can unwind as well as return an error. Keep cleanup outside the
-// callback stack so neither voice nor codec snapshots survive either failure.
+// callback stack so neither voice nor codec snapshots survive non-cooperative failure.
 struct SynthesisGuard<'a> {
     synthesizer: &'a mut Synthesizer,
-    complete: bool,
+    retain_warm: bool,
 }
 
 impl Drop for SynthesisGuard<'_> {
     fn drop(&mut self) {
         self.synthesizer.codec.reset();
-        if !self.complete {
+        if !self.retain_warm {
             self.synthesizer.codec.discard_reference();
             self.synthesizer.voices.0 = None;
         }
     }
+}
+
+fn flush_pcm_chunk(
+    codec: &mut rust_codec::Codec,
+    frames: &[[i32; engine::TOTAL_CODE_GROUPS]],
+    count: &mut usize,
+    cancel: &CancelHook<'_>,
+    observe: &Observer<'_>,
+    sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
+) -> io::Result<()> {
+    let chunk = codec
+        .decode_stream_cancellable(frames, &mut || (cancel.borrow_mut())())
+        .map_err(|error| SynthesisStage::CodecDecode.failure(error))?;
+    *count = sample_count(&chunk, *count)
+        .ok_or_else(|| SynthesisStage::AudioValidation.failure(invalid_audio()))?;
+    observe.borrow_mut()(observation::Observation::Pcm {
+        phase: observation::Phase::Base,
+        samples: &chunk,
+    })?;
+    sink(&chunk).map_err(|error| SynthesisStage::AudioOutput.failure(error))
 }
 
 type Observer<'a> =
@@ -406,7 +426,7 @@ impl Synthesizer {
     ///
     /// # Errors
     /// Returns [`Self::synthesize`] failures or the first error yielded by
-    /// `cancel`, discarding reusable voice and codec state after input admission.
+    /// `cancel`; cooperative `cancel` resets stream state while retaining committed warm voice/codec reuse, whereas other failures or unwinds discard it.
     pub fn synthesize_cancellable(
         &mut self,
         text: &str,
@@ -479,8 +499,8 @@ impl Synthesizer {
     /// `exit(70)` watchdog contract when a client disconnects asynchronously.
     ///
     /// # Errors
-    /// Returns [`Self::synthesize_stream`] failures or `cancel` errors; after
-    /// input admission, any cancellation or error drops warm voice/codec reuse.
+    /// Returns [`Self::synthesize_stream`] failures or `cancel` errors;
+    /// cooperative `cancel` resets transient stream state while retaining committed warm voice/codec reuse, whereas other errors or unwinds discard it.
     pub fn synthesize_stream_cancellable(
         &mut self,
         text: &str,
@@ -520,8 +540,7 @@ impl Synthesizer {
     ///
     /// # Errors
     /// Returns [`Self::synthesize_stream_observed`] failures or the first error
-    /// yielded by `cancel`. After input admission, cancellation discards
-    /// reusable voice and codec state.
+    /// yielded by `cancel`. Cooperative `cancel` resets transient stream state while retaining committed warm reuse; observer refusals, errors, and unwinds discard it.
     pub fn synthesize_stream_observed_cancellable(
         &mut self,
         text: &str,
@@ -532,27 +551,40 @@ impl Synthesizer {
     ) -> io::Result<()> {
         let text = bounded_input(text, MAX_TEXT)?;
         let profile = bounded_input(voice, MAX_VOICE)?;
-        let cancel = std::cell::RefCell::new(cancel);
+        let cancelled_by_hook = std::sync::atomic::AtomicBool::new(false);
+        let mut tracked_cancel = || {
+            let res = cancel();
+            if res.is_err() {
+                cancelled_by_hook.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            res
+        };
+        let cancel_ref: CancelHook<'_> = std::cell::RefCell::new(&mut tracked_cancel);
         let observe = std::cell::RefCell::new(observe);
         let mut guard = SynthesisGuard {
             synthesizer: self,
-            complete: false,
+            retain_warm: false,
         };
         let synthesizer = &mut *guard.synthesizer;
         let result = (|| {
-            let _ = synthesizer.voice(profile, &cancel, &observe)?;
+            let _ = synthesizer.voice(profile, &cancel_ref, &observe)?;
             let Self { voices, codec, .. } = synthesizer;
             let (_, voice) = voices.0.as_mut().ok_or_else(invalid_audio)?;
-            (cancel.borrow_mut())().map_err(|error| SynthesisStage::CodecPriming.failure(error))?;
+            (cancel_ref.borrow_mut())()
+                .map_err(|error| SynthesisStage::CodecPriming.failure(error))?;
             observe.borrow_mut()(observation::Observation::Speaker(&voice.reference.speaker))?;
             observe.borrow_mut()(observation::Observation::ReferenceCodes(
                 &voice.reference.codes,
             ))?;
             codec
                 .prime_reference_cancellable(&voice.reference.codes, &mut || {
-                    (cancel.borrow_mut())()
+                    (cancel_ref.borrow_mut())()
                 })
                 .map_err(|error| SynthesisStage::CodecPriming.failure(error))?;
+            let chunk_cfg = engine::StreamChunkConfig::dyadic_ramp();
+            let mut chunk_idx = 0_usize;
+            let mut pending_frames: Vec<[i32; engine::TOTAL_CODE_GROUPS]> =
+                Vec::with_capacity(chunk_cfg.steady_chunk_frames);
             let mut count = 0;
             voice
                 .talker
@@ -561,19 +593,22 @@ impl Synthesizer {
                     None,
                     Some(&voice.reference),
                     &mut |frame| {
-                        let chunk = codec
-                            .decode_stream_cancellable(&[frame], &mut || (cancel.borrow_mut())())
-                            .map_err(|error| SynthesisStage::CodecDecode.failure(error))?;
-                        count = sample_count(&chunk, count).ok_or_else(|| {
-                            SynthesisStage::AudioValidation.failure(invalid_audio())
-                        })?;
-                        observe.borrow_mut()(observation::Observation::Pcm {
-                            phase: observation::Phase::Base,
-                            samples: &chunk,
-                        })?;
-                        sink(&chunk).map_err(|error| SynthesisStage::AudioOutput.failure(error))
+                        pending_frames.push(frame);
+                        if pending_frames.len() >= chunk_cfg.dyadic_frames_for_chunk(chunk_idx) {
+                            flush_pcm_chunk(
+                                codec,
+                                &pending_frames,
+                                &mut count,
+                                &cancel_ref,
+                                &observe,
+                                sink,
+                            )?;
+                            pending_frames.clear();
+                            chunk_idx = chunk_idx.saturating_add(1);
+                        }
+                        Ok(())
                     },
-                    &mut || (cancel.borrow_mut())(),
+                    &mut || (cancel_ref.borrow_mut())(),
                     &mut |observation| {
                         observe.borrow_mut()(observation::Observation::Talker {
                             phase: observation::Phase::Base,
@@ -582,6 +617,17 @@ impl Synthesizer {
                     },
                 )
                 .map_err(|error| SynthesisStage::Generation.failure(error))?;
+            if !pending_frames.is_empty() {
+                flush_pcm_chunk(
+                    codec,
+                    &pending_frames,
+                    &mut count,
+                    &cancel_ref,
+                    &observe,
+                    sink,
+                )?;
+                pending_frames.clear();
+            }
             if count == 0 {
                 return Err(SynthesisStage::AudioValidation.failure(invalid_audio()));
             }
@@ -591,7 +637,8 @@ impl Synthesizer {
             })?;
             Ok(())
         })();
-        guard.complete = result.is_ok();
+        guard.retain_warm =
+            result.is_ok() || cancelled_by_hook.load(std::sync::atomic::Ordering::Relaxed);
         result
     }
 }
