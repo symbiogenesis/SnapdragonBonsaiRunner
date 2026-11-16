@@ -6,6 +6,7 @@ use std::{
     io,
     os::windows::io::AsRawHandle,
     ptr::{self, NonNull},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -19,6 +20,10 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 /// Minimum regular-file length (`4 MiB`) that uses read-only section mapping,
 /// prefetching, and chunked CNG updates instead of buffered `Read` hashing.
 pub const MIN_MAPPED_HASH_BYTES: u64 = 4 * 1024 * 1024;
+/// Default chunk size (`16 MiB`) for parallel mapped CNG SHA-256 verification.
+pub const PARALLEL_HASH_DEFAULT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum OS worker threads used by parallel mapped CNG SHA-256 verification.
+pub const MAX_PARALLEL_HASH_WORKERS: usize = 8;
 const MAPPED_HASH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAPPED_PREFETCH_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
@@ -49,6 +54,15 @@ struct ReadOnlyMapping {
     _mapping: MappingHandle,
     len: usize,
 }
+
+// SAFETY: `ReadOnlyMapping` owns a process-wide kernel section handle and a
+// `PAGE_READONLY` / `FILE_MAP_READ` mapping view with no thread affinity, so
+// transferring ownership across threads introduces no aliasing or race.
+unsafe impl Send for ReadOnlyMapping {}
+
+// SAFETY: `&ReadOnlyMapping` exposes only immutable `&[u8]` slices over
+// `0..self.len` while the view remains mapped until `Drop`.
+unsafe impl Sync for ReadOnlyMapping {}
 
 impl ReadOnlyMapping {
     fn open(file: &File, expected_bytes: u64) -> Option<Self> {
@@ -138,6 +152,321 @@ pub fn try_hash_locked_file_mapped<E>(
         }
     }
     hasher.finish().map(Some).map_err(map_io_error)
+}
+
+enum WorkerError {
+    Cancelled,
+    PeerAborted,
+    Io(io::Error),
+}
+
+fn validate_chunk_bytes(chunk_bytes: usize) -> io::Result<u64> {
+    let chunk_bytes_u64 = u64::try_from(chunk_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Chunk size exceeds supported u64 range.",
+        )
+    })?;
+    if chunk_bytes_u64 < MIN_MAPPED_HASH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Chunk size must be at least MIN_MAPPED_HASH_BYTES.",
+        ));
+    }
+    Ok(chunk_bytes_u64)
+}
+
+fn cancelled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "Chunked hashing was cancelled.")
+}
+
+fn constant_time_diff_32(lhs: &[u8; 32], rhs: &[u8; 32]) -> u8 {
+    let mut diff = 0_u8;
+    for (&a, &b) in lhs.iter().zip(rhs.iter()) {
+        diff |= std::hint::black_box(a ^ b);
+    }
+    diff
+}
+
+fn hash_mapped_chunk(
+    chunk: &[u8],
+    should_cancel: &(impl Fn() -> bool + Sync),
+    peer_error: &AtomicBool,
+) -> Result<[u8; 32], WorkerError> {
+    let check_abort = || {
+        if should_cancel() {
+            Err(WorkerError::Cancelled)
+        } else if peer_error.load(Ordering::Acquire) {
+            Err(WorkerError::PeerAborted)
+        } else {
+            Ok(())
+        }
+    };
+    if chunk.len() <= MAPPED_PREFETCH_WINDOW_BYTES {
+        check_abort()?;
+        prefetch_window(chunk);
+        check_abort()?;
+        return Sha256::digest_bytes(chunk).map_err(WorkerError::Io);
+    }
+    let mut hasher = Sha256::new().map_err(WorkerError::Io)?;
+    for window in chunk.chunks(MAPPED_PREFETCH_WINDOW_BYTES) {
+        check_abort()?;
+        prefetch_window(window);
+        for subchunk in window.chunks(MAPPED_HASH_CHUNK_BYTES) {
+            check_abort()?;
+            hasher.update(subchunk).map_err(WorkerError::Io)?;
+        }
+    }
+    hasher.finish().map_err(WorkerError::Io)
+}
+
+/// Compute fixed-chunk SHA-256 digests for a read-locked regular file via a
+/// single read-only section mapping and bounded parallel CNG workers, polling
+/// `should_cancel` before every prefetch and hash step.
+///
+/// Returns `Ok(None)` when `expected_bytes < MIN_MAPPED_HASH_BYTES`, the file
+/// length mismatches or overflows `usize`, or section/view creation is
+/// unsupported so callers can fall back cleanly.
+///
+/// # Errors
+/// Rejects `chunk_bytes < MIN_MAPPED_HASH_BYTES`, returns
+/// `io::ErrorKind::Interrupted` when `should_cancel` triggers, or returns CNG
+/// hashing failures.
+pub fn compute_mapped_chunk_digests_with(
+    file: &File,
+    expected_bytes: u64,
+    chunk_bytes: usize,
+    workers: usize,
+    should_cancel: &(impl Fn() -> bool + Sync),
+) -> io::Result<Option<Vec<[u8; 32]>>> {
+    if should_cancel() {
+        return Err(cancelled_error());
+    }
+    let _ = validate_chunk_bytes(chunk_bytes)?;
+    let Some(mapping) = ReadOnlyMapping::open(file, expected_bytes) else {
+        return Ok(None);
+    };
+    let data = mapping.as_bytes();
+    let chunk_count = data.len().div_ceil(chunk_bytes);
+    let worker_count = workers.clamp(1, MAX_PARALLEL_HASH_WORKERS).min(chunk_count);
+    let next_chunk = AtomicUsize::new(0);
+    let peer_error = AtomicBool::new(false);
+
+    let worker_task = || -> Result<Vec<(usize, [u8; 32])>, WorkerError> {
+        let mut local = Vec::with_capacity(chunk_count.div_ceil(worker_count));
+        loop {
+            if should_cancel() {
+                peer_error.store(true, Ordering::Release);
+                return Err(WorkerError::Cancelled);
+            }
+            if peer_error.load(Ordering::Acquire) {
+                return Err(WorkerError::PeerAborted);
+            }
+            let chunk_index = next_chunk.fetch_add(1, Ordering::Relaxed);
+            if chunk_index >= chunk_count {
+                break;
+            }
+            let start = chunk_index.checked_mul(chunk_bytes).ok_or_else(|| {
+                peer_error.store(true, Ordering::Release);
+                WorkerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Chunk offset overflow.",
+                ))
+            })?;
+            let end = start.saturating_add(chunk_bytes).min(data.len());
+            let chunk = data.get(start..end).ok_or_else(|| {
+                peer_error.store(true, Ordering::Release);
+                WorkerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Chunk bounds out of range.",
+                ))
+            })?;
+            let digest = match hash_mapped_chunk(chunk, should_cancel, &peer_error) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    peer_error.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            };
+            local.push((chunk_index, digest));
+        }
+        Ok(local)
+    };
+
+    let worker_results = if worker_count == 1 {
+        vec![worker_task()]
+    } else {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count - 1);
+            for _ in 0..(worker_count - 1) {
+                handles.push(scope.spawn(&worker_task));
+            }
+            let current = worker_task();
+            let mut results = Vec::with_capacity(worker_count);
+            results.push(current);
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => results.push(result),
+                    Err(_) => {
+                        peer_error.store(true, Ordering::Release);
+                        results.push(Err(WorkerError::Io(io::Error::other(
+                            "Parallel hash worker thread panicked.",
+                        ))));
+                    }
+                }
+            }
+            results
+        })
+    };
+
+    if should_cancel() {
+        return Err(cancelled_error());
+    }
+    let mut digests = vec![[0_u8; 32]; chunk_count];
+    let mut first_io_error = None;
+    let mut saw_peer_abort = false;
+    for result in worker_results {
+        match result {
+            Ok(pairs) => {
+                for (chunk_index, digest) in pairs {
+                    let slot = digests
+                        .get_mut(chunk_index)
+                        .ok_or_else(|| io::Error::other("Computed chunk index out of range."))?;
+                    *slot = digest;
+                }
+            }
+            Err(WorkerError::Cancelled) => return Err(cancelled_error()),
+            Err(WorkerError::PeerAborted) => saw_peer_abort = true,
+            Err(WorkerError::Io(error)) => {
+                if first_io_error.is_none() {
+                    first_io_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_io_error {
+        return Err(error);
+    }
+    if saw_peer_abort {
+        return Err(io::Error::other("Parallel hash worker aborted."));
+    }
+    Ok(Some(digests))
+}
+
+/// Compute fixed-chunk SHA-256 digests for a read-locked regular file via a
+/// single read-only section mapping and bounded parallel CNG workers, checking
+/// `cancel` before every prefetch and hash step.
+///
+/// Returns `Ok(None)` when `expected_bytes < MIN_MAPPED_HASH_BYTES`, the file
+/// length mismatches or overflows `usize`, or section/view creation is
+/// unsupported so callers can fall back cleanly.
+///
+/// # Errors
+/// Rejects `chunk_bytes < MIN_MAPPED_HASH_BYTES`, returns
+/// `io::ErrorKind::Interrupted` when `cancel` is set, or returns CNG hashing
+/// failures.
+pub fn compute_mapped_chunk_digests(
+    file: &File,
+    expected_bytes: u64,
+    chunk_bytes: usize,
+    workers: usize,
+    cancel: &AtomicBool,
+) -> io::Result<Option<Vec<[u8; 32]>>> {
+    compute_mapped_chunk_digests_with(file, expected_bytes, chunk_bytes, workers, &|| {
+        cancel.load(Ordering::Acquire)
+    })
+}
+
+/// Verify a read-locked regular file's fixed-chunk SHA-256 manifest via a
+/// single read-only section mapping and bounded parallel CNG workers, polling
+/// `should_cancel` before every prefetch and hash step.
+///
+/// Returns `Ok(None)` when `expected_bytes < MIN_MAPPED_HASH_BYTES`, the file
+/// length mismatches or overflows `usize`, or section/view creation is
+/// unsupported. Returns `Ok(Some(true))` when every chunk matches in constant
+/// time and `Ok(Some(false))` when any chunk differs.
+///
+/// # Errors
+/// Rejects `chunk_bytes < MIN_MAPPED_HASH_BYTES` or a chunk-digest count
+/// differing from `expected_bytes.div_ceil(chunk_bytes)`, returns
+/// `io::ErrorKind::Interrupted` on cancellation, or returns CNG hashing failures.
+pub fn try_verify_locked_file_chunk_digests_mapped_with(
+    file: &File,
+    expected_bytes: u64,
+    chunk_bytes: usize,
+    expected_digests: &[[u8; 32]],
+    workers: usize,
+    should_cancel: &(impl Fn() -> bool + Sync),
+) -> io::Result<Option<bool>> {
+    if should_cancel() {
+        return Err(cancelled_error());
+    }
+    let chunk_bytes_u64 = validate_chunk_bytes(chunk_bytes)?;
+    let expected_chunks =
+        usize::try_from(expected_bytes.div_ceil(chunk_bytes_u64)).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Expected chunk count exceeds usize range.",
+            )
+        })?;
+    if expected_digests.len() != expected_chunks {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected chunk digest count does not match file length and chunk size.",
+        ));
+    }
+    let Some(actual_digests) = compute_mapped_chunk_digests_with(
+        file,
+        expected_bytes,
+        chunk_bytes,
+        workers,
+        should_cancel,
+    )?
+    else {
+        return Ok(None);
+    };
+    if actual_digests.len() != expected_digests.len() {
+        return Err(io::Error::other(
+            "Computed chunk digest count differed from expected chunk count.",
+        ));
+    }
+    let mut diff = 0_u8;
+    for (actual, expected) in actual_digests.iter().zip(expected_digests.iter()) {
+        diff |= constant_time_diff_32(actual, expected);
+    }
+    Ok(Some(diff == 0))
+}
+
+/// Verify a read-locked regular file's fixed-chunk SHA-256 manifest via a
+/// single read-only section mapping and bounded parallel CNG workers, checking
+/// `cancel` before every prefetch and hash step.
+///
+/// Returns `Ok(None)` when `expected_bytes < MIN_MAPPED_HASH_BYTES`, the file
+/// length mismatches or overflows `usize`, or section/view creation is
+/// unsupported. Returns `Ok(Some(true))` when every chunk matches in constant
+/// time and `Ok(Some(false))` when any chunk differs.
+///
+/// # Errors
+/// Rejects `chunk_bytes < MIN_MAPPED_HASH_BYTES` or a chunk-digest count
+/// differing from `expected_bytes.div_ceil(chunk_bytes)`, returns
+/// `io::ErrorKind::Interrupted` when `cancel` is set, or returns CNG hashing
+/// failures.
+pub fn try_verify_locked_file_chunk_digests_mapped(
+    file: &File,
+    expected_bytes: u64,
+    chunk_bytes: usize,
+    expected_digests: &[[u8; 32]],
+    workers: usize,
+    cancel: &AtomicBool,
+) -> io::Result<Option<bool>> {
+    try_verify_locked_file_chunk_digests_mapped_with(
+        file,
+        expected_bytes,
+        chunk_bytes,
+        expected_digests,
+        workers,
+        &|| cancel.load(Ordering::Acquire),
+    )
 }
 
 /// A streaming SHA-256 hash using Windows' CPU-dispatched CNG implementation.

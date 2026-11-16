@@ -36,7 +36,11 @@ pub use sealed::{
 )]
 mod hash;
 
-pub use hash::{MIN_MAPPED_HASH_BYTES, Sha256, try_hash_locked_file_mapped};
+pub use hash::{
+    MAX_PARALLEL_HASH_WORKERS, MIN_MAPPED_HASH_BYTES, PARALLEL_HASH_DEFAULT_CHUNK_BYTES, Sha256,
+    compute_mapped_chunk_digests, compute_mapped_chunk_digests_with, try_hash_locked_file_mapped,
+    try_verify_locked_file_chunk_digests_mapped, try_verify_locked_file_chunk_digests_mapped_with,
+};
 
 /// Queries the actual Windows process token, without trusting an environment flag.
 ///

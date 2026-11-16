@@ -264,3 +264,306 @@ fn frontend_only_credentials_generate_in_memory_backend_key_without_backend_file
     drop(credentials);
     Ok(())
 }
+
+fn open_read_locked_test_file(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+fn synthetic_chunk_payload(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| u8::try_from((i.wrapping_mul(37) ^ (i >> 9) ^ 0x5a) & 0xff).unwrap_or(0))
+        .collect()
+}
+
+#[test]
+fn parallel_mapped_chunk_digests_compute_and_verify_exact_multichunk() -> io::Result<()> {
+    let lane = test_lane("parallel-chunk-ok")?;
+    let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
+    let len = 2 * chunk_bytes + 73_219;
+    let payload = synthetic_chunk_payload(len);
+    let path = lane.join("multichunk.bin");
+    fs::write(&path, &payload)?;
+
+    let expected: Vec<[u8; 32]> = payload
+        .chunks(chunk_bytes)
+        .map(Sha256::digest_bytes)
+        .collect::<io::Result<Vec<_>>>()?;
+    assert_eq!(expected.len(), 3);
+
+    let file = open_read_locked_test_file(&path)?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let total_u64 = u64::try_from(len).map_err(io::Error::other)?;
+
+    for workers in [0, 1, 4, MAX_PARALLEL_HASH_WORKERS, 16] {
+        let computed =
+            compute_mapped_chunk_digests(&file, total_u64, chunk_bytes, workers, &cancel)?;
+        assert_eq!(computed.as_deref(), Some(expected.as_slice()));
+        let verified = try_verify_locked_file_chunk_digests_mapped(
+            &file,
+            total_u64,
+            chunk_bytes,
+            &expected,
+            workers,
+            &cancel,
+        )?;
+        assert_eq!(verified, Some(true));
+    }
+
+    // Also verify default 16 MiB chunk size covering the full 8+ MiB payload as one chunk.
+    let whole_expected = [Sha256::digest_bytes(&payload)?];
+    assert_eq!(
+        compute_mapped_chunk_digests(
+            &file,
+            total_u64,
+            PARALLEL_HASH_DEFAULT_CHUNK_BYTES,
+            4,
+            &cancel
+        )?
+        .as_deref(),
+        Some(whole_expected.as_slice())
+    );
+    assert_eq!(
+        try_verify_locked_file_chunk_digests_mapped(
+            &file,
+            total_u64,
+            PARALLEL_HASH_DEFAULT_CHUNK_BYTES,
+            &whole_expected,
+            4,
+            &cancel
+        )?,
+        Some(true)
+    );
+
+    drop(file);
+    fs::remove_dir_all(&lane)?;
+    Ok(())
+}
+
+#[test]
+fn parallel_mapped_chunk_verification_detects_single_byte_corruption_in_any_chunk() -> io::Result<()>
+{
+    let lane = test_lane("parallel-chunk-corrupt")?;
+    let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
+    let len = 2 * chunk_bytes + 1_024;
+    let payload = synthetic_chunk_payload(len);
+    let expected: Vec<[u8; 32]> = payload
+        .chunks(chunk_bytes)
+        .map(Sha256::digest_bytes)
+        .collect::<io::Result<Vec<_>>>()?;
+    let total_u64 = u64::try_from(len).map_err(io::Error::other)?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+
+    // Corrupt a single byte in the first, middle, and last chunks on disk.
+    let path = lane.join("corrupt.bin");
+    for offset in [0, chunk_bytes - 1, chunk_bytes + 123, len - 1] {
+        let mut tampered = payload.clone();
+        tampered[offset] ^= 0x01;
+        fs::write(&path, &tampered)?;
+        let file = open_read_locked_test_file(&path)?;
+        assert_eq!(
+            try_verify_locked_file_chunk_digests_mapped(
+                &file,
+                total_u64,
+                chunk_bytes,
+                &expected,
+                MAX_PARALLEL_HASH_WORKERS,
+                &cancel
+            )?,
+            Some(false)
+        );
+    }
+
+    // Clean payload on disk, but corrupt expected digest for first, middle, and last chunk.
+    fs::write(&path, &payload)?;
+    let file = open_read_locked_test_file(&path)?;
+    for chunk_index in [0, 1, 2] {
+        let mut bad_expected = expected.clone();
+        bad_expected[chunk_index][31] ^= 0x80;
+        assert_eq!(
+            try_verify_locked_file_chunk_digests_mapped(
+                &file,
+                total_u64,
+                chunk_bytes,
+                &bad_expected,
+                MAX_PARALLEL_HASH_WORKERS,
+                &cancel
+            )?,
+            Some(false)
+        );
+    }
+
+    drop(file);
+    fs::remove_dir_all(&lane)?;
+    Ok(())
+}
+
+#[test]
+fn parallel_mapped_chunk_verification_rejects_count_chunk_size_and_length_mismatches()
+-> io::Result<()> {
+    let lane = test_lane("parallel-chunk-mismatch")?;
+    let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
+    let len = 2 * chunk_bytes + 512;
+    let payload = synthetic_chunk_payload(len);
+    let path = lane.join("mismatch.bin");
+    fs::write(&path, &payload)?;
+
+    let expected: Vec<[u8; 32]> = payload
+        .chunks(chunk_bytes)
+        .map(Sha256::digest_bytes)
+        .collect::<io::Result<Vec<_>>>()?;
+    let file = open_read_locked_test_file(&path)?;
+    let total_u64 = u64::try_from(len).map_err(io::Error::other)?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+
+    // Sub-threshold chunk size must fail cleanly as InvalidInput.
+    for bad_chunk_bytes in [0, 1024, chunk_bytes - 1] {
+        let compute_err =
+            compute_mapped_chunk_digests(&file, total_u64, bad_chunk_bytes, 4, &cancel)
+                .err()
+                .ok_or_else(|| io::Error::other("expected invalid chunk size rejection"))?;
+        assert_eq!(compute_err.kind(), io::ErrorKind::InvalidInput);
+        let verify_err = try_verify_locked_file_chunk_digests_mapped(
+            &file,
+            total_u64,
+            bad_chunk_bytes,
+            &expected,
+            4,
+            &cancel,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("expected invalid chunk size rejection"))?;
+        assert_eq!(verify_err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // Mismatched expected chunk digest count must fail cleanly as InvalidInput.
+    let mut too_many = expected.clone();
+    too_many.push([0_u8; 32]);
+    for bad_digests in [&expected[..2], &too_many[..], &[][..]] {
+        let count_err = try_verify_locked_file_chunk_digests_mapped(
+            &file,
+            total_u64,
+            chunk_bytes,
+            bad_digests,
+            4,
+            &cancel,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("expected chunk count mismatch rejection"))?;
+        assert_eq!(count_err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // File length mismatch returns Ok(None) rather than verifying mismatched bytes.
+    assert_eq!(
+        compute_mapped_chunk_digests(&file, total_u64 - 1, chunk_bytes, 4, &cancel)?,
+        None
+    );
+    assert_eq!(
+        try_verify_locked_file_chunk_digests_mapped(
+            &file,
+            total_u64 - 1,
+            chunk_bytes,
+            &expected,
+            4,
+            &cancel
+        )?,
+        None
+    );
+    assert_eq!(
+        try_verify_locked_file_chunk_digests_mapped(
+            &file,
+            total_u64 + 1,
+            chunk_bytes,
+            &expected,
+            4,
+            &cancel
+        )?,
+        None
+    );
+
+    // Below MIN_MAPPED_HASH_BYTES returns Ok(None) for sequential fallback.
+    let small_path = lane.join("small.bin");
+    let small_bytes = MIN_MAPPED_HASH_BYTES - 1;
+    let small_len = usize::try_from(small_bytes).map_err(io::Error::other)?;
+    fs::write(&small_path, vec![0x33_u8; small_len])?;
+    let small_file = open_read_locked_test_file(&small_path)?;
+    assert_eq!(
+        compute_mapped_chunk_digests(&small_file, small_bytes, chunk_bytes, 4, &cancel)?,
+        None
+    );
+    assert_eq!(
+        try_verify_locked_file_chunk_digests_mapped(
+            &small_file,
+            small_bytes,
+            chunk_bytes,
+            &[[0_u8; 32]],
+            4,
+            &cancel
+        )?,
+        None
+    );
+
+    drop(small_file);
+    drop(file);
+    fs::remove_dir_all(&lane)?;
+    Ok(())
+}
+
+#[test]
+fn parallel_mapped_chunk_verification_honors_immediate_cancellation() -> io::Result<()> {
+    let lane = test_lane("parallel-chunk-cancel")?;
+    let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
+    let len = 2 * chunk_bytes + 512;
+    let payload = synthetic_chunk_payload(len);
+    let path = lane.join("cancel.bin");
+    fs::write(&path, &payload)?;
+
+    let expected: Vec<[u8; 32]> = payload
+        .chunks(chunk_bytes)
+        .map(Sha256::digest_bytes)
+        .collect::<io::Result<Vec<_>>>()?;
+    let file = open_read_locked_test_file(&path)?;
+    let total_u64 = u64::try_from(len).map_err(io::Error::other)?;
+
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let compute_err = compute_mapped_chunk_digests(&file, total_u64, chunk_bytes, 4, &cancelled)
+        .err()
+        .ok_or_else(|| io::Error::other("expected immediate cancellation"))?;
+    assert_eq!(compute_err.kind(), io::ErrorKind::Interrupted);
+
+    let verify_err = try_verify_locked_file_chunk_digests_mapped(
+        &file,
+        total_u64,
+        chunk_bytes,
+        &expected,
+        4,
+        &cancelled,
+    )
+    .err()
+    .ok_or_else(|| io::Error::other("expected immediate cancellation"))?;
+    assert_eq!(verify_err.kind(), io::ErrorKind::Interrupted);
+
+    // Also verify mid-flight cancellation triggers at the next prefetch/hash check.
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let mid_cancel = || checks.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= 2;
+    let mid_err = try_verify_locked_file_chunk_digests_mapped_with(
+        &file,
+        total_u64,
+        chunk_bytes,
+        &expected,
+        1,
+        &mid_cancel,
+    )
+    .err()
+    .ok_or_else(|| io::Error::other("expected mid-flight cancellation"))?;
+    assert_eq!(mid_err.kind(), io::ErrorKind::Interrupted);
+
+    drop(file);
+    fs::remove_dir_all(&lane)?;
+    Ok(())
+}
