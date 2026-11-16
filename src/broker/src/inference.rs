@@ -43,6 +43,181 @@ pub(super) enum KvCache {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum PromptReuseMode {
+    #[default]
+    Disabled,
+    Latest,
+    PromptEndAndLatest,
+}
+
+impl PromptReuseMode {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
+        match value.and_then(std::ffi::OsStr::to_str) {
+            Some("disabled") => Ok(Self::Disabled),
+            Some("latest") => Ok(Self::Latest),
+            Some("prompt-end-and-latest") => Ok(Self::PromptEndAndLatest),
+            _ => Err(LaunchError::Arguments),
+        }
+    }
+
+    pub(super) const fn as_wire(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::Latest => Some("latest"),
+            Self::PromptEndAndLatest => Some("prompt-end-and-latest"),
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) const fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Wired into launcher CLI options in follow-up commit."
+    )
+)]
+pub(super) enum CpuPrefillGdn {
+    #[default]
+    Sequential,
+    WyF32,
+}
+
+impl CpuPrefillGdn {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
+        match value.and_then(std::ffi::OsStr::to_str) {
+            Some("sequential") => Ok(Self::Sequential),
+            Some("wy-f32") => Ok(Self::WyF32),
+            _ => Err(LaunchError::Arguments),
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) const fn is_wy_f32(self) -> bool {
+        matches!(self, Self::WyF32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Wired into launcher CLI options in follow-up commit."
+    )
+)]
+pub(super) enum SpeculationType {
+    #[default]
+    None,
+    Suffix,
+}
+
+impl SpeculationType {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
+        match value.and_then(std::ffi::OsStr::to_str) {
+            Some("none") => Ok(Self::None),
+            Some("suffix") => Ok(Self::Suffix),
+            _ => Err(LaunchError::Arguments),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Wired into launcher CLI options in follow-up commit."
+    )
+)]
+pub(super) enum CpuFamily {
+    X1,
+    X2,
+}
+
+impl CpuFamily {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
+        match value.and_then(std::ffi::OsStr::to_str) {
+            Some("x1") => Ok(Self::X1),
+            Some("x2") => Ok(Self::X2),
+            _ => Err(LaunchError::Arguments),
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::X1 => "x1",
+            Self::X2 => "x2",
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) const fn default_row_workers(self) -> u8 {
+        match self {
+            Self::X1 | Self::X2 => 8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Placement {
     #[default]
     Auto,
@@ -63,7 +238,7 @@ impl Placement {
 // requested placement and effective CPU backend in a genuine reviewed release.
 // Source omission alone does not justify a smaller fixed memory allowance.
 const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
 fn select_placement(release: &ReleasePin, requested: Placement) -> Result<Placement, LaunchError> {
     if requested == Placement::Auto || reviewed_release_matches(release, CPU_PLACEMENT_RELEASE) {
@@ -274,7 +449,7 @@ fn row_workers_supported(
 // This combined review also retains four row workers, K4/V4 and latest reuse;
 // a later repin cannot silently lose those existing serving capabilities.
 const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
 // K4/V3 changes precision and needs its own reviewed capacity/quality release.
 // Both gates must identify the same genuine released source before this profile
@@ -287,7 +462,7 @@ const K4V3_CONTEXT_RELEASE: Option<(&str, &str)> = None;
 // 4 GiB. Precision and process charges remain unchanged; this gate cannot
 // authorize an unrelated memory release.
 const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
 fn full_context_release_matches(release: &ReleasePin, reviewed: Option<(&str, &str)>) -> bool {
     reviewed.is_some()
@@ -321,7 +496,7 @@ pub(super) fn memory_context_supported() -> Result<bool, LaunchError> {
 // bounded timeout, and resets live model state on authenticated `POST /reset`
 // without expecting a `Content-Type` header.
 const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
 fn reset_on_cancel_release_matches(release: &ReleasePin) -> bool {
     reviewed_release_matches(release, RESET_ON_CANCEL_RELEASE)
@@ -334,8 +509,9 @@ pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
 
 // Offline anonymous broker-pipe transport requires a separately reviewed native
 // release implementing `--broker-pipe`, `AppContainer` verification, `SB2PIPE1`
-// / `SB2OKAY1` handshake, `KIND_SERVER_READY`, and `KIND_RESET`.
-const BROKER_PIPE_RELEASE: Option<(&str, &str)> = None;
+// / `SB2OKAY1` handshake, `KIND_SERVER_READY`, `KIND_RESET`, and `KIND_VERIFIED_SECTION`.
+const BROKER_PIPE_RELEASE: Option<(&str, &str)> =
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
 fn broker_pipe_release_matches(release: &ReleasePin) -> bool {
     reviewed_release_matches(release, BROKER_PIPE_RELEASE)
@@ -346,17 +522,79 @@ pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
     Ok(broker_pipe_release_matches(&pin))
 }
 
+// Calibrated CoW admission, sparse branch prompt reuse, chunkwise GDN prefill,
+// and suffix CPU speculation require the reviewed post-0.1.31 Prism release.
+const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> =
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> =
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> =
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const CPU_SPECULATION_RELEASE: Option<(&str, &str)> =
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Wired into default admission promotion in follow-up commit."
+    )
+)]
+pub(super) fn calibrated_cow_admission_supported() -> Result<bool, LaunchError> {
+    let pin = release(LOCK)?;
+    Ok(reviewed_release_matches(
+        &pin,
+        CALIBRATED_COW_ADMISSION_RELEASE,
+    ))
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Wired into launcher CLI options in follow-up commit."
+    )
+)]
+pub(super) fn branch_prompt_reuse_supported() -> Result<bool, LaunchError> {
+    let pin = release(LOCK)?;
+    Ok(reviewed_release_matches(&pin, BRANCH_PROMPT_REUSE_RELEASE))
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Wired into launcher CLI options in follow-up commit."
+    )
+)]
+pub(super) fn cpu_prefill_gdn_supported() -> Result<bool, LaunchError> {
+    let pin = release(LOCK)?;
+    Ok(reviewed_release_matches(&pin, CPU_PREFILL_GDN_RELEASE))
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Wired into launcher CLI options in follow-up commit."
+    )
+)]
+pub(super) fn cpu_speculation_supported() -> Result<bool, LaunchError> {
+    let pin = release(LOCK)?;
+    Ok(reviewed_release_matches(&pin, CPU_SPECULATION_RELEASE))
+}
+
 // Multimodal image/mmproj support requires a separately reviewed native release
 // that implements vision projector loading, image embedding injection and the
 // matching readiness identity fields.
 const VISION_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
 // CPU tiled prefill requires a separately reviewed native release supporting
 // `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
 // readiness fields (`cpu_prefill_tokens`, `cpu_prefill_scratch_bytes`, `:cpu-tiled-ffn-v1:{n}`).
 const CPU_PREFILL_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
 pub(super) fn parse_cpu_prefill_tokens(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
     match value.and_then(std::ffi::OsStr::to_str) {
@@ -442,12 +680,13 @@ mod tests {
         let mut pin = release(LOCK)?;
         assert_eq!(select_placement(&pin, Placement::Cpu)?, Placement::Cpu);
         for (version, commit) in [
-            ("0.1.27", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.28", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.30", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.32", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.31", "0000000000000000000000000000000000000000"),
-            ("0.1.31", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
+            ("0.1.27", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.28", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.30", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.33", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.32", "0000000000000000000000000000000000000000"),
+            ("0.1.32", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -462,11 +701,12 @@ mod tests {
         let mut pin = release(LOCK)?;
         assert!(reset_on_cancel_release_matches(&pin));
         for (version, commit) in [
-            ("0.1.27", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.28", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.30", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.31", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.31", "0000000000000000000000000000000000000000"),
+            ("0.1.27", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.28", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.30", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.32", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
+            ("0.1.32", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -502,12 +742,13 @@ mod tests {
             Some(KvCache::Rsq4)
         );
         for (version, commit) in [
-            ("0.1.27", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.28", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.30", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.32", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.31", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.31", "0000000000000000000000000000000000000000"),
+            ("0.1.27", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.28", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.30", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.33", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.32", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
+            ("0.1.32", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -528,11 +769,11 @@ mod tests {
         assert_eq!(K4V4_FULL_CONTEXT_RELEASE, MEMORY_CONTEXT_RELEASE);
         assert!(!full_context_release_matches(&pin, None));
         assert!(full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
-        for version in ["0.1.27", "0.1.28", "0.1.30", "0.1.32"] {
+        for version in ["0.1.27", "0.1.28", "0.1.30", "0.1.31", "0.1.33"] {
             pin.version = version.into();
             assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         }
-        pin.version = "0.1.31".into();
+        pin.version = "0.1.32".into();
         pin.commit = "0".repeat(40);
         assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         let other_source = (pin.version.as_str(), pin.commit.as_str());
@@ -557,11 +798,12 @@ mod tests {
             KvCache::Rsq4K3v
         );
         for (version, commit) in [
-            ("0.1.27", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.28", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.30", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.32", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.31", "0000000000000000000000000000000000000000"),
+            ("0.1.27", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.28", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.30", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.33", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.32", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -588,11 +830,12 @@ mod tests {
             "0.1.28",
             "0.1.29",
             "0.1.30",
-            "0.1.32",
-            "0.1.31-dev",
-            "v0.1.31",
-            "0.1.31.0",
-            "0.1.031",
+            "0.1.31",
+            "0.1.33",
+            "0.1.32-dev",
+            "v0.1.32",
+            "0.1.32.0",
+            "0.1.032",
             "",
             "latest",
         ] {
@@ -683,11 +926,12 @@ mod tests {
             "0.1.28",
             "0.1.29",
             "0.1.30",
-            "0.1.32",
-            "0.1.31-dev",
-            "v0.1.31",
-            "0.1.31.0",
-            "0.1.031",
+            "0.1.31",
+            "0.1.33",
+            "0.1.32-dev",
+            "v0.1.32",
+            "0.1.32.0",
+            "0.1.032",
             "",
             "latest",
         ] {
@@ -790,19 +1034,89 @@ mod tests {
     }
 
     #[test]
-    fn broker_pipe_waits_for_a_separately_reviewed_native_release() -> Result<(), LaunchError> {
+    fn broker_pipe_and_0_1_32_capabilities_require_reviewed_release() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
-        assert_eq!(BROKER_PIPE_RELEASE, None);
-        assert!(!broker_pipe_supported()?);
-        assert!(!broker_pipe_release_matches(&pin));
+        assert_eq!(
+            BROKER_PIPE_RELEASE,
+            Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"))
+        );
+        assert!(broker_pipe_supported()?);
+        assert!(broker_pipe_release_matches(&pin));
+        assert!(calibrated_cow_admission_supported()?);
+        assert!(branch_prompt_reuse_supported()?);
+        assert!(cpu_prefill_gdn_supported()?);
+        assert!(cpu_speculation_supported()?);
         for (version, commit) in [
             ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.32", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.32", "0000000000000000000000000000000000000000"),
+            ("0.1.33", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
             assert!(!broker_pipe_release_matches(&pin));
+            assert!(!reviewed_release_matches(
+                &pin,
+                CALIBRATED_COW_ADMISSION_RELEASE
+            ));
+            assert!(!reviewed_release_matches(&pin, BRANCH_PROMPT_REUSE_RELEASE));
+            assert!(!reviewed_release_matches(&pin, CPU_PREFILL_GDN_RELEASE));
+            assert!(!reviewed_release_matches(&pin, CPU_SPECULATION_RELEASE));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_0_1_32_session_enums_validate_exact_tokens_and_reject_aliases()
+    -> Result<(), LaunchError> {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            PromptReuseMode::parse(Some(OsStr::new("disabled")))?,
+            PromptReuseMode::Disabled
+        );
+        assert!(!PromptReuseMode::Disabled.enabled());
+        assert_eq!(
+            PromptReuseMode::parse(Some(OsStr::new("latest")))?,
+            PromptReuseMode::Latest
+        );
+        assert!(PromptReuseMode::Latest.enabled());
+        assert_eq!(
+            PromptReuseMode::parse(Some(OsStr::new("prompt-end-and-latest")))?,
+            PromptReuseMode::PromptEndAndLatest
+        );
+        assert!(PromptReuseMode::PromptEndAndLatest.enabled());
+        assert!(PromptReuseMode::parse(Some(OsStr::new("prompt_end"))).is_err());
+
+        assert_eq!(
+            CpuPrefillGdn::parse(Some(OsStr::new("sequential")))?,
+            CpuPrefillGdn::Sequential
+        );
+        assert!(!CpuPrefillGdn::Sequential.is_wy_f32());
+        assert_eq!(
+            CpuPrefillGdn::parse(Some(OsStr::new("wy-f32")))?,
+            CpuPrefillGdn::WyF32
+        );
+        assert!(CpuPrefillGdn::WyF32.is_wy_f32());
+        assert!(CpuPrefillGdn::parse(Some(OsStr::new("wy"))).is_err());
+
+        assert_eq!(
+            SpeculationType::parse(Some(OsStr::new("none")))?,
+            SpeculationType::None
+        );
+        assert_eq!(
+            SpeculationType::parse(Some(OsStr::new("suffix")))?,
+            SpeculationType::Suffix
+        );
+        assert!(SpeculationType::parse(Some(OsStr::new("ngram"))).is_err());
+
+        let x1 = CpuFamily::parse(Some(OsStr::new("x1")))?;
+        let x2 = CpuFamily::parse(Some(OsStr::new("x2")))?;
+        assert_eq!(x1.as_str(), "x1");
+        assert_eq!(x2.as_str(), "x2");
+        assert_eq!(x1.default_row_workers(), 8);
+        assert_eq!(x2.default_row_workers(), 8);
+        assert!(CpuFamily::parse(Some(OsStr::new("x3"))).is_err());
         Ok(())
     }
 }

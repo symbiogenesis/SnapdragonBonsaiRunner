@@ -3047,7 +3047,8 @@ mod tests {
     }
 
     #[test]
-    fn require_broker_pipe_enforces_sandbox_native_engine_and_reviewed_release() {
+    fn require_broker_pipe_enforces_sandbox_native_engine_and_reviewed_release()
+    -> Result<(), LaunchError> {
         let mut valid = [
             "--launch-development",
             "--require-native-sandbox",
@@ -3064,23 +3065,19 @@ mod tests {
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
-        // While BROKER_PIPE_RELEASE is None, valid flag combinations fail closed with NativeRuntime.
-        assert_eq!(
-            LaunchConfig::parse(valid.clone()).err(),
-            Some(LaunchError::NativeRuntime)
-        );
+        // With BROKER_PIPE_RELEASE pinned at 0.1.32, valid flag combinations succeed and enable broker pipe.
+        let parsed = LaunchConfig::parse(valid.clone())?;
+        assert!(parsed.uses_broker_pipe()?);
 
         // Duplicate flag is rejected as Arguments.
         let mut dup = valid.clone();
         dup.push("--require-broker-pipe".into());
         assert_eq!(LaunchConfig::parse(dup).err(), Some(LaunchError::Arguments));
 
-        // Optional explicit --backend-port still fails closed with NativeRuntime when release is unpinned.
+        // Optional explicit --backend-port also succeeds with --require-broker-pipe when pinned.
         valid.extend(["--backend-port", "8081"].map(OsString::from));
-        assert_eq!(
-            LaunchConfig::parse(valid).err(),
-            Some(LaunchError::NativeRuntime)
-        );
+        let with_port = LaunchConfig::parse(valid)?;
+        assert!(with_port.uses_broker_pipe()?);
 
         // Invalid combinations reject with Arguments before release gating.
         for bad in [
@@ -3150,6 +3147,7 @@ mod tests {
             LaunchConfig::parse(missing_port).err(),
             Some(LaunchError::Arguments)
         );
+        Ok(())
     }
 
     #[test]

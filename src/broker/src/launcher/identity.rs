@@ -19,6 +19,7 @@ pub(super) enum NativeIdentityError {
     Adapter,
     Vision,
     CpuPrefill,
+    CpuSpeculation,
 }
 
 impl NativeIdentityError {
@@ -37,6 +38,7 @@ impl NativeIdentityError {
             Self::Adapter => "adapter",
             Self::Vision => "vision",
             Self::CpuPrefill => "cpu-prefill",
+            Self::CpuSpeculation => "cpu-speculation",
         }
     }
 }
@@ -60,10 +62,13 @@ pub(super) struct WorkerReadiness {
     legacy_missing_allowed: bool,
     projection_startup_required: bool,
     adapter_execution_digest_required: bool,
-    latest_prompt_reuse: bool,
+    prompt_reuse: crate::inference::PromptReuseMode,
+    prompt_reuse_checkpoints: u8,
     vision: bool,
     kv_cache: Option<crate::inference::KvCache>,
     cpu_prefill: Option<(u8, usize)>,
+    cpu_prefill_gdn_wy_f32: bool,
+    cpu_speculation: Option<(u8, usize, usize)>,
     placement: crate::inference::Placement,
 }
 
@@ -82,10 +87,13 @@ impl WorkerReadiness {
             // Prism 0.1.29+ binds the compiled rank-one adapter execution digest
             // inside `startup_graph_identity` (`:sha256=<64-hex>`).
             adapter_execution_digest_required: patch.is_none_or(|number| number >= 29),
-            latest_prompt_reuse: false,
+            prompt_reuse: crate::inference::PromptReuseMode::Disabled,
+            prompt_reuse_checkpoints: 1,
             vision: false,
             kv_cache: None,
             cpu_prefill: None,
+            cpu_prefill_gdn_wy_f32: false,
+            cpu_speculation: None,
             placement: crate::inference::Placement::Auto,
         }
     }
@@ -106,7 +114,38 @@ impl WorkerReadiness {
     }
 
     pub(super) const fn with_prompt_reuse(mut self, latest: bool) -> Self {
-        self.latest_prompt_reuse = latest;
+        self.prompt_reuse = if latest {
+            crate::inference::PromptReuseMode::Latest
+        } else {
+            crate::inference::PromptReuseMode::Disabled
+        };
+        self
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) const fn with_prompt_reuse_mode(
+        mut self,
+        mode: crate::inference::PromptReuseMode,
+    ) -> Self {
+        self.prompt_reuse = mode;
+        self
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) const fn with_prompt_reuse_checkpoints(mut self, checkpoints: u8) -> Self {
+        self.prompt_reuse_checkpoints = checkpoints;
         self
     }
 
@@ -122,6 +161,33 @@ impl WorkerReadiness {
 
     pub(super) const fn with_cpu_prefill(mut self, prefill: Option<(u8, usize)>) -> Self {
         self.cpu_prefill = prefill;
+        self
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) const fn with_cpu_prefill_gdn(mut self, wy_f32: bool) -> Self {
+        self.cpu_prefill_gdn_wy_f32 = wy_f32;
+        self
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Wired into launcher CLI options in follow-up commit."
+        )
+    )]
+    pub(super) const fn with_cpu_speculation(
+        mut self,
+        speculation: Option<(u8, usize, usize)>,
+    ) -> Self {
+        self.cpu_speculation = speculation;
         self
     }
 
@@ -214,6 +280,8 @@ struct NativeModel<'a> {
     abliteration_scale_range: Option<[u8; 2]>,
     #[serde(default, borrow, deserialize_with = "present")]
     prompt_reuse: Option<Text<'a>>,
+    #[serde(default, deserialize_with = "present")]
+    prompt_reuse_checkpoints: Option<u8>,
     #[serde(default, borrow, deserialize_with = "present")]
     kv_cache: Option<Text<'a>>,
     #[serde(default, borrow, deserialize_with = "present")]
@@ -234,6 +302,14 @@ struct NativeModel<'a> {
     cpu_prefill_tokens: Option<u8>,
     #[serde(default, deserialize_with = "present")]
     cpu_prefill_scratch_bytes: Option<usize>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    cpu_prefill_gdn: Option<Text<'a>>,
+    #[serde(default, deserialize_with = "present")]
+    cpu_speculative_tokens: Option<u8>,
+    #[serde(default, deserialize_with = "present")]
+    cpu_verification_scratch_bytes: Option<usize>,
+    #[serde(default, deserialize_with = "present")]
+    cpu_speculative_checkpoint_bytes: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -276,7 +352,7 @@ fn startup_projection_matches(
         "cpu" => startup.identity.is_none() && no_residency,
         "hexagon-native-q2" => {
             requested == "auto"
-                && workers.cpu_prefill.is_none()
+                && workers.cpu_speculation.is_none()
                 && !repacked
                 && startup.identity.as_deref()
                     == Some("hexagon-hvx-native-q2-resident-v1-experimental")
@@ -286,7 +362,7 @@ fn startup_projection_matches(
         }
         "hexagon-native-q2-partial" => {
             requested == "auto"
-                && workers.cpu_prefill.is_none()
+                && workers.cpu_speculation.is_none()
                 && !repacked
                 && matches!(
                     startup.identity.as_deref(),
@@ -302,6 +378,7 @@ fn startup_projection_matches(
         "external" => {
             requested == "auto"
                 && workers.cpu_prefill.is_none()
+                && workers.cpu_speculation.is_none()
                 && no_residency
                 && startup.identity.as_deref().is_some_and(|identity| {
                     !identity.trim().is_empty()
@@ -321,11 +398,16 @@ fn cache_identity_matches(
 ) -> bool {
     let Some(policy) = workers.kv_cache else {
         return workers.cpu_prefill.is_none()
+            && !workers.cpu_prefill_gdn_wy_f32
+            && workers.cpu_speculation.is_none()
             && model.kv_cache.is_none()
             && model.startup_graph_identity.is_none();
     };
     if workers.cpu_prefill.is_none() && policy == crate::inference::KvCache::F16 {
-        return model.kv_cache.is_none() && model.startup_graph_identity.is_none();
+        return !workers.cpu_prefill_gdn_wy_f32
+            && workers.cpu_speculation.is_none()
+            && model.kv_cache.is_none()
+            && model.startup_graph_identity.is_none();
     }
     let expected_kv = (policy != crate::inference::KvCache::F16).then_some(policy.name());
     let cache = if policy == crate::inference::KvCache::F16 {
@@ -364,6 +446,14 @@ fn cache_identity_matches(
         if write!(identity, ":cpu-tiled-ffn-v1:{tokens}").is_err() {
             return false;
         }
+        if workers.cpu_prefill_gdn_wy_f32 {
+            identity.push_str(":gdn-wy-f32-v1");
+        }
+        if workers.cpu_speculation.is_some() {
+            identity.push_str(":cpu-tiled-verify-v1");
+        }
+    } else if workers.cpu_prefill_gdn_wy_f32 || workers.cpu_speculation.is_some() {
+        return false;
     }
     model.kv_cache.as_deref() == expected_kv
         && model.startup_graph_identity.as_deref() == Some(identity.as_str())
@@ -413,7 +503,11 @@ pub(super) fn validate_native_identity_detailed(
     if !workers.accepts(model.row_workers) {
         return Err(NativeIdentityError::RowWorkers);
     }
-    if model.prompt_reuse.as_deref() != workers.latest_prompt_reuse.then_some("latest") {
+    let expected_checkpoints =
+        (workers.prompt_reuse_checkpoints > 1).then_some(workers.prompt_reuse_checkpoints);
+    if model.prompt_reuse.as_deref() != workers.prompt_reuse.as_wire()
+        || model.prompt_reuse_checkpoints != expected_checkpoints
+    {
         return Err(NativeIdentityError::PromptReuse);
     }
     let adapter_matches = if repacked || adapter {
@@ -437,8 +531,24 @@ pub(super) fn validate_native_identity_detailed(
         .map_or((None, None), |(tokens, scratch)| {
             (Some(tokens), Some(scratch))
         });
-    if (model.cpu_prefill_tokens, model.cpu_prefill_scratch_bytes) != expected_prefill {
+    let expected_gdn = workers.cpu_prefill_gdn_wy_f32.then_some("wy-f32");
+    if (model.cpu_prefill_tokens, model.cpu_prefill_scratch_bytes) != expected_prefill
+        || model.cpu_prefill_gdn.as_deref() != expected_gdn
+    {
         return Err(NativeIdentityError::CpuPrefill);
+    }
+    let expected_speculation = workers
+        .cpu_speculation
+        .map_or((None, None, None), |(tokens, scratch, checkpoint)| {
+            (Some(tokens), Some(scratch), Some(checkpoint))
+        });
+    if (
+        model.cpu_speculative_tokens,
+        model.cpu_verification_scratch_bytes,
+        model.cpu_speculative_checkpoint_bytes,
+    ) != expected_speculation
+    {
+        return Err(NativeIdentityError::CpuSpeculation);
     }
     let placement = (workers.placement == crate::inference::Placement::Cpu).then_some("cpu");
     if model.placement.as_deref() != placement || model.projection_backend.as_deref() != placement {
@@ -977,7 +1087,9 @@ mod tests {
                 Err(NativeIdentityError::CpuPrefill)
             );
 
-            let mut hex_active = prefill_model;
+            // 0.1.32 preserves mixed-phase Hexagon decode alongside CPU tiled prefill
+            // whenever CPU speculation is disabled, while "external" stays excluded.
+            let mut hex_active = prefill_model.clone();
             hex_active["startup_projection"] = projection_startup("hexagon-native-q2");
             assert_eq!(
                 validate_native_identity_detailed(
@@ -986,9 +1098,145 @@ mod tests {
                     true,
                     policy,
                 ),
+                Ok(())
+            );
+
+            let mut external_active = prefill_model;
+            external_active["startup_projection"] = projection_startup("external");
+            assert_eq!(
+                validate_native_identity_detailed(
+                    &model_response(&external_active)?,
+                    false,
+                    true,
+                    policy,
+                ),
                 Err(NativeIdentityError::StartupProjection)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn branch_reuse_gdn_wy_f32_and_speculation_readiness_bind_all_0_1_32_fields()
+    -> Result<(), serde_json::Error> {
+        use crate::inference::{KvCache, PromptReuseMode};
+        use serde_json::json;
+
+        let prefill_scratch = 12_000_000_usize;
+        let verify_scratch = 7_946_432_usize;
+        let checkpoint_bytes = 1_073_741_824_usize;
+
+        // Prompt-end-and-latest reuse with multi-branch checkpoints and chunkwise wy-f32 GDN prefill.
+        let (mut gdn_model, _) = kv_cache_model_for_version("0.1.32", false, false);
+        gdn_model.as_object_mut().map(|o| o.remove("kv_cache"));
+        let base_f16 = gdn_model["startup_graph_identity"]
+            .as_str()
+            .map_or_else(String::new, ToOwned::to_owned)
+            .replace("kv-rsq4-d256-rht3-v1", "kv-f16");
+        gdn_model["startup_projection"] = projection_startup("hexagon-native-q2");
+        gdn_model["prompt_reuse"] = json!("prompt-end-and-latest");
+        gdn_model["prompt_reuse_checkpoints"] = json!(4);
+        gdn_model["cpu_prefill_tokens"] = json!(16);
+        gdn_model["cpu_prefill_scratch_bytes"] = json!(prefill_scratch);
+        gdn_model["cpu_prefill_gdn"] = json!("wy-f32");
+        gdn_model["startup_graph_identity"] =
+            json!(format!("{base_f16}:cpu-tiled-ffn-v1:16:gdn-wy-f32-v1"));
+
+        let gdn_policy = WorkerReadiness::for_version("0.1.32", 8)
+            .with_kv_cache(Some(KvCache::F16))
+            .with_prompt_reuse_mode(PromptReuseMode::PromptEndAndLatest)
+            .with_prompt_reuse_checkpoints(4)
+            .with_cpu_prefill(Some((16, prefill_scratch)))
+            .with_cpu_prefill_gdn(true);
+        let mut gdn_eight = gdn_model.clone();
+        gdn_eight["row_workers"] = json!(8);
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&gdn_eight)?,
+                false,
+                false,
+                gdn_policy,
+            ),
+            Ok(())
+        );
+
+        let mut wrong_gdn = gdn_eight.clone();
+        wrong_gdn
+            .as_object_mut()
+            .map(|o| o.remove("cpu_prefill_gdn"));
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&wrong_gdn)?,
+                false,
+                false,
+                gdn_policy,
+            ),
+            Err(NativeIdentityError::CpuPrefill)
+        );
+
+        let mut wrong_ckpts = gdn_eight;
+        wrong_ckpts["prompt_reuse_checkpoints"] = json!(2);
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&wrong_ckpts)?,
+                false,
+                false,
+                gdn_policy,
+            ),
+            Err(NativeIdentityError::PromptReuse)
+        );
+
+        // Speculative decoding with K4/V4 cache requires CPU projection and :cpu-tiled-verify-v1.
+        let (mut spec_model, base_rsq4) = kv_cache_model_for_version("0.1.32", false, false);
+        spec_model["row_workers"] = json!(8);
+        spec_model["startup_projection"] = projection_startup("cpu");
+        spec_model["cpu_prefill_tokens"] = json!(16);
+        spec_model["cpu_prefill_scratch_bytes"] = json!(prefill_scratch);
+        spec_model["cpu_speculative_tokens"] = json!(4);
+        spec_model["cpu_verification_scratch_bytes"] = json!(verify_scratch);
+        spec_model["cpu_speculative_checkpoint_bytes"] = json!(checkpoint_bytes);
+        spec_model["startup_graph_identity"] = json!(format!(
+            "{base_rsq4}:cpu-tiled-ffn-v1:16:cpu-tiled-verify-v1"
+        ));
+
+        let spec_policy = WorkerReadiness::for_version("0.1.32", 8)
+            .with_kv_cache(Some(KvCache::Rsq4))
+            .with_cpu_prefill(Some((16, prefill_scratch)))
+            .with_cpu_speculation(Some((4, verify_scratch, checkpoint_bytes)));
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&spec_model)?,
+                false,
+                false,
+                spec_policy,
+            ),
+            Ok(())
+        );
+
+        let mut wrong_spec = spec_model.clone();
+        wrong_spec["cpu_speculative_tokens"] = json!(5);
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&wrong_spec)?,
+                false,
+                false,
+                spec_policy,
+            ),
+            Err(NativeIdentityError::CpuSpeculation)
+        );
+
+        let mut hex_spec = spec_model;
+        hex_spec["startup_projection"] = projection_startup("hexagon-native-q2");
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&hex_spec)?,
+                false,
+                false,
+                spec_policy,
+            ),
+            Err(NativeIdentityError::StartupProjection)
+        );
+
         Ok(())
     }
 
