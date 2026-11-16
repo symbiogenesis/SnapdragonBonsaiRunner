@@ -699,7 +699,13 @@ impl LaunchConfig {
                 key_path.as_os_str().to_owned(),
             ]);
         } else {
-            arguments.push(OsString::from("--broker-pipe"));
+            let verified_sections =
+                1_usize + usize::from(plan.adapter.is_some()) + usize::from(plan.mmproj.is_some());
+            arguments.extend([
+                OsString::from("--broker-pipe"),
+                OsString::from("--verified-sections"),
+                OsString::from(verified_sections.to_string()),
+            ]);
         }
         arguments.extend([OsString::from("--seed"), OsString::from("42")]);
         if crate::inference::memory_context_supported().unwrap_or(false) {
@@ -791,7 +797,17 @@ impl LaunchConfig {
         mmproj: Option<&bonsai_artifacts::VerifiedFile>,
         credentials: &PrivateCredentials,
         broker_pipe: bool,
-    ) -> Result<(OwnedProcess, Option<(std::fs::File, std::fs::File)>), LaunchError> {
+    ) -> Result<
+        (
+            OwnedProcess,
+            Option<(
+                std::fs::File,
+                std::fs::File,
+                Vec<crate::pipe_transport::VerifiedSectionAttestation>,
+            )>,
+        ),
+        LaunchError,
+    > {
         if !self.requires_native_sandbox() {
             return OwnedProcess::start(specification)
                 .map(|process| (process, None))
@@ -802,6 +818,9 @@ impl LaunchConfig {
             specification.executable.clone(),
             artifacts.model().to_owned(),
         ]);
+        if self.native_engine && self.placement == crate::inference::Placement::Auto {
+            readonly_paths.extend(hexagon_runtime_readonly_paths(&self.data));
+        }
         if !broker_pipe && credentials.has_backend_file() {
             readonly_paths.push(credentials.backend_path().to_owned());
         }
@@ -813,20 +832,63 @@ impl LaunchConfig {
             readonly_paths,
             writable_directory: specification.working_directory.clone(),
         };
-        let started = if broker_pipe {
-            OwnedProcess::start_sandboxed_broker_pipe(specification, &policy)
-                .map(|(process, child_in, child_out)| (process, Some((child_in, child_out))))
+        if broker_pipe {
+            let mut section_files: Vec<&std::fs::File> = Vec::with_capacity(3);
+            let mut section_digests: Vec<[u8; 32]> = Vec::with_capacity(3);
+            let model_hash = if self.uses_repacked_ptq1() {
+                crate::inference::REPACKED_PTQ1_SHA256
+            } else {
+                crate::inference::MODEL_SHA256
+            };
+            section_files.push(artifacts.model_file().ok_or(LaunchError::Artifacts)?);
+            section_digests.push(decode_sha256_hex(model_hash)?);
+            if let Some(adapter_file) = adapter {
+                section_files.push(adapter_file.file().ok_or(LaunchError::Artifacts)?);
+                section_digests.push(decode_sha256_hex(crate::inference::ADAPTER_SHA256)?);
+            }
+            if let Some(mmproj_file) = mmproj {
+                section_files.push(mmproj_file.file().ok_or(LaunchError::Artifacts)?);
+                section_digests.push(decode_sha256_hex(crate::inference::MMPROJ_SHA256)?);
+            }
+            let (process, child_in, child_out, grants) =
+                OwnedProcess::start_sandboxed_broker_pipe_with_sections(
+                    specification,
+                    &policy,
+                    &section_files,
+                )
+                .map_err(|error| {
+                    let _result = write_sandbox_failure(&mut io::stderr().lock(), &error);
+                    LaunchError::Sandbox
+                })?;
+            if grants.len() != section_digests.len() {
+                return Err(LaunchError::Process);
+            }
+            let mut attestations = Vec::with_capacity(grants.len());
+            for (index, (grant, sha256)) in grants.into_iter().zip(section_digests).enumerate() {
+                let expected_slot = u32::try_from(index).map_err(|_| LaunchError::Process)?;
+                if grant.slot != expected_slot || grant.child_handle == 0 || grant.bytes == 0 {
+                    return Err(LaunchError::Process);
+                }
+                attestations.push(crate::pipe_transport::VerifiedSectionAttestation {
+                    slot: grant.slot,
+                    child_handle: grant.child_handle,
+                    bytes: grant.bytes,
+                    sha256,
+                });
+            }
+            Ok((process, Some((child_in, child_out, attestations))))
         } else {
-            OwnedProcess::start_sandboxed(specification, &policy).map(|process| (process, None))
-        };
-        started.map_err(|error| {
-            // The native boundary emits fixed validation reasons or Windows API
-            // errors, never arguments, file contents or credential values. Keep
-            // that technical cause in the broker's retained stderr while the UI
-            // continues to receive only the value-free launch classification.
-            let _result = write_sandbox_failure(&mut io::stderr().lock(), &error);
-            LaunchError::Sandbox
-        })
+            OwnedProcess::start_sandboxed(specification, &policy)
+                .map(|process| (process, None))
+                .map_err(|error| {
+                    // The native boundary emits fixed validation reasons or Windows API
+                    // errors, never arguments, file contents or credential values. Keep
+                    // that technical cause in the broker's retained stderr while the UI
+                    // continues to receive only the value-free launch classification.
+                    let _result = write_sandbox_failure(&mut io::stderr().lock(), &error);
+                    LaunchError::Sandbox
+                })
+        }
     }
 
     /// Verify pinned artifacts, create credentials, launch and await authenticated readiness.
@@ -1062,11 +1124,12 @@ impl LaunchConfig {
             if attempt == 0 {
                 startup_timing.phase(StartupPhase::AuthenticatedReadiness);
             }
-            let readiness = if let Some((child_stdin, child_stdout)) = pipe_handles {
-                match crate::pipe_transport::PipeBackend::connect_stdio(
+            let readiness = if let Some((child_stdin, child_stdout, attestations)) = pipe_handles {
+                match crate::pipe_transport::PipeBackend::connect_stdio_with_sections(
                     child_stdin,
                     child_stdout,
                     credentials.backend_key(),
+                    &attestations,
                 ) {
                     Ok(pipe_backend) => wait_ready_models_pipe(
                         &process,
@@ -1614,6 +1677,40 @@ const fn containment(
 
 fn number(value: Option<OsString>) -> Result<u16, LaunchError> {
     crate::configuration::decimal_u16(value).ok_or(LaunchError::Arguments)
+}
+
+fn decode_sha256_hex(hex: &str) -> Result<[u8; 32], LaunchError> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return Err(LaunchError::Artifacts);
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let nibble = |byte: u8| -> Result<u8, LaunchError> {
+            match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                _ => Err(LaunchError::Artifacts),
+            }
+        };
+        let slot = digest.get_mut(index).ok_or(LaunchError::Artifacts)?;
+        *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Ok(digest)
+}
+
+fn hexagon_runtime_readonly_paths(data: &std::path::Path) -> Vec<PathBuf> {
+    const HEXAGON_RUNTIME_FILES: [&str; 3] = [
+        "libggml-htp-v81.so",
+        "libggml-htp-v73.so",
+        "hexagon-runtime.receipt.json",
+    ];
+    let runtime_dir = data.join("hexagon").join("runtime");
+    HEXAGON_RUNTIME_FILES
+        .into_iter()
+        .map(|name| runtime_dir.join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn admit(required: u64) -> Result<(), LaunchError> {
@@ -3551,6 +3648,82 @@ mod tests {
             LaunchConfig::parse(reference).err(),
             Some(LaunchError::Arguments)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_arguments_emit_verified_sections_for_broker_pipe_and_omit_for_loopback()
+    -> Result<(), LaunchError> {
+        let mut args = arguments();
+        args.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        let config = LaunchConfig::parse(args)?;
+        let data = std::env::temp_dir().join("Bonsai-verified-sections-args");
+        let key = data.join("backend.key");
+        let mmproj =
+            bonsai_cpu_policy::swift_mmproj_artifact(&data).map_err(|_| LaunchError::Policy)?;
+
+        for (with_adapter, with_mmproj, expected_count) in [
+            (false, false, "1"),
+            (true, false, "2"),
+            (false, true, "2"),
+            (true, true, "3"),
+        ] {
+            let mut plan = super::LaunchPlan::for_profile_with_options(
+                &data,
+                8081,
+                &key,
+                LaunchProfile::SwiftPq2Assessment,
+                with_adapter,
+                false,
+            )
+            .map_err(|_| LaunchError::Policy)?;
+            assert_eq!(plan.adapter.is_some(), with_adapter);
+            if with_mmproj {
+                plan.enable_swift_mmproj(mmproj.clone())
+                    .map_err(|_| LaunchError::Policy)?;
+            }
+
+            let pipe_args = config.native_arguments(&plan, None);
+            assert!(pipe_args.iter().any(|arg| arg == "--broker-pipe"));
+            assert!(
+                pipe_args
+                    .array_windows::<2>()
+                    .any(|pair| pair[0] == "--verified-sections" && pair[1] == expected_count)
+            );
+            assert!(!pipe_args.iter().any(|arg| arg == "--key-file"));
+
+            let loopback_args = config.native_arguments(&plan, Some(&key));
+            assert!(!loopback_args.iter().any(|arg| arg == "--broker-pipe"));
+            assert!(!loopback_args.iter().any(|arg| arg == "--verified-sections"));
+            assert!(loopback_args.iter().any(|arg| arg == "--key-file"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hexagon_runtime_readonly_paths_selects_present_runtime_files_only() -> std::io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "Bonsai-hexagon-readonly-paths-{}",
+            std::process::id()
+        ));
+        let _cleanup = std::fs::remove_dir_all(&root);
+        assert!(super::hexagon_runtime_readonly_paths(&root).is_empty());
+
+        let runtime_dir = root.join("hexagon").join("runtime");
+        std::fs::create_dir_all(&runtime_dir)?;
+        std::fs::write(runtime_dir.join("libggml-htp-v81.so"), b"so81")?;
+        std::fs::write(runtime_dir.join("hexagon-runtime.receipt.json"), b"{}")?;
+        std::fs::write(runtime_dir.join("unrelated.bin"), b"ignored")?;
+
+        let selected = super::hexagon_runtime_readonly_paths(&root);
+        assert_eq!(
+            selected,
+            vec![
+                runtime_dir.join("libggml-htp-v81.so"),
+                runtime_dir.join("hexagon-runtime.receipt.json"),
+            ]
+        );
+        std::fs::remove_dir_all(&root)?;
         Ok(())
     }
 }

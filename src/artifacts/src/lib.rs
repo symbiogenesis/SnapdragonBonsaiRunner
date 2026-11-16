@@ -461,6 +461,12 @@ impl VerifiedFile {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Locked read-only regular file handle held stable by this guard.
+    #[must_use]
+    pub fn file(&self) -> Option<&File> {
+        self._handles.last()
+    }
 }
 
 /// Verify multiple artifacts concurrently across up to four scoped OS worker
@@ -1852,6 +1858,11 @@ mod tests {
                 total_checks += 1;
                 Ok(())
             })?;
+        assert!(
+            guard
+                .file()
+                .is_some_and(|file| file.metadata().is_ok_and(|metadata| metadata.is_file()))
+        );
         drop(guard);
         assert!(total_checks >= 5);
 

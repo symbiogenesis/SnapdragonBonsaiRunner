@@ -184,6 +184,11 @@ impl VerifiedArtifacts {
     pub fn model(&self) -> &Path {
         &self.model
     }
+    /// Locked read-only model file handle held stable by verification handles.
+    #[cfg(windows)]
+    pub(crate) fn model_file(&self) -> Option<&std::fs::File> {
+        self._model.as_ref().and_then(VerifiedFile::file)
+    }
     /// Complete installed runtime directory.
     #[must_use]
     pub fn runtime_directory(&self) -> &Path {
