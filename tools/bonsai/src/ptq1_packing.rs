@@ -127,8 +127,8 @@ fn block_matches(source: &[u8], output: &[u8]) -> crate::Result<()> {
     if source.len() != 34 || output.len() != 28 || source[..2] != output[26..] {
         return Err("PTQ1 packing changed raw scale bytes or block extent.".into());
     }
-    let scale = half::f16::from_le_bytes([source[0], source[1]]);
-    if !scale.is_finite() || scale == half::f16::ZERO {
+    let scale_bits = u16::from_le_bytes([source[0], source[1]]);
+    if (scale_bits & 0x7fff) == 0 || (scale_bits & 0x7c00) == 0x7c00 {
         return Err("PTQ1 packing requires finite nonzero raw FP16 scales.".into());
     }
     for (first, start, stride, groups) in [(0, 2, 4, 4), (16, 22, 2, 2)] {

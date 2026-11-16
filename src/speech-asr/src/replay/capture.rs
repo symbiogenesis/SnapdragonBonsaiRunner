@@ -64,19 +64,7 @@ impl CacheValues<'_> {
     fn bits(self, index: usize) -> u32 {
         match self {
             Self::F32(values) => values[index].to_bits(),
-            Self::F16(values) => {
-                let bits = values[index];
-                let value = half::f16::from_bits(bits);
-                if value.is_nan() {
-                    // Hardware `FCVT` and `half::f16::to_f32()` quiet signaling NaNs;
-                    // capture verification requires preserving unquieted NaN payload bits.
-                    (u32::from(bits & 0x8000) << 16)
-                        | 0x7f80_0000
-                        | (u32::from(bits & 0x03ff) << 13)
-                } else {
-                    value.to_f32().to_bits()
-                }
-            }
+            Self::F16(values) => bonsai_ternary::half_to_float(values[index]).to_bits(),
         }
     }
 }

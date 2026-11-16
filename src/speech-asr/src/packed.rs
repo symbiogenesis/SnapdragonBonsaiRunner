@@ -154,14 +154,21 @@ fn half_scale(bytes: &[u8]) -> f32 {
 }
 
 #[inline]
-pub(super) fn unpack_q4_k_scale_min(group: usize, packed: &[u8]) -> (u8, u8) {
-    if group < 4 {
-        (packed[group] & 63, packed[group + 4] & 63)
-    } else {
-        (
-            (packed[group + 4] & 15) | ((packed[group - 4] >> 6) << 4),
-            (packed[group + 4] >> 4) | ((packed[group] >> 6) << 4),
-        )
+pub(super) const fn unpack_q4_k_scale_min(group: usize, packed: &[u8]) -> (u8, u8) {
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        quant_kernels::unpack_q4_k_scale_min(group, packed)
+    }
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    {
+        if group < 4 {
+            (packed[group] & 63, packed[group + 4] & 63)
+        } else {
+            (
+                (packed[group + 4] & 15) | ((packed[group - 4] >> 6) << 4),
+                (packed[group + 4] >> 4) | ((packed[group] >> 6) << 4),
+            )
+        }
     }
 }
 
@@ -1745,6 +1752,32 @@ pub(super) fn attend_head(
     Ok(())
 }
 
+/// Narrows finite `f32` to IEEE binary16 bits using round-ties-to-even, returning `None`
+/// when `value` is nonfinite or rounds to infinity (`|value| >= 65520`).
+#[inline]
+pub(super) fn checked_float_to_half(value: f32) -> Option<u16> {
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        quant_kernels::checked_float_to_half(value)
+    }
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    {
+        if (value.to_bits() & 0x7fff_ffff) >= 0x477f_f000 {
+            return None;
+        }
+        let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
+        let bits = value.to_bits();
+        let doubled = bits.wrapping_add(bits);
+        let exponent_bias = (doubled & 0xff00_0000).max(0x7100_0000);
+        base += f32::from_bits((exponent_bias >> 1) + 0x0780_0000);
+        let rounded = base.to_bits();
+        let magnitude = ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff);
+        let word = ((bits >> 16) & 0x8000) | magnitude;
+        let [lo, hi, _, _] = word.to_le_bytes();
+        Some(u16::from_le_bytes([lo, hi]))
+    }
+}
+
 /// Narrow finite `f32` values into IEEE binary16 words (`FCVTN` SIMD on ARM64 Windows),
 /// returning `false` on non-finite input, length mismatch, or overflow past finite `f16` range.
 pub(super) fn narrow_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) -> bool {
@@ -1758,14 +1791,10 @@ pub(super) fn narrow_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) -> bool {
     #[cfg(not(all(windows, feature = "rust-qualification")))]
     {
         for (&value, slot) in src.iter().zip(dst.iter_mut()) {
-            if !value.is_finite() {
+            let Some(bits) = checked_float_to_half(value) else {
                 return false;
-            }
-            let narrowed = half::f16::from_f32(value);
-            if !narrowed.is_finite() {
-                return false;
-            }
-            *slot = narrowed.to_bits();
+            };
+            *slot = bits;
         }
         true
     }
@@ -1773,16 +1802,28 @@ pub(super) fn narrow_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) -> bool {
 
 /// Widen IEEE binary16 words into `f32` values (`FCVTL` SIMD on ARM64 Windows).
 pub(super) fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
-    let n = src.len().min(dst.len());
-    let (src8, src_rem) = src[..n].as_chunks::<8>();
-    let (dst8, dst_rem) = dst[..n].as_chunks_mut::<8>();
-    for (s, d) in src8.iter().zip(dst8.iter_mut()) {
-        let [lo, hi] = bonsai_neon_dot::widen_f16_eight(s);
-        d[..4].copy_from_slice(&lo);
-        d[4..].copy_from_slice(&hi);
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    {
+        quant_kernels::widen_f16_slice(src, dst);
     }
-    for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
-        *slot = bonsai_ternary::half_to_float(bits);
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    {
+        let n = src.len().min(dst.len());
+        let (src8, src_tail) = src[..n].as_chunks::<8>();
+        let (dst8, dst_tail) = dst[..n].as_chunks_mut::<8>();
+        for (s, d) in src8.iter().zip(dst8.iter_mut()) {
+            let [lo, hi] = bonsai_neon_dot::widen_f16_eight(s);
+            d[..4].copy_from_slice(&lo);
+            d[4..].copy_from_slice(&hi);
+        }
+        let (src4, src_rem) = src_tail.as_chunks::<4>();
+        let (dst4, dst_rem) = dst_tail.as_chunks_mut::<4>();
+        if let (Some(s), Some(d)) = (src4.first(), dst4.first_mut()) {
+            *d = bonsai_neon_dot::widen_f16_four(s);
+        }
+        for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
+            *slot = bonsai_ternary::half_to_float(bits);
+        }
     }
 }
 
@@ -1926,7 +1967,7 @@ mod tests {
                         .iter()
                         .zip(input.as_chunks::<32>().0)
                     {
-                        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                        let scale = super::half_scale(&block[0..2]);
                         for (&byte, activation) in block[2..].iter().zip(activations) {
                             *target += (scale * f32::from(byte.cast_signed())) * *activation;
                         }
@@ -1989,7 +2030,7 @@ mod tests {
                 .iter()
                 .zip(&act_blocks)
             {
-                let w_d = half::f16::from_le_bytes([w_blk[0], w_blk[1]]).to_f32();
+                let w_d = super::half_scale(&w_blk[0..2]);
                 let mut idot = 0_i32;
                 for (&wb, &ab) in w_blk[2..].iter().zip(act_qs) {
                     idot += i32::from(wb.cast_signed()) * ab;

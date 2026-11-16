@@ -559,15 +559,8 @@ fn cache_value(value: f32, precision: CachePrecision) -> io::Result<f32> {
 // Shared exact nearest-even conversion for F16 cache and convolution operands.
 // Reject finite values that would narrow to infinity before graph publication.
 pub(super) fn binary16_operand(value: f32) -> io::Result<f32> {
-    if !value.is_finite() {
-        return Err(invalid());
-    }
-    let narrowed = half::f16::from_f32(value);
-    if !narrowed.is_finite() {
-        Err(invalid())
-    } else {
-        Ok(narrowed.to_f32())
-    }
+    let bits = packed::checked_float_to_half(value).ok_or_else(invalid)?;
+    Ok(bonsai_ternary::half_to_float(bits))
 }
 
 /// Reviewed single-stream geometry for a Qwen3 causal decoder.
