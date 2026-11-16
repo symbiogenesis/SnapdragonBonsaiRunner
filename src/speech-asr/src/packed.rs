@@ -62,10 +62,11 @@ impl PreparedBatch {
     pub(super) fn prepare_into(&mut self, raw_input: &[f32], batch: usize, input: usize) {
         self.input = input;
         self.batch = batch;
-        self.num_quads = batch / 4;
+        self.num_quads = batch.div_ceil(4);
         if self.num_quads > 0 && input > 0 {
             self.quads.resize(self.num_quads * input, [0.0; 4]);
-            for q in 0..self.num_quads {
+            let full_quads = batch / 4;
+            for q in 0..full_quads {
                 let p0 = &raw_input[(q * 4) * input..(q * 4 + 1) * input];
                 let p1 = &raw_input[(q * 4 + 1) * input..(q * 4 + 2) * input];
                 let p2 = &raw_input[(q * 4 + 2) * input..(q * 4 + 3) * input];
@@ -73,6 +74,30 @@ impl PreparedBatch {
                 let dst = &mut self.quads[q * input..(q + 1) * input];
                 for col in 0..input {
                     dst[col] = [p0[col], p1[col], p2[col], p3[col]];
+                }
+            }
+            let rem = batch % 4;
+            if rem > 0 {
+                let base = full_quads * 4;
+                let p0 = &raw_input[base * input..(base + 1) * input];
+                let p1 = if rem > 1 {
+                    &raw_input[(base + 1) * input..(base + 2) * input]
+                } else {
+                    p0
+                };
+                let p2 = if rem > 2 {
+                    &raw_input[(base + 2) * input..(base + 3) * input]
+                } else {
+                    p0
+                };
+                let dst = &mut self.quads[full_quads * input..(full_quads + 1) * input];
+                for col in 0..input {
+                    dst[col] = [
+                        p0[col],
+                        if rem > 1 { p1[col] } else { 0.0 },
+                        if rem > 2 { p2[col] } else { 0.0 },
+                        0.0,
+                    ];
                 }
             }
         } else {
@@ -660,20 +685,19 @@ fn scatter_quads_simd<S: Simd>(
 }
 
 /// Bit-exact matrix multiplication for a pre-transposed batch `[batch, input]`
-/// using `4x8` / `4x4` SIMD tiles, `1x4` tail positions, and `row_workers`.
+/// using `4x8` / `4x4` SIMD tiles (with zero-padded partial trailing quads) and `row_workers`.
 pub(super) fn multiply_batch_prepared_into(
     weights: WeightMatrix<'_>,
     prepared: &PreparedBatch,
-    raw_input: &[f32],
+    _raw_input: &[f32],
     workers: usize,
     transposed_scratch: &mut Vec<f32>,
     out: &mut [f32],
 ) {
     let output = weights.output;
-    let input = weights.input;
     let num_quads = prepared.num_quads;
     let level = simd_level();
-    if num_quads > 0 {
+    if num_quads > 0 && output > 0 {
         let row_stride = num_quads * 4;
         let needed = output * row_stride;
         if transposed_scratch.len() < needed {
@@ -687,22 +711,27 @@ pub(super) fn multiply_batch_prepared_into(
                 simd => batch_rows_simd(simd, weights, start_row, &prepared.quads, num_quads, slice)
             );
         });
-        let quad_out = &mut out[..row_stride * output];
-        row_workers::run_aligned(quad_out, workers, 4 * output, &|elem_off, slice| {
-            dispatch!(
-                level,
-                simd => scatter_quads_simd(simd, transposed, row_stride, output, elem_off, slice)
-            );
-        });
-    }
-    let tail_start = num_quads * 4;
-    for pos in tail_start..prepared.batch {
-        multiply_single_into(
-            weights,
-            &raw_input[pos * input..(pos + 1) * input],
-            workers,
-            &mut out[pos * output..(pos + 1) * output],
-        );
+        let full_quads = prepared.batch / 4;
+        if full_quads > 0 {
+            let quad_out = &mut out[..full_quads * 4 * output];
+            row_workers::run_aligned(quad_out, workers, 4 * output, &|elem_off, slice| {
+                dispatch!(
+                    level,
+                    simd => scatter_quads_simd(simd, transposed, row_stride, output, elem_off, slice)
+                );
+            });
+        }
+        let rem = prepared.batch % 4;
+        if rem > 0 {
+            let tail_quad = full_quads * 4;
+            let tail_out = &mut out[tail_quad * output..prepared.batch * output];
+            for pos in 0..rem {
+                let dst_row = &mut tail_out[pos * output..(pos + 1) * output];
+                for (r, dst) in dst_row.iter_mut().enumerate() {
+                    *dst = transposed[r * row_stride + tail_quad + pos];
+                }
+            }
+        }
     }
 }
 
