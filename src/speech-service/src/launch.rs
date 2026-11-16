@@ -217,17 +217,39 @@ pub fn verify_models(
             let files = pin.get("files").ok_or_else(invalid_models)?;
             let codec = arguments.codec.as_ref().ok_or_else(invalid_models)?;
             let voice_model = arguments.voice_model.as_ref().ok_or_else(invalid_models)?;
-            vec![
-                verify_artifact(
-                    &arguments.model,
-                    files.get("talker").ok_or_else(invalid_models)?,
-                )?,
-                verify_artifact(codec, files.get("codec").ok_or_else(invalid_models)?)?,
-                verify_artifact(
-                    voice_model,
-                    files.get("voice_talker").ok_or_else(invalid_models)?,
-                )?,
-            ]
+            let (talker_bytes, talker_hash) = parse_artifact_pin(
+                &arguments.model,
+                files.get("talker").ok_or_else(invalid_models)?,
+            )?;
+            let (codec_bytes, codec_hash) =
+                parse_artifact_pin(codec, files.get("codec").ok_or_else(invalid_models)?)?;
+            let (voice_bytes, voice_hash) = parse_artifact_pin(
+                voice_model,
+                files.get("voice_talker").ok_or_else(invalid_models)?,
+            )?;
+            let (talker_res, codec_res, voice_res) = std::thread::scope(|scope| {
+                let codec_job = std::thread::Builder::new()
+                    .name("speech-verify-codec".to_owned())
+                    .spawn_scoped(scope, move || {
+                        verify_pinned_file(codec, codec_bytes, codec_hash)
+                    });
+                let voice_job = std::thread::Builder::new()
+                    .name("speech-verify-voice".to_owned())
+                    .spawn_scoped(scope, move || {
+                        verify_pinned_file(voice_model, voice_bytes, voice_hash)
+                    });
+                let talker_res = verify_pinned_file(&arguments.model, talker_bytes, talker_hash);
+                let codec_res = match codec_job {
+                    Ok(handle) => handle.join().unwrap_or_else(|_| Err(invalid_models())),
+                    Err(_) => verify_pinned_file(codec, codec_bytes, codec_hash),
+                };
+                let voice_res = match voice_job {
+                    Ok(handle) => handle.join().unwrap_or_else(|_| Err(invalid_models())),
+                    Err(_) => verify_pinned_file(voice_model, voice_bytes, voice_hash),
+                };
+                (talker_res, codec_res, voice_res)
+            });
+            vec![talker_res?, codec_res?, voice_res?]
         }
     };
     Ok(ModelGuards {
@@ -236,7 +258,11 @@ pub fn verify_models(
     })
 }
 
-fn verify_artifact(path: &Path, pin: &serde_json::Value) -> io::Result<VerifiedFile> {
+fn verify_pinned_file(path: &Path, bytes: u64, hash: &str) -> io::Result<VerifiedFile> {
+    VerifiedFile::verify(path, bytes, hash).map_err(|_| invalid_models())
+}
+
+fn parse_artifact_pin<'a>(path: &Path, pin: &'a serde_json::Value) -> io::Result<(u64, &'a str)> {
     validate_file(path)?;
     let bytes = pin
         .get("bytes")
@@ -254,6 +280,11 @@ fn verify_artifact(path: &Path, pin: &serde_json::Value) -> io::Result<VerifiedF
     {
         return Err(invalid_models());
     }
+    Ok((bytes, hash))
+}
+
+fn verify_artifact(path: &Path, pin: &serde_json::Value) -> io::Result<VerifiedFile> {
+    let (bytes, hash) = parse_artifact_pin(path, pin)?;
     VerifiedFile::verify(path, bytes, hash).map_err(|_| invalid_models())
 }
 
