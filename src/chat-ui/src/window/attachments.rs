@@ -245,9 +245,13 @@ impl State {
                     && self.audio_import.is_none();
 
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(can_audio, egui::Button::selectable(false, "Audio files"))
-                        .clicked()
+                    if attachment_option_button(
+                        ui,
+                        AttachmentOptionIcon::Audio,
+                        "Audio files",
+                        can_audio,
+                    )
+                    .clicked()
                     {
                         ui.close();
                         self.start_audio_import(crate::audio_import::Source::Picker {
@@ -264,22 +268,24 @@ impl State {
                         }
                     }
                 });
-                if ui
-                    .add_enabled(
-                        can_draft_attach,
-                        egui::Button::selectable(false, "Text files"),
-                    )
-                    .clicked()
+                if attachment_option_button(
+                    ui,
+                    AttachmentOptionIcon::Text,
+                    "Text files",
+                    can_draft_attach,
+                )
+                .clicked()
                 {
                     ui.close();
                     self.start_attachment_import(PickerKind::Text);
                 }
-                if ui
-                    .add_enabled(
-                        can_draft_attach,
-                        egui::Button::selectable(false, "Images and Videos"),
-                    )
-                    .clicked()
+                if attachment_option_button(
+                    ui,
+                    AttachmentOptionIcon::Media,
+                    "Images and Videos",
+                    can_draft_attach,
+                )
+                .clicked()
                 {
                     ui.close();
                     self.start_attachment_import(PickerKind::Media);
@@ -419,5 +425,144 @@ pub(super) fn truncate_name(name: &str, max_chars: usize) -> String {
         format!("{collected}…")
     } else {
         collected
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AttachmentOptionIcon {
+    Audio,
+    Text,
+    Media,
+}
+
+fn attachment_option_button(
+    ui: &mut egui::Ui,
+    icon: AttachmentOptionIcon,
+    label: &'static str,
+    enabled: bool,
+) -> egui::Response {
+    let icon_atom = egui::Atom::paint(egui::Vec2::splat(16.0), move |ui, args| {
+        paint_attachment_option_icon(ui, args.rect, icon, args.fallback_text_color);
+    });
+    ui.add_enabled(
+        enabled,
+        egui::Button::selectable(false, (icon_atom, label))
+            .gap(8.0)
+            .corner_radius(8),
+    )
+    .accessible_name(label)
+}
+
+fn paint_attachment_option_icon(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    icon: AttachmentOptionIcon,
+    color: Color32,
+) {
+    let painter = ui.painter_at(rect);
+    let point = |x, y| rect.min + egui::vec2(x, y);
+    let stroke = egui::Stroke::new(1.4, color);
+    match icon {
+        AttachmentOptionIcon::Audio => {
+            for (x, half_h) in [
+                (2.5_f32, 2.5_f32),
+                (5.5, 5.5),
+                (8.0, 3.5),
+                (10.5, 6.0),
+                (13.5, 3.0),
+            ] {
+                painter.line_segment([point(x, 8.0 - half_h), point(x, 8.0 + half_h)], stroke);
+            }
+        }
+        AttachmentOptionIcon::Text => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    point(3.0, 1.5),
+                    point(10.0, 1.5),
+                    point(13.0, 4.5),
+                    point(13.0, 14.5),
+                    point(3.0, 14.5),
+                ],
+                stroke,
+            ));
+            painter.add(egui::Shape::line(
+                vec![point(10.0, 1.5), point(10.0, 4.5), point(13.0, 4.5)],
+                stroke,
+            ));
+            painter.line_segment([point(5.5, 8.0), point(10.5, 8.0)], stroke);
+            painter.line_segment([point(5.5, 11.0), point(9.5, 11.0)], stroke);
+        }
+        AttachmentOptionIcon::Media => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(point(1.5, 2.5), point(14.5, 13.5)),
+                2.0,
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            painter.circle_stroke(point(5.2, 6.2), 1.3, stroke);
+            painter.add(egui::Shape::line(
+                vec![
+                    point(2.5, 12.5),
+                    point(6.5, 8.5),
+                    point(9.2, 11.0),
+                    point(11.5, 8.8),
+                    point(14.0, 11.8),
+                ],
+                stroke,
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT as _, Queryable as _},
+    };
+
+    #[test]
+    fn attachment_option_buttons_paint_consistent_vector_icons_for_each_kind() {
+        for (icon, label, enabled) in [
+            (AttachmentOptionIcon::Audio, "Audio files", false),
+            (AttachmentOptionIcon::Audio, "Audio files", true),
+            (AttachmentOptionIcon::Text, "Text files", true),
+            (AttachmentOptionIcon::Media, "Images and Videos", true),
+        ] {
+            let mut baseline = Harness::builder()
+                .with_size([260.0, 60.0])
+                .with_context_setup(super::super::configure)
+                .build_ui(|ui| {
+                    ui.add_enabled(
+                        enabled,
+                        egui::Button::selectable(false, label)
+                            .gap(8.0)
+                            .corner_radius(8),
+                    )
+                    .accessible_name(label);
+                });
+            baseline.step();
+            let baseline_width = baseline
+                .get_by_role_and_label(egui::Role::Button, label)
+                .rect()
+                .width();
+
+            let mut with_icon = Harness::builder()
+                .with_size([260.0, 60.0])
+                .with_context_setup(super::super::configure)
+                .build_ui(|ui| {
+                    attachment_option_button(ui, icon, label, enabled);
+                });
+            with_icon.step();
+
+            let node = with_icon.get_by_role_and_label(egui::Role::Button, label);
+            let icon_width = node.rect().width();
+            assert_eq!(node.accesskit_node().is_disabled(), !enabled);
+            assert!(
+                icon_width >= baseline_width + 20.0,
+                "{label} ({enabled}): expected 16pt icon + 8pt gap width increase, got {icon_width} vs {baseline_width}"
+            );
+        }
     }
 }
