@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bonsai_windows_process::{
-    MAX_WORKER_PRIVATE_STORAGE_BYTES, MAX_WORKER_PRIVATE_STORAGE_ENTRIES, OwnedProcess,
-    ParentProcess, ProcessSpec, SandboxNetwork, SandboxPolicy, ToolProcessSpec,
+    MAX_INHERITED_SECTIONS, MAX_WORKER_PRIVATE_STORAGE_BYTES, MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
+    OwnedProcess, ParentProcess, ProcessSpec, SandboxNetwork, SandboxPolicy, ToolProcessSpec,
     available_memory_bytes, listener_process_id, native_sandbox_available,
     native_sandbox_offline_available,
 };
@@ -1277,5 +1277,147 @@ fn native_sandbox_broker_pipe_abrupt_owner_death_ends_worker() -> io::Result<()>
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(true),
         Err(error) => Err(error),
     })?;
+    Ok(())
+}
+
+#[test]
+fn broker_pipe_with_sections_enforces_bounds_and_file_kinds_before_creating_streams()
+-> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    let lane = Lane::new("broker-pipe-section-bounds")?;
+    let scratch = lane.path.join("scratch");
+    fs::create_dir(&scratch)?;
+    let mut spec = lane.spec(vec![OsString::from("sleep")]);
+    spec.working_directory.clone_from(&scratch);
+    spec.active_process_limit = 1;
+
+    let valid_path = lane.path.join("model.bin");
+    fs::write(&valid_path, b"model-section-bytes")?;
+    let valid_file = fs::File::open(&valid_path)?;
+    let policy = SandboxPolicy {
+        readonly_paths: vec![spec.executable.clone()],
+        writable_directory: scratch.clone(),
+    };
+
+    // More than MAX_INHERITED_SECTIONS (8) must reject with InvalidInput before creating streams.
+    let too_many: Vec<&fs::File> = vec![&valid_file; MAX_INHERITED_SECTIONS + 1];
+    let error = OwnedProcess::start_sandboxed_broker_pipe_with_sections(&spec, &policy, &too_many)
+        .err()
+        .ok_or_else(|| io::Error::other("excess inherited sections were accepted"))?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(!spec.stdout.exists());
+    assert!(!spec.stderr.exists());
+
+    // Empty (0-byte) files must reject with InvalidInput before creating streams.
+    let empty_path = lane.path.join("empty.bin");
+    fs::write(&empty_path, b"")?;
+    let empty_file = fs::File::open(&empty_path)?;
+    let error =
+        OwnedProcess::start_sandboxed_broker_pipe_with_sections(&spec, &policy, &[&empty_file])
+            .err()
+            .ok_or_else(|| io::Error::other("empty section file was accepted"))?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(!spec.stdout.exists());
+    assert!(!spec.stderr.exists());
+
+    // Non-regular directory handles must reject with InvalidInput before creating streams.
+    let dir_handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&lane.path)?;
+    let error =
+        OwnedProcess::start_sandboxed_broker_pipe_with_sections(&spec, &policy, &[&dir_handle])
+            .err()
+            .ok_or_else(|| io::Error::other("directory section handle was accepted"))?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(!spec.stdout.exists());
+    assert!(!spec.stderr.exists());
+
+    // Multi-process limit must reject cleanly with valid sections without creating streams.
+    spec.active_process_limit = 2;
+    let error =
+        OwnedProcess::start_sandboxed_broker_pipe_with_sections(&spec, &policy, &[&valid_file])
+            .err()
+            .ok_or_else(|| io::Error::other("multi-process broker-pipe section launch succeeded"))?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(!spec.stdout.exists());
+    assert!(!spec.stderr.exists());
+
+    // Exactly MAX_INHERITED_SECTIONS valid files followed by invalid policy drops all section
+    // handles cleanly without creating evidence files.
+    spec.active_process_limit = 1;
+    let invalid_policy = SandboxPolicy {
+        readonly_paths: Vec::new(),
+        writable_directory: scratch,
+    };
+    let exact_max: Vec<&fs::File> = vec![&valid_file; MAX_INHERITED_SECTIONS];
+    let error = OwnedProcess::start_sandboxed_broker_pipe_with_sections(
+        &spec,
+        &invalid_policy,
+        &exact_max,
+    )
+    .err()
+    .ok_or_else(|| io::Error::other("invalid sandbox policy launched with max sections"))?;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(!spec.stdout.exists());
+    assert!(!spec.stderr.exists());
+
+    drop(dir_handle);
+    drop(empty_file);
+    drop(valid_file);
+    let _ = fs::remove_dir_all(&lane.path);
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires a native Windows PSEC v1.1 host."]
+fn native_sandbox_broker_pipe_with_sections_inherits_grants_and_stops_cleanly() -> io::Result<()> {
+    native_sandbox_offline_available()?;
+    let lane = Lane::new("broker-pipe-sections")?;
+    let scratch = lane.path.join("scratch");
+    fs::create_dir(&scratch)?;
+    let section_a_path = lane.path.join("section-a.bin");
+    let section_b_path = lane.path.join("section-b.bin");
+    fs::write(&section_a_path, b"alpha-weights-fixture")?;
+    fs::write(&section_b_path, b"beta-weights-fixture-extra")?;
+    let file_a = fs::File::open(&section_a_path)?;
+    let file_b = fs::File::open(&section_b_path)?;
+
+    let mut spec = lane.spec(vec![OsString::from("sandbox-broker-pipe-wait")]);
+    spec.working_directory.clone_from(&scratch);
+    spec.active_process_limit = 1;
+    let policy = SandboxPolicy {
+        readonly_paths: vec![spec.executable.clone()],
+        writable_directory: scratch,
+    };
+    let (process, input, mut output, grants) =
+        OwnedProcess::start_sandboxed_broker_pipe_with_sections(
+            &spec,
+            &policy,
+            &[&file_a, &file_b],
+        )?;
+    assert_eq!(grants.len(), 2);
+    assert_eq!(grants[0].slot, 0);
+    assert_eq!(grants[0].bytes, 21);
+    assert_ne!(grants[0].child_handle, 0);
+    assert_eq!(grants[1].slot, 1);
+    assert_eq!(grants[1].bytes, 26);
+    assert_ne!(grants[1].child_handle, 0);
+    assert_ne!(grants[0].child_handle, grants[1].child_handle);
+    assert_eq!(process.active_processes()?, 1);
+
+    let mut alive = [0_u8; 6];
+    output.read_exact(&mut alive)?;
+    assert_eq!(&alive, b"alive\n");
+
+    drop((input, output));
+    process.stop(TIMEOUT)?;
+    assert_eq!(process.active_processes()?, 0);
+    assert!(spec.stdout.exists());
+    assert_eq!(fs::metadata(&spec.stdout)?.len(), 0);
+    assert!(fs::read_to_string(&spec.stderr)?.contains("stderr-alive"));
+    drop((file_a, file_b));
+    let _ = fs::remove_dir_all(&lane.path);
     Ok(())
 }

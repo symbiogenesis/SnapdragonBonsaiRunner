@@ -897,6 +897,20 @@ pub enum SandboxNetwork {
     Offline,
 }
 
+/// Maximum number of explicit read-only sections inherited by a broker-pipe worker.
+pub const MAX_INHERITED_SECTIONS: usize = 8;
+
+/// Inherited `PAGE_READONLY` Windows section handle granted to a contained broker-pipe child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InheritedSectionGrant {
+    /// Zero-based caller-assigned section slot matching the input slice index.
+    pub slot: u32,
+    /// Raw inherited Windows `HANDLE` value valid in the child process.
+    pub child_handle: u64,
+    /// Nonzero byte length of the regular file backed by the section.
+    pub bytes: u64,
+}
+
 /// Maximum aggregate private storage permitted across a contained worker's scratch
 /// directory and Windows-managed AppContainer storage folder (64 MiB).
 pub const MAX_WORKER_PRIVATE_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
@@ -1135,11 +1149,40 @@ impl OwnedProcess {
         spec: &ProcessSpec,
         policy: &SandboxPolicy,
     ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
+        let (process, input, output, _grants) =
+            Self::start_sandboxed_broker_pipe_with_sections(spec, policy, &[])?;
+        Ok((process, input, output))
+    }
+
+    /// Starts an offline broker-pipe inference worker with explicit inherited `PAGE_READONLY` sections.
+    ///
+    /// Creates one unnamed `PAGE_READONLY` section per supplied regular non-empty file,
+    /// duplicates each handle into an inheritable descriptor attenuated strictly to
+    /// `SECTION_MAP_READ | SECTION_QUERY`, passes those section handles alongside
+    /// `[stdin, stdout, stderr]` in `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and closes the parent's
+    /// inheritable section handles before returning `(process, parent_stdin, parent_stdout, grants)`.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if more than [`MAX_INHERITED_SECTIONS`] files are supplied, any
+    /// file is empty or not a regular non-reparse file, or launch/policy validation fails;
+    /// returns native section creation, containment, or AppContainer verification errors otherwise.
+    pub fn start_sandboxed_broker_pipe_with_sections(
+        spec: &ProcessSpec,
+        policy: &SandboxPolicy,
+        sections: &[&std::fs::File],
+    ) -> io::Result<(Self, std::fs::File, std::fs::File, Vec<InheritedSectionGrant>)> {
+        if sections.len() > MAX_INHERITED_SECTIONS {
+            return Err(invalid(
+                "broker-pipe worker accepts at most eight inherited read-only sections",
+            ));
+        }
         Self::validate_sandboxed(spec, std::iter::empty())?;
         let command = command_line(&spec.executable, &spec.arguments)?;
-        let (process, input, output) =
-            native::NativeProcess::start_sandboxed_broker_pipe(spec, command, policy)?;
-        Ok((Self(process), input, output))
+        let (process, input, output, grants) =
+            native::NativeProcess::start_sandboxed_broker_pipe_with_sections(
+                spec, command, policy, sections,
+            )?;
+        Ok((Self(process), input, output, grants))
     }
 
     fn validate_sandboxed(

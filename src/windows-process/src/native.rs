@@ -7,6 +7,7 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::windows::fs::MetadataExt as _;
 use std::os::windows::io::{
     AsRawHandle as _, AsRawSocket as _, AsSocket, FromRawHandle as _, FromRawSocket as _,
     OwnedHandle, OwnedSocket, RawHandle,
@@ -16,9 +17,10 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES,
-    FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    LocalFree, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
+    ERROR_NO_MORE_FILES, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
@@ -35,8 +37,8 @@ use windows_sys::Win32::Security::{
     TokenAppContainerSid, TokenIsAppContainer,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -50,6 +52,9 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
+};
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, PAGE_READONLY, SECTION_MAP_READ, SECTION_QUERY,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::ProcessStatus::{
@@ -433,6 +438,68 @@ enum PipeMode {
     },
 }
 
+struct InheritableReadOnlySection {
+    slot: u32,
+    handle: OwnedHandle,
+    bytes: u64,
+}
+
+impl InheritableReadOnlySection {
+    fn new(slot: u32, file: &std::fs::File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(invalid(
+                "inherited read-only section requires a regular non-reparse file",
+            ));
+        }
+        let bytes = metadata.len();
+        if bytes == 0 {
+            return Err(invalid(
+                "inherited read-only section file must be non-empty",
+            ));
+        }
+        // SAFETY: `file` is an open handle borrowed synchronously; null security
+        // attributes and name create a non-inheritable unnamed section for the full file.
+        let raw_section = unsafe {
+            CreateFileMappingW(file.as_raw_handle(), null(), PAGE_READONLY, 0, 0, null())
+        };
+        let section = owned(raw_section)?;
+        // SAFETY: GetCurrentProcess returns the current-process pseudo handle without ownership.
+        let current = unsafe { GetCurrentProcess() };
+        let mut inheritable = null_mut();
+        // SAFETY: Both process handles are the borrowed current-process pseudo handle,
+        // `section` is a live owned handle, `inheritable` is writable local storage, and
+        // desired access attenuates the inheritable duplicate to read/query rights only.
+        check(unsafe {
+            DuplicateHandle(
+                current,
+                section.as_raw_handle(),
+                current,
+                &raw mut inheritable,
+                SECTION_MAP_READ | SECTION_QUERY,
+                1,
+                0,
+            )
+        })?;
+        let handle = owned(inheritable)?;
+        Ok(Self {
+            slot,
+            handle,
+            bytes,
+        })
+    }
+
+    fn grant(&self) -> io::Result<crate::InheritedSectionGrant> {
+        let child_handle = u64::try_from(self.handle.as_raw_handle().addr())
+            .map_err(|_| invalid("inherited section handle exceeds u64"))?;
+        Ok(crate::InheritedSectionGrant {
+            slot: self.slot,
+            child_handle,
+            bytes: self.bytes,
+        })
+    }
+}
+
 pub(super) struct NativeProcess {
     // Drop order closes the Job before the root process handle.
     job: OwnedHandle,
@@ -464,6 +531,7 @@ impl NativeProcess {
             None,
             PipeMode::None,
             None,
+            Vec::new(),
         )
     }
 
@@ -483,6 +551,7 @@ impl NativeProcess {
             None,
             PipeMode::None,
             None,
+            Vec::new(),
         )
     }
 
@@ -509,6 +578,7 @@ impl NativeProcess {
             Some(containment),
             PipeMode::None,
             Some(policy.writable_directory.clone()),
+            Vec::new(),
         )
     }
 
@@ -537,11 +607,31 @@ impl NativeProcess {
         )
     }
 
-    pub(super) fn start_sandboxed_broker_pipe(
+    pub(super) fn start_sandboxed_broker_pipe_with_sections(
         spec: &ProcessSpec,
         command: Vec<u16>,
         policy: &SandboxPolicy,
-    ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
+        section_files: &[&std::fs::File],
+    ) -> io::Result<(
+        Self,
+        std::fs::File,
+        std::fs::File,
+        Vec<crate::InheritedSectionGrant>,
+    )> {
+        if section_files.len() > crate::MAX_INHERITED_SECTIONS {
+            return Err(invalid(
+                "broker-pipe worker accepts at most eight inherited read-only sections",
+            ));
+        }
+        let mut sections = Vec::with_capacity(section_files.len());
+        let mut grants = Vec::with_capacity(section_files.len());
+        for (index, file) in section_files.iter().enumerate() {
+            let slot = u32::try_from(index)
+                .map_err(|_| invalid("inherited section slot index overflow"))?;
+            let section = InheritableReadOnlySection::new(slot, file)?;
+            grants.push(section.grant()?);
+            sections.push(section);
+        }
         let environment = containment::minimal_child_environment(policy)?;
         let containment = containment::Environment::create(spec, policy, SandboxNetwork::Offline)?;
         let (child_input, parent_input) = anonymous_pipe(true)?;
@@ -564,8 +654,9 @@ impl NativeProcess {
                 output: child_output,
             },
             Some(policy.writable_directory.clone()),
+            sections,
         )?;
-        Ok((process, parent_input.into(), parent_output.into()))
+        Ok((process, parent_input.into(), parent_output.into(), grants))
     }
 
     fn start_sandboxed_piped_with_environment(
@@ -596,6 +687,7 @@ impl NativeProcess {
                 output: child_output,
             },
             Some(policy.writable_directory.clone()),
+            Vec::new(),
         )?;
         Ok((process, parent_input.into(), parent_output.into()))
     }
@@ -624,6 +716,7 @@ impl NativeProcess {
             None,
             PipeMode::None,
             None,
+            Vec::new(),
         )
     }
 
@@ -634,19 +727,23 @@ impl NativeProcess {
         containment: Option<containment::Environment>,
         pipes: PipeMode,
         writable_root: Option<PathBuf>,
+        sections: Vec<InheritableReadOnlySection>,
     ) -> io::Result<Self> {
         let executable = wide(spec.executable.as_os_str());
         let directory = wide(spec.working_directory.as_os_str());
         let job = launch_job(spec)?;
         let ([input, output, error_output], pending_captures) =
             standard_streams(spec, pipes, containment.is_some())?;
+        let mut inherited_handles = Vec::with_capacity(3 + sections.len());
+        inherited_handles.extend([
+            input.as_raw_handle(),
+            output.as_raw_handle(),
+            error_output.as_raw_handle(),
+        ]);
+        inherited_handles.extend(sections.iter().map(|section| section.handle.as_raw_handle()));
         let attributes = CreationAttributes::new(
             job.as_raw_handle(),
-            [
-                input.as_raw_handle(),
-                output.as_raw_handle(),
-                error_output.as_raw_handle(),
-            ],
+            inherited_handles,
             spec.mitigation_profile.flags(),
             containment.as_ref().map(containment::Environment::raw),
         )?;
@@ -660,10 +757,11 @@ impl NativeProcess {
         let mut info = PROCESS_INFORMATION::default();
         // SAFETY: All strings are terminated and mutable command storage is live.
         // Attributes hold stable buffers and live handles. HANDLE_LIST restricts
-        // inheritance to the three streams; JOB_LIST assigns the Job atomically
-        // before child code can run. An optional complete double-NUL-terminated
-        // UTF-16 environment block stays allocated; null inherits unchanged.
-        // Both process/thread handles are noninheritable, no breakaway is enabled.
+        // inheritance to the standard streams and validated read-only sections;
+        // JOB_LIST assigns the Job atomically before child code can run. An optional
+        // complete double-NUL-terminated UTF-16 environment block stays allocated;
+        // null inherits unchanged. Both process/thread handles are noninheritable,
+        // and no breakaway is enabled.
         check(unsafe {
             CreateProcessW(
                 executable.as_ptr(),
@@ -681,6 +779,9 @@ impl NativeProcess {
                 &raw mut info,
             )
         })?;
+        // Attribute list must be deleted before closing the parent handles it referenced.
+        drop(attributes);
+        drop(sections);
         let process = owned(info.hProcess)?;
         let thread = owned(info.hThread)?;
         let captures = match pending_captures
@@ -1744,7 +1845,7 @@ const HEADLESS_MITIGATIONS: u64 = (1 << 12) | (1 << 28) | (1 << 32) | (1 << 52) 
 
 struct CreationAttributes {
     storage: Vec<usize>,
-    handles: Box<[HANDLE; 3]>,
+    handles: Box<[HANDLE]>,
     jobs: Box<[HANDLE; 1]>,
     mitigations: Option<Box<u64>>,
     security_environment: Option<Box<HANDLE>>,
@@ -1754,10 +1855,13 @@ struct CreationAttributes {
 impl CreationAttributes {
     fn new(
         job: HANDLE,
-        handles: [HANDLE; 3],
+        handles: Vec<HANDLE>,
         mitigations: Option<u64>,
         security_environment: Option<HANDLE>,
     ) -> io::Result<Self> {
+        if handles.is_empty() {
+            return Err(invalid("process attribute handle list must be non-empty"));
+        }
         let count =
             2 + u32::from(mitigations.is_some()) + u32::from(security_environment.is_some());
         let mut bytes = 0;
@@ -1768,7 +1872,7 @@ impl CreationAttributes {
         }
         let mut value = Self {
             storage: vec![0; bytes.div_ceil(size_of::<usize>())],
-            handles: Box::new(handles),
+            handles: handles.into_boxed_slice(),
             jobs: Box::new([job]),
             mitigations: mitigations.map(Box::new),
             security_environment: security_environment.map(Box::new),
@@ -1898,5 +2002,97 @@ mod tests {
             return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
         }
         Ok(enabled)
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use std::fs::{self, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GetHandleInformation};
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::System::Memory::{
+        FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+    };
+
+    use super::*;
+
+    #[test]
+    fn inheritable_readonly_section_attenuates_rights_sets_inherit_and_rejects_invalid_files()
+    -> io::Result<()> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "Bonsai-InheritableSection-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir)?;
+
+        let payload = b"verified-readonly-section-payload";
+        let file_path = dir.join("weights.bin");
+        fs::write(&file_path, payload)?;
+        let file = fs::File::open(&file_path)?;
+
+        let section = InheritableReadOnlySection::new(3, &file)?;
+        let grant = section.grant()?;
+        assert_eq!(grant.slot, 3);
+        assert_eq!(
+            grant.bytes,
+            u64::try_from(payload.len()).map_err(io::Error::other)?
+        );
+        assert_ne!(grant.child_handle, 0);
+
+        let mut flags = 0_u32;
+        // SAFETY: `section.handle` is a live owned section handle and `flags` is writable.
+        check(unsafe { GetHandleInformation(section.handle.as_raw_handle(), &raw mut flags) })?;
+        assert_ne!(flags & HANDLE_FLAG_INHERIT, 0);
+
+        // SAFETY: `section.handle` holds SECTION_MAP_READ over a non-empty PAGE_READONLY section.
+        let view = unsafe { MapViewOfFile(section.handle.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
+        assert!(!view.Value.is_null());
+        // SAFETY: `view.Value` maps `payload.len()` readable bytes for this immutable borrow.
+        let mapped = unsafe { std::slice::from_raw_parts(view.Value.cast::<u8>(), payload.len()) };
+        assert_eq!(mapped, payload);
+        // SAFETY: `view` was returned by MapViewOfFile and is no longer borrowed.
+        check(unsafe { UnmapViewOfFile(view) })?;
+
+        // Write mapping must be denied on the attenuated PAGE_READONLY section handle.
+        // SAFETY: `section.handle` is live; requesting FILE_MAP_WRITE checks access denial.
+        let write_view =
+            unsafe { MapViewOfFile(section.handle.as_raw_handle(), FILE_MAP_WRITE, 0, 0, 0) };
+        assert!(write_view.Value.is_null());
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            i32::try_from(ERROR_ACCESS_DENIED).ok()
+        );
+
+        drop(section);
+
+        let empty_path = dir.join("empty.bin");
+        fs::write(&empty_path, b"")?;
+        let empty = fs::File::open(&empty_path)?;
+        let empty_err = InheritableReadOnlySection::new(0, &empty)
+            .err()
+            .ok_or_else(|| io::Error::other("empty file accepted for section"))?;
+        assert_eq!(empty_err.kind(), io::ErrorKind::InvalidInput);
+
+        let dir_handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&dir)?;
+        let dir_err = InheritableReadOnlySection::new(0, &dir_handle)
+            .err()
+            .ok_or_else(|| io::Error::other("directory handle accepted for section"))?;
+        assert_eq!(dir_err.kind(), io::ErrorKind::InvalidInput);
+
+        drop(dir_handle);
+        drop(empty);
+        drop(file);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
