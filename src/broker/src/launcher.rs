@@ -690,7 +690,7 @@ impl LaunchConfig {
                 OsString::from("--context-tokens"),
                 OsString::from(plan.context_tokens.to_string()),
                 OsString::from("--memory-limit-bytes"),
-                OsString::from(plan.memory_limit_bytes.to_string()),
+                OsString::from(plan.native_child_memory_limit_bytes().to_string()),
             ]);
         }
         if self.native_row_workers > 1 {
@@ -732,33 +732,30 @@ impl LaunchConfig {
         &self,
         plan: LaunchPlan,
         credentials: &PrivateCredentials,
-        native: Option<(PathBuf, bonsai_artifacts::VerifiedFile)>,
+        native_executable: Option<&std::path::Path>,
         broker_pipe: bool,
-    ) -> Result<(ProcessSpec, Option<bonsai_artifacts::VerifiedFile>), LaunchError> {
+    ) -> Result<ProcessSpec, LaunchError> {
         // The worker may write only this child, never the sibling keys or logs.
         // Its parent already has the credential owner's protected inheritable ACL.
         let working_directory = credentials.directory().join("worker");
         std::fs::create_dir(&working_directory).map_err(|_| LaunchError::Path)?;
         validate_external_path(&working_directory).map_err(|_| LaunchError::Path)?;
-        let (executable, arguments, guard) = if let Some((executable, guard)) = native {
+        let (executable, arguments) = if let Some(executable) = native_executable {
             let key_path = (!broker_pipe).then(|| credentials.backend_path());
             let arguments = self.native_arguments(&plan, key_path);
-            (executable, arguments, Some(guard))
+            (executable.to_path_buf(), arguments)
         } else {
-            (plan.executable, plan.arguments, None)
+            (plan.executable, plan.arguments)
         };
-        Ok((
-            ProcessSpec {
-                executable,
-                arguments,
-                working_directory,
-                stdout: credentials.directory().join("backend.stdout"),
-                stderr: credentials.directory().join("backend.stderr"),
-                memory_limit_bytes: plan.memory_limit_bytes,
-                active_process_limit: 1,
-            },
-            guard,
-        ))
+        Ok(ProcessSpec {
+            executable,
+            arguments,
+            working_directory,
+            stdout: credentials.directory().join("backend.stdout"),
+            stderr: credentials.directory().join("backend.stderr"),
+            memory_limit_bytes: plan.memory_limit_bytes,
+            active_process_limit: 1,
+        })
     }
 
     fn start_process(
@@ -841,6 +838,7 @@ impl LaunchConfig {
         shutdown: impl Future<Output = io::Result<()>>,
         observe: impl FnMut(StartupProgress),
     ) -> Result<LaunchedService, LaunchError> {
+        const MAX_MEMORY_STARTUP_ATTEMPTS: usize = 3;
         // Register cancellation before synchronous policy/artifact work. The CLI
         // retains this same future across startup and serving, so a signal in
         // the readiness-to-serving handoff remains observable.
@@ -876,7 +874,7 @@ impl LaunchConfig {
             native_executable,
             artifacts,
             adapter,
-            mut mmproj,
+            mmproj,
         } = self.verify_launch_artifacts(&preliminary)?;
         startup_timing.phase(StartupPhase::AdapterVerification);
         if poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_ready())).await {
@@ -889,164 +887,234 @@ impl LaunchConfig {
             PrivateCredentials::create(&self.evidence_parent)
         }
         .map_err(|_| LaunchError::Credentials)?;
-        let mut plan = LaunchPlan::for_profile_with_options(
-            &self.data,
-            self.backend_port,
-            credentials.backend_path(),
-            self.profile,
-            self.use_abliterate_lora,
-            self.uses_repacked_ptq1(),
-        )
-        .map_err(|_| LaunchError::Policy)?;
-        if self.memory_context_supported()? {
-            let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
-            let profile = self.swift_context_profile()?;
-            let (context, vision_admitted) =
-                bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_vision(
-                    available,
-                    profile,
-                    mmproj.is_some(),
-                )
-                .map_err(|_| LaunchError::Memory)?;
-            if !vision_admitted {
-                mmproj = None;
-            }
-            plan.select_swift_context(context)
-                .map_err(|_| LaunchError::Policy)?;
-        }
-        if let Some((artifact, _)) = &mmproj {
-            plan.enable_swift_mmproj(artifact.clone())
-                .map_err(|_| LaunchError::Policy)?;
-        }
-        let vision_enabled = mmproj.is_some();
-        let mmproj_file = mmproj.map(|(_, guard)| guard);
-        let context_tokens = plan.context_tokens;
-        // Reserve only as a collision check in TCP modes; offline broker-pipe binds no port.
-        let reservation = if broker_pipe {
-            None
-        } else {
-            Some(bound_loopback_socket(self.backend_port).map_err(|_| LaunchError::Port)?)
+        let (native_executable_path, native_executable) = match native_executable {
+            Some((path, guard)) => (Some(path), Some(guard)),
+            None => (None, None),
         };
-        admit(plan.required_available_bytes)?;
-        let (specification, native_executable) =
-            self.specification(plan, &credentials, native_executable, broker_pipe)?;
-        validate_external_path(&specification.executable).map_err(|_| LaunchError::Path)?;
-        drop(reservation);
+        let (mmproj_artifact, mmproj_file) = match mmproj {
+            Some((artifact, guard)) => (Some(artifact), Some(guard)),
+            None => (None, None),
+        };
         let storage_budget = self.requires_native_sandbox().then_some((
             MAX_WORKER_PRIVATE_STORAGE_BYTES,
             MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
         ));
-        let worker_root = specification.working_directory.clone();
-        startup_timing.phase(StartupPhase::ProcessCreation);
-        let (process, pipe_handles) = self.start_process(
-            &specification,
-            &artifacts,
-            adapter.as_ref(),
-            mmproj_file.as_ref(),
-            &credentials,
-            broker_pipe,
-        )?;
-        if guard(
-            &process,
-            specification.memory_limit_bytes,
-            storage_budget,
-            Some(worker_root.as_path()),
-        )
-        .is_err()
-        {
-            // Keep sandbox storage rejections distinct if the check tripped right after spawn.
-            let err = check_storage_budget(&process, storage_budget, Some(worker_root.as_path()))
-                .err()
-                .unwrap_or(LaunchError::Backend);
-            process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-            return Err(err);
-        }
-        startup_timing.phase(StartupPhase::AuthenticatedReadiness);
-        let (pipe_backend, models) = if let Some((child_stdin, child_stdout)) = pipe_handles {
-            let pipe_backend = match crate::pipe_transport::PipeBackend::connect_stdio(
-                child_stdin,
-                child_stdout,
-                credentials.backend_key(),
-            ) {
-                Ok(backend) => backend,
-                Err(_) => {
-                    note_startup_failure(
-                        StartupStage::AuthenticatedReadiness,
-                        LaunchError::Backend,
-                        &process,
-                    );
-                    process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-                    return Err(LaunchError::Backend);
-                }
-            };
-            let models = match wait_ready_models_pipe(
-                &process,
-                &pipe_backend,
-                credentials.backend_key(),
-                specification.memory_limit_bytes,
-                storage_budget,
-                Some(worker_root.as_path()),
-                shutdown,
-            )
-            .await
-            {
-                Ok(models) => models,
-                Err(error) => {
-                    note_startup_failure(StartupStage::AuthenticatedReadiness, error, &process);
-                    process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-                    return Err(error);
-                }
-            };
-            (Some(pipe_backend), models)
+        let memory_context_supported = self.memory_context_supported()?;
+        let max_attempts = if memory_context_supported {
+            MAX_MEMORY_STARTUP_ATTEMPTS
         } else {
-            let models = match wait_ready_models(
-                &process,
+            1
+        };
+
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                if poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_ready())).await {
+                    return Err(LaunchError::Cancelled);
+                }
+                reset_worker_attempt_files(credentials.directory())?;
+            }
+            let mut plan = LaunchPlan::for_profile_with_options(
+                &self.data,
                 self.backend_port,
-                credentials.backend_key(),
+                credentials.backend_path(),
+                self.profile,
+                self.use_abliterate_lora,
+                self.uses_repacked_ptq1(),
+            )
+            .map_err(|_| LaunchError::Policy)?;
+            // Reserve as a collision check in TCP modes before sampling free RAM so
+            // socket binding cannot widen the window between context sizing and admission.
+            let reservation = if broker_pipe {
+                None
+            } else {
+                Some(bound_loopback_socket(self.backend_port).map_err(|_| LaunchError::Port)?)
+            };
+            let mut active_mmproj = mmproj_artifact.clone();
+            if memory_context_supported {
+                let raw_available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
+                let retry_margin = u64::try_from(attempt)
+                    .unwrap_or(0)
+                    .saturating_mul(bonsai_cpu_policy::context::STARTUP_RESERVE_BYTES);
+                let available = raw_available.saturating_sub(retry_margin);
+                let profile = self.swift_context_profile()?;
+                let (context, vision_admitted) =
+                    match bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_vision(
+                        available,
+                        profile,
+                        active_mmproj.is_some(),
+                    ) {
+                        Ok(result) => result,
+                        Err(_) if attempt > 0 => {
+                            // If the extra retry margin pushed below minimum context, try raw available RAM.
+                            bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_vision(
+                                raw_available,
+                                profile,
+                                active_mmproj.is_some(),
+                            )
+                            .map_err(|_| LaunchError::Memory)?
+                        }
+                        Err(_) => return Err(LaunchError::Memory),
+                    };
+                if !vision_admitted {
+                    active_mmproj = None;
+                }
+                plan.select_swift_context(context)
+                    .map_err(|_| LaunchError::Policy)?;
+            }
+            if let Some(artifact) = &active_mmproj {
+                plan.enable_swift_mmproj(artifact.clone())
+                    .map_err(|_| LaunchError::Policy)?;
+            }
+            let vision_enabled = active_mmproj.is_some();
+            let active_mmproj_guard = vision_enabled.then(|| mmproj_file.as_ref()).flatten();
+            let context_tokens = plan.context_tokens;
+            if let Err(error) = admit(plan.required_available_bytes) {
+                drop(reservation);
+                if error == LaunchError::Memory && attempt + 1 < max_attempts {
+                    continue;
+                }
+                return Err(error);
+            }
+            let specification = self.specification(
+                plan,
+                &credentials,
+                native_executable_path.as_deref(),
+                broker_pipe,
+            )?;
+            validate_external_path(&specification.executable).map_err(|_| LaunchError::Path)?;
+            drop(reservation);
+            let worker_root = specification.working_directory.clone();
+            if attempt == 0 {
+                startup_timing.phase(StartupPhase::ProcessCreation);
+            }
+            let (process, pipe_handles) = self.start_process(
+                &specification,
+                &artifacts,
+                adapter.as_ref(),
+                active_mmproj_guard,
+                &credentials,
+                broker_pipe,
+            )?;
+            if guard(
+                &process,
                 specification.memory_limit_bytes,
                 storage_budget,
                 Some(worker_root.as_path()),
-                shutdown,
             )
-            .await
+            .is_err()
             {
-                Ok(models) => models,
+                // Keep sandbox storage rejections distinct if the check tripped right after spawn.
+                let err =
+                    check_storage_budget(&process, storage_budget, Some(worker_root.as_path()))
+                        .err()
+                        .unwrap_or(LaunchError::Backend);
+                let status = wait_briefly_for_exit(&process, err);
+                process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+                let (refined, child_stage) =
+                    refine_backend_startup_error(err, &specification.stderr);
+                if (refined == LaunchError::Memory
+                    || child_stage == Some(ChildStartupStage::Memory))
+                    && attempt + 1 < max_attempts
+                {
+                    continue;
+                }
+                if refined != LaunchError::Sandbox {
+                    let _result = write_startup_failure(
+                        &mut io::stderr().lock(),
+                        StartupStage::AuthenticatedReadiness,
+                        refined,
+                        &status,
+                    );
+                }
+                return Err(refined);
+            }
+            if attempt == 0 {
+                startup_timing.phase(StartupPhase::AuthenticatedReadiness);
+            }
+            let readiness = if let Some((child_stdin, child_stdout)) = pipe_handles {
+                match crate::pipe_transport::PipeBackend::connect_stdio(
+                    child_stdin,
+                    child_stdout,
+                    credentials.backend_key(),
+                ) {
+                    Ok(pipe_backend) => wait_ready_models_pipe(
+                        &process,
+                        &pipe_backend,
+                        credentials.backend_key(),
+                        specification.memory_limit_bytes,
+                        storage_budget,
+                        Some(worker_root.as_path()),
+                        shutdown.as_mut(),
+                    )
+                    .await
+                    .map(|models| (Some(pipe_backend), models)),
+                    Err(_) => Err(LaunchError::Backend),
+                }
+            } else {
+                wait_ready_models(
+                    &process,
+                    self.backend_port,
+                    credentials.backend_key(),
+                    specification.memory_limit_bytes,
+                    storage_budget,
+                    Some(worker_root.as_path()),
+                    shutdown.as_mut(),
+                )
+                .await
+                .map(|models| (None, models))
+            };
+            let (pipe_backend, models) = match readiness {
+                Ok(ready) => ready,
                 Err(error) => {
-                    note_startup_failure(StartupStage::AuthenticatedReadiness, error, &process);
+                    let status = wait_briefly_for_exit(&process, error);
                     process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-                    return Err(error);
+                    let (refined, child_stage) =
+                        refine_backend_startup_error(error, &specification.stderr);
+                    if (refined == LaunchError::Memory
+                        || child_stage == Some(ChildStartupStage::Memory))
+                        && attempt + 1 < max_attempts
+                    {
+                        continue;
+                    }
+                    let _result = write_startup_failure(
+                        &mut io::stderr().lock(),
+                        StartupStage::AuthenticatedReadiness,
+                        refined,
+                        &status,
+                    );
+                    return Err(refined);
                 }
             };
-            (None, models)
-        };
-        if self.native_engine {
-            startup_timing.phase(StartupPhase::NativeIdentity);
-            self.confirm_native_identity(&process, &models, context_tokens, vision_enabled)?;
+            if self.native_engine {
+                startup_timing.phase(StartupPhase::NativeIdentity);
+                self.confirm_native_identity(&process, &models, context_tokens, vision_enabled)?;
+            }
+            startup_timing.phase(StartupPhase::FrontendBinding);
+            let service = self
+                .bind_frontend(
+                    &process,
+                    &credentials,
+                    pipe_backend,
+                    adapter.is_some(),
+                    context_tokens,
+                    vision_enabled,
+                )
+                .await?;
+            startup_timing.finish();
+            return Ok(LaunchedService {
+                service,
+                process,
+                credentials,
+                _artifacts: artifacts,
+                _adapter: adapter,
+                _mmproj: vision_enabled.then_some(mmproj_file).flatten(),
+                _native_executable: native_executable,
+                memory_limit_bytes: specification.memory_limit_bytes,
+                backend_port: if broker_pipe { 0 } else { self.backend_port },
+                storage_budget,
+            });
         }
-        startup_timing.phase(StartupPhase::FrontendBinding);
-        let service = self
-            .bind_frontend(
-                &process,
-                &credentials,
-                pipe_backend,
-                adapter.is_some(),
-                context_tokens,
-                vision_enabled,
-            )
-            .await?;
-        startup_timing.finish();
-        Ok(LaunchedService {
-            service,
-            process,
-            credentials,
-            _artifacts: artifacts,
-            _adapter: adapter,
-            _mmproj: mmproj_file,
-            _native_executable: native_executable,
-            memory_limit_bytes: specification.memory_limit_bytes,
-            backend_port: if broker_pipe { 0 } else { self.backend_port },
-            storage_budget,
-        })
+        Err(LaunchError::Memory)
     }
 
     async fn bind_frontend(
@@ -1134,6 +1202,150 @@ enum StartupStage {
     NativeIdentity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildStartupStage {
+    Arguments,
+    Environment,
+    Memory,
+    Key,
+    Model,
+    Runtime,
+    Listener,
+    Backend,
+    Unknown,
+}
+
+impl ChildStartupStage {
+    const fn launch_error(self) -> LaunchError {
+        match self {
+            Self::Memory => LaunchError::Memory,
+            Self::Environment => LaunchError::Policy,
+            Self::Key => LaunchError::Credentials,
+            Self::Listener => LaunchError::Port,
+            Self::Arguments | Self::Model | Self::Runtime | Self::Backend | Self::Unknown => {
+                LaunchError::Backend
+            }
+        }
+    }
+}
+
+fn parse_child_startup_failure(stderr: &[u8]) -> Option<ChildStartupStage> {
+    let text = std::str::from_utf8(stderr).ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("private-inference-startup-failed stage=") else {
+            continue;
+        };
+        let Some((stage, rest)) = rest.split_once(" errorKind=") else {
+            continue;
+        };
+        let Some((kind, os_code)) = rest.split_once(" osCode=") else {
+            continue;
+        };
+        if kind.is_empty()
+            || !kind.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || os_code.is_empty()
+            || !(os_code == "none"
+                || os_code
+                    .strip_prefix('-')
+                    .unwrap_or(os_code)
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        let parsed = match stage {
+            "arguments" => ChildStartupStage::Arguments,
+            "environment" => ChildStartupStage::Environment,
+            "memory" => ChildStartupStage::Memory,
+            "key" => ChildStartupStage::Key,
+            "model" => ChildStartupStage::Model,
+            "runtime" => ChildStartupStage::Runtime,
+            "listener" => ChildStartupStage::Listener,
+            "backend" => ChildStartupStage::Backend,
+            "unknown" => ChildStartupStage::Unknown,
+            _ => continue,
+        };
+        return Some(parsed);
+    }
+    None
+}
+
+fn classify_child_startup_stderr(stderr_path: &std::path::Path) -> Option<ChildStartupStage> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(stderr_path).ok()?;
+    let mut bytes = Vec::with_capacity(256);
+    file.take(4096).read_to_end(&mut bytes).ok()?;
+    parse_child_startup_failure(&bytes)
+}
+
+fn refine_backend_startup_error(
+    error: LaunchError,
+    stderr_path: &std::path::Path,
+) -> (LaunchError, Option<ChildStartupStage>) {
+    if error != LaunchError::Backend {
+        return (error, None);
+    }
+    if let Some(stage) = classify_child_startup_stderr(stderr_path) {
+        (stage.launch_error(), Some(stage))
+    } else {
+        (error, None)
+    }
+}
+
+fn wait_briefly_for_exit(process: &OwnedProcess, error: LaunchError) -> io::Result<Option<u32>> {
+    let mut status = process.try_wait();
+    if error == LaunchError::Backend && matches!(status, Ok(None)) {
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(5));
+            status = process.try_wait();
+            if !matches!(status, Ok(None)) {
+                break;
+            }
+        }
+    }
+    status
+}
+
+fn reset_worker_attempt_files(credentials_directory: &std::path::Path) -> Result<(), LaunchError> {
+    validate_external_path(credentials_directory).map_err(|_| LaunchError::Path)?;
+    for file in ["backend.stdout", "backend.stderr"] {
+        let path = credentials_directory.join(file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(LaunchError::Path),
+        }
+    }
+    remove_worker_directory(&credentials_directory.join("worker"))
+}
+
+fn remove_worker_directory(path: &std::path::Path) -> Result<(), LaunchError> {
+    validate_external_path(path).map_err(|_| LaunchError::Path)?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(LaunchError::Path),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LaunchError::Path);
+    }
+    for entry in std::fs::read_dir(path).map_err(|_| LaunchError::Path)? {
+        let entry = entry.map_err(|_| LaunchError::Path)?;
+        let child = entry.path();
+        validate_external_path(&child).map_err(|_| LaunchError::Path)?;
+        let child_meta = std::fs::symlink_metadata(&child).map_err(|_| LaunchError::Path)?;
+        if child_meta.file_type().is_symlink() {
+            return Err(LaunchError::Path);
+        }
+        if child_meta.is_dir() {
+            remove_worker_directory(&child)?;
+        } else {
+            std::fs::remove_file(&child).map_err(|_| LaunchError::Path)?;
+        }
+    }
+    std::fs::remove_dir(path).map_err(|_| LaunchError::Path)
+}
+
 fn note_startup_failure(stage: StartupStage, error: LaunchError, process: &OwnedProcess) {
     let _result =
         write_startup_failure(&mut io::stderr().lock(), stage, error, &process.try_wait());
@@ -1149,9 +1361,13 @@ fn write_startup_failure(
         StartupStage::AuthenticatedReadiness => "authenticated-readiness",
         StartupStage::NativeIdentity => "native-identity",
     };
+    let marker_error = match error {
+        LaunchError::Memory | LaunchError::Cancelled => error,
+        _ => LaunchError::Backend,
+    };
     write!(
         output,
-        "Native backend startup failure: stage={stage}, error={error:?}, process="
+        "Native backend startup failure: stage={stage}, error={marker_error:?}, process="
     )?;
     match status {
         Ok(Some(code)) => writeln!(output, "exited-0x{code:08X}"),
@@ -2855,5 +3071,194 @@ mod tests {
             LaunchConfig::parse(missing_port).err(),
             Some(LaunchError::Arguments)
         );
+    }
+
+    #[test]
+    fn native_arguments_with_vision_pass_base_memory_limit_without_double_counting_mmproj_reserve()
+    -> Result<(), LaunchError> {
+        use crate::inference::KvCache;
+        use bonsai_cpu_policy::{
+            MMPROJ_RESERVE_BYTES,
+            context::{HOST_RESERVE_BYTES, STARTUP_RESERVE_BYTES, SwiftContextPlan},
+        };
+
+        let mut args = arguments();
+        args.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        let mut config = LaunchConfig::parse(args)?;
+        let data = std::env::temp_dir().join("Bonsai-vision-memory-limit-routing");
+        let key = data.join("backend.key");
+        let mmproj =
+            bonsai_cpu_policy::swift_mmproj_artifact(&data).map_err(|_| LaunchError::Policy)?;
+        let gib = 1024 * 1024 * 1024_u64;
+
+        for policy in [KvCache::Rsq4, KvCache::F16, KvCache::Rsq4K3v] {
+            config.kv_cache = Some(policy);
+            let profile = config.swift_context_profile()?;
+            for available in [17 * gib, 18 * gib, 20 * gib, 22 * gib, 24 * gib, 48 * gib] {
+                let (vision_context, vision_admitted) =
+                    SwiftContextPlan::for_profile_with_vision(available, profile, true)
+                        .map_err(|_| LaunchError::Memory)?;
+                assert!(vision_admitted, "expected vision admission at {available}");
+                let base_context =
+                    SwiftContextPlan::for_profile(available - MMPROJ_RESERVE_BYTES, profile)
+                        .map_err(|_| LaunchError::Memory)?;
+                assert_eq!(vision_context.context_tokens, base_context.context_tokens);
+
+                let mut plan = super::LaunchPlan::for_profile_with_options(
+                    &data,
+                    8081,
+                    &key,
+                    LaunchProfile::SwiftPq2Assessment,
+                    true,
+                    false,
+                )
+                .map_err(|_| LaunchError::Policy)?;
+                plan.select_swift_context(vision_context)
+                    .map_err(|_| LaunchError::Policy)?;
+                plan.enable_swift_mmproj(mmproj.clone())
+                    .map_err(|_| LaunchError::Policy)?;
+
+                // Windows Job ceiling retains the full vision reserve, while the child's
+                // --memory-limit-bytes receives the base text memory limit so adding
+                // 4 GiB + 768 MiB inside the child matches required_available_bytes.
+                assert_eq!(plan.memory_limit_bytes, vision_context.memory_limit_bytes);
+                assert_eq!(
+                    plan.native_child_memory_limit_bytes(),
+                    base_context.memory_limit_bytes
+                );
+                let child = config.native_arguments(&plan, Some(&key));
+                let child_limit = child
+                    .array_windows::<2>()
+                    .find_map(|[flag, value]| {
+                        (flag == "--memory-limit-bytes")
+                            .then(|| value.to_str()?.parse::<u64>().ok())
+                            .flatten()
+                    })
+                    .ok_or(LaunchError::Arguments)?;
+                assert_eq!(
+                    child_limit,
+                    u64::try_from(base_context.memory_limit_bytes)
+                        .map_err(|_| LaunchError::Memory)?
+                );
+                let child_required_available =
+                    child_limit + HOST_RESERVE_BYTES + MMPROJ_RESERVE_BYTES;
+                assert_eq!(child_required_available, plan.required_available_bytes);
+                assert!(child_required_available + STARTUP_RESERVE_BYTES <= available);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn child_startup_stderr_classification_maps_value_free_stages_and_resets_worker_files()
+    -> std::io::Result<()> {
+        use super::{
+            ChildStartupStage, StartupStage, parse_child_startup_failure,
+            refine_backend_startup_error, reset_worker_attempt_files, write_startup_failure,
+        };
+
+        for (line, expected_stage, expected_error, expected_marker) in [
+            (
+                b"private-inference-startup-failed stage=memory errorKind=Other osCode=none\n"
+                    .as_slice(),
+                ChildStartupStage::Memory,
+                LaunchError::Memory,
+                "error=Memory",
+            ),
+            (
+                b"private-inference-startup-failed stage=environment errorKind=PermissionDenied osCode=none\n".as_slice(),
+                ChildStartupStage::Environment,
+                LaunchError::Policy,
+                "error=Backend",
+            ),
+            (
+                b"private-inference-startup-failed stage=key errorKind=PermissionDenied osCode=5\n".as_slice(),
+                ChildStartupStage::Key,
+                LaunchError::Credentials,
+                "error=Backend",
+            ),
+            (
+                b"private-inference-startup-failed stage=listener errorKind=AddrInUse osCode=10048\n".as_slice(),
+                ChildStartupStage::Listener,
+                LaunchError::Port,
+                "error=Backend",
+            ),
+            (
+                b"private-inference-startup-failed stage=arguments errorKind=InvalidInput osCode=none\n".as_slice(),
+                ChildStartupStage::Arguments,
+                LaunchError::Backend,
+                "error=Backend",
+            ),
+            (
+                b"private-inference-startup-failed stage=model errorKind=InvalidData osCode=-1\n".as_slice(),
+                ChildStartupStage::Model,
+                LaunchError::Backend,
+                "error=Backend",
+            ),
+        ] {
+            let parsed = parse_child_startup_failure(line);
+            assert_eq!(parsed, Some(expected_stage));
+            assert_eq!(expected_stage.launch_error(), expected_error);
+            let mut marker = Vec::new();
+            write_startup_failure(
+                &mut marker,
+                StartupStage::AuthenticatedReadiness,
+                expected_error,
+                &Ok(Some(1)),
+            )?;
+            let marker = String::from_utf8(marker).map_err(std::io::Error::other)?;
+            assert!(marker.contains(expected_marker), "{marker}");
+        }
+
+        for rejected in [
+            b"".as_slice(),
+            b"arbitrary stderr line\n".as_slice(),
+            b"private-inference-startup-failed stage=memory\n".as_slice(),
+            b"private-inference-startup-failed stage=memory errorKind=Other osCode=none extra\n"
+                .as_slice(),
+            b"private-inference-startup-failed stage=forged errorKind=Other osCode=none\n"
+                .as_slice(),
+            b"private-inference-startup-failed stage=memory errorKind=Other! osCode=none\n"
+                .as_slice(),
+            b"private-inference-startup-failed stage=memory errorKind=Other osCode=abc\n"
+                .as_slice(),
+        ] {
+            assert_eq!(parse_child_startup_failure(rejected), None);
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "Bonsai-child-stderr-classify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(std::io::Error::other)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("worker/nested"))?;
+        std::fs::write(dir.join("frontend.key"), b"retained-frontend-key")?;
+        std::fs::write(dir.join("backend.key"), b"retained-backend-key")?;
+        std::fs::write(dir.join("worker/nested/state.bin"), b"scratch")?;
+        std::fs::write(dir.join("backend.stdout"), b"stdout")?;
+        let stderr_path = dir.join("backend.stderr");
+        std::fs::write(
+            &stderr_path,
+            b"private-inference-startup-failed stage=memory errorKind=Other osCode=none\r\n",
+        )?;
+        assert_eq!(
+            refine_backend_startup_error(LaunchError::Backend, &stderr_path),
+            (LaunchError::Memory, Some(ChildStartupStage::Memory))
+        );
+        assert_eq!(
+            refine_backend_startup_error(LaunchError::Cancelled, &stderr_path),
+            (LaunchError::Cancelled, None)
+        );
+        reset_worker_attempt_files(&dir).map_err(|_| std::io::Error::other("reset failed"))?;
+        assert!(!dir.join("worker").exists());
+        assert!(!dir.join("backend.stdout").exists());
+        assert!(!dir.join("backend.stderr").exists());
+        assert!(dir.join("frontend.key").is_file());
+        assert!(dir.join("backend.key").is_file());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

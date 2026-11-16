@@ -133,6 +133,24 @@ pub struct LaunchPlan {
     pub context_tokens: usize,
 }
 impl LaunchPlan {
+    /// Base process memory limit passed to the native child's `--memory-limit-bytes`.
+    ///
+    /// When `mmproj` is enabled, [`bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_vision`]
+    /// includes [`bonsai_cpu_policy::MMPROJ_RESERVE_BYTES`] in [`Self::memory_limit_bytes`]
+    /// for the Windows Job commit limit, while the native child adds its own 768 MiB
+    /// vision reserve on top of `--memory-limit-bytes + 4 GiB` during startup admission.
+    #[must_use]
+    pub fn native_child_memory_limit_bytes(&self) -> usize {
+        if self.mmproj.is_some() {
+            usize::try_from(bonsai_cpu_policy::MMPROJ_RESERVE_BYTES)
+                .ok()
+                .and_then(|reserve| self.memory_limit_bytes.checked_sub(reserve))
+                .unwrap_or(self.memory_limit_bytes)
+        } else {
+            self.memory_limit_bytes
+        }
+    }
+
     /// Apply a trusted memory-derived Swift context to this interactive launch.
     /// Fixed qualification argument builders remain unchanged.
     #[cfg(windows)]
