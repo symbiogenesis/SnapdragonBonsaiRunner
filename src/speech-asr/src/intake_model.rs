@@ -121,18 +121,24 @@ pub(super) fn validate_tokenizer(index: &Index) -> io::Result<()> {
     if tokens.len() != vocabulary {
         return Err(invalid());
     }
-    for required in [
-        "<|im_start|>",
-        "<|im_end|>",
-        "Ċ",
-        "system",
-        "user",
-        "assistant",
-        "<asr_text>",
-    ] {
-        if !tokens.iter().any(|piece| piece == required) {
-            return Err(invalid());
+    let mut found = 0_u8;
+    for piece in tokens {
+        match piece.as_str() {
+            "<|im_start|>" => found |= 1 << 0,
+            "<|im_end|>" => found |= 1 << 1,
+            "Ċ" => found |= 1 << 2,
+            "system" => found |= 1 << 3,
+            "user" => found |= 1 << 4,
+            "assistant" => found |= 1 << 5,
+            "<asr_text>" => found |= 1 << 6,
+            _ => continue,
         }
+        if found == 0x7f {
+            break;
+        }
+    }
+    if found != 0x7f {
+        return Err(invalid());
     }
     for (key, kind) in [
         ("tokenizer.ggml.scores", 6),
