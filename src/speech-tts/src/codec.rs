@@ -572,6 +572,10 @@ impl CausalConv1d {
         let out_frames = (frames + pad_left - k_eff).div_ceil(self.stride) + 1;
         let ideal_len = (out_frames - 1) * self.stride + k_eff - pad_left;
         let extra_pad = ideal_len.saturating_sub(frames);
+        if pad_left == 0 && extra_pad == 0 {
+            let out = self.compute_frames(input, out_frames, self.stride, threads);
+            return Ok((out, out_frames));
+        }
         let padded_len = pad_left + frames + extra_pad;
 
         let mut padded = vec![0.0_f32; padded_len * self.in_c];
@@ -624,15 +628,16 @@ impl CausalConv1d {
                 "Invalid streaming CausalConv1d state or input.",
             ));
         }
+        if ctx_frames == 0 {
+            return Ok(self.compute_frames(input, frames, 1, threads));
+        }
         let ext_frames = ctx_frames + frames;
         let mut ext = Vec::with_capacity(ext_frames * self.in_c);
         ext.extend_from_slice(state);
         ext.extend_from_slice(input);
 
-        if ctx_frames > 0 {
-            let tail_start = frames * self.in_c;
-            state.copy_from_slice(&ext[tail_start..]);
-        }
+        let tail_start = frames * self.in_c;
+        state.copy_from_slice(&ext[tail_start..]);
 
         Ok(self.compute_frames(&ext, frames, 1, threads))
     }
@@ -1071,12 +1076,17 @@ impl ConvNeXtBlock {
                 "Invalid ConvNeXtBlock dimensions.",
             ));
         }
-        let mut ext = Vec::with_capacity((ctx_len + frames) * c);
-        ext.extend_from_slice(dw_state);
-        ext.extend_from_slice(input);
-        if ctx_len > 0 {
-            dw_state.copy_from_slice(&ext[frames * c..]);
-        }
+        let ext_owned;
+        let ext: &[f32] = if ctx_len == 0 {
+            input
+        } else {
+            let mut buf = Vec::with_capacity((ctx_len + frames) * c);
+            buf.extend_from_slice(dw_state);
+            buf.extend_from_slice(input);
+            dw_state.copy_from_slice(&buf[frames * c..]);
+            ext_owned = buf;
+            &ext_owned
+        };
 
         let inv_c = 1.0_f32 / usize_to_f32(c);
         let mid_c = self.pwconv1_b.len();
@@ -1093,7 +1103,7 @@ impl ConvNeXtBlock {
                 level,
                 simd => convnext_frame_simd(
                     simd,
-                    &ext,
+                    ext,
                     t,
                     c,
                     k,
@@ -2151,6 +2161,93 @@ mod tests {
                 "threads {threads}",
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn zero_context_convolutions_and_convnext_match_padded_bits() -> std::io::Result<()> {
+        let in_c = 6_usize;
+        let out_c = 5_usize;
+        let frames = 7_usize;
+        let conv = CausalConv1d {
+            out_c,
+            in_c,
+            kernel: 1,
+            dilation: 1,
+            stride: 1,
+            pad_mode: PadMode::Constant,
+            weight: (0..out_c * in_c)
+                .map(|i| (f32::from(u16::try_from(i % 13).unwrap_or(0)) - 6.0) * 0.0625)
+                .collect(),
+            bias: Some(
+                (0..out_c)
+                    .map(|o| (f32::from(u8::try_from(o).unwrap_or(0)) - 2.0) * 0.125)
+                    .collect(),
+            ),
+        };
+        let input: Vec<f32> = (0..frames * in_c)
+            .map(|i| (f32::from(u16::try_from(i % 19).unwrap_or(0)) - 9.0) * 0.05)
+            .collect();
+        let mut expected = vec![0.0_f32; frames * out_c];
+        for t in 0..frames {
+            for o in 0..out_c {
+                let mut acc = conv.bias.as_ref().map_or(0.0_f32, |b| b[o]);
+                for c in 0..in_c {
+                    acc = conv.weight[o * in_c + c].mul_add(input[t * in_c + c], acc);
+                }
+                expected[t * out_c + o] = acc;
+            }
+        }
+        // Verify exact bit parity across offline/streaming and serial/parallel zero-context paths.
+        let (off_out, off_frames) = conv.forward(&input, frames)?;
+        assert_eq!(off_frames, frames);
+        let mut empty_state = [];
+        let stream_out = conv.forward_stream(&input, frames, &mut empty_state)?;
+        assert_eq!(
+            off_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            stream_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        for (got, want) in off_out.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-6);
+        }
+        for threads in [2_usize, 4] {
+            let (par_off, _) = conv.forward_parallel(&input, frames, threads)?;
+            let par_stream =
+                conv.forward_stream_parallel(&input, frames, &mut empty_state, threads)?;
+            assert_eq!(
+                par_off.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                off_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                par_stream.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                off_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+
+        let c = 8_usize;
+        let cn = ConvNeXtBlock {
+            channels: c,
+            kernel: 1,
+            dw_weight: vec![0.25; c],
+            dw_bias: vec![-0.1; c],
+            norm_w: vec![1.0; c],
+            norm_b: vec![0.0; c],
+            pwconv1_w: vec![0.05; 4 * c * c],
+            pwconv1_b: vec![0.01; 4 * c],
+            pwconv2_w: vec![-0.02; c * 4 * c],
+            pwconv2_b: vec![0.03; c],
+            gamma: vec![0.5; c],
+        };
+        let cn_in: Vec<f32> = (0..frames * c)
+            .map(|i| (f32::from(u16::try_from(i % 11).unwrap_or(0)) - 5.0) * 0.1)
+            .collect();
+        let mut empty_dw = [];
+        let cn_seq = cn.forward_stream(&cn_in, frames, &mut empty_dw)?;
+        let cn_par = cn.forward_stream_parallel(&cn_in, frames, &mut empty_dw, 4)?;
+        assert_eq!(
+            cn_par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            cn_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
         Ok(())
     }
 }
