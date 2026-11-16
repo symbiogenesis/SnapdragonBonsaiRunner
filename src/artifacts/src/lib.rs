@@ -15,6 +15,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use zip::ZipArchive;
 
@@ -84,6 +85,71 @@ pub struct RuntimeSpec {
     pub archive_bytes: u64,
     /// Locked lowercase whole ZIP SHA-256.
     pub archive_sha256: String,
+}
+
+/// Fixed-chunk SHA-256 manifest specification for a locked file.
+///
+/// When `bytes` and `chunk_bytes` meet the Windows read-only section mapping
+/// threshold, [`VerifiedFile::verify_chunked_with`] hashes every contiguous
+/// chunk across `0..bytes` in parallel via `chunk_sha256s` without running a
+/// redundant second sequential whole-file pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChunkedFileSpec {
+    /// Target file path held stable for the guard's lifetime.
+    pub path: PathBuf,
+    /// Locked exact file length in bytes.
+    pub bytes: u64,
+    /// Locked lowercase whole-file SHA-256.
+    pub sha256: String,
+    /// Fixed chunk size in bytes used to partition `0..bytes`.
+    pub chunk_bytes: usize,
+    /// Locked lowercase SHA-256 digests covering every contiguous chunk in `0..bytes`.
+    pub chunk_sha256s: Vec<String>,
+}
+
+/// Artifact identity specification for bounded multi-artifact parallel verification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileVerificationSpec {
+    /// Verify a file by exact byte length and whole-file lowercase SHA-256.
+    Whole {
+        /// Target file path held stable for the guard's lifetime.
+        path: PathBuf,
+        /// Locked exact file length in bytes.
+        bytes: u64,
+        /// Locked lowercase whole-file SHA-256.
+        sha256: String,
+    },
+    /// Verify a file by exact byte length and fixed-chunk SHA-256 manifest.
+    Chunked(ChunkedFileSpec),
+}
+
+impl FileVerificationSpec {
+    /// Construct a whole-file verification specification.
+    #[must_use]
+    pub fn whole(path: impl Into<PathBuf>, bytes: u64, sha256: impl Into<String>) -> Self {
+        Self::Whole {
+            path: path.into(),
+            bytes,
+            sha256: sha256.into(),
+        }
+    }
+
+    /// Construct a chunk-manifest verification specification.
+    #[must_use]
+    pub const fn chunked(spec: ChunkedFileSpec) -> Self {
+        Self::Chunked(spec)
+    }
+
+    /// Target file path to verify and lock.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Whole { path, .. } => path,
+            Self::Chunked(spec) => &spec.path,
+        }
+    }
 }
 
 /// Identity of one installed file established by verification or installation.
@@ -260,11 +326,418 @@ impl VerifiedFile {
         })
     }
 
+    /// Verify a file against its exact byte length and fixed-chunk SHA-256 manifest.
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms, unsafe paths, invalid chunk manifests, and
+    /// identity drift.
+    pub fn verify_chunked(spec: &ChunkedFileSpec) -> Result<Self, ArtifactError> {
+        Self::verify_chunked_with(spec, default_chunk_workers(), &AtomicBool::new(false))
+    }
+
+    /// Verify a file against a fixed-chunk SHA-256 manifest while retaining all
+    /// ancestor and file deny-write/deny-delete locks.
+    ///
+    /// When `spec.bytes` and `spec.chunk_bytes` meet the Windows read-only
+    /// section mapping threshold, this verifies every contiguous chunk covering
+    /// `0..spec.bytes` in parallel via Windows CNG (`try_verify_locked_file_chunk_digests_mapped_with`)
+    /// without performing a redundant second sequential whole-file hash pass.
+    /// Smaller files, smaller chunk sizes, or non-mappable files fall back to a
+    /// single-pass sequential read verifying both `chunk_sha256s` and `sha256`.
+    ///
+    /// # Errors
+    /// Rejects unsupported platforms, invalid `chunk_bytes`, unsafe paths,
+    /// identity or chunk-manifest drift, and `cancel` interruption.
+    pub fn verify_chunked_with(
+        spec: &ChunkedFileSpec,
+        workers: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ArtifactError> {
+        Self::verify_chunked_until(spec, workers, &|| cancel.load(Ordering::Acquire))
+    }
+
+    fn verify_chunked_until(
+        spec: &ChunkedFileSpec,
+        workers: usize,
+        is_cancelled: &(impl Fn() -> bool + Sync),
+    ) -> Result<Self, ArtifactError> {
+        if is_cancelled() {
+            return Err(ArtifactError::Cancelled);
+        }
+        if !cfg!(windows) {
+            return Err(ArtifactError::Configuration);
+        }
+        let chunk_bytes_u64 =
+            u64::try_from(spec.chunk_bytes).map_err(|_| ArtifactError::Configuration)?;
+        if chunk_bytes_u64 == 0 {
+            return Err(ArtifactError::Configuration);
+        }
+
+        let mut checkpoint = || {
+            if is_cancelled() {
+                Err(ArtifactError::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        let mut handles = Vec::new();
+        let mut held_ancestors = BTreeSet::new();
+        hold_ancestors(
+            &spec.path,
+            &mut handles,
+            &mut held_ancestors,
+            &mut checkpoint,
+        )?;
+        let mut file = open_locked_file_with_access(&spec.path, true)?;
+        checkpoint()?;
+
+        if file.metadata().map_err(|_| ArtifactError::Identity)?.len() != spec.bytes {
+            return Err(ArtifactError::Identity);
+        }
+        let expected_chunks = usize::try_from(spec.bytes.div_ceil(chunk_bytes_u64))
+            .map_err(|_| ArtifactError::Identity)?;
+        if spec.chunk_sha256s.len() != expected_chunks {
+            return Err(ArtifactError::Identity);
+        }
+        let expected_whole_digest = parse_sha256_hex(&spec.sha256)?;
+        let expected_chunk_digests: Vec<[u8; 32]> = spec
+            .chunk_sha256s
+            .iter()
+            .map(|digest| parse_sha256_hex(digest))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        #[cfg(windows)]
+        if chunk_bytes_u64 >= bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES {
+            match bonsai_windows_credentials::try_verify_locked_file_chunk_digests_mapped_with(
+                &file,
+                spec.bytes,
+                spec.chunk_bytes,
+                &expected_chunk_digests,
+                workers,
+                is_cancelled,
+            ) {
+                Ok(Some(true)) => {
+                    file.seek(SeekFrom::Start(0))
+                        .map_err(|_| ArtifactError::Identity)?;
+                    handles.push(file);
+                    return Ok(Self {
+                        path: spec.path.clone(),
+                        _handles: handles,
+                    });
+                }
+                Ok(Some(false)) => return Err(ArtifactError::Identity),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(
+                        if error.kind() == std::io::ErrorKind::Interrupted || is_cancelled() {
+                            ArtifactError::Cancelled
+                        } else {
+                            ArtifactError::Identity
+                        },
+                    );
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = workers;
+
+        check_locked_chunked_buffered(
+            &mut file,
+            spec.bytes,
+            chunk_bytes_u64,
+            &expected_whole_digest,
+            &expected_chunk_digests,
+            &mut checkpoint,
+        )?;
+        handles.push(file);
+        Ok(Self {
+            path: spec.path.clone(),
+            _handles: handles,
+        })
+    }
+
     /// Exact file path held stable by this guard.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Verify multiple artifacts concurrently across up to four scoped OS worker
+/// threads while retaining deterministic input-ordered [`VerifiedFile`] guards.
+///
+/// Sets an internal `cancel_or_error` flag upon the first peer failure or
+/// external `cancel` signal so peer workers abort promptly at their next
+/// checkpoint. Any guards already opened before an error or cancellation are
+/// dropped before returning.
+///
+/// # Errors
+/// Returns `ArtifactError::Cancelled` when cancelled externally, or the earliest
+/// non-cancellation artifact error by input order (`0..specs.len()`).
+pub fn verify_files_bounded_parallel(
+    specs: &[FileVerificationSpec],
+    max_workers: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<VerifiedFile>, ArtifactError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(ArtifactError::Cancelled);
+    }
+    if !cfg!(windows) {
+        return Err(ArtifactError::Configuration);
+    }
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let file_workers = max_workers.clamp(1, 4).min(specs.len());
+    #[cfg(windows)]
+    let chunk_workers =
+        (bonsai_windows_credentials::MAX_PARALLEL_HASH_WORKERS / file_workers).max(1);
+    #[cfg(not(windows))]
+    let chunk_workers = 1;
+
+    let next_index = AtomicUsize::new(0);
+    let cancel_or_error = AtomicBool::new(false);
+    let should_abort = || {
+        if cancel.load(Ordering::Acquire) {
+            cancel_or_error.store(true, Ordering::Release);
+            true
+        } else {
+            cancel_or_error.load(Ordering::Acquire)
+        }
+    };
+
+    let worker_task = || -> Vec<(usize, Result<VerifiedFile, ArtifactError>)> {
+        let mut local = Vec::with_capacity(specs.len().div_ceil(file_workers));
+        loop {
+            if should_abort() {
+                break;
+            }
+            let index = next_index.fetch_add(1, Ordering::Relaxed);
+            let Some(spec) = specs.get(index) else {
+                break;
+            };
+            let result = match spec {
+                FileVerificationSpec::Whole {
+                    path,
+                    bytes,
+                    sha256,
+                } => VerifiedFile::verify_with(path, *bytes, sha256, || {
+                    if should_abort() {
+                        Err(ArtifactError::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                FileVerificationSpec::Chunked(chunked) => {
+                    VerifiedFile::verify_chunked_until(chunked, chunk_workers, &should_abort)
+                }
+            };
+            if result.is_err() {
+                cancel_or_error.store(true, Ordering::Release);
+                local.push((index, result));
+                break;
+            }
+            local.push((index, result));
+        }
+        local
+    };
+
+    let worker_results = if file_workers == 1 {
+        vec![worker_task()]
+    } else {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(file_workers - 1);
+            for _ in 0..(file_workers - 1) {
+                handles.push(scope.spawn(&worker_task));
+            }
+            let current = worker_task();
+            let mut results = Vec::with_capacity(file_workers);
+            results.push(current);
+            for handle in handles {
+                match handle.join() {
+                    Ok(items) => results.push(items),
+                    Err(_) => {
+                        cancel_or_error.store(true, Ordering::Release);
+                        // Ensure deterministic failure rather than ignoring a panicked worker.
+                        results.push(vec![(0, Err(ArtifactError::Configuration))]);
+                    }
+                }
+            }
+            results
+        })
+    };
+
+    let mut ordered: Vec<Option<Result<VerifiedFile, ArtifactError>>> =
+        std::iter::repeat_with(|| None).take(specs.len()).collect();
+    let mut panic_fallback = false;
+    for worker_items in worker_results {
+        for (index, result) in worker_items {
+            if let Some(slot) = ordered.get_mut(index) {
+                if slot.is_none() {
+                    *slot = Some(result);
+                } else if matches!(result, Err(ArtifactError::Configuration)) {
+                    panic_fallback = true;
+                }
+            }
+        }
+    }
+
+    for entry in &ordered {
+        if let Some(Err(error)) = entry
+            && *error != ArtifactError::Cancelled
+        {
+            return Err(*error);
+        }
+    }
+    if panic_fallback {
+        return Err(ArtifactError::Configuration);
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(ArtifactError::Cancelled);
+    }
+
+    let mut verified = Vec::with_capacity(specs.len());
+    for entry in ordered {
+        match entry {
+            Some(Ok(guard)) => verified.push(guard),
+            Some(Err(error)) => return Err(error),
+            None => return Err(ArtifactError::Cancelled),
+        }
+    }
+    Ok(verified)
+}
+
+fn default_chunk_workers() -> usize {
+    #[cfg(windows)]
+    {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(1, bonsai_windows_credentials::MAX_PARALLEL_HASH_WORKERS)
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
+fn parse_sha256_hex(digest: &str) -> Result<[u8; 32], ArtifactError> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ArtifactError::Identity);
+    }
+    let mut decoded = [0_u8; 32];
+    hex::decode_to_slice(digest, &mut decoded).map_err(|_| ArtifactError::Identity)?;
+    Ok(decoded)
+}
+
+fn constant_time_eq_32(lhs: &[u8; 32], rhs: &[u8; 32]) -> bool {
+    let mut diff = 0_u8;
+    for (&a, &b) in lhs.iter().zip(rhs.iter()) {
+        diff |= std::hint::black_box(a ^ b);
+    }
+    diff == 0
+}
+
+fn check_locked_chunked_buffered(
+    file: &mut File,
+    expected_bytes: u64,
+    chunk_bytes_u64: u64,
+    expected_whole_digest: &[u8; 32],
+    expected_chunk_digests: &[[u8; 32]],
+    checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    let mut buffer = verification_buffer(expected_bytes);
+    let mut whole_hash =
+        bonsai_native_hash::Hasher::new().map_err(|_| ArtifactError::Configuration)?;
+    let mut chunk_hash: Option<bonsai_native_hash::Hasher> = None;
+    let mut total = 0_u64;
+    let mut chunk_index = 0_usize;
+    let mut chunk_offset = 0_u64;
+
+    loop {
+        checkpoint()?;
+        let count = match file.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(ArtifactError::Identity),
+        };
+        if count == 0 {
+            break;
+        }
+        let count_u64 = u64::try_from(count).map_err(|_| ArtifactError::Identity)?;
+        total = total
+            .checked_add(count_u64)
+            .ok_or(ArtifactError::Identity)?;
+        if total > expected_bytes {
+            return Err(ArtifactError::Identity);
+        }
+        let mut slice = &buffer[..count];
+        whole_hash
+            .update(slice)
+            .map_err(|_| ArtifactError::Identity)?;
+        while !slice.is_empty() {
+            let hasher = match chunk_hash.as_mut() {
+                Some(hasher) => hasher,
+                None => {
+                    let hasher = bonsai_native_hash::Hasher::new()
+                        .map_err(|_| ArtifactError::Configuration)?;
+                    chunk_hash.insert(hasher)
+                }
+            };
+            let remaining_in_chunk = chunk_bytes_u64 - chunk_offset;
+            let take = usize::try_from(remaining_in_chunk)
+                .unwrap_or(usize::MAX)
+                .min(slice.len());
+            let (head, tail) = slice.split_at(take);
+            hasher.update(head).map_err(|_| ArtifactError::Identity)?;
+            chunk_offset += u64::try_from(take).map_err(|_| ArtifactError::Identity)?;
+            slice = tail;
+            if chunk_offset == chunk_bytes_u64 {
+                let finished = chunk_hash
+                    .take()
+                    .ok_or(ArtifactError::Identity)?
+                    .finish()
+                    .map_err(|_| ArtifactError::Identity)?;
+                let expected_chunk = expected_chunk_digests
+                    .get(chunk_index)
+                    .ok_or(ArtifactError::Identity)?;
+                if !constant_time_eq_32(&finished, expected_chunk) {
+                    return Err(ArtifactError::Identity);
+                }
+                chunk_index += 1;
+                chunk_offset = 0;
+            }
+        }
+    }
+
+    if total != expected_bytes {
+        return Err(ArtifactError::Identity);
+    }
+    if let Some(hasher) = chunk_hash.take() {
+        let finished = hasher.finish().map_err(|_| ArtifactError::Identity)?;
+        let expected_chunk = expected_chunk_digests
+            .get(chunk_index)
+            .ok_or(ArtifactError::Identity)?;
+        if !constant_time_eq_32(&finished, expected_chunk) {
+            return Err(ArtifactError::Identity);
+        }
+        chunk_index += 1;
+    }
+    if chunk_index != expected_chunk_digests.len() {
+        return Err(ArtifactError::Identity);
+    }
+    let whole_digest = whole_hash.finish().map_err(|_| ArtifactError::Identity)?;
+    if !constant_time_eq_32(&whole_digest, expected_whole_digest) {
+        return Err(ArtifactError::Identity);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ArtifactError::Identity)?;
+    Ok(())
 }
 
 fn classify_hash_error(error: ArtifactError, fallback: ArtifactError) -> ArtifactError {
