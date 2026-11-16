@@ -2106,28 +2106,47 @@ pub struct LayerKvCache {
 /// Widen `IEEE binary16` `u16` elements into `f32` (`dst.len() == src.len()`), using ARM64 `FCVTL`
 /// on Windows when available.
 pub(crate) fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
-    let count = src.len().min(dst.len());
-    let mut idx = 0_usize;
-    for (chunk, out_chunk) in src[..count]
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .zip(dst[..count].as_chunks_mut::<8>().0.iter_mut())
+    #[cfg(windows)]
     {
-        let [lo, hi] = bonsai_neon_dot::widen_f16_eight(chunk);
-        out_chunk[..4].copy_from_slice(&lo);
-        out_chunk[4..].copy_from_slice(&hi);
-        idx += 8;
+        bonsai_windows_process::quant_kernels::widen_f16_slice(src, dst);
     }
-    if idx + 4 <= count {
-        let chunk = [src[idx], src[idx + 1], src[idx + 2], src[idx + 3]];
-        let widened = bonsai_neon_dot::widen_f16_four(&chunk);
-        dst[idx..idx + 4].copy_from_slice(&widened);
-        idx += 4;
+    #[cfg(not(windows))]
+    {
+        let count = src.len().min(dst.len());
+        let (src_chunks, src_tail) = src[..count].as_chunks::<8>();
+        let (dst_chunks, dst_tail) = dst[..count].as_chunks_mut::<8>();
+        for (chunk, out_chunk) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+            let [lo, hi] = bonsai_neon_dot::widen_f16_eight(chunk);
+            out_chunk[..4].copy_from_slice(&lo);
+            out_chunk[4..].copy_from_slice(&hi);
+        }
+        let (src_four, src_rem) = src_tail.as_chunks::<4>();
+        let (dst_four, dst_rem) = dst_tail.as_chunks_mut::<4>();
+        if let (Some(chunk), Some(out_chunk)) = (src_four.first(), dst_four.first_mut()) {
+            *out_chunk = bonsai_neon_dot::widen_f16_four(chunk);
+        }
+        for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
+            *slot = bonsai_ternary::half_to_float(bits);
+        }
     }
-    for i in idx..count {
-        dst[i] = bonsai_ternary::half_to_float(src[i]);
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn checked_float_to_half(value: f32) -> Option<u16> {
+    if (value.to_bits() & 0x7fff_ffff) >= 0x477f_f000 {
+        return None;
     }
+    let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
+    let bits = value.to_bits();
+    let doubled = bits.wrapping_add(bits);
+    let exponent_bias = (doubled & 0xff00_0000).max(0x7100_0000);
+    base += f32::from_bits((exponent_bias >> 1) + 0x0780_0000);
+    let rounded = base.to_bits();
+    let magnitude = ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff);
+    let word = ((bits >> 16) & 0x8000) | magnitude;
+    let [lo, hi, _, _] = word.to_le_bytes();
+    Some(u16::from_le_bytes([lo, hi]))
 }
 
 /// Narrow `f32` values into `IEEE binary16` `u16` bits (`dst.len() == src.len()`), returning
@@ -2143,10 +2162,10 @@ pub(crate) fn narrow_f32_slice(src: &[f32], dst: &mut [u16]) -> bool {
     #[cfg(not(windows))]
     {
         for (&val, slot) in src.iter().zip(dst.iter_mut()) {
-            if !val.is_finite() || val.abs() >= 65_520.0 {
+            let Some(bits) = checked_float_to_half(val) else {
                 return false;
-            }
-            *slot = bonsai_neon_dot::scalar_half_bits(val);
+            };
+            *slot = bits;
         }
         true
     }

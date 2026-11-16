@@ -7,18 +7,19 @@
 )]
 
 use core::arch::aarch64::{
-    float32x4_t, int8x16_t, int16x8_t, int32x4_t, uint8x16_t, uint16x4_t, vabsq_f32, vaddq_s32,
-    vaddvq_s16, vaddvq_s32, vand_u16, vandq_u8, vcombine_s8, vcombine_s16, vcvt_f16_f32,
-    vcvtnq_s32_f32, vdotq_s32, vdup_n_u16, vdupq_n_f32, vdupq_n_s8, vdupq_n_s32, vdupq_n_u8,
-    vget_high_s8, vget_low_s8, vld1q_f32, vld1q_s8, vld1q_s32, vld1q_u8, vmaxq_f32, vmaxq_s8,
-    vmaxv_u16, vmaxvq_f32, vmulq_f32, vmulq_s32, vorrq_u8, vpaddlq_s8, vqmovn_s16, vqmovn_s32,
-    vreinterpret_u16_f16, vreinterpretq_s8_u8, vshlq_n_u8, vshrq_n_u8, vst1_u16, vst1q_s8,
-    vst1q_s32, vsubq_s8,
+    float32x4_t, int8x16_t, int16x8_t, int32x4_t, uint8x16_t, uint16x4_t, uint16x8_t, vabsq_f32,
+    vaddq_s32, vaddvq_s16, vaddvq_s32, vandq_u8, vandq_u32, vcombine_s8, vcombine_s16,
+    vcvt_f16_f32, vcvt_high_f16_f32, vcvtnq_s32_f32, vdotq_s32, vdupq_n_f32, vdupq_n_s8,
+    vdupq_n_s32, vdupq_n_u8, vdupq_n_u32, vget_high_s8, vget_low_s8, vld1q_f32, vld1q_s8,
+    vld1q_s32, vld1q_u8, vmaxq_f32, vmaxq_s8, vmaxq_u32, vmaxvq_f32, vmaxvq_u32, vmulq_f32,
+    vmulq_s32, vorrq_u8, vpaddlq_s8, vqmovn_s16, vqmovn_s32, vreinterpret_u16_f16,
+    vreinterpretq_s8_u8, vreinterpretq_u16_f16, vreinterpretq_u32_f32, vshlq_n_u8, vshrq_n_u8,
+    vst1_u16, vst1q_s8, vst1q_s32, vst1q_u16, vsubq_s8,
 };
 
 use crate::quant_kernels::{
-    Q4_K_REPACK8_BLOCK_BYTES, Q8_0ActBlock, Q8_KActBlock, f16_bits_to_f32, f64_to_f32,
-    unpack_q4_k_scale_min,
+    Q4_K_REPACK8_BLOCK_BYTES, Q8_0ActBlock, Q8_KActBlock, checked_float_to_half, f16_bits_to_f32,
+    f64_to_f32, unpack_q4_k_scale_min,
 };
 
 #[inline]
@@ -33,6 +34,13 @@ fn load_f32x4(values: &[f32; 4]) -> float32x4_t {
 fn store_u16x4(vec: uint16x4_t, out: &mut [u16; 4]) {
     // SAFETY: `out` is a unique mutable 4-element `u16` array.
     unsafe { vst1_u16(out.as_mut_ptr(), vec) };
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_u16x8(vec: uint16x8_t, out: &mut [u16; 8]) {
+    // SAFETY: `out` is a unique mutable 8-element `u16` array.
+    unsafe { vst1q_u16(out.as_mut_ptr(), vec) };
 }
 
 #[inline]
@@ -80,24 +88,37 @@ pub(crate) fn narrow_f32_slice_to_f16(src: &[f32], dst: &mut [u16]) -> bool {
 #[cfg(target_feature = "neon")]
 #[target_feature(enable = "neon")]
 fn narrow_f32_slice_to_f16_neon(src: &[f32], dst: &mut [u16]) -> bool {
+    const OVERFLOW_BOUND: u32 = 0x477f_f000;
     if src.len() != dst.len() {
         return false;
     }
-    let (src_chunks, src_tail) = src.as_chunks::<4>();
-    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<4>();
+    let abs_mask = vdupq_n_u32(0x7fff_ffff);
+    let (src_chunks, src_tail) = src.as_chunks::<8>();
+    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<8>();
     for (s, d) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
-        if !s.iter().all(|v| v.is_finite()) {
+        let (halves, _) = s.as_chunks::<4>();
+        let lo = load_f32x4(&halves[0]);
+        let hi = load_f32x4(&halves[1]);
+        let abs_lo = vandq_u32(vreinterpretq_u32_f32(lo), abs_mask);
+        let abs_hi = vandq_u32(vreinterpretq_u32_f32(hi), abs_mask);
+        if vmaxvq_u32(vmaxq_u32(abs_lo, abs_hi)) >= OVERFLOW_BOUND {
             return false;
         }
-        let v = load_f32x4(s);
-        let bits = vreinterpret_u16_f16(vcvt_f16_f32(v));
-        if vmaxv_u16(vand_u16(bits, vdup_n_u16(0x7fff))) >= 0x7c00 {
-            return false;
-        }
-        store_u16x4(bits, d);
+        let half = vcvt_high_f16_f32(vcvt_f16_f32(lo), hi);
+        store_u16x8(vreinterpretq_u16_f16(half), d);
     }
-    for (&v, d) in src_tail.iter().zip(dst_tail.iter_mut()) {
-        let Some(bits) = crate::quant_kernels::scalar_narrow_f32_to_f16(v) else {
+    let (src_four, src_rem) = src_tail.as_chunks::<4>();
+    let (dst_four, dst_rem) = dst_tail.as_chunks_mut::<4>();
+    if let (Some(s), Some(d)) = (src_four.first(), dst_four.first_mut()) {
+        let v = load_f32x4(s);
+        let abs = vandq_u32(vreinterpretq_u32_f32(v), abs_mask);
+        if vmaxvq_u32(abs) >= OVERFLOW_BOUND {
+            return false;
+        }
+        store_u16x4(vreinterpret_u16_f16(vcvt_f16_f32(v)), d);
+    }
+    for (&v, d) in src_rem.iter().zip(dst_rem.iter_mut()) {
+        let Some(bits) = checked_float_to_half(v) else {
             return false;
         };
         *d = bits;

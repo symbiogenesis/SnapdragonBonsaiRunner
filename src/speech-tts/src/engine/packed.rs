@@ -11,7 +11,7 @@
 
 use fearless_simd::{f32x4, prelude::*, u8x16};
 
-use crate::weights::half;
+use crate::weights::{half, unpack_q4_k_scale_min};
 
 #[inline(always)]
 fn unsigned_lanes<S: Simd>(simd: S, bytes: u8x16<S>) -> [f32x4<S>; 4] {
@@ -93,14 +93,7 @@ fn q4_k<S: Simd>(simd: S, source: &[u8], input: &[f32]) -> f32 {
     let scales = &source[4..16];
     let mut dot = Dot::new(simd);
     for group in 0..8 {
-        let (s, m) = if group < 4 {
-            (scales[group] & 63, scales[group + 4] & 63)
-        } else {
-            (
-                (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4),
-                (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
-            )
-        };
+        let (s, m) = unpack_q4_k_scale_min(group, scales);
         let multiplier = f32x4::splat(simd, scale * f32::from(s));
         let offset = f32x4::splat(simd, minimum * f32::from(m));
         for part in 0..2 {
@@ -173,14 +166,7 @@ fn q4_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
     let mut dots = std::array::from_fn(|_| Dot::new(simd));
     for group in 0..8 {
         let params = row_scales_min.map(|(scale, minimum, scales)| {
-            let (s, m) = if group < 4 {
-                (scales[group] & 63, scales[group + 4] & 63)
-            } else {
-                (
-                    (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4),
-                    (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
-                )
-            };
+            let (s, m) = unpack_q4_k_scale_min(group, scales);
             (
                 f32x4::splat(simd, scale * f32::from(s)),
                 f32x4::splat(simd, minimum * f32::from(m)),

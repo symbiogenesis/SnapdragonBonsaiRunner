@@ -113,49 +113,42 @@ pub(crate) fn f16_bits_to_f32(bytes: [u8; 2]) -> f32 {
     bonsai_ternary::half_to_float(u16::from_le_bytes(bytes))
 }
 
+/// Converts `binary32` to IEEE 754 `binary16` bits using round-ties-to-even,
+/// preserving signed zero, subnormals, infinities, and canonical GGML quiet `NaN`s.
 #[inline]
-pub(crate) fn scalar_narrow_f32_to_f16(value: f32) -> Option<u16> {
-    if !value.is_finite() {
-        return None;
-    }
+#[must_use]
+pub fn float_to_half(value: f32) -> u16 {
+    // Port of ggml_compute_fp32_to_fp16; the shift/add path rounds ties to
+    // even via native f32 arithmetic and includes subnormals and signed zero.
+    let mut base = (value.abs() * f32::from_bits(0x7780_0000)) * f32::from_bits(0x0880_0000);
     let bits = value.to_bits();
-    let sign = u16::try_from((bits >> 16) & 0x8000).ok()?;
-    let exp = (bits >> 23) & 0xff;
-    let mant = bits & 0x007f_ffff;
-    if exp >= 143 || (exp == 142 && mant >= 0x007f_f000) {
-        return None;
-    }
-    if exp >= 113 {
-        let mut h_exp = exp - 112;
-        let mut h_mant = mant >> 13;
-        let rem = mant & 0x1fff;
-        if rem > 0x1000 || (rem == 0x1000 && (h_mant & 1) != 0) {
-            h_mant += 1;
-            if h_mant == 0x0400 {
-                h_mant = 0;
-                h_exp += 1;
-            }
-        }
-        let h_bits = u16::try_from((h_exp << 10) | h_mant).ok()?;
-        return Some(sign | h_bits);
-    }
-    if exp < 102 {
-        return Some(sign);
-    }
-    let sig = 0x0080_0000 | mant;
-    let shift = 126 - exp;
-    let mut h_mant = sig >> shift;
-    let half = 1_u32 << (shift - 1);
-    let rem = sig & ((1_u32 << shift) - 1);
-    if rem > half || (rem == half && (h_mant & 1) != 0) {
-        h_mant += 1;
-    }
-    let h_bits = u16::try_from(h_mant).ok()?;
-    Some(sign | h_bits)
+    let doubled = bits.wrapping_add(bits);
+    let exponent_bias = (doubled & 0xff00_0000).max(0x7100_0000);
+    base += f32::from_bits((exponent_bias >> 1) + 0x0780_0000);
+    let rounded = base.to_bits();
+    let magnitude = if doubled > 0xff00_0000 {
+        0x7e00_u32
+    } else {
+        ((rounded >> 13) & 0x7c00) + (rounded & 0x0fff)
+    };
+    let word = ((bits >> 16) & 0x8000) | magnitude;
+    let [lo, hi, _, _] = word.to_le_bytes();
+    u16::from_le_bytes([lo, hi])
 }
 
+/// Narrows a finite `f32` value to IEEE 754 `binary16` bits using round-ties-to-even,
+/// returning `None` for nonfinite inputs or magnitudes that round to infinity (`|value| >= 65520.0`).
 #[inline]
-pub(crate) fn unpack_q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
+#[must_use]
+pub fn checked_float_to_half(value: f32) -> Option<u16> {
+    ((value.to_bits() & 0x7fff_ffff) < 0x477f_f000).then(|| float_to_half(value))
+}
+
+/// Unpacks the 6-bit sub-block scale and minimum `(scale, min)` pair for `group` (`0..8`)
+/// from a 12-byte GGML `Q4_K` scales slice (`scales.len() >= 12`).
+#[inline]
+#[must_use]
+pub const fn unpack_q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
     if group < 4 {
         (scales[group] & 63, scales[group + 4] & 63)
     } else {
@@ -178,6 +171,28 @@ pub fn widen_f16_eight(bits: &[u16; 8]) -> [[f32; 4]; 2] {
     bonsai_neon_dot::widen_f16_eight(bits)
 }
 
+/// Widens `src.len().min(dst.len())` IEEE binary16 bits into `f32` using baseline ARM64 `FCVTL`/`FCVTL2`
+/// chunks for finite inputs and exact `bonsai_ternary::half_to_float` handling for exceptional tails.
+#[inline]
+pub fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
+    let count = src.len().min(dst.len());
+    let (src_chunks, src_tail) = src[..count].as_chunks::<8>();
+    let (dst_chunks, dst_tail) = dst[..count].as_chunks_mut::<8>();
+    for (chunk, out_chunk) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+        let [lo, hi] = bonsai_neon_dot::widen_f16_eight(chunk);
+        out_chunk[..4].copy_from_slice(&lo);
+        out_chunk[4..].copy_from_slice(&hi);
+    }
+    let (src_four, src_rem) = src_tail.as_chunks::<4>();
+    let (dst_four, dst_rem) = dst_tail.as_chunks_mut::<4>();
+    if let (Some(chunk), Some(out_chunk)) = (src_four.first(), dst_four.first_mut()) {
+        *out_chunk = bonsai_neon_dot::widen_f16_four(chunk);
+    }
+    for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
+        *slot = bonsai_ternary::half_to_float(bits);
+    }
+}
+
 /// Narrows finite `f32` values into IEEE binary16 bits, rejecting nonfinite or overflowing elements.
 #[must_use]
 pub fn narrow_f32_slice_to_f16(src: &[f32], dst: &mut [u16]) -> bool {
@@ -191,7 +206,7 @@ pub fn narrow_f32_slice_to_f16(src: &[f32], dst: &mut [u16]) -> bool {
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {
         for (&v, slot) in src.iter().zip(dst.iter_mut()) {
-            let Some(bits) = scalar_narrow_f32_to_f16(v) else {
+            let Some(bits) = checked_float_to_half(v) else {
                 return false;
             };
             *slot = bits;
@@ -687,7 +702,7 @@ mod tests {
     use super::*;
 
     fn f32_to_f16_bits_ref(value: f32) -> u16 {
-        scalar_narrow_f32_to_f16(value).unwrap_or(0)
+        checked_float_to_half(value).unwrap_or(0)
     }
 
     fn make_q8_0_row(blocks: usize, seed: usize) -> Vec<u8> {
@@ -876,6 +891,68 @@ mod tests {
             &mut bad
         ));
         assert_eq!(bad[2], 0x8000);
+
+        let mut mismatch = [0_u16; 1];
+        assert!(!narrow_f32_slice_to_f16(&[1.0, 2.0], &mut mismatch));
+        assert_eq!(
+            checked_float_to_half(f32::from_bits(0x477f_efff)),
+            Some(0x7bff)
+        );
+        assert_eq!(
+            checked_float_to_half(f32::from_bits(0xc77f_efff)),
+            Some(0xfbff)
+        );
+        for len in 0..=23_usize {
+            let src: Vec<f32> = (0..len)
+                .map(|i| {
+                    bonsai_ternary::half_to_float(
+                        u16::try_from((i * 199 + 1) & 0x7bff).unwrap_or(0),
+                    )
+                })
+                .collect();
+            let mut narrowed = vec![0_u16; len];
+            assert!(narrow_f32_slice_to_f16(&src, &mut narrowed));
+            assert_eq!(
+                narrowed,
+                src.iter()
+                    .copied()
+                    .filter_map(checked_float_to_half)
+                    .collect::<Vec<_>>()
+            );
+            let mut widened = vec![0.0_f32; len];
+            widen_f16_slice(&narrowed, &mut widened);
+            assert_eq!(
+                widened
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+                src.iter().copied().map(f32::to_bits).collect::<Vec<_>>()
+            );
+            for bad_val in [65_520.0_f32, -65_520.0, f32::INFINITY, f32::NAN] {
+                for bad_idx in 0..len {
+                    let mut with_bad = src.clone();
+                    with_bad[bad_idx] = bad_val;
+                    assert_eq!(checked_float_to_half(bad_val), None);
+                    assert!(!narrow_f32_slice_to_f16(&with_bad, &mut narrowed));
+                }
+            }
+            if len > 0 {
+                let mut edge = src;
+                edge[len - 1] = f32::from_bits(0x477f_efff);
+                assert!(narrow_f32_slice_to_f16(&edge, &mut narrowed));
+                assert_eq!(narrowed[len - 1], 0x7bff);
+            }
+        }
+        let snan = [
+            0x7c01_u16, 0xfc01, 0x7e00, 0x3c00, 0x8000, 0x0001, 0x7bff, 0xfbff, 0x7c01,
+        ];
+        let mut snan_out = [0.0_f32; 9];
+        widen_f16_slice(&snan, &mut snan_out);
+        assert_eq!(
+            snan_out.map(f32::to_bits),
+            snan.map(|bits| bonsai_ternary::half_to_float(bits).to_bits())
+        );
     }
 
     #[test]

@@ -602,6 +602,25 @@ pub(crate) fn half(bytes: &[u8]) -> f32 {
     bonsai_ternary::half_to_float(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
+#[inline]
+pub(crate) const fn unpack_q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
+    #[cfg(windows)]
+    {
+        bonsai_windows_process::quant_kernels::unpack_q4_k_scale_min(group, scales)
+    }
+    #[cfg(not(windows))]
+    {
+        if group < 4 {
+            (scales[group] & 63, scales[group + 4] & 63)
+        } else {
+            (
+                (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4),
+                (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
+            )
+        }
+    }
+}
+
 pub(crate) fn validate_packed(kind: u32, bytes: &[u8]) -> io::Result<()> {
     let (_, size) = packed_layout(kind)?;
     if !bytes.len().is_multiple_of(size) {
@@ -650,14 +669,7 @@ pub(crate) fn decode_block(kind: u32, source: &[u8], destination: &mut [f32]) {
             let minimum = half(&source[2..]);
             let scales = &source[4..16];
             for group in 0..8 {
-                let (s, m) = if group < 4 {
-                    (scales[group] & 63, scales[group + 4] & 63)
-                } else {
-                    (
-                        (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4),
-                        (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
-                    )
-                };
+                let (s, m) = unpack_q4_k_scale_min(group, scales);
                 for index in 0..32 {
                     let byte = source[16 + (group / 2) * 32 + index];
                     let quant = if group % 2 == 0 { byte & 15 } else { byte >> 4 };
