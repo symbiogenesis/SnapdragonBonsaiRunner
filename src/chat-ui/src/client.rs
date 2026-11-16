@@ -72,6 +72,38 @@ const CONTROL_TOKEN_MESSAGE: &str = "This conversation contains reserved chat ma
 const RATE_LIMIT_MESSAGE: &str =
     "Too many messages were sent in a short time. Wait a moment, then send again.";
 const TEARDOWN_FAILURE_MESSAGE: &str = "The local model's owned processes could not be confirmed stopped. Copy any conversation or drafts you want to keep, then close this app before launching again.";
+const NATIVE_IDENTITY_RELEASE_PIN_MESSAGE: &str = "Swift's compiled Rust runtime version check failed readiness verification. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_FRAMING_MESSAGE: &str = "The local Rust runtime returned an unexpected readiness response format. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_SCHEMA_MESSAGE: &str = "The local Rust runtime returned an unsupported readiness schema. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_MODEL_MESSAGE: &str = "The loaded local model identity did not match Swift's compiled contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_CONTEXT_TOKENS_MESSAGE: &str = "The local Rust runtime reported a different context window than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_ROW_WORKERS_MESSAGE: &str = "The local Rust runtime reported a different worker count than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_PROMPT_REUSE_MESSAGE: &str = "The local Rust runtime reported a different prompt-reuse setting than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_KV_CACHE_GRAPH_MESSAGE: &str = "The local Rust runtime's compiled KV-cache or adapter graph identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_PLACEMENT_MESSAGE: &str = "The local Rust runtime reported a different accelerator placement than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_STARTUP_PROJECTION_MESSAGE: &str = "The local Rust runtime did not report the expected startup projection state. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_ADAPTER_MESSAGE: &str = "The local Rust runtime's loaded LoRA adapter identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_VISION_MESSAGE: &str = "The local Rust runtime's vision projector identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const POLICY_FAILURE_MESSAGE: &str = "The local model launch policy rejected the current environment or configuration. Restart Swift from a clean session without model or runtime environment overrides. Completed conversation turns remain in memory.";
+const PATH_OR_CREDENTIALS_FAILURE_MESSAGE: &str = "Swift could not safely access its local data or temporary credential folder without links or redirects. Check folder permissions and local storage, then close and reopen Swift. Completed conversation turns remain in memory.";
+const ARGUMENTS_FAILURE_MESSAGE: &str = "The app and local broker disagreed on launch options. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 15] = [
+    NATIVE_IDENTITY_RELEASE_PIN_MESSAGE,
+    NATIVE_IDENTITY_FRAMING_MESSAGE,
+    NATIVE_IDENTITY_SCHEMA_MESSAGE,
+    NATIVE_IDENTITY_MODEL_MESSAGE,
+    NATIVE_IDENTITY_CONTEXT_TOKENS_MESSAGE,
+    NATIVE_IDENTITY_ROW_WORKERS_MESSAGE,
+    NATIVE_IDENTITY_PROMPT_REUSE_MESSAGE,
+    NATIVE_IDENTITY_KV_CACHE_GRAPH_MESSAGE,
+    NATIVE_IDENTITY_PLACEMENT_MESSAGE,
+    NATIVE_IDENTITY_STARTUP_PROJECTION_MESSAGE,
+    NATIVE_IDENTITY_ADAPTER_MESSAGE,
+    NATIVE_IDENTITY_VISION_MESSAGE,
+    POLICY_FAILURE_MESSAGE,
+    PATH_OR_CREDENTIALS_FAILURE_MESSAGE,
+    ARGUMENTS_FAILURE_MESSAGE,
+];
 pub(crate) const STOPPED_MESSAGE: &str = "Response stopped. Ready when you are.";
 /// System instructions prepended to every model turn to enable structured SVG image generation.
 pub(crate) const SYSTEM_PROMPT: &str = "\
@@ -404,11 +436,15 @@ pub(crate) fn run(config: Config, commands: Receiver<Command>, events: EventSend
                 return;
             }
             Err(Failure::Memory) => {
+                let guidance = attach_broker_log_evidence(
+                    "Not enough free memory. Swift needs 15.5 GiB available. Free some RAM, then select Retry model.".to_owned(),
+                    &attempt_config.evidence,
+                );
                 if !wait_for_retry(
                     &commands,
                     &events,
                     &mut history,
-                    &Event::Retryable("Not enough free memory. Swift needs 15.5 GiB available. Free some RAM, then select Retry model.".to_owned()),
+                    &Event::Retryable(guidance),
                 ) {
                     return;
                 }
@@ -443,7 +479,14 @@ pub(crate) fn run(config: Config, commands: Receiver<Command>, events: EventSend
                 };
                 // worker has confirmed its complete Job empty before Retry
                 // can be offered, including on startup and transport failures.
-                if !wait_for_retry(&commands, &events, &mut history, &Event::Retryable(retry_guidance(&message))) {
+                let guidance =
+                    attach_broker_log_evidence(retry_guidance(&message), &attempt_config.evidence);
+                if !wait_for_retry(
+                    &commands,
+                    &events,
+                    &mut history,
+                    &Event::Retryable(guidance),
+                ) {
                     return;
                 }
             }
@@ -452,12 +495,27 @@ pub(crate) fn run(config: Config, commands: Receiver<Command>, events: EventSend
 }
 
 fn retry_guidance(message: &str) -> String {
-    if message == RUNNING_MEMORY_MESSAGE || message == PUBLISHER_INIT_FAILURE_MESSAGE {
+    if message == RUNNING_MEMORY_MESSAGE
+        || message == PUBLISHER_INIT_FAILURE_MESSAGE
+        || NON_RETRYABLE_STARTUP_MESSAGES.contains(&message)
+    {
         return message.to_owned();
     }
     format!(
         "{message}\nSelect Retry model to restart the local model. Completed turns remain in memory."
     )
+}
+
+fn attach_broker_log_evidence(guidance: String, evidence_directory: &Path) -> String {
+    let log = evidence_directory.join("broker.stderr.log");
+    let has_nonempty_log = std::fs::symlink_metadata(&log).is_ok_and(|metadata| {
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0
+    });
+    if has_nonempty_log {
+        format!("{guidance}\n{EVIDENCE_PREFIX}{}", log.display())
+    } else {
+        guidance
+    }
 }
 
 fn native_runtime_guidance(data: &Path) -> String {
@@ -833,9 +891,58 @@ fn model_verification_message(diagnostic: &str) -> Option<&'static str> {
     })
 }
 
+fn native_identity_message(diagnostic: &str) -> Option<&'static str> {
+    if !diagnostic
+        .lines()
+        .any(|line| line == "Development backend launch failed: Backend.")
+    {
+        return None;
+    }
+    diagnostic.lines().find_map(|line| match line {
+        "Native identity verification failed: reason=release-pin." => {
+            Some(NATIVE_IDENTITY_RELEASE_PIN_MESSAGE)
+        }
+        "Native identity verification failed: reason=framing." => {
+            Some(NATIVE_IDENTITY_FRAMING_MESSAGE)
+        }
+        "Native identity verification failed: reason=schema." => {
+            Some(NATIVE_IDENTITY_SCHEMA_MESSAGE)
+        }
+        "Native identity verification failed: reason=model." => Some(NATIVE_IDENTITY_MODEL_MESSAGE),
+        "Native identity verification failed: reason=context-tokens." => {
+            Some(NATIVE_IDENTITY_CONTEXT_TOKENS_MESSAGE)
+        }
+        "Native identity verification failed: reason=row-workers." => {
+            Some(NATIVE_IDENTITY_ROW_WORKERS_MESSAGE)
+        }
+        "Native identity verification failed: reason=prompt-reuse." => {
+            Some(NATIVE_IDENTITY_PROMPT_REUSE_MESSAGE)
+        }
+        "Native identity verification failed: reason=kv-cache-graph." => {
+            Some(NATIVE_IDENTITY_KV_CACHE_GRAPH_MESSAGE)
+        }
+        "Native identity verification failed: reason=placement." => {
+            Some(NATIVE_IDENTITY_PLACEMENT_MESSAGE)
+        }
+        "Native identity verification failed: reason=startup-projection." => {
+            Some(NATIVE_IDENTITY_STARTUP_PROJECTION_MESSAGE)
+        }
+        "Native identity verification failed: reason=adapter." => {
+            Some(NATIVE_IDENTITY_ADAPTER_MESSAGE)
+        }
+        "Native identity verification failed: reason=vision." => {
+            Some(NATIVE_IDENTITY_VISION_MESSAGE)
+        }
+        _ => None,
+    })
+}
+
 fn startup_failure(diagnostic: &[u8], native_engine: bool) -> Failure {
     let text = String::from_utf8_lossy(diagnostic);
     if let Some(message) = model_verification_message(&text) {
+        return Failure::Message(message);
+    }
+    if native_engine && let Some(message) = native_identity_message(&text) {
         return Failure::Message(message);
     }
     if native_engine
@@ -881,6 +988,21 @@ fn startup_failure(diagnostic: &[u8], native_engine: bool) -> Failure {
         Failure::Message(
             "The selected model or publisher CPU runtime could not be verified. Close and reopen Swift to check the selected downloads again. If setup fails, select Retry setup or copy its diagnostics.",
         )
+    } else if text
+        .lines()
+        .any(|line| line == "Development backend launch failed: Policy.")
+    {
+        Failure::Message(POLICY_FAILURE_MESSAGE)
+    } else if text.lines().any(|line| {
+        line == "Development backend launch failed: Path."
+            || line == "Development backend launch failed: Credentials."
+    }) {
+        Failure::Message(PATH_OR_CREDENTIALS_FAILURE_MESSAGE)
+    } else if text
+        .lines()
+        .any(|line| line == "Development backend launch failed: Arguments.")
+    {
+        Failure::Message(ARGUMENTS_FAILURE_MESSAGE)
     } else {
         Failure::Message("Swift could not start. Check the retained broker diagnostic logs.")
     }
@@ -3133,6 +3255,140 @@ mod tests {
 
         drop(opened);
         drop(creds);
+        let _removed = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_identity_guidance_maps_all_closed_reasons_and_rejects_partial_or_publisher_lines()
+    -> Result<(), Failure> {
+        let reasons = [
+            ("release-pin", "version check failed"),
+            ("framing", "response format"),
+            ("schema", "unsupported readiness schema"),
+            ("model", "model identity"),
+            ("context-tokens", "context window"),
+            ("row-workers", "worker count"),
+            ("prompt-reuse", "prompt-reuse setting"),
+            ("kv-cache-graph", "KV-cache or adapter graph identity"),
+            ("placement", "accelerator placement"),
+            ("startup-projection", "startup projection"),
+            ("adapter", "LoRA adapter identity"),
+            ("vision", "vision projector identity"),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (reason, expected) in reasons {
+            let diagnostic = format!(
+                "Native backend startup failure: stage=native-identity, error=Backend, process=running\r\nNative identity verification failed: reason={reason}.\r\nDevelopment backend launch failed: Backend.\r\nsynthetic-private-detail\r\n"
+            );
+            let Failure::Message(message) = startup_failure(diagnostic.as_bytes(), true) else {
+                return Err(Failure::Message(
+                    "Native identity failure lost its actionable message",
+                ));
+            };
+            assert!(message.contains(expected));
+            assert!(message.contains("instead of retrying"));
+            assert!(message.contains("Completed conversation turns remain in memory."));
+            assert!(!message.contains("synthetic-private-detail"));
+            let guidance = super::retry_guidance(message);
+            assert_eq!(guidance, message);
+            assert!(!guidance.contains("Select Retry model"));
+            assert!(seen.insert(message));
+
+            let generic = startup_failure(diagnostic.as_bytes(), false);
+            assert_eq!(
+                generic,
+                startup_failure(b"Development backend launch failed: Backend.", false)
+            );
+        }
+        assert_eq!(seen.len(), reasons.len());
+
+        const MARKER: &str = "Native identity verification failed: reason=kv-cache-graph.";
+        for bad in [
+            MARKER.to_owned(),
+            format!("{MARKER}\nDevelopment backend launch failed: Memory."),
+            format!("prefix {MARKER}\nDevelopment backend launch failed: Backend."),
+            format!("{MARKER} suffix\nDevelopment backend launch failed: Backend."),
+            "Native identity verification failed: reason=unknown.\nDevelopment backend launch failed: Backend."
+                .to_owned(),
+        ] {
+            assert_eq!(super::native_identity_message(&bad), None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_policy_path_credentials_and_arguments_failures_give_specific_guidance()
+    -> Result<(), Failure> {
+        let generic = startup_failure(b"Development backend launch failed: Backend.", true);
+        let cases = [
+            ("Policy", "launch policy rejected"),
+            ("Path", "links or redirects"),
+            ("Credentials", "links or redirects"),
+            ("Arguments", "disagreed on launch options"),
+        ];
+        for (variant, expected) in cases {
+            let diagnostic =
+                format!("synthetic preamble\r\nDevelopment backend launch failed: {variant}.\r\n");
+            for native_engine in [true, false] {
+                let Failure::Message(message) =
+                    startup_failure(diagnostic.as_bytes(), native_engine)
+                else {
+                    return Err(Failure::Message(
+                        "Deterministic startup failure lost its actionable message",
+                    ));
+                };
+                assert!(message.contains(expected));
+                assert!(message.contains("Completed conversation turns remain in memory."));
+                let guidance = super::retry_guidance(message);
+                assert_eq!(guidance, message);
+                assert!(!guidance.contains("Select Retry model"));
+                assert_ne!(Failure::Message(message), generic);
+            }
+            let prefixed = format!("note: Development backend launch failed: {variant}.\n");
+            assert_eq!(startup_failure(prefixed.as_bytes(), true), generic);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn broker_log_evidence_attaches_only_nonempty_regular_stderr_log_for_details_and_copy()
+    -> io::Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("Bonsai-LogEvidence-{}-{stamp}", std::process::id()));
+        let attempt = root.join("attempt-0");
+        let keys = attempt.join("SwiftBonsai-Keys-123");
+        std::fs::create_dir_all(&keys)?;
+        std::fs::write(keys.join("frontend.key"), b"00")?;
+
+        let base = "Swift could not start.".to_owned();
+        assert_eq!(
+            super::attach_broker_log_evidence(base.clone(), &attempt),
+            base
+        );
+
+        let log = attempt.join("broker.stderr.log");
+        std::fs::write(&log, b"")?;
+        assert_eq!(
+            super::attach_broker_log_evidence(base.clone(), &attempt),
+            base
+        );
+
+        std::fs::write(
+            &log,
+            b"Native backend startup failure: stage=native-identity, error=Backend, process=running\n",
+        )?;
+        let attached = super::attach_broker_log_evidence(base.clone(), &attempt);
+        assert_eq!(
+            attached,
+            format!("{base}\n{}{}", super::EVIDENCE_PREFIX, log.display())
+        );
+        assert!(!attached.contains("SwiftBonsai-Keys"));
+
         let _removed = std::fs::remove_dir_all(root);
         Ok(())
     }
