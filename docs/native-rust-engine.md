@@ -178,7 +178,12 @@ Requests cannot override cache policy. Compare complete multi-turn latency,
 cached/uncached token counts, resources and complete logits/state against fresh
 recomputation across edits, switches, scales, page boundaries, cancellation and
 reset. Decode TPS alone cannot demonstrate saved prefill. Actual-model service
-acceptance and measured benefit remain pending.
+acceptance and measured benefit remain pending. After single-tip `latest`
+acceptance, a conditional bounded sparse-checkpoint ring/tree (`<= 8` saved
+prefixes per [hybrid cache reuse](inference-algorithms.md#hybrid-cache-reuse-and-speculative-state),
+binding sealed 64-token KV pages, complete recurrent state, pre-convolution
+window and adapter scale under `SwiftExecutionShape::reuse_recurrent_copies`) can
+extend reuse across edited, regenerated and switched branches.
 
 ## Acceptance ownership
 

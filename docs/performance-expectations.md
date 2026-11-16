@@ -17,6 +17,53 @@ Publisher measurements for base Bonsai, Qwen or other hardware have different
 weights, arithmetic, workloads and observation boundaries. They are not Runner
 or Swift measurements and cannot serve as a Snapdragon forecast.
 
+## Physical ceilings and remaining optimization headroom
+
+Because sustained profiles remain unqualified until owner-operated CI and
+matched-power device captures complete, remaining headroom is tracked by
+separating **hard physical and information-theoretic limits** from **optimizations
+currently disabled or awaiting qualification in Runner's default serving policy**.
+Roofline ratios, byte ledgers ([swift-memory.md](swift-memory.md),
+[hexagon-swift-traffic-ledger.json](evidence/hexagon-swift-traffic-ledger.json))
+and power-ineligible smoke captures ([lora-weight-edit.md](evidence/lora-weight-edit.md),
+where AC disconnected mid-trial) bound regimes and prioritize [PLAN.md](../PLAN.md)
+work; they are not qualified baselines or performance promises.
+
+### Hard physical and security floors
+
+- **Batch-1 decode DRAM wall ([T2](research-register.md#t2-traffic-arithmetic-and-the-whole-request-ceiling)):**
+  Dense single-token decode streams at least `~7.02 GB/token` for `PQ2_0` (`~6.80 GB`
+  packed projections + `0.06 GB` F32/BF16 + `~0.16 GB` FP32 GDN state) or
+  `~5.75 GB/token` for `PTQ1_0` (`-18.1%` traffic). Against unified LPDDR5x peak
+  bandwidth (`~135 GB/s` on X1, `~228 GB/s` on X2), wire-speed batch-1 ceilings are
+  `19.2–23.5 tok/s` on X1 and `32.5–39.6 tok/s` on X2 (`~15–19 tok/s` and
+  `~26–32 tok/s` at ~78%–85% sustainable SoC memory-controller efficiency).
+  Exceeding those ceilings requires amortizing weight reads across multiple tokens
+  via [speculative verification](inference-algorithms.md#hybrid-cache-reuse-and-speculative-state)
+  or omitting weight groups under [W8](weight-space-programming.md#selected-w8-investigation-recover-omitted-ffn-computation).
+- **Lossless independent-block weight packing ([T1](research-register.md#t1-packing-limits-and-the-difference-between-sparse-and-small)):**
+  128 independent trits require `ceil(128 log2(3)) = 203` bits (`26` code bytes)
+  plus the 2-byte scale = `28` bytes. `PTQ1_0` (`5.95 GB`, `-17.5%` vs `7.21 GB`
+  `PQ2_0`) achieves this bound exactly, and Swift's `32.76154%` zero rate falls
+  below BITCOS's `37.5%` break-even: `0%` lossless independent-block headroom
+  remains past `PTQ1_0`.
+- **Startup byte-verification floor ([Mapping and startup](swift-memory.md#mapping-and-startup)):**
+  Runner forbids trusting cached digests or timestamps without hashing file bytes on
+  launch, setting lossless floors at `1×` cold NVMe sequential throughput and `1×`
+  warm multicore hardware `SHA256` RAM bandwidth.
+
+### Serving baseline versus remaining levers
+
+| Dimension | Current default serving policy | Lossless / exact-contract headroom (in source or scoped in [PLAN.md](../PLAN.md)) | Speculative / approximate / profile-gated ceiling |
+| --- | --- | --- | --- |
+| **Decode (`tok/s`)** | `PQ2_0`, 4 CPU row workers on X2 / 8 on X1, batch-1, LoRA disabling fused NPU FFN | Tuned 6–12 AC CPU workers + `SDOT` + 16-row tiles (`#23`) + `ciot` T2P + fused GDN (`#27`), `PTQ1_0` (`P2`–`P5`, `-18%` traffic), composite Hexagon `native-q2` + Adreno with LoRA side-branches (`NPU-1`–`NPU-8`) approaching the LPDDR5x ceiling | Tiled verification (`#30`–`#34` `SuffixDrafter` on structured/code text; `#35` `DFlash2` learned ternary drafter) + `W8` 3-group FFN omission breaking the batch-1 DRAM wall |
+| **Uncached `TTFT`** | Sequential `N = 1` prompt ingestion (streams full weights per prompt token) | CPU `8/16/32`-token `SDOT`/`I8MM` tiles + parallel packed-KV prompt attention + `gdn-wy-f32-v1` chunkwise GDN (`16×–32×` fewer weight reads) | Signed `N > 1` Hexagon HMX matrix solver + pipelined DMA/chunkwise GDN (`#41`, `#42`) + long-context `TokenGate` (`W8.3`) |
+| **Multi-turn `TTFT`** | `--prompt-reuse disabled` (recomputes full chat history every turn) | `--prompt-reuse latest` eliminating repeated linear-chat prefixes, plus bounded sparse checkpoints (`<= 8` slots) across edited/switched branches | Combined prefix checkpoint hit + tiled/HMX tail ingestion |
+| **Model preparation** | Double sequential CNG SHA-256 (`2 × 7.21 GB` across Runner + Prism) + per-launch NPU repack | Single-pass verified-handle/section inheritance across `--broker-pipe`, lockfile-pinned parallel chunk `SHA256`, `PTQ1_0` (`-17.5%` bytes), digest-bound cached Hexagon arenas, `#16`/`#17` staging/direct I/O | Sub-second warm mapping could go lower only by weakening per-launch byte hashing (disallowed by security policy) |
+| **Base RAM & admission** | `11.0 GiB` fixed admission (`+4 GiB` reserve), private CPU heap copies, `+2.69 GiB` duplicate host/NPU `blk.0..=26` weights | `PTQ1_0` (`-1.173 GiB`), `#14` packing-aware `FIXED_RUNTIME_BYTES` calibration (`M1`–`M3`), `#18` read-only `MapViewOfFile` (shifting ~5.5–6.7 GiB out of private Job commit) + releasing CPU `blk.0..=26` spans after NPU arena seal | `W8.2` selective unloading of omitted Hadamard FFN groups (`~590–725 MiB` net after rank-16 recovery factors) |
+| **Context (`tokens / GiB`)** | Dev `K4/V4` (`34,016` B/tok, charging `2×` full KV copies; `~4.0×` denser than `FP16`) | Qualifying `K1` for production, `K4/V3` (`29,920` B/tok), and append-only CoW sealed-page KV accounting (`live_kv_copies: 2 -> 1 + mutable tail`, up to `~4.1 GiB` physical saving at 256K) | Heterogeneous layer precision (`U3`), calibrated K-mean centering (`#21`), MLA (16 GQA layers) or `TokenGate` (`W8.3`) |
+| **Speech (`TTS` / `ASR`)** | `Q8` CPU baseline (`S3` `SDOT`/`I8MM`, `F16` KV, `MappedFile` & dyadic `1->2->4->8` codec ramp in source) | Qualifying `S1`–`S3` Tier-2 CPU/streaming paths, warm `Voice` retention and Hexagon native `Q8` transport | `Q4` Talker weights and conditional ternary Talker profile |
+
 ## Measurement and comparison
 
 Use the same observation boundary for both arms. Record request start, first output,

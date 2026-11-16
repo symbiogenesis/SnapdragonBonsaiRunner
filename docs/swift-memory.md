@@ -312,6 +312,24 @@ pairs `SwiftKvCacheFormat::Rotated4FittedValues` (`16,896` bytes/token) with
   to a legacy `SwiftContextProfile`), leaving existing context admission ceilings unchanged
   while awaiting compiled CI and device qualification.
 
+Two conservative over-reservations remain explicitly separated for calibration once `#14`
+and `M1`–`M3` Job-commit measurements land:
+
+1. **Packing-aware fixed base allowance (`FIXED_RUNTIME_BYTES = 11 GiB`):** Measured short-context
+   `PQ2_0` CPU Job commit is `~7.06 GiB` (`~5.89 GiB` projected with `PTQ1_0`'s `1.173 GiB`
+   packing reduction). Calibrating `weights_and_fixed_runtime_bytes` per packing (`PQ2_0` vs
+   `PTQ1_0`) and placement (crediting `#18` host/NPU deduplication only when measured) can
+   reclaim `~2.5–3.5 GiB` of unused admission margin without lowering the `4 GiB` host reserve.
+2. **Copy-on-write sealed-page KV accounting (`live_kv_copies = 2` vs `1 + mutable tail`):**
+   Charging two complete KV caches (`34,016` vs `17,120` process bytes/token for `K4/V4`)
+   covers arbitrary non-extending divergent turns that retain a full-window rollback snapshot
+   while building an unshared replacement history. In append-only / extending turns—or when
+   non-extending turns release prior committed pages before replacement—Prism's immutable
+   64-token sealed-page sharing keeps physical KV residency bounded by `1×` occupied context
+   plus one mutable 64-token tail page (`~4.1 GiB` physical saving at 262,144 `K4/V4` tokens).
+   Crediting single-copy sealed pages in admission requires a separately verified execution
+   shape and rollback/eviction contract.
+
 Publisher serving receives `--ctx-size`. Native serving receives paired
 `--context-tokens` and `--memory-limit-bytes`. Runner enables cache-aware sizing,
 full-context K4/V4, four workers and latest-prefix capabilities only for the
@@ -444,8 +462,11 @@ NPU payloads supplies that guarantee; their separate gates remain in PLAN.
 ### Mapping and startup
 
 Runner and the pinned Rust runtime independently hash every model byte through
-Windows CNG while retaining verified read-only handles. Neither pass trusts
-cached digests or timestamps. Hashing, census and export use bounded buffers.
+Windows CNG while retaining verified read-only handles (`2 × 7.21 GB ≈ 14.4 GB`
+sequential bytes read for `PQ2_0`). Neither pass trusts cached digests or
+timestamps, making `1×` cold NVMe read throughput and `1×` warm multicore
+`SHA256` RAM bandwidth the lossless startup floor. Hashing, census and export
+use bounded buffers.
 
 The publisher [loader](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/src/llama-model-loader.cpp)
 can map eligible CPU tensors directly; other buffer types may copy them. Its
@@ -454,11 +475,28 @@ prefetches the complete file and cannot unmap fragments. Prefetch populates the
 physical cache, not the process working set. Disabling it would not remove tensor
 storage; no current CLI switch exposes that choice.
 
-Three memory/I/O screening candidates remain explicitly deferred in [PLAN.md](../PLAN.md#native-context-expansion-roadmap)
-until measured cold-start, I/O or mapping bottlenecks justify dedicated contracts: **#16**
-(aligned staging reuse), **#17** (optional Windows unbuffered direct I/O preserving strict
-sector alignment, fallible fallback and CNG handle integrity) and **#18** (owned tensor
-range mapping avoiding full-file unmap gaps without weakening file-handle/reparse guards).
+Startup and mapping candidates remain explicitly deferred in [PLAN.md](../PLAN.md#memory-loading-and-approximate-cache)
+until measured cold/warm load or memory-commit gates select them:
+
+- **Single-pass verified-handle / section inheritance and parallel chunked `SHA256`:**
+  Attesting and inheriting Runner's verified deny-write/deny-delete, no-reparse
+  read-only file or `PAGE_READONLY` section handle into the offline `--broker-pipe`
+  worker eliminates the duplicate child whole-file hash pass (`2× -> 1×` bytes read)
+  while still hashing every byte on launch. Pairing that single pass with a
+  lockfile-pinned fixed-chunk `SHA256` manifest (verified across 4–8 Oryon crypto
+  cores in parallel, alongside bounded multi-artifact overlap across Swift, adapter,
+  `mmproj` and speech) removes single-stream Merkle-Damgård serialization in warm RAM.
+- **#16 (aligned staging reuse)** and **#17 (optional Windows unbuffered direct I/O):**
+  Bounded largest-first upload staging and sector-aligned `FILE_FLAG_NO_BUFFERING`
+  with CNG digest continuity and buffered fallback when cold NVMe double-buffering
+  is a demonstrated bottleneck.
+- **#18 (owned tensor-range mapping, read-only Swift views and host/NPU deduplication):**
+  Mapping verified immutable Swift CPU tensor spans via read-only `MapViewOfFile`
+  (moving ~5.5–6.7 GiB out of private Windows Job commit into evictable file-backed
+  pages while retaining the physical-RAM watchdog) and unmapping/omitting the
+  `2,888,663,040` bytes (`2.69 GiB`) of CPU-side `blk.0..=26` spans once sealed into
+  resident [Hexagon FastRPC arenas](hexagon.md#resident-packets-and-prefill),
+  without weakening handle/reparse guards or losing explicit NPU-fault recovery.
 
 ### Graph and output buffers
 

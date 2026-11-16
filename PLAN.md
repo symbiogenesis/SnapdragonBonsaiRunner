@@ -468,6 +468,11 @@ adoption decisions without displacing native daily-use acceptance.
   Include the [vLLM checkpoint review cases](docs/inference-algorithms.md#hybrid-cache-reuse-and-speculative-state):
   allocated-but-unwritten checkpoints, complete recurrent/convolution history,
   and shared attention prefixes without a usable matching recurrent checkpoint.
+- [ ] After `latest-prefix reuse` acceptance, evaluate bounded sparse multi-branch
+  prefix checkpoints (`<= 8` saved prefixes binding sealed 64-token KV pages,
+  complete recurrent state, pre-convolution window and adapter scale, charged via
+  `SwiftExecutionShape::reuse_recurrent_copies`) so edited, regenerated and
+  switched conversation branches retain multi-turn TTFT reuse without unbounded RAM.
 - [ ] Qualify the batched target verifier and integrated Swift sampled suffix
   consumer: per-position logits, actual sampler/RNG progression, checkpoint
   admission, accepted-prefix restoration, EOS/Stop/failure and complete-cycle benefit.
@@ -881,9 +886,16 @@ nor editing the available Abliteration factors.
 - [ ] Qualify `#14`'s itemized worst-case execution-shape ledger (`SwiftExecutionShape`,
   `SwiftMemoryBreakdown`, `SwiftKvCacheFormat::Rotated4FittedValues` at `16,896` B/tok
   and monotonic `SwiftContextPlan::for_execution_shape`) in compiled CI and M1–M3 model
-  checks. Deferred screening leads `#16` (aligned staging reuse), `#17` (optional Windows
-  unbuffered direct I/O) and `#18` (owned tensor range mapping) remain gated behind measured
-  cold-start/I/O/mapping bottlenecks and retained-handle/alignment/Job-commit contracts.
+  checks. Once M1–M3 Job-commit measurements land, evaluate calibrating
+  `weights_and_fixed_runtime_bytes` per packing (`PQ2_0` vs `PTQ1_0` against the
+  `11 GiB` `FIXED_RUNTIME_BYTES` baseline) and separating append-only copy-on-write
+  sealed-page KV admission (`live_kv_copies = 1` + bounded mutable tail, saving up
+  to `~4.1 GiB` physical KV at 262,144 `K4/V4` tokens) from arbitrary non-extending
+  divergent `2×` rollback admission under verified eviction/rollback contracts.
+  Deferred screening leads `#16` (aligned staging reuse), `#17` (optional Windows
+  unbuffered direct I/O) and `#18` (owned tensor range mapping, read-only Swift
+  views and host/NPU deduplication) remain gated behind measured cold-start/I/O/mapping
+  bottlenecks and retained-handle/alignment/Job-commit contracts.
 
 ## Bounded calibration and optional precision
 
@@ -1209,6 +1221,11 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Qualify existing full-FFN chains, sibling packets, multi-tile N=1 and
   tile-major reuse independently. Implement true N>1 prefill only with a supported
   signed solver, causal state, bounded VTCM/DMA and measured total-cost benefit.
+- [ ] Support rank-one/low-rank LoRA side-branches alongside Hexagon's fused
+  `ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU + ffn_down` VTCM chain (on sibling CPU
+  workers or explicit side-branch tensors without splitting intermediate FFN
+  activations back to host DRAM) so daily-use standard LoRA (`scale 1.3`) retains
+  fused NPU packet execution under [Hexagon policy](docs/hexagon.md#resident-packets-and-prefill).
 - [ ] Integrate remaining RMSNorm/RoPE/attention/conv/GDN VTCM chains only where
   signed operation support, transformed bases, full-state ownership and measured
   benefit justify placement.
@@ -1312,6 +1329,15 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 #### Memory, loading and approximate cache
 
+- [ ] **Single-pass verified-handle inheritance, parallel chunked `SHA256` and
+  cached Hexagon arenas.** Eliminate the duplicate `7.21 GB` child CNG SHA-256 pass
+  by attesting and inheriting Runner's verified deny-write/deny-delete, no-reparse
+  read-only file or `PAGE_READONLY` section handle into offline `--broker-pipe`
+  workers (still hashing every byte on launch without trusting cached digests or
+  timestamps), evaluate a lockfile-pinned fixed-chunk `SHA256` manifest verified
+  across 4–8 Oryon crypto cores in parallel alongside bounded multi-artifact
+  overlap, and evaluate digest-verified persistent Hexagon `native-q2` repacked
+  arena files for cold startup under [mapping and startup](docs/swift-memory.md#mapping-and-startup).
 - [ ] **#16 — Aligned loading and upload staging reuse.** Process largest tensors
   first, reuse bounded aligned staging and shrink excess capacity once accelerator
   upload or cold-load staging demonstrates a measured bottleneck under the
@@ -1320,10 +1346,13 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   `FILE_FLAG_NO_BUFFERING` handle with logical seek semantics, CNG digest continuity
   and explicit buffered fallback only if cold model loading is I/O-bound and beats
   the existing mapped path.
-- [ ] **#18 — Owned tensor-range mapping and pinning.** Merge owned tensor byte
-  ranges and exclude unrelated spans instead of mapping `first..last` when
-  shared-weight or accelerator pinning requires it, preserving Windows handle and
-  reparse-point identity guards.
+- [ ] **#18 — Owned tensor-range mapping, read-only Swift views and host/NPU
+  deduplication.** Merge owned tensor byte ranges and map verified immutable Swift
+  CPU spans via read-only `MapViewOfFile` (shifting ~5.5–6.7 GiB out of private
+  Windows Job commit into evictable file-backed pages while retaining the
+  physical-RAM watchdog), and unmap/exclude the `2,888,663,040` bytes (`~2.69 GiB`)
+  of CPU-side `blk.0..=26` spans once sealed into resident Hexagon FastRPC arenas,
+  preserving Windows handle/reparse guards and explicit NPU-fault recovery.
 - [ ] **#21 — Calibrated K-cache mean centering.** Evaluate subtracting a
   per-layer/head/channel key mean on rotated `K4` only after `K1` baseline
   attribution, with separate center-vector storage/identity accounting and held-out

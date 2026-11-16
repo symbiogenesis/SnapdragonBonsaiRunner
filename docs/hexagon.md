@@ -57,9 +57,12 @@ end-to-end serving qualification.
 The native-Q2 executor submits the existing gate/up, SwiGLU, optional supported
 Hadamard, down and optional residual chain in one correlated packet. Operation/tensor
 pairs are 4/12, 5/14, 5/15 and 6/17. Borrowed and owned sessions retain checked handles,
-dimensions, cache flushes and exact response correlation. Adapters disable this fused
-chain; arbitrary signs and grouped rotations are unsupported. The optional down
-Hadamard requires every authored sign to be positive one.
+dimensions, cache flushes and exact response correlation. Adapters currently disable this
+fused chain; arbitrary signs and grouped rotations are unsupported. The optional down
+Hadamard requires every authored sign to be positive one. Preserving fused VTCM execution
+under daily-use standard LoRA (`scale 1.3`) requires evaluating rank-one/low-rank adapter
+side-branches alongside the correlated NPU packet (on sibling CPU row workers or explicit
+side-branch tensors) without splitting intermediate FFN activations back to host DRAM.
 
 Two complete independent token chains can share one packet, with odd tails using
 the single-token path. Queue writes become `ceil(tokens / 2)`; every logical operation,
@@ -85,7 +88,11 @@ Unused secondary arenas remain dirty and unimported; already prepared views can
 still be submitted together after import. Primary-arena append preparation keeps
 its separate populated-prefix flush. Native fake-session controls exercise those
 boundaries; signed-driver coherency and complete serving acceptance
-remain independent.
+remain independent. Persisting digest-verified `native-q2` repacked arena images
+on disk (avoiding `2.89 GB` of CPU repacking on cold worker startup) and
+releasing/unmapping duplicate host CPU `blk.0..=26` weight spans (`#18`,
+`~2.69 GiB`) once FastRPC arenas are sealed remain gated behind explicit digest,
+fallback and lifetime contracts in [PLAN.md](../PLAN.md#hexagon-npu).
 
 Source work counts establish no measured latency, memory or energy saving. Complete
 model state/logit/adapter and cancellation acceptance, ARM64 code generation, signed
