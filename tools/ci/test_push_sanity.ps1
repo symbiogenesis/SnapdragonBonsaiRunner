@@ -5,7 +5,8 @@ $adapter=Join-Path $PSScriptRoot 'check_push_sanity.ps1'
 function Invoke-PushRecoveryFixture([string]$CheckerState,[string]$RecoveryState='valid',[switch]$RunRecovery,[ValidateSet('none','handoff','invalid-output')][string]$PreparationState='none') {
     $scratch=New-CiScratch 'bonsai-push-recovery-'
     try {
-        $repository=Join-Path $scratch 'repository'; $target=Join-Path $scratch 'target'
+        $repository=Join-Path $scratch 'repository'
+        $target=if ($CheckerState -ceq 'absent-target') { Join-Path $scratch 'absent/cache/target' } else { Join-Path $scratch 'target' }
         $checkerInputs=@('Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo','tools/ci','src/artifacts','src/windows-process','src/windows-credentials','scripts/release/Release-Common.ps1')
         $recoveryInputs=@('Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo','src/windows-process')
         foreach ($path in @('Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo/fixture.txt','tools/ci/fixture.txt','src/artifacts/fixture.txt','src/windows-process/fixture.txt','src/windows-credentials/fixture.txt')) { Write-CiFixture $repository $path 'Inert committed build identity; no Cargo consumer.' }
@@ -47,30 +48,34 @@ foreach ($entry in @(@{Receipt='push-checker.json';Image='bonsai-ci.exe'},@{Rece
         }
         $checker=Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
         $recovery=Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-push-recovery.exe'
-        Write-CiFixture $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe' 'Inert checker; it must never execute.'
-        Write-CiFixture $target 'aarch64-pc-windows-msvc/debug/bonsai-push-recovery.exe' 'Inert supervisor; archive interception stops before execution.'
-        if ($RunRecovery) {
-            # The native WHERE utility rejects the supervisor's switches promptly.
-            # It cannot compile a checker or manufacture a successful receipt.
-            Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32/where.exe') -Destination $recovery -Force
+        if ($CheckerState -cne 'absent-target') {
+            Write-CiFixture $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe' 'Inert checker; it must never execute.'
+            Write-CiFixture $target 'aarch64-pc-windows-msvc/debug/bonsai-push-recovery.exe' 'Inert supervisor; archive interception stops before execution.'
+            if ($RunRecovery) {
+                # The native WHERE utility rejects the supervisor's switches promptly.
+                # It cannot compile a checker or manufacture a successful receipt.
+                Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32/where.exe') -Destination $recovery -Force
+            }
+            $checkerReceipt=@{SchemaVersion=1;SourceIdentity=$identities.checker;Sha256=(Get-FileHash -LiteralPath $checker -Algorithm SHA256).Hash.ToLowerInvariant()}
+            if ($CheckerState -ceq 'stale') { $checkerReceipt.SourceIdentity='0' * 64 }
+            if ($CheckerState -ceq 'collection-source') { $checkerReceipt.SourceIdentity=@($identities.checker,('0' * 64)) }
+            if ($CheckerState -ceq 'collection-digest') { $checkerReceipt.Sha256=@($checkerReceipt.Sha256,('0' * 64)) }
+            $checkerReceipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-checker.json') -Encoding utf8NoBOM
+            if ($CheckerState -ceq 'missing') { [IO.File]::Delete((Join-Path $target 'push-checker.json')) }
+            if ($CheckerState -ceq 'malformed') { Write-CiFixture $target 'push-checker.json' '{"unfinished":' }
+            if ($CheckerState -ceq 'corrupt') { [IO.File]::AppendAllText($checker,'Changed after receipt publication.') }
+            $recoveryReceipt=@{SchemaVersion=1;SourceIdentity=$identities.recovery;Sha256=(Get-FileHash -LiteralPath $recovery -Algorithm SHA256).Hash.ToLowerInvariant()}
+            if ($RecoveryState -ceq 'invalid') { $recoveryReceipt.Sha256='0' * 64 }
+            if ($RecoveryState -ceq 'stale') { $recoveryReceipt.SourceIdentity='0' * 64 }
+            if ($RecoveryState -ceq 'collection-source') { $recoveryReceipt.SourceIdentity=@($identities.recovery,('0' * 64)) }
+            if ($RecoveryState -ceq 'collection-digest') { $recoveryReceipt.Sha256=@($recoveryReceipt.Sha256,('0' * 64)) }
+            $recoveryReceipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-recovery.json') -Encoding utf8NoBOM
+            if ($RecoveryState -ceq 'missing-receipt') { [IO.File]::Delete((Join-Path $target 'push-recovery.json')) }
+            if ($RecoveryState -ceq 'missing-image') { [IO.File]::Delete($recovery) }
+            if ($RecoveryState -ceq 'corrupt') { [IO.File]::AppendAllText($recovery,'Changed after recovery receipt publication.') }
+        } else {
+            Assert-Ci (-not (Test-Path -LiteralPath $target)) 'Absent recovery target already exists.'
         }
-        $checkerReceipt=@{SchemaVersion=1;SourceIdentity=$identities.checker;Sha256=(Get-FileHash -LiteralPath $checker -Algorithm SHA256).Hash.ToLowerInvariant()}
-        if ($CheckerState -ceq 'stale') { $checkerReceipt.SourceIdentity='0' * 64 }
-        if ($CheckerState -ceq 'collection-source') { $checkerReceipt.SourceIdentity=@($identities.checker,('0' * 64)) }
-        if ($CheckerState -ceq 'collection-digest') { $checkerReceipt.Sha256=@($checkerReceipt.Sha256,('0' * 64)) }
-        $checkerReceipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-checker.json') -Encoding utf8NoBOM
-        if ($CheckerState -ceq 'missing') { [IO.File]::Delete((Join-Path $target 'push-checker.json')) }
-        if ($CheckerState -ceq 'malformed') { Write-CiFixture $target 'push-checker.json' '{"unfinished":' }
-        if ($CheckerState -ceq 'corrupt') { [IO.File]::AppendAllText($checker,'Changed after receipt publication.') }
-        $recoveryReceipt=@{SchemaVersion=1;SourceIdentity=$identities.recovery;Sha256=(Get-FileHash -LiteralPath $recovery -Algorithm SHA256).Hash.ToLowerInvariant()}
-        if ($RecoveryState -ceq 'invalid') { $recoveryReceipt.Sha256='0' * 64 }
-        if ($RecoveryState -ceq 'stale') { $recoveryReceipt.SourceIdentity='0' * 64 }
-        if ($RecoveryState -ceq 'collection-source') { $recoveryReceipt.SourceIdentity=@($identities.recovery,('0' * 64)) }
-        if ($RecoveryState -ceq 'collection-digest') { $recoveryReceipt.Sha256=@($recoveryReceipt.Sha256,('0' * 64)) }
-        $recoveryReceipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-recovery.json') -Encoding utf8NoBOM
-        if ($RecoveryState -ceq 'missing-receipt') { [IO.File]::Delete((Join-Path $target 'push-recovery.json')) }
-        if ($RecoveryState -ceq 'missing-image') { [IO.File]::Delete($recovery) }
-        if ($RecoveryState -ceq 'corrupt') { [IO.File]::AppendAllText($recovery,'Changed after recovery receipt publication.') }
         Write-CiFixture $repository 'unrelated-source.txt' 'Uncommitted poison must not reach recovery.'
         if ($PreparationState -cne 'none') { Write-CiFixture $repository 'tools/ci/prepare_push_helpers.ps1' "throw 'Uncommitted preparation helper must never execute.'" }
         $driver=Join-Path $scratch 'recovery-driver.ps1'
@@ -145,6 +150,7 @@ $cases=[ordered]@{
  corrupt_checker_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'corrupt' }
  missing_checker_receipt_recovers_from_committed_source={ Invoke-PushRecoveryFixture 'missing' }
  unverified_supervisor_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'invalid' }
+ absent_target_directory_triggers_preparation={ Invoke-PushRecoveryFixture 'absent-target' 'absent-target' -PreparationState handoff }
  missing_recovery_receipt_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'missing-receipt' }
  missing_recovery_helper_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'missing-image' }
  stale_recovery_source_triggers_preparation={ Invoke-PushRecoveryFixture 'stale' 'stale' }

@@ -186,6 +186,7 @@ try {
     $recover = -not $Prepare -and -not (Test-PushHelperReceipt $receiptPath $tool $sourceId)
     $prepareForPush = $false
     if ($Prepare -or $recover) {
+        [void][IO.Directory]::CreateDirectory($target)
         $recoveryInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'src/windows-process')
         $recoveryObjects = @($recoveryInputs | ForEach-Object { $objects[[array]::IndexOf($inputs, $_)] })
         $recoveryId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($recoveryObjects -join "`n")))).ToLowerInvariant()
@@ -193,7 +194,6 @@ try {
     # A failed explicit rebuild cannot leave an earlier preparation admitted.
     # Keep its binary for diagnosis/reuse, but publish a receipt only on success.
     if ($Prepare) {
-        [void][IO.Directory]::CreateDirectory($target)
         [IO.File]::Delete($receiptPath)
         [IO.File]::Delete($recoveryReceiptPath)
     }
@@ -241,6 +241,7 @@ try {
                     throw 'Push blocked: automatic preparation did not produce verified helpers for the original committed source.'
                 }
             } catch {
+                [void][IO.Directory]::CreateDirectory($target)
                 [IO.File]::Delete($receiptPath)
                 [IO.File]::Delete($recoveryReceiptPath)
                 throw

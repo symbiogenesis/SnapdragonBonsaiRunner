@@ -1674,6 +1674,11 @@ mod tests {
     }
 
     #[test]
+    fn push_sanity_absent_target_directory_triggers_preparation() -> Result<()> {
+        preparation_case("absent_target_directory_triggers_preparation")
+    }
+
+    #[test]
     fn push_sanity_missing_recovery_receipt_triggers_preparation() -> Result<()> {
         preparation_case("missing_recovery_receipt_triggers_preparation")
     }
