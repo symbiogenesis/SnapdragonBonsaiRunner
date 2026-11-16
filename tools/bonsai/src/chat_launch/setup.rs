@@ -6,11 +6,26 @@ use std::{
     fs,
     io::Write as _,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 const SWIFT: &str = include_str!("../../../../config/swift-assessment.lock.json");
 const ADAPTER: &str = include_str!("../../../../config/swift-lora.lock.json");
 const PTQ1: &str = include_str!("../../../../config/swift.ptq1-export.json");
+
+static SWIFT_LOCK: OnceLock<crate::Result<Value>> = OnceLock::new();
+static ADAPTER_LOCK: OnceLock<crate::Result<Value>> = OnceLock::new();
+static PTQ1_EXPORT: OnceLock<crate::Result<Value>> = OnceLock::new();
+
+fn cached_json(
+    cache: &'static OnceLock<crate::Result<Value>>,
+    raw: &str,
+) -> crate::Result<&'static Value> {
+    cache
+        .get_or_init(|| serde_json::from_str(raw).map_err(|error| error.to_string()))
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 struct Model {
     path: PathBuf,
@@ -26,13 +41,13 @@ fn text<'a>(value: &'a Value, key: &str) -> crate::Result<&'a str> {
 }
 
 fn model(request: &Request) -> crate::Result<Model> {
-    let lock: Value = serde_json::from_str(SWIFT).map_err(|error| error.to_string())?;
-    let derived: Value = serde_json::from_str(PTQ1).map_err(|error| error.to_string())?;
+    let lock = cached_json(&SWIFT_LOCK, SWIFT)?;
+    let derived = cached_json(&PTQ1_EXPORT, PTQ1)?;
     let pin = bonsai_cpu_policy::select_artifact(
-        &lock,
+        lock,
         bonsai_cpu_policy::Profile::SwiftPq2Assessment,
         request.use_repacked_ptq1,
-        request.use_repacked_ptq1.then_some(&derived),
+        request.use_repacked_ptq1.then_some(derived),
     )?;
     let source = &lock["model"];
     let filename = text(&pin, "Filename")?;
@@ -88,8 +103,8 @@ pub(super) fn status(
     fs::rename(&temporary, &path).map_err(|error| format!("Cannot publish setup progress: {error}"))
 }
 
-fn preflight(data: &Path, model: &Model) -> crate::Result<()> {
-    if model.path.exists() || model.url.is_none() {
+fn preflight(data: &Path, model: &Model, model_exists: bool) -> crate::Result<()> {
+    if model_exists || model.url.is_none() {
         return Ok(());
     }
     #[cfg(windows)]
@@ -137,8 +152,7 @@ pub(super) fn kind(request: &Request) -> crate::Result<&'static str> {
     })
 }
 
-fn publisher(request: &Request, working: &Path) -> crate::Result<()> {
-    let kind = kind(request)?;
+fn publisher(request: &Request, working: &Path, kind: &str) -> crate::Result<()> {
     runtime_status(
         working,
         kind,
@@ -175,22 +189,33 @@ fn publisher(request: &Request, working: &Path) -> crate::Result<()> {
 
 pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
     crate::startup_cancel::checkpoint()?;
-    if !request.native_engine {
-        publisher(request, working)?;
-    }
     let selected = model(request)?;
-    let kind = kind(request)?;
-    let mmproj_path = (!request.no_mmproj)
+    let model_exists = selected.path.exists();
+    let kind = if model_exists {
+        "existing"
+    } else {
+        "first-run"
+    };
+    if !request.native_engine {
+        publisher(request, working, kind)?;
+    }
+    let mmproj = (!request.no_mmproj)
         .then(|| bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory))
-        .transpose()?
-        .map(|artifact| artifact.path);
-    prepare_weights(
+        .transpose()?;
+    prepare_weights_with(
         request,
         working,
+        &selected,
+        model_exists,
+        kind,
+        mmproj.as_ref(),
         |url, path, bytes, hash, working| {
             let stage = if path == selected.path {
                 "model"
-            } else if mmproj_path.as_deref() == Some(path) {
+            } else if mmproj
+                .as_ref()
+                .is_some_and(|artifact| artifact.path == path)
+            {
                 "mmproj"
             } else {
                 "adapter"
@@ -208,15 +233,50 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
     )
 }
 
+#[cfg(test)]
 fn prepare_weights(
     request: &Request,
     working: &Path,
+    receive: impl FnMut(&str, &Path, u64, &str, &Path) -> crate::Result<()>,
+    verify: impl FnMut(&Path, u64, &str) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let selected = model(request)?;
+    let model_exists = selected.path.exists();
+    let kind = if model_exists {
+        "existing"
+    } else {
+        "first-run"
+    };
+    let mmproj = (!request.no_mmproj)
+        .then(|| bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory))
+        .transpose()?;
+    prepare_weights_with(
+        request,
+        working,
+        &selected,
+        model_exists,
+        kind,
+        mmproj.as_ref(),
+        receive,
+        verify,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shares pre-resolved model, existence, kind and mmproj state from prepare without reparsing."
+)]
+fn prepare_weights_with(
+    request: &Request,
+    working: &Path,
+    selected: &Model,
+    model_exists: bool,
+    kind: &str,
+    mmproj: Option<&bonsai_cpu_policy::SwiftMmprojArtifact>,
     mut receive: impl FnMut(&str, &Path, u64, &str, &Path) -> crate::Result<()>,
     mut verify: impl FnMut(&Path, u64, &str) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    let selected = model(request)?;
-    preflight(&request.data_directory, &selected)?;
-    let kind = kind(request)?;
+    preflight(&request.data_directory, selected, model_exists)?;
     let (activity, message) = if selected.url.is_none() {
         ("verifying", "Verifying the selected PTQ1 model…")
     } else {
@@ -230,8 +290,8 @@ fn prepare_weights(
         activity,
         Some((&selected.path, selected.bytes)),
     )?;
-    if let Some(url) = selected.url {
-        receive(&url, &selected.path, selected.bytes, &selected.sha256, working)
+    if let Some(url) = selected.url.as_deref() {
+        receive(url, &selected.path, selected.bytes, &selected.sha256, working)
             .map_err(|error| format!("Swift model setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup. Partial downloads are kept for resume.", selected.path.display()))?;
     } else {
         verify(&selected.path, selected.bytes, &selected.sha256)
@@ -239,7 +299,7 @@ fn prepare_weights(
     }
     if !request.no_abliterate_lora {
         let selected = bonsai_cpu_policy::abliterate_lora_artifact(&request.data_directory)?;
-        let lock: Value = serde_json::from_str(ADAPTER).map_err(|error| error.to_string())?;
+        let lock = cached_json(&ADAPTER_LOCK, ADAPTER)?;
         status(
             working,
             "adapter",
@@ -251,8 +311,7 @@ fn prepare_weights(
         receive(text(&lock["adapter"], "url")?, &selected.path, selected.bytes, &selected.sha256, working)
             .map_err(|error| format!("Model adapter setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup.", selected.path.display()))?;
     }
-    if !request.no_mmproj {
-        let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory)?;
+    if let Some(mmproj) = mmproj {
         status(
             working,
             "mmproj",

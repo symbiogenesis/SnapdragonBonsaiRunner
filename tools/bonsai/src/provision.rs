@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
 use bonsai_artifacts::{is_redirect, open_locked_file, validate_external_path};
@@ -489,7 +489,8 @@ fn extract_inference(
     staging: &Path,
     created: &mut bool,
 ) -> crate::Result<()> {
-    let mut file = open_locked_file(archive_path).map_err(|error| error.to_string())?;
+    let mut file = crate::bounded_input::open_locked_file_sequential(archive_path)
+        .map_err(|error| error.to_string())?;
     let bytes = pin["bytes"]
         .as_u64()
         .ok_or("Missing inference archive length.")?;
@@ -508,6 +509,7 @@ fn extract_inference(
     fs::create_dir(staging).map_err(|error| error.to_string())?;
     *created = true;
     let mut names = BTreeSet::new();
+    let mut buffer = vec![0_u8; 65_536];
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
         let expected = {
@@ -532,18 +534,50 @@ fn extract_inference(
             );
         }
         let path = staging.join(&expected.name);
+        let is_exe = Path::new(&expected.name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
         let mut output = OpenOptions::new()
+            .read(is_exe)
             .write(true)
             .create_new(true)
             .open(path)
             .map_err(|error| error.to_string())?;
-        let copied = std::io::copy(&mut entry.by_ref().take(expected.bytes + 1), &mut output)
-            .map_err(|error| error.to_string())?;
+        let mut hasher = crate::identity::Hasher::new()?;
+        let mut copied = 0_u64;
+        loop {
+            let count = match entry.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            if count == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(u64::try_from(count).map_err(|error| error.to_string())?)
+                .ok_or("Inference archive entry exceeded its bound or was truncated.")?;
+            if copied > expected.bytes {
+                return Err("Inference archive entry exceeded its bound or was truncated.".into());
+            }
+            let chunk = &buffer[..count];
+            hasher.update(chunk)?;
+            output.write_all(chunk).map_err(|error| error.to_string())?;
+        }
         if copied != expected.bytes {
             return Err("Inference archive entry exceeded its bound or was truncated.".into());
         }
+        if hasher.finalize_hex()? != expected.sha256 {
+            return Err("Inference archive entry SHA-256 differs from its lock.".into());
+        }
         output.flush().map_err(|error| error.to_string())?;
         output.sync_all().map_err(|error| error.to_string())?;
+        if is_exe {
+            output
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| error.to_string())?;
+            crate::startup_cache::assert_arm64_file(&mut output, expected.bytes)?;
+        }
     }
     Ok(())
 }
@@ -553,20 +587,15 @@ fn prepare_inference_stage(
     files: &[InferenceFile],
     archive: &Path,
     staging: &Path,
-    observe: &mut RuntimeObserver<'_>,
+    _observe: &mut RuntimeObserver<'_>,
 ) -> crate::Result<()> {
     let mut created = false;
-    let result = (|| {
-        extract_inference(archive, &lock["asset"], files, staging, &mut created)?;
-        observe(RepairActivity::VerifyingExisting, None)?;
-        verify_inference(lock, files, staging)?;
-        Ok(())
-    })();
+    let result = extract_inference(archive, &lock["asset"], files, staging, &mut created);
     result.map_err(|error| {
         if !created {
             return error;
         }
-        // No extraction or verification handles survive this closure. The exact
+        // No extraction or verification handles survive this call. The exact
         // current-attempt path and pinned inventory authorize cleanup even when
         // the original failure was cancellation; its textual error is retained.
         let expected = files.iter().map(|file| PathBuf::from(&file.name)).collect::<Vec<_>>();
@@ -593,6 +622,7 @@ fn inference(request: &Request, working: &Path) -> crate::Result<Value> {
         .join(commit)
         .join(target);
     validate_external_path(&destination).map_err(|error| error.to_string())?;
+    let mut downloads_cleaned = false;
     if !destination.exists() {
         if request.verify_only {
             return Err("Prism Inference is not installed.".into());
@@ -600,6 +630,7 @@ fn inference(request: &Request, working: &Path) -> crate::Result<Value> {
         let archive = request.data_directory.join("downloads").join(filename);
         receive(request, pin, text(pin, "url")?, &archive, working)?;
         cleanup_obsolete_inference_downloads(&request.data_directory, filename)?;
+        downloads_cleaned = true;
         let parent = destination
             .parent()
             .ok_or("Inference installation has no parent.")?;
@@ -615,7 +646,9 @@ fn inference(request: &Request, working: &Path) -> crate::Result<Value> {
     }
     let mut installed = verify_inference(&lock, &files, &destination)?;
     if !request.verify_only {
-        cleanup_obsolete_inference_downloads(&request.data_directory, filename)?;
+        if !downloads_cleaned {
+            cleanup_obsolete_inference_downloads(&request.data_directory, filename)?;
+        }
         cleanup_obsolete_inference_installations(&request.data_directory, commit, target)?;
     }
     if request.include_capabilities {
@@ -1088,7 +1121,7 @@ fn repair_inference(
 fn stage_publisher_repair(
     spec: &bonsai_artifacts::RuntimeSpec,
     observe: &mut RuntimeObserver<'_>,
-) -> crate::Result<()> {
+) -> crate::Result<bonsai_artifacts::VerifiedRuntime> {
     let parent = spec
         .runtime_directory
         .parent()
@@ -1119,11 +1152,12 @@ fn stage_publisher_repair(
     // A successful rename is not a verification result. Recheck the published
     // directory against the original locked archive before returning to launch.
     observe(RepairActivity::VerifyingExisting, None)?;
-    bonsai_artifacts::VerifiedRuntime::verify_with(spec, || {
+    let verified = bonsai_artifacts::VerifiedRuntime::verify_with(spec, || {
         crate::startup_cancel::checkpoint().map_err(|_| bonsai_artifacts::ArtifactError::Cancelled)
     })
     .map_err(|error| format!("The published runtime could not be verified: {error}"))?;
-    cleanup_invalid_runtime_directories(&spec.runtime_directory, &expected)
+    cleanup_invalid_runtime_directories(&spec.runtime_directory, &expected)?;
+    Ok(verified)
 }
 
 #[cfg(windows)]
@@ -1169,11 +1203,17 @@ fn repair_engine(
         archive_bytes,
         archive_sha256: text(pin, "sha256")?.into(),
     };
-    observe(RepairActivity::VerifyingExisting, None)?;
-    let verified = bonsai_artifacts::VerifiedRuntime::verify_with(&spec, || {
-        crate::startup_cancel::checkpoint().map_err(|_| bonsai_artifacts::ArtifactError::Cancelled)
-    });
-    if let Ok(verified) = verified {
+    let existing = if destination.exists() {
+        observe(RepairActivity::VerifyingExisting, None)?;
+        bonsai_artifacts::VerifiedRuntime::verify_with(&spec, || {
+            crate::startup_cancel::checkpoint()
+                .map_err(|_| bonsai_artifacts::ArtifactError::Cancelled)
+        })
+        .ok()
+    } else {
+        None
+    };
+    let verified = if let Some(verified) = existing {
         let expected = verified
             .files()
             .iter()
@@ -1185,13 +1225,18 @@ fn repair_engine(
             })
             .collect::<crate::Result<Vec<_>>>()?;
         cleanup_invalid_runtime_directories(&spec.runtime_directory, &expected)?;
+        verified
     } else {
         crate::startup_cancel::checkpoint()?;
         observe(RepairActivity::Publishing, None)?;
-        stage_publisher_repair(&spec, observe)?;
-    }
-    observe(RepairActivity::VerifyingExisting, None)?;
-    engine(request, working)
+        stage_publisher_repair(&spec, observe)?
+    };
+    crate::runtime::probe_verified(
+        &verified,
+        &spec,
+        text(runtime, "commit")?,
+        request.include_help,
+    )
 }
 
 #[cfg(not(windows))]
@@ -2085,6 +2130,72 @@ mod tests {
             assert!(!root.join("escape.exe").exists());
             assert!(!root.join(format!("staging-{index}")).exists());
         }
+        // Reject corrupt entry hash and non-ARM64 executable bytes during inline stage extraction.
+        let mut wrong_hash_zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let mut non_arm64_image = vec![0; 128];
+        non_arm64_image[..2].copy_from_slice(b"MZ");
+        non_arm64_image[60..64].copy_from_slice(&64_u32.to_le_bytes());
+        non_arm64_image[64..70].copy_from_slice(&[b'P', b'E', 0, 0, 0x64, 0x86]);
+        for name in names {
+            wrong_hash_zip
+                .start_file(name, SimpleFileOptions::default())
+                .map_err(|error| error.to_string())?;
+            wrong_hash_zip
+                .write_all(&non_arm64_image)
+                .map_err(|error| error.to_string())?;
+        }
+        let non_arm64_bytes = wrong_hash_zip
+            .finish()
+            .map_err(|error| error.to_string())?
+            .into_inner();
+        let non_arm64_archive = root.join("non-arm64.zip");
+        fs::write(&non_arm64_archive, &non_arm64_bytes).map_err(|error| error.to_string())?;
+        let non_arm64_pin = json!({
+            "bytes": non_arm64_bytes.len(),
+            "sha256": crate::identity::hex(&Sha256::digest(&non_arm64_bytes))
+        });
+        // First reject hash mismatch against expected[0].
+        let mismatch_files = names
+            .iter()
+            .map(|name| InferenceFile {
+                name: (*name).into(),
+                bytes: u64::try_from(non_arm64_image.len()).unwrap_or(0),
+                sha256: "0".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        let mismatch_stage = root.join("staging-mismatch");
+        assert!(
+            prepare_inference_stage(
+                &json!({"asset": non_arm64_pin}),
+                &mismatch_files,
+                &non_arm64_archive,
+                &mismatch_stage,
+                &mut |_, _| Ok(())
+            )
+            .is_err()
+        );
+        assert!(!mismatch_stage.exists());
+        // Now match hash but fail ARM64 PE machine check.
+        let bad_arch_files = names
+            .iter()
+            .map(|name| InferenceFile {
+                name: (*name).into(),
+                bytes: u64::try_from(non_arm64_image.len()).unwrap_or(0),
+                sha256: crate::identity::hex(&Sha256::digest(&non_arm64_image)),
+            })
+            .collect::<Vec<_>>();
+        let bad_arch_stage = root.join("staging-bad-arch");
+        assert!(
+            prepare_inference_stage(
+                &json!({"asset": non_arm64_pin}),
+                &bad_arch_files,
+                &non_arm64_archive,
+                &bad_arch_stage,
+                &mut |_, _| Ok(())
+            )
+            .is_err()
+        );
+        assert!(!bad_arch_stage.exists());
         fs::remove_dir_all(root).map_err(|error| error.to_string())
     }
 

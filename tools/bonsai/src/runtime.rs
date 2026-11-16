@@ -19,6 +19,20 @@ pub fn run(request: serde_json::Value) -> crate::Result<serde_json::Value> {
 }
 
 #[cfg(windows)]
+pub(crate) fn probe_verified(
+    runtime: &bonsai_artifacts::VerifiedRuntime,
+    spec: &bonsai_artifacts::RuntimeSpec,
+    commit: &str,
+    include_help: bool,
+) -> crate::Result<serde_json::Value> {
+    let (id, creation) = crate::cpu_check::parent_identity(None, None)?;
+    let parent = bonsai_windows_process::ParentProcess::open(id, creation)
+        .map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    windows::probe_verified(runtime, spec, commit, include_help, &parent, deadline)
+}
+
+#[cfg(windows)]
 pub(crate) fn file_receipt(runtime: &bonsai_artifacts::VerifiedRuntime) -> serde_json::Value {
     serde_json::json!(
         runtime
@@ -106,6 +120,37 @@ mod windows {
         Ok(output.stdout + &output.stderr)
     }
 
+    pub(super) fn probe_verified(
+        runtime: &VerifiedRuntime,
+        spec: &RuntimeSpec,
+        commit: &str,
+        include_help: bool,
+        parent: &ParentProcess,
+        deadline: Instant,
+    ) -> Result<Value> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch: PathBuf = std::env::temp_dir().join(format!(
+            "SwiftBonsai-RuntimeProbe-{}-{stamp}",
+            std::process::id()
+        ));
+        validate_external_path(&scratch).map_err(|error| error.to_string())?;
+        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let version = probe(runtime, parent, &scratch, "version", deadline)?;
+        if !matches_commit(&version, commit) {
+            return Err("Runtime reported build identity differs from the lock file.".into());
+        }
+        let help = include_help
+            .then(|| probe(runtime, parent, &scratch, "help", deadline))
+            .transpose()?;
+        Ok(json!({"Status": "verified", "Commit": commit,
+            "ServerPath": runtime.executable(), "ArchivePath": runtime.archive_path(),
+            "ReportedVersion": version.trim(), "Runtime": spec,
+            "RuntimeFiles": super::file_receipt(runtime), "RuntimeHelp": help, "EvidenceDirectory": scratch}))
+    }
+
     pub(super) fn run(value: Value) -> Result<Value> {
         if !value.is_object() {
             return Err("Runtime request must be an object.".into());
@@ -132,28 +177,14 @@ mod windows {
             parent.ensure_alive().map_err(|_| ArtifactError::Cancelled)
         })
         .map_err(|error| error.to_string())?;
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos();
-        let scratch: PathBuf = std::env::temp_dir().join(format!(
-            "SwiftBonsai-RuntimeProbe-{}-{stamp}",
-            std::process::id()
-        ));
-        validate_external_path(&scratch).map_err(|error| error.to_string())?;
-        fs::create_dir(&scratch).map_err(|error| error.to_string())?;
-        let version = probe(&runtime, &parent, &scratch, "version", deadline)?;
-        if !matches_commit(&version, &request.commit) {
-            return Err("Runtime reported build identity differs from the lock file.".into());
-        }
-        let help = request
-            .include_help
-            .then(|| probe(&runtime, &parent, &scratch, "help", deadline))
-            .transpose()?;
-        Ok(json!({"Status": "verified", "Commit": request.commit,
-            "ServerPath": runtime.executable(), "ArchivePath": runtime.archive_path(),
-            "ReportedVersion": version.trim(), "Runtime": request.runtime,
-            "RuntimeFiles": super::file_receipt(&runtime), "RuntimeHelp": help, "EvidenceDirectory": scratch}))
+        probe_verified(
+            &runtime,
+            &request.runtime,
+            &request.commit,
+            request.include_help,
+            &parent,
+            deadline,
+        )
     }
 
     #[cfg(test)]
