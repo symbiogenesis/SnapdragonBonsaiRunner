@@ -128,6 +128,61 @@ fn missing_native_runtime_is_distinct_from_missing_model_artifacts() -> io::Resu
 }
 
 #[test]
+fn parallel_launch_artifact_verification_reports_deterministic_error_precedence() -> io::Result<()>
+{
+    let data = std::env::temp_dir().join(format!(
+        "Bonsai-ParallelVerifyPrecedence-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos()
+    ));
+    fs::create_dir(&data)?;
+    let mut config = LaunchConfig::parse([
+        OsString::from("--launch-development"),
+        "--allow-unisolated-backend".into(),
+        "--native-engine".into(),
+        "--use-abliterate-lora".into(),
+        "--profile".into(),
+        "swift-pq2-assessment".into(),
+        "--data-directory".into(),
+        data.as_os_str().to_owned(),
+        "--evidence-parent".into(),
+        data.as_os_str().to_owned(),
+        "--frontend-port".into(),
+        "0".into(),
+        "--backend-port".into(),
+        "8081".into(),
+    ])
+    .map_err(|_| io::Error::other("Invalid fixture launch configuration."))?;
+    let plan = LaunchPlan::for_profile_with_options(
+        &data,
+        config.backend_port,
+        &data.join("not-created.key"),
+        config.profile,
+        true,
+        false,
+    )
+    .map_err(|_| io::Error::other("Invalid fixture launch policy."))?;
+    for _ in 0..4 {
+        assert_eq!(
+            config.verify_launch_artifacts(&plan).err(),
+            Some(LaunchError::NativeRuntime)
+        );
+    }
+    config.native_engine = false;
+    for _ in 0..4 {
+        assert_eq!(
+            config.verify_launch_artifacts(&plan).err(),
+            Some(LaunchError::Artifacts)
+        );
+    }
+    fs::remove_dir(data)?;
+    Ok(())
+}
+
+#[test]
 fn owned_ready_backend_stops_with_service() -> io::Result<()> {
     check(async {
         let Fixture {

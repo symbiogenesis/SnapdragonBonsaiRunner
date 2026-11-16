@@ -154,6 +154,16 @@ pub struct LaunchCheck {
     pub memory_admitted: bool,
 }
 
+struct VerifiedLaunchGuards {
+    native_executable: Option<(PathBuf, bonsai_artifacts::VerifiedFile)>,
+    artifacts: VerifiedArtifacts,
+    adapter: Option<bonsai_artifacts::VerifiedFile>,
+    mmproj: Option<(
+        bonsai_cpu_policy::SwiftMmprojArtifact,
+        bonsai_artifacts::VerifiedFile,
+    )>,
+}
+
 impl LaunchConfig {
     /// Parse the launcher arguments, including an explicit containment selection.
     ///
@@ -473,10 +483,7 @@ impl LaunchConfig {
             self.uses_repacked_ptq1(),
         )
         .map_err(|_| LaunchError::Policy)?;
-        let _native_executable = self.native_executable_guard()?;
-        let _artifacts = self.verify_artifacts(&plan)?;
-        let _adapter = Self::adapter_guard(&plan)?;
-        let _mmproj = self.mmproj_guard()?;
+        let _guards = self.verify_launch_artifacts(&plan)?;
         let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
         let memory_admitted = if self.memory_context_supported()? {
             self.swift_context_plan(available).is_ok()
@@ -589,6 +596,46 @@ impl LaunchConfig {
             return Err(LaunchError::Artifacts);
         }
         Ok(artifacts)
+    }
+
+    fn verify_launch_artifacts(
+        &self,
+        plan: &LaunchPlan,
+    ) -> Result<VerifiedLaunchGuards, LaunchError> {
+        let verify_vision = self.runtime_supports_vision()?;
+        std::thread::scope(|scope| {
+            let native_handle = self
+                .native_engine
+                .then(|| scope.spawn(|| self.native_executable_guard()));
+            let adapter_handle = plan
+                .adapter
+                .is_some()
+                .then(|| scope.spawn(|| Self::adapter_guard(plan)));
+            let mmproj_handle = verify_vision.then(|| scope.spawn(|| self.mmproj_guard()));
+
+            let artifacts_result = self.verify_artifacts(plan);
+
+            let native_executable = match native_handle {
+                Some(handle) => handle.join().map_err(|_| LaunchError::NativeRuntime)??,
+                None => None,
+            };
+            let artifacts = artifacts_result?;
+            let adapter = match adapter_handle {
+                Some(handle) => handle.join().map_err(|_| LaunchError::Adapter)??,
+                None => None,
+            };
+            let mmproj = match mmproj_handle {
+                Some(handle) => handle.join().map_err(|_| LaunchError::Artifacts)??,
+                None => None,
+            };
+
+            Ok(VerifiedLaunchGuards {
+                native_executable,
+                artifacts,
+                adapter,
+                mmproj,
+            })
+        })
     }
 
     fn validate_paths(&self) -> Result<(), LaunchError> {
@@ -824,12 +871,14 @@ impl LaunchConfig {
         if self.native_engine {
             startup_timing.phase(StartupPhase::NativeRuntimeVerification);
         }
-        let native_executable = self.native_executable_guard()?;
         startup_timing.phase(StartupPhase::ModelVerification);
-        let artifacts = self.verify_artifacts(&preliminary)?;
+        let VerifiedLaunchGuards {
+            native_executable,
+            artifacts,
+            adapter,
+            mut mmproj,
+        } = self.verify_launch_artifacts(&preliminary)?;
         startup_timing.phase(StartupPhase::AdapterVerification);
-        let adapter = Self::adapter_guard(&preliminary)?;
-        let mut mmproj = self.mmproj_guard()?;
         if poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_ready())).await {
             return Err(LaunchError::Cancelled);
         }

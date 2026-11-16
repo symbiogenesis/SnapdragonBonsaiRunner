@@ -111,8 +111,16 @@ impl VerifiedArtifacts {
             archive_bytes: pins.runtime.asset.bytes,
             archive_sha256: pins.runtime.asset.sha256.clone(),
         };
-        let runtime = VerifiedRuntime::verify(&spec)?;
-        let (model, model_guard) = Self::verify_selected_model(data, profile, use_repacked_ptq1)?;
+        let (runtime_result, model_result) = std::thread::scope(|scope| {
+            let runtime_handle = scope.spawn(|| VerifiedRuntime::verify(&spec));
+            let model_result = Self::verify_selected_model(data, profile, use_repacked_ptq1);
+            let runtime_result = runtime_handle
+                .join()
+                .unwrap_or(Err(ArtifactError::Configuration));
+            (runtime_result, model_result)
+        });
+        let runtime = runtime_result?;
+        let (model, model_guard) = model_result?;
         Ok(Self {
             executable: runtime.executable().to_owned(),
             model,
