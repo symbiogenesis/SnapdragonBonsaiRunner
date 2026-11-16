@@ -13,12 +13,15 @@ const STREAM_EVENTS: usize = 64;
 const CONTROL_RESERVE: usize = 16;
 const COALESCE_BYTES: usize = 16 * 1024;
 
+type RepaintCallback = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Default)]
 struct Queue {
     events: VecDeque<Event>,
     stream_bytes: usize,
     sender_closed: bool,
     receiver_closed: bool,
+    repaint: Option<RepaintCallback>,
     #[cfg(test)]
     wait_started: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -31,8 +34,26 @@ pub(crate) struct EventReceiver(Arc<Mutex<Queue>>);
 
 /// Create one FIFO; lifecycle events retain room when streaming is saturated.
 pub(crate) fn channel() -> (EventSender, EventReceiver) {
-    let shared = Arc::new(Mutex::new(Queue::default()));
+    channel_with_wakeup(None)
+}
+
+/// Create one FIFO that invokes `repaint` outside the queue lock whenever a worker event is posted.
+pub(crate) fn channel_with_repaint(repaint: RepaintCallback) -> (EventSender, EventReceiver) {
+    channel_with_wakeup(Some(repaint))
+}
+
+fn channel_with_wakeup(repaint: Option<RepaintCallback>) -> (EventSender, EventReceiver) {
+    let shared = Arc::new(Mutex::new(Queue {
+        repaint,
+        ..Queue::default()
+    }));
     (EventSender(Arc::clone(&shared)), EventReceiver(shared))
+}
+
+fn notify_repaint(repaint: Option<RepaintCallback>) {
+    if let Some(callback) = repaint {
+        callback();
+    }
 }
 
 const fn stream_bytes(event: &Event) -> usize {
@@ -63,7 +84,9 @@ impl EventSender {
             return Err(());
         }
         queue.events.push_back(event);
+        let repaint = queue.repaint.clone();
         drop(queue);
+        notify_repaint(repaint);
         Ok(())
     }
 
@@ -93,18 +116,24 @@ impl EventSender {
         };
         if combined {
             queue.stream_bytes += bytes;
+            let repaint = queue.repaint.clone();
             drop(queue);
             *event = None;
+            notify_repaint(repaint);
             return Ok(true);
         }
         if queue.events.len() >= STREAM_EVENTS {
             return Ok(false);
         }
+        let mut posted = false;
         if let Some(event) = event.take() {
             queue.stream_bytes += bytes;
             queue.events.push_back(event);
+            posted = true;
         }
+        let repaint = if posted { queue.repaint.clone() } else { None };
         drop(queue);
+        notify_repaint(repaint);
         Ok(true)
     }
 
@@ -137,9 +166,13 @@ impl EventSender {
 
 impl Drop for EventSender {
     fn drop(&mut self) {
-        if let Ok(mut queue) = self.0.lock() {
+        let repaint = if let Ok(mut queue) = self.0.lock() {
             queue.sender_closed = true;
-        }
+            queue.repaint.clone()
+        } else {
+            None
+        };
+        notify_repaint(repaint);
     }
 }
 

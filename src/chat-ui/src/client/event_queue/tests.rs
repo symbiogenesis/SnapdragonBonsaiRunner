@@ -239,3 +239,53 @@ fn saturated_delivery_stops_when_command_sender_disconnects() -> Result<()> {
     assert_eq!(receiver.try_iter().count(), STREAM_EVENTS);
     Ok(())
 }
+
+#[test]
+fn event_sender_invokes_repaint_wakeup_on_posted_events_and_drop() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let wakeups = Arc::new(AtomicUsize::new(0));
+    let callback_wakeups = Arc::clone(&wakeups);
+    let (sender, receiver) = channel_with_repaint(Arc::new(move || {
+        callback_wakeups.fetch_add(1, Ordering::Relaxed);
+    }));
+    // Replace wakeup with one that also verifies the queue mutex is released before invocation.
+    let probe_wakeups = Arc::clone(&wakeups);
+    let shared = Arc::clone(&sender.0);
+    sender.0.lock().map_err(|_| Failure::Shutdown)?.repaint = Some(Arc::new(move || {
+        assert!(
+            shared.try_lock().is_ok(),
+            "Repaint wakeup must run outside the queue lock"
+        );
+        probe_wakeups.fetch_add(1, Ordering::Relaxed);
+    }));
+
+    sender
+        .send(Event::Stage("Thinking…"))
+        .map_err(|()| Failure::Shutdown)?;
+    assert_eq!(wakeups.load(Ordering::Relaxed), 1);
+
+    sender
+        .send(Event::Text("a".into()))
+        .map_err(|()| Failure::Shutdown)?;
+    assert_eq!(wakeups.load(Ordering::Relaxed), 2);
+
+    // Coalesced text delta must still trigger immediate repaint wakeup.
+    sender
+        .send(Event::Text("b".into()))
+        .map_err(|()| Failure::Shutdown)?;
+    assert_eq!(wakeups.load(Ordering::Relaxed), 3);
+
+    // Saturate the stream queue; rejected backpressure send must not spuriously wake.
+    assert!(matches!(receiver.try_recv(), Ok(Event::Stage("Thinking…"))));
+    assert!(matches!(receiver.try_recv(), Ok(Event::Text(text)) if text == "ab"));
+    fill(&sender)?;
+    let count_when_full = wakeups.load(Ordering::Relaxed);
+    assert_eq!(sender.send(Event::Text("overflow".into())), Err(()));
+    assert_eq!(wakeups.load(Ordering::Relaxed), count_when_full);
+
+    drop(sender);
+    assert_eq!(wakeups.load(Ordering::Relaxed), count_when_full + 1);
+    drop(receiver);
+    Ok(())
+}

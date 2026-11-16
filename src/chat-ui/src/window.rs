@@ -129,6 +129,7 @@ fn runtime_description(config: &Config) -> String {
 struct State {
     commands: Sender<Command>,
     events: client::EventReceiver,
+    repaint_ctx: Option<egui::Context>,
     worker: Option<JoinHandle<()>>,
     markdown_image: Option<std::path::PathBuf>,
     pending_config: Option<Config>,
@@ -288,6 +289,7 @@ impl State {
         Self {
             commands,
             events,
+            repaint_ctx: None,
             worker: None,
             markdown_image: None,
             pending_config: None,
@@ -576,7 +578,15 @@ impl State {
         start: impl FnOnce(Config, Receiver<Command>, client::EventSender) -> io::Result<JoinHandle<()>>,
     ) -> io::Result<()> {
         let (commands, incoming) = mpsc::channel();
-        let (events, incoming_events) = client::event_channel();
+        let (events, incoming_events) = match &self.repaint_ctx {
+            Some(ctx) => {
+                let repaint_ctx = ctx.clone();
+                client::event_channel_with_repaint(std::sync::Arc::new(move || {
+                    repaint_ctx.request_repaint();
+                }))
+            }
+            None => client::event_channel(),
+        };
         self.abliteration_enabled = config.use_abliterate_lora;
         self.runtime_description = runtime_description(&config);
         self.markdown_image = Some(config.broker.clone());
@@ -2702,6 +2712,9 @@ fn horizontal_inset<R>(
 
 impl eframe::App for State {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self.repaint_ctx.is_none() {
+            self.repaint_ctx = Some(ctx.clone());
+        }
         self.poll_placement(frame, ctx.input(|input| input.viewport().close_requested()));
         let was_ready = self.model.ready();
         let was_busy = self.model.busy();
@@ -2801,6 +2814,7 @@ pub(super) fn run(config: Config) -> io::Result<()> {
             let (_events, incoming_events) = client::event_channel();
             let microphone = microphone::Microphone::new().ok();
             let mut state = State::create(commands, incoming_events, None, microphone);
+            state.repaint_ctx = Some(cc.egui_ctx.clone());
             state.model = ModelLifecycle::Preparing;
             state.preview = false;
             state.runtime_description = runtime_description(&config);
@@ -2854,6 +2868,7 @@ pub(super) fn run_startup(request: crate::startup::Request) -> io::Result<bool> 
             let (commands, _incoming) = mpsc::channel();
             let (_events, incoming_events) = client::event_channel();
             let mut state = State::pending_startup(commands, incoming_events, request);
+            state.repaint_ctx = Some(cc.egui_ctx.clone());
             state.startup_failure = Some(reported_failure);
             state.update_exit = Some(approved_update);
             state.attach_recovery(recovery);

@@ -34,7 +34,10 @@ mod memory_tests;
 mod owner_control;
 mod sse;
 
-pub(crate) use event_queue::{EventReceiver, EventSender, channel as event_channel};
+pub(crate) use event_queue::{
+    EventReceiver, EventSender, channel as event_channel,
+    channel_with_repaint as event_channel_with_repaint,
+};
 use sse::Sse;
 
 const POLL: Duration = Duration::from_millis(100);
