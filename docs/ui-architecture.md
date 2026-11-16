@@ -466,11 +466,14 @@ transaction scratch capped at `4 * INPUT_LIMIT + 4_096` bytes, `max_undos: 0` on
 `egui::TextEditState`, `TextFingerprint` invalidation, and single-group IME
 preedit-to-commit batching) in place of full-draft snapshots while preserving
 whole-edit overflow rejection, cursor and undo restoration, and atomic source
-insertion. Candidate improvements remaining unimplemented: `cosmic-text` supplies
+insertion. Text-engine update note: `cosmic-text` supplies
 multilingual and bidirectional editing cases rather than a selected replacement
-text engine; and a draft comparison using `similar` would calculate Unicode-aware diffs
-in bounded, cancellable background work; presentation and explicit user acceptance
-must retain source text and branch ownership, without silently merging drafts.
+text engine. In `bonsai-chat` source (`window/branch_diff.rs`, `window/iteration.rs`,
+and `window.rs`), bounded Myers comparison using `similar` (`diff_unicode_spans`,
+off-thread cancellable `BranchDiffJob`, immutable `BranchDiffSource`, and
+explicit `accept_comparison_replacement`) is implemented while retaining source
+text and branch ownership without silently merging drafts; desktop interactive
+UI qualification remains open.
 
 Spindle's scene packets and SillyTavern's context cards motivate an optional native
 writing-context design: user-approved character/world facts, scene relevance,

@@ -482,12 +482,11 @@ timestamps, making `1×` cold NVMe read throughput and `1×` warm multicore
 and `bonsai-artifacts`) uses read-only Windows file mapping (`MIN_MAPPED_HASH_BYTES = 4 MiB`)
 with `16 MiB` `PrefetchVirtualMemory` windows and cancellable `4 MiB` chunked CNG
 SHA-256 verification (retaining buffered fallback for smaller/unmappable inputs).
-In pinned Prism 0.1.31 (pending X1/X2 device qualification), `bonsai-gguf` and
-`bonsai-native-hash` likewise map `>= 4 MiB` GGUF files zero-copy
+In `prism-inference` `main` (pending release repin and X1/X2 device qualification),
+`bonsai-gguf` and `bonsai-native-hash` likewise map `>= 4 MiB` GGUF files zero-copy
 (`MappedSlice`) with `16 MiB` `PrefetchVirtualMemory`, `4 MiB` chunked CNG
-SHA-256, and up to 8-worker parallel tensor payload validation.
-Cross-process handle inheritance and `#18` host/NPU deduplication remain deferred
-(see below). Hashing, census and export use bounded buffers.
+SHA-256, and up to 8-worker parallel tensor payload validation. Hashing, census and export
+use bounded buffers.
 
 The publisher [loader](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/src/llama-model-loader.cpp)
 can map eligible CPU tensors directly; other buffer types may copy them. Its
@@ -496,28 +495,42 @@ prefetches the complete file and cannot unmap fragments. Prefetch populates the
 physical cache, not the process working set. Disabling it would not remove tensor
 storage; no current CLI switch exposes that choice.
 
-Startup and mapping candidates remain explicitly deferred in [PLAN.md](../PLAN.md#memory-loading-and-approximate-cache)
-until measured cold/warm load or memory-commit gates select them:
+Startup, handle-inheritance and `#18` candidates have partial source controls
+across both repositories, while end-to-end launcher/service wiring, release
+repin, hosted CI and measured cold/warm load or memory-commit gates remain
+pending in [PLAN.md](../PLAN.md#memory-loading-and-approximate-cache):
 
 - **Single-pass verified-handle / section inheritance and parallel chunked `SHA256`:**
-  Attesting and inheriting Runner's verified deny-write/deny-delete, no-reparse
-  read-only file or `PAGE_READONLY` section handle into the offline `--broker-pipe`
-  worker eliminates the duplicate child whole-file hash pass (`2× -> 1×` bytes read)
-  while still hashing every byte on launch. Pairing that single pass with a
-  lockfile-pinned fixed-chunk `SHA256` manifest (verified across 4–8 Oryon crypto
-  cores in parallel, alongside bounded multi-artifact overlap across Swift, adapter,
-  `mmproj` and speech) removes single-stream Merkle-Damgård serialization in warm RAM.
+  Runner and Prism implement core primitives pending end-to-end launcher
+  wiring, repin and CI/device qualification: `bonsai-windows-process`
+  `OwnedProcess::start_sandboxed_broker_pipe_with_sections` (`MAX_INHERITED_SECTIONS = 8`,
+  `InheritableReadOnlySection`), `bonsai-broker` `PipeBackend::connect_stdio_with_sections`
+  (`KIND_VERIFIED_SECTION = 6`, 52-byte little-endian `VerifiedSectionAttestation`),
+  Prism's `ServerEndpoint::verified_sections` descriptor intake,
+  `bonsai-windows-credentials` `compute_mapped_chunk_digests[_with]` /
+  `try_verify_locked_file_chunk_digests_mapped[_with]` (`16 MiB` default chunks,
+  up to `8` workers), and `bonsai-artifacts` `VerifiedFile::verify_chunked[_with]` /
+  `verify_files_bounded_parallel`. Full-byte launch hashing remains mandatory,
+  and lockfile-pinned fixed-chunk `SHA256` manifests still require manifest
+  signing and Oryon crypto-core qualification.
 - **#16 (aligned staging reuse)** and **#17 (optional Windows unbuffered direct I/O):**
   Bounded largest-first upload staging and sector-aligned `FILE_FLAG_NO_BUFFERING`
-  with CNG digest continuity and buffered fallback when cold NVMe double-buffering
-  is a demonstrated bottleneck.
-- **#18 (owned tensor-range mapping, read-only Swift views and host/NPU deduplication):**
-  Mapping verified immutable Swift CPU tensor spans via read-only `MapViewOfFile`
-  (moving ~5.5–6.7 GiB out of private Windows Job commit into evictable file-backed
-  pages while retaining the physical-RAM watchdog) and unmapping/omitting the
-  `2,888,663,040` bytes (`2.69 GiB`) of CPU-side `blk.0..=26` spans once sealed into
-  resident [Hexagon FastRPC arenas](hexagon.md#resident-packets-and-prefill),
-  without weakening handle/reparse guards or losing explicit NPU-fault recovery.
+  with CNG digest continuity and buffered fallback remain deferred unless cold
+  NVMe double-buffering becomes a demonstrated bottleneck.
+- **#18 (owned tensor-range mapping, Job-commit credit and host/NPU deduplication):**
+  `bonsai-hexagon-runtime` implements `"SB2HQ2C1"` `NativeQ2ArenaCache`
+  (`bonsai_native_hash`-verified) and Prism implements
+  `Qwen35::release_executor_resident_host_weights` (`TensorBytes::release_mapped`)
+  to drop resident CPU host tensor views once sealed into an external executor;
+  `bonsai-cpu-policy` adds `SwiftWeightPacking`, `evictable_mapped_weight_bytes`,
+  `HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES` (`2,888,663,040`),
+  `private_job_commit_with_mapped_credit`, opt-in `SwiftExecutionShape`
+  builders and `SwiftContextPlan::for_append_only_cow_shape`, and `bonsai-chat`
+  adds `window/context_capacity.rs` footprint diagnostics. Promoting default
+  planner admission (moving evictable mapped weights out of private Job commit
+  or omitting CPU `blk.0..=26` spans in live builds) remains gated behind
+  release repin, M1–M3 Job-commit verification, physical-RAM watchdog checks
+  and explicit NPU-fault recovery qualification.
 
 ### Graph and output buffers
 

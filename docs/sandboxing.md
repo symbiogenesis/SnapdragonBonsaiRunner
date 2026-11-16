@@ -175,7 +175,13 @@ The owned-worker policy grants:
   requires completed capture threads within its existing absolute allowance.
   Offline binary-pipe decoder/parser workers keep protocol stdout and a `NUL`
   stderr sink.
-- For broker-pipe inference workers (`OwnedProcess::start_sandboxed_broker_pipe`),
+- For broker-pipe inference workers (`OwnedProcess::start_sandboxed_broker_pipe`,
+  and opt-in `start_sandboxed_broker_pipe_with_sections` with
+  `MAX_INHERITED_SECTIONS = 8` `InheritableReadOnlySection` handles granting
+  `SECTION_MAP_READ | SECTION_QUERY` via `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` and
+  `PipeBackend::connect_stdio_with_sections` / `KIND_VERIFIED_SECTION = 6`
+  52-byte little-endian `VerifiedSectionAttestation` frames paired with Prism's
+  `ServerEndpoint::verified_sections`),
   `SandboxNetwork::Offline` denies both host loopback and external egress,
   replacing the loopback socket and on-disk `backend.key` with anonymous
   `(stdin, stdout)` protocol pipes, a `0`-byte `backend.stdout` sentinel, and
@@ -278,7 +284,11 @@ runtime and artifact identities. Distinguish portable parser/policy checks from
 actual native enforcement and actual-model acceptance. Model-free native fixtures
 cover file and hard-link denial, retained artifact/key guards, separate private
 temp storage, child-process denial, exact listener identity, external TCP denial
-and worker teardown after abrupt owner death. The separate isolated
+and worker teardown after abrupt owner death. Verified section-handle inheritance
+(`OwnedProcess::start_sandboxed_broker_pipe_with_sections` /
+`PipeBackend::connect_stdio_with_sections` and Prism's `ServerEndpoint::verified_sections`)
+adds source primitives pending launcher wiring, post-`0.1.31` release repin and
+containment qualification. The separate isolated
 `inference-authority-v1` `sandbox-qualification` workload targets three
 model-free broker-pipe PSEC controls (`180` estimated seconds: offline authority
 and egress denial, `64 MiB`/`1_024`-entry private storage ceiling across

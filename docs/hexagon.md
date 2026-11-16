@@ -55,21 +55,25 @@ end-to-end serving qualification.
 ## Resident packets and prefill
 
 The native-Q2 executor submits the existing gate/up, SwiGLU, optional supported
-Hadamard, down and optional residual chain in one correlated packet. Operation/tensor
-pairs are 4/12, 5/14, 5/15 and 6/17. Borrowed and owned sessions retain checked handles,
-dimensions, cache flushes and exact response correlation. Prism 0.1.31
-uses per-layer active-target gating (`adapter_affects_any`, pending X1/X2
-device qualification) so `external_ffn_chain` stays enabled whenever
-`[ffn_gate, ffn_up, ffn_down]` have no active LoRA (`scale == 0.0` or untargeted
-layer) and `external_ffn_swiglu` (`ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU`) runs
-across all 64 Swift layers under active `RankOneAdapter` (which targets only
-residual writers and `token_embd`, preserving original-basis `up` for CPU
-`ffn_down` plus its LoRA delta). Arbitrary signs and grouped rotations are
-unsupported, and the optional down Hadamard requires every authored sign to be
-positive one. Retaining full `ffn_down`-inclusive VTCM chain fusion under
-nonzero `ffn_down` LoRA still requires evaluating rank-one/low-rank adapter
-side-branches alongside the correlated NPU packet (on sibling CPU row workers or explicit
-side-branch tensors) without splitting intermediate FFN activations back to host DRAM.
+Hadamard, down and optional residual chain in one correlated packet.
+Operation/tensor pairs are 4/12, 5/14, 5/15 and 6/17. Borrowed and owned
+sessions retain checked handles, dimensions, cache flushes and exact response
+correlation. Prism `0.1.31` added per-layer active-target gating
+(`adapter_affects_any`, pending X1/X2 device qualification) so
+`external_ffn_chain` stays enabled whenever `[ffn_gate, ffn_up, ffn_down]` have
+no active LoRA (`scale == 0.0` or untargeted layer) and `external_ffn_swiglu`
+(`ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU`) runs across all 64 Swift layers under
+active `RankOneAdapter` (which targets only residual writers and `token_embd`).
+Subsequent `prism-inference` `main` commits (pending release repin and X1/X2
+qualification) also implement full `ffn_down`-inclusive FFN-chain LoRA
+side-branch fusion (`supports_ffn_chain_lora` / `submit_resident_ffn_chain_lora`
+and `supports_f32_ffn_chain_lora` / `project_f32_ffn_chain_lora`, evaluating
+`RankOneAdapter::dense_rank_one_factor` into a single finite scalar `lora_dot`
+without spilling intermediate `17,408` FFN activations back to host DRAM).
+Arbitrary signs and grouped rotations are unsupported, and the optional down
+Hadamard requires every authored sign to be positive one. Keeping that full VTCM
+chain active under active LoRA still requires signed hardware parity, full-model
+logit checks and X1/X2 device qualification.
 
 Two complete independent token chains can share one packet, with odd tails using
 the single-token path. Queue writes become `ceil(tokens / 2)`; every logical operation,
@@ -95,11 +99,14 @@ Unused secondary arenas remain dirty and unimported; already prepared views can
 still be submitted together after import. Primary-arena append preparation keeps
 its separate populated-prefix flush. Native fake-session controls exercise those
 boundaries; signed-driver coherency and complete serving acceptance
-remain independent. Persisting digest-verified `native-q2` repacked arena images
-on disk (avoiding `2.89 GB` of CPU repacking on cold worker startup) and
-releasing/unmapping duplicate host CPU `blk.0..=26` weight spans (`#18`,
-`~2.69 GiB`) once FastRPC arenas are sealed remain gated behind explicit digest,
-fallback and lifetime contracts in [PLAN.md](../PLAN.md#hexagon-npu).
+remain independent. In `prism-inference` `main` (pending release repin, live
+service wiring and device qualification), `bonsai-hexagon-runtime` implements
+`"SB2HQ2C1"` `NativeQ2ArenaCache` (`bonsai_native_hash`-verified persistent repacked
+arena images) and `Qwen35::release_executor_resident_host_weights`
+(`TensorBytes::release_mapped` when `tiled_prefill` is absent and an external
+executor is attached); full digest/fallback lifetime qualification and host
+`blk.0..=26` deduplication (`#18`, `~2.69 GiB`) in live serving remain open in
+[PLAN.md](../PLAN.md#hexagon-npu).
 
 Source work counts establish no measured latency, memory or energy saving. Complete
 model state/logit/adapter and cancellation acceptance, ARM64 code generation, signed

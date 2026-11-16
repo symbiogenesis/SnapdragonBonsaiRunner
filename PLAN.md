@@ -346,10 +346,14 @@ adoption decisions without displacing native daily-use acceptance.
   [native candidate contract](docs/ui-architecture.md#candidate-native-improvements).
   Bound retained edit bytes and preserve atomic oversized-edit rejection,
   IME composition, selection/cursor restoration and complete undo/redo recovery.
-- [ ] Add bounded native comparison of alternate replies/drafts using the
-  [similar reference](docs/research-register.md#native-application-and-writing-references).
-  Keep Unicode-aware diff work cancellable and off the event loop; preserve
-  immutable branch identities and require explicit acceptance of any replacement.
+- [ ] Qualify bounded native comparison of alternate replies/drafts using the
+  [similar reference](docs/research-register.md#native-application-and-writing-references)
+  (`bonsai-chat` `window/branch_diff.rs` now implements `diff_unicode_spans`,
+  cancellable off-thread `BranchDiffJob`, immutable `BranchDiffSource`, and
+  explicit `accept_comparison_replacement` in source; pending hosted CI and
+  interactive desktop review). Keep Unicode-aware diff work cancellable and
+  off the event loop; preserve immutable branch identities and require explicit
+  acceptance of any replacement.
 
 ### Isolation, transport and recovery
 
@@ -458,10 +462,14 @@ adoption decisions without displacing native daily-use acceptance.
   [engine contract](docs/native-rust-engine.md) and
   [Hexagon execution contract](docs/hexagon.md).
 - [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32`, spin-then-park
-  `NativeRowPool`, and `6:1` grouped GQA packed-KV decode/tile attention (all
-  pinned in Prism `0.1.31`), expose and qualify distinct `gdn-wy-f32-v1`
-  arithmetic, decouple CPU tiled prefill from resident Hexagon decode
-  (`mixed-phase handoff`) once qualified, and verify selected-cache service
+  `NativeRowPool`, `6:1` grouped GQA packed-KV decode/tile attention, consumer
+  `[token][head]` attention probabilities and KV-group-aligned balanced tail
+  tasks, chunkwise `--cpu-prefill-gdn wy-f32` (`:gdn-wy-f32-v1`), and
+  mixed-phase handoff (`install_default_hexagon_executor` keeping resident
+  Hexagon decode active alongside `--cpu-prefill-tokens` when
+  `cpu_speculation` is absent and `supports_tile_tokens() == false`), all
+  implemented in `prism-inference` `main` (pending post-`0.1.31` release
+  repin, hosted CI and X1/X2 device qualification). Verify selected-cache
   service consumers and independent packed-KV head workers: scratch/admission,
   complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
@@ -472,11 +480,14 @@ adoption decisions without displacing native daily-use acceptance.
   Include the [vLLM checkpoint review cases](docs/inference-algorithms.md#hybrid-cache-reuse-and-speculative-state):
   allocated-but-unwritten checkpoints, complete recurrent/convolution history,
   and shared attention prefixes without a usable matching recurrent checkpoint.
-- [ ] After `latest-prefix reuse` acceptance, evaluate bounded sparse multi-branch
-  prefix checkpoints (`<= 8` saved prefixes binding sealed 64-token KV pages,
-  complete recurrent state, pre-convolution window and adapter scale, charged via
-  `SwiftExecutionShape::reuse_recurrent_copies`) so edited, regenerated and
-  switched conversation branches retain multi-turn TTFT reuse without unbounded RAM.
+- [ ] After `latest-prefix reuse` acceptance, qualify bounded sparse multi-branch
+  prefix checkpoints (`BranchCheckpoints` `1..=8` via
+  `--prompt-reuse prompt-end-and-latest`, `--prompt-reuse-checkpoints` and
+  `--prompt-reuse-checkpoint-bytes` in `prism-inference` `main`, paired with
+  `MAX_REUSABLE_BRANCH_CHECKPOINTS = 8` / `SwiftExecutionShape::reuse_recurrent_copies`
+  in `bonsai-cpu-policy`; pending repin and Runner CLI/device qualification) so
+  edited, regenerated and switched conversation branches retain multi-turn TTFT
+  reuse without unbounded RAM.
 - [ ] Qualify the batched target verifier and integrated Swift sampled suffix
   consumer: per-position logits, actual sampler/RNG progression, checkpoint
   admission, accepted-prefix restoration, EOS/Stop/failure and complete-cycle benefit.
@@ -607,8 +618,12 @@ adoption decisions without displacing native daily-use acceptance.
   Include clause-aware hard cuts, preserved live paragraph separators and 5 ms
   segment-edge fades, with first/last and exact-packet endings, under real-device
   listening and synthesis-gap acceptance.
-- [ ] Add Rust ebur128 loudness/true-peak observations and reproducible
-  loudness-matched listening copies to selected speech review packets under
+- [ ] Qualify Rust ITU-R BS.1770-4 / EBU R128 loudness/true-peak observations
+  and reproducible loudness-matched listening copies (`bonsai-audio`
+  `src/audio/src/loudness.rs` now implements `LoudnessObservation`,
+  `measure_loudness_f32`, `measure_loudness_mono_pcm16_wav` and
+  `build_loudness_matched_listening_wav` in source; speech packet captures and
+  human listening reviews remain open) under
   [speech measurement](docs/performance-expectations.md#q4-speech-resource-comparison).
   Preserve original PCM and sample identities as numerical evidence; loudness
   matching alone establishes neither voice quality nor intelligibility.
@@ -876,23 +891,32 @@ nor editing the available Abliteration factors.
 - [ ] Qualify `#14`'s itemized worst-case execution-shape ledger (`SwiftExecutionShape`,
   `SwiftMemoryBreakdown`, `SwiftKvCacheFormat::Rotated4FittedValues` at `16,896` B/tok
   and monotonic `SwiftContextPlan::for_execution_shape`) in compiled CI and M1–M3 model
-  checks. Once M1–M3 Job-commit measurements land, evaluate calibrating
-  `weights_and_fixed_runtime_bytes` per packing (`PQ2_0` vs `PTQ1_0` against the
-  `11 GiB` `FIXED_RUNTIME_BYTES` baseline) and separating append-only copy-on-write
-  sealed-page KV admission (`live_kv_copies = 1` + bounded mutable tail, saving up
-  to `~4.1 GiB` physical KV at 262,144 `K4/V4` tokens; `physical_cow_kv_bytes` and
-  `physical_cow_footprint_bytes` telemetry helpers are implemented in `cpu-policy`
-  and `bonsai-chat`) from arbitrary non-extending divergent `2×` rollback admission
-  under verified eviction/rollback contracts.
-  Runner (`bonsai-windows-credentials`/`bonsai-artifacts`) now uses mapped
-  `PrefetchVirtualMemory` + cancellable `4 MiB` chunked CNG SHA-256 verification
-  (`>= 4 MiB`), and pinned Prism `0.1.31` implements zero-copy `MappedSlice`
-  GGUF mapping + 8-worker parallel tensor payload validation (pending hosted
-  Foundation and X1/X2 device qualification). Deferred
-  screening leads `#16` (aligned staging reuse), `#17` (optional Windows
-  unbuffered direct I/O) and `#18` (owned tensor range mapping, read-only Swift
-  views and host/NPU deduplication) remain gated behind measured cold-start/I/O/mapping
-  bottlenecks and retained-handle/alignment/Job-commit contracts.
+  checks. `bonsai-cpu-policy` (`context.rs`) now implements opt-in
+  `SwiftWeightPacking` (`Pq2_0`, `Ptq1_0`), `evictable_mapped_weight_bytes`,
+  `HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES` (`2,888,663,040`),
+  `private_job_commit_with_mapped_credit`, opt-in `SwiftExecutionShape` builders
+  and `SwiftContextPlan::for_append_only_cow_shape`, alongside
+  `context_capacity.rs` footprint diagnostics in `bonsai-chat` (including
+  `physical_cow_kv_bytes` and `physical_cow_footprint_bytes`); once M1–M3
+  Job-commit measurements and rollback/eviction contracts pass, qualify
+  promoting calibrated per-packing `weights_and_fixed_runtime_bytes`, mapped
+  evictable credit and append-only CoW sealed-page KV admission (`live_kv_copies = 1`
+  + bounded mutable tail, saving up to `~4.1 GiB` physical KV at 262,144
+  `K4/V4` tokens) as default admission rules instead of arbitrary non-extending
+  `2×` rollback admission. Runner (`bonsai-windows-credentials`/`bonsai-artifacts`)
+  uses mapped `PrefetchVirtualMemory` + cancellable `4 MiB` chunked CNG SHA-256
+  verification (`>= 4 MiB`) and also adds parallel mapped-chunk digest helpers
+  (`compute_mapped_chunk_digests[_with]`, `VerifiedFile::verify_chunked[_with]`,
+  `verify_files_bounded_parallel`) alongside `OwnedProcess::start_sandboxed_broker_pipe_with_sections`
+  / `PipeBackend::connect_stdio_with_sections`; `prism-inference` `main` implements
+  zero-copy `MappedSlice` GGUF mapping, 8-worker parallel tensor payload validation,
+  `ServerEndpoint::verified_sections`, `"SB2HQ2C1"` `NativeQ2ArenaCache` and
+  `Qwen35::release_executor_resident_host_weights` (pending post-`0.1.31` release
+  repin, end-to-end launcher/service wiring, hosted Foundation and X1/X2 device
+  qualification). Deferred screening leads `#16` (aligned staging reuse), `#17`
+  (optional Windows unbuffered direct I/O) and end-to-end `#18` qualification
+  remain gated behind measured cold-start/I/O/mapping bottlenecks and
+  retained-handle/alignment/Job-commit contracts.
 
 ## Bounded calibration and optional precision
 
@@ -1225,16 +1249,19 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   tile-major reuse independently. Implement true N>1 prefill only with a supported
   signed solver, causal state, bounded VTCM/DMA and measured total-cost benefit.
 - [ ] Qualify Prism `0.1.31` per-layer active-target gating
-  (`adapter_affects_any`), which keeps `external_ffn_chain` active when
+  (`adapter_affects_any`, which keeps `external_ffn_chain` active when
   `[ffn_gate, ffn_up, ffn_down]` have no active LoRA and unlocks
-  `external_ffn_swiglu` across all 64 Swift layers under active `RankOneAdapter`
-  (preserving original-basis `up` for CPU `ffn_down` plus LoRA delta; pending
-  hosted Foundation and device qualification), and support rank-one/low-rank
-  LoRA side-branches alongside
-  Hexagon's full `ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU + ffn_down` VTCM chain (on sibling CPU
-  workers or explicit side-branch tensors without splitting intermediate FFN
-  activations back to host DRAM) so daily-use standard LoRA (`scale 1.3`) retains
-  full fused NPU packet execution including `ffn_down` under [Hexagon policy](docs/hexagon.md#resident-packets-and-prefill).
+  `external_ffn_swiglu` across all 64 Swift layers under active `RankOneAdapter`)
+  and `prism-inference` `main` (`f55c8d4`, `7f8cd31`) full Hexagon `ffn_down`
+  LoRA side-branch fusion (`supports_ffn_chain_lora` /
+  `submit_resident_ffn_chain_lora` and `supports_f32_ffn_chain_lora` /
+  `project_f32_ffn_chain_lora`, evaluating `RankOneAdapter::dense_rank_one_factor`
+  into a single finite scalar `lora_dot` without spilling intermediate `17,408`
+  FFN activations back to host DRAM), pending post-`0.1.31` Foundation release
+  repin, signed Hexagon driver parity, full-model logit checks, and X1/X2
+  device qualification so daily-use standard LoRA (`scale 1.3`) retains full
+  fused NPU packet execution including `ffn_down` under
+  [Hexagon policy](docs/hexagon.md#resident-packets-and-prefill).
 - [ ] Integrate remaining RMSNorm/RoPE/attention/conv/GDN VTCM chains only where
   signed operation support, transformed bases, full-state ownership and measured
   benefit justify placement.
@@ -1309,24 +1336,29 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 ### Repin, CI and device qualification of landed screening controls
 
-- [x] Publish a reviewed Foundation release bundle from `prism-inference` `main`
-  (`0.1.31` at `577966d98cf8b36021df52da194b1a5540429a6b` delivering `633624f`
-  zero-copy `MappedSlice` GGUF + 8-worker payload validation, `3cba373`
-  spin-then-park `NativeRowPool`, `cc629e7` bit-exact `G in {2, 3, 6}` grouped
-  GQA packed-KV decode/tile attention, and `244578e` `adapter_affects_any`
-  external FFN/SwiGLU LoRA unlocking alongside `e9cb947`..`71f44bd` and the
-  five crates.io helper updates) and repin
+- [ ] Publish a reviewed post-`0.1.31` Foundation release bundle from
+  `prism-inference` `main` (`f55c8d43eeaa51209e7a26ccbdbbcf6cd0c7469e`,
+  incorporating `0.1.31` at `577966d98cf8b36021df52da194b1a5540429a6b` plus
+  `a491440` fixing `43900458316` `correctness-3`
+  `tests/runtime.rs::oversized_optional_checkpoint_preserves_an_older_prefix`,
+  `0b80bee` `#38` `GrammarConstrainedSampler`, `b407e92`/`b7bc692`
+  `--cpu-prefill-gdn wy-f32`, `1..=8` `BranchCheckpoints`, mixed-phase Hexagon
+  handoff and `KIND_VERIFIED_SECTION` 52-byte LE intake, `7f8cd31`/`a1a3c12`
+  Hexagon `ffn_down` LoRA side-branch fusion, `"SB2HQ2C1"` `NativeQ2ArenaCache`
+  and `Qwen35::release_executor_resident_host_weights`, `93e9416`/`60c9d20` `#29`
+  `[token][head]` consumer-layout packed probabilities and KV-group-aligned
+  balanced tail partitions, and `0550e05` integration fixes) and repin
   [config/prism-inference.lock.json](config/prism-inference.lock.json) under
   the [distribution guide](docs/releases.md) so installed and daily-use builds
   consume them alongside the `0.1.30`/`0.1.31` runtime checkpoints, GDN guards,
   memory ledger and worker cancellation (`#2`–`#7`, `#9`–`#13`, `#15`,
   `#19`–`#20`, `#22`, `#25`–`#26`, `#28`, `#30`–`#34`, `#36`, `#45`–`#51`).
-  Complete `prism-inference` `Foundation` suite acceptance remains open
-  (`43900458316` failed `correctness-3` on `tests/runtime.rs::oversized_optional_checkpoint_preserves_an_older_prefix`).
+  Complete `prism-inference` `Foundation` suite acceptance on
+  `f55c8d43eeaa51209e7a26ccbdbbcf6cd0c7469e` remains open.
 - [ ] Complete hosted `source-checks` and `foundation` compiler, strict Release
   analyzer and full regression-suite verdicts in both repositories under
   [promotion criteria](docs/validation.md#promotion-criteria); local merge checks
-  ran scoped Clippy and targeted `--exact` tests only.
+  ran scoped Clippy and targeted/component test suites only.
 - [ ] Qualify landed controls on actual weights and X1/X2 hardware within
   predeclared 5-to-15-minute AC/battery-logged allowances:
   - [ ] `#8`: Exercise live long-prefill HTTP Stop/disconnect,
@@ -1346,14 +1378,19 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 #### Memory, loading and approximate cache
 
 - [ ] **Single-pass verified-handle inheritance, parallel chunked `SHA256` and
-  cached Hexagon arenas.** Eliminate the duplicate `7.21 GB` child CNG SHA-256 pass
-  by attesting and inheriting Runner's verified deny-write/deny-delete, no-reparse
-  read-only file or `PAGE_READONLY` section handle into offline `--broker-pipe`
-  workers (still hashing every byte on launch without trusting cached digests or
-  timestamps), evaluate a lockfile-pinned fixed-chunk `SHA256` manifest verified
-  across 4–8 Oryon crypto cores in parallel alongside bounded multi-artifact
-  overlap, and evaluate digest-verified persistent Hexagon `native-q2` repacked
-  arena files for cold startup under [mapping and startup](docs/swift-memory.md#mapping-and-startup).
+  cached Hexagon arenas.** Runner and Prism implement core source primitives
+  (`bonsai-windows-process` `OwnedProcess::start_sandboxed_broker_pipe_with_sections` /
+  `InheritableReadOnlySection` with `MAX_INHERITED_SECTIONS = 8`, `bonsai-broker`
+  `PipeBackend::connect_stdio_with_sections` / `KIND_VERIFIED_SECTION = 6`,
+  Prism `ServerEndpoint::verified_sections` 52-byte LE intake,
+  `bonsai-windows-credentials` `compute_mapped_chunk_digests[_with]` /
+  `try_verify_locked_file_chunk_digests_mapped[_with]`, `bonsai-artifacts`
+  `VerifiedFile::verify_chunked[_with]` / `verify_files_bounded_parallel`, and
+  `bonsai-hexagon-runtime` `"SB2HQ2C1"` `NativeQ2ArenaCache`); end-to-end
+  lockfile/launcher/service wiring, post-`0.1.31` release repin, hosted CI,
+  full-byte launch hashing verification, and cold/warm Oryon device
+  qualification remain open under
+  [mapping and startup](docs/swift-memory.md#mapping-and-startup).
 - [ ] **#16 — Aligned loading and upload staging reuse.** Process largest tensors
   first, reuse bounded aligned staging and shrink excess capacity once accelerator
   upload or cold-load staging demonstrates a measured bottleneck under the
@@ -1364,13 +1401,16 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   the existing mapped path.
 - [ ] **#18 — Owned tensor-range mapping, Job-commit credit and host/NPU
   deduplication.** Whole-file read-only `MapViewOfFile` (`>= 4 MiB` `MappedSlice`
-  tensor views in `prism-inference` `main` `633624f`) is implemented in source
-  pending release repin; extend to selective tensor-range mapping, credit
-  evictable file-backed residency versus private Windows Job commit (`~5.5–6.7 GiB`)
-  in Runner's admission planner while retaining the physical-RAM watchdog, and
-  unmap/exclude the `2,888,663,040` bytes (`~2.69 GiB`) of CPU-side `blk.0..=26`
-  spans once sealed into resident Hexagon FastRPC arenas, preserving Windows
-  handle/reparse guards and explicit NPU-fault recovery.
+  tensor views and `Qwen35::release_executor_resident_host_weights` /
+  `TensorBytes::release_mapped` in `prism-inference` `main`) plus `bonsai-cpu-policy`
+  `SwiftWeightPacking`, `evictable_mapped_weight_bytes`,
+  `HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES` (`2,888,663,040`),
+  `private_job_commit_with_mapped_credit`, opt-in `SwiftExecutionShape` /
+  `SwiftContextPlan::for_append_only_cow_shape`, and `bonsai-chat`
+  `window/context_capacity.rs` footprint diagnostics are implemented in source;
+  selective tensor-range mapping, default admission promotion, post-`0.1.31`
+  repin, M1–M3 Job-commit verification, physical-RAM watchdog checks and
+  explicit NPU-fault recovery qualification remain open.
 - [ ] **#21 — Calibrated K-cache mean centering.** Evaluate subtracting a
   per-layer/head/channel key mean on rotated `K4` only after `K1` baseline
   attribution, with separate center-vector storage/identity accounting and held-out
@@ -1410,8 +1450,12 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   numerics. Implemented in source in Prism (`bonsai-neon-dot` / graph kernels;
   physical X1 hardware measurements and parity qualification remain open).
 - [ ] **#29 — Consumer-layout attention probabilities and tail balancing.** Emit FP16
-  attention probabilities directly in consumer layout and split oversized final
-  head/token tasks without changing the FP16 boundary or reduction order under
+  attention probabilities directly in consumer layout (`[token][head]`) and
+  split oversized final head/token tasks via KV-group-aligned balanced
+  `partition_heads` and `TileTask` partitioning without changing the FP16
+  boundary or reduction order (implemented in `prism-inference` `main`
+  `93e9416`/`60c9d20`, pending post-`0.1.31` repin, hosted CI and X1/X2
+  parity/throughput qualification) under
   [CPU kernels](docs/cpu-kernels.md#cross-generation-cpu-promotion).
 
 #### Speculative decoding extensions
@@ -1426,7 +1470,10 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   measured state-copy traffic justifies `KVBuffer`/`SpecLA`-style delayed recurrence.
 - [ ] **#38 — Transactional grammar speculation.** Bind grammar state advancement and
   rejection-sampling masks into the atomic KV/GDN/convolution/sampler rollback
-  transaction before allowing speculative decoding alongside grammar constraints.
+  transaction (`GrammarConstrainedSampler` and `GrammarState` `is_accepting`,
+  `accept_candidate`, and `filter_candidates` with atomic rollback integration
+  are implemented in `prism-inference` `main` `0b80bee`, pending post-`0.1.31`
+  repin, hosted CI and model parity qualification).
 
 #### Adreno Vulkan, Hexagon NPU and power policy
 

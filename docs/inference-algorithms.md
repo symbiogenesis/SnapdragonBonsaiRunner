@@ -288,7 +288,17 @@ alone cannot establish benefit without full drafting/verify/recovery cost.
 Existing algorithm source controls (`#19`–`#20`, `#22`, `#30`–`#34`, `#36` in the
 [screening ledger](research-register.md#august-to-november-2026-screening-ledger)) retain
 their compiled CI, actual-model, full-state restoration and X1/X2 device benefit gates.
-Three related screening leads remain explicitly deferred:
+Subsequent `prism-inference` `main` commits (pending release repin, hosted CI and
+actual-model qualification) also implement opt-in chunkwise FP16 tiled prefill GDN
+(`CpuPrefill::with_chunkwise_gdn` / `--cpu-prefill-gdn wy-f32`, `:gdn-wy-f32-v1`),
+mixed-phase CPU tiled prefill with resident Hexagon decode handoff
+(`install_default_hexagon_executor` when `cpu_speculation` is absent and
+`supports_tile_tokens() == false`), bounded sparse multi-branch prefix caching
+(`BranchCheckpoints` `1..=8` via `--prompt-reuse prompt-end-and-latest`,
+`--prompt-reuse-checkpoints` and `--prompt-reuse-checkpoint-bytes`, paired with
+`MAX_REUSABLE_BRANCH_CHECKPOINTS = 8` in `bonsai-cpu-policy`), and `#38` below.
+Two speculative/recurrent screening leads remain unimplemented in source, while `#38`
+has source controls pending repin and model parity qualification:
 
 - **#35 (shared drafter embeddings/head)**: extends the DFlash2 / trained-drafter gate
   above by requiring exact tokenizer, transformed basis, scale/adapter and weight identity
@@ -296,9 +306,11 @@ Three related screening leads remain explicitly deferred:
 - **#37 (checkpointable delayed recurrent updates / `ReplaySSM`)**: extends the
   `KVBuffer` / `TreeWY` / `SpecLA` boundary above with mandatory factor/window buffer charges,
   bounded-error forward reconstruction, cancellation cleanup and matched batch-one benefit.
-- **#38 (transactional grammar speculation)**: requires constrained-decoding masks or
-  speculative token branches to participate in the atomic KV, GDN, convolution and sampler
-  transaction so rejected or cancelled steps roll back both graph state and grammar cursor.
+- **#38 (transactional grammar speculation)**: `GrammarConstrainedSampler` and
+  `GrammarState` (`is_accepting`, `accept_candidate`, `filter_candidates`) with
+  atomic KV/GDN/convolution/grammar/sampler rollback are implemented in `prism-inference`
+  source (pending repin, hosted CI and model parity qualification) so rejected or
+  cancelled steps roll back both graph state and grammar cursor.
 
 ### Certified sparse attention is a separate approximation
 

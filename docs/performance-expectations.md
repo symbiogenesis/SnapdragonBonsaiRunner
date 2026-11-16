@@ -62,7 +62,7 @@ work; they are not qualified baselines or performance promises.
 | **Model preparation** | Runner `main` uses mapped `PrefetchVirtualMemory` (`16 MiB`) + cancellable `4 MiB` CNG SHA-256; `0.1.31` delivers `MappedReadOnlyFile`/`MappedSlice` zero-copy GGUF + 8-worker validation (still `2 × 7.21 GB` total across Runner + Prism + per-launch NPU repack) | Single-pass verified-handle/section inheritance across `--broker-pipe` (`2× -> 1×`), lockfile-pinned parallel chunk `SHA256`, `PTQ1_0` (`-17.5%` bytes), digest-bound cached Hexagon arenas, `#16`/`#17` staging/direct I/O | Sub-second warm mapping could go lower only by weakening per-launch byte hashing (disallowed by security policy) |
 | **Base RAM & admission** | `11.0 GiB` fixed admission (`+4 GiB` reserve), zero-copy `MappedSlice` GGUF in `0.1.31`, `+2.69 GiB` duplicate host/NPU `blk.0..=26` weights | `PTQ1_0` (`-1.173 GiB`), `#14` packing-aware `FIXED_RUNTIME_BYTES` calibration (`M1`–`M3`), `#18` selective tensor-range mapping / Job-commit credit (`~5.5–6.7 GiB` moved from private commit) + releasing CPU `blk.0..=26` spans after NPU arena seal | `W8.2` selective unloading of omitted Hadamard FFN groups (`~590–725 MiB` net after rank-16 recovery factors) |
 | **Context (`tokens / GiB`)** | Dev `K4/V4` (`34,016` B/tok, charging `2×` full KV copies; `~4.0×` denser than `FP16`); `physical_cow_footprint_bytes` telemetry implemented in Runner `main` | Qualifying `K1` for production, `K4/V3` (`29,920` B/tok), and append-only CoW sealed-page KV admission (`live_kv_copies: 2 -> 1 + mutable tail`, up to `~4.1 GiB` physical saving at 256K) | Heterogeneous layer precision (`U3`), calibrated K-mean centering (`#21`), MLA (16 GQA layers) or `TokenGate` (`W8.3`) |
-| **Speech (`TTS` / `ASR`)** | `Q8` CPU baseline (`S3` `SDOT`/`I8MM`, `F16` KV, `MappedFile`, spin-park pool, & dyadic `1->2->4->8` codec ramp in source) | Qualifying `S1`–`S3` Tier-2 CPU/streaming paths, warm `Voice` retention and Hexagon native `Q8` transport | `Q4` Talker weights and conditional ternary Talker profile |
+| **Speech (`TTS` / `ASR`)** | `Q8` CPU baseline (`S3` `SDOT`/`I8MM`, `F16` KV, `MappedFile`, spin-park pool, `1->2->4->8` codec ramp, & `bonsai-audio` BS.1770-4 loudness helper in source) | Qualifying `S1`–`S3` Tier-2 CPU/streaming paths, warm `Voice` retention and Hexagon native `Q8` transport | `Q4` Talker weights and conditional ternary Talker profile |
 
 ## Measurement and comparison
 
@@ -146,14 +146,16 @@ Average faster-than-real-time synthesis can still stall playback. Framing/owners
 checks cannot replace real-device audio or independent listening for timbre,
 continuity, timing and prosody. See [speech controls](../tools/qwen-tts/README.md).
 
-The Rust [ebur128 analyzer](https://github.com/sdroege/ebur128) is a candidate
-review helper for integrated/short-term loudness, loudness range and true peak.
+Runner's `bonsai-audio` crate (`src/audio/src/loudness.rs`) implements a
+dependency-free ITU-R BS.1770-4 / EBU R128 loudness and 4x Kaiser-sinc true-peak
+analyzer (`LoudnessObservation`, `measure_loudness_f32`,
+`measure_loudness_mono_pcm16_wav`, and `build_loudness_matched_listening_wav`)
+for integrated/momentary/short-term loudness, LRA, sample peak and true peak;
+actual speech packet capture and human listening reviews remain pending.
 If loudness matching is used for listening, apply the declared gain only to
 separately identified listening copies and record their relationship to the
 original samples. Original generated PCM remains the authority for numerical,
 streaming and continuity comparisons. Record unavailable measurements explicitly;
-this proposal sets no loudness threshold and changes no serving PCM. Matched
+this helper sets no loudness threshold and changes no serving PCM. Matched
 loudness controls a listening confound, but establishes neither numerical equality
-nor intelligibility, voice identity or audible quality. Follow the
-[source and adoption limits](research-register.md#speech-and-creative-review-references)
-before introducing the helper.
+nor intelligibility, voice identity or audible quality.
