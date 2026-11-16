@@ -2,8 +2,8 @@
 
 use std::{collections::BTreeSet, ffi::OsString, fs, path::Path};
 
+use bonsai_native_hash::hash_bytes;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 
 use super::native_source_inventory::{
     digest, lower_hex, plain_ancestors, plain_metadata, read_bounded,
@@ -236,7 +236,8 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     }
     plain_ancestors(path)?;
     let bytes = read_bounded(path, MAX_DOCUMENT)?;
-    if super::native_source_inventory::hex(&Sha256::digest(&bytes)) != expected {
+    let manifest_digest = hash_bytes(&bytes).map_err(|error| error.to_string())?;
+    if super::native_source_inventory::hex(&manifest_digest) != expected {
         return Err(
             "Native boundary manifest differs from its independently reviewed digest.".into(),
         );

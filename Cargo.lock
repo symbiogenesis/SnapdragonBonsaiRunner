@@ -491,6 +491,7 @@ dependencies = [
 name = "bonsai-artifacts"
 version = "0.3.3"
 dependencies = [
+ "bonsai-native-hash",
  "bonsai-windows-credentials",
  "bonsai-windows-process",
  "hex",
@@ -553,6 +554,7 @@ name = "bonsai-ci"
 version = "0.3.3"
 dependencies = [
  "bonsai-artifacts",
+ "bonsai-native-hash",
  "bonsai-windows-process",
  "hex",
  "serde",
@@ -603,6 +605,7 @@ version = "0.3.3"
 dependencies = [
  "bonsai-artifacts",
  "bonsai-cpu-policy",
+ "bonsai-native-hash",
  "bonsai-speech-service",
  "bonsai-windows-process",
  "fearless_simd 1.2.0",
@@ -637,6 +640,7 @@ dependencies = [
  "bonsai-artifacts",
  "bonsai-audio",
  "bonsai-cpu-policy",
+ "bonsai-native-hash",
  "bonsai-speech-service",
  "bonsai-windows-process",
  "fearless_simd 1.2.0",
@@ -662,6 +666,7 @@ dependencies = [
  "bonsai-artifacts",
  "bonsai-audio",
  "bonsai-cpu-policy",
+ "bonsai-native-hash",
  "bonsai-windows-credentials",
  "bonsai-windows-process",
  "flate2",

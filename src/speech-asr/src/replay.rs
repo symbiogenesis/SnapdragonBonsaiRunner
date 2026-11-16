@@ -8,7 +8,7 @@
 
 use std::io::{self, BufReader, Read};
 
-use sha2::{Digest as _, Sha256};
+use bonsai_native_hash::Hasher;
 
 use crate::rust_engine::{ARITHMETIC_IDENTITY, Observation, RustRecognizer};
 
@@ -218,16 +218,18 @@ impl<R: Read> Replay<R> {
         if pcm.len() > crate::SAMPLE_RATE * crate::MAX_CLIP_SECONDS {
             return Err(invalid());
         }
-        let mut digest = Sha256::new();
+        let mut digest = Hasher::new()?;
+        let mut bytes = [0_u8; 4096 * 4];
         for chunk in pcm.chunks(4096) {
             if cancel() {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            for sample in chunk {
-                digest.update(sample.to_le_bytes());
+            for (dst, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(chunk) {
+                *dst = sample.to_le_bytes();
             }
+            digest.update(&bytes[..chunk.len() * 4])?;
         }
-        if <[u8; 32]>::from(digest.finalize()) != self.pcm {
+        if digest.finish()? != self.pcm {
             return Err(invalid());
         }
         // The engine and comparator must share the same cancellation owner.

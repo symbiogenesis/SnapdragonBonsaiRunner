@@ -2,6 +2,7 @@
 
 use super::*;
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use std::fs;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;

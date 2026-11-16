@@ -35,6 +35,7 @@ required-features = ["rust-qualification"]
 [dependencies]
 bonsai-artifacts = { workspace = true, optional = true }
 bonsai-cpu-policy = { workspace = true, optional = true }
+bonsai-native-hash.workspace = true
 bonsai-speech-service = { workspace = true, optional = true }
 fearless_simd.workspace = true
 half.workspace = true
@@ -42,8 +43,10 @@ hex = { workspace = true, optional = true }
 rayon = "=1.12.0"
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
-sha2.workspace = true
 transcribe-cpp = { version = "=0.4.1", default-features = false, optional = true }
+
+[dev-dependencies]
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 bonsai-windows-process = { workspace = true, optional = true }

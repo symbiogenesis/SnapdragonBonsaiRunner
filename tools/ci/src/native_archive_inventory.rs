@@ -7,8 +7,8 @@ use std::{
     io::{Read as _, Seek},
 };
 
+use bonsai_native_hash::{Hasher, hash_bytes};
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use zip::{CompressionMethod, ZipArchive};
 
 use super::native_source_inventory::{hex, lower_hex, plain_ancestors, read_bounded};
@@ -102,7 +102,7 @@ fn inventory<R: std::io::Read + Seek>(reader: R, pin: &Pin) -> Result<serde_json
             .checked_add(entry.size())
             .filter(|bytes| *bytes <= MAX_TOTAL)
             .ok_or("Native source archive exceeds its aggregate expansion bound.")?;
-        let mut hash = Sha256::new();
+        let mut hash = Hasher::new().map_err(|error| error.to_string())?;
         let mut bytes = 0_u64;
         let mut buffer = [0_u8; 16 * 1024];
         loop {
@@ -114,14 +114,16 @@ fn inventory<R: std::io::Read + Seek>(reader: R, pin: &Pin) -> Result<serde_json
                 .checked_add(u64::try_from(count).map_err(|error| error.to_string())?)
                 .filter(|bytes| *bytes <= MAX_FILE && *bytes <= entry.size())
                 .ok_or("Native source archive expansion exceeded its declared length.")?;
-            hash.update(&buffer[..count]);
+            hash.update(&buffer[..count])
+                .map_err(|error| error.to_string())?;
         }
         if bytes != entry.size() {
             return Err("Native source archive expanded length differs.".into());
         }
+        let digest = hash.finish().map_err(|error| error.to_string())?;
         entries.insert(
             relative,
-            serde_json::json!({"bytes": bytes, "sha256": hex(&hash.finalize())}),
+            serde_json::json!({"bytes": bytes, "sha256": hex(&digest)}),
         );
     }
     if entries.is_empty() {
@@ -168,7 +170,8 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
         plain_ancestors(path)?;
     }
     let pin_bytes = read_bounded(pin_path, 4096)?;
-    if hex(&Sha256::digest(&pin_bytes)) != expected {
+    let pin_digest = hash_bytes(&pin_bytes).map_err(|error| error.to_string())?;
+    if hex(&pin_digest) != expected {
         return Err("Native source archive pin differs from its reviewed SHA-256.".into());
     }
     let pin: Pin = serde_json::from_slice(&pin_bytes).map_err(|error| error.to_string())?;
@@ -190,7 +193,7 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     }
     // Hash and parse the same open file, so replacing a pathname cannot substitute
     // an unverified archive between intake and ZIP parsing.
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new().map_err(|error| error.to_string())?;
     let mut count = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -202,9 +205,12 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
             .checked_add(u64::try_from(read).map_err(|error| error.to_string())?)
             .filter(|bytes| *bytes <= MAX_ARCHIVE)
             .ok_or("Native source archive exceeded its intake bound.")?;
-        hasher.update(&buffer[..read]);
+        hasher
+            .update(&buffer[..read])
+            .map_err(|error| error.to_string())?;
     }
-    if count != pin.archive_bytes || hex(&hasher.finalize()) != pin.archive_sha256 {
+    let digest = hasher.finish().map_err(|error| error.to_string())?;
+    if count != pin.archive_bytes || hex(&digest) != pin.archive_sha256 {
         return Err("Native source archive differs from its pinned bytes.".into());
     }
     file.rewind().map_err(|error| error.to_string())?;

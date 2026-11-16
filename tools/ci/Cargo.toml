@@ -16,12 +16,15 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+bonsai-native-hash.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sha2.workspace = true
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }
 zip.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
 
 [features]
 default = ["github-api"]

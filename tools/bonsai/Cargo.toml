@@ -59,6 +59,7 @@ hex.workspace = true
 httparse.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+bonsai-native-hash.workspace = true
 zip.workspace = true
 tar = { version = "=0.4.46", default-features = false }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }
@@ -70,7 +71,6 @@ bonsai-windows-credentials.workspace = true
 ureq = { workspace = true, features = ["native-tls-no-default"] }
 
 [target.'cfg(not(windows))'.dependencies]
-sha2.workspace = true
 ureq = { workspace = true, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]

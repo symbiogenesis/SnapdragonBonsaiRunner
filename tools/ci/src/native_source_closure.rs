@@ -8,8 +8,8 @@ use std::{
     time::Instant,
 };
 
+use bonsai_native_hash::hash_bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use super::native_source_inventory::{
     checkpoint, digest_until, hex, lower_hex, plain_ancestors, read_bounded, read_bounded_until,
@@ -452,8 +452,9 @@ fn verify_compilation_database(manifest: &Manifest, total: &mut Verification) ->
     }
     verify_identity(identity, total)?;
     let bytes = read_bounded_until(Path::new(&identity.path), MAX_DOCUMENT, total.deadline)?;
+    let actual_digest = hash_bytes(&bytes).map_err(|error| error.to_string())?;
     if u64::try_from(bytes.len()).map_err(|error| error.to_string())? != identity.bytes
-        || hex(&Sha256::digest(&bytes)) != identity.sha256
+        || hex(&actual_digest) != identity.sha256
     {
         return Err("Native compilation database changed before parsing.".into());
     }
@@ -523,8 +524,9 @@ fn verify_unit(
         total.deadline,
     )?)
     .map_err(|error| error.to_string())?;
+    let dep_digest = hash_bytes(text.as_bytes()).map_err(|error| error.to_string())?;
     if u64::try_from(text.len()).map_err(|error| error.to_string())? != unit.dependencies.bytes
-        || hex(&Sha256::digest(text.as_bytes())) != unit.dependencies.sha256
+        || hex(&dep_digest) != unit.dependencies.sha256
     {
         return Err("Native dependency report changed before parsing.".into());
     }
@@ -584,7 +586,8 @@ fn verify_manifest_bytes_until(
     deadline: Option<Instant>,
 ) -> Result<String> {
     checkpoint(deadline)?;
-    if hex(&Sha256::digest(bytes)) != expected {
+    let manifest_digest = hash_bytes(bytes).map_err(|error| error.to_string())?;
+    if hex(&manifest_digest) != expected {
         return Err("Native closure manifest differs from its reviewed SHA-256.".into());
     }
     let manifest: Manifest = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;

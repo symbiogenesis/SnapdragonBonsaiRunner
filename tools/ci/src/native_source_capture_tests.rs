@@ -1,6 +1,7 @@
 //! Synthetic execution injection; these controls execute no native compiler.
 
 use super::*;
+use sha2::{Digest as _, Sha256};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 

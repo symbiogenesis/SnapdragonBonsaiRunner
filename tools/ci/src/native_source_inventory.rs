@@ -9,8 +9,8 @@ use std::{
     time::Instant,
 };
 
+use bonsai_native_hash::{Hasher, hash_bytes};
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 
 use crate::Result;
 
@@ -90,7 +90,7 @@ pub(super) fn digest_until(
         return Err("Native inventory input is not a bounded regular file.".into());
     }
     let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let mut hash = Sha256::new();
+    let mut hash = Hasher::new().map_err(|error| error.to_string())?;
     let mut length = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -103,14 +103,16 @@ pub(super) fn digest_until(
             .checked_add(u64::try_from(count).map_err(|error| error.to_string())?)
             .filter(|length| *length <= limit)
             .ok_or("Native inventory input exceeded its byte bound.")?;
-        hash.update(&buffer[..count]);
+        hash.update(&buffer[..count])
+            .map_err(|error| error.to_string())?;
     }
     let after = plain_metadata(path)?;
     checkpoint(deadline)?;
     if length != before.len() || length != after.len() {
         return Err("Native inventory input length changed during hashing.".into());
     }
-    Ok((length, hex(&hash.finalize())))
+    let digest = hash.finish().map_err(|error| error.to_string())?;
+    Ok((length, hex(&digest)))
 }
 
 pub(super) fn hex(bytes: &[u8]) -> String {
@@ -305,7 +307,7 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     let manifest = root.join(MANIFEST);
     plain_ancestors(&manifest)?;
     let manifest_bytes = read_bounded(&manifest, MAX_MANIFEST_BYTES)?;
-    let manifest_hash = hex(&Sha256::digest(&manifest_bytes));
+    let manifest_hash = hex(&hash_bytes(&manifest_bytes).map_err(|error| error.to_string())?);
     let inventory: Inventory =
         serde_json::from_slice(&manifest_bytes).map_err(|error| error.to_string())?;
     checked_entries(&inventory)?;

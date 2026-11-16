@@ -27,12 +27,15 @@ required-features = ["rust-qualification"]
 bonsai-artifacts = { workspace = true, optional = true }
 bonsai-audio.workspace = true
 bonsai-cpu-policy = { workspace = true, optional = true }
+bonsai-native-hash.workspace = true
 bonsai-speech-service.workspace = true
 fearless_simd.workspace = true
 half.workspace = true
 libm = "=0.2.16"
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json.workspace = true
+
+[dev-dependencies]
 sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -5,9 +5,8 @@
 //! matching packet does not establish provider independence or model parity.
 #![forbid(unsafe_code)]
 
+use bonsai_native_hash::Hasher;
 use std::io::{self, BufReader, Read};
-
-use sha2::{Digest as _, Sha256};
 
 use crate::{
     Synthesizer,
@@ -529,16 +528,16 @@ impl<R: Read> Replay<R> {
 }
 
 fn request_digest(text: &str, voice: &str) -> io::Result<[u8; 32]> {
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new()?;
     for value in [text, voice] {
         digest.update(
-            u64::try_from(value.len())
+            &u64::try_from(value.len())
                 .map_err(|_| invalid())?
                 .to_le_bytes(),
-        );
-        digest.update(value.as_bytes());
+        )?;
+        digest.update(value.as_bytes())?;
     }
-    Ok(digest.finalize().into())
+    digest.finish()
 }
 
 #[cfg(test)]

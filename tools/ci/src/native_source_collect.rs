@@ -6,8 +6,8 @@ use super::{
     verify_manifest_bytes_until,
 };
 use crate::Result;
+use bonsai_native_hash::hash_bytes;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use std::{ffi::OsString, path::Path, time::Instant};
 
 #[cfg(test)]
@@ -191,7 +191,8 @@ fn assemble_until(request: Request, deadline: Option<Instant>) -> Result<String>
     // original inputs, rejects changed identities on its verification pass,
     // and checks the exact
     // compiler dependency set, complete database and recursive provenance.
-    verify_manifest_bytes_until(&bytes, &hex(&Sha256::digest(&bytes)), deadline)?;
+    let manifest_digest = hex(&hash_bytes(&bytes).map_err(|error| error.to_string())?);
+    verify_manifest_bytes_until(&bytes, &manifest_digest, deadline)?;
     let result = String::from_utf8(bytes).map_err(|error| error.to_string())?;
     checkpoint(deadline)?;
     Ok(result)
@@ -205,7 +206,8 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     cursor.finish()?;
     path_key(path)?;
     let bytes = read_bounded(Path::new(path), MAX_DOCUMENT)?;
-    if hex(&Sha256::digest(&bytes)) != expected {
+    let request_digest = hash_bytes(&bytes).map_err(|error| error.to_string())?;
+    if hex(&request_digest) != expected {
         return Err("Native source collection request differs from its reviewed SHA-256.".into());
     }
     let request: Request = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;

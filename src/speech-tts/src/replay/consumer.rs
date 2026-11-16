@@ -1,6 +1,7 @@
 //! Immutable intake and inherited owner deadline for an ordered TTS replay.
 
 use bonsai_artifacts::{VerifiedFile, open_locked_file};
+use bonsai_native_hash::{Hasher, hash_bytes};
 #[cfg(test)]
 use bonsai_speech_service::replay_harness::arguments;
 use bonsai_speech_service::replay_harness::{
@@ -14,7 +15,6 @@ use bonsai_speech_tts::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 use std::{io, path::PathBuf};
 
 trait IdentityExt {
@@ -169,16 +169,16 @@ fn input(bytes: Vec<u8>, maximum: usize) -> io::Result<String> {
 }
 
 fn request_digest(text: &str, voice: &str) -> io::Result<[u8; 32]> {
-    let mut hash = Sha256::new();
+    let mut hash = Hasher::new()?;
     for value in [text, voice] {
         hash.update(
-            u64::try_from(value.len())
+            &u64::try_from(value.len())
                 .map_err(|_| invalid())?
                 .to_le_bytes(),
-        );
-        hash.update(value.as_bytes());
+        )?;
+        hash.update(value.as_bytes())?;
     }
-    Ok(hash.finalize().into())
+    hash.finish()
 }
 
 fn model_artifacts(request: &Request) -> io::Result<([Artifact; 3], [u8; 32])> {
@@ -203,7 +203,7 @@ fn model_artifacts(request: &Request) -> io::Result<([Artifact; 3], [u8; 32])> {
             artifact("voice_talker", &request.models.base)?,
             artifact("codec", &request.models.codec)?,
         ],
-        Sha256::digest(bytes).into(),
+        hash_bytes(bytes)?,
     ))
 }
 
@@ -363,7 +363,7 @@ pub(super) fn run() -> io::Result<bool> {
         provider: "bonsai-tts-replay",
         power_scope: "Consumer entry/exit and each candidate case only; aggregate setup, reference-arm and retention observations remain required.",
         cleanup: "Rust-owned tensors and verified-file guards drop on result or unwind; external native owner must enforce process lifetime.",
-        sha256: &|bytes| Sha256::digest(bytes).into(),
+        sha256: &hash_bytes,
         power: &power,
         compare_power: &bonsai_cpu_policy::power::compare_endpoints,
     };

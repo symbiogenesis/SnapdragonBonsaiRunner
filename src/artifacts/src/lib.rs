@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-#[cfg(any(test, not(windows)))]
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -418,14 +418,9 @@ fn stream_and_hash_bounded(
     if buffer.is_empty() {
         return Err(ArtifactError::Configuration);
     }
-    // RustCrypto's ARM64 runtime feature detection is unavailable on Windows;
-    // CNG dispatches to the OS-supported implementation without requiring a
-    // global CPU target flag or skipping any artifact bytes.
-    #[cfg(windows)]
-    let mut hash =
-        bonsai_windows_credentials::Sha256::new().map_err(|_| ArtifactError::Configuration)?;
-    #[cfg(not(windows))]
-    let mut hash = Sha256::new();
+    // Uses Windows CNG on Windows and audited portable SHA-256 elsewhere
+    // via the shared native-hash owner without skipping any artifact bytes.
+    let mut hash = bonsai_native_hash::Hasher::new().map_err(|_| ArtifactError::Configuration)?;
     let mut total = 0_u64;
     loop {
         checkpoint()?;
@@ -444,10 +439,7 @@ fn stream_and_hash_bounded(
             return Err(read_error);
         }
         let chunk = &buffer[..count];
-        #[cfg(windows)]
         hash.update(chunk).map_err(|_| read_error)?;
-        #[cfg(not(windows))]
-        hash.update(chunk);
         if let Some(output) = writer.as_deref_mut() {
             output.write_all(chunk).map_err(|_| write_error)?;
         }
@@ -455,10 +447,7 @@ fn stream_and_hash_bounded(
     if total != expected {
         return Err(read_error);
     }
-    #[cfg(windows)]
     let digest = hash.finish().map_err(|_| read_error)?;
-    #[cfg(not(windows))]
-    let digest = hash.finalize().into();
     Ok(digest_hex(digest))
 }
 

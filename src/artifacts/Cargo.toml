@@ -9,12 +9,10 @@ repository.workspace = true
 description = "Offline bounded artifact verification with retained Windows file guards"
 
 [dependencies]
+bonsai-native-hash.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 zip.workspace = true
-
-[target.'cfg(not(windows))'.dependencies]
-sha2.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true

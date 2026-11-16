@@ -8,9 +8,9 @@ use super::super::{
 };
 use super::{CaptureInput, CaptureUnit, Intake, Request, assemble_until};
 use crate::Result;
+use bonsai_native_hash::hash_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
@@ -323,7 +323,8 @@ where
         &Path,
     ) -> Result<u32>,
 {
-    if hex(&Sha256::digest(request_bytes)) != request_digest
+    let actual_request_digest = hash_bytes(request_bytes).map_err(|error| error.to_string())?;
+    if hex(&actual_request_digest) != request_digest
         || request.schema_version != 1
         || request.kind != "explicit-clang-native-source-execution"
         || request.target != "aarch64-pc-windows-msvc"
@@ -485,7 +486,8 @@ where
             },
             Some(deadline),
         )?;
-        let manifest_digest = hex(&Sha256::digest(manifest.as_bytes()));
+        let manifest_digest =
+            hex(&hash_bytes(manifest.as_bytes()).map_err(|error| error.to_string())?);
         let verification = super::super::verify_manifest_bytes_until(
             manifest.as_bytes(),
             &manifest_digest,
@@ -578,7 +580,8 @@ pub(super) fn run(arguments: &[OsString]) -> Result<String> {
     cursor.finish()?;
     path_key(path)?;
     let bytes = read_bounded(Path::new(path), MAX_DOCUMENT / 2)?;
-    if hex(&Sha256::digest(&bytes)) != expected {
+    let actual_digest = hash_bytes(&bytes).map_err(|error| error.to_string())?;
+    if hex(&actual_digest) != expected {
         return Err("Native execution request differs from its reviewed SHA-256.".into());
     }
     let request: Execution = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;

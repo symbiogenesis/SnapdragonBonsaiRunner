@@ -4,54 +4,21 @@
     reason = "Private maintenance modules expose only a crate-local implementation API."
 )]
 
-#[cfg(not(windows))]
-use sha2::{Digest as _, Sha256};
-
-pub(crate) struct Hasher {
-    #[cfg(windows)]
-    inner: bonsai_windows_credentials::Sha256,
-    #[cfg(not(windows))]
-    inner: Sha256,
-}
+pub(crate) struct Hasher(bonsai_native_hash::Hasher);
 
 impl Hasher {
     pub(crate) fn new() -> crate::Result<Self> {
-        #[cfg(windows)]
-        {
-            Ok(Self {
-                inner: bonsai_windows_credentials::Sha256::new()
-                    .map_err(|error| error.to_string())?,
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(Self {
-                inner: Sha256::new(),
-            })
-        }
+        bonsai_native_hash::Hasher::new()
+            .map(Self)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn update(&mut self, bytes: &[u8]) -> crate::Result<()> {
-        #[cfg(windows)]
-        {
-            self.inner.update(bytes).map_err(|error| error.to_string())
-        }
-        #[cfg(not(windows))]
-        {
-            self.inner.update(bytes);
-            Ok(())
-        }
+        self.0.update(bytes).map_err(|error| error.to_string())
     }
 
     pub(crate) fn finalize_bytes(self) -> crate::Result<[u8; 32]> {
-        #[cfg(windows)]
-        {
-            self.inner.finish().map_err(|error| error.to_string())
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(self.inner.finalize().into())
-        }
+        self.0.finish().map_err(|error| error.to_string())
     }
 
     pub(crate) fn finalize_hex(self) -> crate::Result<String> {
@@ -71,7 +38,7 @@ pub(super) fn sha256(bytes: &[u8]) -> String {
     }
     #[cfg(not(windows))]
     {
-        hex(&Sha256::digest(bytes))
+        bonsai_native_hash::hash_bytes(bytes).map_or_else(|_| String::new(), |digest| hex(&digest))
     }
 }
 

@@ -232,7 +232,7 @@ pub struct ReplayRunConfig<'a> {
     /// Human-readable `cleanup` notice included in the JSON report.
     pub cleanup: &'a str,
     /// Computes a raw 32-byte SHA-256 digest over request bytes.
-    pub sha256: &'a dyn Fn(&[u8]) -> [u8; 32],
+    pub sha256: &'a dyn Fn(&[u8]) -> io::Result<[u8; 32]>,
     /// Queries an endpoint power snapshot JSON value.
     pub power: &'a dyn Fn() -> Value,
     /// Compares `powerBefore` and `powerAfter` endpoint JSON values.
@@ -435,7 +435,7 @@ pub fn run_replay<R: DeserializeOwned>(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
         let (path, digest) = arguments(std::env::args_os().skip(1))?;
         let bytes = bounded_bytes(&path, 64 * 1024)?;
-        if (config.sha256)(&bytes) != hexadecimal::<32>(&digest)? {
+        if (config.sha256)(&bytes)? != hexadecimal::<32>(&digest)? {
             return Err(invalid());
         }
         report["requestSha256"] = digest.into();

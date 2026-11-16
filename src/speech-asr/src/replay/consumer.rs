@@ -1,6 +1,7 @@
 //! Verified file intake and deadline handoff for one complete Rust replay.
 
 use bonsai_artifacts::open_locked_file;
+use bonsai_native_hash::hash_bytes;
 use bonsai_speech_asr::{
     replay::{Binding, Provider, Replay, Tolerance, Tolerances},
     rust_engine::{ARITHMETIC_IDENTITY, RustRecognizer},
@@ -14,7 +15,6 @@ use bonsai_speech_service::replay_harness::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 use std::{io, path::PathBuf};
 
 #[derive(Deserialize)]
@@ -174,7 +174,7 @@ fn compare(request: &Request, report: &mut Value) -> io::Result<()> {
         return Err(io::ErrorKind::Interrupted.into());
     }
     report["transcriptBytes"] = transcript.len().into();
-    report["transcriptSha256"] = hex::encode(Sha256::digest(transcript.as_bytes())).into();
+    report["transcriptSha256"] = hex::encode(hash_bytes(transcript.as_bytes())?).into();
     report["completeReplayPassed"] = true.into();
     report["phase"] = "completed".into();
     Ok(())
@@ -189,7 +189,7 @@ pub(super) fn run() -> io::Result<bool> {
         provider: "bonsai-asr-replay",
         power_scope: "This consumer entry/exit only; owner aggregate setup, reference arm and retention observations remain required.",
         cleanup: "Rust-owned tensors and verified-file guards drop on every result or unwind; external owner must enforce process lifetime.",
-        sha256: &|bytes| Sha256::digest(bytes).into(),
+        sha256: &hash_bytes,
         power: &power,
         compare_power: &bonsai_cpu_policy::power::compare_endpoints,
     };
