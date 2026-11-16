@@ -150,7 +150,7 @@ fn pcm_in_unit_range_simd<S: Simd>(simd: S, pcm: &[f32]) -> bool {
 
 #[inline(always)]
 fn half_scale(bytes: &[u8]) -> f32 {
-    half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32()
+    bonsai_ternary::half_to_float(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 #[inline]
@@ -1774,24 +1774,15 @@ pub(super) fn narrow_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) -> bool {
 /// Widen IEEE binary16 words into `f32` values (`FCVTL` SIMD on ARM64 Windows).
 pub(super) fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
     let n = src.len().min(dst.len());
-    #[cfg(all(windows, feature = "rust-qualification"))]
-    {
-        let (src8, src_rem) = src[..n].as_chunks::<8>();
-        let (dst8, dst_rem) = dst[..n].as_chunks_mut::<8>();
-        for (s, d) in src8.iter().zip(dst8.iter_mut()) {
-            let [lo, hi] = quant_kernels::widen_f16_eight(s);
-            d[..4].copy_from_slice(&lo);
-            d[4..].copy_from_slice(&hi);
-        }
-        for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
-            *slot = half::f16::from_bits(bits).to_f32();
-        }
+    let (src8, src_rem) = src[..n].as_chunks::<8>();
+    let (dst8, dst_rem) = dst[..n].as_chunks_mut::<8>();
+    for (s, d) in src8.iter().zip(dst8.iter_mut()) {
+        let [lo, hi] = bonsai_neon_dot::widen_f16_eight(s);
+        d[..4].copy_from_slice(&lo);
+        d[4..].copy_from_slice(&hi);
     }
-    #[cfg(not(all(windows, feature = "rust-qualification")))]
-    {
-        for (&bits, slot) in src[..n].iter().zip(dst[..n].iter_mut()) {
-            *slot = half::f16::from_bits(bits).to_f32();
-        }
+    for (&bits, slot) in src_rem.iter().zip(dst_rem.iter_mut()) {
+        *slot = bonsai_ternary::half_to_float(bits);
     }
 }
 

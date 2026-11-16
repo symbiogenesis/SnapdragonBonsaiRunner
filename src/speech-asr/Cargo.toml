@@ -36,7 +36,9 @@ required-features = ["rust-qualification"]
 bonsai-artifacts = { workspace = true, optional = true }
 bonsai-cpu-policy = { workspace = true, optional = true }
 bonsai-native-hash.workspace = true
+bonsai-neon-dot.workspace = true
 bonsai-speech-service = { workspace = true, optional = true }
+bonsai-ternary.workspace = true
 fearless_simd.workspace = true
 half.workspace = true
 hex = { workspace = true, optional = true }

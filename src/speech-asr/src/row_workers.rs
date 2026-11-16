@@ -6,9 +6,9 @@ use crate::threads::MAX_WORKERS;
 use bonsai_windows_process::RowWorkerPool;
 #[cfg(not(all(windows, feature = "rust-qualification")))]
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
+use std::{cell::RefCell, io};
 #[cfg(not(all(windows, feature = "rust-qualification")))]
-use std::thread::JoinHandle;
-use std::{cell::RefCell, io, sync::Mutex};
+use std::{sync::Mutex, thread::JoinHandle};
 
 thread_local! {
     // Each calling serving thread owns its worker team across requests; dropping
@@ -258,26 +258,11 @@ where
             out.len(),
             eff_align,
             |pool, active_workers| {
-                let failure: Mutex<Option<(usize, io::Error)>> = Mutex::new(None);
                 let run = |offset: usize, slice: &mut [f32]| {
                     let _guard = WorkerFlagGuard::enter();
-                    if let Err(error) = compute_slice(offset, slice) {
-                        let mut guard = failure
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if guard.as_ref().is_none_or(|(prev, _)| offset < *prev) {
-                            *guard = Some((offset, error));
-                        }
-                    }
+                    compute_slice(offset, slice)
                 };
-                pool.run_aligned(out, active_workers, eff_align, &run);
-                match failure
-                    .into_inner()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                {
-                    Some((_, error)) => Err(error),
-                    None => Ok(()),
-                }
+                pool.try_run_aligned(out, active_workers, eff_align, &run)
             },
         ) {
             result

@@ -121,8 +121,25 @@ impl Projection {
             return Err(invalid());
         }
         let mut values = zeros(count)?;
-        for (value, bytes) in values.iter_mut().zip(bytes.as_chunks::<2>().0) {
-            *value = half(u16::from_le_bytes(*bytes))?;
+        let (chunks8, tail) = bytes.as_chunks::<16>();
+        let mut offset = 0_usize;
+        for raw_chunk in chunks8 {
+            let pairs = raw_chunk.as_chunks::<2>().0;
+            let bits: [u16; 8] = std::array::from_fn(|idx| u16::from_le_bytes(pairs[idx]));
+            let [lo, hi] = bonsai_neon_dot::widen_f16_eight(&bits);
+            for (slot, value) in values[offset..offset + 8]
+                .iter_mut()
+                .zip(lo.into_iter().chain(hi))
+            {
+                if !value.is_finite() {
+                    return Err(invalid());
+                }
+                *slot = value;
+            }
+            offset += 8;
+        }
+        for (value, pair) in values[offset..].iter_mut().zip(tail.as_chunks::<2>().0) {
+            *value = half(u16::from_le_bytes(*pair))?;
         }
         Self::f32(input, output, values)
     }
@@ -512,11 +529,11 @@ fn extent(input: usize, output: usize) -> io::Result<usize> {
 }
 
 fn half(bits: u16) -> io::Result<f32> {
-    let value = half::f16::from_bits(bits);
+    let value = bonsai_ternary::half_to_float(bits);
     if !value.is_finite() {
         return Err(invalid());
     }
-    Ok(value.to_f32())
+    Ok(value)
 }
 
 /// Cache scalar policy, selected explicitly when creating a decoder model.

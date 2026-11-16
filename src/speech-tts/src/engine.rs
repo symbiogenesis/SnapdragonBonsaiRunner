@@ -2107,35 +2107,26 @@ pub struct LayerKvCache {
 /// on Windows when available.
 pub(crate) fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
     let count = src.len().min(dst.len());
-    #[cfg(windows)]
+    let mut idx = 0_usize;
+    for (chunk, out_chunk) in src[..count]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(dst[..count].as_chunks_mut::<8>().0.iter_mut())
     {
-        let mut idx = 0_usize;
-        for (chunk, out_chunk) in src[..count]
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .zip(dst[..count].as_chunks_mut::<8>().0.iter_mut())
-        {
-            let [lo, hi] = bonsai_windows_process::quant_kernels::widen_f16_eight(chunk);
-            out_chunk[..4].copy_from_slice(&lo);
-            out_chunk[4..].copy_from_slice(&hi);
-            idx += 8;
-        }
-        if idx + 4 <= count {
-            let chunk = [src[idx], src[idx + 1], src[idx + 2], src[idx + 3]];
-            let widened = bonsai_windows_process::quant_kernels::widen_f16_four(&chunk);
-            dst[idx..idx + 4].copy_from_slice(&widened);
-            idx += 4;
-        }
-        for i in idx..count {
-            dst[i] = crate::weights::half(&src[i].to_le_bytes());
-        }
+        let [lo, hi] = bonsai_neon_dot::widen_f16_eight(chunk);
+        out_chunk[..4].copy_from_slice(&lo);
+        out_chunk[4..].copy_from_slice(&hi);
+        idx += 8;
     }
-    #[cfg(not(windows))]
-    {
-        for (s, d) in src[..count].iter().zip(dst[..count].iter_mut()) {
-            *d = crate::weights::half(&s.to_le_bytes());
-        }
+    if idx + 4 <= count {
+        let chunk = [src[idx], src[idx + 1], src[idx + 2], src[idx + 3]];
+        let widened = bonsai_neon_dot::widen_f16_four(&chunk);
+        dst[idx..idx + 4].copy_from_slice(&widened);
+        idx += 4;
+    }
+    for i in idx..count {
+        dst[i] = bonsai_ternary::half_to_float(src[i]);
     }
 }
 
@@ -2155,7 +2146,7 @@ pub(crate) fn narrow_f32_slice(src: &[f32], dst: &mut [u16]) -> bool {
             if !val.is_finite() || val.abs() >= 65_520.0 {
                 return false;
             }
-            *slot = half::f16::from_f32(val).to_bits();
+            *slot = bonsai_neon_dot::scalar_half_bits(val);
         }
         true
     }

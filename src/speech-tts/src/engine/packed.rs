@@ -276,31 +276,13 @@ fn load_f32x4_le<S: Simd>(simd: S, source: &[u8]) -> f32x4<S> {
 
 #[inline(always)]
 fn load_f16x4<S: Simd>(simd: S, source: &[u8]) -> f32x4<S> {
-    #[cfg(windows)]
-    {
-        let bits = [
-            u16::from_le_bytes([source[0], source[1]]),
-            u16::from_le_bytes([source[2], source[3]]),
-            u16::from_le_bytes([source[4], source[5]]),
-            u16::from_le_bytes([source[6], source[7]]),
-        ];
-        f32x4::from_slice(
-            simd,
-            &bonsai_windows_process::quant_kernels::widen_f16_four(&bits),
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        f32x4::from_slice(
-            simd,
-            &[
-                half(&source[0..2]),
-                half(&source[2..4]),
-                half(&source[4..6]),
-                half(&source[6..8]),
-            ],
-        )
-    }
+    let bits = [
+        u16::from_le_bytes([source[0], source[1]]),
+        u16::from_le_bytes([source[2], source[3]]),
+        u16::from_le_bytes([source[4], source[5]]),
+        u16::from_le_bytes([source[6], source[7]]),
+    ];
+    f32x4::from_slice(simd, &bonsai_neon_dot::widen_f16_four(&bits))
 }
 
 // Interleave four ordinary floating-point rows, retaining one output per SIMD

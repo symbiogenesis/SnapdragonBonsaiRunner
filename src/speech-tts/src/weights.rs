@@ -599,7 +599,7 @@ pub(crate) fn packed_layout(kind: u32) -> io::Result<(usize, usize)> {
 }
 
 pub(crate) fn half(bytes: &[u8]) -> f32 {
-    half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32()
+    bonsai_ternary::half_to_float(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 pub(crate) fn validate_packed(kind: u32, bytes: &[u8]) -> io::Result<()> {

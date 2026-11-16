@@ -178,7 +178,19 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Vec<f32>> {
         self.stream_tensor_values(name, 1, 2, cancel, |chunk, values| {
-            for &raw in chunk.as_chunks::<2>().0 {
+            let (chunks8, tail) = chunk.as_chunks::<16>();
+            for raw_chunk in chunks8 {
+                let pairs = raw_chunk.as_chunks::<2>().0;
+                let bits: [u16; 8] = std::array::from_fn(|idx| u16::from_le_bytes(pairs[idx]));
+                let [lo, hi] = bonsai_neon_dot::widen_f16_eight(&bits);
+                for value in lo.into_iter().chain(hi) {
+                    if !value.is_finite() {
+                        return Err(invalid());
+                    }
+                    values.push(value);
+                }
+            }
+            for &raw in tail.as_chunks::<2>().0 {
                 values.push(decode_f16(u16::from_le_bytes(raw))?);
             }
             Ok(())
@@ -238,11 +250,11 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
 }
 
 fn decode_f16(bits: u16) -> io::Result<f32> {
-    let value = half::f16::from_bits(bits);
+    let value = bonsai_ternary::half_to_float(bits);
     if !value.is_finite() {
         return Err(invalid());
     }
-    Ok(value.to_f32())
+    Ok(value)
 }
 
 pub(super) fn load<R: Read + Seek>(
