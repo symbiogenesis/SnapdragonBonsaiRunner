@@ -92,6 +92,65 @@ const KIND_EOF: u8 = 3;
 const KIND_RESET: u8 = 4;
 const KIND_SERVER_READY: u8 = 5;
 
+/// Control frame kind carrying one parent-verified read-only section attestation (`stream_id == 0`).
+pub const KIND_VERIFIED_SECTION: u8 = 6;
+
+/// Maximum number of verified read-only section attestations sent during pipe startup.
+pub const MAX_VERIFIED_SECTIONS: usize = 8;
+
+const VERIFIED_SECTION_PAYLOAD_BYTES: usize = 52;
+
+/// Attestation metadata for one parent-verified read-only file section inherited by the worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedSectionAttestation {
+    /// Zero-based section slot index matching the inherited handle order.
+    pub slot: u32,
+    /// Inherited Windows `HANDLE` value valid in the child process.
+    pub child_handle: u64,
+    /// Nonzero byte length of the verified regular file backed by the section.
+    pub bytes: u64,
+    /// Expected SHA-256 digest of the verified section contents.
+    pub sha256: [u8; 32],
+}
+
+/// Encodes one [`VerifiedSectionAttestation`] into its canonical 52-byte little-endian payload.
+///
+/// Wire layout: `slot (4 LE) || child_handle (8 LE) || bytes (8 LE) || sha256 (32)`.
+///
+/// # Errors
+/// Returns [`BackendError::Configuration`] when `child_handle == 0` or `bytes == 0`.
+pub fn encode_verified_section_payload(
+    attestation: &VerifiedSectionAttestation,
+) -> Result<[u8; VERIFIED_SECTION_PAYLOAD_BYTES], BackendError> {
+    if attestation.child_handle == 0 || attestation.bytes == 0 {
+        return Err(BackendError::Configuration);
+    }
+    let mut payload = [0_u8; VERIFIED_SECTION_PAYLOAD_BYTES];
+    payload[..4].copy_from_slice(&attestation.slot.to_le_bytes());
+    payload[4..12].copy_from_slice(&attestation.child_handle.to_le_bytes());
+    payload[12..20].copy_from_slice(&attestation.bytes.to_le_bytes());
+    payload[20..52].copy_from_slice(&attestation.sha256);
+    Ok(payload)
+}
+
+fn encode_verified_sections(
+    sections: &[VerifiedSectionAttestation],
+) -> Result<Vec<[u8; VERIFIED_SECTION_PAYLOAD_BYTES]>, BackendError> {
+    if sections.len() > MAX_VERIFIED_SECTIONS {
+        return Err(BackendError::Configuration);
+    }
+    let mut seen_slots = [0_u32; MAX_VERIFIED_SECTIONS];
+    let mut encoded = Vec::with_capacity(sections.len());
+    for (index, section) in sections.iter().enumerate() {
+        if seen_slots[..index].contains(&section.slot) {
+            return Err(BackendError::Configuration);
+        }
+        seen_slots[index] = section.slot;
+        encoded.push(encode_verified_section_payload(section)?);
+    }
+    Ok(encoded)
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ReadyState {
     Pending,
@@ -132,6 +191,7 @@ struct TxState {
     queued_data_frames: usize,
     enqueued_seq: u64,
     flushed_seq: u64,
+    ack_received: bool,
     closed: bool,
     failed: bool,
     reset_streams: VecDeque<u32>,
@@ -147,6 +207,7 @@ impl TxState {
             queued_data_frames: 0,
             enqueued_seq: 0,
             flushed_seq: 0,
+            ack_received: false,
             closed: false,
             failed: false,
             reset_streams: VecDeque::new(),
@@ -275,7 +336,26 @@ impl PipeBackend {
         child_stdout: File,
         backend_key: &str,
     ) -> Result<Self, BackendError> {
-        Self::from_io(child_stdout, child_stdin, backend_key)
+        Self::connect_stdio_with_sections(child_stdin, child_stdout, backend_key, &[])
+    }
+
+    /// Connects over the child's `(stdin, stdout)` pipe handles and attests inherited sections.
+    ///
+    /// Validates `sections` eagerly before starting background I/O threads, completes the
+    /// `SB2PIPE1`/`SB2OKAY1` bearer handshake, and emits one `KIND_VERIFIED_SECTION` control
+    /// frame (`stream_id == 0`, 52-byte payload) per attested section before `KIND_SERVER_READY`.
+    ///
+    /// # Errors
+    /// Returns [`BackendError::Configuration`] for an invalid 64-byte hex credential, more than
+    /// [`MAX_VERIFIED_SECTIONS`] attestations, duplicate `slot`, or zero `child_handle`/`bytes`;
+    /// returns [`BackendError::Io`] if background pipe threads cannot start.
+    pub fn connect_stdio_with_sections(
+        child_stdin: File,
+        child_stdout: File,
+        backend_key: &str,
+        sections: &[VerifiedSectionAttestation],
+    ) -> Result<Self, BackendError> {
+        Self::from_io_with_sections(child_stdout, child_stdin, backend_key, sections)
     }
 
     /// Connects over arbitrary blocking reader/writer streams using the `SB2PIPE1` protocol.
@@ -288,11 +368,35 @@ impl PipeBackend {
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
+        Self::from_io_with_sections(reader, writer, backend_key, &[])
+    }
+
+    /// Connects over blocking reader/writer streams and attests inherited read-only sections.
+    ///
+    /// Validates `sections` synchronously before spawning background threads, then transmits
+    /// one `KIND_VERIFIED_SECTION` control frame (`stream_id == 0`, 52-byte payload) per entry
+    /// immediately after `SB2OKAY1` is observed and before `KIND_SERVER_READY` completes.
+    ///
+    /// # Errors
+    /// Returns [`BackendError::Configuration`] for an invalid 64-byte hex credential, more than
+    /// [`MAX_VERIFIED_SECTIONS`] attestations, duplicate `slot`, or zero `child_handle`/`bytes`;
+    /// returns [`BackendError::Io`] if background pipe threads cannot start.
+    pub fn from_io_with_sections<R, W>(
+        reader: R,
+        writer: W,
+        backend_key: &str,
+        sections: &[VerifiedSectionAttestation],
+    ) -> Result<Self, BackendError>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
         let policy = BackendPolicy::new(BROKER_PIPE_HOST_PORT, backend_key)?;
         let raw_key = backend_key.as_bytes();
         if raw_key.len() != KEY_HEX_BYTES {
             return Err(BackendError::Configuration);
         }
+        let pending_sections = encode_verified_sections(sections)?;
         let mut boxed_key = Box::new([0_u8; KEY_HEX_BYTES]);
         boxed_key.copy_from_slice(raw_key);
         let handshake_key = ScrubHandshake(boxed_key);
@@ -313,6 +417,7 @@ impl PipeBackend {
                 run_writer(
                     writer,
                     handshake_key,
+                    pending_sections,
                     &tx_worker,
                     &rx_fail,
                     &ready_tx_fail,
@@ -826,6 +931,11 @@ fn run_reader<R: Read>(
         fail_transport(tx, rx_state, ready_tx, pool);
         return;
     }
+    {
+        let mut state = lock_unpoisoned(&tx.state);
+        state.ack_received = true;
+    }
+    tx.writer_ready.notify_one();
     loop {
         let header = match read_header(&mut reader) {
             Ok(HeaderRead::CleanEof) => {
@@ -861,6 +971,7 @@ fn run_reader<R: Read>(
 fn run_writer<W: Write>(
     mut writer: W,
     handshake_key: ScrubHandshake,
+    pending_sections: Vec<[u8; VERIFIED_SECTION_PAYLOAD_BYTES]>,
     tx: &Arc<TxShared>,
     rx_state: &Arc<Mutex<RxState>>,
     ready_tx: &watch::Sender<ReadyState>,
@@ -874,6 +985,37 @@ fn run_writer<W: Write>(
     if handshake_result.is_err() {
         fail_transport(tx, rx_state, ready_tx, pool);
         return;
+    }
+
+    if !pending_sections.is_empty() {
+        let should_emit = {
+            let mut state = lock_unpoisoned(&tx.state);
+            while !state.ack_received && !state.failed && !state.closed {
+                state = wait_unpoisoned(&tx.writer_ready, state);
+            }
+            state.ack_received && !state.failed && !state.closed
+        };
+        if !should_emit {
+            return;
+        }
+        let header = encode_header(0, KIND_VERIFIED_SECTION, 52);
+        let mut emit_result = Ok(());
+        for payload in pending_sections {
+            if let Err(error) = writer
+                .write_all(&header)
+                .and_then(|()| writer.write_all(&payload))
+            {
+                emit_result = Err(error);
+                break;
+            }
+        }
+        if emit_result.is_ok() {
+            emit_result = writer.flush();
+        }
+        if emit_result.is_err() {
+            fail_transport(tx, rx_state, ready_tx, pool);
+            return;
+        }
     }
 
     let mut batch = Vec::new();
@@ -970,6 +1112,12 @@ mod tests {
 
     struct MemoryStream {
         shared: Arc<(Mutex<PipeQueue>, Condvar)>,
+    }
+
+    impl MemoryStream {
+        fn buffered_bytes(&self) -> usize {
+            lock_unpoisoned(&self.shared.0).bytes.len()
+        }
     }
 
     fn memory_channel() -> (MemoryStream, MemoryStream) {
@@ -1237,6 +1385,249 @@ mod tests {
             drop(s2);
             assert!(backend.pool.len() >= 1);
             assert!(backend.pool.len() <= FREE_LIST_CAPACITY);
+            Ok(())
+        })
+    }
+
+    fn sample_attestation(slot: u32, child_handle: u64, bytes: u64) -> VerifiedSectionAttestation {
+        let mut sha256 = [0_u8; 32];
+        for (index, byte) in sha256.iter_mut().enumerate() {
+            *byte = u8::try_from(index).unwrap_or(0) ^ u8::try_from(slot & 0xff).unwrap_or(0);
+        }
+        VerifiedSectionAttestation {
+            slot,
+            child_handle,
+            bytes,
+            sha256,
+        }
+    }
+
+    #[test]
+    fn verified_section_payload_encodes_52_le_bytes_and_rejects_invalid_bounds()
+    -> Result<(), BackendError> {
+        let attestation = sample_attestation(3, 0x0123_4567_89ab_cdef, 0x1020_3040_5060_7080);
+        let payload = encode_verified_section_payload(&attestation)?;
+        assert_eq!(payload.len(), 52);
+        assert_eq!(&payload[0..4], &3_u32.to_le_bytes());
+        assert_eq!(&payload[4..12], &0x0123_4567_89ab_cdef_u64.to_le_bytes());
+        assert_eq!(&payload[12..20], &0x1020_3040_5060_7080_u64.to_le_bytes());
+        assert_eq!(&payload[20..52], &attestation.sha256);
+
+        assert_eq!(
+            encode_verified_section_payload(&VerifiedSectionAttestation {
+                child_handle: 0,
+                ..attestation
+            }),
+            Err(BackendError::Configuration)
+        );
+        assert_eq!(
+            encode_verified_section_payload(&VerifiedSectionAttestation {
+                bytes: 0,
+                ..attestation
+            }),
+            Err(BackendError::Configuration)
+        );
+
+        let exact_max: Vec<VerifiedSectionAttestation> = (0..8_u32)
+            .map(|slot| sample_attestation(slot, u64::from(slot) + 100, u64::from(slot) + 4096))
+            .collect();
+        assert_eq!(
+            encode_verified_sections(&exact_max).map(|encoded| encoded.len()),
+            Ok(MAX_VERIFIED_SECTIONS)
+        );
+
+        let mut too_many = exact_max;
+        too_many.push(sample_attestation(8, 200, 4096));
+        assert_eq!(
+            encode_verified_sections(&too_many),
+            Err(BackendError::Configuration)
+        );
+
+        assert_eq!(
+            encode_verified_sections(&[
+                sample_attestation(2, 100, 512),
+                sample_attestation(2, 104, 1024),
+            ]),
+            Err(BackendError::Configuration)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn from_io_with_sections_rejects_invalid_attestations_before_spawning_threads() {
+        let invalid_cases = [
+            (0..=u32::try_from(MAX_VERIFIED_SECTIONS).unwrap_or(8))
+                .map(|slot| sample_attestation(slot, u64::from(slot) + 10, 64))
+                .collect::<Vec<_>>(),
+            vec![
+                sample_attestation(1, 0x10, 64),
+                sample_attestation(1, 0x20, 128),
+            ],
+            vec![sample_attestation(0, 0, 64)],
+            vec![sample_attestation(0, 0x10, 0)],
+        ];
+        for sections in invalid_cases {
+            let (p_to_c_w, mut p_to_c_r) = memory_channel();
+            let (_c_to_p_w, c_to_p_r) = memory_channel();
+            assert!(matches!(
+                PipeBackend::from_io_with_sections(c_to_p_r, p_to_c_w, VALID_KEY, &sections),
+                Err(BackendError::Configuration)
+            ));
+            let mut drained = Vec::new();
+            assert!(p_to_c_r.read_to_end(&mut drained).is_ok());
+            assert!(drained.is_empty());
+        }
+    }
+
+    #[test]
+    fn from_io_with_sections_emits_frames_after_sb2okay1_and_before_server_ready() -> io::Result<()>
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let sections = [
+                sample_attestation(0, 0x110, 8192),
+                sample_attestation(3, 0x220, 16384),
+            ];
+            let (p_to_c_w, mut p_to_c_r) = memory_channel();
+            let (mut c_to_p_w, c_to_p_r) = memory_channel();
+
+            let backend =
+                PipeBackend::from_io_with_sections(c_to_p_r, p_to_c_w, VALID_KEY, &sections)
+                    .map_err(|_| io::Error::other("from_io_with_sections failed"))?;
+
+            let mut handshake = [0_u8; 8 + KEY_HEX_BYTES];
+            p_to_c_r.read_exact(&mut handshake)?;
+            assert_eq!(&handshake[..8], HANDSHAKE_REQUEST_MAGIC);
+            assert_eq!(&handshake[8..], VALID_KEY.as_bytes());
+
+            // No KIND_VERIFIED_SECTION frame may be emitted before SB2OKAY1 arrives.
+            std::thread::sleep(Duration::from_millis(25));
+            assert_eq!(p_to_c_r.buffered_bytes(), 0);
+
+            c_to_p_w.write_all(HANDSHAKE_RESPONSE_MAGIC)?;
+            c_to_p_w.flush()?;
+
+            for expected in &sections {
+                let (stream_id, kind, payload) = read_frame(&mut p_to_c_r)?;
+                assert_eq!(stream_id, 0);
+                assert_eq!(kind, KIND_VERIFIED_SECTION);
+                let expected_payload = encode_verified_section_payload(expected)
+                    .map_err(|_| io::Error::other("encode_verified_section_payload failed"))?;
+                assert_eq!(payload, expected_payload.as_slice());
+            }
+
+            // wait_server_ready stays pending until KIND_SERVER_READY is sent after attestation.
+            assert!(
+                matches!(
+                    backend
+                        .wait_server_ready(Instant::now() + Duration::from_millis(25))
+                        .await,
+                    Err(BackendError::Deadline)
+                ),
+                "wait_server_ready completed before KIND_SERVER_READY"
+            );
+
+            write_frame(&mut c_to_p_w, 0, KIND_SERVER_READY, &[])?;
+            backend
+                .wait_server_ready(Instant::now() + Duration::from_secs(2))
+                .await
+                .map_err(|_| io::Error::other("wait_server_ready failed"))?;
+
+            let mut stream = backend
+                .connect(Instant::now() + Duration::from_secs(1))
+                .await
+                .map_err(|_| io::Error::other("connect after verified sections failed"))?;
+            stream.write_all(b"GET /v1/models HTTP/1.1\r\n\r\n").await?;
+            stream.flush().await?;
+            assert_eq!(read_frame(&mut p_to_c_r)?, (1, KIND_OPEN, Vec::new()));
+            assert_eq!(
+                read_frame(&mut p_to_c_r)?,
+                (1, KIND_DATA, b"GET /v1/models HTTP/1.1\r\n\r\n".to_vec())
+            );
+            write_frame(&mut c_to_p_w, 1, KIND_DATA, b"HTTP/1.1 200 OK\r\n\r\n")?;
+            write_frame(&mut c_to_p_w, 1, KIND_EOF, &[])?;
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).await?;
+            assert_eq!(reply, b"HTTP/1.1 200 OK\r\n\r\n");
+            drop(stream);
+            assert_eq!(read_frame(&mut p_to_c_r)?, (1, KIND_EOF, Vec::new()));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn from_io_with_sections_suppresses_attestations_when_ack_fails() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let sections = [sample_attestation(0, 0x330, 4096)];
+            let (p_to_c_w, mut p_to_c_r) = memory_channel();
+            let (mut c_to_p_w, c_to_p_r) = memory_channel();
+
+            let backend =
+                PipeBackend::from_io_with_sections(c_to_p_r, p_to_c_w, VALID_KEY, &sections)
+                    .map_err(|_| io::Error::other("from_io_with_sections failed"))?;
+
+            let mut handshake = [0_u8; 8 + KEY_HEX_BYTES];
+            p_to_c_r.read_exact(&mut handshake)?;
+            c_to_p_w.write_all(b"BADACK01")?;
+            c_to_p_w.flush()?;
+
+            assert!(matches!(
+                backend
+                    .wait_server_ready(Instant::now() + Duration::from_secs(2))
+                    .await,
+                Err(BackendError::Io)
+            ));
+            let mut trailing = Vec::new();
+            p_to_c_r.read_to_end(&mut trailing)?;
+            assert!(trailing.is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn connect_stdio_with_sections_exchanges_attestations_over_os_pipes() -> io::Result<()> {
+        use std::os::windows::io::OwnedHandle;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (mut p_to_c_r, p_to_c_w) = io::pipe()?;
+            let (c_to_p_r, mut c_to_p_w) = io::pipe()?;
+            let sections = [sample_attestation(0, 0x440, 12_288)];
+
+            let backend = PipeBackend::connect_stdio_with_sections(
+                File::from(OwnedHandle::from(p_to_c_w)),
+                File::from(OwnedHandle::from(c_to_p_r)),
+                VALID_KEY,
+                &sections,
+            )
+            .map_err(|_| io::Error::other("connect_stdio_with_sections failed"))?;
+
+            let mut handshake = [0_u8; 8 + KEY_HEX_BYTES];
+            p_to_c_r.read_exact(&mut handshake)?;
+            assert_eq!(&handshake[..8], HANDSHAKE_REQUEST_MAGIC);
+            assert_eq!(&handshake[8..], VALID_KEY.as_bytes());
+            c_to_p_w.write_all(HANDSHAKE_RESPONSE_MAGIC)?;
+            c_to_p_w.flush()?;
+
+            let (stream_id, kind, payload) = read_frame(&mut p_to_c_r)?;
+            assert_eq!(stream_id, 0);
+            assert_eq!(kind, KIND_VERIFIED_SECTION);
+            let expected = encode_verified_section_payload(&sections[0])
+                .map_err(|_| io::Error::other("encode_verified_section_payload failed"))?;
+            assert_eq!(payload, expected.as_slice());
+
+            write_frame(&mut c_to_p_w, 0, KIND_SERVER_READY, &[])?;
+            backend
+                .wait_server_ready(Instant::now() + Duration::from_secs(2))
+                .await
+                .map_err(|_| io::Error::other("wait_server_ready failed"))?;
             Ok(())
         })
     }
