@@ -1574,7 +1574,10 @@ impl Codec {
     }
 }
 
-pub(crate) struct Speaker(EcapaSpeakerEncoder);
+pub(crate) struct Speaker {
+    model: EcapaSpeakerEncoder,
+    threads: usize,
+}
 
 fn tdnn(
     weights: &mut Weights,
@@ -1595,7 +1598,7 @@ fn tdnn(
 }
 
 impl Speaker {
-    pub(crate) fn load(weights: &mut Weights) -> io::Result<Self> {
+    pub(crate) fn load(weights: &mut Weights, threads: usize) -> io::Result<Self> {
         if weights.u32("qwen3-tts.spk_enc.embedding_length")? != 2048
             || weights.u32("qwen3-tts.spk_enc.sample_rate")? != SAMPLE_RATE
         {
@@ -1626,17 +1629,20 @@ impl Speaker {
                 scale: 8,
             });
         }
-        Ok(Self(EcapaSpeakerEncoder {
-            mel: MelSpectrogramExtractor::new(AudioMelConfig::default())?,
-            conv0: tdnn(weights, "spk_enc.conv0", 128, 512, 5, 1)?,
-            blocks: blocks.try_into().map_err(|_| invalid())?,
-            mfa: tdnn(weights, "spk_enc.mfa", 1536, 1536, 1, 1)?,
-            asp: AttentiveStatPool {
-                tdnn: tdnn(weights, "spk_enc.asp.tdnn", 4608, 128, 1, 1)?,
-                conv: tdnn(weights, "spk_enc.asp.conv", 128, 1536, 1, 1)?,
+        Ok(Self {
+            model: EcapaSpeakerEncoder {
+                mel: MelSpectrogramExtractor::new(AudioMelConfig::default())?,
+                conv0: tdnn(weights, "spk_enc.conv0", 128, 512, 5, 1)?,
+                blocks: blocks.try_into().map_err(|_| invalid())?,
+                mfa: tdnn(weights, "spk_enc.mfa", 1536, 1536, 1, 1)?,
+                asp: AttentiveStatPool {
+                    tdnn: tdnn(weights, "spk_enc.asp.tdnn", 4608, 128, 1, 1)?,
+                    conv: tdnn(weights, "spk_enc.asp.conv", 128, 1536, 1, 1)?,
+                },
+                fc: tdnn(weights, "spk_enc.fc", 3072, 2048, 1, 1)?,
             },
-            fc: tdnn(weights, "spk_enc.fc", 3072, 2048, 1, 1)?,
-        }))
+            threads,
+        })
     }
 
     pub(crate) fn extract_cancellable(
@@ -1651,7 +1657,7 @@ impl Speaker {
         {
             return Err(invalid());
         }
-        let vector = self.0.extract_xvector(samples)?;
+        let vector = self.model.extract_xvector_parallel(samples, self.threads)?;
         cancel()?;
         if vector.len() != 2048 || !vector.iter().all(|value| value.is_finite()) {
             return Err(invalid());

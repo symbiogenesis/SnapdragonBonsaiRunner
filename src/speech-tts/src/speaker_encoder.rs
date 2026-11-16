@@ -22,7 +22,10 @@ use std::io;
 
 use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 
-use crate::numerics::{axpy_simd, f32_dot_simd, usize_to_f32};
+use crate::{
+    engine::row_workers,
+    numerics::{axpy_simd, f32_dot_simd, usize_to_f32},
+};
 
 #[expect(
     clippy::as_conversions,
@@ -349,6 +352,15 @@ impl MelSpectrogramExtractor {
     /// # Errors
     /// Rejects waveforms shorter than `(n_fft - hop) / 2 + 1` or containing non-finite samples.
     pub fn extract(&self, audio: &[f32]) -> io::Result<(Vec<f32>, usize)> {
+        self.extract_parallel(audio, 1)
+    }
+
+    /// Extract a `[n_mels, n_frames]` log-mel spectrogram using up to `threads` frame workers
+    /// with 0-ULP bit parity against [`Self::extract`].
+    ///
+    /// # Errors
+    /// Rejects waveforms shorter than `(n_fft - hop) / 2 + 1` or containing non-finite samples.
+    pub fn extract_parallel(&self, audio: &[f32], threads: usize) -> io::Result<(Vec<f32>, usize)> {
         let pad = (self.cfg.n_fft - self.cfg.hop) / 2;
         if audio.len() <= pad || !audio.iter().all(|s| s.is_finite()) {
             return Err(io::Error::new(
@@ -364,30 +376,86 @@ impl MelSpectrogramExtractor {
             ));
         }
         let n_frames = (padded.len() - self.cfg.n_fft) / self.cfg.hop + 1;
+        let work = n_frames
+            .saturating_mul(self.n_freq)
+            .saturating_mul(self.cfg.n_fft);
+        let workers = if n_frames < 4 || work < 65_536 {
+            1
+        } else {
+            threads.clamp(1, 18)
+        };
         let mut log_mel = vec![0.0_f32; self.cfg.n_mels * n_frames];
-        let mut windowed = vec![0.0_f32; self.cfg.n_fft];
-        let mut mag_frame = vec![0.0_f32; self.n_freq];
         let level = Level::new();
 
-        dispatch!(level, simd => {
-            for t in 0..n_frames {
-                let start = t * self.cfg.hop;
-                let frame = &padded[start..start + self.cfg.n_fft];
-                window_frame_simd(simd, frame, &self.hann, &mut windowed);
-                for (k, mag_slot) in mag_frame.iter_mut().enumerate() {
-                    let re_row = &self.dft_real[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
-                    let im_row = &self.dft_imag[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
-                    let (re, im) = f32_dot_pair_simd(simd, &windowed, re_row, im_row);
-                    *mag_slot = re.mul_add(re, im.mul_add(im, 1e-9_f32)).sqrt();
+        if workers <= 1 {
+            let mut windowed = vec![0.0_f32; self.cfg.n_fft];
+            let mut mag_frame = vec![0.0_f32; self.n_freq];
+            dispatch!(level, simd => {
+                for t in 0..n_frames {
+                    let start = t * self.cfg.hop;
+                    let frame = &padded[start..start + self.cfg.n_fft];
+                    self.compute_mel_magnitude_simd(simd, frame, &mut windowed, &mut mag_frame);
+                    for m in 0..self.cfg.n_mels {
+                        let basis_row = &self.mel_basis[m * self.n_freq..(m + 1) * self.n_freq];
+                        let sum = f32_dot_simd(simd, basis_row, &mag_frame);
+                        log_mel[m * n_frames + t] = sum.max(1e-5_f32).ln();
+                    }
                 }
-                for m in 0..self.cfg.n_mels {
-                    let basis_row = &self.mel_basis[m * self.n_freq..(m + 1) * self.n_freq];
-                    let sum = f32_dot_simd(simd, basis_row, &mag_frame);
-                    log_mel[m * n_frames + t] = sum.max(1e-5_f32).ln();
-                }
+            });
+            return Ok((log_mel, n_frames));
+        }
+
+        let mut frame_major = vec![0.0_f32; n_frames * self.cfg.n_mels];
+        row_workers::run_aligned(
+            &mut frame_major,
+            workers,
+            self.cfg.n_mels,
+            &|offset, slice| {
+                let first_frame = offset / self.cfg.n_mels;
+                let mut windowed = vec![0.0_f32; self.cfg.n_fft];
+                let mut mag_frame = vec![0.0_f32; self.n_freq];
+                dispatch!(level, simd => {
+                    for (local_t, frame_out) in slice.chunks_exact_mut(self.cfg.n_mels).enumerate() {
+                        let t = first_frame + local_t;
+                        let start = t * self.cfg.hop;
+                        let frame = &padded[start..start + self.cfg.n_fft];
+                        self.compute_mel_magnitude_simd(simd, frame, &mut windowed, &mut mag_frame);
+                        for (m, dst) in frame_out.iter_mut().enumerate() {
+                            let basis_row = &self.mel_basis[m * self.n_freq..(m + 1) * self.n_freq];
+                            let sum = f32_dot_simd(simd, basis_row, &mag_frame);
+                            *dst = sum.max(1e-5_f32).ln();
+                        }
+                    }
+                });
+            },
+        );
+        for (t, frame_row) in frame_major.chunks_exact(self.cfg.n_mels).enumerate() {
+            for (m, &value) in frame_row.iter().enumerate() {
+                log_mel[m * n_frames + t] = value;
             }
-        });
+        }
         Ok((log_mel, n_frames))
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+    )]
+    #[inline(always)]
+    fn compute_mel_magnitude_simd<S: Simd>(
+        &self,
+        simd: S,
+        frame: &[f32],
+        windowed: &mut [f32],
+        mag_frame: &mut [f32],
+    ) {
+        window_frame_simd(simd, frame, &self.hann, windowed);
+        for (k, mag_slot) in mag_frame.iter_mut().enumerate() {
+            let re_row = &self.dft_real[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
+            let im_row = &self.dft_imag[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
+            let (re, im) = f32_dot_pair_simd(simd, windowed, re_row, im_row);
+            *mag_slot = re.mul_add(re, im.mul_add(im, 1e-9_f32)).sqrt();
+        }
     }
 }
 
@@ -433,6 +501,18 @@ pub struct TdnnConv1d {
 impl TdnnConv1d {
     /// Execute reflect-padded same-length 1D convolution on `[in_c, frames]` channel-major input.
     pub fn forward(&self, input: &[f32], frames: usize, apply_relu: bool) -> io::Result<Vec<f32>> {
+        self.forward_parallel(input, frames, apply_relu, 1)
+    }
+
+    /// Execute reflect-padded same-length 1D convolution across up to `threads` output-channel
+    /// workers with 0-ULP bit parity against [`Self::forward`].
+    pub fn forward_parallel(
+        &self,
+        input: &[f32],
+        frames: usize,
+        apply_relu: bool,
+        threads: usize,
+    ) -> io::Result<Vec<f32>> {
         if input.len() != self.in_c * frames
             || self.weight.len() != self.out_c * self.in_c * self.kernel
             || self.bias.len() != self.out_c
@@ -456,67 +536,91 @@ impl TdnnConv1d {
                 ));
             }
             let mut buf = vec![0.0_f32; self.in_c * padded_frames];
-            for c in 0..self.in_c {
-                let row = &input[c * frames..(c + 1) * frames];
-                let dst = &mut buf[c * padded_frames..(c + 1) * padded_frames];
-                for i in 0..pad {
-                    dst[i] = row[pad - i];
+            let pad_workers = if self.in_c < 2 || buf.len() < 65_536 {
+                1
+            } else {
+                threads.clamp(1, 18)
+            };
+            row_workers::run_aligned(&mut buf, pad_workers, padded_frames, &|offset, slice| {
+                let first_c = offset / padded_frames;
+                for (local_c, dst) in slice.chunks_exact_mut(padded_frames).enumerate() {
+                    let c = first_c + local_c;
+                    let row = &input[c * frames..(c + 1) * frames];
+                    for i in 0..pad {
+                        dst[i] = row[pad - i];
+                    }
+                    dst[pad..pad + frames].copy_from_slice(row);
+                    for i in 0..pad {
+                        dst[pad + frames + i] = row[frames - 2 - i];
+                    }
                 }
-                dst[pad..pad + frames].copy_from_slice(row);
-                for i in 0..pad {
-                    dst[pad + frames + i] = row[frames - 2 - i];
-                }
-            }
+            });
             owned_padded = buf;
             &owned_padded
         };
 
         let mut out = vec![0.0_f32; self.out_c * frames];
+        if self.out_c == 0 || frames == 0 {
+            return Ok(out);
+        }
+        let work = self
+            .out_c
+            .saturating_mul(self.in_c)
+            .saturating_mul(self.kernel)
+            .saturating_mul(frames);
+        let workers = if self.out_c <= 1 || work < 65_536 {
+            1
+        } else {
+            threads.clamp(1, 18)
+        };
         let level = Level::new();
-        dispatch!(level, simd => {
-            for oc in 0..self.out_c {
-                let b = self.bias[oc];
-                let out_row = &mut out[oc * frames..(oc + 1) * frames];
-                out_row.fill(b);
-                if self.kernel == 1 {
-                    let w_row = &self.weight[oc * self.in_c..(oc + 1) * self.in_c];
-                    let mut ic = 0;
-                    while ic + 4 <= self.in_c {
-                        let r0 = &padded[ic * padded_frames..ic * padded_frames + frames];
-                        let r1 = &padded[(ic + 1) * padded_frames..(ic + 1) * padded_frames + frames];
-                        let r2 = &padded[(ic + 2) * padded_frames..(ic + 2) * padded_frames + frames];
-                        let r3 = &padded[(ic + 3) * padded_frames..(ic + 3) * padded_frames + frames];
-                        axpy4_simd(
-                            simd,
-                            [w_row[ic], w_row[ic + 1], w_row[ic + 2], w_row[ic + 3]],
-                            r0,
-                            r1,
-                            r2,
-                            r3,
-                            out_row,
-                        );
-                        ic += 4;
-                    }
-                    while ic < self.in_c {
-                        let in_row = &padded[ic * padded_frames..ic * padded_frames + frames];
-                        axpy_simd(simd, w_row[ic], in_row, out_row);
-                        ic += 1;
-                    }
-                } else {
-                    for ic in 0..self.in_c {
-                        let in_row = &padded[ic * padded_frames..(ic + 1) * padded_frames];
-                        let w_base = (oc * self.in_c + ic) * self.kernel;
-                        for k in 0..self.kernel {
-                            let w = self.weight[w_base + k];
-                            let offset = k * self.dilation;
-                            axpy_simd(simd, w, &in_row[offset..offset + frames], out_row);
+        row_workers::run_aligned(&mut out, workers, frames, &|offset, slice| {
+            let first_oc = offset / frames;
+            dispatch!(level, simd => {
+                for (local_oc, out_row) in slice.chunks_exact_mut(frames).enumerate() {
+                    let oc = first_oc + local_oc;
+                    let b = self.bias[oc];
+                    out_row.fill(b);
+                    if self.kernel == 1 {
+                        let w_row = &self.weight[oc * self.in_c..(oc + 1) * self.in_c];
+                        let mut ic = 0;
+                        while ic + 4 <= self.in_c {
+                            let r0 = &padded[ic * padded_frames..ic * padded_frames + frames];
+                            let r1 = &padded[(ic + 1) * padded_frames..(ic + 1) * padded_frames + frames];
+                            let r2 = &padded[(ic + 2) * padded_frames..(ic + 2) * padded_frames + frames];
+                            let r3 = &padded[(ic + 3) * padded_frames..(ic + 3) * padded_frames + frames];
+                            axpy4_simd(
+                                simd,
+                                [w_row[ic], w_row[ic + 1], w_row[ic + 2], w_row[ic + 3]],
+                                r0,
+                                r1,
+                                r2,
+                                r3,
+                                out_row,
+                            );
+                            ic += 4;
+                        }
+                        while ic < self.in_c {
+                            let in_row = &padded[ic * padded_frames..ic * padded_frames + frames];
+                            axpy_simd(simd, w_row[ic], in_row, out_row);
+                            ic += 1;
+                        }
+                    } else {
+                        for ic in 0..self.in_c {
+                            let in_row = &padded[ic * padded_frames..(ic + 1) * padded_frames];
+                            let w_base = (oc * self.in_c + ic) * self.kernel;
+                            for k in 0..self.kernel {
+                                let w = self.weight[w_base + k];
+                                let offset = k * self.dilation;
+                                axpy_simd(simd, w, &in_row[offset..offset + frames], out_row);
+                            }
                         }
                     }
+                    if apply_relu {
+                        relu_in_place_simd(simd, out_row);
+                    }
                 }
-                if apply_relu {
-                    relu_in_place_simd(simd, out_row);
-                }
-            }
+            });
         });
         Ok(out)
     }
@@ -579,6 +683,16 @@ pub struct SeRes2NetBlock {
 impl SeRes2NetBlock {
     /// Run one SE-Res2Net block on `[channels, frames]`.
     pub fn forward(&self, input: &[f32], frames: usize) -> io::Result<Vec<f32>> {
+        self.forward_parallel(input, frames, 1)
+    }
+
+    /// Run one SE-Res2Net block across up to `threads` channel workers.
+    pub fn forward_parallel(
+        &self,
+        input: &[f32],
+        frames: usize,
+        threads: usize,
+    ) -> io::Result<Vec<f32>> {
         let channels = self.tdnn1.in_c;
         if self.scale < 2
             || !channels.is_multiple_of(self.scale)
@@ -590,7 +704,7 @@ impl SeRes2NetBlock {
                 "Invalid SE-Res2Net block configuration.",
             ));
         }
-        let h = self.tdnn1.forward(input, frames, true)?;
+        let h = self.tdnn1.forward_parallel(input, frames, true, threads)?;
         let chunk_c = channels / self.scale;
         let chunk_len = chunk_c * frames;
         let mut res2net_out = vec![0.0_f32; channels * frames];
@@ -607,12 +721,14 @@ impl SeRes2NetBlock {
                 }
                 &prev
             };
-            let y = self.branches[i - 1].forward(branch_in, frames, true)?;
+            let y = self.branches[i - 1].forward_parallel(branch_in, frames, true, threads)?;
             res2net_out[i * chunk_len..(i + 1) * chunk_len].copy_from_slice(&y);
             prev = y;
         }
 
-        let h2 = self.tdnn2.forward(&res2net_out, frames, true)?;
+        let h2 = self
+            .tdnn2
+            .forward_parallel(&res2net_out, frames, true, threads)?;
         let mut gated = self.se.forward(&h2, frames)?;
         for (dst, &res) in gated.iter_mut().zip(input.iter()) {
             *dst += res;
@@ -633,6 +749,17 @@ pub struct AttentiveStatPool {
 impl AttentiveStatPool {
     /// Pool `[channels, frames]` into `[2 * channels]` weighted mean and standard deviation.
     pub fn forward(&self, input: &[f32], channels: usize, frames: usize) -> io::Result<Vec<f32>> {
+        self.forward_parallel(input, channels, frames, 1)
+    }
+
+    /// Pool `[channels, frames]` across up to `threads` workers.
+    pub fn forward_parallel(
+        &self,
+        input: &[f32],
+        channels: usize,
+        frames: usize,
+        threads: usize,
+    ) -> io::Result<Vec<f32>> {
         if frames == 0
             || input.len() != channels * frames
             || self.tdnn.in_c != channels * 3
@@ -664,11 +791,11 @@ impl AttentiveStatPool {
         }
 
         // Upstream applies TDNN (with ReLU), then tanh, then 1x1 conv.
-        let mut attn = self.tdnn.forward(&cat, frames, true)?;
+        let mut attn = self.tdnn.forward_parallel(&cat, frames, true, threads)?;
         for v in &mut attn {
             *v = v.tanh();
         }
-        let scores = self.conv.forward(&attn, frames, false)?;
+        let scores = self.conv.forward_parallel(&attn, frames, false, threads)?;
 
         let mut stats = vec![0.0_f32; channels * 2];
         let mut weights = Vec::with_capacity(frames);
@@ -723,11 +850,21 @@ pub struct EcapaSpeakerEncoder {
 impl EcapaSpeakerEncoder {
     /// Extract the 2048-dimensional speaker x-vector from a 24 kHz mono waveform.
     pub fn extract_xvector(&self, audio_24k: &[f32]) -> io::Result<Vec<f32>> {
-        let (mel, frames) = self.mel.extract(audio_24k)?;
-        let h0 = self.conv0.forward(&mel, frames, true)?;
-        let b1 = self.blocks[0].forward(&h0, frames)?;
-        let b2 = self.blocks[1].forward(&b1, frames)?;
-        let b3 = self.blocks[2].forward(&b2, frames)?;
+        self.extract_xvector_parallel(audio_24k, 1)
+    }
+
+    /// Extract the 2048-dimensional speaker x-vector using up to `threads` workers
+    /// with 0-ULP bit parity against [`Self::extract_xvector`].
+    pub fn extract_xvector_parallel(
+        &self,
+        audio_24k: &[f32],
+        threads: usize,
+    ) -> io::Result<Vec<f32>> {
+        let (mel, frames) = self.mel.extract_parallel(audio_24k, threads)?;
+        let h0 = self.conv0.forward_parallel(&mel, frames, true, threads)?;
+        let b1 = self.blocks[0].forward_parallel(&h0, frames, threads)?;
+        let b2 = self.blocks[1].forward_parallel(&b1, frames, threads)?;
+        let b3 = self.blocks[2].forward_parallel(&b2, frames, threads)?;
 
         let hidden = self.conv0.out_c;
         let mut cat = Vec::with_capacity(hidden * 3 * frames);
@@ -735,9 +872,11 @@ impl EcapaSpeakerEncoder {
         cat.extend_from_slice(&b2);
         cat.extend_from_slice(&b3);
 
-        let mfa_out = self.mfa.forward(&cat, frames, true)?;
-        let pooled = self.asp.forward(&mfa_out, hidden * 3, frames)?;
-        self.fc.forward(&pooled, 1, false)
+        let mfa_out = self.mfa.forward_parallel(&cat, frames, true, threads)?;
+        let pooled = self
+            .asp
+            .forward_parallel(&mfa_out, hidden * 3, frames, threads)?;
+        self.fc.forward_parallel(&pooled, 1, false, threads)
     }
 }
 
@@ -900,6 +1039,144 @@ mod tests {
         let xvec = encoder.extract_xvector(&audio)?;
         assert_eq!(xvec.len(), 8);
         assert!(xvec.iter().all(|v| v.is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    fn speaker_encoder_parallel_matches_sequential_bits() -> std::io::Result<()> {
+        let cfg = AudioMelConfig {
+            sample_rate: 24_000,
+            n_fft: 64,
+            hop: 8,
+            n_mels: 16,
+            fmin: 0.0,
+            fmax: 12_000.0,
+        };
+        let mel = MelSpectrogramExtractor::new(cfg)?;
+        let audio: Vec<f32> = (0..1024)
+            .map(|i| (f32::from(u16::try_from(i % 73).unwrap_or(0)) * 0.05).sin())
+            .collect();
+        let (seq_mel, frames) = mel.extract(&audio)?;
+        assert!(frames >= 64);
+
+        let hidden = 24_usize;
+        let scale = 3_usize;
+        let make_block = |dilation: usize| SeRes2NetBlock {
+            tdnn1: TdnnConv1d {
+                out_c: hidden,
+                in_c: hidden,
+                kernel: 1,
+                dilation: 1,
+                weight: (0..hidden * hidden)
+                    .map(|i| (f32::from(u8::try_from(i % 13).unwrap_or(0)) - 6.0) * 0.01)
+                    .collect(),
+                bias: vec![0.01; hidden],
+            },
+            branches: (0..(scale - 1))
+                .map(|b| TdnnConv1d {
+                    out_c: hidden / scale,
+                    in_c: hidden / scale,
+                    kernel: 3,
+                    dilation,
+                    weight: (0..(hidden / scale) * (hidden / scale) * 3)
+                        .map(|i| (f32::from(u8::try_from((i + b) % 11).unwrap_or(0)) - 5.0) * 0.01)
+                        .collect(),
+                    bias: vec![0.0; hidden / scale],
+                })
+                .collect(),
+            tdnn2: TdnnConv1d {
+                out_c: hidden,
+                in_c: hidden,
+                kernel: 1,
+                dilation: 1,
+                weight: vec![0.02; hidden * hidden],
+                bias: vec![0.0; hidden],
+            },
+            se: SqueezeExcitation {
+                conv1: TdnnConv1d {
+                    out_c: 6,
+                    in_c: hidden,
+                    kernel: 1,
+                    dilation: 1,
+                    weight: vec![0.05; 6 * hidden],
+                    bias: vec![0.0; 6],
+                },
+                conv2: TdnnConv1d {
+                    out_c: hidden,
+                    in_c: 6,
+                    kernel: 1,
+                    dilation: 1,
+                    weight: vec![0.05; hidden * 6],
+                    bias: vec![0.0; hidden],
+                },
+            },
+            scale,
+        };
+        let mfa_c = hidden * 3;
+        let encoder = EcapaSpeakerEncoder {
+            mel,
+            conv0: TdnnConv1d {
+                out_c: hidden,
+                in_c: 16,
+                kernel: 5,
+                dilation: 1,
+                weight: (0..hidden * 16 * 5)
+                    .map(|i| (f32::from(u16::try_from(i % 19).unwrap_or(0)) - 9.0) * 0.01)
+                    .collect(),
+                bias: vec![0.01; hidden],
+            },
+            blocks: [make_block(2), make_block(3), make_block(4)],
+            mfa: TdnnConv1d {
+                out_c: mfa_c,
+                in_c: mfa_c,
+                kernel: 1,
+                dilation: 1,
+                weight: vec![0.01; mfa_c * mfa_c],
+                bias: vec![0.0; mfa_c],
+            },
+            asp: AttentiveStatPool {
+                tdnn: TdnnConv1d {
+                    out_c: 8,
+                    in_c: mfa_c * 3,
+                    kernel: 1,
+                    dilation: 1,
+                    weight: vec![0.01; 8 * mfa_c * 3],
+                    bias: vec![0.0; 8],
+                },
+                conv: TdnnConv1d {
+                    out_c: mfa_c,
+                    in_c: 8,
+                    kernel: 1,
+                    dilation: 1,
+                    weight: vec![0.01; mfa_c * 8],
+                    bias: vec![0.0; mfa_c],
+                },
+            },
+            fc: TdnnConv1d {
+                out_c: 16,
+                in_c: mfa_c * 2,
+                kernel: 1,
+                dilation: 1,
+                weight: vec![0.02; 16 * mfa_c * 2],
+                bias: vec![0.01; 16],
+            },
+        };
+        let seq_xvec = encoder.extract_xvector(&audio)?;
+        for threads in [2_usize, 4, 8] {
+            let (par_mel, par_frames) = encoder.mel.extract_parallel(&audio, threads)?;
+            assert_eq!(par_frames, frames);
+            assert_eq!(
+                par_mel.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                seq_mel.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mel threads {threads}"
+            );
+            let par_xvec = encoder.extract_xvector_parallel(&audio, threads)?;
+            assert_eq!(
+                par_xvec.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                seq_xvec.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "xvec threads {threads}"
+            );
+        }
         Ok(())
     }
 }

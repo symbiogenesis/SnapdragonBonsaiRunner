@@ -367,7 +367,7 @@ impl Synthesizer {
                             "Speech voice model must be Base.",
                         )));
                     }
-                    let speaker = rust_codec::Speaker::load(weights)
+                    let speaker = rust_codec::Speaker::load(weights, *threads)
                         .map_err(|error| SynthesisStage::SpeakerWeights.failure(error))?
                         .extract_cancellable(samples, &mut || (cancel.borrow_mut())())
                         .map_err(|error| SynthesisStage::SpeakerExtraction.failure(error))?;
