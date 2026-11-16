@@ -6,11 +6,17 @@ app, broker, provisioning and release integration. The
 [compiled release lock](../config/prism-inference.lock.json) is authoritative for
 the runtime version, source, archive and installed file identities.
 
-The development default is Prism **0.1.30**, original Swift PQ2, four CPU row
-workers, K4/V4 cache and the standard adapter at scale 1.3. Supported X2 workers
+The development default is Prism **0.1.30**, original Swift PQ2, eight CPU row
+workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (four when the host
+family is unknown or in fixed-four qualification controls), K4/V4 cache and the
+standard adapter at scale 1.3. Supported X2 workers
 attempt [resident Hexagon `native-q2`](hexagon.md), retaining CPU execution when
 accelerator initialization is unavailable. Trusted `--placement cpu` explicitly
-selects CPU execution. These placement choices preserve the engine and weights;
+selects CPU execution, and explicit `--cpu-prefill-tokens 8|16|32`
+(`-CpuPrefillTokens` / `cpuPrefillTokens`) enables CPU tiled FFN prefill with
+exact `--cpu-prefill-scratch-bytes` and `:cpu-tiled-ffn-v1:{tokens}` readiness
+verification on Prism 0.1.30 (skipping implicit Hexagon installation and
+reporting effective CPU projection). These placement choices preserve the engine and weights;
 `--publisher-engine` separately selects the pinned publisher rollback. Failures
 never silently switch engines, weights or cache precision.
 
@@ -243,8 +249,9 @@ separate NPU transport, operation lifetime and signed-solver boundaries.
 ## Bounded parallel-row qualification
 
 Runner admits explicit `--native-row-workers 1|4|8|12` for the reviewed parallel
-release and defaults omitted live host launches to `8` on Snapdragon X1 (four
-otherwise; pure CLI/plan parsers remain host-independent at `4`), while trusted
+release and defaults omitted live host launches to `8` on Snapdragon X1 and
+Snapdragon X2 Elite Extreme (`4` otherwise; pure CLI/plan parsers remain
+host-independent at `4`), while trusted
 `bonsai-tools chat --native-row-workers 1` selects serial execution. A persistent pool and
 readiness identity establish availability, not correctness or benefit.
 

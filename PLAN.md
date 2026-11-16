@@ -890,9 +890,16 @@ nor editing the available Abliteration factors.
   `weights_and_fixed_runtime_bytes` per packing (`PQ2_0` vs `PTQ1_0` against the
   `11 GiB` `FIXED_RUNTIME_BYTES` baseline) and separating append-only copy-on-write
   sealed-page KV admission (`live_kv_copies = 1` + bounded mutable tail, saving up
-  to `~4.1 GiB` physical KV at 262,144 `K4/V4` tokens) from arbitrary non-extending
-  divergent `2×` rollback admission under verified eviction/rollback contracts.
-  Deferred screening leads `#16` (aligned staging reuse), `#17` (optional Windows
+  to `~4.1 GiB` physical KV at 262,144 `K4/V4` tokens; `physical_cow_kv_bytes` and
+  `physical_cow_footprint_bytes` telemetry helpers are implemented in `cpu-policy`
+  and `bonsai-chat`) from arbitrary non-extending divergent `2×` rollback admission
+  under verified eviction/rollback contracts.
+  Runner (`bonsai-windows-credentials`/`bonsai-artifacts`) now uses mapped
+  `PrefetchVirtualMemory` + cancellable `4 MiB` chunked CNG SHA-256 verification
+  (`>= 4 MiB`), and post-`0.1.30` `prism-inference` `main` implements zero-copy
+  `MappedSlice` GGUF mapping + 8-worker parallel tensor payload validation (pending
+  a reviewed Foundation release repin and X1/X2 device qualification). Deferred
+  screening leads `#16` (aligned staging reuse), `#17` (optional Windows
   unbuffered direct I/O) and `#18` (owned tensor range mapping, read-only Swift
   views and host/NPU deduplication) remain gated behind measured cold-start/I/O/mapping
   bottlenecks and retained-handle/alignment/Job-commit contracts.
@@ -1135,9 +1142,15 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   scratch, scalar/NEON identity and complete-request cost.
 - [ ] Bound selected CPU screens to at most four NEON layouts on three shapes
   and at most two exact LUT candidates before choosing further integration.
-- [ ] Integrate further selected cross-token and 8/16/32-token tiled-prefill
-  consumers, preserving transformed bases, causal state, bounded scratch and
-  rollback before timing the complete request.
+- [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32` (wired end-to-end across
+  `bonsai-cpu-policy` `swift_tiled_prefill_scratch_bytes`, `bonsai-tools`,
+  `bonsai-chat` and `bonsai-broker` `:cpu-tiled-ffn-v1:{tokens}` readiness on
+  pinned Prism `0.1.30`) plus post-`0.1.30` `prism-inference` `main` CPU source
+  candidates (zero-alloc spin-then-park `NativeRowPool` replacing `rayon::ThreadPool`,
+  and bit-exact `G in {2, 3, 6}` grouped GQA packed-KV attention; pending a reviewed
+  release repin and X1/X2 qualification), and integrate further selected cross-token
+  and 8/16/32-token tiled-prefill consumers preserving transformed bases, causal
+  state, bounded scratch and rollback before timing the complete request.
 - [ ] Use signed constant floor division only inside a measured parent hotspot
   with unchanged rounding/rejection and charged setup/dispatch costs.
 - [ ] After the selected CPU candidate's acceptance, review
@@ -1211,7 +1224,7 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   GPU `Q2_0` projections), `CompositeProjectionExecutor`, `CompositeTelemetry`,
   `HybridPrefillCoordinator`, Runner `bonsai-broker` `"hexagon-native-q2-partial"`
   (`v73`/`v81`) startup readiness admission, Runner `1|4|8|12` row-worker admission
-  with Snapdragon X1 `8`-worker live host default, and Prism per-group
+  with Snapdragon X1/X2 `8`-worker live host default, and Prism per-group
   `Transforms::project_group_into_with_executor` CPU sibling dispatch under partial
   executors under [Hexagon policy](docs/hexagon.md).
 - [ ] Qualify the pinned model-thread initialization/readiness handshake
@@ -1221,11 +1234,16 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Qualify existing full-FFN chains, sibling packets, multi-tile N=1 and
   tile-major reuse independently. Implement true N>1 prefill only with a supported
   signed solver, causal state, bounded VTCM/DMA and measured total-cost benefit.
-- [ ] Support rank-one/low-rank LoRA side-branches alongside Hexagon's fused
-  `ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU + ffn_down` VTCM chain (on sibling CPU
+- [ ] Qualify post-`0.1.30` `prism-inference` `main` per-layer active-target gating
+  (`adapter_affects_any`), which keeps `external_ffn_chain` active when
+  `[ffn_gate, ffn_up, ffn_down]` have no active LoRA and unlocks `external_ffn_swiglu`
+  across all 64 Swift layers under active `RankOneAdapter` (preserving original-basis
+  `up` for CPU `ffn_down` plus LoRA delta; pending release repin and device
+  qualification), and support rank-one/low-rank LoRA side-branches alongside
+  Hexagon's full `ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU + ffn_down` VTCM chain (on sibling CPU
   workers or explicit side-branch tensors without splitting intermediate FFN
   activations back to host DRAM) so daily-use standard LoRA (`scale 1.3`) retains
-  fused NPU packet execution under [Hexagon policy](docs/hexagon.md#resident-packets-and-prefill).
+  full fused NPU packet execution including `ffn_down` under [Hexagon policy](docs/hexagon.md#resident-packets-and-prefill).
 - [ ] Integrate remaining RMSNorm/RoPE/attention/conv/GDN VTCM chains only where
   signed operation support, transformed bases, full-state ownership and measured
   benefit justify placement.
@@ -1363,9 +1381,11 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 - [ ] **#23 — Weight-stationary multirow decode.** Evaluate reusing quantized
   activation blocks across multiple output rows on X1/X2, measuring register
   pressure and L1/L2 cache behavior while preserving per-block reduction order.
-  Implemented in source (physical X1 throughput, parity and power qualification
+  Implemented in source (physical X1/X2 throughput, parity and power qualification
   open): Prism `16`-row `PQ2`/`Q8_0`/`PTQ1` SIMD tiles, X1 `3`-head/`2`-head
-  grouped attention and `[token][head]` F16-packed `4`-head decode,
+  grouped attention, `[token][head]` F16-packed `4`-head decode, and post-`0.1.30`
+  bit-exact `G in {2, 3, 6}` grouped GQA packed-KV attention + zero-alloc
+  spin-then-park `NativeRowPool`,
   `bonsai-speech-tts` `4`-row `Q8_0`/`Q4_K`/`Q6_K` SIMD tiles in
   `src/speech-tts/src/engine/packed.rs`, `bonsai-speech-asr` bit-exact non-FMA
   `1x4`/`4x8` `F32`/`Q8_0` SIMD tiles, 4-frame `mixed_fft_4` frontend, batched
@@ -1373,8 +1393,8 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   TTS / `(8, 10)` ASR thread budgets / `SpeculationPolicy` /
   `"runner-x1-cpu-evaluation-plan"` (`d8-p12`) in `cpu-policy` / `bonsai-tools`,
   Prism server `--cpu-family x1|x2`, `--spec-type none|suffix`, and
-  `--draft-max 1..=8`, Runner `1|4|8|12` row-worker admission with Snapdragon X1
-  `8`-worker live host default, Prism per-group CPU sibling dispatch under partial
+  `--draft-max 1..=8`, Runner `1|4|8|12` row-worker admission with Snapdragon X1/X2
+  `8`-worker live host default and end-to-end `--cpu-prefill-tokens 8|16|32`, Prism per-group CPU sibling dispatch under partial
   executors, Prism tiled (`ProjectionTile`) / head-major 4-query parallel
   `SwiftVisionEncoder` (with parallel `LayerNorm` & bicubic resize), and
   `bonsai-chat` scanline RGBA box downscaling / chunked BGRX normalization.

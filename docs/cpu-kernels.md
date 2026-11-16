@@ -72,8 +72,12 @@ change neither the selected runtime nor the existing candidate/promotion order.
 ## Prompt and attention consumers
 
 The pinned source includes these consumers. Parallel quantized attention serves
-the selected packed-cache path; explicit prompt tiles and sampled suffixes remain
-outside ordinary Runner launch policy:
+the selected packed-cache path; explicit `--cpu-prefill-tokens 8|16|32` prompt
+tiling is wired end-to-end through `bonsai-cpu-policy`, `bonsai-tools`, `bonsai-chat`
+and `bonsai-broker` (omitted by default, pairing exact `--cpu-prefill-scratch-bytes`
+and `:cpu-tiled-ffn-v1:{tokens}` readiness on Prism `0.1.30` while disabling
+implicit Hexagon placement), and sampled suffixes remain outside ordinary Runner
+launch policy:
 
 | Consumer | Contract |
 | --- | --- |
@@ -94,6 +98,23 @@ requirements. The 0.1.30 binary delivery includes its source-bound helper
 implementations; it does not establish model parity, benefit or profile promotion. Changed
 helper registry APIs still require publication before dependent registry crates; binary
 delivery does not establish that separate publication.
+
+### Post-0.1.30 runtime candidates (pending release repin and device qualification)
+
+Post-`0.1.30` `prism-inference` `main` source includes two additional CPU runtime
+optimizations (verified in local unit/workspace checks; awaiting a reviewed
+Foundation release repin, hosted CI and X1/X2 device qualification):
+
+- **Zero-allocation spin-then-park `NativeRowPool`:** Replaces `rayon::ThreadPool`
+  across parallel row, sibling and tile kernels (`kernels::parallel`) with a
+  fixed-worker atomic-generation spin-then-park pool, eliminating per-dispatch heap
+  allocations and Rayon thread-pool wake overhead while preserving task/error order.
+- **Bit-exact grouped GQA packed-KV attention (`G in {2, 3, 6}`):** Introduces
+  `PreparedQueryGroup<'a, const G: usize>` and `ValueGroupAccumulator<'a, const G: usize>`
+  across NEON and portable `kv_quant` paths, decoding each shared packed K/V record
+  once per KV head across all `G` query heads in both decode (`6:1` for Swift's
+  24 query / 4 KV heads) and tiled prefill while preserving exact binary32/binary64
+  rounding and reduction order.
 
 ## CPU preparation candidates
 

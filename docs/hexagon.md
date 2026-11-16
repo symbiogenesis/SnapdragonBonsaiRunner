@@ -7,7 +7,7 @@ when the verified signed GenieX v0.10.0 package and CDSP driver are available.
 The expected DSP file is `<data_directory>/hexagon/runtime/libggml-htp-v81.so`.
 When those prerequisites are absent, the [Rust runtime][rust-runtime] retains CPU
 inference, defaulting omitted live host launches to eight NEON row workers on
-Snapdragon X1 and four otherwise (admitting explicit
+Snapdragon X1 and Snapdragon X2 Elite Extreme (`X2`), and four otherwise (admitting explicit
 `--native-row-workers 1|4|8|12`).
 
 The fixed placement (`DEFAULT_NATIVE_Q2_PROJECTIONS`) covers 168 `PQ2_0`
@@ -57,10 +57,18 @@ end-to-end serving qualification.
 The native-Q2 executor submits the existing gate/up, SwiGLU, optional supported
 Hadamard, down and optional residual chain in one correlated packet. Operation/tensor
 pairs are 4/12, 5/14, 5/15 and 6/17. Borrowed and owned sessions retain checked handles,
-dimensions, cache flushes and exact response correlation. Adapters currently disable this
-fused chain; arbitrary signs and grouped rotations are unsupported. The optional down
-Hadamard requires every authored sign to be positive one. Preserving fused VTCM execution
-under daily-use standard LoRA (`scale 1.3`) requires evaluating rank-one/low-rank adapter
+dimensions, cache flushes and exact response correlation. Under pinned Prism 0.1.30, adapters disable this
+fused chain; post-0.1.30 `prism-inference` `main` source (pending a reviewed release
+repin and X1/X2 device qualification) uses per-layer active-target gating
+(`adapter_affects_any`) so `external_ffn_chain` stays enabled whenever
+`[ffn_gate, ffn_up, ffn_down]` have no active LoRA (`scale == 0.0` or untargeted
+layer) and `external_ffn_swiglu` (`ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU`) runs
+across all 64 Swift layers under active `RankOneAdapter` (which targets only
+residual writers and `token_embd`, preserving original-basis `up` for CPU
+`ffn_down` plus its LoRA delta). Arbitrary signs and grouped rotations are
+unsupported, and the optional down Hadamard requires every authored sign to be
+positive one. Retaining full `ffn_down`-inclusive VTCM chain fusion under
+nonzero `ffn_down` LoRA still requires evaluating rank-one/low-rank adapter
 side-branches alongside the correlated NPU packet (on sibling CPU row workers or explicit
 side-branch tensors) without splitting intermediate FFN activations back to host DRAM.
 

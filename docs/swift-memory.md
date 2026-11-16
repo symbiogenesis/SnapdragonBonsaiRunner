@@ -1,8 +1,12 @@
 # Swift artifacts, memory and PTQ1
 
-**Original PQ2 on native Rust Prism 0.1.30 is the development default**, with four
-CPU row workers, standard adapter scale 1.3 and [X2 NPU placement](hexagon.md) when initialization
-succeeds. `--publisher-engine` explicitly selects rollback; PTQ1 remains opt-in.
+**Original PQ2 on native Rust Prism 0.1.30 is the development default**, with eight
+CPU row workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (`X2`; four when
+the host family is unknown or in fixed-four qualification controls), standard adapter
+scale 1.3 and [X2 NPU placement](hexagon.md) when initialization
+succeeds. `--publisher-engine` explicitly selects rollback; PTQ1 remains opt-in,
+and explicit `--cpu-prefill-tokens 8|16|32` enables CPU tiled FFN prefill with
+exact `--cpu-prefill-scratch-bytes` reservation.
 Creative quality, performance and daily-service isolation remain unqualified.
 The [Qwen reference](model-selection.md) has a separate
 lock/profile; no local training or fine-tuning is planned.
@@ -195,8 +199,9 @@ default native Rust engine. `--publisher-engine` selects the explicit publisher 
 rollback; direct app/broker launches also accept `--use-repacked-ptq1`. The artifact
 handle stays verified/held through owned teardown. Arbitrary paths, checkpoint
 substitutions and missing-file fallback are unsupported. Service implementation
-alone does not establish release qualification. Native chat defaults
-to four row workers, with explicit one-worker selection. Publisher rollback keeps
+alone does not establish release qualification. Live native chat defaults
+to eight row workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (four otherwise),
+with explicit `1|4|8|12` selection. Publisher rollback keeps
 its separate fixed four-thread CPU policy. Separate source-checker evidence does not qualify app TPS.
 The default NPU placement selects original PQ2 projections, not PTQ1 tensors.
 
@@ -279,7 +284,11 @@ fit the metadata allowance; codec storage, prepared rows and fixed checkpoint
 costs stay in the fixed allowance and minimum 1 GiB state/checkpoint allowance.
 Shared pages do not reduce admission because
 divergent requests may retain the old cache. Tiled prefill and speculation need
-separate additive reservations.
+separate additive reservations: `swift_tiled_prefill_scratch_bytes` and
+`SwiftContextPlan::for_profile_with_prefill` / `for_profile_with_options` charge
+exact Prism 0.1.30 `--cpu-prefill-scratch-bytes` (`8`, `16` or `32` tokens)
+into both the child `--memory-limit-bytes` Job budget and pre-spawn physical
+reserve before artifact I/O.
 
 Capacity rounds down to 256-token pages, reserves the 4,096-token reply cap and
 64-token template margin, and never exceeds Swift's 262,144-token model limit.
@@ -327,12 +336,16 @@ and `M1`–`M3` Job-commit measurements land:
    non-extending turns release prior committed pages before replacement—Prism's immutable
    64-token sealed-page sharing keeps physical KV residency bounded by `1×` occupied context
    plus one mutable 64-token tail page (`~4.1 GiB` physical saving at 262,144 `K4/V4` tokens).
-   Crediting single-copy sealed pages in admission requires a separately verified execution
-   shape and rollback/eviction contract.
+   `SwiftContextPlan::physical_cow_kv_bytes` and `SwiftContextPlan::physical_cow_footprint_bytes`
+   now expose this 64-token sealed-page copy-on-write physical accounting for UI/telemetry
+   reporting while retaining conservative `2×` rollback admission until eviction/rollback
+   qualification closes.
 
 Publisher serving receives `--ctx-size`. Native serving receives paired
-`--context-tokens` and `--memory-limit-bytes`. Runner enables cache-aware sizing,
-full-context K4/V4, four workers and latest-prefix capabilities only for the
+`--context-tokens` and `--memory-limit-bytes` (plus `--cpu-prefill-tokens` and
+`--cpu-prefill-scratch-bytes` when CPU tiled prefill is selected). Runner enables cache-aware sizing,
+full-context K4/V4, live-host eight-worker defaults on X1/X2, tiled prefill, and
+latest-prefix capabilities only for the
 verified source/file identities in the [runtime lock](../config/prism-inference.lock.json).
 A version string cannot enable them. The prepared K4/V3 planner remains gated
 off until a reviewed bundle delivers its numerical and M1/M2 accounting contracts.
@@ -465,8 +478,16 @@ Runner and the pinned Rust runtime independently hash every model byte through
 Windows CNG while retaining verified read-only handles (`2 × 7.21 GB ≈ 14.4 GB`
 sequential bytes read for `PQ2_0`). Neither pass trusts cached digests or
 timestamps, making `1×` cold NVMe read throughput and `1×` warm multicore
-`SHA256` RAM bandwidth the lossless startup floor. Hashing, census and export
-use bounded buffers.
+`SHA256` RAM bandwidth the lossless startup floor. Runner (`bonsai-windows-credentials`
+and `bonsai-artifacts`) uses read-only Windows file mapping (`MIN_MAPPED_HASH_BYTES = 4 MiB`)
+with `16 MiB` `PrefetchVirtualMemory` windows and cancellable `4 MiB` chunked CNG
+SHA-256 verification (retaining buffered fallback for smaller/unmappable inputs).
+In post-`0.1.30` `prism-inference` `main` source (pending a reviewed release repin and
+X1/X2 device qualification), `bonsai-gguf` and `bonsai-native-hash` likewise map
+`>= 4 MiB` GGUF files zero-copy (`MappedSlice`) with `16 MiB` `PrefetchVirtualMemory`,
+`4 MiB` chunked CNG SHA-256, and up to 8-worker parallel tensor payload validation.
+Cross-process handle inheritance and `#18` host/NPU deduplication remain deferred
+(see below). Hashing, census and export use bounded buffers.
 
 The publisher [loader](https://github.com/PrismML-Eng/llama.cpp/blob/73bfe6cc485554822f80c473a3c0c4f25e80f41b/src/llama-model-loader.cpp)
 can map eligible CPU tensors directly; other buffer types may copy them. Its
