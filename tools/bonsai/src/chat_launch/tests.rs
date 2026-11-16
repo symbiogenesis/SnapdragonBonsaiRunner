@@ -1229,7 +1229,7 @@ fn explicit_rust_runtime_survives_early_window_and_backend_preparation() -> crat
         true,
         Some(bonsai_cpu_policy::hardware::SnapdragonFamily::X2EliteExtreme),
     )?;
-    assert_eq!(x2_plan.request.native_row_workers, Some(4));
+    assert_eq!(x2_plan.request.native_row_workers, Some(8));
     Ok(())
 }
 
@@ -1546,6 +1546,43 @@ fn renderer_guidance_uses_only_the_selected_adapter_record() -> crate::Result<()
         let guidance = graphics_failure_guidance(101, &format!("{unrelated}\n{panic}"))
             .ok_or("Missing graphics guidance.")?;
         assert!(!guidance.contains("was selected"));
+    }
+    Ok(())
+}
+
+#[test]
+fn cpu_prefill_tokens_validate_and_forward_in_chat_launch() -> crate::Result<()> {
+    for tokens in [8_u8, 16, 32] {
+        let mut f = fixture(&format!("prefill-{tokens}"))?;
+        f.request["NativeEngine"] = json!(true);
+        f.request["NoSpeechModels"] = json!(true);
+        f.request["CpuPrefillTokens"] = json!(tokens);
+        let mut recorder = Recorder::new(f.root);
+        let result = prepare_backend(plan(f.request)?, &mut recorder, &f.working)?;
+        let args = result["Arguments"]
+            .as_array()
+            .ok_or("Missing launch arguments.")?;
+        let token_text = tokens.to_string();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--cpu-prefill-tokens" && pair[1] == token_text)
+        );
+    }
+    let bad_fixture = fixture("invalid-prefill")?;
+    for patch in [
+        json!({"NativeEngine": false, "CpuPrefillTokens": 8}),
+        json!({"NativeEngine": true, "CpuPrefillTokens": 4}),
+        json!({"NativeEngine": true, "CpuPrefillTokens": 64}),
+        json!({"NativeEngine": true, "CpuPrefillTokens": "8"}),
+        json!({"NativeEngine": true, "CpuPrefillTokens": null}),
+    ] {
+        let mut request = bad_fixture.request.clone();
+        if let (Some(target), Some(patch_obj)) = (request.as_object_mut(), patch.as_object()) {
+            for (k, v) in patch_obj {
+                target.insert(k.clone(), v.clone());
+            }
+        }
+        assert!(plan(request).is_err());
     }
     Ok(())
 }

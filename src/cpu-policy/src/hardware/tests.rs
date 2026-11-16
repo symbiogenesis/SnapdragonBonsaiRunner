@@ -75,7 +75,7 @@ fn snapdragon_evidence_preserves_x2_extreme_and_rejects_family_relabeling() {
     );
     assert_eq!(
         SnapdragonFamily::default_native_row_workers(Some(SnapdragonFamily::X2EliteExtreme)),
-        4
+        8
     );
     assert_eq!(SnapdragonFamily::default_native_row_workers(None), 4);
 }

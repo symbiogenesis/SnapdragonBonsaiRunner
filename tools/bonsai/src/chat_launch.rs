@@ -135,6 +135,12 @@ struct Request {
     kv_cache: Option<KvCache>,
     #[serde(
         default,
+        deserialize_with = "requested_cpu_prefill_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cpu_prefill_tokens: Option<u8>,
+    #[serde(
+        default,
         deserialize_with = "requested_placement",
         skip_serializing_if = "Option::is_none"
     )]
@@ -190,6 +196,20 @@ where
     KvCache::deserialize(deserializer).map(Some)
 }
 
+fn requested_cpu_prefill_tokens<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let tokens = u8::deserialize(deserializer)?;
+    if matches!(tokens, 8 | 16 | 32) {
+        Ok(Some(tokens))
+    } else {
+        Err(serde::de::Error::custom(
+            "CpuPrefillTokens must be 8, 16 or 32.",
+        ))
+    }
+}
+
 fn requested_placement<'de, D>(deserializer: D) -> Result<Option<Placement>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -231,6 +251,14 @@ impl Request {
         }
         if self.kv_cache.is_some() && !self.native_engine {
             return Err("KvCache requires NativeEngine.".into());
+        }
+        if let Some(tokens) = self.cpu_prefill_tokens {
+            if !self.native_engine {
+                return Err("CpuPrefillTokens requires NativeEngine.".into());
+            }
+            if !matches!(tokens, 8 | 16 | 32) {
+                return Err("CpuPrefillTokens must be 8, 16 or 32.".into());
+            }
         }
         if self.placement.is_some() && !self.native_engine {
             return Err("Placement requires NativeEngine.".into());
@@ -748,6 +776,9 @@ fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
     }
     if let Some(policy) = request.kv_cache {
         argument(arguments, "--kv-cache", policy.name());
+    }
+    if let Some(tokens) = request.cpu_prefill_tokens {
+        argument(arguments, "--cpu-prefill-tokens", tokens.to_string());
     }
     if let Some(placement) = request.placement {
         argument(arguments, "--placement", placement.name());

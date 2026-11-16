@@ -55,9 +55,10 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  --frontend-port <0-or-1024..65535> [--backend-port <1024..65535>]\n",
     "  [--profile <reference-cpu|swift-pq2-assessment>]\n",
     "  [--native-engine|--publisher-engine] (Swift defaults to the pinned Rust runtime; publisher is explicit rollback)\n",
-    "  [--native-row-workers 1|4|8|12] (Rust defaults to 8 on Snapdragon X1 or 4 otherwise; publisher supports only 1)\n",
+    "  [--native-row-workers 1|4|8|12] (Rust defaults to 8 on Snapdragon X1/X2 or 4 otherwise; publisher supports only 1)\n",
     "  [--prompt-reuse disabled|latest] (experimental exact latest-state reuse; Rust only)\n",
     "  [--kv-cache f16|rsq4|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
+    "  [--cpu-prefill-tokens 8|16|32] (reviewed native runtime only; enables layer-major CPU FFN tile prefill)\n",
     "  [--placement auto|cpu] (native Swift only; CPU requires a reviewed compatible release)\n",
     "  [--reset-on-cancel] (reviewed native runtime only; reset live state in place on client cancel)\n",
     "  [--no-mmproj] (disable multimodal vision projector; Swift only)\n",
@@ -142,6 +143,7 @@ pub struct LaunchConfig {
     native_row_workers: u8,
     latest_prompt_reuse: bool,
     kv_cache: Option<crate::inference::KvCache>,
+    cpu_prefill_tokens: Option<u8>,
     placement: crate::inference::Placement,
     reset_on_cancel: bool,
     no_mmproj: bool,
@@ -209,7 +211,7 @@ impl LaunchConfig {
         let mut check_only = false;
         let mut native_engine = None;
         let (mut native_row_workers, mut latest_prompt_reuse) = (None, None);
-        let (mut kv_cache, mut placement) = (None, None);
+        let (mut kv_cache, mut cpu_prefill_tokens, mut placement) = (None, None, None);
         let mut reset_on_cancel = false;
         let mut no_mmproj = false;
         let mut use_abliterate_lora = false;
@@ -239,6 +241,11 @@ impl LaunchConfig {
                 }
                 Some("--kv-cache") if kv_cache.is_none() => {
                     kv_cache = Some(crate::inference::KvCache::parse(args.next().as_deref())?);
+                }
+                Some("--cpu-prefill-tokens") if cpu_prefill_tokens.is_none() => {
+                    cpu_prefill_tokens = Some(crate::inference::parse_cpu_prefill_tokens(
+                        args.next().as_deref(),
+                    )?);
                 }
                 Some("--placement") if placement.is_none() => {
                     placement = Some(crate::inference::Placement::parse(args.next().as_deref())?);
@@ -302,9 +309,13 @@ impl LaunchConfig {
         });
         let latest_prompt_reuse = latest_prompt_reuse.unwrap_or(false);
         let kv_cache = crate::inference::pinned_kv_cache(native_engine, kv_cache)?;
-        if placement.is_some() && profile != LaunchProfile::SwiftPq2Assessment {
+        if (cpu_prefill_tokens.is_some() || placement.is_some())
+            && profile != LaunchProfile::SwiftPq2Assessment
+        {
             return Err(LaunchError::Arguments);
         }
+        let cpu_prefill_tokens =
+            crate::inference::pinned_cpu_prefill_tokens(native_engine, cpu_prefill_tokens)?;
         let placement = crate::inference::pinned_placement(native_engine, placement)?;
         let configuration = Self {
             data: data.ok_or(LaunchError::Arguments)?,
@@ -320,6 +331,7 @@ impl LaunchConfig {
             native_row_workers,
             latest_prompt_reuse,
             kv_cache,
+            cpu_prefill_tokens,
             placement,
             reset_on_cancel,
             no_mmproj,
@@ -351,6 +363,7 @@ impl LaunchConfig {
                 && (!self.requires_native_sandbox() || !self.native_engine))
             || (self.native_row_workers != 1 && !self.native_engine)
             || (self.latest_prompt_reuse && !self.native_engine)
+            || (self.cpu_prefill_tokens.is_some() && !self.native_engine)
             || (self.reset_on_cancel && !self.native_engine)
             || (self.no_mmproj && !swift)
             || (self.use_abliterate_lora && !swift)
@@ -452,11 +465,13 @@ impl LaunchConfig {
         &self,
         available_bytes: u64,
     ) -> Result<bonsai_cpu_policy::context::SwiftContextPlan, LaunchError> {
-        bonsai_cpu_policy::context::SwiftContextPlan::for_profile(
+        let (plan, _) = bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_prefill(
             available_bytes,
             self.swift_context_profile()?,
+            self.cpu_prefill_tokens.map(usize::from),
         )
-        .map_err(|_| LaunchError::Memory)
+        .map_err(|_| LaunchError::Memory)?;
+        Ok(plan)
     }
 
     fn initial_memory_admission(&self, plan: &LaunchPlan) -> Result<(), LaunchError> {
@@ -707,6 +722,14 @@ impl LaunchConfig {
         if let Some(policy) = self.kv_cache {
             arguments.extend([OsString::from("--kv-cache"), OsString::from(policy.name())]);
         }
+        if let Some((tokens, scratch_bytes)) = plan.cpu_prefill {
+            arguments.extend([
+                OsString::from("--cpu-prefill-tokens"),
+                OsString::from(tokens.to_string()),
+                OsString::from("--cpu-prefill-scratch-bytes"),
+                OsString::from(scratch_bytes.to_string()),
+            ]);
+        }
         if self.placement == crate::inference::Placement::Cpu {
             arguments.extend([OsString::from("--placement"), OsString::from("cpu")]);
         }
@@ -942,19 +965,21 @@ impl LaunchConfig {
                     .saturating_mul(bonsai_cpu_policy::context::STARTUP_RESERVE_BYTES);
                 let available = raw_available.saturating_sub(retry_margin);
                 let profile = self.swift_context_profile()?;
-                let (context, vision_admitted) =
-                    match bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_vision(
+                let (context, vision_admitted, prefill_scratch) =
+                    match bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
                         available,
                         profile,
                         active_mmproj.is_some(),
+                        self.cpu_prefill_tokens.map(usize::from),
                     ) {
                         Ok(result) => result,
                         Err(_) if attempt > 0 => {
                             // If the extra retry margin pushed below minimum context, try raw available RAM.
-                            bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_vision(
+                            bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
                                 raw_available,
                                 profile,
                                 active_mmproj.is_some(),
+                                self.cpu_prefill_tokens.map(usize::from),
                             )
                             .map_err(|_| LaunchError::Memory)?
                         }
@@ -965,6 +990,7 @@ impl LaunchConfig {
                 }
                 plan.select_swift_context(context)
                     .map_err(|_| LaunchError::Policy)?;
+                plan.cpu_prefill = self.cpu_prefill_tokens.zip(prefill_scratch);
             }
             if let Some(artifact) = &active_mmproj {
                 plan.enable_swift_mmproj(artifact.clone())
@@ -973,6 +999,7 @@ impl LaunchConfig {
             let vision_enabled = active_mmproj.is_some();
             let active_mmproj_guard = vision_enabled.then(|| mmproj_file.as_ref()).flatten();
             let context_tokens = plan.context_tokens;
+            let cpu_prefill = plan.cpu_prefill;
             if let Err(error) = admit(plan.required_available_bytes) {
                 drop(reservation);
                 if error == LaunchError::Memory && attempt + 1 < max_attempts {
@@ -1091,7 +1118,13 @@ impl LaunchConfig {
             };
             if self.native_engine {
                 startup_timing.phase(StartupPhase::NativeIdentity);
-                self.confirm_native_identity(&process, &models, context_tokens, vision_enabled)?;
+                self.confirm_native_identity(
+                    &process,
+                    &models,
+                    context_tokens,
+                    vision_enabled,
+                    cpu_prefill,
+                )?;
             }
             startup_timing.phase(StartupPhase::FrontendBinding);
             let service = self
@@ -1176,6 +1209,7 @@ impl LaunchConfig {
         models: &[u8],
         context_tokens: usize,
         vision_enabled: bool,
+        cpu_prefill: Option<(u8, usize)>,
     ) -> Result<(), LaunchError> {
         let verification = crate::inference::pinned_version()
             .map_err(|_| NativeIdentityError::ReleasePin)
@@ -1188,6 +1222,7 @@ impl LaunchConfig {
                         .with_prompt_reuse(self.latest_prompt_reuse)
                         .with_vision(vision_enabled)
                         .with_kv_cache(self.kv_cache)
+                        .with_cpu_prefill(cpu_prefill)
                         .with_placement(self.placement)
                         .with_context_tokens(context_tokens),
                 )
@@ -2396,7 +2431,7 @@ mod tests {
         assert_eq!(
             LaunchConfig::parse_for_family(swift.clone(), Some(SnapdragonFamily::X2EliteExtreme))?
                 .native_row_workers,
-            4
+            8
         );
         assert_eq!(
             LaunchConfig::parse_for_family(swift.clone(), None)?.native_row_workers,
@@ -3408,6 +3443,116 @@ mod tests {
         assert_eq!(preflight_frontend_port(port), Err(LaunchError::Service));
         drop(occupied);
         assert_eq!(preflight_frontend_port(port), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_prefill_tokens_require_native_swift_and_emit_paired_scratch_bytes()
+    -> Result<(), LaunchError> {
+        use bonsai_cpu_policy::context::{
+            FIXED_RUNTIME_BYTES, SwiftContextPlan, SwiftContextProfile,
+            swift_tiled_prefill_scratch_bytes,
+        };
+
+        let gib = 1024 * 1024 * 1024_u64;
+        for (tokens, value) in [(8_u8, "8"), (16, "16"), (32, "32")] {
+            let mut args = arguments();
+            args.extend(
+                [
+                    "--profile",
+                    "swift-pq2-assessment",
+                    "--cpu-prefill-tokens",
+                    value,
+                ]
+                .map(OsString::from),
+            );
+            let config = LaunchConfig::parse(args.clone())?;
+            assert_eq!(config.cpu_prefill_tokens, Some(tokens));
+            let (plan, scratch) = SwiftContextPlan::for_profile_with_prefill(
+                24 * gib,
+                SwiftContextProfile::NativeRsq4Full,
+                Some(usize::from(tokens)),
+            )
+            .map_err(|_| LaunchError::Memory)?;
+            let scratch = scratch.ok_or(LaunchError::Memory)?;
+            assert_eq!(
+                u64::try_from(scratch).ok(),
+                swift_tiled_prefill_scratch_bytes(
+                    usize::from(tokens),
+                    plan.context_tokens,
+                    bonsai_cpu_policy::context::SwiftKvCacheFormat::Rsq4,
+                )
+            );
+            assert!(
+                u64::try_from(plan.memory_limit_bytes - scratch).ok() >= Some(FIXED_RUNTIME_BYTES)
+            );
+            let data = std::env::temp_dir().join("Bonsai-prefill-args");
+            let key = data.join("backend.key");
+            let mut launch_plan = super::LaunchPlan::for_profile_with_options(
+                &data,
+                8081,
+                &key,
+                LaunchProfile::SwiftPq2Assessment,
+                true,
+                false,
+            )
+            .map_err(|_| LaunchError::Policy)?;
+            launch_plan
+                .select_swift_context(plan)
+                .map_err(|_| LaunchError::Policy)?;
+            launch_plan.cpu_prefill = Some((tokens, scratch));
+            let child_args = config.native_arguments(&launch_plan, Some(&key));
+            assert!(
+                child_args
+                    .array_windows::<2>()
+                    .any(|pair| pair[0] == "--cpu-prefill-tokens" && pair[1] == value)
+            );
+            assert!(child_args.array_windows::<2>().any(|pair| {
+                pair[0] == "--cpu-prefill-scratch-bytes" && pair[1] == scratch.to_string().as_str()
+            }));
+            args.extend(["--cpu-prefill-tokens", value].map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(args).err(),
+                Some(LaunchError::Arguments)
+            );
+        }
+        for invalid in ["0", "4", "12", "64", "eight"] {
+            let mut args = arguments();
+            args.extend(
+                [
+                    "--profile",
+                    "swift-pq2-assessment",
+                    "--cpu-prefill-tokens",
+                    invalid,
+                ]
+                .map(OsString::from),
+            );
+            assert_eq!(
+                LaunchConfig::parse(args).err(),
+                Some(LaunchError::Arguments)
+            );
+        }
+        let mut publisher = arguments();
+        publisher.extend(
+            [
+                "--profile",
+                "swift-pq2-assessment",
+                "--publisher-engine",
+                "--cpu-prefill-tokens",
+                "16",
+            ]
+            .map(OsString::from),
+        );
+        assert_eq!(
+            LaunchConfig::parse(publisher).err(),
+            Some(LaunchError::Arguments)
+        );
+        let mut reference = arguments();
+        reference.extend(["--cpu-prefill-tokens", "8"].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse(reference).err(),
+            Some(LaunchError::Arguments)
+        );
         Ok(())
     }
 }

@@ -104,14 +104,14 @@ impl SnapdragonFamily {
 
     /// Default native inference CPU row-worker count for an observed host family.
     ///
-    /// Snapdragon X Elite defaults to `8` workers across two four-core Oryon
-    /// clusters (`attend_group::<3>` across Swift's 24 query / 4 KV heads) while
-    /// X2 Elite Extreme and unrecognized hosts default to `4` workers.
+    /// Snapdragon X Elite and Snapdragon X2 Elite Extreme both default to `8`
+    /// workers (`attend_group::<3>` across Swift's 24 query / 4 KV heads) while
+    /// unrecognized hosts default to `4` workers.
     #[must_use]
     pub const fn default_native_row_workers(family: Option<Self>) -> u8 {
         match family {
-            Some(Self::XElite) => 8,
-            Some(Self::X2EliteExtreme) | None => 4,
+            Some(Self::XElite | Self::X2EliteExtreme) => 8,
+            None => 4,
         }
     }
 

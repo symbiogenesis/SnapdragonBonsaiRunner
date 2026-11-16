@@ -18,6 +18,7 @@ pub(super) enum NativeIdentityError {
     StartupProjection,
     Adapter,
     Vision,
+    CpuPrefill,
 }
 
 impl NativeIdentityError {
@@ -35,6 +36,7 @@ impl NativeIdentityError {
             Self::StartupProjection => "startup-projection",
             Self::Adapter => "adapter",
             Self::Vision => "vision",
+            Self::CpuPrefill => "cpu-prefill",
         }
     }
 }
@@ -61,6 +63,7 @@ pub(super) struct WorkerReadiness {
     latest_prompt_reuse: bool,
     vision: bool,
     kv_cache: Option<crate::inference::KvCache>,
+    cpu_prefill: Option<(u8, usize)>,
     placement: crate::inference::Placement,
 }
 
@@ -82,6 +85,7 @@ impl WorkerReadiness {
             latest_prompt_reuse: false,
             vision: false,
             kv_cache: None,
+            cpu_prefill: None,
             placement: crate::inference::Placement::Auto,
         }
     }
@@ -113,6 +117,11 @@ impl WorkerReadiness {
 
     pub(super) const fn with_kv_cache(mut self, policy: Option<crate::inference::KvCache>) -> Self {
         self.kv_cache = policy;
+        self
+    }
+
+    pub(super) const fn with_cpu_prefill(mut self, prefill: Option<(u8, usize)>) -> Self {
+        self.cpu_prefill = prefill;
         self
     }
 
@@ -221,6 +230,10 @@ struct NativeModel<'a> {
     mmproj_sha256: Option<Text<'a>>,
     #[serde(default, deserialize_with = "present")]
     image_max_tokens: Option<usize>,
+    #[serde(default, deserialize_with = "present")]
+    cpu_prefill_tokens: Option<u8>,
+    #[serde(default, deserialize_with = "present")]
+    cpu_prefill_scratch_bytes: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +276,7 @@ fn startup_projection_matches(
         "cpu" => startup.identity.is_none() && no_residency,
         "hexagon-native-q2" => {
             requested == "auto"
+                && workers.cpu_prefill.is_none()
                 && !repacked
                 && startup.identity.as_deref()
                     == Some("hexagon-hvx-native-q2-resident-v1-experimental")
@@ -272,6 +286,7 @@ fn startup_projection_matches(
         }
         "hexagon-native-q2-partial" => {
             requested == "auto"
+                && workers.cpu_prefill.is_none()
                 && !repacked
                 && matches!(
                     startup.identity.as_deref(),
@@ -286,6 +301,7 @@ fn startup_projection_matches(
         }
         "external" => {
             requested == "auto"
+                && workers.cpu_prefill.is_none()
                 && no_residency
                 && startup.identity.as_deref().is_some_and(|identity| {
                     !identity.trim().is_empty()
@@ -303,14 +319,22 @@ fn cache_identity_matches(
     repacked: bool,
     adapter: bool,
 ) -> bool {
-    let Some(policy @ (crate::inference::KvCache::Rsq4 | crate::inference::KvCache::Rsq4K3v)) =
-        workers.kv_cache
-    else {
-        return model.kv_cache.is_none() && model.startup_graph_identity.is_none();
+    let Some(policy) = workers.kv_cache else {
+        return workers.cpu_prefill.is_none()
+            && model.kv_cache.is_none()
+            && model.startup_graph_identity.is_none();
     };
-    let cache = policy.name();
+    if workers.cpu_prefill.is_none() && policy == crate::inference::KvCache::F16 {
+        return model.kv_cache.is_none() && model.startup_graph_identity.is_none();
+    }
+    let expected_kv = (policy != crate::inference::KvCache::F16).then_some(policy.name());
+    let cache = if policy == crate::inference::KvCache::F16 {
+        "kv-f16".to_owned()
+    } else {
+        format!("kv-{}-d256-rht3-v1", policy.name())
+    };
     let mut identity = format!(
-        "{}:qwen35-text-v1:nonflash-f16:kv-{cache}-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1",
+        "{}:qwen35-text-v1:nonflash-f16:{cache}:gdn-f32:prism-arm64-fused-v1",
         &*model.model_sha256
     );
     if adapter {
@@ -335,7 +359,13 @@ fn cache_identity_matches(
             return false;
         }
     }
-    model.kv_cache.as_deref() == Some(cache)
+    if let Some((tokens, _)) = workers.cpu_prefill {
+        use std::fmt::Write as _;
+        if write!(identity, ":cpu-tiled-ffn-v1:{tokens}").is_err() {
+            return false;
+        }
+    }
+    model.kv_cache.as_deref() == expected_kv
         && model.startup_graph_identity.as_deref() == Some(identity.as_str())
 }
 
@@ -401,6 +431,14 @@ pub(super) fn validate_native_identity_detailed(
     }
     if !cache_identity_matches(model, workers, repacked, adapter) {
         return Err(NativeIdentityError::KvCacheGraph);
+    }
+    let expected_prefill = workers
+        .cpu_prefill
+        .map_or((None, None), |(tokens, scratch)| {
+            (Some(tokens), Some(scratch))
+        });
+    if (model.cpu_prefill_tokens, model.cpu_prefill_scratch_bytes) != expected_prefill {
+        return Err(NativeIdentityError::CpuPrefill);
     }
     let placement = (workers.placement == crate::inference::Placement::Cpu).then_some("cpu");
     if model.placement.as_deref() != placement || model.projection_backend.as_deref() != placement {
@@ -885,6 +923,71 @@ mod tests {
                     assert!(validate_native_identity(&bytes, repacked, adapter, selected).is_err());
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_prefill_readiness_binds_tokens_scratch_projection_and_graph_identity()
+    -> Result<(), serde_json::Error> {
+        use crate::inference::KvCache;
+        use serde_json::json;
+
+        let scratch = 11_501_568_usize;
+        for kv in [KvCache::F16, KvCache::Rsq4] {
+            let (mut prefill_model, _) = kv_cache_model_for_version("0.1.30", false, true);
+            prefill_model["startup_projection"] = projection_startup("cpu");
+            prefill_model["cpu_prefill_tokens"] = json!(8);
+            prefill_model["cpu_prefill_scratch_bytes"] = json!(scratch);
+            let base_graph = prefill_model["startup_graph_identity"]
+                .as_str()
+                .map_or_else(String::new, ToOwned::to_owned);
+            let updated_graph = if kv == KvCache::F16 {
+                prefill_model.as_object_mut().map(|o| o.remove("kv_cache"));
+                format!(
+                    "{}:cpu-tiled-ffn-v1:8",
+                    base_graph.replace("kv-rsq4-d256-rht3-v1", "kv-f16")
+                )
+            } else {
+                format!("{base_graph}:cpu-tiled-ffn-v1:8")
+            };
+            prefill_model["startup_graph_identity"] = json!(updated_graph);
+            let policy = WorkerReadiness::for_version("0.1.30", 4)
+                .with_kv_cache(Some(kv))
+                .with_cpu_prefill(Some((8, scratch)));
+            assert_eq!(
+                validate_native_identity_detailed(
+                    &model_response(&prefill_model)?,
+                    false,
+                    true,
+                    policy,
+                ),
+                Ok(())
+            );
+
+            let mut wrong_scratch = prefill_model.clone();
+            wrong_scratch["cpu_prefill_scratch_bytes"] = json!(scratch + 1);
+            assert_eq!(
+                validate_native_identity_detailed(
+                    &model_response(&wrong_scratch)?,
+                    false,
+                    true,
+                    policy,
+                ),
+                Err(NativeIdentityError::CpuPrefill)
+            );
+
+            let mut hex_active = prefill_model;
+            hex_active["startup_projection"] = projection_startup("hexagon-native-q2");
+            assert_eq!(
+                validate_native_identity_detailed(
+                    &model_response(&hex_active)?,
+                    false,
+                    true,
+                    policy,
+                ),
+                Err(NativeIdentityError::StartupProjection)
+            );
         }
         Ok(())
     }

@@ -59,6 +59,7 @@ mod window;
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum HostFamily {
     SnapdragonXElite,
+    SnapdragonX2EliteExtreme,
     Other,
 }
 
@@ -66,7 +67,7 @@ enum HostFamily {
 impl HostFamily {
     const fn default_native_row_workers(self) -> u8 {
         match self {
-            Self::SnapdragonXElite => 8,
+            Self::SnapdragonXElite | Self::SnapdragonX2EliteExtreme => 8,
             Self::Other => 4,
         }
     }
@@ -103,11 +104,13 @@ fn host_family_from_processor_name(name: &str) -> HostFamily {
     let extreme = words
         .next()
         .is_some_and(|word| word.eq_ignore_ascii_case("extreme"));
-    if (generation.eq_ignore_ascii_case("x") || generation.eq_ignore_ascii_case("x1"))
-        && tier.eq_ignore_ascii_case("elite")
-        && !extreme
-    {
+    if !tier.eq_ignore_ascii_case("elite") {
+        return HostFamily::Other;
+    }
+    if (generation.eq_ignore_ascii_case("x") || generation.eq_ignore_ascii_case("x1")) && !extreme {
         HostFamily::SnapdragonXElite
+    } else if generation.eq_ignore_ascii_case("x2") && extreme {
+        HostFamily::SnapdragonX2EliteExtreme
     } else {
         HostFamily::Other
     }
@@ -160,6 +163,7 @@ fn configuration_for_family(
     let mut native_row_workers = None;
     let mut latest_prompt_reuse = None;
     let mut kv_cache = None;
+    let mut cpu_prefill_tokens = None;
     let mut placement = None;
     while let Some(option) = args.next() {
         match option.to_str() {
@@ -200,6 +204,16 @@ fn configuration_for_family(
                         Some("rsq4") => client::KvCache::Rsq4,
                         Some("rsq4k3v") => client::KvCache::Rsq4K3v,
                         _ => return Err("KV cache must be f16, rsq4 or rsq4k3v."),
+                    },
+                );
+            }
+            Some("--cpu-prefill-tokens") if cpu_prefill_tokens.is_none() => {
+                cpu_prefill_tokens = Some(
+                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+                        Some("8") => 8_u8,
+                        Some("16") => 16_u8,
+                        Some("32") => 32_u8,
+                        _ => return Err("CPU prefill tokens must be 8, 16 or 32."),
                     },
                 );
             }
@@ -312,7 +326,7 @@ fn configuration_for_family(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
@@ -329,6 +343,9 @@ fn configuration_for_family(
     }
     if kv_cache.is_some() && !native_engine {
         return Err("KV cache selection requires --native-engine.");
+    }
+    if cpu_prefill_tokens.is_some() && !native_engine {
+        return Err("CPU prefill tile selection requires --native-engine.");
     }
     if placement.is_some() && !native_engine {
         return Err("Placement selection requires --native-engine.");
@@ -388,6 +405,7 @@ fn configuration_for_family(
         native_row_workers,
         latest_prompt_reuse,
         kv_cache,
+        cpu_prefill_tokens,
         placement,
         canary: canary_key_file.map(|key_file| canary::Config {
             port: canary_port.unwrap_or(8766),
@@ -894,7 +912,28 @@ mod tests {
             ),
         )
         .map_err(io::Error::other)?;
-        assert_eq!(x2_default.native_row_workers, 4);
+        assert_eq!(x2_default.native_row_workers, 8);
+        for (value, expected) in [("8", 8_u8), ("16", 16), ("32", 32)] {
+            let mut tiled = native.clone();
+            tiled.extend(["--cpu-prefill-tokens", value].map(OsString::from));
+            assert_eq!(
+                configuration(tiled.clone())
+                    .map_err(io::Error::other)?
+                    .cpu_prefill_tokens,
+                Some(expected)
+            );
+            tiled.extend(["--cpu-prefill-tokens", value].map(OsString::from));
+            assert!(configuration(tiled).is_err());
+        }
+        for invalid in ["0", "4", "64", "eight"] {
+            let mut rejected = native.clone();
+            rejected.extend(["--cpu-prefill-tokens", invalid].map(OsString::from));
+            assert!(configuration(rejected).is_err());
+        }
+        let mut publisher_prefill = args.clone();
+        publisher_prefill
+            .extend(["--publisher-engine", "--cpu-prefill-tokens", "8"].map(OsString::from));
+        assert!(configuration(publisher_prefill).is_err());
         let mut missing_rows = native.clone();
         missing_rows.push("--native-row-workers".into());
         assert!(configuration(missing_rows).is_err());

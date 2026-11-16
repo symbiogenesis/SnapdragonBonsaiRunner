@@ -177,6 +177,7 @@ pub(crate) struct Config {
     pub(crate) native_row_workers: u8,
     pub(crate) latest_prompt_reuse: bool,
     pub(crate) kv_cache: Option<KvCache>,
+    pub(crate) cpu_prefill_tokens: Option<u8>,
     pub(crate) placement: Option<Placement>,
     pub(crate) canary: Option<crate::canary::Config>,
     pub(crate) qwen_tts: Option<crate::tts::Config>,
@@ -601,6 +602,17 @@ fn runtime_arguments(config: &Config) -> Vec<&'static str> {
     }
     if let Some(policy) = config.kv_cache {
         arguments.extend(["--kv-cache", policy.name()]);
+    }
+    if let Some(tokens) = config.cpu_prefill_tokens {
+        arguments.extend([
+            "--cpu-prefill-tokens",
+            match tokens {
+                8 => "8",
+                16 => "16",
+                32 => "32",
+                _ => "8",
+            },
+        ]);
     }
     if let Some(placement) = config.placement {
         arguments.extend(["--placement", placement.name()]);
@@ -1650,6 +1662,7 @@ mod tests {
             native_row_workers: 1,
             latest_prompt_reuse: false,
             kv_cache: None,
+            cpu_prefill_tokens: None,
             placement: None,
             canary: None,
             qwen_tts: None,
@@ -1750,8 +1763,14 @@ mod tests {
             );
         }
         config.latest_prompt_reuse = true;
+        config.cpu_prefill_tokens = Some(16);
         config.placement = Some(super::Placement::Cpu);
         let selected = runtime_arguments(&config);
+        assert!(
+            selected
+                .array_windows()
+                .any(|args| args == &["--cpu-prefill-tokens", "16"])
+        );
         assert!(
             selected
                 .array_windows()
@@ -1784,6 +1803,7 @@ mod tests {
             native_row_workers: 4,
             latest_prompt_reuse: false,
             kv_cache: None,
+            cpu_prefill_tokens: None,
             placement: None,
             canary: None,
             qwen_tts: None,

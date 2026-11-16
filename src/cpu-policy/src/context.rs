@@ -40,9 +40,60 @@ pub const RSQ4_FULL_STATE_LIMIT_BYTES: u64 =
     262_144_u64 * (RSQ4_KV_BYTES_PER_TOKEN + 96 + 128) + RECURRENT_BYTES;
 /// Context selection granularity, divisible by the runtime's 64-token cache pages.
 pub const CONTEXT_PAGE_TOKENS: usize = 256;
+/// Number of tokens sealed into each immutable copy-on-write KV cache page.
+pub const KV_COW_PAGE_TOKENS: usize = 64;
+/// Swift's largest projection activation/output width (FFN intermediate width).
+pub const SWIFT_MAX_LAYER_WIDTH: usize = 17_408;
+/// Bounded task-slice and error-descriptor reserve for parallel tiled prefill.
+pub const SWIFT_ROW_TASK_SCRATCH_BYTES: u64 = 16 * 1024;
 /// Preserve room for the largest reply, template margin and a positive prompt.
 pub const MIN_CONTEXT_TOKENS: usize =
     (4_096_usize + 64).div_ceil(CONTEXT_PAGE_TOKENS) * CONTEXT_PAGE_TOKENS;
+
+fn tile_scratch_fixed_and_per_ctx(
+    tokens: usize,
+    kv_format: SwiftKvCacheFormat,
+) -> Option<(u64, u64)> {
+    if !matches!(tokens, 8 | 16 | 32) {
+        return None;
+    }
+    let t = u64::try_from(tokens).ok()?;
+    let score_heads = match kv_format {
+        SwiftKvCacheFormat::F16 => 6_u64,
+        SwiftKvCacheFormat::Rsq4
+        | SwiftKvCacheFormat::Rsq4K3v
+        | SwiftKvCacheFormat::Rotated4FittedValues => 1_u64,
+    };
+    let row_bytes = t.checked_mul(u64::try_from(SWIFT_MAX_LAYER_WIDTH).ok()?.checked_mul(80)?)?;
+    let meta_bytes = t.checked_mul(2_048)?;
+    let fixed = row_bytes
+        .checked_add(meta_bytes)?
+        .checked_add(64 * 1024)?
+        .checked_add(SWIFT_ROW_TASK_SCRATCH_BYTES)?;
+    let per_ctx = t.checked_mul(score_heads * 4)?;
+    Some((fixed, per_ctx))
+}
+
+/// Conservative additional scratch reservation (`bytes`) required by Prism's
+/// `Qwen35::tiled_prefill_scratch_bytes` for an explicit `8`, `16`, or `32`-token
+/// CPU tiled prefill configuration at `context_tokens` and `kv_format`.
+///
+/// Returns `None` for unsupported tile sizes (`!(8|16|32)`), `context_tokens == 0`,
+/// or `u64` arithmetic overflow.
+#[must_use]
+pub fn swift_tiled_prefill_scratch_bytes(
+    tokens: usize,
+    context_tokens: usize,
+    kv_format: SwiftKvCacheFormat,
+) -> Option<u64> {
+    if context_tokens == 0 {
+        return None;
+    }
+    let (fixed, per_ctx) = tile_scratch_fixed_and_per_ctx(tokens, kv_format)?;
+    let ctx = u64::try_from(context_tokens).ok()?;
+    let scores = ctx.checked_mul(per_ctx)?;
+    fixed.checked_add(scores)
+}
 
 /// Immutable cache and execution layout used to admit one Swift model lifetime.
 ///
@@ -241,18 +292,62 @@ impl SwiftExecutionShape {
         )
     }
 
+    /// Attach Prism's exact `CPU` tiled-prefill scratch reserve for `tokens` (`8`,
+    /// `16`, or `32`) at `context_tokens` using this shape's `kv_format`.
+    #[must_use]
+    pub fn with_tiled_prefill_tokens(
+        mut self,
+        tokens: usize,
+        context_tokens: usize,
+    ) -> Option<Self> {
+        self.tile_prefill_scratch_bytes =
+            swift_tiled_prefill_scratch_bytes(tokens, context_tokens, self.kv_format)?;
+        Some(self)
+    }
+
+    /// Physical copy-on-write `KV` cache and per-token bookkeeping bytes when
+    /// sealed `64`-token `Arc` pages are shared across `live_kv_copies`, keeping
+    /// at most one unsealed tail page per additional history.
+    #[must_use]
+    pub fn physical_cow_kv_bytes(&self, context_tokens: usize) -> Option<u64> {
+        if context_tokens == 0 {
+            return Some(0);
+        }
+        let ctx = u64::try_from(context_tokens).ok()?;
+        let bookkeeping = ctx.checked_mul(
+            self.score_rows_per_token
+                .checked_mul(4)?
+                .checked_add(self.per_token_metadata_bytes)?,
+        )?;
+        let kv_per_token = self.kv_format.kv_bytes_per_token();
+        if self.live_kv_copies == 0 {
+            return Some(bookkeeping);
+        }
+        let extra_copies = u64::from(self.live_kv_copies - 1);
+        let tail_tokens = u64::try_from(context_tokens.min(KV_COW_PAGE_TOKENS)).ok()?;
+        let shared_kv = ctx.checked_mul(kv_per_token)?;
+        let unsealed_tails = extra_copies
+            .checked_mul(tail_tokens)?
+            .checked_mul(kv_per_token)?;
+        shared_kv
+            .checked_add(unsealed_tails)?
+            .checked_add(bookkeeping)
+    }
+
     /// Itemize all worst-case memory categories for `context_tokens`.
     #[must_use]
     pub fn breakdown(&self, context_tokens: usize) -> Option<SwiftMemoryBreakdown> {
         let tokens = u64::try_from(context_tokens).ok()?;
         let per_token = self.kv_bytes_per_token_total()?;
         let live_kv_bytes = tokens.checked_mul(per_token)?;
+        let physical_cow_kv_bytes = self.physical_cow_kv_bytes(context_tokens)?;
         let recurrent_checkpoint_bytes = self.recurrent_checkpoint_bytes()?;
         let execution_scratch_bytes = self.execution_scratch_bytes()?;
         Some(SwiftMemoryBreakdown {
             weights_and_fixed_runtime_bytes: self.weights_and_fixed_runtime_bytes,
             recurrent_checkpoint_bytes,
             live_kv_bytes,
+            physical_cow_kv_bytes,
             execution_scratch_bytes,
             accelerator_resident_arena_bytes: self.accelerator_resident_arena_bytes,
             accelerator_staging_bytes: self.accelerator_staging_bytes,
@@ -271,6 +366,8 @@ pub struct SwiftMemoryBreakdown {
     pub recurrent_checkpoint_bytes: u64,
     /// Live KV cache copies and per-token bookkeeping for the selected context (`c`).
     pub live_kv_bytes: u64,
+    /// Copy-on-write shared-page `KV` footprint across active and rollback histories.
+    pub physical_cow_kv_bytes: u64,
     /// Worst-case execution scratch across decode, tile prefill, and speculative verify/replay (`d`).
     pub execution_scratch_bytes: u64,
     /// Optional accelerator resident arena outside Windows Job private commit (`e`).
@@ -292,6 +389,19 @@ impl SwiftMemoryBreakdown {
             .checked_add(self.live_kv_bytes)?
             .checked_add(self.execution_scratch_bytes)?
             .checked_add(self.allocator_fragmentation_margin_bytes)
+    }
+
+    /// Expected steady-state physical footprint when immutable `64`-token `KV`
+    /// pages are shared via `Arc` copy-on-write rather than duplicated across
+    /// active and rollback histories, excluding [`HOST_RESERVE_BYTES`].
+    #[must_use]
+    pub fn physical_cow_footprint_bytes(&self) -> Option<u64> {
+        self.weights_and_fixed_runtime_bytes
+            .checked_add(self.recurrent_checkpoint_bytes)?
+            .checked_add(self.physical_cow_kv_bytes)?
+            .checked_add(self.execution_scratch_bytes)?
+            .checked_add(self.allocator_fragmentation_margin_bytes)?
+            .checked_add(self.accelerator_bytes()?)
     }
 
     /// Total optional accelerator resident arena and staging bytes tracked
@@ -462,6 +572,112 @@ impl SwiftContextPlan {
             return Ok((plan, true));
         }
         Ok((Self::for_profile(available_bytes, profile)?, false))
+    }
+
+    /// Derive a context plan for `profile`, adding an optional `CPU` tiled prefill
+    /// scratch reservation (`8`, `16`, or `32` tokens) within `available_bytes`.
+    ///
+    /// Returns `(plan, Some(prefill_scratch_bytes))` when `prefill_tokens` is
+    /// `Some`, guaranteeing `plan.memory_limit_bytes - prefill_scratch_bytes` equals
+    /// the exact paired native `--context-tokens` and base `--memory-limit-bytes`
+    /// allowance checked by Prism.
+    ///
+    /// # Errors
+    /// Rejects unsupported profiles (`PublisherF16`), unsupported tile counts,
+    /// insufficient memory, or overflow.
+    pub fn for_profile_with_prefill(
+        available_bytes: u64,
+        profile: SwiftContextProfile,
+        prefill_tokens: Option<usize>,
+    ) -> Result<(Self, Option<usize>), String> {
+        let Some(tile_tokens) = prefill_tokens else {
+            return Ok((Self::for_profile(available_bytes, profile)?, None));
+        };
+        if profile == SwiftContextProfile::PublisherF16 {
+            return Err(insufficient());
+        }
+        let kv_format = SwiftKvCacheFormat::from_profile(profile);
+        let (fixed_tile, score_per_ctx_token) =
+            tile_scratch_fixed_and_per_ctx(tile_tokens, kv_format).ok_or_else(insufficient)?;
+        let allocation = available_bytes
+            .checked_sub(HOST_RESERVE_BYTES)
+            .and_then(|bytes| bytes.checked_sub(STARTUP_RESERVE_BYTES))
+            .and_then(|bytes| bytes.checked_sub(FIXED_RUNTIME_BYTES))
+            .and_then(|bytes| bytes.checked_sub(fixed_tile))
+            .ok_or_else(insufficient)?;
+        let state_allocation = profile
+            .state_limit_bytes()
+            .checked_sub(RECURRENT_BYTES)
+            .ok_or_else(insufficient)?;
+        let total_per_token = profile
+            .context_bytes_per_token()
+            .checked_add(score_per_ctx_token)
+            .ok_or_else(insufficient)?;
+        let tokens =
+            (allocation / total_per_token).min(state_allocation / profile.state_bytes_per_token());
+        let tokens = usize::try_from(tokens)
+            .map_err(|_| insufficient())?
+            .min(MODEL_CONTEXT_TOKENS);
+        let context_tokens = tokens / CONTEXT_PAGE_TOKENS * CONTEXT_PAGE_TOKENS;
+        if context_tokens < MIN_CONTEXT_TOKENS {
+            return Err(insufficient());
+        }
+        let scratch_u64 = swift_tiled_prefill_scratch_bytes(tile_tokens, context_tokens, kv_format)
+            .ok_or_else(insufficient)?;
+        let context_bytes = u64::try_from(context_tokens)
+            .ok()
+            .and_then(|count| count.checked_mul(profile.context_bytes_per_token()))
+            .ok_or_else(insufficient)?;
+        let memory_limit = FIXED_RUNTIME_BYTES
+            .checked_add(context_bytes)
+            .and_then(|bytes| bytes.checked_add(scratch_u64))
+            .ok_or_else(insufficient)?;
+        let required_available_bytes = memory_limit
+            .checked_add(HOST_RESERVE_BYTES)
+            .ok_or_else(insufficient)?;
+        let scratch_bytes = usize::try_from(scratch_u64).map_err(|_| insufficient())?;
+        Ok((
+            Self {
+                context_tokens,
+                memory_limit_bytes: usize::try_from(memory_limit).map_err(|_| insufficient())?,
+                required_available_bytes,
+            },
+            Some(scratch_bytes),
+        ))
+    }
+
+    /// Derive a context plan for `profile`, reserving [`crate::MMPROJ_RESERVE_BYTES`]
+    /// when `request_vision` is true and fitting within `available_bytes`, and
+    /// optionally reserving `CPU` tiled prefill scratch for `prefill_tokens`.
+    ///
+    /// If `available_bytes` admits text-only execution but cannot accommodate the
+    /// vision projector reserve, this cleanly falls back to
+    /// `(text_only_plan, false, scratch)`.
+    ///
+    /// # Errors
+    /// Returns an error when even text-only execution cannot fit within `available_bytes`
+    /// or when `prefill_tokens` selects an invalid tile count or non-native profile.
+    pub fn for_profile_with_options(
+        available_bytes: u64,
+        profile: SwiftContextProfile,
+        request_vision: bool,
+        prefill_tokens: Option<usize>,
+    ) -> Result<(Self, bool, Option<usize>), String> {
+        if !request_vision {
+            let (plan, scratch) =
+                Self::for_profile_with_prefill(available_bytes, profile, prefill_tokens)?;
+            return Ok((plan, false, scratch));
+        }
+        if let Some(remaining) = available_bytes.checked_sub(crate::MMPROJ_RESERVE_BYTES)
+            && let Ok((mut plan, scratch)) =
+                Self::for_profile_with_prefill(remaining, profile, prefill_tokens)
+        {
+            apply_mmproj_reserve_to_plan(&mut plan)?;
+            return Ok((plan, true, scratch));
+        }
+        let (plan, scratch) =
+            Self::for_profile_with_prefill(available_bytes, profile, prefill_tokens)?;
+        Ok((plan, false, scratch))
     }
 
     /// Derive a context plan and itemized memory breakdown for `shape`, reserving
@@ -852,6 +1068,80 @@ mod tests {
             &larger,
         )?;
         assert!(tighter.context_tokens <= plan.context_tokens);
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_prefill_scratch_and_cow_kv_accounting_preserve_exact_contracts()
+    -> Result<(), Box<dyn Error>> {
+        let gib = 1024 * 1024 * 1024_u64;
+        assert_eq!(
+            swift_tiled_prefill_scratch_bytes(8, 8_192, SwiftKvCacheFormat::Rsq4),
+            Some(11_501_568)
+        );
+        assert_eq!(
+            swift_tiled_prefill_scratch_bytes(8, 262_144, SwiftKvCacheFormat::Rsq4),
+            Some(19_628_032)
+        );
+        assert_eq!(
+            swift_tiled_prefill_scratch_bytes(16, 62_720, SwiftKvCacheFormat::F16),
+            Some(46_481_408)
+        );
+        for invalid in [0, 1, 4, 7, 15, 64] {
+            assert_eq!(
+                swift_tiled_prefill_scratch_bytes(invalid, 8_192, SwiftKvCacheFormat::F16),
+                None
+            );
+        }
+        assert_eq!(
+            swift_tiled_prefill_scratch_bytes(8, 0, SwiftKvCacheFormat::F16),
+            None
+        );
+
+        for profile in [
+            SwiftContextProfile::NativeF16,
+            SwiftContextProfile::NativeRsq4,
+            SwiftContextProfile::NativeRsq4Full,
+            SwiftContextProfile::NativeRsq4K3v,
+        ] {
+            for tile in [8_usize, 16, 32] {
+                let (plan, vision, Some(scratch)) = SwiftContextPlan::for_profile_with_options(
+                    24 * gib,
+                    profile,
+                    true,
+                    Some(tile),
+                )?
+                else {
+                    return Err("expected prefill scratch bytes".into());
+                };
+                assert!(vision);
+                let expected = FIXED_RUNTIME_BYTES
+                    + crate::MMPROJ_RESERVE_BYTES
+                    + u64::try_from(plan.context_tokens)? * profile.context_bytes_per_token()
+                    + u64::try_from(scratch)?;
+                assert_eq!(u64::try_from(plan.memory_limit_bytes)?, expected);
+                assert!(plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 24 * gib);
+            }
+        }
+        assert!(
+            SwiftContextPlan::for_profile_with_prefill(
+                24 * gib,
+                SwiftContextProfile::PublisherF16,
+                Some(8)
+            )
+            .is_err()
+        );
+
+        let shape = SwiftExecutionShape::for_profile(SwiftContextProfile::NativeRsq4Full)
+            .with_tiled_prefill_tokens(8, 262_144)
+            .ok_or("missing tiled prefill shape")?;
+        assert_eq!(shape.tile_prefill_scratch_bytes, 19_628_032);
+        let breakdown = shape.breakdown(262_144).ok_or("missing breakdown")?;
+        let worst = breakdown.total_footprint_bytes().ok_or("overflow")?;
+        let cow = breakdown.physical_cow_footprint_bytes().ok_or("overflow")?;
+        assert!(cow < worst);
+        // Sharing 262_144 - 64 immutable KV tokens saves 262_080 * 16_896 bytes (~4.12 GiB).
+        assert_eq!(worst - cow, 262_080 * RSQ4_KV_BYTES_PER_TOKEN);
         Ok(())
     }
 }

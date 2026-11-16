@@ -352,6 +352,41 @@ pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
 const VISION_RELEASE: Option<(&str, &str)> =
     Some(("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"));
 
+// CPU tiled prefill requires a separately reviewed native release supporting
+// `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
+// readiness fields (`cpu_prefill_tokens`, `cpu_prefill_scratch_bytes`, `:cpu-tiled-ffn-v1:{n}`).
+const CPU_PREFILL_RELEASE: Option<(&str, &str)> =
+    Some(("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"));
+
+pub(super) fn parse_cpu_prefill_tokens(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
+    match value.and_then(std::ffi::OsStr::to_str) {
+        Some("8") => Ok(8),
+        Some("16") => Ok(16),
+        Some("32") => Ok(32),
+        _ => Err(LaunchError::Arguments),
+    }
+}
+
+pub(super) fn pinned_cpu_prefill_tokens(
+    native: bool,
+    requested: Option<u8>,
+) -> Result<Option<u8>, LaunchError> {
+    let Some(tokens) = requested else {
+        return Ok(None);
+    };
+    if !native || !matches!(tokens, 8 | 16 | 32) {
+        return Err(LaunchError::Arguments);
+    }
+    let pin = release(LOCK)?;
+    if reviewed_release_matches(&pin, MEMORY_CONTEXT_RELEASE)
+        && reviewed_release_matches(&pin, CPU_PREFILL_RELEASE)
+    {
+        Ok(Some(tokens))
+    } else {
+        Err(LaunchError::NativeRuntime)
+    }
+}
+
 fn vision_release_matches(release: &ReleasePin) -> bool {
     reviewed_release_matches(release, VISION_RELEASE)
 }

@@ -118,6 +118,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--native-row-workers" => ("NativeRowWorkers", false, true),
             "--prompt-reuse" => ("PromptReuse", false, false),
             "--kv-cache" => ("KvCache", false, false),
+            "--cpu-prefill-tokens" => ("CpuPrefillTokens", false, true),
             "--placement" => ("Placement", false, false),
             "--graphics-backend" => ("GraphicsBackend", false, false),
             "--frontend-port" => ("FrontendPort", false, true),
@@ -310,11 +311,14 @@ mod tests {
             "--native-engine".into(),
             "--native-row-workers".into(),
             "4".into(),
+            "--cpu-prefill-tokens".into(),
+            "16".into(),
             "--data-directory".into(),
             "C:\\Data with spaces".into(),
         ])?;
         assert_eq!(options["NativeEngine"], true);
         assert_eq!(options["NativeRowWorkers"], 4);
+        assert_eq!(options["CpuPrefillTokens"], 16);
         assert_eq!(options["DataDirectory"], "C:\\Data with spaces");
         for arguments in [
             vec!["--no-tts", "--no-tts"],
