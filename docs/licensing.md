@@ -121,6 +121,28 @@ notices from the exact [speech pins](../config/native-speech.lock.json),
 [ASR lock](../src/speech-asr/model.lock.json) and `src/speech-tts/LICENSE.*` files.
 These code terms are separate from the speech model terms below.
 
+Additional surveyed upstream speech and ARM64 CPU kernel implementations with
+permissive Apache-2.0-compatible terms (requiring exact revision pinning, notice
+retention, and change attribution on incorporation):
+
+| Source | Surveyed revision | Declared terms | Notes |
+| --- | --- | --- | --- |
+| `ServeurpersoCom/qwentts.cpp` | `5916bf7c79dbb4e66fc059cdc507a79a23a28bb4`..`f1a6924789883bd92eeb59176793a94af55730b3` | MIT | TTS/codec/speaker C++ reference (`src/speech-tts/LICENSE.qwen-core`) |
+| `ServeurpersoCom/ggml` | `cc5df49a6b878db2b68b9a7b45976e279594627d`..`0d403add5cb6329935290f02462e1072045aacd2` | MIT | ARM64 `SDOT`/`I8MM` quantized kernels (`LICENSE.ggml`) |
+| `handy-computer/transcribe.cpp` | `4d7c1ccefd39e5a9ea36cca5f8fefc6dcc14b99b`..`adfc50210a3f026a655a3e19937d90ef2bf0728c` | MIT | Qwen3-ASR engine, Win32 mmap, `gate+up` alias (`src/speech-asr/LICENSE.transcribe`) |
+| `QwenLM/Qwen3-TTS` | `022e286b98fbec7e1e916cb940cdf532cd9f488e` | Apache-2.0 | Upstream TTS architecture & tokenization reference |
+| `QwenLM/Qwen3-ASR` | `7c6daf77a2421100f5fb066495372c00129d39ff` | Apache-2.0 | Upstream ASR encoder windowing & prompting reference |
+| `gpillon/ignis` (`crates/speech`) | `19b23fc45cd5f765943e325ebc437a214c5b3c55` | Apache-2.0 | Pure-Rust Qwen3-ASR `SDOT`/`I8MM`, `BlockQ4Kx8`, spin-then-park pool, streaming mic (`vad.rs` adapted from `snakers4/silero-vad`, MIT) |
+| `kyutai-labs/moshi` (`rust/moshi-core`) | `e6a55d2722a65870ef52a6c9f6ecfc0e90f38362` | Apache-2.0 | Pure-Rust streaming Mimi conv/ring-buffer codec |
+| `ARM-software/kleidiai` | `0dfee30a1879035957cde46db7b95521722cc2e0` | Apache-2.0 | ARM64 microkernel packing & tile interfaces (`LICENSES/Apache-2.0.txt`) |
+| `robertknight/rten` | `b9407f41a71f1930d4f5dde3f721e808a9f08369` | Apache-2.0 | Pure-Rust ARM64 `rten-gemm` packing/tiling reference |
+
+Excluded speech repositories (do **not** copy source into Apache-2.0 deliverables):
+`Dicklesworthstone/franken_tts` (`267d84add52ef1f48644f8f63119b261b58f311f` uses
+"MIT License (with OpenAI/Anthropic Rider)", a non-OSI party restriction incompatible
+with Apache-2.0 redistribution) and `second-state/qwen3_tts_rs` / `TrevorS/qwen3-tts-rs`
+(no declared repository license).
+
 Retain each exact distribution's bundled licenses/notices. A top-level MIT
 license does not replace terms for additional included components.
 

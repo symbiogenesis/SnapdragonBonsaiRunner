@@ -524,6 +524,38 @@ adoption decisions without displacing native daily-use acceptance.
   independent replay.
   Qualify the prebuilt source-bound replay consumer with actual independent
   packets, matching provider identities and the original owner clock/power scope.
+- [ ] **S3 — Speech & kernel Tier 2 performance, memory, and reliability lifts**
+  (updating `ARITHMETIC_IDENTITY` and keeping `#![forbid(unsafe_code)]` on
+  `speech-tts`/`speech-asr` crate roots by isolating `unsafe` intrinsics and Win32
+  FFI inside an audited boundary crate, qualified against `fp64`/teacher-forced/WER/
+  human-listening gates):
+  - [ ] Add checked ARM64 `DOTPROD` (`SDOT` / `vdotq_s32`) + `I8MM` (`SMMLA` /
+    `vmmlaq_s32`) quantized matmul kernels (`Q8_0 × Q8_0`, `Q4_K × Q8_K`,
+    `Q6_K × Q8_K`, optional 8-row `Q4_K` load-time repack, plus `prism-inference`
+    `kquants.rs` NEON paths) replacing per-call non-FMA `f32` weight widening.
+  - [ ] Add verified-handle read-only GGUF `CreateFileMappingW` + `MapViewOfFile` +
+    `PrefetchVirtualMemory` in `bonsai-windows-process` (replacing >2 GB private
+    committed heap copies and 34k unbuffered 64 KiB `ReadFile` syscalls), on-demand
+    packed `codec_embd` row lookup (~265 MiB saved), and lazy Mimi codec encoder
+    loading (dropping encoder weights outside VoiceDesign->Base bootstrap).
+  - [ ] Replace per-op Rayon `pool.install` barriers with a low-overhead
+    spin-then-park `AtomicUsize` worker pool (calling thread as worker 0, cutting
+    ~879 barriers/frame in TTS and ~197/token in ASR), add zero-copy adjacent
+    `gate+up`/`QKV` projection fusion, batched Talker prefill GEMM, and true `u16`
+    `F16` KV cache storage (replacing `Vec<f32>` in `speech-asr` and `speech-tts`).
+  - [ ] Land `speech-tts` DSP/streaming upgrades: vectorized + parallel
+    `SnakeBeta` (`sin`), `qwentts.cpp` dyadic `1 -> 2 -> 4 -> 8` streaming codec
+    chunk ramp, pre-permuted `[IC, K*OC]` `CausalTransConv1d`, persistent
+    `CodecWorkspace`, ring-buffer `TransformerState`, warm `Voice` retention across
+    cooperative Stop/skip cancellation, and 1024-pt real FFT + GEMM `TdnnConv1d` +
+    decomposed `AttentiveStatPool` in `speaker_encoder.rs`.
+  - [ ] Land `speech-asr` frontend/encoder/reliability upgrades: vectorized `f32x4`
+    minimax `erf` GELU (replacing the 128/256-step `f64` incomplete-gamma loop),
+    radix-2/5 200-pt packed real FFT + SIMD `log10` filterbank, optional `Q4_K_M`
+    decoder + `Q8_0` encoder mixed quantization, live-microphone incremental 8s
+    `cu_seqlens` (`104`-token window) prefill during capture, short-clip
+    (`<= 1.5s`) `Languages: <Name>.` system-prompt hint, multi-`<asr_text>` /
+    budget-stop repetition trimming, and Silero VAD / Earshot pause endpointing.
 - [ ] Retire the remaining Windows queue ABI, ASR, Prism reference and publisher
   native/DLL families
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
