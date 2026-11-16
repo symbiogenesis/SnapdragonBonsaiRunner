@@ -90,14 +90,17 @@ struct HeaderEnd {
 
 impl HeaderEnd {
     fn find(&mut self, bytes: &[u8]) -> Option<usize> {
-        for (offset, window) in bytes[self.next..].array_windows().enumerate() {
+        let tail = &bytes[self.next..];
+        if let Some(offset) = memchr::memmem::find(tail, b"\r\n\r\n") {
             #[cfg(test)]
             {
-                self.comparisons += 1;
+                self.comparisons += offset + 1;
             }
-            if window == b"\r\n\r\n" {
-                return Some(self.next + offset + 4);
-            }
+            return Some(self.next + offset + 4);
+        }
+        #[cfg(test)]
+        {
+            self.comparisons += tail.len().saturating_sub(3);
         }
         // An unchanged prefix cannot gain a delimiter; retain only its overlap.
         self.next = bytes.len().saturating_sub(3);
@@ -112,6 +115,7 @@ pub(super) fn handle(
     engine: &mut impl Engine,
     scratch: &mut Scratch,
 ) {
+    let _ = peer.set_nodelay(true);
     let result = receive(peer, port, key, engine.kind(), scratch)
         .and_then(|prepared| respond(engine, &prepared, peer));
     scratch.recycle();
