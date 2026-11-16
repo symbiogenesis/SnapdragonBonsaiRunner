@@ -9,8 +9,10 @@ requirements; prior audit snapshots and prototype results belong in Git history.
 ## Dependency policy
 
 Artifact verification belongs in `bonsai-artifacts`; the broker has no direct `sha2` dependency.
-Windows artifact/maintenance hashing uses the shared CNG boundary in
-`bonsai-windows-credentials`; portable and test paths retain `sha2`.
+Shared artifact, maintenance, replay, and CI hashing now delegates through `bonsai-native-hash`
+(Windows CNG streaming/native dispatch on Windows, portable SHA-256 elsewhere), while
+`bonsai-windows-credentials` retains stateless `BCryptHash` for one-shot slice hashing and tests retain
+`sha2` as an independent reference.
 ZIP disables defaults and enables only `deflate-flate2-zlib-rs`. Bounded custom
 extraction remains necessary; upstream hardening does not replace Runner policy.
 
@@ -60,10 +62,13 @@ not evidence of a browser frontend.
 | `ureq` | Synchronous HTTPS for native provisioning, updates and CI. Reuse the workspace pin with defaults, automatic compression and cookies disabled; Windows selects Schannel and system trust through native-tls-no-default and PlatformVerifier, portable checks select Rustls. No new async runtime is required. |
 | `transcribe-cpp` | Static CPU ASR, defaults disabled; reviewed CMake script downloads no source and explicitly enables MSVC optimization. |
 | `simd-json` | Exact optional qualification-only crates.io pin; ordinary requests still use serde_json. |
-| `fearless_simd` | Pinned safe SIMD (`=1.2.0` in Runner speech and the active external runtime, with independent locks). ASR uses it in `validate_pcm` and the Rust `frontend`/`encoder`/`decoder`/`packed` SIMD kernels; TTS uses it in the serving Rust `engine`/`codec` modules. Prism's `bonsai-neon-dot` kernels are a separate runtime dependency. |
-| `rayon` | TTS and ASR pin `=1.12.0` for safe borrowed projection, attention, and frontend work on a reusable, explicitly bounded team owned by its calling thread. No global pool or whole-weight copies; one-worker and failed-team construction run serially. Owning hosted dependency/model acceptance remains required. |
+| `fearless_simd` | Pinned safe SIMD (`=1.2.0` in Runner speech and the active external runtime, with independent locks). ASR uses it in `validate_pcm` and the Rust `frontend`/`encoder`/`decoder`/`packed` SIMD kernels; TTS uses it in the serving Rust `engine`/`codec` modules. |
+| `bonsai-native-hash` | Exact published `crates.io` pin (`=0.1.3`): shared Windows CNG / portable SHA-256 streaming boundary consumed directly by `bonsai-windows-credentials`, `bonsai-artifacts`, `bonsai-tools`, `bonsai-speech-asr`, `bonsai-speech-tts`, and `bonsai-ci`, avoiding duplicated CNG FFI handles and reducing direct `sha2` edges to independent dev-test verification. |
+| `bonsai-neon-dot` | Exact published `crates.io` pin (`=0.1.5`): dependency-free shared ARM64 `SDOT`/`I8MM`/`FCVTL` capability and kernel boundary consumed by `bonsai-windows-process`, `bonsai-speech-tts`, and `bonsai-speech-asr` (`widen_f16_four`, `widen_f16_eight`, `dot_q8_0_block`, `smmla_q8_0_4x2`, `has_dotprod`, `has_i8mm`). |
+| `bonsai-ternary` | Exact published `crates.io` pin (`=0.1.3`): dependency-free shared `half_to_float` and quantized block primitives consumed by `bonsai-windows-process`, `bonsai-speech-tts`, and `bonsai-speech-asr`. |
+| `rayon` | TTS and ASR pin `=1.12.0` on non-Windows targets for safe borrowed projection, attention, and frontend work on a reusable, explicitly bounded team owned by its calling thread; Windows builds use `bonsai-windows-process::RowWorkerPool`. No global pool or whole-weight copies; one-worker and failed-team construction run serially. |
 | `memchr` | Direct (`default-features = false`) in `bonsai-broker`, `bonsai-chat`, and `bonsai-speech-service` for NEON-vectorized HTTP header, SSE line, multipart boundary, and ASCII folded Find scanning. |
-| Windows CNG | Runner artifact and maintenance digests use `bonsai_windows_credentials::Sha256` (`BCryptHashData`); CPU dispatch belongs to the Windows provider. Prism's `bonsai-native-hash` is external to this workspace. These paths alone establish no device speedup. |
+| Windows CNG | `bonsai-native-hash` owns the shared streaming CNG SHA-256 handle and `bonsai-windows-credentials` retains stateless `BCryptHash` (`digest_bytes`); CPU dispatch belongs to the Windows provider. These paths alone establish no device speedup. |
 | `mxc-sdk`, `flatbuffers` | Required security integration; pursue upstream modularity. |
 | Internal crates | Retain shared process/credential/audio/policy/artifact boundaries; no unused direct path edge found. |
 

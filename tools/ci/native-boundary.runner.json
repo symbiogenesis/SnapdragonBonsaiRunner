@@ -99,14 +99,14 @@
     },
     {
       "path": "Cargo.lock",
-      "bytes": 138782,
-      "sha256": "fcaee41ae6d3bc450f2f8719de9ddc10856105944ea34c5b1c1a2c62a39961df",
+      "bytes": 139711,
+      "sha256": "e0d56282e6f351fd8c39ed4ac15a844a6a461cac1b3f69d8a54352e3fe8a6507",
       "family": "native-asr"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 4870,
-      "sha256": "d3640b584293876eccc3152d2a8afd7483ce6a7c649bf2a43d12acf7dccfb762",
+      "bytes": 4956,
+      "sha256": "21d8f240e3c38771a80d36a93113a19f0307ae5d8048ce4fde9b8529986bd996",
       "family": "msvc-unwind"
     },
     {
@@ -135,8 +135,8 @@
     },
     {
       "path": "src/speech-asr/Cargo.toml",
-      "bytes": 1851,
-      "sha256": "b7399e439a822eeadd79af012e444641c43e534dad78d6b847966fd36eaa8226",
+      "bytes": 1977,
+      "sha256": "79d98f55d9c058102b30055045242f0040b03439dfa7312a898b961056330665",
       "family": "native-asr"
     },
     {
@@ -153,8 +153,8 @@
     },
     {
       "path": "src/speech-asr/src/native.rs",
-      "bytes": 13630,
-      "sha256": "49b2e5e706809dcaa2995df1c0447d8d3cd463e71228cfd589a1b5f710aa6474",
+      "bytes": 13765,
+      "sha256": "08f2c0c07b79c68199f15471f6a20f4e3caaa2c546af0d60603a8821e543b345",
       "family": "native-asr"
     },
     {
@@ -225,8 +225,8 @@
     },
     {
       "path": "tools/bonsai/src/publisher_startup/windows.rs",
-      "bytes": 13459,
-      "sha256": "7eb62764c63242c4383db7b252d147bc6b747f3a0909cd2fc9091e6feda871cd",
+      "bytes": 13475,
+      "sha256": "cde0381892703e5a678805f2e795aa1b3a70f37a3f0ec7c6f9b1a2953ac13356",
       "family": "publisher-runtime"
     },
     {
