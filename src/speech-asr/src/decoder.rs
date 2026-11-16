@@ -799,48 +799,80 @@ impl LayerState {
     }
 
     fn prepare_prefill(&mut self, kv_total: usize) -> io::Result<()> {
+        self.prepare_append(0, kv_total)
+    }
+
+    fn prepare_append(&mut self, start_kv: usize, add_kv: usize) -> io::Result<()> {
+        let total = start_kv.checked_add(add_kv).ok_or_else(invalid)?;
         match &mut self.data {
             LayerKv::F32 { keys, values } => {
-                keys.clear();
-                values.clear();
-                keys.try_reserve_exact(kv_total).map_err(io::Error::other)?;
-                values
-                    .try_reserve_exact(kv_total)
-                    .map_err(io::Error::other)?;
-                keys.resize(kv_total, 0.0);
-                values.resize(kv_total, 0.0);
+                keys.truncate(start_kv);
+                values.truncate(start_kv);
+                if keys.capacity() < total {
+                    keys.try_reserve_exact(total - keys.len())
+                        .map_err(io::Error::other)?;
+                }
+                if values.capacity() < total {
+                    values
+                        .try_reserve_exact(total - values.len())
+                        .map_err(io::Error::other)?;
+                }
+                keys.resize(total, 0.0);
+                values.resize(total, 0.0);
             }
             LayerKv::F16 { keys, values } => {
-                keys.clear();
-                values.clear();
-                keys.try_reserve_exact(kv_total).map_err(io::Error::other)?;
-                values
-                    .try_reserve_exact(kv_total)
-                    .map_err(io::Error::other)?;
-                keys.resize(kv_total, 0);
-                values.resize(kv_total, 0);
+                keys.truncate(start_kv);
+                values.truncate(start_kv);
+                if keys.capacity() < total {
+                    keys.try_reserve_exact(total - keys.len())
+                        .map_err(io::Error::other)?;
+                }
+                if values.capacity() < total {
+                    values
+                        .try_reserve_exact(total - values.len())
+                        .map_err(io::Error::other)?;
+                }
+                keys.resize(total, 0);
+                values.resize(total, 0);
             }
         }
         Ok(())
     }
 
-    fn write_batch(&mut self, src_k: &[f32], src_v: &[f32]) -> io::Result<()> {
+    fn write_append(&mut self, start_kv: usize, src_k: &[f32], src_v: &[f32]) -> io::Result<()> {
         match &mut self.data {
             LayerKv::F32 { keys, values } => {
                 finite(src_k)?;
                 finite(src_v)?;
-                keys.copy_from_slice(src_k);
-                values.copy_from_slice(src_v);
+                keys[start_kv..start_kv + src_k.len()].copy_from_slice(src_k);
+                values[start_kv..start_kv + src_v.len()].copy_from_slice(src_v);
             }
             LayerKv::F16 { keys, values } => {
-                if !packed::narrow_f32_to_f16_slice(src_k, keys)
-                    || !packed::narrow_f32_to_f16_slice(src_v, values)
-                {
+                if !packed::narrow_f32_to_f16_slice(
+                    src_k,
+                    &mut keys[start_kv..start_kv + src_k.len()],
+                ) || !packed::narrow_f32_to_f16_slice(
+                    src_v,
+                    &mut values[start_kv..start_kv + src_v.len()],
+                ) {
                     return Err(invalid());
                 }
             }
         }
         Ok(())
+    }
+
+    fn truncate_to(&mut self, keep: usize) {
+        match &mut self.data {
+            LayerKv::F32 { keys, values } => {
+                keys.truncate(keep);
+                values.truncate(keep);
+            }
+            LayerKv::F16 { keys, values } => {
+                keys.truncate(keep);
+                values.truncate(keep);
+            }
+        }
     }
 
     fn as_layer_cache(&self) -> LayerCache<'_> {
@@ -1216,35 +1248,153 @@ impl Session {
             guard.success = true;
             return Ok(Vec::new());
         }
-        let logits = prefill_inner(
+        let logits = prefill_rows_inner(
             &model,
             &mut guard.session.layers,
             &mut guard.session.workspace,
-            prompt,
-            audio,
+            0,
+            PrefillSource::Prompt { prompt, audio },
+            true,
             cancel,
-        )?;
+        )?
+        .ok_or_else(invalid)?;
         guard.session.position = total;
         guard.success = true;
         Ok(logits)
     }
+
+    /// Incrementally append prompt or control tokens at the current position,
+    /// skipping the final vocabulary projection when `need_logits` is `false`.
+    ///
+    /// Failures, cancellations, or unwinds roll every layer back to the previous position.
+    ///
+    /// # Errors
+    /// Rejects empty token slices when `need_logits` is `true`, context overflow, or invalid IDs.
+    pub fn prefill_tokens(
+        &mut self,
+        ids: &[u32],
+        need_logits: bool,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<Option<Vec<f32>>> {
+        check(cancel)?;
+        let saved_pos = self.position;
+        let model = Arc::clone(&self.model);
+        let c = model.config;
+        let kv_width = c.kv_heads * c.head_dim;
+        let end_pos = saved_pos.checked_add(ids.len()).ok_or_else(invalid)?;
+        if end_pos > c.context || (ids.is_empty() && need_logits) {
+            return Err(invalid());
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let mut guard = TruncateGuard {
+            session: self,
+            saved_pos,
+            kv_width,
+            success: false,
+        };
+        let logits = prefill_rows_inner(
+            &model,
+            &mut guard.session.layers,
+            &mut guard.session.workspace,
+            saved_pos,
+            PrefillSource::Tokens(ids),
+            need_logits,
+            cancel,
+        )?;
+        guard.session.position = end_pos;
+        guard.success = true;
+        Ok(logits)
+    }
+
+    /// Incrementally append encoded audio feature rows during live microphone capture.
+    ///
+    /// Failures, cancellations, or unwinds roll every layer back to the previous position.
+    ///
+    /// # Errors
+    /// Rejects mismatched audio dimensions, non-finite inputs, context overflow, or cancellation.
+    pub fn prefill_audio_chunk(
+        &mut self,
+        audio: &[f32],
+        rows: usize,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        check(cancel)?;
+        let saved_pos = self.position;
+        let model = Arc::clone(&self.model);
+        let c = model.config;
+        let hidden = c.hidden;
+        let kv_width = c.kv_heads * c.head_dim;
+        if audio.len() != rows.checked_mul(hidden).ok_or_else(invalid)? {
+            return Err(invalid());
+        }
+        let end_pos = saved_pos.checked_add(rows).ok_or_else(invalid)?;
+        if end_pos > c.context {
+            return Err(invalid());
+        }
+        finite(audio)?;
+        if rows == 0 {
+            return Ok(());
+        }
+        let mut guard = TruncateGuard {
+            session: self,
+            saved_pos,
+            kv_width,
+            success: false,
+        };
+        let _ = prefill_rows_inner(
+            &model,
+            &mut guard.session.layers,
+            &mut guard.session.workspace,
+            saved_pos,
+            PrefillSource::Audio { audio, rows },
+            false,
+            cancel,
+        )?;
+        guard.session.position = end_pos;
+        guard.success = true;
+        Ok(())
+    }
 }
 
-fn prefill_inner(
+enum PrefillSource<'a> {
+    Prompt {
+        prompt: &'a Prompt,
+        audio: &'a [f32],
+    },
+    Tokens(&'a [u32]),
+    Audio {
+        audio: &'a [f32],
+        rows: usize,
+    },
+}
+
+impl PrefillSource<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Prompt { prompt, .. } => prompt.ids().len(),
+            Self::Tokens(ids) => ids.len(),
+            Self::Audio { rows, .. } => *rows,
+        }
+    }
+}
+
+fn prefill_rows_inner(
     model: &Model,
     layers: &mut [LayerState],
     ws: &mut DecoderWorkspace,
-    prompt: &Prompt,
-    audio: &[f32],
+    start_pos: usize,
+    source: PrefillSource<'_>,
+    need_logits: bool,
     cancel: &mut impl FnMut() -> bool,
-) -> io::Result<Vec<f32>> {
+) -> io::Result<Option<Vec<f32>>> {
     let c = model.config;
-    let total = prompt.ids().len();
+    let total = source.len();
     let hidden = c.hidden;
     let kv_width = c.kv_heads * c.head_dim;
     let q_width = c.heads * c.head_dim;
     let workers = model.batch_threads;
-    let range = prompt.audio_rows();
 
     ensure_len(&mut ws.batch_a, total * hidden)?;
     ensure_len(&mut ws.batch_norm, total * hidden)?;
@@ -1256,22 +1406,44 @@ fn prefill_inner(
     ensure_len(&mut ws.batch_gate, total * c.intermediate)?;
     ensure_len(&mut ws.batch_up, total * c.intermediate)?;
 
-    for (pos, &id) in prompt.ids().iter().enumerate() {
-        check(cancel)?;
-        let dst = &mut ws.batch_a[pos * hidden..(pos + 1) * hidden];
-        if range.contains(&pos) {
-            let start = (pos - range.start) * hidden;
-            dst.copy_from_slice(&audio[start..start + hidden]);
-        } else {
-            let token_id = usize::try_from(id).map_err(|_| invalid())?;
-            model.embedding.row_into(token_id, dst)?;
+    match source {
+        PrefillSource::Prompt { prompt, audio } => {
+            let range = prompt.audio_rows();
+            for (pos, &id) in prompt.ids().iter().enumerate() {
+                check(cancel)?;
+                let dst = &mut ws.batch_a[pos * hidden..(pos + 1) * hidden];
+                if range.contains(&pos) {
+                    let start = (pos - range.start) * hidden;
+                    dst.copy_from_slice(&audio[start..start + hidden]);
+                } else {
+                    let token_id = usize::try_from(id).map_err(|_| invalid())?;
+                    model.embedding.row_into(token_id, dst)?;
+                }
+            }
+        }
+        PrefillSource::Tokens(ids) => {
+            for (pos, &id) in ids.iter().enumerate() {
+                check(cancel)?;
+                let dst = &mut ws.batch_a[pos * hidden..(pos + 1) * hidden];
+                let token_id = usize::try_from(id).map_err(|_| invalid())?;
+                model.embedding.row_into(token_id, dst)?;
+            }
+        }
+        PrefillSource::Audio { audio, .. } => {
+            check(cancel)?;
+            ws.batch_a[..total * hidden].copy_from_slice(audio);
         }
     }
     finite(&ws.batch_a)?;
 
-    let kv_total = total * kv_width;
+    let start_kv = start_pos * kv_width;
+    let add_kv = total * kv_width;
     for state in &mut *layers {
-        state.prepare_prefill(kv_total)?;
+        if start_pos == 0 {
+            state.prepare_prefill(add_kv)?;
+        } else {
+            state.prepare_append(start_kv, add_kv)?;
+        }
     }
 
     let divisor = scalar(c.head_dim).sqrt();
@@ -1304,24 +1476,34 @@ fn prefill_inner(
         )?;
 
         row_workers::try_run_aligned(&mut ws.batch_q, workers, q_width, &|elem_off, q_slice| {
-            let start_pos = elem_off / q_width;
+            let local_start = elem_off / q_width;
             for (local_pos, q_row) in q_slice.chunks_exact_mut(q_width).enumerate() {
                 normalize_heads(q_row, &block.query_norm, c)?;
-                rope_with_inv_freq(q_row, &model.inv_freq, c, start_pos + local_pos)?;
+                rope_with_inv_freq(
+                    q_row,
+                    &model.inv_freq,
+                    c,
+                    start_pos + local_start + local_pos,
+                )?;
             }
             Ok(())
         })?;
 
         row_workers::try_run_aligned(&mut ws.batch_k, workers, kv_width, &|elem_off, k_slice| {
-            let start_pos = elem_off / kv_width;
+            let local_start = elem_off / kv_width;
             for (local_pos, k_row) in k_slice.chunks_exact_mut(kv_width).enumerate() {
                 normalize_heads(k_row, &block.key_norm, c)?;
-                rope_with_inv_freq(k_row, &model.inv_freq, c, start_pos + local_pos)?;
+                rope_with_inv_freq(
+                    k_row,
+                    &model.inv_freq,
+                    c,
+                    start_pos + local_start + local_pos,
+                )?;
             }
             Ok(())
         })?;
 
-        state.write_batch(&ws.batch_k, &ws.batch_v)?;
+        state.write_append(start_kv, &ws.batch_k, &ws.batch_v)?;
 
         for _ in 0..(total * c.heads) {
             check(cancel)?;
@@ -1332,13 +1514,14 @@ fn prefill_inner(
             workers,
             q_width,
             &|elem_off, attn_slice| {
-                let start_pos = elem_off / q_width;
+                let local_start = elem_off / q_width;
                 let rows = attn_slice.len() / q_width;
-                let max_pos = start_pos + rows - 1;
-                let mut scores = zeros(max_pos + 1)?;
+                let max_history = start_pos + local_start + rows;
+                let mut scores = zeros(max_history)?;
                 for (local_pos, out_row) in attn_slice.chunks_exact_mut(q_width).enumerate() {
-                    let pos = start_pos + local_pos;
-                    let q_row = &queries[pos * q_width..(pos + 1) * q_width];
+                    let local_row = local_start + local_pos;
+                    let pos = start_pos + local_row;
+                    let q_row = &queries[local_row * q_width..(local_row + 1) * q_width];
                     let history_rows = pos + 1;
                     let row_scores = &mut scores[..history_rows];
                     for head in 0..c.heads {
@@ -1376,6 +1559,10 @@ fn prefill_inner(
             cancel,
         )?;
         add_residual_batch(&mut ws.batch_a, &ws.batch_proj, workers, hidden)?;
+
+        if layer_idx == last_layer && !need_logits {
+            return Ok(None);
+        }
 
         if layer_idx == last_layer {
             // Only the final prompt token feeds output_norm and tied lm_head;
@@ -1466,7 +1653,26 @@ fn prefill_inner(
         .embedding
         .multiply_with_threads(&ws.single_norm, workers, cancel)?;
     check(cancel)?;
-    Ok(logits)
+    Ok(Some(logits))
+}
+
+struct TruncateGuard<'a> {
+    session: &'a mut Session,
+    saved_pos: usize,
+    kv_width: usize,
+    success: bool,
+}
+
+impl Drop for TruncateGuard<'_> {
+    fn drop(&mut self) {
+        if !self.success {
+            let keep = self.saved_pos * self.kv_width;
+            for layer in &mut self.session.layers {
+                layer.truncate_to(keep);
+            }
+            self.session.position = self.saved_pos;
+        }
+    }
 }
 
 struct ResetGuard<'a> {

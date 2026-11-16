@@ -468,3 +468,63 @@ fn rust_asr_encoder_parallel_conv_matches_sequential_bits() -> io::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn rust_asr_encoder_simd_gelu_and_windowed_attention_parity() -> io::Result<()> {
+    let inputs = [
+        -12.0_f32, -3.0, -1.0, -0.0, 0.0, 0.5, 1.0, 3.0, 7.5, 16.03125, 20.0,
+    ];
+    let mut vec_vals = inputs;
+    numerics::gelu_slice_in_place(&mut vec_vals);
+    for (got, x) in vec_vals.iter().zip(inputs) {
+        assert_eq!(got.to_bits(), numerics::gelu(x).to_bits(), "x={x}");
+    }
+    assert_eq!(vec_vals[3].to_bits(), (-0.0_f32).to_bits());
+
+    // Multi-window cu_seqlens test: window=1 -> mel_per_chunk=2, rows_per_chunk=1,
+    // so window_rows=8.Perturbing mel frames after window 0 (frame >= 16) must leave
+    // window 0 encoder rows (0..8) bit-identical across workers.
+    let mut enc = fixture()?.with_threads(1)?;
+    enc.config.window = 1;
+    enc.config.max_positions = 16;
+    enc.sinusoids = super::build_sinusoids(16, enc.config.hidden)?;
+    let frames = 20_usize;
+    let mel_a: Vec<f32> = (0..enc.config.mel_bins * frames)
+        .map(|i| f32::from(i8::try_from((i % 13).cast_signed() - 6).unwrap_or(0)) * 0.05)
+        .collect();
+    let mut mel_b = mel_a.clone();
+    for f in 16..frames {
+        for b in 0..enc.config.mel_bins {
+            mel_b[b * frames + f] += 0.35;
+        }
+    }
+    let out_a = enc.encode_mel(&mel_a, frames, &mut || false)?;
+    let out_b = enc.encode_mel(&mel_b, frames, &mut || false)?;
+    assert_eq!(out_a.rows(), 10);
+    let win0_elems = 8 * out_a.width();
+    assert_eq!(
+        out_a.values()[..win0_elems]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        out_b.values()[..win0_elems]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    let enc4 = enc.with_threads(4)?;
+    let out_par = enc4.encode_mel(&mel_a, frames, &mut || false)?;
+    assert_eq!(
+        out_par
+            .values()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        out_a
+            .values()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}

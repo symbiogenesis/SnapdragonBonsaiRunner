@@ -1,71 +1,103 @@
-//! Erf-based GELU evaluated through convergent incomplete-gamma series/fraction.
-//! This independent f64 scalar policy is explicitly distinct from GGML kernels.
+//! Vectorized Chebyshev+Padé `erf`-based GELU (replacing iterative `f64` incomplete-gamma).
 
-#[expect(
-    clippy::many_single_char_names,
-    reason = "Retain the standard a/b/c/d notation of the convergent incomplete-gamma continued fraction."
-)]
-fn erfc_positive(value: f64) -> f64 {
-    if value == 0.0 {
-        return 1.0;
-    }
-    if value > 27.0 {
-        return 0.0;
-    }
-    let x = value * value;
-    let factor = (-x + 0.5 * x.ln() - 0.5 * std::f64::consts::PI.ln()).exp();
-    if x < 1.5 {
-        let mut step = 2.0;
-        let mut sum = step;
-        let mut power = 0.5;
-        for _ in 0..128 {
-            power += 1.0;
-            step *= x / power;
-            sum += step;
-            if step.abs() <= sum.abs() * f64::EPSILON {
-                break;
-            }
-        }
-        return (1.0 - sum * factor).clamp(0.0, 1.0);
-    }
-    let mut b = x + 0.5;
-    let mut c = 1.0e300;
-    let mut d = 1.0 / b;
-    let mut result = d;
-    for index in 1..=256 {
-        let i = f64::from(index);
-        let a = -i * (i - 0.5);
-        b += 2.0;
-        d = a * d + b;
-        if d.abs() < 1.0e-300 {
-            d = 1.0e-300;
-        }
-        c = b + a / c;
-        if c.abs() < 1.0e-300 {
-            c = 1.0e-300;
-        }
-        d = 1.0 / d;
-        let correction = d * c;
-        result *= correction;
-        if (correction - 1.0).abs() <= 4.0 * f64::EPSILON {
-            break;
-        }
-    }
-    (factor * result).clamp(0.0, 1.0)
-}
+use fearless_simd::{Level, dispatch, f32x4, prelude::*};
+use std::f32::consts::FRAC_1_SQRT_2;
+
+const CHEB_COEFFS: [f32; 10] = [
+    0.170_872_77,
+    -0.822_152_23,
+    1.488_515_87,
+    -1.135_203_98,
+    0.278_868_07,
+    -0.186_288_06,
+    0.096_784_18,
+    0.374_091_96,
+    1.000_023_68,
+    -1.265_512_23,
+];
 
 #[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "The independent GELU policy explicitly rounds its f64 probability result to f32."
+    clippy::suboptimal_flops,
+    reason = "Match scalar and SIMD non-FMA GELU rounding identically across targets."
 )]
+#[inline]
 pub(super) fn gelu(value: f32) -> f32 {
-    let x = f64::from(value);
-    let complement = erfc_positive(x.abs() / std::f64::consts::SQRT_2);
-    (0.5 * x
-        * if x < 0.0 {
-            complement
-        } else {
-            2.0 - complement
-        }) as f32
+    let xc = value.abs().min(7.5_f32);
+    let z = xc * FRAC_1_SQRT_2;
+    let t = 1.0_f32 / ((0.5_f32 * z) + 1.0_f32);
+    let mut p = CHEB_COEFFS[0];
+    for &c in &CHEB_COEFFS[1..] {
+        p = (p * t) + c;
+    }
+    let w = (-(z * z)) + p;
+    let u = w * 0.031_25_f32;
+    let u2 = u * u;
+    let pe = (((0.000_595_238_1_f32 * u2) + 0.107_142_86_f32) * u2) + 1.0_f32;
+    let uq = u * ((0.011_904_762_f32 * u2) + 0.5_f32);
+    let mut r = (pe + uq) / (pe - uq);
+    for _ in 0..5 {
+        r = r * r;
+    }
+    let erfc = t * r;
+    let scale = if value < 0.0_f32 {
+        0.5_f32 * erfc
+    } else {
+        1.0_f32 - (0.5_f32 * erfc)
+    };
+    value * scale
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "Match scalar and SIMD non-FMA GELU rounding identically across targets."
+)]
+#[inline(always)]
+fn gelu_slice_simd<S: Simd>(simd: S, values: &mut [f32]) {
+    let clamp_v = f32x4::splat(simd, 7.5_f32);
+    let inv_sqrt2 = f32x4::splat(simd, FRAC_1_SQRT_2);
+    let half = f32x4::splat(simd, 0.5_f32);
+    let one = f32x4::splat(simd, 1.0_f32);
+    let zero = f32x4::splat(simd, 0.0_f32);
+    let inv32 = f32x4::splat(simd, 0.031_25_f32);
+    let p2 = f32x4::splat(simd, 0.000_595_238_1_f32);
+    let p1 = f32x4::splat(simd, 0.107_142_86_f32);
+    let q1 = f32x4::splat(simd, 0.011_904_762_f32);
+
+    let (chunks, tail) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let x = f32x4::from_slice(simd, chunk);
+        let xc = x.abs().min(clamp_v);
+        let z = xc * inv_sqrt2;
+        let t = one / ((half * z) + one);
+        let mut p = f32x4::splat(simd, CHEB_COEFFS[0]);
+        for &c in &CHEB_COEFFS[1..] {
+            p = (p * t) + f32x4::splat(simd, c);
+        }
+        let w = zero - (z * z) + p;
+        let u = w * inv32;
+        let u2 = u * u;
+        let pe = (((p2 * u2) + p1) * u2) + one;
+        let uq = u * ((q1 * u2) + half);
+        let mut r = (pe + uq) / (pe - uq);
+        for _ in 0..5 {
+            r = r * r;
+        }
+        let erfc = t * r;
+        let neg_scale = half * erfc;
+        let pos_scale = one - neg_scale;
+        let scale = x.simd_lt(zero).select(neg_scale, pos_scale);
+        (x * scale).store_slice(chunk);
+    }
+    for value in tail {
+        *value = gelu(*value);
+    }
+}
+
+pub(super) fn gelu_slice_in_place(values: &mut [f32]) {
+    let level: Level = crate::packed::simd_level();
+    dispatch!(level, simd => gelu_slice_simd(simd, values));
 }

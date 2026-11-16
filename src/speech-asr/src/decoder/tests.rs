@@ -561,3 +561,70 @@ fn rust_asr_session_reset_retains_normal_capacity_and_shrinks_bursts() -> io::Re
     );
     Ok(())
 }
+
+#[test]
+fn rust_asr_decoder_incremental_prefill_matches_full_prefill_and_rolls_back() -> io::Result<()> {
+    let model = model()?;
+    let prompt = PromptTokens::new([0; 6], [0; 3], 2)?.automatic_prompt(3, 512)?;
+    let audio = [1.0, -0.5, 0.25, 0.75, -1.25, 0.5];
+
+    let mut full = model.session();
+    let full_logits = full.prefill(&prompt, &audio, &mut || false)?;
+
+    let mut inc = model.session();
+    assert!(
+        inc.prefill_tokens(&model_prefix(), false, &mut || false)?
+            .is_none()
+    );
+    assert_eq!(inc.position(), 9);
+    inc.prefill_audio_chunk(&audio[..4], 2, &mut || false)?;
+    assert_eq!(inc.position(), 11);
+    inc.prefill_audio_chunk(&audio[4..], 1, &mut || false)?;
+    assert_eq!(inc.position(), 12);
+
+    // Inject late error after partial commit attempt: must roll back to position 12.
+    let saved_cache = cache_vecs(inc.cache(0));
+    assert!(
+        inc.prefill_audio_chunk(&[f32::NAN; 2], 1, &mut || false)
+            .is_err()
+    );
+    assert!(inc.prefill_tokens(&[0, 1], false, &mut || true).is_err());
+    assert_eq!(inc.position(), 12);
+    assert_eq!(cache_vecs(inc.cache(0)), saved_cache);
+
+    let inc_logits = inc
+        .prefill_tokens(&model_suffix(), true, &mut || false)?
+        .ok_or_else(|| io::Error::other("missing suffix logits"))?;
+    assert_eq!(inc.position(), full.position());
+    assert_eq!(
+        inc_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        full_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    for layer in 0..full.layer_count() {
+        let (ik, iv) =
+            cache_vecs(inc.cache(layer)).ok_or_else(|| io::Error::other("missing inc layer"))?;
+        let (fk, fv) =
+            cache_vecs(full.cache(layer)).ok_or_else(|| io::Error::other("missing full layer"))?;
+        assert_eq!(
+            ik.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fk.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            iv.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fv.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+    return Ok(());
+
+    fn model_prefix() -> [u32; 9] {
+        PromptTokens::new([0; 6], [0; 3], 2)
+            .map(PromptTokens::prefix_ids)
+            .unwrap_or([0; 9])
+    }
+
+    fn model_suffix() -> [u32; 6] {
+        PromptTokens::new([0; 6], [0; 3], 2)
+            .map(PromptTokens::suffix_ids)
+            .unwrap_or([0; 6])
+    }
+}

@@ -6,13 +6,22 @@
 #![forbid(unsafe_code)]
 
 use crate::{
+    MAX_CLIP_SECONDS, SAMPLE_RATE,
     decoder::{CachePrecision, Session},
     encoder::{Encoded, Encoder},
-    frontend::{Frontend, MelSpectrogram},
-    protocol::{DecodeStop, Prompt, PromptTokens, completed_transcript},
+    frontend::{Frontend, FrontendScratch, MelSpectrogram},
+    protocol::{
+        DecodeStop, Prompt, PromptTokens, TranscribeOptions, completed_transcript,
+        completed_transcript_with_options,
+    },
     tokenizer::Tokenizer,
 };
 use std::{fs::OpenOptions, io, path::Path, sync::Arc};
+
+const LIVE_CHUNK_SAMPLES: usize = 8 * SAMPLE_RATE;
+const MIN_TAIL_SAMPLES: usize = 201;
+const SHORT_CLIP_HINT_MAX_SAMPLES: usize = (SAMPLE_RATE * 3) / 2;
+const CHAT_FRAME_TOKENS: usize = 15;
 
 /// Independent arithmetic identity; not the native GGML/flash-attention identity.
 pub const ARITHMETIC_IDENTITY: &str = "rust-asr-sdot-i8mm-v3-f16-kv-minimax-gelu";
@@ -62,6 +71,7 @@ fn check(cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
 /// Loaded immutable frontend/encoder/tokenizer and one isolated Rust decoder session.
 pub struct RustRecognizer {
     frontend: Frontend,
+    frontend_scratch: FrontendScratch,
     encoder: Encoder,
     tokenizer: Tokenizer,
     decoder: Session,
@@ -169,6 +179,7 @@ impl RustRecognizer {
         check(cancel)?;
         Ok(Self {
             frontend,
+            frontend_scratch: FrontendScratch::default(),
             encoder,
             tokenizer,
             decoder: Arc::new(model).session(),
@@ -227,9 +238,12 @@ impl RustRecognizer {
         self.decoder.reset();
         let guard = ClearSession(&mut self.decoder);
         check(cancel)?;
-        let mel = self
-            .frontend
-            .compute_with_threads(pcm, self.batch_threads, &mut *cancel)?;
+        let mel = self.frontend.compute_with_scratch(
+            pcm,
+            self.batch_threads,
+            &mut self.frontend_scratch,
+            &mut *cancel,
+        )?;
         observe(Observation::Frontend(&mel))?;
         check(cancel)?;
         let audio = self.encoder.encode(&mel, cancel)?;
@@ -245,6 +259,205 @@ impl RustRecognizer {
             cancel,
             observe,
         )
+    }
+
+    /// Recognize one bounded clip using optional short-clip language hints (`<= 1.5s`)
+    /// and repetition-suffix trimming when hitting the generation budget or repetition bar.
+    ///
+    /// # Errors
+    /// Rejects invalid PCM, invalid language hint strings, graph faults, cancellation, or
+    /// unrecovered incomplete generation.
+    pub fn transcribe_with_options(
+        &mut self,
+        pcm: &[f32],
+        options: &TranscribeOptions<'_>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<String> {
+        self.decoder.reset();
+        let guard = ClearSession(&mut self.decoder);
+        check(cancel)?;
+        let system_tokens = if pcm.len() <= SHORT_CLIP_HINT_MAX_SAMPLES
+            && let Some(lang) = options.short_clip_language
+        {
+            let trimmed = lang.trim();
+            if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+                return Err(invalid());
+            }
+            self.tokenizer.encode(&format!("Languages: {trimmed}."))?
+        } else {
+            Vec::new()
+        };
+        let mel = self.frontend.compute_with_scratch(
+            pcm,
+            self.batch_threads,
+            &mut self.frontend_scratch,
+            &mut *cancel,
+        )?;
+        check(cancel)?;
+        let audio = self.encoder.encode(&mel, cancel)?;
+        drop(mel);
+        check(cancel)?;
+        let prompt =
+            self.prompt_tokens
+                .prompt_with_system(&system_tokens, audio.rows(), self.context)?;
+        let budget = decode_budget(audio.rows(), prompt.ids().len(), self.context)?;
+        let logits = guard.0.prefill(&prompt, audio.values(), cancel)?;
+        decode_from_logits(
+            guard.0,
+            &self.tokenizer,
+            logits,
+            budget,
+            options.trim_repetition_on_stop,
+            cancel,
+            &mut |_| Ok(()),
+        )
+    }
+
+    /// Start an incremental live-microphone capture session that prefills 8-second
+    /// (`128,000`-sample) windows on disk/stream arrival before [`LiveCapture::finish`].
+    ///
+    /// Dropping [`LiveCapture`] at any stage unconditionally resets decoder KV state.
+    ///
+    /// # Errors
+    /// Rejects cancellation or failure while prefilling the 9-token prompt prefix.
+    pub fn begin_live_capture(
+        &mut self,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<LiveCapture<'_>> {
+        self.decoder.reset();
+        let prefix = self.prompt_tokens.prefix_ids();
+        if let Err(err) = self.decoder.prefill_tokens(&prefix, false, cancel) {
+            self.decoder.reset();
+            return Err(err);
+        }
+        Ok(LiveCapture {
+            recognizer: self,
+            pending_pcm: Vec::new(),
+            total_samples: 0,
+            prefilled_audio_rows: 0,
+        })
+    }
+}
+
+/// Incremental live-audio capture session holding exclusive access to one [`RustRecognizer`].
+pub struct LiveCapture<'a> {
+    recognizer: &'a mut RustRecognizer,
+    pending_pcm: Vec<f32>,
+    total_samples: usize,
+    prefilled_audio_rows: usize,
+}
+
+impl LiveCapture<'_> {
+    /// Append validated finite `[-1.0, 1.0]` 16 kHz mono samples and immediately prefill
+    /// any completed 8-second window while retaining at least `201` samples for reflect padding.
+    ///
+    /// # Errors
+    /// Rejects non-unit/non-finite PCM, clips exceeding `30` seconds, context exhaustion, or cancellation.
+    pub fn push_pcm(
+        &mut self,
+        samples: &[f32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<usize> {
+        check(cancel)?;
+        let max_samples = SAMPLE_RATE * MAX_CLIP_SECONDS;
+        let next_total = self
+            .total_samples
+            .checked_add(samples.len())
+            .ok_or_else(invalid)?;
+        if next_total > max_samples {
+            return Err(invalid());
+        }
+        for chunk in samples.chunks(4096) {
+            check(cancel)?;
+            if !crate::packed::pcm_in_unit_range(chunk) {
+                return Err(invalid());
+            }
+        }
+        if !samples.is_empty() {
+            self.pending_pcm
+                .try_reserve(samples.len())
+                .map_err(io::Error::other)?;
+            self.pending_pcm.extend_from_slice(samples);
+            self.total_samples = next_total;
+        }
+        let mut added_rows = 0_usize;
+        while self.pending_pcm.len() >= LIVE_CHUNK_SAMPLES + MIN_TAIL_SAMPLES {
+            let mel = self.recognizer.frontend.compute_with_scratch(
+                &self.pending_pcm[..LIVE_CHUNK_SAMPLES],
+                self.recognizer.batch_threads,
+                &mut self.recognizer.frontend_scratch,
+                &mut *cancel,
+            )?;
+            let encoded = self.recognizer.encoder.encode(&mel, cancel)?;
+            drop(mel);
+            let rows = encoded.rows();
+            let projected_rows = self
+                .prefilled_audio_rows
+                .checked_add(rows)
+                .ok_or_else(invalid)?;
+            let projected_prompt = CHAT_FRAME_TOKENS
+                .checked_add(projected_rows)
+                .ok_or_else(invalid)?;
+            let _ = decode_budget(projected_rows, projected_prompt, self.recognizer.context)?;
+            self.recognizer
+                .decoder
+                .prefill_audio_chunk(encoded.values(), rows, cancel)?;
+            self.prefilled_audio_rows = projected_rows;
+            added_rows += rows;
+            self.pending_pcm.drain(..LIVE_CHUNK_SAMPLES);
+        }
+        Ok(added_rows)
+    }
+
+    /// Encode the final tail audio, prefill the 6-token suffix, and decode the complete transcript.
+    ///
+    /// # Errors
+    /// Rejects clips under `201` tail samples, decoding faults, repetition, or cancellation.
+    pub fn finish(self, cancel: &mut impl FnMut() -> bool) -> io::Result<String> {
+        check(cancel)?;
+        if self.pending_pcm.len() < MIN_TAIL_SAMPLES {
+            return Err(invalid());
+        }
+        let mel = self.recognizer.frontend.compute_with_scratch(
+            &self.pending_pcm,
+            self.recognizer.batch_threads,
+            &mut self.recognizer.frontend_scratch,
+            &mut *cancel,
+        )?;
+        let encoded = self.recognizer.encoder.encode(&mel, cancel)?;
+        drop(mel);
+        let total_audio = self
+            .prefilled_audio_rows
+            .checked_add(encoded.rows())
+            .ok_or_else(invalid)?;
+        let total_prompt = CHAT_FRAME_TOKENS
+            .checked_add(total_audio)
+            .ok_or_else(invalid)?;
+        let budget = decode_budget(total_audio, total_prompt, self.recognizer.context)?;
+        self.recognizer
+            .decoder
+            .prefill_audio_chunk(encoded.values(), encoded.rows(), cancel)?;
+        let suffix = self.recognizer.prompt_tokens.suffix_ids();
+        let logits = self
+            .recognizer
+            .decoder
+            .prefill_tokens(&suffix, true, cancel)?
+            .ok_or_else(invalid)?;
+        decode_from_logits(
+            &mut self.recognizer.decoder,
+            &self.recognizer.tokenizer,
+            logits,
+            budget,
+            false,
+            cancel,
+            &mut |_| Ok(()),
+        )
+    }
+}
+
+impl Drop for LiveCapture<'_> {
+    fn drop(&mut self) {
+        self.recognizer.decoder.reset();
     }
 }
 
@@ -268,7 +481,19 @@ fn decode_audio(
     let budget = decode_budget(audio.rows(), prompt.ids().len(), context)?;
     observe(Observation::Prompt(&prompt))?;
     check(cancel)?;
-    let mut logits = session.prefill(&prompt, audio.values(), cancel)?;
+    let logits = session.prefill(&prompt, audio.values(), cancel)?;
+    decode_from_logits(session, tokenizer, logits, budget, false, cancel, observe)
+}
+
+fn decode_from_logits(
+    session: &mut Session,
+    tokenizer: &Tokenizer,
+    mut logits: Vec<f32>,
+    budget: usize,
+    trim_on_stop: bool,
+    cancel: &mut impl FnMut() -> bool,
+    observe: &mut impl FnMut(Observation<'_>) -> io::Result<()>,
+) -> io::Result<String> {
     session.reserve_decode(budget)?;
     let mut generated = Vec::new();
     generated
@@ -286,17 +511,34 @@ fn decode_audio(
         check(cancel)?;
         if token == tokenizer.eos() {
             let raw = tokenizer.decode(&generated)?;
-            let transcript = completed_transcript(&raw, DecodeStop::EndOfSequence)?.to_owned();
+            let transcript = if trim_on_stop {
+                completed_transcript_with_options(&raw, DecodeStop::EndOfSequence, true)?
+            } else {
+                completed_transcript(&raw, DecodeStop::EndOfSequence)?.to_owned()
+            };
             check(cancel)?;
             return Ok(transcript);
         }
         generated.push(token);
         if repeating(&generated) {
+            if trim_on_stop {
+                let raw = tokenizer.decode(&generated)?;
+                let transcript =
+                    completed_transcript_with_options(&raw, DecodeStop::Repetition, true)?;
+                check(cancel)?;
+                return Ok(transcript);
+            }
             return Err(invalid());
         }
         if index + 1 < budget {
             logits = session.step(token, cancel)?;
         }
+    }
+    if trim_on_stop {
+        let raw = tokenizer.decode(&generated)?;
+        let transcript = completed_transcript_with_options(&raw, DecodeStop::TokenLimit, true)?;
+        check(cancel)?;
+        return Ok(transcript);
     }
     Err(invalid())
 }

@@ -451,6 +451,7 @@ impl Encoder {
         }
 
         let num_rows = layout.audio_rows;
+        let window_rows = (8 * layout.rows_per_chunk).max(1);
         let mut norm_buf = zeros(num_rows * c.hidden)?;
         let mut q = zeros(num_rows * c.hidden)?;
         let mut k = zeros(num_rows * c.hidden)?;
@@ -472,6 +473,7 @@ impl Encoder {
                 &mut prepared,
                 &mut conv_scratch,
                 num_rows,
+                window_rows,
                 c,
                 workers,
                 cancel,
@@ -651,9 +653,7 @@ fn convolve_with_threads(
 
 fn gelu_parallel(values: &mut [f32], workers: usize, alignment: usize) -> io::Result<()> {
     row_workers::try_run_aligned(values, workers, alignment, &|_, slice| {
-        for value in &mut *slice {
-            *value = numerics::gelu(*value);
-        }
+        numerics::gelu_slice_in_place(slice);
         finite(slice)
     })
 }
@@ -724,6 +724,7 @@ fn transform_block(
     prepared: &mut PreparedBatch,
     scratch: &mut Vec<f32>,
     num_rows: usize,
+    window_rows: usize,
     c: Config,
     workers: usize,
     cancel: &mut impl FnMut() -> bool,
@@ -758,26 +759,25 @@ fn transform_block(
     let v_ref = &*v;
     let head_dim = c.hidden / c.heads;
     let divisor = scalar(head_dim).sqrt();
+    let window_rows = window_rows.max(1);
     row_workers::try_run_aligned(attn_out, workers, c.hidden, &|elem_off, slice| {
         let start_row = elem_off / c.hidden;
-        let mut scores = zeros(num_rows)?;
+        let mut scores = zeros(window_rows.min(num_rows).max(1))?;
         for (local_idx, out_row) in slice.chunks_exact_mut(c.hidden).enumerate() {
             let row_idx = start_row + local_idx;
+            let win_start = (row_idx / window_rows) * window_rows;
+            let win_end = (win_start + window_rows).min(num_rows);
+            let win_len = win_end - win_start;
             let q_row = &q_ref[row_idx * c.hidden..(row_idx + 1) * c.hidden];
+            let k_win = &k_ref[win_start * c.hidden..win_end * c.hidden];
+            let v_win = &v_ref[win_start * c.hidden..win_end * c.hidden];
+            let win_scores = &mut scores[..win_len];
             for head in 0..c.heads {
                 let offset = head * head_dim;
                 let q_head = &q_row[offset..offset + head_dim];
                 let out_head = &mut out_row[offset..offset + head_dim];
                 attention_head_bidirectional(
-                    q_head,
-                    k_ref,
-                    v_ref,
-                    num_rows,
-                    c.hidden,
-                    offset,
-                    head_dim,
-                    divisor,
-                    &mut scores,
+                    q_head, k_win, v_win, win_len, c.hidden, offset, head_dim, divisor, win_scores,
                     out_head,
                 )?;
             }
