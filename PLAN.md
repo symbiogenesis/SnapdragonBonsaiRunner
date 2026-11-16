@@ -146,7 +146,7 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify Prism's Foundation scheduling and source-package/Hexagon caches
   on matching hosted images, preserving complete correctness, mutation, packaging
   and independent ABI/SDK obligations.
-- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.30.**
+- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.31.**
   Complete actual-model, state, resource, quality and device acceptance using
   the source-bound package identities in the [distribution guide](docs/releases.md).
   Model-free release checks leave these development-runtime gates pending.
@@ -457,11 +457,11 @@ adoption decisions without displacing native daily-use acceptance.
   immutable logits and BPE/special parsing under the
   [engine contract](docs/native-rust-engine.md) and
   [Hexagon execution contract](docs/hexagon.md).
-- [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32` (wired end-to-end against
-  pinned `0.1.30`, plus post-`0.1.30` Prism `main` `NativeRowPool` and `6:1`
-  grouped GQA packed-KV decode/tile attention awaiting repin), expose and qualify
-  distinct `gdn-wy-f32-v1` arithmetic, decouple CPU tiled prefill from resident
-  Hexagon decode (`mixed-phase handoff`) once qualified, and verify selected-cache
+- [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32`, spin-then-park
+  `NativeRowPool`, and `6:1` grouped GQA packed-KV decode/tile attention (all
+  pinned in Prism `0.1.31`), expose and qualify distinct `gdn-wy-f32-v1`
+  arithmetic, decouple CPU tiled prefill from resident Hexagon decode
+  (`mixed-phase handoff`) once qualified, and verify selected-cache service
   service consumers and independent packed-KV head workers: scratch/admission,
   complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
@@ -886,9 +886,9 @@ nor editing the available Abliteration factors.
   under verified eviction/rollback contracts.
   Runner (`bonsai-windows-credentials`/`bonsai-artifacts`) now uses mapped
   `PrefetchVirtualMemory` + cancellable `4 MiB` chunked CNG SHA-256 verification
-  (`>= 4 MiB`), and post-`0.1.30` `prism-inference` `main` implements zero-copy
-  `MappedSlice` GGUF mapping + 8-worker parallel tensor payload validation (pending
-  a reviewed Foundation release repin and X1/X2 device qualification). Deferred
+  (`>= 4 MiB`), and pinned Prism `0.1.31` implements zero-copy `MappedSlice`
+  GGUF mapping + 8-worker parallel tensor payload validation (pending hosted
+  Foundation and X1/X2 device qualification). Deferred
   screening leads `#16` (aligned staging reuse), `#17` (optional Windows
   unbuffered direct I/O) and `#18` (owned tensor range mapping, read-only Swift
   views and host/NPU deduplication) remain gated behind measured cold-start/I/O/mapping
@@ -1135,12 +1135,12 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32` (wired end-to-end across
   `bonsai-cpu-policy` `swift_tiled_prefill_scratch_bytes`, `bonsai-tools`,
   `bonsai-chat` and `bonsai-broker` `:cpu-tiled-ffn-v1:{tokens}` readiness on
-  pinned Prism `0.1.30`) plus post-`0.1.30` `prism-inference` `main` CPU source
-  candidates (zero-alloc spin-then-park `NativeRowPool` replacing `rayon::ThreadPool`,
-  and bit-exact `G in {2, 3, 6}` grouped GQA packed-KV attention; pending a reviewed
-  release repin and X1/X2 qualification), and integrate further selected cross-token
-  and 8/16/32-token tiled-prefill consumers preserving transformed bases, causal
-  state, bounded scratch and rollback before timing the complete request.
+  pinned Prism `0.1.31`), zero-alloc spin-then-park `NativeRowPool`, and
+  bit-exact `G in {2, 3, 6}` grouped GQA packed-KV attention (also pinned in
+  `0.1.31`; pending hosted Foundation and X1/X2 qualification), and integrate
+  further selected cross-token and 8/16/32-token tiled-prefill consumers
+  preserving transformed bases, causal state, bounded scratch and rollback
+  before timing the complete request.
 - [ ] Use signed constant floor division only inside a measured parent hotspot
   with unchanged rounding/rejection and charged setup/dispatch costs.
 - [ ] After the selected CPU candidate's acceptance, review
@@ -1224,12 +1224,13 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Qualify existing full-FFN chains, sibling packets, multi-tile N=1 and
   tile-major reuse independently. Implement true N>1 prefill only with a supported
   signed solver, causal state, bounded VTCM/DMA and measured total-cost benefit.
-- [ ] Qualify post-`0.1.30` `prism-inference` `main` per-layer active-target gating
+- [ ] Qualify Prism `0.1.31` per-layer active-target gating
   (`adapter_affects_any`), which keeps `external_ffn_chain` active when
-  `[ffn_gate, ffn_up, ffn_down]` have no active LoRA and unlocks `external_ffn_swiglu`
-  across all 64 Swift layers under active `RankOneAdapter` (preserving original-basis
-  `up` for CPU `ffn_down` plus LoRA delta; pending release repin and device
-  qualification), and support rank-one/low-rank LoRA side-branches alongside
+  `[ffn_gate, ffn_up, ffn_down]` have no active LoRA and unlocks
+  `external_ffn_swiglu` across all 64 Swift layers under active `RankOneAdapter`
+  (preserving original-basis `up` for CPU `ffn_down` plus LoRA delta; pending
+  hosted Foundation and device qualification), and support rank-one/low-rank
+  LoRA side-branches alongside
   Hexagon's full `ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU + ffn_down` VTCM chain (on sibling CPU
   workers or explicit side-branch tensors without splitting intermediate FFN
   activations back to host DRAM) so daily-use standard LoRA (`scale 1.3`) retains
@@ -1308,16 +1309,20 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 ### Repin, CI and device qualification of landed screening controls
 
-- [ ] Publish a reviewed Foundation release bundle from `prism-inference` `main`
-  past `0.1.30` (`633624f` zero-copy `MappedSlice` GGUF + 8-worker payload
-  validation, `3cba373` spin-then-park `NativeRowPool`, `cc629e7` bit-exact
-  `G in {2, 3, 6}` grouped GQA packed-KV decode/tile attention, and `244578e`
-  `adapter_affects_any` external FFN/SwiGLU LoRA unlocking alongside `e9cb947`..`71f44bd`)
-  and repin [config/prism-inference.lock.json](config/prism-inference.lock.json)
-  under the [distribution guide](docs/releases.md) so installed and daily-use builds
-  consume them alongside the `0.1.30` runtime checkpoints, GDN guards, memory ledger
-  and worker cancellation (`#2`–`#7`, `#9`–`#13`, `#15`, `#19`–`#20`, `#22`, `#25`–`#26`,
-  `#28`, `#30`–`#34`, `#36`, `#45`–`#51`).
+- [x] Publish a reviewed Foundation release bundle from `prism-inference` `main`
+  (`0.1.31` at `577966d98cf8b36021df52da194b1a5540429a6b` delivering `633624f`
+  zero-copy `MappedSlice` GGUF + 8-worker payload validation, `3cba373`
+  spin-then-park `NativeRowPool`, `cc629e7` bit-exact `G in {2, 3, 6}` grouped
+  GQA packed-KV decode/tile attention, and `244578e` `adapter_affects_any`
+  external FFN/SwiGLU LoRA unlocking alongside `e9cb947`..`71f44bd` and the
+  five crates.io helper updates) and repin
+  [config/prism-inference.lock.json](config/prism-inference.lock.json) under
+  the [distribution guide](docs/releases.md) so installed and daily-use builds
+  consume them alongside the `0.1.30`/`0.1.31` runtime checkpoints, GDN guards,
+  memory ledger and worker cancellation (`#2`–`#7`, `#9`–`#13`, `#15`,
+  `#19`–`#20`, `#22`, `#25`–`#26`, `#28`, `#30`–`#34`, `#36`, `#45`–`#51`).
+  Complete `prism-inference` `Foundation` suite acceptance remains open
+  (`43900458316` failed `correctness-3` on `tests/runtime.rs::oversized_optional_checkpoint_preserves_an_older_prefix`).
 - [ ] Complete hosted `source-checks` and `foundation` compiler, strict Release
   analyzer and full regression-suite verdicts in both repositories under
   [promotion criteria](docs/validation.md#promotion-criteria); local merge checks
@@ -1378,7 +1383,7 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   pressure and L1/L2 cache behavior while preserving per-block reduction order.
   Implemented in source (physical X1/X2 throughput, parity and power qualification
   open): Prism `16`-row `PQ2`/`Q8_0`/`PTQ1` SIMD tiles, X1 `3`-head/`2`-head
-  grouped attention, `[token][head]` F16-packed `4`-head decode, and post-`0.1.30`
+  grouped attention, `[token][head]` F16-packed `4`-head decode, and `0.1.31`
   bit-exact `G in {2, 3, 6}` grouped GQA packed-KV attention + zero-alloc
   spin-then-park `NativeRowPool`,
   `bonsai-speech-tts` `4`-row `Q8_0`/`Q4_K`/`Q6_K` SIMD tiles in

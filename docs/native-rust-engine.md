@@ -6,7 +6,7 @@ app, broker, provisioning and release integration. The
 [compiled release lock](../config/prism-inference.lock.json) is authoritative for
 the runtime version, source, archive and installed file identities.
 
-The development default is Prism **0.1.30**, original Swift PQ2, eight CPU row
+The development default is Prism **0.1.31**, original Swift PQ2, eight CPU row
 workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (four when the host
 family is unknown or in fixed-four qualification controls), K4/V4 cache and the
 standard adapter at scale 1.3. Supported X2 workers
@@ -15,7 +15,7 @@ accelerator initialization is unavailable. Trusted `--placement cpu` explicitly
 selects CPU execution, and explicit `--cpu-prefill-tokens 8|16|32`
 (`-CpuPrefillTokens` / `cpuPrefillTokens`) enables CPU tiled FFN prefill with
 exact `--cpu-prefill-scratch-bytes` and `:cpu-tiled-ffn-v1:{tokens}` readiness
-verification on Prism 0.1.30 (skipping implicit Hexagon installation and
+verification on Prism 0.1.31 (skipping implicit Hexagon installation and
 reporting effective CPU projection). These placement choices preserve the engine and weights;
 `--publisher-engine` separately selects the pinned publisher rollback. Failures
 never silently switch engines, weights or cache precision.
@@ -195,11 +195,11 @@ extend reuse across edited, regenerated and switched branches.
 
 ### Long-request runtime deadline
 
-Runner's ordinary chat path and the pinned Prism 0.1.30 private HTTP server impose
+Runner's ordinary chat path and the pinned Prism 0.1.31 private HTTP server impose
 no total generation deadline, including prefill. Explicit diagnostic deadlines,
 Stop/cancellation, bounded header/body intake and per-write limits remain in
 force. The verified source-bound release is documented in the
-[delivery record](evidence/prism-0.1.30-release.md).
+[delivery record](evidence/prism-0.1.31-release.md).
 
 The previous 0.1.27 private server imposed a ten-minute cutoff that could surface
 as `backend_generation_failed` before response headers. Older empty backend logs

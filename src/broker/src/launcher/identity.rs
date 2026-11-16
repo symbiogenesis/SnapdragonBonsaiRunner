@@ -258,7 +258,7 @@ fn startup_projection_matches(
 ) -> bool {
     let Some(startup) = &model.startup_projection else {
         // Historical releases, including 0.1.27, predate this observation.
-        // The reviewed 0.1.28 and 0.1.30 tuples must identify completed initialization.
+        // The reviewed 0.1.28, 0.1.30 and 0.1.31 tuples must identify completed initialization.
         return !workers.projection_startup_required;
     };
     let requested = if workers.placement == crate::inference::Placement::Cpu {
@@ -564,8 +564,8 @@ mod tests {
             validate_native_identity(&model_response(&legacy_model)?, false, true, legacy).is_ok()
         );
 
-        let (mut model, _) = kv_cache_model_for_version("0.1.30", false, true);
-        let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
+        let (mut model, _) = kv_cache_model_for_version("0.1.31", false, true);
+        let auto = WorkerReadiness::for_version("0.1.31", 4).with_kv_cache(Some(KvCache::Rsq4));
         assert!(validate_native_identity(&model_response(&model)?, false, true, auto).is_err());
         let mut legacy_with_startup = legacy_model;
         legacy_with_startup["startup_projection"] = projection_startup("cpu");
@@ -589,7 +589,7 @@ mod tests {
         model["startup_projection"] = projection_startup("cpu");
         model["startup_projection"]["requested"] = serde_json::json!("cpu");
         assert!(validate_native_identity(&model_response(&model)?, false, true, cpu).is_ok());
-        let (mut ptq1, _) = kv_cache_model_for_version("0.1.30", true, true);
+        let (mut ptq1, _) = kv_cache_model_for_version("0.1.31", true, true);
         ptq1["startup_projection"] = projection_startup("hexagon-native-q2");
         assert!(validate_native_identity(&model_response(&ptq1)?, true, true, auto).is_err());
         ptq1["startup_projection"] = projection_startup("cpu");
@@ -603,8 +603,8 @@ mod tests {
         use crate::inference::{KvCache, Placement};
         use serde_json::json;
 
-        let (mut model, _) = kv_cache_model_for_version("0.1.30", false, true);
-        let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
+        let (mut model, _) = kv_cache_model_for_version("0.1.31", false, true);
+        let auto = WorkerReadiness::for_version("0.1.31", 4).with_kv_cache(Some(KvCache::Rsq4));
         for identity in [
             "hexagon-v73-hvx-native-q2-partial-v1-experimental",
             "hexagon-v81-hvx-native-q2-partial-v1-experimental",
@@ -631,7 +631,7 @@ mod tests {
         cpu_model["startup_projection"]["requested"] = json!("cpu");
         assert!(validate_native_identity(&model_response(&cpu_model)?, false, true, cpu).is_err());
 
-        let (mut ptq1, _) = kv_cache_model_for_version("0.1.30", true, true);
+        let (mut ptq1, _) = kv_cache_model_for_version("0.1.31", true, true);
         ptq1["startup_projection"] = model["startup_projection"].clone();
         assert!(validate_native_identity(&model_response(&ptq1)?, true, true, auto).is_err());
 
@@ -668,7 +668,7 @@ mod tests {
         use crate::inference::KvCache;
         use serde_json::json;
         let (model, _) = kv_cache_model(false, false);
-        let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
+        let auto = WorkerReadiness::for_version("0.1.31", 4).with_kv_cache(Some(KvCache::Rsq4));
         for (field, value) in [
             ("schema_version", json!(2)),
             ("schema_version", json!(true)),
@@ -750,7 +750,7 @@ mod tests {
         use crate::inference::KvCache;
         use serde_json::json;
         let (mut model, _) = kv_cache_model(false, false);
-        let auto = WorkerReadiness::for_version("0.1.30", 4).with_kv_cache(Some(KvCache::Rsq4));
+        let auto = WorkerReadiness::for_version("0.1.31", 4).with_kv_cache(Some(KvCache::Rsq4));
         model["startup_projection"] = projection_startup("external");
         for identity in ["", " ", "bad\nidentity", &"x".repeat(257)] {
             model["startup_projection"]["identity"] = json!(identity);
@@ -935,7 +935,7 @@ mod tests {
 
         let scratch = 11_501_568_usize;
         for kv in [KvCache::F16, KvCache::Rsq4] {
-            let (mut prefill_model, _) = kv_cache_model_for_version("0.1.30", false, true);
+            let (mut prefill_model, _) = kv_cache_model_for_version("0.1.31", false, true);
             prefill_model["startup_projection"] = projection_startup("cpu");
             prefill_model["cpu_prefill_tokens"] = json!(8);
             prefill_model["cpu_prefill_scratch_bytes"] = json!(scratch);
@@ -952,7 +952,7 @@ mod tests {
                 format!("{base_graph}:cpu-tiled-ffn-v1:8")
             };
             prefill_model["startup_graph_identity"] = json!(updated_graph);
-            let policy = WorkerReadiness::for_version("0.1.30", 4)
+            let policy = WorkerReadiness::for_version("0.1.31", 4)
                 .with_kv_cache(Some(kv))
                 .with_cpu_prefill(Some((8, scratch)));
             assert_eq!(
@@ -1174,7 +1174,7 @@ mod tests {
             );
         }
         for expected in [8, 12] {
-            let policy = WorkerReadiness::for_version("0.1.30", expected);
+            let policy = WorkerReadiness::for_version("0.1.31", expected);
             assert!(validate_native_identity(&response(None), false, false, policy).is_err());
             assert!(
                 validate_native_identity(
@@ -1198,7 +1198,7 @@ mod tests {
             model["row_workers"] = json!(expected);
             model["startup_projection"] = projection_startup("cpu");
             let policy =
-                WorkerReadiness::for_version("0.1.30", expected).with_kv_cache(Some(KvCache::Rsq4));
+                WorkerReadiness::for_version("0.1.31", expected).with_kv_cache(Some(KvCache::Rsq4));
             assert!(
                 validate_native_identity(&model_response(&model)?, false, false, policy).is_ok()
             );
@@ -1328,9 +1328,10 @@ mod context_tests {
             ("0.1.29", false, true, true),
             ("0.1.30", false, true, true),
             ("0.1.31", false, true, true),
+            ("0.1.32", false, true, true),
             ("1.0.0", false, false, true),
-            ("0.1.030", false, false, true),
-            ("0.1.30-dev", false, false, true),
+            ("0.1.031", false, false, true),
+            ("0.1.31-dev", false, false, true),
         ] {
             let w = WorkerReadiness::for_version(version, 4);
             assert_eq!(w.allows_missing_row_workers(), legacy_workers, "{version}");

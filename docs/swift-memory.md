@@ -1,6 +1,6 @@
 # Swift artifacts, memory and PTQ1
 
-**Original PQ2 on native Rust Prism 0.1.30 is the development default**, with eight
+**Original PQ2 on native Rust Prism 0.1.31 is the development default**, with eight
 CPU row workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (`X2`; four when
 the host family is unknown or in fixed-four qualification controls), standard adapter
 scale 1.3 and [X2 NPU placement](hexagon.md) when initialization
@@ -286,7 +286,7 @@ Shared pages do not reduce admission because
 divergent requests may retain the old cache. Tiled prefill and speculation need
 separate additive reservations: `swift_tiled_prefill_scratch_bytes` and
 `SwiftContextPlan::for_profile_with_prefill` / `for_profile_with_options` charge
-exact Prism 0.1.30 `--cpu-prefill-scratch-bytes` (`8`, `16` or `32` tokens)
+exact Prism 0.1.31 `--cpu-prefill-scratch-bytes` (`8`, `16` or `32` tokens)
 into both the child `--memory-limit-bytes` Job budget and pre-spawn physical
 reserve before artifact I/O.
 
@@ -438,7 +438,7 @@ comparison uses source `73bfe6cc485554822f80c473a3c0c4f25e80f41b`.
 
 ### Native allocation candidates
 
-The source-bound Prism 0.1.30 bundle includes redundant-storage removals without
+The source-bound Prism 0.1.31 bundle includes redundant-storage removals without
 changing the selected model weights, cache precision, floating-point operations
 or worker count. These source-derived payload counts do not establish measured
 process savings or authorize lower conservative admission charges.
@@ -482,10 +482,10 @@ timestamps, making `1×` cold NVMe read throughput and `1×` warm multicore
 and `bonsai-artifacts`) uses read-only Windows file mapping (`MIN_MAPPED_HASH_BYTES = 4 MiB`)
 with `16 MiB` `PrefetchVirtualMemory` windows and cancellable `4 MiB` chunked CNG
 SHA-256 verification (retaining buffered fallback for smaller/unmappable inputs).
-In post-`0.1.30` `prism-inference` `main` source (pending a reviewed release repin and
-X1/X2 device qualification), `bonsai-gguf` and `bonsai-native-hash` likewise map
-`>= 4 MiB` GGUF files zero-copy (`MappedSlice`) with `16 MiB` `PrefetchVirtualMemory`,
-`4 MiB` chunked CNG SHA-256, and up to 8-worker parallel tensor payload validation.
+In pinned Prism 0.1.31 (pending X1/X2 device qualification), `bonsai-gguf` and
+`bonsai-native-hash` likewise map `>= 4 MiB` GGUF files zero-copy
+(`MappedSlice`) with `16 MiB` `PrefetchVirtualMemory`, `4 MiB` chunked CNG
+SHA-256, and up to 8-worker parallel tensor payload validation.
 Cross-process handle inheritance and `#18` host/NPU deduplication remain deferred
 (see below). Hashing, census and export use bounded buffers.
 

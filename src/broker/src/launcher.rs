@@ -2999,7 +2999,7 @@ mod tests {
             Some(LaunchError::Arguments)
         );
 
-        // Native 0.1.30 supports vision unless --no-mmproj opts out.
+        // Native 0.1.31 supports vision unless --no-mmproj opts out.
         let mut native_opt_out = swift.clone();
         native_opt_out.push("--no-mmproj".into());
         let native = LaunchConfig::parse(swift)?;

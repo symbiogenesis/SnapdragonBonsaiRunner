@@ -7,8 +7,8 @@ run on native ARM64 as part of target-profile acceptance.
 This guide owns arithmetic, dispatch, qualification and the
 [X2 thread screen](#x2-cpu-thread-screen). Synthetic parity qualifies neither
 whole-model parity nor device speedup. Runner's active
-[release lock](../config/prism-inference.lock.json) pins Prism 0.1.30 at
-`89df9aaff9e580d66679f2befe94d471bcf4fc7f`; later source candidates retain separate identities. The fixed CPU
+[release lock](../config/prism-inference.lock.json) pins Prism 0.1.31 at
+`577966d98cf8b36021df52da194b1a5540429a6b`; later source candidates retain separate identities. The fixed CPU
 comparison baseline remains 0.1.23 with explicit FP16 KV. The current development repin
 does not qualify CPU performance; [PLAN.md](../PLAN.md#cpu-kernels) owns remaining work.
 
@@ -75,7 +75,7 @@ The pinned source includes these consumers. Parallel quantized attention serves
 the selected packed-cache path; explicit `--cpu-prefill-tokens 8|16|32` prompt
 tiling is wired end-to-end through `bonsai-cpu-policy`, `bonsai-tools`, `bonsai-chat`
 and `bonsai-broker` (omitted by default, pairing exact `--cpu-prefill-scratch-bytes`
-and `:cpu-tiled-ffn-v1:{tokens}` readiness on Prism `0.1.30` while disabling
+and `:cpu-tiled-ffn-v1:{tokens}` readiness on Prism `0.1.31` while disabling
 implicit Hexagon placement), and sampled suffixes remain outside ordinary Runner
 launch policy:
 
@@ -94,16 +94,16 @@ below) remain gated on compiled strict Release checks, fallback controls and mat
 complete-request CI receipts. Deferred CPU kernel candidates (`#23`–`#25`, `#27`, `#29`)
 remain outside the active implementation queue until baseline attribution establishes an
 actionable hotspot and each path closes its exact arithmetic, tail/scale and benefit
-requirements. The 0.1.30 binary delivery includes its source-bound helper
+requirements. The 0.1.31 binary delivery includes its source-bound helper
 implementations; it does not establish model parity, benefit or profile promotion. Changed
 helper registry APIs still require publication before dependent registry crates; binary
 delivery does not establish that separate publication.
 
-### Post-0.1.30 runtime candidates (pending release repin and device qualification)
+### 0.1.31 runtime candidates (pending hosted CI and device qualification)
 
-Post-`0.1.30` `prism-inference` `main` source includes two additional CPU runtime
-optimizations (verified in local unit/workspace checks; awaiting a reviewed
-Foundation release repin, hosted CI and X1/X2 device qualification):
+Pinned `0.1.31` delivers two additional CPU runtime optimizations (verified
+in local unit/workspace checks; awaiting full hosted Foundation acceptance and
+X1/X2 device qualification):
 
 - **Zero-allocation spin-then-park `NativeRowPool`:** Replaces `rayon::ThreadPool`
   across parallel row, sibling and tile kernels (`kernels::parallel`) with a
@@ -148,7 +148,7 @@ In particular, inspect table-register residency and lookup/setup costs rather
 than inferring machine savings from source counts. Complete-model logits/state,
 adapter and cancellation parity and matched CPU-only complete-request benefit
 remain separate gates under [cross-generation promotion](#cross-generation-cpu-promotion).
-The reviewed 0.1.30 bundle delivers these paths without closing those gates.
+The reviewed 0.1.31 bundle delivers these paths without closing those gates.
 Changed NEON helper registry APIs retain their separate publication obligation.
 
 ### Joined BF16 prompt tiles and fused packed-KV scans
@@ -174,7 +174,7 @@ portable and feature-disabled controls, complete-model state/logit/adapter/
 cancellation parity and matched CPU-only benefit remain separate gates under
 [cross-generation promotion](#cross-generation-cpu-promotion). X1 applicability
 does not supply an X1 timing result. The fixed X2 CPU-bundle comparison cannot
-qualify these sources. The 0.1.30 binary delivery does not replace a newly
+qualify these sources. The 0.1.31 binary delivery does not replace a newly
 declared matching-source workload or its independent acceptance.
 
 ### Provisional GDN and prepared current-token KV
@@ -318,7 +318,7 @@ at centroid/midpoint boundaries, neighboring binary32 values, extreme rounded
 ties and deterministic finite bit patterns, then compare complete packed
 records across scale extremes and fitted-scale selection.
 
-The reviewed 0.1.30 bundle includes this source change without a measured X1 speedup.
+The reviewed 0.1.31 bundle includes this source change without a measured X1 speedup.
 Strict native/fallback compilation, exact codec and failure controls do not
 replace complete-model state/logit/adapter/cancellation acceptance, codegen,
 resources or matched CPU-only complete-request benefit under the
@@ -353,7 +353,7 @@ execution, ARM64 codegen/resources, full-model state/logit/adapter/cancellation
 parity and matched CPU-only complete-request benefit remain pending. Apply the
 [cross-generation promotion gates](#cross-generation-cpu-promotion); X1 deployment
 and performance claims retain their applicability and measurement boundaries.
-The reviewed 0.1.30 bundle consumes these paths; binary delivery does not qualify
+The reviewed 0.1.31 bundle consumes these paths; binary delivery does not qualify
 their benefit. Changed NEON helper registry APIs retain separate publication gates.
 
 ### Zero-weight packed values, temporal GDN heads and joined Q8 tiles
@@ -390,7 +390,7 @@ cancellation acceptance, and a newly declared matching-source CPU-only request
 comparison under the [cross-generation gates](#cross-generation-cpu-promotion).
 Keep ordinary K4/V4 decode, exact tiled prefill and PTQ1 acceptance distinct.
 The fixed 0.1.23/0.1.25 comparison cannot qualify these paths, and their inclusion
-in the 0.1.30 development bundle does not close those independent gates.
+in the 0.1.31 development bundle does not close those independent gates.
 
 ### Compact KV rotations and joined Q8 decode siblings
 
@@ -427,7 +427,7 @@ evaluator must reject candidate receipts. See Prism's
 
 The earlier predeclared local source diagnostic stopped at native supervisor
 process creation before Cargo or any test started; it was not retried. The
-source-bound 0.1.30 binary delivery does not convert that failed attempt into
+source-bound 0.1.31 binary delivery does not convert that failed attempt into
 compiled-control acceptance. Separate native ARM64 strict Release analysis,
 helper tests, feature-disabled controls, collector linking, ARM64 codegen/stack,
 complete-model state/logit/adapter/cancellation and matched complete-request
@@ -450,7 +450,7 @@ signed zero, subnormals, invalid inputs and graph recovery. These controls and
 the reduced source work do not establish complete-model parity or X2 benefit.
 Require final-source native/portable/feature-disabled analysis, production
 linking, codegen/resources and matched CPU-only complete-request acceptance.
-Inclusion in the 0.1.30 development bundle does not close those gates.
+Inclusion in the 0.1.31 development bundle does not close those gates.
 
 ### Current-source comparison admission
 
@@ -529,7 +529,7 @@ public helper API. Deinterleaving and row-transpose costs, codegen/stack,
 strict native ARM64 analysis and linking, feature-disabled execution, complete-model
 state/logits/adapters/cancellation and matched CPU-only complete-request benefit
 remain independent gates under [cross-generation promotion](#cross-generation-cpu-promotion).
-The source-bound 0.1.30 bundle includes the changed helper implementation;
+The source-bound 0.1.31 bundle includes the changed helper implementation;
 publishing its registry API before a dependent registry crate remains separate.
 
 The fixed local source check at Prism
@@ -573,7 +573,7 @@ work observations, not latency or memory measurements.
 
 Native ARM64/feature-disabled analysis, scalar controls, production linking,
 full-model state/logit/adapter/cancellation acceptance and matched complete-request
-benefit remain required. Runner's 0.1.30 development pin consumes these source
+benefit remain required. Runner's 0.1.31 development pin consumes these source
 changes without qualifying the named controls, model behavior or benefit.
 
 ### Bounded attention score growth
@@ -597,7 +597,7 @@ Poisoned ordinary/tiled score controls, allocation refusal, non-power-of-two
 ceilings and short tails cover storage ownership independently of timing.
 Strict Release analysis/linking, compiled controls, complete-model state/logits/
 adapters/cancellation and matched CPU request benefit remain pending. Runner's
-0.1.30 development pin consumes these source changes without qualifying the
+0.1.31 development pin consumes these source changes without qualifying the
 complete-model controls or matched CPU request benefit.
 
 ## Execution and dispatch

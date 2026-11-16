@@ -63,7 +63,7 @@ impl Placement {
 // requested placement and effective CPU backend in a genuine reviewed release.
 // Source omission alone does not justify a smaller fixed memory allowance.
 const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"));
+    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
 
 fn select_placement(release: &ReleasePin, requested: Placement) -> Result<Placement, LaunchError> {
     if requested == Placement::Auto || reviewed_release_matches(release, CPU_PLACEMENT_RELEASE) {
@@ -274,7 +274,7 @@ fn row_workers_supported(
 // This combined review also retains four row workers, K4/V4 and latest reuse;
 // a later repin cannot silently lose those existing serving capabilities.
 const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"));
+    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
 
 // K4/V3 changes precision and needs its own reviewed capacity/quality release.
 // Both gates must identify the same genuine released source before this profile
@@ -287,7 +287,7 @@ const K4V3_CONTEXT_RELEASE: Option<(&str, &str)> = None;
 // 4 GiB. Precision and process charges remain unchanged; this gate cannot
 // authorize an unrelated memory release.
 const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"));
+    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
 
 fn full_context_release_matches(release: &ReleasePin, reviewed: Option<(&str, &str)>) -> bool {
     reviewed.is_some()
@@ -321,7 +321,7 @@ pub(super) fn memory_context_supported() -> Result<bool, LaunchError> {
 // bounded timeout, and resets live model state on authenticated `POST /reset`
 // without expecting a `Content-Type` header.
 const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"));
+    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
 
 fn reset_on_cancel_release_matches(release: &ReleasePin) -> bool {
     reviewed_release_matches(release, RESET_ON_CANCEL_RELEASE)
@@ -350,13 +350,13 @@ pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
 // that implements vision projector loading, image embedding injection and the
 // matching readiness identity fields.
 const VISION_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"));
+    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
 
 // CPU tiled prefill requires a separately reviewed native release supporting
 // `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
 // readiness fields (`cpu_prefill_tokens`, `cpu_prefill_scratch_bytes`, `:cpu-tiled-ffn-v1:{n}`).
 const CPU_PREFILL_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"));
+    Some(("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"));
 
 pub(super) fn parse_cpu_prefill_tokens(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
     match value.and_then(std::ffi::OsStr::to_str) {
@@ -442,11 +442,12 @@ mod tests {
         let mut pin = release(LOCK)?;
         assert_eq!(select_placement(&pin, Placement::Cpu)?, Placement::Cpu);
         for (version, commit) in [
-            ("0.1.27", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.28", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
+            ("0.1.27", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.28", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.30", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.32", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.31", "0000000000000000000000000000000000000000"),
             ("0.1.31", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.30", "0000000000000000000000000000000000000000"),
-            ("0.1.30", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -461,10 +462,11 @@ mod tests {
         let mut pin = release(LOCK)?;
         assert!(reset_on_cancel_release_matches(&pin));
         for (version, commit) in [
-            ("0.1.27", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.28", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.30", "99671be7ab2be01e406a11b0c3d6caede398d96f"),
-            ("0.1.30", "0000000000000000000000000000000000000000"),
+            ("0.1.27", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.28", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.30", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.31", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
+            ("0.1.31", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -500,10 +502,12 @@ mod tests {
             Some(KvCache::Rsq4)
         );
         for (version, commit) in [
-            ("0.1.27", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.28", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
+            ("0.1.27", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.28", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.30", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.32", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.31", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.30", "0000000000000000000000000000000000000000"),
+            ("0.1.31", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -524,11 +528,11 @@ mod tests {
         assert_eq!(K4V4_FULL_CONTEXT_RELEASE, MEMORY_CONTEXT_RELEASE);
         assert!(!full_context_release_matches(&pin, None));
         assert!(full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
-        for version in ["0.1.27", "0.1.28", "0.1.31"] {
+        for version in ["0.1.27", "0.1.28", "0.1.30", "0.1.32"] {
             pin.version = version.into();
             assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         }
-        pin.version = "0.1.30".into();
+        pin.version = "0.1.31".into();
         pin.commit = "0".repeat(40);
         assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         let other_source = (pin.version.as_str(), pin.commit.as_str());
@@ -553,10 +557,11 @@ mod tests {
             KvCache::Rsq4K3v
         );
         for (version, commit) in [
-            ("0.1.27", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.28", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.31", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.30", "0000000000000000000000000000000000000000"),
+            ("0.1.27", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.28", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.30", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.32", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.31", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -582,11 +587,12 @@ mod tests {
             "0.1.27",
             "0.1.28",
             "0.1.29",
-            "0.1.31",
-            "0.1.30-dev",
-            "v0.1.30",
-            "0.1.30.0",
-            "0.1.030",
+            "0.1.30",
+            "0.1.32",
+            "0.1.31-dev",
+            "v0.1.31",
+            "0.1.31.0",
+            "0.1.031",
             "",
             "latest",
         ] {
@@ -676,11 +682,12 @@ mod tests {
             "0.1.27",
             "0.1.28",
             "0.1.29",
-            "0.1.31",
-            "0.1.30-dev",
-            "v0.1.30",
-            "0.1.30.0",
-            "0.1.030",
+            "0.1.30",
+            "0.1.32",
+            "0.1.31-dev",
+            "v0.1.31",
+            "0.1.31.0",
+            "0.1.031",
             "",
             "latest",
         ] {
@@ -789,8 +796,8 @@ mod tests {
         assert!(!broker_pipe_supported()?);
         assert!(!broker_pipe_release_matches(&pin));
         for (version, commit) in [
-            ("0.1.30", "89df9aaff9e580d66679f2befe94d471bcf4fc7f"),
-            ("0.1.31", "0000000000000000000000000000000000000000"),
+            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
+            ("0.1.32", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();

@@ -27,7 +27,7 @@ accurate when a later request changes the adapter scale. Runner's trusted launch
 policy selects the cache from the exact reviewed runtime source and checks the
 matching cache and startup graph identity. Application use requires a published, verified Prism bundle with that
 source identity. Trusted launch parsing accepts `--kv-cache f16|rsq4|rsq4k3v`
-without exposing precision in client request bodies. The current 0.1.30 pin admits
+without exposing precision in client request bodies. The current 0.1.31 pin admits
 `f16` and `rsq4`; `rsq4k3v` remains rejected until a separately reviewed, source-bound
 release delivers the K4/V3 profile and M1/M2 memory contract together. Its prepared
 planner charges 14,848 KV and 29,920 process bytes per token, retaining two complete
@@ -39,7 +39,7 @@ work; current cache selection relies on reviewed source and live readiness.
 
 The sibling Prism checkout owns `src/kv_quant.rs`,
 `src/graph/quantized_kv.rs` and its `docs/quantized-kv.md` runtime contract.
-Runner's 0.1.30 pin consumes the reviewed codec implementation. Model-free codec
+Runner's 0.1.31 pin consumes the reviewed codec implementation. Model-free codec
 and graph controls do not establish full-model quality, usable
 capacity, performance or device qualification. Require current-source owning
 checks and the complete packet below for each selected profile.
@@ -83,7 +83,7 @@ establish unbiased softmax, negligible quality loss or faster inference.
 
 ## Fitted-value scale candidate
 
-The Prism 0.1.30 runtime includes explicit `rsq4vf` (`Rotated4FittedValues`) for
+The Prism 0.1.31 runtime includes explicit `rsq4vf` (`Rotated4FittedValues`) for
 investigating reconstruction accuracy without increasing record size. Version-1
 K4 keys remain unchanged; V4 values use codec version 2's guarded fitted scale.
 After the existing normalization, rotation and code selection, the fitter proposes
@@ -114,17 +114,15 @@ not qualify that profile. The sibling Prism
 
 X1 and X2 share a runtime-detected 128-bit NEON execution path with an explicit
 scalar reference. There is no SKU-specific timing or thread-count tuning.
-The pinned 0.1.30 source distributes independent query heads over the existing
-private row-worker pool. Each head retains its score, softmax, value and inverse
-transform order; joined workers return the earliest failing head chunk. Post-0.1.30
-`prism-inference` `main` source (pending a reviewed release repin and X1/X2
-qualification) adds bit-exact `G in {2, 3, 6}` grouped GQA packed-KV decode and
-tiled-prefill attention (`PreparedQueryGroup` / `ValueGroupAccumulator`) running on
-the zero-allocation spin-then-park `NativeRowPool`. The
-path adds no cache expansion or second pool, and cancellation retains the
-ordinary synchronous-token boundary. Complete-model state/adapter/recovery,
-resource and matched request-time qualification remain required; binary delivery
-does not close those gates. X2 qualification
+The pinned 0.1.31 source distributes independent query heads over the existing
+zero-allocation spin-then-park `NativeRowPool` and adds bit-exact
+`G in {2, 3, 6}` grouped GQA packed-KV decode and tiled-prefill attention
+(`PreparedQueryGroup` / `ValueGroupAccumulator`). Each head retains its score,
+softmax, value and inverse transform order; joined workers return the earliest
+failing head chunk. The path adds no cache expansion or second pool, and
+cancellation retains the ordinary synchronous-token boundary. Complete-model
+state/adapter/recovery, resource and matched request-time qualification remain
+required; binary delivery does not close those gates. X2 qualification
 cannot establish an X1 speedup, and source concurrency is not a measured benefit.
 
 Checkpoint/restore must preserve the **exact bytes of the selected quantized
