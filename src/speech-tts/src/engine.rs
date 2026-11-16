@@ -165,6 +165,56 @@ pub struct Q8Block {
 }
 
 /// Supported weight representations for `Talker` and `CodePredictor` linear projections.
+/// Shared zero-copy byte slice inside a read-only OS-mapped GGUF section.
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct MappedSlice {
+    mapped: std::sync::Arc<bonsai_windows_process::MappedFile>,
+    start: usize,
+    end: usize,
+}
+
+#[cfg(windows)]
+impl MappedSlice {
+    /// Construct a bounds-checked slice within an OS-mapped GGUF file.
+    pub fn new(
+        mapped: std::sync::Arc<bonsai_windows_process::MappedFile>,
+        start: usize,
+        end: usize,
+    ) -> io::Result<Self> {
+        if start > end || end > mapped.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Mapped tensor slice exceeds mapped file bounds.",
+            ));
+        }
+        Ok(Self { mapped, start, end })
+    }
+
+    /// Borrow the immutable bytes covering this tensor.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mapped.as_slice()[self.start..self.end]
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for MappedSlice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedSlice")
+            .field("len", &(self.end.saturating_sub(self.start)))
+            .finish()
+    }
+}
+
+#[cfg(windows)]
+impl PartialEq for MappedSlice {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+/// Matrix weight representation for pure-Rust projections.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WeightQuantization {
     /// Unquantized row-major `F32` weights `[out_dim * in_dim]`.
@@ -175,6 +225,14 @@ pub enum WeightQuantization {
         ggml_type: u32,
         /// Original little-endian tensor bytes without whole-model expansion.
         bytes: Vec<u8>,
+    },
+    /// Zero-copy OS-mapped GGML `F32/F16/Q8_0/Q4_K/Q6_K` blocks.
+    #[cfg(windows)]
+    MappedPacked {
+        /// GGML tensor type (`0`, `1`, `8`, `12`, or `14`).
+        ggml_type: u32,
+        /// Zero-copy slice inside a read-only memory-mapped GGUF file.
+        bytes: MappedSlice,
     },
     /// 32-element block-quantized `Q8_0` weights.
     Q8_0 {
@@ -211,6 +269,17 @@ pub enum WeightQuantization {
         /// Input-side Rademacher signs (`+1` or `-1`) `[in_dim]`.
         signs: Vec<i8>,
     },
+}
+
+impl WeightQuantization {
+    pub(crate) fn packed_slice(&self) -> Option<(u32, &[u8])> {
+        match self {
+            Self::Packed { ggml_type, bytes } => Some((*ggml_type, bytes.as_slice())),
+            #[cfg(windows)]
+            Self::MappedPacked { ggml_type, bytes } => Some((*ggml_type, bytes.as_slice())),
+            _ => None,
+        }
+    }
 }
 
 /// Returns `true` if `tensor_name` is an eligible 28-layer `Talker` projection for
@@ -675,8 +744,8 @@ impl LinearProjection {
             ));
         }
         projection_layout::validate(in_dim, out_dim, &weight)?;
-        if let WeightQuantization::Packed { ggml_type, bytes } = &weight {
-            crate::weights::validate_packed(*ggml_type, bytes)?;
+        if let Some((ggml_type, bytes)) = weight.packed_slice() {
+            crate::weights::validate_packed(ggml_type, bytes)?;
         }
         Ok(Self {
             name,
@@ -693,52 +762,114 @@ impl LinearProjection {
     /// Rejects an out-of-range row, malformed weights or a transformed ternary
     /// projection, which cannot represent an ordinary embedding lookup.
     pub fn row(&self, index: usize) -> io::Result<Vec<f32>> {
-        if index >= self.out_dim {
+        let mut output = vec![0.0_f32; self.in_dim];
+        self.row_into(index, &mut output)?;
+        Ok(output)
+    }
+
+    /// Decode embedding row `index` directly into pre-allocated `out` (`[in_dim]`).
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when `index >= out_dim` or `out.len() != in_dim`, and
+    /// `InvalidData` when the weight payload cannot supply that row cleanly.
+    pub fn row_into(&self, index: usize, out: &mut [f32]) -> io::Result<()> {
+        if index >= self.out_dim || out.len() != self.in_dim {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Embedding row is out of range.",
+                "Embedding row or destination extent is out of range.",
             ));
         }
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Invalid embedding weights.");
         let offset = index.checked_mul(self.in_dim).ok_or_else(invalid)?;
         let end = offset.checked_add(self.in_dim).ok_or_else(invalid)?;
+        if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
+            let (block, size) = crate::weights::packed_layout(ggml_type)?;
+            if !self.in_dim.is_multiple_of(block) {
+                return Err(invalid());
+            }
+            let start = (offset / block).checked_mul(size).ok_or_else(invalid)?;
+            let stop = (end / block).checked_mul(size).ok_or_else(invalid)?;
+            let row = bytes.get(start..stop).ok_or_else(invalid)?;
+            for (source, destination) in row.chunks_exact(size).zip(out.chunks_exact_mut(block)) {
+                crate::weights::decode_block(ggml_type, source, destination);
+            }
+            return Ok(());
+        }
         match &self.weight {
-            WeightQuantization::F32(values) => values
-                .get(offset..end)
-                .map(<[f32]>::to_vec)
-                .ok_or_else(invalid),
-            WeightQuantization::Packed { ggml_type, bytes } => {
-                let (block, size) = crate::weights::packed_layout(*ggml_type)?;
-                if !self.in_dim.is_multiple_of(block) {
-                    return Err(invalid());
-                }
-                let start = (offset / block).checked_mul(size).ok_or_else(invalid)?;
-                let stop = (end / block).checked_mul(size).ok_or_else(invalid)?;
-                let row = bytes.get(start..stop).ok_or_else(invalid)?;
-                let mut output = vec![0.0; self.in_dim];
-                for (source, destination) in
-                    row.chunks_exact(size).zip(output.chunks_exact_mut(block))
-                {
-                    crate::weights::decode_block(*ggml_type, source, destination);
-                }
-                Ok(output)
+            WeightQuantization::F32(values) => {
+                let slice = values.get(offset..end).ok_or_else(invalid)?;
+                out.copy_from_slice(slice);
+                Ok(())
             }
             WeightQuantization::Q8_0 { blocks } => {
                 if !self.in_dim.is_multiple_of(32) {
                     return Err(invalid());
                 }
                 let row = blocks.get(offset / 32..end / 32).ok_or_else(invalid)?;
-                Ok(row
-                    .iter()
-                    .flat_map(|block| {
-                        block
-                            .quants
-                            .iter()
-                            .map(move |value| block.scale * f32::from(*value))
-                    })
-                    .collect())
+                for (block, dst) in row.iter().zip(out.chunks_exact_mut(32)) {
+                    for (value, slot) in block.quants.iter().zip(dst.iter_mut()) {
+                        *slot = block.scale * f32::from(*value);
+                    }
+                }
+                Ok(())
             }
-            WeightQuantization::PQ2_0 { .. } | WeightQuantization::PTQ1_0 { .. } => Err(invalid()),
+            _ => Err(invalid()),
+        }
+    }
+
+    /// Decode embedding row `index` and add it elementwise into `accum` (`[in_dim]`).
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when `index >= out_dim` or `accum.len() != in_dim`, and
+    /// `InvalidData` when the weight payload cannot supply that row cleanly.
+    pub fn add_row_into(&self, index: usize, accum: &mut [f32]) -> io::Result<()> {
+        if index >= self.out_dim || accum.len() != self.in_dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Embedding row or accumulator extent is out of range.",
+            ));
+        }
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Invalid embedding weights.");
+        let offset = index.checked_mul(self.in_dim).ok_or_else(invalid)?;
+        let end = offset.checked_add(self.in_dim).ok_or_else(invalid)?;
+        if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
+            let (block, size) = crate::weights::packed_layout(ggml_type)?;
+            if !self.in_dim.is_multiple_of(block) || block > 256 {
+                return Err(invalid());
+            }
+            let start = (offset / block).checked_mul(size).ok_or_else(invalid)?;
+            let stop = (end / block).checked_mul(size).ok_or_else(invalid)?;
+            let row = bytes.get(start..stop).ok_or_else(invalid)?;
+            let mut decoded = [0.0_f32; 256];
+            for (source, destination) in row.chunks_exact(size).zip(accum.chunks_exact_mut(block)) {
+                crate::weights::decode_block(ggml_type, source, &mut decoded[..block]);
+                for (acc, &add) in destination.iter_mut().zip(&decoded[..block]) {
+                    *acc += add;
+                }
+            }
+            return Ok(());
+        }
+        match &self.weight {
+            WeightQuantization::F32(values) => {
+                let slice = values.get(offset..end).ok_or_else(invalid)?;
+                for (acc, &add) in accum.iter_mut().zip(slice) {
+                    *acc += add;
+                }
+                Ok(())
+            }
+            WeightQuantization::Q8_0 { blocks } => {
+                if !self.in_dim.is_multiple_of(32) {
+                    return Err(invalid());
+                }
+                let row = blocks.get(offset / 32..end / 32).ok_or_else(invalid)?;
+                for (block, dst) in row.iter().zip(accum.chunks_exact_mut(32)) {
+                    for (value, acc) in block.quants.iter().zip(dst.iter_mut()) {
+                        *acc += block.scale * f32::from(*value);
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(invalid()),
         }
     }
 
@@ -760,6 +891,8 @@ impl LinearProjection {
             WeightQuantization::F32(_)
             | WeightQuantization::Q8_0 { .. }
             | WeightQuantization::Packed { .. } => None,
+            #[cfg(windows)]
+            WeightQuantization::MappedPacked { .. } => None,
         }
     }
 
@@ -831,117 +964,131 @@ impl LinearProjection {
         let worker_count = threads.clamp(1, 18).min(self.out_dim.max(1));
         let level = Level::new();
 
-        match &self.weight {
-            WeightQuantization::Packed { ggml_type, bytes } => {
-                let row_bytes = layout.bytes_per_row;
-                let compute_slice = |row_offset: usize, destination: &mut [f32]| {
-                    dispatch!(level, simd => {
-                        let offset = row_offset * row_bytes;
-                        packed::rows(simd, *ggml_type, &bytes[offset..], input, destination);
-                    });
-                };
-                run_row_chunks(out, worker_count, compute_slice);
-            }
-            WeightQuantization::F32(w) => {
-                let in_dim = self.in_dim;
-                let compute_slice = |row_offset: usize, dst_slice: &mut [f32]| {
-                    dispatch!(level, simd => {
-                        for (local_o, dst) in dst_slice.iter_mut().enumerate() {
-                            let o = row_offset + local_o;
-                            let row = &w[o * in_dim..(o + 1) * in_dim];
-                            *dst += f32_dot_simd(simd, row, input);
-                        }
-                    });
-                };
-                run_row_chunks(out, worker_count, compute_slice);
-            }
-            WeightQuantization::Q8_0 { blocks } => {
-                let blocks_per_row = layout.groups_per_row;
-                let compute_slice = |row_offset: usize, dst_slice: &mut [f32]| {
-                    dispatch!(level, simd => {
-                        for (local_o, dst) in dst_slice.iter_mut().enumerate() {
-                            let o = row_offset + local_o;
-                            let row_blocks = &blocks[o * blocks_per_row..(o + 1) * blocks_per_row];
-                            let mut acc = *dst;
-                            for (bi, blk) in row_blocks.iter().enumerate() {
-                                let x_slice = &input[bi * 32..(bi + 1) * 32];
-                                let b_sum = q8_block_dot_simd(simd, &blk.quants, x_slice);
-                                acc = blk.scale.mul_add(b_sum, acc);
+        if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
+            let row_bytes = layout.bytes_per_row;
+            let compute_slice = |row_offset: usize, destination: &mut [f32]| {
+                dispatch!(level, simd => {
+                    let offset = row_offset * row_bytes;
+                    packed::rows(simd, ggml_type, &bytes[offset..], input, destination);
+                });
+            };
+            run_row_chunks(out, worker_count, compute_slice);
+        } else {
+            match &self.weight {
+                WeightQuantization::Packed { .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unreachable packed weight branch.",
+                    ));
+                }
+                #[cfg(windows)]
+                WeightQuantization::MappedPacked { .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unreachable mapped packed weight branch.",
+                    ));
+                }
+                WeightQuantization::F32(w) => {
+                    let in_dim = self.in_dim;
+                    let compute_slice = |row_offset: usize, dst_slice: &mut [f32]| {
+                        dispatch!(level, simd => {
+                            for (local_o, dst) in dst_slice.iter_mut().enumerate() {
+                                let o = row_offset + local_o;
+                                let row = &w[o * in_dim..(o + 1) * in_dim];
+                                *dst += f32_dot_simd(simd, row, input);
                             }
-                            *dst = acc;
-                        }
-                    });
-                };
-                run_row_chunks(out, worker_count, compute_slice);
-            }
-            WeightQuantization::PQ2_0 {
-                group_size,
-                scales,
-                packed_trits,
-                hadamard_block,
-                signs,
-            } => {
-                let x_folded =
-                    projection_layout::folded(input, pre_folded, signs, *hadamard_block)?;
-                let groups_per_row = layout.groups_per_row;
-                let bytes_per_row = layout.bytes_per_row;
-                let gsize = *group_size;
-                let gbytes = gsize / 4;
-                let compute_slice = |row_offset: usize, dst_slice: &mut [f32]| {
-                    dispatch!(level, simd => {
-                        for (local_o, dst) in dst_slice.iter_mut().enumerate() {
-                            let o = row_offset + local_o;
-                            let row_scales = &scales[o * groups_per_row..(o + 1) * groups_per_row];
-                            let row_bytes = &packed_trits[o * bytes_per_row..(o + 1) * bytes_per_row];
-                            let mut acc = *dst;
-                            for (gi, &scale) in row_scales.iter().enumerate() {
-                                let start_col = gi * gsize;
-                                let byte_slice = &row_bytes[gi * gbytes..(gi + 1) * gbytes];
-                                let x_group = &x_folded[start_col..start_col + gsize];
-                                let g_sum = pq2_group_dot_simd(simd, byte_slice, x_group);
-                                acc = scale.mul_add(g_sum, acc);
+                        });
+                    };
+                    run_row_chunks(out, worker_count, compute_slice);
+                }
+                WeightQuantization::Q8_0 { blocks } => {
+                    let blocks_per_row = layout.groups_per_row;
+                    let compute_slice = |row_offset: usize, dst_slice: &mut [f32]| {
+                        dispatch!(level, simd => {
+                            for (local_o, dst) in dst_slice.iter_mut().enumerate() {
+                                let o = row_offset + local_o;
+                                let row_blocks = &blocks[o * blocks_per_row..(o + 1) * blocks_per_row];
+                                let mut acc = *dst;
+                                for (bi, blk) in row_blocks.iter().enumerate() {
+                                    let x_slice = &input[bi * 32..(bi + 1) * 32];
+                                    let b_sum = q8_block_dot_simd(simd, &blk.quants, x_slice);
+                                    acc = blk.scale.mul_add(b_sum, acc);
+                                }
+                                *dst = acc;
                             }
-                            *dst = acc;
-                        }
-                    });
-                };
-                run_row_chunks(out, worker_count, compute_slice);
-            }
-            WeightQuantization::PTQ1_0 {
-                group_size,
-                scales,
-                nz_mask,
-                sign_mask,
-                hadamard_block,
-                signs,
-            } => {
-                let x_folded =
-                    projection_layout::folded(input, pre_folded, signs, *hadamard_block)?;
-                let groups_per_row = layout.groups_per_row;
-                let bytes_per_row = layout.bytes_per_row;
-                let gsize = *group_size;
-                let gbytes = gsize / 8;
-                let compute_slice = |row_offset: usize, dst_slice: &mut [f32]| {
-                    dispatch!(level, simd => {
-                        for (local_o, dst) in dst_slice.iter_mut().enumerate() {
-                            let o = row_offset + local_o;
-                            let row_scales = &scales[o * groups_per_row..(o + 1) * groups_per_row];
-                            let row_nz = &nz_mask[o * bytes_per_row..(o + 1) * bytes_per_row];
-                            let row_sg = &sign_mask[o * bytes_per_row..(o + 1) * bytes_per_row];
-                            let mut acc = *dst;
-                            for (gi, &scale) in row_scales.iter().enumerate() {
-                                let start_col = gi * gsize;
-                                let nz_slice = &row_nz[gi * gbytes..(gi + 1) * gbytes];
-                                let sg_slice = &row_sg[gi * gbytes..(gi + 1) * gbytes];
-                                let x_group = &x_folded[start_col..start_col + gsize];
-                                let g_sum = ptq1_group_dot_simd(simd, nz_slice, sg_slice, x_group);
-                                acc = scale.mul_add(g_sum, acc);
+                        });
+                    };
+                    run_row_chunks(out, worker_count, compute_slice);
+                }
+                WeightQuantization::PQ2_0 {
+                    group_size,
+                    scales,
+                    packed_trits,
+                    hadamard_block,
+                    signs,
+                } => {
+                    let x_folded =
+                        projection_layout::folded(input, pre_folded, signs, *hadamard_block)?;
+                    let groups_per_row = layout.groups_per_row;
+                    let bytes_per_row = layout.bytes_per_row;
+                    let gsize = *group_size;
+                    let gbytes = gsize / 4;
+                    let compute_slice = |row_offset: usize, dst_slice: &mut [f32]| {
+                        dispatch!(level, simd => {
+                            for (local_o, dst) in dst_slice.iter_mut().enumerate() {
+                                let o = row_offset + local_o;
+                                let row_scales = &scales[o * groups_per_row..(o + 1) * groups_per_row];
+                                let row_bytes = &packed_trits[o * bytes_per_row..(o + 1) * bytes_per_row];
+                                let mut acc = *dst;
+                                for (gi, &scale) in row_scales.iter().enumerate() {
+                                    let start_col = gi * gsize;
+                                    let byte_slice = &row_bytes[gi * gbytes..(gi + 1) * gbytes];
+                                    let x_group = &x_folded[start_col..start_col + gsize];
+                                    let g_sum = pq2_group_dot_simd(simd, byte_slice, x_group);
+                                    acc = scale.mul_add(g_sum, acc);
+                                }
+                                *dst = acc;
                             }
-                            *dst = acc;
-                        }
-                    });
-                };
-                run_row_chunks(out, worker_count, compute_slice);
+                        });
+                    };
+                    run_row_chunks(out, worker_count, compute_slice);
+                }
+                WeightQuantization::PTQ1_0 {
+                    group_size,
+                    scales,
+                    nz_mask,
+                    sign_mask,
+                    hadamard_block,
+                    signs,
+                } => {
+                    let x_folded =
+                        projection_layout::folded(input, pre_folded, signs, *hadamard_block)?;
+                    let groups_per_row = layout.groups_per_row;
+                    let bytes_per_row = layout.bytes_per_row;
+                    let gsize = *group_size;
+                    let gbytes = gsize / 8;
+                    let compute_slice = |row_offset: usize, dst_slice: &mut [f32]| {
+                        dispatch!(level, simd => {
+                            for (local_o, dst) in dst_slice.iter_mut().enumerate() {
+                                let o = row_offset + local_o;
+                                let row_scales = &scales[o * groups_per_row..(o + 1) * groups_per_row];
+                                let row_nz = &nz_mask[o * bytes_per_row..(o + 1) * bytes_per_row];
+                                let row_sg = &sign_mask[o * bytes_per_row..(o + 1) * bytes_per_row];
+                                let mut acc = *dst;
+                                for (gi, &scale) in row_scales.iter().enumerate() {
+                                    let start_col = gi * gsize;
+                                    let nz_slice = &row_nz[gi * gbytes..(gi + 1) * gbytes];
+                                    let sg_slice = &row_sg[gi * gbytes..(gi + 1) * gbytes];
+                                    let x_group = &x_folded[start_col..start_col + gsize];
+                                    let g_sum = ptq1_group_dot_simd(simd, nz_slice, sg_slice, x_group);
+                                    acc = scale.mul_add(g_sum, acc);
+                                }
+                                *dst = acc;
+                            }
+                        });
+                    };
+                    run_row_chunks(out, worker_count, compute_slice);
+                }
             }
         }
 
@@ -1611,8 +1758,8 @@ pub struct CodePredictorModel {
     pub layers: Vec<QwenDecoderLayer>,
     /// Final `RMSNorm` weight `[hidden_size]`.
     pub norm_w: Vec<f32>,
-    /// 15 private acoustic embedding tables (`[vocab_size * talker_hidden]`).
-    pub codec_embeddings: Vec<Vec<f32>>,
+    /// 15 private acoustic embedding tables (`[vocab_size, talker_hidden]`).
+    pub codec_embeddings: Vec<LinearProjection>,
     /// 15 private acoustic LM heads (`[vocab_size, hidden_size]`).
     pub lm_heads: Vec<LinearProjection>,
 }
@@ -1639,7 +1786,7 @@ impl CodePredictorModel {
         &self,
         talker_hidden: &[f32],
         c0: i32,
-        talker_codec_embd: &[f32],
+        talker_codec_embd: &LinearProjection,
         params: DecoupledSamplingParams,
         seed: i64,
         subseq_base: i64,
@@ -1665,7 +1812,7 @@ impl CodePredictorModel {
         &self,
         talker_hidden: &[f32],
         c0: i32,
-        talker_codec_embd: &[f32],
+        talker_codec_embd: &LinearProjection,
         params: DecoupledSamplingParams,
         seed: i64,
         subseq_base: i64,
@@ -1693,7 +1840,7 @@ impl CodePredictorModel {
         &self,
         talker_hidden: &[f32],
         c0: i32,
-        talker_codec_embd: &[f32],
+        talker_codec_embd: &LinearProjection,
         params: DecoupledSamplingParams,
         seed: i64,
         subseq_base: i64,
@@ -1724,7 +1871,7 @@ impl CodePredictorModel {
         &self,
         talker_hidden: &[f32],
         c0: i32,
-        talker_codec_embd: &[f32],
+        talker_codec_embd: &LinearProjection,
         params: DecoupledSamplingParams,
         seed: i64,
         subseq_base: i64,
@@ -1755,17 +1902,24 @@ impl CodePredictorModel {
             ));
         }
         let talker_dim = talker_hidden.len();
+        if talker_codec_embd.in_dim != talker_dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "talker.codec_embd hidden size mismatch.",
+            ));
+        }
         let c0_usize = usize::try_from(c0).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "Negative semantic code c0.")
         })?;
-        let c0_emb_start = c0_usize.saturating_mul(talker_dim);
-        if c0_emb_start + talker_dim > talker_codec_embd.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Semantic code c0 out of range for talker.codec_embd.",
-            ));
-        }
-        let c0_emb = &talker_codec_embd[c0_emb_start..c0_emb_start + talker_dim];
+        let mut next_raw = vec![0.0_f32; talker_dim];
+        talker_codec_embd
+            .row_into(c0_usize, &mut next_raw)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Semantic code c0 out of range for talker.codec_embd.",
+                )
+            })?;
 
         let mut codes = [0_i32; TOTAL_CODE_GROUPS];
         codes[0] = c0;
@@ -1795,12 +1949,11 @@ impl CodePredictorModel {
         }
 
         observe(PredictorObservation::Prefill { cache: kv_caches })?;
-        let mut next_raw = c0_emb;
         let mut normed = Vec::with_capacity(self.hidden_size);
         let mut logits = Vec::with_capacity(self.vocab_size);
         for g in 0..NUM_ACOUSTIC_CODEBOOKS {
             cancel()?;
-            self.project_in_parallel_into(next_raw, workers, &mut h_a)?;
+            self.project_in_parallel_into(&next_raw, workers, &mut h_a)?;
             h_b.resize(h_a.len(), 0.0);
             for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
                 cancel()?;
@@ -1856,15 +2009,14 @@ impl CodePredictorModel {
             })?;
 
             if g + 1 < NUM_ACOUSTIC_CODEBOOKS {
-                let table = &self.codec_embeddings[g];
-                let start = sampled_idx.saturating_mul(talker_dim);
-                if start + talker_dim > table.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Acoustic code index exceeds embedding table.",
-                    ));
-                }
-                next_raw = &table[start..start + talker_dim];
+                self.codec_embeddings[g]
+                    .row_into(sampled_idx, &mut next_raw)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Acoustic code index exceeds embedding table.",
+                        )
+                    })?;
             }
         }
         Ok(codes)
@@ -2131,6 +2283,16 @@ mod tests {
                 vocab,
             )?);
         }
+        let mut codec_embeddings = Vec::with_capacity(NUM_ACOUSTIC_CODEBOOKS);
+        for g in 0..NUM_ACOUSTIC_CODEBOOKS {
+            codec_embeddings.push(LinearProjection::new(
+                &format!("code_pred.codec_embd.{g}.weight"),
+                hidden,
+                vocab,
+                WeightQuantization::F32(vec![0.1; vocab * hidden]),
+                None,
+            )?);
+        }
         Ok(CodePredictorModel {
             hidden_size: hidden,
             num_q_heads: 2,
@@ -2143,7 +2305,7 @@ mod tests {
             mtp_proj: None,
             layers: vec![layer],
             norm_w: vec![1.0; hidden],
-            codec_embeddings: vec![vec![0.1; vocab * hidden]; NUM_ACOUSTIC_CODEBOOKS],
+            codec_embeddings,
             lm_heads,
         })
     }
@@ -2252,7 +2414,13 @@ mod tests {
         let hidden = 4;
         let vocab = 8;
         let cp = code_predictor_fixture()?;
-        let talker_embd = vec![0.2_f32; vocab * hidden];
+        let talker_embd = LinearProjection::new(
+            "talker.codec_embd.weight",
+            hidden,
+            vocab,
+            WeightQuantization::F32(vec![0.2_f32; vocab * hidden]),
+            None,
+        )?;
         let codes = cp.predict_frame(
             &[0.1, -0.2, 0.3, 0.4],
             3,
@@ -2300,7 +2468,13 @@ mod tests {
     fn predictor_workers_preserve_codes_and_cancellation_reaches_inner_layers()
     -> std::io::Result<()> {
         let cp = code_predictor_fixture()?;
-        let talker_embd = vec![0.2_f32; 8 * 4];
+        let talker_embd = LinearProjection::new(
+            "talker.codec_embd.weight",
+            4,
+            8,
+            WeightQuantization::F32(vec![0.2_f32; 8 * 4]),
+            None,
+        )?;
         let codes = cp.predict_frame(
             &[0.1, -0.2, 0.3, 0.4],
             3,
@@ -2351,7 +2525,13 @@ mod tests {
     fn predictor_workspace_matches_fresh_frames_after_edits_cancellation_errors_and_unwind()
     -> std::io::Result<()> {
         let mut model = code_predictor_fixture()?;
-        let embeddings = vec![0.2; 8 * 4];
+        let embeddings = LinearProjection::new(
+            "talker.codec_embd.weight",
+            4,
+            8,
+            WeightQuantization::F32(vec![0.2; 8 * 4]),
+            None,
+        )?;
         let mut workspace = super::predictor_workspace::PredictorWorkspace::default();
         let input = [0.1, -0.2, 0.3, 0.4];
         let run = |model: &CodePredictorModel,

@@ -1092,12 +1092,13 @@ struct DecodeState {
 
 pub(crate) struct Codec {
     threads: usize,
+    weights_path: Option<std::path::PathBuf>,
     quantizer: RvqDecoder,
     pre: CausalConv1d,
     transformer: Transformer,
     upsample: Vec<Upsample>,
     dac: DacDecoder,
-    encoder: Encoder,
+    encoder: Option<Encoder>,
     state: DecodeState,
     primed: Option<(Vec<[i32; 16]>, DecodeState)>,
 }
@@ -1247,15 +1248,15 @@ impl Codec {
                 PadMode::Constant,
             )?,
         };
-        let encoder = Encoder::load(weights, threads)?;
         let mut codec = Self {
             threads,
+            weights_path: Some(weights.path().to_path_buf()),
             quantizer,
             pre,
             transformer,
             upsample,
             dac,
-            encoder,
+            encoder: None,
             state: DecodeState {
                 audio: CodecStreamState::default(),
                 transformer: TransformerState::default(),
@@ -1431,11 +1432,17 @@ impl Codec {
     }
 
     pub(crate) fn encode_reference_cancellable(
-        &self,
+        &mut self,
         samples: &[f32],
         cancel: &mut dyn FnMut() -> io::Result<()>,
     ) -> io::Result<Vec<[i32; 16]>> {
-        self.encoder.encode_cancellable(samples, cancel)
+        if let Some(encoder) = &self.encoder {
+            return encoder.encode_cancellable(samples, cancel);
+        }
+        let path = self.weights_path.as_deref().ok_or_else(invalid)?;
+        let mut weights = Weights::open(path)?;
+        let encoder = Encoder::load(&mut weights, self.threads)?;
+        encoder.encode_cancellable(samples, cancel)
     }
 }
 

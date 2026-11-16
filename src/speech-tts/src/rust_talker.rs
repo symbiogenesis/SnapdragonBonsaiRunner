@@ -174,7 +174,7 @@ pub(crate) struct Talker {
     text_embedding: LinearProjection,
     text_fc1: LinearProjection,
     text_fc2: LinearProjection,
-    codec_embedding: Vec<f32>,
+    codec_embedding: LinearProjection,
     predictor: CodePredictorModel,
     tokenizer: Tokenizer,
     specials: Specials,
@@ -373,10 +373,8 @@ impl Talker {
         let mut text_fc2 =
             weights.projection("talker.text_proj.fc2.weight", text_dim, geometry.hidden)?;
         text_fc2.bias = Some(weights.tensor_f32("talker.text_proj.fc2.bias", &[geometry.hidden])?);
-        let codec_embedding = weights.tensor_f32(
-            "talker.codec_embd.weight",
-            &[geometry.hidden, geometry.vocab],
-        )?;
+        let codec_embedding =
+            weights.projection("talker.codec_embd.weight", geometry.hidden, geometry.vocab)?;
         let head =
             weights.projection("talker.codec_head.weight", geometry.hidden, geometry.vocab)?;
         let norm = weights.tensor_f32("talker.output_norm.weight", &[geometry.hidden])?;
@@ -396,9 +394,10 @@ impl Talker {
         let mut codec_embeddings = Vec::with_capacity(15);
         let mut lm_heads = Vec::with_capacity(15);
         for codebook in 0..15 {
-            codec_embeddings.push(weights.tensor_f32(
+            codec_embeddings.push(weights.projection(
                 &format!("code_pred.codec_embd.{codebook}.weight"),
-                &[geometry.hidden, predictor_geometry.vocab],
+                geometry.hidden,
+                predictor_geometry.vocab,
             )?);
             lm_heads.push(weights.projection(
                 &format!("code_pred.lm_head.{codebook}.weight"),
@@ -460,14 +459,30 @@ impl Talker {
         self.text_fc2.forward_vec_parallel(&h, None, self.threads)
     }
 
-    fn codec_row(&self, id: i32) -> io::Result<&[f32]> {
-        embedding_row(&self.codec_embedding, self.geometry.hidden, id)
+    fn codec_row(&self, id: i32) -> io::Result<Vec<f32>> {
+        let index = usize::try_from(id).map_err(|_| invalid("Negative speech codec token."))?;
+        let mut row = vec![0.0_f32; self.geometry.hidden];
+        self.codec_embedding
+            .row_into(index, &mut row)
+            .map_err(|_| invalid("Speech codec token exceeds embedding bounds."))?;
+        Ok(row)
+    }
+
+    fn add_codec_row(&self, id: i32, accum: &mut [f32]) -> io::Result<()> {
+        let index = usize::try_from(id).map_err(|_| invalid("Negative speech codec token."))?;
+        self.codec_embedding
+            .add_row_into(index, accum)
+            .map_err(|_| invalid("Speech codec token exceeds embedding bounds."))
     }
 
     fn sum_codes(&self, frame: &[i32; TOTAL_CODE_GROUPS]) -> io::Result<Vec<f32>> {
-        let mut row = self.codec_row(frame[0])?.to_vec();
+        let mut row = self.codec_row(frame[0])?;
         for (table, &code) in self.predictor.codec_embeddings.iter().zip(&frame[1..]) {
-            add(&mut row, embedding_row(table, self.geometry.hidden, code)?)?;
+            let index =
+                usize::try_from(code).map_err(|_| invalid("Negative speech codec token."))?;
+            table
+                .add_row_into(index, &mut row)
+                .map_err(|_| invalid("Speech codec token exceeds embedding bounds."))?;
         }
         Ok(row)
     }
@@ -520,7 +535,7 @@ impl Talker {
             self.specials.think_eos,
         ] {
             let mut row = self.tts_pad.clone();
-            add(&mut row, self.codec_row(id)?)?;
+            self.add_codec_row(id, &mut row)?;
             rows.push(row);
         }
         if let Some(reference) = reference {
@@ -536,7 +551,7 @@ impl Talker {
             rows.push(row);
         }
         let mut prefix = self.tts_bos.clone();
-        add(&mut prefix, self.codec_row(self.specials.pad)?)?;
+        self.add_codec_row(self.specials.pad, &mut prefix)?;
         rows.push(prefix);
 
         let body = &ids[3..ids.len() - 5];
@@ -550,7 +565,7 @@ impl Talker {
                 text_rows.push(self.project_text(id)?);
             }
             text_rows.push(self.tts_eos.clone());
-            let mut codec_rows = vec![self.codec_row(self.specials.bos)?.to_vec()];
+            let mut codec_rows = vec![self.codec_row(self.specials.bos)?];
             for frame in &reference.codes {
                 cancel()?;
                 codec_rows.push(self.sum_codes(frame)?);
@@ -564,14 +579,14 @@ impl Talker {
             for &id in body {
                 cancel()?;
                 let mut row = self.project_text(id)?;
-                add(&mut row, self.codec_row(self.specials.pad)?)?;
+                self.add_codec_row(self.specials.pad, &mut row)?;
                 rows.push(row);
             }
             let mut eos = self.tts_eos.clone();
-            add(&mut eos, self.codec_row(self.specials.pad)?)?;
+            self.add_codec_row(self.specials.pad, &mut eos)?;
             rows.push(eos);
             let mut end = self.tts_pad.clone();
-            add(&mut end, self.codec_row(self.specials.bos)?)?;
+            self.add_codec_row(self.specials.bos, &mut end)?;
             rows.push(end);
             vec![self.tts_pad.clone()]
         };
@@ -873,6 +888,7 @@ fn align_icl(mut text: Vec<Vec<f32>>, codec: Vec<Vec<f32>>, pad: &[f32]) -> io::
     })
 }
 
+#[cfg(test)]
 fn embedding_row(table: &[f32], hidden: usize, id: i32) -> io::Result<&[f32]> {
     let id = usize::try_from(id).map_err(|_| invalid("Negative speech codec token."))?;
     let start = id
@@ -952,9 +968,15 @@ pub(crate) mod tests {
             )?,
             text_fc1: linear()?,
             text_fc2: linear()?,
-            codec_embedding: vec![
-                0.0, 1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0, 7000.0, 8000.0, 9000.0,
-            ],
+            codec_embedding: LinearProjection::new(
+                "talker.codec_embd.weight",
+                1,
+                10,
+                WeightQuantization::F32(vec![
+                    0.0, 1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0, 7000.0, 8000.0, 9000.0,
+                ]),
+                None,
+            )?,
             predictor: CodePredictorModel {
                 hidden_size: 1,
                 num_q_heads: 1,
@@ -968,8 +990,16 @@ pub(crate) mod tests {
                 layers: Vec::new(),
                 norm_w: vec![1.0],
                 codec_embeddings: (1_u8..=15)
-                    .map(|codebook| vec![0.0, f32::from(codebook)])
-                    .collect(),
+                    .map(|codebook| {
+                        LinearProjection::new(
+                            &format!("code_pred.codec_embd.{}.weight", codebook - 1),
+                            1,
+                            2,
+                            WeightQuantization::F32(vec![0.0, f32::from(codebook)]),
+                            None,
+                        )
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?,
                 lm_heads: Vec::new(),
             },
             tokenizer,
@@ -1125,7 +1155,13 @@ pub(crate) mod tests {
     fn prefix_snapshot_discards_on_cancelled_prompt_layer_and_output() -> std::io::Result<()> {
         let mut talker = prompt_fixture(true)?;
         talker.geometry.vocab = 1026;
-        talker.codec_embedding.resize(1026, 0.0);
+        talker.codec_embedding = LinearProjection::new(
+            "talker.codec_embd.weight",
+            1,
+            1026,
+            WeightQuantization::F32(vec![0.0; 1026]),
+            None,
+        )?;
         talker.layers = vec![tiny_layer()?];
         let eos_head = |eos| {
             let mut bias = vec![-1000.0; 1026];
@@ -1181,7 +1217,17 @@ pub(crate) mod tests {
         assert!(talker.prefill_cache.is_none());
         talker.generate("x", None, Some(&reference), &mut |_| Ok(()), &mut || Ok(()))?;
         talker.head = eos_head(false)?;
-        talker.predictor.codec_embeddings = vec![vec![0.0; 2]; 15];
+        talker.predictor.codec_embeddings = (0..15)
+            .map(|g| {
+                LinearProjection::new(
+                    &format!("code_pred.codec_embd.{g}.weight"),
+                    1,
+                    2,
+                    WeightQuantization::F32(vec![0.0; 2]),
+                    None,
+                )
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
         talker.predictor.lm_heads = (0..15)
             .map(|_| {
                 LinearProjection::new(
@@ -1211,12 +1257,19 @@ pub(crate) mod tests {
     fn reference_fixture() -> std::io::Result<Talker> {
         let mut talker = prompt_fixture(false)?;
         talker.geometry.vocab = 1026;
-        talker.codec_embedding = vec![0.0; talker.geometry.vocab];
+        let mut codec_table = vec![0.0; talker.geometry.vocab];
         // Prompt's final codec BOS produces a positive hidden state. The first
         // emitted frame then produces a negative state, selecting EOS on the
         // second semantic sample after repetition history becomes nonempty.
-        talker.codec_embedding[0] = -3.0;
-        talker.codec_embedding[1] = 2.0;
+        codec_table[0] = -3.0;
+        codec_table[1] = 2.0;
+        talker.codec_embedding = LinearProjection::new(
+            "talker.codec_embd.weight",
+            1,
+            talker.geometry.vocab,
+            WeightQuantization::F32(codec_table),
+            None,
+        )?;
         talker.tts_pad = vec![-1.0];
         let mut head = vec![0.0; talker.geometry.vocab];
         head[0] = 1000.0;
@@ -1228,7 +1281,17 @@ pub(crate) mod tests {
             WeightQuantization::F32(head),
             None,
         )?;
-        talker.predictor.codec_embeddings = vec![vec![0.0; 2]; 15];
+        talker.predictor.codec_embeddings = (0..15)
+            .map(|g| {
+                LinearProjection::new(
+                    &format!("code_pred.codec_embd.{g}.weight"),
+                    1,
+                    2,
+                    WeightQuantization::F32(vec![0.0; 2]),
+                    None,
+                )
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
         talker.predictor.lm_heads = (0..15)
             .map(|_| {
                 LinearProjection::new(
@@ -1438,7 +1501,13 @@ pub(crate) mod tests {
 
         let mut talker = prompt_fixture(true)?;
         talker.geometry.vocab = 1026;
-        talker.codec_embedding.resize(1026, 0.0);
+        talker.codec_embedding = LinearProjection::new(
+            "talker.codec_embd.weight",
+            1,
+            1026,
+            WeightQuantization::F32(vec![0.0; 1026]),
+            None,
+        )?;
         talker.layers = vec![tiny_layer()?, tiny_layer()?];
         let mut bias = vec![-1000.0; 1026];
         bias[2] = 1000.0;

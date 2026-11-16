@@ -1,8 +1,13 @@
 //! Bounded, reusable projection workers with synchronous borrowed row jobs.
 #![forbid(unsafe_code)]
 
-use std::{cell::RefCell, thread::JoinHandle};
+#[cfg(not(windows))]
+use std::thread::JoinHandle;
+use std::{cell::RefCell, io};
 
+#[cfg(windows)]
+use bonsai_windows_process::RowWorkerPool;
+#[cfg(not(windows))]
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 
 thread_local! {
@@ -19,6 +24,9 @@ enum CachedTeam {
 impl CachedTeam {
     const fn needs_rebuild(&self, requested: usize) -> bool {
         match self {
+            #[cfg(windows)]
+            Self::Ready(team) => team.worker_count < requested,
+            #[cfg(not(windows))]
             Self::Ready(team) => team.workers.len() < requested,
             Self::Unavailable(count) => *count != requested,
         }
@@ -26,12 +34,27 @@ impl CachedTeam {
 }
 
 struct OwnedTeam {
+    #[cfg(windows)]
+    pool: RowWorkerPool,
+    #[cfg(windows)]
+    worker_count: usize,
+    #[cfg(not(windows))]
     pool: Option<ThreadPool>,
+    #[cfg(not(windows))]
     workers: Vec<JoinHandle<()>>,
 }
 
 impl OwnedTeam {
-    fn build(worker_count: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
+    #[cfg(windows)]
+    fn build(worker_count: usize) -> io::Result<Self> {
+        Ok(Self {
+            pool: RowWorkerPool::new(worker_count, "tts-row")?,
+            worker_count,
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn build(worker_count: usize) -> io::Result<Self> {
         let mut team = Self {
             pool: None,
             workers: Vec::with_capacity(worker_count),
@@ -45,12 +68,14 @@ impl OwnedTeam {
                 team.workers.push(handle);
                 Ok(())
             })
-            .build()?;
+            .build()
+            .map_err(io::Error::other)?;
         team.pool = Some(pool);
         Ok(team)
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for OwnedTeam {
     fn drop(&mut self) {
         // Rayon signals termination when the pool drops. Join even a partial
@@ -84,7 +109,12 @@ pub(crate) fn run_aligned<F>(
     F: Fn(usize, &mut [f32]) + Sync,
 {
     let requested = worker_count.clamp(1, 18);
-    if requested <= 1 || out.len() < 4 || rayon::current_thread_index().is_some() {
+    #[cfg(not(windows))]
+    if rayon::current_thread_index().is_some() {
+        compute_slice(0, out);
+        return;
+    }
+    if requested <= 1 || out.len() < 4 {
         compute_slice(0, out);
         return;
     }
@@ -94,8 +124,8 @@ pub(crate) fn run_aligned<F>(
         compute_slice(0, out);
         return;
     }
-    let active_workers = requested.min(groups);
-    let chunk_rows = groups.div_ceil(active_workers) * alignment;
+    #[cfg(not(windows))]
+    let chunk_rows = groups.div_ceil(requested.min(groups)) * alignment;
 
     let completed = TEAM.with(|slot| {
         let Ok(mut team) = slot.try_borrow_mut() else {
@@ -116,14 +146,22 @@ pub(crate) fn run_aligned<F>(
         let Some(CachedTeam::Ready(team)) = team.as_ref() else {
             return false;
         };
-        let Some(pool) = team.pool.as_ref() else {
-            return false;
-        };
-        pool.install(|| {
-            out.par_chunks_mut(chunk_rows)
-                .enumerate()
-                .for_each(|(chunk, rows)| compute_slice(chunk * chunk_rows, rows));
-        });
+        #[cfg(windows)]
+        {
+            team.pool
+                .run_aligned(out, requested, alignment, compute_slice);
+        }
+        #[cfg(not(windows))]
+        {
+            let Some(pool) = team.pool.as_ref() else {
+                return false;
+            };
+            pool.install(|| {
+                out.par_chunks_mut(chunk_rows)
+                    .enumerate()
+                    .for_each(|(chunk, rows)| compute_slice(chunk * chunk_rows, rows));
+            });
+        }
         true
     });
     if !completed {
@@ -200,8 +238,9 @@ mod tests {
 
         // Return construction failure before entering a barrier: the public
         // helper's serial fallback must never make this control hang.
-        let team = OwnedTeam::build(4).map_err(io::Error::other)?;
+        let team = OwnedTeam::build(4)?;
         TEAM.with(|slot| *slot.borrow_mut() = Some(CachedTeam::Ready(team)));
+        #[cfg(not(windows))]
         assert!(rayon::current_thread_index().is_none());
         let first = team_ids()?;
         assert_eq!(first.len(), 4);
@@ -269,7 +308,7 @@ mod tests {
                 .map_err(|_| io::Error::other("Thread IDs poisoned."))
         }
 
-        let team = OwnedTeam::build(8).map_err(io::Error::other)?;
+        let team = OwnedTeam::build(8)?;
         TEAM.with(|slot| *slot.borrow_mut() = Some(CachedTeam::Ready(team)));
         let initial = team_ids(8)?;
         assert_eq!(initial.len(), 8);

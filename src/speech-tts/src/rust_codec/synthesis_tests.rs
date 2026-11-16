@@ -84,7 +84,8 @@ fn warm_synthesizer() -> io::Result<Synthesizer> {
             },
             conv_post: convolution.clone(),
         },
-        encoder: Encoder {
+        weights_path: None,
+        encoder: Some(Encoder {
             threads: 1,
             first: convolution.clone(),
             stages: Vec::new(),
@@ -93,7 +94,7 @@ fn warm_synthesizer() -> io::Result<Synthesizer> {
             down: convolution,
             semantic: side.clone(),
             acoustic: side,
-        },
+        }),
         primed: Some((vec![[0; 16]], state.clone())),
         state,
     };

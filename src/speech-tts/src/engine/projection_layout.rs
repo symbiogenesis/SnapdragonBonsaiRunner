@@ -13,6 +13,27 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn validate_packed_bytes(
+    ggml_type: u32,
+    bytes: &[u8],
+    input: usize,
+    output: usize,
+) -> io::Result<Layout> {
+    let message = "Invalid packed projection size.";
+    let (block, size) = crate::weights::packed_layout(ggml_type)?;
+    if !input.is_multiple_of(block) {
+        return Err(invalid(message));
+    }
+    let bytes_per_row = (input / block)
+        .checked_mul(size)
+        .ok_or_else(|| invalid(message))?;
+    rows(bytes_per_row, output, bytes.len(), message)?;
+    Ok(Layout {
+        groups_per_row: input / block,
+        bytes_per_row,
+    })
+}
+
 fn rows(row: usize, count: usize, actual: usize, message: &'static str) -> io::Result<()> {
     if row.checked_mul(count) != Some(actual) {
         return Err(invalid(message));
@@ -79,19 +100,11 @@ pub(super) fn validate(
             })
         }
         WeightQuantization::Packed { ggml_type, bytes } => {
-            let message = "Invalid packed projection size.";
-            let (block, size) = crate::weights::packed_layout(*ggml_type)?;
-            if !input.is_multiple_of(block) {
-                return Err(invalid(message));
-            }
-            let bytes_per_row = (input / block)
-                .checked_mul(size)
-                .ok_or_else(|| invalid(message))?;
-            rows(bytes_per_row, output, bytes.len(), message)?;
-            Ok(Layout {
-                groups_per_row: input / block,
-                bytes_per_row,
-            })
+            validate_packed_bytes(*ggml_type, bytes, input, output)
+        }
+        #[cfg(windows)]
+        WeightQuantization::MappedPacked { ggml_type, bytes } => {
+            validate_packed_bytes(*ggml_type, bytes.as_slice(), input, output)
         }
         WeightQuantization::PQ2_0 {
             group_size,

@@ -13,7 +13,7 @@ use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{self, BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::engine::{LinearProjection, WeightQuantization};
@@ -51,7 +51,10 @@ struct Tensor {
 
 /// Validated tensor index retaining a non-writable model file handle.
 pub(crate) struct Weights {
+    path: PathBuf,
     file: File,
+    #[cfg(windows)]
+    mapped: Option<std::sync::Arc<bonsai_windows_process::MappedFile>>,
     metadata: BTreeMap<String, Metadata>,
     tensors: BTreeMap<String, Tensor>,
 }
@@ -318,10 +321,15 @@ impl Weights {
                 return Err(invalid());
             }
         }
-        Self::read(file, properties.len(), allow_zero_tensors)
+        Self::read(
+            path.to_path_buf(),
+            file,
+            properties.len(),
+            allow_zero_tensors,
+        )
     }
 
-    fn read(file: File, length: u64, allow_zero_tensors: bool) -> io::Result<Self> {
+    fn read(path: PathBuf, file: File, length: u64, allow_zero_tensors: bool) -> io::Result<Self> {
         let mut reader = BufReader::with_capacity(256 * 1024, file);
         let (metadata, tensor_count, alignment, mut budget) =
             read_header(&mut reader, length, allow_zero_tensors)?;
@@ -388,11 +396,27 @@ impl Weights {
                 return Err(invalid());
             }
         }
+        let file = reader.into_inner();
+        #[cfg(windows)]
+        let mapped = if tensors.is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::new(
+                bonsai_windows_process::MappedFile::from_file(&file)?,
+            ))
+        };
         Ok(Self {
-            file: reader.into_inner(),
+            path,
+            file,
+            #[cfg(windows)]
+            mapped,
             metadata,
             tensors,
         })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     pub(crate) fn metadata_contains(&self, key: &str) -> bool {
@@ -484,6 +508,26 @@ impl Weights {
         in_dim: usize,
         out_dim: usize,
     ) -> io::Result<LinearProjection> {
+        #[cfg(windows)]
+        if let Some(mapped) = &self.mapped {
+            let tensor = self.tensors.get(name).ok_or_else(invalid)?;
+            if tensor.shape != [in_dim, out_dim] {
+                return Err(invalid());
+            }
+            let start = usize::try_from(tensor.offset).map_err(|_| invalid())?;
+            let end = start.checked_add(tensor.bytes).ok_or_else(invalid)?;
+            let slice = crate::engine::MappedSlice::new(std::sync::Arc::clone(mapped), start, end)?;
+            return LinearProjection::new(
+                name,
+                in_dim,
+                out_dim,
+                WeightQuantization::MappedPacked {
+                    ggml_type: tensor.kind,
+                    bytes: slice,
+                },
+                None,
+            );
+        }
         let (ggml_type, bytes) = self.tensor_bytes(name, &[in_dim, out_dim])?;
         LinearProjection::new(
             name,
@@ -601,7 +645,7 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    struct Fixture(std::path::PathBuf);
+    struct Fixture(PathBuf);
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);

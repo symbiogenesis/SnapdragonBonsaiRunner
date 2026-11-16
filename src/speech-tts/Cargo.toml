@@ -12,7 +12,7 @@ categories = ["multimedia::audio"]
 description = "Owned native Qwen VoiceDesign speech inference for Bonsai"
 
 [features]
-rust-qualification = ["dep:bonsai-artifacts", "dep:bonsai-cpu-policy", "dep:bonsai-windows-process", "dep:serde"]
+rust-qualification = ["dep:bonsai-artifacts", "dep:bonsai-cpu-policy", "dep:serde"]
 
 [[bin]]
 name = "bonsai-speech-tts"
@@ -31,13 +31,15 @@ bonsai-speech-service.workspace = true
 fearless_simd.workspace = true
 half.workspace = true
 libm = "=0.2.16"
-rayon = "=1.12.0"
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json.workspace = true
 sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-bonsai-windows-process = { workspace = true, optional = true }
+bonsai-windows-process = { workspace = true }
+
+[target.'cfg(not(windows))'.dependencies]
+rayon = "=1.12.0"
 
 [lints]
 workspace = true
