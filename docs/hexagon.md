@@ -1,7 +1,7 @@
 # Hexagon deployment and execution contracts
 
-Runner pins [Prism 0.1.31](../config/prism-inference.lock.json), source
-`577966d98cf8b36021df52da194b1a5540429a6b`. On Windows ARM64 Snapdragon X2 (`v81`),
+Runner pins [Prism 0.1.32](../config/prism-inference.lock.json), source
+`23e24e444a821d4426f65d56c6cf874cf568b0d9`. On Windows ARM64 Snapdragon X2 (`v81`),
 `prism-inference-server` selects experimental `native-q2` resident NPU acceleration
 when the verified signed GenieX v0.10.0 package and CDSP driver are available.
 The expected DSP file is `<data_directory>/hexagon/runtime/libggml-htp-v81.so`.
@@ -26,10 +26,10 @@ for this fixed development policy. Full-model X1/X2 qualification and the
 with interactive/battery objectives remain separate work in [PLAN.md](../PLAN.md#hexagon-npu).
 `native-q2` uses
 bounded floating-point tolerance; it does not promise the bitwise PQ2/Q8_K
-parity of the independent block-preserving controls. Prism 0.1.31 completes a
+parity of the independent block-preserving controls. Prism 0.1.32 retains a
 model-thread initialization handshake before authenticated serving readiness
 and reports a versioned `startup_projection` observation. Runner requires that
-object for the reviewed 0.1.31 source, with consistent requested/effective
+object for the reviewed 0.1.32 source, with consistent requested/effective
 placement, the fixed
 168-tensor/2,888,663,040-byte resident layout and bounded host metadata (`"hexagon-native-q2-resident"`),
 or—under `auto` placement when secondary CDSP arenas fall back cleanly without
@@ -58,14 +58,13 @@ The native-Q2 executor submits the existing gate/up, SwiGLU, optional supported
 Hadamard, down and optional residual chain in one correlated packet.
 Operation/tensor pairs are 4/12, 5/14, 5/15 and 6/17. Borrowed and owned
 sessions retain checked handles, dimensions, cache flushes and exact response
-correlation. Prism `0.1.31` added per-layer active-target gating
+Prism `0.1.32` incorporates `0.1.31`'s per-layer active-target gating
 (`adapter_affects_any`, pending X1/X2 device qualification) so
 `external_ffn_chain` stays enabled whenever `[ffn_gate, ffn_up, ffn_down]` have
 no active LoRA (`scale == 0.0` or untargeted layer) and `external_ffn_swiglu`
 (`ffn_gate + ffn_up + HTP_OP_GLU_SWIGLU`) runs across all 64 Swift layers under
-active `RankOneAdapter` (which targets only residual writers and `token_embd`).
-Subsequent `prism-inference` `main` commits (pending release repin and X1/X2
-qualification) also implement full `ffn_down`-inclusive FFN-chain LoRA
+active `RankOneAdapter` (which targets only residual writers and `token_embd`),
+and adds full `ffn_down`-inclusive FFN-chain LoRA
 side-branch fusion (`supports_ffn_chain_lora` / `submit_resident_ffn_chain_lora`
 and `supports_f32_ffn_chain_lora` / `project_f32_ffn_chain_lora`, evaluating
 `RankOneAdapter::dense_rank_one_factor` into a single finite scalar `lora_dot`
@@ -99,8 +98,7 @@ Unused secondary arenas remain dirty and unimported; already prepared views can
 still be submitted together after import. Primary-arena append preparation keeps
 its separate populated-prefix flush. Native fake-session controls exercise those
 boundaries; signed-driver coherency and complete serving acceptance
-remain independent. In `prism-inference` `main` (pending release repin, live
-service wiring and device qualification), `bonsai-hexagon-runtime` implements
+remain independent. The pinned `0.1.32` native source also implements
 `"SB2HQ2C1"` `NativeQ2ArenaCache` (`bonsai_native_hash`-verified persistent repacked
 arena images) and `Qwen35::release_executor_resident_host_weights`
 (`TensorBytes::release_mapped` when `tiled_prefill` is absent and an external
@@ -134,8 +132,7 @@ controls do not qualify signed execution, device lifetime or request benefit.
 Native/fallback compiled controls, production linking, full-model state/adapters,
 cancellation/resources and source-bound device acceptance remain required.
 The earlier [local source check](cpu-kernels.md#current-source-comparison-admission)
-failed during supervisor setup before compiled controls. The source-bound
-0.1.31 binary delivery does not supply that missing independent control acceptance.
+failed during supervisor setup before compiled controls. The source-bound `0.1.32` binary delivery (incorporating `0.1.31`) does not supply that missing independent control acceptance.
 
 Guarded/model-probe whole-request reservation and explicit partial placement
 already exist in source. Their terminal 24,000-attempt policy remains separate

@@ -237,8 +237,7 @@ throwaway preflight. HTTP workers require host-loopback support; offline decoder
 require PSEC 1.1 (`native_sandbox_offline_available()`) without requesting or probing loopback authority. There are no audit/learning modes,
 SDK backend dispatch, DACL augmentation, global loopback exemptions or weaker
 fallbacks. Host Firewall restrictions remain independent. The launcher's
-`--require-broker-pipe` flag fails closed unless `BROKER_PIPE_RELEASE` pins a
-separately reviewed `--broker-pipe` release.
+`--require-broker-pipe` flag binds to `BROKER_PIPE_RELEASE` (`0.1.32`).
 
 The supported [Rust V1 spawn API](https://github.com/microsoft/mxc/blob/v1.0.1/docs/api-reference/rust/v1/api.md)
 cannot accept Runner's existing Job and suspended-launch contract. The audited
@@ -286,9 +285,10 @@ cover file and hard-link denial, retained artifact/key guards, separate private
 temp storage, child-process denial, exact listener identity, external TCP denial
 and worker teardown after abrupt owner death. Verified section-handle inheritance
 (`OwnedProcess::start_sandboxed_broker_pipe_with_sections` /
-`PipeBackend::connect_stdio_with_sections` and Prism's `ServerEndpoint::verified_sections`)
-adds source primitives pending launcher wiring, post-`0.1.31` release repin and
-containment qualification. The separate isolated
+`PipeBackend::connect_stdio_with_sections`, launcher `--verified-sections`, and
+Prism's `ServerEndpoint::verified_sections`) and Hexagon runtime AppContainer
+read-only grants are wired end-to-end on the `0.1.32` pin (`BROKER_PIPE_RELEASE`).
+The separate isolated
 `inference-authority-v1` `sandbox-qualification` workload targets three
 model-free broker-pipe PSEC controls (`180` estimated seconds: offline authority
 and egress denial, `64 MiB`/`1_024`-entry private storage ceiling across

@@ -1,7 +1,7 @@
 # Inference defaults and quality evidence
 
 Chat preserves the native template and publisher's evaluated sampler, with thinking
-off by default. The development default is Rust Prism 0.1.31, original Swift PQ2, eight CPU
+off by default. The development default is Rust Prism 0.1.32, original Swift PQ2, eight CPU
 row workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (four when the host
 family is unknown or in fixed-four qualification controls) and standard adapter scale 1.3.
 `--publisher-engine` selects publisher rollback;
@@ -24,10 +24,10 @@ acceptance remain pending.
 | Added system prompt | None | Retain publisher instructions and user-supplied task/voice constraints |
 | Standard generation harness | One completion, EOS honored | No automatic critique/rewrite, forced extra thinking, majority voting or best-of-N; the app's opt-in Extra effort runs separate passes |
 | Assistant history | Preserve supplied `reasoning_content` with `preserve_thinking: true` | Both verified templates support replaying prior assistant reasoning |
-| Attention / recurrent state | K4/V4 (`rsq4`) in the 0.1.31 development pin; F32 recurrent/convolution state | Owner-selected approximate cache; measured quality/memory qualification remains pending, with explicit FP16 recovery |
+| Attention / recurrent state | K4/V4 (`rsq4`) in the 0.1.32 development pin; F32 recurrent/convolution state | Owner-selected approximate cache; measured quality/memory qualification remains pending, with explicit FP16 recovery |
 | Context handling | Exact rendered token count; reject overflow | Preserve supplied history rather than silently shifting or truncating it |
 | RoPE | Model metadata, no override | Context extension can change short-context behavior |
-| Prompt tiles, cache reuse & speculation | Disabled by default | Explicit [`--cpu-prefill-tokens 8\|16\|32`](native-rust-engine.md#swift-cpu-supported-subset) and [`--prompt-reuse latest`](native-rust-engine.md#latest-prefix-reuse) are available for native launches; speculation remains outside Runner serving. None is an established quality/performance default. |
+| Prompt tiles, cache reuse & speculation | Disabled by default | Explicit [`--cpu-prefill-tokens 8\|16\|32`](native-rust-engine.md#swift-cpu-supported-subset), `--cpu-prefill-gdn sequential\|wy-f32`, [`--prompt-reuse latest\|prompt-end-and-latest`](native-rust-engine.md#latest-prefix-reuse) (`--prompt-reuse-checkpoints 1..=8`), and `--spec-type none\|suffix` (`--draft-max 1..=8`, auto-suppressing optional `mmproj`) are exposed end-to-end on native `0.1.32` launches; none is an established quality/performance default. |
 
 CPU checks, server plans and the Rust development launcher pass sampler/reasoning arguments
 explicitly. The pinned completion renderer nevertheless omits template kwargs: its single-turn

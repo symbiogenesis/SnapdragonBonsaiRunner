@@ -17,7 +17,7 @@ not establish Adreno execution.
 
 | Repository fact | Execution boundary |
 | --- | --- |
-| [Rust release lock](../config/prism-inference.lock.json): Prism 0.1.31, source `577966d98cf8b36021df52da194b1a5540429a6b` | CPU inference and the separate X2 Hexagon policy; no admitted Adreno inference |
+| [Rust release lock](../config/prism-inference.lock.json): Prism 0.1.32, source `23e24e444a821d4426f65d56c6cf874cf568b0d9` | CPU inference and the separate X2 Hexagon policy; no admitted Adreno inference |
 | [Assessment lock](../config/swift-assessment.lock.json): 6.71 GiB PQ2, publisher Prism `73bfe6cc485554822f80c473a3c0c4f25e80f41b`, `win-cpu-arm64` | Explicit publisher rollback remains a CPU reference |
 | [Publisher baseline build](../tools/bonsai/src/build_tools/engine.rs) and [overlay build][overlay] disable Vulkan/OpenCL | These publisher CPU recipes do not produce a GPU runtime |
 | Publisher [completion](../src/cpu-policy/src/lib.rs), [server](../tools/bonsai/src/server.rs) and [broker](../src/broker/src/launch_policy.rs) use `--gpu-layers 0` / `--device none` | Drivers do not activate publisher GPU offload; its server policy also disables KV/operation offload |

@@ -12,7 +12,8 @@ PowerShell 7.6+. Follow [validation](validation.md) for standards and focused ch
 ## Current state
 
 The app defaults to native Rust [Prism Inference](https://github.com/symbiogenesis/prism-inference)
-0.1.31, original Swift PQ2, four CPU row workers and the pinned pretrained adapter
+0.1.32, original Swift PQ2, eight CPU row workers on Snapdragon X1 and X2
+(four when the host family is unknown), and the pinned pretrained adapter
 at scale 1.3. On supported Snapdragon X2 Elite Extreme installations, the runtime
 also enables the experimental resident Hexagon `native-q2` path, with CPU fallback
 when the signed runtime package or CDSP driver is absent. See [Hexagon policy](hexagon.md)
@@ -675,8 +676,8 @@ and installed-package launches retain native admission. Installed launches use [
 
 | Runtime/model | Source and installed launch options | Boundary |
 | --- | --- | --- |
-| Native Rust Prism 0.1.31, original Swift PQ2 | Development default; optional explicit `--native-engine --use-original-pq2`; pinned adapter enabled | Four CPU row workers, adapter scale 1.3, K4/V4 cache and supported X2 resident `native-q2` acceleration. Exact artifact/readiness checks remain mandatory; full daily-use qualification is pending. |
-| Native Rust Prism 0.1.31, current-weight PTQ1 export | `--use-repacked-ptq1`, optionally `--native-engine` | Experimental opt-in; separate [PTQ1 qualification](swift-memory.md#current-weight-ptq1-option) remains pending. Missing/changed bytes reject. |
+| Native Rust Prism 0.1.32, original Swift PQ2 | Development default; optional explicit `--native-engine --use-original-pq2`; pinned adapter enabled | Eight CPU row workers on Snapdragon X1/X2 (four when unknown), adapter scale 1.3, `calibrated-cow` admission, K4/V4 cache and supported X2 resident `native-q2` acceleration. Exact artifact/readiness checks remain mandatory; full daily-use qualification is pending. |
+| Native Rust Prism 0.1.32, current-weight PTQ1 export | `--use-repacked-ptq1`, optionally `--native-engine` | Experimental opt-in; separate [PTQ1 qualification](swift-memory.md#current-weight-ptq1-option) remains pending. Missing/changed bytes reject. |
 | Publisher Prism CPU, original Swift PQ2 | `--publisher-engine`, optionally `--use-original-pq2` | Manual rollback with the same pinned adapter and response scale; no automatic fallback. |
 | Publisher Prism CPU, current-weight PTQ1 export | `--publisher-engine --use-repacked-ptq1` | Same adapter opt-out/scale. No older publisher PTQ1 substitution. |
 
@@ -690,8 +691,9 @@ For multimodal context (`Images and Videos`), Swift setup also prepares and
 verifies `config/swift-mmproj.lock.json` (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`,
 `629,246,976` bytes), reserving `768 MiB` in memory planning (`--no-mmproj-offload`,
 `1,024` default max image tokens) unless disabled with `--no-mmproj` (PowerShell
-`-NoMmproj`, installed JSON `NoMmproj: true`). `--publisher-engine` and pinned
-native Rust `0.1.31` activate `Input modalities: text, image` when the vision
+`-NoMmproj`, installed JSON `NoMmproj: true`) or automatically suppressed when
+`--spec-type suffix` is selected. `--publisher-engine` and pinned
+native Rust `0.1.32` activate `Input modalities: text, image` when the vision
 reserve fits, and `--no-mmproj` disables the projector.
 
 Engine options are mutually exclusive. Installed launches retain
@@ -701,7 +703,7 @@ Rust selection; omitting it selects the current development default.
 The owner selects [TurboQuant-inspired K4/V4 (`rsq4`)](quantized-kv.md) as the
 development default in new Swift runtime source. Runner activates that default
 only for the exact reviewed runtime source after published-bundle verification
-and repinning. The 0.1.31 development pin retains it. This selection supplies no
+and repinning. The 0.1.32 development pin retains it. This selection supplies no
 measured CPU or cache benefit. Trusted
 source launches accept `--kv-cache f16|rsq4|rsq4k3v`
 (`-KvCache F16|Rsq4|Rsq4K3V` through `Start-Chat.ps1`); installed-launch JSON uses
@@ -715,9 +717,19 @@ choice accepts approximation and pending measured quality/memory qualification;
 context and process admission follow the selected-cache memory planner.
 Trusted native `--placement cpu` (installed JSON `Placement: "cpu"`,
 PowerShell `-Placement cpu`) skips accelerator initialization with the reviewed
-0.1.31 pin and survives setup and Retry. Readiness must report both CPU placement
+0.1.32 pin and survives setup and Retry. Readiness must report both CPU placement
 and CPU projection execution. Omission or `auto` retains automatic placement;
 this selection does not reduce the conservative memory allowance.
+
+On the `0.1.32` pin, native source/installed/broker launches also expose
+`--require-broker-pipe` (`-RequireBrokerPipe` / `RequireBrokerPipe`),
+`--cpu-family x1|x2` (`-CpuFamily`), `--prompt-reuse disabled|latest|prompt-end-and-latest`
+(`-PromptReuse`), `--prompt-reuse-checkpoints 1..=8` (`-PromptReuseCheckpoints`),
+`--prompt-reuse-checkpoint-bytes` (`-PromptReuseCheckpointBytes`),
+`--cpu-prefill-tokens 8|16|32` (`-CpuPrefillTokens`), `--cpu-prefill-gdn sequential|wy-f32`
+(`-CpuPrefillGdn`, `wy-f32` requires `--kv-cache f16` and cannot combine with speculation),
+`--spec-type none|suffix` (`-SpecType`, `suffix` requires `--cpu-prefill-tokens` and
+suppresses optional `mmproj`), and `--draft-max 1..=8` (`-DraftMax`).
 
 The prepared `rsq4k3v` capacity option rejects the current pin. Activation requires
 a separate exact-source review of K4/V3 with the complete
@@ -741,8 +753,8 @@ Original PQ2 and adapter scale 1.3 remain the defaults. The engine selection is
 independent of the weight selection; current-release device rollback still
 requires qualification.
 
-Native Rust defaults to four row workers using the reviewed 0.1.31 implementation.
-`--native-row-workers 1` explicitly selects one worker. Publisher/reference
+Native Rust defaults to eight row workers on Snapdragon X1/X2 (four when host
+family is unknown) using the reviewed 0.1.32 implementation. `--native-row-workers 1` explicitly selects one worker. Publisher/reference
 launches default to one and reject four; no request can override this private launch setting.
 Worker arithmetic, complete-state parity, application startup/streaming and
 complete-answer latency require their own qualification. Keep the same model,
@@ -1038,7 +1050,7 @@ Pass `--profile swift-pq2-assessment` for Swift's original PQ2 model, provisione
 with `config/swift-assessment.lock.json`. Provision the native runtime with
 `provision` operation `inference`; publisher rollback instead uses operation
 `engine` with the Swift lock, as shown in [runtime selection](#runtime-selection).
-Publisher Swift uses batch/microbatch 128/64. Native Prism 0.1.31 and publisher
+Publisher Swift uses batch/microbatch 128/64. Native Prism 0.1.32 and publisher
 Swift select context and the Job/admission budget from available memory under the
 [context policy](swift-memory.md#memory-selected-serving-context). The native planner
 charges the selected cache and sequential scratch, retaining the 4 GiB host reserve

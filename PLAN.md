@@ -146,7 +146,7 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify Prism's Foundation scheduling and source-package/Hexagon caches
   on matching hosted images, preserving complete correctness, mutation, packaging
   and independent ABI/SDK obligations.
-- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.31.**
+- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.32.**
   Complete actual-model, state, resource, quality and device acceptance using
   the source-bound package identities in the [distribution guide](docs/releases.md).
   Model-free release checks leave these development-runtime gates pending.
@@ -378,15 +378,15 @@ adoption decisions without displacing native daily-use acceptance.
   approved read-only artifacts, bounded private cache/temp, denied unrelated
   files/credentials and egress, broker-only communication and no same-user bypass.
   Offline `--broker-pipe` transport (`SB2PIPE1`/`SB2OKAY1`, `KIND_SERVER_READY`,
-  `KIND_RESET`), `PrivateCredentials::create_frontend_only`,
-  `OwnedProcess::start_sandboxed_broker_pipe` (`SandboxNetwork::Offline`, 6-entry
-  minimal environment, pre-resume kernel `TokenIsAppContainer`/`GetAppContainerFolderPath`
-  verification, `64 MiB`/`1_024`-entry private storage ceiling), the fail-closed
-  `BROKER_PIPE_RELEASE` gate, and `inference-authority-v1` fixture/tooling
-  support exist in source; qualifying `inference-authority-v1` in sandbox CI
-  (after a closed local Case 1 fixture failure repaired without retry), pinning a
-  reviewed `--broker-pipe` release, and qualifying actual-model MXC loading, atomic
-  Job limits and exact identity without weaker fallback remain open.
+  `KIND_RESET`, `KIND_VERIFIED_SECTION`), `PrivateCredentials::create_frontend_only`,
+  `OwnedProcess::start_sandboxed_broker_pipe_with_sections` (`SandboxNetwork::Offline`,
+  6-entry minimal environment, pre-resume kernel `TokenIsAppContainer`/`GetAppContainerFolderPath`
+  verification, `64 MiB`/`1_024`-entry private storage ceiling), `BROKER_PIPE_RELEASE`
+  (`0.1.32`), and `inference-authority-v1` fixture/tooling support are wired
+  end-to-end; qualifying `inference-authority-v1` in sandbox CI
+  (after a closed local Case 1 fixture failure repaired without retry), and
+  qualifying actual-model X1/MXC loading, atomic Job limits and exact identity
+  without weaker fallback remain open.
 - [ ] Qualify trusted-host artifact ancestor sharing and nested rename/DELETE
   regressions through native/AppContainer integration; host guards must outlive
   contained readers and preserve their narrower rights. Compare Codex's
@@ -468,8 +468,7 @@ adoption decisions without displacing native daily-use acceptance.
   mixed-phase handoff (`install_default_hexagon_executor` keeping resident
   Hexagon decode active alongside `--cpu-prefill-tokens` when
   `cpu_speculation` is absent and `supports_tile_tokens() == false`), all
-  implemented in `prism-inference` `main` (pending post-`0.1.31` release
-  repin, hosted CI and X1/X2 device qualification). Verify selected-cache
+  pinned in Prism `0.1.32` (pending Runner hosted CI and complete X1/X2 device qualification). Verify selected-cache
   service consumers and independent packed-KV head workers: scratch/admission,
   complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
@@ -911,9 +910,9 @@ nor editing the available Abliteration factors.
   / `PipeBackend::connect_stdio_with_sections`; `prism-inference` `main` implements
   zero-copy `MappedSlice` GGUF mapping, 8-worker parallel tensor payload validation,
   `ServerEndpoint::verified_sections`, `"SB2HQ2C1"` `NativeQ2ArenaCache` and
-  `Qwen35::release_executor_resident_host_weights` (pending post-`0.1.31` release
-  repin, end-to-end launcher/service wiring, hosted Foundation and X1/X2 device
-  qualification). Deferred screening leads `#16` (aligned staging reuse), `#17`
+  `Qwen35::release_executor_resident_host_weights` (pinned in Prism `0.1.32`
+  with end-to-end launcher/service wiring; pending Runner hosted Foundation and
+  X1/X2 device qualification). Deferred screening leads `#16` (aligned staging reuse), `#17`
   (optional Windows unbuffered direct I/O) and end-to-end `#18` qualification
   remain gated behind measured cold-start/I/O/mapping bottlenecks and
   retained-handle/alignment/Job-commit contracts.
@@ -1156,12 +1155,10 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   scratch, scalar/NEON identity and complete-request cost.
 - [ ] Bound selected CPU screens to at most four NEON layouts on three shapes
   and at most two exact LUT candidates before choosing further integration.
-- [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32` (wired end-to-end across
-  `bonsai-cpu-policy` `swift_tiled_prefill_scratch_bytes`, `bonsai-tools`,
-  `bonsai-chat` and `bonsai-broker` `:cpu-tiled-ffn-v1:{tokens}` readiness on
-  pinned Prism `0.1.31`), zero-alloc spin-then-park `NativeRowPool`, and
-  bit-exact `G in {2, 3, 6}` grouped GQA packed-KV attention (also pinned in
-  `0.1.31`; pending hosted Foundation and X1/X2 qualification), and integrate
+- [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32`, zero-alloc spin-then-park
+  `NativeRowPool`, and bit-exact `G in {2, 3, 6}` grouped GQA packed-KV
+  attention (pinned in Prism `0.1.32`; pending Runner hosted Foundation and
+  X1/X2 qualification), and integrate
   further selected cross-token and 8/16/32-token tiled-prefill consumers
   preserving transformed bases, causal state, bounded scratch and rollback
   before timing the complete request.
@@ -1248,20 +1245,18 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Qualify existing full-FFN chains, sibling packets, multi-tile N=1 and
   tile-major reuse independently. Implement true N>1 prefill only with a supported
   signed solver, causal state, bounded VTCM/DMA and measured total-cost benefit.
-- [ ] Qualify Prism `0.1.31` per-layer active-target gating
-  (`adapter_affects_any`, which keeps `external_ffn_chain` active when
-  `[ffn_gate, ffn_up, ffn_down]` have no active LoRA and unlocks
-  `external_ffn_swiglu` across all 64 Swift layers under active `RankOneAdapter`)
-  and `prism-inference` `main` (`f55c8d4`, `7f8cd31`) full Hexagon `ffn_down`
+- [ ] Qualify Prism `0.1.32` per-layer active-target gating (`adapter_affects_any`,
+  which keeps `external_ffn_chain` active when `[ffn_gate, ffn_up, ffn_down]`
+  have no active LoRA and unlocks `external_ffn_swiglu` across all 64 Swift
+  layers under active `RankOneAdapter`) and full Hexagon `ffn_down`
   LoRA side-branch fusion (`supports_ffn_chain_lora` /
   `submit_resident_ffn_chain_lora` and `supports_f32_ffn_chain_lora` /
   `project_f32_ffn_chain_lora`, evaluating `RankOneAdapter::dense_rank_one_factor`
   into a single finite scalar `lora_dot` without spilling intermediate `17,408`
-  FFN activations back to host DRAM), pending post-`0.1.31` Foundation release
-  repin, signed Hexagon driver parity, full-model logit checks, and X1/X2
-  device qualification so daily-use standard LoRA (`scale 1.3`) retains full
-  fused NPU packet execution including `ffn_down` under
-  [Hexagon policy](docs/hexagon.md#resident-packets-and-prefill).
+  FFN activations back to host DRAM), pending signed Hexagon driver parity,
+  full-model logit checks, and X1/X2 device qualification so daily-use standard
+  LoRA (`scale 1.3`) retains full fused NPU packet execution including
+  `ffn_down` under [Hexagon policy](docs/hexagon.md#resident-packets-and-prefill).
 - [ ] Integrate remaining RMSNorm/RoPE/attention/conv/GDN VTCM chains only where
   signed operation support, transformed bases, full-state ownership and measured
   benefit justify placement.
@@ -1334,31 +1329,13 @@ Track remaining qualification, conditional candidates and housekeeping from the
 [screening ledger](docs/research-register.md#august-to-november-2026-screening-ledger).
 Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
-### Repin, CI and device qualification of landed screening controls
+### CI and device qualification of landed screening controls
 
-- [ ] Publish a reviewed post-`0.1.31` Foundation release bundle from
-  `prism-inference` `main` (`f55c8d43eeaa51209e7a26ccbdbbcf6cd0c7469e`,
-  incorporating `0.1.31` at `577966d98cf8b36021df52da194b1a5540429a6b` plus
-  `a491440` fixing `43900458316` `correctness-3`
-  `tests/runtime.rs::oversized_optional_checkpoint_preserves_an_older_prefix`,
-  `0b80bee` `#38` `GrammarConstrainedSampler`, `b407e92`/`b7bc692`
-  `--cpu-prefill-gdn wy-f32`, `1..=8` `BranchCheckpoints`, mixed-phase Hexagon
-  handoff and `KIND_VERIFIED_SECTION` 52-byte LE intake, `7f8cd31`/`a1a3c12`
-  Hexagon `ffn_down` LoRA side-branch fusion, `"SB2HQ2C1"` `NativeQ2ArenaCache`
-  and `Qwen35::release_executor_resident_host_weights`, `93e9416`/`60c9d20` `#29`
-  `[token][head]` consumer-layout packed probabilities and KV-group-aligned
-  balanced tail partitions, and `0550e05` integration fixes) and repin
-  [config/prism-inference.lock.json](config/prism-inference.lock.json) under
-  the [distribution guide](docs/releases.md) so installed and daily-use builds
-  consume them alongside the `0.1.30`/`0.1.31` runtime checkpoints, GDN guards,
-  memory ledger and worker cancellation (`#2`–`#7`, `#9`–`#13`, `#15`,
-  `#19`–`#20`, `#22`, `#25`–`#26`, `#28`, `#30`–`#34`, `#36`, `#45`–`#51`).
-  Complete `prism-inference` `Foundation` suite acceptance on
-  `f55c8d43eeaa51209e7a26ccbdbbcf6cd0c7469e` remains open.
 - [ ] Complete hosted `source-checks` and `foundation` compiler, strict Release
-  analyzer and full regression-suite verdicts in both repositories under
-  [promotion criteria](docs/validation.md#promotion-criteria); local merge checks
-  ran scoped Clippy and targeted/component test suites only.
+  analyzer and full regression-suite verdicts in `SwiftBonsai2Runner` under
+  [promotion criteria](docs/validation.md#promotion-criteria) (`prism-inference`
+  `v0.1.32` at `23e24e444a821d4426f65d56c6cf874cf568b0d9` passed `Source checks`
+  and `Foundation`; local Runner checks ran scoped Clippy and targeted suites).
 - [ ] Qualify landed controls on actual weights and X1/X2 hardware within
   predeclared 5-to-15-minute AC/battery-logged allowances:
   - [ ] `#8`: Exercise live long-prefill HTTP Stop/disconnect,
@@ -1378,19 +1355,14 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 #### Memory, loading and approximate cache
 
 - [ ] **Single-pass verified-handle inheritance, parallel chunked `SHA256` and
-  cached Hexagon arenas.** Runner and Prism implement core source primitives
-  (`bonsai-windows-process` `OwnedProcess::start_sandboxed_broker_pipe_with_sections` /
-  `InheritableReadOnlySection` with `MAX_INHERITED_SECTIONS = 8`, `bonsai-broker`
-  `PipeBackend::connect_stdio_with_sections` / `KIND_VERIFIED_SECTION = 6`,
-  Prism `ServerEndpoint::verified_sections` 52-byte LE intake,
-  `bonsai-windows-credentials` `compute_mapped_chunk_digests[_with]` /
-  `try_verify_locked_file_chunk_digests_mapped[_with]`, `bonsai-artifacts`
-  `VerifiedFile::verify_chunked[_with]` / `verify_files_bounded_parallel`, and
-  `bonsai-hexagon-runtime` `"SB2HQ2C1"` `NativeQ2ArenaCache`); end-to-end
-  lockfile/launcher/service wiring, post-`0.1.31` release repin, hosted CI,
-  full-byte launch hashing verification, and cold/warm Oryon device
-  qualification remain open under
-  [mapping and startup](docs/swift-memory.md#mapping-and-startup).
+  cached Hexagon arenas.** Runner (`0.1.32` pin) and Prism implement and wire
+  end-to-end section inheritance (`--verified-sections` /
+  `OwnedProcess::start_sandboxed_broker_pipe_with_sections` /
+  `PipeBackend::connect_stdio_with_sections`), `bonsai-windows-credentials`
+  parallel mapped-chunk digest helpers, `bonsai-artifacts` chunked verification,
+  and `"SB2HQ2C1"` `NativeQ2ArenaCache`; hosted CI, full-byte launch hashing
+  verification across all cold/warm paths, and X1 Oryon device qualification
+  remain open under [mapping and startup](docs/swift-memory.md#mapping-and-startup).
 - [ ] **#16 — Aligned loading and upload staging reuse.** Process largest tensors
   first, reuse bounded aligned staging and shrink excess capacity once accelerator
   upload or cold-load staging demonstrates a measured bottleneck under the
@@ -1406,11 +1378,10 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   `SwiftWeightPacking`, `evictable_mapped_weight_bytes`,
   `HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES` (`2,888,663,040`),
   `private_job_commit_with_mapped_credit`, opt-in `SwiftExecutionShape` /
-  `SwiftContextPlan::for_append_only_cow_shape`, and `bonsai-chat`
-  `window/context_capacity.rs` footprint diagnostics are implemented in source;
-  selective tensor-range mapping, default admission promotion, post-`0.1.31`
-  repin, M1–M3 Job-commit verification, physical-RAM watchdog checks and
-  explicit NPU-fault recovery qualification remain open.
+  `bonsai-chat` `window/context_capacity.rs` live footprint diagnostics and
+  default `--admission-policy calibrated-cow` admission are wired on `0.1.32`;
+  selective tensor-range mapping, M1–M3 Job-commit verification, physical-RAM
+  watchdog checks and explicit NPU-fault recovery qualification remain open.
 - [ ] **#21 — Calibrated K-cache mean centering.** Evaluate subtracting a
   per-layer/head/channel key mean on rotated `K4` only after `K1` baseline
   attribution, with separate center-vector storage/identity accounting and held-out
@@ -1423,9 +1394,9 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   pressure and L1/L2 cache behavior while preserving per-block reduction order.
   Implemented in source (physical X1/X2 throughput, parity and power qualification
   open): Prism `16`-row `PQ2`/`Q8_0`/`PTQ1` SIMD tiles, X1 `3`-head/`2`-head
-  grouped attention, `[token][head]` F16-packed `4`-head decode, and `0.1.31`
-  bit-exact `G in {2, 3, 6}` grouped GQA packed-KV attention + zero-alloc
-  spin-then-park `NativeRowPool`,
+  grouped attention, `[token][head]` F16-packed `4`-head decode, and `0.1.32`
+  (incorporating `0.1.31`) bit-exact `G in {2, 3, 6}` grouped GQA packed-KV
+  attention + zero-alloc spin-then-park `NativeRowPool`,
   `bonsai-speech-tts` `4`-row `Q8_0`/`Q4_K`/`Q6_K` SIMD tiles in
   `src/speech-tts/src/engine/packed.rs`, `bonsai-speech-asr` bit-exact non-FMA
   `1x4`/`4x8` `F32`/`Q8_0` SIMD tiles, 4-frame `mixed_fft_4` frontend, batched
@@ -1453,9 +1424,8 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   attention probabilities directly in consumer layout (`[token][head]`) and
   split oversized final head/token tasks via KV-group-aligned balanced
   `partition_heads` and `TileTask` partitioning without changing the FP16
-  boundary or reduction order (implemented in `prism-inference` `main`
-  `93e9416`/`60c9d20`, pending post-`0.1.31` repin, hosted CI and X1/X2
-  parity/throughput qualification) under
+  boundary or reduction order (pinned in Prism `0.1.32`, pending Runner hosted
+  CI and X1/X2 parity/throughput qualification) under
   [CPU kernels](docs/cpu-kernels.md#cross-generation-cpu-promotion).
 
 #### Speculative decoding extensions
@@ -1472,8 +1442,7 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   rejection-sampling masks into the atomic KV/GDN/convolution/sampler rollback
   transaction (`GrammarConstrainedSampler` and `GrammarState` `is_accepting`,
   `accept_candidate`, and `filter_candidates` with atomic rollback integration
-  are implemented in `prism-inference` `main` `0b80bee`, pending post-`0.1.31`
-  repin, hosted CI and model parity qualification).
+  are pinned in Prism `0.1.32`, pending Runner hosted CI and model parity qualification).
 
 #### Adreno Vulkan, Hexagon NPU and power policy
 

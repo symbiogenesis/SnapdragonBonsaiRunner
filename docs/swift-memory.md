@@ -1,9 +1,9 @@
 # Swift artifacts, memory and PTQ1
 
-**Original PQ2 on native Rust Prism 0.1.31 is the development default**, with eight
+**Original PQ2 on native Rust Prism 0.1.32 is the development default**, with eight
 CPU row workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (`X2`; four when
 the host family is unknown or in fixed-four qualification controls), standard adapter
-scale 1.3 and [X2 NPU placement](hexagon.md) when initialization
+scale 1.3, default `calibrated-cow` Job-commit admission, and [X2 NPU placement](hexagon.md) when initialization
 succeeds. `--publisher-engine` explicitly selects rollback; PTQ1 remains opt-in,
 and explicit `--cpu-prefill-tokens 8|16|32` enables CPU tiled FFN prefill with
 exact `--cpu-prefill-scratch-bytes` reservation.
@@ -286,7 +286,7 @@ Shared pages do not reduce admission because
 divergent requests may retain the old cache. Tiled prefill and speculation need
 separate additive reservations: `swift_tiled_prefill_scratch_bytes` and
 `SwiftContextPlan::for_profile_with_prefill` / `for_profile_with_options` charge
-exact Prism 0.1.31 `--cpu-prefill-scratch-bytes` (`8`, `16` or `32` tokens)
+exact Prism 0.1.32 `--cpu-prefill-scratch-bytes` (`8`, `16` or `32` tokens)
 into both the child `--memory-limit-bytes` Job budget and pre-spawn physical
 reserve before artifact I/O.
 
@@ -438,7 +438,7 @@ comparison uses source `73bfe6cc485554822f80c473a3c0c4f25e80f41b`.
 
 ### Native allocation candidates
 
-The source-bound Prism 0.1.31 bundle includes redundant-storage removals without
+The source-bound Prism 0.1.32 bundle (incorporating `0.1.31`) includes redundant-storage removals without
 changing the selected model weights, cache precision, floating-point operations
 or worker count. These source-derived payload counts do not establish measured
 process savings or authorize lower conservative admission charges.
