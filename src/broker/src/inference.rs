@@ -51,13 +51,6 @@ pub(super) enum PromptReuseMode {
 }
 
 impl PromptReuseMode {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
         match value.and_then(std::ffi::OsStr::to_str) {
             Some("disabled") => Ok(Self::Disabled),
@@ -75,26 +68,12 @@ impl PromptReuseMode {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) const fn enabled(self) -> bool {
         !matches!(self, Self::Disabled)
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Wired into launcher CLI options in follow-up commit."
-    )
-)]
 pub(super) enum CpuPrefillGdn {
     #[default]
     Sequential,
@@ -102,13 +81,6 @@ pub(super) enum CpuPrefillGdn {
 }
 
 impl CpuPrefillGdn {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
         match value.and_then(std::ffi::OsStr::to_str) {
             Some("sequential") => Ok(Self::Sequential),
@@ -117,26 +89,19 @@ impl CpuPrefillGdn {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) const fn is_wy_f32(self) -> bool {
         matches!(self, Self::WyF32)
+    }
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::WyF32 => "wy-f32",
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Wired into launcher CLI options in follow-up commit."
-    )
-)]
 pub(super) enum SpeculationType {
     #[default]
     None,
@@ -144,13 +109,6 @@ pub(super) enum SpeculationType {
 }
 
 impl SpeculationType {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
         match value.and_then(std::ffi::OsStr::to_str) {
             Some("none") => Ok(Self::None),
@@ -158,29 +116,22 @@ impl SpeculationType {
             _ => Err(LaunchError::Arguments),
         }
     }
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Suffix => "suffix",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Wired into launcher CLI options in follow-up commit."
-    )
-)]
 pub(super) enum CpuFamily {
     X1,
     X2,
 }
 
 impl CpuFamily {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
         match value.and_then(std::ffi::OsStr::to_str) {
             Some("x1") => Ok(Self::X1),
@@ -189,13 +140,6 @@ impl CpuFamily {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::X1 => "x1",
@@ -203,13 +147,6 @@ impl CpuFamily {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) const fn default_row_workers(self) -> u8 {
         match self {
             Self::X1 | Self::X2 => 8,
@@ -541,37 +478,16 @@ pub(super) fn calibrated_cow_admission_supported() -> Result<bool, LaunchError> 
     ))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Wired into launcher CLI options in follow-up commit."
-    )
-)]
 pub(super) fn branch_prompt_reuse_supported() -> Result<bool, LaunchError> {
     let pin = release(LOCK)?;
     Ok(reviewed_release_matches(&pin, BRANCH_PROMPT_REUSE_RELEASE))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Wired into launcher CLI options in follow-up commit."
-    )
-)]
 pub(super) fn cpu_prefill_gdn_supported() -> Result<bool, LaunchError> {
     let pin = release(LOCK)?;
     Ok(reviewed_release_matches(&pin, CPU_PREFILL_GDN_RELEASE))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Wired into launcher CLI options in follow-up commit."
-    )
-)]
 pub(super) fn cpu_speculation_supported() -> Result<bool, LaunchError> {
     let pin = release(LOCK)?;
     Ok(reviewed_release_matches(&pin, CPU_SPECULATION_RELEASE))

@@ -84,10 +84,12 @@ const NATIVE_IDENTITY_PLACEMENT_MESSAGE: &str = "The local Rust runtime reported
 const NATIVE_IDENTITY_STARTUP_PROJECTION_MESSAGE: &str = "The local Rust runtime did not report the expected startup projection state. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
 const NATIVE_IDENTITY_ADAPTER_MESSAGE: &str = "The local Rust runtime's loaded LoRA adapter identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
 const NATIVE_IDENTITY_VISION_MESSAGE: &str = "The local Rust runtime's vision projector identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_CPU_PREFILL_MESSAGE: &str = "The local Rust runtime's tiled CPU prefill configuration did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_CPU_SPECULATION_MESSAGE: &str = "The local Rust runtime's speculative decoding configuration did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
 const POLICY_FAILURE_MESSAGE: &str = "The local model launch policy rejected the current environment or configuration. Restart Swift from a clean session without model or runtime environment overrides. Completed conversation turns remain in memory.";
 const PATH_OR_CREDENTIALS_FAILURE_MESSAGE: &str = "Swift could not safely access its local data or temporary credential folder without links or redirects. Check folder permissions and local storage, then close and reopen Swift. Completed conversation turns remain in memory.";
 const ARGUMENTS_FAILURE_MESSAGE: &str = "The app and local broker disagreed on launch options. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 15] = [
+const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 17] = [
     NATIVE_IDENTITY_RELEASE_PIN_MESSAGE,
     NATIVE_IDENTITY_FRAMING_MESSAGE,
     NATIVE_IDENTITY_SCHEMA_MESSAGE,
@@ -100,6 +102,8 @@ const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 15] = [
     NATIVE_IDENTITY_STARTUP_PROJECTION_MESSAGE,
     NATIVE_IDENTITY_ADAPTER_MESSAGE,
     NATIVE_IDENTITY_VISION_MESSAGE,
+    NATIVE_IDENTITY_CPU_PREFILL_MESSAGE,
+    NATIVE_IDENTITY_CPU_SPECULATION_MESSAGE,
     POLICY_FAILURE_MESSAGE,
     PATH_OR_CREDENTIALS_FAILURE_MESSAGE,
     ARGUMENTS_FAILURE_MESSAGE,
@@ -158,11 +162,84 @@ impl Placement {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PromptReuse {
+    #[default]
+    Disabled,
+    Latest,
+    PromptEndAndLatest,
+}
+
+impl PromptReuse {
+    pub(crate) const fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Latest => "latest",
+            Self::PromptEndAndLatest => "prompt-end-and-latest",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CpuPrefillGdn {
+    Sequential,
+    WyF32,
+}
+
+impl CpuPrefillGdn {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::WyF32 => "wy-f32",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpeculationType {
+    None,
+    Suffix,
+}
+
+impl SpeculationType {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Suffix => "suffix",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CpuFamily {
+    X1,
+    X2,
+}
+
+impl CpuFamily {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::X1 => "x1",
+            Self::X2 => "x2",
+        }
+    }
+
+    pub(crate) const fn default_native_row_workers(self) -> u8 {
+        match self {
+            Self::X1 | Self::X2 => 8,
+        }
+    }
+}
+
 /// Fixed development launch inputs; paths and keys have no debug representation.
 #[derive(Clone)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "Independent explicit runtime, adapter, weight and reuse choices survive retry."
+    reason = "Independent explicit runtime, adapter, weight and transport choices survive retry."
 )]
 pub(crate) struct Config {
     pub(crate) broker: PathBuf,
@@ -170,14 +247,21 @@ pub(crate) struct Config {
     pub(crate) evidence: PathBuf,
     pub(crate) frontend_port: u16,
     pub(crate) backend_port: u16,
+    pub(crate) require_broker_pipe: bool,
     pub(crate) use_abliterate_lora: bool,
     pub(crate) no_mmproj: bool,
     pub(crate) use_repacked_ptq1: bool,
     pub(crate) native_engine: bool,
     pub(crate) native_row_workers: u8,
-    pub(crate) latest_prompt_reuse: bool,
+    pub(crate) prompt_reuse: PromptReuse,
+    pub(crate) prompt_reuse_checkpoints: Option<u8>,
+    pub(crate) prompt_reuse_checkpoint_bytes: Option<usize>,
     pub(crate) kv_cache: Option<KvCache>,
     pub(crate) cpu_prefill_tokens: Option<u8>,
+    pub(crate) cpu_prefill_gdn: Option<CpuPrefillGdn>,
+    pub(crate) spec_type: Option<SpeculationType>,
+    pub(crate) draft_max: Option<u8>,
+    pub(crate) cpu_family: Option<CpuFamily>,
     pub(crate) placement: Option<Placement>,
     pub(crate) canary: Option<crate::canary::Config>,
     pub(crate) qwen_tts: Option<crate::tts::Config>,
@@ -567,55 +651,81 @@ fn wait_for_retry(
     }
 }
 
-fn runtime_arguments(config: &Config) -> Vec<&'static str> {
-    let mut arguments = Vec::with_capacity(8);
+fn runtime_arguments(config: &Config) -> Vec<String> {
+    let mut arguments = Vec::with_capacity(16);
     if config.use_abliterate_lora {
-        arguments.push("--use-abliterate-lora");
+        arguments.push("--use-abliterate-lora".into());
     }
     if config.no_mmproj {
-        arguments.push("--no-mmproj");
+        arguments.push("--no-mmproj".into());
     }
-    arguments.push(if config.use_repacked_ptq1 {
-        "--use-repacked-ptq1"
-    } else {
-        "--use-original-pq2"
-    });
-    arguments.push(if config.native_engine {
-        "--native-engine"
-    } else {
-        "--publisher-engine"
-    });
+    arguments.push(
+        if config.use_repacked_ptq1 {
+            "--use-repacked-ptq1"
+        } else {
+            "--use-original-pq2"
+        }
+        .into(),
+    );
+    arguments.push(
+        if config.native_engine {
+            "--native-engine"
+        } else {
+            "--publisher-engine"
+        }
+        .into(),
+    );
     if config.native_engine {
-        arguments.push("--reset-on-cancel");
+        arguments.push("--reset-on-cancel".into());
     }
     arguments.extend([
-        "--native-row-workers",
+        "--native-row-workers".into(),
         match config.native_row_workers {
             4 => "4",
             8 => "8",
             12 => "12",
             _ => "1",
-        },
+        }
+        .into(),
     ]);
-    if config.latest_prompt_reuse {
-        arguments.extend(["--prompt-reuse", "latest"]);
+    if let Some(family) = config.cpu_family {
+        arguments.extend(["--cpu-family".into(), family.name().into()]);
+    }
+    if config.prompt_reuse.enabled() {
+        arguments.extend(["--prompt-reuse".into(), config.prompt_reuse.name().into()]);
+    }
+    if let Some(checkpoints) = config.prompt_reuse_checkpoints {
+        arguments.extend(["--prompt-reuse-checkpoints".into(), checkpoints.to_string()]);
+    }
+    if let Some(bytes) = config.prompt_reuse_checkpoint_bytes {
+        arguments.extend(["--prompt-reuse-checkpoint-bytes".into(), bytes.to_string()]);
     }
     if let Some(policy) = config.kv_cache {
-        arguments.extend(["--kv-cache", policy.name()]);
+        arguments.extend(["--kv-cache".into(), policy.name().into()]);
     }
     if let Some(tokens) = config.cpu_prefill_tokens {
         arguments.extend([
-            "--cpu-prefill-tokens",
+            "--cpu-prefill-tokens".into(),
             match tokens {
                 8 => "8",
                 16 => "16",
                 32 => "32",
                 _ => "8",
-            },
+            }
+            .into(),
         ]);
     }
+    if let Some(gdn) = config.cpu_prefill_gdn {
+        arguments.extend(["--cpu-prefill-gdn".into(), gdn.name().into()]);
+    }
+    if let Some(spec_type) = config.spec_type {
+        arguments.extend(["--spec-type".into(), spec_type.name().into()]);
+    }
+    if let Some(draft_max) = config.draft_max {
+        arguments.extend(["--draft-max".into(), draft_max.to_string()]);
+    }
     if let Some(placement) = config.placement {
-        arguments.extend(["--placement", placement.name()]);
+        arguments.extend(["--placement".into(), placement.name().into()]);
     }
     arguments
 }
@@ -648,6 +758,11 @@ fn broker_spec(config: &Config, shutdown_directory: &Path) -> ToolProcessSpec {
     arguments.extend([
         "--launch-development".into(),
         "--require-native-sandbox".into(),
+    ]);
+    if config.require_broker_pipe {
+        arguments.push("--require-broker-pipe".into());
+    }
+    arguments.extend([
         "--profile".into(),
         "swift-pq2-assessment".into(),
         "--data-directory".into(),
@@ -944,6 +1059,12 @@ fn native_identity_message(diagnostic: &str) -> Option<&'static str> {
         }
         "Native identity verification failed: reason=vision." => {
             Some(NATIVE_IDENTITY_VISION_MESSAGE)
+        }
+        "Native identity verification failed: reason=cpu-prefill." => {
+            Some(NATIVE_IDENTITY_CPU_PREFILL_MESSAGE)
+        }
+        "Native identity verification failed: reason=cpu-speculation." => {
+            Some(NATIVE_IDENTITY_CPU_SPECULATION_MESSAGE)
         }
         _ => None,
     })
@@ -1655,14 +1776,21 @@ mod tests {
             evidence: "evidence".into(),
             frontend_port: 5173,
             backend_port: 8081,
+            require_broker_pipe: false,
             use_abliterate_lora: true,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: false,
             native_row_workers: 1,
-            latest_prompt_reuse: false,
+            prompt_reuse: super::PromptReuse::Disabled,
+            prompt_reuse_checkpoints: None,
+            prompt_reuse_checkpoint_bytes: None,
             kv_cache: None,
             cpu_prefill_tokens: None,
+            cpu_prefill_gdn: None,
+            spec_type: None,
+            draft_max: None,
+            cpu_family: None,
             placement: None,
             canary: None,
             qwen_tts: None,
@@ -1745,7 +1873,11 @@ mod tests {
             ]
         );
         config.no_mmproj = true;
-        assert!(runtime_arguments(&config).contains(&"--no-mmproj"));
+        assert!(
+            runtime_arguments(&config)
+                .iter()
+                .any(|arg| arg == "--no-mmproj")
+        );
         config.no_mmproj = false;
         for policy in [
             super::KvCache::Rsq4,
@@ -1757,35 +1889,54 @@ mod tests {
             assert_eq!(
                 arguments
                     .array_windows::<2>()
-                    .filter(|args| args == &&["--kv-cache", policy.name()])
+                    .filter(|args| **args == ["--kv-cache", policy.name()])
                     .count(),
                 1
             );
         }
-        config.latest_prompt_reuse = true;
+        config.prompt_reuse = super::PromptReuse::PromptEndAndLatest;
+        config.prompt_reuse_checkpoints = Some(4);
+        config.prompt_reuse_checkpoint_bytes = Some(134_217_728);
         config.cpu_prefill_tokens = Some(16);
+        config.kv_cache = Some(super::KvCache::F16);
+        config.cpu_prefill_gdn = Some(super::CpuPrefillGdn::WyF32);
+        config.cpu_family = Some(super::CpuFamily::X2);
         config.placement = Some(super::Placement::Cpu);
         let selected = runtime_arguments(&config);
+        for pair in [
+            ["--cpu-family", "x2"],
+            ["--cpu-prefill-tokens", "16"],
+            ["--cpu-prefill-gdn", "wy-f32"],
+            ["--placement", "cpu"],
+            ["--prompt-reuse", "prompt-end-and-latest"],
+            ["--prompt-reuse-checkpoints", "4"],
+            ["--prompt-reuse-checkpoint-bytes", "134217728"],
+        ] {
+            assert!(
+                selected.array_windows().any(|args| *args == pair),
+                "missing {pair:?} in {selected:?}"
+            );
+        }
+        config.kv_cache = Some(super::KvCache::Rsq4);
+        config.cpu_prefill_gdn = None;
+        config.spec_type = Some(super::SpeculationType::Suffix);
+        config.draft_max = Some(6);
+        let spec_selected = runtime_arguments(&config);
         assert!(
-            selected
+            spec_selected
                 .array_windows()
-                .any(|args| args == &["--cpu-prefill-tokens", "16"])
+                .any(|args| *args == ["--spec-type", "suffix"])
         );
         assert!(
-            selected
+            spec_selected
                 .array_windows()
-                .any(|args| args == &["--placement", "cpu"])
-        );
-        assert!(
-            selected
-                .array_windows()
-                .any(|args| args == &["--prompt-reuse", "latest"])
+                .any(|args| *args == ["--draft-max", "6"])
         );
         let retry = Config {
             evidence: "retry-evidence".into(),
             ..config.clone()
         };
-        assert_eq!(runtime_arguments(&retry), selected);
+        assert_eq!(runtime_arguments(&retry), spec_selected);
     }
 
     #[test]
@@ -1796,45 +1947,58 @@ mod tests {
             evidence: r"C:\private evidence\attempt-3".into(),
             frontend_port: 5174,
             backend_port: 8082,
+            require_broker_pipe: true,
             use_abliterate_lora: true,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: true,
             native_row_workers: 4,
-            latest_prompt_reuse: false,
+            prompt_reuse: super::PromptReuse::Disabled,
+            prompt_reuse_checkpoints: None,
+            prompt_reuse_checkpoint_bytes: None,
             kv_cache: None,
             cpu_prefill_tokens: None,
+            cpu_prefill_gdn: None,
+            spec_type: None,
+            draft_max: None,
+            cpu_family: None,
             placement: None,
             canary: None,
             qwen_tts: None,
         };
         for publisher in [false, true] {
             config.native_engine = !publisher;
+            config.require_broker_pipe = !publisher;
             config.native_row_workers = if publisher { 1 } else { 4 };
             let control = config.evidence.join("private-owner");
             let spec = super::broker_spec(&config, &control);
-            let expected: Vec<std::ffi::OsString> = runtime_arguments(&config)
+            let mut expected: Vec<std::ffi::OsString> = runtime_arguments(&config)
                 .into_iter()
                 .map(Into::into)
-                .chain([
-                    "--launch-development".into(),
-                    "--require-native-sandbox".into(),
-                    "--profile".into(),
-                    "swift-pq2-assessment".into(),
-                    "--data-directory".into(),
-                    config.data.as_os_str().to_owned(),
-                    "--evidence-parent".into(),
-                    config.evidence.as_os_str().to_owned(),
-                    "--frontend-port".into(),
-                    "5174".into(),
-                    "--backend-port".into(),
-                    "8082".into(),
-                    "--max-waiting".into(),
-                    if publisher { "0" } else { "1" }.into(),
-                    "--owner-shutdown-directory".into(),
-                    control.into_os_string(),
-                ])
                 .collect();
+            expected.extend([
+                "--launch-development".into(),
+                "--require-native-sandbox".into(),
+            ]);
+            if !publisher {
+                expected.push("--require-broker-pipe".into());
+            }
+            expected.extend([
+                "--profile".into(),
+                "swift-pq2-assessment".into(),
+                "--data-directory".into(),
+                config.data.as_os_str().to_owned(),
+                "--evidence-parent".into(),
+                config.evidence.as_os_str().to_owned(),
+                "--frontend-port".into(),
+                "5174".into(),
+                "--backend-port".into(),
+                "8082".into(),
+                "--max-waiting".into(),
+                if publisher { "0" } else { "1" }.into(),
+                "--owner-shutdown-directory".into(),
+                control.into_os_string(),
+            ]);
             assert_eq!(spec.executable, config.broker);
             assert_eq!(spec.arguments, expected);
             assert_eq!(spec.working_directory, config.evidence);

@@ -135,6 +135,8 @@ pub struct LaunchPlan {
     pub context_tokens: usize,
     /// Optional native CPU tiled-prefill selection `(tokens, scratch_bytes)`.
     pub cpu_prefill: Option<(u8, usize)>,
+    /// Optional native CPU suffix-speculation selection `(draft_max, verification_scratch_bytes, checkpoint_bytes)`.
+    pub cpu_speculation: Option<(u8, usize, usize)>,
 }
 impl LaunchPlan {
     /// Base process memory limit passed to the native child's `--memory-limit-bytes`.
@@ -335,6 +337,7 @@ impl LaunchPlan {
             working_set_limit_bytes: profile.memory_limit_bytes(),
             context_tokens: crate::CONTEXT_TOKENS,
             cpu_prefill: None,
+            cpu_speculation: None,
         })
     }
 }

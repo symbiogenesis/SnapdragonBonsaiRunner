@@ -113,6 +113,7 @@ impl WorkerReadiness {
         self.adapter_execution_digest_required
     }
 
+    #[cfg(test)]
     pub(super) const fn with_prompt_reuse(mut self, latest: bool) -> Self {
         self.prompt_reuse = if latest {
             crate::inference::PromptReuseMode::Latest
@@ -122,13 +123,6 @@ impl WorkerReadiness {
         self
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) const fn with_prompt_reuse_mode(
         mut self,
         mode: crate::inference::PromptReuseMode,
@@ -137,13 +131,6 @@ impl WorkerReadiness {
         self
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) const fn with_prompt_reuse_checkpoints(mut self, checkpoints: u8) -> Self {
         self.prompt_reuse_checkpoints = checkpoints;
         self
@@ -164,25 +151,11 @@ impl WorkerReadiness {
         self
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) const fn with_cpu_prefill_gdn(mut self, wy_f32: bool) -> Self {
         self.cpu_prefill_gdn_wy_f32 = wy_f32;
         self
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Wired into launcher CLI options in follow-up commit."
-        )
-    )]
     pub(super) const fn with_cpu_speculation(
         mut self,
         speculation: Option<(u8, usize, usize)>,

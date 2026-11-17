@@ -458,7 +458,11 @@ fn prompt_reuse_survives_deferred_preparation_and_rejects_unsupported_selection(
 -> crate::Result<()> {
     let mut fixture = fixture("prompt-reuse")?;
     fixture.request["NativeEngine"] = json!(true);
-    for (value, latest) in [("disabled", false), ("latest", true)] {
+    for (value, wire) in [
+        ("disabled", None),
+        ("latest", Some("latest")),
+        ("prompt-end-and-latest", Some("prompt-end-and-latest")),
+    ] {
         fixture.request["PromptReuse"] = json!(value);
         let prepared = plan(fixture.request.clone())?;
         let serialized =
@@ -471,9 +475,9 @@ fn prompt_reuse_survives_deferred_preparation_and_rejects_unsupported_selection(
         assert_eq!(
             arguments
                 .array_windows::<2>()
-                .filter(|args| args[0] == "--prompt-reuse" && args[1] == "latest")
+                .filter(|args| args[0] == "--prompt-reuse" && args[1] == wire.unwrap_or(""))
                 .count(),
-            usize::from(latest)
+            usize::from(wire.is_some())
         );
     }
     for invalid in [
@@ -1583,6 +1587,104 @@ fn cpu_prefill_tokens_validate_and_forward_in_chat_launch() -> crate::Result<()>
             }
         }
         assert!(plan(request).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn session_options_0_1_32_validate_and_forward_in_chat_launch() -> crate::Result<()> {
+    let mut gdn_fixture = fixture("session-0-1-32-gdn")?;
+    gdn_fixture.request["NativeEngine"] = json!(true);
+    gdn_fixture.request["NoSpeechModels"] = json!(true);
+    gdn_fixture.request["RequireBrokerPipe"] = json!(true);
+    gdn_fixture.request["PromptReuse"] = json!("prompt-end-and-latest");
+    gdn_fixture.request["PromptReuseCheckpoints"] = json!(4);
+    gdn_fixture.request["PromptReuseCheckpointBytes"] = json!(134_217_728);
+    gdn_fixture.request["KvCache"] = json!("f16");
+    gdn_fixture.request["CpuPrefillTokens"] = json!(16);
+    gdn_fixture.request["CpuPrefillGdn"] = json!("wy-f32");
+    gdn_fixture.request["CpuFamily"] = json!("x1");
+    let mut recorder = Recorder::new(gdn_fixture.root);
+    let result = prepare_backend(
+        plan(gdn_fixture.request)?,
+        &mut recorder,
+        &gdn_fixture.working,
+    )?;
+    let args = result["Arguments"]
+        .as_array()
+        .ok_or("Missing launch arguments.")?;
+    assert!(args.iter().any(|item| item == "--require-broker-pipe"));
+    for [flag, value] in [
+        ["--native-row-workers", "8"],
+        ["--cpu-family", "x1"],
+        ["--prompt-reuse", "prompt-end-and-latest"],
+        ["--prompt-reuse-checkpoints", "4"],
+        ["--prompt-reuse-checkpoint-bytes", "134217728"],
+        ["--kv-cache", "f16"],
+        ["--cpu-prefill-tokens", "16"],
+        ["--cpu-prefill-gdn", "wy-f32"],
+    ] {
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value),
+            "missing [{flag}, {value}] in {args:?}"
+        );
+    }
+
+    let mut spec_fixture = fixture("session-0-1-32-spec")?;
+    spec_fixture.request["NativeEngine"] = json!(true);
+    spec_fixture.request["NoSpeechModels"] = json!(true);
+    spec_fixture.request["CpuPrefillTokens"] = json!(16);
+    spec_fixture.request["SpecType"] = json!("suffix");
+    spec_fixture.request["DraftMax"] = json!(6);
+    spec_fixture.request["CpuFamily"] = json!("x2");
+    let mut spec_recorder = Recorder::new(spec_fixture.root);
+    let spec_result = prepare_backend(
+        plan(spec_fixture.request)?,
+        &mut spec_recorder,
+        &spec_fixture.working,
+    )?;
+    let spec_args = spec_result["Arguments"]
+        .as_array()
+        .ok_or("Missing launch arguments.")?;
+    for [flag, value] in [
+        ["--native-row-workers", "8"],
+        ["--cpu-family", "x2"],
+        ["--cpu-prefill-tokens", "16"],
+        ["--spec-type", "suffix"],
+        ["--draft-max", "6"],
+    ] {
+        assert!(
+            spec_args
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value),
+            "missing [{flag}, {value}] in {spec_args:?}"
+        );
+    }
+
+    let bad_fixture = fixture("session-0-1-32-invalid")?;
+    for patch in [
+        json!({"NativeEngine": false, "RequireBrokerPipe": true}),
+        json!({"NativeEngine": true, "PromptReuse": "disabled", "PromptReuseCheckpoints": 2}),
+        json!({"NativeEngine": true, "PromptReuse": "latest", "PromptReuseCheckpoints": 9}),
+        json!({"NativeEngine": true, "PromptReuse": "latest", "PromptReuseCheckpointBytes": 0}),
+        json!({"NativeEngine": true, "CpuPrefillGdn": "wy-f32"}),
+        json!({"NativeEngine": true, "CpuPrefillTokens": 16, "CpuPrefillGdn": "wy-f32"}),
+        json!({"NativeEngine": true, "CpuPrefillTokens": 16, "KvCache": "rsq4", "CpuPrefillGdn": "wy-f32"}),
+        json!({"NativeEngine": true, "DraftMax": 4}),
+        json!({"NativeEngine": true, "SpecType": "none", "DraftMax": 4}),
+        json!({"NativeEngine": true, "SpecType": "suffix"}),
+        json!({"NativeEngine": true, "CpuPrefillTokens": 16, "KvCache": "f16", "CpuPrefillGdn": "wy-f32", "SpecType": "suffix"}),
+        json!({"NativeEngine": true, "CpuFamily": "x3"}),
+        json!({"NativeEngine": false, "CpuFamily": "x2"}),
+    ] {
+        let mut request = bad_fixture.request.clone();
+        if let (Some(target), Some(patch_obj)) = (request.as_object_mut(), patch.as_object()) {
+            for (k, v) in patch_obj {
+                target.insert(k.clone(), v.clone());
+            }
+        }
+        assert!(plan(request).is_err(), "expected rejection for {patch}");
     }
     Ok(())
 }

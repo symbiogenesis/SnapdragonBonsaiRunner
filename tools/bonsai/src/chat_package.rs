@@ -361,7 +361,17 @@ fn launch_options(package: &Value, options: Value) -> crate::Result<Value> {
                 | "NoAbliterateLora"
                 | "UseRepackedPtq1"
                 | "NativeEngine"
+                | "RequireBrokerPipe"
                 | "NativeRowWorkers"
+                | "PromptReuse"
+                | "PromptReuseCheckpoints"
+                | "PromptReuseCheckpointBytes"
+                | "KvCache"
+                | "CpuPrefillTokens"
+                | "CpuPrefillGdn"
+                | "SpecType"
+                | "DraftMax"
+                | "CpuFamily"
                 | "Placement"
                 | "TtsQuantization"
                 | "TtsThreads"
@@ -612,12 +622,30 @@ mod tests {
         let native = launch_options(
             &package,
             json!({
-                "NoSpeechModels": true, "NativeEngine": true, "NativeRowWorkers": 4, "NoAbliterateLora": true, "Placement": "cpu"
+                "NoSpeechModels": true,
+                "NativeEngine": true,
+                "RequireBrokerPipe": true,
+                "NativeRowWorkers": 4,
+                "NoAbliterateLora": true,
+                "PromptReuse": "prompt-end-and-latest",
+                "PromptReuseCheckpoints": 4,
+                "CpuPrefillTokens": 16,
+                "SpecType": "suffix",
+                "DraftMax": 6,
+                "CpuFamily": "x2",
+                "Placement": "cpu"
             }),
         )?;
         assert_eq!(native["NativeEngine"], true);
+        assert_eq!(native["RequireBrokerPipe"], true);
         assert_eq!(native["NativeRowWorkers"], 4);
         assert_eq!(native["NoAbliterateLora"], true);
+        assert_eq!(native["PromptReuse"], "prompt-end-and-latest");
+        assert_eq!(native["PromptReuseCheckpoints"], 4);
+        assert_eq!(native["CpuPrefillTokens"], 16);
+        assert_eq!(native["SpecType"], "suffix");
+        assert_eq!(native["DraftMax"], 6);
+        assert_eq!(native["CpuFamily"], "x2");
         assert_eq!(native["Placement"], "cpu");
         let original = launch_options(
             &package,

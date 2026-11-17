@@ -26,11 +26,80 @@ enum GraphicsBackend {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 enum PromptReuse {
     #[default]
     Disabled,
     Latest,
+    PromptEndAndLatest,
+}
+
+impl PromptReuse {
+    const fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Latest => "latest",
+            Self::PromptEndAndLatest => "prompt-end-and-latest",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CpuPrefillGdn {
+    Sequential,
+    WyF32,
+}
+
+impl CpuPrefillGdn {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::WyF32 => "wy-f32",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SpeculationType {
+    None,
+    Suffix,
+}
+
+impl SpeculationType {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Suffix => "suffix",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CpuFamily {
+    X1,
+    X2,
+}
+
+impl CpuFamily {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::X1 => "x1",
+            Self::X2 => "x2",
+        }
+    }
+
+    const fn default_native_row_workers(self) -> u8 {
+        match self {
+            Self::X1 | Self::X2 => 8,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -123,10 +192,24 @@ struct Request {
     use_repacked_ptq1: bool,
     #[serde(default = "default_native_engine")]
     native_engine: bool,
+    #[serde(default)]
+    require_broker_pipe: bool,
     #[serde(default, deserialize_with = "requested_native_row_workers")]
     native_row_workers: Option<u8>,
     #[serde(default)]
     prompt_reuse: PromptReuse,
+    #[serde(
+        default,
+        deserialize_with = "requested_prompt_reuse_checkpoints",
+        skip_serializing_if = "Option::is_none"
+    )]
+    prompt_reuse_checkpoints: Option<u8>,
+    #[serde(
+        default,
+        deserialize_with = "requested_prompt_reuse_checkpoint_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    prompt_reuse_checkpoint_bytes: Option<usize>,
     #[serde(
         default,
         deserialize_with = "requested_kv_cache",
@@ -139,6 +222,30 @@ struct Request {
         skip_serializing_if = "Option::is_none"
     )]
     cpu_prefill_tokens: Option<u8>,
+    #[serde(
+        default,
+        deserialize_with = "requested_cpu_prefill_gdn",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cpu_prefill_gdn: Option<CpuPrefillGdn>,
+    #[serde(
+        default,
+        deserialize_with = "requested_spec_type",
+        skip_serializing_if = "Option::is_none"
+    )]
+    spec_type: Option<SpeculationType>,
+    #[serde(
+        default,
+        deserialize_with = "requested_draft_max",
+        skip_serializing_if = "Option::is_none"
+    )]
+    draft_max: Option<u8>,
+    #[serde(
+        default,
+        deserialize_with = "requested_cpu_family",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cpu_family: Option<CpuFamily>,
     #[serde(
         default,
         deserialize_with = "requested_placement",
@@ -217,6 +324,71 @@ where
     Placement::deserialize(deserializer).map(Some)
 }
 
+fn requested_prompt_reuse_checkpoints<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let count = u8::deserialize(deserializer)?;
+    if (1..=8).contains(&count) {
+        Ok(Some(count))
+    } else {
+        Err(serde::de::Error::custom(
+            "PromptReuseCheckpoints must be between 1 and 8.",
+        ))
+    }
+}
+
+fn requested_prompt_reuse_checkpoint_bytes<'de, D>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let bytes = usize::deserialize(deserializer)?;
+    if bytes > 0 {
+        Ok(Some(bytes))
+    } else {
+        Err(serde::de::Error::custom(
+            "PromptReuseCheckpointBytes must be greater than zero.",
+        ))
+    }
+}
+
+fn requested_cpu_prefill_gdn<'de, D>(deserializer: D) -> Result<Option<CpuPrefillGdn>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CpuPrefillGdn::deserialize(deserializer).map(Some)
+}
+
+fn requested_spec_type<'de, D>(deserializer: D) -> Result<Option<SpeculationType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    SpeculationType::deserialize(deserializer).map(Some)
+}
+
+fn requested_draft_max<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let count = u8::deserialize(deserializer)?;
+    if (1..=8).contains(&count) {
+        Ok(Some(count))
+    } else {
+        Err(serde::de::Error::custom(
+            "DraftMax must be between 1 and 8.",
+        ))
+    }
+}
+
+fn requested_cpu_family<'de, D>(deserializer: D) -> Result<Option<CpuFamily>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CpuFamily::deserialize(deserializer).map(Some)
+}
+
 impl Request {
     const fn native_row_workers(&self) -> u8 {
         self.native_row_workers_for_family(None)
@@ -228,9 +400,12 @@ impl Request {
     ) -> u8 {
         match self.native_row_workers {
             Some(workers) => workers,
-            None if self.native_engine => {
-                bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_workers(family)
-            }
+            None if self.native_engine => match self.cpu_family {
+                Some(explicit) => explicit.default_native_row_workers(),
+                None => bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_workers(
+                    family,
+                ),
+            },
             None => 1,
         }
     }
@@ -246,8 +421,19 @@ impl Request {
                     .into(),
             );
         }
-        if self.prompt_reuse == PromptReuse::Latest && !self.native_engine {
-            return Err("Latest prompt reuse requires NativeEngine.".into());
+        if self.require_broker_pipe && !self.native_engine {
+            return Err("RequireBrokerPipe requires NativeEngine.".into());
+        }
+        if self.prompt_reuse.enabled() && !self.native_engine {
+            return Err("PromptReuse requires NativeEngine.".into());
+        }
+        if (self.prompt_reuse_checkpoints.is_some() || self.prompt_reuse_checkpoint_bytes.is_some())
+            && (!self.native_engine || !self.prompt_reuse.enabled())
+        {
+            return Err(
+                "PromptReuseCheckpoints and PromptReuseCheckpointBytes require NativeEngine and enabled PromptReuse."
+                    .into(),
+            );
         }
         if self.kv_cache.is_some() && !self.native_engine {
             return Err("KvCache requires NativeEngine.".into());
@@ -259,6 +445,32 @@ impl Request {
             if !matches!(tokens, 8 | 16 | 32) {
                 return Err("CpuPrefillTokens must be 8, 16 or 32.".into());
             }
+        }
+        if self.cpu_prefill_gdn.is_some()
+            && (!self.native_engine || self.cpu_prefill_tokens.is_none())
+        {
+            return Err("CpuPrefillGdn requires NativeEngine and CpuPrefillTokens.".into());
+        }
+        if self.cpu_prefill_gdn == Some(CpuPrefillGdn::WyF32) && self.kv_cache != Some(KvCache::F16)
+        {
+            return Err("CpuPrefillGdn wy-f32 requires KvCache f16.".into());
+        }
+        if (self.spec_type.is_some() || self.draft_max.is_some()) && !self.native_engine {
+            return Err("CPU speculation options require NativeEngine.".into());
+        }
+        if self.draft_max.is_some() && self.spec_type != Some(SpeculationType::Suffix) {
+            return Err("DraftMax requires SpecType suffix.".into());
+        }
+        if self.spec_type == Some(SpeculationType::Suffix) && self.cpu_prefill_tokens.is_none() {
+            return Err("SpecType suffix requires CpuPrefillTokens.".into());
+        }
+        if self.spec_type == Some(SpeculationType::Suffix)
+            && self.cpu_prefill_gdn == Some(CpuPrefillGdn::WyF32)
+        {
+            return Err("CpuPrefillGdn wy-f32 cannot be combined with SpecType suffix.".into());
+        }
+        if self.cpu_family.is_some() && !self.native_engine {
+            return Err("CpuFamily requires NativeEngine.".into());
         }
         if self.placement.is_some() && !self.native_engine {
             return Err("Placement requires NativeEngine.".into());
@@ -766,19 +978,48 @@ fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
     } else {
         "--publisher-engine".into()
     });
+    if request.require_broker_pipe {
+        arguments.push("--require-broker-pipe".into());
+    }
     argument(
         arguments,
         "--native-row-workers",
         request.native_row_workers().to_string(),
     );
-    if request.prompt_reuse == PromptReuse::Latest {
-        argument(arguments, "--prompt-reuse", "latest");
+    if let Some(family) = request.cpu_family {
+        argument(arguments, "--cpu-family", family.name());
+    }
+    if request.prompt_reuse.enabled() {
+        argument(arguments, "--prompt-reuse", request.prompt_reuse.name());
+    }
+    if let Some(checkpoints) = request.prompt_reuse_checkpoints {
+        argument(
+            arguments,
+            "--prompt-reuse-checkpoints",
+            checkpoints.to_string(),
+        );
+    }
+    if let Some(bytes) = request.prompt_reuse_checkpoint_bytes {
+        argument(
+            arguments,
+            "--prompt-reuse-checkpoint-bytes",
+            bytes.to_string(),
+        );
     }
     if let Some(policy) = request.kv_cache {
         argument(arguments, "--kv-cache", policy.name());
     }
     if let Some(tokens) = request.cpu_prefill_tokens {
         argument(arguments, "--cpu-prefill-tokens", tokens.to_string());
+    }
+    if let Some(gdn) = request.cpu_prefill_gdn {
+        argument(arguments, "--cpu-prefill-gdn", gdn.name());
+    }
+    if let Some(spec_type) = request.spec_type {
+        argument(arguments, "--spec-type", spec_type.name());
+    }
+    if let Some(draft_max) = request.draft_max {
+        argument(arguments, "--draft-max", draft_max.to_string());
     }
     if let Some(placement) = request.placement {
         argument(arguments, "--placement", placement.name());

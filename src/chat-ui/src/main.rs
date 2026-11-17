@@ -156,17 +156,25 @@ fn configuration_for_family(
     let (mut tts_executable, mut tts_model, mut tts_codec) = (None, None, None);
     let mut tts_voice_model = None;
     let (mut tts_quantization, mut tts_threads) = (None, None);
+    let mut require_broker_pipe = false;
     let mut no_abliterate_lora = false;
     let mut no_mmproj = false;
     let mut use_repacked_ptq1 = None;
     let mut native_engine = None;
     let mut native_row_workers = None;
-    let mut latest_prompt_reuse = None;
+    let mut prompt_reuse = None;
+    let mut prompt_reuse_checkpoints = None;
+    let mut prompt_reuse_checkpoint_bytes = None;
     let mut kv_cache = None;
     let mut cpu_prefill_tokens = None;
+    let mut cpu_prefill_gdn = None;
+    let mut spec_type = None;
+    let mut draft_max = None;
+    let mut cpu_family = None;
     let mut placement = None;
     while let Some(option) = args.next() {
         match option.to_str() {
+            Some("--require-broker-pipe") if !require_broker_pipe => require_broker_pipe = true,
             Some("--no-abliterate-lora") if !no_abliterate_lora => no_abliterate_lora = true,
             Some("--no-mmproj") if !no_mmproj => no_mmproj = true,
             Some("--use-repacked-ptq1") if use_repacked_ptq1.is_none() => {
@@ -188,13 +196,46 @@ fn configuration_for_family(
                     },
                 );
             }
-            Some("--prompt-reuse") if latest_prompt_reuse.is_none() => {
-                latest_prompt_reuse = Some(
+            Some("--prompt-reuse") if prompt_reuse.is_none() => {
+                prompt_reuse = Some(
                     match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("disabled") => false,
-                        Some("latest") => true,
-                        _ => return Err("Prompt reuse must be disabled or latest."),
+                        Some("disabled") => client::PromptReuse::Disabled,
+                        Some("latest") => client::PromptReuse::Latest,
+                        Some("prompt-end-and-latest") => client::PromptReuse::PromptEndAndLatest,
+                        _ => {
+                            return Err(
+                                "Prompt reuse must be disabled, latest or prompt-end-and-latest.",
+                            );
+                        }
                     },
+                );
+            }
+            Some("--prompt-reuse-checkpoints") if prompt_reuse_checkpoints.is_none() => {
+                prompt_reuse_checkpoints = Some(
+                    args.next()
+                        .and_then(|value| value.into_string().ok())
+                        .filter(|text| {
+                            !text.is_empty()
+                                && !(text.len() > 1 && text.starts_with('0'))
+                                && text.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                        .and_then(|text| text.parse::<u8>().ok())
+                        .filter(|count| (1..=8).contains(count))
+                        .ok_or("Prompt reuse checkpoints must be between 1 and 8.")?,
+                );
+            }
+            Some("--prompt-reuse-checkpoint-bytes") if prompt_reuse_checkpoint_bytes.is_none() => {
+                prompt_reuse_checkpoint_bytes = Some(
+                    args.next()
+                        .and_then(|value| value.into_string().ok())
+                        .filter(|text| {
+                            !text.is_empty()
+                                && !(text.len() > 1 && text.starts_with('0'))
+                                && text.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                        .and_then(|text| text.parse::<usize>().ok())
+                        .filter(|bytes| *bytes > 0)
+                        .ok_or("Prompt reuse checkpoint bytes must be a positive integer.")?,
                 );
             }
             Some("--kv-cache") if kv_cache.is_none() => {
@@ -214,6 +255,47 @@ fn configuration_for_family(
                         Some("16") => 16_u8,
                         Some("32") => 32_u8,
                         _ => return Err("CPU prefill tokens must be 8, 16 or 32."),
+                    },
+                );
+            }
+            Some("--cpu-prefill-gdn") if cpu_prefill_gdn.is_none() => {
+                cpu_prefill_gdn = Some(
+                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+                        Some("sequential") => client::CpuPrefillGdn::Sequential,
+                        Some("wy-f32") => client::CpuPrefillGdn::WyF32,
+                        _ => return Err("CPU prefill GDN mode must be sequential or wy-f32."),
+                    },
+                );
+            }
+            Some("--spec-type") if spec_type.is_none() => {
+                spec_type = Some(
+                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+                        Some("none") => client::SpeculationType::None,
+                        Some("suffix") => client::SpeculationType::Suffix,
+                        _ => return Err("Speculation type must be none or suffix."),
+                    },
+                );
+            }
+            Some("--draft-max") if draft_max.is_none() => {
+                draft_max = Some(
+                    args.next()
+                        .and_then(|value| value.into_string().ok())
+                        .filter(|text| {
+                            !text.is_empty()
+                                && !(text.len() > 1 && text.starts_with('0'))
+                                && text.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                        .and_then(|text| text.parse::<u8>().ok())
+                        .filter(|count| (1..=8).contains(count))
+                        .ok_or("Draft max must be between 1 and 8.")?,
+                );
+            }
+            Some("--cpu-family") if cpu_family.is_none() => {
+                cpu_family = Some(
+                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+                        Some("x1") => client::CpuFamily::X1,
+                        Some("x2") => client::CpuFamily::X2,
+                        _ => return Err("CPU family must be x1 or x2."),
                     },
                 );
             }
@@ -333,19 +415,56 @@ fn configuration_for_family(
     }
     let native_engine = native_engine.unwrap_or(true);
     let native_row_workers = native_row_workers.unwrap_or(if native_engine {
-        host_family.default_native_row_workers()
+        if let Some(family) = cpu_family {
+            family.default_native_row_workers()
+        } else {
+            host_family.default_native_row_workers()
+        }
     } else {
         1
     });
-    let latest_prompt_reuse = latest_prompt_reuse.unwrap_or(false);
-    if latest_prompt_reuse && !native_engine {
-        return Err("Latest prompt reuse requires --native-engine.");
+    let prompt_reuse = prompt_reuse.unwrap_or_default();
+    if require_broker_pipe && !native_engine {
+        return Err("Broker-pipe transport requires --native-engine.");
+    }
+    if prompt_reuse.enabled() && !native_engine {
+        return Err("Prompt reuse requires --native-engine.");
+    }
+    if (prompt_reuse_checkpoints.is_some() || prompt_reuse_checkpoint_bytes.is_some())
+        && (!native_engine || !prompt_reuse.enabled())
+    {
+        return Err("Prompt reuse checkpoints require --native-engine and enabled prompt reuse.");
     }
     if kv_cache.is_some() && !native_engine {
         return Err("KV cache selection requires --native-engine.");
     }
     if cpu_prefill_tokens.is_some() && !native_engine {
         return Err("CPU prefill tile selection requires --native-engine.");
+    }
+    if cpu_prefill_gdn.is_some() && (!native_engine || cpu_prefill_tokens.is_none()) {
+        return Err("CPU prefill GDN selection requires --native-engine and --cpu-prefill-tokens.");
+    }
+    if cpu_prefill_gdn == Some(client::CpuPrefillGdn::WyF32)
+        && kv_cache != Some(client::KvCache::F16)
+    {
+        return Err("CPU prefill GDN wy-f32 requires --kv-cache f16.");
+    }
+    if (spec_type.is_some() || draft_max.is_some()) && !native_engine {
+        return Err("CPU speculative decoding requires --native-engine.");
+    }
+    if draft_max.is_some() && spec_type != Some(client::SpeculationType::Suffix) {
+        return Err("Draft max requires --spec-type suffix.");
+    }
+    if spec_type == Some(client::SpeculationType::Suffix) && cpu_prefill_tokens.is_none() {
+        return Err("Suffix speculation requires --cpu-prefill-tokens.");
+    }
+    if spec_type == Some(client::SpeculationType::Suffix)
+        && cpu_prefill_gdn == Some(client::CpuPrefillGdn::WyF32)
+    {
+        return Err("CPU prefill GDN wy-f32 cannot be combined with suffix speculation.");
+    }
+    if cpu_family.is_some() && !native_engine {
+        return Err("CPU family selection requires --native-engine.");
     }
     if placement.is_some() && !native_engine {
         return Err("Placement selection requires --native-engine.");
@@ -398,14 +517,21 @@ fn configuration_for_family(
         evidence: evidence.ok_or("An external evidence directory is required.")?,
         frontend_port: frontend_port.unwrap_or(5173),
         backend_port: backend_port.unwrap_or(8081),
+        require_broker_pipe,
         use_abliterate_lora: !no_abliterate_lora,
         no_mmproj,
         use_repacked_ptq1: use_repacked_ptq1.unwrap_or(false),
         native_engine,
         native_row_workers,
-        latest_prompt_reuse,
+        prompt_reuse,
+        prompt_reuse_checkpoints,
+        prompt_reuse_checkpoint_bytes,
         kv_cache,
         cpu_prefill_tokens,
+        cpu_prefill_gdn,
+        spec_type,
+        draft_max,
+        cpu_family,
         placement,
         canary: canary_key_file.map(|key_file| canary::Config {
             port: canary_port.unwrap_or(8766),
@@ -754,9 +880,16 @@ mod tests {
         assert!(default.use_abliterate_lora);
         assert!(!default.use_repacked_ptq1);
         assert!(default.native_engine);
+        assert!(!default.require_broker_pipe);
         assert_eq!(default.native_row_workers, 4);
-        assert!(!default.latest_prompt_reuse);
+        assert_eq!(default.prompt_reuse, crate::client::PromptReuse::Disabled);
+        assert!(default.prompt_reuse_checkpoints.is_none());
+        assert!(default.prompt_reuse_checkpoint_bytes.is_none());
         assert!(default.kv_cache.is_none());
+        assert!(default.cpu_prefill_gdn.is_none());
+        assert!(default.spec_type.is_none());
+        assert!(default.draft_max.is_none());
+        assert!(default.cpu_family.is_none());
         assert!(default.placement.is_none());
         for (name, placement) in [
             ("auto", crate::client::Placement::Auto),
@@ -810,14 +943,21 @@ mod tests {
             rejected.extend(suffix.into_iter().map(OsString::from));
             assert!(configuration(rejected).is_err());
         }
-        for (value, latest) in [("disabled", false), ("latest", true)] {
+        for (value, reuse) in [
+            ("disabled", crate::client::PromptReuse::Disabled),
+            ("latest", crate::client::PromptReuse::Latest),
+            (
+                "prompt-end-and-latest",
+                crate::client::PromptReuse::PromptEndAndLatest,
+            ),
+        ] {
             let mut selected = args.to_vec();
             selected.extend(["--prompt-reuse", value].map(OsString::from));
             assert_eq!(
                 configuration(selected.clone())
                     .map_err(io::Error::other)?
-                    .latest_prompt_reuse,
-                latest
+                    .prompt_reuse,
+                reuse
             );
             selected.extend(["--prompt-reuse", value].map(OsString::from));
             assert!(configuration(selected).is_err());
@@ -825,6 +965,131 @@ mod tests {
         for value in ["Latest", "true", "", "approximate"] {
             let mut rejected = args.to_vec();
             rejected.extend(["--prompt-reuse", value].map(OsString::from));
+            assert!(configuration(rejected).is_err());
+        }
+        let mut branch_selected = args.to_vec();
+        branch_selected.extend(
+            [
+                "--require-broker-pipe",
+                "--prompt-reuse",
+                "prompt-end-and-latest",
+                "--prompt-reuse-checkpoints",
+                "4",
+                "--prompt-reuse-checkpoint-bytes",
+                "134217728",
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "f16",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+                "--cpu-family",
+                "x1",
+            ]
+            .map(OsString::from),
+        );
+        let parsed_branch = configuration(branch_selected).map_err(io::Error::other)?;
+        assert!(parsed_branch.require_broker_pipe);
+        assert_eq!(
+            parsed_branch.prompt_reuse,
+            crate::client::PromptReuse::PromptEndAndLatest
+        );
+        assert_eq!(parsed_branch.prompt_reuse_checkpoints, Some(4));
+        assert_eq!(
+            parsed_branch.prompt_reuse_checkpoint_bytes,
+            Some(134_217_728)
+        );
+        assert_eq!(
+            parsed_branch.cpu_prefill_gdn,
+            Some(crate::client::CpuPrefillGdn::WyF32)
+        );
+        assert_eq!(parsed_branch.cpu_family, Some(crate::client::CpuFamily::X1));
+        assert_eq!(parsed_branch.native_row_workers, 8);
+
+        let mut spec_selected = args.to_vec();
+        spec_selected.extend(
+            [
+                "--cpu-prefill-tokens",
+                "16",
+                "--spec-type",
+                "suffix",
+                "--draft-max",
+                "6",
+                "--cpu-family",
+                "x2",
+            ]
+            .map(OsString::from),
+        );
+        let parsed_spec = configuration(spec_selected).map_err(io::Error::other)?;
+        assert_eq!(
+            parsed_spec.spec_type,
+            Some(crate::client::SpeculationType::Suffix)
+        );
+        assert_eq!(parsed_spec.draft_max, Some(6));
+        assert_eq!(parsed_spec.cpu_family, Some(crate::client::CpuFamily::X2));
+        assert_eq!(parsed_spec.native_row_workers, 8);
+
+        for invalid in [
+            vec!["--publisher-engine", "--require-broker-pipe"],
+            vec!["--prompt-reuse-checkpoints", "2"],
+            vec![
+                "--prompt-reuse",
+                "disabled",
+                "--prompt-reuse-checkpoints",
+                "2",
+            ],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "0",
+            ],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "9",
+            ],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "02",
+            ],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoint-bytes",
+                "0",
+            ],
+            vec!["--cpu-prefill-gdn", "wy-f32"],
+            vec!["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"],
+            vec![
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "rsq4",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+            ],
+            vec!["--draft-max", "4"],
+            vec!["--spec-type", "none", "--draft-max", "4"],
+            vec!["--spec-type", "suffix"],
+            vec![
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "f16",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+                "--spec-type",
+                "suffix",
+            ],
+            vec!["--cpu-family", "x3"],
+            vec!["--publisher-engine", "--cpu-family", "x2"],
+        ] {
+            let mut rejected = args.to_vec();
+            rejected.extend(invalid.into_iter().map(OsString::from));
             assert!(configuration(rejected).is_err());
         }
         let mut publisher = args.to_vec();

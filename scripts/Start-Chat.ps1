@@ -16,12 +16,27 @@ Uses a prebuilt bonsai-tools executable. Rust owns startup and application polic
 param(
     [switch]$NativeEngine,
     [switch]$PublisherEngine,
+    [switch]$RequireBrokerPipe,
     [ValidateSet(1, 4, 8, 12)]
     [int]$NativeRowWorkers,
-    [ValidateSet('disabled', 'latest')]
+    [ValidateSet('disabled', 'latest', 'prompt-end-and-latest')]
     [string]$PromptReuse,
+    [ValidateRange(1, 8)]
+    [int]$PromptReuseCheckpoints,
+    [ValidateRange(1, 9223372036854775807)]
+    [long]$PromptReuseCheckpointBytes,
     [ValidateSet('f16', 'rsq4', 'rsq4k3v')]
     [string]$KvCache,
+    [ValidateSet(8, 16, 32)]
+    [int]$CpuPrefillTokens,
+    [ValidateSet('sequential', 'wy-f32')]
+    [string]$CpuPrefillGdn,
+    [ValidateSet('none', 'suffix')]
+    [string]$SpecType,
+    [ValidateRange(1, 8)]
+    [int]$DraftMax,
+    [ValidateSet('x1', 'x2')]
+    [string]$CpuFamily,
     [ValidateSet('auto', 'cpu')]
     [string]$Placement,
     [switch]$UseRepackedPtq1,
@@ -75,6 +90,7 @@ $launchArguments = @('chat', '--repository-root', (Split-Path $PSScriptRoot -Par
 if ($DataDirectory) { $launchArguments += @('--data-directory', $DataDirectory) }
 if ($NativeEngine) { $launchArguments += '--native-engine' }
 if ($PublisherEngine) { $launchArguments += '--publisher-engine' }
+if ($RequireBrokerPipe) { $launchArguments += '--require-broker-pipe' }
 if ($PSBoundParameters.ContainsKey('NativeRowWorkers')) {
     $launchArguments += @('--native-row-workers', [string]$NativeRowWorkers)
 }
@@ -82,7 +98,22 @@ if ($UseRepackedPtq1) { $launchArguments += '--use-repacked-ptq1' }
 if ($UseOriginalPq2) { $launchArguments += '--use-original-pq2' }
 if ($GraphicsBackend) { $launchArguments += @('--graphics-backend', $GraphicsBackend.ToLowerInvariant()) }
 if ($PromptReuse) { $launchArguments += @('--prompt-reuse', $PromptReuse.ToLowerInvariant()) }
+if ($PSBoundParameters.ContainsKey('PromptReuseCheckpoints')) {
+    $launchArguments += @('--prompt-reuse-checkpoints', [string]$PromptReuseCheckpoints)
+}
+if ($PSBoundParameters.ContainsKey('PromptReuseCheckpointBytes')) {
+    $launchArguments += @('--prompt-reuse-checkpoint-bytes', [string]$PromptReuseCheckpointBytes)
+}
 if ($KvCache) { $launchArguments += @('--kv-cache', $KvCache.ToLowerInvariant()) }
+if ($PSBoundParameters.ContainsKey('CpuPrefillTokens')) {
+    $launchArguments += @('--cpu-prefill-tokens', [string]$CpuPrefillTokens)
+}
+if ($CpuPrefillGdn) { $launchArguments += @('--cpu-prefill-gdn', $CpuPrefillGdn.ToLowerInvariant()) }
+if ($SpecType) { $launchArguments += @('--spec-type', $SpecType.ToLowerInvariant()) }
+if ($PSBoundParameters.ContainsKey('DraftMax')) {
+    $launchArguments += @('--draft-max', [string]$DraftMax)
+}
+if ($CpuFamily) { $launchArguments += @('--cpu-family', $CpuFamily.ToLowerInvariant()) }
 if ($Placement) { $launchArguments += @('--placement', $Placement.ToLowerInvariant()) }
 & $ToolPath @launchArguments
 exit $LASTEXITCODE

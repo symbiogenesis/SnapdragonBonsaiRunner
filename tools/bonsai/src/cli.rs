@@ -117,8 +117,14 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--tts-threads" => ("TtsThreads", false, true),
             "--native-row-workers" => ("NativeRowWorkers", false, true),
             "--prompt-reuse" => ("PromptReuse", false, false),
+            "--prompt-reuse-checkpoints" => ("PromptReuseCheckpoints", false, true),
+            "--prompt-reuse-checkpoint-bytes" => ("PromptReuseCheckpointBytes", false, true),
             "--kv-cache" => ("KvCache", false, false),
             "--cpu-prefill-tokens" => ("CpuPrefillTokens", false, true),
+            "--cpu-prefill-gdn" => ("CpuPrefillGdn", false, false),
+            "--spec-type" => ("SpecType", false, false),
+            "--draft-max" => ("DraftMax", false, true),
+            "--cpu-family" => ("CpuFamily", false, false),
             "--placement" => ("Placement", false, false),
             "--graphics-backend" => ("GraphicsBackend", false, false),
             "--frontend-port" => ("FrontendPort", false, true),
@@ -128,6 +134,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--canary-key-file" => ("CanaryKeyFile", false, false),
             "--tts-key-file" => ("TtsKeyFile", false, false),
             "--native-engine" | "--publisher-engine" => ("NativeEngine", true, false),
+            "--require-broker-pipe" => ("RequireBrokerPipe", true, false),
             "--use-repacked-ptq1" | "--use-original-pq2" => ("UseRepackedPtq1", true, false),
             "--no-abliterate-lora" => ("NoAbliterateLora", true, false),
             "--no-mmproj" => ("NoMmproj", true, false),
@@ -222,7 +229,17 @@ pub fn installed_chat(arguments: &[OsString]) -> crate::Result<Value> {
                 | "NoMmproj"
                 | "UseRepackedPtq1"
                 | "NativeEngine"
+                | "RequireBrokerPipe"
                 | "NativeRowWorkers"
+                | "PromptReuse"
+                | "PromptReuseCheckpoints"
+                | "PromptReuseCheckpointBytes"
+                | "KvCache"
+                | "CpuPrefillTokens"
+                | "CpuPrefillGdn"
+                | "SpecType"
+                | "DraftMax"
+                | "CpuFamily"
                 | "Placement"
                 | "TtsQuantization"
                 | "TtsThreads"
@@ -284,6 +301,64 @@ mod tests {
         arguments.push("--force-build".into());
         assert!(installed_chat(&arguments).is_err());
         assert!(installed_chat(&["--installation-directory".into(), "relative".into()]).is_err());
+        assert_eq!(
+            Value::Object(chat_options(&[
+                "--require-broker-pipe".into(),
+                "--prompt-reuse".into(),
+                "prompt-end-and-latest".into(),
+                "--prompt-reuse-checkpoints".into(),
+                "4".into(),
+                "--prompt-reuse-checkpoint-bytes".into(),
+                "134217728".into(),
+                "--kv-cache".into(),
+                "f16".into(),
+                "--cpu-prefill-tokens".into(),
+                "16".into(),
+                "--cpu-prefill-gdn".into(),
+                "wy-f32".into(),
+                "--spec-type".into(),
+                "suffix".into(),
+                "--draft-max".into(),
+                "4".into(),
+                "--cpu-family".into(),
+                "x2".into(),
+            ])?),
+            serde_json::json!({
+                "RequireBrokerPipe": true,
+                "PromptReuse": "prompt-end-and-latest",
+                "PromptReuseCheckpoints": 4,
+                "PromptReuseCheckpointBytes": 134_217_728,
+                "KvCache": "f16",
+                "CpuPrefillTokens": 16,
+                "CpuPrefillGdn": "wy-f32",
+                "SpecType": "suffix",
+                "DraftMax": 4,
+                "CpuFamily": "x2",
+            })
+        );
+        let installed_branch = installed_chat(&[
+            "--installation-directory".into(),
+            std::env::temp_dir()
+                .join("Bonsai installed branch")
+                .into_os_string(),
+            "--require-broker-pipe".into(),
+            "--prompt-reuse".into(),
+            "prompt-end-and-latest".into(),
+            "--prompt-reuse-checkpoints".into(),
+            "4".into(),
+            "--cpu-prefill-tokens".into(),
+            "16".into(),
+            "--spec-type".into(),
+            "suffix".into(),
+            "--draft-max".into(),
+            "4".into(),
+            "--cpu-family".into(),
+            "x1".into(),
+        ])?;
+        assert_eq!(installed_branch["options"]["RequireBrokerPipe"], true);
+        assert_eq!(installed_branch["options"]["CpuPrefillTokens"], 16);
+        assert_eq!(installed_branch["options"]["DraftMax"], 4);
+        assert_eq!(installed_branch["options"]["CpuFamily"], "x1");
         Ok(())
     }
 

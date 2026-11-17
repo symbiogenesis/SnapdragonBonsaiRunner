@@ -141,9 +141,15 @@ pub struct LaunchConfig {
     profile: LaunchProfile,
     native_engine: bool,
     native_row_workers: u8,
-    latest_prompt_reuse: bool,
+    prompt_reuse: crate::inference::PromptReuseMode,
+    prompt_reuse_checkpoints: Option<u8>,
+    prompt_reuse_checkpoint_bytes: Option<usize>,
     kv_cache: Option<crate::inference::KvCache>,
     cpu_prefill_tokens: Option<u8>,
+    cpu_prefill_gdn: Option<crate::inference::CpuPrefillGdn>,
+    spec_type: Option<crate::inference::SpeculationType>,
+    draft_max: Option<u8>,
+    cpu_family: Option<crate::inference::CpuFamily>,
     placement: crate::inference::Placement,
     reset_on_cancel: bool,
     no_mmproj: bool,
@@ -210,8 +216,11 @@ impl LaunchConfig {
             (false, false, false, false);
         let mut check_only = false;
         let mut native_engine = None;
-        let (mut native_row_workers, mut latest_prompt_reuse) = (None, None);
-        let (mut kv_cache, mut cpu_prefill_tokens, mut placement) = (None, None, None);
+        let (mut native_row_workers, mut prompt_reuse) = (None, None);
+        let (mut prompt_reuse_checkpoints, mut prompt_reuse_checkpoint_bytes) = (None, None);
+        let (mut kv_cache, mut cpu_prefill_tokens, mut cpu_prefill_gdn, mut placement) =
+            (None, None, None, None);
+        let (mut spec_type, mut draft_max, mut cpu_family) = (None, None, None);
         let mut reset_on_cancel = false;
         let mut no_mmproj = false;
         let mut use_abliterate_lora = false;
@@ -236,8 +245,18 @@ impl LaunchConfig {
                 Some("--native-row-workers") if native_row_workers.is_none() => {
                     native_row_workers = Some(row_workers(args.next().as_deref())?);
                 }
-                Some("--prompt-reuse") if latest_prompt_reuse.is_none() => {
-                    latest_prompt_reuse = Some(prompt_reuse(args.next().as_deref())?);
+                Some("--prompt-reuse") if prompt_reuse.is_none() => {
+                    prompt_reuse = Some(crate::inference::PromptReuseMode::parse(
+                        args.next().as_deref(),
+                    )?);
+                }
+                Some("--prompt-reuse-checkpoints") if prompt_reuse_checkpoints.is_none() => {
+                    prompt_reuse_checkpoints = Some(decimal_range_u8(args.next(), 1..=8)?);
+                }
+                Some("--prompt-reuse-checkpoint-bytes")
+                    if prompt_reuse_checkpoint_bytes.is_none() =>
+                {
+                    prompt_reuse_checkpoint_bytes = Some(positive_decimal_usize(args.next())?);
                 }
                 Some("--kv-cache") if kv_cache.is_none() => {
                     kv_cache = Some(crate::inference::KvCache::parse(args.next().as_deref())?);
@@ -246,6 +265,22 @@ impl LaunchConfig {
                     cpu_prefill_tokens = Some(crate::inference::parse_cpu_prefill_tokens(
                         args.next().as_deref(),
                     )?);
+                }
+                Some("--cpu-prefill-gdn") if cpu_prefill_gdn.is_none() => {
+                    cpu_prefill_gdn = Some(crate::inference::CpuPrefillGdn::parse(
+                        args.next().as_deref(),
+                    )?);
+                }
+                Some("--spec-type") if spec_type.is_none() => {
+                    spec_type = Some(crate::inference::SpeculationType::parse(
+                        args.next().as_deref(),
+                    )?);
+                }
+                Some("--draft-max") if draft_max.is_none() => {
+                    draft_max = Some(decimal_range_u8(args.next(), 1..=8)?);
+                }
+                Some("--cpu-family") if cpu_family.is_none() => {
+                    cpu_family = Some(crate::inference::CpuFamily::parse(args.next().as_deref())?);
                 }
                 Some("--placement") if placement.is_none() => {
                     placement = Some(crate::inference::Placement::parse(args.next().as_deref())?);
@@ -303,13 +338,22 @@ impl LaunchConfig {
         let profile = profile.unwrap_or_default();
         let native_engine = native_engine.unwrap_or(profile == LaunchProfile::SwiftPq2Assessment);
         let native_row_workers = native_row_workers.unwrap_or(if native_engine {
-            bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_workers(family)
+            if let Some(explicit_family) = cpu_family {
+                explicit_family.default_row_workers()
+            } else {
+                bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_workers(family)
+            }
         } else {
             1
         });
-        let latest_prompt_reuse = latest_prompt_reuse.unwrap_or(false);
+        let prompt_reuse = prompt_reuse.unwrap_or_default();
         let kv_cache = crate::inference::pinned_kv_cache(native_engine, kv_cache)?;
-        if (cpu_prefill_tokens.is_some() || placement.is_some())
+        if (cpu_prefill_tokens.is_some()
+            || cpu_prefill_gdn.is_some()
+            || spec_type.is_some()
+            || draft_max.is_some()
+            || cpu_family.is_some()
+            || placement.is_some())
             && profile != LaunchProfile::SwiftPq2Assessment
         {
             return Err(LaunchError::Arguments);
@@ -329,9 +373,15 @@ impl LaunchConfig {
             profile,
             native_engine,
             native_row_workers,
-            latest_prompt_reuse,
+            prompt_reuse,
+            prompt_reuse_checkpoints,
+            prompt_reuse_checkpoint_bytes,
             kv_cache,
             cpu_prefill_tokens,
+            cpu_prefill_gdn,
+            spec_type,
+            draft_max,
+            cpu_family,
             placement,
             reset_on_cancel,
             no_mmproj,
@@ -349,7 +399,35 @@ impl LaunchConfig {
         if configuration.require_broker_pipe && !crate::inference::broker_pipe_supported()? {
             return Err(LaunchError::NativeRuntime);
         }
+        if (configuration.prompt_reuse == crate::inference::PromptReuseMode::PromptEndAndLatest
+            || configuration.prompt_reuse_checkpoints.is_some()
+            || configuration.prompt_reuse_checkpoint_bytes.is_some())
+            && !crate::inference::branch_prompt_reuse_supported()?
+        {
+            return Err(LaunchError::NativeRuntime);
+        }
+        if configuration.cpu_prefill_gdn.is_some()
+            && !crate::inference::cpu_prefill_gdn_supported()?
+        {
+            return Err(LaunchError::NativeRuntime);
+        }
+        if configuration.spec_type.is_some() && !crate::inference::cpu_speculation_supported()? {
+            return Err(LaunchError::NativeRuntime);
+        }
+        if configuration.cpu_family.is_some() && !crate::inference::broker_pipe_supported()? {
+            return Err(LaunchError::NativeRuntime);
+        }
         Ok(configuration)
+    }
+
+    const fn effective_speculation_tokens(&self) -> Option<u8> {
+        match self.spec_type {
+            Some(crate::inference::SpeculationType::Suffix) => Some(match self.draft_max {
+                Some(tokens) => tokens,
+                None => 4,
+            }),
+            Some(crate::inference::SpeculationType::None) | None => None,
+        }
     }
 
     fn validate_selection(&self, explicit_weight: bool) -> Result<(), LaunchError> {
@@ -362,8 +440,25 @@ impl LaunchConfig {
             || (self.require_broker_pipe
                 && (!self.requires_native_sandbox() || !self.native_engine))
             || (self.native_row_workers != 1 && !self.native_engine)
-            || (self.latest_prompt_reuse && !self.native_engine)
-            || (self.cpu_prefill_tokens.is_some() && !self.native_engine)
+            || (self.prompt_reuse.enabled() && !self.native_engine)
+            || ((self.prompt_reuse_checkpoints.is_some()
+                || self.prompt_reuse_checkpoint_bytes.is_some())
+                && (!self.native_engine || !self.prompt_reuse.enabled()))
+            || ((self.cpu_prefill_tokens.is_some()
+                || self.cpu_prefill_gdn.is_some()
+                || self.spec_type.is_some()
+                || self.draft_max.is_some()
+                || self.cpu_family.is_some())
+                && !self.native_engine)
+            || (self.cpu_prefill_gdn.is_some() && self.cpu_prefill_tokens.is_none())
+            || (self.cpu_prefill_gdn == Some(crate::inference::CpuPrefillGdn::WyF32)
+                && self.kv_cache != Some(crate::inference::KvCache::F16))
+            || (self.draft_max.is_some()
+                && self.spec_type != Some(crate::inference::SpeculationType::Suffix))
+            || (self.spec_type == Some(crate::inference::SpeculationType::Suffix)
+                && self.cpu_prefill_tokens.is_none())
+            || (self.cpu_prefill_gdn == Some(crate::inference::CpuPrefillGdn::WyF32)
+                && self.spec_type == Some(crate::inference::SpeculationType::Suffix))
             || (self.reset_on_cancel && !self.native_engine)
             || (self.no_mmproj && !swift)
             || (self.use_abliterate_lora && !swift)
@@ -436,6 +531,7 @@ impl LaunchConfig {
     fn runtime_supports_vision(&self) -> Result<bool, LaunchError> {
         Ok(self.memory_context_supported()?
             && !self.no_mmproj
+            && self.effective_speculation_tokens().is_none()
             && (!self.native_engine || crate::inference::vision_supported()?))
     }
 
@@ -472,13 +568,20 @@ impl LaunchConfig {
         } else {
             SwiftWeightPacking::Pq2_0
         };
-        let prompt_reuse = if self.latest_prompt_reuse {
-            SwiftCalibratedReuse::Latest {
-                checkpoints: 1,
-                checkpoint_bytes: None,
+        let checkpoints = self.prompt_reuse_checkpoints.unwrap_or(1);
+        let checkpoint_bytes = self.prompt_reuse_checkpoint_bytes;
+        let prompt_reuse = match self.prompt_reuse {
+            crate::inference::PromptReuseMode::Disabled => SwiftCalibratedReuse::Disabled,
+            crate::inference::PromptReuseMode::Latest => SwiftCalibratedReuse::Latest {
+                checkpoints,
+                checkpoint_bytes,
+            },
+            crate::inference::PromptReuseMode::PromptEndAndLatest => {
+                SwiftCalibratedReuse::PromptEndAndLatest {
+                    checkpoints,
+                    checkpoint_bytes,
+                }
             }
-        } else {
-            SwiftCalibratedReuse::Disabled
         };
         SwiftContextPlan::for_calibrated_execution(
             available_bytes,
@@ -487,8 +590,10 @@ impl LaunchConfig {
                 weight_packing,
                 request_vision,
                 prefill_tokens: self.cpu_prefill_tokens.map(usize::from),
-                chunkwise_gdn_wy_f32: false,
-                speculation_tokens: None,
+                chunkwise_gdn_wy_f32: self
+                    .cpu_prefill_gdn
+                    .is_some_and(crate::inference::CpuPrefillGdn::is_wy_f32),
+                speculation_tokens: self.effective_speculation_tokens(),
                 prompt_reuse,
             },
         )
@@ -715,7 +820,7 @@ impl LaunchConfig {
             crate::inference::verify(
                 &self.data,
                 self.native_row_workers,
-                self.latest_prompt_reuse,
+                self.prompt_reuse.enabled(),
             )
             .map(Some)
             .map_err(|_| LaunchError::NativeRuntime)
@@ -771,8 +876,26 @@ impl LaunchConfig {
                 OsString::from(self.native_row_workers.to_string()),
             ]);
         }
-        if self.latest_prompt_reuse {
-            arguments.extend([OsString::from("--prompt-reuse"), OsString::from("latest")]);
+        if let Some(family) = self.cpu_family {
+            arguments.extend([
+                OsString::from("--cpu-family"),
+                OsString::from(family.as_str()),
+            ]);
+        }
+        if let Some(mode) = self.prompt_reuse.as_wire() {
+            arguments.extend([OsString::from("--prompt-reuse"), OsString::from(mode)]);
+        }
+        if let Some(checkpoints) = self.prompt_reuse_checkpoints {
+            arguments.extend([
+                OsString::from("--prompt-reuse-checkpoints"),
+                OsString::from(checkpoints.to_string()),
+            ]);
+        }
+        if let Some(bytes) = self.prompt_reuse_checkpoint_bytes {
+            arguments.extend([
+                OsString::from("--prompt-reuse-checkpoint-bytes"),
+                OsString::from(bytes.to_string()),
+            ]);
         }
         if let Some(policy) = self.kv_cache {
             arguments.extend([OsString::from("--kv-cache"), OsString::from(policy.name())]);
@@ -783,6 +906,29 @@ impl LaunchConfig {
                 OsString::from(tokens.to_string()),
                 OsString::from("--cpu-prefill-scratch-bytes"),
                 OsString::from(scratch_bytes.to_string()),
+            ]);
+            if let Some(gdn) = self.cpu_prefill_gdn {
+                arguments.extend([
+                    OsString::from("--cpu-prefill-gdn"),
+                    OsString::from(gdn.as_str()),
+                ]);
+            }
+        }
+        if let Some((draft_max, verification_scratch, checkpoint_bytes)) = plan.cpu_speculation {
+            arguments.extend([
+                OsString::from("--spec-type"),
+                OsString::from("suffix"),
+                OsString::from("--draft-max"),
+                OsString::from(draft_max.to_string()),
+                OsString::from("--cpu-verification-scratch-bytes"),
+                OsString::from(verification_scratch.to_string()),
+                OsString::from("--cpu-speculative-checkpoint-bytes"),
+                OsString::from(checkpoint_bytes.to_string()),
+            ]);
+        } else if let Some(spec_type) = self.spec_type {
+            arguments.extend([
+                OsString::from("--spec-type"),
+                OsString::from(spec_type.as_str()),
             ]);
         }
         if self.placement == crate::inference::Placement::Cpu {
@@ -1093,7 +1239,20 @@ impl LaunchConfig {
                     plan.cpu_prefill = self
                         .cpu_prefill_tokens
                         .zip(calibrated.prefill_scratch_bytes);
+                    plan.cpu_speculation = self
+                        .effective_speculation_tokens()
+                        .zip(calibrated.speculation_reserves)
+                        .map(|(tokens, (verify, checkpoint))| (tokens, verify, checkpoint));
                 } else {
+                    if self.effective_speculation_tokens().is_some()
+                        || self.cpu_prefill_gdn.is_some()
+                        || self.prompt_reuse
+                            == crate::inference::PromptReuseMode::PromptEndAndLatest
+                        || self.prompt_reuse_checkpoints.is_some()
+                        || self.prompt_reuse_checkpoint_bytes.is_some()
+                    {
+                        return Err(LaunchError::NativeRuntime);
+                    }
                     let profile = self.swift_context_profile()?;
                     let (context, vision_admitted, prefill_scratch) =
                         match bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
@@ -1131,6 +1290,7 @@ impl LaunchConfig {
             let active_mmproj_guard = vision_enabled.then(|| mmproj_file.as_ref()).flatten();
             let context_tokens = plan.context_tokens;
             let cpu_prefill = plan.cpu_prefill;
+            let cpu_speculation = plan.cpu_speculation;
             let working_set_limit_bytes = plan.working_set_limit_bytes;
             if let Err(error) = admit(plan.required_available_bytes) {
                 drop(reservation);
@@ -1260,6 +1420,7 @@ impl LaunchConfig {
                     context_tokens,
                     vision_enabled,
                     cpu_prefill,
+                    cpu_speculation,
                 )?;
             }
             startup_timing.phase(StartupPhase::FrontendBinding);
@@ -1347,6 +1508,7 @@ impl LaunchConfig {
         context_tokens: usize,
         vision_enabled: bool,
         cpu_prefill: Option<(u8, usize)>,
+        cpu_speculation: Option<(u8, usize, usize)>,
     ) -> Result<(), LaunchError> {
         let verification = crate::inference::pinned_version()
             .map_err(|_| NativeIdentityError::ReleasePin)
@@ -1356,10 +1518,16 @@ impl LaunchConfig {
                     self.uses_repacked_ptq1(),
                     self.use_abliterate_lora,
                     WorkerReadiness::for_version(&version, self.native_row_workers)
-                        .with_prompt_reuse(self.latest_prompt_reuse)
+                        .with_prompt_reuse_mode(self.prompt_reuse)
+                        .with_prompt_reuse_checkpoints(self.prompt_reuse_checkpoints.unwrap_or(1))
                         .with_vision(vision_enabled)
                         .with_kv_cache(self.kv_cache)
                         .with_cpu_prefill(cpu_prefill)
+                        .with_cpu_prefill_gdn(
+                            self.cpu_prefill_gdn
+                                .is_some_and(crate::inference::CpuPrefillGdn::is_wy_f32),
+                        )
+                        .with_cpu_speculation(cpu_speculation)
                         .with_placement(self.placement)
                         .with_context_tokens(context_tokens),
                 )
@@ -1721,12 +1889,40 @@ fn row_workers(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
     }
 }
 
-fn prompt_reuse(value: Option<&std::ffi::OsStr>) -> Result<bool, LaunchError> {
-    match value.and_then(std::ffi::OsStr::to_str) {
-        Some("disabled") => Ok(false),
-        Some("latest") => Ok(true),
-        _ => Err(LaunchError::Arguments),
+fn canonical_decimal_str(value: Option<OsString>) -> Result<String, LaunchError> {
+    let text = value
+        .and_then(|raw| raw.into_string().ok())
+        .ok_or(LaunchError::Arguments)?;
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(LaunchError::Arguments);
     }
+    Ok(text)
+}
+
+fn decimal_range_u8(
+    value: Option<OsString>,
+    range: std::ops::RangeInclusive<u8>,
+) -> Result<u8, LaunchError> {
+    let parsed = canonical_decimal_str(value)?
+        .parse::<u8>()
+        .map_err(|_| LaunchError::Arguments)?;
+    if !range.contains(&parsed) {
+        return Err(LaunchError::Arguments);
+    }
+    Ok(parsed)
+}
+
+fn positive_decimal_usize(value: Option<OsString>) -> Result<usize, LaunchError> {
+    let parsed = canonical_decimal_str(value)?
+        .parse::<usize>()
+        .map_err(|_| LaunchError::Arguments)?;
+    if parsed == 0 {
+        return Err(LaunchError::Arguments);
+    }
+    Ok(parsed)
 }
 
 fn launch_profile(value: Option<&std::ffi::OsStr>) -> Result<LaunchProfile, LaunchError> {
@@ -2687,9 +2883,13 @@ mod tests {
     #[test]
     fn prompt_reuse_is_explicit_native_only_and_reaches_the_owned_child() -> Result<(), LaunchError>
     {
+        use crate::inference::PromptReuseMode;
         let mut native = arguments();
         native.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
-        assert!(!LaunchConfig::parse(native.clone())?.latest_prompt_reuse);
+        assert_eq!(
+            LaunchConfig::parse(native.clone())?.prompt_reuse,
+            PromptReuseMode::Disabled
+        );
         let data = std::env::temp_dir().join("Bonsai-prefix-routing");
         let key = data.join("backend.key");
         let plan = super::LaunchPlan::for_profile_with_options(
@@ -2701,18 +2901,23 @@ mod tests {
             false,
         )
         .map_err(|_| LaunchError::Policy)?;
-        for (name, latest) in [("disabled", false), ("latest", true)] {
+        for (name, mode) in [
+            ("disabled", PromptReuseMode::Disabled),
+            ("latest", PromptReuseMode::Latest),
+            ("prompt-end-and-latest", PromptReuseMode::PromptEndAndLatest),
+        ] {
             let mut selected = native.clone();
             selected.extend(["--prompt-reuse", name].map(OsString::from));
             let config = LaunchConfig::parse(selected.clone())?;
-            assert_eq!(config.latest_prompt_reuse, latest);
+            assert_eq!(config.prompt_reuse, mode);
             let child = config.native_arguments(&plan, Some(&key));
             assert_eq!(
                 child
                     .array_windows()
-                    .filter(|[flag, value]| flag == "--prompt-reuse" && value == "latest")
+                    .filter(|[flag, value]| flag == "--prompt-reuse"
+                        && value == mode.as_wire().unwrap_or(""))
                     .count(),
-                usize::from(latest)
+                usize::from(mode.enabled())
             );
             selected.extend(["--prompt-reuse", name].map(OsString::from));
             assert_eq!(
@@ -3905,6 +4110,212 @@ mod tests {
             pair[0] == "--memory-limit-bytes"
                 && pair[1] == plan.native_child_memory_limit_bytes().to_string().as_str()
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn session_options_0_1_32_validate_reserves_vision_suppression_and_child_arguments()
+    -> Result<(), LaunchError> {
+        use crate::inference::{CpuFamily, CpuPrefillGdn, PromptReuseMode, SpeculationType};
+        let mut native = arguments();
+        native.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+
+        let mut branch_args = native.clone();
+        branch_args.extend(
+            [
+                "--prompt-reuse",
+                "prompt-end-and-latest",
+                "--prompt-reuse-checkpoints",
+                "4",
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "f16",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+                "--cpu-family",
+                "x1",
+            ]
+            .map(OsString::from),
+        );
+        let branch = LaunchConfig::parse(branch_args)?;
+        assert_eq!(branch.prompt_reuse, PromptReuseMode::PromptEndAndLatest);
+        assert_eq!(branch.prompt_reuse_checkpoints, Some(4));
+        assert_eq!(branch.cpu_prefill_tokens, Some(16));
+        assert_eq!(branch.cpu_prefill_gdn, Some(CpuPrefillGdn::WyF32));
+        assert_eq!(branch.cpu_family, Some(CpuFamily::X1));
+        assert_eq!(branch.native_row_workers, 8);
+        assert!(branch.runtime_supports_vision()?);
+
+        let gib = 1024 * 1024 * 1024_u64;
+        let calibrated_branch = branch.calibrated_context_plan(48 * gib, true)?;
+        let mut branch_plan = super::LaunchPlan::for_profile_with_options(
+            &branch.data,
+            8081,
+            &branch.evidence_parent.join("backend.key"),
+            LaunchProfile::SwiftPq2Assessment,
+            true,
+            false,
+        )
+        .map_err(|_| LaunchError::Policy)?;
+        branch_plan
+            .select_calibrated_swift_context(&calibrated_branch)
+            .map_err(|_| LaunchError::Policy)?;
+        branch_plan.cpu_prefill = branch
+            .cpu_prefill_tokens
+            .zip(calibrated_branch.prefill_scratch_bytes);
+        let branch_child = branch.native_arguments(&branch_plan, None);
+        for [flag, value] in [
+            ["--cpu-family", "x1"],
+            ["--prompt-reuse", "prompt-end-and-latest"],
+            ["--prompt-reuse-checkpoints", "4"],
+            ["--cpu-prefill-gdn", "wy-f32"],
+        ] {
+            assert!(
+                branch_child
+                    .array_windows::<2>()
+                    .any(|pair| pair[0] == flag && pair[1] == value),
+                "missing [{flag}, {value}] in {branch_child:?}"
+            );
+        }
+
+        let mut spec_args = native.clone();
+        spec_args.extend(
+            [
+                "--cpu-prefill-tokens",
+                "16",
+                "--spec-type",
+                "suffix",
+                "--draft-max",
+                "6",
+                "--cpu-family",
+                "x2",
+                "--native-row-workers",
+                "4",
+            ]
+            .map(OsString::from),
+        );
+        let spec = LaunchConfig::parse(spec_args)?;
+        assert_eq!(spec.spec_type, Some(SpeculationType::Suffix));
+        assert_eq!(spec.draft_max, Some(6));
+        assert_eq!(spec.effective_speculation_tokens(), Some(6));
+        assert_eq!(spec.native_row_workers, 4);
+        assert!(
+            !spec.runtime_supports_vision()?,
+            "suffix speculation must automatically suppress optional mmproj"
+        );
+        let calibrated_spec = spec.calibrated_context_plan(24 * gib, false)?;
+        let mut spec_plan = super::LaunchPlan::for_profile_with_options(
+            &spec.data,
+            8081,
+            &spec.evidence_parent.join("backend.key"),
+            LaunchProfile::SwiftPq2Assessment,
+            true,
+            false,
+        )
+        .map_err(|_| LaunchError::Policy)?;
+        spec_plan
+            .select_calibrated_swift_context(&calibrated_spec)
+            .map_err(|_| LaunchError::Policy)?;
+        spec_plan.cpu_prefill = spec
+            .cpu_prefill_tokens
+            .zip(calibrated_spec.prefill_scratch_bytes);
+        spec_plan.cpu_speculation = spec
+            .effective_speculation_tokens()
+            .zip(calibrated_spec.speculation_reserves)
+            .map(|(tokens, (verify, checkpoint))| (tokens, verify, checkpoint));
+        let spec_child = spec.native_arguments(&spec_plan, None);
+        assert!(
+            spec_child
+                .array_windows::<2>()
+                .any(|pair| pair[0] == "--spec-type" && pair[1] == "suffix")
+        );
+        assert!(
+            spec_child
+                .array_windows::<2>()
+                .any(|pair| pair[0] == "--draft-max" && pair[1] == "6")
+        );
+        assert!(
+            spec_child
+                .iter()
+                .all(|flag| flag != "--cpu-speculative-tokens")
+        );
+        assert!(
+            spec_child
+                .iter()
+                .any(|flag| flag == "--cpu-verification-scratch-bytes")
+        );
+        assert!(
+            spec_child
+                .iter()
+                .any(|flag| flag == "--cpu-speculative-checkpoint-bytes")
+        );
+
+        for invalid in [
+            vec!["--prompt-reuse-checkpoints", "2"],
+            vec![
+                "--prompt-reuse",
+                "disabled",
+                "--prompt-reuse-checkpoints",
+                "2",
+            ],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "0",
+            ],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "9",
+            ],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoints",
+                "02",
+            ],
+            vec![
+                "--prompt-reuse",
+                "latest",
+                "--prompt-reuse-checkpoint-bytes",
+                "0",
+            ],
+            vec!["--cpu-prefill-gdn", "wy-f32"],
+            vec!["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"],
+            vec![
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "rsq4",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+            ],
+            vec!["--draft-max", "4"],
+            vec!["--spec-type", "none", "--draft-max", "4"],
+            vec!["--spec-type", "suffix"],
+            vec![
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "f16",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+                "--spec-type",
+                "suffix",
+            ],
+            vec!["--cpu-family", "x3"],
+            vec!["--publisher-engine", "--cpu-family", "x2"],
+        ] {
+            let mut rejected = native.clone();
+            rejected.extend(invalid.into_iter().map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(rejected).err(),
+                Some(LaunchError::Arguments)
+            );
+        }
         Ok(())
     }
 }
