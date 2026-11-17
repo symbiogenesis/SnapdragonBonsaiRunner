@@ -101,13 +101,14 @@ impl fmt::Display for LoudnessError {
             Self::NonFiniteSample => {
                 formatter.write_str("audio input contains non-finite (NaN or infinite) samples")
             }
-            Self::InvalidTargetLufs => formatter.write_str("target loudness in LUFS must be finite"),
+            Self::InvalidTargetLufs => {
+                formatter.write_str("target loudness in LUFS must be finite")
+            }
             Self::InvalidTruePeakCeiling => {
                 formatter.write_str("true-peak ceiling in dBTP must be finite")
             }
-            Self::BelowLoudnessGate => formatter.write_str(
-                "audio has no measurable integrated loudness above the -70 LUFS gate",
-            ),
+            Self::BelowLoudnessGate => formatter
+                .write_str("audio has no measurable integrated loudness above the -70 LUFS gate"),
             Self::AllocationFailed => {
                 formatter.write_str("failed to allocate loudness analysis buffer")
             }
@@ -290,7 +291,8 @@ fn measure_true_peak_linear(samples: &[f32], sample_peak: f64) -> f64 {
         for taps in &phases {
             let mut acc = 0.0_f64;
             for (k, &coeff) in taps.iter().enumerate() {
-                let offset = isize::try_from(k).unwrap_or(0) - isize::try_from(half_before).unwrap_or(5);
+                let offset =
+                    isize::try_from(k).unwrap_or(0) - isize::try_from(half_before).unwrap_or(5);
                 let sample_idx = center + offset;
                 if sample_idx >= 0
                     && let Ok(idx) = usize::try_from(sample_idx)
@@ -475,8 +477,7 @@ fn collect_block_energies_general(
 
     let mut short_term = Vec::new();
     if samples.len() >= geometry.short_term_samples {
-        let short_count =
-            (samples.len() - geometry.short_term_samples) / geometry.step_samples + 1;
+        let short_count = (samples.len() - geometry.short_term_samples) / geometry.step_samples + 1;
         let inv_short = 1.0 / f64::from(u32::try_from(geometry.short_term_samples).unwrap_or(1));
         short_term
             .try_reserve_exact(short_count)
@@ -668,8 +669,8 @@ pub fn measure_loudness_f32(
         });
     }
 
-    let geometry =
-        WindowGeometry::new(sample_rate).ok_or(LoudnessError::UnsupportedSampleRate(sample_rate))?;
+    let geometry = WindowGeometry::new(sample_rate)
+        .ok_or(LoudnessError::UnsupportedSampleRate(sample_rate))?;
     let (momentary_energies, short_term_energies) = if geometry.exact_step_grid() {
         collect_block_energies_grid(samples, sample_rate, &geometry)?
     } else {
@@ -924,7 +925,10 @@ mod tests {
         assert!(short_obs.true_peak_dbtp.is_some_and(f64::is_finite));
 
         // Validation errors.
-        assert_eq!(measure_loudness_f32(&[], 24_000), Err(LoudnessError::EmptyInput));
+        assert_eq!(
+            measure_loudness_f32(&[], 24_000),
+            Err(LoudnessError::EmptyInput)
+        );
         assert_eq!(
             measure_loudness_f32(&[0.0], 7_999),
             Err(LoudnessError::UnsupportedSampleRate(7_999))
@@ -986,7 +990,12 @@ mod tests {
         );
 
         // Now test unclamped matching on a quiet -28 LUFS sine targeting -18 LUFS with -1.0 dBTP ceiling.
-        let clean_quiet = sine_wave(997.0, 10.0_f64.powf((-28.0 + 3.010_299_956_639_812) / 20.0), 16_000, 1.0);
+        let clean_quiet = sine_wave(
+            997.0,
+            10.0_f64.powf((-28.0 + 3.010_299_956_639_812) / 20.0),
+            16_000,
+            1.0,
+        );
         let unmatched = build_loudness_matched_listening_wav(&clean_quiet, 16_000, -18.0, -1.0)?;
         assert!(!unmatched.true_peak_clamped);
         let matched_obs = measure_loudness_mono_pcm16_wav(&unmatched.wav_bytes, 16_000, 16_000)?;

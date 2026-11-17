@@ -1170,7 +1170,12 @@ impl OwnedProcess {
         spec: &ProcessSpec,
         policy: &SandboxPolicy,
         sections: &[&std::fs::File],
-    ) -> io::Result<(Self, std::fs::File, std::fs::File, Vec<InheritedSectionGrant>)> {
+    ) -> io::Result<(
+        Self,
+        std::fs::File,
+        std::fs::File,
+        Vec<InheritedSectionGrant>,
+    )> {
         if sections.len() > MAX_INHERITED_SECTIONS {
             return Err(invalid(
                 "broker-pipe worker accepts at most eight inherited read-only sections",

@@ -1339,7 +1339,9 @@ fn broker_pipe_with_sections_enforces_bounds_and_file_kinds_before_creating_stre
     let error =
         OwnedProcess::start_sandboxed_broker_pipe_with_sections(&spec, &policy, &[&valid_file])
             .err()
-            .ok_or_else(|| io::Error::other("multi-process broker-pipe section launch succeeded"))?;
+            .ok_or_else(|| {
+                io::Error::other("multi-process broker-pipe section launch succeeded")
+            })?;
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(!spec.stdout.exists());
     assert!(!spec.stderr.exists());
@@ -1352,13 +1354,10 @@ fn broker_pipe_with_sections_enforces_bounds_and_file_kinds_before_creating_stre
         writable_directory: scratch,
     };
     let exact_max: Vec<&fs::File> = vec![&valid_file; MAX_INHERITED_SECTIONS];
-    let error = OwnedProcess::start_sandboxed_broker_pipe_with_sections(
-        &spec,
-        &invalid_policy,
-        &exact_max,
-    )
-    .err()
-    .ok_or_else(|| io::Error::other("invalid sandbox policy launched with max sections"))?;
+    let error =
+        OwnedProcess::start_sandboxed_broker_pipe_with_sections(&spec, &invalid_policy, &exact_max)
+            .err()
+            .ok_or_else(|| io::Error::other("invalid sandbox policy launched with max sections"))?;
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(!spec.stdout.exists());
     assert!(!spec.stderr.exists());

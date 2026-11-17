@@ -516,7 +516,10 @@ fn wait_for_branch_diff(chat: &mut Harness<'_, Fixture>) {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "branch diff comparison timed out");
+        assert!(
+            Instant::now() < deadline,
+            "branch diff comparison timed out"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     chat.run();
@@ -573,7 +576,11 @@ fn branch_comparison_requires_explicit_acceptance_for_draft_and_new_branch() {
     let original = chat.state().app.active_conversation;
     let answer_id = chat.state().app.transcript.messages[1].id;
     let ctx = chat.ctx.clone();
-    assert!(chat.state_mut().app.compare_message_with_draft(answer_id, Some(&ctx)));
+    assert!(
+        chat.state_mut()
+            .app
+            .compare_message_with_draft(answer_id, Some(&ctx))
+    );
     wait_for_branch_diff(&mut chat);
     assert_eq!(chat.state().app.input, "Keep my next draft 🌱");
     assert_eq!(chat.state().app.committed.len(), 2);

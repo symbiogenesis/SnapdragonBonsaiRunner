@@ -740,7 +740,11 @@ impl NativeProcess {
             output.as_raw_handle(),
             error_output.as_raw_handle(),
         ]);
-        inherited_handles.extend(sections.iter().map(|section| section.handle.as_raw_handle()));
+        inherited_handles.extend(
+            sections
+                .iter()
+                .map(|section| section.handle.as_raw_handle()),
+        );
         let attributes = CreationAttributes::new(
             job.as_raw_handle(),
             inherited_handles,

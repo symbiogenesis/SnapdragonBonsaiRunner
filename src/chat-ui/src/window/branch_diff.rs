@@ -109,12 +109,8 @@ impl fmt::Display for DiffError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Cancelled => "Branch comparison was cancelled.",
-            Self::InputTooLarge => {
-                "Comparison input exceeds the 4 MiB draft diff limit."
-            }
-            Self::EditLimitExceeded => {
-                "Texts differ too extensively for inline token comparison."
-            }
+            Self::InputTooLarge => "Comparison input exceeds the 4 MiB draft diff limit.",
+            Self::EditLimitExceeded => "Texts differ too extensively for inline token comparison.",
         })
     }
 }
@@ -486,8 +482,7 @@ fn myers_middle<'a>(
 
         if d > 0 {
             let prev_d = d - 1;
-            let prev_d_isize =
-                isize::try_from(prev_d).map_err(|_| DiffError::EditLimitExceeded)?;
+            let prev_d_isize = isize::try_from(prev_d).map_err(|_| DiffError::EditLimitExceeded)?;
             trace_starts.push(trace_data.len());
             trace_data
                 .try_reserve(d)
@@ -912,7 +907,11 @@ mod tests {
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         assert_eq!(diff.reconstruct_left(), left.text);
         assert_eq!(diff.reconstruct_right(), right.text);
-        assert!(diff.spans.iter().any(|s| s.op == DiffOp::Insert && s.text.contains("brave")));
+        assert!(
+            diff.spans
+                .iter()
+                .any(|s| s.op == DiffOp::Insert && s.text.contains("brave"))
+        );
 
         // Cancellation on a large job sets cancelled state cleanly without panicking.
         let large_left = BranchDiffSource {

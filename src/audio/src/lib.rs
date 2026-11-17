@@ -294,7 +294,10 @@ pub fn mono_pcm16_wav_bytes(
     maximum_samples: usize,
 ) -> Result<Vec<u8>, WavError> {
     let header = mono_pcm16_header_checked(samples, sample_rate, maximum_samples)?;
-    let pcm_bytes = samples.len().checked_mul(2).ok_or(WavError::BufferTooSmall)?;
+    let pcm_bytes = samples
+        .len()
+        .checked_mul(2)
+        .ok_or(WavError::BufferTooSmall)?;
     let total_bytes = header
         .len()
         .checked_add(pcm_bytes)

@@ -1,9 +1,7 @@
 //! Explicit message iteration preserves the source conversation and exact history.
 use super::{
     Command, Conversation, INPUT_LIMIT, ModelLifecycle, State, Transcript,
-    branch_diff::{
-        BranchDiffJob, BranchDiffOrigin, BranchDiffSource, DiffOp, UnicodeDiff,
-    },
+    branch_diff::{BranchDiffJob, BranchDiffOrigin, BranchDiffSource, DiffOp, UnicodeDiff},
     egui,
 };
 
@@ -489,12 +487,11 @@ impl State {
         self.cancel_branch_comparison();
         self.branch_diff_generation = self.branch_diff_generation.wrapping_add(1);
         let generation = self.branch_diff_generation;
-        let repaint = ctx
-            .cloned()
-            .or_else(|| self.repaint_ctx.clone())
-            .map(|repaint_ctx| -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        let repaint = ctx.cloned().or_else(|| self.repaint_ctx.clone()).map(
+            |repaint_ctx| -> std::sync::Arc<dyn Fn() + Send + Sync> {
                 std::sync::Arc::new(move || repaint_ctx.request_repaint())
-            });
+            },
+        );
         match BranchDiffJob::start(generation, left, right, repaint) {
             Ok(job) => {
                 self.branch_comparison = Some(BranchComparison {
@@ -557,10 +554,7 @@ impl State {
         )
     }
 
-    fn conversation_last_message_source(
-        &self,
-        conversation_id: u64,
-    ) -> Option<BranchDiffSource> {
+    fn conversation_last_message_source(&self, conversation_id: u64) -> Option<BranchDiffSource> {
         let (title, transcript, committed) = if conversation_id == self.active_conversation {
             let title = self
                 .conversations
@@ -784,7 +778,9 @@ impl State {
         if confirmed {
             self.resend_edited_message(edit);
         } else if compare_requested {
-            let history_index = self.transcript.committed_index(edit.message, &self.committed);
+            let history_index = self
+                .transcript
+                .committed_index(edit.message, &self.committed);
             let history_prefix = history_index.or_else(|| {
                 self.transcript
                     .messages
