@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 use crate::identity::Hasher;
 
-const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 192 * 1024 * 1024;
 const MAX_FILES: usize = 16;
 
 struct Budget {
@@ -102,7 +102,7 @@ pub(super) fn observe(candidates: Option<&[VulkanModuleFileCandidate]>) -> Value
     };
     let mut budget = Budget {
         remaining: MAX_TOTAL_BYTES,
-        deadline: Instant::now() + Duration::from_millis(500),
+        deadline: Instant::now() + Duration::from_millis(1500),
     };
     let files: Vec<_> = candidates
         .iter()
@@ -114,7 +114,7 @@ pub(super) fn observe(candidates: Option<&[VulkanModuleFileCandidate]>) -> Value
         "files": files,
         "maximum_files": MAX_FILES, "maximum_file_bytes": MAX_FILE_BYTES,
         "maximum_total_read_bytes": MAX_TOTAL_BYTES, "read_bytes": MAX_TOTAL_BYTES - budget.remaining,
-        "work_budget_milliseconds": 500,
+        "work_budget_milliseconds": 1500,
         "loaded_image_identity_verified": false,
         "signature_verified": false, "dependencies_verified": false,
     })
