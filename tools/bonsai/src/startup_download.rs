@@ -211,6 +211,119 @@ pub(crate) fn receive_repair_with_timeout(
     })
 }
 
+const MAX_TRANSIENT_DOWNLOAD_RETRIES: usize = 6;
+const MAX_CONSECUTIVE_STALLED_RETRIES: usize = 3;
+
+fn is_transient_download_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("cancelled")
+        || lower.contains("exceeded its aggregate allowance")
+        || lower.contains("not enough free")
+        || lower.contains("disk full")
+        || lower.contains("access is denied")
+        || lower.contains("permission denied")
+        || lower.contains("credential-free")
+        || lower.contains("differs from its locked")
+        || lower.contains("exceeded its locked")
+        || lower.contains("identity content encoding")
+        || lower.contains("duplicate http response header")
+        || lower.contains("invalid ")
+    {
+        return false;
+    }
+    [
+        "timeout:",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "broken pipe",
+        "unexpected eof",
+        "ended before its locked byte length",
+        "could not resolve",
+        "dns",
+        "http 408",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn wait_retry_backoff(delay: Duration, until: Instant) -> crate::Result<()> {
+    let wake = Instant::now()
+        .checked_add(delay)
+        .ok_or("Invalid download retry delay.")?;
+    loop {
+        let remaining = repair_remaining(until)?;
+        let Some(wait) = wake.checked_duration_since(Instant::now()) else {
+            return Ok(());
+        };
+        if wait.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(wait.min(remaining).min(Duration::from_millis(50)));
+    }
+}
+
+fn retry_delay(stalled_attempts: usize) -> Duration {
+    match stalled_attempts {
+        0 | 1 => Duration::from_secs(2),
+        2 => Duration::from_secs(4),
+        _ => Duration::from_secs(8),
+    }
+}
+
+fn transfer_with_retries(
+    file: &mut File,
+    offset: u64,
+    bytes: u64,
+    until: Instant,
+    backoff: impl Fn(usize) -> Duration,
+    mut attempt: impl FnMut(&mut File, u64) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let mut current_offset = offset;
+    let mut total_retries = 0_usize;
+    let mut consecutive_stalls = 0_usize;
+    loop {
+        repair_remaining(until)?;
+        if file.metadata().map_err(|error| error.to_string())?.len() != current_offset {
+            return Err(
+                "Partial download length changed before transfer; bytes are retained.".into(),
+            );
+        }
+        match attempt(file, current_offset) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                repair_remaining(until)?;
+                if !is_transient_download_error(&error) {
+                    return Err(error);
+                }
+                let next_offset = file.metadata().map_err(|err| err.to_string())?.len();
+                if next_offset >= bytes {
+                    return Err(error);
+                }
+                if next_offset > current_offset {
+                    consecutive_stalls = 0;
+                } else {
+                    consecutive_stalls += 1;
+                }
+                current_offset = next_offset;
+                total_retries += 1;
+                if total_retries > MAX_TRANSIENT_DOWNLOAD_RETRIES
+                    || consecutive_stalls > MAX_CONSECUTIVE_STALLED_RETRIES
+                {
+                    return Err(error);
+                }
+                wait_retry_backoff(backoff(consecutive_stalls), until)?;
+            }
+        }
+    }
+}
+
 fn transfer_repair_until(
     uri: &str,
     partial: &Path,
@@ -224,12 +337,12 @@ fn transfer_repair_until(
     repair_remaining(until)?;
     let _parents = repair_parents(partial)?;
     let mut file = repair_file_with_creation(partial, offset == 0)?;
-    if file.metadata().map_err(|error| error.to_string())?.len() != offset {
-        return Err("Partial download length changed before transfer; bytes are retained.".into());
-    }
-    let result = crate::https_transfer::download(uri, &mut file, offset, bytes, until, &mut || {
-        repair_remaining(until).map(|_| ())
-    });
+    let result =
+        transfer_with_retries(&mut file, offset, bytes, until, retry_delay, |file, offset| {
+            crate::https_transfer::download(uri, file, offset, bytes, until, &mut || {
+                repair_remaining(until).map(|_| ())
+            })
+        });
     repair_remaining(until)?;
     result.map_err(|error| {
         format!(
@@ -1639,5 +1752,91 @@ mod tests {
         );
         fs::remove_dir_all(working).map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    #[test]
+    fn transient_download_retries_resume_progress_and_stop_on_stalls_or_permanent_errors()
+    -> crate::Result<()> {
+        use std::io::Write as _;
+
+        for transient in [
+            "Native HTTPS request failed: timeout: resolve",
+            "Native HTTPS request failed: timeout: per read",
+            "Native HTTPS request failed: io: connection reset",
+            "Pinned download ended before its locked byte length.",
+            "Pinned download returned HTTP 503.",
+        ] {
+            assert!(is_transient_download_error(transient), "{transient}");
+        }
+        for permanent in [
+            "Pinned download returned HTTP 404.",
+            "Native HTTPS operation cancelled.",
+            "Native HTTPS operation exceeded its aggregate allowance.",
+            "Pinned download Content-Length differs from its locked length.",
+            "Not enough free disk space to finish setup.",
+        ] {
+            assert!(!is_transient_download_error(permanent), "{permanent}");
+        }
+
+        let (working, _, partial, _) = recovery_fixture()?;
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        let until = Instant::now() + Duration::from_secs(30);
+
+        let mut file = repair_file_with_creation(&partial, true)?;
+        let mut offsets = Vec::new();
+        transfer_with_retries(&mut file, 0, 5, until, |_| Duration::ZERO, |file, offset| {
+            offsets.push(offset);
+            if offset == 0 {
+                file.write_all(b"ri").map_err(|error| error.to_string())?;
+                Err("Native HTTPS request failed: timeout: per read".into())
+            } else {
+                file.write_all(b"ght").map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        })?;
+        assert_eq!(offsets, vec![0, 2]);
+        drop(file);
+        assert_eq!(
+            fs::read(&partial).map_err(|error| error.to_string())?,
+            b"right"
+        );
+
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        let mut stalled_file = repair_file_with_creation(&partial, true)?;
+        let mut attempts = 0_usize;
+        let stalled = transfer_with_retries(
+            &mut stalled_file,
+            0,
+            5,
+            until,
+            |_| Duration::ZERO,
+            |_, _| {
+                attempts += 1;
+                Err("Native HTTPS request failed: timeout: resolve".into())
+            },
+        );
+        assert!(stalled.is_err());
+        assert_eq!(attempts, MAX_CONSECUTIVE_STALLED_RETRIES + 1);
+        drop(stalled_file);
+
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        let mut permanent_file = repair_file_with_creation(&partial, true)?;
+        let mut permanent_attempts = 0_usize;
+        let permanent = transfer_with_retries(
+            &mut permanent_file,
+            0,
+            5,
+            until,
+            |_| Duration::ZERO,
+            |_, _| {
+                permanent_attempts += 1;
+                Err("Pinned download returned HTTP 404.".into())
+            },
+        );
+        assert!(permanent.is_err());
+        assert_eq!(permanent_attempts, 1);
+        drop(permanent_file);
+
+        fs::remove_dir_all(working).map_err(|error| error.to_string())
     }
 }
