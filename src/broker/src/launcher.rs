@@ -493,6 +493,12 @@ impl LaunchConfig {
         self.native_engine
     }
 
+    /// Whether the selected configuration uses offline broker-pipe containment.
+    #[must_use]
+    pub fn uses_broker_pipe_transport(&self) -> bool {
+        self.uses_broker_pipe().unwrap_or(false)
+    }
+
     fn uses_broker_pipe(&self) -> Result<bool, LaunchError> {
         if !self.requires_native_sandbox() || !self.native_engine {
             return if self.require_broker_pipe {
@@ -683,6 +689,23 @@ impl LaunchConfig {
             LaunchError::SandboxEnvironment
         } else {
             LaunchError::SandboxUnavailable
+        }
+    }
+
+    fn classify_sandbox_start_error(error: &io::Error) -> LaunchError {
+        if bonsai_windows_process::process_start_cleanup_unconfirmed(error) {
+            return LaunchError::Sandbox;
+        }
+        match error.kind() {
+            io::ErrorKind::Unsupported => LaunchError::SandboxUnavailable,
+            io::ErrorKind::InvalidInput
+                if error
+                    .to_string()
+                    .contains("inherited credential environment variables") =>
+            {
+                LaunchError::SandboxEnvironment
+            }
+            _ => LaunchError::Sandbox,
         }
     }
 
@@ -1053,7 +1076,7 @@ impl LaunchConfig {
                 )
                 .map_err(|error| {
                     let _result = write_sandbox_failure(&mut io::stderr().lock(), &error);
-                    LaunchError::Sandbox
+                    Self::classify_sandbox_start_error(&error)
                 })?;
             if grants.len() != section_digests.len() {
                 return Err(LaunchError::Process);
@@ -1081,7 +1104,7 @@ impl LaunchConfig {
                     // that technical cause in the broker's retained stderr while the UI
                     // continues to receive only the value-free launch classification.
                     let _result = write_sandbox_failure(&mut io::stderr().lock(), &error);
-                    LaunchError::Sandbox
+                    Self::classify_sandbox_start_error(&error)
                 })
         }
     }
@@ -2479,6 +2502,35 @@ mod tests {
                 LaunchError::SandboxUnavailable
             );
         }
+    }
+
+    #[test]
+    fn sandbox_start_classification_separates_unavailable_credentials_and_policy() {
+        assert_eq!(
+            LaunchConfig::classify_sandbox_start_error(&std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "native PSEC containment: API set is not implemented",
+            )),
+            LaunchError::SandboxUnavailable
+        );
+        assert_eq!(
+            LaunchConfig::classify_sandbox_start_error(&std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sandbox launch rejects inherited credential environment variables",
+            )),
+            LaunchError::SandboxEnvironment
+        );
+        assert_eq!(
+            LaunchConfig::classify_sandbox_start_error(&std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native sandbox requires 1..128 explicit read-only grants",
+            )),
+            LaunchError::Sandbox
+        );
+        assert_eq!(
+            LaunchConfig::classify_sandbox_start_error(&std::io::Error::from_raw_os_error(5)),
+            LaunchError::Sandbox
+        );
     }
 
     fn arguments() -> Vec<OsString> {

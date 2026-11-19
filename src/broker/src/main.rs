@@ -86,8 +86,12 @@ fn launched(args: Vec<OsString>) -> ExitCode {
         return failure(b"Private owner shutdown control rejected.\n");
     };
     let Ok(configuration) = LaunchConfig::parse_host(args) else {
-        return failure(LAUNCH_USAGE.as_bytes());
+        let _confirmed = confirm_owner_cleanup(owner_control.as_ref());
+        return failure(
+            format!("Development backend launch failed: Arguments.\n{LAUNCH_USAGE}").as_bytes(),
+        );
     };
+    let broker_pipe = configuration.uses_broker_pipe_transport();
     let profile_name = if configuration.uses_native_engine() {
         "swift-native"
     } else {
@@ -106,7 +110,7 @@ fn launched(args: Vec<OsString>) -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
-            Err(error) => launch_failure(error),
+            Err(error) => launch_failure(error, broker_pipe),
         };
     }
     let containment = if configuration.requires_native_sandbox() {
@@ -118,6 +122,7 @@ fn launched(args: Vec<OsString>) -> ExitCode {
         .enable_all()
         .build()
     else {
+        let _confirmed = confirm_owner_cleanup(owner_control.as_ref());
         return failure(b"Development launch runtime initialization failed.\n");
     };
     runtime.block_on(async {
@@ -133,7 +138,7 @@ fn launched(args: Vec<OsString>) -> ExitCode {
                 if owner_shutdown::startup_cleanup_confirmed(error) {
                     let _confirmed = confirm_owner_cleanup(owner_control.as_ref());
                 }
-                return launch_failure(error);
+                return launch_failure(error, broker_pipe);
             }
         };
         let modalities = if owner.vision_enabled() {
@@ -187,7 +192,7 @@ fn confirm_owner_cleanup(control: Option<&bonsai_broker::owner_shutdown::OwnerSh
 }
 
 #[cfg(windows)]
-fn launch_failure(error: bonsai_broker::launcher::LaunchError) -> ExitCode {
+fn launch_failure(error: bonsai_broker::launcher::LaunchError, broker_pipe: bool) -> ExitCode {
     use bonsai_broker::launcher::LaunchError;
     let guidance = match error {
         LaunchError::NativeRuntime => {
@@ -197,7 +202,20 @@ fn launch_failure(error: bonsai_broker::launcher::LaunchError) -> ExitCode {
             " Restart from a terminal or app session without inherited service credentials."
         }
         LaunchError::SandboxUnavailable => {
-            " Native Windows sandbox support with container-hosted loopback is unavailable. Update Windows to a supported build. No unisolated fallback was attempted."
+            match (broker_pipe, bonsai_windows_process::windows_reboot_pending()) {
+                (true, true) => {
+                    " Native Windows sandbox support (PSEC 1.1) is unavailable because a Windows Update restart is pending. Restart Windows, then reopen Swift. No unisolated fallback was attempted."
+                }
+                (false, true) => {
+                    " Native Windows sandbox support with container-hosted loopback is unavailable because a Windows Update restart is pending. Restart Windows, then reopen Swift. No unisolated fallback was attempted."
+                }
+                (true, false) => {
+                    " Native Windows sandbox support (PSEC 1.1) is unavailable on this Windows build. Install the latest Windows updates and restart Windows. No unisolated fallback was attempted."
+                }
+                (false, false) => {
+                    " Native Windows sandbox support with container-hosted loopback is unavailable. Update Windows to a supported build and restart Windows. No unisolated fallback was attempted."
+                }
+            }
         }
         LaunchError::Sandbox => {
             " Native sandbox policy could not be applied. No unisolated fallback was attempted."
