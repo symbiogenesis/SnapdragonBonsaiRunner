@@ -1766,7 +1766,13 @@ fn sandbox_preflight_stops_before_downloads_and_formats_reboot_and_update_guidan
             working: &Path,
             environment: &BTreeMap<String, String>,
         ) -> crate::Result<u32> {
-            self.0.launch(executable, arguments, working, environment)
+            <Recorder as Operations>::launch(
+                &mut self.0,
+                executable,
+                arguments,
+                working,
+                environment,
+            )
         }
     }
 
