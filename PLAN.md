@@ -798,99 +798,28 @@ nor editing the available Abliteration factors.
   steering at the same site, preserve the original activation basis and qualify
   held-out complete answers, composition, state and resources before serving.
 
-### DaisyRose-27B task-vector adapter evaluation
+### DaisyRose-27B composition boundary
 
-Conditional, opt-in, no-retraining investigation of transferring pure-RL
-post-training gains from Apache-2.0
+Gate 1 (`DR1`) of raw BF16 task-vector LoRA extraction from Apache-2.0
 [DaisyRose-27B](https://www.radixark.com/blog/daisyrose-27b)
-(`RadixArk/DaisyRose-27B`, `Qwen3.8-27B` base, `qwen35` architecture) onto
-immutable packed `Swift-Bonsai-2` (`PQ2_0`/`PTQ1_0`) as a modular floating-point
-LoRA extracted from upstream **BF16 task vectors**
-(`f32(W_DaisyRose_BF16) - f32(W_Qwen3.8_BF16)`). Do not ternarize DaisyRose
-before differencing or subtract against Swift's packed weights: naive PTQ
-quantization noise swamps a 1,200-task RL delta, and subtracting Swift fights
-PrismML's QAT compensation and UkisAI's merged reasoning-efficiency patch. Keep
-all extraction, SVD, GGUF-export and evaluation tooling in Rust/PowerShell (no
-Python), preserve `A1`/`Q1` native daily-use priority, and stop at the first
-failed gate before writing runtime or UI code. Treat any future upstream QAT
-ternary `DaisyRose-27B` as a separate model profile rather than an adapter, and
-keep direct `UD-Q3_K_XL`/quantized `DaisyRose-27B` runs under the separate
-high-RAM reference boundary in
-[model selection](docs/model-selection.md#selection-boundary).
-
-- [ ] **DR1 — Run a read-only Rust BF16 weight-diff and SVD spectrum audit (Gate 1).**
-  Add an offline Rust command (`bonsai-tools lora-diff-audit`) pinning immutable
-  revisions of `RadixArk/DaisyRose-27B` and `Qwen/Qwen3.8-27B`, reading
-  `model.safetensors.index.json` and shard headers, and streaming matched tensor
-  pairs via HTTP Range requests or one temporary shard pair at a time (avoiding
-  108 GiB resident BF16 storage; the largest `[17408, 5120]` BF16 matrix is
-  ~170 MiB). Start with a 4-layer probe (`blk.0` GDN, `blk.3` full attention,
-  `blk.31`, `blk.63`, plus norms, `token_embd` and `output.weight`) before
-  scanning all 64 blocks: compute per-tensor relative Frobenius deltas
-  `||ΔW||_F / ||W_base||_F` across linear projections and non-matrix parameters
-  (`attn_norm`, `post_attention_norm`, `output_norm`, `ssm_a`, `ssm_dt.bias`,
-  `ssm_conv1d`, BF16 `ssm_alpha`/`ssm_beta`), and run deterministic Rust
-  randomized SVD (`f32`/`f64` accumulation) to measure cumulative Frobenius
-  energy `E(r)` at `r` in `{1, 4, 8, 16, 32, 64}`. Stop (no-go) and retain the
-  concise audit summary if dominant delta energy resides in non-matrix GDN/norm
-  parameters a linear LoRA cannot express or if `E(32) < 50%` across FFN and
-  attention matrices; proceed to `DR2` only if linear matrices hold dominant
-  delta energy with a clear low-rank knee (target `E(r) >= 65–80%` at
-  `r <= 16–32`).
-- [ ] **DR2 — Export frozen GGUF LoRA candidates in Rust and screen on `--publisher-engine` (Gate 2).**
-  Only after `DR1` passes, add `bonsai-tools lora-diff-export` (reusing
-  `bonsai-gguf` writer conventions) to emit SHA-256-verified
-  `general.architecture=qwen35`, `general.type=adapter`, `adapter.type=lora`
-  F16/F32 GGUF candidates (`adapter.lora_alpha = r`) with immutable source
-  revisions, target inventory, rank and recipe receipts. Export Candidate A
-  first (`ffn_down` only at `2.75 MiB/rank` F16, or `ffn_down` + full-attention
-  `attn_output` at `3.09 MiB/rank` F16, preserving NPU `external_ffn_swiglu`
-  compatibility), and Candidate B only if `DR1` shows `ffn_gate`/`ffn_up`/`attn_qkv`
-  dominate (all FFN + full-attention `q/k/v/o` at `9.50 MiB/rank` F16),
-  excluding all 48 `ssm_out.weight` sites until `P1` resolves Swift's
-  `prism.hadamard.gdn_v_grouped=true` channel order under
-  [Swift LoRA](docs/swift-lora.md#structural-compatibility-and-unresolved-basis).
-  Screen without changing `prism-inference`, Hexagon, broker or UI by stacking
-  `--lora-scaled` on the pinned `--publisher-engine` (Orca at `1.3` plus
-  candidate `scale` in `{0.0, 0.25, 0.5, 0.75, 1.0}`) under the
-  [owner-device budget and power rules](AGENTS.md#owner-device-execution-budgets)
-  (keeping full sweeps in owner-operated CI). Evaluate two separate held-out
-  slices with independent human review: (1) Thinking-OFF creative and general
-  writing (strict non-regression on prose quality, conciseness, refusal
-  compatibility and termination) and (2) Thinking-ON instruction following,
-  reasoning and coding (measurable gain over `scale = 0.0` without regressing
-  Swift's anti-overthinking behavior into truncated 4,096-token replies). Stop
-  (no-go) and leave native runtime code untouched if no scale clears both
-  slices; retain the no-go summary under
-  [evidence retention](docs/validation.md#evidence-retention).
-- [ ] **DR3 — Extend native Rust `prism-inference` for stackable multi-rank LoRA only after `DR2` passes.**
-  Generalize `prism-inference` beyond single rank-1 `RankOneAdapter` to support
-  a bounded stackable multi-rank adapter (`MultiRankAdapter`, F16 or F32
-  factors, bounded rank cap such as `1..=32`) alongside independent Orca
-  `RankOneAdapter` scales, preserving exact `scale = 0.0` no-op bypass and
-  binding base, adapter digest, target inventory, rank and scale bits into
-  `graph.identity` so checkpoints and prefix reuse invalidate cleanly. Hook only
-  the `DR2`-winning target families across scalar, NEON, tiled-prefill and
-  accelerator paths; preserve fused NPU `external_ffn_chain`/`external_ffn_swiglu`
-  on untargeted layers via `adapter_affects_any`, and explicitly route any
-  `ffn_gate`/`ffn_up`-targeted layers off fused NPU FFN chains under
-  [Hexagon policy](docs/hexagon.md#resident-packets-and-prefill). Qualify
-  scalar/NEON/NPU numerical parity, `swift_model_check rollback` bit-exact
-  state/reset/cancellation behavior and measured prefill/decode overhead before
-  repinning Prism.
-- [ ] **DR4 — Wire opt-in Runner lockfile, memory accounting, controls and promotion gates.**
-  Pin the frozen winning adapter artifact and upstream BF16 derivation
-  provenance in a dedicated lockfile (`config/daisyrose-lora.lock.json`) without
-  admitting arbitrary external adapter paths. Charge exact factor storage
-  (`~44–208 MiB` F16 at `r = 16` depending on target subset) and multi-rank
-  scratch into `bonsai-cpu-policy::context` (`SwiftExecutionShape` /
-  `SwiftMemoryBreakdown`) before spawn. Expose an opt-in, default-off Settings
-  toggle and scale control (default `0.0`, preserving exact Swift rollback) with
-  canonical broker validation, then close owning CI (`source-checks`,
-  `foundation`), matched-power X1/X2 throughput/RAM measurements and held-out
-  human review under
-  [Swift LoRA qualification](docs/swift-lora.md#standard-profile-qualification)
-  and [promotion criteria](docs/validation.md#promotion-criteria).
+(`RadixArk/DaisyRose-27B` vs `Qwen/Qwen3.8-27B`, `qwen35`) onto immutable
+`Swift-Bonsai-2` closed **no-go (`no-go-high-rank`)**: the 4-layer read-only
+`bonsai-tools lora-diff-audit` probe measured energy-weighted `E(32) = 14.26%`
+(`< 50%`, `E(64) = 18.38%`) across FFN and full-attention linear projections,
+bounded by a BF16 1-ULP quantization floor (`maxAbsDelta <= 2^-13`) across
+`23.5%–38.9%` of entries with `65.95%` of block linear energy in
+`ffn_gate`/`ffn_up`/`attn_qkv`/`attn_q`/`attn_k`/`attn_v`/`attn_gate`. Do not
+reopen LoRA SVD extraction (`DR2`–`DR4`) or modify `prism-inference`/UI for a
+BF16 task-vector LoRA; retain the
+[Gate 1 no-go audit summary](docs/evidence/daisyrose-task-vector-audit.md).
+Composing DaisyRose capability, Bonsai quantization and Swift anti-looping
+requires either an upstream FP32 master-weight RL delta, on-policy LoRA/RL
+trained directly against `Swift-Bonsai-2` activations, or a separate upstream
+QAT-ternary `DaisyRose-27B` + Swift-RL model profile (keeping direct quantized
+`DaisyRose-27B` under the separate high-RAM reference boundary in
+[model selection](docs/model-selection.md#selection-boundary)). Checked-in
+`bonsai-tools lora-diff-audit` and `https_transfer::fetch_range` still require
+owning CI (`source-checks`, `foundation`) acceptance.
 
 ### Memory and profiles
 
