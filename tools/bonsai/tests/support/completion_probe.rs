@@ -30,7 +30,12 @@ fn main() -> io::Result<ExitCode> {
             emit(b"retained-input", b"")
         }
         "invalid-utf8" => emit(&[255], b""),
-        "streams" | "--version" | "--help" => emit(b"output", b"diagnostic"),
+        "streams"
+        | "--version"
+        | "--help"
+        | "host-gpu-query"
+        | "host-opencl-query"
+        | "opencl-projection-worker" => emit(b"output", b"diagnostic"),
         "partial-failure" => {
             let _ = emit(b"partial-response", b"")?;
             Ok(ExitCode::from(7))

@@ -293,6 +293,7 @@ enum MitigationProfile {
     Tool,
     Headless,
     Inspection,
+    GraphicsProbe,
 }
 
 impl MitigationProfile {
@@ -300,7 +301,7 @@ impl MitigationProfile {
         match self {
             Self::Tool => None,
             Self::Headless => Some(HEADLESS_MITIGATIONS),
-            Self::Inspection => Some(HEADLESS_MITIGATIONS & !(1 << 28)),
+            Self::Inspection | Self::GraphicsProbe => Some(HEADLESS_MITIGATIONS & !(1 << 28)),
         }
     }
 }
@@ -549,6 +550,26 @@ impl NativeProcess {
                 limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
                 priority_class: None,
                 mitigation_profile: MitigationProfile::Inspection,
+            },
+            command,
+            None,
+            None,
+            PipeMode::None,
+            None,
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn start_graphics_probe(spec: &ProcessSpec, command: Vec<u16>) -> io::Result<Self> {
+        Self::launch(
+            &LaunchSpec {
+                executable: &spec.executable,
+                working_directory: &spec.working_directory,
+                stdout: &spec.stdout,
+                stderr: &spec.stderr,
+                limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
+                priority_class: None,
+                mitigation_profile: MitigationProfile::GraphicsProbe,
             },
             command,
             None,

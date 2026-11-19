@@ -488,8 +488,12 @@ mod windows {
             memory_limit_bytes: 1024 * 1024 * 1024,
             active_process_limit: 1,
         };
-        let result =
-            crate::runtime_probe::run(&spec, 1024 * 1024, "OpenCL PQ2 projection", || Ok(()));
+        let result = crate::runtime_probe::graphics_probe(
+            &spec,
+            1024 * 1024,
+            "OpenCL PQ2 projection",
+            || Ok(()),
+        );
         let mut report = match result {
             Ok(output) => {
                 let parsed = serde_json::from_str::<Value>(&output.stdout);
@@ -538,7 +542,7 @@ mod windows {
         };
         report["aggregate_power_before"] = before;
         report["aggregate_power_after"] = power();
-        report["execution_policy"] = json!("headless-worker");
+        report["execution_policy"] = json!("graphics-probe-worker");
         report["work_deadline_seconds"] = json!(10);
         report["cleanup_reserve_seconds"] = json!(10);
         report["output_directory"] = json!(request.output_directory);

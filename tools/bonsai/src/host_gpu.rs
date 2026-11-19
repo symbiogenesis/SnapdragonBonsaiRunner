@@ -20,7 +20,7 @@ fn unknown() -> Value {
         "application_api_version": null,
         "instance_modules": null,
         "graphics_adapter_count": null,
-        "required_execution_policy": "headless-worker", "failure": null,
+        "required_execution_policy": "graphics-probe-worker", "failure": null,
         "adapters": null, "qualification": "unqualified",
         "backend_ready": false, "error": "native-vulkan-query-unavailable"})
 }
@@ -120,25 +120,73 @@ pub fn query(request: &Value) -> crate::Result<Value> {
             Ok(inventory) => inventory,
             Err(error) => return Ok(failed_query(&error)),
         };
-        let adapters: Vec<_> = inventory.adapters.iter().map(|adapter| json!({
-            "name": adapter.name, "vendor_id": adapter.vendor_id, "device_id": adapter.device_id,
-            "driver_version_raw": adapter.driver_version, "api_version": adapter.api_version,
-            "device_type": adapter.device_type, "hardware_gpu": adapter.hardware_gpu,
-            "compute_queues": adapter.compute_queues.iter().map(|(index, count)| json!({"family_index": index, "queue_count": count})).collect::<Vec<_>>(),
-            "extensions": adapter.extensions,
-            "memory_heaps": adapter.memory_heaps.iter().map(|(bytes, local)| json!({"capacity_bytes": bytes, "device_local": local})).collect::<Vec<_>>(),
-            "shader_float16": adapter.shader_float16,
-            "shader_integer_dot_product": adapter.shader_integer_dot_product,
-            "subgroup_size": adapter.subgroup_size, "subgroup_operations_raw": adapter.subgroup_operations,
-            "subgroup_stages_raw": adapter.subgroup_stages,
-            "memory_budget_bytes": null, "driver_signature": null, "cooperative_matrix": null,
-            "backend_ready": false
-        })).collect();
+        let adapters: Vec<_> = inventory.adapters.iter().map(|adapter| {
+            let memory_budget_bytes = adapter.memory_budget_heaps.as_ref().map(|heaps| {
+                heaps
+                    .iter()
+                    .zip(&adapter.memory_heaps)
+                    .filter(|(_, (_, device_local))| *device_local)
+                    .map(|((budget, _), _)| *budget)
+                    .fold(0_u64, u64::saturating_add)
+            });
+            let memory_budget_heaps = adapter.memory_budget_heaps.as_ref().map(|heaps| {
+                heaps
+                    .iter()
+                    .map(|(budget_bytes, usage_bytes)| {
+                        json!({"budget_bytes": budget_bytes, "usage_bytes": usage_bytes})
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let cooperative_matrix = adapter.cooperative_matrix_properties.as_ref().map(|shapes| {
+                shapes
+                    .iter()
+                    .map(|shape| {
+                        json!({
+                            "m_size": shape.m_size,
+                            "n_size": shape.n_size,
+                            "k_size": shape.k_size,
+                            "a_type_raw": shape.a_type_raw,
+                            "b_type_raw": shape.b_type_raw,
+                            "c_type_raw": shape.c_type_raw,
+                            "result_type_raw": shape.result_type_raw,
+                            "saturating_accumulation": shape.saturating_accumulation,
+                            "scope_raw": shape.scope_raw,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            json!({
+                "name": adapter.name, "vendor_id": adapter.vendor_id, "device_id": adapter.device_id,
+                "driver_version_raw": adapter.driver_version, "api_version": adapter.api_version,
+                "device_type": adapter.device_type, "hardware_gpu": adapter.hardware_gpu,
+                "compute_queues": adapter.compute_queues.iter().map(|(index, count)| json!({"family_index": index, "queue_count": count})).collect::<Vec<_>>(),
+                "extensions": adapter.extensions,
+                "memory_heaps": adapter.memory_heaps.iter().map(|(bytes, local)| json!({"capacity_bytes": bytes, "device_local": local})).collect::<Vec<_>>(),
+                "shader_float16": adapter.shader_float16,
+                "shader_integer_dot_product": adapter.shader_integer_dot_product,
+                "integer_dot_4x8_packed_signed_accelerated": adapter.integer_dot_4x8_packed_signed_accelerated,
+                "qcom_cooperative_matrix_conversion": adapter.qcom_cooperative_matrix_conversion,
+                "compute_limits": {
+                    "max_compute_shared_memory_size": adapter.compute_limits.max_compute_shared_memory_size,
+                    "max_compute_work_group_invocations": adapter.compute_limits.max_compute_work_group_invocations,
+                    "max_compute_work_group_size": adapter.compute_limits.max_compute_work_group_size,
+                    "max_storage_buffer_range": adapter.compute_limits.max_storage_buffer_range,
+                    "max_memory_allocation_count": adapter.compute_limits.max_memory_allocation_count,
+                },
+                "subgroup_size": adapter.subgroup_size, "subgroup_operations_raw": adapter.subgroup_operations,
+                "subgroup_stages_raw": adapter.subgroup_stages,
+                "memory_budget_bytes": memory_budget_bytes,
+                "memory_budget_heaps": memory_budget_heaps,
+                "driver_signature": null,
+                "cooperative_matrix": cooperative_matrix,
+                "backend_ready": false
+            })
+        }).collect();
         Ok(
             json!({"schema_version": 1, "kind": "runner-native-gpu-observations",
             "status": "observed", "source": "system-vulkan-loader",
             "architecture": std::env::consts::ARCH,
-            "required_execution_policy": "headless-worker", "failure": null,
+            "required_execution_policy": "graphics-probe-worker", "failure": null,
             "loader_api_version": inventory.loader_api_version, "adapters": adapters,
             "application_api_version": inventory.application_api_version,
             "instance_modules": instance_modules(&inventory.instance_modules),
@@ -188,20 +236,24 @@ mod windows {
             memory_limit_bytes: 512 * 1024 * 1024,
             active_process_limit: 1,
         };
-        let report =
-            crate::runtime_probe::run(&spec, 1024 * 1024, "Native GPU inventory", || Ok(()))
-                .and_then(|output| {
-                    serde_json::from_str::<Value>(&output.stdout).map_err(|error| error.to_string())
-                });
+        let report = crate::runtime_probe::graphics_probe(
+            &spec,
+            1024 * 1024,
+            "Native GPU inventory",
+            || Ok(()),
+        )
+        .and_then(|output| {
+            serde_json::from_str::<Value>(&output.stdout).map_err(|error| error.to_string())
+        });
         if let Ok(mut report) = report
             && report["schema_version"] == 1
             && report["kind"] == "runner-native-gpu-observations"
             && report["qualification"] == "unqualified"
             && report["backend_ready"] == false
-            && report["required_execution_policy"] == "headless-worker"
+            && report["required_execution_policy"] == "graphics-probe-worker"
             && (report["status"] == "observed" || report["status"] == "unknown")
         {
-            report["execution_policy"] = json!("headless-worker");
+            report["execution_policy"] = json!("graphics-probe-worker");
             if report["status"] == "unknown" {
                 // A completed discovery failure is evidence, not unsupported
                 // hardware. Keep the exact bounded child report for review.
@@ -272,7 +324,7 @@ mod tests {
         });
         let report = failed_query(&error);
         assert_eq!(report["status"], "unknown");
-        assert_eq!(report["required_execution_policy"], "headless-worker");
+        assert_eq!(report["required_execution_policy"], "graphics-probe-worker");
         assert_eq!(report["failure"]["stage"], "instance-creation");
         assert_eq!(report["failure"]["vulkan_result"], -9);
         assert_eq!(report["loader_api_version"], 4_206_893);

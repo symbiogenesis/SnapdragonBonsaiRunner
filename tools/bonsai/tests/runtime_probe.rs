@@ -113,3 +113,69 @@ fn inspection_keeps_fixed_commands_output_limits_and_cancellation() -> Result<()
     assert!(!spec.stderr.exists());
     fs::remove_dir_all(scratch).map_err(|error| error.to_string())
 }
+
+#[test]
+fn graphics_probe_keeps_allowlisted_commands_output_limits_and_cancellation() -> Result<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let scratch = std::env::temp_dir().join(format!(
+        "Bonsai-GraphicsProbe-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+    let request_path = scratch.join("request.json");
+    let mut spec = ProcessSpec {
+        executable: env!("CARGO_BIN_EXE_bonsai-completion-test-probe").into(),
+        arguments: vec![
+            "host-gpu-query".into(),
+            "--request".into(),
+            request_path.as_os_str().to_os_string(),
+        ],
+        working_directory: scratch.clone(),
+        stdout: scratch.join("gpu.stdout"),
+        stderr: scratch.join("gpu.stderr"),
+        memory_limit_bytes: 512 * 1024 * 1024,
+        active_process_limit: 1,
+    };
+    for command in [
+        "host-gpu-query",
+        "host-opencl-query",
+        "opencl-projection-worker",
+    ] {
+        spec.arguments = vec![
+            command.into(),
+            "--request".into(),
+            request_path.as_os_str().to_os_string(),
+        ];
+        spec.stdout = scratch.join(format!("{command}.stdout"));
+        spec.stderr = scratch.join(format!("{command}.stderr"));
+        let output = runtime_probe::graphics_probe(&spec, 1024, "Fixture", || Ok(()))?;
+        assert_eq!(output.stdout, "output");
+        assert_eq!(output.stderr, "diagnostic");
+    }
+    spec.stdout = scratch.join("limit.stdout");
+    spec.stderr = scratch.join("limit.stderr");
+    assert_eq!(
+        runtime_probe::graphics_probe(&spec, 1, "Fixture", || Ok(()))
+            .err()
+            .as_deref(),
+        Some("Fixture probe exceeded its output bound.")
+    );
+    spec.stdout = scratch.join("cancel.stdout");
+    spec.stderr = scratch.join("cancel.stderr");
+    assert_eq!(
+        runtime_probe::graphics_probe(&spec, 1024, "Fixture", || Err("cancelled".into()))
+            .err()
+            .as_deref(),
+        Some("cancelled")
+    );
+    spec.stdout = scratch.join("invalid.stdout");
+    spec.stderr = scratch.join("invalid.stderr");
+    spec.arguments = vec!["streams".into()];
+    assert!(runtime_probe::graphics_probe(&spec, 1024, "Fixture", || Ok(())).is_err());
+    assert!(!spec.stdout.exists());
+    assert!(!spec.stderr.exists());
+    fs::remove_dir_all(scratch).map_err(|error| error.to_string())
+}

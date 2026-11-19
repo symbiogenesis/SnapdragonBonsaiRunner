@@ -13,13 +13,14 @@ use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
 use super::library::SystemLibrary;
 use crate::{
-    VulkanAdapter, VulkanInstanceModules, VulkanInventory, VulkanModuleFileCandidate,
-    VulkanQueryFailure, WindowsGraphicsAdapterCount,
+    VulkanAdapter, VulkanComputeLimits, VulkanCooperativeMatrixShape, VulkanInstanceModules,
+    VulkanInventory, VulkanModuleFileCandidate, VulkanQueryFailure, WindowsGraphicsAdapterCount,
 };
 
 const MAX_ADAPTERS: usize = 16;
 const MAX_QUEUES: usize = 64;
 const MAX_EXTENSIONS: usize = 1024;
+const MAX_COOP_MAT_SHAPES: usize = 64;
 const MAX_MODULES: usize = 256;
 const MAX_MODULE_NAME: usize = 260;
 
@@ -368,6 +369,7 @@ fn create_instance(
         for name in [
             c"vkGetPhysicalDeviceFeatures2",
             c"vkGetPhysicalDeviceProperties2",
+            c"vkGetPhysicalDeviceMemoryProperties2",
         ] {
             loader.has_instance_symbol(instance.0.handle(), name)?;
         }
@@ -389,6 +391,8 @@ const fn device_type(kind: vk::PhysicalDeviceType) -> (&'static str, bool) {
 struct Features {
     float16: Option<bool>,
     integer_dot: Option<bool>,
+    integer_dot_4x8_packed_signed_accelerated: Option<bool>,
+    cooperative_matrix_properties: Option<Vec<VulkanCooperativeMatrixShape>>,
     subgroup_size: Option<u32>,
     subgroup_operations: Option<u32>,
     subgroup_stages: Option<u32>,
@@ -414,7 +418,66 @@ fn feature_structures(
     })
 }
 
+fn query_cooperative_matrix_shapes(
+    loader: &Loader,
+    instance: &Instance,
+    device: vk::PhysicalDevice,
+) -> Option<Vec<VulkanCooperativeMatrixShape>> {
+    if loader
+        .has_instance_symbol(
+            instance.0.handle(),
+            c"vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR",
+        )
+        .is_err()
+    {
+        return None;
+    }
+    let coop = ash::khr::cooperative_matrix::Instance::new(&loader.entry, &instance.0);
+    let get_props = coop
+        .fp()
+        .get_physical_device_cooperative_matrix_properties_khr;
+    let mut total_count = 0_u32;
+    // SAFETY: `device` belongs to this live instance and `get_props` was verified non-null;
+    // passing a null properties pointer queries only the shape count.
+    let status = unsafe { get_props(device, &raw mut total_count, null_mut()) };
+    if status != vk::Result::SUCCESS {
+        return None;
+    }
+    if total_count == 0 {
+        return Some(Vec::new());
+    }
+    let bounded = usize::try_from(total_count)
+        .unwrap_or(MAX_COOP_MAT_SHAPES)
+        .min(MAX_COOP_MAT_SHAPES);
+    let mut read_count = u32::try_from(bounded).ok()?;
+    let mut raw = vec![vk::CooperativeMatrixPropertiesKHR::default(); bounded];
+    // SAFETY: `raw` is initialized for `bounded` entries (`read_count` elements);
+    // Vulkan writes at most `read_count` entries and retains no pointers.
+    let status = unsafe { get_props(device, &raw mut read_count, raw.as_mut_ptr()) };
+    if !matches!(status, vk::Result::SUCCESS | vk::Result::INCOMPLETE) {
+        return None;
+    }
+    let written = usize::try_from(read_count).ok()?.min(bounded);
+    Some(
+        raw[..written]
+            .iter()
+            .map(|shape| VulkanCooperativeMatrixShape {
+                m_size: shape.m_size,
+                n_size: shape.n_size,
+                k_size: shape.k_size,
+                a_type_raw: shape.a_type.as_raw(),
+                b_type_raw: shape.b_type.as_raw(),
+                c_type_raw: shape.c_type.as_raw(),
+                result_type_raw: shape.result_type.as_raw(),
+                saturating_accumulation: shape.saturating_accumulation != 0,
+                scope_raw: shape.scope.as_raw(),
+            })
+            .collect(),
+    )
+}
+
 fn features(
+    loader: &Loader,
     instance: &Instance,
     device: vk::PhysicalDevice,
     api: u32,
@@ -442,17 +505,29 @@ fn features(
             .get_physical_device_features2(device, &mut features)
     };
     let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut dot_props = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
     let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
-    // SAFETY: Both structures are supported core 1.1 structures and live
+    if supports_dot {
+        properties2 = properties2.push_next(&mut dot_props);
+    }
+    // SAFETY: Both structures are supported core/advertised structures and live
     // throughout the read-only properties query against this valid device.
     unsafe {
         instance
             .0
             .get_physical_device_properties2(device, &mut properties2)
     };
+    let cooperative_matrix_properties = extensions
+        .iter()
+        .any(|name| name == "VK_KHR_cooperative_matrix")
+        .then(|| query_cooperative_matrix_shapes(loader, instance, device))
+        .flatten();
     Features {
         float16: supports_half.then_some(half.shader_float16 != 0),
         integer_dot: supports_dot.then_some(dot.shader_integer_dot_product != 0),
+        integer_dot_4x8_packed_signed_accelerated: supports_dot
+            .then_some(dot_props.integer_dot_product4x8_bit_packed_signed_accelerated != 0),
+        cooperative_matrix_properties,
         subgroup_size: Some(subgroup.subgroup_size),
         subgroup_operations: Some(subgroup.supported_operations.as_raw()),
         subgroup_stages: Some(subgroup.supported_stages.as_raw()),
@@ -460,6 +535,7 @@ fn features(
 }
 
 fn adapter(
+    loader: &Loader,
     instance: &Instance,
     device: vk::PhysicalDevice,
     application_api: u32,
@@ -527,14 +603,42 @@ fn adapter(
             )
         })
         .collect();
+    let effective_api = application_api.min(properties.api_version);
+    let memory_budget_heaps = (effective_api >= vk::API_VERSION_1_1
+        && extensions.iter().any(|name| name == "VK_EXT_memory_budget"))
+    .then(|| {
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut memory2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        // SAFETY: Both structures stay live on stack for this synchronous read-only
+        // Vulkan 1.1 query against an enumerated physical device.
+        unsafe {
+            instance
+                .0
+                .get_physical_device_memory_properties2(device, &mut memory2);
+        }
+        (0..heaps)
+            .map(|index| (budget.heap_budget[index], budget.heap_usage[index]))
+            .collect()
+    });
 
     let features = features(
+        loader,
         instance,
         device,
         properties.api_version,
         &extensions,
         application_api,
     );
+    let qcom_cooperative_matrix_conversion = extensions
+        .iter()
+        .any(|name| name == "VK_QCOM_cooperative_matrix_conversion");
+    let compute_limits = VulkanComputeLimits {
+        max_compute_shared_memory_size: properties.limits.max_compute_shared_memory_size,
+        max_compute_work_group_invocations: properties.limits.max_compute_work_group_invocations,
+        max_compute_work_group_size: properties.limits.max_compute_work_group_size,
+        max_storage_buffer_range: properties.limits.max_storage_buffer_range,
+        max_memory_allocation_count: properties.limits.max_memory_allocation_count,
+    };
     let (device_type, hardware_gpu) = device_type(properties.device_type);
     Ok(VulkanAdapter {
         name: text(properties.device_name_as_c_str())?,
@@ -549,6 +653,12 @@ fn adapter(
         memory_heaps,
         shader_float16: features.float16,
         shader_integer_dot_product: features.integer_dot,
+        integer_dot_4x8_packed_signed_accelerated: features
+            .integer_dot_4x8_packed_signed_accelerated,
+        cooperative_matrix_properties: features.cooperative_matrix_properties,
+        qcom_cooperative_matrix_conversion,
+        memory_budget_heaps,
+        compute_limits,
         subgroup_size: features.subgroup_size,
         subgroup_operations: features.subgroup_operations,
         subgroup_stages: features.subgroup_stages,
@@ -607,7 +717,7 @@ pub(super) fn query() -> io::Result<VulkanInventory> {
         .ok_or_else(invalid)?
         .iter()
         .map(|device| {
-            adapter(&instance, *device, application_api).map_err(|error| {
+            adapter(&loader, &instance, *device, application_api).map_err(|error| {
                 let result = error
                     .get_ref()
                     .and_then(|error| error.downcast_ref::<VulkanQueryFailure>())

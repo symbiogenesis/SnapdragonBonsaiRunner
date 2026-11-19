@@ -54,6 +54,9 @@ fn main() -> io::Result<()> {
         "priority-tree" => priority_tree()?,
         "mitigations" => report_mitigations()?,
         "--version" | "--help" => report_inspection_mitigations()?,
+        "host-gpu-query" | "host-opencl-query" | "opencl-projection-worker" => {
+            report_inspection_mitigations()?
+        }
         "nested-mitigations" => nested_mitigations()?,
         "sandbox-files" => sandbox_files(&args)?,
         "sandbox-offline-pipes" => offline_probe(&args)?,

@@ -56,6 +56,26 @@ pub(super) fn inspect(
     )
 }
 
+pub(super) fn graphics_probe(
+    spec: &ProcessSpec,
+    maximum: u64,
+    label: &str,
+    checkpoint: impl FnMut() -> Result<()>,
+) -> Result<Output> {
+    // Windows Vulkan and OpenCL WDDM ICD discovery/enumeration calls gdi32.dll!
+    // D3DKMTEnumAdapters2, which Win32k syscall denial blocks (`VK_ERROR_INCOMPATIBLE_DRIVER`
+    // and GDI32 lookup error 126). Restrict Win32k relaxation solely to allowlisted
+    // graphics inventory/pilot subcommands while retaining Job, memory, extension-point,
+    // image-load, and environment restrictions.
+    run_with(
+        spec,
+        maximum,
+        label,
+        checkpoint,
+        OwnedProcess::start_graphics_probe,
+    )
+}
+
 fn run_with(
     spec: &ProcessSpec,
     maximum: u64,

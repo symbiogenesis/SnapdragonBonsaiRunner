@@ -867,6 +867,80 @@ fn inspection_keeps_non_win32k_mitigations_and_rejects_worker_arguments() -> io:
 }
 
 #[test]
+fn graphics_probe_keeps_non_win32k_mitigations_and_rejects_worker_arguments() -> io::Result<()> {
+    let invalid = Lane::new("graphics-probe-invalid")?;
+    let valid_request = invalid.path.join("request.json").into_os_string();
+    for arguments in [
+        Vec::new(),
+        vec![OsString::from("host-gpu-query")],
+        vec![
+            OsString::from("mitigations"),
+            OsString::from("--request"),
+            valid_request.clone(),
+        ],
+        vec![
+            OsString::from("host-gpu-query"),
+            OsString::from("--other"),
+            valid_request.clone(),
+        ],
+        vec![
+            OsString::from("host-gpu-query"),
+            OsString::from("--request"),
+            OsString::from("relative.json"),
+        ],
+    ] {
+        let mut spec = invalid.spec(arguments);
+        spec.active_process_limit = 1;
+        let error = OwnedProcess::start_graphics_probe(&spec)
+            .err()
+            .ok_or_else(|| io::Error::other("invalid arguments accepted for graphics probe"))?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!spec.stdout.exists());
+        assert!(!spec.stderr.exists());
+    }
+    let invalid_count = invalid.spec(vec![
+        OsString::from("host-gpu-query"),
+        OsString::from("--request"),
+        valid_request,
+    ]);
+    assert!(OwnedProcess::start_graphics_probe(&invalid_count).is_err());
+    assert!(!invalid_count.stdout.exists());
+    assert!(!invalid_count.stderr.exists());
+
+    for subcommand in [
+        "host-gpu-query",
+        "host-opencl-query",
+        "opencl-projection-worker",
+    ] {
+        let lane = Lane::new("graphics-probe-mitigations")?;
+        let request = lane.path.join("request.json");
+        fs::write(&request, b"{}")?;
+        let mut spec = lane.spec(vec![
+            OsString::from(subcommand),
+            OsString::from("--request"),
+            request.into_os_string(),
+        ]);
+        spec.active_process_limit = 1;
+        let process = OwnedProcess::start_graphics_probe(&spec)?;
+        assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
+        let observed = fs::read_to_string(lane.path.join("mitigations.txt"))?;
+        for (name, expected) in [("win32k", 0), ("extensions", 1), ("images", 3)] {
+            assert!(
+                observed
+                    .lines()
+                    .any(|line| line == format!("{name}={expected}")),
+                "{observed}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(lane.path.join("inspection.txt"))?,
+            "spawn=denied\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn committed_memory_limit_denies_allocations() -> io::Result<()> {
     let lane = Lane::new("memory-limit")?;
     let mut spec = lane.spec(vec![OsString::from("commit")]);

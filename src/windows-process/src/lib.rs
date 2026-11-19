@@ -368,6 +368,44 @@ pub struct VulkanModuleFileCandidate {
     pub path: Option<PathBuf>,
 }
 
+/// One supported Vulkan `VK_KHR_cooperative_matrix` multiply-accumulate shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VulkanCooperativeMatrixShape {
+    /// Matrix `M` dimension.
+    pub m_size: u32,
+    /// Matrix `N` dimension.
+    pub n_size: u32,
+    /// Matrix `K` dimension.
+    pub k_size: u32,
+    /// Raw `VkComponentTypeKHR` value for operand `A`.
+    pub a_type_raw: i32,
+    /// Raw `VkComponentTypeKHR` value for operand `B`.
+    pub b_type_raw: i32,
+    /// Raw `VkComponentTypeKHR` value for accumulator `C`.
+    pub c_type_raw: i32,
+    /// Raw `VkComponentTypeKHR` value for result matrix `D`.
+    pub result_type_raw: i32,
+    /// Whether saturating accumulation is supported for this shape.
+    pub saturating_accumulation: bool,
+    /// Raw `VkScopeKHR` execution scope.
+    pub scope_raw: i32,
+}
+
+/// Bounded Vulkan physical-device compute limits relevant to kernel tiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VulkanComputeLimits {
+    /// Maximum total workgroup shared memory in bytes (`maxComputeSharedMemorySize`).
+    pub max_compute_shared_memory_size: u32,
+    /// Maximum local workgroup invocations (`maxComputeWorkGroupInvocations`).
+    pub max_compute_work_group_invocations: u32,
+    /// Maximum local workgroup extent `(x, y, z)` (`maxComputeWorkGroupSize`).
+    pub max_compute_work_group_size: [u32; 3],
+    /// Maximum single storage-buffer binding range in bytes (`maxStorageBufferRange`).
+    pub max_storage_buffer_range: u32,
+    /// Maximum simultaneous device memory allocations (`maxMemoryAllocationCount`).
+    pub max_memory_allocation_count: u32,
+}
+
 /// One Vulkan physical device; observations do not qualify an inference backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanAdapter {
@@ -395,6 +433,16 @@ pub struct VulkanAdapter {
     pub shader_float16: Option<bool>,
     /// Supported integer-dot shader feature, unknown before Vulkan 1.1 queries.
     pub shader_integer_dot_product: Option<bool>,
+    /// Whether packed signed 4x8-bit integer dot product is hardware-accelerated.
+    pub integer_dot_4x8_packed_signed_accelerated: Option<bool>,
+    /// Supported `VK_KHR_cooperative_matrix` shapes when advertised and enumerated.
+    pub cooperative_matrix_properties: Option<Vec<VulkanCooperativeMatrixShape>>,
+    /// Whether `VK_QCOM_cooperative_matrix_conversion` is advertised.
+    pub qcom_cooperative_matrix_conversion: bool,
+    /// Per-heap `(budget_bytes, usage_bytes)` from `VK_EXT_memory_budget`, when advertised.
+    pub memory_budget_heaps: Option<Vec<(u64, u64)>>,
+    /// Physical device compute and storage limits from `VkPhysicalDeviceLimits`.
+    pub compute_limits: VulkanComputeLimits,
     /// Subgroup width when Vulkan 1.1 properties are available.
     pub subgroup_size: Option<u32>,
     /// Raw subgroup operation flags when Vulkan 1.1 properties are available.
@@ -1336,6 +1384,42 @@ impl OwnedProcess {
         }
         let command = command_line(&spec.executable, &spec.arguments)?;
         native::NativeProcess::start_inspection(spec, command).map(Self)
+    }
+
+    /// Starts a bounded graphics discovery or standalone pilot probe.
+    ///
+    /// Preserves the single-process Job limit, committed memory limit,
+    /// heap termination, extension-point denial, image-load restrictions, and
+    /// inherited environment validation of worker launches, while leaving Win32k
+    /// system calls available so the Windows Vulkan loader and `OpenCL` WDDM
+    /// adapters can enumerate via `gdi32.dll!D3DKMTEnumAdapters2`. Restricted
+    /// strictly to allowlisted graphics subcommands with `--request PATH`.
+    ///
+    /// # Errors
+    /// Rejects non-unit process limits, unallowlisted arguments, ambiguous
+    /// request paths, and every invalid worker launch input or native failure.
+    pub fn start_graphics_probe(spec: &ProcessSpec) -> io::Result<Self> {
+        validate_process(spec)?;
+        let [subcommand, option, request_path] = spec.arguments.as_slice() else {
+            return Err(invalid(
+                "graphics probe requires [subcommand, --request, PATH] and a single-process limit",
+            ));
+        };
+        if spec.active_process_limit != 1
+            || !matches!(
+                subcommand.to_str(),
+                Some("host-gpu-query" | "host-opencl-query" | "opencl-projection-worker")
+            )
+            || option != "--request"
+            || request_path.is_empty()
+        {
+            return Err(invalid(
+                "graphics probe requires a single-process limit and an allowlisted graphics probe command",
+            ));
+        }
+        validate_path(Path::new(request_path))?;
+        let command = command_line(&spec.executable, &spec.arguments)?;
+        native::NativeProcess::start_graphics_probe(spec, command).map(Self)
     }
 
     /// Returns the root Windows process identifier.

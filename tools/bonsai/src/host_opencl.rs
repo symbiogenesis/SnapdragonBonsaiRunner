@@ -14,7 +14,7 @@ fn unknown() -> Value {
     json!({"schema_version": 1, "kind": "runner-native-opencl-observations",
         "status": "unknown", "source": "system-opencl-loader",
         "architecture": std::env::consts::ARCH, "platforms": null,
-        "loader": null, "execution_policy": "headless-worker",
+        "loader": null, "execution_policy": "graphics-probe-worker",
         "qualification": "unqualified", "backend_ready": false,
         "error": "native-opencl-query-unavailable"})
 }
@@ -123,7 +123,7 @@ fn checked_report(report: &Value) -> bool {
         || report["kind"] != "runner-native-opencl-observations"
         || report["source"] != "system-opencl-loader"
         || report["architecture"] != "aarch64"
-        || report["execution_policy"] != "headless-worker"
+        || report["execution_policy"] != "graphics-probe-worker"
         || report["qualification"] != "unqualified"
         || report["backend_ready"] != false
         || report["status"] != "observed"
@@ -214,7 +214,7 @@ mod windows {
             json!({"schema_version": 1, "kind": "runner-native-opencl-observations",
             "status": "observed", "source": "system-opencl-loader",
             "architecture": std::env::consts::ARCH, "platforms": platforms,
-            "loader": loader, "execution_policy": "headless-worker",
+            "loader": loader, "execution_policy": "graphics-probe-worker",
             "qualification": "unqualified", "backend_ready": false, "error": null}),
         )
     }
@@ -245,11 +245,15 @@ mod windows {
             memory_limit_bytes: 512 * 1024 * 1024,
             active_process_limit: 1,
         };
-        let report =
-            crate::runtime_probe::run(&spec, 1024 * 1024, "Native OpenCL inventory", || Ok(()))
-                .and_then(|output| {
-                    serde_json::from_str::<Value>(&output.stdout).map_err(|error| error.to_string())
-                });
+        let report = crate::runtime_probe::graphics_probe(
+            &spec,
+            1024 * 1024,
+            "Native OpenCL inventory",
+            || Ok(()),
+        )
+        .and_then(|output| {
+            serde_json::from_str::<Value>(&output.stdout).map_err(|error| error.to_string())
+        });
         match report {
             Ok(report) if checked_report(&report) => {
                 for path in [&spec.stdout, &spec.stderr, &request] {
