@@ -1279,14 +1279,23 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 
 ## Adreno Vulkan
 
-- [ ] Diagnose X2 `VK_ERROR_INCOMPATIBLE_DRIVER` and the separate GDI32 lookup
-  error 126; establish their causes before further inference claims.
-- [ ] After driver/access and packed-projection acceptance, implement and compare
-  bounded fused and [decomposed attention](docs/adreno.md#decomposed-attention-candidate)
-  in the Rust GPU backend. Preserve global normalization/FP16 probability rounding,
-  causal state, exact stage dependencies, complete cache identity and explicit
-  scratch/transfer admission; require path witnesses, independent stage/state
-  controls and whole-request benefit before selecting either implementation.
+- [ ] After packed-projection serving integration and hosted CI acceptance, compare
+  and qualify bounded fused and [decomposed attention](docs/adreno.md#decomposed-attention-candidate)
+  from local Prism `bonsai-adreno-vulkan` (`..\prism-inference\tools\adreno-vulkan`,
+  SPIR-V 1.6 + Vulkan 1.3 core) in complete serving workflows. Runner unblocked X2
+  WDDM/DXCore ICD initialization via `MitigationProfile::GraphicsProbe`
+  (`graphics-probe-worker` allowlisted for `host-gpu-query`, `host-opencl-query`, and
+  `opencl-projection-worker`), dynamic `user32.dll` lookup in `error_dialog`, raised
+  `host_gpu` module hash limits (`64 MiB`/file, `192 MiB`/total, `1500 ms`), and extended
+  Vulkan capability queries (verified live on X2E94100 `Adreno(TM) X2-90 GPU` Vulkan
+  `1.3.301`/`1.4.327`, `qcvkarm64xum.dll` `32,157,248` B, and OpenCL `3.0 build 863.0`).
+  Local Prism `bonsai-adreno-vulkan` passes `5/5` unit tests and `5/5` live X2-90 parity
+  tests (`#39` `PQ2_0`/`PTQ1_0` with `OpSDot` and portable fallback, `Qwen35` decode/
+  checkpoint/rollback, `CompositeProjectionExecutor`; `#40` fused vs 3-stage decomposed/
+  pipelined attention with QGLC-safe binary16 probability rounding and explicit pipeline
+  barriers) plus bounded AC-logged timing (`2.306 s` total). Whole-request serving
+  benefit vs production NEON, hosted CI, physical X1-85 verification, pinned release-lock
+  promotion, LoRA/full-state coverage, and TDR/recovery qualification remain open.
 - [ ] Qualify the opt-in native ARM64 OpenCL original-PQ2/Q8_K projection
   pilot under unchanged mitigations, including owning hosted analysis/linking,
   exact input/kernel/device identities, every-block scalar replay and terminal
@@ -1305,9 +1314,10 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Optimize measured bottlenecks only, including packed kernels, reusable
   weights, cache/lifetime accounting and bounded scratch.
 - [ ] Qualify full-device benefit, pressure/device-loss/cancellation recovery,
-  rollback, resources and safety before selecting a GPU profile. Keep conditional Adreno
+  rollback, resources and safety before selecting a GPU profile. Keep serving-level Adreno
   GPU, async storage and DCVS/power-scaling gates from screening items `#39`–`#44`
-  deferred behind driver/access resolution and matched host/device attribution.
+  behind hosted CI, X1-85 hardware evidence, pinned release-lock promotion, and
+  matched host/device attribution.
 
 ## Hexagon NPU
 
@@ -1540,12 +1550,21 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 
 #### Adreno Vulkan, Hexagon NPU and power policy
 
-- [ ] **#39 — Native packed Vulkan (`PTQ1` / integer-dot) kernels.** Gate behind
-  `VK_ERROR_INCOMPATIBLE_DRIVER` diagnosis and Qualcomm matrix-conversion capability
-  checks with explicit fallback under [Adreno](docs/adreno.md).
-- [ ] **#40 — Resource-pressure fused versus decomposed GPU attention.** Select
-  row/head tile shapes from register and local-memory pressure to prevent spills and
-  Windows GPU TDRs while preserving global normalization and FP16 probabilities.
+- [ ] **#39 — Native packed Vulkan (`PQ2`/`PTQ1` / integer-dot) kernels.** Source
+  implementation and live X2-90 parity/AC micro-timings landed locally in
+  `..\prism-inference\tools\adreno-vulkan` (`bonsai-adreno-vulkan`, SPIR-V 1.6 + Vulkan
+  1.3 core `OpSDot` and portable fallback; `0 ULP` on `PQ2 x Q8_K fused=false`,
+  `PQ2 x Q8_0`, `PTQ1 x Q8_0`, `PTQ1 x Q8_K`, `Qwen35` decode/checkpoint/rollback, and
+  `CompositeProjectionExecutor`; documented `<= 1 ULP` Adreno `mad.f32` behavior for
+  `fused=true` `GLSL_FMA`); Runner `graphics-probe-worker` and extended Vulkan capability
+  queries verified on X2E94100. Hosted CI, physical X1-85, pinned lock promotion, and
+  production multi-thread NEON complete-request comparisons remain open under
+  [Adreno](docs/adreno.md).
+- [ ] **#40 — Resource-pressure fused versus decomposed GPU attention.** Resource-planned
+  fused (`total_seq <= 512`) and 3-stage decomposed/pipelined SPIR-V 1.6 kernels with
+  QGLC-safe binary16 probability rounding and explicit pipeline barriers implemented and
+  verified live on X2-90 in `..\prism-inference\tools\adreno-vulkan`; hosted CI, X1-85,
+  complete serving latency vs CPU, and sustained TDR/pressure gates remain open.
 - [ ] **#41 — Hexagon `PQ2`/`PTQ1` tile packing, VTCM sizing and IOVA placement.**
   Tailor host repacking and mapping placement to actual queried VTCM capacity and
   Swift's `PQ2`/`PTQ1` layouts under [Hexagon](docs/hexagon.md).

@@ -69,11 +69,55 @@ separate qualification scopes.
 ## Decomposed attention candidate
 
 The ggml 1.0 [Adreno decomposition][ggml-adreno-decomposition] is a resource-pressure
-reference for the future Rust backend. Splitting a fused attention kernel can
-reduce registers and local-memory use even when it adds dispatches. This selects
-no GPU implementation or profile: resolve the driver/access prerequisites in
-[PLAN](../PLAN.md#adreno-vulkan) and qualify the existing packed-projection pilot
-before adding an attention workload.
+reference for native Rust GPU work (`..\prism-inference\tools\adreno-vulkan`,
+`bonsai-adreno-vulkan`), contrasting a bounded single-dispatch fused attention path
+against three explicit stages: `QK` scores, globally normalized probabilities with
+explicit binary16 rounding, and `probs * V` accumulation, while keeping Runner's pinned
+release lock (`backend_ready: false`) unqualified for application serving pending hosted
+CI, X1-85 evidence, and complete-model comparison.
+
+### Resolved X2 probe access and local SPIR-V 1.6 pilot (`bonsai-adreno-vulkan`)
+
+On Snapdragon X2 Elite Extreme (`X2E94100`), Runner's headless probe originally hit
+`VK_ERROR_INCOMPATIBLE_DRIVER` and GDI32 lookup error `126` because `HEADLESS_MITIGATIONS`
+disabled Win32k system calls (`1 << 28`), blocking WDDM/DXCore ICD initialization, and
+`qcvkarm64xum.dll` (`32,157,248` B) exceeded the earlier `16 MiB` per-file hash cap.
+`MitigationProfile::GraphicsProbe` (`OwnedProcess::start_graphics_probe`, allowlisted for
+`host-gpu-query`, `host-opencl-query`, and `opencl-projection-worker`), dynamic `user32.dll`
+loading in `error_dialog`, and raised `host_gpu` hash limits (`64 MiB`/`192 MiB`/`1500 ms`)
+unblocked live X2-90 discovery via `bonsai-tools doctor --json '{"nativeGraphics":true}'`:
+- Vulkan loader `1.3.301`, `Adreno(TM) X2-90 GPU` device API `1.4.327`, ICD
+  `qcvkarm64xum.dll` (`32,157,248` B, SHA-256 `eab059ad149a0370e4097b98e027abc2161b426aa094c75b5f94ab546b332c59`),
+  `max_compute_shared_memory_size = 32,768` B, `max_compute_work_group_invocations = 1,024`,
+  `max_storage_buffer_range = 2,147,483,647` B, `integer_dot_4x8_packed_signed_accelerated = true`,
+  `VK_KHR_cooperative_matrix` shapes + `VK_QCOM_cooperative_matrix_conversion`, and
+  Qualcomm OpenCL `3.0 QUALCOMM build: 863.0` (`25,563,551,744` B global / `32,768` B local).
+
+In the sibling `..\prism-inference` repository, `bonsai-adreno-vulkan` emits SPIR-V 1.6
+(`0x0001_0600`, complete global `OpEntryPoint` interfaces) on Vulkan 1.3+ (core integer
+dot product `OpSDot`) for `#39` (`VulkanPq2Executor` + `Qwen35` + `CompositeProjectionExecutor`)
+and `#40` (`VulkanAttentionExecutor` with fused `total_seq <= 512` vs 3-stage decomposed /
+single-CB pipelined execution):
+- **Live X2-90 parity (`5/5` unit + `5/5` live tests)**: `PQ2_0 x Q8_K` (`fused=false`,
+  batched `tokens=4`, and `5120x17408`), `PQ2_0 x Q8_0`, `PTQ1_0 x Q8_0` (`pinned=false/true`),
+  `PTQ1_0 x Q8_K`, `Qwen35` decode/checkpoint/rollback, and `CompositeProjectionExecutor`
+  overflow routing all match CPU at `0 ULP`.
+- **Empirical compiler/precision findings on X2-90**: `fused=true` emits `GLSL.std.450`
+  `Fma` (`NoContraction`), which Adreno's shader compiler lowers to hardware `mad.f32`
+  (`<= 1 ULP` difference vs CPU `f32::mul_add`, `OpSDot == Portable` at `0 ULP`; gated
+  separately from `fused=false`); attention `round_f16` uses an explicit bitwise IEEE-754
+  binary16 shift/add + `GLSLstd450UnpackHalf2x16` (`62`) rather than `packHalf2x16` +
+  `unpackHalf2x16` because Adreno QGLC peephole-folded the round-trip back to unrounded `f32`.
+- **Bounded AC-logged X2-90 micro-timings (`2.306 s` total, prebuilt `adreno_live`, all 4
+  `GetSystemPowerStatus` checks `AC(1)`, charge `100%`, Battery Saver `Off`)**:
+  - `PQ2_0 x Q8_K` (`5120x17408`): `OpSDot` `8.363 ms` median vs portable `8.452 ms`
+    (single-thread CPU scalar oracle `43.888 ms` median).
+  - `PTQ1_0 x Q8_0` pinned (`5120x17408`): `OpSDot` `9.261 ms` median (`2.238 ms` min) vs
+    portable `15.724 ms` median (single-thread CPU scalar oracle `58.251 ms` median).
+  - Attention (`Q=1, H=24, KV=4, D=256`): `seq=64` fused `8.309 ms` / decomposed `6.039 ms`;
+    `seq=512` fused `8.300 ms` / decomposed `8.257 ms`; `seq=2048` auto decomposed `16.665 ms`.
+  Note: per-call timings include synchronous host buffer upload/readback and fence wait, and
+  compare against single-threaded scalar CPU inside the test rather than multi-worker NEON.
 
 For the first eligible Swift shape, compare a bounded fused candidate with three
 explicit stages: QK scores, globally normalized probabilities, and probability/V
@@ -101,8 +145,9 @@ and complete logits/state to independent CPU arithmetic, and exercise odd tiles,
 causal boundaries, long sums, changed shapes and cancellation between stages.
 Moving packet boundaries or adding unused work must not silently change arithmetic
 or upload unread inputs. Adapters, native policy access and complete-request
-benefit retain their separate gates. No attention kernel or GPU dispatch is added
-by this design; those tasks remain explicit in PLAN.
+benefit retain their separate gates. Runner's pinned release lock introduces no Adreno GPU
+serving path yet; local Prism prototype work in `bonsai-adreno-vulkan` awaits hosted CI,
+physical X1-85 verification, lock promotion and complete-request benefit in PLAN.
 
 ## Resources, failure and acceptance
 
@@ -118,11 +163,12 @@ submission/waits and critical-path traces, including faults, evictions and
 sustained failures. Overlapping durations cannot be summed; utilization is not
 energy. [GPUView][gpuview] requires native ARM64 tooling. Native diagnostics use
 absolute system-temp lanes and inherited Windows system/profile variables.
-Moving source links are leads, not build pins. Conditional accelerator, async storage and
+Moving source links are leads, not build pins. Serving admission, async storage and
 DCVS/power-scaling gates from the August–November 2026 screening (`#39`–`#44` in the
 [screening ledger](research-register.md#august-to-november-2026-screening-ledger)) remain
-deferred behind `VK_ERROR_INCOMPATIBLE_DRIVER` diagnosis, packed-projection controls and
-matched host/device resource accounting.
+behind hosted CI, physical X1-85 evidence, pinned lock promotion, and matched host/device
+resource accounting even though X2 probe access and the local `bonsai-adreno-vulkan`
+SPIR-V 1.6 pilot are live-verified on X2-90.
 
 ## Cross-device research limits
 
@@ -144,10 +190,11 @@ program, kernel or device allocation.
 
 ### Reproducible native query
 
-`bonsai-tools host-opencl --request <absolute-empty-object.json>` launches its own ARM64 child with
-the ordinary headless worker mitigations. It loads only the absolute Windows system `OpenCL.dll`,
-restricting initial dependency search to that directory and System32. `OCL_*`, `OPENCL_*` and `CL_*`
-environment overrides reject. Loader/ICD calls still execute installed native code and remain an
+`bonsai-tools host-opencl --request <absolute-empty-object.json>` (or `doctor --json '{"nativeGraphics":true}'`)
+launches the ARM64 child with `MitigationProfile::GraphicsProbe` (`graphics-probe-worker`,
+retaining all non-Win32k headless mitigations while permitting WDDM/DXCore ICD queries). It
+loads only the absolute Windows system `OpenCL.dll`, restricting initial dependency search
+to that directory and System32. `OCL_*`, `OPENCL_*` and `CL_*` environment overrides reject. Loader/ICD calls still execute installed native code and remain an
 operator trust boundary. The internal `host-opencl-query` command has no intrinsic driver timeout;
 callers must use the owning wrapper.
 
