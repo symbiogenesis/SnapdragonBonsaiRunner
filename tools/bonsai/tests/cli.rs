@@ -82,6 +82,7 @@ fn version_advertises_policy_commands_and_compiled_inference_without_request_fil
         "ffn-plan",
         "ffn-surrogate",
         "adapter-edit",
+        "lora-diff-audit",
         "speech-models",
         "inference-lock",
         "inference-capabilities",
@@ -290,5 +291,34 @@ fn inline_and_stdin_json_preserve_native_promotion_roundtrip()
         assert!(!result.status.success());
         assert_eq!(result.stdout, Vec::<u8>::new());
     }
+    Ok(())
+}
+
+#[test]
+fn lora_diff_audit_plan_dispatches_without_network() -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
+        .args([
+            "lora-diff-audit",
+            "--json",
+            r#"{"schemaVersion":1,"operation":"plan","source":{"kind":"pinned-daisyrose"}}"#,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, Vec::<u8>::new());
+    let plan: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(plan["status"], "planned-no-io");
+    assert_eq!(plan["selectedTensorCount"], 50);
+    assert_eq!(
+        plan["source"]["candidate"]["revision"],
+        "64a4ec665091bb0c1931babce4e97e686eef3c5c"
+    );
+    assert_eq!(
+        plan["source"]["base"]["revision"],
+        "37561816e66b5b9153b1b64c10968c18c1e6f4a0"
+    );
     Ok(())
 }

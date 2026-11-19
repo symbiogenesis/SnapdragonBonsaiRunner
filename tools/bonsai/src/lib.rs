@@ -35,6 +35,7 @@ pub const COMMANDS: &[&str] = &[
     "ffn-plan",
     "ffn-surrogate",
     "adapter-edit",
+    "lora-diff-audit",
     "runtime-promotion",
     "kv-promotion",
     "evidence-archive",
@@ -125,6 +126,9 @@ pub mod ffn_plan;
 
 /// Offline, separately published edits to the approved adapter's F32 A factors.
 pub mod adapter_edit;
+
+/// Read-only BF16 weight-diff and SVD spectrum audit for Gate 1 (`DR1`).
+pub mod lora_diff_audit;
 
 /// Exact standard-profile promotion policy and offline evidence completeness review.
 pub mod runtime_promotion;

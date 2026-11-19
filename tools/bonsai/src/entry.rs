@@ -170,6 +170,7 @@ fn dispatch(command: &str, request: serde_json::Value) -> bonsai_tools::Result<s
         "ffn-plan" => bonsai_tools::ffn_plan::run(request),
         "ffn-surrogate" => bonsai_tools::ffn_surrogate::run(request),
         "adapter-edit" => bonsai_tools::adapter_edit::run(request),
+        "lora-diff-audit" => bonsai_tools::lora_diff_audit::run(request),
         "runtime-promotion" => bonsai_tools::runtime_promotion::run(request),
         "kv-promotion" => bonsai_tools::kv_promotion::run(request),
         "evidence-archive" => bonsai_tools::evidence_archive::run(request),

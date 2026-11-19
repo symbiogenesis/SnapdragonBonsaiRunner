@@ -62,6 +62,19 @@ the GGUF byte length unchanged. Native sparse execution is separately required
 for memory or arithmetic savings. Neither retained weight energy nor a factual
 smoke establishes broad quality or an inference-speed improvement.
 
+`lora-diff-audit` runs Gate 1 (`DR1`): a read-only Rust BF16 weight-diff and SVD
+spectrum audit comparing `RadixArk/DaisyRose-27B` against `Qwen/Qwen3.8-27B`
+(or explicit `local-directories` fixtures) via bounded HTTP Range streaming.
+Supply `schemaVersion: 1`, `operation: "plan"` or `"audit"`, `source`
+(`{"kind":"pinned-daisyrose"}` or `{"kind":"local-directories","candidateDirectory":...,"baseDirectory":...}`),
+optional `scope` (`layers`, `includeOutputNorm`, `includeVocab`, `includeSvd`,
+`maxRank`, `oversampling`, `powerIterations`), optional `controls`
+(`timeBudgetSeconds` in `10..=900`, `workers`, `httpConcurrency`), and optional
+fresh external `outputPath`. Gate 1 stops (`no-go`) if non-matrix parameters
+hold `>= 50%` of non-vocab delta energy (or mean relative delta `> 5x` linear
+matrices), or if energy-weighted `E(32) < 50%` across FFN and full-attention
+matrices.
+
 `ffn-plan` screens the packed-payload envelope of an explicit structured FFN
 omission plan without reading a model or choosing important sites. Supply
 `schemaVersion: 1`, `weightRepresentation` (`PQ2_0` or

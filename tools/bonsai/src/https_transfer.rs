@@ -529,6 +529,130 @@ pub(crate) fn download_fresh(
     })
 }
 
+fn range_expected_len(start: u64, end_inclusive: u64, max_bytes: u64) -> crate::Result<u64> {
+    if start > end_inclusive {
+        return Err("Range start must not exceed end.".into());
+    }
+    let expected_len = end_inclusive
+        .checked_sub(start)
+        .and_then(|diff| diff.checked_add(1))
+        .ok_or("Range length overflow.")?;
+    if expected_len == 0 || expected_len > max_bytes {
+        return Err("Range request exceeds byte limit.".into());
+    }
+    Ok(expected_len)
+}
+
+fn parse_content_range_total(
+    headers: &BTreeMap<String, String>,
+    start: u64,
+    end_inclusive: u64,
+) -> crate::Result<u64> {
+    let header = headers
+        .get("content-range")
+        .ok_or("HTTP 206 response omitted Content-Range.")?;
+    let expected_prefix = format!("bytes {start}-{end_inclusive}/");
+    let total_str = header
+        .strip_prefix(&expected_prefix)
+        .ok_or("HTTP 206 Content-Range differs from requested slice.")?;
+    if total_str == "*" || total_str.is_empty() || !total_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("HTTP 206 Content-Range total is invalid or unknown.".into());
+    }
+    let total: u64 = total_str
+        .parse()
+        .map_err(|_| "Invalid HTTP 206 Content-Range total.")?;
+    if total <= end_inclusive {
+        return Err("HTTP 206 Content-Range total does not cover requested range.".into());
+    }
+    Ok(total)
+}
+
+fn fetch_range_with(
+    agent: &Agent,
+    uri: &str,
+    start: u64,
+    end_inclusive: u64,
+    max_bytes: u64,
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> crate::Result<(Vec<u8>, u64)> {
+    let expected_len = range_expected_len(start, end_inclusive, max_bytes)?;
+    let headers = [
+        ("Accept-Encoding".to_owned(), "identity".to_owned()),
+        ("Range".to_owned(), format!("bytes={start}-{end_inclusive}")),
+    ];
+    let mut response = get(agent, uri, &headers, until, 10)?;
+    active(until, cancelled)?;
+    let status = response.status().as_u16();
+    let response_headers = response_headers(&response)?;
+    if response_headers
+        .get("content-encoding")
+        .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
+    {
+        return Err("Range fetches require identity content encoding.".into());
+    }
+    if status != 206 {
+        return Err(format!(
+            "Range fetch expected HTTP 206, received HTTP {status}."
+        ));
+    }
+    let total = parse_content_range_total(&response_headers, start, end_inclusive)?;
+    if content_length(&response_headers)?.is_some_and(|n| n != expected_len) {
+        return Err("Range fetch Content-Length differs from requested slice.".into());
+    }
+    let expected_usize = usize::try_from(expected_len).map_err(|e| e.to_string())?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(expected_usize)
+        .map_err(|e| format!("Range buffer allocation failed: {e}"))?;
+    let mut reader = response.body_mut().as_reader();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        active(until, cancelled)?;
+        let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        active(until, cancelled)?;
+        if count == 0 {
+            break;
+        }
+        let next = u64::try_from(body.len())
+            .map_err(|e| e.to_string())?
+            .checked_add(u64::try_from(count).map_err(|e| e.to_string())?)
+            .ok_or("Range response length overflow.")?;
+        if next > expected_len {
+            return Err("Range fetch exceeded requested slice length.".into());
+        }
+        body.extend_from_slice(&buffer[..count]);
+    }
+    if u64::try_from(body.len()).map_err(|e| e.to_string())? != expected_len {
+        return Err("Range fetch ended before requested slice length.".into());
+    }
+    active(until, cancelled)?;
+    Ok((body, total))
+}
+
+/// Fetches an exact bounded byte range (`start..=end_inclusive`) requiring HTTP 206 and `Content-Range`.
+pub(crate) fn fetch_range(
+    uri: &str,
+    start: u64,
+    end_inclusive: u64,
+    max_bytes: u64,
+    until: Instant,
+    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+) -> crate::Result<(Vec<u8>, u64)> {
+    validate_uri(uri)?;
+    let _ = range_expected_len(start, end_inclusive, max_bytes)?;
+    owned(agent(), until, checkpoint, |agent, cancelled| {
+        fetch_range_with(
+            agent,
+            uri,
+            start,
+            end_inclusive,
+            max_bytes,
+            until,
+            cancelled,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,5 +1161,54 @@ mod tests {
             }
             released
         })
+    }
+
+    #[test]
+    fn native_https_fetch_range_validates_partial_content_and_bounds() -> crate::Result<()> {
+        assert!(range_expected_len(10, 5, 100).is_err());
+        assert!(range_expected_len(0, 100, 100).is_err());
+
+        let (result, request) = fixture(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 2-6/20\r\nConnection: close\r\n\r\nworld",
+            |agent, uri| {
+                fetch_range_with(
+                    &agent,
+                    uri,
+                    2,
+                    6,
+                    16,
+                    Instant::now() + Duration::from_secs(5),
+                    &AtomicBool::new(false),
+                )
+            },
+        )?;
+        assert_eq!(result, (b"world".to_vec(), 20));
+        let lower = request.to_ascii_lowercase();
+        assert!(lower.contains("range: bytes=2-6\r\n"));
+        assert!(lower.contains("accept-encoding: identity\r\n"));
+
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nworld".as_slice(),
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 0-4/20\r\nConnection: close\r\n\r\nworld",
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 2-6/*\r\nConnection: close\r\n\r\nworld",
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 2-6/6\r\nConnection: close\r\n\r\nworld",
+            b"HTTP/1.1 206 Partial Content\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\nContent-Range: bytes 2-6/20\r\nConnection: close\r\n\r\nworld",
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 2-6/20\r\nConnection: close\r\n\r\nwo",
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 2-6/20\r\nConnection: close\r\n\r\nworl",
+        ] {
+            let (err, _) = fixture(response, |agent, uri| {
+                Ok(fetch_range_with(
+                    &agent,
+                    uri,
+                    2,
+                    6,
+                    16,
+                    Instant::now() + Duration::from_secs(5),
+                    &AtomicBool::new(false),
+                ))
+            })?;
+            assert!(err.is_err(), "Expected failure for range response");
+        }
+        Ok(())
     }
 }
