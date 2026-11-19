@@ -107,6 +107,16 @@ impl AlertKind {
     }
 }
 
+fn needs_windows_update(summary: &str, detail: &str) -> bool {
+    let matches_update = |text: &str| {
+        text.contains("Windows Update")
+            || text.contains("Windows updates")
+            || text.contains("Update Windows")
+            || text.contains("pending update restart")
+    };
+    matches_update(summary) || matches_update(detail)
+}
+
 impl State {
     pub(super) fn active_alerts(&self) -> Vec<AlertKind> {
         let preparing =
@@ -270,6 +280,30 @@ impl State {
     }
 
     fn alert_actions(&mut self, ui: &mut egui::Ui, kind: AlertKind) {
+        let windows_update = matches!(
+            kind,
+            AlertKind::Setup
+                | AlertKind::Model
+                | AlertKind::SpeechSetup
+                | AlertKind::Speech
+                | AlertKind::AudioFile
+        ) && {
+            let (summary, detail) = self.alert_text(kind);
+            needs_windows_update(summary, detail)
+        };
+        if windows_update
+            && ui
+                .button("Open Windows Update")
+                .on_hover_text(
+                    "Open Windows Settings to install pending Windows updates or restart.",
+                )
+                .clicked()
+            && !super::platform::open_windows_update()
+        {
+            self.record(
+                "Could not open Windows Update settings automatically. Open Settings > Windows Update manually.",
+            );
+        }
         match kind {
             AlertKind::Setup => self.setup_error_actions(ui),
             AlertKind::Model => {

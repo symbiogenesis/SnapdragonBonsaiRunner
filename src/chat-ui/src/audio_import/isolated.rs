@@ -39,6 +39,8 @@ const PROCESS_COMMIT_LIMIT: u64 = 256 * 1024 * 1024;
 const ISOLATED_WORKING_BYTES: u64 = PROCESS_COMMIT_LIMIT + CHUNK_WORKING_BYTES + 128 * 1024;
 const CLEANUP_LIMIT: Duration = Duration::from_secs(2);
 const ISOLATION_FAILURE: &str = "Windows could not start the isolated audio decoder. Transcription stopped. Your draft was kept.";
+const SANDBOX_REBOOT_PENDING_FAILURE: &str = "Windows Update has a pending restart required for the isolated audio decoder. Restart Windows, then reopen Swift. Your draft was kept.";
+const SANDBOX_UNAVAILABLE_FAILURE: &str = "This Windows build lacks the required Windows sandbox (PSEC 1.1) for the isolated audio decoder. Install the latest Windows updates, restart Windows, and reopen Swift. Your draft was kept.";
 const PROTOCOL_FAILURE: &str = "The isolated audio decoder returned invalid or incomplete audio. Transcription stopped. Your draft was kept.";
 const TIMEOUT: &str = "Windows did not finish decoding the next audio segment. Try converting the recording to WAV. Your draft was kept.";
 const CLEANUP_FAILURE: &str = "Windows could not confirm isolated audio decoder cleanup. Restart the app before importing another file. Your draft was kept.";
@@ -256,6 +258,13 @@ pub(super) fn convert(
         {
             Ok(started) => started,
             Err(error) if !bonsai_windows_process::process_start_cleanup_unconfirmed(&error) => {
+                if error.kind() == io::ErrorKind::Unsupported {
+                    return Err(if bonsai_windows_process::windows_reboot_pending() {
+                        SANDBOX_REBOOT_PENDING_FAILURE
+                    } else {
+                        SANDBOX_UNAVAILABLE_FAILURE
+                    });
+                }
                 return Err(ISOLATION_FAILURE);
             }
             Err(_) => {

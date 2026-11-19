@@ -167,6 +167,29 @@ fn error_reporting_single_alert_omits_selector_and_prioritizes_recovery_in_tab_o
 }
 
 #[test]
+fn error_reporting_offers_windows_update_action_only_for_sandbox_os_alerts() {
+    let mut chat = harness([1080.0, 780.0], 16.0);
+    chat.state_mut().app.set_status("Model failed", true);
+    chat.state_mut().app.model = ModelLifecycle::Retryable;
+    chat.run();
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Open Windows Update")
+            .is_none()
+    );
+
+    chat.state_mut().app.fail_startup(&io::Error::other(
+        "Required Windows sandbox (PSEC 1.1) is unavailable because a Windows Update restart is pending.",
+    ));
+    chat.run();
+    assert!(
+        chat.get_by_role_and_label(egui::Role::Button, "Open Windows Update")
+            .rect()
+            .is_positive()
+    );
+    assert_eq!(chat.state().app.input, "Keep this draft");
+}
+
+#[test]
 fn error_reporting_popup_rows_wrap_and_fill_the_width_at_minimum_size() {
     let mut chat = harness([480.0, 480.0], 24.0);
     chat.state_mut().app.set_status("Model failed", true);

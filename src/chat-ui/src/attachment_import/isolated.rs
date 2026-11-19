@@ -38,6 +38,8 @@ const PROCESS_COMMIT_LIMIT: usize = 512 * 1024 * 1024;
 const CLEANUP_LIMIT: Duration = Duration::from_secs(2);
 const ISOLATION_FAILURE: &str =
     "Windows could not start the isolated attachment decoder. Your draft was kept.";
+const SANDBOX_REBOOT_PENDING_FAILURE: &str = "Windows Update has a pending restart required for the isolated attachment decoder. Restart Windows, then reopen Swift. Your draft was kept.";
+const SANDBOX_UNAVAILABLE_FAILURE: &str = "This Windows build lacks the required Windows sandbox (PSEC 1.1) for the isolated attachment decoder. Install the latest Windows updates, restart Windows, and reopen Swift. Your draft was kept.";
 const PROTOCOL_FAILURE: &str =
     "The isolated attachment decoder returned invalid media data. Your draft was kept.";
 const TIMEOUT_FAILURE: &str =
@@ -269,6 +271,14 @@ pub(super) fn import_media(
         {
             Ok(started) => started,
             Err(error) if !bonsai_windows_process::process_start_cleanup_unconfirmed(&error) => {
+                if error.kind() == io::ErrorKind::Unsupported {
+                    return Err(if bonsai_windows_process::windows_reboot_pending() {
+                        SANDBOX_REBOOT_PENDING_FAILURE
+                    } else {
+                        SANDBOX_UNAVAILABLE_FAILURE
+                    }
+                    .to_owned());
+                }
                 return Err(ISOLATION_FAILURE.to_owned());
             }
             Err(_) => {

@@ -33,26 +33,42 @@ const RESOURCE_STOP: Duration = Duration::from_secs(5);
 const LOW_MEMORY: u8 = 1;
 const MEMORY_UNAVAILABLE: u8 = 2;
 
-fn sandbox_support_failure(kind: io::ErrorKind) -> Failure {
+fn sandbox_support_failure_for(kind: io::ErrorKind, reboot_pending: bool) -> Failure {
     if kind == io::ErrorKind::InvalidInput {
         Failure::Message(
             "The speech sandbox rejected inherited service credentials. Restart the app from a terminal or app session without service credentials in its parent environment. Text chat remains available.",
         )
+    } else if reboot_pending {
+        Failure::Message(
+            "Windows Update has a pending restart required for the speech sandbox. Restart Windows, then reopen Swift. Text chat remains available.",
+        )
     } else {
         Failure::Message(
-            "The required native Windows sandbox is unavailable for speech. Update Windows to a build with process containment and container-hosted loopback support. Text chat remains available.",
+            "The required native Windows sandbox is unavailable for speech. Update Windows to a build with process containment and container-hosted loopback support, then restart Windows. Text chat remains available.",
         )
     }
 }
 
-fn sandbox_start_failure(kind: io::ErrorKind) -> Failure {
-    if kind == io::ErrorKind::Unsupported {
-        sandbox_support_failure(kind)
+fn sandbox_start_failure_for(error: &io::Error, reboot_pending: bool) -> Failure {
+    if !bonsai_windows_process::process_start_cleanup_unconfirmed(error)
+        && error.kind() == io::ErrorKind::Unsupported
+    {
+        sandbox_support_failure_for(io::ErrorKind::Unsupported, reboot_pending)
     } else {
         Failure::Message(
             "Could not apply the native speech sandbox or start its executable. Check the retained service evidence; text chat remains available.",
         )
     }
+}
+
+#[cfg(test)]
+fn sandbox_support_failure(kind: io::ErrorKind) -> Failure {
+    sandbox_support_failure_for(kind, false)
+}
+
+#[cfg(test)]
+fn sandbox_start_failure(kind: io::ErrorKind) -> Failure {
+    sandbox_start_failure_for(&io::Error::from(kind), false)
 }
 
 /// Fixed native executable and local GGUF artifacts; no arbitrary arguments.
@@ -245,7 +261,12 @@ impl Service {
         // Reject ambient credentials before provisioning. The real worker launch
         // admits its complete PSEC policy; do not create/discard an empty PSEC
         // environment first or cache a prior admission result.
-        validate_sandbox_environment().map_err(|error| sandbox_support_failure(error.kind()))?;
+        validate_sandbox_environment().map_err(|error| {
+            sandbox_support_failure_for(
+                error.kind(),
+                bonsai_windows_process::windows_reboot_pending(),
+            )
+        })?;
         if listener_process_id(port)
             .map_err(|_| Failure::Message("Could not check the local speech port."))?
             .is_some()
@@ -261,8 +282,9 @@ impl Service {
         if let Some(record) = &diagnostic_sink {
             record(service_diagnostic(&evidence_directory, None));
         }
-        let process = OwnedProcess::start_sandboxed(&specification, &policy)
-            .map_err(|error| sandbox_start_failure(error.kind()))?;
+        let process = OwnedProcess::start_sandboxed(&specification, &policy).map_err(|error| {
+            sandbox_start_failure_for(&error, bonsai_windows_process::windows_reboot_pending())
+        })?;
         let mut service =
             Self::monitored_in(Arc::new(process), available_memory_bytes, Some(directory))?;
         service.diagnostic_sink = diagnostic_sink;
@@ -627,6 +649,12 @@ fn main() -> std::io::Result<()> {
         assert!(
             matches!(super::sandbox_start_failure(io::ErrorKind::Unsupported),
                 Failure::Message(message) if message.contains("Update Windows") && message.contains("loopback"))
+        );
+        assert!(
+            matches!(
+                super::sandbox_start_failure_for(&io::Error::from(io::ErrorKind::Unsupported), true),
+                Failure::Message(message) if message.contains("pending restart") && message.contains("Restart Windows")
+            )
         );
         for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::PermissionDenied] {
             assert!(matches!(super::sandbox_start_failure(kind),

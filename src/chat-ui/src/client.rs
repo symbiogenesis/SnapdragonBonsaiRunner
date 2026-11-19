@@ -89,7 +89,10 @@ const NATIVE_IDENTITY_CPU_SPECULATION_MESSAGE: &str = "The local Rust runtime's 
 const POLICY_FAILURE_MESSAGE: &str = "The local model launch policy rejected the current environment or configuration. Restart Swift from a clean session without model or runtime environment overrides. Completed conversation turns remain in memory.";
 const PATH_OR_CREDENTIALS_FAILURE_MESSAGE: &str = "Swift could not safely access its local data or temporary credential folder without links or redirects. Check folder permissions and local storage, then close and reopen Swift. Completed conversation turns remain in memory.";
 const ARGUMENTS_FAILURE_MESSAGE: &str = "The app and local broker disagreed on launch options. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 17] = [
+const SANDBOX_REBOOT_PENDING_MESSAGE: &str = "Windows Update has a pending restart required for the native Windows sandbox (PSEC 1.1). Restart Windows, then reopen Swift. Completed conversation turns remain in memory.";
+const SANDBOX_UNAVAILABLE_OFFLINE_MESSAGE: &str = "This Windows build lacks the required native Windows sandbox (PSEC 1.1). Install the latest Windows updates, restart Windows, and reopen Swift. Completed conversation turns remain in memory.";
+const SANDBOX_UNAVAILABLE_LOOPBACK_MESSAGE: &str = "The required native Windows sandbox is unavailable. Update Windows to a build with process containment and container-hosted loopback support, restart Windows, and reopen Swift. Completed conversation turns remain in memory.";
+const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 20] = [
     NATIVE_IDENTITY_RELEASE_PIN_MESSAGE,
     NATIVE_IDENTITY_FRAMING_MESSAGE,
     NATIVE_IDENTITY_SCHEMA_MESSAGE,
@@ -107,6 +110,9 @@ const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 17] = [
     POLICY_FAILURE_MESSAGE,
     PATH_OR_CREDENTIALS_FAILURE_MESSAGE,
     ARGUMENTS_FAILURE_MESSAGE,
+    SANDBOX_REBOOT_PENDING_MESSAGE,
+    SANDBOX_UNAVAILABLE_OFFLINE_MESSAGE,
+    SANDBOX_UNAVAILABLE_LOOPBACK_MESSAGE,
 ];
 pub(crate) const STOPPED_MESSAGE: &str = "Response stopped. Ready when you are.";
 /// System instructions prepended to every model turn to enable structured SVG image generation.
@@ -517,7 +523,11 @@ pub(crate) fn run(config: Config, commands: Receiver<Command>, events: EventSend
         match worker(&attempt_config, &commands, &events, &mut history) {
             Ok(()) | Err(Failure::Shutdown) => return,
             Err(Failure::Teardown) => {
-                let _notification = events.send(Event::Failed(TEARDOWN_FAILURE_MESSAGE.to_owned()));
+                let message = attach_broker_log_evidence(
+                    TEARDOWN_FAILURE_MESSAGE.to_owned(),
+                    &attempt_config.evidence,
+                );
+                let _notification = events.send(Event::Failed(message));
                 return;
             }
             Err(Failure::Memory) => {
@@ -1096,9 +1106,13 @@ fn startup_failure(diagnostic: &[u8], native_engine: bool) -> Failure {
             "The model sandbox rejected inherited service credentials. Restart the app from a terminal or app session without service credentials in its parent environment.",
         )
     } else if text.contains("SandboxUnavailable") {
-        Failure::Message(
-            "The required native Windows sandbox is unavailable. Update Windows to a build with process containment and container-hosted loopback support, then retry the model.",
-        )
+        if text.contains("Windows Update restart is pending") {
+            Failure::Message(SANDBOX_REBOOT_PENDING_MESSAGE)
+        } else if native_engine && !text.contains("container-hosted loopback") {
+            Failure::Message(SANDBOX_UNAVAILABLE_OFFLINE_MESSAGE)
+        } else {
+            Failure::Message(SANDBOX_UNAVAILABLE_LOOPBACK_MESSAGE)
+        }
     } else if text.contains("Sandbox") {
         Failure::Message(
             "The native model sandbox could not apply its required policy. Check the retained broker diagnostics, then retry the model.",
@@ -2757,7 +2771,15 @@ mod tests {
         );
         assert!(
             matches!(startup_failure(b"Development backend launch failed: SandboxUnavailable.", false),
-                Failure::Message(message) if message.contains("Update Windows") && message.contains("loopback"))
+                Failure::Message(message) if message.contains("Update Windows") && message.contains("loopback") && super::retry_guidance(message) == message)
+        );
+        assert!(
+            matches!(startup_failure(b"Development backend launch failed: SandboxUnavailable. Native Windows sandbox support (PSEC 1.1) is unavailable because a Windows Update restart is pending.", true),
+                Failure::Message(message) if message.contains("pending restart") && message.contains("Restart Windows") && super::retry_guidance(message) == message)
+        );
+        assert!(
+            matches!(startup_failure(b"Development backend launch failed: SandboxUnavailable. Native Windows sandbox support (PSEC 1.1) is unavailable on this Windows build.", true),
+                Failure::Message(message) if message.contains("PSEC 1.1") && message.contains("Windows updates") && !message.contains("loopback") && super::retry_guidance(message) == message)
         );
         assert!(
             matches!(startup_failure(b"Development backend launch failed: Sandbox.", false),

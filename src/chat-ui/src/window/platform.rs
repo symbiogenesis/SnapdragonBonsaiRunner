@@ -3,15 +3,18 @@
 use std::{path::PathBuf, ptr};
 
 use eframe::egui::{Color32, Shadow, Stroke, Visuals};
-use windows_sys::Win32::{
-    Graphics::Gdi::{
-        COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
+use windows_sys::{
+    Win32::{
+        Graphics::Gdi::{
+            COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
+        },
+        UI::{
+            Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+            Shell::{FOLDERID_Fonts, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellExecuteW},
+            WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SW_SHOWNORMAL, SystemParametersInfoW},
+        },
     },
-    UI::{
-        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-        Shell::{FOLDERID_Fonts, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
-        WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SystemParametersInfoW},
-    },
+    core::w,
 };
 
 #[derive(Clone, Copy)]
@@ -143,6 +146,27 @@ pub(super) fn fonts_directory() -> Option<PathBuf> {
 /// Keep fatal startup failures visible when an egui window cannot be created.
 pub(super) fn show_error(message: &str) {
     bonsai_windows_process::show_startup_error(message);
+}
+
+/// Open Windows Update settings using the compile-time fixed Windows Settings URI.
+#[allow(
+    unsafe_code,
+    reason = "Audited Windows Shell launch of the compile-time fixed ms-settings:windowsupdate URI."
+)]
+pub(super) fn open_windows_update() -> bool {
+    // SAFETY: All pointer arguments are null or static NUL-terminated UTF-16 literals;
+    // ShellExecuteW does not retain any caller pointer after returning.
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            w!("open"),
+            w!("ms-settings:windowsupdate"),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result.addr() > 32
 }
 
 #[cfg(test)]

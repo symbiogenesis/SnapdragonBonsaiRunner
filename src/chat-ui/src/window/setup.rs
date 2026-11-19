@@ -77,6 +77,17 @@ pub(super) fn failure_message(error: &io::Error) -> &'static str {
         return "Setup paused. Select Retry setup to continue. Your draft is safe.";
     }
     let text = message.to_ascii_lowercase();
+    if text.contains("windows sandbox") && text.contains("restart is pending") {
+        return "Windows Update has a pending restart required for Swift's Windows sandbox. Restart Windows, then reopen Swift. Your draft is safe.";
+    }
+    if text.contains("windows sandbox")
+        && (text.contains("unavailable") || text.contains("windows update"))
+    {
+        return "This Windows build lacks Swift's required Windows sandbox (PSEC 1.1). Install the latest Windows updates, restart Windows, and reopen Swift. Your draft is safe.";
+    }
+    if text.contains("windows sandbox") && text.contains("inherited service credentials") {
+        return "Swift's Windows sandbox rejected inherited service credentials. Close Swift and reopen it from a clean app or terminal session. Your draft is safe.";
+    }
     if error.kind() == io::ErrorKind::StorageFull
         || error.raw_os_error() == Some(ERROR_DISK_FULL.cast_signed())
         || text.contains("not enough free disk space")
@@ -435,5 +446,8 @@ mod tests {
         assert!(failure_message(&io::Error::other("Pinned download failed")).contains("internet"));
         assert!(failure_message(&io::Error::other("Swift model setup failed: Artifact storage could not be opened safely. Check the internet connection, free storage and folder permissions.")).contains("permissions"));
         assert!(failure_message(&io::Error::other("Pinned download failed (6): Could not resolve host; check free disk space and folder permissions")).contains("internet"));
+        assert!(failure_message(&io::Error::other("Required Windows sandbox (PSEC 1.1) is unavailable because a Windows Update restart is pending. Restart Windows, then reopen Swift. No model files were downloaded.")).contains("pending restart"));
+        assert!(failure_message(&io::Error::other("Required Windows sandbox (PSEC 1.1) is unavailable on this Windows build. Open Settings > Windows Update. No model files were downloaded.")).contains("Windows updates"));
+        assert!(failure_message(&io::Error::other("The required native Windows sandbox rejected inherited service credentials in the parent environment.")).contains("service credentials"));
     }
 }
