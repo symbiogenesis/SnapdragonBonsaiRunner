@@ -950,6 +950,17 @@ pub fn native_sandbox_offline_available() -> io::Result<()> {
     native::offline_sandbox_available()
 }
 
+/// Reports whether Windows currently advertises a pending update or servicing restart.
+///
+/// Checks the read-only `Component Based Servicing\RebootPending` and
+/// `WindowsUpdate\Auto Update\RebootRequired` keys under `HKLM`. This is an
+/// advisory diagnostic only; unavailable keys report `false` and never relax
+/// containment or admission requirements.
+#[must_use]
+pub fn windows_reboot_pending() -> bool {
+    native::windows_reboot_pending()
+}
+
 /// Startup compiler/tool inputs with a child-only inherited-environment overlay.
 ///
 /// The unnamed Job owns the complete tree without applying model-specific

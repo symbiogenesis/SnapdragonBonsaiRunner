@@ -236,6 +236,10 @@ pub(super) fn computer_identity() -> io::Result<crate::ComputerIdentity> {
     host::computer_identity()
 }
 
+pub(super) fn windows_reboot_pending() -> bool {
+    host::reboot_pending()
+}
+
 pub(super) fn power_status() -> io::Result<crate::PowerStatus> {
     power::query()
 }
