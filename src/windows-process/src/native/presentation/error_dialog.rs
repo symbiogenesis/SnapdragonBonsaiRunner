@@ -1,31 +1,115 @@
 //! Fixed native startup failure UI, independent of graphics initialization.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::ptr;
 use windows_sys::{
     Win32::{
-        Foundation::{GlobalFree, HGLOBAL, HWND, LPARAM, WPARAM},
+        Foundation::{GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, WPARAM},
         System::{
-            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
             LibraryLoader::GetModuleHandleW,
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
             Ole::CF_UNICODETEXT,
         },
         UI::WindowsAndMessaging::{
-            BS_DEFPUSHBUTTON, DLGTEMPLATE, DS_CENTER, DS_MODALFRAME, DS_SETFONT,
-            DialogBoxIndirectParamW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, EndDialog,
-            GWLP_USERDATA, GetWindowLongPtrW, IDCANCEL, IDOK, MB_ICONERROR, MB_OK, MessageBoxW,
-            SetDlgItemTextW, SetWindowLongPtrW, WM_CLOSE, WM_COMMAND, WM_INITDIALOG, WS_BORDER,
-            WS_CAPTION, WS_CHILD, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+            BS_DEFPUSHBUTTON, DLGTEMPLATE, DS_CENTER, DS_MODALFRAME, DS_SETFONT, ES_AUTOVSCROLL,
+            ES_MULTILINE, ES_READONLY, GWLP_USERDATA, IDCANCEL, IDOK, MB_ICONERROR, MB_OK,
+            WM_CLOSE, WM_COMMAND, WM_INITDIALOG, WS_BORDER, WS_CAPTION, WS_CHILD, WS_SYSMENU,
+            WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
         },
     },
     core::w,
 };
 
+use crate::native::library::SystemLibrary;
+
 const PREVIEW_ID: u16 = 1000;
 const COPY_ID: u16 = 1001;
 const FEEDBACK_ID: u16 = 1002;
 const PREVIEW_CHARS: usize = 2048;
+
+type DialogProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize;
+type DialogBoxIndirectParamWFn = unsafe extern "system" fn(
+    HINSTANCE,
+    *const DLGTEMPLATE,
+    HWND,
+    Option<DialogProc>,
+    LPARAM,
+) -> isize;
+type MessageBoxWFn = unsafe extern "system" fn(HWND, *const u16, *const u16, u32) -> i32;
+type SetDlgItemTextWFn = unsafe extern "system" fn(HWND, i32, *const u16) -> i32;
+type GetWindowLongPtrWFn = unsafe extern "system" fn(HWND, i32) -> isize;
+type SetWindowLongPtrWFn = unsafe extern "system" fn(HWND, i32, isize) -> isize;
+type EndDialogFn = unsafe extern "system" fn(HWND, isize) -> i32;
+type OpenClipboardFn = unsafe extern "system" fn(HWND) -> i32;
+type EmptyClipboardFn = unsafe extern "system" fn() -> i32;
+type SetClipboardDataFn = unsafe extern "system" fn(u32, HANDLE) -> HANDLE;
+type CloseClipboardFn = unsafe extern "system" fn() -> i32;
+
+struct User32Api {
+    dialog_box_indirect_param_w: DialogBoxIndirectParamWFn,
+    message_box_w: MessageBoxWFn,
+    set_dlg_item_text_w: SetDlgItemTextWFn,
+    get_window_long_ptr_w: GetWindowLongPtrWFn,
+    set_window_long_ptr_w: SetWindowLongPtrWFn,
+    end_dialog: EndDialogFn,
+    open_clipboard: OpenClipboardFn,
+    empty_clipboard: EmptyClipboardFn,
+    set_clipboard_data: SetClipboardDataFn,
+    close_clipboard: CloseClipboardFn,
+    _library: SystemLibrary,
+}
+
+impl User32Api {
+    fn load() -> std::io::Result<Self> {
+        let library = SystemLibrary::load_system32("user32.dll", "system user32.dll unavailable")?;
+        macro_rules! symbol {
+            ($name:literal, $kind:ty) => {{
+                let pointer = library.symbol($name)?;
+                // SAFETY: Exact documented Windows ARM64 user32.dll export signature;
+                // `_library` remains owned for the lifetime of this struct.
+                unsafe {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, $kind>(pointer)
+                }
+            }};
+        }
+        Ok(Self {
+            dialog_box_indirect_param_w: symbol!(
+                c"DialogBoxIndirectParamW",
+                DialogBoxIndirectParamWFn
+            ),
+            message_box_w: symbol!(c"MessageBoxW", MessageBoxWFn),
+            set_dlg_item_text_w: symbol!(c"SetDlgItemTextW", SetDlgItemTextWFn),
+            get_window_long_ptr_w: symbol!(c"GetWindowLongPtrW", GetWindowLongPtrWFn),
+            set_window_long_ptr_w: symbol!(c"SetWindowLongPtrW", SetWindowLongPtrWFn),
+            end_dialog: symbol!(c"EndDialog", EndDialogFn),
+            open_clipboard: symbol!(c"OpenClipboard", OpenClipboardFn),
+            empty_clipboard: symbol!(c"EmptyClipboard", EmptyClipboardFn),
+            set_clipboard_data: symbol!(c"SetClipboardData", SetClipboardDataFn),
+            close_clipboard: symbol!(c"CloseClipboard", CloseClipboardFn),
+            _library: library,
+        })
+    }
+}
+
+thread_local! {
+    static ACTIVE_USER32: Cell<*const User32Api> = const { Cell::new(ptr::null()) };
+}
+
+struct ActiveUser32Guard;
+
+impl ActiveUser32Guard {
+    fn install(api: &User32Api) -> Self {
+        ACTIVE_USER32.set(&raw const *api);
+        Self
+    }
+}
+
+impl Drop for ActiveUser32Guard {
+    fn drop(&mut self) {
+        ACTIVE_USER32.set(ptr::null());
+    }
+}
 
 struct Contents {
     full: Vec<u16>,
@@ -55,6 +139,11 @@ fn preview(message: &str, limit: usize) -> Cow<'_, str> {
 }
 
 pub(super) fn show(message: &str) {
+    // Load user32.dll only when presenting a fatal graphical dialog so headless
+    // CLI/probe binaries retain zero static GUI DLL imports under Win32k denial.
+    let Ok(user32) = User32Api::load() else {
+        return;
+    };
     let contents = Contents {
         full: terminated(message),
         preview: terminated(&preview(message, PREVIEW_CHARS)),
@@ -64,11 +153,12 @@ pub(super) fn show(message: &str) {
     // SAFETY: A null name requests this process's module without transferring ownership.
     let instance = unsafe { GetModuleHandleW(ptr::null()) };
     let result = parameter.map_or(-1, |parameter| {
+        let _guard = ActiveUser32Guard::install(&user32);
         // SAFETY: The DWORD-aligned template contains only standard native controls.
-        // All template/text storage and the callback context remain live until this
-        // synchronous modal call returns. The callback never retains these pointers.
+        // All template/text storage, `user32`, and the callback context remain live
+        // until this synchronous modal call returns on this thread.
         unsafe {
-            DialogBoxIndirectParamW(
+            (user32.dialog_box_indirect_param_w)(
                 instance,
                 template.as_ptr().cast::<DLGTEMPLATE>(),
                 ptr::null_mut(),
@@ -93,9 +183,9 @@ pub(super) fn show(message: &str) {
         let fallback = terminated(&format!(
             "Swift Bonsai could not start.\n\n{short}\n\nThe detailed error controls could not open."
         ));
-        // SAFETY: Both terminated strings remain live throughout the synchronous call.
+        // SAFETY: Both terminated strings and `user32` remain live throughout the synchronous call.
         let _ = unsafe {
-            MessageBoxW(
+            (user32.message_box_w)(
                 ptr::null_mut(),
                 fallback.as_ptr(),
                 w!("Swift Bonsai 2"),
@@ -111,13 +201,20 @@ unsafe extern "system" fn dialog_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
+    let api_pointer = ACTIVE_USER32.with(Cell::get);
+    if api_pointer.is_null() {
+        return 0;
+    }
+    // SAFETY: `ActiveUser32Guard` keeps the borrowed `User32Api` alive on this
+    // thread's stack for the complete synchronous `DialogBoxIndirectParamW` call.
+    let user32 = unsafe { &*api_pointer };
     if message == WM_INITDIALOG {
         // SAFETY: This dialog owns its user-data slot and receives the live Contents
         // pointer only from the synchronous DialogBoxIndirectParamW invocation above.
-        let _ = unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, lparam) };
+        let _ = unsafe { (user32.set_window_long_ptr_w)(dialog, GWLP_USERDATA, lparam) };
     }
     // SAFETY: Only WM_INITDIALOG above writes this dialog's private user-data slot.
-    let parameter = unsafe { GetWindowLongPtrW(dialog, GWLP_USERDATA) };
+    let parameter = unsafe { (user32.get_window_long_ptr_w)(dialog, GWLP_USERDATA) };
     let pointer =
         ptr::with_exposed_provenance::<Contents>(usize::try_from(parameter).unwrap_or_default());
     if !pointer.is_null() {
@@ -127,18 +224,23 @@ unsafe extern "system" fn dialog_proc(
         if message == WM_INITDIALOG {
             // SAFETY: PREVIEW_ID identifies the template's edit control; text stays live.
             let _ = unsafe {
-                SetDlgItemTextW(dialog, i32::from(PREVIEW_ID), contents.preview.as_ptr())
+                (user32.set_dlg_item_text_w)(
+                    dialog,
+                    i32::from(PREVIEW_ID),
+                    contents.preview.as_ptr(),
+                )
             };
             return 1;
         }
         if message == WM_COMMAND && wparam & 0xffff == usize::from(COPY_ID) {
-            let feedback = if copy(dialog, &contents.full) {
+            let feedback = if copy(user32, dialog, &contents.full) {
                 w!("Copied the complete error.")
             } else {
                 w!("Clipboard unavailable. Try Copy error again.")
             };
             // SAFETY: The template's fixed feedback control copies this static text.
-            let _ = unsafe { SetDlgItemTextW(dialog, i32::from(FEEDBACK_ID), feedback) };
+            let _ =
+                unsafe { (user32.set_dlg_item_text_w)(dialog, i32::from(FEEDBACK_ID), feedback) };
             return 1;
         }
     }
@@ -146,18 +248,18 @@ unsafe extern "system" fn dialog_proc(
         || (message == WM_COMMAND && matches!(i32::try_from(wparam & 0xffff), Ok(IDOK | IDCANCEL)))
     {
         // SAFETY: This callback runs only for its own live modal dialog.
-        let _ = unsafe { EndDialog(dialog, 0) };
+        let _ = unsafe { (user32.end_dialog)(dialog, 0) };
         return 1;
     }
     0
 }
 
-struct Clipboard;
+struct Clipboard<'a>(&'a User32Api);
 
-impl Drop for Clipboard {
+impl Drop for Clipboard<'_> {
     fn drop(&mut self) {
         // SAFETY: This guard exists only after OpenClipboard succeeded on this thread.
-        let _ = unsafe { CloseClipboard() };
+        let _ = unsafe { (self.0.close_clipboard)() };
     }
 }
 
@@ -173,7 +275,7 @@ impl Drop for Allocation {
     }
 }
 
-fn copy(dialog: HWND, text: &[u16]) -> bool {
+fn copy(user32: &User32Api, dialog: HWND, text: &[u16]) -> bool {
     let Some(bytes) = text.len().checked_mul(size_of::<u16>()) else {
         return false;
     };
@@ -193,17 +295,17 @@ fn copy(dialog: HWND, text: &[u16]) -> bool {
     // SAFETY: The allocation has exactly the one lock obtained above.
     let _ = unsafe { GlobalUnlock(allocation.0) };
     // SAFETY: The live dialog provides the valid owner required by EmptyClipboard.
-    if unsafe { OpenClipboard(dialog) } == 0 {
+    if unsafe { (user32.open_clipboard)(dialog) } == 0 {
         return false;
     }
-    let _clipboard = Clipboard;
+    let _clipboard = Clipboard(user32);
     // SAFETY: This thread holds the clipboard open and intentionally replaces its contents.
-    if unsafe { EmptyClipboard() } == 0 {
+    if unsafe { (user32.empty_clipboard)() } == 0 {
         return false;
     }
     // SAFETY: CF_UNICODETEXT accepts unlocked movable storage containing
     // terminated UTF-16. Ownership transfers only when this call succeeds.
-    if unsafe { SetClipboardData(u32::from(CF_UNICODETEXT), allocation.0) }.is_null() {
+    if unsafe { (user32.set_clipboard_data)(u32::from(CF_UNICODETEXT), allocation.0) }.is_null() {
         return false;
     }
     allocation.0 = ptr::null_mut();
