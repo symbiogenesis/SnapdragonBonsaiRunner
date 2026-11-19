@@ -709,6 +709,9 @@ fn prepare_for_family(
 }
 
 trait Operations {
+    fn check_sandbox(&mut self, _request: &Request) -> crate::Result<()> {
+        Ok(())
+    }
     fn artifacts(&mut self, request: &Request, working: &Path) -> crate::Result<()>;
     fn inference(&mut self, request: &Request, working: &Path) -> crate::Result<()>;
     fn model_apps(
@@ -756,7 +759,73 @@ fn path_field(value: &Value, key: &str) -> crate::Result<PathBuf> {
     field(value, key).map(PathBuf::from)
 }
 
+#[cfg(any(windows, test))]
+fn sandbox_preflight_error(
+    error: &std::io::Error,
+    offline_only: bool,
+    reboot_pending: bool,
+) -> String {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        "The required native Windows sandbox rejected inherited service credentials in the parent environment. Close Swift and reopen it from a clean app or terminal session without service credentials."
+            .to_owned()
+    } else if reboot_pending {
+        format!(
+            "Required Windows sandbox (PSEC 1.1) is unavailable because a Windows Update restart is pending. Restart Windows to finish installing updates, then reopen Swift. No model files were downloaded. ({error})"
+        )
+    } else if offline_only {
+        format!(
+            "Required Windows sandbox (PSEC 1.1) is unavailable on this Windows build. Open Settings > Windows Update, install the latest Windows updates, restart Windows, and reopen Swift. No model files were downloaded. ({error})"
+        )
+    } else {
+        format!(
+            "Required Windows sandbox (PSEC 1.1 with container-hosted loopback) is unavailable on this Windows build. Open Settings > Windows Update, install the latest Windows updates, restart Windows, and reopen Swift. No model files were downloaded. ({error})"
+        )
+    }
+}
+
 impl Operations for Native {
+    fn check_sandbox(&mut self, request: &Request) -> crate::Result<()> {
+        if request.speech_models_only {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            if request.preparation_stage == PreparationStage::Speech {
+                // Reject inherited credentials before downloading speech assets
+                // without creating a throwaway PSEC container on cached launches.
+                bonsai_windows_process::validate_sandbox_environment().map_err(|error| {
+                    sandbox_preflight_error(
+                        &error,
+                        false,
+                        bonsai_windows_process::windows_reboot_pending(),
+                    )
+                })?;
+                return Ok(());
+            }
+            // Only probe a throwaway PSEC container on first-run setup before
+            // downloading multi-gigabyte model/runtime artifacts. Cached launches
+            // admit the real broker policy once without extra preflight overhead.
+            if setup::kind(request)? == "first-run" {
+                let offline_only = request.native_engine;
+                let probe = if offline_only {
+                    bonsai_windows_process::native_sandbox_offline_available()
+                } else {
+                    bonsai_windows_process::native_sandbox_available()
+                };
+                probe.map_err(|error| {
+                    sandbox_preflight_error(
+                        &error,
+                        offline_only,
+                        bonsai_windows_process::windows_reboot_pending(),
+                    )
+                })?;
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = request;
+        Ok(())
+    }
+
     fn artifacts(&mut self, request: &Request, working: &Path) -> crate::Result<()> {
         setup::prepare(request, working)
     }
@@ -1150,6 +1219,7 @@ fn prepare_backend(
         format!("Swift cannot create its data folder {}: {error}. Choose a writable local folder and launch again.", request.data_directory.display())
     })?;
     external(&request.data_directory)?;
+    operations.check_sandbox(&request)?;
     let model_apps = if stage == PreparationStage::Model && !request.speech_models_only {
         operations.model_apps(&request, &app_packages, working)?
     } else {

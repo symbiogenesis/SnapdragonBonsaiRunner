@@ -1688,3 +1688,97 @@ fn session_options_0_1_32_validate_and_forward_in_chat_launch() -> crate::Result
     }
     Ok(())
 }
+
+#[test]
+fn sandbox_preflight_stops_before_downloads_and_formats_reboot_and_update_guidance()
+-> crate::Result<()> {
+    let unsupported = std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native PSEC containment: API set is not implemented",
+    );
+    let reboot = sandbox_preflight_error(&unsupported, true, true);
+    assert!(reboot.contains("Windows sandbox"));
+    assert!(reboot.contains("restart is pending"));
+    assert!(reboot.contains("No model files were downloaded"));
+
+    let offline = sandbox_preflight_error(&unsupported, true, false);
+    assert!(offline.contains("PSEC 1.1"));
+    assert!(offline.contains("Windows Update"));
+    assert!(!offline.contains("loopback"));
+
+    let loopback = sandbox_preflight_error(&unsupported, false, false);
+    assert!(loopback.contains("container-hosted loopback"));
+    assert!(loopback.contains("Windows Update"));
+
+    let env_error = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "sandbox launch rejects inherited credential environment variables",
+    );
+    let env_message = sandbox_preflight_error(&env_error, false, false);
+    assert!(env_message.contains("inherited service credentials"));
+
+    struct FailingSandbox(Recorder);
+
+    impl Operations for FailingSandbox {
+        fn check_sandbox(&mut self, _request: &Request) -> crate::Result<()> {
+            Err(
+                "Required Windows sandbox (PSEC 1.1) is unavailable because a Windows Update restart is pending."
+                    .into(),
+            )
+        }
+        fn artifacts(&mut self, request: &Request, working: &Path) -> crate::Result<()> {
+            self.0.artifacts(request, working)
+        }
+        fn inference(&mut self, request: &Request, working: &Path) -> crate::Result<()> {
+            self.0.inference(request, working)
+        }
+        fn models(
+            &mut self,
+            request: &Request,
+            model: &str,
+            working: &Path,
+        ) -> crate::Result<Value> {
+            self.0.models(request, model, working)
+        }
+        fn apps(
+            &mut self,
+            request: &Request,
+            packages: &[&str],
+            working: &Path,
+        ) -> crate::Result<Value> {
+            self.0.apps(request, packages, working)
+        }
+        fn native(
+            &mut self,
+            request: &Request,
+            model: &str,
+            working: &Path,
+        ) -> crate::Result<Value> {
+            self.0.native(request, model, working)
+        }
+        fn keys(&mut self, parent: &Path) -> crate::Result<PathBuf> {
+            self.0.keys(parent)
+        }
+        fn launch(
+            &mut self,
+            executable: &Path,
+            arguments: &[OsString],
+            working: &Path,
+            environment: &BTreeMap<String, String>,
+        ) -> crate::Result<u32> {
+            self.0.launch(executable, arguments, working, environment)
+        }
+    }
+
+    let setup_fixture = fixture("sandbox-preflight")?;
+    let mut recorder = FailingSandbox(Recorder::new(setup_fixture.root));
+    let result = prepare_backend(
+        plan(setup_fixture.request)?,
+        &mut recorder,
+        &setup_fixture.working,
+    );
+    assert!(result.is_err_and(|error| error.contains("restart is pending")));
+    assert!(recorder.0.events.is_empty());
+    assert!(recorder.0.artifact_requests.is_empty());
+    Ok(())
+}
