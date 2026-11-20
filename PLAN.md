@@ -874,11 +874,15 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   (`bonsai-cpu-policy::daisyrose` lock schema/resolver with
   `pinned_daisyrose_lora_artifact` returning `Ok(None)`, `bonsai-tools provision`
   `daisyrose-lora` with `verify_multi_rank_lora_gguf`, `chat_launch::setup`
-  auto-setup hook + `bonsai-chat` startup progress stage, and `--no-daisyrose-lora`
-  across CLI/`chat_launch`/`chat_package`/`bonsai-chat`) are complete;
-  `config/daisyrose-lora.lock.json`, `MULTI_RANK_LORA_RELEASE` enablement,
-  matched-power X1/X2 measurements, held-out human review and owning CI remain
-  open.
+  auto-setup hook + `bonsai-chat` startup progress stage, `--no-daisyrose-lora`
+  across CLI/`chat_launch`/`chat_package`/`bonsai-chat`/`bonsai-broker`,
+  and promoted default-on broker/UI plumbing (lock `effective_default_scale_*`
+  helpers, broker promoted-pin auto-resolution, exact lock-digest enforcement,
+  tight-RAM shedding, default-scale request policy and readiness reporting,
+  and fresh/new-conversation UI initialization preserving saved workspaces)) are
+  complete; `config/daisyrose-lora.lock.json`, `MULTI_RANK_LORA_RELEASE`
+  enablement, matched-power X1/X2 measurements, held-out human review and
+  owning CI remain open.
 
 ### Memory and profiles
 
