@@ -153,9 +153,13 @@ candidate (`scale in {0.0, 0.25, 0.5, 0.75, 1.0}`):
 4. **Native runtime (`DR-C1`) & Runner integration (`DR-C2`)**: Stackable opt-in
    `MultiRankAdapter` runtime wiring (`DR-C1` in `prism-inference`) and Runner
    artifact, `bonsai-cpu-policy::context` accounting, canonical broker validation,
-   default-off Settings controls, and CLI/prefetch forwarding (`DR-C2`, unpinned)
-   are implemented and smoke-vetted locally on a 4-layer `npu-friendly` F16 export
-   at `scale = 0.0` (see
+   default-off Settings controls, CLI/prefetch forwarding, and gated-off download
+   provenance/provisioning/`chat_launch::setup`/`--no-daisyrose-lora` plumbing
+   (`DR-C2`, with `pinned_daisyrose_lora_artifact` returning `Ok(None)` and
+   `MULTI_RANK_LORA_RELEASE = None`) are implemented and smoke-vetted locally on a
+   4-layer `npu-friendly` F16 export at `scale = 0.0` (a follow-up AC vet
+   attempt closed at `120.629 s` with `budget-exceeded-not-published` during live
+   HTTP export before running any model arm; see
    [multi-rank wiring and vet](evidence/daisyrose-multirank-wiring-vet.md)).
    Promoting any DaisyRose adapter to production still requires `DR-B1` / `DR-G2`
    quality approval, Prism release repin in `config/prism-inference.lock.json`,

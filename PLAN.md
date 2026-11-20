@@ -853,10 +853,12 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   64 layers, scalar/NEON/tiled-prefill parity and `swift_model_check rollback`
   bit-exact state before repinning Prism. Local `..\prism-inference` source
   wiring (`39ae592`, `4c49f6f`, `5aab2f4`, `7d63f8a`), unit/example checks and a
-  bounded 27B `scale = 0.0` parity vet are complete
+  bounded 27B `scale = 0.0` parity vet are complete, while a follow-up AC vet
+  attempt exited at `120.629 s` (`budget-exceeded-not-published`) during live
+  HTTP export before running any model arm
   ([vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md)); live 27B
-  `:0.5` rollback on real weights, Prism release publication and lock repin
-  beyond `v0.1.32` remain open pending `DR-B1`/`DR-G2`.
+  `:0.5` rollback on real weights, Prism release publication beyond `v0.1.32`
+  and lock repin remain open pending `DR-B1`/`DR-G2`.
 - [ ] **DR-C2 — Wire Runner lockfile, memory accounting, UI controls and qualification gates.**
   Pin the verified adapter in `config/daisyrose-lora.lock.json`, charge exact
   factor payload (`4.00 MiB/rank` F16) and multi-rank scratch in
@@ -865,11 +867,18 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   `foundation`), matched-power X1/X2 throughput/RAM measurements and held-out
   human review under [Swift LoRA qualification](docs/swift-lora.md#standard-profile-qualification)
   and [promotion criteria](docs/validation.md#promotion-criteria). Local opt-in
-  Runner wiring (`647dc42e`, `fa982da5`, `82e100f5`, `fb5af9b5`, `f67f6b7a`) and
-  a bounded 4-layer `export-denoised` + `verify-adapter` vet are complete
-  ([vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md));
-  `config/daisyrose-lora.lock.json`, matched-power X1/X2 measurements, held-out
-  human review and owning CI remain open.
+  Runner wiring (`647dc42e`, `fa982da5`, `82e100f5`, `fb5af9b5`, `f67f6b7a`),
+  a bounded 4-layer `export-denoised` + `verify-adapter` vet
+  ([vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md)), and
+  gated-off download provenance, provisioning and opt-out plumbing
+  (`bonsai-cpu-policy::daisyrose` lock schema/resolver with
+  `pinned_daisyrose_lora_artifact` returning `Ok(None)`, `bonsai-tools provision`
+  `daisyrose-lora` with `verify_multi_rank_lora_gguf`, `chat_launch::setup`
+  auto-setup hook + `bonsai-chat` startup progress stage, and `--no-daisyrose-lora`
+  across CLI/`chat_launch`/`chat_package`/`bonsai-chat`) are complete;
+  `config/daisyrose-lora.lock.json`, `MULTI_RANK_LORA_RELEASE` enablement,
+  matched-power X1/X2 measurements, held-out human review and owning CI remain
+  open.
 
 ### Memory and profiles
 

@@ -87,3 +87,18 @@ Concise evidence record for opt-in stackable `MultiRankAdapter` (`F16`/`F32`, `N
 - Zero retraining was performed; the vet exercised exported denoised spikes (`layers: [0,3,31,63]`), not a qualified Track B (`DR-B1`) adapter.
 - `config/prism-inference.lock.json` remains pinned at `v0.1.32` (not repinned), and no `config/daisyrose-lora.lock.json` was created.
 - `DR-B1` (external OPD training), `DR-B2`/`DR-G2` `--publisher-engine` three-way quality screen, live 27B nonzero rollback and matched-power X1/X2 performance/RAM qualification, and owning CI (`source-checks`, `foundation`) remain open.
+
+## Follow-up AC-powered vet attempt (closed — HTTP export budget exceeded)
+
+A bounded AC-powered follow-up vet was launched to attempt the skipped `:0.5` rollback check and a matched-AC overhead arm without compilation inside the timer, and closed without completing any model arm:
+
+- **Predeclared budget and prebuilt inputs (`budgetSeconds: 300`, zero compilation inside timer):**
+  - `target\release\bonsai-tools.exe`: `12,482,560` bytes, SHA-256 `7c44c7e332a0e8f6b1a5943ac8a0edd77a9b6ff8ad83e3d8294507daf9b42331`.
+  - `..\prism-inference\target\release\examples\swift_model_check.exe`: `3,704,320` bytes, SHA-256 `eefa53205fee4b795d52db3ba52ca6f999e39b0d5f3e5ebc850a779b5859164c`.
+  - Existing local weights inspected at intake: `Swift-Bonsai-2-PQ2_0.gguf` (`7,206,168,928` bytes) and Orca rank-1 adapter (`9,682,464` bytes).
+- **Power (`GetSystemPowerStatus`):**
+  - Before: `ac_online: true` (`raw_ac_line_status: 1`), `battery_saver: false`, `battery_flag: 8`, `battery_percent: 65`.
+  - After: `ac_online: true` (`raw_ac_line_status: 1`), `battery_saver: false`, `battery_flag: 8`, `battery_percent: 66`.
+  - Endpoint AC snapshots alone do not rule out intervening changes, and no inference arm ran.
+- **Outcome:** `status: "failed"` at `totalElapsedSeconds: 120.629`. `bonsai-tools lora-diff-audit` (`export-denoised`) exceeded `timeBudgetSeconds: 120` during live Hugging Face HTTP Range streaming and exited with `export-denoised did not publish/complete: budget-exceeded-not-published`. All four model arms (`arm1`–`arm4`) and `comparisons` remained `null`, and temporary scratch cleanup completed (`scratchExistsAfter: false`).
+- **Disposition:** Closed without restart or retry per `AGENTS.md`. Future AC-powered 27B rollback and matched-AC performance trials should consume an already-local or pinned adapter rather than coupling live Hugging Face HTTP Range export into the inference trial clock.

@@ -730,7 +730,9 @@ builds. Native publication writes a bounded atomic bootstrap receipt with the
 snapshot digest and checked capabilities. Changed images receive their version
 handshake in Rust. Cache hits skip Cargo; rebuilds use content freshness without
 cache cleanup. `chat` and JSON `chat-launch` own option validation, provisioning,
-credentials, arguments and native app lifetime. Rust holds the persistent per-user
+credentials, arguments and native app lifetime (including `--daisyrose-lora` /
+`--no-daisyrose-lora` opt-in/opt-out forwarding, gated off by default while
+unpinned). Rust holds the persistent per-user
 instance lock until the owned app tree exits.
 Build variants use independent, flushed-and-atomically-published receipts.
 Non-build documentation/helper changes preserve reuse; referenced embedded
@@ -816,6 +818,11 @@ Windows ARM64 target. Each output stream is limited to 16 KiB; stdout remains
 separate from stderr. The result adds `Capabilities` and `CapabilityVerification`,
 including the retained evidence directory. No model is loaded or profile selected.
 This option requires a trusted current maintenance tool and rejects custom locks.
+
+`provision` operation `daisyrose-lora` downloads and verifies an explicit
+candidate DaisyRose multi-rank GGUF lock supplied via `lockPath` (using
+`verify_multi_rank_lora_gguf`), while rejecting unpinned default calls until a
+qualified adapter lock is promoted.
 
 `speech-build` plans the pinned ASR compiler and prepares speech model files.
 Its `environment` operation selects the ASR compiler/SDK environment; `build`
