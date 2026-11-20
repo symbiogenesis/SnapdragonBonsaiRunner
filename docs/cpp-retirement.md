@@ -127,10 +127,25 @@ helper functions inlined into `codec_buffers.hpp`) and leaving 20 checked-in C++
 files and 0 C files in Prism (20 Prism native files; 21 cross-repo including
 Runner's 1 C file), with all 19 `RequiredReferencePassedIds` in `baseline.json`
 off checked-in C++; complete Prism suite execution, native bridge compilation and
-owning hosted acceptance remain pending.
+owning hosted acceptance remain pending. A subsequent wave for
+`model_resolution.hpp` (`test-model-resolution` via `reference_model_resolution.rs`),
+`codec_buffers.hpp` (`test-quantize-perf` and `test-quantize-stats` via
+`reference_codec_buffers.rs`), `peg.hpp` (`test-peg-parser` and six nested
+`tests/peg-parser/*.cpp` suites via `reference_peg.rs`), `chat_templates.hpp`
+(`test-chat-template` via `reference_chat_templates.rs`), `chat_analysis.hpp`
+(`test-chat-analysis` via `reference_chat_analysis.rs`), `chat_parser.hpp`
+(`test-chat-peg-parser` via `reference_chat_parser.rs`), `chat_auto.hpp`
+(`test-chat-auto-parser` via `reference_chat_auto.rs`), and `chat.hpp` plus the
+`prism-upstream-server-context` CMake target (`test-chat` via `reference_chat.rs`)
+additionally passes `rustfmt --check`, Release Clippy, and all 128 focused
+`reference_*` tests on integrated Prism `main` (`2cd3f25`), removing those 8
+C++ headers and the server-context CMake target and leaving 12 checked-in C++
+files and 0 C files in Prism (12 Prism native files; 13 cross-repo including
+Runner's 1 C file `tools/hexagon/windows_queue_abi.c`); complete Prism suite
+execution, native bridge compilation and owning hosted acceptance remain pending.
 
 The [checked-in boundary verifier](../tools/ci/README.md#checked-in-native-retirement-boundary)
-now binds Runner's remaining C file and the reviewed Prism snapshot's 20 C++
+now binds Runner's remaining C file and the reviewed Prism snapshot's 12 C++
 files plus migrated Rust assertion/provider edges.
 Exact per-file families and declared
 compiler/provider/contracts identities preserve the green-ID baseline and both
