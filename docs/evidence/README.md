@@ -19,6 +19,7 @@ consumers below without installing or executing the recorded Python tools.
 | `lora-weight-edit/` | [Direct LoRA weight edit](lora-weight-edit.md): independent edit derivation, candidate digest, complete factual, storage, supervision and power review |
 | [DaisyRose task-vector audit](daisyrose-task-vector-audit.md) | Closed Gate 1 (`DR1`) no-go summary for raw BF16 task-vector LoRA extraction (`E(32) = 14.26% < 50%`) |
 | [DaisyRose spectral-denoising audit](daisyrose-spectral-denoising-audit.md) | Closed Track A (`DR-A1`) empirical Rademacher-null + Gavish–Donoho summary (`saturated-high-rank-tail`, `81.98%` bulk, Track A standalone `DR-A2` no-go) |
+| [DaisyRose multi-rank wiring & bounded vet](daisyrose-multirank-wiring-vet.md) | Source-bound Prism + Runner multi-rank wiring commits, local verification counts, bounded 4-layer F16 export/verify and 27B `scale = 0.0` parity vet (live `:0.5` rollback arm skipped; repin/lock/CI open) |
 | `hexagon-public-qaic-41171859264/` | [Signed-Q2 source lock](../../config/hexagon-signed-q2-candidate.lock.json), public-wire review and [Windows ABI replay inputs](../../tools/hexagon/windows_queue_abi.ps1) |
 | `hexagon-public-qaic-41169481882/provenance.json` | Supplemental template notices referenced by the current [QAIC provenance](hexagon-public-qaic-41171859264/provenance.json) |
 | Hexagon operation, traffic, session-budget and K-tiling ledgers | [Static policy verifiers](../../tools/hexagon/README.md) |

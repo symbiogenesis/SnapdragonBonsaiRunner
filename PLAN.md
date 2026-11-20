@@ -851,7 +851,12 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   `RankOneAdapter`, preserving exact `scale = 0.0` bypass, `graph.identity`
   invalidation, `adapter_affects_any` fused Hexagon NPU FFN execution across all
   64 layers, scalar/NEON/tiled-prefill parity and `swift_model_check rollback`
-  bit-exact state before repinning Prism.
+  bit-exact state before repinning Prism. Local `..\prism-inference` source
+  wiring (`39ae592`, `4c49f6f`, `5aab2f4`, `7d63f8a`), unit/example checks and a
+  bounded 27B `scale = 0.0` parity vet are complete
+  ([vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md)); live 27B
+  `:0.5` rollback on real weights, Prism release publication and lock repin
+  beyond `v0.1.32` remain open pending `DR-B1`/`DR-G2`.
 - [ ] **DR-C2 — Wire Runner lockfile, memory accounting, UI controls and qualification gates.**
   Pin the verified adapter in `config/daisyrose-lora.lock.json`, charge exact
   factor payload (`4.00 MiB/rank` F16) and multi-rank scratch in
@@ -859,7 +864,12 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   with canonical broker validation, and close owning CI (`source-checks`,
   `foundation`), matched-power X1/X2 throughput/RAM measurements and held-out
   human review under [Swift LoRA qualification](docs/swift-lora.md#standard-profile-qualification)
-  and [promotion criteria](docs/validation.md#promotion-criteria).
+  and [promotion criteria](docs/validation.md#promotion-criteria). Local opt-in
+  Runner wiring (`647dc42e`, `fa982da5`, `82e100f5`, `fb5af9b5`, `f67f6b7a`) and
+  a bounded 4-layer `export-denoised` + `verify-adapter` vet are complete
+  ([vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md));
+  `config/daisyrose-lora.lock.json`, matched-power X1/X2 measurements, held-out
+  human review and owning CI remain open.
 
 ### Memory and profiles
 

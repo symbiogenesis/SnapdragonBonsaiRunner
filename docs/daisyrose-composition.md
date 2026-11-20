@@ -150,12 +150,16 @@ candidate (`scale in {0.0, 0.25, 0.5, 0.75, 1.0}`):
    truncation or pathological repetition/loop rates.
 3. **Creative & Orca non-regression**: Thinking-OFF creative prose quality,
    conciseness, and Orca refusal behavior match or exceed `scale = 0.0`.
-4. **Native runtime (`DR-C1`) & Runner integration (`DR-C2`)**: Only after
-   `DR-G2` passes, extend `prism-inference` with stackable `MultiRankAdapter`
-   (preserving `RankOneAdapter`, exact `scale = 0.0` bypass, `graph.identity`
-   checkpoint invalidation, `adapter_affects_any` NPU FFN routing, and
-   `swift_model_check rollback` bit-exact parity), then wire
-   `config/daisyrose-lora.lock.json`, `bonsai-cpu-policy::context` memory
-   accounting, default-off Settings controls, owning CI, and matched-power
+4. **Native runtime (`DR-C1`) & Runner integration (`DR-C2`)**: Stackable opt-in
+   `MultiRankAdapter` runtime wiring (`DR-C1` in `prism-inference`) and Runner
+   artifact, `bonsai-cpu-policy::context` accounting, canonical broker validation,
+   default-off Settings controls, and CLI/prefetch forwarding (`DR-C2`, unpinned)
+   are implemented and smoke-vetted locally on a 4-layer `npu-friendly` F16 export
+   at `scale = 0.0` (see
+   [multi-rank wiring and vet](evidence/daisyrose-multirank-wiring-vet.md)).
+   Promoting any DaisyRose adapter to production still requires `DR-B1` / `DR-G2`
+   quality approval, Prism release repin in `config/prism-inference.lock.json`,
+   pinning `config/daisyrose-lora.lock.json`, live nonzero rollback and matched-power
    X1/X2 device qualification under [validation](validation.md) and
-   [Swift LoRA qualification](swift-lora.md#standard-profile-qualification).
+   [Swift LoRA qualification](swift-lora.md#standard-profile-qualification), and
+   owning CI (`source-checks`, `foundation`).
