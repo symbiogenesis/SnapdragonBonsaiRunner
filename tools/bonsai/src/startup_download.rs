@@ -80,6 +80,15 @@ fn digest_matches(file: &mut File, bytes: u64, sha256: &str) -> crate::Result<bo
     if file.metadata().map_err(|error| error.to_string())?.len() != bytes {
         return Err("Artifact byte length differs from its lock.".into());
     }
+    #[cfg(windows)]
+    if let Some(digest) = bonsai_windows_credentials::try_hash_locked_file_mapped(
+        file,
+        bytes,
+        &mut repair_checkpoint,
+        |error| error.to_string(),
+    )? {
+        return Ok(hex::encode(digest).eq_ignore_ascii_case(sha256));
+    }
     file.seek(SeekFrom::Start(0))
         .map_err(|error| error.to_string())?;
     let (_, hash) =
