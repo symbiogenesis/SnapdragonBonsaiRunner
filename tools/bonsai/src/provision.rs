@@ -321,7 +321,7 @@ fn daisyrose_lora(request: &Request, working: &Path) -> crate::Result<Value> {
     } else {
         bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&request.data_directory)?.ok_or_else(
             || {
-                "No pinned DaisyRose multi-rank LoRA lock is compiled yet (DR-B1/DR-G2 pending); supply an explicit lockPath for a candidate lock.".to_owned()
+                "No pinned DaisyRose multi-rank LoRA lock is compiled yet (DR-E1/DR-G2 pending); supply an explicit lockPath for a candidate lock.".to_owned()
             },
         )?
     };

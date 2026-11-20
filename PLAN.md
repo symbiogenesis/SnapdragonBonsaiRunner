@@ -804,50 +804,66 @@ Gate 1 (`DR1`) of raw BF16 task-vector LoRA extraction from Apache-2.0
 [DaisyRose-27B](https://www.radixark.com/blog/daisyrose-27b)
 (`RadixArk/DaisyRose-27B` vs `Qwen/Qwen3.8-27B`, `qwen35`) onto immutable
 `Swift-Bonsai-2` closed **no-go (`no-go-high-rank`)** ([DR1 summary](docs/evidence/daisyrose-task-vector-audit.md)),
-and Track A Gate `DR-A1` (`bonsai-tools lora-diff-audit` Rademacher-null +
+and Gate `DR-A1` (`bonsai-tools lora-diff-audit` Rademacher-null +
 Gavish–Donoho denoising across 16 `npu-friendly` matrices in `[0, 3, 31, 63]`)
-closed standalone zero-shot BF16 export (`DR-A2`) **no-go (`saturated-high-rank-tail`)**:
-while denoising stripped `81.98%` bulk noise and isolated `15.71%` coherent
-spike energy (`6.75x` mean / `14.92x` peak, `E_denoised(16) = 69.21%`,
-`E_denoised(32) = 85.27%`), `13/16` matrices remained saturated above the bulk
-edge at rank 64 (`meanAboveBulkRank = 57.69`; see [DR-A1 summary](docs/evidence/daisyrose-spectral-denoising-audit.md)).
-Do not reopen standalone BF16 task-vector LoRA transfer (`DR1`–`DR4` / `DR-A2`);
-`export-denoised` remains available only for an optional rank-16/32 warm-start
-of Track B.
-Composing DaisyRose capability, Bonsai quantization and Swift anti-looping
-follows the [hybrid composition contract](docs/daisyrose-composition.md) via
-**Track B Dual-Anchor On-Policy Distillation (`DR-B1`)** under the NPU-friendly
-staged target envelope (`ffn_down` + full-attention
+stripped `81.98%` bulk noise and isolated `15.71%` coherent spike energy
+(`6.75x` mean / `14.92x` peak, `E_denoised(16) = 69.21%`, `E_denoised(32) = 85.27%`)
+while `13/16` matrices remained above the bulk edge at rank 64
+(`meanAboveBulkRank = 57.69`; see [DR-A1 summary](docs/evidence/daisyrose-spectral-denoising-audit.md)).
+Full-on retraining and external GPU On-Policy Distillation (`Track B` / `DR-B1`)
+are **permanently retired**, superseding the prior `DR-A1` standalone-export
+stop. Under the [hybrid composition contract](docs/daisyrose-composition.md),
+the active plan is **zero-retraining direct stacking (`DR-E1` -> `DR-G2`)** under
+the `npu-friendly` envelope (`ffn_down` + full-attention
 `attn_q`/`attn_k`/`attn_v`/`attn_output` at `4.00 MiB/rank` F16, preserving all
 64 Hexagon NPU `external_ffn_swiglu` chains and excluding `ssm_out` until `P1`
-resolves grouped-SSM channel order). Direct quantized `DaisyRose-27B` remains
-under the separate high-RAM reference boundary in
+resolves grouped-SSM channel order), with **pure-Rust direct weight editing (`DR-W1`)**
+as the remediation path only if the unedited stacked LoRA fails `DR-G2`. Direct
+quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary in
 [model selection](docs/model-selection.md#selection-boundary). Checked-in
 `bonsai-tools lora-diff-audit` (including spectral denoising, `export-denoised`
 and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
 (`source-checks`, `foundation`) acceptance.
 
-- [ ] **DR-B1 — External Dual-Anchor On-Policy Distillation (OPD) LoRA on `Swift-Bonsai-2` (Track B).**
-  Train an Apache-2.0 `npu-friendly` F16 LoRA (`r = 16` or `32`, optionally
-  warm-started from `DR-A1` denoised spikes via `export-denoised`) externally
-  outside this repository on `Swift-Bonsai-2` activations using on-policy
-  rollouts, `RadixArk/DaisyRose-27B` teacher top-64 Reverse-KL, and a
-  `Swift-Bonsai-2` anti-looping KL/budget anchor preserving `~39.8%` shorter
-  thinking traces (`<= 1.10x` Swift median thinking tokens). Keep held-out
-  evaluation splits strictly disjoint.
-- [ ] **DR-B2 / DR-G2 — Native Rust GGUF verification and `--publisher-engine` three-way screen.**
-  Verify candidate GGUF adapters locally in pure Rust with
-  `bonsai-tools lora-diff-audit` `operation: "verify-adapter"` (finite F16/F32
-  factors, `Swift-Bonsai-2` shapes, dual `adapter.lora.alpha`/`adapter.lora_alpha`
-  equality, NPU/SSM boundary checks), then screen via `--publisher-engine`
-  `--lora-scaled` stacked with Orca `1.3` before touching `prism-inference` or UI:
-  require (1) Thinking-ON coding/reasoning/IF gain over `scale = 0.0`,
-  (2) Swift anti-looping preservation (`<= 1.10x` thinking tokens, zero extra
-  `4,096`-token truncation/loops), and (3) Thinking-OFF creative prose & Orca
-  non-regression. Pure-Rust `dr-g2-plan`, fail-closed `dr-g2-score`, and
-  [Track B handoff / promotion spec](docs/daisyrose-composition.md#external-track-b-dr-b1-training-handoff-and-promotion-checklist)
-  are checked in (`574b961a`); candidate training (`DR-B1`), actual-model screen
-  capture, and external human review remain open.
+- [ ] **DR-E1 — Extract full 64-layer zero-retraining spectral-denoised `npu-friendly` LoRA and verify in pure Rust.**
+  Run `bonsai-tools lora-diff-audit` `operation: "export-denoised"` across all
+  64 layers (`128` `npu-friendly` pairs, `F16`, `r = 16` first at `64 MiB`,
+  optional `r = 32` at `128 MiB`) from pinned `RadixArk/DaisyRose-27B` vs
+  `Qwen/Qwen3.8-27B` (using local shards or a dedicated extraction pass
+  decoupled from inference timers; if live HF streaming exceeds
+  `timeBudgetSeconds <= 900`, add pure-Rust layer-chunked GGUF merge rather than
+  inflating inference trials), then verify finiteness, dual alpha equality, and
+  NPU/SSM bounds with `verify-adapter`.
+- [ ] **DR-G2 — Direct-stack three-way empirical screen on `Swift-Bonsai-2` + Orca `1.3`.**
+  Stack the unedited `DR-E1` LoRA directly on top of `Swift-Bonsai-2-PQ2_0.gguf`
+  + Orca `1.3` via `--publisher-engine` `--lora-scaled` across `scaleGrid` (e.g.
+  `[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`) and score fail-closed with
+  `dr-g2-plan` / `dr-g2-score` (`trainingPromptSha256s: []`) under the
+  [zero-retraining workflow and promotion checklist](docs/daisyrose-composition.md#zero-retraining-workflow-direct-edit-fallback-and-promotion-checklist):
+  require (1) Thinking-ON coding/reasoning/IF gain over `scale = 0.0` with zero
+  category regression, (2) Swift anti-looping preservation (`<= 1.10x` thinking
+  tokens, zero extra loops or `4,096`-token truncations), (3) Thinking-OFF
+  creative prose & Orca non-regression, and (4) zero-scale bit identity. If it
+  passes as-is, skip `DR-W1` and proceed directly to `DR-C1`/`DR-C2`; if it
+  fails, capture exact per-category/prompt failure modes for `DR-W1`. Pure-Rust
+  `dr-g2-plan`/`dr-g2-score` tooling is checked in (`574b961a`); actual
+  full-adapter screen capture and independent human review remain open.
+- [ ] **DR-W1 — Conditional pure-Rust direct weight editing on the multi-rank LoRA if `DR-G2` fails (zero retraining).**
+  Triggered only if the unedited `DR-E1` stack fails `DR-G2`; keep
+  `Swift-Bonsai-2`'s packed ternary base immutable and stay inside `npu-friendly`
+  with zero GPU/gradient retraining. Start with algebraic factor edits (rank
+  `16 -> 32`, shrinkage / unshrunk-spike retention, per-family/per-layer gain &
+  depth masking, singular-mode/coefficient pruning and norm capping generalizing
+  `adapter-edit`, and Orca subspace orthogonalization at overlapping sites); if
+  behavioral or manifold defects persist, apply bounded closed-form
+  activation-guided pure-Rust edits (`weight-patch` PDHG sparse LP vs
+  constant-steering baseline folded/appended at `ffn_down`, or
+  `ffn-surrogate`-style closed-form ridge realignment of `A`/`B` on bounded
+  `Swift-Bonsai-2` captures). Keep any diagnostic/fit prompts strictly disjoint
+  from final untouched held-out `DR-G2` prompts (`trainingPromptSha256s`),
+  re-verify with `verify-adapter`, and re-score fail-closed with `dr-g2-score`;
+  if bounded direct edits still fail `DR-G2`, record the no-go outcome and
+  leave `config/daisyrose-lora.lock.json` unpinned.
 - [ ] **DR-C1 — Extend `prism-inference` for stackable `MultiRankAdapter` after `DR-G2` passes.**
   Generalize `prism-inference` (`src/model/lora.rs`) beyond rank-1
   `RankOneAdapter` to support a stackable `MultiRankAdapter` alongside
@@ -860,7 +876,7 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   `:0.0` parity / `:0.5` perturbation / `:0.5` full-state `rollback` vet
   (`status: "passed"` in `33.875 s`; [vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md))
   are complete; Prism release publication beyond `v0.1.32` and lock repin
-  remain open pending `DR-B1`/`DR-G2`.
+  remain open pending `DR-E1`/`DR-G2` (and conditional `DR-W1`).
 - [ ] **DR-C2 — Wire Runner lockfile, memory accounting, UI controls and qualification gates.**
   Pin the verified adapter in `config/daisyrose-lora.lock.json`, charge exact
   factor payload (`4.00 MiB/rank` F16) and multi-rank scratch in

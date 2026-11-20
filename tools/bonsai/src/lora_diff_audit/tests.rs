@@ -1320,7 +1320,7 @@ fn generate_lock_builds_valid_daisyrose_lock_and_rejects_synthetic_default_enabl
     assert_eq!(synth_lock_res["lock"]["defaultEnabled"], false);
 
     // Non-synthetic npu-friendly adapter succeeds with defaultEnabled=true and round-trips through cpu-policy.
-    let trained_gguf = scratch.join("trained-candidate.gguf");
+    let candidate_gguf = scratch.join("denoised-candidate.gguf");
     let make_pair =
         |name: &str, in_f: usize, out_f: usize, rank: usize| -> crate::Result<ExportTensorPair> {
             let u: Vec<Vec<f32>> = (0..rank).map(|_| vec![0.01_f32; out_f]).collect();
@@ -1337,10 +1337,13 @@ fn generate_lock_builds_valid_daisyrose_lock_and_rejects_synthetic_default_enabl
             })
         };
     let written = write_lora_gguf(
-        &trained_gguf,
+        &candidate_gguf,
         ExportDtype::F16,
         4.0,
-        &[("bonsai.composition.method", "dual-anchor-opd-v1")],
+        &[(
+            "bonsai.composition.method",
+            "rademacher-null-gavish-donoho-v1",
+        )],
         &[
             make_pair("blk.3.attn_k.weight", 5_120, 1_024, 4)?,
             make_pair("blk.3.attn_v.weight", 5_120, 1_024, 4)?,
@@ -1351,7 +1354,7 @@ fn generate_lock_builds_valid_daisyrose_lock_and_rejects_synthetic_default_enabl
     let lock_res = run(json!({
         "schemaVersion": 1,
         "operation": "generate-lock",
-        "adapterPath": trained_gguf,
+        "adapterPath": candidate_gguf,
         "outputPath": lock_path,
         "lockSource": source_meta,
         "defaultEnabled": true,

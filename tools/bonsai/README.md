@@ -64,8 +64,8 @@ the GGUF byte length unchanged. Native sparse execution is separately required
 for memory or arithmetic savings. Neither retained weight energy nor a factual
 smoke establishes broad quality or an inference-speed improvement.
 
-`lora-diff-audit` runs Gate 1 (`DR1`), Track A spectral-denoising (`DR-A1`/
-`DR-A2`), and Track B/G2 GGUF adapter verification against
+`lora-diff-audit` runs Gate 1 (`DR1`), spectral-denoising audit/export (`DR-A1`/
+`DR-E1`), and `DR-G2` GGUF adapter verification/readiness against
 `RadixArk/DaisyRose-27B` vs `Qwen/Qwen3.8-27B` (or `local-directories` fixtures)
 via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
 - `"plan"` / `"audit"`: requires `source` (`{"kind":"pinned-daisyrose"}` or

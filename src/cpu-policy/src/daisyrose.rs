@@ -296,7 +296,7 @@ pub fn daisyrose_lora_artifact_from_lock(
 
 /// Resolve the compiled pinned DaisyRose multi-rank `LoRA` artifact if one has been promoted.
 ///
-/// Remains `Ok(None)` until Track B (`DR-B1`), `DR-G2`, and Prism `v0.1.33+` promotion
+/// Remains `Ok(None)` until zero-retraining extraction / direct weight editing (`DR-E1`/`DR-W1`), `DR-G2`, and Prism `v0.1.33+` promotion
 /// publish a verified `config/daisyrose-lora.lock.json` artifact.
 ///
 /// # Errors
