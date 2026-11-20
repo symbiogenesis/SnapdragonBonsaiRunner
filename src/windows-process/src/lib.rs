@@ -43,6 +43,15 @@ impl MappedFile {
         native::mmap::map_readonly_file(file).map(Self)
     }
 
+    /// Map an open read-only file handle into memory without calling `PrefetchVirtualMemory`.
+    ///
+    /// Prefer this when pages were already brought into the OS file cache (for example,
+    /// right after SHA-256 verification) or when sections such as vocabulary embeddings are
+    /// accessed sparsely by row.
+    pub fn from_file_without_prefetch(file: &std::fs::File) -> io::Result<Self> {
+        native::mmap::map_readonly_file_with_prefetch(file, false).map(Self)
+    }
+
     /// Borrow the mapped bytes as an immutable slice.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
@@ -2403,9 +2412,15 @@ mod storage_budget_tests {
         assert!(!mapped.is_empty());
         assert_eq!(mapped.as_slice(), payload.as_slice());
 
+        let opened = fs::File::open(&data_path)?;
+        let no_prefetch = MappedFile::from_file_without_prefetch(&opened)?;
+        assert_eq!(no_prefetch.as_slice(), payload.as_slice());
+
         let empty_path = tree.0.join("empty.bin");
         fs::write(&empty_path, b"")?;
         assert!(MappedFile::open(&empty_path).is_err());
+        let empty_file = fs::File::open(&empty_path)?;
+        assert!(MappedFile::from_file_without_prefetch(&empty_file).is_err());
 
         let dir_handle = fs::File::open(&tree.0);
         if let Ok(file) = dir_handle {

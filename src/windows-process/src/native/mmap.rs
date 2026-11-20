@@ -49,6 +49,13 @@ impl NativeMappedFile {
 }
 
 pub(crate) fn map_readonly_file(file: &File) -> io::Result<NativeMappedFile> {
+    map_readonly_file_with_prefetch(file, true)
+}
+
+pub(crate) fn map_readonly_file_with_prefetch(
+    file: &File,
+    prefetch: bool,
+) -> io::Result<NativeMappedFile> {
     let metadata = file.metadata()?;
     if !metadata.is_file() || (metadata.file_attributes() & REPARSE_ATTRIBUTE) != 0 {
         return Err(super::invalid(
@@ -79,14 +86,16 @@ pub(crate) fn map_readonly_file(file: &File) -> io::Result<NativeMappedFile> {
         len,
         _section: section,
     };
-    let entry = WIN32_MEMORY_RANGE_ENTRY {
-        VirtualAddress: mapped.ptr.as_ptr().cast(),
-        NumberOfBytes: mapped.len,
-    };
-    // SAFETY: `GetCurrentProcess` returns the pseudo-handle for this process.
-    let process = unsafe { GetCurrentProcess() };
-    // SAFETY: `mapped` owns the live mapped view covering `[VirtualAddress, +len)`.
-    // Prefetch is advisory only; unsupported volumes ignore failure safely.
-    let _ = unsafe { PrefetchVirtualMemory(process, 1, &raw const entry, 0) };
+    if prefetch {
+        let entry = WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: mapped.ptr.as_ptr().cast(),
+            NumberOfBytes: mapped.len,
+        };
+        // SAFETY: `GetCurrentProcess` returns the pseudo-handle for this process.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: `mapped` owns the live mapped view covering `[VirtualAddress, +len)`.
+        // Prefetch is advisory only; unsupported volumes ignore failure safely.
+        let _ = unsafe { PrefetchVirtualMemory(process, 1, &raw const entry, 0) };
+    }
     Ok(mapped)
 }
