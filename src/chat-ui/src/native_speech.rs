@@ -292,6 +292,10 @@ impl Service {
         loop {
             call.check()?;
             service.check()?;
+            if matches!(listener_process_id(port), Ok(None)) {
+                thread::sleep(Duration::from_millis(15));
+                continue;
+            }
             match ready() {
                 Ok(()) => {
                     service.check_listener(port)?;
@@ -300,7 +304,7 @@ impl Service {
                     return Ok(service);
                 }
                 Err(Failure::Cancelled) => return Err(Failure::Cancelled),
-                Err(Failure::Message(_)) => thread::sleep(Duration::from_millis(100)),
+                Err(Failure::Message(_)) => thread::sleep(Duration::from_millis(15)),
             }
         }
     }
