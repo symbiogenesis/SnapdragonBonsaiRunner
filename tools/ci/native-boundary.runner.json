@@ -99,8 +99,8 @@
     },
     {
       "path": "Cargo.lock",
-      "bytes": 134515,
-      "sha256": "ee415d840f16dfbf25233aa2abdc931c139b66638c98d3579c107f1496861492",
+      "bytes": 140021,
+      "sha256": "260d866e41ce6efa20f256adb006f5195808f2fecfdf68f60932bb839d420b6c",
       "family": "native-asr"
     },
     {
