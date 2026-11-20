@@ -844,7 +844,10 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   require (1) Thinking-ON coding/reasoning/IF gain over `scale = 0.0`,
   (2) Swift anti-looping preservation (`<= 1.10x` thinking tokens, zero extra
   `4,096`-token truncation/loops), and (3) Thinking-OFF creative prose & Orca
-  non-regression.
+  non-regression. Pure-Rust `dr-g2-plan`, fail-closed `dr-g2-score`, and
+  [Track B handoff / promotion spec](docs/daisyrose-composition.md#external-track-b-dr-b1-training-handoff-and-promotion-checklist)
+  are checked in (`574b961a`); candidate training (`DR-B1`), actual-model screen
+  capture, and external human review remain open.
 - [ ] **DR-C1 — Extend `prism-inference` for stackable `MultiRankAdapter` after `DR-G2` passes.**
   Generalize `prism-inference` (`src/model/lora.rs`) beyond rank-1
   `RankOneAdapter` to support a stackable `MultiRankAdapter` alongside
@@ -852,13 +855,12 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   invalidation, `adapter_affects_any` fused Hexagon NPU FFN execution across all
   64 layers, scalar/NEON/tiled-prefill parity and `swift_model_check rollback`
   bit-exact state before repinning Prism. Local `..\prism-inference` source
-  wiring (`39ae592`, `4c49f6f`, `5aab2f4`, `7d63f8a`), unit/example checks and a
-  bounded 27B `scale = 0.0` parity vet are complete, while a follow-up AC vet
-  attempt exited at `120.629 s` (`budget-exceeded-not-published`) during live
-  HTTP export before running any model arm
-  ([vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md)); live 27B
-  `:0.5` rollback on real weights, Prism release publication beyond `v0.1.32`
-  and lock repin remain open pending `DR-B1`/`DR-G2`.
+  wiring (`39ae592`, `4c49f6f`, `5aab2f4`, `7d63f8a`), unit/example checks,
+  bounded 27B `scale = 0.0` parity vet, and an offline AC-powered 27B 4-layer
+  `:0.0` parity / `:0.5` perturbation / `:0.5` full-state `rollback` vet
+  (`status: "passed"` in `33.875 s`; [vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md))
+  are complete; Prism release publication beyond `v0.1.32` and lock repin
+  remain open pending `DR-B1`/`DR-G2`.
 - [ ] **DR-C2 — Wire Runner lockfile, memory accounting, UI controls and qualification gates.**
   Pin the verified adapter in `config/daisyrose-lora.lock.json`, charge exact
   factor payload (`4.00 MiB/rank` F16) and multi-rank scratch in
@@ -868,9 +870,8 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   human review under [Swift LoRA qualification](docs/swift-lora.md#standard-profile-qualification)
   and [promotion criteria](docs/validation.md#promotion-criteria). Local opt-in
   Runner wiring (`647dc42e`, `fa982da5`, `82e100f5`, `fb5af9b5`, `f67f6b7a`),
-  a bounded 4-layer `export-denoised` + `verify-adapter` vet
-  ([vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md)), and
-  gated-off download provenance, provisioning and opt-out plumbing
+  pure-Rust `generate-test-adapter` and `generate-lock` candidate lock tooling
+  (`574b961a`), gated-off download provenance, provisioning and opt-out plumbing
   (`bonsai-cpu-policy::daisyrose` lock schema/resolver with
   `pinned_daisyrose_lora_artifact` returning `Ok(None)`, `bonsai-tools provision`
   `daisyrose-lora` with `verify_multi_rank_lora_gguf`, `chat_launch::setup`
@@ -881,8 +882,8 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   tight-RAM shedding, default-scale request policy and readiness reporting,
   and fresh/new-conversation UI initialization preserving saved workspaces)) are
   complete; `config/daisyrose-lora.lock.json`, `MULTI_RANK_LORA_RELEASE`
-  enablement, matched-power X1/X2 measurements, held-out human review and
-  owning CI remain open.
+  enablement, matched-power full-adapter X1/X2 measurements, held-out human
+  review and owning CI remain open.
 
 ### Memory and profiles
 
