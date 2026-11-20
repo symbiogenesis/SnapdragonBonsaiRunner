@@ -498,6 +498,9 @@ pub(super) fn cpu_speculation_supported() -> Result<bool, LaunchError> {
 // matching readiness identity fields.
 const VISION_RELEASE: Option<(&str, &str)> =
     Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+// Multi-rank DaisyRose LoRA support stays gated off for the frozen v0.1.32 pin
+// until a reviewed Prism release publishes its release tuple here.
+const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = None;
 
 // CPU tiled prefill requires a separately reviewed native release supporting
 // `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
@@ -541,6 +544,15 @@ fn vision_release_matches(release: &ReleasePin) -> bool {
 pub(super) fn vision_supported() -> Result<bool, LaunchError> {
     let pin = release(LOCK)?;
     Ok(vision_release_matches(&pin))
+}
+
+fn multi_rank_lora_release_matches(release: &ReleasePin) -> bool {
+    reviewed_release_matches(release, MULTI_RANK_LORA_RELEASE)
+}
+
+pub(super) fn multi_rank_lora_supported() -> Result<bool, LaunchError> {
+    let pin = release(LOCK)?;
+    Ok(multi_rank_lora_release_matches(&pin))
 }
 
 pub(super) fn pinned_version() -> Result<String, LaunchError> {
@@ -908,6 +920,8 @@ mod tests {
         assert!(prompt_reuse_supported(&pin, false).is_ok());
         assert!(vision_supported()?);
         assert!(!vision_release_matches(&pin));
+        assert!(!multi_rank_lora_supported()?);
+        assert!(!multi_rank_lora_release_matches(&pin));
         Ok(())
     }
 

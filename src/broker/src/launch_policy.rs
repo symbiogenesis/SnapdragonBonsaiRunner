@@ -106,6 +106,28 @@ pub fn validate_environment(names: impl IntoIterator<Item = OsString>) -> Result
     Ok(())
 }
 
+/// Verified stackable multi-rank DaisyRose `LoRA` artifact selected for a native Swift launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaisyRoseLoraPlan {
+    /// Verified external filesystem path to the adapter GGUF.
+    pub path: PathBuf,
+    /// Exact byte length of the verified GGUF file.
+    pub bytes: u64,
+    /// Lowercase 64-hex SHA-256 of the verified GGUF file.
+    pub sha256: String,
+    /// Maximum factor rank across all verified target matrices.
+    pub max_rank: u16,
+}
+
+impl DaisyRoseLoraPlan {
+    /// Total host memory reserve (`bytes + DAISYROSE_SCRATCH_HEADROOM_BYTES`) budgeted for this adapter.
+    #[must_use]
+    pub const fn reserve_bytes(&self) -> Option<u64> {
+        self.bytes
+            .checked_add(bonsai_cpu_policy::DAISYROSE_SCRATCH_HEADROOM_BYTES)
+    }
+}
+
 /// Fixed, separately tokenized backend invocation; callers cannot add arguments.
 #[derive(Debug)]
 pub struct LaunchPlan {
@@ -119,6 +141,8 @@ pub struct LaunchPlan {
     pub mmproj: Option<bonsai_cpu_policy::SwiftMmprojArtifact>,
     /// Optional pinned adapter identity; never an arbitrary caller-supplied path.
     pub adapter: Option<bonsai_cpu_policy::AbliterateLoraArtifact>,
+    /// Optional verified stackable DaisyRose multi-rank adapter plan.
+    pub daisyrose_lora: Option<DaisyRoseLoraPlan>,
     /// Pinned archive path verified before launch.
     pub archive_path: PathBuf,
     /// Complete installed runtime directory.
@@ -141,20 +165,48 @@ pub struct LaunchPlan {
 impl LaunchPlan {
     /// Base process memory limit passed to the native child's `--memory-limit-bytes`.
     ///
-    /// When `mmproj` is enabled, the planner includes [`bonsai_cpu_policy::MMPROJ_RESERVE_BYTES`]
-    /// in [`Self::working_set_limit_bytes`] (and [`Self::memory_limit_bytes`]), while the native
-    /// child adds its own 768 MiB vision reserve on top of `--memory-limit-bytes + 4 GiB`
+    /// When `mmproj` or `daisyrose_lora` is enabled, the planner includes
+    /// [`bonsai_cpu_policy::MMPROJ_RESERVE_BYTES`] and `daisyrose.reserve_bytes()` in
+    /// [`Self::working_set_limit_bytes`] (and [`Self::memory_limit_bytes`]), while the native
+    /// child adds its own vision and multi-rank reserves on top of `--memory-limit-bytes + 4 GiB`
     /// during startup admission.
     #[must_use]
     pub fn native_child_memory_limit_bytes(&self) -> usize {
+        let mut reserve_u64 = 0_u64;
         if self.mmproj.is_some() {
-            usize::try_from(bonsai_cpu_policy::MMPROJ_RESERVE_BYTES)
+            reserve_u64 = reserve_u64.saturating_add(bonsai_cpu_policy::MMPROJ_RESERVE_BYTES);
+        }
+        if let Some(daisyrose) = &self.daisyrose_lora
+            && let Some(bytes) = daisyrose.reserve_bytes()
+        {
+            reserve_u64 = reserve_u64.saturating_add(bytes);
+        }
+        if reserve_u64 == 0 {
+            self.working_set_limit_bytes
+        } else {
+            usize::try_from(reserve_u64)
                 .ok()
                 .and_then(|reserve| self.working_set_limit_bytes.checked_sub(reserve))
                 .unwrap_or(self.working_set_limit_bytes)
-        } else {
-            self.working_set_limit_bytes
         }
+    }
+
+    /// Record a verified stackable DaisyRose multi-rank `LoRA` adapter on this launch plan.
+    ///
+    /// # Errors
+    /// Rejects duplicate registration or unsafe external paths.
+    #[cfg(windows)]
+    pub(crate) fn enable_daisyrose_lora(
+        &mut self,
+        adapter: DaisyRoseLoraPlan,
+    ) -> Result<(), PolicyError> {
+        if self.daisyrose_lora.is_some() {
+            return Err(PolicyError::Configuration);
+        }
+        validate_external_path(&adapter.path)?;
+        let _path_text = adapter.path.to_str().ok_or(PolicyError::Path)?;
+        self.daisyrose_lora = Some(adapter);
+        Ok(())
     }
 
     /// Apply a trusted memory-derived Swift context to this interactive launch.
@@ -329,6 +381,7 @@ impl LaunchPlan {
             model_path,
             mmproj: None,
             adapter,
+            daisyrose_lora: None,
             archive_path,
             runtime_directory,
             key_file: key_file.to_path_buf(),

@@ -54,8 +54,12 @@ impl JsonCandidateScratch {
         {
             let mut deserializer = simd_json::Deserializer::from_tape(tape);
             let result = match Object::<ClientChat<'_>>::deserialize(&mut deserializer) {
-                Ok(Object(chat)) if chat.abliteration_scale.is_none() => head.prepare_chat(&chat),
-                // Only parsed requests with an explicit `abliteration_scale`
+                Ok(Object(chat))
+                    if chat.abliteration_scale.is_none() && chat.daisyrose_scale.is_none() =>
+                {
+                    head.prepare_chat(&chat)
+                }
+                // Only parsed requests with explicit adapter scale fields
                 // delegate to production serde_json so decimal conversion
                 // matches exactly; schema failures already classify to
                 // `Rejection::ChatSchema` without re-parsing the full body.
@@ -90,6 +94,7 @@ mod tests {
         let head = || AuthorizedHead {
             length: declared_length,
             pinned_abliteration: pinned,
+            daisyrose_lora: false,
             context_tokens: crate::CONTEXT_TOKENS,
             vision: false,
         };
@@ -140,6 +145,7 @@ mod tests {
                     AuthorizedHead {
                         length: oversized.len(),
                         pinned_abliteration: false,
+                        daisyrose_lora: false,
                         context_tokens: crate::CONTEXT_TOKENS,
                         vision: false,
                     },

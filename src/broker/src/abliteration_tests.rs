@@ -6,11 +6,12 @@ use serde_json::{Value, json};
 
 const CHAT: &[u8] = br#"{"messages":[{"role":"user","content":"Write a scene."}]}"#;
 
-fn prepare(body: &[u8], enabled: bool) -> Result<PendingChat, Rejection> {
+fn prepare_with(body: &[u8], orca_enabled: bool, daisyrose_enabled: bool) -> Result<PendingChat, Rejection> {
     let key = "a".repeat(64);
     let mut policy = RequestPolicy::new(8080, &key)?;
     // Production can set this only inside the owned launcher's verified service.
-    policy.pinned_abliteration = enabled;
+    policy.pinned_abliteration = orca_enabled;
+    policy.daisyrose_lora = daisyrose_enabled;
     let request = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -21,6 +22,10 @@ fn prepare(body: &[u8], enabled: bool) -> Result<PendingChat, Rejection> {
         .body(())
         .map_err(|_| Rejection::Configuration)?;
     policy.check_head(&request.into_parts().0)?.prepare(body)
+}
+
+fn prepare(body: &[u8], enabled: bool) -> Result<PendingChat, Rejection> {
+    prepare_with(body, enabled, false)
 }
 
 fn body_with(scale: &str) -> String {
@@ -104,6 +109,51 @@ fn pinned_abliteration_scale_is_unavailable_without_verified_launch() {
             Err(Rejection::ChatSchema)
         ));
     }
+}
+
+#[test]
+fn stacked_daisyrose_lora_defaults_to_zero_maps_slot_ids_and_rejects_when_unconfigured()
+-> Result<(), Rejection> {
+    let canonical_with = |body: &[u8], orca: bool, daisy: bool| -> Result<Value, Rejection> {
+        let admitted = prepare_with(body, orca, daisy)?.admit(|_| Ok(1))?;
+        serde_json::from_slice(admitted.backend_body()).map_err(|_| Rejection::ChatSchema)
+    };
+
+    // Unconfigured DaisyRose rejects explicit daisyrose_scale.
+    let explicit_daisy =
+        br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.5}"#;
+    assert_eq!(
+        canonical_with(explicit_daisy, true, false).err(),
+        Some(Rejection::ChatSchema)
+    );
+    assert_eq!(
+        canonical_with(explicit_daisy, false, false).err(),
+        Some(Rejection::ChatSchema)
+    );
+
+    // Both active: Orca id 0 (default 1.3), DaisyRose id 1 (default 0.0).
+    let stacked_default = canonical_with(CHAT, true, true)?;
+    assert_eq!(
+        stacked_default["lora"],
+        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.0}])
+    );
+
+    let stacked_explicit = canonical_with(
+        br#"{"messages":[{"role":"user","content":"Write a scene."}],"abliteration_scale":1.5,"daisyrose_scale":0.5}"#,
+        true,
+        true,
+    )?;
+    assert_eq!(
+        stacked_explicit["lora"],
+        json!([{"id": 0, "scale": 1.5}, {"id": 1, "scale": 0.5}])
+    );
+
+    // DaisyRose only (no Orca): maps to slot id 0, defaulting to 0.0.
+    let daisy_only = canonical_with(explicit_daisy, false, true)?;
+    assert_eq!(daisy_only["lora"], json!([{"id": 0, "scale": 0.5}]));
+    let daisy_only_default = canonical_with(CHAT, false, true)?;
+    assert_eq!(daisy_only_default["lora"], json!([{"id": 0, "scale": 0.0}]));
+    Ok(())
 }
 
 #[cfg(windows)]

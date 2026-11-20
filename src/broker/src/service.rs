@@ -313,6 +313,12 @@ impl LocalChatService {
         self.policy.pinned_abliteration = true;
     }
 
+    /// Only the owned launcher can enable the already verified stackable DaisyRose adapter.
+    #[cfg(windows)]
+    pub(crate) const fn enable_daisyrose_lora(&mut self) {
+        self.policy.daisyrose_lora = true;
+    }
+
     /// Enable in-place `POST /reset` recovery when a client cancels active generation.
     ///
     /// By default (`false`), any interrupted generation attempt permanently closes

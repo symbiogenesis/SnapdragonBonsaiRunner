@@ -11,6 +11,7 @@ fn canonical(body: &[u8], candidate: bool, pinned: bool) -> Result<Vec<u8>, Reje
     let head = AuthorizedHead {
         length: body.len(),
         pinned_abliteration: pinned,
+        daisyrose_lora: false,
         context_tokens: crate::CONTEXT_TOKENS,
         vision: false,
     };
@@ -43,6 +44,7 @@ fn reused_canonical(
             AuthorizedHead {
                 length: body.len(),
                 pinned_abliteration: pinned,
+                daisyrose_lora: false,
                 context_tokens: crate::CONTEXT_TOKENS,
                 vision: false,
             },

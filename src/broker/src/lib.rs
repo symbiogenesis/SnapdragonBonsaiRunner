@@ -144,6 +144,7 @@ pub struct RequestPolicy {
     origin: String,
     authorization: [u8; 71], // "Bearer " + 64 lowercase hex characters
     pinned_abliteration: bool,
+    daisyrose_lora: bool,
     context_tokens: usize,
     pub(crate) vision: bool,
 }
@@ -188,6 +189,7 @@ impl RequestPolicy {
             authority,
             authorization,
             pinned_abliteration: false,
+            daisyrose_lora: false,
             context_tokens: CONTEXT_TOKENS,
             vision: false,
         })
@@ -339,6 +341,7 @@ impl RequestPolicy {
         Ok(AuthorizedHead {
             length,
             pinned_abliteration: self.pinned_abliteration,
+            daisyrose_lora: self.daisyrose_lora,
             context_tokens: self.context_tokens,
             vision: self.vision,
         })
@@ -429,6 +432,7 @@ fn singleton<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a [u8]>,
 pub struct AuthorizedHead {
     length: usize,
     pinned_abliteration: bool,
+    daisyrose_lora: bool,
     context_tokens: usize,
     vision: bool,
 }
@@ -502,12 +506,30 @@ impl AuthorizedHead {
         if chat.abliteration_scale.is_some() && !self.pinned_abliteration {
             return Err(Rejection::ChatSchema);
         }
-        let lora = self.pinned_abliteration.then(|| {
-            [PinnedLora {
+        if chat.daisyrose_scale.is_some() && !self.daisyrose_lora {
+            return Err(Rejection::ChatSchema);
+        }
+        let lora = match (self.pinned_abliteration, self.daisyrose_lora) {
+            (true, false) => Some(vec![PinnedLora {
                 id: 0,
                 scale: chat.abliteration_scale.unwrap_or(1.3),
-            }]
-        });
+            }]),
+            (true, true) => Some(vec![
+                PinnedLora {
+                    id: 0,
+                    scale: chat.abliteration_scale.unwrap_or(1.3),
+                },
+                PinnedLora {
+                    id: 1,
+                    scale: chat.daisyrose_scale.unwrap_or(0.0),
+                },
+            ]),
+            (false, true) => Some(vec![PinnedLora {
+                id: 0,
+                scale: chat.daisyrose_scale.unwrap_or(0.0),
+            }]),
+            (false, false) => None,
+        };
         let max_completion_tokens = chat.max_completion_tokens;
         let body = request_buffer::serialize_with_hint_and_limit(
             &BackendChat {
@@ -559,6 +581,8 @@ struct ClientChat<'a> {
     enable_thinking: bool,
     #[serde(default, deserialize_with = "deserialize_abliteration_scale")]
     abliteration_scale: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_abliteration_scale")]
+    daisyrose_scale: Option<f64>,
 }
 
 fn deserialize_abliteration_scale<'de, D: Deserializer<'de>>(
@@ -1042,7 +1066,7 @@ struct BackendChat<'a, 'b> {
     max_completion_tokens: u32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    lora: Option<[PinnedLora; 1]>,
+    lora: Option<Vec<PinnedLora>>,
     n: u8,
     cache_prompt: bool,
     n_cache_reuse: u8,

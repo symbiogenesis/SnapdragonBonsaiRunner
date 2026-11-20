@@ -56,7 +56,7 @@ fn prism_zero_one_patch(version: &str) -> Option<u32> {
 
 /// The selected private projection-worker budget, separate from execution evidence.
 #[derive(Clone, Copy)]
-pub(super) struct WorkerReadiness {
+pub(super) struct WorkerReadiness<'a> {
     expected: u8,
     context_tokens: usize,
     legacy_missing_allowed: bool,
@@ -70,9 +70,10 @@ pub(super) struct WorkerReadiness {
     cpu_prefill_gdn_wy_f32: bool,
     cpu_speculation: Option<(u8, usize, usize)>,
     placement: crate::inference::Placement,
+    daisyrose: Option<(&'a str, u16)>,
 }
 
-impl WorkerReadiness {
+impl<'a> WorkerReadiness<'a> {
     pub(super) fn for_version(version: &str, expected: u8) -> Self {
         let patch = prism_zero_one_patch(version);
         Self {
@@ -95,6 +96,7 @@ impl WorkerReadiness {
             cpu_prefill_gdn_wy_f32: false,
             cpu_speculation: None,
             placement: crate::inference::Placement::Auto,
+            daisyrose: None,
         }
     }
 
@@ -171,6 +173,14 @@ impl WorkerReadiness {
 
     pub(super) const fn with_placement(mut self, placement: crate::inference::Placement) -> Self {
         self.placement = placement;
+        self
+    }
+
+    pub(super) const fn with_daisyrose_adapter(
+        mut self,
+        daisyrose: Option<(&'a str, u16)>,
+    ) -> Self {
+        self.daisyrose = daisyrose;
         self
     }
 
@@ -251,6 +261,14 @@ struct NativeModel<'a> {
     supports_abliteration_scale: Option<bool>,
     #[serde(default, deserialize_with = "present")]
     abliteration_scale_range: Option<[u8; 2]>,
+    #[serde(default, deserialize_with = "present")]
+    supports_daisyrose_scale: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    daisyrose_scale_range: Option<[u8; 2]>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    daisyrose_adapter_sha256: Option<Text<'a>>,
+    #[serde(default, deserialize_with = "present")]
+    daisyrose_adapter_max_rank: Option<u16>,
     #[serde(default, borrow, deserialize_with = "present")]
     prompt_reuse: Option<Text<'a>>,
     #[serde(default, deserialize_with = "present")]
@@ -302,7 +320,7 @@ struct StartupProjection<'a> {
 
 fn startup_projection_matches(
     model: &NativeModel<'_>,
-    workers: WorkerReadiness,
+    workers: WorkerReadiness<'_>,
     repacked: bool,
 ) -> bool {
     let Some(startup) = &model.startup_projection else {
@@ -365,7 +383,7 @@ fn startup_projection_matches(
 
 fn cache_identity_matches(
     model: &NativeModel<'_>,
-    workers: WorkerReadiness,
+    workers: WorkerReadiness<'_>,
     repacked: bool,
     adapter: bool,
 ) -> bool {
@@ -388,7 +406,7 @@ fn cache_identity_matches(
     } else {
         format!("kv-{}-d256-rht3-v1", policy.name())
     };
-    let mut identity = format!(
+    let mut prefix = format!(
         "{}:qwen35-text-v1:nonflash-f16:{cache}:gdn-f32:prism-arm64-fused-v1",
         &*model.model_sha256
     );
@@ -396,7 +414,7 @@ fn cache_identity_matches(
         use std::fmt::Write as _;
         let write_result = if workers.adapter_execution_digest_required {
             write!(
-                identity,
+                prefix,
                 ":rank-one-lora-v1:{}:sha256={}:{:08x}",
                 crate::inference::ADAPTER_SHA256,
                 crate::inference::adapter_execution_sha256(repacked),
@@ -404,7 +422,7 @@ fn cache_identity_matches(
             )
         } else {
             write!(
-                identity,
+                prefix,
                 ":rank-one-lora-v1:{}:{:08x}",
                 crate::inference::ADAPTER_SHA256,
                 1.3_f32.to_bits()
@@ -414,29 +432,58 @@ fn cache_identity_matches(
             return false;
         }
     }
+    let mut suffix = String::new();
     if let Some((tokens, _)) = workers.cpu_prefill {
         use std::fmt::Write as _;
-        if write!(identity, ":cpu-tiled-ffn-v1:{tokens}").is_err() {
+        if write!(suffix, ":cpu-tiled-ffn-v1:{tokens}").is_err() {
             return false;
         }
         if workers.cpu_prefill_gdn_wy_f32 {
-            identity.push_str(":gdn-wy-f32-v1");
+            suffix.push_str(":gdn-wy-f32-v1");
         }
         if workers.cpu_speculation.is_some() {
-            identity.push_str(":cpu-tiled-verify-v1");
+            suffix.push_str(":cpu-tiled-verify-v1");
         }
     } else if workers.cpu_prefill_gdn_wy_f32 || workers.cpu_speculation.is_some() {
         return false;
     }
-    model.kv_cache.as_deref() == expected_kv
-        && model.startup_graph_identity.as_deref() == Some(identity.as_str())
+    if model.kv_cache.as_deref() != expected_kv {
+        return false;
+    }
+    let Some(observed) = model.startup_graph_identity.as_deref() else {
+        return false;
+    };
+    if workers.daisyrose.is_some() {
+        let Some(after_prefix) = observed.strip_prefix(&prefix) else {
+            return false;
+        };
+        let Some(after_tag) = after_prefix.strip_prefix(":multi-rank-lora-v1:") else {
+            return false;
+        };
+        let Some((hex_part, after_hex)) = after_tag.split_at_checked(64) else {
+            return false;
+        };
+        if !hex_part
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return false;
+        }
+        let Some(after_scale) = after_hex.strip_prefix(":00000000") else {
+            return false;
+        };
+        after_scale == suffix.as_str()
+    } else {
+        prefix.push_str(&suffix);
+        observed == prefix.as_str()
+    }
 }
 
 pub(super) fn validate_native_identity_detailed(
     bytes: &[u8],
     repacked: bool,
     adapter: bool,
-    workers: WorkerReadiness,
+    workers: WorkerReadiness<'_>,
 ) -> Result<(), NativeIdentityError> {
     let body = super::validate_response(bytes, 200).map_err(|_| NativeIdentityError::Framing)?;
     let crate::Object(models): crate::Object<Models<'_>> =
@@ -496,6 +543,23 @@ pub(super) fn validate_native_identity_detailed(
     if !adapter_matches {
         return Err(NativeIdentityError::Adapter);
     }
+    let daisyrose_matches = match workers.daisyrose {
+        Some((expected_sha, expected_max_rank)) => {
+            model.supports_daisyrose_scale == Some(true)
+                && model.daisyrose_scale_range == Some([0, 2])
+                && model.daisyrose_adapter_sha256.as_deref() == Some(expected_sha)
+                && model.daisyrose_adapter_max_rank == Some(expected_max_rank)
+        }
+        None => {
+            model.supports_daisyrose_scale.is_none()
+                && model.daisyrose_scale_range.is_none()
+                && model.daisyrose_adapter_sha256.is_none()
+                && model.daisyrose_adapter_max_rank.is_none()
+        }
+    };
+    if !daisyrose_matches {
+        return Err(NativeIdentityError::Adapter);
+    }
     if !cache_identity_matches(model, workers, repacked, adapter) {
         return Err(NativeIdentityError::KvCacheGraph);
     }
@@ -550,7 +614,7 @@ pub(super) fn validate_native_identity(
     bytes: &[u8],
     repacked: bool,
     adapter: bool,
-    workers: WorkerReadiness,
+    workers: WorkerReadiness<'_>,
 ) -> std::io::Result<()> {
     validate_native_identity_detailed(bytes, repacked, adapter, workers)
         .map_err(|error| std::io::Error::other(error.reason()))
@@ -1885,11 +1949,57 @@ mod context_tests {
             Err(NativeIdentityError::StartupProjection)
         );
 
-        let mut wrong_vision = default_model;
+        let mut wrong_vision = default_model.clone();
         wrong_vision["vision"] = json!(false);
         assert_eq!(
             validate_native_identity_detailed(&wire(&wrong_vision)?, false, true, default_policy),
             Err(NativeIdentityError::Vision)
+        );
+
+        let daisy_sha = "cd".repeat(32);
+        let mut daisy_model = default_model.clone();
+        daisy_model["supports_daisyrose_scale"] = json!(true);
+        daisy_model["daisyrose_scale_range"] = json!([0, 2]);
+        daisy_model["daisyrose_adapter_sha256"] = json!(daisy_sha.as_str());
+        daisy_model["daisyrose_adapter_max_rank"] = json!(16);
+        let base_identity = daisy_model["startup_graph_identity"]
+            .as_str()
+            .ok_or("missing startup_graph_identity")?
+            .to_owned();
+        let daisy_exec_sha = "ab".repeat(32);
+        let daisy_identity =
+            format!("{base_identity}:multi-rank-lora-v1:{daisy_exec_sha}:00000000");
+        daisy_model["startup_graph_identity"] = json!(daisy_identity);
+        let daisy_policy = default_policy.with_daisyrose_adapter(Some((daisy_sha.as_str(), 16)));
+        assert!(
+            validate_native_identity_detailed(&wire(&daisy_model)?, false, true, daisy_policy)
+                .is_ok()
+        );
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&daisy_model)?, false, true, default_policy),
+            Err(NativeIdentityError::Adapter)
+        );
+        let mut wrong_rank = daisy_model.clone();
+        wrong_rank["daisyrose_adapter_max_rank"] = json!(8);
+        assert_eq!(
+            validate_native_identity_detailed(&wire(&wrong_rank)?, false, true, daisy_policy),
+            Err(NativeIdentityError::Adapter)
+        );
+        let mut wrong_scale_identity = daisy_model;
+        wrong_scale_identity["startup_graph_identity"] = json!(
+            wrong_scale_identity["startup_graph_identity"]
+                .as_str()
+                .ok_or("missing identity")?
+                .replace(":00000000", ":3f000000")
+        );
+        assert_eq!(
+            validate_native_identity_detailed(
+                &wire(&wrong_scale_identity)?,
+                false,
+                true,
+                daisy_policy
+            ),
+            Err(NativeIdentityError::KvCacheGraph)
         );
 
         Ok(())
