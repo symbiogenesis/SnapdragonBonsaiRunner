@@ -141,8 +141,8 @@
     },
     {
       "path": "src/speech-asr/model.lock.json",
-      "bytes": 880,
-      "sha256": "d7ccfa21bba09948383deff6ed4e01b8d2ea25197d1128639d82ec06c61ee19f",
+      "bytes": 10496,
+      "sha256": "e7d8faedb08db21a2e49a705b7db752572db12140d70cc92c3a625438e61fc0a",
       "family": "native-asr"
     },
     {

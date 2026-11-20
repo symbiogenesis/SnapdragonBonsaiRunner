@@ -1,11 +1,12 @@
 //! Fixed native companion CLI and retained compiled-artifact verification.
 
 use crate::{Kind, credentials::Credential};
-use bonsai_artifacts::VerifiedFile;
+use bonsai_artifacts::{ChunkedFileSpec, VerifiedFile};
 use std::{
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
 /// A supported companion command, with no arbitrary runtime or model overrides.
@@ -184,6 +185,49 @@ pub fn version(kind: Kind) -> serde_json::Value {
     })
 }
 
+/// Stage at which staged TTS verification and model loading failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TtsStartupStage {
+    /// Failed while checking credential or SHA-256 model pins.
+    Verify,
+    /// Failed while constructing the Rust codec or design talker.
+    Load,
+}
+
+/// Failure from [`verify_and_load_tts`], attributing verification vs. model loading.
+#[derive(Debug)]
+pub struct TtsStartupError {
+    /// Startup stage where the error occurred.
+    pub stage: TtsStartupStage,
+    /// Underlying value-free I/O error.
+    pub error: io::Error,
+}
+
+#[cfg(not(windows))]
+const MIN_CHUNK_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CHUNK_MANIFEST_COUNT: usize = 16_384;
+
+struct ArtifactPin<'a> {
+    path: &'a Path,
+    bytes: u64,
+    sha256: &'a str,
+    chunks: Option<(usize, Vec<String>)>,
+}
+
+fn hash_worker_count() -> usize {
+    #[cfg(windows)]
+    {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(1, bonsai_windows_credentials::MAX_PARALLEL_HASH_WORKERS)
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
 /// Verify only the compiled checkpoint identities and retain their file guards.
 ///
 /// `compiled_lock` must come from `include_str!` in the companion binary. No
@@ -199,57 +243,60 @@ pub fn verify_models(
     compiled_lock: &str,
 ) -> io::Result<ModelGuards> {
     let credential = Credential::open(&arguments.token_file).map_err(|_| invalid_models())?;
-    let pin: serde_json::Value =
-        serde_json::from_str(compiled_lock).map_err(|_| invalid_models())?;
-    if pin.get("schemaVersion").and_then(serde_json::Value::as_u64) != Some(1)
-        || pin.get("model").and_then(serde_json::Value::as_str) != Some(kind.model())
-    {
-        return Err(invalid_models());
-    }
+    let pin = parse_lock_document(kind, compiled_lock)?;
+    let workers = hash_worker_count();
     let models = match kind {
         Kind::Canary => {
             if arguments.codec.is_some() || arguments.voice_model.is_some() {
                 return Err(invalid_models());
             }
-            vec![verify_artifact(&arguments.model, &pin)?]
+            let model_pin = parse_artifact_pin(&arguments.model, &pin)?;
+            vec![verify_pinned_artifact(&model_pin, workers)?]
         }
         Kind::QwenTts => {
             let files = pin.get("files").ok_or_else(invalid_models)?;
             let codec = arguments.codec.as_ref().ok_or_else(invalid_models)?;
             let voice_model = arguments.voice_model.as_ref().ok_or_else(invalid_models)?;
-            let (talker_bytes, talker_hash) = parse_artifact_pin(
-                &arguments.model,
-                files.get("talker").ok_or_else(invalid_models)?,
-            )?;
-            let (codec_bytes, codec_hash) =
+            let talker_pin =
+                parse_artifact_pin(&arguments.model, files.get("talker").ok_or_else(invalid_models)?)?;
+            let codec_pin =
                 parse_artifact_pin(codec, files.get("codec").ok_or_else(invalid_models)?)?;
-            let (voice_bytes, voice_hash) = parse_artifact_pin(
+            let voice_pin = parse_artifact_pin(
                 voice_model,
                 files.get("voice_talker").ok_or_else(invalid_models)?,
             )?;
-            let (talker_res, codec_res, voice_res) = std::thread::scope(|scope| {
-                let codec_job = std::thread::Builder::new()
-                    .name("speech-verify-codec".to_owned())
-                    .spawn_scoped(scope, move || {
-                        verify_pinned_file(codec, codec_bytes, codec_hash)
-                    });
-                let voice_job = std::thread::Builder::new()
-                    .name("speech-verify-voice".to_owned())
-                    .spawn_scoped(scope, move || {
-                        verify_pinned_file(voice_model, voice_bytes, voice_hash)
-                    });
-                let talker_res = verify_pinned_file(&arguments.model, talker_bytes, talker_hash);
-                let codec_res = match codec_job {
-                    Ok(handle) => handle.join().unwrap_or_else(|_| Err(invalid_models())),
-                    Err(_) => verify_pinned_file(codec, codec_bytes, codec_hash),
-                };
-                let voice_res = match voice_job {
-                    Ok(handle) => handle.join().unwrap_or_else(|_| Err(invalid_models())),
-                    Err(_) => verify_pinned_file(voice_model, voice_bytes, voice_hash),
-                };
-                (talker_res, codec_res, voice_res)
-            });
-            vec![talker_res?, codec_res?, voice_res?]
+            let has_chunks = talker_pin.chunks.is_some()
+                && codec_pin.chunks.is_some()
+                && voice_pin.chunks.is_some();
+            if has_chunks {
+                // Verify chunked artifacts sequentially with full worker parallelism to avoid
+                // oversubscribing CPU cores and memory bandwidth across files.
+                vec![
+                    verify_pinned_artifact(&talker_pin, workers)?,
+                    verify_pinned_artifact(&codec_pin, workers)?,
+                    verify_pinned_artifact(&voice_pin, workers)?,
+                ]
+            } else {
+                let (talker_res, codec_res, voice_res) = std::thread::scope(|scope| {
+                    let codec_job = std::thread::Builder::new()
+                        .name("speech-verify-codec".to_owned())
+                        .spawn_scoped(scope, || verify_pinned_artifact(&codec_pin, workers));
+                    let voice_job = std::thread::Builder::new()
+                        .name("speech-verify-voice".to_owned())
+                        .spawn_scoped(scope, || verify_pinned_artifact(&voice_pin, workers));
+                    let talker_res = verify_pinned_artifact(&talker_pin, workers);
+                    let codec_res = match codec_job {
+                        Ok(handle) => handle.join().unwrap_or_else(|_| Err(invalid_models())),
+                        Err(_) => verify_pinned_artifact(&codec_pin, workers),
+                    };
+                    let voice_res = match voice_job {
+                        Ok(handle) => handle.join().unwrap_or_else(|_| Err(invalid_models())),
+                        Err(_) => verify_pinned_artifact(&voice_pin, workers),
+                    };
+                    (talker_res, codec_res, voice_res)
+                });
+                vec![talker_res?, codec_res?, voice_res?]
+            }
         }
     };
     Ok(ModelGuards {
@@ -258,11 +305,155 @@ pub fn verify_models(
     })
 }
 
-fn verify_pinned_file(path: &Path, bytes: u64, hash: &str) -> io::Result<VerifiedFile> {
-    VerifiedFile::verify(path, bytes, hash).map_err(|_| invalid_models())
+/// Verify compiled TTS checkpoint pins and pipeline verified model loading safely.
+///
+/// No loader closure is invoked before its corresponding artifact completes full SHA-256
+/// verification and lock-guard retention. Once `codec` passes verification, `load_codec`
+/// runs concurrently with `talker` verification; once `talker` passes verification,
+/// `load_design` runs concurrently with `voice_talker` verification.
+///
+/// # Errors
+/// Attributes credential/verification failures to [`TtsStartupStage::Verify`] and loader
+/// failures to [`TtsStartupStage::Load`].
+pub fn verify_and_load_tts<C, T, Fc, Ft>(
+    arguments: &ServiceArgs,
+    compiled_lock: &str,
+    load_codec: Fc,
+    load_design: Ft,
+) -> Result<(ModelGuards, C, T), TtsStartupError>
+where
+    C: Send,
+    T: Send,
+    Fc: FnOnce(&Path) -> io::Result<C> + Send,
+    Ft: FnOnce(&Path) -> io::Result<T> + Send,
+{
+    let verify_err = |error| TtsStartupError {
+        stage: TtsStartupStage::Verify,
+        error,
+    };
+    let load_err = |error| TtsStartupError {
+        stage: TtsStartupStage::Load,
+        error,
+    };
+    let credential = Credential::open(&arguments.token_file).map_err(|_| verify_err(invalid_models()))?;
+    let pin = parse_lock_document(Kind::QwenTts, compiled_lock).map_err(verify_err)?;
+    let files = pin.get("files").ok_or_else(|| verify_err(invalid_models()))?;
+    let codec_path = arguments
+        .codec
+        .as_ref()
+        .ok_or_else(|| verify_err(invalid_models()))?;
+    let voice_path = arguments
+        .voice_model
+        .as_ref()
+        .ok_or_else(|| verify_err(invalid_models()))?;
+    let talker_pin = parse_artifact_pin(
+        &arguments.model,
+        files.get("talker").ok_or_else(|| verify_err(invalid_models()))?,
+    )
+    .map_err(verify_err)?;
+    let codec_pin = parse_artifact_pin(
+        codec_path,
+        files.get("codec").ok_or_else(|| verify_err(invalid_models()))?,
+    )
+    .map_err(verify_err)?;
+    let voice_pin = parse_artifact_pin(
+        voice_path,
+        files
+            .get("voice_talker")
+            .ok_or_else(|| verify_err(invalid_models()))?,
+    )
+    .map_err(verify_err)?;
+
+    let full_workers = hash_worker_count();
+    let overlap_workers = (full_workers / 2).max(4).min(full_workers);
+    let codec_guard = verify_pinned_artifact(&codec_pin, full_workers).map_err(verify_err)?;
+
+    let (codec_res, talker_guard_res, voice_guard_res, design_res) = std::thread::scope(|scope| {
+        let verified_codec_path = codec_guard.path();
+        let codec_job = std::thread::Builder::new()
+            .name("tts-load-codec".to_owned())
+            .spawn_scoped(scope, || load_codec(verified_codec_path));
+
+        let talker_guard_res = verify_pinned_artifact(&talker_pin, full_workers);
+        let (voice_guard_res, design_res) = if talker_guard_res.is_ok() {
+            let verified_design_path = talker_pin.path;
+            let design_job = std::thread::Builder::new()
+                .name("tts-load-design".to_owned())
+                .spawn_scoped(scope, || load_design(verified_design_path));
+            let voice_guard_res = verify_pinned_artifact(&voice_pin, overlap_workers);
+            let design_res = match design_job {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("TTS design loader panicked."))),
+                Err(_) => Err(io::Error::other("Could not spawn TTS design loader.")),
+            };
+            (voice_guard_res, Some(design_res))
+        } else {
+            (Err(invalid_models()), None)
+        };
+
+        let codec_res = match codec_job {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("TTS codec loader panicked."))),
+            Err(_) => Err(io::Error::other("Could not spawn TTS codec loader.")),
+        };
+
+        (codec_res, talker_guard_res, voice_guard_res, design_res)
+    });
+
+    let talker_guard = talker_guard_res.map_err(verify_err)?;
+    let voice_guard = voice_guard_res.map_err(verify_err)?;
+    let codec = codec_res.map_err(load_err)?;
+    let design = design_res
+        .unwrap_or_else(|| Err(invalid_models()))
+        .map_err(load_err)?;
+
+    Ok((
+        ModelGuards {
+            _models: vec![talker_guard, codec_guard, voice_guard],
+            _credential: credential,
+        },
+        codec,
+        design,
+    ))
 }
 
-fn parse_artifact_pin<'a>(path: &Path, pin: &'a serde_json::Value) -> io::Result<(u64, &'a str)> {
+fn parse_lock_document(kind: Kind, compiled_lock: &str) -> io::Result<serde_json::Value> {
+    let pin: serde_json::Value =
+        serde_json::from_str(compiled_lock).map_err(|_| invalid_models())?;
+    if pin.get("schemaVersion").and_then(serde_json::Value::as_u64) != Some(1)
+        || pin.get("model").and_then(serde_json::Value::as_str) != Some(kind.model())
+    {
+        return Err(invalid_models());
+    }
+    Ok(pin)
+}
+
+fn verify_pinned_artifact(pin: &ArtifactPin<'_>, workers: usize) -> io::Result<VerifiedFile> {
+    if let Some((chunk_bytes, chunk_sha256s)) = &pin.chunks {
+        let spec = ChunkedFileSpec {
+            path: pin.path.to_path_buf(),
+            bytes: pin.bytes,
+            sha256: pin.sha256.to_owned(),
+            chunk_bytes: *chunk_bytes,
+            chunk_sha256s: chunk_sha256s.clone(),
+        };
+        let cancel = AtomicBool::new(false);
+        VerifiedFile::verify_chunked_with(&spec, workers, &cancel).map_err(|_| invalid_models())
+    } else {
+        VerifiedFile::verify(pin.path, pin.bytes, pin.sha256).map_err(|_| invalid_models())
+    }
+}
+
+fn is_lower_sha256_hex(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_artifact_pin<'a>(path: &'a Path, pin: &'a serde_json::Value) -> io::Result<ArtifactPin<'a>> {
     validate_file(path)?;
     let bytes = pin
         .get("bytes")
@@ -272,20 +463,46 @@ fn parse_artifact_pin<'a>(path: &Path, pin: &'a serde_json::Value) -> io::Result
     let hash = pin
         .get("sha256")
         .and_then(serde_json::Value::as_str)
+        .filter(|hash| is_lower_sha256_hex(hash))
         .ok_or_else(invalid_models)?;
-    if hash.len() != 64
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(invalid_models());
-    }
-    Ok((bytes, hash))
-}
-
-fn verify_artifact(path: &Path, pin: &serde_json::Value) -> io::Result<VerifiedFile> {
-    let (bytes, hash) = parse_artifact_pin(path, pin)?;
-    VerifiedFile::verify(path, bytes, hash).map_err(|_| invalid_models())
+    let chunks = match (pin.get("chunkBytes"), pin.get("chunkSha256s")) {
+        (None, None) => None,
+        (Some(chunk_bytes_val), Some(chunk_hashes_val)) => {
+            #[cfg(windows)]
+            let min_chunk_bytes = bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES;
+            #[cfg(not(windows))]
+            let min_chunk_bytes = MIN_CHUNK_MANIFEST_BYTES;
+            let chunk_bytes_u64 = chunk_bytes_val
+                .as_u64()
+                .filter(|size| *size >= min_chunk_bytes)
+                .ok_or_else(invalid_models)?;
+            let chunk_bytes = usize::try_from(chunk_bytes_u64).map_err(|_| invalid_models())?;
+            let expected_chunks = usize::try_from(bytes.div_ceil(chunk_bytes_u64))
+                .ok()
+                .filter(|count| *count > 0 && *count <= MAX_CHUNK_MANIFEST_COUNT)
+                .ok_or_else(invalid_models)?;
+            let array = chunk_hashes_val.as_array().ok_or_else(invalid_models)?;
+            if array.len() != expected_chunks {
+                return Err(invalid_models());
+            }
+            let mut digests = Vec::with_capacity(expected_chunks);
+            for item in array {
+                let digest = item
+                    .as_str()
+                    .filter(|hex_str| is_lower_sha256_hex(hex_str))
+                    .ok_or_else(invalid_models)?;
+                digests.push(digest.to_owned());
+            }
+            Some((chunk_bytes, digests))
+        }
+        _ => return Err(invalid_models()),
+    };
+    Ok(ArtifactPin {
+        path,
+        bytes,
+        sha256: hash,
+        chunks,
+    })
 }
 
 fn validate_file(path: &Path) -> io::Result<()> {
@@ -323,12 +540,14 @@ fn invalid_models() -> io::Error {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{Command, ServiceArgs, parse, verify_models};
+    use super::{Command, ServiceArgs, TtsStartupStage, parse, verify_and_load_tts, verify_models};
     use crate::Kind;
+    use bonsai_windows_credentials::{MIN_MAPPED_HASH_BYTES, Sha256};
     use std::{
         ffi::OsString,
         fs, io,
-        path::PathBuf,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicBool, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -531,6 +750,204 @@ mod tests {
             invalid.extend(extra.into_iter().map(OsString::from));
             assert!(parse(Kind::Canary, invalid).is_err());
         }
+        Ok(())
+    }
+
+    fn hex_lower(bytes: &[u8; 32]) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in bytes {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
+    fn write_chunked_fixture_file(path: &Path, payload: &[u8], chunk_bytes: usize) -> io::Result<serde_json::Value> {
+        fs::write(path, payload)?;
+        let whole = hex_lower(&Sha256::digest_bytes(payload)?);
+        let mut chunks = Vec::new();
+        for chunk in payload.chunks(chunk_bytes) {
+            chunks.push(hex_lower(&Sha256::digest_bytes(chunk)?));
+        }
+        Ok(serde_json::json!({
+            "bytes": payload.len(),
+            "sha256": whole,
+            "chunkBytes": chunk_bytes,
+            "chunkSha256s": chunks,
+        }))
+    }
+
+    #[test]
+    fn chunk_manifest_verification_accepts_valid_and_rejects_malformed_or_tampered() -> io::Result<()>
+    {
+        let (directory, values) = fixture()?;
+        let Command::Serve(arguments) = parse(Kind::Canary, values)? else {
+            return Err(io::Error::other("Missing serve arguments"));
+        };
+        let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
+        let len = chunk_bytes + 4_096;
+        let payload: Vec<u8> = (0..len)
+            .map(|i| u8::try_from((i.wrapping_mul(31) ^ 0xa5) & 0xff).unwrap_or(0))
+            .collect();
+        let entry = write_chunked_fixture_file(&arguments.model, &payload, chunk_bytes)?;
+        let valid_pin = serde_json::json!({
+            "schemaVersion": 1,
+            "model": Kind::Canary.model(),
+            "bytes": entry["bytes"],
+            "sha256": entry["sha256"],
+            "chunkBytes": entry["chunkBytes"],
+            "chunkSha256s": entry["chunkSha256s"],
+        });
+
+        let guard = verify_models(Kind::Canary, &arguments, &valid_pin.to_string())?;
+        assert!(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&arguments.model)
+                .is_err()
+        );
+        drop(guard);
+
+        // Missing half of the chunk fields must fail closed.
+        let mut missing_hashes = valid_pin.clone();
+        missing_hashes
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("object"))?
+            .remove("chunkSha256s");
+        assert!(verify_models(Kind::Canary, &arguments, &missing_hashes.to_string()).is_err());
+
+        let mut missing_size = valid_pin.clone();
+        missing_size
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("object"))?
+            .remove("chunkBytes");
+        assert!(verify_models(Kind::Canary, &arguments, &missing_size.to_string()).is_err());
+
+        // Sub-threshold chunk size must fail closed.
+        let mut small_chunk = valid_pin.clone();
+        small_chunk["chunkBytes"] = serde_json::json!(1024);
+        assert!(verify_models(Kind::Canary, &arguments, &small_chunk.to_string()).is_err());
+
+        // Wrong chunk count must fail closed.
+        let mut short_list = valid_pin.clone();
+        short_list["chunkSha256s"] = serde_json::json!([entry["chunkSha256s"][0].clone()]);
+        assert!(verify_models(Kind::Canary, &arguments, &short_list.to_string()).is_err());
+
+        // Bad hex digest must fail closed.
+        let mut bad_hex = valid_pin.clone();
+        bad_hex["chunkSha256s"][1] = serde_json::json!("not-hex");
+        assert!(verify_models(Kind::Canary, &arguments, &bad_hex.to_string()).is_err());
+
+        // Single-byte tamper in the second chunk must be caught.
+        let mut tampered = payload;
+        tampered[chunk_bytes + 17] ^= 0x01;
+        fs::write(&arguments.model, &tampered)?;
+        assert!(verify_models(Kind::Canary, &arguments, &valid_pin.to_string()).is_err());
+
+        let _ = fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_tts_verification_never_loads_unverified_artifact() -> io::Result<()> {
+        let (directory, mut values) = fixture()?;
+        let codec = directory.join("codec.gguf");
+        let voice = directory.join("voice.gguf");
+        let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
+        let codec_entry = write_chunked_fixture_file(&codec, &vec![0x11_u8; chunk_bytes + 5], chunk_bytes)?;
+        let design_entry =
+            write_chunked_fixture_file(&directory.join("model.gguf"), &vec![0x22_u8; chunk_bytes + 7], chunk_bytes)?;
+        let voice_entry = write_chunked_fixture_file(&voice, &vec![0x33_u8; chunk_bytes + 9], chunk_bytes)?;
+
+        values.extend([
+            OsString::from("--codec"),
+            codec.clone().into_os_string(),
+            OsString::from("--voice-model"),
+            voice.clone().into_os_string(),
+        ]);
+        let Command::Serve(arguments) = parse(Kind::QwenTts, values)? else {
+            return Err(io::Error::other("Missing TTS arguments"));
+        };
+        let lock_value = serde_json::json!({
+            "schemaVersion": 1,
+            "model": Kind::QwenTts.model(),
+            "files": {
+                "talker": design_entry,
+                "codec": codec_entry,
+                "voice_talker": voice_entry,
+            },
+        });
+
+        // Case 1: invalid codec -> neither loader runs.
+        let mut bad_codec = lock_value.clone();
+        bad_codec["files"]["codec"]["sha256"] = serde_json::json!("0".repeat(64));
+        bad_codec["files"]["codec"]["chunkSha256s"][0] = serde_json::json!("0".repeat(64));
+        let codec_called = AtomicBool::new(false);
+        let design_called = AtomicBool::new(false);
+        let res = verify_and_load_tts(
+            &arguments,
+            &bad_codec.to_string(),
+            |_| {
+                codec_called.store(true, Ordering::Release);
+                Ok(())
+            },
+            |_| {
+                design_called.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        let err = res
+            .err()
+            .ok_or_else(|| io::Error::other("expected verify failure"))?;
+        assert_eq!(err.stage, TtsStartupStage::Verify);
+        assert!(!codec_called.load(Ordering::Acquire));
+        assert!(!design_called.load(Ordering::Acquire));
+
+        // Case 2: bad design talker -> design loader must NEVER run.
+        let mut bad_design = lock_value.clone();
+        bad_design["files"]["talker"]["chunkSha256s"][1] = serde_json::json!("f".repeat(64));
+        let design_called_2 = AtomicBool::new(false);
+        let res = verify_and_load_tts(
+            &arguments,
+            &bad_design.to_string(),
+            |_| Ok(()),
+            |_| {
+                design_called_2.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        let err = res
+            .err()
+            .ok_or_else(|| io::Error::other("expected design verify failure"))?;
+        assert_eq!(err.stage, TtsStartupStage::Verify);
+        assert!(!design_called_2.load(Ordering::Acquire));
+
+        // Case 3: loader failure reports Load stage.
+        let res: Result<(_, (), ()), _> = verify_and_load_tts(
+            &arguments,
+            &lock_value.to_string(),
+            |_| Ok(()),
+            |_| Err(io::Error::new(io::ErrorKind::InvalidData, "bad design weights")),
+        );
+        let err = res
+            .err()
+            .ok_or_else(|| io::Error::other("expected load failure"))?;
+        assert_eq!(err.stage, TtsStartupStage::Load);
+        assert_eq!(err.error.kind(), io::ErrorKind::InvalidData);
+
+        // Case 4: valid artifacts return guards + both loaded parts.
+        let (guards, c_ok, d_ok) = verify_and_load_tts(
+            &arguments,
+            &lock_value.to_string(),
+            |p| Ok(p.to_path_buf()),
+            |p| Ok(p.to_path_buf()),
+        )
+        .map_err(|failure| failure.error)?;
+        assert_eq!(c_ok, codec);
+        assert_eq!(d_ok, arguments.model);
+        assert!(fs::OpenOptions::new().write(true).open(&voice).is_err());
+        drop(guards);
+
+        let _ = fs::remove_dir_all(&directory);
         Ok(())
     }
 }
