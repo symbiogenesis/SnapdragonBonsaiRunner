@@ -196,6 +196,8 @@ struct State {
     daisyrose_scale: f32,
     daisyrose_enabled: bool,
     daisyrose_available: bool,
+    daisyrose_default_scale_tenths: u8,
+    daisyrose_customized: bool,
     focus_composer: bool,
     composing: bool,
     composer_id: Option<egui::Id>,
@@ -376,6 +378,8 @@ impl State {
             daisyrose_scale: client::DEFAULT_DAISYROSE_SCALE,
             daisyrose_enabled: false,
             daisyrose_available: false,
+            daisyrose_default_scale_tenths: 0,
+            daisyrose_customized: false,
             focus_composer: false,
             composing: false,
             composer_id: None,
@@ -616,6 +620,7 @@ impl State {
         };
         self.abliteration_enabled = config.use_abliterate_lora;
         self.daisyrose_available = config.daisyrose_lora.is_some();
+        self.daisyrose_default_scale_tenths = 0;
         self.runtime_description = runtime_description(&config);
         self.markdown_image = Some(config.broker.clone());
         if !speech_pending {
@@ -777,6 +782,7 @@ impl State {
             .unwrap_or(4096);
         let (wire_text, images) =
             crate::attachment_import::format_user_turn(&text, &self.draft_attachments);
+        self.daisyrose_customized = true;
         if self
             .commands
             .send(Command::Send {
@@ -875,6 +881,8 @@ impl State {
         self.stop_speech();
         self.context_tokens = None;
         self.vision_available = false;
+        self.daisyrose_available = false;
+        self.daisyrose_default_scale_tenths = 0;
         self.model = ModelLifecycle::Restarting;
         self.set_status("Restarting the local model…", false);
     }
@@ -1292,6 +1300,8 @@ impl State {
                 self.auto_continuing = false;
                 self.context_tokens = None;
                 self.vision_available = false;
+                self.daisyrose_available = false;
+                self.daisyrose_default_scale_tenths = 0;
                 self.model = ModelLifecycle::Preparing;
                 self.set_status("Preparing your local model…", false);
             }
@@ -1299,6 +1309,8 @@ impl State {
                 self.auto_continuing = false;
                 self.context_tokens = None;
                 self.vision_available = false;
+                self.daisyrose_available = false;
+                self.daisyrose_default_scale_tenths = 0;
                 self.model = ModelLifecycle::Restarting;
                 self.set_status("Restarting the local model…", false);
             }
@@ -1314,6 +1326,24 @@ impl State {
             Event::ModelStopped => self.stopped_model(),
             Event::ContextCapacity(tokens) => self.context_tokens = Some(tokens),
             Event::VisionAvailable(available) => self.vision_available = available,
+            Event::DaisyRoseAvailable(readiness) => {
+                self.daisyrose_available = readiness.available;
+                self.daisyrose_default_scale_tenths = if readiness.available {
+                    readiness.default_scale_tenths
+                } else {
+                    0
+                };
+                if readiness.default_enabled()
+                    && !self.daisyrose_customized
+                    && self.committed.is_empty()
+                    && self.transcript.messages.is_empty()
+                    && !self.daisyrose_enabled
+                    && (self.daisyrose_scale - client::DEFAULT_DAISYROSE_SCALE).abs() < f32::EPSILON
+                {
+                    self.daisyrose_enabled = true;
+                    self.daisyrose_scale = readiness.default_scale();
+                }
+            }
             Event::Ready => {
                 self.auto_continuing = false;
                 self.model = ModelLifecycle::Ready;
@@ -3184,6 +3214,7 @@ mod startup_tests {
             require_broker_pipe: false,
             use_abliterate_lora: false,
             daisyrose_lora: None,
+            no_daisyrose_lora: false,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: false,
@@ -3312,6 +3343,7 @@ mod startup_tests {
                 require_broker_pipe: false,
                 use_abliterate_lora: false,
                 daisyrose_lora: None,
+                no_daisyrose_lora: false,
                 no_mmproj: false,
                 use_repacked_ptq1: false,
                 native_engine: true,

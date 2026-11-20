@@ -67,6 +67,18 @@ impl Conversation {
 }
 
 impl State {
+    pub(super) const fn daisyrose_default_enabled(&self) -> bool {
+        self.daisyrose_available && self.daisyrose_default_scale_tenths > 0
+    }
+
+    pub(super) fn daisyrose_default_scale(&self) -> f32 {
+        if self.daisyrose_default_enabled() {
+            f32::from(self.daisyrose_default_scale_tenths) / 10.0
+        } else {
+            client::DEFAULT_DAISYROSE_SCALE
+        }
+    }
+
     pub(super) const fn effective_daisyrose_scale(&self) -> f32 {
         if self.daisyrose_available && self.daisyrose_enabled {
             self.daisyrose_scale
@@ -169,8 +181,9 @@ impl State {
         self.streaming_read_aloud = false;
         self.output_budget = 3;
         self.abliteration_scale = client::DEFAULT_ABLITERATION_SCALE;
-        self.daisyrose_enabled = false;
-        self.daisyrose_scale = client::DEFAULT_DAISYROSE_SCALE;
+        self.daisyrose_enabled = self.daisyrose_default_enabled();
+        self.daisyrose_scale = self.daisyrose_default_scale();
+        self.daisyrose_customized = false;
         self.place_composer_cursor(0);
         self.focus_composer = true;
     }
@@ -192,6 +205,7 @@ impl State {
         self.abliteration_scale = snapshot.abliteration_scale;
         self.daisyrose_enabled = snapshot.daisyrose_enabled;
         self.daisyrose_scale = snapshot.daisyrose_scale;
+        self.daisyrose_customized = true;
         // Loading/failure status belongs to the model, not a saved transcript.
         if self.model.ready() {
             self.status = snapshot.status;

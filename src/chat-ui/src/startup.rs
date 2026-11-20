@@ -588,6 +588,7 @@ mod tests {
             require_broker_pipe: false,
             use_abliterate_lora: false,
             daisyrose_lora: None,
+            no_daisyrose_lora: false,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: true,

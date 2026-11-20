@@ -603,6 +603,113 @@ fn daisyrose_settings_toggle_and_slider_default_off_and_reach_next_turn() {
 }
 
 #[test]
+fn daisyrose_promoted_readiness_enables_fresh_and_new_conversations_without_clobbering_saved()
+-> io::Result<()> {
+    let mut chat = harness([1180.0, 960.0], false);
+    chat.state_mut().app.model = ModelLifecycle::Preparing;
+    chat.state_mut()
+        .app
+        .model_event(Event::DaisyRoseAvailable(client::DaisyRoseReadiness {
+            available: true,
+            default_scale_tenths: 10,
+        }));
+    chat.state_mut().app.model_event(Event::Ready);
+    chat.run();
+
+    assert!(chat.state().app.daisyrose_available);
+    assert!(chat.state().app.daisyrose_enabled);
+    assert!((chat.state().app.daisyrose_scale - 1.0).abs() < f32::EPSILON);
+
+    chat.state_mut().app.input = "Promoted default turn".to_owned();
+    chat.state_mut().app.submit();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { daisyrose_scale, .. })
+            if (daisyrose_scale - 1.0).abs() < f32::EPSILON
+    ));
+
+    chat.state_mut().app.show_settings = true;
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::DisclosureTriangle, "Advanced response controls")
+        .scroll_to_me();
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::DisclosureTriangle, "Advanced response controls")
+        .click();
+    chat.run();
+    let default_hint =
+        chat.get_by_label("0 disables contribution. Default: 1.0. Applies to your next response.");
+    default_hint.scroll_to_me();
+    chat.run();
+    assert!(
+        chat.get_by_label("0 disables contribution. Default: 1.0. Applies to your next response.")
+            .rect()
+            .is_positive()
+    );
+    chat.state_mut().app.show_settings = false;
+    chat.run();
+
+    chat.state_mut().app.new_chat();
+    assert!(chat.state().app.daisyrose_enabled);
+    assert!((chat.state().app.daisyrose_scale - 1.0).abs() < f32::EPSILON);
+
+    // Tight-RAM shedding on restart marks DaisyRose unavailable and clamps effective scale to 0.0.
+    chat.state_mut().app.model = ModelLifecycle::Retryable;
+    chat.state_mut().app.retry();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Retry)
+    ));
+    assert!(!chat.state().app.daisyrose_available);
+    chat.state_mut().app.model_event(Event::Starting);
+    chat.state_mut().app.model_event(Event::DaisyRoseAvailable(
+        client::DaisyRoseReadiness::default(),
+    ));
+    chat.state_mut().app.model_event(Event::Ready);
+    assert!(!chat.state().app.daisyrose_available);
+    assert!((chat.state().app.effective_daisyrose_scale() - 0.0).abs() < f32::EPSILON);
+    chat.state_mut().app.new_chat();
+    assert!(!chat.state().app.daisyrose_enabled);
+    assert!((chat.state().app.effective_daisyrose_scale() - 0.0).abs() < f32::EPSILON);
+
+    // Restoring a saved or legacy conversation before promoted readiness preserves disabled state,
+    // while new conversations still initialize to the promoted default.
+    let mut source = Fixture::new(false);
+    source.app.daisyrose_enabled = false;
+    source.app.daisyrose_scale = 0.0;
+    let saved_bytes = source.app.workspace_bytes()?;
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&saved_bytes).map_err(io::Error::other)?;
+    let active = legacy["active"]
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("active object"))?;
+    active.remove("daisyrose_enabled");
+    active.remove("daisyrose_scale");
+    let legacy_bytes = serde_json::to_vec(&legacy).map_err(io::Error::other)?;
+
+    for bytes in [saved_bytes, legacy_bytes] {
+        let mut restored = Fixture::new(false);
+        restored.app.model = ModelLifecycle::Preparing;
+        restored.app.restore_workspace(&bytes)?;
+        restored
+            .app
+            .model_event(Event::DaisyRoseAvailable(client::DaisyRoseReadiness {
+                available: true,
+                default_scale_tenths: 10,
+            }));
+        restored.app.model_event(Event::Ready);
+        assert!(!restored.app.daisyrose_enabled);
+        assert!((restored.app.daisyrose_scale - 0.0).abs() < f32::EPSILON);
+        assert!((restored.app.effective_daisyrose_scale() - 0.0).abs() < f32::EPSILON);
+
+        restored.app.new_chat();
+        assert!(restored.app.daisyrose_enabled);
+        assert!((restored.app.daisyrose_scale - 1.0).abs() < f32::EPSILON);
+        assert!((restored.app.effective_daisyrose_scale() - 1.0).abs() < f32::EPSILON);
+    }
+    Ok(())
+}
+
+#[test]
 fn accessible_chat_controls_handle_enter_and_shift_enter() {
     let mut menu = harness([760.0, 800.0], false);
     menu.get_by_role_and_label(egui::Role::Button, "Conversation menu")

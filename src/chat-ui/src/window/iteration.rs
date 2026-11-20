@@ -408,6 +408,7 @@ impl State {
             self.daisyrose_enabled,
             self.daisyrose_scale,
         ) = settings;
+        self.daisyrose_customized = true;
         if let Some(answer) = self.committed.last() {
             self.last_answer = answer.content.to_string();
             self.answer_complete = true;

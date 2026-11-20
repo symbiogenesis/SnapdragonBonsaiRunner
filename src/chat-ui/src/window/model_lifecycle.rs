@@ -69,7 +69,10 @@ impl ModelLifecycle {
         match event {
             Event::Starting => matches!(self, Self::Preparing | Self::Restarting),
             Event::Restarting => matches!(self, Self::Stopping),
-            Event::ContextCapacity(_) | Event::VisionAvailable(_) | Event::Ready => {
+            Event::ContextCapacity(_)
+            | Event::VisionAvailable(_)
+            | Event::DaisyRoseAvailable(_)
+            | Event::Ready => {
                 matches!(self, Self::Preparing)
             }
             Event::Text(_)

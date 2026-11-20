@@ -145,6 +145,27 @@ pub(crate) fn valid_daisyrose_scale(scale: f32) -> bool {
     scale.is_finite() && (0.0..=2.0).contains(&scale)
 }
 
+/// Broker-reported DaisyRose multi-rank `LoRA` readiness and default scale (in tenths `0..=20`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DaisyRoseReadiness {
+    pub(crate) available: bool,
+    pub(crate) default_scale_tenths: u8,
+}
+
+impl DaisyRoseReadiness {
+    pub(crate) const fn default_enabled(self) -> bool {
+        self.available && self.default_scale_tenths > 0
+    }
+
+    pub(crate) fn default_scale(self) -> f32 {
+        if self.available {
+            f32::from(self.default_scale_tenths) / 10.0
+        } else {
+            DEFAULT_DAISYROSE_SCALE
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KvCache {
     F16,
@@ -265,6 +286,7 @@ pub(crate) struct Config {
     pub(crate) require_broker_pipe: bool,
     pub(crate) use_abliterate_lora: bool,
     pub(crate) daisyrose_lora: Option<PathBuf>,
+    pub(crate) no_daisyrose_lora: bool,
     pub(crate) no_mmproj: bool,
     pub(crate) use_repacked_ptq1: bool,
     pub(crate) native_engine: bool,
@@ -309,6 +331,7 @@ pub(crate) enum Event {
     Restarting,
     ContextCapacity(usize),
     VisionAvailable(bool),
+    DaisyRoseAvailable(DaisyRoseReadiness),
     Ready,
     Text(String),
     Reasoning(String),
@@ -680,6 +703,9 @@ fn runtime_arguments(config: &Config) -> Vec<String> {
     if config.use_abliterate_lora {
         arguments.push("--use-abliterate-lora".into());
     }
+    if config.no_daisyrose_lora {
+        arguments.push("--no-daisyrose-lora".into());
+    }
     if let Some(path) = config.daisyrose_lora.as_deref().and_then(|p| p.to_str()) {
         arguments.extend(["--daisyrose-lora".into(), path.to_owned()]);
     }
@@ -832,7 +858,7 @@ fn serve_broker(
     history: &mut Vec<Message>,
     spec: &ToolProcessSpec,
 ) -> Result<()> {
-    let (key, context_tokens, vision_available) = wait_ready(
+    let (key, context_tokens, vision_available, daisyrose) = wait_ready(
         broker,
         config,
         commands,
@@ -842,6 +868,7 @@ fn serve_broker(
     )?;
     notify(events, Event::ContextCapacity(context_tokens))?;
     notify(events, Event::VisionAvailable(vision_available))?;
+    notify(events, Event::DaisyRoseAvailable(daisyrose))?;
     notify(events, Event::Ready)?;
     loop {
         if broker
@@ -885,7 +912,7 @@ fn serve_broker(
                     images,
                 });
                 let scale = config.use_abliterate_lora.then_some(abliteration_scale);
-                let daisyrose_scale = config.daisyrose_lora.is_some().then_some(daisyrose_scale);
+                let daisyrose_scale = daisyrose.available.then_some(daisyrose_scale);
                 let outcome = serialize_request_with_adapters(
                     &pending,
                     max_completion_tokens,
@@ -943,7 +970,7 @@ fn wait_ready(
     history: &mut Vec<Message>,
     stdout_path: &Path,
     stderr_path: &Path,
-) -> Result<(RetainedCredential, usize, bool)> {
+) -> Result<(RetainedCredential, usize, bool, DaisyRoseReadiness)> {
     let until = Instant::now() + STARTUP_TIMEOUT;
     loop {
         check_startup_commands(commands, history)?;
@@ -953,8 +980,12 @@ fn wait_ready(
                 "The broker did not report its selected context capacity. Rebuild the broker and retry.",
             ))?;
             let vision_available = input_modalities(&output)?.unwrap_or(false);
+            let daisyrose = daisyrose_adapter(&output)?.unwrap_or(DaisyRoseReadiness {
+                available: config.daisyrose_lora.is_some(),
+                default_scale_tenths: 0,
+            });
             let key = read_api_key(&config.evidence, &directory)?;
-            return Ok((key, context_tokens, vision_available));
+            return Ok((key, context_tokens, vision_available, daisyrose));
         }
         if broker
             .try_wait()
@@ -1256,6 +1287,53 @@ fn input_modalities(output: &[u8]) -> Result<Option<bool>> {
         }
     }
     Ok(vision)
+}
+
+fn daisyrose_adapter(output: &[u8]) -> Result<Option<DaisyRoseReadiness>> {
+    let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&output[..=end])
+        .map_err(|_| Failure::Message("Broker startup output was not valid UTF-8."))?;
+    let mut status = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("DaisyRose adapter: ") {
+            let parsed = if value == "unavailable" {
+                DaisyRoseReadiness::default()
+            } else if let Some(scale) = value.strip_prefix("available, default scale ") {
+                let [whole, b'.', frac] = scale.as_bytes() else {
+                    return Err(Failure::Message(
+                        "The broker reported an unsupported DaisyRose adapter status.",
+                    ));
+                };
+                if !(b'0'..=b'2').contains(whole) || !frac.is_ascii_digit() {
+                    return Err(Failure::Message(
+                        "The broker reported an unsupported DaisyRose adapter status.",
+                    ));
+                }
+                let tenths = (*whole - b'0') * 10 + (*frac - b'0');
+                if tenths > 20 {
+                    return Err(Failure::Message(
+                        "The broker reported an unsupported DaisyRose adapter status.",
+                    ));
+                }
+                DaisyRoseReadiness {
+                    available: true,
+                    default_scale_tenths: tenths,
+                }
+            } else {
+                return Err(Failure::Message(
+                    "The broker reported an unsupported DaisyRose adapter status.",
+                ));
+            };
+            if status.replace(parsed).is_some() {
+                return Err(Failure::Message(
+                    "The broker reported DaisyRose adapter status more than once.",
+                ));
+            }
+        }
+    }
+    Ok(status)
 }
 
 fn evidence_directory(output: &[u8]) -> Result<Option<PathBuf>> {
@@ -1841,6 +1919,7 @@ mod tests {
             require_broker_pipe: false,
             use_abliterate_lora: true,
             daisyrose_lora: None,
+            no_daisyrose_lora: false,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: false,
@@ -2013,6 +2092,7 @@ mod tests {
             require_broker_pipe: true,
             use_abliterate_lora: true,
             daisyrose_lora: None,
+            no_daisyrose_lora: false,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: true,
@@ -2230,6 +2310,13 @@ mod tests {
             runtime_arguments(&with_daisy)
                 .array_windows()
                 .any(|pair| *pair == ["--daisyrose-lora", r"C:\adapters\daisyrose.gguf"])
+        );
+        let mut without_daisy = publisher_runtime_config();
+        without_daisy.no_daisyrose_lora = true;
+        assert!(
+            runtime_arguments(&without_daisy)
+                .iter()
+                .any(|arg| arg == "--no-daisyrose-lora")
         );
         Ok(())
     }
@@ -3390,6 +3477,59 @@ mod tests {
         assert!(input_modalities(b"Input modalities: text\nInput modalities: text\n").is_err());
         assert!(
             input_modalities(b"Input modalities: text\nInput modalities: text, image\n").is_err()
+        );
+    }
+
+    #[test]
+    fn startup_daisyrose_adapter_recognizes_available_default_scales_and_unavailable() {
+        use super::{DaisyRoseReadiness, daisyrose_adapter};
+
+        assert_eq!(
+            daisyrose_adapter(b"DaisyRose adapter: unavailable\r\n"),
+            Ok(Some(DaisyRoseReadiness {
+                available: false,
+                default_scale_tenths: 0,
+            }))
+        );
+        for (text, tenths) in [("0.0", 0), ("1.0", 10), ("1.3", 13), ("2.0", 20)] {
+            let line = format!("DaisyRose adapter: available, default scale {text}\n");
+            let parsed = daisyrose_adapter(line.as_bytes());
+            assert_eq!(
+                parsed,
+                Ok(Some(DaisyRoseReadiness {
+                    available: true,
+                    default_scale_tenths: tenths,
+                }))
+            );
+        }
+        assert_eq!(daisyrose_adapter(b"Context tokens: 8192\n"), Ok(None));
+        assert_eq!(
+            daisyrose_adapter(b"other\nDaisyRose adapter: available, default scale 1.0"),
+            Ok(None)
+        );
+        for invalid in [
+            "",
+            "available",
+            "available, default scale 2.1",
+            "available, default scale -0.0",
+            "available, default scale 1.00",
+            "available, default scale 1",
+            "unavailable ",
+        ] {
+            assert!(
+                daisyrose_adapter(format!("DaisyRose adapter: {invalid}\n").as_bytes()).is_err(),
+                "expected rejection for {invalid:?}"
+            );
+        }
+        assert!(
+            daisyrose_adapter(b"DaisyRose adapter: unavailable\nDaisyRose adapter: unavailable\n")
+                .is_err()
+        );
+        assert!(
+            daisyrose_adapter(
+                b"DaisyRose adapter: unavailable\nDaisyRose adapter: available, default scale 1.0\n"
+            )
+            .is_err()
         );
     }
 

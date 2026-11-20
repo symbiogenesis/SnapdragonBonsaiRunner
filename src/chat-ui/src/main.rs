@@ -535,6 +535,7 @@ fn configuration_for_family(
         require_broker_pipe,
         use_abliterate_lora: !no_abliterate_lora,
         daisyrose_lora,
+        no_daisyrose_lora,
         no_mmproj,
         use_repacked_ptq1: use_repacked_ptq1.unwrap_or(false),
         native_engine,
@@ -1260,6 +1261,8 @@ mod tests {
         no_daisy.push("--no-daisyrose-lora".into());
         let parsed_no_daisy = configuration(no_daisy.clone()).map_err(io::Error::other)?;
         assert!(parsed_no_daisy.daisyrose_lora.is_none());
+        assert!(parsed_no_daisy.no_daisyrose_lora);
+        assert!(!parsed_daisy.no_daisyrose_lora);
         no_daisy.push("--no-daisyrose-lora".into());
         assert!(configuration(no_daisy).is_err());
 

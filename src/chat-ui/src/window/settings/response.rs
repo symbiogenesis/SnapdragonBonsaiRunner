@@ -92,13 +92,16 @@ impl State {
                         self.abliteration_enabled,
                         !self.model.busy(),
                     );
-                    self.recovery_dirty |= daisyrose_preferences(
+                    let daisyrose_changed = daisyrose_preferences(
                         ui,
                         self.daisyrose_available,
+                        self.daisyrose_default_scale_tenths,
                         &mut self.daisyrose_enabled,
                         &mut self.daisyrose_scale,
                         !self.model.busy(),
                     );
+                    self.daisyrose_customized |= daisyrose_changed;
+                    self.recovery_dirty |= daisyrose_changed;
                 });
         });
     }
@@ -194,6 +197,7 @@ fn adapter_preferences(ui: &mut egui::Ui, scale: &mut f32, enabled: bool, editab
 fn daisyrose_preferences(
     ui: &mut egui::Ui,
     available: bool,
+    default_scale_tenths: u8,
     enabled: &mut bool,
     scale: &mut f32,
     editable: bool,
@@ -226,16 +230,24 @@ fn daisyrose_preferences(
             .changed()
         })
         .inner;
-    ui.label(
-        RichText::new(if !available {
-            "No --daisyrose-lora GGUF selected at launch."
-        } else if *enabled {
-            "0 disables contribution. Default: 0.0. Applies to your next response."
-        } else {
-            "Enable DaisyRose above to adjust its scale."
-        })
-        .small()
-        .weak(),
-    );
+    let help = if !available {
+        "Unavailable for this launch (not configured, opted out with --no-daisyrose-lora, or omitted under memory limits)."
+            .to_owned()
+    } else if *enabled {
+        format!(
+            "0 disables contribution. Default: {}.{}. Applies to your next response.",
+            default_scale_tenths / 10,
+            default_scale_tenths % 10
+        )
+    } else if default_scale_tenths > 0 {
+        format!(
+            "Disabled for this conversation. New conversations default to {}.{}. Enable DaisyRose above to adjust its scale.",
+            default_scale_tenths / 10,
+            default_scale_tenths % 10
+        )
+    } else {
+        "Enable DaisyRose above to adjust its scale.".to_owned()
+    };
+    ui.label(RichText::new(help).small().weak());
     changed
 }
