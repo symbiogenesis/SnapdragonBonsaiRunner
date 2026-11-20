@@ -114,12 +114,24 @@ remain pending. Separate independent Rust providers for `threadpool.hpp` (`test-
 additionally pass their focused `reference_*` unit tests and Release ARM64
 Clippy, removing those ten C++ headers and leaving 25 checked-in C++ files (plus
 2 C ABI files = 27 total native files; 28 cross-repo including Runner's 1 C
-file); complete Prism suite, native bridge compilation and owning hosted
-acceptance remain pending.
+file). Independent clean-room Rust providers for `public_c_abi.c`/`.h`
+(`test-c` via `reference_public_c_abi.rs`), `dspark.hpp` (`test-dspark-logsnr-meta`
+via `reference_dspark_logsnr.rs`), `arg_parser.hpp` (`test-arg-parser` via
+`reference_arg_parser.rs`), `optimizer.hpp` (`test-opt` via
+`reference_optimizer.rs`), `codec.hpp` (`test-quantize-fns` and
+`test-ptq1_0-cuda-dot` via `reference_codec.rs`), and `jinja.hpp` (`test-jinja`
+via `reference_jinja.rs`) additionally pass their focused `reference_*` and
+assertion tests, `rustfmt --check`, and Release Clippy on integrated Prism
+`main` (`15e3e59fc`), removing those 5 C++ headers and 2 C ABI files (with
+helper functions inlined into `codec_buffers.hpp`) and leaving 20 checked-in C++
+files and 0 C files in Prism (20 Prism native files; 21 cross-repo including
+Runner's 1 C file), with all 19 `RequiredReferencePassedIds` in `baseline.json`
+off checked-in C++; complete Prism suite execution, native bridge compilation and
+owning hosted acceptance remain pending.
 
 The [checked-in boundary verifier](../tools/ci/README.md#checked-in-native-retirement-boundary)
-now binds Runner's remaining C file and the reviewed Prism snapshot's 25 C++
-files plus coupled C ABI source/header and migrated Rust assertion/provider edges.
+now binds Runner's remaining C file and the reviewed Prism snapshot's 20 C++
+files plus migrated Rust assertion/provider edges.
 Exact per-file families and declared
 compiler/provider/contracts identities preserve the green-ID baseline and both
 original ordered geometry schedules. Four focused controls, strict Release
