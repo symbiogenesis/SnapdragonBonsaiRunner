@@ -267,5 +267,51 @@ try {
         Assert-CiEqual ([IO.File]::ReadAllText((Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'))) $binary
     } finally { Remove-CiScratch $scratch }
  }
+ cargo_path_fallback_discovers_cargo_and_restores_path={
+    $scratch=New-CiScratch 'bonsai-push-cargo-path-'
+    try {
+        $repository=Join-Path $scratch 'repository'; $target=Join-Path $scratch 'target'
+        foreach ($path in @('Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo/fixture.txt','tools/ci/fixture.txt','src/artifacts/fixture.txt','src/windows-process/fixture.txt','src/windows-credentials/fixture.txt')) { Write-CiFixture $repository $path 'Inert source identity fixture; no compiler consumer.' }
+        Write-CiFixture $repository 'scripts/release/Release-Common.ps1' @'
+function Get-ReleaseToolchain([string]$RepositoryRoot) {
+    $found = Get-Command cargo.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) { throw 'Cargo missing from PATH.' }
+    throw "Cargo resolved at: $($found.Source)"
+}
+'@
+        & git -C $repository init --quiet
+        if ($LASTEXITCODE) { throw 'Cannot initialize cargo-path fixture.' }
+        & git -C $repository add --all
+        if ($LASTEXITCODE) { throw 'Cannot stage cargo-path fixture.' }
+        & git -C $repository -c user.name=Fixture -c user.email=fixture@example.invalid -c core.hooksPath= -c commit.gpgsign=false commit --quiet -m fixture
+        if ($LASTEXITCODE) { throw 'Cannot commit cargo-path fixture.' }
+        $cargoHome=Join-Path $scratch 'cargo-home'
+        $userProfile=Join-Path $scratch 'user-profile'
+        $cargoHomeExe=[IO.Path]::GetFullPath((Join-Path $cargoHome 'bin/cargo.exe'))
+        $userProfileExe=[IO.Path]::GetFullPath((Join-Path $userProfile '.cargo/bin/cargo.exe'))
+        Write-CiFixture $cargoHome 'bin/cargo.exe' 'Inert cargo-home placeholder; must never execute.'
+        Write-CiFixture $userProfile '.cargo/bin/cargo.exe' 'Inert user-profile placeholder; must never execute.'
+        $gitDirectory=[IO.Path]::GetDirectoryName((Get-Command git -CommandType Application | Select-Object -First 1).Source)
+        $driver=Join-Path $scratch 'cargo-path-driver.ps1'
+        @'
+#Requires -Version 7.6
+param([string]$Adapter,[string]$Repository,[string]$Target,[string]$GitDirectory,[string]$CargoHome,[string]$UserProfile,[string]$CargoHomeExe,[string]$UserProfileExe,[string]$Support)
+. $Support
+$cleanPath=$GitDirectory+[IO.Path]::PathSeparator+(Join-Path $env:SystemRoot 'System32')
+$env:PATH=$cleanPath
+Assert-Ci ($null -eq (Get-Command cargo.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)) 'Clean fixture PATH unexpectedly contained cargo.exe.'
+[Environment]::SetEnvironmentVariable('CARGO_HOME',$CargoHome)
+[Environment]::SetEnvironmentVariable('USERPROFILE',$UserProfile)
+Assert-CiReject { & $Adapter -Root $Repository -TargetDirectory $Target -Prepare } "Cargo resolved at: $CargoHomeExe"
+Assert-Ci ([Environment]::GetEnvironmentVariable('PATH') -ceq $cleanPath) 'Adapter did not restore PATH after CARGO_HOME fallback.'
+[Environment]::SetEnvironmentVariable('CARGO_HOME',[NullString]::Value)
+Assert-CiReject { & $Adapter -Root $Repository -TargetDirectory $Target -Prepare } "Cargo resolved at: $UserProfileExe"
+Assert-Ci ([Environment]::GetEnvironmentVariable('PATH') -ceq $cleanPath) 'Adapter did not restore PATH after USERPROFILE fallback.'
+'Cargo PATH fallback and restoration passed.'
+'@ | Set-Content -LiteralPath $driver -Encoding utf8NoBOM
+        & ([Environment]::ProcessPath) -NoLogo -NoProfile -NonInteractive -File $driver -Adapter $adapter -Repository $repository -Target $target -GitDirectory $gitDirectory -CargoHome $cargoHome -UserProfile $userProfile -CargoHomeExe $cargoHomeExe -UserProfileExe $userProfileExe -Support (Join-Path $PSScriptRoot 'test_support.ps1')
+        if ($LASTEXITCODE) { throw 'Cargo PATH fallback fixture failed.' }
+    } finally { Remove-CiScratch $scratch }
+ }
 }
 Invoke-CiCases $cases $Case

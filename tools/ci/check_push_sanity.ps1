@@ -138,9 +138,34 @@ function Sync-PushSourceTree([string]$Source, [string]$Destination) {
         }
     }
 }
+function Add-PushCargoToPath {
+    if (Get-Command cargo.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1) {
+        return
+    }
+    $candidates = [Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME) -and [IO.Path]::IsPathFullyQualified($env:CARGO_HOME)) {
+        [void]$candidates.Add((Join-Path $env:CARGO_HOME 'bin/cargo.exe'))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and [IO.Path]::IsPathFullyQualified($env:USERPROFILE)) {
+        [void]$candidates.Add((Join-Path $env:USERPROFILE '.cargo/bin/cargo.exe'))
+    }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $directory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($candidate))
+            $current = [Environment]::GetEnvironmentVariable('PATH')
+            $env:PATH = if ($current) {
+                $directory + [IO.Path]::PathSeparator + $current
+            } else {
+                $directory
+            }
+            return
+        }
+    }
+}
 $updates = if (-not $Prepare -and [Console]::IsInputRedirected) { [Console]::In.ReadToEnd() } else { '' }
 if (-not $updates.Trim() -and -not $Prepare) { return }
 $started = [Diagnostics.Stopwatch]::StartNew()
+$originalPath = [Environment]::GetEnvironmentVariable('PATH')
 $originalPwsh = $env:BONSAI_PUSH_PWSH_PATH
 $originalTargetDir = $env:BONSAI_PUSH_CARGO_TARGET_DIR
 $originalChecksum = $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS
@@ -172,6 +197,7 @@ $target = [IO.Path]::GetFullPath($TargetDirectory)
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('bonsai-push-bootstrap-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($scratch)
 try {
+    Add-PushCargoToPath
     $inputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'tools/ci', 'src/artifacts', 'src/windows-process', 'src/windows-credentials', 'scripts/release/Release-Common.ps1')
     $revisions = @('HEAD') + @($inputs | ForEach-Object { 'HEAD:' + $_ })
     $resolved = @(git -C $Root rev-parse @revisions)
@@ -309,6 +335,8 @@ try {
     Remove-Item -LiteralPath $absolute -Recurse -Force
     $power = [Windows.Forms.SystemInformation]::PowerStatus
     Write-Host "Push sanity power after: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown; aggregate elapsed=$($started.Elapsed)."
+    if ($null -eq $originalPath) { [Environment]::SetEnvironmentVariable('PATH', [NullString]::Value) }
+    else { [Environment]::SetEnvironmentVariable('PATH', $originalPath) }
     if ($null -eq $originalPwsh) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH', [NullString]::Value) }
     else { $env:BONSAI_PUSH_PWSH_PATH = $originalPwsh }
     if ($null -eq $originalTargetDir) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_CARGO_TARGET_DIR', [NullString]::Value) }

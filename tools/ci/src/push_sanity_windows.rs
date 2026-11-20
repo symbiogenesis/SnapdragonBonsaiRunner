@@ -1734,6 +1734,11 @@ mod tests {
     }
 
     #[test]
+    fn push_sanity_cargo_path_fallback_discovers_cargo_and_restores_path() -> Result<()> {
+        preparation_case("cargo_path_fallback_discovers_cargo_and_restores_path")
+    }
+
+    #[test]
     fn push_sanity_script_batch_preserves_scopes_and_rejections() -> Result<()> {
         let temporary = super::super::canonical_path(std::env::temp_dir())?;
         let nonce = SystemTime::now()

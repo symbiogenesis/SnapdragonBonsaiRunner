@@ -866,7 +866,10 @@ dependency audit or benchmark. Foundation retains Release compilation, analyzers
 complete tests; this screen does not establish their verdicts.
 
 Prerequisites are native Windows ARM64, PowerShell 7.6+, Git, the pinned Rust
-toolchain and cached locked dependencies. A valid checker requires no maintenance
+toolchain and cached locked dependencies. When `cargo.exe` is absent from
+`PATH`, `check_push_sanity.ps1` prepends `$env:CARGO_HOME\bin` or
+`%USERPROFILE%\.cargo\bin` (when present) for the duration of the check and
+restores the caller's `PATH` on exit. A valid checker requires no maintenance
 executable. When both the checker and its recovery supervisor need repair, the
 hook automatically prepares them through an independently trusted prebuilt
 `bonsai-tools.exe`. It selects `BONSAI_TOOLS_PATH`, then
