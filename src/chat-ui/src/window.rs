@@ -193,6 +193,9 @@ struct State {
     output_budget: usize,
     abliteration_scale: f32,
     abliteration_enabled: bool,
+    daisyrose_scale: f32,
+    daisyrose_enabled: bool,
+    daisyrose_available: bool,
     focus_composer: bool,
     composing: bool,
     composer_id: Option<egui::Id>,
@@ -279,6 +282,7 @@ impl State {
             state.preview = false;
             state.runtime_description = runtime_description(config);
             state.abliteration_enabled = config.use_abliterate_lora;
+            state.daisyrose_available = config.daisyrose_lora.is_some();
             state.canary_configured = config.canary.is_some();
             state.tts_configured = config.qwen_tts.is_some();
             state.canary_managed = config
@@ -369,6 +373,9 @@ impl State {
             output_budget: 3,
             abliteration_scale: client::DEFAULT_ABLITERATION_SCALE,
             abliteration_enabled: true,
+            daisyrose_scale: client::DEFAULT_DAISYROSE_SCALE,
+            daisyrose_enabled: false,
+            daisyrose_available: false,
             focus_composer: false,
             composing: false,
             composer_id: None,
@@ -445,6 +452,7 @@ impl State {
         "Preparing runtime selection…".clone_into(&mut state.runtime_description);
         state.model = ModelLifecycle::Preparing;
         state.abliteration_enabled = false;
+        state.daisyrose_available = false;
         state.record(&format!(
             "Swift Bonsai {}. Data directory: {}",
             env!("CARGO_PKG_VERSION"),
@@ -607,6 +615,7 @@ impl State {
             None => client::event_channel(),
         };
         self.abliteration_enabled = config.use_abliterate_lora;
+        self.daisyrose_available = config.daisyrose_lora.is_some();
         self.runtime_description = runtime_description(&config);
         self.markdown_image = Some(config.broker.clone());
         if !speech_pending {
@@ -777,6 +786,7 @@ impl State {
                 extra_effort: self.extra_effort,
                 enable_thinking: self.enable_thinking,
                 abliteration_scale: self.abliteration_scale,
+                daisyrose_scale: self.effective_daisyrose_scale(),
             })
             .is_err()
         {
@@ -2853,6 +2863,7 @@ pub(super) fn run(config: Config) -> io::Result<()> {
             state.preview = false;
             state.runtime_description = runtime_description(&config);
             state.abliteration_enabled = config.use_abliterate_lora;
+            state.daisyrose_available = config.daisyrose_lora.is_some();
             state.markdown_image = Some(config.broker.clone());
             state.pending_config = Some(config);
             state.attach_recovery(recovery);
@@ -3172,6 +3183,7 @@ mod startup_tests {
             backend_port: 8081,
             require_broker_pipe: false,
             use_abliterate_lora: false,
+            daisyrose_lora: None,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: false,
@@ -3299,6 +3311,7 @@ mod startup_tests {
                 backend_port: 8081,
                 require_broker_pipe: false,
                 use_abliterate_lora: false,
+                daisyrose_lora: None,
                 no_mmproj: false,
                 use_repacked_ptq1: false,
                 native_engine: true,

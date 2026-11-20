@@ -31,6 +31,10 @@ pub(super) struct ConversationSnapshot {
     pub(super) output_budget: usize,
     #[serde(default = "client::default_abliteration_scale")]
     pub(super) abliteration_scale: f32,
+    #[serde(default)]
+    pub(super) daisyrose_enabled: bool,
+    #[serde(default = "client::default_daisyrose_scale")]
+    pub(super) daisyrose_scale: f32,
     pub(super) status: String,
     #[serde(skip)]
     pub(super) status_detail: String,
@@ -63,6 +67,14 @@ impl Conversation {
 }
 
 impl State {
+    pub(super) const fn effective_daisyrose_scale(&self) -> f32 {
+        if self.daisyrose_available && self.daisyrose_enabled {
+            self.daisyrose_scale
+        } else {
+            client::DEFAULT_DAISYROSE_SCALE
+        }
+    }
+
     pub(super) fn update_worker_conversation(&mut self, command: Command) {
         // Startup and generation consume history commands without applying them.
         // Coalesce navigation until the worker can accept the selected history.
@@ -111,6 +123,8 @@ impl State {
             streaming_read_aloud: self.streaming_read_aloud,
             output_budget: self.output_budget,
             abliteration_scale: self.abliteration_scale,
+            daisyrose_enabled: self.daisyrose_enabled,
+            daisyrose_scale: self.daisyrose_scale,
             status: if self.model.ready() {
                 self.status.clone()
             } else {
@@ -155,6 +169,8 @@ impl State {
         self.streaming_read_aloud = false;
         self.output_budget = 3;
         self.abliteration_scale = client::DEFAULT_ABLITERATION_SCALE;
+        self.daisyrose_enabled = false;
+        self.daisyrose_scale = client::DEFAULT_DAISYROSE_SCALE;
         self.place_composer_cursor(0);
         self.focus_composer = true;
     }
@@ -174,6 +190,8 @@ impl State {
         self.streaming_read_aloud = snapshot.streaming_read_aloud;
         self.output_budget = snapshot.output_budget;
         self.abliteration_scale = snapshot.abliteration_scale;
+        self.daisyrose_enabled = snapshot.daisyrose_enabled;
+        self.daisyrose_scale = snapshot.daisyrose_scale;
         // Loading/failure status belongs to the model, not a saved transcript.
         if self.model.ready() {
             self.status = snapshot.status;
@@ -304,6 +322,8 @@ impl State {
         );
         std::mem::swap(&mut self.output_budget, &mut saved.output_budget);
         std::mem::swap(&mut self.abliteration_scale, &mut saved.abliteration_scale);
+        std::mem::swap(&mut self.daisyrose_enabled, &mut saved.daisyrose_enabled);
+        std::mem::swap(&mut self.daisyrose_scale, &mut saved.daisyrose_scale);
         std::mem::swap(&mut self.status, &mut saved.status);
         std::mem::swap(&mut self.status_detail, &mut saved.status_detail);
         std::mem::swap(&mut self.warning, &mut saved.warning);

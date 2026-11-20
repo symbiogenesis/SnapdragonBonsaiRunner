@@ -123,6 +123,8 @@ struct ActiveView<'a> {
     streaming_read_aloud: bool,
     output_budget: usize,
     abliteration_scale: f32,
+    daisyrose_enabled: bool,
+    daisyrose_scale: f32,
     status: &'a str,
     warning: bool,
 }
@@ -161,6 +163,7 @@ impl State {
 
     pub(super) fn workspace_bytes(&self) -> io::Result<Vec<u8>> {
         if !client::valid_abliteration_scale(self.abliteration_scale)
+            || !client::valid_daisyrose_scale(self.daisyrose_scale)
             || !valid_parts(
                 &self.transcript,
                 &self.input,
@@ -199,6 +202,8 @@ impl State {
                 streaming_read_aloud: self.streaming_read_aloud,
                 output_budget: self.output_budget,
                 abliteration_scale: self.abliteration_scale,
+                daisyrose_enabled: self.daisyrose_enabled,
+                daisyrose_scale: self.daisyrose_scale,
                 status: &self.status,
                 warning: self.warning,
             },
@@ -358,6 +363,7 @@ impl SavedWorkspace {
 
 fn valid_snapshot(saved: &ConversationSnapshot) -> bool {
     client::valid_abliteration_scale(saved.abliteration_scale)
+        && client::valid_daisyrose_scale(saved.daisyrose_scale)
         && valid_parts(
             &saved.transcript,
             &saved.input,
@@ -1083,6 +1089,35 @@ mod tests {
         for invalid in [f32::NAN, f32::INFINITY, -0.1, 2.1] {
             original.abliteration_scale = invalid;
             assert!(original.workspace_bytes().is_err());
+        }
+        original.abliteration_scale = 1.7;
+        original.daisyrose_enabled = true;
+        original.daisyrose_scale = 0.5;
+        let daisy_bytes = original.workspace_bytes()?;
+        restored.restore_workspace(&daisy_bytes)?;
+        assert!(restored.daisyrose_enabled);
+        assert!((restored.daisyrose_scale - 0.5).abs() < f32::EPSILON);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&daisy_bytes).map_err(io::Error::other)?;
+        let active_obj = legacy["active"]
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("active object"))?;
+        active_obj.remove("daisyrose_enabled");
+        active_obj.remove("daisyrose_scale");
+        restored.restore_workspace(&serde_json::to_vec(&legacy).map_err(io::Error::other)?)?;
+        assert!(!restored.daisyrose_enabled);
+        assert!((restored.daisyrose_scale - client::DEFAULT_DAISYROSE_SCALE).abs() < f32::EPSILON);
+        for invalid in [
+            serde_json::json!(-0.1),
+            serde_json::json!(2.1),
+            serde_json::json!(null),
+        ] {
+            legacy["active"]["daisyrose_scale"] = invalid;
+            assert!(
+                restored
+                    .restore_workspace(&serde_json::to_vec(&legacy).map_err(io::Error::other)?)
+                    .is_err()
+            );
         }
         Ok(())
     }

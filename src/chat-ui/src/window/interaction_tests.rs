@@ -556,6 +556,53 @@ fn abliteration_startup_opt_out_disables_settings_control() {
 }
 
 #[test]
+fn daisyrose_settings_toggle_and_slider_default_off_and_reach_next_turn() {
+    let mut chat = harness([1180.0, 960.0], false);
+    assert!(!chat.state().app.daisyrose_available);
+    assert!(!chat.state().app.daisyrose_enabled);
+    assert!((chat.state().app.daisyrose_scale - 0.0).abs() < f32::EPSILON);
+
+    chat.state_mut().app.daisyrose_available = true;
+    chat.state_mut().app.show_settings = true;
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::DisclosureTriangle, "Advanced response controls")
+        .scroll_to_me();
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::DisclosureTriangle, "Advanced response controls")
+        .click();
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::CheckBox, "Enable DaisyRose adapter")
+        .scroll_to_me();
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::CheckBox, "Enable DaisyRose adapter")
+        .click();
+    chat.run();
+    assert!(chat.state().app.daisyrose_enabled);
+
+    chat.get_by_role_and_label(egui::Role::Slider, "DaisyRose scale")
+        .scroll_to_me();
+    chat.run();
+    chat.get_by_role_and_label(egui::Role::Slider, "DaisyRose scale")
+        .focus();
+    chat.run();
+    chat.key_press(egui::Key::ArrowRight);
+    chat.run();
+    chat.key_press(egui::Key::ArrowRight);
+    chat.run();
+    let selected = chat.state().app.daisyrose_scale;
+    assert!((selected - 0.2).abs() < 0.01);
+
+    chat.state_mut().app.show_settings = false;
+    chat.state_mut().app.input = "Test DaisyRose turn".to_owned();
+    chat.state_mut().app.submit();
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { daisyrose_scale, .. })
+            if (daisyrose_scale - selected).abs() < f32::EPSILON
+    ));
+}
+
+#[test]
 fn accessible_chat_controls_handle_enter_and_shift_enter() {
     let mut menu = harness([760.0, 800.0], false);
     menu.get_by_role_and_label(egui::Role::Button, "Conversation menu")

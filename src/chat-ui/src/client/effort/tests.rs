@@ -31,11 +31,12 @@ fn task() -> Vec<Message> {
 #[test]
 fn effort_working_material_keeps_json_bytes_and_rejects_oversized_temporaries() -> Result<()> {
     let pending = task();
-    let original = serialize_request(&pending, 1024, false, None)?;
+    let original = serialize_request_with_adapters(&pending, 1024, false, None, None)?;
     let options = ResponseOptions {
         max_completion_tokens: 1024,
         enable_thinking: false,
         abliteration_scale: None,
+        daisyrose_scale: None,
     };
     let working = Working {
         plan: Some("A plan: 雨 🌱\n\"quoted\""),
@@ -73,7 +74,10 @@ fn effort_working_material_keeps_json_bytes_and_rejects_oversized_temporaries() 
             .err(),
             Some(request_byte_limit()),
         );
-        assert_eq!(serialize_request(&pending, 1024, false, None)?, original);
+        assert_eq!(
+            serialize_request_with_adapters(&pending, 1024, false, None, None)?,
+            original
+        );
     }
     Ok(())
 }
@@ -90,6 +94,7 @@ fn effort_applies_thinking_selection_to_every_stage() -> Result<()> {
                 max_completion_tokens: 1024,
                 enable_thinking,
                 abliteration_scale: None,
+                daisyrose_scale: None,
             },
             &incoming,
             &events,
@@ -140,6 +145,7 @@ fn effort_stages_use_fresh_original_context() -> Result<()> {
             max_completion_tokens: 2048,
             enable_thinking: false,
             abliteration_scale: Some(1.3),
+            daisyrose_scale: Some(0.5),
         },
         &incoming,
         &events,
@@ -164,6 +170,7 @@ fn effort_stages_use_fresh_original_context() -> Result<()> {
     for request in &requests {
         assert_eq!(request["max_completion_tokens"], 2048);
         assert_eq!(request["abliteration_scale"], serde_json::json!(1.3));
+        assert_eq!(request["daisyrose_scale"], serde_json::json!(0.5));
         assert_eq!(request["messages"].as_array().map(Vec::len), Some(4));
         assert_eq!(request["messages"][0]["role"], "system");
         assert_eq!(
@@ -218,6 +225,7 @@ fn effort_truncation_stops_later_stages_and_keeps_complete_draft() -> Result<()>
                 max_completion_tokens: 4096,
                 enable_thinking: false,
                 abliteration_scale: None,
+                daisyrose_scale: None,
             },
             &incoming,
             &events,
@@ -275,6 +283,7 @@ fn effort_cancellation_and_request_bounds_prevent_later_calls() {
             max_completion_tokens: 1024,
             enable_thinking: false,
             abliteration_scale: None,
+            daisyrose_scale: None,
         },
         &incoming,
         &events,
@@ -295,6 +304,7 @@ fn effort_cancellation_and_request_bounds_prevent_later_calls() {
             max_completion_tokens: 1024,
             enable_thinking: false,
             abliteration_scale: None,
+            daisyrose_scale: None,
         },
         &incoming,
         &events,
@@ -318,6 +328,7 @@ fn effort_review_failure_leaves_complete_draft_visible() {
             max_completion_tokens: 4096,
             enable_thinking: false,
             abliteration_scale: None,
+            daisyrose_scale: None,
         },
         &incoming,
         &events,

@@ -127,12 +127,21 @@ If the user explicitly asks to inspect raw SVG markup or source code, use a ```x
 For all ordinary requests, respond normally without emitting an ```svg block.";
 
 pub(crate) const DEFAULT_ABLITERATION_SCALE: f32 = 1.3;
+pub(crate) const DEFAULT_DAISYROSE_SCALE: f32 = 0.0;
 
 pub(crate) const fn default_abliteration_scale() -> f32 {
     DEFAULT_ABLITERATION_SCALE
 }
 
 pub(crate) fn valid_abliteration_scale(scale: f32) -> bool {
+    scale.is_finite() && (0.0..=2.0).contains(&scale)
+}
+
+pub(crate) const fn default_daisyrose_scale() -> f32 {
+    DEFAULT_DAISYROSE_SCALE
+}
+
+pub(crate) fn valid_daisyrose_scale(scale: f32) -> bool {
     scale.is_finite() && (0.0..=2.0).contains(&scale)
 }
 
@@ -255,6 +264,7 @@ pub(crate) struct Config {
     pub(crate) backend_port: u16,
     pub(crate) require_broker_pipe: bool,
     pub(crate) use_abliterate_lora: bool,
+    pub(crate) daisyrose_lora: Option<PathBuf>,
     pub(crate) no_mmproj: bool,
     pub(crate) use_repacked_ptq1: bool,
     pub(crate) native_engine: bool,
@@ -282,6 +292,7 @@ pub(crate) enum Command {
         extra_effort: bool,
         enable_thinking: bool,
         abliteration_scale: f32,
+        daisyrose_scale: f32,
     },
     NewChat,
     RestoreChat(Vec<Message>),
@@ -488,6 +499,8 @@ struct ChatRequest<'a> {
     enable_thinking: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     abliteration_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daisyrose_scale: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -495,6 +508,7 @@ struct ResponseOptions {
     max_completion_tokens: u32,
     enable_thinking: bool,
     abliteration_scale: Option<f32>,
+    daisyrose_scale: Option<f32>,
 }
 
 /// Launch the owned broker, then serve one in-memory conversation until shutdown.
@@ -665,6 +679,9 @@ fn runtime_arguments(config: &Config) -> Vec<String> {
     let mut arguments = Vec::with_capacity(16);
     if config.use_abliterate_lora {
         arguments.push("--use-abliterate-lora".into());
+    }
+    if let Some(path) = config.daisyrose_lora.as_deref().and_then(|p| p.to_str()) {
+        arguments.extend(["--daisyrose-lora".into(), path.to_owned()]);
     }
     if config.no_mmproj {
         arguments.push("--no-mmproj".into());
@@ -850,6 +867,7 @@ fn serve_broker(
                 extra_effort,
                 enable_thinking,
                 abliteration_scale,
+                daisyrose_scale,
             }) => {
                 if text.trim().is_empty() && images.is_empty() {
                     continue;
@@ -867,35 +885,42 @@ fn serve_broker(
                     images,
                 });
                 let scale = config.use_abliterate_lora.then_some(abliteration_scale);
-                let outcome =
-                    serialize_request(&pending, max_completion_tokens, enable_thinking, scale)
-                        .and_then(|request| {
-                            if extra_effort {
-                                // Validate the original request locally; effort
-                                // constructs its own stage bodies.
-                                drop(request);
-                                effort::run(
-                                    config.frontend_port,
-                                    key.as_hex(),
-                                    &pending,
-                                    ResponseOptions {
-                                        max_completion_tokens,
-                                        enable_thinking,
-                                        abliteration_scale: scale,
-                                    },
-                                    commands,
-                                    events,
-                                )
-                            } else {
-                                generate(
-                                    config.frontend_port,
-                                    key.as_hex(),
-                                    request,
-                                    commands,
-                                    events,
-                                )
-                            }
-                        });
+                let daisyrose_scale = config.daisyrose_lora.is_some().then_some(daisyrose_scale);
+                let outcome = serialize_request_with_adapters(
+                    &pending,
+                    max_completion_tokens,
+                    enable_thinking,
+                    scale,
+                    daisyrose_scale,
+                )
+                .and_then(|request| {
+                    if extra_effort {
+                        // Validate the original request locally; effort
+                        // constructs its own stage bodies.
+                        drop(request);
+                        effort::run(
+                            config.frontend_port,
+                            key.as_hex(),
+                            &pending,
+                            ResponseOptions {
+                                max_completion_tokens,
+                                enable_thinking,
+                                abliteration_scale: scale,
+                                daisyrose_scale,
+                            },
+                            commands,
+                            events,
+                        )
+                    } else {
+                        generate(
+                            config.frontend_port,
+                            key.as_hex(),
+                            request,
+                            commands,
+                            events,
+                        )
+                    }
+                });
                 finish_turn(
                     history,
                     pending,
@@ -1323,15 +1348,37 @@ fn finish_turn(
     }
 }
 
+#[cfg(test)]
 fn serialize_request(
     history: &[Message],
     max_completion_tokens: u32,
     enable_thinking: bool,
     abliteration_scale: Option<f32>,
 ) -> Result<Vec<u8>> {
+    serialize_request_with_adapters(
+        history,
+        max_completion_tokens,
+        enable_thinking,
+        abliteration_scale,
+        None,
+    )
+}
+
+fn serialize_request_with_adapters(
+    history: &[Message],
+    max_completion_tokens: u32,
+    enable_thinking: bool,
+    abliteration_scale: Option<f32>,
+    daisyrose_scale: Option<f32>,
+) -> Result<Vec<u8>> {
     if abliteration_scale.is_some_and(|scale| !valid_abliteration_scale(scale)) {
         return Err(Failure::Rejected(
             "Choose an abliteration scale between 0 and 2.",
+        ));
+    }
+    if daisyrose_scale.is_some_and(|scale| !valid_daisyrose_scale(scale)) {
+        return Err(Failure::Rejected(
+            "Choose a DaisyRose scale between 0 and 2.",
         ));
     }
     if !(1..=4096).contains(&max_completion_tokens) {
@@ -1365,6 +1412,7 @@ fn serialize_request(
             stream: true,
             enable_thinking,
             abliteration_scale,
+            daisyrose_scale,
         },
         limit,
     )
@@ -1792,6 +1840,7 @@ mod tests {
             backend_port: 8081,
             require_broker_pipe: false,
             use_abliterate_lora: true,
+            daisyrose_lora: None,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: false,
@@ -1963,6 +2012,7 @@ mod tests {
             backend_port: 8082,
             require_broker_pipe: true,
             use_abliterate_lora: true,
+            daisyrose_lora: None,
             no_mmproj: false,
             use_repacked_ptq1: false,
             native_engine: true,
@@ -2154,7 +2204,18 @@ mod tests {
                 serialize_request(&history, 4096, false, Some(scale)),
                 Err(Failure::Rejected(_))
             ));
+            assert!(matches!(
+                super::serialize_request_with_adapters(&history, 4096, false, Some(1.3), Some(scale)),
+                Err(Failure::Rejected(_))
+            ));
         }
+        let stacked = super::serialize_request_with_adapters(&history, 4096, false, Some(1.3), Some(0.5))?;
+        let stacked_json: serde_json::Value = serde_json::from_slice(&stacked)
+            .map_err(|_| Failure::Message("invalid stacked request JSON"))?;
+        assert!(stacked_json["daisyrose_scale"].as_f64().is_some_and(|v| (v - 0.5).abs() < 1e-6));
+        let mut with_daisy = publisher_runtime_config();
+        with_daisy.daisyrose_lora = Some(r"C:\adapters\daisyrose.gguf".into());
+        assert!(runtime_arguments(&with_daisy).array_windows().any(|pair| *pair == ["--daisyrose-lora", r"C:\adapters\daisyrose.gguf"]));
         Ok(())
     }
     use std::io::{self, Read};
@@ -3023,6 +3084,7 @@ mod tests {
                     extra_effort: false,
                     enable_thinking: false,
                     abliteration_scale: super::DEFAULT_ABLITERATION_SCALE,
+                    daisyrose_scale: super::DEFAULT_DAISYROSE_SCALE,
                 })
                 .is_ok()
         );

@@ -158,6 +158,7 @@ fn configuration_for_family(
     let (mut tts_quantization, mut tts_threads) = (None, None);
     let mut require_broker_pipe = false;
     let mut no_abliterate_lora = false;
+    let mut daisyrose_lora = None;
     let mut no_mmproj = false;
     let mut use_repacked_ptq1 = None;
     let mut native_engine = None;
@@ -176,6 +177,12 @@ fn configuration_for_family(
         match option.to_str() {
             Some("--require-broker-pipe") if !require_broker_pipe => require_broker_pipe = true,
             Some("--no-abliterate-lora") if !no_abliterate_lora => no_abliterate_lora = true,
+            Some("--daisyrose-lora") if daisyrose_lora.is_none() => {
+                daisyrose_lora = Some(PathBuf::from(
+                    args.next()
+                        .ok_or("A DaisyRose multi-rank LoRA GGUF path is required.")?,
+                ));
+            }
             Some("--no-mmproj") if !no_mmproj => no_mmproj = true,
             Some("--use-repacked-ptq1") if use_repacked_ptq1.is_none() => {
                 use_repacked_ptq1 = Some(true);
@@ -408,7 +415,7 @@ fn configuration_for_family(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
@@ -469,6 +476,9 @@ fn configuration_for_family(
     if placement.is_some() && !native_engine {
         return Err("Placement selection requires --native-engine.");
     }
+    if daisyrose_lora.is_some() && !native_engine {
+        return Err("DaisyRose multi-rank LoRA requires --native-engine.");
+    }
     if native_row_workers != 1 && !native_engine {
         return Err("Parallel native row workers require --native-engine.");
     }
@@ -519,6 +529,7 @@ fn configuration_for_family(
         backend_port: backend_port.unwrap_or(8081),
         require_broker_pipe,
         use_abliterate_lora: !no_abliterate_lora,
+        daisyrose_lora,
         no_mmproj,
         use_repacked_ptq1: use_repacked_ptq1.unwrap_or(false),
         native_engine,
@@ -560,6 +571,13 @@ fn validate_configuration(
     }
     if !config.broker.is_file() || !config.data.is_dir() || !config.evidence.is_dir() {
         return Err("The broker, model data and evidence directory must already exist.");
+    }
+    if let Some(daisyrose_path) = &config.daisyrose_lora {
+        bonsai_windows_credentials::validate_external_path(daisyrose_path)
+            .map_err(|_| "Use an existing expanded absolute DaisyRose LoRA GGUF path.")?;
+        if daisyrose_path.to_str().is_none() || !daisyrose_path.is_file() {
+            return Err("The DaisyRose multi-rank LoRA GGUF must be an existing Unicode file.");
+        }
     }
     if config.frontend_port < 1024
         || config.backend_port < 1024
@@ -1215,6 +1233,28 @@ mod tests {
         assert!(no_vision.no_mmproj);
         mmproj_disabled.push("--no-mmproj".into());
         assert!(configuration(mmproj_disabled).is_err());
+        let daisy_gguf = directory.join("daisyrose-vet.gguf");
+        fs::write(&daisy_gguf, b"GGUF")?;
+        let mut with_daisy = native.clone();
+        with_daisy.extend([
+            OsString::from("--daisyrose-lora"),
+            daisy_gguf.as_os_str().to_owned(),
+        ]);
+        let parsed_daisy = configuration(with_daisy.clone()).map_err(io::Error::other)?;
+        assert_eq!(parsed_daisy.daisyrose_lora.as_ref(), Some(&daisy_gguf));
+        with_daisy.extend([
+            OsString::from("--daisyrose-lora"),
+            daisy_gguf.as_os_str().to_owned(),
+        ]);
+        assert!(configuration(with_daisy).is_err());
+        let mut publisher_daisy = args.clone();
+        publisher_daisy.extend([
+            OsString::from("--publisher-engine"),
+            OsString::from("--daisyrose-lora"),
+            daisy_gguf.as_os_str().to_owned(),
+        ]);
+        assert!(configuration(publisher_daisy).is_err());
+
         native.push("--use-repacked-ptq1".into());
         assert!(configuration(native).is_ok_and(|config| config.use_repacked_ptq1));
         let mut disabled = args;
@@ -1227,6 +1267,7 @@ mod tests {
         // Neither mode requires adapter bytes at UI parsing time; the broker
         // verifies the selected artifacts before creating an inference process.
         assert!(!directory.join("adapters").exists());
+        fs::remove_file(daisy_gguf)?;
         fs::remove_file(broker)?;
         fs::remove_dir(directory)?;
         Ok(())

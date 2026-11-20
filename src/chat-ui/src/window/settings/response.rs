@@ -92,6 +92,13 @@ impl State {
                         self.abliteration_enabled,
                         !self.model.busy(),
                     );
+                    self.recovery_dirty |= daisyrose_preferences(
+                        ui,
+                        self.daisyrose_available,
+                        &mut self.daisyrose_enabled,
+                        &mut self.daisyrose_scale,
+                        !self.model.busy(),
+                    );
                 });
         });
     }
@@ -177,6 +184,55 @@ fn adapter_preferences(ui: &mut egui::Ui, scale: &mut f32, enabled: bool, editab
             "0 disables the correction. Default: 1.3. Applies to your next response."
         } else {
             "Disabled by the selected launch options."
+        })
+        .small()
+        .weak(),
+    );
+    changed
+}
+
+fn daisyrose_preferences(
+    ui: &mut egui::Ui,
+    available: bool,
+    enabled: &mut bool,
+    scale: &mut f32,
+    editable: bool,
+) -> bool {
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(RichText::new("DaisyRose multi-rank LoRA").strong());
+    ui.label(
+        RichText::new(
+            "Optional stackable NpuFriendly adapter applied alongside the pinned adapter when enabled.",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(8.0);
+    let mut changed = ui
+        .add_enabled_ui(editable && available, |ui| {
+            ui.checkbox(enabled, "Enable DaisyRose adapter").changed()
+        })
+        .inner;
+    changed |= ui
+        .add_enabled_ui(editable && available && *enabled, |ui| {
+            ui.add(
+                egui::Slider::new(scale, 0.0..=2.0)
+                    .step_by(0.1)
+                    .fixed_decimals(1)
+                    .text("DaisyRose scale"),
+            )
+            .changed()
+        })
+        .inner;
+    ui.label(
+        RichText::new(if !available {
+            "No --daisyrose-lora GGUF selected at launch."
+        } else if *enabled {
+            "0 disables contribution. Default: 0.0. Applies to your next response."
+        } else {
+            "Enable DaisyRose above to adjust its scale."
         })
         .small()
         .weak(),

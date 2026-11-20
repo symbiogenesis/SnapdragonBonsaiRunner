@@ -273,6 +273,7 @@ impl State {
                 extra_effort: self.extra_effort,
                 enable_thinking: self.enable_thinking,
                 abliteration_scale: self.abliteration_scale,
+                daisyrose_scale: self.effective_daisyrose_scale(),
             })
             .is_err()
         {
@@ -383,6 +384,8 @@ impl State {
             self.streaming_read_aloud,
             self.output_budget,
             self.abliteration_scale,
+            self.daisyrose_enabled,
+            self.daisyrose_scale,
         );
         self.stop_speech();
         self.save_conversation();
@@ -402,6 +405,8 @@ impl State {
             self.streaming_read_aloud,
             self.output_budget,
             self.abliteration_scale,
+            self.daisyrose_enabled,
+            self.daisyrose_scale,
         ) = settings;
         if let Some(answer) = self.committed.last() {
             self.last_answer = answer.content.to_string();

@@ -2,7 +2,7 @@
 
 use super::{
     Command, Completion, Event, EventSender, Failure, MAX_REQUEST, Message, ResponseOptions,
-    Result, check_commands, generate, notify, request_byte_limit, serialize_request,
+    Result, check_commands, generate, notify, request_byte_limit, serialize_request_with_adapters,
 };
 use serde::Serialize;
 use std::sync::mpsc::Receiver;
@@ -77,11 +77,12 @@ fn stage_request(
     }
     drop(working);
     task.content = content.into();
-    serialize_request(
+    serialize_request_with_adapters(
         &fresh,
         options.max_completion_tokens,
         options.enable_thinking,
         options.abliteration_scale,
+        options.daisyrose_scale,
     )
 }
 
