@@ -32,7 +32,7 @@ trait Metadata {
     fn find(&self, name: &[u8]) -> Option<usize>;
     fn string_count(&self, key: usize) -> io::Result<usize>;
     fn string(&self, key: usize, index: usize) -> io::Result<&[u8]>;
-    fn string_table(&self, _key: usize) -> Option<&[Box<[u8]>]> {
+    fn string_table(&self, _key: usize) -> Option<&[String]> {
         None
     }
     fn u32_value(&self, key: usize) -> io::Result<u32>;
@@ -59,11 +59,11 @@ impl Metadata for Weights {
     fn string(&self, key: usize, index: usize) -> io::Result<&[u8]> {
         self.string_array(key_name(key)?)?
             .get(index)
-            .map(Box::as_ref)
+            .map(String::as_bytes)
             .ok_or_else(invalid)
     }
 
-    fn string_table(&self, key: usize) -> Option<&[Box<[u8]>]> {
+    fn string_table(&self, key: usize) -> Option<&[String]> {
         self.string_array(key_name(key).ok()?).ok()
     }
 
@@ -100,9 +100,14 @@ fn tables(metadata: &impl Metadata) -> io::Result<Tokenizer> {
     reject_stage(1)?;
     let mut owner = Tokenizer::new();
     if let Some(table) = metadata.string_table(token_key) {
+        let total_bytes: usize = table.iter().map(String::len).sum();
+        owner.reserve_tokens(table.len(), total_bytes)?;
         for (index, entry) in table.iter().enumerate() {
             reject_stage(2)?;
-            owner.add_token(entry, i32::try_from(index).map_err(io::Error::other)?)?;
+            owner.add_token(
+                entry.as_bytes(),
+                i32::try_from(index).map_err(io::Error::other)?,
+            )?;
         }
     } else {
         for index in 0..tokens {
@@ -114,9 +119,14 @@ fn tables(metadata: &impl Metadata) -> io::Result<Tokenizer> {
         }
     }
     if let Some(table) = metadata.string_table(merge_key) {
+        let total_bytes: usize = table.iter().map(String::len).sum();
+        owner.reserve_merges(table.len(), total_bytes)?;
         for (index, entry) in table.iter().enumerate() {
             reject_stage(3)?;
-            owner.add_merge(entry, i32::try_from(index).map_err(io::Error::other)?)?;
+            owner.add_merge(
+                entry.as_bytes(),
+                i32::try_from(index).map_err(io::Error::other)?,
+            )?;
         }
     } else {
         for index in 0..merges {

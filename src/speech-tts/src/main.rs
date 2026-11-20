@@ -140,17 +140,7 @@ fn run() -> io::Result<()> {
             writeln!(io::stdout().lock())
         }
         Command::Serve(arguments) => {
-            let guards = startup_step("verified model artifacts", || {
-                launch::verify_models(
-                    Kind::QwenTts,
-                    &arguments,
-                    match arguments.quantization {
-                        TtsQuantization::Q8 => include_str!("../model.lock.json"),
-                        TtsQuantization::Q4KM => include_str!("../model-q4.lock.json"),
-                    },
-                )
-            })?;
-            let codec = arguments
+            let _codec = arguments
                 .codec
                 .as_ref()
                 .ok_or_else(|| io::Error::other("Native speech codec is required."))?;
@@ -158,13 +148,54 @@ fn run() -> io::Result<()> {
                 .voice_model
                 .as_ref()
                 .ok_or_else(|| io::Error::other("Native speech voice model is required."))?;
-            let synthesizer = startup_step("Rust model loading", || {
-                bonsai_speech_tts::Synthesizer::load_with_threads(
-                    &arguments.model,
-                    codec,
-                    voice_model,
-                    arguments.threads,
-                )
+            let lock_json = match arguments.quantization {
+                TtsQuantization::Q8 => include_str!("../model.lock.json"),
+                TtsQuantization::Q4KM => include_str!("../model-q4.lock.json"),
+            };
+            let _written = writeln!(
+                io::stderr().lock(),
+                "Qwen TTS startup stage: verified model artifacts."
+            );
+            let _written = writeln!(
+                io::stderr().lock(),
+                "Qwen TTS startup stage: Rust model loading."
+            );
+            let threads = arguments.threads;
+            let (guards, loaded_codec, loaded_design) = launch::verify_and_load_tts(
+                &arguments,
+                lock_json,
+                |verified_codec| {
+                    bonsai_speech_tts::Synthesizer::load_codec_with_threads(verified_codec, threads)
+                },
+                |verified_design| {
+                    bonsai_speech_tts::Synthesizer::load_design_with_threads(verified_design, threads)
+                },
+            )
+            .map_err(|failure| {
+                let stage = match failure.stage {
+                    launch::TtsStartupStage::Verify => "verified model artifacts",
+                    launch::TtsStartupStage::Load => "Rust model loading",
+                };
+                let _written = writeln!(
+                    io::stderr().lock(),
+                    "{}",
+                    startup_failure(stage, &failure.error)
+                );
+                failure.error
+            })?;
+            let synthesizer = bonsai_speech_tts::Synthesizer::assemble(
+                &arguments.model,
+                voice_model,
+                loaded_codec,
+                loaded_design,
+                threads,
+            )
+            .inspect_err(|error| {
+                let _written = writeln!(
+                    io::stderr().lock(),
+                    "{}",
+                    startup_failure("Rust model loading", error)
+                );
             })?;
             let engine = NativeEngine {
                 synthesizer,

@@ -37,16 +37,60 @@ enum Metadata {
     F32(f32),
     String(String),
     U32Array(Vec<u32>),
-    StringArray(Vec<Box<[u8]>>),
+    StringArray(Vec<String>),
     Other,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Tensor {
     shape: Vec<usize>,
     kind: u32,
     offset: u64,
     bytes: usize,
+}
+
+/// Read-only retained memory-mapped tensor view sharing an `Arc<MappedFile>` without an open handle.
+#[cfg(windows)]
+pub(crate) struct MappedWeights {
+    mapped: std::sync::Arc<bonsai_windows_process::MappedFile>,
+    metadata: BTreeMap<String, Metadata>,
+    tensors: BTreeMap<String, Tensor>,
+}
+
+#[cfg(windows)]
+impl Metadata {
+    fn clone_without_string_arrays(&self) -> Option<Self> {
+        match self {
+            Self::U32(value) => Some(Self::U32(*value)),
+            Self::I32(value) => Some(Self::I32(*value)),
+            Self::F32(value) => Some(Self::F32(*value)),
+            Self::String(value) => Some(Self::String(value.clone())),
+            Self::U32Array(values) => Some(Self::U32Array(values.clone())),
+            Self::StringArray(_) | Self::Other => None,
+        }
+    }
+}
+
+fn metadata_u32(metadata: &BTreeMap<String, Metadata>, key: &str) -> io::Result<u32> {
+    match metadata.get(key) {
+        Some(Metadata::U32(value)) => Ok(*value),
+        Some(Metadata::I32(value)) => u32::try_from(*value).map_err(|_| invalid()),
+        _ => Err(invalid()),
+    }
+}
+
+fn metadata_f32(metadata: &BTreeMap<String, Metadata>, key: &str) -> io::Result<f32> {
+    match metadata.get(key) {
+        Some(Metadata::F32(value)) => Ok(*value),
+        _ => Err(invalid()),
+    }
+}
+
+fn metadata_u32_array(metadata: &BTreeMap<String, Metadata>, key: &str) -> io::Result<Vec<u32>> {
+    match metadata.get(key) {
+        Some(Metadata::U32Array(values)) => Ok(values.clone()),
+        _ => Err(invalid()),
+    }
 }
 
 /// Validated tensor index retaining a non-writable model file handle.
@@ -118,12 +162,7 @@ fn map_tts_metadata(entry: bonsai_gguf::IndexValue) -> Metadata {
                 .map(|value| u32::try_from(value).ok())
                 .collect::<Option<Vec<u32>>>()
                 .map_or(Metadata::Other, Metadata::U32Array),
-            MetadataValue::Array(MetadataArray::String(values)) => Metadata::StringArray(
-                values
-                    .into_iter()
-                    .map(|value| value.into_bytes().into_boxed_slice())
-                    .collect(),
-            ),
+            MetadataValue::Array(MetadataArray::String(values)) => Metadata::StringArray(values),
             _ => Metadata::Other,
         },
         IndexValue::SkippedArray { .. } => Metadata::Other,
@@ -241,17 +280,29 @@ impl Weights {
         length: u64,
         allow_zero_tensors: bool,
     ) -> io::Result<Self> {
+        #[cfg(windows)]
+        let mapped = if length > 0 {
+            Some(std::sync::Arc::new(
+                bonsai_windows_process::MappedFile::from_file_without_prefetch(&file)?,
+            ))
+        } else {
+            None
+        };
         let ParsedWeightsIndex {
             metadata, tensors, ..
-        } = parse_index(&mut file, length, allow_zero_tensors, MAX_METADATA_BYTES)?;
-        #[cfg(windows)]
-        let mapped = if tensors.is_empty() {
-            None
-        } else {
-            Some(std::sync::Arc::new(
-                bonsai_windows_process::MappedFile::from_file(&file)?,
-            ))
+        } = {
+            #[cfg(windows)]
+            if let Some(view) = &mapped {
+                let mut cursor = io::Cursor::new(view.as_slice());
+                parse_index(&mut cursor, length, allow_zero_tensors, MAX_METADATA_BYTES)?
+            } else {
+                parse_index(&mut file, length, allow_zero_tensors, MAX_METADATA_BYTES)?
+            }
+            #[cfg(not(windows))]
+            parse_index(&mut file, length, allow_zero_tensors, MAX_METADATA_BYTES)?
         };
+        #[cfg(windows)]
+        let mapped = if tensors.is_empty() { None } else { mapped };
         Ok(Self {
             path,
             file,
@@ -263,6 +314,30 @@ impl Weights {
         })
     }
 
+    pub(crate) const fn is_mapped(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.mapped.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn retain_mapped_view(&self) -> Option<MappedWeights> {
+        self.mapped.as_ref().map(|mapped| MappedWeights {
+            mapped: std::sync::Arc::clone(mapped),
+            metadata: self
+                .metadata
+                .iter()
+                .filter_map(|(k, v)| v.clone_without_string_arrays().map(|cloned| (k.clone(), cloned)))
+                .collect(),
+            tensors: self.tensors.clone(),
+        })
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -271,7 +346,7 @@ impl Weights {
         self.metadata.contains_key(key)
     }
 
-    pub(crate) fn string_array(&self, key: &str) -> io::Result<&[Box<[u8]>]> {
+    pub(crate) fn string_array(&self, key: &str) -> io::Result<&[String]> {
         match self.metadata.get(key) {
             Some(Metadata::StringArray(values)) => Ok(values.as_slice()),
             _ => Err(invalid()),
@@ -279,18 +354,11 @@ impl Weights {
     }
 
     pub(crate) fn u32(&self, key: &str) -> io::Result<u32> {
-        match self.metadata.get(key) {
-            Some(Metadata::U32(value)) => Ok(*value),
-            Some(Metadata::I32(value)) => u32::try_from(*value).map_err(|_| invalid()),
-            _ => Err(invalid()),
-        }
+        metadata_u32(&self.metadata, key)
     }
 
     pub(crate) fn f32_metadata(&self, key: &str) -> io::Result<f32> {
-        match self.metadata.get(key) {
-            Some(Metadata::F32(value)) => Ok(*value),
-            _ => Err(invalid()),
-        }
+        metadata_f32(&self.metadata, key)
     }
 
     pub(crate) fn string(&self, key: &str) -> io::Result<&str> {
@@ -301,10 +369,7 @@ impl Weights {
     }
 
     pub(crate) fn u32_array(&self, key: &str) -> io::Result<Vec<u32>> {
-        match self.metadata.get(key) {
-            Some(Metadata::U32Array(values)) => Ok(values.clone()),
-            _ => Err(invalid()),
-        }
+        metadata_u32_array(&self.metadata, key)
     }
 
     pub(crate) fn tensor_shape(&self, name: &str) -> io::Result<&[usize]> {
@@ -333,6 +398,10 @@ impl Weights {
     }
 
     pub(crate) fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
+        #[cfg(windows)]
+        if self.mapped.is_some() {
+            return self.tensor_f32_mapped_with_threads(name, shape, 1);
+        }
         let tensor = self.tensors.get(name).ok_or_else(invalid)?;
         if tensor.shape != shape {
             return Err(invalid());
@@ -349,21 +418,6 @@ impl Weights {
         let mut output = Vec::new();
         output.try_reserve_exact(count).map_err(|_| invalid())?;
         output.resize(count, 0.0);
-        #[cfg(windows)]
-        if let Some(mapped) = &self.mapped {
-            let start = usize::try_from(offset).map_err(|_| invalid())?;
-            let end = start.checked_add(tensor_bytes).ok_or_else(invalid)?;
-            let bytes = mapped.as_slice().get(start..end).ok_or_else(invalid)?;
-            for (source, destination) in
-                bytes.chunks_exact(size).zip(output.chunks_exact_mut(block))
-            {
-                decode_block(kind, source, destination);
-            }
-            if output.iter().any(|value| !value.is_finite()) {
-                return Err(invalid());
-            }
-            return Ok(output);
-        }
         self.file.seek(SeekFrom::Start(offset))?;
         let max_chunk_blocks = (64 * 1024 / size).max(1);
         let chunk_bytes = total_blocks.min(max_chunk_blocks) * size;
@@ -382,19 +436,33 @@ impl Weights {
             self.file.read_exact(buf)?;
             let out_step = step_blocks * block;
             let dest_slice = &mut output[out_offset..out_offset + out_step];
-            for (source, destination) in buf
-                .chunks_exact(size)
-                .zip(dest_slice.chunks_exact_mut(block))
-            {
-                decode_block(kind, source, destination);
-            }
-            if dest_slice.iter().any(|value| !value.is_finite()) {
-                return Err(invalid());
-            }
+            decode_slice_f32(kind, buf, dest_slice)?;
             out_offset += out_step;
             blocks_left -= step_blocks;
         }
         Ok(output)
+    }
+
+    pub(crate) fn tensor_f32_mapped(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
+        self.tensor_f32_mapped_with_threads(name, shape, 1)
+    }
+
+    pub(crate) fn tensor_f32_mapped_with_threads(
+        &self,
+        name: &str,
+        shape: &[usize],
+        threads: usize,
+    ) -> io::Result<Vec<f32>> {
+        #[cfg(windows)]
+        {
+            let mapped = self.mapped.as_deref().ok_or_else(invalid)?;
+            return mapped_tensor_f32(&self.tensors, mapped, name, shape, threads);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (name, shape, threads);
+            Err(invalid())
+        }
     }
 
     pub(crate) fn projection(
@@ -404,24 +472,8 @@ impl Weights {
         out_dim: usize,
     ) -> io::Result<LinearProjection> {
         #[cfg(windows)]
-        if let Some(mapped) = &self.mapped {
-            let tensor = self.tensors.get(name).ok_or_else(invalid)?;
-            if tensor.shape != [in_dim, out_dim] {
-                return Err(invalid());
-            }
-            let start = usize::try_from(tensor.offset).map_err(|_| invalid())?;
-            let end = start.checked_add(tensor.bytes).ok_or_else(invalid)?;
-            let slice = crate::engine::MappedSlice::new(std::sync::Arc::clone(mapped), start, end)?;
-            return LinearProjection::new(
-                name,
-                in_dim,
-                out_dim,
-                WeightQuantization::MappedPacked {
-                    ggml_type: tensor.kind,
-                    bytes: slice,
-                },
-                None,
-            );
+        if self.mapped.is_some() {
+            return self.projection_mapped(name, in_dim, out_dim, 1);
         }
         let (ggml_type, bytes) = self.tensor_bytes(name, &[in_dim, out_dim])?;
         LinearProjection::new(
@@ -432,6 +484,127 @@ impl Weights {
             None,
         )
     }
+
+    pub(crate) fn projection_mapped(
+        &self,
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+        validate_threads: usize,
+    ) -> io::Result<LinearProjection> {
+        #[cfg(windows)]
+        {
+            let mapped = self.mapped.as_ref().ok_or_else(invalid)?;
+            return mapped_projection(&self.tensors, mapped, name, in_dim, out_dim, validate_threads);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (name, in_dim, out_dim, validate_threads);
+            Err(invalid())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl MappedWeights {
+    pub(crate) fn u32(&self, key: &str) -> io::Result<u32> {
+        metadata_u32(&self.metadata, key)
+    }
+
+    pub(crate) fn f32_metadata(&self, key: &str) -> io::Result<f32> {
+        metadata_f32(&self.metadata, key)
+    }
+
+    pub(crate) fn u32_array(&self, key: &str) -> io::Result<Vec<u32>> {
+        metadata_u32_array(&self.metadata, key)
+    }
+
+    pub(crate) fn tensor_shape(&self, name: &str) -> io::Result<&[usize]> {
+        self.tensors
+            .get(name)
+            .map(|tensor| tensor.shape.as_slice())
+            .ok_or_else(invalid)
+    }
+
+    pub(crate) fn tensor_f32_mapped(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
+        mapped_tensor_f32(&self.tensors, &self.mapped, name, shape, 1)
+    }
+
+    pub(crate) fn projection_mapped(
+        &self,
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+        validate_threads: usize,
+    ) -> io::Result<LinearProjection> {
+        mapped_projection(
+            &self.tensors,
+            &self.mapped,
+            name,
+            in_dim,
+            out_dim,
+            validate_threads,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn mapped_tensor_f32(
+    tensors: &BTreeMap<String, Tensor>,
+    mapped: &bonsai_windows_process::MappedFile,
+    name: &str,
+    shape: &[usize],
+    threads: usize,
+) -> io::Result<Vec<f32>> {
+    let tensor = tensors.get(name).ok_or_else(invalid)?;
+    if tensor.shape != shape {
+        return Err(invalid());
+    }
+    let kind = tensor.kind;
+    let tensor_bytes = tensor.bytes;
+    let (block, size) = packed_layout(kind)?;
+    if !tensor_bytes.is_multiple_of(size) {
+        return Err(invalid());
+    }
+    let start = usize::try_from(tensor.offset).map_err(|_| invalid())?;
+    let end = start.checked_add(tensor_bytes).ok_or_else(invalid)?;
+    let bytes = mapped.as_slice().get(start..end).ok_or_else(invalid)?;
+    let total_blocks = tensor_bytes / size;
+    let count = total_blocks.checked_mul(block).ok_or_else(invalid)?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(count).map_err(|_| invalid())?;
+    output.resize(count, 0.0);
+    decode_slice_f32_parallel(kind, bytes, &mut output, threads)?;
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn mapped_projection(
+    tensors: &BTreeMap<String, Tensor>,
+    mapped: &std::sync::Arc<bonsai_windows_process::MappedFile>,
+    name: &str,
+    in_dim: usize,
+    out_dim: usize,
+    validate_threads: usize,
+) -> io::Result<LinearProjection> {
+    let tensor = tensors.get(name).ok_or_else(invalid)?;
+    if tensor.shape != [in_dim, out_dim] {
+        return Err(invalid());
+    }
+    let start = usize::try_from(tensor.offset).map_err(|_| invalid())?;
+    let end = start.checked_add(tensor.bytes).ok_or_else(invalid)?;
+    let slice = crate::engine::MappedSlice::new(std::sync::Arc::clone(mapped), start, end)?;
+    LinearProjection::new_with_threads(
+        name,
+        in_dim,
+        out_dim,
+        WeightQuantization::MappedPacked {
+            ggml_type: tensor.kind,
+            bytes: slice,
+        },
+        None,
+        validate_threads,
+    )
 }
 
 pub(crate) fn packed_layout(kind: u32) -> io::Result<(usize, usize)> {
@@ -454,26 +627,178 @@ pub(crate) const fn unpack_q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u
     bonsai_ternary::unpack_q4_k_scale_min(group, scales)
 }
 
+#[inline]
+const fn f16_bytes_finite(lo: u8, hi: u8) -> bool {
+    (u16::from_le_bytes([lo, hi]) & 0x7C00) != 0x7C00
+}
+
+#[inline]
+const fn f32_bytes_finite(raw: [u8; 4]) -> bool {
+    (u32::from_le_bytes(raw) & 0x7F80_0000) != 0x7F80_0000
+}
+
 pub(crate) fn validate_packed(kind: u32, bytes: &[u8]) -> io::Result<()> {
     let (_, size) = packed_layout(kind)?;
     if !bytes.len().is_multiple_of(size) {
         return Err(invalid());
     }
-    for block in bytes.chunks_exact(size) {
-        let finite = match kind {
-            0 => block
-                .first_chunk::<4>()
-                .is_some_and(|raw| f32::from_le_bytes(*raw).is_finite()),
-            1 | 8 => half(block).is_finite(),
-            12 => half(block).is_finite() && half(&block[2..]).is_finite(),
-            14 => half(&block[208..]).is_finite(),
-            _ => false,
-        };
-        if !finite {
-            return Err(invalid());
-        }
+    let valid = match kind {
+        0 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|raw| f32_bytes_finite(*raw)),
+        1 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|raw| f16_bytes_finite(raw[0], raw[1])),
+        8 => bytes
+            .chunks_exact(34)
+            .all(|block| f16_bytes_finite(block[0], block[1])),
+        12 => bytes.chunks_exact(144).all(|block| {
+            f16_bytes_finite(block[0], block[1]) && f16_bytes_finite(block[2], block[3])
+        }),
+        14 => bytes
+            .chunks_exact(210)
+            .all(|block| f16_bytes_finite(block[208], block[209])),
+        _ => false,
+    };
+    if valid { Ok(()) } else { Err(invalid()) }
+}
+
+pub(crate) fn validate_packed_parallel(kind: u32, bytes: &[u8], threads: usize) -> io::Result<()> {
+    const PARALLEL_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+    let (_, size) = packed_layout(kind)?;
+    if !bytes.len().is_multiple_of(size) {
+        return Err(invalid());
     }
-    Ok(())
+    if threads <= 1 || bytes.len() < PARALLEL_THRESHOLD_BYTES {
+        return validate_packed(kind, bytes);
+    }
+    let total_blocks = bytes.len() / size;
+    let workers = threads.min(total_blocks).min(32);
+    if workers <= 1 {
+        return validate_packed(kind, bytes);
+    }
+    let chunk_blocks = total_blocks.div_ceil(workers);
+    let chunk_bytes = chunk_blocks * size;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers - 1);
+        let mut chunks = bytes.chunks(chunk_bytes);
+        let first = chunks.next().unwrap_or(&[]);
+        for chunk in chunks {
+            handles.push(scope.spawn(move || validate_packed(kind, chunk)));
+        }
+        let mut result = validate_packed(kind, first);
+        for handle in handles {
+            let joined = handle.join().unwrap_or_else(|_| Err(invalid()));
+            if result.is_ok() {
+                result = joined;
+            }
+        }
+        result
+    })
+}
+
+fn decode_slice_f32(kind: u32, bytes: &[u8], output: &mut [f32]) -> io::Result<()> {
+    match kind {
+        0 => {
+            for (raw, dst) in bytes.as_chunks::<4>().0.iter().zip(output.iter_mut()) {
+                if !f32_bytes_finite(*raw) {
+                    return Err(invalid());
+                }
+                *dst = f32::from_le_bytes(*raw);
+            }
+            Ok(())
+        }
+        1 => {
+            let (in8, in_tail) = bytes.as_chunks::<16>();
+            let (out8, out_tail) = output.as_chunks_mut::<8>();
+            for (src, dst) in in8.iter().zip(out8.iter_mut()) {
+                let pairs = src.as_chunks::<2>().0;
+                let bits: [u16; 8] = std::array::from_fn(|idx| u16::from_le_bytes(pairs[idx]));
+                if bits.iter().any(|&raw| (raw & 0x7C00) == 0x7C00) {
+                    return Err(invalid());
+                }
+                let [lo, hi] = bonsai_neon_dot::widen_f16_eight(&bits);
+                dst[..4].copy_from_slice(&lo);
+                dst[4..].copy_from_slice(&hi);
+            }
+            for (src, dst) in in_tail.as_chunks::<2>().0.iter().zip(out_tail.iter_mut()) {
+                if !f16_bytes_finite(src[0], src[1]) {
+                    return Err(invalid());
+                }
+                *dst = half(src);
+            }
+            Ok(())
+        }
+        8 => {
+            for (source, destination) in bytes.chunks_exact(34).zip(output.chunks_exact_mut(32)) {
+                if !f16_bytes_finite(source[0], source[1]) {
+                    return Err(invalid());
+                }
+                let scale = half(source);
+                for (value, &byte) in destination.iter_mut().zip(&source[2..]) {
+                    *value = scale * f32::from(byte.cast_signed());
+                }
+            }
+            Ok(())
+        }
+        12 | 14 => {
+            validate_packed(kind, bytes)?;
+            let (block, size) = packed_layout(kind)?;
+            for (source, destination) in bytes.chunks_exact(size).zip(output.chunks_exact_mut(block))
+            {
+                decode_block(kind, source, destination);
+            }
+            if output.iter().any(|value| !value.is_finite()) {
+                return Err(invalid());
+            }
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+#[cfg(windows)]
+fn decode_slice_f32_parallel(
+    kind: u32,
+    bytes: &[u8],
+    output: &mut [f32],
+    threads: usize,
+) -> io::Result<()> {
+    const PARALLEL_DECODE_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
+    if threads <= 1 || bytes.len() < PARALLEL_DECODE_THRESHOLD_BYTES {
+        return decode_slice_f32(kind, bytes, output);
+    }
+    let (block, size) = packed_layout(kind)?;
+    let total_blocks = bytes.len() / size;
+    let workers = threads.min(total_blocks).min(32);
+    if workers <= 1 {
+        return decode_slice_f32(kind, bytes, output);
+    }
+    let chunk_blocks = total_blocks.div_ceil(workers);
+    let in_chunk = chunk_blocks * size;
+    let out_chunk = chunk_blocks * block;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers - 1);
+        let mut in_chunks = bytes.chunks(in_chunk);
+        let mut out_chunks = output.chunks_mut(out_chunk);
+        let first_in = in_chunks.next().unwrap_or(&[]);
+        let first_out = out_chunks.next().unwrap_or(&mut []);
+        for (src, dst) in in_chunks.zip(out_chunks) {
+            handles.push(scope.spawn(move || decode_slice_f32(kind, src, dst)));
+        }
+        let mut result = decode_slice_f32(kind, first_in, first_out);
+        for handle in handles {
+            let joined = handle.join().unwrap_or_else(|_| Err(invalid()));
+            if result.is_ok() {
+                result = joined;
+            }
+        }
+        result
+    })
 }
 
 // The caller validates the exact kind, source block size and destination width.
@@ -970,14 +1295,8 @@ mod tests {
             0,
         )?;
         let weights = Weights::open(&file.0)?;
-        assert_eq!(
-            weights.string_array("tokenizer.ggml.tokens")?,
-            [b"alpha".as_slice().into(), b"beta".as_slice().into()]
-        );
-        assert_eq!(
-            weights.string_array("tokenizer.ggml.merges")?,
-            [b"alpha".as_slice().into(), b"beta".as_slice().into()]
-        );
+        assert_eq!(weights.string_array("tokenizer.ggml.tokens")?, ["alpha", "beta"]);
+        assert_eq!(weights.string_array("tokenizer.ggml.merges")?, ["alpha", "beta"]);
         assert!(weights.string_array("other.strings").is_err());
 
         let zero_tensor = {
@@ -1125,6 +1444,65 @@ mod tests {
             expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
         assert!(loaded.stream_buf.len() >= 64 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn bitmask_f16_finiteness_and_neon_widening_match_half_to_float_exhaustively() {
+        for raw in 0..=u16::MAX {
+            let [lo, hi] = raw.to_le_bytes();
+            let expected = bonsai_ternary::half_to_float(raw);
+            assert_eq!(f16_bytes_finite(lo, hi), expected.is_finite());
+        }
+        let finite_bits: Vec<u16> = (0..=u16::MAX)
+            .filter(|&bits| (bits & 0x7C00) != 0x7C00)
+            .collect();
+        for chunk in finite_bits.chunks(8) {
+            let mut input = [0_u16; 8];
+            input[..chunk.len()].copy_from_slice(chunk);
+            let [lo, hi] = bonsai_neon_dot::widen_f16_eight(&input);
+            let widened: [f32; 8] = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
+            for (idx, &bits) in chunk.iter().enumerate() {
+                assert_eq!(
+                    widened[idx].to_bits(),
+                    bonsai_ternary::half_to_float(bits).to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_packed_validation_and_retained_mapped_view_preserve_exact_semantics()
+    -> io::Result<()> {
+        let blocks = 130_000_usize; // > 4 MiB Q8_0 payload
+        let mut payload = vec![0_u8; blocks * 34];
+        for (i, block) in payload.chunks_exact_mut(34).enumerate() {
+            block[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            block[2..].fill(i8::try_from(i % 17).unwrap_or(1).to_le_bytes()[0]);
+        }
+        validate_packed_parallel(8, &payload, 4)?;
+        let bad_offset = (blocks - 1) * 34;
+        payload[bad_offset..bad_offset + 2].copy_from_slice(&0x7e00_u16.to_le_bytes());
+        assert!(validate_packed_parallel(8, &payload, 4).is_err());
+
+        // Verify retained mapped view matches direct Weights reads.
+        let mut f16_raw = Vec::with_capacity(18 * 2);
+        for i in 0_u16..18 {
+            f16_raw.extend_from_slice(&(0x3c00 + i).to_le_bytes());
+        }
+        let file = fixture(&[("half_vec", &[18], 1, 0)], &f16_raw)?;
+        let mut weights = Weights::open(&file.0)?;
+        let expected = weights.tensor_f32("half_vec", &[18])?;
+        #[cfg(windows)]
+        {
+            let retained = weights
+                .retain_mapped_view()
+                .ok_or_else(|| io::Error::other("expected mapped view"))?;
+            assert_eq!(
+                retained.tensor_f32_mapped("half_vec", &[18])?,
+                expected
+            );
+        }
         Ok(())
     }
 }

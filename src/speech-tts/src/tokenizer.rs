@@ -68,6 +68,22 @@ impl FlatTable {
         Self::span_bytes(&self.arena, entry.start, entry.len)
     }
 
+    fn reserve(&mut self, entries: usize, bytes: usize) -> io::Result<()> {
+        let entry_cap = entries.min(MAX_ENTRIES);
+        let arena_cap = bytes.min(MAX_TABLE_BYTES);
+        if entry_cap > self.entries.capacity() {
+            self.entries
+                .try_reserve(entry_cap - self.entries.len())
+                .map_err(io::Error::other)?;
+        }
+        if arena_cap > self.arena.capacity() {
+            self.arena
+                .try_reserve(arena_cap - self.arena.len())
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
     fn push(&mut self, bytes: &[u8], value: i32) -> io::Result<()> {
         let start = u32::try_from(self.arena.len())
             .map_err(|_| invalid("Qwen tokenizer table exceeds its aggregate bound."))?;
@@ -183,6 +199,99 @@ fn hash_pair(left: u32, right: u32) -> usize {
     let folded = (x ^ (x >> 32)) & 0xffff_ffff;
     let [b0, b1, b2, b3, ..] = folded.to_le_bytes();
     usize::from(b0) | (usize::from(b1) << 8) | (usize::from(b2) << 16) | (usize::from(b3) << 24)
+}
+
+const FNV_OFFSET_64: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME_64: u64 = 0x0100_0000_01b3;
+
+#[inline]
+fn fnv1a_step(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME_64);
+    }
+    hash
+}
+
+#[inline]
+fn hash_slot(hash: u64, mask: usize) -> usize {
+    let mixed = hash ^ (hash >> 33);
+    let low = u32::from_le_bytes([
+        mixed.to_le_bytes()[0],
+        mixed.to_le_bytes()[1],
+        mixed.to_le_bytes()[2],
+        mixed.to_le_bytes()[3],
+    ]);
+    usize::try_from(low).unwrap_or(0) & mask
+}
+
+struct VocabHashIndex {
+    slots: Vec<u32>,
+    mask: usize,
+}
+
+impl VocabHashIndex {
+    fn build(vocabulary: &FlatTable) -> io::Result<Self> {
+        let count = vocabulary.entries.len();
+        let cap = (count.saturating_mul(2)).next_power_of_two().max(16);
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(cap).map_err(io::Error::other)?;
+        slots.resize(cap, UNMAPPED_SYMBOL);
+        let mask = cap - 1;
+        for (idx, entry) in vocabulary.entries.iter().enumerate() {
+            let idx_u32 = u32::try_from(idx).map_err(|_| invalid("Invalid Qwen vocabulary index."))?;
+            let hash = fnv1a_step(FNV_OFFSET_64, vocabulary.entry_bytes(*entry));
+            let mut pos = hash_slot(hash, mask);
+            while slots[pos] != UNMAPPED_SYMBOL {
+                pos = (pos + 1) & mask;
+            }
+            slots[pos] = idx_u32;
+        }
+        Ok(Self { slots, mask })
+    }
+
+    fn get(&self, vocabulary: &FlatTable, key: &[u8]) -> Option<u32> {
+        if vocabulary.entries.is_empty() {
+            return None;
+        }
+        let hash = fnv1a_step(FNV_OFFSET_64, key);
+        let mut pos = hash_slot(hash, self.mask);
+        loop {
+            let slot = self.slots[pos];
+            if slot == UNMAPPED_SYMBOL {
+                return None;
+            }
+            let entry = vocabulary.entries[usize::try_from(slot).unwrap_or(0)];
+            if vocabulary.entry_bytes(entry) == key {
+                return Some(slot);
+            }
+            pos = (pos + 1) & self.mask;
+        }
+    }
+
+    fn get_concat(&self, vocabulary: &FlatTable, left: &[u8], right: &[u8]) -> Option<u32> {
+        if vocabulary.entries.is_empty() {
+            return None;
+        }
+        let target_len = left.len().checked_add(right.len())?;
+        let hash = fnv1a_step(fnv1a_step(FNV_OFFSET_64, left), right);
+        let mut pos = hash_slot(hash, self.mask);
+        loop {
+            let slot = self.slots[pos];
+            if slot == UNMAPPED_SYMBOL {
+                return None;
+            }
+            let entry = vocabulary.entries[usize::try_from(slot).unwrap_or(0)];
+            let candidate = vocabulary.entry_bytes(entry);
+            if candidate.len() == target_len
+                && candidate[..left.len()] == *left
+                && candidate[left.len()..] == *right
+            {
+                return Some(slot);
+            }
+            pos = (pos + 1) & self.mask;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -424,6 +533,16 @@ impl Tokenizer {
         Ok(())
     }
 
+    /// Pre-reserve vocabulary table storage for bulk metadata intake.
+    pub(super) fn reserve_tokens(&mut self, count: usize, bytes: usize) -> io::Result<()> {
+        self.vocabulary.reserve(count, bytes)
+    }
+
+    /// Pre-reserve merge table storage for bulk metadata intake.
+    pub(super) fn reserve_merges(&mut self, count: usize, bytes: usize) -> io::Result<()> {
+        self.merges.reserve(count, bytes)
+    }
+
     /// Add a raw vocabulary spelling; repeated spellings replace their ID.
     pub(super) fn add_token(&mut self, bytes: &[u8], id: i32) -> io::Result<()> {
         self.insert(bytes, id, false)
@@ -469,16 +588,17 @@ impl Tokenizer {
         Ok(())
     }
 
-    fn lookup_vocab_index(vocabulary: &FlatTable, key: &[u8]) -> Option<u32> {
-        vocabulary
-            .entries
-            .binary_search_by(|entry| vocabulary.entry_bytes(*entry).cmp(key))
-            .ok()
-            .and_then(|idx| u32::try_from(idx).ok())
-    }
-
-    fn resolve_symbol(&self, key: &[u8], extras: &[&[u8]], vocab_cap: u32) -> u32 {
-        Self::lookup_vocab_index(&self.vocabulary, key).unwrap_or_else(|| {
+    fn resolve_symbol(
+        &self,
+        vocab_index: &VocabHashIndex,
+        key: &[u8],
+        extras: &[&[u8]],
+        vocab_cap: u32,
+    ) -> u32 {
+        vocab_index.get(&self.vocabulary, key).unwrap_or_else(|| {
+            if extras.is_empty() {
+                return UNMAPPED_SYMBOL;
+            }
             extras
                 .binary_search(&key)
                 .ok()
@@ -490,19 +610,18 @@ impl Tokenizer {
 
     fn resolve_concat_symbol(
         &self,
+        vocab_index: &VocabHashIndex,
         left: &[u8],
         right: &[u8],
         extras: &[&[u8]],
         vocab_cap: u32,
     ) -> u32 {
-        if let Ok(idx) = self
-            .vocabulary
-            .entries
-            .binary_search_by(|entry| cmp_concat(self.vocabulary.entry_bytes(*entry), left, right))
-        {
-            return u32::try_from(idx).unwrap_or(UNMAPPED_SYMBOL);
+        if let Some(idx) = vocab_index.get_concat(&self.vocabulary, left, right) {
+            return idx;
         }
-        if let Ok(idx) = extras.binary_search_by(|candidate| cmp_concat(candidate, left, right)) {
+        if !extras.is_empty()
+            && let Ok(idx) = extras.binary_search_by(|candidate| cmp_concat(candidate, left, right))
+        {
             return u32::try_from(idx)
                 .ok()
                 .and_then(|offset| vocab_cap.checked_add(offset))
@@ -514,16 +633,17 @@ impl Tokenizer {
     fn build_pair_index(&self) -> io::Result<(PairTable, [u32; 256], u32)> {
         let vocab_cap = u32::try_from(self.vocabulary.entries.len())
             .map_err(|_| invalid("Invalid Qwen vocabulary index."))?;
+        let vocab_index = VocabHashIndex::build(&self.vocabulary)?;
         let mut extras = Vec::new();
         let mut valid_merges = 0_usize;
         for entry in &self.merges.entries {
             if let Some((left, right)) = split_merge_pair(self.merges.entry_bytes(*entry)) {
                 valid_merges += 1;
-                if Self::lookup_vocab_index(&self.vocabulary, left).is_none() {
+                if vocab_index.get(&self.vocabulary, left).is_none() {
                     extras.try_reserve(1).map_err(io::Error::other)?;
                     extras.push(left);
                 }
-                if Self::lookup_vocab_index(&self.vocabulary, right).is_none() {
+                if vocab_index.get(&self.vocabulary, right).is_none() {
                     extras.try_reserve(1).map_err(io::Error::other)?;
                     extras.push(right);
                 }
@@ -544,9 +664,10 @@ impl Tokenizer {
         let mut pair_table = PairTable::with_capacity(valid_merges)?;
         for entry in &self.merges.entries {
             if let Some((left, right)) = split_merge_pair(self.merges.entry_bytes(*entry)) {
-                let left_sym = self.resolve_symbol(left, &extras, vocab_cap);
-                let right_sym = self.resolve_symbol(right, &extras, vocab_cap);
-                let merged = self.resolve_concat_symbol(left, right, &extras, vocab_cap);
+                let left_sym = self.resolve_symbol(&vocab_index, left, &extras, vocab_cap);
+                let right_sym = self.resolve_symbol(&vocab_index, right, &extras, vocab_cap);
+                let merged =
+                    self.resolve_concat_symbol(&vocab_index, left, right, &extras, vocab_cap);
                 pair_table.insert(left_sym, right_sym, entry.value, merged);
             }
         }
@@ -554,7 +675,7 @@ impl Tokenizer {
         for (byte, slot) in byte_symbols.iter_mut().enumerate() {
             let spelling = BYTE_ENCODER[byte];
             let width = if spelling[1] == 0 { 1 } else { 2 };
-            *slot = self.resolve_symbol(&spelling[..width], &extras, vocab_cap);
+            *slot = self.resolve_symbol(&vocab_index, &spelling[..width], &extras, vocab_cap);
         }
         Ok((pair_table, byte_symbols, vocab_cap))
     }
@@ -1000,6 +1121,32 @@ mod tests {
         tokenizer.add_special(b"!tag", 5)?;
 
         assert_eq!(tokenizer.encode(b"hi!tag<|talk|>", true)?, [2, 5, 4, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn reserved_tables_and_hash_pair_index_handle_collisions_and_extras() -> io::Result<()> {
+        let mut tokenizer = Tokenizer::new();
+        let pad_count = 512_usize;
+        tokenizer.reserve_tokens(pad_count + 5, pad_count * 6 + 64)?;
+        tokenizer.reserve_merges(16, 256)?;
+        for idx in 0..pad_count {
+            let piece = format!("t{idx:03}");
+            tokenizer.add_token(piece.as_bytes(), i32::try_from(idx).map_err(io::Error::other)?)?;
+        }
+        let base = i32::try_from(pad_count).map_err(io::Error::other)?;
+        tokenizer.add_token(b"a", base)?;
+        tokenizer.add_token(b"b", base + 1)?;
+        tokenizer.add_token(b"c", base + 2)?;
+        tokenizer.add_token(b"abc", base + 3)?;
+        tokenizer.add_token(b"unseen_x", base + 4)?;
+        // Also test non-vocab intermediate merge ("ab") chaining + duplicate last-wins override.
+        tokenizer.add_merge(b"a b", 5)?;
+        tokenizer.add_merge(b"a b", 0)?;
+        tokenizer.add_merge(b"ab c", 1)?;
+        tokenizer.finish()?;
+        assert!(tokenizer.pair_table.slots.len().is_power_of_two());
+        assert_eq!(tokenizer.encode(b"abc", false)?, [base + 3]);
         Ok(())
     }
 }

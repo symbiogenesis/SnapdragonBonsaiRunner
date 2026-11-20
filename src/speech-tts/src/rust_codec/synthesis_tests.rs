@@ -85,6 +85,8 @@ fn warm_synthesizer() -> io::Result<Synthesizer> {
             conv_post: convolution.clone(),
         },
         weights_path: None,
+        #[cfg(windows)]
+        mapped_weights: None,
         encoder: Some(Encoder {
             threads: 1,
             first: convolution.clone(),

@@ -768,6 +768,18 @@ impl LinearProjection {
         weight: WeightQuantization,
         bias: Option<Vec<f32>>,
     ) -> io::Result<Self> {
+        Self::new_with_threads(name, in_dim, out_dim, weight, bias, 1)
+    }
+
+    /// Construct a validated linear projection using `validate_threads` for packed validation.
+    pub(crate) fn new_with_threads(
+        name: impl Into<String>,
+        in_dim: usize,
+        out_dim: usize,
+        weight: WeightQuantization,
+        bias: Option<Vec<f32>>,
+        validate_threads: usize,
+    ) -> io::Result<Self> {
         let name = name.into();
         validate_talker_ternary_policy(&name, &weight)?;
         if bias.as_ref().is_some_and(|b| b.len() != out_dim) {
@@ -778,7 +790,7 @@ impl LinearProjection {
         }
         projection_layout::validate(in_dim, out_dim, &weight)?;
         if let Some((ggml_type, bytes)) = weight.packed_slice() {
-            crate::weights::validate_packed(ggml_type, bytes)?;
+            crate::weights::validate_packed_parallel(ggml_type, bytes, validate_threads)?;
         }
         Ok(Self {
             name,

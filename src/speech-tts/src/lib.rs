@@ -264,8 +264,17 @@ fn load_talker(path: &Path, kind: &str, threads: usize) -> io::Result<rust_talke
             "Unsupported speech model architecture.",
         ));
     }
-    let tokenizer = tokenizer::Tokenizer::from_weights(&weights)?;
-    rust_talker::Talker::load(&mut weights, tokenizer, threads)
+    rust_talker::Talker::load_with_weights(&mut weights, threads)
+}
+
+/// Preloaded, validated Qwen3 tokenizer codec ready for [`Synthesizer::assemble`].
+pub struct LoadedCodec {
+    codec: rust_codec::Codec,
+}
+
+/// Preloaded, validated Qwen3 `VoiceDesign` talker ready for [`Synthesizer::assemble`].
+pub struct LoadedDesign {
+    talker: rust_talker::Talker,
 }
 
 impl Synthesizer {
@@ -289,19 +298,57 @@ impl Synthesizer {
         voice_model: &Path,
         threads: Option<usize>,
     ) -> io::Result<Self> {
-        for path in [model, codec, voice_model] {
-            model_path(path)?;
-        }
+        let loaded_codec = Self::load_codec_with_threads(codec, threads)?;
+        let loaded_design = Self::load_design_with_threads(model, threads)?;
+        Self::assemble(model, voice_model, loaded_codec, loaded_design, threads)
+    }
+
+    /// Load and validate only the verified pinned codec GGUF with an optional team size.
+    ///
+    /// # Errors
+    /// Rejects unsafe paths, invalid team sizes, and incompatible or malformed codec weights.
+    pub fn load_codec_with_threads(codec: &Path, threads: Option<usize>) -> io::Result<LoadedCodec> {
+        model_path(codec)?;
         let threads = select_threads(threads, std::thread::available_parallelism()?.get())?;
         let mut codec_weights = weights::Weights::open(codec)?;
         let codec = rust_codec::Codec::load(&mut codec_weights, threads)?;
-        let design = load_talker(model, "voice_design", threads)?;
+        Ok(LoadedCodec { codec })
+    }
+
+    /// Load and validate only the verified pinned `VoiceDesign` GGUF with an optional team size.
+    ///
+    /// # Errors
+    /// Rejects unsafe paths, invalid team sizes, and incompatible or malformed talker weights.
+    pub fn load_design_with_threads(
+        model: &Path,
+        threads: Option<usize>,
+    ) -> io::Result<LoadedDesign> {
+        model_path(model)?;
+        let threads = select_threads(threads, std::thread::available_parallelism()?.get())?;
+        let talker = load_talker(model, "voice_design", threads)?;
+        Ok(LoadedDesign { talker })
+    }
+
+    /// Assemble a [`Synthesizer`] from preloaded codec and `VoiceDesign` components.
+    ///
+    /// # Errors
+    /// Rejects unsafe paths or invalid team sizes.
+    pub fn assemble(
+        model: &Path,
+        voice_model: &Path,
+        codec: LoadedCodec,
+        design: LoadedDesign,
+        threads: Option<usize>,
+    ) -> io::Result<Self> {
+        model_path(model)?;
+        model_path(voice_model)?;
+        let threads = select_threads(threads, std::thread::available_parallelism()?.get())?;
         Ok(Self {
             voices: VoiceCache(None),
-            design: Some(design),
+            design: Some(design.talker),
             model_path: model.to_owned(),
             voice_model_path: voice_model.to_owned(),
-            codec,
+            codec: codec.codec,
             threads,
         })
     }
