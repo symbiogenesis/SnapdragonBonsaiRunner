@@ -25,6 +25,7 @@ updates and publication. [PLAN.md](../PLAN.md) is the single backlog.
 | [Swift memory and PTQ1](swift-memory.md) | Artifact formats, context selection, packing and allocation |
 | [Quantized KV](quantized-kv.md) | K4/V4, optional K4/V3 and qualification |
 | [Swift LoRA](swift-lora.md) | Adapter basis, cost, overlay and qualification |
+| [DaisyRose composition](daisyrose-composition.md) | Hybrid DaisyRose-27B + Swift-Bonsai-2 composition, denoising audit, OPD spec and gates |
 | [Adapter authoring intake](adapter-authoring-intake.md) | Authenticated inputs, bounds and provenance |
 | [Public adapter reference](adapter-public-reference.md) | Public-pack reconstruction and scalar comparison |
 | [Weight-space programming](weight-space-programming.md) | Compact corrections and weight-edit evidence |

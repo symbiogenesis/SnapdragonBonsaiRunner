@@ -18,6 +18,7 @@ consumers below without installing or executing the recorded Python tools.
 | `weight-patch-sanity/` | [Initial four-fact adapter-cost smoke](weight-patch-sanity.md): independent answer, accounting, resource, supervision and power review |
 | `lora-weight-edit/` | [Direct LoRA weight edit](lora-weight-edit.md): independent edit derivation, candidate digest, complete factual, storage, supervision and power review |
 | [DaisyRose task-vector audit](daisyrose-task-vector-audit.md) | Closed Gate 1 (`DR1`) no-go summary for raw BF16 task-vector LoRA extraction (`E(32) = 14.26% < 50%`) |
+| [DaisyRose spectral-denoising audit](daisyrose-spectral-denoising-audit.md) | Closed Track A (`DR-A1`) empirical Rademacher-null + Gavish–Donoho summary (`saturated-high-rank-tail`, `81.98%` bulk, Track A standalone `DR-A2` no-go) |
 | `hexagon-public-qaic-41171859264/` | [Signed-Q2 source lock](../../config/hexagon-signed-q2-candidate.lock.json), public-wire review and [Windows ABI replay inputs](../../tools/hexagon/windows_queue_abi.ps1) |
 | `hexagon-public-qaic-41169481882/provenance.json` | Supplemental template notices referenced by the current [QAIC provenance](hexagon-public-qaic-41171859264/provenance.json) |
 | Hexagon operation, traffic, session-budget and K-tiling ledgers | [Static policy verifiers](../../tools/hexagon/README.md) |

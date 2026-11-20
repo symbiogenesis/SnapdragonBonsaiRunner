@@ -1,5 +1,6 @@
-//! Read-only BF16 weight-diff and SVD spectrum audit for Gate 1 (`DR1`).
+//! Read-only BF16 weight-diff, spectral-denoising audit, and GGUF LoRA export/verification.
 
+mod gguf_adapter;
 mod safetensors;
 mod svd;
 #[cfg(test)]
@@ -13,11 +14,18 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use self::gguf_adapter::{
+    ExportDtype, ExportTensorPair, VerifyPolicy, build_balanced_factors, swift_base_dims_map,
+    verify_lora_gguf, verify_lora_gguf_with_dims, write_lora_gguf,
+};
 use self::safetensors::{
     FloatDtype, SafetensorsIndex, ShardSource, TensorCategory, TensorDescriptor, TensorSpec,
     coalesce_small_spans, decode_scalar_f32, swift_tensor_inventory,
 };
-use self::svd::{CumulativeEnergy, StreamingTwoSidedSketch, SvdSpectrum, randomized_subspace_svd};
+use self::svd::{
+    CumulativeEnergy, StreamingTwoSidedSketch, SvdSpectrum, randomized_subspace_denoised_factors,
+    randomized_subspace_svd,
+};
 
 const DAISYROSE_REPO: &str = "RadixArk/DaisyRose-27B";
 const DAISYROSE_REVISION: &str = "64a4ec665091bb0c1931babce4e97e686eef3c5c";
@@ -33,6 +41,54 @@ const STREAMING_THRESHOLD_ELEMENTS: usize = 100_000_000;
 enum Operation {
     Plan,
     Audit,
+    ExportDenoised,
+    VerifyAdapter,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum TargetEnvelope {
+    #[default]
+    All,
+    ResidualWriters,
+    NpuFriendly,
+    FullLinear,
+}
+
+impl TargetEnvelope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::ResidualWriters => "residual-writers",
+            Self::NpuFriendly => "npu-friendly",
+            Self::FullLinear => "full-linear",
+        }
+    }
+
+    fn matches_family(self, family: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::ResidualWriters => matches!(family, "ffn_down" | "attn_output"),
+            Self::NpuFriendly => {
+                matches!(
+                    family,
+                    "ffn_down" | "attn_output" | "attn_q" | "attn_k" | "attn_v"
+                )
+            }
+            Self::FullLinear => {
+                matches!(
+                    family,
+                    "ffn_gate"
+                        | "ffn_up"
+                        | "ffn_down"
+                        | "attn_output"
+                        | "attn_q"
+                        | "attn_k"
+                        | "attn_v"
+                )
+            }
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -48,13 +104,27 @@ enum SourceSpec {
     },
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_min_spike_ratio() -> f64 {
+    1.0
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct Scope {
     layers: Vec<u32>,
+    target_envelope: Option<TargetEnvelope>,
     include_output_norm: bool,
     include_vocab: bool,
     include_svd: bool,
+    #[serde(default = "default_true")]
+    include_spectral_denoising: bool,
+    export_dtype: ExportDtype,
+    #[serde(default = "default_min_spike_ratio")]
+    min_spike_ratio: f64,
     max_rank: usize,
     oversampling: usize,
     power_iterations: usize,
@@ -64,9 +134,13 @@ impl Default for Scope {
     fn default() -> Self {
         Self {
             layers: vec![0, 3, 31, 63],
+            target_envelope: None,
             include_output_norm: true,
             include_vocab: true,
             include_svd: true,
+            include_spectral_denoising: true,
+            export_dtype: ExportDtype::F16,
+            min_spike_ratio: 1.0,
             max_rank: 64,
             oversampling: 16,
             power_iterations: 2,
@@ -100,12 +174,17 @@ impl Default for Controls {
 struct Request {
     schema_version: u32,
     operation: Operation,
-    source: SourceSpec,
+    #[serde(default)]
+    source: Option<SourceSpec>,
     #[serde(default)]
     scope: Scope,
     #[serde(default)]
     controls: Controls,
     output_path: Option<PathBuf>,
+    #[serde(default)]
+    adapter_path: Option<PathBuf>,
+    #[serde(default)]
+    verify_policy: VerifyPolicy,
 }
 
 #[expect(
@@ -126,6 +205,30 @@ const fn usize_to_f64(value: usize) -> f64 {
     value as f64
 }
 
+#[expect(
+    clippy::as_conversions,
+    reason = "Scalar integer ranks (<= 64) convert exactly to f32 for GGUF alpha."
+)]
+#[inline]
+const fn usize_to_f32(value: usize) -> f32 {
+    value as f32
+}
+
+fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
+    match request.operation {
+        Operation::ExportDenoised => match request.scope.target_envelope {
+            None => Ok(TargetEnvelope::NpuFriendly),
+            Some(TargetEnvelope::All) => Err(
+                "export-denoised requires targetEnvelope in {residual-writers, npu-friendly, full-linear} so ssm_out and non-matrix tensors stay excluded.".into(),
+            ),
+            Some(env) => Ok(env),
+        },
+        Operation::Plan | Operation::Audit | Operation::VerifyAdapter => {
+            Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All))
+        }
+    }
+}
+
 fn validate_output_path(path: &Path) -> crate::Result<()> {
     bonsai_artifacts::validate_external_path(path).map_err(|e| e.to_string())?;
     if fs::exists(path).map_err(|e| e.to_string())? {
@@ -141,6 +244,30 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     if request.schema_version != 1 {
         return Err("lora-diff-audit requires schemaVersion 1.".into());
     }
+    if request.operation == Operation::VerifyAdapter {
+        if request.source.is_some() {
+            return Err("verify-adapter does not accept a model diff source.".into());
+        }
+        if request.output_path.is_some() {
+            return Err("verify-adapter does not accept outputPath.".into());
+        }
+        let adapter_path = request
+            .adapter_path
+            .as_ref()
+            .ok_or("verify-adapter requires adapterPath.")?;
+        bonsai_artifacts::validate_external_path(adapter_path).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    if request.adapter_path.is_some() {
+        return Err("adapterPath is only supported for verify-adapter.".into());
+    }
+    let source = request
+        .source
+        .as_ref()
+        .ok_or("plan, audit, and export-denoised require source.")?;
+    let envelope = effective_envelope(request)?;
+
     let mut seen_layers = BTreeSet::new();
     for &layer in &request.scope.layers {
         if layer >= 64 {
@@ -150,10 +277,14 @@ fn validate_request(request: &Request) -> crate::Result<()> {
             return Err(format!("Duplicate layer index {layer} in scope.layers."));
         }
     }
-    if request.scope.layers.is_empty()
-        && !request.scope.include_output_norm
-        && !request.scope.include_vocab
-    {
+    let selects_any_tensor = if envelope == TargetEnvelope::All {
+        !request.scope.layers.is_empty()
+            || request.scope.include_output_norm
+            || request.scope.include_vocab
+    } else {
+        !select_tensors(&request.scope, envelope).is_empty()
+    };
+    if !selects_any_tensor {
         return Err("Audit scope selects zero tensors.".into());
     }
     if !(1..=64).contains(&request.scope.max_rank) {
@@ -164,6 +295,11 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     }
     if request.scope.power_iterations > 6 {
         return Err("scope.powerIterations must be in 0..=6.".into());
+    }
+    if !request.scope.min_spike_ratio.is_finite()
+        || !(1.0..=100.0).contains(&request.scope.min_spike_ratio)
+    {
+        return Err("scope.minSpikeRatio must be finite and in 1.0..=100.0.".into());
     }
     if !(10..=900).contains(&request.controls.time_budget_seconds) {
         return Err("controls.timeBudgetSeconds must be in 10..=900.".into());
@@ -177,7 +313,7 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     if let SourceSpec::LocalDirectories {
         candidate_directory,
         base_directory,
-    } = &request.source
+    } = source
     {
         bonsai_artifacts::validate_external_path(candidate_directory).map_err(|e| e.to_string())?;
         bonsai_artifacts::validate_external_path(base_directory).map_err(|e| e.to_string())?;
@@ -185,24 +321,48 @@ fn validate_request(request: &Request) -> crate::Result<()> {
             return Err("Local candidateDirectory and baseDirectory must both exist.".into());
         }
     }
-    if let Some(output) = &request.output_path {
-        validate_output_path(output)?;
+    match request.operation {
+        Operation::ExportDenoised => {
+            if !request.scope.include_svd || !request.scope.include_spectral_denoising {
+                return Err(
+                    "export-denoised requires includeSvd and includeSpectralDenoising to be true."
+                        .into(),
+                );
+            }
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("export-denoised requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+        }
+        Operation::Plan | Operation::Audit => {
+            if let Some(output) = &request.output_path {
+                validate_output_path(output)?;
+            }
+        }
+        Operation::VerifyAdapter => {}
     }
     Ok(())
 }
 
-fn select_tensors(scope: &Scope) -> Vec<TensorSpec> {
+fn select_tensors(scope: &Scope, envelope: TargetEnvelope) -> Vec<TensorSpec> {
     let layer_set: BTreeSet<u32> = scope.layers.iter().copied().collect();
     let inventory = swift_tensor_inventory();
     let mut selected = Vec::new();
     for spec in inventory {
-        let include = match spec.layer {
-            Some(layer) => layer_set.contains(&layer),
-            None => match spec.category {
-                TensorCategory::NonMatrix => scope.include_output_norm,
-                TensorCategory::VocabMatrix => scope.include_vocab,
-                TensorCategory::GdnSmallMatrix | TensorCategory::LinearMatrix => false,
-            },
+        let include = if envelope == TargetEnvelope::All {
+            match spec.layer {
+                Some(layer) => layer_set.contains(&layer),
+                None => match spec.category {
+                    TensorCategory::NonMatrix => scope.include_output_norm,
+                    TensorCategory::VocabMatrix => scope.include_vocab,
+                    TensorCategory::GdnSmallMatrix | TensorCategory::LinearMatrix => false,
+                },
+            }
+        } else {
+            spec.layer.is_some_and(|layer| layer_set.contains(&layer))
+                && spec.category == TensorCategory::LinearMatrix
+                && envelope.matches_family(spec.family)
         };
         if include {
             selected.push(spec);
@@ -211,6 +371,22 @@ fn select_tensors(scope: &Scope) -> Vec<TensorSpec> {
     // Order by increasing cost: non-matrix -> small GDN -> block linear -> vocab.
     selected.sort_by_key(|spec| (spec.category, spec.layer.unwrap_or(u32::MAX)));
     selected
+}
+
+fn resolved_scope_json(scope: &Scope, envelope: TargetEnvelope) -> Value {
+    json!({
+        "layers": scope.layers,
+        "targetEnvelope": envelope,
+        "includeOutputNorm": if envelope == TargetEnvelope::All { scope.include_output_norm } else { false },
+        "includeVocab": if envelope == TargetEnvelope::All { scope.include_vocab } else { false },
+        "includeSvd": scope.include_svd,
+        "includeSpectralDenoising": scope.include_spectral_denoising,
+        "exportDtype": scope.export_dtype,
+        "minSpikeRatio": scope.min_spike_ratio,
+        "maxRank": scope.max_rank,
+        "oversampling": scope.oversampling,
+        "powerIterations": scope.power_iterations,
+    })
 }
 
 fn estimated_bf16_bytes(spec: &TensorSpec) -> u64 {
@@ -834,16 +1010,276 @@ fn evaluate_gate1(
     })
 }
 
+fn summarize_denoising_subset(reports: &[&TensorReport]) -> (Value, usize, bool, f64, f64, f64) {
+    let mut count = 0_usize;
+    let mut with_spikes = 0_usize;
+    let mut any_tail_saturated = false;
+    let mut sum_above_rank = 0_usize;
+    let mut max_above_rank = 0_usize;
+    let mut sum_ratio = 0.0_f64;
+    let mut max_ratio = 0.0_f64;
+    let mut raw_energy = 0.0_f64;
+    let mut denoised_energy = 0.0_f64;
+    let mut bulk_energy = 0.0_f64;
+    let mut wr1 = 0.0_f64;
+    let mut wr4 = 0.0_f64;
+    let mut wr8 = 0.0_f64;
+    let mut wr16 = 0.0_f64;
+    let mut wr32 = 0.0_f64;
+    let mut wr64 = 0.0_f64;
+
+    for &report in reports {
+        raw_energy += report.delta_frobenius_energy;
+        let Some(den) = report.svd.as_ref().and_then(|s| s.denoised.as_ref()) else {
+            continue;
+        };
+        count += 1;
+        if den.above_bulk_rank > 0 {
+            with_spikes += 1;
+        }
+        any_tail_saturated |= den.tail_saturated;
+        sum_above_rank += den.above_bulk_rank;
+        max_above_rank = max_above_rank.max(den.above_bulk_rank);
+        sum_ratio += den.sigma_max_to_bulk_edge_ratio;
+        max_ratio = max_ratio.max(den.sigma_max_to_bulk_edge_ratio);
+        let w = den.denoised_signal_energy;
+        denoised_energy += w;
+        bulk_energy += den.estimated_bulk_energy_fraction * report.delta_frobenius_energy;
+        if w > 0.0 {
+            wr1 += w * den.denoised_cumulative_energy.r1;
+            wr4 += w * den.denoised_cumulative_energy.r4;
+            wr8 += w * den.denoised_cumulative_energy.r8;
+            wr16 += w * den.denoised_cumulative_energy.r16;
+            wr32 += w * den.denoised_cumulative_energy.r32;
+            wr64 += w * den.denoised_cumulative_energy.r64;
+        }
+    }
+
+    let mean_rank = if count > 0 {
+        usize_to_f64(sum_above_rank) / usize_to_f64(count)
+    } else {
+        0.0
+    };
+    let mean_ratio = if count > 0 {
+        sum_ratio / usize_to_f64(count)
+    } else {
+        0.0
+    };
+    let bulk_fraction = if raw_energy > 0.0 {
+        (bulk_energy / raw_energy).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let denoised_share = if raw_energy > 0.0 {
+        (denoised_energy / raw_energy).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let weighted_cum = if denoised_energy > 0.0 {
+        let inv = 1.0 / denoised_energy;
+        Some(CumulativeEnergy {
+            r1: (wr1 * inv).clamp(0.0, 1.0),
+            r4: (wr4 * inv).clamp(0.0, 1.0),
+            r8: (wr8 * inv).clamp(0.0, 1.0),
+            r16: (wr16 * inv).clamp(0.0, 1.0),
+            r32: (wr32 * inv).clamp(0.0, 1.0),
+            r64: (wr64 * inv).clamp(0.0, 1.0),
+        })
+    } else {
+        None
+    };
+
+    let summary = json!({
+        "tensorCount": count,
+        "tensorsWithSpikes": with_spikes,
+        "anyTailSaturated": any_tail_saturated,
+        "meanAboveBulkRank": mean_rank,
+        "maxAboveBulkRank": max_above_rank,
+        "meanSigmaMaxToBulkEdgeRatio": mean_ratio,
+        "maxSigmaMaxToBulkEdgeRatio": max_ratio,
+        "rawDeltaEnergy": raw_energy,
+        "denoisedSignalEnergy": denoised_energy,
+        "estimatedBulkEnergyFraction": bulk_fraction,
+        "denoisedShareOfRawEnergy": denoised_share,
+        "energyWeightedDenoisedCumulativeEnergy": weighted_cum,
+    });
+    (
+        summary,
+        max_above_rank,
+        any_tail_saturated,
+        mean_ratio,
+        max_ratio,
+        denoised_energy,
+    )
+}
+
+fn evaluate_spectral_denoising_screen(
+    completed: bool,
+    include_svd: bool,
+    include_denoising: bool,
+    skipped_count: usize,
+    envelope: TargetEnvelope,
+    reports: &[TensorReport],
+) -> Value {
+    let npu_reports: Vec<&TensorReport> = reports
+        .iter()
+        .filter(|r| {
+            r.category == "linear-matrix" && TargetEnvelope::NpuFriendly.matches_family(&r.family)
+        })
+        .collect();
+    let ffn_attn_reports: Vec<&TensorReport> = reports
+        .iter()
+        .filter(|r| {
+            r.category == "linear-matrix"
+                && matches!(
+                    r.family.as_str(),
+                    "ffn_gate"
+                        | "ffn_up"
+                        | "ffn_down"
+                        | "attn_q"
+                        | "attn_k"
+                        | "attn_v"
+                        | "attn_output"
+                )
+        })
+        .collect();
+
+    let (npu_summary, npu_max_rank, npu_sat, npu_mean_ratio, npu_max_ratio, npu_den_energy) =
+        summarize_denoising_subset(&npu_reports);
+    let (ffn_summary, ffn_max_rank, ffn_sat, ffn_mean_ratio, ffn_max_ratio, ffn_den_energy) =
+        summarize_denoising_subset(&ffn_attn_reports);
+
+    let use_npu = !npu_reports.is_empty();
+    let (primary_max_rank, primary_sat, primary_mean_ratio, primary_max_ratio, primary_summary) =
+        if use_npu {
+            (
+                npu_max_rank,
+                npu_sat,
+                npu_mean_ratio,
+                npu_max_ratio,
+                &npu_summary,
+            )
+        } else {
+            (
+                ffn_max_rank,
+                ffn_sat,
+                ffn_mean_ratio,
+                ffn_max_ratio,
+                &ffn_summary,
+            )
+        };
+
+    let npu_share_of_denoised = if ffn_den_energy > 0.0 {
+        (npu_den_energy / ffn_den_energy).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let mut reasons = Vec::new();
+    let verdict = if !include_svd || !include_denoising {
+        reasons.push("Spectral denoising or SVD was disabled in request scope.".to_owned());
+        "denoising-disabled"
+    } else if !completed {
+        reasons.push(format!(
+            "Audit stopped before completing {skipped_count} remaining tensor(s)."
+        ));
+        "incomplete-budget-exceeded"
+    } else if primary_max_rank == 0 {
+        reasons.push(
+            "Zero singular values cleared the Rademacher-null / Gavish–Donoho bulk edge."
+                .to_owned(),
+        );
+        "no-above-bulk-spikes"
+    } else if primary_sat {
+        reasons.push(format!(
+            "Top singular spectrum remained saturated above the bulk edge at maxRank (maxRatio={primary_max_ratio:.2}x)."
+        ));
+        "saturated-high-rank-tail"
+    } else {
+        reasons.push(format!(
+            "Non-saturated coherent spike core detected above Rademacher-null bulk edge (envelope='{}', maxRank={primary_max_rank}, maxRatio={primary_max_ratio:.2}x, meanRatio={primary_mean_ratio:.2}x).",
+            envelope.as_str()
+        ));
+        "coherent-low-rank-core-detected"
+    };
+
+    json!({
+        "verdict": verdict,
+        "anyTailSaturated": primary_sat,
+        "meanSigmaMaxToBulkEdgeRatio": primary_mean_ratio,
+        "maxSigmaMaxToBulkEdgeRatio": primary_max_ratio,
+        "meanAboveBulkRank": primary_summary["meanAboveBulkRank"],
+        "maxAboveBulkRank": primary_max_rank,
+        "estimatedBulkEnergyFraction": primary_summary["estimatedBulkEnergyFraction"],
+        "denoisedShareOfRawEnergy": primary_summary["denoisedShareOfRawEnergy"],
+        "npuFriendlyShareOfDenoisedSignalEnergy": npu_share_of_denoised,
+        "npuFriendlySummary": npu_summary,
+        "ffnAndFullAttnSummary": ffn_summary,
+        "reasons": reasons,
+    })
+}
+
+fn open_sources(
+    source: &SourceSpec,
+    http_concurrency: usize,
+) -> crate::Result<(ShardSource, ShardSource)> {
+    let per_side_http = (http_concurrency / 2).max(1);
+    match source {
+        SourceSpec::PinnedDaisyrose => Ok((
+            ShardSource::https(
+                HUGGINGFACE_BASE_URL.to_owned(),
+                DAISYROSE_REPO.to_owned(),
+                DAISYROSE_REVISION.to_owned(),
+                per_side_http,
+            )?,
+            ShardSource::https(
+                HUGGINGFACE_BASE_URL.to_owned(),
+                QWEN38_REPO.to_owned(),
+                QWEN38_REVISION.to_owned(),
+                per_side_http,
+            )?,
+        )),
+        SourceSpec::LocalDirectories {
+            candidate_directory,
+            base_directory,
+        } => Ok((
+            ShardSource::local(candidate_directory.clone())?,
+            ShardSource::local(base_directory.clone())?,
+        )),
+    }
+}
+
+fn fetch_indices(
+    cand_src: &ShardSource,
+    base_src: &ShardSource,
+    deadline: Instant,
+) -> crate::Result<(SafetensorsIndex, SafetensorsIndex)> {
+    std::thread::scope(|scope| {
+        let c_handle = scope.spawn(|| cand_src.fetch_index(deadline));
+        let b_res = base_src.fetch_index(deadline);
+        let c_res = c_handle
+            .join()
+            .unwrap_or_else(|_| Err("Candidate index thread panicked.".into()))?;
+        let b_res = b_res?;
+        Ok((c_res, b_res))
+    })
+}
+
 fn plan_response(request: &Request) -> crate::Result<Value> {
-    let selected = select_tensors(&request.scope);
+    let source = request
+        .source
+        .as_ref()
+        .ok_or("plan requires a model diff source.")?;
+    let envelope = effective_envelope(request)?;
+    let selected = select_tensors(&request.scope, envelope);
     let est_one: u64 = selected.iter().map(estimated_bf16_bytes).sum();
     let est_pair = est_one.saturating_mul(2);
     let receipt = json!({
         "schemaVersion": 1,
         "operation": "plan",
         "status": "planned-no-io",
-        "source": source_summary(&request.source),
-        "scope": request.scope,
+        "source": source_summary(source),
+        "scope": resolved_scope_json(&request.scope, envelope),
         "controls": request.controls,
         "selectedTensorCount": selected.len(),
         "estimatedBf16BytesOneModel": est_one,
@@ -863,7 +1299,7 @@ fn plan_response(request: &Request) -> crate::Result<Value> {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Orchestrates read-only intake, small-tensor coalescing, block SVD, streaming vocab sketches, power endpoints, and Gate 1 aggregation."
+    reason = "Orchestrates read-only intake, small-tensor coalescing, block SVD, spectral denoising, power endpoints, and Gate 1 aggregation."
 )]
 fn run_audit(request: &Request) -> crate::Result<Value> {
     let started = Instant::now();
@@ -872,42 +1308,15 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
         .checked_add(Duration::from_secs(request.controls.time_budget_seconds))
         .ok_or("Audit deadline overflow.")?;
 
-    let per_side_http = (request.controls.http_concurrency / 2).max(1);
-    let (cand_src, base_src) = match &request.source {
-        SourceSpec::PinnedDaisyrose => (
-            ShardSource::https(
-                HUGGINGFACE_BASE_URL.to_owned(),
-                DAISYROSE_REPO.to_owned(),
-                DAISYROSE_REVISION.to_owned(),
-                per_side_http,
-            )?,
-            ShardSource::https(
-                HUGGINGFACE_BASE_URL.to_owned(),
-                QWEN38_REPO.to_owned(),
-                QWEN38_REVISION.to_owned(),
-                per_side_http,
-            )?,
-        ),
-        SourceSpec::LocalDirectories {
-            candidate_directory,
-            base_directory,
-        } => (
-            ShardSource::local(candidate_directory.clone())?,
-            ShardSource::local(base_directory.clone())?,
-        ),
-    };
+    let source = request
+        .source
+        .as_ref()
+        .ok_or("audit requires a model diff source.")?;
+    let envelope = effective_envelope(request)?;
+    let (cand_src, base_src) = open_sources(source, request.controls.http_concurrency)?;
+    let (cand_idx, base_idx) = fetch_indices(&cand_src, &base_src, deadline)?;
 
-    let (cand_idx, base_idx) = std::thread::scope(|scope| {
-        let c_handle = scope.spawn(|| cand_src.fetch_index(deadline));
-        let b_res = base_src.fetch_index(deadline);
-        let c_res = c_handle
-            .join()
-            .unwrap_or_else(|_| Err("Candidate index thread panicked.".into()))?;
-        let b_res = b_res?;
-        Ok::<_, String>((c_res, b_res))
-    })?;
-
-    let selected = select_tensors(&request.scope);
+    let selected = select_tensors(&request.scope, envelope);
     let prepared = resolve_and_validate_tensors(
         selected, &cand_src, &cand_idx, &base_src, &base_idx, deadline,
     )?;
@@ -933,6 +1342,7 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
         .max_rank
         .saturating_add(request.scope.oversampling);
     let workers = request.controls.workers;
+    let include_denoising = request.scope.include_spectral_denoising;
 
     // Phase 1: Small coalesced tensors (non-matrix + ssm_alpha/ssm_beta).
     if !small_indices.is_empty() {
@@ -1000,6 +1410,8 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
                         k_sketch,
                         request.scope.power_iterations,
                         stats.delta_energy,
+                        include_denoising,
+                        request.scope.max_rank,
                         workers,
                     )?)
                 } else {
@@ -1076,6 +1488,8 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
                 k_sketch,
                 request.scope.power_iterations,
                 stats.delta_energy,
+                include_denoising,
+                request.scope.max_rank,
                 workers,
             )?)
         } else {
@@ -1192,7 +1606,12 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
             break;
         }
         let svd = match sketch {
-            Some(sk) => Some(sk.finish(total_stats.delta_energy, workers)?),
+            Some(sk) => Some(sk.finish(
+                total_stats.delta_energy,
+                include_denoising,
+                request.scope.max_rank,
+                workers,
+            )?),
             None => None,
         };
         reports.push(build_tensor_report(
@@ -1215,6 +1634,7 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
     let mut non_matrix_small_gdn = MetricsAccum::default();
     let mut linear_matrices = MetricsAccum::default();
     let mut ffn_and_full_attn = MetricsAccum::default();
+    let mut npu_friendly = MetricsAccum::default();
     let mut cand_a_ffn_down_only = MetricsAccum::default();
     let mut cand_a_down_attn_o = MetricsAccum::default();
     let mut cand_b_all = MetricsAccum::default();
@@ -1244,6 +1664,9 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
             "linear-matrix" => {
                 non_vocab_all.add(report);
                 linear_matrices.add(report);
+                if TargetEnvelope::NpuFriendly.matches_family(&report.family) {
+                    npu_friendly.add(report);
+                }
                 match report.family.as_str() {
                     "ffn_down" => {
                         ffn_and_full_attn.add(report);
@@ -1299,6 +1722,14 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
         &cand_a_down_attn_o,
         &cand_b_gate_up_qkv,
     );
+    let spectral_denoising_screen = evaluate_spectral_denoising_screen(
+        completed,
+        request.scope.include_svd,
+        include_denoising,
+        skipped_tensors.len(),
+        envelope,
+        &reports,
+    );
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let cand_bytes_read = cand_src.transferred_bytes();
@@ -1309,8 +1740,8 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
         "completed": completed,
         "budgetExceeded": budget_exceeded,
         "elapsedMilliseconds": elapsed_ms,
-        "source": source_summary(&request.source),
-        "scope": request.scope,
+        "source": source_summary(source),
+        "scope": resolved_scope_json(&request.scope, envelope),
         "controls": request.controls,
         "candidateIndexSha256": cand_idx.sha256,
         "baseIndexSha256": base_idx.sha256,
@@ -1332,6 +1763,7 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
             "nonMatrixAndSmallGdn": non_matrix_small_gdn.to_json(audited_energy, non_vocab_energy, linear_energy),
             "linearMatrices": linear_matrices.to_json(audited_energy, non_vocab_energy, linear_energy),
             "ffnAndFullAttnLinearMatrices": ffn_and_full_attn.to_json(audited_energy, non_vocab_energy, linear_energy),
+            "npuFriendly": npu_friendly.to_json(audited_energy, non_vocab_energy, linear_energy),
             "candidateA_ffnDownOnly": cand_a_ffn_down_only.to_json(audited_energy, non_vocab_energy, linear_energy),
             "candidateA_ffnDownAndAttnOutput": cand_a_down_attn_o.to_json(audited_energy, non_vocab_energy, linear_energy),
             "candidateB_allFfnAndFullAttn": cand_b_all.to_json(audited_energy, non_vocab_energy, linear_energy),
@@ -1340,6 +1772,7 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
             "vocabMatrices": vocab_matrices.to_json(audited_energy, non_vocab_energy, linear_energy),
         },
         "gate1Screen": gate1_screen,
+        "spectralDenoisingScreen": spectral_denoising_screen,
         "tensors": reports,
     });
     if let Some(output) = &request.output_path {
@@ -1348,11 +1781,308 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
     Ok(receipt)
 }
 
-/// Runs a read-only BF16 weight-diff and SVD spectrum audit (`DR1` Gate 1).
+fn run_export_denoised(request: &Request) -> crate::Result<Value> {
+    run_export_denoised_with_dims(request, &swift_base_dims_map())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Streams target matrices, extracts denoised low-rank factors, publishes atomic GGUF, and self-verifies without echoing local paths."
+)]
+fn run_export_denoised_with_dims(
+    request: &Request,
+    verify_dims: &BTreeMap<String, (usize, usize, &'static str)>,
+) -> crate::Result<Value> {
+    let started = Instant::now();
+    let power_before = crate::host_cpu::power_snapshot();
+    let deadline = started
+        .checked_add(Duration::from_secs(request.controls.time_budget_seconds))
+        .ok_or("Export deadline overflow.")?;
+
+    let source = request
+        .source
+        .as_ref()
+        .ok_or("export-denoised requires a model diff source.")?;
+    let output_path = request
+        .output_path
+        .as_ref()
+        .ok_or("export-denoised requires outputPath.")?;
+    let envelope = effective_envelope(request)?;
+    let (cand_src, base_src) = open_sources(source, request.controls.http_concurrency)?;
+    let (cand_idx, base_idx) = fetch_indices(&cand_src, &base_src, deadline)?;
+
+    let selected = select_tensors(&request.scope, envelope);
+    let prepared = resolve_and_validate_tensors(
+        selected, &cand_src, &cand_idx, &base_src, &base_idx, deadline,
+    )?;
+
+    struct ExtractedEntry {
+        gguf_name: String,
+        in_features: usize,
+        out_features: usize,
+        factors: svd::DenoisedFactors,
+    }
+
+    let k_sketch = request
+        .scope
+        .max_rank
+        .saturating_add(request.scope.oversampling);
+    let workers = request.controls.workers;
+    let export_dtype = request.scope.export_dtype;
+
+    let mut extracted = Vec::with_capacity(prepared.len());
+    let mut reports = Vec::with_capacity(prepared.len());
+    let mut skipped_tensors = Vec::new();
+    let mut budget_exceeded = false;
+
+    for (pos, p) in prepared.iter().enumerate() {
+        if Instant::now() >= deadline {
+            budget_exceeded = true;
+            for rem in &prepared[pos..] {
+                skipped_tensors.push(rem.spec.gguf_name.clone());
+            }
+            break;
+        }
+        crate::startup_cancel::checkpoint()?;
+        if p.desc.shape.len() != 2 {
+            return Err(format!(
+                "export-denoised expected 2D matrix for '{}'.",
+                p.spec.hf_name
+            ));
+        }
+        let rows = p.desc.shape[0];
+        let cols = p.desc.shape[1];
+        let b_desc = base_src.descriptor(&p.base_shard, &p.spec.hf_name)?;
+        let (cb, bb) = match fetch_pair_slices(
+            &cand_src,
+            &p.cand_shard,
+            p.desc.abs_begin,
+            p.byte_size,
+            &base_src,
+            &p.base_shard,
+            b_desc.abs_begin,
+            p.byte_size,
+            deadline,
+        ) {
+            Ok(pair) => pair,
+            Err(_) if Instant::now() >= deadline => {
+                budget_exceeded = true;
+                for rem in &prepared[pos..] {
+                    skipped_tensors.push(rem.spec.gguf_name.clone());
+                }
+                break;
+            }
+            Err(err) => return Err(err),
+        };
+        let mut delta = Vec::new();
+        delta
+            .try_reserve_exact(p.element_count)
+            .map_err(|e| format!("Cannot allocate delta matrix for '{}': {e}", p.spec.hf_name))?;
+        delta.resize(p.element_count, 0.0_f32);
+        let stats = diff_chunk_rows(p.dtype, &cb, &bb, rows, cols, &mut delta, workers)?;
+        drop(cb);
+        drop(bb);
+
+        let factors = randomized_subspace_denoised_factors(
+            &p.spec.hf_name,
+            &delta,
+            rows,
+            cols,
+            k_sketch,
+            request.scope.power_iterations,
+            stats.delta_energy,
+            request.scope.max_rank,
+            request.scope.min_spike_ratio,
+            workers,
+        )?;
+        let report = build_tensor_report(
+            &p.spec,
+            p.dtype,
+            p.desc.shape.clone(),
+            p.element_count,
+            p.byte_size,
+            stats,
+            Some(factors.spectrum.clone()),
+        );
+        reports.push(report);
+        if factors.rank > 0 {
+            extracted.push(ExtractedEntry {
+                gguf_name: p.spec.gguf_name.clone(),
+                in_features: cols,
+                out_features: rows,
+                factors,
+            });
+        }
+    }
+
+    let power_after = crate::host_cpu::power_snapshot();
+    let power_conditions = bonsai_cpu_policy::power::compare_endpoints(&power_before, &power_after);
+    let completed = !budget_exceeded && skipped_tensors.is_empty();
+    let spectral_summary = evaluate_spectral_denoising_screen(
+        completed,
+        true,
+        true,
+        skipped_tensors.len(),
+        envelope,
+        &reports,
+    );
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let cand_bytes_read = cand_src.transferred_bytes();
+    let base_bytes_read = base_src.transferred_bytes();
+
+    if !completed {
+        return Ok(json!({
+            "schemaVersion": 1,
+            "operation": "export-denoised",
+            "published": false,
+            "status": "budget-exceeded-not-published",
+            "completed": false,
+            "budgetExceeded": true,
+            "elapsedMilliseconds": elapsed_ms,
+            "targetEnvelope": envelope,
+            "exportDtype": export_dtype,
+            "skippedTensors": skipped_tensors,
+            "transferredBytes": {
+                "candidate": cand_bytes_read,
+                "base": base_bytes_read,
+                "total": cand_bytes_read.saturating_add(base_bytes_read)
+            },
+            "powerBefore": power_before,
+            "powerAfter": power_after,
+            "powerConditions": power_conditions,
+            "spectralSummary": spectral_summary,
+        }));
+    }
+
+    if extracted.is_empty() {
+        return Ok(json!({
+            "schemaVersion": 1,
+            "operation": "export-denoised",
+            "published": false,
+            "status": "no-above-bulk-spikes",
+            "completed": true,
+            "budgetExceeded": false,
+            "elapsedMilliseconds": elapsed_ms,
+            "targetEnvelope": envelope,
+            "exportDtype": export_dtype,
+            "pairCount": 0,
+            "transferredBytes": {
+                "candidate": cand_bytes_read,
+                "base": base_bytes_read,
+                "total": cand_bytes_read.saturating_add(base_bytes_read)
+            },
+            "powerBefore": power_before,
+            "powerAfter": power_after,
+            "powerConditions": power_conditions,
+            "spectralSummary": spectral_summary,
+        }));
+    }
+
+    let max_rank = extracted
+        .iter()
+        .map(|entry| entry.factors.rank)
+        .max()
+        .unwrap_or(1);
+    let global_alpha = usize_to_f32(max_rank);
+    let mut pairs = Vec::with_capacity(extracted.len());
+    for entry in &extracted {
+        let (lora_a_f32, lora_b_f32) = build_balanced_factors(
+            &entry.factors.u_cols,
+            &entry.factors.v_cols,
+            &entry.factors.shrunk_sigmas,
+            global_alpha,
+            export_dtype,
+        )?;
+        pairs.push(ExportTensorPair {
+            gguf_base_name: entry.gguf_name.clone(),
+            in_features: entry.in_features,
+            out_features: entry.out_features,
+            rank: entry.factors.rank,
+            lora_a_f32,
+            lora_b_f32,
+        });
+    }
+
+    let mut meta: Vec<(&str, &str)> = vec![
+        (
+            "bonsai.composition.method",
+            "rademacher-null-gavish-donoho-v1",
+        ),
+        ("bonsai.composition.envelope", envelope.as_str()),
+        (
+            "bonsai.composition.candidate_index_sha256",
+            &cand_idx.sha256,
+        ),
+        ("bonsai.composition.base_index_sha256", &base_idx.sha256),
+    ];
+    if matches!(source, SourceSpec::PinnedDaisyrose) {
+        meta.push(("bonsai.composition.candidate_repo", DAISYROSE_REPO));
+        meta.push(("bonsai.composition.candidate_revision", DAISYROSE_REVISION));
+        meta.push(("bonsai.composition.base_repo", QWEN38_REPO));
+        meta.push(("bonsai.composition.base_revision", QWEN38_REVISION));
+    }
+
+    let written = write_lora_gguf(output_path, export_dtype, global_alpha, &meta, &pairs)?;
+    let verification = verify_lora_gguf_with_dims(
+        output_path,
+        &VerifyPolicy {
+            expected_sha256: Some(written.sha256.clone()),
+            expected_envelope: Some(envelope.as_str().to_owned()),
+            require_npu_friendly: matches!(
+                envelope,
+                TargetEnvelope::ResidualWriters | TargetEnvelope::NpuFriendly
+            ),
+            require_no_grouped_ssm: true,
+            max_allowed_rank: Some(request.scope.max_rank),
+        },
+        verify_dims,
+    )?;
+
+    Ok(json!({
+        "schemaVersion": 1,
+        "operation": "export-denoised",
+        "published": true,
+        "status": "published-and-verified",
+        "completed": true,
+        "budgetExceeded": false,
+        "elapsedMilliseconds": elapsed_ms,
+        "targetEnvelope": envelope,
+        "exportDtype": export_dtype,
+        "alpha": global_alpha,
+        "bytes": written.bytes,
+        "sha256": written.sha256,
+        "tensorCount": written.tensor_count,
+        "pairCount": pairs.len(),
+        "candidateIndexSha256": cand_idx.sha256,
+        "baseIndexSha256": base_idx.sha256,
+        "transferredBytes": {
+            "candidate": cand_bytes_read,
+            "base": base_bytes_read,
+            "total": cand_bytes_read.saturating_add(base_bytes_read)
+        },
+        "powerBefore": power_before,
+        "powerAfter": power_after,
+        "powerConditions": power_conditions,
+        "spectralSummary": spectral_summary,
+        "verification": verification,
+        "tensors": reports,
+    }))
+}
+
+fn run_verify_adapter(request: &Request) -> crate::Result<Value> {
+    let adapter_path = request
+        .adapter_path
+        .as_ref()
+        .ok_or("verify-adapter requires adapterPath.")?;
+    verify_lora_gguf(adapter_path, &request.verify_policy)
+}
+
+/// Runs read-only BF16 weight-diff/spectral-denoising audits (`plan`, `audit`),
+/// denoised GGUF LoRA export (`export-denoised`), or adapter verification (`verify-adapter`).
 ///
 /// # Errors
 /// Rejects unsupported schema versions, invalid scopes or budgets, unsafe or existing
-/// output paths, mismatched safetensors layouts, nonfinite weights, or failed range I/O.
+/// output paths, mismatched safetensors or GGUF layouts, nonfinite weights, or failed range I/O.
 pub fn run(request: Value) -> crate::Result<Value> {
     let parsed: Request = serde_json::from_value(request)
         .map_err(|e| format!("Invalid lora-diff-audit request: {e}"))?;
@@ -1360,5 +2090,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
     match parsed.operation {
         Operation::Plan => plan_response(&parsed),
         Operation::Audit => run_audit(&parsed),
+        Operation::ExportDenoised => run_export_denoised(&parsed),
+        Operation::VerifyAdapter => run_verify_adapter(&parsed),
     }
 }

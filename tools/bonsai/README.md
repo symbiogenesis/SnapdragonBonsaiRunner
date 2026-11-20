@@ -62,18 +62,31 @@ the GGUF byte length unchanged. Native sparse execution is separately required
 for memory or arithmetic savings. Neither retained weight energy nor a factual
 smoke establishes broad quality or an inference-speed improvement.
 
-`lora-diff-audit` runs Gate 1 (`DR1`): a read-only Rust BF16 weight-diff and SVD
-spectrum audit comparing `RadixArk/DaisyRose-27B` against `Qwen/Qwen3.8-27B`
-(or explicit `local-directories` fixtures) via bounded HTTP Range streaming.
-Supply `schemaVersion: 1`, `operation: "plan"` or `"audit"`, `source`
-(`{"kind":"pinned-daisyrose"}` or `{"kind":"local-directories","candidateDirectory":...,"baseDirectory":...}`),
-optional `scope` (`layers`, `includeOutputNorm`, `includeVocab`, `includeSvd`,
-`maxRank`, `oversampling`, `powerIterations`), optional `controls`
-(`timeBudgetSeconds` in `10..=900`, `workers`, `httpConcurrency`), and optional
-fresh external `outputPath`. Gate 1 stops (`no-go`) if non-matrix parameters
-hold `>= 50%` of non-vocab delta energy (or mean relative delta `> 5x` linear
-matrices), or if energy-weighted `E(32) < 50%` across FFN and full-attention
-matrices.
+`lora-diff-audit` runs Gate 1 (`DR1`), Track A spectral-denoising (`DR-A1`/
+`DR-A2`), and Track B/G2 GGUF adapter verification against
+`RadixArk/DaisyRose-27B` vs `Qwen/Qwen3.8-27B` (or `local-directories` fixtures)
+via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
+- `"plan"` / `"audit"`: requires `source` (`{"kind":"pinned-daisyrose"}` or
+  `{"kind":"local-directories","candidateDirectory":...,"baseDirectory":...}`),
+  optional `scope` (`layers`, `targetEnvelope` in `"all"` | `"residual-writers"` |
+  `"npu-friendly"` | `"full-linear"`, `includeOutputNorm`, `includeVocab`,
+  `includeSvd`, `includeSpectralDenoising`, `exportDtype` `"f16"` | `"f32"`,
+  `minSpikeRatio`, `maxRank`, `oversampling`, `powerIterations`), optional
+  `controls` (`timeBudgetSeconds` in `10..=900`, `workers`, `httpConcurrency`),
+  and optional fresh external `outputPath`. Audits emit both `gate1Screen` (raw
+  SVD) and `spectralDenoisingScreen` (Rademacher-null bulk calibration +
+  Gavish–Donoho optimal shrinkage + `tailSaturated` check).
+- `"export-denoised"`: requires `source`, fresh external `outputPath`, and
+  `targetEnvelope` in `"residual-writers"` | `"npu-friendly"` (default) |
+  `"full-linear"`, atomically exporting shrunk above-bulk spikes to a GGUF v3
+  LoRA with both `adapter.lora.alpha` and `adapter.lora_alpha` and immediately
+  self-verifying the published bytes.
+- `"verify-adapter"`: requires external `adapterPath` and optional `verifyPolicy`
+  (`expectedSha256`, `expectedEnvelope`, `requireNpuFriendly`,
+  `requireNoGroupedSsm`, `maxAllowedRank`), verifying GGUF v3 structure, dual
+  alpha equality, `Swift-Bonsai-2` tensor shapes, finite scalars, Hexagon NPU
+  FFN chain preservation, and exclusion of unresolved `ssm_out` targets without
+  echoing local filesystem paths in receipts.
 
 `ffn-plan` screens the packed-payload envelope of an explicit structured FFN
 omission plan without reading a model or choosing important sites. Supply

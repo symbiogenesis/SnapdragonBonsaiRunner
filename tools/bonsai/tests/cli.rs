@@ -320,5 +320,22 @@ fn lora_diff_audit_plan_dispatches_without_network() -> Result<(), Box<dyn std::
         plan["source"]["base"]["revision"],
         "37561816e66b5b9153b1b64c10968c18c1e6f4a0"
     );
+
+    let npu_output = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
+        .args([
+            "lora-diff-audit",
+            "--json",
+            r#"{"schemaVersion":1,"operation":"plan","source":{"kind":"pinned-daisyrose"},"scope":{"layers":[0,3,31,63],"targetEnvelope":"npu-friendly"}}"#,
+        ])
+        .output()?;
+    assert!(
+        npu_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&npu_output.stderr)
+    );
+    let npu_plan: Value = serde_json::from_slice(&npu_output.stdout)?;
+    assert_eq!(npu_plan["scope"]["targetEnvelope"], "npu-friendly");
+    assert_eq!(npu_plan["selectedTensorCount"], 16);
+    assert_eq!(npu_plan["estimatedBf16BytesPair"], 2_684_354_560_u64);
     Ok(())
 }
