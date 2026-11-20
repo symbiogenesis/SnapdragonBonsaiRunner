@@ -137,6 +137,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--require-broker-pipe" => ("RequireBrokerPipe", true, false),
             "--use-repacked-ptq1" | "--use-original-pq2" => ("UseRepackedPtq1", true, false),
             "--no-abliterate-lora" => ("NoAbliterateLora", true, false),
+            "--daisyrose-lora" => ("DaisyRoseLora", false, false),
             "--no-mmproj" => ("NoMmproj", true, false),
             "--no-tts" => ("NoTts", true, false),
             "--no-speech-models" => ("NoSpeechModels", true, false),
@@ -491,6 +492,21 @@ mod tests {
         assert_eq!(
             chat_options(&["--native-engine".into()])?["NativeEngine"],
             true
+        );
+        let daisy = std::env::temp_dir().join("daisyrose-cli.gguf");
+        assert_eq!(
+            chat_options(&["--daisyrose-lora".into(), daisy.clone().into()])?["DaisyRoseLora"],
+            serde_json::to_value(&daisy).map_err(|e| e.to_string())?
+        );
+        assert!(chat_options(&["--daisyrose-lora".into()]).is_err());
+        assert!(
+            chat_options(&[
+                "--daisyrose-lora".into(),
+                daisy.clone().into(),
+                "--daisyrose-lora".into(),
+                daisy.into()
+            ])
+            .is_err()
         );
         for first in ["--native-engine", "--publisher-engine"] {
             for second in ["--native-engine", "--publisher-engine"] {

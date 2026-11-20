@@ -1830,90 +1830,126 @@ fn run_export_denoised_with_dims(
     let workers = request.controls.workers;
     let export_dtype = request.scope.export_dtype;
 
-    let mut extracted = Vec::with_capacity(prepared.len());
-    let mut reports = Vec::with_capacity(prepared.len());
-    let mut skipped_tensors = Vec::new();
-    let mut budget_exceeded = false;
-
-    for (pos, p) in prepared.iter().enumerate() {
-        if Instant::now() >= deadline {
-            budget_exceeded = true;
-            for rem in &prepared[pos..] {
-                skipped_tensors.push(rem.spec.gguf_name.clone());
-            }
-            break;
-        }
-        crate::startup_cancel::checkpoint()?;
+    for p in &prepared {
         if p.desc.shape.len() != 2 {
             return Err(format!(
                 "export-denoised expected 2D matrix for '{}'.",
                 p.spec.hf_name
             ));
         }
-        let rows = p.desc.shape[0];
-        let cols = p.desc.shape[1];
-        let b_desc = base_src.descriptor(&p.base_shard, &p.spec.hf_name)?;
-        let (cb, bb) = match fetch_pair_slices(
-            &cand_src,
-            &p.cand_shard,
-            p.desc.abs_begin,
-            p.byte_size,
-            &base_src,
-            &p.base_shard,
-            b_desc.abs_begin,
-            p.byte_size,
-            deadline,
-        ) {
-            Ok(pair) => pair,
-            Err(_) if Instant::now() >= deadline => {
+    }
+
+    let mut extracted = Vec::with_capacity(prepared.len());
+    let mut reports = Vec::with_capacity(prepared.len());
+    let mut skipped_tensors = Vec::new();
+    let mut budget_exceeded = false;
+
+    // 1-slot HTTP Range prefetch pipeline: keep at most one next-tensor slice
+    // pair fetching concurrently while computing denoised factors for the current tensor.
+    std::thread::scope(|scope| -> crate::Result<()> {
+        let start_fetch = |index: usize| -> crate::Result<
+            std::thread::ScopedJoinHandle<'_, crate::Result<(Vec<u8>, Vec<u8>)>>,
+        > {
+            let item = &prepared[index];
+            let b_desc = base_src.descriptor(&item.base_shard, &item.spec.hf_name)?;
+            let cand_ref = &cand_src;
+            let base_ref = &base_src;
+            let cand_shard = &item.cand_shard;
+            let base_shard = &item.base_shard;
+            let cand_begin = item.desc.abs_begin;
+            let base_begin = b_desc.abs_begin;
+            let byte_size = item.byte_size;
+            Ok(scope.spawn(move || {
+                fetch_pair_slices(
+                    cand_ref, cand_shard, cand_begin, byte_size, base_ref, base_shard, base_begin,
+                    byte_size, deadline,
+                )
+            }))
+        };
+
+        let mut prefetched = (!prepared.is_empty() && Instant::now() < deadline)
+            .then(|| start_fetch(0))
+            .transpose()?;
+
+        for (pos, p) in prepared.iter().enumerate() {
+            if Instant::now() >= deadline {
+                if let Some(handle) = prefetched.take() {
+                    let _ = handle.join();
+                }
                 budget_exceeded = true;
                 for rem in &prepared[pos..] {
                     skipped_tensors.push(rem.spec.gguf_name.clone());
                 }
                 break;
             }
-            Err(err) => return Err(err),
-        };
-        let mut delta = Vec::new();
-        delta
-            .try_reserve_exact(p.element_count)
-            .map_err(|e| format!("Cannot allocate delta matrix for '{}': {e}", p.spec.hf_name))?;
-        delta.resize(p.element_count, 0.0_f32);
-        let stats = diff_chunk_rows(p.dtype, &cb, &bb, rows, cols, &mut delta, workers)?;
-        drop(cb);
-        drop(bb);
+            crate::startup_cancel::checkpoint()?;
+            let rows = p.desc.shape[0];
+            let cols = p.desc.shape[1];
+            let fetched = match prefetched.take() {
+                Some(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err("Prefetch thread panicked.".into())),
+                None => start_fetch(pos)?
+                    .join()
+                    .unwrap_or_else(|_| Err("Fetch thread panicked.".into())),
+            };
+            let (cb, bb) = match fetched {
+                Ok(pair) => pair,
+                Err(_) if Instant::now() >= deadline => {
+                    budget_exceeded = true;
+                    for rem in &prepared[pos..] {
+                        skipped_tensors.push(rem.spec.gguf_name.clone());
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            if pos + 1 < prepared.len() && Instant::now() < deadline {
+                prefetched = Some(start_fetch(pos + 1)?);
+            }
 
-        let factors = randomized_subspace_denoised_factors(
-            &p.spec.hf_name,
-            &delta,
-            rows,
-            cols,
-            k_sketch,
-            request.scope.power_iterations,
-            stats.delta_energy,
-            request.scope.max_rank,
-            request.scope.min_spike_ratio,
-            workers,
-        )?;
-        let report = build_tensor_report(
-            &p.spec,
-            p.dtype,
-            p.desc.shape.clone(),
-            p.element_count,
-            p.byte_size,
-            stats,
-            Some(factors.spectrum.clone()),
-        );
-        reports.push(report);
-        if factors.rank > 0 {
-            extracted.push(ExtractedEntry {
-                gguf_name: p.spec.gguf_name.clone(),
-                in_features: cols,
-                out_features: rows,
-                factors,
-            });
+            let mut delta = Vec::new();
+            delta.try_reserve_exact(p.element_count).map_err(|e| {
+                format!("Cannot allocate delta matrix for '{}': {e}", p.spec.hf_name)
+            })?;
+            delta.resize(p.element_count, 0.0_f32);
+            let stats = diff_chunk_rows(p.dtype, &cb, &bb, rows, cols, &mut delta, workers)?;
+            drop(cb);
+            drop(bb);
+
+            let factors = randomized_subspace_denoised_factors(
+                &p.spec.hf_name,
+                &delta,
+                rows,
+                cols,
+                k_sketch,
+                request.scope.power_iterations,
+                stats.delta_energy,
+                request.scope.max_rank,
+                request.scope.min_spike_ratio,
+                workers,
+            )?;
+            let report = build_tensor_report(
+                &p.spec,
+                p.dtype,
+                p.desc.shape.clone(),
+                p.element_count,
+                p.byte_size,
+                stats,
+                Some(factors.spectrum.clone()),
+            );
+            reports.push(report);
+            if factors.rank > 0 {
+                extracted.push(ExtractedEntry {
+                    gguf_name: p.spec.gguf_name.clone(),
+                    in_features: cols,
+                    out_features: rows,
+                    factors,
+                });
+            }
         }
-    }
+        Ok(())
+    })?;
 
     let power_after = crate::host_cpu::power_snapshot();
     let power_conditions = bonsai_cpu_policy::power::compare_endpoints(&power_before, &power_after);

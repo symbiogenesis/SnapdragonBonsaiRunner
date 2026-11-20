@@ -1260,6 +1260,27 @@ fn native_alternate_profiles_keep_verified_launch_options() -> crate::Result<()>
             !adapter
         );
     }
+    let mut daisy_fixture = fixture("daisyrose-forwarding")?;
+    let daisy_path = daisy_fixture.root.join("daisyrose-vet.gguf");
+    daisy_fixture.request["NativeEngine"] = json!(true);
+    daisy_fixture.request["NoSpeechModels"] = json!(true);
+    daisy_fixture.request["DaisyRoseLora"] = json!(daisy_path);
+    let mut daisy_recorder = Recorder::new(daisy_fixture.root.clone());
+    let daisy_result = prepare_backend(
+        plan(daisy_fixture.request.clone())?,
+        &mut daisy_recorder,
+        &daisy_fixture.working,
+    )?;
+    let daisy_args = daisy_result["Arguments"]
+        .as_array()
+        .ok_or("Missing launch arguments.")?;
+    assert!(
+        daisy_args
+            .array_windows::<2>()
+            .any(|pair| pair[0] == "--daisyrose-lora" && pair[1] == daisy_path.to_string_lossy().as_ref())
+    );
+    daisy_fixture.request["NativeEngine"] = json!(false);
+    assert!(plan(daisy_fixture.request).is_err());
     Ok(())
 }
 

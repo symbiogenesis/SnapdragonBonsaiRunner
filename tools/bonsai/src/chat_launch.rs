@@ -186,6 +186,8 @@ struct Request {
     tts_threads: u16,
     #[serde(default)]
     no_abliterate_lora: bool,
+    #[serde(default, rename = "DaisyRoseLora")]
+    daisyrose_lora: Option<PathBuf>,
     #[serde(default)]
     no_mmproj: bool,
     #[serde(default)]
@@ -475,6 +477,12 @@ impl Request {
         if self.placement.is_some() && !self.native_engine {
             return Err("Placement requires NativeEngine.".into());
         }
+        if let Some(path) = &self.daisyrose_lora {
+            if !self.native_engine {
+                return Err("DaisyRoseLora requires NativeEngine.".into());
+            }
+            external(path)?;
+        }
         self.native_row_workers = Some(workers);
         Ok(())
     }
@@ -626,6 +634,7 @@ fn prepare_for_family(
         &mut request.broker_path,
         &mut request.asr_path,
         &mut request.tts_path,
+        &mut request.daisyrose_lora,
         &mut request.canary_key_file,
         &mut request.tts_key_file,
     ] {
@@ -1033,6 +1042,9 @@ fn argument(arguments: &mut Vec<OsString>, name: &str, value: impl Into<OsString
 fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
     if request.no_abliterate_lora {
         arguments.push("--no-abliterate-lora".into());
+    }
+    if let Some(daisyrose_lora) = &request.daisyrose_lora {
+        argument(arguments, "--daisyrose-lora", daisyrose_lora);
     }
     if request.no_mmproj {
         arguments.push("--no-mmproj".into());

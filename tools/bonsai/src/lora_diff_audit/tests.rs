@@ -1148,5 +1148,42 @@ fn export_denoised_and_verify_adapter_roundtrip_f32_and_f16() -> crate::Result<(
         .is_err()
     );
 
+    // Repeat deterministic pipelined export-denoised against the same inputs and verify identical bytes/sha256.
+    let replay_gguf = scratch.join("real-replay-a.gguf");
+    let replay_gguf_b = scratch.join("real-replay-b.gguf");
+    let export_req = |out: &Path| {
+        serde_json::from_value::<Request>(json!({
+            "schemaVersion": 1,
+            "operation": "export-denoised",
+            "source": {
+                "kind": "local-directories",
+                "candidateDirectory": cand_dir,
+                "baseDirectory": base_dir
+            },
+            "scope": {
+                "layers": [0, 3],
+                "targetEnvelope": "npu-friendly",
+                "exportDtype": "f16",
+                "maxRank": 4,
+                "oversampling": 4,
+                "powerIterations": 2,
+                "minSpikeRatio": 1.0
+            },
+            "controls": {
+                "timeBudgetSeconds": 60,
+                "workers": 2,
+                "httpConcurrency": 1
+            },
+            "outputPath": out
+        }))
+    };
+    let res_a = run_export_denoised_with_dims(&export_req(&replay_gguf).map_err(|e| e.to_string())?, &toy_dims)?;
+    let res_b = run_export_denoised_with_dims(&export_req(&replay_gguf_b).map_err(|e| e.to_string())?, &toy_dims)?;
+    assert_eq!(res_a["adapterSha256"], res_b["adapterSha256"]);
+    assert_eq!(
+        fs::read(&replay_gguf).map_err(|e| e.to_string())?,
+        fs::read(&replay_gguf_b).map_err(|e| e.to_string())?
+    );
+
     Ok(())
 }
