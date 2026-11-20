@@ -509,7 +509,7 @@ pending in [PLAN.md](../PLAN.md#memory-loading-and-approximate-cache):
   Prism's `ServerEndpoint::verified_sections` descriptor intake,
   `bonsai-windows-credentials` `compute_mapped_chunk_digests[_with]` /
   `try_verify_locked_file_chunk_digests_mapped[_with]` (`16 MiB` default chunks,
-  up to `8` workers), and `bonsai-artifacts` `VerifiedFile::verify_chunked[_with]` /
+  up to `16` workers), and `bonsai-artifacts` `VerifiedFile::verify_chunked[_with]` /
   `verify_files_bounded_parallel`. Full-byte launch hashing remains mandatory,
   and lockfile-pinned fixed-chunk `SHA256` manifests still require manifest
   signing and Oryon crypto-core qualification.

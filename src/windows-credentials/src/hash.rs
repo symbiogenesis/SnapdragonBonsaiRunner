@@ -23,7 +23,7 @@ pub const MIN_MAPPED_HASH_BYTES: u64 = 4 * 1024 * 1024;
 /// Default chunk size (`16 MiB`) for parallel mapped CNG SHA-256 verification.
 pub const PARALLEL_HASH_DEFAULT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum OS worker threads used by parallel mapped CNG SHA-256 verification.
-pub const MAX_PARALLEL_HASH_WORKERS: usize = 8;
+pub const MAX_PARALLEL_HASH_WORKERS: usize = 16;
 const MAPPED_HASH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAPPED_PREFETCH_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
