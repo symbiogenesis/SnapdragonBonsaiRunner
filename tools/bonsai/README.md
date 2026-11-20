@@ -89,6 +89,19 @@ via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
   alpha equality, `Swift-Bonsai-2` tensor shapes, finite scalars, Hexagon NPU
   FFN chain preservation, and exclusion of unresolved `ssm_out` targets without
   echoing local filesystem paths in receipts.
+- `"generate-test-adapter"`: builds a deterministic offline synthetic multi-rank
+  GGUF fixture (`scope.layers`, `scope.targetEnvelope`, `scope.exportDtype`,
+  `scope.maxRank`) at fresh external `outputPath` and self-verifies it for
+  runtime wiring checks (marked `synthetic-runtime-test-fixture-v1`).
+- `"generate-lock"`: verifies an external candidate GGUF (`adapterPath`) and
+  `lockSource` provenance, rejects synthetic fixtures with `defaultEnabled: true`,
+  round-trips through `bonsai-cpu-policy`, and writes a candidate DaisyRose lock
+  at fresh external `outputPath`.
+- `"dr-g2-plan"` / `"dr-g2-score"`: emits the canonical `DR-G2` three-way
+  screen contract/template (optional `screenConfig` and `outputPath`) and scores
+  `evidencePath` fail-closed across capability gain, Thinking-ON `<= 1.10x`
+  anti-looping, Thinking-OFF creative/Orca non-regression, split disjointness,
+  and zero-scale bit identity.
 
 `ffn-plan` screens the packed-payload envelope of an explicit structured FFN
 omission plan without reading a model or choosing important sites. Supply

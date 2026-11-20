@@ -1,6 +1,7 @@
 //! Read-only BF16 weight-diff, spectral-denoising audit, and GGUF LoRA export/verification.
 
 mod gguf_adapter;
+mod readiness;
 mod safetensors;
 mod svd;
 #[cfg(test)]
@@ -43,6 +44,10 @@ enum Operation {
     Audit,
     ExportDenoised,
     VerifyAdapter,
+    GenerateTestAdapter,
+    GenerateLock,
+    DrG2Plan,
+    DrG2Score,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -185,6 +190,16 @@ struct Request {
     adapter_path: Option<PathBuf>,
     #[serde(default)]
     verify_policy: VerifyPolicy,
+    #[serde(default)]
+    lock_source: Option<bonsai_cpu_policy::DaisyRoseLoraSource>,
+    #[serde(default)]
+    default_enabled: bool,
+    #[serde(default)]
+    default_scale_tenths: Option<u8>,
+    #[serde(default)]
+    evidence_path: Option<PathBuf>,
+    #[serde(default)]
+    screen_config: Option<readiness::DrG2PlanConfig>,
 }
 
 #[expect(
@@ -223,9 +238,19 @@ fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
             ),
             Some(env) => Ok(env),
         },
-        Operation::Plan | Operation::Audit | Operation::VerifyAdapter => {
-            Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All))
-        }
+        Operation::GenerateTestAdapter => match request.scope.target_envelope {
+            None => Ok(TargetEnvelope::NpuFriendly),
+            Some(TargetEnvelope::All) => Err(
+                "generate-test-adapter requires targetEnvelope in {residual-writers, npu-friendly, full-linear} so ssm_out and non-matrix tensors stay excluded.".into(),
+            ),
+            Some(env) => Ok(env),
+        },
+        Operation::Plan
+        | Operation::Audit
+        | Operation::VerifyAdapter
+        | Operation::GenerateLock
+        | Operation::DrG2Plan
+        | Operation::DrG2Score => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
     }
 }
 
@@ -240,23 +265,134 @@ fn validate_output_path(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+fn validate_layers_and_rank(scope: &Scope) -> crate::Result<()> {
+    let mut seen_layers = BTreeSet::new();
+    for &layer in &scope.layers {
+        if layer >= 64 {
+            return Err("Selected layer index must be in 0..64.".into());
+        }
+        if !seen_layers.insert(layer) {
+            return Err(format!("Duplicate layer index {layer} in scope.layers."));
+        }
+    }
+    if !(1..=64).contains(&scope.max_rank) {
+        return Err("scope.maxRank must be in 1..=64.".into());
+    }
+    Ok(())
+}
+
 fn validate_request(request: &Request) -> crate::Result<()> {
     if request.schema_version != 1 {
         return Err("lora-diff-audit requires schemaVersion 1.".into());
     }
-    if request.operation == Operation::VerifyAdapter {
-        if request.source.is_some() {
-            return Err("verify-adapter does not accept a model diff source.".into());
+    if request.operation != Operation::VerifyAdapter && !request.verify_policy.is_default() {
+        return Err("verifyPolicy is only supported for verify-adapter.".into());
+    }
+    if request.operation != Operation::GenerateLock
+        && (request.lock_source.is_some()
+            || request.default_enabled
+            || request.default_scale_tenths.is_some())
+    {
+        return Err(
+            "lockSource, defaultEnabled, and defaultScaleTenths are only supported for generate-lock."
+                .into(),
+        );
+    }
+    if request.operation != Operation::DrG2Score && request.evidence_path.is_some() {
+        return Err("evidencePath is only supported for dr-g2-score.".into());
+    }
+    if request.operation != Operation::DrG2Plan && request.screen_config.is_some() {
+        return Err("screenConfig is only supported for dr-g2-plan.".into());
+    }
+
+    match request.operation {
+        Operation::VerifyAdapter => {
+            if request.source.is_some() {
+                return Err("verify-adapter does not accept a model diff source.".into());
+            }
+            if request.output_path.is_some() {
+                return Err("verify-adapter does not accept outputPath.".into());
+            }
+            let adapter_path = request
+                .adapter_path
+                .as_ref()
+                .ok_or("verify-adapter requires adapterPath.")?;
+            bonsai_artifacts::validate_external_path(adapter_path).map_err(|e| e.to_string())?;
+            return Ok(());
         }
-        if request.output_path.is_some() {
-            return Err("verify-adapter does not accept outputPath.".into());
+        Operation::GenerateTestAdapter => {
+            if request.source.is_some() {
+                return Err("generate-test-adapter does not accept a model diff source.".into());
+            }
+            if request.adapter_path.is_some() {
+                return Err("generate-test-adapter does not accept adapterPath.".into());
+            }
+            validate_layers_and_rank(&request.scope)?;
+            if request.scope.layers.is_empty() {
+                return Err(
+                    "generate-test-adapter requires at least one layer in scope.layers.".into(),
+                );
+            }
+            let envelope = effective_envelope(request)?;
+            if select_tensors(&request.scope, envelope).is_empty() {
+                return Err("generate-test-adapter scope selects zero tensors.".into());
+            }
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("generate-test-adapter requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            return Ok(());
         }
-        let adapter_path = request
-            .adapter_path
-            .as_ref()
-            .ok_or("verify-adapter requires adapterPath.")?;
-        bonsai_artifacts::validate_external_path(adapter_path).map_err(|e| e.to_string())?;
-        return Ok(());
+        Operation::GenerateLock => {
+            if request.source.is_some() {
+                return Err("generate-lock does not accept a model diff source.".into());
+            }
+            let adapter_path = request
+                .adapter_path
+                .as_ref()
+                .ok_or("generate-lock requires adapterPath.")?;
+            bonsai_artifacts::validate_external_path(adapter_path).map_err(|e| e.to_string())?;
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("generate-lock requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            if request.lock_source.is_none() {
+                return Err("generate-lock requires lockSource provenance.".into());
+            }
+            return Ok(());
+        }
+        Operation::DrG2Plan => {
+            if request.source.is_some() {
+                return Err("dr-g2-plan does not accept a model diff source.".into());
+            }
+            if request.adapter_path.is_some() {
+                return Err("dr-g2-plan does not accept adapterPath.".into());
+            }
+            if let Some(output) = &request.output_path {
+                validate_output_path(output)?;
+            }
+            return Ok(());
+        }
+        Operation::DrG2Score => {
+            if request.source.is_some() {
+                return Err("dr-g2-score does not accept a model diff source.".into());
+            }
+            if request.adapter_path.is_some() {
+                return Err("dr-g2-score does not accept adapterPath.".into());
+            }
+            let evidence_path = request
+                .evidence_path
+                .as_ref()
+                .ok_or("dr-g2-score requires evidencePath.")?;
+            bonsai_artifacts::validate_external_path(evidence_path).map_err(|e| e.to_string())?;
+            if let Some(output) = &request.output_path {
+                validate_output_path(output)?;
+            }
+            return Ok(());
+        }
+        Operation::Plan | Operation::Audit | Operation::ExportDenoised => {}
     }
 
     if request.adapter_path.is_some() {
@@ -268,15 +404,7 @@ fn validate_request(request: &Request) -> crate::Result<()> {
         .ok_or("plan, audit, and export-denoised require source.")?;
     let envelope = effective_envelope(request)?;
 
-    let mut seen_layers = BTreeSet::new();
-    for &layer in &request.scope.layers {
-        if layer >= 64 {
-            return Err("Selected layer index must be in 0..64.".into());
-        }
-        if !seen_layers.insert(layer) {
-            return Err(format!("Duplicate layer index {layer} in scope.layers."));
-        }
-    }
+    validate_layers_and_rank(&request.scope)?;
     let selects_any_tensor = if envelope == TargetEnvelope::All {
         !request.scope.layers.is_empty()
             || request.scope.include_output_norm
@@ -286,9 +414,6 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     };
     if !selects_any_tensor {
         return Err("Audit scope selects zero tensors.".into());
-    }
-    if !(1..=64).contains(&request.scope.max_rank) {
-        return Err("scope.maxRank must be in 1..=64.".into());
     }
     if request.scope.oversampling > 64 {
         return Err("scope.oversampling must be in 0..=64.".into());
@@ -340,7 +465,11 @@ fn validate_request(request: &Request) -> crate::Result<()> {
                 validate_output_path(output)?;
             }
         }
-        Operation::VerifyAdapter => {}
+        Operation::VerifyAdapter
+        | Operation::GenerateTestAdapter
+        | Operation::GenerateLock
+        | Operation::DrG2Plan
+        | Operation::DrG2Score => {}
     }
     Ok(())
 }
@@ -2128,5 +2257,9 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::Audit => run_audit(&parsed),
         Operation::ExportDenoised => run_export_denoised(&parsed),
         Operation::VerifyAdapter => run_verify_adapter(&parsed),
+        Operation::GenerateTestAdapter => readiness::run_generate_test_adapter(&parsed),
+        Operation::GenerateLock => readiness::run_generate_lock(&parsed),
+        Operation::DrG2Plan => readiness::run_dr_g2_plan(&parsed),
+        Operation::DrG2Score => readiness::run_dr_g2_score(&parsed),
     }
 }

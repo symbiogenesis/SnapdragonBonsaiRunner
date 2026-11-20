@@ -1193,3 +1193,398 @@ fn export_denoised_and_verify_adapter_roundtrip_f32_and_f16() -> crate::Result<(
 
     Ok(())
 }
+
+#[test]
+fn generate_test_adapter_is_deterministic_npu_friendly_and_self_verifies() -> crate::Result<()> {
+    let scratch = ScratchDir::new("Bonsai-GenTestAdapter")?;
+    let out_a = scratch.join("synth-a.gguf");
+    let out_b = scratch.join("synth-b.gguf");
+
+    let req = |out: &Path| {
+        json!({
+            "schemaVersion": 1,
+            "operation": "generate-test-adapter",
+            "scope": {
+                "layers": [0, 3, 31, 63],
+                "targetEnvelope": "npu-friendly",
+                "exportDtype": "f16",
+                "maxRank": 4
+            },
+            "outputPath": out
+        })
+    };
+    let res_a = run(req(&out_a))?;
+    let res_b = run(req(&out_b))?;
+
+    assert_eq!(res_a["published"], true);
+    assert_eq!(res_a["status"], "published-and-verified");
+    assert_eq!(res_a["syntheticFixture"], true);
+    assert_eq!(res_a["pairCount"], 16);
+    assert_eq!(res_a["tensorCount"], 32);
+    assert_eq!(res_a["sha256"], res_b["sha256"]);
+    assert_eq!(res_a["bytes"], res_b["bytes"]);
+    assert_eq!(
+        fs::read(&out_a).map_err(|e| e.to_string())?,
+        fs::read(&out_b).map_err(|e| e.to_string())?
+    );
+    assert_eq!(res_a["verification"]["verified"], true);
+    assert_eq!(res_a["verification"]["detectedEnvelope"], "npu-friendly");
+    assert_eq!(res_a["verification"]["preservesHexagonFfnChains"], true);
+    assert_eq!(res_a["verification"]["excludesGroupedSsmOut"], true);
+    assert_eq!(res_a["verification"]["minRank"], 4);
+    assert_eq!(res_a["verification"]["maxRank"], 4);
+    assert_eq!(
+        res_a["verification"]["provenanceMetadata"]["bonsai.composition.method"],
+        "synthetic-runtime-test-fixture-v1"
+    );
+    let ffn_energy = res_a["verification"]["byFamily"]["ffn_down"]["factorFrobeniusEnergy"]
+        .as_f64()
+        .ok_or("Missing ffn_down energy.")?;
+    assert!(ffn_energy > 0.0 && ffn_energy.is_finite());
+
+    let verify = run(json!({
+        "schemaVersion": 1,
+        "operation": "verify-adapter",
+        "adapterPath": out_a,
+        "verifyPolicy": {
+            "expectedSha256": res_a["sha256"],
+            "expectedEnvelope": "npu-friendly",
+            "requireNpuFriendly": true,
+            "requireNoGroupedSsm": true,
+            "maxAllowedRank": 4
+        }
+    }))?;
+    assert_eq!(verify["verified"], true);
+
+    assert!(
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "generate-test-adapter",
+            "scope": { "layers": [0, 3], "targetEnvelope": "all", "maxRank": 4 },
+            "outputPath": scratch.join("bad-all.gguf")
+        }))
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn generate_lock_builds_valid_daisyrose_lock_and_rejects_synthetic_default_enabled()
+-> crate::Result<()> {
+    let scratch = ScratchDir::new("Bonsai-GenLock")?;
+    let source_meta = json!({
+        "host": "huggingface",
+        "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "path": "gguf/daisyrose-npu-r4.gguf",
+        "filename": "daisyrose-npu-r4.gguf",
+        "url": "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose-npu-r4.gguf",
+        "license": "Apache-2.0"
+    });
+
+    // Synthetic test fixture rejects defaultEnabled=true, accepts defaultEnabled=false.
+    let synth_gguf = scratch.join("synth-fixture.gguf");
+    run(json!({
+        "schemaVersion": 1,
+        "operation": "generate-test-adapter",
+        "scope": {
+            "layers": [0, 3],
+            "targetEnvelope": "npu-friendly",
+            "exportDtype": "f16",
+            "maxRank": 2
+        },
+        "outputPath": synth_gguf
+    }))?;
+    assert!(
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "generate-lock",
+            "adapterPath": synth_gguf,
+            "outputPath": scratch.join("synth-bad.lock.json"),
+            "lockSource": source_meta,
+            "defaultEnabled": true,
+            "defaultScaleTenths": 10
+        }))
+        .is_err()
+    );
+    let synth_lock_path = scratch.join("synth-ok.lock.json");
+    let synth_lock_res = run(json!({
+        "schemaVersion": 1,
+        "operation": "generate-lock",
+        "adapterPath": synth_gguf,
+        "outputPath": synth_lock_path,
+        "lockSource": source_meta,
+        "defaultEnabled": false
+    }))?;
+    assert_eq!(synth_lock_res["status"], "candidate-lock-written");
+    assert_eq!(synth_lock_res["lock"]["defaultEnabled"], false);
+
+    // Non-synthetic npu-friendly adapter succeeds with defaultEnabled=true and round-trips through cpu-policy.
+    let trained_gguf = scratch.join("trained-candidate.gguf");
+    let make_pair =
+        |name: &str, in_f: usize, out_f: usize, rank: usize| -> crate::Result<ExportTensorPair> {
+            let u: Vec<Vec<f32>> = (0..rank).map(|_| vec![0.01_f32; out_f]).collect();
+            let v: Vec<Vec<f32>> = (0..rank).map(|_| vec![0.02_f32; in_f]).collect();
+            let sigmas = vec![0.4_f64; rank];
+            let (a, b) = build_balanced_factors(&u, &v, &sigmas, 4.0, ExportDtype::F16)?;
+            Ok(ExportTensorPair {
+                gguf_base_name: name.to_owned(),
+                in_features: in_f,
+                out_features: out_f,
+                rank,
+                lora_a_f32: a,
+                lora_b_f32: b,
+            })
+        };
+    let written = write_lora_gguf(
+        &trained_gguf,
+        ExportDtype::F16,
+        4.0,
+        &[("bonsai.composition.method", "dual-anchor-opd-v1")],
+        &[
+            make_pair("blk.3.attn_k.weight", 5_120, 1_024, 4)?,
+            make_pair("blk.3.attn_v.weight", 5_120, 1_024, 4)?,
+        ],
+    )?;
+
+    let lock_path = scratch.join("daisyrose.lock.json");
+    let lock_res = run(json!({
+        "schemaVersion": 1,
+        "operation": "generate-lock",
+        "adapterPath": trained_gguf,
+        "outputPath": lock_path,
+        "lockSource": source_meta,
+        "defaultEnabled": true,
+        "defaultScaleTenths": 10
+    }))?;
+    assert_eq!(lock_res["status"], "candidate-lock-written");
+    assert_eq!(lock_res["lock"]["sha256"], written.sha256);
+    assert_eq!(lock_res["lock"]["bytes"], written.bytes);
+    assert_eq!(lock_res["lock"]["maxRank"], 4);
+    assert_eq!(lock_res["lock"]["targetCount"], 2);
+    assert_eq!(lock_res["lock"]["dtype"], "f16");
+    assert_eq!(lock_res["lock"]["envelope"], "npu-friendly");
+    assert_eq!(lock_res["lock"]["defaultEnabled"], true);
+    assert_eq!(lock_res["lock"]["defaultScaleTenths"], 10);
+
+    let lock_raw = fs::read_to_string(&lock_path).map_err(|e| e.to_string())?;
+    let dummy_data = if cfg!(windows) {
+        Path::new(r"C:\External\SwiftData")
+    } else {
+        Path::new("/tmp/swift-data")
+    };
+    let artifact = bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(dummy_data, &lock_raw)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(artifact.sha256, written.sha256);
+    assert_eq!(artifact.effective_default_scale_tenths(), 10);
+    Ok(())
+}
+
+#[test]
+fn dr_g2_plan_and_score_enforce_all_four_gates_fail_closed() -> crate::Result<()> {
+    let scratch = ScratchDir::new("Bonsai-DrG2")?;
+    let cand_sha = "1".repeat(64);
+    let plan = run(json!({
+        "schemaVersion": 1,
+        "operation": "dr-g2-plan",
+        "screenConfig": {
+            "candidateAdapterSha256": cand_sha,
+            "candidateMaxRank": 16,
+            "candidateTargetCount": 128
+        }
+    }))?;
+    assert_eq!(plan["status"], "planned-no-io");
+    let contract_sha = plan["contractSha256"]
+        .as_str()
+        .ok_or("Missing contractSha256.")?
+        .to_owned();
+    let base_sha = plan["contract"]["baseModelSha256"]
+        .as_str()
+        .ok_or("Missing baseModelSha256.")?
+        .to_owned();
+    let orca_sha = plan["contract"]["orcaAdapterSha256"]
+        .as_str()
+        .ok_or("Missing orcaAdapterSha256.")?
+        .to_owned();
+
+    let train_prompt_sha = "9".repeat(64);
+    let good_evidence = json!({
+        "schemaVersion": 1,
+        "contractSha256": contract_sha,
+        "baseModelSha256": base_sha,
+        "orcaAdapterSha256": orca_sha,
+        "orcaScale": 1.3,
+        "candidateAdapterSha256": cand_sha,
+        "candidateMaxRank": 16,
+        "candidateTargetCount": 128,
+        "scaleGrid": [0.0, 0.25, 0.5, 0.75, 1.0],
+        "selectedScale": 0.5,
+        "trainingPromptSha256s": [train_prompt_sha],
+        "thinkingOnPrompts": [
+            {
+                "promptId": "code-1",
+                "promptSha256": "2".repeat(64),
+                "category": "coding",
+                "baseline": {
+                    "scale": 0.0, "responseSha256": "a".repeat(64),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 2.5, "thinkingTokens": 400, "hit4096Truncation": false, "loopDetected": false
+                },
+                "candidate": {
+                    "scale": 0.5, "responseSha256": "b".repeat(64),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.5, "thinkingTokens": 420, "hit4096Truncation": false, "loopDetected": false
+                }
+            },
+            {
+                "promptId": "reason-1",
+                "promptSha256": "3".repeat(64),
+                "category": "reasoning",
+                "baseline": {
+                    "scale": 0.0, "responseSha256": "c".repeat(64),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.0, "thinkingTokens": 500, "hit4096Truncation": false, "loopDetected": false
+                },
+                "candidate": {
+                    "scale": 0.5, "responseSha256": "d".repeat(64),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.5, "thinkingTokens": 520, "hit4096Truncation": false, "loopDetected": false
+                }
+            },
+            {
+                "promptId": "if-1",
+                "promptSha256": "4".repeat(64),
+                "category": "instruction-following",
+                "baseline": {
+                    "scale": 0.0, "responseSha256": "e".repeat(64),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.0, "thinkingTokens": 300, "hit4096Truncation": false, "loopDetected": false
+                },
+                "candidate": {
+                    "scale": 0.5, "responseSha256": "f".repeat(64),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.0, "thinkingTokens": 310, "hit4096Truncation": false, "loopDetected": false
+                }
+            }
+        ],
+        "thinkingOffPrompts": [
+            {
+                "promptId": "creative-1",
+                "promptSha256": "5".repeat(64),
+                "category": "creative-prose",
+                "baseline": {
+                    "scale": 0.0, "responseSha256": "7".repeat(64),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.5, "unwantedRefusal": false
+                },
+                "candidate": {
+                    "scale": 0.5, "responseSha256": "8".repeat(64),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.5, "unwantedRefusal": false
+                }
+            }
+        ],
+        "zeroScaleControls": [
+            {
+                "promptId": "z-1",
+                "promptSha256": "6".repeat(64),
+                "noAdapterResponseSha256": "0".repeat(64),
+                "zeroScaleResponseSha256": "0".repeat(64)
+            }
+        ]
+    });
+
+    let score_val = |name: &str, payload: &Value| -> crate::Result<Value> {
+        let p = scratch.join(name);
+        fs::write(&p, serde_json::to_vec(payload).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-score",
+            "evidencePath": p
+        }))
+    };
+
+    let passing = score_val("pass.json", &good_evidence)?;
+    assert_eq!(passing["drG2Passed"], true);
+    assert_eq!(passing["status"], "passed");
+    assert_eq!(passing["contractScope"], "candidate-bound");
+
+    // 1. Capability non-improvement / regression
+    let mut cap_fail = good_evidence.clone();
+    cap_fail["thinkingOnPrompts"][0]["candidate"]["score"] = json!(2.5);
+    cap_fail["thinkingOnPrompts"][1]["candidate"]["score"] = json!(3.0);
+    assert_eq!(score_val("cap-fail.json", &cap_fail)?["drG2Passed"], false);
+
+    // 2. Single-category regression even when overall mean rises
+    let mut cat_fail = good_evidence.clone();
+    cat_fail["thinkingOnPrompts"][0]["candidate"]["score"] = json!(4.0);
+    cat_fail["thinkingOnPrompts"][2]["candidate"]["score"] = json!(2.8);
+    assert_eq!(score_val("cat-fail.json", &cat_fail)?["drG2Passed"], false);
+
+    // 3. Thinking token ratio > 1.10x
+    let mut tok_fail = good_evidence.clone();
+    tok_fail["thinkingOnPrompts"][0]["candidate"]["thinkingTokens"] = json!(600);
+    assert_eq!(score_val("tok-fail.json", &tok_fail)?["drG2Passed"], false);
+
+    // 4. Extra loop
+    let mut loop_fail = good_evidence.clone();
+    loop_fail["thinkingOnPrompts"][0]["candidate"]["loopDetected"] = json!(true);
+    assert_eq!(
+        score_val("loop-fail.json", &loop_fail)?["drG2Passed"],
+        false
+    );
+
+    // 5. Extra 4,096 truncation
+    let mut trunc_fail = good_evidence.clone();
+    trunc_fail["thinkingOnPrompts"][0]["candidate"]["hit4096Truncation"] = json!(true);
+    assert_eq!(
+        score_val("trunc-fail.json", &trunc_fail)?["drG2Passed"],
+        false
+    );
+
+    // 6. Creative score < 3.0 floor
+    let mut cfloor_fail = good_evidence.clone();
+    cfloor_fail["thinkingOffPrompts"][0]["baseline"]["score"] = json!(2.5);
+    cfloor_fail["thinkingOffPrompts"][0]["candidate"]["score"] = json!(2.8);
+    assert_eq!(
+        score_val("cfloor-fail.json", &cfloor_fail)?["drG2Passed"],
+        false
+    );
+
+    // 7. Creative median regression
+    let mut cmed_fail = good_evidence.clone();
+    cmed_fail["thinkingOffPrompts"][0]["candidate"]["score"] = json!(3.2);
+    assert_eq!(
+        score_val("cmed-fail.json", &cmed_fail)?["drG2Passed"],
+        false
+    );
+
+    // 8. Extra Orca refusal
+    let mut orca_fail = good_evidence.clone();
+    orca_fail["thinkingOffPrompts"][0]["candidate"]["unwantedRefusal"] = json!(true);
+    assert_eq!(
+        score_val("orca-fail.json", &orca_fail)?["drG2Passed"],
+        false
+    );
+
+    // 9. Zero-scale SHA-256 mismatch
+    let mut zero_fail = good_evidence.clone();
+    zero_fail["zeroScaleControls"][0]["zeroScaleResponseSha256"] = json!("e".repeat(64));
+    assert_eq!(
+        score_val("zero-fail.json", &zero_fail)?["drG2Passed"],
+        false
+    );
+
+    // 10. humanReviewed=false rejects hard
+    let mut review_fail = good_evidence.clone();
+    review_fail["thinkingOnPrompts"][0]["candidate"]["humanReviewed"] = json!(false);
+    assert!(score_val("review-fail.json", &review_fail).is_err());
+
+    // 11. Training-split overlap rejects hard
+    let mut split_fail = good_evidence;
+    split_fail["thinkingOnPrompts"][0]["promptSha256"] = json!(train_prompt_sha);
+    assert!(score_val("split-fail.json", &split_fail).is_err());
+
+    Ok(())
+}

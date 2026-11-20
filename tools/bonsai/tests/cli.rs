@@ -339,3 +339,34 @@ fn lora_diff_audit_plan_dispatches_without_network() -> Result<(), Box<dyn std::
     assert_eq!(npu_plan["estimatedBf16BytesPair"], 2_684_354_560_u64);
     Ok(())
 }
+
+#[test]
+fn lora_diff_audit_dr_g2_plan_dispatches_without_network() -> Result<(), Box<dyn std::error::Error>>
+{
+    let output = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
+        .args([
+            "lora-diff-audit",
+            "--json",
+            r#"{"schemaVersion":1,"operation":"dr-g2-plan"}"#,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, Vec::<u8>::new());
+    let plan: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(plan["status"], "planned-no-io");
+    assert_eq!(plan["operation"], "dr-g2-plan");
+    let contract_sha = plan["contractSha256"]
+        .as_str()
+        .ok_or("Missing contractSha256.")?;
+    assert_eq!(contract_sha.len(), 64);
+    assert!(
+        contract_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    Ok(())
+}

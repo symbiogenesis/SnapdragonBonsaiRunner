@@ -61,6 +61,16 @@ pub(super) struct VerifyPolicy {
     pub(super) max_allowed_rank: Option<usize>,
 }
 
+impl VerifyPolicy {
+    pub(super) fn is_default(&self) -> bool {
+        self.expected_sha256.is_none()
+            && self.expected_envelope.is_none()
+            && !self.require_npu_friendly
+            && !self.require_no_grouped_ssm
+            && self.max_allowed_rank.is_none()
+    }
+}
+
 /// One exported LoRA `(lora_a, lora_b)` matrix pair in canonical GGUF dimensions.
 pub(super) struct ExportTensorPair {
     pub(super) gguf_base_name: String,
