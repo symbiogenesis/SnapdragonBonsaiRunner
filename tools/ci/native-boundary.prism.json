@@ -1,959 +1,1103 @@
 {
-    "schemaVersion":  1,
-    "kind":  "checked-in-native-retirement-boundary",
-    "repository":  "prism",
-    "sourceRevision":  "15e3e59fc1a67695065b2660ef59991405569959",
-    "exclusions":  [
-                       {
-                           "path":  ".git",
-                           "reason":  "Git object and worktree administration, not operative repository source."
-                       },
-                       {
-                           "path":  ".worktrees",
-                           "reason":  "Independent local Git worktrees, inventoried through their own roots."
-                       },
-                       {
-                           "path":  "target",
-                           "reason":  "Reconstructible Cargo outputs and local worktrees; selected generated/compiled closure uses native-closure-verify separately."
-                       }
-                   ],
-    "families":  [
-                     {
-                         "id":  "common-action-file",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/action_file.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-allocation",
-                         "obligations":  [
-                                             "Preserve every test-alloc.cpp allocation/view/aliasing/multi-backend/alignment contract through tests/upstream_prism/reference_allocation.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-arena-graph",
-                         "obligations":  [
-                                             "Preserve every test-moe-weighted-reduce and arena-graph layout/placement/bounds contract through tests/upstream_prism/reference_arena_graph.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-arg-parser",
-                         "obligations":  [
-                                             "Preserve every test-arg-parser.cpp argument enum, CLI parse, speculative limits/transfer, quoting/LoRA CSV and remote HTTP content assertion through tests/upstream_prism/reference_arg_parser.rs. The C++ arg_parser.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-backend-ops",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_ops.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-backend-sampler",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_sampler.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-backend-session",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_session.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-batch-allocator",
-                         "obligations":  [
-                                             "Preserve every test-batch-alloc contract, equal-split/mrope/position/coupling invariant through tests/upstream_prism/reference_batch_allocator.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-bridge",
-                         "obligations":  [
-                                             "Preserve every remaining common handler in tools/prism/upstream/common/bridge.cpp under the exact catalog and migration inventory; top-level unicode-* dispatch (test-unicode) and the retired public-c-abi, dspark, arg-parser, optimizer, codec, and jinja handlers moved to tests/upstream_prism/reference_*.rs. Remaining handlers and required green IDs must pass before retiring bridge.cpp."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-chat",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/chat.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-chat-analysis",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/chat_analysis.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-chat-auto",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/chat_auto.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-chat-parser",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/chat_parser.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-chat-templates",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/chat_templates.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-codec",
-                         "obligations":  [
-                                             "Preserve every test-quantize-fns.cpp and test-ptq1_0-cuda-dot.cpp codec inventory, quantize/dequantize/dot tolerance, PQ2/PTQ1 packed-pattern and full-byte-domain contract through tests/upstream_prism/reference_codec.rs (with Target::RustReference codec routing in engine.rs). The C++ codec.hpp header/include/dispatch/CMake edge is retired (retaining inlined helper functions in codec_buffers.hpp); keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-codec-buffers",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/codec_buffers.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-concurrency",
-                         "obligations":  [
-                                             "Preserve test-log.cpp\u0027s eight original concurrent workers, 8,000 records, per-thread Windows random schedules, timestamp/prefix toggles and join/flush/free smoke contract through independent bounded-channel Rust observations and the separate production Rust logger. Preserve the required reference green ID and reject writer/teardown failures. The C++ header/include/dispatch/CMake edge is retired; output-content/native replay and whole-repository retirement are not claimed. Owning hosted acceptance remains separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-context-graph",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/context_graph.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-dspark",
-                         "obligations":  [
-                                             "Preserve every test-dspark-logsnr-meta.cpp GGUF v2/v3 load, log-SNR conditioning bound and diagnostic guard contract through tests/upstream_prism/reference_dspark_logsnr.rs. The C++ dspark.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-dspark-runtime",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/dspark_runtime.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-generated-model",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/generated_model.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-gguf",
-                         "obligations":  [
-                                             "Preserve every test-gguf.cpp GGUF read/write, KV metadata, alignment, context lifecycle and tensor-data assertion through tests/upstream_prism/reference_gguf.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-grammar",
-                         "obligations":  [
-                                             "Preserve every test-llama-grammar.cpp, test-gbnf-validator.cpp and test-grammar-integration.cpp stack/rejection/unicode/UTF-8 grammar assertion through tests/upstream_prism/reference_grammar.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-grammar-parser",
-                         "obligations":  [
-                                             "Preserve all 274 original grammar-parser assertions across 17 valid and six invalid variants, exact symbol/rule order, Unicode, repetition lowering and failure state using an independent Rust AST provider. The native header/include/dispatch/CMake route is retired; keep required reference green IDs and owning hosted acceptance separate from native replay or full retirement."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-jinja",
-                         "obligations":  [
-                                             "Preserve every test-jinja.cpp literal, hasher/hash-trace, builtin inventory, stats, caps, string-parts, ByteStrings, exception-phase and fuzz contract through tests/upstream_prism/reference_jinja.rs. The C++ jinja.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-json-schema",
-                         "obligations":  [
-                                             "Preserve every test-json-schema-to-grammar.cpp and test-grammar-integration.cpp schema conversion assertion through tests/upstream_prism/reference_json_schema.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-llguidance",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/llguidance.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-model-resolution",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/model_resolution.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-model-runtime",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/model_runtime.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-mtmd",
-                         "obligations":  [
-                                             "Preserve all 29 original LFM2 tiling and temporal-grouping assertions, ties-to-even alignment, strict area thresholds, ordered image/audio/text boundaries and separately counted bitmap survivors through the independent nearest-lattice/run-partition Rust provider. Keep typed bounds and owned request lifetime. The native header/include/dispatch/CMake route is retired; no model, native replay, device or complete retirement verdict is claimed."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-mtmd-chunks",
-                         "obligations":  [
-                                             "Preserve all 46 original public MTMD chunk conditions, source-defined factory metadata, wire lengths/positions, save query and tiny/truncated failures, complete roundtrip identity and owned/null reload lifecycle through a separate Rust wire-recipe/cursor decoder. The native header/include/dispatch/CMake route is retired; preserve original source and required reference identities, and keep owning hosted and full-retirement acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-optimizer",
-                         "obligations":  [
-                                             "Preserve every test-opt.cpp dataset, gradient accumulation, forward/backward, epoch/fit, AdamW/SGD step, split, regression and lifetime contract through tests/upstream_prism/reference_optimizer.rs. The C++ optimizer.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-peg",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/peg.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-public-c-abi",
-                         "obligations":  [
-                                             "Preserve every test-c.c public C ABI layout/alignment/width/C-standard contract through tests/upstream_prism/reference_public_c_abi.rs. The C public_c_abi.c/.h source/header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-quantization",
-                         "obligations":  [
-                                             "Preserve every test-quant-type-selection model/tensor/exclude/tied/MoE rule through tests/upstream_prism/reference_quantization.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-reasoning-budget",
-                         "obligations":  [
-                                             "Preserve all 71 original reasoning-budget semantic conditions, null-vocabulary lifecycle, exceptional candidate bits, clone ownership and UTF-8 boundary assertions using the independently implemented active-prefix/event-ordinal Rust reference. The C++ header/include/dispatch/CMake edge is retired; owning hosted acceptance and whole-repository native retirement remain separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-sampling",
-                         "obligations":  [
-                                             "Preserve every test-sampling.cpp sampler-chain, RNG, candidate copy/sort and penalty/XTC/Mirostat assertion through tests/upstream_prism/reference_sampling.rs. The C++ sampling.hpp header/include/dispatch/CMake edge is retired (retaining prism_backend_sampler helpers in backend_sampler.hpp); keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-tensor-graph",
-                         "obligations":  [
-                                             "Preserve every test-col2im-1d, test-dfly-fusion and test-rope contract through tests/upstream_prism/reference_tensor_graph.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-threadpool",
-                         "obligations":  [
-                                             "Preserve every test-barrier schedule, DAG dependency and timed-yield contract through tests/upstream_prism/reference_threadpool.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-vocab",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/vocab.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "common-vocab-session",
-                         "obligations":  [
-                                             "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/vocab_session.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "upstream-contracts",
-                         "obligations":  [
-                                             "Preserve all 71 source IDs, all approved required green IDs and source hashes, every exclusion and tolerance.",
-                                             "Retain all 22817 ordered correctness geometries and separate 1530 performance workloads; count parity alone cannot replace exact schedule bytes."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "native-build",
-                         "obligations":  [
-                                             "Preserve CMake/native adapter/source patch/compiler/link/cache/packaging routes until independent providers and no-project-C++ hosted acceptance pass."
-                                         ],
-                         "retirementQualified":  false
-                     },
-                     {
-                         "id":  "external-native",
-                         "obligations":  [
-                                             "Preserve exact upstream archive/patch/LLGuidance/codec source identities, license notices and ABI/dependency boundaries before removing download/load/build routes."
-                                         ],
-                         "retirementQualified":  false
-                     }
-                 ],
-    "files":  [
-                  {
-                      "path":  "tools/prism/upstream/common/action_file.hpp",
-                      "bytes":  3256,
-                      "sha256":  "474445881948a30a5bdf11bcd320d0aa3b613e4846d13320ed0ade46e579da38",
-                      "family":  "common-action-file"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/backend_ops.hpp",
-                      "bytes":  45874,
-                      "sha256":  "b87e717cb647696d0a90bc10e1714442a3933504c5ff5c69cdd1a408952f8f68",
-                      "family":  "common-backend-ops"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/backend_sampler.hpp",
-                      "bytes":  22422,
-                      "sha256":  "d3454ae519ca9743ad7582c5af3676de014e7b8b014a00e15cad57520697a3ed",
-                      "family":  "common-backend-sampler"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/backend_session.hpp",
-                      "bytes":  5444,
-                      "sha256":  "104cb583d3e710e21098aed4b8bd992981733b743aa6f312f8196e828147df73",
-                      "family":  "common-backend-session"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/bridge.cpp",
-                      "bytes":  8257,
-                      "sha256":  "7f560f7c617372899e68d517a7f9b6f08aa4dd9ee4dd15cd9692e5bad76ca485",
-                      "family":  "common-bridge"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/chat.hpp",
-                      "bytes":  14240,
-                      "sha256":  "64134516ab2e95cb3fbb8ac8b49109d380b2b9f2fabc302517eeadc57c3d4383",
-                      "family":  "common-chat"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/chat_analysis.hpp",
-                      "bytes":  7642,
-                      "sha256":  "5cbdb23ebdb5cfe0feba315b67f2e4e513c06b6017851d9f3015a40a6cc80bcc",
-                      "family":  "common-chat-analysis"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/chat_auto.hpp",
-                      "bytes":  10607,
-                      "sha256":  "2a88e137e1d4d55d172fa42d5358faf172efe9b78007bd4261e59229735e6139",
-                      "family":  "common-chat-auto"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/chat_parser.hpp",
-                      "bytes":  20493,
-                      "sha256":  "5a0eae95683b25afdf00ff562c96b7004baed332832c2b37fe06256d780f3b5e",
-                      "family":  "common-chat-parser"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/chat_templates.hpp",
-                      "bytes":  5769,
-                      "sha256":  "54f63b953b5e9c133829edfc49070b0c620f1106f74321a08a5476c059fbdfaf",
-                      "family":  "common-chat-templates"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/codec_buffers.hpp",
-                      "bytes":  13683,
-                      "sha256":  "68819bcd7c47aa9a16978393327b760ecebcb0b87b8ac5c4824db4c9c17afbe1",
-                      "family":  "common-codec-buffers"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/context_graph.hpp",
-                      "bytes":  2463,
-                      "sha256":  "516d8844ab188d7bf2f679d2396b5d5f53b3a178e3fa6a1da40ea0cd83b8d2da",
-                      "family":  "common-context-graph"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/dspark_runtime.hpp",
-                      "bytes":  26368,
-                      "sha256":  "6c927681e23677dca8109e09a6d17305326d4f328c05092fc1c6ecb6c23d8c94",
-                      "family":  "common-dspark-runtime"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/generated_model.hpp",
-                      "bytes":  10469,
-                      "sha256":  "4fb9f6524508780c476e2fcb068f4b64036fd003614c0359791d6649f956a063",
-                      "family":  "common-generated-model"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/llguidance.hpp",
-                      "bytes":  12261,
-                      "sha256":  "409dd2cd4832d27ce64c31b570a7d6c96e4558845a5c3adebd9635679938dfa4",
-                      "family":  "common-llguidance"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/model_resolution.hpp",
-                      "bytes":  5094,
-                      "sha256":  "fcbeab4850cef34d33638c28b934eebcd7dc65a699a34b82484c908c919e2a23",
-                      "family":  "common-model-resolution"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/model_runtime.hpp",
-                      "bytes":  44001,
-                      "sha256":  "316755d7728ff406e7c0ff604ef52235208ed5cae080e7b5160cd6b1dd13134d",
-                      "family":  "common-model-runtime"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/peg.hpp",
-                      "bytes":  12116,
-                      "sha256":  "edc2b312960de15cc869151af4c1b3aaaacf8b20fdac1b95df73080893e11fed",
-                      "family":  "common-peg"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/vocab.hpp",
-                      "bytes":  8985,
-                      "sha256":  "e6e3c7d50be1a0c3b26688452894a9be820ccd307bd38d84505ef475fad7bd69",
-                      "family":  "common-vocab"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/vocab_session.hpp",
-                      "bytes":  8426,
-                      "sha256":  "d438bbffc3dbd933481b50fed8e353cd5f57b97d89a9afb10ec76fbf48408c88",
-                      "family":  "common-vocab-session"
-                  }
-              ],
-    "edges":  [
-                  {
-                      "path":  "Cargo.lock",
-                      "bytes":  55551,
-                      "sha256":  "2f27fef1eb8557a73873ab42d8c1490b7e3fbc9f9938b7be2b3d719778610ad6",
-                      "family":  "external-native"
-                  },
-                  {
-                      "path":  "Cargo.toml",
-                      "bytes":  6144,
-                      "sha256":  "c932cf359923af0bf5063b441b1b7dc73cb967ab5f0027b10e3e35d83d21e8f8",
-                      "family":  "external-native"
-                  },
-                  {
-                      "path":  "scripts/Bonsai.Native.psm1",
-                      "bytes":  3967,
-                      "sha256":  "2d085b83039898315ed87233a50170ed9747375d98750ea0d243e9a231cfd605",
-                      "family":  "external-native"
-                  },
-                  {
-                      "path":  "scripts/Bonsai.PrismNativeCache.psm1",
-                      "bytes":  7808,
-                      "sha256":  "86efcde9bdf1903bff6420966ca994d5ccdcb23942bc0995fb4c93764b69959a",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "scripts/Build-PrismEngine.ps1",
-                      "bytes":  14485,
-                      "sha256":  "5be6d37f40ff701d7e7e3aa50c4da4b798de484cfba9d7aa16ff270712185e4b",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "scripts/New-ReleaseBundle.ps1",
-                      "bytes":  6354,
-                      "sha256":  "fa558ade6bd7f2988dbec3ebb5e230eaf3c4e19cb6bace0d3e56e709d55a986f",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tests/Test-PrismUpstream.ps1",
-                      "bytes":  37574,
-                      "sha256":  "d330f607f3ff4d378e3d1a82166e3aae3468eb59a30b36b2613a6d697895de83",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/allocation.rs",
-                      "bytes":  35757,
-                      "sha256":  "e4517019f3a550a6b61e3bdbc11d03e025dc8a4c0fab3d169e3a0a11a65380d8",
-                      "family":  "common-allocation"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/arg_parser.rs",
-                      "bytes":  16715,
-                      "sha256":  "ccd2a910ca68a539d0fa9b7fe85798170cd00c9733f057f246b9c81b639969bc",
-                      "family":  "common-arg-parser"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/backend-ops-geometries.json",
-                      "bytes":  2360032,
-                      "sha256":  "8eb986e0a2cf7694b98a03f24f8ed4e5aabf6407ce60dcc502cab0682434549d",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/backend-ops-program.json",
-                      "bytes":  3301844,
-                      "sha256":  "bb1264b48ee43841949ef350a84bd2731a0656e9c4cd565c1afcecbfd75633a6",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/barrier.rs",
-                      "bytes":  15145,
-                      "sha256":  "f5e81aea683285787f7c5eb71f23e509da274d4519734eb2236ebfcc2af98cac",
-                      "family":  "common-threadpool"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/batch_allocator.rs",
-                      "bytes":  37210,
-                      "sha256":  "34ef97c6ba12ea0ef86a8feecaf4710bf705b63bb6d3666e01aa55849c163144",
-                      "family":  "common-batch-allocator"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/codec_assertions.rs",
-                      "bytes":  42320,
-                      "sha256":  "ed76848861396e3bc2eeb4b90ba4787b830bacd6d47ee94cfcca510e9829b8df",
-                      "family":  "common-codec"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/common.rs",
-                      "bytes":  7608,
-                      "sha256":  "b001d484b38fd4cea4018617190848cdf9121d82f3abae0c4f31de79ded4ac61",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/dspark_inputs.rs",
-                      "bytes":  8717,
-                      "sha256":  "9d59e0271698df2eef38bf658d8dc3ad58f798f98ae6007e34d5448e5de307b5",
-                      "family":  "common-dspark"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/dspark_logsnr.rs",
-                      "bytes":  6781,
-                      "sha256":  "4489d64fbc1e1ab1fa3626e4166c09303c5b30a0214c0d8c1029122daf170c7c",
-                      "family":  "common-dspark"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/engine.rs",
-                      "bytes":  22041,
-                      "sha256":  "60bcd60c1fa43b9ea75c8d31113597c376d3facd7ef07ac121feb6c4f92ee156",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/gguf.rs",
-                      "bytes":  61922,
-                      "sha256":  "939f05ea8b9589785cb4bd71ef16c34bea5e3ff07bc87a44368283130be7de32",
-                      "family":  "common-gguf"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/grammar-integration-cases.json",
-                      "bytes":  130059,
-                      "sha256":  "f502bcdd2b7ae764bc38a72a5ac920228ec383d9ab0832a0a17272a4817a6d22",
-                      "family":  "common-grammar"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/grammar-parser-cases.json",
-                      "bytes":  22079,
-                      "sha256":  "e99f45b9c0cd0a3139c82f48fbf98c9767b119eff7a6a616b84e48ab6ba06842",
-                      "family":  "common-grammar-parser"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/grammar_integration.rs",
-                      "bytes":  19378,
-                      "sha256":  "14402516e2672c6f0c41a4cd0e55d00f5e0619dc99c87c517a7f75e65f46df9b",
-                      "family":  "common-grammar"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/grammar_parser.rs",
-                      "bytes":  10874,
-                      "sha256":  "9c2c290e3029c127dcb66c9e01490fd35a34482f7df1c433fd4be631cd2e090a",
-                      "family":  "common-grammar-parser"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/harness.rs",
-                      "bytes":  31468,
-                      "sha256":  "6bfb01f4f448ff8da4c87f5299888c3109dbb26945561ab3078ba3f7d0b92449",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/jinja-cases.json",
-                      "bytes":  68515,
-                      "sha256":  "e840d2487c560d676b248bbba4c3724f9f2b6687ad3558088558f051e8e29c3f",
-                      "family":  "common-jinja"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/jinja.rs",
-                      "bytes":  40541,
-                      "sha256":  "5a64d8e60c446d491c010af1afb15e317ce88046e124bf05b3fa118ca4af6126",
-                      "family":  "common-jinja"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/json-schema-cases.json",
-                      "bytes":  60833,
-                      "sha256":  "d0fd6806a9ba517d438f3976957f77fab21ec7c2e047fe26082f944937cedaba",
-                      "family":  "common-json-schema"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/json_schema.rs",
-                      "bytes":  15739,
-                      "sha256":  "0c20022773ec0968ff503b1ce0790fcb5a04dd5db70522c8006a7825b71d3c3e",
-                      "family":  "common-json-schema"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/llama-grammar-cases.json",
-                      "bytes":  11892,
-                      "sha256":  "83b6e86fdb5e214b0c5470dec8d1f354da02bce2ff66b392270f6dc6888c5c58",
-                      "family":  "common-grammar"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/llama_grammar.rs",
-                      "bytes":  25960,
-                      "sha256":  "b031981444e4c0aceea5fe40603b85d1f1b86b6dd2bcfd91c017665fbb08ff3c",
-                      "family":  "common-grammar"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/logging.rs",
-                      "bytes":  2989,
-                      "sha256":  "7f158151896f92460a9d3c2c1612daa042f582f85b7eb64a8f25c85737e979e8",
-                      "family":  "common-concurrency"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/moe_reduce.rs",
-                      "bytes":  8878,
-                      "sha256":  "c3ba8f6f9729aefc948ddc91990a849d72e31103705d93bb7f0ec2e85efd43a5",
-                      "family":  "common-arena-graph"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/mtmd.rs",
-                      "bytes":  8444,
-                      "sha256":  "8b117e884a1e12de9a4f54e1741b0e4ca18d9ac5e646ead913b943c4e46c1521",
-                      "family":  "common-mtmd"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/mtmd_chunks.rs",
-                      "bytes":  10450,
-                      "sha256":  "aaa1b20dc59ad3cce6336db2c4ef9f42ff2770ebadd25b958237c66bda3b856c",
-                      "family":  "common-mtmd-chunks"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/numerics.rs",
-                      "bytes":  22392,
-                      "sha256":  "67d29d942720e7f3509d00cd89553f1080d2da4e15f42f651d0fd418463bb39b",
-                      "family":  "common-tensor-graph"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/optimizer.rs",
-                      "bytes":  32047,
-                      "sha256":  "cc85b15c7c3e50070c3e4044bb90802fea624667efb71403d6c882b4c720b560",
-                      "family":  "common-optimizer"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/public_c.rs",
-                      "bytes":  2423,
-                      "sha256":  "ded78ab94b6b7f5929fa5458dd006b94072668d10536c7020961c8c5077cbf39",
-                      "family":  "common-public-c-abi"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/quant_selection.rs",
-                      "bytes":  30637,
-                      "sha256":  "0570cc0e0e6c683db94d9c3f84f94c6939719558d2e338cfad344532fe362684",
-                      "family":  "common-quantization"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reasoning-budget-cases.json",
-                      "bytes":  4098,
-                      "sha256":  "c5d4d241e022d504ae9c2162014267c9a0da538cc88add1992888617953562fb",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reasoning_budget.rs",
-                      "bytes":  32707,
-                      "sha256":  "a6728070bf1f1112680dce036f078bcdce3a8263f62fef93f0c0a7d54f8d5aff",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_allocation.rs",
-                      "bytes":  65232,
-                      "sha256":  "0a06ade2ae0608b8aba39cc2de90606ffc95729244ae01e45e93ed20feb97375",
-                      "family":  "common-allocation"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_arena_graph.rs",
-                      "bytes":  34305,
-                      "sha256":  "b240540a2da3f1859467244cd9f7dbf5ab255770ae1a5f7e44e498c197302759",
-                      "family":  "common-arena-graph"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_arg_parser.rs",
-                      "bytes":  54393,
-                      "sha256":  "048f6ae454a3452cb5a6f5804cd5254738b0cdb50838b3540d207dc1a20bf920",
-                      "family":  "common-arg-parser"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_batch_allocator.rs",
-                      "bytes":  63587,
-                      "sha256":  "5ce45337895c32e7b184082d225287edf7b57122fadbe3a9ef2c638d9882b22e",
-                      "family":  "common-batch-allocator"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_codec.rs",
-                      "bytes":  239344,
-                      "sha256":  "39f4b21d54459ad4aeb9d95821d0700bc7d168bc439d2593c3309b90a805e107",
-                      "family":  "common-codec"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_dspark_logsnr.rs",
-                      "bytes":  40129,
-                      "sha256":  "238a2bc5ab863caef6b14bc218eaec55cc13bec8f09cbbe67fa4f3410d3f5227",
-                      "family":  "common-dspark"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_gguf.rs",
-                      "bytes":  41229,
-                      "sha256":  "a7314e09fa0d850b06d49f92457f7ac275095fcbf00061efbb9079c26dccdee3",
-                      "family":  "common-gguf"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_grammar.rs",
-                      "bytes":  46140,
-                      "sha256":  "2b0c77fbb197d5c0e55a4c8c1c0a6fd6bcc83c738ff65408592679e1f16c60de",
-                      "family":  "common-grammar"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_grammar_parser.rs",
-                      "bytes":  24221,
-                      "sha256":  "951058632f0538db2b6ff724f3030a9d152b9117d850f4bf346d73631d17f2e7",
-                      "family":  "common-grammar-parser"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_jinja.rs",
-                      "bytes":  170190,
-                      "sha256":  "354433f79755510c7d8e44922ea0af7aad78bd61a75f677d58e28142226e96c4",
-                      "family":  "common-jinja"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_json_schema.rs",
-                      "bytes":  76105,
-                      "sha256":  "e1cd70aa0cb167217b3ad4ffbf458c44249ff4f8501c31cde88d10af36c98054",
-                      "family":  "common-json-schema"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_logging.rs",
-                      "bytes":  12379,
-                      "sha256":  "1d7bb6a71f3882034aba49634b8b3acfea3eafb4e8199ecda397fb9d5287d372",
-                      "family":  "common-concurrency"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_mtmd.rs",
-                      "bytes":  13407,
-                      "sha256":  "a351d81157f7140df12563dad10ca6cb69e1e47fe3b07fb1523ca8a742492a43",
-                      "family":  "common-mtmd"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_mtmd_chunks.rs",
-                      "bytes":  24614,
-                      "sha256":  "76babf1eb80b1d6f13107f036cb4ed1463e150048a700c26d41e3b7582ea27ea",
-                      "family":  "common-mtmd-chunks"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_optimizer.rs",
-                      "bytes":  94482,
-                      "sha256":  "c26c35273d184508216533f80d8162a86011c0a889acb80de7c7f090eaee0d6e",
-                      "family":  "common-optimizer"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_provider.rs",
-                      "bytes":  14391,
-                      "sha256":  "62f4e3aa4495ed07a353875ed12e8b7856fcedeed6aedc75ee88691d46ccc68a",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_public_c_abi.rs",
-                      "bytes":  8934,
-                      "sha256":  "f08d1c79750a1a9f0971d8af2993cfda34a165bce781de496fadd81cd70d3225",
-                      "family":  "common-public-c-abi"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_quantization.rs",
-                      "bytes":  45061,
-                      "sha256":  "59fb58ef91307cf521e62a1fe62fd4ca519e77ef1b49a8ae5c27673480625f51",
-                      "family":  "common-quantization"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_reasoning.rs",
-                      "bytes":  17855,
-                      "sha256":  "097295b3ab74d33c7e40840b8b52b627928af2e5ae932e834d6aa378b164ef6f",
-                      "family":  "common-reasoning-budget"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_sampling.rs",
-                      "bytes":  47827,
-                      "sha256":  "4a15e98e063461b9a8cb342079f4cc2bd538af9e1561ac182b92efeb7ae14ca3",
-                      "family":  "common-sampling"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_tensor_graph.rs",
-                      "bytes":  70779,
-                      "sha256":  "ed691b305a546af5a34c263cbfe39c4feaf36c9cba2aaaef494b85a312992295",
-                      "family":  "common-tensor-graph"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_threadpool.rs",
-                      "bytes":  29345,
-                      "sha256":  "d2fec7e9b7f07f487e19369b5eb63a7d019e104b66c1fe355673a4214ecdf279",
-                      "family":  "common-threadpool"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/reference_unicode.rs",
-                      "bytes":  19173,
-                      "sha256":  "786bb1dc8e264d13b0d29c3b37e20881c9b6b05afb8a66eaff4012004073fc84",
-                      "family":  "common-bridge"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/sampling-cases.json",
-                      "bytes":  23880,
-                      "sha256":  "a53bd147cba5f1ae941327b9ecac03701123f3e2dd69f4a90d49f57ca470c736",
-                      "family":  "common-sampling"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/sampling.rs",
-                      "bytes":  34875,
-                      "sha256":  "a26a2f608ad71f9c0e3a1ee0bafdab828ea6e780a873ad31c1d331d7f38856be",
-                      "family":  "common-sampling"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/schema_python.rs",
-                      "bytes":  5854,
-                      "sha256":  "999faf158345f6733b38ce46095024875edbdea380f532c65e008fe693f47f8b",
-                      "family":  "common-json-schema"
-                  },
-                  {
-                      "path":  "tests/upstream_prism/validator.rs",
-                      "bytes":  13396,
-                      "sha256":  "3078eed662f3303976302ddea95c422746fae6345cb5207d0918ed18f4f8d0e6",
-                      "family":  "common-grammar"
-                  },
-                  {
-                      "path":  "tools/codec-probe/Cargo.toml",
-                      "bytes":  880,
-                      "sha256":  "606e296ddef9ad73e6341eb2f993d10c0f1e214d896b0354d26303728b927439",
-                      "family":  "external-native"
-                  },
-                  {
-                      "path":  "tools/codec-probe/native.lock.json",
-                      "bytes":  699,
-                      "sha256":  "cc1244b813b59bab411442c4bad400dcd14967f54f74246f998edc1abe554235",
-                      "family":  "external-native"
-                  },
-                  {
-                      "path":  "tools/prism/CMakeLists.txt",
-                      "bytes":  1202,
-                      "sha256":  "ea3c31dcbd3c8655cef36ae7abd7273fa121ac2b7dabc21a973146393e207a6f",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/Cargo.toml",
-                      "bytes":  790,
-                      "sha256":  "fcc48d2b81e927db845369af327eb53b18fff8fdbde45cc40da545c93f33130f",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/build.rs",
-                      "bytes":  4285,
-                      "sha256":  "13ae0d33f3177538c41856fa41382ee1e388c5eed67d16f32105f0a97fe9b11b",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/src/loader.rs",
-                      "bytes":  16929,
-                      "sha256":  "cc47295174dec551e51b0983cc46e94995b8d946542e097b5a9fa0ca93782f20",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/Apply-ReferencePatch.cmake",
-                      "bytes":  1556,
-                      "sha256":  "1c50647d8334c59aaf1bdc004f790ef0c68766d274e1bb24f69dec2f25aa5b31",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/CMakeLists.txt",
-                      "bytes":  1132,
-                      "sha256":  "eebaec09de0c2ad53cb0bd107dbb9121eeae8a1b2d167d80ab62dca1bf9c9412",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/LICENSE",
-                      "bytes":  1099,
-                      "sha256":  "bcd8ec749126d45cb06737d0690295d73df4b6e7e194205bcf91190368f27285",
-                      "family":  "external-native"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/RustBridge.cmake",
-                      "bytes":  3794,
-                      "sha256":  "0c52498ee58c75d99630bb2097da4b2c896d388b1df3b637cdd058b153e936d8",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/baseline.json",
-                      "bytes":  7240,
-                      "sha256":  "d8c75c5207a2cde0d250db32262be32d124d70bbbca54f254a67b9b5be6d1779",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/bridge/native.rs",
-                      "bytes":  7205,
-                      "sha256":  "6df2f8016b891ab19945a8bf5b0ef37cb83fcbc79151584177fbc2f7c51995d0",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/catalog.json",
-                      "bytes":  13696,
-                      "sha256":  "4293dcedddbe3cac5ffbbe273fc70de2d531246ef6b0b3c85cc74e01d0ccbf4b",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/common/CMakeLists.txt",
-                      "bytes":  4810,
-                      "sha256":  "1d5a6bd4fb2eae39fb9099b5fe598c43f90bfe5ad1e51b8dc1aa6963d2c0cbf6",
-                      "family":  "native-build"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/llguidance.lock.json",
-                      "bytes":  870,
-                      "sha256":  "5d6fa36c0669be2e7fe50e594a76b53adafe088c6eb233591bd2b7b6a6c4ea9b",
-                      "family":  "external-native"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/migration.json",
-                      "bytes":  44663,
-                      "sha256":  "bd7a23c439a36f986bf2bac3212c98eb9363c5b968ab776ed8e096cf3833c6d0",
-                      "family":  "upstream-contracts"
-                  },
-                  {
-                      "path":  "tools/prism/upstream/reference-patches.lock.json",
-                      "bytes":  1903,
-                      "sha256":  "5a5fc96d05469640b524c2d9d583cfd27c810b9be94eb5e1f0630d04b02dea88",
-                      "family":  "external-native"
-                  }
-              ]
+  "schemaVersion": 1,
+  "kind": "checked-in-native-retirement-boundary",
+  "repository": "prism",
+  "sourceRevision": "2cd3f25379c1451963add2adb40cb88820f031ad",
+  "exclusions": [
+    {
+      "path": ".git",
+      "reason": "Git object and worktree administration, not operative repository source."
+    },
+    {
+      "path": ".worktrees",
+      "reason": "Independent local Git worktrees, inventoried through their own roots."
+    },
+    {
+      "path": "target",
+      "reason": "Reconstructible Cargo outputs and local worktrees; selected generated/compiled closure uses native-closure-verify separately."
+    }
+  ],
+  "families": [
+    {
+      "id": "common-action-file",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/action_file.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-allocation",
+      "obligations": [
+        "Preserve every test-alloc.cpp allocation/view/aliasing/multi-backend/alignment contract through tests/upstream_prism/reference_allocation.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-arena-graph",
+      "obligations": [
+        "Preserve every test-moe-weighted-reduce and arena-graph layout/placement/bounds contract through tests/upstream_prism/reference_arena_graph.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-arg-parser",
+      "obligations": [
+        "Preserve every test-arg-parser.cpp argument enum, CLI parse, speculative limits/transfer, quoting/LoRA CSV and remote HTTP content assertion through tests/upstream_prism/reference_arg_parser.rs. The C++ arg_parser.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-backend-ops",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_ops.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-backend-sampler",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_sampler.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-backend-session",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_session.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-batch-allocator",
+      "obligations": [
+        "Preserve every test-batch-alloc contract, equal-split/mrope/position/coupling invariant through tests/upstream_prism/reference_batch_allocator.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-bridge",
+      "obligations": [
+        "Preserve every remaining common handler in tools/prism/upstream/common/bridge.cpp under the exact catalog and migration inventory; top-level unicode-* dispatch (test-unicode) and the retired public-c-abi, dspark, arg-parser, model-resolution, optimizer, codec, codec-buffers, jinja, peg, chat-templates, chat-analysis, chat-parser, chat-auto, and chat (plus prism-upstream-server-context) handlers moved to tests/upstream_prism/reference_*.rs, leaving 12 checked-in C++ files in the common bridge. Remaining handlers and required green IDs must pass before retiring bridge.cpp."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-chat",
+      "obligations": [
+        "Preserve every test-chat.cpp template, parser, OpenAI/Responses conversion, reasoning effort/preserve and reconstruction contract through tests/upstream_prism/reference_chat.rs. The C++ chat.hpp header/include/dispatch/CMake edge and prism-upstream-server-context target are retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-chat-analysis",
+      "obligations": [
+        "Preserve every test-chat-analysis.cpp template differential analysis, capability diff, error-stop and rendering trace contract through tests/upstream_prism/reference_chat_analysis.rs. The C++ chat_analysis.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-chat-auto",
+      "obligations": [
+        "Preserve every test-chat-auto-parser.cpp diff-split, format classification, tool/reasoning detection, marker and quote-normalization contract through tests/upstream_prism/reference_chat_auto.rs. The C++ chat_auto.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-chat-parser",
+      "obligations": [
+        "Preserve every test-chat-peg-parser.cpp whole and incremental chat PEG parser, grammar mapping, partial-diff and tool-call contract through tests/upstream_prism/reference_chat_parser.rs. The C++ chat_parser.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-chat-templates",
+      "obligations": [
+        "Preserve every test-chat-template.cpp builtin, legacy and common template render, tool-call and capability contract through tests/upstream_prism/reference_chat_templates.rs. The C++ chat_templates.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-codec",
+      "obligations": [
+        "Preserve every test-quantize-fns.cpp and test-ptq1_0-cuda-dot.cpp codec inventory, quantize/dequantize/dot tolerance, PQ2/PTQ1 packed-pattern and full-byte-domain contract through tests/upstream_prism/reference_codec.rs (with Target::RustReference codec routing in engine.rs). The C++ codec.hpp header/include/dispatch/CMake edge is retired (retaining inlined helper functions in codec_buffers.hpp); keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-codec-buffers",
+      "obligations": [
+        "Preserve every test-quantize-perf.cpp and test-quantize-stats.cpp persistent buffer, GGUF tensor load/copy, checkpoint/continuation and workload contract through tests/upstream_prism/reference_codec_buffers.rs. The C++ codec_buffers.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-concurrency",
+      "obligations": [
+        "Preserve test-log.cpp's eight original concurrent workers, 8,000 records, per-thread Windows random schedules, timestamp/prefix toggles and join/flush/free smoke contract through independent bounded-channel Rust observations and the separate production Rust logger. Preserve the required reference green ID and reject writer/teardown failures. The C++ header/include/dispatch/CMake edge is retired; output-content/native replay and whole-repository retirement are not claimed. Owning hosted acceptance remains separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-context-graph",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/context_graph.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-dspark",
+      "obligations": [
+        "Preserve every test-dspark-logsnr-meta.cpp GGUF v2/v3 load, log-SNR conditioning bound and diagnostic guard contract through tests/upstream_prism/reference_dspark_logsnr.rs. The C++ dspark.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-dspark-runtime",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/dspark_runtime.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-generated-model",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/generated_model.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-gguf",
+      "obligations": [
+        "Preserve every test-gguf.cpp GGUF read/write, KV metadata, alignment, context lifecycle and tensor-data assertion through tests/upstream_prism/reference_gguf.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-grammar",
+      "obligations": [
+        "Preserve every test-llama-grammar.cpp, test-gbnf-validator.cpp and test-grammar-integration.cpp stack/rejection/unicode/UTF-8 grammar assertion through tests/upstream_prism/reference_grammar.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-grammar-parser",
+      "obligations": [
+        "Preserve all 274 original grammar-parser assertions across 17 valid and six invalid variants, exact symbol/rule order, Unicode, repetition lowering and failure state using an independent Rust AST provider. The native header/include/dispatch/CMake route is retired; keep required reference green IDs and owning hosted acceptance separate from native replay or full retirement."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-jinja",
+      "obligations": [
+        "Preserve every test-jinja.cpp literal, hasher/hash-trace, builtin inventory, stats, caps, string-parts, ByteStrings, exception-phase and fuzz contract through tests/upstream_prism/reference_jinja.rs. The C++ jinja.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-json-schema",
+      "obligations": [
+        "Preserve every test-json-schema-to-grammar.cpp and test-grammar-integration.cpp schema conversion assertion through tests/upstream_prism/reference_json_schema.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-llguidance",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/llguidance.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-model-resolution",
+      "obligations": [
+        "Preserve every test-model-resolution.cpp fake HF repo, split, mmproj, preset and loopback HTTP resolution precedence contract through tests/upstream_prism/reference_model_resolution.rs. The C++ model_resolution.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-model-runtime",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/model_runtime.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-mtmd",
+      "obligations": [
+        "Preserve all 29 original LFM2 tiling and temporal-grouping assertions, ties-to-even alignment, strict area thresholds, ordered image/audio/text boundaries and separately counted bitmap survivors through the independent nearest-lattice/run-partition Rust provider. Keep typed bounds and owned request lifetime. The native header/include/dispatch/CMake route is retired; no model, native replay, device or complete retirement verdict is claimed."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-mtmd-chunks",
+      "obligations": [
+        "Preserve all 46 original public MTMD chunk conditions, source-defined factory metadata, wire lengths/positions, save query and tiny/truncated failures, complete roundtrip identity and owned/null reload lifecycle through a separate Rust wire-recipe/cursor decoder. The native header/include/dispatch/CMake route is retired; preserve original source and required reference identities, and keep owning hosted and full-retirement acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-optimizer",
+      "obligations": [
+        "Preserve every test-opt.cpp dataset, gradient accumulation, forward/backward, epoch/fit, AdamW/SGD step, split, regression and lifetime contract through tests/upstream_prism/reference_optimizer.rs. The C++ optimizer.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-peg",
+      "obligations": [
+        "Preserve every test-peg-parser.cpp and six nested tests/peg-parser/*.cpp builder, parser, GBNF, JSON/Python-dict, serialization and Unicode contract through tests/upstream_prism/reference_peg.rs. The C++ peg.hpp header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-public-c-abi",
+      "obligations": [
+        "Preserve every test-c.c public C ABI layout/alignment/width/C-standard contract through tests/upstream_prism/reference_public_c_abi.rs. The C public_c_abi.c/.h source/header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-quantization",
+      "obligations": [
+        "Preserve every test-quant-type-selection model/tensor/exclude/tied/MoE rule through tests/upstream_prism/reference_quantization.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-reasoning-budget",
+      "obligations": [
+        "Preserve all 71 original reasoning-budget semantic conditions, null-vocabulary lifecycle, exceptional candidate bits, clone ownership and UTF-8 boundary assertions using the independently implemented active-prefix/event-ordinal Rust reference. The C++ header/include/dispatch/CMake edge is retired; owning hosted acceptance and whole-repository native retirement remain separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-sampling",
+      "obligations": [
+        "Preserve every test-sampling.cpp sampler-chain, RNG, candidate copy/sort and penalty/XTC/Mirostat assertion through tests/upstream_prism/reference_sampling.rs. The C++ sampling.hpp header/include/dispatch/CMake edge is retired (retaining prism_backend_sampler helpers in backend_sampler.hpp); keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-tensor-graph",
+      "obligations": [
+        "Preserve every test-col2im-1d, test-dfly-fusion and test-rope contract through tests/upstream_prism/reference_tensor_graph.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-threadpool",
+      "obligations": [
+        "Preserve every test-barrier schedule, DAG dependency and timed-yield contract through tests/upstream_prism/reference_threadpool.rs. The C++ header/include/dispatch/CMake edge is retired; keeping required green IDs and owning hosted acceptance separate."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-vocab",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/vocab.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "common-vocab-session",
+      "obligations": [
+        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/vocab_session.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "upstream-contracts",
+      "obligations": [
+        "Preserve all 71 source IDs, all approved required green IDs and source hashes, every exclusion and tolerance.",
+        "Retain all 22817 ordered correctness geometries and separate 1530 performance workloads; count parity alone cannot replace exact schedule bytes."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "native-build",
+      "obligations": [
+        "Preserve CMake/native adapter/source patch/compiler/link/cache/packaging routes until independent providers and no-project-C++ hosted acceptance pass."
+      ],
+      "retirementQualified": false
+    },
+    {
+      "id": "external-native",
+      "obligations": [
+        "Preserve exact upstream archive/patch/LLGuidance/codec source identities, license notices and ABI/dependency boundaries before removing download/load/build routes."
+      ],
+      "retirementQualified": false
+    }
+  ],
+  "files": [
+    {
+      "path": "tools/prism/upstream/common/action_file.hpp",
+      "bytes": 3256,
+      "sha256": "474445881948a30a5bdf11bcd320d0aa3b613e4846d13320ed0ade46e579da38",
+      "family": "common-action-file"
+    },
+    {
+      "path": "tools/prism/upstream/common/backend_ops.hpp",
+      "bytes": 45874,
+      "sha256": "b87e717cb647696d0a90bc10e1714442a3933504c5ff5c69cdd1a408952f8f68",
+      "family": "common-backend-ops"
+    },
+    {
+      "path": "tools/prism/upstream/common/backend_sampler.hpp",
+      "bytes": 22422,
+      "sha256": "d3454ae519ca9743ad7582c5af3676de014e7b8b014a00e15cad57520697a3ed",
+      "family": "common-backend-sampler"
+    },
+    {
+      "path": "tools/prism/upstream/common/backend_session.hpp",
+      "bytes": 5444,
+      "sha256": "104cb583d3e710e21098aed4b8bd992981733b743aa6f312f8196e828147df73",
+      "family": "common-backend-session"
+    },
+    {
+      "path": "tools/prism/upstream/common/bridge.cpp",
+      "bytes": 6726,
+      "sha256": "30478d3cefcd9430d1c6d3953f4e64c1008f482357a3e37fc520afacc0758508",
+      "family": "common-bridge"
+    },
+    {
+      "path": "tools/prism/upstream/common/context_graph.hpp",
+      "bytes": 2463,
+      "sha256": "516d8844ab188d7bf2f679d2396b5d5f53b3a178e3fa6a1da40ea0cd83b8d2da",
+      "family": "common-context-graph"
+    },
+    {
+      "path": "tools/prism/upstream/common/dspark_runtime.hpp",
+      "bytes": 26368,
+      "sha256": "6c927681e23677dca8109e09a6d17305326d4f328c05092fc1c6ecb6c23d8c94",
+      "family": "common-dspark-runtime"
+    },
+    {
+      "path": "tools/prism/upstream/common/generated_model.hpp",
+      "bytes": 10469,
+      "sha256": "4fb9f6524508780c476e2fcb068f4b64036fd003614c0359791d6649f956a063",
+      "family": "common-generated-model"
+    },
+    {
+      "path": "tools/prism/upstream/common/llguidance.hpp",
+      "bytes": 12261,
+      "sha256": "409dd2cd4832d27ce64c31b570a7d6c96e4558845a5c3adebd9635679938dfa4",
+      "family": "common-llguidance"
+    },
+    {
+      "path": "tools/prism/upstream/common/model_runtime.hpp",
+      "bytes": 43680,
+      "sha256": "8ad6d4c1d7e719187a887e2ddcef05bdfdde73d891014d87dc4574a8825feb2a",
+      "family": "common-model-runtime"
+    },
+    {
+      "path": "tools/prism/upstream/common/vocab.hpp",
+      "bytes": 8985,
+      "sha256": "e6e3c7d50be1a0c3b26688452894a9be820ccd307bd38d84505ef475fad7bd69",
+      "family": "common-vocab"
+    },
+    {
+      "path": "tools/prism/upstream/common/vocab_session.hpp",
+      "bytes": 8426,
+      "sha256": "d438bbffc3dbd933481b50fed8e353cd5f57b97d89a9afb10ec76fbf48408c88",
+      "family": "common-vocab-session"
+    }
+  ],
+  "edges": [
+    {
+      "path": "Cargo.lock",
+      "bytes": 55551,
+      "sha256": "2f27fef1eb8557a73873ab42d8c1490b7e3fbc9f9938b7be2b3d719778610ad6",
+      "family": "external-native"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 6144,
+      "sha256": "c932cf359923af0bf5063b441b1b7dc73cb967ab5f0027b10e3e35d83d21e8f8",
+      "family": "external-native"
+    },
+    {
+      "path": "scripts/Bonsai.Native.psm1",
+      "bytes": 3967,
+      "sha256": "2d085b83039898315ed87233a50170ed9747375d98750ea0d243e9a231cfd605",
+      "family": "external-native"
+    },
+    {
+      "path": "scripts/Bonsai.PrismNativeCache.psm1",
+      "bytes": 7808,
+      "sha256": "86efcde9bdf1903bff6420966ca994d5ccdcb23942bc0995fb4c93764b69959a",
+      "family": "native-build"
+    },
+    {
+      "path": "scripts/Build-PrismEngine.ps1",
+      "bytes": 14485,
+      "sha256": "5be6d37f40ff701d7e7e3aa50c4da4b798de484cfba9d7aa16ff270712185e4b",
+      "family": "native-build"
+    },
+    {
+      "path": "scripts/New-ReleaseBundle.ps1",
+      "bytes": 6354,
+      "sha256": "fa558ade6bd7f2988dbec3ebb5e230eaf3c4e19cb6bace0d3e56e709d55a986f",
+      "family": "native-build"
+    },
+    {
+      "path": "tests/Test-PrismUpstream.ps1",
+      "bytes": 37574,
+      "sha256": "d330f607f3ff4d378e3d1a82166e3aae3468eb59a30b36b2613a6d697895de83",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/allocation.rs",
+      "bytes": 35757,
+      "sha256": "e4517019f3a550a6b61e3bdbc11d03e025dc8a4c0fab3d169e3a0a11a65380d8",
+      "family": "common-allocation"
+    },
+    {
+      "path": "tests/upstream_prism/arg_parser.rs",
+      "bytes": 16715,
+      "sha256": "ccd2a910ca68a539d0fa9b7fe85798170cd00c9733f057f246b9c81b639969bc",
+      "family": "common-arg-parser"
+    },
+    {
+      "path": "tests/upstream_prism/backend-ops-geometries.json",
+      "bytes": 2360032,
+      "sha256": "8eb986e0a2cf7694b98a03f24f8ed4e5aabf6407ce60dcc502cab0682434549d",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/backend-ops-program.json",
+      "bytes": 3301844,
+      "sha256": "bb1264b48ee43841949ef350a84bd2731a0656e9c4cd565c1afcecbfd75633a6",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/barrier.rs",
+      "bytes": 15145,
+      "sha256": "f5e81aea683285787f7c5eb71f23e509da274d4519734eb2236ebfcc2af98cac",
+      "family": "common-threadpool"
+    },
+    {
+      "path": "tests/upstream_prism/batch_allocator.rs",
+      "bytes": 37210,
+      "sha256": "34ef97c6ba12ea0ef86a8feecaf4710bf705b63bb6d3666e01aa55849c163144",
+      "family": "common-batch-allocator"
+    },
+    {
+      "path": "tests/upstream_prism/chat-analysis-inputs.json",
+      "bytes": 2762,
+      "sha256": "dd6688bcece6fa94fcc5ab0cfee75822515d87d31f64a4faef251cee1ef8d53b",
+      "family": "common-chat-analysis"
+    },
+    {
+      "path": "tests/upstream_prism/chat-auto-cases.json",
+      "bytes": 625019,
+      "sha256": "82ca341c6262fd375a9b3f9ddf86ddc0f47ad576c05d454b14cac86c27125b3a",
+      "family": "common-chat-auto"
+    },
+    {
+      "path": "tests/upstream_prism/chat-cases.json",
+      "bytes": 2103158,
+      "sha256": "27d5aa0c6fd163fa6af4718fe01ac7aca4437c4255527499e2b173a4a5fc4cc1",
+      "family": "common-chat"
+    },
+    {
+      "path": "tests/upstream_prism/chat-peg-cases.json",
+      "bytes": 124474,
+      "sha256": "22a7c5ae285026e62f527d96f44278da27f82945c5efb993fe181c85ae7aa50e",
+      "family": "common-chat-parser"
+    },
+    {
+      "path": "tests/upstream_prism/chat-template-cases.json",
+      "bytes": 52686,
+      "sha256": "a644ea7ceb38ae9877be29fa3229f5dcad0f423f3048db9a68809244e8e2a7dc",
+      "family": "common-chat-templates"
+    },
+    {
+      "path": "tests/upstream_prism/chat.rs",
+      "bytes": 47488,
+      "sha256": "c578ab321af68704795a5e495aaee8decb005429ae5604c5b4b63518e4155381",
+      "family": "common-chat"
+    },
+    {
+      "path": "tests/upstream_prism/chat_analysis.rs",
+      "bytes": 22173,
+      "sha256": "76105f945e1fd7df9559a1fe21a4fa693b146be4714670adfcc0e91287e5393a",
+      "family": "common-chat-analysis"
+    },
+    {
+      "path": "tests/upstream_prism/chat_auto.rs",
+      "bytes": 19176,
+      "sha256": "5e3c3c374aafad1637b8d1676fffb9d00d78d8d2025ab5803a47f956c769e6f9",
+      "family": "common-chat-auto"
+    },
+    {
+      "path": "tests/upstream_prism/chat_peg.rs",
+      "bytes": 37604,
+      "sha256": "8d89bc0b278a3884fe810244c9a0c9fdf5b8716660d3af5fafed6c5eb197749a",
+      "family": "common-chat-parser"
+    },
+    {
+      "path": "tests/upstream_prism/chat_template.rs",
+      "bytes": 12740,
+      "sha256": "082405a8a259aac25d11b8c6f8389e4ccb253b3eeb9b1fd8ea51c9459c280c39",
+      "family": "common-chat-templates"
+    },
+    {
+      "path": "tests/upstream_prism/codec_assertions.rs",
+      "bytes": 42320,
+      "sha256": "ed76848861396e3bc2eeb4b90ba4787b830bacd6d47ee94cfcca510e9829b8df",
+      "family": "common-codec"
+    },
+    {
+      "path": "tests/upstream_prism/common.rs",
+      "bytes": 7608,
+      "sha256": "b001d484b38fd4cea4018617190848cdf9121d82f3abae0c4f31de79ded4ac61",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/dspark_inputs.rs",
+      "bytes": 8717,
+      "sha256": "9d59e0271698df2eef38bf658d8dc3ad58f798f98ae6007e34d5448e5de307b5",
+      "family": "common-dspark"
+    },
+    {
+      "path": "tests/upstream_prism/dspark_logsnr.rs",
+      "bytes": 6781,
+      "sha256": "4489d64fbc1e1ab1fa3626e4166c09303c5b30a0214c0d8c1029122daf170c7c",
+      "family": "common-dspark"
+    },
+    {
+      "path": "tests/upstream_prism/engine.rs",
+      "bytes": 22158,
+      "sha256": "22e5fd073da61d971f766a307dedeb9a9b2428e299e5ebbbf68b12281dc66a75",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/gguf.rs",
+      "bytes": 61922,
+      "sha256": "939f05ea8b9589785cb4bd71ef16c34bea5e3ff07bc87a44368283130be7de32",
+      "family": "common-gguf"
+    },
+    {
+      "path": "tests/upstream_prism/grammar-integration-cases.json",
+      "bytes": 130059,
+      "sha256": "f502bcdd2b7ae764bc38a72a5ac920228ec383d9ab0832a0a17272a4817a6d22",
+      "family": "common-grammar"
+    },
+    {
+      "path": "tests/upstream_prism/grammar-parser-cases.json",
+      "bytes": 22079,
+      "sha256": "e99f45b9c0cd0a3139c82f48fbf98c9767b119eff7a6a616b84e48ab6ba06842",
+      "family": "common-grammar-parser"
+    },
+    {
+      "path": "tests/upstream_prism/grammar_integration.rs",
+      "bytes": 19378,
+      "sha256": "14402516e2672c6f0c41a4cd0e55d00f5e0619dc99c87c517a7f75e65f46df9b",
+      "family": "common-grammar"
+    },
+    {
+      "path": "tests/upstream_prism/grammar_parser.rs",
+      "bytes": 10874,
+      "sha256": "9c2c290e3029c127dcb66c9e01490fd35a34482f7df1c433fd4be631cd2e090a",
+      "family": "common-grammar-parser"
+    },
+    {
+      "path": "tests/upstream_prism/harness.rs",
+      "bytes": 31762,
+      "sha256": "a33fd05b48e79baf926daf028863ed4dc1d867da1ae4b2e18e24bd8cfb5582bc",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/jinja-cases.json",
+      "bytes": 68515,
+      "sha256": "e840d2487c560d676b248bbba4c3724f9f2b6687ad3558088558f051e8e29c3f",
+      "family": "common-jinja"
+    },
+    {
+      "path": "tests/upstream_prism/jinja.rs",
+      "bytes": 40541,
+      "sha256": "5a64d8e60c446d491c010af1afb15e317ce88046e124bf05b3fa118ca4af6126",
+      "family": "common-jinja"
+    },
+    {
+      "path": "tests/upstream_prism/json-schema-cases.json",
+      "bytes": 60833,
+      "sha256": "d0fd6806a9ba517d438f3976957f77fab21ec7c2e047fe26082f944937cedaba",
+      "family": "common-json-schema"
+    },
+    {
+      "path": "tests/upstream_prism/json_schema.rs",
+      "bytes": 15739,
+      "sha256": "0c20022773ec0968ff503b1ce0790fcb5a04dd5db70522c8006a7825b71d3c3e",
+      "family": "common-json-schema"
+    },
+    {
+      "path": "tests/upstream_prism/llama-grammar-cases.json",
+      "bytes": 11892,
+      "sha256": "83b6e86fdb5e214b0c5470dec8d1f354da02bce2ff66b392270f6dc6888c5c58",
+      "family": "common-grammar"
+    },
+    {
+      "path": "tests/upstream_prism/llama_grammar.rs",
+      "bytes": 25960,
+      "sha256": "b031981444e4c0aceea5fe40603b85d1f1b86b6dd2bcfd91c017665fbb08ff3c",
+      "family": "common-grammar"
+    },
+    {
+      "path": "tests/upstream_prism/logging.rs",
+      "bytes": 2989,
+      "sha256": "7f158151896f92460a9d3c2c1612daa042f582f85b7eb64a8f25c85737e979e8",
+      "family": "common-concurrency"
+    },
+    {
+      "path": "tests/upstream_prism/model-resolution-inputs.json",
+      "bytes": 7772,
+      "sha256": "09d2e7c769499950a27861151aafff318e0a94b46a45fa8cb4787141b88ad38a",
+      "family": "common-model-resolution"
+    },
+    {
+      "path": "tests/upstream_prism/model_resolution.rs",
+      "bytes": 21300,
+      "sha256": "efabd710064950df6faa030841858fffbc8725a3c72982e4f8431041bf524413",
+      "family": "common-model-resolution"
+    },
+    {
+      "path": "tests/upstream_prism/model_resolution_runtime.rs",
+      "bytes": 7462,
+      "sha256": "252d89bcdf8164e49dd2219b42babc4757d089d7d53d73aaf2fb35a559c6744a",
+      "family": "common-model-resolution"
+    },
+    {
+      "path": "tests/upstream_prism/model_resolution_server.rs",
+      "bytes": 10644,
+      "sha256": "094f9f6cbc81e92e9b8ae5a8f0cb5f0347734bf59f911b418d2cde386dacda58",
+      "family": "common-model-resolution"
+    },
+    {
+      "path": "tests/upstream_prism/moe_reduce.rs",
+      "bytes": 8878,
+      "sha256": "c3ba8f6f9729aefc948ddc91990a849d72e31103705d93bb7f0ec2e85efd43a5",
+      "family": "common-arena-graph"
+    },
+    {
+      "path": "tests/upstream_prism/mtmd.rs",
+      "bytes": 8444,
+      "sha256": "8b117e884a1e12de9a4f54e1741b0e4ca18d9ac5e646ead913b943c4e46c1521",
+      "family": "common-mtmd"
+    },
+    {
+      "path": "tests/upstream_prism/mtmd_chunks.rs",
+      "bytes": 10450,
+      "sha256": "aaa1b20dc59ad3cce6336db2c4ef9f42ff2770ebadd25b958237c66bda3b856c",
+      "family": "common-mtmd-chunks"
+    },
+    {
+      "path": "tests/upstream_prism/numerics.rs",
+      "bytes": 22392,
+      "sha256": "67d29d942720e7f3509d00cd89553f1080d2da4e15f42f651d0fd418463bb39b",
+      "family": "common-tensor-graph"
+    },
+    {
+      "path": "tests/upstream_prism/optimizer.rs",
+      "bytes": 32047,
+      "sha256": "cc85b15c7c3e50070c3e4044bb90802fea624667efb71403d6c882b4c720b560",
+      "family": "common-optimizer"
+    },
+    {
+      "path": "tests/upstream_prism/peg-basic.json",
+      "bytes": 51493,
+      "sha256": "091af3a6f911a08411ca1e6e6d84a4f7cb3ee4cc1e8b4d3965e3f9a751062508",
+      "family": "common-peg"
+    },
+    {
+      "path": "tests/upstream_prism/peg-gbnf-generation.json",
+      "bytes": 168522,
+      "sha256": "0daff3a2d58a9f001ddb4ab7d7dc94132a6a927d37197596e3fb5af5ef6a8dff",
+      "family": "common-peg"
+    },
+    {
+      "path": "tests/upstream_prism/peg-json-parser.json",
+      "bytes": 18469,
+      "sha256": "e8521960f12be1c8f110554ee13727773c44976ab919b571d93c27622963e164",
+      "family": "common-peg"
+    },
+    {
+      "path": "tests/upstream_prism/peg-json-serialization.json",
+      "bytes": 3466,
+      "sha256": "f0fbc4eb74fb7e3a326c63fe84aec75f19470bc98b96159385d1c8be28f095dc",
+      "family": "common-peg"
+    },
+    {
+      "path": "tests/upstream_prism/peg-python-dict-parser.json",
+      "bytes": 43912,
+      "sha256": "fb2ab2a8d5affdef39230bfb45cb4115199ff6ea3d75d3be4c0c58c98e070684",
+      "family": "common-peg"
+    },
+    {
+      "path": "tests/upstream_prism/peg-unicode.json",
+      "bytes": 150687,
+      "sha256": "26ecacff42fb8a0a59c62a00da681aec8563a250134af18ab5a020b454de7521",
+      "family": "common-peg"
+    },
+    {
+      "path": "tests/upstream_prism/peg.rs",
+      "bytes": 22529,
+      "sha256": "5ba3d4e2869538a6f0dac5ca1fdb71a948f7eec377db82062871a912ead90798",
+      "family": "common-peg"
+    },
+    {
+      "path": "tests/upstream_prism/public_c.rs",
+      "bytes": 2423,
+      "sha256": "ded78ab94b6b7f5929fa5458dd006b94072668d10536c7020961c8c5077cbf39",
+      "family": "common-public-c-abi"
+    },
+    {
+      "path": "tests/upstream_prism/quant_buffers.rs",
+      "bytes": 9924,
+      "sha256": "2dbbb060d01329ddf8e782d0e5354f37a0d1f3539cc7a132e996007b293383b2",
+      "family": "common-codec-buffers"
+    },
+    {
+      "path": "tests/upstream_prism/quant_selection.rs",
+      "bytes": 30637,
+      "sha256": "0570cc0e0e6c683db94d9c3f84f94c6939719558d2e338cfad344532fe362684",
+      "family": "common-quantization"
+    },
+    {
+      "path": "tests/upstream_prism/quantize_perf.rs",
+      "bytes": 15113,
+      "sha256": "7917bbe077e7529cfb7e341645890d6b09d4812da5ea68e018065f485b2d47e2",
+      "family": "common-codec-buffers"
+    },
+    {
+      "path": "tests/upstream_prism/quantize_stats.rs",
+      "bytes": 38934,
+      "sha256": "5a1d8e1b93072fe838633da5dada61f6658fc98dcca80831dc08841102ff7da8",
+      "family": "common-codec-buffers"
+    },
+    {
+      "path": "tests/upstream_prism/reasoning-budget-cases.json",
+      "bytes": 4098,
+      "sha256": "c5d4d241e022d504ae9c2162014267c9a0da538cc88add1992888617953562fb",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reasoning_budget.rs",
+      "bytes": 32707,
+      "sha256": "a6728070bf1f1112680dce036f078bcdce3a8263f62fef93f0c0a7d54f8d5aff",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reference_allocation.rs",
+      "bytes": 65232,
+      "sha256": "0a06ade2ae0608b8aba39cc2de90606ffc95729244ae01e45e93ed20feb97375",
+      "family": "common-allocation"
+    },
+    {
+      "path": "tests/upstream_prism/reference_arena_graph.rs",
+      "bytes": 34305,
+      "sha256": "b240540a2da3f1859467244cd9f7dbf5ab255770ae1a5f7e44e498c197302759",
+      "family": "common-arena-graph"
+    },
+    {
+      "path": "tests/upstream_prism/reference_arg_parser.rs",
+      "bytes": 54393,
+      "sha256": "048f6ae454a3452cb5a6f5804cd5254738b0cdb50838b3540d207dc1a20bf920",
+      "family": "common-arg-parser"
+    },
+    {
+      "path": "tests/upstream_prism/reference_batch_allocator.rs",
+      "bytes": 63587,
+      "sha256": "5ce45337895c32e7b184082d225287edf7b57122fadbe3a9ef2c638d9882b22e",
+      "family": "common-batch-allocator"
+    },
+    {
+      "path": "tests/upstream_prism/reference_chat.rs",
+      "bytes": 286313,
+      "sha256": "741b2bc373b25876ff93a91d3a58f24855608a4e3e08ed1396c0016f4e5d4bd5",
+      "family": "common-chat"
+    },
+    {
+      "path": "tests/upstream_prism/reference_chat_analysis.rs",
+      "bytes": 36871,
+      "sha256": "35aea5dc904ef632391b9f7ce0d37b02ff4e8e214b0f0dc3c52553b42c9f3fd9",
+      "family": "common-chat-analysis"
+    },
+    {
+      "path": "tests/upstream_prism/reference_chat_auto.rs",
+      "bytes": 120666,
+      "sha256": "59850214826c34095621dd7244a3df11cdb624b94e436baa776a612cec4fb230",
+      "family": "common-chat-auto"
+    },
+    {
+      "path": "tests/upstream_prism/reference_chat_parser.rs",
+      "bytes": 105103,
+      "sha256": "8e04e22c17caa1fcc921df2815cff539d01cc1523fe639cc797ad005deea6c29",
+      "family": "common-chat-parser"
+    },
+    {
+      "path": "tests/upstream_prism/reference_chat_templates.rs",
+      "bytes": 67166,
+      "sha256": "e48e7671cbaa55c3b99665a5c2fb294564445c7fd3aa014d66ed57222e948353",
+      "family": "common-chat-templates"
+    },
+    {
+      "path": "tests/upstream_prism/reference_codec.rs",
+      "bytes": 239544,
+      "sha256": "5136178b39df2d10a870b897c4a340574ca70318a0f8b729ebee4e3cf98b9643",
+      "family": "common-codec"
+    },
+    {
+      "path": "tests/upstream_prism/reference_codec_buffers.rs",
+      "bytes": 81308,
+      "sha256": "38c29168e97448af9d64c008d3fe84b08e7291a3b31a53a78e8f3cc3980ff169",
+      "family": "common-codec-buffers"
+    },
+    {
+      "path": "tests/upstream_prism/reference_dspark_logsnr.rs",
+      "bytes": 40129,
+      "sha256": "238a2bc5ab863caef6b14bc218eaec55cc13bec8f09cbbe67fa4f3410d3f5227",
+      "family": "common-dspark"
+    },
+    {
+      "path": "tests/upstream_prism/reference_gguf.rs",
+      "bytes": 41229,
+      "sha256": "a7314e09fa0d850b06d49f92457f7ac275095fcbf00061efbb9079c26dccdee3",
+      "family": "common-gguf"
+    },
+    {
+      "path": "tests/upstream_prism/reference_grammar.rs",
+      "bytes": 46140,
+      "sha256": "2b0c77fbb197d5c0e55a4c8c1c0a6fd6bcc83c738ff65408592679e1f16c60de",
+      "family": "common-grammar"
+    },
+    {
+      "path": "tests/upstream_prism/reference_grammar_parser.rs",
+      "bytes": 24221,
+      "sha256": "951058632f0538db2b6ff724f3030a9d152b9117d850f4bf346d73631d17f2e7",
+      "family": "common-grammar-parser"
+    },
+    {
+      "path": "tests/upstream_prism/reference_jinja.rs",
+      "bytes": 197653,
+      "sha256": "2833330f2e1a5953bb1d9c62458a8c456327311b76fb4fc9932804da9cdbda47",
+      "family": "common-jinja"
+    },
+    {
+      "path": "tests/upstream_prism/reference_json_schema.rs",
+      "bytes": 84302,
+      "sha256": "8fec004b7877fbf509da362618622ea35cd003965f2d05aebe1f3fa5ad3eaf08",
+      "family": "common-json-schema"
+    },
+    {
+      "path": "tests/upstream_prism/reference_logging.rs",
+      "bytes": 12379,
+      "sha256": "1d7bb6a71f3882034aba49634b8b3acfea3eafb4e8199ecda397fb9d5287d372",
+      "family": "common-concurrency"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_resolution.rs",
+      "bytes": 112948,
+      "sha256": "a65280f28cde20276d6ad635bedc7bf2554308b6758335e63c8078c974bb4670",
+      "family": "common-model-resolution"
+    },
+    {
+      "path": "tests/upstream_prism/reference_mtmd.rs",
+      "bytes": 13407,
+      "sha256": "a351d81157f7140df12563dad10ca6cb69e1e47fe3b07fb1523ca8a742492a43",
+      "family": "common-mtmd"
+    },
+    {
+      "path": "tests/upstream_prism/reference_mtmd_chunks.rs",
+      "bytes": 24614,
+      "sha256": "76babf1eb80b1d6f13107f036cb4ed1463e150048a700c26d41e3b7582ea27ea",
+      "family": "common-mtmd-chunks"
+    },
+    {
+      "path": "tests/upstream_prism/reference_optimizer.rs",
+      "bytes": 94482,
+      "sha256": "c26c35273d184508216533f80d8162a86011c0a889acb80de7c7f090eaee0d6e",
+      "family": "common-optimizer"
+    },
+    {
+      "path": "tests/upstream_prism/reference_peg.rs",
+      "bytes": 136280,
+      "sha256": "f137158532f7c70972f9b501b98ddb1fdd79428189bb0648085440259e4feb21",
+      "family": "common-peg"
+    },
+    {
+      "path": "tests/upstream_prism/reference_provider.rs",
+      "bytes": 17421,
+      "sha256": "374b58b35973a0e1f3bc18214dfd390ffb1bd326a6929feefd365dc4c3ba0a6e",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/reference_public_c_abi.rs",
+      "bytes": 8934,
+      "sha256": "f08d1c79750a1a9f0971d8af2993cfda34a165bce781de496fadd81cd70d3225",
+      "family": "common-public-c-abi"
+    },
+    {
+      "path": "tests/upstream_prism/reference_quantization.rs",
+      "bytes": 45061,
+      "sha256": "59fb58ef91307cf521e62a1fe62fd4ca519e77ef1b49a8ae5c27673480625f51",
+      "family": "common-quantization"
+    },
+    {
+      "path": "tests/upstream_prism/reference_reasoning.rs",
+      "bytes": 17855,
+      "sha256": "097295b3ab74d33c7e40840b8b52b627928af2e5ae932e834d6aa378b164ef6f",
+      "family": "common-reasoning-budget"
+    },
+    {
+      "path": "tests/upstream_prism/reference_sampling.rs",
+      "bytes": 47827,
+      "sha256": "4a15e98e063461b9a8cb342079f4cc2bd538af9e1561ac182b92efeb7ae14ca3",
+      "family": "common-sampling"
+    },
+    {
+      "path": "tests/upstream_prism/reference_tensor_graph.rs",
+      "bytes": 70779,
+      "sha256": "ed691b305a546af5a34c263cbfe39c4feaf36c9cba2aaaef494b85a312992295",
+      "family": "common-tensor-graph"
+    },
+    {
+      "path": "tests/upstream_prism/reference_threadpool.rs",
+      "bytes": 29345,
+      "sha256": "d2fec7e9b7f07f487e19369b5eb63a7d019e104b66c1fe355673a4214ecdf279",
+      "family": "common-threadpool"
+    },
+    {
+      "path": "tests/upstream_prism/reference_unicode.rs",
+      "bytes": 19173,
+      "sha256": "786bb1dc8e264d13b0d29c3b37e20881c9b6b05afb8a66eaff4012004073fc84",
+      "family": "common-bridge"
+    },
+    {
+      "path": "tests/upstream_prism/sampling-cases.json",
+      "bytes": 23880,
+      "sha256": "a53bd147cba5f1ae941327b9ecac03701123f3e2dd69f4a90d49f57ca470c736",
+      "family": "common-sampling"
+    },
+    {
+      "path": "tests/upstream_prism/sampling.rs",
+      "bytes": 34875,
+      "sha256": "a26a2f608ad71f9c0e3a1ee0bafdab828ea6e780a873ad31c1d331d7f38856be",
+      "family": "common-sampling"
+    },
+    {
+      "path": "tests/upstream_prism/schema_python.rs",
+      "bytes": 5854,
+      "sha256": "999faf158345f6733b38ce46095024875edbdea380f532c65e008fe693f47f8b",
+      "family": "common-json-schema"
+    },
+    {
+      "path": "tests/upstream_prism/validator.rs",
+      "bytes": 13396,
+      "sha256": "3078eed662f3303976302ddea95c422746fae6345cb5207d0918ed18f4f8d0e6",
+      "family": "common-grammar"
+    },
+    {
+      "path": "tools/codec-probe/Cargo.toml",
+      "bytes": 880,
+      "sha256": "606e296ddef9ad73e6341eb2f993d10c0f1e214d896b0354d26303728b927439",
+      "family": "external-native"
+    },
+    {
+      "path": "tools/codec-probe/native.lock.json",
+      "bytes": 699,
+      "sha256": "cc1244b813b59bab411442c4bad400dcd14967f54f74246f998edc1abe554235",
+      "family": "external-native"
+    },
+    {
+      "path": "tools/prism/CMakeLists.txt",
+      "bytes": 1202,
+      "sha256": "ea3c31dcbd3c8655cef36ae7abd7273fa121ac2b7dabc21a973146393e207a6f",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/Cargo.toml",
+      "bytes": 790,
+      "sha256": "fcc48d2b81e927db845369af327eb53b18fff8fdbde45cc40da545c93f33130f",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/build.rs",
+      "bytes": 4285,
+      "sha256": "13ae0d33f3177538c41856fa41382ee1e388c5eed67d16f32105f0a97fe9b11b",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/src/loader.rs",
+      "bytes": 16929,
+      "sha256": "cc47295174dec551e51b0983cc46e94995b8d946542e097b5a9fa0ca93782f20",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/upstream/Apply-ReferencePatch.cmake",
+      "bytes": 1556,
+      "sha256": "1c50647d8334c59aaf1bdc004f790ef0c68766d274e1bb24f69dec2f25aa5b31",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/upstream/CMakeLists.txt",
+      "bytes": 1132,
+      "sha256": "eebaec09de0c2ad53cb0bd107dbb9121eeae8a1b2d167d80ab62dca1bf9c9412",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/upstream/LICENSE",
+      "bytes": 1099,
+      "sha256": "bcd8ec749126d45cb06737d0690295d73df4b6e7e194205bcf91190368f27285",
+      "family": "external-native"
+    },
+    {
+      "path": "tools/prism/upstream/RustBridge.cmake",
+      "bytes": 3794,
+      "sha256": "0c52498ee58c75d99630bb2097da4b2c896d388b1df3b637cdd058b153e936d8",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/upstream/baseline.json",
+      "bytes": 7240,
+      "sha256": "d8c75c5207a2cde0d250db32262be32d124d70bbbca54f254a67b9b5be6d1779",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tools/prism/upstream/bridge/native.rs",
+      "bytes": 7205,
+      "sha256": "6df2f8016b891ab19945a8bf5b0ef37cb83fcbc79151584177fbc2f7c51995d0",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/upstream/catalog.json",
+      "bytes": 13696,
+      "sha256": "4293dcedddbe3cac5ffbbe273fc70de2d531246ef6b0b3c85cc74e01d0ccbf4b",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tools/prism/upstream/common/CMakeLists.txt",
+      "bytes": 3845,
+      "sha256": "5007ec15a06225dd67096fb139a54fa5a4b00def8898ba817c2ff49163e704bd",
+      "family": "native-build"
+    },
+    {
+      "path": "tools/prism/upstream/llguidance.lock.json",
+      "bytes": 870,
+      "sha256": "5d6fa36c0669be2e7fe50e594a76b53adafe088c6eb233591bd2b7b6a6c4ea9b",
+      "family": "external-native"
+    },
+    {
+      "path": "tools/prism/upstream/migration.json",
+      "bytes": 45715,
+      "sha256": "adbd80911f07725950975827da01d247f3bf72dff91772fdacae45c7745da752",
+      "family": "upstream-contracts"
+    },
+    {
+      "path": "tools/prism/upstream/reference-patches.lock.json",
+      "bytes": 1903,
+      "sha256": "5a5fc96d05469640b524c2d9d583cfd27c810b9be94eb5e1f0630d04b02dea88",
+      "family": "external-native"
+    }
+  ]
 }
