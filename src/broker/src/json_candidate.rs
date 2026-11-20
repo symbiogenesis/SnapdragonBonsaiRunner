@@ -12,6 +12,7 @@ fn canonical(body: &[u8], candidate: bool, pinned: bool) -> Result<Vec<u8>, Reje
         length: body.len(),
         pinned_abliteration: pinned,
         daisyrose_lora: false,
+        daisyrose_default_scale_tenths: 0,
         context_tokens: crate::CONTEXT_TOKENS,
         vision: false,
     };
@@ -45,6 +46,7 @@ fn reused_canonical(
                 length: body.len(),
                 pinned_abliteration: pinned,
                 daisyrose_lora: false,
+                daisyrose_default_scale_tenths: 0,
                 context_tokens: crate::CONTEXT_TOKENS,
                 vision: false,
             },
@@ -197,6 +199,29 @@ fn fixed_candidate_preserves_serde_scale_lexemes() {
         }
     }
     parity(br#"{"messages":[{"role":"user","content":"a"}],"abliteration_scale":1,"abliteration_\u0073cale":2}"#, true);
+    let mut scratch = JsonCandidateScratch::default();
+    for body in [
+        br#"{"messages":[{"role":"user","content":"rain"}]}"#.as_slice(),
+        br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":0.0}"#,
+        br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":0.5}"#,
+    ] {
+        let head = || AuthorizedHead {
+            length: body.len(),
+            pinned_abliteration: true,
+            daisyrose_lora: true,
+            daisyrose_default_scale_tenths: 10,
+            context_tokens: crate::CONTEXT_TOKENS,
+            vision: false,
+        };
+        assert_eq!(
+            head().prepare_simd_json(body).map(|chat| chat.body),
+            head().prepare(body).map(|chat| chat.body)
+        );
+        assert_eq!(
+            scratch.prepare(head(), body).map(|chat| chat.body),
+            head().prepare(body).map(|chat| chat.body)
+        );
+    }
 }
 
 fn history(count: usize) -> Result<Vec<u8>, serde_json::Error> {

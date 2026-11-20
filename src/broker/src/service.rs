@@ -276,6 +276,22 @@ impl LocalChatService {
         self.policy.vision
     }
 
+    /// Whether the stackable DaisyRose multi-rank `LoRA` adapter is loaded on this service.
+    #[must_use]
+    pub const fn daisyrose_enabled(&self) -> bool {
+        self.policy.daisyrose_lora
+    }
+
+    /// Default DaisyRose `LoRA` scale expressed in tenths (`0..=20`), or `0` when unavailable.
+    #[must_use]
+    pub const fn daisyrose_default_scale_tenths(&self) -> u8 {
+        if self.policy.daisyrose_lora {
+            self.policy.daisyrose_default_scale_tenths
+        } else {
+            0
+        }
+    }
+
     /// Enable bounded multimodal image parts on this service's frontend policy.
     pub const fn enable_vision(&mut self) {
         self.policy.vision = true;
@@ -314,9 +330,20 @@ impl LocalChatService {
     }
 
     /// Only the owned launcher can enable the already verified stackable DaisyRose adapter.
+    ///
+    /// # Errors
+    /// Rejects default scales outside `0..=20` tenths (`0.0..=2.0`).
     #[cfg(windows)]
-    pub(crate) const fn enable_daisyrose_lora(&mut self) {
+    pub(crate) fn enable_daisyrose_lora(
+        &mut self,
+        default_scale_tenths: u8,
+    ) -> Result<(), ServiceError> {
+        if default_scale_tenths > 20 {
+            return Err(ServiceError::Configuration);
+        }
         self.policy.daisyrose_lora = true;
+        self.policy.daisyrose_default_scale_tenths = default_scale_tenths;
+        Ok(())
     }
 
     /// Enable in-place `POST /reset` recovery when a client cancels active generation.

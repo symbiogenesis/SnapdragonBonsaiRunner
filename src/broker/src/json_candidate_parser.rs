@@ -95,6 +95,7 @@ mod tests {
             length: declared_length,
             pinned_abliteration: pinned,
             daisyrose_lora: false,
+            daisyrose_default_scale_tenths: 0,
             context_tokens: crate::CONTEXT_TOKENS,
             vision: false,
         };
@@ -146,6 +147,7 @@ mod tests {
                         length: oversized.len(),
                         pinned_abliteration: false,
                         daisyrose_lora: false,
+                        daisyrose_default_scale_tenths: 0,
                         context_tokens: crate::CONTEXT_TOKENS,
                         vision: false,
                     },

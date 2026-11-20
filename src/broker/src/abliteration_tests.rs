@@ -11,11 +11,21 @@ fn prepare_with(
     orca_enabled: bool,
     daisyrose_enabled: bool,
 ) -> Result<PendingChat, Rejection> {
+    prepare_with_default(body, orca_enabled, daisyrose_enabled, 0)
+}
+
+fn prepare_with_default(
+    body: &[u8],
+    orca_enabled: bool,
+    daisyrose_enabled: bool,
+    daisyrose_default_scale_tenths: u8,
+) -> Result<PendingChat, Rejection> {
     let key = "a".repeat(64);
     let mut policy = RequestPolicy::new(8080, &key)?;
     // Production can set this only inside the owned launcher's verified service.
     policy.pinned_abliteration = orca_enabled;
     policy.daisyrose_lora = daisyrose_enabled;
+    policy.daisyrose_default_scale_tenths = daisyrose_default_scale_tenths;
     let request = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -157,6 +167,44 @@ fn stacked_daisyrose_lora_defaults_to_zero_maps_slot_ids_and_rejects_when_unconf
     assert_eq!(daisy_only["lora"], json!([{"id": 0, "scale": 0.5}]));
     let daisy_only_default = canonical_with(CHAT, false, true)?;
     assert_eq!(daisy_only_default["lora"], json!([{"id": 0, "scale": 0.0}]));
+    Ok(())
+}
+
+#[test]
+fn stacked_daisyrose_lora_uses_configured_default_scale_and_preserves_explicit_override()
+-> Result<(), Rejection> {
+    let canonical_default = |body: &[u8], orca: bool, tenths: u8| -> Result<Value, Rejection> {
+        let admitted = prepare_with_default(body, orca, true, tenths)?.admit(|_| Ok(1))?;
+        serde_json::from_slice(admitted.backend_body()).map_err(|_| Rejection::ChatSchema)
+    };
+
+    // Omitted daisyrose_scale picks up the promoted lock default (1.0).
+    assert_eq!(
+        canonical_default(CHAT, true, 10)?["lora"],
+        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 1.0}])
+    );
+    assert_eq!(
+        canonical_default(CHAT, false, 10)?["lora"],
+        json!([{"id": 0, "scale": 1.0}])
+    );
+
+    // Explicit 0.0 and 0.5 overrides still beat the default scale.
+    let explicit_zero =
+        br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.0}"#;
+    let explicit_half =
+        br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.5}"#;
+    assert_eq!(
+        canonical_default(explicit_zero, true, 10)?["lora"],
+        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.0}])
+    );
+    assert_eq!(
+        canonical_default(explicit_half, true, 10)?["lora"],
+        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}])
+    );
+    assert_eq!(
+        canonical_default(explicit_zero, false, 10)?["lora"],
+        json!([{"id": 0, "scale": 0.0}])
+    );
     Ok(())
 }
 

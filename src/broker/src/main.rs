@@ -146,8 +146,14 @@ fn launched(args: Vec<OsString>) -> ExitCode {
         } else {
             "text"
         };
+        let daisyrose_status = if owner.daisyrose_enabled() {
+            let tenths = owner.daisyrose_default_scale_tenths();
+            format!("available, default scale {}.{}", tenths / 10, tenths % 10)
+        } else {
+            "unavailable".to_owned()
+        };
         let notice = format!(
-            "DEVELOPMENT ONLY: owned {profile_name} backend ready; listening on http://127.0.0.1:{}.\nContext tokens: {}\nInput modalities: {modalities}\n{context_note}Protected credentials and technical evidence: {}\n{containment} Ctrl-C stops the complete owned Job.\n",
+            "DEVELOPMENT ONLY: owned {profile_name} backend ready; listening on http://127.0.0.1:{}.\nContext tokens: {}\nInput modalities: {modalities}\nDaisyRose adapter: {daisyrose_status}\n{context_note}Protected credentials and technical evidence: {}\n{containment} Ctrl-C stops the complete owned Job.\n",
             owner.port(), owner.context_tokens(), owner.evidence_directory().display()
         );
         let notified = std::io::stdout().write_all(notice.as_bytes()).is_ok();

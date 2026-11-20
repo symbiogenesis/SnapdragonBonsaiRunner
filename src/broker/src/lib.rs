@@ -145,6 +145,7 @@ pub struct RequestPolicy {
     authorization: [u8; 71], // "Bearer " + 64 lowercase hex characters
     pinned_abliteration: bool,
     daisyrose_lora: bool,
+    daisyrose_default_scale_tenths: u8,
     context_tokens: usize,
     pub(crate) vision: bool,
 }
@@ -190,6 +191,7 @@ impl RequestPolicy {
             authorization,
             pinned_abliteration: false,
             daisyrose_lora: false,
+            daisyrose_default_scale_tenths: 0,
             context_tokens: CONTEXT_TOKENS,
             vision: false,
         })
@@ -342,6 +344,7 @@ impl RequestPolicy {
             length,
             pinned_abliteration: self.pinned_abliteration,
             daisyrose_lora: self.daisyrose_lora,
+            daisyrose_default_scale_tenths: self.daisyrose_default_scale_tenths,
             context_tokens: self.context_tokens,
             vision: self.vision,
         })
@@ -433,6 +436,7 @@ pub struct AuthorizedHead {
     length: usize,
     pinned_abliteration: bool,
     daisyrose_lora: bool,
+    daisyrose_default_scale_tenths: u8,
     context_tokens: usize,
     vision: bool,
 }
@@ -509,6 +513,7 @@ impl AuthorizedHead {
         if chat.daisyrose_scale.is_some() && !self.daisyrose_lora {
             return Err(Rejection::ChatSchema);
         }
+        let default_daisyrose = f64::from(self.daisyrose_default_scale_tenths) / 10.0;
         let lora = match (self.pinned_abliteration, self.daisyrose_lora) {
             (true, false) => Some(vec![PinnedLora {
                 id: 0,
@@ -521,12 +526,12 @@ impl AuthorizedHead {
                 },
                 PinnedLora {
                     id: 1,
-                    scale: chat.daisyrose_scale.unwrap_or(0.0),
+                    scale: chat.daisyrose_scale.unwrap_or(default_daisyrose),
                 },
             ]),
             (false, true) => Some(vec![PinnedLora {
                 id: 0,
-                scale: chat.daisyrose_scale.unwrap_or(0.0),
+                scale: chat.daisyrose_scale.unwrap_or(default_daisyrose),
             }]),
             (false, false) => None,
         };

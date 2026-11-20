@@ -63,7 +63,8 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--reset-on-cancel] (reviewed native runtime only; reset live state in place on client cancel)\n",
     "  [--no-mmproj] (disable multimodal vision projector; Swift only)\n",
     "  [--use-abliterate-lora] (pinned adapter; request scale 0..2, default 1.3; Swift CPU only)\n",
-    "  [--daisyrose-lora <absolute-gguf>] (stackable multi-rank NpuFriendly LoRA; native Swift only; request scale 0..2, default 0.0)\n",
+    "  [--daisyrose-lora <absolute-gguf>] (stackable multi-rank NpuFriendly LoRA; native Swift only; request scale 0..2, default 0.0 unless promoted lock)\n",
+    "  [--no-daisyrose-lora] (disable any default-enabled DaisyRose adapter; native Swift only)\n",
     "  [--use-repacked-ptq1|--use-original-pq2] (mutually exclusive weight selections; Swift CPU only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
     "Default: reference-cpu. Only compiled model/runtime pins and fixed CPU policies are accepted.\n",
@@ -156,6 +157,7 @@ pub struct LaunchConfig {
     no_mmproj: bool,
     use_abliterate_lora: bool,
     daisyrose_lora: Option<PathBuf>,
+    no_daisyrose_lora: bool,
     weight_representation: WeightRepresentation,
 }
 
@@ -166,11 +168,26 @@ pub struct LaunchCheck {
     pub memory_admitted: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DaisyRoseSelection {
+    Explicit(PathBuf),
+    Promoted {
+        artifact: Box<bonsai_cpu_policy::DaisyRoseLoraArtifact>,
+        explicitly_passed: bool,
+    },
+}
+
+struct VerifiedDaisyRose {
+    guard: bonsai_artifacts::VerifiedMultiRankAdapter,
+    default_scale_tenths: u8,
+    sheddable: bool,
+}
+
 struct VerifiedLaunchGuards {
     native_executable: Option<(PathBuf, bonsai_artifacts::VerifiedFile)>,
     artifacts: VerifiedArtifacts,
     adapter: Option<bonsai_artifacts::VerifiedFile>,
-    daisyrose: Option<bonsai_artifacts::VerifiedMultiRankAdapter>,
+    daisyrose: Option<VerifiedDaisyRose>,
     mmproj: Option<(
         bonsai_cpu_policy::SwiftMmprojArtifact,
         bonsai_artifacts::VerifiedFile,
@@ -228,6 +245,7 @@ impl LaunchConfig {
         let mut no_mmproj = false;
         let mut use_abliterate_lora = false;
         let mut daisyrose_lora = None;
+        let mut no_daisyrose_lora = false;
         let mut use_repacked_ptq1 = None;
         let mut profile = None;
         let (mut data, mut evidence_parent) = (None, None);
@@ -302,6 +320,7 @@ impl LaunchConfig {
                     daisyrose_lora =
                         Some(PathBuf::from(args.next().ok_or(LaunchError::Arguments)?));
                 }
+                Some("--no-daisyrose-lora") if !no_daisyrose_lora => no_daisyrose_lora = true,
                 Some("--use-repacked-ptq1") if use_repacked_ptq1.is_none() => {
                     use_repacked_ptq1 = Some(true);
                 }
@@ -395,6 +414,7 @@ impl LaunchConfig {
             no_mmproj,
             use_abliterate_lora,
             daisyrose_lora,
+            no_daisyrose_lora,
             weight_representation: if use_repacked_ptq1.unwrap_or(false) {
                 WeightRepresentation::CurrentRepackedPtq1
             } else {
@@ -476,6 +496,7 @@ impl LaunchConfig {
             || (self.no_mmproj && !swift)
             || (self.use_abliterate_lora && !swift)
             || (self.daisyrose_lora.is_some() && (!swift || !self.native_engine))
+            || (self.no_daisyrose_lora && (!swift || self.daisyrose_lora.is_some()))
             || (explicit_weight && !swift)
         {
             return Err(LaunchError::Arguments);
@@ -631,6 +652,95 @@ impl LaunchConfig {
         .map_err(|_| LaunchError::Memory)
     }
 
+    fn resolve_calibrated_daisyrose_admission(
+        &self,
+        available_bytes: u64,
+        request_vision: bool,
+        daisyrose_reserve_bytes: u64,
+        daisyrose_sheddable: bool,
+    ) -> Result<(bonsai_cpu_policy::context::SwiftCalibratedPlan, bool), LaunchError> {
+        match self.calibrated_context_plan_with_daisyrose(
+            available_bytes,
+            request_vision,
+            daisyrose_reserve_bytes,
+        ) {
+            Ok(plan) => Ok((plan, daisyrose_reserve_bytes > 0)),
+            Err(LaunchError::Memory) if daisyrose_sheddable && daisyrose_reserve_bytes > 0 => {
+                let plan = self.calibrated_context_plan_with_daisyrose(
+                    available_bytes,
+                    request_vision,
+                    0,
+                )?;
+                Ok((plan, false))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn resolve_profile_daisyrose_admission(
+        &self,
+        available_bytes: u64,
+        request_vision: bool,
+        daisyrose_reserve_bytes: u64,
+        daisyrose_sheddable: bool,
+    ) -> Result<
+        (
+            bonsai_cpu_policy::context::SwiftContextPlan,
+            bool,
+            Option<usize>,
+            bool,
+        ),
+        LaunchError,
+    > {
+        let profile = self.swift_context_profile()?;
+        let prefill_tokens = self.cpu_prefill_tokens.map(usize::from);
+        let attempt_with = |reserve: u64| -> Result<
+            (
+                bonsai_cpu_policy::context::SwiftContextPlan,
+                bool,
+                Option<usize>,
+            ),
+            LaunchError,
+        > {
+            let budget = available_bytes
+                .checked_sub(reserve)
+                .ok_or(LaunchError::Memory)?;
+            let (mut context, vision_admitted, prefill_scratch) =
+                bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
+                    budget,
+                    profile,
+                    request_vision,
+                    prefill_tokens,
+                )
+                .map_err(|_| LaunchError::Memory)?;
+            if reserve > 0 {
+                let extra_usize = usize::try_from(reserve).map_err(|_| LaunchError::Memory)?;
+                context.memory_limit_bytes = context
+                    .memory_limit_bytes
+                    .checked_add(extra_usize)
+                    .ok_or(LaunchError::Memory)?;
+                context.required_available_bytes = context
+                    .required_available_bytes
+                    .checked_add(reserve)
+                    .ok_or(LaunchError::Memory)?;
+            }
+            Ok((context, vision_admitted, prefill_scratch))
+        };
+        match attempt_with(daisyrose_reserve_bytes) {
+            Ok((context, vision_admitted, prefill_scratch)) => Ok((
+                context,
+                vision_admitted,
+                prefill_scratch,
+                daisyrose_reserve_bytes > 0,
+            )),
+            Err(LaunchError::Memory) if daisyrose_sheddable && daisyrose_reserve_bytes > 0 => {
+                let (context, vision_admitted, prefill_scratch) = attempt_with(0)?;
+                Ok((context, vision_admitted, prefill_scratch, false))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     // Call only after the exact released runtime's context and cache-accounting
     // contract is admitted. Cache selection remains immutable through retry.
     #[cfg(test)]
@@ -717,19 +827,28 @@ impl LaunchConfig {
             .daisyrose
             .as_ref()
             .and_then(|d| {
-                bonsai_cpu_policy::context::MultiRankAdapterBudget::from_verified_bytes(d.bytes())?
-                    .total_bytes()
+                bonsai_cpu_policy::context::MultiRankAdapterBudget::from_verified_bytes(
+                    d.guard.bytes(),
+                )?
+                .total_bytes()
             })
             .unwrap_or(0);
+        let daisyrose_sheddable = guards.daisyrose.as_ref().is_some_and(|d| d.sheddable);
         let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
         let memory_admitted = if self.memory_context_supported()? {
             self.swift_context_plan_with_daisyrose(available, daisyrose_reserve)
                 .is_ok()
+                || (daisyrose_sheddable
+                    && daisyrose_reserve > 0
+                    && self.swift_context_plan_with_daisyrose(available, 0).is_ok())
         } else {
             available
                 >= plan
                     .required_available_bytes
                     .saturating_add(daisyrose_reserve)
+                || (daisyrose_sheddable
+                    && daisyrose_reserve > 0
+                    && available >= plan.required_available_bytes)
         };
         Ok(LaunchCheck { memory_admitted })
     }
@@ -795,23 +914,112 @@ impl LaunchConfig {
             .transpose()
     }
 
-    fn daisyrose_guard(
+    fn resolve_daisyrose_selection(&self) -> Result<Option<DaisyRoseSelection>, LaunchError> {
+        let pinned = bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&self.data)
+            .map_err(|_| LaunchError::Policy)?;
+        let multi_rank_supported = crate::inference::multi_rank_lora_supported()?;
+        self.resolve_daisyrose_selection_with(pinned, multi_rank_supported)
+    }
+
+    fn resolve_daisyrose_selection_with(
         &self,
-    ) -> Result<Option<bonsai_artifacts::VerifiedMultiRankAdapter>, LaunchError> {
+        pinned: Option<bonsai_cpu_policy::DaisyRoseLoraArtifact>,
+        multi_rank_supported: bool,
+    ) -> Result<Option<DaisyRoseSelection>, LaunchError> {
+        if self.no_daisyrose_lora
+            || !self.native_engine
+            || self.profile != LaunchProfile::SwiftPq2Assessment
+        {
+            return Ok(None);
+        }
+        if let Some(explicit) = &self.daisyrose_lora {
+            if !multi_rank_supported {
+                return Err(LaunchError::NativeRuntime);
+            }
+            if let Some(artifact) = pinned.filter(|artifact| {
+                artifact.default_enabled && paths_match(explicit, &artifact.path)
+            }) {
+                return Ok(Some(DaisyRoseSelection::Promoted {
+                    artifact: Box::new(artifact),
+                    explicitly_passed: true,
+                }));
+            }
+            return Ok(Some(DaisyRoseSelection::Explicit(explicit.clone())));
+        }
+        if !multi_rank_supported {
+            return Ok(None);
+        }
+        Ok(pinned
+            .filter(|artifact| artifact.default_enabled)
+            .map(|artifact| DaisyRoseSelection::Promoted {
+                artifact: Box::new(artifact),
+                explicitly_passed: false,
+            }))
+    }
+
+    fn verify_daisyrose_selection(
+        selection: &DaisyRoseSelection,
+    ) -> Result<Option<VerifiedDaisyRose>, LaunchError> {
         const MAX_DAISYROSE_RANK: u16 = 32;
         const MAX_DAISYROSE_BYTES: u64 = 512 * 1024 * 1024;
-        self.daisyrose_lora
-            .as_ref()
-            .map(|path| {
-                bonsai_artifacts::verify_multi_rank_lora_gguf(
+        match selection {
+            DaisyRoseSelection::Explicit(path) => {
+                validate_external_path(path).map_err(|_| LaunchError::Path)?;
+                if !path.is_file() {
+                    return Err(LaunchError::Adapter);
+                }
+                let guard = bonsai_artifacts::verify_multi_rank_lora_gguf(
                     path,
                     MAX_DAISYROSE_RANK,
                     MAX_DAISYROSE_BYTES,
                     bonsai_artifacts::MultiRankEnvelope::NpuFriendly,
                 )
-                .map_err(|_| LaunchError::Adapter)
-            })
-            .transpose()
+                .map_err(|_| LaunchError::Adapter)?;
+                Ok(Some(VerifiedDaisyRose {
+                    guard,
+                    default_scale_tenths: 0,
+                    sheddable: false,
+                }))
+            }
+            DaisyRoseSelection::Promoted {
+                artifact,
+                explicitly_passed,
+            } => {
+                validate_external_path(&artifact.path).map_err(|_| LaunchError::Path)?;
+                match std::fs::symlink_metadata(&artifact.path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound && !explicitly_passed => {
+                        return Ok(None);
+                    }
+                    Err(_) => return Err(LaunchError::Adapter),
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                        return Err(LaunchError::Adapter);
+                    }
+                    Ok(_) => {}
+                }
+                if artifact.envelope != "npu-friendly" {
+                    return Err(LaunchError::Policy);
+                }
+                let guard = bonsai_artifacts::verify_multi_rank_lora_gguf(
+                    &artifact.path,
+                    artifact.max_rank,
+                    artifact.bytes,
+                    bonsai_artifacts::MultiRankEnvelope::NpuFriendly,
+                )
+                .map_err(|_| LaunchError::Adapter)?;
+                if guard.bytes() != artifact.bytes
+                    || guard.sha256() != artifact.sha256
+                    || guard.max_rank() > artifact.max_rank
+                    || guard.target_count() != artifact.target_count
+                {
+                    return Err(LaunchError::Adapter);
+                }
+                Ok(Some(VerifiedDaisyRose {
+                    guard,
+                    default_scale_tenths: artifact.effective_default_scale_tenths(),
+                    sheddable: true,
+                }))
+            }
+        }
     }
 
     fn mmproj_guard(
@@ -880,6 +1088,7 @@ impl LaunchConfig {
         plan: &LaunchPlan,
     ) -> Result<VerifiedLaunchGuards, LaunchError> {
         let verify_vision = self.runtime_supports_vision()?;
+        let daisyrose_selection = self.resolve_daisyrose_selection()?;
         std::thread::scope(|scope| {
             let native_handle = self
                 .native_engine
@@ -888,10 +1097,9 @@ impl LaunchConfig {
                 .adapter
                 .is_some()
                 .then(|| scope.spawn(|| Self::adapter_guard(plan)));
-            let daisyrose_handle = self
-                .daisyrose_lora
-                .is_some()
-                .then(|| scope.spawn(|| self.daisyrose_guard()));
+            let daisyrose_handle = daisyrose_selection
+                .as_ref()
+                .map(|selection| scope.spawn(|| Self::verify_daisyrose_selection(selection)));
             let mmproj_handle = verify_vision.then(|| scope.spawn(|| self.mmproj_guard()));
 
             let artifacts_result = self.verify_artifacts(plan);
@@ -1307,10 +1515,13 @@ impl LaunchConfig {
         let daisyrose_reserve_bytes = daisyrose
             .as_ref()
             .and_then(|d| {
-                bonsai_cpu_policy::context::MultiRankAdapterBudget::from_verified_bytes(d.bytes())?
-                    .total_bytes()
+                bonsai_cpu_policy::context::MultiRankAdapterBudget::from_verified_bytes(
+                    d.guard.bytes(),
+                )?
+                .total_bytes()
             })
             .unwrap_or(0);
+        let daisyrose_sheddable = daisyrose.as_ref().is_some_and(|d| d.sheddable);
         startup_timing.phase(StartupPhase::AdapterVerification);
         if poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_ready())).await {
             return Err(LaunchError::Cancelled);
@@ -1370,23 +1581,25 @@ impl LaunchConfig {
             let mut active_mmproj = mmproj_artifact.clone();
             let calibrated_admission = self.native_engine
                 && crate::inference::calibrated_cow_admission_supported().unwrap_or(false);
-            if memory_context_supported {
+            let daisyrose_admitted = if memory_context_supported {
                 let raw_available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
                 let retry_margin = u64::try_from(attempt)
                     .unwrap_or(0)
                     .saturating_mul(bonsai_cpu_policy::context::STARTUP_RESERVE_BYTES);
                 let available = raw_available.saturating_sub(retry_margin);
                 if calibrated_admission {
-                    let calibrated = match self.calibrated_context_plan_with_daisyrose(
+                    let (calibrated, admitted) = match self.resolve_calibrated_daisyrose_admission(
                         available,
                         active_mmproj.is_some(),
                         daisyrose_reserve_bytes,
+                        daisyrose_sheddable,
                     ) {
                         Ok(result) => result,
-                        Err(_) if attempt > 0 => self.calibrated_context_plan_with_daisyrose(
+                        Err(_) if attempt > 0 => self.resolve_calibrated_daisyrose_admission(
                             raw_available,
                             active_mmproj.is_some(),
                             daisyrose_reserve_bytes,
+                            daisyrose_sheddable,
                         )?,
                         Err(_) => return Err(LaunchError::Memory),
                     };
@@ -1402,6 +1615,7 @@ impl LaunchConfig {
                         .effective_speculation_tokens()
                         .zip(calibrated.speculation_reserves)
                         .map(|(tokens, (verify, checkpoint))| (tokens, verify, checkpoint));
+                    daisyrose.is_some() && admitted
                 } else {
                     if self.effective_speculation_tokens().is_some()
                         || self.cpu_prefill_gdn.is_some()
@@ -1412,59 +1626,40 @@ impl LaunchConfig {
                     {
                         return Err(LaunchError::NativeRuntime);
                     }
-                    let profile = self.swift_context_profile()?;
-                    let budget = available
-                        .checked_sub(daisyrose_reserve_bytes)
-                        .ok_or(LaunchError::Memory)?;
-                    let (mut context, vision_admitted, prefill_scratch) =
-                        match bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
-                            budget,
-                            profile,
+                    let (context, vision_admitted, prefill_scratch, admitted) = match self
+                        .resolve_profile_daisyrose_admission(
+                            available,
                             active_mmproj.is_some(),
-                            self.cpu_prefill_tokens.map(usize::from),
+                            daisyrose_reserve_bytes,
+                            daisyrose_sheddable,
                         ) {
-                            Ok(result) => result,
-                            Err(_) if attempt > 0 => {
-                                let raw_budget = raw_available
-                                    .checked_sub(daisyrose_reserve_bytes)
-                                    .ok_or(LaunchError::Memory)?;
-                                // If the extra retry margin pushed below minimum context, try raw available RAM.
-                                bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
-                                    raw_budget,
-                                    profile,
-                                    active_mmproj.is_some(),
-                                    self.cpu_prefill_tokens.map(usize::from),
-                                )
-                                .map_err(|_| LaunchError::Memory)?
-                            }
-                            Err(_) => return Err(LaunchError::Memory),
-                        };
+                        Ok(result) => result,
+                        Err(_) if attempt > 0 => self.resolve_profile_daisyrose_admission(
+                            raw_available,
+                            active_mmproj.is_some(),
+                            daisyrose_reserve_bytes,
+                            daisyrose_sheddable,
+                        )?,
+                        Err(_) => return Err(LaunchError::Memory),
+                    };
                     if !vision_admitted {
                         active_mmproj = None;
-                    }
-                    if daisyrose_reserve_bytes > 0 {
-                        let extra_usize = usize::try_from(daisyrose_reserve_bytes)
-                            .map_err(|_| LaunchError::Memory)?;
-                        context.memory_limit_bytes = context
-                            .memory_limit_bytes
-                            .checked_add(extra_usize)
-                            .ok_or(LaunchError::Memory)?;
-                        context.required_available_bytes = context
-                            .required_available_bytes
-                            .checked_add(daisyrose_reserve_bytes)
-                            .ok_or(LaunchError::Memory)?;
                     }
                     plan.select_swift_context(context)
                         .map_err(|_| LaunchError::Policy)?;
                     plan.cpu_prefill = self.cpu_prefill_tokens.zip(prefill_scratch);
+                    daisyrose.is_some() && admitted
                 }
-            }
-            if let Some(d) = &daisyrose {
+            } else {
+                daisyrose.is_some()
+            };
+            let active_daisyrose = daisyrose_admitted.then(|| daisyrose.as_ref()).flatten();
+            if let Some(d) = active_daisyrose {
                 plan.enable_daisyrose_lora(crate::launch_policy::DaisyRoseLoraPlan {
-                    path: d.path().to_path_buf(),
-                    bytes: d.bytes(),
-                    sha256: d.sha256().to_owned(),
-                    max_rank: d.max_rank(),
+                    path: d.guard.path().to_path_buf(),
+                    bytes: d.guard.bytes(),
+                    sha256: d.guard.sha256().to_owned(),
+                    max_rank: d.guard.max_rank(),
                 })
                 .map_err(|_| LaunchError::Policy)?;
             }
@@ -1501,7 +1696,7 @@ impl LaunchConfig {
                 &specification,
                 &artifacts,
                 adapter.as_ref(),
-                daisyrose.as_ref(),
+                active_daisyrose.map(|d| &d.guard),
                 active_mmproj_guard,
                 &credentials,
                 broker_pipe,
@@ -1606,19 +1801,20 @@ impl LaunchConfig {
                     &models,
                     context_tokens,
                     vision_enabled,
-                    daisyrose.as_ref().map(|d| (d.sha256(), d.max_rank())),
+                    active_daisyrose.map(|d| (d.guard.sha256(), d.guard.max_rank())),
                     cpu_prefill,
                     cpu_speculation,
                 )?;
             }
             startup_timing.phase(StartupPhase::FrontendBinding);
+            let daisyrose_default_scale_tenths = active_daisyrose.map(|d| d.default_scale_tenths);
             let service = self
                 .bind_frontend(
                     &process,
                     &credentials,
                     pipe_backend,
                     adapter.is_some(),
-                    daisyrose.is_some(),
+                    daisyrose_default_scale_tenths,
                     context_tokens,
                     vision_enabled,
                 )
@@ -1630,7 +1826,11 @@ impl LaunchConfig {
                 credentials,
                 _artifacts: artifacts,
                 _adapter: adapter,
-                _daisyrose: daisyrose,
+                _daisyrose: if daisyrose_admitted {
+                    daisyrose.map(|d| d.guard)
+                } else {
+                    None
+                },
                 _mmproj: vision_enabled.then_some(mmproj_file).flatten(),
                 _native_executable: native_executable,
                 memory_limit_bytes: specification.memory_limit_bytes,
@@ -1648,7 +1848,7 @@ impl LaunchConfig {
         credentials: &PrivateCredentials,
         pipe_backend: Option<crate::pipe_transport::PipeBackend>,
         adapter: bool,
-        daisyrose_adapter: bool,
+        daisyrose_default_scale_tenths: Option<u8>,
         context_tokens: usize,
         vision_enabled: bool,
     ) -> Result<LocalChatService, LaunchError> {
@@ -1683,8 +1883,11 @@ impl LaunchConfig {
         if adapter {
             service.enable_pinned_abliteration();
         }
-        if daisyrose_adapter {
-            service.enable_daisyrose_lora();
+        if let Some(default_scale_tenths) = daisyrose_default_scale_tenths
+            && service.enable_daisyrose_lora(default_scale_tenths).is_err()
+        {
+            process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+            return Err(LaunchError::Service);
         }
         if vision_enabled {
             service.enable_vision();
@@ -1736,6 +1939,26 @@ impl LaunchConfig {
         }
         Ok(())
     }
+}
+
+fn paths_match(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(windows)]
+    if let (Some(a_str), Some(b_str)) = (a.to_str(), b.to_str()) {
+        fn normalize(text: &str) -> impl Iterator<Item = u8> + '_ {
+            text.bytes().map(|byte| {
+                if byte == b'/' {
+                    b'\\'
+                } else {
+                    byte.to_ascii_lowercase()
+                }
+            })
+        }
+        return normalize(a_str).eq(normalize(b_str));
+    }
+    false
 }
 
 fn preflight_frontend_port(port: u16) -> Result<(), LaunchError> {
@@ -1995,6 +2218,16 @@ impl LaunchedService {
     /// Whether the active supervised backend admits multimodal image context.
     pub const fn vision_enabled(&self) -> bool {
         self.service.vision_enabled()
+    }
+
+    /// Whether the stackable DaisyRose multi-rank `LoRA` adapter is active.
+    pub const fn daisyrose_enabled(&self) -> bool {
+        self.service.daisyrose_enabled()
+    }
+
+    /// Default DaisyRose `LoRA` scale in tenths (`0..=20`), or `0` when unavailable.
+    pub const fn daisyrose_default_scale_tenths(&self) -> u8 {
+        self.service.daisyrose_default_scale_tenths()
     }
 
     /// Protected evidence directory; contains credentials, so share only selected logs.
@@ -3162,6 +3395,411 @@ mod tests {
                 .array_windows()
                 .any(|[f, v]| f == "--daisyrose-lora-sha256" && v == daisy_sha.as_str())
         );
+        Ok(())
+    }
+
+    fn build_test_daisyrose_gguf(path: &std::path::Path, rank: u16) -> std::io::Result<String> {
+        let mut kv = Vec::new();
+        let push_str = |out: &mut Vec<u8>, s: &str| {
+            let len = u64::try_from(s.len()).unwrap_or(0);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        };
+        let push_kv_str = |out: &mut Vec<u8>, key: &str, val: &str| {
+            push_str(out, key);
+            out.extend_from_slice(&8_u32.to_le_bytes());
+            push_str(out, val);
+        };
+        let push_kv_f32 = |out: &mut Vec<u8>, key: &str, val: f32| {
+            push_str(out, key);
+            out.extend_from_slice(&6_u32.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        };
+        let push_kv_u32 = |out: &mut Vec<u8>, key: &str, val: u32| {
+            push_str(out, key);
+            out.extend_from_slice(&4_u32.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        };
+        push_kv_str(&mut kv, "general.type", "adapter");
+        push_kv_str(&mut kv, "adapter.type", "lora");
+        push_kv_f32(&mut kv, "adapter.lora.alpha", 16.0);
+        push_kv_f32(&mut kv, "adapter.lora_alpha", 16.0);
+        push_kv_u32(&mut kv, "general.alignment", 32);
+
+        let r_u64 = u64::from(rank);
+        let a_data = [0x00_u8, 0x3c].repeat(4 * usize::from(rank));
+        let b_data = [0x00_u8, 0x3c].repeat(usize::from(rank) * 3);
+        let tensors = [
+            ("blk.0.ffn_down.weight.lora_a", [4_u64, r_u64], a_data),
+            ("blk.0.ffn_down.weight.lora_b", [r_u64, 3_u64], b_data),
+        ];
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3_u32.to_le_bytes());
+        out.extend_from_slice(&2_u64.to_le_bytes());
+        out.extend_from_slice(&5_u64.to_le_bytes());
+        out.extend_from_slice(&kv);
+
+        let mut offset = 0_usize;
+        for (name, dims, data) in &tensors {
+            push_str(&mut out, name);
+            out.extend_from_slice(&2_u32.to_le_bytes());
+            out.extend_from_slice(&dims[0].to_le_bytes());
+            out.extend_from_slice(&dims[1].to_le_bytes());
+            out.extend_from_slice(&1_u32.to_le_bytes());
+            out.extend_from_slice(&(u64::try_from(offset).unwrap_or(0)).to_le_bytes());
+            offset += data.len().next_multiple_of(32);
+        }
+        let header_padded = out.len().next_multiple_of(32);
+        out.resize(header_padded, 0);
+        for (_, _, data) in &tensors {
+            out.extend_from_slice(data);
+            let padded = data.len().next_multiple_of(32);
+            out.resize(out.len() + (padded - data.len()), 0);
+        }
+        std::fs::write(path, &out)?;
+        let expected = bonsai_artifacts::verify_multi_rank_lora_gguf(
+            path,
+            64,
+            u64::try_from(out.len()).map_err(std::io::Error::other)?,
+            bonsai_artifacts::MultiRankEnvelope::NpuFriendly,
+        )
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        Ok(expected.sha256().to_owned())
+    }
+
+    #[test]
+    fn daisyrose_no_flag_and_promoted_selection_rules() -> Result<(), LaunchError> {
+        let mut no_daisy = arguments();
+        no_daisy.extend(
+            [
+                "--profile",
+                "swift-pq2-assessment",
+                "--native-engine",
+                "--no-daisyrose-lora",
+            ]
+            .map(OsString::from),
+        );
+        let no_daisy_cfg = LaunchConfig::parse(no_daisy.clone())?;
+        assert!(no_daisy_cfg.no_daisyrose_lora);
+
+        let mut duplicate_no_daisy = no_daisy.clone();
+        duplicate_no_daisy.push("--no-daisyrose-lora".into());
+        assert_eq!(
+            LaunchConfig::parse(duplicate_no_daisy).err(),
+            Some(LaunchError::Arguments)
+        );
+
+        let mut conflict = no_daisy;
+        conflict.extend([
+            OsString::from("--daisyrose-lora"),
+            OsString::from(r"C:\ExternalData\daisy.gguf"),
+        ]);
+        assert_eq!(
+            LaunchConfig::parse(conflict).err(),
+            Some(LaunchError::Arguments)
+        );
+
+        let mut ref_no_daisy = arguments();
+        ref_no_daisy.push("--no-daisyrose-lora".into());
+        assert_eq!(
+            LaunchConfig::parse(ref_no_daisy).err(),
+            Some(LaunchError::Arguments)
+        );
+
+        let mut publisher_no_daisy = arguments();
+        publisher_no_daisy.extend(
+            [
+                "--profile",
+                "swift-pq2-assessment",
+                "--publisher-engine",
+                "--no-daisyrose-lora",
+            ]
+            .map(OsString::from),
+        );
+        let publisher_cfg = LaunchConfig::parse(publisher_no_daisy)?;
+
+        let promoted_path = std::path::PathBuf::from(r"C:\ExternalData\adapters\rev\daisy.gguf");
+        let promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact {
+            path: promoted_path.clone(),
+            bytes: 1024,
+            sha256: "a".repeat(64),
+            base_model_sha256: "b".repeat(64),
+            envelope: "npu-friendly".into(),
+            dtype: "f16".into(),
+            max_rank: 16,
+            target_count: 1,
+            repository: "symbiogenesis/DaisyRose-Swift-LoRA".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            filename: "daisy.gguf".into(),
+            url: "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/daisy.gguf".into(),
+            default_enabled: true,
+            default_scale_tenths: Some(10),
+        };
+        let mut unpromoted = promoted.clone();
+        unpromoted.default_enabled = false;
+
+        let mut base_args = arguments();
+        base_args.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        let base_cfg = LaunchConfig::parse(base_args)?;
+
+        assert_eq!(
+            base_cfg.resolve_daisyrose_selection_with(Some(promoted.clone()), false)?,
+            None
+        );
+        assert_eq!(
+            base_cfg.resolve_daisyrose_selection_with(Some(unpromoted), true)?,
+            None
+        );
+        assert_eq!(
+            base_cfg.resolve_daisyrose_selection_with(Some(promoted.clone()), true)?,
+            Some(super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(promoted.clone()),
+                explicitly_passed: false,
+            })
+        );
+        assert_eq!(
+            no_daisy_cfg.resolve_daisyrose_selection_with(Some(promoted.clone()), true)?,
+            None
+        );
+        assert_eq!(
+            publisher_cfg.resolve_daisyrose_selection_with(Some(promoted.clone()), true)?,
+            None
+        );
+
+        let mut explicit_matching = LaunchConfig::parse({
+            let mut args = arguments();
+            args.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+            args
+        })?;
+        explicit_matching.daisyrose_lora = Some(std::path::PathBuf::from(
+            r"c:/externaldata/adapters/rev/daisy.gguf",
+        ));
+        assert_eq!(
+            explicit_matching.resolve_daisyrose_selection_with(Some(promoted.clone()), false),
+            Err(LaunchError::NativeRuntime)
+        );
+        assert_eq!(
+            explicit_matching.resolve_daisyrose_selection_with(Some(promoted.clone()), true)?,
+            Some(super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(promoted.clone()),
+                explicitly_passed: true,
+            })
+        );
+
+        let other_path = std::path::PathBuf::from(r"C:\ExternalData\other.gguf");
+        explicit_matching.daisyrose_lora = Some(other_path.clone());
+        assert_eq!(
+            explicit_matching.resolve_daisyrose_selection_with(Some(promoted), true)?,
+            Some(super::DaisyRoseSelection::Explicit(other_path))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn daisyrose_promoted_verification_enforces_exact_lock_digest_and_missing_semantics()
+    -> std::io::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "Bonsai-daisyrose-verify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(std::io::Error::other)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let gguf_path = dir.join("daisy-test.gguf");
+        let sha256 = build_test_daisyrose_gguf(&gguf_path, 4)?;
+        let bytes = std::fs::metadata(&gguf_path)?.len();
+
+        let promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact {
+            path: gguf_path.clone(),
+            bytes,
+            sha256: sha256.clone(),
+            base_model_sha256: "b".repeat(64),
+            envelope: "npu-friendly".into(),
+            dtype: "f16".into(),
+            max_rank: 4,
+            target_count: 1,
+            repository: "symbiogenesis/DaisyRose-Swift-LoRA".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            filename: "daisy-test.gguf".into(),
+            url: "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/daisy-test.gguf".into(),
+            default_enabled: true,
+            default_scale_tenths: Some(10),
+        };
+
+        let verified =
+            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(promoted.clone()),
+                explicitly_passed: false,
+            })
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+            .ok_or_else(|| std::io::Error::other("Expected verified DaisyRose"))?;
+        assert_eq!(verified.default_scale_tenths, 10);
+        assert!(verified.sheddable);
+        assert_eq!(verified.guard.sha256(), sha256);
+        assert_eq!(verified.guard.bytes(), bytes);
+        drop(verified);
+
+        let mut bad_hash = promoted.clone();
+        bad_hash.sha256 = "0".repeat(64);
+        assert_eq!(
+            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(bad_hash),
+                explicitly_passed: false,
+            })
+            .err(),
+            Some(LaunchError::Adapter)
+        );
+
+        let mut bad_bytes = promoted.clone();
+        bad_bytes.bytes = bytes.saturating_sub(1);
+        assert_eq!(
+            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(bad_bytes),
+                explicitly_passed: false,
+            })
+            .err(),
+            Some(LaunchError::Adapter)
+        );
+
+        let mut bad_targets = promoted.clone();
+        bad_targets.target_count = 2;
+        assert_eq!(
+            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(bad_targets),
+                explicitly_passed: false,
+            })
+            .err(),
+            Some(LaunchError::Adapter)
+        );
+
+        let mut bad_rank = promoted.clone();
+        bad_rank.max_rank = 3;
+        assert_eq!(
+            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(bad_rank),
+                explicitly_passed: false,
+            })
+            .err(),
+            Some(LaunchError::Adapter)
+        );
+
+        let mut missing = promoted;
+        missing.path = dir.join("missing.gguf");
+        assert!(
+            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(missing.clone()),
+                explicitly_passed: false,
+            })
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+            .is_none()
+        );
+        assert_eq!(
+            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
+                artifact: Box::new(missing),
+                explicitly_passed: true,
+            })
+            .err(),
+            Some(LaunchError::Adapter)
+        );
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daisyrose_tight_ram_sheds_promoted_but_rejects_explicit() -> Result<(), LaunchError> {
+        let mut args = arguments();
+        args.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        let config = LaunchConfig::parse(args)?;
+        let daisy_reserve = 80 * 1024 * 1024_u64;
+        let max_probe = 64 * 1024 * 1024 * 1024_u64;
+
+        let find_min_budget = |probe: &dyn Fn(u64) -> bool| -> u64 {
+            let mut lo = 1_u64;
+            let mut hi = max_probe;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if probe(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        };
+
+        let min_calibrated = find_min_budget(&|bytes| {
+            config
+                .calibrated_context_plan_with_daisyrose(bytes, false, 0)
+                .is_ok()
+        });
+        assert_eq!(
+            config
+                .resolve_calibrated_daisyrose_admission(
+                    min_calibrated - 1,
+                    false,
+                    daisy_reserve,
+                    true,
+                )
+                .err(),
+            Some(LaunchError::Memory)
+        );
+        for boundary in [min_calibrated, min_calibrated + daisy_reserve - 1] {
+            let (_plan, admitted) = config.resolve_calibrated_daisyrose_admission(
+                boundary,
+                false,
+                daisy_reserve,
+                true,
+            )?;
+            assert!(!admitted);
+            assert_eq!(
+                config
+                    .resolve_calibrated_daisyrose_admission(boundary, false, daisy_reserve, false)
+                    .err(),
+                Some(LaunchError::Memory)
+            );
+        }
+        let (_plan, admitted) = config.resolve_calibrated_daisyrose_admission(
+            min_calibrated + daisy_reserve,
+            false,
+            daisy_reserve,
+            true,
+        )?;
+        assert!(admitted);
+
+        let min_profile = find_min_budget(&|bytes| {
+            config
+                .resolve_profile_daisyrose_admission(bytes, false, 0, false)
+                .is_ok()
+        });
+        assert_eq!(
+            config
+                .resolve_profile_daisyrose_admission(min_profile - 1, false, daisy_reserve, true)
+                .err(),
+            Some(LaunchError::Memory)
+        );
+        for boundary in [min_profile, min_profile + daisy_reserve - 1] {
+            let (_plan, _vision, _scratch, admitted) =
+                config.resolve_profile_daisyrose_admission(boundary, false, daisy_reserve, true)?;
+            assert!(!admitted);
+            assert_eq!(
+                config
+                    .resolve_profile_daisyrose_admission(boundary, false, daisy_reserve, false)
+                    .err(),
+                Some(LaunchError::Memory)
+            );
+        }
+        let (_plan, _vision, _scratch, admitted) = config.resolve_profile_daisyrose_admission(
+            min_profile + daisy_reserve,
+            false,
+            daisy_reserve,
+            true,
+        )?;
+        assert!(admitted);
         Ok(())
     }
 
