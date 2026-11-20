@@ -95,29 +95,69 @@ unblocked live X2-90 discovery via `bonsai-tools doctor --json '{"nativeGraphics
 
 In the sibling `..\prism-inference` repository, `bonsai-adreno-vulkan` emits SPIR-V 1.6
 (`0x0001_0600`, complete global `OpEntryPoint` interfaces) on Vulkan 1.3+ (core integer
-dot product `OpSDot`) for `#39` (`VulkanPq2Executor` + `Qwen35` + `CompositeProjectionExecutor`)
-and `#40` (`VulkanAttentionExecutor` with fused `total_seq <= 512` vs 3-stage decomposed /
-single-CB pipelined execution):
-- **Live X2-90 parity (`5/5` unit + `5/5` live tests)**: `PQ2_0 x Q8_K` (`fused=false`,
-  batched `tokens=4`, and `5120x17408`), `PQ2_0 x Q8_0`, `PTQ1_0 x Q8_0` (`pinned=false/true`),
-  `PTQ1_0 x Q8_K`, `Qwen35` decode/checkpoint/rollback, and `CompositeProjectionExecutor`
-  overflow routing all match CPU at `0 ULP`.
+dot product `OpSDot`) for `#39` (`VulkanPq2Executor` + `Qwen35` +
+`CompositeProjectionExecutor` / `OwnedCompositeProjectionExecutor`) and `#40`
+(`VulkanAttentionExecutor` with fused `total_seq <= 512` vs 3-stage decomposed /
+single-CB pipelined execution), expanded in post-lock local candidate commits `6c0a3b5`,
+`0489989`, `1bfdb25`, `7697d3c`, `af6274d`, `e8c96be`, and `3fafc84` with persistent host
+buffer mappings, `256 MiB` `WeightArena` allocations, `vk::PipelineCache`, a resettable
+transient descriptor pool, coalesced 64-row `PQ2_0`/`PTQ1_0` GEMV & 4-token GEMM, GPU
+4-plane `Q8_K` quantization using Veltkamp-Dekker `exact_fdiv_dekker` (eliminating the
+`1 ULP` Adreno `OpFDiv` residual; `OpLogicalOr = 166` opcode fix), fused GPU FFN chain
+(`gate/up + SwiGLU + Hadamard + down + residual` + rank-1 LoRA side-branch), zero-scale
+`f16` block handling, full `Pq2ProjectionExecutor` FFN/tile forwarding on composite
+executors, tiled verification admission for `supports_tile_tokens()` executors, and
+explicit server `--placement vulkan|composite` with strict readiness and `8 GiB` weight
+prewarm:
+- **Live X2-90 parity (`5/5` unit tests + `9/9` non-ignored live tests)**: `PQ2_0 x Q8_K`
+  (`fused=false`, batched `tokens=4`, zero-scale blocks, and `5120x17408`), `PQ2_0 x Q8_0`,
+  `PTQ1_0 x Q8_0` (`pinned=false/true`), `PTQ1_0 x Q8_K`, GPU 4-plane `Q8_K` quantization,
+  direct `F32` projections (`0 ULP` bit-identical to CPU), fused `F32` FFN chain + Hadamard +
+  LoRA (`<= 1e-4`), 8-token tiled `Qwen35` decode/checkpoint/rollback, and
+  `CompositeProjectionExecutor` overflow routing all pass against CPU.
 - **Empirical compiler/precision findings on X2-90**: `fused=true` emits `GLSL.std.450`
   `Fma` (`NoContraction`), which Adreno's shader compiler lowers to hardware `mad.f32`
-  (`<= 1 ULP` difference vs CPU `f32::mul_add`, `OpSDot == Portable` at `0 ULP`; gated
-  separately from `fused=false`); attention `round_f16` uses an explicit bitwise IEEE-754
-  binary16 shift/add + `GLSLstd450UnpackHalf2x16` (`62`) rather than `packHalf2x16` +
-  `unpackHalf2x16` because Adreno QGLC peephole-folded the round-trip back to unrounded `f32`.
-- **Bounded AC-logged X2-90 micro-timings (`2.306 s` total, prebuilt `adreno_live`, all 4
-  `GetSystemPowerStatus` checks `AC(1)`, charge `100%`, Battery Saver `Off`)**:
-  - `PQ2_0 x Q8_K` (`5120x17408`): `OpSDot` `8.363 ms` median vs portable `8.452 ms`
-    (single-thread CPU scalar oracle `43.888 ms` median).
-  - `PTQ1_0 x Q8_0` pinned (`5120x17408`): `OpSDot` `9.261 ms` median (`2.238 ms` min) vs
-    portable `15.724 ms` median (single-thread CPU scalar oracle `58.251 ms` median).
-  - Attention (`Q=1, H=24, KV=4, D=256`): `seq=64` fused `8.309 ms` / decomposed `6.039 ms`;
-    `seq=512` fused `8.300 ms` / decomposed `8.257 ms`; `seq=2048` auto decomposed `16.665 ms`.
-  Note: per-call timings include synchronous host buffer upload/readback and fence wait, and
-  compare against single-threaded scalar CPU inside the test rather than multi-worker NEON.
+  (2-rounding, `<= 1 ULP` difference vs CPU `f32::mul_add`, `OpSDot == Portable` at `0 ULP`;
+  gated separately from `fused=false`, which forced replacing Markstein FMA division with
+  non-FMA Veltkamp-Dekker splitting in `exact_fdiv_dekker`); attention `round_f16` uses an
+  explicit bitwise IEEE-754 binary16 shift/add + `GLSLstd450UnpackHalf2x16` (`62`) rather
+  than `packHalf2x16` + `unpackHalf2x16` because Adreno QGLC peephole-folded the round-trip
+  back to unrounded `f32`.
+- **Bounded AC-logged X2E94100 trial (`3fafc84`; predeclared `180 s` ceiling overrun at
+  `282.29 s` total because `bench_swift_arm_b_vulkan_seq` alone took `265.48 s`, stopped early
+  before Arms C/D without retrying; every before/after `Win32_Battery` snapshot recorded
+  `BatteryStatus = 2` AC, charge `43% -> 45%`, `EnergySaverStatus = Disabled`)**:
+  - **Kernel micro-timings (`adreno_live`, `5.55 s` across all 4 arms)**:
+    - `ARM1` (`PQ2_0 x Q8_K`, `5120x17408`): `OpSDot` `8.325 ms` median (`8.005 ms` min)
+      vs portable `8.993 ms` (single-thread CPU scalar oracle `48.846 ms`).
+    - `ARM2` (`PTQ1_0 x Q8_0` pinned, `5120x17408`): `OpSDot` `15.551 ms` median
+      (`8.014 ms` min) vs portable `8.549 ms` (`1.525 ms` min; single-thread CPU scalar
+      oracle `62.175 ms`).
+    - `ARM3` (Attention `Q=1, H=24, KV=4, D=256`): `seq=64` fused `8.393 ms` /
+      decomposed `8.529 ms`; `seq=512` fused `8.940 ms` / decomposed `8.702 ms`;
+      `seq=2048` auto decomposed `15.275 ms`.
+    - `ARM4` (coalesced `5120x17408` + 3-matrix `5120->17408->5120` FFN chain, `3` tensors =
+      `71,024,640` B prewarmed in `24.676 ms`): `gemv1` `12.328 ms` (`2.748 ms` min),
+      `gemm4` `8.199 ms` (`2.243 ms` min), `ffn_chain1` `9.419 ms` (`1.388 ms` min),
+      `ffn_chain4` `12.375 ms` (`8.526 ms` min).
+  - **Full-model `Swift-Bonsai-2-PQ2_0.gguf` losing/no-go verdict (`context=2048`, FP16 KV,
+    12 row workers, seed `42`, thinking off, `72` prompt tokens, `16` generated tokens)**:
+    - **CPU Arm A** (8-token tiled NEON `I8MM`/`SDOT` prefill): `load 4,808.1 ms`, prefill
+      `3,384.46 ms` (`21.27 tok/s`), decode `1,469.09 ms` (`10.21 tok/s`, `15` evals), total
+      `5,010.70 ms`, text `"1. **Memory Bandwidth**: Coalesced GPU weight layouts (transposed"`.
+    - **Vulkan Arm B** (sequential, `401` resident tensors = `6,799,564,800` B prewarmed in
+      `1,878.5 ms`): `load 4,945.0 ms`, prefill `214,684.18 ms` (`0.34 tok/s`), decode
+      `40,097.79 ms` (`0.37 tok/s`, `15` evals), total `257,293.49 ms`, text
+      `"1. **Memory Bandwidth**: Coalesced GPU weight layouts (swizz"` (matching tokens 1–13,
+      with a near-tie argmax flip at token 14 within FP32 `SwiGLU`/`Hadamard` tolerance).
+  - **Root cause and gating verdict (do not promote; keep `backend_ready: false`)**: Even
+    with persistent scratch buffers and `1.388 ms` minimum GPU FFN-chain execution,
+    per-projection synchronous `vkQueueSubmit` + `vkWaitForFences` incurs `~8–10 ms`
+    WDDM/Vulkan submission round-trip latency across `~256` submissions/token (`64` layers),
+    making sequential end-to-end Vulkan `~28x` slower on decode and `~63x` slower on prefill
+    than 12-worker Oryon CPU. Moving norms, RoPE, attention/GDN, and projections into
+    whole-layer / whole-graph single-submission command buffers is required before Adreno
+    Vulkan can compete with multi-worker Oryon CPU.
 
 For the first eligible Swift shape, compare a bounded fused candidate with three
 explicit stages: QK scores, globally normalized probabilities, and probability/V

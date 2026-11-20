@@ -1231,8 +1231,12 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32`, zero-alloc spin-then-park
   `NativeRowPool`, and bit-exact `G in {2, 3, 6}` grouped GQA packed-KV
   attention (pinned in Prism `0.1.32`; pending Runner hosted Foundation and
-  X1/X2 qualification), and integrate
-  further selected cross-token and 8/16/32-token tiled-prefill consumers
+  X1/X2 qualification), plus post-lock local Prism CPU candidates (`75e1a69`
+  cache-line padded Dekker `NativeRowPool`, `f2efd9c` spill-free `neon-dot` +
+  fused `8x32` `I8MM`/`SDOT` PQ2 prefill, `af6274d` tile-capable verification;
+  single-arm AC X2E94100 observation `SWIFT_ARM_A_CPU_TILED` at `21.27 tok/s`
+  prefill / `10.21 tok/s` decode, awaiting paired lock-promotion packets), and
+  integrate further selected cross-token and 8/16/32-token tiled-prefill consumers
   preserving transformed bases, causal state, bounded scratch and rollback
   before timing the complete request.
 - [ ] Use signed constant floor division only inside a measured parent hotspot
@@ -1268,13 +1272,20 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   `host_gpu` module hash limits (`64 MiB`/file, `192 MiB`/total, `1500 ms`), and extended
   Vulkan capability queries (verified live on X2E94100 `Adreno(TM) X2-90 GPU` Vulkan
   `1.3.301`/`1.4.327`, `qcvkarm64xum.dll` `32,157,248` B, and OpenCL `3.0 build 863.0`).
-  Local Prism `bonsai-adreno-vulkan` passes `5/5` unit tests and `5/5` live X2-90 parity
-  tests (`#39` `PQ2_0`/`PTQ1_0` with `OpSDot` and portable fallback, `Qwen35` decode/
-  checkpoint/rollback, `CompositeProjectionExecutor`; `#40` fused vs 3-stage decomposed/
-  pipelined attention with QGLC-safe binary16 probability rounding and explicit pipeline
-  barriers) plus bounded AC-logged timing (`2.306 s` total). Whole-request serving
-  benefit vs production NEON, hosted CI, physical X1-85 verification, pinned release-lock
-  promotion, LoRA/full-state coverage, and TDR/recovery qualification remain open.
+  Post-lock local Prism commits `6c0a3b5`, `0489989`, `1bfdb25`, `7697d3c`, `e8c96be`,
+  and `3fafc84` added persistent mappings, `256 MiB` `WeightArena`, coalesced 64-row
+  GEMV/GEMM, GPU `Q8_K` quantize with `exact_fdiv_dekker` (`OpLogicalOr = 166`), fused FFN
+  chains + LoRA, full `OwnedCompositeProjectionExecutor` forwarding, and server
+  `--placement vulkan|composite`, passing `5/5` unit and `9/9` live X2-90 parity tests.
+  However, the bounded AC-logged X2E94100 end-to-end trial (`3fafc84`, `282.29 s` total on AC
+  `BatteryStatus = 2`) recorded a **losing/no-go verdict for per-projection synchronous
+  Vulkan**: while GPU FFN kernels hit `1.388 ms` min (`ARM4`), ~256 per-projection
+  `vkQueueSubmit` + `vkWaitForFences` round-trips per token left sequential `Swift-Bonsai-2`
+  at `0.34 tok/s` prefill / `0.37 tok/s` decode (`257.3 s`) vs 12-worker CPU tiled `21.27` /
+  `10.21 tok/s` (`5.01 s`). Moving norms, RoPE, attention/GDN, and projections into
+  whole-layer / whole-graph command-buffer batching (plus hosted CI, physical X1-85
+  verification, lock promotion, LoRA/full-state coverage, and TDR qualification) is required
+  before selecting Adreno Vulkan (`backend_ready: false`).
 - [ ] Qualify the opt-in native ARM64 OpenCL original-PQ2/Q8_K projection
   pilot under unchanged mitigations, including owning hosted analysis/linking,
   exact input/kernel/device identities, every-block scalar replay and terminal

@@ -118,6 +118,21 @@ Foundation acceptance and complete X1/X2 device qualification):
   once per KV head across all `G` query heads in both decode (`6:1` for Swift's
   24 query / 4 KV heads) and tiled prefill while preserving exact binary32/binary64
   rounding and reduction order.
+- **Post-lock local Prism candidates (`75e1a69`, `f2efd9c`, `af6274d`; awaiting release
+  publication and paired CI/device qualification):**
+  - `75e1a69` (`NativeRowPool`): cache-line padded atomics, `SPIN_ITERATIONS = 32_768`,
+    and Dekker sleep/wake skipping hot-path mutex/condvar syscalls.
+  - `f2efd9c` (`neon-dot`, `prefill_neon`): eliminated register spills on `pq2_scaled_rows` /
+    `dot_pq2_8x8` and added a fused `8x32`-token `I8MM`/`SDOT` PQ2 prefill kernel
+    (`dot_scaled_8x8_chunks`).
+  - `af6274d` (`graph/prefill`): allows `supports_tile_tokens() == true` executors in
+    `with_tiled_verification` / `evaluate_verification_block`.
+  - **Single-arm AC-logged X2E94100 observation (`3fafc84` `SWIFT_ARM_A_CPU_TILED`;
+    not a paired lock-promotion packet):** `Swift-Bonsai-2-PQ2_0.gguf`, 12 row workers,
+    8-token tiled prefill, FP16 KV, `context = 2048`, thinking off, `72` prompt + `16`
+    generated tokens, `Win32_Battery` `BatteryStatus = 2` AC, charge `43%`,
+    `EnergySaverStatus = Disabled`: prefill `3,384.46 ms` (`21.27 tok/s`), decode
+    `1,469.09 ms` (`10.21 tok/s`, `15` evals), total `5,010.70 ms`.
 
 ## CPU preparation candidates
 
