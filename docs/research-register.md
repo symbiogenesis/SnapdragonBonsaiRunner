@@ -464,14 +464,63 @@ bottleneck. For a large, stable corpus and representative queries, KeyNet maps
 query vectors before an existing index; SupportNet is a separate cluster-routing
 candidate. Neither is an active dependency, runtime integration or device trial.
 
-Applicability depends on exact corpus, chunking, encoder and learned-model
-identities, with invalidation or requalification after changes. Original-query
-candidate scoring and ordinary retrieval fallback remain required. Top-1 recovery
-does not establish passage relevance or complete scene-packet quality: evaluation
-must cover multiple useful passages and complete-task latency. Offline training,
+If that future corpus-retrieval lane justifies an IVF or cluster-partitioned
+vector index (including centroid partitions paired with a router such as
+SupportNet), [SuperEMeans](https://www.lkuffo.com/superemeans/) (**report**,
+Leonardo Kuffo, 2026-11-17) is the primary centroid-clustering reference. It
+fuses [SuperKMeans](https://arxiv.org/abs/2603.20009) (**paper**, 2026-03-20:
+high-dimensional pruning during assignment and early termination by recall)
+with [e-means](https://arxiv.org/abs/2611.09501) (**paper**, 2026-11-06:
+mini-batch exponential moving average centroid updates, decay/batch-size
+scaling laws and periodic dead-cluster revival converging in 2–5 epochs instead
+of 10–25 Lloyd iterations), with an inspectable MIT-licensed C++/Python
+**implementation** at [`cwida/SuperKMeans`](https://github.com/cwida/SuperKMeans)
+(surveyed `main` revision `50ee8caacda2cdea381bdf6451636bddf506f45d`). The
+report also notes quantized-vector clustering
+([arXiv:2608.14648](https://arxiv.org/abs/2608.14648)) as a related direction.
+
+SuperEMeans carries explicit algorithmic, hardware and ownership limits:
+
+- **Cluster balance versus WCSS:** Mini-batch EMA updates can leave bloated
+  clusters in high-density query regions, reaching lower WCSS and slightly
+  higher recall@100 at a fixed 1% probed-centroid ratio while scanning 10–20%
+  more vectors per query than 10-iteration Lloyd's k-means (on 10M 1024D Cohere
+  embeddings, matching scanned-vector count leaves e-means behind Lloyd's
+  recall/scan tradeoff). Raising the dead-cluster revival threshold from `0.1`
+  to `0.3` of mean batch usage narrowed that Cohere scan penalty from `1.20x`
+  to `1.06x` with a small recall tradeoff; hierarchical k-means also interacted
+  poorly with e-means in the report's baseline setup. Qualify actual query-time
+  scanned-vector latency and cluster balance alongside recall, not WCSS or
+  fixed-probe recall alone.
+- **Scale and hardware boundary:** Reported speedups (`1.8x` over base e-means
+  at 2 epochs and `3.0x`–`3.2x` at 5 epochs; ~`7.7x`–`8.5x` over 10-iteration
+  Lloyd's) come from a 16-core AMD Zen 5 server (`128 GB` RAM) over 5M–10M
+  embeddings (`27–40 GB`). Neither server x86 throughput nor multi-million-vector
+  indexing establishes Snapdragon X1/X2 Windows ARM64 laptop benefit.
+- **Rust-only implementation boundary:** `cwida/SuperKMeans` is C++ with Python
+  bindings and serves as an algorithm reference only, not a dependency, C++
+  import or Python helper under the [language policy](../AGENTS.md#tooling-languages).
+  Any future local index builder belongs in native Rust (ARM64 NEON plus scalar
+  fallback), charging full index-build time, memory and exact-scan fallback.
+- **Non-applicable project areas:** High-dimensional embedding clustering does
+  not apply to Swift's fixed 1D scalar symmetric Gaussian Lloyd-Max KV tables
+  ([quantized KV](quantized-kv.md#scope-and-algorithm)), pretrained Mimi/Qwen3-TTS
+  RVQ exact nearest-centroid inference lookup, immutable packed ternary weights
+  (`PQ2`/`PTQ1`), low-dimensional Hessian-weighted weight-VQ research or the
+  initial embedding-free [writing-context](../PLAN.md#writing-context) packet
+  milestone. Any hypothetical future cluster-indexed sparse KV attention would
+  separately need incremental per-token maintenance, bounded attention-error
+  controls and Snapdragon latency evidence.
+
+Applicability depends on exact corpus, chunking, encoder, clustering-parameter
+and learned-model identities, with invalidation or requalification after
+changes. Original-query candidate scoring and ordinary exact-scan/retrieval
+fallback remain required. Top-1 recovery does not establish passage relevance
+or complete scene-packet quality: evaluation must cover multiple useful
+passages and complete-task latency. Offline training, centroid/index building,
 exact-target generation, vectors/index and auxiliary weights all count toward
-native Windows ARM64 time and shared-memory budgets. GPU/batched results supply
-no Snapdragon benefit or generation/attention shortcut.
+native Windows ARM64 time and shared-memory budgets. GPU/batched and server-CPU
+results supply no Snapdragon benefit or generation/attention shortcut.
 
 ### Native application and writing references
 

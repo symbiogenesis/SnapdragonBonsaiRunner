@@ -1561,9 +1561,13 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 - [ ] Reopen approximate checkpoint omission only if exact reuse and suffix
   recomputation cannot meet a demonstrated need. Wide trees, SVD caches and sparse
   indexes need a measured bottleneck and bounded native benefit.
-- [ ] Consider [learned corpus retrieval](docs/research-register.md#conditional-learned-corpus-retrieval)
-  only after embeddings are justified and vector search is a measured bottleneck;
-  qualify passage relevance, complete-task cost, resource bounds and fallback.
+- [ ] Consider [learned corpus retrieval and clustered vector indexing](docs/research-register.md#conditional-learned-corpus-retrieval)
+  (including KeyNet/SupportNet routing and native Rust SuperEMeans-style
+  dimension-pruned EMA centroid clustering for IVF/partitioned indexes) only
+  after embeddings are justified and vector search or index construction is a
+  measured bottleneck; qualify passage relevance, cluster balance and
+  scanned-vector query latency (including dead-cluster revival tuning),
+  complete-task cost, resource bounds and exact-scan fallback on X1/X2.
 - [ ] After portable-update acceptance, design a separate signed-metadata trust
   extension using the [tough/TUF reference](docs/research-register.md#reliability-and-distribution-references).
   Specify publisher key custody/rotation, trust bootstrap, expiry/clock and offline
