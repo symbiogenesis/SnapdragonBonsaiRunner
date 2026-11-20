@@ -90,6 +90,35 @@ pub struct DaisyRoseLoraArtifact {
     pub default_scale_tenths: Option<u8>,
 }
 
+impl DaisyRoseLoraArtifact {
+    /// Effective default inference scale in tenths (`0..=20`), gated by `default_enabled`.
+    ///
+    /// Returns `0` when the artifact is not promoted (`default_enabled == false`) or when
+    /// `default_scale_tenths` is absent or outside `1..=20`.
+    #[must_use]
+    pub const fn effective_default_scale_tenths(&self) -> u8 {
+        if !self.default_enabled {
+            return 0;
+        }
+        match self.default_scale_tenths {
+            Some(tenths) if tenths >= 1 && tenths <= 20 => tenths,
+            _ => 0,
+        }
+    }
+
+    /// Effective default inference scale as `f64`, gated by `default_enabled`.
+    #[must_use]
+    pub fn effective_default_scale_f64(&self) -> f64 {
+        f64::from(self.effective_default_scale_tenths()) / 10.0
+    }
+
+    /// Effective default inference scale as `f32`, gated by `default_enabled`.
+    #[must_use]
+    pub fn effective_default_scale_f32(&self) -> f32 {
+        f32::from(self.effective_default_scale_tenths()) / 10.0
+    }
+}
+
 fn atom(value: &str) -> bool {
     !value.is_empty()
         && value != "."
@@ -440,6 +469,38 @@ mod tests {
             .remove("source");
         missing_source["defaultEnabled"] = json!(false);
         assert!(daisyrose_lora_artifact_from_lock(data, &missing_source.to_string()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn effective_default_scale_helpers_gate_on_default_enabled() -> Result<(), String> {
+        let data = if cfg!(windows) {
+            Path::new(r"C:\External\SwiftData")
+        } else {
+            Path::new("/tmp/swift-data")
+        };
+        let hf_url = "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose-npu-r16.gguf";
+        let promoted = daisyrose_lora_artifact_from_lock(
+            data,
+            &sample_full_lock("huggingface", hf_url).to_string(),
+        )?;
+        assert_eq!(promoted.effective_default_scale_tenths(), 10);
+        assert!((promoted.effective_default_scale_f64() - 1.0).abs() < 1e-12);
+        assert!((promoted.effective_default_scale_f32() - 1.0).abs() < f32::EPSILON);
+
+        let mut unpromoted = promoted.clone();
+        unpromoted.default_enabled = false;
+        assert_eq!(unpromoted.effective_default_scale_tenths(), 0);
+        assert!((unpromoted.effective_default_scale_f64() - 0.0).abs() < 1e-12);
+        assert!((unpromoted.effective_default_scale_f32() - 0.0).abs() < f32::EPSILON);
+
+        for invalid in [None, Some(0), Some(21)] {
+            let mut mutated = promoted.clone();
+            mutated.default_scale_tenths = invalid;
+            assert_eq!(mutated.effective_default_scale_tenths(), 0);
+            assert!((mutated.effective_default_scale_f64() - 0.0).abs() < 1e-12);
+            assert!((mutated.effective_default_scale_f32() - 0.0).abs() < f32::EPSILON);
+        }
         Ok(())
     }
 }
