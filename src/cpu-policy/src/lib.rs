@@ -31,6 +31,10 @@ const PHYSICAL_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SWIFT_WEIGHT_BYTES: u64 = 7_206_168_928;
 const PTQ1_WEIGHT_BYTES: u64 = 5_946_648_928;
 const ADAPTER_BYTES: u64 = 9_682_464;
+/// Conservative retained weight budget per rank for `NpuFriendly` `F16` DaisyRose adapters (~4 MiB/rank).
+pub const DAISYROSE_NPU_FRIENDLY_BYTES_PER_RANK_F16: u64 = 4_194_304;
+/// Conservative runtime execution scratch reserve (`16 MiB`) budgeted for an active multi-rank adapter.
+pub const DAISYROSE_SCRATCH_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
 /// Embedded pinned Swift vision projector (`mmproj`) lock document.
 pub const MMPROJ_LOCK: &str = include_str!("../../../config/swift-mmproj.lock.json");
 /// Exact byte length of the pinned Swift vision projector (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`).
@@ -868,6 +872,91 @@ pub fn run(request: Value) -> Result<Value, String> {
         "AdapterPath": adapter_path,
         "Arguments": arguments,
     }))
+}
+
+/// Pinned schema for a promoted stackable DaisyRose multi-rank `LoRA` GGUF artifact lock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DaisyRoseLoraLock {
+    /// Lock schema version (`1`).
+    pub schema_version: u32,
+    /// Target policy envelope (`"npu-friendly"` or `"full-matrix"`).
+    pub envelope: String,
+    /// Factor storage dtype (`"f16"` or `"f32"`).
+    pub dtype: String,
+    /// Maximum rank across all verified targets (`1..=64`).
+    pub max_rank: u16,
+    /// Number of paired target matrices.
+    pub target_count: usize,
+    /// Exact locked byte length of the GGUF artifact.
+    pub bytes: u64,
+    /// Lowercase 64-hex SHA-256 of the GGUF artifact.
+    pub sha256: String,
+    /// Lowercase 64-hex SHA-256 of the compatible base model.
+    pub base_model_sha256: String,
+}
+
+/// Parse and validate a [`DaisyRoseLoraLock`] JSON document.
+///
+/// # Errors
+/// Rejects malformed JSON, unsupported schema versions, invalid envelopes or dtypes,
+/// out-of-range ranks, empty targets/bytes, or non-lowercase-hex digests.
+pub fn parse_daisyrose_lora_lock(json: &str) -> Result<DaisyRoseLoraLock, String> {
+    let lock: DaisyRoseLoraLock =
+        serde_json::from_str(json).map_err(|_| "Invalid DaisyRose LoRA lock JSON.".to_owned())?;
+    require(lock.schema_version == 1, "Unsupported DaisyRose lock schema version.")?;
+    require(
+        matches!(lock.envelope.as_str(), "npu-friendly" | "full-matrix"),
+        "Unsupported DaisyRose lock envelope.",
+    )?;
+    require(
+        matches!(lock.dtype.as_str(), "f16" | "f32"),
+        "Unsupported DaisyRose lock dtype.",
+    )?;
+    require(
+        (1..=64).contains(&lock.max_rank),
+        "DaisyRose lock maxRank must be within 1..=64.",
+    )?;
+    require(
+        lock.target_count > 0 && lock.bytes > 0,
+        "DaisyRose lock requires non-zero targetCount and bytes.",
+    )?;
+    require(
+        hex(&lock.sha256, 64) && hex(&lock.base_model_sha256, 64),
+        "DaisyRose lock digests must be lowercase 64-hex SHA-256 strings.",
+    )?;
+    Ok(lock)
+}
+
+#[cfg(test)]
+mod daisyrose_lock_tests {
+    use super::parse_daisyrose_lora_lock;
+
+    #[test]
+    fn validates_daisyrose_lora_lock_schema_and_rejects_drift() -> Result<(), String> {
+        let sha = "a".repeat(64);
+        let base_sha = "b".repeat(64);
+        let valid = format!(
+            r#"{{
+                "schemaVersion": 1,
+                "envelope": "npu-friendly",
+                "dtype": "f16",
+                "maxRank": 16,
+                "targetCount": 48,
+                "bytes": 67108864,
+                "sha256": "{sha}",
+                "baseModelSha256": "{base_sha}"
+            }}"#
+        );
+        let parsed = parse_daisyrose_lora_lock(&valid)?;
+        assert_eq!(parsed.max_rank, 16);
+        assert_eq!(parsed.target_count, 48);
+
+        assert!(parse_daisyrose_lora_lock(&valid.replace(r#""maxRank": 16"#, r#""maxRank": 0"#)).is_err());
+        assert!(parse_daisyrose_lora_lock(&valid.replace("npu-friendly", "other")).is_err());
+        assert!(parse_daisyrose_lora_lock(&valid.replace(&sha, &"A".repeat(64))).is_err());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

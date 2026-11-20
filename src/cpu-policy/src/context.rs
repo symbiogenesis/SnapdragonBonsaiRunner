@@ -405,6 +405,16 @@ impl SwiftExecutionShape {
         self
     }
 
+    /// Add `budget.total_bytes()` for an active multi-rank DaisyRose adapter into
+    /// [`Self::weights_and_fixed_runtime_bytes`], or return `None` on overflow.
+    #[must_use]
+    pub fn with_multi_rank_adapter(mut self, budget: MultiRankAdapterBudget) -> Option<Self> {
+        let total = budget.total_bytes()?;
+        self.weights_and_fixed_runtime_bytes =
+            self.weights_and_fixed_runtime_bytes.checked_add(total)?;
+        Some(self)
+    }
+
     /// Total live recurrent/convolution checkpoint bytes across active, rollback,
     /// and reuse copies (`156_893_184` bytes per copy), or `None` on overflow.
     #[must_use]
@@ -1003,6 +1013,49 @@ pub struct SwiftCalibratedOptions {
     pub prompt_reuse: SwiftCalibratedReuse,
 }
 
+/// Conservative memory reserve for an active stackable multi-rank `LoRA` adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MultiRankAdapterBudget {
+    /// Resident factor storage bytes of the verified adapter.
+    pub payload_bytes: u64,
+    /// Temporary runtime scratch headroom charged on top of payload storage.
+    pub scratch_headroom_bytes: u64,
+}
+
+impl MultiRankAdapterBudget {
+    /// Conservative budget estimate for an `NpuFriendly` `F16` adapter of `max_rank` (`1..=64`).
+    #[must_use]
+    pub fn for_npu_friendly_f16(max_rank: u16) -> Option<Self> {
+        if !(1..=64).contains(&max_rank) {
+            return None;
+        }
+        let payload_bytes =
+            u64::from(max_rank).checked_mul(crate::DAISYROSE_NPU_FRIENDLY_BYTES_PER_RANK_F16)?;
+        Some(Self {
+            payload_bytes,
+            scratch_headroom_bytes: crate::DAISYROSE_SCRATCH_HEADROOM_BYTES,
+        })
+    }
+
+    /// Conservative budget bound from a verified GGUF file's exact byte size.
+    #[must_use]
+    pub const fn from_verified_bytes(bytes: u64) -> Option<Self> {
+        if bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            payload_bytes: bytes,
+            scratch_headroom_bytes: crate::DAISYROSE_SCRATCH_HEADROOM_BYTES,
+        })
+    }
+
+    /// Total adapter payload and scratch reserve in bytes.
+    #[must_use]
+    pub const fn total_bytes(self) -> Option<u64> {
+        self.payload_bytes.checked_add(self.scratch_headroom_bytes)
+    }
+}
+
 /// Calibrated representation- and CoW-aware Swift admission result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SwiftCalibratedPlan {
@@ -1265,6 +1318,43 @@ impl SwiftContextPlan {
             return Ok(plan);
         }
         search(false).ok_or_else(insufficient)
+    }
+
+    /// Derive a calibrated CoW context plan while charging `extra_adapter_bytes` for
+    /// an active stackable multi-rank adapter on top of base weights, vision, and caches.
+    ///
+    /// # Errors
+    /// Returns an error if `available_bytes` cannot cover `extra_adapter_bytes` plus the
+    /// minimum calibrated execution profile, or on arithmetic overflow.
+    pub fn for_calibrated_execution_with_adapter_reserve(
+        available_bytes: u64,
+        profile: SwiftContextProfile,
+        options: SwiftCalibratedOptions,
+        extra_adapter_bytes: u64,
+    ) -> Result<SwiftCalibratedPlan, String> {
+        if extra_adapter_bytes == 0 {
+            return Self::for_calibrated_execution(available_bytes, profile, options);
+        }
+        let remaining = available_bytes
+            .checked_sub(extra_adapter_bytes)
+            .ok_or_else(insufficient)?;
+        let mut plan = Self::for_calibrated_execution(remaining, profile, options)?;
+        let extra_usize = usize::try_from(extra_adapter_bytes).map_err(|_| insufficient())?;
+        plan.context_plan.memory_limit_bytes = plan
+            .context_plan
+            .memory_limit_bytes
+            .checked_add(extra_usize)
+            .ok_or_else(insufficient)?;
+        plan.context_plan.required_available_bytes = plan
+            .context_plan
+            .required_available_bytes
+            .checked_add(extra_adapter_bytes)
+            .ok_or_else(insufficient)?;
+        plan.working_set_limit_bytes = plan
+            .working_set_limit_bytes
+            .checked_add(extra_usize)
+            .ok_or_else(insufficient)?;
+        Ok(plan)
     }
 }
 
@@ -1696,6 +1786,55 @@ mod tests {
         assert!(cow < worst);
         // Sharing 262_144 - 64 immutable KV tokens saves 262_080 * 16_896 bytes (~4.12 GiB).
         assert_eq!(worst - cow, 262_080 * RSQ4_KV_BYTES_PER_TOKEN);
+        Ok(())
+    }
+
+    #[test]
+    fn multi_rank_adapter_budget_accounts_for_shape_and_calibrated_cow_plan()
+    -> Result<(), Box<dyn Error>> {
+        let budget =
+            MultiRankAdapterBudget::for_npu_friendly_f16(16).ok_or("valid rank 16 budget")?;
+        assert_eq!(budget.payload_bytes, 16 * 4_194_304);
+        assert_eq!(
+            budget.scratch_headroom_bytes,
+            crate::DAISYROSE_SCRATCH_HEADROOM_BYTES
+        );
+        assert!(MultiRankAdapterBudget::for_npu_friendly_f16(0).is_none());
+        assert!(MultiRankAdapterBudget::for_npu_friendly_f16(65).is_none());
+        assert!(MultiRankAdapterBudget::from_verified_bytes(0).is_none());
+
+        let base_shape = SwiftExecutionShape::for_profile(SwiftContextProfile::NativeRsq4);
+        let stacked_shape = base_shape
+            .with_multi_rank_adapter(budget)
+            .ok_or("stacked shape")?;
+        assert_eq!(
+            stacked_shape.weights_and_fixed_runtime_bytes
+                - base_shape.weights_and_fixed_runtime_bytes,
+            budget.total_bytes().ok_or("budget total")?
+        );
+
+        let gib = 1024 * 1024 * 1024_u64;
+        let opts = SwiftCalibratedOptions {
+            weight_packing: SwiftWeightPacking::Pq2_0,
+            request_vision: false,
+            prefill_tokens: Some(8),
+            chunkwise_gdn_wy_f32: false,
+            speculation_tokens: None,
+            prompt_reuse: SwiftCalibratedReuse::Disabled,
+        };
+        let extra = MultiRankAdapterBudget::from_verified_bytes(40 * 1024 * 1024)
+            .and_then(MultiRankAdapterBudget::total_bytes)
+            .ok_or("extra total")?;
+        let base_plan =
+            SwiftContextPlan::for_calibrated_execution(24 * gib, SwiftContextProfile::NativeRsq4, opts)?;
+        let stacked_plan = SwiftContextPlan::for_calibrated_execution_with_adapter_reserve(
+            24 * gib,
+            SwiftContextProfile::NativeRsq4,
+            opts,
+            extra,
+        )?;
+        assert!(stacked_plan.context_plan.context_tokens <= base_plan.context_plan.context_tokens);
+        assert!(stacked_plan.context_plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 24 * gib);
         Ok(())
     }
 }
