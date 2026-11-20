@@ -174,10 +174,7 @@ impl Projection {
         if !input.is_multiple_of(32) || bytes.len() != count / 32 * 34 {
             return Err(invalid());
         }
-        for block in bytes.as_chunks::<34>().0 {
-            let [s0, s1, ..] = *block;
-            let _ = half(u16::from_le_bytes([s0, s1]))?;
-        }
+        validate_quant_blocks::<34>(bytes, |block| f16_bits_finite(block[0], block[1]))?;
         Ok(Self {
             input,
             output,
@@ -199,11 +196,9 @@ impl Projection {
         if !input.is_multiple_of(256) || bytes.len() != count / 256 * 144 {
             return Err(invalid());
         }
-        for block in bytes.as_chunks::<144>().0 {
-            let [d0, d1, m0, m1, ..] = *block;
-            let _ = half(u16::from_le_bytes([d0, d1]))?;
-            let _ = half(u16::from_le_bytes([m0, m1]))?;
-        }
+        validate_quant_blocks::<144>(bytes, |block| {
+            f16_bits_finite(block[0], block[1]) && f16_bits_finite(block[2], block[3])
+        })?;
         Ok(Self {
             input,
             output,
@@ -225,9 +220,7 @@ impl Projection {
         if !input.is_multiple_of(256) || bytes.len() != count / 256 * 210 {
             return Err(invalid());
         }
-        for block in bytes.as_chunks::<210>().0 {
-            let _ = half(u16::from_le_bytes([block[208], block[209]]))?;
-        }
+        validate_quant_blocks::<210>(bytes, |block| f16_bits_finite(block[208], block[209]))?;
         Ok(Self {
             input,
             output,
@@ -526,6 +519,28 @@ fn extent(input: usize, output: usize) -> io::Result<usize> {
         .checked_mul(output)
         .filter(|count| input > 0 && output > 0 && *count <= 2 * 1024 * 1024 * 1024)
         .ok_or_else(invalid)
+}
+
+#[inline]
+const fn f16_bits_finite(lo: u8, hi: u8) -> bool {
+    (u16::from_le_bytes([lo, hi]) & 0x7C00) != 0x7C00
+}
+
+fn validate_quant_blocks<const BLOCK_BYTES: usize>(
+    bytes: &[u8],
+    check: fn(&[u8; BLOCK_BYTES]) -> bool,
+) -> io::Result<()> {
+    const PARALLEL_THRESHOLD_BYTES: usize = 1024 * 1024;
+    if bytes.len() < PARALLEL_THRESHOLD_BYTES {
+        let valid = bytes.as_chunks::<BLOCK_BYTES>().0.iter().all(check);
+        return if valid { Ok(()) } else { Err(invalid()) };
+    }
+    use rayon::prelude::*;
+    let chunk_bytes = 16_384 * BLOCK_BYTES;
+    let valid = bytes
+        .par_chunks(chunk_bytes)
+        .all(|chunk| chunk.as_chunks::<BLOCK_BYTES>().0.iter().all(check));
+    if valid { Ok(()) } else { Err(invalid()) }
 }
 
 fn half(bits: u16) -> io::Result<f32> {

@@ -257,6 +257,111 @@ fn decode_f16(bits: u16) -> io::Result<f32> {
     Ok(value)
 }
 
+#[cfg(all(windows, feature = "rust-qualification"))]
+pub(super) struct MappedSliceLoader<'a> {
+    index: &'a Index,
+    mapping: &'a std::sync::Arc<bonsai_windows_process::MappedFile>,
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+impl<'a> MappedSliceLoader<'a> {
+    pub(super) const fn new(
+        index: &'a Index,
+        mapping: &'a std::sync::Arc<bonsai_windows_process::MappedFile>,
+    ) -> Self {
+        Self { index, mapping }
+    }
+
+    pub(super) fn reserve_tensor(
+        &self,
+        remaining: &mut u64,
+        name: &str,
+    ) -> io::Result<()> {
+        let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
+        *remaining = remaining.checked_sub(tensor.bytes).ok_or_else(invalid)?;
+        Ok(())
+    }
+
+    fn tensor_slice(&self, name: &str, expected_kind: u32, elem_bytes: u64) -> io::Result<&'a [u8]> {
+        let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
+        if tensor.kind != expected_kind || !tensor.bytes.is_multiple_of(elem_bytes) {
+            return Err(invalid());
+        }
+        let offset = usize::try_from(tensor.offset).map_err(|_| invalid())?;
+        let len = usize::try_from(tensor.bytes).map_err(|_| invalid())?;
+        let end = offset.checked_add(len).ok_or_else(invalid)?;
+        self.mapping
+            .as_slice()
+            .get(offset..end)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+    }
+
+    pub(super) fn vector(&self, name: &str) -> io::Result<Vec<f32>> {
+        let slice = self.tensor_slice(name, 0, 4)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(slice.len() / 4)
+            .map_err(io::Error::other)?;
+        for &raw in slice.as_chunks::<4>().0 {
+            values.push(f32::from_le_bytes(raw));
+        }
+        Ok(values)
+    }
+
+    pub(super) fn f16_vector(&self, name: &str) -> io::Result<Vec<f32>> {
+        let slice = self.tensor_slice(name, 1, 2)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(slice.len() / 2)
+            .map_err(io::Error::other)?;
+        let (chunks8, tail) = slice.as_chunks::<16>();
+        for raw_chunk in chunks8 {
+            let pairs = raw_chunk.as_chunks::<2>().0;
+            let bits: [u16; 8] = std::array::from_fn(|idx| u16::from_le_bytes(pairs[idx]));
+            let [lo, hi] = bonsai_neon_dot::widen_f16_eight(&bits);
+            for value in lo.into_iter().chain(hi) {
+                if !value.is_finite() {
+                    return Err(invalid());
+                }
+                values.push(value);
+            }
+        }
+        for &raw in tail.as_chunks::<2>().0 {
+            values.push(decode_f16(u16::from_le_bytes(raw))?);
+        }
+        Ok(values)
+    }
+
+    pub(super) fn projection(&self, name: &str) -> io::Result<Projection> {
+        let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
+        let input = usize::try_from(tensor.shape[0]).map_err(|_| invalid())?;
+        let output =
+            usize::try_from(tensor.shape.get(1).copied().unwrap_or(1)).map_err(|_| invalid())?;
+        if tensor.shape.iter().skip(2).any(|axis| *axis != 1) {
+            return Err(invalid());
+        }
+        let offset = usize::try_from(tensor.offset).map_err(|_| invalid())?;
+        let len = usize::try_from(tensor.bytes).map_err(|_| invalid())?;
+        let end = offset.checked_add(len).ok_or_else(invalid)?;
+        if end > self.mapping.len() {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        let mapped_bytes = || WeightBytes::Mapped {
+            _mapping: std::sync::Arc::clone(self.mapping),
+            offset,
+            len,
+        };
+        match tensor.kind {
+            0 => Projection::f32(input, output, self.vector(name)?),
+            1 => Projection::f32(input, output, self.f16_vector(name)?),
+            8 => Projection::q8_bytes(input, output, mapped_bytes()),
+            12 => Projection::q4_k_bytes(input, output, mapped_bytes()),
+            14 => Projection::q6_k_bytes(input, output, mapped_bytes()),
+            _ => Err(invalid()),
+        }
+    }
+}
+
 pub(super) fn load<R: Read + Seek>(
     index: &Index,
     source: &mut R,
@@ -264,7 +369,28 @@ pub(super) fn load<R: Read + Seek>(
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Model> {
     let mut loader = Loader::new(index, source);
-    load_with_loader(&mut loader, precision, cancel)
+    let (config, count) = validate_decoder_geometry(&loader, precision)?;
+    let embedding = loader.projection("dec.token_embd.weight", cancel)?;
+    let output_norm = loader.vector("dec.output_norm.weight", cancel)?;
+    let mut blocks = Vec::new();
+    blocks.try_reserve_exact(count).map_err(io::Error::other)?;
+    for layer in 0..count {
+        let prefix = format!("dec.blocks.{layer}.");
+        blocks.push(Block {
+            attention_norm: loader.vector(&(prefix.clone() + "norm_attn.weight"), cancel)?,
+            ffn_norm: loader.vector(&(prefix.clone() + "norm_ffn.weight"), cancel)?,
+            query: loader.projection(&(prefix.clone() + "attn.q.weight"), cancel)?,
+            key: loader.projection(&(prefix.clone() + "attn.k.weight"), cancel)?,
+            value: loader.projection(&(prefix.clone() + "attn.v.weight"), cancel)?,
+            attention_out: loader.projection(&(prefix.clone() + "attn.o.weight"), cancel)?,
+            query_norm: loader.vector(&(prefix.clone() + "attn.q_norm.weight"), cancel)?,
+            key_norm: loader.vector(&(prefix.clone() + "attn.k_norm.weight"), cancel)?,
+            gate: loader.projection(&(prefix.clone() + "ffn.gate.weight"), cancel)?,
+            up: loader.projection(&(prefix.clone() + "ffn.up.weight"), cancel)?,
+            down: loader.projection(&(prefix + "ffn.down.weight"), cancel)?,
+        });
+    }
+    Model::new(config, embedding, blocks, output_norm)
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
@@ -274,16 +400,77 @@ pub(super) fn load_mapped(
     precision: CachePrecision,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Model> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let mut cursor = io::Cursor::new(mapping.as_slice());
     let mut loader = Loader::new_mapped(index, &mut cursor, mapping);
-    load_with_loader(&mut loader, precision, cancel)
+    let (config, count) = validate_decoder_geometry(&loader, precision)?;
+    let embedding = loader.projection("dec.token_embd.weight", cancel)?;
+    let output_norm = loader.vector("dec.output_norm.weight", cancel)?;
+    let slice_loader = MappedSliceLoader::new(index, mapping);
+    let mut remaining = loader.remaining;
+    for layer in 0..count {
+        let prefix = format!("dec.blocks.{layer}.");
+        for suffix in [
+            "norm_attn.weight",
+            "norm_ffn.weight",
+            "attn.q.weight",
+            "attn.k.weight",
+            "attn.v.weight",
+            "attn.o.weight",
+            "attn.q_norm.weight",
+            "attn.k_norm.weight",
+            "ffn.gate.weight",
+            "ffn.up.weight",
+            "ffn.down.weight",
+        ] {
+            slice_loader.reserve_tensor(&mut remaining, &(prefix.clone() + suffix))?;
+        }
+    }
+    if cancel() {
+        return Err(io::Error::from(io::ErrorKind::Interrupted));
+    }
+    let abort = AtomicBool::new(false);
+    let blocks = (0..count)
+        .into_par_iter()
+        .map(|layer| {
+            if abort.load(Ordering::Acquire) {
+                return Err(invalid());
+            }
+            let prefix = format!("dec.blocks.{layer}.");
+            let load_block = || -> io::Result<Block> {
+                Ok(Block {
+                    attention_norm: slice_loader.vector(&(prefix.clone() + "norm_attn.weight"))?,
+                    ffn_norm: slice_loader.vector(&(prefix.clone() + "norm_ffn.weight"))?,
+                    query: slice_loader.projection(&(prefix.clone() + "attn.q.weight"))?,
+                    key: slice_loader.projection(&(prefix.clone() + "attn.k.weight"))?,
+                    value: slice_loader.projection(&(prefix.clone() + "attn.v.weight"))?,
+                    attention_out: slice_loader.projection(&(prefix.clone() + "attn.o.weight"))?,
+                    query_norm: slice_loader.vector(&(prefix.clone() + "attn.q_norm.weight"))?,
+                    key_norm: slice_loader.vector(&(prefix.clone() + "attn.k_norm.weight"))?,
+                    gate: slice_loader.projection(&(prefix.clone() + "ffn.gate.weight"))?,
+                    up: slice_loader.projection(&(prefix.clone() + "ffn.up.weight"))?,
+                    down: slice_loader.projection(&(prefix + "ffn.down.weight"))?,
+                })
+            };
+            let res = load_block();
+            if res.is_err() {
+                abort.store(true, Ordering::Release);
+            }
+            res
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if cancel() {
+        return Err(io::Error::from(io::ErrorKind::Interrupted));
+    }
+    Model::new(config, embedding, blocks, output_norm)
 }
 
-fn load_with_loader<R: Read + Seek>(
-    loader: &mut Loader<'_, R>,
+fn validate_decoder_geometry<R: Read + Seek>(
+    loader: &Loader<'_, R>,
     precision: CachePrecision,
-    cancel: &mut impl FnMut() -> bool,
-) -> io::Result<Model> {
+) -> io::Result<(Config, usize)> {
     let config = Config {
         hidden: loader.count("hidden_size")?,
         heads: loader.count("n_heads")?,
@@ -315,27 +502,7 @@ fn load_with_loader<R: Read + Seek>(
     {
         return Err(invalid());
     }
-    let embedding = loader.projection("dec.token_embd.weight", cancel)?;
-    let output_norm = loader.vector("dec.output_norm.weight", cancel)?;
-    let mut blocks = Vec::new();
-    blocks.try_reserve_exact(count).map_err(io::Error::other)?;
-    for layer in 0..count {
-        let prefix = format!("dec.blocks.{layer}.");
-        blocks.push(Block {
-            attention_norm: loader.vector(&(prefix.clone() + "norm_attn.weight"), cancel)?,
-            ffn_norm: loader.vector(&(prefix.clone() + "norm_ffn.weight"), cancel)?,
-            query: loader.projection(&(prefix.clone() + "attn.q.weight"), cancel)?,
-            key: loader.projection(&(prefix.clone() + "attn.k.weight"), cancel)?,
-            value: loader.projection(&(prefix.clone() + "attn.v.weight"), cancel)?,
-            attention_out: loader.projection(&(prefix.clone() + "attn.o.weight"), cancel)?,
-            query_norm: loader.vector(&(prefix.clone() + "attn.q_norm.weight"), cancel)?,
-            key_norm: loader.vector(&(prefix.clone() + "attn.k_norm.weight"), cancel)?,
-            gate: loader.projection(&(prefix.clone() + "ffn.gate.weight"), cancel)?,
-            up: loader.projection(&(prefix.clone() + "ffn.up.weight"), cancel)?,
-            down: loader.projection(&(prefix + "ffn.down.weight"), cancel)?,
-        });
-    }
-    Model::new(config, embedding, blocks, output_norm)
+    Ok((config, count))
 }
 
 #[cfg(test)]

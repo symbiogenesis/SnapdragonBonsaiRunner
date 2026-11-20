@@ -571,22 +571,94 @@ fn build_merge_entries(
     Ok((merge_arena, merges))
 }
 
-fn resolve_symbol(
+const FNV_OFFSET_64: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME_64: u64 = 0x0100_0000_01b3;
+
+#[inline]
+fn fnv1a_step(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME_64);
+    }
+    hash
+}
+
+#[inline]
+fn hash_slot(hash: u64, mask: usize) -> usize {
+    let mixed = hash ^ (hash >> 33);
+    let bytes = mixed.to_le_bytes();
+    let low = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    usize::try_from(low).unwrap_or(0) & mask
+}
+
+struct VocabHashIndex {
+    slots: Vec<u32>,
+    mask: usize,
+}
+
+impl VocabHashIndex {
+    fn build(
+        token_arena: &[u8],
+        token_spans: &[TokenSpan],
+        vocab_sorted: &[u32],
+    ) -> io::Result<Self> {
+        let cap = (vocab_sorted.len().saturating_mul(2))
+            .next_power_of_two()
+            .max(16);
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(cap).map_err(io::Error::other)?;
+        slots.resize(cap, UNMAPPED_SYMBOL);
+        let mask = cap - 1;
+        for &vocab_id in vocab_sorted {
+            let span = token_spans[usize::try_from(vocab_id).unwrap_or(0)];
+            let hash = fnv1a_step(FNV_OFFSET_64, span_bytes(token_arena, span));
+            let mut pos = hash_slot(hash, mask);
+            while slots[pos] != UNMAPPED_SYMBOL {
+                pos = (pos + 1) & mask;
+            }
+            slots[pos] = vocab_id;
+        }
+        Ok(Self { slots, mask })
+    }
+
+    fn get(&self, token_arena: &[u8], token_spans: &[TokenSpan], piece: &[u8]) -> Option<u32> {
+        let hash = fnv1a_step(FNV_OFFSET_64, piece);
+        let mut pos = hash_slot(hash, self.mask);
+        loop {
+            let id = self.slots[pos];
+            if id == UNMAPPED_SYMBOL {
+                return None;
+            }
+            let span = token_spans[usize::try_from(id).unwrap_or(0)];
+            if span_bytes(token_arena, span) == piece {
+                return Some(id);
+            }
+            pos = (pos + 1) & self.mask;
+        }
+    }
+}
+
+fn resolve_symbol_indexed(
+    vocab_index: &VocabHashIndex,
     token_arena: &[u8],
     token_spans: &[TokenSpan],
-    vocab_sorted: &[u32],
     extras: &[&[u8]],
     vocab_cap: u32,
     key: &[u8],
 ) -> u32 {
-    find_vocab_bytes(token_arena, token_spans, vocab_sorted, key).unwrap_or_else(|| {
-        extras
-            .binary_search(&key)
-            .ok()
-            .and_then(|idx| u32::try_from(idx).ok())
-            .and_then(|offset| vocab_cap.checked_add(offset))
-            .unwrap_or(UNMAPPED_SYMBOL)
-    })
+    vocab_index
+        .get(token_arena, token_spans, key)
+        .unwrap_or_else(|| {
+            if extras.is_empty() {
+                return UNMAPPED_SYMBOL;
+            }
+            extras
+                .binary_search(&key)
+                .ok()
+                .and_then(|idx| u32::try_from(idx).ok())
+                .and_then(|offset| vocab_cap.checked_add(offset))
+                .unwrap_or(UNMAPPED_SYMBOL)
+        })
 }
 
 fn build_pair_index(
@@ -597,14 +669,15 @@ fn build_pair_index(
     merge_arena: &[u8],
     merges: &[MergeEntry],
 ) -> io::Result<(PairTable, [u32; 256])> {
+    let vocab_index = VocabHashIndex::build(token_arena, token_spans, vocab_sorted)?;
     let mut extras = Vec::new();
     for &entry in merges {
         let (left, right) = merge_parts(merge_arena, entry);
-        if find_vocab_bytes(token_arena, token_spans, vocab_sorted, left).is_none() {
+        if vocab_index.get(token_arena, token_spans, left).is_none() {
             extras.try_reserve(1).map_err(io::Error::other)?;
             extras.push(left);
         }
-        if find_vocab_bytes(token_arena, token_spans, vocab_sorted, right).is_none() {
+        if vocab_index.get(token_arena, token_spans, right).is_none() {
             extras.try_reserve(1).map_err(io::Error::other)?;
             extras.push(right);
         }
@@ -622,26 +695,26 @@ fn build_pair_index(
     let mut pair_table = PairTable::with_capacity(merges.len())?;
     for &entry in merges {
         let (left, right) = merge_parts(merge_arena, entry);
-        let left_sym = resolve_symbol(
+        let left_sym = resolve_symbol_indexed(
+            &vocab_index,
             token_arena,
             token_spans,
-            vocab_sorted,
             &extras,
             vocab_cap,
             left,
         );
-        let right_sym = resolve_symbol(
+        let right_sym = resolve_symbol_indexed(
+            &vocab_index,
             token_arena,
             token_spans,
-            vocab_sorted,
             &extras,
             vocab_cap,
             right,
         );
-        let merged = resolve_symbol(
+        let merged = resolve_symbol_indexed(
+            &vocab_index,
             token_arena,
             token_spans,
-            vocab_sorted,
             &extras,
             vocab_cap,
             merge_combined(merge_arena, entry),
@@ -653,10 +726,10 @@ fn build_pair_index(
     for (byte, slot) in byte_symbols.iter_mut().enumerate() {
         let byte_val = u8::try_from(byte).unwrap_or(0);
         let encoded = byte_glyph(byte_val).encode_utf8(&mut glyph_buf);
-        *slot = resolve_symbol(
+        *slot = resolve_symbol_indexed(
+            &vocab_index,
             token_arena,
             token_spans,
-            vocab_sorted,
             &extras,
             vocab_cap,
             encoded.as_bytes(),
