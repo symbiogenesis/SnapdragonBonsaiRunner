@@ -188,6 +188,8 @@ struct Request {
     no_abliterate_lora: bool,
     #[serde(default, rename = "DaisyRoseLora")]
     daisyrose_lora: Option<PathBuf>,
+    #[serde(default, rename = "NoDaisyRoseLora")]
+    no_daisyrose_lora: bool,
     #[serde(default)]
     no_mmproj: bool,
     #[serde(default)]
@@ -476,6 +478,9 @@ impl Request {
         }
         if self.placement.is_some() && !self.native_engine {
             return Err("Placement requires NativeEngine.".into());
+        }
+        if self.no_daisyrose_lora && self.daisyrose_lora.is_some() {
+            return Err("NoDaisyRoseLora cannot be combined with DaisyRoseLora.".into());
         }
         if let Some(path) = &self.daisyrose_lora {
             if !self.native_engine {
@@ -1039,11 +1044,34 @@ fn argument(arguments: &mut Vec<OsString>, name: &str, value: impl Into<OsString
     arguments.push(value.into());
 }
 
+fn effective_daisyrose_lora_path(
+    request: &Request,
+    pinned: Option<&bonsai_cpu_policy::DaisyRoseLoraArtifact>,
+) -> Option<PathBuf> {
+    if request.no_daisyrose_lora || !request.native_engine {
+        return None;
+    }
+    if let Some(explicit) = &request.daisyrose_lora {
+        return Some(explicit.clone());
+    }
+    pinned
+        .filter(|artifact| artifact.default_enabled)
+        .map(|artifact| artifact.path.clone())
+}
+
 fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
     if request.no_abliterate_lora {
         arguments.push("--no-abliterate-lora".into());
     }
-    if let Some(daisyrose_lora) = &request.daisyrose_lora {
+    if request.no_daisyrose_lora {
+        arguments.push("--no-daisyrose-lora".into());
+    }
+    let pinned_daisyrose =
+        bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&request.data_directory)
+            .ok()
+            .flatten();
+    if let Some(daisyrose_lora) = effective_daisyrose_lora_path(request, pinned_daisyrose.as_ref())
+    {
         argument(arguments, "--daisyrose-lora", daisyrose_lora);
     }
     if request.no_mmproj {

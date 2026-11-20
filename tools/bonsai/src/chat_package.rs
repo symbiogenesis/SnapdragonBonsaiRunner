@@ -359,6 +359,7 @@ fn launch_options(package: &Value, options: Value) -> crate::Result<Value> {
                 | "NoSpeechModels"
                 | "NoTts"
                 | "NoAbliterateLora"
+                | "NoDaisyRoseLora"
                 | "UseRepackedPtq1"
                 | "NativeEngine"
                 | "RequireBrokerPipe"
@@ -627,6 +628,7 @@ mod tests {
                 "RequireBrokerPipe": true,
                 "NativeRowWorkers": 4,
                 "NoAbliterateLora": true,
+                "NoDaisyRoseLora": true,
                 "PromptReuse": "prompt-end-and-latest",
                 "PromptReuseCheckpoints": 4,
                 "CpuPrefillTokens": 16,
@@ -640,6 +642,7 @@ mod tests {
         assert_eq!(native["RequireBrokerPipe"], true);
         assert_eq!(native["NativeRowWorkers"], 4);
         assert_eq!(native["NoAbliterateLora"], true);
+        assert_eq!(native["NoDaisyRoseLora"], true);
         assert_eq!(native["PromptReuse"], "prompt-end-and-latest");
         assert_eq!(native["PromptReuseCheckpoints"], 4);
         assert_eq!(native["CpuPrefillTokens"], 16);

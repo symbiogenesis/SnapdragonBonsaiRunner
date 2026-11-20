@@ -5,7 +5,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
-use bonsai_artifacts::{is_redirect, open_locked_file, validate_external_path};
+use bonsai_artifacts::{
+    MultiRankEnvelope, is_redirect, open_locked_file, validate_external_path,
+    verify_multi_rank_lora_gguf,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zip::ZipArchive;
@@ -46,6 +49,7 @@ struct Request {
 enum Operation {
     Model,
     Adapter,
+    DaisyroseLora,
     Mmproj,
     Engine,
     Inference,
@@ -297,6 +301,83 @@ fn mmproj(request: &Request, working: &Path) -> crate::Result<Value> {
         "Revision": selected.revision,
         "Sha256": selected.sha256,
         "Qualification": "pretrained vision projector artifact integrity only"
+    }))
+}
+
+fn daisyrose_lora(request: &Request, working: &Path) -> crate::Result<Value> {
+    let selected = if let Some(lock_path) = request.lock_path.as_deref() {
+        if !lock_path.is_absolute() {
+            return Err("LockPath must be expanded and absolute.".into());
+        }
+        validate_external_path(lock_path).map_err(|error| error.to_string())?;
+        let raw_bytes = crate::bounded_input::read_regular_file(
+            lock_path,
+            MAX_LOCK_BYTES,
+            "Artifact lock exceeds its byte bound.",
+        )?;
+        let raw_json = String::from_utf8(raw_bytes)
+            .map_err(|_| "DaisyRose artifact lock must be valid UTF-8 JSON.".to_owned())?;
+        bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&request.data_directory, &raw_json)?
+    } else {
+        bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&request.data_directory)?.ok_or_else(
+            || {
+                "No pinned DaisyRose multi-rank LoRA lock is compiled yet (DR-B1/DR-G2 pending); supply an explicit lockPath for a candidate lock.".to_owned()
+            },
+        )?
+    };
+    if !request.verify_only && !request.data_directory.is_dir() {
+        return Err("The external DataDirectory must already exist.".into());
+    }
+    if request.verify_only {
+        crate::startup_download::verify(&selected.path, selected.bytes, &selected.sha256)?;
+    } else {
+        crate::startup_download::receive_with_timeout(
+            &selected.url,
+            &selected.path,
+            selected.bytes,
+            &selected.sha256,
+            working,
+            std::time::Duration::from_mins(5),
+        )?;
+    }
+    #[cfg(windows)]
+    {
+        let envelope = match selected.envelope.as_str() {
+            "npu-friendly" => MultiRankEnvelope::NpuFriendly,
+            "full-matrix" => MultiRankEnvelope::FullMatrix,
+            _ => return Err("Unsupported DaisyRose lock envelope.".into()),
+        };
+        let verified = verify_multi_rank_lora_gguf(
+            &selected.path,
+            selected.max_rank,
+            selected.bytes,
+            envelope,
+        )
+        .map_err(|error| format!("DaisyRose GGUF verification failed ({error:?})."))?;
+        if verified.sha256() != selected.sha256
+            || verified.max_rank() > selected.max_rank
+            || verified.target_count() != selected.target_count
+        {
+            return Err(
+                "DaisyRose GGUF metadata disagrees with the supplied lock identity.".into(),
+            );
+        }
+    }
+    Ok(json!({
+        "Status": "verified",
+        "AdapterPath": selected.path,
+        "Repository": selected.repository,
+        "Revision": selected.revision,
+        "Sha256": selected.sha256,
+        "Envelope": selected.envelope,
+        "Dtype": selected.dtype,
+        "MaxRank": selected.max_rank,
+        "TargetCount": selected.target_count,
+        "Qualification": if selected.default_enabled {
+            "verified multi-rank GGUF against promoted lock"
+        } else {
+            "candidate multi-rank GGUF integrity only; DR-G2/CI/device qualification remains separate"
+        }
     }))
 }
 
@@ -1452,7 +1533,7 @@ pub fn run(value: Value) -> crate::Result<Value> {
     if request.lock_path.is_some()
         && !matches!(
             request.operation,
-            Operation::Model | Operation::Engine | Operation::Inference
+            Operation::Model | Operation::DaisyroseLora | Operation::Engine | Operation::Inference
         )
         || request.include_capabilities
             && (request.operation != Operation::Inference || request.lock_path.is_some())
@@ -1470,6 +1551,7 @@ pub fn run(value: Value) -> crate::Result<Value> {
     match request.operation {
         Operation::Model => model(&request, &working),
         Operation::Adapter => adapter(&request, &working),
+        Operation::DaisyroseLora => daisyrose_lora(&request, &working),
         Operation::Mmproj => mmproj(&request, &working),
         Operation::Engine => engine(&request, &working),
         Operation::Inference => inference(&request, &working),
@@ -2302,6 +2384,206 @@ mod tests {
         assert!(current_dir.join("prism-inference.exe").is_file());
         assert!(!inference.join(old_commit).exists());
         assert!(owner_dir.join("owner.txt").is_file());
+
+        fs::remove_dir_all(root).map_err(|error| error.to_string())
+    }
+
+    fn build_synthetic_lora_gguf(target_base: &str, rank: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let push_str = |buf: &mut Vec<u8>, s: &str| {
+            let len = u64::try_from(s.len()).unwrap_or(0);
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        };
+        let push_kv_str = |buf: &mut Vec<u8>, key: &str, val: &str| {
+            push_str(buf, key);
+            buf.extend_from_slice(&8_u32.to_le_bytes());
+            push_str(buf, val);
+        };
+        let push_kv_f32 = |buf: &mut Vec<u8>, key: &str, val: f32| {
+            push_str(buf, key);
+            buf.extend_from_slice(&6_u32.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        };
+        let push_kv_u32 = |buf: &mut Vec<u8>, key: &str, val: u32| {
+            push_str(buf, key);
+            buf.extend_from_slice(&4_u32.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        };
+
+        let mut kv = Vec::new();
+        push_kv_str(&mut kv, "general.architecture", "qwen35");
+        push_kv_str(&mut kv, "general.type", "adapter");
+        push_kv_str(&mut kv, "adapter.type", "lora");
+        push_kv_f32(&mut kv, "adapter.lora.alpha", 16.0);
+        push_kv_f32(&mut kv, "adapter.lora_alpha", 16.0);
+        push_kv_u32(&mut kv, "general.alignment", 32);
+
+        let a_name = format!("{target_base}.lora_a");
+        let b_name = format!("{target_base}.lora_b");
+        let elems_a = usize::try_from(4 * rank).unwrap_or(0);
+        let elems_b = usize::try_from(rank * 3).unwrap_or(0);
+        let a_bytes: Vec<u8> = std::iter::repeat_n(0x3c00_u16.to_le_bytes(), elems_a)
+            .flatten()
+            .collect();
+        let b_bytes: Vec<u8> = std::iter::repeat_n(0x3800_u16.to_le_bytes(), elems_b)
+            .flatten()
+            .collect();
+
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3_u32.to_le_bytes());
+        out.extend_from_slice(&2_u64.to_le_bytes());
+        out.extend_from_slice(&6_u64.to_le_bytes());
+        out.extend_from_slice(&kv);
+
+        let a_offset = 0_u64;
+        let b_offset = u64::try_from(a_bytes.len().next_multiple_of(32)).unwrap_or(0);
+        for (name, dims, offset) in [
+            (&a_name, [4_u64, rank], a_offset),
+            (&b_name, [rank, 3_u64], b_offset),
+        ] {
+            push_str(&mut out, name);
+            out.extend_from_slice(&2_u32.to_le_bytes());
+            out.extend_from_slice(&dims[0].to_le_bytes());
+            out.extend_from_slice(&dims[1].to_le_bytes());
+            out.extend_from_slice(&1_u32.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+        let header_padded = out.len().next_multiple_of(32);
+        out.resize(header_padded, 0);
+        for data in [&a_bytes, &b_bytes] {
+            out.extend_from_slice(data);
+            let padded = data.len().next_multiple_of(32);
+            out.resize(out.len() + (padded - data.len()), 0);
+        }
+        out
+    }
+
+    #[test]
+    fn daisyrose_lora_provisioning_rejects_unpinned_default_and_verifies_candidate_locks()
+    -> crate::Result<()> {
+        use sha2::{Digest as _, Sha256};
+
+        let root = std::env::temp_dir().join(format!(
+            "Bonsai-Provision-DaisyRose-{}",
+            crate::startup_process::unique()
+        ));
+        let data = root.join("data");
+
+        // Without lockPath, unpinned default rejects before creating dataDirectory.
+        let unpinned_err = run(json!({
+            "operation": "daisyrose-lora",
+            "dataDirectory": data,
+            "verifyOnly": true,
+        }))
+        .err()
+        .ok_or("Expected unpinned daisyrose-lora to reject.")?;
+        assert!(unpinned_err.contains("No pinned DaisyRose"));
+        assert!(!data.exists());
+
+        // Reject inapplicable provisioning options for daisyrose-lora.
+        for bad in [
+            json!({"operation": "daisyrose-lora", "dataDirectory": data, "includeHelp": true}),
+            json!({"operation": "daisyrose-lora", "dataDirectory": data, "includeCapabilities": true}),
+            json!({"operation": "daisyrose-lora", "dataDirectory": data, "model": "QwenTts"}),
+            json!({"operation": "daisyrose-lora", "dataDirectory": data, "ttsQuantization": "Q4_K_M"}),
+        ] {
+            assert!(run(bad).is_err());
+        }
+
+        fs::create_dir_all(&data).map_err(|error| error.to_string())?;
+        let rev = "0123456789abcdef0123456789abcdef01234567";
+        let filename = "daisyrose-candidate.gguf";
+        let adapter_dir = data.join("adapters").join(rev);
+        fs::create_dir_all(&adapter_dir).map_err(|error| error.to_string())?;
+        let adapter_path = adapter_dir.join(filename);
+        let gguf_bytes = build_synthetic_lora_gguf("blk.0.ffn_down.weight", 4);
+        fs::write(&adapter_path, &gguf_bytes).map_err(|error| error.to_string())?;
+        let sha = crate::identity::hex(&Sha256::digest(&gguf_bytes));
+        let swift_model_sha = "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5";
+        let url = format!(
+            "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/{rev}/gguf/{filename}"
+        );
+        let candidate_lock = json!({
+            "schemaVersion": 1,
+            "envelope": "npu-friendly",
+            "dtype": "f16",
+            "maxRank": 4,
+            "targetCount": 1,
+            "bytes": gguf_bytes.len(),
+            "sha256": sha,
+            "baseModelSha256": swift_model_sha,
+            "source": {
+                "host": "huggingface",
+                "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+                "revision": rev,
+                "path": format!("gguf/{filename}"),
+                "filename": filename,
+                "url": url,
+                "license": "Apache-2.0"
+            },
+            "defaultEnabled": false
+        });
+        let lock_path = root.join("daisyrose.lock.json");
+        fs::write(
+            &lock_path,
+            serde_json::to_vec(&candidate_lock).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let receipt = run(json!({
+            "operation": "daisyrose-lora",
+            "dataDirectory": data,
+            "lockPath": lock_path,
+            "verifyOnly": true,
+        }))?;
+        assert_eq!(receipt["Status"], "verified");
+        assert_eq!(receipt["Envelope"], "npu-friendly");
+        assert_eq!(receipt["MaxRank"], 4);
+        assert_eq!(receipt["TargetCount"], 1);
+        assert_eq!(receipt["Sha256"], sha);
+
+        // Reject targetCount mismatch against the verified GGUF.
+        let mut wrong_count_lock = candidate_lock.clone();
+        wrong_count_lock["targetCount"] = json!(2);
+        let wrong_count_path = root.join("daisyrose-wrong-count.lock.json");
+        fs::write(
+            &wrong_count_path,
+            serde_json::to_vec(&wrong_count_lock).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(
+            run(json!({
+                "operation": "daisyrose-lora",
+                "dataDirectory": data,
+                "lockPath": wrong_count_path,
+                "verifyOnly": true,
+            }))
+            .is_err()
+        );
+
+        // Reject ffn_gate target under npu-friendly envelope even when file hash/bytes match lock.
+        let gate_bytes = build_synthetic_lora_gguf("blk.0.ffn_gate.weight", 4);
+        fs::write(&adapter_path, &gate_bytes).map_err(|error| error.to_string())?;
+        let gate_sha = crate::identity::hex(&Sha256::digest(&gate_bytes));
+        let mut gate_lock = candidate_lock;
+        gate_lock["bytes"] = json!(gate_bytes.len());
+        gate_lock["sha256"] = json!(gate_sha);
+        let gate_lock_path = root.join("daisyrose-gate.lock.json");
+        fs::write(
+            &gate_lock_path,
+            serde_json::to_vec(&gate_lock).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(
+            run(json!({
+                "operation": "daisyrose-lora",
+                "dataDirectory": data,
+                "lockPath": gate_lock_path,
+                "verifyOnly": true,
+            }))
+            .is_err()
+        );
 
         fs::remove_dir_all(root).map_err(|error| error.to_string())
     }

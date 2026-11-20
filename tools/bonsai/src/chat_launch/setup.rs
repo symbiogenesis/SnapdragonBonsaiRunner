@@ -202,6 +202,12 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
     let mmproj = (!request.no_mmproj)
         .then(|| bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory))
         .transpose()?;
+    let daisyrose =
+        (request.native_engine && !request.no_daisyrose_lora && request.daisyrose_lora.is_none())
+            .then(|| bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&request.data_directory))
+            .transpose()?
+            .flatten()
+            .filter(|artifact| artifact.default_enabled);
     prepare_weights_with(
         request,
         working,
@@ -209,6 +215,7 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
         model_exists,
         kind,
         mmproj.as_ref(),
+        daisyrose.as_ref(),
         |url, path, bytes, hash, working| {
             let stage = if path == selected.path {
                 "model"
@@ -217,6 +224,11 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
                 .is_some_and(|artifact| artifact.path == path)
             {
                 "mmproj"
+            } else if daisyrose
+                .as_ref()
+                .is_some_and(|artifact| artifact.path == path)
+            {
+                "daisyrose-lora"
             } else {
                 "adapter"
             };
@@ -250,6 +262,12 @@ fn prepare_weights(
     let mmproj = (!request.no_mmproj)
         .then(|| bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory))
         .transpose()?;
+    let daisyrose =
+        (request.native_engine && !request.no_daisyrose_lora && request.daisyrose_lora.is_none())
+            .then(|| bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&request.data_directory))
+            .transpose()?
+            .flatten()
+            .filter(|artifact| artifact.default_enabled);
     prepare_weights_with(
         request,
         working,
@@ -257,6 +275,7 @@ fn prepare_weights(
         model_exists,
         kind,
         mmproj.as_ref(),
+        daisyrose.as_ref(),
         receive,
         verify,
     )
@@ -264,7 +283,7 @@ fn prepare_weights(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Shares pre-resolved model, existence, kind and mmproj state from prepare without reparsing."
+    reason = "Shares pre-resolved model, existence, kind, mmproj, and daisyrose state from prepare without reparsing."
 )]
 fn prepare_weights_with(
     request: &Request,
@@ -273,6 +292,7 @@ fn prepare_weights_with(
     model_exists: bool,
     kind: &str,
     mmproj: Option<&bonsai_cpu_policy::SwiftMmprojArtifact>,
+    daisyrose: Option<&bonsai_cpu_policy::DaisyRoseLoraArtifact>,
     mut receive: impl FnMut(&str, &Path, u64, &str, &Path) -> crate::Result<()>,
     mut verify: impl FnMut(&Path, u64, &str) -> crate::Result<()>,
 ) -> crate::Result<()> {
@@ -323,6 +343,34 @@ fn prepare_weights_with(
         receive(&mmproj.url, &mmproj.path, mmproj.bytes, &mmproj.sha256, working)
             .map_err(|error| format!("Vision projector setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup.", mmproj.path.display()))?;
     }
+    if let Some(daisyrose) = daisyrose.filter(|artifact| {
+        artifact.default_enabled
+            && request.native_engine
+            && !request.no_daisyrose_lora
+            && request.daisyrose_lora.is_none()
+    }) {
+        status(
+            working,
+            "daisyrose-lora",
+            "Checking DaisyRose adapter files…",
+            kind,
+            "checking",
+            Some((&daisyrose.path, daisyrose.bytes)),
+        )?;
+        receive(
+            &daisyrose.url,
+            &daisyrose.path,
+            daisyrose.bytes,
+            &daisyrose.sha256,
+            working,
+        )
+        .map_err(|error| {
+            format!(
+                "DaisyRose adapter setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup.",
+                daisyrose.path.display()
+            )
+        })?;
+    }
     status(
         working,
         "ready",
@@ -366,6 +414,7 @@ fn artifact_status(
     let name = match stage {
         "model" => "Swift model",
         "mmproj" => "vision projector",
+        "daisyrose-lora" => "DaisyRose adapter",
         _ => "model adapter",
     };
     let (activity, message) = match phase {
@@ -572,6 +621,152 @@ mod tests {
                 .0
                 .ends_with("Swift-Bonsai-2-current-repacked-PTQ1_0.gguf")
         );
+        fs::remove_dir_all(working).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn automatic_weight_setup_handles_promoted_daisyrose_opt_in_and_opt_out() -> crate::Result<()> {
+        let working = std::env::temp_dir().join(format!(
+            "Bonsai-SetupDaisyRose-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&working).map_err(|error| error.to_string())?;
+        let data = working.join("data");
+        fs::create_dir(&data).map_err(|error| error.to_string())?;
+        let mut request: Request = serde_json::from_value(json!({
+            "DataDirectory": data,
+            "RepositoryRoot": working.join("source"),
+            "NativeEngine": true,
+            "NoAbliterateLora": true,
+            "NoMmproj": true,
+        }))
+        .map_err(|error| error.to_string())?;
+        let selected = model(&request)?;
+        fs::create_dir_all(selected.path.parent().ok_or("Missing parent.")?)
+            .map_err(|error| error.to_string())?;
+        fs::write(&selected.path, b"model-free placeholder").map_err(|error| error.to_string())?;
+
+        // Unpinned default downloads zero DaisyRose files.
+        let mut default_received = Vec::new();
+        prepare_weights(
+            &request,
+            &working,
+            |_url, path, _bytes, _hash, _| {
+                default_received.push(path.to_owned());
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(default_received, vec![selected.path.clone()]);
+
+        let lock = json!({
+            "schemaVersion": 1,
+            "envelope": "npu-friendly",
+            "dtype": "f16",
+            "maxRank": 16,
+            "targetCount": 128,
+            "bytes": 67_108_864_u64,
+            "sha256": "a".repeat(64),
+            "baseModelSha256": "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
+            "source": {
+                "host": "huggingface",
+                "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
+                "path": "gguf/daisyrose.gguf",
+                "filename": "daisyrose.gguf",
+                "url": "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose.gguf",
+                "license": "Apache-2.0"
+            },
+            "defaultEnabled": true,
+            "defaultScaleTenths": 10
+        });
+        let promoted =
+            bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &lock.to_string())?;
+
+        // Promoted default downloads DaisyRose after model when enabled.
+        let mut received = Vec::new();
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            true,
+            "existing",
+            None,
+            Some(&promoted),
+            |url, path, bytes, hash, _| {
+                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[1].0, promoted.url);
+        assert_eq!(received[1].1, promoted.path);
+        assert_eq!(received[1].2, promoted.bytes);
+        assert_eq!(received[1].3, promoted.sha256);
+
+        // NoDaisyRoseLora skips automatic DaisyRose download.
+        request.no_daisyrose_lora = true;
+        received.clear();
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            true,
+            "existing",
+            None,
+            Some(&promoted),
+            |url, path, bytes, hash, _| {
+                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(received.len(), 1);
+
+        // Explicit --daisyrose-lora override skips automatic pinned download too.
+        request.no_daisyrose_lora = false;
+        request.daisyrose_lora = Some(data.join("explicit-daisy.gguf"));
+        received.clear();
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            true,
+            "existing",
+            None,
+            Some(&promoted),
+            |url, path, bytes, hash, _| {
+                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(received.len(), 1);
+
+        // Download failure on DaisyRose stops setup cleanly.
+        request.daisyrose_lora = None;
+        let err = prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            true,
+            "existing",
+            None,
+            Some(&promoted),
+            |_, path, _, _, _| {
+                if path == promoted.path {
+                    Err("Synthetic DaisyRose failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _, _| Ok(()),
+        )
+        .err()
+        .ok_or("Expected DaisyRose setup failure.")?;
+        assert!(err.contains("DaisyRose adapter setup failed"));
+
         fs::remove_dir_all(working).map_err(|error| error.to_string())
     }
 }

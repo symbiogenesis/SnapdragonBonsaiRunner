@@ -73,7 +73,7 @@ fn status(report: Report, data: &Path) -> Option<Status> {
     if !matches!(report.schema_version, 1 | 2)
         || !matches!(
             report.stage.as_str(),
-            "model" | "adapter" | "mmproj" | "runtime" | "ready"
+            "model" | "adapter" | "mmproj" | "daisyrose-lora" | "runtime" | "ready"
         )
         || report.message.is_empty()
         || report.message.len() > 512
@@ -89,6 +89,7 @@ fn status(report: Report, data: &Path) -> Option<Status> {
             "ready" => (Activity::Ready, "Starting your local model…"),
             "adapter" => (Activity::Checking, "Preparing model adapter files…"),
             "mmproj" => (Activity::Checking, "Preparing Swift vision encoder files…"),
+            "daisyrose-lora" => (Activity::Checking, "Preparing DaisyRose adapter files…"),
             _ => (Activity::Checking, "Preparing Swift model files…"),
         };
         (activity, message.to_owned(), None)
@@ -226,6 +227,26 @@ mod tests {
         assert_eq!(
             status(mmproj_legacy, &data).map(|parsed| parsed.activity),
             Some(Activity::Checking)
+        );
+        let mut daisyrose = make();
+        daisyrose.stage = "daisyrose-lora".into();
+        daisyrose.message = "Downloading DaisyRose adapter…".into();
+        assert!(status(daisyrose, &data).is_some());
+        let daisyrose_legacy = Report {
+            schema_version: 1,
+            stage: "daisyrose-lora".into(),
+            message: "Checking DaisyRose files…".into(),
+            kind: None,
+            activity: None,
+            artifact_path: None,
+            expected_bytes: None,
+        };
+        assert_eq!(
+            status(daisyrose_legacy, &data).map(|parsed| (parsed.activity, parsed.message)),
+            Some((
+                Activity::Checking,
+                "Preparing DaisyRose adapter files…".into()
+            ))
         );
         let mut unknown = make();
         unknown.stage = "unreviewed".into();

@@ -1281,7 +1281,26 @@ fn native_alternate_profiles_keep_verified_launch_options() -> crate::Result<()>
                 && pair[1] == daisy_path.to_string_lossy().as_ref())
     );
     daisy_fixture.request["NativeEngine"] = json!(false);
+    assert!(plan(daisy_fixture.request.clone()).is_err());
+    daisy_fixture.request["NativeEngine"] = json!(true);
+    daisy_fixture.request["NoDaisyRoseLora"] = json!(true);
     assert!(plan(daisy_fixture.request).is_err());
+
+    let mut no_daisy = fixture("no-daisyrose-forwarding")?;
+    no_daisy.request["NativeEngine"] = json!(true);
+    no_daisy.request["NoSpeechModels"] = json!(true);
+    no_daisy.request["NoDaisyRoseLora"] = json!(true);
+    let mut no_daisy_recorder = Recorder::new(no_daisy.root.clone());
+    let no_daisy_result = prepare_backend(
+        plan(no_daisy.request.clone())?,
+        &mut no_daisy_recorder,
+        &no_daisy.working,
+    )?;
+    let no_daisy_args = no_daisy_result["Arguments"]
+        .as_array()
+        .ok_or("Missing launch arguments.")?;
+    assert!(no_daisy_args.iter().any(|arg| arg == "--no-daisyrose-lora"));
+    assert!(!no_daisy_args.iter().any(|arg| arg == "--daisyrose-lora"));
     Ok(())
 }
 
@@ -1809,4 +1828,62 @@ fn sandbox_preflight_stops_before_downloads_and_formats_reboot_and_update_guidan
     assert!(recorder.0.events.is_empty());
     assert!(recorder.0.artifact_requests.is_empty());
     Ok(())
+}
+
+#[test]
+fn effective_daisyrose_path_respects_promotion_opt_out_and_explicit_override() -> crate::Result<()>
+{
+    let fixture = fixture("effective-daisyrose")?;
+    let mut req: Request = serde_json::from_value(fixture.request).map_err(|e| e.to_string())?;
+    req.native_engine = true;
+
+    let data = fixture.root.join("data");
+    let lock = json!({
+        "schemaVersion": 1,
+        "envelope": "npu-friendly",
+        "dtype": "f16",
+        "maxRank": 16,
+        "targetCount": 128,
+        "bytes": 67_108_864_u64,
+        "sha256": "a".repeat(64),
+        "baseModelSha256": "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
+        "source": {
+            "host": "huggingface",
+            "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "path": "gguf/daisyrose.gguf",
+            "filename": "daisyrose.gguf",
+            "url": "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose.gguf",
+            "license": "Apache-2.0"
+        },
+        "defaultEnabled": true,
+        "defaultScaleTenths": 10
+    });
+    let promoted = bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &lock.to_string())?;
+    let mut unpromoted = promoted.clone();
+    unpromoted.default_enabled = false;
+
+    assert_eq!(effective_daisyrose_lora_path(&req, None), None);
+    assert_eq!(effective_daisyrose_lora_path(&req, Some(&unpromoted)), None);
+    assert_eq!(
+        effective_daisyrose_lora_path(&req, Some(&promoted)),
+        Some(promoted.path.clone())
+    );
+
+    req.no_daisyrose_lora = true;
+    assert_eq!(effective_daisyrose_lora_path(&req, Some(&promoted)), None);
+
+    req.no_daisyrose_lora = false;
+    req.native_engine = false;
+    assert_eq!(effective_daisyrose_lora_path(&req, Some(&promoted)), None);
+
+    req.native_engine = true;
+    let explicit = fixture.root.join("explicit.gguf");
+    req.daisyrose_lora = Some(explicit.clone());
+    assert_eq!(
+        effective_daisyrose_lora_path(&req, Some(&promoted)),
+        Some(explicit)
+    );
+
+    fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
 }

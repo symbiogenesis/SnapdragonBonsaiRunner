@@ -159,6 +159,7 @@ fn configuration_for_family(
     let mut require_broker_pipe = false;
     let mut no_abliterate_lora = false;
     let mut daisyrose_lora = None;
+    let mut no_daisyrose_lora = false;
     let mut no_mmproj = false;
     let mut use_repacked_ptq1 = None;
     let mut native_engine = None;
@@ -183,6 +184,7 @@ fn configuration_for_family(
                         .ok_or("A DaisyRose multi-rank LoRA GGUF path is required.")?,
                 ));
             }
+            Some("--no-daisyrose-lora") if !no_daisyrose_lora => no_daisyrose_lora = true,
             Some("--no-mmproj") if !no_mmproj => no_mmproj = true,
             Some("--use-repacked-ptq1") if use_repacked_ptq1.is_none() => {
                 use_repacked_ptq1 = Some(true);
@@ -415,7 +417,7 @@ fn configuration_for_family(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
@@ -475,6 +477,9 @@ fn configuration_for_family(
     }
     if placement.is_some() && !native_engine {
         return Err("Placement selection requires --native-engine.");
+    }
+    if no_daisyrose_lora && daisyrose_lora.is_some() {
+        return Err("--no-daisyrose-lora cannot be combined with --daisyrose-lora.");
     }
     if daisyrose_lora.is_some() && !native_engine {
         return Err("DaisyRose multi-rank LoRA requires --native-engine.");
@@ -1242,11 +1247,22 @@ mod tests {
         ]);
         let parsed_daisy = configuration(with_daisy.clone()).map_err(io::Error::other)?;
         assert_eq!(parsed_daisy.daisyrose_lora.as_ref(), Some(&daisy_gguf));
+        let mut conflict_daisy = with_daisy.clone();
+        conflict_daisy.push("--no-daisyrose-lora".into());
+        assert!(configuration(conflict_daisy).is_err());
         with_daisy.extend([
             OsString::from("--daisyrose-lora"),
             daisy_gguf.as_os_str().to_owned(),
         ]);
         assert!(configuration(with_daisy).is_err());
+
+        let mut no_daisy = native.clone();
+        no_daisy.push("--no-daisyrose-lora".into());
+        let parsed_no_daisy = configuration(no_daisy.clone()).map_err(io::Error::other)?;
+        assert!(parsed_no_daisy.daisyrose_lora.is_none());
+        no_daisy.push("--no-daisyrose-lora".into());
+        assert!(configuration(no_daisy).is_err());
+
         let mut publisher_daisy = args.clone();
         publisher_daisy.extend([
             OsString::from("--publisher-engine"),

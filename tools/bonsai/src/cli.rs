@@ -138,6 +138,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--use-repacked-ptq1" | "--use-original-pq2" => ("UseRepackedPtq1", true, false),
             "--no-abliterate-lora" => ("NoAbliterateLora", true, false),
             "--daisyrose-lora" => ("DaisyRoseLora", false, false),
+            "--no-daisyrose-lora" => ("NoDaisyRoseLora", true, false),
             "--no-mmproj" => ("NoMmproj", true, false),
             "--no-tts" => ("NoTts", true, false),
             "--no-speech-models" => ("NoSpeechModels", true, false),
@@ -227,6 +228,7 @@ pub fn installed_chat(arguments: &[OsString]) -> crate::Result<Value> {
                 | "NoSpeechModels"
                 | "NoTts"
                 | "NoAbliterateLora"
+                | "NoDaisyRoseLora"
                 | "NoMmproj"
                 | "UseRepackedPtq1"
                 | "NativeEngine"
@@ -285,6 +287,7 @@ mod tests {
         arguments.extend([
             "--no-speech-models".into(),
             "--no-mmproj".into(),
+            "--no-daisyrose-lora".into(),
             "--publisher-engine".into(),
         ]);
         let request = installed_chat(&arguments)?;
@@ -292,6 +295,7 @@ mod tests {
         assert_eq!(request["installationDirectory"], serde_json::json!(root));
         assert_eq!(request["options"]["NativeEngine"], false);
         assert_eq!(request["options"]["NoMmproj"], true);
+        assert_eq!(request["options"]["NoDaisyRoseLora"], true);
         assert_eq!(request["options"]["NoSpeechModels"], true);
         for forbidden in ["--repository-root", "--chat-path", "--broker-path"] {
             let mut arguments = prefix.clone();
@@ -497,6 +501,13 @@ mod tests {
         assert_eq!(
             chat_options(&["--daisyrose-lora".into(), daisy.clone().into()])?["DaisyRoseLora"],
             serde_json::to_value(&daisy).map_err(|e| e.to_string())?
+        );
+        assert_eq!(
+            chat_options(&["--no-daisyrose-lora".into()])?["NoDaisyRoseLora"],
+            true
+        );
+        assert!(
+            chat_options(&["--no-daisyrose-lora".into(), "--no-daisyrose-lora".into()]).is_err()
         );
         assert!(chat_options(&["--daisyrose-lora".into()]).is_err());
         assert!(
