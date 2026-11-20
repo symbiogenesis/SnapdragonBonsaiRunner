@@ -170,19 +170,24 @@ bonsai-tools chat --data-directory $data
 The explicit target keeps application static-CRT flags out of host build scripts
 and procedural macros, including when the host is also Windows ARM64.
 
-The optional convenience launcher uses the same prebuilt executable:
+The convenience launcher builds or refreshes `bonsai-tools.exe` into
+`%LOCALAPPDATA%\SwiftBonsai2\build\maintenance` automatically when `-ToolPath`
+and `BONSAI_TOOLS_PATH` are omitted (falling back to a cached or `PATH`
+executable when Cargo is unavailable), and skips Cargo when `-ToolPath` or
+`BONSAI_TOOLS_PATH` is explicitly provided:
 
 ```powershell
 ./scripts/Start-Chat.ps1
 ./scripts/Start-Chat.ps1 -PublisherEngine
 ```
 
-It accepts `-DataDirectory` and `-ToolPath`, otherwise selecting
-`BONSAI_TOOLS_PATH`, the maintenance build above, or `bonsai-tools.exe` on PATH.
-Omitting engine options selects Rust. `-NativeEngine` remains an explicit Rust
-selection; `-PublisherEngine` selects publisher rollback, prepared from its pinned
-release. See [runtime selection](#runtime-selection). The script
-only forwards to Rust and propagates its exit code; it builds or provisions nothing.
+It accepts `-DataDirectory`, `-ForceBuild` (which forwards `--force-build`),
+and `-ToolPath`. Omitting engine options selects Rust. `-NativeEngine` remains
+an explicit Rust selection; `-PublisherEngine` selects publisher rollback,
+prepared from its pinned release. See [runtime selection](#runtime-selection).
+Once `bonsai-tools.exe` is ready, the script forwards options to
+`bonsai-tools chat` and propagates its exit code; Rust owns startup, builds,
+provisioning, and application policy.
 
 The launcher prepares the UI and headless broker image before opening the window.
 The native window warms the Markdown worker before Swift or TTS preparation,
@@ -623,9 +628,11 @@ services still verify their models.
 worker runs after the first UI tick. Rust owns options, speech setup, builds,
 credentials, per-user admission and teardown. The maintenance executable can be
 selected from a trusted hosted artifact or built once with the commands above;
-the optional `Start-Chat.ps1` only forwards to this command. There is no
-source-bootstrap script or PowerShell module dependency. Unchanged
-launches call the executable directly without running Cargo. The JSON
+when `-ToolPath` and `BONSAI_TOOLS_PATH` are omitted, `Start-Chat.ps1` builds or
+reuses the maintenance executable automatically and forwards to `bonsai-tools chat`
+(passing `-ToolPath` or `BONSAI_TOOLS_PATH` skips Cargo). There is no
+source-bootstrap script or PowerShell module dependency. Direct `bonsai-tools chat`
+launches (and unchanged builds) call the executable without running Cargo. The JSON
 `chat-launch` command remains available for automation.
 
 Native commands observe and retain the caller's PID and creation identity before

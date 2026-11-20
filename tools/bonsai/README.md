@@ -34,7 +34,9 @@ For source builds and `chat` launch options, use the
 [development guide](../../docs/development-guide.md#contributor-source-launch),
 [runtime selection](../../docs/development-guide.md#runtime-selection) and
 [source-cache contract](../../docs/development-guide.md#source-launch-caches-and-runtime-selection).
-`scripts/Start-Chat.ps1` only forwards supplied options to the native tool.
+`scripts/Start-Chat.ps1` builds or refreshes `bonsai-tools.exe` automatically
+when `-ToolPath` and `BONSAI_TOOLS_PATH` are omitted, then forwards supplied
+options to `bonsai-tools chat`.
 
 Credential requests contain only `parentDirectory`, an existing absolute external
 local directory; results contain protected file paths, never key bytes.
