@@ -239,7 +239,8 @@ impl VocabHashIndex {
         slots.resize(cap, UNMAPPED_SYMBOL);
         let mask = cap - 1;
         for (idx, entry) in vocabulary.entries.iter().enumerate() {
-            let idx_u32 = u32::try_from(idx).map_err(|_| invalid("Invalid Qwen vocabulary index."))?;
+            let idx_u32 =
+                u32::try_from(idx).map_err(|_| invalid("Invalid Qwen vocabulary index."))?;
             let hash = fnv1a_step(FNV_OFFSET_64, vocabulary.entry_bytes(*entry));
             let mut pos = hash_slot(hash, mask);
             while slots[pos] != UNMAPPED_SYMBOL {
@@ -1132,7 +1133,10 @@ mod tests {
         tokenizer.reserve_merges(16, 256)?;
         for idx in 0..pad_count {
             let piece = format!("t{idx:03}");
-            tokenizer.add_token(piece.as_bytes(), i32::try_from(idx).map_err(io::Error::other)?)?;
+            tokenizer.add_token(
+                piece.as_bytes(),
+                i32::try_from(idx).map_err(io::Error::other)?,
+            )?;
         }
         let base = i32::try_from(pad_count).map_err(io::Error::other)?;
         tokenizer.add_token(b"a", base)?;

@@ -299,7 +299,8 @@ impl LaunchConfig {
                     use_abliterate_lora = true;
                 }
                 Some("--daisyrose-lora") if daisyrose_lora.is_none() => {
-                    daisyrose_lora = Some(PathBuf::from(args.next().ok_or(LaunchError::Arguments)?));
+                    daisyrose_lora =
+                        Some(PathBuf::from(args.next().ok_or(LaunchError::Arguments)?));
                 }
                 Some("--use-repacked-ptq1") if use_repacked_ptq1.is_none() => {
                     use_repacked_ptq1 = Some(true);
@@ -659,13 +660,14 @@ impl LaunchConfig {
         let budget = available_bytes
             .checked_sub(daisyrose_reserve_bytes)
             .ok_or(LaunchError::Memory)?;
-        let (mut plan, _, _) = bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
-            budget,
-            self.swift_context_profile()?,
-            false,
-            self.cpu_prefill_tokens.map(usize::from),
-        )
-        .map_err(|_| LaunchError::Memory)?;
+        let (mut plan, _, _) =
+            bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
+                budget,
+                self.swift_context_profile()?,
+                false,
+                self.cpu_prefill_tokens.map(usize::from),
+            )
+            .map_err(|_| LaunchError::Memory)?;
         if daisyrose_reserve_bytes > 0 {
             let reserve_usize =
                 usize::try_from(daisyrose_reserve_bytes).map_err(|_| LaunchError::Memory)?;
@@ -3068,8 +3070,8 @@ mod tests {
     }
 
     #[test]
-    fn daisyrose_lora_cli_gate_and_native_arguments_wire_sections_and_flags() -> Result<(), LaunchError>
-    {
+    fn daisyrose_lora_cli_gate_and_native_arguments_wire_sections_and_flags()
+    -> Result<(), LaunchError> {
         let data = std::env::temp_dir().join("Bonsai-daisyrose-args");
         let key = data.join("backend.key");
         let daisy_path = std::env::temp_dir().join("daisyrose-vet.gguf");
@@ -3084,7 +3086,10 @@ mod tests {
             daisy_path.as_os_str().to_owned(),
         ]);
         // Frozen v0.1.32 release pin refuses --daisyrose-lora at parse time.
-        assert_eq!(LaunchConfig::parse(gated.clone()).err(), Some(LaunchError::NativeRuntime));
+        assert_eq!(
+            LaunchConfig::parse(gated.clone()).err(),
+            Some(LaunchError::NativeRuntime)
+        );
 
         let mut non_native = arguments();
         non_native.extend([
@@ -3094,11 +3099,22 @@ mod tests {
             OsString::from("--daisyrose-lora"),
             daisy_path.as_os_str().to_owned(),
         ]);
-        assert_eq!(LaunchConfig::parse(non_native).err(), Some(LaunchError::Arguments));
+        assert_eq!(
+            LaunchConfig::parse(non_native).err(),
+            Some(LaunchError::Arguments)
+        );
 
         let mut config = LaunchConfig::parse({
             let mut base = arguments();
-            base.extend(["--profile", "swift-pq2-assessment", "--native-engine", "--use-abliterate-lora"].map(OsString::from));
+            base.extend(
+                [
+                    "--profile",
+                    "swift-pq2-assessment",
+                    "--native-engine",
+                    "--use-abliterate-lora",
+                ]
+                .map(OsString::from),
+            );
             base
         })?;
         config.daisyrose_lora = Some(daisy_path.clone());
@@ -3112,8 +3128,9 @@ mod tests {
         )
         .map_err(|_| LaunchError::Policy)?;
         let initial_limit = plan.working_set_limit_bytes;
-        let daisy_reserve = usize::try_from(8_000_000 + bonsai_cpu_policy::DAISYROSE_SCRATCH_HEADROOM_BYTES)
-            .map_err(|_| LaunchError::Policy)?;
+        let daisy_reserve =
+            usize::try_from(8_000_000 + bonsai_cpu_policy::DAISYROSE_SCRATCH_HEADROOM_BYTES)
+                .map_err(|_| LaunchError::Policy)?;
         plan.working_set_limit_bytes = initial_limit + daisy_reserve;
         plan.enable_daisyrose_lora(crate::launch_policy::DaisyRoseLoraPlan {
             path: daisy_path.clone(),
@@ -3125,10 +3142,26 @@ mod tests {
         assert_eq!(plan.native_child_memory_limit_bytes(), initial_limit);
 
         let pipe_args = config.native_arguments(&plan, None);
-        assert!(pipe_args.array_windows().any(|[f, v]| f == "--verified-sections" && v == "3"));
-        assert!(pipe_args.array_windows().any(|[f, v]| f == "--daisyrose-lora" && v == daisy_path.as_os_str()));
-        assert!(pipe_args.array_windows().any(|[f, v]| f == "--daisyrose-lora-bytes" && v == "8000000"));
-        assert!(pipe_args.array_windows().any(|[f, v]| f == "--daisyrose-lora-sha256" && v == daisy_sha.as_str()));
+        assert!(
+            pipe_args
+                .array_windows()
+                .any(|[f, v]| f == "--verified-sections" && v == "3")
+        );
+        assert!(
+            pipe_args
+                .array_windows()
+                .any(|[f, v]| f == "--daisyrose-lora" && v == daisy_path.as_os_str())
+        );
+        assert!(
+            pipe_args
+                .array_windows()
+                .any(|[f, v]| f == "--daisyrose-lora-bytes" && v == "8000000")
+        );
+        assert!(
+            pipe_args
+                .array_windows()
+                .any(|[f, v]| f == "--daisyrose-lora-sha256" && v == daisy_sha.as_str())
+        );
         Ok(())
     }
 

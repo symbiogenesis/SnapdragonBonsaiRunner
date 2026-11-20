@@ -1177,8 +1177,14 @@ fn export_denoised_and_verify_adapter_roundtrip_f32_and_f16() -> crate::Result<(
             "outputPath": out
         }))
     };
-    let res_a = run_export_denoised_with_dims(&export_req(&replay_gguf).map_err(|e| e.to_string())?, &toy_dims)?;
-    let res_b = run_export_denoised_with_dims(&export_req(&replay_gguf_b).map_err(|e| e.to_string())?, &toy_dims)?;
+    let res_a = run_export_denoised_with_dims(
+        &export_req(&replay_gguf).map_err(|e| e.to_string())?,
+        &toy_dims,
+    )?;
+    let res_b = run_export_denoised_with_dims(
+        &export_req(&replay_gguf_b).map_err(|e| e.to_string())?,
+        &toy_dims,
+    )?;
     assert_eq!(res_a["adapterSha256"], res_b["adapterSha256"]);
     assert_eq!(
         fs::read(&replay_gguf).map_err(|e| e.to_string())?,

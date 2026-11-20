@@ -654,12 +654,10 @@ fn main() -> std::io::Result<()> {
             matches!(super::sandbox_start_failure(io::ErrorKind::Unsupported),
                 Failure::Message(message) if message.contains("Update Windows") && message.contains("loopback"))
         );
-        assert!(
-            matches!(
-                super::sandbox_start_failure_for(&io::Error::from(io::ErrorKind::Unsupported), true),
-                Failure::Message(message) if message.contains("pending restart") && message.contains("Restart Windows")
-            )
-        );
+        assert!(matches!(
+            super::sandbox_start_failure_for(&io::Error::from(io::ErrorKind::Unsupported), true),
+            Failure::Message(message) if message.contains("pending restart") && message.contains("Restart Windows")
+        ));
         for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::PermissionDenied] {
             assert!(matches!(super::sandbox_start_failure(kind),
                     Failure::Message(message) if message.contains("retained service evidence") && !message.contains("parent environment")));

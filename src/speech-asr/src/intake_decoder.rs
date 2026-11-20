@@ -272,17 +272,18 @@ impl<'a> MappedSliceLoader<'a> {
         Self { index, mapping }
     }
 
-    pub(super) fn reserve_tensor(
-        &self,
-        remaining: &mut u64,
-        name: &str,
-    ) -> io::Result<()> {
+    pub(super) fn reserve_tensor(&self, remaining: &mut u64, name: &str) -> io::Result<()> {
         let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
         *remaining = remaining.checked_sub(tensor.bytes).ok_or_else(invalid)?;
         Ok(())
     }
 
-    fn tensor_slice(&self, name: &str, expected_kind: u32, elem_bytes: u64) -> io::Result<&'a [u8]> {
+    fn tensor_slice(
+        &self,
+        name: &str,
+        expected_kind: u32,
+        elem_bytes: u64,
+    ) -> io::Result<&'a [u8]> {
         let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
         if tensor.kind != expected_kind || !tensor.bytes.is_multiple_of(elem_bytes) {
             return Err(invalid());

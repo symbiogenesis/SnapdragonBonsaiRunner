@@ -904,7 +904,10 @@ pub struct DaisyRoseLoraLock {
 pub fn parse_daisyrose_lora_lock(json: &str) -> Result<DaisyRoseLoraLock, String> {
     let lock: DaisyRoseLoraLock =
         serde_json::from_str(json).map_err(|_| "Invalid DaisyRose LoRA lock JSON.".to_owned())?;
-    require(lock.schema_version == 1, "Unsupported DaisyRose lock schema version.")?;
+    require(
+        lock.schema_version == 1,
+        "Unsupported DaisyRose lock schema version.",
+    )?;
     require(
         matches!(lock.envelope.as_str(), "npu-friendly" | "full-matrix"),
         "Unsupported DaisyRose lock envelope.",
@@ -952,7 +955,10 @@ mod daisyrose_lock_tests {
         assert_eq!(parsed.max_rank, 16);
         assert_eq!(parsed.target_count, 48);
 
-        assert!(parse_daisyrose_lora_lock(&valid.replace(r#""maxRank": 16"#, r#""maxRank": 0"#)).is_err());
+        assert!(
+            parse_daisyrose_lora_lock(&valid.replace(r#""maxRank": 16"#, r#""maxRank": 0"#))
+                .is_err()
+        );
         assert!(parse_daisyrose_lora_lock(&valid.replace("npu-friendly", "other")).is_err());
         assert!(parse_daisyrose_lora_lock(&valid.replace(&sha, &"A".repeat(64))).is_err());
         Ok(())

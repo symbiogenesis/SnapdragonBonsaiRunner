@@ -257,8 +257,10 @@ pub fn verify_models(
             let files = pin.get("files").ok_or_else(invalid_models)?;
             let codec = arguments.codec.as_ref().ok_or_else(invalid_models)?;
             let voice_model = arguments.voice_model.as_ref().ok_or_else(invalid_models)?;
-            let talker_pin =
-                parse_artifact_pin(&arguments.model, files.get("talker").ok_or_else(invalid_models)?)?;
+            let talker_pin = parse_artifact_pin(
+                &arguments.model,
+                files.get("talker").ok_or_else(invalid_models)?,
+            )?;
             let codec_pin =
                 parse_artifact_pin(codec, files.get("codec").ok_or_else(invalid_models)?)?;
             let voice_pin = parse_artifact_pin(
@@ -335,9 +337,12 @@ where
         stage: TtsStartupStage::Load,
         error,
     };
-    let credential = Credential::open(&arguments.token_file).map_err(|_| verify_err(invalid_models()))?;
+    let credential =
+        Credential::open(&arguments.token_file).map_err(|_| verify_err(invalid_models()))?;
     let pin = parse_lock_document(Kind::QwenTts, compiled_lock).map_err(verify_err)?;
-    let files = pin.get("files").ok_or_else(|| verify_err(invalid_models()))?;
+    let files = pin
+        .get("files")
+        .ok_or_else(|| verify_err(invalid_models()))?;
     let codec_path = arguments
         .codec
         .as_ref()
@@ -348,12 +353,16 @@ where
         .ok_or_else(|| verify_err(invalid_models()))?;
     let talker_pin = parse_artifact_pin(
         &arguments.model,
-        files.get("talker").ok_or_else(|| verify_err(invalid_models()))?,
+        files
+            .get("talker")
+            .ok_or_else(|| verify_err(invalid_models()))?,
     )
     .map_err(verify_err)?;
     let codec_pin = parse_artifact_pin(
         codec_path,
-        files.get("codec").ok_or_else(|| verify_err(invalid_models()))?,
+        files
+            .get("codec")
+            .ok_or_else(|| verify_err(invalid_models()))?,
     )
     .map_err(verify_err)?;
     let voice_pin = parse_artifact_pin(
@@ -453,7 +462,10 @@ fn is_lower_sha256_hex(hash: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn parse_artifact_pin<'a>(path: &'a Path, pin: &'a serde_json::Value) -> io::Result<ArtifactPin<'a>> {
+fn parse_artifact_pin<'a>(
+    path: &'a Path,
+    pin: &'a serde_json::Value,
+) -> io::Result<ArtifactPin<'a>> {
     validate_file(path)?;
     let bytes = pin
         .get("bytes")
@@ -761,7 +773,11 @@ mod tests {
         out
     }
 
-    fn write_chunked_fixture_file(path: &Path, payload: &[u8], chunk_bytes: usize) -> io::Result<serde_json::Value> {
+    fn write_chunked_fixture_file(
+        path: &Path,
+        payload: &[u8],
+        chunk_bytes: usize,
+    ) -> io::Result<serde_json::Value> {
         fs::write(path, payload)?;
         let whole = hex_lower(&Sha256::digest_bytes(payload)?);
         let mut chunks = Vec::new();
@@ -777,8 +793,8 @@ mod tests {
     }
 
     #[test]
-    fn chunk_manifest_verification_accepts_valid_and_rejects_malformed_or_tampered() -> io::Result<()>
-    {
+    fn chunk_manifest_verification_accepts_valid_and_rejects_malformed_or_tampered()
+    -> io::Result<()> {
         let (directory, values) = fixture()?;
         let Command::Serve(arguments) = parse(Kind::Canary, values)? else {
             return Err(io::Error::other("Missing serve arguments"));
@@ -853,10 +869,15 @@ mod tests {
         let codec = directory.join("codec.gguf");
         let voice = directory.join("voice.gguf");
         let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
-        let codec_entry = write_chunked_fixture_file(&codec, &vec![0x11_u8; chunk_bytes + 5], chunk_bytes)?;
-        let design_entry =
-            write_chunked_fixture_file(&directory.join("model.gguf"), &vec![0x22_u8; chunk_bytes + 7], chunk_bytes)?;
-        let voice_entry = write_chunked_fixture_file(&voice, &vec![0x33_u8; chunk_bytes + 9], chunk_bytes)?;
+        let codec_entry =
+            write_chunked_fixture_file(&codec, &vec![0x11_u8; chunk_bytes + 5], chunk_bytes)?;
+        let design_entry = write_chunked_fixture_file(
+            &directory.join("model.gguf"),
+            &vec![0x22_u8; chunk_bytes + 7],
+            chunk_bytes,
+        )?;
+        let voice_entry =
+            write_chunked_fixture_file(&voice, &vec![0x33_u8; chunk_bytes + 9], chunk_bytes)?;
 
         values.extend([
             OsString::from("--codec"),
@@ -926,7 +947,12 @@ mod tests {
             &arguments,
             &lock_value.to_string(),
             |_| Ok(()),
-            |_| Err(io::Error::new(io::ErrorKind::InvalidData, "bad design weights")),
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad design weights",
+                ))
+            },
         );
         let err = res
             .err()

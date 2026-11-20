@@ -169,10 +169,8 @@ fn load_talker_globals<W: TalkerWeightSource + ?Sized>(
             Some(weights.tensor_f32("code_pred.mtp_proj.bias", &[predictor_geometry.hidden])?);
         Some(projection)
     };
-    let cp_norm_w = weights.tensor_f32(
-        "code_pred.output_norm.weight",
-        &[predictor_geometry.hidden],
-    )?;
+    let cp_norm_w =
+        weights.tensor_f32("code_pred.output_norm.weight", &[predictor_geometry.hidden])?;
     Ok(TalkerGlobals {
         text_fc1,
         text_fc2,
@@ -541,12 +539,13 @@ impl Talker {
                 let globals_slot: Mutex<Option<io::Result<TalkerGlobals>>> = Mutex::new(None);
                 let layer_slots: Vec<Mutex<Option<io::Result<QwenDecoderLayer>>>> =
                     (0..geometry.layers).map(|_| Mutex::new(None)).collect();
-                let cp_slots: Vec<Mutex<Option<io::Result<QwenDecoderLayer>>>> =
-                    (0..predictor_geometry.layers)
-                        .map(|_| Mutex::new(None))
-                        .collect();
-                let codebook_slots: Vec<Mutex<Option<io::Result<(LinearProjection, LinearProjection)>>>> =
-                    (0..15).map(|_| Mutex::new(None)).collect();
+                let cp_slots: Vec<Mutex<Option<io::Result<QwenDecoderLayer>>>> = (0
+                    ..predictor_geometry.layers)
+                    .map(|_| Mutex::new(None))
+                    .collect();
+                let codebook_slots: Vec<
+                    Mutex<Option<io::Result<(LinearProjection, LinearProjection)>>>,
+                > = (0..15).map(|_| Mutex::new(None)).collect();
 
                 let next_task = AtomicUsize::new(0);
                 let abort = AtomicBool::new(false);

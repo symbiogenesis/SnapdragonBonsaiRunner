@@ -346,12 +346,18 @@ fn transfer_repair_until(
     repair_remaining(until)?;
     let _parents = repair_parents(partial)?;
     let mut file = repair_file_with_creation(partial, offset == 0)?;
-    let result =
-        transfer_with_retries(&mut file, offset, bytes, until, retry_delay, |file, offset| {
+    let result = transfer_with_retries(
+        &mut file,
+        offset,
+        bytes,
+        until,
+        retry_delay,
+        |file, offset| {
             crate::https_transfer::download(uri, file, offset, bytes, until, &mut || {
                 repair_remaining(until).map(|_| ())
             })
-        });
+        },
+    );
     repair_remaining(until)?;
     result.map_err(|error| {
         format!(
@@ -1793,16 +1799,23 @@ mod tests {
 
         let mut file = repair_file_with_creation(&partial, true)?;
         let mut offsets = Vec::new();
-        transfer_with_retries(&mut file, 0, 5, until, |_| Duration::ZERO, |file, offset| {
-            offsets.push(offset);
-            if offset == 0 {
-                file.write_all(b"ri").map_err(|error| error.to_string())?;
-                Err("Native HTTPS request failed: timeout: per read".into())
-            } else {
-                file.write_all(b"ght").map_err(|error| error.to_string())?;
-                Ok(())
-            }
-        })?;
+        transfer_with_retries(
+            &mut file,
+            0,
+            5,
+            until,
+            |_| Duration::ZERO,
+            |file, offset| {
+                offsets.push(offset);
+                if offset == 0 {
+                    file.write_all(b"ri").map_err(|error| error.to_string())?;
+                    Err("Native HTTPS request failed: timeout: per read".into())
+                } else {
+                    file.write_all(b"ght").map_err(|error| error.to_string())?;
+                    Ok(())
+                }
+            },
+        )?;
         assert_eq!(offsets, vec![0, 2]);
         drop(file);
         assert_eq!(

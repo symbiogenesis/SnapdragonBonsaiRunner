@@ -332,7 +332,10 @@ impl Weights {
             metadata: self
                 .metadata
                 .iter()
-                .filter_map(|(k, v)| v.clone_without_string_arrays().map(|cloned| (k.clone(), cloned)))
+                .filter_map(|(k, v)| {
+                    v.clone_without_string_arrays()
+                        .map(|cloned| (k.clone(), cloned))
+                })
                 .collect(),
             tensors: self.tensors.clone(),
         })
@@ -495,7 +498,14 @@ impl Weights {
         #[cfg(windows)]
         {
             let mapped = self.mapped.as_ref().ok_or_else(invalid)?;
-            return mapped_projection(&self.tensors, mapped, name, in_dim, out_dim, validate_threads);
+            return mapped_projection(
+                &self.tensors,
+                mapped,
+                name,
+                in_dim,
+                out_dim,
+                validate_threads,
+            );
         }
         #[cfg(not(windows))]
         {
@@ -748,7 +758,8 @@ fn decode_slice_f32(kind: u32, bytes: &[u8], output: &mut [f32]) -> io::Result<(
         12 | 14 => {
             validate_packed(kind, bytes)?;
             let (block, size) = packed_layout(kind)?;
-            for (source, destination) in bytes.chunks_exact(size).zip(output.chunks_exact_mut(block))
+            for (source, destination) in
+                bytes.chunks_exact(size).zip(output.chunks_exact_mut(block))
             {
                 decode_block(kind, source, destination);
             }
@@ -1295,8 +1306,14 @@ mod tests {
             0,
         )?;
         let weights = Weights::open(&file.0)?;
-        assert_eq!(weights.string_array("tokenizer.ggml.tokens")?, ["alpha", "beta"]);
-        assert_eq!(weights.string_array("tokenizer.ggml.merges")?, ["alpha", "beta"]);
+        assert_eq!(
+            weights.string_array("tokenizer.ggml.tokens")?,
+            ["alpha", "beta"]
+        );
+        assert_eq!(
+            weights.string_array("tokenizer.ggml.merges")?,
+            ["alpha", "beta"]
+        );
         assert!(weights.string_array("other.strings").is_err());
 
         let zero_tensor = {
@@ -1498,10 +1515,7 @@ mod tests {
             let retained = weights
                 .retain_mapped_view()
                 .ok_or_else(|| io::Error::other("expected mapped view"))?;
-            assert_eq!(
-                retained.tensor_f32_mapped("half_vec", &[18])?,
-                expected
-            );
+            assert_eq!(retained.tensor_f32_mapped("half_vec", &[18])?, expected);
         }
         Ok(())
     }

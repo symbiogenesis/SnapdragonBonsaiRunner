@@ -249,7 +249,10 @@ fn hash_locked_file(file: &mut File, expected_len: u64) -> Result<String, Artifa
     Ok(hex::encode(digest))
 }
 
-fn validate_target_name(base_weight_name: &str, envelope: MultiRankEnvelope) -> Result<(), ArtifactError> {
+fn validate_target_name(
+    base_weight_name: &str,
+    envelope: MultiRankEnvelope,
+) -> Result<(), ArtifactError> {
     if !base_weight_name.ends_with(".weight") {
         return Err(ArtifactError::Identity);
     }
@@ -287,7 +290,8 @@ fn scan_tensor_finite(
         FactorDtype::F32 => 4_usize,
         FactorDtype::F16 => 2_usize,
     };
-    let cap = FINITE_SCAN_CHUNK_BYTES.min(usize::try_from(byte_len).unwrap_or(FINITE_SCAN_CHUNK_BYTES));
+    let cap =
+        FINITE_SCAN_CHUNK_BYTES.min(usize::try_from(byte_len).unwrap_or(FINITE_SCAN_CHUNK_BYTES));
     let mut buf = vec![0_u8; cap.max(width)];
     let mut remaining = byte_len;
     while remaining > 0 {
@@ -810,7 +814,11 @@ mod tests {
                 "blk.0.ssm_out.weight",
                 MultiRankEnvelope::FullMatrix,
             ),
-            ("embd.gguf", "token_embd.weight", MultiRankEnvelope::FullMatrix),
+            (
+                "embd.gguf",
+                "token_embd.weight",
+                MultiRankEnvelope::FullMatrix,
+            ),
         ] {
             let path = dir.0.join(file);
             fs::write(

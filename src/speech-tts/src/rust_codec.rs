@@ -1321,14 +1321,8 @@ impl Encoder {
             channels *= 2;
         }
         let transformer = Transformer::load_sequential(weights, false, threads)?;
-        let (last, down, semantic, acoustic) = Self::load_tail(
-            weights,
-            channels,
-            hidden,
-            last_kernel,
-            2048,
-            256,
-        )?;
+        let (last, down, semantic, acoustic) =
+            Self::load_tail(weights, channels, hidden, last_kernel, 2048, 256)?;
         Ok(Self {
             first,
             threads,
@@ -1421,7 +1415,15 @@ impl Encoder {
         {
             return Err(invalid());
         }
-        Ok((filters, hidden, compress, kernel, residual, last_kernel, ratios))
+        Ok((
+            filters,
+            hidden,
+            compress,
+            kernel,
+            residual,
+            last_kernel,
+            ratios,
+        ))
     }
 
     fn load_tail<S: CodecSource + ?Sized>(
@@ -1677,9 +1679,11 @@ fn load_upsample_stage<S: CodecSource + ?Sized>(
             dw_bias: weights.tensor_f32(&format!("{name}.dwconv.bias"), &[latent])?,
             norm_w: weights.tensor_f32(&format!("{name}.norm.weight"), &[latent])?,
             norm_b: weights.tensor_f32(&format!("{name}.norm.bias"), &[latent])?,
-            pwconv1_w: weights.tensor_f32(&format!("{name}.pwconv1.weight"), &[latent, latent * 4])?,
+            pwconv1_w: weights
+                .tensor_f32(&format!("{name}.pwconv1.weight"), &[latent, latent * 4])?,
             pwconv1_b: weights.tensor_f32(&format!("{name}.pwconv1.bias"), &[latent * 4])?,
-            pwconv2_w: weights.tensor_f32(&format!("{name}.pwconv2.weight"), &[latent * 4, latent])?,
+            pwconv2_w: weights
+                .tensor_f32(&format!("{name}.pwconv2.weight"), &[latent * 4, latent])?,
             pwconv2_b: weights.tensor_f32(&format!("{name}.pwconv2.bias"), &[latent])?,
             gamma: weights.tensor_f32(&format!("{name}.gamma"), &[latent])?,
         },
@@ -1810,7 +1814,12 @@ impl Codec {
                         })
                     });
                     let dac_job = scope.spawn(|| {
-                        let strides = [(0_usize, 8_usize, 1536_usize), (1, 5, 768), (2, 4, 384), (3, 3, 192)];
+                        let strides = [
+                            (0_usize, 8_usize, 1536_usize),
+                            (1, 5, 768),
+                            (2, 4, 384),
+                            (3, 3, 192),
+                        ];
                         let blocks = parallel_build(4, threads, |i| {
                             let (idx, stride, ch) = strides[i];
                             let mut s = MappedSource(weights_ref);

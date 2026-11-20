@@ -2205,17 +2205,32 @@ mod tests {
                 Err(Failure::Rejected(_))
             ));
             assert!(matches!(
-                super::serialize_request_with_adapters(&history, 4096, false, Some(1.3), Some(scale)),
+                super::serialize_request_with_adapters(
+                    &history,
+                    4096,
+                    false,
+                    Some(1.3),
+                    Some(scale)
+                ),
                 Err(Failure::Rejected(_))
             ));
         }
-        let stacked = super::serialize_request_with_adapters(&history, 4096, false, Some(1.3), Some(0.5))?;
+        let stacked =
+            super::serialize_request_with_adapters(&history, 4096, false, Some(1.3), Some(0.5))?;
         let stacked_json: serde_json::Value = serde_json::from_slice(&stacked)
             .map_err(|_| Failure::Message("invalid stacked request JSON"))?;
-        assert!(stacked_json["daisyrose_scale"].as_f64().is_some_and(|v| (v - 0.5).abs() < 1e-6));
+        assert!(
+            stacked_json["daisyrose_scale"]
+                .as_f64()
+                .is_some_and(|v| (v - 0.5).abs() < 1e-6)
+        );
         let mut with_daisy = publisher_runtime_config();
         with_daisy.daisyrose_lora = Some(r"C:\adapters\daisyrose.gguf".into());
-        assert!(runtime_arguments(&with_daisy).array_windows().any(|pair| *pair == ["--daisyrose-lora", r"C:\adapters\daisyrose.gguf"]));
+        assert!(
+            runtime_arguments(&with_daisy)
+                .array_windows()
+                .any(|pair| *pair == ["--daisyrose-lora", r"C:\adapters\daisyrose.gguf"])
+        );
         Ok(())
     }
     use std::io::{self, Read};

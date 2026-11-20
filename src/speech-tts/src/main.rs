@@ -168,7 +168,10 @@ fn run() -> io::Result<()> {
                     bonsai_speech_tts::Synthesizer::load_codec_with_threads(verified_codec, threads)
                 },
                 |verified_design| {
-                    bonsai_speech_tts::Synthesizer::load_design_with_threads(verified_design, threads)
+                    bonsai_speech_tts::Synthesizer::load_design_with_threads(
+                        verified_design,
+                        threads,
+                    )
                 },
             )
             .map_err(|failure| {

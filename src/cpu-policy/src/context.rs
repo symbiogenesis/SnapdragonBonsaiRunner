@@ -1825,8 +1825,11 @@ mod tests {
         let extra = MultiRankAdapterBudget::from_verified_bytes(40 * 1024 * 1024)
             .and_then(MultiRankAdapterBudget::total_bytes)
             .ok_or("extra total")?;
-        let base_plan =
-            SwiftContextPlan::for_calibrated_execution(24 * gib, SwiftContextProfile::NativeRsq4, opts)?;
+        let base_plan = SwiftContextPlan::for_calibrated_execution(
+            24 * gib,
+            SwiftContextProfile::NativeRsq4,
+            opts,
+        )?;
         let stacked_plan = SwiftContextPlan::for_calibrated_execution_with_adapter_reserve(
             24 * gib,
             SwiftContextProfile::NativeRsq4,
@@ -1834,7 +1837,9 @@ mod tests {
             extra,
         )?;
         assert!(stacked_plan.context_plan.context_tokens <= base_plan.context_plan.context_tokens);
-        assert!(stacked_plan.context_plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 24 * gib);
+        assert!(
+            stacked_plan.context_plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 24 * gib
+        );
         Ok(())
     }
 }

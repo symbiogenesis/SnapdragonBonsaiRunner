@@ -307,7 +307,10 @@ impl Synthesizer {
     ///
     /// # Errors
     /// Rejects unsafe paths, invalid team sizes, and incompatible or malformed codec weights.
-    pub fn load_codec_with_threads(codec: &Path, threads: Option<usize>) -> io::Result<LoadedCodec> {
+    pub fn load_codec_with_threads(
+        codec: &Path,
+        threads: Option<usize>,
+    ) -> io::Result<LoadedCodec> {
         model_path(codec)?;
         let threads = select_threads(threads, std::thread::available_parallelism()?.get())?;
         let mut codec_weights = weights::Weights::open(codec)?;

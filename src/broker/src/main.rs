@@ -202,7 +202,10 @@ fn launch_failure(error: bonsai_broker::launcher::LaunchError, broker_pipe: bool
             " Restart from a terminal or app session without inherited service credentials."
         }
         LaunchError::SandboxUnavailable => {
-            match (broker_pipe, bonsai_windows_process::windows_reboot_pending()) {
+            match (
+                broker_pipe,
+                bonsai_windows_process::windows_reboot_pending(),
+            ) {
                 (true, true) => {
                     " Native Windows sandbox support (PSEC 1.1) is unavailable because a Windows Update restart is pending. Restart Windows, then reopen Swift. No unisolated fallback was attempted."
                 }

@@ -158,7 +158,8 @@ impl RustRecognizer {
         }
         #[cfg(all(windows, feature = "rust-qualification"))]
         let (tokenizer, prompt_tokens, encoder, frontend, model) = {
-            let mapping = Arc::new(bonsai_windows_process::MappedFile::from_file_without_prefetch(&file)?);
+            let mapping =
+                Arc::new(bonsai_windows_process::MappedFile::from_file_without_prefetch(&file)?);
             drop(file);
             crate::intake::load_artifacts_mapped(&mapping, CachePrecision::F16, cancel)?
         };

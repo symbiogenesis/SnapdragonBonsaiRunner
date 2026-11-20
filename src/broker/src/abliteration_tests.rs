@@ -6,7 +6,11 @@ use serde_json::{Value, json};
 
 const CHAT: &[u8] = br#"{"messages":[{"role":"user","content":"Write a scene."}]}"#;
 
-fn prepare_with(body: &[u8], orca_enabled: bool, daisyrose_enabled: bool) -> Result<PendingChat, Rejection> {
+fn prepare_with(
+    body: &[u8],
+    orca_enabled: bool,
+    daisyrose_enabled: bool,
+) -> Result<PendingChat, Rejection> {
     let key = "a".repeat(64);
     let mut policy = RequestPolicy::new(8080, &key)?;
     // Production can set this only inside the owned launcher's verified service.

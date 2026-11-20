@@ -1277,7 +1277,8 @@ fn native_alternate_profiles_keep_verified_launch_options() -> crate::Result<()>
     assert!(
         daisy_args
             .array_windows::<2>()
-            .any(|pair| pair[0] == "--daisyrose-lora" && pair[1] == daisy_path.to_string_lossy().as_ref())
+            .any(|pair| pair[0] == "--daisyrose-lora"
+                && pair[1] == daisy_path.to_string_lossy().as_ref())
     );
     daisy_fixture.request["NativeEngine"] = json!(false);
     assert!(plan(daisy_fixture.request).is_err());
