@@ -103,9 +103,12 @@ via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
   `scope.maxRank`) at fresh external `outputPath` and self-verifies it for
   runtime wiring checks (marked `synthetic-runtime-test-fixture-v1`).
 - `"generate-lock"`: verifies an external candidate GGUF (`adapterPath`) and
-  `lockSource` provenance, rejects synthetic fixtures with `defaultEnabled: true`,
-  round-trips through `bonsai-cpu-policy`, and writes a candidate DaisyRose lock
-  at fresh external `outputPath`.
+  `lockSource` provenance (`"huggingface"`, `"github"`, or `"github-release"`
+  with `release` tag and `path == filename`, supporting both `66.9 MiB` `r = 16`
+  and `133.3 MiB` `r = 32` GitHub Release assets without Hugging Face tokens),
+  rejects synthetic fixtures with `defaultEnabled: true`, round-trips through
+  `bonsai-cpu-policy`, and writes a candidate DaisyRose lock at fresh external
+  `outputPath`.
 - `"dr-g2-plan"` / `"dr-g2-score"`: emits the canonical `DR-G2` three-way
   screen contract/template (optional `screenConfig` and `outputPath`) and scores
   `evidencePath` fail-closed across capability gain, Thinking-ON `<= 1.10x`

@@ -329,8 +329,9 @@ bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"dr-g2-plan"
 # 4. Score completed held-out evidence + human reviews fail-closed
 bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"dr-g2-score","evidencePath":"C:/External/dr-g2-evidence.json"}'
 
-# 5. After DR-G2 passes, write schema-validated candidate lock JSON (refuses synthetic fixtures when defaultEnabled=true)
-bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"generate-lock","adapterPath":"C:/External/daisyrose-r16.gguf","outputPath":"C:/External/daisyrose-lora.lock.json","lockSource":{"host":"huggingface","repository":"<OWNER>/<REPO>","revision":"<40_HEX>","path":"<POSIX_PATH>","filename":"<FILE>.gguf","url":"https://huggingface.co/<OWNER>/<REPO>/resolve/<40_HEX>/<POSIX_PATH>","license":"Apache-2.0"},"defaultEnabled":true,"defaultScaleTenths":10}'
+# 5. After DR-G2 passes, write schema-validated candidate lock JSON (refuses synthetic fixtures when defaultEnabled=true; supports host "huggingface", "github", or "github-release")
+bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"generate-lock","adapterPath":"C:/External/daisyrose-r16.gguf","outputPath":"C:/External/daisyrose-lora.lock.json","lockSource":{"host":"github-release","repository":"<OWNER>/<REPO>","release":"<TAG>","revision":"<40_HEX>","path":"<FILE>.gguf","filename":"<FILE>.gguf","url":"https://github.com/<OWNER>/<REPO>/releases/download/<TAG>/<FILE>.gguf","license":"Apache-2.0"},"defaultEnabled":true,"defaultScaleTenths":10}'
+#    For Hugging Face or raw GitHub tree files (no release tag), set host to "huggingface" (https://huggingface.co/<OWNER>/<REPO>/resolve/<40_HEX>/<POSIX_PATH>) or "github" (https://raw.githubusercontent.com/<OWNER>/<REPO>/<40_HEX>/<POSIX_PATH>).
 ```
 
 ### Default-on promotion flip checklist

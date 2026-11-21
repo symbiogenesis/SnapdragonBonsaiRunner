@@ -1381,6 +1381,90 @@ fn generate_lock_builds_valid_daisyrose_lock_and_rejects_synthetic_default_enabl
         .map_err(|e| e.to_string())?;
     assert_eq!(artifact.sha256, written.sha256);
     assert_eq!(artifact.effective_default_scale_tenths(), 10);
+
+    // GitHub Release asset provenance round-trips cleanly for 66.9 MiB (r=16) and 133.3 MiB (r=32) artifacts.
+    let gh_rel_source = json!({
+        "host": "github-release",
+        "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+        "release": "v0.1.0-daisyrose-r16",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "path": "daisyrose-npu-r16.gguf",
+        "filename": "daisyrose-npu-r16.gguf",
+        "url": "https://github.com/symbiogenesis/DaisyRose-Swift-LoRA/releases/download/v0.1.0-daisyrose-r16/daisyrose-npu-r16.gguf",
+        "license": "Apache-2.0"
+    });
+    let gh_rel_lock_path = scratch.join("daisyrose-gh-release.lock.json");
+    let gh_rel_res = run(json!({
+        "schemaVersion": 1,
+        "operation": "generate-lock",
+        "adapterPath": candidate_gguf,
+        "outputPath": gh_rel_lock_path,
+        "lockSource": gh_rel_source,
+        "defaultEnabled": true,
+        "defaultScaleTenths": 10
+    }))?;
+    assert_eq!(gh_rel_res["status"], "candidate-lock-written");
+    assert_eq!(
+        gh_rel_res["lock"]["source"]["release"],
+        "v0.1.0-daisyrose-r16"
+    );
+    let gh_rel_raw = fs::read_to_string(&gh_rel_lock_path).map_err(|e| e.to_string())?;
+    let gh_rel_artifact =
+        bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(dummy_data, &gh_rel_raw)
+            .map_err(|e| e.to_string())?;
+    assert_eq!(
+        gh_rel_artifact.release.as_deref(),
+        Some("v0.1.0-daisyrose-r16")
+    );
+    assert_eq!(
+        gh_rel_artifact.url,
+        "https://github.com/symbiogenesis/DaisyRose-Swift-LoRA/releases/download/v0.1.0-daisyrose-r16/daisyrose-npu-r16.gguf"
+    );
+
+    // Reject github-release without release tag or with nested path.
+    for mut bad_source in [gh_rel_source.clone(), gh_rel_source] {
+        if bad_source["path"] == "daisyrose-npu-r16.gguf" {
+            if bad_source.get("release").is_some() {
+                bad_source
+                    .as_object_mut()
+                    .ok_or("Expected object.")?
+                    .remove("release");
+            }
+        }
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "generate-lock",
+                "adapterPath": candidate_gguf,
+                "outputPath": scratch.join("bad-gh-rel-missing.lock.json"),
+                "lockSource": bad_source,
+                "defaultEnabled": false
+            }))
+            .is_err()
+        );
+    }
+    let mut bad_nested = json!({
+        "host": "github-release",
+        "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+        "release": "v0.1.0-daisyrose-r16",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "path": "gguf/daisyrose-npu-r16.gguf",
+        "filename": "daisyrose-npu-r16.gguf",
+        "url": "https://github.com/symbiogenesis/DaisyRose-Swift-LoRA/releases/download/v0.1.0-daisyrose-r16/daisyrose-npu-r16.gguf",
+        "license": "Apache-2.0"
+    });
+    assert!(
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "generate-lock",
+            "adapterPath": candidate_gguf,
+            "outputPath": scratch.join("bad-gh-rel-nested.lock.json"),
+            "lockSource": &bad_nested,
+            "defaultEnabled": false
+        }))
+        .is_err()
+    );
+    let _ = &mut bad_nested;
     Ok(())
 }
 

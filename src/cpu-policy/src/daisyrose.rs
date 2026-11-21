@@ -10,17 +10,20 @@ use crate::{SWIFT_LOCK, hex, parse, require, unexpanded_variable};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DaisyRoseLoraSource {
-    /// Upstream artifact host kind (`"huggingface"` or `"github"`).
+    /// Upstream artifact host kind (`"huggingface"`, `"github"`, or `"github-release"`).
     pub host: String,
     /// Immutable `owner/name` repository identifier.
     pub repository: String,
+    /// Immutable release tag for `"github-release"` assets; absent for `"huggingface"` / `"github"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
     /// Lowercase 40-character hexadecimal Git revision hash.
     pub revision: String,
-    /// Repository-relative POSIX path to the `.gguf` artifact.
+    /// Repository-relative POSIX path to the `.gguf` artifact (must equal `filename` for `"github-release"`).
     pub path: String,
     /// Plain `.gguf` filename matching the final segment of `path`.
     pub filename: String,
-    /// Exact immutable HTTPS download URL matching `host`, `repository`, `revision`, and `path`.
+    /// Exact immutable HTTPS download URL matching `host`, `repository`, `release`/`revision`, and `path`.
     pub url: String,
     /// Short ASCII license identifier (for example `"Apache-2.0"`).
     pub license: String,
@@ -78,6 +81,8 @@ pub struct DaisyRoseLoraArtifact {
     pub target_count: usize,
     /// Source repository identifier (`owner/name`).
     pub repository: String,
+    /// Optional immutable release tag when hosted as a `"github-release"` asset.
+    pub release: Option<String>,
     /// Pinned 40-hex commit revision.
     pub revision: String,
     /// Pinned `.gguf` filename.
@@ -156,14 +161,44 @@ fn validate_source(source: &DaisyRoseLoraSource) -> Result<(), String> {
         "DaisyRose source path must be a relative POSIX path ending in filename.",
     )?;
     let expected_url = match source.host.as_str() {
-        "huggingface" => format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            source.repository, source.revision, source.path
-        ),
-        "github" => format!(
-            "https://raw.githubusercontent.com/{}/{}/{}",
-            source.repository, source.revision, source.path
-        ),
+        "huggingface" => {
+            require(
+                source.release.is_none(),
+                "DaisyRose source release is only valid for github-release host.",
+            )?;
+            format!(
+                "https://huggingface.co/{}/resolve/{}/{}",
+                source.repository, source.revision, source.path
+            )
+        }
+        "github" => {
+            require(
+                source.release.is_none(),
+                "DaisyRose source release is only valid for github-release host.",
+            )?;
+            format!(
+                "https://raw.githubusercontent.com/{}/{}/{}",
+                source.repository, source.revision, source.path
+            )
+        }
+        "github-release" => {
+            let tag = source
+                .release
+                .as_deref()
+                .ok_or("DaisyRose github-release source requires release tag.")?;
+            require(
+                atom(tag) && tag.len() <= 128,
+                "DaisyRose github-release tag must be a safe ASCII atom (<= 128 bytes).",
+            )?;
+            require(
+                source.path == source.filename,
+                "DaisyRose github-release source path must equal filename.",
+            )?;
+            format!(
+                "https://github.com/{}/releases/download/{}/{}",
+                source.repository, tag, source.filename
+            )
+        }
         _ => return Err("Unsupported DaisyRose source host.".into()),
     };
     require(
@@ -286,6 +321,7 @@ pub fn daisyrose_lora_artifact_from_lock(
         max_rank: lock.max_rank,
         target_count: lock.target_count,
         repository: source.repository,
+        release: source.release,
         revision: source.revision,
         filename: source.filename,
         url: source.url,
@@ -375,15 +411,63 @@ mod tests {
 
         let hf_url = "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose-npu-r16.gguf";
         let gh_url = "https://raw.githubusercontent.com/symbiogenesis/DaisyRose-Swift-LoRA/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose-npu-r16.gguf";
+        let gh_rel_url = "https://github.com/symbiogenesis/DaisyRose-Swift-LoRA/releases/download/v0.1.0-daisyrose-r16/daisyrose-npu-r16.gguf";
         let hf_lock = sample_full_lock("huggingface", hf_url);
         let gh_lock = sample_full_lock("github", gh_url);
+        let mut gh_rel_lock = sample_full_lock("github-release", gh_rel_url);
+        gh_rel_lock["source"]["release"] = json!("v0.1.0-daisyrose-r16");
+        gh_rel_lock["source"]["path"] = json!("daisyrose-npu-r16.gguf");
         assert!(parse_daisyrose_lora_lock(&hf_lock.to_string()).is_ok());
         assert!(parse_daisyrose_lora_lock(&gh_lock.to_string()).is_ok());
+        assert!(parse_daisyrose_lora_lock(&gh_rel_lock.to_string()).is_ok());
 
         for mut bad in [
             {
                 let mut v = hf_lock.clone();
                 v["source"]["url"] = json!(gh_url);
+                v
+            },
+            {
+                let mut v = hf_lock.clone();
+                v["source"]["release"] = json!("v0.1.0");
+                v
+            },
+            {
+                let mut v = gh_lock;
+                v["source"]["release"] = json!("v0.1.0");
+                v
+            },
+            {
+                let mut v = gh_rel_lock.clone();
+                v["source"]
+                    .as_object_mut()
+                    .ok_or("Expected source object.")?
+                    .remove("release");
+                v
+            },
+            {
+                let mut v = gh_rel_lock.clone();
+                v["source"]["release"] = json!("../bad-tag");
+                v
+            },
+            {
+                let mut v = gh_rel_lock.clone();
+                v["source"]["release"] = json!("t".repeat(129));
+                v
+            },
+            {
+                let mut v = gh_rel_lock.clone();
+                v["source"]["path"] = json!("gguf/daisyrose-npu-r16.gguf");
+                v
+            },
+            {
+                let mut v = gh_rel_lock.clone();
+                v["source"]["url"] = json!(hf_url);
+                v
+            },
+            {
+                let mut v = gh_rel_lock;
+                v["source"]["revision"] = json!("not-hex");
                 v
             },
             {
@@ -455,8 +539,28 @@ mod tests {
                 .join("daisyrose-npu-r16.gguf")
         );
         assert_eq!(resolved.url, hf_url);
+        assert_eq!(resolved.release, None);
         assert!(resolved.default_enabled);
         assert_eq!(resolved.default_scale_tenths, Some(10));
+
+        let gh_rel_url = "https://github.com/symbiogenesis/DaisyRose-Swift-LoRA/releases/download/v0.1.0-daisyrose-r16/daisyrose-npu-r16.gguf";
+        let mut gh_rel = sample_full_lock("github-release", gh_rel_url);
+        gh_rel["source"]["release"] = json!("v0.1.0-daisyrose-r16");
+        gh_rel["source"]["path"] = json!("daisyrose-npu-r16.gguf");
+        let resolved_gh_rel = daisyrose_lora_artifact_from_lock(data, &gh_rel.to_string())?;
+        assert_eq!(
+            resolved_gh_rel.path,
+            data.join("adapters")
+                .join("0123456789abcdef0123456789abcdef01234567")
+                .join("daisyrose-npu-r16.gguf")
+        );
+        assert_eq!(
+            resolved_gh_rel.release.as_deref(),
+            Some("v0.1.0-daisyrose-r16")
+        );
+        assert_eq!(resolved_gh_rel.url, gh_rel_url);
+        assert!(resolved_gh_rel.default_enabled);
+        assert_eq!(resolved_gh_rel.default_scale_tenths, Some(10));
 
         let mut wrong_base = valid.clone();
         wrong_base["baseModelSha256"] = json!("c".repeat(64));

@@ -363,7 +363,7 @@ fn daisyrose_lora(request: &Request, working: &Path) -> crate::Result<Value> {
             );
         }
     }
-    Ok(json!({
+    let mut receipt = json!({
         "Status": "verified",
         "AdapterPath": selected.path,
         "Repository": selected.repository,
@@ -378,7 +378,11 @@ fn daisyrose_lora(request: &Request, working: &Path) -> crate::Result<Value> {
         } else {
             "candidate multi-rank GGUF integrity only; DR-G2/CI/device qualification remains separate"
         }
-    }))
+    });
+    if let Some(release) = selected.release {
+        receipt["Release"] = json!(release);
+    }
+    Ok(receipt)
 }
 
 #[derive(Deserialize)]
@@ -2542,6 +2546,48 @@ mod tests {
         assert_eq!(receipt["MaxRank"], 4);
         assert_eq!(receipt["TargetCount"], 1);
         assert_eq!(receipt["Sha256"], sha);
+
+        // Verify immutable github-release lock provenance without requiring HF tokens.
+        let gh_rel_tag = "v0.1.0-daisyrose-r4";
+        let gh_rel_url = format!(
+            "https://github.com/symbiogenesis/DaisyRose-Swift-LoRA/releases/download/{gh_rel_tag}/{filename}"
+        );
+        let gh_rel_lock = json!({
+            "schemaVersion": 1,
+            "envelope": "npu-friendly",
+            "dtype": "f16",
+            "maxRank": 4,
+            "targetCount": 1,
+            "bytes": gguf_bytes.len(),
+            "sha256": sha,
+            "baseModelSha256": swift_model_sha,
+            "source": {
+                "host": "github-release",
+                "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+                "release": gh_rel_tag,
+                "revision": rev,
+                "path": filename,
+                "filename": filename,
+                "url": gh_rel_url,
+                "license": "Apache-2.0"
+            },
+            "defaultEnabled": false
+        });
+        let gh_rel_lock_path = root.join("daisyrose-gh-release.lock.json");
+        fs::write(
+            &gh_rel_lock_path,
+            serde_json::to_vec(&gh_rel_lock).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let gh_rel_receipt = run(json!({
+            "operation": "daisyrose-lora",
+            "dataDirectory": data,
+            "lockPath": gh_rel_lock_path,
+            "verifyOnly": true,
+        }))?;
+        assert_eq!(gh_rel_receipt["Status"], "verified");
+        assert_eq!(gh_rel_receipt["Release"], gh_rel_tag);
+        assert_eq!(gh_rel_receipt["Sha256"], sha);
 
         // Reject targetCount mismatch against the verified GGUF.
         let mut wrong_count_lock = candidate_lock.clone();
