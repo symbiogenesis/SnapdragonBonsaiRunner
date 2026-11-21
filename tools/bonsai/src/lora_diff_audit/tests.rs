@@ -6,7 +6,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::gguf_adapter::{
-    ExportDtype, ExportTensorPair, build_balanced_factors, encode_f16_le, write_lora_gguf,
+    ExportDtype, ExportTensorPair, build_balanced_factors, encode_f16_le, read_lora_gguf_pairs,
+    write_lora_gguf,
 };
 use super::safetensors::{FloatDtype, TensorCategory, decode_scalar_f32, swift_tensor_inventory};
 use super::svd::{
@@ -1588,6 +1589,400 @@ fn dr_g2_plan_and_score_enforce_all_four_gates_fail_closed() -> crate::Result<()
     let mut split_fail = good_evidence;
     split_fail["thinkingOnPrompts"][0]["promptSha256"] = json!(train_prompt_sha);
     assert!(score_val("split-fail.json", &split_fail).is_err());
+
+    Ok(())
+}
+
+fn reconstruct_delta_f64(pair: &ExportTensorPair, alpha: f32) -> Vec<f64> {
+    let scale = f64::from(alpha) / usize_to_f64(pair.rank);
+    let mut out = vec![0.0_f64; pair.out_features * pair.in_features];
+    for row in 0..pair.out_features {
+        for col in 0..pair.in_features {
+            let mut sum = 0.0_f64;
+            for k in 0..pair.rank {
+                sum += f64::from(pair.lora_b_f32[row * pair.rank + k])
+                    * f64::from(pair.lora_a_f32[k * pair.in_features + col]);
+            }
+            out[row * pair.in_features + col] = scale * sum;
+        }
+    }
+    out
+}
+
+#[test]
+fn merge_adapters_renormalizes_alpha_and_rejects_duplicate_targets() -> crate::Result<()> {
+    let scratch = ScratchDir::new("Bonsai-MergeAdapters")?;
+    let mut toy_dims = BTreeMap::new();
+    toy_dims.insert("blk.0.ffn_down.weight".to_owned(), (64, 48, "ffn_down"));
+    toy_dims.insert("blk.3.attn_k.weight".to_owned(), (64, 32, "attn_k"));
+    toy_dims.insert("blk.3.attn_v.weight".to_owned(), (64, 32, "attn_v"));
+
+    let make_pair = |name: &str,
+                     in_f: usize,
+                     out_f: usize,
+                     rank: usize,
+                     alpha: f32,
+                     seed: usize|
+     -> crate::Result<ExportTensorPair> {
+        let u: Vec<Vec<f32>> = (0..rank)
+            .map(|k| {
+                (0..out_f)
+                    .map(|r| {
+                        f64_to_f32(
+                            (usize_to_f64((r + 1) * (k + 2) + seed) * 0.37).sin()
+                                / usize_to_f64(out_f).sqrt(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let v: Vec<Vec<f32>> = (0..rank)
+            .map(|k| {
+                (0..in_f)
+                    .map(|c| {
+                        f64_to_f32(
+                            (usize_to_f64((c + 1) * (k + 3) + seed * 5) * 0.53).cos()
+                                / usize_to_f64(in_f).sqrt(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let sigmas: Vec<f64> = (0..rank).map(|k| 1.2 / usize_to_f64(k + 1)).collect();
+        let (a, b) = build_balanced_factors(&u, &v, &sigmas, alpha, ExportDtype::F16)?;
+        Ok(ExportTensorPair {
+            gguf_base_name: name.to_owned(),
+            in_features: in_f,
+            out_features: out_f,
+            rank,
+            lora_a_f32: a,
+            lora_b_f32: b,
+        })
+    };
+
+    let chunk_a = scratch.join("chunk-a.gguf");
+    let chunk_b = scratch.join("chunk-b.gguf");
+    let pair0 = make_pair("blk.0.ffn_down.weight", 64, 48, 2, 2.0, 1)?;
+    let pair1 = make_pair("blk.3.attn_k.weight", 64, 32, 4, 4.0, 2)?;
+    let pair2 = make_pair("blk.3.attn_v.weight", 64, 32, 3, 4.0, 3)?;
+
+    write_lora_gguf(
+        &chunk_a,
+        ExportDtype::F16,
+        2.0,
+        &[(
+            "bonsai.composition.method",
+            "rademacher-null-gavish-donoho-v1",
+        )],
+        &[pair0],
+    )?;
+    write_lora_gguf(
+        &chunk_b,
+        ExportDtype::F16,
+        4.0,
+        &[(
+            "bonsai.composition.method",
+            "rademacher-null-gavish-donoho-v1",
+        )],
+        &[pair2, pair1],
+    )?;
+
+    let loaded_a = super::gguf_adapter::read_lora_gguf_pairs_with_dims(&chunk_a, &toy_dims)?;
+    let loaded_b = super::gguf_adapter::read_lora_gguf_pairs_with_dims(&chunk_b, &toy_dims)?;
+    let expected_0 = reconstruct_delta_f64(&loaded_a.pairs[0], loaded_a.alpha);
+    let expected_1 = reconstruct_delta_f64(
+        loaded_b
+            .pairs
+            .iter()
+            .find(|p| p.gguf_base_name == "blk.3.attn_k.weight")
+            .ok_or("Missing attn_k.")?,
+        loaded_b.alpha,
+    );
+
+    let merged_path = scratch.join("merged.gguf");
+    let req: Request = serde_json::from_value(json!({
+        "schemaVersion": 1,
+        "operation": "merge-adapters",
+        "inputPaths": [chunk_a, chunk_b],
+        "outputPath": merged_path
+    }))
+    .map_err(|e| e.to_string())?;
+    let res = super::transform::run_merge_adapters_with_dims(&req, &toy_dims)?;
+    assert_eq!(res["published"], true);
+    assert_eq!(res["pairCount"], 3);
+    assert_eq!(res["alpha"], 4.0);
+    assert_eq!(res["minRank"], 2);
+    assert_eq!(res["maxRank"], 4);
+    assert_eq!(res["verification"]["verified"], true);
+    assert_eq!(res["verification"]["detectedEnvelope"], "npu-friendly");
+
+    let merged_loaded =
+        super::gguf_adapter::read_lora_gguf_pairs_with_dims(&merged_path, &toy_dims)?;
+    let names: Vec<&str> = merged_loaded
+        .pairs
+        .iter()
+        .map(|p| p.gguf_base_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "blk.0.ffn_down.weight",
+            "blk.3.attn_k.weight",
+            "blk.3.attn_v.weight"
+        ]
+    );
+    let actual_0 = reconstruct_delta_f64(&merged_loaded.pairs[0], merged_loaded.alpha);
+    let actual_1 = reconstruct_delta_f64(&merged_loaded.pairs[1], merged_loaded.alpha);
+    for (exp, act) in [(&expected_0, &actual_0), (&expected_1, &actual_1)] {
+        let diff_sq: f64 = exp.iter().zip(act).map(|(x, y)| (x - y) * (x - y)).sum();
+        let norm_sq: f64 = exp.iter().map(|x| x * x).sum();
+        let rel_err = (diff_sq / norm_sq).sqrt();
+        assert!(rel_err < 5e-3, "Merged alpha-renorm rel_err={rel_err}");
+    }
+
+    // Reject duplicate targets across chunks.
+    let dup_chunk = scratch.join("dup.gguf");
+    write_lora_gguf(
+        &dup_chunk,
+        ExportDtype::F16,
+        2.0,
+        &[(
+            "bonsai.composition.method",
+            "rademacher-null-gavish-donoho-v1",
+        )],
+        &[make_pair("blk.0.ffn_down.weight", 64, 48, 2, 2.0, 9)?],
+    )?;
+    let dup_req: Request = serde_json::from_value(json!({
+        "schemaVersion": 1,
+        "operation": "merge-adapters",
+        "inputPaths": [chunk_a, dup_chunk],
+        "outputPath": scratch.join("dup-out.gguf")
+    }))
+    .map_err(|e| e.to_string())?;
+    assert!(super::transform::run_merge_adapters_with_dims(&dup_req, &toy_dims).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn edit_adapter_truncates_rank_scales_and_orthogonalizes_against_rank_one() -> crate::Result<()> {
+    let scratch = ScratchDir::new("Bonsai-EditAdapter")?;
+    let mut toy_dims = BTreeMap::new();
+    toy_dims.insert("blk.0.ffn_down.weight".to_owned(), (64, 48, "ffn_down"));
+    toy_dims.insert("blk.3.attn_k.weight".to_owned(), (64, 32, "attn_k"));
+    toy_dims.insert("blk.63.ffn_down.weight".to_owned(), (64, 48, "ffn_down"));
+
+    let build_synth_pair =
+        |name: &str, rank: usize, seed: usize| -> crate::Result<ExportTensorPair> {
+            let u: Vec<Vec<f32>> = (0..rank)
+                .map(|k| {
+                    (0..48)
+                        .map(|r| {
+                            f64_to_f32(
+                                (usize_to_f64((r + 1) * (k + 2) + seed) * 0.41).sin()
+                                    / usize_to_f64(48).sqrt(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let v: Vec<Vec<f32>> = (0..rank)
+                .map(|k| {
+                    (0..64)
+                        .map(|c| {
+                            f64_to_f32(
+                                (usize_to_f64((c + 1) * (k + 5) + seed * 3) * 0.29).cos()
+                                    / usize_to_f64(64).sqrt(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let sigmas: Vec<f64> = (0..rank).map(|k| 1.5 / usize_to_f64(k + 1)).collect();
+            let (a, b) = build_balanced_factors(&u, &v, &sigmas, 8.0, ExportDtype::F16)?;
+            Ok(ExportTensorPair {
+                gguf_base_name: name.to_owned(),
+                in_features: 64,
+                out_features: 48,
+                rank,
+                lora_a_f32: a,
+                lora_b_f32: b,
+            })
+        };
+
+    let mut attn_a = vec![0.0_f32; 8 * 64];
+    let mut attn_b = vec![0.0_f32; 32 * 8];
+    attn_a[0] = 0.1;
+    attn_b[0] = 0.1;
+    let attn_pair = ExportTensorPair {
+        gguf_base_name: "blk.3.attn_k.weight".to_owned(),
+        in_features: 64,
+        out_features: 32,
+        rank: 8,
+        lora_a_f32: attn_a,
+        lora_b_f32: attn_b,
+    };
+
+    let src_gguf = scratch.join("src-r8.gguf");
+    write_lora_gguf(
+        &src_gguf,
+        ExportDtype::F16,
+        8.0,
+        &[(
+            "bonsai.composition.method",
+            "rademacher-null-gavish-donoho-v1",
+        )],
+        &[
+            build_synth_pair("blk.0.ffn_down.weight", 8, 11)?,
+            attn_pair,
+            build_synth_pair("blk.63.ffn_down.weight", 8, 29)?,
+        ],
+    )?;
+
+    // 1. Pure rank slicing (8 -> 4) preserves top-4 singular modes accurately.
+    let loaded_src = super::gguf_adapter::read_lora_gguf_pairs_with_dims(&src_gguf, &toy_dims)?;
+    let blk63_src = loaded_src
+        .pairs
+        .iter()
+        .find(|p| p.gguf_base_name == "blk.63.ffn_down.weight")
+        .ok_or("Missing blk.63 source.")?;
+    let expected_top4 = reconstruct_delta_f64(
+        &ExportTensorPair {
+            gguf_base_name: blk63_src.gguf_base_name.clone(),
+            in_features: 64,
+            out_features: 48,
+            rank: 4,
+            lora_a_f32: blk63_src.lora_a_f32[..4 * 64].to_vec(),
+            lora_b_f32: {
+                let mut b4 = Vec::with_capacity(48 * 4);
+                for row in 0..48 {
+                    b4.extend_from_slice(&blk63_src.lora_b_f32[row * 8..row * 8 + 4]);
+                }
+                b4
+            },
+        },
+        4.0,
+    );
+    let sliced_path = scratch.join("sliced-r4.gguf");
+    let slice_req: Request = serde_json::from_value(json!({
+        "schemaVersion": 1,
+        "operation": "edit-adapter",
+        "adapterPath": src_gguf,
+        "outputPath": sliced_path,
+        "editConfig": {
+            "targetMaxRank": 4,
+            "layerMin": 63,
+            "layerMax": 63
+        }
+    }))
+    .map_err(|e| e.to_string())?;
+    let slice_res = super::transform::run_edit_adapter_with_dims(&slice_req, &toy_dims)?;
+    assert_eq!(slice_res["published"], true);
+    assert_eq!(slice_res["pairCount"], 1);
+    assert_eq!(slice_res["droppedSiteCount"], 2);
+    assert_eq!(slice_res["maxRank"], 4);
+    assert_eq!(slice_res["alpha"], 4.0);
+    let sliced_loaded =
+        super::gguf_adapter::read_lora_gguf_pairs_with_dims(&sliced_path, &toy_dims)?;
+    let actual_top4 = reconstruct_delta_f64(&sliced_loaded.pairs[0], sliced_loaded.alpha);
+    let mut diff_sq = 0.0_f64;
+    let mut norm_sq = 0.0_f64;
+    for (x, y) in expected_top4.iter().zip(&actual_top4) {
+        diff_sq += (x - y) * (x - y);
+        norm_sq += x * x;
+    }
+    let rel_err = (diff_sq / norm_sq).sqrt();
+    assert!(rel_err < 5e-3, "Top-4 sliced rel_err={rel_err}");
+
+    // 2. Family dropping + depth gain + norm cap + Orca rank-1 B orthogonalization.
+    let orca_real_like = scratch.join("orca-like.gguf");
+    let mut dir = vec![0.0_f32; 5_120];
+    dir[0] = 1.0;
+    write_lora_gguf(
+        &orca_real_like,
+        ExportDtype::F32,
+        1.0,
+        &[],
+        &[ExportTensorPair {
+            gguf_base_name: "blk.0.ffn_down.weight".to_owned(),
+            in_features: 17_408,
+            out_features: 5_120,
+            rank: 1,
+            lora_a_f32: vec![0.05_f32; 17_408],
+            lora_b_f32: dir,
+        }],
+    )?;
+    let full_src_real = scratch.join("real-dims-src.gguf");
+    let real_pair_fn = |name: &str, in_f: usize, out_f: usize, rank: usize| -> ExportTensorPair {
+        let mut a = vec![0.0_f32; rank * in_f];
+        let mut b = vec![0.0_f32; out_f * rank];
+        for k in 0..rank {
+            a[k * in_f + k] = 0.25;
+            b[k] = 0.4;
+            b[(k + 1) * rank + k] = 0.3;
+        }
+        ExportTensorPair {
+            gguf_base_name: name.to_owned(),
+            in_features: in_f,
+            out_features: out_f,
+            rank,
+            lora_a_f32: a,
+            lora_b_f32: b,
+        }
+    };
+    write_lora_gguf(
+        &full_src_real,
+        ExportDtype::F16,
+        8.0,
+        &[(
+            "bonsai.composition.method",
+            "rademacher-null-gavish-donoho-v1",
+        )],
+        &[
+            real_pair_fn("blk.0.ffn_down.weight", 17_408, 5_120, 8),
+            real_pair_fn("blk.3.attn_k.weight", 5_120, 1_024, 8),
+            real_pair_fn("blk.63.ffn_down.weight", 17_408, 5_120, 8),
+        ],
+    )?;
+
+    let edited_real = scratch.join("real-edited.gguf");
+    let edit_res = run(json!({
+        "schemaVersion": 1,
+        "operation": "edit-adapter",
+        "adapterPath": full_src_real,
+        "outputPath": edited_real,
+        "editConfig": {
+            "targetMaxRank": 4,
+            "globalGain": 1.2,
+            "familyScales": { "attn_k": 0.0 },
+            "depthGainStart": 0.5,
+            "depthGainEnd": 1.5,
+            "maxSiteFrobeniusNorm": 0.25,
+            "orthogonalizeAgainstRankOnePath": orca_real_like
+        }
+    }))?;
+    assert_eq!(edit_res["published"], true);
+    assert_eq!(edit_res["pairCount"], 2);
+    assert_eq!(edit_res["droppedSiteCount"], 1);
+    assert_eq!(edit_res["orthogonalizedSiteCount"], 1);
+    assert_eq!(edit_res["maxRank"], 4);
+    assert_eq!(edit_res["verification"]["verified"], true);
+    assert_eq!(
+        edit_res["verification"]["detectedEnvelope"],
+        "residual-writers"
+    );
+
+    let loaded_edited = read_lora_gguf_pairs(&edited_real)?;
+    let blk0 = &loaded_edited.pairs[0];
+    assert_eq!(blk0.gguf_base_name, "blk.0.ffn_down.weight");
+    // Because rank-1 direction was unit vector e_0, every column of blk0.lora_b row 0 must be 0.
+    for k in 0..blk0.rank {
+        assert!(
+            blk0.lora_b_f32[k].abs() < 1e-4,
+            "Expected orthogonalized coordinate 0 near zero, got {}",
+            blk0.lora_b_f32[k]
+        );
+    }
 
     Ok(())
 }

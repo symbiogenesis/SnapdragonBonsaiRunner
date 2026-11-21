@@ -6,6 +6,7 @@ mod safetensors;
 mod svd;
 #[cfg(test)]
 mod tests;
+mod transform;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -44,6 +45,8 @@ enum Operation {
     Audit,
     ExportDenoised,
     VerifyAdapter,
+    MergeAdapters,
+    EditAdapter,
     GenerateTestAdapter,
     GenerateLock,
     DrG2Plan,
@@ -189,6 +192,10 @@ struct Request {
     #[serde(default)]
     adapter_path: Option<PathBuf>,
     #[serde(default)]
+    input_paths: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    edit_config: Option<transform::EditAdapterConfig>,
+    #[serde(default)]
     verify_policy: VerifyPolicy,
     #[serde(default)]
     lock_source: Option<bonsai_cpu_policy::DaisyRoseLoraSource>,
@@ -248,6 +255,8 @@ fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
         Operation::Plan
         | Operation::Audit
         | Operation::VerifyAdapter
+        | Operation::MergeAdapters
+        | Operation::EditAdapter
         | Operation::GenerateLock
         | Operation::DrG2Plan
         | Operation::DrG2Score => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
@@ -288,6 +297,12 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     if request.operation != Operation::VerifyAdapter && !request.verify_policy.is_default() {
         return Err("verifyPolicy is only supported for verify-adapter.".into());
     }
+    if request.operation != Operation::MergeAdapters && request.input_paths.is_some() {
+        return Err("inputPaths is only supported for merge-adapters.".into());
+    }
+    if request.operation != Operation::EditAdapter && request.edit_config.is_some() {
+        return Err("editConfig is only supported for edit-adapter.".into());
+    }
     if request.operation != Operation::GenerateLock
         && (request.lock_source.is_some()
             || request.default_enabled
@@ -318,6 +333,60 @@ fn validate_request(request: &Request) -> crate::Result<()> {
                 .as_ref()
                 .ok_or("verify-adapter requires adapterPath.")?;
             bonsai_artifacts::validate_external_path(adapter_path).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        Operation::MergeAdapters => {
+            if request.source.is_some() {
+                return Err("merge-adapters does not accept a model diff source.".into());
+            }
+            if request.adapter_path.is_some() {
+                return Err("merge-adapters does not accept adapterPath.".into());
+            }
+            let inputs = request
+                .input_paths
+                .as_ref()
+                .ok_or("merge-adapters requires inputPaths.")?;
+            if !(2..=64).contains(&inputs.len()) {
+                return Err("merge-adapters requires 2..=64 chunk adapter paths.".into());
+            }
+            let mut unique_inputs = BTreeSet::new();
+            for path in inputs {
+                bonsai_artifacts::validate_external_path(path).map_err(|e| e.to_string())?;
+                if !path.is_file() {
+                    return Err(
+                        "Each merge-adapters inputPath must exist as a regular file.".into(),
+                    );
+                }
+                if !unique_inputs.insert(path.clone()) {
+                    return Err("Duplicate path in merge-adapters inputPaths.".into());
+                }
+            }
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("merge-adapters requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            return Ok(());
+        }
+        Operation::EditAdapter => {
+            if request.source.is_some() {
+                return Err("edit-adapter does not accept a model diff source.".into());
+            }
+            let adapter_path = request
+                .adapter_path
+                .as_ref()
+                .ok_or("edit-adapter requires adapterPath.")?;
+            bonsai_artifacts::validate_external_path(adapter_path).map_err(|e| e.to_string())?;
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("edit-adapter requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            let config = request
+                .edit_config
+                .as_ref()
+                .ok_or("edit-adapter requires editConfig.")?;
+            transform::validate_edit_config(config)?;
             return Ok(());
         }
         Operation::GenerateTestAdapter => {
@@ -466,6 +535,8 @@ fn validate_request(request: &Request) -> crate::Result<()> {
             }
         }
         Operation::VerifyAdapter
+        | Operation::MergeAdapters
+        | Operation::EditAdapter
         | Operation::GenerateTestAdapter
         | Operation::GenerateLock
         | Operation::DrG2Plan
@@ -2257,6 +2328,8 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::Audit => run_audit(&parsed),
         Operation::ExportDenoised => run_export_denoised(&parsed),
         Operation::VerifyAdapter => run_verify_adapter(&parsed),
+        Operation::MergeAdapters => transform::run_merge_adapters(&parsed),
+        Operation::EditAdapter => transform::run_edit_adapter(&parsed),
         Operation::GenerateTestAdapter => readiness::run_generate_test_adapter(&parsed),
         Operation::GenerateLock => readiness::run_generate_lock(&parsed),
         Operation::DrG2Plan => readiness::run_dr_g2_plan(&parsed),

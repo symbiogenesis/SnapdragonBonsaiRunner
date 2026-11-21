@@ -659,35 +659,144 @@ fn bytes_to_mib(bytes: u64) -> f64 {
     (bytes as f64) / (1024.0 * 1024.0)
 }
 
-/// Verifies a GGUF v3 LoRA adapter file against `Swift-Bonsai-2` shapes, finite scalars,
-/// dual alpha metadata compatibility, and optional policy gates without leaking local paths.
-pub(super) fn verify_lora_gguf(path: &Path, policy: &VerifyPolicy) -> crate::Result<Value> {
-    verify_lora_gguf_with_dims(path, policy, &swift_base_dims_map())
+/// Exported or loaded multi-rank GGUF LoRA adapter payload.
+pub(super) struct LoadedLoraAdapter {
+    pub(super) sha256: String,
+    pub(super) alpha: f32,
+    pub(super) dtype: ExportDtype,
+    pub(super) detected_envelope: String,
+    pub(super) provenance_meta: BTreeMap<String, String>,
+    pub(super) pairs: Vec<ExportTensorPair>,
+}
+
+struct ParsedGgufHeader {
+    file: File,
+    file_len: u64,
+    file_sha256: String,
+    architecture: Option<String>,
+    general_type: Option<String>,
+    adapter_type: Option<String>,
+    alpha_dot: Option<f32>,
+    alpha_underscore: Option<f32>,
+    effective_alpha: f32,
+    provenance_meta: BTreeMap<String, String>,
+    data_start: u64,
+    by_base: BTreeMap<String, (Option<ParsedTensorDesc>, Option<ParsedTensorDesc>)>,
+    tensor_count: usize,
+}
+
+fn canonical_target_order() -> BTreeMap<String, usize> {
+    swift_tensor_inventory()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, spec)| (spec.gguf_name, idx))
+        .collect()
+}
+
+pub(super) fn sort_pairs_canonically(pairs: &mut [ExportTensorPair]) {
+    let order = canonical_target_order();
+    pairs.sort_by(|left, right| {
+        let li = order
+            .get(&left.gguf_base_name)
+            .copied()
+            .unwrap_or(usize::MAX);
+        let ri = order
+            .get(&right.gguf_base_name)
+            .copied()
+            .unwrap_or(usize::MAX);
+        li.cmp(&ri)
+            .then_with(|| left.gguf_base_name.cmp(&right.gguf_base_name))
+    });
+}
+
+fn validate_pair_dims(
+    base_name: &str,
+    a: &ParsedTensorDesc,
+    b: &ParsedTensorDesc,
+    base_dims: &BTreeMap<String, (usize, usize, &'static str)>,
+) -> crate::Result<(usize, usize, usize, &'static str)> {
+    let &(in_dim, out_dim, family) = base_dims
+        .get(base_name)
+        .ok_or_else(|| format!("Unknown Swift-Bonsai-2 adapter target '{base_name}'."))?;
+    let rank = if base_name == "token_embd.weight" {
+        let r = a.dims[0];
+        if a.dims[1] != out_dim || b.dims != [r, in_dim] {
+            return Err(format!(
+                "Embedding LoRA shape mismatch on '{base_name}': A={:?}, B={:?}.",
+                a.dims, b.dims
+            ));
+        }
+        r
+    } else {
+        let r = a.dims[1];
+        if a.dims[0] != in_dim || b.dims != [r, out_dim] {
+            return Err(format!(
+                "Linear LoRA shape mismatch on '{base_name}': expected A=[{in_dim}, r] B=[r, {out_dim}], got A={:?}, B={:?}.",
+                a.dims, b.dims
+            ));
+        }
+        r
+    };
+    if !(1..=MAX_LORA_RANK).contains(&rank) {
+        return Err(format!(
+            "Rank {rank} out of 1..={MAX_LORA_RANK} on '{base_name}'."
+        ));
+    }
+    Ok((in_dim, out_dim, rank, family))
+}
+
+pub(super) fn classify_families(
+    families_used: &BTreeSet<&'static str>,
+) -> (&'static str, bool, bool) {
+    let excludes_grouped_ssm_out = !families_used.contains("ssm_out");
+    let preserves_hexagon_ffn_chains =
+        !families_used.contains("ffn_gate") && !families_used.contains("ffn_up");
+    let has_only_residual = families_used
+        .iter()
+        .all(|&f| matches!(f, "ffn_down" | "attn_output"));
+    let has_only_npu_friendly = families_used.iter().all(|&f| {
+        matches!(
+            f,
+            "ffn_down" | "attn_output" | "attn_q" | "attn_k" | "attn_v"
+        )
+    });
+    let has_only_full_linear = families_used.iter().all(|&f| {
+        matches!(
+            f,
+            "ffn_gate" | "ffn_up" | "ffn_down" | "attn_output" | "attn_q" | "attn_k" | "attn_v"
+        )
+    });
+    let detected_envelope = if has_only_residual {
+        "residual-writers"
+    } else if has_only_npu_friendly {
+        "npu-friendly"
+    } else if has_only_full_linear {
+        "full-linear"
+    } else {
+        "custom"
+    };
+    (
+        detected_envelope,
+        preserves_hexagon_ffn_chains,
+        excludes_grouped_ssm_out,
+    )
 }
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Single-pass bounded GGUF parser, shape/finiteness verifier, and family/policy aggregator."
+    reason = "Single-pass bounded GGUF parser validating magic, metadata, alignment, non-overlapping extents, and A/B pairing."
 )]
-pub(super) fn verify_lora_gguf_with_dims(
+fn parse_gguf_header(
     path: &Path,
-    policy: &VerifyPolicy,
-    base_dims: &BTreeMap<String, (usize, usize, &'static str)>,
-) -> crate::Result<Value> {
+    expected_sha256: Option<&str>,
+) -> crate::Result<ParsedGgufHeader> {
     bonsai_artifacts::validate_external_path(path).map_err(|e| e.to_string())?;
-    if let Some(expected) = &policy.expected_sha256
+    if let Some(expected) = expected_sha256
         && !crate::identity::is_lower_hex(expected, 64)
     {
         return Err(
             "verifyPolicy.expectedSha256 must be a 64-character lowercase hex digest.".into(),
         );
-    }
-    if let Some(max_r) = policy.max_allowed_rank
-        && !(1..=MAX_LORA_RANK).contains(&max_r)
-    {
-        return Err(format!(
-            "verifyPolicy.maxAllowedRank must be in 1..={MAX_LORA_RANK}."
-        ));
     }
 
     let mut file = bonsai_artifacts::open_locked_file(path).map_err(|e| e.to_string())?;
@@ -700,7 +809,7 @@ pub(super) fn verify_lora_gguf_with_dims(
     let (_, file_sha256) = crate::identity::hash_reader_checked(
         &mut file,
         Some(file_len),
-        policy.expected_sha256.as_deref(),
+        expected_sha256,
         &mut crate::startup_cancel::checkpoint,
     )?;
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
@@ -872,7 +981,212 @@ pub(super) fn verify_lora_gguf_with_dims(
         }
     }
 
-    let mut file = reader.reader.into_inner();
+    Ok(ParsedGgufHeader {
+        file: reader.reader.into_inner(),
+        file_len,
+        file_sha256,
+        architecture,
+        general_type,
+        adapter_type,
+        alpha_dot,
+        alpha_underscore,
+        effective_alpha,
+        provenance_meta,
+        data_start,
+        by_base,
+        tensor_count,
+    })
+}
+
+fn read_tensor_f32(
+    file: &mut File,
+    abs_offset: u64,
+    byte_len: u64,
+    elem_count: usize,
+    dtype: FloatDtype,
+) -> crate::Result<Vec<f32>> {
+    let width = dtype.byte_width();
+    let expected_bytes = u64::try_from(elem_count)
+        .map_err(|e| e.to_string())?
+        .checked_mul(u64::try_from(width).map_err(|e| e.to_string())?)
+        .ok_or("Tensor byte length overflow.")?;
+    if expected_bytes != byte_len {
+        return Err("GGUF tensor byte extent mismatches element count.".into());
+    }
+    file.seek(SeekFrom::Start(abs_offset))
+        .map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(usize::try_from(byte_len).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("Cannot allocate GGUF tensor read buffer: {e}"))?;
+    raw.resize(usize::try_from(byte_len).map_err(|e| e.to_string())?, 0);
+    file.read_exact(&mut raw).map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    out.try_reserve_exact(elem_count)
+        .map_err(|e| format!("Cannot allocate F32 LoRA factor buffer: {e}"))?;
+    for elem in raw.chunks_exact(width) {
+        crate::startup_cancel::checkpoint()?;
+        out.push(decode_scalar_f32(dtype, elem)?);
+    }
+    Ok(out)
+}
+
+/// Loads all linear LoRA `(lora_a, lora_b)` pairs from a GGUF v3 adapter file.
+#[cfg(test)]
+pub(super) fn read_lora_gguf_pairs(path: &Path) -> crate::Result<LoadedLoraAdapter> {
+    read_lora_gguf_pairs_with_dims(path, &swift_base_dims_map())
+}
+
+pub(super) fn read_lora_gguf_pairs_with_dims(
+    path: &Path,
+    base_dims: &BTreeMap<String, (usize, usize, &'static str)>,
+) -> crate::Result<LoadedLoraAdapter> {
+    let mut parsed = parse_gguf_header(path, None)?;
+    if parsed.alpha_dot.is_none() || parsed.alpha_underscore.is_none() {
+        return Err(
+            "Adapter GGUF must define matching adapter.lora.alpha and adapter.lora_alpha metadata."
+                .into(),
+        );
+    }
+    let mut families_used = BTreeSet::new();
+    let mut uniform_dtype: Option<FloatDtype> = None;
+    let mut pairs = Vec::with_capacity(parsed.by_base.len());
+
+    for (base_name, (maybe_a, maybe_b)) in &parsed.by_base {
+        if base_name == "token_embd.weight" {
+            return Err(
+                "Multi-rank merge-adapters/edit-adapter does not admit token_embd.weight.".into(),
+            );
+        }
+        let (Some(a), Some(b)) = (maybe_a, maybe_b) else {
+            return Err(format!("Incomplete LoRA A/B pair for '{base_name}'."));
+        };
+        if a.dtype != b.dtype {
+            return Err(format!("Mismatched factor dtypes on '{base_name}'."));
+        }
+        match uniform_dtype {
+            None => uniform_dtype = Some(a.dtype),
+            Some(prev) if prev == a.dtype => {}
+            Some(_) => {
+                return Err(
+                    "Adapter GGUF mixes tensor dtypes; expected uniform F16 or F32.".into(),
+                );
+            }
+        }
+        let (in_features, out_features, rank, family) =
+            validate_pair_dims(base_name, a, b, base_dims)?;
+        families_used.insert(family);
+
+        let a_elems = rank
+            .checked_mul(in_features)
+            .ok_or("lora_a element count overflow.")?;
+        let b_elems = out_features
+            .checked_mul(rank)
+            .ok_or("lora_b element count overflow.")?;
+        let lora_a_f32 = read_tensor_f32(
+            &mut parsed.file,
+            parsed.data_start + a.offset,
+            a.byte_len,
+            a_elems,
+            a.dtype,
+        )?;
+        let lora_b_f32 = read_tensor_f32(
+            &mut parsed.file,
+            parsed.data_start + b.offset,
+            b.byte_len,
+            b_elems,
+            b.dtype,
+        )?;
+        pairs.push(ExportTensorPair {
+            gguf_base_name: base_name.clone(),
+            in_features,
+            out_features,
+            rank,
+            lora_a_f32,
+            lora_b_f32,
+        });
+    }
+
+    let dtype = match uniform_dtype {
+        Some(FloatDtype::F16) => ExportDtype::F16,
+        Some(FloatDtype::F32) => ExportDtype::F32,
+        _ => return Err("Adapter GGUF must use uniform F16 or F32 factor dtype.".into()),
+    };
+    sort_pairs_canonically(&mut pairs);
+    let (detected_envelope, _, _) = classify_families(&families_used);
+    Ok(LoadedLoraAdapter {
+        sha256: parsed.file_sha256,
+        alpha: parsed.effective_alpha,
+        dtype,
+        detected_envelope: detected_envelope.to_owned(),
+        provenance_meta: parsed.provenance_meta,
+        pairs,
+    })
+}
+
+/// Reads unit-normalized output (`lora_b`) directions from a rank-1 reference GGUF adapter.
+pub(super) fn read_rank_one_b_directions(path: &Path) -> crate::Result<BTreeMap<String, Vec<f64>>> {
+    let base_dims = swift_base_dims_map();
+    let mut parsed = parse_gguf_header(path, None)?;
+    let mut directions = BTreeMap::new();
+    for (base_name, (maybe_a, maybe_b)) in &parsed.by_base {
+        if base_name == "token_embd.weight" {
+            continue;
+        }
+        let (Some(a), Some(b)) = (maybe_a, maybe_b) else {
+            return Err(format!("Incomplete rank-1 LoRA pair for '{base_name}'."));
+        };
+        let (_in_dim, out_dim, rank, _family) = validate_pair_dims(base_name, a, b, &base_dims)?;
+        if rank != 1 {
+            return Err(format!(
+                "orthogonalizeAgainstRankOnePath requires rank-1 factors, got rank {rank} on '{base_name}'."
+            ));
+        }
+        let b_vals = read_tensor_f32(
+            &mut parsed.file,
+            parsed.data_start + b.offset,
+            b.byte_len,
+            out_dim,
+            b.dtype,
+        )?;
+        let b_f64: Vec<f64> = b_vals.into_iter().map(f64::from).collect();
+        let norm_sq: f64 = b_f64.iter().map(|&v| v * v).sum();
+        let norm = norm_sq.sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(format!(
+                "Rank-1 reference direction '{base_name}' has zero or nonfinite norm."
+            ));
+        }
+        let unit: Vec<f64> = b_f64.into_iter().map(|v| v / norm).collect();
+        directions.insert(base_name.clone(), unit);
+    }
+    Ok(directions)
+}
+
+/// Verifies a GGUF v3 LoRA adapter file against `Swift-Bonsai-2` shapes, finite scalars,
+/// dual alpha metadata compatibility, and optional policy gates without leaking local paths.
+pub(super) fn verify_lora_gguf(path: &Path, policy: &VerifyPolicy) -> crate::Result<Value> {
+    verify_lora_gguf_with_dims(path, policy, &swift_base_dims_map())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Single-pass bounded verifier checking Swift dimensions, finiteness, and NPU/SSM policy gates."
+)]
+pub(super) fn verify_lora_gguf_with_dims(
+    path: &Path,
+    policy: &VerifyPolicy,
+    base_dims: &BTreeMap<String, (usize, usize, &'static str)>,
+) -> crate::Result<Value> {
+    if let Some(max_r) = policy.max_allowed_rank
+        && !(1..=MAX_LORA_RANK).contains(&max_r)
+    {
+        return Err(format!(
+            "verifyPolicy.maxAllowedRank must be in 1..={MAX_LORA_RANK}."
+        ));
+    }
+
+    let mut parsed = parse_gguf_header(path, policy.expected_sha256.as_deref())?;
     let mut families_used = BTreeSet::new();
     let mut dtypes_used = BTreeSet::new();
     let mut by_family: BTreeMap<&'static str, FamilyVerifyAccum> = BTreeMap::new();
@@ -881,40 +1195,24 @@ pub(super) fn verify_lora_gguf_with_dims(
     let mut total_payload_bytes = 0_u64;
     let mut projected_f16_payload_bytes = 0_u64;
 
-    for (base_name, (maybe_a, maybe_b)) in &by_base {
+    for (base_name, (maybe_a, maybe_b)) in &parsed.by_base {
         let (Some(a), Some(b)) = (maybe_a, maybe_b) else {
             return Err(format!("Incomplete LoRA A/B pair for '{base_name}'."));
         };
-        let &(in_dim, out_dim, family) = base_dims
-            .get(base_name)
-            .ok_or_else(|| format!("Unknown Swift-Bonsai-2 adapter target '{base_name}'."))?;
-        let rank = if base_name == "token_embd.weight" {
-            let r = a.dims[0];
-            if a.dims[1] != out_dim || b.dims != [r, in_dim] {
-                return Err(format!(
-                    "Embedding LoRA shape mismatch on '{base_name}': A={:?}, B={:?}.",
-                    a.dims, b.dims
-                ));
-            }
-            r
-        } else {
-            let r = a.dims[1];
-            if a.dims[0] != in_dim || b.dims != [r, out_dim] {
-                return Err(format!(
-                    "Linear LoRA shape mismatch on '{base_name}': expected A=[{in_dim}, r] B=[r, {out_dim}], got A={:?}, B={:?}.",
-                    a.dims, b.dims
-                ));
-            }
-            r
-        };
-        if !(1..=MAX_LORA_RANK).contains(&rank) {
-            return Err(format!(
-                "Rank {rank} out of 1..={MAX_LORA_RANK} on '{base_name}'."
-            ));
-        }
+        let (_in_dim, _out_dim, rank, family) = validate_pair_dims(base_name, a, b, base_dims)?;
 
-        let e_a = verify_and_sum_tensor(&mut file, data_start + a.offset, a.byte_len, a.dtype)?;
-        let e_b = verify_and_sum_tensor(&mut file, data_start + b.offset, b.byte_len, b.dtype)?;
+        let e_a = verify_and_sum_tensor(
+            &mut parsed.file,
+            parsed.data_start + a.offset,
+            a.byte_len,
+            a.dtype,
+        )?;
+        let e_b = verify_and_sum_tensor(
+            &mut parsed.file,
+            parsed.data_start + b.offset,
+            b.byte_len,
+            b.dtype,
+        )?;
         let pair_bytes = a.byte_len + b.byte_len;
         let f16_elems = (u64::try_from(a.dims[0]).map_err(|e| e.to_string())?
             * u64::try_from(a.dims[1]).map_err(|e| e.to_string())?)
@@ -935,34 +1233,8 @@ pub(super) fn verify_lora_gguf_with_dims(
             .record(rank, pair_bytes, f16_bytes, e_a + e_b);
     }
 
-    let excludes_grouped_ssm_out = !families_used.contains("ssm_out");
-    let preserves_hexagon_ffn_chains =
-        !families_used.contains("ffn_gate") && !families_used.contains("ffn_up");
-    let has_only_residual = families_used
-        .iter()
-        .all(|&f| matches!(f, "ffn_down" | "attn_output"));
-    let has_only_npu_friendly = families_used.iter().all(|&f| {
-        matches!(
-            f,
-            "ffn_down" | "attn_output" | "attn_q" | "attn_k" | "attn_v"
-        )
-    });
-    let has_only_full_linear = families_used.iter().all(|&f| {
-        matches!(
-            f,
-            "ffn_gate" | "ffn_up" | "ffn_down" | "attn_output" | "attn_q" | "attn_k" | "attn_v"
-        )
-    });
-
-    let detected_envelope = if has_only_residual {
-        "residual-writers"
-    } else if has_only_npu_friendly {
-        "npu-friendly"
-    } else if has_only_full_linear {
-        "full-linear"
-    } else {
-        "custom"
-    };
+    let (detected_envelope, preserves_hexagon_ffn_chains, excludes_grouped_ssm_out) =
+        classify_families(&families_used);
 
     let mut policy_failures = Vec::new();
     if policy.require_no_grouped_ssm && !excludes_grouped_ssm_out {
@@ -1013,18 +1285,18 @@ pub(super) fn verify_lora_gguf_with_dims(
         "operation": "verify-adapter",
         "verified": verified,
         "status": if verified { "verified" } else { "policy-rejected" },
-        "bytes": file_len,
-        "sha256": file_sha256,
-        "architecture": architecture,
-        "generalType": general_type,
-        "adapterType": adapter_type,
-        "alpha": effective_alpha,
-        "adapterLoraDotAlpha": alpha_dot,
-        "adapterLoraUnderscoreAlpha": alpha_underscore,
-        "publisherEngineAlphaCompatible": alpha_dot.is_some(),
-        "prismInferenceAlphaCompatible": alpha_underscore.is_some(),
-        "tensorCount": tensor_count,
-        "pairCount": by_base.len(),
+        "bytes": parsed.file_len,
+        "sha256": parsed.file_sha256,
+        "architecture": parsed.architecture,
+        "generalType": parsed.general_type,
+        "adapterType": parsed.adapter_type,
+        "alpha": parsed.effective_alpha,
+        "adapterLoraDotAlpha": parsed.alpha_dot,
+        "adapterLoraUnderscoreAlpha": parsed.alpha_underscore,
+        "publisherEngineAlphaCompatible": parsed.alpha_dot.is_some(),
+        "prismInferenceAlphaCompatible": parsed.alpha_underscore.is_some(),
+        "tensorCount": parsed.tensor_count,
+        "pairCount": parsed.by_base.len(),
         "dtypes": dtype_list,
         "minRank": min_rank,
         "maxRank": max_rank,
@@ -1036,7 +1308,7 @@ pub(super) fn verify_lora_gguf_with_dims(
         "projectedF16PayloadBytes": projected_f16_payload_bytes,
         "projectedF16PayloadMiB": bytes_to_mib(projected_f16_payload_bytes),
         "byFamily": family_json,
-        "provenanceMetadata": provenance_meta,
+        "provenanceMetadata": parsed.provenance_meta,
         "policyFailures": policy_failures,
     }))
 }

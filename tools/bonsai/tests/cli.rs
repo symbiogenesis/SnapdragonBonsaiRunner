@@ -370,3 +370,90 @@ fn lora_diff_audit_dr_g2_plan_dispatches_without_network() -> Result<(), Box<dyn
     );
     Ok(())
 }
+
+#[test]
+fn lora_diff_audit_merge_and_edit_dispatch_cleanly_without_network()
+-> Result<(), Box<dyn std::error::Error>> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let scratch = std::env::temp_dir().join(format!(
+        "SwiftBonsai-MergeEditCli-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&scratch)?;
+    let c0 = scratch.join("chunk0.gguf");
+    let c1 = scratch.join("chunk1.gguf");
+    let merged = scratch.join("merged.gguf");
+    let edited = scratch.join("edited.gguf");
+
+    for (layer, rank, path) in [(3_u32, 4_usize, &c0), (7_u32, 6_usize, &c1)] {
+        let req = json!({
+            "schemaVersion": 1,
+            "operation": "generate-test-adapter",
+            "scope": {
+                "layers": [layer],
+                "targetEnvelope": "npu-friendly",
+                "exportDtype": "f16",
+                "maxRank": rank
+            },
+            "outputPath": path
+        });
+        let out = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
+            .args(["lora-diff-audit", "--json", &req.to_string()])
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let merge_req = json!({
+        "schemaVersion": 1,
+        "operation": "merge-adapters",
+        "inputPaths": [&c0, &c1],
+        "outputPath": &merged
+    });
+    let merge_out = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
+        .args(["lora-diff-audit", "--json", &merge_req.to_string()])
+        .output()?;
+    assert!(
+        merge_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merge_out.stderr)
+    );
+    assert_eq!(merge_out.stderr, Vec::<u8>::new());
+    let merge_json: Value = serde_json::from_slice(&merge_out.stdout)?;
+    assert_eq!(merge_json["published"], true);
+    assert_eq!(merge_json["pairCount"], 10);
+    assert_eq!(merge_json["maxRank"], 6);
+    assert_eq!(merge_json["alpha"], 6.0);
+
+    let edit_req = json!({
+        "schemaVersion": 1,
+        "operation": "edit-adapter",
+        "adapterPath": &merged,
+        "outputPath": &edited,
+        "editConfig": { "targetMaxRank": 3 }
+    });
+    let edit_out = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
+        .args(["lora-diff-audit", "--json", &edit_req.to_string()])
+        .output()?;
+    assert!(
+        edit_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&edit_out.stderr)
+    );
+    assert_eq!(edit_out.stderr, Vec::<u8>::new());
+    let edit_json: Value = serde_json::from_slice(&edit_out.stdout)?;
+    assert_eq!(edit_json["published"], true);
+    assert_eq!(edit_json["pairCount"], 10);
+    assert_eq!(edit_json["maxRank"], 3);
+    assert_eq!(edit_json["alpha"], 3.0);
+
+    fs::remove_file(c0)?;
+    fs::remove_file(c1)?;
+    fs::remove_file(merged)?;
+    fs::remove_file(edited)?;
+    fs::remove_dir(scratch)?;
+    Ok(())
+}

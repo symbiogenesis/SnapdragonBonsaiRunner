@@ -89,6 +89,15 @@ via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
   alpha equality, `Swift-Bonsai-2` tensor shapes, finite scalars, Hexagon NPU
   FFN chain preservation, and exclusion of unresolved `ssm_out` targets without
   echoing local filesystem paths in receipts.
+- `"merge-adapters"`: merges `2..=64` disjoint layer-chunk multi-rank GGUF LoRA
+  files (`inputPaths`) with identical factor dtype and compatible provenance
+  into one canonically ordered, alpha-renormalized, verified GGUF at fresh
+  external `outputPath` for resumable chunked `DR-E1` extraction.
+- `"edit-adapter"`: applies pure-Rust algebraic direct weight edits (`editConfig`:
+  `targetMaxRank`, `globalGain`, `familyScales`, `layerMin`/`layerMax`,
+  `depthGainStart`/`depthGainEnd`, `maxSiteFrobeniusNorm`,
+  `orthogonalizeAgainstRankOnePath`, `exportDtype`) to an existing multi-rank
+  GGUF (`adapterPath`) and publishes a verified GGUF at fresh `outputPath`.
 - `"generate-test-adapter"`: builds a deterministic offline synthetic multi-rank
   GGUF fixture (`scope.layers`, `scope.targetEnvelope`, `scope.exportDtype`,
   `scope.maxRank`) at fresh external `outputPath` and self-verifies it for
