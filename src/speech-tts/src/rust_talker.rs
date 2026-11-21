@@ -859,60 +859,117 @@ impl Talker {
         Ok(text_rows)
     }
 
-    fn resolve_reference_icl(
+    fn compute_reference_codec_rows(
         &self,
         reference: &Reference,
-        body: &[i32],
-        cache_slot: Option<&mut Option<ReferencePromptCache>>,
         cancel: &mut dyn FnMut() -> io::Result<()>,
-    ) -> io::Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, usize)> {
-        let existing = match cache_slot.as_deref() {
-            Some(slot) => slot.as_ref(),
-            None => self.reference_cache.as_ref(),
-        };
-        let (text_rows, cached_ref_text) = if !self.reference_text_rows.is_empty() {
-            (self.reference_text_rows.clone(), None)
-        } else if let Some(cached) = existing.filter(|c| !c.text_rows.is_empty()) {
-            (cached.text_rows.clone(), Some(cached.text_rows.clone()))
+    ) -> io::Result<Vec<Vec<f32>>> {
+        let mut rows = Vec::with_capacity(reference.codes.len() + 1);
+        rows.push(self.codec_row(self.specials.bos)?);
+        for frame in &reference.codes {
+            cancel()?;
+            rows.push(self.sum_codes(frame)?);
+        }
+        Ok(rows)
+    }
+
+    fn ensure_reference_cache<'a>(
+        &self,
+        reference: &Reference,
+        slot: &'a mut Option<ReferencePromptCache>,
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<&'a ReferencePromptCache> {
+        let needs_text = self.reference_text_rows.is_empty();
+        // Polonius lets a warm slot lend directly while a miss or partial hit
+        // ends the borrow to compute only missing rows and update the slot.
+        if let Some(cached) = slot.as_ref()
+            && cached.codes == reference.codes
+            && (!needs_text || !cached.text_rows.is_empty())
+        {
+            return Ok(cached);
+        }
+        let text_rows = if !needs_text {
+            Vec::new()
+        } else if let Some(cached) = slot.as_ref().filter(|c| !c.text_rows.is_empty()) {
+            cached.text_rows.clone()
         } else {
-            let computed = self.project_reference_text_rows(cancel)?;
-            (computed.clone(), Some(computed))
+            self.project_reference_text_rows(cancel)?
         };
-        let ref_text_count = text_rows.len();
+        let codec_rows = if let Some(cached) = slot.as_ref().filter(|c| c.codes == reference.codes)
+        {
+            cached.codec_rows.clone()
+        } else {
+            self.compute_reference_codec_rows(reference, cancel)?
+        };
+        Ok(slot.insert(ReferencePromptCache {
+            codes: reference.codes.clone(),
+            text_rows,
+            codec_rows,
+        }))
+    }
+
+    fn assemble_icl_text_rows(
+        &self,
+        ref_text: &[Vec<f32>],
+        body: &[i32],
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<(Vec<Vec<f32>>, usize)> {
+        let ref_text_count = ref_text.len();
         let mut full_text_rows = Vec::with_capacity(ref_text_count + body.len() + 1);
-        full_text_rows.extend(text_rows);
+        full_text_rows.extend_from_slice(ref_text);
         for &id in body {
             cancel()?;
             full_text_rows.push(self.project_text(id)?);
         }
         full_text_rows.push(self.tts_eos.clone());
+        Ok((full_text_rows, ref_text_count))
+    }
 
-        let codec_rows = if let Some(cached) = existing.filter(|c| c.codes == reference.codes) {
-            cached.codec_rows.clone()
-        } else {
-            let mut rows = Vec::with_capacity(reference.codes.len() + 1);
-            rows.push(self.codec_row(self.specials.bos)?);
-            for frame in &reference.codes {
-                cancel()?;
-                rows.push(self.sum_codes(frame)?);
-            }
-            rows
-        };
-
+    fn build_reference_icl(
+        &self,
+        reference: &Reference,
+        body: &[i32],
+        cache_slot: Option<&mut Option<ReferencePromptCache>>,
+        cancel: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<(Prompt, usize)> {
         if let Some(slot) = cache_slot {
-            let need_update = slot.as_ref().is_none_or(|c| {
-                c.codes != reference.codes
-                    || (self.reference_text_rows.is_empty() && c.text_rows.is_empty())
-            });
-            if need_update {
-                *slot = Some(ReferencePromptCache {
-                    codes: reference.codes.clone(),
-                    text_rows: cached_ref_text.unwrap_or_default(),
-                    codec_rows: codec_rows.clone(),
-                });
-            }
+            let cached = self.ensure_reference_cache(reference, slot, cancel)?;
+            let ref_text = if self.reference_text_rows.is_empty() {
+                &cached.text_rows
+            } else {
+                &self.reference_text_rows
+            };
+            let (full_text_rows, ref_text_count) =
+                self.assemble_icl_text_rows(ref_text, body, cancel)?;
+            return Ok((
+                align_icl(full_text_rows, &cached.codec_rows, &self.tts_pad)?,
+                ref_text_count,
+            ));
         }
-        Ok((full_text_rows, codec_rows, ref_text_count))
+        let existing = self.reference_cache.as_ref();
+        let owned_ref_text;
+        let ref_text: &[Vec<f32>] = if !self.reference_text_rows.is_empty() {
+            &self.reference_text_rows
+        } else if let Some(cached) = existing.filter(|c| !c.text_rows.is_empty()) {
+            &cached.text_rows
+        } else {
+            owned_ref_text = self.project_reference_text_rows(cancel)?;
+            &owned_ref_text
+        };
+        let (full_text_rows, ref_text_count) =
+            self.assemble_icl_text_rows(ref_text, body, cancel)?;
+        let owned_codec_rows;
+        let codec_rows: &[Vec<f32>] =
+            if let Some(cached) = existing.filter(|c| c.codes == reference.codes) {
+                &cached.codec_rows
+            } else {
+                owned_codec_rows = self.compute_reference_codec_rows(reference, cancel)?;
+                &owned_codec_rows
+            };
+        Ok((
+            align_icl(full_text_rows, codec_rows, &self.tts_pad)?,
+            ref_text_count,
+        ))
     }
 
     #[cfg(test)]
@@ -986,9 +1043,8 @@ impl Talker {
         let body = &ids[3..ids.len() - 5];
         let mut cacheable_rows = 0;
         let trailing = if let Some(reference) = reference {
-            let (text_rows, codec_rows, ref_text_count) =
-                self.resolve_reference_icl(reference, body, reference_cache, cancel)?;
-            let aligned = align_icl(text_rows, codec_rows, &self.tts_pad)?;
+            let (aligned, ref_text_count) =
+                self.build_reference_icl(reference, body, reference_cache, cancel)?;
             cacheable_rows =
                 (rows.len() + ref_text_count.min(aligned.rows.len())).min(MAX_PREFILL_ROWS);
             rows.extend(aligned.rows);
@@ -1330,7 +1386,7 @@ impl Talker {
     }
 }
 
-fn align_icl(mut text: Vec<Vec<f32>>, codec: Vec<Vec<f32>>, pad: &[f32]) -> io::Result<Prompt> {
+fn align_icl(mut text: Vec<Vec<f32>>, codec: &[Vec<f32>], pad: &[f32]) -> io::Result<Prompt> {
     if codec.is_empty() || pad.is_empty() {
         return Err(invalid("Invalid speech reference alignment."));
     }
@@ -1341,7 +1397,7 @@ fn align_icl(mut text: Vec<Vec<f32>>, codec: Vec<Vec<f32>>, pad: &[f32]) -> io::
     };
     text.resize_with(codec.len(), || pad.to_vec());
     for (row, code) in text.iter_mut().zip(codec) {
-        add(row, &code)?;
+        add(row, code)?;
     }
     Ok(Prompt {
         rows: text,
@@ -2104,15 +2160,15 @@ pub(crate) mod tests {
     fn icl_alignment_retains_unconsumed_text_and_pads_short_text() -> std::io::Result<()> {
         let long = align_icl(
             vec![vec![1.0], vec![2.0], vec![3.0]],
-            vec![vec![10.0], vec![20.0]],
+            &[vec![10.0], vec![20.0]],
             &[100.0],
         )?;
         assert_eq!(long.rows, [vec![11.0], vec![22.0]]);
         assert_eq!(long.trailing, [vec![3.0]]);
-        let short = align_icl(vec![vec![1.0]], vec![vec![10.0], vec![20.0]], &[100.0])?;
+        let short = align_icl(vec![vec![1.0]], &[vec![10.0], vec![20.0]], &[100.0])?;
         assert_eq!(short.rows, [vec![11.0], vec![120.0]]);
         assert_eq!(short.trailing, [vec![100.0]]);
-        let equal = align_icl(vec![vec![1.0]], vec![vec![10.0]], &[100.0])?;
+        let equal = align_icl(vec![vec![1.0]], &[vec![10.0]], &[100.0])?;
         assert_eq!(equal.trailing, [vec![100.0]]);
         Ok(())
     }
