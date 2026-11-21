@@ -22,13 +22,24 @@ enum CachedTeam {
 }
 
 impl CachedTeam {
-    const fn needs_rebuild(&self, requested: usize) -> bool {
-        match self {
-            #[cfg(windows)]
-            Self::Ready(team) => team.worker_count < requested,
-            #[cfg(not(windows))]
-            Self::Ready(team) => team.workers.len() < requested,
-            Self::Unavailable(count) => *count != requested,
+    fn get_or_build(slot: &mut Option<Self>, requested: usize) -> Option<&OwnedTeam> {
+        // Polonius lets a warm hit lend the cached team directly while a
+        // rebuild ends the borrow to drop the old workers before spawning.
+        if let Some(cached) = slot.as_ref() {
+            match cached {
+                Self::Ready(team) if team.worker_count() >= requested => return Some(team),
+                Self::Unavailable(count) if *count == requested => return None,
+                Self::Ready(_) | Self::Unavailable(_) => {}
+            }
+        }
+        // Release the old team only when growing beyond its worker count
+        // or changing unavailable fallback requests, keeping warm larger pools.
+        *slot = None;
+        match slot.insert(
+            OwnedTeam::build(requested).map_or_else(|_| Self::Unavailable(requested), Self::Ready),
+        ) {
+            Self::Ready(team) => Some(team),
+            Self::Unavailable(_) => None,
         }
     }
 }
@@ -45,6 +56,15 @@ struct OwnedTeam {
 }
 
 impl OwnedTeam {
+    #[cfg(windows)]
+    const fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    #[cfg(not(windows))]
+    const fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
     #[cfg(windows)]
     fn build(worker_count: usize) -> io::Result<Self> {
         Ok(Self {
@@ -131,19 +151,7 @@ pub(crate) fn run_aligned<F>(
         let Ok(mut team) = slot.try_borrow_mut() else {
             return false;
         };
-        if team
-            .as_ref()
-            .is_none_or(|team| team.needs_rebuild(requested))
-        {
-            // Release the old team only when growing beyond its worker count
-            // or changing unavailable fallback requests, keeping warm larger pools.
-            *team = None;
-            *team = Some(
-                OwnedTeam::build(requested)
-                    .map_or_else(|_| CachedTeam::Unavailable(requested), CachedTeam::Ready),
-            );
-        }
-        let Some(CachedTeam::Ready(team)) = team.as_ref() else {
+        let Some(team) = CachedTeam::get_or_build(&mut team, requested) else {
             return false;
         };
         #[cfg(windows)]

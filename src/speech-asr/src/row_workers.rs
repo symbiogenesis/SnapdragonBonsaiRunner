@@ -24,10 +24,25 @@ enum CachedTeam {
 }
 
 impl CachedTeam {
-    fn needs_rebuild(&self, worker_count: usize) -> bool {
-        match self {
-            Self::Ready(team) => team.worker_count() < worker_count,
-            Self::Unavailable(count) => *count != worker_count,
+    fn get_or_build(slot: &mut Option<Self>, worker_count: usize) -> Option<&OwnedTeam> {
+        // Polonius lets a warm hit lend the cached team directly while a
+        // rebuild ends the borrow to drop the old workers before spawning.
+        if let Some(cached) = slot.as_ref() {
+            match cached {
+                Self::Ready(team) if team.worker_count() >= worker_count => return Some(team),
+                Self::Unavailable(count) if *count == worker_count => return None,
+                Self::Ready(_) | Self::Unavailable(_) => {}
+            }
+        }
+        // Release any prior team only when growing beyond its worker count
+        // or changing unavailable fallback requests, keeping warm batch pools across decode.
+        *slot = None;
+        match slot.insert(
+            OwnedTeam::build(worker_count)
+                .map_or_else(|_| Self::Unavailable(worker_count), Self::Ready),
+        ) {
+            Self::Ready(team) => Some(team),
+            Self::Unavailable(_) => None,
         }
     }
 }
@@ -135,19 +150,7 @@ fn with_team<R>(
         let Ok(mut team) = slot.try_borrow_mut() else {
             return None;
         };
-        if team
-            .as_ref()
-            .is_none_or(|cached| cached.needs_rebuild(worker_count))
-        {
-            *team = None;
-            *team = Some(
-                OwnedTeam::build(worker_count)
-                    .map_or_else(|_| CachedTeam::Unavailable(worker_count), CachedTeam::Ready),
-            );
-        }
-        let CachedTeam::Ready(owned) = team.as_ref()? else {
-            return None;
-        };
+        let owned = CachedTeam::get_or_build(&mut team, worker_count)?;
         Some(action(&owned.pool, active_workers))
     })
 }
@@ -174,21 +177,7 @@ fn with_team<R>(
         let Ok(mut team) = slot.try_borrow_mut() else {
             return None;
         };
-        if team
-            .as_ref()
-            .is_none_or(|cached| cached.needs_rebuild(worker_count))
-        {
-            // Release any prior team only when growing beyond its worker count
-            // or changing unavailable fallback requests, keeping warm batch pools across decode.
-            *team = None;
-            *team = Some(
-                OwnedTeam::build(worker_count)
-                    .map_or_else(|_| CachedTeam::Unavailable(worker_count), CachedTeam::Ready),
-            );
-        }
-        let CachedTeam::Ready(owned) = team.as_ref()? else {
-            return None;
-        };
+        let owned = CachedTeam::get_or_build(&mut team, worker_count)?;
         let pool = owned.pool.as_ref()?;
         Some(action(pool, chunk_len))
     })
