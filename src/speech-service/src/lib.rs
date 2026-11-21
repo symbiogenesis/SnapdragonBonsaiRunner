@@ -135,7 +135,7 @@ pub trait Engine {
     fn infer_stream(
         &mut self,
         _request: Request<'_>,
-        _sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
+        _sink: &mut (impl FnMut(&[f32]) -> io::Result<()> + Send + ?Sized),
     ) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

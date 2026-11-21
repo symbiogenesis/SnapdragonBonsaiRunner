@@ -232,11 +232,11 @@ pub struct ReplayRunConfig<'a> {
     /// Human-readable `cleanup` notice included in the JSON report.
     pub cleanup: &'a str,
     /// Computes a raw 32-byte SHA-256 digest over request bytes.
-    pub sha256: &'a dyn Fn(&[u8]) -> io::Result<[u8; 32]>,
+    pub sha256: fn(&[u8]) -> io::Result<[u8; 32]>,
     /// Queries an endpoint power snapshot JSON value.
-    pub power: &'a dyn Fn() -> Value,
+    pub power: fn() -> Value,
     /// Compares `powerBefore` and `powerAfter` endpoint JSON values.
-    pub compare_power: &'a dyn Fn(&Value, &Value) -> Value,
+    pub compare_power: fn(&Value, &Value) -> Value,
 }
 
 /// Returns the canonical `InvalidData` error for malformed replay requests.
@@ -349,7 +349,7 @@ pub fn validate_provider_pair(
 /// or during verification, or [`io::Error`] on [`ArtifactError`].
 pub fn verify_artifact(
     artifact: &Artifact,
-    expired: &dyn Fn() -> bool,
+    expired: &(impl Fn() -> bool + ?Sized),
 ) -> io::Result<VerifiedFile> {
     if expired() {
         return Err(io::ErrorKind::Interrupted.into());
@@ -370,7 +370,7 @@ pub fn verify_artifact(
 /// Returns any error from [`std::env::current_exe`], [`Path::metadata`], or [`verify_artifact`].
 pub fn verify_candidate_image(
     candidate_sha256: &str,
-    expired: &dyn Fn() -> bool,
+    expired: &(impl Fn() -> bool + ?Sized),
     report: &mut Value,
 ) -> io::Result<VerifiedFile> {
     report["phase"] = "verify-candidate-image".into();

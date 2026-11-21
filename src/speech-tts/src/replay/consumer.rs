@@ -363,9 +363,9 @@ pub(super) fn run() -> io::Result<bool> {
         provider: "bonsai-tts-replay",
         power_scope: "Consumer entry/exit and each candidate case only; aggregate setup, reference-arm and retention observations remain required.",
         cleanup: "Rust-owned tensors and verified-file guards drop on result or unwind; external native owner must enforce process lifetime.",
-        sha256: &hash_bytes,
-        power: &power,
-        compare_power: &bonsai_cpu_policy::power::compare_endpoints,
+        sha256: hash_bytes,
+        power,
+        compare_power: bonsai_cpu_policy::power::compare_endpoints,
     };
     run_replay(&config, compare)
 }

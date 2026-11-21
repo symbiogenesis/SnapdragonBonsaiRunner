@@ -847,7 +847,7 @@ impl Talker {
 
     fn project_reference_text_rows(
         &self,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Vec<Vec<f32>>> {
         let reference_ids = self.framed_ids(REFERENCE_TEXT)?;
         let reference_body = &reference_ids[3..reference_ids.len() - 5];
@@ -862,7 +862,7 @@ impl Talker {
     fn compute_reference_codec_rows(
         &self,
         reference: &Reference,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Vec<Vec<f32>>> {
         let mut rows = Vec::with_capacity(reference.codes.len() + 1);
         rows.push(self.codec_row(self.specials.bos)?);
@@ -877,7 +877,7 @@ impl Talker {
         &self,
         reference: &Reference,
         slot: &'a mut Option<ReferencePromptCache>,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<&'a ReferencePromptCache> {
         let needs_text = self.reference_text_rows.is_empty();
         // Polonius lets a warm slot lend directly while a miss or partial hit
@@ -912,7 +912,7 @@ impl Talker {
         &self,
         ref_text: &[Vec<f32>],
         body: &[i32],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<(Vec<Vec<f32>>, usize)> {
         let ref_text_count = ref_text.len();
         let mut full_text_rows = Vec::with_capacity(ref_text_count + body.len() + 1);
@@ -930,7 +930,7 @@ impl Talker {
         reference: &Reference,
         body: &[i32],
         cache_slot: Option<&mut Option<ReferencePromptCache>>,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<(Prompt, usize)> {
         if let Some(slot) = cache_slot {
             let cached = self.ensure_reference_cache(reference, slot, cancel)?;
@@ -978,7 +978,7 @@ impl Talker {
         text: &str,
         instruct: Option<&str>,
         reference: Option<&Reference>,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Prompt> {
         self.prompt_with_cache(text, instruct, reference, None, cancel)
     }
@@ -989,7 +989,7 @@ impl Talker {
         instruct: Option<&str>,
         reference: Option<&Reference>,
         reference_cache: Option<&mut Option<ReferencePromptCache>>,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Prompt> {
         if self.base != reference.is_some() || (self.base && instruct.is_some()) {
             return Err(invalid(
@@ -1078,7 +1078,7 @@ impl Talker {
         &self,
         row: &[f32],
         caches: &mut [LayerKvCache],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
         workspace: &mut DecoderWorkspace,
         out: &mut Vec<f32>,
     ) -> io::Result<()> {
@@ -1110,8 +1110,8 @@ impl Talker {
         text: &str,
         instruct: Option<&str>,
         reference: Option<&Reference>,
-        sink: &mut dyn FnMut([i32; TOTAL_CODE_GROUPS]) -> io::Result<()>,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        sink: &mut (impl FnMut([i32; TOTAL_CODE_GROUPS]) -> io::Result<()> + ?Sized),
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<()> {
         self.generate_observed(text, instruct, reference, sink, cancel, &mut |_| Ok(()))
     }
@@ -1121,9 +1121,9 @@ impl Talker {
         text: &str,
         instruct: Option<&str>,
         reference: Option<&Reference>,
-        sink: &mut dyn FnMut([i32; TOTAL_CODE_GROUPS]) -> io::Result<()>,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
-        observe: &mut dyn FnMut(crate::observation::TalkerObservation<'_>) -> io::Result<()>,
+        sink: &mut (impl FnMut([i32; TOTAL_CODE_GROUPS]) -> io::Result<()> + ?Sized),
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
+        observe: &mut (impl FnMut(crate::observation::TalkerObservation<'_>) -> io::Result<()> + ?Sized),
     ) -> io::Result<()> {
         // Take the snapshots before prompt construction: every failure, including
         // cancelled projection or sink output, discards all reusable state.
@@ -1155,7 +1155,7 @@ impl Talker {
         rows: &[Vec<f32>],
         caches: &mut [LayerKvCache],
         final_ffn_last_only: bool,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Vec<f32>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -1202,7 +1202,7 @@ impl Talker {
         &self,
         prompt: &Prompt,
         snapshot: &mut Option<PrefillCache>,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
         _workspace: &mut DecoderWorkspace,
     ) -> io::Result<(Vec<LayerKvCache>, Vec<f32>)> {
         cancel()?;
@@ -1256,12 +1256,12 @@ impl Talker {
         text: &str,
         instruct: Option<&str>,
         reference: Option<&Reference>,
-        sink: &mut dyn FnMut([i32; TOTAL_CODE_GROUPS]) -> io::Result<()>,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        sink: &mut (impl FnMut([i32; TOTAL_CODE_GROUPS]) -> io::Result<()> + ?Sized),
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
         prefill_cache: &mut Option<PrefillCache>,
         reference_cache: &mut Option<ReferencePromptCache>,
         predictor_workspace: &mut PredictorWorkspace,
-        observe: &mut dyn FnMut(crate::observation::TalkerObservation<'_>) -> io::Result<()>,
+        observe: &mut (impl FnMut(crate::observation::TalkerObservation<'_>) -> io::Result<()> + ?Sized),
     ) -> io::Result<()> {
         use crate::observation::TalkerObservation;
 

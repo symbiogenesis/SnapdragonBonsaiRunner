@@ -3042,7 +3042,7 @@ impl CodePredictorModel {
         seed: i64,
         subseq_base: i64,
         workers: usize,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<[i32; TOTAL_CODE_GROUPS]> {
         self.predict_frame_reusing(
             talker_hidden,
@@ -3070,7 +3070,7 @@ impl CodePredictorModel {
         seed: i64,
         subseq_base: i64,
         workers: usize,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
         workspace: &mut predictor_workspace::PredictorWorkspace,
     ) -> io::Result<[i32; TOTAL_CODE_GROUPS]> {
         self.predict_frame_observed_reusing(
@@ -3101,9 +3101,11 @@ impl CodePredictorModel {
         seed: i64,
         subseq_base: i64,
         workers: usize,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
         workspace: &mut predictor_workspace::PredictorWorkspace,
-        observe: &mut dyn FnMut(crate::observation::PredictorObservation<'_>) -> io::Result<()>,
+        observe: &mut (
+                 impl FnMut(crate::observation::PredictorObservation<'_>) -> io::Result<()> + ?Sized
+             ),
     ) -> io::Result<[i32; TOTAL_CODE_GROUPS]> {
         use crate::observation::PredictorObservation;
 
@@ -3824,16 +3826,19 @@ mod tests {
         )?;
         let mut workspace = super::predictor_workspace::PredictorWorkspace::default();
         let input = [0.1, -0.2, 0.3, 0.4];
-        let run = |model: &CodePredictorModel,
-                   hidden: &[f32],
-                   code,
-                   sequence,
-                   workspace: &mut super::predictor_workspace::PredictorWorkspace,
-                   cancel: &mut dyn FnMut() -> std::io::Result<()>| {
+        fn run(
+            model: &CodePredictorModel,
+            hidden: &[f32],
+            code: i32,
+            sequence: i64,
+            embeddings: &LinearProjection,
+            workspace: &mut super::predictor_workspace::PredictorWorkspace,
+            cancel: &mut impl FnMut() -> std::io::Result<()>,
+        ) -> std::io::Result<[i32; super::TOTAL_CODE_GROUPS]> {
             model.predict_frame_reusing(
                 hidden,
                 code,
-                &embeddings,
+                embeddings,
                 DecoupledSamplingParams::base_clone(),
                 42,
                 sequence,
@@ -3841,7 +3846,7 @@ mod tests {
                 cancel,
                 workspace,
             )
-        };
+        }
         let expected = model.predict_frame(
             &input,
             3,
@@ -3864,48 +3869,105 @@ mod tests {
                 sequence,
             )?;
             assert_eq!(
-                run(&model, &hidden, code, sequence, &mut workspace, &mut || Ok(
-                    ()
-                ))?,
+                run(
+                    &model,
+                    &hidden,
+                    code,
+                    sequence,
+                    &embeddings,
+                    &mut workspace,
+                    &mut || Ok(()),
+                )?,
                 fresh
             );
         }
         let mut polls = 0;
-        let interrupted = run(&model, &input, 3, 100, &mut workspace, &mut || {
-            polls += 1;
-            if polls == 8 {
-                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
-            } else {
-                Ok(())
-            }
-        });
+        let interrupted = run(
+            &model,
+            &input,
+            3,
+            100,
+            &embeddings,
+            &mut workspace,
+            &mut || {
+                polls += 1;
+                if polls == 8 {
+                    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                } else {
+                    Ok(())
+                }
+            },
+        );
         assert_eq!(polls, 8);
         assert!(interrupted.is_err_and(|error| error.kind() == std::io::ErrorKind::Interrupted));
         assert_eq!(
-            run(&model, &input, 3, 100, &mut workspace, &mut || Ok(()))?,
+            run(
+                &model,
+                &input,
+                3,
+                100,
+                &embeddings,
+                &mut workspace,
+                &mut || Ok(()),
+            )?,
             expected
         );
         model.lm_heads[4].bias = Some(Vec::new());
-        assert!(run(&model, &input, 3, 100, &mut workspace, &mut || Ok(())).is_err());
+        assert!(
+            run(
+                &model,
+                &input,
+                3,
+                100,
+                &embeddings,
+                &mut workspace,
+                &mut || Ok(()),
+            )
+            .is_err()
+        );
         model.lm_heads[4].bias = None;
         assert_eq!(
-            run(&model, &input, 3, 100, &mut workspace, &mut || Ok(()))?,
+            run(
+                &model,
+                &input,
+                3,
+                100,
+                &embeddings,
+                &mut workspace,
+                &mut || Ok(()),
+            )?,
             expected
         );
         polls = 0;
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run(&model, &input, 3, 100, &mut workspace, &mut || {
-                polls += 1;
-                if polls == 8 {
-                    std::panic::resume_unwind(Box::new("injected acoustic frame fault"));
-                }
-                Ok(())
-            })
+            run(
+                &model,
+                &input,
+                3,
+                100,
+                &embeddings,
+                &mut workspace,
+                &mut || {
+                    polls += 1;
+                    if polls == 8 {
+                        std::panic::resume_unwind(Box::new("injected acoustic frame fault"));
+                    }
+                    Ok(())
+                },
+            )
         }));
         assert!(unwound.is_err());
         assert_eq!(polls, 8);
         assert_eq!(
-            run(&model, &input, 3, 100, &mut workspace, &mut || Ok(()))?,
+            run(
+                &model,
+                &input,
+                3,
+                100,
+                &embeddings,
+                &mut workspace,
+                &mut || Ok(()),
+            )?,
             expected
         );
         Ok(())

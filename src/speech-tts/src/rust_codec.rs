@@ -1479,7 +1479,7 @@ impl Encoder {
     fn encode_cancellable(
         &self,
         samples: &[f32],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Vec<[i32; 16]>> {
         cancel()?;
         if samples.len() < TOKENIZER_HOP_24K
@@ -2002,7 +2002,7 @@ impl Codec {
     pub(crate) fn decode_cancellable(
         &mut self,
         codes: &[[i32; 16]],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Vec<f32>> {
         self.reset();
         self.decode_stream_cancellable(codes, cancel)
@@ -2012,7 +2012,7 @@ impl Codec {
         &mut self,
         codes: &[[i32; 16]],
         run_audio: bool,
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
         mut out: Option<&mut Vec<f32>>,
     ) -> io::Result<()> {
         let count = codes.len();
@@ -2156,7 +2156,7 @@ impl Codec {
     pub(crate) fn decode_stream_cancellable(
         &mut self,
         codes: &[[i32; 16]],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Vec<f32>> {
         cancel()?;
         if codes.is_empty()
@@ -2191,7 +2191,7 @@ impl Codec {
     pub(crate) fn prime_reference_cancellable(
         &mut self,
         codes: &[[i32; 16]],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<()> {
         cancel()?;
         if codes.is_empty()
@@ -2225,7 +2225,7 @@ impl Codec {
     pub(crate) fn encode_reference_cancellable(
         &mut self,
         samples: &[f32],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Vec<[i32; 16]>> {
         if let Some(encoder) = &self.encoder {
             return encoder.encode_cancellable(samples, cancel);
@@ -2357,7 +2357,7 @@ impl Speaker {
     pub(crate) fn extract_cancellable(
         &self,
         samples: &[f32],
-        cancel: &mut dyn FnMut() -> io::Result<()>,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
     ) -> io::Result<Vec<f32>> {
         cancel()?;
         if samples.is_empty()

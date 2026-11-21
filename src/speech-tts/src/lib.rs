@@ -185,14 +185,19 @@ impl Drop for SynthesisGuard<'_> {
     }
 }
 
-fn flush_pcm_chunk(
+fn flush_pcm_chunk<C, O, S>(
     codec: &mut rust_codec::Codec,
     frames: &[[i32; engine::TOTAL_CODE_GROUPS]],
     count: &mut usize,
-    cancel: &CancelHook<'_>,
-    observe: &Observer<'_>,
-    sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
-) -> io::Result<()> {
+    cancel: &std::cell::RefCell<C>,
+    observe: &std::cell::RefCell<&mut O>,
+    sink: &mut S,
+) -> io::Result<()>
+where
+    C: FnMut() -> io::Result<()>,
+    O: FnMut(observation::Observation<'_>) -> io::Result<()> + ?Sized,
+    S: FnMut(&[f32]) -> io::Result<()> + ?Sized,
+{
     let chunk = codec
         .decode_stream_cancellable(frames, &mut || (cancel.borrow_mut())())
         .map_err(|error| SynthesisStage::CodecDecode.failure(error))?;
@@ -204,11 +209,6 @@ fn flush_pcm_chunk(
     })?;
     sink(&chunk).map_err(|error| SynthesisStage::AudioOutput.failure(error))
 }
-
-type Observer<'a> =
-    std::cell::RefCell<&'a mut dyn FnMut(observation::Observation<'_>) -> io::Result<()>>;
-
-type CancelHook<'a> = std::cell::RefCell<&'a mut (dyn FnMut() -> io::Result<()> + Send)>;
 
 struct Voice {
     talker: rust_talker::Talker,
@@ -362,12 +362,16 @@ impl Synthesizer {
         self.codec.sample_rate()
     }
 
-    fn voice(
+    fn voice<C, O>(
         &mut self,
         profile: &str,
-        cancel: &CancelHook<'_>,
-        observe: &Observer<'_>,
-    ) -> io::Result<&mut Voice> {
+        cancel: &std::cell::RefCell<C>,
+        observe: &std::cell::RefCell<&mut O>,
+    ) -> io::Result<&mut Voice>
+    where
+        C: FnMut() -> io::Result<()>,
+        O: FnMut(observation::Observation<'_>) -> io::Result<()> + ?Sized,
+    {
         let Self {
             voices,
             design,
@@ -481,7 +485,7 @@ impl Synthesizer {
         &mut self,
         text: &str,
         voice: &str,
-        cancel: &mut (dyn FnMut() -> io::Result<()> + Send),
+        cancel: &mut (impl FnMut() -> io::Result<()> + Send + ?Sized),
     ) -> io::Result<Audio> {
         let audio = self.synthesize_owned_cancellable(text, voice, cancel)?;
         Ok(Audio {
@@ -507,7 +511,7 @@ impl Synthesizer {
         &mut self,
         text: &str,
         voice: &str,
-        cancel: &mut (dyn FnMut() -> io::Result<()> + Send),
+        cancel: &mut (impl FnMut() -> io::Result<()> + Send + ?Sized),
     ) -> io::Result<Waveform> {
         let mut samples = Vec::new();
         self.synthesize_stream_cancellable(
@@ -538,7 +542,7 @@ impl Synthesizer {
         &mut self,
         text: &str,
         voice: &str,
-        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
+        sink: &mut (impl FnMut(&[f32]) -> io::Result<()> + Send + ?Sized),
     ) -> io::Result<()> {
         self.synthesize_stream_cancellable(text, voice, sink, &mut || Ok(()))
     }
@@ -555,8 +559,8 @@ impl Synthesizer {
         &mut self,
         text: &str,
         voice: &str,
-        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
-        cancel: &mut (dyn FnMut() -> io::Result<()> + Send),
+        sink: &mut (impl FnMut(&[f32]) -> io::Result<()> + Send + ?Sized),
+        cancel: &mut (impl FnMut() -> io::Result<()> + Send + ?Sized),
     ) -> io::Result<()> {
         self.synthesize_stream_observed_cancellable(text, voice, sink, cancel, &mut |_| Ok(()))
     }
@@ -579,8 +583,8 @@ impl Synthesizer {
         &mut self,
         text: &str,
         voice: &str,
-        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
-        observe: &mut dyn FnMut(observation::Observation<'_>) -> io::Result<()>,
+        sink: &mut (impl FnMut(&[f32]) -> io::Result<()> + Send + ?Sized),
+        observe: &mut (impl FnMut(observation::Observation<'_>) -> io::Result<()> + ?Sized),
     ) -> io::Result<()> {
         self.synthesize_stream_observed_cancellable(text, voice, sink, &mut || Ok(()), observe)
     }
@@ -595,21 +599,21 @@ impl Synthesizer {
         &mut self,
         text: &str,
         voice: &str,
-        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
-        cancel: &mut (dyn FnMut() -> io::Result<()> + Send),
-        observe: &mut dyn FnMut(observation::Observation<'_>) -> io::Result<()>,
+        sink: &mut (impl FnMut(&[f32]) -> io::Result<()> + Send + ?Sized),
+        cancel: &mut (impl FnMut() -> io::Result<()> + Send + ?Sized),
+        observe: &mut (impl FnMut(observation::Observation<'_>) -> io::Result<()> + ?Sized),
     ) -> io::Result<()> {
         let text = bounded_input(text, MAX_TEXT)?;
         let profile = bounded_input(voice, MAX_VOICE)?;
         let cancelled_by_hook = std::sync::atomic::AtomicBool::new(false);
-        let mut tracked_cancel = || {
+        let tracked_cancel = || {
             let res = cancel();
             if res.is_err() {
                 cancelled_by_hook.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             res
         };
-        let cancel_ref: CancelHook<'_> = std::cell::RefCell::new(&mut tracked_cancel);
+        let cancel_ref = std::cell::RefCell::new(tracked_cancel);
         let observe = std::cell::RefCell::new(observe);
         let mut guard = SynthesisGuard {
             synthesizer: self,

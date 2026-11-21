@@ -189,9 +189,9 @@ pub(super) fn run() -> io::Result<bool> {
         provider: "bonsai-asr-replay",
         power_scope: "This consumer entry/exit only; owner aggregate setup, reference arm and retention observations remain required.",
         cleanup: "Rust-owned tensors and verified-file guards drop on every result or unwind; external owner must enforce process lifetime.",
-        sha256: &hash_bytes,
-        power: &power,
-        compare_power: &bonsai_cpu_policy::power::compare_endpoints,
+        sha256: hash_bytes,
+        power,
+        compare_power: bonsai_cpu_policy::power::compare_endpoints,
     };
     run_replay(&config, compare)
 }

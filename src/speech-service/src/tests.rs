@@ -77,7 +77,7 @@ impl Engine for StreamFake {
     fn infer_stream(
         &mut self,
         _: Request<'_>,
-        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
+        sink: &mut (impl FnMut(&[f32]) -> io::Result<()> + Send + ?Sized),
     ) -> io::Result<()> {
         sink(&[-1.0, 0.0, 1.0])?;
         if self.invalid {
@@ -626,7 +626,7 @@ impl Engine for CompletionFake {
     fn infer_stream(
         &mut self,
         _: Request<'_>,
-        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
+        sink: &mut (impl FnMut(&[f32]) -> io::Result<()> + Send + ?Sized),
     ) -> io::Result<()> {
         sink(&[0.0; 4])
     }

@@ -35,7 +35,7 @@ impl bonsai_speech_service::Engine for NativeEngine {
     fn infer_stream(
         &mut self,
         request: bonsai_speech_service::Request<'_>,
-        sink: &mut (dyn FnMut(&[f32]) -> io::Result<()> + Send),
+        sink: &mut (impl FnMut(&[f32]) -> io::Result<()> + Send + ?Sized),
     ) -> io::Result<()> {
         let bonsai_speech_service::Request::Synthesize {
             text,
