@@ -155,10 +155,7 @@ fn boundary(media: &str) -> Result<&str, Error> {
     Ok(value)
 }
 
-fn split_bytes<'a, 'd>(
-    bytes: &'a [u8],
-    delimiter: &'d [u8],
-) -> impl Iterator<Item = &'a [u8]> + use<'a, 'd> {
+fn split_bytes<'a>(bytes: &'a [u8], delimiter: &[u8]) -> impl Iterator<Item = &'a [u8]> {
     let mut remaining = Some(bytes);
     let finder = memchr::memmem::Finder::new(delimiter);
     std::iter::from_fn(move || {

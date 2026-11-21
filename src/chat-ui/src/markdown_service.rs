@@ -163,7 +163,7 @@ impl Service {
     }
 
     #[cfg(test)]
-    pub(crate) fn custom_responder<T: FnMut(&str, Option<(u32, u32)>) -> Vec<u8> + 'static>(
+    pub(crate) fn custom_responder<T: FnMut(&str, Option<(u32, u32)>) -> Vec<u8>>(
         context: &egui::Context,
         mut reply: T,
     ) -> (

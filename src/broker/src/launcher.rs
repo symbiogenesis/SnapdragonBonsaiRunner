@@ -1947,7 +1947,7 @@ fn paths_match(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
     #[cfg(windows)]
     if let (Some(a_str), Some(b_str)) = (a.to_str(), b.to_str()) {
-        fn normalize(text: &str) -> impl Iterator<Item = u8> + '_ {
+        fn normalize(text: &str) -> impl Iterator<Item = u8> {
             text.bytes().map(|byte| {
                 if byte == b'/' {
                     b'\\'

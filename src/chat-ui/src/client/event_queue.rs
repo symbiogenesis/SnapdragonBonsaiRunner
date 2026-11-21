@@ -190,7 +190,7 @@ impl EventReceiver {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_iter(&self) -> impl Iterator<Item = Event> + '_ {
+    pub(crate) fn try_iter(&self) -> impl Iterator<Item = Event> {
         std::iter::from_fn(|| self.try_recv().ok())
     }
 }

@@ -190,7 +190,7 @@ fn parse(source: &str) -> Result<Vec<Shape>> {
     Ok(shapes)
 }
 
-fn segments(shape: &Shape) -> impl Iterator<Item = (Point, Point)> + '_ {
+fn segments(shape: &Shape) -> impl Iterator<Item = (Point, Point)> {
     shape
         .points
         .windows(2)
