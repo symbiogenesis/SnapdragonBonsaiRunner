@@ -206,7 +206,11 @@ impl<'a> Q8ReferenceOracle<'a> {
     ///
     /// # Errors
     /// Propagates transport failures or rejected numerical error bounds.
-    pub fn submit(&self, transport: &mut dyn Q8Submitter, output: &mut [f32]) -> Result<(), Error> {
+    pub fn submit(
+        &self,
+        transport: &mut (impl Q8Submitter + ?Sized),
+        output: &mut [f32],
+    ) -> Result<(), Error> {
         self.submit_with_control(transport, output, || Ok(()))
     }
 
@@ -221,7 +225,7 @@ impl<'a> Q8ReferenceOracle<'a> {
     /// Propagates control, transport and numerical review failures.
     pub fn submit_with_control(
         &self,
-        transport: &mut dyn Q8Submitter,
+        transport: &mut (impl Q8Submitter + ?Sized),
         output: &mut [f32],
         mut check: impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
@@ -396,7 +400,11 @@ impl<'a> Q8ExactOracle<'a> {
     ///
     /// # Errors
     /// Propagates transport, cancellation, bound or independent numeric failure.
-    pub fn submit(&self, transport: &mut dyn Q8Submitter, output: &mut [f32]) -> Result<(), Error> {
+    pub fn submit(
+        &self,
+        transport: &mut (impl Q8Submitter + ?Sized),
+        output: &mut [f32],
+    ) -> Result<(), Error> {
         self.submit_with_control(transport, output, || Ok(()))
     }
 
@@ -410,7 +418,7 @@ impl<'a> Q8ExactOracle<'a> {
     /// Propagates control, transport and exact numerical review failures.
     pub fn submit_with_control(
         &self,
-        transport: &mut dyn Q8Submitter,
+        transport: &mut (impl Q8Submitter + ?Sized),
         output: &mut [f32],
         mut check: impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
@@ -708,7 +716,11 @@ impl<'a> Q8HvxQuantizationOracle<'a> {
     ///
     /// # Errors
     /// Rejects transport failure or failed output review before publication.
-    pub fn submit(&self, transport: &mut dyn Q8Submitter, output: &mut [f32]) -> Result<(), Error> {
+    pub fn submit(
+        &self,
+        transport: &mut (impl Q8Submitter + ?Sized),
+        output: &mut [f32],
+    ) -> Result<(), Error> {
         self.submit_with_control(transport, output, || Ok(()))
     }
 
@@ -718,7 +730,7 @@ impl<'a> Q8HvxQuantizationOracle<'a> {
     /// Rejects early cancellation/expiry, transport refusal or failed review before publication.
     pub fn submit_with_control(
         &self,
-        transport: &mut dyn Q8Submitter,
+        transport: &mut (impl Q8Submitter + ?Sized),
         output: &mut [f32],
         mut check: impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
