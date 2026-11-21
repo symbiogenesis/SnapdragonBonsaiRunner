@@ -186,3 +186,20 @@ fn verify_in_tree_reads_runner_manifest_and_rejects_tamper() -> TestResult {
     assert!(super::verify_in_tree(&scratch.0).is_err());
     Ok(())
 }
+
+#[test]
+fn native_boundary_accepts_empty_file_set_and_rejects_untracked_cpp() -> TestResult {
+    let scratch = Scratch::new()?;
+    let mut manifest = scratch.fixture()?;
+    fs::remove_file(scratch.0.join("adapter.cpp"))?;
+    manifest.repository = "prism".into();
+    manifest.exclusions.pop();
+    manifest.files.clear();
+    let report = verify(&scratch.0, &manifest)?;
+    assert_eq!(report["nativeFiles"], 0);
+    assert_eq!(report["operativeAndContractEdges"], 1);
+    assert_eq!(report["nativeRetirementQualified"], false);
+    fs::write(scratch.0.join("rogue.cpp"), b"untracked c++")?;
+    assert!(verify(&scratch.0, &manifest).is_err());
+    Ok(())
+}

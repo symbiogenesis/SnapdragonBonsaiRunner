@@ -119,7 +119,6 @@ fn validate_manifest(manifest: &Manifest) -> Result<BTreeSet<&str>> {
         || manifest.kind != "checked-in-native-retirement-boundary"
         || !matches!(manifest.repository.as_str(), "runner" | "prism")
         || !lower_hex(&manifest.source_revision, 40)
-        || manifest.files.is_empty()
         || manifest.files.len() > 4096
         || manifest.edges.is_empty()
         || manifest.edges.len() > 4096
