@@ -833,12 +833,18 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   decoupled from inference timers; if live HF streaming exceeds
   `timeBudgetSeconds <= 900`, add pure-Rust layer-chunked GGUF merge rather than
   inflating inference trials), then verify finiteness, dual alpha equality, and
-  NPU/SSM bounds with `verify-adapter`.
+  NPU/SSM bounds with `verify-adapter`. Local pure-Rust `merge-adapters` &
+  `edit-adapter` (`937b27c0`), full 64-layer chunked extraction (`r = 32`,
+  `133,326,912` bytes, SHA-256 `8820b56a...`), offline `r = 16` derivation
+  (`66,930,944` bytes, `128` pairs, SHA-256 `1b850494...`), and `verify-adapter`
+  verification are complete locally
+  ([DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md));
+  immutable remote hosting and owning CI remain open.
 - [ ] **DR-G2 — Direct-stack three-way empirical screen on `Swift-Bonsai-2` + Orca `1.3`.**
   Stack the unedited `DR-E1` LoRA directly on top of `Swift-Bonsai-2-PQ2_0.gguf`
-  + Orca `1.3` via `--publisher-engine` `--lora-scaled` across `scaleGrid` (e.g.
-  `[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`) and score fail-closed with
-  `dr-g2-plan` / `dr-g2-score` (`trainingPromptSha256s: []`) under the
+  + Orca `1.3` across `scaleGrid` (e.g. `[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`)
+  and score fail-closed with `dr-g2-plan` / `dr-g2-score`
+  (`trainingPromptSha256s: []`) under the
   [zero-retraining workflow and promotion checklist](docs/daisyrose-composition.md#zero-retraining-workflow-direct-edit-fallback-and-promotion-checklist):
   require (1) Thinking-ON coding/reasoning/IF gain over `scale = 0.0` with zero
   category regression, (2) Swift anti-looping preservation (`<= 1.10x` thinking
@@ -846,8 +852,13 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   creative prose & Orca non-regression, and (4) zero-scale bit identity. If it
   passes as-is, skip `DR-W1` and proceed directly to `DR-C1`/`DR-C2`; if it
   fails, capture exact per-category/prompt failure modes for `DR-W1`. Pure-Rust
-  `dr-g2-plan`/`dr-g2-score` tooling is checked in (`574b961a`); actual
-  full-adapter screen capture and independent human review remain open.
+  `dr-g2-plan`/`dr-g2-score` tooling (`574b961a`) is checked in, and a local
+  battery-CPU `prism-inference-server` run verified bit-exact `scale = 0.0`
+  parity on `zero-ctrl-001` (`51` tokens, `cb08876d...`) plus non-degenerate
+  `creative-001` output before hitting its `900 s` ceiling during `if-001` (`1/8`
+  pairs completed; [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md)).
+  Accelerated AC-powered completion across all 4 required categories and blinded
+  human review (`humanReviewed: true`) remain open.
 - [ ] **DR-W1 — Conditional pure-Rust direct weight editing on the multi-rank LoRA if `DR-G2` fails (zero retraining).**
   Triggered only if the unedited `DR-E1` stack fails `DR-G2`; keep
   `Swift-Bonsai-2`'s packed ternary base immutable and stay inside `npu-friendly`
@@ -872,11 +883,14 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   64 layers, scalar/NEON/tiled-prefill parity and `swift_model_check rollback`
   bit-exact state before repinning Prism. Local `..\prism-inference` source
   wiring (`39ae592`, `4c49f6f`, `5aab2f4`, `7d63f8a`), unit/example checks,
-  bounded 27B `scale = 0.0` parity vet, and an offline AC-powered 27B 4-layer
+  bounded 27B `scale = 0.0` parity vet, an offline AC-powered 27B 4-layer
   `:0.0` parity / `:0.5` perturbation / `:0.5` full-state `rollback` vet
-  (`status: "passed"` in `33.875 s`; [vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md))
-  are complete; Prism release publication beyond `v0.1.32` and lock repin
-  remain open pending `DR-E1`/`DR-G2` (and conditional `DR-W1`).
+  (`status: "passed"` in `33.875 s`; [vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md)),
+  and a full 64-layer (`128`-pair `daisyrose-npu-r16.gguf`) `:0.0` parity /
+  `:1.0` perturbation / `:1.0` full-state `rollback` vet (`status: "passed"` in
+  `138.61 s` on battery; [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md))
+  are complete locally; Prism release publication beyond `v0.1.32` and lock
+  repin remain open pending `DR-G2` human review and hosting.
 - [ ] **DR-C2 — Wire Runner lockfile, memory accounting, UI controls and qualification gates.**
   Pin the verified adapter in `config/daisyrose-lora.lock.json`, charge exact
   factor payload (`4.00 MiB/rank` F16) and multi-rank scratch in
