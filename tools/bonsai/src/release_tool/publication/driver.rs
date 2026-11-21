@@ -8,8 +8,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-type Transport<'a> = dyn FnMut(&str, &[String], u64) -> Result<String> + 'a;
-
 struct Publication {
     repository_root: PathBuf,
     policy: Value,
@@ -43,14 +41,21 @@ impl Publication {
         policy["complete"] = complete.into();
         validate(&policy)
     }
-    fn get(&self, transport: &mut Transport<'_>, id: u64) -> Result<Value> {
+    fn get(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+        id: u64,
+    ) -> Result<Value> {
         response(&transport(
             "gh",
             &["api".into(), self.endpoint(&format!("releases/{id}"))?],
             180,
         )?)
     }
-    fn find(&self, transport: &mut Transport<'_>) -> Result<Option<Value>> {
+    fn find(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+    ) -> Result<Option<Value>> {
         let raw = transport(
             "gh",
             &[
@@ -74,7 +79,11 @@ impl Publication {
             None => Ok(None),
         }
     }
-    fn confirm_tag(&self, transport: &mut Transport<'_>, required: bool) -> Result<()> {
+    fn confirm_tag(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+        required: bool,
+    ) -> Result<()> {
         let raw = transport(
             "gh",
             &[
@@ -108,7 +117,10 @@ impl Publication {
             Err("Release tag nesting exceeds bound.".into())
         }
     }
-    fn main_matches(&self, transport: &mut Transport<'_>) -> Result<()> {
+    fn main_matches(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+    ) -> Result<()> {
         let main = transport(
             "gh",
             &[
@@ -124,7 +136,11 @@ impl Publication {
         }
         Ok(())
     }
-    fn existing(&self, transport: &mut Transport<'_>, release: &Value) -> Result<Value> {
+    fn existing(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+        release: &Value,
+    ) -> Result<Value> {
         self.check(release, false, 0, true)?;
         self.confirm_tag(transport, true)?;
         self.check(
@@ -135,7 +151,11 @@ impl Publication {
         )?;
         Ok(json!(self.url()?))
     }
-    fn create(&self, transport: &mut Transport<'_>, working: &Path) -> Result<Value> {
+    fn create(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+        working: &Path,
+    ) -> Result<Value> {
         let body = json!({"tag_name":self.tag()?,"target_commitish":self.revision()?,"name":format!("Swift Bonsai 2 Runner {}",self.tag()?),"body":self.policy["notes"],"draft":true,"prerelease":self.policy["prerelease"]});
         let input = working.join("release-create.json");
         write_json(&input, &body)?;
@@ -171,7 +191,11 @@ impl Publication {
             }
         }
     }
-    fn upload(&self, transport: &mut Transport<'_>, id: u64) -> Result<()> {
+    fn upload(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+        id: u64,
+    ) -> Result<()> {
         let assets = self.policy["assets"].as_object().ok_or("Missing assets.")?;
         for (name, asset) in assets {
             let release = self.get(transport, id)?;
@@ -215,7 +239,12 @@ impl Publication {
         }
         Ok(())
     }
-    fn finish(&self, transport: &mut Transport<'_>, id: u64, working: &Path) -> Result<Value> {
+    fn finish(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+        id: u64,
+        working: &Path,
+    ) -> Result<Value> {
         let release = self.get(transport, id)?;
         self.check(&release, true, id, true)?;
         self.confirm_tag(transport, false)?;
@@ -242,7 +271,11 @@ impl Publication {
         self.confirm_tag(transport, true)?;
         Ok(json!(self.url()?))
     }
-    fn execute(&self, transport: &mut Transport<'_>, working: &Path) -> Result<Value> {
+    fn execute(
+        &self,
+        transport: &mut (impl FnMut(&str, &[String], u64) -> Result<String> + ?Sized),
+        working: &Path,
+    ) -> Result<Value> {
         let release = self.find(transport)?;
         if let Some(release) = release
             .as_ref()

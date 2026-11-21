@@ -177,7 +177,7 @@ fn active(until: Instant, cancelled: &AtomicBool) -> crate::Result<()> {
 fn owned<T: Send>(
     agent: Agent,
     until: Instant,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
     operation: impl FnOnce(&Agent, &AtomicBool) -> crate::Result<T> + Send,
 ) -> crate::Result<T> {
     checkpoint()?;
@@ -507,7 +507,7 @@ pub(crate) fn download(
     offset: u64,
     bytes: u64,
     until: Instant,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
 ) -> crate::Result<()> {
     validate_uri(uri)?;
     owned(agent(), until, checkpoint, |agent, cancelled| {
@@ -521,7 +521,7 @@ pub(crate) fn download_fresh(
     file: &mut File,
     bytes: u64,
     until: Instant,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
 ) -> crate::Result<()> {
     validate_uri(uri)?;
     owned(agent(), until, checkpoint, |agent, cancelled| {
@@ -636,7 +636,7 @@ pub(crate) fn fetch_range(
     end_inclusive: u64,
     max_bytes: u64,
     until: Instant,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
 ) -> crate::Result<(Vec<u8>, u64)> {
     validate_uri(uri)?;
     let _ = range_expected_len(start, end_inclusive, max_bytes)?;

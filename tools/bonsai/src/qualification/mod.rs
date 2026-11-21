@@ -21,7 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 use crate::Result;
@@ -75,7 +75,7 @@ fn digest(text: &str) -> String {
     sha256(text.as_bytes())
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
+fn decode<T: DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|error| format!("Invalid qualification input: {error}"))
 }
 
@@ -361,7 +361,7 @@ fn control_identity(controls: &Controls, policy: &Policy) -> Result<(String, Str
     Ok((digest(&canonical), canonical))
 }
 
-fn take<T: for<'de> Deserialize<'de>>(request: &mut Map<String, Value>, key: &str) -> Result<T> {
+fn take<T: DeserializeOwned>(request: &mut Map<String, Value>, key: &str) -> Result<T> {
     decode(
         request
             .remove(key)

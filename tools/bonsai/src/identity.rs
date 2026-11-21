@@ -55,7 +55,7 @@ pub(crate) fn hash_reader_checked<R: std::io::Read + ?Sized>(
     reader: &mut R,
     expected_bytes: Option<u64>,
     expected_sha256: Option<&str>,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
 ) -> crate::Result<(u64, String)> {
     let mut hasher = Hasher::new()?;
     let buffer_len = expected_bytes.map_or(65_536, |bytes| {

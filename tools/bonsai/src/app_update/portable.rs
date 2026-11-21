@@ -53,7 +53,7 @@ impl Drop for Temporary {
 fn original(
     target: &Path,
     expected: &str,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
 ) -> crate::Result<()> {
     checkpoint()?;
     external(target)?;
@@ -114,7 +114,7 @@ fn publish(
     previous_sha256: &str,
     mut rename: impl FnMut(&File, &Path) -> io::Result<()>,
     mut retry: impl FnMut(&io::Error) -> bool,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
 ) -> crate::Result<()> {
     loop {
         checkpoint()?;
@@ -141,7 +141,7 @@ fn copy_and_replace(
     previous_sha256: &str,
     rename: impl FnMut(&File, &Path) -> io::Result<()>,
     retry: impl FnMut(&io::Error) -> bool,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
 ) -> crate::Result<()> {
     checkpoint()?;
     original(target, previous_sha256, checkpoint)?;

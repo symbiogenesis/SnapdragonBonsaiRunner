@@ -16,9 +16,6 @@ use zip::ZipArchive;
 use crate::identity::is_lower_hex;
 use crate::startup_download::RepairActivity;
 
-type RuntimeObserver<'a> =
-    dyn FnMut(RepairActivity, Option<(&Path, u64)>) -> crate::Result<()> + 'a;
-
 const REFERENCE: &str = include_str!("../../../config/runtime.lock.json");
 const INFERENCE: &str = include_str!("../../../config/prism-inference.lock.json");
 const ADAPTER: &str = include_str!("../../../config/swift-lora.lock.json");
@@ -495,7 +492,7 @@ pub(crate) struct InstalledInferenceFile<'a> {
 pub(crate) fn verify_installed_inference<'a>(
     destination: &Path,
     files: impl IntoIterator<Item = InstalledInferenceFile<'a>>,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
     inventory_error: &str,
 ) -> crate::Result<Vec<bonsai_artifacts::VerifiedFile>> {
     validate_external_path(destination).map_err(|error| error.to_string())?;
@@ -672,7 +669,6 @@ fn prepare_inference_stage(
     files: &[InferenceFile],
     archive: &Path,
     staging: &Path,
-    _observe: &mut RuntimeObserver<'_>,
 ) -> crate::Result<()> {
     let mut created = false;
     let result = extract_inference(archive, &lock["asset"], files, staging, &mut created);
@@ -721,7 +717,7 @@ fn inference(request: &Request, working: &Path) -> crate::Result<Value> {
             .ok_or("Inference installation has no parent.")?;
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         let staging = parent.join(format!(".staging-{}", crate::startup_process::unique()));
-        prepare_inference_stage(&lock, &files, &archive, &staging, &mut |_, _| Ok(()))?;
+        prepare_inference_stage(&lock, &files, &archive, &staging)?;
         fs::rename(&staging, &destination).map_err(|error| {
             format!(
                 "Cannot publish inference installation; staging retained at {}: {error}",
@@ -1136,7 +1132,7 @@ fn runtime_archive_expanded_bytes(path: &Path) -> crate::Result<u64> {
 fn repair_inference(
     request: &Request,
     working: &Path,
-    observe: &mut RuntimeObserver<'_>,
+    observe: &mut (impl FnMut(RepairActivity, Option<(&Path, u64)>) -> crate::Result<()> + ?Sized),
 ) -> crate::Result<Value> {
     let lock = read_lock(request.lock_path.as_deref(), INFERENCE)?;
     let files = inference_lock(&lock)?;
@@ -1192,7 +1188,7 @@ fn repair_inference(
     // the downloaded archive. Only the fresh expanded staging files are added.
     require_runtime_staging_space(parent, files.iter().map(|file| file.bytes).sum())?;
     let staging = parent.join(format!(".staging-{}", crate::startup_process::unique()));
-    prepare_inference_stage(&lock, &files, &archive, &staging, observe)?;
+    prepare_inference_stage(&lock, &files, &archive, &staging)?;
     observe(RepairActivity::Publishing, None)?;
     let _previous = publish_repaired_runtime(&staging, &destination, &expected)?;
     observe(RepairActivity::VerifyingExisting, None)?;
@@ -1205,7 +1201,7 @@ fn repair_inference(
 #[cfg(windows)]
 fn stage_publisher_repair(
     spec: &bonsai_artifacts::RuntimeSpec,
-    observe: &mut RuntimeObserver<'_>,
+    observe: &mut (impl FnMut(RepairActivity, Option<(&Path, u64)>) -> crate::Result<()> + ?Sized),
 ) -> crate::Result<bonsai_artifacts::VerifiedRuntime> {
     let parent = spec
         .runtime_directory
@@ -1249,7 +1245,7 @@ fn stage_publisher_repair(
 fn repair_engine(
     request: &Request,
     working: &Path,
-    observe: &mut RuntimeObserver<'_>,
+    observe: &mut (impl FnMut(RepairActivity, Option<(&Path, u64)>) -> crate::Result<()> + ?Sized),
 ) -> crate::Result<Value> {
     let lock = read_lock(request.lock_path.as_deref(), REFERENCE)?;
     model_lock(&lock)?;
@@ -1328,7 +1324,7 @@ fn repair_engine(
 fn repair_engine(
     _request: &Request,
     _working: &Path,
-    _observe: &mut RuntimeObserver<'_>,
+    _observe: &mut (impl FnMut(RepairActivity, Option<(&Path, u64)>) -> crate::Result<()> + ?Sized),
 ) -> crate::Result<Value> {
     Err("Publisher runtime setup requires Windows.".into())
 }
@@ -1343,7 +1339,7 @@ pub(crate) fn prepare_chat_runtime(value: Value) -> crate::Result<Value> {
 /// Reports selected chat-runtime work without observing unrelated provisioners.
 pub(crate) fn prepare_chat_runtime_observed(
     value: Value,
-    observe: &mut RuntimeObserver<'_>,
+    observe: &mut (impl FnMut(RepairActivity, Option<(&Path, u64)>) -> crate::Result<()> + ?Sized),
 ) -> crate::Result<Value> {
     let request: Request = serde_json::from_value(value).map_err(|error| error.to_string())?;
     validate_external_path(&request.data_directory).map_err(|error| error.to_string())?;
@@ -2209,7 +2205,6 @@ mod tests {
                     &files,
                     &archive_path,
                     &root.join(format!("staging-{index}")),
-                    &mut |_, _| Ok(())
                 )
                 .is_err()
             );
@@ -2256,7 +2251,6 @@ mod tests {
                 &mismatch_files,
                 &non_arm64_archive,
                 &mismatch_stage,
-                &mut |_, _| Ok(())
             )
             .is_err()
         );
@@ -2277,7 +2271,6 @@ mod tests {
                 &bad_arch_files,
                 &non_arm64_archive,
                 &bad_arch_stage,
-                &mut |_, _| Ok(())
             )
             .is_err()
         );

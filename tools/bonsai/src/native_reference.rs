@@ -157,7 +157,7 @@ fn digest(path: &Path) -> crate::Result<String> {
 
 fn digest_reader(
     file: &mut File,
-    checkpoint: &mut dyn FnMut() -> crate::Result<()>,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
 ) -> crate::Result<String> {
     crate::identity::hash_reader_checked(file, None, None, checkpoint).map(|(_, digest)| digest)
 }

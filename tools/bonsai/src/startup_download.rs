@@ -192,7 +192,7 @@ pub(crate) fn receive_repair_observed(
     bytes: u64,
     sha256: &str,
     working: &Path,
-    observe: &mut dyn FnMut(RepairActivity) -> crate::Result<()>,
+    observe: &mut (impl FnMut(RepairActivity) -> crate::Result<()> + ?Sized),
 ) -> crate::Result<()> {
     receive_repair_observed_with(uri, path, bytes, sha256, working, transfer, observe)
 }
@@ -536,7 +536,7 @@ fn verified_repair_partial(
     sha256: &str,
     working: &Path,
     mut transfer: impl FnMut(&str, &Path, u64, u64, &Path) -> crate::Result<()>,
-    observe: &mut dyn FnMut(RepairActivity) -> crate::Result<()>,
+    observe: &mut (impl FnMut(RepairActivity) -> crate::Result<()> + ?Sized),
 ) -> crate::Result<File> {
     let mut offset = repair_partial_offset(partial, bytes)?;
     let mut restart_resumed = offset > 0;
@@ -642,7 +642,7 @@ fn receive_repair_observed_with(
     sha256: &str,
     working: &Path,
     transfer: impl FnMut(&str, &Path, u64, u64, &Path) -> crate::Result<()>,
-    observe: &mut dyn FnMut(RepairActivity) -> crate::Result<()>,
+    observe: &mut (impl FnMut(RepairActivity) -> crate::Result<()> + ?Sized),
 ) -> crate::Result<()> {
     let (_parents, _guard, partial) = prepare_receive(
         uri,
