@@ -186,10 +186,7 @@ impl Pending {
             && !self.failed
             && let Some(request_source) = &self.request_source
         {
-            if self.service.is_none() {
-                self.service = Service::get(ui.ctx());
-            }
-            let Some(service) = &self.service else {
+            let Some(service) = Service::get_or_init(&mut self.service, ui.ctx()) else {
                 // Recovered messages can precede the asynchronously prepared
                 // broker image. Startup will repaint when it becomes available.
                 return changed;

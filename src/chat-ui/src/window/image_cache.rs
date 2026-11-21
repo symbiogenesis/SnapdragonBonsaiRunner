@@ -137,10 +137,7 @@ pub(super) struct ImageCache {
 impl ImageCache {
     /// Drives active offline rasterization tickets to GPU texture upload.
     pub(super) fn poll(&mut self, ctx: &egui::Context) {
-        if self.service.is_none() {
-            self.service = Service::get(ctx);
-        }
-        let Some(service) = self.service.as_ref().map(Arc::clone) else {
+        let Some(service) = Service::get_or_init(&mut self.service, ctx) else {
             return;
         };
         let mut any_pending = false;
@@ -158,7 +155,7 @@ impl ImageCache {
                     service.release(ticket);
                     clock = clock.wrapping_add(1);
                     entry.last_used = clock;
-                    entry.state = upload_from_packet(ctx, &service, &bytes);
+                    entry.state = upload_from_packet(ctx, service, &bytes);
                     entry.bytes = match &entry.state {
                         SlotState::Ready(texture) => texture_bytes(texture),
                         _ => 0,
@@ -239,38 +236,34 @@ impl ImageCache {
         }
 
         let fallback = self.best_fallback(svg);
-        if self.service.is_none() {
-            self.service = Service::get(ctx);
-        }
-
-        #[cfg(test)]
-        if self.service.is_none() {
-            let packet = bonsai_markdown::rasterize(svg, max_width, max_height);
-            let state = match markdown_service::decode_raster(&packet) {
-                Ok(Some(decoded)) => {
-                    create_texture(ctx, &decoded).map_or(SlotState::Failed, SlotState::Ready)
-                }
-                Ok(None) => SlotState::Unrenderable,
-                Err(_) => SlotState::Failed,
-            };
-            let (bytes, result) = match &state {
-                SlotState::Ready(texture) => {
-                    (texture_bytes(texture), RasterSlot::Ready(texture.clone()))
-                }
-                _ => (0, RasterSlot::FallbackSource),
-            };
-            self.entries.push(Entry {
-                key,
-                svg: svg.clone(),
-                last_used: stamp,
-                bytes,
-                state,
-            });
-            self.evict_finished();
-            return result;
-        }
-
-        let Some(service) = self.service.as_ref().map(Arc::clone) else {
+        let Some(service) = Service::get_or_init(&mut self.service, ctx) else {
+            #[cfg(test)]
+            {
+                let packet = bonsai_markdown::rasterize(svg, max_width, max_height);
+                let state = match markdown_service::decode_raster(&packet) {
+                    Ok(Some(decoded)) => {
+                        create_texture(ctx, &decoded).map_or(SlotState::Failed, SlotState::Ready)
+                    }
+                    Ok(None) => SlotState::Unrenderable,
+                    Err(_) => SlotState::Failed,
+                };
+                let (bytes, result) = match &state {
+                    SlotState::Ready(texture) => {
+                        (texture_bytes(texture), RasterSlot::Ready(texture.clone()))
+                    }
+                    _ => (0, RasterSlot::FallbackSource),
+                };
+                self.entries.push(Entry {
+                    key,
+                    svg: svg.clone(),
+                    last_used: stamp,
+                    bytes,
+                    state,
+                });
+                self.evict_finished();
+                return result;
+            }
+            #[cfg(not(test))]
             return RasterSlot::Loading { fallback };
         };
 

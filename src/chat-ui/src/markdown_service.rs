@@ -276,6 +276,20 @@ impl Service {
         })
     }
 
+    /// Borrows a cached service handle or resolves and caches it from `context`.
+    pub(crate) fn get_or_init<'a>(
+        slot: &'a mut Option<Arc<Self>>,
+        context: &egui::Context,
+    ) -> Option<&'a Self> {
+        // Polonius lets a warm slot lend directly while a cold slot ends the
+        // borrow to resolve and cache the context service.
+        if let Some(service) = slot.as_deref() {
+            return Some(service);
+        }
+        *slot = Self::get(context);
+        slot.as_deref()
+    }
+
     fn new(image: PathBuf) -> Arc<Self> {
         let shared = Arc::new(Shared::default());
         let (requests, pending) = mpsc::sync_channel(MAX_REQUESTS);
@@ -580,11 +594,19 @@ mod tests {
     #[test]
     fn markdown_waits_for_prepared_image_and_reuses_one_context_service() -> io::Result<()> {
         let context = egui::Context::default();
+        let mut slot = None;
         assert!(Service::get(&context).is_none());
+        assert!(Service::get_or_init(&mut slot, &context).is_none());
         Service::configure(&context, Path::new("C:\\prepared\\broker.exe"));
         let first = Service::get(&context).ok_or_else(|| io::Error::other("Missing service"))?;
         let second = Service::get(&context).ok_or_else(|| io::Error::other("Missing service"))?;
         assert!(Arc::ptr_eq(&first, &second));
+        let cached = Service::get_or_init(&mut slot, &context)
+            .ok_or_else(|| io::Error::other("Missing service from get_or_init"))?;
+        assert!(std::ptr::eq(cached, Arc::as_ptr(&first)));
+        let reused = Service::get_or_init(&mut slot, &context)
+            .ok_or_else(|| io::Error::other("Missing cached service from get_or_init"))?;
+        assert!(std::ptr::eq(reused, Arc::as_ptr(&first)));
         assert!(!first.unavailable());
         // No request is admitted here, so the supervisor never launches a child.
         Ok(())
