@@ -259,8 +259,10 @@ impl BranchDiffJob {
 
     /// Non-blocking poll for completion, reaping the joined worker once done.
     pub(super) fn poll(&mut self) -> Option<&BranchDiffOutcome> {
-        if self.completed.is_some() {
-            return self.completed.as_ref();
+        // Polonius lets an already-completed job lend `self.completed` directly
+        // while the pending path ends the borrow to store a received outcome.
+        if let Some(outcome) = self.completed.as_ref() {
+            return Some(outcome);
         }
         if self.worker.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(handle) = self.worker.take()
@@ -268,12 +270,12 @@ impl BranchDiffJob {
             let _joined = handle.join();
         }
         if let Ok(outcome) = self.receiver.try_recv() {
-            self.completed = Some(outcome);
             if let Some(handle) = self.worker.take() {
                 let _joined = handle.join();
             }
+            return Some(self.completed.insert(outcome));
         }
-        self.completed.as_ref()
+        None
     }
 }
 
