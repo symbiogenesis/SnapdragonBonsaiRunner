@@ -943,9 +943,9 @@ fn check_locked(
 fn digest_hex(digest: [u8; 32]) -> String {
     hex::encode(digest)
 }
-fn stream_and_hash_bounded(
+fn stream_and_hash_bounded<W: Write + ?Sized>(
     reader: &mut impl Read,
-    mut writer: Option<&mut dyn Write>,
+    mut writer: Option<&mut W>,
     expected: u64,
     buffer: &mut [u8],
     checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
@@ -1025,7 +1025,7 @@ pub fn hash_reader(
 ) -> Result<String, ArtifactError> {
     stream_and_hash_bounded(
         reader,
-        None,
+        None::<&mut std::io::Sink>,
         expected,
         buffer,
         checkpoint,
