@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "prism",
-  "sourceRevision": "2cd3f25379c1451963add2adb40cb88820f031ad",
+  "sourceRevision": "2215167fca93d67a86df7caccee28532c8fcce3b",
   "exclusions": [
     {
       "path": ".git",
@@ -21,7 +21,7 @@
     {
       "id": "common-action-file",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/action_file.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every routed action-file assertion, boundary, and error contract of retired tools/prism/upstream/common/action_file.hpp through tests/upstream_prism/reference_backend_ops.rs (reference_backend_ops/types.rs) and backend_ops/pipe.rs. The C++ header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs, ordered backend geometries, and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -49,21 +49,21 @@
     {
       "id": "common-backend-ops",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_ops.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-backend-ops.cpp per-op mathematical reference, error/tolerance, and geometry contract through tests/upstream_prism/reference_backend_ops.rs (and submodules). The C++ backend_ops.hpp header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping all 22,817 ordered correctness geometries, 1,530 performance workloads, required green IDs, and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
     {
       "id": "common-backend-sampler",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_sampler.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-backend-sampler.cpp sampling chain, candidate buffer, observer callback, and seed/probability parity contract through tests/upstream_prism/reference_model_runtime/sampler.rs via in-process model_session.rs. The C++ backend_sampler.hpp header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
     {
       "id": "common-backend-session",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/backend_session.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every persistent backend-graph session/checkpoint/frame/lifetime contract of retired tools/prism/upstream/common/backend_session.hpp through tests/upstream_prism/reference_backend_ops/state.rs and tests/upstream_prism/backend_ops/pipe.rs. The C++ header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -77,7 +77,7 @@
     {
       "id": "common-bridge",
       "obligations": [
-        "Preserve every remaining common handler in tools/prism/upstream/common/bridge.cpp under the exact catalog and migration inventory; top-level unicode-* dispatch (test-unicode) and the retired public-c-abi, dspark, arg-parser, model-resolution, optimizer, codec, codec-buffers, jinja, peg, chat-templates, chat-analysis, chat-parser, chat-auto, and chat (plus prism-upstream-server-context) handlers moved to tests/upstream_prism/reference_*.rs, leaving 12 checked-in C++ files in the common bridge. Remaining handlers and required green IDs must pass before retiring bridge.cpp."
+        "Preserve every routed operation, framed session lifecycle, and provider dispatch obligation of retired tools/prism/upstream/common/bridge.cpp through tests/upstream_prism/reference_*.rs (including reference_unicode.rs and model_session.rs). bridge.cpp and tools/prism/upstream/common/CMakeLists.txt are deleted (0 checked-in C++ files in Prism); keeping required green IDs, all 22,817 ordered backend geometries, and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -140,7 +140,7 @@
     {
       "id": "common-context-graph",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/context_graph.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every export-graph-ops, KV mean-center, and context graph reservation contract of retired tools/prism/upstream/common/context_graph.hpp through tests/upstream_prism/reference_model_runtime/forward.rs via in-process model_session.rs. The C++ header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -154,14 +154,14 @@
     {
       "id": "common-dspark-runtime",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/dspark_runtime.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every DSpark forward, loop, real-eval, staging, capture, and correction-prefix contract of retired tools/prism/upstream/common/dspark_runtime.hpp through tests/upstream_prism/reference_model_runtime/dspark.rs via in-process model_session.rs. The C++ header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
     {
       "id": "common-generated-model",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/generated_model.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every architecture inventory, generated GGUF tensor spec, and callback failure-latch contract of retired tools/prism/upstream/common/generated_model.hpp through tests/upstream_prism/reference_model_runtime/architectures.rs and gguf_model.rs. The C++ header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -203,7 +203,7 @@
     {
       "id": "common-llguidance",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/llguidance.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-grammar-llguidance.cpp Lark grammar, JSON schema, Earley traversal, and bit-exact candidate buffer contract through tests/upstream_prism/reference_llguidance.rs (and submodules) plus reference_model_runtime/llg_vocab.rs. The C++ llguidance.hpp header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -217,7 +217,7 @@
     {
       "id": "common-model-runtime",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/model_runtime.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every persistent model/context/LoRA/autorelease/cancel/save-load/thread-safety contract of retired tools/prism/upstream/common/model_runtime.hpp through tests/upstream_prism/reference_model_runtime.rs (including session.rs, params.rs, lora_merge.rs) via in-process model_session.rs. The C++ header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -294,14 +294,14 @@
     {
       "id": "common-vocab",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/vocab.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every test-tokenizer-0.{cpp,py,sh} and test-tokenizers-repo.sh vocabulary loader, SPM/BPE/WPM/UGM/RWKV/PLaMo2 tokenization, and pretokenizer contract through tests/upstream_prism/reference_vocab.rs (and submodules). The C++ vocab.hpp header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
     {
       "id": "common-vocab-session",
       "obligations": [
-        "Preserve every routed assertion, error/tolerance, boundary, model/session and concurrency obligation of tools/prism/upstream/common/vocab_session.hpp under the exact catalog and migration inventory. Independent replacement and required green IDs must pass before removing this provider or its operative include/dispatch edge."
+        "Preserve every session vocab-tokenize/detokenize and unicode-encode/decode contract of retired tools/prism/upstream/common/vocab_session.hpp through tests/upstream_prism/reference_model_runtime/llg_vocab.rs via in-process model_session.rs. The C++ header/include/dispatch/CMake edge is retired (0 checked-in C++ files); keeping required green IDs and owning hosted acceptance separate."
       ],
       "retirementQualified": false
     },
@@ -328,80 +328,7 @@
       "retirementQualified": false
     }
   ],
-  "files": [
-    {
-      "path": "tools/prism/upstream/common/action_file.hpp",
-      "bytes": 3256,
-      "sha256": "474445881948a30a5bdf11bcd320d0aa3b613e4846d13320ed0ade46e579da38",
-      "family": "common-action-file"
-    },
-    {
-      "path": "tools/prism/upstream/common/backend_ops.hpp",
-      "bytes": 45874,
-      "sha256": "b87e717cb647696d0a90bc10e1714442a3933504c5ff5c69cdd1a408952f8f68",
-      "family": "common-backend-ops"
-    },
-    {
-      "path": "tools/prism/upstream/common/backend_sampler.hpp",
-      "bytes": 22422,
-      "sha256": "d3454ae519ca9743ad7582c5af3676de014e7b8b014a00e15cad57520697a3ed",
-      "family": "common-backend-sampler"
-    },
-    {
-      "path": "tools/prism/upstream/common/backend_session.hpp",
-      "bytes": 5444,
-      "sha256": "104cb583d3e710e21098aed4b8bd992981733b743aa6f312f8196e828147df73",
-      "family": "common-backend-session"
-    },
-    {
-      "path": "tools/prism/upstream/common/bridge.cpp",
-      "bytes": 6726,
-      "sha256": "30478d3cefcd9430d1c6d3953f4e64c1008f482357a3e37fc520afacc0758508",
-      "family": "common-bridge"
-    },
-    {
-      "path": "tools/prism/upstream/common/context_graph.hpp",
-      "bytes": 2463,
-      "sha256": "516d8844ab188d7bf2f679d2396b5d5f53b3a178e3fa6a1da40ea0cd83b8d2da",
-      "family": "common-context-graph"
-    },
-    {
-      "path": "tools/prism/upstream/common/dspark_runtime.hpp",
-      "bytes": 26368,
-      "sha256": "6c927681e23677dca8109e09a6d17305326d4f328c05092fc1c6ecb6c23d8c94",
-      "family": "common-dspark-runtime"
-    },
-    {
-      "path": "tools/prism/upstream/common/generated_model.hpp",
-      "bytes": 10469,
-      "sha256": "4fb9f6524508780c476e2fcb068f4b64036fd003614c0359791d6649f956a063",
-      "family": "common-generated-model"
-    },
-    {
-      "path": "tools/prism/upstream/common/llguidance.hpp",
-      "bytes": 12261,
-      "sha256": "409dd2cd4832d27ce64c31b570a7d6c96e4558845a5c3adebd9635679938dfa4",
-      "family": "common-llguidance"
-    },
-    {
-      "path": "tools/prism/upstream/common/model_runtime.hpp",
-      "bytes": 43680,
-      "sha256": "8ad6d4c1d7e719187a887e2ddcef05bdfdde73d891014d87dc4574a8825feb2a",
-      "family": "common-model-runtime"
-    },
-    {
-      "path": "tools/prism/upstream/common/vocab.hpp",
-      "bytes": 8985,
-      "sha256": "e6e3c7d50be1a0c3b26688452894a9be820ccd307bd38d84505ef475fad7bd69",
-      "family": "common-vocab"
-    },
-    {
-      "path": "tools/prism/upstream/common/vocab_session.hpp",
-      "bytes": 8426,
-      "sha256": "d438bbffc3dbd933481b50fed8e353cd5f57b97d89a9afb10ec76fbf48408c88",
-      "family": "common-vocab-session"
-    }
-  ],
+  "files": [],
   "edges": [
     {
       "path": "Cargo.lock",
@@ -441,8 +368,8 @@
     },
     {
       "path": "tests/Test-PrismUpstream.ps1",
-      "bytes": 37574,
-      "sha256": "d330f607f3ff4d378e3d1a82166e3aae3468eb59a30b36b2613a6d697895de83",
+      "bytes": 33950,
+      "sha256": "b7d3705da46d8e01979c075937b0c49ecdf0fb5e300539069aac2a3b43eead31",
       "family": "upstream-contracts"
     },
     {
@@ -468,6 +395,12 @@
       "bytes": 3301844,
       "sha256": "bb1264b48ee43841949ef350a84bd2731a0656e9c4cd565c1afcecbfd75633a6",
       "family": "upstream-contracts"
+    },
+    {
+      "path": "tests/upstream_prism/backend_ops/pipe.rs",
+      "bytes": 32539,
+      "sha256": "010e4121fff0e1f4a1f5c458cb8691eb4a6eae768c43b2abf17781d8482263dd",
+      "family": "common-backend-session"
     },
     {
       "path": "tests/upstream_prism/barrier.rs",
@@ -531,26 +464,26 @@
     },
     {
       "path": "tests/upstream_prism/chat_peg.rs",
-      "bytes": 37604,
-      "sha256": "8d89bc0b278a3884fe810244c9a0c9fdf5b8716660d3af5fafed6c5eb197749a",
+      "bytes": 36437,
+      "sha256": "43c97dec97f32b37c3a6994ee970c8339a76e4a4e3a61904db7229e8a31f549d",
       "family": "common-chat-parser"
     },
     {
       "path": "tests/upstream_prism/chat_template.rs",
-      "bytes": 12740,
-      "sha256": "082405a8a259aac25d11b8c6f8389e4ccb253b3eeb9b1fd8ea51c9459c280c39",
+      "bytes": 12340,
+      "sha256": "d70d3ef6b0adf2a07980a105456e835fb67f0960a5fa155c78f706bead9bca31",
       "family": "common-chat-templates"
     },
     {
       "path": "tests/upstream_prism/codec_assertions.rs",
-      "bytes": 42320,
-      "sha256": "ed76848861396e3bc2eeb4b90ba4787b830bacd6d47ee94cfcca510e9829b8df",
+      "bytes": 41081,
+      "sha256": "096efcec42478f4d1b7ad66d663ba03c29b1bc5f7e6c4d3c5f9fbc9d7bdeab09",
       "family": "common-codec"
     },
     {
       "path": "tests/upstream_prism/common.rs",
-      "bytes": 7608,
-      "sha256": "b001d484b38fd4cea4018617190848cdf9121d82f3abae0c4f31de79ded4ac61",
+      "bytes": 7307,
+      "sha256": "fe744c8b6769877ea7f4ce9d1bde41a2d9213e87a0c524795f19c59cd5b2f03e",
       "family": "upstream-contracts"
     },
     {
@@ -567,8 +500,8 @@
     },
     {
       "path": "tests/upstream_prism/engine.rs",
-      "bytes": 22158,
-      "sha256": "22e5fd073da61d971f766a307dedeb9a9b2428e299e5ebbbf68b12281dc66a75",
+      "bytes": 20242,
+      "sha256": "bcd270aab279e9bf5fcf898803f32d0e9f77524f387276d15c0061695d840760",
       "family": "upstream-contracts"
     },
     {
@@ -603,8 +536,8 @@
     },
     {
       "path": "tests/upstream_prism/harness.rs",
-      "bytes": 31762,
-      "sha256": "a33fd05b48e79baf926daf028863ed4dc1d867da1ae4b2e18e24bd8cfb5582bc",
+      "bytes": 30332,
+      "sha256": "b33b7363aba06c4eccb6fb1a2761e08ba4f5eb0631c2c481cf2a975b75d177bd",
       "family": "upstream-contracts"
     },
     {
@@ -615,8 +548,8 @@
     },
     {
       "path": "tests/upstream_prism/jinja.rs",
-      "bytes": 40541,
-      "sha256": "5a64d8e60c446d491c010af1afb15e317ce88046e124bf05b3fa118ca4af6126",
+      "bytes": 39230,
+      "sha256": "6736b7a9310119feb62ab3a957f25e7623518270e2e079c9afbd5097dbdb018c",
       "family": "common-jinja"
     },
     {
@@ -672,6 +605,12 @@
       "bytes": 10644,
       "sha256": "094f9f6cbc81e92e9b8ae5a8f0cb5f0347734bf59f911b418d2cde386dacda58",
       "family": "common-model-resolution"
+    },
+    {
+      "path": "tests/upstream_prism/model_session.rs",
+      "bytes": 29085,
+      "sha256": "0033ad49afaef0d8e10d583d3fc59163b50ee0d34f58a3fa9c13b2b922d5998e",
+      "family": "common-bridge"
     },
     {
       "path": "tests/upstream_prism/moe_reduce.rs",
@@ -795,15 +734,57 @@
     },
     {
       "path": "tests/upstream_prism/reference_arena_graph.rs",
-      "bytes": 34305,
-      "sha256": "b240540a2da3f1859467244cd9f7dbf5ab255770ae1a5f7e44e498c197302759",
+      "bytes": 34299,
+      "sha256": "733d245b2a4857c66bbbba0541fb784b517d7de1bd4d83eaa46ccf908926ef9a",
       "family": "common-arena-graph"
     },
     {
       "path": "tests/upstream_prism/reference_arg_parser.rs",
-      "bytes": 54393,
-      "sha256": "048f6ae454a3452cb5a6f5804cd5254738b0cdb50838b3540d207dc1a20bf920",
+      "bytes": 54387,
+      "sha256": "a10f7aad66c528deb99ae79f120a18e2695a4c279ee36e1412571dfd797424fb",
       "family": "common-arg-parser"
+    },
+    {
+      "path": "tests/upstream_prism/reference_backend_ops.rs",
+      "bytes": 13540,
+      "sha256": "71f6d9769e0ae82237670d8e14abfe776af0cc0d38032a54ab531dc970d6f307",
+      "family": "common-backend-ops"
+    },
+    {
+      "path": "tests/upstream_prism/reference_backend_ops/eval_ops.rs",
+      "bytes": 46799,
+      "sha256": "35eb8a3b14e544d494f73213eac5d06a443532ad7b7cb8672695db223f6c87ef",
+      "family": "common-backend-ops"
+    },
+    {
+      "path": "tests/upstream_prism/reference_backend_ops/eval_ops_extra.rs",
+      "bytes": 30292,
+      "sha256": "3561597c23bbd1f631bf808e4e83975433b702972167b427b83557ab854b566a",
+      "family": "common-backend-ops"
+    },
+    {
+      "path": "tests/upstream_prism/reference_backend_ops/ops_builders.rs",
+      "bytes": 78329,
+      "sha256": "0a59e94eb60fafa28071be57260aeaf1fd04e00f0670e36b41721d2f454f963d",
+      "family": "common-backend-ops"
+    },
+    {
+      "path": "tests/upstream_prism/reference_backend_ops/quants.rs",
+      "bytes": 26857,
+      "sha256": "713a1547ab675f49e072d1387be9c6413288417aab1ac3a85fec8277f3c83337",
+      "family": "common-backend-ops"
+    },
+    {
+      "path": "tests/upstream_prism/reference_backend_ops/state.rs",
+      "bytes": 42483,
+      "sha256": "e43ca9be78b9abb185179f9ba4b8fc48189c0d7128f6c9e39b535ef837e090ef",
+      "family": "common-backend-session"
+    },
+    {
+      "path": "tests/upstream_prism/reference_backend_ops/types.rs",
+      "bytes": 27251,
+      "sha256": "9d06490bac55e1f40787ad87ad452fe8ea4a3da6ca102c139f30badfb616e681",
+      "family": "common-action-file"
     },
     {
       "path": "tests/upstream_prism/reference_batch_allocator.rs",
@@ -813,128 +794,218 @@
     },
     {
       "path": "tests/upstream_prism/reference_chat.rs",
-      "bytes": 286313,
-      "sha256": "741b2bc373b25876ff93a91d3a58f24855608a4e3e08ed1396c0016f4e5d4bd5",
+      "bytes": 286307,
+      "sha256": "4114bca11d397b8d6056c47f512804447be2ec9fb7dbdde16ab696170148e670",
       "family": "common-chat"
     },
     {
       "path": "tests/upstream_prism/reference_chat_analysis.rs",
-      "bytes": 36871,
-      "sha256": "35aea5dc904ef632391b9f7ce0d37b02ff4e8e214b0f0dc3c52553b42c9f3fd9",
+      "bytes": 35824,
+      "sha256": "d32019313455c523644ed86a618934e0cf10b690f4b359bda3a55a593c72fd00",
       "family": "common-chat-analysis"
     },
     {
       "path": "tests/upstream_prism/reference_chat_auto.rs",
-      "bytes": 120666,
-      "sha256": "59850214826c34095621dd7244a3df11cdb624b94e436baa776a612cec4fb230",
+      "bytes": 120660,
+      "sha256": "47771545d999a0b6fe2346ad0451220e8ae0ef2730528d6edbbb42ffa021f4a4",
       "family": "common-chat-auto"
     },
     {
       "path": "tests/upstream_prism/reference_chat_parser.rs",
-      "bytes": 105103,
-      "sha256": "8e04e22c17caa1fcc921df2815cff539d01cc1523fe639cc797ad005deea6c29",
+      "bytes": 105097,
+      "sha256": "04af371cdb4d400464843263f0fd0b873ade754a5aa370758bc58181a525077a",
       "family": "common-chat-parser"
     },
     {
       "path": "tests/upstream_prism/reference_chat_templates.rs",
-      "bytes": 67166,
-      "sha256": "e48e7671cbaa55c3b99665a5c2fb294564445c7fd3aa014d66ed57222e948353",
+      "bytes": 67160,
+      "sha256": "4c364706c8e916c5349a0765e4a47152c0f1e4ea5ce9af1f6fa0b3284817b019",
       "family": "common-chat-templates"
     },
     {
       "path": "tests/upstream_prism/reference_codec.rs",
-      "bytes": 239544,
-      "sha256": "5136178b39df2d10a870b897c4a340574ca70318a0f8b729ebee4e3cf98b9643",
+      "bytes": 239538,
+      "sha256": "e77d9228a788d3a00d0a7e551074aa4a7f66a9ae6ce905690277f25c376d3377",
       "family": "common-codec"
     },
     {
       "path": "tests/upstream_prism/reference_codec_buffers.rs",
-      "bytes": 81308,
-      "sha256": "38c29168e97448af9d64c008d3fe84b08e7291a3b31a53a78e8f3cc3980ff169",
+      "bytes": 81254,
+      "sha256": "633ba3f19bb683db486df2b9fd30e6befdf7bb5b29df638c298a7cfe40b29d41",
       "family": "common-codec-buffers"
     },
     {
       "path": "tests/upstream_prism/reference_dspark_logsnr.rs",
-      "bytes": 40129,
-      "sha256": "238a2bc5ab863caef6b14bc218eaec55cc13bec8f09cbbe67fa4f3410d3f5227",
+      "bytes": 40123,
+      "sha256": "692c5f57e95f3490015a3d691ba565b204ec13dd4ff90ae40a371056e1afcc0b",
       "family": "common-dspark"
     },
     {
       "path": "tests/upstream_prism/reference_gguf.rs",
-      "bytes": 41229,
-      "sha256": "a7314e09fa0d850b06d49f92457f7ac275095fcbf00061efbb9079c26dccdee3",
+      "bytes": 41223,
+      "sha256": "f565404757b32113b40884e3c61472de8ce873cd50eee8f48636b47fe17a9bff",
       "family": "common-gguf"
     },
     {
       "path": "tests/upstream_prism/reference_grammar.rs",
-      "bytes": 46140,
-      "sha256": "2b0c77fbb197d5c0e55a4c8c1c0a6fd6bcc83c738ff65408592679e1f16c60de",
+      "bytes": 46134,
+      "sha256": "4f313cdc388c4c082740ed166e757fbcf5cee9fed821fc6e94e8cef97543f2d3",
       "family": "common-grammar"
     },
     {
       "path": "tests/upstream_prism/reference_grammar_parser.rs",
-      "bytes": 24221,
-      "sha256": "951058632f0538db2b6ff724f3030a9d152b9117d850f4bf346d73631d17f2e7",
+      "bytes": 24215,
+      "sha256": "8141986943db41738aa92c9f9797c79a73ecbb107626a9345c13d7a9e31d3407",
       "family": "common-grammar-parser"
     },
     {
       "path": "tests/upstream_prism/reference_jinja.rs",
-      "bytes": 197653,
-      "sha256": "2833330f2e1a5953bb1d9c62458a8c456327311b76fb4fc9932804da9cdbda47",
+      "bytes": 197647,
+      "sha256": "4207b42321951faddabbdb841a144c702c5782d8954851bc65531171b308177d",
       "family": "common-jinja"
     },
     {
       "path": "tests/upstream_prism/reference_json_schema.rs",
-      "bytes": 84302,
-      "sha256": "8fec004b7877fbf509da362618622ea35cd003965f2d05aebe1f3fa5ad3eaf08",
+      "bytes": 84278,
+      "sha256": "f8caf8e55d90c73e3d76d8fb28c81fccdd7e105ae32d5ac505306f05dfbe73f6",
       "family": "common-json-schema"
     },
     {
+      "path": "tests/upstream_prism/reference_llguidance.rs",
+      "bytes": 36578,
+      "sha256": "410f8341456e9a49ed525c5ae86532e967ee3182b02dba1172bc7369fa8c2e73",
+      "family": "common-llguidance"
+    },
+    {
+      "path": "tests/upstream_prism/reference_llguidance/candidates.rs",
+      "bytes": 10339,
+      "sha256": "a1c05155500b3fa4aaa43191e70e9ebd773c2103a1daa17eee14d1c46338dae8",
+      "family": "common-llguidance"
+    },
+    {
+      "path": "tests/upstream_prism/reference_llguidance/grammar.rs",
+      "bytes": 38240,
+      "sha256": "8cd190991e29956b42a25b2970fd1dfc2a229e6fe543b15035bd414d590a8921",
+      "family": "common-llguidance"
+    },
+    {
+      "path": "tests/upstream_prism/reference_llguidance/grammar_schema.rs",
+      "bytes": 33219,
+      "sha256": "200bee8b81316d99420c2d4a332c851d563bc084a05bf2b4396f3d0f2547f2db",
+      "family": "common-llguidance"
+    },
+    {
+      "path": "tests/upstream_prism/reference_llguidance/json_ast.rs",
+      "bytes": 14785,
+      "sha256": "29bded29474ee6e27ae58232674b646d74d84ebb72b3d02c1eeb5fb9f4f34643",
+      "family": "common-llguidance"
+    },
+    {
       "path": "tests/upstream_prism/reference_logging.rs",
-      "bytes": 12379,
-      "sha256": "1d7bb6a71f3882034aba49634b8b3acfea3eafb4e8199ecda397fb9d5287d372",
+      "bytes": 12373,
+      "sha256": "b4a925d6b43397c2eab73693c1eefa7372877bb8b5ea34a3cd8502b700a8d46a",
       "family": "common-concurrency"
     },
     {
       "path": "tests/upstream_prism/reference_model_resolution.rs",
-      "bytes": 112948,
-      "sha256": "a65280f28cde20276d6ad635bedc7bf2554308b6758335e63c8078c974bb4670",
+      "bytes": 112942,
+      "sha256": "26535c8f0ee6c294acefc7a1343c4891827621fdeda1c3804a1e51b7bf6dff82",
       "family": "common-model-resolution"
     },
     {
+      "path": "tests/upstream_prism/reference_model_runtime.rs",
+      "bytes": 4491,
+      "sha256": "a7917b64e5d417dbc8fea74b5d718b5d0ee87924adfba6e3ef596c2006ef38ab",
+      "family": "common-model-runtime"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/architectures.rs",
+      "bytes": 5732,
+      "sha256": "7af45c533001111e7b4c3085e7188a32d116c3532b7b5ff99f22896e107e6793",
+      "family": "common-generated-model"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/dspark.rs",
+      "bytes": 33305,
+      "sha256": "33c914bfed7df48f489d293b411587c82060b0813a77214ebb35ab89c580cba2",
+      "family": "common-dspark-runtime"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/forward.rs",
+      "bytes": 50172,
+      "sha256": "3dd873774e0d79f0262aa5e14148fcb86e1677581f6d804df3c9eedc8e056196",
+      "family": "common-context-graph"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/gguf_model.rs",
+      "bytes": 37526,
+      "sha256": "2831a96ca0ea43bd7be97932a9b2be699a4da1215accdb40f4af8be5346dd537",
+      "family": "common-generated-model"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/llg_vocab.rs",
+      "bytes": 11987,
+      "sha256": "2866e28b4ee5a6f5792685889cb70547f42629198ffa853aa2d32a175f5a388b",
+      "family": "common-vocab-session"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/lora_merge.rs",
+      "bytes": 4291,
+      "sha256": "ef0175955e70175d364e1f24bacf4d2414d909a2338c39a9d494d38aa1634cfc",
+      "family": "common-model-runtime"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/params.rs",
+      "bytes": 9434,
+      "sha256": "71da7d7bda9cabdf1b4e7269a5ffac4f91193a19ae651026cd3f4f52745b4e51",
+      "family": "common-model-runtime"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/sampler.rs",
+      "bytes": 32523,
+      "sha256": "1e9d5b67c9537e626e4bf79818c8c87a29108a8ca579b9fcf3b856962fe9c09f",
+      "family": "common-backend-sampler"
+    },
+    {
+      "path": "tests/upstream_prism/reference_model_runtime/session.rs",
+      "bytes": 46916,
+      "sha256": "fd8656d414056e8b03f0f5c1970ad82ed8838789d3834d405ef2a113a64a16e5",
+      "family": "common-model-runtime"
+    },
+    {
       "path": "tests/upstream_prism/reference_mtmd.rs",
-      "bytes": 13407,
-      "sha256": "a351d81157f7140df12563dad10ca6cb69e1e47fe3b07fb1523ca8a742492a43",
+      "bytes": 13401,
+      "sha256": "d4af35055726b97e8307b01159dfaaf6c20d3f200579db24d2514da72d66beb8",
       "family": "common-mtmd"
     },
     {
       "path": "tests/upstream_prism/reference_mtmd_chunks.rs",
-      "bytes": 24614,
-      "sha256": "76babf1eb80b1d6f13107f036cb4ed1463e150048a700c26d41e3b7582ea27ea",
+      "bytes": 24608,
+      "sha256": "11c5bc62a3b28436f925374cf2be295cd926b3234987fc79cd4e4a29e9cd47b7",
       "family": "common-mtmd-chunks"
     },
     {
       "path": "tests/upstream_prism/reference_optimizer.rs",
-      "bytes": 94482,
-      "sha256": "c26c35273d184508216533f80d8162a86011c0a889acb80de7c7f090eaee0d6e",
+      "bytes": 94476,
+      "sha256": "804286af5476ba3ef23bf7450a124daa8461580c21c1fd0fabd7ebbe2f356caa",
       "family": "common-optimizer"
     },
     {
       "path": "tests/upstream_prism/reference_peg.rs",
-      "bytes": 136280,
-      "sha256": "f137158532f7c70972f9b501b98ddb1fdd79428189bb0648085440259e4feb21",
+      "bytes": 136274,
+      "sha256": "c116dc334057fed1d7a6e29772b690e67f84e6003818a888d04b4d255eba033f",
       "family": "common-peg"
     },
     {
       "path": "tests/upstream_prism/reference_provider.rs",
-      "bytes": 17421,
-      "sha256": "374b58b35973a0e1f3bc18214dfd390ffb1bd326a6929feefd365dc4c3ba0a6e",
+      "bytes": 18645,
+      "sha256": "1598bb6d4c200e828c52b4df37b896231fbd8f9610cbfd00de66a8c81721da84",
       "family": "upstream-contracts"
     },
     {
       "path": "tests/upstream_prism/reference_public_c_abi.rs",
-      "bytes": 8934,
-      "sha256": "f08d1c79750a1a9f0971d8af2993cfda34a165bce781de496fadd81cd70d3225",
+      "bytes": 8916,
+      "sha256": "64617491f1ea45d1d8acacd30521d3d499a454551ad960a18b3ccfe42f0b63f0",
       "family": "common-public-c-abi"
     },
     {
@@ -945,20 +1016,20 @@
     },
     {
       "path": "tests/upstream_prism/reference_reasoning.rs",
-      "bytes": 17855,
-      "sha256": "097295b3ab74d33c7e40840b8b52b627928af2e5ae932e834d6aa378b164ef6f",
+      "bytes": 17837,
+      "sha256": "11eb2d6efa010e0e854e15c72f1f90ec5b41f24445cfad8b41edd0e1b58cda9c",
       "family": "common-reasoning-budget"
     },
     {
       "path": "tests/upstream_prism/reference_sampling.rs",
-      "bytes": 47827,
-      "sha256": "4a15e98e063461b9a8cb342079f4cc2bd538af9e1561ac182b92efeb7ae14ca3",
+      "bytes": 47821,
+      "sha256": "a4eacd00e1c026ab45b0d48dc2b7cbb60e66fa267cde91274bcc8155a9376c25",
       "family": "common-sampling"
     },
     {
       "path": "tests/upstream_prism/reference_tensor_graph.rs",
-      "bytes": 70779,
-      "sha256": "ed691b305a546af5a34c263cbfe39c4feaf36c9cba2aaaef494b85a312992295",
+      "bytes": 70773,
+      "sha256": "aafee586f2c5ed9ae0df838bf380b960942bb296d593cf35a3b0070431e18c20",
       "family": "common-tensor-graph"
     },
     {
@@ -972,6 +1043,30 @@
       "bytes": 19173,
       "sha256": "786bb1dc8e264d13b0d29c3b37e20881c9b6b05afb8a66eaff4012004073fc84",
       "family": "common-bridge"
+    },
+    {
+      "path": "tests/upstream_prism/reference_vocab.rs",
+      "bytes": 23427,
+      "sha256": "f2f45ed1bc602346a2b8e7259f3059afeef91056faf029114d5e1ae2053c802e",
+      "family": "common-vocab"
+    },
+    {
+      "path": "tests/upstream_prism/reference_vocab/algorithms.rs",
+      "bytes": 41681,
+      "sha256": "348056ae9ca70cf74ef53393e3d04108e4d7fe6c3b61bf0eeeea003efc045d43",
+      "family": "common-vocab"
+    },
+    {
+      "path": "tests/upstream_prism/reference_vocab/gguf.rs",
+      "bytes": 9984,
+      "sha256": "b208271eb9e7055ad683a9e11a21aa2ee7788ddc89e5c193ed583b1035bae9d2",
+      "family": "common-vocab"
+    },
+    {
+      "path": "tests/upstream_prism/reference_vocab/pretokenizer.rs",
+      "bytes": 5441,
+      "sha256": "072b013ea7bb399f3342fbecdb628830d258e103d0387e8c72d65a9ade994841",
+      "family": "common-vocab"
     },
     {
       "path": "tests/upstream_prism/sampling-cases.json",
@@ -1076,12 +1171,6 @@
       "family": "upstream-contracts"
     },
     {
-      "path": "tools/prism/upstream/common/CMakeLists.txt",
-      "bytes": 3845,
-      "sha256": "5007ec15a06225dd67096fb139a54fa5a4b00def8898ba817c2ff49163e704bd",
-      "family": "native-build"
-    },
-    {
       "path": "tools/prism/upstream/llguidance.lock.json",
       "bytes": 870,
       "sha256": "5d6fa36c0669be2e7fe50e594a76b53adafe088c6eb233591bd2b7b6a6c4ea9b",
@@ -1089,8 +1178,8 @@
     },
     {
       "path": "tools/prism/upstream/migration.json",
-      "bytes": 45715,
-      "sha256": "adbd80911f07725950975827da01d247f3bf72dff91772fdacae45c7745da752",
+      "bytes": 47951,
+      "sha256": "c217438e6b3e0694c89a080286615eeddf4eaee97bfe29044c6d3a8df3fc69c3",
       "family": "upstream-contracts"
     },
     {
