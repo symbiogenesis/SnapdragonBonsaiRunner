@@ -3720,7 +3720,7 @@ mod tests {
         let daisy_reserve = 80 * 1024 * 1024_u64;
         let max_probe = 64 * 1024 * 1024 * 1024_u64;
 
-        let find_min_budget = |probe: &dyn Fn(u64) -> bool| -> u64 {
+        fn find_min_budget(max_probe: u64, probe: impl Fn(u64) -> bool) -> u64 {
             let mut lo = 1_u64;
             let mut hi = max_probe;
             while lo < hi {
@@ -3732,9 +3732,9 @@ mod tests {
                 }
             }
             lo
-        };
+        }
 
-        let min_calibrated = find_min_budget(&|bytes| {
+        let min_calibrated = find_min_budget(max_probe, |bytes| {
             config
                 .calibrated_context_plan_with_daisyrose(bytes, false, 0)
                 .is_ok()
@@ -3773,7 +3773,7 @@ mod tests {
         )?;
         assert!(admitted);
 
-        let min_profile = find_min_budget(&|bytes| {
+        let min_profile = find_min_budget(max_probe, |bytes| {
             config
                 .resolve_profile_daisyrose_admission(bytes, false, 0, false)
                 .is_ok()

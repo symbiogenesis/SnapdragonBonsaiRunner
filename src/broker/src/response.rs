@@ -176,8 +176,8 @@ pub async fn send_chat_response<W, R>(
     supervisor_deadline: impl Into<RequestDeadline>,
 ) -> Result<(), ResponseError>
 where
-    W: AsyncWrite + Unpin + 'static,
-    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
 {
     send_chat_response_mode(
         client,
@@ -195,8 +195,8 @@ pub(crate) async fn send_chat_response_mode<W, R>(
     supervisor_deadline: RequestDeadline,
 ) -> Result<(), ResponseError>
 where
-    W: AsyncWrite + Unpin + 'static,
-    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
 {
     ensure_time(supervisor_deadline)?;
     validate_metadata(&backend, streaming)?;
@@ -218,8 +218,8 @@ pub(crate) async fn send_buffered_chat_response_mode<W, R>(
     supervisor_deadline: RequestDeadline,
 ) -> Result<(), ResponseError>
 where
-    W: AsyncWrite + Unpin + 'static,
-    R: AsyncBufRead + Unpin + 'static,
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
 {
     ensure_time(supervisor_deadline)?;
     if streaming && client.is_write_vectored() {

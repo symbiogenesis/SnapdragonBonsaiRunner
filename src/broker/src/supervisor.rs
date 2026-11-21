@@ -33,7 +33,7 @@ use tokio::{
 /// this trait cannot establish those properties or process isolation.
 pub trait BackendConnector {
     /// Owned connection whose Drop closes the backend stream.
-    type Stream: AsyncRead + AsyncWrite + Unpin + 'static;
+    type Stream: AsyncRead + AsyncWrite + Unpin;
 
     /// Fixed private backend HTTP metadata, shared by counting and generation.
     fn policy(&self) -> &BackendPolicy;
@@ -96,7 +96,7 @@ pub async fn serve_chat<C>(
     deadline: impl Into<RequestDeadline>,
 ) -> Result<(), ServeError>
 where
-    C: AsyncRead + AsyncWrite + Unpin + 'static,
+    C: AsyncRead + AsyncWrite + Unpin,
 {
     serve_chat_inner(client, policy, backend, deadline.into(), None).await
 }
@@ -109,7 +109,7 @@ pub(crate) async fn serve_chat_with_budget<C>(
     budget: &BurstBudget,
 ) -> Result<(), ServeError>
 where
-    C: AsyncRead + AsyncWrite + Unpin + 'static,
+    C: AsyncRead + AsyncWrite + Unpin,
 {
     serve_chat_inner(client, policy, backend, deadline, Some(budget)).await
 }
@@ -122,7 +122,7 @@ async fn serve_chat_inner<C>(
     budget: Option<&BurstBudget>,
 ) -> Result<(), ServeError>
 where
-    C: AsyncRead + AsyncWrite + Unpin + 'static,
+    C: AsyncRead + AsyncWrite + Unpin,
 {
     ensure_time(deadline)?;
     // AcceptedChat::serve wraps the complete serve_chat_with_budget future—including
@@ -220,7 +220,7 @@ async fn receive_admitted<C>(
     budget: Option<&BurstBudget>,
 ) -> Result<Option<ReceivedChat<C>>, ServeError>
 where
-    C: AsyncRead + AsyncWrite + Unpin + 'static,
+    C: AsyncRead + AsyncWrite + Unpin,
 {
     match receive_chat_with_budget(
         client,

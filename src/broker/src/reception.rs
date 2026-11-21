@@ -91,7 +91,7 @@ impl<R> ReceivedChat<R> {
 /// Returns [`ReceiveError`] for an expired deadline, stream failure, incomplete
 /// or oversized headers/body, invalid wire syntax, surplus bytes, unavailable
 /// body storage or policy rejection.
-pub async fn receive_chat<R: AsyncRead + Unpin + 'static>(
+pub async fn receive_chat<R: AsyncRead + Unpin>(
     stream: R,
     policy: &RequestPolicy,
     supervisor_deadline: Instant,
@@ -104,7 +104,7 @@ pub async fn receive_chat<R: AsyncRead + Unpin + 'static>(
     })
 }
 
-pub(crate) async fn receive_chat_with_budget<R: AsyncRead + Unpin + 'static>(
+pub(crate) async fn receive_chat_with_budget<R: AsyncRead + Unpin>(
     stream: R,
     policy: &RequestPolicy,
     supervisor_deadline: Instant,

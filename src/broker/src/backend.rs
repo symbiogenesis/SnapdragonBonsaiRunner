@@ -113,7 +113,7 @@ pub async fn count_and_admit<S>(
     deadline: impl Into<RequestDeadline>,
 ) -> Result<AdmittedChat, BackendError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let deadline = deadline.into();
     let (status, body) =
@@ -189,7 +189,7 @@ pub(crate) async fn reset_backend<S>(
     deadline: RequestDeadline,
 ) -> Result<(), BackendError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let (_, body) = send_exchange::<_, &[u8]>(
         stream,
@@ -225,7 +225,7 @@ pub async fn request_chat<S>(
     deadline: impl Into<RequestDeadline>,
 ) -> Result<Response<BackendBody<S>>, BackendError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let deadline = deadline.into();
     let (status, body) = exchange(
@@ -261,7 +261,7 @@ pub(crate) async fn request_chat_owned<S>(
     deadline: RequestDeadline,
 ) -> Result<BackendBody<S>, BackendError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let (_, body) = exchange(
         stream,
@@ -312,7 +312,7 @@ async fn exchange<S, B: AsRef<[u8]>>(
     deadline: RequestDeadline,
 ) -> Result<(StatusCode, BackendBody<S>), BackendError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     send_exchange(
         stream,
@@ -334,7 +334,7 @@ async fn send_exchange<S, B: AsRef<[u8]>>(
     deadline: RequestDeadline,
 ) -> Result<(StatusCode, BackendBody<S>), BackendError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let write_deadline = deadline.earlier(Instant::now() + WRITE_TIMEOUT);
     ensure_time(write_deadline)?;
