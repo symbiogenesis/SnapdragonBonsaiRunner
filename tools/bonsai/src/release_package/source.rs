@@ -233,7 +233,7 @@ fn github(arguments: &Value) -> Result<Value> {
     serde_json::from_str(&invoke("gh.exe", arguments, 180, false, &json!({}))?)
         .map_err(|error| error.to_string())
 }
-fn upstream(section: &Value, cache: &mut BTreeMap<String, String>) -> Result<String> {
+fn upstream<'a>(section: &Value, cache: &'a mut BTreeMap<String, String>) -> Result<&'a str> {
     let identity = crate::release_tool::run(
         &json!({"operation":"notice-provenance","directory":section["directory"],"repository":section["repository"],"packageName":section["packageName"],"packageVersion":section["packageVersion"]}),
     )?;
@@ -244,8 +244,9 @@ fn upstream(section: &Value, cache: &mut BTreeMap<String, String>) -> Result<Str
         .as_str()
         .ok_or("Missing notice revision.")?;
     let key = format!("{upstream}@{revision}");
+    // Polonius lends from `cache` on a hit while a miss ends the borrow to insert.
     if let Some(cached) = cache.get(&key) {
-        return Ok(cached.clone());
+        return Ok(cached.as_str());
     }
     let tree = github(&json!([
         "api",
@@ -271,8 +272,7 @@ fn upstream(section: &Value, cache: &mut BTreeMap<String, String>) -> Result<Str
         )
         .map_err(|error| error.to_string())?;
     }
-    cache.insert(key, result.clone());
-    Ok(result)
+    Ok(cache.entry(key).or_insert(result).as_str())
 }
 pub(super) fn notices(repository: &Path, output: &Path) -> Result<Value> {
     let repository = resolve(repository, true, false)?;
@@ -313,12 +313,9 @@ pub(super) fn notices(repository: &Path, output: &Path) -> Result<Value> {
         let content = if section["upstreamRequired"] == true {
             upstream(section, &mut cache)?
         } else {
-            section["text"]
-                .as_str()
-                .ok_or("Missing notice text.")?
-                .into()
+            section["text"].as_str().ok_or("Missing notice text.")?
         };
-        text.push_str(&content);
+        text.push_str(content);
         text.push('\n');
     }
     fs::write(output, text).map_err(|error| error.to_string())?;
