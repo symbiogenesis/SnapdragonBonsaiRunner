@@ -567,9 +567,13 @@ adoption decisions without displacing native daily-use acceptance.
   native/DLL families
   [file by file](docs/cpp-retirement.md): replace source assertions, geometry IDs,
   codec/ABI, state and fallback obligations with independent controls, then remove
-  compiler/provisioning/build paths. Prism needs complete independent observation
-  provider coverage for its 12 remaining C++ files; retain every approved
-  green ID, all 22,817 ordered backend geometries and separate performance work.
+  compiler/provisioning/build paths. Prism has completed its **12 -> 0**
+  checked-in C++ retirement locally (`2215167fca93d67a86df7caccee28532c8fcce3b`:
+  0 checked-in C/C++ files in Prism and 0 checked-in C++ files across both repos,
+  retaining `tools/hexagon/windows_queue_abi.c` in Runner and
+  `tools/prism/upstream/bridge/` Rust GGML adapter in Prism); hosted CI acceptance
+  covering all approved green IDs, all 22,817 ordered backend geometries, native
+  GGML bridge compilation and separate performance work remains open.
   Retain required replay data and qualify owning hosted builds without a project
   C++ toolchain. Capture original selected compiled/preprocessed/generated inputs
   and the complete schema-3 compilation database beyond ASR's registry inventory;

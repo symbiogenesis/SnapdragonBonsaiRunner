@@ -457,16 +457,20 @@ reviewed manifest digest and original source revision independently; computing a
 new digest from changed bytes is not inventory acceptance.
 
 Here `$snapshotRoot` supplies the manifest's exact reviewed input bytes. Runner's
-manifest now follows the remaining queue C control and native Rust replay/build
-edges after public-wire retirement; Prism's manifest follows the reviewed
-reasoning-budget/MTP reference retirement, including the independent Rust provider
-and complete source assertions. The verifier checks bytes rather than Git revision
-provenance. Inventory
-acceptance supplies no native-model or hosted compiler verdict.
+manifest tracks its sole remaining Windows queue ABI C control
+(`tools/hexagon/windows_queue_abi.c`, zero checked-in C++ files) and native Rust
+replay/build edges after public-wire retirement; Prism's manifest
+(`sourceRevision`: `2215167fca93d67a86df7caccee28532c8fcce3b`) binds **zero**
+checked-in C/C++ files (`"files": []`) and 143 operative/contract edges across
+all 44 families following full retirement of `tools/prism/upstream/common/`
+(while retaining the Rust `PQ2`/`PTQ1` `bridge/` and build files without checked-in
+C++, with `retirementQualified: false` pending hosted CI acceptance). The verifier
+checks bytes rather than Git revision provenance; inventory acceptance supplies no
+native-model or hosted compiler verdict.
 
 The manifests enumerate Runner's remaining Windows queue ABI C control and
-Prism's 38 C++ files plus its coupled C ABI source/header. Each file belongs to an
-explicit replacement family.
+Prism's zero checked-in C/C++ source set alongside retained Rust/build/contract
+edges. Each family retains explicit replacement obligations.
 Additional identities bind operative compiler/provisioning/dispatcher/cache/
 packaging paths and immutable catalog, migration, required-green-ID and complete
 ordered backend geometry contracts. The 22,817 correctness geometries and 1,530

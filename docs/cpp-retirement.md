@@ -68,11 +68,11 @@ fixtures exercise a test-only cache and do not qualify current serving graphs.
 ## Prism checked-in native files
 
 Use Prism's [migration inventory](https://github.com/symbiogenesis/prism-inference/blob/main/tools/prism/upstream/migration.json)
-for the file-level provider list. The native boundary under
-`tools/prism/upstream/common/` includes `bridge.cpp`, its 34 C++ headers and coupled
-`public_c_abi.h`/`public_c_abi.c`. Retire each route only after its numerical,
-text/API, model/session or concurrency assertions have independent replacements;
-remove the final dispatcher after every provider has migrated.
+for the file-level provider list. The historical native boundary under
+`tools/prism/upstream/common/` comprised `bridge.cpp`, its 34 C++ headers and
+coupled `public_c_abi.h`/`public_c_abi.c`, retired in waves only after numerical,
+text/API, model/session and concurrency assertions gained independent safe Rust
+replacements (`bridge.cpp` removed last after all providers migrated).
 
 Two model-free reference families now use separate Rust implementations in the
 owning reference arm. MTP derives its six original predicates from nonnegative
@@ -140,20 +140,29 @@ owning hosted acceptance remain pending. A subsequent wave for
 additionally passes `rustfmt --check`, Release Clippy, and all 128 focused
 `reference_*` tests on integrated Prism `main` (`2cd3f25`), removing those 8
 C++ headers and the server-context CMake target and leaving 12 checked-in C++
-files and 0 C files in Prism (12 Prism native files; 13 cross-repo including
-Runner's 1 C file `tools/hexagon/windows_queue_abi.c`); complete Prism suite
-execution, native bridge compilation and owning hosted acceptance remain pending.
+files and 0 C files in Prism. The final wave retired those remaining 12 C++
+files (`vocab.hpp` via `reference_vocab.rs`, `llguidance.hpp` via
+`reference_llguidance*`, `action_file.hpp`/`backend_ops.hpp`/`backend_session.hpp`
+via `reference_backend_ops*`, and `bridge.cpp` + `backend_sampler.hpp`/
+`context_graph.hpp`/`dspark_runtime.hpp`/`generated_model.hpp`/
+`model_runtime.hpp`/`vocab_session.hpp` plus `tools/prism/upstream/common/CMakeLists.txt`
+via in-process `reference_model_runtime*` and `model_session.rs`) across Prism
+commits `c25ad1f`..`2215167fca93d67a86df7caccee28532c8fcce3b`, leaving **0 checked-in
+C++ files across both Prism and Runner** and only Runner's single retained C
+control [`tools/hexagon/windows_queue_abi.c`](../tools/hexagon/windows_queue_abi.c);
+complete Prism suite execution, native GGML `bridge/` compilation and owning
+hosted acceptance remain pending.
 
 The [checked-in boundary verifier](../tools/ci/README.md#checked-in-native-retirement-boundary)
-now binds Runner's remaining C file and the reviewed Prism snapshot's 12 C++
-files plus migrated Rust assertion/provider edges.
-Exact per-file families and declared
+now binds Runner's remaining C file (`31` edges, `6` families) and the reviewed
+Prism snapshot's `0` checked-in C/C++ files (`"files": []`, `143` edges across
+`44` families). Exact per-file families and declared
 compiler/provider/contracts identities preserve the green-ID baseline and both
-original ordered geometry schedules. Four focused controls, strict Release
-analysis/docs and real snapshot verification passed. The guard rejects added,
-deleted or changed files/declared edges and every retirement-qualified status;
-inventory acceptance cannot authorize deletion. It verifies original bytes,
-not Git revision provenance, external archives or compiled/link closure.
+original ordered geometry schedules. Five `native_boundary_` controls, strict
+Release analysis/docs and real snapshot verification passed. The guard rejects
+added, deleted or changed files/declared edges and every retirement-qualified
+status; inventory acceptance cannot authorize deletion. It verifies original
+bytes, not Git revision provenance, external archives or compiled/link closure.
 
 ## External engines, generators and build dependencies
 
@@ -165,9 +174,11 @@ not Git revision provenance, external archives or compiled/link closure.
 | Hexagon | Pure Rust model/codec execution and signed `hexagon-native-rpc` replace GGML host engines. Review vendor FastRPC separately: DriverStore `libcdsprpc.dll` (`qcnspmcdm`), `remote_handle64_*`, `rpcmem_*`, `dspqueue_*` and signed `libggml-htp-v73.so` / `libggml-htp-v81.so` DSP skels. |
 
 Expand external families to exact pinned source files before porting. Prism's
-remaining boundary includes CMake projects/adapters, native loader/LoRA-export
-linkage, LLGuidance and codec downloads, packaging, caches and provider dispatch.
-Preserve assertions when removing their build paths. TTS's Rust build and scalar,
+remaining external boundary is the Rust `PQ2`/`PTQ1` `bridge/` CMake adapter built
+at runtime against the pinned external upstream archive (`tools/prism/upstream/CMakeLists.txt`
+and `RustBridge.cmake`), packaging and caches; `--common-bridge`, `llama-export-lora`,
+and external `LLAMA_LLGUIDANCE` C++ builds are retired. Preserve assertions when
+removing remaining build paths. TTS's Rust build and scalar,
 tokenizer and graph-lifetime fixtures have no live source-overlay generator or
 native Qwen/GGML registration dependency.
 
