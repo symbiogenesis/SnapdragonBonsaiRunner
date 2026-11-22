@@ -160,6 +160,27 @@ impl Projection {
         })
     }
 
+    fn admit_quant<const BLOCK_BYTES: usize>(
+        input: usize,
+        output: usize,
+        data: WeightBytes,
+        block_elems: usize,
+        check: fn(&[u8; BLOCK_BYTES]) -> bool,
+        wrap: fn(WeightBytes) -> Storage,
+    ) -> io::Result<Self> {
+        let count = extent(input, output)?;
+        let bytes = data.as_slice();
+        if !input.is_multiple_of(block_elems) || bytes.len() != count / block_elems * BLOCK_BYTES {
+            return Err(invalid());
+        }
+        validate_quant_blocks::<BLOCK_BYTES>(bytes, check)?;
+        Ok(Self {
+            input,
+            output,
+            data: wrap(data),
+        })
+    }
+
     /// Admit `Q8_0` blocks: little-endian half scale followed by 32 signed bytes.
     ///
     /// # Errors
@@ -169,17 +190,14 @@ impl Projection {
     }
 
     pub(super) fn q8_bytes(input: usize, output: usize, data: WeightBytes) -> io::Result<Self> {
-        let count = extent(input, output)?;
-        let bytes = data.as_slice();
-        if !input.is_multiple_of(32) || bytes.len() != count / 32 * 34 {
-            return Err(invalid());
-        }
-        validate_quant_blocks::<34>(bytes, |block| f16_bits_finite(block[0], block[1]))?;
-        Ok(Self {
+        Self::admit_quant::<34>(
             input,
             output,
-            data: Storage::Q8(data),
-        })
+            data,
+            32,
+            |block| f16_bits_finite(block[0], block[1]),
+            Storage::Q8,
+        )
     }
 
     /// Admit `Q4_K` super-blocks (`144` bytes per `256` elements).
@@ -191,19 +209,14 @@ impl Projection {
     }
 
     pub(super) fn q4_k_bytes(input: usize, output: usize, data: WeightBytes) -> io::Result<Self> {
-        let count = extent(input, output)?;
-        let bytes = data.as_slice();
-        if !input.is_multiple_of(256) || bytes.len() != count / 256 * 144 {
-            return Err(invalid());
-        }
-        validate_quant_blocks::<144>(bytes, |block| {
-            f16_bits_finite(block[0], block[1]) && f16_bits_finite(block[2], block[3])
-        })?;
-        Ok(Self {
+        Self::admit_quant::<144>(
             input,
             output,
-            data: Storage::Q4K(data),
-        })
+            data,
+            256,
+            |block| f16_bits_finite(block[0], block[1]) && f16_bits_finite(block[2], block[3]),
+            Storage::Q4K,
+        )
     }
 
     /// Admit `Q6_K` super-blocks (`210` bytes per `256` elements).
@@ -215,17 +228,14 @@ impl Projection {
     }
 
     pub(super) fn q6_k_bytes(input: usize, output: usize, data: WeightBytes) -> io::Result<Self> {
-        let count = extent(input, output)?;
-        let bytes = data.as_slice();
-        if !input.is_multiple_of(256) || bytes.len() != count / 256 * 210 {
-            return Err(invalid());
-        }
-        validate_quant_blocks::<210>(bytes, |block| f16_bits_finite(block[208], block[209]))?;
-        Ok(Self {
+        Self::admit_quant::<210>(
             input,
             output,
-            data: Storage::Q6K(data),
-        })
+            data,
+            256,
+            |block| f16_bits_finite(block[208], block[209]),
+            Storage::Q6K,
+        )
     }
 
     fn row_into(&self, row: usize, output: &mut [f32]) -> io::Result<()> {
@@ -343,115 +353,63 @@ impl Projection {
         finite(out)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Fuses two sibling projections sharing `input` and activation quantization into one worker pass."
-    )]
-    pub(super) fn multiply_pair_into(
-        p0: &Self,
-        p1: &Self,
+    pub(super) fn multiply_group_into<const N: usize>(
+        pairs: [(&Self, &mut [f32]); N],
         input: &[f32],
         workers: usize,
-        out0: &mut [f32],
-        out1: &mut [f32],
         scratch: &mut Vec<f32>,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
-        if input.len() != p0.input
-            || input.len() != p1.input
-            || out0.len() != p0.output
-            || out1.len() != p1.output
-        {
-            return Err(invalid());
+        let mut checks = 0_usize;
+        for (p, out) in &pairs {
+            if input.len() != p.input || out.len() != p.output {
+                return Err(invalid());
+            }
+            checks += p.output;
         }
         finite(input)?;
-        for _ in 0..(p0.output + p1.output) {
+        for _ in 0..checks {
             check(cancel)?;
         }
-        let mut targets = [
-            (p0.as_weight_matrix(), &mut *out0),
-            (p1.as_weight_matrix(), &mut *out1),
-        ];
+        let mut targets = pairs.map(|(p, out)| (p.as_weight_matrix(), out));
         packed::multiply_single_group_into(&mut targets, input, workers, scratch);
-        finite(out0)?;
-        finite(out1)
+        for (_, out) in &targets {
+            finite(out)?;
+        }
+        Ok(())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Fuses three sibling projections (`q+k+v`) sharing `input` and activation quantization into one worker pass."
-    )]
-    pub(super) fn multiply_triple_into(
-        p0: &Self,
-        p1: &Self,
-        p2: &Self,
-        input: &[f32],
-        workers: usize,
-        out0: &mut [f32],
-        out1: &mut [f32],
-        out2: &mut [f32],
-        scratch: &mut Vec<f32>,
-        cancel: &mut impl FnMut() -> bool,
-    ) -> io::Result<()> {
-        if input.len() != p0.input
-            || input.len() != p1.input
-            || input.len() != p2.input
-            || out0.len() != p0.output
-            || out1.len() != p1.output
-            || out2.len() != p2.output
-        {
-            return Err(invalid());
-        }
-        finite(input)?;
-        for _ in 0..(p0.output + p1.output + p2.output) {
-            check(cancel)?;
-        }
-        let mut targets = [
-            (p0.as_weight_matrix(), &mut *out0),
-            (p1.as_weight_matrix(), &mut *out1),
-            (p2.as_weight_matrix(), &mut *out2),
-        ];
-        packed::multiply_single_group_into(&mut targets, input, workers, scratch);
-        finite(out0)?;
-        finite(out1)?;
-        finite(out2)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Fuses two sibling batched projections (`gate+up`) sharing `prepared` and quantized activations."
-    )]
-    pub(super) fn multiply_batch_pair_into(
-        p0: &Self,
-        p1: &Self,
+    pub(super) fn multiply_batch_group_into<const N: usize>(
+        pairs: [(&Self, &mut [f32]); N],
         prepared: &PreparedBatch,
         raw_input: &[f32],
         workers: usize,
         scratch: &mut Vec<f32>,
-        out0: &mut [f32],
-        out1: &mut [f32],
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
         let batch = prepared.batch();
-        if prepared.input() != p0.input
-            || prepared.input() != p1.input
-            || raw_input.len() != batch.checked_mul(p0.input).ok_or_else(invalid)?
-            || out0.len() != batch.checked_mul(p0.output).ok_or_else(invalid)?
-            || out1.len() != batch.checked_mul(p1.output).ok_or_else(invalid)?
-        {
+        if raw_input.len() != batch.checked_mul(prepared.input()).ok_or_else(invalid)? {
             return Err(invalid());
         }
+        let mut checks = 0_usize;
+        for (p, out) in &pairs {
+            if prepared.input() != p.input
+                || out.len() != batch.checked_mul(p.output).ok_or_else(invalid)?
+            {
+                return Err(invalid());
+            }
+            checks += batch + p.output;
+        }
         finite(raw_input)?;
-        for _ in 0..(batch + p0.output + batch + p1.output) {
+        for _ in 0..checks {
             check(cancel)?;
         }
-        let mut targets = [
-            (p0.as_weight_matrix(), &mut *out0),
-            (p1.as_weight_matrix(), &mut *out1),
-        ];
+        let mut targets = pairs.map(|(p, out)| (p.as_weight_matrix(), out));
         packed::multiply_batch_group_into(&mut targets, prepared, raw_input, workers, scratch);
-        finite(out0)?;
-        finite(out1)
+        for (_, out) in &targets {
+            finite(out)?;
+        }
+        Ok(())
     }
 
     #[expect(
@@ -471,30 +429,14 @@ impl Projection {
         out2: &mut [f32],
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
-        let batch = prepared.batch();
-        if prepared.input() != p0.input
-            || prepared.input() != p1.input
-            || prepared.input() != p2.input
-            || raw_input.len() != batch.checked_mul(p0.input).ok_or_else(invalid)?
-            || out0.len() != batch.checked_mul(p0.output).ok_or_else(invalid)?
-            || out1.len() != batch.checked_mul(p1.output).ok_or_else(invalid)?
-            || out2.len() != batch.checked_mul(p2.output).ok_or_else(invalid)?
-        {
-            return Err(invalid());
-        }
-        finite(raw_input)?;
-        for _ in 0..(batch + p0.output + batch + p1.output + batch + p2.output) {
-            check(cancel)?;
-        }
-        let mut targets = [
-            (p0.as_weight_matrix(), &mut *out0),
-            (p1.as_weight_matrix(), &mut *out1),
-            (p2.as_weight_matrix(), &mut *out2),
-        ];
-        packed::multiply_batch_group_into(&mut targets, prepared, raw_input, workers, scratch);
-        finite(out0)?;
-        finite(out1)?;
-        finite(out2)
+        Self::multiply_batch_group_into(
+            [(p0, out0), (p1, out1), (p2, out2)],
+            prepared,
+            raw_input,
+            workers,
+            scratch,
+            cancel,
+        )
     }
 
     /// Compute every output row with a cancellation check before each row.
@@ -756,9 +698,62 @@ impl Model {
     }
 }
 
+struct KvPair<T> {
+    keys: Vec<T>,
+    values: Vec<T>,
+}
+
+impl<T: Default + Clone> KvPair<T> {
+    const fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+
+    fn clear_bounded(&mut self, retain_cap: usize) {
+        clear_bounded(&mut self.keys, retain_cap);
+        clear_bounded(&mut self.values, retain_cap);
+    }
+
+    fn reserve_extra(&mut self, extra_kv: usize) -> io::Result<()> {
+        for buf in [&mut self.keys, &mut self.values] {
+            if buf.capacity() < buf.len().saturating_add(extra_kv) {
+                buf.try_reserve(extra_kv).map_err(io::Error::other)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_append(&mut self, start_kv: usize, total: usize) -> io::Result<()> {
+        for buf in [&mut self.keys, &mut self.values] {
+            buf.truncate(start_kv);
+            if buf.capacity() < total {
+                buf.try_reserve_exact(total - buf.len())
+                    .map_err(io::Error::other)?;
+            }
+            buf.resize(total, T::default());
+        }
+        Ok(())
+    }
+
+    fn truncate_to(&mut self, keep: usize) {
+        self.keys.truncate(keep);
+        self.values.truncate(keep);
+    }
+
+    fn extend(&mut self, src_k: &[T], src_v: &[T])
+    where
+        T: Copy,
+    {
+        self.keys.extend_from_slice(src_k);
+        self.values.extend_from_slice(src_v);
+    }
+}
+
 enum LayerKv {
-    F32 { keys: Vec<f32>, values: Vec<f32> },
-    F16 { keys: Vec<u16>, values: Vec<u16> },
+    F32(KvPair<f32>),
+    F16(KvPair<u16>),
 }
 
 struct LayerState {
@@ -769,14 +764,8 @@ impl LayerState {
     const fn new(precision: CachePrecision) -> Self {
         Self {
             data: match precision {
-                CachePrecision::F32 => LayerKv::F32 {
-                    keys: Vec::new(),
-                    values: Vec::new(),
-                },
-                CachePrecision::F16 => LayerKv::F16 {
-                    keys: Vec::new(),
-                    values: Vec::new(),
-                },
+                CachePrecision::F32 => LayerKv::F32(KvPair::new()),
+                CachePrecision::F16 => LayerKv::F16(KvPair::new()),
             },
         }
     }
@@ -784,43 +773,22 @@ impl LayerState {
     #[cfg(test)]
     fn from_f32(keys: Vec<f32>, values: Vec<f32>) -> Self {
         Self {
-            data: LayerKv::F32 { keys, values },
+            data: LayerKv::F32(KvPair { keys, values }),
         }
     }
 
     fn clear_bounded(&mut self, retain_cap: usize) {
         match &mut self.data {
-            LayerKv::F32 { keys, values } => {
-                clear_bounded(keys, retain_cap);
-                clear_bounded(values, retain_cap);
-            }
-            LayerKv::F16 { keys, values } => {
-                clear_bounded(keys, retain_cap);
-                clear_bounded(values, retain_cap);
-            }
+            LayerKv::F32(pair) => pair.clear_bounded(retain_cap),
+            LayerKv::F16(pair) => pair.clear_bounded(retain_cap),
         }
     }
 
     fn reserve_extra(&mut self, extra_kv: usize) -> io::Result<()> {
         match &mut self.data {
-            LayerKv::F32 { keys, values } => {
-                if keys.capacity() < keys.len().saturating_add(extra_kv) {
-                    keys.try_reserve(extra_kv).map_err(io::Error::other)?;
-                }
-                if values.capacity() < values.len().saturating_add(extra_kv) {
-                    values.try_reserve(extra_kv).map_err(io::Error::other)?;
-                }
-            }
-            LayerKv::F16 { keys, values } => {
-                if keys.capacity() < keys.len().saturating_add(extra_kv) {
-                    keys.try_reserve(extra_kv).map_err(io::Error::other)?;
-                }
-                if values.capacity() < values.len().saturating_add(extra_kv) {
-                    values.try_reserve(extra_kv).map_err(io::Error::other)?;
-                }
-            }
+            LayerKv::F32(pair) => pair.reserve_extra(extra_kv),
+            LayerKv::F16(pair) => pair.reserve_extra(extra_kv),
         }
-        Ok(())
     }
 
     fn prepare_prefill(&mut self, kv_total: usize) -> io::Result<()> {
@@ -830,55 +798,26 @@ impl LayerState {
     fn prepare_append(&mut self, start_kv: usize, add_kv: usize) -> io::Result<()> {
         let total = start_kv.checked_add(add_kv).ok_or_else(invalid)?;
         match &mut self.data {
-            LayerKv::F32 { keys, values } => {
-                keys.truncate(start_kv);
-                values.truncate(start_kv);
-                if keys.capacity() < total {
-                    keys.try_reserve_exact(total - keys.len())
-                        .map_err(io::Error::other)?;
-                }
-                if values.capacity() < total {
-                    values
-                        .try_reserve_exact(total - values.len())
-                        .map_err(io::Error::other)?;
-                }
-                keys.resize(total, 0.0);
-                values.resize(total, 0.0);
-            }
-            LayerKv::F16 { keys, values } => {
-                keys.truncate(start_kv);
-                values.truncate(start_kv);
-                if keys.capacity() < total {
-                    keys.try_reserve_exact(total - keys.len())
-                        .map_err(io::Error::other)?;
-                }
-                if values.capacity() < total {
-                    values
-                        .try_reserve_exact(total - values.len())
-                        .map_err(io::Error::other)?;
-                }
-                keys.resize(total, 0);
-                values.resize(total, 0);
-            }
+            LayerKv::F32(pair) => pair.prepare_append(start_kv, total),
+            LayerKv::F16(pair) => pair.prepare_append(start_kv, total),
         }
-        Ok(())
     }
 
     fn write_append(&mut self, start_kv: usize, src_k: &[f32], src_v: &[f32]) -> io::Result<()> {
         match &mut self.data {
-            LayerKv::F32 { keys, values } => {
+            LayerKv::F32(pair) => {
                 finite(src_k)?;
                 finite(src_v)?;
-                keys[start_kv..start_kv + src_k.len()].copy_from_slice(src_k);
-                values[start_kv..start_kv + src_v.len()].copy_from_slice(src_v);
+                pair.keys[start_kv..start_kv + src_k.len()].copy_from_slice(src_k);
+                pair.values[start_kv..start_kv + src_v.len()].copy_from_slice(src_v);
             }
-            LayerKv::F16 { keys, values } => {
+            LayerKv::F16(pair) => {
                 if !packed::narrow_f32_to_f16_slice(
                     src_k,
-                    &mut keys[start_kv..start_kv + src_k.len()],
+                    &mut pair.keys[start_kv..start_kv + src_k.len()],
                 ) || !packed::narrow_f32_to_f16_slice(
                     src_v,
-                    &mut values[start_kv..start_kv + src_v.len()],
+                    &mut pair.values[start_kv..start_kv + src_v.len()],
                 ) {
                     return Err(invalid());
                 }
@@ -889,26 +828,20 @@ impl LayerState {
 
     fn truncate_to(&mut self, keep: usize) {
         match &mut self.data {
-            LayerKv::F32 { keys, values } => {
-                keys.truncate(keep);
-                values.truncate(keep);
-            }
-            LayerKv::F16 { keys, values } => {
-                keys.truncate(keep);
-                values.truncate(keep);
-            }
+            LayerKv::F32(pair) => pair.truncate_to(keep),
+            LayerKv::F16(pair) => pair.truncate_to(keep),
         }
     }
 
     fn as_layer_cache(&self) -> LayerCache<'_> {
         match &self.data {
-            LayerKv::F32 { keys, values } => LayerCache {
-                keys: CacheValues::F32(keys.as_slice()),
-                values: CacheValues::F32(values.as_slice()),
+            LayerKv::F32(pair) => LayerCache {
+                keys: CacheValues::F32(pair.keys.as_slice()),
+                values: CacheValues::F32(pair.values.as_slice()),
             },
-            LayerKv::F16 { keys, values } => LayerCache {
-                keys: CacheValues::F16(keys.as_slice()),
-                values: CacheValues::F16(values.as_slice()),
+            LayerKv::F16(pair) => LayerCache {
+                keys: CacheValues::F16(pair.keys.as_slice()),
+                values: CacheValues::F16(pair.values.as_slice()),
             },
         }
     }
@@ -916,16 +849,16 @@ impl LayerState {
     #[cfg(test)]
     fn key_capacity(&self) -> usize {
         match &self.data {
-            LayerKv::F32 { keys, .. } => keys.capacity(),
-            LayerKv::F16 { keys, .. } => keys.capacity(),
+            LayerKv::F32(pair) => pair.keys.capacity(),
+            LayerKv::F16(pair) => pair.keys.capacity(),
         }
     }
 
     #[cfg(test)]
     fn value_capacity(&self) -> usize {
         match &self.data {
-            LayerKv::F32 { values, .. } => values.capacity(),
-            LayerKv::F16 { values, .. } => values.capacity(),
+            LayerKv::F32(pair) => pair.values.capacity(),
+            LayerKv::F16(pair) => pair.values.capacity(),
         }
     }
 }
@@ -1216,23 +1149,16 @@ impl Session {
             state.reserve_extra(kv_width)?;
         }
         for (layer_idx, state) in self.layers.iter_mut().enumerate() {
+            let range = layer_idx * kv_width..(layer_idx + 1) * kv_width;
             match &mut state.data {
-                LayerKv::F32 { keys, values } => {
-                    let k_slice = &ws.single_provisional_keys
-                        [layer_idx * kv_width..(layer_idx + 1) * kv_width];
-                    let v_slice = &ws.single_provisional_values
-                        [layer_idx * kv_width..(layer_idx + 1) * kv_width];
-                    keys.extend_from_slice(k_slice);
-                    values.extend_from_slice(v_slice);
-                }
-                LayerKv::F16 { keys, values } => {
-                    let k_slice = &ws.single_provisional_keys_f16
-                        [layer_idx * kv_width..(layer_idx + 1) * kv_width];
-                    let v_slice = &ws.single_provisional_values_f16
-                        [layer_idx * kv_width..(layer_idx + 1) * kv_width];
-                    keys.extend_from_slice(k_slice);
-                    values.extend_from_slice(v_slice);
-                }
+                LayerKv::F32(pair) => pair.extend(
+                    &ws.single_provisional_keys[range.clone()],
+                    &ws.single_provisional_values[range],
+                ),
+                LayerKv::F16(pair) => pair.extend(
+                    &ws.single_provisional_keys_f16[range.clone()],
+                    &ws.single_provisional_values_f16[range],
+                ),
             }
         }
         self.position += 1;
@@ -1486,47 +1412,37 @@ fn prefill_rows_inner(
             workers,
         )?;
         ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
-        Projection::multiply_batch_triple_into(
-            &block.query,
-            &block.key,
-            &block.value,
+        Projection::multiply_batch_group_into(
+            [
+                (&block.query, &mut ws.batch_q),
+                (&block.key, &mut ws.batch_k),
+                (&block.value, &mut ws.batch_v),
+            ],
             &ws.prepared,
             &ws.batch_norm,
             workers,
             &mut ws.transposed_scratch,
-            &mut ws.batch_q,
-            &mut ws.batch_k,
-            &mut ws.batch_v,
             cancel,
         )?;
 
-        row_workers::try_run_aligned(&mut ws.batch_q, workers, q_width, &|elem_off, q_slice| {
-            let local_start = elem_off / q_width;
-            for (local_pos, q_row) in q_slice.chunks_exact_mut(q_width).enumerate() {
-                normalize_heads(q_row, &block.query_norm, c)?;
-                rope_with_inv_freq(
-                    q_row,
-                    &model.inv_freq,
-                    c,
-                    start_pos + local_start + local_pos,
-                )?;
-            }
-            Ok(())
-        })?;
-
-        row_workers::try_run_aligned(&mut ws.batch_k, workers, kv_width, &|elem_off, k_slice| {
-            let local_start = elem_off / kv_width;
-            for (local_pos, k_row) in k_slice.chunks_exact_mut(kv_width).enumerate() {
-                normalize_heads(k_row, &block.key_norm, c)?;
-                rope_with_inv_freq(
-                    k_row,
-                    &model.inv_freq,
-                    c,
-                    start_pos + local_start + local_pos,
-                )?;
-            }
-            Ok(())
-        })?;
+        normalize_and_rope_batch(
+            &mut ws.batch_q,
+            workers,
+            q_width,
+            &block.query_norm,
+            &model.inv_freq,
+            c,
+            start_pos,
+        )?;
+        normalize_and_rope_batch(
+            &mut ws.batch_k,
+            workers,
+            kv_width,
+            &block.key_norm,
+            &model.inv_freq,
+            c,
+            start_pos,
+        )?;
 
         state.write_append(start_kv, &ws.batch_k, &ws.batch_v)?;
 
@@ -1596,29 +1512,18 @@ fn prefill_rows_inner(
             ensure_len(&mut ws.single_gate, c.intermediate)?;
             ensure_len(&mut ws.single_up, c.intermediate)?;
             ensure_len(&mut ws.single_proj, hidden)?;
-            let last_row = &mut ws.batch_a[last_offset..last_offset + hidden];
-            rms_into(last_row, &block.ffn_norm, c.epsilon, &mut ws.single_norm)?;
-            Projection::multiply_pair_into(
-                &block.gate,
-                &block.up,
-                &ws.single_norm,
-                workers,
+            ffn_single_row_into(
+                block,
+                &mut ws.batch_a[last_offset..last_offset + hidden],
+                &mut ws.single_norm,
                 &mut ws.single_gate,
                 &mut ws.single_up,
+                &mut ws.single_proj,
                 &mut ws.transposed_scratch,
+                c,
+                workers,
                 cancel,
             )?;
-            for (gate, &up) in ws.single_gate.iter_mut().zip(&ws.single_up) {
-                *gate = (*gate / (1.0 + (-*gate).exp())) * up;
-            }
-            finite(&ws.single_gate)?;
-            block
-                .down
-                .multiply_into(&ws.single_gate, workers, &mut ws.single_proj, cancel)?;
-            for (out, &value) in last_row.iter_mut().zip(&ws.single_proj) {
-                *out += value;
-            }
-            finite(last_row)?;
         } else {
             rms_batch(
                 &ws.batch_a,
@@ -1629,15 +1534,15 @@ fn prefill_rows_inner(
                 workers,
             )?;
             ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
-            Projection::multiply_batch_pair_into(
-                &block.gate,
-                &block.up,
+            Projection::multiply_batch_group_into(
+                [
+                    (&block.gate, &mut ws.batch_gate),
+                    (&block.up, &mut ws.batch_up),
+                ],
                 &ws.prepared,
                 &ws.batch_norm,
                 workers,
                 &mut ws.transposed_scratch,
-                &mut ws.batch_gate,
-                &mut ws.batch_up,
                 cancel,
             )?;
             let up_all = &ws.batch_up;
@@ -1798,6 +1703,60 @@ fn rope_with_inv_freq(
     finite(values)
 }
 
+fn normalize_and_rope_batch(
+    values: &mut [f32],
+    workers: usize,
+    width: usize,
+    norm: &[f32],
+    inv_freq: &[f32],
+    c: Config,
+    start_pos: usize,
+) -> io::Result<()> {
+    row_workers::try_run_aligned(values, workers, width, &|elem_off, slice| {
+        let local_start = elem_off / width;
+        for (local_pos, row) in slice.chunks_exact_mut(width).enumerate() {
+            normalize_heads(row, norm, c)?;
+            rope_with_inv_freq(row, inv_freq, c, start_pos + local_start + local_pos)?;
+        }
+        Ok(())
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shares single-row SwiGLU FFN across decode steps and prefill tails with caller scratch."
+)]
+fn ffn_single_row_into(
+    block: &Block,
+    row: &mut [f32],
+    norm: &mut [f32],
+    gate: &mut [f32],
+    up: &mut [f32],
+    proj: &mut [f32],
+    transposed_scratch: &mut Vec<f32>,
+    c: Config,
+    workers: usize,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<()> {
+    rms_into(row, &block.ffn_norm, c.epsilon, norm)?;
+    Projection::multiply_group_into(
+        [(&block.gate, gate), (&block.up, up)],
+        norm,
+        workers,
+        transposed_scratch,
+        cancel,
+    )?;
+    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+        *g = (*g / (1.0 + (-*g).exp())) * u;
+    }
+    finite(gate)?;
+    block.down.multiply_into(gate, workers, proj, cancel)?;
+    for (out, &value) in row.iter_mut().zip(proj.iter()) {
+        *out += value;
+    }
+    finite(row)
+}
+
 fn forward_into(
     block: &Block,
     state: &LayerState,
@@ -1814,15 +1773,14 @@ fn forward_into(
         c.epsilon,
         &mut ws.single_norm,
     )?;
-    Projection::multiply_triple_into(
-        &block.query,
-        &block.key,
-        &block.value,
+    Projection::multiply_group_into(
+        [
+            (&block.query, &mut ws.single_q),
+            (&block.key, &mut ws.single_k),
+            (&block.value, &mut ws.single_v),
+        ],
         &ws.single_norm,
         workers,
-        &mut ws.single_q,
-        &mut ws.single_k,
-        &mut ws.single_v,
         &mut ws.transposed_scratch,
         cancel,
     )?;
@@ -1860,33 +1818,18 @@ fn forward_into(
         *dst += add;
     }
     finite(&ws.single_hidden)?;
-    rms_into(
-        &ws.single_hidden,
-        &block.ffn_norm,
-        c.epsilon,
+    ffn_single_row_into(
+        block,
+        &mut ws.single_hidden,
         &mut ws.single_norm,
-    )?;
-    Projection::multiply_pair_into(
-        &block.gate,
-        &block.up,
-        &ws.single_norm,
-        workers,
         &mut ws.single_gate,
         &mut ws.single_up,
+        &mut ws.single_proj,
         &mut ws.transposed_scratch,
+        c,
+        workers,
         cancel,
-    )?;
-    for (gate, &up) in ws.single_gate.iter_mut().zip(&ws.single_up) {
-        *gate = (*gate / (1.0 + (-*gate).exp())) * up;
-    }
-    finite(&ws.single_gate)?;
-    block
-        .down
-        .multiply_into(&ws.single_gate, workers, &mut ws.single_proj, cancel)?;
-    for (out, &value) in ws.single_hidden.iter_mut().zip(&ws.single_proj) {
-        *out += value;
-    }
-    finite(&ws.single_hidden)
+    )
 }
 
 #[expect(
@@ -1907,10 +1850,10 @@ fn attend_head_causal(
     out_head: &mut [f32],
 ) -> io::Result<()> {
     match &state.data {
-        LayerKv::F32 { keys, values } => packed::attend_head(
+        LayerKv::F32(pair) => packed::attend_head(
             q_head,
-            keys,
-            values,
+            &pair.keys,
+            &pair.values,
             history_rows,
             kv_width,
             offset,
@@ -1921,10 +1864,10 @@ fn attend_head_causal(
             out_head,
             invalid,
         ),
-        LayerKv::F16 { keys, values } => packed::attend_head_f16(
+        LayerKv::F16(pair) => packed::attend_head_f16(
             q_head,
-            keys,
-            values,
+            &pair.keys,
+            &pair.values,
             history_rows,
             kv_width,
             offset,
