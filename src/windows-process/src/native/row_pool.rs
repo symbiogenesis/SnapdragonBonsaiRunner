@@ -5,8 +5,19 @@ use std::cell::{Cell, UnsafeCell};
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn wait_unpoisoned<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    cv.wait(guard)
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 const MAX_POOL_WORKERS: usize = 32;
 const SPIN_ITERATIONS: usize = 512;
@@ -155,19 +166,13 @@ fn worker_loop(shared: &Shared) {
         }
         if current_gen == last_gen {
             shared.parked_count.fetch_add(1, Ordering::SeqCst);
-            let mut guard = shared
-                .park_mutex
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = lock_unpoisoned(&shared.park_mutex);
             while !shared.shutdown.load(Ordering::SeqCst) {
                 current_gen = shared.generation.load(Ordering::SeqCst);
                 if current_gen != last_gen {
                     break;
                 }
-                guard = shared
-                    .park_cv
-                    .wait(guard)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard = wait_unpoisoned(&shared.park_cv, guard);
             }
             shared.parked_count.fetch_sub(1, Ordering::SeqCst);
             drop(guard);
@@ -183,19 +188,13 @@ fn worker_loop(shared: &Shared) {
             shared.drain_chunks(task);
         }));
         if let Err(payload) = result {
-            let mut panic_guard = shared
-                .panic_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut panic_guard = lock_unpoisoned(&shared.panic_slot);
             if panic_guard.is_none() {
                 *panic_guard = Some(payload);
             }
         }
         if shared.workers_remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
-            let _done_guard = shared
-                .done_mutex
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _done_guard = lock_unpoisoned(&shared.done_mutex);
             shared.done_cv.notify_all();
         }
     }
@@ -217,17 +216,9 @@ impl Drop for ScopeGuard<'_> {
                 std::hint::spin_loop();
             }
             if self.shared.workers_remaining.load(Ordering::Acquire) != 0 {
-                let mut guard = self
-                    .shared
-                    .done_mutex
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = lock_unpoisoned(&self.shared.done_mutex);
                 while self.shared.workers_remaining.load(Ordering::Acquire) != 0 {
-                    guard = self
-                        .shared
-                        .done_cv
-                        .wait(guard)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard = wait_unpoisoned(&self.shared.done_cv, guard);
                 }
             }
         }
@@ -240,12 +231,7 @@ impl Drop for ScopeGuard<'_> {
         unsafe { *self.shared.task.get() = TaskPtr::default() };
         IN_ROW_POOL.with(|flag| flag.set(self.previous_in_pool));
         if !std::thread::panicking() {
-            let panic_payload = self
-                .shared
-                .panic_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let panic_payload = lock_unpoisoned(&self.shared.panic_slot).take();
             if let Some(payload) = panic_payload {
                 std::panic::resume_unwind(payload);
             }
@@ -303,11 +289,7 @@ impl NativeRowWorkerPool {
         }
 
         let target_chunks = active.min(groups).min(MAX_POOL_WORKERS);
-        let _dispatch = self
-            .shared
-            .dispatch_mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _dispatch = lock_unpoisoned(&self.shared.dispatch_mutex);
         let chunk_elems = groups.div_ceil(target_chunks) * align;
         let mut chunk_count = 0_usize;
         let mut offset = 0_usize;
@@ -351,11 +333,7 @@ impl NativeRowWorkerPool {
 
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
         if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
-            let _park = self
-                .shared
-                .park_mutex
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _park = lock_unpoisoned(&self.shared.park_mutex);
             self.shared.park_cv.notify_all();
         }
 
@@ -375,9 +353,7 @@ impl NativeRowWorkerPool {
         let failure: Mutex<Option<(usize, io::Error)>> = Mutex::new(None);
         self.run_aligned(out, active_workers, alignment, &|offset, slice| {
             if let Err(error) = compute(offset, slice) {
-                let mut guard = failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = lock_unpoisoned(&failure);
                 if guard.as_ref().is_none_or(|(prev, _)| offset < *prev) {
                     *guard = Some((offset, error));
                 }
@@ -397,11 +373,7 @@ impl Drop for NativeRowWorkerPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         {
-            let _guard = self
-                .shared
-                .park_mutex
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _guard = lock_unpoisoned(&self.shared.park_mutex);
             self.shared.park_cv.notify_all();
         }
         for handle in self.workers.drain(..) {
