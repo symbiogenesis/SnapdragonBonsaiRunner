@@ -155,7 +155,9 @@ fn option_accounting(
             .any(|(left, right)| left >= right)
         || omitted_groups.iter().any(|&g| g >= 17)
     {
-        return Err("U2 omittedGroups must be sorted distinct indices 0..16 keeping >= 1 group.".into());
+        return Err(
+            "U2 omittedGroups must be sorted distinct indices 0..16 keeping >= 1 group.".into(),
+        );
     }
     if recovery_rank > 16 {
         return Err(format!("U2 recoveryRank {recovery_rank} exceeds 16.").into());
@@ -224,8 +226,8 @@ fn evaluate_kl_metrics(
     reason = "Keep U2 split validation, role summaries, exact MCKP, and baselines auditable together."
 )]
 pub(super) fn run(value: Value) -> crate::Result<Value> {
-    let request: RequestV2 =
-        serde_json::from_value(value).map_err(|error| format!("Invalid U2 FFN sensitivity request: {error}"))?;
+    let request: RequestV2 = serde_json::from_value(value)
+        .map_err(|error| format!("Invalid U2 FFN sensitivity request: {error}"))?;
     if request.schema_version != 2 {
         return Err("U2 sensitivity screening requires schemaVersion 2.".into());
     }
@@ -394,7 +396,13 @@ pub(super) fn run(value: Value) -> crate::Result<Value> {
     let mut mckp_total_kl = 0.0_f64;
     let mut selected_ffn_json = Vec::with_capacity(ffn_groups.len());
     let mut hasher = Hasher::new()?;
-    hasher.update(format!("rep={:?};budget={};", request.weight_representation, request.max_recovery_factor_bytes).as_bytes())?;
+    hasher.update(
+        format!(
+            "rep={:?};budget={};",
+            request.weight_representation, request.max_recovery_factor_bytes
+        )
+        .as_bytes(),
+    )?;
     for d in &fit_set {
         hasher.update(format!("fit={d};").as_bytes())?;
     }
@@ -433,8 +441,11 @@ pub(super) fn run(value: Value) -> crate::Result<Value> {
         compute_uniform_baseline(&ffn_groups, request.max_recovery_factor_bytes);
 
     // Baseline 2: Magnitude-greedy allocation prioritizing sites with largest magnitude_score.
-    let (magnitude_kl, magnitude_bytes) =
-        compute_magnitude_baseline(&ffn_groups, &ffn_site_meta, request.max_recovery_factor_bytes);
+    let (magnitude_kl, magnitude_bytes) = compute_magnitude_baseline(
+        &ffn_groups,
+        &ffn_site_meta,
+        request.max_recovery_factor_bytes,
+    );
 
     let mut role_summaries = BTreeMap::new();
     for (role, acc) in role_accs {
@@ -589,7 +600,8 @@ fn compute_magnitude_baseline(
                     .then_with(|| ia.cmp(&ib))
             })
         {
-            used_bytes = used_bytes - base_cost + groups[idx][best_opt].accounting.new_factor_payload_bytes;
+            used_bytes =
+                used_bytes - base_cost + groups[idx][best_opt].accounting.new_factor_payload_bytes;
             chosen[idx] = best_opt;
         }
     }

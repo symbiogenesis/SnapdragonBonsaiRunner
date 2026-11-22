@@ -440,7 +440,9 @@ pub fn weighted_mean_kl_divergence(kl_values: &[f64], weights: &[f64]) -> Result
     let mut raw_sum = 0.0_f64;
     for (&kl, &w) in kl_values.iter().zip(weights) {
         if !kl.is_finite() || kl < 0.0 {
-            return Err(format!("KL value must be finite and non-negative, got {kl}"));
+            return Err(format!(
+                "KL value must be finite and non-negative, got {kl}"
+            ));
         }
         if !w.is_finite() || w < 0.0 {
             return Err(format!("weight must be finite and non-negative, got {w}"));
@@ -485,11 +487,7 @@ pub fn per_site_fisher_weighted_kl_metrics<T: AsRef<[f64]>>(
     let weights = token_softmax_fisher_weights(teacher_logits)?;
     let mut base_kls = Vec::with_capacity(teacher_logits.len());
     let mut rec_kls = Vec::with_capacity(teacher_logits.len());
-    for ((t, b), r) in teacher_logits
-        .iter()
-        .zip(base_logits)
-        .zip(recovered_logits)
-    {
+    for ((t, b), r) in teacher_logits.iter().zip(base_logits).zip(recovered_logits) {
         base_kls.push(kl_divergence_from_logits(t.as_ref(), b.as_ref())?);
         rec_kls.push(kl_divergence_from_logits(t.as_ref(), r.as_ref())?);
     }
@@ -507,7 +505,8 @@ pub fn per_site_kl_gap<T: AsRef<[f64]>>(
     base_logits: &[T],
     recovered_logits: &[T],
 ) -> Result<f64> {
-    let (_, _, gap) = per_site_fisher_weighted_kl_metrics(teacher_logits, base_logits, recovered_logits)?;
+    let (_, _, gap) =
+        per_site_fisher_weighted_kl_metrics(teacher_logits, base_logits, recovered_logits)?;
     Ok(gap)
 }
 
@@ -543,7 +542,9 @@ fn solve_multiple_choice_knapsack(
     let mut total_min_cost = 0_u64;
     for (g_idx, group) in groups.iter().enumerate() {
         if group.is_empty() {
-            return Err(format!("knapsack group {g_idx} must contain at least one option"));
+            return Err(format!(
+                "knapsack group {g_idx} must contain at least one option"
+            ));
         }
         if group.len() > usize::from(u16::MAX) {
             return Err(format!("knapsack group {g_idx} exceeds u16 option limit"));
@@ -551,7 +552,9 @@ fn solve_multiple_choice_knapsack(
         let mut group_min = u64::MAX;
         for opt in group {
             if !opt.value.is_finite() {
-                return Err(format!("knapsack option value in group {g_idx} must be finite"));
+                return Err(format!(
+                    "knapsack option value in group {g_idx} must be finite"
+                ));
             }
             group_min = group_min.min(opt.cost);
         }
@@ -571,7 +574,11 @@ fn solve_multiple_choice_knapsack(
         for opt in group {
             let rel = opt.cost - g_min;
             if rel > 0 {
-                step_gcd = if step_gcd == 0 { rel } else { u64_gcd(step_gcd, rel) };
+                step_gcd = if step_gcd == 0 {
+                    rel
+                } else {
+                    u64_gcd(step_gcd, rel)
+                };
             }
         }
     }
@@ -756,7 +763,8 @@ mod tests {
         // Base is slightly off on token 0, badly off on token 1; recovered fixes token 1.
         let base = vec![vec![20.0, 0.0], vec![4.0, 0.0]];
         let recovered = vec![vec![20.0, 0.0], vec![1.0, 1.0]];
-        let (base_kl, rec_kl, gap) = per_site_fisher_weighted_kl_metrics(&teacher, &base, &recovered)?;
+        let (base_kl, rec_kl, gap) =
+            per_site_fisher_weighted_kl_metrics(&teacher, &base, &recovered)?;
         assert!(base_kl > 1.0);
         assert!(rec_kl <= 1e-9);
         assert!((gap - (base_kl - rec_kl)).abs() <= 1e-12);

@@ -157,7 +157,8 @@ fn rejects_unsupported_shapes_and_noncanonical_sites() {
 }
 
 #[test]
-fn u2_sensitivity_screen_enforces_splits_separates_roles_and_beats_baselines() -> crate::Result<()> {
+fn u2_sensitivity_screen_enforces_splits_separates_roles_and_beats_baselines() -> crate::Result<()>
+{
     let fit_a = "aa".repeat(32);
     let dev_a = "bb".repeat(32);
     let held_a = "cc".repeat(32);
@@ -248,10 +249,7 @@ fn u2_sensitivity_screen_enforces_splits_separates_roles_and_beats_baselines() -
     assert_eq!(plan["performanceQualified"], false);
     assert_eq!(plan["behaviorQualified"], false);
     assert_eq!(plan["splitCounts"]["pairwiseDisjoint"], true);
-    assert_eq!(
-        plan["aggregate"]["newFactorPayloadBytes"],
-        budget_bytes
-    );
+    assert_eq!(plan["aggregate"]["newFactorPayloadBytes"], budget_bytes);
     // MCKP must give rank 4 to critical high-KL layer 63 (not high-magnitude layer 0!).
     assert_eq!(plan["selectedFfnSites"][0]["recoveryRank"], 0);
     assert_eq!(plan["selectedFfnSites"][1]["recoveryRank"], 4);
@@ -270,7 +268,12 @@ fn u2_sensitivity_screen_enforces_splits_separates_roles_and_beats_baselines() -
     assert!(plan["roleSummaries"]["ffn"].is_object());
     assert!(plan["roleSummaries"]["recurrent-projection"].is_object());
     assert!(plan["roleSummaries"]["attention-projection"].is_object());
-    assert!(!plan["frozenSelectionSha256"].as_str().unwrap_or("").is_empty());
+    assert!(
+        !plan["frozenSelectionSha256"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty()
+    );
 
     // Changing only heldoutPromptSha256s must NOT alter frozenSelectionSha256.
     let plan2 = run(json!({
@@ -309,27 +312,32 @@ fn u2_sensitivity_screen_enforces_splits_separates_roles_and_beats_baselines() -
             }
         ]
     }))?;
-    assert_eq!(plan2["frozenSelectionSha256"], plan["frozenSelectionSha256"]);
+    assert_eq!(
+        plan2["frozenSelectionSha256"],
+        plan["frozenSelectionSha256"]
+    );
 
     // Reject overlapping heldout / fit / dev prompt digests (U1 split disjointness).
-    assert!(run(json!({
-        "schemaVersion": 2,
-        "weightRepresentation": "PQ2_0",
-        "maxRecoveryFactorBytes": budget_bytes,
-        "fitPromptSha256s": [fit_a],
-        "devPromptSha256s": [dev_a],
-        "heldoutPromptSha256s": [dev_a],
-        "sites": [{
-            "layer": 0,
-            "role": "ffn",
-            "magnitudeScore": 1.0,
-            "branchMagnitude": 1.0,
-            "logitDeltaL2": 0.1,
-            "residualDrift": 0.1,
-            "candidates": [{ "omittedGroups": [0], "recoveryRank": 1, "expectedKlLoss": 0.1 }]
-        }]
-    }))
-    .is_err());
+    assert!(
+        run(json!({
+            "schemaVersion": 2,
+            "weightRepresentation": "PQ2_0",
+            "maxRecoveryFactorBytes": budget_bytes,
+            "fitPromptSha256s": [fit_a],
+            "devPromptSha256s": [dev_a],
+            "heldoutPromptSha256s": [dev_a],
+            "sites": [{
+                "layer": 0,
+                "role": "ffn",
+                "magnitudeScore": 1.0,
+                "branchMagnitude": 1.0,
+                "logitDeltaL2": 0.1,
+                "residualDrift": 0.1,
+                "candidates": [{ "omittedGroups": [0], "recoveryRank": 1, "expectedKlLoss": 0.1 }]
+            }]
+        }))
+        .is_err()
+    );
 
     Ok(())
 }

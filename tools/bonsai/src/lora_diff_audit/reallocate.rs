@@ -13,9 +13,7 @@ use super::gguf_adapter::{
     ExportDtype, ExportTensorPair, read_lora_gguf_pairs_with_dims, sort_pairs_canonically,
     swift_base_dims_map, write_lora_gguf,
 };
-use super::transform::{
-    check_factor_value, target_layer_and_family_map, verify_published_adapter,
-};
+use super::transform::{check_factor_value, target_layer_and_family_map, verify_published_adapter};
 use super::{Operation, Request, usize_to_f32};
 
 pub(super) const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
@@ -525,11 +523,8 @@ pub(super) fn run_reallocate_ranks_with_dims(
     }
     sort_pairs_canonically(&mut final_pairs);
 
-    let canonical_digests: BTreeSet<String> = config
-        .diagnostic_prompt_sha256s
-        .iter()
-        .cloned()
-        .collect();
+    let canonical_digests: BTreeSet<String> =
+        config.diagnostic_prompt_sha256s.iter().cloned().collect();
     let training_prompt_sha256s: Vec<String> = canonical_digests.into_iter().collect();
 
     let mut meta: Vec<(String, String)> = loaded

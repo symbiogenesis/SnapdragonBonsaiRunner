@@ -2131,23 +2131,27 @@ fn edit_adapter_per_site_ranks_slices_drops_and_validates() -> crate::Result<()>
     assert_eq!(reloaded.pairs[1].gguf_base_name, "blk.63.ffn_down.weight");
     assert_eq!(reloaded.pairs[1].rank, 6);
 
-    assert!(run(json!({
-        "schemaVersion": 1,
-        "operation": "edit-adapter",
-        "adapterPath": src,
-        "outputPath": scratch.join("bad-target.gguf"),
-        "editConfig": { "perSiteRanks": { "blk.99.ffn_down.weight": 2 } }
-    }))
-    .is_err());
+    assert!(
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "edit-adapter",
+            "adapterPath": src,
+            "outputPath": scratch.join("bad-target.gguf"),
+            "editConfig": { "perSiteRanks": { "blk.99.ffn_down.weight": 2 } }
+        }))
+        .is_err()
+    );
 
-    assert!(run(json!({
-        "schemaVersion": 1,
-        "operation": "edit-adapter",
-        "adapterPath": src,
-        "outputPath": scratch.join("bad-rank.gguf"),
-        "editConfig": { "perSiteRanks": { "blk.0.ffn_down.weight": 16 } }
-    }))
-    .is_err());
+    assert!(
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "edit-adapter",
+            "adapterPath": src,
+            "outputPath": scratch.join("bad-rank.gguf"),
+            "editConfig": { "perSiteRanks": { "blk.0.ffn_down.weight": 16 } }
+        }))
+        .is_err()
+    );
     Ok(())
 }
 
@@ -2231,9 +2235,7 @@ fn reallocate_ranks_equal_byte_kl_fisher_knapsack_and_split_disjointness() -> cr
     }))?;
 
     assert_eq!(res["published"], true);
-    assert!(
-        res["factorPayloadBytes"].as_u64().unwrap_or(u64::MAX) <= 2_162_688_u64
-    );
+    assert!(res["factorPayloadBytes"].as_u64().unwrap_or(u64::MAX) <= 2_162_688_u64);
     assert_eq!(res["maxRank"], 32);
     assert_eq!(res["perSiteRanks"]["blk.63.ffn_down.weight"], 32);
     assert_eq!(res["perSiteRanks"]["blk.62.ffn_down.weight"], 16);
@@ -2360,18 +2362,23 @@ fn reallocate_ranks_equal_byte_kl_fisher_knapsack_and_split_disjointness() -> cr
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    assert!(run(json!({
-        "schemaVersion": 1,
-        "operation": "dr-g2-score",
-        "evidencePath": overlap_path
-    }))
-    .is_err());
+    assert!(
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-score",
+            "evidencePath": overlap_path
+        }))
+        .is_err()
+    );
 
     let clean_path = scratch.join("clean-evidence.json");
     fs::write(
         &clean_path,
-        serde_json::to_vec(&make_evidence(&res["trainingPromptSha256s"], &eval_disjoint))
-            .map_err(|e| e.to_string())?,
+        serde_json::to_vec(&make_evidence(
+            &res["trainingPromptSha256s"],
+            &eval_disjoint,
+        ))
+        .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let scored = run(json!({
@@ -2382,28 +2389,32 @@ fn reallocate_ranks_equal_byte_kl_fisher_knapsack_and_split_disjointness() -> cr
     assert_eq!(scored["drG2Passed"], true);
 
     // Budget above 64 MiB or missing diagnosticPromptSha256s must be rejected.
-    assert!(run(json!({
-        "schemaVersion": 1,
-        "operation": "reallocate-ranks",
-        "adapterPath": src,
-        "outputPath": scratch.join("over64mib.gguf"),
-        "reallocateConfig": {
-            "maxPayloadBytes": 64_u64 * 1024 * 1024 + 1,
-            "diagnosticPromptSha256s": [diag_a],
-            "siteSensitivities": [{ "target": "blk.63.ffn_down.weight", "reasoningKlGap": 1.0 }]
-        }
-    }))
-    .is_err());
-    assert!(run(json!({
-        "schemaVersion": 1,
-        "operation": "reallocate-ranks",
-        "adapterPath": src,
-        "outputPath": scratch.join("no-diag.gguf"),
-        "reallocateConfig": {
-            "diagnosticPromptSha256s": [],
-            "siteSensitivities": [{ "target": "blk.63.ffn_down.weight", "reasoningKlGap": 1.0 }]
-        }
-    }))
-    .is_err());
+    assert!(
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "reallocate-ranks",
+            "adapterPath": src,
+            "outputPath": scratch.join("over64mib.gguf"),
+            "reallocateConfig": {
+                "maxPayloadBytes": 64_u64 * 1024 * 1024 + 1,
+                "diagnosticPromptSha256s": [diag_a],
+                "siteSensitivities": [{ "target": "blk.63.ffn_down.weight", "reasoningKlGap": 1.0 }]
+            }
+        }))
+        .is_err()
+    );
+    assert!(
+        run(json!({
+            "schemaVersion": 1,
+            "operation": "reallocate-ranks",
+            "adapterPath": src,
+            "outputPath": scratch.join("no-diag.gguf"),
+            "reallocateConfig": {
+                "diagnosticPromptSha256s": [],
+                "siteSensitivities": [{ "target": "blk.63.ffn_down.weight", "reasoningKlGap": 1.0 }]
+            }
+        }))
+        .is_err()
+    );
     Ok(())
 }
