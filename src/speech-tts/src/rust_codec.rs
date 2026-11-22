@@ -208,15 +208,11 @@ fn trans_conv<S: CodecSource + ?Sized>(
     kernel: usize,
     stride: usize,
 ) -> io::Result<CausalTransConv1d> {
-    Ok(CausalTransConv1d {
-        in_c: input,
-        out_c: output,
-        kernel,
-        stride,
-        // GGUF stores the PyTorch [IC, OC, K] array without a permutation.
-        weight: convolution_weight(weights, &format!("{name}.weight"), [kernel, output, input])?,
-        bias: Some(weights.tensor_f32(&format!("{name}.bias"), &[output])?),
-    })
+    // GGUF stores the PyTorch [IC, OC, K] array without a permutation.
+    let raw_weight =
+        convolution_weight(weights, &format!("{name}.weight"), [kernel, output, input])?;
+    let bias = weights.tensor_f32(&format!("{name}.bias"), &[output])?;
+    CausalTransConv1d::from_ic_oc_k(input, output, kernel, stride, &raw_weight, Some(bias))
 }
 
 fn snake<S: CodecSource + ?Sized>(
@@ -2438,44 +2434,46 @@ mod tests {
             .map(|stride| -> std::io::Result<DacBlock> {
                 Ok(DacBlock {
                     snake1: SnakeBeta::from_log_params(&[0.0, 0.1], &[0.0, 0.0])?,
-                    trans_conv: CausalTransConv1d {
-                        in_c: 2,
-                        out_c: 2,
-                        kernel: 2 * stride,
+                    trans_conv: CausalTransConv1d::from_ic_oc_k(
+                        2,
+                        2,
+                        2 * stride,
                         stride,
-                        weight: vec![0.05; 2 * 2 * 2 * stride],
-                        bias: Some(vec![0.0, 0.01]),
-                    },
+                        &vec![0.05; 2 * 2 * 2 * stride],
+                        Some(vec![0.0, 0.01]),
+                    )?,
                     res_units: [res(1)?, res(3)?, res(9)?],
                 })
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         let make_codec = || -> std::io::Result<super::Codec> {
             let upsamples = (0..2)
-                .map(|_| super::Upsample {
-                    conv: CausalTransConv1d {
-                        in_c: 2,
-                        out_c: 2,
-                        kernel: 2,
-                        stride: 2,
-                        weight: vec![0.125; 2 * 2 * 2],
-                        bias: Some(vec![0.0, -0.01]),
-                    },
-                    block: crate::codec::ConvNeXtBlock {
-                        channels: 2,
-                        kernel: 3,
-                        dw_weight: vec![0.05; 2 * 3],
-                        dw_bias: vec![0.0; 2],
-                        norm_w: vec![1.0; 2],
-                        norm_b: vec![0.0; 2],
-                        pwconv1_w: vec![0.02; 8 * 2],
-                        pwconv1_b: vec![0.0; 8],
-                        pwconv2_w: vec![0.02; 2 * 8],
-                        pwconv2_b: vec![0.0; 2],
-                        gamma: vec![0.1; 2],
-                    },
+                .map(|_| -> std::io::Result<super::Upsample> {
+                    Ok(super::Upsample {
+                        conv: CausalTransConv1d::from_ic_oc_k(
+                            2,
+                            2,
+                            2,
+                            2,
+                            &[0.125; 2 * 2 * 2],
+                            Some(vec![0.0, -0.01]),
+                        )?,
+                        block: crate::codec::ConvNeXtBlock {
+                            channels: 2,
+                            kernel: 3,
+                            dw_weight: vec![0.05; 2 * 3],
+                            dw_bias: vec![0.0; 2],
+                            norm_w: vec![1.0; 2],
+                            norm_b: vec![0.0; 2],
+                            pwconv1_w: vec![0.02; 8 * 2],
+                            pwconv1_b: vec![0.0; 8],
+                            pwconv2_w: vec![0.02; 2 * 8],
+                            pwconv2_b: vec![0.0; 2],
+                            gamma: vec![0.1; 2],
+                        },
+                    })
                 })
-                .collect();
+                .collect::<std::io::Result<Vec<_>>>()?;
             Ok(super::Codec {
                 threads: 2,
                 weights_path: None,

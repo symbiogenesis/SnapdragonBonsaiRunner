@@ -42,29 +42,32 @@ fn residual(dilation: usize) -> DacResUnit {
     }
 }
 
-fn decoder() -> DacDecoder {
-    DacDecoder {
-        conv_pre: current_convolution(1.0 / 16.0, 1),
-        blocks: [8, 5, 4, 3]
-            .into_iter()
-            .map(|stride| DacBlock {
+fn decoder() -> io::Result<DacDecoder> {
+    let blocks = [8, 5, 4, 3]
+        .into_iter()
+        .map(|stride| -> io::Result<DacBlock> {
+            Ok(DacBlock {
                 snake1: identity_snake(),
-                trans_conv: CausalTransConv1d {
-                    in_c: 1,
-                    out_c: 1,
-                    kernel: 2 * stride,
+                trans_conv: CausalTransConv1d::from_ic_oc_k(
+                    1,
+                    1,
+                    2 * stride,
                     stride,
-                    weight: vec![1.0 / 8.0; 2 * stride],
-                    bias: None,
-                },
+                    &vec![1.0 / 8.0; 2 * stride],
+                    None,
+                )?,
                 // All three residual branches execute and double the signal,
                 // cancelling this block's 1/8 transposed-convolution scale.
                 res_units: [residual(1), residual(3), residual(9)],
             })
-            .collect(),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(DacDecoder {
+        conv_pre: current_convolution(1.0 / 16.0, 1),
+        blocks,
         snake_post: identity_snake(),
         conv_post: current_convolution(1.0, 1),
-    }
+    })
 }
 
 fn initial_state() -> CodecStreamState {
@@ -116,7 +119,7 @@ const INPUT: [f32; 11] = [0.5, -0.75, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
 
 #[test]
 fn dac_reference_complete_four_block_impulse_has_literal_pcm_and_flushed_state() -> io::Result<()> {
-    let decoder = decoder();
+    let decoder = decoder()?;
     assert_eq!(decoder.sample_rate(), 24_000);
     for chunks in [&[11][..], &[1; 11][..], &[2, 3, 6][..]] {
         let mut state = initial_state();
@@ -143,7 +146,7 @@ fn dac_reference_complete_four_block_impulse_has_literal_pcm_and_flushed_state()
 
 #[test]
 fn dac_reference_final_nonlinearity_and_finite_saturation_follow_closed_form() -> io::Result<()> {
-    let mut decoder = decoder();
+    let mut decoder = decoder()?;
     decoder.snake_post = SnakeBeta {
         a: vec![1.0],
         inv_b: vec![0.25],
