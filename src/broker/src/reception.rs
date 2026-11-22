@@ -269,11 +269,7 @@ async fn read_before<R: AsyncRead + Unpin>(
 }
 
 fn ensure_time(deadline: Instant) -> Result<(), ReceiveError> {
-    if Instant::now() >= deadline {
-        Err(ReceiveError::Deadline)
-    } else {
-        Ok(())
-    }
+    crate::deadline::RequestDeadline::from(deadline).ensure(ReceiveError::Deadline)
 }
 
 fn parse_head(policy: &RequestPolicy, raw: &[u8]) -> Result<AuthorizedHead, ReceiveError> {

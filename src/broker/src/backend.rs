@@ -129,7 +129,7 @@ where
     if context_rejected {
         let Object(rejection): Object<CountRejection<'_>> =
             serde_json::from_slice(&bytes).map_err(|_| BackendError::CountSchema)?;
-        ensure_time(deadline)?;
+        deadline.ensure(BackendError::Deadline)?;
         return if rejection.error.0.code == "context_length_exceeded" {
             Err(BackendError::Admission(Rejection::ContextLimit))
         } else {
@@ -138,7 +138,7 @@ where
     }
     let Object(count): Object<Count<'_>> =
         serde_json::from_slice(&bytes).map_err(|_| BackendError::CountSchema)?;
-    ensure_time(deadline)?;
+    deadline.ensure(BackendError::Deadline)?;
     if count.object != "response.input_tokens" {
         return Err(BackendError::CountSchema);
     }
@@ -146,7 +146,7 @@ where
     let admitted = pending
         .admit(|_| Ok(count.input_tokens))
         .map_err(BackendError::Admission)?;
-    ensure_time(deadline)?;
+    deadline.ensure(BackendError::Deadline)?;
     Ok(admitted)
 }
 
@@ -203,7 +203,7 @@ where
     let bytes = read_bounded_body(body, MAX_COUNT_BYTES, 64, BackendError::Metadata).await?;
     let Object(ack): Object<ResetAck<'_>> =
         serde_json::from_slice(&bytes).map_err(|_| BackendError::Metadata)?;
-    ensure_time(deadline)?;
+    deadline.ensure(BackendError::Deadline)?;
     if ack.status != "ok" {
         return Err(BackendError::Metadata);
     }
@@ -337,7 +337,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let write_deadline = deadline.earlier(Instant::now() + WRITE_TIMEOUT);
-    ensure_time(write_deadline)?;
+    write_deadline.ensure(BackendError::Deadline)?;
     let authorization = policy.authorization_str()?;
     let (content_type_header, body_bytes) = match &body {
         RequestBody::Empty => ("", &[][..]),
@@ -364,7 +364,7 @@ where
         .await
         .map_err(|_| BackendError::Deadline)?
         .map_err(|_| BackendError::Io)?;
-    ensure_time(write_deadline)?;
+    write_deadline.ensure(BackendError::Deadline)?;
     // Counting borrows these exact bytes for subsequent generation. The owned
     // generation path needs no prompt storage once the complete write is flushed.
     drop(body);
@@ -372,7 +372,7 @@ where
     let mut reader = BufReader::with_capacity(8192, stream);
     let (status, framing) =
         read_head(&mut reader, streaming, route == COUNT_ROUTE, deadline).await?;
-    ensure_time(deadline)?;
+    deadline.ensure(BackendError::Deadline)?;
     Ok((
         status,
         BackendBody {
@@ -386,22 +386,30 @@ where
     ))
 }
 
+async fn fill_head_buf<S: AsyncRead + Unpin>(
+    reader: &mut BufReader<S>,
+    deadline: RequestDeadline,
+) -> Result<&[u8], BackendError> {
+    deadline.ensure(BackendError::Deadline)?;
+    let available = deadline
+        .timeout(reader.fill_buf())
+        .await
+        .map_err(|_| BackendError::Deadline)?
+        .map_err(|_| BackendError::Io)?;
+    deadline.ensure(BackendError::Deadline)?;
+    if available.is_empty() {
+        return Err(BackendError::WireSyntax);
+    }
+    Ok(available)
+}
+
 async fn read_head<S: AsyncRead + Unpin>(
     reader: &mut BufReader<S>,
     streaming: bool,
     counting: bool,
     deadline: RequestDeadline,
 ) -> Result<(StatusCode, Framing), BackendError> {
-    ensure_time(deadline)?;
-    let available = deadline
-        .timeout(reader.fill_buf())
-        .await
-        .map_err(|_| BackendError::Deadline)?
-        .map_err(|_| BackendError::Io)?;
-    ensure_time(deadline)?;
-    if available.is_empty() {
-        return Err(BackendError::WireSyntax);
-    }
+    let available = fill_head_buf(reader, deadline).await?;
     let available = &available[..available.len().min(MAX_HEADER_BYTES)];
     if let Some(end) = wire::head_end(available, 0) {
         // Complete ordinary heads borrow the reader allocation. Only fragmented
@@ -415,19 +423,11 @@ async fn read_head<S: AsyncRead + Unpin>(
     let count = available.len();
     reader.consume(count);
     loop {
-        ensure_time(deadline)?;
+        deadline.ensure(BackendError::Deadline)?;
         if raw.len() == MAX_HEADER_BYTES {
             return Err(BackendError::HeadLimit);
         }
-        let available = deadline
-            .timeout(reader.fill_buf())
-            .await
-            .map_err(|_| BackendError::Deadline)?
-            .map_err(|_| BackendError::Io)?;
-        ensure_time(deadline)?;
-        if available.is_empty() {
-            return Err(BackendError::WireSyntax);
-        }
+        let available = fill_head_buf(reader, deadline).await?;
         let count = available.len().min(MAX_HEADER_BYTES - raw.len());
         let previous = raw.len();
         raw.extend_from_slice(&available[..count]);
@@ -783,14 +783,6 @@ impl<S: AsyncRead + Unpin> AsyncBufRead for BackendBody<S> {
             Pin::new(reader).consume(count);
             this.advance_payload(count);
         }
-    }
-}
-
-fn ensure_time(deadline: RequestDeadline) -> Result<(), BackendError> {
-    if deadline.expired() {
-        Err(BackendError::Deadline)
-    } else {
-        Ok(())
     }
 }
 

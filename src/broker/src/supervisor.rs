@@ -124,7 +124,7 @@ async fn serve_chat_inner<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    ensure_time(deadline)?;
+    deadline.ensure(ServeError::Deadline)?;
     // AcceptedChat::serve wraps the complete serve_chat_with_budget future—including
     // receive_admitted—in service.gate.closed(), and receive_admitted reads client so
     // peer disconnect yields ReceiveError::Incomplete without blocking.
@@ -195,7 +195,7 @@ where
         pipeline.as_mut().poll(cx)
     })
     .await;
-    ensure_time(deadline)?;
+    deadline.ensure(ServeError::Deadline)?;
     result
 }
 
@@ -262,13 +262,5 @@ where
             }
             Err(ServeError::Receive(ReceiveError::Policy(rejection)))
         }
-    }
-}
-
-fn ensure_time(deadline: RequestDeadline) -> Result<(), ServeError> {
-    if deadline.expired() {
-        Err(ServeError::Deadline)
-    } else {
-        Ok(())
     }
 }

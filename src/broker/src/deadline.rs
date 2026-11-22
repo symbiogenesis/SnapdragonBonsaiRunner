@@ -18,6 +18,10 @@ impl RequestDeadline {
         self.0.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
+    pub(crate) fn ensure<E>(self, error: E) -> Result<(), E> {
+        if self.expired() { Err(error) } else { Ok(()) }
+    }
+
     pub(crate) fn limit(self, operation_deadline: Instant) -> Instant {
         self.0.map_or(operation_deadline, |deadline| {
             deadline.min(operation_deadline)

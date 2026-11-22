@@ -198,7 +198,7 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    ensure_time(supervisor_deadline)?;
+    supervisor_deadline.ensure(ResponseError::Deadline)?;
     validate_metadata(&backend, streaming)?;
     let mut body = backend.into_body();
     if streaming {
@@ -221,7 +221,7 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
 {
-    ensure_time(supervisor_deadline)?;
+    supervisor_deadline.ensure(ResponseError::Deadline)?;
     if streaming && client.is_write_vectored() {
         write_buffered_sse_response(&mut client, &mut body, supervisor_deadline).await
     } else if streaming {
@@ -303,13 +303,13 @@ async fn write_buffered_sse_response<W: AsyncWrite + Unpin, R: AsyncBufRead + Un
     let mut frame = [0; CHUNK_PREFIX_BYTES + RESPONSE_BUFFER_BYTES + 2];
     let mut sent = 0;
     loop {
-        ensure_time(deadline)?;
+        deadline.ensure(ResponseError::Deadline)?;
         let available = deadline
             .timeout(body.fill_buf())
             .await
             .map_err(|_| ResponseError::Deadline)?
             .map_err(|_| ResponseError::BackendIo)?;
-        ensure_time(deadline)?;
+        deadline.ensure(ResponseError::Deadline)?;
         if available.is_empty() {
             break;
         }
@@ -368,7 +368,7 @@ async fn write_vectored_group<W: AsyncWrite + Unpin>(
     shutdown: bool,
 ) -> Result<(), ResponseError> {
     let deadline = supervisor_deadline.earlier(Instant::now() + CLIENT_WRITE_TIMEOUT);
-    ensure_time(deadline)?;
+    deadline.ensure(ResponseError::Deadline)?;
     deadline
         .timeout(async {
             crate::wire::write_vectored_all(client, slices).await?;
@@ -380,7 +380,7 @@ async fn write_vectored_group<W: AsyncWrite + Unpin>(
         .await
         .map_err(|_| ResponseError::Deadline)?
         .map_err(|_| ResponseError::ClientIo)?;
-    ensure_time(deadline)
+    deadline.ensure(ResponseError::Deadline)
 }
 
 enum SseReadStatus {
@@ -406,7 +406,7 @@ async fn read_sse_group<R: AsyncRead + Unpin>(
         if count == buffer.len() {
             break;
         }
-        ensure_time(deadline)?;
+        deadline.ensure(ResponseError::Deadline)?;
         let ready = poll_fn(|cx| {
             let mut output = ReadBuf::new(&mut buffer[count..]);
             Poll::Ready(match Pin::new(&mut *body).poll_read(cx, &mut output) {
@@ -415,7 +415,7 @@ async fn read_sse_group<R: AsyncRead + Unpin>(
             })
         })
         .await;
-        ensure_time(deadline)?;
+        deadline.ensure(ResponseError::Deadline)?;
         match ready {
             None => break,
             Some(Ok(0)) => return Ok((count, SseReadStatus::Complete)),
@@ -496,7 +496,7 @@ async fn collect_json<R: AsyncRead + Unpin>(
             }
             break;
         }
-        ensure_time(deadline)?;
+        deadline.ensure(ResponseError::Deadline)?;
         if bytes.len() == bytes.capacity() {
             let target = bytes
                 .capacity()
@@ -514,7 +514,7 @@ async fn collect_json<R: AsyncRead + Unpin>(
             .await
             .map_err(|_| ResponseError::Deadline)?
             .map_err(|_| ResponseError::BackendIo)?;
-        ensure_time(deadline)?;
+        deadline.ensure(ResponseError::Deadline)?;
         if count == 0 {
             break;
         }
@@ -523,7 +523,7 @@ async fn collect_json<R: AsyncRead + Unpin>(
     std::str::from_utf8(&bytes).map_err(|_| ResponseError::JsonSyntax)?;
     serde_json::from_slice::<Object<IgnoredAny>>(&bytes).map_err(|_| ResponseError::JsonSyntax)?;
     // Parsing is bounded synchronous work, not a preemptive CPU deadline.
-    ensure_time(deadline)?;
+    deadline.ensure(ResponseError::Deadline)?;
     Ok(bytes)
 }
 
@@ -532,13 +532,13 @@ async fn read_before<R: AsyncRead + Unpin>(
     buffer: &mut [u8],
     deadline: RequestDeadline,
 ) -> Result<usize, ResponseError> {
-    ensure_time(deadline)?;
+    deadline.ensure(ResponseError::Deadline)?;
     let count = deadline
         .timeout(body.read(buffer))
         .await
         .map_err(|_| ResponseError::Deadline)?
         .map_err(|_| ResponseError::BackendIo)?;
-    ensure_time(deadline)?;
+    deadline.ensure(ResponseError::Deadline)?;
     Ok(count)
 }
 
@@ -551,7 +551,7 @@ async fn write_group<W: AsyncWrite + Unpin>(
     // One deadline covers the whole group, including all partial writes, flush
     // and (on success only) shutdown. No helper restarts it between pieces.
     let deadline = supervisor_deadline.earlier(Instant::now() + CLIENT_WRITE_TIMEOUT);
-    ensure_time(deadline)?;
+    deadline.ensure(ResponseError::Deadline)?;
     deadline
         .timeout(async {
             for piece in pieces {
@@ -567,15 +567,7 @@ async fn write_group<W: AsyncWrite + Unpin>(
         .map_err(|_| ResponseError::Deadline)?
         .map_err(|_| ResponseError::ClientIo)?;
     // timeout_at allows an immediately ready operation to win after expiry.
-    ensure_time(deadline)
-}
-
-fn ensure_time(deadline: RequestDeadline) -> Result<(), ResponseError> {
-    if deadline.expired() {
-        Err(ResponseError::Deadline)
-    } else {
-        Ok(())
-    }
+    deadline.ensure(ResponseError::Deadline)
 }
 
 #[cfg(test)]
