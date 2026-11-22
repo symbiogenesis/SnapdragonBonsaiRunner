@@ -5,14 +5,16 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod sensitivity;
+
 const WIDTH: u64 = 5_120;
 const GROUP_WIDTH: u64 = 1_024;
 const GROUPS: u64 = 17;
 const BLOCK_COEFFICIENTS: u64 = 128;
 const TARGET_BYTES: u64 = 512 * 1_024 * 1_024;
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
-enum Representation {
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(super) enum Representation {
     #[serde(rename = "PQ2_0")]
     Pq2,
     #[serde(rename = "current-repacked-PTQ1_0")]
@@ -20,7 +22,7 @@ enum Representation {
 }
 
 impl Representation {
-    const fn block_bytes(self) -> u64 {
+    pub(super) const fn block_bytes(self) -> u64 {
         match self {
             Self::Pq2 => 34,
             Self::CurrentRepackedPtq1 => 28,
@@ -44,22 +46,22 @@ struct Request {
     sites: Vec<Site>,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Accounting {
-    gross_omitted_packed_payload_bytes: u64,
-    new_factor_payload_bytes: u64,
-    net_packed_minus_factor_payload_bytes: u64,
-    omitted_base_projection_multiply_accumulates_per_token: u64,
-    new_factor_projection_multiply_accumulates_per_token: u64,
+pub(super) struct Accounting {
+    pub(super) gross_omitted_packed_payload_bytes: u64,
+    pub(super) new_factor_payload_bytes: u64,
+    pub(super) net_packed_minus_factor_payload_bytes: u64,
+    pub(super) omitted_base_projection_multiply_accumulates_per_token: u64,
+    pub(super) new_factor_projection_multiply_accumulates_per_token: u64,
 }
 
-fn multiply(left: u64, right: u64) -> crate::Result<u64> {
+pub(super) fn multiply(left: u64, right: u64) -> crate::Result<u64> {
     left.checked_mul(right)
         .ok_or_else(|| "FFN geometry multiplication overflowed.".into())
 }
 
-fn add(left: u64, right: u64) -> crate::Result<u64> {
+pub(super) fn add(left: u64, right: u64) -> crate::Result<u64> {
     left.checked_add(right)
         .ok_or_else(|| "FFN geometry addition overflowed.".into())
 }
@@ -87,7 +89,7 @@ impl Accounting {
         })
     }
 
-    fn accumulate(&mut self, site: &Self) -> crate::Result<()> {
+    pub(super) fn accumulate(&mut self, site: &Self) -> crate::Result<()> {
         self.gross_omitted_packed_payload_bytes = add(
             self.gross_omitted_packed_payload_bytes,
             site.gross_omitted_packed_payload_bytes,
@@ -120,6 +122,9 @@ impl Accounting {
 /// Rejects unsupported schemas/representations, unknown fields, duplicate or
 /// out-of-range sites, noncanonical whole groups, unsupported ranks and overflow.
 pub fn run(value: Value) -> crate::Result<Value> {
+    if value.get("schemaVersion").and_then(Value::as_u64) == Some(2) {
+        return sensitivity::run(value);
+    }
     let request: Request = serde_json::from_value(value).map_err(|error| error.to_string())?;
     if request.schema_version != 1 || !(1..=64).contains(&request.sites.len()) {
         return Err("FFN plan requires schema 1 and 1..64 explicit sites.".into());

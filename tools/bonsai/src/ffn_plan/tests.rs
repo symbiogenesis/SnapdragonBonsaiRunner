@@ -155,3 +155,181 @@ fn rejects_unsupported_shapes_and_noncanonical_sites() {
         assert!(run(value_request).is_err(), "{field}");
     }
 }
+
+#[test]
+fn u2_sensitivity_screen_enforces_splits_separates_roles_and_beats_baselines() -> crate::Result<()> {
+    let fit_a = "aa".repeat(32);
+    let dev_a = "bb".repeat(32);
+    let held_a = "cc".repeat(32);
+    // Single-rank factor cost = 2 * 5120 * rank * 4 = 40960 * rank bytes.
+    // Budget for 2 FFN sites = 4 * 40960 = 163_840 bytes (rank 4 total across 2 layers: 0+4, 2+2, or 4+0).
+    let budget_bytes = 163_840_u64;
+    let plan = run(json!({
+        "schemaVersion": 2,
+        "weightRepresentation": "PQ2_0",
+        "maxRecoveryFactorBytes": budget_bytes,
+        "fitPromptSha256s": [fit_a],
+        "devPromptSha256s": [dev_a],
+        "heldoutPromptSha256s": [held_a],
+        "sites": [
+            {
+                "layer": 0,
+                "role": "ffn",
+                "target": "blk.0.ffn_down.weight",
+                "magnitudeScore": 10.0,
+                "branchMagnitude": 3.0,
+                "logitDeltaL2": 0.4,
+                "residualDrift": 0.1,
+                "candidates": [
+                    { "omittedGroups": [0], "recoveryRank": 0, "expectedKlLoss": 0.05, "klGap": 0.01 },
+                    { "omittedGroups": [0], "recoveryRank": 2, "expectedKlLoss": 0.04, "klGap": 0.02 },
+                    { "omittedGroups": [0], "recoveryRank": 4, "expectedKlLoss": 0.03, "klGap": 0.03 }
+                ]
+            },
+            {
+                "layer": 63,
+                "role": "ffn",
+                "target": "blk.63.ffn_down.weight",
+                "magnitudeScore": 1.0,
+                "branchMagnitude": 2.5,
+                "logitDeltaL2": 2.1,
+                "residualDrift": 0.8,
+                "candidates": [
+                    {
+                        "omittedGroups": [0, 1],
+                        "recoveryRank": 0,
+                        "teacherDevLogits": [[4.0, 0.0], [1.2, 1.0]],
+                        "baseDevLogits": [[0.0, 3.0], [3.0, 0.0]],
+                        "recoveredDevLogits": [[0.0, 3.0], [3.0, 0.0]]
+                    },
+                    {
+                        "omittedGroups": [0, 1],
+                        "recoveryRank": 2,
+                        "expectedKlLoss": 0.60,
+                        "klGap": 1.2
+                    },
+                    {
+                        "omittedGroups": [0, 1],
+                        "recoveryRank": 4,
+                        "teacherDevLogits": [[4.0, 0.0], [1.2, 1.0]],
+                        "baseDevLogits": [[0.0, 3.0], [3.0, 0.0]],
+                        "recoveredDevLogits": [[4.0, 0.0], [1.2, 1.0]]
+                    }
+                ]
+            },
+            {
+                "layer": 3,
+                "role": "recurrent-projection",
+                "target": "blk.3.attn_qkv.weight",
+                "magnitudeScore": 4.2,
+                "branchMagnitude": 1.8,
+                "logitDeltaL2": 0.7,
+                "residualDrift": 0.25,
+                "expectedKlLoss": 0.02,
+                "klGap": 0.15,
+                "softmaxFisherMean": 0.42
+            },
+            {
+                "layer": 7,
+                "role": "attention-projection",
+                "target": "blk.7.attn_q.weight",
+                "magnitudeScore": 3.1,
+                "branchMagnitude": 1.2,
+                "logitDeltaL2": 0.5,
+                "residualDrift": 0.12,
+                "expectedKlLoss": 0.01,
+                "klGap": 0.08
+            }
+        ]
+    }))?;
+
+    assert_eq!(plan["schemaVersion"], 2);
+    assert_eq!(plan["heldoutSplitUsedForSelection"], false);
+    assert_eq!(plan["performanceQualified"], false);
+    assert_eq!(plan["behaviorQualified"], false);
+    assert_eq!(plan["splitCounts"]["pairwiseDisjoint"], true);
+    assert_eq!(
+        plan["aggregate"]["newFactorPayloadBytes"],
+        budget_bytes
+    );
+    // MCKP must give rank 4 to critical high-KL layer 63 (not high-magnitude layer 0!).
+    assert_eq!(plan["selectedFfnSites"][0]["recoveryRank"], 0);
+    assert_eq!(plan["selectedFfnSites"][1]["recoveryRank"], 4);
+    assert!(
+        plan["baselines"]["uniform"]["knapsackImprovementKl"]
+            .as_f64()
+            .unwrap_or(-1.0)
+            > 0.0
+    );
+    assert!(
+        plan["baselines"]["magnitudeGreedy"]["knapsackImprovementKl"]
+            .as_f64()
+            .unwrap_or(-1.0)
+            > 0.0
+    );
+    assert!(plan["roleSummaries"]["ffn"].is_object());
+    assert!(plan["roleSummaries"]["recurrent-projection"].is_object());
+    assert!(plan["roleSummaries"]["attention-projection"].is_object());
+    assert!(!plan["frozenSelectionSha256"].as_str().unwrap_or("").is_empty());
+
+    // Changing only heldoutPromptSha256s must NOT alter frozenSelectionSha256.
+    let plan2 = run(json!({
+        "schemaVersion": 2,
+        "weightRepresentation": "PQ2_0",
+        "maxRecoveryFactorBytes": budget_bytes,
+        "fitPromptSha256s": [fit_a],
+        "devPromptSha256s": [dev_a],
+        "heldoutPromptSha256s": ["dd".repeat(32)],
+        "sites": [
+            {
+                "layer": 0,
+                "role": "ffn",
+                "target": "blk.0.ffn_down.weight",
+                "magnitudeScore": 10.0,
+                "branchMagnitude": 3.0,
+                "logitDeltaL2": 0.4,
+                "residualDrift": 0.1,
+                "candidates": [
+                    { "omittedGroups": [0], "recoveryRank": 0, "expectedKlLoss": 0.05, "klGap": 0.01 },
+                    { "omittedGroups": [0], "recoveryRank": 4, "expectedKlLoss": 0.03, "klGap": 0.03 }
+                ]
+            },
+            {
+                "layer": 63,
+                "role": "ffn",
+                "target": "blk.63.ffn_down.weight",
+                "magnitudeScore": 1.0,
+                "branchMagnitude": 2.5,
+                "logitDeltaL2": 2.1,
+                "residualDrift": 0.8,
+                "candidates": [
+                    { "omittedGroups": [0, 1], "recoveryRank": 0, "expectedKlLoss": 1.5, "klGap": 0.0 },
+                    { "omittedGroups": [0, 1], "recoveryRank": 4, "expectedKlLoss": 0.0, "klGap": 1.5 }
+                ]
+            }
+        ]
+    }))?;
+    assert_eq!(plan2["frozenSelectionSha256"], plan["frozenSelectionSha256"]);
+
+    // Reject overlapping heldout / fit / dev prompt digests (U1 split disjointness).
+    assert!(run(json!({
+        "schemaVersion": 2,
+        "weightRepresentation": "PQ2_0",
+        "maxRecoveryFactorBytes": budget_bytes,
+        "fitPromptSha256s": [fit_a],
+        "devPromptSha256s": [dev_a],
+        "heldoutPromptSha256s": [dev_a],
+        "sites": [{
+            "layer": 0,
+            "role": "ffn",
+            "magnitudeScore": 1.0,
+            "branchMagnitude": 1.0,
+            "logitDeltaL2": 0.1,
+            "residualDrift": 0.1,
+            "candidates": [{ "omittedGroups": [0], "recoveryRank": 1, "expectedKlLoss": 0.1 }]
+        }]
+    }))
+    .is_err());
+
+    Ok(())
+}
