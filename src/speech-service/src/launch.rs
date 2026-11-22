@@ -114,22 +114,12 @@ pub fn parse(kind: Kind, arguments: impl IntoIterator<Item = OsString>) -> io::R
                 ));
             }
             Some("--port") if port.is_none() => {
-                let value = arguments.next().ok_or_else(invalid_arguments)?;
-                let text = value.to_str().ok_or_else(invalid_arguments)?;
-                if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(invalid_arguments());
-                }
-                port = Some(text.parse::<u16>().map_err(|_| invalid_arguments())?);
+                port = Some(parse_decimal_arg::<u16>(&mut arguments)?);
             }
             Some("--threads")
                 if matches!(kind, Kind::Canary | Kind::QwenTts) && threads.is_none() =>
             {
-                let value = arguments.next().ok_or_else(invalid_arguments)?;
-                let text = value.to_str().ok_or_else(invalid_arguments)?;
-                if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(invalid_arguments());
-                }
-                let count = text.parse::<usize>().map_err(|_| invalid_arguments())?;
+                let count = parse_decimal_arg::<usize>(&mut arguments)?;
                 if !(1..=256).contains(&count) {
                     return Err(invalid_arguments());
                 }
@@ -254,19 +244,7 @@ pub fn verify_models(
             vec![verify_pinned_artifact(&model_pin, workers)?]
         }
         Kind::QwenTts => {
-            let files = pin.get("files").ok_or_else(invalid_models)?;
-            let codec = arguments.codec.as_ref().ok_or_else(invalid_models)?;
-            let voice_model = arguments.voice_model.as_ref().ok_or_else(invalid_models)?;
-            let talker_pin = parse_artifact_pin(
-                &arguments.model,
-                files.get("talker").ok_or_else(invalid_models)?,
-            )?;
-            let codec_pin =
-                parse_artifact_pin(codec, files.get("codec").ok_or_else(invalid_models)?)?;
-            let voice_pin = parse_artifact_pin(
-                voice_model,
-                files.get("voice_talker").ok_or_else(invalid_models)?,
-            )?;
+            let [talker_pin, codec_pin, voice_pin] = parse_tts_pins(arguments, &pin, |err| err)?;
             let has_chunks = talker_pin.chunks.is_some()
                 && codec_pin.chunks.is_some()
                 && voice_pin.chunks.is_some();
@@ -280,21 +258,23 @@ pub fn verify_models(
                 ]
             } else {
                 let (talker_res, codec_res, voice_res) = std::thread::scope(|scope| {
-                    let codec_job = std::thread::Builder::new()
-                        .name("speech-verify-codec".to_owned())
-                        .spawn_scoped(scope, || verify_pinned_artifact(&codec_pin, workers));
-                    let voice_job = std::thread::Builder::new()
-                        .name("speech-verify-voice".to_owned())
-                        .spawn_scoped(scope, || verify_pinned_artifact(&voice_pin, workers));
+                    let codec_job = spawn_scoped(scope, "speech-verify-codec", || {
+                        verify_pinned_artifact(&codec_pin, workers)
+                    });
+                    let voice_job = spawn_scoped(scope, "speech-verify-voice", || {
+                        verify_pinned_artifact(&voice_pin, workers)
+                    });
                     let talker_res = verify_pinned_artifact(&talker_pin, workers);
-                    let codec_res = match codec_job {
-                        Ok(handle) => handle.join().unwrap_or_else(|_| Err(invalid_models())),
-                        Err(_) => verify_pinned_artifact(&codec_pin, workers),
-                    };
-                    let voice_res = match voice_job {
-                        Ok(handle) => handle.join().unwrap_or_else(|_| Err(invalid_models())),
-                        Err(_) => verify_pinned_artifact(&voice_pin, workers),
-                    };
+                    let codec_res = join_scoped(
+                        codec_job,
+                        || Err(invalid_models()),
+                        || verify_pinned_artifact(&codec_pin, workers),
+                    );
+                    let voice_res = join_scoped(
+                        voice_job,
+                        || Err(invalid_models()),
+                        || verify_pinned_artifact(&voice_pin, workers),
+                    );
                     (talker_res, codec_res, voice_res)
                 });
                 vec![talker_res?, codec_res?, voice_res?]
@@ -340,38 +320,7 @@ where
     let credential =
         Credential::open(&arguments.token_file).map_err(|_| verify_err(invalid_models()))?;
     let pin = parse_lock_document(Kind::QwenTts, compiled_lock).map_err(verify_err)?;
-    let files = pin
-        .get("files")
-        .ok_or_else(|| verify_err(invalid_models()))?;
-    let codec_path = arguments
-        .codec
-        .as_ref()
-        .ok_or_else(|| verify_err(invalid_models()))?;
-    let voice_path = arguments
-        .voice_model
-        .as_ref()
-        .ok_or_else(|| verify_err(invalid_models()))?;
-    let talker_pin = parse_artifact_pin(
-        &arguments.model,
-        files
-            .get("talker")
-            .ok_or_else(|| verify_err(invalid_models()))?,
-    )
-    .map_err(verify_err)?;
-    let codec_pin = parse_artifact_pin(
-        codec_path,
-        files
-            .get("codec")
-            .ok_or_else(|| verify_err(invalid_models()))?,
-    )
-    .map_err(verify_err)?;
-    let voice_pin = parse_artifact_pin(
-        voice_path,
-        files
-            .get("voice_talker")
-            .ok_or_else(|| verify_err(invalid_models()))?,
-    )
-    .map_err(verify_err)?;
+    let [talker_pin, codec_pin, voice_pin] = parse_tts_pins(arguments, &pin, verify_err)?;
 
     let full_workers = hash_worker_count();
     let overlap_workers = (full_workers / 2).max(4).min(full_workers);
@@ -379,34 +328,30 @@ where
 
     let (codec_res, talker_guard_res, voice_guard_res, design_res) = std::thread::scope(|scope| {
         let verified_codec_path = codec_guard.path();
-        let codec_job = std::thread::Builder::new()
-            .name("tts-load-codec".to_owned())
-            .spawn_scoped(scope, || load_codec(verified_codec_path));
+        let codec_job = spawn_scoped(scope, "tts-load-codec", || load_codec(verified_codec_path));
 
         let talker_guard_res = verify_pinned_artifact(&talker_pin, full_workers);
         let (voice_guard_res, design_res) = if talker_guard_res.is_ok() {
             let verified_design_path = talker_pin.path;
-            let design_job = std::thread::Builder::new()
-                .name("tts-load-design".to_owned())
-                .spawn_scoped(scope, || load_design(verified_design_path));
+            let design_job = spawn_scoped(scope, "tts-load-design", || {
+                load_design(verified_design_path)
+            });
             let voice_guard_res = verify_pinned_artifact(&voice_pin, overlap_workers);
-            let design_res = match design_job {
-                Ok(handle) => handle
-                    .join()
-                    .unwrap_or_else(|_| Err(io::Error::other("TTS design loader panicked."))),
-                Err(_) => Err(io::Error::other("Could not spawn TTS design loader.")),
-            };
+            let design_res = join_scoped(
+                design_job,
+                || Err(io::Error::other("TTS design loader panicked.")),
+                || Err(io::Error::other("Could not spawn TTS design loader.")),
+            );
             (voice_guard_res, Some(design_res))
         } else {
             (Err(invalid_models()), None)
         };
 
-        let codec_res = match codec_job {
-            Ok(handle) => handle
-                .join()
-                .unwrap_or_else(|_| Err(io::Error::other("TTS codec loader panicked."))),
-            Err(_) => Err(io::Error::other("Could not spawn TTS codec loader.")),
-        };
+        let codec_res = join_scoped(
+            codec_job,
+            || Err(io::Error::other("TTS codec loader panicked.")),
+            || Err(io::Error::other("Could not spawn TTS codec loader.")),
+        );
 
         (codec_res, talker_guard_res, voice_guard_res, design_res)
     });
@@ -426,6 +371,63 @@ where
         codec,
         design,
     ))
+}
+
+fn parse_decimal_arg<T: std::str::FromStr>(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> io::Result<T> {
+    let value = arguments.next().ok_or_else(invalid_arguments)?;
+    let text = value.to_str().ok_or_else(invalid_arguments)?;
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_arguments());
+    }
+    text.parse::<T>().map_err(|_| invalid_arguments())
+}
+
+fn parse_tts_pins<'a, E>(
+    arguments: &'a ServiceArgs,
+    pin: &'a serde_json::Value,
+    map_err: impl Fn(io::Error) -> E,
+) -> Result<[ArtifactPin<'a>; 3], E> {
+    let files = pin.get("files").ok_or_else(|| map_err(invalid_models()))?;
+    let codec = arguments
+        .codec
+        .as_ref()
+        .ok_or_else(|| map_err(invalid_models()))?;
+    let voice_model = arguments
+        .voice_model
+        .as_ref()
+        .ok_or_else(|| map_err(invalid_models()))?;
+    let pin_for = |path: &'a Path, key: &str| {
+        let entry = files.get(key).ok_or_else(|| map_err(invalid_models()))?;
+        parse_artifact_pin(path, entry).map_err(&map_err)
+    };
+    Ok([
+        pin_for(&arguments.model, "talker")?,
+        pin_for(codec, "codec")?,
+        pin_for(voice_model, "voice_talker")?,
+    ])
+}
+
+fn spawn_scoped<'scope, 'env, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: &str,
+    work: impl FnOnce() -> T + Send + 'scope,
+) -> io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn_scoped(scope, work)
+}
+
+fn join_scoped<T>(
+    handle: io::Result<std::thread::ScopedJoinHandle<'_, io::Result<T>>>,
+    on_panic: impl FnOnce() -> io::Result<T>,
+    on_spawn_err: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    match handle {
+        Ok(handle) => handle.join().unwrap_or_else(|_| on_panic()),
+        Err(_) => on_spawn_err(),
+    }
 }
 
 fn parse_lock_document(kind: Kind, compiled_lock: &str) -> io::Result<serde_json::Value> {
