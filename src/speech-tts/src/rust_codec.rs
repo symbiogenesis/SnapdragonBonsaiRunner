@@ -73,7 +73,6 @@ impl CodecSource for Weights {
     }
 }
 
-#[cfg(windows)]
 impl CodecSource for MappedWeights {
     fn parallel_load(&self) -> bool {
         true
@@ -1379,7 +1378,6 @@ struct DecodeState {
 pub(crate) struct Codec {
     threads: usize,
     weights_path: Option<std::path::PathBuf>,
-    #[cfg(windows)]
     mapped_weights: Option<MappedWeights>,
     quantizer: RvqDecoder,
     pre: CausalConv1d,
@@ -1603,7 +1601,6 @@ impl Codec {
         let mut codec = Self {
             threads,
             weights_path: Some(weights.path().to_path_buf()),
-            #[cfg(windows)]
             mapped_weights: weights.retain_mapped_view(),
             quantizer,
             pre,
@@ -1903,7 +1900,6 @@ impl Codec {
         if let Some(encoder) = &self.encoder {
             return encoder.encode_cancellable(samples, cancel);
         }
-        #[cfg(windows)]
         if let Some(mapped) = &self.mapped_weights {
             let encoder = Encoder::load(mapped, self.threads)?;
             return encoder.encode_cancellable(samples, cancel);
@@ -2483,7 +2479,6 @@ mod tests {
             Ok(super::Codec {
                 threads: 2,
                 weights_path: None,
-                #[cfg(windows)]
                 mapped_weights: None,
                 quantizer: RvqDecoder {
                     semantic: rvq_group(1),

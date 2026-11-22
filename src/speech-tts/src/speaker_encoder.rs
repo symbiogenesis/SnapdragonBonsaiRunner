@@ -268,6 +268,11 @@ impl MelSpectrogramExtractor {
     /// # Errors
     /// Rejects zero `n_fft`, `hop`, `n_mels`, or `n_fft < hop`.
     pub fn new(cfg: AudioMelConfig) -> io::Result<Self> {
+        let u32_to_f64 = |value: usize, msg: &str| -> io::Result<f64> {
+            u32::try_from(value)
+                .map(f64::from)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, msg))
+        };
         if cfg.n_fft == 0 || cfg.hop == 0 || cfg.n_mels == 0 || cfg.n_fft < cfg.hop {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -276,19 +281,12 @@ impl MelSpectrogramExtractor {
         }
         let n_freq = cfg.n_fft / 2 + 1;
         let n_fft_f = usize_to_f32(cfg.n_fft);
-        let n_fft_double =
-            f64::from(u32::try_from(cfg.n_fft).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "FFT length exceeds u32.")
-            })?);
+        let n_fft_double = u32_to_f64(cfg.n_fft, "FFT length exceeds u32.")?;
         let two_pi = 2.0_f64 * core::f64::consts::PI;
 
         let mut hann = Vec::with_capacity(cfg.n_fft);
         for i in 0..cfg.n_fft {
-            let phase = two_pi
-                * f64::from(u32::try_from(i).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "Hann index exceeds u32.")
-                })?)
-                / n_fft_double;
+            let phase = two_pi * u32_to_f64(i, "Hann index exceeds u32.")? / n_fft_double;
             // The original narrows cos(), then subtracts/multiplies in f32.
             hann.push(0.5_f32 * (1.0_f32 - coefficient(phase.cos())));
         }
@@ -310,13 +308,7 @@ impl MelSpectrogramExtractor {
             let mut cos_t = Vec::with_capacity(half_n);
             let mut sin_t = Vec::with_capacity(half_n);
             for k in 0..half_n {
-                let kf = f64::from(u32::try_from(k).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "FFT twiddle index exceeds u32.",
-                    )
-                })?);
-                let th = two_pi * kf / n_fft_double;
+                let th = two_pi * u32_to_f64(k, "FFT twiddle index exceeds u32.")? / n_fft_double;
                 cos_t.push(coefficient(th.cos()));
                 sin_t.push(coefficient(-th.sin()));
             }
@@ -325,13 +317,9 @@ impl MelSpectrogramExtractor {
             let mut dft_real = vec![0.0_f32; n_freq * cfg.n_fft];
             let mut dft_imag = vec![0.0_f32; n_freq * cfg.n_fft];
             for k in 0..n_freq {
-                let kf = f64::from(u32::try_from(k).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "DFT row exceeds u32.")
-                })?);
+                let kf = u32_to_f64(k, "DFT row exceeds u32.")?;
                 for n in 0..cfg.n_fft {
-                    let nf = f64::from(u32::try_from(n).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "DFT column exceeds u32.")
-                    })?);
+                    let nf = u32_to_f64(n, "DFT column exceeds u32.")?;
                     let th = two_pi * kf * nf / n_fft_double;
                     dft_real[k * cfg.n_fft + n] = coefficient(th.cos());
                     dft_imag[k * cfg.n_fft + n] = coefficient(-th.sin());
@@ -449,29 +437,28 @@ impl MelSpectrogramExtractor {
             0
         };
 
+        let make_scratch = || {
+            (
+                vec![0.0_f32; self.cfg.n_fft],
+                vec![0.0_f32; half_n],
+                vec![0.0_f32; half_n],
+                vec![0.0_f32; self.n_freq],
+            )
+        };
         if workers <= 1 {
-            let mut windowed = vec![0.0_f32; self.cfg.n_fft];
-            let mut fft_re = vec![0.0_f32; half_n];
-            let mut fft_im = vec![0.0_f32; half_n];
-            let mut mag_frame = vec![0.0_f32; self.n_freq];
+            let (mut windowed, mut fft_re, mut fft_im, mut mag_frame) = make_scratch();
             dispatch!(level, simd => {
                 for t in 0..n_frames {
                     let start = t * self.cfg.hop;
-                    let frame = &padded[start..start + self.cfg.n_fft];
-                    self.compute_mel_magnitude_simd(
+                    self.compute_log_mel_frame_simd(
                         simd,
-                        frame,
+                        &padded[start..start + self.cfg.n_fft],
                         &mut windowed,
                         &mut fft_re,
                         &mut fft_im,
                         &mut mag_frame,
+                        |m, val| log_mel[m * n_frames + t] = val,
                     );
-                    for (m, &(b_start, b_end)) in self.mel_extents.iter().enumerate() {
-                        let basis_row =
-                            &self.mel_basis[m * self.n_freq + b_start..m * self.n_freq + b_end];
-                        let sum = f32_dot_simd(simd, basis_row, &mag_frame[b_start..b_end]);
-                        log_mel[m * n_frames + t] = sum.max(1e-5_f32).ln();
-                    }
                 }
             });
             return Ok((log_mel, n_frames));
@@ -484,31 +471,19 @@ impl MelSpectrogramExtractor {
             self.cfg.n_mels,
             &|offset, slice| {
                 let first_frame = offset / self.cfg.n_mels;
-                let mut windowed = vec![0.0_f32; self.cfg.n_fft];
-                let mut fft_re = vec![0.0_f32; half_n];
-                let mut fft_im = vec![0.0_f32; half_n];
-                let mut mag_frame = vec![0.0_f32; self.n_freq];
+                let (mut windowed, mut fft_re, mut fft_im, mut mag_frame) = make_scratch();
                 dispatch!(level, simd => {
                     for (local_t, frame_out) in slice.chunks_exact_mut(self.cfg.n_mels).enumerate() {
-                        let t = first_frame + local_t;
-                        let start = t * self.cfg.hop;
-                        let frame = &padded[start..start + self.cfg.n_fft];
-                        self.compute_mel_magnitude_simd(
+                        let start = (first_frame + local_t) * self.cfg.hop;
+                        self.compute_log_mel_frame_simd(
                             simd,
-                            frame,
+                            &padded[start..start + self.cfg.n_fft],
                             &mut windowed,
                             &mut fft_re,
                             &mut fft_im,
                             &mut mag_frame,
+                            |m, val| frame_out[m] = val,
                         );
-                        for (m, (dst, &(b_start, b_end))) in
-                            frame_out.iter_mut().zip(&self.mel_extents).enumerate()
-                        {
-                            let basis_row =
-                                &self.mel_basis[m * self.n_freq + b_start..m * self.n_freq + b_end];
-                            let sum = f32_dot_simd(simd, basis_row, &mag_frame[b_start..b_end]);
-                            *dst = sum.max(1e-5_f32).ln();
-                        }
                     }
                 });
             },
@@ -523,10 +498,11 @@ impl MelSpectrogramExtractor {
 
     #[expect(
         clippy::inline_always,
+        clippy::too_many_arguments,
         reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
     )]
     #[inline(always)]
-    fn compute_mel_magnitude_simd<S: Simd>(
+    fn compute_log_mel_frame_simd<S: Simd>(
         &self,
         simd: S,
         frame: &[f32],
@@ -534,17 +510,23 @@ impl MelSpectrogramExtractor {
         fft_re: &mut [f32],
         fft_im: &mut [f32],
         mag_frame: &mut [f32],
+        mut write_bin: impl FnMut(usize, f32),
     ) {
         window_frame_simd(simd, frame, &self.hann, windowed);
         if self.use_fft() {
             self.real_fft_magnitudes(windowed, fft_re, fft_im, mag_frame);
-            return;
+        } else {
+            for (k, mag_slot) in mag_frame.iter_mut().enumerate() {
+                let re_row = &self.dft_real[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
+                let im_row = &self.dft_imag[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
+                let (re, im) = f32_dot_pair_simd(simd, windowed, re_row, im_row);
+                *mag_slot = re.mul_add(re, im.mul_add(im, 1e-9_f32)).sqrt();
+            }
         }
-        for (k, mag_slot) in mag_frame.iter_mut().enumerate() {
-            let re_row = &self.dft_real[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
-            let im_row = &self.dft_imag[k * self.cfg.n_fft..(k + 1) * self.cfg.n_fft];
-            let (re, im) = f32_dot_pair_simd(simd, windowed, re_row, im_row);
-            *mag_slot = re.mul_add(re, im.mul_add(im, 1e-9_f32)).sqrt();
+        for (m, &(b_start, b_end)) in self.mel_extents.iter().enumerate() {
+            let basis_row = &self.mel_basis[m * self.n_freq + b_start..m * self.n_freq + b_end];
+            let sum = f32_dot_simd(simd, basis_row, &mag_frame[b_start..b_end]);
+            write_bin(m, sum.max(1e-5_f32).ln());
         }
     }
 
@@ -609,6 +591,17 @@ impl MelSpectrogramExtractor {
     }
 }
 
+fn fill_reflect_padded(src: &[f32], left: usize, right: usize, dst: &mut [f32]) {
+    let len = src.len();
+    for i in 0..left {
+        dst[i] = src[left - i];
+    }
+    dst[left..left + len].copy_from_slice(src);
+    for i in 0..right {
+        dst[left + len + i] = src[len - 2 - i];
+    }
+}
+
 /// 1D reflect padding matching `torch.nn.functional.pad(mode="reflect")`.
 pub fn reflect_pad_1d(input: &[f32], left: usize, right: usize) -> io::Result<Vec<f32>> {
     let len = input.len();
@@ -618,14 +611,8 @@ pub fn reflect_pad_1d(input: &[f32], left: usize, right: usize) -> io::Result<Ve
             "Reflect padding width must be strictly less than signal length.",
         ));
     }
-    let mut out = Vec::with_capacity(left + len + right);
-    for i in 0..left {
-        out.push(input[left - i]);
-    }
-    out.extend_from_slice(input);
-    for i in 0..right {
-        out.push(input[len - 2 - i]);
-    }
+    let mut out = vec![0.0_f32; left + len + right];
+    fill_reflect_padded(input, left, right, &mut out);
     Ok(out)
 }
 
@@ -695,14 +682,7 @@ impl TdnnConv1d {
                 let first_c = offset / padded_frames;
                 for (local_c, dst) in slice.chunks_exact_mut(padded_frames).enumerate() {
                     let c = first_c + local_c;
-                    let row = &input[c * frames..(c + 1) * frames];
-                    for i in 0..pad {
-                        dst[i] = row[pad - i];
-                    }
-                    dst[pad..pad + frames].copy_from_slice(row);
-                    for i in 0..pad {
-                        dst[pad + frames + i] = row[frames - 2 - i];
-                    }
+                    fill_reflect_padded(&input[c * frames..(c + 1) * frames], pad, pad, dst);
                 }
             });
             owned_padded = buf;
@@ -729,59 +709,34 @@ impl TdnnConv1d {
             dispatch!(level, simd => {
                 for (local_oc, out_row) in slice.chunks_exact_mut(frames).enumerate() {
                     let oc = first_oc + local_oc;
-                    let b = self.bias[oc];
-                    out_row.fill(b);
-                    if self.kernel == 1 {
-                        let w_row = &self.weight[oc * self.in_c..(oc + 1) * self.in_c];
+                    out_row.fill(self.bias[oc]);
+                    for k in 0..self.kernel {
+                        let offset = k * self.dilation;
                         let mut ic = 0;
                         while ic + 4 <= self.in_c {
-                            let r0 = &padded[ic * padded_frames..ic * padded_frames + frames];
-                            let r1 = &padded[(ic + 1) * padded_frames..(ic + 1) * padded_frames + frames];
-                            let r2 = &padded[(ic + 2) * padded_frames..(ic + 2) * padded_frames + frames];
-                            let r3 = &padded[(ic + 3) * padded_frames..(ic + 3) * padded_frames + frames];
-                            axpy4_simd(
-                                simd,
-                                [w_row[ic], w_row[ic + 1], w_row[ic + 2], w_row[ic + 3]],
-                                r0,
-                                r1,
-                                r2,
-                                r3,
-                                out_row,
-                            );
+                            let w = [
+                                self.weight[(oc * self.in_c + ic) * self.kernel + k],
+                                self.weight[(oc * self.in_c + ic + 1) * self.kernel + k],
+                                self.weight[(oc * self.in_c + ic + 2) * self.kernel + k],
+                                self.weight[(oc * self.in_c + ic + 3) * self.kernel + k],
+                            ];
+                            let r0 = &padded
+                                [ic * padded_frames + offset..ic * padded_frames + offset + frames];
+                            let r1 = &padded[(ic + 1) * padded_frames + offset
+                                ..(ic + 1) * padded_frames + offset + frames];
+                            let r2 = &padded[(ic + 2) * padded_frames + offset
+                                ..(ic + 2) * padded_frames + offset + frames];
+                            let r3 = &padded[(ic + 3) * padded_frames + offset
+                                ..(ic + 3) * padded_frames + offset + frames];
+                            axpy4_simd(simd, w, r0, r1, r2, r3, out_row);
                             ic += 4;
                         }
                         while ic < self.in_c {
-                            let in_row = &padded[ic * padded_frames..ic * padded_frames + frames];
-                            axpy_simd(simd, w_row[ic], in_row, out_row);
+                            let in_row =
+                                &padded[ic * padded_frames + offset..ic * padded_frames + offset + frames];
+                            let w = self.weight[(oc * self.in_c + ic) * self.kernel + k];
+                            axpy_simd(simd, w, in_row, out_row);
                             ic += 1;
-                        }
-                    } else {
-                        for k in 0..self.kernel {
-                            let offset = k * self.dilation;
-                            let mut ic = 0;
-                            while ic + 4 <= self.in_c {
-                                let w0 = self.weight[(oc * self.in_c + ic) * self.kernel + k];
-                                let w1 = self.weight[(oc * self.in_c + ic + 1) * self.kernel + k];
-                                let w2 = self.weight[(oc * self.in_c + ic + 2) * self.kernel + k];
-                                let w3 = self.weight[(oc * self.in_c + ic + 3) * self.kernel + k];
-                                let r0 = &padded
-                                    [ic * padded_frames + offset..ic * padded_frames + offset + frames];
-                                let r1 = &padded[(ic + 1) * padded_frames + offset
-                                    ..(ic + 1) * padded_frames + offset + frames];
-                                let r2 = &padded[(ic + 2) * padded_frames + offset
-                                    ..(ic + 2) * padded_frames + offset + frames];
-                                let r3 = &padded[(ic + 3) * padded_frames + offset
-                                    ..(ic + 3) * padded_frames + offset + frames];
-                                axpy4_simd(simd, [w0, w1, w2, w3], r0, r1, r2, r3, out_row);
-                                ic += 4;
-                            }
-                            while ic < self.in_c {
-                                let in_row =
-                                    &padded[ic * padded_frames + offset..ic * padded_frames + offset + frames];
-                                let w = self.weight[(oc * self.in_c + ic) * self.kernel + k];
-                                axpy_simd(simd, w, in_row, out_row);
-                                ic += 1;
-                            }
                         }
                     }
                     if apply_relu {

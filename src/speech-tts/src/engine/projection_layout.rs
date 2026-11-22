@@ -102,11 +102,9 @@ pub(super) fn validate(
         WeightQuantization::Packed { ggml_type, bytes } => {
             validate_packed_bytes(*ggml_type, bytes, input, output)
         }
-        #[cfg(windows)]
         WeightQuantization::MappedPacked { ggml_type, bytes } => {
             validate_packed_bytes(*ggml_type, bytes.as_slice(), input, output)
         }
-        #[cfg(windows)]
         WeightQuantization::RepackedQ4K8 { bytes } => {
             let message = "Invalid 8-row repacked Q4_K projection size.";
             if !output.is_multiple_of(8) || !input.is_multiple_of(256) {

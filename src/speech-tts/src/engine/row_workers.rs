@@ -1,14 +1,9 @@
 //! Bounded, reusable projection workers with synchronous borrowed row jobs.
 #![forbid(unsafe_code)]
 
-#[cfg(not(windows))]
-use std::thread::JoinHandle;
 use std::{cell::RefCell, io};
 
-#[cfg(windows)]
 use bonsai_windows_process::RowWorkerPool;
-#[cfg(not(windows))]
-use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 
 thread_local! {
     // The serving thread owns its team through voice/model switches. Dropping
@@ -45,65 +40,20 @@ impl CachedTeam {
 }
 
 struct OwnedTeam {
-    #[cfg(windows)]
     pool: RowWorkerPool,
-    #[cfg(windows)]
     worker_count: usize,
-    #[cfg(not(windows))]
-    pool: Option<ThreadPool>,
-    #[cfg(not(windows))]
-    workers: Vec<JoinHandle<()>>,
 }
 
 impl OwnedTeam {
-    #[cfg(windows)]
     const fn worker_count(&self) -> usize {
         self.worker_count
     }
 
-    #[cfg(not(windows))]
-    const fn worker_count(&self) -> usize {
-        self.workers.len()
-    }
-    #[cfg(windows)]
     fn build(worker_count: usize) -> io::Result<Self> {
         Ok(Self {
             pool: RowWorkerPool::new(worker_count, "tts-row")?,
             worker_count,
         })
-    }
-
-    #[cfg(not(windows))]
-    fn build(worker_count: usize) -> io::Result<Self> {
-        let mut team = Self {
-            pool: None,
-            workers: Vec::with_capacity(worker_count),
-        };
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(worker_count)
-            .spawn_handler(|worker| {
-                let handle = std::thread::Builder::new()
-                    .name(format!("tts-row-{}", worker.index()))
-                    .spawn(move || worker.run())?;
-                team.workers.push(handle);
-                Ok(())
-            })
-            .build()
-            .map_err(io::Error::other)?;
-        team.pool = Some(pool);
-        Ok(team)
-    }
-}
-
-#[cfg(not(windows))]
-impl Drop for OwnedTeam {
-    fn drop(&mut self) {
-        // Rayon signals termination when the pool drops. Join even a partial
-        // construction before leaving or creating a replacement team.
-        drop(self.pool.take());
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
     }
 }
 
@@ -129,11 +79,6 @@ pub(crate) fn run_aligned<F>(
     F: Fn(usize, &mut [f32]) + Sync,
 {
     let requested = worker_count.clamp(1, 18);
-    #[cfg(not(windows))]
-    if rayon::current_thread_index().is_some() {
-        compute_slice(0, out);
-        return;
-    }
     if requested <= 1 || out.len() < 4 {
         compute_slice(0, out);
         return;
@@ -144,8 +89,6 @@ pub(crate) fn run_aligned<F>(
         compute_slice(0, out);
         return;
     }
-    #[cfg(not(windows))]
-    let chunk_rows = groups.div_ceil(requested.min(groups)) * alignment;
 
     let completed = TEAM.with(|slot| {
         let Ok(mut team) = slot.try_borrow_mut() else {
@@ -154,22 +97,8 @@ pub(crate) fn run_aligned<F>(
         let Some(team) = CachedTeam::get_or_build(&mut team, requested) else {
             return false;
         };
-        #[cfg(windows)]
-        {
-            team.pool
-                .run_aligned(out, requested, alignment, compute_slice);
-        }
-        #[cfg(not(windows))]
-        {
-            let Some(pool) = team.pool.as_ref() else {
-                return false;
-            };
-            pool.install(|| {
-                out.par_chunks_mut(chunk_rows)
-                    .enumerate()
-                    .for_each(|(chunk, rows)| compute_slice(chunk * chunk_rows, rows));
-            });
-        }
+        team.pool
+            .run_aligned(out, requested, alignment, compute_slice);
         true
     });
     if !completed {
@@ -248,8 +177,6 @@ mod tests {
         // helper's serial fallback must never make this control hang.
         let team = OwnedTeam::build(4)?;
         TEAM.with(|slot| *slot.borrow_mut() = Some(CachedTeam::Ready(team)));
-        #[cfg(not(windows))]
-        assert!(rayon::current_thread_index().is_none());
         let first = team_ids()?;
         assert_eq!(first.len(), 4);
         assert_eq!(first, team_ids()?);

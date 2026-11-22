@@ -54,14 +54,12 @@ struct Tensor {
 }
 
 /// Read-only retained memory-mapped tensor view sharing an `Arc<MappedFile>` without an open handle.
-#[cfg(windows)]
 pub(crate) struct MappedWeights {
     mapped: std::sync::Arc<bonsai_windows_process::MappedFile>,
     metadata: BTreeMap<String, Metadata>,
     tensors: BTreeMap<String, Tensor>,
 }
 
-#[cfg(windows)]
 impl Metadata {
     fn clone_without_string_arrays(&self) -> Option<Self> {
         match self {
@@ -106,7 +104,6 @@ struct FileStream {
 pub(crate) struct Weights {
     path: PathBuf,
     stream: Mutex<FileStream>,
-    #[cfg(windows)]
     mapped: Option<std::sync::Arc<bonsai_windows_process::MappedFile>>,
     metadata: BTreeMap<String, Metadata>,
     tensors: BTreeMap<String, Tensor>,
@@ -305,7 +302,6 @@ impl Weights {
         }
         let mut options = OpenOptions::new();
         options.read(true);
-        #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt as _;
             // Read sharing only: replacements and writes cannot race loading.
@@ -319,7 +315,6 @@ impl Weights {
         if !properties.is_file() || properties.len() > MAX_FILE_BYTES {
             return Err(invalid());
         }
-        #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt as _;
             if properties.file_attributes() & 0x400 != 0 {
@@ -340,7 +335,6 @@ impl Weights {
         length: u64,
         allow_zero_tensors: bool,
     ) -> io::Result<Self> {
-        #[cfg(windows)]
         let mapped = if length > 0 {
             Some(std::sync::Arc::new(
                 bonsai_windows_process::MappedFile::from_file_without_prefetch(&file)?,
@@ -350,18 +344,12 @@ impl Weights {
         };
         let ParsedWeightsIndex {
             metadata, tensors, ..
-        } = {
-            #[cfg(windows)]
-            if let Some(view) = &mapped {
-                let mut cursor = io::Cursor::new(view.as_slice());
-                parse_index(&mut cursor, length, allow_zero_tensors, MAX_METADATA_BYTES)?
-            } else {
-                parse_index(&mut file, length, allow_zero_tensors, MAX_METADATA_BYTES)?
-            }
-            #[cfg(not(windows))]
+        } = if let Some(view) = &mapped {
+            let mut cursor = io::Cursor::new(view.as_slice());
+            parse_index(&mut cursor, length, allow_zero_tensors, MAX_METADATA_BYTES)?
+        } else {
             parse_index(&mut file, length, allow_zero_tensors, MAX_METADATA_BYTES)?
         };
-        #[cfg(windows)]
         let mapped = if tensors.is_empty() { None } else { mapped };
         Ok(Self {
             path,
@@ -369,7 +357,6 @@ impl Weights {
                 file,
                 stream_buf: Vec::new(),
             }),
-            #[cfg(windows)]
             mapped,
             metadata,
             tensors,
@@ -377,17 +364,9 @@ impl Weights {
     }
 
     pub(crate) const fn is_mapped(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.mapped.is_some()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
+        self.mapped.is_some()
     }
 
-    #[cfg(windows)]
     pub(crate) fn retain_mapped_view(&self) -> Option<MappedWeights> {
         self.mapped.as_ref().map(|mapped| MappedWeights {
             mapped: std::sync::Arc::clone(mapped),
@@ -467,7 +446,6 @@ impl Weights {
     }
 
     pub(crate) fn tensor_f32(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
-        #[cfg(windows)]
         if let Some(mapped) = self.mapped.as_deref() {
             return mapped_tensor_f32(&self.tensors, mapped, name, shape, 1);
         }
@@ -534,7 +512,6 @@ impl Weights {
         out_dim: usize,
         validate_threads: usize,
     ) -> io::Result<LinearProjection> {
-        #[cfg(windows)]
         if self.mapped.is_some() {
             return self.projection_mapped(name, in_dim, out_dim, validate_threads);
         }
@@ -556,27 +533,18 @@ impl Weights {
         out_dim: usize,
         validate_threads: usize,
     ) -> io::Result<LinearProjection> {
-        #[cfg(windows)]
-        {
-            let mapped = self.mapped.as_ref().ok_or_else(invalid)?;
-            return mapped_projection(
-                &self.tensors,
-                mapped,
-                name,
-                in_dim,
-                out_dim,
-                validate_threads,
-            );
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (name, in_dim, out_dim, validate_threads);
-            Err(invalid())
-        }
+        let mapped = self.mapped.as_ref().ok_or_else(invalid)?;
+        mapped_projection(
+            &self.tensors,
+            mapped,
+            name,
+            in_dim,
+            out_dim,
+            validate_threads,
+        )
     }
 }
 
-#[cfg(windows)]
 impl MappedWeights {
     pub(crate) fn u32(&self, key: &str) -> io::Result<u32> {
         metadata_u32(&self.metadata, key)
@@ -619,7 +587,6 @@ impl MappedWeights {
     }
 }
 
-#[cfg(windows)]
 fn mapped_tensor_f32(
     tensors: &BTreeMap<String, Tensor>,
     mapped: &bonsai_windows_process::MappedFile,
@@ -649,7 +616,6 @@ fn mapped_tensor_f32(
     Ok(output)
 }
 
-#[cfg(windows)]
 fn mapped_projection(
     tensors: &BTreeMap<String, Tensor>,
     mapped: &std::sync::Arc<bonsai_windows_process::MappedFile>,
@@ -738,30 +704,47 @@ pub(crate) fn validate_packed(kind: u32, bytes: &[u8]) -> io::Result<()> {
     if valid { Ok(()) } else { Err(invalid()) }
 }
 
-pub(crate) fn validate_packed_parallel(kind: u32, bytes: &[u8], threads: usize) -> io::Result<()> {
-    const PARALLEL_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
-    let (_, size) = packed_layout(kind)?;
+fn run_packed_parallel(
+    kind: u32,
+    bytes: &[u8],
+    output: &mut [f32],
+    threshold_bytes: usize,
+    threads: usize,
+    work: fn(u32, &[u8], &mut [f32]) -> io::Result<()>,
+) -> io::Result<()> {
+    let (block, size) = packed_layout(kind)?;
     if !bytes.len().is_multiple_of(size) {
         return Err(invalid());
     }
-    if threads <= 1 || bytes.len() < PARALLEL_THRESHOLD_BYTES {
-        return validate_packed(kind, bytes);
-    }
     let total_blocks = bytes.len() / size;
-    let workers = threads.min(total_blocks).min(32);
+    let workers = if threads <= 1 || bytes.len() < threshold_bytes {
+        1
+    } else {
+        threads.min(total_blocks).min(32)
+    };
     if workers <= 1 {
-        return validate_packed(kind, bytes);
+        return work(kind, bytes, output);
     }
     let chunk_blocks = total_blocks.div_ceil(workers);
-    let chunk_bytes = chunk_blocks * size;
+    let in_chunk = chunk_blocks * size;
+    let out_chunk = chunk_blocks * block;
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers - 1);
-        let mut chunks = bytes.chunks(chunk_bytes);
-        let first = chunks.next().unwrap_or(&[]);
-        for chunk in chunks {
-            handles.push(scope.spawn(move || validate_packed(kind, chunk)));
+        let mut rest_in = bytes;
+        let mut rest_out = output;
+        while rest_in.len() > in_chunk {
+            let (src, next_in) = rest_in.split_at(in_chunk);
+            rest_in = next_in;
+            let dst = if rest_out.is_empty() {
+                &mut [][..]
+            } else {
+                let (d, next_out) = rest_out.split_at_mut(out_chunk.min(rest_out.len()));
+                rest_out = next_out;
+                d
+            };
+            handles.push(scope.spawn(move || work(kind, src, dst)));
         }
-        let mut result = validate_packed(kind, first);
+        let mut result = work(kind, rest_in, rest_out);
         for handle in handles {
             let joined = handle.join().unwrap_or_else(|_| Err(invalid()));
             if result.is_ok() {
@@ -770,6 +753,18 @@ pub(crate) fn validate_packed_parallel(kind: u32, bytes: &[u8], threads: usize) 
         }
         result
     })
+}
+
+pub(crate) fn validate_packed_parallel(kind: u32, bytes: &[u8], threads: usize) -> io::Result<()> {
+    const PARALLEL_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+    run_packed_parallel(
+        kind,
+        bytes,
+        &mut [],
+        PARALLEL_THRESHOLD_BYTES,
+        threads,
+        |k, src, _| validate_packed(k, src),
+    )
 }
 
 fn decode_slice_f32(kind: u32, bytes: &[u8], output: &mut [f32]) -> io::Result<()> {
@@ -833,7 +828,6 @@ fn decode_slice_f32(kind: u32, bytes: &[u8], output: &mut [f32]) -> io::Result<(
     }
 }
 
-#[cfg(windows)]
 fn decode_slice_f32_parallel(
     kind: u32,
     bytes: &[u8],
@@ -841,36 +835,14 @@ fn decode_slice_f32_parallel(
     threads: usize,
 ) -> io::Result<()> {
     const PARALLEL_DECODE_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
-    if threads <= 1 || bytes.len() < PARALLEL_DECODE_THRESHOLD_BYTES {
-        return decode_slice_f32(kind, bytes, output);
-    }
-    let (block, size) = packed_layout(kind)?;
-    let total_blocks = bytes.len() / size;
-    let workers = threads.min(total_blocks).min(32);
-    if workers <= 1 {
-        return decode_slice_f32(kind, bytes, output);
-    }
-    let chunk_blocks = total_blocks.div_ceil(workers);
-    let in_chunk = chunk_blocks * size;
-    let out_chunk = chunk_blocks * block;
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers - 1);
-        let mut in_chunks = bytes.chunks(in_chunk);
-        let mut out_chunks = output.chunks_mut(out_chunk);
-        let first_in = in_chunks.next().unwrap_or(&[]);
-        let first_out = out_chunks.next().unwrap_or(&mut []);
-        for (src, dst) in in_chunks.zip(out_chunks) {
-            handles.push(scope.spawn(move || decode_slice_f32(kind, src, dst)));
-        }
-        let mut result = decode_slice_f32(kind, first_in, first_out);
-        for handle in handles {
-            let joined = handle.join().unwrap_or_else(|_| Err(invalid()));
-            if result.is_ok() {
-                result = joined;
-            }
-        }
-        result
-    })
+    run_packed_parallel(
+        kind,
+        bytes,
+        output,
+        PARALLEL_DECODE_THRESHOLD_BYTES,
+        threads,
+        decode_slice_f32,
+    )
 }
 
 // The caller validates the exact kind, source block size and destination width.
@@ -1512,10 +1484,7 @@ mod tests {
             mapped_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
-        #[cfg(windows)]
-        {
-            loaded.mapped = None;
-        }
+        loaded.mapped = None;
         let streamed_out = loaded.tensor_f32("big", &[count])?;
         assert_eq!(
             streamed_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -1576,13 +1545,10 @@ mod tests {
         let file = fixture(&[("half_vec", &[18], 1, 0)], &f16_raw)?;
         let weights = Weights::open(&file.0)?;
         let expected = weights.tensor_f32("half_vec", &[18])?;
-        #[cfg(windows)]
-        {
-            let retained = weights
-                .retain_mapped_view()
-                .ok_or_else(|| io::Error::other("expected mapped view"))?;
-            assert_eq!(retained.tensor_f32_mapped("half_vec", &[18])?, expected);
-        }
+        let retained = weights
+            .retain_mapped_view()
+            .ok_or_else(|| io::Error::other("expected mapped view"))?;
+        assert_eq!(retained.tensor_f32_mapped("half_vec", &[18])?, expected);
         Ok(())
     }
 }

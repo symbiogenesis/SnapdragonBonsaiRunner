@@ -499,7 +499,6 @@ impl Talker {
             } else if task < codebook_start {
                 let mut layer =
                     predictor_geometry.load_layer(weights, "code_pred", task - cp_start)?;
-                #[cfg(windows)]
                 layer.repack_q4_k_if_aligned();
                 Ok(TalkerLoadItem::CpLayer(layer))
             } else {

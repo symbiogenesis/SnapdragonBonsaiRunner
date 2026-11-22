@@ -188,7 +188,6 @@ pub struct Q8Block {
 
 /// Supported weight representations for `Talker` and `CodePredictor` linear projections.
 /// Shared zero-copy byte slice inside a read-only OS-mapped GGUF section.
-#[cfg(windows)]
 #[derive(Clone)]
 pub struct MappedSlice {
     mapped: std::sync::Arc<bonsai_windows_process::MappedFile>,
@@ -196,7 +195,6 @@ pub struct MappedSlice {
     end: usize,
 }
 
-#[cfg(windows)]
 impl MappedSlice {
     /// Construct a bounds-checked slice within an OS-mapped GGUF file.
     pub fn new(
@@ -220,7 +218,6 @@ impl MappedSlice {
     }
 }
 
-#[cfg(windows)]
 impl std::fmt::Debug for MappedSlice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MappedSlice")
@@ -229,7 +226,6 @@ impl std::fmt::Debug for MappedSlice {
     }
 }
 
-#[cfg(windows)]
 impl PartialEq for MappedSlice {
     fn eq(&self, other: &Self) -> bool {
         self.as_slice() == other.as_slice()
@@ -249,7 +245,6 @@ pub enum WeightQuantization {
         bytes: Vec<u8>,
     },
     /// Zero-copy OS-mapped GGML `F32/F16/Q8_0/Q4_K/Q6_K` blocks.
-    #[cfg(windows)]
     MappedPacked {
         /// GGML tensor type (`0`, `1`, `8`, `12`, or `14`).
         ggml_type: u32,
@@ -257,7 +252,6 @@ pub enum WeightQuantization {
         bytes: MappedSlice,
     },
     /// 8-row repacked `Q4_K` matrix tuned for `SDOT` / `I8MM` kernels (`out_dim % 8 == 0`).
-    #[cfg(windows)]
     RepackedQ4K8 {
         /// Repacked 8-row `Q4_K` superblock strips (`1184` bytes per 8x256 tile).
         bytes: Vec<u8>,
@@ -303,7 +297,6 @@ impl WeightQuantization {
     pub(crate) fn packed_slice(&self) -> Option<(u32, &[u8])> {
         match self {
             Self::Packed { ggml_type, bytes } => Some((*ggml_type, bytes.as_slice())),
-            #[cfg(windows)]
             Self::MappedPacked { ggml_type, bytes } => Some((*ggml_type, bytes.as_slice())),
             _ => None,
         }
@@ -916,7 +909,6 @@ impl LinearProjection {
             WeightQuantization::F32(_)
             | WeightQuantization::Q8_0 { .. }
             | WeightQuantization::Packed { .. } => None,
-            #[cfg(windows)]
             WeightQuantization::MappedPacked { .. } | WeightQuantization::RepackedQ4K8 { .. } => {
                 None
             }
@@ -992,7 +984,6 @@ impl LinearProjection {
         let level = Level::new();
 
         if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
-            #[cfg(windows)]
             if dispatch_packed_quant_kernels(
                 ggml_type,
                 bytes,
@@ -1022,14 +1013,12 @@ impl LinearProjection {
                         "Unreachable packed weight branch.",
                     ));
                 }
-                #[cfg(windows)]
                 WeightQuantization::MappedPacked { .. } => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Unreachable mapped packed weight branch.",
                     ));
                 }
-                #[cfg(windows)]
                 WeightQuantization::RepackedQ4K8 { bytes } => {
                     if !dispatch_repacked_q4_k(bytes, self.in_dim, input, worker_count, out) {
                         return Err(io::Error::new(
@@ -1150,7 +1139,6 @@ impl LinearProjection {
 
     /// Convert eligible `Q4_K` projections (`out_dim % 8 == 0`, `in_dim % 256 == 0`) to
     /// interleaved 8-row layout tuned for ARM64 `SDOT` / `I8MM` kernels.
-    #[cfg(windows)]
     pub fn repack_q4_k_if_aligned(&mut self) {
         if !bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod
             || !self.out_dim.is_multiple_of(8)
@@ -1266,7 +1254,6 @@ impl LinearProjection {
         }
         out.resize(expected_out, 0.0);
 
-        #[cfg(windows)]
         if dispatch_batch_quant_kernels(self, inputs, seq_len, threads, out)? {
             if let Some(patch) = lora {
                 for t in 0..seq_len {
@@ -1294,7 +1281,6 @@ impl LinearProjection {
     }
 }
 
-#[cfg(windows)]
 mod quant_dispatch {
     use std::cell::RefCell;
 
@@ -1679,12 +1665,10 @@ mod quant_dispatch {
     }
 }
 
-#[cfg(windows)]
 use quant_dispatch::{
     dispatch_batch_quant_kernels, dispatch_packed_quant_kernels, dispatch_repacked_q4_k,
 };
 
-#[cfg(windows)]
 fn run_row_chunks_aligned<F>(out: &mut [f32], worker_count: usize, alignment: usize, compute: F)
 where
     F: Fn(usize, &mut [f32]) + Sync,
@@ -1731,7 +1715,6 @@ fn forward_group_into(
         total_out = total_out.saturating_add(proj.out_dim);
     }
 
-    #[cfg(windows)]
     if threads > 1 && total_out >= 8 {
         let caps = bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect();
         let all_packed = caps.dotprod
@@ -2129,7 +2112,6 @@ pub(crate) fn narrow_f32_slice(src: &[f32], dst: &mut [u16]) -> bool {
 
 impl QwenDecoderLayer {
     /// Repack eligible `Q4_K` layer projections into the aligned ARM64 kernel layout.
-    #[cfg(windows)]
     pub(crate) fn repack_q4_k_if_aligned(&mut self) {
         for proj in [
             &mut self.q_proj,

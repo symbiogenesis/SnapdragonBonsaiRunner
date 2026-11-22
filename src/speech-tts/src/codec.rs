@@ -105,16 +105,20 @@ fn frame_workers(threads: usize, frames: usize, work: usize) -> usize {
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
-fn add_slice_in_place_simd<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
+fn slice_binop_in_place_simd<S: Simd, const SUB: bool>(simd: S, dst: &mut [f32], src: &[f32]) {
     let (dst_chunks, dst_tail) = dst.as_chunks_mut::<4>();
     let (src_chunks, src_tail) = src.as_chunks::<4>();
     for (d, s) in dst_chunks.iter_mut().zip(src_chunks.iter()) {
         let dv = f32x4::from_slice(simd, d);
         let sv = f32x4::from_slice(simd, s);
-        (dv + sv).store_slice(d);
+        (if SUB { dv - sv } else { dv + sv }).store_slice(d);
     }
     for (d, &s) in dst_tail.iter_mut().zip(src_tail.iter()) {
-        *d += s;
+        if SUB {
+            *d -= s;
+        } else {
+            *d += s;
+        }
     }
 }
 
@@ -123,17 +127,17 @@ fn add_slice_in_place_simd<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
+fn add_slice_in_place_simd<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
+    slice_binop_in_place_simd::<S, false>(simd, dst, src);
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
 fn sub_slice_in_place_simd<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
-    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<4>();
-    let (src_chunks, src_tail) = src.as_chunks::<4>();
-    for (d, s) in dst_chunks.iter_mut().zip(src_chunks.iter()) {
-        let dv = f32x4::from_slice(simd, d);
-        let sv = f32x4::from_slice(simd, s);
-        (dv - sv).store_slice(d);
-    }
-    for (d, &s) in dst_tail.iter_mut().zip(src_tail.iter()) {
-        *d -= s;
-    }
+    slice_binop_in_place_simd::<S, true>(simd, dst, src);
 }
 
 #[inline]
@@ -811,23 +815,17 @@ impl CausalConv1d {
                 "Invalid streaming CausalConv1d state or input.",
             ));
         }
-        if ctx_frames == 0 {
-            self.compute_frames_into(input, frames, 1, threads, out);
-            return Ok(());
-        }
-        let ext_len = (ctx_frames + frames) * self.in_c;
-        ext_scratch.clear();
-        if ext_scratch.capacity() < ext_len {
-            ext_scratch.reserve(ext_len - ext_scratch.capacity());
-        }
-        ext_scratch.extend_from_slice(state);
-        ext_scratch.extend_from_slice(input);
-
-        let tail_start = frames * self.in_c;
-        state.copy_from_slice(&ext_scratch[tail_start..]);
-
-        self.compute_frames_into(ext_scratch, frames, 1, threads, out);
+        let ext = update_stream_context(state, input, ext_scratch);
+        self.compute_frames_into(ext, frames, 1, threads, out);
         Ok(())
+    }
+
+    fn gather_patch(&self, ext: &[f32], first_frame: usize, patch: &mut [f32]) {
+        for (ic, row) in patch.chunks_exact_mut(self.kernel).enumerate() {
+            for (k, value) in row.iter_mut().enumerate() {
+                *value = ext[(first_frame + k * self.dilation) * self.in_c + ic];
+            }
+        }
     }
 
     fn compute_frames_into(
@@ -853,12 +851,7 @@ impl CausalConv1d {
             let width = self.in_c * self.kernel;
             with_worker_patch(width, |patch| {
                 for (frame, out_row) in out.chunks_exact_mut(self.out_c).enumerate() {
-                    let first = frame * stride;
-                    for (ic, row) in patch.chunks_exact_mut(self.kernel).enumerate() {
-                        for (k, value) in row.iter_mut().enumerate() {
-                            *value = ext[(first + k * self.dilation) * self.in_c + ic];
-                        }
-                    }
+                    self.gather_patch(ext, frame * stride, patch);
                     row_workers::run_aligned(out_row, threads, 4, &|offset, rows| {
                         let weights = &self.weight[offset * width..(offset + rows.len()) * width];
                         let bias = bias.map(|values| &values[offset..offset + rows.len()]);
@@ -886,14 +879,7 @@ impl CausalConv1d {
             }
             with_worker_patch(self.in_c * self.kernel, |patch| {
                 for (frame, out_row) in output.chunks_exact_mut(self.out_c).enumerate() {
-                    let t_in_base = (first_frame + frame) * stride;
-                    for ic in 0..self.in_c {
-                        let p_base = ic * self.kernel;
-                        for k in 0..self.kernel {
-                            let t_in = t_in_base + k * self.dilation;
-                            patch[p_base + k] = ext[t_in * self.in_c + ic];
-                        }
-                    }
+                    self.gather_patch(ext, (first_frame + frame) * stride, patch);
                     dispatch!(
                         level,
                         simd => matvec_4rows_simd(simd, &self.weight, patch, bias, out_row)
@@ -902,6 +888,22 @@ impl CausalConv1d {
             });
         });
     }
+}
+
+fn update_stream_context<'a>(
+    state: &mut [f32],
+    input: &'a [f32],
+    ext_buf: &'a mut Vec<f32>,
+) -> &'a [f32] {
+    if state.is_empty() {
+        return input;
+    }
+    ext_buf.clear();
+    ext_buf.reserve(state.len() + input.len());
+    ext_buf.extend_from_slice(state);
+    ext_buf.extend_from_slice(input);
+    state.copy_from_slice(&ext_buf[input.len()..]);
+    ext_buf
 }
 
 /// Causal 1D transposed convolution (`[in_c, out_c, kernel]` `PyTorch` layout).
@@ -1121,17 +1123,11 @@ impl SnakeBeta {
         } else {
             threads.clamp(1, 18)
         };
-        if workers <= 1 {
-            for row in data.chunks_exact_mut(channels) {
+        row_workers::run_aligned(data, workers, channels, &|_, slice| {
+            for row in slice.chunks_exact_mut(channels) {
                 dispatch!(level, simd => snake_beta_row_simd(simd, row, &self.a, &self.inv_b));
             }
-        } else {
-            row_workers::run_aligned(data, workers, channels, &|_, slice| {
-                for row in slice.chunks_exact_mut(channels) {
-                    dispatch!(level, simd => snake_beta_row_simd(simd, row, &self.a, &self.inv_b));
-                }
-            });
-        }
+        });
         Ok(())
     }
 }
@@ -1386,19 +1382,7 @@ impl ConvNeXtBlock {
                 "Invalid ConvNeXtBlock dimensions.",
             ));
         }
-        let ext: &[f32] = if ctx_len == 0 {
-            input
-        } else {
-            let ext_len = (ctx_len + frames) * c;
-            ext_buf.clear();
-            if ext_buf.capacity() < ext_len {
-                ext_buf.reserve(ext_len - ext_buf.capacity());
-            }
-            ext_buf.extend_from_slice(dw_state);
-            ext_buf.extend_from_slice(input);
-            dw_state.copy_from_slice(&ext_buf[frames * c..]);
-            ext_buf
-        };
+        let ext = update_stream_context(dw_state, input, ext_buf);
 
         let inv_c = 1.0_f32 / usize_to_f32(c);
         let mid_c = self.pwconv1_b.len();
@@ -1562,16 +1546,8 @@ impl RvqDecoder {
         } else {
             scratch.rvq_sem_codes.clear();
             scratch.rvq_aco_codes.clear();
-            if scratch.rvq_sem_codes.capacity() < frames * k_sem {
-                scratch
-                    .rvq_sem_codes
-                    .reserve(frames * k_sem - scratch.rvq_sem_codes.capacity());
-            }
-            if scratch.rvq_aco_codes.capacity() < frames * k_aco {
-                scratch
-                    .rvq_aco_codes
-                    .reserve(frames * k_aco - scratch.rvq_aco_codes.capacity());
-            }
+            scratch.rvq_sem_codes.reserve(frames * k_sem);
+            scratch.rvq_aco_codes.reserve(frames * k_aco);
             for t in 0..frames {
                 let row = &codes[t * total_k..(t + 1) * total_k];
                 scratch.rvq_sem_codes.extend_from_slice(&row[..k_sem]);
