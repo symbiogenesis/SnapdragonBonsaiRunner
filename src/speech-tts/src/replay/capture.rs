@@ -2,12 +2,10 @@
 
 use std::io::{self, BufWriter, Write};
 
-use super::{Binding, Provider, Tolerance, Tolerances, check_cancel, invalid};
+use super::{Binding, Tolerance, Tolerances, WireSink, check_cancel, invalid, valid_header_inputs};
 use crate::{
     engine::{LayerKvCache, TOTAL_CODE_GROUPS},
-    observation::{
-        ARITHMETIC_IDENTITY, Observation, Phase, PredictorObservation, TalkerObservation,
-    },
+    observation::{Observation, Phase, PredictorObservation, TalkerObservation},
 };
 
 /// Independently reviewed decoder geometry; all layers and vocabulary entries are mandatory.
@@ -349,6 +347,16 @@ pub struct CaptureWriter<W: Write> {
     events: usize,
 }
 
+impl<W: Write> WireSink for CaptureWriter<W> {
+    fn bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.output.write_all(bytes)
+    }
+
+    fn float(&mut self, value: f32, _tolerance: Tolerance) -> io::Result<()> {
+        self.output.write_all(&value.to_le_bytes())
+    }
+}
+
 impl<W: Write> CaptureWriter<W> {
     /// Write the reviewed provider/model/request/tolerance-bound packet header.
     ///
@@ -364,9 +372,7 @@ impl<W: Write> CaptureWriter<W> {
             || !layout.base.valid()
             || !(1..=4096).contains(&layout.speaker_width)
             || !crate::is_supported_sample_rate(layout.sample_rate)
-            || !(1..=256).contains(&binding.workers)
-            || binding.candidate.arithmetic != ARITHMETIC_IDENTITY
-            || !rules.rules().into_iter().all(Tolerance::valid)
+            || !valid_header_inputs(binding, rules)
         {
             return Err(invalid());
         }
@@ -390,28 +396,7 @@ impl<W: Write> CaptureWriter<W> {
             samples: 0,
             events: 0,
         };
-        capture.output.write_all(b"TTSREPL1")?;
-        capture.provider(&binding.reference)?;
-        capture.provider(&binding.candidate)?;
-        capture.digest(&binding.model_lock)?;
-        for model in &binding.models {
-            capture.digest(model)?;
-        }
-        capture.digest(&binding.request)?;
-        capture.number(binding.workers)?;
-        capture
-            .output
-            .write_all(&[u8::from(binding.retained_voice)])?;
-        for rule in rules.rules() {
-            match rule {
-                Tolerance::Bits => capture.output.write_all(&[0])?,
-                Tolerance::Finite { absolute, relative } => {
-                    capture.output.write_all(&[1])?;
-                    capture.output.write_all(&absolute.to_le_bytes())?;
-                    capture.output.write_all(&relative.to_le_bytes())?;
-                }
-            }
-        }
+        capture.header(binding, rules)?;
         Ok(capture)
     }
 
@@ -483,8 +468,7 @@ impl<W: Write> CaptureWriter<W> {
         if phase != self.phase {
             return Err(invalid());
         }
-        self.output
-            .write_all(&[tag, u8::from(phase == Phase::Base)])
+        self.record_tag(tag, phase)
     }
 
     fn event(
@@ -681,12 +665,7 @@ impl<W: Write> CaptureWriter<W> {
                 {
                     return Err(invalid());
                 }
-                self.output.write_all(&[9])?;
-                self.number(frames.len())?;
-                for frame in frames {
-                    check_cancel(cancel)?;
-                    self.codes(frame)?;
-                }
+                self.reference_codes(frames, cancel)?;
                 Ok(Stage::Prompt)
             }
             CaptureEvent::Complete {
@@ -730,8 +709,8 @@ impl<W: Write> CaptureWriter<W> {
                     {
                         return Err(invalid());
                     }
-                    self.floats(layer.keys, cancel)?;
-                    self.floats(layer.values, cancel)?;
+                    WireSink::floats(self, layer.keys, Tolerance::Bits, cancel)?;
+                    WireSink::floats(self, layer.values, Tolerance::Bits, cancel)?;
                 }
                 LayerView::F16 {
                     keys,
@@ -744,12 +723,16 @@ impl<W: Write> CaptureWriter<W> {
                     {
                         return Err(invalid());
                     }
-                    self.floats_f16(keys, cancel)?;
-                    self.floats_f16(v_bits, cancel)?;
+                    self.floats_f16(keys, Tolerance::Bits, cancel)?;
+                    self.floats_f16(v_bits, Tolerance::Bits, cancel)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn floats(&mut self, values: &[f32], cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
+        WireSink::floats(self, values, Tolerance::Bits, cancel)
     }
 
     fn rows(
@@ -774,64 +757,5 @@ impl<W: Write> CaptureWriter<W> {
             }
         }
         Ok(())
-    }
-
-    fn floats(&mut self, values: &[f32], cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
-        self.number(values.len())?;
-        for chunk in values.chunks(4096) {
-            check_cancel(cancel)?;
-            for value in chunk {
-                self.output.write_all(&value.to_le_bytes())?;
-            }
-        }
-        Ok(())
-    }
-
-    fn floats_f16(&mut self, values: &[u16], cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
-        self.number(values.len())?;
-        let mut widened = [0.0_f32; 256];
-        for chunk in values.chunks(256) {
-            check_cancel(cancel)?;
-            crate::engine::widen_f16_slice(chunk, &mut widened[..chunk.len()]);
-            for value in &widened[..chunk.len()] {
-                self.output.write_all(&value.to_le_bytes())?;
-            }
-        }
-        Ok(())
-    }
-
-    fn codes(&mut self, codes: &[i32; TOTAL_CODE_GROUPS]) -> io::Result<()> {
-        for code in codes {
-            self.output.write_all(&code.to_le_bytes())?;
-        }
-        Ok(())
-    }
-
-    fn number(&mut self, value: usize) -> io::Result<()> {
-        self.output
-            .write_all(&u64::try_from(value).map_err(|_| invalid())?.to_le_bytes())
-    }
-
-    fn digest(&mut self, value: &[u8]) -> io::Result<()> {
-        if value.iter().all(|byte| *byte == 0) {
-            return Err(invalid());
-        }
-        self.output.write_all(value)
-    }
-
-    fn text(&mut self, value: &str) -> io::Result<()> {
-        if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
-            return Err(invalid());
-        }
-        self.number(value.len())?;
-        self.output.write_all(value.as_bytes())
-    }
-
-    fn provider(&mut self, provider: &Provider<'_>) -> io::Result<()> {
-        self.digest(&provider.revision)?;
-        self.text(provider.compiler)?;
-        self.text(provider.target)?;
-        self.digest(&provider.executable)?;
-        self.text(provider.arithmetic)
     }
 }

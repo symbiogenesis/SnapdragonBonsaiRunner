@@ -167,6 +167,149 @@ fn check_cancel(cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
     Ok(())
 }
 
+fn valid_header_inputs(binding: &Binding<'_>, rules: Tolerances) -> bool {
+    binding.candidate.arithmetic == ARITHMETIC_IDENTITY
+        && (1..=256).contains(&binding.workers)
+        && rules.rules().into_iter().all(Tolerance::valid)
+}
+
+trait WireSink {
+    fn bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
+    fn float(&mut self, value: f32, tolerance: Tolerance) -> io::Result<()>;
+
+    fn number(&mut self, value: usize) -> io::Result<()> {
+        self.bytes(&u64::try_from(value).map_err(|_| invalid())?.to_le_bytes())
+    }
+
+    fn digest(&mut self, value: &[u8]) -> io::Result<()> {
+        if value.iter().all(|byte| *byte == 0) {
+            return Err(invalid());
+        }
+        self.bytes(value)
+    }
+
+    fn text(&mut self, value: &str) -> io::Result<()> {
+        if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+        self.number(value.len())?;
+        self.bytes(value.as_bytes())
+    }
+
+    fn provider(&mut self, provider: &Provider<'_>) -> io::Result<()> {
+        self.digest(&provider.revision)?;
+        self.text(provider.compiler)?;
+        self.text(provider.target)?;
+        self.digest(&provider.executable)?;
+        self.text(provider.arithmetic)
+    }
+
+    fn header(&mut self, binding: &Binding<'_>, rules: Tolerances) -> io::Result<()> {
+        self.bytes(b"TTSREPL1")?;
+        self.provider(&binding.reference)?;
+        self.provider(&binding.candidate)?;
+        self.digest(&binding.model_lock)?;
+        for model in &binding.models {
+            self.digest(model)?;
+        }
+        self.digest(&binding.request)?;
+        self.number(binding.workers)?;
+        self.bytes(&[u8::from(binding.retained_voice)])?;
+        for rule in rules.rules() {
+            match rule {
+                Tolerance::Bits => self.bytes(&[0])?,
+                Tolerance::Finite { absolute, relative } => {
+                    self.bytes(&[1])?;
+                    self.bytes(&absolute.to_le_bytes())?;
+                    self.bytes(&relative.to_le_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_tag(&mut self, tag: u8, phase: Phase) -> io::Result<()> {
+        self.bytes(&[tag, u8::from(phase == Phase::Base)])
+    }
+
+    fn codes(&mut self, codes: &[i32; TOTAL_CODE_GROUPS]) -> io::Result<()> {
+        for code in codes {
+            self.bytes(&code.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn reference_codes(
+        &mut self,
+        frames: &[[i32; TOTAL_CODE_GROUPS]],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        self.bytes(&[9])?;
+        self.number(frames.len())?;
+        for frame in frames {
+            check_cancel(cancel)?;
+            self.codes(frame)?;
+        }
+        Ok(())
+    }
+
+    fn floats(
+        &mut self,
+        values: &[f32],
+        tolerance: Tolerance,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        self.number(values.len())?;
+        for chunk in values.chunks(4096) {
+            check_cancel(cancel)?;
+            for &value in chunk {
+                self.float(value, tolerance)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn floats_f16(
+        &mut self,
+        values: &[u16],
+        tolerance: Tolerance,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        self.number(values.len())?;
+        let mut widened = [0.0_f32; 256];
+        for chunk in values.chunks(256) {
+            check_cancel(cancel)?;
+            crate::engine::widen_f16_slice(chunk, &mut widened[..chunk.len()]);
+            for &value in &widened[..chunk.len()] {
+                self.float(value, tolerance)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> WireSink for Replay<R> {
+    fn bytes(&mut self, expected: &[u8]) -> io::Result<()> {
+        let mut buffer = [0_u8; 1024];
+        for expected in expected.chunks(buffer.len()) {
+            self.input.read_exact(&mut buffer[..expected.len()])?;
+            if &buffer[..expected.len()] != expected {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    fn float(&mut self, value: f32, tolerance: Tolerance) -> io::Result<()> {
+        let mut raw = [0; 4];
+        self.input.read_exact(&mut raw)?;
+        if !tolerance.accepts(f32::from_le_bytes(raw), value) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
 impl<R: Read> Replay<R> {
     /// Bind the packet header to independently reviewed identities and rules.
     ///
@@ -177,10 +320,7 @@ impl<R: Read> Replay<R> {
     /// # Errors
     /// Rejects missing/changed identities, malformed headers or invalid rules.
     pub fn new(input: R, binding: &Binding<'_>, tolerance: Tolerances) -> io::Result<Self> {
-        if binding.candidate.arithmetic != ARITHMETIC_IDENTITY
-            || !(1..=256).contains(&binding.workers)
-            || !tolerance.rules().into_iter().all(Tolerance::valid)
-        {
+        if !valid_header_inputs(binding, tolerance) {
             return Err(invalid());
         }
         let mut replay = Self {
@@ -193,26 +333,7 @@ impl<R: Read> Replay<R> {
             failed: false,
             complete: false,
         };
-        replay.bytes(b"TTSREPL1")?;
-        replay.provider(&binding.reference)?;
-        replay.provider(&binding.candidate)?;
-        replay.digest(&binding.model_lock)?;
-        for model in &binding.models {
-            replay.digest(model)?;
-        }
-        replay.digest(&binding.request)?;
-        replay.number(binding.workers)?;
-        replay.bytes(&[u8::from(binding.retained_voice)])?;
-        for rule in tolerance.rules() {
-            match rule {
-                Tolerance::Bits => replay.bytes(&[0])?,
-                Tolerance::Finite { absolute, relative } => {
-                    replay.bytes(&[1])?;
-                    replay.bytes(&absolute.to_le_bytes())?;
-                    replay.bytes(&relative.to_le_bytes())?;
-                }
-            }
-        }
+        replay.header(binding, tolerance)?;
         Ok(replay)
     }
 
@@ -257,95 +378,11 @@ impl<R: Read> Replay<R> {
         Ok(())
     }
 
-    fn bytes(&mut self, expected: &[u8]) -> io::Result<()> {
-        let mut buffer = [0_u8; 1024];
-        for expected in expected.chunks(buffer.len()) {
-            self.input.read_exact(&mut buffer[..expected.len()])?;
-            if &buffer[..expected.len()] != expected {
-                return Err(invalid());
-            }
-        }
-        Ok(())
-    }
-
-    fn number(&mut self, expected: usize) -> io::Result<()> {
-        self.bytes(
-            &u64::try_from(expected)
-                .map_err(|_| invalid())?
-                .to_le_bytes(),
-        )
-    }
-
-    fn digest(&mut self, expected: &[u8]) -> io::Result<()> {
-        if expected.iter().all(|byte| *byte == 0) {
-            return Err(invalid());
-        }
-        self.bytes(expected)
-    }
-
-    fn text(&mut self, expected: &str) -> io::Result<()> {
-        if expected.is_empty() || expected.len() > 1024 || expected.chars().any(char::is_control) {
-            return Err(invalid());
-        }
-        self.number(expected.len())?;
-        self.bytes(expected.as_bytes())
-    }
-
-    fn provider(&mut self, expected: &Provider<'_>) -> io::Result<()> {
-        self.digest(&expected.revision)?;
-        self.text(expected.compiler)?;
-        self.text(expected.target)?;
-        self.digest(&expected.executable)?;
-        self.text(expected.arithmetic)
-    }
-
-    fn floats(
-        &mut self,
-        actual: &[f32],
-        tolerance: Tolerance,
-        cancel: &mut impl FnMut() -> bool,
-    ) -> io::Result<()> {
-        self.number(actual.len())?;
-        for chunk in actual.chunks(4096) {
-            check_cancel(cancel)?;
-            for actual in chunk {
-                let mut raw = [0; 4];
-                self.input.read_exact(&mut raw)?;
-                if !tolerance.accepts(f32::from_le_bytes(raw), *actual) {
-                    return Err(invalid());
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn rows(&mut self, actual: &[Vec<f32>], cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
         self.number(actual.len())?;
         for row in actual {
             check_cancel(cancel)?;
             self.floats(row, self.tolerance.prompt, cancel)?;
-        }
-        Ok(())
-    }
-
-    fn floats_f16(
-        &mut self,
-        actual: &[u16],
-        tolerance: Tolerance,
-        cancel: &mut impl FnMut() -> bool,
-    ) -> io::Result<()> {
-        self.number(actual.len())?;
-        let mut widened = [0.0_f32; 256];
-        for chunk in actual.chunks(256) {
-            check_cancel(cancel)?;
-            crate::engine::widen_f16_slice(chunk, &mut widened[..chunk.len()]);
-            for &value in &widened[..chunk.len()] {
-                let mut raw = [0; 4];
-                self.input.read_exact(&mut raw)?;
-                if !tolerance.accepts(f32::from_le_bytes(raw), value) {
-                    return Err(invalid());
-                }
-            }
         }
         Ok(())
     }
@@ -364,17 +401,6 @@ impl<R: Read> Replay<R> {
             self.floats_f16(&layer.v, self.tolerance.cache, cancel)?;
         }
         Ok(())
-    }
-
-    fn codes(&mut self, codes: &[i32; TOTAL_CODE_GROUPS]) -> io::Result<()> {
-        for code in codes {
-            self.bytes(&code.to_le_bytes())?;
-        }
-        Ok(())
-    }
-
-    fn record(&mut self, tag: u8, phase: Phase) -> io::Result<()> {
-        self.bytes(&[tag, u8::from(phase == Phase::Base)])
     }
 
     fn observe(
@@ -407,16 +433,9 @@ impl<R: Read> Replay<R> {
                 self.bytes(&[8])?;
                 self.floats(values, self.tolerance.speaker, cancel)?;
             }
-            Observation::ReferenceCodes(frames) => {
-                self.bytes(&[9])?;
-                self.number(frames.len())?;
-                for frame in frames {
-                    check_cancel(cancel)?;
-                    self.codes(frame)?;
-                }
-            }
+            Observation::ReferenceCodes(frames) => self.reference_codes(frames, cancel)?,
             Observation::Pcm { phase, samples } => {
-                self.record(10, phase)?;
+                self.record_tag(10, phase)?;
                 self.floats(samples, self.tolerance.pcm, cancel)?;
             }
             Observation::Complete {
@@ -455,7 +474,7 @@ impl<R: Read> Replay<R> {
                 trailing,
                 cacheable_rows,
             } => {
-                self.record(1, phase)?;
+                self.record_tag(1, phase)?;
                 self.rows(rows, cancel)?;
                 self.rows(trailing, cancel)?;
                 self.number(cacheable_rows)?;
@@ -466,14 +485,14 @@ impl<R: Read> Replay<R> {
                 logits,
                 cache,
             } => {
-                self.record(2, phase)?;
+                self.record_tag(2, phase)?;
                 self.number(frame)?;
                 self.floats(hidden, self.tolerance.hidden, cancel)?;
                 self.floats(logits, self.tolerance.logits, cancel)?;
                 self.cache(cache, cancel)?;
             }
             TalkerObservation::Decision { frame, token, eos } => {
-                self.record(3, phase)?;
+                self.record_tag(3, phase)?;
                 self.number(frame)?;
                 self.bytes(&token.to_le_bytes())?;
                 self.bytes(&[u8::from(eos)])?;
@@ -482,7 +501,7 @@ impl<R: Read> Replay<R> {
                 self.predictor(phase, frame, observation, cancel)?;
             }
             TalkerObservation::Frame { frame, codes } => {
-                self.record(7, phase)?;
+                self.record_tag(7, phase)?;
                 self.number(frame)?;
                 self.codes(codes)?;
             }
@@ -499,7 +518,7 @@ impl<R: Read> Replay<R> {
     ) -> io::Result<()> {
         match event {
             PredictorObservation::Prefill { cache } => {
-                self.record(4, phase)?;
+                self.record_tag(4, phase)?;
                 self.number(frame)?;
                 self.cache(cache, cancel)?;
             }
@@ -509,7 +528,7 @@ impl<R: Read> Replay<R> {
                 logits,
                 cache,
             } => {
-                self.record(5, phase)?;
+                self.record_tag(5, phase)?;
                 self.number(frame)?;
                 self.number(codebook)?;
                 self.floats(hidden, self.tolerance.hidden, cancel)?;
@@ -517,7 +536,7 @@ impl<R: Read> Replay<R> {
                 self.cache(cache, cancel)?;
             }
             PredictorObservation::Decision { codebook, token } => {
-                self.record(6, phase)?;
+                self.record_tag(6, phase)?;
                 self.number(frame)?;
                 self.number(codebook)?;
                 self.bytes(&token.to_le_bytes())?;
