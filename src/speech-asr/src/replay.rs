@@ -146,6 +146,240 @@ fn check_cancel(cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
     Ok(())
 }
 
+fn valid_header_inputs(binding: &Binding<'_>, tolerance: Tolerances) -> bool {
+    binding.candidate.arithmetic == ARITHMETIC_IDENTITY
+        && [
+            tolerance.frontend,
+            tolerance.encoder,
+            tolerance.logits,
+            tolerance.cache,
+        ]
+        .into_iter()
+        .all(Tolerance::valid)
+}
+
+trait WireSink {
+    fn bytes(&mut self, data: &[u8]) -> io::Result<()>;
+
+    fn float(&mut self, value: f32, tolerance: Tolerance, index: usize) -> io::Result<()>;
+
+    fn number(&mut self, value: usize) -> io::Result<()> {
+        self.bytes(&u64::try_from(value).map_err(|_| invalid())?.to_le_bytes())
+    }
+
+    fn digest(&mut self, value: &[u8]) -> io::Result<()> {
+        if value.iter().all(|byte| *byte == 0) {
+            return Err(invalid());
+        }
+        self.bytes(value)
+    }
+
+    fn text(&mut self, value: &str) -> io::Result<()> {
+        if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+        self.number(value.len())?;
+        self.bytes(value.as_bytes())
+    }
+
+    fn provider(&mut self, value: &Provider<'_>) -> io::Result<()> {
+        self.digest(&value.revision)?;
+        self.text(value.compiler)?;
+        self.text(value.target)?;
+        self.digest(&value.executable)?;
+        self.text(value.arithmetic)
+    }
+
+    fn header(&mut self, binding: &Binding<'_>, tolerance: Tolerances) -> io::Result<()> {
+        self.bytes(MAGIC)?;
+        self.provider(&binding.reference)?;
+        self.provider(&binding.candidate)?;
+        self.digest(&binding.model)?;
+        self.digest(&binding.pcm)?;
+        for rule in [
+            tolerance.frontend,
+            tolerance.encoder,
+            tolerance.logits,
+            tolerance.cache,
+        ] {
+            match rule {
+                Tolerance::Bits => self.bytes(&[0])?,
+                Tolerance::Finite { absolute, relative } => {
+                    self.bytes(&[1])?;
+                    self.bytes(&absolute.to_le_bytes())?;
+                    self.bytes(&relative.to_le_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn float_chunk(&mut self, chunk: &[f32], tolerance: Tolerance, base: usize) -> io::Result<()> {
+        for (index, &value) in chunk.iter().enumerate() {
+            self.float(value, tolerance, base + index)?;
+        }
+        Ok(())
+    }
+
+    fn floats(
+        &mut self,
+        values: &[f32],
+        tolerance: Tolerance,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        self.number(values.len())?;
+        for (chunk_index, chunk) in values.chunks(4096).enumerate() {
+            check_cancel(cancel)?;
+            self.float_chunk(chunk, tolerance, chunk_index * 4096)?;
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> WireSink for Replay<R> {
+    fn bytes(&mut self, expected: &[u8]) -> io::Result<()> {
+        let mut buffer = [0_u8; 1024];
+        for expected in expected.chunks(buffer.len()) {
+            self.input.read_exact(&mut buffer[..expected.len()])?;
+            if &buffer[..expected.len()] != expected {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    fn float(&mut self, actual: f32, tolerance: Tolerance, index: usize) -> io::Result<()> {
+        let mut raw = [0; 4];
+        self.input.read_exact(&mut raw)?;
+        if !tolerance.accepts(f32::from_le_bytes(raw), actual) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ASR replay numerical mismatch at element {index}."),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn valid_header_inputs(binding: &Binding<'_>, tolerance: Tolerances) -> bool {
+    binding.candidate.arithmetic == ARITHMETIC_IDENTITY
+        && [
+            tolerance.frontend,
+            tolerance.encoder,
+            tolerance.logits,
+            tolerance.cache,
+        ]
+        .into_iter()
+        .all(Tolerance::valid)
+}
+
+trait WireSink {
+    fn bytes(&mut self, data: &[u8]) -> io::Result<()>;
+
+    fn float(&mut self, value: f32, tolerance: Tolerance, index: usize) -> io::Result<()>;
+
+    fn number(&mut self, value: usize) -> io::Result<()> {
+        self.bytes(
+            &u64::try_from(value)
+                .map_err(|_| invalid())?
+                .to_le_bytes(),
+        )
+    }
+
+    fn digest(&mut self, value: &[u8]) -> io::Result<()> {
+        if value.iter().all(|byte| *byte == 0) {
+            return Err(invalid());
+        }
+        self.bytes(value)
+    }
+
+    fn text(&mut self, value: &str) -> io::Result<()> {
+        if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+        self.number(value.len())?;
+        self.bytes(value.as_bytes())
+    }
+
+    fn provider(&mut self, value: &Provider<'_>) -> io::Result<()> {
+        self.digest(&value.revision)?;
+        self.text(value.compiler)?;
+        self.text(value.target)?;
+        self.digest(&value.executable)?;
+        self.text(value.arithmetic)
+    }
+
+    fn header(&mut self, binding: &Binding<'_>, tolerance: Tolerances) -> io::Result<()> {
+        self.bytes(MAGIC)?;
+        self.provider(&binding.reference)?;
+        self.provider(&binding.candidate)?;
+        self.digest(&binding.model)?;
+        self.digest(&binding.pcm)?;
+        for rule in [
+            tolerance.frontend,
+            tolerance.encoder,
+            tolerance.logits,
+            tolerance.cache,
+        ] {
+            match rule {
+                Tolerance::Bits => self.bytes(&[0])?,
+                Tolerance::Finite { absolute, relative } => {
+                    self.bytes(&[1])?;
+                    self.bytes(&absolute.to_le_bytes())?;
+                    self.bytes(&relative.to_le_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn float_chunk(&mut self, chunk: &[f32], tolerance: Tolerance, base: usize) -> io::Result<()> {
+        for (index, &value) in chunk.iter().enumerate() {
+            self.float(value, tolerance, base + index)?;
+        }
+        Ok(())
+    }
+
+    fn floats(
+        &mut self,
+        values: &[f32],
+        tolerance: Tolerance,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        self.number(values.len())?;
+        for (chunk_index, chunk) in values.chunks(4096).enumerate() {
+            check_cancel(cancel)?;
+            self.float_chunk(chunk, tolerance, chunk_index * 4096)?;
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> WireSink for Replay<R> {
+    fn bytes(&mut self, expected: &[u8]) -> io::Result<()> {
+        let mut buffer = [0_u8; 1024];
+        for expected in expected.chunks(buffer.len()) {
+            self.input.read_exact(&mut buffer[..expected.len()])?;
+            if &buffer[..expected.len()] != expected {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    fn float(&mut self, actual: f32, tolerance: Tolerance, index: usize) -> io::Result<()> {
+        let mut raw = [0; 4];
+        self.input.read_exact(&mut raw)?;
+        if !tolerance.accepts(f32::from_le_bytes(raw), actual) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ASR replay numerical mismatch at element {index}."),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl<R: Read> Replay<R> {
     /// Bind the original packet header to caller-reviewed identities and tolerances.
     ///
@@ -155,16 +389,7 @@ impl<R: Read> Replay<R> {
     /// # Errors
     /// Rejects missing/changed identities, invalid tolerances and malformed headers.
     pub fn new(input: R, binding: &Binding<'_>, tolerance: Tolerances) -> io::Result<Self> {
-        if binding.candidate.arithmetic != ARITHMETIC_IDENTITY
-            || ![
-                tolerance.frontend,
-                tolerance.encoder,
-                tolerance.logits,
-                tolerance.cache,
-            ]
-            .into_iter()
-            .all(Tolerance::valid)
-        {
+        if !valid_header_inputs(binding, tolerance) {
             return Err(invalid());
         }
         let mut replay = Self {
@@ -176,26 +401,7 @@ impl<R: Read> Replay<R> {
             layers: None,
             pcm: binding.pcm,
         };
-        replay.bytes(MAGIC)?;
-        replay.provider(&binding.reference)?;
-        replay.provider(&binding.candidate)?;
-        replay.digest(&binding.model)?;
-        replay.digest(&binding.pcm)?;
-        for rule in [
-            tolerance.frontend,
-            tolerance.encoder,
-            tolerance.logits,
-            tolerance.cache,
-        ] {
-            match rule {
-                Tolerance::Bits => replay.bytes(&[0])?,
-                Tolerance::Finite { absolute, relative } => {
-                    replay.bytes(&[1])?;
-                    replay.bytes(&absolute.to_le_bytes())?;
-                    replay.bytes(&relative.to_le_bytes())?;
-                }
-            }
-        }
+        replay.header(binding, tolerance)?;
         Ok(replay)
     }
 
@@ -244,76 +450,6 @@ impl<R: Read> Replay<R> {
         Ok(transcript)
     }
 
-    fn bytes(&mut self, expected: &[u8]) -> io::Result<()> {
-        let mut buffer = [0_u8; 1024];
-        for expected in expected.chunks(buffer.len()) {
-            self.input.read_exact(&mut buffer[..expected.len()])?;
-            if &buffer[..expected.len()] != expected {
-                return Err(invalid());
-            }
-        }
-        Ok(())
-    }
-
-    fn digest(&mut self, expected: &[u8]) -> io::Result<()> {
-        if expected.iter().all(|byte| *byte == 0) {
-            return Err(invalid());
-        }
-        self.bytes(expected)
-    }
-
-    fn number(&mut self, expected: usize) -> io::Result<()> {
-        self.bytes(
-            &u64::try_from(expected)
-                .map_err(|_| invalid())?
-                .to_le_bytes(),
-        )
-    }
-
-    fn text(&mut self, expected: &str) -> io::Result<()> {
-        if expected.is_empty() || expected.len() > 1024 || expected.chars().any(char::is_control) {
-            return Err(invalid());
-        }
-        self.number(expected.len())?;
-        self.bytes(expected.as_bytes())
-    }
-
-    fn provider(&mut self, expected: &Provider<'_>) -> io::Result<()> {
-        self.digest(&expected.revision)?;
-        self.text(expected.compiler)?;
-        self.text(expected.target)?;
-        self.digest(&expected.executable)?;
-        self.text(expected.arithmetic)
-    }
-
-    fn floats(
-        &mut self,
-        actual: &[f32],
-        tolerance: Tolerance,
-        cancel: &mut impl FnMut() -> bool,
-    ) -> io::Result<()> {
-        self.number(actual.len())?;
-        for (chunk_index, chunk) in actual.chunks(4096).enumerate() {
-            if cancel() {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            for (index, actual) in chunk.iter().enumerate() {
-                let mut raw = [0; 4];
-                self.input.read_exact(&mut raw)?;
-                if !tolerance.accepts(f32::from_le_bytes(raw), *actual) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "ASR replay numerical mismatch at element {}.",
-                            chunk_index * 4096 + index
-                        ),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn cache_values(
         &mut self,
         actual: CacheValues<'_>,
@@ -326,24 +462,10 @@ impl<R: Read> Replay<R> {
                 self.number(words.len())?;
                 let mut widened = [0.0_f32; 4096];
                 for (chunk_index, chunk) in words.chunks(4096).enumerate() {
-                    if cancel() {
-                        return Err(io::ErrorKind::Interrupted.into());
-                    }
+                    check_cancel(cancel)?;
                     let slice = &mut widened[..chunk.len()];
                     crate::packed::widen_f16_slice(chunk, slice);
-                    for (index, &value) in slice.iter().enumerate() {
-                        let mut raw = [0; 4];
-                        self.input.read_exact(&mut raw)?;
-                        if !tolerance.accepts(f32::from_le_bytes(raw), value) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "ASR replay numerical mismatch at element {}.",
-                                    chunk_index * 4096 + index
-                                ),
-                            ));
-                        }
-                    }
+                    self.float_chunk(slice, tolerance, chunk_index * 4096)?;
                 }
                 Ok(())
             }

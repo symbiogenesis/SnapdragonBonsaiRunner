@@ -5,8 +5,9 @@ use std::{
     ops::Range,
 };
 
-use super::{Binding, MAGIC, Provider, Stage, Tolerance, Tolerances, check_cancel, invalid};
-use crate::rust_engine::ARITHMETIC_IDENTITY;
+use super::{
+    Binding, Stage, Tolerance, Tolerances, WireSink, check_cancel, invalid, valid_header_inputs,
+};
 
 /// Independently reviewed model geometry, supplied before any observation.
 #[derive(Clone, Copy)]
@@ -61,6 +62,7 @@ impl CacheValues<'_> {
         }
     }
 
+    #[cfg(test)]
     fn bits(self, index: usize) -> u32 {
         match self {
             Self::F32(values) => values[index].to_bits(),
@@ -132,15 +134,7 @@ impl<W: Write> CaptureWriter<W> {
             || !(1..=128).contains(&layout.decoder_layers)
             || !(1..=32_768).contains(&layout.kv_width)
             || usize::try_from(layout.eos_token).map_err(|_| invalid())? >= layout.vocabulary
-            || binding.candidate.arithmetic != ARITHMETIC_IDENTITY
-            || ![
-                tolerance.frontend,
-                tolerance.encoder,
-                tolerance.logits,
-                tolerance.cache,
-            ]
-            .into_iter()
-            .all(Tolerance::valid)
+            || !valid_header_inputs(binding, tolerance)
         {
             return Err(invalid());
         }
@@ -153,26 +147,7 @@ impl<W: Write> CaptureWriter<W> {
             generation: 0,
             eos: false,
         };
-        capture.output.write_all(MAGIC)?;
-        capture.provider(&binding.reference)?;
-        capture.provider(&binding.candidate)?;
-        capture.digest(&binding.model)?;
-        capture.digest(&binding.pcm)?;
-        for rule in [
-            tolerance.frontend,
-            tolerance.encoder,
-            tolerance.logits,
-            tolerance.cache,
-        ] {
-            match rule {
-                Tolerance::Bits => capture.output.write_all(&[0])?,
-                Tolerance::Finite { absolute, relative } => {
-                    capture.output.write_all(&[1])?;
-                    capture.output.write_all(&absolute.to_le_bytes())?;
-                    capture.output.write_all(&relative.to_le_bytes())?;
-                }
-            }
-        }
+        capture.header(binding, tolerance)?;
         Ok(capture)
     }
 
@@ -193,7 +168,7 @@ impl<W: Write> CaptureWriter<W> {
             }
             capture.output.write_all(&[1])?;
             capture.number(frames)?;
-            capture.floats(values, cancel)?;
+            capture.floats(values, Tolerance::Bits, cancel)?;
             capture.stage = Stage::Encoder;
             Ok(())
         })
@@ -217,7 +192,7 @@ impl<W: Write> CaptureWriter<W> {
             capture.output.write_all(&[2])?;
             capture.number(rows)?;
             capture.number(capture.layout.encoder_width)?;
-            capture.floats(values, cancel)?;
+            capture.floats(values, Tolerance::Bits, cancel)?;
             capture.audio_rows = rows;
             capture.stage = Stage::Prompt;
             Ok(())
@@ -308,7 +283,7 @@ impl<W: Write> CaptureWriter<W> {
             }
             capture.output.write_all(&[4])?;
             capture.number(snapshot.generation_index)?;
-            capture.floats(snapshot.logits, cancel)?;
+            capture.floats(snapshot.logits, Tolerance::Bits, cancel)?;
             capture.output.write_all(&snapshot.token.to_le_bytes())?;
             capture.number(positions)?;
             capture.number(snapshot.layers.len())?;
@@ -383,51 +358,34 @@ impl<W: Write> CaptureWriter<W> {
         result
     }
 
-    fn number(&mut self, value: usize) -> io::Result<()> {
-        self.output
-            .write_all(&u64::try_from(value).map_err(|_| invalid())?.to_le_bytes())
-    }
-
-    fn digest(&mut self, value: &[u8]) -> io::Result<()> {
-        if value.iter().all(|byte| *byte == 0) {
-            return Err(invalid());
-        }
-        self.output.write_all(value)
-    }
-
-    fn text(&mut self, value: &str) -> io::Result<()> {
-        if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
-            return Err(invalid());
-        }
-        self.number(value.len())?;
-        self.output.write_all(value.as_bytes())
-    }
-
-    fn provider(&mut self, value: &Provider<'_>) -> io::Result<()> {
-        self.digest(&value.revision)?;
-        self.text(value.compiler)?;
-        self.text(value.target)?;
-        self.digest(&value.executable)?;
-        self.text(value.arithmetic)
-    }
-
-    fn floats(&mut self, values: &[f32], cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
-        self.cache_values(CacheValues::F32(values), cancel)
-    }
-
     fn cache_values(
         &mut self,
         values: CacheValues<'_>,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
-        self.number(values.len())?;
-        for start in (0..values.len()).step_by(4096) {
-            check_cancel(cancel)?;
-            for index in start..(start + 4096).min(values.len()) {
-                self.output.write_all(&values.bits(index).to_le_bytes())?;
+        match values {
+            CacheValues::F32(values) => self.floats(values, Tolerance::Bits, cancel),
+            CacheValues::F16(words) => {
+                self.number(words.len())?;
+                for chunk in words.chunks(4096) {
+                    check_cancel(cancel)?;
+                    for &word in chunk {
+                        self.bytes(&bonsai_ternary::half_to_float(word).to_bits().to_le_bytes())?;
+                    }
+                }
+                Ok(())
             }
         }
-        Ok(())
+    }
+}
+
+impl<W: Write> WireSink for CaptureWriter<W> {
+    fn bytes(&mut self, data: &[u8]) -> io::Result<()> {
+        self.output.write_all(data)
+    }
+
+    fn float(&mut self, value: f32, _tolerance: Tolerance, _index: usize) -> io::Result<()> {
+        self.output.write_all(&value.to_le_bytes())
     }
 }
 
