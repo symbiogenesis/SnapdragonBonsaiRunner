@@ -91,14 +91,7 @@ mod tests {
         pinned: bool,
     ) {
         let original = body.to_vec();
-        let head = || AuthorizedHead {
-            length: declared_length,
-            pinned_abliteration: pinned,
-            daisyrose_lora: false,
-            daisyrose_default_scale_tenths: 0,
-            context_tokens: crate::CONTEXT_TOKENS,
-            vision: false,
-        };
+        let head = || AuthorizedHead::test_head(declared_length, pinned);
         let summarize =
             |chat: crate::PendingChat| (chat.body, chat.max_completion_tokens, chat.stream);
         assert_eq!(
@@ -143,15 +136,8 @@ mod tests {
         assert_eq!(
             scratch
                 .prepare(
-                    AuthorizedHead {
-                        length: oversized.len(),
-                        pinned_abliteration: false,
-                        daisyrose_lora: false,
-                        daisyrose_default_scale_tenths: 0,
-                        context_tokens: crate::CONTEXT_TOKENS,
-                        vision: false,
-                    },
-                    &oversized,
+                    AuthorizedHead::test_head(oversized.len(), false),
+                    &oversized
                 )
                 .err(),
             Some(Rejection::BodySize)

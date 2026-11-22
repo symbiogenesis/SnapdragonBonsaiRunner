@@ -48,9 +48,19 @@ fn body_with(scale: &str) -> String {
     )
 }
 
-fn canonical(body: &[u8], enabled: bool) -> Result<Value, Rejection> {
-    let admitted = prepare(body, enabled)?.admit(|_| Ok(1))?;
+fn canonical_with_default(
+    body: &[u8],
+    orca_enabled: bool,
+    daisyrose_enabled: bool,
+    default_tenths: u8,
+) -> Result<Value, Rejection> {
+    let admitted = prepare_with_default(body, orca_enabled, daisyrose_enabled, default_tenths)?
+        .admit(|_| Ok(1))?;
     serde_json::from_slice(admitted.backend_body()).map_err(|_| Rejection::ChatSchema)
+}
+
+fn canonical(body: &[u8], enabled: bool) -> Result<Value, Rejection> {
+    canonical_with_default(body, enabled, false, 0)
 }
 
 #[test]
@@ -128,34 +138,30 @@ fn pinned_abliteration_scale_is_unavailable_without_verified_launch() {
 #[test]
 fn stacked_daisyrose_lora_defaults_to_zero_maps_slot_ids_and_rejects_when_unconfigured()
 -> Result<(), Rejection> {
-    let canonical_with = |body: &[u8], orca: bool, daisy: bool| -> Result<Value, Rejection> {
-        let admitted = prepare_with(body, orca, daisy)?.admit(|_| Ok(1))?;
-        serde_json::from_slice(admitted.backend_body()).map_err(|_| Rejection::ChatSchema)
-    };
-
     // Unconfigured DaisyRose rejects explicit daisyrose_scale.
     let explicit_daisy =
         br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.5}"#;
     assert_eq!(
-        canonical_with(explicit_daisy, true, false).err(),
+        canonical_with_default(explicit_daisy, true, false, 0).err(),
         Some(Rejection::ChatSchema)
     );
     assert_eq!(
-        canonical_with(explicit_daisy, false, false).err(),
+        canonical_with_default(explicit_daisy, false, false, 0).err(),
         Some(Rejection::ChatSchema)
     );
 
     // Both active: Orca id 0 (default 1.3), DaisyRose id 1 (default 0.0).
-    let stacked_default = canonical_with(CHAT, true, true)?;
+    let stacked_default = canonical_with_default(CHAT, true, true, 0)?;
     assert_eq!(
         stacked_default["lora"],
         json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.0}])
     );
 
-    let stacked_explicit = canonical_with(
+    let stacked_explicit = canonical_with_default(
         br#"{"messages":[{"role":"user","content":"Write a scene."}],"abliteration_scale":1.5,"daisyrose_scale":0.5}"#,
         true,
         true,
+        0,
     )?;
     assert_eq!(
         stacked_explicit["lora"],
@@ -163,9 +169,9 @@ fn stacked_daisyrose_lora_defaults_to_zero_maps_slot_ids_and_rejects_when_unconf
     );
 
     // DaisyRose only (no Orca): maps to slot id 0, defaulting to 0.0.
-    let daisy_only = canonical_with(explicit_daisy, false, true)?;
+    let daisy_only = canonical_with_default(explicit_daisy, false, true, 0)?;
     assert_eq!(daisy_only["lora"], json!([{"id": 0, "scale": 0.5}]));
-    let daisy_only_default = canonical_with(CHAT, false, true)?;
+    let daisy_only_default = canonical_with_default(CHAT, false, true, 0)?;
     assert_eq!(daisy_only_default["lora"], json!([{"id": 0, "scale": 0.0}]));
     Ok(())
 }
@@ -173,18 +179,13 @@ fn stacked_daisyrose_lora_defaults_to_zero_maps_slot_ids_and_rejects_when_unconf
 #[test]
 fn stacked_daisyrose_lora_uses_configured_default_scale_and_preserves_explicit_override()
 -> Result<(), Rejection> {
-    let canonical_default = |body: &[u8], orca: bool, tenths: u8| -> Result<Value, Rejection> {
-        let admitted = prepare_with_default(body, orca, true, tenths)?.admit(|_| Ok(1))?;
-        serde_json::from_slice(admitted.backend_body()).map_err(|_| Rejection::ChatSchema)
-    };
-
     // Omitted daisyrose_scale picks up the promoted lock default (1.0).
     assert_eq!(
-        canonical_default(CHAT, true, 10)?["lora"],
+        canonical_with_default(CHAT, true, true, 10)?["lora"],
         json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 1.0}])
     );
     assert_eq!(
-        canonical_default(CHAT, false, 10)?["lora"],
+        canonical_with_default(CHAT, false, true, 10)?["lora"],
         json!([{"id": 0, "scale": 1.0}])
     );
 
@@ -194,15 +195,15 @@ fn stacked_daisyrose_lora_uses_configured_default_scale_and_preserves_explicit_o
     let explicit_half =
         br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.5}"#;
     assert_eq!(
-        canonical_default(explicit_zero, true, 10)?["lora"],
+        canonical_with_default(explicit_zero, true, true, 10)?["lora"],
         json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.0}])
     );
     assert_eq!(
-        canonical_default(explicit_half, true, 10)?["lora"],
+        canonical_with_default(explicit_half, true, true, 10)?["lora"],
         json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}])
     );
     assert_eq!(
-        canonical_default(explicit_zero, false, 10)?["lora"],
+        canonical_with_default(explicit_zero, false, true, 10)?["lora"],
         json!([{"id": 0, "scale": 0.0}])
     );
     Ok(())

@@ -1089,6 +1089,44 @@ struct ChatTemplateKwargs {
 mod abliteration_tests;
 
 #[cfg(test)]
+pub(crate) mod test_util {
+    pub(crate) fn http_json_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    pub(crate) fn http_models_response(
+        model: &serde_json::Value,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        let body = serde_json::to_string(&serde_json::json!({ "data": [model] }))?;
+        Ok(http_json_response(&body))
+    }
+}
+
+#[cfg(all(test, feature = "json-candidate"))]
+impl AuthorizedHead {
+    pub(crate) const fn test_head(length: usize, pinned_abliteration: bool) -> Self {
+        Self {
+            length,
+            pinned_abliteration,
+            daisyrose_lora: false,
+            daisyrose_default_scale_tenths: 0,
+            context_tokens: CONTEXT_TOKENS,
+            vision: false,
+        }
+    }
+
+    pub(crate) const fn with_daisyrose(mut self, default_scale_tenths: u8) -> Self {
+        self.daisyrose_lora = true;
+        self.daisyrose_default_scale_tenths = default_scale_tenths;
+        self
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         ClientChat, ContentPart, Cow, MAX_CONTENT_PARTS, MAX_MESSAGES, Message, MessageContent,

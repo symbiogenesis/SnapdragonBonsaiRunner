@@ -8,14 +8,7 @@ use serde::Serialize;
 use std::{error::Error, hint::black_box, path::PathBuf, time::Instant};
 
 fn canonical(body: &[u8], candidate: bool, pinned: bool) -> Result<Vec<u8>, Rejection> {
-    let head = AuthorizedHead {
-        length: body.len(),
-        pinned_abliteration: pinned,
-        daisyrose_lora: false,
-        daisyrose_default_scale_tenths: 0,
-        context_tokens: crate::CONTEXT_TOKENS,
-        vision: false,
-    };
+    let head = AuthorizedHead::test_head(body.len(), pinned);
     if candidate {
         head.prepare_simd_json(body)
     } else {
@@ -41,17 +34,7 @@ fn reused_canonical(
     scratch: &mut JsonCandidateScratch,
 ) -> Result<Vec<u8>, Rejection> {
     scratch
-        .prepare(
-            AuthorizedHead {
-                length: body.len(),
-                pinned_abliteration: pinned,
-                daisyrose_lora: false,
-                daisyrose_default_scale_tenths: 0,
-                context_tokens: crate::CONTEXT_TOKENS,
-                vision: false,
-            },
-            body,
-        )
+        .prepare(AuthorizedHead::test_head(body.len(), pinned), body)
         .map(|chat| chat.body)
 }
 
@@ -205,14 +188,7 @@ fn fixed_candidate_preserves_serde_scale_lexemes() {
         br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":0.0}"#,
         br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":0.5}"#,
     ] {
-        let head = || AuthorizedHead {
-            length: body.len(),
-            pinned_abliteration: true,
-            daisyrose_lora: true,
-            daisyrose_default_scale_tenths: 10,
-            context_tokens: crate::CONTEXT_TOKENS,
-            vision: false,
-        };
+        let head = || AuthorizedHead::test_head(body.len(), true).with_daisyrose(10);
         assert_eq!(
             head().prepare_simd_json(body).map(|chat| chat.body),
             head().prepare(body).map(|chat| chat.body)

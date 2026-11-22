@@ -608,12 +608,7 @@ mod tests {
     }
 
     fn model_response(model: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
-        let body = serde_json::to_string(&serde_json::json!({"data": [model]}))?;
-        Ok(format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .into_bytes())
+        crate::test_util::http_models_response(model)
     }
 
     fn projection_startup(effective: &str) -> serde_json::Value {
@@ -1505,69 +1500,38 @@ mod context_tests {
         );
         assert_eq!(crate::inference::MMPROJ_SHA256, mmproj.sha256);
 
-        let with_vision = serde_json::json!({"data":[{
-            "id":"Swift-Bonsai-2-PQ2_0", "object":"model",
-            "model_sha256":crate::inference::MODEL_SHA256,
-            "template_sha256":crate::inference::TEMPLATE_SHA256,
-            "runtime":"prism-inference", "context_tokens":8192,
-            "seed":42, "row_workers":1,
-            "vision":true,
-            "mmproj_sha256":crate::inference::MMPROJ_SHA256,
-            "image_max_tokens":1024
-        }]})
-        .to_string();
-        let vision_wire = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{with_vision}",
-            with_vision.len()
-        );
+        let base_model = serde_json::json!({
+            "id": "Swift-Bonsai-2-PQ2_0", "object": "model",
+            "model_sha256": crate::inference::MODEL_SHA256,
+            "template_sha256": crate::inference::TEMPLATE_SHA256,
+            "runtime": "prism-inference", "context_tokens": 8192,
+            "seed": 42, "row_workers": 1,
+        });
+        let mut with_vision = base_model.clone();
+        with_vision["vision"] = serde_json::json!(true);
+        with_vision["mmproj_sha256"] = serde_json::json!(crate::inference::MMPROJ_SHA256);
+        with_vision["image_max_tokens"] = serde_json::json!(1024);
+        let vision_wire = crate::test_util::http_models_response(&with_vision)
+            .map_err(|err| format!("{err:?}"))?;
         let expect_vision = WorkerReadiness {
             vision: true,
             ..WorkerReadiness::for_version("0.1.27", 1)
         };
         let expect_text = WorkerReadiness::for_version("0.1.27", 1);
-        assert!(
-            validate_native_identity(vision_wire.as_bytes(), false, false, expect_vision).is_ok()
-        );
-        assert!(
-            validate_native_identity(vision_wire.as_bytes(), false, false, expect_text).is_err()
-        );
+        assert!(validate_native_identity(&vision_wire, false, false, expect_vision).is_ok());
+        assert!(validate_native_identity(&vision_wire, false, false, expect_text).is_err());
 
-        let mismatched_vision = serde_json::json!({"data":[{
-            "id":"Swift-Bonsai-2-PQ2_0", "object":"model",
-            "model_sha256":crate::inference::MODEL_SHA256,
-            "template_sha256":crate::inference::TEMPLATE_SHA256,
-            "runtime":"prism-inference", "context_tokens":8192,
-            "seed":42, "row_workers":1,
-            "vision":true,
-            "mmproj_sha256":"28e6426fe933262e362bfbe3054f973d9deac116f49e7e342d1a7748b44c1904",
-            "image_max_tokens":1024
-        }]})
-        .to_string();
-        let mismatched_wire = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{mismatched_vision}",
-            mismatched_vision.len()
-        );
-        assert!(
-            validate_native_identity(mismatched_wire.as_bytes(), false, false, expect_vision)
-                .is_err()
-        );
+        let mut mismatched_vision = with_vision;
+        mismatched_vision["mmproj_sha256"] =
+            serde_json::json!("28e6426fe933262e362bfbe3054f973d9deac116f49e7e342d1a7748b44c1904");
+        let mismatched_wire = crate::test_util::http_models_response(&mismatched_vision)
+            .map_err(|err| format!("{err:?}"))?;
+        assert!(validate_native_identity(&mismatched_wire, false, false, expect_vision).is_err());
 
-        let text_body = serde_json::json!({"data":[{
-            "id":"Swift-Bonsai-2-PQ2_0", "object":"model",
-            "model_sha256":crate::inference::MODEL_SHA256,
-            "template_sha256":crate::inference::TEMPLATE_SHA256,
-            "runtime":"prism-inference", "context_tokens":8192,
-            "seed":42, "row_workers":1
-        }]})
-        .to_string();
-        let text_wire = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text_body}",
-            text_body.len()
-        );
-        assert!(validate_native_identity(text_wire.as_bytes(), false, false, expect_text).is_ok());
-        assert!(
-            validate_native_identity(text_wire.as_bytes(), false, false, expect_vision).is_err()
-        );
+        let text_wire = crate::test_util::http_models_response(&base_model)
+            .map_err(|err| format!("{err:?}"))?;
+        assert!(validate_native_identity(&text_wire, false, false, expect_text).is_ok());
+        assert!(validate_native_identity(&text_wire, false, false, expect_vision).is_err());
         Ok(())
     }
 
@@ -1930,12 +1894,20 @@ mod context_tests {
             Err(NativeIdentityError::StartupProjection)
         );
 
+        let assert_mutated_err = |model: &serde_json::Value,
+                                  policy: WorkerReadiness<'_>,
+                                  expected: NativeIdentityError|
+         -> Result<(), String> {
+            assert_eq!(
+                validate_native_identity_detailed(&wire(model)?, false, true, policy),
+                Err(expected)
+            );
+            Ok(())
+        };
+
         let mut wrong_vision = default_model.clone();
         wrong_vision["vision"] = json!(false);
-        assert_eq!(
-            validate_native_identity_detailed(&wire(&wrong_vision)?, false, true, default_policy),
-            Err(NativeIdentityError::Vision)
-        );
+        assert_mutated_err(&wrong_vision, default_policy, NativeIdentityError::Vision)?;
 
         let daisy_sha = "cd".repeat(32);
         let mut daisy_model = default_model.clone();
@@ -1959,16 +1931,10 @@ mod context_tests {
             validate_native_identity_detailed(&wire(&daisy_model)?, false, true, daisy_policy)
                 .is_ok()
         );
-        assert_eq!(
-            validate_native_identity_detailed(&wire(&daisy_model)?, false, true, default_policy),
-            Err(NativeIdentityError::Adapter)
-        );
+        assert_mutated_err(&daisy_model, default_policy, NativeIdentityError::Adapter)?;
         let mut wrong_rank = daisy_model.clone();
         wrong_rank["daisyrose_adapter_max_rank"] = json!(8);
-        assert_eq!(
-            validate_native_identity_detailed(&wire(&wrong_rank)?, false, true, daisy_policy),
-            Err(NativeIdentityError::Adapter)
-        );
+        assert_mutated_err(&wrong_rank, daisy_policy, NativeIdentityError::Adapter)?;
         let mut wrong_scale_identity = daisy_model;
         wrong_scale_identity["startup_graph_identity"] = json!(
             wrong_scale_identity["startup_graph_identity"]
@@ -1976,15 +1942,11 @@ mod context_tests {
                 .ok_or("missing identity")?
                 .replace(":00000000", ":3f000000")
         );
-        assert_eq!(
-            validate_native_identity_detailed(
-                &wire(&wrong_scale_identity)?,
-                false,
-                true,
-                daisy_policy
-            ),
-            Err(NativeIdentityError::KvCacheGraph)
-        );
+        assert_mutated_err(
+            &wrong_scale_identity,
+            daisy_policy,
+            NativeIdentityError::KvCacheGraph,
+        )?;
 
         Ok(())
     }
