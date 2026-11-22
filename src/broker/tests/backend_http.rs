@@ -6,95 +6,34 @@
 )]
 
 use bonsai_broker::{
-    AdmittedChat, MAX_HEADER_BYTES, MAX_HEADERS, PendingChat, Rejection, RequestPolicy,
+    AdmittedChat, MAX_HEADER_BYTES, MAX_HEADERS, PendingChat, Rejection,
     backend::{BackendError, BackendPolicy, count_and_admit, request_chat},
     response::MAX_RESPONSE_BYTES,
 };
-use http::{Request, Version};
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    io,
-    pin::Pin,
-    rc::Rc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{collections::BTreeMap, io, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
-    time::{Instant, Sleep, sleep, timeout},
+    io::AsyncReadExt,
+    time::{Instant, timeout},
 };
 
 mod support;
-use support::{BACKEND_KEY, CLIENT_KEY, deadline, run};
+use support::{
+    BACKEND_KEY, CLIENT_KEY, COUNT_BODY as COUNT, MockStream as Stream, backend_policy as policy,
+    deadline, http_chunked_response as chunked_response, http_length_response as length_response,
+    pending_chat, run,
+};
 
-const COUNT: &[u8] = br#"{"input_tokens":100,"object":"response.input_tokens"}"#;
 const CONTEXT_ERROR: &[u8] = br#"{"error":{"code":"context_length_exceeded"}}"#;
-
-fn policy() -> BackendPolicy {
-    BackendPolicy::new(8081, BACKEND_KEY).unwrap()
-}
 
 fn pending(stream: bool) -> PendingChat {
     let body = format!(
         r#"{{"messages":[{{"role":"user","content":"A scene.\nKeep rain & snow ☃."}}],"max_completion_tokens":128,"stream":{stream}}}"#
     );
-    let head = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .version(Version::HTTP_11)
-        .header("host", "127.0.0.1:8080")
-        .header("origin", "http://127.0.0.1:8080")
-        .header("authorization", format!("Bearer {CLIENT_KEY}"))
-        .header("content-type", "application/json")
-        .header("content-length", body.len())
-        .body(())
-        .unwrap()
-        .into_parts()
-        .0;
-    RequestPolicy::new(8080, CLIENT_KEY)
-        .unwrap()
-        .check_head(&head)
-        .unwrap()
-        .prepare(body.as_bytes())
-        .unwrap()
+    pending_chat(body.as_bytes())
 }
 
 fn admitted(stream: bool) -> AdmittedChat {
     pending(stream).admit(|_| Ok(100)).unwrap()
-}
-
-fn length_response(body: &[u8], stream: bool) -> Vec<u8> {
-    let mut bytes = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
-        if stream {
-            "text/event-stream"
-        } else {
-            "application/json"
-        },
-        body.len()
-    )
-    .into_bytes();
-    bytes.extend_from_slice(body);
-    bytes
-}
-
-fn chunked_response(body: &[u8], stream: bool) -> Vec<u8> {
-    let mut bytes = chunked_head(stream);
-    bytes.extend_from_slice(body);
-    bytes
-}
-
-fn chunked_head(stream: bool) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\n\r\n",
-        if stream {
-            "text/event-stream"
-        } else {
-            "application/json"
-        }
-    )
-    .into_bytes()
 }
 
 fn context_response(body: &[u8], chunked: bool) -> Vec<u8> {
@@ -114,157 +53,6 @@ fn context_response(body: &[u8], chunked: bool) -> Vec<u8> {
         bytes.extend_from_slice(body);
     }
     bytes
-}
-
-#[derive(Default)]
-struct State {
-    read_polls: usize,
-    read_bytes: usize,
-    largest_read: usize,
-    write_polls: usize,
-    written: Vec<u8>,
-    flushes: usize,
-    dropped: bool,
-}
-
-// Owned, non-Send full-duplex fixture. All data and stalls are deterministic;
-// no socket, listener, background task or native process is needed.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent fault-injection switches exercise each I/O failure mode"
-)]
-struct Stream {
-    input: Vec<u8>,
-    position: usize,
-    fragment: usize,
-    stall_after_input: bool,
-    fail_read_after_input: bool,
-    read_delay: Option<Duration>,
-    read_timer: Option<Pin<Box<Sleep>>>,
-    write_fragment: usize,
-    write_delay: Option<Duration>,
-    write_timer: Option<Pin<Box<Sleep>>>,
-    stall_write: bool,
-    fail_write: bool,
-    zero_write: bool,
-    stall_flush: bool,
-    fail_flush: bool,
-    state: Rc<RefCell<State>>,
-}
-
-impl Stream {
-    fn new(input: impl Into<Vec<u8>>, fragment: usize) -> Self {
-        Self {
-            input: input.into(),
-            position: 0,
-            fragment,
-            stall_after_input: false,
-            fail_read_after_input: false,
-            read_delay: None,
-            read_timer: None,
-            write_fragment: usize::MAX,
-            write_delay: None,
-            write_timer: None,
-            stall_write: false,
-            fail_write: false,
-            zero_write: false,
-            stall_flush: false,
-            fail_flush: false,
-            state: Rc::new(RefCell::new(State::default())),
-        }
-    }
-}
-
-impl AsyncRead for Stream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        {
-            let mut state = self.state.borrow_mut();
-            state.read_polls += 1;
-            state.largest_read = state.largest_read.max(buffer.remaining());
-        }
-        if let Some(delay) = self.read_delay {
-            let timer = self
-                .read_timer
-                .get_or_insert_with(|| Box::pin(sleep(delay)));
-            if timer.as_mut().poll(cx).is_pending() {
-                return Poll::Pending;
-            }
-            self.read_timer = None;
-        }
-        if self.position == self.input.len() && self.fail_read_after_input {
-            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
-        }
-        if self.position == self.input.len() && self.stall_after_input {
-            return Poll::Pending;
-        }
-        let count = buffer
-            .remaining()
-            .min(self.fragment)
-            .min(self.input.len() - self.position);
-        buffer.put_slice(&self.input[self.position..self.position + count]);
-        self.position += count;
-        self.state.borrow_mut().read_bytes += count;
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncWrite for Stream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.state.borrow_mut().write_polls += 1;
-        if self.fail_write {
-            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-        }
-        if self.zero_write {
-            return Poll::Ready(Ok(0));
-        }
-        if self.stall_write {
-            return Poll::Pending;
-        }
-        if let Some(delay) = self.write_delay {
-            let timer = self
-                .write_timer
-                .get_or_insert_with(|| Box::pin(sleep(delay)));
-            if timer.as_mut().poll(cx).is_pending() {
-                return Poll::Pending;
-            }
-            self.write_timer = None;
-        }
-        let count = self.write_fragment.min(bytes.len());
-        self.state
-            .borrow_mut()
-            .written
-            .extend_from_slice(&bytes[..count]);
-        Poll::Ready(Ok(count))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.state.borrow_mut().flushes += 1;
-        if self.fail_flush {
-            Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
-        } else if self.stall_flush {
-            Poll::Pending
-        } else {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl Drop for Stream {
-    fn drop(&mut self) {
-        self.state.borrow_mut().dropped = true;
-    }
 }
 
 fn request_parts<'a>(bytes: &'a [u8], path: &str) -> (BTreeMap<String, String>, &'a [u8]) {
@@ -646,7 +434,7 @@ fn body_read_errors_close_the_stream_immediately_and_remain_sticky() {
             chunked_response(b"1\r\n", false),
         ] {
             let mut backend = Stream::new(input, usize::MAX);
-            backend.fail_read_after_input = true;
+            backend.fail_read_after_input = Some(io::ErrorKind::ConnectionReset);
             let state = backend.state.clone();
             let mut body = request_chat(backend, &admitted(false), &policy(), deadline())
                 .await

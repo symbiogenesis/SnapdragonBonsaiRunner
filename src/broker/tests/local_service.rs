@@ -18,29 +18,23 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    task::{JoinHandle, LocalSet, spawn_local},
+    task::{JoinHandle, spawn_local},
     time::{Instant, timeout},
 };
 
-const FRONT_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const BACK_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+mod support;
+use support::{
+    BACKEND_KEY as BACK_KEY, CLIENT_KEY as FRONT_KEY, http_post_request,
+    loopback_listener as listener, read_http_request as read_request, run_local_timeout,
+    serve_count_once as count, write_json_response as respond,
+};
 
 fn run(test: impl Future<Output = ()>) {
     run_with_timeout(test, Duration::from_secs(10));
 }
 
 fn run_with_timeout(test: impl Future<Output = ()>, limit: Duration) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(LocalSet::new().run_until(async {
-            timeout(limit, test).await.unwrap();
-        }));
-}
-
-async fn listener() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0").await.unwrap()
+    run_local_timeout(limit, test);
 }
 
 async fn service(backend: &TcpListener, waiting: usize) -> Arc<LocalChatService> {
@@ -81,12 +75,8 @@ async fn send_request(client: &mut TcpStream, port: u16) {
 }
 
 async fn send_body(client: &mut TcpStream, port: u16, body: &[u8]) {
-    let head = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nAuthorization: Bearer {FRONT_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
-    client.write_all(head.as_bytes()).await.unwrap();
-    client.write_all(body).await.unwrap();
+    let bytes = http_post_request(port, FRONT_KEY, Some(port), body);
+    client.write_all(&bytes).await.unwrap();
 }
 
 #[test]
@@ -324,49 +314,6 @@ fn control_token_rejection_never_contacts_backend_and_keeps_service_ready() {
         let counted: serde_json::Value = serde_json::from_slice(&count_body).unwrap();
         assert_eq!(counted["messages"][0]["content"], "A rainy scene.");
     });
-}
-
-async fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
-    let mut raw = Vec::new();
-    loop {
-        assert!(raw.len() <= 2 * 1024 * 1024);
-        let mut buffer = [0; 4096];
-        let count = stream.read(&mut buffer).await.unwrap();
-        assert_ne!(count, 0);
-        raw.extend_from_slice(&buffer[..count]);
-        if let Some(end) = raw.array_windows().position(|part| part == b"\r\n\r\n") {
-            let head = String::from_utf8(raw[..end + 4].to_vec()).unwrap();
-            let length: usize = head
-                .lines()
-                .find_map(|line| line.strip_prefix("Content-Length: "))
-                .unwrap()
-                .parse()
-                .unwrap();
-            if raw.len() >= end + 4 + length {
-                return (head, raw[end + 4..end + 4 + length].to_vec());
-            }
-        }
-    }
-}
-
-async fn respond(stream: &mut TcpStream, body: &[u8]) {
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes()).await.unwrap();
-    stream.write_all(body).await.unwrap();
-}
-
-async fn count(listener: &TcpListener) -> (String, Vec<u8>) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let request = read_request(&mut stream).await;
-    respond(
-        &mut stream,
-        br#"{"input_tokens":100,"object":"response.input_tokens"}"#,
-    )
-    .await;
-    request
 }
 
 struct Generating {

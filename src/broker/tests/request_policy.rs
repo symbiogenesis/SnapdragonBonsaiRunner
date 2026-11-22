@@ -10,31 +10,12 @@ use bonsai_broker::{
     MAX_MULTIMODAL_BODY_BYTES, MAX_REQUEST_IMAGES, MODEL_ALIAS, PendingChat, Rejection,
     RequestPolicy, TEMPLATE_MARGIN_TOKENS,
 };
-use http::{HeaderValue, Method, Request, Version, request::Parts};
+use http::{HeaderValue, Method, Version, request::Parts};
 
-// Synthetic fixture only: production randomness/private storage is a later gate.
-const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+mod support;
+use support::{CLIENT_KEY as KEY, chat_head as head, chat_policy as policy};
+
 const CHAT: &[u8] = br#"{"messages":[{"role":"user","content":"Draft a scene with rain."}]}"#;
-
-fn policy() -> RequestPolicy {
-    RequestPolicy::new(8080, KEY).unwrap()
-}
-
-fn head(size: usize) -> Parts {
-    Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .version(Version::HTTP_11)
-        .header("host", "127.0.0.1:8080")
-        .header("origin", "http://127.0.0.1:8080")
-        .header("authorization", format!("Bearer {KEY}"))
-        .header("content-type", "application/json")
-        .header("content-length", size.to_string())
-        .body(())
-        .unwrap()
-        .into_parts()
-        .0
-}
 
 fn prepare(body: &[u8]) -> Result<PendingChat, Rejection> {
     let authorized = policy().check_head(&head(body.len()))?;

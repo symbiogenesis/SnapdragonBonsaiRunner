@@ -6,7 +6,7 @@
 )]
 
 use bonsai_broker::{
-    Rejection, RequestPolicy,
+    Rejection,
     backend::{BackendError, BackendPolicy},
     deadline::RequestDeadline,
     supervisor::{BackendConnector, ServeError, serve_chat},
@@ -23,16 +23,17 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
-    time::{Instant, Sleep, sleep_until},
+    time::{Instant, sleep_until},
 };
 
 mod support;
-use support::{BACKEND_KEY, CLIENT_KEY, deadline, run};
+use support::{
+    BACKEND_KEY, CLIENT_KEY, COUNT_BODY as COUNT, MockStream as BackendStream, backend_policy,
+    chat_policy as policy, deadline, http_length_response as response, http_post_request, run,
+};
 
-const COUNT: &[u8] = br#"{"input_tokens":100,"object":"response.input_tokens"}"#;
-
-fn policy() -> RequestPolicy {
-    RequestPolicy::new(8080, CLIENT_KEY).unwrap()
+fn request_body(body: &[u8]) -> Vec<u8> {
+    http_post_request(8080, CLIENT_KEY, None, body)
 }
 
 fn request(stream: bool) -> Vec<u8> {
@@ -40,16 +41,6 @@ fn request(stream: bool) -> Vec<u8> {
         r#"{{"messages":[{{"role":"user","content":"Keep the rain.\nKeep the voice."}}],"max_completion_tokens":128,"stream":{stream}}}"#
     );
     request_body(body.as_bytes())
-}
-
-fn request_body(body: &[u8]) -> Vec<u8> {
-    let mut bytes = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer {CLIENT_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    bytes.extend_from_slice(body);
-    bytes
 }
 
 fn assert_error_reply(bytes: &[u8], status: &str, code: &str) {
@@ -66,110 +57,6 @@ fn assert_error_reply(bytes: &[u8], status: &str, code: &str) {
     assert!(!wire.contains("private diagnostic") && !wire.contains("Keep the rain"));
 }
 
-fn response(body: &[u8], stream: bool) -> Vec<u8> {
-    let mut bytes = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
-        if stream {
-            "text/event-stream"
-        } else {
-            "application/json"
-        },
-        body.len()
-    )
-    .into_bytes();
-    bytes.extend_from_slice(body);
-    bytes
-}
-
-#[derive(Default)]
-struct State {
-    written: Vec<u8>,
-    reads: usize,
-    dropped: bool,
-}
-
-struct BackendStream {
-    input: Vec<u8>,
-    offset: usize,
-    stall: bool,
-    delayed: Option<(usize, Pin<Box<Sleep>>)>,
-    state: Rc<RefCell<State>>,
-}
-
-impl BackendStream {
-    fn new(input: Vec<u8>) -> Self {
-        Self {
-            input,
-            offset: 0,
-            stall: false,
-            delayed: None,
-            state: Rc::new(RefCell::new(State::default())),
-        }
-    }
-
-    fn stalled() -> Self {
-        let mut stream = Self::new(Vec::new());
-        stream.stall = true;
-        stream
-    }
-}
-
-impl AsyncRead for BackendStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        self.state.borrow_mut().reads += 1;
-        let offset = self.offset;
-        let remaining_before_delay = match &mut self.delayed {
-            Some((after, timer)) if offset >= *after => {
-                if timer.as_mut().poll(cx).is_pending() {
-                    return Poll::Pending;
-                }
-                usize::MAX
-            }
-            Some((after, _)) => *after - offset,
-            None => usize::MAX,
-        };
-        let count = buffer
-            .remaining()
-            .min(self.input.len() - self.offset)
-            .min(remaining_before_delay);
-        if count == 0 && self.stall {
-            return Poll::Pending;
-        }
-        buffer.put_slice(&self.input[self.offset..self.offset + count]);
-        self.offset += count;
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncWrite for BackendStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.state.borrow_mut().written.extend_from_slice(bytes);
-        Poll::Ready(Ok(bytes.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl Drop for BackendStream {
-    fn drop(&mut self) {
-        self.state.borrow_mut().dropped = true;
-    }
-}
-
 struct Connector {
     policy: BackendPolicy,
     streams: RefCell<VecDeque<BackendStream>>,
@@ -180,7 +67,7 @@ struct Connector {
 impl Connector {
     fn new(streams: impl IntoIterator<Item = BackendStream>) -> Self {
         Self {
-            policy: BackendPolicy::new(8081, BACKEND_KEY).unwrap(),
+            policy: backend_policy(),
             streams: RefCell::new(streams.into_iter().collect()),
             calls: Cell::new(0),
             stall_connect: false,
@@ -300,8 +187,8 @@ async fn response_head(peer: &mut DuplexStream) {
 #[test]
 fn canonical_count_and_generation_share_body_and_drop_streams() {
     run(async {
-        let counter = BackendStream::new(response(COUNT, false));
-        let generation = BackendStream::new(response(br#"{"choices":[]}"#, false));
+        let counter = BackendStream::full(response(COUNT, false));
+        let generation = BackendStream::full(response(br#"{"choices":[]}"#, false));
         let count_state = counter.state.clone();
         let generation_state = generation.state.clone();
         let backend = Connector::new([counter, generation]);
@@ -367,7 +254,7 @@ fn rejected_count_never_connects_generation() {
                 false,
             ),
         ] {
-            let counter = BackendStream::new(response(body, false));
+            let counter = BackendStream::full(response(body, false));
             let state = counter.state.clone();
             let backend = Connector::new([counter]);
             let (client, mut peer, dropped) = clients();
@@ -420,7 +307,7 @@ fn typed_private_context_rejection_sends_only_sanitized_public_admission_error()
                 let bytes = format!(
                     "HTTP/1.1 413 Content Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nSet-Cookie: private-data\r\n\r\n{body}",body.len()
                 ).into_bytes();
-                let counter = BackendStream::new(bytes);
+                let counter = BackendStream::full(bytes);
                 let state = counter.state.clone();
                 let backend = Connector::new([counter]);
                 let (client, mut peer, dropped) = clients();
@@ -528,13 +415,13 @@ fn backend_failures_before_response_report_counting_or_generation_stage() {
         for (streams, calls, error, code) in [
             (vec![], 1, BackendError::Io, "backend_token_count_failed"),
             (
-                vec![BackendStream::new(private.to_vec())],
+                vec![BackendStream::full(private.to_vec())],
                 1,
                 BackendError::Metadata,
                 "backend_token_count_failed",
             ),
             (
-                vec![BackendStream::new(response(
+                vec![BackendStream::full(response(
                     br#"{"private diagnostic":1}"#,
                     false,
                 ))],
@@ -543,15 +430,15 @@ fn backend_failures_before_response_report_counting_or_generation_stage() {
                 "backend_token_count_failed",
             ),
             (
-                vec![BackendStream::new(response(COUNT, false))],
+                vec![BackendStream::full(response(COUNT, false))],
                 2,
                 BackendError::Io,
                 "backend_generation_failed",
             ),
             (
                 vec![
-                    BackendStream::new(response(COUNT, false)),
-                    BackendStream::new(private.to_vec()),
+                    BackendStream::full(response(COUNT, false)),
+                    BackendStream::full(private.to_vec()),
                 ],
                 2,
                 BackendError::Metadata,
@@ -559,8 +446,8 @@ fn backend_failures_before_response_report_counting_or_generation_stage() {
             ),
             (
                 vec![
-                    BackendStream::new(response(COUNT, false)),
-                    BackendStream::new(b"private diagnostic\r\n\r\n".to_vec()),
+                    BackendStream::full(response(COUNT, false)),
+                    BackendStream::full(b"private diagnostic\r\n\r\n".to_vec()),
                 ],
                 2,
                 BackendError::WireSyntax,
@@ -660,8 +547,8 @@ fn backend_failure_diagnostics_preserve_stage_and_redact_private_values() {
 #[test]
 fn truncated_generation_does_not_append_an_admission_error() {
     run(async {
-        let counter = BackendStream::new(response(COUNT, false));
-        let generation = BackendStream::new(
+        let counter = BackendStream::full(response(COUNT, false));
+        let generation = BackendStream::full(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10\r\n\r\npartial".to_vec(),
         );
         let state = generation.state.clone();
@@ -704,7 +591,7 @@ fn disconnect_during_count_drops_backend_and_client() {
         let (result, ()) = both(serve_chat(client, &policy, &backend, deadline()), async {
             peer.write_all(&request(false)).await.unwrap();
             tokio::task::yield_now().await;
-            assert!(state.borrow().reads > 0);
+            assert!(state.borrow().read_polls > 0);
             peer.shutdown().await.unwrap();
         })
         .await;
@@ -718,9 +605,9 @@ fn disconnect_during_count_drops_backend_and_client() {
 fn disconnect_or_surplus_during_generation_drops_backend() {
     run(async {
         for surplus in [false, true] {
-            let counter = BackendStream::new(response(COUNT, false));
-            let mut generation = BackendStream::new(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\n\r\n".to_vec());
-            generation.stall = true;
+            let counter = BackendStream::full(response(COUNT, false));
+            let mut generation = BackendStream::full(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\n\r\n".to_vec());
+            generation.stall_after_input = true;
             let state = generation.state.clone();
             let backend = Connector::new([counter, generation]);
             let (client, mut peer, dropped) = clients();
@@ -764,11 +651,11 @@ fn untimed_generation_accepts_delayed_headers_and_body_with_virtual_time() {
                 };
                 let start = Instant::now();
                 let delay = Duration::from_mins(11);
-                let mut generation = BackendStream::new(wire);
-                generation.delayed = Some((after, Box::pin(sleep_until(start + delay))));
+                let mut generation = BackendStream::full(wire);
+                generation.delayed_after = Some((after, Box::pin(sleep_until(start + delay))));
                 let state = generation.state.clone();
                 let backend =
-                    Connector::new([BackendStream::new(response(COUNT, false)), generation]);
+                    Connector::new([BackendStream::full(response(COUNT, false)), generation]);
                 let (client, mut peer, dropped) = clients();
                 let policy = policy();
                 let (result, bytes) = both(

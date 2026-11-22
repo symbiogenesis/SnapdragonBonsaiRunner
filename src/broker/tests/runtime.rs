@@ -23,25 +23,21 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    task::{LocalSet, spawn_local},
-    time::timeout,
+    task::spawn_local,
 };
 
-const FRONT_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const BACK_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+mod support;
+use support::{
+    BACKEND_KEY as BACK_KEY, CLIENT_KEY as FRONT_KEY, http_post_request, loopback_listener,
+    read_http_request, run_local_timeout, write_json_response as respond,
+};
 
 fn check(test: impl Future<Output = ()>) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(LocalSet::new().run_until(async {
-            timeout(Duration::from_secs(10), test).await.unwrap();
-        }));
+    run_local_timeout(Duration::from_secs(10), test);
 }
 
 async fn setup(waiting: usize) -> (TcpListener, Arc<LocalChatService>) {
-    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = loopback_listener().await;
     let service = LocalChatService::bind(
         0,
         FRONT_KEY,
@@ -57,45 +53,15 @@ async fn setup(waiting: usize) -> (TcpListener, Arc<LocalChatService>) {
 async fn request(port: u16) -> TcpStream {
     let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let body = br#"{"messages":[{"role":"user","content":"A scene."}],"stream":false}"#;
-    let head = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {FRONT_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
-    client.write_all(head.as_bytes()).await.unwrap();
-    client.write_all(body).await.unwrap();
+    client
+        .write_all(&http_post_request(port, FRONT_KEY, None, body))
+        .await
+        .unwrap();
     client
 }
 
 async fn backend_request(stream: &mut TcpStream) {
-    let mut bytes = Vec::new();
-    loop {
-        let mut buffer = [0; 4096];
-        let size = stream.read(&mut buffer).await.unwrap();
-        assert_ne!(size, 0);
-        bytes.extend_from_slice(&buffer[..size]);
-        assert!(bytes.len() < 16 * 1024);
-        if let Some(end) = bytes.array_windows().position(|part| part == b"\r\n\r\n") {
-            let head = std::str::from_utf8(&bytes[..end]).unwrap();
-            let length: usize = head
-                .lines()
-                .find_map(|line| line.strip_prefix("Content-Length: "))
-                .unwrap()
-                .parse()
-                .unwrap();
-            if bytes.len() >= end + 4 + length {
-                return;
-            }
-        }
-    }
-}
-
-async fn respond(stream: &mut TcpStream, body: &[u8]) {
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes()).await.unwrap();
-    stream.write_all(body).await.unwrap();
+    let _ = read_http_request(stream).await;
 }
 
 async fn assert_client_closed(client: &mut TcpStream) {

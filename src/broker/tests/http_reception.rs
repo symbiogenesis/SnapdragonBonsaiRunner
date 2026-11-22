@@ -7,7 +7,6 @@
 
 use bonsai_broker::{
     MAX_BODY_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, MAX_MULTIMODAL_BODY_BYTES, Rejection,
-    RequestPolicy,
     reception::{HEADER_TIMEOUT, INTAKE_TIMEOUT, ReceiveError, receive_chat},
 };
 use std::{
@@ -23,17 +22,13 @@ use tokio::{
 };
 
 mod support;
-use support::{CLIENT_KEY as KEY, deadline, run};
+use support::{CLIENT_KEY as KEY, chat_policy as policy, deadline, run};
 
 // Literal JSON whitespace newlines must never be inspected as HTTP head bytes.
 const CHAT: &[u8] = br#"{
     "messages":[{"role":"user","content":"Draft a scene.\nKeep the rain."}],
     "max_completion_tokens":128
 }"#;
-
-fn policy() -> RequestPolicy {
-    RequestPolicy::new(8080, KEY).unwrap()
-}
 
 fn head(length: usize, extra: &str) -> String {
     format!(

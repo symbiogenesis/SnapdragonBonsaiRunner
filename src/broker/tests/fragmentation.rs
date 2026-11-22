@@ -6,7 +6,6 @@
 )]
 
 use bonsai_broker::{
-    RequestPolicy,
     backend::{BackendError, BackendPolicy},
     response::ResponseError,
     supervisor::{BackendConnector, ServeError, serve_chat},
@@ -26,9 +25,8 @@ use tokio::{
 };
 
 mod support;
-use support::{BACKEND_KEY, CLIENT_KEY, run};
+use support::{BACKEND_KEY, CLIENT_KEY, COUNT_BODY as COUNT, chat_policy, http_post_request, run};
 
-const COUNT: &[u8] = br#"{"input_tokens":100,"object":"response.input_tokens"}"#;
 const TEXT: &str = "Keep rain, snow ☃, and the voice.\nNext line.";
 const JSON: &[u8] = "{\"choices\":[{\"text\":\"rain ☃\"}]}".as_bytes();
 const SSE: &[u8] = "data: {\"text\":\"rain ☃\"}\n\ndata: [DONE]\n\n".as_bytes();
@@ -40,13 +38,7 @@ fn request(stream: bool) -> Vec<u8> {
         "stream": stream,
     }))
     .unwrap();
-    let mut bytes = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer {CLIENT_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    bytes.extend(body);
-    bytes
+    http_post_request(8080, CLIENT_KEY, None, &body)
 }
 
 fn response(body: &[u8], streaming: bool, chunked: bool) -> Vec<u8> {
@@ -278,7 +270,7 @@ impl Exchange {
         let start = Instant::now();
         let result = serve_chat(
             self.client,
-            &RequestPolicy::new(8080, CLIENT_KEY).unwrap(),
+            &chat_policy(),
             &self.backend,
             start + Duration::from_secs(1),
         )

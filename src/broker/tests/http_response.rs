@@ -6,13 +6,13 @@
 )]
 
 use bonsai_broker::{
-    AdmittedChat, RequestPolicy,
+    AdmittedChat,
     response::{
         CLIENT_WRITE_TIMEOUT, MAX_RESPONSE_BYTES, RESPONSE_BUFFER_BYTES, ResponseError,
         send_chat_response,
     },
 };
-use http::{HeaderValue, Request, Response, Version};
+use http::{HeaderValue, Response};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -23,222 +23,21 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    time::{Instant, Sleep, sleep, timeout},
+    io::{AsyncRead, ReadBuf},
+    time::{Instant, timeout},
 };
 
 mod support;
-use support::{CLIENT_KEY as KEY, deadline, run};
+use support::{MockStream as Backend, MockStreamState, admitted_chat, deadline, run};
 
 fn admitted(stream: bool) -> AdmittedChat {
     let body =
         format!(r#"{{"messages":[{{"role":"user","content":"A scene."}}],"stream":{stream}}}"#);
-    let head = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .version(Version::HTTP_11)
-        .header("host", "127.0.0.1:8080")
-        .header("authorization", format!("Bearer {KEY}"))
-        .header("content-type", "application/json")
-        .header("content-length", body.len())
-        .body(())
-        .unwrap()
-        .into_parts()
-        .0;
-    RequestPolicy::new(8080, KEY)
-        .unwrap()
-        .check_head(&head)
-        .unwrap()
-        .prepare(body.as_bytes())
-        .unwrap()
-        .admit(|_| Ok(100))
-        .unwrap()
+    admitted_chat(body.as_bytes())
 }
 
-#[derive(Default)]
-struct ReadState {
-    consumed: usize,
-    polls: usize,
-    largest_buffer: usize,
-    dropped: bool,
-}
-
-// A decoder fixture: an error after payload means HTTP framing was truncated,
-// while an empty successful read means the decoder verified clean message EOF.
-struct Backend {
-    bytes: Vec<u8>,
-    position: usize,
-    fragment: usize,
-    fail_at_end: bool,
-    stall_at_end: bool,
-    delay: Option<Duration>,
-    timer: Option<Pin<Box<Sleep>>>,
-    state: Rc<RefCell<ReadState>>,
-}
-
-impl Backend {
-    fn new(bytes: impl Into<Vec<u8>>, fragment: usize) -> Self {
-        Self {
-            bytes: bytes.into(),
-            position: 0,
-            fragment,
-            fail_at_end: false,
-            stall_at_end: false,
-            delay: None,
-            timer: None,
-            state: Rc::new(RefCell::new(ReadState::default())),
-        }
-    }
-}
-
-impl AsyncRead for Backend {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        {
-            let mut state = self.state.borrow_mut();
-            state.polls += 1;
-            state.largest_buffer = state.largest_buffer.max(buffer.remaining());
-        }
-        if let Some(delay) = self.delay {
-            let timer = self.timer.get_or_insert_with(|| Box::pin(sleep(delay)));
-            if timer.as_mut().poll(cx).is_pending() {
-                return Poll::Pending;
-            }
-            self.timer = None;
-        }
-        if self.position == self.bytes.len() {
-            return if self.fail_at_end {
-                Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)))
-            } else if self.stall_at_end {
-                Poll::Pending
-            } else {
-                Poll::Ready(Ok(()))
-            };
-        }
-        let count = buffer
-            .remaining()
-            .min(self.fragment)
-            .min(self.bytes.len() - self.position);
-        buffer.put_slice(&self.bytes[self.position..self.position + count]);
-        self.position += count;
-        self.state.borrow_mut().consumed += count;
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl Drop for Backend {
-    fn drop(&mut self) {
-        self.state.borrow_mut().dropped = true;
-    }
-}
-
-#[derive(Default)]
-struct WriteState {
-    bytes: Vec<u8>,
-    write_polls: usize,
-    flushes: Vec<usize>,
-    shutdowns: usize,
-    dropped: bool,
-}
-
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent fault-injection switches exercise each I/O failure mode"
-)]
-struct Client {
-    state: Rc<RefCell<WriteState>>,
-    fragment: usize,
-    zero_write: bool,
-    fail_write: bool,
-    fail_flush: bool,
-    stall_flush: bool,
-    stall_shutdown: bool,
-    body_write_delay: Option<Duration>,
-    timer: Option<Pin<Box<Sleep>>>,
-}
-
-impl Client {
-    fn new(fragment: usize) -> Self {
-        Self {
-            state: Rc::new(RefCell::new(WriteState::default())),
-            fragment,
-            zero_write: false,
-            fail_write: false,
-            fail_flush: false,
-            stall_flush: false,
-            stall_shutdown: false,
-            body_write_delay: None,
-            timer: None,
-        }
-    }
-}
-
-impl AsyncWrite for Client {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.state.borrow_mut().write_polls += 1;
-        if self.fail_write {
-            return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
-        }
-        if self.zero_write {
-            return Poll::Ready(Ok(0));
-        }
-        if let Some(delay) = self.body_write_delay {
-            let in_body = self
-                .state
-                .borrow()
-                .bytes
-                .array_windows()
-                .any(|part| part == b"\r\n\r\n");
-            if in_body {
-                let timer = self.timer.get_or_insert_with(|| Box::pin(sleep(delay)));
-                if timer.as_mut().poll(cx).is_pending() {
-                    return Poll::Pending;
-                }
-                self.timer = None;
-            }
-        }
-        let count = self.fragment.min(bytes.len());
-        self.state
-            .borrow_mut()
-            .bytes
-            .extend_from_slice(&bytes[..count]);
-        Poll::Ready(Ok(count))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.fail_flush {
-            return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
-        }
-        if self.stall_flush {
-            return Poll::Pending;
-        }
-        let mut state = self.state.borrow_mut();
-        let count = state.bytes.len();
-        state.flushes.push(count);
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.state.borrow_mut().shutdowns += 1;
-        if self.stall_shutdown {
-            Poll::Pending
-        } else {
-            Poll::Ready(Ok(()))
-        }
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.state.borrow_mut().dropped = true;
-    }
+fn client(fragment: usize) -> Backend {
+    Backend::writer(fragment)
 }
 
 fn response(body: Backend, stream: bool) -> Response<Backend> {
@@ -340,7 +139,7 @@ fn sized_json(length: usize) -> Vec<u8> {
     body
 }
 
-fn assert_closed(client: &Rc<RefCell<WriteState>>, backend: &Rc<RefCell<ReadState>>) {
+fn assert_closed(client: &Rc<RefCell<MockStreamState>>, backend: &Rc<RefCell<MockStreamState>>) {
     assert!(client.borrow().dropped);
     assert!(backend.borrow().dropped);
 }
@@ -351,7 +150,7 @@ fn json_is_validated_then_sent_unchanged_with_fresh_headers_and_partial_writes()
         let body = b" \r\n{\"duplicate\":1,\"duplicate\":2,\"text\":\"rain\\n\"}\t ".to_vec();
         let backend = Backend::new(body.clone(), 3);
         let backend_state = backend.state.clone();
-        let client = Client::new(2);
+        let client = client(2);
         let client_state = client.state.clone();
         let mut backend = response(backend, false);
         for (name, value) in [
@@ -380,7 +179,7 @@ fn json_is_validated_then_sent_unchanged_with_fresh_headers_and_partial_writes()
         .unwrap();
         assert_closed(&client_state, &backend_state);
         let state = client_state.borrow();
-        let (headers, actual, _) = wire_parts(&state.bytes);
+        let (headers, actual, _) = wire_parts(&state.written);
         assert_headers(&headers, false, body.len());
         assert_eq!(actual, body);
         assert_eq!(state.shutdowns, 1);
@@ -394,7 +193,7 @@ fn backend_status_media_type_and_compression_fail_before_any_io() {
             for case in 0..11 {
                 let backend = Backend::new(b"{}".to_vec(), usize::MAX);
                 let backend_state = backend.state.clone();
-                let client = Client::new(usize::MAX);
+                let client = client(usize::MAX);
                 let client_state = client.state.clone();
                 let mut backend = response(backend, stream);
                 match case {
@@ -459,9 +258,9 @@ fn backend_status_media_type_and_compression_fail_before_any_io() {
                     Err(ResponseError::BackendMetadata)
                 ));
                 assert_closed(&client_state, &backend_state);
-                assert_eq!(client_state.borrow().bytes, [0_u8; 0]);
+                assert_eq!(client_state.borrow().written, [0_u8; 0]);
                 assert_eq!(client_state.borrow().shutdowns, 0);
-                assert_eq!(backend_state.borrow().polls, 0);
+                assert_eq!(backend_state.borrow().read_polls, 0);
             }
         }
     });
@@ -476,7 +275,7 @@ fn validated_media_types_accept_case_and_optional_utf8_charset() {
             (true, "TEXT/EVENT-STREAM"),
             (true, "Text/Event-Stream; Charset=UTF-8"),
         ] {
-            let client = Client::new(usize::MAX);
+            let client = client(usize::MAX);
             let state = client.state.clone();
             let mut backend = response(Backend::new(b"{}".to_vec(), usize::MAX), stream);
             backend
@@ -491,7 +290,7 @@ fn validated_media_types_accept_case_and_optional_utf8_charset() {
             .await
             .unwrap();
             let state = state.borrow();
-            let (headers, _, _) = wire_parts(&state.bytes);
+            let (headers, _, _) = wire_parts(&state.written);
             assert_headers(&headers, stream, 2);
         }
     });
@@ -515,7 +314,7 @@ fn json_requires_one_complete_object_and_never_sends_invalid_bytes() {
         ] {
             let backend = Backend::new(body.to_vec(), 1);
             let backend_state = backend.state.clone();
-            let client = Client::new(usize::MAX);
+            let client = client(usize::MAX);
             let client_state = client.state.clone();
             assert!(matches!(
                 Box::pin(send_chat_response(
@@ -528,7 +327,7 @@ fn json_requires_one_complete_object_and_never_sends_invalid_bytes() {
                 Err(ResponseError::JsonSyntax)
             ));
             assert_closed(&client_state, &backend_state);
-            assert_eq!(client_state.borrow().bytes, [0_u8; 0]);
+            assert_eq!(client_state.borrow().written, [0_u8; 0]);
             assert_eq!(client_state.borrow().shutdowns, 0);
         }
     });
@@ -542,7 +341,7 @@ fn exact_four_mib_json_and_sse_bodies_succeed() {
             let body = sized_json(MAX_RESPONSE_BYTES);
             let backend = Backend::new(body.clone(), usize::MAX);
             let backend_state = backend.state.clone();
-            let client = Client::new(usize::MAX);
+            let client = client(usize::MAX);
             let client_state = client.state.clone();
             Box::pin(send_chat_response(
                 client,
@@ -554,7 +353,7 @@ fn exact_four_mib_json_and_sse_bodies_succeed() {
             .unwrap();
             assert_closed(&client_state, &backend_state);
             let state = client_state.borrow();
-            let (headers, actual, _) = wire_parts(&state.bytes);
+            let (headers, actual, _) = wire_parts(&state.written);
             assert_headers(&headers, stream, body.len());
             let actual = if stream {
                 chunks(actual, true).0
@@ -562,7 +361,7 @@ fn exact_four_mib_json_and_sse_bodies_succeed() {
                 actual.to_vec()
             };
             assert_eq!(actual, body);
-            assert_eq!(backend_state.borrow().consumed, MAX_RESPONSE_BYTES);
+            assert_eq!(backend_state.borrow().read_bytes, MAX_RESPONSE_BYTES);
         }
     });
 }
@@ -576,7 +375,7 @@ fn cap_plus_one_probe_rejects_json_and_sse_without_forwarding_excess() {
                 usize::MAX,
             );
             let backend_state = backend.state.clone();
-            let client = Client::new(usize::MAX);
+            let client = client(usize::MAX);
             let client_state = client.state.clone();
             assert!(matches!(
                 Box::pin(send_chat_response(
@@ -589,14 +388,14 @@ fn cap_plus_one_probe_rejects_json_and_sse_without_forwarding_excess() {
                 Err(ResponseError::BodyLimit)
             ));
             assert_closed(&client_state, &backend_state);
-            assert_eq!(backend_state.borrow().consumed, MAX_RESPONSE_BYTES + 1);
+            assert_eq!(backend_state.borrow().read_bytes, MAX_RESPONSE_BYTES + 1);
             let state = client_state.borrow();
             assert_eq!(state.shutdowns, 0);
             if stream {
-                let (_, body, _) = wire_parts(&state.bytes);
+                let (_, body, _) = wire_parts(&state.written);
                 assert!(chunks(body, false).0.len() <= MAX_RESPONSE_BYTES);
             } else {
-                assert_eq!(state.bytes, [0_u8; 0]);
+                assert_eq!(state.written, [0_u8; 0]);
             }
         }
     });
@@ -620,7 +419,7 @@ fn fragmented_sse_is_flushed_in_bounded_chunks_without_inventing_events() {
             body.extend_from_slice(b"\n\ndata: \xff\n\n");
             let backend = Backend::new(body.clone(), fragment);
             let backend_state = backend.state.clone();
-            let client = Client::new(3);
+            let client = client(3);
             let client_state = client.state.clone();
             Box::pin(send_chat_response(
                 client,
@@ -631,18 +430,18 @@ fn fragmented_sse_is_flushed_in_bounded_chunks_without_inventing_events() {
             .await
             .unwrap();
             let state = client_state.borrow();
-            let (headers, actual, head_length) = wire_parts(&state.bytes);
+            let (headers, actual, head_length) = wire_parts(&state.written);
             assert_headers(&headers, true, body.len());
             let (decoded, chunk_ends) = chunks(actual, true);
             assert_eq!(decoded, body);
-            assert_eq!(state.flushes.first(), Some(&head_length));
+            assert_eq!(state.flush_offsets.first(), Some(&head_length));
             for end in chunk_ends {
                 assert!(
-                    state.flushes.contains(&(head_length + end)),
+                    state.flush_offsets.contains(&(head_length + end)),
                     "each complete chunk must be flushed"
                 );
             }
-            assert!(backend_state.borrow().largest_buffer <= RESPONSE_BUFFER_BYTES);
+            assert!(backend_state.borrow().largest_read <= RESPONSE_BUFFER_BYTES);
             assert_eq!(state.shutdowns, 1);
             assert_closed(&client_state, &backend_state);
         }
@@ -655,7 +454,7 @@ fn ready_sse_fragments_share_bounded_wire_chunks_and_fewer_writes() {
         let body = vec![b'x'; 1024];
         let backend = Backend::new(body.clone(), 1);
         let backend_state = backend.state.clone();
-        let client = Client::new(usize::MAX);
+        let client = client(usize::MAX);
         let client_state = client.state.clone();
         Box::pin(send_chat_response(
             client,
@@ -666,17 +465,17 @@ fn ready_sse_fragments_share_bounded_wire_chunks_and_fewer_writes() {
         .await
         .unwrap();
         let state = client_state.borrow();
-        let (_, wire, _) = wire_parts(&state.bytes);
+        let (_, wire, _) = wire_parts(&state.written);
         let (decoded, ends) = chunks(wire, true);
         assert_eq!(decoded, body);
         // Deterministic operation counts, not elapsed-time measurements: even
         // one-byte ready reads need far fewer writes/flushes than payload bytes.
         assert!(state.write_polls <= body.len() / 16);
-        assert!(state.flushes.len() <= body.len() / 16);
+        assert!(state.flush_offsets.len() <= body.len() / 16);
         assert!(ends.len() < body.len() / 16);
         // A group cannot drain unlimited immediately-ready one-byte fragments.
         assert!(ends.len() >= body.len() / 32);
-        assert_eq!(backend_state.borrow().consumed, body.len());
+        assert_eq!(backend_state.borrow().read_bytes, body.len());
         assert_closed(&client_state, &backend_state);
     });
 }
@@ -686,9 +485,9 @@ fn sse_ready_prefix_is_flushed_before_a_later_read_becomes_pending() {
     run(async {
         let body = b"data: first\n\n";
         let mut backend = Backend::new(body.to_vec(), usize::MAX);
-        backend.stall_at_end = true;
+        backend.stall_after_input = true;
         let backend_state = backend.state.clone();
-        let client = Client::new(usize::MAX);
+        let client = client(usize::MAX);
         let client_state = client.state.clone();
         assert!(
             timeout(
@@ -704,11 +503,11 @@ fn sse_ready_prefix_is_flushed_before_a_later_read_becomes_pending() {
             .is_err()
         );
         let state = client_state.borrow();
-        let (_, wire, head) = wire_parts(&state.bytes);
+        let (_, wire, head) = wire_parts(&state.written);
         let (decoded, ends) = chunks(wire, false);
         assert_eq!(decoded, body);
         assert_eq!(ends.len(), 1);
-        assert_eq!(state.flushes, [head, head + ends[0]]);
+        assert_eq!(state.flush_offsets, [head, head + ends[0]]);
         assert_eq!(state.shutdowns, 0);
         assert_closed(&client_state, &backend_state);
     });
@@ -743,7 +542,7 @@ fn sse_coalescing_finishes_after_the_first_framed_eof() {
         let body = b"data: first\n\n";
         let backend = Backend::new(body.to_vec(), usize::MAX);
         let backend_state = backend.state.clone();
-        let client = Client::new(usize::MAX);
+        let client = client(usize::MAX);
         let client_state = client.state.clone();
         let response = Response::builder()
             .header("content-type", "text/event-stream")
@@ -761,9 +560,9 @@ fn sse_coalescing_finishes_after_the_first_framed_eof() {
         .await
         .unwrap();
         let state = client_state.borrow();
-        let (_, wire, _) = wire_parts(&state.bytes);
+        let (_, wire, _) = wire_parts(&state.written);
         assert_eq!(chunks(wire, true).0, body);
-        assert_eq!(backend_state.borrow().polls, 2);
+        assert_eq!(backend_state.borrow().read_polls, 2);
         assert_eq!(state.shutdowns, 1);
         assert_closed(&client_state, &backend_state);
     });
@@ -773,9 +572,9 @@ fn sse_coalescing_finishes_after_the_first_framed_eof() {
 fn sse_coalescing_does_not_extend_the_absolute_backend_deadline() {
     run(async {
         let mut backend = Backend::new(b"abc".to_vec(), 1);
-        backend.delay = Some(Duration::from_secs(1));
+        backend.read_delay = Some(Duration::from_secs(1));
         let backend_state = backend.state.clone();
-        let client = Client::new(usize::MAX);
+        let client = client(usize::MAX);
         let client_state = client.state.clone();
         let start = Instant::now();
         assert!(matches!(
@@ -790,7 +589,7 @@ fn sse_coalescing_does_not_extend_the_absolute_backend_deadline() {
         ));
         assert_eq!(Instant::now() - start, Duration::from_secs(2));
         let state = client_state.borrow();
-        let (_, wire, _) = wire_parts(&state.bytes);
+        let (_, wire, _) = wire_parts(&state.written);
         assert_eq!(chunks(wire, false).0, b"a");
         assert_eq!(state.shutdowns, 0);
         assert_closed(&client_state, &backend_state);
@@ -802,9 +601,9 @@ fn decoded_backend_truncation_is_an_error_even_after_valid_payload() {
     run(async {
         for stream in [false, true] {
             let mut backend = Backend::new(b"{}".to_vec(), 1);
-            backend.fail_at_end = true;
+            backend.fail_read_after_input = Some(io::ErrorKind::UnexpectedEof);
             let backend_state = backend.state.clone();
-            let client = Client::new(usize::MAX);
+            let client = client(usize::MAX);
             let client_state = client.state.clone();
             assert!(matches!(
                 Box::pin(send_chat_response(
@@ -820,10 +619,10 @@ fn decoded_backend_truncation_is_an_error_even_after_valid_payload() {
             let state = client_state.borrow();
             assert_eq!(state.shutdowns, 0);
             if stream {
-                let (_, body, _) = wire_parts(&state.bytes);
+                let (_, body, _) = wire_parts(&state.written);
                 assert_eq!(chunks(body, false).0, b"{}");
             } else {
-                assert_eq!(state.bytes, [0_u8; 0]);
+                assert_eq!(state.written, [0_u8; 0]);
             }
         }
     });
@@ -835,7 +634,7 @@ fn zero_writes_write_errors_and_flush_errors_drop_both_streams() {
         for failure in 0..3 {
             let backend = Backend::new(b"{}".to_vec(), usize::MAX);
             let backend_state = backend.state.clone();
-            let mut client = Client::new(usize::MAX);
+            let mut client = client(usize::MAX);
             client.zero_write = failure == 0;
             client.fail_write = failure == 1;
             client.fail_flush = failure == 2;
@@ -863,7 +662,7 @@ fn stalled_header_flush_uses_client_or_supervisor_deadline() {
         for bound in [CLIENT_WRITE_TIMEOUT, Duration::from_secs(2)] {
             let backend = Backend::new(b"{}".to_vec(), usize::MAX);
             let backend_state = backend.state.clone();
-            let mut client = Client::new(usize::MAX);
+            let mut client = client(usize::MAX);
             client.stall_flush = true;
             let client_state = client.state.clone();
             let start = Instant::now();
@@ -880,7 +679,7 @@ fn stalled_header_flush_uses_client_or_supervisor_deadline() {
             assert_eq!(Instant::now() - start, bound);
             assert_closed(&client_state, &backend_state);
             assert_eq!(client_state.borrow().shutdowns, 0);
-            assert_eq!(backend_state.borrow().polls, 0);
+            assert_eq!(backend_state.borrow().read_polls, 0);
         }
     });
 }
@@ -890,8 +689,8 @@ fn partial_chunk_writes_share_one_deadline_instead_of_resetting_it() {
     run(async {
         let backend = Backend::new(b"data: rain\n\n".to_vec(), usize::MAX);
         let backend_state = backend.state.clone();
-        let mut client = Client::new(1);
-        client.body_write_delay = Some(Duration::from_secs(1));
+        let mut client = client(1);
+        client.write_delay = Some(Duration::from_secs(1));
         let client_state = client.state.clone();
         let start = Instant::now();
         assert!(matches!(
@@ -915,7 +714,7 @@ fn stalled_shutdown_is_bounded_and_releases_both_streams() {
     run(async {
         let backend = Backend::new(b"{}".to_vec(), usize::MAX);
         let backend_state = backend.state.clone();
-        let mut client = Client::new(usize::MAX);
+        let mut client = client(usize::MAX);
         client.stall_shutdown = true;
         let client_state = client.state.clone();
         let start = Instant::now();
@@ -941,13 +740,13 @@ fn backend_reads_use_one_absolute_supervisor_deadline() {
         for drip in [false, true] {
             let mut backend = Backend::new(b"{}".to_vec(), 1);
             if drip {
-                backend.delay = Some(Duration::from_secs(1));
+                backend.read_delay = Some(Duration::from_secs(1));
             } else {
-                backend.bytes.clear();
-                backend.stall_at_end = true;
+                backend.input.clear();
+                backend.stall_after_input = true;
             }
             let backend_state = backend.state.clone();
-            let client = Client::new(usize::MAX);
+            let client = client(usize::MAX);
             let client_state = client.state.clone();
             let start = Instant::now();
             assert!(matches!(
@@ -962,7 +761,7 @@ fn backend_reads_use_one_absolute_supervisor_deadline() {
             ));
             assert_eq!(Instant::now() - start, Duration::from_secs(2));
             assert_closed(&client_state, &backend_state);
-            assert_eq!(client_state.borrow().bytes, [0_u8; 0]);
+            assert_eq!(client_state.borrow().written, [0_u8; 0]);
             assert_eq!(client_state.borrow().shutdowns, 0);
         }
     });
@@ -974,7 +773,7 @@ fn expired_deadline_rejects_immediately_ready_input_before_any_io() {
         for stream in [false, true] {
             let backend = Backend::new(b"{}".to_vec(), usize::MAX);
             let backend_state = backend.state.clone();
-            let client = Client::new(usize::MAX);
+            let client = client(usize::MAX);
             let client_state = client.state.clone();
             assert!(matches!(
                 Box::pin(send_chat_response(
@@ -987,8 +786,8 @@ fn expired_deadline_rejects_immediately_ready_input_before_any_io() {
                 Err(ResponseError::Deadline)
             ));
             assert_closed(&client_state, &backend_state);
-            assert_eq!(backend_state.borrow().polls, 0);
-            assert_eq!(client_state.borrow().bytes, [0_u8; 0]);
+            assert_eq!(backend_state.borrow().read_polls, 0);
+            assert_eq!(client_state.borrow().written, [0_u8; 0]);
             assert_eq!(client_state.borrow().shutdowns, 0);
         }
     });
@@ -998,9 +797,9 @@ fn expired_deadline_rejects_immediately_ready_input_before_any_io() {
 fn a_backend_read_becoming_ready_at_expiry_still_fails_closed() {
     run(async {
         let mut backend = Backend::new(b"{}".to_vec(), usize::MAX);
-        backend.delay = Some(Duration::from_secs(2));
+        backend.read_delay = Some(Duration::from_secs(2));
         let backend_state = backend.state.clone();
-        let client = Client::new(usize::MAX);
+        let client = client(usize::MAX);
         let client_state = client.state.clone();
         let start = Instant::now();
         assert!(matches!(
@@ -1015,7 +814,7 @@ fn a_backend_read_becoming_ready_at_expiry_still_fails_closed() {
         ));
         assert_eq!(Instant::now() - start, Duration::from_secs(2));
         assert_closed(&client_state, &backend_state);
-        assert_eq!(client_state.borrow().bytes, [0_u8; 0]);
+        assert_eq!(client_state.borrow().written, [0_u8; 0]);
     });
 }
 
@@ -1024,9 +823,9 @@ fn cancellation_during_backend_read_or_client_flush_drops_owned_streams() {
     run(async {
         for blocked_flush in [false, true] {
             let mut backend = Backend::new(Vec::new(), usize::MAX);
-            backend.stall_at_end = true;
+            backend.stall_after_input = true;
             let backend_state = backend.state.clone();
-            let mut client = Client::new(usize::MAX);
+            let mut client = client(usize::MAX);
             client.stall_flush = blocked_flush;
             let client_state = client.state.clone();
             let start = Instant::now();
@@ -1047,7 +846,7 @@ fn cancellation_during_backend_read_or_client_flush_drops_owned_streams() {
             assert_closed(&client_state, &backend_state);
             assert_eq!(client_state.borrow().shutdowns, 0);
             let state = client_state.borrow();
-            let (_, body, _) = wire_parts(&state.bytes);
+            let (_, body, _) = wire_parts(&state.written);
             assert_eq!(body, [0_u8; 0]);
         }
     });
