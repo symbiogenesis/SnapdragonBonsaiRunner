@@ -231,6 +231,37 @@ where
     }
 }
 
+async fn forward_sse_chunk<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    client: &mut W,
+    body: &mut R,
+    buffer: &mut [u8; CHUNK_PREFIX_BYTES + RESPONSE_BUFFER_BYTES + 2],
+    sent: &mut usize,
+    deadline: RequestDeadline,
+) -> Result<bool, ResponseError> {
+    // At the cap, probe one byte to distinguish exact-limit EOF from
+    // surplus without forwarding any byte beyond the limit.
+    let bound = RESPONSE_BUFFER_BYTES.min(MAX_RESPONSE_BYTES - *sent + 1);
+    let (count, status) = read_sse_group(
+        body,
+        &mut buffer[CHUNK_PREFIX_BYTES..CHUNK_PREFIX_BYTES + bound],
+        deadline,
+    )
+    .await?;
+    if count == 0 {
+        return Ok(false);
+    }
+    if count > MAX_RESPONSE_BYTES - *sent {
+        return Err(ResponseError::BodyLimit);
+    }
+    write_group(client, &[sse_frame(buffer, count)], deadline, false).await?;
+    *sent += count;
+    match status {
+        SseReadStatus::Open => Ok(true),
+        SseReadStatus::Complete => Ok(false),
+        SseReadStatus::Failed => Err(ResponseError::BackendIo),
+    }
+}
+
 async fn write_sse_response<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     client: &mut W,
     body: &mut R,
@@ -241,31 +272,7 @@ async fn write_sse_response<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     // separate writes for the size, payload and CRLF.
     let mut buffer = [0u8; CHUNK_PREFIX_BYTES + RESPONSE_BUFFER_BYTES + 2];
     let mut sent = 0;
-    loop {
-        // At the cap, probe one byte to distinguish exact-limit EOF from
-        // surplus without forwarding any byte beyond the limit.
-        let bound = RESPONSE_BUFFER_BYTES.min(MAX_RESPONSE_BYTES - sent + 1);
-        let (count, status) = read_sse_group(
-            body,
-            &mut buffer[CHUNK_PREFIX_BYTES..CHUNK_PREFIX_BYTES + bound],
-            supervisor_deadline,
-        )
-        .await?;
-        if count == 0 {
-            break;
-        }
-        if count > MAX_RESPONSE_BYTES - sent {
-            return Err(ResponseError::BodyLimit);
-        }
-        let frame = sse_frame(&mut buffer, count);
-        write_group(client, &[frame], supervisor_deadline, false).await?;
-        sent += count;
-        match status {
-            SseReadStatus::Open => {}
-            SseReadStatus::Complete => break,
-            SseReadStatus::Failed => return Err(ResponseError::BackendIo),
-        }
-    }
+    while forward_sse_chunk(client, body, &mut buffer, &mut sent, supervisor_deadline).await? {}
     // Never emit the terminator on backend error, byte limit or deadline.
     write_group(client, &[b"0\r\n\r\n"], supervisor_deadline, true).await
 }
@@ -337,28 +344,29 @@ async fn write_buffered_sse_response<W: AsyncWrite + Unpin, R: AsyncBufRead + Un
         }
         // Small/fragmented spans retain immediate-ready coalescing and one
         // contiguous write. Never exchange saved copies for tiny socket writes.
-        let bound = RESPONSE_BUFFER_BYTES.min(MAX_RESPONSE_BYTES - sent + 1);
-        let (count, status) = read_sse_group(
-            body,
-            &mut frame[CHUNK_PREFIX_BYTES..CHUNK_PREFIX_BYTES + bound],
-            deadline,
-        )
-        .await?;
-        if count > MAX_RESPONSE_BYTES - sent {
-            return Err(ResponseError::BodyLimit);
-        }
-        if count == 0 {
+        if !forward_sse_chunk(client, body, &mut frame, &mut sent, deadline).await? {
             break;
-        }
-        write_group(client, &[sse_frame(&mut frame, count)], deadline, false).await?;
-        sent += count;
-        match status {
-            SseReadStatus::Open => {}
-            SseReadStatus::Complete => break,
-            SseReadStatus::Failed => return Err(ResponseError::BackendIo),
         }
     }
     write_group(client, &[b"0\r\n\r\n"], deadline, true).await
+}
+
+async fn run_client_write<F>(
+    supervisor_deadline: RequestDeadline,
+    op: F,
+) -> Result<(), ResponseError>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    let deadline = supervisor_deadline.earlier(Instant::now() + CLIENT_WRITE_TIMEOUT);
+    deadline.ensure(ResponseError::Deadline)?;
+    deadline
+        .timeout(op)
+        .await
+        .map_err(|_| ResponseError::Deadline)?
+        .map_err(|_| ResponseError::ClientIo)?;
+    // timeout_at allows an immediately ready operation to win after expiry.
+    deadline.ensure(ResponseError::Deadline)
 }
 
 async fn write_vectored_group<W: AsyncWrite + Unpin>(
@@ -367,20 +375,14 @@ async fn write_vectored_group<W: AsyncWrite + Unpin>(
     supervisor_deadline: RequestDeadline,
     shutdown: bool,
 ) -> Result<(), ResponseError> {
-    let deadline = supervisor_deadline.earlier(Instant::now() + CLIENT_WRITE_TIMEOUT);
-    deadline.ensure(ResponseError::Deadline)?;
-    deadline
-        .timeout(async {
-            crate::wire::write_vectored_all(client, slices).await?;
-            if shutdown {
-                client.shutdown().await?;
-            }
-            Ok::<_, std::io::Error>(())
-        })
-        .await
-        .map_err(|_| ResponseError::Deadline)?
-        .map_err(|_| ResponseError::ClientIo)?;
-    deadline.ensure(ResponseError::Deadline)
+    run_client_write(supervisor_deadline, async {
+        crate::wire::write_vectored_all(client, slices).await?;
+        if shutdown {
+            client.shutdown().await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 enum SseReadStatus {
@@ -550,24 +552,17 @@ async fn write_group<W: AsyncWrite + Unpin>(
 ) -> Result<(), ResponseError> {
     // One deadline covers the whole group, including all partial writes, flush
     // and (on success only) shutdown. No helper restarts it between pieces.
-    let deadline = supervisor_deadline.earlier(Instant::now() + CLIENT_WRITE_TIMEOUT);
-    deadline.ensure(ResponseError::Deadline)?;
-    deadline
-        .timeout(async {
-            for piece in pieces {
-                client.write_all(piece).await?;
-            }
-            client.flush().await?;
-            if shutdown {
-                client.shutdown().await?;
-            }
-            Ok::<_, std::io::Error>(())
-        })
-        .await
-        .map_err(|_| ResponseError::Deadline)?
-        .map_err(|_| ResponseError::ClientIo)?;
-    // timeout_at allows an immediately ready operation to win after expiry.
-    deadline.ensure(ResponseError::Deadline)
+    run_client_write(supervisor_deadline, async {
+        for piece in pieces {
+            client.write_all(piece).await?;
+        }
+        client.flush().await?;
+        if shutdown {
+            client.shutdown().await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[cfg(test)]

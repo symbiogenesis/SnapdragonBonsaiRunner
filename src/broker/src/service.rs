@@ -357,17 +357,14 @@ impl LocalChatService {
 
     async fn reset_backend(&self) -> Result<(), BackendError> {
         let deadline = Instant::now() + RESET_TIMEOUT;
-        let mut shutdown = pin!(self.gate.closed());
-        let mut resetting = pin!(async {
-            let stream = self.backend.connect(deadline).await?;
-            crate::backend::reset_backend(stream, self.backend.policy(), deadline.into()).await
-        });
-        poll_fn(|cx| {
-            if shutdown.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(BackendError::Io));
-            }
-            resetting.as_mut().poll(cx)
-        })
+        race_gate_close(
+            &self.gate,
+            async {
+                let stream = self.backend.connect(deadline).await?;
+                crate::backend::reset_backend(stream, self.backend.policy(), deadline.into()).await
+            },
+            || BackendError::Io,
+        )
         .await
     }
 
@@ -391,17 +388,11 @@ impl LocalChatService {
     /// Returns [`ServiceError`] for capacity, shutdown or socket failure.
     pub async fn accept(&self) -> Result<AcceptedChat<'_>, ServiceError> {
         let reservation = self.gate.reserve().map_err(ServiceError::Gate)?;
-        let mut shutdown = pin!(self.gate.closed());
-        let mut accepting = pin!(self.listener.accept());
-        let (stream, peer) = poll_fn(|cx| {
-            if shutdown.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(ServiceError::Gate(GateError::Closed)));
-            }
-            accepting
-                .as_mut()
-                .poll(cx)
-                .map(|result| result.map_err(|_| ServiceError::Io))
-        })
+        let (stream, peer) = race_gate_close(
+            &self.gate,
+            async { self.listener.accept().await.map_err(|_| ServiceError::Io) },
+            || ServiceError::Gate(GateError::Closed),
+        )
         .await?;
         if !peer.ip().is_loopback() || !peer.is_ipv4() {
             return Err(ServiceError::Configuration);
@@ -500,26 +491,22 @@ impl AcceptedChat<'_> {
                 generation: AtomicBool::new(false),
                 completed: AtomicBool::new(false),
             };
-            let result = {
-                let mut shutdown = pin!(service.gate.closed());
-                let mut serving = pin!(serve_chat_with_budget(
-                    stream,
-                    &service.policy,
-                    &backend,
-                    RequestDeadline::NONE,
-                    &service.burst
-                ));
-                poll_fn(|cx| {
-                    if shutdown.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(Err(ServiceError::Gate(GateError::Closed)));
-                    }
-                    serving
-                        .as_mut()
-                        .poll(cx)
-                        .map(|result| result.map_err(ServiceError::Request))
-                })
-                .await
-            };
+            let result = race_gate_close(
+                &service.gate,
+                async {
+                    serve_chat_with_budget(
+                        stream,
+                        &service.policy,
+                        &backend,
+                        RequestDeadline::NONE,
+                        &service.burst,
+                    )
+                    .await
+                    .map_err(ServiceError::Request)
+                },
+                || ServiceError::Gate(GateError::Closed),
+            )
+            .await;
             let client_cancelled = matches!(
                 result,
                 Err(ServiceError::Request(
@@ -549,6 +536,22 @@ impl AcceptedChat<'_> {
         drop(active);
         result
     }
+}
+
+async fn race_gate_close<T, E>(
+    gate: &RequestGate,
+    op: impl Future<Output = Result<T, E>>,
+    closed_err: fn() -> E,
+) -> Result<T, E> {
+    let mut shutdown = pin!(gate.closed());
+    let mut op = pin!(op);
+    poll_fn(|cx| {
+        if shutdown.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(closed_err()));
+        }
+        op.as_mut().poll(cx)
+    })
+    .await
 }
 
 // The supervisor makes exactly one count connection, then one generation
@@ -652,34 +655,46 @@ mod tests {
                     .await
                     .map_err(|_| io::Error::other("bind"))?;
             let frontend_port = service.port();
+            async fn send_json(conn: &mut TcpStream, body: &str) -> io::Result<()> {
+                conn.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+            }
+
+            async fn send_sse(
+                conn: &mut TcpStream,
+                chunk: &str,
+                terminate: bool,
+            ) -> io::Result<()> {
+                let tail = if terminate { "0\r\n\r\n" } else { "" };
+                conn.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{chunk}\r\n{tail}",
+                        chunk.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+                conn.flush().await
+            }
+
+            const COUNT_BODY: &str = r#"{"object":"response.input_tokens","input_tokens":8}"#;
+            const HEL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+
             let backend_task = tokio::spawn(async move {
                 let (mut count_conn, _) = backend_listener.accept().await?;
                 let _ = read_http_head(&mut count_conn).await?;
-                let count_body = r#"{"object":"response.input_tokens","input_tokens":8}"#;
-                count_conn
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{count_body}",
-                            count_body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
+                send_json(&mut count_conn, COUNT_BODY).await?;
                 drop(count_conn);
 
                 let (mut gen_conn, _) = backend_listener.accept().await?;
                 let _ = read_http_head(&mut gen_conn).await?;
-                let sse_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
-                gen_conn
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{sse_chunk}\r\n",
-                            sse_chunk.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                gen_conn.flush().await?;
+                send_sse(&mut gen_conn, HEL_SSE, false).await?;
                 let mut eof = [0_u8; 16];
                 let _ = gen_conn.read(&mut eof).await?;
                 Ok::<(), io::Error>(())
@@ -719,32 +734,13 @@ mod tests {
                 let (mut count_conn, _) = backend_listener.accept().await?;
                 let head = read_http_head(&mut count_conn).await?;
                 assert!(head.starts_with("POST /v1/chat/completions/input_tokens "));
-                let count_body = r#"{"object":"response.input_tokens","input_tokens":8}"#;
-                count_conn
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{count_body}",
-                            count_body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
+                send_json(&mut count_conn, COUNT_BODY).await?;
                 drop(count_conn);
 
                 let (mut gen_conn, _) = backend_listener.accept().await?;
                 let head = read_http_head(&mut gen_conn).await?;
                 assert!(head.starts_with("POST /v1/chat/completions "));
-                let sse_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
-                gen_conn
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{sse_chunk}\r\n",
-                            sse_chunk.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                gen_conn.flush().await?;
+                send_sse(&mut gen_conn, HEL_SSE, false).await?;
                 let _ = first_streaming_tx.send(());
                 let mut eof = [0_u8; 16];
                 assert_eq!(gen_conn.read(&mut eof).await?, 0);
@@ -755,40 +751,21 @@ mod tests {
                 let reset_head = read_http_head(&mut reset_conn).await?;
                 assert!(reset_head.starts_with("POST /reset HTTP/1.1\r\n"));
                 assert!(!reset_head.to_ascii_lowercase().contains("content-type:"));
-                reset_conn
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
-                    )
-                    .await?;
+                send_json(&mut reset_conn, r#"{"status":"ok"}"#).await?;
                 drop(reset_conn);
 
                 // Queued second request count + complete generation.
                 let (mut count2, _) = backend_listener.accept().await?;
                 let head2 = read_http_head(&mut count2).await?;
                 assert!(head2.starts_with("POST /v1/chat/completions/input_tokens "));
-                count2
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{count_body}",
-                            count_body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
+                send_json(&mut count2, COUNT_BODY).await?;
                 drop(count2);
 
                 let (mut gen2, _) = backend_listener.accept().await?;
                 let head2 = read_http_head(&mut gen2).await?;
                 assert!(head2.starts_with("POST /v1/chat/completions "));
                 let done = "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-                gen2.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{done}\r\n0\r\n\r\n",
-                        done.len()
-                    )
-                    .as_bytes(),
-                )
-                .await?;
+                send_sse(&mut gen2, done, true).await?;
                 drop(gen2);
                 Ok::<(), io::Error>(())
             });
