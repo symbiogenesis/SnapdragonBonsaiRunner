@@ -856,12 +856,14 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   creative prose & Orca non-regression, and (4) zero-scale bit identity. If it
   passes as-is, skip `DR-W1` and proceed directly to `DR-C1`/`DR-C2`; if it
   fails, capture exact per-category/prompt failure modes for `DR-W1`. Pure-Rust
-  `dr-g2-plan`/`dr-g2-score` tooling (`574b961a`) is checked in, and a local
-  battery-CPU `prism-inference-server` run verified bit-exact `scale = 0.0`
-  parity on `zero-ctrl-001` (`51` tokens, `cb08876d...`) plus non-degenerate
-  `creative-001` output before hitting its `900 s` ceiling during `if-001` (`1/8`
-  pairs completed; [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md)).
-  Accelerated AC-powered completion across all 4 required categories and blinded
+  `dr-g2-plan`/`dr-g2-score` tooling (`574b961a`) is checked in, and closed local
+  `prism-inference-server` runs verified bit-exact `scale = 0.0` parity on
+  `zero-ctrl-001` (`51` tokens, `cb08876d...`) alongside partial captures
+  (`1/8` pairs on battery CPU, `2/8` pairs on `28d47fe` AC `900 s` ceiling, and
+  `1/4` pairs on `91298a4c` AC before host Windows suspend exceeded `900 s`;
+  [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md)).
+  Awake AC-powered 4-category completion (`coding`, `reasoning`,
+  `instruction-following`, `creative-prose`) with sleep inhibition and blinded
   human review (`humanReviewed: true`) remain open.
 - [ ] **DR-W1 — Conditional pure-Rust direct weight editing on the multi-rank LoRA if `DR-G2` fails (zero retraining).**
   Triggered only if the unedited `DR-E1` stack fails `DR-G2`; keep
@@ -886,14 +888,16 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   invalidation, `adapter_affects_any` fused Hexagon NPU FFN execution across all
   64 layers, scalar/NEON/tiled-prefill parity and `swift_model_check rollback`
   bit-exact state before repinning Prism. Local `..\prism-inference` source
-  wiring (`39ae592`, `4c49f6f`, `5aab2f4`, `7d63f8a`), unit/example checks,
-  bounded 27B `scale = 0.0` parity vet, an offline AC-powered 27B 4-layer
-  `:0.0` parity / `:0.5` perturbation / `:0.5` full-state `rollback` vet
-  (`status: "passed"` in `33.875 s`; [vet summary](docs/evidence/daisyrose-multirank-wiring-vet.md)),
-  and a full 64-layer (`128`-pair `daisyrose-npu-r16.gguf`) `:0.0` parity /
-  `:1.0` perturbation / `:1.0` full-state `rollback` vet (`status: "passed"` in
-  `138.61 s` on battery; [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md))
-  are complete locally; Prism release publication beyond `v0.1.32` and lock
+  wiring (`39ae592`, `4c49f6f`, `5aab2f4`, `7d63f8a`), green Foundation `main`
+  (`91298a4c`), unit/example checks, bounded 27B `scale = 0.0` parity vets, an
+  offline AC-powered 27B 4-layer `:0.0`/`:0.5` vet (`33.875 s`), and full
+  64-layer (`128`-pair `daisyrose-npu-r16.gguf`) parity / perturbation /
+  rollback / matched-AC overhead vets (`138.61 s` on battery; `48.518 s` /
+  `5.07%` mean overhead on `28d47fe`; `65.152 s` / **`3.16%` mean / `3.56%`
+  median overhead** `<= 10%`, `+74.05 MiB` WS / `+74.20 MiB` private RAM,
+  bit-exact `0.0`, `6/6` rollback on `91298a4c`;
+  [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md))
+  are complete locally; Prism `v0.1.34+` release bundle publication and lock
   repin remain open pending `DR-G2` human review and hosting.
 - [ ] **DR-C2 — Wire Runner lockfile, memory accounting, UI controls and qualification gates.**
   Pin the verified adapter in `config/daisyrose-lora.lock.json`, charge exact
@@ -916,8 +920,8 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   tight-RAM shedding, default-scale request policy and readiness reporting,
   and fresh/new-conversation UI initialization preserving saved workspaces)) are
   complete; `config/daisyrose-lora.lock.json`, `MULTI_RANK_LORA_RELEASE`
-  enablement, matched-power full-adapter X1/X2 measurements, held-out human
-  review and owning CI remain open.
+  enablement, physical X1 matched-power throughput/RAM qualification, awake
+  4-category `DR-G2` + held-out human review, and owning CI remain open.
 
 ### Memory and profiles
 
