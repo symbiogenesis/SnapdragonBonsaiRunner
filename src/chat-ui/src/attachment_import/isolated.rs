@@ -3,21 +3,17 @@
 
 use std::{
     ffi::OsString,
-    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
-    path::{Component, Path, Prefix},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
-    },
-    thread::{self, JoinHandle},
+    path::Path,
+    sync::{Arc, atomic::Ordering, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
-use bonsai_windows_credentials::PrivateDirectory;
-use bonsai_windows_process::{OwnedProcess, ProcessSpec, SandboxNetwork, SandboxPolicy};
+use crate::isolated_worker::{
+    SandboxedLaunch, SlotError, WorkerErrors, WorkerSlot, le_u32, le_u64, recv_until,
+    run_sandboxed_piped,
+};
 
 use super::{
     Attachment, MAX_IMAGE_EDGE, MAX_MODEL_PNG_BYTES, MAX_SOURCE_MEDIA_BYTES, MAX_THUMBNAIL_EDGE,
@@ -36,6 +32,8 @@ pub(super) const ERR_NO_VIDEO: u64 = 2;
 
 const PROCESS_COMMIT_LIMIT: usize = 512 * 1024 * 1024;
 const CLEANUP_LIMIT: Duration = Duration::from_secs(2);
+const ACTIVE_FAILURE: &str =
+    "Another media attachment import is still active. Wait or cancel it first.";
 const ISOLATION_FAILURE: &str =
     "Windows could not start the isolated attachment decoder. Your draft was kept.";
 const SANDBOX_REBOOT_PENDING_FAILURE: &str = "Windows Update has a pending restart required for the isolated attachment decoder. Restart Windows, then reopen Swift. Your draft was kept.";
@@ -53,196 +51,15 @@ const MEMORY_FAILURE: &str =
     "This media file exceeds memory limits after decoding. Choose a smaller file.";
 const NO_VIDEO_FAILURE: &str =
     "No decodable video stream was found in this file. Your draft was kept.";
+const ERRORS: WorkerErrors = WorkerErrors {
+    isolation: ISOLATION_FAILURE,
+    reboot_pending: SANDBOX_REBOOT_PENDING_FAILURE,
+    unavailable: SANDBOX_UNAVAILABLE_FAILURE,
+    protocol: PROTOCOL_FAILURE,
+    cleanup: CLEANUP_FAILURE,
+};
 
-static ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static QUARANTINE: OnceLock<Quarantine> = OnceLock::new();
-
-struct ActiveImport<'a>(&'a AtomicBool);
-
-impl<'a> ActiveImport<'a> {
-    fn acquire(slot: &'a AtomicBool) -> Result<Self, String> {
-        slot.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| Self(slot))
-            .map_err(|_| {
-                "Another media attachment import is still active. Wait or cancel it first."
-                    .to_owned()
-            })
-    }
-}
-
-impl Drop for ActiveImport<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-#[allow(dead_code, reason = "Retained for process-lifetime cleanup safety.")]
-struct Quarantine {
-    _source: Selection,
-    _executable: Selection,
-    _scratch: Scratch,
-    _reader: Option<JoinHandle<()>>,
-}
-
-fn quarantine(
-    source: Selection,
-    executable: Selection,
-    scratch: Scratch,
-    reader: Option<JoinHandle<()>>,
-) {
-    ADMISSION_CLOSED.store(true, Ordering::Release);
-    QUARANTINE.get_or_init(|| Quarantine {
-        _source: source,
-        _executable: executable,
-        _scratch: scratch,
-        _reader: reader,
-    });
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained directory and file locks prevent source replacement."
-)]
-struct Selection {
-    _ancestors: Vec<File>,
-    _file: File,
-}
-
-impl Selection {
-    fn open(path: &Path, enforce_media_cap: bool) -> io::Result<Self> {
-        if !path.is_absolute()
-            || !matches!(
-                path.components().next(),
-                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
-            )
-            || path
-                .components()
-                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-        {
-            return Err(io::Error::other(SOURCE_FAILURE));
-        }
-        bonsai_windows_process::require_local_data_drive(path)?;
-        let mut ancestors = Vec::new();
-        for ancestor in path
-            .ancestors()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            let directory = OpenOptions::new()
-                .read(true)
-                .access_mode(0x81)
-                .share_mode(3)
-                .custom_flags(0x0220_0000)
-                .open(ancestor)?;
-            let metadata = directory.metadata()?;
-            if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
-                return Err(io::Error::other(SOURCE_FAILURE));
-            }
-            ancestors.push(directory);
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .custom_flags(0x0020_0000)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.len() == 0
-            || metadata.file_attributes() & 0x400 != 0
-            || (enforce_media_cap && metadata.len() > MAX_SOURCE_MEDIA_BYTES)
-        {
-            return Err(io::Error::other(SOURCE_FAILURE));
-        }
-        Ok(Self {
-            _ancestors: ancestors,
-            _file: file,
-        })
-    }
-}
-
-struct Scratch(Option<PrivateDirectory>);
-
-impl Scratch {
-    fn create() -> io::Result<Self> {
-        PrivateDirectory::create(&std::env::temp_dir()).map(|directory| Self(Some(directory)))
-    }
-
-    fn path(&self) -> io::Result<&Path> {
-        self.0
-            .as_ref()
-            .map(PrivateDirectory::path)
-            .ok_or_else(|| io::Error::other(CLEANUP_FAILURE))
-    }
-
-    fn cleanup(&mut self) -> io::Result<()> {
-        let Some(directory) = self.0.take() else {
-            return Ok(());
-        };
-        let path = directory.path().to_owned();
-        let stderr = path.join("attachment.stderr");
-        if stderr.try_exists()? {
-            fs::remove_file(stderr)?;
-        }
-        let worker = path.join("worker");
-        if worker.try_exists()? {
-            fs::remove_dir(worker)?;
-        }
-        drop(directory);
-        fs::remove_dir(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _removed = self.cleanup();
-    }
-}
-
-struct Prepared {
-    source: Selection,
-    executable_guard: Selection,
-    scratch: Scratch,
-    specification: ProcessSpec,
-    policy: SandboxPolicy,
-}
-
-fn prepare(path: &Path, kind: MediaKind) -> Result<Prepared, String> {
-    let source = Selection::open(path, true).map_err(|_| SOURCE_FAILURE.to_owned())?;
-    let executable = std::env::current_exe().map_err(|_| ISOLATION_FAILURE.to_owned())?;
-    let executable_guard =
-        Selection::open(&executable, false).map_err(|_| ISOLATION_FAILURE.to_owned())?;
-    let scratch = Scratch::create().map_err(|_| ISOLATION_FAILURE.to_owned())?;
-    let directory = scratch.path().map_err(|_| ISOLATION_FAILURE.to_owned())?;
-    let working_directory = directory.join("worker");
-    fs::create_dir(&working_directory).map_err(|_| ISOLATION_FAILURE.to_owned())?;
-    let specification = ProcessSpec {
-        executable: executable.clone(),
-        arguments: vec![
-            OsString::from("--attachment-import-worker"),
-            OsString::from(kind.as_arg()),
-            path.as_os_str().to_owned(),
-        ],
-        working_directory: working_directory.clone(),
-        stdout: directory.join("attachment.stdout"),
-        stderr: directory.join("attachment.stderr"),
-        memory_limit_bytes: PROCESS_COMMIT_LIMIT,
-        active_process_limit: 1,
-    };
-    let policy = SandboxPolicy {
-        readonly_paths: vec![executable, path.to_owned()],
-        writable_directory: working_directory,
-    };
-    Ok(Prepared {
-        source,
-        executable_guard,
-        scratch,
-        specification,
-        policy,
-    })
-}
+static SLOT: WorkerSlot = WorkerSlot::new();
 
 pub(super) fn import_media(
     path: &Path,
@@ -250,110 +67,61 @@ pub(super) fn import_media(
     shared: &Shared,
     timeout: Duration,
 ) -> Result<Attachment, String> {
-    let _active = ActiveImport::acquire(&ACTIVE)?;
-    if ADMISSION_CLOSED.load(Ordering::Acquire) {
-        return Err(CLEANUP_FAILURE.to_owned());
-    }
+    let _active = SLOT.acquire().map_err(|err| {
+        match err {
+            SlotError::Active => ACTIVE_FAILURE,
+            SlotError::Closed => CLEANUP_FAILURE,
+        }
+        .to_owned()
+    })?;
     if shared.cancelled.load(Ordering::Acquire) {
         return Err("Attachment import cancelled.".to_owned());
     }
     let name = display_name(path);
-    let Prepared {
-        source,
-        executable_guard,
-        mut scratch,
-        specification,
-        policy,
-    } = prepare(path, kind)?;
+    let launch = SandboxedLaunch::prepare(
+        path,
+        Some(MAX_SOURCE_MEDIA_BYTES),
+        "attachment.stdout",
+        "attachment.stderr",
+        PROCESS_COMMIT_LIMIT,
+        vec![
+            OsString::from("--attachment-import-worker"),
+            OsString::from(kind.as_arg()),
+            path.as_os_str().to_owned(),
+        ],
+        SOURCE_FAILURE,
+        ISOLATION_FAILURE,
+    )
+    .map_err(str::to_owned)?;
     let deadline = Instant::now() + timeout;
-    let (process, input, mut output) =
-        match OwnedProcess::start_sandboxed_piped(&specification, &policy, SandboxNetwork::Offline)
-        {
-            Ok(started) => started,
-            Err(error) if !bonsai_windows_process::process_start_cleanup_unconfirmed(&error) => {
-                if error.kind() == io::ErrorKind::Unsupported {
-                    return Err(if bonsai_windows_process::windows_reboot_pending() {
-                        SANDBOX_REBOOT_PENDING_FAILURE
-                    } else {
-                        SANDBOX_UNAVAILABLE_FAILURE
-                    }
-                    .to_owned());
-                }
-                return Err(ISOLATION_FAILURE.to_owned());
-            }
-            Err(_) => {
-                quarantine(source, executable_guard, scratch, None);
-                return Err(CLEANUP_FAILURE.to_owned());
-            }
-        };
-    drop(input);
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    let reader_name = name.clone();
-    let Ok(reader) = thread::Builder::new()
-        .name("bonsai-attachment-pipe".to_owned())
-        .spawn(move || {
-            let result = read_packet_and_eof(&mut output, &reader_name, kind);
-            let _sent = done_tx.try_send(result);
-        })
-    else {
-        if process.stop(CLEANUP_LIMIT).is_err() {
-            quarantine(source, executable_guard, scratch, None);
-            drop(process);
-            return Err(CLEANUP_FAILURE.to_owned());
-        }
-        drop(process);
-        return Err(ISOLATION_FAILURE.to_owned());
-    };
-    let result = await_packet(&done_rx, shared, deadline);
-    drop(done_rx);
-    let clean = match &result {
-        Ok(_) => process
-            .wait_for_exit(CLEANUP_LIMIT)
-            .and_then(|code| match code {
-                Some(0) if process.active_processes()? == 0 => Ok(()),
-                _ => Err(io::Error::other(CLEANUP_FAILURE)),
-            }),
-        Err(_) => process.stop(CLEANUP_LIMIT),
-    };
-    if clean.is_err() {
-        quarantine(source, executable_guard, scratch, Some(reader));
-        drop(process);
-        return Err(CLEANUP_FAILURE.to_owned());
-    }
-    reader.join().map_err(|_| PROTOCOL_FAILURE.to_owned())?;
-    drop(process);
-    if scratch.cleanup().is_err() {
-        ADMISSION_CLOSED.store(true, Ordering::Release);
-        return Err(CLEANUP_FAILURE.to_owned());
-    }
-    result
-}
-
-fn await_packet(
-    receiver: &Receiver<Result<Attachment, String>>,
-    shared: &Shared,
-    deadline: Instant,
-) -> Result<Attachment, String> {
-    loop {
-        if shared.cancelled.load(Ordering::Acquire) {
-            return Err("Attachment import cancelled.".to_owned());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(TIMEOUT_FAILURE.to_owned());
-        }
-        match receiver.recv_timeout(POLL.min(remaining)) {
-            Ok(result) => {
-                return if shared.cancelled.load(Ordering::Acquire) {
-                    Err("Attachment import cancelled.".to_owned())
-                } else {
-                    result
-                };
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(PROTOCOL_FAILURE.to_owned()),
-        }
-    }
+    run_sandboxed_piped(
+        &SLOT,
+        launch,
+        CLEANUP_LIMIT,
+        ERRORS,
+        |input, mut output| {
+            drop(input);
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            let reader = thread::Builder::new()
+                .name("bonsai-attachment-pipe".to_owned())
+                .spawn(move || {
+                    let result = read_packet_and_eof(&mut output, &name, kind);
+                    let _sent = done_tx.try_send(result);
+                })?;
+            Ok((reader, done_rx))
+        },
+        |done_rx| {
+            recv_until(
+                &done_rx,
+                &shared.cancelled,
+                deadline,
+                POLL,
+                || "Attachment import cancelled.".to_owned(),
+                || TIMEOUT_FAILURE.to_owned(),
+                || PROTOCOL_FAILURE.to_owned(),
+            )
+        },
+    )
 }
 
 #[allow(dead_code, reason = "Used across host pipe reader and unit tests.")]
@@ -583,19 +351,11 @@ const fn duration_or_zero(kind: MediaKind, duration_ms: u64) -> u64 {
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    bytes
-        .get(offset..offset + 4)
-        .and_then(|slice| slice.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or_else(|| PROTOCOL_FAILURE.to_owned())
+    le_u32(bytes, offset).ok_or_else(|| PROTOCOL_FAILURE.to_owned())
 }
 
 fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, String> {
-    bytes
-        .get(offset..offset + 8)
-        .and_then(|slice| slice.try_into().ok())
-        .map(u64::from_le_bytes)
-        .ok_or_else(|| PROTOCOL_FAILURE.to_owned())
+    le_u64(bytes, offset).ok_or_else(|| PROTOCOL_FAILURE.to_owned())
 }
 
 #[cfg(test)]

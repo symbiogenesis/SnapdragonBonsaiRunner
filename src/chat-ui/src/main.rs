@@ -35,6 +35,8 @@ mod http;
 #[cfg(windows)]
 mod image_export;
 #[cfg(windows)]
+mod isolated_worker;
+#[cfg(windows)]
 mod markdown_service;
 #[cfg(windows)]
 mod native_speech;

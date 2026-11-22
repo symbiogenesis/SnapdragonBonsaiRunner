@@ -2,19 +2,16 @@
 
 use std::{
     io::{self, Cursor, Read},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, atomic::Ordering, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 use super::{
-    ActiveImport, CANCELLED, CODEC_FAILURE, FLAG_ERROR, HEADER_BYTES, MEMORY_FAILURE, NEXT,
-    PROTOCOL_FAILURE, Shared, TIMEOUT, read_frame, read_frames, receive_frame, relay,
+    CANCELLED, CODEC_FAILURE, FLAG_ERROR, HEADER_BYTES, MEMORY_FAILURE, NEXT, PROTOCOL_FAILURE,
+    Shared, TIMEOUT, read_frame, read_frames, receive_frame, relay,
 };
+use crate::isolated_worker::WorkerSlot;
 
 // Independently assembled canonical PCM16: 16 kHz, mono, two samples [0x0201,
 // 0x0403]. This deliberately does not call either production frame/WAV writer.
@@ -409,16 +406,20 @@ fn isolated_relay_cancellation_during_backpressure_grants_no_further_decode() ->
 
 #[test]
 fn isolated_active_admission_is_exclusive_and_recovers_only_on_owner_drop() -> io::Result<()> {
-    let slot = AtomicBool::new(false);
-    let owner = ActiveImport::acquire(&slot).map_err(io::Error::other)?;
-    assert!(slot.load(Ordering::Acquire));
-    assert!(ActiveImport::acquire(&slot).is_err());
-    assert!(slot.load(Ordering::Acquire));
+    let slot = WorkerSlot::new();
+    let owner = slot
+        .acquire()
+        .map_err(|_| io::Error::other("Active slot failed"))?;
+    assert!(slot.acquire().is_err());
     drop(owner);
-    let fresh = ActiveImport::acquire(&slot).map_err(io::Error::other)?;
-    assert!(ActiveImport::acquire(&slot).is_err());
+    let fresh = slot
+        .acquire()
+        .map_err(|_| io::Error::other("Reacquire failed"))?;
+    assert!(slot.acquire().is_err());
     drop(fresh);
-    assert!(!slot.load(Ordering::Acquire));
+    let _released = slot
+        .acquire()
+        .map_err(|_| io::Error::other("Release failed"))?;
     Ok(())
 }
 

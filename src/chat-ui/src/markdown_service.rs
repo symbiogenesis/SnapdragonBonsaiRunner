@@ -13,7 +13,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::isolated_worker::WorkerSlot;
 use bonsai_windows_process::OwnedProcess;
 
 mod ownership;
@@ -38,8 +39,7 @@ const STARTUP_LIMIT: Duration = Duration::from_secs(10);
 const REQUEST_LIMIT: Duration = Duration::from_secs(2);
 const CLEANUP_LIMIT: Duration = Duration::from_secs(5);
 
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
+static SLOT: WorkerSlot = WorkerSlot::new();
 
 /// Session-local identity for a bounded parse or raster request; zero is an immediate failure.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -94,18 +94,18 @@ struct Shared {
 }
 
 impl Shared {
-    fn ready(&self) {
+    fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ready = true;
+    }
+
+    fn ready(&self) {
+        self.state().ready = true;
     }
 
     fn fail(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state();
         state.failed = true;
         for status in state.results.values_mut() {
             if matches!(status, Status::Pending) {
@@ -115,19 +115,14 @@ impl Shared {
     }
 
     fn pending(&self, ticket: Ticket) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.state()
             .results
             .get(&ticket)
             .is_some_and(|status| matches!(status, Status::Pending))
     }
 
     fn complete(&self, ticket: Ticket, bytes: Vec<u8>) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state();
         if state.failed || self.cancelled.load(Ordering::Acquire) {
             return;
         }
@@ -229,15 +224,11 @@ impl Service {
     /// Terminal formatting failure lets independent model preparation continue.
     pub(crate) fn warm_up(&self) -> bool {
         self.shared.warmup.store(true, Ordering::Release);
-        let state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.shared.state();
         !state.ready
             && !state.failed
             && !self.shared.cancelled.load(Ordering::Acquire)
-            && !ADMISSION_CLOSED.load(Ordering::Acquire)
+            && !SLOT.is_closed()
     }
 
     /// Supplies the verified headless image after native startup prepares it.
@@ -249,16 +240,10 @@ impl Service {
 
     /// Separates a terminal session failure from transient queue backpressure.
     pub(crate) fn unavailable(&self) -> bool {
-        let state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.shared.state();
         let unavailable = state.failed || state.next == u64::MAX;
         drop(state);
-        unavailable
-            || self.shared.cancelled.load(Ordering::Acquire)
-            || ADMISSION_CLOSED.load(Ordering::Acquire)
+        unavailable || self.shared.cancelled.load(Ordering::Acquire) || SLOT.is_closed()
     }
     /// Reuses one service for the native UI context; process setup stays off its thread.
     pub(crate) fn get(context: &egui::Context) -> Option<Arc<Self>> {
@@ -339,11 +324,7 @@ impl Service {
         if self.shared.cancelled.load(Ordering::Acquire) {
             return Ticket(0);
         }
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.shared.state();
         if state.failed || state.results.len() >= MAX_REQUESTS {
             return Ticket(0);
         }
@@ -364,9 +345,7 @@ impl Service {
     /// Polls a result without waiting; absent or released identities fail closed.
     pub(crate) fn poll(&self, ticket: Ticket) -> Status {
         self.shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
             .results
             .get(&ticket)
             .cloned()
@@ -375,12 +354,7 @@ impl Service {
 
     /// Releases obsolete pending/results; queued obsolete sources are skipped before IPC.
     pub(crate) fn release(&self, ticket: Ticket) {
-        self.shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .results
-            .remove(&ticket);
+        self.shared.state().results.remove(&ticket);
     }
 
     /// Closes the parsing session after independently detecting malformed output.
@@ -409,23 +383,23 @@ impl Drop for Service {
     }
 }
 
-struct Active;
-
-impl Active {
-    fn acquire() -> Option<Self> {
-        if ADMISSION_CLOSED.load(Ordering::Acquire) {
-            return None;
+fn finish_prepared_cleanup(
+    mut prepared: ownership::Prepared,
+    reader: Option<JoinHandle<()>>,
+    need_quarantine: bool,
+    shared: &Shared,
+) {
+    if need_quarantine {
+        ownership::quarantine(prepared, reader);
+        shared.cleanup_failed.store(true, Ordering::Release);
+    } else {
+        if let Some(reader) = reader {
+            let _joined = reader.join();
         }
-        ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-impl Drop for Active {
-    fn drop(&mut self) {
-        ACTIVE.store(false, Ordering::Release);
+        if prepared.cleanup().is_err() {
+            shared.cleanup_failed.store(true, Ordering::Release);
+            SLOT.close_admission();
+        }
     }
 }
 
@@ -454,12 +428,12 @@ fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
     {
         return;
     }
-    let Some(_active) = Active::acquire() else {
+    let Ok(_active) = SLOT.acquire() else {
         shared.fail();
         return;
     };
     let startup = Instant::now() + STARTUP_LIMIT;
-    let Ok(mut prepared) = ownership::Prepared::new(image) else {
+    let Ok(prepared) = ownership::Prepared::new(image) else {
         shared.fail();
         return;
     };
@@ -469,13 +443,12 @@ fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
     ) {
         Ok(started) => started,
         Err(error) => {
-            if bonsai_windows_process::process_start_cleanup_unconfirmed(&error) {
-                ownership::quarantine(prepared, None);
-                shared.cleanup_failed.store(true, Ordering::Release);
-            } else if prepared.cleanup().is_err() {
-                shared.cleanup_failed.store(true, Ordering::Release);
-                ADMISSION_CLOSED.store(true, Ordering::Release);
-            }
+            finish_prepared_cleanup(
+                prepared,
+                None,
+                bonsai_windows_process::process_start_cleanup_unconfirmed(&error),
+                shared,
+            );
             shared.fail();
             return;
         }
@@ -487,13 +460,7 @@ fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
         .spawn(move || protocol::exchange(input, output, &commands_rx, &events_tx));
     let Ok(reader) = reader else {
         shared.fail();
-        if process.stop(CLEANUP_LIMIT).is_err() {
-            ownership::quarantine(prepared, None);
-            shared.cleanup_failed.store(true, Ordering::Release);
-        } else if prepared.cleanup().is_err() {
-            shared.cleanup_failed.store(true, Ordering::Release);
-            ADMISSION_CLOSED.store(true, Ordering::Release);
-        }
+        finish_prepared_cleanup(prepared, None, process.stop(CLEANUP_LIMIT).is_err(), shared);
         return;
     };
     let ready = await_event(shared, &process, &events, startup)
@@ -531,16 +498,8 @@ fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
     while stopped && !reader.is_finished() && Instant::now() < cleanup {
         thread::sleep(POLL.min(cleanup.saturating_duration_since(Instant::now())));
     }
-    if !stopped || !reader.is_finished() {
-        ownership::quarantine(prepared, Some(reader));
-        shared.cleanup_failed.store(true, Ordering::Release);
-    } else {
-        let _joined = reader.join();
-        if prepared.cleanup().is_err() {
-            shared.cleanup_failed.store(true, Ordering::Release);
-            ADMISSION_CLOSED.store(true, Ordering::Release);
-        }
-    }
+    let quarantine = !stopped || !reader.is_finished();
+    finish_prepared_cleanup(prepared, Some(reader), quarantine, shared);
 }
 
 fn await_event(

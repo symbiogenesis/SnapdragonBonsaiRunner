@@ -6,21 +6,17 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
-    path::{Component, Path},
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, SyncSender},
-    },
-    thread::{self, JoinHandle},
+    path::Path,
+    sync::mpsc::{self, Receiver, SyncSender},
+    thread,
     time::{Duration, Instant},
 };
 
-use bonsai_windows_credentials::PrivateDirectory;
-use bonsai_windows_process::{OwnedProcess, ProcessSpec, SandboxNetwork, SandboxPolicy};
+use crate::isolated_worker::{
+    SandboxedLaunch, SlotError, WorkerErrors, WorkerSlot, le_u32, le_u64, recv_until,
+    run_sandboxed_piped,
+};
 
 use super::{
     CANCELLED, CHUNK_TOO_LONG, CHUNK_WORKING_BYTES, CODEC_FAILURE, CONVERSION_LIMIT, Chunk,
@@ -38,6 +34,8 @@ const PROCESS_COMMIT_LIMIT: u64 = 256 * 1024 * 1024;
 // pipeline buffer ledger and both requested 64 KiB kernel pipe buffers.
 const ISOLATED_WORKING_BYTES: u64 = PROCESS_COMMIT_LIMIT + CHUNK_WORKING_BYTES + 128 * 1024;
 const CLEANUP_LIMIT: Duration = Duration::from_secs(2);
+const ACTIVE_FAILURE: &str =
+    "Another audio import is still active. Cancel it before selecting a new file.";
 const ISOLATION_FAILURE: &str = "Windows could not start the isolated audio decoder. Transcription stopped. Your draft was kept.";
 const SANDBOX_REBOOT_PENDING_FAILURE: &str = "Windows Update has a pending restart required for the isolated audio decoder. Restart Windows, then reopen Swift. Your draft was kept.";
 const SANDBOX_UNAVAILABLE_FAILURE: &str = "This Windows build lacks the required Windows sandbox (PSEC 1.1) for the isolated audio decoder. Install the latest Windows updates, restart Windows, and reopen Swift. Your draft was kept.";
@@ -45,191 +43,30 @@ const PROTOCOL_FAILURE: &str = "The isolated audio decoder returned invalid or i
 const TIMEOUT: &str = "Windows did not finish decoding the next audio segment. Try converting the recording to WAV. Your draft was kept.";
 const CLEANUP_FAILURE: &str = "Windows could not confirm isolated audio decoder cleanup. Restart the app before importing another file. Your draft was kept.";
 const SOURCE_FAILURE: &str = "Choose a nonempty regular audio file on a local drive. The file must stay unchanged until transcription finishes. Your draft was kept.";
-static ADMISSION_CLOSED: AtomicBool = AtomicBool::new(false);
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static QUARANTINE: OnceLock<Quarantine> = OnceLock::new();
+const ERRORS: WorkerErrors = WorkerErrors {
+    isolation: ISOLATION_FAILURE,
+    reboot_pending: SANDBOX_REBOOT_PENDING_FAILURE,
+    unavailable: SANDBOX_UNAVAILABLE_FAILURE,
+    protocol: PROTOCOL_FAILURE,
+    cleanup: CLEANUP_FAILURE,
+};
+static SLOT: WorkerSlot = WorkerSlot::new();
 
-struct ActiveImport<'a>(&'a AtomicBool);
-
-impl<'a> ActiveImport<'a> {
-    fn acquire(slot: &'a AtomicBool) -> Result<Self, &'static str> {
-        slot.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| Self(slot))
-            .map_err(
-                |_| "Another audio import is still active. Cancel it before selecting a new file.",
-            )
-    }
-}
-
-impl Drop for ActiveImport<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-// At most one import is admitted, and failed cleanup permanently closes new
-// admission. Retain this single quarantine until process exit when native death
-// is unknown; dropped Job/PSEC handles still request terminal OS enforcement.
-struct Quarantine {
-    _source: Selection,
-    _executable: Selection,
-    _scratch: Scratch,
-    _reader: Option<JoinHandle<()>>,
-}
-
-fn quarantine(
-    source: Selection,
-    executable: Selection,
-    scratch: Scratch,
-    reader: Option<JoinHandle<()>>,
-) {
-    ADMISSION_CLOSED.store(true, Ordering::Release);
-    QUARANTINE.get_or_init(|| Quarantine {
-        _source: source,
-        _executable: executable,
-        _scratch: scratch,
-        _reader: reader,
-    });
-}
-
-/// No file contents are read or hashed during authorization. Retained host
-/// directory readers deny ancestor rename; the leaf reader also denies writes.
-struct Selection {
-    _ancestors: Vec<File>,
-    _file: File,
-}
-
-impl Selection {
-    fn open(path: &Path) -> io::Result<Self> {
-        if !path.is_absolute()
-            || !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::Disk(_)))
-            || path
-                .components()
-                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-        {
-            return Err(io::Error::other(SOURCE_FAILURE));
-        }
-        bonsai_windows_process::require_local_data_drive(path)?;
-        let mut ancestors = Vec::new();
-        // Retain parents from the drive root down before opening the leaf, so
-        // a later path grant cannot select a replacement through an ancestor.
-        for ancestor in path
-            .ancestors()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            let directory = OpenOptions::new()
-                .read(true)
-                // FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES. Metadata-only
-                // opens do not enforce denied-delete sharing for renames.
-                .access_mode(0x81)
-                .share_mode(3)
-                .custom_flags(0x0220_0000)
-                .open(ancestor)?;
-            let metadata = directory.metadata()?;
-            if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
-                return Err(io::Error::other(SOURCE_FAILURE));
-            }
-            ancestors.push(directory);
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .custom_flags(0x0020_0000)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() == 0 || metadata.file_attributes() & 0x400 != 0 {
-            return Err(io::Error::other(SOURCE_FAILURE));
-        }
-        Ok(Self {
-            _ancestors: ancestors,
-            _file: file,
-        })
-    }
-}
-
-struct Scratch(Option<PrivateDirectory>);
-
-impl Scratch {
-    fn create() -> io::Result<Self> {
-        PrivateDirectory::create(&std::env::temp_dir()).map(|directory| Self(Some(directory)))
-    }
-
-    fn path(&self) -> io::Result<&Path> {
-        self.0
-            .as_ref()
-            .map(PrivateDirectory::path)
-            .ok_or_else(|| io::Error::other(CLEANUP_FAILURE))
-    }
-
-    fn cleanup(&mut self) -> io::Result<()> {
-        let Some(directory) = self.0.take() else {
-            return Ok(());
-        };
-        let path = directory.path().to_owned();
-        // This worker owns only these fixed entries. Unknown files are retained
-        // privately and reported, rather than traversed or silently discarded.
-        let stderr = path.join("decoder.stderr");
-        if stderr.try_exists()? {
-            fs::remove_file(stderr)?;
-        }
-        let worker = path.join("worker");
-        if worker.try_exists()? {
-            fs::remove_dir(worker)?;
-        }
-        drop(directory);
-        fs::remove_dir(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _removed = self.cleanup();
-    }
-}
-
-struct Prepared {
-    source: Selection,
-    executable_guard: Selection,
-    scratch: Scratch,
-    specification: ProcessSpec,
-    policy: SandboxPolicy,
-}
-
-fn prepare(path: &Path) -> Result<Prepared, &'static str> {
+fn prepare(path: &Path) -> Result<SandboxedLaunch, &'static str> {
     check_memory(ISOLATED_WORKING_BYTES)?;
-    let source = Selection::open(path).map_err(|_| SOURCE_FAILURE)?;
-    let executable = std::env::current_exe().map_err(|_| ISOLATION_FAILURE)?;
-    let executable_guard = Selection::open(&executable).map_err(|_| ISOLATION_FAILURE)?;
-    let scratch = Scratch::create().map_err(|_| ISOLATION_FAILURE)?;
-    let directory = scratch.path().map_err(|_| ISOLATION_FAILURE)?;
-    let working_directory = directory.join("worker");
-    fs::create_dir(&working_directory).map_err(|_| ISOLATION_FAILURE)?;
-    let specification = ProcessSpec {
-        executable: executable.clone(),
-        arguments: vec![
+    SandboxedLaunch::prepare(
+        path,
+        None,
+        "decoder.stdout",
+        "decoder.stderr",
+        usize::try_from(PROCESS_COMMIT_LIMIT).map_err(|_| ISOLATION_FAILURE)?,
+        vec![
             OsString::from("--audio-import-worker"),
             path.as_os_str().to_owned(),
         ],
-        working_directory: working_directory.clone(),
-        stdout: directory.join("decoder.stdout"),
-        stderr: directory.join("decoder.stderr"),
-        memory_limit_bytes: usize::try_from(PROCESS_COMMIT_LIMIT).map_err(|_| ISOLATION_FAILURE)?,
-        active_process_limit: 1,
-    };
-    let policy = SandboxPolicy {
-        readonly_paths: vec![executable, path.to_owned()],
-        writable_directory: working_directory,
-    };
-    Ok(Prepared {
-        source,
-        executable_guard,
-        scratch,
-        specification,
-        policy,
-    })
+        SOURCE_FAILURE,
+        ISOLATION_FAILURE,
+    )
 }
 
 pub(super) fn convert(
@@ -238,96 +75,36 @@ pub(super) fn convert(
     sender: &SyncSender<ImportResult>,
     next: &Receiver<()>,
 ) -> Result<(), &'static str> {
-    let _active = ActiveImport::acquire(&ACTIVE)?;
-    if ADMISSION_CLOSED.load(Ordering::Acquire) {
-        return Err(CLEANUP_FAILURE);
-    }
-    if shared.cancelled.load(Ordering::Acquire) {
+    let _active = SLOT.acquire().map_err(|err| match err {
+        SlotError::Active => ACTIVE_FAILURE,
+        SlotError::Closed => CLEANUP_FAILURE,
+    })?;
+    if shared.cancelled.load(std::sync::atomic::Ordering::Acquire) {
         return Err(CANCELLED);
     }
-    let Prepared {
-        source,
-        executable_guard,
-        mut scratch,
-        specification,
-        policy,
-    } = prepare(path)?;
+    let launch = prepare(path)?;
     let deadline = Instant::now() + CONVERSION_LIMIT;
-    let (process, input, output) =
-        match OwnedProcess::start_sandboxed_piped(&specification, &policy, SandboxNetwork::Offline)
-        {
-            Ok(started) => started,
-            Err(error) if !bonsai_windows_process::process_start_cleanup_unconfirmed(&error) => {
-                if error.kind() == io::ErrorKind::Unsupported {
-                    return Err(if bonsai_windows_process::windows_reboot_pending() {
-                        SANDBOX_REBOOT_PENDING_FAILURE
-                    } else {
-                        SANDBOX_UNAVAILABLE_FAILURE
-                    });
-                }
-                return Err(ISOLATION_FAILURE);
-            }
-            Err(_) => {
-                // A native creation/cleanup error can leave process death unknown.
-                // Retain authority conservatively rather than reopen a source path.
-                quarantine(source, executable_guard, scratch, None);
-                return Err(CLEANUP_FAILURE);
-            }
-        };
-    let (frames, received) = mpsc::sync_channel(1);
-    let (advance, permits) = mpsc::sync_channel(1);
-    let Ok(reader) = thread::Builder::new()
-        .name("bonsai-audio-decoder-pipe".to_owned())
-        .spawn(move || read_frames(input, output, &frames, &permits))
-    else {
-        if process.stop(CLEANUP_LIMIT).is_err() {
-            quarantine(source, executable_guard, scratch, None);
-            drop(process);
-            return Err(CLEANUP_FAILURE);
-        }
-        drop(process);
-        return Err(ISOLATION_FAILURE);
-    };
-    let result = relay(&advance, &received, shared, sender, next, deadline);
-    // A compromised helper cannot keep a pipe reader blocked on channel delivery
-    // during joined shutdown. Dropping permits also wakes its between-frame wait.
-    drop(received);
-    drop(advance);
-    // Successful EOF still requires process exit and an empty Job. Every other
-    // path terminates the exact owned helper, unblocking native codec/pipe calls.
-    let clean = match &result {
-        Ok(_) => process
-            .wait_for_exit(CLEANUP_LIMIT)
-            .and_then(|code| match code {
-                Some(0) if process.active_processes()? == 0 => Ok(()),
-                _ => Err(io::Error::other(CLEANUP_FAILURE)),
-            }),
-        Err(_) => process.stop(CLEANUP_LIMIT),
-    };
-    if clean.is_err() {
-        quarantine(source, executable_guard, scratch, Some(reader));
-        // Close both native owners for terminal OS enforcement, while retaining
-        // path identities and IO ownership until application exit.
-        drop(process);
-        return Err(CLEANUP_FAILURE);
-    }
-    join_reader(reader)?;
-    drop(process);
-    if scratch.cleanup().is_err() {
-        ADMISSION_CLOSED.store(true, Ordering::Release);
-        return Err(CLEANUP_FAILURE);
-    }
-    let final_chunk = result?;
+    let final_chunk = run_sandboxed_piped(
+        &SLOT,
+        launch,
+        CLEANUP_LIMIT,
+        ERRORS,
+        |input, output| {
+            let (frames, received) = mpsc::sync_channel(1);
+            let (advance, permits) = mpsc::sync_channel(1);
+            let reader = thread::Builder::new()
+                .name("bonsai-audio-decoder-pipe".to_owned())
+                .spawn(move || read_frames(input, output, &frames, &permits))?;
+            Ok((reader, (advance, received)))
+        },
+        |(advance, received)| relay(&advance, &received, shared, sender, next, deadline),
+    )?;
     // Final output is admitted only after verified native teardown and scratch
     // cleanup. This prevents a terminal audio result from hiding failed cleanup.
-    if !shared.cancelled.load(Ordering::Acquire) {
+    if !shared.cancelled.load(std::sync::atomic::Ordering::Acquire) {
         let _sent = sender.send(Ok(Some(final_chunk)));
     }
     Ok(())
-}
-
-fn join_reader(reader: JoinHandle<()>) -> Result<(), &'static str> {
-    reader.join().map_err(|_| PROTOCOL_FAILURE)
 }
 
 fn read_frames(
@@ -381,7 +158,7 @@ fn relay(
             return Err(CANCELLED);
         }
         await_advance(shared, next)?;
-        if shared.cancelled.load(Ordering::Acquire) {
+        if shared.cancelled.load(std::sync::atomic::Ordering::Acquire) {
             return Err(CANCELLED);
         }
         // Native writes stay on the supervised IO thread too: a compromised
@@ -396,26 +173,15 @@ fn receive_frame(
     shared: &Shared,
     deadline: Instant,
 ) -> Result<Chunk, &'static str> {
-    loop {
-        if shared.cancelled.load(Ordering::Acquire) {
-            return Err(CANCELLED);
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(TIMEOUT);
-        }
-        match frames.recv_timeout(POLL.min(remaining)) {
-            Ok(result) => {
-                return if shared.cancelled.load(Ordering::Acquire) {
-                    Err(CANCELLED)
-                } else {
-                    result
-                };
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(PROTOCOL_FAILURE),
-        }
-    }
+    recv_until(
+        frames,
+        &shared.cancelled,
+        deadline,
+        POLL,
+        || CANCELLED,
+        || TIMEOUT,
+        || PROTOCOL_FAILURE,
+    )
 }
 
 fn read_frame(read: &mut impl Read, expected_start: Duration) -> Result<Chunk, &'static str> {
@@ -482,19 +248,11 @@ fn read_frame(read: &mut impl Read, expected_start: Duration) -> Result<Chunk, &
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
-    bytes
-        .get(offset..offset + 4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or(PROTOCOL_FAILURE)
+    le_u32(bytes, offset).ok_or(PROTOCOL_FAILURE)
 }
 
 fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, &'static str> {
-    bytes
-        .get(offset..offset + 8)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u64::from_le_bytes)
-        .ok_or(PROTOCOL_FAILURE)
+    le_u64(bytes, offset).ok_or(PROTOCOL_FAILURE)
 }
 
 fn samples(duration: Duration) -> Result<u64, &'static str> {
@@ -564,10 +322,11 @@ pub(super) fn run_worker(arguments: &[OsString]) -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FLAG_LAST, HEADER_BYTES, MAGIC, PROTOCOL_FAILURE, Selection, read_frame, write_frame,
+    use super::{FLAG_LAST, HEADER_BYTES, MAGIC, PROTOCOL_FAILURE, read_frame, write_frame};
+    use crate::{
+        audio_import::{Chunk, MAX_SAMPLES, sample_duration},
+        isolated_worker::PathLock,
     };
-    use crate::audio_import::{Chunk, MAX_SAMPLES, sample_duration};
     use std::{
         fs, io,
         path::PathBuf,
@@ -665,7 +424,7 @@ mod tests {
         let mut fixture = Fixture(path.clone());
         let input = path.join("input.wav");
         fs::write(&input, [1, 2, 3, 4])?;
-        let selected = Selection::open(&input)?;
+        let selected = PathLock::open_nonempty(&input, None)?;
         assert!(fs::write(&input, [9, 9]).is_err());
         let moved = path.with_extension("moved");
         assert!(fs::rename(&path, &moved).is_err());
