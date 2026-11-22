@@ -83,18 +83,9 @@ impl Linear {
         output: &mut [f32],
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
-        let out_width = self.bias.len();
         self.weights
             .multiply_batch_prepared_into(prepared, raw_input, workers, scratch, output, cancel)?;
-        let bias = &self.bias;
-        row_workers::try_run_aligned(output, workers, out_width, &|_, slice| {
-            for row in slice.chunks_exact_mut(out_width) {
-                for (value, b) in row.iter_mut().zip(bias) {
-                    *value += *b;
-                }
-            }
-            finite(slice)
-        })
+        add_batch_bias(output, &self.bias, workers)
     }
 }
 
@@ -747,9 +738,13 @@ fn transform_block(
         v,
         cancel,
     )?;
-    add_batch_bias(q, &block.query.bias, workers)?;
-    add_batch_bias(k, &block.key.bias, workers)?;
-    add_batch_bias(v, &block.value.bias, workers)?;
+    for (dst, bias) in [
+        (&mut *q, &block.query.bias),
+        (&mut *k, &block.key.bias),
+        (&mut *v, &block.value.bias),
+    ] {
+        add_batch_bias(dst, bias, workers)?;
+    }
 
     for _ in 0..(num_rows * c.heads) {
         check(cancel)?;

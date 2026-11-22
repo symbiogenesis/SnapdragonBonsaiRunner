@@ -60,6 +60,16 @@ fn small_integer(value: usize) -> f64 {
     f64::from(u16::try_from(value).unwrap_or(u16::MAX))
 }
 
+fn ensure_zeroed(values: &mut Vec<f32>, len: usize) -> io::Result<()> {
+    if values.len() < len {
+        values
+            .try_reserve_exact(len - values.len())
+            .map_err(io::Error::other)?;
+    }
+    values.resize(len, 0.0);
+    Ok(())
+}
+
 fn zeroes(length: usize) -> io::Result<Vec<f32>> {
     let mut values = Vec::new();
     values
@@ -242,14 +252,7 @@ impl Frontend {
             }
         }
         let padded_len = pcm.len() + 2 * PAD;
-        if scratch.padded.len() < padded_len {
-            let add = padded_len - scratch.padded.len();
-            scratch
-                .padded
-                .try_reserve_exact(add)
-                .map_err(io::Error::other)?;
-        }
-        scratch.padded.resize(padded_len, 0.0);
+        ensure_zeroed(&mut scratch.padded, padded_len)?;
         let padded = &mut scratch.padded[..padded_len];
         for (part, chunk) in pcm.chunks(4096).enumerate() {
             cancelled(&mut is_cancelled)?;
@@ -265,14 +268,7 @@ impl Frontend {
             cancelled(&mut is_cancelled)?;
         }
         let frame_elems = frames * MEL_BINS;
-        if scratch.frame_major.len() < frame_elems {
-            let add = frame_elems - scratch.frame_major.len();
-            scratch
-                .frame_major
-                .try_reserve_exact(add)
-                .map_err(io::Error::other)?;
-        }
-        scratch.frame_major.resize(frame_elems, 0.0);
+        ensure_zeroed(&mut scratch.frame_major, frame_elems)?;
         let frame_major = &mut scratch.frame_major[..frame_elems];
         let level = packed::simd_level();
         row_workers::run_aligned(frame_major, threads, 4 * MEL_BINS, &|elem_off, slice| {
@@ -390,7 +386,14 @@ fn compute_four_frames_simd<S: Simd>(
         );
         *slot = samples * f32x4::splat(simd, frontend.window[index]);
     }
-    mixed_fft_4(simd, input, FFT_SIZE, &frontend.cos, &frontend.sin, output);
+    mixed_fft_lane(
+        SimdLane(simd),
+        input,
+        FFT_SIZE,
+        &frontend.cos,
+        &frontend.sin,
+        output,
+    );
     for (index, slot) in power4.iter_mut().enumerate() {
         let real = output[2 * index];
         let imaginary = output[2 * index + 1];
@@ -469,26 +472,68 @@ fn compute_single_frame(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScalarLane;
+
+#[derive(Clone, Copy)]
+struct SimdLane<S>(S);
+
+trait FftLane: Copy {
+    type Value: Copy
+        + std::ops::Add<Output = Self::Value>
+        + std::ops::Sub<Output = Self::Value>
+        + std::ops::Mul<Output = Self::Value>
+        + std::ops::Neg<Output = Self::Value>;
+
+    fn splat(self, value: f32) -> Self::Value;
+}
+
+impl FftLane for ScalarLane {
+    type Value = f32;
+
+    #[expect(
+        clippy::inline_always,
+        reason = "Matches SIMD FFT inlining across recursive calls."
+    )]
+    #[inline(always)]
+    fn splat(self, value: f32) -> f32 {
+        value
+    }
+}
+
+impl<S: Simd> FftLane for SimdLane<S> {
+    type Value = f32x4<S>;
+
+    #[expect(
+        clippy::inline_always,
+        reason = "fearless_simd FFT helper inherits target_feature from dispatch!."
+    )]
+    #[inline(always)]
+    fn splat(self, value: f32) -> f32x4<S> {
+        f32x4::splat(self.0, value)
+    }
+}
+
 #[expect(
     clippy::inline_always,
     reason = "fearless_simd recursive FFT helper inherits target_feature from dispatch!."
 )]
 #[inline(always)]
-fn fft5_real_4<S: Simd>(
-    simd: S,
-    x: [f32x4<S>; 5],
-    c1: f32x4<S>,
-    s1: f32x4<S>,
-    c2: f32x4<S>,
-    s2: f32x4<S>,
-    out: &mut [f32x4<S>],
+fn fft5_real<L: FftLane>(
+    lane: L,
+    x: [L::Value; 5],
+    c1: L::Value,
+    s1: L::Value,
+    c2: L::Value,
+    s2: L::Value,
+    out: &mut [L::Value],
 ) {
     let p1 = x[1] + x[4];
     let p2 = x[2] + x[3];
     let d1 = x[1] - x[4];
     let d2 = x[2] - x[3];
     out[0] = (x[0] + p1) + p2;
-    out[1] = f32x4::splat(simd, 0.0);
+    out[1] = lane.splat(0.0);
     let re1 = x[0] + (p1 * c1 + p2 * c2);
     let im1 = -(d1 * s1 + d2 * s2);
     let re2 = x[0] + (p1 * c2 + p2 * c1);
@@ -503,22 +548,34 @@ fn fft5_real_4<S: Simd>(
     out[9] = -im1;
 }
 
+// Exact mixed-radix split, odd-leaf DFT and butterfly order of the reviewed
+// fp32 frontend. Buffers follow its 2*N input / 8*N output scratch contract.
+fn mixed_fft(
+    input: &mut [f32],
+    size: usize,
+    cos: &[f32; FFT_SIZE],
+    sin: &[f32; FFT_SIZE],
+    output: &mut [f32],
+) {
+    mixed_fft_lane(ScalarLane, input, size, cos, sin, output);
+}
+
 #[expect(
     clippy::inline_always,
     reason = "fearless_simd recursive FFT helper inherits target_feature from dispatch!."
 )]
 #[inline(always)]
-fn mixed_fft_4<S: Simd>(
-    simd: S,
-    input: &mut [f32x4<S>],
+fn mixed_fft_lane<L: FftLane>(
+    lane: L,
+    input: &mut [L::Value],
     size: usize,
     cos: &[f32; FFT_SIZE],
     sin: &[f32; FFT_SIZE],
-    output: &mut [f32x4<S>],
+    output: &mut [L::Value],
 ) {
     if size == 1 {
         output[0] = input[0];
-        output[1] = f32x4::splat(simd, 0.0);
+        output[1] = lane.splat(0.0);
     } else if size.is_multiple_of(2) {
         let half = size / 2;
         let (original, input_scratch) = input.split_at_mut(size);
@@ -526,17 +583,17 @@ fn mixed_fft_4<S: Simd>(
             input_scratch[index] = original[2 * index];
         }
         let (result, output_scratch) = output.split_at_mut(2 * size);
-        mixed_fft_4(simd, input_scratch, half, cos, sin, output_scratch);
+        mixed_fft_lane(lane, input_scratch, half, cos, sin, output_scratch);
         for index in 0..half {
             input_scratch[index] = original[2 * index + 1];
         }
         let (even, odd_scratch) = output_scratch.split_at_mut(size);
-        mixed_fft_4(simd, input_scratch, half, cos, sin, odd_scratch);
+        mixed_fft_lane(lane, input_scratch, half, cos, sin, odd_scratch);
         let step = FFT_SIZE / size;
         for bin in 0..half {
             let phase = bin * step;
-            let wr = f32x4::splat(simd, cos[phase]);
-            let wi = f32x4::splat(simd, -sin[phase]);
+            let wr = lane.splat(cos[phase]);
+            let wi = lane.splat(-sin[phase]);
             let real = odd_scratch[2 * bin];
             let imaginary = odd_scratch[2 * bin + 1];
             let wr_real = wr * real;
@@ -550,26 +607,26 @@ fn mixed_fft_4<S: Simd>(
         }
     } else if size == 5 {
         let stride = FFT_SIZE / 5;
-        fft5_real_4(
-            simd,
+        fft5_real(
+            lane,
             [input[0], input[1], input[2], input[3], input[4]],
-            f32x4::splat(simd, cos[stride]),
-            f32x4::splat(simd, sin[stride]),
-            f32x4::splat(simd, cos[2 * stride]),
-            f32x4::splat(simd, sin[2 * stride]),
+            lane.splat(cos[stride]),
+            lane.splat(sin[stride]),
+            lane.splat(cos[2 * stride]),
+            lane.splat(sin[2 * stride]),
             output,
         );
     } else if size == 25 {
         let fifth = 5_usize;
         let stride5 = FFT_SIZE / 5;
-        let c1 = f32x4::splat(simd, cos[stride5]);
-        let s1 = f32x4::splat(simd, sin[stride5]);
-        let c2 = f32x4::splat(simd, cos[2 * stride5]);
-        let s2 = f32x4::splat(simd, sin[2 * stride5]);
-        let mut sub_area = [f32x4::splat(simd, 0.0); 50];
+        let c1 = lane.splat(cos[stride5]);
+        let s1 = lane.splat(sin[stride5]);
+        let c2 = lane.splat(cos[2 * stride5]);
+        let s2 = lane.splat(sin[2 * stride5]);
+        let mut sub_area = [lane.splat(0.0); 50];
         for rem in 0..5 {
-            fft5_real_4(
-                simd,
+            fft5_real(
+                lane,
                 [
                     input[rem],
                     input[5 + rem],
@@ -588,21 +645,17 @@ fn mixed_fft_4<S: Simd>(
         for bin in 0..fifth {
             let t0r = sub_area[2 * bin];
             let t0i = sub_area[2 * bin + 1];
-            let mut tr = [f32x4::splat(simd, 0.0); 5];
-            let mut ti = [f32x4::splat(simd, 0.0); 5];
+            let mut tr = [lane.splat(0.0); 5];
+            let mut ti = [lane.splat(0.0); 5];
             for rem in 1..5 {
                 let phase = (rem * bin * step) % FFT_SIZE;
-                let wr = f32x4::splat(simd, cos[phase]);
-                let wi = f32x4::splat(simd, -sin[phase]);
+                let wr = lane.splat(cos[phase]);
+                let wi = lane.splat(-sin[phase]);
                 let base = rem * 10 + 2 * bin;
                 let xr = sub_area[base];
                 let xi = sub_area[base + 1];
-                let wr_xr = wr * xr;
-                let wi_xi = wi * xi;
-                let wr_xi = wr * xi;
-                let wi_xr = wi * xr;
-                tr[rem] = wr_xr - wi_xi;
-                ti[rem] = wr_xi + wi_xr;
+                tr[rem] = wr * xr - wi * xi;
+                ti[rem] = wr * xi + wi * xr;
             }
             let p1r = tr[1] + tr[4];
             let p1i = ti[1] + ti[4];
@@ -634,12 +687,12 @@ fn mixed_fft_4<S: Simd>(
     } else {
         let stride = FFT_SIZE / size;
         for bin in 0..size {
-            let mut real = f32x4::splat(simd, 0.0);
-            let mut imaginary = f32x4::splat(simd, 0.0);
+            let mut real = lane.splat(0.0);
+            let mut imaginary = lane.splat(0.0);
             for (index, sample) in input[..size].iter().enumerate() {
                 let phase = (bin * index * stride) % FFT_SIZE;
-                real += *sample * f32x4::splat(simd, cos[phase]);
-                imaginary -= *sample * f32x4::splat(simd, sin[phase]);
+                real = real + *sample * lane.splat(cos[phase]);
+                imaginary = imaginary - *sample * lane.splat(sin[phase]);
             }
             output[2 * bin] = real;
             output[2 * bin + 1] = imaginary;
@@ -694,157 +747,6 @@ fn normalize(values: &mut [f32], check: &mut impl FnMut() -> bool) -> io::Result
         }
     }
     cancelled(check)
-}
-
-fn fft5_real(x: [f32; 5], c1: f32, s1: f32, c2: f32, s2: f32, out: &mut [f32]) {
-    let p1 = x[1] + x[4];
-    let p2 = x[2] + x[3];
-    let d1 = x[1] - x[4];
-    let d2 = x[2] - x[3];
-    out[0] = (x[0] + p1) + p2;
-    out[1] = 0.0;
-    let re1 = x[0] + (p1 * c1 + p2 * c2);
-    let im1 = -(d1 * s1 + d2 * s2);
-    let re2 = x[0] + (p1 * c2 + p2 * c1);
-    let im2 = -(d1 * s2 - d2 * s1);
-    out[2] = re1;
-    out[3] = im1;
-    out[4] = re2;
-    out[5] = im2;
-    out[6] = re2;
-    out[7] = -im2;
-    out[8] = re1;
-    out[9] = -im1;
-}
-
-// Exact mixed-radix split, odd-leaf DFT and butterfly order of the reviewed
-// fp32 frontend. Buffers follow its 2*N input / 8*N output scratch contract.
-fn mixed_fft(
-    input: &mut [f32],
-    size: usize,
-    cos: &[f32; FFT_SIZE],
-    sin: &[f32; FFT_SIZE],
-    output: &mut [f32],
-) {
-    if size == 1 {
-        output[0] = input[0];
-        output[1] = 0.0;
-    } else if size.is_multiple_of(2) {
-        let half = size / 2;
-        let (original, input_scratch) = input.split_at_mut(size);
-        for index in 0..half {
-            input_scratch[index] = original[2 * index];
-        }
-        let (result, output_scratch) = output.split_at_mut(2 * size);
-        mixed_fft(input_scratch, half, cos, sin, output_scratch);
-        for index in 0..half {
-            input_scratch[index] = original[2 * index + 1];
-        }
-        let (even, odd_scratch) = output_scratch.split_at_mut(size);
-        mixed_fft(input_scratch, half, cos, sin, odd_scratch);
-        let step = FFT_SIZE / size;
-        for bin in 0..half {
-            let phase = bin * step;
-            let wr = cos[phase];
-            let wi = -sin[phase];
-            let real = odd_scratch[2 * bin];
-            let imaginary = odd_scratch[2 * bin + 1];
-            result[2 * bin] = even[2 * bin] + wr * real - wi * imaginary;
-            result[2 * bin + 1] = even[2 * bin + 1] + wr * imaginary + wi * real;
-            result[2 * (bin + half)] = even[2 * bin] - wr * real + wi * imaginary;
-            result[2 * (bin + half) + 1] = even[2 * bin + 1] - wr * imaginary - wi * real;
-        }
-    } else if size == 5 {
-        let stride = FFT_SIZE / 5;
-        fft5_real(
-            [input[0], input[1], input[2], input[3], input[4]],
-            cos[stride],
-            sin[stride],
-            cos[2 * stride],
-            sin[2 * stride],
-            output,
-        );
-    } else if size == 25 {
-        let fifth = 5_usize;
-        let stride5 = FFT_SIZE / 5;
-        let c1 = cos[stride5];
-        let s1 = sin[stride5];
-        let c2 = cos[2 * stride5];
-        let s2 = sin[2 * stride5];
-        let mut sub_area = [0.0_f32; 50];
-        for rem in 0..5 {
-            fft5_real(
-                [
-                    input[rem],
-                    input[5 + rem],
-                    input[10 + rem],
-                    input[15 + rem],
-                    input[20 + rem],
-                ],
-                c1,
-                s1,
-                c2,
-                s2,
-                &mut sub_area[rem * 10..(rem + 1) * 10],
-            );
-        }
-        let step = FFT_SIZE / 25;
-        for bin in 0..fifth {
-            let t0r = sub_area[2 * bin];
-            let t0i = sub_area[2 * bin + 1];
-            let mut tr = [0.0_f32; 5];
-            let mut ti = [0.0_f32; 5];
-            for rem in 1..5 {
-                let phase = (rem * bin * step) % FFT_SIZE;
-                let wr = cos[phase];
-                let wi = -sin[phase];
-                let base = rem * 10 + 2 * bin;
-                let xr = sub_area[base];
-                let xi = sub_area[base + 1];
-                tr[rem] = wr * xr - wi * xi;
-                ti[rem] = wr * xi + wi * xr;
-            }
-            let p1r = tr[1] + tr[4];
-            let p1i = ti[1] + ti[4];
-            let p2r = tr[2] + tr[3];
-            let p2i = ti[2] + ti[3];
-            let d1r = tr[1] - tr[4];
-            let d1i = ti[1] - ti[4];
-            let d2r = tr[2] - tr[3];
-            let d2i = ti[2] - ti[3];
-            output[2 * bin] = (t0r + p1r) + p2r;
-            output[2 * bin + 1] = (t0i + p1i) + p2i;
-            let br1 = t0r + (p1r * c1 + p2r * c2);
-            let bi1 = t0i + (p1i * c1 + p2i * c2);
-            let sr1 = d1r * s1 + d2r * s2;
-            let si1 = d1i * s1 + d2i * s2;
-            output[2 * (bin + fifth)] = br1 + si1;
-            output[2 * (bin + fifth) + 1] = bi1 - sr1;
-            output[2 * (bin + 4 * fifth)] = br1 - si1;
-            output[2 * (bin + 4 * fifth) + 1] = bi1 + sr1;
-            let br2 = t0r + (p1r * c2 + p2r * c1);
-            let bi2 = t0i + (p1i * c2 + p2i * c1);
-            let sr2 = d1r * s2 - d2r * s1;
-            let si2 = d1i * s2 - d2i * s1;
-            output[2 * (bin + 2 * fifth)] = br2 + si2;
-            output[2 * (bin + 2 * fifth) + 1] = bi2 - sr2;
-            output[2 * (bin + 3 * fifth)] = br2 - si2;
-            output[2 * (bin + 3 * fifth) + 1] = bi2 + sr2;
-        }
-    } else {
-        let stride = FFT_SIZE / size;
-        for bin in 0..size {
-            let mut real = 0.0;
-            let mut imaginary = 0.0;
-            for (index, sample) in input[..size].iter().enumerate() {
-                let phase = (bin * index * stride) % FFT_SIZE;
-                real += *sample * cos[phase];
-                imaginary -= *sample * sin[phase];
-            }
-            output[2 * bin] = real;
-            output[2 * bin + 1] = imaginary;
-        }
-    }
 }
 
 #[cfg(test)]
