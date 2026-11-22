@@ -247,6 +247,34 @@ loaded drafter or checkpoint-free serving path.
 floating gates can underflow/saturate and convolution overwrites history. Use snapshots or saved
 factors with checked forward reconstruction.
 
+### Speculative suffix replay folding and adaptive gating
+
+Following the [LookAtMyQuant Qwen3.5/3.8 runtime](research-register.md#hybrid-recurrence-prefix-caching-and-speculative-decoding)
+reference patterns (`block_q35.py`, `drafter_q35.py` and `strategies/ngram_source_cursor.py`), two
+zero-weight-cost mechanisms apply to `prism-inference`'s deterministic `--spec-type suffix` path
+and batched verifier while preserving Swift's stochastic sampler contract:
+
+- **Folded accepted-prefix GDN/convolution replay (`block_q35.py` pattern):** After a partial
+  rejection inside a verified block, truncate full-attention KV directly and carry the accepted
+  prefix's GDN/convolution replay into the next verification block's layer pass instead of issuing an
+  immediate separate weight-streaming replay pass. Require explicit eager flush before returning to
+  serial decode, on stop/EOS, on cancellation/deadline and before checkpoint capture/publication.
+  Require bit-exact KV/GDN/convolution state and logit parity against eager replay, complete atomic
+  rollback, separate `SpeculativeStats` accounting for folded versus eager replay passes, and
+  composition with both `RankOneAdapter` (Orca) and `MultiRankAdapter` (DaisyRose) without changing
+  Hexagon or CPU arithmetic boundaries.
+- **Adaptive break-even speculation gating and moving source-cursor suffix matching (`drafter_q35.py` /
+  `ngram_source_cursor.py` patterns):** Extend deterministic `SuffixDecoding` (`--spec-type suffix`)
+  with a bounded moving prompt/history source cursor so repetitive coding, editing and tool outputs
+  continue proposing across minor local mismatches without exceeding `MAX_SPECULATIVE_DRAFT_TOKENS`
+  or `MAX_SUFFIX_MATCH_TOKENS`. Pair this with a self-calibrating break-even gate that tracks
+  rolling observed `verify / serial` latency (charging replay and flush overhead) and pauses
+  speculation into bounded exact serial bursts whenever rolling acceptance drops below break-even.
+  This protects Thinking-OFF creative prose while retaining speedups on DaisyRose coding and
+  structured workloads, adds zero model weights, preserves exact `generate_sampled_speculative_until`
+  target distribution and RNG draw order, and requires matched-power X1/X2 complete-cycle benefit
+  qualification before serving enablement.
+
 ### 2026 state-traffic and verification research
 
 The [hybrid-state catalog](research-register.md#hybrid-recurrence-prefix-caching-and-speculative-decoding)

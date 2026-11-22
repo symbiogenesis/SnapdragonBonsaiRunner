@@ -165,6 +165,20 @@ GPU/gradient retraining). Ordered levers mapped to diagnosed `DR-G2` failures
 2. **Closed-form activation-guided weight-space edits (pure-Rust linear algebra
    / convex LP on bounded `Swift-Bonsai-2` activations — zero gradient
    retraining)**:
+   - Apply equal-byte per-site KL-gap and Softmax-Fisher variable-rank
+     reallocation (following
+     [LookAtMyQuant sensitivity allocation](research-register.md#small-edits-around-cheaper-execution)):
+     instead of uniform `r = 16` across all 128 `npu-friendly` sites
+     (`64 MiB` F16), score each site on disjoint diagnostic splits by isolated /
+     leave-one-out KL gap (`KL(all) - KL(site = 0)`) and token-weighted output
+     Softmax-Fisher (`E[p_v(1 - p_v)]`), separating Thinking-ON coding/reasoning
+     gain from Thinking-OFF creative/Orca drift. Reallocate variable per-site
+     rank (`r = 0..32`, bounded to `<= 64 MiB` total F16 payload inside
+     `npu-friendly` and `MultiRankAdapter`) toward high-SNR late reasoning
+     layers (such as `blk.63.ffn_down` `14.92x` and `blk.63.attn_output`
+     `11.61x`) while zeroing or trimming noisy or prose-interfering early sites.
+     Record all diagnostic prompt digests in `trainingPromptSha256s` so final
+     held-out `DR-G2` splits remain untouched.
    - Apply targeted behavioral remediation via `bonsai-tools weight-patch` (PDHG
      sparse LP `u * (v^T * h)` on original-basis activations, compared against a
      constant residual steering baseline `x + β d` per

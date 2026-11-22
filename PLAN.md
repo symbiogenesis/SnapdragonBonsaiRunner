@@ -494,6 +494,20 @@ adoption decisions without displacing native daily-use acceptance.
   published Bonsai DFlash2 drafter, then bounded adaptive length. Charge target
   features, shared embeddings/head, adapters/tokenizers, both models and rejected
   work under [speculation contracts](docs/inference-algorithms.md#hybrid-cache-reuse-and-speculative-state).
+- [ ] Implement and qualify folded accepted-prefix GDN/conv replay, moving
+  source-cursor suffix matching, and self-calibrating adaptive break-even
+  speculation gating in `prism-inference` under
+  [speculative suffix replay folding and adaptive gating](docs/inference-algorithms.md#speculative-suffix-replay-folding-and-adaptive-gating)
+  (pinned [LookAtMyQuant runtime reference](docs/research-register.md#hybrid-recurrence-prefix-caching-and-speculative-decoding),
+  `51069235`, MIT). Fold partial-rejection accepted-prefix GDN/conv replay into
+  the next verification block with explicit flush on serial exit, stop,
+  cancellation, deadline and checkpoint capture; pair `--spec-type suffix` with
+  a bounded moving source cursor and rolling `verify / serial` break-even gating
+  so DaisyRose coding/copying gains do not regress Swift creative prose. Require
+  bit-exact state/logit parity against eager replay, exact
+  `generate_sampled_speculative_until` sampler/RNG order, stacked Orca +
+  DaisyRose adapter compatibility, and matched-power X1/X2 complete-cycle
+  benefit before serving enablement.
 - [ ] Apply reviewed [cache/batch/transfer planning](docs/inference-algorithms.md#cache-batch-and-transfer-planning)
   to selected consumers: complete page identities, one cache owner, bounded
   transfer queues, terminal completion and cancellation before publication/reuse.
@@ -873,10 +887,15 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   depth masking, singular-mode/coefficient pruning and norm capping generalizing
   `adapter-edit`, and Orca subspace orthogonalization at overlapping sites); if
   behavioral or manifold defects persist, apply bounded closed-form
-  activation-guided pure-Rust edits (`weight-patch` PDHG sparse LP vs
-  constant-steering baseline folded/appended at `ffn_down`, or
-  `ffn-surrogate`-style closed-form ridge realignment of `A`/`B` on bounded
-  `Swift-Bonsai-2` captures). Keep any diagnostic/fit prompts strictly disjoint
+  activation-guided pure-Rust edits (equal-byte per-site KL-gap &
+  Softmax-Fisher variable-rank reallocation `r = 0..32` across the 128
+  `npu-friendly` sites within `<= 64 MiB` F16 — prioritizing high-SNR late
+  reasoning layers while trimming noisy or Thinking-OFF creative/Orca-interfering
+  sites per [DR-W1 direct weight editing](docs/daisyrose-composition.md#stage-3-dr-w1-direct-weight-editing-remediation-zero-retraining-pure-rust)
+  and [LookAtMyQuant sensitivity allocation](docs/research-register.md#small-edits-around-cheaper-execution),
+  `weight-patch` PDHG sparse LP vs constant-steering baseline folded/appended at
+  `ffn_down`, or `ffn-surrogate`-style closed-form ridge realignment of `A`/`B`
+  on bounded `Swift-Bonsai-2` captures). Keep any diagnostic/fit prompts strictly disjoint
   from final untouched held-out `DR-G2` prompts (`trainingPromptSha256s`),
   re-verify with `verify-adapter`, and re-score fail-closed with `dr-g2-score`;
   if bounded direct edits still fail `DR-G2`, record the no-go outcome and
@@ -1064,7 +1083,10 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] **U2 — Allocate approximation and recovery by measured sensitivity.** Extend
   W8.1 with a bounded one-site-at-a-time screen using U1 and the same normalized
   inputs: activation-weighted branch error, local output/logit effects and
-  changed-prefix drift. Keep comparative site/rank/policy screens in owner-operated
+  changed-prefix drift, optionally paired with per-site KL gap
+  (`KL(all) - KL(site = reference)`) and output Softmax-Fisher
+  (`E[p_v(1 - p_v)]`) weighting on disjoint U1 splits
+  ([LookAtMyQuant sensitivity allocation](docs/research-register.md#small-edits-around-cheaper-execution)). Keep comparative site/rank/policy screens in owner-operated
   CI; device capture selects one predeclared site within its original aggregate
   allowance. Review FFN/projection roles, embeddings/output and
   attention/recurrent boundaries separately. Compare magnitude/uniform choices
