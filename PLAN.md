@@ -508,6 +508,11 @@ adoption decisions without displacing native daily-use acceptance.
   `generate_sampled_speculative_until` sampler/RNG order, stacked Orca +
   DaisyRose adapter compatibility, and matched-power X1/X2 complete-cycle
   benefit before serving enablement.
+  (Source landed in `prism-inference` commits `f27213d`, `93bd46c`, and `2d4e0d7`
+  with synthetic hybrid/adapter unit controls in `speculative::tests`,
+  `graph::prefill::folded_tests`, and `runtime::sampled_speculation::tests`;
+  hosted CI, serving wire-up, and matched-power X1/X2 complete-cycle benefit
+  qualification remain open.)
 - [ ] Apply reviewed [cache/batch/transfer planning](docs/inference-algorithms.md#cache-batch-and-transfer-planning)
   to selected consumers: complete page identities, one cache owner, bounded
   transfer queues, terminal completion and cancellation before publication/reuse.
@@ -900,6 +905,10 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   re-verify with `verify-adapter`, and re-score fail-closed with `dr-g2-score`;
   if bounded direct edits still fail `DR-G2`, record the no-go outcome and
   leave `config/daisyrose-lora.lock.json` unpinned.
+  (Pure-Rust `calibration_metrics` KL-gap / Softmax-Fisher / exact MCKP helpers
+  and `bonsai-tools lora-diff-audit` `reallocate-ranks` plus `edit-adapter`
+  `perSiteRanks` landed locally with synthetic unit controls; conditional `DR-G2`
+  trigger and X1/X2 device qualification remain open.)
 - [ ] **DR-C1 — Extend `prism-inference` for stackable `MultiRankAdapter` after `DR-G2` passes.**
   Generalize `prism-inference` (`src/model/lora.rs`) beyond rank-1
   `RankOneAdapter` to support a stackable `MultiRankAdapter` alongside
@@ -1095,6 +1104,11 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   then qualify multi-site composition and complete held-out answers through W8.4;
   stop at a failed local gate. No wider decode of ternary weights can recover
   unavailable original precision, and local sensitivity is no quality guarantee.
+  (U2 `schemaVersion: 2` bounded one-site-at-a-time sensitivity screening with
+  strict U1 split disjointness, separate role reporting, KL-gap/Softmax-Fisher
+  scoring, and exact MCKP vs uniform/magnitude baselines landed locally in
+  `bonsai-tools ffn-plan` with unit controls; owner CI and X1/X2 capture/W8.4
+  qualification remain open.)
 - [ ] **U3 — Screen heterogeneous execution precision only after K1 attribution.**
   For a measured cache/activation bottleneck, compare one explicit static
   per-layer/per-role policy with uniform K4/V4 and FP16 controls; reuse K1's

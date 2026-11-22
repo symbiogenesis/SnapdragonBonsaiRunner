@@ -274,6 +274,11 @@ and batched verifier while preserving Swift's stochastic sampler contract:
   structured workloads, adds zero model weights, preserves exact `generate_sampled_speculative_until`
   target distribution and RNG draw order, and requires matched-power X1/X2 complete-cycle benefit
   qualification before serving enablement.
+- **Landed engine source (pending X1/X2 qualification):** `prism-inference` commits `f27213d`,
+  `93bd46c`, and `2d4e0d7` implement `MovingSourceCursor`, `AdaptiveSpeculationGate`,
+  `Decoder` folded verification hooks + `FoldedRecurrentLayerTape` in `Qwen35`, and
+  `generate_sampled_speculative_with_gate_until`, verified locally via unit parity/rollback controls
+  while hosted CI and X1/X2 device benchmarks remain open.
 
 ### 2026 state-traffic and verification research
 
