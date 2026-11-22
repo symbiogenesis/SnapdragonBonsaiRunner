@@ -320,9 +320,511 @@ impl RowMetricsAccumulator {
     }
 }
 
+/// Numerically stable log-softmax in `f64` from raw logits.
+///
+/// # Errors
+/// Returns an error if `logits` is empty or contains non-finite values.
+pub fn log_softmax_f64(logits: &[f64]) -> Result<Vec<f64>> {
+    if logits.is_empty() {
+        return Err("log_softmax requires at least one logit".to_owned());
+    }
+    let mut max_logit = f64::NEG_INFINITY;
+    for &value in logits {
+        if !value.is_finite() {
+            return Err(format!("logit must be finite, got {value}"));
+        }
+        if value > max_logit {
+            max_logit = value;
+        }
+    }
+    let sum_exp: f64 = logits.iter().map(|&value| (value - max_logit).exp()).sum();
+    if !sum_exp.is_finite() || sum_exp <= 0.0 {
+        return Err("log_softmax normalizer must be positive and finite".to_owned());
+    }
+    let log_z = max_logit + sum_exp.ln();
+    Ok(logits.iter().map(|&value| value - log_z).collect())
+}
+
+/// Forward KL divergence `KL(teacher || student)` computed in `f64` from raw logits.
+///
+/// # Errors
+/// Returns an error on length mismatch, empty vectors, or non-finite values.
+pub fn kl_divergence_from_logits(teacher_logits: &[f64], student_logits: &[f64]) -> Result<f64> {
+    if teacher_logits.len() != student_logits.len() {
+        return Err(format!(
+            "KL logit vocabulary length mismatch: teacher={}, student={}",
+            teacher_logits.len(),
+            student_logits.len()
+        ));
+    }
+    let log_p = log_softmax_f64(teacher_logits)?;
+    let log_q = log_softmax_f64(student_logits)?;
+    let mut kl = 0.0_f64;
+    for (&lp, &lq) in log_p.iter().zip(&log_q) {
+        let p = lp.exp();
+        if p > 0.0 {
+            kl += p * (lp - lq);
+        }
+    }
+    if !kl.is_finite() {
+        return Err("KL divergence overflowed finite bounds".to_owned());
+    }
+    Ok(kl.max(0.0))
+}
+
+/// Softmax-Fisher information weight `sum_v p_v * (1 - p_v)` computed in `f64` from logits.
+///
+/// Bounded in `[0.0, 1.0]`, peaking on high-ambiguity decision distributions and vanishing
+/// on one-hot near-deterministic predictions.
+///
+/// # Errors
+/// Returns an error if `logits` is empty or contains non-finite values.
+pub fn softmax_fisher_from_logits(logits: &[f64]) -> Result<f64> {
+    let log_p = log_softmax_f64(logits)?;
+    let mut argmax = 0_usize;
+    let mut best_lp = f64::NEG_INFINITY;
+    for (idx, &lp) in log_p.iter().enumerate() {
+        if lp > best_lp {
+            best_lp = lp;
+            argmax = idx;
+        }
+    }
+    let probs: Vec<f64> = log_p.into_iter().map(f64::exp).collect();
+    let rest_sum: f64 = probs
+        .iter()
+        .enumerate()
+        .filter(|&(idx, _)| idx != argmax)
+        .map(|(_, &p)| p)
+        .sum();
+    let fisher: f64 = probs[argmax] * rest_sum
+        + probs
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| idx != argmax)
+            .map(|(_, &p)| p * (1.0 - p))
+            .sum::<f64>();
+    if !fisher.is_finite() {
+        return Err("softmax Fisher weight overflowed finite bounds".to_owned());
+    }
+    Ok(fisher.clamp(0.0, 1.0))
+}
+
+/// Per-token Softmax-Fisher weights for a slice of teacher logit rows.
+///
+/// # Errors
+/// Returns an error if any token row is empty or contains non-finite logits.
+pub fn token_softmax_fisher_weights<T: AsRef<[f64]>>(teacher_logits: &[T]) -> Result<Vec<f64>> {
+    let mut weights = Vec::with_capacity(teacher_logits.len());
+    for row in teacher_logits {
+        weights.push(softmax_fisher_from_logits(row.as_ref())?);
+    }
+    Ok(weights)
+}
+
+/// Non-negative weighted mean KL divergence across diagnostic tokens.
+///
+/// Falls back cleanly to unweighted mean if all weights are `0.0` (all deterministic one-hot).
+///
+/// # Errors
+/// Returns an error on empty slices, length mismatch, negative weights, or non-finite inputs.
+pub fn weighted_mean_kl_divergence(kl_values: &[f64], weights: &[f64]) -> Result<f64> {
+    if kl_values.is_empty() || kl_values.len() != weights.len() {
+        return Err(format!(
+            "weighted mean KL requires matching non-empty vectors (kl={}, weights={})",
+            kl_values.len(),
+            weights.len()
+        ));
+    }
+    let mut weight_sum = 0.0_f64;
+    let mut weighted_sum = 0.0_f64;
+    let mut raw_sum = 0.0_f64;
+    for (&kl, &w) in kl_values.iter().zip(weights) {
+        if !kl.is_finite() || kl < 0.0 {
+            return Err(format!("KL value must be finite and non-negative, got {kl}"));
+        }
+        if !w.is_finite() || w < 0.0 {
+            return Err(format!("weight must be finite and non-negative, got {w}"));
+        }
+        weight_sum += w;
+        weighted_sum += w * kl;
+        raw_sum += kl;
+    }
+    if !weight_sum.is_finite() || !weighted_sum.is_finite() || !raw_sum.is_finite() {
+        return Err("weighted KL aggregation overflowed finite bounds".to_owned());
+    }
+    if weight_sum == 0.0 {
+        return Ok(raw_sum / count_as_f64(kl_values.len())?);
+    }
+    Ok(weighted_sum / weight_sum)
+}
+
+/// Fisher-weighted `(base_kl, recovered_kl, kl_gap)` across diagnostic tokens.
+///
+/// `kl_gap = weighted_mean(KL(teacher || base)) - weighted_mean(KL(teacher || recovered))`.
+/// Positive `kl_gap` quantifies how much teacher-aligned KL divergence recovering the site removes.
+///
+/// # Errors
+/// Returns an error if token counts or vocabulary widths mismatch, slices are empty, or logits
+/// contain non-finite entries.
+pub fn per_site_fisher_weighted_kl_metrics<T: AsRef<[f64]>>(
+    teacher_logits: &[T],
+    base_logits: &[T],
+    recovered_logits: &[T],
+) -> Result<(f64, f64, f64)> {
+    if teacher_logits.is_empty()
+        || teacher_logits.len() != base_logits.len()
+        || teacher_logits.len() != recovered_logits.len()
+    {
+        return Err(format!(
+            "per-site KL gap requires matching non-empty token counts (teacher={}, base={}, recovered={})",
+            teacher_logits.len(),
+            base_logits.len(),
+            recovered_logits.len()
+        ));
+    }
+    let weights = token_softmax_fisher_weights(teacher_logits)?;
+    let mut base_kls = Vec::with_capacity(teacher_logits.len());
+    let mut rec_kls = Vec::with_capacity(teacher_logits.len());
+    for ((t, b), r) in teacher_logits
+        .iter()
+        .zip(base_logits)
+        .zip(recovered_logits)
+    {
+        base_kls.push(kl_divergence_from_logits(t.as_ref(), b.as_ref())?);
+        rec_kls.push(kl_divergence_from_logits(t.as_ref(), r.as_ref())?);
+    }
+    let base_mean = weighted_mean_kl_divergence(&base_kls, &weights)?;
+    let rec_mean = weighted_mean_kl_divergence(&rec_kls, &weights)?;
+    Ok((base_mean, rec_mean, base_mean - rec_mean))
+}
+
+/// Fisher-weighted per-site KL gap `mean_base_kl - mean_recovered_kl` across diagnostic tokens.
+///
+/// # Errors
+/// Returns the errors of [`per_site_fisher_weighted_kl_metrics`].
+pub fn per_site_kl_gap<T: AsRef<[f64]>>(
+    teacher_logits: &[T],
+    base_logits: &[T],
+    recovered_logits: &[T],
+) -> Result<f64> {
+    let (_, _, gap) = per_site_fisher_weighted_kl_metrics(teacher_logits, base_logits, recovered_logits)?;
+    Ok(gap)
+}
+
+/// One candidate option inside a multiple-choice knapsack group.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KnapsackOption {
+    /// Non-negative discrete resource cost (such as byte size).
+    pub cost: u64,
+    /// Objective value contributed when selecting this option.
+    pub value: f64,
+}
+
+const MAX_KNAPSACK_CELLS: usize = 32_000_000;
+
+fn u64_gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn solve_multiple_choice_knapsack(
+    groups: &[Vec<KnapsackOption>],
+    budget: u64,
+    maximize: bool,
+) -> Result<Vec<usize>> {
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut min_costs = Vec::with_capacity(groups.len());
+    let mut total_min_cost = 0_u64;
+    for (g_idx, group) in groups.iter().enumerate() {
+        if group.is_empty() {
+            return Err(format!("knapsack group {g_idx} must contain at least one option"));
+        }
+        if group.len() > usize::from(u16::MAX) {
+            return Err(format!("knapsack group {g_idx} exceeds u16 option limit"));
+        }
+        let mut group_min = u64::MAX;
+        for opt in group {
+            if !opt.value.is_finite() {
+                return Err(format!("knapsack option value in group {g_idx} must be finite"));
+            }
+            group_min = group_min.min(opt.cost);
+        }
+        min_costs.push(group_min);
+        total_min_cost = total_min_cost
+            .checked_add(group_min)
+            .ok_or_else(|| "knapsack minimum cost sum overflowed u64".to_owned())?;
+    }
+    if total_min_cost > budget {
+        return Err(format!(
+            "knapsack budget {budget} is below minimum feasible cost {total_min_cost}"
+        ));
+    }
+    let rem_budget = budget - total_min_cost;
+    let mut step_gcd = 0_u64;
+    for (group, &g_min) in groups.iter().zip(&min_costs) {
+        for opt in group {
+            let rel = opt.cost - g_min;
+            if rel > 0 {
+                step_gcd = if step_gcd == 0 { rel } else { u64_gcd(step_gcd, rel) };
+            }
+        }
+    }
+    if step_gcd == 0 {
+        // All options inside each group share equal cost; pick best value greedily per group.
+        let mut chosen = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mut best_idx = 0_usize;
+            for (idx, opt) in group.iter().enumerate().skip(1) {
+                let better = if maximize {
+                    opt.value > group[best_idx].value
+                } else {
+                    opt.value < group[best_idx].value
+                };
+                if better {
+                    best_idx = idx;
+                }
+            }
+            chosen.push(best_idx);
+        }
+        return Ok(chosen);
+    }
+
+    let budget_units_u64 = rem_budget / step_gcd;
+    let budget_units = usize::try_from(budget_units_u64).map_err(|_| {
+        format!("scaled knapsack budget {budget_units_u64} exceeds addressable table units")
+    })?;
+    let stride = budget_units
+        .checked_add(1)
+        .ok_or_else(|| "knapsack stride overflow".to_owned())?;
+    let cells = groups
+        .len()
+        .checked_mul(stride)
+        .ok_or_else(|| "knapsack state space overflow".to_owned())?;
+    if cells > MAX_KNAPSACK_CELLS {
+        return Err(format!(
+            "exact knapsack state space {cells} cells exceeds safety cap {MAX_KNAPSACK_CELLS}"
+        ));
+    }
+
+    let init_val = if maximize {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
+    let mut prev = vec![init_val; stride];
+    let mut next = vec![init_val; stride];
+    let mut choices = vec![u16::MAX; cells];
+    prev[0] = 0.0;
+
+    for (g_idx, (group, &g_min)) in groups.iter().zip(&min_costs).enumerate() {
+        next.fill(init_val);
+        let row_offset = g_idx * stride;
+        for (opt_idx, opt) in group.iter().enumerate() {
+            let cost_units = usize::try_from((opt.cost - g_min) / step_gcd)
+                .map_err(|_| "option unit cost overflow".to_owned())?;
+            if cost_units > budget_units {
+                continue;
+            }
+            let opt_code = u16::try_from(opt_idx)
+                .map_err(|_| "knapsack option index exceeds u16".to_owned())?;
+            for u in cost_units..=budget_units {
+                let base = prev[u - cost_units];
+                if !base.is_finite() {
+                    continue;
+                }
+                let candidate = base + opt.value;
+                if !candidate.is_finite() {
+                    continue;
+                }
+                let better = if maximize {
+                    candidate > next[u]
+                } else {
+                    candidate < next[u]
+                };
+                if better {
+                    next[u] = candidate;
+                    choices[row_offset + u] = opt_code;
+                }
+            }
+        }
+        std::mem::swap(&mut prev, &mut next);
+    }
+
+    let mut best_u = 0_usize;
+    let mut best_score = init_val;
+    for (u, &score) in prev.iter().enumerate() {
+        if !score.is_finite() {
+            continue;
+        }
+        let better = if maximize {
+            score > best_score
+        } else {
+            score < best_score
+        };
+        if better {
+            best_score = score;
+            best_u = u;
+        }
+    }
+    if !best_score.is_finite() {
+        return Err("knapsack found no finite feasible assignment".to_owned());
+    }
+
+    let mut chosen = vec![0_usize; groups.len()];
+    let mut rem_u = best_u;
+    for g_idx in (0..groups.len()).rev() {
+        let code = choices[g_idx * stride + rem_u];
+        let opt_idx = usize::from(code);
+        let opt = groups[g_idx]
+            .get(opt_idx)
+            .ok_or_else(|| "knapsack backtracking encountered invalid option choice".to_owned())?;
+        chosen[g_idx] = opt_idx;
+        let cost_units = usize::try_from((opt.cost - min_costs[g_idx]) / step_gcd)
+            .map_err(|_| "backtrack cost unit overflow".to_owned())?;
+        rem_u = rem_u
+            .checked_sub(cost_units)
+            .ok_or_else(|| "knapsack backtrack underflow".to_owned())?;
+    }
+    Ok(chosen)
+}
+
+/// Exact multiple-choice knapsack solver selecting one option per group to maximize total value
+/// within `budget`.
+///
+/// Uses `gcd`-reduced integer DP over feasible costs.
+///
+/// # Errors
+/// Returns an error if any group is empty, values are non-finite, `budget` is infeasible, or the
+/// scaled state table exceeds safety bounds.
+pub fn solve_multiple_choice_knapsack_maximize(
+    groups: &[Vec<KnapsackOption>],
+    budget: u64,
+) -> Result<Vec<usize>> {
+    solve_multiple_choice_knapsack(groups, budget, true)
+}
+
+/// Exact multiple-choice knapsack solver selecting one option per group to minimize total value
+/// within `budget`.
+///
+/// Uses `gcd`-reduced integer DP over feasible costs.
+///
+/// # Errors
+/// Returns an error if any group is empty, values are non-finite, `budget` is infeasible, or the
+/// scaled state table exceeds safety bounds.
+pub fn solve_multiple_choice_knapsack_minimize(
+    groups: &[Vec<KnapsackOption>],
+    budget: u64,
+) -> Result<Vec<usize>> {
+    solve_multiple_choice_knapsack(groups, budget, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kl_divergence_and_softmax_fisher_handle_identical_shifted_and_peaked_logits() -> Result<()> {
+        let teacher = vec![2.0, 0.5, -1.0, 0.0];
+        let shifted = teacher.iter().map(|v| v + 42.0).collect::<Vec<_>>();
+        assert!(kl_divergence_from_logits(&teacher, &shifted)? <= 1e-12);
+
+        let student = vec![0.0, 1.5, 0.5, -0.5];
+        let kl = kl_divergence_from_logits(&teacher, &student)?;
+        assert!(kl > 0.4);
+
+        let fisher_ambiguous = softmax_fisher_from_logits(&[0.0, 0.0, 0.0, 0.0])?;
+        assert!((fisher_ambiguous - 0.75).abs() <= 1e-12);
+
+        let fisher_peaked = softmax_fisher_from_logits(&[50.0, 0.0, 0.0, 0.0])?;
+        assert!(fisher_peaked <= 1e-12);
+
+        let fisher_near_onehot = softmax_fisher_from_logits(&[30.0, 0.0])?;
+        assert!(fisher_near_onehot > 0.0 && fisher_near_onehot < 1e-11);
+        Ok(())
+    }
+
+    #[test]
+    fn per_site_kl_gap_weights_by_teacher_softmax_fisher() -> Result<()> {
+        // Token 0 is near-deterministic (tiny Fisher weight ~ 0); token 1 is ambiguous (Fisher = 0.5).
+        let teacher = vec![vec![40.0, 0.0], vec![1.0, 1.0]];
+        // Base is slightly off on token 0, badly off on token 1; recovered fixes token 1.
+        let base = vec![vec![20.0, 0.0], vec![4.0, 0.0]];
+        let recovered = vec![vec![20.0, 0.0], vec![1.0, 1.0]];
+        let (base_kl, rec_kl, gap) = per_site_fisher_weighted_kl_metrics(&teacher, &base, &recovered)?;
+        assert!(base_kl > 1.0);
+        assert!(rec_kl <= 1e-9);
+        assert!((gap - (base_kl - rec_kl)).abs() <= 1e-12);
+        assert!((per_site_kl_gap(&teacher, &base, &recovered)? - gap).abs() <= 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_choice_knapsack_solves_exact_gcd_scaled_max_and_min() -> Result<()> {
+        let groups = vec![
+            vec![
+                KnapsackOption {
+                    cost: 0,
+                    value: 0.0,
+                },
+                KnapsackOption {
+                    cost: 2_048,
+                    value: 3.0,
+                },
+                KnapsackOption {
+                    cost: 4_096,
+                    value: 8.0,
+                },
+            ],
+            vec![
+                KnapsackOption {
+                    cost: 2_048,
+                    value: 1.0,
+                },
+                KnapsackOption {
+                    cost: 6_144,
+                    value: 10.0,
+                },
+            ],
+        ];
+        // Total budget = 8_192 -> group 0 min 0 + group 1 min 2_048 => 2 choices:
+        // (cost 4_096 + 2_048 = 6_144 -> val 9.0) OR (cost 2_048 + 6_144 = 8_192 -> val 13.0)
+        // Wait: (4_096 + 2_048 = 6_144, val 9) vs (2_048 + 6_144 = 8_192, val 13) -> opt [1, 1]!
+        let chosen_max = solve_multiple_choice_knapsack_maximize(&groups, 8_192)?;
+        assert_eq!(chosen_max, vec![1, 1]);
+
+        let min_groups = vec![
+            vec![
+                KnapsackOption {
+                    cost: 0,
+                    value: 10.0,
+                },
+                KnapsackOption {
+                    cost: 4_096,
+                    value: 2.0,
+                },
+            ],
+            vec![
+                KnapsackOption {
+                    cost: 0,
+                    value: 8.0,
+                },
+                KnapsackOption {
+                    cost: 4_096,
+                    value: 3.0,
+                },
+            ],
+        ];
+        let chosen_min = solve_multiple_choice_knapsack_minimize(&min_groups, 4_096)?;
+        assert_eq!(chosen_min, vec![1, 0]);
+        assert!(solve_multiple_choice_knapsack_maximize(&groups, 1_024).is_err());
+        Ok(())
+    }
 
     #[test]
     fn scaled_l2_handles_extreme_exponents_and_subnormals_without_overflow() -> Result<()> {
