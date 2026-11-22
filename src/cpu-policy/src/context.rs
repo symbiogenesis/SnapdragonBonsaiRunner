@@ -249,6 +249,17 @@ impl SwiftWeightPacking {
             Self::Ptq1_0 => crate::PTQ1_WEIGHT_BYTES,
         }
     }
+
+    /// Fixed runtime byte allowance for calibrated CoW admission.
+    #[must_use]
+    pub const fn calibrated_fixed_runtime_bytes(self) -> u64 {
+        match self {
+            Self::Pq2_0 => FIXED_RUNTIME_BYTES,
+            Self::Ptq1_0 => {
+                FIXED_RUNTIME_BYTES - (crate::SWIFT_WEIGHT_BYTES - crate::PTQ1_WEIGHT_BYTES)
+            }
+        }
+    }
 }
 
 /// Explicit worst-case runtime, checkpoint, scratch, and accelerator shape for
@@ -634,25 +645,14 @@ impl SwiftContextPlan {
     /// # Errors
     /// Rejects insufficient memory or an unrepresentable complete allocation.
     pub fn for_profile(available_bytes: u64, profile: SwiftContextProfile) -> Result<Self, String> {
-        let allocation = available_bytes
-            .checked_sub(HOST_RESERVE_BYTES)
-            .and_then(|bytes| bytes.checked_sub(STARTUP_RESERVE_BYTES))
-            .and_then(|bytes| bytes.checked_sub(FIXED_RUNTIME_BYTES))
-            .ok_or_else(insufficient)?;
-        let state_allocation = profile
-            .state_limit_bytes()
-            .checked_sub(RECURRENT_BYTES)
-            .ok_or_else(insufficient)?;
         let process_bytes = profile.context_bytes_per_token();
-        let state_bytes = profile.state_bytes_per_token();
-        let tokens = (allocation / process_bytes).min(state_allocation / state_bytes);
-        let tokens = usize::try_from(tokens)
-            .map_err(|_| insufficient())?
-            .min(MODEL_CONTEXT_TOKENS);
-        let context_tokens = tokens / CONTEXT_PAGE_TOKENS * CONTEXT_PAGE_TOKENS;
-        if context_tokens < MIN_CONTEXT_TOKENS {
-            return Err(insufficient());
-        }
+        let context_tokens = admit_context_tokens(
+            available_bytes,
+            profile,
+            FIXED_RUNTIME_BYTES,
+            process_bytes,
+            MODEL_CONTEXT_TOKENS,
+        )?;
         let context_bytes = u64::try_from(context_tokens)
             .ok()
             .and_then(|tokens| tokens.checked_mul(process_bytes))
@@ -691,29 +691,14 @@ impl SwiftContextPlan {
         let fixed_physical = zero_context
             .total_footprint_bytes()
             .ok_or_else(insufficient)?;
-        let per_token = shape
-            .kv_bytes_per_token_total()
-            .filter(|bytes| *bytes > 0)
-            .ok_or_else(insufficient)?;
-        let allocation = available_bytes
-            .checked_sub(HOST_RESERVE_BYTES)
-            .and_then(|bytes| bytes.checked_sub(STARTUP_RESERVE_BYTES))
-            .and_then(|bytes| bytes.checked_sub(fixed_physical))
-            .ok_or_else(insufficient)?;
-        let state_allocation = profile
-            .state_limit_bytes()
-            .checked_sub(RECURRENT_BYTES)
-            .ok_or_else(insufficient)?;
-        let tokens =
-            (allocation / per_token).min(state_allocation / profile.state_bytes_per_token());
-        let tokens = usize::try_from(tokens)
-            .map_err(|_| insufficient())?
-            .min(baseline.context_tokens)
-            .min(MODEL_CONTEXT_TOKENS);
-        let context_tokens = tokens / CONTEXT_PAGE_TOKENS * CONTEXT_PAGE_TOKENS;
-        if context_tokens < MIN_CONTEXT_TOKENS {
-            return Err(insufficient());
-        }
+        let per_token = shape.kv_bytes_per_token_total().ok_or_else(insufficient)?;
+        let context_tokens = admit_context_tokens(
+            available_bytes,
+            profile,
+            fixed_physical,
+            per_token,
+            baseline.context_tokens,
+        )?;
         let breakdown = shape.breakdown(context_tokens).ok_or_else(insufficient)?;
         let job_commit = breakdown.job_commit_bytes().ok_or_else(insufficient)?;
         let required_available_bytes = breakdown
@@ -763,7 +748,6 @@ impl SwiftContextPlan {
             .ok_or_else(insufficient)?;
         let per_cow_token = kv_per_token
             .checked_add(bookkeeping_per_token)
-            .filter(|bytes| *bytes > 0)
             .ok_or_else(insufficient)?;
         let extra_copies = u64::from(shape.live_kv_copies - 1);
         let cow_tail_tokens = u64::try_from(KV_COW_PAGE_TOKENS).map_err(|_| insufficient())?;
@@ -771,25 +755,16 @@ impl SwiftContextPlan {
             .checked_mul(cow_tail_tokens)
             .and_then(|tokens| tokens.checked_mul(kv_per_token))
             .ok_or_else(insufficient)?;
-        let allocation = available_bytes
-            .checked_sub(HOST_RESERVE_BYTES)
-            .and_then(|bytes| bytes.checked_sub(STARTUP_RESERVE_BYTES))
-            .and_then(|bytes| bytes.checked_sub(fixed_physical))
-            .and_then(|bytes| bytes.checked_sub(unsealed_tail_bytes))
+        let fixed_cow = fixed_physical
+            .checked_add(unsealed_tail_bytes)
             .ok_or_else(insufficient)?;
-        let state_allocation = profile
-            .state_limit_bytes()
-            .checked_sub(RECURRENT_BYTES)
-            .ok_or_else(insufficient)?;
-        let tokens =
-            (allocation / per_cow_token).min(state_allocation / profile.state_bytes_per_token());
-        let tokens = usize::try_from(tokens)
-            .map_err(|_| insufficient())?
-            .min(MODEL_CONTEXT_TOKENS);
-        let context_tokens = tokens / CONTEXT_PAGE_TOKENS * CONTEXT_PAGE_TOKENS;
-        if context_tokens < MIN_CONTEXT_TOKENS {
-            return Err(insufficient());
-        }
+        let context_tokens = admit_context_tokens(
+            available_bytes,
+            profile,
+            fixed_cow,
+            per_cow_token,
+            MODEL_CONTEXT_TOKENS,
+        )?;
         let breakdown = shape.breakdown(context_tokens).ok_or_else(insufficient)?;
         let physical_cow = breakdown
             .physical_cow_footprint_bytes()
@@ -822,16 +797,9 @@ impl SwiftContextPlan {
         profile: SwiftContextProfile,
         request_vision: bool,
     ) -> Result<(Self, bool), String> {
-        if !request_vision {
-            return Ok((Self::for_profile(available_bytes, profile)?, false));
-        }
-        if let Some(remaining) = available_bytes.checked_sub(crate::MMPROJ_RESERVE_BYTES)
-            && let Ok(mut plan) = Self::for_profile(remaining, profile)
-        {
-            apply_mmproj_reserve_to_plan(&mut plan)?;
-            return Ok((plan, true));
-        }
-        Ok((Self::for_profile(available_bytes, profile)?, false))
+        let (plan, vision, _) =
+            Self::for_profile_with_options(available_bytes, profile, request_vision, None)?;
+        Ok((plan, vision))
     }
 
     /// Derive a context plan for `profile`, adding an optional `CPU` tiled prefill
@@ -859,29 +827,20 @@ impl SwiftContextPlan {
         let kv_format = SwiftKvCacheFormat::from_profile(profile);
         let (fixed_tile, score_per_ctx_token) =
             tile_scratch_fixed_and_per_ctx(tile_tokens, kv_format).ok_or_else(insufficient)?;
-        let allocation = available_bytes
-            .checked_sub(HOST_RESERVE_BYTES)
-            .and_then(|bytes| bytes.checked_sub(STARTUP_RESERVE_BYTES))
-            .and_then(|bytes| bytes.checked_sub(FIXED_RUNTIME_BYTES))
-            .and_then(|bytes| bytes.checked_sub(fixed_tile))
-            .ok_or_else(insufficient)?;
-        let state_allocation = profile
-            .state_limit_bytes()
-            .checked_sub(RECURRENT_BYTES)
+        let fixed_bytes = FIXED_RUNTIME_BYTES
+            .checked_add(fixed_tile)
             .ok_or_else(insufficient)?;
         let total_per_token = profile
             .context_bytes_per_token()
             .checked_add(score_per_ctx_token)
             .ok_or_else(insufficient)?;
-        let tokens =
-            (allocation / total_per_token).min(state_allocation / profile.state_bytes_per_token());
-        let tokens = usize::try_from(tokens)
-            .map_err(|_| insufficient())?
-            .min(MODEL_CONTEXT_TOKENS);
-        let context_tokens = tokens / CONTEXT_PAGE_TOKENS * CONTEXT_PAGE_TOKENS;
-        if context_tokens < MIN_CONTEXT_TOKENS {
-            return Err(insufficient());
-        }
+        let context_tokens = admit_context_tokens(
+            available_bytes,
+            profile,
+            fixed_bytes,
+            total_per_token,
+            MODEL_CONTEXT_TOKENS,
+        )?;
         let scratch_u64 = swift_tiled_prefill_scratch_bytes(tile_tokens, context_tokens, kv_format)
             .ok_or_else(insufficient)?;
         let context_bytes = u64::try_from(context_tokens)
@@ -923,21 +882,12 @@ impl SwiftContextPlan {
         request_vision: bool,
         prefill_tokens: Option<usize>,
     ) -> Result<(Self, bool, Option<usize>), String> {
-        if !request_vision {
-            let (plan, scratch) =
-                Self::for_profile_with_prefill(available_bytes, profile, prefill_tokens)?;
-            return Ok((plan, false, scratch));
-        }
-        if let Some(remaining) = available_bytes.checked_sub(crate::MMPROJ_RESERVE_BYTES)
-            && let Ok((mut plan, scratch)) =
-                Self::for_profile_with_prefill(remaining, profile, prefill_tokens)
-        {
-            apply_mmproj_reserve_to_plan(&mut plan)?;
-            return Ok((plan, true, scratch));
-        }
-        let (plan, scratch) =
-            Self::for_profile_with_prefill(available_bytes, profile, prefill_tokens)?;
-        Ok((plan, false, scratch))
+        with_optional_vision(
+            available_bytes,
+            request_vision,
+            |avail| Self::for_profile_with_prefill(avail, profile, prefill_tokens),
+            |_| Ok(()),
+        )
     }
 
     /// Derive a context plan and itemized memory breakdown for `shape`, reserving
@@ -954,23 +904,19 @@ impl SwiftContextPlan {
         shape: &SwiftExecutionShape,
         request_vision: bool,
     ) -> Result<(Self, SwiftMemoryBreakdown, bool), String> {
-        if !request_vision {
-            let (plan, breakdown) = Self::for_execution_shape(available_bytes, profile, shape)?;
-            return Ok((plan, breakdown, false));
-        }
-        if let Some(remaining) = available_bytes.checked_sub(crate::MMPROJ_RESERVE_BYTES)
-            && let Ok((mut plan, mut breakdown)) =
-                Self::for_execution_shape(remaining, profile, shape)
-        {
-            apply_mmproj_reserve_to_plan(&mut plan)?;
-            breakdown.weights_and_fixed_runtime_bytes = breakdown
-                .weights_and_fixed_runtime_bytes
-                .checked_add(crate::MMPROJ_RESERVE_BYTES)
-                .ok_or_else(insufficient)?;
-            return Ok((plan, breakdown, true));
-        }
-        let (plan, breakdown) = Self::for_execution_shape(available_bytes, profile, shape)?;
-        Ok((plan, breakdown, false))
+        let (plan, vision, breakdown) = with_optional_vision(
+            available_bytes,
+            request_vision,
+            |avail| Self::for_execution_shape(avail, profile, shape),
+            |breakdown| {
+                breakdown.weights_and_fixed_runtime_bytes = breakdown
+                    .weights_and_fixed_runtime_bytes
+                    .checked_add(crate::MMPROJ_RESERVE_BYTES)
+                    .ok_or_else(insufficient)?;
+                Ok(())
+            },
+        )?;
+        Ok((plan, breakdown, vision))
     }
 }
 
@@ -1074,34 +1020,24 @@ pub struct SwiftCalibratedPlan {
 fn validate_calibrated_reuse(
     reuse: SwiftCalibratedReuse,
 ) -> Result<(u64, u64, Option<usize>), String> {
-    match reuse {
-        SwiftCalibratedReuse::Disabled => Ok((0, 0, None)),
+    let (checkpoints, checkpoint_bytes, extra_slot) = match reuse {
+        SwiftCalibratedReuse::Disabled => return Ok((0, 0, None)),
         SwiftCalibratedReuse::Latest {
             checkpoints,
             checkpoint_bytes,
-        } => {
-            if !(1..=MAX_REUSABLE_BRANCH_CHECKPOINTS).contains(&checkpoints)
-                || checkpoint_bytes == Some(0)
-            {
-                return Err(insufficient());
-            }
-            let slots = u64::from(checkpoints);
-            Ok((slots, slots, checkpoint_bytes))
-        }
+        } => (checkpoints, checkpoint_bytes, 0_u64),
         SwiftCalibratedReuse::PromptEndAndLatest {
             checkpoints,
             checkpoint_bytes,
-        } => {
-            if !(1..=MAX_REUSABLE_BRANCH_CHECKPOINTS).contains(&checkpoints)
-                || checkpoint_bytes == Some(0)
-            {
-                return Err(insufficient());
-            }
-            let min_slots = u64::from(checkpoints);
-            let slots = min_slots.checked_add(1).ok_or_else(insufficient)?;
-            Ok((slots, min_slots, checkpoint_bytes))
-        }
+        } => (checkpoints, checkpoint_bytes, 1_u64),
+    };
+    if !(1..=MAX_REUSABLE_BRANCH_CHECKPOINTS).contains(&checkpoints) || checkpoint_bytes == Some(0)
+    {
+        return Err(insufficient());
     }
+    let min_slots = u64::from(checkpoints);
+    let slots = min_slots.checked_add(extra_slot).ok_or_else(insufficient)?;
+    Ok((slots, min_slots, checkpoint_bytes))
 }
 
 fn eval_calibrated_cow_at(
@@ -1132,12 +1068,7 @@ fn eval_calibrated_cow_at(
         }
     }
 
-    let fixed_bytes = match options.weight_packing {
-        SwiftWeightPacking::Pq2_0 => FIXED_RUNTIME_BYTES,
-        SwiftWeightPacking::Ptq1_0 => {
-            FIXED_RUNTIME_BYTES - (crate::SWIFT_WEIGHT_BYTES - crate::PTQ1_WEIGHT_BYTES)
-        }
-    };
+    let fixed_bytes = options.weight_packing.calibrated_fixed_runtime_bytes();
     let base_recurrent = 2_u64
         .checked_add(u64::from(options.speculation_tokens.is_some()))?
         .checked_mul(RECURRENT_BYTES)?;
@@ -1280,30 +1211,24 @@ impl SwiftContextPlan {
         }
 
         let search = |include_mmproj: bool| -> Option<SwiftCalibratedPlan> {
-            let mut best = eval_calibrated_cow_at(
-                available_bytes,
-                profile,
-                options,
-                min_pages * CONTEXT_PAGE_TOKENS,
-                reuse_slots,
-                min_checkpoint_slots,
-                explicit_checkpoint_bytes,
-                include_mmproj,
-            )?;
-            let mut lo = min_pages + 1;
-            let mut hi = max_pages;
-            while lo <= hi {
-                let mid = lo + (hi - lo) / 2;
-                if let Some(plan) = eval_calibrated_cow_at(
+            let eval_pages = |pages: usize| {
+                eval_calibrated_cow_at(
                     available_bytes,
                     profile,
                     options,
-                    mid * CONTEXT_PAGE_TOKENS,
+                    pages * CONTEXT_PAGE_TOKENS,
                     reuse_slots,
                     min_checkpoint_slots,
                     explicit_checkpoint_bytes,
                     include_mmproj,
-                ) {
+                )
+            };
+            let mut best = eval_pages(min_pages)?;
+            let mut lo = min_pages + 1;
+            let mut hi = max_pages;
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                if let Some(plan) = eval_pages(mid) {
                     best = plan;
                     lo = mid + 1;
                 } else {
@@ -1356,6 +1281,55 @@ impl SwiftContextPlan {
             .ok_or_else(insufficient)?;
         Ok(plan)
     }
+}
+
+fn admit_context_tokens(
+    available_bytes: u64,
+    profile: SwiftContextProfile,
+    fixed_bytes: u64,
+    per_token: u64,
+    max_tokens: usize,
+) -> Result<usize, String> {
+    if per_token == 0 {
+        return Err(insufficient());
+    }
+    let allocation = available_bytes
+        .checked_sub(HOST_RESERVE_BYTES)
+        .and_then(|bytes| bytes.checked_sub(STARTUP_RESERVE_BYTES))
+        .and_then(|bytes| bytes.checked_sub(fixed_bytes))
+        .ok_or_else(insufficient)?;
+    let state_allocation = profile
+        .state_limit_bytes()
+        .checked_sub(RECURRENT_BYTES)
+        .ok_or_else(insufficient)?;
+    let tokens = (allocation / per_token).min(state_allocation / profile.state_bytes_per_token());
+    let tokens = usize::try_from(tokens)
+        .map_err(|_| insufficient())?
+        .min(max_tokens)
+        .min(MODEL_CONTEXT_TOKENS);
+    let context_tokens = tokens / CONTEXT_PAGE_TOKENS * CONTEXT_PAGE_TOKENS;
+    if context_tokens < MIN_CONTEXT_TOKENS {
+        return Err(insufficient());
+    }
+    Ok(context_tokens)
+}
+
+fn with_optional_vision<T>(
+    available_bytes: u64,
+    request_vision: bool,
+    plan_for: impl Fn(u64) -> Result<(SwiftContextPlan, T), String>,
+    add_mmproj_to_extra: impl FnOnce(&mut T) -> Result<(), String>,
+) -> Result<(SwiftContextPlan, bool, T), String> {
+    if request_vision
+        && let Some(remaining) = available_bytes.checked_sub(crate::MMPROJ_RESERVE_BYTES)
+        && let Ok((mut plan, mut extra)) = plan_for(remaining)
+    {
+        apply_mmproj_reserve_to_plan(&mut plan)?;
+        add_mmproj_to_extra(&mut extra)?;
+        return Ok((plan, true, extra));
+    }
+    let (plan, extra) = plan_for(available_bytes)?;
+    Ok((plan, false, extra))
 }
 
 fn apply_mmproj_reserve_to_plan(plan: &mut SwiftContextPlan) -> Result<(), String> {
