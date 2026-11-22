@@ -183,6 +183,14 @@ struct VerifiedDaisyRose {
     sheddable: bool,
 }
 
+impl VerifiedDaisyRose {
+    fn reserve_bytes(&self) -> u64 {
+        bonsai_cpu_policy::context::MultiRankAdapterBudget::from_verified_bytes(self.guard.bytes())
+            .and_then(|budget| budget.total_bytes())
+            .unwrap_or(0)
+    }
+}
+
 struct VerifiedLaunchGuards {
     native_executable: Option<(PathBuf, bonsai_artifacts::VerifiedFile)>,
     artifacts: VerifiedArtifacts,
@@ -231,6 +239,33 @@ impl LaunchConfig {
         args: impl IntoIterator<Item = OsString>,
         family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
     ) -> Result<Self, LaunchError> {
+        fn set_flag(slot: &mut bool) -> Result<(), LaunchError> {
+            if *slot {
+                Err(LaunchError::Arguments)
+            } else {
+                *slot = true;
+                Ok(())
+            }
+        }
+        fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), LaunchError> {
+            if slot.is_some() {
+                Err(LaunchError::Arguments)
+            } else {
+                *slot = Some(value);
+                Ok(())
+            }
+        }
+        fn take_once<T>(
+            slot: &mut Option<T>,
+            args: &mut impl Iterator<Item = OsString>,
+            parse: impl FnOnce(Option<OsString>) -> Result<T, LaunchError>,
+        ) -> Result<(), LaunchError> {
+            if slot.is_some() {
+                return Err(LaunchError::Arguments);
+            }
+            *slot = Some(parse(args.next())?);
+            Ok(())
+        }
         let mut args = args.into_iter();
         let (mut launch, mut unisolated, mut require_native_sandbox, mut require_broker_pipe) =
             (false, false, false, false);
@@ -241,110 +276,83 @@ impl LaunchConfig {
         let (mut kv_cache, mut cpu_prefill_tokens, mut cpu_prefill_gdn, mut placement) =
             (None, None, None, None);
         let (mut spec_type, mut draft_max, mut cpu_family) = (None, None, None);
-        let mut reset_on_cancel = false;
-        let mut no_mmproj = false;
-        let mut use_abliterate_lora = false;
-        let mut daisyrose_lora = None;
-        let mut no_daisyrose_lora = false;
-        let mut use_repacked_ptq1 = None;
-        let mut profile = None;
+        let (mut reset_on_cancel, mut no_mmproj, mut use_abliterate_lora, mut no_daisyrose_lora) =
+            (false, false, false, false);
+        let (mut daisyrose_lora, mut use_repacked_ptq1, mut profile) = (None, None, None);
         let (mut data, mut evidence_parent) = (None, None);
         let (mut frontend_port, mut backend_port, mut max_waiting) = (None, None, None);
+        let take_path = |v: Option<OsString>| v.map(PathBuf::from).ok_or(LaunchError::Arguments);
         while let Some(argument) = args.next() {
             match argument.to_str() {
-                Some("--launch-development") if !launch => launch = true,
-                Some("--allow-unisolated-backend") if !unisolated => unisolated = true,
-                Some("--require-native-sandbox") if !require_native_sandbox => {
-                    require_native_sandbox = true;
+                Some("--launch-development") => set_flag(&mut launch)?,
+                Some("--allow-unisolated-backend") => set_flag(&mut unisolated)?,
+                Some("--require-native-sandbox") => set_flag(&mut require_native_sandbox)?,
+                Some("--require-broker-pipe") => set_flag(&mut require_broker_pipe)?,
+                Some("--check-only") => set_flag(&mut check_only)?,
+                Some("--native-engine" | "--publisher-engine") => {
+                    set_once(&mut native_engine, argument == "--native-engine")?;
                 }
-                Some("--require-broker-pipe") if !require_broker_pipe => {
-                    require_broker_pipe = true;
+                Some("--native-row-workers") => {
+                    take_once(&mut native_row_workers, &mut args, |v| {
+                        row_workers(v.as_deref())
+                    })?;
                 }
-                Some("--check-only") if !check_only => check_only = true,
-                Some("--native-engine" | "--publisher-engine") if native_engine.is_none() => {
-                    native_engine = Some(argument == "--native-engine");
+                Some("--prompt-reuse") => take_once(&mut prompt_reuse, &mut args, |v| {
+                    crate::inference::PromptReuseMode::parse(v.as_deref())
+                })?,
+                Some("--prompt-reuse-checkpoints") => {
+                    take_once(&mut prompt_reuse_checkpoints, &mut args, |v| {
+                        decimal_range_u8(v, 1..=8)
+                    })?;
                 }
-                Some("--native-row-workers") if native_row_workers.is_none() => {
-                    native_row_workers = Some(row_workers(args.next().as_deref())?);
+                Some("--prompt-reuse-checkpoint-bytes") => {
+                    take_once(
+                        &mut prompt_reuse_checkpoint_bytes,
+                        &mut args,
+                        positive_decimal_usize,
+                    )?;
                 }
-                Some("--prompt-reuse") if prompt_reuse.is_none() => {
-                    prompt_reuse = Some(crate::inference::PromptReuseMode::parse(
-                        args.next().as_deref(),
-                    )?);
+                Some("--kv-cache") => take_once(&mut kv_cache, &mut args, |v| {
+                    crate::inference::KvCache::parse(v.as_deref())
+                })?,
+                Some("--cpu-prefill-tokens") => {
+                    take_once(&mut cpu_prefill_tokens, &mut args, |v| {
+                        crate::inference::parse_cpu_prefill_tokens(v.as_deref())
+                    })?;
                 }
-                Some("--prompt-reuse-checkpoints") if prompt_reuse_checkpoints.is_none() => {
-                    prompt_reuse_checkpoints = Some(decimal_range_u8(args.next(), 1..=8)?);
+                Some("--cpu-prefill-gdn") => take_once(&mut cpu_prefill_gdn, &mut args, |v| {
+                    crate::inference::CpuPrefillGdn::parse(v.as_deref())
+                })?,
+                Some("--spec-type") => take_once(&mut spec_type, &mut args, |v| {
+                    crate::inference::SpeculationType::parse(v.as_deref())
+                })?,
+                Some("--draft-max") => {
+                    take_once(&mut draft_max, &mut args, |v| decimal_range_u8(v, 1..=8))?;
                 }
-                Some("--prompt-reuse-checkpoint-bytes")
-                    if prompt_reuse_checkpoint_bytes.is_none() =>
-                {
-                    prompt_reuse_checkpoint_bytes = Some(positive_decimal_usize(args.next())?);
+                Some("--cpu-family") => take_once(&mut cpu_family, &mut args, |v| {
+                    crate::inference::CpuFamily::parse(v.as_deref())
+                })?,
+                Some("--placement") => take_once(&mut placement, &mut args, |v| {
+                    crate::inference::Placement::parse(v.as_deref())
+                })?,
+                Some("--reset-on-cancel") => set_flag(&mut reset_on_cancel)?,
+                Some("--no-mmproj") => set_flag(&mut no_mmproj)?,
+                Some("--use-abliterate-lora") => set_flag(&mut use_abliterate_lora)?,
+                Some("--daisyrose-lora") => take_once(&mut daisyrose_lora, &mut args, take_path)?,
+                Some("--no-daisyrose-lora") => set_flag(&mut no_daisyrose_lora)?,
+                Some("--use-repacked-ptq1") => set_once(&mut use_repacked_ptq1, true)?,
+                Some("--use-original-pq2") => set_once(&mut use_repacked_ptq1, false)?,
+                Some("--profile") => {
+                    take_once(&mut profile, &mut args, |v| launch_profile(v.as_deref()))?;
                 }
-                Some("--kv-cache") if kv_cache.is_none() => {
-                    kv_cache = Some(crate::inference::KvCache::parse(args.next().as_deref())?);
+                Some("--data-directory") => take_once(&mut data, &mut args, take_path)?,
+                Some("--evidence-parent") => {
+                    take_once(&mut evidence_parent, &mut args, take_path)?;
                 }
-                Some("--cpu-prefill-tokens") if cpu_prefill_tokens.is_none() => {
-                    cpu_prefill_tokens = Some(crate::inference::parse_cpu_prefill_tokens(
-                        args.next().as_deref(),
-                    )?);
-                }
-                Some("--cpu-prefill-gdn") if cpu_prefill_gdn.is_none() => {
-                    cpu_prefill_gdn = Some(crate::inference::CpuPrefillGdn::parse(
-                        args.next().as_deref(),
-                    )?);
-                }
-                Some("--spec-type") if spec_type.is_none() => {
-                    spec_type = Some(crate::inference::SpeculationType::parse(
-                        args.next().as_deref(),
-                    )?);
-                }
-                Some("--draft-max") if draft_max.is_none() => {
-                    draft_max = Some(decimal_range_u8(args.next(), 1..=8)?);
-                }
-                Some("--cpu-family") if cpu_family.is_none() => {
-                    cpu_family = Some(crate::inference::CpuFamily::parse(args.next().as_deref())?);
-                }
-                Some("--placement") if placement.is_none() => {
-                    placement = Some(crate::inference::Placement::parse(args.next().as_deref())?);
-                }
-                Some("--reset-on-cancel") if !reset_on_cancel => {
-                    reset_on_cancel = true;
-                }
-                Some("--no-mmproj") if !no_mmproj => {
-                    no_mmproj = true;
-                }
-                Some("--use-abliterate-lora") if !use_abliterate_lora => {
-                    use_abliterate_lora = true;
-                }
-                Some("--daisyrose-lora") if daisyrose_lora.is_none() => {
-                    daisyrose_lora =
-                        Some(PathBuf::from(args.next().ok_or(LaunchError::Arguments)?));
-                }
-                Some("--no-daisyrose-lora") if !no_daisyrose_lora => no_daisyrose_lora = true,
-                Some("--use-repacked-ptq1") if use_repacked_ptq1.is_none() => {
-                    use_repacked_ptq1 = Some(true);
-                }
-                Some("--use-original-pq2") if use_repacked_ptq1.is_none() => {
-                    use_repacked_ptq1 = Some(false);
-                }
-                Some("--profile") if profile.is_none() => {
-                    profile = Some(launch_profile(args.next().as_deref())?);
-                }
-                Some("--data-directory") if data.is_none() => {
-                    data = Some(PathBuf::from(args.next().ok_or(LaunchError::Arguments)?));
-                }
-                Some("--evidence-parent") if evidence_parent.is_none() => {
-                    evidence_parent =
-                        Some(PathBuf::from(args.next().ok_or(LaunchError::Arguments)?));
-                }
-                Some("--frontend-port") if frontend_port.is_none() => {
-                    frontend_port = Some(number(args.next())?);
-                }
-                Some("--backend-port") if backend_port.is_none() => {
-                    backend_port = Some(number(args.next())?);
-                }
-                Some("--max-waiting") if max_waiting.is_none() => {
-                    max_waiting = Some(usize::from(number(args.next())?));
+                Some("--frontend-port") => take_once(&mut frontend_port, &mut args, number)?,
+                Some("--backend-port") => take_once(&mut backend_port, &mut args, number)?,
+                Some("--max-waiting") => {
+                    take_once(&mut max_waiting, &mut args, |v| number(v).map(usize::from))?;
                 }
                 _ => return Err(LaunchError::Arguments),
             }
@@ -422,33 +430,42 @@ impl LaunchConfig {
             },
         };
         configuration.validate_selection(use_repacked_ptq1.is_some())?;
-        if configuration.reset_on_cancel && !crate::inference::reset_on_cancel_supported()? {
-            return Err(LaunchError::NativeRuntime);
-        }
-        if configuration.require_broker_pipe && !crate::inference::broker_pipe_supported()? {
-            return Err(LaunchError::NativeRuntime);
-        }
-        if (configuration.prompt_reuse == crate::inference::PromptReuseMode::PromptEndAndLatest
-            || configuration.prompt_reuse_checkpoints.is_some()
-            || configuration.prompt_reuse_checkpoint_bytes.is_some())
-            && !crate::inference::branch_prompt_reuse_supported()?
-        {
-            return Err(LaunchError::NativeRuntime);
-        }
-        if configuration.cpu_prefill_gdn.is_some()
-            && !crate::inference::cpu_prefill_gdn_supported()?
-        {
-            return Err(LaunchError::NativeRuntime);
-        }
-        if configuration.spec_type.is_some() && !crate::inference::cpu_speculation_supported()? {
-            return Err(LaunchError::NativeRuntime);
-        }
-        if configuration.cpu_family.is_some() && !crate::inference::broker_pipe_supported()? {
-            return Err(LaunchError::NativeRuntime);
-        }
-        if configuration.daisyrose_lora.is_some() && !crate::inference::multi_rank_lora_supported()?
-        {
-            return Err(LaunchError::NativeRuntime);
+        let gates: [(bool, fn() -> Result<bool, LaunchError>); 7] = [
+            (
+                configuration.reset_on_cancel,
+                crate::inference::reset_on_cancel_supported,
+            ),
+            (
+                configuration.require_broker_pipe,
+                crate::inference::broker_pipe_supported,
+            ),
+            (
+                configuration.prompt_reuse == crate::inference::PromptReuseMode::PromptEndAndLatest
+                    || configuration.prompt_reuse_checkpoints.is_some()
+                    || configuration.prompt_reuse_checkpoint_bytes.is_some(),
+                crate::inference::branch_prompt_reuse_supported,
+            ),
+            (
+                configuration.cpu_prefill_gdn.is_some(),
+                crate::inference::cpu_prefill_gdn_supported,
+            ),
+            (
+                configuration.spec_type.is_some(),
+                crate::inference::cpu_speculation_supported,
+            ),
+            (
+                configuration.cpu_family.is_some(),
+                crate::inference::broker_pipe_supported,
+            ),
+            (
+                configuration.daisyrose_lora.is_some(),
+                crate::inference::multi_rank_lora_supported,
+            ),
+        ];
+        for (enabled, supported) in gates {
+            if enabled && !supported()? {
+                return Err(LaunchError::NativeRuntime);
+            }
         }
         Ok(configuration)
     }
@@ -652,6 +669,20 @@ impl LaunchConfig {
         .map_err(|_| LaunchError::Memory)
     }
 
+    fn with_sheddable_reserve<T>(
+        reserve: u64,
+        sheddable: bool,
+        mut try_reserve: impl FnMut(u64) -> Result<T, LaunchError>,
+    ) -> Result<(T, bool), LaunchError> {
+        match try_reserve(reserve) {
+            Ok(value) => Ok((value, reserve > 0)),
+            Err(LaunchError::Memory) if sheddable && reserve > 0 => {
+                try_reserve(0).map(|value| (value, false))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn resolve_calibrated_daisyrose_admission(
         &self,
         available_bytes: u64,
@@ -659,22 +690,47 @@ impl LaunchConfig {
         daisyrose_reserve_bytes: u64,
         daisyrose_sheddable: bool,
     ) -> Result<(bonsai_cpu_policy::context::SwiftCalibratedPlan, bool), LaunchError> {
-        match self.calibrated_context_plan_with_daisyrose(
-            available_bytes,
-            request_vision,
-            daisyrose_reserve_bytes,
-        ) {
-            Ok(plan) => Ok((plan, daisyrose_reserve_bytes > 0)),
-            Err(LaunchError::Memory) if daisyrose_sheddable && daisyrose_reserve_bytes > 0 => {
-                let plan = self.calibrated_context_plan_with_daisyrose(
-                    available_bytes,
-                    request_vision,
-                    0,
-                )?;
-                Ok((plan, false))
-            }
-            Err(error) => Err(error),
+        Self::with_sheddable_reserve(daisyrose_reserve_bytes, daisyrose_sheddable, |reserve| {
+            self.calibrated_context_plan_with_daisyrose(available_bytes, request_vision, reserve)
+        })
+    }
+
+    fn profile_context_plan_with_reserve(
+        &self,
+        available_bytes: u64,
+        request_vision: bool,
+        reserve_bytes: u64,
+    ) -> Result<
+        (
+            bonsai_cpu_policy::context::SwiftContextPlan,
+            bool,
+            Option<usize>,
+        ),
+        LaunchError,
+    > {
+        let budget = available_bytes
+            .checked_sub(reserve_bytes)
+            .ok_or(LaunchError::Memory)?;
+        let (mut plan, vision_admitted, prefill_scratch) =
+            bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
+                budget,
+                self.swift_context_profile()?,
+                request_vision,
+                self.cpu_prefill_tokens.map(usize::from),
+            )
+            .map_err(|_| LaunchError::Memory)?;
+        if reserve_bytes > 0 {
+            let extra = usize::try_from(reserve_bytes).map_err(|_| LaunchError::Memory)?;
+            plan.memory_limit_bytes = plan
+                .memory_limit_bytes
+                .checked_add(extra)
+                .ok_or(LaunchError::Memory)?;
+            plan.required_available_bytes = plan
+                .required_available_bytes
+                .checked_add(reserve_bytes)
+                .ok_or(LaunchError::Memory)?;
         }
+        Ok((plan, vision_admitted, prefill_scratch))
     }
 
     fn resolve_profile_daisyrose_admission(
@@ -692,53 +748,14 @@ impl LaunchConfig {
         ),
         LaunchError,
     > {
-        let profile = self.swift_context_profile()?;
-        let prefill_tokens = self.cpu_prefill_tokens.map(usize::from);
-        let attempt_with = |reserve: u64| -> Result<
-            (
-                bonsai_cpu_policy::context::SwiftContextPlan,
-                bool,
-                Option<usize>,
-            ),
-            LaunchError,
-        > {
-            let budget = available_bytes
-                .checked_sub(reserve)
-                .ok_or(LaunchError::Memory)?;
-            let (mut context, vision_admitted, prefill_scratch) =
-                bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
-                    budget,
-                    profile,
-                    request_vision,
-                    prefill_tokens,
-                )
-                .map_err(|_| LaunchError::Memory)?;
-            if reserve > 0 {
-                let extra_usize = usize::try_from(reserve).map_err(|_| LaunchError::Memory)?;
-                context.memory_limit_bytes = context
-                    .memory_limit_bytes
-                    .checked_add(extra_usize)
-                    .ok_or(LaunchError::Memory)?;
-                context.required_available_bytes = context
-                    .required_available_bytes
-                    .checked_add(reserve)
-                    .ok_or(LaunchError::Memory)?;
-            }
-            Ok((context, vision_admitted, prefill_scratch))
-        };
-        match attempt_with(daisyrose_reserve_bytes) {
-            Ok((context, vision_admitted, prefill_scratch)) => Ok((
-                context,
-                vision_admitted,
-                prefill_scratch,
-                daisyrose_reserve_bytes > 0,
-            )),
-            Err(LaunchError::Memory) if daisyrose_sheddable && daisyrose_reserve_bytes > 0 => {
-                let (context, vision_admitted, prefill_scratch) = attempt_with(0)?;
-                Ok((context, vision_admitted, prefill_scratch, false))
-            }
-            Err(error) => Err(error),
-        }
+        let ((context, vision_admitted, prefill_scratch), admitted) = Self::with_sheddable_reserve(
+            daisyrose_reserve_bytes,
+            daisyrose_sheddable,
+            |reserve| {
+                self.profile_context_plan_with_reserve(available_bytes, request_vision, reserve)
+            },
+        )?;
+        Ok((context, vision_admitted, prefill_scratch, admitted))
     }
 
     // Call only after the exact released runtime's context and cache-accounting
@@ -767,30 +784,9 @@ impl LaunchConfig {
                 )?
                 .context_plan);
         }
-        let budget = available_bytes
-            .checked_sub(daisyrose_reserve_bytes)
-            .ok_or(LaunchError::Memory)?;
-        let (mut plan, _, _) =
-            bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
-                budget,
-                self.swift_context_profile()?,
-                false,
-                self.cpu_prefill_tokens.map(usize::from),
-            )
-            .map_err(|_| LaunchError::Memory)?;
-        if daisyrose_reserve_bytes > 0 {
-            let reserve_usize =
-                usize::try_from(daisyrose_reserve_bytes).map_err(|_| LaunchError::Memory)?;
-            plan.memory_limit_bytes = plan
-                .memory_limit_bytes
-                .checked_add(reserve_usize)
-                .ok_or(LaunchError::Memory)?;
-            plan.required_available_bytes = plan
-                .required_available_bytes
-                .checked_add(daisyrose_reserve_bytes)
-                .ok_or(LaunchError::Memory)?;
-        }
-        Ok(plan)
+        Ok(self
+            .profile_context_plan_with_reserve(available_bytes, false, daisyrose_reserve_bytes)?
+            .0)
     }
 
     fn initial_memory_admission(&self, plan: &LaunchPlan) -> Result<(), LaunchError> {
@@ -826,21 +822,14 @@ impl LaunchConfig {
         let daisyrose_reserve = guards
             .daisyrose
             .as_ref()
-            .and_then(|d| {
-                bonsai_cpu_policy::context::MultiRankAdapterBudget::from_verified_bytes(
-                    d.guard.bytes(),
-                )?
-                .total_bytes()
-            })
-            .unwrap_or(0);
+            .map_or(0, VerifiedDaisyRose::reserve_bytes);
         let daisyrose_sheddable = guards.daisyrose.as_ref().is_some_and(|d| d.sheddable);
         let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
         let memory_admitted = if self.memory_context_supported()? {
-            self.swift_context_plan_with_daisyrose(available, daisyrose_reserve)
-                .is_ok()
-                || (daisyrose_sheddable
-                    && daisyrose_reserve > 0
-                    && self.swift_context_plan_with_daisyrose(available, 0).is_ok())
+            Self::with_sheddable_reserve(daisyrose_reserve, daisyrose_sheddable, |reserve| {
+                self.swift_context_plan_with_daisyrose(available, reserve)
+            })
+            .is_ok()
         } else {
             available
                 >= plan
@@ -1087,6 +1076,13 @@ impl LaunchConfig {
         &self,
         plan: &LaunchPlan,
     ) -> Result<VerifiedLaunchGuards, LaunchError> {
+        fn join_opt<T>(
+            handle: Option<std::thread::ScopedJoinHandle<'_, Result<Option<T>, LaunchError>>>,
+            panic_error: LaunchError,
+        ) -> Result<Option<T>, LaunchError> {
+            handle.map_or(Ok(None), |h| h.join().map_err(|_| panic_error)?)
+        }
+
         let verify_vision = self.runtime_supports_vision()?;
         let daisyrose_selection = self.resolve_daisyrose_selection()?;
         std::thread::scope(|scope| {
@@ -1103,31 +1099,14 @@ impl LaunchConfig {
             let mmproj_handle = verify_vision.then(|| scope.spawn(|| self.mmproj_guard()));
 
             let artifacts_result = self.verify_artifacts(plan);
-
-            let native_executable = match native_handle {
-                Some(handle) => handle.join().map_err(|_| LaunchError::NativeRuntime)??,
-                None => None,
-            };
+            let native_executable = join_opt(native_handle, LaunchError::NativeRuntime)?;
             let artifacts = artifacts_result?;
-            let adapter = match adapter_handle {
-                Some(handle) => handle.join().map_err(|_| LaunchError::Adapter)??,
-                None => None,
-            };
-            let daisyrose = match daisyrose_handle {
-                Some(handle) => handle.join().map_err(|_| LaunchError::Adapter)??,
-                None => None,
-            };
-            let mmproj = match mmproj_handle {
-                Some(handle) => handle.join().map_err(|_| LaunchError::Artifacts)??,
-                None => None,
-            };
-
             Ok(VerifiedLaunchGuards {
                 native_executable,
                 artifacts,
-                adapter,
-                daisyrose,
-                mmproj,
+                adapter: join_opt(adapter_handle, LaunchError::Adapter)?,
+                daisyrose: join_opt(daisyrose_handle, LaunchError::Adapter)?,
+                mmproj: join_opt(mmproj_handle, LaunchError::Artifacts)?,
             })
         })
     }
@@ -1169,134 +1148,113 @@ impl LaunchConfig {
         plan: &LaunchPlan,
         key_path: Option<&std::path::Path>,
     ) -> Vec<OsString> {
-        let mut arguments = vec![
-            OsString::from("--native-engine-child"),
-            OsString::from("--model"),
-            plan.model_path.as_os_str().to_owned(),
-        ];
+        fn push_arg(args: &mut Vec<OsString>, flag: &str, value: impl Into<OsString>) {
+            args.push(OsString::from(flag));
+            args.push(value.into());
+        }
+        fn push_num(args: &mut Vec<OsString>, flag: &str, value: impl std::fmt::Display) {
+            push_arg(args, flag, value.to_string());
+        }
+        let mut arguments = Vec::new();
+        arguments.push(OsString::from("--native-engine-child"));
+        push_arg(&mut arguments, "--model", plan.model_path.as_os_str());
         if let Some(key_path) = key_path {
-            arguments.extend([
-                OsString::from("--port"),
-                OsString::from(self.backend_port.to_string()),
-                OsString::from("--key-file"),
-                key_path.as_os_str().to_owned(),
-            ]);
+            push_num(&mut arguments, "--port", self.backend_port);
+            push_arg(&mut arguments, "--key-file", key_path.as_os_str());
         } else {
             let verified_sections = 1_usize
                 + usize::from(plan.adapter.is_some())
                 + usize::from(plan.daisyrose_lora.is_some())
                 + usize::from(plan.mmproj.is_some());
-            arguments.extend([
-                OsString::from("--broker-pipe"),
-                OsString::from("--verified-sections"),
-                OsString::from(verified_sections.to_string()),
-            ]);
+            arguments.push(OsString::from("--broker-pipe"));
+            push_num(&mut arguments, "--verified-sections", verified_sections);
         }
-        arguments.extend([OsString::from("--seed"), OsString::from("42")]);
+        push_arg(&mut arguments, "--seed", "42");
         if crate::inference::memory_context_supported().unwrap_or(false) {
-            arguments.extend([
-                OsString::from("--context-tokens"),
-                OsString::from(plan.context_tokens.to_string()),
-                OsString::from("--memory-limit-bytes"),
-                OsString::from(plan.native_child_memory_limit_bytes().to_string()),
-            ]);
+            push_num(&mut arguments, "--context-tokens", plan.context_tokens);
+            push_num(
+                &mut arguments,
+                "--memory-limit-bytes",
+                plan.native_child_memory_limit_bytes(),
+            );
             if crate::inference::calibrated_cow_admission_supported().unwrap_or(false) {
-                arguments.extend([
-                    OsString::from("--admission-policy"),
-                    OsString::from("calibrated-cow"),
-                ]);
+                push_arg(&mut arguments, "--admission-policy", "calibrated-cow");
             }
         }
         if self.native_row_workers > 1 {
-            arguments.extend([
-                OsString::from("--row-workers"),
-                OsString::from(self.native_row_workers.to_string()),
-            ]);
+            push_num(&mut arguments, "--row-workers", self.native_row_workers);
         }
         if let Some(family) = self.cpu_family {
-            arguments.extend([
-                OsString::from("--cpu-family"),
-                OsString::from(family.as_str()),
-            ]);
+            push_arg(&mut arguments, "--cpu-family", family.as_str());
         }
         if let Some(mode) = self.prompt_reuse.as_wire() {
-            arguments.extend([OsString::from("--prompt-reuse"), OsString::from(mode)]);
+            push_arg(&mut arguments, "--prompt-reuse", mode);
         }
         if let Some(checkpoints) = self.prompt_reuse_checkpoints {
-            arguments.extend([
-                OsString::from("--prompt-reuse-checkpoints"),
-                OsString::from(checkpoints.to_string()),
-            ]);
+            push_num(&mut arguments, "--prompt-reuse-checkpoints", checkpoints);
         }
         if let Some(bytes) = self.prompt_reuse_checkpoint_bytes {
-            arguments.extend([
-                OsString::from("--prompt-reuse-checkpoint-bytes"),
-                OsString::from(bytes.to_string()),
-            ]);
+            push_num(&mut arguments, "--prompt-reuse-checkpoint-bytes", bytes);
         }
         if let Some(policy) = self.kv_cache {
-            arguments.extend([OsString::from("--kv-cache"), OsString::from(policy.name())]);
+            push_arg(&mut arguments, "--kv-cache", policy.name());
         }
         if let Some((tokens, scratch_bytes)) = plan.cpu_prefill {
-            arguments.extend([
-                OsString::from("--cpu-prefill-tokens"),
-                OsString::from(tokens.to_string()),
-                OsString::from("--cpu-prefill-scratch-bytes"),
-                OsString::from(scratch_bytes.to_string()),
-            ]);
+            push_num(&mut arguments, "--cpu-prefill-tokens", tokens);
+            push_num(&mut arguments, "--cpu-prefill-scratch-bytes", scratch_bytes);
             if let Some(gdn) = self.cpu_prefill_gdn {
-                arguments.extend([
-                    OsString::from("--cpu-prefill-gdn"),
-                    OsString::from(gdn.as_str()),
-                ]);
+                push_arg(&mut arguments, "--cpu-prefill-gdn", gdn.as_str());
             }
         }
         if let Some((draft_max, verification_scratch, checkpoint_bytes)) = plan.cpu_speculation {
-            arguments.extend([
-                OsString::from("--spec-type"),
-                OsString::from("suffix"),
-                OsString::from("--draft-max"),
-                OsString::from(draft_max.to_string()),
-                OsString::from("--cpu-verification-scratch-bytes"),
-                OsString::from(verification_scratch.to_string()),
-                OsString::from("--cpu-speculative-checkpoint-bytes"),
-                OsString::from(checkpoint_bytes.to_string()),
-            ]);
+            push_arg(&mut arguments, "--spec-type", "suffix");
+            push_num(&mut arguments, "--draft-max", draft_max);
+            push_num(
+                &mut arguments,
+                "--cpu-verification-scratch-bytes",
+                verification_scratch,
+            );
+            push_num(
+                &mut arguments,
+                "--cpu-speculative-checkpoint-bytes",
+                checkpoint_bytes,
+            );
         } else if let Some(spec_type) = self.spec_type {
-            arguments.extend([
-                OsString::from("--spec-type"),
-                OsString::from(spec_type.as_str()),
-            ]);
+            push_arg(&mut arguments, "--spec-type", spec_type.as_str());
         }
         if self.placement == crate::inference::Placement::Cpu {
-            arguments.extend([OsString::from("--placement"), OsString::from("cpu")]);
+            push_arg(&mut arguments, "--placement", "cpu");
         }
         if self.uses_repacked_ptq1() {
             arguments.push("--use-repacked-ptq1".into());
         }
         if let Some(adapter) = &plan.adapter {
-            arguments.extend([
-                OsString::from("--abliterate-lora"),
-                adapter.path.as_os_str().to_owned(),
-            ]);
+            push_arg(
+                &mut arguments,
+                "--abliterate-lora",
+                adapter.path.as_os_str(),
+            );
         }
         if let Some(daisyrose) = &plan.daisyrose_lora {
-            arguments.extend([
-                OsString::from("--daisyrose-lora"),
-                daisyrose.path.as_os_str().to_owned(),
-                OsString::from("--daisyrose-lora-bytes"),
-                OsString::from(daisyrose.bytes.to_string()),
-                OsString::from("--daisyrose-lora-sha256"),
-                OsString::from(daisyrose.sha256.as_str()),
-            ]);
+            push_arg(
+                &mut arguments,
+                "--daisyrose-lora",
+                daisyrose.path.as_os_str(),
+            );
+            push_num(&mut arguments, "--daisyrose-lora-bytes", daisyrose.bytes);
+            push_arg(
+                &mut arguments,
+                "--daisyrose-lora-sha256",
+                daisyrose.sha256.as_str(),
+            );
         }
         if let Some(mmproj) = &plan.mmproj {
-            arguments.extend([
-                OsString::from("--mmproj"),
-                mmproj.path.as_os_str().to_owned(),
-                OsString::from("--image-max-tokens"),
-                OsString::from(bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS.to_string()),
-            ]);
+            push_arg(&mut arguments, "--mmproj", mmproj.path.as_os_str());
+            push_num(
+                &mut arguments,
+                "--image-max-tokens",
+                bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS,
+            );
         }
         arguments
     }
@@ -1376,6 +1334,14 @@ impl LaunchConfig {
             readonly_paths,
             writable_directory: specification.working_directory.clone(),
         };
+        let map_sandbox_error = |error: &io::Error| {
+            // The native boundary emits fixed validation reasons or Windows API
+            // errors, never arguments, file contents or credential values. Keep
+            // that technical cause in the broker's retained stderr while the UI
+            // continues to receive only the value-free launch classification.
+            let _result = write_sandbox_failure(&mut io::stderr().lock(), error);
+            Self::classify_sandbox_start_error(error)
+        };
         if broker_pipe {
             let mut section_files: Vec<&std::fs::File> = Vec::with_capacity(4);
             let mut section_digests: Vec<[u8; 32]> = Vec::with_capacity(4);
@@ -1404,10 +1370,7 @@ impl LaunchConfig {
                     &policy,
                     &section_files,
                 )
-                .map_err(|error| {
-                    let _result = write_sandbox_failure(&mut io::stderr().lock(), &error);
-                    Self::classify_sandbox_start_error(&error)
-                })?;
+                .map_err(|error| map_sandbox_error(&error))?;
             if grants.len() != section_digests.len() {
                 return Err(LaunchError::Process);
             }
@@ -1428,14 +1391,7 @@ impl LaunchConfig {
         } else {
             OwnedProcess::start_sandboxed(specification, &policy)
                 .map(|process| (process, None))
-                .map_err(|error| {
-                    // The native boundary emits fixed validation reasons or Windows API
-                    // errors, never arguments, file contents or credential values. Keep
-                    // that technical cause in the broker's retained stderr while the UI
-                    // continues to receive only the value-free launch classification.
-                    let _result = write_sandbox_failure(&mut io::stderr().lock(), &error);
-                    Self::classify_sandbox_start_error(&error)
-                })
+                .map_err(|error| map_sandbox_error(&error))
         }
     }
 
@@ -1514,13 +1470,7 @@ impl LaunchConfig {
         } = self.verify_launch_artifacts(&preliminary)?;
         let daisyrose_reserve_bytes = daisyrose
             .as_ref()
-            .and_then(|d| {
-                bonsai_cpu_policy::context::MultiRankAdapterBudget::from_verified_bytes(
-                    d.guard.bytes(),
-                )?
-                .total_bytes()
-            })
-            .unwrap_or(0);
+            .map_or(0, VerifiedDaisyRose::reserve_bytes);
         let daisyrose_sheddable = daisyrose.as_ref().is_some_and(|d| d.sheddable);
         startup_timing.phase(StartupPhase::AdapterVerification);
         if poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_ready())).await {
@@ -1581,28 +1531,32 @@ impl LaunchConfig {
             let mut active_mmproj = mmproj_artifact.clone();
             let calibrated_admission = self.native_engine
                 && crate::inference::calibrated_cow_admission_supported().unwrap_or(false);
-            let daisyrose_admitted = if memory_context_supported {
-                let raw_available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
+            fn try_with_retry_margin<T>(
+                attempt: usize,
+                raw_available: u64,
+                mut try_fn: impl FnMut(u64) -> Result<T, LaunchError>,
+            ) -> Result<T, LaunchError> {
                 let retry_margin = u64::try_from(attempt)
                     .unwrap_or(0)
                     .saturating_mul(bonsai_cpu_policy::context::STARTUP_RESERVE_BYTES);
-                let available = raw_available.saturating_sub(retry_margin);
+                match try_fn(raw_available.saturating_sub(retry_margin)) {
+                    Ok(result) => Ok(result),
+                    Err(_) if attempt > 0 => try_fn(raw_available),
+                    Err(_) => Err(LaunchError::Memory),
+                }
+            }
+            let daisyrose_admitted = if memory_context_supported {
+                let raw_available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
                 if calibrated_admission {
-                    let (calibrated, admitted) = match self.resolve_calibrated_daisyrose_admission(
-                        available,
-                        active_mmproj.is_some(),
-                        daisyrose_reserve_bytes,
-                        daisyrose_sheddable,
-                    ) {
-                        Ok(result) => result,
-                        Err(_) if attempt > 0 => self.resolve_calibrated_daisyrose_admission(
-                            raw_available,
-                            active_mmproj.is_some(),
-                            daisyrose_reserve_bytes,
-                            daisyrose_sheddable,
-                        )?,
-                        Err(_) => return Err(LaunchError::Memory),
-                    };
+                    let (calibrated, admitted) =
+                        try_with_retry_margin(attempt, raw_available, |budget| {
+                            self.resolve_calibrated_daisyrose_admission(
+                                budget,
+                                active_mmproj.is_some(),
+                                daisyrose_reserve_bytes,
+                                daisyrose_sheddable,
+                            )
+                        })?;
                     if !calibrated.vision_admitted {
                         active_mmproj = None;
                     }
@@ -1626,22 +1580,15 @@ impl LaunchConfig {
                     {
                         return Err(LaunchError::NativeRuntime);
                     }
-                    let (context, vision_admitted, prefill_scratch, admitted) = match self
-                        .resolve_profile_daisyrose_admission(
-                            available,
-                            active_mmproj.is_some(),
-                            daisyrose_reserve_bytes,
-                            daisyrose_sheddable,
-                        ) {
-                        Ok(result) => result,
-                        Err(_) if attempt > 0 => self.resolve_profile_daisyrose_admission(
-                            raw_available,
-                            active_mmproj.is_some(),
-                            daisyrose_reserve_bytes,
-                            daisyrose_sheddable,
-                        )?,
-                        Err(_) => return Err(LaunchError::Memory),
-                    };
+                    let (context, vision_admitted, prefill_scratch, admitted) =
+                        try_with_retry_margin(attempt, raw_available, |budget| {
+                            self.resolve_profile_daisyrose_admission(
+                                budget,
+                                active_mmproj.is_some(),
+                                daisyrose_reserve_bytes,
+                                daisyrose_sheddable,
+                            )
+                        })?;
                     if !vision_admitted {
                         active_mmproj = None;
                     }
@@ -1701,38 +1648,29 @@ impl LaunchConfig {
                 &credentials,
                 broker_pipe,
             )?;
-            if let Err(guard_error) = guard(
-                &process,
-                specification.memory_limit_bytes,
-                working_set_limit_bytes,
+            let process_guard = ProcessGuard {
+                process: &process,
+                private_limit: specification.memory_limit_bytes,
+                working_set_limit: working_set_limit_bytes,
                 storage_budget,
-                Some(worker_root.as_path()),
-            ) {
+                worker_root: Some(worker_root.as_path()),
+            };
+            if let Err(guard_error) = process_guard.check() {
                 // Keep sandbox storage rejections distinct if the check tripped right after spawn,
                 // without discarding Memory or Sandbox errors returned by guard itself.
                 let storage_error =
                     check_storage_budget(&process, storage_budget, Some(worker_root.as_path()))
                         .err();
                 let err = classify_initial_guard_error(guard_error, storage_error);
-                let status = wait_briefly_for_exit(&process, err);
-                process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-                let (refined, child_stage) =
-                    refine_backend_startup_error(err, &specification.stderr);
-                if (refined == LaunchError::Memory
-                    || child_stage == Some(ChildStartupStage::Memory))
-                    && attempt + 1 < max_attempts
-                {
-                    continue;
-                }
-                if refined != LaunchError::Sandbox {
-                    let _result = write_startup_failure(
-                        &mut io::stderr().lock(),
-                        StartupStage::AuthenticatedReadiness,
-                        refined,
-                        &status,
-                    );
-                }
-                return Err(refined);
+                handle_startup_attempt_error(
+                    &process,
+                    err,
+                    &specification.stderr,
+                    attempt,
+                    max_attempts,
+                    false,
+                )?;
+                continue;
             }
             if attempt == 0 {
                 startup_timing.phase(StartupPhase::AuthenticatedReadiness);
@@ -1745,13 +1683,9 @@ impl LaunchConfig {
                     &attestations,
                 ) {
                     Ok(pipe_backend) => wait_ready_models_pipe(
-                        &process,
+                        process_guard,
                         &pipe_backend,
                         credentials.backend_key(),
-                        specification.memory_limit_bytes,
-                        working_set_limit_bytes,
-                        storage_budget,
-                        Some(worker_root.as_path()),
                         shutdown.as_mut(),
                     )
                     .await
@@ -1760,13 +1694,9 @@ impl LaunchConfig {
                 }
             } else {
                 wait_ready_models(
-                    &process,
+                    process_guard,
                     self.backend_port,
                     credentials.backend_key(),
-                    specification.memory_limit_bytes,
-                    working_set_limit_bytes,
-                    storage_budget,
-                    Some(worker_root.as_path()),
                     shutdown.as_mut(),
                 )
                 .await
@@ -1775,23 +1705,15 @@ impl LaunchConfig {
             let (pipe_backend, models) = match readiness {
                 Ok(ready) => ready,
                 Err(error) => {
-                    let status = wait_briefly_for_exit(&process, error);
-                    process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-                    let (refined, child_stage) =
-                        refine_backend_startup_error(error, &specification.stderr);
-                    if (refined == LaunchError::Memory
-                        || child_stage == Some(ChildStartupStage::Memory))
-                        && attempt + 1 < max_attempts
-                    {
-                        continue;
-                    }
-                    let _result = write_startup_failure(
-                        &mut io::stderr().lock(),
-                        StartupStage::AuthenticatedReadiness,
-                        refined,
-                        &status,
-                    );
-                    return Err(refined);
+                    handle_startup_attempt_error(
+                        &process,
+                        error,
+                        &specification.stderr,
+                        attempt,
+                        max_attempts,
+                        true,
+                    )?;
+                    continue;
                 }
             };
             if self.native_engine {
@@ -1871,31 +1793,37 @@ impl LaunchConfig {
             )
             .await
         };
-        let Ok(mut service) = bound else {
-            process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-            return Err(LaunchError::Service);
+        let configure = || -> Result<LocalChatService, LaunchError> {
+            let Ok(mut service) = bound else {
+                return Err(LaunchError::Service);
+            };
+            if service.select_context_tokens(context_tokens).is_err() {
+                return Err(LaunchError::Service);
+            }
+            service.require_backend_process(process.id());
+            if adapter {
+                service.enable_pinned_abliteration();
+            }
+            if let Some(default_scale_tenths) = daisyrose_default_scale_tenths
+                && service.enable_daisyrose_lora(default_scale_tenths).is_err()
+            {
+                return Err(LaunchError::Service);
+            }
+            if vision_enabled {
+                service.enable_vision();
+            }
+            if self.reset_on_cancel {
+                service.enable_reset_on_cancel();
+            }
+            Ok(service)
         };
-        if service.select_context_tokens(context_tokens).is_err() {
-            process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-            return Err(LaunchError::Service);
+        match configure() {
+            Ok(service) => Ok(service),
+            Err(error) => {
+                process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+                Err(error)
+            }
         }
-        service.require_backend_process(process.id());
-        if adapter {
-            service.enable_pinned_abliteration();
-        }
-        if let Some(default_scale_tenths) = daisyrose_default_scale_tenths
-            && service.enable_daisyrose_lora(default_scale_tenths).is_err()
-        {
-            process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
-            return Err(LaunchError::Service);
-        }
-        if vision_enabled {
-            service.enable_vision();
-        }
-        if self.reset_on_cancel {
-            service.enable_reset_on_cancel();
-        }
-        Ok(service)
     }
 
     fn confirm_native_identity(
@@ -2254,17 +2182,17 @@ impl LaunchedService {
         let mut shutdown = pin!(shutdown);
         let worker_root = self.credentials.directory().join("worker");
         let monitoring = async {
+            let process_guard = ProcessGuard {
+                process: &self.process,
+                private_limit: self.memory_limit_bytes,
+                working_set_limit: self.working_set_limit_bytes,
+                storage_budget: self.storage_budget,
+                worker_root: Some(worker_root.as_path()),
+            };
             let mut tick = interval(Duration::from_millis(250));
             loop {
                 tick.tick().await;
-                let status = guard(
-                    &self.process,
-                    self.memory_limit_bytes,
-                    self.working_set_limit_bytes,
-                    self.storage_budget,
-                    Some(worker_root.as_path()),
-                )
-                .and_then(|(memory, available)| {
+                let status = process_guard.check().and_then(|(memory, available)| {
                     resources.set(resource_sample(resources.get(), memory, available));
                     if self.backend_port == 0 {
                         Ok(())
@@ -2441,30 +2369,72 @@ fn check_storage_budget(
     Ok(())
 }
 
-fn guard(
-    process: &OwnedProcess,
+#[derive(Clone, Copy)]
+struct ProcessGuard<'a> {
+    process: &'a OwnedProcess,
     private_limit: usize,
     working_set_limit: usize,
     storage_budget: Option<(u64, usize)>,
-    worker_root: Option<&std::path::Path>,
-) -> Result<(ProcessMemory, u64), LaunchError> {
-    if process
-        .try_wait()
-        .map_err(|_| LaunchError::Backend)?
-        .is_some()
+    worker_root: Option<&'a std::path::Path>,
+}
+
+impl ProcessGuard<'_> {
+    fn check(self) -> Result<(ProcessMemory, u64), LaunchError> {
+        if self
+            .process
+            .try_wait()
+            .map_err(|_| LaunchError::Backend)?
+            .is_some()
+        {
+            return Err(LaunchError::Backend);
+        }
+        let memory = self
+            .process
+            .memory_usage()
+            .map_err(|_| LaunchError::Memory)?;
+        if memory.private_bytes > self.private_limit
+            || memory.working_set_bytes > self.working_set_limit
+        {
+            return Err(LaunchError::Memory);
+        }
+        check_storage_budget(self.process, self.storage_budget, self.worker_root)?;
+        let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
+        if available < PHYSICAL_RESERVE {
+            return Err(LaunchError::Memory);
+        }
+        Ok((memory, available))
+    }
+
+    fn check_or_backend(self) -> LaunchError {
+        self.check().err().unwrap_or(LaunchError::Backend)
+    }
+}
+
+fn handle_startup_attempt_error(
+    process: &OwnedProcess,
+    err: LaunchError,
+    stderr: &std::path::Path,
+    attempt: usize,
+    max_attempts: usize,
+    emit_sandbox_failure: bool,
+) -> Result<(), LaunchError> {
+    let status = wait_briefly_for_exit(process, err);
+    process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
+    let (refined, child_stage) = refine_backend_startup_error(err, stderr);
+    if (refined == LaunchError::Memory || child_stage == Some(ChildStartupStage::Memory))
+        && attempt + 1 < max_attempts
     {
-        return Err(LaunchError::Backend);
+        return Ok(());
     }
-    let memory = process.memory_usage().map_err(|_| LaunchError::Memory)?;
-    if memory.private_bytes > private_limit || memory.working_set_bytes > working_set_limit {
-        return Err(LaunchError::Memory);
+    if emit_sandbox_failure || refined != LaunchError::Sandbox {
+        let _result = write_startup_failure(
+            &mut io::stderr().lock(),
+            StartupStage::AuthenticatedReadiness,
+            refined,
+            &status,
+        );
     }
-    check_storage_budget(process, storage_budget, worker_root)?;
-    let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
-    if available < PHYSICAL_RESERVE {
-        return Err(LaunchError::Memory);
-    }
-    Ok((memory, available))
+    Err(refined)
 }
 
 fn resource_sample(
@@ -2515,36 +2485,21 @@ async fn run_startup_with_timeout<T>(
 }
 
 async fn wait_ready_models(
-    process: &OwnedProcess,
+    guard: ProcessGuard<'_>,
     port: u16,
     key: &str,
-    private_limit: usize,
-    working_set_limit: usize,
-    storage_budget: Option<(u64, usize)>,
-    worker_root: Option<&std::path::Path>,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Vec<u8>, LaunchError> {
     run_startup_with_timeout(shutdown, async {
         loop {
-            guard(
-                process,
-                private_limit,
-                working_set_limit,
-                storage_budget,
-                worker_root,
-            )?;
+            guard.check()?;
             match listener_process_id(port).map_err(|_| LaunchError::Backend)? {
-                Some(pid) if pid != process.id() => return Err(LaunchError::Backend),
-                Some(_) if healthy(port, key, process.id()).await => {
-                    if let Some(models) = authenticated_models(port, key, process.id()).await {
-                        owner(process, port)?;
-                        guard(
-                            process,
-                            private_limit,
-                            working_set_limit,
-                            storage_budget,
-                            worker_root,
-                        )?;
+                Some(pid) if pid != guard.process.id() => return Err(LaunchError::Backend),
+                Some(_) if healthy(port, key, guard.process.id()).await => {
+                    if let Some(models) = authenticated_models(port, key, guard.process.id()).await
+                    {
+                        owner(guard.process, port)?;
+                        guard.check()?;
                         return Ok(models);
                     }
                 }
@@ -2557,23 +2512,13 @@ async fn wait_ready_models(
 }
 
 async fn wait_ready_models_pipe(
-    process: &OwnedProcess,
+    guard: ProcessGuard<'_>,
     backend: &crate::pipe_transport::PipeBackend,
     key: &str,
-    private_limit: usize,
-    working_set_limit: usize,
-    storage_budget: Option<(u64, usize)>,
-    worker_root: Option<&std::path::Path>,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Vec<u8>, LaunchError> {
     run_startup_with_timeout(shutdown, async {
-        guard(
-            process,
-            private_limit,
-            working_set_limit,
-            storage_budget,
-            worker_root,
-        )?;
+        guard.check()?;
         {
             let ready_deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
             let mut ready = pin!(backend.wait_server_ready(ready_deadline));
@@ -2582,25 +2527,11 @@ async fn wait_ready_models_pipe(
                 if let Poll::Ready(result) = ready.as_mut().poll(cx) {
                     return Poll::Ready(match result {
                         Ok(()) => Ok(()),
-                        Err(_) => Err(guard(
-                            process,
-                            private_limit,
-                            working_set_limit,
-                            storage_budget,
-                            worker_root,
-                        )
-                        .err()
-                        .unwrap_or(LaunchError::Backend)),
+                        Err(_) => Err(guard.check_or_backend()),
                     });
                 }
                 while tick.poll_tick(cx).is_ready() {
-                    if let Err(error) = guard(
-                        process,
-                        private_limit,
-                        working_set_limit,
-                        storage_budget,
-                        worker_root,
-                    ) {
+                    if let Err(error) = guard.check() {
                         return Poll::Ready(Err(error));
                     }
                 }
@@ -2608,48 +2539,18 @@ async fn wait_ready_models_pipe(
             })
             .await?;
         }
-        guard(
-            process,
-            private_limit,
-            working_set_limit,
-            storage_budget,
-            worker_root,
-        )?;
+        guard.check()?;
         let health = pipe_exchange(backend, "/health", Some(key))
             .await
             .and_then(|bytes| validate_health(&bytes))
             .is_ok();
         if !health {
-            return Err(guard(
-                process,
-                private_limit,
-                working_set_limit,
-                storage_budget,
-                worker_root,
-            )
-            .err()
-            .unwrap_or(LaunchError::Backend));
+            return Err(guard.check_or_backend());
         }
         let models = pipe_authenticated_models(backend, key)
             .await
-            .ok_or_else(|| {
-                guard(
-                    process,
-                    private_limit,
-                    working_set_limit,
-                    storage_budget,
-                    worker_root,
-                )
-                .err()
-                .unwrap_or(LaunchError::Backend)
-            })?;
-        guard(
-            process,
-            private_limit,
-            working_set_limit,
-            storage_budget,
-            worker_root,
-        )?;
+            .ok_or_else(|| guard.check_or_backend())?;
+        guard.check()?;
         Ok(models)
     })
     .await
@@ -2663,9 +2564,20 @@ async fn wait_ready(
     limit: usize,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<(), LaunchError> {
-    wait_ready_models(process, port, key, limit, limit, None, None, shutdown)
-        .await
-        .map(|_| ())
+    wait_ready_models(
+        ProcessGuard {
+            process,
+            private_limit: limit,
+            working_set_limit: limit,
+            storage_budget: None,
+            worker_root: None,
+        },
+        port,
+        key,
+        shutdown,
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn healthy(port: u16, key: &str, process_id: u32) -> bool {

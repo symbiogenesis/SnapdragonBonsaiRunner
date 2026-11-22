@@ -641,16 +641,18 @@ fn broker_pipe_launched_service_serves_cancels_resets_and_avoids_backend_key_fil
             crate::pipe_transport::PipeBackend::from_io(c2p_rx, p2c_tx, credentials.backend_key())
                 .map_err(|_| io::Error::other("PipeBackend::from_io failed."))?;
         let models = wait_ready_models_pipe(
-            &process,
+            ProcessGuard {
+                process: &process,
+                private_limit: PROBE_MEMORY,
+                working_set_limit: PROBE_MEMORY,
+                storage_budget: Some((
+                    MAX_WORKER_PRIVATE_STORAGE_BYTES,
+                    MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
+                )),
+                worker_root: Some(worker_dir.as_path()),
+            },
             &pipe_backend,
             credentials.backend_key(),
-            PROBE_MEMORY,
-            PROBE_MEMORY,
-            Some((
-                MAX_WORKER_PRIVATE_STORAGE_BYTES,
-                MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
-            )),
-            Some(worker_dir.as_path()),
             pending(),
         )
         .await
