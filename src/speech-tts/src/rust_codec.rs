@@ -11,8 +11,6 @@
 
 use std::io;
 
-use fearless_simd::{Level, dispatch, f32x4, prelude::*};
-
 use crate::{
     SAMPLE_RATE,
     codec::{
@@ -685,14 +683,14 @@ impl Transformer {
                 &mut scratch.k,
                 &mut scratch.v,
             )?;
-            apply_rope_neox_with_tables(
+            crate::engine::apply_rope_neox_with_tables(
                 &mut scratch.q,
                 self.heads,
                 self.head_dim,
                 &scratch.rope_cos,
                 &scratch.rope_sin,
             )?;
-            apply_rope_neox_with_tables(
+            crate::engine::apply_rope_neox_with_tables(
                 &mut scratch.k,
                 self.kv_heads,
                 self.head_dim,
@@ -844,69 +842,6 @@ impl CodecTransformerScratch {
         }
         Ok(())
     }
-}
-
-#[expect(
-    clippy::inline_always,
-    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
-)]
-#[inline(always)]
-fn rope_head_simd<S: Simd>(simd: S, lo: &mut [f32], hi: &mut [f32], cos: &[f32], sin: &[f32]) {
-    let (lo_chunks, lo_tail) = lo.as_chunks_mut::<4>();
-    let (hi_chunks, hi_tail) = hi.as_chunks_mut::<4>();
-    let (cos_chunks, cos_tail) = cos.as_chunks::<4>();
-    let (sin_chunks, sin_tail) = sin.as_chunks::<4>();
-    for (((lo_c, hi_c), cos_c), sin_c) in lo_chunks
-        .iter_mut()
-        .zip(hi_chunks.iter_mut())
-        .zip(cos_chunks.iter())
-        .zip(sin_chunks.iter())
-    {
-        let x0 = f32x4::from_slice(simd, lo_c);
-        let x1 = f32x4::from_slice(simd, hi_c);
-        let cv = f32x4::from_slice(simd, cos_c);
-        let sv = f32x4::from_slice(simd, sin_c);
-        x0.mul_add(cv, -(x1 * sv)).store_slice(lo_c);
-        x0.mul_add(sv, x1 * cv).store_slice(hi_c);
-    }
-    for (((x0_ref, x1_ref), &cos_v), &sin_v) in lo_tail
-        .iter_mut()
-        .zip(hi_tail.iter_mut())
-        .zip(cos_tail.iter())
-        .zip(sin_tail.iter())
-    {
-        let x0 = *x0_ref;
-        let x1 = *x1_ref;
-        *x0_ref = x0.mul_add(cos_v, -x1 * sin_v);
-        *x1_ref = x0.mul_add(sin_v, x1 * cos_v);
-    }
-}
-
-fn apply_rope_neox_with_tables(
-    heads: &mut [f32],
-    num_heads: usize,
-    head_dim: usize,
-    cos: &[f32],
-    sin: &[f32],
-) -> io::Result<()> {
-    let half = head_dim / 2;
-    if head_dim == 0
-        || !head_dim.is_multiple_of(2)
-        || cos.len() != half
-        || sin.len() != half
-        || heads.len() != num_heads * head_dim
-    {
-        return Err(invalid());
-    }
-    let level = Level::new();
-    dispatch!(level, simd => {
-        for h in 0..num_heads {
-            let slice = &mut heads[h * head_dim..(h + 1) * head_dim];
-            let (lo, hi) = slice.split_at_mut(half);
-            rope_head_simd(simd, lo, hi, cos, sin);
-        }
-    });
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2431,7 +2366,7 @@ mod tests {
                     theta,
                 )?;
                 let mut actual = original;
-                super::apply_rope_neox_with_tables(
+                crate::engine::apply_rope_neox_with_tables(
                     &mut actual,
                     num_heads,
                     head_dim,

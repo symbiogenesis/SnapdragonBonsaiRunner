@@ -25,7 +25,16 @@ impl<'a> KvAppend<'a> {
         keys: &[f32],
         values: &[f32],
     ) -> io::Result<Self> {
-        let next = cache.seq_len.checked_add(1).ok_or_else(|| {
+        Self::new_batch(cache, 1, keys, values)
+    }
+
+    pub(super) fn new_batch(
+        cache: &'a mut LayerKvCache,
+        seq_len: usize,
+        keys: &[f32],
+        values: &[f32],
+    ) -> io::Result<Self> {
+        let next = cache.seq_len.checked_add(seq_len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "Speech KV position overflow.")
         })?;
         cache.k.try_reserve(keys.len()).map_err(io::Error::other)?;

@@ -812,16 +812,15 @@ impl LinearProjection {
         Ok(output)
     }
 
-    /// Decode embedding row `index` directly into pre-allocated `out` (`[in_dim]`).
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` when `index >= out_dim` or `out.len() != in_dim`, and
-    /// `InvalidData` when the weight payload cannot supply that row cleanly.
-    pub fn row_into(&self, index: usize, out: &mut [f32]) -> io::Result<()> {
-        if index >= self.out_dim || out.len() != self.in_dim {
+    fn decode_row_into<const ADD: bool>(&self, index: usize, dst: &mut [f32]) -> io::Result<()> {
+        if index >= self.out_dim || dst.len() != self.in_dim {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Embedding row or destination extent is out of range.",
+                if ADD {
+                    "Embedding row or accumulator extent is out of range."
+                } else {
+                    "Embedding row or destination extent is out of range."
+                },
             ));
         }
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Invalid embedding weights.");
@@ -829,21 +828,35 @@ impl LinearProjection {
         let end = offset.checked_add(self.in_dim).ok_or_else(invalid)?;
         if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
             let (block, size) = crate::weights::packed_layout(ggml_type)?;
-            if !self.in_dim.is_multiple_of(block) {
+            if !self.in_dim.is_multiple_of(block) || (ADD && block > 256) {
                 return Err(invalid());
             }
             let start = (offset / block).checked_mul(size).ok_or_else(invalid)?;
             let stop = (end / block).checked_mul(size).ok_or_else(invalid)?;
             let row = bytes.get(start..stop).ok_or_else(invalid)?;
-            for (source, destination) in row.chunks_exact(size).zip(out.chunks_exact_mut(block)) {
-                crate::weights::decode_block(ggml_type, source, destination);
+            let mut decoded = [0.0_f32; 256];
+            for (source, destination) in row.chunks_exact(size).zip(dst.chunks_exact_mut(block)) {
+                if ADD {
+                    crate::weights::decode_block(ggml_type, source, &mut decoded[..block]);
+                    for (acc, &add) in destination.iter_mut().zip(&decoded[..block]) {
+                        *acc += add;
+                    }
+                } else {
+                    crate::weights::decode_block(ggml_type, source, destination);
+                }
             }
             return Ok(());
         }
         match &self.weight {
             WeightQuantization::F32(values) => {
                 let slice = values.get(offset..end).ok_or_else(invalid)?;
-                out.copy_from_slice(slice);
+                if ADD {
+                    for (acc, &add) in dst.iter_mut().zip(slice) {
+                        *acc += add;
+                    }
+                } else {
+                    dst.copy_from_slice(slice);
+                }
                 Ok(())
             }
             WeightQuantization::Q8_0 { blocks } => {
@@ -851,9 +864,14 @@ impl LinearProjection {
                     return Err(invalid());
                 }
                 let row = blocks.get(offset / 32..end / 32).ok_or_else(invalid)?;
-                for (block, dst) in row.iter().zip(out.chunks_exact_mut(32)) {
-                    for (value, slot) in block.quants.iter().zip(dst.iter_mut()) {
-                        *slot = block.scale * f32::from(*value);
+                for (block, chunk) in row.iter().zip(dst.chunks_exact_mut(32)) {
+                    for (value, slot) in block.quants.iter().zip(chunk.iter_mut()) {
+                        let weighted = block.scale * f32::from(*value);
+                        if ADD {
+                            *slot += weighted;
+                        } else {
+                            *slot = weighted;
+                        }
                     }
                 }
                 Ok(())
@@ -862,60 +880,22 @@ impl LinearProjection {
         }
     }
 
+    /// Decode embedding row `index` directly into pre-allocated `out` (`[in_dim]`).
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when `index >= out_dim` or `out.len() != in_dim`, and
+    /// `InvalidData` when the weight payload cannot supply that row cleanly.
+    pub fn row_into(&self, index: usize, out: &mut [f32]) -> io::Result<()> {
+        self.decode_row_into::<false>(index, out)
+    }
+
     /// Decode embedding row `index` and add it elementwise into `accum` (`[in_dim]`).
     ///
     /// # Errors
     /// Returns `InvalidInput` when `index >= out_dim` or `accum.len() != in_dim`, and
     /// `InvalidData` when the weight payload cannot supply that row cleanly.
     pub fn add_row_into(&self, index: usize, accum: &mut [f32]) -> io::Result<()> {
-        if index >= self.out_dim || accum.len() != self.in_dim {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Embedding row or accumulator extent is out of range.",
-            ));
-        }
-        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Invalid embedding weights.");
-        let offset = index.checked_mul(self.in_dim).ok_or_else(invalid)?;
-        let end = offset.checked_add(self.in_dim).ok_or_else(invalid)?;
-        if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
-            let (block, size) = crate::weights::packed_layout(ggml_type)?;
-            if !self.in_dim.is_multiple_of(block) || block > 256 {
-                return Err(invalid());
-            }
-            let start = (offset / block).checked_mul(size).ok_or_else(invalid)?;
-            let stop = (end / block).checked_mul(size).ok_or_else(invalid)?;
-            let row = bytes.get(start..stop).ok_or_else(invalid)?;
-            let mut decoded = [0.0_f32; 256];
-            for (source, destination) in row.chunks_exact(size).zip(accum.chunks_exact_mut(block)) {
-                crate::weights::decode_block(ggml_type, source, &mut decoded[..block]);
-                for (acc, &add) in destination.iter_mut().zip(&decoded[..block]) {
-                    *acc += add;
-                }
-            }
-            return Ok(());
-        }
-        match &self.weight {
-            WeightQuantization::F32(values) => {
-                let slice = values.get(offset..end).ok_or_else(invalid)?;
-                for (acc, &add) in accum.iter_mut().zip(slice) {
-                    *acc += add;
-                }
-                Ok(())
-            }
-            WeightQuantization::Q8_0 { blocks } => {
-                if !self.in_dim.is_multiple_of(32) {
-                    return Err(invalid());
-                }
-                let row = blocks.get(offset / 32..end / 32).ok_or_else(invalid)?;
-                for (block, dst) in row.iter().zip(accum.chunks_exact_mut(32)) {
-                    for (value, acc) in block.quants.iter().zip(dst.iter_mut()) {
-                        *acc += block.scale * f32::from(*value);
-                    }
-                }
-                Ok(())
-            }
-            _ => Err(invalid()),
-        }
+        self.decode_row_into::<true>(index, accum)
     }
 
     /// Return the input-side `(signs, hadamard_block)` signature when this projection uses
@@ -1504,6 +1484,76 @@ mod quant_dispatch {
         None
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Generic 4-row GEMM driver parameterizes activation quantization and block kernels without dynamic dispatch."
+    )]
+    fn run_batch_4row_gemm<Act: Default + Clone + Sync>(
+        transposed: &mut [f32],
+        bytes: &[u8],
+        inputs: &[f32],
+        in_dim: usize,
+        seq_len: usize,
+        worker_count: usize,
+        block_elems: usize,
+        elem_bytes: usize,
+        quantize: impl Fn(&[f32], &mut [Act]),
+        gemm_4x2: impl Fn([&[u8]; 4], &[Act], &[Act]) -> [[f32; 2]; 4] + Sync,
+        dot_4rows: impl Fn([&[u8]; 4], &[Act]) -> [f32; 4] + Sync,
+        dot_row: impl Fn(&[u8], &[Act]) -> f32 + Sync,
+    ) {
+        let blocks_per_tok = in_dim / block_elems;
+        let row_bytes = blocks_per_tok * elem_bytes;
+        let mut acts = vec![Act::default(); seq_len * blocks_per_tok];
+        for t in 0..seq_len {
+            quantize(
+                &inputs[t * in_dim..(t + 1) * in_dim],
+                &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+            );
+        }
+        run_row_chunks_aligned(transposed, worker_count, 4 * seq_len, |flat_off, dst| {
+            let start_row = flat_off / seq_len;
+            let rows_here = dst.len() / seq_len;
+            let mut processed = 0_usize;
+            while processed + 4 <= rows_here {
+                let r0 = (start_row + processed) * row_bytes;
+                let row_refs = std::array::from_fn(|r| {
+                    let start = r0 + r * row_bytes;
+                    &bytes[start..start + row_bytes]
+                });
+                let mut t = 0_usize;
+                while t + 1 < seq_len {
+                    let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                    let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
+                    let tile = gemm_4x2(row_refs, a0, a1);
+                    for r in 0..4 {
+                        let base = (processed + r) * seq_len + t;
+                        dst[base] += tile[r][0];
+                        dst[base + 1] += tile[r][1];
+                    }
+                    t += 2;
+                }
+                if t < seq_len {
+                    let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                    let col = dot_4rows(row_refs, a0);
+                    for r in 0..4 {
+                        dst[(processed + r) * seq_len + t] += col[r];
+                    }
+                }
+                processed += 4;
+            }
+            for local_r in processed..rows_here {
+                let off = (start_row + local_r) * row_bytes;
+                let w_row = &bytes[off..off + row_bytes];
+                let base = local_r * seq_len;
+                for t in 0..seq_len {
+                    let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                    dst[base + t] += dot_row(w_row, a0);
+                }
+            }
+        });
+    }
+
     pub(super) fn dispatch_batch_quant_kernels(
         proj: &LinearProjection,
         inputs: &[f32],
@@ -1532,133 +1582,51 @@ mod quant_dispatch {
             GroupKind::Packed {
                 ggml_type: 8,
                 bytes,
-            } => {
-                let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
-                let row_bytes = blocks_per_tok * Q8_0_BLOCK_BYTES;
-                let mut acts = vec![Q8_0ActBlock::default(); seq_len * blocks_per_tok];
-                for t in 0..seq_len {
-                    quantize_row_q8_0(
-                        &inputs[t * in_dim..(t + 1) * in_dim],
-                        &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
-                    );
-                }
-                let align = 4 * seq_len;
-                run_row_chunks_aligned(&mut transposed, worker_count, align, |flat_off, dst| {
-                    let start_row = flat_off / seq_len;
-                    let rows_here = dst.len() / seq_len;
-                    let mut processed = 0_usize;
-                    while processed + 4 <= rows_here {
-                        let r0 = (start_row + processed) * row_bytes;
-                        let row_refs = [
-                            &bytes[r0..r0 + row_bytes],
-                            &bytes[r0 + row_bytes..r0 + 2 * row_bytes],
-                            &bytes[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
-                            &bytes[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
-                        ];
-                        let mut t = 0_usize;
-                        while t + 1 < seq_len {
-                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                            let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
-                            let tile = gemm_q8_0_4x2(caps, row_refs, a0, a1);
-                            for r in 0..4 {
-                                let base = (processed + r) * seq_len + t;
-                                dst[base] += tile[r][0];
-                                dst[base + 1] += tile[r][1];
-                            }
-                            t += 2;
-                        }
-                        if t < seq_len {
-                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                            let col = dot_q8_0_4rows(caps, row_refs, a0);
-                            for r in 0..4 {
-                                dst[(processed + r) * seq_len + t] += col[r];
-                            }
-                        }
-                        processed += 4;
-                    }
-                    for local_r in processed..rows_here {
-                        let off = (start_row + local_r) * row_bytes;
-                        let w_row = &bytes[off..off + row_bytes];
-                        let base = local_r * seq_len;
-                        for t in 0..seq_len {
-                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                            dst[base + t] += dot_q8_0_row(caps, w_row, a0);
-                        }
-                    }
-                });
-            }
-            GroupKind::Packed { ggml_type, bytes } => {
-                let blocks_per_tok = in_dim / QK_K;
-                let elem_bytes = if ggml_type == 12 {
-                    Q4_K_BLOCK_BYTES
-                } else {
-                    Q6_K_BLOCK_BYTES
-                };
-                let row_bytes = blocks_per_tok * elem_bytes;
-                let mut acts = vec![Q8_KActBlock::default(); seq_len * blocks_per_tok];
-                for t in 0..seq_len {
-                    quantize_row_q8_k(
-                        &inputs[t * in_dim..(t + 1) * in_dim],
-                        &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
-                    );
-                }
-                let align = 4 * seq_len;
-                run_row_chunks_aligned(&mut transposed, worker_count, align, |flat_off, dst| {
-                    let start_row = flat_off / seq_len;
-                    let rows_here = dst.len() / seq_len;
-                    let mut processed = 0_usize;
-                    while processed + 4 <= rows_here {
-                        let r0 = (start_row + processed) * row_bytes;
-                        let row_refs = [
-                            &bytes[r0..r0 + row_bytes],
-                            &bytes[r0 + row_bytes..r0 + 2 * row_bytes],
-                            &bytes[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
-                            &bytes[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
-                        ];
-                        let mut t = 0_usize;
-                        while t + 1 < seq_len {
-                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                            let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
-                            let tile = if ggml_type == 12 {
-                                gemm_q4_k_4x2(caps, row_refs, a0, a1)
-                            } else {
-                                gemm_q6_k_4x2(caps, row_refs, a0, a1)
-                            };
-                            for r in 0..4 {
-                                let base = (processed + r) * seq_len + t;
-                                dst[base] += tile[r][0];
-                                dst[base + 1] += tile[r][1];
-                            }
-                            t += 2;
-                        }
-                        if t < seq_len {
-                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                            let col = if ggml_type == 12 {
-                                dot_q4_k_4rows(caps, row_refs, a0)
-                            } else {
-                                dot_q6_k_4rows(caps, row_refs, a0)
-                            };
-                            for r in 0..4 {
-                                dst[(processed + r) * seq_len + t] += col[r];
-                            }
-                        }
-                        processed += 4;
-                    }
-                    for local_r in processed..rows_here {
-                        let off = (start_row + local_r) * row_bytes;
-                        let w_row = &bytes[off..off + row_bytes];
-                        let base = local_r * seq_len;
-                        for t in 0..seq_len {
-                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                            dst[base + t] += if ggml_type == 12 {
-                                dot_q4_k_row(caps, w_row, a0)
-                            } else {
-                                dot_q6_k_row(caps, w_row, a0)
-                            };
-                        }
-                    }
-                });
-            }
+            } => run_batch_4row_gemm(
+                &mut transposed,
+                bytes,
+                inputs,
+                in_dim,
+                seq_len,
+                worker_count,
+                Q8_0_BLOCK_ELEMENTS,
+                Q8_0_BLOCK_BYTES,
+                quantize_row_q8_0,
+                |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
+                |r, a0| dot_q8_0_4rows(caps, r, a0),
+                |r, a0| dot_q8_0_row(caps, r, a0),
+            ),
+            GroupKind::Packed {
+                ggml_type: 12,
+                bytes,
+            } => run_batch_4row_gemm(
+                &mut transposed,
+                bytes,
+                inputs,
+                in_dim,
+                seq_len,
+                worker_count,
+                QK_K,
+                Q4_K_BLOCK_BYTES,
+                quantize_row_q8_k,
+                |r, a0, a1| gemm_q4_k_4x2(caps, r, a0, a1),
+                |r, a0| dot_q4_k_4rows(caps, r, a0),
+                |r, a0| dot_q4_k_row(caps, r, a0),
+            ),
+            GroupKind::Packed { bytes, .. } => run_batch_4row_gemm(
+                &mut transposed,
+                bytes,
+                inputs,
+                in_dim,
+                seq_len,
+                worker_count,
+                QK_K,
+                Q6_K_BLOCK_BYTES,
+                quantize_row_q8_k,
+                |r, a0, a1| gemm_q6_k_4x2(caps, r, a0, a1),
+                |r, a0| dot_q6_k_4rows(caps, r, a0),
+                |r, a0| dot_q6_k_row(caps, r, a0),
+            ),
             GroupKind::Repacked(bytes) => {
                 let blocks_per_tok = in_dim / QK_K;
                 let strip_bytes = blocks_per_tok * Q4_K_REPACK8_BLOCK_BYTES;
@@ -2027,14 +1995,25 @@ fn compute_rope_tables(head_dim: usize, pos: usize, theta: f32, cos: &mut [f32],
     }
 }
 
-fn apply_rope_neox_with_tables(
+pub(crate) fn apply_rope_neox_with_tables(
     heads: &mut [f32],
     num_heads: usize,
     head_dim: usize,
     cos: &[f32],
     sin: &[f32],
-) {
+) -> io::Result<()> {
     let half = head_dim / 2;
+    if head_dim == 0
+        || !head_dim.is_multiple_of(2)
+        || cos.len() != half
+        || sin.len() != half
+        || heads.len() != num_heads * head_dim
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid RoPE head dimensions.",
+        ));
+    }
     let level = Level::new();
     dispatch!(level, simd => {
         for h in 0..num_heads {
@@ -2043,6 +2022,7 @@ fn apply_rope_neox_with_tables(
             rope_head_simd(simd, lo, hi, cos, sin);
         }
     });
+    Ok(())
 }
 
 /// Apply 1D NEOX-style half-split `RoPE` (or collapsed 3D `MRoPE` when all 3 axes share `pos`)
@@ -2067,14 +2047,34 @@ pub fn apply_rope_neox_in_place(
         let cos_table = &mut cos_stack[..half];
         let sin_table = &mut sin_stack[..half];
         compute_rope_tables(head_dim, pos, theta, cos_table, sin_table);
-        apply_rope_neox_with_tables(heads, num_heads, head_dim, cos_table, sin_table);
+        apply_rope_neox_with_tables(heads, num_heads, head_dim, cos_table, sin_table)?;
     } else {
         let mut cos_table = vec![0.0_f32; half];
         let mut sin_table = vec![0.0_f32; half];
         compute_rope_tables(head_dim, pos, theta, &mut cos_table, &mut sin_table);
-        apply_rope_neox_with_tables(heads, num_heads, head_dim, &cos_table, &sin_table);
+        apply_rope_neox_with_tables(heads, num_heads, head_dim, &cos_table, &sin_table)?;
     }
     Ok(())
+}
+
+fn normalize_heads_in_place(
+    buf: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    weight: &[f32],
+    eps: f32,
+) -> io::Result<()> {
+    for h in 0..num_heads {
+        rms_norm_in_place(&mut buf[h * head_dim..(h + 1) * head_dim], weight, eps)?;
+    }
+    Ok(())
+}
+
+fn swiglu_in_place(gate: &mut [f32], up: &[f32]) {
+    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+        let silu = *g / (1.0_f32 + (-*g).exp());
+        *g = silu * u;
+    }
 }
 
 /// One decoder layer shared by `Talker` (28 layers) and `CodePredictor` (5 layers).
@@ -2173,6 +2173,75 @@ impl QwenDecoderLayer {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Validates the fixed GQA layer geometry before single-step or batched execution."
+    )]
+    fn validate_geometry(
+        &self,
+        hidden: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        rms_eps: f32,
+        kv: &LayerKvCache,
+        workers: usize,
+    ) -> io::Result<(usize, usize)> {
+        if !(1..=256).contains(&workers) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid CPU worker count.",
+            ));
+        }
+        let invalid_geometry = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid speech decoder geometry or state.",
+            )
+        };
+        let query_width = num_q_heads
+            .checked_mul(head_dim)
+            .ok_or_else(invalid_geometry)?;
+        let kv_width = num_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(invalid_geometry)?;
+        if hidden == 0
+            || num_q_heads == 0
+            || num_kv_heads == 0
+            || !num_q_heads.is_multiple_of(num_kv_heads)
+            || head_dim == 0
+            || !head_dim.is_multiple_of(2)
+            || !rope_theta.is_finite()
+            || rope_theta <= 0.0
+            || !rms_eps.is_finite()
+            || rms_eps <= 0.0
+            || self.attn_norm_w.len() != hidden
+            || self.ffn_norm_w.len() != hidden
+            || self.q_norm_w.len() != head_dim
+            || self.k_norm_w.len() != head_dim
+            || self.q_proj.in_dim != hidden
+            || self.q_proj.out_dim != query_width
+            || self.k_proj.in_dim != hidden
+            || self.k_proj.out_dim != kv_width
+            || self.v_proj.in_dim != hidden
+            || self.v_proj.out_dim != kv_width
+            || self.o_proj.in_dim != query_width
+            || self.o_proj.out_dim != hidden
+            || self.gate_proj.in_dim != hidden
+            || self.up_proj.in_dim != hidden
+            || self.gate_proj.out_dim == 0
+            || self.gate_proj.out_dim != self.up_proj.out_dim
+            || self.down_proj.in_dim != self.gate_proj.out_dim
+            || self.down_proj.out_dim != hidden
+            || kv.seq_len.checked_mul(kv_width) != Some(kv.k.len())
+            || kv.k.len() != kv.v.len()
+        {
+            return Err(invalid_geometry());
+        }
+        Ok((query_width, kv_width))
+    }
+
     /// Run one decoder step with an explicit bounded CPU worker count.
     /// Failed steps, including unwinding, preserve the prior KV contents and position.
     #[expect(
@@ -2260,58 +2329,22 @@ impl QwenDecoderLayer {
         workspace: &mut decoder_workspace::DecoderWorkspace,
         output: &mut [f32],
     ) -> io::Result<()> {
-        if !(1..=256).contains(&workers) {
+        if input.len() != output.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Invalid CPU worker count.",
+                "Invalid speech decoder geometry or state.",
             ));
         }
-        let invalid_geometry = || {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid speech decoder geometry or state.",
-            )
-        };
-        let query_width = num_q_heads
-            .checked_mul(head_dim)
-            .ok_or_else(invalid_geometry)?;
-        let kv_width = num_kv_heads
-            .checked_mul(head_dim)
-            .ok_or_else(invalid_geometry)?;
-        if input.is_empty()
-            || output.len() != input.len()
-            || num_q_heads == 0
-            || num_kv_heads == 0
-            || !num_q_heads.is_multiple_of(num_kv_heads)
-            || head_dim == 0
-            || !head_dim.is_multiple_of(2)
-            || !rope_theta.is_finite()
-            || rope_theta <= 0.0
-            || !rms_eps.is_finite()
-            || rms_eps <= 0.0
-            || self.attn_norm_w.len() != input.len()
-            || self.ffn_norm_w.len() != input.len()
-            || self.q_norm_w.len() != head_dim
-            || self.k_norm_w.len() != head_dim
-            || self.q_proj.in_dim != input.len()
-            || self.q_proj.out_dim != query_width
-            || self.k_proj.in_dim != input.len()
-            || self.k_proj.out_dim != kv_width
-            || self.v_proj.in_dim != input.len()
-            || self.v_proj.out_dim != kv_width
-            || self.o_proj.in_dim != query_width
-            || self.o_proj.out_dim != input.len()
-            || self.gate_proj.in_dim != input.len()
-            || self.up_proj.in_dim != input.len()
-            || self.gate_proj.out_dim == 0
-            || self.gate_proj.out_dim != self.up_proj.out_dim
-            || self.down_proj.in_dim != self.gate_proj.out_dim
-            || self.down_proj.out_dim != input.len()
-            || kv.seq_len.checked_mul(kv_width) != Some(kv.k.len())
-            || kv.k.len() != kv.v.len()
-        {
-            return Err(invalid_geometry());
-        }
+        let (query_width, _kv_width) = self.validate_geometry(
+            input.len(),
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_theta,
+            rms_eps,
+            kv,
+            workers,
+        )?;
         let decoder_workspace::DecoderWorkspace {
             norm: h_norm,
             q,
@@ -2402,20 +2435,8 @@ impl QwenDecoderLayer {
             )?;
         }
 
-        for h in 0..num_q_heads {
-            rms_norm_in_place(
-                &mut q[h * head_dim..(h + 1) * head_dim],
-                &self.q_norm_w,
-                rms_eps,
-            )?;
-        }
-        for h in 0..num_kv_heads {
-            rms_norm_in_place(
-                &mut k[h * head_dim..(h + 1) * head_dim],
-                &self.k_norm_w,
-                rms_eps,
-            )?;
-        }
+        normalize_heads_in_place(q, num_q_heads, head_dim, &self.q_norm_w, rms_eps)?;
+        normalize_heads_in_place(k, num_kv_heads, head_dim, &self.k_norm_w, rms_eps)?;
 
         let pos = kv.seq_len;
         let half = head_dim / 2;
@@ -2425,8 +2446,8 @@ impl QwenDecoderLayer {
             let cos_table = &mut cos_stack[..half];
             let sin_table = &mut sin_stack[..half];
             compute_rope_tables(head_dim, pos, rope_theta, cos_table, sin_table);
-            apply_rope_neox_with_tables(q, num_q_heads, head_dim, cos_table, sin_table);
-            apply_rope_neox_with_tables(k, num_kv_heads, head_dim, cos_table, sin_table);
+            apply_rope_neox_with_tables(q, num_q_heads, head_dim, cos_table, sin_table)?;
+            apply_rope_neox_with_tables(k, num_kv_heads, head_dim, cos_table, sin_table)?;
         } else {
             apply_rope_neox_in_place(q, num_q_heads, head_dim, pos, rope_theta)?;
             apply_rope_neox_in_place(k, num_kv_heads, head_dim, pos, rope_theta)?;
@@ -2514,10 +2535,7 @@ impl QwenDecoderLayer {
                 up,
             )?;
         }
-        for (g, &u) in gate.iter_mut().zip(up.iter()) {
-            let silu = *g / (1.0_f32 + (-*g).exp());
-            *g = silu * u;
-        }
+        swiglu_in_place(gate, up);
         self.down_proj
             .forward_vec_into(gate, None, patch(&self.down_proj), workers, projected)?;
         dispatch!(level, simd => axpy_simd(simd, 1.0_f32, projected, x_res));
@@ -2558,17 +2576,9 @@ impl QwenDecoderLayer {
     ) -> io::Result<()> {
         let invalid_geometry =
             || io::Error::new(io::ErrorKind::InvalidInput, "Invalid GQA geometry.");
-        if !(1..=256).contains(&workers) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid CPU worker count.",
-            ));
-        }
-        if seq_len == 0 {
-            return Err(invalid_geometry());
-        }
         let hidden = self.attn_norm_w.len();
-        if hidden == 0
+        if seq_len == 0
+            || hidden == 0
             || inputs.len() != seq_len.checked_mul(hidden).ok_or_else(invalid_geometry)?
         {
             return Err(invalid_geometry());
@@ -2590,75 +2600,20 @@ impl QwenDecoderLayer {
                 output,
             );
         }
-        let Some(query_width) = num_q_heads.checked_mul(head_dim) else {
-            return Err(invalid_geometry());
-        };
-        let Some(kv_width) = num_kv_heads.checked_mul(head_dim) else {
-            return Err(invalid_geometry());
-        };
-        if num_q_heads == 0
-            || num_kv_heads == 0
-            || head_dim == 0
-            || !head_dim.is_multiple_of(2)
-            || !num_q_heads.is_multiple_of(num_kv_heads)
-            || rope_theta <= 0.0
-            || rms_eps <= 0.0
-            || self.ffn_norm_w.len() != hidden
-            || self.q_norm_w.len() != head_dim
-            || self.k_norm_w.len() != head_dim
-            || self.q_proj.in_dim != hidden
-            || self.q_proj.out_dim != query_width
-            || self.k_proj.in_dim != hidden
-            || self.k_proj.out_dim != kv_width
-            || self.v_proj.in_dim != hidden
-            || self.v_proj.out_dim != kv_width
-            || self.o_proj.in_dim != query_width
-            || self.o_proj.out_dim != hidden
-            || self.gate_proj.in_dim != hidden
-            || self.up_proj.in_dim != hidden
-            || self.gate_proj.out_dim == 0
-            || self.gate_proj.out_dim != self.up_proj.out_dim
-            || self.down_proj.in_dim != self.gate_proj.out_dim
-            || self.down_proj.out_dim != hidden
-            || kv.seq_len.checked_mul(kv_width) != Some(kv.k.len())
-            || kv.k.len() != kv.v.len()
-        {
-            return Err(invalid_geometry());
-        }
-
-        struct KvBatchGuard<'a> {
-            kv: &'a mut LayerKvCache,
-            orig_k: usize,
-            orig_v: usize,
-            orig_seq: usize,
-            committed: bool,
-        }
-        impl Drop for KvBatchGuard<'_> {
-            fn drop(&mut self) {
-                if !self.committed {
-                    self.kv.k.truncate(self.orig_k);
-                    self.kv.v.truncate(self.orig_v);
-                    self.kv.seq_len = self.orig_seq;
-                }
-            }
-        }
-
-        let initial_seq = kv.seq_len;
-        let next_seq = initial_seq
-            .checked_add(seq_len)
-            .ok_or_else(invalid_geometry)?;
-        let append_elems = seq_len.checked_mul(kv_width).ok_or_else(invalid_geometry)?;
-        let orig_k = kv.k.len();
-        let orig_v = kv.v.len();
-        kv.k.try_reserve(append_elems).map_err(io::Error::other)?;
-        kv.v.try_reserve(append_elems).map_err(io::Error::other)?;
-        let mut guard = KvBatchGuard {
+        let (query_width, kv_width) = self.validate_geometry(
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_theta,
+            rms_eps,
             kv,
-            orig_k,
-            orig_v,
-            orig_seq: initial_seq,
-            committed: false,
-        };
+            workers,
+        )?;
+        let initial_seq = kv.seq_len;
+        if initial_seq.checked_add(seq_len).is_none() || seq_len.checked_mul(kv_width).is_none() {
+            return Err(invalid_geometry());
+        }
 
         let mut h_norm = vec![0.0_f32; seq_len * hidden];
         let mut row_norm = Vec::with_capacity(hidden);
@@ -2703,21 +2658,9 @@ impl QwenDecoderLayer {
         let mut sin_buf = vec![0.0_f32; half];
         for t in 0..seq_len {
             let q_tok = &mut q_all[t * query_width..(t + 1) * query_width];
-            for h in 0..num_q_heads {
-                rms_norm_in_place(
-                    &mut q_tok[h * head_dim..(h + 1) * head_dim],
-                    &self.q_norm_w,
-                    rms_eps,
-                )?;
-            }
+            normalize_heads_in_place(q_tok, num_q_heads, head_dim, &self.q_norm_w, rms_eps)?;
             let k_tok = &mut k_all[t * kv_width..(t + 1) * kv_width];
-            for h in 0..num_kv_heads {
-                rms_norm_in_place(
-                    &mut k_tok[h * head_dim..(h + 1) * head_dim],
-                    &self.k_norm_w,
-                    rms_eps,
-                )?;
-            }
+            normalize_heads_in_place(k_tok, num_kv_heads, head_dim, &self.k_norm_w, rms_eps)?;
             compute_rope_tables(
                 head_dim,
                 initial_seq + t,
@@ -2725,21 +2668,12 @@ impl QwenDecoderLayer {
                 &mut cos_buf,
                 &mut sin_buf,
             );
-            apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, &cos_buf, &sin_buf);
-            apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, &cos_buf, &sin_buf);
+            apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, &cos_buf, &sin_buf)?;
+            apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, &cos_buf, &sin_buf)?;
         }
 
-        guard.kv.k.resize(orig_k + append_elems, 0);
-        guard.kv.v.resize(orig_v + append_elems, 0);
-        if !narrow_f32_slice(&k_all, &mut guard.kv.k[orig_k..])
-            || !narrow_f32_slice(&v_all, &mut guard.kv.v[orig_v..])
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Batched KV activation exceeds finite IEEE binary16 range.",
-            ));
-        }
-        guard.kv.seq_len = next_seq;
+        let append = kv_append::KvAppend::new_batch(kv, seq_len, &k_all, &v_all)?;
+        let kv = append.cache();
 
         let level = Level::new();
         let gqa_ratio = num_q_heads / num_kv_heads;
@@ -2752,7 +2686,7 @@ impl QwenDecoderLayer {
             attend_query_f16(
                 level,
                 q_tok,
-                guard.kv,
+                kv,
                 initial_seq + t + 1,
                 kv_width,
                 num_q_heads,
@@ -2798,10 +2732,7 @@ impl QwenDecoderLayer {
                 &mut gate,
                 &mut up,
             )?;
-            for (g, &u) in gate.iter_mut().zip(up.iter()) {
-                let silu = *g / (1.0_f32 + (-*g).exp());
-                *g = silu * u;
-            }
+            swiglu_in_place(&mut gate, &up);
             self.down_proj.forward_vec_into(
                 &gate,
                 None,
@@ -2838,10 +2769,7 @@ impl QwenDecoderLayer {
                 workers,
                 &mut up_all,
             )?;
-            for (g, &u) in gate_all.iter_mut().zip(up_all.iter()) {
-                let silu = *g / (1.0_f32 + (-*g).exp());
-                *g = silu * u;
-            }
+            swiglu_in_place(&mut gate_all, &up_all);
             self.down_proj.forward_batch_into(
                 &gate_all,
                 seq_len,
@@ -2860,7 +2788,7 @@ impl QwenDecoderLayer {
                 "Nonfinite speech batched decoder output.",
             ));
         }
-        guard.committed = true;
+        append.commit();
         Ok(())
     }
 }
