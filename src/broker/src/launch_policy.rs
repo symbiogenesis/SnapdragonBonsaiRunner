@@ -427,80 +427,54 @@ struct ModelPinFields<'a> {
     architecture: &'a str,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ModelPinCommon {
-    repository: String,
-    revision: String,
-    filename: String,
-    bytes: u64,
-    sha256: String,
-    digest_source: String,
-    license: String,
-    architecture: String,
+macro_rules! define_model_pin {
+    ($vis:vis struct $name:ident $(($fvis:vis))? { $($extra:tt)* }) => {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        $vis struct $name {
+            repository: String,
+            $($fvis)? revision: String,
+            $($fvis)? filename: String,
+            $($fvis)? bytes: u64,
+            $($fvis)? sha256: String,
+            digest_source: String,
+            license: String,
+            architecture: String,
+            $($extra)*
+        }
+
+        impl $name {
+            fn fields(&self) -> ModelPinFields<'_> {
+                ModelPinFields {
+                    repository: &self.repository,
+                    revision: &self.revision,
+                    filename: &self.filename,
+                    bytes: self.bytes,
+                    sha256: &self.sha256,
+                    digest_source: &self.digest_source,
+                    license: &self.license,
+                    architecture: &self.architecture,
+                }
+            }
+
+            fn into_artifact(self) -> ModelArtifact {
+                ModelArtifact {
+                    revision: self.revision,
+                    filename: self.filename,
+                    bytes: self.bytes,
+                    sha256: self.sha256,
+                }
+            }
+        }
+    };
 }
 
-impl ModelPinCommon {
-    fn fields(&self) -> ModelPinFields<'_> {
-        ModelPinFields {
-            repository: &self.repository,
-            revision: &self.revision,
-            filename: &self.filename,
-            bytes: self.bytes,
-            sha256: &self.sha256,
-            digest_source: &self.digest_source,
-            license: &self.license,
-            architecture: &self.architecture,
-        }
-    }
-
-    fn into_artifact(self) -> ModelArtifact {
-        ModelArtifact {
-            revision: self.revision,
-            filename: self.filename,
-            bytes: self.bytes,
-            sha256: self.sha256,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ModelPin {
-    repository: String,
-    pub(crate) revision: String,
-    pub(crate) filename: String,
-    pub(crate) bytes: u64,
-    pub(crate) sha256: String,
-    digest_source: String,
-    license: String,
-    architecture: String,
+define_model_pin!(
+    struct ModelPinCommon {}
+);
+define_model_pin!(pub(crate) struct ModelPin (pub(crate)) {
     expected_metadata: super::Object<Metadata>,
-}
-
-impl ModelPin {
-    fn fields(&self) -> ModelPinFields<'_> {
-        ModelPinFields {
-            repository: &self.repository,
-            revision: &self.revision,
-            filename: &self.filename,
-            bytes: self.bytes,
-            sha256: &self.sha256,
-            digest_source: &self.digest_source,
-            license: &self.license,
-            architecture: &self.architecture,
-        }
-    }
-
-    fn into_artifact(self) -> ModelArtifact {
-        ModelArtifact {
-            revision: self.revision,
-            filename: self.filename,
-            bytes: self.bytes,
-            sha256: self.sha256,
-        }
-    }
-}
+});
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
