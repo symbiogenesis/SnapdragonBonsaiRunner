@@ -53,6 +53,7 @@ pub const COMMANDS: &[&str] = &[
     "ptq1-capture",
     "native-qualification",
     "ptq1-packing",
+    "chunk-manifest",
     "packing-qualification",
     "host-capabilities",
     "native-acceptance-budget",
@@ -186,6 +187,9 @@ pub mod native_qualification;
 
 /// Independent complete current-weight PTQ1 packing and preserved-byte checks.
 pub mod ptq1_packing;
+
+/// Parallel mapped CNG chunk-SHA-256 manifest generation and verification.
+pub mod chunk_manifest;
 
 /// Hosted-only complete PTQ1 reproduction, worker deadlines and evidence retention.
 pub mod packing_qualification;

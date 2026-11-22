@@ -427,6 +427,24 @@ struct ModelPinFields<'a> {
     architecture: &'a str,
 }
 
+fn validate_chunk_manifest(
+    bytes: u64,
+    chunk_bytes: Option<usize>,
+    chunk_sha256s: Option<Vec<String>>,
+) -> Result<Option<(usize, Vec<String>)>, PolicyError> {
+    let manifest = bonsai_cpu_policy::validate_chunk_manifest(bytes, chunk_bytes, chunk_sha256s)
+        .map_err(|_| PolicyError::Configuration)?;
+    #[cfg(windows)]
+    if let Some((chunk_bytes, _)) = &manifest {
+        let chunk_bytes_u64 =
+            u64::try_from(*chunk_bytes).map_err(|_| PolicyError::Configuration)?;
+        if chunk_bytes_u64 < bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES {
+            return Err(PolicyError::Configuration);
+        }
+    }
+    Ok(manifest)
+}
+
 macro_rules! define_model_pin {
     ($vis:vis struct $name:ident $(($fvis:vis))? { $($extra:tt)* }) => {
         #[derive(Deserialize)]
@@ -440,6 +458,10 @@ macro_rules! define_model_pin {
             digest_source: String,
             license: String,
             architecture: String,
+            #[serde(default)]
+            chunk_bytes: Option<usize>,
+            #[serde(default)]
+            chunk_sha256s: Option<Vec<String>>,
             $($extra)*
         }
 
@@ -457,13 +479,16 @@ macro_rules! define_model_pin {
                 }
             }
 
-            fn into_artifact(self) -> ModelArtifact {
-                ModelArtifact {
+            fn into_artifact(self) -> Result<ModelArtifact, PolicyError> {
+                let chunk_manifest =
+                    validate_chunk_manifest(self.bytes, self.chunk_bytes, self.chunk_sha256s)?;
+                Ok(ModelArtifact {
                     revision: self.revision,
                     filename: self.filename,
                     bytes: self.bytes,
                     sha256: self.sha256,
-                }
+                    chunk_manifest,
+                })
             }
         }
     };
@@ -578,6 +603,7 @@ pub(crate) struct ModelArtifact {
     pub(crate) filename: String,
     pub(crate) bytes: u64,
     pub(crate) sha256: String,
+    pub(crate) chunk_manifest: Option<(usize, Vec<String>)>,
 }
 
 pub(crate) fn reviewed_pins(profile: LaunchProfile) -> Result<ReviewedPins, PolicyError> {
@@ -585,7 +611,7 @@ pub(crate) fn reviewed_pins(profile: LaunchProfile) -> Result<ReviewedPins, Poli
         let pins = parse_pins(LOCK_JSON)?;
         validate_profile(PROFILE_JSON)?;
         Ok(ReviewedPins {
-            model: pins.model.0.into_artifact(),
+            model: pins.model.0.into_artifact()?,
             runtime: pins.runtime,
         })
     });
@@ -624,6 +650,8 @@ pub(crate) fn reviewed_pins_for_representation(
         pins.model.filename = selected.filename;
         pins.model.bytes = selected.bytes;
         pins.model.sha256 = selected.sha256;
+        pins.model.chunk_manifest =
+            validate_chunk_manifest(selected.bytes, selected.chunk_bytes, selected.chunk_sha256s)?;
     }
     Ok(pins)
 }
@@ -634,6 +662,10 @@ struct SelectedModel {
     filename: String,
     bytes: u64,
     sha256: String,
+    #[serde(default)]
+    chunk_bytes: Option<usize>,
+    #[serde(default)]
+    chunk_sha256s: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -697,7 +729,7 @@ fn parse_swift_pins(input: &str) -> Result<ReviewedPins, PolicyError> {
         return Err(PolicyError::Configuration);
     }
     Ok(ReviewedPins {
-        model: pins.model.0.into_artifact(),
+        model: pins.model.0.into_artifact()?,
         runtime: pins.runtime,
     })
 }
@@ -756,6 +788,12 @@ fn parse_pins(input: &str) -> Result<Pins, PolicyError> {
         || q.cpu_loading != "pending"
         || q.daily_security != "pending"
         || q.device_performance != "pending-self-hosted-ci"
+        || bonsai_cpu_policy::validate_chunk_manifest_ref(
+            pins.model.bytes,
+            pins.model.chunk_bytes,
+            pins.model.chunk_sha256s.as_deref(),
+        )
+        .is_err()
     {
         return Err(PolicyError::Configuration);
     }
@@ -976,6 +1014,88 @@ mod tests {
             plan.enable_swift_mmproj(mmproj),
             Err(PolicyError::Configuration)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn model_lock_optional_chunk_manifest_validates_and_fails_closed() -> Result<(), PolicyError> {
+        // Default compiled locks omit chunk manifests and fall back to whole-file verification.
+        assert!(
+            reviewed_pins(LaunchProfile::ReferenceCpu)?
+                .model
+                .chunk_manifest
+                .is_none()
+        );
+        assert!(
+            reviewed_pins(LaunchProfile::SwiftPq2Assessment)?
+                .model
+                .chunk_manifest
+                .is_none()
+        );
+
+        // Valid Swift chunk manifest: 1 GiB chunks -> ceil(7_206_168_928 / 1 GiB) = 7.
+        let chunk_bytes = 1024 * 1024 * 1024_usize;
+        let digests = vec!["a".repeat(64); 7];
+        let mut valid_swift: serde_json::Value =
+            serde_json::from_str(SWIFT_LOCK_JSON).map_err(|_| PolicyError::Configuration)?;
+        valid_swift["model"]["chunkBytes"] = serde_json::json!(chunk_bytes);
+        valid_swift["model"]["chunkSha256s"] = serde_json::json!(digests);
+        let parsed = parse_swift_pins(&valid_swift.to_string())?;
+        assert_eq!(parsed.model.chunk_manifest, Some((chunk_bytes, digests)));
+
+        // Valid Reference chunk manifest: 1 GiB chunks -> ceil(13_146_393_504 / 1 GiB) = 13.
+        let ref_digests = vec!["b".repeat(64); 13];
+        let mut valid_ref: serde_json::Value =
+            serde_json::from_str(LOCK_JSON).map_err(|_| PolicyError::Configuration)?;
+        valid_ref["model"]["chunkBytes"] = serde_json::json!(chunk_bytes);
+        valid_ref["model"]["chunkSha256s"] = serde_json::json!(ref_digests);
+        let parsed_ref = parse_pins(&valid_ref.to_string())?;
+        let ref_artifact = parsed_ref.model.0.into_artifact()?;
+        assert_eq!(
+            ref_artifact.chunk_manifest,
+            Some((chunk_bytes, ref_digests))
+        );
+
+        // Reject one-sided chunkBytes, one-sided chunkSha256s, sub-threshold chunkBytes,
+        // mismatched digest count, and malformed hex in both Swift and Reference pins.
+        let min_chunk = bonsai_cpu_policy::MIN_MAPPED_HASH_BYTES;
+        #[cfg(windows)]
+        assert_eq!(min_chunk, bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES);
+
+        for bad_model in [
+            serde_json::json!({"chunkBytes": chunk_bytes}),
+            serde_json::json!({"chunkSha256s": vec!["a".repeat(64); 7]}),
+            serde_json::json!({"chunkBytes": min_chunk - 1, "chunkSha256s": vec!["a".repeat(64); 7]}),
+            serde_json::json!({"chunkBytes": 0, "chunkSha256s": vec!["a".repeat(64); 7]}),
+            serde_json::json!({"chunkBytes": chunk_bytes, "chunkSha256s": vec!["a".repeat(64); 6]}),
+            serde_json::json!({"chunkBytes": chunk_bytes, "chunkSha256s": vec!["a".repeat(64); 8]}),
+            serde_json::json!({"chunkBytes": chunk_bytes, "chunkSha256s": vec!["A".repeat(64); 7]}),
+            serde_json::json!({"chunkBytes": chunk_bytes, "chunkSha256s": vec!["bad"; 7]}),
+        ] {
+            let mut bad_swift: serde_json::Value =
+                serde_json::from_str(SWIFT_LOCK_JSON).map_err(|_| PolicyError::Configuration)?;
+            if let Some(obj) = bad_model.as_object() {
+                for (k, v) in obj {
+                    bad_swift["model"][k] = v.clone();
+                }
+            }
+            assert_eq!(
+                parse_swift_pins(&bad_swift.to_string()).err(),
+                Some(PolicyError::Configuration)
+            );
+
+            let mut bad_ref: serde_json::Value =
+                serde_json::from_str(LOCK_JSON).map_err(|_| PolicyError::Configuration)?;
+            if let Some(obj) = bad_model.as_object() {
+                for (k, v) in obj {
+                    bad_ref["model"][k] = v.clone();
+                }
+            }
+            assert_eq!(
+                parse_pins(&bad_ref.to_string()).err(),
+                Some(PolicyError::Configuration)
+            );
+        }
         Ok(())
     }
 }

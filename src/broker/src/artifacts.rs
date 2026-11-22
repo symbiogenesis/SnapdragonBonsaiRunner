@@ -1,10 +1,63 @@
 //! Offline verification of compiled model/runtime identities with retained guards.
 
-use crate::launch_policy::{LaunchProfile, reviewed_pins_for_representation};
-use bonsai_artifacts::{RuntimeSpec, VerifiedFile, VerifiedRuntime};
-use std::path::{Path, PathBuf};
+use crate::launch_policy::{LaunchProfile, ModelArtifact, reviewed_pins_for_representation};
+use bonsai_artifacts::{ChunkedFileSpec, RuntimeSpec, VerifiedFile, VerifiedRuntime};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
+};
 
 pub use bonsai_artifacts::ArtifactError;
+
+fn default_chunk_workers() -> usize {
+    #[cfg(windows)]
+    {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(1, bonsai_windows_credentials::MAX_PARALLEL_HASH_WORKERS)
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
+/// Verify an artifact against its exact byte length and SHA-256, using parallel
+/// chunked verification when a complete chunk manifest is provided.
+#[cfg_attr(
+    not(windows),
+    expect(
+        dead_code,
+        reason = "Used by Windows-only launcher guards in addition to verify_selected_model."
+    )
+)]
+pub(crate) fn verify_file_with_optional_chunks(
+    path: &Path,
+    bytes: u64,
+    sha256: &str,
+    chunk_bytes: Option<usize>,
+    chunk_sha256s: Option<&[String]>,
+) -> Result<VerifiedFile, ArtifactError> {
+    match (chunk_bytes, chunk_sha256s) {
+        (Some(chunk_bytes), Some(chunk_sha256s)) => {
+            let spec = ChunkedFileSpec {
+                path: path.to_path_buf(),
+                bytes,
+                sha256: sha256.to_owned(),
+                chunk_bytes,
+                chunk_sha256s: chunk_sha256s.to_vec(),
+            };
+            VerifiedFile::verify_chunked_with(
+                &spec,
+                default_chunk_workers(),
+                &AtomicBool::new(false),
+            )
+        }
+        (None, None) => VerifiedFile::verify(path, bytes, sha256),
+        (Some(_), None) | (None, Some(_)) => Err(ArtifactError::Configuration),
+    }
+}
 
 fn model_failure_reason(path: &Path, error: ArtifactError) -> &'static str {
     match error {
@@ -149,6 +202,36 @@ impl VerifiedArtifacts {
         })
     }
 
+    fn verify_model_artifact(
+        model: &Path,
+        artifact: &ModelArtifact,
+        use_repacked_ptq1: bool,
+    ) -> Result<VerifiedFile, ArtifactError> {
+        let (chunk_bytes, chunk_sha256s) = artifact
+            .chunk_manifest
+            .as_ref()
+            .map_or((None, None), |(bytes, digests)| {
+                (Some(*bytes), Some(digests.as_slice()))
+            });
+        verify_file_with_optional_chunks(
+            model,
+            artifact.bytes,
+            &artifact.sha256,
+            chunk_bytes,
+            chunk_sha256s,
+        )
+        .inspect_err(|error| {
+            // Only fixed classifications enter stderr; paths, file contents
+            // and inherited process output never enter the UI error text.
+            let _written = write_model_failure(
+                &mut std::io::stderr().lock(),
+                model,
+                use_repacked_ptq1,
+                *error,
+            );
+        })
+    }
+
     fn verify_selected_model(
         data: &Path,
         profile: LaunchProfile,
@@ -160,17 +243,7 @@ impl VerifiedArtifacts {
             .join("models")
             .join(&pins.model.revision)
             .join(&pins.model.filename);
-        let guard = VerifiedFile::verify(&model, pins.model.bytes, &pins.model.sha256)
-            .inspect_err(|error| {
-                // Only fixed classifications enter stderr; paths, file contents
-                // and inherited process output never enter the UI error text.
-                let _written = write_model_failure(
-                    &mut std::io::stderr().lock(),
-                    &model,
-                    use_repacked_ptq1,
-                    *error,
-                );
-            })?;
+        let guard = Self::verify_model_artifact(&model, &pins.model, use_repacked_ptq1)?;
         Ok((model, guard))
     }
 
@@ -352,6 +425,152 @@ mod tests {
             fs::remove_file(&archive)?;
         }
         assert_eq!(data.parent(), Some(std::env::temp_dir().as_path()));
+        Ok(())
+    }
+
+    fn lower_hex(digest: &[u8; 32]) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    fn synthetic_gguf_bytes(len: usize) -> Vec<u8> {
+        let mut payload: Vec<u8> = (0..len)
+            .map(|i| u8::try_from((i.wrapping_mul(29) ^ (i >> 7) ^ 0x5c) & 0xff).unwrap_or(0))
+            .collect();
+        if payload.len() >= 4 {
+            payload[..4].copy_from_slice(b"GGUF");
+        }
+        payload
+    }
+
+    #[test]
+    fn chunked_model_verification_succeeds_and_catches_one_byte_corruption_in_any_chunk()
+    -> std::io::Result<()> {
+        let temp = TempDir::new("Bonsai-chunked-model-verify")?;
+        let model_path = temp.path().join("synthetic-model.gguf");
+        let chunk_bytes = usize::try_from(bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES)
+            .map_err(std::io::Error::other)?;
+        let total_len = 2 * chunk_bytes + 4_096;
+        let payload = synthetic_gguf_bytes(total_len);
+        fs::write(&model_path, &payload)?;
+
+        let whole_sha256 = lower_hex(&bonsai_windows_credentials::Sha256::digest_bytes(&payload)?);
+        let locked = bonsai_artifacts::open_locked_file(&model_path)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        let bytes_u64 = u64::try_from(total_len).map_err(std::io::Error::other)?;
+        let raw_chunks = bonsai_windows_credentials::compute_mapped_chunk_digests(
+            &locked,
+            bytes_u64,
+            chunk_bytes,
+            4,
+            &AtomicBool::new(false),
+        )?
+        .ok_or_else(|| std::io::Error::other("Expected mapped chunk digests."))?;
+        drop(locked);
+        let chunk_sha256s: Vec<String> = raw_chunks.iter().map(lower_hex).collect();
+        assert_eq!(chunk_sha256s.len(), 3);
+
+        let artifact = ModelArtifact {
+            revision: "a".repeat(40),
+            filename: "synthetic-model.gguf".to_owned(),
+            bytes: bytes_u64,
+            sha256: whole_sha256.clone(),
+            chunk_manifest: Some((chunk_bytes, chunk_sha256s.clone())),
+        };
+
+        // Valid chunked verification acquires read lock and prevents write opens.
+        let guard = VerifiedArtifacts::verify_model_artifact(&model_path, &artifact, false)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        assert!(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&model_path)
+                .is_err()
+        );
+        drop(guard);
+
+        // Whole-file fallback when chunk_manifest is omitted also succeeds.
+        let whole_artifact = ModelArtifact {
+            chunk_manifest: None,
+            ..artifact.clone()
+        };
+        let whole_guard =
+            VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact, false)
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        drop(whole_guard);
+
+        // 1-byte corruption in chunk 0, chunk 1, and final tail chunk must fail with Identity.
+        for tamper_offset in [17_usize, chunk_bytes + 17, total_len - 1] {
+            let mut tampered = payload.clone();
+            tampered[tamper_offset] ^= 0x01;
+            fs::write(&model_path, &tampered)?;
+            assert_eq!(
+                VerifiedArtifacts::verify_model_artifact(&model_path, &artifact, false).err(),
+                Some(ArtifactError::Identity),
+                "missed corruption at offset {tamper_offset}"
+            );
+            assert_eq!(
+                VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact, false).err(),
+                Some(ArtifactError::Identity)
+            );
+        }
+
+        // Restore valid file and verify manifest schema/identity mismatches fail closed.
+        fs::write(&model_path, &payload)?;
+        let mut wrong_count = artifact.clone();
+        wrong_count.chunk_manifest = Some((chunk_bytes, chunk_sha256s[..2].to_vec()));
+        assert_eq!(
+            VerifiedArtifacts::verify_model_artifact(&model_path, &wrong_count, false).err(),
+            Some(ArtifactError::Identity)
+        );
+
+        let mut wrong_chunk_bytes = artifact.clone();
+        wrong_chunk_bytes.chunk_manifest = Some((chunk_bytes + 4096, chunk_sha256s.clone()));
+        assert_eq!(
+            VerifiedArtifacts::verify_model_artifact(&model_path, &wrong_chunk_bytes, false).err(),
+            Some(ArtifactError::Identity)
+        );
+
+        let mut bad_hex = artifact;
+        bad_hex.chunk_manifest = Some((
+            chunk_bytes,
+            vec![
+                "bad".to_owned(),
+                chunk_sha256s[1].clone(),
+                chunk_sha256s[2].clone(),
+            ],
+        ));
+        assert_eq!(
+            VerifiedArtifacts::verify_model_artifact(&model_path, &bad_hex, false).err(),
+            Some(ArtifactError::Identity)
+        );
+
+        assert_eq!(
+            verify_file_with_optional_chunks(
+                &model_path,
+                bytes_u64,
+                &whole_sha256,
+                Some(chunk_bytes),
+                None,
+            )
+            .err(),
+            Some(ArtifactError::Configuration)
+        );
+        assert_eq!(
+            verify_file_with_optional_chunks(
+                &model_path,
+                bytes_u64,
+                &whole_sha256,
+                None,
+                Some(&chunk_sha256s),
+            )
+            .err(),
+            Some(ArtifactError::Configuration)
+        );
         Ok(())
     }
 }

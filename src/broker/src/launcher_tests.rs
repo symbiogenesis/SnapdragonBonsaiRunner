@@ -705,3 +705,98 @@ fn launched_service_stops_with_sandbox_error_when_storage_budget_exceeded() -> i
         Ok(())
     })
 }
+
+#[test]
+fn adapter_guard_supports_chunk_manifest_and_whole_file_fallback() -> io::Result<()> {
+    let dir = TempDir::new("Bonsai-adapter-chunk-guard")?;
+    let adapter_path = dir.path().join("adapter.gguf");
+    let chunk_bytes = usize::try_from(bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES)
+        .map_err(io::Error::other)?;
+    let total_len = chunk_bytes + 2_048;
+    let mut payload: Vec<u8> = (0..total_len)
+        .map(|i| u8::try_from((i.wrapping_mul(19) ^ 0x42) & 0xff).unwrap_or(0))
+        .collect();
+    payload[..4].copy_from_slice(b"GGUF");
+    fs::write(&adapter_path, &payload)?;
+
+    let encode_hex = |digest: [u8; 32]| {
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    };
+    let sha256 = encode_hex(bonsai_windows_credentials::Sha256::digest_bytes(&payload)?);
+    let bytes_u64 = u64::try_from(total_len).map_err(io::Error::other)?;
+    let locked = bonsai_artifacts::open_locked_file(&adapter_path)
+        .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    let raw_chunks = bonsai_windows_credentials::compute_mapped_chunk_digests(
+        &locked,
+        bytes_u64,
+        chunk_bytes,
+        2,
+        &std::sync::atomic::AtomicBool::new(false),
+    )?
+    .ok_or_else(|| io::Error::other("Expected mapped chunk digests."))?;
+    drop(locked);
+    let chunk_sha256s: Vec<String> = raw_chunks.into_iter().map(encode_hex).collect();
+
+    let key = dir.path().join("not-created.key");
+    let mut plan = LaunchPlan::for_profile_with_options(
+        dir.path(),
+        8081,
+        &key,
+        LaunchProfile::SwiftPq2Assessment,
+        false,
+        false,
+    )
+    .map_err(|_| io::Error::other("Invalid fixture launch plan."))?;
+
+    plan.adapter = Some(bonsai_cpu_policy::AbliterateLoraArtifact {
+        path: adapter_path.clone(),
+        bytes: bytes_u64,
+        sha256: sha256.clone(),
+        chunk_bytes: Some(chunk_bytes),
+        chunk_sha256s: Some(chunk_sha256s),
+    });
+    let chunk_guard = LaunchConfig::adapter_guard(&plan)
+        .map_err(|error| io::Error::other(format!("chunk adapter_guard failed: {error:?}")))?;
+    assert!(chunk_guard.is_some());
+    drop(chunk_guard);
+
+    // Whole-file fallback when chunk fields are omitted.
+    let mut whole_plan = LaunchPlan::for_profile_with_options(
+        dir.path(),
+        8081,
+        &key,
+        LaunchProfile::SwiftPq2Assessment,
+        false,
+        false,
+    )
+    .map_err(|_| io::Error::other("Invalid fixture launch plan."))?;
+    whole_plan.adapter = Some(bonsai_cpu_policy::AbliterateLoraArtifact {
+        path: adapter_path.clone(),
+        bytes: bytes_u64,
+        sha256,
+        chunk_bytes: None,
+        chunk_sha256s: None,
+    });
+    let whole_guard = LaunchConfig::adapter_guard(&whole_plan)
+        .map_err(|error| io::Error::other(format!("whole adapter_guard failed: {error:?}")))?;
+    assert!(whole_guard.is_some());
+    drop(whole_guard);
+
+    // 1-byte tamper in second chunk fails closed with LaunchError::Adapter.
+    payload[chunk_bytes + 64] ^= 0x01;
+    fs::write(&adapter_path, &payload)?;
+    assert_eq!(
+        LaunchConfig::adapter_guard(&plan).err(),
+        Some(LaunchError::Adapter)
+    );
+    assert_eq!(
+        LaunchConfig::adapter_guard(&whole_plan).err(),
+        Some(LaunchError::Adapter)
+    );
+    Ok(())
+}

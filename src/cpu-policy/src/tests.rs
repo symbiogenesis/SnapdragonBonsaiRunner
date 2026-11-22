@@ -992,3 +992,232 @@ fn calibrated_cow_execution_matches_prism_accounting_across_packings_reuse_and_s
     );
     Ok(())
 }
+
+#[test]
+fn chunk_manifest_schema_validation_enforces_symmetry_bounds_count_and_hex() -> Result<(), String> {
+    let min_chunk = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(|error| error.to_string())?;
+    let valid_hex = "a".repeat(64);
+
+    assert_eq!(validate_chunk_manifest(0, None, None)?, None);
+    assert_eq!(validate_chunk_manifest(123, None, None)?, None);
+
+    assert_eq!(
+        validate_chunk_manifest(
+            MIN_MAPPED_HASH_BYTES,
+            Some(min_chunk),
+            Some(vec![valid_hex.clone()]),
+        )?,
+        Some((min_chunk, vec![valid_hex.clone()]))
+    );
+    assert_eq!(
+        validate_chunk_manifest(
+            MIN_MAPPED_HASH_BYTES + 1,
+            Some(min_chunk),
+            Some(vec![valid_hex.clone(), valid_hex.clone()]),
+        )?,
+        Some((min_chunk, vec![valid_hex.clone(), valid_hex.clone()]))
+    );
+
+    // Zero bytes with chunk manifest must fail closed.
+    assert!(validate_chunk_manifest(0, Some(min_chunk), Some(vec![])).is_err());
+    assert!(validate_chunk_manifest(0, Some(min_chunk), Some(vec![valid_hex.clone()])).is_err());
+
+    // One-sided chunk fields must fail closed.
+    assert!(validate_chunk_manifest(MIN_MAPPED_HASH_BYTES, Some(min_chunk), None).is_err());
+    assert!(
+        validate_chunk_manifest(MIN_MAPPED_HASH_BYTES, None, Some(vec![valid_hex.clone()]))
+            .is_err()
+    );
+
+    // Sub-threshold chunk size must fail closed.
+    for bad_chunk in [0_usize, 1024, min_chunk - 1] {
+        assert!(
+            validate_chunk_manifest(
+                MIN_MAPPED_HASH_BYTES,
+                Some(bad_chunk),
+                Some(vec![valid_hex.clone()])
+            )
+            .is_err()
+        );
+    }
+
+    // Wrong chunk count must fail closed.
+    assert!(
+        validate_chunk_manifest(
+            MIN_MAPPED_HASH_BYTES + 1,
+            Some(min_chunk),
+            Some(vec![valid_hex.clone()]),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_chunk_manifest(
+            MIN_MAPPED_HASH_BYTES,
+            Some(min_chunk),
+            Some(vec![valid_hex.clone(), valid_hex]),
+        )
+        .is_err()
+    );
+
+    // Malformed hex digests must fail closed.
+    for bad_hex in [
+        "A".repeat(64),
+        "a".repeat(63),
+        "a".repeat(65),
+        format!("{}g", "a".repeat(63)),
+        String::new(),
+    ] {
+        assert!(
+            validate_chunk_manifest(MIN_MAPPED_HASH_BYTES, Some(min_chunk), Some(vec![bad_hex]))
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn compiled_model_mmproj_and_adapter_locks_validate_optional_chunk_manifests() -> Result<(), String>
+{
+    let data = std::env::temp_dir().join("Bonsai-chunk-lock-schema");
+    let base_adapter = abliterate_lora_artifact(&data)?;
+    assert_eq!(base_adapter.chunk_bytes, None);
+    assert_eq!(base_adapter.chunk_sha256s, None);
+    let base_mmproj = swift_mmproj_artifact(&data)?;
+    assert_eq!(base_mmproj.chunk_bytes, None);
+    assert_eq!(base_mmproj.chunk_sha256s, None);
+
+    // Swift model lock with optional 1 GiB chunk manifest (ceil(7_206_168_928 / 1 GiB) = 7).
+    let model_chunk = 1024 * 1024 * 1024_usize;
+    let model_digests = vec!["a".repeat(64); 7];
+    let mut swift_lock = parse(SWIFT_LOCK)?;
+    swift_lock["model"]["chunkBytes"] = json!(model_chunk);
+    swift_lock["model"]["chunkSha256s"] = json!(model_digests);
+    let selected = select_artifact(&swift_lock, Profile::SwiftPq2Assessment, false, None)?;
+    assert_eq!(selected["ChunkBytes"], json!(model_chunk));
+    assert_eq!(selected["ChunkSha256s"], json!(model_digests));
+
+    // Adapter lock with valid chunk manifest (ceil(9_682_464 / 4 MiB) = 3).
+    let min_chunk = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(|error| error.to_string())?;
+    let adapter_digests = vec!["b".repeat(64); 3];
+    let mut adapter_lock = parse(ADAPTER_LOCK)?;
+    adapter_lock["adapter"]["chunkBytes"] = json!(min_chunk);
+    adapter_lock["adapter"]["chunkSha256s"] = json!(adapter_digests);
+    let parsed_adapter =
+        abliterate_lora_artifact_from_locks(&data, &adapter_lock.to_string(), SWIFT_LOCK)?;
+    assert_eq!(parsed_adapter.chunk_bytes, Some(min_chunk));
+    assert_eq!(parsed_adapter.chunk_sha256s, Some(adapter_digests));
+
+    // Mmproj lock with valid chunk manifest (ceil(629_246_976 / 16 MiB) = 38).
+    let mmproj_chunk = 16 * 1024 * 1024_usize;
+    let mmproj_expected = usize::try_from(MMPROJ_BYTES.div_ceil(16 * 1024 * 1024))
+        .map_err(|error| error.to_string())?;
+    assert_eq!(mmproj_expected, 38);
+    let mmproj_digests = vec!["c".repeat(64); mmproj_expected];
+    let mut mmproj_lock = parse(MMPROJ_LOCK)?;
+    mmproj_lock["mmproj"]["chunkBytes"] = json!(mmproj_chunk);
+    mmproj_lock["mmproj"]["chunkSha256s"] = json!(mmproj_digests);
+    let parsed_mmproj =
+        swift_mmproj_artifact_from_locks(&data, &mmproj_lock.to_string(), SWIFT_LOCK)?;
+    assert_eq!(parsed_mmproj.chunk_bytes, Some(mmproj_chunk));
+    assert_eq!(parsed_mmproj.chunk_sha256s, Some(mmproj_digests));
+
+    // Reject one-sided, undersized, mismatched count, malformed hex, and unknown fields.
+    for mut bad_swift in [
+        {
+            let mut v = swift_lock.clone();
+            v["model"]
+                .as_object_mut()
+                .ok_or("model object")?
+                .remove("chunkSha256s");
+            v
+        },
+        {
+            let mut v = swift_lock.clone();
+            v["model"]["chunkBytes"] = json!(min_chunk - 1);
+            v
+        },
+        {
+            let mut v = swift_lock.clone();
+            v["model"]["chunkSha256s"] = json!(vec!["a".repeat(64); 6]);
+            v
+        },
+        {
+            let mut v = swift_lock;
+            v["model"]["chunkSha256s"][0] = json!("bad");
+            v
+        },
+    ] {
+        assert!(
+            select_artifact(&bad_swift, Profile::SwiftPq2Assessment, false, None).is_err(),
+            "accepted invalid swift chunk manifest"
+        );
+        let _ = &mut bad_swift;
+    }
+
+    for bad_adapter in [
+        {
+            let mut v = adapter_lock.clone();
+            v["adapter"]
+                .as_object_mut()
+                .ok_or("adapter object")?
+                .remove("chunkBytes");
+            v
+        },
+        {
+            let mut v = adapter_lock.clone();
+            v["adapter"]["chunkBytes"] = json!(1024);
+            v
+        },
+        {
+            let mut v = adapter_lock.clone();
+            v["adapter"]["chunkSha256s"] = json!(vec!["b".repeat(64); 2]);
+            v
+        },
+        {
+            let mut v = adapter_lock;
+            v["adapter"]["chunkSha256s"][1] = json!("B".repeat(64));
+            v
+        },
+    ] {
+        assert!(
+            abliterate_lora_artifact_from_locks(&data, &bad_adapter.to_string(), SWIFT_LOCK)
+                .is_err()
+        );
+    }
+
+    for bad_mmproj in [
+        {
+            let mut v = mmproj_lock.clone();
+            v["mmproj"]
+                .as_object_mut()
+                .ok_or("mmproj object")?
+                .remove("chunkSha256s");
+            v
+        },
+        {
+            let mut v = mmproj_lock.clone();
+            v["mmproj"]["chunkBytes"] = json!(min_chunk - 1);
+            v
+        },
+        {
+            let mut v = mmproj_lock.clone();
+            v["mmproj"]["chunkSha256s"] = json!(vec!["c".repeat(64); mmproj_expected - 1]);
+            v
+        },
+        {
+            let mut v = mmproj_lock.clone();
+            v["mmproj"]["chunkSha256s"][0] = json!("not-hex");
+            v
+        },
+        {
+            let mut v = mmproj_lock;
+            v["mmproj"]["unknownExtra"] = json!(true);
+            v
+        },
+    ] {
+        assert!(
+            swift_mmproj_artifact_from_locks(&data, &bad_mmproj.to_string(), SWIFT_LOCK).is_err()
+        );
+    }
+    Ok(())
+}

@@ -49,6 +49,12 @@ pub const MMPROJ_BYTES: u64 = 629_246_976;
 pub const MMPROJ_RESERVE_BYTES: u64 = 768 * 1024 * 1024;
 /// Default maximum visual tokens encoded per image (`--image-max-tokens`).
 pub const DEFAULT_IMAGE_MAX_TOKENS: usize = 1_024;
+/// Minimum fixed chunk byte length (`4 MiB`) eligible for parallel mapped SHA-256 verification.
+///
+/// Matches `bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES`.
+pub const MIN_MAPPED_HASH_BYTES: u64 = 4 * 1024 * 1024;
+/// Validated optional chunk manifest `(chunk_bytes, chunk_sha256s)`.
+pub type ChunkManifest = (usize, Vec<String>);
 const MMPROJ_REPOSITORY: &str = "prism-ml/Ternary-Bonsai-2-27B-gguf";
 const MMPROJ_REVISION: &str = "6ed5e12bf84b7a63069882c91dd9e9218647d17b";
 const MMPROJ_FILENAME: &str = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf";
@@ -147,6 +153,81 @@ pub(crate) fn hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OptionalChunkFields {
+    #[serde(default)]
+    chunk_bytes: Option<usize>,
+    #[serde(default)]
+    chunk_sha256s: Option<Vec<String>>,
+}
+
+/// Validate optional fixed-chunk SHA-256 manifest fields against an artifact byte length.
+///
+/// Enforces fail-closed schema validation:
+/// - `chunk_bytes` and `chunk_sha256s` must either both be `None` or both be `Some`,
+/// - `bytes` must be nonzero when a chunk manifest is provided,
+/// - `chunk_bytes >= MIN_MAPPED_HASH_BYTES` (`4 MiB`),
+/// - `chunk_sha256s.len() == usize::try_from(bytes.div_ceil(u64::try_from(chunk_bytes)?))?`,
+/// - every entry in `chunk_sha256s` is valid 64 lowercase hexadecimal characters.
+///
+/// # Errors
+/// Rejects one-sided chunk manifests, zero byte lengths, sub-4 MiB chunk sizes,
+/// mismatched chunk digest counts, and non-64-lowercase-hex digests.
+pub fn validate_chunk_manifest(
+    bytes: u64,
+    chunk_bytes: Option<usize>,
+    chunk_sha256s: Option<Vec<String>>,
+) -> Result<Option<ChunkManifest>, String> {
+    match (chunk_bytes, chunk_sha256s) {
+        (None, None) => Ok(None),
+        (Some(chunk_bytes), Some(chunk_sha256s)) => {
+            validate_chunk_manifest_ref(bytes, Some(chunk_bytes), Some(&chunk_sha256s))?;
+            Ok(Some((chunk_bytes, chunk_sha256s)))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            Err("chunkBytes and chunkSha256s must both be present or both omitted.".into())
+        }
+    }
+}
+
+/// Validate optional borrowed chunk manifest slices against an artifact byte length.
+///
+/// # Errors
+/// Rejects one-sided chunk manifests, zero byte lengths, sub-4 MiB chunk sizes,
+/// mismatched chunk digest counts, and non-64-lowercase-hex digests.
+pub fn validate_chunk_manifest_ref(
+    bytes: u64,
+    chunk_bytes: Option<usize>,
+    chunk_sha256s: Option<&[String]>,
+) -> Result<(), String> {
+    match (chunk_bytes, chunk_sha256s) {
+        (None, None) => Ok(()),
+        (Some(chunk_bytes), Some(chunk_sha256s)) => {
+            require(bytes > 0, "Chunked artifact byte length must be nonzero.")?;
+            let chunk_bytes_u64 =
+                u64::try_from(chunk_bytes).map_err(|_| "Chunk byte length exceeds u64 range.")?;
+            require(
+                chunk_bytes_u64 >= MIN_MAPPED_HASH_BYTES,
+                "Chunk byte length must be at least MIN_MAPPED_HASH_BYTES.",
+            )?;
+            let expected_chunks = usize::try_from(bytes.div_ceil(chunk_bytes_u64))
+                .map_err(|_| "Chunk count exceeds usize range.")?;
+            require(
+                expected_chunks > 0 && chunk_sha256s.len() == expected_chunks,
+                "Chunk SHA-256 count differs from bytes.div_ceil(chunkBytes).",
+            )?;
+            require(
+                chunk_sha256s.iter().all(|digest| hex(digest, 64)),
+                "Chunk SHA-256 digests must be 64 lowercase hexadecimal characters.",
+            )
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            Err("chunkBytes and chunkSha256s must both be present or both omitted.".into())
+        }
+    }
 }
 
 fn validate_options(
@@ -471,7 +552,7 @@ const fn expected_source_identity(profile: Profile) -> [(&'static str, &'static 
     }
 }
 
-fn validate_source(lock: &Value, profile: Profile) -> Result<(), String> {
+fn validate_source(lock: &Value, profile: Profile) -> Result<Option<ChunkManifest>, String> {
     require(
         lock.is_object() && lock["schemaVersion"].as_u64() == Some(1),
         "Invalid compiled model/runtime identity.",
@@ -503,10 +584,18 @@ fn validate_source(lock: &Value, profile: Profile) -> Result<(), String> {
         repository.trim_end_matches(".git")
     );
     require(
-        lock["model"]["bytes"].as_u64() == Some(model_bytes)
+        lock["model"].is_object()
+            && lock["model"]["bytes"].as_u64() == Some(model_bytes)
             && lock["runtime"]["asset"]["bytes"].as_u64() == Some(runtime_bytes)
             && lock["runtime"]["asset"]["url"].as_str() == Some(expected_url.as_str()),
         "Invalid compiled artifact size or runtime download URL.",
+    )?;
+    let chunk_fields = OptionalChunkFields::deserialize(&lock["model"])
+        .map_err(|_| "Invalid model chunk manifest fields.")?;
+    validate_chunk_manifest(
+        model_bytes,
+        chunk_fields.chunk_bytes,
+        chunk_fields.chunk_sha256s,
     )
 }
 
@@ -533,6 +622,10 @@ struct Derived<'a> {
     source_repository: &'a str,
     saving_bytes: u64,
     model_process_started: bool,
+    #[serde(default, rename = "chunkBytes")]
+    chunk_bytes: Option<usize>,
+    #[serde(default, rename = "chunkSha256s")]
+    chunk_sha256s: Option<Vec<String>>,
 }
 
 /// Select the pinned source or verified PTQ1 identity without reading model bytes.
@@ -547,17 +640,22 @@ pub fn select_artifact(
     derived: Option<&Value>,
 ) -> Result<Value, String> {
     validate_options(profile, false, use_repacked_ptq1)?;
-    validate_source(lock, profile)?;
+    let source_chunks = validate_source(lock, profile)?;
     if !use_repacked_ptq1 {
         require(
             derived.is_none(),
             "Derived weights require the explicit PTQ1 policy.",
         )?;
-        return Ok(json!({
+        let mut artifact = json!({
             "Filename": lock["model"]["filename"],
             "Bytes": lock["model"]["bytes"],
             "Sha256": lock["model"]["sha256"],
-        }));
+        });
+        if let Some((chunk_bytes, chunk_sha256s)) = source_chunks {
+            artifact["ChunkBytes"] = json!(chunk_bytes);
+            artifact["ChunkSha256s"] = json!(chunk_sha256s);
+        }
+        return Ok(artifact);
     }
     let evidence = derived
         .filter(|value| value.is_object())
@@ -593,35 +691,86 @@ pub fn select_artifact(
                 == Some(evidence.saving_bytes),
         "Review this check before changing the assessment weight estimate.",
     )?;
-    Ok(json!({
+    let derived_chunks = validate_chunk_manifest(
+        evidence.output_bytes,
+        evidence.chunk_bytes,
+        evidence.chunk_sha256s,
+    )?;
+    let mut artifact = json!({
         "Filename": evidence.output_filename,
         "Bytes": evidence.output_bytes,
         "Sha256": evidence.output_sha256,
-    }))
+    });
+    if let Some((chunk_bytes, chunk_sha256s)) = derived_chunks {
+        artifact["ChunkBytes"] = json!(chunk_bytes);
+        artifact["ChunkSha256s"] = json!(chunk_sha256s);
+    }
+    Ok(artifact)
 }
 
-fn validate_adapter(adapter: &Value, lock: &Value) -> Result<(), String> {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdapterEntry {
+    repository: String,
+    revision: String,
+    path: String,
+    filename: String,
+    bytes: u64,
+    sha256: String,
+    git_blob_sha1: String,
+    url: String,
+    digest_source: String,
+    license: String,
+    #[serde(default)]
+    chunk_bytes: Option<usize>,
+    #[serde(default)]
+    chunk_sha256s: Option<Vec<String>>,
+}
+
+fn validate_adapter_with_chunks(
+    adapter: &Value,
+    lock: &Value,
+) -> Result<(AdapterEntry, Option<ChunkManifest>), String> {
     require(
         adapter.is_object()
             && adapter["schemaVersion"].as_u64() == Some(1)
-            && adapter["adapter"]["repository"] == "Continuum-AI-Corp/OrcaBonsai-27B-Uncensored"
-            && adapter["adapter"]["revision"] == "703028bb7fba03496e796b144839b161cf0f5409"
-            && adapter["adapter"]["path"] == "gguf/bonsai-abliterate-lora.gguf"
-            && adapter["adapter"]["filename"] == "bonsai-abliterate-lora.gguf"
-            && adapter["adapter"]["bytes"].as_u64() == Some(ADAPTER_BYTES)
-            && adapter["adapter"]["sha256"]
-                == "f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42"
-            && adapter["adapter"]["url"]
+            && adapter["adapter"].is_object()
+            && adapter["compatibility"].is_object(),
+        "Review adapter compatibility and memory accounting for the pinned model/runtime.",
+    )?;
+    let entry = AdapterEntry::deserialize(&adapter["adapter"])
+        .map_err(|_| "Invalid compiled adapter lock entry.")?;
+    require(
+        entry.repository == "Continuum-AI-Corp/OrcaBonsai-27B-Uncensored"
+            && entry.revision == "703028bb7fba03496e796b144839b161cf0f5409"
+            && entry.path == "gguf/bonsai-abliterate-lora.gguf"
+            && entry.filename == "bonsai-abliterate-lora.gguf"
+            && entry.bytes > 0
+            && entry.bytes == ADAPTER_BYTES
+            && hex(&entry.sha256, 64)
+            && entry.sha256 == "f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42"
+            && !entry.git_blob_sha1.is_empty()
+            && !entry.digest_source.is_empty()
+            && !entry.license.is_empty()
+            && entry.url
                 == "https://raw.githubusercontent.com/Continuum-AI-Corp/OrcaBonsai-27B-Uncensored/703028bb7fba03496e796b144839b161cf0f5409/gguf/bonsai-abliterate-lora.gguf"
             && adapter["compatibility"]["modelRepository"] == lock["model"]["repository"]
             && adapter["compatibility"]["modelRevision"] == lock["model"]["revision"]
             && adapter["compatibility"]["runtimeCommit"] == lock["runtime"]["commit"],
         "Review adapter compatibility and memory accounting for the pinned model/runtime.",
-    )
+    )?;
+    let chunks =
+        validate_chunk_manifest(entry.bytes, entry.chunk_bytes, entry.chunk_sha256s.clone())?;
+    Ok((entry, chunks))
+}
+
+fn validate_adapter(adapter: &Value, lock: &Value) -> Result<(), String> {
+    let _ = validate_adapter_with_chunks(adapter, lock)?;
+    Ok(())
 }
 
 /// The sole reviewed pretrained adapter, resolved under an external data directory.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbliterateLoraArtifact {
     /// Whole-file path; callers must verify and retain it before model launch.
     pub path: PathBuf,
@@ -629,6 +778,39 @@ pub struct AbliterateLoraArtifact {
     pub bytes: u64,
     /// Required lowercase whole-file SHA-256.
     pub sha256: String,
+    /// Optional fixed chunk size (`>= 4 MiB`) for parallel mapped SHA-256 verification.
+    pub chunk_bytes: Option<usize>,
+    /// Optional ordered lowercase 64-hex SHA-256 digests covering `0..bytes`.
+    pub chunk_sha256s: Option<Vec<String>>,
+}
+
+/// Resolve the pinned adapter from explicit adapter and Swift lock JSON documents.
+///
+/// # Errors
+/// Rejects unexpanded/nonabsolute paths or inconsistent/malformed lock documents.
+pub fn abliterate_lora_artifact_from_locks(
+    data: &Path,
+    adapter_lock_json: &str,
+    swift_lock_json: &str,
+) -> Result<AbliterateLoraArtifact, String> {
+    require(
+        data.is_absolute()
+            && data
+                .to_str()
+                .is_some_and(|path| !path.contains('\0') && !unexpanded_variable(path)),
+        "An expanded absolute data directory is required.",
+    )?;
+    let adapter = parse(adapter_lock_json)?;
+    let swift_lock = parse(swift_lock_json)?;
+    let (entry, chunks) = validate_adapter_with_chunks(&adapter, &swift_lock)?;
+    let (chunk_bytes, chunk_sha256s) = chunks.map_or((None, None), |(cb, cs)| (Some(cb), Some(cs)));
+    Ok(AbliterateLoraArtifact {
+        path: artifact_path(data, "adapters", &adapter["adapter"], &entry.filename)?.into(),
+        bytes: entry.bytes,
+        sha256: entry.sha256,
+        chunk_bytes,
+        chunk_sha256s,
+    })
 }
 
 /// Resolve the pinned adapter after validating its Swift model/runtime compatibility.
@@ -637,29 +819,7 @@ pub struct AbliterateLoraArtifact {
 /// # Errors
 /// Rejects unexpanded/nonabsolute paths or inconsistent compiled adapter pins.
 pub fn abliterate_lora_artifact(data: &Path) -> Result<AbliterateLoraArtifact, String> {
-    require(
-        data.is_absolute()
-            && data
-                .to_str()
-                .is_some_and(|path| !path.contains('\0') && !unexpanded_variable(path)),
-        "An expanded absolute data directory is required.",
-    )?;
-    let adapter = parse(ADAPTER_LOCK)?;
-    validate_adapter(&adapter, &parse(SWIFT_LOCK)?)?;
-    let pin = &adapter["adapter"];
-    let filename = pin["filename"]
-        .as_str()
-        .ok_or("Invalid adapter filename.")?;
-    Ok(AbliterateLoraArtifact {
-        path: artifact_path(data, "adapters", pin, filename)?.into(),
-        bytes: pin["bytes"]
-            .as_u64()
-            .ok_or("Invalid adapter byte length.")?,
-        sha256: pin["sha256"]
-            .as_str()
-            .ok_or("Invalid adapter digest.")?
-            .into(),
-    })
+    abliterate_lora_artifact_from_locks(data, ADAPTER_LOCK, SWIFT_LOCK)
 }
 
 #[derive(Deserialize)]
@@ -717,45 +877,122 @@ pub struct SwiftMmprojArtifact {
     pub filename: String,
     /// Pinned immutable download URL.
     pub url: String,
+    /// Optional fixed chunk size (`>= 4 MiB`) for parallel mapped SHA-256 verification.
+    pub chunk_bytes: Option<usize>,
+    /// Optional ordered lowercase 64-hex SHA-256 digests covering `0..bytes`.
+    pub chunk_sha256s: Option<Vec<String>>,
 }
 
-fn validate_mmproj(mmproj_lock: &Value, swift_lock: &Value) -> Result<(), String> {
-    let entry = &mmproj_lock["mmproj"];
-    let compatibility = &mmproj_lock["compatibility"];
-    let repository = entry["repository"]
-        .as_str()
-        .ok_or("Invalid mmproj repository.")?;
-    let revision = entry["revision"]
-        .as_str()
-        .ok_or("Invalid mmproj revision.")?;
-    let filename = entry["filename"]
-        .as_str()
-        .ok_or("Invalid mmproj filename.")?;
-    let sha256 = entry["sha256"].as_str().ok_or("Invalid mmproj digest.")?;
-    let url = entry["url"].as_str().ok_or("Invalid mmproj URL.")?;
-    let expected_url = format!("https://huggingface.co/{repository}/resolve/{revision}/{filename}");
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MmprojEntry {
+    repository: String,
+    revision: String,
+    filename: String,
+    bytes: u64,
+    sha256: String,
+    url: String,
+    license: String,
+    #[serde(default)]
+    chunk_bytes: Option<usize>,
+    #[serde(default)]
+    chunk_sha256s: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MmprojCompatibility {
+    model_repository: String,
+    model_revision: String,
+    architecture: String,
+    default_image_max_tokens: u64,
+    memory_reserve_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MmprojLock {
+    schema_version: u8,
+    mmproj: MmprojEntry,
+    compatibility: MmprojCompatibility,
+}
+
+fn validate_mmproj(
+    mmproj_lock: &Value,
+    swift_lock: &Value,
+) -> Result<(MmprojLock, Option<ChunkManifest>), String> {
+    require(
+        mmproj_lock.is_object(),
+        "Invalid or incompatible Swift mmproj artifact configuration.",
+    )?;
+    let parsed = MmprojLock::deserialize(mmproj_lock)
+        .map_err(|_| "Invalid or incompatible Swift mmproj artifact configuration.")?;
+    let entry = &parsed.mmproj;
+    let compatibility = &parsed.compatibility;
+    let expected_url = format!(
+        "https://huggingface.co/{}/resolve/{}/{}",
+        entry.repository, entry.revision, entry.filename
+    );
     let default_tokens =
         u64::try_from(DEFAULT_IMAGE_MAX_TOKENS).map_err(|_| "Invalid default image tokens.")?;
     require(
-        mmproj_lock.is_object()
-            && mmproj_lock["schemaVersion"].as_u64() == Some(1)
-            && repository == MMPROJ_REPOSITORY
-            && revision == MMPROJ_REVISION
-            && hex(revision, 40)
-            && filename == MMPROJ_FILENAME
-            && entry["bytes"].as_u64() == Some(MMPROJ_BYTES)
-            && hex(sha256, 64)
-            && sha256 == MMPROJ_SHA256
-            && url == expected_url
-            && compatibility["modelRepository"].as_str()
+        parsed.schema_version == 1
+            && entry.repository == MMPROJ_REPOSITORY
+            && entry.revision == MMPROJ_REVISION
+            && hex(&entry.revision, 40)
+            && entry.filename == MMPROJ_FILENAME
+            && entry.bytes > 0
+            && entry.bytes == MMPROJ_BYTES
+            && hex(&entry.sha256, 64)
+            && entry.sha256 == MMPROJ_SHA256
+            && entry.url == expected_url
+            && !entry.license.is_empty()
+            && Some(compatibility.model_repository.as_str())
                 == swift_lock["model"]["repository"].as_str()
-            && compatibility["modelRevision"].as_str() == swift_lock["model"]["revision"].as_str()
-            && compatibility["architecture"].as_str()
+            && Some(compatibility.model_revision.as_str())
+                == swift_lock["model"]["revision"].as_str()
+            && Some(compatibility.architecture.as_str())
                 == swift_lock["model"]["architecture"].as_str()
-            && compatibility["defaultImageMaxTokens"].as_u64() == Some(default_tokens)
-            && compatibility["memoryReserveBytes"].as_u64() == Some(MMPROJ_RESERVE_BYTES),
+            && compatibility.default_image_max_tokens == default_tokens
+            && compatibility.memory_reserve_bytes == MMPROJ_RESERVE_BYTES,
         "Invalid or incompatible Swift mmproj artifact configuration.",
-    )
+    )?;
+    let chunks =
+        validate_chunk_manifest(entry.bytes, entry.chunk_bytes, entry.chunk_sha256s.clone())?;
+    Ok((parsed, chunks))
+}
+
+/// Resolve the pinned Swift Qwen3-VL vision projector (`mmproj`) from explicit lock JSON documents.
+///
+/// # Errors
+/// Rejects invalid data directories and malformed or inconsistent mmproj lock metadata.
+pub fn swift_mmproj_artifact_from_locks(
+    data: &Path,
+    mmproj_lock_json: &str,
+    swift_lock_json: &str,
+) -> Result<SwiftMmprojArtifact, String> {
+    let data_text = data.to_str().ok_or("Invalid data directory.")?;
+    require(
+        data.is_absolute() && !data_text.contains('\0') && !unexpanded_variable(data_text),
+        "An expanded absolute data directory is required.",
+    )?;
+    let mmproj_lock = parse(mmproj_lock_json)?;
+    let swift_lock = parse(swift_lock_json)?;
+    let (parsed, chunks) = validate_mmproj(&mmproj_lock, &swift_lock)?;
+    let entry = &mmproj_lock["mmproj"];
+    let path_string = artifact_path(data, "mmproj", entry, &parsed.mmproj.filename)?;
+    let (chunk_bytes, chunk_sha256s) = chunks.map_or((None, None), |(cb, cs)| (Some(cb), Some(cs)));
+    Ok(SwiftMmprojArtifact {
+        path: PathBuf::from(path_string),
+        bytes: MMPROJ_BYTES,
+        sha256: MMPROJ_SHA256.to_owned(),
+        repository: MMPROJ_REPOSITORY.to_owned(),
+        revision: MMPROJ_REVISION.to_owned(),
+        filename: MMPROJ_FILENAME.to_owned(),
+        url: parsed.mmproj.url,
+        chunk_bytes,
+        chunk_sha256s,
+    })
 }
 
 /// Resolve the pinned Swift Qwen3-VL vision projector (`mmproj`) path and digest under `data`.
@@ -764,31 +1001,7 @@ fn validate_mmproj(mmproj_lock: &Value, swift_lock: &Value) -> Result<(), String
 /// Rejects non-absolute, NUL-containing, or unexpanded data directories, and rejects
 /// malformed or inconsistent compiled mmproj lock metadata.
 pub fn swift_mmproj_artifact(data: &Path) -> Result<SwiftMmprojArtifact, String> {
-    let data_text = data.to_str().ok_or("Invalid data directory.")?;
-    require(
-        data.is_absolute() && !data_text.contains('\0') && !unexpanded_variable(data_text),
-        "An expanded absolute data directory is required.",
-    )?;
-    let mmproj_lock = parse(MMPROJ_LOCK)?;
-    let swift_lock = parse(SWIFT_LOCK)?;
-    validate_mmproj(&mmproj_lock, &swift_lock)?;
-    let entry = &mmproj_lock["mmproj"];
-    let filename = entry["filename"]
-        .as_str()
-        .ok_or("Invalid mmproj filename.")?;
-    let path_string = artifact_path(data, "mmproj", entry, filename)?;
-    Ok(SwiftMmprojArtifact {
-        path: PathBuf::from(path_string),
-        bytes: MMPROJ_BYTES,
-        sha256: MMPROJ_SHA256.to_owned(),
-        repository: MMPROJ_REPOSITORY.to_owned(),
-        revision: MMPROJ_REVISION.to_owned(),
-        filename: MMPROJ_FILENAME.to_owned(),
-        url: entry["url"]
-            .as_str()
-            .ok_or("Invalid mmproj URL.")?
-            .to_owned(),
-    })
+    swift_mmproj_artifact_from_locks(data, MMPROJ_LOCK, SWIFT_LOCK)
 }
 
 /// Build the fixed completion plan for one explicit profile and option selection.

@@ -189,6 +189,7 @@ fn dispatch(command: &str, request: serde_json::Value) -> bonsai_tools::Result<s
         "ptq1-capture" => bonsai_tools::ptq1_capture::run(request),
         "native-qualification" => bonsai_tools::native_qualification::run(request),
         "ptq1-packing" => bonsai_tools::ptq1_packing::run(request),
+        "chunk-manifest" => bonsai_tools::chunk_manifest::run(request),
         "packing-qualification" => bonsai_tools::packing_qualification::run(request),
         "host-capabilities" => bonsai_tools::host_capabilities::run(&request),
         "native-acceptance-budget" => bonsai_tools::native_acceptance_budget::run(request),

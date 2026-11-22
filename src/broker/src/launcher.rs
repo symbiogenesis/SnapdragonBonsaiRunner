@@ -893,10 +893,12 @@ impl LaunchConfig {
         plan.adapter
             .as_ref()
             .map(|adapter| {
-                bonsai_artifacts::VerifiedFile::verify(
+                crate::artifacts::verify_file_with_optional_chunks(
                     &adapter.path,
                     adapter.bytes,
                     &adapter.sha256,
+                    adapter.chunk_bytes,
+                    adapter.chunk_sha256s.as_deref(),
                 )
                 .map_err(|_| LaunchError::Adapter)
             })
@@ -1034,10 +1036,12 @@ impl LaunchConfig {
             }
             Ok(_) => {}
         }
-        let guard = bonsai_artifacts::VerifiedFile::verify(
+        let guard = crate::artifacts::verify_file_with_optional_chunks(
             &artifact.path,
             artifact.bytes,
             &artifact.sha256,
+            artifact.chunk_bytes,
+            artifact.chunk_sha256s.as_deref(),
         )
         .map_err(|_| LaunchError::Artifacts)?;
         Ok(Some((artifact, guard)))
