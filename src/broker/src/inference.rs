@@ -166,11 +166,30 @@ pub(super) enum Placement {
     #[default]
     Auto,
     Cpu,
+    Vulkan,
+    Composite,
 }
 
 impl Placement {
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
-        parse_enum(value, &[("auto", Self::Auto), ("cpu", Self::Cpu)])
+        parse_enum(
+            value,
+            &[
+                ("auto", Self::Auto),
+                ("cpu", Self::Cpu),
+                ("vulkan", Self::Vulkan),
+                ("composite", Self::Composite),
+            ],
+        )
+    }
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Vulkan => "vulkan",
+            Self::Composite => "composite",
+        }
     }
 }
 
@@ -182,8 +201,24 @@ const REVIEWED_0_1_32: Option<(&str, &str)> =
 // Source omission alone does not justify a smaller fixed memory allowance.
 const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
-fn select_placement(release: &ReleasePin, requested: Placement) -> Result<Placement, LaunchError> {
-    if requested == Placement::Auto || reviewed_release_matches(release, CPU_PLACEMENT_RELEASE) {
+// Explicit Vulkan/Composite placements require a separately reviewed native
+// release before they can be admitted on a pinned bundle.
+const VULKAN_PLACEMENT_RELEASE: Option<(&str, &str)> = None;
+
+fn select_placement(
+    release: &ReleasePin,
+    requested: Placement,
+    cpu_release: Option<(&str, &str)>,
+    vulkan_release: Option<(&str, &str)>,
+) -> Result<Placement, LaunchError> {
+    let supported = match requested {
+        Placement::Auto => true,
+        Placement::Cpu => reviewed_release_matches(release, cpu_release),
+        Placement::Vulkan | Placement::Composite => {
+            reviewed_release_matches(release, vulkan_release)
+        }
+    };
+    if supported {
         Ok(requested)
     } else {
         Err(LaunchError::NativeRuntime)
@@ -197,7 +232,12 @@ pub(super) fn pinned_placement(
     if !native {
         return requested.map_or(Ok(Placement::Auto), |_| Err(LaunchError::Arguments));
     }
-    select_placement(pinned_release()?, requested.unwrap_or_default())
+    select_placement(
+        pinned_release()?,
+        requested.unwrap_or_default(),
+        CPU_PLACEMENT_RELEASE,
+        VULKAN_PLACEMENT_RELEASE,
+    )
 }
 
 impl KvCache {
@@ -465,6 +505,10 @@ pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
 const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
+// `wy-f32` chunkwise GDN prefill with rotated KV caches (`rsq4` / `rsq4k3v`)
+// requires a separately reviewed post-0.1.32 Prism release; pinned 0.1.32
+// preserves F16-only safety for `wy-f32`.
+const WY_F32_ROTATED_KV_RELEASE: Option<(&str, &str)> = None;
 const CPU_SPECULATION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
 pub(super) fn calibrated_cow_admission_supported() -> Result<bool, LaunchError> {
@@ -477,6 +521,44 @@ pub(super) fn branch_prompt_reuse_supported() -> Result<bool, LaunchError> {
 
 pub(super) fn cpu_prefill_gdn_supported() -> Result<bool, LaunchError> {
     pinned_matches(CPU_PREFILL_GDN_RELEASE)
+}
+
+fn select_wy_f32_kv_cache(
+    release: &ReleasePin,
+    gdn: Option<CpuPrefillGdn>,
+    kv_cache: Option<KvCache>,
+    gdn_release: Option<(&str, &str)>,
+    rotated_kv_release: Option<(&str, &str)>,
+) -> Result<(), LaunchError> {
+    if gdn != Some(CpuPrefillGdn::WyF32) {
+        return Ok(());
+    }
+    if !reviewed_release_matches(release, gdn_release) {
+        return Err(LaunchError::NativeRuntime);
+    }
+    match kv_cache {
+        Some(KvCache::F16) => Ok(()),
+        Some(KvCache::Rsq4 | KvCache::Rsq4K3v)
+            if reviewed_release_matches(release, rotated_kv_release) =>
+        {
+            Ok(())
+        }
+        Some(KvCache::Rsq4 | KvCache::Rsq4K3v) => Err(LaunchError::NativeRuntime),
+        None => Err(LaunchError::Arguments),
+    }
+}
+
+pub(super) fn pinned_wy_f32_kv_cache(
+    gdn: Option<CpuPrefillGdn>,
+    kv_cache: Option<KvCache>,
+) -> Result<(), LaunchError> {
+    select_wy_f32_kv_cache(
+        pinned_release()?,
+        gdn,
+        kv_cache,
+        CPU_PREFILL_GDN_RELEASE,
+        WY_F32_ROTATED_KV_RELEASE,
+    )
 }
 
 pub(super) fn cpu_speculation_supported() -> Result<bool, LaunchError> {
@@ -572,7 +654,15 @@ mod tests {
     #[test]
     fn cpu_placement_waits_for_an_exact_reviewed_release() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
-        assert_eq!(select_placement(&pin, Placement::Cpu)?, Placement::Cpu);
+        assert_eq!(
+            select_placement(
+                &pin,
+                Placement::Cpu,
+                CPU_PLACEMENT_RELEASE,
+                VULKAN_PLACEMENT_RELEASE
+            )?,
+            Placement::Cpu
+        );
         for (version, commit) in [
             ("0.1.27", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
             ("0.1.28", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
@@ -584,9 +674,22 @@ mod tests {
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
-            assert_eq!(select_placement(&pin, Placement::Auto)?, Placement::Auto);
             assert_eq!(
-                select_placement(&pin, Placement::Cpu),
+                select_placement(
+                    &pin,
+                    Placement::Auto,
+                    CPU_PLACEMENT_RELEASE,
+                    VULKAN_PLACEMENT_RELEASE
+                )?,
+                Placement::Auto
+            );
+            assert_eq!(
+                select_placement(
+                    &pin,
+                    Placement::Cpu,
+                    CPU_PLACEMENT_RELEASE,
+                    VULKAN_PLACEMENT_RELEASE
+                ),
                 Err(LaunchError::NativeRuntime)
             );
         }
@@ -607,7 +710,12 @@ mod tests {
             assert!(!reviewed_release_matches(&pin, RESET_ON_CANCEL_RELEASE));
         }
         assert_eq!(pinned_placement(false, None)?, Placement::Auto);
-        for placement in [Placement::Auto, Placement::Cpu] {
+        for placement in [
+            Placement::Auto,
+            Placement::Cpu,
+            Placement::Vulkan,
+            Placement::Composite,
+        ] {
             assert_eq!(
                 pinned_placement(false, Some(placement)),
                 Err(LaunchError::Arguments)
@@ -1013,6 +1121,120 @@ mod tests {
         assert_eq!(x1.default_row_workers(), 8);
         assert_eq!(x2.default_row_workers(), 8);
         assert!(CpuFamily::parse(Some(OsStr::new("x3"))).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn vulkan_and_composite_placements_parse_and_stay_gated_on_pinned_0_1_32()
+    -> Result<(), LaunchError> {
+        use std::ffi::OsStr;
+        let vulkan = Placement::parse(Some(OsStr::new("vulkan")))?;
+        let composite = Placement::parse(Some(OsStr::new("composite")))?;
+        assert_eq!(vulkan, Placement::Vulkan);
+        assert_eq!(composite, Placement::Composite);
+        assert_eq!(Placement::Auto.as_str(), "auto");
+        assert_eq!(Placement::Cpu.as_str(), "cpu");
+        assert_eq!(vulkan.as_str(), "vulkan");
+        assert_eq!(composite.as_str(), "composite");
+        assert!(Placement::parse(Some(OsStr::new("npu"))).is_err());
+
+        for requested in [Placement::Vulkan, Placement::Composite] {
+            assert_eq!(
+                pinned_placement(true, Some(requested)),
+                Err(LaunchError::NativeRuntime)
+            );
+            assert_eq!(
+                pinned_placement(false, Some(requested)),
+                Err(LaunchError::Arguments)
+            );
+        }
+
+        let mut reviewed = release(LOCK)?;
+        let reviewed_0_1_33 = ("0.1.33", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        reviewed.version = reviewed_0_1_33.0.into();
+        reviewed.commit = reviewed_0_1_33.1.into();
+        assert_eq!(
+            select_placement(
+                &reviewed,
+                Placement::Vulkan,
+                Some(reviewed_0_1_33),
+                Some(reviewed_0_1_33),
+            )?,
+            Placement::Vulkan
+        );
+        assert_eq!(
+            select_placement(
+                &reviewed,
+                Placement::Composite,
+                Some(reviewed_0_1_33),
+                Some(reviewed_0_1_33),
+            )?,
+            Placement::Composite
+        );
+        assert_eq!(
+            select_placement(
+                &reviewed,
+                Placement::Vulkan,
+                Some(reviewed_0_1_33),
+                Some(("0.1.33", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+            ),
+            Err(LaunchError::NativeRuntime)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wy_f32_rotated_kv_gate_keeps_f16_only_on_0_1_32_and_admits_reviewed_release()
+    -> Result<(), LaunchError> {
+        let pinned = release(LOCK)?;
+        assert_eq!(WY_F32_ROTATED_KV_RELEASE, None);
+        assert_eq!(
+            pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::WyF32), Some(KvCache::F16)),
+            Ok(())
+        );
+        assert_eq!(
+            pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::WyF32), Some(KvCache::Rsq4)),
+            Err(LaunchError::NativeRuntime)
+        );
+        assert_eq!(
+            pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::WyF32), Some(KvCache::Rsq4K3v)),
+            Err(LaunchError::NativeRuntime)
+        );
+        assert_eq!(
+            pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::WyF32), None),
+            Err(LaunchError::Arguments)
+        );
+        assert_eq!(
+            pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::Sequential), Some(KvCache::Rsq4)),
+            Ok(())
+        );
+
+        let mut next = pinned;
+        let reviewed_next = ("0.1.33", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        next.version = reviewed_next.0.into();
+        next.commit = reviewed_next.1.into();
+        for kv in [KvCache::F16, KvCache::Rsq4, KvCache::Rsq4K3v] {
+            assert_eq!(
+                select_wy_f32_kv_cache(
+                    &next,
+                    Some(CpuPrefillGdn::WyF32),
+                    Some(kv),
+                    Some(reviewed_next),
+                    Some(reviewed_next),
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            select_wy_f32_kv_cache(
+                &next,
+                Some(CpuPrefillGdn::WyF32),
+                Some(KvCache::Rsq4),
+                Some(reviewed_next),
+                Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9")),
+            ),
+            Err(LaunchError::NativeRuntime)
+        );
         Ok(())
     }
 }

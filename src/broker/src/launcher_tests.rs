@@ -38,7 +38,10 @@ fn synthetic_launched_service(
     }
 }
 
-fn native_launch_config(data: &std::path::Path, extra: &[&str]) -> io::Result<LaunchConfig> {
+fn parse_native_launch_config(
+    data: &std::path::Path,
+    extra: &[&str],
+) -> Result<LaunchConfig, LaunchError> {
     let mut args = vec![
         OsString::from("--launch-development"),
         "--allow-unisolated-backend".into(),
@@ -57,7 +60,12 @@ fn native_launch_config(data: &std::path::Path, extra: &[&str]) -> io::Result<La
         "--backend-port".into(),
         "8081".into(),
     ]);
-    LaunchConfig::parse(args).map_err(|_| io::Error::other("Invalid fixture launch configuration."))
+    LaunchConfig::parse(args)
+}
+
+fn native_launch_config(data: &std::path::Path, extra: &[&str]) -> io::Result<LaunchConfig> {
+    parse_native_launch_config(data, extra)
+        .map_err(|_| io::Error::other("Invalid fixture launch configuration."))
 }
 
 const PROBE_NAME: &str = "launcher::lifecycle_tests::synthetic_backend_probe";
@@ -798,5 +806,93 @@ fn adapter_guard_supports_chunk_manifest_and_whole_file_fallback() -> io::Result
         LaunchConfig::adapter_guard(&whole_plan).err(),
         Some(LaunchError::Adapter)
     );
+    Ok(())
+}
+
+#[test]
+fn launch_usage_and_vulkan_composite_wy_f32_gates_match_pinned_contract() -> Result<(), LaunchError>
+{
+    for snippet in [
+        "--prompt-reuse disabled|latest|prompt-end-and-latest",
+        "--prompt-reuse-checkpoints 1..=8",
+        "--prompt-reuse-checkpoint-bytes",
+        "--cpu-prefill-gdn sequential|wy-f32",
+        "--spec-type none|suffix",
+        "--draft-max 1..=8",
+        "--cpu-family x1|x2",
+        "--placement auto|cpu|vulkan|composite",
+    ] {
+        assert!(
+            LAUNCH_USAGE.contains(snippet),
+            "LAUNCH_USAGE missing `{snippet}`"
+        );
+    }
+
+    let data = std::env::temp_dir().join("Bonsai-vulkan-wyf32-gates");
+    for placement in ["vulkan", "composite"] {
+        assert_eq!(
+            parse_native_launch_config(&data, &["--placement", placement]).err(),
+            Some(LaunchError::NativeRuntime)
+        );
+    }
+    for wy_rotated in [
+        &["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"][..],
+        &[
+            "--cpu-prefill-tokens",
+            "16",
+            "--kv-cache",
+            "rsq4",
+            "--cpu-prefill-gdn",
+            "wy-f32",
+        ][..],
+        &[
+            "--cpu-prefill-tokens",
+            "16",
+            "--kv-cache",
+            "rsq4k3v",
+            "--cpu-prefill-gdn",
+            "wy-f32",
+        ][..],
+    ] {
+        assert_eq!(
+            parse_native_launch_config(&data, wy_rotated).err(),
+            Some(LaunchError::NativeRuntime)
+        );
+    }
+
+    let mut base = parse_native_launch_config(
+        &data,
+        &[
+            "--cpu-prefill-tokens",
+            "16",
+            "--kv-cache",
+            "f16",
+            "--cpu-prefill-gdn",
+            "wy-f32",
+        ],
+    )?;
+    let key = data.join("backend.key");
+    let plan = LaunchPlan::for_profile_with_options(
+        &data,
+        8081,
+        &key,
+        LaunchProfile::SwiftPq2Assessment,
+        true,
+        false,
+    )
+    .map_err(|_| LaunchError::Policy)?;
+    for (placement, expected) in [
+        (crate::inference::Placement::Vulkan, "vulkan"),
+        (crate::inference::Placement::Composite, "composite"),
+    ] {
+        base.placement = placement;
+        let child = base.native_arguments(&plan, Some(&key));
+        assert!(
+            child
+                .array_windows::<2>()
+                .any(|[flag, value]| flag == "--placement" && value == expected),
+            "missing [--placement, {expected}] in {child:?}"
+        );
+    }
     Ok(())
 }

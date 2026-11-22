@@ -56,10 +56,14 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--profile <reference-cpu|swift-pq2-assessment>]\n",
     "  [--native-engine|--publisher-engine] (Swift defaults to the pinned Rust runtime; publisher is explicit rollback)\n",
     "  [--native-row-workers 1|4|8|12] (Rust defaults to 8 on Snapdragon X1/X2 or 4 otherwise; publisher supports only 1)\n",
-    "  [--prompt-reuse disabled|latest] (experimental exact latest-state reuse; Rust only)\n",
+    "  [--prompt-reuse disabled|latest|prompt-end-and-latest] (reviewed native runtime only)\n",
+    "  [--prompt-reuse-checkpoints 1..=8] [--prompt-reuse-checkpoint-bytes <bytes>] (reviewed native runtime only; requires --prompt-reuse)\n",
     "  [--kv-cache f16|rsq4|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
     "  [--cpu-prefill-tokens 8|16|32] (reviewed native runtime only; enables layer-major CPU FFN tile prefill)\n",
-    "  [--placement auto|cpu] (native Swift only; CPU requires a reviewed compatible release)\n",
+    "  [--cpu-prefill-gdn sequential|wy-f32] (reviewed native runtime only; requires --cpu-prefill-tokens; wy-f32 requires --kv-cache f16 on pinned 0.1.32 and excludes suffix speculation)\n",
+    "  [--spec-type none|suffix] [--draft-max 1..=8] (reviewed native runtime only; suffix requires --cpu-prefill-tokens and suppresses mmproj)\n",
+    "  [--cpu-family x1|x2] (reviewed native runtime only; overrides detected Snapdragon X1/X2 family)\n",
+    "  [--placement auto|cpu|vulkan|composite] (native Swift only; cpu/vulkan/composite require a reviewed compatible release)\n",
     "  [--reset-on-cancel] (reviewed native runtime only; reset live state in place on client cancel)\n",
     "  [--no-mmproj] (disable multimodal vision projector; Swift only)\n",
     "  [--use-abliterate-lora] (pinned adapter; request scale 0..2, default 1.3; Swift CPU only)\n",
@@ -68,7 +72,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--use-repacked-ptq1|--use-original-pq2] (mutually exclusive weight selections; Swift CPU only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
     "Default: reference-cpu. Only compiled model/runtime pins and fixed CPU policies are accepted.\n",
-    "Swift defaults to Rust with four workers and original PQ2 weights; PTQ1 requires explicit selection. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
+    "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise) and original PQ2 weights; PTQ1 requires explicit selection. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
     "Creates fresh protected credentials; prints paths, never key values.\n",
 );
 
@@ -467,6 +471,10 @@ impl LaunchConfig {
                 return Err(LaunchError::NativeRuntime);
             }
         }
+        crate::inference::pinned_wy_f32_kv_cache(
+            configuration.cpu_prefill_gdn,
+            configuration.kv_cache,
+        )?;
         Ok(configuration)
     }
 
@@ -502,7 +510,7 @@ impl LaunchConfig {
                 && !self.native_engine)
             || (self.cpu_prefill_gdn.is_some() && self.cpu_prefill_tokens.is_none())
             || (self.cpu_prefill_gdn == Some(crate::inference::CpuPrefillGdn::WyF32)
-                && self.kv_cache != Some(crate::inference::KvCache::F16))
+                && self.kv_cache.is_none())
             || (self.draft_max.is_some()
                 && self.spec_type != Some(crate::inference::SpeculationType::Suffix))
             || (self.spec_type == Some(crate::inference::SpeculationType::Suffix)
@@ -1226,8 +1234,8 @@ impl LaunchConfig {
         } else if let Some(spec_type) = self.spec_type {
             push_arg(&mut arguments, "--spec-type", spec_type.as_str());
         }
-        if self.placement == crate::inference::Placement::Cpu {
-            push_arg(&mut arguments, "--placement", "cpu");
+        if self.placement != crate::inference::Placement::Auto {
+            push_arg(&mut arguments, "--placement", self.placement.as_str());
         }
         if self.uses_repacked_ptq1() {
             arguments.push("--use-repacked-ptq1".into());
@@ -3853,6 +3861,8 @@ mod tests {
             vec!["--placement", "auto", "--placement", "cpu"],
             vec!["--publisher-engine", "--placement", "auto"],
             vec!["--publisher-engine", "--placement", "cpu"],
+            vec!["--publisher-engine", "--placement", "vulkan"],
+            vec!["--publisher-engine", "--placement", "composite"],
         ] {
             let mut rejected = native.clone();
             rejected.extend(suffix.into_iter().map(OsString::from));
@@ -3861,7 +3871,15 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
-        for placement in ["auto", "cpu"] {
+        for gated in ["vulkan", "composite"] {
+            let mut rejected = native.clone();
+            rejected.extend(["--placement", gated].map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(rejected).err(),
+                Some(LaunchError::NativeRuntime)
+            );
+        }
+        for placement in ["auto", "cpu", "vulkan", "composite"] {
             let mut rejected = arguments();
             rejected.extend(["--placement", placement].map(OsString::from));
             assert_eq!(
@@ -3881,16 +3899,24 @@ mod tests {
         )
         .map_err(|_| LaunchError::Policy)?;
         let admitted = config.swift_context_plan(20 * 1024 * 1024 * 1024)?;
-        for placement in [Placement::Auto, Placement::Cpu] {
+        for placement in [
+            Placement::Auto,
+            Placement::Cpu,
+            Placement::Vulkan,
+            Placement::Composite,
+        ] {
             // Model-free routing control for the exact reviewed source-bound release.
             config.placement = placement;
             let child = config.native_arguments(&plan, Some(&key));
+            let expected =
+                (placement != Placement::Auto).then_some(std::ffi::OsStr::new(placement.as_str()));
             assert_eq!(
                 child
                     .array_windows::<2>()
-                    .filter(|[flag, value]| flag == "--placement" && value == "cpu")
-                    .count(),
-                usize::from(placement == Placement::Cpu)
+                    .filter(|[flag, _]| flag == "--placement")
+                    .map(|[_, value]| value.as_os_str())
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>()
             );
             assert_eq!(
                 config.swift_context_plan(20 * 1024 * 1024 * 1024)?,
@@ -5056,15 +5082,6 @@ mod tests {
                 "0",
             ],
             vec!["--cpu-prefill-gdn", "wy-f32"],
-            vec!["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"],
-            vec![
-                "--cpu-prefill-tokens",
-                "16",
-                "--kv-cache",
-                "rsq4",
-                "--cpu-prefill-gdn",
-                "wy-f32",
-            ],
             vec!["--draft-max", "4"],
             vec!["--spec-type", "none", "--draft-max", "4"],
             vec!["--spec-type", "suffix"],
@@ -5086,6 +5103,32 @@ mod tests {
             assert_eq!(
                 LaunchConfig::parse(rejected).err(),
                 Some(LaunchError::Arguments)
+            );
+        }
+        for gated in [
+            vec!["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"],
+            vec![
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "rsq4",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+            ],
+            vec![
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "rsq4k3v",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+            ],
+        ] {
+            let mut rejected = native.clone();
+            rejected.extend(gated.into_iter().map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(rejected).err(),
+                Some(LaunchError::NativeRuntime)
             );
         }
         Ok(())
