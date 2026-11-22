@@ -4,7 +4,10 @@
     reason = "Explicit parent scope keeps these implementation helpers private."
 )]
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 
 use bonsai_artifacts::VerifiedFile;
 use serde::Deserialize;
@@ -35,6 +38,17 @@ pub(super) const fn adapter_execution_sha256(repacked: bool) -> &'static str {
     }
 }
 
+fn parse_enum<T: Copy>(
+    value: Option<&std::ffi::OsStr>,
+    variants: &[(&str, T)],
+) -> Result<T, LaunchError> {
+    let raw = value.and_then(std::ffi::OsStr::to_str);
+    variants
+        .iter()
+        .find_map(|(name, variant)| (raw == Some(*name)).then_some(*variant))
+        .ok_or(LaunchError::Arguments)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KvCache {
     F16,
@@ -52,12 +66,14 @@ pub(super) enum PromptReuseMode {
 
 impl PromptReuseMode {
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
-        match value.and_then(std::ffi::OsStr::to_str) {
-            Some("disabled") => Ok(Self::Disabled),
-            Some("latest") => Ok(Self::Latest),
-            Some("prompt-end-and-latest") => Ok(Self::PromptEndAndLatest),
-            _ => Err(LaunchError::Arguments),
-        }
+        parse_enum(
+            value,
+            &[
+                ("disabled", Self::Disabled),
+                ("latest", Self::Latest),
+                ("prompt-end-and-latest", Self::PromptEndAndLatest),
+            ],
+        )
     }
 
     pub(super) const fn as_wire(self) -> Option<&'static str> {
@@ -82,11 +98,10 @@ pub(super) enum CpuPrefillGdn {
 
 impl CpuPrefillGdn {
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
-        match value.and_then(std::ffi::OsStr::to_str) {
-            Some("sequential") => Ok(Self::Sequential),
-            Some("wy-f32") => Ok(Self::WyF32),
-            _ => Err(LaunchError::Arguments),
-        }
+        parse_enum(
+            value,
+            &[("sequential", Self::Sequential), ("wy-f32", Self::WyF32)],
+        )
     }
 
     pub(super) const fn is_wy_f32(self) -> bool {
@@ -110,11 +125,7 @@ pub(super) enum SpeculationType {
 
 impl SpeculationType {
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
-        match value.and_then(std::ffi::OsStr::to_str) {
-            Some("none") => Ok(Self::None),
-            Some("suffix") => Ok(Self::Suffix),
-            _ => Err(LaunchError::Arguments),
-        }
+        parse_enum(value, &[("none", Self::None), ("suffix", Self::Suffix)])
     }
 
     pub(super) const fn as_str(self) -> &'static str {
@@ -133,11 +144,7 @@ pub(super) enum CpuFamily {
 
 impl CpuFamily {
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
-        match value.and_then(std::ffi::OsStr::to_str) {
-            Some("x1") => Ok(Self::X1),
-            Some("x2") => Ok(Self::X2),
-            _ => Err(LaunchError::Arguments),
-        }
+        parse_enum(value, &[("x1", Self::X1), ("x2", Self::X2)])
     }
 
     pub(super) const fn as_str(self) -> &'static str {
@@ -163,19 +170,17 @@ pub(super) enum Placement {
 
 impl Placement {
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
-        match value.and_then(std::ffi::OsStr::to_str) {
-            Some("auto") => Ok(Self::Auto),
-            Some("cpu") => Ok(Self::Cpu),
-            _ => Err(LaunchError::Arguments),
-        }
+        parse_enum(value, &[("auto", Self::Auto), ("cpu", Self::Cpu)])
     }
 }
+
+const REVIEWED_0_1_32: Option<(&str, &str)> =
+    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
 
 // CPU placement must skip accelerator initialization and report both its
 // requested placement and effective CPU backend in a genuine reviewed release.
 // Source omission alone does not justify a smaller fixed memory allowance.
-const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
 fn select_placement(release: &ReleasePin, requested: Placement) -> Result<Placement, LaunchError> {
     if requested == Placement::Auto || reviewed_release_matches(release, CPU_PLACEMENT_RELEASE) {
@@ -192,17 +197,19 @@ pub(super) fn pinned_placement(
     if !native {
         return requested.map_or(Ok(Placement::Auto), |_| Err(LaunchError::Arguments));
     }
-    select_placement(&release(LOCK)?, requested.unwrap_or_default())
+    select_placement(pinned_release()?, requested.unwrap_or_default())
 }
 
 impl KvCache {
     pub(super) fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, LaunchError> {
-        match value.and_then(std::ffi::OsStr::to_str) {
-            Some("f16") => Ok(Self::F16),
-            Some("rsq4") => Ok(Self::Rsq4),
-            Some("rsq4k3v") => Ok(Self::Rsq4K3v),
-            _ => Err(LaunchError::Arguments),
-        }
+        parse_enum(
+            value,
+            &[
+                ("f16", Self::F16),
+                ("rsq4", Self::Rsq4),
+                ("rsq4k3v", Self::Rsq4K3v),
+            ],
+        )
     }
 
     pub(super) const fn name(self) -> &'static str {
@@ -250,7 +257,7 @@ pub(super) fn pinned_kv_cache(
     requested: Option<KvCache>,
 ) -> Result<Option<KvCache>, LaunchError> {
     if native {
-        select_kv_cache(&release(LOCK)?, requested)
+        select_kv_cache(pinned_release()?, requested)
     } else if requested.is_some() {
         Err(LaunchError::Arguments)
     } else {
@@ -379,14 +386,23 @@ fn row_workers_supported(
     }
 }
 
+static PINNED_RELEASE: LazyLock<Result<ReleasePin, LaunchError>> = LazyLock::new(|| release(LOCK));
+
+fn pinned_release() -> Result<&'static ReleasePin, LaunchError> {
+    PINNED_RELEASE.as_ref().map_err(|_| LaunchError::Artifacts)
+}
+
+fn pinned_matches(identity: Option<(&str, &str)>) -> Result<bool, LaunchError> {
+    Ok(reviewed_release_matches(pinned_release()?, identity))
+}
+
 // Enable only after a reviewed source-bound release implements the paired
 // context/memory flags AND the selected-cache/sequential-scratch accounting
 // contract in bonsai_cpu_policy::context. A protocol-only source candidate must
 // not activate smaller process allowances. A version number alone attests neither.
 // This combined review also retains four row workers, K4/V4 and latest reuse;
 // a later repin cannot silently lose those existing serving capabilities.
-const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
 // K4/V3 changes precision and needs its own reviewed capacity/quality release.
 // Both gates must identify the same genuine released source before this profile
@@ -398,8 +414,7 @@ const K4V3_CONTEXT_RELEASE: Option<(&str, &str)> = None;
 // source supplies the geometry-derived Swift allowance; generic graphs retain
 // 4 GiB. Precision and process charges remain unchanged; this gate cannot
 // authorize an unrelated memory release.
-const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
 fn full_context_release_matches(release: &ReleasePin, reviewed: Option<(&str, &str)>) -> bool {
     reviewed.is_some()
@@ -408,9 +423,8 @@ fn full_context_release_matches(release: &ReleasePin, reviewed: Option<(&str, &s
 }
 
 pub(super) fn full_context_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
     Ok(full_context_release_matches(
-        &pin,
+        pinned_release()?,
         K4V4_FULL_CONTEXT_RELEASE,
     ))
 }
@@ -424,80 +438,55 @@ fn k4v3_context_supported(release: &ReleasePin) -> bool {
 }
 
 pub(super) fn memory_context_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(reviewed_release_matches(&pin, MEMORY_CONTEXT_RELEASE))
+    pinned_matches(MEMORY_CONTEXT_RELEASE)
 }
 
 // In-place cancellation recovery requires a reviewed release whose worker loop
 // observes abandoned generation sockets, settles active computation within a
 // bounded timeout, and resets live model state on authenticated `POST /reset`
 // without expecting a `Content-Type` header.
-const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
-
-fn reset_on_cancel_release_matches(release: &ReleasePin) -> bool {
-    reviewed_release_matches(release, RESET_ON_CANCEL_RELEASE)
-}
+const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
 pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(reset_on_cancel_release_matches(&pin))
+    pinned_matches(RESET_ON_CANCEL_RELEASE)
 }
 
 // Offline anonymous broker-pipe transport requires a separately reviewed native
 // release implementing `--broker-pipe`, `AppContainer` verification, `SB2PIPE1`
 // / `SB2OKAY1` handshake, `KIND_SERVER_READY`, `KIND_RESET`, and `KIND_VERIFIED_SECTION`.
-const BROKER_PIPE_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
-
-fn broker_pipe_release_matches(release: &ReleasePin) -> bool {
-    reviewed_release_matches(release, BROKER_PIPE_RELEASE)
-}
+const BROKER_PIPE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
 pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(broker_pipe_release_matches(&pin))
+    pinned_matches(BROKER_PIPE_RELEASE)
 }
 
 // Calibrated CoW admission, sparse branch prompt reuse, chunkwise GDN prefill,
 // and suffix CPU speculation require the reviewed post-0.1.31 Prism release.
-const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
-const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
-const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
-const CPU_SPECULATION_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
+const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
+const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
+const CPU_SPECULATION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
 pub(super) fn calibrated_cow_admission_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(reviewed_release_matches(
-        &pin,
-        CALIBRATED_COW_ADMISSION_RELEASE,
-    ))
+    pinned_matches(CALIBRATED_COW_ADMISSION_RELEASE)
 }
 
 pub(super) fn branch_prompt_reuse_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(reviewed_release_matches(&pin, BRANCH_PROMPT_REUSE_RELEASE))
+    pinned_matches(BRANCH_PROMPT_REUSE_RELEASE)
 }
 
 pub(super) fn cpu_prefill_gdn_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(reviewed_release_matches(&pin, CPU_PREFILL_GDN_RELEASE))
+    pinned_matches(CPU_PREFILL_GDN_RELEASE)
 }
 
 pub(super) fn cpu_speculation_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(reviewed_release_matches(&pin, CPU_SPECULATION_RELEASE))
+    pinned_matches(CPU_SPECULATION_RELEASE)
 }
 
 // Multimodal image/mmproj support requires a separately reviewed native release
 // that implements vision projector loading, image embedding injection and the
 // matching readiness identity fields.
-const VISION_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const VISION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 // Multi-rank DaisyRose LoRA support stays gated off for the frozen v0.1.32 pin
 // until a reviewed Prism release publishes its release tuple here.
 const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = None;
@@ -505,16 +494,10 @@ const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = None;
 // CPU tiled prefill requires a separately reviewed native release supporting
 // `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
 // readiness fields (`cpu_prefill_tokens`, `cpu_prefill_scratch_bytes`, `:cpu-tiled-ffn-v1:{n}`).
-const CPU_PREFILL_RELEASE: Option<(&str, &str)> =
-    Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"));
+const CPU_PREFILL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 
 pub(super) fn parse_cpu_prefill_tokens(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
-    match value.and_then(std::ffi::OsStr::to_str) {
-        Some("8") => Ok(8),
-        Some("16") => Ok(16),
-        Some("32") => Ok(32),
-        _ => Err(LaunchError::Arguments),
-    }
+    parse_enum(value, &[("8", 8), ("16", 16), ("32", 32)])
 }
 
 pub(super) fn pinned_cpu_prefill_tokens(
@@ -527,9 +510,9 @@ pub(super) fn pinned_cpu_prefill_tokens(
     if !native || !matches!(tokens, 8 | 16 | 32) {
         return Err(LaunchError::Arguments);
     }
-    let pin = release(LOCK)?;
-    if reviewed_release_matches(&pin, MEMORY_CONTEXT_RELEASE)
-        && reviewed_release_matches(&pin, CPU_PREFILL_RELEASE)
+    let pin = pinned_release()?;
+    if reviewed_release_matches(pin, MEMORY_CONTEXT_RELEASE)
+        && reviewed_release_matches(pin, CPU_PREFILL_RELEASE)
     {
         Ok(Some(tokens))
     } else {
@@ -537,26 +520,16 @@ pub(super) fn pinned_cpu_prefill_tokens(
     }
 }
 
-fn vision_release_matches(release: &ReleasePin) -> bool {
-    reviewed_release_matches(release, VISION_RELEASE)
-}
-
 pub(super) fn vision_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(vision_release_matches(&pin))
-}
-
-fn multi_rank_lora_release_matches(release: &ReleasePin) -> bool {
-    reviewed_release_matches(release, MULTI_RANK_LORA_RELEASE)
+    pinned_matches(VISION_RELEASE)
 }
 
 pub(super) fn multi_rank_lora_supported() -> Result<bool, LaunchError> {
-    let pin = release(LOCK)?;
-    Ok(multi_rank_lora_release_matches(&pin))
+    pinned_matches(MULTI_RANK_LORA_RELEASE)
 }
 
 pub(super) fn pinned_version() -> Result<String, LaunchError> {
-    release(LOCK).map(|release| release.version)
+    pinned_release().map(|release| release.version.clone())
 }
 
 fn prompt_reuse_supported(release: &ReleasePin, latest: bool) -> Result<(), LaunchError> {
@@ -574,9 +547,9 @@ pub(super) fn verify(
     row_workers: u8,
     latest_prompt_reuse: bool,
 ) -> Result<(PathBuf, VerifiedFile), LaunchError> {
-    let release = release(LOCK)?;
-    row_workers_supported(&release, row_workers, MEMORY_CONTEXT_RELEASE)?;
-    prompt_reuse_supported(&release, latest_prompt_reuse)?;
+    let release = pinned_release()?;
+    row_workers_supported(release, row_workers, MEMORY_CONTEXT_RELEASE)?;
+    prompt_reuse_supported(release, latest_prompt_reuse)?;
     let file = release
         .files
         .iter()
@@ -620,7 +593,7 @@ mod tests {
         assert_eq!(pinned_placement(true, None)?, Placement::Auto);
         assert!(reset_on_cancel_supported()?);
         let mut pin = release(LOCK)?;
-        assert!(reset_on_cancel_release_matches(&pin));
+        assert!(reviewed_release_matches(&pin, RESET_ON_CANCEL_RELEASE));
         for (version, commit) in [
             ("0.1.27", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
             ("0.1.28", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
@@ -631,7 +604,7 @@ mod tests {
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
-            assert!(!reset_on_cancel_release_matches(&pin));
+            assert!(!reviewed_release_matches(&pin, RESET_ON_CANCEL_RELEASE));
         }
         assert_eq!(pinned_placement(false, None)?, Placement::Auto);
         for placement in [Placement::Auto, Placement::Cpu] {
@@ -919,9 +892,9 @@ mod tests {
         );
         assert!(prompt_reuse_supported(&pin, false).is_ok());
         assert!(vision_supported()?);
-        assert!(!vision_release_matches(&pin));
+        assert!(!reviewed_release_matches(&pin, VISION_RELEASE));
         assert!(!multi_rank_lora_supported()?);
-        assert!(!multi_rank_lora_release_matches(&pin));
+        assert!(!reviewed_release_matches(&pin, MULTI_RANK_LORA_RELEASE));
         Ok(())
     }
 
@@ -964,7 +937,7 @@ mod tests {
             Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"))
         );
         assert!(broker_pipe_supported()?);
-        assert!(broker_pipe_release_matches(&pin));
+        assert!(reviewed_release_matches(&pin, BROKER_PIPE_RELEASE));
         assert!(calibrated_cow_admission_supported()?);
         assert!(branch_prompt_reuse_supported()?);
         assert!(cpu_prefill_gdn_supported()?);
@@ -977,7 +950,7 @@ mod tests {
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
-            assert!(!broker_pipe_release_matches(&pin));
+            assert!(!reviewed_release_matches(&pin, BROKER_PIPE_RELEASE));
             assert!(!reviewed_release_matches(
                 &pin,
                 CALIBRATED_COW_ADMISSION_RELEASE
