@@ -42,7 +42,7 @@ impl ExportDtype {
         }
     }
 
-    const fn byte_width(self) -> usize {
+    pub(super) const fn byte_width(self) -> usize {
         match self {
             Self::F16 => 2,
             Self::F32 => 4,

@@ -2,6 +2,7 @@
 
 mod gguf_adapter;
 mod readiness;
+mod reallocate;
 mod safetensors;
 mod svd;
 #[cfg(test)]
@@ -47,6 +48,7 @@ enum Operation {
     VerifyAdapter,
     MergeAdapters,
     EditAdapter,
+    ReallocateRanks,
     GenerateTestAdapter,
     GenerateLock,
     DrG2Plan,
@@ -196,6 +198,8 @@ struct Request {
     #[serde(default)]
     edit_config: Option<transform::EditAdapterConfig>,
     #[serde(default)]
+    reallocate_config: Option<reallocate::ReallocateRanksConfig>,
+    #[serde(default)]
     verify_policy: VerifyPolicy,
     #[serde(default)]
     lock_source: Option<bonsai_cpu_policy::DaisyRoseLoraSource>,
@@ -257,6 +261,7 @@ fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
         | Operation::VerifyAdapter
         | Operation::MergeAdapters
         | Operation::EditAdapter
+        | Operation::ReallocateRanks
         | Operation::GenerateLock
         | Operation::DrG2Plan
         | Operation::DrG2Score => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
@@ -302,6 +307,9 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     }
     if request.operation != Operation::EditAdapter && request.edit_config.is_some() {
         return Err("editConfig is only supported for edit-adapter.".into());
+    }
+    if request.operation != Operation::ReallocateRanks && request.reallocate_config.is_some() {
+        return Err("reallocateConfig is only supported for reallocate-ranks.".into());
     }
     if request.operation != Operation::GenerateLock
         && (request.lock_source.is_some()
@@ -387,6 +395,27 @@ fn validate_request(request: &Request) -> crate::Result<()> {
                 .as_ref()
                 .ok_or("edit-adapter requires editConfig.")?;
             transform::validate_edit_config(config)?;
+            return Ok(());
+        }
+        Operation::ReallocateRanks => {
+            if request.source.is_some() {
+                return Err("reallocate-ranks does not accept a model diff source.".into());
+            }
+            let adapter_path = request
+                .adapter_path
+                .as_ref()
+                .ok_or("reallocate-ranks requires adapterPath.")?;
+            bonsai_artifacts::validate_external_path(adapter_path).map_err(|e| e.to_string())?;
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("reallocate-ranks requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            let config = request
+                .reallocate_config
+                .as_ref()
+                .ok_or("reallocate-ranks requires reallocateConfig.")?;
+            reallocate::validate_reallocate_config(config)?;
             return Ok(());
         }
         Operation::GenerateTestAdapter => {
@@ -537,6 +566,7 @@ fn validate_request(request: &Request) -> crate::Result<()> {
         Operation::VerifyAdapter
         | Operation::MergeAdapters
         | Operation::EditAdapter
+        | Operation::ReallocateRanks
         | Operation::GenerateTestAdapter
         | Operation::GenerateLock
         | Operation::DrG2Plan
@@ -2330,6 +2360,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::VerifyAdapter => run_verify_adapter(&parsed),
         Operation::MergeAdapters => transform::run_merge_adapters(&parsed),
         Operation::EditAdapter => transform::run_edit_adapter(&parsed),
+        Operation::ReallocateRanks => reallocate::run_reallocate_ranks(&parsed),
         Operation::GenerateTestAdapter => readiness::run_generate_test_adapter(&parsed),
         Operation::GenerateLock => readiness::run_generate_lock(&parsed),
         Operation::DrG2Plan => readiness::run_dr_g2_plan(&parsed),

@@ -43,6 +43,7 @@ const VALID_LINEAR_FAMILIES: [&str; 10] = [
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct EditAdapterConfig {
     pub(super) target_max_rank: Option<usize>,
+    pub(super) per_site_ranks: BTreeMap<String, usize>,
     pub(super) global_gain: Option<f64>,
     pub(super) family_scales: BTreeMap<String, f64>,
     pub(super) layer_min: Option<u32>,
@@ -77,6 +78,16 @@ pub(super) fn validate_edit_config(config: &EditAdapterConfig) -> crate::Result<
         && !(1..=64).contains(&rank)
     {
         return Err("editConfig.targetMaxRank must be in 1..=64.".into());
+    }
+    for (target, &rank) in &config.per_site_ranks {
+        if target.trim().is_empty() {
+            return Err("editConfig.perSiteRanks contains an empty target name.".into());
+        }
+        if rank > 64 {
+            return Err(format!(
+                "editConfig.perSiteRanks[{target}] must be in 0..=64, got {rank}."
+            ));
+        }
     }
     if let Some(gain) = config.global_gain
         && (!gain.is_finite() || gain <= 0.0 || gain > 100.0)
@@ -142,7 +153,7 @@ pub(super) fn validate_edit_config(config: &EditAdapterConfig) -> crate::Result<
     Ok(())
 }
 
-fn verify_published_adapter(
+pub(super) fn verify_published_adapter(
     output_path: &std::path::Path,
     expected_sha256: &str,
     expected_bytes: u64,
@@ -208,7 +219,7 @@ fn verify_published_adapter(
     Ok(verification)
 }
 
-fn check_factor_value(val: f64, dtype: ExportDtype, label: &str) -> crate::Result<f32> {
+pub(super) fn check_factor_value(val: f64, dtype: ExportDtype, label: &str) -> crate::Result<f32> {
     let val_f32 = f64_to_f32(val);
     if !val_f32.is_finite() || (dtype == ExportDtype::F16 && val_f32.abs() >= 65_520.0) {
         return Err(format!(
@@ -371,7 +382,7 @@ pub(super) fn run_merge_adapters_with_dims(
     }))
 }
 
-fn target_layer_and_family_map() -> BTreeMap<String, (u32, &'static str)> {
+pub(super) fn target_layer_and_family_map() -> BTreeMap<String, (u32, &'static str)> {
     let mut map = BTreeMap::new();
     for spec in swift_tensor_inventory() {
         if let Some(layer) = spec.layer {
@@ -381,7 +392,7 @@ fn target_layer_and_family_map() -> BTreeMap<String, (u32, &'static str)> {
     map
 }
 
-fn effective_delta_frobenius_norm_f64(
+pub(super) fn effective_delta_frobenius_norm_f64(
     a_f64: &[f64],
     b_f64: &[f64],
     in_features: usize,
@@ -468,6 +479,25 @@ pub(super) fn run_edit_adapter_with_dims(
         .ok_or("edit-adapter requires editConfig.")?;
 
     let loaded = read_lora_gguf_pairs_with_dims(adapter_path, base_dims)?;
+    if !config.per_site_ranks.is_empty() {
+        let available: BTreeMap<&str, usize> = loaded
+            .pairs
+            .iter()
+            .map(|p| (p.gguf_base_name.as_str(), p.rank))
+            .collect();
+        for (target, &requested) in &config.per_site_ranks {
+            let Some(&src_rank) = available.get(target.as_str()) else {
+                return Err(format!(
+                    "editConfig.perSiteRanks target '{target}' is not present in source adapter."
+                ));
+            };
+            if requested > src_rank {
+                return Err(format!(
+                    "editConfig.perSiteRanks[{target}] rank {requested} exceeds loaded source rank {src_rank}."
+                ));
+            }
+        }
+    }
     let rank_one_dirs = match &config.orthogonalize_against_rank_one_path {
         Some(path) => Some(read_rank_one_b_directions(path)?),
         None => None,
@@ -508,7 +538,13 @@ pub(super) fn run_edit_adapter_with_dims(
             continue;
         }
 
-        let new_rank = pair.rank.min(config.target_max_rank.unwrap_or(pair.rank));
+        let requested_rank = config
+            .per_site_ranks
+            .get(&pair.gguf_base_name)
+            .copied()
+            .unwrap_or(pair.rank);
+        let cap_rank = config.target_max_rank.unwrap_or(pair.rank);
+        let new_rank = requested_rank.min(cap_rank).min(pair.rank);
         if new_rank == 0 {
             dropped_sites += 1;
             continue;

@@ -2070,3 +2070,340 @@ fn edit_adapter_truncates_rank_scales_and_orthogonalizes_against_rank_one() -> c
 
     Ok(())
 }
+
+#[test]
+fn edit_adapter_per_site_ranks_slices_drops_and_validates() -> crate::Result<()> {
+    let scratch = ScratchDir::new("edit-per-site-ranks")?;
+    let src = scratch.join("src-r8.gguf");
+    let make_pair = |name: &str, in_f: usize, out_f: usize, rank: usize| -> ExportTensorPair {
+        let mut a = vec![0.0_f32; rank * in_f];
+        let mut b = vec![0.0_f32; out_f * rank];
+        for k in 0..rank {
+            a[k * in_f + k] = 0.25;
+            b[k * rank + k] = 0.2;
+        }
+        ExportTensorPair {
+            gguf_base_name: name.to_owned(),
+            in_features: in_f,
+            out_features: out_f,
+            rank,
+            lora_a_f32: a,
+            lora_b_f32: b,
+        }
+    };
+    write_lora_gguf(
+        &src,
+        ExportDtype::F16,
+        8.0,
+        &[("bonsai.composition.method", "svd-test")],
+        &[
+            make_pair("blk.0.ffn_down.weight", 17_408, 5_120, 8),
+            make_pair("blk.3.attn_k.weight", 5_120, 1_024, 8),
+            make_pair("blk.63.ffn_down.weight", 17_408, 5_120, 8),
+        ],
+    )?;
+
+    let out = scratch.join("edited-var-rank.gguf");
+    let res = run(json!({
+        "schemaVersion": 1,
+        "operation": "edit-adapter",
+        "adapterPath": src,
+        "outputPath": out,
+        "editConfig": {
+            "perSiteRanks": {
+                "blk.63.ffn_down.weight": 6,
+                "blk.0.ffn_down.weight": 2,
+                "blk.3.attn_k.weight": 0
+            }
+        }
+    }))?;
+    assert_eq!(res["published"], true);
+    assert_eq!(res["pairCount"], 2);
+    assert_eq!(res["droppedSiteCount"], 1);
+    assert_eq!(res["maxRank"], 6);
+    assert_eq!(res["verification"]["verified"], true);
+    assert_eq!(res["verification"]["uniformRank"], false);
+
+    let reloaded = read_lora_gguf_pairs(&out)?;
+    assert_eq!(reloaded.pairs.len(), 2);
+    assert_eq!(reloaded.pairs[0].gguf_base_name, "blk.0.ffn_down.weight");
+    assert_eq!(reloaded.pairs[0].rank, 2);
+    assert_eq!(reloaded.pairs[1].gguf_base_name, "blk.63.ffn_down.weight");
+    assert_eq!(reloaded.pairs[1].rank, 6);
+
+    assert!(run(json!({
+        "schemaVersion": 1,
+        "operation": "edit-adapter",
+        "adapterPath": src,
+        "outputPath": scratch.join("bad-target.gguf"),
+        "editConfig": { "perSiteRanks": { "blk.99.ffn_down.weight": 2 } }
+    }))
+    .is_err());
+
+    assert!(run(json!({
+        "schemaVersion": 1,
+        "operation": "edit-adapter",
+        "adapterPath": src,
+        "outputPath": scratch.join("bad-rank.gguf"),
+        "editConfig": { "perSiteRanks": { "blk.0.ffn_down.weight": 16 } }
+    }))
+    .is_err());
+    Ok(())
+}
+
+#[test]
+fn reallocate_ranks_equal_byte_kl_fisher_knapsack_and_split_disjointness() -> crate::Result<()> {
+    let scratch = ScratchDir::new("reallocate-ranks")?;
+    let src = scratch.join("src-r32.gguf");
+    let make_decayed_r32 = |name: &str, in_f: usize, out_f: usize| -> ExportTensorPair {
+        let rank = 32;
+        let mut a = vec![0.0_f32; rank * in_f];
+        let mut b = vec![0.0_f32; out_f * rank];
+        for k in 0..rank {
+            let decay = 1.0 - 0.005 * f32::from(u8::try_from(k).unwrap_or(31));
+            let amp = 0.25 * decay;
+            a[k * in_f + k] = amp;
+            b[k * rank + k] = amp;
+        }
+        ExportTensorPair {
+            gguf_base_name: name.to_owned(),
+            in_features: in_f,
+            out_features: out_f,
+            rank,
+            lora_a_f32: a,
+            lora_b_f32: b,
+        }
+    };
+    write_lora_gguf(
+        &src,
+        ExportDtype::F16,
+        32.0,
+        &[("bonsai.composition.method", "r32-source-test")],
+        &[
+            make_decayed_r32("blk.0.ffn_down.weight", 17_408, 5_120),
+            make_decayed_r32("blk.3.attn_k.weight", 5_120, 1_024),
+            make_decayed_r32("blk.62.ffn_down.weight", 17_408, 5_120),
+            make_decayed_r32("blk.63.ffn_down.weight", 17_408, 5_120),
+        ],
+    )?;
+
+    let diag_a = "11".repeat(32);
+    let diag_b = "22".repeat(32);
+    let eval_disjoint = "33".repeat(32);
+    let out = scratch.join("reallocated.gguf");
+    // Exact budget for (blk.63 @ r=32) + (blk.62 @ r=16) in F16: 48 * (17408 + 5120) * 2 = 2_162_688 bytes.
+    let res = run(json!({
+        "schemaVersion": 1,
+        "operation": "reallocate-ranks",
+        "adapterPath": src,
+        "outputPath": out,
+        "reallocateConfig": {
+            "maxPayloadBytes": 2_162_688_u64,
+            "maxRank": 32,
+            "diagnosticPromptSha256s": [diag_b, diag_a],
+            "thinkingOffPenaltyWeight": 1.0,
+            "siteSensitivities": [
+                {
+                    "target": "blk.63.ffn_down.weight",
+                    "teacherReasoningLogits": [[4.0, 1.0, 0.0], [1.5, 1.4, -2.0]],
+                    "baseReasoningLogits": [[0.0, 3.0, 2.0], [0.0, 4.0, 2.0]],
+                    "recoveredReasoningLogits": [[4.0, 1.0, 0.0], [1.5, 1.4, -2.0]]
+                },
+                {
+                    "target": "blk.62.ffn_down.weight",
+                    "reasoningKlGap": 0.4,
+                    "softmaxFisherWeight": 1.0,
+                    "thinkingOffKlPenalty": 0.0
+                },
+                {
+                    "target": "blk.0.ffn_down.weight",
+                    "reasoningKlGap": 0.2,
+                    "teacherThinkingOffLogits": [[3.0, 0.0], [1.0, 1.0]],
+                    "baseThinkingOffLogits": [[3.0, 0.0], [1.0, 1.0]],
+                    "recoveredThinkingOffLogits": [[0.0, 4.0], [4.0, 0.0]]
+                },
+                {
+                    "target": "blk.3.attn_k.weight",
+                    "reasoningKlGap": -0.05
+                }
+            ]
+        }
+    }))?;
+
+    assert_eq!(res["published"], true);
+    assert!(
+        res["factorPayloadBytes"].as_u64().unwrap_or(u64::MAX) <= 2_162_688_u64
+    );
+    assert_eq!(res["maxRank"], 32);
+    assert_eq!(res["perSiteRanks"]["blk.63.ffn_down.weight"], 32);
+    assert_eq!(res["perSiteRanks"]["blk.62.ffn_down.weight"], 16);
+    assert_eq!(res["perSiteRanks"]["blk.0.ffn_down.weight"], 0);
+    assert_eq!(res["zeroedSiteCount"], 2);
+    assert_eq!(res["verification"]["verified"], true);
+    assert_eq!(res["verification"]["uniformRank"], false);
+    assert_eq!(res["trainingPromptSha256s"], json!([diag_a, diag_b]));
+
+    // Verify dr-g2-score enforces split disjointness against diagnosticPromptSha256s.
+    let cand_sha = res["sha256"]
+        .as_str()
+        .ok_or("Missing reallocated sha256.")?
+        .to_owned();
+    let plan = run(json!({
+        "schemaVersion": 1,
+        "operation": "dr-g2-plan",
+        "screenConfig": {
+            "candidateAdapterSha256": cand_sha,
+            "candidateMaxRank": 32,
+            "candidateTargetCount": 2,
+            "scaleGrid": [0.0, 0.5, 1.0]
+        }
+    }))?;
+    let contract_sha = plan["contractSha256"]
+        .as_str()
+        .ok_or("Missing contractSha256.")?
+        .to_owned();
+    let base_sha = plan["contract"]["baseModelSha256"]
+        .as_str()
+        .ok_or("Missing baseModelSha256.")?
+        .to_owned();
+    let orca_sha = plan["contract"]["orcaAdapterSha256"]
+        .as_str()
+        .ok_or("Missing orcaAdapterSha256.")?
+        .to_owned();
+    let make_evidence = |train: &Value, coding_digest: &str| {
+        json!({
+            "schemaVersion": 1,
+            "contractSha256": contract_sha,
+            "baseModelSha256": base_sha,
+            "orcaAdapterSha256": orca_sha,
+            "orcaScale": 1.3,
+            "candidateAdapterSha256": cand_sha,
+            "candidateMaxRank": 32,
+            "candidateTargetCount": 2,
+            "scaleGrid": [0.0, 0.5, 1.0],
+            "selectedScale": 0.5,
+            "trainingPromptSha256s": train,
+            "thinkingOnPrompts": [
+                {
+                    "promptId": "code-1",
+                    "promptSha256": coding_digest,
+                    "category": "coding",
+                    "baseline": {
+                        "scale": 0.0, "responseSha256": "a1".repeat(32),
+                        "humanReviewed": true, "reviewerId": "owner",
+                        "score": 2.5, "thinkingTokens": 400, "hit4096Truncation": false, "loopDetected": false
+                    },
+                    "candidate": {
+                        "scale": 0.5, "responseSha256": "b1".repeat(32),
+                        "humanReviewed": true, "reviewerId": "owner",
+                        "score": 3.5, "thinkingTokens": 420, "hit4096Truncation": false, "loopDetected": false
+                    }
+                },
+                {
+                    "promptId": "reason-1",
+                    "promptSha256": "34".repeat(32),
+                    "category": "reasoning",
+                    "baseline": {
+                        "scale": 0.0, "responseSha256": "c1".repeat(32),
+                        "humanReviewed": true, "reviewerId": "owner",
+                        "score": 3.0, "thinkingTokens": 500, "hit4096Truncation": false, "loopDetected": false
+                    },
+                    "candidate": {
+                        "scale": 0.5, "responseSha256": "d1".repeat(32),
+                        "humanReviewed": true, "reviewerId": "owner",
+                        "score": 3.5, "thinkingTokens": 510, "hit4096Truncation": false, "loopDetected": false
+                    }
+                },
+                {
+                    "promptId": "if-1",
+                    "promptSha256": "35".repeat(32),
+                    "category": "instruction-following",
+                    "baseline": {
+                        "scale": 0.0, "responseSha256": "e1".repeat(32),
+                        "humanReviewed": true, "reviewerId": "owner",
+                        "score": 3.0, "thinkingTokens": 300, "hit4096Truncation": false, "loopDetected": false
+                    },
+                    "candidate": {
+                        "scale": 0.5, "responseSha256": "f1".repeat(32),
+                        "humanReviewed": true, "reviewerId": "owner",
+                        "score": 3.0, "thinkingTokens": 310, "hit4096Truncation": false, "loopDetected": false
+                    }
+                }
+            ],
+            "thinkingOffPrompts": [{
+                "promptId": "creative-1",
+                "promptSha256": "36".repeat(32),
+                "category": "creative-prose",
+                "baseline": {
+                    "scale": 0.0, "responseSha256": "71".repeat(32),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.5, "unwantedRefusal": false
+                },
+                "candidate": {
+                    "scale": 0.5, "responseSha256": "81".repeat(32),
+                    "humanReviewed": true, "reviewerId": "owner",
+                    "score": 3.5, "unwantedRefusal": false
+                }
+            }],
+            "zeroScaleControls": [{
+                "promptId": "z-1",
+                "promptSha256": "44".repeat(32),
+                "noAdapterResponseSha256": "00".repeat(32),
+                "zeroScaleResponseSha256": "00".repeat(32)
+            }]
+        })
+    };
+    let overlap_path = scratch.join("overlap-evidence.json");
+    fs::write(
+        &overlap_path,
+        serde_json::to_vec(&make_evidence(&res["trainingPromptSha256s"], &diag_a))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    assert!(run(json!({
+        "schemaVersion": 1,
+        "operation": "dr-g2-score",
+        "evidencePath": overlap_path
+    }))
+    .is_err());
+
+    let clean_path = scratch.join("clean-evidence.json");
+    fs::write(
+        &clean_path,
+        serde_json::to_vec(&make_evidence(&res["trainingPromptSha256s"], &eval_disjoint))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let scored = run(json!({
+        "schemaVersion": 1,
+        "operation": "dr-g2-score",
+        "evidencePath": clean_path
+    }))?;
+    assert_eq!(scored["drG2Passed"], true);
+
+    // Budget above 64 MiB or missing diagnosticPromptSha256s must be rejected.
+    assert!(run(json!({
+        "schemaVersion": 1,
+        "operation": "reallocate-ranks",
+        "adapterPath": src,
+        "outputPath": scratch.join("over64mib.gguf"),
+        "reallocateConfig": {
+            "maxPayloadBytes": 64_u64 * 1024 * 1024 + 1,
+            "diagnosticPromptSha256s": [diag_a],
+            "siteSensitivities": [{ "target": "blk.63.ffn_down.weight", "reasoningKlGap": 1.0 }]
+        }
+    }))
+    .is_err());
+    assert!(run(json!({
+        "schemaVersion": 1,
+        "operation": "reallocate-ranks",
+        "adapterPath": src,
+        "outputPath": scratch.join("no-diag.gguf"),
+        "reallocateConfig": {
+            "diagnosticPromptSha256s": [],
+            "siteSensitivities": [{ "target": "blk.63.ffn_down.weight", "reasoningKlGap": 1.0 }]
+        }
+    }))
+    .is_err());
+    Ok(())
+}
