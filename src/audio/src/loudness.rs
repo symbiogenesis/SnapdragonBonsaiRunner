@@ -381,6 +381,21 @@ fn sum_squares(values: &[f64]) -> f64 {
     total
 }
 
+fn collect_window_means(
+    count: usize,
+    window_samples: usize,
+    mut energy_at: impl FnMut(usize) -> f64,
+) -> Result<Vec<f64>, LoudnessError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| LoudnessError::AllocationFailed)?;
+    let inv = 1.0 / f64::from(u32::try_from(window_samples).unwrap_or(1));
+    for idx in 0..count {
+        out.push(energy_at(idx) * inv);
+    }
+    Ok(out)
+}
+
 fn collect_block_energies_grid(
     samples: &[f32],
     sample_rate: u32,
@@ -420,28 +435,17 @@ fn collect_block_energies_grid(
         step_energies.push(energy);
     }
 
-    let inv_momentary = 1.0 / f64::from(u32::try_from(geometry.momentary_samples).unwrap_or(1));
-    let momentary_count = chunk_count - 3;
-    let mut momentary = Vec::new();
-    momentary
-        .try_reserve_exact(momentary_count)
-        .map_err(|_| LoudnessError::AllocationFailed)?;
-    for win in step_energies.windows(4) {
-        momentary.push((win[0] + win[1] + win[2] + win[3]) * inv_momentary);
-    }
-
-    let mut short_term = Vec::new();
-    if chunk_count >= 30 {
-        let inv_short = 1.0 / f64::from(u32::try_from(geometry.short_term_samples).unwrap_or(1));
-        let short_count = chunk_count - 29;
-        short_term
-            .try_reserve_exact(short_count)
-            .map_err(|_| LoudnessError::AllocationFailed)?;
-        for win in step_energies.windows(30) {
-            let sum: f64 = win.iter().sum();
-            short_term.push(sum * inv_short);
-        }
-    }
+    let momentary = collect_window_means(chunk_count - 3, geometry.momentary_samples, |idx| {
+        let w = &step_energies[idx..idx + 4];
+        w[0] + w[1] + w[2] + w[3]
+    })?;
+    let short_term = if chunk_count >= 30 {
+        collect_window_means(chunk_count - 29, geometry.short_term_samples, |idx| {
+            step_energies[idx..idx + 30].iter().sum()
+        })?
+    } else {
+        Vec::new()
+    };
 
     Ok((momentary, short_term))
 }
@@ -464,58 +468,51 @@ fn collect_block_energies_general(
     }
 
     let momentary_count = (samples.len() - geometry.momentary_samples) / geometry.step_samples + 1;
-    let inv_momentary = 1.0 / f64::from(u32::try_from(geometry.momentary_samples).unwrap_or(1));
-    let mut momentary = Vec::new();
-    momentary
-        .try_reserve_exact(momentary_count)
-        .map_err(|_| LoudnessError::AllocationFailed)?;
-    for idx in 0..momentary_count {
+    let momentary = collect_window_means(momentary_count, geometry.momentary_samples, |idx| {
         let start = idx * geometry.step_samples;
-        let end = start + geometry.momentary_samples;
-        momentary.push(sum_squares(&k_weighted[start..end]) * inv_momentary);
-    }
+        sum_squares(&k_weighted[start..start + geometry.momentary_samples])
+    })?;
 
-    let mut short_term = Vec::new();
-    if samples.len() >= geometry.short_term_samples {
+    let short_term = if samples.len() >= geometry.short_term_samples {
         let short_count = (samples.len() - geometry.short_term_samples) / geometry.step_samples + 1;
-        let inv_short = 1.0 / f64::from(u32::try_from(geometry.short_term_samples).unwrap_or(1));
-        short_term
-            .try_reserve_exact(short_count)
-            .map_err(|_| LoudnessError::AllocationFailed)?;
-        for idx in 0..short_count {
+        collect_window_means(short_count, geometry.short_term_samples, |idx| {
             let start = idx * geometry.step_samples;
-            let end = start + geometry.short_term_samples;
-            short_term.push(sum_squares(&k_weighted[start..end]) * inv_short);
-        }
-    }
+            sum_squares(&k_weighted[start..start + geometry.short_term_samples])
+        })?
+    } else {
+        Vec::new()
+    };
 
     Ok((momentary, short_term))
 }
 
-fn compute_integrated_lufs(momentary_energies: &[f64]) -> (Option<f64>, Option<f64>) {
-    let mut max_momentary: Option<f64> = None;
+fn absolute_gate_pass(energies: &[f64]) -> (Option<f64>, Option<(f64, usize)>) {
+    let mut max_lufs: Option<f64> = None;
     let mut abs_sum = 0.0_f64;
     let mut abs_count = 0_usize;
 
-    for &energy in momentary_energies {
+    for &energy in energies {
         let Some(lufs) = energy_to_lufs(energy) else {
             continue;
         };
-        max_momentary = Some(match max_momentary {
-            Some(prev) => prev.max(lufs),
-            None => lufs,
-        });
+        max_lufs = Some(max_lufs.map_or(lufs, |prev| prev.max(lufs)));
         if lufs > ABSOLUTE_GATE_LUFS {
             abs_sum += energy;
             abs_count += 1;
         }
     }
 
-    let Some(abs_count_u32) = u32::try_from(abs_count).ok().filter(|&n| n > 0) else {
-        return (None, max_momentary);
-    };
-    let abs_mean = abs_sum / f64::from(abs_count_u32);
-    let Some(abs_lufs) = energy_to_lufs(abs_mean) else {
+    let abs_lufs = u32::try_from(abs_count)
+        .ok()
+        .filter(|&n| n > 0)
+        .and_then(|count_u32| energy_to_lufs(abs_sum / f64::from(count_u32)))
+        .map(|lufs| (lufs, abs_count));
+    (max_lufs, abs_lufs)
+}
+
+fn compute_integrated_lufs(momentary_energies: &[f64]) -> (Option<f64>, Option<f64>) {
+    let (max_momentary, abs) = absolute_gate_pass(momentary_energies);
+    let Some((abs_lufs, _)) = abs else {
         return (None, max_momentary);
     };
     let relative_gate = abs_lufs + INTEGRATED_RELATIVE_GATE_LU;
@@ -561,29 +558,8 @@ fn interpolated_percentile(sorted: &[f64], percentile: f64) -> Option<f64> {
 }
 
 fn compute_short_term_and_lra(short_term_energies: &[f64]) -> (Option<f64>, Option<f64>) {
-    let mut max_short_term: Option<f64> = None;
-    let mut abs_sum = 0.0_f64;
-    let mut abs_count = 0_usize;
-
-    for &energy in short_term_energies {
-        let Some(lufs) = energy_to_lufs(energy) else {
-            continue;
-        };
-        max_short_term = Some(match max_short_term {
-            Some(prev) => prev.max(lufs),
-            None => lufs,
-        });
-        if lufs > ABSOLUTE_GATE_LUFS {
-            abs_sum += energy;
-            abs_count += 1;
-        }
-    }
-
-    let Some(abs_count_u32) = u32::try_from(abs_count).ok().filter(|&n| n > 0) else {
-        return (max_short_term, None);
-    };
-    let abs_mean = abs_sum / f64::from(abs_count_u32);
-    let Some(abs_lufs) = energy_to_lufs(abs_mean) else {
+    let (max_short_term, abs) = absolute_gate_pass(short_term_energies);
+    let Some((abs_lufs, abs_count)) = abs else {
         return (max_short_term, None);
     };
     let relative_gate = abs_lufs + LRA_RELATIVE_GATE_LU;
