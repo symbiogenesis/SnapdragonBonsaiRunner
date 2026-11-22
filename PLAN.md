@@ -475,7 +475,12 @@ adoption decisions without displacing native daily-use acceptance.
   added NEON-vectorized 8-row triangular updates in `prefill_gdn.rs`, while
   Prism commits `14ff98e`, `ce0a00c`, and `43809de` added full-K spill-free
   `PQ2` (`2..=7` / tail), `PTQ1`, and `Q8_0` 8-row multi-token kernels in
-  `bonsai-neon-dot` / `src/kernels/`. Verify selected-cache
+  `bonsai-neon-dot` / `src/kernels/`, and Prism commits `c4b94e4` and `da699ed`
+  added full-K spill-free `16`/`8`/`4`/`1`-row `Q8_0` `SDOT` decode kernels
+  (`fill_sixteen_rows`), NEON `vqtbl2q_u8` 3-bit KV codecs, NEON
+  `Quantizer::encode`, and long-context (`> 4,096` tokens) `G in {6, 4, 3, 2, 1}`
+  and 2-token × G-head `attend_tile` reuse without growing caller score
+  allocations. Verify selected-cache
   service consumers and independent packed-KV head workers: scratch/admission,
   complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
@@ -587,7 +592,12 @@ adoption decisions without displacing native daily-use acceptance.
   and `speech-asr` / `audio` `f32x4` minimax `erf` GELU, radix-2/5 400-pt FFT,
   `Q4_K`/`Q6_K` decoder intake, windowed `cu_seqlens` + 8s `LiveCapture` prefill,
   short-clip language hints, repetition trimming, and sub-band adaptive VAD.
-  Complete compiled CI, actual-model `fp64`/teacher-forced/WER/listening, and
+  Runner commit `5bf8cbe0` additionally landed `[k, ic, oc]` pre-permuted
+  `CausalTransConv1d` with 4-frame reuse, `4x4`-tiled `CausalConv1d`, and
+  `f32x4` Padé `tanh` GELU in `bonsai-speech-tts`, plus parallel
+  `quantize_batch_activations` and zero-allocation 4-row `Q4_K`/`Q6_K` SIMD
+  kernels in `bonsai-speech-asr`. Complete compiled CI, actual-model
+  `fp64`/teacher-forced/WER/listening, and
   X1/X2 device qualification gates before promotion.
 - [ ] Retire the remaining Windows queue ABI, ASR, Prism reference and publisher
   native/DLL families
@@ -1077,7 +1087,13 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   zero-copy `MappedSlice` GGUF mapping, 8-worker parallel tensor payload validation,
   `ServerEndpoint::verified_sections`, `"SB2HQ2C1"` `NativeQ2ArenaCache` and
   `Qwen35::release_executor_resident_host_weights` (pinned in Prism `0.1.32`
-  with end-to-end launcher/service wiring; pending Runner hosted Foundation and
+  with end-to-end launcher/service wiring, and post-lock Prism commit `74d8884`
+  wired `SwiftSession::model_identity`, opt-in `--hexagon-arena-cache <dir>`
+  (`NativeQ2ArenaCache` load/save), and `#41` dynamic VTCM placement in
+  `prism-inference-server` while leaving `Runtime<Qwen35>::release_executor_resident_host_weights`
+  forwarding in `src/runtime.rs` (`#18` server wire-up when `cpu_prefill` is
+  `None`) and `PTQ1_0` admission on `bonsai_prism_runtime`'s `supports_f32` path
+  open as narrow follow-ups; pending Runner hosted Foundation and
   X1/X2 device qualification). Deferred screening leads `#16` (aligned staging reuse), `#17`
   (optional Windows unbuffered direct I/O) and end-to-end `#18` qualification
   remain gated behind measured cold-start/I/O/mapping bottlenecks and
@@ -1391,7 +1407,13 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   commits `420d386`, `1ce84f4`, and `f817e08` (`CommandBatchRecorder`, raised
   submit descriptor pool capacities, SPIR-V 1.6 layer shaders including
   `gdn_step_f32`/`conv1d_silu_f32`/`rms_norm_f32`/`rope_f32`/`l2_norm_f32`,
-  `TdrChunkPolicy`, and `VulkanBatchedGraphExecutor`), and Runner wired opt-in
+  `TdrChunkPolicy`, and `VulkanBatchedGraphExecutor`), followed by Prism commit
+  `48aa711` adding direct packed-FP16 KV attention (`UnpackHalf2x16` `_f16kv`
+  shaders eliminating per-token `kv_unpack_f16` dispatches and unpacked K/V
+  scratch buffers), GPU-resident `RankOneAdapter`/`MultiRankAdapter` execution
+  (`lora_b_accum_f32`, `0.0` bypass, scale-sensitive identity invalidation),
+  and `bonsai_prism_runtime::Decoder` implementation with live Adreno parity
+  tests, and Runner wired opt-in
   release-gated `--placement vulkan|composite` routing in commit `a57a3afd`
   (`VULKAN_PLACEMENT_RELEASE = None`); physical X2/X1-85 hardware parity, TDR
   qualification, and release lock promotion remain open.
@@ -1619,7 +1641,9 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   decode, short verification block (`2`–`9`) and larger prefill tile crossovers with
   odd-tail retention, keeping any rounding change behind an explicit profile gate.
   (Source kernels for full-K spill-free `PQ2` `2..=7`/tails, `PTQ1` decode/tile,
-  and `Q8_0` 8-row tiles landed locally in Prism `14ff98e`, `ce0a00c`, `43809de`;
+  and `Q8_0` 8-row tiles landed locally in Prism `14ff98e`, `ce0a00c`, `43809de`,
+  and full-K spill-free `Q8_0` `16/8/4/1`-row `SDOT` decode kernels + long-context
+  `attend_tile` grouped KV reuse landed in `c4b94e4` and `da699ed`;
   device crossover benchmarking remains open.)
 - [ ] **#25 — Remaining shared activation-preparation consumers.** Extend shared
   transform-and-quantize preparation to remaining recurrent sibling projections
@@ -1681,8 +1705,11 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   Swift's `PQ2`/`PTQ1` layouts under [Hexagon](docs/hexagon.md). (Source
   support for lossless `PTQ1_0` transcoding and `#41` VTCM-aware dynamic
   multi-arena placement landed locally in Prism `bonsai-hexagon-runtime` commits
-  `a2551de` and `359f88a`; physical NPU device qualification and release lock
-  promotion remain open.)
+  `a2551de` and `359f88a`, and `prism-inference-server` wired `#41` dynamic
+  VTCM placement + opt-in `--hexagon-arena-cache <dir>` in `74d8884`;
+  physical NPU device qualification, remaining `#18` `src/runtime.rs`
+  host-weight-release forwarding, `PTQ1_0` `supports_f32` runtime admission,
+  and release lock promotion remain open.)
 - [ ] **#42 — Pipelined DMA, HVX preparation and HMX chunkwise GDN.** Gate under an
   explicit separate numerical profile (HMX FP16 intermediates do not preserve the
   FP32 GDN contract) with a small-token CPU/HVX fallback.
