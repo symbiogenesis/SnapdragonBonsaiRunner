@@ -1,7 +1,7 @@
 //! Bounded inert Markdown packets and offline SVG rasterization without UI or OS APIs.
 #![forbid(unsafe_code)]
 
-use std::{ops::Range, sync::OnceLock};
+use std::ops::Range;
 
 mod markdown;
 mod protocol;
@@ -17,11 +17,50 @@ pub use svg::{MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS, MAX_SVG_BYTES, MAX_SVG_IM
 const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
 const MAX_STYLE_SPANS: usize = 16_384;
 const MAX_RENDERED_BYTES: usize = 4 * MAX_MARKDOWN_BYTES;
-pub(crate) const CODE_BLOCK_FONT_NAME: &str = "Bonsai Code Block";
+
+pub(crate) const STYLE_CODE: u8 = 1;
+pub(crate) const STYLE_ITALIC: u8 = 2;
+pub(crate) const STYLE_STRONG: u8 = 4;
+pub(crate) const STYLE_STRIKE: u8 = 8;
+pub(crate) const STYLE_CODE_BLOCK: u8 = 16;
 
 const QUOTE_PREFIX: &str = "│ ";
 const QUOTE_PREFIX_BLOCK: &str = "│ │ │ │ │ │ │ │ ";
 const MAX_STATIC_REPEATS: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Style {
+    flags: u8,
+    size: u8,
+}
+
+impl Style {
+    const NORMAL: Self = Self { flags: 0, size: 16 };
+
+    const fn with(self, flag: u8) -> Self {
+        Self {
+            flags: self.flags | flag,
+            size: self.size,
+        }
+    }
+
+    const fn code(self, block: bool) -> Self {
+        let extra = if block {
+            STYLE_CODE | STYLE_CODE_BLOCK
+        } else {
+            STYLE_CODE
+        };
+        Self {
+            flags: (self.flags & !STYLE_ITALIC) | extra,
+            size: self.size,
+        }
+    }
+}
+
+struct Section {
+    range: Range<usize>,
+    style: Style,
+}
 
 struct Mapping {
     source: Range<usize>,
@@ -30,8 +69,19 @@ struct Mapping {
 }
 
 struct Layout {
-    job: egui::text::LayoutJob,
+    text: String,
+    sections: Vec<Section>,
     mappings: Vec<Mapping>,
+}
+
+#[cfg(test)]
+impl Layout {
+    fn style_at_byte(&self, byte_offset: usize) -> Option<Style> {
+        self.sections
+            .iter()
+            .find(|section| section.range.contains(&byte_offset))
+            .map(|section| section.style)
+    }
 }
 
 struct ImageBlock {
@@ -49,29 +99,9 @@ struct DocumentLayout {
     segments: Vec<Segment>,
 }
 
-pub(crate) struct RenderTheme {
-    pub(crate) normal: egui::TextFormat,
-    pub(crate) strong_text_color: egui::Color32,
-    pub(crate) code_bg_color: egui::Color32,
-}
-
-pub(crate) fn theme() -> &'static RenderTheme {
-    static THEME: OnceLock<RenderTheme> = OnceLock::new();
-    THEME.get_or_init(|| {
-        let visuals = egui::Visuals::dark();
-        RenderTheme {
-            normal: egui::TextFormat::simple(
-                egui::FontId::proportional(16.0),
-                visuals.text_color(),
-            ),
-            strong_text_color: visuals.strong_text_color(),
-            code_bg_color: visuals.code_bg_color,
-        }
-    })
-}
-
 struct BuilderOut {
-    job: egui::text::LayoutJob,
+    text: String,
+    sections: Vec<Section>,
     mappings: Vec<Mapping>,
     segments: Vec<Segment>,
     quote_depth: usize,
@@ -85,26 +115,29 @@ impl BuilderOut {
     fn append(
         &mut self,
         source_text: &str,
-        normal: &egui::TextFormat,
-        scratch: &mut String,
         text: &str,
         source: Option<Range<usize>>,
-        format: &egui::TextFormat,
+        style: Style,
     ) {
         if text.is_empty() || self.limited {
             return;
         }
         if self.quote_depth != 0
             && !text.starts_with('\n')
-            && (self.job.text.is_empty() || self.job.text.ends_with('\n'))
+            && (self.text.is_empty() || self.text.ends_with('\n'))
         {
             // Container markers are presentation text, never part of a source
             // match. Prefix each authored line rather than only the first one.
-            let prefix =
-                repeated_slice(QUOTE_PREFIX, QUOTE_PREFIX_BLOCK, self.quote_depth, scratch);
-            self.append_raw(source_text, prefix, None, normal);
+            let mut overflow = String::new();
+            let prefix = repeated_slice(
+                QUOTE_PREFIX,
+                QUOTE_PREFIX_BLOCK,
+                self.quote_depth,
+                &mut overflow,
+            );
+            self.append_raw(source_text, prefix, None, Style::NORMAL);
         }
-        self.append_raw(source_text, text, source, format);
+        self.append_raw(source_text, text, source, style);
     }
 
     fn append_raw(
@@ -112,7 +145,7 @@ impl BuilderOut {
         source_text: &str,
         text: &str,
         source: Option<Range<usize>>,
-        format: &egui::TextFormat,
+        style: Style,
     ) {
         if text.is_empty() || self.limited {
             return;
@@ -124,14 +157,19 @@ impl BuilderOut {
             return;
         }
         self.rendered_bytes = next_bytes;
-        let display_start = self.job.text.len();
-        if let Some(last) = self.job.sections.last_mut().filter(|section| {
-            section.byte_range.end.0 == display_start && section.format == *format
-        }) {
-            self.job.text.push_str(text);
-            last.byte_range.end.0 = self.job.text.len();
+        let display_start = self.text.len();
+        self.text.push_str(text);
+        if let Some(last) = self
+            .sections
+            .last_mut()
+            .filter(|section| section.range.end == display_start && section.style == style)
+        {
+            last.range.end = self.text.len();
         } else {
-            self.job.append(text, 0.0, format.clone());
+            self.sections.push(Section {
+                range: display_start..self.text.len(),
+                style,
+            });
         }
         if let Some(source) = source.filter(|range| !range.is_empty()) {
             self.mappings.push(Mapping {
@@ -143,12 +181,17 @@ impl BuilderOut {
     }
 
     fn flush_text(&mut self) {
-        if self.job.text.is_empty() && self.mappings.is_empty() {
+        if self.text.is_empty() && self.mappings.is_empty() {
             return;
         }
-        let job = std::mem::take(&mut self.job);
+        let text = std::mem::take(&mut self.text);
+        let sections = std::mem::take(&mut self.sections);
         let mappings = std::mem::take(&mut self.mappings);
-        self.segments.push(Segment::Text(Layout { job, mappings }));
+        self.segments.push(Segment::Text(Layout {
+            text,
+            sections,
+            mappings,
+        }));
     }
 
     fn push_image(&mut self, image: ImageBlock) {
@@ -183,78 +226,34 @@ fn repeated_slice<'a>(
 
 struct Builder<'a> {
     source: &'a str,
-    theme: &'a RenderTheme,
     scratch: String,
     out: BuilderOut,
 }
 
 impl Builder<'_> {
-    fn append(&mut self, text: &str, source: Option<Range<usize>>, format: &egui::TextFormat) {
-        self.out.append(
-            self.source,
-            &self.theme.normal,
-            &mut self.scratch,
-            text,
-            source,
-            format,
-        );
+    fn append(&mut self, text: &str, source: Option<Range<usize>>, style: Style) {
+        self.out.append(self.source, text, source, style);
     }
 
     fn push_image(&mut self, image: ImageBlock) {
         self.out.push_image(image);
     }
 
-    fn generated(&mut self, text: &str, format: &egui::TextFormat) {
-        self.append(text, None, format);
+    fn generated(&mut self, text: &str, style: Style) {
+        self.append(text, None, style);
     }
 
-    fn generated_repeated(
-        &mut self,
-        unit: &str,
-        static_block: &str,
-        count: usize,
-        format: &egui::TextFormat,
-    ) {
-        if count == 0 || self.out.limited {
-            return;
-        }
-        if count <= MAX_STATIC_REPEATS
-            && let Some(slice) = static_block.get(..count * unit.len())
-        {
-            self.append(slice, None, format);
-            return;
-        }
-        self.scratch.clear();
-        let max_repeats = MAX_RENDERED_BYTES / unit.len().max(1);
-        let capped = count.min(max_repeats.saturating_add(1));
-        for _ in 0..capped {
-            self.scratch.push_str(unit);
-        }
-        // Only one small heap allocation if depth exceeds MAX_STATIC_REPEATS (> 8) inside an active quote line.
-        if self.out.quote_depth != 0
-            && (self.out.job.text.is_empty() || self.out.job.text.ends_with('\n'))
-        {
-            let mut prefix_buf = String::new();
-            let prefix = repeated_slice(
-                QUOTE_PREFIX,
-                QUOTE_PREFIX_BLOCK,
-                self.out.quote_depth,
-                &mut prefix_buf,
-            );
-            self.out
-                .append_raw(self.source, prefix, None, &self.theme.normal);
-        }
-        self.out
-            .append_raw(self.source, &self.scratch, None, format);
+    fn generated_repeated(&mut self, unit: &str, static_block: &str, count: usize, style: Style) {
+        let slice = repeated_slice(unit, static_block, count, &mut self.scratch);
+        self.out.append(self.source, slice, None, style);
     }
 
     fn newlines(&mut self, count: usize) {
-        if self.out.job.text.is_empty() {
+        if self.out.text.is_empty() {
             return;
         }
         let existing = self
             .out
-            .job
             .text
             .bytes()
             .rev()
@@ -267,57 +266,45 @@ impl Builder<'_> {
         }
         const TWO_NEWLINES: &str = "\n\n";
         if let Some(slice) = TWO_NEWLINES.get(..needed) {
-            self.out.append(
-                self.source,
-                &self.theme.normal,
-                &mut self.scratch,
-                slice,
-                None,
-                &self.theme.normal,
-            );
+            self.out.append(self.source, slice, None, Style::NORMAL);
         } else {
             for _ in 0..needed {
-                self.out.append(
-                    self.source,
-                    &self.theme.normal,
-                    &mut self.scratch,
-                    "\n",
-                    None,
-                    &self.theme.normal,
-                );
+                self.out.append(self.source, "\n", None, Style::NORMAL);
             }
         }
     }
 
-    fn literal(&mut self, span: Option<markdown_syntax::Span>, format: &egui::TextFormat) {
+    fn literal(&mut self, span: Option<markdown_syntax::Span>, style: Style) {
         if let Some(span) = span
             && let Some(text) = self.source.get(span.start..span.end)
         {
-            self.append(text, Some(span.start..span.end), format);
+            self.append(text, Some(span.start..span.end), style);
         }
     }
 
-    fn value(
-        &mut self,
-        value: &str,
-        span: Option<markdown_syntax::Span>,
-        format: &egui::TextFormat,
-    ) {
+    fn value(&mut self, value: &str, span: Option<markdown_syntax::Span>, style: Style) {
         let range = span.and_then(|span| {
             let source = self.source.get(span.start..span.end)?;
             Some(source.find(value).map_or(span.start..span.end, |offset| {
                 span.start + offset..span.start + offset + value.len()
             }))
         });
-        self.append(value, range, format);
+        self.append(value, range, style);
     }
 }
 
-fn plain(body: &str, normal: &egui::TextFormat) -> Layout {
-    let mut job = egui::text::LayoutJob::default();
-    job.append(body, 0.0, normal.clone());
+fn plain(body: &str) -> Layout {
+    let sections = if body.is_empty() {
+        Vec::new()
+    } else {
+        vec![Section {
+            range: 0..body.len(),
+            style: Style::NORMAL,
+        }]
+    };
     Layout {
-        job,
+        text: body.to_owned(),
+        sections,
         mappings: vec![Mapping {
             source: 0..body.len(),
             display: 0..body.len(),
@@ -334,20 +321,16 @@ fn parse_layout(body: &str) -> Layout {
     {
         return layout;
     }
-    plain(body, &theme().normal)
+    plain(body)
 }
 
 fn parse_document(body: &str) -> DocumentLayout {
-    let theme = theme();
     let mut builder = Builder {
         source: body,
-        theme,
         scratch: String::new(),
         out: BuilderOut {
-            job: egui::text::LayoutJob {
-                text: String::with_capacity(body.len()),
-                ..Default::default()
-            },
+            text: String::with_capacity(body.len()),
+            sections: Vec::new(),
             mappings: Vec::new(),
             segments: Vec::new(),
             quote_depth: 0,
@@ -358,22 +341,22 @@ fn parse_document(body: &str) -> DocumentLayout {
         },
     };
     let parsed = markdown_syntax::parse(body);
-    builder.blocks(&parsed.document.children, &theme.normal, 0, false);
-    if body.ends_with('\n') && (builder.out.segments.is_empty() || !builder.out.job.text.is_empty())
-    {
+    builder.blocks(&parsed.document.children, Style::NORMAL, 0, false);
+    if body.ends_with('\n') && (builder.out.segments.is_empty() || !builder.out.text.is_empty()) {
         builder.newlines(1);
     }
     if builder.out.limited {
         return DocumentLayout {
-            segments: vec![Segment::Text(plain(body, &theme.normal))],
+            segments: vec![Segment::Text(plain(body))],
         };
     }
     if builder.out.segments.is_empty()
-        || !builder.out.job.text.is_empty()
+        || !builder.out.text.is_empty()
         || !builder.out.mappings.is_empty()
     {
         builder.out.segments.push(Segment::Text(Layout {
-            job: builder.out.job,
+            text: builder.out.text,
+            sections: builder.out.sections,
             mappings: builder.out.mappings,
         }));
     }

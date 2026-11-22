@@ -116,24 +116,23 @@ fn markdown_typography_preserves_six_heading_levels_and_inline_code_size() -> io
     let source = "# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six\n\n# `heading_code`\n\nBody `body_code`";
     let layout = parse_layout(source);
     for (needle, size) in [
-        ("One", 28.0_f32),
-        ("Two", 24.0),
-        ("Three", 21.0),
-        ("Four", 19.0),
-        ("Five", 17.0),
-        ("Six", 16.0),
-        ("heading_code", 28.0),
-        ("body_code", 16.0),
+        ("One", 28_u8),
+        ("Two", 24),
+        ("Three", 21),
+        ("Four", 19),
+        ("Five", 17),
+        ("Six", 16),
+        ("heading_code", 28),
+        ("body_code", 16),
     ] {
-        let offset = egui::text::ByteIndex(
-            layout
-                .job
-                .text
-                .find(needle)
-                .ok_or_else(|| io::Error::other("Missing heading text"))?,
-        );
-        let format = layout.job.format_at_byte(offset);
-        assert_eq!(format.font_id.size.to_bits(), size.to_bits(), "{needle}");
+        let offset = layout
+            .text
+            .find(needle)
+            .ok_or_else(|| io::Error::other("Missing heading text"))?;
+        let style = layout
+            .style_at_byte(offset)
+            .ok_or_else(|| io::Error::other("Missing heading style"))?;
+        assert_eq!(style.size, size, "{needle}");
     }
     // All admitted heading sizes must survive the worker's closed wire format.
     assert!(!parse(source).is_empty());
@@ -146,28 +145,28 @@ fn markdown_typography_prefixes_quote_lines_and_indents_nested_lists() -> io::Re
         "> First\n> second\n>\n> Third\n>\n>> Nested\n\n- Parent\n  - Child\n    - Grandchild";
     let layout = parse_layout(source);
     assert_eq!(
-        layout.job.text,
+        layout.text,
         "│ First\n│ second\n\n│ Third\n\n│ │ Nested\n\n• Parent\n    • Child\n        • Grandchild"
     );
     for mapping in &layout.mappings {
         assert!(mapping.verbatim);
         assert_eq!(
             source.get(mapping.source.clone()),
-            layout.job.text.get(mapping.display.clone())
+            layout.text.get(mapping.display.clone())
         );
     }
     for pair in layout.mappings.windows(2) {
         assert!(pair[0].source.end <= pair[1].source.start);
         assert!(pair[0].display.end <= pair[1].display.start);
     }
-    let first = egui::text::ByteIndex(
-        layout
-            .job
-            .text
-            .find("First")
-            .ok_or_else(|| io::Error::other("Missing quote text"))?,
-    );
-    assert!(!layout.job.format_at_byte(first).italics);
+    let first = layout
+        .text
+        .find("First")
+        .ok_or_else(|| io::Error::other("Missing quote text"))?;
+    let style = layout
+        .style_at_byte(first)
+        .ok_or_else(|| io::Error::other("Missing quote style"))?;
+    assert_eq!(style.flags & super::STYLE_ITALIC, 0);
     assert!(!parse(source).is_empty());
     Ok(())
 }
@@ -177,7 +176,7 @@ fn markdown_typography_marks_code_blocks_separately_from_inline_code() -> io::Re
     let source = "```rust\nlet first = 1;\nlet second = 2;\n```\n\nUse `inline`.";
     let layout = parse_layout(source);
     let packet = parse(source);
-    let count_offset = 8 + layout.job.text.len();
+    let count_offset = 8 + layout.text.len();
     let count = usize::try_from(u32::from_le_bytes(
         packet
             .get(count_offset..count_offset + 4)
@@ -197,7 +196,7 @@ fn markdown_typography_marks_code_blocks_separately_from_inline_code() -> io::Re
     for mapping in &layout.mappings {
         assert_eq!(
             source.get(mapping.source.clone()),
-            layout.job.text.get(mapping.display.clone())
+            layout.text.get(mapping.display.clone())
         );
     }
     Ok(())
@@ -214,7 +213,7 @@ fn segmented_markdown_extracts_top_level_svg_and_preserves_monotonic_source_maps
     let Segment::Text(before) = &doc.segments[0] else {
         return Err(io::Error::other("expected leading text segment"));
     };
-    assert_eq!(before.job.text, "Intro text:");
+    assert_eq!(before.text, "Intro text:");
     let Segment::Image(img) = &doc.segments[1] else {
         return Err(io::Error::other("expected image segment"));
     };
@@ -224,7 +223,7 @@ fn segmented_markdown_extracts_top_level_svg_and_preserves_monotonic_source_maps
     let Segment::Text(after) = &doc.segments[2] else {
         return Err(io::Error::other("expected trailing text segment"));
     };
-    assert_eq!(after.job.text, "Outro note.\n");
+    assert_eq!(after.text, "Outro note.\n");
     let before_last = before
         .mappings
         .last()
@@ -705,16 +704,13 @@ fn svg_parse_tree_cache_reuses_valid_trees_and_evicts_lru_after_four() -> io::Re
 #[test]
 fn nested_quotes_deep_ordered_lists_and_multiline_code_coalesce_sections() -> io::Result<()> {
     let quoted = parse_layout("> > one\n> > two");
-    assert_eq!(quoted.job.text, "│ │ one\n│ │ two");
+    assert_eq!(quoted.text, "│ │ one\n│ │ two");
 
     let deep_quote = parse_layout(&format!("{}deep quote", "> ".repeat(10)));
-    assert_eq!(
-        deep_quote.job.text,
-        format!("{}deep quote", "│ ".repeat(10))
-    );
+    assert_eq!(deep_quote.text, format!("{}deep quote", "│ ".repeat(10)));
 
     let ordered = parse_layout("12. top\n13. second\n14. third");
-    assert_eq!(ordered.job.text, "12. top\n13. second\n14. third");
+    assert_eq!(ordered.text, "12. top\n13. second\n14. third");
 
     let mut deep = String::new();
     for level in 1..=10 {
@@ -728,21 +724,20 @@ fn nested_quotes_deep_ordered_lists_and_multiline_code_coalesce_sections() -> io
     let list_layout = parse_layout(&deep);
     assert!(
         list_layout
-            .job
             .text
             .contains(&format!("{}1. leaf", "    ".repeat(9))),
         "unexpected list text: {:?}",
-        list_layout.job.text
+        list_layout.text
     );
 
     let code_source = "```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```";
     let code_layout = parse_layout(code_source);
-    assert_eq!(code_layout.job.text, "let a = 1;\nlet b = 2;\nlet c = 3;\n");
-    assert_eq!(code_layout.job.sections.len(), 1);
+    assert_eq!(code_layout.text, "let a = 1;\nlet b = 2;\nlet c = 3;\n");
+    assert_eq!(code_layout.sections.len(), 1);
     for mapping in &code_layout.mappings {
         assert_eq!(
             code_source.get(mapping.source.clone()),
-            code_layout.job.text.get(mapping.display.clone())
+            code_layout.text.get(mapping.display.clone())
         );
     }
     assert!(parse(code_source).starts_with(b"BMD1"));

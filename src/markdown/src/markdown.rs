@@ -1,18 +1,12 @@
 //! Render only the documented native subset; other constructs retain source.
-use super::{Builder, CODE_BLOCK_FONT_NAME, ImageBlock};
+use super::{Builder, ImageBlock, STYLE_ITALIC, STYLE_STRIKE, STYLE_STRONG, Style};
 use markdown_syntax::{Block, CodeBlock, CodeBlockKind, FenceMarker, Inline};
-use std::sync::OnceLock;
 
 const INDENT_UNIT: &str = "    ";
 const INDENT_BLOCK: &str = "                                ";
 
-fn code_block_font_family() -> &'static egui::FontFamily {
-    static FAMILY: OnceLock<egui::FontFamily> = OnceLock::new();
-    FAMILY.get_or_init(|| egui::FontFamily::Name(CODE_BLOCK_FONT_NAME.into()))
-}
-
 impl Builder<'_> {
-    fn emit_ordered_marker(&mut self, mut number: u64, format: &egui::TextFormat) {
+    fn emit_ordered_marker(&mut self, mut number: u64, style: Style) {
         let mut buf = [b' '; 24];
         buf[23] = b' ';
         buf[22] = b'.';
@@ -27,17 +21,11 @@ impl Builder<'_> {
             }
         }
         if let Ok(marker) = std::str::from_utf8(&buf[pos..24]) {
-            self.generated(marker, format);
+            self.generated(marker, style);
         }
     }
 
-    pub(super) fn blocks(
-        &mut self,
-        blocks: &[Block],
-        format: &egui::TextFormat,
-        depth: usize,
-        tight: bool,
-    ) {
+    pub(super) fn blocks(&mut self, blocks: &[Block], style: Style, depth: usize, tight: bool) {
         for (index, block) in blocks.iter().enumerate() {
             if self.out.limited {
                 return;
@@ -55,23 +43,24 @@ impl Builder<'_> {
                 self.newlines(if tight { 1 } else { 2 });
             }
             match block {
-                Block::Paragraph(node) => self.inlines(&node.children, format),
+                Block::Paragraph(node) => self.inlines(&node.children, style),
                 Block::Heading(node) => {
-                    let mut heading = format.clone();
-                    heading.font_id.size = match node.depth {
-                        1 => 28.0,
-                        2 => 24.0,
-                        3 => 21.0,
-                        4 => 19.0,
-                        5 => 17.0,
-                        _ => 16.0,
-                    } * (self.theme.normal.font_id.size / 16.0);
-                    heading.color = self.theme.strong_text_color;
-                    self.inlines(&node.children, &heading);
+                    let heading = Style {
+                        flags: style.flags | STYLE_STRONG,
+                        size: match node.depth {
+                            1 => 28,
+                            2 => 24,
+                            3 => 21,
+                            4 => 19,
+                            5 => 17,
+                            _ => 16,
+                        },
+                    };
+                    self.inlines(&node.children, heading);
                 }
                 Block::BlockQuote(node) => {
                     self.out.quote_depth += 1;
-                    self.blocks(&node.children, format, depth, false);
+                    self.blocks(&node.children, style, depth, false);
                     self.out.quote_depth -= 1;
                 }
                 Block::List(node) => {
@@ -84,24 +73,23 @@ impl Builder<'_> {
                         if index != 0 {
                             self.newlines(if node.tight { 1 } else { 2 });
                         }
-                        self.generated_repeated(INDENT_UNIT, INDENT_BLOCK, depth, format);
+                        self.generated_repeated(INDENT_UNIT, INDENT_BLOCK, depth, style);
                         if node.ordered {
-                            self.emit_ordered_marker(number, format);
+                            self.emit_ordered_marker(number, style);
                             number = number.saturating_add(1);
                         } else {
-                            self.generated("• ", format);
+                            self.generated("• ", style);
                         }
                         if let Some(checked) = item.checked {
-                            self.generated(if checked { "☑ " } else { "☐ " }, format);
+                            self.generated(if checked { "☑ " } else { "☐ " }, style);
                         }
-                        self.blocks(&item.children, format, depth + 1, node.tight);
+                        self.blocks(&item.children, style, depth + 1, node.tight);
                     }
                 }
                 Block::CodeBlock(node) => {
-                    let mut code = self.code_format(format);
                     // A finite wire flag lets the trusted UI distinguish a
                     // code surface from an inline monospace span.
-                    code.font_id.family = code_block_font_family().clone();
+                    let code = style.code(true);
                     // Map each de-indented code line back to its actual source,
                     // excluding the fence/info string and container prefixes.
                     let mut start = node.meta.span.map_or(0, |span| span.start);
@@ -133,29 +121,30 @@ impl Builder<'_> {
                                 self.out.limited = true;
                                 return;
                             };
-                            self.append(value, Some(range), &code);
+                            self.append(value, Some(range), code);
                         }
                         start = physical_end;
                         if line.ends_with('\n') {
-                            self.generated("\n", &code);
+                            self.generated("\n", code);
                         }
                     }
                 }
-                Block::ThematicBreak(_) => self.generated("────", format),
+                Block::ThematicBreak(_) => self.generated("────", style),
                 Block::Table(node) => {
                     for (row_index, row) in node.rows.iter().enumerate() {
                         if row_index != 0 {
                             self.newlines(1);
                         }
-                        let mut cell_format = format.clone();
-                        if row_index == 0 {
-                            cell_format.color = self.theme.strong_text_color;
-                        }
+                        let cell_style = if row_index == 0 {
+                            style.with(STYLE_STRONG)
+                        } else {
+                            style
+                        };
                         for (cell_index, cell) in row.cells.iter().enumerate() {
                             if cell_index != 0 {
-                                self.generated("  │  ", format);
+                                self.generated("  │  ", style);
                             }
-                            self.inlines(&cell.children, &cell_format);
+                            self.inlines(&cell.children, cell_style);
                         }
                     }
                 }
@@ -163,7 +152,7 @@ impl Builder<'_> {
                 Block::Definition(_) => {}
                 // HTML and extensions stay visible and inert. Never route any
                 // model output into a browser, image loader or code executor.
-                _ => self.literal(block.span(), format),
+                _ => self.literal(block.span(), style),
             }
         }
     }
@@ -214,48 +203,27 @@ impl Builder<'_> {
         })
     }
 
-    fn code_format(&self, format: &egui::TextFormat) -> egui::TextFormat {
-        let mut code = format.clone();
-        code.font_id = egui::FontId::monospace(format.font_id.size);
-        code.background = self.theme.code_bg_color;
-        code.italics = false;
-        code
-    }
-
-    fn inlines(&mut self, inlines: &[Inline], format: &egui::TextFormat) {
+    fn inlines(&mut self, inlines: &[Inline], style: Style) {
         for inline in inlines {
             if self.out.limited {
                 return;
             }
             match inline {
-                Inline::Text(node) => self.value(&node.value, node.meta.span, format),
+                Inline::Text(node) => self.value(&node.value, node.meta.span, style),
                 Inline::Escape(node) => {
-                    self.value(node.value.encode_utf8(&mut [0; 4]), node.meta.span, format)
+                    self.value(node.value.encode_utf8(&mut [0; 4]), node.meta.span, style)
                 }
                 Inline::CharacterReference(node) => {
                     if let Some(value) = node.value() {
-                        self.value(&value, node.meta.span, format);
+                        self.value(&value, node.meta.span, style);
                     } else {
-                        self.literal(node.meta.span, format);
+                        self.literal(node.meta.span, style);
                     }
                 }
-                Inline::Emphasis(node) => {
-                    let mut emphasis = format.clone();
-                    emphasis.italics = true;
-                    self.inlines(&node.children, &emphasis);
-                }
-                Inline::Strong(node) => {
-                    let mut strong = format.clone();
-                    strong.color = self.theme.strong_text_color;
-                    self.inlines(&node.children, &strong);
-                }
-                Inline::Delete(node) => {
-                    let mut deleted = format.clone();
-                    deleted.strikethrough = egui::Stroke::new(1.0, format.color);
-                    self.inlines(&node.children, &deleted);
-                }
+                Inline::Emphasis(node) => self.inlines(&node.children, style.with(STYLE_ITALIC)),
+                Inline::Strong(node) => self.inlines(&node.children, style.with(STYLE_STRONG)),
+                Inline::Delete(node) => self.inlines(&node.children, style.with(STYLE_STRIKE)),
                 Inline::Code(node) => {
-                    let code = self.code_format(format);
                     let span = node.meta.span.and_then(|span| {
                         let source = self.source.get(span.start..span.end)?;
                         let width = source.bytes().take_while(|byte| *byte == b'`').count();
@@ -264,17 +232,17 @@ impl Builder<'_> {
                             span.end.saturating_sub(width),
                         ))
                     });
-                    self.value(&node.value, span, &code);
+                    self.value(&node.value, span, style.code(false));
                 }
-                Inline::Link(node) => self.inlines(&node.children, format),
-                Inline::LinkReference(node) => self.inlines(&node.children, format),
-                Inline::Image(node) => self.inlines(&node.alt, format),
-                Inline::ImageReference(node) => self.inlines(&node.alt, format),
-                Inline::Autolink(node) => self.value(&node.text, node.meta.span, format),
+                Inline::Link(node) => self.inlines(&node.children, style),
+                Inline::LinkReference(node) => self.inlines(&node.children, style),
+                Inline::Image(node) => self.inlines(&node.alt, style),
+                Inline::ImageReference(node) => self.inlines(&node.alt, style),
+                Inline::Autolink(node) => self.value(&node.text, node.meta.span, style),
                 Inline::SoftBreak(_) | Inline::LineBreak(_) => {
-                    self.value("\n", inline.span(), format)
+                    self.value("\n", inline.span(), style)
                 }
-                _ => self.literal(inline.span(), format),
+                _ => self.literal(inline.span(), style),
             }
         }
     }
