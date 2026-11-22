@@ -1,6 +1,6 @@
 //! Source-bound Qwen3-ASR metadata, tokenizer and tensor catalog checks.
 
-use super::{Index, Value, invalid};
+use super::{Index, LINEAR_TYPES, Value, invalid};
 use crate::{protocol::PromptTokens, tokenizer::Tokenizer};
 use std::io;
 
@@ -249,8 +249,6 @@ fn validate_frontend(index: &Index) -> io::Result<()> {
 fn validate_catalog(index: &Index) -> io::Result<()> {
     validate_decoder(index, validate_encoder(index)?)
 }
-
-const LINEAR_TYPES: &[u32] = &[0, 1, 2, 3, 6, 7, 8, 12, 13, 14, 30];
 
 fn validate_encoder(index: &Index) -> io::Result<u64> {
     let encoder = |key: &str| index.positive(&format!("stt.qwen3_asr.encoder.{key}"));

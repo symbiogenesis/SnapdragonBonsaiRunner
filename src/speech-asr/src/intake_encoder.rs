@@ -1,6 +1,10 @@
 //! Source-bound CNN/encoder and exact supported frontend metadata intake.
 
-use super::{Index, decoder::Loader, invalid};
+use super::{
+    Index,
+    decoder::{BlockLoader, CancellableLoader, Loader},
+    invalid,
+};
 use crate::{
     encoder::{Block, Config, Encoder, Linear, Norm, Weights},
     frontend::Frontend,
@@ -55,24 +59,31 @@ fn frontend_metadata(index: &Index) -> io::Result<()> {
     Ok(())
 }
 
-fn linear<R: Read + Seek>(
-    loader: &mut Loader<'_, R>,
-    prefix: &str,
-    cancel: &mut impl FnMut() -> bool,
-) -> io::Result<Linear> {
+fn linear(loader: &mut impl BlockLoader, prefix: &str) -> io::Result<Linear> {
     Ok(Linear {
-        weights: loader.projection(&format!("{prefix}.weight"), cancel)?,
-        bias: loader.vector(&format!("{prefix}.bias"), cancel)?,
+        weights: loader.projection(&format!("{prefix}.weight"))?,
+        bias: loader.vector(&format!("{prefix}.bias"))?,
     })
 }
-fn norm<R: Read + Seek>(
-    loader: &mut Loader<'_, R>,
-    prefix: &str,
-    cancel: &mut impl FnMut() -> bool,
-) -> io::Result<Norm> {
+
+fn norm(loader: &mut impl BlockLoader, prefix: &str) -> io::Result<Norm> {
     Ok(Norm {
-        weight: loader.vector(&format!("{prefix}.weight"), cancel)?,
-        bias: loader.vector(&format!("{prefix}.bias"), cancel)?,
+        weight: loader.vector(&format!("{prefix}.weight"))?,
+        bias: loader.vector(&format!("{prefix}.bias"))?,
+    })
+}
+
+fn load_encoder_block(loader: &mut impl BlockLoader, layer: usize) -> io::Result<Block> {
+    let prefix = format!("enc.blocks.{layer}.");
+    Ok(Block {
+        attention_norm: norm(loader, &(prefix.clone() + "norm_attn"))?,
+        ffn_norm: norm(loader, &(prefix.clone() + "norm_ffn"))?,
+        query: linear(loader, &(prefix.clone() + "attn.q"))?,
+        key: linear(loader, &(prefix.clone() + "attn.k"))?,
+        value: linear(loader, &(prefix.clone() + "attn.v"))?,
+        attention_out: linear(loader, &(prefix.clone() + "attn.out"))?,
+        ffn_in: linear(loader, &(prefix.clone() + "ffn.fc1"))?,
+        ffn_out: linear(loader, &(prefix + "ffn.fc2"))?,
     })
 }
 
@@ -85,26 +96,18 @@ pub(super) fn load<R: Read + Seek>(
     let (c, layers, frontend, convolutions) = load_encoder_prefix(index, &mut loader, cancel)?;
     let mut blocks = Vec::new();
     blocks.try_reserve_exact(layers).map_err(io::Error::other)?;
+    let mut block_loader = CancellableLoader::new(&mut loader, cancel);
     for layer in 0..layers {
-        let prefix = format!("enc.blocks.{layer}.");
-        blocks.push(Block {
-            attention_norm: norm(&mut loader, &(prefix.clone() + "norm_attn"), cancel)?,
-            ffn_norm: norm(&mut loader, &(prefix.clone() + "norm_ffn"), cancel)?,
-            query: linear(&mut loader, &(prefix.clone() + "attn.q"), cancel)?,
-            key: linear(&mut loader, &(prefix.clone() + "attn.k"), cancel)?,
-            value: linear(&mut loader, &(prefix.clone() + "attn.v"), cancel)?,
-            attention_out: linear(&mut loader, &(prefix.clone() + "attn.out"), cancel)?,
-            ffn_in: linear(&mut loader, &(prefix.clone() + "ffn.fc1"), cancel)?,
-            ffn_out: linear(&mut loader, &(prefix + "ffn.fc2"), cancel)?,
-        });
+        blocks.push(load_encoder_block(&mut block_loader, layer)?);
     }
+    let convolution_out = block_loader.projection("enc.conv_out.weight")?;
     let weights = Weights {
         convolutions,
-        convolution_out: loader.projection("enc.conv_out.weight", cancel)?,
+        convolution_out,
         blocks,
-        output_norm: norm(&mut loader, "enc.ln_post", cancel)?,
-        output_in: linear(&mut loader, "enc.proj1", cancel)?,
-        output_out: linear(&mut loader, "enc.proj2", cancel)?,
+        output_norm: norm(&mut block_loader, "enc.ln_post")?,
+        output_in: linear(&mut block_loader, "enc.proj1")?,
+        output_out: linear(&mut block_loader, "enc.proj2")?,
     };
     Ok((Encoder::new(c, weights)?, frontend))
 }
@@ -115,9 +118,7 @@ pub(super) fn load_mapped(
     mapping: &std::sync::Arc<bonsai_windows_process::MappedFile>,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<(Encoder, Frontend)> {
-    use super::decoder::MappedSliceLoader;
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::decoder::{MappedSliceLoader, load_mapped_blocks};
 
     let mut cursor = io::Cursor::new(mapping.as_slice());
     let mut loader = Loader::new_mapped(index, &mut cursor, mapping);
@@ -148,58 +149,18 @@ pub(super) fn load_mapped(
         }
     }
     loader.remaining = remaining;
-    if cancel() {
-        return Err(io::Error::from(io::ErrorKind::Interrupted));
-    }
-    let linear_mapped = |prefix: &str| -> io::Result<Linear> {
-        Ok(Linear {
-            weights: slice_loader.projection(&format!("{prefix}.weight"))?,
-            bias: slice_loader.vector(&format!("{prefix}.bias"))?,
-        })
-    };
-    let norm_mapped = |prefix: &str| -> io::Result<Norm> {
-        Ok(Norm {
-            weight: slice_loader.vector(&format!("{prefix}.weight"))?,
-            bias: slice_loader.vector(&format!("{prefix}.bias"))?,
-        })
-    };
-    let abort = AtomicBool::new(false);
-    let blocks = (0..layers)
-        .into_par_iter()
-        .map(|layer| {
-            if abort.load(Ordering::Acquire) {
-                return Err(invalid());
-            }
-            let prefix = format!("enc.blocks.{layer}.");
-            let load_block = || -> io::Result<Block> {
-                Ok(Block {
-                    attention_norm: norm_mapped(&(prefix.clone() + "norm_attn"))?,
-                    ffn_norm: norm_mapped(&(prefix.clone() + "norm_ffn"))?,
-                    query: linear_mapped(&(prefix.clone() + "attn.q"))?,
-                    key: linear_mapped(&(prefix.clone() + "attn.k"))?,
-                    value: linear_mapped(&(prefix.clone() + "attn.v"))?,
-                    attention_out: linear_mapped(&(prefix.clone() + "attn.out"))?,
-                    ffn_in: linear_mapped(&(prefix.clone() + "ffn.fc1"))?,
-                    ffn_out: linear_mapped(&(prefix + "ffn.fc2"))?,
-                })
-            };
-            let res = load_block();
-            if res.is_err() {
-                abort.store(true, Ordering::Release);
-            }
-            res
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    if cancel() {
-        return Err(io::Error::from(io::ErrorKind::Interrupted));
-    }
+    let blocks = load_mapped_blocks(layers, cancel, |layer| {
+        let mut s = &slice_loader;
+        load_encoder_block(&mut s, layer)
+    })?;
+    let mut tail_loader = CancellableLoader::new(&mut loader, cancel);
     let weights = Weights {
         convolutions,
-        convolution_out: loader.projection("enc.conv_out.weight", cancel)?,
+        convolution_out: tail_loader.projection("enc.conv_out.weight")?,
         blocks,
-        output_norm: norm(&mut loader, "enc.ln_post", cancel)?,
-        output_in: linear(&mut loader, "enc.proj1", cancel)?,
-        output_out: linear(&mut loader, "enc.proj2", cancel)?,
+        output_norm: norm(&mut tail_loader, "enc.ln_post")?,
+        output_in: linear(&mut tail_loader, "enc.proj1")?,
+        output_out: linear(&mut tail_loader, "enc.proj2")?,
     };
     Ok((Encoder::new(c, weights)?, frontend))
 }
