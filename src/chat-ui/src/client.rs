@@ -72,41 +72,71 @@ const CONTROL_TOKEN_MESSAGE: &str = "This conversation contains reserved chat ma
 const RATE_LIMIT_MESSAGE: &str =
     "Too many messages were sent in a short time. Wait a moment, then send again.";
 const TEARDOWN_FAILURE_MESSAGE: &str = "The local model's owned processes could not be confirmed stopped. Copy any conversation or drafts you want to keep, then close this app before launching again.";
-const NATIVE_IDENTITY_RELEASE_PIN_MESSAGE: &str = "Swift's compiled Rust runtime version check failed readiness verification. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_FRAMING_MESSAGE: &str = "The local Rust runtime returned an unexpected readiness response format. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_SCHEMA_MESSAGE: &str = "The local Rust runtime returned an unsupported readiness schema. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_MODEL_MESSAGE: &str = "The loaded local model identity did not match Swift's compiled contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_CONTEXT_TOKENS_MESSAGE: &str = "The local Rust runtime reported a different context window than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_ROW_WORKERS_MESSAGE: &str = "The local Rust runtime reported a different worker count than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_PROMPT_REUSE_MESSAGE: &str = "The local Rust runtime reported a different prompt-reuse setting than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_KV_CACHE_GRAPH_MESSAGE: &str = "The local Rust runtime's compiled KV-cache or adapter graph identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_PLACEMENT_MESSAGE: &str = "The local Rust runtime reported a different accelerator placement than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_STARTUP_PROJECTION_MESSAGE: &str = "The local Rust runtime did not report the expected startup projection state. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_ADAPTER_MESSAGE: &str = "The local Rust runtime's loaded LoRA adapter identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_VISION_MESSAGE: &str = "The local Rust runtime's vision projector identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_CPU_PREFILL_MESSAGE: &str = "The local Rust runtime's tiled CPU prefill configuration did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
-const NATIVE_IDENTITY_CPU_SPECULATION_MESSAGE: &str = "The local Rust runtime's speculative decoding configuration did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
+const NATIVE_IDENTITY_GUIDANCE: &[(&str, &str)] = &[
+    (
+        "Native identity verification failed: reason=release-pin.",
+        "Swift's compiled Rust runtime version check failed readiness verification. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=framing.",
+        "The local Rust runtime returned an unexpected readiness response format. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=schema.",
+        "The local Rust runtime returned an unsupported readiness schema. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=model.",
+        "The loaded local model identity did not match Swift's compiled contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=context-tokens.",
+        "The local Rust runtime reported a different context window than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=row-workers.",
+        "The local Rust runtime reported a different worker count than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=prompt-reuse.",
+        "The local Rust runtime reported a different prompt-reuse setting than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=kv-cache-graph.",
+        "The local Rust runtime's compiled KV-cache or adapter graph identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=placement.",
+        "The local Rust runtime reported a different accelerator placement than Swift selected. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=startup-projection.",
+        "The local Rust runtime did not report the expected startup projection state. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=adapter.",
+        "The local Rust runtime's loaded LoRA adapter identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=vision.",
+        "The local Rust runtime's vision projector identity did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=cpu-prefill.",
+        "The local Rust runtime's tiled CPU prefill configuration did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+    (
+        "Native identity verification failed: reason=cpu-speculation.",
+        "The local Rust runtime's speculative decoding configuration did not match Swift's contract. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
+    ),
+];
 const POLICY_FAILURE_MESSAGE: &str = "The local model launch policy rejected the current environment or configuration. Restart Swift from a clean session without model or runtime environment overrides. Completed conversation turns remain in memory.";
 const PATH_OR_CREDENTIALS_FAILURE_MESSAGE: &str = "Swift could not safely access its local data or temporary credential folder without links or redirects. Check folder permissions and local storage, then close and reopen Swift. Completed conversation turns remain in memory.";
 const ARGUMENTS_FAILURE_MESSAGE: &str = "The app and local broker disagreed on launch options. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.";
 const SANDBOX_REBOOT_PENDING_MESSAGE: &str = "Windows Update has a pending restart required for the native Windows sandbox (PSEC 1.1). Restart Windows, then reopen Swift. Completed conversation turns remain in memory.";
 const SANDBOX_UNAVAILABLE_OFFLINE_MESSAGE: &str = "This Windows build lacks the required native Windows sandbox (PSEC 1.1). Install the latest Windows updates, restart Windows, and reopen Swift. Completed conversation turns remain in memory.";
 const SANDBOX_UNAVAILABLE_LOOPBACK_MESSAGE: &str = "The required native Windows sandbox is unavailable. Update Windows to a build with process containment and container-hosted loopback support, restart Windows, and reopen Swift. Completed conversation turns remain in memory.";
-const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 20] = [
-    NATIVE_IDENTITY_RELEASE_PIN_MESSAGE,
-    NATIVE_IDENTITY_FRAMING_MESSAGE,
-    NATIVE_IDENTITY_SCHEMA_MESSAGE,
-    NATIVE_IDENTITY_MODEL_MESSAGE,
-    NATIVE_IDENTITY_CONTEXT_TOKENS_MESSAGE,
-    NATIVE_IDENTITY_ROW_WORKERS_MESSAGE,
-    NATIVE_IDENTITY_PROMPT_REUSE_MESSAGE,
-    NATIVE_IDENTITY_KV_CACHE_GRAPH_MESSAGE,
-    NATIVE_IDENTITY_PLACEMENT_MESSAGE,
-    NATIVE_IDENTITY_STARTUP_PROJECTION_MESSAGE,
-    NATIVE_IDENTITY_ADAPTER_MESSAGE,
-    NATIVE_IDENTITY_VISION_MESSAGE,
-    NATIVE_IDENTITY_CPU_PREFILL_MESSAGE,
-    NATIVE_IDENTITY_CPU_SPECULATION_MESSAGE,
+const NON_RETRYABLE_STARTUP_MESSAGES: [&str; 6] = [
     POLICY_FAILURE_MESSAGE,
     PATH_OR_CREDENTIALS_FAILURE_MESSAGE,
     ARGUMENTS_FAILURE_MESSAGE,
@@ -133,8 +163,12 @@ pub(crate) const fn default_abliteration_scale() -> f32 {
     DEFAULT_ABLITERATION_SCALE
 }
 
-pub(crate) fn valid_abliteration_scale(scale: f32) -> bool {
+pub(crate) fn valid_adapter_scale(scale: f32) -> bool {
     scale.is_finite() && (0.0..=2.0).contains(&scale)
+}
+
+pub(crate) fn valid_abliteration_scale(scale: f32) -> bool {
+    valid_adapter_scale(scale)
 }
 
 pub(crate) const fn default_daisyrose_scale() -> f32 {
@@ -142,7 +176,7 @@ pub(crate) const fn default_daisyrose_scale() -> f32 {
 }
 
 pub(crate) fn valid_daisyrose_scale(scale: f32) -> bool {
-    scale.is_finite() && (0.0..=2.0).contains(&scale)
+    valid_adapter_scale(scale)
 }
 
 /// Broker-reported DaisyRose multi-rank `LoRA` readiness and default scale (in tenths `0..=20`).
@@ -181,6 +215,15 @@ impl KvCache {
             Self::Rsq4K3v => "rsq4k3v",
         }
     }
+
+    pub(crate) fn from_cli(value: &str) -> Option<Self> {
+        match value {
+            "f16" => Some(Self::F16),
+            "rsq4" => Some(Self::Rsq4),
+            "rsq4k3v" => Some(Self::Rsq4K3v),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,6 +237,14 @@ impl Placement {
         match self {
             Self::Auto => "auto",
             Self::Cpu => "cpu",
+        }
+    }
+
+    pub(crate) fn from_cli(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "cpu" => Some(Self::Cpu),
+            _ => None,
         }
     }
 }
@@ -218,6 +269,15 @@ impl PromptReuse {
             Self::PromptEndAndLatest => "prompt-end-and-latest",
         }
     }
+
+    pub(crate) fn from_cli(value: &str) -> Option<Self> {
+        match value {
+            "disabled" => Some(Self::Disabled),
+            "latest" => Some(Self::Latest),
+            "prompt-end-and-latest" => Some(Self::PromptEndAndLatest),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +291,14 @@ impl CpuPrefillGdn {
         match self {
             Self::Sequential => "sequential",
             Self::WyF32 => "wy-f32",
+        }
+    }
+
+    pub(crate) fn from_cli(value: &str) -> Option<Self> {
+        match value {
+            "sequential" => Some(Self::Sequential),
+            "wy-f32" => Some(Self::WyF32),
+            _ => None,
         }
     }
 }
@@ -248,6 +316,14 @@ impl SpeculationType {
             Self::Suffix => "suffix",
         }
     }
+
+    pub(crate) fn from_cli(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "suffix" => Some(Self::Suffix),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,6 +337,14 @@ impl CpuFamily {
         match self {
             Self::X1 => "x1",
             Self::X2 => "x2",
+        }
+    }
+
+    pub(crate) fn from_cli(value: &str) -> Option<Self> {
+        match value {
+            "x1" => Some(Self::X1),
+            "x2" => Some(Self::X2),
+            _ => None,
         }
     }
 
@@ -630,6 +714,9 @@ fn retry_guidance(message: &str) -> String {
     if message == RUNNING_MEMORY_MESSAGE
         || message == PUBLISHER_INIT_FAILURE_MESSAGE
         || NON_RETRYABLE_STARTUP_MESSAGES.contains(&message)
+        || NATIVE_IDENTITY_GUIDANCE
+            .iter()
+            .any(|(_, guidance)| *guidance == message)
     {
         return message.to_owned();
     }
@@ -1091,48 +1178,10 @@ fn native_identity_message(diagnostic: &str) -> Option<&'static str> {
     {
         return None;
     }
-    diagnostic.lines().find_map(|line| match line {
-        "Native identity verification failed: reason=release-pin." => {
-            Some(NATIVE_IDENTITY_RELEASE_PIN_MESSAGE)
-        }
-        "Native identity verification failed: reason=framing." => {
-            Some(NATIVE_IDENTITY_FRAMING_MESSAGE)
-        }
-        "Native identity verification failed: reason=schema." => {
-            Some(NATIVE_IDENTITY_SCHEMA_MESSAGE)
-        }
-        "Native identity verification failed: reason=model." => Some(NATIVE_IDENTITY_MODEL_MESSAGE),
-        "Native identity verification failed: reason=context-tokens." => {
-            Some(NATIVE_IDENTITY_CONTEXT_TOKENS_MESSAGE)
-        }
-        "Native identity verification failed: reason=row-workers." => {
-            Some(NATIVE_IDENTITY_ROW_WORKERS_MESSAGE)
-        }
-        "Native identity verification failed: reason=prompt-reuse." => {
-            Some(NATIVE_IDENTITY_PROMPT_REUSE_MESSAGE)
-        }
-        "Native identity verification failed: reason=kv-cache-graph." => {
-            Some(NATIVE_IDENTITY_KV_CACHE_GRAPH_MESSAGE)
-        }
-        "Native identity verification failed: reason=placement." => {
-            Some(NATIVE_IDENTITY_PLACEMENT_MESSAGE)
-        }
-        "Native identity verification failed: reason=startup-projection." => {
-            Some(NATIVE_IDENTITY_STARTUP_PROJECTION_MESSAGE)
-        }
-        "Native identity verification failed: reason=adapter." => {
-            Some(NATIVE_IDENTITY_ADAPTER_MESSAGE)
-        }
-        "Native identity verification failed: reason=vision." => {
-            Some(NATIVE_IDENTITY_VISION_MESSAGE)
-        }
-        "Native identity verification failed: reason=cpu-prefill." => {
-            Some(NATIVE_IDENTITY_CPU_PREFILL_MESSAGE)
-        }
-        "Native identity verification failed: reason=cpu-speculation." => {
-            Some(NATIVE_IDENTITY_CPU_SPECULATION_MESSAGE)
-        }
-        _ => None,
+    diagnostic.lines().find_map(|line| {
+        NATIVE_IDENTITY_GUIDANCE
+            .iter()
+            .find_map(|(marker, guidance)| (*marker == line).then_some(*guidance))
     })
 }
 
@@ -1234,114 +1283,102 @@ fn read_bounded_file(path: &Path, limit: usize) -> Result<Vec<u8>> {
     ))
 }
 
-fn context_capacity(output: &[u8]) -> Result<Option<usize>> {
+fn complete_startup_lines(output: &[u8]) -> Result<Option<&str>> {
     let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
         return Ok(None);
     };
     let text = std::str::from_utf8(&output[..=end])
         .map_err(|_| Failure::Message("Broker startup output was not valid UTF-8."))?;
-    let mut capacity = None;
+    Ok(Some(text))
+}
+
+fn parse_unique_complete_line<T>(
+    output: &[u8],
+    prefix: &str,
+    duplicate_error: &'static str,
+    mut parse: impl FnMut(&str) -> Result<T>,
+) -> Result<Option<T>> {
+    let Some(text) = complete_startup_lines(output)? else {
+        return Ok(None);
+    };
+    let mut observed = None;
     for line in text.lines() {
-        if let Some(value) = line.strip_prefix("Context tokens: ") {
-            let tokens = value
+        if let Some(value) = line.strip_prefix(prefix) {
+            let parsed = parse(value)?;
+            if observed.replace(parsed).is_some() {
+                return Err(Failure::Message(duplicate_error));
+            }
+        }
+    }
+    Ok(observed)
+}
+
+fn context_capacity(output: &[u8]) -> Result<Option<usize>> {
+    parse_unique_complete_line(
+        output,
+        "Context tokens: ",
+        "The broker reported more than one context capacity.",
+        |value| {
+            value
                 .parse::<usize>()
                 .ok()
                 .filter(|tokens| (1..=crate::context::MAX_CONTEXT_TOKENS).contains(tokens))
                 .filter(|_| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
                 .ok_or(Failure::Message(
                     "The broker reported an invalid context capacity.",
-                ))?;
-            if capacity.replace(tokens).is_some() {
-                return Err(Failure::Message(
-                    "The broker reported more than one context capacity.",
-                ));
-            }
-        }
-    }
-    Ok(capacity)
+                ))
+        },
+    )
 }
 
 fn input_modalities(output: &[u8]) -> Result<Option<bool>> {
-    let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
-        return Ok(None);
-    };
-    let text = std::str::from_utf8(&output[..=end])
-        .map_err(|_| Failure::Message("Broker startup output was not valid UTF-8."))?;
-    let mut vision = None;
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("Input modalities: ") {
-            let parsed = match value {
-                "text, image" => true,
-                "text" => false,
-                _ => {
-                    return Err(Failure::Message(
-                        "The broker reported unsupported input modalities.",
-                    ));
-                }
-            };
-            if vision.replace(parsed).is_some() {
-                return Err(Failure::Message(
-                    "The broker reported input modalities more than once.",
-                ));
-            }
-        }
-    }
-    Ok(vision)
+    parse_unique_complete_line(
+        output,
+        "Input modalities: ",
+        "The broker reported input modalities more than once.",
+        |value| match value {
+            "text, image" => Ok(true),
+            "text" => Ok(false),
+            _ => Err(Failure::Message(
+                "The broker reported unsupported input modalities.",
+            )),
+        },
+    )
 }
 
 fn daisyrose_adapter(output: &[u8]) -> Result<Option<DaisyRoseReadiness>> {
-    let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
-        return Ok(None);
-    };
-    let text = std::str::from_utf8(&output[..=end])
-        .map_err(|_| Failure::Message("Broker startup output was not valid UTF-8."))?;
-    let mut status = None;
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("DaisyRose adapter: ") {
-            let parsed = if value == "unavailable" {
-                DaisyRoseReadiness::default()
-            } else if let Some(scale) = value.strip_prefix("available, default scale ") {
-                let [whole, b'.', frac] = scale.as_bytes() else {
-                    return Err(Failure::Message(
-                        "The broker reported an unsupported DaisyRose adapter status.",
-                    ));
-                };
-                if !(b'0'..=b'2').contains(whole) || !frac.is_ascii_digit() {
-                    return Err(Failure::Message(
-                        "The broker reported an unsupported DaisyRose adapter status.",
-                    ));
-                }
-                let tenths = (*whole - b'0') * 10 + (*frac - b'0');
-                if tenths > 20 {
-                    return Err(Failure::Message(
-                        "The broker reported an unsupported DaisyRose adapter status.",
-                    ));
-                }
-                DaisyRoseReadiness {
-                    available: true,
-                    default_scale_tenths: tenths,
-                }
-            } else {
-                return Err(Failure::Message(
-                    "The broker reported an unsupported DaisyRose adapter status.",
-                ));
-            };
-            if status.replace(parsed).is_some() {
-                return Err(Failure::Message(
-                    "The broker reported DaisyRose adapter status more than once.",
-                ));
+    parse_unique_complete_line(
+        output,
+        "DaisyRose adapter: ",
+        "The broker reported DaisyRose adapter status more than once.",
+        |value| {
+            if value == "unavailable" {
+                return Ok(DaisyRoseReadiness::default());
             }
-        }
-    }
-    Ok(status)
+            if let Some(scale) = value.strip_prefix("available, default scale ")
+                && let [whole, b'.', frac] = scale.as_bytes()
+                && (b'0'..=b'2').contains(whole)
+                && frac.is_ascii_digit()
+            {
+                let tenths = (*whole - b'0') * 10 + (*frac - b'0');
+                if tenths <= 20 {
+                    return Ok(DaisyRoseReadiness {
+                        available: true,
+                        default_scale_tenths: tenths,
+                    });
+                }
+            }
+            Err(Failure::Message(
+                "The broker reported an unsupported DaisyRose adapter status.",
+            ))
+        },
+    )
 }
 
 fn evidence_directory(output: &[u8]) -> Result<Option<PathBuf>> {
-    let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
+    let Some(text) = complete_startup_lines(output)? else {
         return Ok(None);
     };
-    let text = std::str::from_utf8(&output[..=end])
-        .map_err(|_| Failure::Message("Broker startup output was not valid UTF-8."))?;
     // Only complete lines are considered: a poll may observe a partial write.
     for line in text
         .split_inclusive('\n')
@@ -1449,12 +1486,12 @@ fn serialize_request_with_adapters(
     abliteration_scale: Option<f32>,
     daisyrose_scale: Option<f32>,
 ) -> Result<Vec<u8>> {
-    if abliteration_scale.is_some_and(|scale| !valid_abliteration_scale(scale)) {
+    if abliteration_scale.is_some_and(|scale| !valid_adapter_scale(scale)) {
         return Err(Failure::Rejected(
             "Choose an abliteration scale between 0 and 2.",
         ));
     }
-    if daisyrose_scale.is_some_and(|scale| !valid_daisyrose_scale(scale)) {
+    if daisyrose_scale.is_some_and(|scale| !valid_adapter_scale(scale)) {
         return Err(Failure::Rejected(
             "Choose a DaisyRose scale between 0 and 2.",
         ));

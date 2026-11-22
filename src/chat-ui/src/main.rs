@@ -140,6 +140,54 @@ fn configuration(
 }
 
 #[cfg(windows)]
+fn next_str<T>(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    parse: impl FnOnce(&str) -> Option<T>,
+    err: &'static str,
+) -> Result<T, &'static str> {
+    args.next()
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(parse)
+        .ok_or(err)
+}
+
+#[cfg(windows)]
+fn next_path(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    err: &'static str,
+) -> Result<std::path::PathBuf, &'static str> {
+    args.next().map(std::path::PathBuf::from).ok_or(err)
+}
+
+#[cfg(windows)]
+fn next_port(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    err: &'static str,
+) -> Result<u16, &'static str> {
+    next_str(args, |text| text.parse::<u16>().ok(), err)
+}
+
+#[cfg(windows)]
+fn next_strict_decimal(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    min: usize,
+    max: usize,
+    err: &'static str,
+) -> Result<usize, &'static str> {
+    args.next()
+        .and_then(|value| value.into_string().ok())
+        .filter(|text| {
+            !text.is_empty()
+                && !(text.len() > 1 && text.starts_with('0'))
+                && text.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .and_then(|text| text.parse::<usize>().ok())
+        .filter(|count| (min..=max).contains(count))
+        .ok_or(err)
+}
+
+#[cfg(windows)]
 #[expect(
     clippy::too_many_lines,
     reason = "Parse the bounded native launcher contract without accepting arbitrary service arguments."
@@ -148,7 +196,6 @@ fn configuration_for_family(
     args: impl IntoIterator<Item = std::ffi::OsString>,
     host_family: HostFamily,
 ) -> Result<client::Config, &'static str> {
-    use std::path::PathBuf;
     let mut args = args.into_iter();
     let (mut broker, mut data, mut evidence) = (None, None, None);
     let (mut frontend_port, mut backend_port) = (None, None);
@@ -181,10 +228,10 @@ fn configuration_for_family(
             Some("--require-broker-pipe") if !require_broker_pipe => require_broker_pipe = true,
             Some("--no-abliterate-lora") if !no_abliterate_lora => no_abliterate_lora = true,
             Some("--daisyrose-lora") if daisyrose_lora.is_none() => {
-                daisyrose_lora = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("A DaisyRose multi-rank LoRA GGUF path is required.")?,
-                ));
+                daisyrose_lora = Some(next_path(
+                    &mut args,
+                    "A DaisyRose multi-rank LoRA GGUF path is required.",
+                )?);
             }
             Some("--no-daisyrose-lora") if !no_daisyrose_lora => no_daisyrose_lora = true,
             Some("--no-mmproj") if !no_mmproj => no_mmproj = true,
@@ -197,225 +244,180 @@ fn configuration_for_family(
             Some("--native-engine") if native_engine.is_none() => native_engine = Some(true),
             Some("--publisher-engine") if native_engine.is_none() => native_engine = Some(false),
             Some("--native-row-workers") if native_row_workers.is_none() => {
-                native_row_workers = Some(
-                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("1") => 1,
-                        Some("4") => 4,
-                        Some("8") => 8,
-                        Some("12") => 12,
-                        _ => return Err("Native row workers must be 1, 4, 8 or 12."),
+                native_row_workers = Some(next_str(
+                    &mut args,
+                    |text| match text {
+                        "1" => Some(1),
+                        "4" => Some(4),
+                        "8" => Some(8),
+                        "12" => Some(12),
+                        _ => None,
                     },
-                );
+                    "Native row workers must be 1, 4, 8 or 12.",
+                )?);
             }
             Some("--prompt-reuse") if prompt_reuse.is_none() => {
-                prompt_reuse = Some(
-                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("disabled") => client::PromptReuse::Disabled,
-                        Some("latest") => client::PromptReuse::Latest,
-                        Some("prompt-end-and-latest") => client::PromptReuse::PromptEndAndLatest,
-                        _ => {
-                            return Err(
-                                "Prompt reuse must be disabled, latest or prompt-end-and-latest.",
-                            );
-                        }
-                    },
-                );
+                prompt_reuse = Some(next_str(
+                    &mut args,
+                    client::PromptReuse::from_cli,
+                    "Prompt reuse must be disabled, latest or prompt-end-and-latest.",
+                )?);
             }
             Some("--prompt-reuse-checkpoints") if prompt_reuse_checkpoints.is_none() => {
-                prompt_reuse_checkpoints = Some(
-                    args.next()
-                        .and_then(|value| value.into_string().ok())
-                        .filter(|text| {
-                            !text.is_empty()
-                                && !(text.len() > 1 && text.starts_with('0'))
-                                && text.bytes().all(|byte| byte.is_ascii_digit())
-                        })
-                        .and_then(|text| text.parse::<u8>().ok())
-                        .filter(|count| (1..=8).contains(count))
-                        .ok_or("Prompt reuse checkpoints must be between 1 and 8.")?,
-                );
+                let count = next_strict_decimal(
+                    &mut args,
+                    1,
+                    8,
+                    "Prompt reuse checkpoints must be between 1 and 8.",
+                )?;
+                prompt_reuse_checkpoints = u8::try_from(count).ok();
             }
             Some("--prompt-reuse-checkpoint-bytes") if prompt_reuse_checkpoint_bytes.is_none() => {
-                prompt_reuse_checkpoint_bytes = Some(
-                    args.next()
-                        .and_then(|value| value.into_string().ok())
-                        .filter(|text| {
-                            !text.is_empty()
-                                && !(text.len() > 1 && text.starts_with('0'))
-                                && text.bytes().all(|byte| byte.is_ascii_digit())
-                        })
-                        .and_then(|text| text.parse::<usize>().ok())
-                        .filter(|bytes| *bytes > 0)
-                        .ok_or("Prompt reuse checkpoint bytes must be a positive integer.")?,
-                );
+                prompt_reuse_checkpoint_bytes = Some(next_strict_decimal(
+                    &mut args,
+                    1,
+                    usize::MAX,
+                    "Prompt reuse checkpoint bytes must be a positive integer.",
+                )?);
             }
             Some("--kv-cache") if kv_cache.is_none() => {
-                kv_cache = Some(
-                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("f16") => client::KvCache::F16,
-                        Some("rsq4") => client::KvCache::Rsq4,
-                        Some("rsq4k3v") => client::KvCache::Rsq4K3v,
-                        _ => return Err("KV cache must be f16, rsq4 or rsq4k3v."),
-                    },
-                );
+                kv_cache = Some(next_str(
+                    &mut args,
+                    client::KvCache::from_cli,
+                    "KV cache must be f16, rsq4 or rsq4k3v.",
+                )?);
             }
             Some("--cpu-prefill-tokens") if cpu_prefill_tokens.is_none() => {
-                cpu_prefill_tokens = Some(
-                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("8") => 8_u8,
-                        Some("16") => 16_u8,
-                        Some("32") => 32_u8,
-                        _ => return Err("CPU prefill tokens must be 8, 16 or 32."),
+                cpu_prefill_tokens = Some(next_str(
+                    &mut args,
+                    |text| match text {
+                        "8" => Some(8_u8),
+                        "16" => Some(16_u8),
+                        "32" => Some(32_u8),
+                        _ => None,
                     },
-                );
+                    "CPU prefill tokens must be 8, 16 or 32.",
+                )?);
             }
             Some("--cpu-prefill-gdn") if cpu_prefill_gdn.is_none() => {
-                cpu_prefill_gdn = Some(
-                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("sequential") => client::CpuPrefillGdn::Sequential,
-                        Some("wy-f32") => client::CpuPrefillGdn::WyF32,
-                        _ => return Err("CPU prefill GDN mode must be sequential or wy-f32."),
-                    },
-                );
+                cpu_prefill_gdn = Some(next_str(
+                    &mut args,
+                    client::CpuPrefillGdn::from_cli,
+                    "CPU prefill GDN mode must be sequential or wy-f32.",
+                )?);
             }
             Some("--spec-type") if spec_type.is_none() => {
-                spec_type = Some(
-                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("none") => client::SpeculationType::None,
-                        Some("suffix") => client::SpeculationType::Suffix,
-                        _ => return Err("Speculation type must be none or suffix."),
-                    },
-                );
+                spec_type = Some(next_str(
+                    &mut args,
+                    client::SpeculationType::from_cli,
+                    "Speculation type must be none or suffix.",
+                )?);
             }
             Some("--draft-max") if draft_max.is_none() => {
-                draft_max = Some(
-                    args.next()
-                        .and_then(|value| value.into_string().ok())
-                        .filter(|text| {
-                            !text.is_empty()
-                                && !(text.len() > 1 && text.starts_with('0'))
-                                && text.bytes().all(|byte| byte.is_ascii_digit())
-                        })
-                        .and_then(|text| text.parse::<u8>().ok())
-                        .filter(|count| (1..=8).contains(count))
-                        .ok_or("Draft max must be between 1 and 8.")?,
-                );
+                let count =
+                    next_strict_decimal(&mut args, 1, 8, "Draft max must be between 1 and 8.")?;
+                draft_max = u8::try_from(count).ok();
             }
             Some("--cpu-family") if cpu_family.is_none() => {
-                cpu_family = Some(
-                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("x1") => client::CpuFamily::X1,
-                        Some("x2") => client::CpuFamily::X2,
-                        _ => return Err("CPU family must be x1 or x2."),
-                    },
-                );
+                cpu_family = Some(next_str(
+                    &mut args,
+                    client::CpuFamily::from_cli,
+                    "CPU family must be x1 or x2.",
+                )?);
             }
             Some("--placement") if placement.is_none() => {
-                placement = Some(
-                    match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
-                        Some("auto") => client::Placement::Auto,
-                        Some("cpu") => client::Placement::Cpu,
-                        _ => return Err("Placement must be auto or cpu."),
-                    },
-                );
+                placement = Some(next_str(
+                    &mut args,
+                    client::Placement::from_cli,
+                    "Placement must be auto or cpu.",
+                )?);
             }
-            Some("--broker-path") if broker.is_none() => broker = args.next().map(PathBuf::from),
-            Some("--data-directory") if data.is_none() => data = args.next().map(PathBuf::from),
+            Some("--broker-path") if broker.is_none() => {
+                broker = args.next().map(std::path::PathBuf::from);
+            }
+            Some("--data-directory") if data.is_none() => {
+                data = args.next().map(std::path::PathBuf::from);
+            }
             Some("--evidence-directory") if evidence.is_none() => {
-                evidence = args.next().map(PathBuf::from);
+                evidence = args.next().map(std::path::PathBuf::from);
             }
             Some("--frontend-port") if frontend_port.is_none() => {
-                frontend_port = Some(
-                    args.next()
-                        .and_then(|arg| arg.to_str().and_then(|text| text.parse::<u16>().ok()))
-                        .ok_or("Invalid frontend port.")?,
-                );
+                frontend_port = Some(next_port(&mut args, "Invalid frontend port.")?);
             }
             Some("--backend-port") if backend_port.is_none() => {
-                backend_port = Some(
-                    args.next()
-                        .and_then(|arg| arg.to_str().and_then(|text| text.parse::<u16>().ok()))
-                        .ok_or("Invalid backend port.")?,
-                );
+                backend_port = Some(next_port(&mut args, "Invalid backend port.")?);
             }
             Some("--canary-port") if canary_port.is_none() => {
-                canary_port = Some(
-                    args.next()
-                        .and_then(|arg| arg.to_str().and_then(|text| text.parse::<u16>().ok()))
-                        .ok_or("Invalid Qwen3-ASR port.")?,
-                );
+                canary_port = Some(next_port(&mut args, "Invalid Qwen3-ASR port.")?);
             }
             Some("--canary-key-file") if canary_key_file.is_none() => {
-                canary_key_file = args.next().map(PathBuf::from);
-                if canary_key_file.is_none() {
-                    return Err("A Qwen3-ASR key-file path is required.");
-                }
+                canary_key_file = Some(next_path(
+                    &mut args,
+                    "A Qwen3-ASR key-file path is required.",
+                )?);
             }
             Some("--tts-port") if tts_port.is_none() => {
-                tts_port = Some(
-                    args.next()
-                        .and_then(|arg| arg.to_str().and_then(|text| text.parse::<u16>().ok()))
-                        .ok_or("Invalid Qwen TTS port.")?,
-                );
+                tts_port = Some(next_port(&mut args, "Invalid Qwen TTS port.")?);
             }
             Some("--tts-key-file") if tts_key_file.is_none() => {
-                tts_key_file = args.next().map(PathBuf::from);
-                if tts_key_file.is_none() {
-                    return Err("A Qwen TTS key-file path is required.");
-                }
+                tts_key_file = Some(next_path(
+                    &mut args,
+                    "A Qwen TTS key-file path is required.",
+                )?);
             }
             Some("--canary-executable") if canary_executable.is_none() => {
-                canary_executable = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("A native Qwen3-ASR executable path is required.")?,
-                ));
+                canary_executable = Some(next_path(
+                    &mut args,
+                    "A native Qwen3-ASR executable path is required.",
+                )?);
             }
             Some("--canary-model") if canary_model.is_none() => {
-                canary_model = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("A Qwen3-ASR GGUF model path is required.")?,
-                ));
+                canary_model = Some(next_path(
+                    &mut args,
+                    "A Qwen3-ASR GGUF model path is required.",
+                )?);
             }
             Some("--tts-executable") if tts_executable.is_none() => {
-                tts_executable = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("A native Qwen TTS executable path is required.")?,
-                ));
+                tts_executable = Some(next_path(
+                    &mut args,
+                    "A native Qwen TTS executable path is required.",
+                )?);
             }
             Some("--tts-model") if tts_model.is_none() => {
-                tts_model = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("A Qwen TTS GGUF model path is required.")?,
-                ));
+                tts_model = Some(next_path(
+                    &mut args,
+                    "A Qwen TTS GGUF model path is required.",
+                )?);
             }
             Some("--tts-codec") if tts_codec.is_none() => {
-                tts_codec = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("A Qwen TTS codec GGUF path is required.")?,
-                ));
+                tts_codec = Some(next_path(
+                    &mut args,
+                    "A Qwen TTS codec GGUF path is required.",
+                )?);
             }
             Some("--tts-voice-model") if tts_voice_model.is_none() => {
-                tts_voice_model = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("A Qwen TTS Base voice GGUF path is required.")?,
-                ));
+                tts_voice_model = Some(next_path(
+                    &mut args,
+                    "A Qwen TTS Base voice GGUF path is required.",
+                )?);
             }
             Some("--tts-quantization") if tts_quantization.is_none() => {
-                let value = args.next().ok_or("A TTS quantization is required.")?;
-                if !matches!(value.to_str(), Some("Q8_0" | "Q4_K_M")) {
-                    return Err("TTS quantization must be Q8_0 or Q4_K_M.");
-                }
-                tts_quantization = value.into_string().ok();
+                tts_quantization = Some(next_str(
+                    &mut args,
+                    |text| matches!(text, "Q8_0" | "Q4_K_M").then(|| text.to_owned()),
+                    "TTS quantization must be Q8_0 or Q4_K_M.",
+                )?);
             }
             Some("--tts-threads") if tts_threads.is_none() => {
-                tts_threads = Some(
-                    args.next()
-                        .and_then(|value| {
-                            value.to_str().and_then(|text| text.parse::<usize>().ok())
-                        })
-                        .filter(|count| (1..=256).contains(count))
-                        .ok_or("TTS threads must be between 1 and 256.")?,
-                );
+                tts_threads = Some(next_str(
+                    &mut args,
+                    |text| {
+                        text.parse::<usize>()
+                            .ok()
+                            .filter(|count| (1..=256).contains(count))
+                    },
+                    "TTS threads must be between 1 and 256.",
+                )?);
             }
             _ => {
                 return Err(
@@ -568,6 +570,32 @@ fn configuration_for_family(
 }
 
 #[cfg(windows)]
+fn validate_speech_service(
+    service: Option<(&std::path::Path, u16, Option<&native_speech::Launch>)>,
+    has_port: bool,
+    port_required_err: &'static str,
+    key_err: &'static str,
+    service_err: &'static str,
+    used_ports: &[u16],
+) -> Result<(), &'static str> {
+    let Some((key_file, port, launch)) = service else {
+        return if has_port {
+            Err(port_required_err)
+        } else {
+            Ok(())
+        };
+    };
+    bonsai_windows_credentials::validate_external_path(key_file).map_err(|_| key_err)?;
+    if !key_file.is_file() || port < 1024 || used_ports.contains(&port) {
+        return Err(service_err);
+    }
+    if let Some(launch) = launch {
+        launch.validate()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn validate_configuration(
     config: &client::Config,
     has_canary_port: bool,
@@ -593,48 +621,32 @@ fn validate_configuration(
     {
         return Err("Use distinct unprivileged frontend and backend ports.");
     }
-    if has_canary_port && config.canary.is_none() {
-        return Err("Configure --canary-key-file with --canary-port.");
-    }
-    if let Some(canary) = &config.canary {
-        bonsai_windows_credentials::validate_external_path(&canary.key_file)
-            .map_err(|_| "Use an expanded absolute external Qwen3-ASR key-file path.")?;
-        if !canary.key_file.is_file()
-            || canary.port < 1024
-            || canary.port == config.frontend_port
-            || canary.port == config.backend_port
-        {
-            return Err(
-                "Qwen3-ASR needs an existing key file and a distinct unprivileged local port.",
-            );
-        }
-        if let Some(launch) = &canary.launch {
-            launch.validate()?;
-        }
-    }
-    if has_tts_port && config.qwen_tts.is_none() {
-        return Err("Configure --tts-key-file with --tts-port.");
-    }
-    if let Some(tts) = &config.qwen_tts {
-        bonsai_windows_credentials::validate_external_path(&tts.key_file)
-            .map_err(|_| "Use an expanded absolute external Qwen TTS key-file path.")?;
-        if !tts.key_file.is_file()
-            || tts.port < 1024
-            || tts.port == config.frontend_port
-            || tts.port == config.backend_port
-            || config
-                .canary
-                .as_ref()
-                .is_some_and(|canary| canary.port == tts.port)
-        {
-            return Err(
-                "Qwen TTS needs an existing key file and a distinct unprivileged local port.",
-            );
-        }
-        if let Some(launch) = &tts.launch {
-            launch.validate()?;
-        }
-    }
+    validate_speech_service(
+        config
+            .canary
+            .as_ref()
+            .map(|c| (c.key_file.as_path(), c.port, c.launch.as_ref())),
+        has_canary_port,
+        "Configure --canary-key-file with --canary-port.",
+        "Use an expanded absolute external Qwen3-ASR key-file path.",
+        "Qwen3-ASR needs an existing key file and a distinct unprivileged local port.",
+        &[config.frontend_port, config.backend_port],
+    )?;
+    validate_speech_service(
+        config
+            .qwen_tts
+            .as_ref()
+            .map(|t| (t.key_file.as_path(), t.port, t.launch.as_ref())),
+        has_tts_port,
+        "Configure --tts-key-file with --tts-port.",
+        "Use an expanded absolute external Qwen TTS key-file path.",
+        "Qwen TTS needs an existing key file and a distinct unprivileged local port.",
+        &[
+            config.frontend_port,
+            config.backend_port,
+            config.canary.as_ref().map_or(0, |c| c.port),
+        ],
+    )?;
     Ok(())
 }
 
