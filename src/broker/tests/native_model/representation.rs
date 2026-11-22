@@ -33,35 +33,16 @@ fn profiles(row_workers: u8) -> [AdapterProfile; 2] {
 }
 
 pub(super) fn body() -> Value {
-    let mut body = request(json!([{"role":"user","content":PROMPT}]), true, CAP);
-    body["enable_thinking"] = json!(false);
-    body["abliteration_scale"] = json!(1.3);
-    body
-}
-
-fn digest(bytes: &[u8]) -> String {
-    bonsai_artifacts::hash_reader(
-        &mut io::Cursor::new(bytes),
-        u64::try_from(bytes.len()).unwrap(),
-        &mut [0; 4096],
-        &mut || Ok(()),
-    )
-    .unwrap()
+    prompt_request(PROMPT, 1.3, CAP)
 }
 
 pub(super) fn model_identity(repacked: bool) -> Value {
     if repacked {
-        let export: Value =
-            serde_json::from_str(include_str!("../../../../config/swift.ptq1-export.json"))
-                .unwrap();
+        let export = ptq1_export_lock();
         json!({"filename":export["OutputFilename"], "bytes":export["OutputBytes"],
             "sha256":export["OutputSha256"], "weightRepresentation":"current-repacked-PTQ1_0"})
     } else {
-        let lock: Value = serde_json::from_str(include_str!(
-            "../../../../config/swift-assessment.lock.json"
-        ))
-        .unwrap();
-        let mut identity = lock["model"].clone();
+        let mut identity = model_lock()["model"].clone();
         identity["weightRepresentation"] = json!("PQ2_0");
         identity
     }
@@ -95,13 +76,12 @@ async fn measured_response(
 }
 
 pub(super) fn response_observation(bytes: &[u8], elapsed: Duration) -> Value {
-    let summary = streamed_response(bytes);
-    let mut observed = stream_observation(&summary, CAP);
-    let content = speed::visible_output(bytes);
+    let parsed = parse_stream_response(bytes);
+    let mut observed = stream_observation(&parsed.summary, CAP);
     observed["requestMilliseconds"] = json!(elapsed_milliseconds(elapsed));
-    observed["visibleContentSha256"] = json!(digest(content.as_bytes()));
-    observed["visibleContent"] = json!(content);
-    observed["naturallyStopped"] = json!(summary.finish_reason == "stop");
+    observed["visibleContentSha256"] = json!(adapter_digest(parsed.visible_content.as_bytes()));
+    observed["visibleContent"] = json!(parsed.visible_content);
+    observed["naturallyStopped"] = json!(parsed.summary.finish_reason == "stop");
     observed
 }
 
@@ -132,7 +112,7 @@ async fn record_response(
     };
     if let Some(captured) = &captured {
         report["samples"][index]["responseBytes"] = json!(captured.bytes.len());
-        report["samples"][index]["responseSha256"] = json!(digest(&captured.bytes));
+        report["samples"][index]["responseSha256"] = json!(adapter_digest(&captured.bytes));
         report["samples"][index]["responseParsePassed"] = json!(false);
     }
     save_acceptance_report(evidence, report);
@@ -177,7 +157,7 @@ fn response_pending_reason(stream: &Value) -> Option<&'static str> {
             .as_u64()
             .is_none_or(|n| !(1..=u64::from(CAP)).contains(&n))
         || content.trim().is_empty()
-        || stream["visibleContentSha256"] != digest(content.as_bytes())
+        || stream["visibleContentSha256"] != adapter_digest(content.as_bytes())
         || stream["requestMilliseconds"]
             .as_f64()
             .is_none_or(|ms| !ms.is_finite() || ms <= 0.0))
@@ -515,7 +495,7 @@ fn native_representation_pair_requires_completion_identity_and_cleanup() {
         }
         let mut changed = pair.clone();
         changed[1]["stream"]["visibleContent"] = json!("Elm");
-        changed[1]["stream"]["visibleContentSha256"] = json!(digest(b"Elm"));
+        changed[1]["stream"]["visibleContentSha256"] = json!(adapter_digest(b"Elm"));
         let result = comparison(&changed, row_workers);
         assert_eq!(result["status"], "captured-complete-pair");
         assert!(result["ptq1OverPq2RequestLatency"].is_null());
@@ -538,7 +518,7 @@ pub(super) fn complete_sample(repacked: bool, row_workers: u8) -> Value {
         "powerBefore":power,"powerAfter":power,
         "configuredNativeRowWorkers":row_workers,"verifiedReadinessObserved":true,
         "stream":{"finishReason":"stop","naturallyStopped":true,"reportedCompletionTokens":3,
-            "visibleContent":"Oak","visibleContentSha256":digest(b"Oak"),"requestMilliseconds":1000},
+            "visibleContent":"Oak","visibleContentSha256":adapter_digest(b"Oak"),"requestMilliseconds":1000},
         "cleanup":{"ownedJobEmpty":true,"listenerReleased":true}});
     sample["cleanup"]["backendResources"] = backend_resource_observation(Some(BackendResources {
         sample_count: 2,
@@ -879,12 +859,7 @@ fn native_representation_profile_is_explicit_and_keeps_original_deadline() {
     assert_eq!(body()["max_completion_tokens"], CAP);
     assert_eq!(body()["enable_thinking"], false);
     assert_eq!(body()["abliteration_scale"], 1.3);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        tokio::time::pause();
+    run_paused(async {
         let deadline = tokio::time::Instant::now() + STOP_WAIT;
         let mut started = false;
         assert_eq!(
@@ -970,21 +945,8 @@ fn native_representation_row4_profile_is_explicit_and_preserves_pair() {
 
 #[test]
 fn native_representation_profiles_leave_skipped_arms_pending_at_original_deadline() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        tokio::time::pause();
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Representation-Reserve-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_paused(async {
+        let evidence = TempEvidence::new("Bonsai-Representation-Reserve");
         let deadline = tokio::time::Instant::now() + NEXT_OWNER_RESERVE + Duration::from_secs(1);
         assert!(can_start_owner(deadline));
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -1017,92 +979,89 @@ fn native_representation_profiles_leave_skipped_arms_pending_at_original_deadlin
                 assert_eq!(retained, report);
             }
         }
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
 #[test]
 fn native_representation_complete_bytes_survive_expired_second_request() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            let evidence = env::temp_dir().join(format!("Bonsai-Representation-Partial-{}-{}",
-                std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-            fs::create_dir(&evidence).unwrap();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let fixture = tokio::spawn(async move {
-                for step in 0..2 {
-                    let (peer,_) = listener.accept().await.unwrap();
-                    let mut peer = BufReader::new(peer);
-                    let mut length = None;
-                    loop {
-                        let line = prefix_line(&mut peer,16*1024).await;
-                        if let Some(value) = line.strip_prefix("Content-Length: ") {
-                            length = Some(value.trim().parse::<usize>().unwrap());
-                        }
-                        if line == "\r\n" { break; }
-                    }
-                    let mut bytes = vec![0;length.unwrap()];
-                    peer.read_exact(&mut bytes).await.unwrap();
-                    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(),body());
-                    if step == 0 {
-                        let payload = concat!(
-                            "data: {\"choices\":[{\"delta\":{\"content\":\"cèdre\\n\"},\"finish_reason\":null}]}\n\n",
-                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":3}}\n\n",
-                            "data: [DONE]\n\n");
-                        let response = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n",payload.len());
-                        peer.get_mut().write_all(response.as_bytes()).await.unwrap();
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                        peer.get_mut().write_all(b"0\r\n\r\n").await.unwrap();
-                        peer.get_mut().shutdown().await.unwrap();
-                    } else {
-                        assert_eq!(peer.read(&mut [0]).await.unwrap(),0);
-                    }
+    run_timed(Duration::from_secs(10), async {
+        let evidence = TempEvidence::new("Bonsai-Representation-Partial");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fixture = tokio::spawn(async move {
+            for step in 0..2 {
+                let (peer, _) = listener.accept().await.unwrap();
+                let mut peer = BufReader::new(peer);
+                assert_eq!(read_fixture_request(&mut peer).await, body());
+                if step == 0 {
+                    let payload = concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"cèdre\\n\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":3}}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n",
+                        payload.len()
+                    );
+                    peer.get_mut().write_all(response.as_bytes()).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    peer.get_mut().write_all(b"0\r\n\r\n").await.unwrap();
+                    peer.get_mut().shutdown().await.unwrap();
+                } else {
+                    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
                 }
-            });
-            let deadline = tokio::time::Instant::now()+STOP_WAIT+Duration::from_millis(300);
-            let mut report = json!({"passed":false,"samples":[{},{}]});
-            let captured = record_response(port,"fixture",&evidence,deadline,&mut report,0).await;
-            assert!(captured.is_some());
-            assert!(report["samples"][0]["stream"].is_null());
-            report["samples"][0]["cleanup"] = json!({"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true});
-            assert!(finish_response_after_cleanup(captured.as_ref(),&evidence,&mut report,0));
-            let first: Value = serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-            assert!(record_response(port,"fixture",&evidence,deadline,&mut report,1).await.is_none());
-            fixture.await.unwrap();
-            let saved: Value = serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-            assert_eq!(saved["samples"][0],first["samples"][0]);
-            assert_eq!(saved["samples"][0]["stream"]["visibleContent"],"cèdre\n");
-            assert_eq!(saved["samples"][0]["stream"]["visibleContentSha256"],digest("cèdre\n".as_bytes()));
-            assert_eq!(saved["samples"][0]["stream"]["reportedCompletionTokens"],3);
-            assert_eq!(saved["samples"][0]["stream"]["naturallyStopped"],true);
-            assert!(saved["samples"][0]["stream"]["requestMilliseconds"].as_f64().unwrap()>=20.0);
-            assert!(saved["samples"][1]["stream"].is_null());
-            assert_eq!(saved["pendingReason"],"request-budget-expired");
-            assert_eq!(saved["passed"],false);
-            assert_eq!(comparison(saved["samples"].as_array().unwrap(),1)["status"],"pending");
-            fs::remove_file(evidence.join("acceptance.json")).unwrap();
-            fs::remove_dir(evidence).unwrap();
-        }).await.unwrap();
+            }
+        });
+        let deadline = tokio::time::Instant::now() + STOP_WAIT + Duration::from_millis(300);
+        let mut report = json!({"passed":false,"samples":[{},{}]});
+        let captured = record_response(port, "fixture", &evidence, deadline, &mut report, 0).await;
+        assert!(captured.is_some());
+        assert!(report["samples"][0]["stream"].is_null());
+        report["samples"][0]["cleanup"] =
+            json!({"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true});
+        assert!(finish_response_after_cleanup(
+            captured.as_ref(),
+            &evidence,
+            &mut report,
+            0
+        ));
+        let first: Value =
+            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
+        assert!(
+            record_response(port, "fixture", &evidence, deadline, &mut report, 1)
+                .await
+                .is_none()
+        );
+        fixture.await.unwrap();
+        let saved: Value =
+            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
+        assert_eq!(saved["samples"][0], first["samples"][0]);
+        assert_eq!(saved["samples"][0]["stream"]["visibleContent"], "cèdre\n");
+        assert_eq!(
+            saved["samples"][0]["stream"]["visibleContentSha256"],
+            adapter_digest("cèdre\n".as_bytes())
+        );
+        assert_eq!(saved["samples"][0]["stream"]["reportedCompletionTokens"], 3);
+        assert_eq!(saved["samples"][0]["stream"]["naturallyStopped"], true);
+        assert!(
+            saved["samples"][0]["stream"]["requestMilliseconds"]
+                .as_f64()
+                .unwrap()
+                >= 20.0
+        );
+        assert!(saved["samples"][1]["stream"].is_null());
+        assert_eq!(saved["pendingReason"], "request-budget-expired");
+        assert_eq!(saved["passed"], false);
+        assert_eq!(
+            comparison(saved["samples"].as_array().unwrap(), 1)["status"],
+            "pending"
+        );
     });
 }
 
 #[test]
 fn native_representation_incomplete_first_arm_blocks_next_owner_after_cleanup() {
-    let evidence = env::temp_dir().join(format!(
-        "Bonsai-Representation-Incomplete-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir(&evidence).unwrap();
+    let evidence = TempEvidence::new("Bonsai-Representation-Incomplete");
     for (finish_reason, tokens, content, elapsed) in [
         (
             "length",
@@ -1122,7 +1081,7 @@ fn native_representation_incomplete_first_arm_blocks_next_owner_after_cleanup() 
         }
         let payload = format!("data: {content_event}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
         let captured = CapturedResponse {
-            bytes: format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",payload.len()).into_bytes(),
+            bytes: chunked_sse(&payload),
             elapsed,
         };
         let mut report = json!({"passed":false,"samples":[{
@@ -1153,120 +1112,90 @@ fn native_representation_incomplete_first_arm_blocks_next_owner_after_cleanup() 
         assert_eq!(retained, report);
         assert_eq!(retained["passed"], false);
     }
-    fs::remove_file(evidence.join("acceptance.json")).unwrap();
-    fs::remove_dir(evidence).unwrap();
 }
 
 #[test]
 fn native_representation_invalid_transport_and_sse_wait_for_cleanup_and_keep_receipts() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            let evidence = env::temp_dir().join(format!(
-                "Bonsai-Representation-Invalid-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir(&evidence).unwrap();
-            for wire in [
-                b"HTTP/1.1 503 Unavailable\r\n\r\n".as_slice(),
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbad\r\n0\r\n\r\n",
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbad\r\n0\r\n",
-            ] {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let port = listener.local_addr().unwrap().port();
-                let fixture = tokio::spawn(async move {
-                    let (peer, _) = listener.accept().await.unwrap();
-                    let mut peer = BufReader::new(peer);
-                    let mut length = 0;
-                    loop {
-                        let line = prefix_line(&mut peer, 16 * 1024).await;
-                        if let Some(value) = line.strip_prefix("Content-Length: ") {
-                            length = value.trim().parse::<usize>().unwrap();
-                        }
-                        if line == "\r\n" {
-                            break;
-                        }
-                    }
-                    peer.read_exact(&mut vec![0; length]).await.unwrap();
-                    peer.get_mut().write_all(wire).await.unwrap();
-                    peer.get_mut().shutdown().await.unwrap();
-                });
-                let mut report = json!({"passed":false,"samples":[complete_sample(false, 4)]});
-                let captured = record_response(
-                    port,
-                    "fixture",
-                    &evidence,
-                    tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(5),
-                    &mut report,
-                    0,
-                )
-                .await;
-                fixture.await.unwrap();
-                assert!(captured.is_some());
-                assert!(report["samples"][0]["stream"].is_null());
-                assert_eq!(report["samples"][0]["responseBytes"], wire.len());
-                assert_eq!(report["samples"][0]["responseSha256"], digest(wire));
-                report["samples"][0]["cleanup"] =
-                    json!({"status":"pending","ownedJobEmpty":null,"listenerReleased":null});
-                assert!(!finish_response_after_cleanup(
-                    captured.as_ref(),
-                    &evidence,
-                    &mut report,
-                    0
-                ));
-                assert_eq!(report["pendingReason"], "owned-cleanup-unconfirmed");
-                report["samples"][0]["cleanup"] =
-                    json!({"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true});
-                assert!(!finish_response_after_cleanup(
-                    captured.as_ref(),
-                    &evidence,
-                    &mut report,
-                    0
-                ));
-                assert_eq!(report["pendingReason"], "invalid-or-incomplete-response");
-                assert!(report["samples"][0]["stream"].is_null());
-                let saved: Value =
-                    serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
-                        .unwrap();
-                assert_eq!(saved, report);
-                assert_eq!(saved["samples"][0]["cleanup"]["ownedJobEmpty"], true);
-                assert_eq!(
-                    saved["samples"][0]["powerBefore"],
-                    saved["samples"][0]["powerAfter"]
-                );
-                assert_eq!(saved["passed"], false);
-            }
-            let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = reservation.local_addr().unwrap().port();
-            drop(reservation);
-            let mut report = json!({"passed":false,"samples":[{}]});
-            assert!(
-                record_response(
-                    port,
-                    "fixture",
-                    &evidence,
-                    tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(5),
-                    &mut report,
-                    0
-                )
-                .await
-                .is_none()
-            );
-            assert_eq!(report["pendingReason"], "request-transport-failed");
-            assert_eq!(report["requestProgress"][0]["transportErrorObserved"], true);
+    run_timed(Duration::from_secs(10), async {
+        let evidence = TempEvidence::new("Bonsai-Representation-Invalid");
+        for wire in [
+            b"HTTP/1.1 503 Unavailable\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbad\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbad\r\n0\r\n",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let fixture = tokio::spawn(async move {
+                let (peer, _) = listener.accept().await.unwrap();
+                let mut peer = BufReader::new(peer);
+                let _ = read_fixture_request(&mut peer).await;
+                peer.get_mut().write_all(wire).await.unwrap();
+                peer.get_mut().shutdown().await.unwrap();
+            });
+            let mut report = json!({"passed":false,"samples":[complete_sample(false, 4)]});
+            let captured = record_response(
+                port,
+                "fixture",
+                &evidence,
+                tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(5),
+                &mut report,
+                0,
+            )
+            .await;
+            fixture.await.unwrap();
+            assert!(captured.is_some());
             assert!(report["samples"][0]["stream"].is_null());
-            fs::remove_file(evidence.join("acceptance.json")).unwrap();
-            fs::remove_dir(evidence).unwrap();
-        })
-        .await
-        .unwrap();
+            assert_eq!(report["samples"][0]["responseBytes"], wire.len());
+            assert_eq!(report["samples"][0]["responseSha256"], adapter_digest(wire));
+            report["samples"][0]["cleanup"] =
+                json!({"status":"pending","ownedJobEmpty":null,"listenerReleased":null});
+            assert!(!finish_response_after_cleanup(
+                captured.as_ref(),
+                &evidence,
+                &mut report,
+                0
+            ));
+            assert_eq!(report["pendingReason"], "owned-cleanup-unconfirmed");
+            report["samples"][0]["cleanup"] =
+                json!({"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true});
+            assert!(!finish_response_after_cleanup(
+                captured.as_ref(),
+                &evidence,
+                &mut report,
+                0
+            ));
+            assert_eq!(report["pendingReason"], "invalid-or-incomplete-response");
+            assert!(report["samples"][0]["stream"].is_null());
+            let saved: Value =
+                serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved, report);
+            assert_eq!(saved["samples"][0]["cleanup"]["ownedJobEmpty"], true);
+            assert_eq!(
+                saved["samples"][0]["powerBefore"],
+                saved["samples"][0]["powerAfter"]
+            );
+            assert_eq!(saved["passed"], false);
+        }
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let mut report = json!({"passed":false,"samples":[{}]});
+        assert!(
+            record_response(
+                port,
+                "fixture",
+                &evidence,
+                tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(5),
+                &mut report,
+                0
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(report["pendingReason"], "request-transport-failed");
+        assert_eq!(report["requestProgress"][0]["transportErrorObserved"], true);
+        assert!(report["samples"][0]["stream"].is_null());
     });
 }
 
@@ -1305,7 +1234,7 @@ fn capture_complete_responses(row_workers: u8) {
         "configuredKvCache":"rsq4","configuredPromptReuse":"disabled",
         "statePolicyScope":"K4/V4 with reset on every request; supplies no CPU/FP16 numerical or full-context/cache quality qualification",
         "automaticPq2PlacementComparisonQualified":false,
-        "request":body(),"requestSha256":digest(&serde_json::to_vec(&body()).unwrap()),
+        "request":body(),"requestSha256":adapter_digest(&serde_json::to_vec(&body()).unwrap()),
         "representationOrder":["PQ2_0","current-repacked-PTQ1_0"],"configuredNativeRowWorkers":row_workers,
         "configuredSeed":42,"requestedAdapterScale":1.3,"servingStatePolicy":"reset-every-request",
         "templateSha256":"c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
@@ -1314,19 +1243,15 @@ fn capture_complete_responses(row_workers: u8) {
         "metricDefinition":"complete framed request milliseconds including prefill, generation, transport and incremental observer/receipt I/O; startup recorded separately; no decode timing",
         "aggregateModelCaseBudgetSeconds":budget.as_secs(),"maximumModelCaseBudgetSeconds":maximum_case_budget().as_secs(),
         "wholeJobMaximumSeconds":whole_job_budget().as_secs(),"requiredNativeSandbox":true,"samples":[],"comparison":{"status":"pending"},
-        "runtimeLock":serde_json::from_str::<Value>(include_str!("../../../../config/prism-inference.lock.json")).unwrap(),
-        "adapterLock":serde_json::from_str::<Value>(include_str!("../../../../config/swift-lora.lock.json")).unwrap(),
-        "ptq1ExportReceipt":serde_json::from_str::<Value>(include_str!("../../../../config/swift.ptq1-export.json")).unwrap(),
+        "runtimeLock":runtime_lock().clone(),
+        "adapterLock":adapter_lock().clone(),
+        "ptq1ExportReceipt":ptq1_export_lock().clone(),
         "decodeTokensPerSecond":null,"performanceQualified":false,"qualityQualified":false,
         "authoringBasisQualified":false,"completeStateParityQualified":false,"defaultMayChange":false,
         "defaultRuntimeQualified":false,"matrixContinuationPermitted":false});
     report["originalPq2Rollback"] = original_pq2_rollback_observation(&[], row_workers);
     save_acceptance_report(evidence, &report);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
+    run_local_set(async {
         timeout(
             budget,
             paired_responses(
@@ -1339,7 +1264,7 @@ fn capture_complete_responses(row_workers: u8) {
         )
         .await
         .unwrap();
-    }));
+    });
     assert_eq!(
         report["passed"], true,
         "Complete-response feasibility pair remains pending."

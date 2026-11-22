@@ -160,11 +160,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for ObservedResponse<S> {
 
 #[test]
 fn native_response_capture_hashes_fragmented_errors_without_retaining_payloads() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    run_local(async {
         let payload = b"HTTP/1.1 413 private-reason\r\nX-Private: secret-header\r\n\r\nsecret-body";
         let observation = Observation::new();
         let mut reader = observation.reader(io::Cursor::new(payload));
@@ -200,12 +196,7 @@ fn native_response_capture_hashes_fragmented_errors_without_retaining_payloads()
 
 #[test]
 fn native_response_capture_cancelled_read_retains_prefix_and_original_deadline() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    run_paused(async {
         let (stream, mut peer) = tokio::io::duplex(128);
         let prefix = b"HTTP/1.1 200 OK\r\n";
         peer.write_all(prefix).await.unwrap();

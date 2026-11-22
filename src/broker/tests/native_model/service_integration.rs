@@ -46,16 +46,9 @@ const fn weight_representation(profile: &AdapterProfile) -> &'static str {
 fn record_model_identity(profile: &AdapterProfile, report: &mut Value) {
     report["weightRepresentation"] = json!(weight_representation(profile));
     if profile.repacked {
-        report["modelExportReceipt"] = serde_json::from_str::<Value>(include_str!(
-            "../../../../config/swift.ptq1-export.json"
-        ))
-        .unwrap();
+        report["modelExportReceipt"] = ptq1_export_lock().clone();
     } else {
-        report["modelIdentity"] = serde_json::from_str::<Value>(include_str!(
-            "../../../../config/swift-assessment.lock.json"
-        ))
-        .unwrap()["model"]
-            .clone();
+        report["modelIdentity"] = model_lock()["model"].clone();
     }
 }
 
@@ -233,23 +226,6 @@ fn cancellation_request_matches_baseline(first: &Value) -> bool {
             )
         && first["requestedScaleF64Bits"] == format!("{:016x}", 1.3_f64.to_bits())
         && first["requestedCompletionCap"] == 1
-}
-
-pub(super) fn reported_prompt_tokens(bytes: &[u8]) -> Option<u64> {
-    let payload = stream_payload(bytes);
-    let payload = std::str::from_utf8(&payload).unwrap();
-    let mut observed = None;
-    for event in payload
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-    {
-        if let Ok(event) = serde_json::from_str::<Value>(event)
-            && let Some(tokens) = event["usage"]["prompt_tokens"].as_u64()
-        {
-            assert!(observed.replace(tokens).is_none());
-        }
-    }
-    observed
 }
 
 fn prompt_counts_match(streams: &Value, replay: Option<&Value>) -> bool {
@@ -709,11 +685,7 @@ fn released_loopback_port() -> u16 {
 
 #[test]
 fn native_service_integration_cleanup_preserves_failures_and_listener_observations() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
+    run_local_set(async {
         // Each case owns its task and port. Start them together so the OS's
         // closed-port refusal delay is paid once instead of once per case.
         let mut checks = tokio::task::JoinSet::new();
@@ -804,26 +776,14 @@ fn native_service_integration_cleanup_preserves_failures_and_listener_observatio
         while let Some(result) = checks.join_next().await {
             result.unwrap();
         }
-    }));
+    });
 }
 
 #[test]
 fn native_service_integration_stuck_owner_is_dropped_inside_existing_stop_allowance() {
-    struct DropMarker(std::rc::Rc<std::cell::Cell<bool>>);
-    impl Drop for DropMarker {
-        fn drop(&mut self) {
-            self.0.set(true);
-        }
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
+    run_paused(async {
         for allowance in [STOP_WAIT, Duration::from_secs(15)] {
-            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
-            let marker = DropMarker(dropped.clone());
+            let (marker, dropped) = drop_flag();
             let (stop, _stopped) = oneshot::channel();
             let running = spawn_local(async move {
                 let _marker = marker;
@@ -853,7 +813,7 @@ fn native_service_integration_stuck_owner_is_dropped_inside_existing_stop_allowa
             assert!(!cleanup_passed(&cleanup));
             assert!(observed.is_none());
         }
-    }));
+    });
 }
 
 #[test]
@@ -1032,11 +992,7 @@ fn native_service_integration_prefix_rejects_terminal_events_already_received() 
         assert_eq!(complete_prefix(&complete[..length]), (None, false));
     }
     assert_eq!(complete_prefix(complete), (Some("Hello".into()), false));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    run_local(async {
         for terminal in [None, Some("stop"), Some("done")] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -1044,7 +1000,9 @@ fn native_service_integration_prefix_rejects_terminal_events_already_received() 
                 let (mut peer, _) = listener.accept().await.unwrap();
                 let content = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n";
                 let terminal = match terminal {
-                    Some("stop") => "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    Some("stop") => {
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                    }
                     Some(_) => "data: [DONE]\n\n",
                     None => "",
                 };
@@ -1057,7 +1015,10 @@ fn native_service_integration_prefix_rejects_terminal_events_already_received() 
             let client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             let reading = tokio::spawn(cancellation_prefix(client));
             let observed = timeout(Duration::from_secs(5), reading).await.unwrap();
-            assert_eq!(observed.unwrap().unwrap().1.as_deref(), terminal.is_none().then_some("Hello"));
+            assert_eq!(
+                observed.unwrap().unwrap().1.as_deref(),
+                terminal.is_none().then_some("Hello")
+            );
             fixture.await.unwrap();
         }
     });
@@ -1065,11 +1026,7 @@ fn native_service_integration_prefix_rejects_terminal_events_already_received() 
 
 #[test]
 fn native_service_integration_cancellation_failures_return_without_unwinding() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    run_local(async {
         let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
         let malformed = "data: invalid-json\n\n";
         let responses = [
@@ -1094,7 +1051,10 @@ fn native_service_integration_cancellation_failures_return_without_unwinding() {
             let reading = tokio::spawn(cancellation_prefix(client));
             // A failed JoinHandle would signal an unwind through the live-owner
             // caller. An ordinary Err leaves its Stop and final power code live.
-            let observed = timeout(Duration::from_secs(5), reading).await.unwrap().unwrap();
+            let observed = timeout(Duration::from_secs(5), reading)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(observed.is_err());
             fixture.await.unwrap();
         }
@@ -1103,20 +1063,8 @@ fn native_service_integration_cancellation_failures_return_without_unwinding() {
 
 #[test]
 fn native_service_integration_cancellation_failure_retains_response_identity() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Service-Prefix-Failure-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_local(async {
+        let evidence = TempEvidence::new("Bonsai-Service-Prefix-Failure");
         let response =
             b"HTTP/1.1 503 private-reason\r\nX-Private: secret-header\r\n\r\nsecret-body";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1168,8 +1116,6 @@ fn native_service_integration_cancellation_failure_retains_response_identity() {
         ] {
             assert!(!retained.contains(private));
         }
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
@@ -1205,20 +1151,8 @@ fn native_pq2_service_integration_fresh_owner_reserve_keeps_original_deadline() 
 }
 
 fn fresh_owner_reserve(profile: &AdapterProfile) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Service-Reserve-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_local(async {
+        let evidence = TempEvidence::new("Bonsai-Service-Reserve");
         let deadline = tokio::time::Instant::now() + NEXT_OWNER_RESERVE;
         let mut report = json!({"passed":false,"serviceIntegrationWorkload":pending_workload()});
         assert!(
@@ -1246,8 +1180,6 @@ fn fresh_owner_reserve(profile: &AdapterProfile) {
         );
         assert_eq!(report["passed"], false);
         assert!(report["freshOwnerReadiness"].is_null());
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
@@ -1294,18 +1226,10 @@ fn service_acceptance(profile: &AdapterProfile) {
         "completeStateParityQualified":false,"authoringBasisQualified":false,
         "performanceQualified":false,"qualityQualified":false});
     record_model_identity(profile, &mut report);
-    report["runtimeLock"] =
-        serde_json::from_str::<Value>(include_str!("../../../../config/prism-inference.lock.json"))
-            .unwrap();
-    report["adapterLock"] =
-        serde_json::from_str::<Value>(include_str!("../../../../config/swift-lora.lock.json"))
-            .unwrap();
+    report["runtimeLock"] = runtime_lock().clone();
+    report["adapterLock"] = adapter_lock().clone();
     save_acceptance_report(Path::new(&evidence), &report);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
+    run_local_set(async {
         let deadline = tokio::time::Instant::now() + budget;
         tokio::time::timeout_at(
             deadline,
@@ -1319,7 +1243,7 @@ fn service_acceptance(profile: &AdapterProfile) {
         )
         .await
         .unwrap();
-    }));
+    });
     assert_eq!(
         report["passed"], true,
         "Required released-service observations remain pending."

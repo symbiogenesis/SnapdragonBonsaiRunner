@@ -8,14 +8,7 @@ const CAP: u32 = 8;
 const NEXT_OWNER_RESERVE: Duration = Duration::from_secs(60);
 
 fn body() -> Value {
-    let mut body = request(
-        json!([{"role":"user","content":"Count from 1 to 100."}]),
-        true,
-        CAP,
-    );
-    body["enable_thinking"] = json!(false);
-    body["abliteration_scale"] = json!(1.3);
-    body
+    prompt_request("Count from 1 to 100.", 1.3, CAP)
 }
 
 fn metrics(progress: &Value) -> Value {
@@ -255,11 +248,10 @@ fn pinned_native_row4_captures_separated_token_timings() {
     let revision = env::var("BONSAI_NATIVE_OWNER_REVISION").unwrap();
     assert_eq!(revision.len(), 40);
     assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    let runtime_lock: Value =
-        serde_json::from_str(include_str!("../../../../config/prism-inference.lock.json")).unwrap();
+    let runtime = runtime_lock();
     assert!(reviewed_memory_context_release(
-        runtime_lock["version"].as_str(),
-        runtime_lock["commit"].as_str(),
+        runtime["version"].as_str(),
+        runtime["commit"].as_str(),
     ));
     let budget = case_budget();
     let data = env::var_os("BONSAI_NATIVE_DATA").unwrap();
@@ -268,8 +260,8 @@ fn pinned_native_row4_captures_separated_token_timings() {
     let mut report = json!({"schemaVersion":1,"case":CASE,"profile":PROFILE,
         "revision":revision,"runId":env::var("BONSAI_NATIVE_OWNER_RUN_ID").unwrap(),
         "executionScope":"explicitly-authorized-local-owner-capture; no CI acceptance claimed",
-        "passed":false,"samples":[],"runtimeLock":runtime_lock,
-        "adapterLock":serde_json::from_str::<Value>(include_str!("../../../../config/swift-lora.lock.json")).unwrap(),
+        "passed":false,"samples":[],"runtimeLock":runtime,
+        "adapterLock":adapter_lock(),
         "request":body(),"configuredSeed":42,"requestedAdapterScale":1.3,
         "aggregateModelCaseBudgetSeconds":budget.as_secs(),
         "wholeJobMaximumSeconds":whole_job_budget().as_secs(),
@@ -282,14 +274,10 @@ fn pinned_native_row4_captures_separated_token_timings() {
         "performanceQualified":false,"ciAcceptanceQualified":false,"qualityQualified":false,
         "completeStateParityQualified":false,"defaultRuntimeQualified":false});
     save_acceptance_report(evidence, &report);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
+    run_local_set(async {
         let deadline = tokio::time::Instant::now() + budget;
         paired_capture(Path::new(&data), evidence, deadline, &mut report).await;
-    }));
+    });
     assert_eq!(
         report["passed"], true,
         "Short token timing remains pending."

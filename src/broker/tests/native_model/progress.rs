@@ -507,20 +507,8 @@ fn native_progress_read_error_retains_partial_response_identity_before_cleanup()
             tokio::io::AsyncRead::poll_read(std::pin::Pin::new(prefix), cx, buffer)
         }
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Progress-Read-Failure-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_local(async {
+        let evidence = TempEvidence::new("Bonsai-Progress-Read-Failure");
         let prefix = b"HTTP/1.1 413 private-reason\r\nX-Private: secret-header\r\n\r\nsecret-body";
         let mut report = json!({"passed":false,"requestProgress":[null]});
         {
@@ -561,8 +549,6 @@ fn native_progress_read_error_retains_partial_response_identity_before_cleanup()
         ] {
             assert!(!retained.contains(private));
         }
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 

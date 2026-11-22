@@ -386,20 +386,8 @@ fn native_service_rollback_malformed_responses_wait_for_owned_cleanup() {
 
 #[test]
 fn native_service_rollback_transport_failure_retains_pending_progress() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Rollback-Transport-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_local(async {
+        let evidence = TempEvidence::new("Bonsai-Rollback-Transport");
         let mut report = json!({"passed":false,"originalPq2Rollback":pending_rollback()});
         let response = timeout(
             Duration::from_secs(5),
@@ -421,56 +409,58 @@ fn native_service_rollback_transport_failure_retains_pending_progress() {
         assert_eq!(saved["requestProgress"][0]["transportErrorObserved"], true);
         assert_eq!(saved["originalPq2Rollback"]["status"], "pending");
         assert_eq!(saved["passed"], false);
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
 #[test]
 fn native_service_rollback_deadline_and_missing_ptq1_cleanup_never_start_an_owner() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!("Bonsai-Service-Rollback-Reserve-{}-{}",std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        fs::create_dir(&evidence).unwrap();
+    run_paused(async {
+        let evidence = TempEvidence::new("Bonsai-Service-Rollback-Reserve");
         let mut report = json!({"passed":false,"originalPq2Rollback":pending_rollback(),
             "serviceIntegrationWorkload":{"status":"passed"},
             "initialCleanup":{"ownedJobEmpty":true,"listenerReleased":true},
             "freshOwnerCleanup":{"ownedJobEmpty":true,"listenerReleased":true,"completedOperations":1,"failedOperations":0}});
-        let deadline = tokio::time::Instant::now()+NEXT_OWNER_RESERVE;
-        assert!(!rollback_owner(Path::new("unused-no-model-start"),&evidence,deadline,&mut report).await.0);
+        let deadline = tokio::time::Instant::now() + NEXT_OWNER_RESERVE;
+        assert!(
+            !rollback_owner(
+                Path::new("unused-no-model-start"),
+                &evidence,
+                deadline,
+                &mut report
+            )
+            .await
+            .0
+        );
         assert!(report["originalPq2Rollback"]["sample"].is_null());
-        assert_eq!(report["originalPq2Rollback"]["status"],"pending");
-        for field in ["initialCleanup","freshOwnerCleanup"] {
+        assert_eq!(report["originalPq2Rollback"]["status"], "pending");
+        for field in ["initialCleanup", "freshOwnerCleanup"] {
             let mut changed = report.clone();
             changed[field]["ownedJobEmpty"] = json!(false);
-            assert!(!can_start_rollback(deadline+Duration::from_mins(1),&changed));
+            assert!(!can_start_rollback(
+                deadline + Duration::from_mins(1),
+                &changed
+            ));
             changed[field]["ownedJobEmpty"] = json!(true);
             changed[field]["listenerReleased"] = json!(false);
-            assert!(!can_start_rollback(deadline+Duration::from_mins(1),&changed));
+            assert!(!can_start_rollback(
+                deadline + Duration::from_mins(1),
+                &changed
+            ));
         }
         let mut pending_service = report.clone();
         pending_service["serviceIntegrationWorkload"]["status"] = json!("pending");
-        assert!(!can_start_rollback(deadline+Duration::from_mins(1),&pending_service));
-        assert_eq!(deadline-tokio::time::Instant::now(),NEXT_OWNER_RESERVE);
-        assert_eq!(report["passed"],false);
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
+        assert!(!can_start_rollback(
+            deadline + Duration::from_mins(1),
+            &pending_service
+        ));
+        assert_eq!(deadline - tokio::time::Instant::now(), NEXT_OWNER_RESERVE);
+        assert_eq!(report["passed"], false);
     });
 }
 
 #[test]
 fn native_service_rollback_reserves_tail_before_ptq1_owner() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    run_paused(async {
         let started = tokio::time::Instant::now();
         let minimum = NEXT_OWNER_RESERVE + service_integration::NEXT_OWNER_RESERVE;
         for allowance in [Duration::ZERO, NEXT_OWNER_RESERVE, minimum] {
@@ -489,15 +479,7 @@ fn native_service_rollback_reserves_tail_before_ptq1_owner() {
             NEXT_OWNER_RESERVE + STOP_WAIT
         );
 
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Service-Rollback-Tail-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+        let evidence = TempEvidence::new("Bonsai-Service-Rollback-Tail");
         let mut report = json!({"passed":false,"originalPq2Rollback":pending_rollback(),
             "serviceIntegrationWorkload":service_integration::pending_workload()});
         assert!(
@@ -520,19 +502,12 @@ fn native_service_rollback_reserves_tail_before_ptq1_owner() {
         let saved: Value =
             serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
         assert_eq!(saved, report);
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
 #[test]
 fn native_service_rollback_keeps_original_stop_and_hash_reserves() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    run_paused(async {
         let deadline =
             tokio::time::Instant::now() + STOP_WAIT + HASH_RESERVE + Duration::from_secs(2);
         assert!(
@@ -579,25 +554,15 @@ fn pinned_native_ptq1_service_and_original_pq2_rollback_row4() {
         "defaultRuntimeQualified":false,"releasedServiceGateQualified":false,
         "completeStateParityQualified":false,"authoringBasisQualified":false,
         "performanceQualified":false,"qualityQualified":false,"numericalParityQualified":false});
-    report["runtimeLock"] =
-        serde_json::from_str::<Value>(include_str!("../../../../config/prism-inference.lock.json"))
-            .unwrap();
+    report["runtimeLock"] = runtime_lock().clone();
     assert!(reviewed_memory_context_release(
         report["runtimeLock"]["version"].as_str(),
         report["runtimeLock"]["commit"].as_str(),
     ));
-    report["adapterLock"] =
-        serde_json::from_str::<Value>(include_str!("../../../../config/swift-lora.lock.json"))
-            .unwrap();
-    report["modelExportReceipt"] =
-        serde_json::from_str::<Value>(include_str!("../../../../config/swift.ptq1-export.json"))
-            .unwrap();
+    report["adapterLock"] = adapter_lock().clone();
+    report["modelExportReceipt"] = ptq1_export_lock().clone();
     save_acceptance_report(Path::new(&evidence), &report);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
+    run_local_set(async {
         let deadline = tokio::time::Instant::now() + budget;
         tokio::time::timeout_at(
             deadline,
@@ -610,7 +575,7 @@ fn pinned_native_ptq1_service_and_original_pq2_rollback_row4() {
         )
         .await
         .unwrap();
-    }));
+    });
     assert_eq!(
         report["passed"], true,
         "Service integration or same-release original-PQ2 rollback remains pending."

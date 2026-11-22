@@ -352,20 +352,8 @@ fn native_adapter_boundary_replay_requires_bound_output_usage_and_settings() {
 
 #[test]
 fn native_adapter_boundary_deadline_retains_pending_work_without_model_start() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Adapter-Boundaries-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_local(async {
+        let evidence = TempEvidence::new("Bonsai-Adapter-Boundaries");
         let mut report =
             json!({"passed":false,"streams":[],"scaleBoundaryWorkload":pending_workload()});
         let deadline = tokio::time::Instant::now() + ADAPTER_LIFECYCLE_RESERVE;
@@ -380,91 +368,122 @@ fn native_adapter_boundary_deadline_retains_pending_work_without_model_start() {
         let saved: Value =
             serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
         assert_eq!(saved, report);
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
 #[test]
 fn native_adapter_boundary_wire_sequence_preserves_rejections_and_failed_replay() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10),async {
-            for final_tokens in [1,0] {
-                let evidence = env::temp_dir().join(format!("Bonsai-Adapter-Boundary-Wire-{}-{}",
-                    std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-                fs::create_dir(&evidence).unwrap();
-                let initial = adapter_initial_fixture(&ADAPTER_PROFILE);
-                let content = initial["visibleContent"].as_str().unwrap().to_owned();
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let port = listener.local_addr().unwrap().port();
-                let fixture = tokio::spawn(async move {
-                    for step in 0..5 {
-                        let (peer,_) = listener.accept().await.unwrap();
-                        let mut peer = BufReader::new(peer);
-                        let mut length = None;
-                        loop {
-                            let line = prefix_line(&mut peer,16*1024).await;
-                            if let Some(value) = line.strip_prefix("Content-Length: ") {
-                                length = Some(value.trim().parse::<usize>().unwrap());
-                            }
-                            if line=="\r\n" { break; }
-                        }
-                        let mut bytes = vec![0;length.unwrap()];
-                        peer.read_exact(&mut bytes).await.unwrap();
-                        let selected: Value = serde_json::from_slice(&bytes).unwrap();
-                        let expected_scale = [-0.0_f64,2.0,2.000_000_01,1.3,1.3][step];
-                        assert_eq!(selected["abliteration_scale"].as_f64().unwrap().to_bits(),expected_scale.to_bits());
-                        assert_eq!(selected["max_completion_tokens"],if step==3 {4096} else {1});
-                        assert_eq!(selected["enable_thinking"],false);
-                        assert_eq!(selected["messages"],if step==3 {
+    run_timed(Duration::from_secs(10), async {
+        for final_tokens in [1, 0] {
+            let evidence = TempEvidence::new("Bonsai-Adapter-Boundary-Wire");
+            let initial = adapter_initial_fixture(&ADAPTER_PROFILE);
+            let content = initial["visibleContent"].as_str().unwrap().to_owned();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let fixture = tokio::spawn(async move {
+                for step in 0..5 {
+                    let (peer, _) = listener.accept().await.unwrap();
+                    let mut peer = BufReader::new(peer);
+                    let selected = read_fixture_request(&mut peer).await;
+                    let expected_scale = [-0.0_f64, 2.0, 2.000_000_01, 1.3, 1.3][step];
+                    assert_eq!(
+                        selected["abliteration_scale"].as_f64().unwrap().to_bits(),
+                        expected_scale.to_bits()
+                    );
+                    assert_eq!(
+                        selected["max_completion_tokens"],
+                        if step == 3 { 4096 } else { 1 }
+                    );
+                    assert_eq!(selected["enable_thinking"], false);
+                    assert_eq!(
+                        selected["messages"],
+                        if step == 3 {
                             json!([{"role":"user","content":" cedar".repeat(9000)}])
-                        } else { body(1.3)["messages"].clone() });
-                        let response = if step==2 {
-                            String::new()
-                        } else if step==3 {
-                            let payload = json!({"error":{"code":"context_length_exceeded"}}).to_string();
-                            format!("HTTP/1.1 413 Content Too Large\r\nContent-Length: {}\r\n\r\n{payload}",payload.len())
                         } else {
-                            let delta = json!({"choices":[{"delta":{"content":content},"finish_reason":null}]});
-                            let terminal = json!({"choices":[{"delta":{},"finish_reason":"length"}],
-                                "usage":{"completion_tokens":if step==4 {final_tokens} else {1}}});
-                            let payload = format!("data: {delta}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
-                            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",payload.len())
-                        };
-                        peer.get_mut().write_all(response.as_bytes()).await.unwrap();
-                        peer.get_mut().shutdown().await.unwrap();
-                    }
-                });
-                let mut report = json!({"passed":false,"streams":[initial],"scaleBoundaryWorkload":pending_workload()});
-                let passed = requests(port,"fixture",&evidence,tokio::time::Instant::now()+Duration::from_mins(2),&mut report).await;
-                fixture.await.unwrap();
-                assert_eq!(passed,final_tokens==1);
-                assert_eq!(report["scaleBoundaryWorkload"]["invalidScaleRejected"],true);
-                assert_eq!(report["scaleBoundaryWorkload"]["contextRejected"],true);
-                assert_eq!(report["scaleBoundaryWorkload"]["sameOwnerReplayMatched"],final_tokens==1);
-                assert_eq!(report["scaleBoundaryWorkload"]["status"],if final_tokens==1 {"passed"} else {"pending"});
-                assert_eq!(report["streams"].as_array().unwrap().len(),4);
-                assert_eq!(report["scaleBoundaryWorkload"]["requests"].as_array().unwrap().len(),5);
-                assert_eq!(report["passed"],false,"Wire fixtures never qualify actual-model acceptance.");
-                let saved: Value = serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-                // Compare the complete persisted structure after the same JSON
-                // round trip, which may round nondeterministic f64 telemetry.
-                let serialized: Value = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
-                assert_eq!(saved,serialized);
-                for receipt in [&report,&saved] {
-                    let progress = receipt["requestProgress"].as_array().unwrap();
-                    assert_eq!(progress.len(),5);
-                    assert!(progress.iter().all(|sample| sample["requestMilliseconds"]
-                        .as_f64().is_some_and(|milliseconds| milliseconds.is_finite() && milliseconds>0.0)));
+                            body(1.3)["messages"].clone()
+                        }
+                    );
+                    let response = if step == 2 {
+                        Vec::new()
+                    } else if step == 3 {
+                        let payload =
+                            json!({"error":{"code":"context_length_exceeded"}}).to_string();
+                        format!(
+                            "HTTP/1.1 413 Content Too Large\r\nContent-Length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .into_bytes()
+                    } else {
+                        let delta =
+                            json!({"choices":[{"delta":{"content":content},"finish_reason":null}]});
+                        let terminal = json!({"choices":[{"delta":{},"finish_reason":"length"}],
+                            "usage":{"completion_tokens":if step==4 {final_tokens} else {1}}});
+                        let payload =
+                            format!("data: {delta}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+                        chunked_sse(&payload)
+                    };
+                    peer.get_mut().write_all(&response).await.unwrap();
+                    peer.get_mut().shutdown().await.unwrap();
                 }
-                fs::remove_file(evidence.join("acceptance.json")).unwrap();
-                fs::remove_dir(evidence).unwrap();
+            });
+            let mut report = json!({"passed":false,"streams":[initial],"scaleBoundaryWorkload":pending_workload()});
+            let passed = requests(
+                port,
+                "fixture",
+                &evidence,
+                tokio::time::Instant::now() + Duration::from_mins(2),
+                &mut report,
+            )
+            .await;
+            fixture.await.unwrap();
+            assert_eq!(passed, final_tokens == 1);
+            assert_eq!(
+                report["scaleBoundaryWorkload"]["invalidScaleRejected"],
+                true
+            );
+            assert_eq!(report["scaleBoundaryWorkload"]["contextRejected"], true);
+            assert_eq!(
+                report["scaleBoundaryWorkload"]["sameOwnerReplayMatched"],
+                final_tokens == 1
+            );
+            assert_eq!(
+                report["scaleBoundaryWorkload"]["status"],
+                if final_tokens == 1 {
+                    "passed"
+                } else {
+                    "pending"
+                }
+            );
+            assert_eq!(report["streams"].as_array().unwrap().len(), 4);
+            assert_eq!(
+                report["scaleBoundaryWorkload"]["requests"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                5
+            );
+            assert_eq!(
+                report["passed"], false,
+                "Wire fixtures never qualify actual-model acceptance."
+            );
+            let saved: Value =
+                serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
+                    .unwrap();
+            // Compare the complete persisted structure after the same JSON
+            // round trip, which may round nondeterministic f64 telemetry.
+            let serialized: Value =
+                serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+            assert_eq!(saved, serialized);
+            for receipt in [&report, &saved] {
+                let progress = receipt["requestProgress"].as_array().unwrap();
+                assert_eq!(progress.len(), 5);
+                assert!(progress.iter().all(|sample| {
+                    sample["requestMilliseconds"]
+                        .as_f64()
+                        .is_some_and(|milliseconds| milliseconds.is_finite() && milliseconds > 0.0)
+                }));
             }
-        }).await.unwrap();
+        }
     });
 }
 
@@ -483,8 +502,7 @@ fn pinned_native_ptq1_adapter_row4_checks_scale_boundaries_and_reset() {
     );
     let data = env::var_os("BONSAI_NATIVE_DATA").unwrap();
     let evidence = env::var_os("BONSAI_NATIVE_EVIDENCE").unwrap();
-    let export: Value =
-        serde_json::from_str(include_str!("../../../../config/swift.ptq1-export.json")).unwrap();
+    let export = ptq1_export_lock();
     let mut report = json!({"schemaVersion":1,"case":CASE,"profile":PROFILE,
         "revision":env::var("GITHUB_SHA").unwrap(),"runId":env::var("GITHUB_RUN_ID").unwrap(),
         "runAttempt":env::var("GITHUB_RUN_ATTEMPT").unwrap(),"passed":false,"lifecyclePassed":false,
@@ -497,8 +515,8 @@ fn pinned_native_ptq1_adapter_row4_checks_scale_boundaries_and_reset() {
         "servingStatePolicy":"reset-every-request","weightRepresentation":"current-repacked-PTQ1_0",
         "modelIdentity":{"filename":export["OutputFilename"],"bytes":export["OutputBytes"],"sha256":export["OutputSha256"]},
         "modelExportReceipt":export,
-        "runtimeLock":serde_json::from_str::<Value>(include_str!("../../../../config/prism-inference.lock.json")).unwrap(),
-        "adapterLock":serde_json::from_str::<Value>(include_str!("../../../../config/swift-lora.lock.json")).unwrap(),
+        "runtimeLock":runtime_lock(),
+        "adapterLock":adapter_lock(),
         "scaleBoundaryWorkload":pending_workload(),"defaultRuntimeQualified":false,
         "completeStateParityQualified":false,"authoringBasisQualified":false,"performanceQualified":false,
         "qualityQualified":false,"releasedServiceGateQualified":false,
@@ -506,24 +524,16 @@ fn pinned_native_ptq1_adapter_row4_checks_scale_boundaries_and_reset() {
             "cancellation-and-fresh-owner-restart","full-context-and-output","installation-and-rollback",
             "quality-and-sustained-comfort","sandbox-isolation"]});
     save_acceptance_report(Path::new(&evidence), &report);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
-        timeout(
+    run_timed(
+        budget,
+        bounded_adapter_acceptance(
+            &ADAPTER_PROFILE,
+            Path::new(&data),
+            Path::new(&evidence),
             budget,
-            bounded_adapter_acceptance(
-                &ADAPTER_PROFILE,
-                Path::new(&data),
-                Path::new(&evidence),
-                budget,
-                &mut report,
-            ),
-        )
-        .await
-        .unwrap();
-    }));
+            &mut report,
+        ),
+    );
     assert_eq!(
         report["passed"], true,
         "Required adapter scale-boundary/reset observations remain pending."

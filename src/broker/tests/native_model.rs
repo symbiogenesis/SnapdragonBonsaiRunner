@@ -32,6 +32,8 @@ use tokio::{
 
 #[path = "native_model/adapter_boundaries.rs"]
 mod adapter_boundaries;
+#[path = "native_model/harness.rs"]
+mod harness;
 #[path = "native_model/power.rs"]
 mod power;
 #[path = "native_model/progress.rs"]
@@ -48,6 +50,8 @@ mod service_rollback;
 mod speed;
 #[path = "native_model/token_timing.rs"]
 mod token_timing;
+
+use harness::*;
 
 const CASE: &str = "pinned_native_model_streams_recovers_and_restarts_in_required_sandbox";
 const PTQ1_ADAPTER_CASE: &str =
@@ -242,11 +246,10 @@ fn worker_readiness_receipt(
 fn record_worker_readiness(report: &mut Value, expected: u8, verified: bool) {
     // Read the same compiled lock as LaunchConfig; never trust a mutable report
     // field to turn a legacy or missing readiness result into observed identity.
-    let runtime_lock: Value =
-        serde_json::from_str(include_str!("../../../config/prism-inference.lock.json")).unwrap();
+    let runtime = runtime_lock();
     let observation = worker_readiness_receipt(
-        runtime_lock["version"].as_str(),
-        runtime_lock["commit"].as_str(),
+        runtime["version"].as_str(),
+        runtime["commit"].as_str(),
         expected,
         verified,
     );
@@ -370,22 +373,18 @@ fn native_worker_receipts_require_the_reviewed_memory_context_source() {
 
 #[test]
 fn native_worker_receipts_read_the_compiled_release_identity() {
-    let runtime_lock: Value =
-        serde_json::from_str(include_str!("../../../config/prism-inference.lock.json")).unwrap();
+    let runtime = runtime_lock();
     let mut report = json!({"runtimeLock":{"version":"untrusted-report-value"},
         "rowWorkerCountIndependentlyObserved":true,"observedNativeRowWorkers":4});
     record_worker_readiness(&mut report, 4, false);
-    assert_eq!(report["rowWorkerReadinessVersion"], runtime_lock["version"]);
-    assert_eq!(report["rowWorkerReadinessRevision"], runtime_lock["commit"]);
+    assert_eq!(report["rowWorkerReadinessVersion"], runtime["version"]);
+    assert_eq!(report["rowWorkerReadinessRevision"], runtime["commit"]);
     assert_eq!(report["rowWorkerCountIndependentlyObserved"], false);
     assert_eq!(report["observedNativeRowWorkers"], Value::Null);
     record_worker_readiness(&mut report, 4, true);
     assert_eq!(
         report["rowWorkerCountIndependentlyObserved"],
-        reviewed_memory_context_release(
-            runtime_lock["version"].as_str(),
-            runtime_lock["commit"].as_str(),
-        )
+        reviewed_memory_context_release(runtime["version"].as_str(), runtime["commit"].as_str(),)
     );
 }
 
@@ -645,51 +644,7 @@ fn streamed_response(bytes: &[u8]) -> StreamSummary {
 }
 
 fn framed_stream_response(bytes: &[u8]) -> StreamSummary {
-    let payload = stream_payload(bytes);
-    let payload = std::str::from_utf8(&payload).unwrap();
-    let mut terminal = false;
-    let mut done = false;
-    let mut finish_reason = String::new();
-    let mut content_bytes = 0;
-    let mut completion_tokens = None;
-    for line in payload
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-    {
-        assert!(!done, "No event may follow DONE.");
-        if line == "[DONE]" {
-            assert!(terminal);
-            done = true;
-            continue;
-        }
-        let event: Value = serde_json::from_str(line).unwrap();
-        assert!(event.get("error").is_none());
-        if let Some(tokens) = event["usage"]["completion_tokens"].as_u64() {
-            assert!(completion_tokens.replace(tokens).is_none());
-        }
-        let choices = event["choices"].as_array().unwrap();
-        for choice in choices {
-            assert!(
-                !terminal,
-                "No generation event may follow a terminal reason."
-            );
-            if let Some(text) = choice["delta"]["content"].as_str() {
-                content_bytes += text.len();
-            }
-            if let Some(reason) = choice["finish_reason"].as_str() {
-                assert!(!terminal);
-                assert!(["length", "stop"].contains(&reason));
-                terminal = true;
-                reason.clone_into(&mut finish_reason);
-            }
-        }
-    }
-    assert!(terminal && done);
-    StreamSummary {
-        finish_reason,
-        content_bytes,
-        completion_tokens,
-    }
+    parse_stream_response(bytes).summary
 }
 
 fn extended_history(repetitions: usize) -> Value {
@@ -1090,70 +1045,59 @@ fn skipped_workload(requested: bool) -> Value {
 
 #[test]
 fn native_stalled_consumer_retains_fragmented_prefix_connection_until_dropped() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-            let (mut peer, _) = listener.accept().await.unwrap();
-            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+    run_timed(Duration::from_secs(10), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        let payload =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"cèdre\"},\"finish_reason\":null}]}\n\n";
+        let split = payload.find('è').unwrap() + 1;
+        for part in [&payload.as_bytes()[..split], &payload.as_bytes()[split..]] {
+            peer.write_all(format!("{:X}\r\n", part.len()).as_bytes())
                 .await
                 .unwrap();
-            let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"cèdre\"},\"finish_reason\":null}]}\n\n";
-            let split = payload.find('è').unwrap() + 1;
-            for part in [&payload.as_bytes()[..split], &payload.as_bytes()[split..]] {
-                peer.write_all(format!("{:X}\r\n", part.len()).as_bytes())
-                    .await
-                    .unwrap();
-                peer.write_all(part).await.unwrap();
-                peer.write_all(b"\r\n").await.unwrap();
-            }
-            let observed = read_until_content(client).await;
-            assert_eq!(observed.1, "cèdre".len());
-            {
-                let mut byte = [0];
-                let mut reading = std::pin::pin!(peer.read(&mut byte));
-                assert!(
-                    std::future::poll_fn(|cx| {
-                        std::task::Poll::Ready(reading.as_mut().poll(cx).is_pending())
-                    })
-                    .await
-                );
-            }
-            drop(observed);
-            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
-        })
-        .await
-        .unwrap();
+            peer.write_all(part).await.unwrap();
+            peer.write_all(b"\r\n").await.unwrap();
+        }
+        let observed = read_until_content(client).await;
+        assert_eq!(observed.1, "cèdre".len());
+        {
+            let mut byte = [0];
+            let mut reading = std::pin::pin!(peer.read(&mut byte));
+            assert!(
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(reading.as_mut().poll(cx).is_pending())
+                })
+                .await
+            );
+        }
+        drop(observed);
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
     });
 }
 
 #[test]
 fn native_stalled_consumer_rejects_error_or_unframed_stream_headers() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            for head in [
-                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 20\r\n\r\n",
-            ] {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-                let (mut peer, _) = listener.accept().await.unwrap();
-                peer.write_all(head.as_bytes()).await.unwrap();
-                let reading = tokio::spawn(read_until_content(client));
-                assert!(reading.await.unwrap_err().is_panic());
-            }
-        })
-        .await
-        .unwrap();
+    run_timed(Duration::from_secs(10), async {
+        for head in [
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 20\r\n\r\n",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            peer.write_all(head.as_bytes()).await.unwrap();
+            let reading = tokio::spawn(read_until_content(client));
+            assert!(reading.await.unwrap_err().is_panic());
+        }
     });
 }
 
@@ -1255,94 +1199,70 @@ async fn history_progress_fixture(
 
 #[test]
 fn native_bounded_history_retains_completed_steps_when_followup_is_cancelled() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            for completed_steps in [1, 2] {
-                let evidence = env::temp_dir().join(format!(
-                    "Bonsai-History-Progress-{}-{}-{completed_steps}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ));
-                fs::create_dir(&evidence).unwrap();
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let port = listener.local_addr().unwrap().port();
-                let (reached, waiting) = oneshot::channel();
-                let fixture =
-                    tokio::spawn(history_progress_fixture(listener, completed_steps, reached));
-                let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false});
-                let mut running = Box::pin(extended_acceptance(
-                    port,
-                    "model-free-fixture",
-                    &evidence,
-                    &mut report,
-                ));
-                let mut waiting = std::pin::pin!(waiting);
-                let completed = std::future::poll_fn(|cx| {
-                    if let std::task::Poll::Ready(result) = waiting.as_mut().poll(cx) {
-                        result.unwrap();
-                        return std::task::Poll::Ready(false);
-                    }
-                    running.as_mut().poll(cx).map(|()| true)
-                })
-                .await;
-                assert!(!completed);
-                drop(running);
-                fixture.abort();
-                assert!(fixture.await.unwrap_err().is_cancelled());
-                let saved: Value =
-                    serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
-                        .unwrap();
-                assert_eq!(saved["passed"], false);
-                assert_eq!(saved["allRequestedWorkloadsPassed"], false);
-                let observed = &saved["extendedWorkload"];
-                assert_eq!(observed["status"], "pending");
-                assert_eq!(observed["contextRejectionPassed"], true);
-                assert_eq!(observed["historyStreamPassed"], completed_steps == 2);
-                assert_eq!(observed["postCompletionRequestPassed"], false);
-                if completed_steps == 2 {
-                    assert_eq!(observed["historyStream"]["reportedCompletionTokens"], 4);
-                    assert_eq!(observed["historyStream"]["visibleContentBytes"], 5);
-                    assert_eq!(observed["phase"], "same-owner-reuse");
-                } else {
-                    assert_eq!(observed["phase"], "bounded-history-stream");
+    run_timed(Duration::from_secs(10), async {
+        for completed_steps in [1, 2] {
+            let evidence = TempEvidence::new("Bonsai-History-Progress");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (reached, waiting) = oneshot::channel();
+            let fixture =
+                tokio::spawn(history_progress_fixture(listener, completed_steps, reached));
+            let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false});
+            let mut running = Box::pin(extended_acceptance(
+                port,
+                "model-free-fixture",
+                &evidence,
+                &mut report,
+            ));
+            let mut waiting = std::pin::pin!(waiting);
+            let completed = std::future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(result) = waiting.as_mut().poll(cx) {
+                    result.unwrap();
+                    return std::task::Poll::Ready(false);
                 }
-                fs::remove_file(evidence.join("acceptance.json")).unwrap();
-                fs::remove_dir(evidence).unwrap();
+                running.as_mut().poll(cx).map(|()| true)
+            })
+            .await;
+            assert!(!completed);
+            drop(running);
+            fixture.abort();
+            assert!(fixture.await.unwrap_err().is_cancelled());
+            let saved: Value =
+                serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["passed"], false);
+            assert_eq!(saved["allRequestedWorkloadsPassed"], false);
+            let observed = &saved["extendedWorkload"];
+            assert_eq!(observed["status"], "pending");
+            assert_eq!(observed["contextRejectionPassed"], true);
+            assert_eq!(observed["historyStreamPassed"], completed_steps == 2);
+            assert_eq!(observed["postCompletionRequestPassed"], false);
+            if completed_steps == 2 {
+                assert_eq!(observed["historyStream"]["reportedCompletionTokens"], 4);
+                assert_eq!(observed["historyStream"]["visibleContentBytes"], 5);
+                assert_eq!(observed["phase"], "same-owner-reuse");
+            } else {
+                assert_eq!(observed["phase"], "bounded-history-stream");
             }
-        })
-        .await
-        .unwrap();
+        }
     });
 }
 
 #[test]
 fn native_acceptance_requires_framed_terminal_generation() {
-    fn framed(payload: &str) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",
-            payload.len()
-        ).into_bytes()
-    }
     let content =
         "data: {\"choices\":[{\"delta\":{\"content\":\"cedar\"},\"finish_reason\":null}]}\n\n";
     let terminal = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n";
     let done = "data: [DONE]\n\n";
-    streamed_response(&framed(&format!("{content}{terminal}{done}")));
-    let mut truncated = framed(&format!("{content}{terminal}{done}"));
+    streamed_response(&chunked_sse(&format!("{content}{terminal}{done}")));
+    let mut truncated = chunked_sse(&format!("{content}{terminal}{done}"));
     truncated.pop();
     for invalid in [
-        framed(&format!("{content}{terminal}")),
-        framed(&format!("{content}{done}")),
-        framed(&format!("{terminal}{done}")),
-        framed(&format!("{content}{terminal}{content}{done}")),
-        framed(&format!("{content}{terminal}{done}{terminal}")),
+        chunked_sse(&format!("{content}{terminal}")),
+        chunked_sse(&format!("{content}{done}")),
+        chunked_sse(&format!("{terminal}{done}")),
+        chunked_sse(&format!("{content}{terminal}{content}{done}")),
+        chunked_sse(&format!("{content}{terminal}{done}{terminal}")),
         truncated,
     ] {
         assert!(std::panic::catch_unwind(|| streamed_response(&invalid)).is_err());
@@ -1351,12 +1271,6 @@ fn native_acceptance_requires_framed_terminal_generation() {
 
 #[test]
 fn native_extended_acceptance_distinguishes_output_usage_from_delta_count() {
-    let framed = |payload: &str| {
-        format!(
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",
-            payload.len()
-        )
-    };
     let content =
         "data: {\"choices\":[{\"delta\":{\"content\":\"cedar\"},\"finish_reason\":null}]}\n\n";
     let terminal = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
@@ -1372,18 +1286,18 @@ fn native_extended_acceptance_distinguishes_output_usage_from_delta_count() {
         format!("{content}{terminal_usage}{done}"),
         format!("{content}{terminal}{usage}{done}"),
     ] {
-        assert_eq!(streamed_response(framed(&payload).as_bytes()), expected);
+        assert_eq!(streamed_response(&chunked_sse(&payload)), expected);
     }
     assert_eq!(
-        streamed_response(framed(&format!("{content}{terminal}{done}")).as_bytes()),
+        streamed_response(&chunked_sse(&format!("{content}{terminal}{done}"))),
         StreamSummary {
             finish_reason: "stop".into(),
             content_bytes: 5,
             completion_tokens: None,
         }
     );
-    let duplicate = framed(&format!("{content}{terminal_usage}{usage}{done}"));
-    assert!(std::panic::catch_unwind(|| streamed_response(duplicate.as_bytes())).is_err());
+    let duplicate = chunked_sse(&format!("{content}{terminal_usage}{usage}{done}"));
+    assert!(std::panic::catch_unwind(|| streamed_response(&duplicate)).is_err());
 }
 
 #[test]
@@ -1482,21 +1396,10 @@ fn pinned_native_model_streams_recovers_and_restarts_in_required_sandbox() {
     let evidence = env::var_os("BONSAI_NATIVE_EVIDENCE").unwrap();
     let data = Path::new(&data);
     let evidence = Path::new(&evidence);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let enabled = |name: &str| {
-        let setting = env::var(name);
-        assert!(matches!(
-            setting.as_deref(),
-            Ok("true" | "false") | Err(env::VarError::NotPresent)
-        ));
-        setting.as_deref() == Ok("true")
-    };
+    let runtime = runtime_lock();
     let workloads = Workloads {
-        extended_history: enabled("BONSAI_NATIVE_EXTENDED"),
-        stalled_consumer: enabled("BONSAI_NATIVE_STALLED_CONSUMER"),
+        extended_history: env::var("BONSAI_NATIVE_EXTENDED").as_deref() == Ok("true"),
+        stalled_consumer: env::var("BONSAI_NATIVE_STALLED_CONSUMER").as_deref() == Ok("true"),
     };
     assert_eq!(
         profile_case(
@@ -1515,7 +1418,7 @@ fn pinned_native_model_streams_recovers_and_restarts_in_required_sandbox() {
         "wholeJobMaximumSeconds":whole_job_budget().as_secs(),
         "boundedHistoryRequested":workloads.extended_history,
         "stalledConsumerRequested":workloads.stalled_consumer,
-        "runtimeLock":serde_json::from_str::<Value>(include_str!("../../../config/prism-inference.lock.json")).unwrap(),
+        "runtimeLock":runtime,
         "modelSha256":"5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
         "requiredNativeSandbox":true, "adapterEnabled":false, "fullContextQualified":false,
         "fullModelNumericalParityQualified":false, "performanceQualified":false,
@@ -1523,14 +1426,10 @@ fn pinned_native_model_streams_recovers_and_restarts_in_required_sandbox() {
         "extendedWorkload":{"enabled":false, "requested":workloads.extended_history, "status":"pending"},
         "stalledConsumerWorkload":{"enabled":false, "requested":workloads.stalled_consumer, "status":"pending"}
     });
-    runtime.block_on(LocalSet::new().run_until(async {
-        timeout(
-            budget,
-            acceptance(data, evidence, &workloads, budget, &mut report),
-        )
-        .await
-        .unwrap();
-    }));
+    run_timed(
+        budget,
+        acceptance(data, evidence, &workloads, budget, &mut report),
+    );
     // Cleanup and fresh-owner recovery finish before a skipped requested gate
     // fails the CI case. A successful core lifecycle cannot qualify that gate.
     assert_eq!(
@@ -1765,12 +1664,12 @@ fn adapter_stream_observation(bytes: Option<&[u8]>, body: &Value, label: &str) -
     // observations. Failed captures never become successful stream evidence.
     let parsed = bytes.and_then(|bytes| {
         std::panic::catch_unwind(|| {
-            let mut observed = adapter_summary(label, scale, cap, &framed_stream_response(bytes));
-            let content = speed::visible_output(bytes);
-            observed["visibleContentSha256"] = json!(adapter_digest(content.as_bytes()));
-            observed["visibleContent"] = json!(content);
-            observed["reportedPromptTokens"] =
-                json!(service_integration::reported_prompt_tokens(bytes));
+            let parsed = parse_stream_response(bytes);
+            let mut observed = adapter_summary(label, scale, cap, &parsed.summary);
+            observed["visibleContentSha256"] =
+                json!(adapter_digest(parsed.visible_content.as_bytes()));
+            observed["visibleContent"] = json!(parsed.visible_content);
+            observed["reportedPromptTokens"] = json!(parsed.prompt_tokens);
             observed
         })
         .ok()
@@ -2345,19 +2244,7 @@ async fn adapter_scale_history_fixture(
     for step in 0..completed_steps {
         let (peer, _) = listener.accept().await.unwrap();
         let mut peer = BufReader::new(peer);
-        let mut length = None;
-        loop {
-            let line = prefix_line(&mut peer, 16 * 1024).await;
-            if let Some(value) = line.strip_prefix("Content-Length: ") {
-                length = Some(value.trim().parse::<usize>().unwrap());
-            }
-            if line == "\r\n" {
-                break;
-            }
-        }
-        let mut body = vec![0; length.unwrap()];
-        peer.read_exact(&mut body).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
+        let body = read_fixture_request(&mut peer).await;
         let cap = adapter_completion_caps(profile)[if step == 2 { 2 } else { 1 }];
         assert_eq!(body["max_completion_tokens"], cap);
         assert_eq!(body["enable_thinking"], false);
@@ -2379,7 +2266,7 @@ async fn adapter_scale_history_fixture(
         assert_eq!(body["messages"], messages);
         let response = if step == 1 {
             // Match the production ChatSchema transport disposition.
-            String::new()
+            Vec::new()
         } else {
             let mut terminal = json!({"choices":[{"delta":{},"finish_reason":"length"}],
                 "usage":{"completion_tokens":cap}});
@@ -2395,12 +2282,9 @@ async fn adapter_scale_history_fixture(
             let payload = format!(
                 "data: {{\"choices\":[{{\"delta\":{{\"content\":\"cedar\"}},\"finish_reason\":null}}]}}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"
             );
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",
-                payload.len()
-            )
+            chunked_sse(&payload)
         };
-        peer.get_mut().write_all(response.as_bytes()).await.unwrap();
+        peer.get_mut().write_all(&response).await.unwrap();
         peer.get_mut().shutdown().await.unwrap();
     }
     if completed_steps < 3 && final_usage.is_none() {
@@ -2464,76 +2348,58 @@ fn native_adapter_generated_history_requires_exact_bound_initial_output() {
 
 #[test]
 fn native_adapter_empty_initial_response_keeps_history_pending() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            let evidence = env::temp_dir().join(format!(
-                "Bonsai-Adapter-Empty-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir(&evidence).unwrap();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let fixture = tokio::spawn(async move {
-                let (peer, _) = listener.accept().await.unwrap();
-                let mut peer = BufReader::new(peer);
-                let mut length = None;
-                loop {
-                    let line = prefix_line(&mut peer, 16 * 1024).await;
-                    if let Some(value) = line.strip_prefix("Content-Length: ") {
-                        length = Some(value.trim().parse::<usize>().unwrap());
-                    }
-                    if line == "\r\n" {
-                        break;
-                    }
-                }
-                let mut body = vec![0; length.unwrap()];
-                peer.read_exact(&mut body).await.unwrap();
-                let payload = concat!(
-                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":1}}\n\n",
-                    "data: [DONE]\n\n"
-                );
-                let wire = format!(
-                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",
-                    payload.len()
-                );
-                peer.get_mut().write_all(wire.as_bytes()).await.unwrap();
-                peer.get_mut().shutdown().await.unwrap();
-            });
-            let profile = &PTQ1_ADAPTER_LIFECYCLE_PROFILE;
-            let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false,
-                "scaleHistoryWorkload":pending_adapter_scale_history()});
-            begin_adapter_requests(profile, &evidence, &mut report);
-            assert!(!adapter_requests(
+    run_timed(Duration::from_secs(10), async {
+        let evidence = TempEvidence::new("Bonsai-Adapter-Empty");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fixture = tokio::spawn(async move {
+            let (peer, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(peer);
+            let _ = read_fixture_request(&mut peer).await;
+            let payload = concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":1}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let wire = chunked_sse(payload);
+            peer.get_mut().write_all(&wire).await.unwrap();
+            peer.get_mut().shutdown().await.unwrap();
+        });
+        let profile = &PTQ1_ADAPTER_LIFECYCLE_PROFILE;
+        let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false,
+            "scaleHistoryWorkload":pending_adapter_scale_history()});
+        begin_adapter_requests(profile, &evidence, &mut report);
+        assert!(
+            !adapter_requests(
                 profile,
                 port,
                 "model-free-fixture",
                 &evidence,
                 tokio::time::Instant::now() + CASE_BUDGET,
                 &mut report,
-            ).await);
-            fixture.await.unwrap();
-            let saved: Value =
-                serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-            assert_eq!(saved["streams"].as_array().unwrap().len(), 1);
-            assert_eq!(saved["streams"][0]["visibleContent"], "");
-            assert_eq!(saved["streams"][0]["visibleContentSha256"], adapter_digest(b""));
-            assert_eq!(saved["streams"][0]["reportedCompletionTokens"], 1);
-            assert_eq!(saved["pendingReason"], "stream-completed-without-visible-content");
-            assert_eq!(saved["scaleHistoryWorkload"]["status"], "pending");
-            assert_eq!(saved["scaleHistoryWorkload"]["suppliedAssistantHistoryIsCapturedModelOutput"], false);
-            assert_eq!(saved["allRequestedWorkloadsPassed"], false);
-            assert!(generated_adapter_history(profile, &saved).is_none());
-            fs::remove_file(evidence.join("acceptance.json")).unwrap();
-            fs::remove_dir(evidence).unwrap();
-        }).await.unwrap();
+            )
+            .await
+        );
+        fixture.await.unwrap();
+        let saved: Value =
+            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
+        assert_eq!(saved["streams"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["streams"][0]["visibleContent"], "");
+        assert_eq!(
+            saved["streams"][0]["visibleContentSha256"],
+            adapter_digest(b"")
+        );
+        assert_eq!(saved["streams"][0]["reportedCompletionTokens"], 1);
+        assert_eq!(
+            saved["pendingReason"],
+            "stream-completed-without-visible-content"
+        );
+        assert_eq!(saved["scaleHistoryWorkload"]["status"], "pending");
+        assert_eq!(
+            saved["scaleHistoryWorkload"]["suppliedAssistantHistoryIsCapturedModelOutput"],
+            false
+        );
+        assert_eq!(saved["allRequestedWorkloadsPassed"], false);
+        assert!(generated_adapter_history(profile, &saved).is_none());
     });
 }
 
@@ -2551,19 +2417,7 @@ async fn adapter_first_request_fixture(
         "required-scale-1.3-stream"
     );
     let mut peer = BufReader::new(peer);
-    let mut length = None;
-    loop {
-        let line = prefix_line(&mut peer, 16 * 1024).await;
-        if let Some(value) = line.strip_prefix("Content-Length: ") {
-            length = Some(value.trim().parse::<usize>().unwrap());
-        }
-        if line == "\r\n" {
-            break;
-        }
-    }
-    let mut body = vec![0; length.unwrap()];
-    peer.read_exact(&mut body).await.unwrap();
-    let body: Value = serde_json::from_slice(&body).unwrap();
+    let body = read_fixture_request(&mut peer).await;
     assert_eq!(body["max_completion_tokens"], 1);
     assert_eq!(body["abliteration_scale"], 1.3);
     reached.send(()).unwrap();
@@ -2572,36 +2426,102 @@ async fn adapter_first_request_fixture(
 
 #[test]
 fn native_adapter_first_request_cancellation_retains_ready_phase_and_missing_work() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            let evidence = env::temp_dir().join(format!(
-                "Bonsai-Adapter-First-Request-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir(&evidence).unwrap();
+    run_timed(Duration::from_secs(10), async {
+        let evidence = TempEvidence::new("Bonsai-Adapter-First-Request");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (reached, waiting) = oneshot::channel();
+        let fixture = tokio::spawn(adapter_first_request_fixture(
+            listener,
+            evidence.to_path_buf(),
+            reached,
+        ));
+        let profile = &PTQ1_ADAPTER_LIFECYCLE_PROFILE;
+        let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false,
+            "verifiedReadinessObserved":true,
+            "scaleHistoryWorkload":pending_adapter_scale_history()});
+        begin_adapter_requests(profile, &evidence, &mut report);
+        let deadline = tokio::time::Instant::now() + CASE_BUDGET;
+        let mut running = Box::pin(adapter_requests(
+            profile,
+            port,
+            "model-free-fixture",
+            &evidence,
+            deadline,
+            &mut report,
+        ));
+        let mut waiting = std::pin::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(result) = waiting.as_mut().poll(cx) {
+                result.unwrap();
+                return std::task::Poll::Ready(());
+            }
+            assert!(running.as_mut().poll(cx).is_pending());
+            std::task::Poll::Pending
+        })
+        .await;
+        drop(running);
+        adapter_request_budget_expired(profile, &evidence, &mut report);
+        // The outer owner advances through cleanup after cancellation.
+        // Preserve the exact failing request independently of that phase.
+        report["phase"] = json!("completed");
+        save_acceptance_report(&evidence, &report);
+        fixture.abort();
+        assert!(fixture.await.unwrap_err().is_cancelled());
+        let saved: Value =
+            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
+        assert_eq!(saved["requestFailurePhase"], "required-scale-1.3-stream");
+        assert_eq!(saved["requestBudgetExpired"], true);
+        assert_eq!(
+            saved["scaleHistoryWorkload"]["reason"],
+            "request-budget-expired"
+        );
+        assert_eq!(saved["scaleHistoryWorkload"]["status"], "pending");
+        for field in [
+            "scaleZeroPassed",
+            "invalidScaleRejected",
+            "changeBackHistoryPassed",
+        ] {
+            assert_eq!(saved["scaleHistoryWorkload"][field], false);
+        }
+        assert_eq!(saved["streams"], json!([]));
+        assert_eq!(saved["allRequestedWorkloadsPassed"], false);
+        assert_eq!(saved["passed"], false);
+    });
+}
+
+#[test]
+fn native_adapter_scale_history_retains_partial_steps_without_qualifying_missing_work() {
+    run_timed(Duration::from_secs(10), async {
+        for (profile, completed_steps) in [
+            &PTQ1_ADAPTER_LIFECYCLE_PROFILE,
+            &PTQ1_ADAPTER_LIFECYCLE_ROW4_PROFILE,
+            &PQ2_ADAPTER_LIFECYCLE_PROFILE,
+        ]
+        .into_iter()
+        .flat_map(|profile| (0..=3).map(move |step| (profile, step)))
+        {
+            let evidence = TempEvidence::new("Bonsai-Adapter-Progress");
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let (reached, waiting) = oneshot::channel();
-            let fixture = tokio::spawn(adapter_first_request_fixture(
+            let fixture = tokio::spawn(adapter_scale_history_fixture(
+                profile,
                 listener,
-                evidence.clone(),
+                completed_steps,
                 reached,
+                None,
             ));
-            let profile = &PTQ1_ADAPTER_LIFECYCLE_PROFILE;
             let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false,
-                "verifiedReadinessObserved":true,
+                "streams":[adapter_initial_fixture(profile)],
                 "scaleHistoryWorkload":pending_adapter_scale_history()});
-            begin_adapter_requests(profile, &evidence, &mut report);
-            let deadline = tokio::time::Instant::now() + CASE_BUDGET;
-            let mut running = Box::pin(adapter_requests(
+            let deadline = tokio::time::Instant::now()
+                + if completed_steps == 0 {
+                    ADAPTER_LIFECYCLE_RESERVE
+                } else {
+                    CASE_BUDGET
+                };
+            let mut running = Box::pin(required_adapter_scale_history(
                 profile,
                 port,
                 "model-free-fixture",
@@ -2610,240 +2530,119 @@ fn native_adapter_first_request_cancellation_retains_ready_phase_and_missing_wor
                 &mut report,
             ));
             let mut waiting = std::pin::pin!(waiting);
-            std::future::poll_fn(|cx| {
-                if let std::task::Poll::Ready(result) = waiting.as_mut().poll(cx) {
+            let passed = std::future::poll_fn(|cx| {
+                if completed_steps > 0
+                    && completed_steps < 3
+                    && let std::task::Poll::Ready(result) = waiting.as_mut().poll(cx)
+                {
                     result.unwrap();
-                    return std::task::Poll::Ready(());
+                    return std::task::Poll::Ready(false);
                 }
-                assert!(running.as_mut().poll(cx).is_pending());
-                std::task::Poll::Pending
+                running.as_mut().poll(cx)
             })
             .await;
             drop(running);
-            adapter_request_budget_expired(profile, &evidence, &mut report);
-            // The outer owner advances through cleanup after cancellation.
-            // Preserve the exact failing request independently of that phase.
-            report["phase"] = json!("completed");
-            save_acceptance_report(&evidence, &report);
-            fixture.abort();
-            assert!(fixture.await.unwrap_err().is_cancelled());
+            if completed_steps < 3 {
+                fixture.abort();
+                assert!(fixture.await.unwrap_err().is_cancelled());
+            } else {
+                fixture.await.unwrap();
+            }
             let saved: Value =
                 serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
                     .unwrap();
-            assert_eq!(saved["requestFailurePhase"], "required-scale-1.3-stream");
-            assert_eq!(saved["requestBudgetExpired"], true);
+            let observed = &saved["scaleHistoryWorkload"];
+            assert_eq!(passed, completed_steps == 3);
             assert_eq!(
-                saved["scaleHistoryWorkload"]["reason"],
-                "request-budget-expired"
+                observed["status"],
+                if passed { "passed" } else { "pending" }
             );
-            assert_eq!(saved["scaleHistoryWorkload"]["status"], "pending");
-            for field in [
-                "scaleZeroPassed",
-                "invalidScaleRejected",
-                "changeBackHistoryPassed",
-            ] {
-                assert_eq!(saved["scaleHistoryWorkload"][field], false);
-            }
-            assert_eq!(saved["streams"], json!([]));
-            assert_eq!(saved["allRequestedWorkloadsPassed"], false);
+            assert_eq!(observed["scaleZeroPassed"], completed_steps >= 1);
+            assert_eq!(observed["invalidScaleRejected"], completed_steps >= 2);
+            assert_eq!(observed["changeBackHistoryPassed"], completed_steps == 3);
+            assert_generated_history_retention(profile, completed_steps, &saved);
             assert_eq!(saved["passed"], false);
-            fs::remove_file(evidence.join("acceptance.json")).unwrap();
-            fs::remove_dir(evidence).unwrap();
-        })
-        .await
-        .unwrap();
-    });
-}
-
-#[test]
-fn native_adapter_scale_history_retains_partial_steps_without_qualifying_missing_work() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            for (profile, completed_steps) in [
-                &PTQ1_ADAPTER_LIFECYCLE_PROFILE,
-                &PTQ1_ADAPTER_LIFECYCLE_ROW4_PROFILE,
-                &PQ2_ADAPTER_LIFECYCLE_PROFILE,
-            ]
-            .into_iter()
-            .flat_map(|profile| (0..=3).map(move |step| (profile, step)))
-            {
-                let evidence = env::temp_dir().join(format!(
-                    "Bonsai-Adapter-Progress-{}-{}-{completed_steps}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ));
-                fs::create_dir(&evidence).unwrap();
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let port = listener.local_addr().unwrap().port();
-                let (reached, waiting) = oneshot::channel();
-                let fixture = tokio::spawn(adapter_scale_history_fixture(
-                    profile,
-                    listener,
-                    completed_steps,
-                    reached,
-                    None,
-                ));
-                let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false,
-                    "streams":[adapter_initial_fixture(profile)],
-                    "scaleHistoryWorkload":pending_adapter_scale_history()});
-                let deadline = tokio::time::Instant::now()
-                    + if completed_steps == 0 {
-                        ADAPTER_LIFECYCLE_RESERVE
-                    } else {
-                        CASE_BUDGET
-                    };
-                let mut running = Box::pin(required_adapter_scale_history(
-                    profile,
-                    port,
-                    "model-free-fixture",
-                    &evidence,
-                    deadline,
-                    &mut report,
-                ));
-                let mut waiting = std::pin::pin!(waiting);
-                let passed = std::future::poll_fn(|cx| {
-                    if completed_steps > 0
-                        && completed_steps < 3
-                        && let std::task::Poll::Ready(result) = waiting.as_mut().poll(cx)
-                    {
-                        result.unwrap();
-                        return std::task::Poll::Ready(false);
-                    }
-                    running.as_mut().poll(cx)
-                })
-                .await;
-                drop(running);
-                if completed_steps < 3 {
-                    fixture.abort();
-                    assert!(fixture.await.unwrap_err().is_cancelled());
-                } else {
-                    fixture.await.unwrap();
-                }
-                let saved: Value =
-                    serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
-                        .unwrap();
-                let observed = &saved["scaleHistoryWorkload"];
-                assert_eq!(passed, completed_steps == 3);
-                assert_eq!(
-                    observed["status"],
-                    if passed { "passed" } else { "pending" }
-                );
-                assert_eq!(observed["scaleZeroPassed"], completed_steps >= 1);
-                assert_eq!(observed["invalidScaleRejected"], completed_steps >= 2);
-                assert_eq!(observed["changeBackHistoryPassed"], completed_steps == 3);
-                assert_generated_history_retention(profile, completed_steps, &saved);
-                assert_eq!(saved["passed"], false);
-                assert_eq!(saved["allRequestedWorkloadsPassed"], false);
-                assert_eq!(
-                    saved["streams"].as_array().unwrap().len(),
-                    1 + usize::from(completed_steps >= 1) + usize::from(completed_steps == 3)
-                );
-                if completed_steps == 0 {
-                    assert_eq!(observed["reason"], "insufficient-owned-cleanup-reserve");
-                }
-                fs::remove_file(evidence.join("acceptance.json")).unwrap();
-                fs::remove_dir(evidence).unwrap();
+            assert_eq!(saved["allRequestedWorkloadsPassed"], false);
+            assert_eq!(
+                saved["streams"].as_array().unwrap().len(),
+                1 + usize::from(completed_steps >= 1) + usize::from(completed_steps == 3)
+            );
+            if completed_steps == 0 {
+                assert_eq!(observed["reason"], "insufficient-owned-cleanup-reserve");
             }
-        })
-        .await
-        .unwrap();
+        }
     });
 }
 
 #[test]
 fn native_adapter_scale_history_requires_reported_bounded_terminal_usage() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        timeout(Duration::from_secs(10), async {
-            for profile in [
-                &PTQ1_ADAPTER_LIFECYCLE_PROFILE,
-                &PTQ1_ADAPTER_LIFECYCLE_ROW4_PROFILE,
-                &PQ2_ADAPTER_LIFECYCLE_PROFILE,
-            ] {
-                for completed_steps in [1, 3] {
-                    let cap =
-                        adapter_completion_caps(profile)[if completed_steps == 1 { 1 } else { 2 }];
-                    let mut cases = vec![
-                        (Value::Null, "stream-completed-without-reported-token-usage"),
-                        (json!(0), "visible-stream-reported-zero-completion-tokens"),
-                        (json!(cap + 1), "stream-reported-over-cap-token-usage"),
-                    ];
-                    if cap > 1 {
-                        cases.push((
-                            json!(cap - 1),
-                            "length-termination-before-reported-token-cap",
-                        ));
-                    }
-                    for (usage, reason) in cases {
-                        let evidence = env::temp_dir().join(format!(
-                            "Bonsai-Adapter-Usage-{}-{}",
-                            std::process::id(),
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos()
-                        ));
-                        fs::create_dir(&evidence).unwrap();
-                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                        let port = listener.local_addr().unwrap().port();
-                        let (reached, _waiting) = oneshot::channel();
-                        let fixture = tokio::spawn(adapter_scale_history_fixture(
+    run_timed(Duration::from_secs(10), async {
+        for profile in [
+            &PTQ1_ADAPTER_LIFECYCLE_PROFILE,
+            &PTQ1_ADAPTER_LIFECYCLE_ROW4_PROFILE,
+            &PQ2_ADAPTER_LIFECYCLE_PROFILE,
+        ] {
+            for completed_steps in [1, 3] {
+                let cap =
+                    adapter_completion_caps(profile)[if completed_steps == 1 { 1 } else { 2 }];
+                let mut cases = vec![
+                    (Value::Null, "stream-completed-without-reported-token-usage"),
+                    (json!(0), "visible-stream-reported-zero-completion-tokens"),
+                    (json!(cap + 1), "stream-reported-over-cap-token-usage"),
+                ];
+                if cap > 1 {
+                    cases.push((
+                        json!(cap - 1),
+                        "length-termination-before-reported-token-cap",
+                    ));
+                }
+                for (usage, reason) in cases {
+                    let evidence = TempEvidence::new("Bonsai-Adapter-Usage");
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    let (reached, _waiting) = oneshot::channel();
+                    let fixture = tokio::spawn(adapter_scale_history_fixture(
+                        profile,
+                        listener,
+                        completed_steps,
+                        reached,
+                        Some(usage.clone()),
+                    ));
+                    let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false,
+                        "streams":[adapter_initial_fixture(profile)],
+                        "scaleHistoryWorkload":pending_adapter_scale_history()});
+                    assert!(
+                        !required_adapter_scale_history(
                             profile,
-                            listener,
-                            completed_steps,
-                            reached,
-                            Some(usage.clone()),
-                        ));
-                        let mut report = json!({"passed":false, "allRequestedWorkloadsPassed":false,
-                            "streams":[adapter_initial_fixture(profile)],
-                            "scaleHistoryWorkload":pending_adapter_scale_history()});
-                        assert!(
-                            !required_adapter_scale_history(
-                                profile,
-                                port,
-                                "model-free-fixture",
-                                &evidence,
-                                tokio::time::Instant::now() + CASE_BUDGET,
-                                &mut report,
-                            )
-                            .await
-                        );
-                        fixture.await.unwrap();
-                        let saved: Value = serde_json::from_slice(
-                            &fs::read(evidence.join("acceptance.json")).unwrap(),
+                            port,
+                            "model-free-fixture",
+                            &evidence,
+                            tokio::time::Instant::now() + CASE_BUDGET,
+                            &mut report,
                         )
-                        .unwrap();
-                        let observed = &saved["scaleHistoryWorkload"];
-                        assert_eq!(observed["status"], "pending");
-                        assert_eq!(observed["reason"], reason);
-                        assert_eq!(observed["scaleZeroPassed"], completed_steps == 3);
-                        assert_eq!(observed["invalidScaleRejected"], completed_steps == 3);
-                        assert_eq!(observed["changeBackHistoryPassed"], false);
-                        let stream = saved["streams"].as_array().unwrap().last().unwrap();
-                        assert_eq!(stream["passed"], false);
-                        assert_eq!(stream["pendingReason"], reason);
-                        assert_eq!(stream["visibleContent"], "cedar");
-                        assert_eq!(stream["reportedCompletionTokens"], usage);
-                        assert_eq!(saved["passed"], false);
-                        assert_eq!(saved["allRequestedWorkloadsPassed"], false);
-                        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-                        fs::remove_dir(evidence).unwrap();
-                    }
+                        .await
+                    );
+                    fixture.await.unwrap();
+                    let saved: Value = serde_json::from_slice(
+                        &fs::read(evidence.join("acceptance.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let observed = &saved["scaleHistoryWorkload"];
+                    assert_eq!(observed["status"], "pending");
+                    assert_eq!(observed["reason"], reason);
+                    assert_eq!(observed["scaleZeroPassed"], completed_steps == 3);
+                    assert_eq!(observed["invalidScaleRejected"], completed_steps == 3);
+                    assert_eq!(observed["changeBackHistoryPassed"], false);
+                    let stream = saved["streams"].as_array().unwrap().last().unwrap();
+                    assert_eq!(stream["passed"], false);
+                    assert_eq!(stream["pendingReason"], reason);
+                    assert_eq!(stream["visibleContent"], "cedar");
+                    assert_eq!(stream["reportedCompletionTokens"], usage);
+                    assert_eq!(saved["passed"], false);
+                    assert_eq!(saved["allRequestedWorkloadsPassed"], false);
                 }
             }
-        })
-        .await
-        .unwrap();
+        }
     });
 }
 
@@ -3004,34 +2803,14 @@ fn native_ptq1_lifecycle_minimizes_tokens_without_changing_required_steps() {
 
 #[test]
 fn native_adapter_startup_budget_retains_pending_receipt_and_cleanup_reserve() {
-    struct InFlight(std::rc::Rc<std::cell::Cell<bool>>);
-    impl Drop for InFlight {
-        fn drop(&mut self) {
-            self.0.set(true);
-        }
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Adapter-Startup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_paused(async {
+        let evidence = TempEvidence::new("Bonsai-Adapter-Startup");
         for allowance in [STOP_WAIT, STOP_WAIT + Duration::from_secs(1)] {
             let mut report = json!({"passed":false,"lifecyclePassed":false,
                 "allRequestedWorkloadsPassed":false,"verifiedReadinessObserved":false,
                 "scaleHistoryWorkload":pending_adapter_scale_history()});
             let started = std::cell::Cell::new(false);
-            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
-            let in_flight = InFlight(dropped.clone());
+            let (in_flight, dropped) = drop_flag();
             let deadline = tokio::time::Instant::now() + allowance;
             let progress = Mutex::new(Vec::new());
             let owner =
@@ -3092,39 +2871,17 @@ fn native_adapter_startup_budget_retains_pending_receipt_and_cleanup_reserve() {
         assert_eq!(report["startupBudgetExpired"], false);
         assert_eq!(deadline - tokio::time::Instant::now(), CASE_BUDGET);
         assert!(report["pendingReason"].is_null());
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
 #[test]
 fn native_adapter_startup_timeout_retains_failure_before_original_deadline() {
-    struct InFlight(std::rc::Rc<std::cell::Cell<bool>>);
-    impl Drop for InFlight {
-        fn drop(&mut self) {
-            self.0.set(true);
-        }
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Adapter-Startup-Timeout-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_paused(async {
+        let evidence = TempEvidence::new("Bonsai-Adapter-Startup-Timeout");
         let deadline = tokio::time::Instant::now() + WAIT + STOP_WAIT + Duration::from_secs(2);
         let mut report = json!({"passed":false,"verifiedReadinessObserved":false});
         let progress = Mutex::new(Vec::new());
-        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
-        let in_flight = InFlight(dropped.clone());
+        let (in_flight, dropped) = drop_flag();
         let owner = adapter_start_before_cleanup(
             deadline,
             &evidence,
@@ -3166,28 +2923,13 @@ fn native_adapter_startup_timeout_retains_failure_before_original_deadline() {
             adapter_startup_with_timeout(async { Err::<(), _>(LaunchError::Process) }).await,
             Err(LaunchError::Process)
         );
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
 #[test]
 fn native_adapter_startup_error_retains_unfinished_phase_without_qualifying_cleanup() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let evidence = env::temp_dir().join(format!(
-            "Bonsai-Adapter-Startup-Error-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&evidence).unwrap();
+    run_paused(async {
+        let evidence = TempEvidence::new("Bonsai-Adapter-Startup-Error");
         let deadline = tokio::time::Instant::now() + CASE_BUDGET;
         let mut report = json!({"passed":false});
         let progress = Mutex::new(vec![StartupProgress {
@@ -3212,33 +2954,19 @@ fn native_adapter_startup_error_retains_unfinished_phase_without_qualifying_clea
         let saved: Value =
             serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
         assert_eq!(saved, report);
-        fs::remove_file(evidence.join("acceptance.json")).unwrap();
-        fs::remove_dir(evidence).unwrap();
     });
 }
 
 #[test]
 fn native_adapter_request_budget_drops_inflight_work_before_owned_cleanup() {
-    struct InFlight(std::rc::Rc<std::cell::Cell<bool>>);
-    impl Drop for InFlight {
-        fn drop(&mut self) {
-            self.0.set(true);
-        }
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    run_paused(async {
         for allowance in [
             Duration::ZERO,
             STOP_WAIT,
             STOP_WAIT + Duration::from_secs(1),
         ] {
             let started = std::cell::Cell::new(false);
-            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
-            let in_flight = InFlight(dropped.clone());
+            let (in_flight, dropped) = drop_flag();
             let deadline = tokio::time::Instant::now() + allowance;
             let result = adapter_work_before_cleanup(deadline, async {
                 let _in_flight = in_flight;
@@ -3293,30 +3021,22 @@ fn pinned_native_ptq1_adapter_starts_and_streams_within_device_budget() {
         "sameOwnerAfterInvalidScalePassed":false, "invalidScaleRejected":false,
         "unrunIndependentGates":["signed-zero-and-scale-2", "context-rejection-and-reuse", "fresh-owner-restart",
             "supplied-history", "extended-history", "stalled-consumer", "full-context-and-output"],
-        "runtimeLock":serde_json::from_str::<Value>(include_str!("../../../config/prism-inference.lock.json")).unwrap(),
-        "modelExportReceipt":serde_json::from_str::<Value>(include_str!("../../../config/swift.ptq1-export.json")).unwrap(),
-        "adapterLock":serde_json::from_str::<Value>(include_str!("../../../config/swift-lora.lock.json")).unwrap(),
+        "runtimeLock":runtime_lock(),
+        "modelExportReceipt":ptq1_export_lock(),
+        "adapterLock":adapter_lock(),
         "adapterRequested":true, "adapterEnabled":false, "verifiedReadinessObserved":false, "completeStateParityQualified":false, "authoringBasisQualified":false,
         "fullContextQualified":false, "fullOutputQualified":false, "performanceQualified":false,
         "qualityQualified":false, "dailyServiceIsolationQualified":false, "defaultRuntimeQualified":false});
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
-        timeout(
+    run_timed(
+        budget,
+        bounded_adapter_acceptance(
+            &PTQ1_ADAPTER_PROFILE,
+            Path::new(&data),
+            evidence,
             budget,
-            bounded_adapter_acceptance(
-                &PTQ1_ADAPTER_PROFILE,
-                Path::new(&data),
-                evidence,
-                budget,
-                &mut report,
-            ),
-        )
-        .await
-        .unwrap();
-    }));
+            &mut report,
+        ),
+    );
     assert_eq!(
         report["passed"], true,
         "Adapter acceptance remains pending."
@@ -3336,12 +3056,10 @@ fn pinned_native_pq2_adapter_row4_starts_and_streams_within_device_budget() {
         ),
         Some(PQ2_ADAPTER_ROW4_CASE)
     );
-    let runtime_lock =
-        serde_json::from_str::<Value>(include_str!("../../../config/prism-inference.lock.json"))
-            .unwrap();
+    let runtime = runtime_lock();
     assert!(native_four_worker_release(
-        runtime_lock["version"].as_str(),
-        runtime_lock["commit"].as_str(),
+        runtime["version"].as_str(),
+        runtime["commit"].as_str(),
     ));
     let data = env::var_os("BONSAI_NATIVE_DATA").unwrap();
     let evidence = env::var_os("BONSAI_NATIVE_EVIDENCE").unwrap();
@@ -3354,9 +3072,9 @@ fn pinned_native_pq2_adapter_row4_starts_and_streams_within_device_budget() {
         "wholeJobMaximumSeconds":whole_job_budget().as_secs(),
         "configuredNativeRowWorkers":4, "rowWorkerCountIndependentlyObserved":false,
         "requiredStreams":1, "requestedAdapterScale":1.3, "requestedCompletionCap":4,
-        "weightRepresentation":"PQ2_0", "runtimeLock":runtime_lock,
-        "modelIdentity":serde_json::from_str::<Value>(include_str!("../../../config/swift-assessment.lock.json")).unwrap()["model"],
-        "adapterLock":serde_json::from_str::<Value>(include_str!("../../../config/swift-lora.lock.json")).unwrap(),
+        "weightRepresentation":"PQ2_0", "runtimeLock":runtime,
+        "modelIdentity":model_lock()["model"],
+        "adapterLock":adapter_lock(),
         "adapterRequested":true, "adapterEnabled":false, "verifiedReadinessObserved":false,
         "sameOwnerAfterInvalidScalePassed":false, "invalidScaleRejected":false,
         "unrunIndependentGates":["multi-scale-and-signed-zero", "invalid-scale-and-reuse", "context-rejection-and-reuse",
@@ -3365,24 +3083,16 @@ fn pinned_native_pq2_adapter_row4_starts_and_streams_within_device_budget() {
         "completeStateParityQualified":false, "authoringBasisQualified":false,
         "fullContextQualified":false, "fullOutputQualified":false, "performanceQualified":false,
         "qualityQualified":false, "dailyServiceIsolationQualified":false, "defaultRuntimeQualified":false});
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
-        timeout(
+    run_timed(
+        budget,
+        bounded_adapter_acceptance(
+            &PQ2_ADAPTER_ROW4_PROFILE,
+            Path::new(&data),
+            evidence,
             budget,
-            bounded_adapter_acceptance(
-                &PQ2_ADAPTER_ROW4_PROFILE,
-                Path::new(&data),
-                evidence,
-                budget,
-                &mut report,
-            ),
-        )
-        .await
-        .unwrap();
-    }));
+            &mut report,
+        ),
+    );
     assert_eq!(
         report["passed"], true,
         "Adapter acceptance remains pending."
@@ -3445,9 +3155,9 @@ fn adapter_scale_history_acceptance(profile: &AdapterProfile) {
         "initialMessages":adapter_messages(profile, false),
         "suppliedHistoryMessages":null,
         "weightRepresentation":representation,
-        "runtimeLock":serde_json::from_str::<Value>(include_str!("../../../config/prism-inference.lock.json")).unwrap(),
-        "modelIdentity":serde_json::from_str::<Value>(include_str!("../../../config/swift-assessment.lock.json")).unwrap()["model"],
-        "adapterLock":serde_json::from_str::<Value>(include_str!("../../../config/swift-lora.lock.json")).unwrap(),
+        "runtimeLock":runtime_lock(),
+        "modelIdentity":model_lock()["model"],
+        "adapterLock":adapter_lock(),
         "adapterRequested":true, "adapterEnabled":false, "verifiedReadinessObserved":false,
         "sameOwnerAfterInvalidScalePassed":false, "invalidScaleRejected":false,
         "unrunIndependentGates":["signed-zero-and-scale-2", "context-rejection-and-reuse", "fresh-owner-restart",
@@ -3457,30 +3167,21 @@ fn adapter_scale_history_acceptance(profile: &AdapterProfile) {
         "fullContextQualified":false, "fullOutputQualified":false, "performanceQualified":false,
         "qualityQualified":false, "dailyServiceIsolationQualified":false, "defaultRuntimeQualified":false});
     if profile.repacked {
-        let export: Value =
-            serde_json::from_str(include_str!("../../../config/swift.ptq1-export.json")).unwrap();
+        let export = ptq1_export_lock();
         report["modelIdentity"] = json!({"filename":export["OutputFilename"],
             "bytes":export["OutputBytes"], "sha256":export["OutputSha256"]});
-        report["modelExportReceipt"] = export;
+        report["modelExportReceipt"] = export.clone();
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
-        timeout(
+    run_timed(
+        budget,
+        bounded_adapter_acceptance(
+            profile,
+            Path::new(&data),
+            Path::new(&evidence),
             budget,
-            bounded_adapter_acceptance(
-                profile,
-                Path::new(&data),
-                Path::new(&evidence),
-                budget,
-                &mut report,
-            ),
-        )
-        .await
-        .unwrap();
-    }));
+            &mut report,
+        ),
+    );
     // Admission failure, budget exhaustion or a skipped required step cannot
     // turn a successful initial smoke/owned cleanup into lifecycle acceptance.
     assert_eq!(
@@ -3550,22 +3251,10 @@ fn native_case_budget_extension_requires_a_valid_predeclared_total() {
 
 #[test]
 fn native_case_budget_cancels_owned_tasks_before_followup() {
-    struct Owned(std::rc::Rc<std::cell::Cell<bool>>);
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            self.0.set(true);
-        }
-    }
-    let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (owner, dropped) = drop_flag();
     let followed = std::rc::Rc::new(std::cell::Cell::new(false));
-    let owner = Owned(dropped.clone());
     let observed = followed.clone();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    runtime.block_on(LocalSet::new().run_until(async {
+    run_paused(async {
         let result = timeout(CASE_BUDGET, async {
             spawn_local(async move {
                 let _owner = owner;
@@ -3577,7 +3266,7 @@ fn native_case_budget_cancels_owned_tasks_before_followup() {
         })
         .await;
         assert!(result.is_err());
-    }));
+    });
     assert!(dropped.get());
     assert!(!followed.get());
 }
