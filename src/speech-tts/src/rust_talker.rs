@@ -8,13 +8,7 @@
     reason = "Keep the serving types private to this crate."
 )]
 
-use std::{
-    io,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-};
+use std::io;
 
 use crate::{
     engine::{
@@ -90,48 +84,6 @@ impl Geometry {
     }
 }
 
-trait TalkerWeightSource {
-    fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>>;
-    fn projection(
-        &mut self,
-        name: &str,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> io::Result<LinearProjection>;
-}
-
-impl TalkerWeightSource for Weights {
-    fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
-        Self::tensor_f32(self, name, shape)
-    }
-
-    fn projection(
-        &mut self,
-        name: &str,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> io::Result<LinearProjection> {
-        Self::projection(self, name, in_dim, out_dim)
-    }
-}
-
-struct MappedTalkerWeights<'a>(&'a Weights);
-
-impl TalkerWeightSource for MappedTalkerWeights<'_> {
-    fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
-        self.0.tensor_f32_mapped(name, shape)
-    }
-
-    fn projection(
-        &mut self,
-        name: &str,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> io::Result<LinearProjection> {
-        self.0.projection_mapped(name, in_dim, out_dim, 1)
-    }
-}
-
 struct TalkerGlobals {
     text_fc1: LinearProjection,
     text_fc2: LinearProjection,
@@ -142,8 +94,8 @@ struct TalkerGlobals {
     cp_norm_w: Vec<f32>,
 }
 
-fn load_talker_globals<W: TalkerWeightSource + ?Sized>(
-    weights: &mut W,
+fn load_talker_globals(
+    weights: &Weights,
     geometry: &Geometry,
     predictor_geometry: &Geometry,
     text_dim: usize,
@@ -182,8 +134,8 @@ fn load_talker_globals<W: TalkerWeightSource + ?Sized>(
     })
 }
 
-fn load_codebook_pair<W: TalkerWeightSource + ?Sized>(
-    weights: &mut W,
+fn load_codebook_pair(
+    weights: &Weights,
     hidden: usize,
     cp_hidden: usize,
     cp_vocab: usize,
@@ -203,9 +155,9 @@ fn load_codebook_pair<W: TalkerWeightSource + ?Sized>(
 }
 
 impl Geometry {
-    fn load_layer<W: TalkerWeightSource + ?Sized>(
+    fn load_layer(
         &self,
-        weights: &mut W,
+        weights: &Weights,
         prefix: &str,
         index: usize,
     ) -> io::Result<QwenDecoderLayer> {
@@ -239,18 +191,6 @@ impl Geometry {
                 self.hidden,
             )?,
         })
-    }
-
-    fn load_layers(
-        &self,
-        weights: &mut Weights,
-        prefix: &str,
-    ) -> io::Result<Vec<QwenDecoderLayer>> {
-        let mut result = Vec::with_capacity(self.layers);
-        for index in 0..self.layers {
-            result.push(self.load_layer(weights, prefix, index)?);
-        }
-        Ok(result)
     }
 }
 
@@ -469,14 +409,14 @@ impl PrefillCache {
 
 impl Talker {
     pub(crate) fn load(
-        weights: &mut Weights,
+        weights: &Weights,
         tokenizer: Tokenizer,
         threads: usize,
     ) -> io::Result<Self> {
         Self::load_components(weights, Some(tokenizer), threads)
     }
 
-    pub(crate) fn load_with_weights(weights: &mut Weights, threads: usize) -> io::Result<Self> {
+    pub(crate) fn load_with_weights(weights: &Weights, threads: usize) -> io::Result<Self> {
         Self::load_components(weights, None, threads)
     }
 
@@ -485,10 +425,18 @@ impl Talker {
         reason = "Load and validate the complete pinned Talker/predictor tensor inventory atomically."
     )]
     fn load_components(
-        weights: &mut Weights,
+        weights: &Weights,
         provided_tokenizer: Option<Tokenizer>,
         threads: usize,
     ) -> io::Result<Self> {
+        enum TalkerLoadItem {
+            Tokenizer(Tokenizer),
+            Globals(TalkerGlobals),
+            Layer(QwenDecoderLayer),
+            CpLayer(QwenDecoderLayer),
+            Codebook(LinearProjection, LinearProjection),
+        }
+
         if !(1..=256).contains(&threads) {
             return Err(invalid("Invalid speech CPU worker count."));
         }
@@ -519,232 +467,73 @@ impl Talker {
         }
         let specials = Specials::load(weights, geometry.vocab, text_vocab)?;
 
-        let (text_embedding, tokenizer, globals, layers, cp_layers, codec_embeddings, lm_heads) =
-            if weights.is_mapped() && threads > 1 {
-                let text_embedding = weights.projection_mapped(
-                    "talker.text_embd.weight",
+        let text_embedding = weights.projection_with_threads(
+            "talker.text_embd.weight",
+            text_dim,
+            text_vocab,
+            threads,
+        )?;
+        let tokenizer_offset = usize::from(provided_tokenizer.is_none());
+        let globals_task = tokenizer_offset;
+        let layer_start = globals_task + 1;
+        let cp_start = layer_start + geometry.layers;
+        let codebook_start = cp_start + predictor_geometry.layers;
+        let total_tasks = codebook_start + 15;
+        let build_threads = if weights.is_mapped() { threads } else { 1 };
+        let items = crate::weights::parallel_build(total_tasks, build_threads, |task| {
+            if task < tokenizer_offset {
+                Ok(TalkerLoadItem::Tokenizer(Tokenizer::from_weights(weights)?))
+            } else if task == globals_task {
+                Ok(TalkerLoadItem::Globals(load_talker_globals(
+                    weights,
+                    &geometry,
+                    &predictor_geometry,
                     text_dim,
-                    text_vocab,
-                    threads,
-                )?;
-                let tokenizer_offset = usize::from(provided_tokenizer.is_none());
-                let globals_task = tokenizer_offset;
-                let layer_start = globals_task + 1;
-                let cp_start = layer_start + geometry.layers;
-                let codebook_start = cp_start + predictor_geometry.layers;
-                let total_tasks = codebook_start + 15;
-
-                let tokenizer_slot: Mutex<Option<io::Result<Tokenizer>>> =
-                    Mutex::new(provided_tokenizer.map(Ok));
-                let globals_slot: Mutex<Option<io::Result<TalkerGlobals>>> = Mutex::new(None);
-                let layer_slots: Vec<Mutex<Option<io::Result<QwenDecoderLayer>>>> =
-                    (0..geometry.layers).map(|_| Mutex::new(None)).collect();
-                let cp_slots: Vec<Mutex<Option<io::Result<QwenDecoderLayer>>>> = (0
-                    ..predictor_geometry.layers)
-                    .map(|_| Mutex::new(None))
-                    .collect();
-                let codebook_slots: Vec<
-                    Mutex<Option<io::Result<(LinearProjection, LinearProjection)>>>,
-                > = (0..15).map(|_| Mutex::new(None)).collect();
-
-                let next_task = AtomicUsize::new(0);
-                let abort = AtomicBool::new(false);
-                let workers = threads.min(total_tasks);
-                let weights_ref: &Weights = weights;
-
-                let run_worker = || {
-                    let mut source = MappedTalkerWeights(weights_ref);
-                    loop {
-                        if abort.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let task = next_task.fetch_add(1, Ordering::Relaxed);
-                        if task >= total_tasks {
-                            break;
-                        }
-                        if task < tokenizer_offset {
-                            let res = Tokenizer::from_weights(weights_ref);
-                            if res.is_err() {
-                                abort.store(true, Ordering::Release);
-                            }
-                            if let Ok(mut guard) = tokenizer_slot.lock() {
-                                *guard = Some(res);
-                            }
-                        } else if task == globals_task {
-                            let res = load_talker_globals(
-                                &mut source,
-                                &geometry,
-                                &predictor_geometry,
-                                text_dim,
-                            );
-                            if res.is_err() {
-                                abort.store(true, Ordering::Release);
-                            }
-                            if let Ok(mut guard) = globals_slot.lock() {
-                                *guard = Some(res);
-                            }
-                        } else if task < cp_start {
-                            let idx = task - layer_start;
-                            let res = geometry.load_layer(&mut source, "talker", idx);
-                            if res.is_err() {
-                                abort.store(true, Ordering::Release);
-                            }
-                            if let Some(slot) = layer_slots.get(idx)
-                                && let Ok(mut guard) = slot.lock()
-                            {
-                                *guard = Some(res);
-                            }
-                        } else if task < codebook_start {
-                            let idx = task - cp_start;
-                            let res = predictor_geometry
-                                .load_layer(&mut source, "code_pred", idx)
-                                .map(|mut layer| {
-                                    #[cfg(windows)]
-                                    {
-                                        layer.q_proj.repack_q4_k_if_aligned();
-                                        layer.k_proj.repack_q4_k_if_aligned();
-                                        layer.v_proj.repack_q4_k_if_aligned();
-                                        layer.o_proj.repack_q4_k_if_aligned();
-                                        layer.gate_proj.repack_q4_k_if_aligned();
-                                        layer.up_proj.repack_q4_k_if_aligned();
-                                        layer.down_proj.repack_q4_k_if_aligned();
-                                    }
-                                    layer
-                                });
-                            if res.is_err() {
-                                abort.store(true, Ordering::Release);
-                            }
-                            if let Some(slot) = cp_slots.get(idx)
-                                && let Ok(mut guard) = slot.lock()
-                            {
-                                *guard = Some(res);
-                            }
-                        } else {
-                            let codebook = task - codebook_start;
-                            let res = load_codebook_pair(
-                                &mut source,
-                                geometry.hidden,
-                                predictor_geometry.hidden,
-                                predictor_geometry.vocab,
-                                codebook,
-                            );
-                            if res.is_err() {
-                                abort.store(true, Ordering::Release);
-                            }
-                            if let Some(slot) = codebook_slots.get(codebook)
-                                && let Ok(mut guard) = slot.lock()
-                            {
-                                *guard = Some(res);
-                            }
-                        }
-                    }
-                };
-
-                std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(workers.saturating_sub(1));
-                    for _ in 0..workers.saturating_sub(1) {
-                        handles.push(scope.spawn(run_worker));
-                    }
-                    run_worker();
-                    for handle in handles {
-                        let _ = handle.join();
-                    }
-                });
-
-                let tokenizer = tokenizer_slot
-                    .into_inner()
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| Err(invalid("Missing Talker tokenizer.")))?;
-                let globals = globals_slot
-                    .into_inner()
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| Err(invalid("Missing Talker projections.")))?;
-                let mut layers = Vec::with_capacity(geometry.layers);
-                for slot in layer_slots {
-                    let item = slot
-                        .into_inner()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| Err(invalid("Missing Talker layer.")))?;
-                    layers.push(item);
-                }
-                let mut cp_layers = Vec::with_capacity(predictor_geometry.layers);
-                for slot in cp_slots {
-                    let item = slot
-                        .into_inner()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| Err(invalid("Missing CodePredictor layer.")))?;
-                    cp_layers.push(item);
-                }
-                let mut codec_embeddings = Vec::with_capacity(15);
-                let mut lm_heads = Vec::with_capacity(15);
-                for slot in codebook_slots {
-                    let (embd, head) = slot
-                        .into_inner()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| Err(invalid("Missing CodePredictor codebook.")))?;
-                    codec_embeddings.push(embd);
-                    lm_heads.push(head);
-                }
-                (
-                    text_embedding,
-                    tokenizer,
-                    globals,
-                    layers,
-                    cp_layers,
-                    codec_embeddings,
-                    lm_heads,
-                )
-            } else {
-                let tokenizer = match provided_tokenizer {
-                    Some(tok) => tok,
-                    None => Tokenizer::from_weights(weights)?,
-                };
-                let text_embedding =
-                    weights.projection("talker.text_embd.weight", text_dim, text_vocab)?;
-                let globals =
-                    load_talker_globals(weights, &geometry, &predictor_geometry, text_dim)?;
-                let layers = geometry.load_layers(weights, "talker")?;
-                let mut codec_embeddings = Vec::with_capacity(15);
-                let mut lm_heads = Vec::with_capacity(15);
-                for codebook in 0..15 {
-                    let (embd, head) = load_codebook_pair(
-                        weights,
-                        geometry.hidden,
-                        predictor_geometry.hidden,
-                        predictor_geometry.vocab,
-                        codebook,
-                    )?;
-                    codec_embeddings.push(embd);
-                    lm_heads.push(head);
-                }
-                let mut cp_layers = predictor_geometry.load_layers(weights, "code_pred")?;
+                )?))
+            } else if task < cp_start {
+                Ok(TalkerLoadItem::Layer(geometry.load_layer(
+                    weights,
+                    "talker",
+                    task - layer_start,
+                )?))
+            } else if task < codebook_start {
+                let mut layer =
+                    predictor_geometry.load_layer(weights, "code_pred", task - cp_start)?;
                 #[cfg(windows)]
-                {
-                    for layer in &mut cp_layers {
-                        layer.q_proj.repack_q4_k_if_aligned();
-                        layer.k_proj.repack_q4_k_if_aligned();
-                        layer.v_proj.repack_q4_k_if_aligned();
-                        layer.o_proj.repack_q4_k_if_aligned();
-                        layer.gate_proj.repack_q4_k_if_aligned();
-                        layer.up_proj.repack_q4_k_if_aligned();
-                        layer.down_proj.repack_q4_k_if_aligned();
-                    }
+                layer.repack_q4_k_if_aligned();
+                Ok(TalkerLoadItem::CpLayer(layer))
+            } else {
+                let (embd, head) = load_codebook_pair(
+                    weights,
+                    geometry.hidden,
+                    predictor_geometry.hidden,
+                    predictor_geometry.vocab,
+                    task - codebook_start,
+                )?;
+                Ok(TalkerLoadItem::Codebook(embd, head))
+            }
+        })?;
+
+        let mut tokenizer = provided_tokenizer;
+        let mut globals = None;
+        let mut layers = Vec::with_capacity(geometry.layers);
+        let mut cp_layers = Vec::with_capacity(predictor_geometry.layers);
+        let mut codec_embeddings = Vec::with_capacity(15);
+        let mut lm_heads = Vec::with_capacity(15);
+        for item in items {
+            match item {
+                TalkerLoadItem::Tokenizer(tok) => tokenizer = Some(tok),
+                TalkerLoadItem::Globals(loaded_globals) => globals = Some(loaded_globals),
+                TalkerLoadItem::Layer(layer) => layers.push(layer),
+                TalkerLoadItem::CpLayer(layer) => cp_layers.push(layer),
+                TalkerLoadItem::Codebook(embd, head) => {
+                    codec_embeddings.push(embd);
+                    lm_heads.push(head);
                 }
-                (
-                    text_embedding,
-                    tokenizer,
-                    globals,
-                    layers,
-                    cp_layers,
-                    codec_embeddings,
-                    lm_heads,
-                )
-            };
+            }
+        }
+        let tokenizer = tokenizer.ok_or_else(|| invalid("Missing Talker tokenizer."))?;
+        let globals = globals.ok_or_else(|| invalid("Missing Talker projections."))?;
 
         let predictor = CodePredictorModel {
             hidden_size: predictor_geometry.hidden,

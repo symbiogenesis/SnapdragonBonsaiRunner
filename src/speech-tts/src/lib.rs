@@ -255,7 +255,7 @@ impl<T> VoiceCache<T> {
 }
 
 fn load_talker(path: &Path, kind: &str, threads: usize) -> io::Result<rust_talker::Talker> {
-    let mut weights = weights::Weights::open(path)?;
+    let weights = weights::Weights::open(path)?;
     if weights.string("general.architecture")? != "qwen3-tts"
         || weights.string("qwen3-tts.model_type")? != kind
     {
@@ -264,7 +264,7 @@ fn load_talker(path: &Path, kind: &str, threads: usize) -> io::Result<rust_talke
             "Unsupported speech model architecture.",
         ));
     }
-    rust_talker::Talker::load_with_weights(&mut weights, threads)
+    rust_talker::Talker::load_with_weights(&weights, threads)
 }
 
 /// Preloaded, validated Qwen3 tokenizer codec ready for [`Synthesizer::assemble`].
@@ -313,8 +313,8 @@ impl Synthesizer {
     ) -> io::Result<LoadedCodec> {
         model_path(codec)?;
         let threads = select_threads(threads, std::thread::available_parallelism()?.get())?;
-        let mut codec_weights = weights::Weights::open(codec)?;
-        let codec = rust_codec::Codec::load(&mut codec_weights, threads)?;
+        let codec_weights = weights::Weights::open(codec)?;
+        let codec = rust_codec::Codec::load(&codec_weights, threads)?;
         Ok(LoadedCodec { codec })
     }
 

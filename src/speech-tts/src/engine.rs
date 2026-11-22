@@ -2128,6 +2128,22 @@ pub(crate) fn narrow_f32_slice(src: &[f32], dst: &mut [u16]) -> bool {
 }
 
 impl QwenDecoderLayer {
+    /// Repack eligible `Q4_K` layer projections into the aligned ARM64 kernel layout.
+    #[cfg(windows)]
+    pub(crate) fn repack_q4_k_if_aligned(&mut self) {
+        for proj in [
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.o_proj,
+            &mut self.gate_proj,
+            &mut self.up_proj,
+            &mut self.down_proj,
+        ] {
+            proj.repack_q4_k_if_aligned();
+        }
+    }
+
     /// Run a single-token step (`pos = kv.seq_len`), appending K/V into `kv` and applying optional `LoRA` patches.
     #[expect(
         clippy::too_many_arguments,

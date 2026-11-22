@@ -9,13 +9,7 @@
     reason = "Private checked graph loaders share the speech service's io::Result contract."
 )]
 
-use std::{
-    io,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-};
+use std::io;
 
 use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 
@@ -32,71 +26,25 @@ use crate::{
         AttentiveStatPool, AudioMelConfig, EcapaSpeakerEncoder, MelSpectrogramExtractor,
         SeRes2NetBlock, SqueezeExcitation, TdnnConv1d,
     },
-    weights::{MappedWeights, Weights},
+    weights::{MappedWeights, Weights, parallel_build},
 };
 
-trait CodecSource {
+trait CodecSource: Sync {
+    fn parallel_load(&self) -> bool;
     fn u32_meta(&self, key: &str) -> io::Result<u32>;
     fn f32_meta(&self, key: &str) -> io::Result<f32>;
     fn u32_array_meta(&self, key: &str) -> io::Result<Vec<u32>>;
     fn tensor_shape(&self, name: &str) -> io::Result<&[usize]>;
-    fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>>;
-    fn projection(
-        &mut self,
-        name: &str,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> io::Result<LinearProjection>;
-}
-
-trait MappedCodecSource: Sync {
-    fn u32_meta(&self, key: &str) -> io::Result<u32>;
-    fn f32_meta(&self, key: &str) -> io::Result<f32>;
-    fn u32_array_meta(&self, key: &str) -> io::Result<Vec<u32>>;
-    fn tensor_shape(&self, name: &str) -> io::Result<&[usize]>;
-    fn tensor_f32_mapped(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>>;
-    fn projection_mapped(
-        &self,
-        name: &str,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> io::Result<LinearProjection>;
-}
-
-struct MappedSource<'a, M: ?Sized>(&'a M);
-
-impl<M: MappedCodecSource + ?Sized> CodecSource for MappedSource<'_, M> {
-    fn u32_meta(&self, key: &str) -> io::Result<u32> {
-        self.0.u32_meta(key)
-    }
-
-    fn f32_meta(&self, key: &str) -> io::Result<f32> {
-        self.0.f32_meta(key)
-    }
-
-    fn u32_array_meta(&self, key: &str) -> io::Result<Vec<u32>> {
-        self.0.u32_array_meta(key)
-    }
-
-    fn tensor_shape(&self, name: &str) -> io::Result<&[usize]> {
-        self.0.tensor_shape(name)
-    }
-
-    fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
-        self.0.tensor_f32_mapped(name, shape)
-    }
-
-    fn projection(
-        &mut self,
-        name: &str,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> io::Result<LinearProjection> {
-        self.0.projection_mapped(name, in_dim, out_dim)
-    }
+    fn tensor_f32(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>>;
+    fn projection(&self, name: &str, in_dim: usize, out_dim: usize)
+    -> io::Result<LinearProjection>;
 }
 
 impl CodecSource for Weights {
+    fn parallel_load(&self) -> bool {
+        self.is_mapped()
+    }
+
     fn u32_meta(&self, key: &str) -> io::Result<u32> {
         Self::u32(self, key)
     }
@@ -113,12 +61,12 @@ impl CodecSource for Weights {
         Self::tensor_shape(self, name)
     }
 
-    fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
+    fn tensor_f32(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
         Self::tensor_f32(self, name, shape)
     }
 
     fn projection(
-        &mut self,
+        &self,
         name: &str,
         in_dim: usize,
         out_dim: usize,
@@ -127,39 +75,12 @@ impl CodecSource for Weights {
     }
 }
 
-impl MappedCodecSource for Weights {
-    fn u32_meta(&self, key: &str) -> io::Result<u32> {
-        Self::u32(self, key)
-    }
-
-    fn f32_meta(&self, key: &str) -> io::Result<f32> {
-        Self::f32_metadata(self, key)
-    }
-
-    fn u32_array_meta(&self, key: &str) -> io::Result<Vec<u32>> {
-        Self::u32_array(self, key)
-    }
-
-    fn tensor_shape(&self, name: &str) -> io::Result<&[usize]> {
-        Self::tensor_shape(self, name)
-    }
-
-    fn tensor_f32_mapped(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
-        Self::tensor_f32_mapped(self, name, shape)
-    }
-
-    fn projection_mapped(
-        &self,
-        name: &str,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> io::Result<LinearProjection> {
-        Self::projection_mapped(self, name, in_dim, out_dim, 1)
-    }
-}
-
 #[cfg(windows)]
-impl MappedCodecSource for MappedWeights {
+impl CodecSource for MappedWeights {
+    fn parallel_load(&self) -> bool {
+        true
+    }
+
     fn u32_meta(&self, key: &str) -> io::Result<u32> {
         Self::u32(self, key)
     }
@@ -176,11 +97,11 @@ impl MappedCodecSource for MappedWeights {
         Self::tensor_shape(self, name)
     }
 
-    fn tensor_f32_mapped(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
+    fn tensor_f32(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
         Self::tensor_f32_mapped(self, name, shape)
     }
 
-    fn projection_mapped(
+    fn projection(
         &self,
         name: &str,
         in_dim: usize,
@@ -188,58 +109,6 @@ impl MappedCodecSource for MappedWeights {
     ) -> io::Result<LinearProjection> {
         Self::projection_mapped(self, name, in_dim, out_dim, 1)
     }
-}
-
-fn parallel_build<T: Send>(
-    count: usize,
-    threads: usize,
-    build: impl Fn(usize) -> io::Result<T> + Sync,
-) -> io::Result<Vec<T>> {
-    if count <= 1 || threads <= 1 {
-        return (0..count).map(build).collect();
-    }
-    let workers = threads.min(count);
-    let slots: Vec<Mutex<Option<io::Result<T>>>> = (0..count).map(|_| Mutex::new(None)).collect();
-    let next = AtomicUsize::new(0);
-    let abort = AtomicBool::new(false);
-    let run_worker = || loop {
-        if abort.load(Ordering::Acquire) {
-            break;
-        }
-        let index = next.fetch_add(1, Ordering::Relaxed);
-        if index >= count {
-            break;
-        }
-        let result = build(index);
-        if result.is_err() {
-            abort.store(true, Ordering::Release);
-        }
-        if let Some(slot) = slots.get(index)
-            && let Ok(mut guard) = slot.lock()
-        {
-            *guard = Some(result);
-        }
-    };
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers - 1);
-        for _ in 0..workers - 1 {
-            handles.push(scope.spawn(run_worker));
-        }
-        run_worker();
-        for handle in handles {
-            let _ = handle.join();
-        }
-    });
-    let mut output = Vec::with_capacity(count);
-    for slot in slots {
-        let item = slot
-            .into_inner()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| Err(invalid()))?;
-        output.push(item);
-    }
-    Ok(output)
 }
 
 fn invalid() -> io::Error {
@@ -262,7 +131,7 @@ fn count_float(value: usize) -> io::Result<f32> {
 }
 
 fn projection<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     input: usize,
     output: usize,
@@ -271,7 +140,7 @@ fn projection<S: CodecSource + ?Sized>(
 }
 
 fn biased_projection<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     input: usize,
     output: usize,
@@ -285,7 +154,7 @@ fn biased_projection<S: CodecSource + ?Sized>(
 // therefore has the same ordered layout as the stored [K, IC] tensor; no
 // other axis may disappear or move, even if the element counts agree.
 fn convolution_weight<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     expected: [usize; 3],
 ) -> io::Result<Vec<f32>> {
@@ -308,7 +177,7 @@ fn convolution_weight<S: CodecSource + ?Sized>(
     reason = "Explicit convolution geometry is validated before loading weights."
 )]
 fn conv<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     input: usize,
     output: usize,
@@ -335,7 +204,7 @@ fn conv<S: CodecSource + ?Sized>(
 }
 
 fn trans_conv<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     input: usize,
     output: usize,
@@ -354,7 +223,7 @@ fn trans_conv<S: CodecSource + ?Sized>(
 }
 
 fn snake<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     channels: usize,
 ) -> io::Result<SnakeBeta> {
@@ -535,7 +404,7 @@ struct Transformer {
 }
 
 fn load_transformer_layer<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     prefix: &str,
     index: usize,
     hidden: usize,
@@ -661,7 +530,7 @@ impl Transformer {
     }
 
     fn load_endpoints<S: CodecSource + ?Sized>(
-        weights: &mut S,
+        weights: &S,
         geom: &TransformerGeometry,
         decoder: bool,
     ) -> io::Result<(
@@ -694,56 +563,18 @@ impl Transformer {
         }
     }
 
-    fn load_sequential(weights: &mut Weights, decoder: bool, threads: usize) -> io::Result<Self> {
-        let geom = Self::parse_geometry(weights, decoder)?;
-        let mut layers = Vec::with_capacity(geom.count);
-        for index in 0..geom.count {
-            layers.push(load_transformer_layer(
-                weights,
-                geom.prefix,
-                index,
-                geom.hidden,
-                geom.heads,
-                geom.kv_heads,
-                geom.head_dim,
-                geom.intermediate,
-                decoder,
-            )?);
-        }
-        let (input, output, final_norm, window) = Self::load_endpoints(weights, &geom, decoder)?;
-        Ok(Self {
-            threads,
-            hidden: geom.hidden,
-            heads: geom.heads,
-            kv_heads: geom.kv_heads,
-            head_dim: geom.head_dim,
-            window,
-            theta: geom.theta,
-            eps: geom.eps,
-            input,
-            output,
-            final_norm,
-            layers,
-        })
-    }
-
-    fn load_mapped<M: MappedCodecSource + ?Sized>(
-        weights: &M,
+    fn load<S: CodecSource + ?Sized>(
+        weights: &S,
         decoder: bool,
         threads: usize,
     ) -> io::Result<Self> {
-        let src = MappedSource(weights);
-        let geom = Self::parse_geometry(&src, decoder)?;
-        let (layers, endpoints) = if threads > 1 {
+        let geom = Self::parse_geometry(weights, decoder)?;
+        let (layers, endpoints) = if weights.parallel_load() && threads > 1 {
             let (layers_res, endpoints_res) = std::thread::scope(|scope| {
-                let ep_job = scope.spawn(|| {
-                    let mut ep_src = MappedSource(weights);
-                    Self::load_endpoints(&mut ep_src, &geom, decoder)
-                });
+                let ep_job = scope.spawn(|| Self::load_endpoints(weights, &geom, decoder));
                 let layers_res = parallel_build(geom.count, threads, |index| {
-                    let mut layer_src = MappedSource(weights);
                     load_transformer_layer(
-                        &mut layer_src,
+                        weights,
                         geom.prefix,
                         index,
                         geom.hidden,
@@ -759,11 +590,10 @@ impl Transformer {
             });
             (layers_res?, endpoints_res?)
         } else {
-            let mut mut_src = MappedSource(weights);
             let layers = (0..geom.count)
                 .map(|index| {
                     load_transformer_layer(
-                        &mut mut_src,
+                        weights,
                         geom.prefix,
                         index,
                         geom.hidden,
@@ -775,7 +605,7 @@ impl Transformer {
                     )
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            let endpoints = Self::load_endpoints(&mut mut_src, &geom, decoder)?;
+            let endpoints = Self::load_endpoints(weights, &geom, decoder)?;
             (layers, endpoints)
         };
         let (input, output, final_norm, window) = endpoints;
@@ -1289,56 +1119,9 @@ struct Encoder {
 }
 
 impl Encoder {
-    fn load(weights: &mut Weights, threads: usize) -> io::Result<Self> {
-        if weights.is_mapped() && threads > 1 {
-            let ref_w: &Weights = weights;
-            return Self::load_mapped(ref_w, threads);
-        }
-        Self::load_sequential(weights, threads)
-    }
-
-    fn load_sequential(weights: &mut Weights, threads: usize) -> io::Result<Self> {
+    fn load<S: CodecSource + ?Sized>(weights: &S, threads: usize) -> io::Result<Self> {
         let (filters, hidden, compress, kernel, residual, last_kernel, ratios) =
             Self::parse_geometry(weights)?;
-        let first = conv(
-            weights,
-            "tok_enc.conv.0",
-            1,
-            filters,
-            kernel,
-            1,
-            1,
-            true,
-            PadMode::Constant,
-        )?;
-        let mut channels = filters;
-        let mut stages = Vec::with_capacity(4);
-        for (index, ratio) in ratios.into_iter().rev().enumerate() {
-            let ratio = usize::try_from(ratio).map_err(|_| invalid())?;
-            stages.push(load_encoder_stage(
-                weights, channels, compress, residual, index, ratio,
-            )?);
-            channels *= 2;
-        }
-        let transformer = Transformer::load_sequential(weights, false, threads)?;
-        let (last, down, semantic, acoustic) =
-            Self::load_tail(weights, channels, hidden, last_kernel, 2048, 256)?;
-        Ok(Self {
-            first,
-            threads,
-            stages,
-            last,
-            transformer,
-            down,
-            semantic,
-            acoustic,
-        })
-    }
-
-    fn load_mapped<M: MappedCodecSource + ?Sized>(weights: &M, threads: usize) -> io::Result<Self> {
-        let src = MappedSource(weights);
-        let (filters, hidden, compress, kernel, residual, last_kernel, ratios) =
-            Self::parse_geometry(&src)?;
         let mut stage_specs = Vec::with_capacity(4);
         let mut channels = filters;
         for (index, ratio) in ratios.into_iter().rev().enumerate() {
@@ -1347,22 +1130,9 @@ impl Encoder {
             channels *= 2;
         }
         let final_channels = channels;
-        let (first_res, stages_res, tfm_res, tail_res) = std::thread::scope(|scope| {
-            let stages_job = scope.spawn(|| {
-                parallel_build(stage_specs.len(), threads, |i| {
-                    let (index, ch, ratio) = stage_specs[i];
-                    let mut s = MappedSource(weights);
-                    load_encoder_stage(&mut s, ch, compress, residual, index, ratio)
-                })
-            });
-            let tfm_job = scope.spawn(|| Transformer::load_mapped(weights, false, threads));
-            let tail_job = scope.spawn(|| {
-                let mut s = MappedSource(weights);
-                Self::load_tail(&mut s, final_channels, hidden, last_kernel, 2048, 256)
-            });
-            let mut s = MappedSource(weights);
-            let first_res = conv(
-                &mut s,
+        let load_first = || {
+            conv(
+                weights,
                 "tok_enc.conv.0",
                 1,
                 filters,
@@ -1371,19 +1141,43 @@ impl Encoder {
                 1,
                 true,
                 PadMode::Constant,
-            );
-            let stages_res = stages_job.join().unwrap_or_else(|_| Err(invalid()));
-            let tfm_res = tfm_job.join().unwrap_or_else(|_| Err(invalid()));
-            let tail_res = tail_job.join().unwrap_or_else(|_| Err(invalid()));
-            (first_res, stages_res, tfm_res, tail_res)
-        });
-        let (last, down, semantic, acoustic) = tail_res?;
+            )
+        };
+        let load_stages = |stage_threads: usize| {
+            parallel_build(stage_specs.len(), stage_threads, |i| {
+                let (index, ch, ratio) = stage_specs[i];
+                load_encoder_stage(weights, ch, compress, residual, index, ratio)
+            })
+        };
+        let load_tail = || Self::load_tail(weights, final_channels, hidden, last_kernel, 2048, 256);
+
+        let (first, stages, transformer, (last, down, semantic, acoustic)) =
+            if weights.parallel_load() && threads > 1 {
+                let (first_res, stages_res, tfm_res, tail_res) = std::thread::scope(|scope| {
+                    let stages_job = scope.spawn(|| load_stages(threads));
+                    let tfm_job = scope.spawn(|| Transformer::load(weights, false, threads));
+                    let tail_job = scope.spawn(load_tail);
+                    let first_res = load_first();
+                    let stages_res = stages_job.join().unwrap_or_else(|_| Err(invalid()));
+                    let tfm_res = tfm_job.join().unwrap_or_else(|_| Err(invalid()));
+                    let tail_res = tail_job.join().unwrap_or_else(|_| Err(invalid()));
+                    (first_res, stages_res, tfm_res, tail_res)
+                });
+                (first_res?, stages_res?, tfm_res?, tail_res?)
+            } else {
+                (
+                    load_first()?,
+                    load_stages(1)?,
+                    Transformer::load(weights, false, threads)?,
+                    load_tail()?,
+                )
+            };
         Ok(Self {
-            first: first_res?,
+            first,
             threads,
-            stages: stages_res?,
+            stages,
             last,
-            transformer: tfm_res?,
+            transformer,
             down,
             semantic,
             acoustic,
@@ -1427,7 +1221,7 @@ impl Encoder {
     }
 
     fn load_tail<S: CodecSource + ?Sized>(
-        weights: &mut S,
+        weights: &S,
         channels: usize,
         hidden: usize,
         last_kernel: usize,
@@ -1559,7 +1353,7 @@ fn codebook_major_to_frames(codes: &[i32], frames: usize) -> io::Result<Vec<[i32
 }
 
 fn load_encoder_stage<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     channels: usize,
     compress: usize,
     residual: usize,
@@ -1605,7 +1399,7 @@ fn load_encoder_stage<S: CodecSource + ?Sized>(
 }
 
 fn load_encode_side<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     count: usize,
     size: usize,
@@ -1621,7 +1415,7 @@ fn load_encode_side<S: CodecSource + ?Sized>(
 }
 
 fn load_rvq_group<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     count: usize,
     size: usize,
@@ -1665,7 +1459,7 @@ pub(crate) struct Codec {
 }
 
 fn load_upsample_stage<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     latent: usize,
     index: usize,
 ) -> io::Result<Upsample> {
@@ -1691,7 +1485,7 @@ fn load_upsample_stage<S: CodecSource + ?Sized>(
 }
 
 fn load_dac_block<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     index: usize,
     stride: usize,
     channels: usize,
@@ -1747,7 +1541,7 @@ impl Codec {
         clippy::too_many_lines,
         reason = "Keep the complete pinned decoder tensor mapping together; each subgraph validates its own fixed geometry."
     )]
-    pub(crate) fn load(weights: &mut Weights, threads: usize) -> io::Result<Self> {
+    pub(crate) fn load(weights: &Weights, threads: usize) -> io::Result<Self> {
         for (key, expected) in [
             ("input_sample_rate", SAMPLE_RATE),
             ("output_sample_rate", SAMPLE_RATE),
@@ -1772,112 +1566,27 @@ impl Codec {
         {
             return Err(invalid());
         }
-        let (quantizer, pre, transformer, upsample, dac) = if weights.is_mapped() && threads > 1 {
-            let weights_ref: &Weights = weights;
-            let (quantizer_res, pre_res, tfm_res, upsample_res, dac_res) =
-                std::thread::scope(|scope| {
-                    let q_job = scope.spawn(|| {
-                        let mut s = MappedSource(weights_ref);
-                        Ok::<_, io::Error>(RvqDecoder {
-                            semantic: load_rvq_group(
-                                &mut s,
-                                "tok_dec.vq_first",
-                                1,
-                                size,
-                                width,
-                                hidden,
-                            )?,
-                            acoustic: RvqGroup {
-                                num_codebooks: 15,
-                                codebook_size: size,
-                                codebook_dim: width,
-                                hidden_dim: hidden,
-                                codebooks: parallel_build(15, threads, |idx| {
-                                    MappedSource(weights_ref).tensor_f32(
-                                        &format!("tok_dec.vq_rest.{idx}.codebook"),
-                                        &[width, size],
-                                    )
-                                })?,
-                                out_proj_w: s.tensor_f32(
-                                    "tok_dec.vq_rest.output_proj.weight",
-                                    &[1, width, hidden],
-                                )?,
-                            },
-                        })
-                    });
-                    let tfm_job =
-                        scope.spawn(|| Transformer::load_mapped(weights_ref, true, threads));
-                    let up_job = scope.spawn(|| {
-                        parallel_build(2, threads.min(2), |index| {
-                            let mut s = MappedSource(weights_ref);
-                            load_upsample_stage(&mut s, latent, index)
-                        })
-                    });
-                    let dac_job = scope.spawn(|| {
-                        let strides = [
-                            (0_usize, 8_usize, 1536_usize),
-                            (1, 5, 768),
-                            (2, 4, 384),
-                            (3, 3, 192),
-                        ];
-                        let blocks = parallel_build(4, threads, |i| {
-                            let (idx, stride, ch) = strides[i];
-                            let mut s = MappedSource(weights_ref);
-                            load_dac_block(&mut s, idx, stride, ch)
-                        })?;
-                        let mut s = MappedSource(weights_ref);
-                        Ok::<_, io::Error>(DacDecoder {
-                            conv_pre: conv(
-                                &mut s,
-                                "tok_dec.dec.0.conv",
-                                latent,
-                                1536,
-                                7,
-                                1,
-                                1,
-                                true,
-                                PadMode::Constant,
-                            )?,
-                            blocks,
-                            snake_post: snake(&mut s, "tok_dec.dec.5.snake", 96)?,
-                            conv_post: conv(
-                                &mut s,
-                                "tok_dec.dec.6.conv",
-                                96,
-                                1,
-                                7,
-                                1,
-                                1,
-                                true,
-                                PadMode::Constant,
-                            )?,
-                        })
-                    });
-                    let mut s = MappedSource(weights_ref);
-                    let pre_res = conv(
-                        &mut s,
-                        "tok_dec.pre_conv",
-                        hidden,
-                        latent,
-                        3,
-                        1,
-                        1,
-                        true,
-                        PadMode::Constant,
-                    );
-                    let q_res = q_job.join().unwrap_or_else(|_| Err(invalid()));
-                    let tfm_res = tfm_job.join().unwrap_or_else(|_| Err(invalid()));
-                    let up_res = up_job.join().unwrap_or_else(|_| Err(invalid()));
-                    let dac_res = dac_job.join().unwrap_or_else(|_| Err(invalid()));
-                    (q_res, pre_res, tfm_res, up_res, dac_res)
-                });
-            (quantizer_res?, pre_res?, tfm_res?, upsample_res?, dac_res?)
-        } else {
-            let quantizer = RvqDecoder {
+        let parallel = weights.is_mapped() && threads > 1;
+        let step_threads = if parallel { threads } else { 1 };
+        let load_quantizer = || {
+            Ok::<_, io::Error>(RvqDecoder {
                 semantic: load_rvq_group(weights, "tok_dec.vq_first", 1, size, width, hidden)?,
-                acoustic: load_rvq_group(weights, "tok_dec.vq_rest", 15, size, width, hidden)?,
-            };
-            let pre = conv(
+                acoustic: RvqGroup {
+                    num_codebooks: 15,
+                    codebook_size: size,
+                    codebook_dim: width,
+                    hidden_dim: hidden,
+                    codebooks: parallel_build(15, step_threads, |idx| {
+                        weights
+                            .tensor_f32(&format!("tok_dec.vq_rest.{idx}.codebook"), &[width, size])
+                    })?,
+                    out_proj_w: weights
+                        .tensor_f32("tok_dec.vq_rest.output_proj.weight", &[1, width, hidden])?,
+                },
+            })
+        };
+        let load_pre = || {
+            conv(
                 weights,
                 "tok_dec.pre_conv",
                 hidden,
@@ -1887,19 +1596,25 @@ impl Codec {
                 1,
                 true,
                 PadMode::Constant,
-            )?;
-            let transformer = Transformer::load_sequential(weights, true, threads)?;
-            let mut upsample = Vec::with_capacity(2);
-            for index in 0..2 {
-                upsample.push(load_upsample_stage(weights, latent, index)?);
-            }
-            let mut blocks = Vec::with_capacity(4);
-            let mut channels = 1536;
-            for (index, stride) in [8, 5, 4, 3].into_iter().enumerate() {
-                blocks.push(load_dac_block(weights, index, stride, channels)?);
-                channels /= 2;
-            }
-            let dac = DacDecoder {
+            )
+        };
+        let load_upsample = || {
+            parallel_build(2, step_threads.min(2), |index| {
+                load_upsample_stage(weights, latent, index)
+            })
+        };
+        let load_dac = || {
+            let strides = [
+                (0_usize, 8_usize, 1536_usize),
+                (1, 5, 768),
+                (2, 4, 384),
+                (3, 3, 192),
+            ];
+            let blocks = parallel_build(4, step_threads, |i| {
+                let (idx, stride, ch) = strides[i];
+                load_dac_block(weights, idx, stride, ch)
+            })?;
+            Ok::<_, io::Error>(DacDecoder {
                 conv_pre: conv(
                     weights,
                     "tok_dec.dec.0.conv",
@@ -1912,11 +1627,11 @@ impl Codec {
                     PadMode::Constant,
                 )?,
                 blocks,
-                snake_post: snake(weights, "tok_dec.dec.5.snake", channels)?,
+                snake_post: snake(weights, "tok_dec.dec.5.snake", 96)?,
                 conv_post: conv(
                     weights,
                     "tok_dec.dec.6.conv",
-                    channels,
+                    96,
                     1,
                     7,
                     1,
@@ -1924,8 +1639,31 @@ impl Codec {
                     true,
                     PadMode::Constant,
                 )?,
-            };
-            (quantizer, pre, transformer, upsample, dac)
+            })
+        };
+        let (quantizer, pre, transformer, upsample, dac) = if parallel {
+            let (quantizer_res, pre_res, tfm_res, upsample_res, dac_res) =
+                std::thread::scope(|scope| {
+                    let q_job = scope.spawn(load_quantizer);
+                    let tfm_job = scope.spawn(|| Transformer::load(weights, true, threads));
+                    let up_job = scope.spawn(load_upsample);
+                    let dac_job = scope.spawn(load_dac);
+                    let pre_res = load_pre();
+                    let q_res = q_job.join().unwrap_or_else(|_| Err(invalid()));
+                    let tfm_res = tfm_job.join().unwrap_or_else(|_| Err(invalid()));
+                    let up_res = up_job.join().unwrap_or_else(|_| Err(invalid()));
+                    let dac_res = dac_job.join().unwrap_or_else(|_| Err(invalid()));
+                    (q_res, pre_res, tfm_res, up_res, dac_res)
+                });
+            (quantizer_res?, pre_res?, tfm_res?, upsample_res?, dac_res?)
+        } else {
+            (
+                load_quantizer()?,
+                load_pre()?,
+                Transformer::load(weights, true, threads)?,
+                load_upsample()?,
+                load_dac()?,
+            )
         };
         let mut codec = Self {
             threads,
@@ -2232,12 +1970,12 @@ impl Codec {
         }
         #[cfg(windows)]
         if let Some(mapped) = &self.mapped_weights {
-            let encoder = Encoder::load_mapped(mapped, self.threads)?;
+            let encoder = Encoder::load(mapped, self.threads)?;
             return encoder.encode_cancellable(samples, cancel);
         }
         let path = self.weights_path.as_deref().ok_or_else(invalid)?;
-        let mut weights = Weights::open(path)?;
-        let encoder = Encoder::load(&mut weights, self.threads)?;
+        let weights = Weights::open(path)?;
+        let encoder = Encoder::load(&weights, self.threads)?;
         encoder.encode_cancellable(samples, cancel)
     }
 }
@@ -2248,7 +1986,7 @@ pub(crate) struct Speaker {
 }
 
 fn tdnn<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     name: &str,
     input: usize,
     output: usize,
@@ -2266,7 +2004,7 @@ fn tdnn<S: CodecSource + ?Sized>(
 }
 
 fn load_speaker_block<S: CodecSource + ?Sized>(
-    weights: &mut S,
+    weights: &S,
     index: usize,
     dilation: usize,
 ) -> io::Result<SeRes2NetBlock> {
@@ -2295,7 +2033,7 @@ fn load_speaker_block<S: CodecSource + ?Sized>(
 }
 
 impl Speaker {
-    pub(crate) fn load(weights: &mut Weights, threads: usize) -> io::Result<Self> {
+    pub(crate) fn load(weights: &Weights, threads: usize) -> io::Result<Self> {
         if weights.u32("qwen3-tts.spk_enc.embedding_length")? != 2048
             || weights.u32("qwen3-tts.spk_enc.sample_rate")? != SAMPLE_RATE
         {
@@ -2303,43 +2041,32 @@ impl Speaker {
         }
         let mel = MelSpectrogramExtractor::new(AudioMelConfig::default())?;
         let dilations = [2_usize, 3, 4];
-        let (blocks, conv0, mfa, asp, fc) = if weights.is_mapped() && threads > 1 {
-            let weights_ref: &Weights = weights;
+        let load_rest = || {
+            Ok::<_, io::Error>((
+                tdnn(weights, "spk_enc.conv0", 128, 512, 5, 1)?,
+                tdnn(weights, "spk_enc.mfa", 1536, 1536, 1, 1)?,
+                AttentiveStatPool {
+                    tdnn: tdnn(weights, "spk_enc.asp.tdnn", 4608, 128, 1, 1)?,
+                    conv: tdnn(weights, "spk_enc.asp.conv", 128, 1536, 1, 1)?,
+                },
+                tdnn(weights, "spk_enc.fc", 3072, 2048, 1, 1)?,
+            ))
+        };
+        let (blocks, (conv0, mfa, asp, fc)) = if weights.is_mapped() && threads > 1 {
             let (blocks_res, rest_res) = std::thread::scope(|scope| {
-                let rest_job = scope.spawn(|| {
-                    let mut s = MappedSource(weights_ref);
-                    Ok::<_, io::Error>((
-                        tdnn(&mut s, "spk_enc.conv0", 128, 512, 5, 1)?,
-                        tdnn(&mut s, "spk_enc.mfa", 1536, 1536, 1, 1)?,
-                        AttentiveStatPool {
-                            tdnn: tdnn(&mut s, "spk_enc.asp.tdnn", 4608, 128, 1, 1)?,
-                            conv: tdnn(&mut s, "spk_enc.asp.conv", 128, 1536, 1, 1)?,
-                        },
-                        tdnn(&mut s, "spk_enc.fc", 3072, 2048, 1, 1)?,
-                    ))
-                });
+                let rest_job = scope.spawn(load_rest);
                 let blocks_res = parallel_build(dilations.len(), threads, |idx| {
-                    let mut s = MappedSource(weights_ref);
-                    load_speaker_block(&mut s, idx, dilations[idx])
+                    load_speaker_block(weights, idx, dilations[idx])
                 });
                 let rest_res = rest_job.join().unwrap_or_else(|_| Err(invalid()));
                 (blocks_res, rest_res)
             });
-            let (conv0, mfa, asp, fc) = rest_res?;
-            (blocks_res?, conv0, mfa, asp, fc)
+            (blocks_res?, rest_res?)
         } else {
-            let mut blocks = Vec::with_capacity(3);
-            for (index, dilation) in dilations.into_iter().enumerate() {
-                blocks.push(load_speaker_block(weights, index, dilation)?);
-            }
-            let conv0 = tdnn(weights, "spk_enc.conv0", 128, 512, 5, 1)?;
-            let mfa = tdnn(weights, "spk_enc.mfa", 1536, 1536, 1, 1)?;
-            let asp = AttentiveStatPool {
-                tdnn: tdnn(weights, "spk_enc.asp.tdnn", 4608, 128, 1, 1)?,
-                conv: tdnn(weights, "spk_enc.asp.conv", 128, 1536, 1, 1)?,
-            };
-            let fc = tdnn(weights, "spk_enc.fc", 3072, 2048, 1, 1)?;
-            (blocks, conv0, mfa, asp, fc)
+            let blocks = parallel_build(dilations.len(), 1, |idx| {
+                load_speaker_block(weights, idx, dilations[idx])
+            })?;
+            (blocks, load_rest()?)
         };
         Ok(Self {
             model: EcapaSpeakerEncoder {
@@ -2579,9 +2306,9 @@ mod tests {
         use crate::{codec::PadMode, weights::Weights};
         for shape in [&[7, 96][..], &[7, 96, 1], &[7, 96, 1, 1]] {
             let fixture = mono_convolution_fixture(shape)?;
-            let mut weights = Weights::open(&fixture.0)?;
+            let weights = Weights::open(&fixture.0)?;
             let layer = super::conv(
-                &mut weights,
+                &weights,
                 "tok_dec.dec.6.conv",
                 96,
                 1,
@@ -2600,10 +2327,10 @@ mod tests {
         }
         for shape in [&[7, 1, 96][..], &[3, 224], &[7, 48, 2]] {
             let fixture = mono_convolution_fixture(shape)?;
-            let mut weights = Weights::open(&fixture.0)?;
+            let weights = Weights::open(&fixture.0)?;
             assert!(
                 super::conv(
-                    &mut weights,
+                    &weights,
                     "tok_dec.dec.6.conv",
                     96,
                     1,

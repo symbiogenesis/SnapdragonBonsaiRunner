@@ -14,6 +14,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use crate::engine::{LinearProjection, WeightQuantization};
@@ -93,15 +97,71 @@ fn metadata_u32_array(metadata: &BTreeMap<String, Metadata>, key: &str) -> io::R
     }
 }
 
+struct FileStream {
+    file: File,
+    stream_buf: Vec<u8>,
+}
+
 /// Validated tensor index retaining a non-writable model file handle.
 pub(crate) struct Weights {
     path: PathBuf,
-    file: File,
+    stream: Mutex<FileStream>,
     #[cfg(windows)]
     mapped: Option<std::sync::Arc<bonsai_windows_process::MappedFile>>,
     metadata: BTreeMap<String, Metadata>,
     tensors: BTreeMap<String, Tensor>,
-    stream_buf: Vec<u8>,
+}
+
+pub(crate) fn parallel_build<T: Send>(
+    count: usize,
+    threads: usize,
+    build: impl Fn(usize) -> io::Result<T> + Sync,
+) -> io::Result<Vec<T>> {
+    if count <= 1 || threads <= 1 {
+        return (0..count).map(build).collect();
+    }
+    let workers = threads.min(count);
+    let slots: Vec<Mutex<Option<io::Result<T>>>> = (0..count).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let abort = AtomicBool::new(false);
+    let run_worker = || loop {
+        if abort.load(Ordering::Acquire) {
+            break;
+        }
+        let index = next.fetch_add(1, Ordering::Relaxed);
+        if index >= count {
+            break;
+        }
+        let result = build(index);
+        if result.is_err() {
+            abort.store(true, Ordering::Release);
+        }
+        if let Some(slot) = slots.get(index)
+            && let Ok(mut guard) = slot.lock()
+        {
+            *guard = Some(result);
+        }
+    };
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers - 1);
+        for _ in 0..workers - 1 {
+            handles.push(scope.spawn(run_worker));
+        }
+        run_worker();
+        for handle in handles {
+            let _ = handle.join();
+        }
+    });
+    let mut output = Vec::with_capacity(count);
+    for slot in slots {
+        let item = slot
+            .into_inner()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Err(invalid()))?;
+        output.push(item);
+    }
+    Ok(output)
 }
 
 const ALLOWED_TTS_TENSORS: &[u32] = &[0, 1, 8, 12, 14];
@@ -305,12 +365,14 @@ impl Weights {
         let mapped = if tensors.is_empty() { None } else { mapped };
         Ok(Self {
             path,
-            file,
+            stream: Mutex::new(FileStream {
+                file,
+                stream_buf: Vec::new(),
+            }),
             #[cfg(windows)]
             mapped,
             metadata,
             tensors,
-            stream_buf: Vec::new(),
         })
     }
 
@@ -382,7 +444,7 @@ impl Weights {
             .ok_or_else(invalid)
     }
 
-    fn tensor_bytes(&mut self, name: &str, shape: &[usize]) -> io::Result<(u32, Vec<u8>)> {
+    fn tensor_bytes(&self, name: &str, shape: &[usize]) -> io::Result<(u32, Vec<u8>)> {
         let tensor = self.tensors.get(name).ok_or_else(invalid)?;
         if tensor.shape != shape {
             return Err(invalid());
@@ -392,18 +454,22 @@ impl Weights {
             .try_reserve_exact(tensor.bytes)
             .map_err(|_| invalid())?;
         bytes.resize(tensor.bytes, 0);
-        self.file.seek(SeekFrom::Start(tensor.offset))?;
-        self.file.read_exact(&mut bytes)?;
+        let mut stream = self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.file.seek(SeekFrom::Start(tensor.offset))?;
+        stream.file.read_exact(&mut bytes)?;
         // Each consumer validates its final representation: projection() uses
         // LinearProjection::new's packed validation, and tensor_f32() checks all
         // decoded values. Avoid scanning the entire model a second time here.
         Ok((tensor.kind, bytes))
     }
 
-    pub(crate) fn tensor_f32(&mut self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
+    pub(crate) fn tensor_f32(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
         #[cfg(windows)]
-        if self.mapped.is_some() {
-            return self.tensor_f32_mapped_with_threads(name, shape, 1);
+        if let Some(mapped) = self.mapped.as_deref() {
+            return mapped_tensor_f32(&self.tensors, mapped, name, shape, 1);
         }
         let tensor = self.tensors.get(name).ok_or_else(invalid)?;
         if tensor.shape != shape {
@@ -421,22 +487,28 @@ impl Weights {
         let mut output = Vec::new();
         output.try_reserve_exact(count).map_err(|_| invalid())?;
         output.resize(count, 0.0);
-        self.file.seek(SeekFrom::Start(offset))?;
+        let mut stream = self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stream = &mut *stream;
+        stream.file.seek(SeekFrom::Start(offset))?;
         let max_chunk_blocks = (64 * 1024 / size).max(1);
         let chunk_bytes = total_blocks.min(max_chunk_blocks) * size;
-        if self.stream_buf.len() < chunk_bytes {
-            self.stream_buf
-                .try_reserve_exact(chunk_bytes - self.stream_buf.len())
+        if stream.stream_buf.len() < chunk_bytes {
+            stream
+                .stream_buf
+                .try_reserve_exact(chunk_bytes - stream.stream_buf.len())
                 .map_err(|_| invalid())?;
-            self.stream_buf.resize(chunk_bytes, 0);
+            stream.stream_buf.resize(chunk_bytes, 0);
         }
         let mut out_offset = 0;
         let mut blocks_left = total_blocks;
         while blocks_left > 0 {
             let step_blocks = blocks_left.min(max_chunk_blocks);
             let step_bytes = step_blocks * size;
-            let buf = &mut self.stream_buf[..step_bytes];
-            self.file.read_exact(buf)?;
+            let buf = &mut stream.stream_buf[..step_bytes];
+            stream.file.read_exact(buf)?;
             let out_step = step_blocks * block;
             let dest_slice = &mut output[out_offset..out_offset + out_step];
             decode_slice_f32(kind, buf, dest_slice)?;
@@ -446,38 +518,27 @@ impl Weights {
         Ok(output)
     }
 
-    pub(crate) fn tensor_f32_mapped(&self, name: &str, shape: &[usize]) -> io::Result<Vec<f32>> {
-        self.tensor_f32_mapped_with_threads(name, shape, 1)
-    }
-
-    pub(crate) fn tensor_f32_mapped_with_threads(
-        &self,
-        name: &str,
-        shape: &[usize],
-        threads: usize,
-    ) -> io::Result<Vec<f32>> {
-        #[cfg(windows)]
-        {
-            let mapped = self.mapped.as_deref().ok_or_else(invalid)?;
-            return mapped_tensor_f32(&self.tensors, mapped, name, shape, threads);
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (name, shape, threads);
-            Err(invalid())
-        }
-    }
-
     pub(crate) fn projection(
-        &mut self,
+        &self,
         name: &str,
         in_dim: usize,
         out_dim: usize,
     ) -> io::Result<LinearProjection> {
+        self.projection_with_threads(name, in_dim, out_dim, 1)
+    }
+
+    pub(crate) fn projection_with_threads(
+        &self,
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+        validate_threads: usize,
+    ) -> io::Result<LinearProjection> {
         #[cfg(windows)]
         if self.mapped.is_some() {
-            return self.projection_mapped(name, in_dim, out_dim, 1);
+            return self.projection_mapped(name, in_dim, out_dim, validate_threads);
         }
+        let _ = validate_threads;
         let (ggml_type, bytes) = self.tensor_bytes(name, &[in_dim, out_dim])?;
         LinearProjection::new(
             name,
@@ -929,7 +990,7 @@ mod tests {
     #[test]
     fn gguf_tensor_loading_preserves_shape_and_rejects_invalid_index_ranges() -> io::Result<()> {
         let valid = fixture(&[("weight", &[2, 1], 0, 0)], &[0, 0, 128, 63, 0, 0, 0, 64])?;
-        let mut loaded = Weights::open(&valid.0)?;
+        let loaded = Weights::open(&valid.0)?;
         assert_eq!(loaded.tensor_shape("weight")?, [2, 1]);
         assert_eq!(loaded.tensor_f32("weight", &[2, 1])?, [1.0, 2.0]);
         assert!(loaded.tensor_f32("weight", &[1, 2]).is_err());
@@ -1044,7 +1105,7 @@ mod tests {
             }
             let shape = [u64::try_from(width).map_err(|_| invalid())?, 1];
             let file = fixture(&[("weight", &shape, kind, 0)], &bytes)?;
-            let mut loaded = Weights::open(&file.0)?;
+            let loaded = Weights::open(&file.0)?;
             assert!(loaded.projection("weight", width, 1).is_err());
             assert!(loaded.tensor_f32("weight", &[width, 1]).is_err());
         }
@@ -1177,7 +1238,7 @@ mod tests {
 
     fn write_raw_gguf(bytes: &[u8]) -> io::Result<Fixture> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "Bonsai-RustWeightsHardened-{}-{id}.gguf",
             std::process::id()
@@ -1460,7 +1521,12 @@ mod tests {
             streamed_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
-        assert!(loaded.stream_buf.len() >= 64 * 1024);
+        assert!(
+            loaded
+                .stream
+                .get_mut()
+                .is_ok_and(|stream| stream.stream_buf.len() >= 64 * 1024)
+        );
         Ok(())
     }
 
@@ -1508,7 +1574,7 @@ mod tests {
             f16_raw.extend_from_slice(&(0x3c00 + i).to_le_bytes());
         }
         let file = fixture(&[("half_vec", &[18], 1, 0)], &f16_raw)?;
-        let mut weights = Weights::open(&file.0)?;
+        let weights = Weights::open(&file.0)?;
         let expected = weights.tensor_f32("half_vec", &[18])?;
         #[cfg(windows)]
         {
