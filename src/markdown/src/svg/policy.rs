@@ -347,7 +347,7 @@ fn is_valid_id(id: &str) -> bool {
 }
 
 fn local_fragment_id(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    let trimmed = raw.trim_ascii();
     let id = trimmed.strip_prefix('#')?;
     is_valid_id(id).then_some(id)
 }
@@ -392,7 +392,7 @@ fn validate_url_functions(input: &str) -> bool {
             let Some(raw_arg) = input.get(arg_start..arg_end) else {
                 return false;
             };
-            let trimmed = raw_arg.trim_matches(|ch: char| ch.is_ascii_whitespace());
+            let trimmed = raw_arg.trim_ascii();
             let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
                 || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
             {
@@ -502,7 +502,7 @@ fn validate_convolve_matrix(node: roxmltree::Node<'_, '_>) -> bool {
 }
 
 fn parse_svg_filter_length(raw: &str) -> Option<(f32, Option<&str>)> {
-    let trimmed = raw.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    let trimmed = raw.trim_ascii();
     if trimmed.is_empty() {
         return None;
     }
@@ -538,15 +538,11 @@ fn validate_filter_dimension(raw: &str, object_bbox: bool, non_negative: bool) -
 }
 
 fn validate_filter_element(node: roxmltree::Node<'_, '_>) -> bool {
-    let object_bbox = node.attribute("filterUnits").is_none_or(|units| {
-        units.trim_matches(|ch: char| ch.is_ascii_whitespace()) == "objectBoundingBox"
-    });
-    if let Some(units) = node.attribute("filterUnits") {
-        let trimmed = units.trim_matches(|ch: char| ch.is_ascii_whitespace());
-        if trimmed != "objectBoundingBox" && trimmed != "userSpaceOnUse" {
-            return false;
-        }
-    }
+    let object_bbox = match node.attribute("filterUnits").map(str::trim_ascii) {
+        None | Some("objectBoundingBox") => true,
+        Some("userSpaceOnUse") => false,
+        Some(_) => return false,
+    };
     for (attr_name, non_negative) in [
         ("x", false),
         ("y", false),
@@ -634,7 +630,7 @@ fn validate_element_and_index<'a, 'input>(
                 return false;
             }
         } else if attr.namespace().is_none() && attr_name == "id" {
-            let trimmed_id = attr_val.trim_matches(|ch: char| ch.is_ascii_whitespace());
+            let trimmed_id = attr_val.trim_ascii();
             if trimmed_id != attr_val || !is_valid_id(trimmed_id) {
                 return false;
             }
@@ -662,7 +658,7 @@ fn validate_element_and_index<'a, 'input>(
     }
     if tag_name == "style" {
         if let Some(style_type) = node.attribute("type") {
-            let trimmed = style_type.trim_matches(|ch: char| ch.is_ascii_whitespace());
+            let trimmed = style_type.trim_ascii();
             if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("text/css") {
                 return false;
             }
