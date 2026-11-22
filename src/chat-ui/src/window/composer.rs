@@ -224,9 +224,7 @@ impl State {
                 .iter()
                 .any(|event| matches!(event, egui::Event::Ime(_)))
         });
-        if self.rename_conversation.is_none()
-            && self.delete_conversation.is_none()
-            && self.edit_message.is_none()
+        if !self.has_conversation_dialog()
             && !egui::Popup::is_any_open(ui.ctx())
             && !self.show_settings
             && !self.show_audio_transcript
@@ -235,17 +233,8 @@ impl State {
             && response.has_focus()
             && !self.composing
             && !ime_event
-            && ui.input_mut(|input| {
-                let plain_enter = input.events.iter().any(|event| {
-                    matches!(event, egui::Event::Key {
-                        key: egui::Key::Enter,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if *modifiers == egui::Modifiers::NONE)
-                });
-                plain_enter && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-            })
+            && super::plain_key_pressed(ui.ctx(), egui::Key::Enter)
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
         {
             self.submit();
         }

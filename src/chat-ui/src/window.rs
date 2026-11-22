@@ -279,22 +279,10 @@ impl State {
             .and_then(|config| speech::start(config.canary.clone(), config.qwen_tts.clone()).ok());
         let mut state = Self::initial_state(commands, events, microphone, speech);
         if let Some(config) = config {
-            state.markdown_image = Some(config.broker.clone());
             state.model = ModelLifecycle::Preparing;
             state.preview = false;
-            state.runtime_description = runtime_description(config);
-            state.abliteration_enabled = config.use_abliterate_lora;
-            state.daisyrose_available = config.daisyrose_lora.is_some();
-            state.canary_configured = config.canary.is_some();
-            state.tts_configured = config.qwen_tts.is_some();
-            state.canary_managed = config
-                .canary
-                .as_ref()
-                .is_some_and(|speech| speech.launch.is_some());
-            state.tts_managed = config
-                .qwen_tts
-                .as_ref()
-                .is_some_and(|speech| speech.launch.is_some());
+            state.apply_model_config(config);
+            state.apply_speech_flags(config);
         }
         state
     }
@@ -618,11 +606,8 @@ impl State {
             }
             None => client::event_channel(),
         };
-        self.abliteration_enabled = config.use_abliterate_lora;
-        self.daisyrose_available = config.daisyrose_lora.is_some();
+        self.apply_model_config(&config);
         self.daisyrose_default_scale_tenths = 0;
-        self.runtime_description = runtime_description(&config);
-        self.markdown_image = Some(config.broker.clone());
         if !speech_pending {
             self.attach_speech_configuration(&config);
         }
@@ -634,9 +619,14 @@ impl State {
         Ok(())
     }
 
-    fn attach_speech_configuration(&mut self, config: &Config) {
-        self.setup.speech_error = None;
-        self.speech_notice = false;
+    fn apply_model_config(&mut self, config: &Config) {
+        self.markdown_image = Some(config.broker.clone());
+        self.runtime_description = runtime_description(config);
+        self.abliteration_enabled = config.use_abliterate_lora;
+        self.daisyrose_available = config.daisyrose_lora.is_some();
+    }
+
+    fn apply_speech_flags(&mut self, config: &Config) {
         self.canary_configured = config.canary.is_some();
         self.tts_configured = config.qwen_tts.is_some();
         self.canary_managed = config
@@ -647,6 +637,12 @@ impl State {
             .qwen_tts
             .as_ref()
             .is_some_and(|speech| speech.launch.is_some());
+    }
+
+    fn attach_speech_configuration(&mut self, config: &Config) {
+        self.setup.speech_error = None;
+        self.speech_notice = false;
+        self.apply_speech_flags(config);
         self.speech = speech::start(config.canary.clone(), config.qwen_tts.clone()).ok();
         self.speech_checked = self.speech.is_none();
         if self.speech_checked {
@@ -703,6 +699,21 @@ impl State {
             &mut self.diagnostics_revision,
             message,
         );
+    }
+
+    pub(super) fn record_speech_status(&mut self) {
+        Self::record_into(
+            &mut self.diagnostics,
+            &mut self.diagnostics_revision,
+            &self.speech_status,
+        );
+    }
+
+    const fn reset_model_capabilities(&mut self) {
+        self.context_tokens = None;
+        self.vision_available = false;
+        self.daisyrose_available = false;
+        self.daisyrose_default_scale_tenths = 0;
     }
 
     pub(super) fn set_draft_attachments(
@@ -879,10 +890,7 @@ impl State {
             return;
         }
         self.stop_speech();
-        self.context_tokens = None;
-        self.vision_available = false;
-        self.daisyrose_available = false;
-        self.daisyrose_default_scale_tenths = 0;
+        self.reset_model_capabilities();
         self.model = ModelLifecycle::Restarting;
         self.set_status("Restarting the local model…", false);
     }
@@ -922,18 +930,7 @@ impl State {
         }
         // Voice cancellation takes effect before overlays consume Escape. Keep
         // the key available so the same action also dismisses Find or a modal.
-        if self.dictation_requested
-            && ctx.input(|input| {
-                input.events.iter().any(|event| {
-                    matches!(event, egui::Event::Key {
-                        key: egui::Key::Escape,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if *modifiers == egui::Modifiers::NONE)
-                })
-            })
-        {
+        if self.dictation_requested && plain_key_pressed(ctx, egui::Key::Escape) {
             if self.audio_file_active {
                 self.cancel_audio_file();
             } else {
@@ -941,24 +938,11 @@ impl State {
                 "Voice message cancelled.".clone_into(&mut self.speech_status);
             }
         }
-        if self.attachment_import.is_some()
-            && ctx.input_mut(|input| {
-                input.events.iter().any(|event| {
-                    matches!(event, egui::Event::Key {
-                        key: egui::Key::Escape,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if *modifiers == egui::Modifiers::NONE)
-                })
-            })
-        {
+        if self.attachment_import.is_some() && plain_key_pressed(ctx, egui::Key::Escape) {
             self.cancel_attachment_import();
             return;
         }
-        if self.rename_conversation.is_some()
-            || self.delete_conversation.is_some()
-            || self.edit_message.is_some()
+        if self.has_conversation_dialog()
             || self.branch_comparison.is_some()
             || self.show_settings
             || egui::Popup::is_any_open(ctx)
@@ -984,6 +968,24 @@ impl State {
         }
     }
 
+    pub(super) const fn has_conversation_dialog(&self) -> bool {
+        self.rename_conversation.is_some()
+            || self.delete_conversation.is_some()
+            || self.edit_message.is_some()
+    }
+
+    const fn has_overlay(&self) -> bool {
+        self.show_settings
+            || self.show_audio_transcript
+            || self.lightbox.is_some()
+            || self.alerts.details.is_some()
+            || self.branch_comparison.is_some()
+    }
+
+    fn has_dialog_or_popup(&self, ctx: &egui::Context) -> bool {
+        self.has_overlay() || self.has_conversation_dialog() || egui::Popup::is_any_open(ctx)
+    }
+
     fn handle_input_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input(|input| input.viewport().close_requested()) {
             if self.dictation_requested {
@@ -1007,29 +1009,10 @@ impl State {
         if self.update_confirmation_visible() {
             return;
         }
-        if self.rename_conversation.is_none()
-            && self.delete_conversation.is_none()
-            && self.edit_message.is_none()
-            && self.branch_comparison.is_none()
-            && !self.show_settings
-            && !self.show_audio_transcript
-            && self.lightbox.is_none()
-            && self.alerts.details.is_none()
-            && !egui::Popup::is_any_open(ctx)
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::N))
-        {
-            self.new_chat();
-        }
-        if !self.show_settings
-            && !self.show_audio_transcript
-            && self.lightbox.is_none()
-            && self.alerts.details.is_none()
-            && self.rename_conversation.is_none()
-            && self.delete_conversation.is_none()
-            && self.edit_message.is_none()
-            && self.branch_comparison.is_none()
-            && !egui::Popup::is_any_open(ctx)
-        {
+        if !self.has_dialog_or_popup(ctx) {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
+                self.new_chat();
+            }
             // Run before the sidebar and composer text editors consume Ctrl+F.
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
                 self.sidebar_open = false;
@@ -1175,21 +1158,8 @@ impl State {
             if self.model.stopping() && retry_required {
                 self.model = ModelLifecycle::AwaitingTeardown;
             }
-            if !adopted
-                && !auto_continuing
-                && restore_rejected_draft_for(
-                    &mut self.input,
-                    &mut self.draft_attachments,
-                    &mut self.draft_attachments_revision,
-                    &self.transcript,
-                    self.committed.len(),
-                    text,
-                )
-            {
-                self.place_composer_cursor(self.input.chars().count());
-            }
             if !adopted && !auto_continuing {
-                self.retain_draft();
+                self.restore_rejected_draft_into_active(text);
             }
             return;
         }
@@ -1213,21 +1183,8 @@ impl State {
             ModelLifecycle::Ready
         };
         self.transcript.remove_empty_response();
-        if !adopted
-            && !auto_continuing
-            && restore_rejected_draft_for(
-                &mut self.input,
-                &mut self.draft_attachments,
-                &mut self.draft_attachments_revision,
-                &self.transcript,
-                self.committed.len(),
-                text,
-            )
-        {
-            self.place_composer_cursor(self.input.chars().count());
-        }
         if !adopted && !auto_continuing {
-            self.retain_draft();
+            self.restore_rejected_draft_into_active(text);
         }
         if auto_continuing && !retry_required {
             self.set_status(
@@ -1298,19 +1255,13 @@ impl State {
         match event {
             Event::Starting => {
                 self.auto_continuing = false;
-                self.context_tokens = None;
-                self.vision_available = false;
-                self.daisyrose_available = false;
-                self.daisyrose_default_scale_tenths = 0;
+                self.reset_model_capabilities();
                 self.model = ModelLifecycle::Preparing;
                 self.set_status("Preparing your local model…", false);
             }
             Event::Restarting => {
                 self.auto_continuing = false;
-                self.context_tokens = None;
-                self.vision_available = false;
-                self.daisyrose_available = false;
-                self.daisyrose_default_scale_tenths = 0;
+                self.reset_model_capabilities();
                 self.model = ModelLifecycle::Restarting;
                 self.set_status("Restarting the local model…", false);
             }
@@ -1457,21 +1408,11 @@ impl State {
             if auto_continuing {
                 self.transcript.discard_turn(self.committed.len());
                 self.restore_committed_last_answer();
-            } else if restore_rejected_draft_for(
-                &mut self.input,
-                &mut self.draft_attachments,
-                &mut self.draft_attachments_revision,
-                &self.transcript,
-                self.committed.len(),
-                text,
-            ) {
-                self.place_composer_cursor(self.input.chars().count());
+            } else {
+                self.restore_rejected_draft_into_active(text);
             }
         }
         self.transcript.remove_empty_response();
-        if !adopted && !auto_continuing {
-            self.retain_draft();
-        }
         self.set_status(
             if stopping_model {
                 "Response stopped. Releasing the local model…"
@@ -1514,21 +1455,26 @@ impl State {
         }
     }
 
-    fn speech_command(&mut self, command: speech::Command) -> bool {
-        if self
-            .speech
-            .as_ref()
-            .is_some_and(|session| session.commands.send(command).is_ok())
-        {
-            return true;
+    fn restore_rejected_draft_into_active(&mut self, wire_text: &str) {
+        if restore_rejected_draft_for(
+            &mut self.input,
+            &mut self.draft_attachments,
+            &mut self.draft_attachments_revision,
+            &self.transcript,
+            self.committed.len(),
+            wire_text,
+        ) {
+            self.place_composer_cursor(self.input.chars().count());
         }
+        self.retain_draft();
+    }
+
+    fn clear_speech_session(&mut self, file_error: &'static str, status: &'static str) {
         self.speech_input = false;
         self.audio_file_input = false;
         self.speech_output = false;
         if self.audio_file_active {
-            self.fail_audio_file(
-                "The speech worker stopped. Restart the app and try the recording again.",
-            );
+            self.fail_audio_file(file_error);
         } else {
             self.cancel_microphone();
         }
@@ -1538,8 +1484,22 @@ impl State {
         self.streaming_active = false;
         self.streaming_utf16 = 0;
         self.streaming_suppressed = true;
-        "Speech worker stopped. Restart the app to retry.".clone_into(&mut self.speech_status);
+        status.clone_into(&mut self.speech_status);
         self.speech_notice = true;
+    }
+
+    fn speech_command(&mut self, command: speech::Command) -> bool {
+        if self
+            .speech
+            .as_ref()
+            .is_some_and(|session| session.commands.send(command).is_ok())
+        {
+            return true;
+        }
+        self.clear_speech_session(
+            "The speech worker stopped. Restart the app and try the recording again.",
+            "Speech worker stopped. Restart the app to retry.",
+        );
         false
     }
 
@@ -1629,11 +1589,7 @@ impl State {
                     .clone_into(&mut self.speech_status);
             }
         }
-        Self::record_into(
-            &mut self.diagnostics,
-            &mut self.diagnostics_revision,
-            &self.speech_status,
-        );
+        self.record_speech_status();
     }
 
     fn finish_dictation(&mut self) {
@@ -1675,11 +1631,7 @@ impl State {
                 "Describe the voice in Settings before reading aloud."
                     .clone_into(&mut self.speech_status);
                 self.open_settings(settings::Page::Voice);
-                Self::record_into(
-                    &mut self.diagnostics,
-                    &mut self.diagnostics_revision,
-                    &self.speech_status,
-                );
+                self.record_speech_status();
                 return;
             }
             self.stop_speech();
@@ -1700,11 +1652,7 @@ impl State {
             message.clone_into(&mut self.speech_status);
             self.open_voice_setup();
         }
-        Self::record_into(
-            &mut self.diagnostics,
-            &mut self.diagnostics_revision,
-            &self.speech_status,
-        );
+        self.record_speech_status();
     }
 
     const fn microphone_help(&self) -> &'static str {
@@ -1735,22 +1683,10 @@ impl State {
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.speech_checked = true;
-                    self.speech_input = false;
-                    self.audio_file_input = false;
-                    self.speech_output = false;
-                    if self.audio_file_active {
-                        self.fail_audio_file("The speech worker disconnected. Restart the app and try the recording again.");
-                    } else {
-                        self.cancel_microphone();
-                    }
-                    self.speaking = false;
-                    self.speech_loading = false;
-                    self.speaking_message = None;
-                    self.streaming_active = false;
-                    self.streaming_suppressed = true;
-                    self.speech_notice = true;
-                    "Speech unavailable. Text chat remains available."
-                        .clone_into(&mut self.speech_status);
+                    self.clear_speech_session(
+                        "The speech worker disconnected. Restart the app and try the recording again.",
+                        "Speech unavailable. Text chat remains available.",
+                    );
                     break;
                 }
             }
@@ -1854,11 +1790,7 @@ impl State {
             speech::Event::Status(_) => {}
         }
         if self.speech_status != previous {
-            Self::record_into(
-                &mut self.diagnostics,
-                &mut self.diagnostics_revision,
-                &self.speech_status,
-            );
+            self.record_speech_status();
         }
     }
 
@@ -2031,11 +1963,7 @@ impl State {
         let previous = self.speech_status.clone();
         self.microphone_event(event);
         if self.speech_status != previous {
-            Self::record_into(
-                &mut self.diagnostics,
-                &mut self.diagnostics_revision,
-                &self.speech_status,
-            );
+            self.record_speech_status();
         }
     }
 
@@ -2165,24 +2093,17 @@ fn configure_test_context(ctx: &egui::Context) {
 
 impl State {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let previous_height = egui::containers::panel::PanelState::load(
-            ui.ctx(),
-            ui.make_persistent_id("sidebar-footer"),
-        )
-        .map(|state| state.size().y);
-        let footer = egui::Panel::bottom("sidebar-footer")
-            .frame(egui::Frame::new().inner_margin(egui::Margin {
+        settle_panel_height(
+            ui,
+            "sidebar-footer",
+            egui::Margin {
                 left: 0,
                 right: 0,
                 top: 8,
                 bottom: 0,
-            }))
-            .show(ui, |ui| self.sidebar_footer(ui));
-        // Settle the measured bottom anchor after first layout or a notice change.
-        if previous_height.is_none_or(|height| (height - footer.response.rect.height()).abs() > 0.5)
-        {
-            ui.ctx().request_repaint();
-        }
+            },
+            |ui| self.sidebar_footer(ui),
+        );
         ui.add_space(4.0);
         branding::logo(ui);
         ui.add_space(8.0);
@@ -2577,25 +2498,17 @@ impl State {
                 horizontal_inset(ui, horizontal_margin, "workspace-notices", |ui| {
                     self.application_notices(ui);
                 });
-                let previous_composer_height = egui::containers::panel::PanelState::load(
-                    ui.ctx(),
-                    ui.make_persistent_id("composer-panel"),
-                )
-                .map(|state| state.size().y);
-                let composer = egui::Panel::bottom("composer-panel")
-                    .frame(egui::Frame::new().inner_margin(egui::Margin {
+                settle_panel_height(
+                    ui,
+                    "composer-panel",
+                    egui::Margin {
                         left: horizontal_margin,
                         right: horizontal_margin,
                         top: 12,
                         bottom: 4,
-                    }))
-                    .show(ui, |ui| self.composer(ui));
-                // Settle the measured bottom anchor when status or guidance changes height.
-                if previous_composer_height
-                    .is_none_or(|height| (height - composer.response.rect.height()).abs() > 0.5)
-                {
-                    ui.ctx().request_repaint();
-                }
+                    },
+                    |ui| self.composer(ui),
+                );
                 let empty = self.transcript.messages.is_empty();
                 // Even an empty Find scope advances egui's layout cursor.
                 let closed_find = find_open
@@ -2662,13 +2575,7 @@ impl State {
         let drawer = self.sidebar_open && ui.available_width() < navigation::DOCK_THRESHOLD;
         let update_confirmation = self.update_confirmation_visible();
         ui.add_enabled_ui(
-            !self.show_settings
-                && !self.show_audio_transcript
-                && self.lightbox.is_none()
-                && self.alerts.details.is_none()
-                && self.branch_comparison.is_none()
-                && !update_confirmation
-                && !drawer,
+            !self.has_overlay() && !update_confirmation && !drawer,
             |ui| {
                 self.draw_workspace(ui);
             },
@@ -2778,6 +2685,36 @@ fn horizontal_inset<R>(
     result
 }
 
+pub(super) fn plain_key_pressed(ctx: &egui::Context, key: egui::Key) -> bool {
+    ctx.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(event, egui::Event::Key {
+                key: pressed_key,
+                pressed: true,
+                modifiers,
+                ..
+            } if *pressed_key == key && *modifiers == egui::Modifiers::NONE)
+        })
+    })
+}
+
+fn settle_panel_height(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    margin: egui::Margin,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    let previous = egui::containers::panel::PanelState::load(ui.ctx(), ui.make_persistent_id(id))
+        .map(|state| state.size().y);
+    let panel = egui::Panel::bottom(id)
+        .frame(egui::Frame::new().inner_margin(margin))
+        .show(ui, content);
+    // Settle the measured bottom anchor after first layout or a notice change.
+    if previous.is_none_or(|height| (height - panel.response.rect.height()).abs() > 0.5) {
+        ui.ctx().request_repaint();
+    }
+}
+
 impl eframe::App for State {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if self.repaint_ctx.is_none() {
@@ -2792,11 +2729,7 @@ impl eframe::App for State {
         self.poll_updates(ctx);
         if ((!was_ready && self.model.ready())
             || (was_busy && !self.model.busy() && self.model.ready()))
-            && !self.show_settings
-            && !self.show_audio_transcript
-            && self.lightbox.is_none()
-            && self.alerts.details.is_none()
-            && self.branch_comparison.is_none()
+            && !self.has_overlay()
             && ctx.memory(|memory| {
                 memory
                     .focused()
@@ -2872,38 +2805,54 @@ fn native_options() -> io::Result<eframe::NativeOptions> {
     })
 }
 
-pub(super) fn run(config: Config) -> io::Result<()> {
+fn open_persisted_stores(
+    data: &std::path::Path,
+) -> impl FnOnce(&mut State, &eframe::CreationContext<'_>) + use<> {
+    let recovery = crate::recovery::Recovery::open(data);
+    let placement = placement::Placement::open(data);
+    let appearance = appearance::Store::open(data);
+    let profile = profile::Store::open(data);
+    move |state, cc| {
+        state.repaint_ctx = Some(cc.egui_ctx.clone());
+        state.attach_recovery(recovery);
+        state.attach_placement(placement, cc);
+        state.attach_appearance(appearance, &cc.egui_ctx);
+        state.attach_profile(profile);
+    }
+}
+
+fn run_native_window(
+    title: &str,
+    build: impl FnOnce(&eframe::CreationContext<'_>, Sender<Command>, client::EventReceiver) -> State
+    + 'static,
+) -> io::Result<()> {
     appearance::prepare_fonts();
-    let recovery = crate::recovery::Recovery::open(&config.data);
-    let placement = placement::Placement::open(&config.data);
-    let appearance = appearance::Store::open(&config.data);
-    let profile = profile::Store::open(&config.data);
     eframe::run_native(
-        "Swift Bonsai",
+        title,
         native_options()?,
         Box::new(move |cc| {
             graphics::install(cc);
             configure(&cc.egui_ctx);
             let (commands, _incoming) = mpsc::channel();
             let (_events, incoming_events) = client::event_channel();
-            let microphone = microphone::Microphone::new().ok();
-            let mut state = State::create(commands, incoming_events, None, microphone);
-            state.repaint_ctx = Some(cc.egui_ctx.clone());
-            state.model = ModelLifecycle::Preparing;
-            state.preview = false;
-            state.runtime_description = runtime_description(&config);
-            state.abliteration_enabled = config.use_abliterate_lora;
-            state.daisyrose_available = config.daisyrose_lora.is_some();
-            state.markdown_image = Some(config.broker.clone());
-            state.pending_config = Some(config);
-            state.attach_recovery(recovery);
-            state.attach_placement(placement, cc);
-            state.attach_appearance(appearance, &cc.egui_ctx);
-            state.attach_profile(profile);
-            Ok(Box::new(state))
+            Ok(Box::new(build(cc, commands, incoming_events)))
         }),
     )
     .map_err(|error| io::Error::other(error.to_string()))
+}
+
+pub(super) fn run(config: Config) -> io::Result<()> {
+    let attach_stores = open_persisted_stores(&config.data);
+    run_native_window("Swift Bonsai", move |cc, commands, incoming_events| {
+        let microphone = microphone::Microphone::new().ok();
+        let mut state = State::create(commands, incoming_events, None, microphone);
+        state.model = ModelLifecycle::Preparing;
+        state.preview = false;
+        state.apply_model_config(&config);
+        state.pending_config = Some(config);
+        attach_stores(&mut state, cc);
+        state
+    })
 }
 
 fn prepare_startup_directory(data: &std::path::Path) -> io::Result<()> {
@@ -2923,37 +2872,20 @@ fn startup_exit_result(update_approved: bool, failure: Option<String>) -> io::Re
 }
 
 pub(super) fn run_startup(request: crate::startup::Request) -> io::Result<bool> {
-    appearance::prepare_fonts();
     prepare_startup_directory(&request.data)?;
     // Retain the established recovery ordering: restore before accepting a draft.
-    let recovery = crate::recovery::Recovery::open(&request.data);
-    let placement = placement::Placement::open(&request.data);
-    let appearance = appearance::Store::open(&request.data);
-    let profile = profile::Store::open(&request.data);
+    let attach_stores = open_persisted_stores(&request.data);
     let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
     let reported_failure = std::sync::Arc::clone(&failure);
     let update_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let approved_update = std::sync::Arc::clone(&update_exit);
-    eframe::run_native(
-        "Swift Bonsai",
-        native_options()?,
-        Box::new(move |cc| {
-            graphics::install(cc);
-            configure(&cc.egui_ctx);
-            let (commands, _incoming) = mpsc::channel();
-            let (_events, incoming_events) = client::event_channel();
-            let mut state = State::pending_startup(commands, incoming_events, request);
-            state.repaint_ctx = Some(cc.egui_ctx.clone());
-            state.startup_failure = Some(reported_failure);
-            state.update_exit = Some(approved_update);
-            state.attach_recovery(recovery);
-            state.attach_placement(placement, cc);
-            state.attach_appearance(appearance, &cc.egui_ctx);
-            state.attach_profile(profile);
-            Ok(Box::new(state))
-        }),
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
+    run_native_window("Swift Bonsai", move |cc, commands, incoming_events| {
+        let mut state = State::pending_startup(commands, incoming_events, request);
+        state.startup_failure = Some(reported_failure);
+        state.update_exit = Some(approved_update);
+        attach_stores(&mut state, cc);
+        state
+    })?;
     let error = failure
         .lock()
         .map_err(|_| io::Error::other("Cannot read native preparation result."))?
@@ -2965,21 +2897,23 @@ pub(super) fn run_startup(request: crate::startup::Request) -> io::Result<bool> 
 }
 /// Opens only a seeded interface; no backend, credential or audio operation runs.
 pub(super) fn run_preview() -> io::Result<()> {
-    appearance::prepare_fonts();
-    eframe::run_native("Swift Bonsai · Preview", native_options()?, Box::new(|cc| {
-        graphics::install(cc);
-        configure(&cc.egui_ctx);
-        let (commands, _incoming) = mpsc::channel();
-        let (_events, incoming_events) = client::event_channel();
+    run_native_window("Swift Bonsai · Preview", |_, commands, incoming_events| {
         let mut state = State::create(commands, incoming_events, None, None);
         state.model = ModelLifecycle::Ready;
         "Interface preview".clone_into(&mut state.status);
-        state.transcript.push(Role::User, "I have a few ideas for a short story, but I’m not sure where to start.".to_owned());
+        state.transcript.push(
+            Role::User,
+            "I have a few ideas for a short story, but I’m not sure where to start.".to_owned(),
+        );
         state.transcript.push(Role::Assistant, "Start with the moment something changes.\n\nA quiet bookshop receives a letter addressed to someone who has never existed. Its owner recognizes the handwriting as their own.\n\nWhat draws you in more: the mystery of the letter, or the person who finds it?".to_owned());
-        state.last_answer = state.transcript.messages.last().map_or(String::new(), |message| message.body.clone());
+        state.last_answer = state
+            .transcript
+            .messages
+            .last()
+            .map_or(String::new(), |message| message.body.clone());
         state.answer_complete = true;
-        Ok(Box::new(state))
-    })).map_err(|error| io::Error::other(error.to_string()))
+        state
+    })
 }
 
 pub(super) fn show_error(message: &str) {

@@ -40,13 +40,11 @@ impl State {
             .as_ref()
             .is_some_and(audio_import::PasteHook::poll)
             || self.composing
-            || self.rename_conversation.is_some()
-            || self.delete_conversation.is_some()
+            || self.has_conversation_dialog()
             || self.show_settings
             || self.show_audio_transcript
             || self.lightbox.is_some()
             || self.alerts.details.is_some()
-            || self.edit_message.is_some()
             || self.help.is_some()
             || self.update_confirmation_visible()
             || !ctx.memory(|memory| {
@@ -119,11 +117,7 @@ impl State {
         {
             self.audio_file_notice = Some(self.speech_status.clone());
         }
-        Self::record_into(
-            &mut self.diagnostics,
-            &mut self.diagnostics_revision,
-            &self.speech_status,
-        );
+        self.record_speech_status();
     }
 
     pub(super) fn poll_audio_import(&mut self) {
@@ -186,11 +180,7 @@ impl State {
         if self.audio_file_active || self.audio_file_error {
             self.audio_file_notice = Some(self.speech_status.clone());
         }
-        Self::record_into(
-            &mut self.diagnostics,
-            &mut self.diagnostics_revision,
-            &self.speech_status,
-        );
+        self.record_speech_status();
     }
 
     pub(super) fn cancel_audio_file(&mut self) {

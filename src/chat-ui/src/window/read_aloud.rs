@@ -45,11 +45,7 @@ impl State {
             }
         }
         self.recovery_dirty = true;
-        Self::record_into(
-            &mut self.diagnostics,
-            &mut self.diagnostics_revision,
-            &self.speech_status,
-        );
+        self.record_speech_status();
     }
 
     pub(super) fn stream_answer(&mut self, text: String) {
