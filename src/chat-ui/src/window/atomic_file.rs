@@ -159,19 +159,27 @@ pub(crate) fn validate_user_export_path(path: &Path) -> io::Result<()> {
     validate_export_leaf(path)
 }
 
+fn validate_stage(
+    stage: Stage,
+    validator: fn(&Path) -> io::Result<()>,
+    path: &Path,
+) -> Result<(), StagedError> {
+    validator(path).map_err(|error| StagedError { stage, error })
+}
+
 fn replace_with(
     path: &Path,
     bytes: &[u8],
-    validate_target: fn(&Path) -> Result<(), StagedError>,
-    validate_temp: fn(&Path) -> Result<(), StagedError>,
-    revalidate_target: fn(&Path) -> Result<(), StagedError>,
+    validate_target: fn(&Path) -> io::Result<()>,
+    validate_temp: fn(&Path) -> io::Result<()>,
+    revalidate_target: fn(&Path) -> io::Result<()>,
 ) -> Result<(), StagedError> {
-    validate_target(path)?;
+    validate_stage(Stage::ValidatePath, validate_target, path)?;
     let temporary = pending_path(path).map_err(|error| StagedError {
         stage: Stage::ValidateTemporary,
         error,
     })?;
-    validate_temp(&temporary)?;
+    validate_stage(Stage::ValidateTemporary, validate_temp, &temporary)?;
     let mut created = false;
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -198,7 +206,7 @@ fn replace_with(
                 error,
             })?;
         drop(file);
-        revalidate_target(path)?;
+        validate_stage(Stage::RevalidatePath, revalidate_target, path)?;
         fs::rename(&temporary, path).map_err(|error| StagedError {
             stage: Stage::Replace,
             error,
@@ -211,36 +219,15 @@ fn replace_with(
     result
 }
 
-fn validate_external_target(path: &Path) -> Result<(), StagedError> {
-    bonsai_windows_credentials::validate_external_path(path).map_err(|error| StagedError {
-        stage: Stage::ValidatePath,
-        error,
-    })
-}
-
-fn validate_external_temp(path: &Path) -> Result<(), StagedError> {
-    bonsai_windows_credentials::validate_external_path(path).map_err(|error| StagedError {
-        stage: Stage::ValidateTemporary,
-        error,
-    })
-}
-
-fn revalidate_external_target(path: &Path) -> Result<(), StagedError> {
-    bonsai_windows_credentials::validate_external_path(path).map_err(|error| StagedError {
-        stage: Stage::RevalidatePath,
-        error,
-    })
-}
-
 /// Validates strict external path containment and atomically replaces `path`, reporting stage.
 // Serialization, encryption and storage limits belong to the individual stores.
 pub(crate) fn replace_staged(path: &Path, bytes: &[u8]) -> Result<(), StagedError> {
     replace_with(
         path,
         bytes,
-        validate_external_target,
-        validate_external_temp,
-        revalidate_external_target,
+        bonsai_windows_credentials::validate_external_path,
+        bonsai_windows_credentials::validate_external_path,
+        bonsai_windows_credentials::validate_external_path,
     )
 }
 
@@ -255,24 +242,9 @@ pub(crate) fn replace_user_export_file(path: &Path, bytes: &[u8]) -> io::Result<
     replace_with(
         path,
         bytes,
-        |target| {
-            validate_user_export_path(target).map_err(|error| StagedError {
-                stage: Stage::ValidatePath,
-                error,
-            })
-        },
-        |temp| {
-            validate_export_leaf(temp).map_err(|error| StagedError {
-                stage: Stage::ValidateTemporary,
-                error,
-            })
-        },
-        |target| {
-            validate_export_leaf(target).map_err(|error| StagedError {
-                stage: Stage::RevalidatePath,
-                error,
-            })
-        },
+        validate_user_export_path,
+        validate_export_leaf,
+        validate_export_leaf,
     )
     .map_err(|failure| failure.error)
 }

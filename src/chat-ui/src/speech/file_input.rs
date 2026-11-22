@@ -16,28 +16,9 @@ pub(super) fn transcribe(
         |input| run(generation, first, &mut import, current, events,
             &mut |wav| input.transcribe(generation, wav, current), &mut admit_text),
     );
-    if let Some(input) = input {
-        if result.is_ok() {
-            input.complete(generation, current, std::time::Instant::now());
-        } else {
-            input.clear();
-        }
-    }
-    if current.load(Ordering::Acquire) != generation {
-        return;
-    }
-    match result {
-        Ok(()) => {
-            let _sent = events.send(Event::FileFinished { generation });
-        }
-        Err(canary::Failure::Cancelled) => {}
-        Err(canary::Failure::Message(message)) => {
-            let _sent = events.send(Event::InputFailed {
-                generation,
-                message,
-            });
-        }
-    }
+    super::finish_input_transcription(input, generation, current, events, result, |()| {
+        Event::FileFinished { generation }
+    });
 }
 
 fn run(

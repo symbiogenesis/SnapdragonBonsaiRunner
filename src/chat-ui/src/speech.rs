@@ -320,8 +320,40 @@ fn receive_command<T>(
     }
 }
 
-fn transcription(
+pub(self) fn finish_input_transcription<T>(
     input: Option<&mut Input>,
+    generation: u64,
+    current: &AtomicU64,
+    events: &Sender<Event>,
+    result: Result<T, canary::Failure>,
+    on_ok: impl FnOnce(T) -> Event,
+) {
+    if let Some(input) = input {
+        if result.is_ok() {
+            input.complete(generation, current, Instant::now());
+        } else {
+            input.clear();
+        }
+    }
+    if current.load(Ordering::Acquire) != generation {
+        return;
+    }
+    match result {
+        Ok(value) => {
+            let _sent = events.send(on_ok(value));
+        }
+        Err(canary::Failure::Cancelled) => {}
+        Err(canary::Failure::Message(message)) => {
+            let _sent = events.send(Event::InputFailed {
+                generation,
+                message,
+            });
+        }
+    }
+}
+
+fn transcription(
+    mut input: Option<&mut Input>,
     generation: u64,
     wav: &[u8],
     current: &AtomicU64,
@@ -336,35 +368,15 @@ fn transcription(
     let _sent = events.send(Event::Status(
         "Transcribing with native Qwen3-ASR 1.7B. Escape cancels model loading or transcription.",
     ));
-    let result = input.map_or(
+    let result = input.as_deref_mut().map_or(
         Err(canary::Failure::Message(
             "Speech input is unavailable. Open Settings > Voice to review speech setup and try again.",
         )),
-        |input| {
-            let result = input.transcribe(generation, wav, current);
-            if result.is_err() {
-                input.clear();
-            } else {
-                input.complete(generation, current, Instant::now());
-            }
-            result
-        },
+        |input| input.transcribe(generation, wav, current),
     );
-    if current.load(Ordering::Acquire) != generation {
-        return;
-    }
-    match result {
-        Ok(text) => {
-            let _sent = events.send(Event::Recognized { generation, text });
-        }
-        Err(canary::Failure::Cancelled) => {}
-        Err(canary::Failure::Message(message)) => {
-            let _sent = events.send(Event::InputFailed {
-                generation,
-                message,
-            });
-        }
-    }
+    finish_input_transcription(input, generation, current, events, result, |text| {
+        Event::Recognized { generation, text }
+    });
 }
 
 fn prepare_input(
@@ -481,6 +493,10 @@ const fn output_failure(failure: tts::Failure) -> &'static str {
         tts::Failure::Message(message) => message,
         tts::Failure::Cancelled => "Read aloud stopped.",
     }
+}
+
+fn valid_voice_description(voice: &str) -> bool {
+    !voice.trim().is_empty() && voice.chars().count() <= 1024 && !voice.contains('\0')
 }
 
 #[expect(
@@ -603,9 +619,7 @@ fn run(
                     continue;
                 }
                 if let Some(segments) = segments(&text)
-                    && !voice_description.trim().is_empty()
-                    && voice_description.chars().count() <= 1024
-                    && !voice_description.contains('\0')
+                    && valid_voice_description(&voice_description)
                 {
                     let service =
                         take_warm(&mut warm, Instant::now(), |service| service.check().is_ok());
@@ -650,10 +664,7 @@ fn run(
                 }
                 let service =
                     take_warm(&mut warm, Instant::now(), |service| service.check().is_ok());
-                let failure = (voice_description.trim().is_empty()
-                    || voice_description.chars().count() > 1024
-                    || voice_description.contains('\0'))
-                .then_some(
+                let failure = (!valid_voice_description(&voice_description)).then_some(
                     "Read aloud needs a non-empty voice description up to 1,024 characters.",
                 );
                 output = Some(Output {

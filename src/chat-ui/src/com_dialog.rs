@@ -299,6 +299,24 @@ pub(crate) struct ModalDialog<'a> {
     _apartment: &'a Apartment,
 }
 
+fn publish_and_show(
+    owner: isize,
+    cancel: &Cancel,
+    cancelled: &AtomicBool,
+    dialog: &ModalDialog<'_>,
+) -> Result<bool, DialogError> {
+    let active = ActiveDialog::publish(cancel, cancelled, dialog)?;
+    let show_result = dialog.show(NonZeroIsize::new(owner));
+    drop(active);
+    classify_picker_show(show_result, cancelled.load(Ordering::Acquire))
+}
+
+fn shell_item_path(item: &IShellItem) -> Option<PathBuf> {
+    // SAFETY: Valid IShellItem; CoTaskMemString frees the returned buffer on drop.
+    let raw = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.ok()?;
+    CoTaskMemString::from_pwstr(raw).into_path_buf()
+}
+
 impl<'a> ModalDialog<'a> {
     /// Instantiates and configures a modal `IFileDialog` on `apartment`.
     pub(crate) fn new(
@@ -358,12 +376,7 @@ impl<'a> ModalDialog<'a> {
         // SAFETY: Called only after Show succeeded.
         let item: IShellItem =
             unsafe { self.inner.GetResult() }.map_err(|_| DialogError::ResultInvalid)?;
-        // SAFETY: Valid IShellItem; CoTaskMemString frees the returned buffer on drop.
-        let raw = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
-            .map_err(|_| DialogError::ResultInvalid)?;
-        let path = CoTaskMemString::from_pwstr(raw)
-            .into_path_buf()
-            .ok_or(DialogError::ResultInvalid)?;
+        let path = shell_item_path(&item).ok_or(DialogError::ResultInvalid)?;
         Ok(DialogSelection {
             path,
             file_type_index,
@@ -383,10 +396,7 @@ pub(crate) fn run_modal(
     }
     let apartment = Apartment::sta().map_err(|_| DialogError::Unavailable)?;
     let dialog = ModalDialog::new(&apartment, spec)?;
-    let active = ActiveDialog::publish(cancel, cancelled, &dialog)?;
-    let show_result = dialog.show(NonZeroIsize::new(owner));
-    drop(active);
-    if !classify_picker_show(show_result, cancelled.load(Ordering::Acquire))? {
+    if !publish_and_show(owner, cancel, cancelled, &dialog)? {
         return Ok(None);
     }
     dialog.selection().map(Some)
@@ -476,13 +486,7 @@ pub(crate) fn run_multi_open_modal(
         inner: base,
         _apartment: &apartment,
     };
-    let active = ActiveDialog::publish(cancel, cancelled, &modal).map_err(|error| match error {
-        DialogError::Cancelled => MultiDialogError::Cancelled,
-        DialogError::Unavailable | DialogError::ResultInvalid => MultiDialogError::Failed,
-    })?;
-    let show_result = modal.show(NonZeroIsize::new(owner));
-    drop(active);
-    match classify_picker_show(show_result, cancelled.load(Ordering::Acquire)) {
+    match publish_and_show(owner, cancel, cancelled, &modal) {
         Ok(true) => {}
         Ok(false) | Err(DialogError::Cancelled) => return Err(MultiDialogError::Cancelled),
         Err(DialogError::Unavailable | DialogError::ResultInvalid) => {
@@ -502,12 +506,7 @@ pub(crate) fn run_multi_open_modal(
         // SAFETY: `index` is strictly below `count` from GetCount on this STA thread.
         let item: IShellItem =
             unsafe { results.GetItemAt(index) }.map_err(|_| MultiDialogError::Failed)?;
-        // SAFETY: Resolves the filesystem path for a selected item; CoTaskMemString frees it.
-        let raw = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
-            .map_err(|_| MultiDialogError::Failed)?;
-        let path = CoTaskMemString::from_pwstr(raw)
-            .into_path_buf()
-            .ok_or(MultiDialogError::Failed)?;
+        let path = shell_item_path(&item).ok_or(MultiDialogError::Failed)?;
         paths.push(path);
     }
     Ok(paths)

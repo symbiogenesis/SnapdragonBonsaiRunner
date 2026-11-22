@@ -75,36 +75,8 @@ impl Export {
         svg: Arc<str>,
         suggested_stem: String,
     ) -> io::Result<Self> {
-        let (raster_tx, raster_rx) = mpsc::sync_channel::<Result<Arc<[u8]>, &'static str>>(1);
-        let raster = prepare_raster(ctx, &svg, &raster_tx);
-        let shared = Arc::new(Shared::default());
-        let worker_shared = Arc::clone(&shared);
-        let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
-            .name("bonsai-image-save".to_owned())
-            .spawn(move || {
-                let outcome = run_worker(
-                    &worker_shared,
-                    || {
-                        picker::pick_save_target(
-                            owner,
-                            &worker_shared.picker,
-                            &worker_shared.cancelled,
-                            &suggested_stem,
-                        )
-                    },
-                    &svg,
-                    &raster_rx,
-                );
-                let _sent = outcome_tx.send(outcome);
-            })?;
-        Ok(Self {
-            shared,
-            outcome: outcome_rx,
-            raster_tx: Some(raster_tx),
-            raster,
-            worker: Some(worker),
-            finished: false,
+        Self::start_with(ctx, svg, "bonsai-image-save", move |shared| {
+            picker::pick_save_target(owner, &shared.picker, &shared.cancelled, &suggested_stem)
         })
     }
 
@@ -114,15 +86,27 @@ impl Export {
         selection: Selection,
         svg: Arc<str>,
     ) -> io::Result<Self> {
+        Self::start_with(ctx, svg, "bonsai-image-save-test-worker", move |_| {
+            Ok(Some(selection))
+        })
+    }
+
+    fn start_with(
+        ctx: &egui::Context,
+        svg: Arc<str>,
+        thread_name: &'static str,
+        select: impl FnOnce(&Shared) -> Result<Option<Selection>, &'static str> + Send + 'static,
+    ) -> io::Result<Self> {
         let (raster_tx, raster_rx) = mpsc::sync_channel::<Result<Arc<[u8]>, &'static str>>(1);
         let raster = prepare_raster(ctx, &svg, &raster_tx);
         let shared = Arc::new(Shared::default());
         let worker_shared = Arc::clone(&shared);
         let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("bonsai-image-save-test-worker".to_owned())
+            .name(thread_name.to_owned())
             .spawn(move || {
-                let outcome = run_worker(&worker_shared, || Ok(Some(selection)), &svg, &raster_rx);
+                let outcome =
+                    run_worker(&worker_shared, || select(&worker_shared), &svg, &raster_rx);
                 let _sent = outcome_tx.send(outcome);
             })?;
         Ok(Self {

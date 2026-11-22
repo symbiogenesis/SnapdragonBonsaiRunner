@@ -259,26 +259,43 @@ fn decode_video(path: &Path) -> Result<DecodedMedia, u64> {
     let mut thumbnail_png = None;
     let mut cumulative_png_bytes = 0_usize;
 
+    let mut prev_ts = None;
+    let mut append_sample = |timestamp_ms: u64,
+                             sample: &IMFSample,
+                             src_w: u32,
+                             src_h: u32,
+                             stride: i32,
+                             fail_on_limit: bool|
+     -> Result<bool, u64> {
+        let (thumb, encoded) = encode_video_sample(
+            sample,
+            src_w,
+            src_h,
+            stride,
+            dst_w,
+            dst_h,
+            timestamp_ms,
+            thumbnail_png.is_none(),
+        )?;
+        thumbnail_png = thumbnail_png.take().or(thumb);
+        let next_total = cumulative_png_bytes.saturating_add(encoded.png_bytes.len());
+        if next_total > MAX_TOTAL_VIDEO_PNG_BYTES {
+            return if fail_on_limit {
+                Err(ERR_MEMORY)
+            } else {
+                Ok(false)
+            };
+        }
+        cumulative_png_bytes = next_total;
+        frames.push(encoded);
+        Ok(true)
+    };
+
     if targets.is_empty() {
         if let Some((ts_hns, sample)) =
             read_next_video_sample(&reader, &mut src_w, &mut src_h, &mut stride)?
         {
-            let (thumb, encoded) = encode_video_sample(
-                &sample,
-                src_w,
-                src_h,
-                stride,
-                dst_w,
-                dst_h,
-                hns_to_ms(ts_hns),
-                thumbnail_png.is_none(),
-            )?;
-            thumbnail_png = thumbnail_png.or(thumb);
-            cumulative_png_bytes = cumulative_png_bytes.saturating_add(encoded.png_bytes.len());
-            if cumulative_png_bytes > MAX_TOTAL_VIDEO_PNG_BYTES {
-                return Err(ERR_MEMORY);
-            }
-            frames.push(encoded);
+            append_sample(hns_to_ms(ts_hns), &sample, src_w, src_h, stride, true)?;
         }
     } else {
         for &target_hns in &targets {
@@ -290,48 +307,20 @@ fn decode_video(path: &Path) -> Result<DecodedMedia, u64> {
             else {
                 continue;
             };
-            let timestamp_ms = frames
-                .last()
-                .map_or(hns_to_ms(ts_hns), |prev: &EncodedFrame| {
-                    hns_to_ms(ts_hns).max(prev.timestamp_ms)
-                });
-            let (thumb, encoded) = encode_video_sample(
-                &sample,
-                src_w,
-                src_h,
-                stride,
-                dst_w,
-                dst_h,
-                timestamp_ms,
-                thumbnail_png.is_none(),
-            )?;
-            thumbnail_png = thumbnail_png.or(thumb);
-            cumulative_png_bytes = cumulative_png_bytes.saturating_add(encoded.png_bytes.len());
-            if cumulative_png_bytes > MAX_TOTAL_VIDEO_PNG_BYTES {
+            let raw_ms = hns_to_ms(ts_hns);
+            let timestamp_ms = prev_ts.map_or(raw_ms, |prev| raw_ms.max(prev));
+            if !append_sample(timestamp_ms, &sample, src_w, src_h, stride, false)? {
                 break;
             }
-            frames.push(encoded);
+            prev_ts = Some(timestamp_ms);
         }
         // Fallback when container index rejects random seeks: rewind to start and decode first keyframe.
-        if frames.is_empty()
+        if prev_ts.is_none()
             && seek_hns(&reader, 0)
             && let Some((ts_hns, sample)) =
                 read_next_video_sample(&reader, &mut src_w, &mut src_h, &mut stride)?
         {
-            let (thumb, encoded) = encode_video_sample(
-                &sample,
-                src_w,
-                src_h,
-                stride,
-                dst_w,
-                dst_h,
-                hns_to_ms(ts_hns),
-                true,
-            )?;
-            thumbnail_png = thumb;
-            if encoded.png_bytes.len() <= MAX_TOTAL_VIDEO_PNG_BYTES {
-                frames.push(encoded);
-            }
+            let _ = append_sample(hns_to_ms(ts_hns), &sample, src_w, src_h, stride, false)?;
         }
     }
 
