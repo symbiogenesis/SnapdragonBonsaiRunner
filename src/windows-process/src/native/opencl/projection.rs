@@ -1,8 +1,6 @@
 //! One fixed original-PQ2 integer projection, owned by a supervised child.
 
-use super::{
-    Api, DEVICE_NOT_FOUND, GPU, Id, MAX_DEVICES, MAX_PLATFORMS, bounded_count, check, invalid,
-};
+use super::{Api, Id, MAX_DEVICES, check, invalid};
 use crate::{
     AdrenoFamily, OpenClDevice, OpenClKernelKind, OpenClPq2Projection, OpenClProjectionSelection,
 };
@@ -340,6 +338,7 @@ struct LaunchSpec<'a> {
     global_work: usize,
     local_work: Option<usize>,
     output_len: usize,
+    output_bytes: usize,
     weights: &'a [u8],
     codes: &'a [u8],
 }
@@ -349,30 +348,15 @@ fn selected_for_family(
     selection: &OpenClProjectionSelection,
     family: AdrenoFamily,
 ) -> io::Result<(Id, OpenClDevice)> {
-    let mut platforms = [std::ptr::null_mut(); MAX_PLATFORMS];
-    let mut count = 0;
-    // SAFETY: Eight initialized output IDs, a native count and a live loader.
-    check(unsafe { (api.platforms)(8, platforms.as_mut_ptr(), &raw mut count) })?;
-    let count = bounded_count(count, MAX_PLATFORMS)?;
+    let (platforms, count) = api.platform_ids(false)?;
     let mut selected = None;
     let mut remaining = MAX_DEVICES;
     for platform in &platforms[..count] {
-        if platform.is_null() {
-            return Err(invalid());
-        }
-        let name = api.string(*platform, 0x0902, true)?;
-        let mut devices = [std::ptr::null_mut(); MAX_DEVICES];
-        let mut count = 0;
-        // SAFETY: The platform came from this loader. The fixed array can hold
-        // sixteen GPU IDs; the aggregate count is checked before indexing.
-        let code =
-            unsafe { (api.devices)(*platform, GPU, 16, devices.as_mut_ptr(), &raw mut count) };
-        if code == DEVICE_NOT_FOUND {
+        let (devices, count) = api.platform_gpus(*platform, &mut remaining)?;
+        if count == 0 {
             continue;
         }
-        check(code)?;
-        let count = bounded_count(count, remaining)?;
-        remaining -= count;
+        let name = api.string(*platform, 0x0902, true)?;
         for id in &devices[..count] {
             let device = api.device(*id)?;
             if name == selection.platform_name
@@ -520,7 +504,7 @@ fn build_spec<'a>(
             ([None, None], work, Some(FWHT_LOCAL_WORK_SIZE), output_len)
         }
     };
-    let _ = validate_buffer_caps(weights.len(), codes.len(), output_len)?;
+    let output_bytes = validate_buffer_caps(weights.len(), codes.len(), output_len)?;
     Ok(LaunchSpec {
         selection,
         family,
@@ -530,6 +514,7 @@ fn build_spec<'a>(
         global_work,
         local_work,
         output_len,
+        output_bytes,
         weights,
         codes,
     })
@@ -540,8 +525,7 @@ pub(crate) fn run(
     weights: &[u8],
     codes: &[u8],
 ) -> io::Result<OpenClPq2Projection> {
-    super::validate_environment()?;
-    let spec = build_spec(
+    run_with_kernel(
         selection,
         AdrenoFamily::X2_90,
         OpenClKernelKind::BlockDots,
@@ -550,8 +534,7 @@ pub(crate) fn run(
         1,
         weights,
         codes,
-    )?;
-    execute(&spec)
+    )
 }
 
 #[expect(
@@ -580,7 +563,7 @@ pub(crate) fn run_with_kernel(
     reason = "Keep the single audited creation, submission, readback and terminal-fence sequence together so object ownership remains reviewable."
 )]
 fn execute(spec: &LaunchSpec<'_>) -> io::Result<OpenClPq2Projection> {
-    let output_bytes = validate_buffer_caps(spec.weights.len(), spec.codes.len(), spec.output_len)?;
+    let output_bytes = spec.output_bytes;
     let api = Api::load()?;
     let (device_id, device) = selected_for_family(&api, spec.selection, spec.family)?;
     if [spec.weights.len(), spec.codes.len(), output_bytes]

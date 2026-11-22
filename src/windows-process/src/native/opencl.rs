@@ -187,7 +187,27 @@ impl Api {
         })
     }
 
-    fn platform(&self, id: Id, remaining: usize) -> io::Result<OpenClPlatform> {
+    pub(super) fn platform_ids(
+        &self,
+        allow_not_found: bool,
+    ) -> io::Result<([Id; MAX_PLATFORMS], usize)> {
+        let mut platforms = [std::ptr::null_mut(); MAX_PLATFORMS];
+        let mut count = 0;
+        // SAFETY: The loader remains owned; initialized output accommodates eight
+        // platform IDs and a native count. OpenCL reports the total available count.
+        let code = unsafe { (self.platforms)(8, platforms.as_mut_ptr(), &raw mut count) };
+        if allow_not_found && code == PLATFORM_NOT_FOUND {
+            return Ok((platforms, 0));
+        }
+        check(code)?;
+        Ok((platforms, bounded_count(count, MAX_PLATFORMS)?))
+    }
+
+    pub(super) fn platform_gpus(
+        &self,
+        id: Id,
+        remaining: &mut usize,
+    ) -> io::Result<([Id; MAX_DEVICES], usize)> {
         if id.is_null() {
             return Err(invalid());
         }
@@ -196,12 +216,17 @@ impl Api {
         // SAFETY: Valid enumerated platform, fixed initialized output for sixteen
         // device IDs and a native u32 count. Only GPU devices are requested.
         let code = unsafe { (self.devices)(id, GPU, 16, devices.as_mut_ptr(), &raw mut count) };
-        let count = if code == DEVICE_NOT_FOUND {
-            0
-        } else {
-            check(code)?;
-            bounded_count(count, remaining)?
-        };
+        if code == DEVICE_NOT_FOUND {
+            return Ok((devices, 0));
+        }
+        check(code)?;
+        let count = bounded_count(count, *remaining)?;
+        *remaining -= count;
+        Ok((devices, count))
+    }
+
+    fn platform(&self, id: Id, remaining: &mut usize) -> io::Result<OpenClPlatform> {
+        let (devices, count) = self.platform_gpus(id, remaining)?;
         Ok(OpenClPlatform {
             name: self.string(id, 0x0902, true)?,
             vendor: self.string(id, 0x0903, true)?,
@@ -238,27 +263,11 @@ fn validate_environment() -> io::Result<()> {
 pub(crate) fn query() -> io::Result<OpenClInventory> {
     validate_environment()?;
     let api = Api::load()?;
-    let mut platforms = [std::ptr::null_mut(); MAX_PLATFORMS];
-    let mut count = 0;
-    // SAFETY: The loader remains owned; initialized output accommodates eight
-    // platform IDs and a native count. OpenCL reports the total available count.
-    let code = unsafe { (api.platforms)(8, platforms.as_mut_ptr(), &raw mut count) };
-    if code == PLATFORM_NOT_FOUND {
-        return Ok(OpenClInventory {
-            loader_path: api.path,
-            platforms: Vec::new(),
-        });
-    }
-    check(code)?;
-    let count = bounded_count(count, MAX_PLATFORMS)?;
+    let (platforms, count) = api.platform_ids(true)?;
     let mut remaining = MAX_DEVICES;
     let platforms = platforms[..count]
         .iter()
-        .map(|id| {
-            let platform = api.platform(*id, remaining)?;
-            remaining -= platform.devices.len();
-            Ok(platform)
-        })
+        .map(|id| api.platform(*id, &mut remaining))
         .collect::<io::Result<_>>()?;
     Ok(OpenClInventory {
         loader_path: api.path,
