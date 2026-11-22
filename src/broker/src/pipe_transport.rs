@@ -84,11 +84,11 @@ impl BufferPool {
     }
 }
 
-const KIND_OPEN: u8 = 1;
-const KIND_DATA: u8 = 2;
-const KIND_EOF: u8 = 3;
-const KIND_RESET: u8 = 4;
-const KIND_SERVER_READY: u8 = 5;
+pub(crate) const KIND_OPEN: u8 = 1;
+pub(crate) const KIND_DATA: u8 = 2;
+pub(crate) const KIND_EOF: u8 = 3;
+pub(crate) const KIND_RESET: u8 = 4;
+pub(crate) const KIND_SERVER_READY: u8 = 5;
 
 /// Control frame kind carrying one parent-verified read-only section attestation (`stream_id == 0`).
 pub const KIND_VERIFIED_SECTION: u8 = 6;
@@ -790,6 +790,32 @@ fn write_raw_frame(
         .and_then(|()| writer.write_all(payload))
 }
 
+#[cfg(test)]
+pub(crate) fn write_test_frame(
+    writer: &mut impl Write,
+    stream_id: u32,
+    kind: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    write_raw_frame(writer, stream_id, kind, payload)?;
+    writer.flush()
+}
+
+#[cfg(test)]
+pub(crate) fn read_test_frame_opt(
+    reader: &mut impl Read,
+) -> io::Result<Option<(u32, u8, Vec<u8>)>> {
+    let HeaderRead::Frame(header) = read_header(reader)? else {
+        return Ok(None);
+    };
+    let (stream_id, kind, len) = decode_header(header);
+    let mut payload = vec![0_u8; len];
+    if len > 0 {
+        reader.read_exact(&mut payload)?;
+    }
+    Ok(Some((stream_id, kind, payload)))
+}
+
 fn fail_transport(
     tx: &Arc<TxShared>,
     rx_state: &Arc<Mutex<RxState>>,
@@ -1143,18 +1169,12 @@ mod tests {
         kind: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        write_raw_frame(writer, stream_id, kind, payload)?;
-        writer.flush()
+        write_test_frame(writer, stream_id, kind, payload)
     }
 
     fn read_frame(reader: &mut impl Read) -> io::Result<(u32, u8, Vec<u8>)> {
-        let HeaderRead::Frame(header) = read_header(reader)? else {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
-        };
-        let (stream_id, kind, len) = decode_header(header);
-        let mut payload = vec![0_u8; len];
-        reader.read_exact(&mut payload)?;
-        Ok((stream_id, kind, payload))
+        read_test_frame_opt(reader)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "eof"))
     }
 
     fn run_async(future: impl Future<Output = io::Result<()>>) -> io::Result<()> {

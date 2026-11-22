@@ -1090,6 +1090,29 @@ mod abliteration_tests;
 
 #[cfg(test)]
 pub(crate) mod test_util {
+    static TEMP_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub(crate) struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        pub(crate) fn new(prefix: &str) -> std::io::Result<Self> {
+            let seq = TEMP_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{seq}", std::process::id()));
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     pub(crate) fn http_json_response(body: &str) -> Vec<u8> {
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",

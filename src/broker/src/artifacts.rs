@@ -213,22 +213,14 @@ impl VerifiedArtifacts {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use crate::launch_policy::reviewed_pins;
+    use crate::{launch_policy::reviewed_pins, test_util::TempDir};
     use std::fs;
 
     #[test]
     fn model_failure_markers_distinguish_missing_storage_and_identity_without_paths()
     -> std::io::Result<()> {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(std::io::Error::other)?
-            .as_nanos();
-        let parent = std::env::temp_dir();
-        let directory = parent.join(format!(
-            "Bonsai-model-failure-{}-{stamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&directory)?;
+        let temp = TempDir::new("Bonsai-model-failure")?;
+        let directory = temp.path();
         let path = directory.join("private-model-name.gguf");
         for (error, reason) in [
             (ArtifactError::Path, "missing"),
@@ -255,25 +247,15 @@ mod tests {
             model_failure_reason(&directory.join("missing.gguf"), ArtifactError::Path),
             "storage"
         );
-        fs::remove_file(path)?;
-        fs::remove_dir(directory.join(".git"))?;
-        assert_eq!(directory.parent(), Some(parent.as_path()));
-        fs::remove_dir(directory)?;
+        assert_eq!(directory.parent(), Some(std::env::temp_dir().as_path()));
         Ok(())
     }
 
     #[test]
     fn ptq1_verification_rejects_missing_or_altered_selected_file_without_pq2_fallback()
     -> std::io::Result<()> {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(std::io::Error::other)?
-            .as_nanos();
-        let parent = std::env::temp_dir();
-        let data = parent.join(format!(
-            "Bonsai-ptq1-identity-{}-{stamp}",
-            std::process::id()
-        ));
+        let temp = TempDir::new("Bonsai-ptq1-identity")?;
+        let data = temp.path();
         let profile = LaunchProfile::SwiftPq2Assessment;
         let pins = reviewed_pins(profile).map_err(std::io::Error::other)?;
         let directory = data.join("models").join(&pins.model.revision);
@@ -282,39 +264,31 @@ mod tests {
         let ptq1 = directory.join("Swift-Bonsai-2-current-repacked-PTQ1_0.gguf");
         fs::write(&ptq1, b"altered PTQ1")?;
         assert_eq!(
-            VerifiedArtifacts::verify_selected_model(&data, profile, true).err(),
+            VerifiedArtifacts::verify_selected_model(data, profile, true).err(),
             Some(ArtifactError::Identity)
         );
         assert_eq!(
-            VerifiedArtifacts::verify_selected_model(&data, profile, false).err(),
+            VerifiedArtifacts::verify_selected_model(data, profile, false).err(),
             Some(ArtifactError::Path)
         );
         fs::write(&pq2, b"altered PQ2")?;
         fs::remove_file(&ptq1)?;
         assert_eq!(
-            VerifiedArtifacts::verify_selected_model(&data, profile, true).err(),
+            VerifiedArtifacts::verify_selected_model(data, profile, true).err(),
             Some(ArtifactError::Path)
         );
         assert_eq!(
-            VerifiedArtifacts::verify_selected_model(&data, profile, false).err(),
+            VerifiedArtifacts::verify_selected_model(data, profile, false).err(),
             Some(ArtifactError::Identity)
         );
-        assert_eq!(data.parent(), Some(parent.as_path()));
-        fs::remove_dir_all(data)?;
+        assert_eq!(data.parent(), Some(std::env::temp_dir().as_path()));
         Ok(())
     }
 
     #[test]
     fn native_profile_checks_model_without_requiring_upstream_runtime() -> std::io::Result<()> {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(std::io::Error::other)?
-            .as_nanos();
-        let parent = std::env::temp_dir();
-        let data = parent.join(format!(
-            "Bonsai-native-model-{}-{stamp}",
-            std::process::id()
-        ));
+        let temp = TempDir::new("Bonsai-native-model")?;
+        let data = temp.path();
         let profile = LaunchProfile::SwiftPq2Assessment;
         let pins = reviewed_pins(profile).map_err(std::io::Error::other)?;
         let model_directory = data.join("models").join(&pins.model.revision);
@@ -324,31 +298,19 @@ mod tests {
         // Identity, rather than Path, proves admission reached the model without
         // first opening a C++ archive or requiring its installed runtime tree.
         assert_eq!(
-            VerifiedArtifacts::verify_model_for_profile(&data, profile, false).err(),
+            VerifiedArtifacts::verify_model_for_profile(data, profile, false).err(),
             Some(ArtifactError::Identity)
         );
         assert!(!data.join("downloads").exists());
-        fs::remove_file(model)?;
-        fs::remove_dir(&model_directory)?;
-        fs::remove_dir(data.join("models"))?;
-        assert_eq!(data.parent(), Some(parent.as_path()));
-        fs::remove_dir(data)?;
+        assert_eq!(data.parent(), Some(std::env::temp_dir().as_path()));
         Ok(())
     }
 
     #[cfg(windows)]
     #[test]
     fn profile_verification_opens_only_its_locked_archive() -> std::io::Result<()> {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(std::io::Error::other)?
-            .as_nanos();
-        let parent = std::env::temp_dir();
-        let data = parent.join(format!(
-            "Bonsai-artifact-profile-{}-{stamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&data)?;
+        let temp = TempDir::new("Bonsai-artifact-profile")?;
+        let data = temp.path();
         fs::create_dir(data.join("downloads"))?;
         for profile in [
             LaunchProfile::ReferenceCpu,
@@ -375,12 +337,12 @@ mod tests {
                     ArtifactError::Path
                 };
                 assert_eq!(
-                    VerifiedArtifacts::verify_for_profile(&data, candidate).err(),
+                    VerifiedArtifacts::verify_for_profile(data, candidate).err(),
                     Some(expected)
                 );
             }
             assert_eq!(
-                VerifiedArtifacts::verify(&data).err(),
+                VerifiedArtifacts::verify(data).err(),
                 Some(if selected == LaunchProfile::ReferenceCpu {
                     ArtifactError::Identity
                 } else {
@@ -389,8 +351,7 @@ mod tests {
             );
             fs::remove_file(&archive)?;
         }
-        assert_eq!(data.parent(), Some(parent.as_path()));
-        fs::remove_dir_all(data)?;
+        assert_eq!(data.parent(), Some(std::env::temp_dir().as_path()));
         Ok(())
     }
 }

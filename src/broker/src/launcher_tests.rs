@@ -1,12 +1,64 @@
 //! Synthetic owned-backend lifecycle regressions; no model process is executed.
 
 use super::*;
+use crate::{
+    pipe_transport::{
+        KIND_DATA, KIND_EOF, KIND_OPEN, KIND_RESET, KIND_SERVER_READY, read_test_frame_opt,
+        write_test_frame,
+    },
+    test_util::TempDir,
+};
 use std::{
     fs,
     future::pending,
     io::{Read, Write},
     net::{TcpListener as BlockingListener, TcpStream as BlockingStream},
 };
+
+fn synthetic_launched_service(
+    service: LocalChatService,
+    process: OwnedProcess,
+    credentials: PrivateCredentials,
+    backend_port: u16,
+    storage_budget: Option<(u64, usize)>,
+) -> LaunchedService {
+    LaunchedService {
+        service,
+        process,
+        credentials,
+        _artifacts: VerifiedArtifacts::synthetic_for_test(),
+        _adapter: None,
+        _daisyrose: None,
+        _mmproj: None,
+        _native_executable: None,
+        memory_limit_bytes: PROBE_MEMORY,
+        working_set_limit_bytes: PROBE_MEMORY,
+        backend_port,
+        storage_budget,
+    }
+}
+
+fn native_launch_config(data: &std::path::Path, extra: &[&str]) -> io::Result<LaunchConfig> {
+    let mut args = vec![
+        OsString::from("--launch-development"),
+        "--allow-unisolated-backend".into(),
+        "--native-engine".into(),
+    ];
+    args.extend(extra.iter().map(OsString::from));
+    args.extend([
+        "--profile".into(),
+        "swift-pq2-assessment".into(),
+        "--data-directory".into(),
+        data.as_os_str().to_owned(),
+        "--evidence-parent".into(),
+        data.as_os_str().to_owned(),
+        "--frontend-port".into(),
+        "0".into(),
+        "--backend-port".into(),
+        "8081".into(),
+    ]);
+    LaunchConfig::parse(args).map_err(|_| io::Error::other("Invalid fixture launch configuration."))
+}
 
 const PROBE_NAME: &str = "launcher::lifecycle_tests::synthetic_backend_probe";
 const HOLDER_PROBE_NAME: &str = "launcher::lifecycle_tests::synthetic_pipe_holder_probe";
@@ -75,39 +127,16 @@ fn check(test: impl Future<Output = io::Result<()>>) -> io::Result<()> {
 
 #[test]
 fn missing_native_runtime_is_distinct_from_missing_model_artifacts() -> io::Result<()> {
-    let data = std::env::temp_dir().join(format!(
-        "Bonsai-NativeRuntimePreflight-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos()
-    ));
-    fs::create_dir(&data)?;
-    let mut config = LaunchConfig::parse([
-        OsString::from("--launch-development"),
-        "--allow-unisolated-backend".into(),
-        "--native-engine".into(),
-        "--profile".into(),
-        "swift-pq2-assessment".into(),
-        "--data-directory".into(),
-        data.as_os_str().to_owned(),
-        "--evidence-parent".into(),
-        data.as_os_str().to_owned(),
-        "--frontend-port".into(),
-        "0".into(),
-        "--backend-port".into(),
-        "8081".into(),
-    ])
-    .map_err(|_| io::Error::other("Invalid fixture launch configuration."))?;
+    let data = TempDir::new("Bonsai-NativeRuntimePreflight")?;
+    let mut config = native_launch_config(data.path(), &[])?;
     assert_eq!(
         config.native_executable_guard().err(),
         Some(LaunchError::NativeRuntime)
     );
     let plan = LaunchPlan::for_profile_with_options(
-        &data,
+        data.path(),
         config.backend_port,
-        &data.join("not-created.key"),
+        &data.path().join("not-created.key"),
         config.profile,
         false,
         false,
@@ -123,43 +152,18 @@ fn missing_native_runtime_is_distinct_from_missing_model_artifacts() -> io::Resu
             .native_executable_guard()
             .is_ok_and(|value| value.is_none())
     );
-    fs::remove_dir(data)?;
     Ok(())
 }
 
 #[test]
 fn parallel_launch_artifact_verification_reports_deterministic_error_precedence() -> io::Result<()>
 {
-    let data = std::env::temp_dir().join(format!(
-        "Bonsai-ParallelVerifyPrecedence-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos()
-    ));
-    fs::create_dir(&data)?;
-    let mut config = LaunchConfig::parse([
-        OsString::from("--launch-development"),
-        "--allow-unisolated-backend".into(),
-        "--native-engine".into(),
-        "--use-abliterate-lora".into(),
-        "--profile".into(),
-        "swift-pq2-assessment".into(),
-        "--data-directory".into(),
-        data.as_os_str().to_owned(),
-        "--evidence-parent".into(),
-        data.as_os_str().to_owned(),
-        "--frontend-port".into(),
-        "0".into(),
-        "--backend-port".into(),
-        "8081".into(),
-    ])
-    .map_err(|_| io::Error::other("Invalid fixture launch configuration."))?;
+    let data = TempDir::new("Bonsai-ParallelVerifyPrecedence")?;
+    let mut config = native_launch_config(data.path(), &["--use-abliterate-lora"])?;
     let plan = LaunchPlan::for_profile_with_options(
-        &data,
+        data.path(),
         config.backend_port,
-        &data.join("not-created.key"),
+        &data.path().join("not-created.key"),
         config.profile,
         true,
         false,
@@ -178,7 +182,6 @@ fn parallel_launch_artifact_verification_reports_deterministic_error_precedence(
             Some(LaunchError::Artifacts)
         );
     }
-    fs::remove_dir(data)?;
     Ok(())
 }
 
@@ -222,20 +225,7 @@ fn owned_ready_backend_stops_with_service() -> io::Result<()> {
         .await
         .map_err(|_| io::Error::other("Synthetic service bind failed."))?;
         service.require_backend_process(process.id());
-        let launched = LaunchedService {
-            service,
-            process,
-            credentials,
-            _artifacts: VerifiedArtifacts::synthetic_for_test(),
-            _adapter: None,
-            _daisyrose: None,
-            _mmproj: None,
-            _native_executable: None,
-            memory_limit_bytes: PROBE_MEMORY,
-            working_set_limit_bytes: PROBE_MEMORY,
-            backend_port: port,
-            storage_budget: None,
-        };
+        let launched = synthetic_launched_service(service, process, credentials, port, None);
         let frontend_port = launched.port();
         let report = launched
             .run(async { Ok(()) })
@@ -406,54 +396,6 @@ fn synthetic_pipe_holder_probe() -> io::Result<()> {
     Ok(())
 }
 
-fn write_pipe_frame(
-    writer: &mut impl Write,
-    stream_id: u32,
-    kind: u8,
-    payload: &[u8],
-) -> io::Result<()> {
-    let len = u32::try_from(payload.len()).map_err(|_| io::Error::other("frame too large"))?;
-    let mut header = [0_u8; 9];
-    header[..4].copy_from_slice(&stream_id.to_be_bytes());
-    header[4] = kind;
-    header[5..9].copy_from_slice(&len.to_be_bytes());
-    writer.write_all(&header)?;
-    if !payload.is_empty() {
-        writer.write_all(payload)?;
-    }
-    writer.flush()
-}
-
-fn read_pipe_frame(reader: &mut impl Read) -> io::Result<Option<(u32, u8, Vec<u8>)>> {
-    let mut header = [0_u8; 9];
-    let mut read = 0;
-    while read < header.len() {
-        match reader.read(&mut header[read..]) {
-            Ok(0) if read == 0 => return Ok(None),
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated test pipe frame header",
-                ));
-            }
-            Ok(count) => read += count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    let stream_id = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-    let kind = header[4];
-    let len = usize::try_from(u32::from_be_bytes([
-        header[5], header[6], header[7], header[8],
-    ]))
-    .map_err(|_| io::Error::other("frame length overflow"))?;
-    let mut payload = vec![0_u8; len];
-    if len > 0 {
-        reader.read_exact(&mut payload)?;
-    }
-    Ok(Some((stream_id, kind, payload)))
-}
-
 fn complete_http_request(buffer: &[u8]) -> Option<usize> {
     let head_end = buffer.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
     let head = std::str::from_utf8(&buffer[..head_end]).ok()?;
@@ -475,11 +417,12 @@ fn run_synthetic_pipe_server(
     mut writer: io::PipeWriter,
     backend_key: &str,
 ) -> io::Result<(bool, bool)> {
-    const KIND_OPEN: u8 = 1;
-    const KIND_DATA: u8 = 2;
-    const KIND_EOF: u8 = 3;
-    const KIND_RESET: u8 = 4;
-    const KIND_SERVER_READY: u8 = 5;
+    let json_reply = |status: &str, body: &str| {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
 
     let mut handshake = [0_u8; 8 + 64];
     reader.read_exact(&mut handshake)?;
@@ -488,7 +431,7 @@ fn run_synthetic_pipe_server(
     }
     writer.write_all(b"SB2OKAY1")?;
     writer.flush()?;
-    write_pipe_frame(&mut writer, 0, KIND_SERVER_READY, &[])?;
+    write_test_frame(&mut writer, 0, KIND_SERVER_READY, &[])?;
 
     let expected_auth = format!("Authorization: Bearer {backend_key}");
     let mut active: Option<(u32, Vec<u8>)> = None;
@@ -496,7 +439,7 @@ fn run_synthetic_pipe_server(
     let mut saw_generation_reset = false;
     let mut saw_reset_post = false;
 
-    while let Some((stream_id, kind, payload)) = read_pipe_frame(&mut reader)? {
+    while let Some((stream_id, kind, payload)) = read_test_frame_opt(&mut reader)? {
         match kind {
             KIND_OPEN => {
                 if active.is_some() {
@@ -518,23 +461,14 @@ fn run_synthetic_pipe_server(
                 let head = std::str::from_utf8(&buffer[..head_end]).map_err(io::Error::other)?;
                 let authorized = head.lines().any(|line| line == expected_auth);
                 let response = if head.starts_with("GET /health HTTP/1.1\r\n") && authorized {
-                    let body = r#"{"status":"ok"}"#;
-                    Some(format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    ))
+                    Some(json_reply("200 OK", r#"{"status":"ok"}"#))
                 } else if head.starts_with("GET /v1/models HTTP/1.1\r\n") {
                     if authorized {
-                        let body = r#"{"data":[]}"#;
-                        Some(format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        ))
+                        Some(json_reply("200 OK", r#"{"data":[]}"#))
                     } else {
-                        let body = r#"{"error":"unauthorized"}"#;
-                        Some(format!(
-                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
+                        Some(json_reply(
+                            "401 Unauthorized",
+                            r#"{"error":"unauthorized"}"#,
                         ))
                     }
                 } else if head.starts_with("POST /reset HTTP/1.1\r\n") && authorized {
@@ -544,17 +478,12 @@ fn run_synthetic_pipe_server(
                         ));
                     }
                     saw_reset_post = true;
-                    let body = r#"{"status":"ok"}"#;
-                    Some(format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    ))
+                    Some(json_reply("200 OK", r#"{"status":"ok"}"#))
                 } else if head.starts_with("POST /v1/chat/completions/input_tokens ") && authorized
                 {
-                    let body = r#"{"object":"response.input_tokens","input_tokens":8}"#;
-                    Some(format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
+                    Some(json_reply(
+                        "200 OK",
+                        r#"{"object":"response.input_tokens","input_tokens":8}"#,
                     ))
                 } else if head.starts_with("POST /v1/chat/completions ") && authorized {
                     chat_count += 1;
@@ -565,7 +494,7 @@ fn run_synthetic_pipe_server(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{sse_chunk}\r\n",
                             sse_chunk.len()
                         );
-                        write_pipe_frame(&mut writer, stream_id, KIND_DATA, partial.as_bytes())?;
+                        write_test_frame(&mut writer, stream_id, KIND_DATA, partial.as_bytes())?;
                         None
                     } else {
                         let done = "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
@@ -575,15 +504,14 @@ fn run_synthetic_pipe_server(
                         ))
                     }
                 } else {
-                    let body = r#"{"error":"unauthorized"}"#;
-                    Some(format!(
-                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
+                    Some(json_reply(
+                        "401 Unauthorized",
+                        r#"{"error":"unauthorized"}"#,
                     ))
                 };
                 if let Some(response) = response {
-                    write_pipe_frame(&mut writer, stream_id, KIND_DATA, response.as_bytes())?;
-                    write_pipe_frame(&mut writer, stream_id, KIND_EOF, &[])?;
+                    write_test_frame(&mut writer, stream_id, KIND_DATA, response.as_bytes())?;
+                    write_test_frame(&mut writer, stream_id, KIND_EOF, &[])?;
                     active = None;
                 }
             }
@@ -671,23 +599,16 @@ fn broker_pipe_launched_service_serves_cancels_resets_and_avoids_backend_key_fil
         service.enable_reset_on_cancel();
 
         let frontend_key = credentials.frontend_key().to_owned();
-        let launched = LaunchedService {
+        let launched = synthetic_launched_service(
             service,
             process,
             credentials,
-            _artifacts: VerifiedArtifacts::synthetic_for_test(),
-            _adapter: None,
-            _daisyrose: None,
-            _mmproj: None,
-            _native_executable: None,
-            memory_limit_bytes: PROBE_MEMORY,
-            working_set_limit_bytes: PROBE_MEMORY,
-            backend_port: 0,
-            storage_budget: Some((
+            0,
+            Some((
                 MAX_WORKER_PRIVATE_STORAGE_BYTES,
                 MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
             )),
-        };
+        );
         let frontend_port = launched.port();
         let evidence_dir = launched.evidence_directory().to_path_buf();
         assert!(!evidence_dir.join("backend.key").exists());
@@ -774,20 +695,8 @@ fn launched_service_stops_with_sandbox_error_when_storage_budget_exceeded() -> i
 
         fs::write(worker_dir.join("overflow.bin"), [0x5A_u8; 256])?;
 
-        let launched = LaunchedService {
-            service,
-            process,
-            credentials,
-            _artifacts: VerifiedArtifacts::synthetic_for_test(),
-            _adapter: None,
-            _daisyrose: None,
-            _mmproj: None,
-            _native_executable: None,
-            memory_limit_bytes: PROBE_MEMORY,
-            working_set_limit_bytes: PROBE_MEMORY,
-            backend_port: 0,
-            storage_budget: Some((128, 16)),
-        };
+        let launched =
+            synthetic_launched_service(service, process, credentials, 0, Some((128, 16)));
         let evidence_dir = launched.evidence_directory().to_path_buf();
         let result = launched.run(pending()).await;
         drop((p2c_rx, c2p_tx));

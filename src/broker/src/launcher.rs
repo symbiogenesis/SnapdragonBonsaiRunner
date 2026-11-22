@@ -2853,6 +2853,31 @@ mod tests {
         );
     }
 
+    fn args_with(extra: &[&str]) -> Vec<OsString> {
+        let mut args = arguments();
+        args.extend(extra.iter().map(OsString::from));
+        args
+    }
+
+    fn has_flag_pair(args: &[OsString], flag: &str, value: &std::ffi::OsStr) -> bool {
+        args.array_windows().any(|[f, v]| f == flag && v == value)
+    }
+
+    fn swift_plan_for(
+        data: &std::path::Path,
+        key: &std::path::Path,
+    ) -> Result<super::LaunchPlan, LaunchError> {
+        super::LaunchPlan::for_profile_with_options(
+            data,
+            8081,
+            key,
+            LaunchProfile::SwiftPq2Assessment,
+            true,
+            false,
+        )
+        .map_err(|_| LaunchError::Policy)
+    }
+
     fn arguments() -> Vec<OsString> {
         [
             "--launch-development",
@@ -2901,10 +2926,7 @@ mod tests {
     fn repacked_ptq1_is_explicit_swift_prism_only_and_keeps_lora_available() {
         let default = LaunchConfig::parse(arguments()).ok();
         assert!(default.is_some_and(|config| !config.uses_repacked_ptq1()));
-        let mut enabled = arguments();
-        enabled.extend(
-            ["--profile", "swift-pq2-assessment", "--use-repacked-ptq1"].map(OsString::from),
-        );
+        let enabled = args_with(&["--profile", "swift-pq2-assessment", "--use-repacked-ptq1"]);
         let config = LaunchConfig::parse(enabled.clone()).ok();
         assert!(config.is_some_and(|config| config.uses_repacked_ptq1()));
         let mut with_lora = enabled.clone();
@@ -2913,16 +2935,14 @@ mod tests {
         let mut rust = enabled.clone();
         rust.extend(["--native-engine", "--use-abliterate-lora"].map(OsString::from));
         assert!(LaunchConfig::parse(rust).is_ok());
-        let mut rejected = enabled.clone();
+        let mut rejected = enabled;
         rejected.push("--use-repacked-ptq1".into());
         assert_eq!(
             LaunchConfig::parse(rejected).err(),
             Some(LaunchError::Arguments)
         );
-        let mut reference = arguments();
-        reference.push("--use-repacked-ptq1".into());
         assert_eq!(
-            LaunchConfig::parse(reference).err(),
+            LaunchConfig::parse(args_with(&["--use-repacked-ptq1"])).err(),
             Some(LaunchError::Arguments)
         );
     }
@@ -3043,15 +3063,11 @@ mod tests {
     fn lora_guard_rejects_missing_and_altered_adapter_and_opt_out_needs_no_file()
     -> std::io::Result<()> {
         use std::{fs, io};
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("Bonsai-lora-guard-{stamp}"));
-        fs::create_dir(&directory)?;
+        let temp = crate::test_util::TempDir::new("Bonsai-lora-guard")?;
+        let directory = temp.path();
         let key = directory.join("not-created.key");
         let base = super::LaunchPlan::for_profile(
-            &directory,
+            directory,
             49152,
             &key,
             LaunchProfile::SwiftPq2Assessment,
@@ -3063,7 +3079,7 @@ mod tests {
                 .is_none()
         );
         let plan = super::LaunchPlan::for_profile_with_lora(
-            &directory,
+            directory,
             49152,
             &key,
             LaunchProfile::SwiftPq2Assessment,
@@ -3089,7 +3105,6 @@ mod tests {
             Some(LaunchError::Adapter)
         );
         assert_eq!(directory.parent(), Some(std::env::temp_dir().as_path()));
-        fs::remove_dir_all(directory)?;
         Ok(())
     }
 
@@ -3222,57 +3237,41 @@ mod tests {
         let key = data.join("backend.key");
         let daisy_path = std::env::temp_dir().join("daisyrose-vet.gguf");
         let daisy_sha = "e".repeat(64);
+        let daisy_flag = daisy_path.to_string_lossy().into_owned();
 
-        let mut gated = arguments();
-        gated.extend([
-            OsString::from("--profile"),
-            OsString::from("swift-pq2-assessment"),
-            OsString::from("--native-engine"),
-            OsString::from("--daisyrose-lora"),
-            daisy_path.as_os_str().to_owned(),
-        ]);
         // Frozen v0.1.32 release pin refuses --daisyrose-lora at parse time.
+        let gated = args_with(&[
+            "--profile",
+            "swift-pq2-assessment",
+            "--native-engine",
+            "--daisyrose-lora",
+            &daisy_flag,
+        ]);
         assert_eq!(
-            LaunchConfig::parse(gated.clone()).err(),
+            LaunchConfig::parse(gated).err(),
             Some(LaunchError::NativeRuntime)
         );
 
-        let mut non_native = arguments();
-        non_native.extend([
-            OsString::from("--profile"),
-            OsString::from("swift-pq2-assessment"),
-            OsString::from("--publisher-engine"),
-            OsString::from("--daisyrose-lora"),
-            daisy_path.as_os_str().to_owned(),
+        let non_native = args_with(&[
+            "--profile",
+            "swift-pq2-assessment",
+            "--publisher-engine",
+            "--daisyrose-lora",
+            &daisy_flag,
         ]);
         assert_eq!(
             LaunchConfig::parse(non_native).err(),
             Some(LaunchError::Arguments)
         );
 
-        let mut config = LaunchConfig::parse({
-            let mut base = arguments();
-            base.extend(
-                [
-                    "--profile",
-                    "swift-pq2-assessment",
-                    "--native-engine",
-                    "--use-abliterate-lora",
-                ]
-                .map(OsString::from),
-            );
-            base
-        })?;
+        let mut config = LaunchConfig::parse(args_with(&[
+            "--profile",
+            "swift-pq2-assessment",
+            "--native-engine",
+            "--use-abliterate-lora",
+        ]))?;
         config.daisyrose_lora = Some(daisy_path.clone());
-        let mut plan = super::LaunchPlan::for_profile_with_options(
-            &data,
-            8081,
-            &key,
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-            false,
-        )
-        .map_err(|_| LaunchError::Policy)?;
+        let mut plan = swift_plan_for(&data, &key)?;
         let initial_limit = plan.working_set_limit_bytes;
         let daisy_reserve =
             usize::try_from(8_000_000 + bonsai_cpu_policy::DAISYROSE_SCRATCH_HEADROOM_BYTES)
@@ -3288,26 +3287,26 @@ mod tests {
         assert_eq!(plan.native_child_memory_limit_bytes(), initial_limit);
 
         let pipe_args = config.native_arguments(&plan, None);
-        assert!(
-            pipe_args
-                .array_windows()
-                .any(|[f, v]| f == "--verified-sections" && v == "3")
-        );
-        assert!(
-            pipe_args
-                .array_windows()
-                .any(|[f, v]| f == "--daisyrose-lora" && v == daisy_path.as_os_str())
-        );
-        assert!(
-            pipe_args
-                .array_windows()
-                .any(|[f, v]| f == "--daisyrose-lora-bytes" && v == "8000000")
-        );
-        assert!(
-            pipe_args
-                .array_windows()
-                .any(|[f, v]| f == "--daisyrose-lora-sha256" && v == daisy_sha.as_str())
-        );
+        assert!(has_flag_pair(
+            &pipe_args,
+            "--verified-sections",
+            std::ffi::OsStr::new("3")
+        ));
+        assert!(has_flag_pair(
+            &pipe_args,
+            "--daisyrose-lora",
+            daisy_path.as_os_str()
+        ));
+        assert!(has_flag_pair(
+            &pipe_args,
+            "--daisyrose-lora-bytes",
+            std::ffi::OsStr::new("8000000")
+        ));
+        assert!(has_flag_pair(
+            &pipe_args,
+            "--daisyrose-lora-sha256",
+            std::ffi::OsStr::new(daisy_sha.as_str())
+        ));
         Ok(())
     }
 
@@ -3514,21 +3513,13 @@ mod tests {
     #[test]
     fn daisyrose_promoted_verification_enforces_exact_lock_digest_and_missing_semantics()
     -> std::io::Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "Bonsai-daisyrose-verify-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(std::io::Error::other)?
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir)?;
-        let gguf_path = dir.join("daisy-test.gguf");
+        let dir = crate::test_util::TempDir::new("Bonsai-daisyrose-verify")?;
+        let gguf_path = dir.path().join("daisy-test.gguf");
         let sha256 = build_test_daisyrose_gguf(&gguf_path, 4)?;
         let bytes = std::fs::metadata(&gguf_path)?.len();
 
         let promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact {
-            path: gguf_path.clone(),
+            path: gguf_path,
             bytes,
             sha256: sha256.clone(),
             base_model_sha256: "b".repeat(64),
@@ -3545,11 +3536,14 @@ mod tests {
             default_scale_tenths: Some(10),
         };
 
-        let verified =
+        let verify = |artifact: bonsai_cpu_policy::DaisyRoseLoraArtifact, explicit: bool| {
             LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
-                artifact: Box::new(promoted.clone()),
-                explicitly_passed: false,
+                artifact: Box::new(artifact),
+                explicitly_passed: explicit,
             })
+        };
+
+        let verified = verify(promoted.clone(), false)
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?
             .ok_or_else(|| std::io::Error::other("Expected verified DaisyRose"))?;
         assert_eq!(verified.default_scale_tenths, 10);
@@ -3558,70 +3552,26 @@ mod tests {
         assert_eq!(verified.guard.bytes(), bytes);
         drop(verified);
 
-        let mut bad_hash = promoted.clone();
-        bad_hash.sha256 = "0".repeat(64);
-        assert_eq!(
-            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
-                artifact: Box::new(bad_hash),
-                explicitly_passed: false,
-            })
-            .err(),
-            Some(LaunchError::Adapter)
-        );
-
-        let mut bad_bytes = promoted.clone();
-        bad_bytes.bytes = bytes.saturating_sub(1);
-        assert_eq!(
-            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
-                artifact: Box::new(bad_bytes),
-                explicitly_passed: false,
-            })
-            .err(),
-            Some(LaunchError::Adapter)
-        );
-
-        let mut bad_targets = promoted.clone();
-        bad_targets.target_count = 2;
-        assert_eq!(
-            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
-                artifact: Box::new(bad_targets),
-                explicitly_passed: false,
-            })
-            .err(),
-            Some(LaunchError::Adapter)
-        );
-
-        let mut bad_rank = promoted.clone();
-        bad_rank.max_rank = 3;
-        assert_eq!(
-            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
-                artifact: Box::new(bad_rank),
-                explicitly_passed: false,
-            })
-            .err(),
-            Some(LaunchError::Adapter)
-        );
+        let mutations: [fn(&mut bonsai_cpu_policy::DaisyRoseLoraArtifact); 4] = [
+            |a| a.sha256 = "0".repeat(64),
+            |a| a.bytes = a.bytes.saturating_sub(1),
+            |a| a.target_count = 2,
+            |a| a.max_rank = 3,
+        ];
+        for mutate in mutations {
+            let mut candidate = promoted.clone();
+            mutate(&mut candidate);
+            assert_eq!(verify(candidate, false).err(), Some(LaunchError::Adapter));
+        }
 
         let mut missing = promoted;
-        missing.path = dir.join("missing.gguf");
+        missing.path = dir.path().join("missing.gguf");
         assert!(
-            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
-                artifact: Box::new(missing.clone()),
-                explicitly_passed: false,
-            })
-            .map_err(|error| std::io::Error::other(format!("{error:?}")))?
-            .is_none()
+            verify(missing.clone(), false)
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+                .is_none()
         );
-        assert_eq!(
-            LaunchConfig::verify_daisyrose_selection(&super::DaisyRoseSelection::Promoted {
-                artifact: Box::new(missing),
-                explicitly_passed: true,
-            })
-            .err(),
-            Some(LaunchError::Adapter)
-        );
-
-        std::fs::remove_dir_all(&dir)?;
+        assert_eq!(verify(missing, true).err(), Some(LaunchError::Adapter));
         Ok(())
     }
 
@@ -4233,11 +4183,7 @@ mod tests {
     }
 
     fn response(body: &str) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .into_bytes()
+        crate::test_util::http_json_response(body)
     }
 
     #[test]
@@ -4318,10 +4264,9 @@ mod tests {
 
         // Real temp data directory: missing mmproj falls back cleanly to None;
         // wrong bytes at the locked mmproj path fails closed with Artifacts.
-        let temp =
-            std::env::temp_dir().join(format!("Bonsai-mmproj-guard-test-{}", std::process::id()));
-        let _cleanup = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).map_err(|_| LaunchError::Path)?;
+        let temp_dir = crate::test_util::TempDir::new("Bonsai-mmproj-guard-test")
+            .map_err(|_| LaunchError::Path)?;
+        let temp = temp_dir.path();
         let evidence = temp.join("evidence");
         std::fs::create_dir_all(&evidence).map_err(|_| LaunchError::Path)?;
         let mut temp_cfg = LaunchConfig::parse([
@@ -4342,7 +4287,7 @@ mod tests {
         assert!(temp_cfg.mmproj_guard()?.is_none());
 
         let artifact =
-            bonsai_cpu_policy::swift_mmproj_artifact(&temp).map_err(|_| LaunchError::Policy)?;
+            bonsai_cpu_policy::swift_mmproj_artifact(temp).map_err(|_| LaunchError::Policy)?;
         if let Some(parent) = artifact.path.parent() {
             std::fs::create_dir_all(parent).map_err(|_| LaunchError::Path)?;
         }
@@ -4350,29 +4295,31 @@ mod tests {
         assert_eq!(temp_cfg.mmproj_guard().err(), Some(LaunchError::Artifacts));
         temp_cfg.no_mmproj = true;
         assert!(temp_cfg.mmproj_guard()?.is_none());
-        let _cleanup = std::fs::remove_dir_all(&temp);
         Ok(())
     }
 
     #[test]
     fn require_broker_pipe_enforces_sandbox_native_engine_and_reviewed_release()
     -> Result<(), LaunchError> {
-        let mut valid = [
-            "--launch-development",
+        let sandboxed_args = |isolation: &str, extra: &[&str]| -> Vec<OsString> {
+            let mut args = vec![
+                "--launch-development",
+                isolation,
+                "--require-broker-pipe",
+                "--data-directory",
+                "C:\\ExternalData",
+                "--evidence-parent",
+                "C:\\ExternalEvidence",
+                "--frontend-port",
+                "0",
+            ];
+            args.extend_from_slice(extra);
+            args.into_iter().map(OsString::from).collect()
+        };
+        let mut valid = sandboxed_args(
             "--require-native-sandbox",
-            "--require-broker-pipe",
-            "--profile",
-            "swift-pq2-assessment",
-            "--data-directory",
-            "C:\\ExternalData",
-            "--evidence-parent",
-            "C:\\ExternalEvidence",
-            "--frontend-port",
-            "0",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect::<Vec<_>>();
+            &["--profile", "swift-pq2-assessment"],
+        );
         // With BROKER_PIPE_RELEASE pinned at 0.1.32, valid flag combinations succeed and enable broker pipe.
         let parsed = LaunchConfig::parse(valid.clone())?;
         assert!(parsed.uses_broker_pipe()?);
@@ -4389,50 +4336,17 @@ mod tests {
 
         // Invalid combinations reject with Arguments before release gating.
         for bad in [
-            vec![
-                "--launch-development",
+            sandboxed_args(
                 "--allow-unisolated-backend",
-                "--require-broker-pipe",
-                "--profile",
-                "swift-pq2-assessment",
-                "--data-directory",
-                "C:\\ExternalData",
-                "--evidence-parent",
-                "C:\\ExternalEvidence",
-                "--frontend-port",
-                "0",
-            ],
-            vec![
-                "--launch-development",
+                &["--profile", "swift-pq2-assessment"],
+            ),
+            sandboxed_args(
                 "--require-native-sandbox",
-                "--require-broker-pipe",
-                "--profile",
-                "swift-pq2-assessment",
-                "--publisher-engine",
-                "--data-directory",
-                "C:\\ExternalData",
-                "--evidence-parent",
-                "C:\\ExternalEvidence",
-                "--frontend-port",
-                "0",
-            ],
-            vec![
-                "--launch-development",
-                "--require-native-sandbox",
-                "--require-broker-pipe",
-                "--data-directory",
-                "C:\\ExternalData",
-                "--evidence-parent",
-                "C:\\ExternalEvidence",
-                "--frontend-port",
-                "0",
-            ],
+                &["--profile", "swift-pq2-assessment", "--publisher-engine"],
+            ),
+            sandboxed_args("--require-native-sandbox", &[]),
         ] {
-            let args = bad.into_iter().map(OsString::from).collect::<Vec<_>>();
-            assert_eq!(
-                LaunchConfig::parse(args).err(),
-                Some(LaunchError::Arguments)
-            );
+            assert_eq!(LaunchConfig::parse(bad).err(), Some(LaunchError::Arguments));
         }
 
         // Omitting --backend-port without --require-broker-pipe still rejects.
@@ -4611,14 +4525,8 @@ mod tests {
             assert_eq!(parse_child_startup_failure(rejected), None);
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "Bonsai-child-stderr-classify-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(std::io::Error::other)?
-                .as_nanos()
-        ));
+        let temp = crate::test_util::TempDir::new("Bonsai-child-stderr-classify")?;
+        let dir = temp.path();
         std::fs::create_dir_all(dir.join("worker/nested"))?;
         std::fs::write(dir.join("frontend.key"), b"retained-frontend-key")?;
         std::fs::write(dir.join("backend.key"), b"retained-backend-key")?;
@@ -4637,13 +4545,12 @@ mod tests {
             refine_backend_startup_error(LaunchError::Cancelled, &stderr_path),
             (LaunchError::Cancelled, None)
         );
-        reset_worker_attempt_files(&dir).map_err(|_| std::io::Error::other("reset failed"))?;
+        reset_worker_attempt_files(dir).map_err(|_| std::io::Error::other("reset failed"))?;
         assert!(!dir.join("worker").exists());
         assert!(!dir.join("backend.stdout").exists());
         assert!(!dir.join("backend.stderr").exists());
         assert!(dir.join("frontend.key").is_file());
         assert!(dir.join("backend.key").is_file());
-        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
@@ -4719,22 +4626,13 @@ mod tests {
             Some(ChildStartupStage::Memory)
         );
 
-        let dir = std::env::temp_dir().join(format!(
-            "Bonsai-long-stderr-classify-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(std::io::Error::other)?
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir)?;
-        let stderr_path = dir.join("backend.stderr");
+        let dir = crate::test_util::TempDir::new("Bonsai-long-stderr-classify")?;
+        let stderr_path = dir.path().join("backend.stderr");
         std::fs::write(&stderr_path, &payload)?;
         assert_eq!(
             refine_backend_startup_error(LaunchError::Backend, &stderr_path),
             (LaunchError::Memory, Some(ChildStartupStage::Memory))
         );
-        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
@@ -4913,20 +4811,16 @@ mod tests {
 
     #[test]
     fn hexagon_runtime_readonly_paths_selects_present_runtime_files_only() -> std::io::Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "Bonsai-hexagon-readonly-paths-{}",
-            std::process::id()
-        ));
-        let _cleanup = std::fs::remove_dir_all(&root);
-        assert!(super::hexagon_runtime_readonly_paths(&root).is_empty());
+        let root = crate::test_util::TempDir::new("Bonsai-hexagon-readonly-paths")?;
+        assert!(super::hexagon_runtime_readonly_paths(root.path()).is_empty());
 
-        let runtime_dir = root.join("hexagon").join("runtime");
+        let runtime_dir = root.path().join("hexagon").join("runtime");
         std::fs::create_dir_all(&runtime_dir)?;
         std::fs::write(runtime_dir.join("libggml-htp-v81.so"), b"so81")?;
         std::fs::write(runtime_dir.join("hexagon-runtime.receipt.json"), b"{}")?;
         std::fs::write(runtime_dir.join("unrelated.bin"), b"ignored")?;
 
-        let selected = super::hexagon_runtime_readonly_paths(&root);
+        let selected = super::hexagon_runtime_readonly_paths(root.path());
         assert_eq!(
             selected,
             vec![
@@ -4934,7 +4828,6 @@ mod tests {
                 runtime_dir.join("hexagon-runtime.receipt.json"),
             ]
         );
-        std::fs::remove_dir_all(&root)?;
         Ok(())
     }
 
