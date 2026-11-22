@@ -551,30 +551,26 @@ pub fn verify_files_bounded_parallel(
         local
     };
 
-    let worker_results = if file_workers == 1 {
-        vec![worker_task()]
-    } else {
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(file_workers - 1);
-            for _ in 0..(file_workers - 1) {
-                handles.push(scope.spawn(&worker_task));
-            }
-            let current = worker_task();
-            let mut results = Vec::with_capacity(file_workers);
-            results.push(current);
-            for handle in handles {
-                match handle.join() {
-                    Ok(items) => results.push(items),
-                    Err(_) => {
-                        cancel_or_error.store(true, Ordering::Release);
-                        // Ensure deterministic failure rather than ignoring a panicked worker.
-                        results.push(vec![(0, Err(ArtifactError::Configuration))]);
-                    }
+    let worker_results = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(file_workers - 1);
+        for _ in 0..(file_workers - 1) {
+            handles.push(scope.spawn(&worker_task));
+        }
+        let current = worker_task();
+        let mut results = Vec::with_capacity(file_workers);
+        results.push(current);
+        for handle in handles {
+            match handle.join() {
+                Ok(items) => results.push(items),
+                Err(_) => {
+                    cancel_or_error.store(true, Ordering::Release);
+                    // Ensure deterministic failure rather than ignoring a panicked worker.
+                    results.push(vec![(0, Err(ArtifactError::Configuration))]);
                 }
             }
-            results
-        })
-    };
+        }
+        results
+    });
 
     let mut ordered: Vec<Option<Result<VerifiedFile, ArtifactError>>> =
         std::iter::repeat_with(|| None).take(specs.len()).collect();
@@ -666,6 +662,19 @@ fn check_locked_chunked_buffered(
     let mut total = 0_u64;
     let mut chunk_index = 0_usize;
     let mut chunk_offset = 0_u64;
+    let finish_chunk = |hasher: bonsai_native_hash::Hasher,
+                        chunk_index: &mut usize|
+     -> Result<(), ArtifactError> {
+        let finished = hasher.finish().map_err(|_| ArtifactError::Identity)?;
+        let expected_chunk = expected_chunk_digests
+            .get(*chunk_index)
+            .ok_or(ArtifactError::Identity)?;
+        if !constant_time_eq_32(&finished, expected_chunk) {
+            return Err(ArtifactError::Identity);
+        }
+        *chunk_index += 1;
+        Ok(())
+    };
 
     loop {
         checkpoint()?;
@@ -706,18 +715,10 @@ fn check_locked_chunked_buffered(
             chunk_offset += u64::try_from(take).map_err(|_| ArtifactError::Identity)?;
             slice = tail;
             if chunk_offset == chunk_bytes_u64 {
-                let finished = chunk_hash
-                    .take()
-                    .ok_or(ArtifactError::Identity)?
-                    .finish()
-                    .map_err(|_| ArtifactError::Identity)?;
-                let expected_chunk = expected_chunk_digests
-                    .get(chunk_index)
-                    .ok_or(ArtifactError::Identity)?;
-                if !constant_time_eq_32(&finished, expected_chunk) {
-                    return Err(ArtifactError::Identity);
-                }
-                chunk_index += 1;
+                finish_chunk(
+                    chunk_hash.take().ok_or(ArtifactError::Identity)?,
+                    &mut chunk_index,
+                )?;
                 chunk_offset = 0;
             }
         }
@@ -727,14 +728,7 @@ fn check_locked_chunked_buffered(
         return Err(ArtifactError::Identity);
     }
     if let Some(hasher) = chunk_hash.take() {
-        let finished = hasher.finish().map_err(|_| ArtifactError::Identity)?;
-        let expected_chunk = expected_chunk_digests
-            .get(chunk_index)
-            .ok_or(ArtifactError::Identity)?;
-        if !constant_time_eq_32(&finished, expected_chunk) {
-            return Err(ArtifactError::Identity);
-        }
-        chunk_index += 1;
+        finish_chunk(hasher, &mut chunk_index)?;
     }
     if chunk_index != expected_chunk_digests.len() {
         return Err(ArtifactError::Identity);
@@ -1146,6 +1140,41 @@ fn verify_installation<R: Read + Seek>(
     )
 }
 
+fn verify_enumerated_tree(
+    root: &Path,
+    expected_files: &BTreeMap<String, Entry>,
+    expected_directories: &BTreeSet<String>,
+    checkpoint: &mut impl FnMut() -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    let mut installed_files = BTreeSet::new();
+    let mut installed_directories = BTreeSet::new();
+    enumerate_installation(
+        root,
+        root,
+        &mut installed_files,
+        &mut installed_directories,
+        checkpoint,
+    )?;
+    // Both collections iterate sorted, unique names; compare them directly
+    // instead of cloning every expected path into a second tree.
+    if !installed_files.iter().eq(expected_files.keys())
+        || installed_directories != *expected_directories
+    {
+        return Err(ArtifactError::Installation);
+    }
+    Ok(())
+}
+
+fn verify_pe_if_binary(path: &Path, file: &mut File) -> Result<(), ArtifactError> {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
+    {
+        check_arm64(file)?;
+    }
+    Ok(())
+}
+
 fn verify_installed_files<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     root: &Path,
@@ -1160,22 +1189,7 @@ fn verify_installed_files<R: Read + Seek>(
         files: expected_files,
         directories: expected_directories,
     } = installation;
-    let mut installed_files = BTreeSet::new();
-    let mut installed_directories = BTreeSet::new();
-    enumerate_installation(
-        root,
-        root,
-        &mut installed_files,
-        &mut installed_directories,
-        checkpoint,
-    )?;
-    // Both collections iterate sorted, unique names; compare them directly
-    // instead of cloning every expected path into a second tree.
-    if !installed_files.iter().eq(expected_files.keys())
-        || installed_directories != expected_directories
-    {
-        return Err(ArtifactError::Installation);
-    }
+    verify_enumerated_tree(root, &expected_files, &expected_directories, checkpoint)?;
     let mut files = Vec::with_capacity(expected_files.len());
     for entry in expected_files.values() {
         checkpoint()?;
@@ -1195,12 +1209,7 @@ fn verify_installed_files<R: Read + Seek>(
             checkpoint,
         )
         .map_err(|error| classify_hash_error(error, ArtifactError::Installation))?;
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
-        {
-            check_arm64(&mut installed)?;
-        }
+        verify_pe_if_binary(&path, &mut installed)?;
         files.push(VerifiedRuntimeFile {
             path,
             bytes: entry.bytes,

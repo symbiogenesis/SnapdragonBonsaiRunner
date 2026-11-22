@@ -1,9 +1,9 @@
 //! Runtime extraction shares the verifier's archive policy.
 
 use super::{
-    ArtifactError, HASH_BUFFER_BYTES, Installation, RuntimeSpec, VerifiedRuntimeFile, check_arm64,
-    check_locked, copy_and_hash_bounded, enumerate_installation, hold_ancestors, inspect_archive,
-    open_locked_file, validate_external_path,
+    ArtifactError, HASH_BUFFER_BYTES, Installation, RuntimeSpec, VerifiedRuntimeFile, check_locked,
+    copy_and_hash_bounded, enumerate_installation, hold_ancestors, inspect_archive,
+    open_locked_file, validate_external_path, verify_enumerated_tree, verify_pe_if_binary,
 };
 use std::collections::BTreeSet;
 use std::fmt;
@@ -142,20 +142,12 @@ fn stage_runtime_inner(
     });
     let result = (|| {
         let (files, _staging_handles) = extract(&mut zip, staging, &installation, &mut buffer)?;
-        let mut installed_files = BTreeSet::new();
-        let mut installed_directories = BTreeSet::new();
-        enumerate_installation(
+        verify_enumerated_tree(
             staging,
-            staging,
-            &mut installed_files,
-            &mut installed_directories,
+            &installation.files,
+            &installation.directories,
             &mut || Ok(()),
         )?;
-        if !installed_files.iter().eq(installation.files.keys())
-            || installed_directories != installation.directories
-        {
-            return Err(ArtifactError::Installation);
-        }
         Ok(files)
     })();
     result.map_err(|error| RuntimeStagingError {
@@ -229,11 +221,7 @@ fn extract<R: Read + Seek>(
             &mut || Ok(()),
         )?;
         output.sync_all().map_err(|_| ArtifactError::Installation)?;
-        if path.extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll")
-        }) {
-            check_arm64(&mut output)?;
-        }
+        verify_pe_if_binary(&path, &mut output)?;
         files.push(VerifiedRuntimeFile {
             path,
             bytes: entry.bytes,

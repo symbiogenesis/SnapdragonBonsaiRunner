@@ -140,40 +140,45 @@ impl<R: Read> BoundedReader<R> {
         }
     }
 
-    fn read_exact_bytes(&mut self, len: usize) -> Result<Vec<u8>, ArtifactError> {
-        let len_u64 = u64::try_from(len).map_err(|_| ArtifactError::Identity)?;
+    fn read_into(&mut self, buf: &mut [u8]) -> Result<(), ArtifactError> {
+        let len_u64 = u64::try_from(buf.len()).map_err(|_| ArtifactError::Identity)?;
         let next = self
             .position
             .checked_add(len_u64)
             .filter(|&p| p <= self.limit)
             .ok_or(ArtifactError::Identity)?;
+        self.reader
+            .read_exact(buf)
+            .map_err(|_| ArtifactError::Identity)?;
+        self.position = next;
+        Ok(())
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], ArtifactError> {
+        let mut array = [0_u8; N];
+        self.read_into(&mut array)?;
+        Ok(array)
+    }
+
+    fn read_exact_bytes(&mut self, len: usize) -> Result<Vec<u8>, ArtifactError> {
         let mut buf = Vec::new();
         buf.try_reserve_exact(len)
             .map_err(|_| ArtifactError::Identity)?;
         buf.resize(len, 0);
-        self.reader
-            .read_exact(&mut buf)
-            .map_err(|_| ArtifactError::Identity)?;
-        self.position = next;
+        self.read_into(&mut buf)?;
         Ok(buf)
     }
 
     fn read_u32(&mut self) -> Result<u32, ArtifactError> {
-        let bytes = self.read_exact_bytes(4)?;
-        let array: [u8; 4] = bytes.try_into().map_err(|_| ArtifactError::Identity)?;
-        Ok(u32::from_le_bytes(array))
+        self.read_array::<4>().map(u32::from_le_bytes)
     }
 
     fn read_u64(&mut self) -> Result<u64, ArtifactError> {
-        let bytes = self.read_exact_bytes(8)?;
-        let array: [u8; 8] = bytes.try_into().map_err(|_| ArtifactError::Identity)?;
-        Ok(u64::from_le_bytes(array))
+        self.read_array::<8>().map(u64::from_le_bytes)
     }
 
     fn read_f32(&mut self) -> Result<f32, ArtifactError> {
-        let bytes = self.read_exact_bytes(4)?;
-        let array: [u8; 4] = bytes.try_into().map_err(|_| ArtifactError::Identity)?;
-        Ok(f32::from_le_bytes(array))
+        self.read_array::<4>().map(f32::from_le_bytes)
     }
 
     fn read_count(&mut self, maximum: usize) -> Result<usize, ArtifactError> {
@@ -213,40 +218,19 @@ impl<R: Read> BoundedReader<R> {
             }
             _ => return Err(ArtifactError::Identity),
         };
-        let _ = self.read_exact_bytes(scalar_bytes)?;
-        Ok(())
+        let mut scratch = [0_u8; 8];
+        self.read_into(&mut scratch[..scalar_bytes])
     }
 }
 
 fn hash_locked_file(file: &mut File, expected_len: u64) -> Result<String, ArtifactError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|_| ArtifactError::Identity)?;
-    let mut hasher = bonsai_native_hash::Hasher::new().map_err(|_| ArtifactError::Configuration)?;
     let mut buffer = verification_buffer(expected_len);
-    let mut read_total = 0_u64;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|_| ArtifactError::Identity)?;
-        if read == 0 {
-            break;
-        }
-        hasher
-            .update(&buffer[..read])
-            .map_err(|_| ArtifactError::Identity)?;
-        let add = u64::try_from(read).map_err(|_| ArtifactError::Identity)?;
-        read_total = read_total
-            .checked_add(add)
-            .filter(|&total| total <= expected_len)
-            .ok_or(ArtifactError::Identity)?;
-    }
-    if read_total != expected_len {
-        return Err(ArtifactError::Identity);
-    }
+    let digest = crate::hash_reader(file, expected_len, &mut buffer, &mut || Ok(()))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|_| ArtifactError::Identity)?;
-    let digest = hasher.finish().map_err(|_| ArtifactError::Identity)?;
-    Ok(hex::encode(digest))
+    Ok(digest)
 }
 
 fn validate_target_name(
@@ -324,7 +308,6 @@ fn scan_tensor_finite(
 }
 
 struct ParsedHeader {
-    alignment: u64,
     data_start: u64,
     tensors: Vec<TensorDesc>,
 }
@@ -333,8 +316,8 @@ fn parse_gguf_header(file: &mut File, file_len: u64) -> Result<ParsedHeader, Art
     file.seek(SeekFrom::Start(0))
         .map_err(|_| ArtifactError::Identity)?;
     let mut reader = BoundedReader::new(BufReader::new(file), file_len);
-    let magic = reader.read_exact_bytes(4)?;
-    if magic.as_slice() != GGUF_MAGIC {
+    let magic = reader.read_array::<4>()?;
+    if &magic != GGUF_MAGIC {
         return Err(ArtifactError::Identity);
     }
     if reader.read_u32()? != GGUF_VERSION {
@@ -360,31 +343,18 @@ fn parse_gguf_header(file: &mut File, file_len: u64) -> Result<ParsedHeader, Art
             return Err(ArtifactError::Identity);
         }
         let kind = reader.read_u32()?;
-        match key.as_str() {
-            "general.type" if kind == 8 => {
-                general_type = Some(reader.read_string()?);
-            }
-            "general.type" => return Err(ArtifactError::Identity),
-            "adapter.type" if kind == 8 => {
-                adapter_type = Some(reader.read_string()?);
-            }
-            "adapter.type" => return Err(ArtifactError::Identity),
-            "adapter.lora.alpha" if kind == 6 => {
-                primary_alpha = Some(reader.read_f32()?);
-            }
-            "adapter.lora.alpha" => return Err(ArtifactError::Identity),
-            "adapter.lora_alpha" if kind == 6 => {
-                legacy_alpha = Some(reader.read_f32()?);
-            }
-            "adapter.lora_alpha" => return Err(ArtifactError::Identity),
-            "lora.alpha" if kind == 6 => {
-                alt_alpha = Some(reader.read_f32()?);
-            }
-            "lora.alpha" => return Err(ArtifactError::Identity),
-            "general.alignment" if kind == 4 => {
-                alignment = Some(reader.read_u32()?);
-            }
-            "general.alignment" => return Err(ArtifactError::Identity),
+        match (key.as_str(), kind) {
+            ("general.type", 8) => general_type = Some(reader.read_string()?),
+            ("adapter.type", 8) => adapter_type = Some(reader.read_string()?),
+            ("adapter.lora.alpha", 6) => primary_alpha = Some(reader.read_f32()?),
+            ("adapter.lora_alpha", 6) => legacy_alpha = Some(reader.read_f32()?),
+            ("lora.alpha", 6) => alt_alpha = Some(reader.read_f32()?),
+            ("general.alignment", 4) => alignment = Some(reader.read_u32()?),
+            (
+                "general.type" | "adapter.type" | "adapter.lora.alpha" | "adapter.lora_alpha"
+                | "lora.alpha" | "general.alignment",
+                _,
+            ) => return Err(ArtifactError::Identity),
             _ => reader.skip_value(kind, 0)?,
         }
     }
@@ -453,7 +423,6 @@ fn parse_gguf_header(file: &mut File, file_len: u64) -> Result<ParsedHeader, Art
         .ok_or(ArtifactError::Identity)?;
 
     Ok(ParsedHeader {
-        alignment: align_u64,
         data_start,
         tensors,
     })
@@ -490,7 +459,6 @@ pub fn verify_multi_rank_lora_gguf(
 
     let sha256 = hash_locked_file(&mut file, file_len)?;
     let parsed = parse_gguf_header(&mut file, file_len)?;
-    let _ = parsed.alignment;
 
     let mut pairs: BTreeMap<String, PairEntry> = BTreeMap::new();
     let mut payload_bytes = 0_u64;
@@ -500,32 +468,28 @@ pub fn verify_multi_rank_lora_gguf(
             .data_start
             .checked_add(tensor.offset)
             .ok_or(ArtifactError::Identity)?;
-        let abs_end = abs_start
+        abs_start
             .checked_add(tensor.byte_len)
             .filter(|&end| end <= file_len)
             .ok_or(ArtifactError::Identity)?;
-        let _ = abs_end;
         payload_bytes = payload_bytes
             .checked_add(tensor.byte_len)
             .ok_or(ArtifactError::Identity)?;
 
-        if let Some(base_name) = tensor.name.strip_suffix(".lora_a") {
-            validate_target_name(base_name, envelope)?;
-            let entry = pairs.entry(base_name.to_owned()).or_default();
-            if entry.a.is_some() {
-                return Err(ArtifactError::Identity);
-            }
-            entry.a = Some((tensor.dims[0], tensor.dims[1], tensor.dtype));
-        } else if let Some(base_name) = tensor.name.strip_suffix(".lora_b") {
-            validate_target_name(base_name, envelope)?;
-            let entry = pairs.entry(base_name.to_owned()).or_default();
-            if entry.b.is_some() {
-                return Err(ArtifactError::Identity);
-            }
-            entry.b = Some((tensor.dims[0], tensor.dims[1], tensor.dtype));
+        let (base_name, is_a) = if let Some(name) = tensor.name.strip_suffix(".lora_a") {
+            (name, true)
+        } else if let Some(name) = tensor.name.strip_suffix(".lora_b") {
+            (name, false)
         } else {
             return Err(ArtifactError::Identity);
+        };
+        validate_target_name(base_name, envelope)?;
+        let entry = pairs.entry(base_name.to_owned()).or_default();
+        let slot = if is_a { &mut entry.a } else { &mut entry.b };
+        if slot.is_some() {
+            return Err(ArtifactError::Identity);
         }
+        *slot = Some((tensor.dims[0], tensor.dims[1], tensor.dtype));
 
         scan_tensor_finite(&mut file, abs_start, tensor.byte_len, tensor.dtype)?;
     }
