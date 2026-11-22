@@ -63,30 +63,22 @@ struct User32Api {
 impl User32Api {
     fn load() -> std::io::Result<Self> {
         let library = SystemLibrary::load_system32("user32.dll", "system user32.dll unavailable")?;
-        macro_rules! symbol {
-            ($name:literal, $kind:ty) => {{
-                let pointer = library.symbol($name)?;
-                // SAFETY: Exact documented Windows ARM64 user32.dll export signature;
-                // `_library` remains owned for the lifetime of this struct.
-                unsafe {
-                    std::mem::transmute::<unsafe extern "system" fn() -> isize, $kind>(pointer)
-                }
-            }};
-        }
+        use super::super::library::load_symbol;
         Ok(Self {
-            dialog_box_indirect_param_w: symbol!(
+            dialog_box_indirect_param_w: load_symbol!(
+                library,
                 c"DialogBoxIndirectParamW",
                 DialogBoxIndirectParamWFn
             ),
-            message_box_w: symbol!(c"MessageBoxW", MessageBoxWFn),
-            set_dlg_item_text_w: symbol!(c"SetDlgItemTextW", SetDlgItemTextWFn),
-            get_window_long_ptr_w: symbol!(c"GetWindowLongPtrW", GetWindowLongPtrWFn),
-            set_window_long_ptr_w: symbol!(c"SetWindowLongPtrW", SetWindowLongPtrWFn),
-            end_dialog: symbol!(c"EndDialog", EndDialogFn),
-            open_clipboard: symbol!(c"OpenClipboard", OpenClipboardFn),
-            empty_clipboard: symbol!(c"EmptyClipboard", EmptyClipboardFn),
-            set_clipboard_data: symbol!(c"SetClipboardData", SetClipboardDataFn),
-            close_clipboard: symbol!(c"CloseClipboard", CloseClipboardFn),
+            message_box_w: load_symbol!(library, c"MessageBoxW", MessageBoxWFn),
+            set_dlg_item_text_w: load_symbol!(library, c"SetDlgItemTextW", SetDlgItemTextWFn),
+            get_window_long_ptr_w: load_symbol!(library, c"GetWindowLongPtrW", GetWindowLongPtrWFn),
+            set_window_long_ptr_w: load_symbol!(library, c"SetWindowLongPtrW", SetWindowLongPtrWFn),
+            end_dialog: load_symbol!(library, c"EndDialog", EndDialogFn),
+            open_clipboard: load_symbol!(library, c"OpenClipboard", OpenClipboardFn),
+            empty_clipboard: load_symbol!(library, c"EmptyClipboard", EmptyClipboardFn),
+            set_clipboard_data: load_symbol!(library, c"SetClipboardData", SetClipboardDataFn),
+            close_clipboard: load_symbol!(library, c"CloseClipboard", CloseClipboardFn),
             _library: library,
         })
     }

@@ -3,10 +3,6 @@
 use std::os::windows::ffi::OsStrExt as _;
 use std::{cmp::Ordering, collections::BTreeMap, ffi::OsString, io};
 
-use windows_sys::Win32::Globalization::{
-    CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal,
-};
-
 use crate::invalid;
 
 const PROTECTED: &[&str] = &[
@@ -31,19 +27,7 @@ const PROTECTED: &[&str] = &[
 ];
 
 fn compare(left: &[u16], right: &[u16]) -> io::Result<Ordering> {
-    let left_len =
-        i32::try_from(left.len()).map_err(|_| invalid("environment name is too long"))?;
-    let right_len =
-        i32::try_from(right.len()).map_err(|_| invalid("environment name is too long"))?;
-    // SAFETY: Both slices remain readable for their checked UTF-16 lengths.
-    // Explicit lengths preserve unpaired UTF-16 units; ordinal case comparison
-    // is independent of locale and does not modify or retain either slice.
-    match unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) } {
-        CSTR_LESS_THAN => Ok(Ordering::Less),
-        CSTR_EQUAL => Ok(Ordering::Equal),
-        CSTR_GREATER_THAN => Ok(Ordering::Greater),
-        _ => Err(io::Error::last_os_error()),
-    }
+    super::compare_ordinal_ignore_case(left, right, "environment name is too long")
 }
 
 fn is_protected(name: &[u16]) -> io::Result<bool> {

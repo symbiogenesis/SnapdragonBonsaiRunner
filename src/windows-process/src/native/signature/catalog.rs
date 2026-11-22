@@ -79,8 +79,7 @@ pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::Authent
         context,
     };
     let mut info = CATALOG_INFO {
-        cbStruct: u32::try_from(size_of::<CATALOG_INFO>())
-            .map_err(|_| super::super::invalid("Catalog structure overflow."))?,
+        cbStruct: super::super::win_size::<CATALOG_INFO>(),
         ..CATALOG_INFO::default()
     };
     // SAFETY: The selected catalog remains owned; info is correctly sized and writable.
@@ -97,8 +96,7 @@ pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::Authent
         .collect();
     member.push(0);
     let mut catalog_info = WINTRUST_CATALOG_INFO {
-        cbStruct: u32::try_from(size_of::<WINTRUST_CATALOG_INFO>())
-            .map_err(|_| super::super::invalid("Catalog trust structure overflow."))?,
+        cbStruct: super::super::win_size::<WINTRUST_CATALOG_INFO>(),
         pcwszCatalogFilePath: info.wszCatalogFile.as_ptr(),
         pcwszMemberTag: member.as_ptr(),
         pcwszMemberFilePath: filename.as_ptr(),

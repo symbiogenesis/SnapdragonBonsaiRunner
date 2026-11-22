@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
-use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf, Prefix};
 
@@ -26,7 +26,6 @@ use mxc_sdk::process_security_environment_spec::process_security_environment_lay
     SchemaVersionT, finish_process_security_environment_buffer,
 };
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 
@@ -82,28 +81,13 @@ impl Environment {
     }
 }
 
-pub(super) fn available() -> io::Result<()> {
-    let api = available_api(SandboxNetwork::HostLoopback)?;
+pub(crate) fn available(network: SandboxNetwork) -> io::Result<()> {
+    let api = available_api(network)?;
     // API exports alone do not prove an enabled, usable native implementation.
     // Creating the same network/UI posture exercises actual PSEC policy admission
     // without a child, credentials, filesystem grants or host ACL changes.
     let environment = api
-        .create(
-            &policy_bytes(Vec::new(), None, SandboxNetwork::HostLoopback),
-            TERMINATE_ON_CLOSE,
-        )
-        .map_err(native_error)?;
-    drop(environment);
-    Ok(())
-}
-
-pub(super) fn offline_available() -> io::Result<()> {
-    let api = available_api(SandboxNetwork::Offline)?;
-    let environment = api
-        .create(
-            &policy_bytes(Vec::new(), None, SandboxNetwork::Offline),
-            TERMINATE_ON_CLOSE,
-        )
+        .create(&policy_bytes(Vec::new(), None, network), TERMINATE_ON_CLOSE)
         .map_err(native_error)?;
     drop(environment);
     Ok(())
@@ -292,17 +276,8 @@ fn path_text(path: &Path) -> io::Result<String> {
 fn same_path(left: &Path, right: &Path) -> io::Result<bool> {
     let left: Vec<u16> = left.as_os_str().encode_wide().collect();
     let right: Vec<u16> = right.as_os_str().encode_wide().collect();
-    let left_len = i32::try_from(left.len()).map_err(|_| invalid("sandbox path is too long"))?;
-    let right_len = i32::try_from(right.len()).map_err(|_| invalid("sandbox path is too long"))?;
-    // SAFETY: Both terminated-independent slices are readable for their checked
-    // UTF-16 lengths. The ordinal comparison retains no pointers or state.
-    let compared =
-        unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
-    if compared == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(compared == CSTR_EQUAL)
-    }
+    super::compare_ordinal_ignore_case(&left, &right, "sandbox path is too long")
+        .map(|ordering| ordering.is_eq())
 }
 
 fn within(path: &Path, root: &Path) -> io::Result<bool> {
@@ -315,31 +290,10 @@ fn within(path: &Path, root: &Path) -> io::Result<bool> {
 }
 
 fn windows_directory() -> io::Result<PathBuf> {
-    let mut stack = [0_u16; 260];
-    // SAFETY: The stack UTF-16 buffer has its advertised element capacity.
-    let length = unsafe { GetWindowsDirectoryW(stack.as_mut_ptr(), 260) };
-    let length =
-        usize::try_from(length).map_err(|_| invalid("Windows directory length overflow"))?;
-    if length == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let windows = if length < stack.len() {
-        PathBuf::from(OsString::from_wide(&stack[..length]))
-    } else if length <= 32_768 {
-        let mut buffer = vec![0_u16; length];
-        let capacity = u32::try_from(buffer.len())
-            .map_err(|_| invalid("Windows directory length overflow"))?;
-        // SAFETY: The writable UTF-16 allocation has exactly the supplied capacity.
-        let actual = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), capacity) };
-        let actual =
-            usize::try_from(actual).map_err(|_| invalid("Windows directory length overflow"))?;
-        if actual == 0 || actual >= buffer.len() {
-            return Err(io::Error::last_os_error());
-        }
-        PathBuf::from(OsString::from_wide(&buffer[..actual]))
-    } else {
-        return Err(invalid("Windows directory exceeds its bound"));
-    };
+    let windows = super::query_system_dir("Windows directory length overflow", |buf, cap| {
+        // SAFETY: Caller provides writable UTF-16 buffer of `cap` elements.
+        unsafe { GetWindowsDirectoryW(buf, cap) }
+    })?;
     validate_local_path(&windows)?;
     Ok(windows)
 }

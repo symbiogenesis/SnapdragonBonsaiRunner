@@ -29,7 +29,7 @@ fn observe(mut present: impl FnMut(u32) -> bool) -> Arm64Isa {
         reason = "Other Windows process architectures must return Unsupported rather than native ARM64 ISA evidence."
     )
 )]
-pub(super) fn query() -> io::Result<Arm64Isa> {
+pub(crate) fn query() -> io::Result<Arm64Isa> {
     #[cfg(target_arch = "aarch64")]
     {
         use windows_sys::Win32::System::Threading::IsProcessorFeaturePresent;

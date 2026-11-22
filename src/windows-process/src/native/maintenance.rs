@@ -36,12 +36,10 @@ pub(crate) fn has_running_process(names: &[&str]) -> io::Result<bool> {
     let mut matched = false;
     super::for_each_process("Process inventory exceeds its fixed bound.", |entry| {
         let exe_units = super::utf16_z(&entry.szExeFile, "Unterminated process name.")?;
-        if names.iter().any(|selected| {
-            exe_units.len() == selected.len()
-                && exe_units.iter().zip(selected.bytes()).all(|(&unit, byte)| {
-                    u8::try_from(unit).is_ok_and(|ascii| ascii.eq_ignore_ascii_case(&byte))
-                })
-        }) {
+        if names
+            .iter()
+            .any(|selected| super::utf16_eq_ignore_ascii_case(exe_units, selected))
+        {
             matched = true;
             return Ok(false);
         }

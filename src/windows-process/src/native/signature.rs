@@ -46,8 +46,7 @@ pub(super) fn verify_wintrust(
     close_message: &'static str,
 ) -> io::Result<crate::AuthenticodeSigner> {
     let mut data = WINTRUST_DATA {
-        cbStruct: u32::try_from(size_of::<WINTRUST_DATA>())
-            .map_err(|_| super::invalid("Trust structure overflow."))?,
+        cbStruct: super::win_size::<WINTRUST_DATA>(),
         dwUIChoice: WTD_UI_NONE,
         fdwRevocationChecks: WTD_REVOKE_NONE,
         dwUnionChoice: choice,
@@ -79,8 +78,7 @@ pub(super) fn verify_wintrust(
 
 fn embedded(file: &File, wide: &[u16]) -> io::Result<crate::AuthenticodeSigner> {
     let mut info = WINTRUST_FILE_INFO {
-        cbStruct: u32::try_from(size_of::<WINTRUST_FILE_INFO>())
-            .map_err(|_| super::invalid("Trust structure overflow."))?,
+        cbStruct: super::win_size::<WINTRUST_FILE_INFO>(),
         pcwszFilePath: wide.as_ptr(),
         hFile: file.as_raw_handle(),
         pgKnownSubject: ptr::null_mut(),
@@ -181,8 +179,7 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
         CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, id)
     })?;
     let mut entry = MODULEENTRY32W {
-        dwSize: u32::try_from(size_of::<MODULEENTRY32W>())
-            .map_err(|_| super::invalid("Module entry overflow."))?,
+        dwSize: super::win_size::<MODULEENTRY32W>(),
         ..MODULEENTRY32W::default()
     };
     let mut paths = Vec::new();
@@ -198,13 +195,7 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
         }
         let module_units = super::utf16_z(&entry.szModule, "Unterminated module name.")?;
         let matches_basename = if basename.is_ascii() {
-            module_units.len() == basename.len()
-                && module_units
-                    .iter()
-                    .zip(basename.bytes())
-                    .all(|(&unit, byte)| {
-                        u8::try_from(unit).is_ok_and(|ascii| ascii.eq_ignore_ascii_case(&byte))
-                    })
+            super::utf16_eq_ignore_ascii_case(module_units, basename)
         } else {
             String::from_utf16_lossy(module_units).eq_ignore_ascii_case(basename)
         };

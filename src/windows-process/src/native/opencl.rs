@@ -7,42 +7,7 @@ use std::path::PathBuf;
 use super::library::SystemLibrary;
 use crate::{OpenClDevice, OpenClInventory, OpenClPlatform};
 
-mod projection;
-
-pub(super) const fn kernel_source() -> &'static str {
-    projection::SOURCE
-}
-
-pub(super) const fn kernel_source_for(kind: crate::OpenClKernelKind) -> &'static str {
-    projection::source_for(kind)
-}
-
-pub(super) fn project(
-    selection: &crate::OpenClProjectionSelection,
-    weights: &[u8],
-    codes: &[u8],
-) -> io::Result<crate::OpenClPq2Projection> {
-    projection::run(selection, weights, codes)
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Forwards explicit OpenCL launch geometry before native loader initialization."
-)]
-pub(super) fn project_with_kernel(
-    selection: &crate::OpenClProjectionSelection,
-    family: crate::AdrenoFamily,
-    kind: crate::OpenClKernelKind,
-    rows: usize,
-    columns: usize,
-    tokens: usize,
-    weights: &[u8],
-    codes: &[u8],
-) -> io::Result<crate::OpenClPq2Projection> {
-    projection::run_with_kernel(
-        selection, family, kind, rows, columns, tokens, weights, codes,
-    )
-}
+pub(crate) mod projection;
 
 const MAX_PLATFORMS: usize = 8;
 const MAX_DEVICES: usize = 16;
@@ -117,34 +82,28 @@ impl Api {
         let library =
             SystemLibrary::load_system32("OpenCL.dll", "system OpenCL loader unavailable")?;
         let path = library.path().to_path_buf();
-        let platforms = library.symbol(c"clGetPlatformIDs").map_err(|_| invalid())?;
-        let platform_info = library
-            .symbol(c"clGetPlatformInfo")
-            .map_err(|_| invalid())?;
-        let devices = library.symbol(c"clGetDeviceIDs").map_err(|_| invalid())?;
-        let device_info = library.symbol(c"clGetDeviceInfo").map_err(|_| invalid())?;
-        // SAFETY: The exact OpenCL 1.0 symbol has the Platforms ABI declared in
-        // Khronos cl.h. The library stays owned for every function-pointer use.
-        let platforms = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, Platforms>(platforms)
-        };
-        // SAFETY: Exact clGetPlatformInfo symbol and Khronos ABI, retained library.
-        let platform_info = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, PlatformInfo>(platform_info)
-        };
-        // SAFETY: Exact clGetDeviceIDs symbol and Khronos ABI, retained library.
-        let devices = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, Devices>(devices)
-        };
-        // SAFETY: Exact clGetDeviceInfo symbol and Khronos ABI, retained library.
-        let device_info = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, DeviceInfo>(device_info)
-        };
         Ok(Self {
-            platforms,
-            platform_info,
-            devices,
-            device_info,
+            platforms: super::library::load_symbol!(
+                library,
+                c"clGetPlatformIDs",
+                Platforms,
+                |_| { invalid() }
+            ),
+            platform_info: super::library::load_symbol!(
+                library,
+                c"clGetPlatformInfo",
+                PlatformInfo,
+                |_| invalid()
+            ),
+            devices: super::library::load_symbol!(library, c"clGetDeviceIDs", Devices, |_| {
+                invalid()
+            }),
+            device_info: super::library::load_symbol!(
+                library,
+                c"clGetDeviceInfo",
+                DeviceInfo,
+                |_| invalid()
+            ),
             path,
             _library: library,
         })
@@ -276,7 +235,7 @@ fn validate_environment() -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn query() -> io::Result<OpenClInventory> {
+pub(crate) fn query() -> io::Result<OpenClInventory> {
     validate_environment()?;
     let api = Api::load()?;
     let mut platforms = [std::ptr::null_mut(); MAX_PLATFORMS];

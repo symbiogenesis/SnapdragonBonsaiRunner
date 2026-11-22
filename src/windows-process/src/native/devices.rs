@@ -9,22 +9,13 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, SetupDiOpenDevRegKey,
 };
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Registry::{
-    HKEY, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW,
-};
+use windows_sys::Win32::System::Registry::{KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegGetValueW};
 
 struct Set(HDEVINFO);
 impl Drop for Set {
     fn drop(&mut self) {
         // SAFETY: The SetupAPI set is owned exactly once and outlives every use.
         let _ = unsafe { SetupDiDestroyDeviceInfoList(self.0) };
-    }
-}
-struct Key(HKEY);
-impl Drop for Key {
-    fn drop(&mut self) {
-        // SAFETY: The registry handle is owned exactly once and is no longer borrowed.
-        let _ = unsafe { RegCloseKey(self.0) };
     }
 }
 fn text(buffer: &[u16]) -> io::Result<String> {
@@ -37,6 +28,15 @@ fn text(buffer: &[u16]) -> io::Result<String> {
         ));
     }
     Ok(text)
+}
+fn decode_utf16_bytes(buffer: &[u16], bytes: u32) -> Option<String> {
+    if bytes < 2 || !bytes.is_multiple_of(2) {
+        return None;
+    }
+    let units = usize::try_from(bytes / 2)
+        .ok()
+        .filter(|units| *units <= buffer.len())?;
+    text(&buffer[..units]).ok()
 }
 fn property(set: &Set, entry: &SP_DEVINFO_DATA, property: u32) -> Option<String> {
     let mut buffer = [0_u16; 2048];
@@ -55,16 +55,13 @@ fn property(set: &Set, entry: &SP_DEVINFO_DATA, property: u32) -> Option<String>
             &raw mut required,
         )
     };
-    if read == 0 || kind != REG_SZ || required < 2 || required % 2 != 0 {
+    if read == 0 || kind != REG_SZ {
         return None;
     }
-    let units = usize::try_from(required / 2)
-        .ok()
-        .filter(|units| *units <= buffer.len())?;
-    text(&buffer[..units]).ok()
+    decode_utf16_bytes(&buffer, required)
 }
-fn registry(key: &Key, name: &str) -> Option<String> {
-    let name: Vec<_> = name.encode_utf16().chain([0]).collect();
+fn registry(key: &super::RegistryKey, name: &str) -> Option<String> {
+    let name = super::wide(name);
     let mut buffer = [0_u16; 2048];
     let mut size = 4096_u32;
     // SAFETY: The owned key and terminated value name remain live; the writable
@@ -80,13 +77,10 @@ fn registry(key: &Key, name: &str) -> Option<String> {
             &raw mut size,
         )
     };
-    if status != 0 || size < 2 || size % 2 != 0 {
+    if status != 0 {
         return None;
     }
-    let units = usize::try_from(size / 2)
-        .ok()
-        .filter(|units| *units <= buffer.len())?;
-    text(&buffer[..units]).ok()
+    decode_utf16_bytes(&buffer, size)
 }
 
 pub(crate) fn inventory(class: &str) -> io::Result<Vec<crate::DeviceInventoryEntry>> {
@@ -107,8 +101,7 @@ pub(crate) fn inventory(class: &str) -> io::Result<Vec<crate::DeviceInventoryEnt
     let mut devices = Vec::new();
     for index in 0..=16 {
         let mut entry = SP_DEVINFO_DATA {
-            cbSize: u32::try_from(size_of::<SP_DEVINFO_DATA>())
-                .map_err(|_| super::invalid("Device entry overflow."))?,
+            cbSize: super::win_size::<SP_DEVINFO_DATA>(),
             ..SP_DEVINFO_DATA::default()
         };
         // SAFETY: set is live and entry has its initialized exact structure size.
@@ -147,7 +140,8 @@ pub(crate) fn inventory(class: &str) -> io::Result<Vec<crate::DeviceInventoryEnt
                 KEY_READ,
             )
         };
-        let key = (raw_key != INVALID_HANDLE_VALUE && !raw_key.is_null()).then(|| Key(raw_key));
+        let key = (raw_key != INVALID_HANDLE_VALUE && !raw_key.is_null())
+            .then(|| super::RegistryKey(raw_key));
         devices.push(crate::DeviceInventoryEntry {
             name: property(&set, &entry, SPDRP_DEVICEDESC),
             manufacturer: property(&set, &entry, SPDRP_MFG),

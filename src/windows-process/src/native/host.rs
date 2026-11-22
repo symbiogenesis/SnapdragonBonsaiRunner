@@ -28,8 +28,8 @@ fn registry_text(subkey: &str, value: &str) -> io::Result<String> {
         HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RRF_ZEROONFAILURE, RegGetValueW,
     };
 
-    let subkey: Vec<_> = subkey.encode_utf16().chain(Some(0)).collect();
-    let value: Vec<_> = value.encode_utf16().chain(Some(0)).collect();
+    let subkey = super::wide(subkey);
+    let value = super::wide(value);
     let mut buffer = [0_u16; 512];
     let mut bytes = 1024_u32;
     // SAFETY: The fixed subkey and caller-owned value names are NUL-terminated.
@@ -52,7 +52,7 @@ fn registry_text(subkey: &str, value: &str) -> io::Result<String> {
     decode_registry_text(&buffer, bytes)
 }
 
-pub(super) fn computer_identity() -> io::Result<crate::ComputerIdentity> {
+pub(crate) fn computer_identity() -> io::Result<crate::ComputerIdentity> {
     const BIOS: &str = "HARDWARE\\DESCRIPTION\\System\\BIOS";
     Ok(crate::ComputerIdentity {
         manufacturer: registry_text(BIOS, "SystemManufacturer")?,
@@ -60,23 +60,12 @@ pub(super) fn computer_identity() -> io::Result<crate::ComputerIdentity> {
     })
 }
 
-struct RegistryKey(windows_sys::Win32::System::Registry::HKEY);
-
-impl Drop for RegistryKey {
-    fn drop(&mut self) {
-        use windows_sys::Win32::System::Registry::RegCloseKey;
-
-        // SAFETY: This handle was opened once by RegOpenKeyExW and is released once here.
-        let _ = unsafe { RegCloseKey(self.0) };
-    }
-}
-
 fn registry_key_exists(subkey: &str) -> bool {
     use windows_sys::Win32::System::Registry::{
         HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, RegOpenKeyExW,
     };
 
-    let subkey: Vec<_> = subkey.encode_utf16().chain(Some(0)).collect();
+    let subkey = super::wide(subkey);
     let mut handle = std::ptr::null_mut();
     // SAFETY: `subkey` is NUL-terminated and live; `handle` is writable local storage.
     // RegOpenKeyExW retains no caller pointers and transfers key ownership only on status 0.
@@ -91,7 +80,7 @@ fn registry_key_exists(subkey: &str) -> bool {
     };
     if status == 0 {
         if !handle.is_null() {
-            let _guard = RegistryKey(handle);
+            let _guard = super::RegistryKey(handle);
         }
         true
     } else {
@@ -99,7 +88,7 @@ fn registry_key_exists(subkey: &str) -> bool {
     }
 }
 
-pub(super) fn reboot_pending() -> bool {
+pub(crate) fn reboot_pending() -> bool {
     [
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending",
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired",
@@ -108,7 +97,7 @@ pub(super) fn reboot_pending() -> bool {
     .any(registry_key_exists)
 }
 
-pub(super) fn query() -> io::Result<crate::NativeBuildHost> {
+pub(crate) fn query() -> io::Result<crate::NativeBuildHost> {
     #[cfg(target_arch = "aarch64")]
     {
         use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
@@ -116,8 +105,7 @@ pub(super) fn query() -> io::Result<crate::NativeBuildHost> {
         use windows_sys::Win32::System::Threading::IsProcessorFeaturePresent;
 
         let mut version = OSVERSIONINFOW {
-            dwOSVersionInfoSize: u32::try_from(size_of::<OSVERSIONINFOW>())
-                .map_err(|_| io::Error::other("invalid native version structure size"))?,
+            dwOSVersionInfoSize: super::win_size::<OSVERSIONINFOW>(),
             ..OSVERSIONINFOW::default()
         };
         // SAFETY: The version structure is initialized with its exact native size,

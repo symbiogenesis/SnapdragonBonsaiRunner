@@ -474,7 +474,7 @@ pub struct VulkanAdapter {
 /// Known stages carry a downcastable [`VulkanQueryFailure`]; a failed query does
 /// not establish that the physical device lacks Vulkan support.
 pub fn vulkan_inventory() -> io::Result<VulkanInventory> {
-    native::vulkan_inventory()
+    native::vulkan::query()
 }
 
 /// Model-free observations from the absolute Windows system `OpenCL` loader.
@@ -541,7 +541,7 @@ pub struct OpenClDevice {
 /// loaders, failed calls and malformed/oversized driver data. Loading the system
 /// implementation does not establish its signature or dependency provenance.
 pub fn opencl_inventory() -> io::Result<OpenClInventory> {
-    native::opencl_inventory()
+    native::opencl::query()
 }
 
 /// Exact operator-selected `OpenCL` platform, GPU and driver for the fixed pilot.
@@ -632,13 +632,13 @@ impl OpenClKernelKind {
 /// Fixed `OpenCL` C 1.2 source whose digest must be reviewed before pilot execution.
 #[must_use]
 pub const fn opencl_pq2_kernel_source() -> &'static str {
-    native::opencl_pq2_kernel_source()
+    native::opencl::projection::SOURCE
 }
 
 /// Pure `OpenCL` C 1.2 source for a specific Adreno `Q2_0`/`Q8_K` or `FWHT` kernel variant.
 #[must_use]
 pub const fn opencl_pq2_kernel_source_for(kind: OpenClKernelKind) -> &'static str {
-    native::opencl_pq2_kernel_source_for(kind)
+    native::opencl::projection::source_for(kind)
 }
 
 /// Execute one fixed K=5120, M=17408 `PQ2/Q8_K` integer projection on Adreno X2.
@@ -664,7 +664,7 @@ pub fn opencl_pq2_projection(
     weights: &[u8],
     codes: &[u8],
 ) -> io::Result<OpenClPq2Projection> {
-    native::opencl_pq2_projection(selection, weights, codes)
+    native::opencl::projection::run(selection, weights, codes)
 }
 
 /// Execute a parameterized `OpenCL` C 1.2 `PQ2/Q8_K` or `FWHT` kernel on a selected Adreno GPU.
@@ -683,7 +683,7 @@ pub fn opencl_pq2_projection_with_kernel(
     weights: &[u8],
     codes: &[u8],
 ) -> io::Result<OpenClPq2Projection> {
-    native::opencl_pq2_projection_with_kernel(
+    native::opencl::projection::run_with_kernel(
         selection, family, kind, rows, columns, tokens, weights, codes,
     )
 }
@@ -737,7 +737,7 @@ pub struct CpuSet {
 /// exist, or `InvalidData` for malformed, duplicate or oversized records. A
 /// changing required buffer size is retried at most three times.
 pub fn cpu_sets() -> io::Result<Vec<CpuSet>> {
-    native::cpu_sets()
+    native::cpu::query()
 }
 
 /// Windows-reported availability of native ARM64 packed-kernel instructions.
@@ -766,7 +766,7 @@ pub struct Arm64Isa {
 /// Returns `Unsupported` outside an ARM64 build; emulated x86/x64 callers cannot
 /// produce a native ARM64 eligibility observation.
 pub fn arm64_isa() -> io::Result<Arm64Isa> {
-    native::arm64_isa()
+    native::isa::query()
 }
 
 /// Stable observed host facts for partitioning host-native compiler outputs.
@@ -799,7 +799,7 @@ pub struct NativeBuildHost {
 /// Returns `Unsupported` outside an ARM64 process, native query failures, or
 /// `InvalidData` when mandatory identity values are absent, malformed or oversized.
 pub fn native_build_host() -> io::Result<NativeBuildHost> {
-    native::native_build_host()
+    native::host::query()
 }
 
 /// Native system manufacturer and product name from the fixed BIOS registry key.
@@ -816,7 +816,7 @@ pub struct ComputerIdentity {
 /// # Errors
 /// Rejects unavailable, oversized, malformed or empty registry strings.
 pub fn computer_identity() -> io::Result<ComputerIdentity> {
-    native::computer_identity()
+    native::host::computer_identity()
 }
 
 /// Current Windows power-source and battery-saver snapshot.
@@ -842,7 +842,7 @@ pub struct PowerStatus {
 /// Returns native query failures or `InvalidData` for undocumented field values.
 /// Documented unknown AC and battery-percentage sentinels remain `None`.
 pub fn power_status() -> io::Result<PowerStatus> {
-    native::power_status()
+    native::power::query()
 }
 
 /// Checked Windows effective power mode, using notification contract version two.
@@ -907,7 +907,7 @@ pub struct PowerPolicy {
 /// a malformed scheme. A failed notification cleanup disables future mode queries
 /// in this process rather than accumulating registrations or reusing stale data.
 pub fn power_policy() -> io::Result<PowerPolicy> {
-    native::power_policy()
+    native::power_policy::query()
 }
 
 /// Explicit launch inputs; no shell or executable search path is used.
@@ -992,7 +992,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 /// `InvalidInput` for recognized ambient credential variables.
 pub fn native_sandbox_available() -> io::Result<()> {
     validate_sandbox_environment()?;
-    native::sandbox_available()
+    native::containment::available(SandboxNetwork::HostLoopback)
 }
 
 /// Requires native PSEC 1.1 offline containment without host loopback or parent environment filtering.
@@ -1004,7 +1004,7 @@ pub fn native_sandbox_available() -> io::Result<()> {
 /// Returns `Unsupported` when the native contract is unavailable, or a native failure
 /// when the host cannot create an offline restricted security environment.
 pub fn native_sandbox_offline_available() -> io::Result<()> {
-    native::offline_sandbox_available()
+    native::containment::available(SandboxNetwork::Offline)
 }
 
 /// Reports whether Windows currently advertises a pending update or servicing restart.
@@ -1015,7 +1015,7 @@ pub fn native_sandbox_offline_available() -> io::Result<()> {
 /// containment or admission requirements.
 #[must_use]
 pub fn windows_reboot_pending() -> bool {
-    native::windows_reboot_pending()
+    native::host::reboot_pending()
 }
 
 /// Startup compiler/tool inputs with a child-only inherited-environment overlay.
@@ -1282,7 +1282,7 @@ impl OwnedProcess {
     /// Rejects invalid paths, malformed arguments or environment entries, protected
     /// system/profile overrides, existing evidence files, or native launch failures.
     pub fn start_tool(spec: &ToolProcessSpec) -> io::Result<Self> {
-        Self::start_tool_with_priority(spec, native::ToolPriority::Inherited)
+        Self::start_tool_inner(spec, native::ToolPriority::Inherited, None)
     }
 
     /// Owns a background startup tool tree at below-normal CPU priority.
@@ -1297,12 +1297,24 @@ impl OwnedProcess {
     /// Returns the same validation and launch failures as [`Self::start_tool`],
     /// including failure to establish the required Job priority limit.
     pub fn start_background_tool(spec: &ToolProcessSpec) -> io::Result<Self> {
-        Self::start_tool_with_priority(spec, native::ToolPriority::Background)
+        Self::start_tool_inner(spec, native::ToolPriority::Background, None)
     }
 
-    fn start_tool_with_priority(
+    /// Starts a tool with explicit child-only environment removals.
+    ///
+    /// Uses the same atomic Job ownership as `start_tool`. Windows system/profile
+    /// variables are protected; the parent environment is never changed.
+    ///
+    /// # Errors
+    /// Rejects invalid removals and every path, Job or creation failure from `start_tool`.
+    pub fn start_tool_with_removed(spec: &ToolProcessSpec, removed: &[String]) -> io::Result<Self> {
+        Self::start_tool_inner(spec, native::ToolPriority::Inherited, Some(removed))
+    }
+
+    fn start_tool_inner(
         spec: &ToolProcessSpec,
         priority: native::ToolPriority,
+        removed: Option<&[String]>,
     ) -> io::Result<Self> {
         for path in [
             &spec.executable,
@@ -1316,38 +1328,14 @@ impl OwnedProcess {
             return Err(invalid("executable or working directory does not exist"));
         }
         let command = tool_command_line(&spec.executable, &spec.arguments)?;
-        let environment = native::tool_environment(&spec.environment)?;
+        let environment = match removed {
+            Some(removed) => Some(native::tool_environment_with_removed(
+                &spec.environment,
+                removed,
+            )?),
+            None => native::tool_environment(&spec.environment)?,
+        };
         native::NativeProcess::start_tool(spec, command, environment.as_deref(), priority).map(Self)
-    }
-
-    /// Starts a tool with explicit child-only environment removals.
-    ///
-    /// Uses the same atomic Job ownership as `start_tool`. Windows system/profile
-    /// variables are protected; the parent environment is never changed.
-    ///
-    /// # Errors
-    /// Rejects invalid removals and every path, Job or creation failure from `start_tool`.
-    pub fn start_tool_with_removed(spec: &ToolProcessSpec, removed: &[String]) -> io::Result<Self> {
-        for path in [
-            &spec.executable,
-            &spec.working_directory,
-            &spec.stdout,
-            &spec.stderr,
-        ] {
-            validate_path(path)?;
-        }
-        if !spec.executable.is_file() || !spec.working_directory.is_dir() {
-            return Err(invalid("executable or working directory does not exist"));
-        }
-        let command = tool_command_line(&spec.executable, &spec.arguments)?;
-        let environment = native::tool_environment_with_removed(&spec.environment, removed)?;
-        native::NativeProcess::start_tool(
-            spec,
-            command,
-            Some(&environment),
-            native::ToolPriority::Inherited,
-        )
-        .map(Self)
     }
 
     /// Creates evidence files, atomically assigns a suspended root, then resumes.
@@ -1366,7 +1354,12 @@ impl OwnedProcess {
     pub fn start(spec: &ProcessSpec) -> io::Result<Self> {
         validate_process(spec)?;
         let command = command_line(&spec.executable, &spec.arguments)?;
-        native::NativeProcess::start(spec, command).map(Self)
+        native::NativeProcess::start_with_profile(
+            spec,
+            command,
+            native::MitigationProfile::Headless,
+        )
+        .map(Self)
     }
 
     /// Starts a bounded, model-free `--version` or `--help` inspection.
@@ -1392,7 +1385,12 @@ impl OwnedProcess {
             ));
         }
         let command = command_line(&spec.executable, &spec.arguments)?;
-        native::NativeProcess::start_inspection(spec, command).map(Self)
+        native::NativeProcess::start_with_profile(
+            spec,
+            command,
+            native::MitigationProfile::Inspection,
+        )
+        .map(Self)
     }
 
     /// Starts a bounded graphics discovery or standalone pilot probe.
@@ -1428,7 +1426,12 @@ impl OwnedProcess {
         }
         validate_path(Path::new(request_path))?;
         let command = command_line(&spec.executable, &spec.arguments)?;
-        native::NativeProcess::start_graphics_probe(spec, command).map(Self)
+        native::NativeProcess::start_with_profile(
+            spec,
+            command,
+            native::MitigationProfile::GraphicsProbe,
+        )
+        .map(Self)
     }
 
     /// Returns the root Windows process identifier.

@@ -6,7 +6,7 @@ use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATU
 
 use crate::PowerStatus;
 
-pub(super) fn query() -> io::Result<PowerStatus> {
+pub(crate) fn query() -> io::Result<PowerStatus> {
     let mut status = SYSTEM_POWER_STATUS::default();
     // SAFETY: The synchronous API writes to one initialized, correctly aligned
     // native status value and retains no pointer. No process/device policy is set.

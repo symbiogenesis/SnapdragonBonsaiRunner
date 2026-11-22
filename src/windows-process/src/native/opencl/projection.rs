@@ -58,7 +58,7 @@ type Release = unsafe extern "system" fn(Id) -> i32;
 // No optional extensions, floating arithmetic, subgroup widths or vendor binaries.
 // One work-item preserves one original 128-symbol PQ2 integer reduction. The host
 // retains the original half scales and CPU-prepared Q8_K scale/FMA order.
-pub(super) const SOURCE: &str = r"
+pub(crate) const SOURCE: &str = r"
 __kernel void pq2_q8k_block_dots(__global const uchar *weights,
                                 __global const char *codes,
                                 __global int *output) {
@@ -200,7 +200,7 @@ __kernel void fwht_local_1024(__global const uchar *weights,
 }
 ";
 
-pub(super) const fn source_for(kind: OpenClKernelKind) -> &'static str {
+pub(crate) const fn source_for(kind: OpenClKernelKind) -> &'static str {
     match kind {
         OpenClKernelKind::BlockDots => SOURCE,
         OpenClKernelKind::Gemv4Row => GEMV_4ROW_SOURCE,
@@ -240,32 +240,23 @@ struct Compute {
 
 impl Compute {
     fn load(api: &Api) -> io::Result<Self> {
-        macro_rules! symbol {
-            ($name:literal, $kind:ty) => {{
-                let pointer = api._library.symbol($name)?;
-                // SAFETY: Fixed OpenCL 1.x core symbol and the exact Khronos
-                // cl.h ABI above. The containing Api outlives all pointer use.
-                unsafe {
-                    std::mem::transmute::<unsafe extern "system" fn() -> isize, $kind>(pointer)
-                }
-            }};
-        }
+        use super::super::library::load_symbol;
         Ok(Self {
-            context: symbol!(c"clCreateContext", Context),
-            queue: symbol!(c"clCreateCommandQueue", Queue),
-            buffer: symbol!(c"clCreateBuffer", Buffer),
-            program: symbol!(c"clCreateProgramWithSource", Program),
-            build: symbol!(c"clBuildProgram", Build),
-            kernel: symbol!(c"clCreateKernel", Kernel),
-            argument: symbol!(c"clSetKernelArg", Argument),
-            enqueue: symbol!(c"clEnqueueNDRangeKernel", Enqueue),
-            read: symbol!(c"clEnqueueReadBuffer", Read),
-            finish: symbol!(c"clFinish", Release),
-            release_context: symbol!(c"clReleaseContext", Release),
-            release_queue: symbol!(c"clReleaseCommandQueue", Release),
-            release_buffer: symbol!(c"clReleaseMemObject", Release),
-            release_program: symbol!(c"clReleaseProgram", Release),
-            release_kernel: symbol!(c"clReleaseKernel", Release),
+            context: load_symbol!(api._library, c"clCreateContext", Context),
+            queue: load_symbol!(api._library, c"clCreateCommandQueue", Queue),
+            buffer: load_symbol!(api._library, c"clCreateBuffer", Buffer),
+            program: load_symbol!(api._library, c"clCreateProgramWithSource", Program),
+            build: load_symbol!(api._library, c"clBuildProgram", Build),
+            kernel: load_symbol!(api._library, c"clCreateKernel", Kernel),
+            argument: load_symbol!(api._library, c"clSetKernelArg", Argument),
+            enqueue: load_symbol!(api._library, c"clEnqueueNDRangeKernel", Enqueue),
+            read: load_symbol!(api._library, c"clEnqueueReadBuffer", Read),
+            finish: load_symbol!(api._library, c"clFinish", Release),
+            release_context: load_symbol!(api._library, c"clReleaseContext", Release),
+            release_queue: load_symbol!(api._library, c"clReleaseCommandQueue", Release),
+            release_buffer: load_symbol!(api._library, c"clReleaseMemObject", Release),
+            release_program: load_symbol!(api._library, c"clReleaseProgram", Release),
+            release_kernel: load_symbol!(api._library, c"clReleaseKernel", Release),
         })
     }
 }
@@ -544,7 +535,7 @@ fn build_spec<'a>(
     })
 }
 
-pub(super) fn run(
+pub(crate) fn run(
     selection: &OpenClProjectionSelection,
     weights: &[u8],
     codes: &[u8],
@@ -567,7 +558,7 @@ pub(super) fn run(
     clippy::too_many_arguments,
     reason = "Matches the public parameterized OpenCL dispatch boundary without bundling a parameter struct."
 )]
-pub(super) fn run_with_kernel(
+pub(crate) fn run_with_kernel(
     selection: &OpenClProjectionSelection,
     family: AdrenoFamily,
     kind: OpenClKernelKind,

@@ -26,7 +26,7 @@ fn unsupported() -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, "no observed Windows CPU Sets")
 }
 
-pub(super) fn query() -> io::Result<Vec<CpuSet>> {
+pub(crate) fn query() -> io::Result<Vec<CpuSet>> {
     let mut required = 0_u32;
     // SAFETY: The current-process pseudo handle requires no ownership or close,
     // is valid for this synchronous query and grants process-query access.

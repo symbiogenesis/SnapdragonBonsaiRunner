@@ -209,7 +209,7 @@ fn active_scheme() -> io::Result<String> {
     Ok(format_guid(guid))
 }
 
-pub(super) fn query() -> io::Result<PowerPolicy> {
+pub(crate) fn query() -> io::Result<PowerPolicy> {
     Ok(PowerPolicy {
         active_scheme: active_scheme()?,
         effective_mode: effective_mode()?,

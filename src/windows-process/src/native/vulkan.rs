@@ -195,15 +195,12 @@ impl Loader {
     fn load() -> io::Result<Self> {
         let library =
             SystemLibrary::load_system32("vulkan-1.dll", "system Vulkan loader unavailable")?;
-        let proc_addr = library
-            .symbol(c"vkGetInstanceProcAddr")
-            .map_err(|_| io::Error::other("system Vulkan loader unavailable"))?;
-        // SAFETY: `vkGetInstanceProcAddr` has the exact Khronos Vulkan 1.0 ABI.
-        let get_instance_proc_addr = unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, vk::PFN_vkGetInstanceProcAddr>(
-                proc_addr,
-            )
-        };
+        let get_instance_proc_addr = super::library::load_symbol!(
+            library,
+            c"vkGetInstanceProcAddr",
+            vk::PFN_vkGetInstanceProcAddr,
+            |_| io::Error::other("system Vulkan loader unavailable")
+        );
         // SAFETY: Global loader command lookup uses a null VkInstance and NUL-terminated name.
         if unsafe { get_instance_proc_addr(vk::Instance::null(), c"vkCreateInstance".as_ptr()) }
             .is_none()
@@ -665,7 +662,7 @@ fn adapter(
     })
 }
 
-pub(super) fn query() -> io::Result<VulkanInventory> {
+pub(crate) fn query() -> io::Result<VulkanInventory> {
     if !cfg!(target_arch = "aarch64")
         || std::env::vars_os().any(|(name, _)| {
             name.as_encoded_bytes()

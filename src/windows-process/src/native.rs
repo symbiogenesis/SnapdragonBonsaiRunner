@@ -78,25 +78,91 @@ use crate::{ProcessMemory, ProcessSpec, SandboxNetwork, SandboxPolicy, ToolProce
 
 pub(super) mod caller;
 mod cleanup;
-mod containment;
-mod cpu;
+pub(super) mod containment;
+pub(super) mod cpu;
 pub(super) mod devices;
 mod environment;
-mod host;
-mod isa;
+pub(super) mod host;
+pub(super) mod isa;
 #[cfg(feature = "test-probe")]
 mod job_probe;
 mod library;
 pub(super) mod mmap;
-mod opencl;
+pub(super) mod opencl;
 mod output;
-mod power;
-mod power_policy;
+pub(super) mod power;
+pub(super) mod power_policy;
 pub(super) mod presentation;
 pub(super) mod replacement;
 pub(super) mod row_pool;
 pub(super) mod signature;
-mod vulkan;
+pub(super) mod vulkan;
+
+pub(super) struct RegistryKey(pub(super) windows_sys::Win32::System::Registry::HKEY);
+
+impl Drop for RegistryKey {
+    fn drop(&mut self) {
+        // SAFETY: This handle was opened once and is released once on Drop.
+        let _ = unsafe { windows_sys::Win32::System::Registry::RegCloseKey(self.0) };
+    }
+}
+
+pub(super) fn query_system_dir(
+    overflow_message: &'static str,
+    mut fill: impl FnMut(*mut u16, u32) -> u32,
+) -> io::Result<PathBuf> {
+    const MAX_DIRECTORY: usize = 32_768;
+    let mut stack = [0_u16; 260];
+    let count =
+        usize::try_from(fill(stack.as_mut_ptr(), 260)).map_err(|_| invalid(overflow_message))?;
+    if count == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if count < stack.len() {
+        return Ok(PathBuf::from(OsString::from_wide(&stack[..count])));
+    }
+    if count > MAX_DIRECTORY {
+        return Err(invalid(overflow_message));
+    }
+    let mut heap = vec![0_u16; count];
+    let capacity = u32::try_from(heap.len()).map_err(|_| invalid(overflow_message))?;
+    let actual = usize::try_from(fill(heap.as_mut_ptr(), capacity))
+        .map_err(|_| invalid(overflow_message))?;
+    if actual == 0 || actual >= heap.len() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PathBuf::from(OsString::from_wide(&heap[..actual])))
+}
+
+pub(super) fn compare_ordinal_ignore_case(
+    left: &[u16],
+    right: &[u16],
+    too_long: &'static str,
+) -> io::Result<std::cmp::Ordering> {
+    use windows_sys::Win32::Globalization::{
+        CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal,
+    };
+
+    let left_len = i32::try_from(left.len()).map_err(|_| invalid(too_long))?;
+    let right_len = i32::try_from(right.len()).map_err(|_| invalid(too_long))?;
+    // SAFETY: Both slices remain readable for their checked UTF-16 lengths.
+    // Explicit lengths preserve unpaired UTF-16 units; ordinal case comparison
+    // is independent of locale and does not modify or retain either slice.
+    match unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) } {
+        CSTR_LESS_THAN => Ok(std::cmp::Ordering::Less),
+        CSTR_EQUAL => Ok(std::cmp::Ordering::Equal),
+        CSTR_GREATER_THAN => Ok(std::cmp::Ordering::Greater),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+pub(super) fn utf16_eq_ignore_ascii_case(units: &[u16], ascii: &str) -> bool {
+    units.len() == ascii.len()
+        && units
+            .iter()
+            .zip(ascii.bytes())
+            .all(|(&unit, byte)| u8::try_from(unit).is_ok_and(|ch| ch.eq_ignore_ascii_case(&byte)))
+}
 
 pub(super) fn utf16_z<'a>(units: &'a [u16], unterminated: &'static str) -> io::Result<&'a [u16]> {
     let end = units
@@ -177,85 +243,6 @@ pub(super) fn decode_job_process_list_header(storage: &[usize]) -> (u32, u32) {
     (assigned, listed)
 }
 
-pub(super) fn vulkan_inventory() -> io::Result<crate::VulkanInventory> {
-    vulkan::query()
-}
-
-pub(super) fn opencl_inventory() -> io::Result<crate::OpenClInventory> {
-    opencl::query()
-}
-
-pub(super) const fn opencl_pq2_kernel_source() -> &'static str {
-    opencl::kernel_source()
-}
-
-pub(super) const fn opencl_pq2_kernel_source_for(kind: crate::OpenClKernelKind) -> &'static str {
-    opencl::kernel_source_for(kind)
-}
-
-pub(super) fn opencl_pq2_projection(
-    selection: &crate::OpenClProjectionSelection,
-    weights: &[u8],
-    codes: &[u8],
-) -> io::Result<crate::OpenClPq2Projection> {
-    opencl::project(selection, weights, codes)
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Matches the public parameterized OpenCL dispatch boundary without bundling a parameter struct."
-)]
-pub(super) fn opencl_pq2_projection_with_kernel(
-    selection: &crate::OpenClProjectionSelection,
-    family: crate::AdrenoFamily,
-    kind: crate::OpenClKernelKind,
-    rows: usize,
-    columns: usize,
-    tokens: usize,
-    weights: &[u8],
-    codes: &[u8],
-) -> io::Result<crate::OpenClPq2Projection> {
-    opencl::project_with_kernel(
-        selection, family, kind, rows, columns, tokens, weights, codes,
-    )
-}
-
-pub(super) fn cpu_sets() -> io::Result<Vec<crate::CpuSet>> {
-    cpu::query()
-}
-
-pub(super) fn arm64_isa() -> io::Result<crate::Arm64Isa> {
-    isa::query()
-}
-
-pub(super) fn native_build_host() -> io::Result<crate::NativeBuildHost> {
-    host::query()
-}
-
-pub(super) fn computer_identity() -> io::Result<crate::ComputerIdentity> {
-    host::computer_identity()
-}
-
-pub(super) fn windows_reboot_pending() -> bool {
-    host::reboot_pending()
-}
-
-pub(super) fn power_status() -> io::Result<crate::PowerStatus> {
-    power::query()
-}
-
-pub(super) fn power_policy() -> io::Result<crate::PowerPolicy> {
-    power_policy::query()
-}
-
-pub(super) fn sandbox_available() -> io::Result<()> {
-    containment::available()
-}
-
-pub(super) fn offline_sandbox_available() -> io::Result<()> {
-    containment::offline_available()
-}
-
 pub(super) fn tool_environment(
     overlay: &std::collections::BTreeMap<String, String>,
 ) -> io::Result<Option<Vec<u16>>> {
@@ -282,6 +269,20 @@ struct LaunchSpec<'a> {
     mitigation_profile: MitigationProfile,
 }
 
+impl<'a> LaunchSpec<'a> {
+    fn from_process(spec: &'a ProcessSpec, mitigation_profile: MitigationProfile) -> Self {
+        Self {
+            executable: &spec.executable,
+            working_directory: &spec.working_directory,
+            stdout: &spec.stdout,
+            stderr: &spec.stderr,
+            limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
+            priority_class: None,
+            mitigation_profile,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum ToolPriority {
     Inherited,
@@ -289,7 +290,7 @@ pub(super) enum ToolPriority {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum MitigationProfile {
+pub(super) enum MitigationProfile {
     Tool,
     Headless,
     Inspection,
@@ -520,57 +521,13 @@ pub(super) struct NativeProcess {
 }
 
 impl NativeProcess {
-    pub(super) fn start(spec: &ProcessSpec, command: Vec<u16>) -> io::Result<Self> {
+    pub(super) fn start_with_profile(
+        spec: &ProcessSpec,
+        command: Vec<u16>,
+        profile: MitigationProfile,
+    ) -> io::Result<Self> {
         Self::launch(
-            &LaunchSpec {
-                executable: &spec.executable,
-                working_directory: &spec.working_directory,
-                stdout: &spec.stdout,
-                stderr: &spec.stderr,
-                limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
-                priority_class: None,
-                mitigation_profile: MitigationProfile::Headless,
-            },
-            command,
-            None,
-            None,
-            PipeMode::None,
-            None,
-            Vec::new(),
-        )
-    }
-
-    pub(super) fn start_inspection(spec: &ProcessSpec, command: Vec<u16>) -> io::Result<Self> {
-        Self::launch(
-            &LaunchSpec {
-                executable: &spec.executable,
-                working_directory: &spec.working_directory,
-                stdout: &spec.stdout,
-                stderr: &spec.stderr,
-                limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
-                priority_class: None,
-                mitigation_profile: MitigationProfile::Inspection,
-            },
-            command,
-            None,
-            None,
-            PipeMode::None,
-            None,
-            Vec::new(),
-        )
-    }
-
-    pub(super) fn start_graphics_probe(spec: &ProcessSpec, command: Vec<u16>) -> io::Result<Self> {
-        Self::launch(
-            &LaunchSpec {
-                executable: &spec.executable,
-                working_directory: &spec.working_directory,
-                stdout: &spec.stdout,
-                stderr: &spec.stderr,
-                limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
-                priority_class: None,
-                mitigation_profile: MitigationProfile::GraphicsProbe,
-            },
+            &LaunchSpec::from_process(spec, profile),
             command,
             None,
             None,
@@ -589,15 +546,7 @@ impl NativeProcess {
             containment::Environment::create(spec, policy, SandboxNetwork::HostLoopback)?;
         let environment = containment::child_environment(policy)?;
         Self::launch(
-            &LaunchSpec {
-                executable: &spec.executable,
-                working_directory: &spec.working_directory,
-                stdout: &spec.stdout,
-                stderr: &spec.stderr,
-                limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
-                priority_class: None,
-                mitigation_profile: MitigationProfile::Headless,
-            },
+            &LaunchSpec::from_process(spec, MitigationProfile::Headless),
             command,
             Some(&environment),
             Some(containment),
@@ -614,7 +563,15 @@ impl NativeProcess {
         network: SandboxNetwork,
     ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
         let environment = containment::child_environment(policy)?;
-        Self::start_sandboxed_piped_with_environment(spec, command, policy, network, &environment)
+        Self::start_sandboxed_piped_inner(
+            spec,
+            command,
+            policy,
+            network,
+            &environment,
+            false,
+            Vec::new(),
+        )
     }
 
     pub(super) fn start_sandboxed_piped_minimal(
@@ -623,12 +580,14 @@ impl NativeProcess {
         policy: &SandboxPolicy,
     ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
         let environment = containment::minimal_child_environment(policy)?;
-        Self::start_sandboxed_piped_with_environment(
+        Self::start_sandboxed_piped_inner(
             spec,
             command,
             policy,
             SandboxNetwork::Offline,
             &environment,
+            false,
+            Vec::new(),
         )
     }
 
@@ -658,61 +617,49 @@ impl NativeProcess {
             sections.push(section);
         }
         let environment = containment::minimal_child_environment(policy)?;
-        let containment = containment::Environment::create(spec, policy, SandboxNetwork::Offline)?;
-        let (child_input, parent_input) = anonymous_pipe(true)?;
-        let (parent_output, child_output) = anonymous_pipe(false)?;
-        let process = Self::launch(
-            &LaunchSpec {
-                executable: &spec.executable,
-                working_directory: &spec.working_directory,
-                stdout: &spec.stdout,
-                stderr: &spec.stderr,
-                limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
-                priority_class: None,
-                mitigation_profile: MitigationProfile::Headless,
-            },
+        let (process, input, output) = Self::start_sandboxed_piped_inner(
+            spec,
             command,
-            Some(&environment),
-            Some(containment),
-            PipeMode::BrokerStdio {
-                input: child_input,
-                output: child_output,
-            },
-            Some(policy.writable_directory.clone()),
+            policy,
+            SandboxNetwork::Offline,
+            &environment,
+            true,
             sections,
         )?;
-        Ok((process, parent_input.into(), parent_output.into(), grants))
+        Ok((process, input, output, grants))
     }
 
-    fn start_sandboxed_piped_with_environment(
+    fn start_sandboxed_piped_inner(
         spec: &ProcessSpec,
         command: Vec<u16>,
         policy: &SandboxPolicy,
         network: SandboxNetwork,
         environment: &[u16],
+        broker_stdio: bool,
+        sections: Vec<InheritableReadOnlySection>,
     ) -> io::Result<(Self, std::fs::File, std::fs::File)> {
         let containment = containment::Environment::create(spec, policy, network)?;
         let (child_input, parent_input) = anonymous_pipe(true)?;
         let (parent_output, child_output) = anonymous_pipe(false)?;
-        let process = Self::launch(
-            &LaunchSpec {
-                executable: &spec.executable,
-                working_directory: &spec.working_directory,
-                stdout: &spec.stdout,
-                stderr: &spec.stderr,
-                limits: Some((spec.memory_limit_bytes, spec.active_process_limit)),
-                priority_class: None,
-                mitigation_profile: MitigationProfile::Headless,
-            },
-            command,
-            Some(environment),
-            Some(containment),
+        let pipes = if broker_stdio {
+            PipeMode::BrokerStdio {
+                input: child_input,
+                output: child_output,
+            }
+        } else {
             PipeMode::BinaryStdio {
                 input: child_input,
                 output: child_output,
-            },
+            }
+        };
+        let process = Self::launch(
+            &LaunchSpec::from_process(spec, MitigationProfile::Headless),
+            command,
+            Some(environment),
+            Some(containment),
+            pipes,
             Some(policy.writable_directory.clone()),
-            Vec::new(),
+            sections,
         )?;
         Ok((process, parent_input.into(), parent_output.into()))
     }
@@ -1472,6 +1419,11 @@ pub(super) fn memory_status() -> io::Result<crate::MemoryStatus> {
     })
 }
 
+fn last_wsa_error() -> io::Error {
+    // SAFETY: Retrieve this thread's Winsock error immediately after a failing socket call.
+    io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+}
+
 pub(super) fn require_exclusive_address(socket: &impl AsSocket) -> io::Result<()> {
     let socket = socket.as_socket();
     let handle = usize::try_from(socket.as_raw_socket())
@@ -1491,8 +1443,7 @@ pub(super) fn require_exclusive_address(socket: &impl AsSocket) -> io::Result<()
         )
     };
     if result == SOCKET_ERROR {
-        // SAFETY: Retrieve this thread's Winsock error immediately after failure.
-        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        return Err(last_wsa_error());
     }
     Ok(())
 }
@@ -1524,8 +1475,7 @@ pub(super) fn bind_exclusive_loopback_listener(
         )
     };
     if raw == INVALID_SOCKET {
-        // SAFETY: Retrieve this thread's Winsock error immediately after failure.
-        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        return Err(last_wsa_error());
     }
     // SAFETY: A successful WSASocketW returned a uniquely owned fresh socket handle.
     let socket = unsafe {
@@ -1555,13 +1505,11 @@ pub(super) fn bind_exclusive_loopback_listener(
         )
     } == SOCKET_ERROR
     {
-        // SAFETY: Retrieve this thread's Winsock error immediately after failure.
-        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        return Err(last_wsa_error());
     }
     // SAFETY: Socket is bound and owned by `socket` during this synchronous call.
     if unsafe { listen(raw, backlog) } == SOCKET_ERROR {
-        // SAFETY: Retrieve this thread's Winsock error immediately after failure.
-        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        return Err(last_wsa_error());
     }
     Ok(std::net::TcpListener::from(socket))
 }
@@ -1848,8 +1796,12 @@ fn check(result: i32) -> io::Result<()> {
     }
 }
 
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(std::iter::once(0)).collect()
+pub(super) fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
+    value
+        .as_ref()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 const fn win_size<T>() -> u32 {
