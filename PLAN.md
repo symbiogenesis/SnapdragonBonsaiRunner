@@ -468,7 +468,14 @@ adoption decisions without displacing native daily-use acceptance.
   mixed-phase handoff (`install_default_hexagon_executor` keeping resident
   Hexagon decode active alongside `--cpu-prefill-tokens` when
   `cpu_speculation` is absent and `supports_tile_tokens() == false`), all
-  pinned in Prism `0.1.32` (pending Runner hosted CI and complete X1/X2 device qualification). Verify selected-cache
+  pinned in Prism `0.1.32` (pending Runner hosted CI and complete X1/X2 device
+  qualification). Post-lock local Prism commit `7186e81` and Runner commit
+  `a57a3afd` additionally enabled `wy-f32` (`:gdn-wy-f32-v1`) on rotated-KV
+  profiles (`Rotated4`, `Rotated4FittedValues`, `Rotated4Keys3Values`) and
+  added NEON-vectorized 8-row triangular updates in `prefill_gdn.rs`, while
+  Prism commits `14ff98e`, `ce0a00c`, and `43809de` added full-K spill-free
+  `PQ2` (`2..=7` / tail), `PTQ1`, and `Q8_0` 8-row multi-token kernels in
+  `bonsai-neon-dot` / `src/kernels/`. Verify selected-cache
   service consumers and independent packed-KV head workers: scratch/admission,
   complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
@@ -739,7 +746,13 @@ evaluation controls without making the pruned candidate a prerequisite for W8.
   geometry only. Two groups at all 64 sites cannot meet W8.4's RAM target even
   before adding compensation. Qualify selected sites independently and their
   changed-prefix composition. Measure real process resources; a bypass retaining
-  tensors saves no RAM.
+  tensors saves no RAM. (Source support for opt-in FFN group-omission compaction
+  (`CompactedFfnPlan`, `Qwen35::with_compacted_ffn`, `:w8-compacted-ffn-v1:<sha256>`,
+  surviving `RankOneAdapter`/`MultiRankAdapter::compact_ffn_down_layers`,
+  per-layer sign separation, and `FfnCompensation` decode/tiled wiring) landed
+  locally in Prism commit `cca199b` with offline `0-ULP` parity against
+  `FfnProbe`; real-model qualification, `ffn-plan` sizing, and process-RAM
+  measurements remain open.)
 - [ ] **W8.3 — Evaluate learned prompt retention only for a long-prefill hotspot.**
   Use the [TokenGate hybrid reference](docs/research-register.md#small-edits-around-cheaper-execution)
   to scope retained positions, gate bias, pre-/post-gate GDN history, attention
@@ -1373,7 +1386,15 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   `10.21 tok/s` (`5.01 s`). Moving norms, RoPE, attention/GDN, and projections into
   whole-layer / whole-graph command-buffer batching (plus hosted CI, physical X1-85
   verification, lock promotion, LoRA/full-state coverage, and TDR qualification) is required
-  before selecting Adreno Vulkan (`backend_ready: false`).
+  before selecting Adreno Vulkan (`backend_ready: false`). Source support for
+  batched whole-layer / chunked multi-layer GPU execution landed locally in Prism
+  commits `420d386`, `1ce84f4`, and `f817e08` (`CommandBatchRecorder`, raised
+  submit descriptor pool capacities, SPIR-V 1.6 layer shaders including
+  `gdn_step_f32`/`conv1d_silu_f32`/`rms_norm_f32`/`rope_f32`/`l2_norm_f32`,
+  `TdrChunkPolicy`, and `VulkanBatchedGraphExecutor`), and Runner wired opt-in
+  release-gated `--placement vulkan|composite` routing in commit `a57a3afd`
+  (`VULKAN_PLACEMENT_RELEASE = None`); physical X2/X1-85 hardware parity, TDR
+  qualification, and release lock promotion remain open.
 - [ ] Qualify the opt-in native ARM64 OpenCL original-PQ2/Q8_K projection
   pilot under unchanged mitigations, including owning hosted analysis/linking,
   exact input/kernel/device identities, every-block scalar replay and terminal
@@ -1542,9 +1563,12 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   `OwnedProcess::start_sandboxed_broker_pipe_with_sections` /
   `PipeBackend::connect_stdio_with_sections`), `bonsai-windows-credentials`
   parallel mapped-chunk digest helpers, `bonsai-artifacts` chunked verification,
-  and `"SB2HQ2C1"` `NativeQ2ArenaCache`; hosted CI, full-byte launch hashing
-  verification across all cold/warm paths, and X1 Oryon device qualification
-  remain open under [mapping and startup](docs/swift-memory.md#mapping-and-startup).
+  and `"SB2HQ2C1"` `NativeQ2ArenaCache`; post-lock Runner commit `4d24ecff`
+  wired optional schema-compatible parallel chunked SHA-256 verification and
+  `bonsai-tools chunk-manifest` without changing locked model digests. Hosted
+  CI, full-byte launch hashing verification across all cold/warm paths, and X1
+  Oryon device qualification remain open under
+  [mapping and startup](docs/swift-memory.md#mapping-and-startup).
 - [ ] **#16 — Aligned loading and upload staging reuse.** Process largest tensors
   first, reuse bounded aligned staging and shrink excess capacity once accelerator
   upload or cold-load staging demonstrates a measured bottleneck under the
@@ -1594,9 +1618,18 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 - [ ] **#24 — Token-count projection crossover tuning.** Benchmark separate 1-token
   decode, short verification block (`2`–`9`) and larger prefill tile crossovers with
   odd-tail retention, keeping any rounding change behind an explicit profile gate.
+  (Source kernels for full-K spill-free `PQ2` `2..=7`/tails, `PTQ1` decode/tile,
+  and `Q8_0` 8-row tiles landed locally in Prism `14ff98e`, `ce0a00c`, `43809de`;
+  device crossover benchmarking remains open.)
 - [ ] **#25 — Remaining shared activation-preparation consumers.** Extend shared
   transform-and-quantize preparation to remaining recurrent sibling projections
-  sharing identical input, basis, width and quantizer.
+  sharing identical input, basis, width and quantizer. (Recurrent sibling audit on
+  `..\prism-inference` `a308b7c` confirmed decode `recurrent_attention` /
+  `recurrent_attention_state_only` already group `[&layer.qkv, &layer.gate,
+  &layer.beta, &layer.alpha]` via `Transforms::project_group_into_with_executor`
+  and tiled prefill already shares `TileReuse` across `[&layer.qkv, &layer.gate]`
+  and `[&layer.beta, &layer.alpha]`; device/profile audit of any new consumers
+  remains open.)
 - [ ] **#27 — Fused GDN `conv1d + SiLU + ClampedL2` pass.** Evaluate fusing causal
   3-tap convolution, `SiLU` and `ClampedL2` Q/K normalization alongside joined BF16
   alpha/beta to cut intermediate traversals while preserving exact `ClampedL2`
@@ -1645,7 +1678,11 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   complete serving latency vs CPU, and sustained TDR/pressure gates remain open.
 - [ ] **#41 — Hexagon `PQ2`/`PTQ1` tile packing, VTCM sizing and IOVA placement.**
   Tailor host repacking and mapping placement to actual queried VTCM capacity and
-  Swift's `PQ2`/`PTQ1` layouts under [Hexagon](docs/hexagon.md).
+  Swift's `PQ2`/`PTQ1` layouts under [Hexagon](docs/hexagon.md). (Source
+  support for lossless `PTQ1_0` transcoding and `#41` VTCM-aware dynamic
+  multi-arena placement landed locally in Prism `bonsai-hexagon-runtime` commits
+  `a2551de` and `359f88a`; physical NPU device qualification and release lock
+  promotion remain open.)
 - [ ] **#42 — Pipelined DMA, HVX preparation and HMX chunkwise GDN.** Gate under an
   explicit separate numerical profile (HMX FP16 intermediates do not preserve the
   FP32 GDN contract) with a small-token CPU/HVX fallback.
