@@ -47,22 +47,20 @@ impl BufferPool {
         Arc::new(Self(Mutex::new(Vec::with_capacity(FREE_LIST_CAPACITY))))
     }
 
+    fn take_raw(&self) -> Vec<u8> {
+        lock_unpoisoned(&self.0)
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_PAYLOAD))
+    }
+
     fn take_zeroed(&self, len: usize) -> Vec<u8> {
-        let mut buf = {
-            let mut list = lock_unpoisoned(&self.0);
-            list.pop()
-                .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_PAYLOAD))
-        };
+        let mut buf = self.take_raw();
         buf.resize(len, 0);
         buf
     }
 
     fn take_from_slice(&self, bytes: &[u8]) -> Vec<u8> {
-        let mut buf = {
-            let mut list = lock_unpoisoned(&self.0);
-            list.pop()
-                .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_PAYLOAD))
-        };
+        let mut buf = self.take_raw();
         buf.clear();
         buf.extend_from_slice(bytes);
         buf
@@ -217,6 +215,28 @@ impl TxState {
         }
     }
 
+    fn push_frame(&mut self, stream_id: u32, kind: u8, payload: Vec<u8>) -> u64 {
+        self.enqueued_seq = self.enqueued_seq.saturating_add(1);
+        if kind == KIND_DATA {
+            self.queued_data_frames = self.queued_data_frames.saturating_add(1);
+        }
+        self.queue.push_back(OutgoingFrame {
+            stream_id,
+            kind,
+            payload,
+        });
+        self.enqueued_seq
+    }
+
+    fn fail_and_drain(&mut self, pool: &BufferPool) {
+        self.failed = true;
+        for frame in self.queue.drain(..) {
+            pool.recycle(frame.payload);
+        }
+        self.queued_data_frames = 0;
+        self.wake_io();
+    }
+
     fn is_reset(&self, stream_id: u32) -> bool {
         self.reset_streams.contains(&stream_id)
     }
@@ -226,21 +246,11 @@ impl TxState {
     }
 
     fn record_dropped_data(&mut self, stream_id: u32) {
-        if !self.has_dropped_data(stream_id) {
-            if self.dropped_reset_data.len() >= MAX_TRACKED_RESETS {
-                let _ = self.dropped_reset_data.pop_front();
-            }
-            self.dropped_reset_data.push_back(stream_id);
-        }
+        push_bounded(&mut self.dropped_reset_data, stream_id);
     }
 
     fn record_reset(&mut self, stream_id: u32, pool: &BufferPool) {
-        if !self.is_reset(stream_id) {
-            if self.reset_streams.len() >= MAX_TRACKED_RESETS {
-                let _ = self.reset_streams.pop_front();
-            }
-            self.reset_streams.push_back(stream_id);
-        }
+        push_bounded(&mut self.reset_streams, stream_id);
         let mut retained = VecDeque::with_capacity(self.queue.len());
         let mut removed_data = 0_usize;
         for frame in self.queue.drain(..) {
@@ -267,6 +277,15 @@ impl TxState {
         if let Some(waker) = self.flush_waker.take() {
             waker.wake();
         }
+    }
+}
+
+fn push_bounded(queue: &mut VecDeque<u32>, stream_id: u32) {
+    if !queue.contains(&stream_id) {
+        if queue.len() >= MAX_TRACKED_RESETS {
+            let _ = queue.pop_front();
+        }
+        queue.push_back(stream_id);
     }
 }
 
@@ -310,6 +329,18 @@ impl RxState {
             active: None,
             closed: false,
             failed: false,
+        }
+    }
+
+    fn take_if_active(&mut self, stream_id: u32) -> Option<ActiveRx> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(active_id, _, _)| *active_id == stream_id)
+        {
+            self.active.take()
+        } else {
+            None
         }
     }
 }
@@ -500,22 +531,10 @@ impl BackendConnector for PipeBackend {
             let mut state = lock_unpoisoned(&self.tx.state);
             if state.closed || state.failed {
                 drop(state);
-                let mut rx = lock_unpoisoned(&self.rx_state);
-                if rx
-                    .active
-                    .as_ref()
-                    .is_some_and(|(active_id, _, _)| *active_id == stream_id)
-                {
-                    rx.active = None;
-                }
+                let _ = lock_unpoisoned(&self.rx_state).take_if_active(stream_id);
                 return Err(BackendError::Io);
             }
-            state.enqueued_seq = state.enqueued_seq.saturating_add(1);
-            state.queue.push_back(OutgoingFrame {
-                stream_id,
-                kind: KIND_OPEN,
-                payload: Vec::new(),
-            });
+            state.push_frame(stream_id, KIND_OPEN, Vec::new());
             drop(state);
             self.tx.writer_ready.notify_one();
         }
@@ -554,16 +573,7 @@ pub struct PipeStream {
 
 impl Drop for PipeStream {
     fn drop(&mut self) {
-        {
-            let mut rx = lock_unpoisoned(&self.rx_state);
-            if rx
-                .active
-                .as_ref()
-                .is_some_and(|(active_id, _, _)| *active_id == self.stream_id)
-            {
-                rx.active = None;
-            }
-        }
+        let _ = lock_unpoisoned(&self.rx_state).take_if_active(self.stream_id);
         let leftover = std::mem::take(&mut self.buffered);
         self.pool.recycle(leftover);
         self.rx.close();
@@ -581,12 +591,7 @@ impl Drop for PipeStream {
                     state.record_reset(self.stream_id, &self.pool);
                     KIND_RESET
                 };
-                state.enqueued_seq = state.enqueued_seq.saturating_add(1);
-                state.queue.push_back(OutgoingFrame {
-                    stream_id: self.stream_id,
-                    kind,
-                    payload: Vec::new(),
-                });
+                state.push_frame(self.stream_id, kind, Vec::new());
                 drop(state);
                 self.tx.writer_ready.notify_one();
             }
@@ -665,25 +670,8 @@ impl AsyncWrite for PipeStream {
                 return Poll::Pending;
             }
             let count = buf.len().min(MAX_FRAME_PAYLOAD);
-            drop(state);
             let payload = self.pool.take_from_slice(&buf[..count]);
-            let mut state = lock_unpoisoned(&self.tx.state);
-            if state.closed || state.failed || state.is_reset(self.stream_id) {
-                drop(state);
-                self.pool.recycle(payload);
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "broker-pipe stream closed",
-                )));
-            }
-            state.enqueued_seq = state.enqueued_seq.saturating_add(1);
-            let seq = state.enqueued_seq;
-            state.queued_data_frames = state.queued_data_frames.saturating_add(1);
-            state.queue.push_back(OutgoingFrame {
-                stream_id: self.stream_id,
-                kind: KIND_DATA,
-                payload,
-            });
+            let seq = state.push_frame(self.stream_id, KIND_DATA, payload);
             drop(state);
             self.tx.writer_ready.notify_one();
             (count, seq)
@@ -734,13 +722,7 @@ impl AsyncWrite for PipeStream {
                 self.eof_sent = true;
                 return self.poll_flush(cx);
             }
-            state.enqueued_seq = state.enqueued_seq.saturating_add(1);
-            let seq = state.enqueued_seq;
-            state.queue.push_back(OutgoingFrame {
-                stream_id: self.stream_id,
-                kind: KIND_EOF,
-                payload: Vec::new(),
-            });
+            let seq = state.push_frame(self.stream_id, KIND_EOF, Vec::new());
             drop(state);
             self.pending_eof_seq = seq;
             self.eof_sent = true;
@@ -791,6 +773,23 @@ fn read_header<R: Read>(reader: &mut R) -> io::Result<HeaderRead> {
     Ok(HeaderRead::Frame(header))
 }
 
+fn write_raw_frame(
+    writer: &mut impl Write,
+    stream_id: u32,
+    kind: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broker-pipe frame exceeds u32 bound",
+        )
+    })?;
+    writer
+        .write_all(&encode_header(stream_id, kind, payload_len))
+        .and_then(|()| writer.write_all(payload))
+}
+
 fn fail_transport(
     tx: &Arc<TxShared>,
     rx_state: &Arc<Mutex<RxState>>,
@@ -808,12 +807,7 @@ fn fail_transport(
         }
     }
     let mut state = lock_unpoisoned(&tx.state);
-    state.failed = true;
-    for frame in state.queue.drain(..) {
-        pool.recycle(frame.payload);
-    }
-    state.queued_data_frames = 0;
-    state.wake_io();
+    state.fail_and_drain(pool);
     drop(state);
     tx.writer_ready.notify_one();
     let _ = ready_tx.send(ReadyState::Failed);
@@ -873,12 +867,8 @@ fn handle_reader_frame<R: Read>(
                     "invalid eof frame",
                 ));
             }
-            let mut rx = lock_unpoisoned(rx_state);
-            if rx
-                .active
-                .as_ref()
-                .is_some_and(|(active_id, _, _)| *active_id == stream_id)
-                && let Some((_, sender, eof_received)) = rx.active.take()
+            if let Some((_, sender, eof_received)) =
+                lock_unpoisoned(rx_state).take_if_active(stream_id)
             {
                 eof_received.store(true, Ordering::Release);
                 drop(sender);
@@ -896,13 +886,7 @@ fn handle_reader_frame<R: Read>(
                 state.record_reset(stream_id, pool);
                 state.wake_io();
             }
-            let mut rx = lock_unpoisoned(rx_state);
-            if rx
-                .active
-                .as_ref()
-                .is_some_and(|(active_id, _, _)| *active_id == stream_id)
-                && let Some((_, sender, _)) = rx.active.take()
-            {
+            if let Some((_, sender, _)) = lock_unpoisoned(rx_state).take_if_active(stream_id) {
                 let _ = sender.try_send(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "backend reset broker-pipe stream",
@@ -946,13 +930,7 @@ fn run_reader<R: Read>(
                 if *ready_tx.borrow() == ReadyState::Pending {
                     let _ = ready_tx.send(ReadyState::Failed);
                 }
-                let mut state = lock_unpoisoned(&tx.state);
-                state.failed = true;
-                for frame in state.queue.drain(..) {
-                    pool.recycle(frame.payload);
-                }
-                state.queued_data_frames = 0;
-                state.wake_io();
+                lock_unpoisoned(&tx.state).fail_and_drain(pool);
                 break;
             }
             Ok(HeaderRead::Frame(header)) => header,
@@ -998,13 +976,9 @@ fn run_writer<W: Write>(
         if !should_emit {
             return;
         }
-        let header = encode_header(0, KIND_VERIFIED_SECTION, 52);
         let mut emit_result = Ok(());
         for payload in pending_sections {
-            if let Err(error) = writer
-                .write_all(&header)
-                .and_then(|()| writer.write_all(&payload))
-            {
+            if let Err(error) = write_raw_frame(&mut writer, 0, KIND_VERIFIED_SECTION, &payload) {
                 emit_result = Err(error);
                 break;
             }
@@ -1059,18 +1033,8 @@ fn run_writer<W: Write>(
 
         let mut io_result = Ok(());
         for frame in batch.drain(..) {
-            let write_result = match u32::try_from(frame.payload.len()) {
-                Ok(payload_len) => {
-                    let header = encode_header(frame.stream_id, frame.kind, payload_len);
-                    writer
-                        .write_all(&header)
-                        .and_then(|()| writer.write_all(&frame.payload))
-                }
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "broker-pipe frame exceeds u32 bound",
-                )),
-            };
+            let write_result =
+                write_raw_frame(&mut writer, frame.stream_id, frame.kind, &frame.payload);
             pool.recycle(frame.payload);
             if let Err(error) = write_result {
                 io_result = Err(error);
@@ -1179,9 +1143,7 @@ mod tests {
         kind: u8,
         payload: &[u8],
     ) -> io::Result<()> {
-        let len = u32::try_from(payload.len()).map_err(io::Error::other)?;
-        writer.write_all(&encode_header(stream_id, kind, len))?;
-        writer.write_all(payload)?;
+        write_raw_frame(writer, stream_id, kind, payload)?;
         writer.flush()
     }
 
@@ -1195,24 +1157,45 @@ mod tests {
         Ok((stream_id, kind, payload))
     }
 
+    fn run_async(future: impl Future<Output = io::Result<()>>) -> io::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(future)
+    }
+
+    fn complete_handshake(p_to_c_r: &mut impl Read, c_to_p_w: &mut impl Write) -> io::Result<()> {
+        let mut handshake = [0_u8; 8 + KEY_HEX_BYTES];
+        p_to_c_r.read_exact(&mut handshake)?;
+        assert_eq!(&handshake[..8], HANDSHAKE_REQUEST_MAGIC);
+        assert_eq!(&handshake[8..], VALID_KEY.as_bytes());
+        c_to_p_w.write_all(HANDSHAKE_RESPONSE_MAGIC)?;
+        c_to_p_w.flush()
+    }
+
+    async fn ready_memory_backend() -> io::Result<(PipeBackend, MemoryStream, MemoryStream)> {
+        let (p_to_c_w, mut p_to_c_r) = memory_channel();
+        let (mut c_to_p_w, c_to_p_r) = memory_channel();
+        let backend = PipeBackend::from_io(c_to_p_r, p_to_c_w, VALID_KEY)
+            .map_err(|_| io::Error::other("PipeBackend::from_io failed"))?;
+        complete_handshake(&mut p_to_c_r, &mut c_to_p_w)?;
+        write_frame(&mut c_to_p_w, 0, KIND_SERVER_READY, &[])?;
+        backend
+            .wait_server_ready(Instant::now() + Duration::from_secs(2))
+            .await
+            .map_err(|_| io::Error::other("wait_server_ready failed"))?;
+        Ok((backend, p_to_c_r, c_to_p_w))
+    }
+
     #[test]
     fn handshake_readiness_large_exchanges_and_drop_reset_work_end_to_end() -> io::Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
+        run_async(async {
             let (p_to_c_w, mut p_to_c_r) = memory_channel();
             let (mut c_to_p_w, c_to_p_r) = memory_channel();
 
             let backend = PipeBackend::from_io(c_to_p_r, p_to_c_w, VALID_KEY)
                 .map_err(|_| io::Error::other("PipeBackend::from_io failed"))?;
-
-            let mut handshake = [0_u8; 8 + KEY_HEX_BYTES];
-            p_to_c_r.read_exact(&mut handshake)?;
-            assert_eq!(&handshake[..8], HANDSHAKE_REQUEST_MAGIC);
-            assert_eq!(&handshake[8..], VALID_KEY.as_bytes());
-            c_to_p_w.write_all(HANDSHAKE_RESPONSE_MAGIC)?;
-            c_to_p_w.flush()?;
+            complete_handshake(&mut p_to_c_r, &mut c_to_p_w)?;
 
             // Calling wait_server_ready concurrently before KIND_SERVER_READY arrives must wait and succeed.
             let server_ready_sender = std::thread::spawn(move || -> io::Result<MemoryStream> {
@@ -1328,32 +1311,15 @@ mod tests {
 
     #[test]
     fn pipe_transport_recycles_buffers_across_frames_and_resets() -> io::Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
-            let (p_to_c_w, mut p_to_c_r) = memory_channel();
-            let (mut c_to_p_w, c_to_p_r) = memory_channel();
-
-            let backend = PipeBackend::from_io(c_to_p_r, p_to_c_w, VALID_KEY)
-                .map_err(|_| io::Error::other("PipeBackend::from_io failed"))?;
-
-            let mut handshake = [0_u8; 8 + KEY_HEX_BYTES];
-            p_to_c_r.read_exact(&mut handshake)?;
-            c_to_p_w.write_all(HANDSHAKE_RESPONSE_MAGIC)?;
-            c_to_p_w.flush()?;
-            write_frame(&mut c_to_p_w, 0, KIND_SERVER_READY, &[])?;
-            backend
-                .wait_server_ready(Instant::now() + Duration::from_secs(2))
-                .await
-                .map_err(|_| io::Error::other("wait_server_ready failed"))?;
+        run_async(async {
+            let (backend, mut p_to_c_r, mut c_to_p_w) = ready_memory_backend().await?;
 
             // Stream 1 writes and reads multiple frames, then consumes until EOF.
             let mut s1 = backend
                 .connect(Instant::now() + Duration::from_secs(1))
                 .await
                 .map_err(|_| io::Error::other("connect 1 failed"))?;
-            let outbound = vec![0xabu8; MAX_FRAME_PAYLOAD + 128];
+            let outbound = vec![0xab_u8; MAX_FRAME_PAYLOAD + 128];
             s1.write_all(&outbound).await?;
             s1.flush().await?;
             assert_eq!(read_frame(&mut p_to_c_r)?, (1, KIND_OPEN, Vec::new()));
@@ -1479,13 +1445,23 @@ mod tests {
         }
     }
 
+    fn assert_verified_section(
+        reader: &mut impl Read,
+        expected: &VerifiedSectionAttestation,
+    ) -> io::Result<()> {
+        let (stream_id, kind, payload) = read_frame(reader)?;
+        assert_eq!(stream_id, 0);
+        assert_eq!(kind, KIND_VERIFIED_SECTION);
+        let expected_payload = encode_verified_section_payload(expected)
+            .map_err(|_| io::Error::other("encode_verified_section_payload failed"))?;
+        assert_eq!(payload, expected_payload.as_slice());
+        Ok(())
+    }
+
     #[test]
     fn from_io_with_sections_emits_frames_after_sb2okay1_and_before_server_ready() -> io::Result<()>
     {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
+        run_async(async {
             let sections = [
                 sample_attestation(0, 0x110, 8192),
                 sample_attestation(3, 0x220, 16384),
@@ -1510,12 +1486,7 @@ mod tests {
             c_to_p_w.flush()?;
 
             for expected in &sections {
-                let (stream_id, kind, payload) = read_frame(&mut p_to_c_r)?;
-                assert_eq!(stream_id, 0);
-                assert_eq!(kind, KIND_VERIFIED_SECTION);
-                let expected_payload = encode_verified_section_payload(expected)
-                    .map_err(|_| io::Error::other("encode_verified_section_payload failed"))?;
-                assert_eq!(payload, expected_payload.as_slice());
+                assert_verified_section(&mut p_to_c_r, expected)?;
             }
 
             // wait_server_ready stays pending until KIND_SERVER_READY is sent after attestation.
@@ -1559,10 +1530,7 @@ mod tests {
 
     #[test]
     fn from_io_with_sections_suppresses_attestations_when_ack_fails() -> io::Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
+        run_async(async {
             let sections = [sample_attestation(0, 0x330, 4096)];
             let (p_to_c_w, mut p_to_c_r) = memory_channel();
             let (mut c_to_p_w, c_to_p_r) = memory_channel();
@@ -1593,10 +1561,7 @@ mod tests {
     fn connect_stdio_with_sections_exchanges_attestations_over_os_pipes() -> io::Result<()> {
         use std::os::windows::io::OwnedHandle;
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
+        run_async(async {
             let (mut p_to_c_r, p_to_c_w) = io::pipe()?;
             let (c_to_p_r, mut c_to_p_w) = io::pipe()?;
             let sections = [sample_attestation(0, 0x440, 12_288)];
@@ -1609,19 +1574,8 @@ mod tests {
             )
             .map_err(|_| io::Error::other("connect_stdio_with_sections failed"))?;
 
-            let mut handshake = [0_u8; 8 + KEY_HEX_BYTES];
-            p_to_c_r.read_exact(&mut handshake)?;
-            assert_eq!(&handshake[..8], HANDSHAKE_REQUEST_MAGIC);
-            assert_eq!(&handshake[8..], VALID_KEY.as_bytes());
-            c_to_p_w.write_all(HANDSHAKE_RESPONSE_MAGIC)?;
-            c_to_p_w.flush()?;
-
-            let (stream_id, kind, payload) = read_frame(&mut p_to_c_r)?;
-            assert_eq!(stream_id, 0);
-            assert_eq!(kind, KIND_VERIFIED_SECTION);
-            let expected = encode_verified_section_payload(&sections[0])
-                .map_err(|_| io::Error::other("encode_verified_section_payload failed"))?;
-            assert_eq!(payload, expected.as_slice());
+            complete_handshake(&mut p_to_c_r, &mut c_to_p_w)?;
+            assert_verified_section(&mut p_to_c_r, &sections[0])?;
 
             write_frame(&mut c_to_p_w, 0, KIND_SERVER_READY, &[])?;
             backend
