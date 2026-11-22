@@ -80,6 +80,26 @@ pub struct PrivateDirectory {
     _reader: File,
 }
 
+fn create_private_directory(
+    parent: &Path,
+    prefix: &str,
+    parent_error: &'static str,
+) -> io::Result<(PathBuf, File)> {
+    validate_external_path(parent)?;
+    if !fs::metadata(parent)?.is_dir() {
+        return Err(invalid(parent_error));
+    }
+    let mut nonce = Secret::<16>::new();
+    native::random(&mut *nonce.0)?;
+    let path = parent.join(format!("SwiftBonsai-{prefix}-{}", hex(&*nonce.0)));
+    let security = native::Security::new(true)?;
+    native::create_directory(&path, &security)?;
+    validate_external_path(&path)?;
+    let reader = native::open_reader(&path, true)?;
+    security.verify(&reader)?;
+    Ok((path, reader))
+}
+
 impl PrivateDirectory {
     /// Creates new private storage without creating or exposing credentials.
     ///
@@ -87,20 +107,11 @@ impl PrivateDirectory {
     /// Rejects unsafe/nonexisting parents, creation collisions, unavailable
     /// randomness, unexpected ownership/DACLs and failed native/file operations.
     pub fn create(parent: &Path) -> io::Result<Self> {
-        validate_external_path(parent)?;
-        if !fs::metadata(parent)?.is_dir() {
-            return Err(invalid(
-                "Private storage parent must be an existing directory.",
-            ));
-        }
-        let mut nonce = Secret::<16>::new();
-        native::random(&mut *nonce.0)?;
-        let path = parent.join(format!("SwiftBonsai-Private-{}", hex(&*nonce.0)));
-        let security = native::Security::new(true)?;
-        native::create_directory(&path, &security)?;
-        validate_external_path(&path)?;
-        let reader = native::open_reader(&path, true)?;
-        security.verify(&reader)?;
+        let (path, reader) = create_private_directory(
+            parent,
+            "Private",
+            "Private storage parent must be an existing directory.",
+        )?;
         Ok(Self {
             path,
             _reader: reader,
@@ -227,18 +238,11 @@ impl PrivateCredentials {
     }
 
     fn create_inner(parent: &Path, create_backend_file: bool) -> io::Result<Self> {
-        validate_external_path(parent)?;
-        if !fs::metadata(parent)?.is_dir() {
-            return Err(invalid("Credential parent must be an existing directory."));
-        }
-        let mut nonce = Secret::<16>::new();
-        native::random(&mut *nonce.0)?;
-        let directory = parent.join(format!("SwiftBonsai-Keys-{}", hex(&*nonce.0)));
-        let security = native::Security::new(true)?;
-        native::create_directory(&directory, &security)?;
-        validate_external_path(&directory)?;
-        let directory_handle = native::open_reader(&directory, true)?;
-        security.verify(&directory_handle)?;
+        let (directory, directory_handle) = create_private_directory(
+            parent,
+            "Keys",
+            "Credential parent must be an existing directory.",
+        )?;
         let file_security = native::Security::new(false)?;
         let frontend_path = directory.join("frontend.key");
         let backend_path = directory.join("backend.key");
@@ -249,7 +253,7 @@ impl PrivateCredentials {
         } else {
             (random_hex_secret()?, None)
         };
-        if constant_time_eq_64(&frontend_key.0, &backend_key.0) {
+        if hash::constant_time_diff(&frontend_key.0, &backend_key.0) == 0 {
             return Err(io::Error::other(
                 "The random source returned duplicate credentials.",
             ));
@@ -433,20 +437,12 @@ fn create_key(path: &Path, security: &native::Security) -> io::Result<(Secret<64
     let mut actual = Secret::<64>::new();
     reader.read_exact(&mut *actual.0)?;
     let mut extra = Secret::<1>::new();
-    if !constant_time_eq_64(&actual.0, &secret.0) || reader.read(&mut *extra.0)? != 0 {
+    if hash::constant_time_diff(&actual.0, &secret.0) != 0 || reader.read(&mut *extra.0)? != 0 {
         return Err(io::Error::other(
             "Credential content changed before publication.",
         ));
     }
     Ok((secret, reader))
-}
-
-fn constant_time_eq_64(lhs: &[u8; 64], rhs: &[u8; 64]) -> bool {
-    let mut diff = 0_u8;
-    for (&a, &b) in lhs.iter().zip(rhs.iter()) {
-        diff |= std::hint::black_box(a ^ b);
-    }
-    diff == 0
 }
 
 fn hex(bytes: &[u8]) -> String {

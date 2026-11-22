@@ -4,12 +4,11 @@ use std::{
     ffi::c_void,
     fs::File,
     io,
-    os::windows::io::AsRawHandle,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY,
@@ -27,15 +26,6 @@ pub const MAX_PARALLEL_HASH_WORKERS: usize = 16;
 const MAPPED_HASH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAPPED_PREFETCH_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
-struct MappingHandle(HANDLE);
-
-impl Drop for MappingHandle {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` was returned non-null by `CreateFileMappingW` and outlives `_view`.
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
 struct MappedView(NonNull<u8>);
 
 impl Drop for MappedView {
@@ -51,7 +41,7 @@ impl Drop for MappedView {
 struct ReadOnlyMapping {
     // Field drop order matters: unmap view before closing the section handle.
     view: MappedView,
-    _mapping: MappingHandle,
+    _mapping: OwnedHandle,
     len: usize,
 }
 
@@ -90,9 +80,10 @@ impl ReadOnlyMapping {
         if handle.is_null() {
             return None;
         }
-        let mapping = MappingHandle(handle);
-        // SAFETY: `mapping.0` is a valid read-only section covering `len` bytes at offset zero.
-        let view_addr = unsafe { MapViewOfFile(mapping.0, FILE_MAP_READ, 0, 0, len) };
+        // SAFETY: `handle` is non-null and owned by `CreateFileMappingW`.
+        let mapping = unsafe { OwnedHandle::from_raw_handle(handle) };
+        // SAFETY: `mapping` is a valid read-only section covering `len` bytes at offset zero.
+        let view_addr = unsafe { MapViewOfFile(mapping.as_raw_handle(), FILE_MAP_READ, 0, 0, len) };
         let base = NonNull::new(view_addr.Value.cast::<u8>())?;
         Some(Self {
             view: MappedView(base),
@@ -121,6 +112,23 @@ fn prefetch_window(window: &[u8]) {
     let _ = unsafe { PrefetchVirtualMemory(process, 1, &raw mut entry, 0) };
 }
 
+fn hash_mapped_windows<E>(
+    bytes: &[u8],
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+    mut map_io_error: impl FnMut(io::Error) -> E,
+) -> Result<[u8; 32], E> {
+    let mut hasher = Sha256::new().map_err(&mut map_io_error)?;
+    for window in bytes.chunks(MAPPED_PREFETCH_WINDOW_BYTES) {
+        checkpoint()?;
+        prefetch_window(window);
+        for chunk in window.chunks(MAPPED_HASH_CHUNK_BYTES) {
+            checkpoint()?;
+            hasher.update(chunk).map_err(&mut map_io_error)?;
+        }
+    }
+    hasher.finish().map_err(map_io_error)
+}
+
 /// Hash a read-locked regular file of `expected_bytes` via a read-only section
 /// view, `PrefetchVirtualMemory`, and `4 MiB` chunked CNG updates, invoking
 /// `checkpoint` before mapping and before each prefetch/update step.
@@ -142,16 +150,7 @@ pub fn try_hash_locked_file_mapped<E>(
     let Some(mapping) = ReadOnlyMapping::open(file, expected_bytes) else {
         return Ok(None);
     };
-    let mut hasher = Sha256::new().map_err(&mut map_io_error)?;
-    for window in mapping.as_bytes().chunks(MAPPED_PREFETCH_WINDOW_BYTES) {
-        checkpoint()?;
-        prefetch_window(window);
-        for chunk in window.chunks(MAPPED_HASH_CHUNK_BYTES) {
-            checkpoint()?;
-            hasher.update(chunk).map_err(&mut map_io_error)?;
-        }
-    }
-    hasher.finish().map(Some).map_err(map_io_error)
+    hash_mapped_windows(mapping.as_bytes(), checkpoint, &mut map_io_error).map(Some)
 }
 
 enum WorkerError {
@@ -180,7 +179,7 @@ fn cancelled_error() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "Chunked hashing was cancelled.")
 }
 
-fn constant_time_diff_32(lhs: &[u8; 32], rhs: &[u8; 32]) -> u8 {
+pub(crate) fn constant_time_diff<const N: usize>(lhs: &[u8; N], rhs: &[u8; N]) -> u8 {
     let mut diff = 0_u8;
     for (&a, &b) in lhs.iter().zip(rhs.iter()) {
         diff |= std::hint::black_box(a ^ b);
@@ -193,7 +192,7 @@ fn hash_mapped_chunk(
     should_cancel: &(impl Fn() -> bool + Sync),
     peer_error: &AtomicBool,
 ) -> Result<[u8; 32], WorkerError> {
-    let check_abort = || {
+    let mut check_abort = || {
         if should_cancel() {
             Err(WorkerError::Cancelled)
         } else if peer_error.load(Ordering::Acquire) {
@@ -208,16 +207,7 @@ fn hash_mapped_chunk(
         check_abort()?;
         return Sha256::digest_bytes(chunk).map_err(WorkerError::Io);
     }
-    let mut hasher = Sha256::new().map_err(WorkerError::Io)?;
-    for window in chunk.chunks(MAPPED_PREFETCH_WINDOW_BYTES) {
-        check_abort()?;
-        prefetch_window(window);
-        for subchunk in window.chunks(MAPPED_HASH_CHUNK_BYTES) {
-            check_abort()?;
-            hasher.update(subchunk).map_err(WorkerError::Io)?;
-        }
-    }
-    hasher.finish().map_err(WorkerError::Io)
+    hash_mapped_windows(chunk, &mut check_abort, WorkerError::Io)
 }
 
 /// Compute fixed-chunk SHA-256 digests for a read-locked regular file via a
@@ -293,31 +283,27 @@ pub fn compute_mapped_chunk_digests_with(
         Ok(local)
     };
 
-    let worker_results = if worker_count == 1 {
-        vec![worker_task()]
-    } else {
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count - 1);
-            for _ in 0..(worker_count - 1) {
-                handles.push(scope.spawn(&worker_task));
-            }
-            let current = worker_task();
-            let mut results = Vec::with_capacity(worker_count);
-            results.push(current);
-            for handle in handles {
-                match handle.join() {
-                    Ok(result) => results.push(result),
-                    Err(_) => {
-                        peer_error.store(true, Ordering::Release);
-                        results.push(Err(WorkerError::Io(io::Error::other(
-                            "Parallel hash worker thread panicked.",
-                        ))));
-                    }
+    let worker_results = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count - 1);
+        for _ in 0..(worker_count - 1) {
+            handles.push(scope.spawn(&worker_task));
+        }
+        let current = worker_task();
+        let mut results = Vec::with_capacity(worker_count);
+        results.push(current);
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => results.push(result),
+                Err(_) => {
+                    peer_error.store(true, Ordering::Release);
+                    results.push(Err(WorkerError::Io(io::Error::other(
+                        "Parallel hash worker thread panicked.",
+                    ))));
                 }
             }
-            results
-        })
-    };
+        }
+        results
+    });
 
     if should_cancel() {
         return Err(cancelled_error());
@@ -432,7 +418,7 @@ pub fn try_verify_locked_file_chunk_digests_mapped_with(
     }
     let mut diff = 0_u8;
     for (actual, expected) in actual_digests.iter().zip(expected_digests.iter()) {
-        diff |= constant_time_diff_32(actual, expected);
+        diff |= constant_time_diff(actual, expected);
     }
     Ok(Some(diff == 0))
 }
