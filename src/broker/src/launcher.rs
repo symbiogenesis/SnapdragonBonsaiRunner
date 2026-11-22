@@ -1915,20 +1915,21 @@ impl LaunchConfig {
                     models,
                     self.uses_repacked_ptq1(),
                     self.use_abliterate_lora,
-                    WorkerReadiness::for_version(&version, self.native_row_workers)
-                        .with_prompt_reuse_mode(self.prompt_reuse)
-                        .with_prompt_reuse_checkpoints(self.prompt_reuse_checkpoints.unwrap_or(1))
-                        .with_vision(vision_enabled)
-                        .with_daisyrose_adapter(daisyrose)
-                        .with_kv_cache(self.kv_cache)
-                        .with_cpu_prefill(cpu_prefill)
-                        .with_cpu_prefill_gdn(
-                            self.cpu_prefill_gdn
-                                .is_some_and(crate::inference::CpuPrefillGdn::is_wy_f32),
-                        )
-                        .with_cpu_speculation(cpu_speculation)
-                        .with_placement(self.placement)
-                        .with_context_tokens(context_tokens),
+                    WorkerReadiness {
+                        prompt_reuse: self.prompt_reuse,
+                        prompt_reuse_checkpoints: self.prompt_reuse_checkpoints.unwrap_or(1),
+                        vision: vision_enabled,
+                        daisyrose,
+                        kv_cache: self.kv_cache,
+                        cpu_prefill,
+                        cpu_prefill_gdn_wy_f32: self
+                            .cpu_prefill_gdn
+                            .is_some_and(crate::inference::CpuPrefillGdn::is_wy_f32),
+                        cpu_speculation,
+                        placement: self.placement,
+                        context_tokens,
+                        ..WorkerReadiness::for_version(&version, self.native_row_workers)
+                    },
                 )
             });
         if let Err(mismatch) = verification {

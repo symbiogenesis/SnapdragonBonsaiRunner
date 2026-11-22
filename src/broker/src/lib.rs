@@ -171,6 +171,14 @@ pub(crate) fn bearer_header(key: &[u8]) -> Option<[u8; 71]> {
     Some(header)
 }
 
+const fn max_body_bytes_for(vision: bool) -> usize {
+    if vision {
+        MAX_MULTIMODAL_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    }
+}
+
 impl RequestPolicy {
     /// The launcher must supply 32 cryptographically random bytes encoded as
     /// lowercase hex. Format validation here cannot establish randomness or ACLs.
@@ -227,11 +235,7 @@ impl RequestPolicy {
     /// Maximum serialized client or canonical backend body length admitted.
     #[must_use]
     pub const fn max_body_bytes(&self) -> usize {
-        if self.vision {
-            MAX_MULTIMODAL_BODY_BYTES
-        } else {
-            MAX_BODY_BYTES
-        }
+        max_body_bytes_for(self.vision)
     }
 
     /// Capabilities for the owner's actual immutable context selection.
@@ -476,11 +480,7 @@ impl AuthorizedHead {
     }
 
     const fn max_body_bytes(&self) -> usize {
-        if self.vision {
-            MAX_MULTIMODAL_BODY_BYTES
-        } else {
-            MAX_BODY_BYTES
-        }
+        max_body_bytes_for(self.vision)
     }
 
     const fn check_body_size(&self, body: &[u8]) -> Result<(), Rejection> {
@@ -514,27 +514,22 @@ impl AuthorizedHead {
             return Err(Rejection::ChatSchema);
         }
         let default_daisyrose = f64::from(self.daisyrose_default_scale_tenths) / 10.0;
-        let lora = match (self.pinned_abliteration, self.daisyrose_lora) {
-            (true, false) => Some(vec![PinnedLora {
+        let mut loras = Vec::with_capacity(
+            usize::from(self.pinned_abliteration) + usize::from(self.daisyrose_lora),
+        );
+        if self.pinned_abliteration {
+            loras.push(PinnedLora {
                 id: 0,
                 scale: chat.abliteration_scale.unwrap_or(1.3),
-            }]),
-            (true, true) => Some(vec![
-                PinnedLora {
-                    id: 0,
-                    scale: chat.abliteration_scale.unwrap_or(1.3),
-                },
-                PinnedLora {
-                    id: 1,
-                    scale: chat.daisyrose_scale.unwrap_or(default_daisyrose),
-                },
-            ]),
-            (false, true) => Some(vec![PinnedLora {
-                id: 0,
+            });
+        }
+        if self.daisyrose_lora {
+            loras.push(PinnedLora {
+                id: u8::from(self.pinned_abliteration),
                 scale: chat.daisyrose_scale.unwrap_or(default_daisyrose),
-            }]),
-            (false, false) => None,
-        };
+            });
+        }
+        let lora = (!loras.is_empty()).then_some(loras);
         let max_completion_tokens = chat.max_completion_tokens;
         let body = request_buffer::serialize_with_hint_and_limit(
             &BackendChat {
@@ -655,7 +650,7 @@ struct Message<'a> {
     #[serde(
         default,
         borrow,
-        deserialize_with = "deserialize_reasoning_content",
+        deserialize_with = "deserialize_present_text",
         skip_serializing_if = "Option::is_none"
     )]
     reasoning_content: Option<Cow<'a, str>>,
@@ -688,18 +683,22 @@ struct RawImageUrl<'a> {
     url: Cow<'a, str>,
 }
 
-fn deserialize_optional_text<'de, D: Deserializer<'de>>(
+pub(crate) fn deserialize_present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_present_text<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Cow<'de, str>>, D::Error> {
+    // An absent field defaults to None; a present field must be text, even when
+    // empty. Deserializing Option directly would also accept an unsupported null.
+    // The derived wrapper enables Serde's borrowing support for Cow while
+    // retaining owned decoding for escaped JSON strings.
     #[derive(Deserialize)]
     struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
     Text::deserialize(deserializer).map(|Text(text)| Some(text))
-}
-
-fn deserialize_optional_image_url<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Object<RawImageUrl<'de>>>, D::Error> {
-    Object::<RawImageUrl<'de>>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -707,9 +706,9 @@ fn deserialize_optional_image_url<'de, D: Deserializer<'de>>(
 struct RawContentPart<'a> {
     #[serde(borrow, rename = "type")]
     kind: Cow<'a, str>,
-    #[serde(default, borrow, deserialize_with = "deserialize_optional_text")]
+    #[serde(default, borrow, deserialize_with = "deserialize_present_text")]
     text: Option<Cow<'a, str>>,
-    #[serde(default, borrow, deserialize_with = "deserialize_optional_image_url")]
+    #[serde(default, borrow, deserialize_with = "deserialize_present")]
     image_url: Option<Object<RawImageUrl<'a>>>,
 }
 
@@ -839,19 +838,6 @@ fn deserialize_content<'de, D: Deserializer<'de>>(
     }
 
     deserializer.deserialize_any(ContentVisitor)
-}
-
-fn deserialize_reasoning_content<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Cow<'de, str>>, D::Error> {
-    // An absent field defaults to None; a present field must be text, even when
-    // empty. Deserializing Option directly would also accept an unsupported null.
-    // The derived wrapper enables Serde's borrowing support for Cow while
-    // retaining owned decoding for escaped JSON strings.
-    #[derive(Deserialize)]
-    struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
-
-    Text::deserialize(deserializer).map(|Text(text)| Some(text))
 }
 
 #[derive(Serialize, PartialEq, Eq)]
