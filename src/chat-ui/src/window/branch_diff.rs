@@ -51,40 +51,33 @@ pub(super) struct UnicodeDiff {
 }
 
 impl UnicodeDiff {
-    /// Losslessly reconstructs the exact original left input string from the diff spans.
-    #[must_use]
-    pub(super) fn reconstruct_left(&self) -> String {
+    fn reconstruct(&self, side_op: DiffOp) -> String {
+        let include = |op| op == DiffOp::Equal || op == side_op;
         let capacity: usize = self
             .spans
             .iter()
-            .filter(|span| matches!(span.op, DiffOp::Equal | DiffOp::Delete))
+            .filter(|span| include(span.op))
             .map(|span| span.text.len())
             .sum();
         let mut out = String::with_capacity(capacity);
         for span in &self.spans {
-            if matches!(span.op, DiffOp::Equal | DiffOp::Delete) {
+            if include(span.op) {
                 out.push_str(&span.text);
             }
         }
         out
     }
 
+    /// Losslessly reconstructs the exact original left input string from the diff spans.
+    #[must_use]
+    pub(super) fn reconstruct_left(&self) -> String {
+        self.reconstruct(DiffOp::Delete)
+    }
+
     /// Losslessly reconstructs the exact original right input string from the diff spans.
     #[must_use]
     pub(super) fn reconstruct_right(&self) -> String {
-        let capacity: usize = self
-            .spans
-            .iter()
-            .filter(|span| matches!(span.op, DiffOp::Equal | DiffOp::Insert))
-            .map(|span| span.text.len())
-            .sum();
-        let mut out = String::with_capacity(capacity);
-        for span in &self.spans {
-            if matches!(span.op, DiffOp::Equal | DiffOp::Insert) {
-                out.push_str(&span.text);
-            }
-        }
-        out
+        self.reconstruct(DiffOp::Insert)
     }
 
     /// Returns `true` when at least one deleted or inserted span is present.

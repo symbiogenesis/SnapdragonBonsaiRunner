@@ -199,26 +199,35 @@ impl State {
             MessageAction::Continue(id) if self.message_options(id).continue_response => {
                 // Continue is an explicit ordinary followup, not an automatic
                 // replay or modification of an already committed answer.
-                let draft = std::mem::replace(&mut self.input, CONTINUE_PROMPT.to_owned());
-                let draft_attachments = self.take_draft_attachments();
-                let cursor = (
-                    self.composer_cursor,
-                    self.pending_cursor,
-                    self.focus_composer,
-                );
-                self.restore_selected_history();
-                self.submit();
-                self.input = draft;
-                self.set_draft_attachments(draft_attachments);
-                (
-                    self.composer_cursor,
-                    self.pending_cursor,
-                    self.focus_composer,
-                ) = cursor;
-                self.recovery_dirty = true;
+                self.with_temporary_draft(CONTINUE_PROMPT.to_owned(), Vec::new(), Self::submit);
             }
             _ => {}
         }
+    }
+
+    fn with_temporary_draft(
+        &mut self,
+        prompt: String,
+        attachments: Vec<crate::attachment_import::Attachment>,
+        action: impl FnOnce(&mut Self),
+    ) {
+        let draft = std::mem::replace(&mut self.input, prompt);
+        let draft_attachments = self.replace_draft_attachments(attachments);
+        let cursor = (
+            self.composer_cursor,
+            self.pending_cursor,
+            self.focus_composer,
+        );
+        self.restore_selected_history();
+        action(self);
+        self.input = draft;
+        self.set_draft_attachments(draft_attachments);
+        (
+            self.composer_cursor,
+            self.pending_cursor,
+            self.focus_composer,
+        ) = cursor;
+        self.recovery_dirty = true;
     }
 
     pub(super) fn try_auto_continue(&mut self) -> bool {
@@ -336,25 +345,11 @@ impl State {
         }
         let prompt = message.body.clone();
         let prompt_attachments = message.attachments.clone();
-        let draft = std::mem::replace(&mut self.input, prompt);
-        let draft_attachments = self.replace_draft_attachments(prompt_attachments);
-        let cursor = (
-            self.composer_cursor,
-            self.pending_cursor,
-            self.focus_composer,
-        );
-        self.restore_selected_history();
-        if self.model == ModelLifecycle::Ready && prefix == self.committed.len() {
-            self.submit_turn(Some(id));
-        }
-        self.input = draft;
-        self.set_draft_attachments(draft_attachments);
-        (
-            self.composer_cursor,
-            self.pending_cursor,
-            self.focus_composer,
-        ) = cursor;
-        self.recovery_dirty = true;
+        self.with_temporary_draft(prompt, prompt_attachments, |state| {
+            if state.model == ModelLifecycle::Ready && prefix == state.committed.len() {
+                state.submit_turn(Some(id));
+            }
+        });
     }
 
     fn branch_history(&mut self, end: usize, label: &str) -> bool {

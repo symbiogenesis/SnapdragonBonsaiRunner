@@ -7,7 +7,7 @@ use super::{
     controls,
     egui::{self, Color32, RichText, Vec2},
     image_cache::{ImageCache, PrehashedSvg, RasterSlot},
-    transcript::aspect_fit_rect,
+    transcript::{aspect_fit_rect, paint_fitted_texture},
 };
 use crate::attachment_import::Attachment;
 
@@ -216,7 +216,7 @@ impl Lightbox {
                         if let Some((_, url)) = frames.get(*current)
                             && let Some(tex) = image_cache.data_url_texture(ctx, url)
                         {
-                            paint_texture(&modal_ui, bounds, &tex);
+                            paint_fitted_texture(&modal_ui, bounds, &tex);
                         } else {
                             let mut unavailable_ui =
                                 modal_ui.new_child(egui::UiBuilder::new().max_rect(bounds).layout(
@@ -331,11 +331,11 @@ fn show_svg_canvas(
     canvas_rect: egui::Rect,
 ) {
     match image_cache.get_or_request(ctx, svg, target_rect.size()) {
-        RasterSlot::Ready(tex) => paint_texture(modal_ui, bounds, &tex),
+        RasterSlot::Ready(tex) => paint_fitted_texture(modal_ui, bounds, &tex),
         RasterSlot::Loading {
             fallback: Some(tex),
         } => {
-            paint_texture(modal_ui, bounds, &tex);
+            paint_fitted_texture(modal_ui, bounds, &tex);
             let badge = egui::Rect::from_min_size(
                 canvas_rect.max - egui::vec2(28.0, 28.0),
                 Vec2::splat(20.0),
@@ -378,14 +378,4 @@ fn show_svg_canvas(
                 });
         }
     }
-}
-
-fn paint_texture(ui: &egui::Ui, bounds: egui::Rect, texture: &egui::TextureHandle) {
-    let fitted = aspect_fit_rect(bounds, texture.size_vec2());
-    ui.painter().image(
-        texture.id(),
-        fitted,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
 }

@@ -282,12 +282,7 @@ impl State {
     }
 
     pub(super) fn speech_setup_current_error_actions(&mut self, ui: &mut egui::Ui) {
-        let retry = self.can_retry_speech_setup()
-            && self
-                .setup
-                .speech_error
-                .as_deref()
-                .is_some_and(cleanup_known);
+        let retry = self.can_retry_speech_setup();
         self.speech_setup_retry_button(ui, retry);
     }
 

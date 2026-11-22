@@ -27,6 +27,25 @@ const COALESCE_MAX_GROUP_BYTES: usize = 4_096;
 
 pub(super) const LIMIT_MESSAGE: &str = "This edit exceeds the 1,048,576-character draft limit. Your draft was kept. Paste a smaller passage.";
 
+fn apply_insert(target: &mut String, byte_idx: usize, text: &str) -> bool {
+    if byte_idx <= target.len() && target.is_char_boundary(byte_idx) {
+        target.insert_str(byte_idx, text);
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_delete(target: &mut String, byte_idx: usize, byte_len: usize) -> bool {
+    let end = byte_idx.saturating_add(byte_len);
+    if end <= target.len() && target.is_char_boundary(byte_idx) && target.is_char_boundary(end) {
+        target.drain(byte_idx..end);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EditOp {
     Insert { byte_idx: usize, text: String },
@@ -36,51 +55,15 @@ enum EditOp {
 impl EditOp {
     fn apply_forward(&self, target: &mut String) -> bool {
         match self {
-            Self::Insert { byte_idx, text } => {
-                if *byte_idx <= target.len() && target.is_char_boundary(*byte_idx) {
-                    target.insert_str(*byte_idx, text);
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::Delete { byte_idx, text } => {
-                let end = byte_idx.saturating_add(text.len());
-                if end <= target.len()
-                    && target.is_char_boundary(*byte_idx)
-                    && target.is_char_boundary(end)
-                {
-                    target.drain(*byte_idx..end);
-                    true
-                } else {
-                    false
-                }
-            }
+            Self::Insert { byte_idx, text } => apply_insert(target, *byte_idx, text),
+            Self::Delete { byte_idx, text } => apply_delete(target, *byte_idx, text.len()),
         }
     }
 
     fn apply_inverse(&self, target: &mut String) -> bool {
         match self {
-            Self::Insert { byte_idx, text } => {
-                let end = byte_idx.saturating_add(text.len());
-                if end <= target.len()
-                    && target.is_char_boundary(*byte_idx)
-                    && target.is_char_boundary(end)
-                {
-                    target.drain(*byte_idx..end);
-                    true
-                } else {
-                    false
-                }
-            }
-            Self::Delete { byte_idx, text } => {
-                if *byte_idx <= target.len() && target.is_char_boundary(*byte_idx) {
-                    target.insert_str(*byte_idx, text);
-                    true
-                } else {
-                    false
-                }
-            }
+            Self::Insert { byte_idx, text } => apply_delete(target, *byte_idx, text.len()),
+            Self::Delete { byte_idx, text } => apply_insert(target, *byte_idx, text),
         }
     }
 
@@ -359,18 +342,10 @@ impl TxOp {
             Self::Insert {
                 byte_idx, byte_len, ..
             } => {
-                let end = byte_idx.saturating_add(*byte_len);
-                if end <= target.len()
-                    && target.is_char_boundary(*byte_idx)
-                    && target.is_char_boundary(end)
-                {
-                    target.drain(*byte_idx..end);
-                }
+                apply_delete(target, *byte_idx, *byte_len);
             }
             Self::Delete { byte_idx, removed } => {
-                if *byte_idx <= target.len() && target.is_char_boundary(*byte_idx) {
-                    target.insert_str(*byte_idx, removed);
-                }
+                apply_insert(target, *byte_idx, removed);
             }
         }
     }
@@ -949,36 +924,7 @@ impl TextBuffer for Buffer<'_> {
             return;
         }
 
-        let old_bytes = self.text.as_bytes();
-        let new_bytes = text.as_bytes();
-        let mut prefix = old_bytes
-            .iter()
-            .zip(new_bytes.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        while prefix > 0 && (!self.text.is_char_boundary(prefix) || !text.is_char_boundary(prefix))
-        {
-            prefix -= 1;
-        }
-        let max_suffix = old_bytes
-            .len()
-            .saturating_sub(prefix)
-            .min(new_bytes.len().saturating_sub(prefix));
-        let mut suffix = old_bytes[old_bytes.len() - max_suffix..]
-            .iter()
-            .rev()
-            .zip(new_bytes[new_bytes.len() - max_suffix..].iter().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        while suffix > 0
-            && (!self.text.is_char_boundary(old_bytes.len() - suffix)
-                || !text.is_char_boundary(new_bytes.len() - suffix))
-        {
-            suffix -= 1;
-        }
-
-        let old_mid_end = old_bytes.len().saturating_sub(suffix);
-        let new_mid_end = new_bytes.len().saturating_sub(suffix);
+        let (prefix, old_mid_end, new_mid_end) = crate::context::utf8_diff_bounds(self.text, text);
         if prefix < old_mid_end {
             let removed = self.text[prefix..old_mid_end].to_owned();
             if !self.try_record_op(TxOp::Delete {

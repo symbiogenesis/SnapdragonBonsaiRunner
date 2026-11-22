@@ -245,37 +245,7 @@ impl IncrementalDraftUnits {
         if self.prev_trimmed == trimmed {
             return units_to_tokens(self.trimmed_units);
         }
-        let old_bytes = self.prev_trimmed.as_bytes();
-        let new_bytes = trimmed.as_bytes();
-        let mut prefix = old_bytes
-            .iter()
-            .zip(new_bytes.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        while prefix > 0
-            && (!self.prev_trimmed.is_char_boundary(prefix) || !trimmed.is_char_boundary(prefix))
-        {
-            prefix -= 1;
-        }
-        let max_suffix = old_bytes
-            .len()
-            .saturating_sub(prefix)
-            .min(new_bytes.len().saturating_sub(prefix));
-        let mut suffix = old_bytes[old_bytes.len() - max_suffix..]
-            .iter()
-            .rev()
-            .zip(new_bytes[new_bytes.len() - max_suffix..].iter().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        while suffix > 0
-            && (!self.prev_trimmed.is_char_boundary(old_bytes.len() - suffix)
-                || !trimmed.is_char_boundary(new_bytes.len() - suffix))
-        {
-            suffix -= 1;
-        }
-
-        let old_mid_end = old_bytes.len().saturating_sub(suffix);
-        let new_mid_end = new_bytes.len().saturating_sub(suffix);
+        let (prefix, old_mid_end, new_mid_end) = utf8_diff_bounds(&self.prev_trimmed, trimmed);
         let old_units = text_units(&self.prev_trimmed[prefix..old_mid_end]);
         let new_units = text_units(&trimmed[prefix..new_mid_end]);
         self.trimmed_units = self
@@ -286,6 +256,40 @@ impl IncrementalDraftUnits {
             .replace_range(prefix..old_mid_end, &trimmed[prefix..new_mid_end]);
         units_to_tokens(self.trimmed_units)
     }
+}
+
+pub(crate) fn utf8_diff_bounds(old: &str, new: &str) -> (usize, usize, usize) {
+    let old_bytes = old.as_bytes();
+    let new_bytes = new.as_bytes();
+    let mut prefix = old_bytes
+        .iter()
+        .zip(new_bytes.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while prefix > 0 && (!old.is_char_boundary(prefix) || !new.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+    let max_suffix = old_bytes
+        .len()
+        .saturating_sub(prefix)
+        .min(new_bytes.len().saturating_sub(prefix));
+    let mut suffix = old_bytes[old_bytes.len() - max_suffix..]
+        .iter()
+        .rev()
+        .zip(new_bytes[new_bytes.len() - max_suffix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while suffix > 0
+        && (!old.is_char_boundary(old_bytes.len() - suffix)
+            || !new.is_char_boundary(new_bytes.len() - suffix))
+    {
+        suffix -= 1;
+    }
+    (
+        prefix,
+        old_bytes.len().saturating_sub(suffix),
+        new_bytes.len().saturating_sub(suffix),
+    )
 }
 
 #[cfg(test)]

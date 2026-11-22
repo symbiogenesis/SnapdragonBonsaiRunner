@@ -1298,13 +1298,7 @@ fn render_attachments_grid(
             && let Some(cache) = image_cache.as_deref_mut()
             && let Some(tex) = cache.png_bytes_texture(ui.ctx(), png)
         {
-            let fitted = aspect_fit_rect(thumb_rect, tex.size_vec2());
-            ui.painter().image(
-                tex.id(),
-                fitted,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            paint_fitted_texture(ui, thumb_rect, &tex);
         } else {
             let badge = if attachment.is_media() { "IMG" } else { "TXT" };
             ui.painter().text(
@@ -1458,15 +1452,7 @@ fn render_image_card(
             | super::image_cache::RasterSlot::Loading {
                 fallback: Some(tex),
             },
-        ) => {
-            let fitted = aspect_fit_rect(preview_rect, tex.size_vec2());
-            ui.painter().image(
-                tex.id(),
-                fitted,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        }
+        ) => paint_fitted_texture(ui, preview_rect, &tex),
         Some(super::image_cache::RasterSlot::Loading { fallback: None }) | None => {
             egui::Spinner::new().paint_at(
                 ui,
@@ -1561,6 +1547,20 @@ fn render_image_card(
     }
 
     action
+}
+
+pub(super) fn paint_fitted_texture(
+    ui: &egui::Ui,
+    bounds: egui::Rect,
+    texture: &egui::TextureHandle,
+) {
+    let fitted = aspect_fit_rect(bounds, texture.size_vec2());
+    ui.painter().image(
+        texture.id(),
+        fitted,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 fn render_generating_card(ui: &mut egui::Ui, card_size: Vec2) {

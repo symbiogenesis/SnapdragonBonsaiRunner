@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use super::{State, controls, egui, error_ui, lightbox, transcript::aspect_fit_rect};
+use super::{State, controls, egui, error_ui, lightbox, transcript::paint_fitted_texture};
 use crate::{
     attachment_import::{
         Attachment, MAX_ATTACHMENTS_PER_MESSAGE, MAX_TOTAL_TEXT_ATTACHMENT_BYTES, Outcome,
@@ -333,16 +333,7 @@ impl State {
                             && let Some(tex) = self.image_cache.png_bytes_texture(ui.ctx(), png)
                         {
                             let (_, thumb_rect) = ui.allocate_space(egui::vec2(28.0, 28.0));
-                            let fitted = aspect_fit_rect(thumb_rect, tex.size_vec2());
-                            ui.painter().image(
-                                tex.id(),
-                                fitted,
-                                egui::Rect::from_min_max(
-                                    egui::pos2(0.0, 0.0),
-                                    egui::pos2(1.0, 1.0),
-                                ),
-                                Color32::WHITE,
-                            );
+                            paint_fitted_texture(ui, thumb_rect, &tex);
                         } else {
                             let badge = if attachment.is_media() { "IMG" } else { "TXT" };
                             ui.label(RichText::new(badge).small().strong().weak());

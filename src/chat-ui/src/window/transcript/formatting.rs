@@ -365,25 +365,23 @@ pub(super) fn layout_document(
     parsed: Option<(&wire::Document, usize)>,
     streaming_visible_prefix: Option<usize>,
 ) -> (Vec<BodySegment>, bool) {
-    let normal = presentation::body_format(text_size, visuals);
-    if !structured {
-        return (
+    let plain_doc = |text: &str, generating: bool| {
+        let normal = presentation::body_format(text_size, visuals);
+        (
             vec![BodySegment::Text(plain(
-                body, width, normal, visuals, matches,
+                text, width, normal, visuals, matches,
             ))],
-            false,
-        );
+            generating,
+        )
+    };
+    if !structured {
+        return plain_doc(body, false);
     }
     if let Some(prefix_end) = streaming_visible_prefix
         && matches.iter().any(|found| found.range.end > prefix_end)
     {
         // A Find match hits inside the incomplete streaming SVG block: reveal raw source.
-        return (
-            vec![BodySegment::Text(plain(
-                body, width, normal, visuals, matches,
-            ))],
-            false,
-        );
+        return plain_doc(body, false);
     }
     let effective_end = streaming_visible_prefix.unwrap_or(body.len());
     let generating = streaming_visible_prefix.is_some();
@@ -393,24 +391,10 @@ pub(super) fn layout_document(
         if effective_body.is_empty() && generating {
             return (Vec::new(), true);
         }
-        return (
-            vec![BodySegment::Text(plain(
-                effective_body,
-                width,
-                normal,
-                visuals,
-                matches,
-            ))],
-            generating,
-        );
+        return plain_doc(effective_body, generating);
     };
     if prefix_len > effective_body.len() || !effective_body.is_char_boundary(prefix_len) {
-        return (
-            vec![BodySegment::Text(plain(
-                body, width, normal, visuals, matches,
-            ))],
-            false,
-        );
+        return plain_doc(body, false);
     }
     let last_text = doc.segments.iter().rev().find_map(|segment| match segment {
         wire::Segment::Text(layout) => Some(layout),
@@ -427,12 +411,7 @@ pub(super) fn layout_document(
         }
     });
     if match_unmapped {
-        return (
-            vec![BodySegment::Text(plain(
-                body, width, normal, visuals, matches,
-            ))],
-            false,
-        );
+        return plain_doc(body, false);
     }
 
     let has_images = doc
@@ -464,9 +443,7 @@ pub(super) fn layout_document(
                     tail_start,
                     is_last && ends_with_text,
                 );
-                if (!out.job.text.is_empty() || (!has_images && !generating))
-                    || (doc.segments.len() == 1 && !has_images && !generating)
-                {
+                if !out.job.text.is_empty() || (!has_images && !generating) {
                     rendered.push(BodySegment::Text(out));
                 }
             }
@@ -482,6 +459,7 @@ pub(super) fn layout_document(
         let tail_text = &effective_body[tail_start..];
         let mut job = egui::text::LayoutJob::default();
         job.wrap.max_width = width;
+        let normal = presentation::body_format(text_size, visuals);
         append_tail_slice(
             tail_text, tail_start, normal, text_size, visuals, matches, &mut job,
         );

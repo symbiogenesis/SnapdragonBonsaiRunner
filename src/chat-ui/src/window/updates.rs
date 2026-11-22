@@ -553,21 +553,18 @@ impl Updates {
                     self.start(Operation::Download);
                 }
             }
-            "current" => {
+            "current" | "no-release" => {
                 self.version = None;
                 self.release_identity = None;
                 self.downloaded = false;
                 self.confirming = false;
                 self.deferred = false;
-                self.status = "Swift is up to date.".into();
-            }
-            "no-release" => {
-                self.version = None;
-                self.release_identity = None;
-                self.downloaded = false;
-                self.confirming = false;
-                self.deferred = false;
-                self.status = "No published releases yet.".into();
+                self.status = if result.status == "current" {
+                    "Swift is up to date."
+                } else {
+                    "No published releases yet."
+                }
+                .into();
             }
             "downloaded" => {
                 self.release_identity = result.release_identity;
