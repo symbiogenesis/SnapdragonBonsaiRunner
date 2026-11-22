@@ -62,11 +62,6 @@ impl<S: Simd> Dot<S> {
     }
 
     #[inline(always)]
-    fn push(&mut self, simd: S, weights: [f32x4<S>; 4], input: &[f32]) {
-        self.push_loaded(weights, Self::load_inputs(simd, input));
-    }
-
-    #[inline(always)]
     fn finish(self) -> f32 {
         let lanes: [f32; 4] = (self.even + self.odd).into();
         (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
@@ -74,84 +69,13 @@ impl<S: Simd> Dot<S> {
 }
 
 #[inline(always)]
-fn q8<S: Simd>(simd: S, source: &[u8], input: &[f32]) -> f32 {
-    let scale = f32x4::splat(simd, half(source));
-    let mut dot = Dot::new(simd);
-    for part in 0..2 {
-        let offset = part * 16;
-        let quants = u8x16::from_slice(simd, &source[2 + offset..2 + offset + 16]);
-        let weights = signed_lanes(simd, quants).map(|quant| scale * quant);
-        dot.push(simd, weights, &input[offset..offset + 16]);
-    }
-    dot.finish()
-}
-
-#[inline(always)]
-fn q4_k<S: Simd>(simd: S, source: &[u8], input: &[f32]) -> f32 {
-    let scale = half(source);
-    let minimum = half(&source[2..]);
-    let scales = &source[4..16];
-    let mut dot = Dot::new(simd);
-    for group in 0..8 {
-        let (s, m) = unpack_q4_k_scale_min(group, scales);
-        let multiplier = f32x4::splat(simd, scale * f32::from(s));
-        let offset = f32x4::splat(simd, minimum * f32::from(m));
-        for part in 0..2 {
-            let start = 16 + (group / 2) * 32 + part * 16;
-            let packed = u8x16::from_slice(simd, &source[start..start + 16]);
-            let quants = if group % 2 == 0 {
-                packed & u8x16::splat(simd, 15)
-            } else {
-                packed >> 4
-            };
-            // Separate multiply/subtract preserves decode_block's rounding.
-            let weights = unsigned_lanes(simd, quants).map(|quant| multiplier * quant - offset);
-            let start = group * 32 + part * 16;
-            dot.push(simd, weights, &input[start..start + 16]);
-        }
-    }
-    dot.finish()
-}
-
-#[inline(always)]
-fn q6_k<S: Simd>(simd: S, source: &[u8], input: &[f32]) -> f32 {
-    let scale = half(&source[208..]);
-    let mut dot = Dot::new(simd);
-    for half_index in 0..2 {
-        for quarter in 0..4 {
-            for part in 0..2 {
-                let start = half_index * 64 + (quarter % 2) * 32 + part * 16;
-                let packed = u8x16::from_slice(simd, &source[start..start + 16]);
-                let low = if quarter < 2 {
-                    packed & u8x16::splat(simd, 15)
-                } else {
-                    packed >> 4
-                };
-                let start = 128 + half_index * 32 + part * 16;
-                let high = u8x16::from_slice(simd, &source[start..start + 16]);
-                let high = (high >> [0, 2, 4, 6][quarter]) & u8x16::splat(simd, 3);
-                let quants = low | (high << 4);
-                let subscale =
-                    i8::from_le_bytes([source[192 + half_index * 8 + quarter * 2 + part]]);
-                let multiplier = f32x4::splat(simd, scale * f32::from(subscale));
-                let weights = unsigned_lanes(simd, quants)
-                    .map(|quant| multiplier * (quant - f32x4::splat(simd, 32.0)));
-                let start = half_index * 128 + quarter * 32 + part * 16;
-                dot.push(simd, weights, &input[start..start + 16]);
-            }
-        }
-    }
-    dot.finish()
-}
-
-#[inline(always)]
-fn q8_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
+fn q8_rows<S: Simd, const N: usize>(simd: S, sources: [&[u8]; N], input: &[f32]) -> [f32; N] {
     let scales = sources.map(|source| f32x4::splat(simd, half(source)));
     let mut dots = std::array::from_fn(|_| Dot::new(simd));
     for part in 0..2 {
         let offset = part * 16;
         let inputs = Dot::load_inputs(simd, &input[offset..offset + 16]);
-        for row_index in 0..4 {
+        for row_index in 0..N {
             let quants = u8x16::from_slice(simd, &sources[row_index][2 + offset..2 + offset + 16]);
             let weights = signed_lanes(simd, quants).map(|quant| scales[row_index] * quant);
             dots[row_index].push_loaded(weights, inputs);
@@ -161,7 +85,7 @@ fn q8_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
 }
 
 #[inline(always)]
-fn q4_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
+fn q4_k_rows<S: Simd, const N: usize>(simd: S, sources: [&[u8]; N], input: &[f32]) -> [f32; N] {
     let row_scales_min = sources.map(|source| (half(source), half(&source[2..]), &source[4..16]));
     let mut dots = std::array::from_fn(|_| Dot::new(simd));
     for group in 0..8 {
@@ -176,7 +100,7 @@ fn q4_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
             let input_start = group * 32 + part * 16;
             let inputs = Dot::load_inputs(simd, &input[input_start..input_start + 16]);
             let start = 16 + (group / 2) * 32 + part * 16;
-            for row_index in 0..4 {
+            for row_index in 0..N {
                 let packed = u8x16::from_slice(simd, &sources[row_index][start..start + 16]);
                 let quants = if group % 2 == 0 {
                     packed & u8x16::splat(simd, 15)
@@ -194,7 +118,7 @@ fn q4_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
 }
 
 #[inline(always)]
-fn q6_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
+fn q6_k_rows<S: Simd, const N: usize>(simd: S, sources: [&[u8]; N], input: &[f32]) -> [f32; N] {
     let scales = sources.map(|source| half(&source[208..]));
     let mut dots = std::array::from_fn(|_| Dot::new(simd));
     for half_index in 0..2 {
@@ -206,7 +130,7 @@ fn q6_k_four<S: Simd>(simd: S, sources: [&[u8]; 4], input: &[f32]) -> [f32; 4] {
                 let high_start = 128 + half_index * 32 + part * 16;
                 let shift = [0, 2, 4, 6][quarter];
                 let scale_index = 192 + half_index * 8 + quarter * 2 + part;
-                for row_index in 0..4 {
+                for row_index in 0..N {
                     let source = sources[row_index];
                     let packed = u8x16::from_slice(simd, &source[low_start..low_start + 16]);
                     let low = if quarter < 2 {
@@ -282,16 +206,9 @@ pub(super) fn rows<S: Simd>(
     input: &[f32],
     destination: &mut [f32],
 ) {
-    let (block, size) = match kind {
-        0 => (1, 4),
-        1 => (1, 2),
-        8 => (32, 34),
-        12 => (256, 144),
-        14 => (256, 210),
-        _ => {
-            destination.fill(f32::NAN);
-            return;
-        }
+    let Ok((block, size)) = crate::weights::packed_layout(kind) else {
+        destination.fill(f32::NAN);
+        return;
     };
     let row_bytes = input.len() / block * size;
     let mut processed = 0;
@@ -377,9 +294,9 @@ pub(super) fn rows<S: Simd>(
                 ];
                 let values = &input[input_offset..input_offset + block];
                 let block_sums = match kind {
-                    8 => q8_four(simd, row_slices, values),
-                    12 => q4_k_four(simd, row_slices, values),
-                    _ => q6_k_four(simd, row_slices, values),
+                    8 => q8_rows(simd, row_slices, values),
+                    12 => q4_k_rows(simd, row_slices, values),
+                    _ => q6_k_rows(simd, row_slices, values),
                 };
                 for (dst, add) in output.iter_mut().zip(block_sums) {
                     *dst += add;
@@ -396,6 +313,24 @@ pub(super) fn rows<S: Simd>(
     }
 }
 
+#[inline(always)]
+fn quant_row_sum<const S: usize, const B: usize>(
+    source: &[u8],
+    input: &[f32],
+    mut sum: f32,
+    mut dot: impl FnMut(&[u8; S], &[f32; B]) -> f32,
+) -> f32 {
+    for (bytes, values) in source
+        .as_chunks::<S>()
+        .0
+        .iter()
+        .zip(input.as_chunks::<B>().0)
+    {
+        sum += dot(bytes, values);
+    }
+    sum
+}
+
 // Validated callers supply complete rows of a supported type. F32/F16 preserve
 // their original separately rounded multiplication and left-to-right summation.
 #[inline(always)]
@@ -407,12 +342,7 @@ pub(super) fn row<S: Simd>(simd: S, kind: u32, source: &[u8], input: &[f32], mut
                 let values = f32x4::from_fn(simd, |index| {
                     let offset = index * size;
                     if kind == 0 {
-                        f32::from_le_bytes([
-                            sources[offset],
-                            sources[offset + 1],
-                            sources[offset + 2],
-                            sources[offset + 3],
-                        ])
+                        read_f32_le(&sources[offset..offset + 4])
                     } else {
                         half(&sources[offset..])
                     }
@@ -425,46 +355,19 @@ pub(super) fn row<S: Simd>(simd: S, kind: u32, source: &[u8], input: &[f32], mut
             let tail = input.len() / 4 * 4;
             for (bytes, value) in source[tail * size..].chunks_exact(size).zip(&input[tail..]) {
                 let weight = if kind == 0 {
-                    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                    read_f32_le(bytes)
                 } else {
                     half(bytes)
                 };
                 sum += weight * value;
             }
+            sum
         }
-        8 => {
-            for (bytes, values) in source
-                .as_chunks::<34>()
-                .0
-                .iter()
-                .zip(input.as_chunks::<32>().0)
-            {
-                sum += q8(simd, bytes, values);
-            }
-        }
-        12 => {
-            for (bytes, values) in source
-                .as_chunks::<144>()
-                .0
-                .iter()
-                .zip(input.as_chunks::<256>().0)
-            {
-                sum += q4_k(simd, bytes, values);
-            }
-        }
-        14 => {
-            for (bytes, values) in source
-                .as_chunks::<210>()
-                .0
-                .iter()
-                .zip(input.as_chunks::<256>().0)
-            {
-                sum += q6_k(simd, bytes, values);
-            }
-        }
-        _ => return f32::NAN,
+        8 => quant_row_sum::<34, 32>(source, input, sum, |b, v| q8_rows(simd, [b], v)[0]),
+        12 => quant_row_sum::<144, 256>(source, input, sum, |b, v| q4_k_rows(simd, [b], v)[0]),
+        14 => quant_row_sum::<210, 256>(source, input, sum, |b, v| q6_k_rows(simd, [b], v)[0]),
+        _ => f32::NAN,
     }
-    sum
 }
 
 #[cfg(test)]
