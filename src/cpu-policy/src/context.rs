@@ -32,6 +32,8 @@ pub const STATE_BYTES_PER_TOKEN: u64 = KV_BYTES_PER_TOKEN + 24 * 4 + 128;
 pub const RSQ4_KV_BYTES_PER_TOKEN: u64 = 16_896;
 /// `Rotated4FittedValues` K/V records, including block scales, across Swift's attention layers.
 pub const ROTATED4_FITTED_VALUES_KV_BYTES_PER_TOKEN: u64 = 16_896;
+/// `Rotated4FittedKv` (`rsq4kvf`) K/V records, using identical 132-byte layout with version-3 co-optimized K & V scales.
+pub const ROTATED4_FITTED_KV_BYTES_PER_TOKEN: u64 = 16_896;
 /// K4/V3 records, including their four-byte scales, across Swift's attention layers.
 pub const RSQ4K3V_KV_BYTES_PER_TOKEN: u64 = 14_848;
 /// The runtime's reviewed total graph-state allocation ceiling.
@@ -71,7 +73,8 @@ fn tile_scratch_fixed_and_per_ctx(
         SwiftKvCacheFormat::F16 => 6_u64,
         SwiftKvCacheFormat::Rsq4
         | SwiftKvCacheFormat::Rsq4K3v
-        | SwiftKvCacheFormat::Rotated4FittedValues => 1_u64,
+        | SwiftKvCacheFormat::Rotated4FittedValues
+        | SwiftKvCacheFormat::Rotated4FittedKv => 1_u64,
     };
     let row_bytes = t.checked_mul(u64::try_from(SWIFT_MAX_LAYER_WIDTH).ok()?.checked_mul(80)?)?;
     let meta_bytes = t.checked_mul(2_048)?;
@@ -206,6 +209,8 @@ pub enum SwiftKvCacheFormat {
     Rsq4K3v,
     /// Hadamard-rotated 4-bit fitted-values KV records (`16_896` bytes/token).
     Rotated4FittedValues,
+    /// Hadamard-rotated 4-bit co-optimized key and value KV records (`16_896` bytes/token).
+    Rotated4FittedKv,
 }
 
 impl SwiftKvCacheFormat {
@@ -217,6 +222,7 @@ impl SwiftKvCacheFormat {
             Self::Rsq4 => RSQ4_KV_BYTES_PER_TOKEN,
             Self::Rsq4K3v => RSQ4K3V_KV_BYTES_PER_TOKEN,
             Self::Rotated4FittedValues => ROTATED4_FITTED_VALUES_KV_BYTES_PER_TOKEN,
+            Self::Rotated4FittedKv => ROTATED4_FITTED_KV_BYTES_PER_TOKEN,
         }
     }
 
@@ -1619,6 +1625,10 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         assert_eq!(
             SwiftKvCacheFormat::Rotated4FittedValues.kv_bytes_per_token(),
+            16_896
+        );
+        assert_eq!(
+            SwiftKvCacheFormat::Rotated4FittedKv.kv_bytes_per_token(),
             16_896
         );
         let gib = 1024 * 1024 * 1024;

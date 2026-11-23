@@ -53,6 +53,7 @@ fn parse_enum<T: Copy>(
 pub(super) enum KvCache {
     F16,
     Rsq4,
+    Rsq4Kvf,
     Rsq4K3v,
 }
 
@@ -265,6 +266,7 @@ impl KvCache {
             &[
                 ("f16", Self::F16),
                 ("rsq4", Self::Rsq4),
+                ("rsq4kvf", Self::Rsq4Kvf),
                 ("rsq4k3v", Self::Rsq4K3v),
             ],
         )
@@ -274,6 +276,7 @@ impl KvCache {
         match self {
             Self::F16 => "f16",
             Self::Rsq4 => "rsq4",
+            Self::Rsq4Kvf => "rsq4kvf",
             Self::Rsq4K3v => "rsq4k3v",
         }
     }
@@ -295,6 +298,12 @@ fn select_kv_cache(
 ) -> Result<Option<KvCache>, LaunchError> {
     if requested == Some(KvCache::Rsq4K3v) {
         if k4v3_context_supported(release) {
+            Ok(requested)
+        } else {
+            Err(LaunchError::NativeRuntime)
+        }
+    } else if requested == Some(KvCache::Rsq4Kvf) {
+        if rsq4kvf_supported(release) {
             Ok(requested)
         } else {
             Err(LaunchError::NativeRuntime)
@@ -467,6 +476,10 @@ const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
 // can use its smaller admission charge. Existing K4/V4 releases stay unchanged.
 const K4V3_CONTEXT_RELEASE: Option<(&str, &str)> = None;
 
+// Version-3 scale-code co-optimized K4/V4 (`rsq4kvf`) and cognitive request
+// controls await the next reviewed Prism release pin beyond `0.1.34`.
+const RSQ4KVF_RELEASE: Option<(&str, &str)> = None;
+
 // Full-model K4/V4 context needs the separately reviewed larger live-state and
 // checkpoint guards, not just the existing paired memory protocol. This exact
 // source supplies the geometry-derived Swift allowance; generic graphs retain
@@ -489,6 +502,14 @@ pub(super) fn full_context_supported() -> Result<bool, LaunchError> {
 
 fn k4v3_context_supported(release: &ReleasePin) -> bool {
     K4V3_CONTEXT_RELEASE.is_some_and(|identity| {
+        MEMORY_CONTEXT_RELEASE == Some(identity)
+            && release.version == identity.0
+            && release.commit == identity.1
+    })
+}
+
+fn rsq4kvf_supported(release: &ReleasePin) -> bool {
+    RSQ4KVF_RELEASE.is_some_and(|identity| {
         MEMORY_CONTEXT_RELEASE == Some(identity)
             && release.version == identity.0
             && release.commit == identity.1
@@ -555,12 +576,12 @@ fn select_wy_f32_kv_cache(
     }
     match kv_cache {
         Some(KvCache::F16) => Ok(()),
-        Some(KvCache::Rsq4 | KvCache::Rsq4K3v)
+        Some(KvCache::Rsq4 | KvCache::Rsq4Kvf | KvCache::Rsq4K3v)
             if reviewed_release_matches(release, rotated_kv_release) =>
         {
             Ok(())
         }
-        Some(KvCache::Rsq4 | KvCache::Rsq4K3v) => Err(LaunchError::NativeRuntime),
+        Some(KvCache::Rsq4 | KvCache::Rsq4Kvf | KvCache::Rsq4K3v) => Err(LaunchError::NativeRuntime),
         None => Err(LaunchError::Arguments),
     }
 }

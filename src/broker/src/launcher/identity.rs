@@ -976,7 +976,7 @@ mod tests {
     -> Result<(), serde_json::Error> {
         use crate::inference::KvCache;
         use serde_json::json;
-        for policy in [KvCache::Rsq4, KvCache::Rsq4K3v] {
+        for policy in [KvCache::Rsq4, KvCache::Rsq4Kvf, KvCache::Rsq4K3v] {
             for repacked in [false, true] {
                 for adapter in [false, true] {
                     let (mut model, graph) = kv_cache_model(repacked, adapter);

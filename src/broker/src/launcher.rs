@@ -58,7 +58,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--native-row-workers 1|4|8|12] (Rust defaults to 8 on Snapdragon X1/X2 or 4 otherwise; publisher supports only 1)\n",
     "  [--prompt-reuse disabled|latest|prompt-end-and-latest] (reviewed native runtime only)\n",
     "  [--prompt-reuse-checkpoints 1..=8] [--prompt-reuse-checkpoint-bytes <bytes>] (reviewed native runtime only; requires --prompt-reuse)\n",
-    "  [--kv-cache f16|rsq4|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
+    "  [--kv-cache f16|rsq4|rsq4kvf|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
     "  [--cpu-prefill-tokens 8|16|32] (reviewed native runtime only; enables layer-major CPU FFN tile prefill)\n",
     "  [--cpu-prefill-gdn sequential|wy-f32] (reviewed native runtime only; requires --cpu-prefill-tokens; wy-f32 excludes suffix speculation)\n",
     "  [--spec-type none|suffix] [--draft-max 1..=8] (reviewed native runtime only; suffix requires --cpu-prefill-tokens and suppresses mmproj)\n",
@@ -627,12 +627,14 @@ impl LaunchConfig {
         use bonsai_cpu_policy::context::SwiftContextProfile;
         if self.native_engine {
             match self.kv_cache {
-                Some(crate::inference::KvCache::Rsq4)
+                Some(crate::inference::KvCache::Rsq4 | crate::inference::KvCache::Rsq4Kvf)
                     if crate::inference::full_context_supported()? =>
                 {
                     Ok(SwiftContextProfile::NativeRsq4Full)
                 }
-                Some(crate::inference::KvCache::Rsq4) => Ok(SwiftContextProfile::NativeRsq4),
+                Some(crate::inference::KvCache::Rsq4 | crate::inference::KvCache::Rsq4Kvf) => {
+                    Ok(SwiftContextProfile::NativeRsq4)
+                }
                 Some(crate::inference::KvCache::Rsq4K3v) => Ok(SwiftContextProfile::NativeRsq4K3v),
                 Some(crate::inference::KvCache::F16) | None => Ok(SwiftContextProfile::NativeF16),
             }
@@ -3859,12 +3861,18 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
-        let mut unsupported = native.clone();
-        unsupported.extend(["--kv-cache", "rsq4k3v"].map(OsString::from));
-        assert_eq!(
-            LaunchConfig::parse(unsupported).err(),
-            Some(LaunchError::NativeRuntime)
-        );
+        for (flag, name) in [
+            ("rsq4k3v", KvCache::Rsq4K3v),
+            ("rsq4kvf", KvCache::Rsq4Kvf),
+        ] {
+            let mut unsupported = native.clone();
+            unsupported.extend(["--kv-cache", flag].map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(unsupported).err(),
+                Some(LaunchError::NativeRuntime),
+                "{flag} ({name:?}) should wait for its reviewed release pin"
+            );
+        }
         let data = std::env::temp_dir().join("Bonsai-kv-routing");
         let key = data.join("backend.key");
         let plan = super::LaunchPlan::for_profile_with_options(
@@ -3877,7 +3885,7 @@ mod tests {
         )
         .map_err(|_| LaunchError::Policy)?;
         let mut config = LaunchConfig::parse(native)?;
-        for policy in [KvCache::Rsq4, KvCache::F16, KvCache::Rsq4K3v] {
+        for policy in [KvCache::Rsq4, KvCache::Rsq4Kvf, KvCache::F16, KvCache::Rsq4K3v] {
             config.kv_cache = Some(policy);
             let child = config.native_arguments(&plan, Some(&key));
             assert_eq!(
@@ -4472,7 +4480,7 @@ mod tests {
             bonsai_cpu_policy::swift_mmproj_artifact(&data).map_err(|_| LaunchError::Policy)?;
         let gib = 1024 * 1024 * 1024_u64;
 
-        for policy in [KvCache::Rsq4, KvCache::F16, KvCache::Rsq4K3v] {
+        for policy in [KvCache::Rsq4, KvCache::Rsq4Kvf, KvCache::F16, KvCache::Rsq4K3v] {
             config.kv_cache = Some(policy);
             let profile = config.swift_context_profile()?;
             for available in [17 * gib, 18 * gib, 20 * gib, 22 * gib, 24 * gib, 48 * gib] {
