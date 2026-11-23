@@ -3033,25 +3033,46 @@ mod tests {
             .map(|t| std::array::from_fn(|b| i32::try_from((t + b) % 4).unwrap_or(0)))
             .collect();
         let mut full = make_codec()?;
-        let mut per_frame = Vec::new();
-        for row in &codes {
-            per_frame
-                .extend(full.decode_stream_cancellable(std::slice::from_ref(row), &mut || Ok(()))?);
-        }
         let mut batched = make_codec()?;
-        let mut dyadic = Vec::new();
-        for (start, len) in [(0, 1), (1, 2), (3, 4), (7, 8), (15, 5)] {
-            dyadic.extend(
-                batched.decode_stream_cancellable(&codes[start..start + len], &mut || Ok(()))?,
-            );
-        }
+        let mut primed = make_codec()?;
+        let (per_frame, dyadic) = std::thread::scope(|scope| -> std::io::Result<_> {
+            let full_h = scope.spawn(|| -> std::io::Result<Vec<f32>> {
+                let mut out = Vec::new();
+                for row in &codes {
+                    out.extend(
+                        full.decode_stream_cancellable(std::slice::from_ref(row), &mut || Ok(()))?,
+                    );
+                }
+                Ok(out)
+            });
+            let batched_h = scope.spawn(|| -> std::io::Result<Vec<f32>> {
+                let mut out = Vec::new();
+                for (start, len) in [(0, 1), (1, 2), (3, 4), (7, 8), (15, 5)] {
+                    out.extend(
+                        batched.decode_stream_cancellable(
+                            &codes[start..start + len],
+                            &mut || Ok(()),
+                        )?,
+                    );
+                }
+                Ok(out)
+            });
+            let primed_h = scope.spawn(|| primed.prime_reference(&codes));
+            let per_frame = full_h
+                .join()
+                .map_err(|_| std::io::Error::other("full codec worker panicked"))??;
+            let dyadic = batched_h
+                .join()
+                .map_err(|_| std::io::Error::other("batched codec worker panicked"))??;
+            primed_h
+                .join()
+                .map_err(|_| std::io::Error::other("primed codec worker panicked"))??;
+            Ok((per_frame, dyadic))
+        })?;
         assert_eq!(
             dyadic.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             per_frame.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
-
-        let mut primed = make_codec()?;
-        primed.prime_reference(&codes)?;
         assert_eq!(primed.state.audio.pos, full.state.audio.pos);
         assert_eq!(primed.state.audio.pre_conv, full.state.audio.pre_conv);
         assert_eq!(primed.state.audio.upsample_dw, full.state.audio.upsample_dw);

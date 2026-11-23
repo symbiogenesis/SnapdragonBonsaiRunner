@@ -25,6 +25,11 @@ mod numerics;
 pub mod observation;
 mod philox;
 pub mod replay;
+/// Internal binary entrypoint module; not a public API.
+#[cfg(feature = "rust-qualification")]
+#[doc(hidden)]
+#[path = "replay/consumer.rs"]
+pub mod replay_consumer;
 mod sampling;
 pub mod speaker_encoder;
 mod tokenizer;
@@ -770,6 +775,27 @@ fn bounded_input(text: &str, maximum: usize) -> io::Result<&str> {
     Ok(text)
 }
 
+/// Formats a sanitized synthesis error message without leaking untrusted text.
+#[doc(hidden)]
+#[must_use]
+pub fn format_synthesis_failure(error: &io::Error) -> String {
+    let stage = synthesis_failure_stage(error).unwrap_or("request execution");
+    format!(
+        "Qwen TTS synthesis failed at {stage}; error kind: {:?}.",
+        error.kind()
+    )
+}
+
+/// Formats a sanitized startup error message without leaking untrusted text.
+#[doc(hidden)]
+#[must_use]
+pub fn format_startup_failure(stage: &'static str, error: &io::Error) -> String {
+    format!(
+        "Qwen TTS startup failed at {stage}; error kind: {:?}.",
+        error.kind()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -986,5 +1012,31 @@ mod tests {
         }
         assert!(bounded_input(" \n\t", MAX_TEXT).is_err());
         assert!(bounded_input("voice\0description", MAX_VOICE).is_err());
+    }
+
+    #[test]
+    fn synthesis_failure_retains_kind_without_untrusted_error_text() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "private prompt, voice description and C:/private/credential.key",
+        );
+        let message = super::format_synthesis_failure(&error);
+        assert!(message.contains("request execution"));
+        assert!(message.contains("BrokenPipe"));
+        assert!(!message.contains("private"));
+        assert!(!message.contains("credential"));
+    }
+
+    #[test]
+    fn startup_failure_retains_stage_and_kind_without_private_error_text() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "private prompt, voice description and C:/private/credential.key",
+        );
+        let message = super::format_startup_failure("Rust model loading", &error);
+        assert!(message.contains("Rust model loading"));
+        assert!(message.contains("InvalidData"));
+        assert!(!message.contains("private"));
+        assert!(!message.contains("credential"));
     }
 }

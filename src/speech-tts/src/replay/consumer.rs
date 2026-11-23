@@ -1,5 +1,10 @@
 //! Immutable intake and inherited owner deadline for an ordered TTS replay.
 
+use crate::{
+    Synthesizer,
+    observation::ARITHMETIC_IDENTITY,
+    replay::{Binding, Provider, Replay, Tolerance, Tolerances},
+};
 use bonsai_artifacts::{VerifiedFile, open_locked_file};
 use bonsai_native_hash::{Hasher, hash_bytes};
 #[cfg(test)]
@@ -7,11 +12,6 @@ use bonsai_speech_service::replay_harness::arguments;
 use bonsai_speech_service::replay_harness::{
     Artifact, ClockSpec, Identity, ReplayRunConfig, Rule, bounded_bytes, hexadecimal, invalid,
     power_snapshot, run_replay, validate_provider_pair, verify_artifact, verify_candidate_image,
-};
-use bonsai_speech_tts::{
-    Synthesizer,
-    observation::ARITHMETIC_IDENTITY,
-    replay::{Binding, Provider, Replay, Tolerance, Tolerances},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -354,11 +354,8 @@ fn compare(request: &Request, report: &mut Value) -> io::Result<()> {
     Ok(())
 }
 
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "Keep the executable entry adapter private to its parent module."
-)]
-pub(super) fn run() -> io::Result<bool> {
+/// Executes the source-bound TTS replay consumer entrypoint.
+pub fn run() -> io::Result<bool> {
     let config = ReplayRunConfig {
         provider: "bonsai-tts-replay",
         power_scope: "Consumer entry/exit and each candidate case only; aggregate setup, reference-arm and retention observations remain required.",

@@ -84,36 +84,24 @@ impl bonsai_speech_service::Engine for NativeEngine {
     }
 }
 
-#[cfg(any(windows, test))]
-fn synthesis_failure(error: &io::Error) -> String {
-    #[cfg(windows)]
-    let stage = bonsai_speech_tts::synthesis_failure_stage(error).unwrap_or("request execution");
-    #[cfg(not(windows))]
-    let stage = "request execution";
-    format!(
-        "Qwen TTS synthesis failed at {stage}; error kind: {:?}.",
-        error.kind()
-    )
-}
-
 #[cfg(windows)]
 fn report_synthesis_failure(error: &io::Error) {
-    let _written = writeln!(io::stderr().lock(), "{}", synthesis_failure(error));
-}
-
-#[cfg(any(windows, test))]
-fn startup_failure(stage: &'static str, error: &io::Error) -> String {
-    format!(
-        "Qwen TTS startup failed at {stage}; error kind: {:?}.",
-        error.kind()
-    )
+    let _written = writeln!(
+        io::stderr().lock(),
+        "{}",
+        bonsai_speech_tts::format_synthesis_failure(error)
+    );
 }
 
 #[cfg(windows)]
 fn startup_step<T>(stage: &'static str, action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     let _written = writeln!(io::stderr().lock(), "Qwen TTS startup stage: {stage}.");
     action().inspect_err(|error| {
-        let _written = writeln!(io::stderr().lock(), "{}", startup_failure(stage, error));
+        let _written = writeln!(
+            io::stderr().lock(),
+            "{}",
+            bonsai_speech_tts::format_startup_failure(stage, error)
+        );
     })
 }
 
@@ -123,7 +111,7 @@ fn run() -> io::Result<()> {
         let _written = writeln!(
             io::stderr().lock(),
             "{}",
-            startup_failure("native host", error)
+            bonsai_speech_tts::format_startup_failure("native host", error)
         );
     })?;
     let command =
@@ -131,7 +119,7 @@ fn run() -> io::Result<()> {
             let _written = writeln!(
                 io::stderr().lock(),
                 "{}",
-                startup_failure("arguments", error)
+                bonsai_speech_tts::format_startup_failure("arguments", error)
             );
         })?;
     match command {
@@ -182,7 +170,7 @@ fn run() -> io::Result<()> {
                 let _written = writeln!(
                     io::stderr().lock(),
                     "{}",
-                    startup_failure(stage, &failure.error)
+                    bonsai_speech_tts::format_startup_failure(stage, &failure.error)
                 );
                 failure.error
             })?;
@@ -197,7 +185,7 @@ fn run() -> io::Result<()> {
                 let _written = writeln!(
                     io::stderr().lock(),
                     "{}",
-                    startup_failure("Rust model loading", error)
+                    bonsai_speech_tts::format_startup_failure("Rust model loading", error)
                 );
             })?;
             let engine = NativeEngine {
@@ -241,34 +229,5 @@ fn main() -> ExitCode {
             "Native Qwen speech service failed; check verified models and local configuration."
         );
         ExitCode::FAILURE
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn synthesis_failure_retains_kind_without_untrusted_error_text() {
-        let error = std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "private prompt, voice description and C:/private/credential.key",
-        );
-        let message = super::synthesis_failure(&error);
-        assert!(message.contains("request execution"));
-        assert!(message.contains("BrokenPipe"));
-        assert!(!message.contains("private"));
-        assert!(!message.contains("credential"));
-    }
-
-    #[test]
-    fn startup_failure_retains_stage_and_kind_without_private_error_text() {
-        let error = std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "private prompt, voice description and C:/private/credential.key",
-        );
-        let message = super::startup_failure("Rust model loading", &error);
-        assert!(message.contains("Rust model loading"));
-        assert!(message.contains("InvalidData"));
-        assert!(!message.contains("private"));
-        assert!(!message.contains("credential"));
     }
 }

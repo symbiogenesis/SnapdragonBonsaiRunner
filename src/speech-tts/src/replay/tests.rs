@@ -181,22 +181,41 @@ fn packet() -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn graph_events(
+struct ReplayFixture {
+    binding: Binding<'static>,
+    prompt_rows: Vec<Vec<f32>>,
+    prompt_trailing: Vec<Vec<f32>>,
+    caches_by_pos: Vec<Vec<LayerKvCache>>,
+}
+
+impl ReplayFixture {
+    fn new() -> Self {
+        Self {
+            binding: binding(),
+            prompt_rows: vec![vec![1.0, -0.0], vec![2.0, -3.0]],
+            prompt_trailing: vec![vec![-1.0, 0.0]],
+            caches_by_pos: (0..=16).map(caches).collect(),
+        }
+    }
+}
+
+fn graph_events_with_fixture(
+    fixture: &ReplayFixture,
     observer: &mut impl FnMut(Observation<'_>) -> io::Result<()>,
     phase: Phase,
 ) -> io::Result<()> {
     let mut observe =
         |observation: TalkerObservation<'_>| observer(Observation::Talker { phase, observation });
     observe(TalkerObservation::Prompt {
-        rows: &[vec![1.0, -0.0], vec![2.0, -3.0]],
-        trailing: &[vec![-1.0, 0.0]],
+        rows: &fixture.prompt_rows,
+        trailing: &fixture.prompt_trailing,
         cacheable_rows: 1,
     })?;
     observe(TalkerObservation::Logits {
         frame: 0,
         hidden: &[3.0, -4.0],
         logits: &[0.25, -0.5],
-        cache: &caches(2),
+        cache: &fixture.caches_by_pos[2],
     })?;
     observe(TalkerObservation::Decision {
         frame: 0,
@@ -205,7 +224,9 @@ fn graph_events(
     })?;
     observe(TalkerObservation::Predictor {
         frame: 0,
-        observation: PredictorObservation::Prefill { cache: &caches(1) },
+        observation: PredictorObservation::Prefill {
+            cache: &fixture.caches_by_pos[1],
+        },
     })?;
     for codebook in 0..15 {
         observe(TalkerObservation::Predictor {
@@ -214,7 +235,7 @@ fn graph_events(
                 codebook,
                 hidden: &[-2.0, 1.0],
                 logits: &[9.0, -9.0],
-                cache: &caches(codebook + 2),
+                cache: &fixture.caches_by_pos[codebook + 2],
             },
         })?;
         observe(TalkerObservation::Predictor {
@@ -238,7 +259,7 @@ fn graph_events(
             frame: 1,
             hidden: &[-3.0, 4.0],
             logits: &[-0.25, 0.5],
-            cache: &caches(3),
+            cache: &fixture.caches_by_pos[3],
         },
     })?;
     observer(Observation::Talker {
@@ -251,23 +272,48 @@ fn graph_events(
     })
 }
 
-fn drive_events(observer: &mut impl FnMut(Observation<'_>) -> io::Result<()>) -> io::Result<()> {
-    graph_events(observer, Phase::Design)?;
+fn graph_events(
+    observer: &mut impl FnMut(Observation<'_>) -> io::Result<()>,
+    phase: Phase,
+) -> io::Result<()> {
+    let fixture = ReplayFixture::new();
+    graph_events_with_fixture(&fixture, observer, phase)
+}
+
+fn drive_events_with_fixture(
+    fixture: &ReplayFixture,
+    observer: &mut impl FnMut(Observation<'_>) -> io::Result<()>,
+) -> io::Result<()> {
+    graph_events_with_fixture(fixture, observer, Phase::Design)?;
     observer(Observation::Pcm {
         phase: Phase::Design,
         samples: &[0.125, -0.125, 0.25],
     })?;
     observer(Observation::Speaker(&[2.0, -3.0]))?;
     observer(Observation::ReferenceCodes(&[[0; 16]]))?;
-    graph_events(observer, Phase::Base)?;
+    graph_events_with_fixture(fixture, observer, Phase::Base)?;
     observer(Observation::Complete {
         samples: 2,
         sample_rate: 24_000,
     })
 }
 
+fn drive_events(observer: &mut impl FnMut(Observation<'_>) -> io::Result<()>) -> io::Result<()> {
+    let fixture = ReplayFixture::new();
+    drive_events_with_fixture(&fixture, observer)
+}
+
+fn drive_with_fixture<R: io::Read>(
+    fixture: &ReplayFixture,
+    replay: &mut Replay<R>,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<()> {
+    drive_events_with_fixture(fixture, &mut |event| replay.observe(event, cancel))
+}
+
 fn drive<R: io::Read>(replay: &mut Replay<R>, cancel: &mut impl FnMut() -> bool) -> io::Result<()> {
-    drive_events(&mut |event| replay.observe(event, cancel))
+    let fixture = ReplayFixture::new();
+    drive_with_fixture(&fixture, replay, cancel)
 }
 
 #[test]
@@ -321,29 +367,69 @@ fn tts_replay_rejects_changed_identities_workers_voice_and_tolerances() -> io::R
 fn tts_replay_rejects_truncation_mutation_reordering_and_trailing_data() -> io::Result<()> {
     let original = packet()?;
     let header_len = header()?.len();
-    // Truncate at each byte: none of the original replay inputs can disappear.
-    for end in header_len..original.len() {
-        let mut replay = Replay::new(&original[..end], &binding(), Tolerances::BITS)?;
-        assert!(drive(&mut replay, &mut || false).is_err(), "length {end}");
-        assert!(replay.failed && !replay.complete);
-        assert!(
-            replay
-                .observe(Observation::Speaker(&[]), &mut || false)
-                .is_err()
-        );
-    }
-    // Sample mutations across original record bytes, including cache bits and IDs.
-    for index in (header_len..original.len()).step_by(37) {
-        let mut changed = original.clone();
-        changed[index] ^= 1;
-        let mut replay = Replay::new(changed.as_slice(), &binding(), Tolerances::BITS)?;
-        assert!(drive(&mut replay, &mut || false).is_err(), "byte {index}");
-    }
+    let fixture = ReplayFixture::new();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 16);
+    let total = original.len() - header_len;
+    let chunk_size = total.div_ceil(workers);
+    std::thread::scope(|scope| -> io::Result<()> {
+        let mut handles = Vec::with_capacity(workers);
+        for worker_idx in 0..workers {
+            let start = header_len + worker_idx * chunk_size;
+            if start >= original.len() {
+                break;
+            }
+            let stop = (start + chunk_size).min(original.len());
+            let original_ref = &original;
+            let fixture_ref = &fixture;
+            handles.push(scope.spawn(move || -> io::Result<()> {
+                let mut changed = original_ref.clone();
+                for end in start..stop {
+                    // Truncate at each byte: none of the original replay inputs can disappear.
+                    let mut replay =
+                        Replay::new(&original_ref[..end], &fixture_ref.binding, Tolerances::BITS)?;
+                    assert!(
+                        drive_with_fixture(fixture_ref, &mut replay, &mut || false).is_err(),
+                        "length {end}"
+                    );
+                    assert!(replay.failed && !replay.complete);
+                    assert!(
+                        replay
+                            .observe(Observation::Speaker(&[]), &mut || false)
+                            .is_err()
+                    );
+                    // Sample mutations across original record bytes, including cache bits and IDs.
+                    if (end - header_len).is_multiple_of(37) {
+                        changed[end] ^= 1;
+                        let mut mut_replay = Replay::new(
+                            changed.as_slice(),
+                            &fixture_ref.binding,
+                            Tolerances::BITS,
+                        )?;
+                        assert!(
+                            drive_with_fixture(fixture_ref, &mut mut_replay, &mut || false)
+                                .is_err(),
+                            "byte {end}"
+                        );
+                        changed[end] ^= 1;
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("replay check worker panicked"))??;
+        }
+        Ok(())
+    })?;
     let mut trailing = original.clone();
     trailing.push(0);
-    let mut replay = Replay::new(trailing.as_slice(), &binding(), Tolerances::BITS)?;
-    assert!(drive(&mut replay, &mut || false).is_err());
-    let mut replay = Replay::new(original.as_slice(), &binding(), Tolerances::BITS)?;
+    let mut replay = Replay::new(trailing.as_slice(), &fixture.binding, Tolerances::BITS)?;
+    assert!(drive_with_fixture(&fixture, &mut replay, &mut || false).is_err());
+    let mut replay = Replay::new(original.as_slice(), &fixture.binding, Tolerances::BITS)?;
     assert!(
         replay
             .observe(Observation::Speaker(&[2.0, -3.0]), &mut || false)
@@ -377,16 +463,17 @@ fn tts_replay_float_rules_preserve_exceptional_bits_and_finite_bounds() {
 #[test]
 fn tts_replay_cancellation_and_unwind_are_sticky() -> io::Result<()> {
     let bytes = packet()?;
+    let fixture = ReplayFixture::new();
     let mut checks = 0;
-    let mut complete = Replay::new(bytes.as_slice(), &binding(), Tolerances::BITS)?;
-    drive(&mut complete, &mut || {
+    let mut complete = Replay::new(bytes.as_slice(), &fixture.binding, Tolerances::BITS)?;
+    drive_with_fixture(&fixture, &mut complete, &mut || {
         checks += 1;
         false
     })?;
     for boundary in 1..=checks {
-        let mut replay = Replay::new(bytes.as_slice(), &binding(), Tolerances::BITS)?;
+        let mut replay = Replay::new(bytes.as_slice(), &fixture.binding, Tolerances::BITS)?;
         let mut seen = 0;
-        let error = drive(&mut replay, &mut || {
+        let error = drive_with_fixture(&fixture, &mut replay, &mut || {
             seen += 1;
             seen == boundary
         });
@@ -396,9 +483,9 @@ fn tts_replay_cancellation_and_unwind_are_sticky() -> io::Result<()> {
         );
         assert!(replay.failed && !replay.complete);
     }
-    let mut replay = Replay::new(bytes.as_slice(), &binding(), Tolerances::BITS)?;
+    let mut replay = Replay::new(bytes.as_slice(), &fixture.binding, Tolerances::BITS)?;
     let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drive(&mut replay, &mut || {
+        drive_with_fixture(&fixture, &mut replay, &mut || {
             std::panic::resume_unwind(Box::new("cancel owner unwound"))
         })
     }));

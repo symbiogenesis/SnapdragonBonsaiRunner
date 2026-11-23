@@ -1406,21 +1406,35 @@ mod tests {
 
             let n_fft_f64 = f64::from(u32::try_from(n_fft).unwrap_or(0));
             let two_pi = 2.0_f64 * core::f64::consts::PI;
-            for (k, &got_mag) in mag.iter().enumerate() {
-                let mut re = 0.0_f64;
-                let mut im = 0.0_f64;
-                let kf = f64::from(u32::try_from(k).unwrap_or(0));
-                for (n, &w) in windowed.iter().enumerate() {
-                    let th = two_pi * kf * f64::from(u32::try_from(n).unwrap_or(0)) / n_fft_f64;
-                    re += f64::from(w) * th.cos();
-                    im -= f64::from(w) * th.sin();
+            let workers = std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+                .clamp(1, mag.len().max(1));
+            let chunk_len = mag.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                for (chunk_idx, mag_chunk) in mag.chunks(chunk_len).enumerate() {
+                    let base_k = chunk_idx * chunk_len;
+                    let windowed_ref = &windowed;
+                    scope.spawn(move || {
+                        for (offset, &got_mag) in mag_chunk.iter().enumerate() {
+                            let k = base_k + offset;
+                            let mut re = 0.0_f64;
+                            let mut im = 0.0_f64;
+                            let kf = f64::from(u32::try_from(k).unwrap_or(0));
+                            for (n, &w) in windowed_ref.iter().enumerate() {
+                                let th = two_pi * kf * f64::from(u32::try_from(n).unwrap_or(0))
+                                    / n_fft_f64;
+                                re += f64::from(w) * th.cos();
+                                im -= f64::from(w) * th.sin();
+                            }
+                            let ref_mag = (re * re + im * im + 1e-9_f64).sqrt();
+                            assert!(
+                                (f64::from(got_mag) - ref_mag).abs() <= 1e-4,
+                                "n_fft={n_fft} k={k} got={got_mag} ref={ref_mag}"
+                            );
+                        }
+                    });
                 }
-                let ref_mag = (re * re + im * im + 1e-9_f64).sqrt();
-                assert!(
-                    (f64::from(got_mag) - ref_mag).abs() <= 1e-4,
-                    "n_fft={n_fft} k={k} got={got_mag} ref={ref_mag}"
-                );
-            }
+            });
         }
         Ok(())
     }

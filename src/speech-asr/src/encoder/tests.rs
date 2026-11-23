@@ -561,17 +561,45 @@ fn rust_asr_encoder_repacks_aligned_q4_k_projections() -> io::Result<()> {
         window: 5,
         max_positions: 2,
     };
-    let conv_out = make_q4_k_linear(c.channels, c.hidden, 1)?;
-    let block = Block {
-        attention_norm: norm(c.hidden),
-        ffn_norm: norm(c.hidden),
-        query: make_q4_k_linear(c.hidden, c.hidden, 2)?,
-        key: make_q4_k_linear(c.hidden, c.hidden, 3)?,
-        value: make_q4_k_linear(c.hidden, c.hidden, 4)?,
-        attention_out: make_q4_k_linear(c.hidden, c.hidden, 5)?,
-        ffn_in: make_q4_k_linear(c.hidden, c.intermediate, 6)?,
-        ffn_out: make_q4_k_linear(c.intermediate, c.hidden, 7)?,
-    };
+    let (conv_out, block, output_in, output_out) = std::thread::scope(|scope| -> io::Result<_> {
+        let h_g1 = scope.spawn(|| -> io::Result<_> {
+            Ok((
+                make_q4_k_linear(c.channels, c.hidden, 1)?,
+                make_q4_k_linear(c.hidden, c.hidden, 2)?,
+                make_q4_k_linear(c.hidden, c.hidden, 3)?,
+            ))
+        });
+        let h_g2 = scope.spawn(|| -> io::Result<_> {
+            Ok((
+                make_q4_k_linear(c.hidden, c.hidden, 4)?,
+                make_q4_k_linear(c.hidden, c.hidden, 5)?,
+                make_q4_k_linear(c.hidden, c.intermediate, 6)?,
+            ))
+        });
+        let g3 = (
+            make_q4_k_linear(c.intermediate, c.hidden, 7)?,
+            make_q4_k_linear(c.hidden, c.hidden, 8)?,
+            make_q4_k_linear(c.hidden, c.output, 9)?,
+        );
+        let (conv_out, query, key) = h_g1
+            .join()
+            .map_err(|_| io::Error::other("encoder fixture worker panicked"))??;
+        let (value, attention_out, ffn_in) = h_g2
+            .join()
+            .map_err(|_| io::Error::other("encoder fixture worker panicked"))??;
+        let (ffn_out, output_in, output_out) = g3;
+        let block = Block {
+            attention_norm: norm(c.hidden),
+            ffn_norm: norm(c.hidden),
+            query,
+            key,
+            value,
+            attention_out,
+            ffn_in,
+            ffn_out,
+        };
+        Ok((conv_out, block, output_in, output_out))
+    })?;
     let enc = Encoder::new(
         c,
         Weights {
@@ -583,8 +611,8 @@ fn rust_asr_encoder_repacks_aligned_q4_k_projections() -> io::Result<()> {
             convolution_out: conv_out.weights,
             blocks: vec![block],
             output_norm: norm(c.hidden),
-            output_in: make_q4_k_linear(c.hidden, c.hidden, 8)?,
-            output_out: make_q4_k_linear(c.hidden, c.output, 9)?,
+            output_in,
+            output_out,
         },
     )?
     .with_threads(2)?;

@@ -20,11 +20,13 @@ rust-qualification = ["dep:bonsai-artifacts", "dep:bonsai-cpu-policy", "dep:serd
 [[bin]]
 name = "bonsai-speech-tts"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "bonsai-tts-replay"
 path = "src/replay_main.rs"
 required-features = ["rust-qualification"]
+test = false
 
 [dependencies]
 bonsai-artifacts = { workspace = true, optional = true }

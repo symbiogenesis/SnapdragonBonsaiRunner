@@ -4243,14 +4243,10 @@ mod tests {
             let mut qs = [0_i32; 32];
             for (dst, &val) in qs.iter_mut().zip(chunk) {
                 let scaled = (val * inv_d).round_ties_even().clamp(-127.0, 127.0);
-                let mag = (0_u8..=127)
-                    .find(|&c| f32::from(c) == scaled.abs())
-                    .unwrap_or(0);
-                *dst = if scaled < 0.0 {
-                    -i32::from(mag)
-                } else {
-                    i32::from(mag)
-                };
+                // scaled.abs() is an exact integer in 0..=127; adding 2^23 aligns it in bits 0..7.
+                let mag =
+                    i32::try_from((scaled.abs() + 8_388_608.0_f32).to_bits() & 0x7f).unwrap_or(0);
+                *dst = if scaled < 0.0 { -mag } else { mag };
             }
             act_blocks.push((d, qs));
         }
@@ -4322,35 +4318,72 @@ mod tests {
                     }
                 };
 
-                for batch in [1_usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 19] {
-                    let raw_input = (0..batch * input)
-                        .map(|idx| {
-                            if idx % 23 == 0 {
-                                -0.0
-                            } else {
-                                (f32::from(u16::try_from((idx * 7) % 41).unwrap_or(0)) - 20.0)
-                                    * 0.03125
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let mut expected = Vec::with_capacity(batch * output);
-                    for pos in 0..batch {
-                        expected.extend(scalar_multiply_reference(
+                const WORKERS_LIST: [usize; 3] = [1, 3, 8];
+                let max_batch = 19_usize;
+                let raw_input_full: Vec<f32> = (0..max_batch * input)
+                    .map(|idx| {
+                        if idx % 23 == 0 {
+                            -0.0
+                        } else {
+                            (f32::from(u16::try_from((idx * 7) % 41).unwrap_or(0)) - 20.0) * 0.03125
+                        }
+                    })
+                    .collect();
+                let mut expected_full = Vec::with_capacity(max_batch * output);
+                for pos in 0..max_batch {
+                    expected_full.extend(scalar_multiply_reference(
+                        weights,
+                        &raw_input_full[pos * input..(pos + 1) * input],
+                    ));
+                }
+                let expected_bits_full: Vec<u32> =
+                    expected_full.iter().map(|v| v.to_bits()).collect();
+                #[cfg(all(windows, feature = "rust-qualification"))]
+                let q8_ref_bits_full: Vec<u32> = if is_q8 {
+                    let mut q8_ref = Vec::with_capacity(max_batch * output);
+                    for pos in 0..max_batch {
+                        q8_ref.extend(scalar_q8_x_q8_reference(
                             weights,
-                            &raw_input[pos * input..(pos + 1) * input],
+                            &raw_input_full[pos * input..(pos + 1) * input],
                         ));
                     }
-                    let expected_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-                    let mut worker1_batch_bits: Option<Vec<u32>> = None;
+                    q8_ref.iter().map(|v| v.to_bits()).collect()
+                } else {
+                    Vec::new()
+                };
+                let single_bits_by_workers: Vec<Vec<u32>> = WORKERS_LIST
+                    .iter()
+                    .map(|&workers| {
+                        let mut all_single_bits = Vec::with_capacity(max_batch * output);
+                        let mut single_out = vec![0.0_f32; output];
+                        for pos in 0..max_batch {
+                            multiply_single_into(
+                                weights,
+                                &raw_input_full[pos * input..(pos + 1) * input],
+                                workers,
+                                &mut single_out,
+                            );
+                            all_single_bits.extend(single_out.iter().map(|v| v.to_bits()));
+                        }
+                        all_single_bits
+                    })
+                    .collect();
 
-                    for workers in [1_usize, 3, 8] {
-                        let mut prepared = PreparedBatch::new(&raw_input, batch, input);
-                        let mut batch_out = vec![0.0_f32; batch * output];
-                        let mut scratch = Vec::new();
+                for batch in [1_usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, max_batch] {
+                    let raw_input = &raw_input_full[..batch * input];
+                    let expected = &expected_full[..batch * output];
+                    let expected_bits = &expected_bits_full[..batch * output];
+                    let mut worker1_batch_bits: Option<Vec<u32>> = None;
+                    let mut prepared = PreparedBatch::new(raw_input, batch, input);
+                    let mut scratch = Vec::new();
+                    let mut batch_out = vec![0.0_f32; batch * output];
+
+                    for (w_idx, &workers) in WORKERS_LIST.iter().enumerate() {
+                        batch_out.fill(0.0);
                         multiply_batch_prepared_into(
                             weights,
                             &mut prepared,
-                            &raw_input,
+                            raw_input,
                             workers,
                             &mut scratch,
                             &mut batch_out,
@@ -4364,47 +4397,31 @@ mod tests {
                         } else {
                             worker1_batch_bits = Some(batch_bits.clone());
                         }
-                        let mut all_single_bits = Vec::with_capacity(batch * output);
-                        let mut single_out = vec![0.0_f32; output];
-                        for pos in 0..batch {
-                            multiply_single_into(
-                                weights,
-                                &raw_input[pos * input..(pos + 1) * input],
-                                workers,
-                                &mut single_out,
-                            );
-                            all_single_bits.extend(single_out.iter().map(|v| v.to_bits()));
-                        }
                         assert_eq!(
-                            all_single_bits, batch_bits,
+                            single_bits_by_workers[w_idx][..batch * output],
+                            batch_bits[..],
                             "single vs batch q8={is_q8} out={output} batch={batch} workers={workers}"
                         );
                         #[cfg(not(all(windows, feature = "rust-qualification")))]
                         assert_eq!(
-                            batch_bits, expected_bits,
+                            batch_bits.as_slice(),
+                            expected_bits,
                             "exact bits q8={is_q8} out={output} batch={batch} workers={workers}"
                         );
                         #[cfg(all(windows, feature = "rust-qualification"))]
                         if !is_q8 {
                             assert_eq!(
-                                batch_bits, expected_bits,
+                                batch_bits.as_slice(),
+                                expected_bits,
                                 "exact bits q8={is_q8} out={output} batch={batch} workers={workers}"
                             );
                         } else {
-                            let mut q8_ref = Vec::with_capacity(batch * output);
-                            for pos in 0..batch {
-                                q8_ref.extend(scalar_q8_x_q8_reference(
-                                    weights,
-                                    &raw_input[pos * input..(pos + 1) * input],
-                                ));
-                            }
-                            let q8_ref_bits: Vec<u32> =
-                                q8_ref.iter().map(|v| v.to_bits()).collect();
                             assert_eq!(
-                                batch_bits, q8_ref_bits,
+                                batch_bits.as_slice(),
+                                &q8_ref_bits_full[..batch * output],
                                 "exact Q8xQ8 bits out={output} batch={batch} workers={workers}"
                             );
-                            for (&got, &want) in batch_out.iter().zip(&expected) {
+                            for (&got, &want) in batch_out.iter().zip(expected) {
                                 let tol = 2.5_f32.max(want.abs() * 0.02);
                                 assert!(
                                     (got - want).abs() <= tol,

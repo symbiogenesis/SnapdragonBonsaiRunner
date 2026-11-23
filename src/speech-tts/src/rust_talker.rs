@@ -1763,54 +1763,76 @@ pub(crate) mod tests {
 
         // Prompt, first raw semantic logits/decision, predictor prefill,
         // fifteen raw-logit/decision pairs, frame, final logits/EOS decision.
-        for stop in 1..=37 {
-            for unwind in [false, true] {
-                let mut talker = reference_fixture()?;
-                talker.layers = vec![tiny_layer()?, tiny_layer()?];
-                talker.predictor.layers = vec![tiny_layer()?, tiny_layer()?];
-                let mut seen = 0;
-                let mut delivered = 0;
-                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    talker.generate_observed(
-                        "x",
-                        Some("i"),
-                        None,
-                        &mut |_| {
-                            delivered += 1;
-                            Ok(())
-                        },
-                        &mut || Ok(()),
-                        &mut |_| {
-                            seen += 1;
-                            if seen == stop {
-                                if unwind {
-                                    std::panic::resume_unwind(Box::new("observer refused"));
-                                }
-                                return Err(std::io::Error::other("observer refused"));
-                            }
-                            Ok(())
-                        },
-                    )
-                }));
-                assert_eq!(seen, stop);
-                assert!(result.map_or(unwind, |result| result.is_err()));
-                assert_eq!(delivered, usize::from(stop > 35));
-                assert!(talker.prefill_cache.is_none());
-                let mut fresh_frames = Vec::new();
-                talker.generate(
-                    "x",
-                    Some("i"),
-                    None,
-                    &mut |frame| {
-                        fresh_frames.push(frame);
+        let cases: Vec<(usize, bool)> = (1..=37_usize)
+            .flat_map(|stop| [(stop, false), (stop, true)])
+            .collect();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .clamp(1, cases.len());
+        let chunk_len = cases.len().div_ceil(workers);
+        std::thread::scope(|scope| -> std::io::Result<()> {
+            let handles: Vec<_> = cases
+                .chunks(chunk_len)
+                .map(|chunk| {
+                    scope.spawn(move || -> std::io::Result<()> {
+                        let mut talker = reference_fixture()?;
+                        talker.layers = vec![tiny_layer()?, tiny_layer()?];
+                        talker.predictor.layers = vec![tiny_layer()?, tiny_layer()?];
+                        for &(stop, unwind) in chunk {
+                            let mut seen = 0;
+                            let mut delivered = 0;
+                            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                talker.generate_observed(
+                                    "x",
+                                    Some("i"),
+                                    None,
+                                    &mut |_| {
+                                        delivered += 1;
+                                        Ok(())
+                                    },
+                                    &mut || Ok(()),
+                                    &mut |_| {
+                                        seen += 1;
+                                        if seen == stop {
+                                            if unwind {
+                                                std::panic::resume_unwind(Box::new(
+                                                    "observer refused",
+                                                ));
+                                            }
+                                            return Err(std::io::Error::other("observer refused"));
+                                        }
+                                        Ok(())
+                                    },
+                                )
+                            }));
+                            assert_eq!(seen, stop);
+                            assert!(result.map_or(unwind, |result| result.is_err()));
+                            assert_eq!(delivered, usize::from(stop > 35));
+                            assert!(talker.prefill_cache.is_none());
+                            let mut fresh_frames = Vec::new();
+                            talker.generate(
+                                "x",
+                                Some("i"),
+                                None,
+                                &mut |frame| {
+                                    fresh_frames.push(frame);
+                                    Ok(())
+                                },
+                                &mut || Ok(()),
+                            )?;
+                            assert_eq!(fresh_frames, [[0; 16]]);
+                        }
                         Ok(())
-                    },
-                    &mut || Ok(()),
-                )?;
-                assert_eq!(fresh_frames, [[0; 16]]);
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| std::io::Error::other("talker boundary worker panicked"))??;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     #[test]

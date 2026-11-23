@@ -4086,9 +4086,32 @@ mod tests {
     use crate::{SAMPLE_RATE, SAMPLE_RATE_48K};
 
     fn values(count: usize) -> Vec<f32> {
-        (0..count)
-            .map(|i| f32::from(i16::try_from(i % 37).unwrap_or(0) - 18) * 0.013)
-            .collect()
+        let base: [f32; 37] =
+            std::array::from_fn(|i| f32::from(i16::try_from(i).unwrap_or(0) - 18) * 0.013);
+        let mut tile = [0.0_f32; 37 * 16];
+        for chunk in tile.chunks_exact_mut(37) {
+            chunk.copy_from_slice(&base);
+        }
+        let mut out = vec![0.0_f32; count];
+        let mut chunks = out.chunks_exact_mut(tile.len());
+        for chunk in &mut chunks {
+            chunk.copy_from_slice(&tile);
+        }
+        for chunk in chunks.into_remainder().chunks_mut(37) {
+            chunk.copy_from_slice(&base[..chunk.len()]);
+        }
+        out
+    }
+
+    fn assert_f32_bits_eq(actual: &[f32], expected: &[f32], context: &str) {
+        assert_eq!(actual.len(), expected.len(), "{context}: length mismatch");
+        for (idx, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{context}: bit mismatch at {idx} (got={got} want={want})"
+            );
+        }
     }
 
     #[test]
@@ -4998,6 +5021,9 @@ mod tests {
     #[test]
     fn causal_conv1d_okic_zero_spill_matches_f64_and_parallel_streaming_bits() -> std::io::Result<()>
     {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .clamp(1, 16);
         // Exercise both small odd dims and large >= 1 MiB weights (oc-parallel + 4x4 SIMD transpose).
         for (in_c, out_c, kernel, dilation) in
             [(19_usize, 17_usize, 7_usize, 9_usize), (131, 289, 7, 9)]
@@ -5019,56 +5045,89 @@ mod tests {
             conv_fallback.weight_okic = None;
 
             let ctx_frames = conv.stream_context_frames();
-            for frames in [1_usize, 2, 3, 4, 32, 256] {
-                let input = values(frames * in_c);
-                let (offline_t1, out_frames) = conv.forward_parallel(&input, frames, 1)?;
-                assert_eq!(out_frames, frames);
-
-                // Verify f64 reference within <= 2e-5.
-                for t in 0..frames {
-                    for oc in 0..out_c {
-                        let mut acc = f64::from(bias[oc]);
-                        for k in 0..kernel {
-                            let src_t = t + k * dilation;
-                            if src_t >= ctx_frames {
-                                let in_t = src_t - ctx_frames;
-                                for ic in 0..in_c {
-                                    acc += f64::from(weight[(oc * in_c + ic) * kernel + k])
-                                        * f64::from(input[in_t * in_c + ic]);
+            let full_input = values(256 * in_c);
+            let mut full_ref = vec![0.0_f64; 256 * out_c];
+            let row_chunk = 256_usize.div_ceil(workers);
+            std::thread::scope(|scope| {
+                for (chunk_idx, out_chunk) in full_ref.chunks_mut(row_chunk * out_c).enumerate() {
+                    let t_start = chunk_idx * row_chunk;
+                    let weight_ref = &weight;
+                    let bias_ref = &bias;
+                    let input_ref = &full_input;
+                    scope.spawn(move || {
+                        for (local_t, row) in out_chunk.chunks_exact_mut(out_c).enumerate() {
+                            let t = t_start + local_t;
+                            for (oc, slot) in row.iter_mut().enumerate() {
+                                let mut acc = f64::from(bias_ref[oc]);
+                                for k in 0..kernel {
+                                    let src_t = t + k * dilation;
+                                    if src_t >= ctx_frames {
+                                        let in_t = src_t - ctx_frames;
+                                        for ic in 0..in_c {
+                                            acc += f64::from(
+                                                weight_ref[(oc * in_c + ic) * kernel + k],
+                                            ) * f64::from(input_ref[in_t * in_c + ic]);
+                                        }
+                                    }
                                 }
+                                *slot = acc;
                             }
                         }
-                        let got = f64::from(offline_t1[t * out_c + oc]);
-                        assert!(
-                            (got - acc).abs() <= 2e-5,
-                            "f64 mismatch in_c={in_c} out_c={out_c} frames={frames} t={t} oc={oc}: got={got} expected={acc}"
-                        );
-                    }
+                    });
+                }
+            });
+
+            for frames in [1_usize, 2, 3, 4, 32, 256] {
+                let input = &full_input[..frames * in_c];
+                let (offline_t1, out_frames) = conv.forward_parallel(input, frames, 1)?;
+                assert_eq!(out_frames, frames);
+
+                // Verify f64 reference within <= 2e-5 (causal left-padding makes prefix references exact).
+                for (idx, (&got_f32, &acc)) in offline_t1
+                    .iter()
+                    .zip(&full_ref[..frames * out_c])
+                    .enumerate()
+                {
+                    let got = f64::from(got_f32);
+                    let t = idx / out_c;
+                    let oc = idx % out_c;
+                    assert!(
+                        (got - acc).abs() <= 2e-5,
+                        "f64 mismatch in_c={in_c} out_c={out_c} frames={frames} t={t} oc={oc}: got={got} expected={acc}"
+                    );
                 }
 
                 // Verify bit-identical threads in [1, 4, 10, 16] and weight_okic=None fallback.
-                let offline_t1_bits: Vec<u32> = offline_t1.iter().map(|v| v.to_bits()).collect();
+                let mut st = vec![0.0_f32; ctx_frames * in_c];
                 for threads in [1_usize, 4, 10, 16] {
-                    let (par_off, _) = conv.forward_parallel(&input, frames, threads)?;
-                    assert_eq!(
-                        par_off.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        offline_t1_bits,
-                        "offline threads={threads} in_c={in_c} out_c={out_c} frames={frames}"
-                    );
-                    let mut st = vec![0.0_f32; ctx_frames * in_c];
+                    if threads > 1 {
+                        let (par_off, _) = conv.forward_parallel(input, frames, threads)?;
+                        assert_f32_bits_eq(
+                            &par_off,
+                            &offline_t1,
+                            &format!(
+                                "offline threads={threads} in_c={in_c} out_c={out_c} frames={frames}"
+                            ),
+                        );
+                    }
+                    st.fill(0.0);
                     let par_stream =
-                        conv.forward_stream_parallel(&input, frames, &mut st, threads)?;
-                    assert_eq!(
-                        par_stream.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        offline_t1_bits,
-                        "stream threads={threads} in_c={in_c} out_c={out_c} frames={frames}"
+                        conv.forward_stream_parallel(input, frames, &mut st, threads)?;
+                    assert_f32_bits_eq(
+                        &par_stream,
+                        &offline_t1,
+                        &format!(
+                            "stream threads={threads} in_c={in_c} out_c={out_c} frames={frames}"
+                        ),
                     );
                 }
-                let (fallback_out, _) = conv_fallback.forward_parallel(&input, frames, 16)?;
-                assert_eq!(
-                    fallback_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    offline_t1_bits,
-                    "fallback weight_okic=None mismatch in_c={in_c} out_c={out_c} frames={frames}"
+                let (fallback_out, _) = conv_fallback.forward_parallel(input, frames, 16)?;
+                assert_f32_bits_eq(
+                    &fallback_out,
+                    &offline_t1,
+                    &format!(
+                        "fallback weight_okic=None mismatch in_c={in_c} out_c={out_c} frames={frames}"
+                    ),
                 );
 
                 // Verify chunked [1, 2, 4, 8] streaming vs offline bits.
@@ -5086,10 +5145,12 @@ mod tests {
                     )?);
                     cursor += take;
                 }
-                assert_eq!(
-                    streamed.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    offline_t1_bits,
-                    "chunked [1,2,4,8] streaming mismatch in_c={in_c} out_c={out_c} frames={frames}"
+                assert_f32_bits_eq(
+                    &streamed,
+                    &offline_t1,
+                    &format!(
+                        "chunked [1,2,4,8] streaming mismatch in_c={in_c} out_c={out_c} frames={frames}"
+                    ),
                 );
             }
         }
@@ -5099,13 +5160,77 @@ mod tests {
     #[test]
     fn causal_trans_conv1d_dac_block0_and_odd_shapes_preserve_zero_ulp_bits() -> std::io::Result<()>
     {
-        // Odd out_c and kernel > 2 * stride against complete scalar reference across frames & threads.
-        for (in_c, out_c, kernel, stride) in
-            [(19_usize, 17_usize, 11_usize, 3_usize), (37, 23, 9, 2)]
-        {
+        std::thread::scope(|outer| -> std::io::Result<()> {
+            let odd_handle = outer.spawn(|| -> std::io::Result<()> {
+                // Odd out_c and kernel > 2 * stride against complete scalar reference across frames & threads.
+                for (in_c, out_c, kernel, stride) in
+                    [(19_usize, 17_usize, 11_usize, 3_usize), (37, 23, 9, 2)]
+                {
+                    let raw_weight = values(in_c * out_c * kernel);
+                    let bias = values(out_c);
+                    let trans = CausalTransConv1d::from_ic_oc_k(
+                        in_c,
+                        out_c,
+                        kernel,
+                        stride,
+                        &raw_weight,
+                        Some(bias.clone()),
+                    )?;
+                    let initial_carry = values(trans.carry_frames() * out_c);
+                    let full_input = values(32 * in_c);
+                    for frames in [1_usize, 2, 4, 13, 32] {
+                        let input = &full_input[..frames * in_c];
+                        let mut expected =
+                            vec![0.0_f32; (frames * stride + trans.carry_frames()) * out_c];
+                        expected[..initial_carry.len()].copy_from_slice(&initial_carry);
+                        for t in 0..frames {
+                            for ic in 0..in_c {
+                                for oc in 0..out_c {
+                                    for k in 0..kernel {
+                                        let dest = (t * stride + k) * out_c + oc;
+                                        expected[dest] = input[t * in_c + ic].mul_add(
+                                            raw_weight[(ic * out_c + oc) * kernel + k],
+                                            expected[dest],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let expected_carry = expected[frames * stride * out_c..].to_vec();
+                        expected.truncate(frames * stride * out_c);
+                        for row in expected.chunks_exact_mut(out_c) {
+                            for (value, &b) in row.iter_mut().zip(&bias) {
+                                *value += b;
+                            }
+                        }
+                        for threads in [1_usize, 4, 10, 16] {
+                            let mut carry = initial_carry.clone();
+                            let actual =
+                                trans.forward_stream_parallel(input, frames, &mut carry, threads)?;
+                            assert_f32_bits_eq(
+                                &actual,
+                                &expected,
+                                &format!("odd tconv mismatch in_c={in_c} out_c={out_c} k={kernel} s={stride} frames={frames} threads={threads}"),
+                            );
+                            assert_f32_bits_eq(
+                                &carry,
+                                &expected_carry,
+                                &format!("odd tconv carry in_c={in_c} out_c={out_c} frames={frames} threads={threads}"),
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            });
+
+            // Explicit DAC Block 0 geometry: in_c=1536, out_c=768, k=16, s=8.
+            let in_c = 1536_usize;
+            let out_c = 768_usize;
+            let kernel = 16_usize;
+            let stride = 8_usize;
             let raw_weight = values(in_c * out_c * kernel);
             let bias = values(out_c);
-            let trans = CausalTransConv1d::from_ic_oc_k(
+            let block0 = CausalTransConv1d::from_ic_oc_k(
                 in_c,
                 out_c,
                 kernel,
@@ -5113,176 +5238,228 @@ mod tests {
                 &raw_weight,
                 Some(bias.clone()),
             )?;
-            let initial_carry = values(trans.carry_frames() * out_c);
-            for frames in [1_usize, 2, 4, 13, 32] {
-                let input = values(frames * in_c);
-                let mut expected = vec![0.0_f32; (frames * stride + trans.carry_frames()) * out_c];
-                expected[..initial_carry.len()].copy_from_slice(&initial_carry);
-                for t in 0..frames {
-                    for ic in 0..in_c {
-                        for oc in 0..out_c {
-                            for k in 0..kernel {
-                                let dest = (t * stride + k) * out_c + oc;
-                                expected[dest] = input[t * in_c + ic].mul_add(
-                                    raw_weight[(ic * out_c + oc) * kernel + k],
-                                    expected[dest],
-                                );
+            let initial_carry = values(block0.carry_frames() * out_c);
+            let full_input = values(32 * in_c);
+            let block0_ref = &block0;
+            let initial_carry_ref = &initial_carry;
+            let full_input_ref = &full_input;
+            let raw_weight_ref = &raw_weight;
+            let bias_ref = &bias;
+
+            const BLOCK0_FRAMES: [usize; 3] = [1, 4, 32];
+            let block0_coords: Vec<Vec<(usize, usize)>> = BLOCK0_FRAMES
+                .iter()
+                .map(|&frames| {
+                    if frames <= 4 {
+                        (0..frames * stride + block0_ref.carry_frames())
+                            .flat_map(|y| {
+                                [0_usize, 15, 16, 17, 383, 767]
+                                    .into_iter()
+                                    .map(move |oc| (y, oc))
+                            })
+                            .collect()
+                    } else {
+                        [0_usize, 7, 8, 9, 127, 255, 256, 263]
+                            .into_iter()
+                            .flat_map(|y| {
+                                [0_usize, 15, 16, 511, 767]
+                                    .into_iter()
+                                    .map(move |oc| (y, oc))
+                            })
+                            .collect()
+                    }
+                })
+                .collect();
+
+            let (t1_runs, par_runs, coords_runs) =
+                std::thread::scope(|inner| -> std::io::Result<_> {
+                    let t1_h = inner.spawn(|| -> std::io::Result<Vec<_>> {
+                        let mut out = Vec::with_capacity(BLOCK0_FRAMES.len());
+                        for &frames in &BLOCK0_FRAMES {
+                            let input = &full_input_ref[..frames * in_c];
+                            let mut carry_ref = initial_carry_ref.clone();
+                            let out_t1 = block0_ref.forward_stream_parallel(
+                                input,
+                                frames,
+                                &mut carry_ref,
+                                1,
+                            )?;
+                            out.push((out_t1, carry_ref));
+                        }
+                        Ok(out)
+                    });
+                    // Reuse one thread-local RowWorkerPool across every [1, 4, 32] frame batch.
+                    let par_h = inner.spawn(|| -> std::io::Result<Vec<_>> {
+                        let mut runs = Vec::with_capacity(BLOCK0_FRAMES.len() * 2);
+                        for &frames in &BLOCK0_FRAMES {
+                            let input = &full_input_ref[..frames * in_c];
+                            let mut frame_runs = Vec::with_capacity(2);
+                            for threads in [10_usize, 16] {
+                                let mut carry = initial_carry_ref.clone();
+                                let out_par = block0_ref
+                                    .forward_stream_parallel(input, frames, &mut carry, threads)?;
+                                frame_runs.push((threads, out_par, carry));
                             }
+                            runs.push(frame_runs);
                         }
+                        Ok(runs)
+                    });
+                    let coords_ref = &block0_coords;
+                    let coords_h = inner.spawn(move || -> Vec<Vec<(usize, usize, u32)>> {
+                        BLOCK0_FRAMES
+                            .iter()
+                            .zip(coords_ref)
+                            .map(|(&frames, coords)| {
+                                let input = &full_input_ref[..frames * in_c];
+                                coords
+                                    .iter()
+                                    .map(|&(y, oc)| {
+                                        let mut acc = if y < block0_ref.carry_frames() {
+                                            initial_carry_ref[y * out_c + oc]
+                                        } else {
+                                            0.0_f32
+                                        };
+                                        for t in 0..frames {
+                                            if y >= t * stride && y < t * stride + kernel {
+                                                let k = y - t * stride;
+                                                for ic in 0..in_c {
+                                                    acc = input[t * in_c + ic].mul_add(
+                                                        raw_weight_ref
+                                                            [(ic * out_c + oc) * kernel + k],
+                                                        acc,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        if y < frames * stride {
+                                            acc += bias_ref[oc];
+                                        }
+                                        (y, oc, acc.to_bits())
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    });
+                    let t1_runs = t1_h
+                        .join()
+                        .map_err(|_| std::io::Error::other("block0 t=1 worker panicked"))??;
+                    let par_runs = par_h
+                        .join()
+                        .map_err(|_| std::io::Error::other("block0 parallel worker panicked"))??;
+                    let coords_runs = coords_h
+                        .join()
+                        .map_err(|_| std::io::Error::other("block0 scalar worker panicked"))?;
+                    Ok((t1_runs, par_runs, coords_runs))
+                })?;
+
+            for (((frames, (out_t1, carry_ref)), frame_par), scalar_expected) in BLOCK0_FRAMES
+                .into_iter()
+                .zip(t1_runs)
+                .zip(par_runs)
+                .zip(coords_runs)
+            {
+                for (y, oc, expected_bits) in scalar_expected {
+                    if y < frames * stride {
+                        assert_eq!(
+                            out_t1[y * out_c + oc].to_bits(),
+                            expected_bits,
+                            "DAC Block 0 0-ULP scalar mismatch frames={frames} y={y} oc={oc}"
+                        );
+                    } else {
+                        let cy = y - frames * stride;
+                        assert_eq!(
+                            carry_ref[cy * out_c + oc].to_bits(),
+                            expected_bits,
+                            "DAC Block 0 0-ULP carry mismatch frames={frames} cy={cy} oc={oc}"
+                        );
                     }
                 }
-                let expected_carry = expected[frames * stride * out_c..].to_vec();
-                expected.truncate(frames * stride * out_c);
-                for row in expected.chunks_exact_mut(out_c) {
-                    for (value, &b) in row.iter_mut().zip(&bias) {
-                        *value += b;
-                    }
-                }
-                let expected_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-                let expected_carry_bits: Vec<u32> =
-                    expected_carry.iter().map(|v| v.to_bits()).collect();
-                for threads in [1_usize, 4, 10, 16] {
-                    let mut carry = initial_carry.clone();
-                    let actual =
-                        trans.forward_stream_parallel(&input, frames, &mut carry, threads)?;
-                    assert_eq!(
-                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        expected_bits,
-                        "odd tconv mismatch in_c={in_c} out_c={out_c} k={kernel} s={stride} frames={frames} threads={threads}"
+                for (threads, out_par, carry) in frame_par {
+                    assert_f32_bits_eq(
+                        &out_par,
+                        &out_t1,
+                        &format!("DAC Block 0 frames={frames} threads={threads}"),
                     );
-                    assert_eq!(
-                        carry.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        expected_carry_bits
+                    assert_f32_bits_eq(
+                        &carry,
+                        &carry_ref,
+                        &format!("DAC Block 0 carry frames={frames} threads={threads}"),
                     );
                 }
             }
-        }
-
-        // Explicit DAC Block 0 geometry: in_c=1536, out_c=768, k=16, s=8.
-        let in_c = 1536_usize;
-        let out_c = 768_usize;
-        let kernel = 16_usize;
-        let stride = 8_usize;
-        let raw_weight = values(in_c * out_c * kernel);
-        let bias = values(out_c);
-        let block0 = CausalTransConv1d::from_ic_oc_k(
-            in_c,
-            out_c,
-            kernel,
-            stride,
-            &raw_weight,
-            Some(bias.clone()),
-        )?;
-        let initial_carry = values(block0.carry_frames() * out_c);
-        for frames in [1_usize, 4, 32] {
-            let input = values(frames * in_c);
-            let mut carry_ref = initial_carry.clone();
-            let out_t1 = block0.forward_stream_parallel(&input, frames, &mut carry_ref, 1)?;
-            let out_t1_bits: Vec<u32> = out_t1.iter().map(|v| v.to_bits()).collect();
-            let carry_ref_bits: Vec<u32> = carry_ref.iter().map(|v| v.to_bits()).collect();
-
-            // Check exact scalar replay on all output/carry frames for frames in [1, 4],
-            // and representative boundary/interior/carry coordinates for frames=32.
-            let check_coords: Vec<(usize, usize)> = if frames <= 4 {
-                (0..frames * stride + block0.carry_frames())
-                    .flat_map(|y| {
-                        [0_usize, 15, 16, 17, 383, 767]
-                            .into_iter()
-                            .map(move |oc| (y, oc))
-                    })
-                    .collect()
-            } else {
-                [0_usize, 7, 8, 9, 127, 255, 256, 263]
-                    .into_iter()
-                    .flat_map(|y| {
-                        [0_usize, 15, 16, 511, 767]
-                            .into_iter()
-                            .map(move |oc| (y, oc))
-                    })
-                    .collect()
-            };
-            for (y, oc) in check_coords {
-                let mut acc = if y < block0.carry_frames() {
-                    initial_carry[y * out_c + oc]
-                } else {
-                    0.0_f32
-                };
-                for t in 0..frames {
-                    if y >= t * stride && y < t * stride + kernel {
-                        let k = y - t * stride;
-                        for ic in 0..in_c {
-                            acc = input[t * in_c + ic]
-                                .mul_add(raw_weight[(ic * out_c + oc) * kernel + k], acc);
-                        }
-                    }
-                }
-                if y < frames * stride {
-                    acc += bias[oc];
-                    assert_eq!(
-                        out_t1[y * out_c + oc].to_bits(),
-                        acc.to_bits(),
-                        "DAC Block 0 0-ULP scalar mismatch frames={frames} y={y} oc={oc}"
-                    );
-                } else {
-                    let cy = y - frames * stride;
-                    assert_eq!(
-                        carry_ref[cy * out_c + oc].to_bits(),
-                        acc.to_bits(),
-                        "DAC Block 0 0-ULP carry mismatch frames={frames} cy={cy} oc={oc}"
-                    );
-                }
-            }
-
-            for threads in [10_usize, 16] {
-                let mut carry = initial_carry.clone();
-                let out_par =
-                    block0.forward_stream_parallel(&input, frames, &mut carry, threads)?;
-                assert_eq!(
-                    out_par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    out_t1_bits,
-                    "DAC Block 0 frames={frames} threads={threads}"
-                );
-                assert_eq!(
-                    carry.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    carry_ref_bits,
-                    "DAC Block 0 carry frames={frames} threads={threads}"
-                );
-            }
-        }
-        Ok(())
+            odd_handle
+                .join()
+                .map_err(|_| std::io::Error::other("odd trans_conv worker panicked"))??;
+            Ok(())
+        })
     }
 
     #[test]
     fn convnext_three_stage_parallel_matches_single_thread_bits() -> std::io::Result<()> {
-        for (channels, mid_c) in [(129_usize, 517_usize), (256, 1024)] {
-            let kernel = 7_usize;
-            let block = ConvNeXtBlock {
-                channels,
-                kernel,
-                dw_weight: values(channels * kernel),
-                dw_bias: values(channels),
-                norm_w: vec![1.05; channels],
-                norm_b: values(channels),
-                pwconv1_w: values(mid_c * channels),
-                pwconv1_b: values(mid_c),
-                pwconv2_w: values(channels * mid_c),
-                pwconv2_b: values(channels),
-                gamma: values(channels),
-            };
-            for frames in [1_usize, 2, 4, 32] {
-                let input = values(frames * channels);
+        const FRAMES_LIST: [usize; 4] = [1, 2, 4, 32];
+        let setups: Vec<_> = [(129_usize, 517_usize), (256, 1024)]
+            .into_iter()
+            .map(|(channels, mid_c)| {
+                let kernel = 7_usize;
+                let block = ConvNeXtBlock {
+                    channels,
+                    kernel,
+                    dw_weight: values(channels * kernel),
+                    dw_bias: values(channels),
+                    norm_w: vec![1.05; channels],
+                    norm_b: values(channels),
+                    pwconv1_w: values(mid_c * channels),
+                    pwconv1_b: values(mid_c),
+                    pwconv2_w: values(channels * mid_c),
+                    pwconv2_b: values(channels),
+                    gamma: values(channels),
+                };
+                let full_input = values(32 * channels);
                 let init_state = values((kernel - 1) * channels);
-                let mut state_t1 = init_state.clone();
-                let mut state_t16 = init_state;
-                let out_t1 = block.forward_stream_parallel(&input, frames, &mut state_t1, 1)?;
-                let out_t16 = block.forward_stream_parallel(&input, frames, &mut state_t16, 16)?;
-                assert_eq!(
-                    out_t16.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    out_t1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    "ConvNeXt threads=1 vs 16 mismatch channels={channels} mid_c={mid_c} frames={frames}"
-                );
-                assert_eq!(state_t16, state_t1);
+                (channels, mid_c, block, full_input, init_state)
+            })
+            .collect();
+        let setups_ref = &setups;
+        let run_all = |threads: usize| -> std::io::Result<Vec<(Vec<f32>, Vec<f32>)>> {
+            let mut results = Vec::with_capacity(setups_ref.len() * FRAMES_LIST.len());
+            for &(channels, _, ref block, ref full_input, ref init_state) in setups_ref {
+                for &frames in &FRAMES_LIST {
+                    let input = &full_input[..frames * channels];
+                    let mut st = init_state.clone();
+                    let out = block.forward_stream_parallel(input, frames, &mut st, threads)?;
+                    results.push((out, st));
+                }
             }
+            Ok(results)
+        };
+        let (t1_runs, t16_runs) = std::thread::scope(|scope| -> std::io::Result<_> {
+            let h1 = scope.spawn(|| run_all(1));
+            // Reuse one thread-local RowWorkerPool across every shape and frame batch.
+            let h16 = scope.spawn(|| run_all(16));
+            let t1_runs = h1
+                .join()
+                .map_err(|_| std::io::Error::other("ConvNeXt t=1 worker panicked"))??;
+            let t16_runs = h16
+                .join()
+                .map_err(|_| std::io::Error::other("ConvNeXt t=16 worker panicked"))??;
+            Ok((t1_runs, t16_runs))
+        })?;
+        let labels = setups.iter().flat_map(|&(channels, mid_c, _, _, _)| {
+            FRAMES_LIST
+                .iter()
+                .map(move |&frames| (channels, mid_c, frames))
+        });
+        for ((channels, mid_c, frames), ((out_t1, state_t1), (out_t16, state_t16))) in
+            labels.zip(t1_runs.into_iter().zip(t16_runs))
+        {
+            assert_f32_bits_eq(
+                &out_t16,
+                &out_t1,
+                &format!(
+                    "ConvNeXt threads=1 vs 16 mismatch channels={channels} mid_c={mid_c} frames={frames}"
+                ),
+            );
+            assert_eq!(state_t16, state_t1);
         }
         Ok(())
     }

@@ -1,10 +1,6 @@
 //! Explicit source-bound independent TTS replay; no audio device or native fallback.
 #![forbid(unsafe_code)]
 
-#[cfg(windows)]
-#[path = "replay/consumer.rs"]
-mod consumer;
-
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -12,7 +8,7 @@ fn main() -> ExitCode {
         || {
             #[cfg(windows)]
             {
-                consumer::run()
+                bonsai_speech_tts::replay_consumer::run()
             }
             #[cfg(not(windows))]
             {

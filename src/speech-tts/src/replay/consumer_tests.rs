@@ -12,7 +12,7 @@ fn request() -> Value {
         "target":"aarch64-pc-windows-msvc","executableSha256":"02".repeat(32),
         "arithmetic":"independent-native-tts"});
     let mut candidate = identity.clone();
-    candidate["arithmetic"] = bonsai_speech_tts::observation::ARITHMETIC_IDENTITY.into();
+    candidate["arithmetic"] = crate::observation::ARITHMETIC_IDENTITY.into();
     candidate["executableSha256"] = "03".repeat(32).into();
     let artifact = json!({"path":"C:\\retained\\original","bytes":10,"sha256":"04".repeat(32)});
     json!({"schemaVersion":1,"reference":identity,"candidate":candidate,"quantization":"q8",

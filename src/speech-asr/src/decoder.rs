@@ -2249,81 +2249,100 @@ mod gqa_attention_tests {
 
     #[test]
     fn parallel_gqa_grouped_attend_into_matches_single_head_bit_for_bit() -> io::Result<()> {
-        for precision in [CachePrecision::F32, CachePrecision::F16] {
-            for head_dim in [6_usize, 64] {
-                for gqa_ratio in [1_usize, 2, 4, 8] {
-                    for position in [32_usize, 67] {
-                        let kv_heads = 4_usize;
-                        let c = Config {
-                            hidden: 64,
-                            heads: kv_heads * gqa_ratio,
-                            kv_heads,
-                            head_dim,
-                            intermediate: 128,
-                            context: 256,
-                            epsilon: 1e-6,
-                            rope_theta: 10_000.0,
-                            cache_precision: precision,
-                        };
-                        let (query, cur_k, cur_v, state) = make_inputs(c, position)?;
-                        let kv_width = c.kv_heads * c.head_dim;
-                        let divisor = scalar(c.head_dim).sqrt();
-                        let mut expected = zeros(c.heads * c.head_dim)?;
-                        let mut head_scores = zeros(position + 1)?;
-                        for head in 0..c.heads {
-                            let kv_head = head / gqa_ratio;
-                            let offset = kv_head * c.head_dim;
-                            attend_head_causal(
-                                &query[head * c.head_dim..(head + 1) * c.head_dim],
-                                &state,
-                                Some(&cur_k[offset..offset + c.head_dim]),
-                                Some(&cur_v[offset..offset + c.head_dim]),
-                                position,
-                                kv_width,
-                                offset,
-                                c.head_dim,
-                                divisor,
-                                &mut head_scores,
-                                &mut expected[head * c.head_dim..(head + 1) * c.head_dim],
-                            )?;
+        let combos = [
+            (CachePrecision::F32, 6_usize),
+            (CachePrecision::F32, 64_usize),
+            (CachePrecision::F16, 6_usize),
+            (CachePrecision::F16, 64_usize),
+        ];
+        std::thread::scope(|scope| -> io::Result<()> {
+            let handles: Vec<_> = combos
+                .into_iter()
+                .map(|(precision, head_dim)| {
+                    scope.spawn(move || -> io::Result<()> {
+                        for gqa_ratio in [1_usize, 2, 4, 8] {
+                            for position in [32_usize, 67] {
+                                let kv_heads = 4_usize;
+                                let c = Config {
+                                    hidden: 64,
+                                    heads: kv_heads * gqa_ratio,
+                                    kv_heads,
+                                    head_dim,
+                                    intermediate: 128,
+                                    context: 256,
+                                    epsilon: 1e-6,
+                                    rope_theta: 10_000.0,
+                                    cache_precision: precision,
+                                };
+                                let (query, cur_k, cur_v, state) = make_inputs(c, position)?;
+                                let kv_width = c.kv_heads * c.head_dim;
+                                let divisor = scalar(c.head_dim).sqrt();
+                                let mut expected = zeros(c.heads * c.head_dim)?;
+                                let mut head_scores = zeros(position + 1)?;
+                                for head in 0..c.heads {
+                                    let kv_head = head / gqa_ratio;
+                                    let offset = kv_head * c.head_dim;
+                                    attend_head_causal(
+                                        &query[head * c.head_dim..(head + 1) * c.head_dim],
+                                        &state,
+                                        Some(&cur_k[offset..offset + c.head_dim]),
+                                        Some(&cur_v[offset..offset + c.head_dim]),
+                                        position,
+                                        kv_width,
+                                        offset,
+                                        c.head_dim,
+                                        divisor,
+                                        &mut head_scores,
+                                        &mut expected[head * c.head_dim..(head + 1) * c.head_dim],
+                                    )?;
+                                }
+                                let seq_grouped = attend_with_workers(
+                                    &query,
+                                    &cur_k,
+                                    &cur_v,
+                                    &state,
+                                    c,
+                                    position,
+                                    1,
+                                    &mut || false,
+                                )?;
+                                let par_grouped = attend_with_workers(
+                                    &query,
+                                    &cur_k,
+                                    &cur_v,
+                                    &state,
+                                    c,
+                                    position,
+                                    4,
+                                    &mut || false,
+                                )?;
+                                let expected_bits: Vec<u32> =
+                                    expected.iter().map(|v| v.to_bits()).collect();
+                                let seq_bits: Vec<u32> =
+                                    seq_grouped.iter().map(|v| v.to_bits()).collect();
+                                let par_bits: Vec<u32> =
+                                    par_grouped.iter().map(|v| v.to_bits()).collect();
+                                assert_eq!(
+                                    seq_bits, expected_bits,
+                                    "seq mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
+                                );
+                                assert_eq!(
+                                    par_bits, expected_bits,
+                                    "par mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
+                                );
+                            }
                         }
-                        let seq_grouped = attend_with_workers(
-                            &query,
-                            &cur_k,
-                            &cur_v,
-                            &state,
-                            c,
-                            position,
-                            1,
-                            &mut || false,
-                        )?;
-                        let par_grouped = attend_with_workers(
-                            &query,
-                            &cur_k,
-                            &cur_v,
-                            &state,
-                            c,
-                            position,
-                            4,
-                            &mut || false,
-                        )?;
-                        let expected_bits: Vec<u32> =
-                            expected.iter().map(|v| v.to_bits()).collect();
-                        let seq_bits: Vec<u32> = seq_grouped.iter().map(|v| v.to_bits()).collect();
-                        let par_bits: Vec<u32> = par_grouped.iter().map(|v| v.to_bits()).collect();
-                        assert_eq!(
-                            seq_bits, expected_bits,
-                            "seq mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
-                        );
-                        assert_eq!(
-                            par_bits, expected_bits,
-                            "par mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
-                        );
-                    }
-                }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| io::Error::other("GQA test worker panicked"))??;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     #[test]

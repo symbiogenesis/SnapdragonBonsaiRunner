@@ -455,82 +455,106 @@ fn rust_asr_engine_rejects_invalid_thread_budgets_before_opening_model() {
 
 #[test]
 fn rust_asr_live_capture_eight_second_chunk_prefill_and_options() -> io::Result<()> {
-    let mut recognizer = recognizer(0)?;
     let full_pcm = vec![0.0_f32; 128_201];
-    let expected = recognizer.transcribe(&full_pcm)?;
+    std::thread::scope(|scope| -> io::Result<()> {
+        let offline_handle = scope.spawn(|| -> io::Result<String> {
+            let mut recognizer = recognizer(0)?;
+            let expected = recognizer.transcribe(&full_pcm)?;
+            assert_cleared(&recognizer);
+            Ok(expected)
+        });
+        let live_handle = scope.spawn(|| -> io::Result<String> {
+            let mut recognizer = recognizer(0)?;
+            let live_text = {
+                let mut live = recognizer.begin_live_capture(&mut || false)?;
+                let mut rows = live.push_pcm(&full_pcm[..64_000], &mut || false)?;
+                assert_eq!(rows, 0);
+                rows += live.push_pcm(&full_pcm[64_000..], &mut || false)?;
+                assert!(rows > 0);
+                live.finish(&mut || false)?
+            };
+            assert_cleared(&recognizer);
+            Ok(live_text)
+        });
+        let drop_handle = scope.spawn(|| -> io::Result<()> {
+            let mut recognizer = recognizer(0)?;
+            // Dropping LiveCapture prematurely resets session cleanly.
+            {
+                let mut live = recognizer.begin_live_capture(&mut || false)?;
+                let _ = live.push_pcm(&full_pcm, &mut || false)?;
+                assert!(live.push_pcm(&[f32::NAN; 4], &mut || false).is_err());
+            }
+            assert_cleared(&recognizer);
+            Ok(())
+        });
 
-    {
-        let mut live = recognizer.begin_live_capture(&mut || false)?;
-        let mut rows = live.push_pcm(&full_pcm[..64_000], &mut || false)?;
-        assert_eq!(rows, 0);
-        rows += live.push_pcm(&full_pcm[64_000..], &mut || false)?;
-        assert!(rows > 0);
-        let live_text = live.finish(&mut || false)?;
+        // Short-clip hint (<= 1.5s) accepts valid language string and rejects control chars;
+        // clips > 1.5s skip the short-clip hint even if the language token isn't in vocab.
+        let mut hinted_rec = recognizer_ext(
+            0,
+            &[
+                "L", "a", "n", "g", "u", "e", "s", ":", "Ġ", "E", "l", "i", "h", ".",
+            ],
+        )?;
+        let hinted = hinted_rec.transcribe_with_options(
+            &[0.0; 201],
+            &crate::protocol::TranscribeOptions {
+                short_clip_language: Some("English"),
+                trim_repetition_on_stop: false,
+            },
+            &mut || false,
+        )?;
+        assert_eq!(hinted, "");
+        let mut recognizer_long = recognizer(0)?;
+        let long_skipped = recognizer_long.transcribe_with_options(
+            &full_pcm[..24_001],
+            &crate::protocol::TranscribeOptions {
+                short_clip_language: Some("French"),
+                trim_repetition_on_stop: false,
+            },
+            &mut || false,
+        )?;
+        assert_eq!(long_skipped, "");
+        assert!(
+            hinted_rec
+                .transcribe_with_options(
+                    &[0.0; 201],
+                    &crate::protocol::TranscribeOptions {
+                        short_clip_language: Some("\n"),
+                        trim_repetition_on_stop: false,
+                    },
+                    &mut || false,
+                )
+                .is_err()
+        );
+        assert_cleared(&hinted_rec);
+        assert_cleared(&recognizer_long);
+
+        // Repetition recovery returns trimmed result cleanly instead of failing.
+        let mut rep_recognizer = recognizer_with_eos(1)?;
+        let recovered = rep_recognizer.transcribe_with_options(
+            &[0.0; 201],
+            &crate::protocol::TranscribeOptions {
+                short_clip_language: None,
+                trim_repetition_on_stop: true,
+            },
+            &mut || false,
+        )?;
+        assert_eq!(recovered, "<|endoftext|>");
+        assert_cleared(&rep_recognizer);
+
+        let expected = offline_handle
+            .join()
+            .map_err(|_| io::Error::other("offline worker panicked"))??;
+        let live_text = live_handle
+            .join()
+            .map_err(|_| io::Error::other("live worker panicked"))??;
         assert_eq!(live_text, expected);
-    }
-    assert_cleared(&recognizer);
-
-    // Dropping LiveCapture prematurely resets session cleanly.
-    {
-        let mut live = recognizer.begin_live_capture(&mut || false)?;
-        let _ = live.push_pcm(&[0.0; 128_201], &mut || false)?;
-        assert!(live.push_pcm(&[f32::NAN; 4], &mut || false).is_err());
-    }
-    assert_cleared(&recognizer);
-
-    // Short-clip hint (<= 1.5s) accepts valid language string and rejects control chars;
-    // clips > 1.5s skip the short-clip hint even if the language token isn't in vocab.
-    let mut hinted_rec = recognizer_ext(
-        0,
-        &[
-            "L", "a", "n", "g", "u", "e", "s", ":", "Ġ", "E", "l", "i", "h", ".",
-        ],
-    )?;
-    let hinted = hinted_rec.transcribe_with_options(
-        &[0.0; 201],
-        &crate::protocol::TranscribeOptions {
-            short_clip_language: Some("English"),
-            trim_repetition_on_stop: false,
-        },
-        &mut || false,
-    )?;
-    assert_eq!(hinted, "");
-    let long_skipped = recognizer.transcribe_with_options(
-        &vec![0.0; 24_001],
-        &crate::protocol::TranscribeOptions {
-            short_clip_language: Some("French"),
-            trim_repetition_on_stop: false,
-        },
-        &mut || false,
-    )?;
-    assert_eq!(long_skipped, "");
-    assert!(
-        hinted_rec
-            .transcribe_with_options(
-                &[0.0; 201],
-                &crate::protocol::TranscribeOptions {
-                    short_clip_language: Some("\n"),
-                    trim_repetition_on_stop: false,
-                },
-                &mut || false,
-            )
-            .is_err()
-    );
-    assert_cleared(&recognizer);
-
-    // Repetition recovery returns trimmed result cleanly instead of failing.
-    let mut rep_recognizer = recognizer_with_eos(1)?;
-    let recovered = rep_recognizer.transcribe_with_options(
-        &[0.0; 201],
-        &crate::protocol::TranscribeOptions {
-            short_clip_language: None,
-            trim_repetition_on_stop: true,
-        },
-        &mut || false,
-    )?;
-    assert_eq!(recovered, "<|endoftext|>");
-    assert_cleared(&rep_recognizer);
-    Ok(())
+        drop_handle
+            .join()
+            .map_err(|_| io::Error::other("drop worker panicked"))??;
+        Ok(())
+    })
 }
 
 fn recognizer_with_eos(eos: u32) -> io::Result<RustRecognizer> {
