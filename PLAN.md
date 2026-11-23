@@ -488,6 +488,9 @@ adoption decisions without displacing native daily-use acceptance.
   complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
   online-softmax work only if selected-context attention is a measured bottleneck.
+  (Prism commit `9dca673` additionally added zero-spill 2-pass `dot_pair_six_neon` /
+  2-key `dot_two_keys_six_neon` decode, once-per-group F16 score pre-packing, and 2D
+  `(token_chunk, kv_head)` prefill parallelism (`0 ULP`).)
 - [ ] Qualify explicit [latest-prefix reuse](docs/native-rust-engine.md#latest-prefix-reuse) across service,
   broker and UI: edited/switched histories, scale changes, cancellation/faults,
   fresh-state parity, bounded eviction/resources and repeated-history benefit.
@@ -523,11 +526,13 @@ adoption decisions without displacing native daily-use acceptance.
   `generate_sampled_speculative_until` sampler/RNG order, stacked Orca +
   DaisyRose adapter compatibility, and matched-power X1/X2 complete-cycle
   benefit before serving enablement.
-  (Source landed in `prism-inference` commits `f27213d`, `93bd46c`, and `2d4e0d7`
-  with synthetic hybrid/adapter unit controls in `speculative::tests`,
-  `graph::prefill::folded_tests`, and `runtime::sampled_speculation::tests`;
-  hosted CI, serving wire-up, and matched-power X1/X2 complete-cycle benefit
-  qualification remain open.)
+  (Source landed in `prism-inference` commits `f27213d`, `93bd46c`, and `2d4e0d7`,
+  with `98e79fc` adding an O(1) `SuffixTree` root edge index and unblocking
+  mixed-phase folded suffix speculation alongside non-tile-capable Hexagon/Composite
+  executors, with synthetic hybrid/adapter unit controls in `speculative::tests`,
+  `graph::prefill::folded_tests`, `runtime::sampled_speculation::tests`, and
+  `native_backend::tests`; hosted CI, full serving enablement, and matched-power
+  X1/X2 complete-cycle benefit qualification remain open.)
 - [ ] Apply reviewed [cache/batch/transfer planning](docs/inference-algorithms.md#cache-batch-and-transfer-planning)
   to selected consumers: complete page identities, one cache owner, bounded
   transfer queues, terminal completion and cancellation before publication/reuse.
@@ -609,7 +614,13 @@ adoption decisions without displacing native daily-use acceptance.
   Mimi pre-transformer) plus `cbfd8765`/`6c78adc4`/`267d4b00`/`87128152`
   (`bonsai-speech-asr` 8-row repacked `Q4_K`, unified `row_workers` batch
   quantization, parallel SIMD 4x4 `scatter_rows_to_batch`, and SIMD encoder
-  LayerNorm/bias/residual/tiled attention). Complete
+  LayerNorm/bias/residual/tiled attention), plus Wave 5 Runner commits
+  `6bdb6b22`/`4b5cd1fa`/`6e3e4660`/`63b970a3`/`fe1ebae2`/`de57117e` (ARM64 8-row
+  `SDOT` and `8x8`/`8x4`/`8x2` `I8MM` `Q8_0` kernels in `bonsai-windows-process`,
+  `[oc, k, ic]` zero-spill `4x4` L1-blocked `CausalConv1d`, `0-ULP` phase-blocked
+  `CausalTransConv1d` gather GEMM + 3-stage `ConvNeXtBlock`, 4x Estrin `SnakeBeta` +
+  parallel copy/residual, `speech-asr` Conv2d stem & lazy `PreparedBatch`, and
+  `speech-tts` zero-alloc `forward_group_into` + cached RoPE tables). Complete
   compiled CI, actual-model `fp64`/teacher-forced/WER/listening, and
   X1/X2 device qualification gates before promotion.
 - [ ] Retire the remaining Windows queue ABI, ASR, Prism reference and publisher
@@ -1498,7 +1509,12 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   added native coalesced `Q8_0` GPU weight kernels/dispatch (avoiding F32
   dequantization of `output.weight`/`lm_head`) plus single-dispatch
   register-resident batched GDN scan, in-place `conv1d_silu`, and strided
-  `l2_norm` (verified in live `Adreno(TM) X2-90 GPU` parity tests); physical X2/X1-85 hardware parity, TDR
+  `l2_norm`, and Prism commits `5199218`/`7ec9f63`/`68ea175` added pipelined
+  multi-CB submits, inline stage storage, persistent pre-baked descriptors,
+  `HOST_CACHED` readback, fused `Permute+MulSign+Hadamard1024+QuantQ8K/Q8_0`,
+  inter-layer `AddRMSNorm`, register-resident decode GDN, `local_size=(64,8,1)`
+  16-token shared-weight prefill GEMMs, and streaming `PTQ1_0` trit decode
+  (verified in live `Adreno(TM) X2-90 GPU` parity tests); physical X2/X1-85 hardware parity, TDR
   qualification, and release lock promotion remain open.
 - [ ] Qualify the opt-in native ARM64 OpenCL original-PQ2/Q8_K projection
   pilot under unchanged mitigations, including owning hosted analysis/linking,
@@ -1731,7 +1747,12 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   `8..=32` token prefill kernels + 4-way register-blocked `MultiRankAdapter` NEON
   kernels (`0 ULP`) landed in `ec4bcfa`, and `dot_pair`/`gdn_wy_update_eight_rows`
   NEON register-spill elimination plus 4-row fused-pass state-only GDN prefill
-  (`0 ULP` bit-exact) landed in Prism `4c745eb` and `3d4ef57`; device crossover benchmarking remains open.)
+  (`0 ULP` bit-exact) landed in Prism `4c745eb` and `3d4ef57`, followed by
+  Wave 5 Prism commits `ce41d2f`/`7b31409`/`bc408d0`/`9dca673`/`11a4db4`
+  (PQ2/PTQ1 8x8 prefill & 16-row PTQ1 sibling decode, caller-participating
+  `NativeRowPool`, zero-spill 6-head GQA + 2-key decode + 2D prefill, and
+  batched `2x4` GDN state dots + fused state-only carry flush, all `0 ULP`);
+  device crossover benchmarking remains open.)
 - [ ] **#25 — Remaining shared activation-preparation consumers.** Extend shared
   transform-and-quantize preparation to remaining recurrent sibling projections
   sharing identical input, basis, width and quantizer. (Recurrent sibling audit on
