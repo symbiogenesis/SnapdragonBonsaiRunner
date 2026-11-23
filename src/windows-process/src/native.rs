@@ -93,6 +93,7 @@ mod output;
 pub(super) mod power;
 pub(super) mod power_policy;
 pub(super) mod presentation;
+pub(super) mod quant_q8;
 pub(super) mod replacement;
 pub(super) mod row_pool;
 pub(super) mod signature;

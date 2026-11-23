@@ -14,6 +14,42 @@ pub use bonsai_neon_dot::{
 };
 pub use bonsai_ternary::{checked_float_to_half, float_to_half, unpack_q4_k_scale_min};
 
+/// Computes eight `Q8_0` row dot products while sharing activations per block (`0-ULP` vs `dot_q8_0_row`).
+#[must_use]
+pub fn dot_q8_0_8rows(caps: Arm64QuantCaps, rows: [&[u8]; 8], act: &[Q8_0ActBlock]) -> [f32; 8] {
+    crate::native::quant_q8::dot_q8_0_8rows(caps, rows, act)
+}
+
+/// Computes an 8-row by 8-token `Q8_0` tile using `I8MM` (`SMMLA`) or exact `SDOT`/portable fallback.
+#[must_use]
+pub fn gemm_q8_0_8x8(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    acts: [&[Q8_0ActBlock]; 8],
+) -> [[f32; 8]; 8] {
+    crate::native::quant_q8::gemm_q8_0_8x8(caps, rows, acts)
+}
+
+/// Computes an 8-row by 4-token `Q8_0` tile using `I8MM` (`SMMLA`) or exact `SDOT`/portable fallback.
+#[must_use]
+pub fn gemm_q8_0_8x4(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    acts: [&[Q8_0ActBlock]; 4],
+) -> [[f32; 4]; 8] {
+    crate::native::quant_q8::gemm_q8_0_8x4(caps, rows, acts)
+}
+
+/// Computes an 8-row by 2-token `Q8_0` tile using `I8MM` (`SMMLA`) or exact `SDOT`/portable fallback.
+#[must_use]
+pub fn gemm_q8_0_8x2(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    acts: [&[Q8_0ActBlock]; 2],
+) -> [[f32; 2]; 8] {
+    crate::native::quant_q8::gemm_q8_0_8x2(caps, rows, acts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +437,153 @@ mod tests {
             assert!((f64::from(q6_g_nat[r][0]) - dot_f64(&w_f64, &x0)).abs() < 6.0);
             assert!((f64::from(q6_g_nat[r][1]) - dot_f64(&w_f64, &x1)).abs() < 6.0);
         }
+    }
+
+    fn make_edge_q8_0_row(blocks: usize, seed: usize) -> Vec<u8> {
+        // Mix positive, negative, subnormal, +0.0, -0.0, and FMA-sensitive scales plus extreme i8 values.
+        const SCALE_BITS: [u16; 10] = [
+            0x3C01, // 1 + 2^-10 (FMA-sensitive)
+            0xBC03, // -(1 + 3*2^-10)
+            0x0001, // smallest positive subnormal f16
+            0x8001, // smallest negative subnormal f16
+            0x0000, // +0.0
+            0x8000, // -0.0
+            0x3555, // ~0.33325 (FMA-sensitive repeating binary)
+            0xB557, // ~-0.33374
+            0x4213, // ~3.037
+            0xC215, // ~-3.041
+        ];
+        const EXTREME_I8: [i8; 8] = [i8::MIN, i8::MIN + 1, -63, -1, 0, 1, 64, i8::MAX];
+        let mut bytes = Vec::with_capacity(blocks * Q8_0_BLOCK_BYTES);
+        for b in 0..blocks {
+            let scale = SCALE_BITS[(seed * 5 + b * 3) % SCALE_BITS.len()];
+            bytes.extend_from_slice(&scale.to_le_bytes());
+            for k in 0..32 {
+                let q = if (seed + b + k) % 7 == 0 {
+                    EXTREME_I8[(seed + b * 11 + k) % EXTREME_I8.len()]
+                } else {
+                    i8::try_from(
+                        isize::try_from((seed * 29 + b * 17 + k * 43) % 256).unwrap_or(0) - 128,
+                    )
+                    .unwrap_or(0)
+                };
+                bytes.push(q.cast_unsigned());
+            }
+        }
+        bytes
+    }
+
+    fn make_edge_q8_0_act(blocks: usize, token: usize) -> Vec<Q8_0ActBlock> {
+        const EXTREME_I8: [i8; 8] = [i8::MIN, -127, -1, 0, 1, 63, 126, i8::MAX];
+        (0..blocks)
+            .map(|b| {
+                let d = match (token + b) % 7 {
+                    0 => -0.0_f32,
+                    1 => 0.0_f32,
+                    2 => -0.333_333_34_f32,
+                    3 => 1.0_f32 / 7.0_f32,
+                    4 => -2.125_f32,
+                    5 => 1.0e-4_f32,
+                    _ => 0.777_777_8_f32,
+                };
+                let mut qs = [0_i8; 32];
+                for (k, slot) in qs.iter_mut().enumerate() {
+                    *slot = if (token + b + k) % 5 == 0 {
+                        EXTREME_I8[(token * 3 + b * 7 + k) % EXTREME_I8.len()]
+                    } else {
+                        i8::try_from(
+                            isize::try_from((token * 37 + b * 19 + k * 23) % 256).unwrap_or(0)
+                                - 128,
+                        )
+                        .unwrap_or(0)
+                    };
+                }
+                Q8_0ActBlock { d, qs }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn q8_0_8row_and_8x_gemm_match_row_and_portable_bit_exact() {
+        let caps = Arm64QuantCaps::detect();
+        let port = Arm64QuantCaps::portable();
+
+        for blocks in [0_usize, 1, 2, 3, 5, 17] {
+            let rows_vec: Vec<Vec<u8>> = (0..8)
+                .map(|r| {
+                    if r % 2 == 0 {
+                        make_edge_q8_0_row(blocks, r + 1)
+                    } else {
+                        make_q8_0_row(blocks, r + 9)
+                    }
+                })
+                .collect();
+            let row_refs: [&[u8]; 8] = std::array::from_fn(|r| rows_vec[r].as_slice());
+
+            let acts_vec: [Vec<Q8_0ActBlock>; 8] =
+                std::array::from_fn(|t| make_edge_q8_0_act(blocks, t));
+            let act8_refs: [&[Q8_0ActBlock]; 8] = std::array::from_fn(|t| acts_vec[t].as_slice());
+            let act4_refs: [&[Q8_0ActBlock]; 4] = std::array::from_fn(|t| acts_vec[t].as_slice());
+            let act2_refs: [&[Q8_0ActBlock]; 2] = std::array::from_fn(|t| acts_vec[t].as_slice());
+
+            let expected: [[u32; 8]; 8] = std::array::from_fn(|r| {
+                std::array::from_fn(|t| dot_q8_0_row(port, row_refs[r], act8_refs[t]).to_bits())
+            });
+            let expected_caps: [[u32; 8]; 8] = std::array::from_fn(|r| {
+                std::array::from_fn(|t| dot_q8_0_row(caps, row_refs[r], act8_refs[t]).to_bits())
+            });
+            assert_eq!(expected, expected_caps);
+
+            for t in 0..8 {
+                let d_nat = dot_q8_0_8rows(caps, row_refs, act8_refs[t]);
+                let d_prt = dot_q8_0_8rows(port, row_refs, act8_refs[t]);
+                assert_eq!(d_nat.map(f32::to_bits), d_prt.map(f32::to_bits));
+                for r in 0..8 {
+                    assert_eq!(d_nat[r].to_bits(), expected[r][t]);
+                }
+            }
+
+            let g8_nat = gemm_q8_0_8x8(caps, row_refs, act8_refs);
+            let g8_prt = gemm_q8_0_8x8(port, row_refs, act8_refs);
+            let g4_nat = gemm_q8_0_8x4(caps, row_refs, act4_refs);
+            let g4_prt = gemm_q8_0_8x4(port, row_refs, act4_refs);
+            let g2_nat = gemm_q8_0_8x2(caps, row_refs, act2_refs);
+            let g2_prt = gemm_q8_0_8x2(port, row_refs, act2_refs);
+
+            for r in 0..8 {
+                assert_eq!(g8_nat[r].map(f32::to_bits), g8_prt[r].map(f32::to_bits));
+                assert_eq!(g8_nat[r].map(f32::to_bits), expected[r]);
+                assert_eq!(g4_nat[r].map(f32::to_bits), g4_prt[r].map(f32::to_bits));
+                assert_eq!(g4_nat[r].map(f32::to_bits), expected[r][..4]);
+                assert_eq!(g2_nat[r].map(f32::to_bits), g2_prt[r].map(f32::to_bits));
+                assert_eq!(g2_nat[r].map(f32::to_bits), expected[r][..2]);
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_8row_and_8x_gemm_invalid_lengths_return_zeros() {
+        let caps = Arm64QuantCaps::detect();
+        let valid_row = make_q8_0_row(2, 3);
+        let short_row = &valid_row[..valid_row.len() - 1];
+        let act = make_edge_q8_0_act(2, 0);
+        let short_act = &act[..1];
+
+        let mut bad_rows = [valid_row.as_slice(); 8];
+        bad_rows[7] = short_row;
+        assert_eq!(
+            dot_q8_0_8rows(caps, bad_rows, &act).map(f32::to_bits),
+            [0_u32; 8]
+        );
+        assert_eq!(
+            gemm_q8_0_8x2(caps, bad_rows, [&act, &act]).map(|r| r.map(f32::to_bits)),
+            [[0_u32; 2]; 8]
+        );
+        let good_rows = [valid_row.as_slice(); 8];
+        assert_eq!(
+            gemm_q8_0_8x4(caps, good_rows, [&act, short_act, &act, &act])
+                .map(|r| r.map(f32::to_bits)),
+            [[0_u32; 4]; 8]
+        );
     }
 }
