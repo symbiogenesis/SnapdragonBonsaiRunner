@@ -98,4 +98,47 @@ $cases = [ordered]@{
         Invoke-SyntaxFixture ($valid.Replace('known: value', 'unknown: value')) $true
     }
 }
-Invoke-CiCases $cases $Case
+if ($Case) {
+    Invoke-CiCases $cases $Case
+} else {
+    $orderedNames = @($cases.Keys)
+    $entries = @($orderedNames | ForEach-Object { [pscustomobject]@{ Name = $_; Script = $cases[$_].ToString() } })
+    $results = @($entries | ForEach-Object -ThrottleLimit 8 -Parallel {
+        $item = $_
+        $ActionlintPath = $using:ActionlintPath
+        $checker = $using:checker
+        . (Join-Path $using:PSScriptRoot 'test_support.ps1')
+        function Invoke-ArchiveCacheFixture([scriptblock]$Work) {
+            $scratch = New-CiScratch 'bonsai-actionlint-cache-'
+            try { . $checker; & $Work $scratch } finally { Remove-CiScratch $scratch }
+        }
+        function Invoke-SyntaxFixture([string]$Source, [bool]$Reject = $false, [bool]$WithoutGit = $false) {
+            $scratch = New-CiScratch 'bonsai-workflow-syntax-'
+            try {
+                if (-not $WithoutGit) { [void][IO.Directory]::CreateDirectory((Join-Path $scratch '.git')) }
+                if ($WithoutGit) { Write-CiFixture $scratch '.github/actionlint.yaml' "self-hosted-runner:`n  labels:`n    - fixture-snapdragon`n" }
+                Write-CiFixture $scratch '.github/workflows/fixture.yml' $Source
+                Write-CiFixture $scratch '.github/actions/fixture/action.yml' @'
+name: Fixture
+description: Inert input contract
+inputs:
+  known:
+    required: false
+    description: Known input
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      run: Write-Output fixture
+'@
+                if ($Reject) { Assert-CiReject { & $checker -Root $scratch -ActionlintPath $ActionlintPath *> $null } }
+                else { & $checker -Root $scratch -ActionlintPath $ActionlintPath }
+            } finally { Remove-CiScratch $scratch }
+        }
+        $valid = $using:valid
+        & ([scriptblock]::Create($item.Script)) | Out-Null
+        [pscustomobject]@{ Name = $item.Name }
+    })
+    foreach ($res in $results) { "PASS $($res.Name)" }
+    "$($results.Count) focused fixture(s) passed."
+}

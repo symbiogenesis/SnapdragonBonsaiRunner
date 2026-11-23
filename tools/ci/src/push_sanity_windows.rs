@@ -1604,7 +1604,13 @@ pub(super) fn check(
 mod tests {
     use super::*;
 
-    fn preparation_case(case: &str) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct PreparationOutcome {
+        passed: bool,
+        error: Option<String>,
+    }
+
+    fn run_preparation_batch() -> Result<BTreeMap<String, std::result::Result<(), String>>> {
         let temporary = super::super::canonical_path(std::env::temp_dir())?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1612,6 +1618,7 @@ mod tests {
             .as_nanos();
         let scratch = temporary.join(format!("bonsai-push-preparation-{nonce}"));
         fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+        let report_path = scratch.join("report.json");
         let mut work = Work {
             directory: scratch.clone(),
             started: Instant::now(),
@@ -1620,17 +1627,54 @@ mod tests {
         // This bootstrap adapter requires Windows. Foundation's native CI
         // library lane owns it; the Linux planner does not exercise WinForms.
         let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
-        let result = work.script(
+        let script_result = work.script(
             &policy,
             &policy,
             "test_push_sanity.ps1",
-            &["-Case".into(), case.into()],
+            &["-ReportPath".into(), report_path.clone().into_os_string()],
         );
+        let outcomes = if report_path.is_file() {
+            let parsed: BTreeMap<String, PreparationOutcome> =
+                serde_json::from_slice(&fs::read(&report_path).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+            Ok(parsed
+                .into_iter()
+                .map(|(name, outcome)| {
+                    (
+                        name,
+                        if outcome.passed {
+                            Ok(())
+                        } else {
+                            Err(outcome
+                                .error
+                                .unwrap_or_else(|| "Push preparation fixture failed.".into()))
+                        },
+                    )
+                })
+                .collect())
+        } else {
+            script_result
+                .and_then(|()| Err("Push preparation batch exited without writing report.".into()))
+        };
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Push preparation fixture cleanup escaped temp.".into());
         }
         fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
-        result
+        outcomes
+    }
+
+    fn preparation_case(case: &str) -> Result<()> {
+        static BATCH_RESULTS: std::sync::OnceLock<
+            Result<BTreeMap<String, std::result::Result<(), String>>>,
+        > = std::sync::OnceLock::new();
+        let outcomes = BATCH_RESULTS
+            .get_or_init(run_preparation_batch)
+            .as_ref()
+            .map_err(Clone::clone)?;
+        outcomes
+            .get(case)
+            .ok_or_else(|| format!("Missing push preparation fixture result for {case}."))?
+            .clone()
     }
 
     #[test]

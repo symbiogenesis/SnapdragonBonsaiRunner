@@ -80,7 +80,7 @@ try {
     try {
         # Keep validation identical across hosts; neither optional linter is
         # installed or invoked. Our Rust/PowerShell source policy is separate.
-        foreach ($workflow in $workflows) {
+        $prepared = @(foreach ($workflow in $workflows) {
             # v1.7.12 predates GitHub's $/ same-repository action notation.
             # Normalize only uses scalars in memory to its equivalent ./ form;
             # the separate offline startup guard owns original paths and pins.
@@ -92,8 +92,42 @@ try {
                     $lines[$index] = [regex]::Replace($lines[$index], '^(\s*(?:-\s*)?(?:uses|''uses''|"uses"):\s*[''"]?)\$/', '${1}./')
                 }
             }
-            $source = $lines -join "`n"
-            $source | & $ActionlintPath @lintArguments -stdin-filename $workflow -
+            [pscustomobject]@{ Path = $workflow; Source = ($lines -join "`n") }
+        })
+        $results = @($prepared | ForEach-Object -ThrottleLimit 8 -Parallel {
+            $item = $_
+            $start = [Diagnostics.ProcessStartInfo]::new($using:ActionlintPath)
+            $start.WorkingDirectory = $using:Root
+            $start.UseShellExecute = $false
+            $start.CreateNoWindow = $true
+            $start.RedirectStandardInput = $true
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            foreach ($argument in $using:lintArguments) { $start.ArgumentList.Add($argument) }
+            $start.ArgumentList.Add('-stdin-filename')
+            $start.ArgumentList.Add($item.Path)
+            $start.ArgumentList.Add('-')
+            $process = [Diagnostics.Process]::Start($start)
+            try {
+                $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                $stderrTask = $process.StandardError.ReadToEndAsync()
+                $utf8 = [Text.UTF8Encoding]::new($false)
+                $bytes = $utf8.GetBytes($item.Source)
+                $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+                $process.StandardInput.Close()
+                $process.WaitForExit()
+                [pscustomobject]@{
+                    Path = $item.Path
+                    ExitCode = $process.ExitCode
+                    Stdout = $stdoutTask.GetAwaiter().GetResult()
+                    Stderr = $stderrTask.GetAwaiter().GetResult()
+                }
+            } finally { $process.Dispose() }
+        })
+        foreach ($res in $results) {
+            if ($res.Stdout) { [Console]::Out.Write($res.Stdout) }
+            if ($res.Stderr) { [Console]::Error.Write($res.Stderr) }
+            if ($res.ExitCode -ne 0) { throw "actionlint failed for $($res.Path) with exit code $($res.ExitCode)." }
         }
     } finally { Pop-Location }
     "Workflow syntax policy passed: $($workflows.Count) manifests (actionlint $version)."

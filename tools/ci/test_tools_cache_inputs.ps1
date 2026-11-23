@@ -130,7 +130,14 @@ function Invoke-ToolsEnvironmentFixture([object[]]$Scenarios) {
         # Keep this harness and its assertions in the committed checking policy;
         # only the selected immutable candidate's adapter supplies the body.
         $prefix=if ($EnvironmentAction -ceq 'ci-tool') { 'BONSAI_CI' } else { 'BONSAI_TOOLS' }
-        $action=[IO.File]::ReadAllText((Join-Path $repository ".github/actions/$EnvironmentAction/action.yml")); $begin=$action.IndexOf('        $buildInputs = '); if ($begin -lt 0) { throw 'Missing candidate cache-input adapter.' }; $end=$action.IndexOf(('        "'+$prefix+'_SOURCE_ID='),$begin); if ($end -le $begin) { throw 'Missing candidate cache-input output boundary.' }; $script=(($action.Substring($begin,$end-$begin) -split '\r?\n' | ForEach-Object { if ($_.Length -ge 8) { $_.Substring(8) } else { '' } }) -join "`n")
+        if (-not (Get-Variable -Name actionEnvScriptBlockCache -Scope Script -ErrorAction SilentlyContinue)) { $script:actionEnvScriptBlockCache = @{} }
+        $cacheKey = "$repository`n$EnvironmentAction"
+        $compiledScript = $script:actionEnvScriptBlockCache[$cacheKey]
+        if ($null -eq $compiledScript) {
+            $action=[IO.File]::ReadAllText((Join-Path $repository ".github/actions/$EnvironmentAction/action.yml")); $begin=$action.IndexOf('        $buildInputs = '); if ($begin -lt 0) { throw 'Missing candidate cache-input adapter.' }; $end=$action.IndexOf(('        "'+$prefix+'_SOURCE_ID='),$begin); if ($end -le $begin) { throw 'Missing candidate cache-input output boundary.' }; $script=(($action.Substring($begin,$end-$begin) -split '\r?\n' | ForEach-Object { if ($_.Length -ge 8) { $_.Substring(8) } else { '' } }) -join "`n")
+            $compiledScript = [scriptblock]::Create($script)
+            $script:actionEnvScriptBlockCache[$cacheKey] = $compiledScript
+        }
         $result=@()
         foreach ($scenario in $Scenarios) {
             # NullString passes an actual null through PowerShell's string
@@ -138,7 +145,7 @@ function Invoke-ToolsEnvironmentFixture([object[]]$Scenarios) {
             foreach ($key in $scenario.environment.Keys) { if ($null -eq $scenario.environment[$key]) { [Environment]::SetEnvironmentVariable($key,[NullString]::Value) } }
             foreach ($key in $scenario.environment.Keys) { if ($null -ne $scenario.environment[$key]) { [Environment]::SetEnvironmentVariable($key,$scenario.environment[$key]) } }
             foreach ($name in @('config','config.toml')) { $path=Join-Path $cargoDirectory $name; if ($scenario.ContainsKey($name)) { [IO.File]::WriteAllText($path,$scenario[$name]) } elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path) } }
-            [IO.File]::WriteAllText($env:GITHUB_ENV,''); & ([scriptblock]::Create($script)) | Out-Null
+            [IO.File]::WriteAllText($env:GITHUB_ENV,''); & $compiledScript | Out-Null
             $identity=@([IO.File]::ReadAllLines($env:GITHUB_ENV) | Where-Object { $_.StartsWith(($prefix+'_CACHE_HOST='),[StringComparison]::Ordinal) })
             Assert-CiEqual $identity.Count 1
             $result+=$identity
