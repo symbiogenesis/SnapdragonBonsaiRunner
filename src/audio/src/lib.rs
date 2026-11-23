@@ -436,8 +436,8 @@ mod tests {
             assert_eq!(mono_pcm16_data(&wave, rate, maximum), Some(&wave[44..]));
             assert!(mono_pcm16_data(&wave, rate, 1).is_none());
             assert!(mono_pcm16_data(&wave, rate + 1, maximum).is_none());
-            let mut maximum_wave = Vec::new();
             let count = usize::try_from(maximum).unwrap_or_default();
+            let mut maximum_wave = Vec::with_capacity(count * 2 + 44);
             maximum_wave.extend_from_slice(&mono_pcm16_header(rate, count).unwrap_or([0; 44]));
             maximum_wave.resize(count * 2 + 44, 0);
             assert!(mono_pcm16_data(&maximum_wave, rate, maximum).is_some());

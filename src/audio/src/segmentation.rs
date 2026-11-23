@@ -161,10 +161,11 @@ mod tests {
     use super::{pcm16_pause_boundary, pcm16_pause_boundary_adaptive};
 
     fn pcm(samples: &[i16]) -> Vec<u8> {
-        samples
-            .iter()
-            .flat_map(|sample| sample.to_le_bytes())
-            .collect()
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
     }
 
     #[test]
@@ -175,12 +176,23 @@ mod tests {
         let boundary = pcm16_pause_boundary(&data, 16_000, 400_000).unwrap_or_default();
         // The cut is protected by at least half an analysis window on each side.
         assert!((432_800..=436_000).contains(&boundary));
-        assert_eq!(
-            data[..boundary * 2].len() + data[boundary * 2..].len(),
-            data.len()
+        let (left, right) = data.split_at(boundary * 2);
+        assert_eq!(left.len() + right.len(), data.len());
+        assert!(
+            left.as_chunks::<2>()
+                .0
+                .iter()
+                .zip(&samples[..boundary])
+                .all(|(actual, expected)| *actual == expected.to_le_bytes())
         );
-        assert_eq!(pcm(&samples[..boundary]), data[..boundary * 2]);
-        assert_eq!(pcm(&samples[boundary..]), data[boundary * 2..]);
+        assert!(
+            right
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(&samples[boundary..])
+                .all(|(actual, expected)| *actual == expected.to_le_bytes())
+        );
     }
 
     #[test]

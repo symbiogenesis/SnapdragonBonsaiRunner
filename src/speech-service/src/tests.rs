@@ -511,11 +511,19 @@ fn watchdog_child() -> io::Result<()> {
     let limit = if std::env::var("BONSAI_SPEECH_TEST_DISCONNECT").is_ok() {
         Duration::from_secs(10)
     } else {
-        Duration::from_millis(100)
+        Duration::from_millis(40)
     };
     let _guard = crate::watchdog::Watchdog::start(&peer, limit)?;
     thread::sleep(Duration::from_secs(15));
     Ok(())
+}
+
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -529,74 +537,86 @@ fn watchdog_terminates_only_its_companion_on_disconnect_extra_data_and_deadline(
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!("Bonsai-SpeechWatchdog-{stamp}"));
-    std::fs::create_dir(&directory)?;
-    for mode in ["disconnect", "extra", "deadline"] {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .args(["--exact", "tests::watchdog_child", "--ignored"])
-            .env(
-                "BONSAI_SPEECH_TEST_PORT",
-                listener.local_addr()?.port().to_string(),
-            )
-            .current_dir(&directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if mode == "deadline" {
-            command.env_remove("BONSAI_SPEECH_TEST_DISCONNECT");
-        } else {
-            command.env("BONSAI_SPEECH_TEST_DISCONNECT", "1");
+    let directory =
+        TempDirGuard(std::env::temp_dir().join(format!("Bonsai-SpeechWatchdog-{stamp}")));
+    std::fs::create_dir(&directory.0)?;
+    let executable = std::env::current_exe()?;
+    thread::scope(|scope| -> io::Result<()> {
+        let handles: Vec<_> = ["disconnect", "extra", "deadline"]
+            .into_iter()
+            .map(|mode| {
+                let executable = &executable;
+                let dir = &directory.0;
+                scope.spawn(move || -> io::Result<()> {
+                    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+                    let mut command = Command::new(executable);
+                    command
+                        .args(["--exact", "tests::watchdog_child", "--ignored"])
+                        .env(
+                            "BONSAI_SPEECH_TEST_PORT",
+                            listener.local_addr()?.port().to_string(),
+                        )
+                        .current_dir(dir)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    if mode == "deadline" {
+                        command.env_remove("BONSAI_SPEECH_TEST_DISCONNECT");
+                    } else {
+                        command.env("BONSAI_SPEECH_TEST_DISCONNECT", "1");
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt as _;
+                        command.creation_flags(0x0800_0000);
+                    }
+                    let mut child = DisposableChild(command.spawn()?);
+                    listener.set_nonblocking(true)?;
+                    let until = Instant::now() + Duration::from_secs(5);
+                    let mut peer = loop {
+                        match listener.accept() {
+                            Ok((peer, _)) => break peer,
+                            Err(error)
+                                if error.kind() == io::ErrorKind::WouldBlock
+                                    && Instant::now() < until =>
+                            {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    if mode == "extra" {
+                        peer.write_all(b"queued-data")?;
+                    }
+                    let _kept_open = if mode == "disconnect" {
+                        drop(peer);
+                        None
+                    } else {
+                        Some(peer)
+                    };
+                    loop {
+                        if let Some(status) = child.0.try_wait()? {
+                            assert_eq!(status.code(), Some(70));
+                            break;
+                        }
+                        if Instant::now() >= until {
+                            return Err(io::Error::other(
+                                "Companion watchdog failed to terminate inference",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("watchdog mode thread panicked"))??;
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            command.creation_flags(0x0800_0000);
-        }
-        let mut child = command.spawn()?;
-        listener.set_nonblocking(true)?;
-        let until = Instant::now() + Duration::from_secs(5);
-        let mut peer = loop {
-            match listener.accept() {
-                Ok((peer, _)) => break peer,
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < until =>
-                {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => {
-                    let _killed = child.kill();
-                    let _waited = child.wait();
-                    return Err(error);
-                }
-            }
-        };
-        if mode == "extra" {
-            peer.write_all(b"queued-data")?;
-        }
-        let _kept_open = if mode == "disconnect" {
-            drop(peer);
-            None
-        } else {
-            Some(peer)
-        };
-        loop {
-            if let Some(status) = child.try_wait()? {
-                assert_eq!(status.code(), Some(70));
-                break;
-            }
-            if Instant::now() >= until {
-                child.kill()?;
-                let _waited = child.wait()?;
-                return Err(io::Error::other(
-                    "Companion watchdog failed to terminate inference",
-                ));
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 struct CompletionFake(bool);
@@ -637,18 +657,13 @@ const COMPLETED_REQUESTS: usize = 32;
 #[test]
 #[ignore = "Only spawned by the completed-response regression as a disposable companion."]
 fn completed_response_child() -> io::Result<()> {
-    let ready = std::path::PathBuf::from(
-        std::env::var_os("BONSAI_SPEECH_COMPLETION_READY")
-            .ok_or_else(|| io::Error::other("Missing fixture ready path."))?,
-    );
-    if !ready.is_absolute() {
-        return Err(io::Error::other("Use an absolute fixture ready path."));
-    }
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let port = listener.local_addr()?.port();
-    let pending = ready.with_extension("pending");
-    std::fs::write(&pending, port.to_string())?;
-    std::fs::rename(pending, ready)?;
+    {
+        let mut out = io::stdout().lock();
+        out.write_all(format!("BONSAI_PORT:{port}\n").as_bytes())?;
+        out.flush()?;
+    }
     let mut engine = CompletionFake(false);
     let mut scratch = http::Scratch::default();
     for _ in 0..COMPLETED_REQUESTS {
@@ -668,31 +683,31 @@ impl Drop for DisposableChild {
 }
 
 fn read_completed_response(peer: &mut TcpStream, pcm: bool) -> io::Result<()> {
-    let mut bytes = Vec::new();
-    let mut one = [0];
-    while !bytes.ends_with(b"\r\n\r\n") {
-        peer.read_exact(&mut one)?;
-        bytes.extend_from_slice(&one);
-        if bytes.len() > 4096 {
-            return Err(io::Error::other("Unbounded fixture response head."));
+    use std::io::BufRead as _;
+    let mut reader = io::BufReader::new(peer);
+    let mut head_bytes = Vec::new();
+    while !head_bytes.ends_with(b"\r\n\r\n") {
+        let before = head_bytes.len();
+        let read = reader.read_until(b'\n', &mut head_bytes)?;
+        if read == 0 || head_bytes.len() > 4096 || head_bytes.len() == before {
+            return Err(io::Error::other("Unbounded or truncated response head."));
         }
     }
-    assert!(bytes.starts_with(b"HTTP/1.1 200"));
+    assert!(head_bytes.starts_with(b"HTTP/1.1 200"));
     if pcm {
-        bytes.clear();
-        while !bytes.ends_with(b"0\r\n\r\n") {
-            peer.read_exact(&mut one)?;
-            bytes.extend_from_slice(&one);
-            if bytes.len() > 128 {
-                return Err(io::Error::other("Unbounded fixture PCM body."));
+        let mut body = Vec::new();
+        while !body.ends_with(b"0\r\n\r\n") {
+            let read = reader.read_until(b'\n', &mut body)?;
+            if read == 0 || body.len() > 128 {
+                return Err(io::Error::other("Unbounded or truncated PCM body."));
             }
         }
-        assert_eq!(bytes, b"8\r\n\0\0\0\0\0\0\0\0\r\n0\r\n\r\n");
+        assert_eq!(body, b"8\r\n\0\0\0\0\0\0\0\0\r\n0\r\n\r\n");
     } else {
-        let head = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+        let head = std::str::from_utf8(&head_bytes).map_err(io::Error::other)?;
         assert!(head.contains("Content-Length: 52\r\n"));
         let mut wave = [0; 52];
-        peer.read_exact(&mut wave)?;
+        reader.read_exact(&mut wave)?;
         assert_eq!(&wave[..4], b"RIFF");
     }
     Ok(())
@@ -701,6 +716,7 @@ fn read_completed_response(peer: &mut TcpStream, pcm: bool) -> io::Result<()> {
 #[test]
 fn completed_pcm_and_wave_clients_can_close_before_the_next_request() -> io::Result<()> {
     use std::{
+        io::BufRead as _,
         process::{Command, Stdio},
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
@@ -708,16 +724,20 @@ fn completed_pcm_and_wave_clients_can_close_before_the_next_request() -> io::Res
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!("Bonsai-SpeechCompletion-{stamp}"));
-    std::fs::create_dir(&directory)?;
-    let ready = directory.join("ready");
+    let directory =
+        TempDirGuard(std::env::temp_dir().join(format!("Bonsai-SpeechCompletion-{stamp}")));
+    std::fs::create_dir(&directory.0)?;
     let mut command = Command::new(std::env::current_exe()?);
     command
-        .args(["--exact", "tests::completed_response_child", "--ignored"])
-        .env("BONSAI_SPEECH_COMPLETION_READY", &ready)
-        .current_dir(&directory)
+        .args([
+            "--exact",
+            "tests::completed_response_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .current_dir(&directory.0)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -725,20 +745,26 @@ fn completed_pcm_and_wave_clients_can_close_before_the_next_request() -> io::Res
         command.creation_flags(0x0800_0000);
     }
     let mut child = DisposableChild(command.spawn()?);
-    let until = Instant::now() + Duration::from_secs(10);
+    let mut stdout = io::BufReader::new(
+        child
+            .0
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("Missing child stdout pipe."))?,
+    );
+    let mut line = String::new();
     let port = loop {
-        if ready.exists() {
-            break std::fs::read_to_string(&ready)?
-                .parse::<u16>()
-                .map_err(io::Error::other)?;
-        }
-        if child.0.try_wait()?.is_some() || Instant::now() >= until {
+        line.clear();
+        if stdout.read_line(&mut line)? == 0 {
             return Err(io::Error::other(
-                "Completion fixture failed before readiness.",
+                "Completion fixture exited before reporting port.",
             ));
         }
-        thread::sleep(Duration::from_millis(10));
+        if let Some(raw_port) = line.trim().strip_prefix("BONSAI_PORT:") {
+            break raw_port.parse::<u16>().map_err(io::Error::other)?;
+        }
     };
+    let until = Instant::now() + Duration::from_secs(10);
     let key = std::str::from_utf8(&KEY).map_err(io::Error::other)?;
     for index in 0..COMPLETED_REQUESTS {
         let pcm = index.is_multiple_of(2);
@@ -771,7 +797,7 @@ fn completed_pcm_and_wave_clients_can_close_before_the_next_request() -> io::Res
         if Instant::now() >= until {
             return Err(io::Error::other("Completion fixture failed to finish."));
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(1));
     }
     Ok(())
 }
@@ -783,9 +809,10 @@ fn protected_credential_keeps_a_read_handle_that_denies_writes() -> io::Result<(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_nanos();
-    let parent = std::env::temp_dir().join(format!("Bonsai-SpeechCredential-{stamp}"));
-    std::fs::create_dir(&parent)?;
-    let keys = bonsai_windows_credentials::PrivateCredentials::create(&parent)?;
+    let parent =
+        TempDirGuard(std::env::temp_dir().join(format!("Bonsai-SpeechCredential-{stamp}")));
+    std::fs::create_dir(&parent.0)?;
+    let keys = bonsai_windows_credentials::PrivateCredentials::create(&parent.0)?;
     let path = keys.frontend_path().to_owned();
     let retained = crate::credentials::Credential::open(&path)?;
     drop(keys);

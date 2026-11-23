@@ -236,11 +236,29 @@ fn clamp_round_u16(value: f64, limit: u16) -> u16 {
     low
 }
 
+#[cfg(test)]
+pub(crate) fn target_dimensions_for_test(
+    intrinsic_w: f32,
+    intrinsic_h: f32,
+    max_width: u32,
+    max_height: u32,
+    max_pixels_limit: usize,
+) -> Option<(u32, u32)> {
+    target_dimensions(
+        intrinsic_w,
+        intrinsic_h,
+        max_width,
+        max_height,
+        max_pixels_limit,
+    )
+}
+
 fn target_dimensions(
     intrinsic_w: f32,
     intrinsic_h: f32,
     max_width: u32,
     max_height: u32,
+    max_pixels_limit: usize,
 ) -> Option<(u32, u32)> {
     if !intrinsic_w.is_finite()
         || !intrinsic_h.is_finite()
@@ -261,13 +279,13 @@ fn target_dimensions(
     }
     let mut w = clamp_round_u16(iw * scale, max_w);
     let mut h = clamp_round_u16(ih * scale, max_h);
-    let max_pixels = u32::try_from(MAX_RASTER_PIXELS).ok()?;
+    let max_pixels = u32::try_from(max_pixels_limit).ok()?;
     let pixels = usize::from(w).saturating_mul(usize::from(h));
-    if pixels > MAX_RASTER_PIXELS {
+    if pixels > max_pixels_limit {
         let shrink = (f64::from(max_pixels) / f64::from(u32::from(w) * u32::from(h))).sqrt();
         w = clamp_round_u16(f64::from(w) * shrink, max_w);
         h = clamp_round_u16(f64::from(h) * shrink, max_h);
-        while usize::from(w).saturating_mul(usize::from(h)) > MAX_RASTER_PIXELS {
+        while usize::from(w).saturating_mul(usize::from(h)) > max_pixels_limit {
             if w >= h && w > 1 {
                 w -= 1;
             } else if h > 1 {
@@ -293,13 +311,36 @@ fn failed_packet() -> Vec<u8> {
 /// the caller can fall back gracefully without tearing down the worker pipe.
 #[must_use]
 pub fn rasterize(svg: &str, max_width: u32, max_height: u32) -> Vec<u8> {
+    rasterize_bounded(svg, max_width, max_height, MAX_RASTER_PIXELS)
+}
+
+#[cfg(test)]
+pub(crate) fn rasterize_with_pixel_cap(
+    svg: &str,
+    max_width: u32,
+    max_height: u32,
+    max_pixels_limit: usize,
+) -> Vec<u8> {
+    rasterize_bounded(svg, max_width, max_height, max_pixels_limit)
+}
+
+fn rasterize_bounded(
+    svg: &str,
+    max_width: u32,
+    max_height: u32,
+    max_pixels_limit: usize,
+) -> Vec<u8> {
     let Some(tree) = parse_tree(svg) else {
         return failed_packet();
     };
     let size = tree.size();
-    let Some((width, height)) =
-        target_dimensions(size.width(), size.height(), max_width, max_height)
-    else {
+    let Some((width, height)) = target_dimensions(
+        size.width(),
+        size.height(),
+        max_width,
+        max_height,
+        max_pixels_limit,
+    ) else {
         return failed_packet();
     };
     let Some(w16) = u16::try_from(width).ok() else {

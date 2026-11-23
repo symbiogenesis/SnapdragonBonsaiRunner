@@ -787,7 +787,7 @@ mod pcm_tests {
 
     #[test]
     fn complete_pcm_reuses_one_bounded_buffer_and_stops_on_write_failure() -> io::Result<()> {
-        let samples = vec![0.5; 2_880_000];
+        let samples = vec![0.5; wave::PCM_SAMPLES * 2 + 17];
         let mut first = None;
         let mut writes = 0;
         let mut total = 0;

@@ -293,13 +293,25 @@ fn offline_svg_rasterizer_produces_valid_premultiplied_rgba_and_blocks_hrefs() -
     }
     assert!(any_non_zero);
 
-    // Pixel ceiling check (MAX_RASTER_DIMENSION x MAX_RASTER_DIMENSION exceeds MAX_RASTER_PIXELS)
+    // Pixel ceiling check (`MAX_RASTER_DIMENSION^2` > `MAX_RASTER_PIXELS`), verified at exact scale
+    // without allocating a 16 MiB pixmap, plus end-to-end bounded rasterization under a 4,096-px cap.
+    assert_eq!(
+        svg::target_dimensions_for_test(
+            100.0,
+            100.0,
+            MAX_RASTER_DIMENSION,
+            MAX_RASTER_DIMENSION,
+            MAX_RASTER_PIXELS
+        ),
+        Some((2048, 2048))
+    );
     let square = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><rect width=\"100\" height=\"100\" fill=\"red\"/></svg>";
-    let capped = rasterize(square, MAX_RASTER_DIMENSION, MAX_RASTER_DIMENSION);
+    let capped = svg::rasterize_with_pixel_cap(square, 128, 128, 4096);
     assert_eq!(capped[4], 1);
     let cw = u32::from_le_bytes(capped[5..9].try_into().map_err(io::Error::other)?);
     let ch = u32::from_le_bytes(capped[9..13].try_into().map_err(io::Error::other)?);
-    assert!(usize::try_from(cw * ch).map_err(io::Error::other)? <= MAX_RASTER_PIXELS);
+    assert_eq!((cw, ch), (64, 64));
+    assert!(usize::try_from(cw * ch).map_err(io::Error::other)? <= 4096);
 
     // `<image>` elements (including `data:` and external URLs) are rejected outright.
     let with_data_img = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><image href=\"data:image/png;base64,iVBORw0KGgo=\" width=\"64\" height=\"64\"/><rect width=\"10\" height=\"10\" fill=\"#00ff00\"/></svg>";

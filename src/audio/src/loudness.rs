@@ -799,32 +799,43 @@ mod tests {
     -> Result<(), LoudnessError> {
         // Peak amplitude corresponding to -19.99 dBFS peak (0 dBFS RMS sine -> -3.01 dB, so -23.00 LUFS).
         let amp_minus_23_lufs = 10.0_f64.powf((-23.0 + 3.010_299_956_639_812) / 20.0);
-        for rate in [48_000_u32, 24_000_u32, 16_000_u32, 11_025_u32] {
-            for freq in [997.0, 1_000.0] {
-                let samples = sine_wave(freq, amp_minus_23_lufs, rate, 4.0);
-                let obs = measure_loudness_f32(&samples, rate)?;
-                let lufs = obs
-                    .integrated_lufs
-                    .ok_or(LoudnessError::BelowLoudnessGate)?;
-                assert!(
-                    (lufs - (-23.0)).abs() <= 0.1,
-                    "rate={rate} freq={freq} measured {lufs} LUFS"
-                );
-                let mom = obs
-                    .max_momentary_lufs
-                    .ok_or(LoudnessError::BelowLoudnessGate)?;
-                assert!((mom - (-23.0)).abs() <= 0.1);
-                let st = obs
-                    .max_short_term_lufs
-                    .ok_or(LoudnessError::BelowLoudnessGate)?;
-                assert!((st - (-23.0)).abs() <= 0.1);
-                let lra = obs
-                    .loudness_range_lu
-                    .ok_or(LoudnessError::BelowLoudnessGate)?;
-                assert!(lra <= 0.05, "steady sine LRA should be ~0 LU, got {lra}");
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(8);
+            for rate in [48_000_u32, 24_000_u32, 16_000_u32, 11_025_u32] {
+                for freq in [997.0, 1_000.0] {
+                    handles.push(scope.spawn(move || -> Result<(), LoudnessError> {
+                        let samples = sine_wave(freq, amp_minus_23_lufs, rate, 4.0);
+                        let obs = measure_loudness_f32(&samples, rate)?;
+                        let lufs = obs
+                            .integrated_lufs
+                            .ok_or(LoudnessError::BelowLoudnessGate)?;
+                        assert!(
+                            (lufs - (-23.0)).abs() <= 0.1,
+                            "rate={rate} freq={freq} measured {lufs} LUFS"
+                        );
+                        let mom = obs
+                            .max_momentary_lufs
+                            .ok_or(LoudnessError::BelowLoudnessGate)?;
+                        assert!((mom - (-23.0)).abs() <= 0.1);
+                        let st = obs
+                            .max_short_term_lufs
+                            .ok_or(LoudnessError::BelowLoudnessGate)?;
+                        assert!((st - (-23.0)).abs() <= 0.1);
+                        let lra = obs
+                            .loudness_range_lu
+                            .ok_or(LoudnessError::BelowLoudnessGate)?;
+                        assert!(lra <= 0.05, "steady sine LRA should be ~0 LU, got {lra}");
+                        Ok(())
+                    }));
+                }
             }
-        }
-        Ok(())
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| LoudnessError::BelowLoudnessGate)??;
+            }
+            Ok(())
+        })
     }
 
     #[test]
@@ -855,10 +866,10 @@ mod tests {
         // produces ~10.0 LU loudness range (both segments well above -70 LUFS and -20 LU rel gate).
         let high_amp = 10.0_f64.powf((-20.0 + 3.010_299_956_639_812) / 20.0);
         let low_amp = 10.0_f64.powf((-30.0 + 3.010_299_956_639_812) / 20.0);
-        let mut samples = sine_wave(997.0, high_amp, 24_000, 5.0);
-        samples.extend(sine_wave(997.0, low_amp, 24_000, 5.0));
+        let mut samples = sine_wave(997.0, high_amp, 8_000, 5.0);
+        samples.extend(sine_wave(997.0, low_amp, 8_000, 5.0));
 
-        let obs = measure_loudness_f32(&samples, 24_000)?;
+        let obs = measure_loudness_f32(&samples, 8_000)?;
         let lra = obs
             .loudness_range_lu
             .ok_or(LoudnessError::BelowLoudnessGate)?;
@@ -873,8 +884,8 @@ mod tests {
     fn silence_subthreshold_short_clips_and_invalid_inputs_behave_safely()
     -> Result<(), LoudnessError> {
         // Pure silence: all Option<f64> fields are None without NaN/Inf.
-        let silence = vec![0.0_f32; 24_000 * 4];
-        let silent_obs = measure_loudness_f32(&silence, 24_000)?;
+        let silence = vec![0.0_f32; 8_000 * 4];
+        let silent_obs = measure_loudness_f32(&silence, 8_000)?;
         assert_eq!(silent_obs.integrated_lufs, None);
         assert_eq!(silent_obs.max_momentary_lufs, None);
         assert_eq!(silent_obs.max_short_term_lufs, None);
@@ -883,16 +894,16 @@ mod tests {
         assert_eq!(silent_obs.true_peak_dbtp, None);
 
         // Sub-threshold (-80 dBFS peak) sine: rejected by -70 LUFS gate -> integrated & LRA None.
-        let quiet = sine_wave(997.0, 1.0e-4, 24_000, 4.0);
-        let quiet_obs = measure_loudness_f32(&quiet, 24_000)?;
+        let quiet = sine_wave(997.0, 1.0e-4, 8_000, 4.0);
+        let quiet_obs = measure_loudness_f32(&quiet, 8_000)?;
         assert_eq!(quiet_obs.integrated_lufs, None);
         assert_eq!(quiet_obs.loudness_range_lu, None);
         assert!(quiet_obs.max_momentary_lufs.is_some_and(f64::is_finite));
         assert!(quiet_obs.true_peak_dbtp.is_some_and(f64::is_finite));
 
         // Short clip (200 ms < 400 ms): peaks exist, loudness windows are None.
-        let short = sine_wave(997.0, 0.25, 24_000, 0.2);
-        let short_obs = measure_loudness_f32(&short, 24_000)?;
+        let short = sine_wave(997.0, 0.25, 8_000, 0.2);
+        let short_obs = measure_loudness_f32(&short, 8_000)?;
         assert_eq!(short_obs.integrated_lufs, None);
         assert_eq!(short_obs.max_momentary_lufs, None);
         assert_eq!(short_obs.max_short_term_lufs, None);

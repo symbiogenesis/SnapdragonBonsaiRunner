@@ -803,9 +803,13 @@ mod tests {
         };
         let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
         let len = chunk_bytes + 4_096;
-        let payload: Vec<u8> = (0..len)
+        let tile: Vec<u8> = (0..256_usize)
             .map(|i| u8::try_from((i.wrapping_mul(31) ^ 0xa5) & 0xff).unwrap_or(0))
             .collect();
+        let mut payload = vec![0_u8; len];
+        for chunk in payload.chunks_mut(tile.len()) {
+            chunk.copy_from_slice(&tile[..chunk.len()]);
+        }
         let entry = write_chunked_fixture_file(&arguments.model, &payload, chunk_bytes)?;
         let valid_pin = serde_json::json!({
             "schemaVersion": 1,
@@ -856,9 +860,21 @@ mod tests {
         assert!(verify_models(Kind::Canary, &arguments, &bad_hex.to_string()).is_err());
 
         // Single-byte tamper in the second chunk must be caught.
-        let mut tampered = payload;
-        tampered[chunk_bytes + 17] ^= 0x01;
-        fs::write(&arguments.model, &tampered)?;
+        {
+            use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&arguments.model)?;
+            let pos = u64::try_from(chunk_bytes + 17).map_err(io::Error::other)?;
+            file.seek(SeekFrom::Start(pos))?;
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte)?;
+            byte[0] ^= 0x01;
+            file.seek(SeekFrom::Start(pos))?;
+            file.write_all(&byte)?;
+            file.flush()?;
+        }
         assert!(verify_models(Kind::Canary, &arguments, &valid_pin.to_string()).is_err());
 
         let _ = fs::remove_dir_all(&directory);
