@@ -180,6 +180,7 @@ fn edited_adapter_publication_never_overwrites_existing_output() -> Result<()> {
 #[test]
 fn adapter_edit_receipt_omits_local_paths_and_emits_published_status_and_digest() -> Result<()> {
     let inspect = receipt(
+        ALGORITHM,
         &"0".repeat(64),
         128,
         1,
@@ -197,6 +198,7 @@ fn adapter_edit_receipt_omits_local_paths_and_emits_published_status_and_digest(
     assert_eq!(inspect["sourceAdapterSha256"], ADAPTER_SHA256);
 
     let published = receipt(
+        ALGORITHM,
         &"1".repeat(64),
         256,
         1,
@@ -212,5 +214,75 @@ fn adapter_edit_receipt_omits_local_paths_and_emits_published_status_and_digest(
             .get("outputPath")
             .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn band_and_family_edits_mask_out_of_band_layers_and_preserve_in_band_bits() -> Result<()> {
+    let source = fixture()?;
+    let mut family_scales = BTreeMap::new();
+    family_scales.insert("ssm_out".to_owned(), 0.0);
+    let mut layer_gains = BTreeMap::new();
+    layer_gains.insert(20, 0.5);
+
+    let band_filter = SiteFilter {
+        layer_min: Some(20),
+        layer_max: Some(47),
+        family_scales: Some(&family_scales),
+        layer_gains: Some(&layer_gains),
+    };
+    let (candidate, summary) = edited_with_filter(&source, 1, 1, &band_filter)?;
+    assert_eq!(summary["linearSites"], 128);
+    // Layers 20..=47 = 28 layers * 2 sites = 56 in-band; 21 are ssm_out ((L+1)%4 != 0 in 20..=47: 7 full-attn -> 21 ssm_out), so 35 active sites and 93 zeroed sites.
+    assert_eq!(summary["activeLinearSites"], 35);
+    assert_eq!(summary["zeroedLinearSites"], 93);
+
+    let ranges = crate::qualification::linear_a_ranges(&source)?;
+    for (site, range) in &ranges {
+        let (layer, family) = parse_site_layer_and_family(site)?;
+        let out_slice = &candidate[range.clone()];
+        let orig_slice = &source[range.clone()];
+        if !(20..=47).contains(&layer) || family == "ssm_out" {
+            assert!(
+                out_slice
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|&c| f32::from_le_bytes(c) == 0.0),
+                "expected zeroed site {site}"
+            );
+        } else if layer == 20 {
+            for (orig_b, cand_b) in orig_slice
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(out_slice.as_chunks::<4>().0)
+            {
+                assert!(
+                    (f32::from_le_bytes(*cand_b) - 0.5 * f32::from_le_bytes(*orig_b)).abs() < 1e-6
+                );
+            }
+        } else {
+            assert_eq!(
+                out_slice, orig_slice,
+                "expected untouched in-band site {site}"
+            );
+        }
+    }
+
+    // Request validation checks for invalid layers, families, gains, and no-op filters.
+    let valid_path = std::env::temp_dir().join("bonsai-band-check-unused.gguf");
+    for mut bad in [
+        json!({"schemaVersion":1,"operation":"inspect","adapterPath":valid_path,"keepNumerator":1,"keepDenominator":1,"layerMin":64}),
+        json!({"schemaVersion":1,"operation":"inspect","adapterPath":valid_path,"keepNumerator":1,"keepDenominator":1,"layerMax":64}),
+        json!({"schemaVersion":1,"operation":"inspect","adapterPath":valid_path,"keepNumerator":1,"keepDenominator":1,"layerMin":48,"layerMax":20}),
+        json!({"schemaVersion":1,"operation":"inspect","adapterPath":valid_path,"keepNumerator":1,"keepDenominator":1,"familyScales":{"bad_family":0.5}}),
+        json!({"schemaVersion":1,"operation":"inspect","adapterPath":valid_path,"keepNumerator":1,"keepDenominator":1,"familyScales":{"ffn_down":-0.1}}),
+        json!({"schemaVersion":1,"operation":"inspect","adapterPath":valid_path,"keepNumerator":1,"keepDenominator":1,"layerGains":{"64":0.5}}),
+        json!({"schemaVersion":1,"operation":"inspect","adapterPath":valid_path,"keepNumerator":1,"keepDenominator":1,"layerGains":{"0":101.0}}),
+    ] {
+        let _ = &mut bad;
+        assert!(serde_json::from_value::<Request>(bad).is_ok_and(|req| validate(&req).is_err()));
+    }
     Ok(())
 }
