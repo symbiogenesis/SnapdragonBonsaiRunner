@@ -2651,6 +2651,7 @@ pub(super) fn widen_f16_slice(src: &[u16], dst: &mut [f32]) {
     bonsai_neon_dot::widen_f16_slice(src, dst);
 }
 
+#[cfg(test)]
 /// Evaluate one attention head over packed `u16` (`F16`) cached KV storage without
 /// retaining a shadow `f32` cache, producing identical bits to `attend_head`.
 #[expect(
@@ -2683,6 +2684,442 @@ pub(super) fn attend_head_f16(
         current_kv,
         scores,
         out_head,
+        invalid,
+    )
+}
+
+#[inline(always)]
+fn dot_4keys_tile_simd<S: Simd, const N: usize>(
+    simd: S,
+    q_tile: [&[f32]; N],
+    keys: [&[f32]; 4],
+    head_dim: usize,
+    divisor: f32,
+) -> [[f32; 4]; N] {
+    let mut acc = [f32x4::splat(simd, 0.0_f32); N];
+    let chunks = head_dim / 4;
+    for chunk_idx in 0..chunks {
+        let base = chunk_idx * 4;
+        let k0 = f32x4::from_slice(simd, &keys[0][base..base + 4]);
+        let k1 = f32x4::from_slice(simd, &keys[1][base..base + 4]);
+        let k2 = f32x4::from_slice(simd, &keys[2][base..base + 4]);
+        let k3 = f32x4::from_slice(simd, &keys[3][base..base + 4]);
+        let cols = transpose_4x4(simd, [k0, k1, k2, k3]);
+        for k in 0..4 {
+            let col = cols[k];
+            for g in 0..N {
+                acc[g] += f32x4::splat(simd, q_tile[g][base + k]) * col;
+            }
+        }
+    }
+    for d in (chunks * 4)..head_dim {
+        let kv = f32x4::from_slice(simd, &[keys[0][d], keys[1][d], keys[2][d], keys[3][d]]);
+        for g in 0..N {
+            acc[g] += f32x4::splat(simd, q_tile[g][d]) * kv;
+        }
+    }
+    let div_v = f32x4::splat(simd, divisor);
+    let mut out = [[0.0_f32; 4]; N];
+    for g in 0..N {
+        out[g] = (acc[g] / div_v).into();
+    }
+    out
+}
+
+#[inline(always)]
+fn weighted_value_accum_4_tile_simd<S: Simd, const N: usize>(
+    simd: S,
+    out_tile: [&mut [f32]; N],
+    values: [&[f32]; 4],
+    weights: [[f32; 4]; N],
+    head_dim: usize,
+) {
+    let w0: [f32x4<S>; N] = std::array::from_fn(|g| f32x4::splat(simd, weights[g][0]));
+    let w1: [f32x4<S>; N] = std::array::from_fn(|g| f32x4::splat(simd, weights[g][1]));
+    let w2: [f32x4<S>; N] = std::array::from_fn(|g| f32x4::splat(simd, weights[g][2]));
+    let w3: [f32x4<S>; N] = std::array::from_fn(|g| f32x4::splat(simd, weights[g][3]));
+    let chunks = head_dim / 4;
+    for chunk_idx in 0..chunks {
+        let base = chunk_idx * 4;
+        let v0 = f32x4::from_slice(simd, &values[0][base..base + 4]);
+        let v1 = f32x4::from_slice(simd, &values[1][base..base + 4]);
+        let v2 = f32x4::from_slice(simd, &values[2][base..base + 4]);
+        let v3 = f32x4::from_slice(simd, &values[3][base..base + 4]);
+        for g in 0..N {
+            let dst = &mut out_tile[g][base..base + 4];
+            let mut ov = f32x4::from_slice(simd, dst);
+            ov += w0[g] * v0;
+            ov += w1[g] * v1;
+            ov += w2[g] * v2;
+            ov += w3[g] * v3;
+            ov.store_slice(dst);
+        }
+    }
+    for d in (chunks * 4)..head_dim {
+        for g in 0..N {
+            out_tile[g][d] += weights[g][0] * values[0][d];
+            out_tile[g][d] += weights[g][1] * values[1][d];
+            out_tile[g][d] += weights[g][2] * values[2][d];
+            out_tile[g][d] += weights[g][3] * values[3][d];
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Applies one shared K quad across all query heads in a GQA group in exact scalar order."
+)]
+fn dot_4keys_group_simd<S: Simd>(
+    simd: S,
+    q_group: &[f32],
+    k_refs: [&[f32]; 4],
+    head_dim: usize,
+    gqa_group: usize,
+    total_rows: usize,
+    row_base: usize,
+    divisor: f32,
+    scores: &mut [f32],
+) {
+    let mut g_base = 0;
+    while g_base < gqa_group {
+        let rem = gqa_group - g_base;
+        let q_at = |local_g: usize| -> &[f32] {
+            let start = (g_base + local_g) * head_dim;
+            &q_group[start..start + head_dim]
+        };
+        let mut store = |local_g: usize, vals: [f32; 4]| {
+            let start = (g_base + local_g) * total_rows + row_base;
+            scores[start..start + 4].copy_from_slice(&vals);
+        };
+        if rem >= 4 {
+            let res = dot_4keys_tile_simd(
+                simd,
+                [q_at(0), q_at(1), q_at(2), q_at(3)],
+                k_refs,
+                head_dim,
+                divisor,
+            );
+            for (local_g, vals) in res.into_iter().enumerate() {
+                store(local_g, vals);
+            }
+            g_base += 4;
+        } else if rem == 3 {
+            let res = dot_4keys_tile_simd(
+                simd,
+                [q_at(0), q_at(1), q_at(2)],
+                k_refs,
+                head_dim,
+                divisor,
+            );
+            for (local_g, vals) in res.into_iter().enumerate() {
+                store(local_g, vals);
+            }
+            g_base += 3;
+        } else if rem == 2 {
+            let res = dot_4keys_tile_simd(simd, [q_at(0), q_at(1)], k_refs, head_dim, divisor);
+            for (local_g, vals) in res.into_iter().enumerate() {
+                store(local_g, vals);
+            }
+            g_base += 2;
+        } else {
+            let res = dot_4keys_tile_simd(simd, [q_at(0)], k_refs, head_dim, divisor);
+            store(0, res[0]);
+            g_base += 1;
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Accumulates one shared V quad across all query heads in a GQA group in exact scalar order."
+)]
+fn weighted_value_accum_4_group_simd<S: Simd>(
+    simd: S,
+    out_group: &mut [f32],
+    v_refs: [&[f32]; 4],
+    scores: &[f32],
+    sums: &[f32],
+    head_dim: usize,
+    gqa_group: usize,
+    total_rows: usize,
+    row_base: usize,
+) {
+    let mut g_base = 0;
+    while g_base < gqa_group {
+        let rem = gqa_group - g_base;
+        let weights_at = |local_g: usize| -> [f32; 4] {
+            let g = g_base + local_g;
+            let sum = sums[g];
+            let s = &scores[g * total_rows + row_base..g * total_rows + row_base + 4];
+            [s[0] / sum, s[1] / sum, s[2] / sum, s[3] / sum]
+        };
+        let tile_out = &mut out_group[g_base * head_dim..];
+        if rem >= 4 {
+            let (o0, r1) = tile_out.split_at_mut(head_dim);
+            let (o1, r2) = r1.split_at_mut(head_dim);
+            let (o2, r3) = r2.split_at_mut(head_dim);
+            let (o3, _) = r3.split_at_mut(head_dim);
+            weighted_value_accum_4_tile_simd(
+                simd,
+                [o0, o1, o2, o3],
+                v_refs,
+                [weights_at(0), weights_at(1), weights_at(2), weights_at(3)],
+                head_dim,
+            );
+            g_base += 4;
+        } else if rem == 3 {
+            let (o0, r1) = tile_out.split_at_mut(head_dim);
+            let (o1, r2) = r1.split_at_mut(head_dim);
+            let (o2, _) = r2.split_at_mut(head_dim);
+            weighted_value_accum_4_tile_simd(
+                simd,
+                [o0, o1, o2],
+                v_refs,
+                [weights_at(0), weights_at(1), weights_at(2)],
+                head_dim,
+            );
+            g_base += 3;
+        } else if rem == 2 {
+            let (o0, r1) = tile_out.split_at_mut(head_dim);
+            let (o1, _) = r1.split_at_mut(head_dim);
+            weighted_value_accum_4_tile_simd(
+                simd,
+                [o0, o1],
+                v_refs,
+                [weights_at(0), weights_at(1)],
+                head_dim,
+            );
+            g_base += 2;
+        } else {
+            let (o0, _) = tile_out.split_at_mut(head_dim);
+            weighted_value_accum_4_tile_simd(simd, [o0], v_refs, [weights_at(0)], head_dim);
+            g_base += 1;
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared GQA KV-group attention kernel reuses caller score/output storage without allocating."
+)]
+fn attend_kv_group_impl<T: KvSource>(
+    q_group: &[f32],
+    keys: T,
+    values: T,
+    history_rows: usize,
+    row_width: usize,
+    offset: usize,
+    head_dim: usize,
+    gqa_group: usize,
+    divisor: f32,
+    current_kv: Option<(&[f32], &[f32])>,
+    scores: &mut [f32],
+    out_group: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    let total_rows = history_rows
+        .checked_add(usize::from(current_kv.is_some()))
+        .ok_or_else(invalid)?;
+    let group_elems = gqa_group.checked_mul(head_dim).ok_or_else(invalid)?;
+    let scores_elems = gqa_group.checked_mul(total_rows).ok_or_else(invalid)?;
+    if gqa_group == 0
+        || head_dim == 0
+        || q_group.len() != group_elems
+        || out_group.len() != group_elems
+        || scores.len() != scores_elems
+        || current_kv.is_some_and(|(k, v)| k.len() != head_dim || v.len() != head_dim)
+    {
+        return Err(invalid());
+    }
+    if gqa_group == 1 {
+        return attend_head_impl(
+            q_group,
+            keys,
+            values,
+            history_rows,
+            row_width,
+            offset,
+            head_dim,
+            divisor,
+            current_kv,
+            scores,
+            out_group,
+            invalid,
+        );
+    }
+    T::validate(head_dim, head_dim, head_dim, invalid)?;
+    let mut buf = T::new_scratch();
+    let full_quads = history_rows / 4;
+    let level = simd_level();
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        keys.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |k_refs| {
+            dispatch!(level, simd => {
+                dot_4keys_group_simd(
+                    simd,
+                    q_group,
+                    k_refs,
+                    head_dim,
+                    gqa_group,
+                    total_rows,
+                    r,
+                    divisor,
+                    scores,
+                );
+            });
+        });
+    }
+    for row in (full_quads * 4)..history_rows {
+        keys.with_row(row, row_width, offset, head_dim, &mut buf, |k| {
+            for g in 0..gqa_group {
+                let q_head = &q_group[g * head_dim..(g + 1) * head_dim];
+                scores[g * total_rows + row] = dot_row(q_head, k, divisor);
+            }
+        });
+    }
+    if let Some((k, _)) = current_kv {
+        for g in 0..gqa_group {
+            let q_head = &q_group[g * head_dim..(g + 1) * head_dim];
+            scores[g * total_rows + history_rows] = dot_row(q_head, k, divisor);
+        }
+    }
+    ensure_finite(scores, invalid)?;
+
+    let mut stack_sums = [0.0_f32; 16];
+    let mut heap_sums = if gqa_group > stack_sums.len() {
+        vec![0.0_f32; gqa_group]
+    } else {
+        Vec::new()
+    };
+    let sums: &mut [f32] = if gqa_group <= stack_sums.len() {
+        &mut stack_sums[..gqa_group]
+    } else {
+        &mut heap_sums[..gqa_group]
+    };
+    for (g, sum_slot) in sums.iter_mut().enumerate() {
+        let head_scores = &mut scores[g * total_rows..(g + 1) * total_rows];
+        let max = head_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0_f32;
+        for score in &mut *head_scores {
+            *score = (*score - max).exp();
+            sum += *score;
+        }
+        if !sum.is_finite() || sum <= 0.0 {
+            return Err(invalid());
+        }
+        *sum_slot = sum;
+    }
+
+    out_group.fill(0.0);
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        values.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |v_refs| {
+            dispatch!(level, simd => {
+                weighted_value_accum_4_group_simd(
+                    simd,
+                    out_group,
+                    v_refs,
+                    scores,
+                    sums,
+                    head_dim,
+                    gqa_group,
+                    total_rows,
+                    r,
+                );
+            });
+        });
+    }
+    for row in (full_quads * 4)..history_rows {
+        values.with_row(row, row_width, offset, head_dim, &mut buf, |v| {
+            for (g, &sum) in sums.iter().enumerate() {
+                let w = scores[g * total_rows + row] / sum;
+                let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
+                weighted_value_accum(out_head, v, w);
+            }
+        });
+    }
+    if let Some((_, v)) = current_kv {
+        for (g, &sum) in sums.iter().enumerate() {
+            let w = scores[g * total_rows + history_rows] / sum;
+            let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
+            weighted_value_accum(out_head, v, w);
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate all `gqa_group` query heads sharing one `F32` KV head in a single pass
+/// over `keys`/`values`, producing bit-identical outputs to calling `attend_head` per head.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared GQA KV-group attention kernel reuses caller score/output storage without allocating."
+)]
+pub(super) fn attend_kv_group_f32(
+    q_group: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    history_rows: usize,
+    row_width: usize,
+    offset: usize,
+    head_dim: usize,
+    gqa_group: usize,
+    divisor: f32,
+    current_kv: Option<(&[f32], &[f32])>,
+    scores: &mut [f32],
+    out_group: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    attend_kv_group_impl(
+        q_group,
+        keys,
+        values,
+        history_rows,
+        row_width,
+        offset,
+        head_dim,
+        gqa_group,
+        divisor,
+        current_kv,
+        scores,
+        out_group,
+        invalid,
+    )
+}
+
+/// Evaluate all `gqa_group` query heads sharing one `F16` KV head in a single pass,
+/// widening each K/V vector once per position and matching `attend_head_f16` bit-for-bit.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared GQA KV-group attention kernel reuses caller score/output storage without allocating."
+)]
+pub(super) fn attend_kv_group_f16(
+    q_group: &[f32],
+    keys: &[u16],
+    values: &[u16],
+    history_rows: usize,
+    row_width: usize,
+    offset: usize,
+    head_dim: usize,
+    gqa_group: usize,
+    divisor: f32,
+    current_kv: Option<(&[f32], &[f32])>,
+    scores: &mut [f32],
+    out_group: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    attend_kv_group_impl(
+        q_group,
+        keys,
+        values,
+        history_rows,
+        row_width,
+        offset,
+        head_dim,
+        gqa_group,
+        divisor,
+        current_kv,
+        scores,
+        out_group,
         invalid,
     )
 }

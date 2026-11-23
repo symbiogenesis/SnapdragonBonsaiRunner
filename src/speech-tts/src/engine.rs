@@ -22,7 +22,7 @@
 
 use std::{collections::HashMap, io};
 
-use fearless_simd::{Level, dispatch, f32x4, prelude::*};
+use fearless_simd::{Level, dispatch, f32x4, i32x4, prelude::*};
 
 use crate::{
     codec::codec_ref_key,
@@ -2462,6 +2462,7 @@ impl QwenDecoderLayer {
             scale,
             scores,
             attn_out,
+            workers,
         )?;
 
         self.o_proj
@@ -2678,6 +2679,7 @@ impl QwenDecoderLayer {
                 scale,
                 &mut scores,
                 out_tok,
+                workers,
             )?;
         }
 
@@ -2775,24 +2777,85 @@ impl QwenDecoderLayer {
     }
 }
 
+#[inline(always)]
+fn exp_f32x4<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
+    // Cody-Waite range reduction by ln(2) = LN2_HI + LN2_LO (15-bit HI so k * LN2_HI is exact
+    // for |k| <= 512) paired with a degree-6 minimax polynomial on [-ln(2)/2, ln(2)/2] with
+    // exact c0 = 1.0 and c1 = 1.0 so exp(0.0) == 1.0 exactly.
+    const INV_LN2: f32 = std::f32::consts::LOG2_E;
+    const LN2_HI: f32 = f32::from_bits(0x3f31_7200);
+    const LN2_LO: f32 = f32::from_bits(0x35bf_be8e);
+    const MIN_NORMAL_EXP_INPUT: f32 = -87.336_54_f32;
+    const C2: f32 = 0.5_f32;
+    const C3: f32 = 0.166_664_17_f32;
+    const C4: f32 = 0.041_666_668_f32;
+    const C5: f32 = 0.008_375_039_f32;
+    const C6: f32 = 0.001_388_888_9_f32;
+
+    let zero = f32x4::splat(simd, 0.0_f32);
+    let one = f32x4::splat(simd, 1.0_f32);
+    let min_x = f32x4::splat(simd, MIN_NORMAL_EXP_INPUT);
+    let is_underflow = x.simd_lt(min_x);
+    let x_safe = is_underflow.select(zero, x);
+
+    let kf = (x_safe * f32x4::splat(simd, INV_LN2)).round_ties_even();
+    let r = f32x4::splat(simd, -LN2_HI).mul_add(kf, x_safe);
+    let r = f32x4::splat(simd, -LN2_LO).mul_add(kf, r);
+
+    let p = f32x4::splat(simd, C6).mul_add(r, f32x4::splat(simd, C5));
+    let p = p.mul_add(r, f32x4::splat(simd, C4));
+    let p = p.mul_add(r, f32x4::splat(simd, C3));
+    let p = p.mul_add(r, f32x4::splat(simd, C2));
+    let poly = p.mul_add(r * r, r) + one;
+
+    let k_i32 = i32x4::truncate_from(kf);
+    let pow2 = ((k_i32 + 127) << 23_u32).bitcast::<f32x4<S>>();
+    is_underflow.select(zero, poly * pow2)
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn softmax_row_simd<S: Simd>(simd: S, scores: &mut [f32], max_score: f32) -> f32 {
+    let max_v = f32x4::splat(simd, max_score);
+    let mut sum_v = f32x4::splat(simd, 0.0_f32);
+    let (chunks, tail) = scores.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let sv = f32x4::from_slice(simd, chunk);
+        let ev = exp_f32x4(simd, sv - max_v);
+        ev.store_slice(chunk);
+        sum_v += ev;
+    }
+    let mut lanes = [0.0_f32; 4];
+    sum_v.store_slice(&mut lanes);
+    let mut sum_exp = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for s in tail {
+        *s = (*s - max_score).exp();
+        sum_exp += *s;
+    }
+    1.0_f32 / sum_exp.max(1e-12_f32)
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "Shared F16 KV attention kernel used by both single-step decode and batched prefill."
+    reason = "Executes a contiguous range of KV head groups using caller-local scratch."
 )]
-fn attend_query_f16(
+fn attend_kv_group_range_f16(
     level: Level,
     q: &[f32],
     kv: &LayerKvCache,
     total_seq: usize,
     kv_stride: usize,
-    num_q_heads: usize,
-    num_kv_heads: usize,
+    kvh_start: usize,
+    kvh_count: usize,
     head_dim: usize,
     gqa_ratio: usize,
     scale: f32,
-    scores: &mut Vec<f32>,
-    attn_out: &mut [f32],
-) -> io::Result<()> {
+    scores: &mut [f32],
+    out_chunk: &mut [f32],
+) {
     let mut stack_buf = [0.0_f32; 256];
     let mut heap_buf = if head_dim > stack_buf.len() {
         vec![0.0_f32; head_dim]
@@ -2805,10 +2868,11 @@ fn attend_query_f16(
         &mut heap_buf[..head_dim]
     };
 
-    if gqa_ratio > 1 && gqa_ratio <= 8 {
-        decoder_workspace::resize(scores, gqa_ratio * total_seq)?;
+    out_chunk.fill(0.0);
+    if gqa_ratio <= 8 {
         dispatch!(level, simd => {
-            for kvh in 0..num_kv_heads {
+            for local_kvh in 0..kvh_count {
+                let kvh = kvh_start + local_kvh;
                 let kv_head_off = kvh * head_dim;
                 let qh_base = kvh * gqa_ratio;
                 let mut max_scores = [f32::NEG_INFINITY; 8];
@@ -2827,59 +2891,120 @@ fn attend_query_f16(
                 }
                 let mut inv_sums = [0.0_f32; 8];
                 for g in 0..gqa_ratio {
-                    let max_score = max_scores[g];
-                    let mut sum_exp = 0.0_f32;
-                    for s in &mut scores[g * total_seq..(g + 1) * total_seq] {
-                        *s = (*s - max_score).exp();
-                        sum_exp += *s;
-                    }
-                    inv_sums[g] = 1.0_f32 / sum_exp.max(1e-12_f32);
+                    inv_sums[g] = softmax_row_simd(
+                        simd,
+                        &mut scores[g * total_seq..(g + 1) * total_seq],
+                        max_scores[g],
+                    );
                 }
                 for t in 0..total_seq {
                     let v_bits = &kv.v[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
                     widen_f16_slice(v_bits, head_buf);
                     for (g, &inv_sum) in inv_sums[..gqa_ratio].iter().enumerate() {
-                        let qh = qh_base + g;
+                        let local_qh = local_kvh * gqa_ratio + g;
                         let w = scores[g * total_seq + t] * inv_sum;
-                        let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
+                        let out_head = &mut out_chunk[local_qh * head_dim..(local_qh + 1) * head_dim];
                         axpy_simd(simd, w, head_buf, out_head);
                     }
                 }
             }
         });
     } else {
-        decoder_workspace::resize(scores, total_seq)?;
+        let scores = &mut scores[..total_seq];
         dispatch!(level, simd => {
-            for qh in 0..num_q_heads {
-                let kvh = qh / gqa_ratio;
-                let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
-                let mut max_score = f32::NEG_INFINITY;
-                for (t, score_slot) in scores.iter_mut().enumerate() {
-                    let k_bits =
-                        &kv.k[t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
-                    widen_f16_slice(k_bits, head_buf);
-                    let s = f32_dot_simd(simd, q_vec, head_buf) * scale;
-                    *score_slot = s;
-                    if s > max_score {
-                        max_score = s;
+            for local_kvh in 0..kvh_count {
+                let kvh = kvh_start + local_kvh;
+                let kv_head_off = kvh * head_dim;
+                let qh_base = kvh * gqa_ratio;
+                for g in 0..gqa_ratio {
+                    let qh = qh_base + g;
+                    let local_qh = local_kvh * gqa_ratio + g;
+                    let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
+                    let mut max_score = f32::NEG_INFINITY;
+                    for (t, score_slot) in scores.iter_mut().enumerate() {
+                        let k_bits = &kv.k[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
+                        widen_f16_slice(k_bits, head_buf);
+                        let s = f32_dot_simd(simd, q_vec, head_buf) * scale;
+                        *score_slot = s;
+                        if s > max_score {
+                            max_score = s;
+                        }
                     }
-                }
-                let mut sum_exp = 0.0_f32;
-                for s in &mut *scores {
-                    *s = (*s - max_score).exp();
-                    sum_exp += *s;
-                }
-                let inv_sum = 1.0_f32 / sum_exp.max(1e-12_f32);
-                let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
-                for (t, &prob_unnorm) in scores.iter().enumerate() {
-                    let w = prob_unnorm * inv_sum;
-                    let v_bits =
-                        &kv.v[t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim];
-                    widen_f16_slice(v_bits, head_buf);
-                    axpy_simd(simd, w, head_buf, out_head);
+                    let inv_sum = softmax_row_simd(simd, scores, max_score);
+                    let out_head = &mut out_chunk[local_qh * head_dim..(local_qh + 1) * head_dim];
+                    for (t, &prob_unnorm) in scores.iter().enumerate() {
+                        let w = prob_unnorm * inv_sum;
+                        let v_bits = &kv.v[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
+                        widen_f16_slice(v_bits, head_buf);
+                        axpy_simd(simd, w, head_buf, out_head);
+                    }
                 }
             }
         });
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared F16 KV attention kernel used by both single-step decode and batched prefill."
+)]
+fn attend_query_f16(
+    level: Level,
+    q: &[f32],
+    kv: &LayerKvCache,
+    total_seq: usize,
+    kv_stride: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    gqa_ratio: usize,
+    scale: f32,
+    scores: &mut Vec<f32>,
+    attn_out: &mut [f32],
+    workers: usize,
+) -> io::Result<()> {
+    let needed_scores = if gqa_ratio <= 8 {
+        gqa_ratio * total_seq
+    } else {
+        total_seq
+    };
+    if workers > 1 && num_kv_heads > 1 && total_seq >= 64 && attn_out.len() == num_q_heads * head_dim {
+        let group_width = gqa_ratio * head_dim;
+        row_workers::run_aligned(attn_out, workers, group_width, &|elem_off, out_chunk| {
+            let kvh_start = elem_off / group_width;
+            let kvh_count = out_chunk.len() / group_width;
+            let mut local_scores = vec![0.0_f32; needed_scores];
+            attend_kv_group_range_f16(
+                level,
+                q,
+                kv,
+                total_seq,
+                kv_stride,
+                kvh_start,
+                kvh_count,
+                head_dim,
+                gqa_ratio,
+                scale,
+                &mut local_scores,
+                out_chunk,
+            );
+        });
+    } else {
+        decoder_workspace::resize(scores, needed_scores)?;
+        attend_kv_group_range_f16(
+            level,
+            q,
+            kv,
+            total_seq,
+            kv_stride,
+            0,
+            num_kv_heads,
+            head_dim,
+            gqa_ratio,
+            scale,
+            scores,
+            attn_out,
+        );
     }
     Ok(())
 }
@@ -2925,8 +3050,8 @@ impl CodePredictorModel {
         if let Some(proj) = &self.mtp_proj {
             proj.forward_vec_into(raw, None, None, workers, out)
         } else {
-            out.clear();
-            out.extend_from_slice(raw);
+            decoder_workspace::resize(out, raw.len())?;
+            out.copy_from_slice(raw);
             Ok(())
         }
     }
@@ -3038,7 +3163,8 @@ impl CodePredictorModel {
         // Clear logical state even when admission below rejects. The guard also
         // clears partial frames on cancellation, numerical errors and unwind.
         let mut frame = workspace.frame(self.layers.len())?;
-        let (kv_caches, sampler_scratch, decoder_workspace) = frame.buffers();
+        let (kv_caches, sampler_scratch, decoder_workspace, next_raw, h_a, h_b, normed, logits) =
+            frame.buffers();
         if !(1..=256).contains(&workers) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3064,9 +3190,9 @@ impl CodePredictorModel {
         let c0_usize = usize::try_from(c0).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "Negative semantic code c0.")
         })?;
-        let mut next_raw = vec![0.0_f32; talker_dim];
+        decoder_workspace::resize(next_raw, talker_dim)?;
         talker_codec_embd
-            .row_into(c0_usize, &mut next_raw)
+            .row_into(c0_usize, next_raw)
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -3079,14 +3205,12 @@ impl CodePredictorModel {
 
         // Step 0 prefill: position 0 = talker_hidden, position 1 = embed(c0)
         cancel()?;
-        let mut h_a = Vec::with_capacity(self.hidden_size);
-        let mut h_b = Vec::with_capacity(self.hidden_size);
-        self.project_in_parallel_into(talker_hidden, workers, &mut h_a)?;
-        h_b.resize(h_a.len(), 0.0);
+        self.project_in_parallel_into(talker_hidden, workers, h_a)?;
+        decoder_workspace::resize(h_b, h_a.len())?;
         for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
             cancel()?;
             layer.forward_step_into(
-                &h_a,
+                h_a,
                 self.num_q_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -3096,22 +3220,20 @@ impl CodePredictorModel {
                 None,
                 workers,
                 decoder_workspace,
-                &mut h_b,
+                h_b,
             )?;
-            std::mem::swap(&mut h_a, &mut h_b);
+            std::mem::swap(h_a, h_b);
         }
 
         observe(PredictorObservation::Prefill { cache: kv_caches })?;
-        let mut normed = Vec::with_capacity(self.hidden_size);
-        let mut logits = Vec::with_capacity(self.vocab_size);
         for g in 0..NUM_ACOUSTIC_CODEBOOKS {
             cancel()?;
-            self.project_in_parallel_into(&next_raw, workers, &mut h_a)?;
-            h_b.resize(h_a.len(), 0.0);
+            self.project_in_parallel_into(next_raw, workers, h_a)?;
+            decoder_workspace::resize(h_b, h_a.len())?;
             for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
                 cancel()?;
                 layer.forward_step_into(
-                    &h_a,
+                    h_a,
                     self.num_q_heads,
                     self.num_kv_heads,
                     self.head_dim,
@@ -3121,21 +3243,21 @@ impl CodePredictorModel {
                     None,
                     workers,
                     decoder_workspace,
-                    &mut h_b,
+                    h_b,
                 )?;
-                std::mem::swap(&mut h_a, &mut h_b);
+                std::mem::swap(h_a, h_b);
             }
-            rms_norm_into(&h_a, &self.norm_w, self.rms_norm_eps, &mut normed)?;
-            self.lm_heads[g].forward_vec_into(&normed, None, None, workers, &mut logits)?;
+            rms_norm_into(h_a, &self.norm_w, self.rms_norm_eps, normed)?;
+            self.lm_heads[g].forward_vec_into(normed, None, None, workers, logits)?;
             observe(PredictorObservation::Logits {
                 codebook: g,
-                hidden: &normed,
-                logits: &logits,
+                hidden: normed,
+                logits,
                 cache: kv_caches,
             })?;
             cancel()?;
             let sampled_idx = sampling::sample_top_k_p_with_scratch(
-                &mut logits,
+                logits,
                 sampling::SampleTopKPParams {
                     temperature: params.subtalker_temperature,
                     top_k: params.subtalker_top_k,
@@ -3163,7 +3285,7 @@ impl CodePredictorModel {
 
             if g + 1 < NUM_ACOUSTIC_CODEBOOKS {
                 self.codec_embeddings[g]
-                    .row_into(sampled_idx, &mut next_raw)
+                    .row_into(sampled_idx, next_raw)
                     .map_err(|_| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -3239,6 +3361,8 @@ impl PromptCache {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use fearless_simd::SimdBase;
 
     use super::{
         CodePredictorModel, DecoupledSamplingParams, LayerKvCache, LinearProjection,
@@ -3957,6 +4081,245 @@ mod tests {
         let out_of_place = super::rms_norm(&x4, &[1.0, 0.5, 1.5, 2.0], 1e-6)?;
         super::rms_norm_in_place(&mut in_place, &[1.0, 0.5, 1.5, 2.0], 1e-6)?;
         assert_eq!(out_of_place.as_slice(), in_place.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn exp_f32x4_matches_scalar_exp_within_two_ulp_and_exact_zero() {
+        let level = super::Level::new();
+        let mut max_ulp = 0_u32;
+        let mut samples = Vec::with_capacity(4096);
+        samples.extend_from_slice(&[0.0_f32, -0.0, -1e-7, -0.346_573_6, -1.0, -20.0, -87.3, -88.0, -120.0]);
+        for i in 0..4000_u32 {
+            let x = -87.3_f32 * (f32::from(u16::try_from(i).unwrap_or(0)) / 4000.0_f32);
+            samples.push(x);
+        }
+        for chunk in samples.chunks_exact(4) {
+            let got: [f32; 4] = super::dispatch!(level, simd => {
+                let v = super::f32x4::from_slice(simd, chunk);
+                super::exp_f32x4(simd, v).into()
+            });
+            for (&x, &g) in chunk.iter().zip(&got) {
+                if x == 0.0 {
+                    assert_eq!(g.to_bits(), 1.0_f32.to_bits());
+                } else if x < -87.336_54 {
+                    assert_eq!(g.to_bits(), 0.0_f32.to_bits());
+                } else {
+                    let want = x.exp();
+                    let ulp = g.to_bits().abs_diff(want.to_bits());
+                    max_ulp = max_ulp.max(ulp);
+                    assert!(ulp <= 2, "x={x} got={g} want={want} ulp={ulp}");
+                }
+            }
+        }
+        assert!(max_ulp <= 2);
+    }
+
+    #[test]
+    fn attend_query_f16_parallel_matches_sequential_across_gqa_ratios() -> std::io::Result<()> {
+        let level = super::Level::new();
+        let head_dim = 64_usize;
+        let total_seq = 97_usize;
+        let num_kv_heads = 4_usize;
+        for gqa_ratio in [1_usize, 2, 4, 8] {
+            let num_q_heads = num_kv_heads * gqa_ratio;
+            let kv_stride = num_kv_heads * head_dim;
+            let scale = 1.0_f32 / super::usize_to_f32(head_dim).sqrt();
+            let q: Vec<f32> = (0..num_q_heads * head_dim)
+                .map(|i| {
+                    let v = i32::try_from((i * 17 + 5) % 29).unwrap_or(0) - 14;
+                    f32::from(i8::try_from(v).unwrap_or(0)) * 0.05
+                })
+                .collect();
+            let mut k_f16 = vec![0_u16; total_seq * kv_stride];
+            let mut v_f16 = vec![0_u16; total_seq * kv_stride];
+            let k_f32: Vec<f32> = (0..total_seq * kv_stride)
+                .map(|i| {
+                    let v = i32::try_from((i * 13 + 3) % 23).unwrap_or(0) - 11;
+                    f32::from(i8::try_from(v).unwrap_or(0)) * 0.0625
+                })
+                .collect();
+            let v_f32: Vec<f32> = (0..total_seq * kv_stride)
+                .map(|i| {
+                    let v = i32::try_from((i * 19 + 7) % 31).unwrap_or(0) - 15;
+                    f32::from(i8::try_from(v).unwrap_or(0)) * 0.03125
+                })
+                .collect();
+            assert!(super::narrow_f32_slice(&k_f32, &mut k_f16));
+            assert!(super::narrow_f32_slice(&v_f32, &mut v_f16));
+            let kv = LayerKvCache {
+                k: k_f16,
+                v: v_f16,
+                seq_len: total_seq,
+            };
+
+            let mut scores = Vec::new();
+            let mut seq_out = vec![0.0_f32; num_q_heads * head_dim];
+            super::attend_query_f16(
+                level,
+                &q,
+                &kv,
+                total_seq,
+                kv_stride,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                gqa_ratio,
+                scale,
+                &mut scores,
+                &mut seq_out,
+                1,
+            )?;
+
+            let mut par_out = vec![f32::NAN; num_q_heads * head_dim];
+            super::attend_query_f16(
+                level,
+                &q,
+                &kv,
+                total_seq,
+                kv_stride,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                gqa_ratio,
+                scale,
+                &mut scores,
+                &mut par_out,
+                4,
+            )?;
+
+            assert_eq!(
+                par_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                seq_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "parallel vs sequential mismatch for gqa_ratio={gqa_ratio}"
+            );
+
+            // Check numerical accuracy against exact scalar f32::exp reference.
+            for qh in 0..num_q_heads {
+                let kvh = qh / gqa_ratio;
+                let q_vec = &q[qh * head_dim..(qh + 1) * head_dim];
+                let mut ref_scores = Vec::with_capacity(total_seq);
+                let mut max_s = f32::NEG_INFINITY;
+                for t in 0..total_seq {
+                    let mut kw = vec![0.0_f32; head_dim];
+                    super::widen_f16_slice(
+                        &kv.k[t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim],
+                        &mut kw,
+                    );
+                    let s = q_vec.iter().zip(&kw).map(|(a, b)| a * b).sum::<f32>() * scale;
+                    max_s = max_s.max(s);
+                    ref_scores.push(s);
+                }
+                let mut sum = 0.0_f32;
+                for s in &mut ref_scores {
+                    *s = (*s - max_s).exp();
+                    sum += *s;
+                }
+                let inv = 1.0_f32 / sum.max(1e-12_f32);
+                let mut ref_out = vec![0.0_f32; head_dim];
+                for (t, &p) in ref_scores.iter().enumerate() {
+                    let mut vw = vec![0.0_f32; head_dim];
+                    super::widen_f16_slice(
+                        &kv.v[t * kv_stride + kvh * head_dim..t * kv_stride + (kvh + 1) * head_dim],
+                        &mut vw,
+                    );
+                    for (dst, &val) in ref_out.iter_mut().zip(&vw) {
+                        *dst += (p * inv) * val;
+                    }
+                }
+                for (got, want) in par_out[qh * head_dim..(qh + 1) * head_dim]
+                    .iter()
+                    .zip(&ref_out)
+                {
+                    assert!(
+                        (got - want).abs() < 1e-5,
+                        "gqa={gqa_ratio} qh={qh} got={got} want={want}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn predictor_workspace_reuses_buffers_across_multiple_frames_without_reallocating()
+    -> std::io::Result<()> {
+        let model = code_predictor_fixture()?;
+        let embeddings = LinearProjection::new(
+            "talker.codec_embd.weight",
+            4,
+            8,
+            WeightQuantization::F32(vec![0.2; 8 * 4]),
+            None,
+        )?;
+        let mut workspace = super::predictor_workspace::PredictorWorkspace::default();
+        let input = [0.1, -0.2, 0.3, 0.4];
+
+        let first = model.predict_frame_reusing(
+            &input,
+            3,
+            &embeddings,
+            DecoupledSamplingParams::base_clone(),
+            42,
+            100,
+            2,
+            &mut || Ok(()),
+            &mut workspace,
+        )?;
+        let mut frame_ptrs = {
+            let mut f = workspace.frame(model.layers.len())?;
+            let (layers, _, decoder, next_raw, h_a, h_b, normed, logits) = f.buffers();
+            let layer0 = (layers[0].k.as_ptr(), layers[0].k.capacity());
+            let dec = (decoder.q.as_ptr(), decoder.q.capacity());
+            let ptrs = [
+                (next_raw.as_ptr(), next_raw.capacity()),
+                (h_a.as_ptr(), h_a.capacity()),
+                (h_b.as_ptr(), h_b.capacity()),
+                (normed.as_ptr(), normed.capacity()),
+                (logits.as_ptr(), logits.capacity()),
+            ];
+            assert!(ptrs.iter().all(|&(_, cap)| cap > 0));
+            (layer0, dec, ptrs)
+        };
+
+        for frame_idx in 1..4_i64 {
+            let out = model.predict_frame_reusing(
+                &input,
+                3,
+                &embeddings,
+                DecoupledSamplingParams::base_clone(),
+                42,
+                100 + frame_idx,
+                2,
+                &mut || Ok(()),
+                &mut workspace,
+            )?;
+            let fresh = model.predict_frame_with_control(
+                &input,
+                3,
+                &embeddings,
+                DecoupledSamplingParams::base_clone(),
+                42,
+                100 + frame_idx,
+                2,
+                &mut || Ok(()),
+            )?;
+            assert_eq!(out, fresh);
+            let mut f = workspace.frame(model.layers.len())?;
+            let (layers, _, decoder, next_raw, h_a, h_b, normed, logits) = f.buffers();
+            assert_eq!((layers[0].k.as_ptr(), layers[0].k.capacity()), frame_ptrs.0);
+            assert_eq!((decoder.q.as_ptr(), decoder.q.capacity()), frame_ptrs.1);
+            let current_ptrs = [
+                (next_raw.as_ptr(), next_raw.capacity()),
+                (h_a.as_ptr(), h_a.capacity()),
+                (h_b.as_ptr(), h_b.capacity()),
+                (normed.as_ptr(), normed.capacity()),
+                (logits.as_ptr(), logits.capacity()),
+            ];
+            assert_eq!(current_ptrs, frame_ptrs.2);
+            frame_ptrs.2 = current_ptrs;
+        }
+        assert_eq!(first[0], 3);
         Ok(())
     }
 }

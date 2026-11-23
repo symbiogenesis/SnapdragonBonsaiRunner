@@ -64,6 +64,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--spec-type none|suffix] [--draft-max 1..=8] (reviewed native runtime only; suffix requires --cpu-prefill-tokens and suppresses mmproj)\n",
     "  [--cpu-family x1|x2] (reviewed native runtime only; overrides detected Snapdragon X1/X2 family)\n",
     "  [--placement auto|cpu|vulkan|composite] (native Swift only; cpu/vulkan/composite require a reviewed compatible release)\n",
+    "  [--hexagon-arena-cache <abs-dir>] (reviewed native runtime only; requires --allow-unisolated-backend and excludes --placement cpu)\n",
     "  [--reset-on-cancel] (reviewed native runtime only; reset live state in place on client cancel)\n",
     "  [--no-mmproj] (disable multimodal vision projector; Swift only)\n",
     "  [--use-abliterate-lora] (pinned adapter; request scale 0..2, default 1.3; Swift CPU only)\n",
@@ -157,6 +158,7 @@ pub struct LaunchConfig {
     draft_max: Option<u8>,
     cpu_family: Option<crate::inference::CpuFamily>,
     placement: crate::inference::Placement,
+    hexagon_arena_cache: Option<PathBuf>,
     reset_on_cancel: bool,
     no_mmproj: bool,
     use_abliterate_lora: bool,
@@ -279,7 +281,8 @@ impl LaunchConfig {
         let (mut prompt_reuse_checkpoints, mut prompt_reuse_checkpoint_bytes) = (None, None);
         let (mut kv_cache, mut cpu_prefill_tokens, mut cpu_prefill_gdn, mut placement) =
             (None, None, None, None);
-        let (mut spec_type, mut draft_max, mut cpu_family) = (None, None, None);
+        let (mut spec_type, mut draft_max, mut cpu_family, mut hexagon_arena_cache) =
+            (None, None, None, None);
         let (mut reset_on_cancel, mut no_mmproj, mut use_abliterate_lora, mut no_daisyrose_lora) =
             (false, false, false, false);
         let (mut daisyrose_lora, mut use_repacked_ptq1, mut profile) = (None, None, None);
@@ -339,6 +342,9 @@ impl LaunchConfig {
                 Some("--placement") => take_once(&mut placement, &mut args, |v| {
                     crate::inference::Placement::parse(v.as_deref())
                 })?,
+                Some("--hexagon-arena-cache") => {
+                    take_once(&mut hexagon_arena_cache, &mut args, take_path)?;
+                }
                 Some("--reset-on-cancel") => set_flag(&mut reset_on_cancel)?,
                 Some("--no-mmproj") => set_flag(&mut no_mmproj)?,
                 Some("--use-abliterate-lora") => set_flag(&mut use_abliterate_lora)?,
@@ -392,7 +398,8 @@ impl LaunchConfig {
             || spec_type.is_some()
             || draft_max.is_some()
             || cpu_family.is_some()
-            || placement.is_some())
+            || placement.is_some()
+            || hexagon_arena_cache.is_some())
             && profile != LaunchProfile::SwiftPq2Assessment
         {
             return Err(LaunchError::Arguments);
@@ -422,6 +429,7 @@ impl LaunchConfig {
             draft_max,
             cpu_family,
             placement,
+            hexagon_arena_cache,
             reset_on_cancel,
             no_mmproj,
             use_abliterate_lora,
@@ -434,7 +442,10 @@ impl LaunchConfig {
             },
         };
         configuration.validate_selection(use_repacked_ptq1.is_some())?;
-        let gates: [(bool, fn() -> Result<bool, LaunchError>); 7] = [
+        if let Some(cache_dir) = &configuration.hexagon_arena_cache {
+            validate_hexagon_arena_cache_dir(cache_dir)?;
+        }
+        let gates: [(bool, fn() -> Result<bool, LaunchError>); 8] = [
             (
                 configuration.reset_on_cancel,
                 crate::inference::reset_on_cancel_supported,
@@ -464,6 +475,10 @@ impl LaunchConfig {
             (
                 configuration.daisyrose_lora.is_some(),
                 crate::inference::multi_rank_lora_supported,
+            ),
+            (
+                configuration.hexagon_arena_cache.is_some(),
+                crate::inference::hexagon_arena_cache_supported,
             ),
         ];
         for (enabled, supported) in gates {
@@ -522,6 +537,11 @@ impl LaunchConfig {
             || (self.use_abliterate_lora && !swift)
             || (self.daisyrose_lora.is_some() && (!swift || !self.native_engine))
             || (self.no_daisyrose_lora && (!swift || self.daisyrose_lora.is_some()))
+            || (self.hexagon_arena_cache.is_some()
+                && (!swift
+                    || !self.native_engine
+                    || self.placement == crate::inference::Placement::Cpu
+                    || self.requires_native_sandbox()))
             || (explicit_weight && !swift)
         {
             return Err(LaunchError::Arguments);
@@ -1136,6 +1156,9 @@ impl LaunchConfig {
                 return Err(LaunchError::Adapter);
             }
         }
+        if let Some(path) = &self.hexagon_arena_cache {
+            validate_hexagon_arena_cache_dir(path)?;
+        }
         Ok(())
     }
 
@@ -1237,6 +1260,13 @@ impl LaunchConfig {
         if self.placement != crate::inference::Placement::Auto {
             push_arg(&mut arguments, "--placement", self.placement.as_str());
         }
+        if let Some(cache_dir) = &self.hexagon_arena_cache {
+            push_arg(
+                &mut arguments,
+                "--hexagon-arena-cache",
+                cache_dir.as_os_str(),
+            );
+        }
         if self.uses_repacked_ptq1() {
             arguments.push("--use-repacked-ptq1".into());
         }
@@ -1278,6 +1308,9 @@ impl LaunchConfig {
         native_executable: Option<&std::path::Path>,
         broker_pipe: bool,
     ) -> Result<ProcessSpec, LaunchError> {
+        if self.requires_native_sandbox() && self.hexagon_arena_cache.is_some() {
+            return Err(LaunchError::Sandbox);
+        }
         // The worker may write only this child, never the sibling keys or logs.
         // Its parent already has the credential owner's protected inheritable ACL.
         let working_directory = credentials.directory().join("worker");
@@ -1325,6 +1358,9 @@ impl LaunchConfig {
             return OwnedProcess::start(specification)
                 .map(|process| (process, None))
                 .map_err(|_| LaunchError::Process);
+        }
+        if self.hexagon_arena_cache.is_some() {
+            return Err(LaunchError::Sandbox);
         }
         let mut readonly_paths = artifacts.runtime_files();
         readonly_paths.extend([
@@ -2340,6 +2376,22 @@ fn decode_sha256_hex(hex: &str) -> Result<[u8; 32], LaunchError> {
         *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Ok(digest)
+}
+
+fn validate_hexagon_arena_cache_dir(dir: &std::path::Path) -> Result<(), LaunchError> {
+    bonsai_artifacts::validate_external_path(dir).map_err(|_| LaunchError::Path)?;
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || bonsai_artifacts::is_redirect(&metadata)
+                || !metadata.is_dir() =>
+        {
+            Err(LaunchError::Path)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(LaunchError::Path),
+    }
 }
 
 fn hexagon_runtime_readonly_paths(data: &std::path::Path) -> Vec<PathBuf> {
@@ -5131,6 +5183,158 @@ mod tests {
                 Some(LaunchError::NativeRuntime)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hexagon_arena_cache_validates_paths_rejects_incompatible_options_and_emits_args()
+    -> std::io::Result<()> {
+        let temp = crate::test_util::TempDir::new("Bonsai-hexagon-arena-cache")?;
+        let existing_dir = temp.path().join("arena-cache-existing");
+        std::fs::create_dir(&existing_dir)?;
+        let leaf_dir = temp.path().join("arena-cache-leaf");
+        let existing_file = temp.path().join("not-a-directory");
+        std::fs::write(&existing_file, b"file")?;
+
+        let existing_str = existing_dir.to_string_lossy().into_owned();
+        let leaf_str = leaf_dir.to_string_lossy().into_owned();
+        let file_str = existing_file.to_string_lossy().into_owned();
+
+        assert!(super::LAUNCH_USAGE.contains("--hexagon-arena-cache"));
+
+        let mut native = arguments();
+        native.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        let default_cfg = LaunchConfig::parse(native.clone())
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        assert_eq!(default_cfg.hexagon_arena_cache, None);
+
+        // Pinned 0.1.32 fails closed when `--hexagon-arena-cache` is supplied with valid flags/paths.
+        for valid_dir in [&existing_str, &leaf_str] {
+            let mut gated = native.clone();
+            gated.extend(["--hexagon-arena-cache", valid_dir].map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(gated).err(),
+                Some(LaunchError::NativeRuntime)
+            );
+        }
+
+        // Incompatible option combinations reject with LaunchError::Arguments.
+        for bad_args in [
+            vec!["--hexagon-arena-cache"],
+            vec!["--hexagon-arena-cache", &existing_str, "--hexagon-arena-cache", &leaf_str],
+            vec!["--publisher-engine", "--hexagon-arena-cache", &existing_str],
+            vec!["--placement", "cpu", "--hexagon-arena-cache", &existing_str],
+        ] {
+            let mut rejected = native.clone();
+            rejected.extend(bad_args.into_iter().map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(rejected).err(),
+                Some(LaunchError::Arguments)
+            );
+        }
+
+        // Default reference-cpu profile rejects `--hexagon-arena-cache`.
+        let mut ref_rejected = arguments();
+        ref_rejected.extend(["--hexagon-arena-cache", &existing_str].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse(ref_rejected).err(),
+            Some(LaunchError::Arguments)
+        );
+
+        // Sandbox containment rejects `--hexagon-arena-cache` at parse time and specification time.
+        let mut sandboxed = native.clone();
+        sandboxed[1] = "--require-native-sandbox".into();
+        let mut sandbox_cfg = LaunchConfig::parse(sandboxed.clone())
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        sandboxed.extend(["--hexagon-arena-cache", &existing_str].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse(sandboxed).err(),
+            Some(LaunchError::Arguments)
+        );
+
+        // Invalid path spellings and non-directory files reject with LaunchError::Path.
+        let nul_path = format!("{}\\bad\0leaf", temp.path().display());
+        let repo_inside = std::env::current_dir()?;
+        let repo_inside_str = repo_inside.to_string_lossy().into_owned();
+        for invalid_path in [
+            "",
+            "relative-cache",
+            "C:\\",
+            "\\\\server\\share\\cache",
+            "C:\\Users\\%USERNAME%\\arena-cache",
+            &nul_path,
+            &file_str,
+            &repo_inside_str,
+        ] {
+            let mut rejected = native.clone();
+            rejected.extend(["--hexagon-arena-cache", invalid_path].map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(rejected).err(),
+                Some(LaunchError::Path),
+                "expected Path error for {invalid_path:?}"
+            );
+        }
+
+        // When symlink creation is permitted on the host, verify symlinked cache dir is rejected.
+        let symlink_path = temp.path().join("arena-cache-symlink");
+        if std::os::windows::fs::symlink_dir(&existing_dir, &symlink_path).is_ok() {
+            let symlink_str = symlink_path.to_string_lossy().into_owned();
+            let mut rejected = native.clone();
+            rejected.extend(["--hexagon-arena-cache", &symlink_str].map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(rejected).err(),
+                Some(LaunchError::Path)
+            );
+        }
+
+        // Verify unisolated argument emission, validate_paths, and specification behavior.
+        let mut unisolated_cfg = LaunchConfig::parse(native)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        unisolated_cfg.data = temp.path().to_path_buf();
+        unisolated_cfg.evidence_parent = temp.path().to_path_buf();
+        unisolated_cfg.hexagon_arena_cache = Some(existing_dir.clone());
+        unisolated_cfg
+            .validate_paths()
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+
+        let creds = super::PrivateCredentials::create(temp.path())?;
+        let plan = swift_plan_for(temp.path(), creds.backend_path())
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        let child_args = unisolated_cfg.native_arguments(&plan, None);
+        assert!(has_flag_pair(
+            &child_args,
+            "--hexagon-arena-cache",
+            existing_dir.as_os_str()
+        ));
+        let spec = unisolated_cfg
+            .specification(
+                plan,
+                &creds,
+                Some(std::path::Path::new("C:\\ExternalData\\prism.exe")),
+                true,
+            )
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        assert!(has_flag_pair(
+            &spec.arguments,
+            "--hexagon-arena-cache",
+            existing_dir.as_os_str()
+        ));
+
+        // Even if mutated directly on a sandboxed config, specification must deny it.
+        sandbox_cfg.hexagon_arena_cache = Some(existing_dir);
+        let sandbox_plan = swift_plan_for(temp.path(), creds.backend_path())
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        assert_eq!(
+            sandbox_cfg
+                .specification(
+                    sandbox_plan,
+                    &creds,
+                    Some(std::path::Path::new("C:\\ExternalData\\prism.exe")),
+                    true,
+                )
+                .err(),
+            Some(LaunchError::Sandbox)
+        );
         Ok(())
     }
 }

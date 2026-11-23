@@ -908,6 +908,7 @@ impl DecoderWorkspace {
         let retain_pos = RETAIN_POSITIONS.min(c.context.max(1));
         let q_width = c.heads.saturating_mul(c.head_dim);
         let kv_width = c.kv_heads.saturating_mul(c.head_dim);
+        let gqa_group = (c.heads / c.kv_heads.max(1)).max(1);
         let max_proj_out = c.intermediate.max(q_width).max(c.hidden);
         let max_proj_in = c.intermediate.max(q_width).max(c.hidden);
         self.single_hidden.clear();
@@ -921,7 +922,10 @@ impl DecoderWorkspace {
         self.single_proj.clear();
         self.single_gate.clear();
         self.single_up.clear();
-        clear_bounded(&mut self.single_scores, retain_pos);
+        clear_bounded(
+            &mut self.single_scores,
+            retain_pos.saturating_mul(gqa_group),
+        );
         self.single_provisional_keys.clear();
         self.single_provisional_values.clear();
         self.single_provisional_keys_f16.clear();
@@ -1014,7 +1018,12 @@ impl Session {
         for state in &mut self.layers {
             state.reserve_extra(extra_kv)?;
         }
-        let scores_len = self.position.saturating_add(additional).max(1);
+        let gqa_group = (c.heads / c.kv_heads.max(1)).max(1);
+        let scores_len = self
+            .position
+            .saturating_add(additional)
+            .max(1)
+            .saturating_mul(gqa_group);
         if self.workspace.single_scores.capacity() < scores_len {
             let needed = scores_len - self.workspace.single_scores.len();
             self.workspace
@@ -1104,7 +1113,8 @@ impl Session {
         ensure_len(&mut ws.single_proj, c.hidden)?;
         ensure_len(&mut ws.single_gate, c.intermediate)?;
         ensure_len(&mut ws.single_up, c.intermediate)?;
-        ensure_len(&mut ws.single_scores, self.position + 1)?;
+        let gqa_group = c.heads / c.kv_heads;
+        ensure_len(&mut ws.single_scores, gqa_group * (self.position + 1))?;
         let prov_total = self.layers.len() * kv_width;
         if matches!(c.cache_precision, CachePrecision::F16) {
             ensure_len_t(&mut ws.single_k_f16, kv_width)?;
@@ -1450,6 +1460,7 @@ fn prefill_rows_inner(
             check(cancel)?;
         }
         let queries = &ws.batch_q;
+        let group_width = gqa_group * c.head_dim;
         row_workers::try_run_aligned(
             &mut ws.batch_attn,
             workers,
@@ -1458,20 +1469,20 @@ fn prefill_rows_inner(
                 let local_start = elem_off / q_width;
                 let rows = attn_slice.len() / q_width;
                 let max_history = start_pos + local_start + rows;
-                let mut scores = zeros(max_history)?;
+                let mut scores = zeros(gqa_group * max_history)?;
                 for (local_pos, out_row) in attn_slice.chunks_exact_mut(q_width).enumerate() {
                     let local_row = local_start + local_pos;
                     let pos = start_pos + local_row;
                     let q_row = &queries[local_row * q_width..(local_row + 1) * q_width];
                     let history_rows = pos + 1;
-                    let row_scores = &mut scores[..history_rows];
-                    for head in 0..c.heads {
-                        let kv_head = head / gqa_group;
+                    let row_scores = &mut scores[..gqa_group * history_rows];
+                    for kv_head in 0..c.kv_heads {
                         let offset = kv_head * c.head_dim;
-                        let q_head = &q_row[head * c.head_dim..(head + 1) * c.head_dim];
-                        let out_head = &mut out_row[head * c.head_dim..(head + 1) * c.head_dim];
-                        attend_head_causal(
-                            q_head,
+                        let q_group = &q_row[kv_head * group_width..(kv_head + 1) * group_width];
+                        let out_group =
+                            &mut out_row[kv_head * group_width..(kv_head + 1) * group_width];
+                        attend_kv_group_causal(
+                            q_group,
                             state,
                             None,
                             None,
@@ -1479,9 +1490,10 @@ fn prefill_rows_inner(
                             kv_width,
                             offset,
                             c.head_dim,
+                            gqa_group,
                             divisor,
                             row_scores,
-                            out_head,
+                            out_group,
                         )?;
                     }
                     finite(out_row)?;
@@ -1807,6 +1819,7 @@ fn forward_into(
         state,
         c,
         position,
+        workers,
         &mut ws.single_scores,
         &mut ws.single_attn,
         cancel,
@@ -1832,6 +1845,7 @@ fn forward_into(
     )
 }
 
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Causal attention kernel shares state/current slices and reusable score buffer without allocations."
@@ -1883,6 +1897,58 @@ fn attend_head_causal(
 
 #[expect(
     clippy::too_many_arguments,
+    reason = "Grouped causal attention shares state/current slices and reusable score buffer without allocations."
+)]
+fn attend_kv_group_causal(
+    q_group: &[f32],
+    state: &LayerState,
+    cur_key: Option<&[f32]>,
+    cur_val: Option<&[f32]>,
+    history_rows: usize,
+    kv_width: usize,
+    offset: usize,
+    head_dim: usize,
+    gqa_group: usize,
+    divisor: f32,
+    scores: &mut [f32],
+    out_group: &mut [f32],
+) -> io::Result<()> {
+    match &state.data {
+        LayerKv::F32(pair) => packed::attend_kv_group_f32(
+            q_group,
+            &pair.keys,
+            &pair.values,
+            history_rows,
+            kv_width,
+            offset,
+            head_dim,
+            gqa_group,
+            divisor,
+            cur_key.zip(cur_val),
+            scores,
+            out_group,
+            invalid,
+        ),
+        LayerKv::F16(pair) => packed::attend_kv_group_f16(
+            q_group,
+            &pair.keys,
+            &pair.values,
+            history_rows,
+            kv_width,
+            offset,
+            head_dim,
+            gqa_group,
+            divisor,
+            cur_key.zip(cur_val),
+            scores,
+            out_group,
+            invalid,
+        ),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "Maintains direct single-position attend contract alongside workspace-reusing attend_into."
 )]
 fn attend_into(
@@ -1892,6 +1958,7 @@ fn attend_into(
     state: &LayerState,
     c: Config,
     position: usize,
+    workers: usize,
     scores: &mut [f32],
     output: &mut [f32],
     cancel: &mut impl FnMut() -> bool,
@@ -1899,26 +1966,70 @@ fn attend_into(
     let width = c.kv_heads * c.head_dim;
     let divisor = scalar(c.head_dim).sqrt();
     let gqa_group = c.heads / c.kv_heads;
-    let row_scores = &mut scores[..=position];
-    for head in 0..c.heads {
+    let group_width = gqa_group * c.head_dim;
+    let total_rows = position + 1;
+    let group_scores_len = gqa_group * total_rows;
+    if output.len() != c.heads * c.head_dim || query.len() != c.heads * c.head_dim {
+        return Err(invalid());
+    }
+    if workers > 1 && c.kv_heads > 1 && position >= 32 {
+        for _ in 0..c.heads {
+            check(cancel)?;
+        }
+        row_workers::try_run_aligned(output, workers, group_width, &|elem_off, out_chunk| {
+            let kv_start = elem_off / group_width;
+            let kv_count = out_chunk.len() / group_width;
+            let mut local_scores = zeros(group_scores_len)?;
+            for local_kv in 0..kv_count {
+                let kv_head = kv_start + local_kv;
+                let offset = kv_head * c.head_dim;
+                let q_group = &query[kv_head * group_width..(kv_head + 1) * group_width];
+                let out_group =
+                    &mut out_chunk[local_kv * group_width..(local_kv + 1) * group_width];
+                attend_kv_group_causal(
+                    q_group,
+                    state,
+                    Some(&keys[offset..offset + c.head_dim]),
+                    Some(&values[offset..offset + c.head_dim]),
+                    position,
+                    width,
+                    offset,
+                    c.head_dim,
+                    gqa_group,
+                    divisor,
+                    &mut local_scores,
+                    out_group,
+                )?;
+            }
+            Ok(())
+        })?;
         check(cancel)?;
-        let kv_head = head / gqa_group;
-        let offset = kv_head * c.head_dim;
-        let q_head = &query[head * c.head_dim..(head + 1) * c.head_dim];
-        let out_head = &mut output[head * c.head_dim..(head + 1) * c.head_dim];
-        attend_head_causal(
-            q_head,
-            state,
-            Some(&keys[offset..offset + c.head_dim]),
-            Some(&values[offset..offset + c.head_dim]),
-            position,
-            width,
-            offset,
-            c.head_dim,
-            divisor,
-            row_scores,
-            out_head,
-        )?;
+    } else {
+        let row_scores = scores
+            .get_mut(..group_scores_len)
+            .ok_or_else(invalid)?;
+        for kv_head in 0..c.kv_heads {
+            for _ in 0..gqa_group {
+                check(cancel)?;
+            }
+            let offset = kv_head * c.head_dim;
+            let q_group = &query[kv_head * group_width..(kv_head + 1) * group_width];
+            let out_group = &mut output[kv_head * group_width..(kv_head + 1) * group_width];
+            attend_kv_group_causal(
+                q_group,
+                state,
+                Some(&keys[offset..offset + c.head_dim]),
+                Some(&values[offset..offset + c.head_dim]),
+                position,
+                width,
+                offset,
+                c.head_dim,
+                gqa_group,
+                divisor,
+                row_scores,
+                out_group,
+            )?;
+        }
     }
     finite(output)
 }
@@ -1933,8 +2044,27 @@ fn attend(
     position: usize,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Vec<f32>> {
+    attend_with_workers(query, keys, values, state, c, position, 1, cancel)
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tests parallel and sequential GQA attention parity against single-head attend_head_causal."
+)]
+fn attend_with_workers(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    state: &LayerState,
+    c: Config,
+    position: usize,
+    workers: usize,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<Vec<f32>> {
+    let gqa_group = c.heads / c.kv_heads;
     let mut output = zeros(c.heads * c.head_dim)?;
-    let mut scores = zeros(position + 1)?;
+    let mut scores = zeros(gqa_group * (position + 1))?;
     attend_into(
         query,
         keys,
@@ -1942,11 +2072,231 @@ fn attend(
         state,
         c,
         position,
+        workers,
         &mut scores,
         &mut output,
         cancel,
     )?;
     Ok(output)
+}
+
+#[cfg(test)]
+mod gqa_attention_tests {
+    use super::{
+        CachePrecision, Config, LayerKv, LayerState, attend_head_causal, attend_into,
+        attend_with_workers, packed, scalar, zeros,
+    };
+    use std::io;
+
+    fn make_inputs(
+        c: Config,
+        position: usize,
+    ) -> io::Result<(Vec<f32>, Vec<f32>, Vec<f32>, LayerState)> {
+        let q_len = c.heads * c.head_dim;
+        let kv_width = c.kv_heads * c.head_dim;
+        let query: Vec<f32> = (0..q_len)
+            .map(|i| {
+                let v = i32::try_from((i * 17 + 3) % 29).unwrap_or(0) - 14;
+                f32::from(i8::try_from(v).unwrap_or(0)) * 0.0625
+            })
+            .collect();
+        let cur_k: Vec<f32> = (0..kv_width)
+            .map(|i| {
+                let v = i32::try_from((i * 11 + 5) % 23).unwrap_or(0) - 11;
+                f32::from(i8::try_from(v).unwrap_or(0)) * 0.05
+            })
+            .collect();
+        let cur_v: Vec<f32> = (0..kv_width)
+            .map(|i| {
+                let v = i32::try_from((i * 13 + 7) % 19).unwrap_or(0) - 9;
+                f32::from(i8::try_from(v).unwrap_or(0)) * 0.03125
+            })
+            .collect();
+        let hist_k: Vec<f32> = (0..position * kv_width)
+            .map(|i| {
+                let v = i32::try_from((i * 7 + 11) % 31).unwrap_or(0) - 15;
+                f32::from(i8::try_from(v).unwrap_or(0)) * 0.05
+            })
+            .collect();
+        let hist_v: Vec<f32> = (0..position * kv_width)
+            .map(|i| {
+                let v = i32::try_from((i * 23 + 1) % 25).unwrap_or(0) - 12;
+                f32::from(i8::try_from(v).unwrap_or(0)) * 0.0625
+            })
+            .collect();
+
+        let state = match c.cache_precision {
+            CachePrecision::F32 => LayerState::from_f32(hist_k, hist_v),
+            CachePrecision::F16 => {
+                let mut hk_u16 = vec![0_u16; hist_k.len()];
+                let mut hv_u16 = vec![0_u16; hist_v.len()];
+                assert!(packed::narrow_f32_to_f16_slice(&hist_k, &mut hk_u16));
+                assert!(packed::narrow_f32_to_f16_slice(&hist_v, &mut hv_u16));
+                LayerState {
+                    data: LayerKv::F16(super::KvPair {
+                        keys: hk_u16,
+                        values: hv_u16,
+                    }),
+                }
+            }
+        };
+        let (final_k, final_v) = if matches!(c.cache_precision, CachePrecision::F16) {
+            let mut k16 = vec![0_u16; kv_width];
+            let mut v16 = vec![0_u16; kv_width];
+            assert!(packed::narrow_f32_to_f16_slice(&cur_k, &mut k16));
+            assert!(packed::narrow_f32_to_f16_slice(&cur_v, &mut v16));
+            let mut kf = vec![0.0_f32; kv_width];
+            let mut vf = vec![0.0_f32; kv_width];
+            packed::widen_f16_slice(&k16, &mut kf);
+            packed::widen_f16_slice(&v16, &mut vf);
+            (kf, vf)
+        } else {
+            (cur_k, cur_v)
+        };
+        Ok((query, final_k, final_v, state))
+    }
+
+    #[test]
+    fn parallel_gqa_grouped_attend_into_matches_single_head_bit_for_bit() -> io::Result<()> {
+        for precision in [CachePrecision::F32, CachePrecision::F16] {
+            for head_dim in [6_usize, 64] {
+                for gqa_ratio in [1_usize, 2, 4, 8] {
+                    for position in [32_usize, 67] {
+                        let kv_heads = 4_usize;
+                        let c = Config {
+                            hidden: 64,
+                            heads: kv_heads * gqa_ratio,
+                            kv_heads,
+                            head_dim,
+                            intermediate: 128,
+                            context: 256,
+                            epsilon: 1e-6,
+                            rope_theta: 10_000.0,
+                            cache_precision: precision,
+                        };
+                        let (query, cur_k, cur_v, state) = make_inputs(c, position)?;
+                        let kv_width = c.kv_heads * c.head_dim;
+                        let divisor = scalar(c.head_dim).sqrt();
+                        let mut expected = zeros(c.heads * c.head_dim)?;
+                        let mut head_scores = zeros(position + 1)?;
+                        for head in 0..c.heads {
+                            let kv_head = head / gqa_ratio;
+                            let offset = kv_head * c.head_dim;
+                            attend_head_causal(
+                                &query[head * c.head_dim..(head + 1) * c.head_dim],
+                                &state,
+                                Some(&cur_k[offset..offset + c.head_dim]),
+                                Some(&cur_v[offset..offset + c.head_dim]),
+                                position,
+                                kv_width,
+                                offset,
+                                c.head_dim,
+                                divisor,
+                                &mut head_scores,
+                                &mut expected[head * c.head_dim..(head + 1) * c.head_dim],
+                            )?;
+                        }
+                        let seq_grouped = attend_with_workers(
+                            &query,
+                            &cur_k,
+                            &cur_v,
+                            &state,
+                            c,
+                            position,
+                            1,
+                            &mut || false,
+                        )?;
+                        let par_grouped = attend_with_workers(
+                            &query,
+                            &cur_k,
+                            &cur_v,
+                            &state,
+                            c,
+                            position,
+                            4,
+                            &mut || false,
+                        )?;
+                        let expected_bits: Vec<u32> =
+                            expected.iter().map(|v| v.to_bits()).collect();
+                        let seq_bits: Vec<u32> =
+                            seq_grouped.iter().map(|v| v.to_bits()).collect();
+                        let par_bits: Vec<u32> =
+                            par_grouped.iter().map(|v| v.to_bits()).collect();
+                        assert_eq!(
+                            seq_bits, expected_bits,
+                            "seq mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
+                        );
+                        assert_eq!(
+                            par_bits, expected_bits,
+                            "par mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_attend_into_checks_cancellation_before_and_after_dispatch() -> io::Result<()> {
+        let c = Config {
+            hidden: 64,
+            heads: 8,
+            kv_heads: 4,
+            head_dim: 8,
+            intermediate: 128,
+            context: 256,
+            epsilon: 1e-6,
+            rope_theta: 10_000.0,
+            cache_precision: CachePrecision::F16,
+        };
+        let position = 35;
+        let (query, cur_k, cur_v, state) = make_inputs(c, position)?;
+        let mut scores = zeros(2 * (position + 1))?;
+        let mut output = zeros(c.heads * c.head_dim)?;
+
+        let mut pre_polls = 0_usize;
+        let pre_err = attend_into(
+            &query,
+            &cur_k,
+            &cur_v,
+            &state,
+            c,
+            position,
+            4,
+            &mut scores,
+            &mut output,
+            &mut || {
+                pre_polls += 1;
+                pre_polls == 3
+            },
+        );
+        assert_eq!(pre_err.err().map(|e| e.kind()), Some(io::ErrorKind::Interrupted));
+        assert_eq!(pre_polls, 3);
+
+        let mut post_polls = 0_usize;
+        let post_err = attend_into(
+            &query,
+            &cur_k,
+            &cur_v,
+            &state,
+            c,
+            position,
+            4,
+            &mut scores,
+            &mut output,
+            &mut || {
+                post_polls += 1;
+                post_polls > c.heads
+            },
+        );
+        assert_eq!(
+            post_err.err().map(|e| e.kind()),
+            Some(io::ErrorKind::Interrupted)
+        );
+        assert_eq!(post_polls, c.heads + 1);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

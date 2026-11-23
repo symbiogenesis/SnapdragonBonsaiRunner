@@ -205,6 +205,24 @@ const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_32;
 // release before they can be admitted on a pinned bundle.
 const VULKAN_PLACEMENT_RELEASE: Option<(&str, &str)> = None;
 
+// Opt-in Hexagon arena cache persistence requires a separately reviewed native
+// release implementing `--hexagon-arena-cache <dir>` and verified cache I/O.
+const HEXAGON_ARENA_CACHE_RELEASE: Option<(&str, &str)> = None;
+
+fn hexagon_arena_cache_supported_for(
+    release: &ReleasePin,
+    cache_release: Option<(&str, &str)>,
+) -> bool {
+    reviewed_release_matches(release, cache_release)
+}
+
+pub(super) fn hexagon_arena_cache_supported() -> Result<bool, LaunchError> {
+    Ok(hexagon_arena_cache_supported_for(
+        pinned_release()?,
+        HEXAGON_ARENA_CACHE_RELEASE,
+    ))
+}
+
 fn select_placement(
     release: &ReleasePin,
     requested: Placement,
@@ -1235,6 +1253,34 @@ mod tests {
             ),
             Err(LaunchError::NativeRuntime)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn hexagon_arena_cache_requires_reviewed_release() -> Result<(), LaunchError> {
+        let mut pin = release(LOCK)?;
+        assert_eq!(HEXAGON_ARENA_CACHE_RELEASE, None);
+        assert!(!hexagon_arena_cache_supported()?);
+        assert!(!hexagon_arena_cache_supported_for(
+            &pin,
+            HEXAGON_ARENA_CACHE_RELEASE
+        ));
+
+        let reviewed = ("0.1.33", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(!hexagon_arena_cache_supported_for(&pin, Some(reviewed)));
+
+        pin.version = reviewed.0.into();
+        pin.commit = reviewed.1.into();
+        assert!(hexagon_arena_cache_supported_for(&pin, Some(reviewed)));
+        assert!(!hexagon_arena_cache_supported_for(
+            &pin,
+            Some(("0.1.33", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+        ));
+        assert!(!hexagon_arena_cache_supported_for(
+            &pin,
+            Some(("0.1.32", reviewed.1)),
+        ));
+        assert!(!hexagon_arena_cache_supported_for(&pin, None));
         Ok(())
     }
 }
