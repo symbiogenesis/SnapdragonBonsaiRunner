@@ -475,12 +475,15 @@ adoption decisions without displacing native daily-use acceptance.
   added NEON-vectorized 8-row triangular updates in `prefill_gdn.rs`, while
   Prism commits `14ff98e`, `ce0a00c`, and `43809de` added full-K spill-free
   `PQ2` (`2..=7` / tail), `PTQ1`, and `Q8_0` 8-row multi-token kernels in
-  `bonsai-neon-dot` / `src/kernels/`, and Prism commits `c4b94e4` and `da699ed`
+  `bonsai-neon-dot` / `src/kernels/`, Prism commits `c4b94e4` and `da699ed`
   added full-K spill-free `16`/`8`/`4`/`1`-row `Q8_0` `SDOT` decode kernels
   (`fill_sixteen_rows`), NEON `vqtbl2q_u8` 3-bit KV codecs, NEON
   `Quantizer::encode`, and long-context (`> 4,096` tokens) `G in {6, 4, 3, 2, 1}`
   and 2-token × G-head `attend_tile` reuse without growing caller score
-  allocations. Verify selected-cache
+  allocations, and Prism commit `ec4bcfa` added `prfm pldl1keep` L1 software
+  prefetch on 8/16-row decode loops, full-K `PTQ1_0`/`Q8_0` `dot_scaled_8x8_chunks`
+  `8..=32` token prefill kernels, and 4-way register-blocked `MultiRankAdapter`
+  NEON kernels (`0 ULP`). Verify selected-cache
   service consumers and independent packed-KV head workers: scratch/admission,
   complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
@@ -596,8 +599,11 @@ adoption decisions without displacing native daily-use acceptance.
   `CausalTransConv1d` with 4-frame reuse, `4x4`-tiled `CausalConv1d`, and
   `f32x4` Padé `tanh` GELU in `bonsai-speech-tts`, plus parallel
   `quantize_batch_activations` and zero-allocation 4-row `Q4_K`/`Q6_K` SIMD
-  kernels in `bonsai-speech-asr`. Complete compiled CI, actual-model
-  `fp64`/teacher-forced/WER/listening, and
+  kernels in `bonsai-speech-asr`, followed by Runner commit `eebb25ba` adding
+  `PredictorWorkspace` scratch reuse across `CodePredictor` frames and parallel
+  `f32x4` minimax-exp `attend_query_f16` in `bonsai-speech-tts`, plus parallel
+  GQA KV-head-grouped `0-ULP` `attend_into` in `bonsai-speech-asr`. Complete
+  compiled CI, actual-model `fp64`/teacher-forced/WER/listening, and
   X1/X2 device qualification gates before promotion.
 - [ ] Retire the remaining Windows queue ABI, ASR, Prism reference and publisher
   native/DLL families
@@ -1090,10 +1096,13 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   with end-to-end launcher/service wiring, and post-lock Prism commit `74d8884`
   wired `SwiftSession::model_identity`, opt-in `--hexagon-arena-cache <dir>`
   (`NativeQ2ArenaCache` load/save), and `#41` dynamic VTCM placement in
-  `prism-inference-server` while leaving `Runtime<Qwen35>::release_executor_resident_host_weights`
-  forwarding in `src/runtime.rs` (`#18` server wire-up when `cpu_prefill` is
-  `None`) and `PTQ1_0` admission on `bonsai_prism_runtime`'s `supports_f32` path
-  open as narrow follow-ups; pending Runner hosted Foundation and
+  `prism-inference-server`; Prism commits `c362ae0` and `7532363` subsequently
+  admitted `PTQ1_0` (`kind = 143`) on `supports_f32` executors and wired
+  `#18` `release_executor_resident_host_weights` forwarding through
+  `Runtime<Qwen35>`, `SwiftSession`, and `prism-inference-server` (when
+  `cpu_prefill` is `None`), while Runner commit `eebb25ba` wired release-gated
+  opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`
+  (`HEXAGON_ARENA_CACHE_RELEASE = None`); pending Runner hosted Foundation and
   X1/X2 device qualification). Deferred screening leads `#16` (aligned staging reuse), `#17`
   (optional Windows unbuffered direct I/O) and end-to-end `#18` qualification
   remain gated behind measured cold-start/I/O/mapping bottlenecks and
@@ -1413,7 +1422,13 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   scratch buffers), GPU-resident `RankOneAdapter`/`MultiRankAdapter` execution
   (`lora_b_accum_f32`, `0.0` bypass, scale-sensitive identity invalidation),
   and `bonsai_prism_runtime::Decoder` implementation with live Adreno parity
-  tests, and Runner wired opt-in
+  tests, Prism commit `edcd18e` adding multi-token batched GPU prefill
+  (`ingest_tokens_batched` / `Decoder::ingest_block` with
+  `VulkanBatchedConfig::prefill_tile_tokens` defaulting to `16` and 4-token
+  batched SPIR-V shaders), and Prism commit `64cdf35` wiring `VulkanSwiftSession`
+  end-to-end in `prism-inference-server` under `--placement vulkan` (dropping
+  host `Model` after GPU upload, `block_tokens: 16` prefill, `f16` KV default),
+  while Runner wired opt-in
   release-gated `--placement vulkan|composite` routing in commit `a57a3afd`
   (`VULKAN_PLACEMENT_RELEASE = None`); physical X2/X1-85 hardware parity, TDR
   qualification, and release lock promotion remain open.
@@ -1642,9 +1657,11 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   odd-tail retention, keeping any rounding change behind an explicit profile gate.
   (Source kernels for full-K spill-free `PQ2` `2..=7`/tails, `PTQ1` decode/tile,
   and `Q8_0` 8-row tiles landed locally in Prism `14ff98e`, `ce0a00c`, `43809de`,
-  and full-K spill-free `Q8_0` `16/8/4/1`-row `SDOT` decode kernels + long-context
-  `attend_tile` grouped KV reuse landed in `c4b94e4` and `da699ed`;
-  device crossover benchmarking remains open.)
+  full-K spill-free `Q8_0` `16/8/4/1`-row `SDOT` decode kernels + long-context
+  `attend_tile` grouped KV reuse landed in `c4b94e4` and `da699ed`, and
+  `prfm pldl1keep` decode L1 prefetch + full-K `PTQ1_0`/`Q8_0` `dot_scaled_8x8_chunks`
+  `8..=32` token prefill kernels + 4-way register-blocked `MultiRankAdapter` NEON
+  kernels (`0 ULP`) landed in `ec4bcfa`; device crossover benchmarking remains open.)
 - [ ] **#25 — Remaining shared activation-preparation consumers.** Extend shared
   transform-and-quantize preparation to remaining recurrent sibling projections
   sharing identical input, basis, width and quantizer. (Recurrent sibling audit on
@@ -1705,11 +1722,14 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   Swift's `PQ2`/`PTQ1` layouts under [Hexagon](docs/hexagon.md). (Source
   support for lossless `PTQ1_0` transcoding and `#41` VTCM-aware dynamic
   multi-arena placement landed locally in Prism `bonsai-hexagon-runtime` commits
-  `a2551de` and `359f88a`, and `prism-inference-server` wired `#41` dynamic
-  VTCM placement + opt-in `--hexagon-arena-cache <dir>` in `74d8884`;
-  physical NPU device qualification, remaining `#18` `src/runtime.rs`
-  host-weight-release forwarding, `PTQ1_0` `supports_f32` runtime admission,
-  and release lock promotion remain open.)
+  `a2551de` and `359f88a`, `prism-inference-server` wired `#41` dynamic
+  VTCM placement + opt-in `--hexagon-arena-cache <dir>` in `74d8884`, Prism
+  commits `c362ae0` and `7532363` admitted `PTQ1_0` on `supports_f32`
+  executors and wired `#18` `release_executor_resident_host_weights` through
+  `Runtime<Qwen35>`, `SwiftSession`, and `prism-inference-server` (when
+  `cpu_prefill` is `None`), and Runner commit `eebb25ba` wired release-gated
+  opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`;
+  physical NPU device qualification and release lock promotion remain open.)
 - [ ] **#42 — Pipelined DMA, HVX preparation and HMX chunkwise GDN.** Gate under an
   explicit separate numerical profile (HMX FP16 intermediates do not preserve the
   FP32 GDN contract) with a small-token CPU/HVX fallback.
