@@ -349,7 +349,7 @@ races accepting/active work (`serve_chat_inner` inherits `service.gate.closed()`
 `receive_admitted`) and wakes queued entries. `close()` retains the listener until service
 drop. Async cleanup still requires polling; dropping operations closes sockets/releases
 permits directly. Deterministic 864-interleaving schedule exploration in
-`src/broker/tests/scheduler_simulation.rs` covers `RequestGate` admission, queued
+`src/broker/tests/integration/scheduler_simulation.rs` covers `RequestGate` admission, queued
 disconnect/drop, `GenerationAttempt` abort latching and late orphan probes without
 requiring external concurrency crates; compiled CI acceptance remains pending.
 
