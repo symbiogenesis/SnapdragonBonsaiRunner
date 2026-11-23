@@ -1130,12 +1130,15 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   with end-to-end launcher/service wiring, and post-lock Prism commit `74d8884`
   wired `SwiftSession::model_identity`, opt-in `--hexagon-arena-cache <dir>`
   (`NativeQ2ArenaCache` load/save), and `#41` dynamic VTCM placement in
-  `prism-inference-server`; Prism commits `c362ae0` and `7532363` subsequently
-  admitted `PTQ1_0` (`kind = 143`) on `supports_f32` executors and wired
-  `#18` `release_executor_resident_host_weights` forwarding through
-  `Runtime<Qwen35>`, `SwiftSession`, and `prism-inference-server` (when
-  `cpu_prefill` is `None`), while Runner commit `eebb25ba` wired release-gated
-  opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`
+  `prism-inference-server`; Prism commits `c362ae0`, `7532363`, and `89ce18b`
+  subsequently admitted `PTQ1_0` (`kind = 143`) on `supports_f32` executors
+  and wired `#18` `release_executor_resident_host_weights` forwarding through
+  `Runtime<Qwen35>`, `SwiftSession`, `NativeQ2Executor` /
+  `OwnedCompositeProjectionExecutor` resident handle rebinding
+  (`release_host_weight_binding` / `has_released_host_weight`, keeping
+  non-opting executors such as `VulkanPq2Executor` fail-closed), and
+  `prism-inference-server` (when `cpu_prefill` is `None`), while Runner commit
+  `eebb25ba` wired release-gated opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`
   (`HEXAGON_ARENA_CACHE_RELEASE = None`); pending Runner hosted Foundation and
   X1/X2 device qualification). Deferred screening leads `#16` (aligned staging reuse), `#17`
   (optional Windows unbuffered direct I/O) and end-to-end `#18` qualification
@@ -1778,11 +1781,13 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   multi-arena placement landed locally in Prism `bonsai-hexagon-runtime` commits
   `a2551de` and `359f88a`, `prism-inference-server` wired `#41` dynamic
   VTCM placement + opt-in `--hexagon-arena-cache <dir>` in `74d8884`, Prism
-  commits `c362ae0` and `7532363` admitted `PTQ1_0` on `supports_f32`
+  commits `c362ae0`, `7532363`, and `89ce18b` admitted `PTQ1_0` on `supports_f32`
   executors and wired `#18` `release_executor_resident_host_weights` through
-  `Runtime<Qwen35>`, `SwiftSession`, and `prism-inference-server` (when
-  `cpu_prefill` is `None`), and Runner commit `eebb25ba` wired release-gated
-  opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`;
+  `Runtime<Qwen35>`, `SwiftSession`, `NativeQ2Executor` /
+  `OwnedCompositeProjectionExecutor` resident handle rebinding
+  (`release_host_weight_binding` / `has_released_host_weight`), and
+  `prism-inference-server` (when `cpu_prefill` is `None`), and Runner commit
+  `eebb25ba` wired release-gated opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`;
   physical NPU device qualification and release lock promotion remain open.)
 - [ ] **#42 — Pipelined DMA, HVX preparation and HMX chunkwise GDN.** Gate under an
   explicit separate numerical profile (HMX FP16 intermediates do not preserve the
