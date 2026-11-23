@@ -522,13 +522,25 @@ fn main() -> std::io::Result<()> {
 }
 "#;
 
-    pub(crate) fn resource_guard_executable(directory: &Path) -> io::Result<PathBuf> {
+    fn build_resource_guard_template() -> io::Result<PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEMPLATE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let template_dir = std::env::temp_dir().join(format!(
+            "Bonsai-ResourceGuard-Template-{}-{}-{stamp}",
+            std::process::id(),
+            TEMPLATE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&template_dir)?;
         // The GUI test executable imports Windows presentation DLLs and cannot
         // initialize under worker Win32k denial. Compile a std-only fixture with
         // the compiler beside the pinned Cargo that built this test instead.
         let compiler = Path::new(env!("CARGO")).with_file_name("rustc.exe");
-        let source = directory.join("resource_guard.rs");
-        let executable = directory.join("resource_guard.exe");
+        let source = template_dir.join("resource_guard.rs");
+        let executable = template_dir.join("resource_guard.exe");
         fs::write(&source, RESOURCE_SOURCE)?;
         let built = (|| {
             let process = OwnedProcess::start_tool(&ToolProcessSpec {
@@ -539,9 +551,9 @@ fn main() -> std::io::Result<()> {
                     OsString::from("-o"),
                     executable.clone().into_os_string(),
                 ],
-                working_directory: directory.to_owned(),
-                stdout: directory.join("compiler.stdout"),
-                stderr: directory.join("compiler.stderr"),
+                working_directory: template_dir.clone(),
+                stdout: template_dir.join("compiler.stdout"),
+                stderr: template_dir.join("compiler.stderr"),
                 environment: std::collections::BTreeMap::new(),
             })?;
             let exit = process.wait_for_exit(Duration::from_secs(30))?;
@@ -549,14 +561,33 @@ fn main() -> std::io::Result<()> {
                 process.stop(Duration::from_secs(5))?;
                 return Err(io::Error::other(format!(
                     "Headless resource fixture compilation failed with {exit:?}:\n{}",
-                    resource_evidence(directory, "compiler")
+                    resource_evidence(&template_dir, "compiler")
                 )));
             }
             Ok(())
         })();
         let removed = fs::remove_file(source);
-        built?;
-        removed?;
+        let _ = fs::remove_file(template_dir.join("compiler.stdout"));
+        let _ = fs::remove_file(template_dir.join("compiler.stderr"));
+        if let Err(err) = built.and(removed) {
+            let _ = fs::remove_dir_all(&template_dir);
+            return Err(err);
+        }
+        Ok(executable)
+    }
+
+    pub(crate) fn resource_guard_executable(directory: &Path) -> io::Result<PathBuf> {
+        static TEMPLATE: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+        let template = TEMPLATE
+            .get_or_init(|| build_resource_guard_template().map_err(|error| error.to_string()));
+        let template = match template {
+            Ok(path) => path,
+            Err(message) => return Err(io::Error::other(message.clone())),
+        };
+        let executable = directory.join("resource_guard.exe");
+        if fs::hard_link(template, &executable).is_err() {
+            fs::copy(template, &executable)?;
+        }
         Ok(executable)
     }
 
@@ -579,7 +610,10 @@ fn main() -> std::io::Result<()> {
         directory: &Path,
         name: &str,
     ) -> io::Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        let stdout_path = directory.join(format!("{name}.stdout"));
+        let mut stdout_text = String::new();
         loop {
             if let Some(exit) = process.try_wait()? {
                 return Err(io::Error::other(format!(
@@ -587,16 +621,30 @@ fn main() -> std::io::Result<()> {
                     resource_evidence(directory, name)
                 )));
             }
-            if resource_evidence(directory, name).contains(RESOURCE_READY) {
+            stdout_text.clear();
+            if fs::File::open(&stdout_path)
+                .and_then(|file| file.take(8192).read_to_string(&mut stdout_text))
+                .is_ok()
+                && stdout_text.contains(RESOURCE_READY)
+            {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(io::Error::other(format!(
                     "Resource fixture {name} did not become ready:\n{}",
                     resource_evidence(directory, name)
                 )));
             }
-            thread::sleep(Duration::from_millis(10));
+            let elapsed = now.saturating_duration_since(started);
+            let step = if elapsed < Duration::from_millis(25) {
+                Duration::from_millis(1)
+            } else if elapsed < Duration::from_millis(250) {
+                Duration::from_millis(5)
+            } else {
+                Duration::from_millis(10)
+            };
+            thread::sleep(step);
         }
     }
 

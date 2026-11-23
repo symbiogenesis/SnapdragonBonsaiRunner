@@ -153,11 +153,16 @@ mod tests {
         }
 
         fn create(listener: bool) -> io::Result<Self> {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(io::Error::other)?
                 .as_nanos();
-            let directory = std::env::temp_dir().join(format!("Bonsai-warm-input-{stamp}"));
+            let directory = std::env::temp_dir().join(format!(
+                "Bonsai-warm-input-{}-{}-{stamp}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir(&directory)?;
             let credentials = PrivateCredentials::create(&directory)?;
             let mut config = canary::Config {
@@ -245,7 +250,7 @@ mod tests {
 
     #[test]
     fn warm_input_cancelled_completion_and_explicit_stop_release_the_owner() -> io::Result<()> {
-        for completed in [false, true] {
+        let run_case = |completed: bool| -> io::Result<()> {
             let mut fixture = Fixture::new()?;
             let current = AtomicU64::new(if completed { 41 } else { 42 });
             fixture.input.complete(41, &current, Instant::now());
@@ -254,9 +259,15 @@ mod tests {
             assert!(fixture.input.service.is_none());
             assert!(fixture.input.generation.is_none());
             assert!(fixture.input.warm_until.is_none());
-            fixture.finish()?;
-        }
-        Ok(())
+            fixture.finish()
+        };
+        std::thread::scope(|scope| -> io::Result<()> {
+            let cancelled = scope.spawn(|| run_case(false));
+            run_case(true)?;
+            cancelled
+                .join()
+                .map_err(|_| io::Error::other("warm input worker panicked"))?
+        })
     }
 
     #[test]

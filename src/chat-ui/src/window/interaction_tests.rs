@@ -1022,13 +1022,16 @@ fn composer_keeps_a_draft_while_the_model_prepares() {
 
 #[test]
 fn long_drafts_keep_transcript_and_actions_visible_and_editable() {
+    let drafts: Vec<String> = [
+        "A manuscript line with a thought.\n",
+        "A wrapped manuscript passage. ",
+    ]
+    .into_iter()
+    .map(|line| line.chars().cycle().take(65_536 - 2).collect())
+    .collect();
     for size in [[1180.0, 860.0], [620.0, 640.0]] {
-        for line in [
-            "A manuscript line with a thought.\n",
-            "A wrapped manuscript passage. ",
-        ] {
+        for draft in &drafts {
             let mut chat = harness(size, true);
-            let draft: String = line.chars().cycle().take(65_536 - 2).collect();
             chat.state_mut().app.input.clone_from(&draft);
             chat.run();
             for label in ["Microphone", "Read this response aloud", "Send  ↑"] {

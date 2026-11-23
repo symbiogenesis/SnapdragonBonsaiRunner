@@ -782,6 +782,7 @@ mod tests {
         let mut encoder = png::Encoder::new(&mut png_bytes, 2_048, 2_048);
         encoder.set_color(png::ColorType::Grayscale);
         encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fastest);
         let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
         let mut pixels = vec![pixel_seed; 2_048 * 2_048];
         pixels[0] = pixel_seed.wrapping_add(1);
@@ -794,13 +795,24 @@ mod tests {
 
     #[test]
     fn image_cache_enforces_64_mib_byte_cap_via_lru_eviction() -> std::io::Result<()> {
-        let pngs = [
-            gray_2048_png(10)?,
-            gray_2048_png(20)?,
-            gray_2048_png(30)?,
-            gray_2048_png(40)?,
-            gray_2048_png(50)?,
-        ];
+        let pngs = std::thread::scope(|scope| -> std::io::Result<[Vec<u8>; 5]> {
+            let h1 = scope.spawn(|| gray_2048_png(10));
+            let h2 = scope.spawn(|| gray_2048_png(20));
+            let h3 = scope.spawn(|| gray_2048_png(30));
+            let h4 = scope.spawn(|| gray_2048_png(40));
+            let p5 = gray_2048_png(50)?;
+            let join_png = |h: std::thread::ScopedJoinHandle<'_, std::io::Result<Vec<u8>>>| {
+                h.join()
+                    .map_err(|_| std::io::Error::other("png fixture worker panicked"))?
+            };
+            Ok([
+                join_png(h1)?,
+                join_png(h2)?,
+                join_png(h3)?,
+                join_png(h4)?,
+                p5,
+            ])
+        })?;
         let hashes: Vec<u64> = pngs.iter().map(|bytes| fnv1a64(bytes)).collect();
         let svg = PrehashedSvg::from_str(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="navy"/></svg>"#,

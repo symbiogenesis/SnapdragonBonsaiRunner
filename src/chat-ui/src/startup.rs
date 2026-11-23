@@ -729,9 +729,11 @@ mod tests {
     }
 
     fn scratch(name: &str) -> io::Result<PathBuf> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
-            "Bonsai-Startup-{name}-{}-{}",
+            "Bonsai-Startup-{name}-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(io::Error::other)?
@@ -835,7 +837,15 @@ mod tests {
                 && !worker.is_finished()
                 && started.elapsed() < Duration::from_secs(20)
             {
-                thread::sleep(Duration::from_millis(20));
+                let elapsed = started.elapsed();
+                let step = if elapsed < Duration::from_millis(25) {
+                    Duration::from_millis(1)
+                } else if elapsed < Duration::from_millis(250) {
+                    Duration::from_millis(5)
+                } else {
+                    Duration::from_millis(10)
+                };
+                thread::sleep(step);
             }
             if !marker.is_file() {
                 return Err(io::Error::other(
@@ -881,7 +891,7 @@ mod tests {
 
     #[test]
     fn native_startup_bounds_output_and_reports_preparation_failure() -> io::Result<()> {
-        for (name, mode, expected) in [
+        let cases = [
             ("Failure", "failure", "Synthetic failure"),
             (
                 "Empty",
@@ -889,25 +899,39 @@ mod tests {
                 "wrote no standard-error diagnostics",
             ),
             ("Bound", "bound", "exceeded its bound"),
-        ] {
-            let directory = scratch(name)?;
-            let result = capture(
-                &spec(&directory, mode)?,
-                &AtomicBool::new(false),
-                Duration::from_secs(30),
-                false,
-                None,
-            );
-            let error = result
-                .err()
-                .ok_or_else(|| io::Error::other("Synthetic startup unexpectedly succeeded."))?;
-            let message = error.to_string();
-            assert!(message.contains(expected), "{name}: {message}");
-            if mode != "bound" {
-                assert!(message.contains("process exited 7, 0x00000007"));
+        ];
+        thread::scope(|scope| -> io::Result<()> {
+            let handles: Vec<_> = cases
+                .into_iter()
+                .map(|(name, mode, expected)| {
+                    scope.spawn(move || -> io::Result<()> {
+                        let directory = scratch(name)?;
+                        let result = capture(
+                            &spec(&directory, mode)?,
+                            &AtomicBool::new(false),
+                            Duration::from_secs(30),
+                            false,
+                            None,
+                        );
+                        let error = result.err().ok_or_else(|| {
+                            io::Error::other("Synthetic startup unexpectedly succeeded.")
+                        })?;
+                        let message = error.to_string();
+                        assert!(message.contains(expected), "{name}: {message}");
+                        if mode != "bound" {
+                            assert!(message.contains("process exited 7, 0x00000007"));
+                        }
+                        fs::remove_dir_all(&directory)?;
+                        Ok(())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| io::Error::other("startup worker panicked"))??;
             }
-            fs::remove_dir_all(&directory)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
