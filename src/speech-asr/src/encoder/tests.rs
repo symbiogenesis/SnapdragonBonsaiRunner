@@ -528,3 +528,88 @@ fn rust_asr_encoder_simd_gelu_and_windowed_attention_parity() -> io::Result<()> 
     );
     Ok(())
 }
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+#[test]
+fn rust_asr_encoder_repacks_aligned_q4_k_projections() -> io::Result<()> {
+    fn make_q4_k_linear(input: usize, output: usize, seed: usize) -> io::Result<Linear> {
+        let blocks_per_row = input / 256;
+        let mut bytes = vec![0_u8; output * blocks_per_row * 144];
+        for (blk_idx, block) in bytes.chunks_exact_mut(144).enumerate() {
+            block[0..2].copy_from_slice(&0x3000_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x2800_u16.to_le_bytes());
+            for (i, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = u8::try_from((blk_idx + seed + i) % 15 + 1).unwrap_or(1);
+            }
+            for (i, byte) in block[16..].iter_mut().enumerate() {
+                *byte = u8::try_from((blk_idx * 7 + seed + i * 3) % 256).unwrap_or(0);
+            }
+        }
+        Ok(Linear {
+            weights: Projection::q4_k(input, output, bytes)?,
+            bias: vec![0.05_f32; output],
+        })
+    }
+
+    let c = Config {
+        mel_bins: 8,
+        channels: 256,
+        hidden: 256,
+        heads: 4,
+        intermediate: 256,
+        output: 256,
+        window: 5,
+        max_positions: 2,
+    };
+    let conv_out = make_q4_k_linear(c.channels, c.hidden, 1)?;
+    let block = Block {
+        attention_norm: norm(c.hidden),
+        ffn_norm: norm(c.hidden),
+        query: make_q4_k_linear(c.hidden, c.hidden, 2)?,
+        key: make_q4_k_linear(c.hidden, c.hidden, 3)?,
+        value: make_q4_k_linear(c.hidden, c.hidden, 4)?,
+        attention_out: make_q4_k_linear(c.hidden, c.hidden, 5)?,
+        ffn_in: make_q4_k_linear(c.hidden, c.intermediate, 6)?,
+        ffn_out: make_q4_k_linear(c.intermediate, c.hidden, 7)?,
+    };
+    let enc = Encoder::new(
+        c,
+        Weights {
+            convolutions: [
+                zero(9, c.channels)?,
+                zero(9 * c.channels, c.channels)?,
+                zero(9 * c.channels, c.channels)?,
+            ],
+            convolution_out: conv_out.weights,
+            blocks: vec![block],
+            output_norm: norm(c.hidden),
+            output_in: make_q4_k_linear(c.hidden, c.hidden, 8)?,
+            output_out: make_q4_k_linear(c.hidden, c.output, 9)?,
+        },
+    )?
+    .with_threads(2)?;
+
+    let expected_repack = bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod;
+    assert_eq!(
+        enc.weights.convolution_out.is_repacked_q4_k(),
+        expected_repack
+    );
+    let b = &enc.weights.blocks[0];
+    for proj in [
+        &b.query.weights,
+        &b.key.weights,
+        &b.value.weights,
+        &b.attention_out.weights,
+        &b.ffn_in.weights,
+        &b.ffn_out.weights,
+        &enc.weights.output_in.weights,
+        &enc.weights.output_out.weights,
+    ] {
+        assert_eq!(proj.is_repacked_q4_k(), expected_repack);
+    }
+
+    let out = enc.encode_mel(&vec![0.0_f32; c.mel_bins * 10], 10, &mut || false)?;
+    assert_eq!(out.rows(), 2);
+    assert_eq!(out.width(), c.output);
+    Ok(())
+}

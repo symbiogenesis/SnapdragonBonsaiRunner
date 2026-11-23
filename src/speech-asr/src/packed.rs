@@ -26,12 +26,14 @@ pub(super) fn simd_level() -> Level {
     *SIMD_LEVEL.get_or_init(Level::new)
 }
 
-/// Borrowed weight slice for row-major `F32`, `Q8_0`, `Q4_K`, or `Q6_K` matrices.
+/// Borrowed weight slice for row-major `F32`, `Q8_0`, `Q4_K`, repacked `Q4_K`, or `Q6_K` matrices.
 #[derive(Clone, Copy)]
 pub(super) enum WeightSlice<'a> {
     Float(&'a [f32]),
     Q8(&'a [u8]),
     Q4K(&'a [u8]),
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    RepackedQ4K8(&'a [u8]),
     Q6K(&'a [u8]),
 }
 
@@ -762,6 +764,8 @@ fn single_rows_simd<S: Simd>(
                 *dst = single_q4_k_1row(simd, &data[off..off + row_bytes], input);
             }
         }
+        #[cfg(all(windows, feature = "rust-qualification"))]
+        WeightSlice::RepackedQ4K8(_) => {}
         WeightSlice::Q6K(data) => {
             let row_bytes = width / 256 * 210;
             for dst in out.as_chunks_mut::<4>().0 {
@@ -803,6 +807,29 @@ fn run_single_rows_quant<A>(
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
+fn run_single_rows_repacked_q4_k(
+    caps: Arm64QuantCaps,
+    data: &[u8],
+    width: usize,
+    start_row: usize,
+    act: &[Q8_KActBlock],
+    out: &mut [f32],
+) {
+    let strip_bytes = (width / quant_kernels::QK_K) * quant_kernels::Q4_K_REPACK8_BLOCK_BYTES;
+    let mut idx = 0_usize;
+    while idx < out.len() {
+        let abs_row = start_row + idx;
+        let strip_idx = abs_row / 8;
+        let lane = abs_row % 8;
+        let strip = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
+        let vals = quant_kernels::dot_q4_k_repacked8(caps, strip, act);
+        let take = (8 - lane).min(out.len() - idx);
+        out[idx..idx + take].copy_from_slice(&vals[lane..lane + take]);
+        idx += take;
+    }
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
 fn single_rows_quant_arm64(
     caps: Arm64QuantCaps,
     weights: WeightMatrix<'_>,
@@ -831,6 +858,9 @@ fn single_rows_quant_arm64(
             |rows, a| quant_kernels::dot_q4_k_4rows(caps, rows, a),
             |row, a| quant_kernels::dot_q4_k_row(caps, row, a),
         ),
+        WeightSlice::RepackedQ4K8(data) => {
+            run_single_rows_repacked_q4_k(caps, data, width, start_row, act_q8_k, out);
+        }
         WeightSlice::Q6K(data) => run_single_rows_quant(
             data,
             start_row,
@@ -855,7 +885,12 @@ pub(super) fn multiply_single_into(
     if !matches!(weights.data, WeightSlice::Float(_)) {
         let (caps, act_q8_0, act_q8_k) =
             quantize_batch_activations([weights], input, 1, weights.input, workers);
-        row_workers::run_aligned(out, workers, 4, &|start_row, slice| {
+        let align = if matches!(weights.data, WeightSlice::RepackedQ4K8(_)) {
+            8
+        } else {
+            4
+        };
+        row_workers::run_aligned(out, workers, align, &|start_row, slice| {
             single_rows_quant_arm64(caps, weights, start_row, &act_q8_0, &act_q8_k, slice);
         });
         return;
@@ -905,11 +940,23 @@ pub(super) fn multiply_single_group_into(
         return;
     }
 
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    let row_align = if targets
+        .iter()
+        .any(|(w, _)| matches!(w.data, WeightSlice::RepackedQ4K8(_)))
+    {
+        8_usize
+    } else {
+        4_usize
+    };
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    let row_align = 4_usize;
+
     let mut offsets = [0_usize; 4];
     let mut padded_total = 0_usize;
     for (idx, (weights, _)) in targets.iter().enumerate() {
         offsets[idx] = padded_total;
-        padded_total += weights.output.next_multiple_of(4);
+        padded_total += weights.output.next_multiple_of(row_align);
     }
     scratch.resize(padded_total, 0.0);
     let matrices: [WeightMatrix<'_>; 4] = [
@@ -919,7 +966,7 @@ pub(super) fn multiply_single_group_into(
         targets.get(3).map_or(targets[0].0, |t| t.0),
     ];
     let count = targets.len();
-    row_workers::run_aligned(scratch, workers, 4, &|chunk_start, slice| {
+    row_workers::run_aligned(scratch, workers, row_align, &|chunk_start, slice| {
         let chunk_end = chunk_start + slice.len();
         for t_idx in 0..count {
             let t_start = offsets[t_idx];
@@ -1650,6 +1697,8 @@ fn batch_rows_simd<S: Simd>(
                 );
             }
         }
+        #[cfg(all(windows, feature = "rust-qualification"))]
+        WeightSlice::RepackedQ4K8(_) => {}
         WeightSlice::Q6K(data) => {
             let row_bytes = width / 256 * 210;
             for chunk in transposed_slice.chunks_exact_mut(4 * row_stride) {
@@ -1843,7 +1892,9 @@ fn quantize_batch_activations<'a>(
     for w in weights {
         match w.data {
             WeightSlice::Q8(_) => needs_q8_0 = true,
-            WeightSlice::Q4K(_) | WeightSlice::Q6K(_) => needs_q8_k = true,
+            WeightSlice::Q4K(_) | WeightSlice::RepackedQ4K8(_) | WeightSlice::Q6K(_) => {
+                needs_q8_k = true;
+            }
             WeightSlice::Float(_) => {}
         }
     }
@@ -1991,6 +2042,52 @@ fn run_batch_rows_quant<A>(
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
+fn run_batch_rows_repacked_q4_k(
+    caps: Arm64QuantCaps,
+    data: &[u8],
+    width: usize,
+    start_row: usize,
+    batch: usize,
+    act: &[Q8_KActBlock],
+    transposed_slice: &mut [f32],
+) {
+    let blocks = width / quant_kernels::QK_K;
+    let strip_bytes = blocks * quant_kernels::Q4_K_REPACK8_BLOCK_BYTES;
+    let rows_here = transposed_slice.len() / batch;
+    let mut row_idx = 0_usize;
+    while row_idx < rows_here {
+        let abs_row = start_row + row_idx;
+        let strip_idx = abs_row / 8;
+        let lane = abs_row % 8;
+        let strip = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
+        let take = (8 - lane).min(rows_here - row_idx);
+        let mut t = 0_usize;
+        while t + 1 < batch {
+            let tile = quant_kernels::gemm_q4_k_repacked8_8x2(
+                caps,
+                strip,
+                &act[t * blocks..(t + 1) * blocks],
+                &act[(t + 1) * blocks..(t + 2) * blocks],
+            );
+            for local_r in 0..take {
+                let base = (row_idx + local_r) * batch + t;
+                transposed_slice[base] = tile[lane + local_r][0];
+                transposed_slice[base + 1] = tile[lane + local_r][1];
+            }
+            t += 2;
+        }
+        if t < batch {
+            let col =
+                quant_kernels::dot_q4_k_repacked8(caps, strip, &act[t * blocks..(t + 1) * blocks]);
+            for local_r in 0..take {
+                transposed_slice[(row_idx + local_r) * batch + t] = col[lane + local_r];
+            }
+        }
+        row_idx += take;
+    }
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
 fn batch_rows_quant_arm64(
     caps: Arm64QuantCaps,
     weights: WeightMatrix<'_>,
@@ -2030,6 +2127,17 @@ fn batch_rows_quant_arm64(
                 |r, a, b| quant_kernels::gemm_q4_k_4x2(caps, r, a, b),
                 |r, a| quant_kernels::dot_q4_k_4rows(caps, r, a),
                 |r, a| quant_kernels::dot_q4_k_row(caps, r, a),
+            );
+        }
+        WeightSlice::RepackedQ4K8(data) => {
+            run_batch_rows_repacked_q4_k(
+                caps,
+                data,
+                width,
+                start_row,
+                batch,
+                act_q8_k,
+                transposed_slice,
             );
         }
         WeightSlice::Q6K(data) => {
@@ -2090,10 +2198,22 @@ pub(super) fn multiply_batch_prepared_into(
             transposed_scratch.resize(needed, 0.0);
         }
         let transposed = &mut transposed_scratch[..needed];
-        row_workers::run_aligned(transposed, workers, 4 * batch, &|elem_off, slice| {
-            let start_row = elem_off / batch;
-            batch_rows_quant_arm64(caps, weights, start_row, batch, &act_q8_0, &act_q8_k, slice);
-        });
+        let row_align = if matches!(weights.data, WeightSlice::RepackedQ4K8(_)) {
+            8
+        } else {
+            4
+        };
+        row_workers::run_aligned(
+            transposed,
+            workers,
+            row_align * batch,
+            &|elem_off, slice| {
+                let start_row = elem_off / batch;
+                batch_rows_quant_arm64(
+                    caps, weights, start_row, batch, &act_q8_0, &act_q8_k, slice,
+                );
+            },
+        );
         scatter_rows_to_batch(transposed, output, batch, out);
         return;
     }
@@ -2191,41 +2311,54 @@ pub(super) fn multiply_batch_group_into(
                 prepared.input,
                 workers,
             );
+            let row_align = if matrices[..count]
+                .iter()
+                .any(|w| matches!(w.data, WeightSlice::RepackedQ4K8(_)))
+            {
+                8_usize
+            } else {
+                4_usize
+            };
             let mut offsets = [0_usize; 4];
             let mut padded_rows = 0_usize;
             for (idx, w) in matrices[..count].iter().enumerate() {
                 offsets[idx] = padded_rows;
-                padded_rows += w.output.next_multiple_of(4);
+                padded_rows += w.output.next_multiple_of(row_align);
             }
             let needed = padded_rows * batch;
             if transposed_scratch.len() < needed {
                 transposed_scratch.resize(needed, 0.0);
             }
             let transposed = &mut transposed_scratch[..needed];
-            row_workers::run_aligned(transposed, workers, 4 * batch, &|elem_off, slice| {
-                let start_row_global = elem_off / batch;
-                let end_row_global = start_row_global + slice.len() / batch;
-                for (idx, w) in matrices[..count].iter().enumerate() {
-                    let t_start = offsets[idx];
-                    let t_end = t_start + w.output;
-                    let lo = start_row_global.max(t_start);
-                    let hi = end_row_global.min(t_end);
-                    if lo >= hi {
-                        continue;
+            row_workers::run_aligned(
+                transposed,
+                workers,
+                row_align * batch,
+                &|elem_off, slice| {
+                    let start_row_global = elem_off / batch;
+                    let end_row_global = start_row_global + slice.len() / batch;
+                    for (idx, w) in matrices[..count].iter().enumerate() {
+                        let t_start = offsets[idx];
+                        let t_end = t_start + w.output;
+                        let lo = start_row_global.max(t_start);
+                        let hi = end_row_global.min(t_end);
+                        if lo >= hi {
+                            continue;
+                        }
+                        let slice_lo = (lo - start_row_global) * batch;
+                        let slice_hi = (hi - start_row_global) * batch;
+                        batch_rows_quant_arm64(
+                            caps,
+                            *w,
+                            lo - t_start,
+                            batch,
+                            &act_q8_0,
+                            &act_q8_k,
+                            &mut slice[slice_lo..slice_hi],
+                        );
                     }
-                    let slice_lo = (lo - start_row_global) * batch;
-                    let slice_hi = (hi - start_row_global) * batch;
-                    batch_rows_quant_arm64(
-                        caps,
-                        *w,
-                        lo - t_start,
-                        batch,
-                        &act_q8_0,
-                        &act_q8_k,
-                        &mut slice[slice_lo..slice_hi],
-                    );
-                }
-            });
+                },
+            );
             for (idx, (w, out)) in targets.iter_mut().enumerate() {
                 let elem_off = offsets[idx] * batch;
                 scatter_rows_to_batch(
@@ -3165,6 +3298,8 @@ mod tests {
                         input,
                     );
                 }
+                #[cfg(all(windows, feature = "rust-qualification"))]
+                WeightSlice::RepackedQ4K8(_) => {}
                 WeightSlice::Q6K(data) => {
                     let row_bytes = weights.input / 256 * 210;
                     *target = super::dot_q6_k_row_scalar(
@@ -3757,5 +3892,215 @@ mod tests {
                 assert_eq!(a.bsums, b.bsums);
             }
         }
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    #[test]
+    fn repacked_q4_k_single_batch_and_groups_match_raw_q4_k_bits() -> io::Result<()> {
+        let input = 512_usize;
+        for out_rows in [8_usize, 16, 24] {
+            let blocks_per_row = input / 256;
+            let mut q4 = vec![0_u8; out_rows * blocks_per_row * 144];
+            for (blk_idx, block) in q4.chunks_exact_mut(144).enumerate() {
+                block[0..2].copy_from_slice(
+                    &(0x2c00_u16 + u16::try_from(blk_idx % 5).unwrap_or(0) * 0x100).to_le_bytes(),
+                );
+                block[2..4].copy_from_slice(
+                    &(0x2800_u16 + u16::try_from(blk_idx % 3).unwrap_or(0) * 0x100).to_le_bytes(),
+                );
+                for (i, byte) in block[4..16].iter_mut().enumerate() {
+                    *byte = u8::try_from((blk_idx * 7 + i * 5 + 3) % 63).unwrap_or(1);
+                }
+                for (i, byte) in block[16..].iter_mut().enumerate() {
+                    *byte = u8::try_from((blk_idx * 17 + i * 11) % 256).unwrap_or(0);
+                }
+            }
+            let repacked = super::quant_kernels::repack_q4_k_8rows(&q4, input, out_rows)
+                .ok_or_else(|| io::Error::other("expected aligned Q4_K repack to succeed"))?;
+            assert_eq!(
+                repacked.len(),
+                (out_rows / 8) * blocks_per_row * super::quant_kernels::Q4_K_REPACK8_BLOCK_BYTES
+            );
+
+            let wm_raw = WeightMatrix {
+                input,
+                output: out_rows,
+                data: WeightSlice::Q4K(&q4),
+            };
+            let wm_repack = WeightMatrix {
+                input,
+                output: out_rows,
+                data: WeightSlice::RepackedQ4K8(&repacked),
+            };
+
+            let q8_blocks = input / 32;
+            let mut q8_data = vec![0_u8; out_rows * q8_blocks * 34];
+            for (blk_idx, block) in q8_data.chunks_exact_mut(34).enumerate() {
+                block[0..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+                for (i, byte) in block[2..].iter_mut().enumerate() {
+                    let v =
+                        i8::try_from(((blk_idx * 5 + i * 3) % 25).cast_signed() - 12).unwrap_or(0);
+                    *byte = v.cast_unsigned();
+                }
+            }
+            let wm_q8 = WeightMatrix {
+                input,
+                output: out_rows,
+                data: WeightSlice::Q8(&q8_data),
+            };
+
+            for batch in [1_usize, 2, 3, 4, 5, 9] {
+                let raw_in: Vec<f32> = (0..batch * input)
+                    .map(|i| {
+                        (f32::from(u16::try_from((i * 11) % 59).unwrap_or(0)) - 29.0) * 0.03125
+                    })
+                    .collect();
+                let prepared = PreparedBatch::new(&raw_in, batch, input);
+
+                let mut exp_single = Vec::with_capacity(batch * out_rows);
+                let mut single_buf = vec![0.0_f32; out_rows];
+                for t in 0..batch {
+                    multiply_single_into(
+                        wm_raw,
+                        &raw_in[t * input..(t + 1) * input],
+                        1,
+                        &mut single_buf,
+                    );
+                    exp_single.extend_from_slice(&single_buf);
+                }
+                let exp_bits: Vec<u32> = exp_single.iter().map(|v| v.to_bits()).collect();
+
+                let mut exp_q8 = vec![0.0_f32; batch * out_rows];
+                let mut scratch = Vec::new();
+                multiply_batch_prepared_into(
+                    wm_q8,
+                    &prepared,
+                    &raw_in,
+                    1,
+                    &mut scratch,
+                    &mut exp_q8,
+                );
+                let exp_q8_bits: Vec<u32> = exp_q8.iter().map(|v| v.to_bits()).collect();
+
+                for workers in [1_usize, 3, 8] {
+                    let mut single_repack = Vec::with_capacity(batch * out_rows);
+                    for t in 0..batch {
+                        multiply_single_into(
+                            wm_repack,
+                            &raw_in[t * input..(t + 1) * input],
+                            workers,
+                            &mut single_buf,
+                        );
+                        single_repack.extend_from_slice(&single_buf);
+                    }
+                    assert_eq!(
+                        single_repack
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        exp_bits,
+                        "repacked GEMV mismatch out={out_rows} batch={batch} workers={workers}"
+                    );
+
+                    scratch.resize(out_rows * batch + 16, f32::NAN);
+                    let mut batch_repack = vec![f32::NAN; batch * out_rows];
+                    multiply_batch_prepared_into(
+                        wm_repack,
+                        &prepared,
+                        &raw_in,
+                        workers,
+                        &mut scratch,
+                        &mut batch_repack,
+                    );
+                    assert_eq!(
+                        batch_repack.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        exp_bits,
+                        "repacked GEMM mismatch out={out_rows} batch={batch} workers={workers}"
+                    );
+
+                    let mut grp_repack = vec![0.0_f32; batch * out_rows];
+                    let mut grp_q8 = vec![0.0_f32; batch * out_rows];
+                    multiply_batch_group_into(
+                        &mut [(wm_q8, &mut grp_q8), (wm_repack, &mut grp_repack)],
+                        &prepared,
+                        &raw_in,
+                        workers,
+                        &mut scratch,
+                    );
+                    assert_eq!(
+                        grp_repack.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        exp_bits,
+                        "repacked batch group mismatch out={out_rows} batch={batch} workers={workers}"
+                    );
+                    assert_eq!(
+                        grp_q8.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        exp_q8_bits,
+                        "repacked batch group Q8 sibling mismatch out={out_rows} batch={batch} workers={workers}"
+                    );
+                }
+            }
+
+            if out_rows >= 16 {
+                let raw_in: Vec<f32> = (0..3 * input)
+                    .map(|i| (f32::from(u16::try_from(i % 37).unwrap_or(0)) - 18.0) * 0.05)
+                    .collect();
+                let (caps, _, act_qk) =
+                    super::quantize_batch_activations([wm_repack], &raw_in, 3, input, 1);
+                let mut full_single = vec![0.0_f32; out_rows];
+                super::run_single_rows_repacked_q4_k(
+                    caps,
+                    &repacked,
+                    input,
+                    0,
+                    &act_qk[..blocks_per_row],
+                    &mut full_single,
+                );
+                let mut sub_single = vec![0.0_f32; 7];
+                super::run_single_rows_repacked_q4_k(
+                    caps,
+                    &repacked,
+                    input,
+                    3,
+                    &act_qk[..blocks_per_row],
+                    &mut sub_single,
+                );
+                assert_eq!(
+                    sub_single.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    full_single[3..10]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+
+                let mut full_batch = vec![0.0_f32; out_rows * 3];
+                super::run_batch_rows_repacked_q4_k(
+                    caps,
+                    &repacked,
+                    input,
+                    0,
+                    3,
+                    &act_qk,
+                    &mut full_batch,
+                );
+                let mut sub_batch = vec![0.0_f32; 7 * 3];
+                super::run_batch_rows_repacked_q4_k(
+                    caps,
+                    &repacked,
+                    input,
+                    3,
+                    3,
+                    &act_qk,
+                    &mut sub_batch,
+                );
+                assert_eq!(
+                    sub_batch.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    full_batch[3 * 3..10 * 3]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        Ok(())
     }
 }

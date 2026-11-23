@@ -423,7 +423,7 @@ impl BlockLoader for &MappedSliceLoader<'_> {
 
 fn load_decoder_block(loader: &mut impl BlockLoader, layer: usize) -> io::Result<Block> {
     let prefix = format!("dec.blocks.{layer}.");
-    Ok(Block {
+    let mut block = Block {
         attention_norm: loader.vector(&(prefix.clone() + "norm_attn.weight"))?,
         ffn_norm: loader.vector(&(prefix.clone() + "norm_ffn.weight"))?,
         query: loader.projection(&(prefix.clone() + "attn.q.weight"))?,
@@ -435,7 +435,9 @@ fn load_decoder_block(loader: &mut impl BlockLoader, layer: usize) -> io::Result
         gate: loader.projection(&(prefix.clone() + "ffn.gate.weight"))?,
         up: loader.projection(&(prefix.clone() + "ffn.up.weight"))?,
         down: loader.projection(&(prefix + "ffn.down.weight"))?,
-    })
+    };
+    block.repack_q4_k_if_aligned();
+    Ok(block)
 }
 
 pub(super) fn load<R: Read + Seek>(

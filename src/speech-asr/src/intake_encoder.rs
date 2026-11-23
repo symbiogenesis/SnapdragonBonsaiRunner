@@ -75,7 +75,7 @@ fn norm(loader: &mut impl BlockLoader, prefix: &str) -> io::Result<Norm> {
 
 fn load_encoder_block(loader: &mut impl BlockLoader, layer: usize) -> io::Result<Block> {
     let prefix = format!("enc.blocks.{layer}.");
-    Ok(Block {
+    let mut block = Block {
         attention_norm: norm(loader, &(prefix.clone() + "norm_attn"))?,
         ffn_norm: norm(loader, &(prefix.clone() + "norm_ffn"))?,
         query: linear(loader, &(prefix.clone() + "attn.q"))?,
@@ -84,7 +84,9 @@ fn load_encoder_block(loader: &mut impl BlockLoader, layer: usize) -> io::Result
         attention_out: linear(loader, &(prefix.clone() + "attn.out"))?,
         ffn_in: linear(loader, &(prefix.clone() + "ffn.fc1"))?,
         ffn_out: linear(loader, &(prefix + "ffn.fc2"))?,
-    })
+    };
+    block.repack_q4_k_if_aligned();
+    Ok(block)
 }
 
 pub(super) fn load<R: Read + Seek>(

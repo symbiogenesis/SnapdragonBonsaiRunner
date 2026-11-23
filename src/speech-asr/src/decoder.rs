@@ -88,6 +88,8 @@ enum Storage {
     Float(Vec<f32>),
     Q8(WeightBytes),
     Q4K(WeightBytes),
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    RepackedQ4K8(Vec<u8>),
     Q6K(WeightBytes),
 }
 
@@ -267,6 +269,8 @@ impl Projection {
                 let row_bytes = self.input / 256 * 144;
                 packed::decode_q4_k_row(&bytes[row * row_bytes..(row + 1) * row_bytes], output);
             }
+            #[cfg(all(windows, feature = "rust-qualification"))]
+            Storage::RepackedQ4K8(_) => return Err(invalid()),
             Storage::Q6K(raw) => {
                 let bytes = raw.as_slice();
                 let row_bytes = self.input / 256 * 210;
@@ -276,11 +280,54 @@ impl Projection {
         finite(output)
     }
 
+    /// Repack eligible `Q4_K` linear projection matrices (`input % 256 == 0`,
+    /// `output % 8 == 0`) into 8-row strips tuned for ARM64 `SDOT` / `I8MM` kernels.
+    ///
+    /// Never call on tied/embedding matrices queried via `row_into`.
+    pub(super) fn repack_q4_k_if_aligned(&mut self) {
+        #[cfg(all(windows, feature = "rust-qualification"))]
+        {
+            if !bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod {
+                return;
+            }
+            self.repack_q4_k_if_aligned_unchecked();
+        }
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    pub(super) fn repack_q4_k_if_aligned_unchecked(&mut self) {
+        if !self.output.is_multiple_of(8) || !self.input.is_multiple_of(256) {
+            return;
+        }
+        let Storage::Q4K(raw) = &self.data else {
+            return;
+        };
+        if let Some(repacked) = bonsai_windows_process::quant_kernels::repack_q4_k_8rows(
+            raw.as_slice(),
+            self.input,
+            self.output,
+        ) {
+            self.data = Storage::RepackedQ4K8(repacked);
+        }
+    }
+
+    #[cfg(all(test, windows, feature = "rust-qualification"))]
+    pub(super) const fn is_raw_q4_k(&self) -> bool {
+        matches!(self.data, Storage::Q4K(_))
+    }
+
+    #[cfg(all(test, windows, feature = "rust-qualification"))]
+    pub(super) const fn is_repacked_q4_k(&self) -> bool {
+        matches!(self.data, Storage::RepackedQ4K8(_))
+    }
+
     pub(super) fn as_weight_matrix(&self) -> WeightMatrix<'_> {
         let data = match &self.data {
             Storage::Float(values) => WeightSlice::Float(values),
             Storage::Q8(bytes) => WeightSlice::Q8(bytes.as_slice()),
             Storage::Q4K(bytes) => WeightSlice::Q4K(bytes.as_slice()),
+            #[cfg(all(windows, feature = "rust-qualification"))]
+            Storage::RepackedQ4K8(bytes) => WeightSlice::RepackedQ4K8(bytes.as_slice()),
             Storage::Q6K(bytes) => WeightSlice::Q6K(bytes.as_slice()),
         };
         WeightMatrix {
@@ -569,6 +616,18 @@ pub struct Block {
     pub down: Projection,
 }
 
+impl Block {
+    pub(super) fn repack_q4_k_if_aligned(&mut self) {
+        self.query.repack_q4_k_if_aligned();
+        self.key.repack_q4_k_if_aligned();
+        self.value.repack_q4_k_if_aligned();
+        self.attention_out.repack_q4_k_if_aligned();
+        self.gate.repack_q4_k_if_aligned();
+        self.up.repack_q4_k_if_aligned();
+        self.down.repack_q4_k_if_aligned();
+    }
+}
+
 /// Immutable admitted decoder weights, sharing the embedding and output head.
 pub struct Model {
     config: Config,
@@ -626,7 +685,7 @@ impl Model {
     pub fn new(
         config: Config,
         embedding: Projection,
-        blocks: Vec<Block>,
+        mut blocks: Vec<Block>,
         output_norm: Vec<f32>,
     ) -> io::Result<Self> {
         let c = config;
@@ -665,6 +724,9 @@ impl Model {
             {
                 return Err(invalid());
             }
+        }
+        for block in &mut blocks {
+            block.repack_q4_k_if_aligned();
         }
         let half_dim = c.head_dim / 2;
         let mut inv_freq = zeros(half_dim)?;

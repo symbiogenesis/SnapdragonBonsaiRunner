@@ -175,6 +175,17 @@ pub struct Block {
     pub ffn_out: Linear,
 }
 
+impl Block {
+    pub(super) fn repack_q4_k_if_aligned(&mut self) {
+        self.query.weights.repack_q4_k_if_aligned();
+        self.key.weights.repack_q4_k_if_aligned();
+        self.value.weights.repack_q4_k_if_aligned();
+        self.attention_out.weights.repack_q4_k_if_aligned();
+        self.ffn_in.weights.repack_q4_k_if_aligned();
+        self.ffn_out.weights.repack_q4_k_if_aligned();
+    }
+}
+
 /// Fixed geometry from the verified encoder metadata.
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -296,6 +307,12 @@ impl Encoder {
         weights.output_norm.validate(c.hidden)?;
         weights.output_in.validate(c.hidden, c.hidden)?;
         weights.output_out.validate(c.hidden, c.output)?;
+        weights.convolution_out.repack_q4_k_if_aligned();
+        for block in &mut weights.blocks {
+            block.repack_q4_k_if_aligned();
+        }
+        weights.output_in.weights.repack_q4_k_if_aligned();
+        weights.output_out.weights.repack_q4_k_if_aligned();
         let sinusoids = build_sinusoids(layout.rows_per_chunk, c.hidden)?;
         Ok(Self {
             config,

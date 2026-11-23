@@ -628,3 +628,98 @@ fn rust_asr_decoder_incremental_prefill_matches_full_prefill_and_rolls_back() ->
             .unwrap_or([0; 6])
     }
 }
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+#[test]
+fn rust_asr_decoder_repacks_aligned_block_q4_k_never_embedding() -> io::Result<()> {
+    fn make_q4_k(input: usize, output: usize, seed: usize) -> io::Result<Projection> {
+        let blocks_per_row = input / 256;
+        let mut bytes = vec![0_u8; output * blocks_per_row * 144];
+        for (blk_idx, block) in bytes.chunks_exact_mut(144).enumerate() {
+            block[0..2].copy_from_slice(&0x3000_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x2800_u16.to_le_bytes());
+            for (i, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = u8::try_from((blk_idx + seed + i) % 15 + 1).unwrap_or(1);
+            }
+            for (i, byte) in block[16..].iter_mut().enumerate() {
+                *byte = u8::try_from((blk_idx * 7 + seed + i * 3) % 256).unwrap_or(0);
+            }
+        }
+        Projection::q4_k(input, output, bytes)
+    }
+
+    let c = Config {
+        hidden: 256,
+        heads: 4,
+        kv_heads: 2,
+        head_dim: 64,
+        intermediate: 256,
+        context: 512,
+        epsilon: 1e-5,
+        rope_theta: 1_000_000.0,
+        cache_precision: CachePrecision::F16,
+    };
+    let vocab = 16_usize;
+    let embedding = make_q4_k(c.hidden, vocab, 1)?;
+    let block = Block {
+        attention_norm: vec![1.0; c.hidden],
+        ffn_norm: vec![1.0; c.hidden],
+        query: make_q4_k(c.hidden, c.heads * c.head_dim, 2)?,
+        key: make_q4_k(c.hidden, c.kv_heads * c.head_dim, 3)?,
+        value: make_q4_k(c.hidden, c.kv_heads * c.head_dim, 4)?,
+        attention_out: make_q4_k(c.heads * c.head_dim, c.hidden, 5)?,
+        query_norm: vec![1.0; c.head_dim],
+        key_norm: vec![1.0; c.head_dim],
+        gate: make_q4_k(c.hidden, c.intermediate, 6)?,
+        up: make_q4_k(c.hidden, c.intermediate, 7)?,
+        down: make_q4_k(c.intermediate, c.hidden, 8)?,
+    };
+    let model = Arc::new(Model::new(c, embedding, vec![block], vec![1.0; c.hidden])?);
+
+    // CRITICAL: token_embd must stay raw Q4_K so row_into lookup succeeds.
+    assert!(model.embedding.is_raw_q4_k());
+    assert!(!model.embedding.is_repacked_q4_k());
+    let mut emb_row = vec![0.0_f32; c.hidden];
+    model.embedding.row_into(3, &mut emb_row)?;
+
+    // On ARM64 dotprod targets, all aligned block projections are repacked.
+    let expected_repack = bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod;
+    let b = &model.blocks[0];
+    for proj in [
+        &b.query,
+        &b.key,
+        &b.value,
+        &b.attention_out,
+        &b.gate,
+        &b.up,
+        &b.down,
+    ] {
+        assert_eq!(proj.is_repacked_q4_k(), expected_repack);
+    }
+
+    // Non-8-row Q4_K never repacks even when forced.
+    let mut unaligned = make_q4_k(256, 4, 9)?;
+    unaligned.repack_q4_k_if_aligned_unchecked();
+    assert!(unaligned.is_raw_q4_k());
+
+    // End-to-end prefill & step match bit-for-bit on the repacked model.
+    let prompt = PromptTokens::new([0, 1, 2, 3, 4, 5], [6, 7, 8], 9)?.automatic_prompt(2, 512)?;
+    let audio = vec![0.05_f32; 2 * c.hidden];
+    let mut pre = model.session();
+    let pre_logits = pre.prefill(&prompt, &audio, &mut || false)?;
+    let mut step = model.session();
+    let mut step_logits = Vec::new();
+    for (pos, &id) in prompt.ids().iter().enumerate() {
+        step_logits = if prompt.audio_rows().contains(&pos) {
+            let start = (pos - prompt.audio_rows().start) * c.hidden;
+            step.step_audio(&audio[start..start + c.hidden], &mut || false)?
+        } else {
+            step.step(id, &mut || false)?
+        };
+    }
+    assert_eq!(
+        pre_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        step_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    Ok(())
+}
