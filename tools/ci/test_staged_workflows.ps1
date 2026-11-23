@@ -66,8 +66,37 @@ $cases = [ordered]@{
     non_repository_fails_closed = { $scratch = New-CiScratch; try { Assert-StagedFailure $scratch 'git diff failed' } finally { Remove-CiScratch $scratch } }
     initial_repository_is_checked = { $scratch = New-CiScratch; try { Invoke-FixtureGit $scratch @('init', '--quiet') | Out-Null; Write-CiFixture $scratch $workflow "uses: $checkout`n"; Invoke-FixtureGit $scratch @('add', '--', $workflow) | Out-Null; Assert-StagedFailure $scratch 'actions.lock' } finally { Remove-CiScratch $scratch } }
 }
-try {
-    Invoke-CiCases $cases $Case
-} finally {
-    if ($null -ne $script:StagedTemplate) { Remove-CiScratch $script:StagedTemplate }
+if ($MyInvocation.InvocationName -ne '.') {
+    try {
+        if ($Case) {
+            Invoke-CiCases $cases $Case
+        } else {
+            $template = Get-StagedTemplate
+            $scriptPath = $PSCommandPath
+            $sequential = 'git_failure_blocks_instead_of_skipping'
+            $orderedNames = @($cases.Keys)
+            $parallelNames = @($orderedNames | Where-Object { $_ -cne $sequential })
+            $outcomes = @($parallelNames | ForEach-Object -ThrottleLimit 8 -Parallel {
+                $name = $_
+                try {
+                    . $using:scriptPath
+                    $script:StagedTemplate = $using:template
+                    & $cases[$name] | Out-Null
+                    [pscustomobject]@{ Name = $name; Error = $null }
+                } catch {
+                    [pscustomobject]@{ Name = $name; Error = $_.Exception.Message }
+                }
+            })
+            $failed = @($outcomes | Where-Object { $null -ne $_.Error })
+            if ($failed.Count -gt 0) {
+                foreach ($item in $failed) { [Console]::Error.WriteLine("FAIL test_staged_workflows.ps1::$($item.Name): $($item.Error)") }
+                throw $failed[0].Error
+            }
+            Invoke-CiCases ([ordered]@{ $sequential = $cases[$sequential] }) $sequential | Out-Null
+            foreach ($name in $orderedNames) { "PASS $name" }
+            "$($orderedNames.Count) focused fixture(s) passed."
+        }
+    } finally {
+        if ($null -ne $script:StagedTemplate) { Remove-CiScratch $script:StagedTemplate }
+    }
 }

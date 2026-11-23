@@ -1,4 +1,4 @@
-#Requires -Version 7.6
+﻿#Requires -Version 7.6
 # Model-free controls; never install software or contact a remote service.
 [CmdletBinding()]
 param()
@@ -25,16 +25,20 @@ foreach ($control in @(
     'Test-ReleaseNotices.ps1'
     'Test-ReleasePolicy.ps1'
     'Test-PortableReleaseAssets.ps1'
-    'Test-ReleasePublication.ps1'
-    'Test-ReleaseCommandFailures.ps1'
-    'Test-ReleaseCleanup.ps1'
-    'Test-ExecutableBuild.ps1'
 )) {
     Write-Host "Starting release control: $control"
     & (Join-Path $PSScriptRoot $control)
     if (-not $?) { throw "Release control failed: $control (exit code $LASTEXITCODE)." }
     Write-Host "Passed release control: $control"
 }
+Write-Host 'Starting release control: Rust release publication, cleanup, and source build tests'
+& cargo test --locked --manifest-path (Join-Path $repository 'Cargo.toml') -p bonsai-tools --lib -- release_publication_ release_cleanup_ release_package::source::tests::
+if ($LASTEXITCODE -ne 0) { throw "Release control failed: Rust release lib tests (exit code $LASTEXITCODE)." }
+Write-Host 'Passed release control: Rust release publication, cleanup, and source build tests'
+Write-Host 'Starting release control: Test-ReleaseCommandFailures.ps1'
+& (Join-Path $PSScriptRoot 'Test-ReleaseCommandFailures.ps1')
+if (-not $?) { throw "Release control failed: Test-ReleaseCommandFailures.ps1 (exit code $LASTEXITCODE)." }
+Write-Host 'Passed release control: Test-ReleaseCommandFailures.ps1'
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('SwiftBonsai-Release-Controls-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($fixture)
 $echoScript = Join-Path $fixture 'arguments.ps1'
