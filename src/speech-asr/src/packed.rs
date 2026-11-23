@@ -11,10 +11,6 @@
 
 #[cfg(all(windows, feature = "rust-qualification"))]
 use bonsai_windows_process::quant_kernels::{self, Arm64QuantCaps, Q8_0ActBlock, Q8_KActBlock};
-#[cfg(all(windows, feature = "rust-qualification"))]
-use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-#[cfg(all(windows, feature = "rust-qualification"))]
-use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use crate::row_workers;
@@ -1783,101 +1779,6 @@ fn scatter_quads_simd<S: Simd>(
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
-struct QuantOwnedTeam {
-    pool: Option<ThreadPool>,
-    workers: Vec<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(all(windows, feature = "rust-qualification"))]
-impl QuantOwnedTeam {
-    fn build(worker_count: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
-        let mut team = Self {
-            pool: None,
-            workers: Vec::with_capacity(worker_count),
-        };
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(worker_count)
-            .spawn_handler(|worker| {
-                let handle = std::thread::Builder::new()
-                    .name(format!("asr-quant-{}", worker.index()))
-                    .spawn(move || worker.run())?;
-                team.workers.push(handle);
-                Ok(())
-            })
-            .build()?;
-        team.pool = Some(pool);
-        Ok(team)
-    }
-
-    const fn worker_count(&self) -> usize {
-        self.workers.len()
-    }
-}
-
-#[cfg(all(windows, feature = "rust-qualification"))]
-impl Drop for QuantOwnedTeam {
-    fn drop(&mut self) {
-        drop(self.pool.take());
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
-    }
-}
-
-#[cfg(all(windows, feature = "rust-qualification"))]
-enum QuantCachedTeam {
-    Ready(QuantOwnedTeam),
-    Unavailable(usize),
-}
-
-#[cfg(all(windows, feature = "rust-qualification"))]
-impl QuantCachedTeam {
-    fn get_or_build(slot: &mut Option<Self>, worker_count: usize) -> Option<&QuantOwnedTeam> {
-        if let Some(cached) = slot.as_ref() {
-            match cached {
-                Self::Ready(team) if team.worker_count() >= worker_count => return Some(team),
-                Self::Unavailable(count) if *count == worker_count => return None,
-                Self::Ready(_) | Self::Unavailable(_) => {}
-            }
-        }
-        *slot = None;
-        match slot.insert(
-            QuantOwnedTeam::build(worker_count)
-                .map_or_else(|_| Self::Unavailable(worker_count), Self::Ready),
-        ) {
-            Self::Ready(team) => Some(team),
-            Self::Unavailable(_) => None,
-        }
-    }
-}
-
-#[cfg(all(windows, feature = "rust-qualification"))]
-thread_local! {
-    static QUANT_TEAM: RefCell<Option<QuantCachedTeam>> = const { RefCell::new(None) };
-}
-
-#[cfg(all(windows, feature = "rust-qualification"))]
-fn with_quant_pool(workers: usize, batch: usize, action: impl FnOnce(&ThreadPool)) -> bool {
-    let worker_count = workers.clamp(1, crate::threads::MAX_WORKERS).min(batch);
-    if worker_count <= 1 || rayon::current_thread_index().is_some() {
-        return false;
-    }
-    QUANT_TEAM.with(|slot| {
-        let Ok(mut team) = slot.try_borrow_mut() else {
-            return false;
-        };
-        let Some(owned) = QuantCachedTeam::get_or_build(&mut team, worker_count) else {
-            return false;
-        };
-        let Some(pool) = owned.pool.as_ref() else {
-            return false;
-        };
-        action(pool);
-        true
-    })
-}
-
-#[cfg(all(windows, feature = "rust-qualification"))]
 fn quantize_batch_activations<'a>(
     weights: impl IntoIterator<Item = WeightMatrix<'a>>,
     raw_input: &[f32],
@@ -1903,72 +1804,75 @@ fn quantize_batch_activations<'a>(
     let q8_0_blocks = width / 32;
     let q8_k_blocks = width / 256;
     if needs_q8_0 {
-        act_q8_0.resize(
-            batch * q8_0_blocks,
-            Q8_0ActBlock {
-                d: 0.0,
-                qs: [0; 32],
-            },
-        );
+        act_q8_0.resize(batch * q8_0_blocks, Q8_0ActBlock::default());
     }
     if needs_q8_k {
-        act_q8_k.resize(
-            batch * q8_k_blocks,
-            Q8_KActBlock {
-                d: 0.0,
-                qs: [0; 256],
-                bsums: [0; 16],
-            },
-        );
+        act_q8_k.resize(batch * q8_k_blocks, Q8_KActBlock::default());
     }
 
-    let parallel_ran = batch > 1
-        && workers > 1
+    let run_q8_0 = needs_q8_0 && q8_0_blocks > 0;
+    let run_q8_k = needs_q8_k && q8_k_blocks > 0;
+    let active_workers = workers.clamp(1, crate::threads::MAX_WORKERS).min(batch);
+    if active_workers > 1
         && batch.saturating_mul(width) >= PARALLEL_QUANT_WORK
-        && (needs_q8_0 || needs_q8_k)
-        && with_quant_pool(workers, batch, |pool| {
-            let active_workers = workers.clamp(1, crate::threads::MAX_WORKERS).min(batch);
-            let chunk_frames = batch.div_ceil(active_workers);
-            pool.install(|| {
-                if needs_q8_0 {
-                    act_q8_0
-                        .par_chunks_mut(chunk_frames * q8_0_blocks)
-                        .enumerate()
-                        .for_each(|(chunk_idx, out_chunk)| {
-                            let start_t = chunk_idx * chunk_frames;
-                            let count = out_chunk.len() / q8_0_blocks;
-                            for local_t in 0..count {
-                                let t = start_t + local_t;
-                                quant_kernels::quantize_row_q8_0(
-                                    &raw_input[t * width..(t + 1) * width],
-                                    &mut out_chunk
-                                        [local_t * q8_0_blocks..(local_t + 1) * q8_0_blocks],
-                                );
-                            }
-                        });
+        && (run_q8_0 || run_q8_k)
+    {
+        let chunk_frames = batch.div_ceil(active_workers);
+        let num_tasks = batch.div_ceil(chunk_frames);
+        let q8_0_slots: Vec<std::sync::Mutex<&mut [Q8_0ActBlock]>> = if run_q8_0 {
+            act_q8_0
+                .chunks_mut(chunk_frames * q8_0_blocks)
+                .map(std::sync::Mutex::new)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let q8_k_slots: Vec<std::sync::Mutex<&mut [Q8_KActBlock]>> = if run_q8_k {
+            act_q8_k
+                .chunks_mut(chunk_frames * q8_k_blocks)
+                .map(std::sync::Mutex::new)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut task_tokens = [0.0_f32; crate::threads::MAX_WORKERS];
+        row_workers::run_aligned(
+            &mut task_tokens[..num_tasks],
+            active_workers,
+            1,
+            &|start_task, slice| {
+                for task_idx in start_task..(start_task + slice.len()) {
+                    let start_t = task_idx * chunk_frames;
+                    let count = (batch - start_t).min(chunk_frames);
+                    if let Some(slot) = q8_0_slots.get(task_idx) {
+                        let mut out_chunk = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for local_t in 0..count {
+                            let t = start_t + local_t;
+                            quant_kernels::quantize_row_q8_0(
+                                &raw_input[t * width..(t + 1) * width],
+                                &mut out_chunk[local_t * q8_0_blocks..(local_t + 1) * q8_0_blocks],
+                            );
+                        }
+                    }
+                    if let Some(slot) = q8_k_slots.get(task_idx) {
+                        let mut out_chunk = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for local_t in 0..count {
+                            let t = start_t + local_t;
+                            quant_kernels::quantize_row_q8_k(
+                                &raw_input[t * width..(t + 1) * width],
+                                &mut out_chunk[local_t * q8_k_blocks..(local_t + 1) * q8_k_blocks],
+                            );
+                        }
+                    }
                 }
-                if needs_q8_k {
-                    act_q8_k
-                        .par_chunks_mut(chunk_frames * q8_k_blocks)
-                        .enumerate()
-                        .for_each(|(chunk_idx, out_chunk)| {
-                            let start_t = chunk_idx * chunk_frames;
-                            let count = out_chunk.len() / q8_k_blocks;
-                            for local_t in 0..count {
-                                let t = start_t + local_t;
-                                quant_kernels::quantize_row_q8_k(
-                                    &raw_input[t * width..(t + 1) * width],
-                                    &mut out_chunk
-                                        [local_t * q8_k_blocks..(local_t + 1) * q8_k_blocks],
-                                );
-                            }
-                        });
-                }
-            });
-        });
-
-    if !parallel_ran {
-        if needs_q8_0 {
+            },
+        );
+    } else {
+        if run_q8_0 {
             for t in 0..batch {
                 quant_kernels::quantize_row_q8_0(
                     &raw_input[t * width..(t + 1) * width],
@@ -1976,7 +1880,7 @@ fn quantize_batch_activations<'a>(
                 );
             }
         }
-        if needs_q8_k {
+        if run_q8_k {
             for t in 0..batch {
                 quant_kernels::quantize_row_q8_k(
                     &raw_input[t * width..(t + 1) * width],
@@ -3892,6 +3796,26 @@ mod tests {
                 assert_eq!(a.bsums, b.bsums);
             }
         }
+
+        // Calling inside an active row_workers scope falls back cleanly without deadlock.
+        let mut outer = [0.0_f32; 4];
+        super::row_workers::run_aligned(&mut outer, 4, 1, &|_, slice| {
+            let (_, nested_q8, nested_qk) =
+                super::quantize_batch_activations(matrices, &raw_input, batch, width, 4);
+            assert_eq!(nested_q8.len(), seq_q8.len());
+            for (a, b) in nested_q8.iter().zip(&seq_q8) {
+                assert_eq!(a.d.to_bits(), b.d.to_bits());
+                assert_eq!(a.qs, b.qs);
+            }
+            assert_eq!(nested_qk.len(), seq_qk.len());
+            for (a, b) in nested_qk.iter().zip(&seq_qk) {
+                assert_eq!(a.d.to_bits(), b.d.to_bits());
+                assert_eq!(a.qs, b.qs);
+                assert_eq!(a.bsums, b.bsums);
+            }
+            slice.fill(1.0);
+        });
+        assert_eq!(outer, [1.0_f32; 4]);
     }
 
     #[cfg(all(windows, feature = "rust-qualification"))]
