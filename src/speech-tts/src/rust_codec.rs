@@ -9,7 +9,13 @@
     reason = "Private checked graph loaders share the speech service's io::Result contract."
 )]
 
-use std::io;
+use std::{
+    cell::RefCell,
+    io,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 
 use crate::{
     SAMPLE_RATE,
@@ -18,8 +24,8 @@ use crate::{
         DacBlock, DacDecoder, DacResUnit, PadMode, RvqDecoder, RvqEncodeSide, RvqGroup, SnakeBeta,
         TOKENIZER_HOP_24K,
     },
-    engine::{LinearProjection, rms_norm_in_place},
-    numerics::usize_to_f32,
+    engine::{LinearProjection, swiglu_in_place},
+    numerics::{axpy_simd, f32_dot_simd, usize_to_f32},
     speaker_encoder::{
         AttentiveStatPool, AudioMelConfig, EcapaSpeakerEncoder, MelSpectrogramExtractor,
         SeRes2NetBlock, SqueezeExcitation, TdnnConv1d,
@@ -724,6 +730,7 @@ impl Transformer {
                 self.kv_heads,
                 self.head_dim,
                 self.window,
+                self.threads,
                 cache,
                 &mut scratch.scores,
                 &mut scratch.attended,
@@ -735,14 +742,7 @@ impl Transformer {
                 self.threads,
                 &mut scratch.projected,
             )?;
-            for ((dst, &value), &scale) in scratch
-                .hidden
-                .iter_mut()
-                .zip(&scratch.projected)
-                .zip(&layer.attn_scale)
-            {
-                *dst += value * scale;
-            }
+            scaled_residual_add(&mut scratch.hidden, &scratch.projected, &layer.attn_scale);
             normalize_into(
                 &scratch.hidden,
                 &layer.ffn_norm,
@@ -761,9 +761,8 @@ impl Transformer {
                     &mut scratch.up,
                     &mut scratch.gate,
                 )?;
-                for (value, &gate) in scratch.up.iter_mut().zip(&scratch.gate) {
-                    *value *= gate / (1.0 + (-gate).exp());
-                }
+                swiglu_in_place(&mut scratch.gate, &scratch.up);
+                std::mem::swap(&mut scratch.up, &mut scratch.gate);
             } else {
                 layer.up.forward_vec_into(
                     &scratch.normalized,
@@ -772,9 +771,7 @@ impl Transformer {
                     self.threads,
                     &mut scratch.up,
                 )?;
-                for value in &mut scratch.up {
-                    *value = gelu_erf(*value);
-                }
+                gelu_erf_in_place(&mut scratch.up);
             }
             layer.down.forward_vec_into(
                 &scratch.up,
@@ -783,17 +780,10 @@ impl Transformer {
                 self.threads,
                 &mut scratch.projected,
             )?;
-            for ((dst, &value), &scale) in scratch
-                .hidden
-                .iter_mut()
-                .zip(&scratch.projected)
-                .zip(&layer.ffn_scale)
-            {
-                *dst += value * scale;
-            }
+            scaled_residual_add(&mut scratch.hidden, &scratch.projected, &layer.ffn_scale);
         }
         if let Some(norm) = &self.final_norm {
-            rms_norm_in_place(&mut scratch.hidden, norm, self.eps)?;
+            rms_norm_checked_in_place(&mut scratch.hidden, norm, self.eps)?;
         }
         if let Some(proj) = &self.output {
             proj.forward_vec_into(
@@ -875,6 +865,262 @@ fn normalize(
     Ok(output)
 }
 
+#[inline(always)]
+fn slice_sum_simd<S: Simd>(simd: S, values: &[f32]) -> f32 {
+    let (chunks, tail) = values.as_chunks::<4>();
+    let (pairs, rem) = chunks.as_chunks::<2>();
+    let mut acc0 = f32x4::splat(simd, 0.0_f32);
+    let mut acc1 = f32x4::splat(simd, 0.0_f32);
+    for pair in pairs {
+        acc0 += f32x4::from_slice(simd, &pair[0]);
+        acc1 += f32x4::from_slice(simd, &pair[1]);
+    }
+    for chunk in rem {
+        acc0 += f32x4::from_slice(simd, chunk);
+    }
+    let mut lanes = [0.0_f32; 4];
+    (acc0 + acc1).store_slice(&mut lanes);
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for &v in tail {
+        sum += v;
+    }
+    sum
+}
+
+#[inline(always)]
+fn variance_sum_simd<S: Simd>(simd: S, values: &[f32], mean: f32) -> f32 {
+    let mean_v = f32x4::splat(simd, mean);
+    let (chunks, tail) = values.as_chunks::<4>();
+    let (pairs, rem) = chunks.as_chunks::<2>();
+    let mut acc0 = f32x4::splat(simd, 0.0_f32);
+    let mut acc1 = f32x4::splat(simd, 0.0_f32);
+    for pair in pairs {
+        let d0 = f32x4::from_slice(simd, &pair[0]) - mean_v;
+        let d1 = f32x4::from_slice(simd, &pair[1]) - mean_v;
+        acc0 = d0.mul_add(d0, acc0);
+        acc1 = d1.mul_add(d1, acc1);
+    }
+    for chunk in rem {
+        let d = f32x4::from_slice(simd, chunk) - mean_v;
+        acc0 = d.mul_add(d, acc0);
+    }
+    let mut lanes = [0.0_f32; 4];
+    (acc0 + acc1).store_slice(&mut lanes);
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for &v in tail {
+        let d = v - mean;
+        sum = d.mul_add(d, sum);
+    }
+    sum
+}
+
+#[inline(always)]
+fn layer_norm_apply_simd<S: Simd>(
+    simd: S,
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    mean: f32,
+    inv: f32,
+    dst: &mut [f32],
+) {
+    let mean_v = f32x4::splat(simd, mean);
+    let inv_v = f32x4::splat(simd, inv);
+    let (in_c, in_t) = input.as_chunks::<4>();
+    let (w_c, w_t) = weight.as_chunks::<4>();
+    let (b_c, b_t) = bias.as_chunks::<4>();
+    let (d_c, d_t) = dst.as_chunks_mut::<4>();
+    for (((xc, wc), bc), dc) in in_c.iter().zip(w_c).zip(b_c).zip(d_c) {
+        let norm = (f32x4::from_slice(simd, xc) - mean_v) * inv_v;
+        norm.mul_add(f32x4::from_slice(simd, wc), f32x4::from_slice(simd, bc))
+            .store_slice(dc);
+    }
+    for (((&x, &w), &b), d) in in_t.iter().zip(w_t).zip(b_t).zip(d_t) {
+        *d = ((x - mean) * inv).mul_add(w, b);
+    }
+}
+
+#[inline(always)]
+fn scaled_residual_add_simd<S: Simd>(simd: S, dst: &mut [f32], value: &[f32], scale: &[f32]) {
+    let n = dst.len().min(value.len()).min(scale.len());
+    let (dst_chunks, dst_tail) = dst[..n].as_chunks_mut::<4>();
+    let (val_chunks, val_tail) = value[..n].as_chunks::<4>();
+    let (sc_chunks, sc_tail) = scale[..n].as_chunks::<4>();
+    for ((dc, vc), sc) in dst_chunks.iter_mut().zip(val_chunks).zip(sc_chunks) {
+        let dv = f32x4::from_slice(simd, dc);
+        let vv = f32x4::from_slice(simd, vc);
+        let sv = f32x4::from_slice(simd, sc);
+        vv.mul_add(sv, dv).store_slice(dc);
+    }
+    for ((d, &v), &s) in dst_tail.iter_mut().zip(val_tail).zip(sc_tail) {
+        *d = v.mul_add(s, *d);
+    }
+}
+
+fn scaled_residual_add(dst: &mut [f32], value: &[f32], scale: &[f32]) {
+    let level = Level::new();
+    dispatch!(level, simd => scaled_residual_add_simd(simd, dst, value, scale));
+}
+
+#[inline(always)]
+fn gelu_erf_slice_simd<S: Simd>(simd: S, values: &mut [f32]) {
+    // Abramowitz & Stegun 7.1.26 erfc(|x| / sqrt(2)) paired with exp_f32x4(-z^2),
+    // keeping exp_f32x4 strictly in its non-positive input domain.
+    const P: f32 = 0.327_591_1;
+    const A1: f32 = 0.254_829_592;
+    const A2: f32 = -0.284_496_736;
+    const A3: f32 = 1.421_413_741;
+    const A4: f32 = -1.453_152_027;
+    const A5: f32 = 1.061_405_429;
+
+    let zero = f32x4::splat(simd, 0.0_f32);
+    let half = f32x4::splat(simd, 0.5_f32);
+    let one = f32x4::splat(simd, 1.0_f32);
+    let inv_sqrt2 = f32x4::splat(simd, std::f32::consts::FRAC_1_SQRT_2);
+    let pv = f32x4::splat(simd, P);
+    let a1 = f32x4::splat(simd, A1);
+    let a2 = f32x4::splat(simd, A2);
+    let a3 = f32x4::splat(simd, A3);
+    let a4 = f32x4::splat(simd, A4);
+    let a5 = f32x4::splat(simd, A5);
+
+    let (chunks, tail) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let x = f32x4::from_slice(simd, chunk);
+        let z = x * inv_sqrt2;
+        let az = z.abs();
+        let t = one / pv.mul_add(az, one);
+        let poly = a5.mul_add(t, a4);
+        let poly = poly.mul_add(t, a3);
+        let poly = poly.mul_add(t, a2);
+        let poly = poly.mul_add(t, a1) * t;
+        let e = crate::engine::exp_f32x4(simd, -(z * z));
+        let erfc_abs = poly * e;
+        let half_cdf = x
+            .simd_lt(zero)
+            .select(half * erfc_abs, one - half * erfc_abs);
+        (x * half_cdf).store_slice(chunk);
+    }
+    for value in tail {
+        *value = gelu_erf(*value);
+    }
+}
+
+fn gelu_erf_in_place(values: &mut [f32]) {
+    let level = Level::new();
+    dispatch!(level, simd => gelu_erf_slice_simd(simd, values));
+}
+
+#[inline(always)]
+fn sum_sq_simd<S: Simd>(simd: S, values: &[f32]) -> f32 {
+    let (chunks, tail) = values.as_chunks::<4>();
+    let (pairs, rem) = chunks.as_chunks::<2>();
+    let mut acc0 = f32x4::splat(simd, 0.0_f32);
+    let mut acc1 = f32x4::splat(simd, 0.0_f32);
+    for pair in pairs {
+        let v0 = f32x4::from_slice(simd, &pair[0]);
+        let v1 = f32x4::from_slice(simd, &pair[1]);
+        acc0 = v0.mul_add(v0, acc0);
+        acc1 = v1.mul_add(v1, acc1);
+    }
+    for chunk in rem {
+        let v = f32x4::from_slice(simd, chunk);
+        acc0 = v.mul_add(v, acc0);
+    }
+    let mut lanes = [0.0_f32; 4];
+    (acc0 + acc1).store_slice(&mut lanes);
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for &v in tail {
+        sum = v.mul_add(v, sum);
+    }
+    sum
+}
+
+#[inline(always)]
+fn rms_scale_simd<S: Simd>(simd: S, input: &[f32], weight: &[f32], scale: f32, dst: &mut [f32]) {
+    let scale_v = f32x4::splat(simd, scale);
+    let (in_c, in_t) = input.as_chunks::<4>();
+    let (w_c, w_t) = weight.as_chunks::<4>();
+    let (d_c, d_t) = dst.as_chunks_mut::<4>();
+    for ((xc, wc), dc) in in_c.iter().zip(w_c).zip(d_c) {
+        let xv = f32x4::from_slice(simd, xc);
+        let wv = f32x4::from_slice(simd, wc);
+        ((xv * scale_v) * wv).store_slice(dc);
+    }
+    for ((&x, &w), d) in in_t.iter().zip(w_t).zip(d_t) {
+        *d = (x * scale) * w;
+    }
+}
+
+#[inline(always)]
+fn rms_scale_in_place_simd<S: Simd>(simd: S, data: &mut [f32], weight: &[f32], scale: f32) {
+    let scale_v = f32x4::splat(simd, scale);
+    let (d_c, d_t) = data.as_chunks_mut::<4>();
+    let (w_c, w_t) = weight.as_chunks::<4>();
+    for (dc, wc) in d_c.iter_mut().zip(w_c) {
+        let xv = f32x4::from_slice(simd, dc);
+        let wv = f32x4::from_slice(simd, wc);
+        ((xv * scale_v) * wv).store_slice(dc);
+    }
+    for (x, &w) in d_t.iter_mut().zip(w_t) {
+        *x = (*x * scale) * w;
+    }
+}
+
+fn rms_norm_checked_in_place(data: &mut [f32], weight: &[f32], eps: f32) -> io::Result<()> {
+    if data.is_empty()
+        || data.len() != weight.len()
+        || !eps.is_finite()
+        || eps <= 0.0
+        || data.iter().chain(weight).any(|value| !value.is_finite())
+    {
+        return Err(invalid());
+    }
+    let count = count_float(data.len())?;
+    let level = Level::new();
+    let mean_sq = dispatch!(level, simd => sum_sq_simd(simd, data)) / count;
+    let denominator = mean_sq + eps;
+    if !mean_sq.is_finite() || !denominator.is_finite() {
+        return Err(invalid());
+    }
+    let scale = 1.0 / denominator.sqrt();
+    dispatch!(level, simd => rms_scale_in_place_simd(simd, data, weight, scale));
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn rms_norm_checked_into(
+    input: &[f32],
+    weight: &[f32],
+    eps: f32,
+    output: &mut Vec<f32>,
+) -> io::Result<()> {
+    if input.is_empty()
+        || input.len() != weight.len()
+        || !eps.is_finite()
+        || eps <= 0.0
+        || input.iter().chain(weight).any(|value| !value.is_finite())
+    {
+        return Err(invalid());
+    }
+    let count = count_float(input.len())?;
+    let level = Level::new();
+    let mean_sq = dispatch!(level, simd => sum_sq_simd(simd, input)) / count;
+    let denominator = mean_sq + eps;
+    if !mean_sq.is_finite() || !denominator.is_finite() {
+        return Err(invalid());
+    }
+    let scale = 1.0 / denominator.sqrt();
+    output.resize(input.len(), 0.0);
+    dispatch!(level, simd => rms_scale_simd(simd, input, weight, scale, output));
+    if output.iter().any(|value| !value.is_finite()) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn normalize_into(
     input: &[f32],
     weight: &[f32],
@@ -883,9 +1129,7 @@ fn normalize_into(
     output: &mut Vec<f32>,
 ) -> io::Result<()> {
     let Some(bias) = bias else {
-        output.clear();
-        output.extend_from_slice(input);
-        return rms_norm_in_place(output, weight, eps);
+        return rms_norm_checked_into(input, weight, eps, output);
     };
     if input.is_empty()
         || input.len() != weight.len()
@@ -901,12 +1145,9 @@ fn normalize_into(
         return Err(invalid());
     }
     let count = count_float(input.len())?;
-    let mean = input.iter().sum::<f32>() / count;
-    let variance = input
-        .iter()
-        .map(|value| (value - mean) * (value - mean))
-        .sum::<f32>()
-        / count;
+    let level = Level::new();
+    let mean = dispatch!(level, simd => slice_sum_simd(simd, input)) / count;
+    let variance = dispatch!(level, simd => variance_sum_simd(simd, input, mean)) / count;
     let denominator = variance + eps;
     // A finite input can overflow the original F32 reduction. An infinite
     // variance would otherwise yield zero scale and apparently valid output.
@@ -914,14 +1155,8 @@ fn normalize_into(
         return Err(invalid());
     }
     let inv = 1.0 / denominator.sqrt();
-    output.clear();
-    output.extend(
-        input
-            .iter()
-            .zip(weight)
-            .zip(bias)
-            .map(|((&value, &scale), &offset)| ((value - mean) * inv).mul_add(scale, offset)),
-    );
+    output.resize(input.len(), 0.0);
+    dispatch!(level, simd => layer_norm_apply_simd(simd, input, weight, bias, mean, inv, output));
     if output.iter().any(|value| !value.is_finite()) {
         return Err(invalid());
     }
@@ -953,11 +1188,159 @@ fn append_attention(
         kv_heads,
         width,
         window,
+        1,
         state,
         &mut scores,
         &mut output,
     )?;
     Ok(output)
+}
+
+thread_local! {
+    static CODEC_ATTN_SCORES: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_codec_attn_scores<R>(needed: usize, action: impl FnOnce(&mut [f32]) -> R) -> R {
+    CODEC_ATTN_SCORES.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            if buf.len() < needed {
+                buf.resize(needed, 0.0_f32);
+            }
+            action(&mut buf[..needed])
+        } else {
+            let mut fallback = vec![0.0_f32; needed];
+            action(&mut fallback)
+        }
+    })
+}
+
+#[inline(always)]
+fn softmax_f32_row_simd<S: Simd>(simd: S, scores: &mut [f32], max_score: f32) -> Option<f32> {
+    let max_v = f32x4::splat(simd, max_score);
+    let mut sum_v = f32x4::splat(simd, 0.0_f32);
+    let (chunks, tail) = scores.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let sv = f32x4::from_slice(simd, chunk);
+        let ev = crate::engine::exp_f32x4(simd, sv - max_v);
+        ev.store_slice(chunk);
+        sum_v += ev;
+    }
+    let mut lanes = [0.0_f32; 4];
+    sum_v.store_slice(&mut lanes);
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for s in tail {
+        *s = (*s - max_score).exp();
+        sum += *s;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return None;
+    }
+    Some(1.0_f32 / sum)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Executes a contiguous range of F32 KV head groups using caller-local score scratch."
+)]
+fn attend_kv_group_range_f32(
+    level: Level,
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    first: usize,
+    frames: usize,
+    stride: usize,
+    kvh_start: usize,
+    kvh_count: usize,
+    width: usize,
+    gqa_ratio: usize,
+    scale: f32,
+    scores: &mut [f32],
+    out_chunk: &mut [f32],
+) -> bool {
+    if gqa_ratio <= 8 {
+        let mut ok = true;
+        dispatch!(level, simd => {
+            for local_kvh in 0..kvh_count {
+                let kvh = kvh_start + local_kvh;
+                let kv_head_off = kvh * width;
+                let qh_base = kvh * gqa_ratio;
+                let mut max_scores = [f32::NEG_INFINITY; 8];
+                for frame in 0..frames {
+                    let offset = (first + frame) * stride + kv_head_off;
+                    let k_row = &keys[offset..offset + width];
+                    for (g, max_slot) in max_scores[..gqa_ratio].iter_mut().enumerate() {
+                        let qh = qh_base + g;
+                        let q_vec = &query[qh * width..(qh + 1) * width];
+                        let s = f32_dot_simd(simd, q_vec, k_row) * scale;
+                        scores[g * frames + frame] = s;
+                        if s > *max_slot {
+                            *max_slot = s;
+                        }
+                    }
+                }
+                let mut inv_sums = [0.0_f32; 8];
+                for g in 0..gqa_ratio {
+                    let Some(inv_sum) = softmax_f32_row_simd(
+                        simd,
+                        &mut scores[g * frames..(g + 1) * frames],
+                        max_scores[g],
+                    ) else {
+                        ok = false;
+                        return;
+                    };
+                    inv_sums[g] = inv_sum;
+                }
+                for frame in 0..frames {
+                    let offset = (first + frame) * stride + kv_head_off;
+                    let v_row = &values[offset..offset + width];
+                    for (g, &inv_sum) in inv_sums[..gqa_ratio].iter().enumerate() {
+                        let local_qh = local_kvh * gqa_ratio + g;
+                        let w = scores[g * frames + frame] * inv_sum;
+                        let out_head = &mut out_chunk[local_qh * width..(local_qh + 1) * width];
+                        axpy_simd(simd, w, v_row, out_head);
+                    }
+                }
+            }
+        });
+        ok
+    } else {
+        let row_scores = &mut scores[..frames];
+        let mut ok = true;
+        dispatch!(level, simd => {
+            for local_kvh in 0..kvh_count {
+                let kvh = kvh_start + local_kvh;
+                let kv_head_off = kvh * width;
+                let qh_base = kvh * gqa_ratio;
+                for g in 0..gqa_ratio {
+                    let qh = qh_base + g;
+                    let local_qh = local_kvh * gqa_ratio + g;
+                    let q_vec = &query[qh * width..(qh + 1) * width];
+                    let mut max_score = f32::NEG_INFINITY;
+                    for (frame, score_slot) in row_scores.iter_mut().enumerate() {
+                        let offset = (first + frame) * stride + kv_head_off;
+                        let k_row = &keys[offset..offset + width];
+                        let s = f32_dot_simd(simd, q_vec, k_row) * scale;
+                        *score_slot = s;
+                        if s > max_score {
+                            max_score = s;
+                        }
+                    }
+                    let Some(inv_sum) = softmax_f32_row_simd(simd, row_scores, max_score) else {
+                        ok = false;
+                        return;
+                    };
+                    let out_head = &mut out_chunk[local_qh * width..(local_qh + 1) * width];
+                    for (frame, &prob_unnorm) in row_scores.iter().enumerate() {
+                        let offset = (first + frame) * stride + kv_head_off;
+                        let v_row = &values[offset..offset + width];
+                        axpy_simd(simd, prob_unnorm * inv_sum, v_row, out_head);
+                    }
+                }
+            }
+        });
+        ok
+    }
 }
 
 #[expect(
@@ -973,6 +1356,7 @@ fn append_attention_into(
     kv_heads: usize,
     width: usize,
     window: Option<usize>,
+    threads: usize,
     state: &mut KvState,
     scores: &mut Vec<f32>,
     output: &mut Vec<f32>,
@@ -1003,39 +1387,71 @@ fn append_attention_into(
     let frames = window.map_or(total, |window| total.min(window));
     let first = total - frames;
     zero_workspace(output, query.len());
-    zero_workspace(scores, frames);
     let scale = 1.0 / count_float(width)?.sqrt();
-    for head in 0..heads {
-        let kv_head = head / (heads / kv_heads);
-        let q = &query[head * width..(head + 1) * width];
-        for (frame, score) in scores.iter_mut().enumerate() {
-            let offset = (first + frame) * stride + kv_head * width;
-            *score = q
-                .iter()
-                .zip(&state.keys[offset..offset + width])
-                .map(|(&a, &b)| a * b)
-                .sum::<f32>()
-                * scale;
-        }
-        let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum = scores
-            .iter_mut()
-            .map(|score| {
-                *score = (*score - maximum).exp();
-                *score
-            })
-            .sum::<f32>();
-        if !sum.is_finite() || sum <= 0.0 {
+    let gqa_ratio = heads / kv_heads;
+    let needed_scores = if gqa_ratio <= 8 {
+        gqa_ratio * frames
+    } else {
+        frames
+    };
+    let level = Level::new();
+    if threads > 1 && kv_heads > 1 && output.len() >= 4 {
+        let group_width = gqa_ratio * width;
+        let had_error = AtomicBool::new(false);
+        crate::engine::row_workers::run_aligned(
+            output,
+            threads,
+            group_width,
+            &|elem_off, out_chunk| {
+                let kvh_start = elem_off / group_width;
+                let kvh_count = out_chunk.len() / group_width;
+                let ok = with_codec_attn_scores(needed_scores, |local_scores| {
+                    attend_kv_group_range_f32(
+                        level,
+                        query,
+                        &state.keys,
+                        &state.values,
+                        first,
+                        frames,
+                        stride,
+                        kvh_start,
+                        kvh_count,
+                        width,
+                        gqa_ratio,
+                        scale,
+                        local_scores,
+                        out_chunk,
+                    )
+                });
+                if !ok {
+                    had_error.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        if had_error.load(Ordering::Relaxed) {
             return Err(invalid());
         }
-        for (frame, score) in scores.iter().enumerate() {
-            let offset = (first + frame) * stride + kv_head * width;
-            for (dst, &value) in output[head * width..(head + 1) * width]
-                .iter_mut()
-                .zip(&state.values[offset..offset + width])
-            {
-                *dst = (score / sum).mul_add(value, *dst);
-            }
+    } else {
+        if scores.len() < needed_scores {
+            scores.resize(needed_scores, 0.0_f32);
+        }
+        if !attend_kv_group_range_f32(
+            level,
+            query,
+            &state.keys,
+            &state.values,
+            first,
+            frames,
+            stride,
+            0,
+            kv_heads,
+            width,
+            gqa_ratio,
+            scale,
+            &mut scores[..needed_scores],
+            output,
+        ) {
+            return Err(invalid());
         }
     }
     if output.iter().any(|value| !value.is_finite()) {
@@ -2783,6 +3199,296 @@ mod tests {
         let repacked_out = repacked_tfm.step(&input, &mut repacked_state)?;
         for (a, b) in repacked_out.iter().zip(&raw_out) {
             assert!((a - b).abs() <= 1e-6, "repacked={a} raw={b}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simd_mimi_append_attention_matches_scalar_and_parallel_bits() -> std::io::Result<()> {
+        let scalar_ref = |query: &[f32],
+                          keys: &[f32],
+                          values: &[f32],
+                          heads: usize,
+                          kv_heads: usize,
+                          width: usize,
+                          window: Option<usize>|
+         -> Vec<f32> {
+            let stride = kv_heads * width;
+            let total = keys.len() / stride;
+            let frames = window.map_or(total, |w| total.min(w));
+            let first = total - frames;
+            let scale = 1.0_f32 / crate::numerics::usize_to_f32(width).sqrt();
+            let gqa = heads / kv_heads;
+            let mut out = vec![0.0_f32; heads * width];
+            for head in 0..heads {
+                let kvh = head / gqa;
+                let q = &query[head * width..(head + 1) * width];
+                let mut scores = Vec::with_capacity(frames);
+                let mut max_s = f32::NEG_INFINITY;
+                for frame in 0..frames {
+                    let off = (first + frame) * stride + kvh * width;
+                    let s = q
+                        .iter()
+                        .zip(&keys[off..off + width])
+                        .map(|(&a, &b)| a * b)
+                        .sum::<f32>()
+                        * scale;
+                    max_s = max_s.max(s);
+                    scores.push(s);
+                }
+                let mut sum = 0.0_f32;
+                for s in &mut scores {
+                    *s = (*s - max_s).exp();
+                    sum += *s;
+                }
+                for (frame, &sc) in scores.iter().enumerate() {
+                    let off = (first + frame) * stride + kvh * width;
+                    for (dst, &val) in out[head * width..(head + 1) * width]
+                        .iter_mut()
+                        .zip(&values[off..off + width])
+                    {
+                        *dst = (sc / sum).mul_add(val, *dst);
+                    }
+                }
+            }
+            out
+        };
+
+        for (heads, kv_heads, width, window) in [
+            (4_usize, 2_usize, 65_usize, Some(7_usize)),
+            (8, 8, 16, None),
+            (10, 1, 17, Some(5)),
+        ] {
+            let stride = kv_heads * width;
+            let mut seq_state = KvState::default();
+            let mut par_state = KvState::default();
+            let mut scores = Vec::new();
+            let mut seq_out = Vec::new();
+            let mut par_out = Vec::new();
+
+            for step in 0..11_usize {
+                let q: Vec<f32> = (0..heads * width)
+                    .map(|i| {
+                        f32::from(i16::try_from((i * 11 + step * 7) % 31).unwrap_or(0) - 15) * 0.05
+                    })
+                    .collect();
+                let k: Vec<f32> = (0..stride)
+                    .map(|i| {
+                        f32::from(i16::try_from((i * 13 + step * 5) % 29).unwrap_or(0) - 14) * 0.04
+                    })
+                    .collect();
+                let v: Vec<f32> = (0..stride)
+                    .map(|i| {
+                        f32::from(i16::try_from((i * 17 + step * 3) % 23).unwrap_or(0) - 11) * 0.03
+                    })
+                    .collect();
+
+                super::append_attention_into(
+                    &q,
+                    &k,
+                    &v,
+                    heads,
+                    kv_heads,
+                    width,
+                    window,
+                    1,
+                    &mut seq_state,
+                    &mut scores,
+                    &mut seq_out,
+                )?;
+                super::append_attention_into(
+                    &q,
+                    &k,
+                    &v,
+                    heads,
+                    kv_heads,
+                    width,
+                    window,
+                    4,
+                    &mut par_state,
+                    &mut scores,
+                    &mut par_out,
+                )?;
+
+                assert_eq!(
+                    par_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    seq_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "parallel vs serial mismatch heads={heads} kv_heads={kv_heads} width={width} step={step}"
+                );
+                assert_eq!(seq_state.keys, par_state.keys);
+                assert_eq!(seq_state.values, par_state.values);
+
+                let expected = scalar_ref(
+                    &q,
+                    &seq_state.keys,
+                    &seq_state.values,
+                    heads,
+                    kv_heads,
+                    width,
+                    window,
+                );
+                for (a, b) in seq_out.iter().zip(&expected) {
+                    assert!((a - b).abs() <= 2e-6, "got={a} want={b}");
+                }
+            }
+        }
+
+        // Verify dot-product overflow to +inf rejects cleanly.
+        let mut overflow_state = KvState::default();
+        let mut scores = Vec::new();
+        let mut out = Vec::new();
+        assert!(
+            super::append_attention_into(
+                &[f32::MAX; 4],
+                &[1e10; 4],
+                &[1.0; 4],
+                2,
+                2,
+                2,
+                None,
+                2,
+                &mut overflow_state,
+                &mut scores,
+                &mut out,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simd_mimi_normalize_gelu_and_scaled_residual_match_scalar_and_overflow_controls()
+    -> std::io::Result<()> {
+        for len in [1_usize, 3, 4, 7, 64, 513] {
+            let input: Vec<f32> = (0..len)
+                .map(|i| f32::from(i16::try_from((i * 13 + 5) % 41).unwrap_or(0) - 20) * 0.075)
+                .collect();
+            let weight: Vec<f32> = (0..len)
+                .map(|i| 0.5 + f32::from(u8::try_from(i % 11).unwrap_or(0)) * 0.1)
+                .collect();
+            let bias: Vec<f32> = (0..len)
+                .map(|i| f32::from(i16::try_from((i * 7) % 19).unwrap_or(0) - 9) * 0.05)
+                .collect();
+
+            // LayerNorm with bias vs scalar f64 reference
+            let got_ln = normalize(&input, &weight, Some(&bias), 1e-5)?;
+            let count = f64::from(u16::try_from(len).map_err(std::io::Error::other)?);
+            let mean = input.iter().map(|&v| f64::from(v)).sum::<f64>() / count;
+            let var = input
+                .iter()
+                .map(|&v| (f64::from(v) - mean).powi(2))
+                .sum::<f64>()
+                / count;
+            let inv = 1.0_f64 / (var + 1e-5_f64).sqrt();
+            for (idx, ((&g, &w), &b)) in got_ln.iter().zip(&weight).zip(&bias).enumerate() {
+                let want = ((f64::from(input[idx]) - mean) * inv) * f64::from(w) + f64::from(b);
+                assert!(
+                    (f64::from(g) - want).abs() <= 2e-6,
+                    "ln len={len} idx={idx} got={g} want={want}"
+                );
+            }
+
+            // RMSNorm without bias vs scalar f64 reference
+            let got_rms = normalize(&input, &weight, None, 1e-5)?;
+            let mean_sq = input.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / count;
+            let inv_rms = 1.0_f64 / (mean_sq + 1e-5_f64).sqrt();
+            for (idx, (&g, &w)) in got_rms.iter().zip(&weight).enumerate() {
+                let want = (f64::from(input[idx]) * inv_rms) * f64::from(w);
+                assert!(
+                    (f64::from(g) - want).abs() <= 2e-6,
+                    "rms len={len} idx={idx} got={g} want={want}"
+                );
+            }
+        }
+
+        // Finite reduction overflow / NaN rejection controls for both LayerNorm and RMSNorm
+        for input in [
+            [f32::MAX; 8],
+            [
+                f32::MAX,
+                -f32::MAX,
+                f32::MAX,
+                -f32::MAX,
+                f32::MAX,
+                -f32::MAX,
+                f32::MAX,
+                -f32::MAX,
+            ],
+        ] {
+            assert!(normalize(&input, &[1.0; 8], Some(&[0.0; 8]), 1.0).is_err());
+            assert!(normalize(&input, &[1.0; 8], None, 1.0).is_err());
+        }
+        assert!(normalize(&[f32::NAN, 0.0, 1.0, 2.0], &[1.0; 4], None, 1e-5).is_err());
+        assert!(normalize(&[1.0; 4], &[1.0; 4], None, 0.0).is_err());
+
+        // GELU erf SIMD vs scalar gelu_erf across 4096 samples + edges
+        let mut samples = vec![
+            0.0_f32,
+            -0.0,
+            1.0,
+            -1.0,
+            2.0,
+            -2.0,
+            10.0,
+            -10.0,
+            20.0,
+            -20.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for i in 0..4096_usize {
+            let v = -20.0_f32 + 40.0_f32 * (f32::from(u16::try_from(i).unwrap_or(0)) / 4095.0_f32);
+            samples.push(v);
+        }
+        let expected_gelu: Vec<f32> = samples.iter().copied().map(gelu_erf).collect();
+        let mut actual_gelu = samples;
+        super::gelu_erf_in_place(&mut actual_gelu);
+        for (idx, (&got, &want)) in actual_gelu.iter().zip(&expected_gelu).enumerate() {
+            if want.is_nan() {
+                assert!(got.is_nan(), "gelu idx={idx} got={got}");
+            } else if want.is_infinite() {
+                assert_eq!(got.to_bits(), want.to_bits(), "gelu idx={idx}");
+            } else {
+                assert!(
+                    (got - want).abs() <= 5e-7,
+                    "gelu idx={idx} got={got} want={want}"
+                );
+            }
+        }
+
+        // Scaled residual add parity across tail lengths
+        for len in [0_usize, 1, 3, 4, 13, 67] {
+            let init: Vec<f32> = (0..len)
+                .map(|i| f32::from(u8::try_from(i).unwrap_or(0)) * 0.25)
+                .collect();
+            let val: Vec<f32> = (0..len)
+                .map(|i| {
+                    f32::from(i8::try_from(i32::try_from(i % 19).unwrap_or(0) - 9).unwrap_or(0))
+                        * 0.1
+                })
+                .collect();
+            let scale: Vec<f32> = (0..len)
+                .map(|i| {
+                    f32::from(
+                        i8::try_from(i32::try_from((i * 3) % 17).unwrap_or(0) - 8).unwrap_or(0),
+                    ) * 0.2
+                })
+                .collect();
+            let mut got = init.clone();
+            super::scaled_residual_add(&mut got, &val, &scale);
+            for (idx, ((&g, &a), (&v, &s))) in got
+                .iter()
+                .zip(&init)
+                .zip(val.iter().zip(&scale))
+                .enumerate()
+            {
+                let want = v.mul_add(s, a);
+                assert!(
+                    (g - want).abs() <= 1e-6,
+                    "res len={len} idx={idx} got={g} want={want}"
+                );
+            }
         }
         Ok(())
     }
