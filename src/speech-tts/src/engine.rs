@@ -2053,10 +2053,44 @@ fn normalize_heads_in_place(
     Ok(())
 }
 
-fn swiglu_in_place(gate: &mut [f32], up: &[f32]) {
-    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+#[inline(always)]
+fn swiglu_slice_simd<S: Simd>(simd: S, gate: &mut [f32], up: &[f32]) {
+    let zero = f32x4::splat(simd, 0.0_f32);
+    let one = f32x4::splat(simd, 1.0_f32);
+    let n = gate.len().min(up.len());
+    let (g_chunks, g_tail) = gate[..n].as_chunks_mut::<4>();
+    let (u_chunks, u_tail) = up[..n].as_chunks::<4>();
+    for (gc, uc) in g_chunks.iter_mut().zip(u_chunks) {
+        let gv = f32x4::from_slice(simd, gc);
+        let uv = f32x4::from_slice(simd, uc);
+        // Evaluate exp(-|g|) <= 0 so exp_f32x4 never overflows its k <= 127 exponent range.
+        let e = exp_f32x4(simd, -gv.abs());
+        let num = gv.simd_lt(zero).select(gv * e, gv);
+        let silu = num / (one + e);
+        (silu * uv).store_slice(gc);
+    }
+    for (g, &u) in g_tail.iter_mut().zip(u_tail) {
         let silu = *g / (1.0_f32 + (-*g).exp());
         *g = silu * u;
+    }
+}
+
+pub(crate) fn swiglu_in_place(gate: &mut [f32], up: &[f32]) {
+    let level = Level::new();
+    dispatch!(level, simd => swiglu_slice_simd(simd, gate, up));
+}
+
+pub(crate) fn swiglu_in_place_parallel(gate: &mut [f32], up: &[f32], workers: usize) {
+    const PARALLEL_SWIGLU_THRESHOLD: usize = 4096;
+    let n = gate.len().min(up.len());
+    if workers > 1 && n >= PARALLEL_SWIGLU_THRESHOLD {
+        let level = Level::new();
+        row_workers::run_aligned(&mut gate[..n], workers, 4, &|offset, g_chunk| {
+            let u_chunk = &up[offset..offset + g_chunk.len()];
+            dispatch!(level, simd => swiglu_slice_simd(simd, g_chunk, u_chunk));
+        });
+    } else {
+        swiglu_in_place(&mut gate[..n], &up[..n]);
     }
 }
 
@@ -2753,7 +2787,7 @@ impl QwenDecoderLayer {
                 workers,
                 &mut up_all,
             )?;
-            swiglu_in_place(&mut gate_all, &up_all);
+            swiglu_in_place_parallel(&mut gate_all, &up_all, workers);
             self.down_proj.forward_batch_into(
                 &gate_all,
                 seq_len,
@@ -2778,7 +2812,7 @@ impl QwenDecoderLayer {
 }
 
 #[inline(always)]
-fn exp_f32x4<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
+pub(crate) fn exp_f32x4<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
     // Cody-Waite range reduction by ln(2) = LN2_HI + LN2_LO (15-bit HI so k * LN2_HI is exact
     // for |k| <= 512) paired with a degree-6 minimax polynomial on [-ln(2)/2, ln(2)/2] with
     // exact c0 = 1.0 and c1 = 1.0 so exp(0.0) == 1.0 exactly.
@@ -4335,5 +4369,100 @@ mod tests {
         }
         assert_eq!(first[0], 3);
         Ok(())
+    }
+
+    #[test]
+    fn swiglu_in_place_and_parallel_match_scalar_and_preserve_nonfinite_edge_cases() {
+        let scalar_swiglu = |gate: &mut [f32], up: &[f32]| {
+            for (g, &u) in gate.iter_mut().zip(up.iter()) {
+                let silu = *g / (1.0_f32 + (-*g).exp());
+                *g = silu * u;
+            }
+        };
+
+        for len in [0_usize, 1, 3, 4, 5, 7, 15, 64, 4095, 4096, 4097, 8195] {
+            let gate_init: Vec<f32> = (0..len)
+                .map(|i| {
+                    let centered = i32::try_from(i % 241).unwrap_or(0) - 120;
+                    f32::from(i16::try_from(centered).unwrap_or(0)) * 0.125
+                })
+                .collect();
+            let up: Vec<f32> = (0..len)
+                .map(|i| {
+                    let centered = i32::try_from((i * 7 + 3) % 101).unwrap_or(0) - 50;
+                    f32::from(i16::try_from(centered).unwrap_or(0)) * 0.05
+                })
+                .collect();
+
+            let mut expected = gate_init.clone();
+            scalar_swiglu(&mut expected, &up);
+
+            let mut actual = gate_init.clone();
+            super::swiglu_in_place(&mut actual, &up);
+
+            let mut parallel = gate_init;
+            super::swiglu_in_place_parallel(&mut parallel, &up, 4);
+
+            for (idx, ((&want, &got), &par)) in
+                expected.iter().zip(&actual).zip(&parallel).enumerate()
+            {
+                assert!(
+                    (got - want).abs() <= 1e-6,
+                    "len={len} idx={idx} got={got} want={want}"
+                );
+                assert_eq!(
+                    par.to_bits(),
+                    got.to_bits(),
+                    "len={len} idx={idx} parallel mismatch"
+                );
+            }
+        }
+
+        // Verify exact behavior on 0.0, -0.0, extreme finite magnitudes, +-inf, and NaN.
+        let edge_gate = [
+            0.0_f32,
+            -0.0,
+            88.0,
+            100.0,
+            -87.0,
+            -88.0,
+            -100.0,
+            -1000.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            1.5,
+        ];
+        let edge_up = [
+            1.0_f32,
+            2.0,
+            -0.5,
+            0.25,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            f32::NAN,
+        ];
+        let mut edge_expected = edge_gate;
+        scalar_swiglu(&mut edge_expected, &edge_up);
+        let mut edge_actual = edge_gate;
+        super::swiglu_in_place(&mut edge_actual, &edge_up);
+
+        for (idx, (&want, &got)) in edge_expected.iter().zip(&edge_actual).enumerate() {
+            if want.is_nan() {
+                assert!(got.is_nan(), "idx={idx} expected NaN got={got}");
+            } else if want.is_infinite() {
+                assert_eq!(got.to_bits(), want.to_bits(), "idx={idx}");
+            } else {
+                assert!(
+                    (got - want).abs() <= 1e-6,
+                    "idx={idx} got={got} want={want}"
+                );
+            }
+        }
     }
 }
