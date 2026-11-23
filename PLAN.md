@@ -661,9 +661,10 @@ adoption decisions without displacing native daily-use acceptance.
   human review and held-out tasks without importing its Python/cloud-judge harness
   or claiming leaderboard equivalence for a shortened packet.
   Include opt-in equal-resource comparisons of [DeepConf](docs/research-register.md#decoding-samplers-and-test-time-scaling)
-  (online sliding-window logprob confidence stopping/weighted voting; offline pure-Rust
-  tracker/consensus primitives landed in `tools/bonsai/src/calibration_metrics.rs`, with
-  per-token Prism SSE logprob streaming remaining a prerequisite) and
+  (online sliding-window logprob confidence stopping and RSA Multi-Draft Synthesis now wired across
+  `prism-inference`, `prism-inference-server` opt-in SSE `logprobs`, and `bonsai-chat` `client/sse.rs`
+  + `client/effort.rs` alongside offline primitives in `tools/bonsai/src/calibration_metrics.rs`;
+  live 27B model quality and resource comparisons on X1/X2 remain open) and
   [Recursive Self-Aggregation (RSA)](docs/research-register.md#decoding-samplers-and-test-time-scaling)
   (iterative multi-draft synthesis for open-ended prose/planning) alongside current 3-stage
   [Extra effort](docs/inference-defaults.md#experimental-extra-effort-mode).
@@ -707,8 +708,12 @@ adoption decisions without displacing native daily-use acceptance.
 
 ### Writing context
 
-- [ ] After creative-chat acceptance, implement a small native story-fact and
-  scene-context packet system using [Spindle and SillyTavern design references](docs/research-register.md#native-application-and-writing-references).
+- [ ] After creative-chat acceptance, qualify the native persistent-instructions and
+  deterministic keyword-triggered context-card system (`bonsai-chat` `context_cards.rs`
+  and Settings -> Memory now implement pinned-first prefix-stable ordering, Unicode
+  boundary triggers, inclusion/exclusion diagnostics, control-token exclusion, strict
+  token budget, Context Ring accounting, and DPAPI persistence; live broker/model
+  scene-continuity review remains open) using [Spindle and SillyTavern design references](docs/research-register.md#native-application-and-writing-references).
   Use explicit approved facts, deterministic activation/priority, inclusion and
   exclusion reasons, and a bounded token budget with authoritative broker
   counting. Require reviewed canon changes; preserve branch ownership, encrypted
@@ -1222,11 +1227,12 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   [`TempQuant`](docs/research-register.md#decoding-samplers-and-test-time-scaling)
   temperature/`top_p` recalibration (`fit_tempquant_temperature` /
   `fit_tempquant_top_p` pure-Rust offline fitters landed in
-  `tools/bonsai/src/calibration_metrics.rs`), and opt-in decode-time anti-slop
-  cliché suppression separately from effort. Qualify any exposed effort or soft
-  `</think>` `ReasoningBudget` control through `prism-inference` `SwiftChatSession` /
-  `native_swift`, native Settings, persistence, broker canonical count/generation bodies,
-  exact context reservation and runtime effective-setting confirmation; preserve current
+  `tools/bonsai/src/calibration_metrics.rs`), and opt-in decode-time DRY anti-repetition
+  separately from effort. Qualify the exposed effort (`low`/`medium`/`xhigh`), soft
+  `</think>` `ReasoningBudget`, calibrated sampling preset, and DRY controls (source path now
+  implemented end-to-end across `prism-inference`, `prism-inference-server`, `bonsai-broker`,
+  and `bonsai-chat`, gated by runtime capability discovery so pinned `0.1.34` remains byte-identical)
+  through exact context reservation and live X1/X2 device comparisons; preserve current
   defaults. Review reasoning replay policy as a separate context/quality tradeoff
   rather than dropping it silently. Count complete answers, truncation,
   useful-answer latency and RAM; shorter reasoning or fewer tokens alone cannot
@@ -1241,9 +1247,12 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Close selected-profile packed-attention, scalar/NEON, exact quantized
   checkpoint, prefix/adapter/cancellation and discovery-inventory gates. Charge
   scales, rotations, scratch and retained copies; preserve FP32 GDN/conv state.
-- [ ] Qualify Prism's explicit `rsq4vf` fitted-value scale candidate against
+- [ ] Qualify Prism's explicit `rsq4vf` fitted-value and `rsq4kvf` scale–code co-optimized
+  (`K`+`V`, codec v3, `262,144`-token ceiling in source across `prism-inference`,
+  `bonsai-cpu-policy`, and `bonsai-broker` release-gate) candidates against
   unchanged `rsq4`: bounded native encoding/whole-request cost and held-out
-  quality under K1's source, power and budget controls. Its guarded rotated
+  quality under K1's source, power and budget controls (hosted CI and live X1/X2 device
+  qualification remain pending). Its guarded rotated
   reconstruction improvement and unchanged record size do not qualify answer
   quality or a default change. See the [candidate contract](docs/quantized-kv.md#fitted-value-scale-candidate).
   Screening audit `#1` (`ClampedL2` reference identity) is closed; deferred item `#21`
