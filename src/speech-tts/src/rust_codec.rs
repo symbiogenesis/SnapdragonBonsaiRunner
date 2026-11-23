@@ -242,6 +242,24 @@ struct TransformerLayer {
     ffn_scale: Vec<f32>,
 }
 
+impl TransformerLayer {
+    fn repack_q4_k_if_aligned(&mut self) {
+        for proj in [
+            &mut self.q,
+            &mut self.k,
+            &mut self.v,
+            &mut self.output,
+            &mut self.up,
+            &mut self.down,
+        ] {
+            proj.repack_q4_k_if_aligned();
+        }
+        if let Some(gate) = &mut self.gate {
+            gate.repack_q4_k_if_aligned();
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct KvState {
     keys: Vec<f32>,
@@ -408,7 +426,7 @@ fn load_transformer_layer<S: CodecSource + ?Sized>(
     decoder: bool,
 ) -> io::Result<TransformerLayer> {
     let name = format!("{prefix}.blk.{index}");
-    Ok(TransformerLayer {
+    let mut layer = TransformerLayer {
         norm: weights.tensor_f32(&format!("{name}.attn_norm.weight"), &[hidden])?,
         norm_bias: if decoder {
             None
@@ -454,7 +472,9 @@ fn load_transformer_layer<S: CodecSource + ?Sized>(
         up: projection(weights, &format!("{name}.ffn_up"), hidden, intermediate)?,
         down: projection(weights, &format!("{name}.ffn_down"), intermediate, hidden)?,
         ffn_scale: weights.tensor_f32(&format!("{name}.ffn_scale"), &[hidden])?,
-    })
+    };
+    layer.repack_q4_k_if_aligned();
+    Ok(layer)
 }
 
 struct TransformerGeometry {
@@ -535,19 +555,23 @@ impl Transformer {
         if decoder {
             let latent = dimension(weights, &format!("{}.latent_dim", geom.metadata))?;
             let window = dimension(weights, &format!("{}.sliding_window", geom.metadata))?;
+            let mut input_proj = biased_projection(
+                weights,
+                &format!("{}.input_proj", geom.prefix),
+                latent,
+                geom.hidden,
+            )?;
+            input_proj.repack_q4_k_if_aligned();
+            let mut output_proj = biased_projection(
+                weights,
+                &format!("{}.output_proj", geom.prefix),
+                geom.hidden,
+                latent,
+            )?;
+            output_proj.repack_q4_k_if_aligned();
             Ok((
-                Some(biased_projection(
-                    weights,
-                    &format!("{}.input_proj", geom.prefix),
-                    latent,
-                    geom.hidden,
-                )?),
-                Some(biased_projection(
-                    weights,
-                    &format!("{}.output_proj", geom.prefix),
-                    geom.hidden,
-                    latent,
-                )?),
+                Some(input_proj),
+                Some(output_proj),
                 Some(weights.tensor_f32(&format!("{}.norm.weight", geom.prefix), &[geom.hidden])?),
                 Some(window),
             ))
@@ -2634,6 +2658,131 @@ mod tests {
         {
             assert_eq!(a.keys, b.keys);
             assert_eq!(a.values, b.values);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mimi_transformer_repacks_aligned_q4_k_projections_with_parity() -> std::io::Result<()> {
+        let make_q4_proj = |name: &str, in_dim: usize, out_dim: usize, seed: usize| {
+            let blocks_per_row = in_dim / 256;
+            let mut bytes = Vec::with_capacity(out_dim * blocks_per_row * 144);
+            for row in 0..out_dim {
+                for blk in 0..blocks_per_row {
+                    let d =
+                        0.01_f32 * f32::from(u8::try_from((seed + row + blk) % 7 + 1).unwrap_or(1));
+                    let dmin = 0.002_f32
+                        * f32::from(u8::try_from((seed + row * 3 + blk) % 5 + 1).unwrap_or(1));
+                    bytes.extend_from_slice(&bonsai_ternary::float_to_half(d).to_le_bytes());
+                    bytes.extend_from_slice(&bonsai_ternary::float_to_half(dmin).to_le_bytes());
+                    for i in 0..12 {
+                        bytes.push(
+                            u8::try_from((seed * 13 + row * 7 + blk * 11 + i * 17) % 251)
+                                .unwrap_or(0),
+                        );
+                    }
+                    for i in 0..128 {
+                        bytes.push(
+                            u8::try_from((seed * 31 + row * 19 + blk * 23 + i * 37) % 256)
+                                .unwrap_or(0),
+                        );
+                    }
+                }
+            }
+            crate::engine::LinearProjection::new(
+                name,
+                in_dim,
+                out_dim,
+                crate::engine::WeightQuantization::Packed {
+                    ggml_type: 12,
+                    bytes,
+                },
+                None,
+            )
+        };
+
+        let hidden = 256_usize;
+        let raw_layer = super::TransformerLayer {
+            norm: vec![1.0; hidden],
+            norm_bias: Some(vec![0.01; hidden]),
+            q: make_q4_proj("tok_enc.blk.0.attn_q.weight", hidden, hidden, 1)?,
+            k: make_q4_proj("tok_enc.blk.0.attn_k.weight", hidden, hidden, 2)?,
+            v: make_q4_proj("tok_enc.blk.0.attn_v.weight", hidden, hidden, 3)?,
+            output: make_q4_proj("tok_enc.blk.0.attn_output.weight", hidden, hidden, 4)?,
+            attn_scale: vec![0.9; hidden],
+            ffn_norm: vec![1.0; hidden],
+            ffn_bias: Some(vec![0.02; hidden]),
+            gate: Some(make_q4_proj(
+                "tok_enc.blk.0.ffn_gate.weight",
+                hidden,
+                hidden,
+                5,
+            )?),
+            up: make_q4_proj("tok_enc.blk.0.ffn_up.weight", hidden, hidden, 6)?,
+            down: make_q4_proj("tok_enc.blk.0.ffn_down.weight", hidden, hidden, 7)?,
+            ffn_scale: vec![0.8; hidden],
+        };
+        let mut repacked_layer = super::TransformerLayer {
+            norm: raw_layer.norm.clone(),
+            norm_bias: raw_layer.norm_bias.clone(),
+            q: raw_layer.q.clone(),
+            k: raw_layer.k.clone(),
+            v: raw_layer.v.clone(),
+            output: raw_layer.output.clone(),
+            attn_scale: raw_layer.attn_scale.clone(),
+            ffn_norm: raw_layer.ffn_norm.clone(),
+            ffn_bias: raw_layer.ffn_bias.clone(),
+            gate: raw_layer.gate.clone(),
+            up: raw_layer.up.clone(),
+            down: raw_layer.down.clone(),
+            ffn_scale: raw_layer.ffn_scale.clone(),
+        };
+        repacked_layer.repack_q4_k_if_aligned();
+        if bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            for proj in [
+                &repacked_layer.q,
+                &repacked_layer.k,
+                &repacked_layer.v,
+                &repacked_layer.output,
+                &repacked_layer.up,
+                &repacked_layer.down,
+            ] {
+                assert!(matches!(
+                    proj.weight,
+                    crate::engine::WeightQuantization::RepackedQ4K8 { .. }
+                ));
+            }
+            assert!(matches!(
+                repacked_layer.gate.as_ref().map(|g| &g.weight),
+                Some(crate::engine::WeightQuantization::RepackedQ4K8 { .. })
+            ));
+        }
+
+        let make_tfm = |layer| super::Transformer {
+            threads: 2,
+            hidden,
+            heads: 4,
+            kv_heads: 4,
+            head_dim: 64,
+            window: Some(8),
+            theta: 10_000.0,
+            eps: 1e-5,
+            input: None,
+            output: None,
+            final_norm: None,
+            layers: vec![layer],
+        };
+        let raw_tfm = make_tfm(raw_layer);
+        let repacked_tfm = make_tfm(repacked_layer);
+        let mut raw_state = super::TransformerState::default();
+        let mut repacked_state = super::TransformerState::default();
+        let input: Vec<f32> = (0..hidden)
+            .map(|i| f32::from(i16::try_from((i * 13) % 31).unwrap_or(0) - 15) * 0.05)
+            .collect();
+        let raw_out = raw_tfm.step(&input, &mut raw_state)?;
+        let repacked_out = repacked_tfm.step(&input, &mut repacked_state)?;
+        for (a, b) in repacked_out.iter().zip(&raw_out) {
+            assert!((a - b).abs() <= 1e-6, "repacked={a} raw={b}");
         }
         Ok(())
     }

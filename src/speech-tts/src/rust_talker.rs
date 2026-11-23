@@ -101,13 +101,17 @@ fn load_talker_globals(
     text_dim: usize,
 ) -> io::Result<TalkerGlobals> {
     let mut text_fc1 = weights.projection("talker.text_proj.fc1.weight", text_dim, text_dim)?;
+    text_fc1.repack_q4_k_if_aligned();
     text_fc1.bias = Some(weights.tensor_f32("talker.text_proj.fc1.bias", &[text_dim])?);
     let mut text_fc2 =
         weights.projection("talker.text_proj.fc2.weight", text_dim, geometry.hidden)?;
+    text_fc2.repack_q4_k_if_aligned();
     text_fc2.bias = Some(weights.tensor_f32("talker.text_proj.fc2.bias", &[geometry.hidden])?);
     let codec_embedding =
         weights.projection("talker.codec_embd.weight", geometry.hidden, geometry.vocab)?;
-    let head = weights.projection("talker.codec_head.weight", geometry.hidden, geometry.vocab)?;
+    let mut head =
+        weights.projection("talker.codec_head.weight", geometry.hidden, geometry.vocab)?;
+    head.repack_q4_k_if_aligned();
     let norm = weights.tensor_f32("talker.output_norm.weight", &[geometry.hidden])?;
     let mtp_proj = if predictor_geometry.hidden == geometry.hidden {
         None
@@ -117,6 +121,7 @@ fn load_talker_globals(
             geometry.hidden,
             predictor_geometry.hidden,
         )?;
+        projection.repack_q4_k_if_aligned();
         projection.bias =
             Some(weights.tensor_f32("code_pred.mtp_proj.bias", &[predictor_geometry.hidden])?);
         Some(projection)
@@ -146,11 +151,12 @@ fn load_codebook_pair(
         hidden,
         cp_vocab,
     )?;
-    let head = weights.projection(
+    let mut head = weights.projection(
         &format!("code_pred.lm_head.{codebook}.weight"),
         cp_hidden,
         cp_vocab,
     )?;
+    head.repack_q4_k_if_aligned();
     Ok((embd, head))
 }
 
@@ -491,11 +497,9 @@ impl Talker {
                     text_dim,
                 )?))
             } else if task < cp_start {
-                Ok(TalkerLoadItem::Layer(geometry.load_layer(
-                    weights,
-                    "talker",
-                    task - layer_start,
-                )?))
+                let mut layer = geometry.load_layer(weights, "talker", task - layer_start)?;
+                layer.repack_q4_k_if_aligned();
+                Ok(TalkerLoadItem::Layer(layer))
             } else if task < codebook_start {
                 let mut layer =
                     predictor_geometry.load_layer(weights, "code_pred", task - cp_start)?;
@@ -2037,6 +2041,484 @@ pub(crate) mod tests {
             row_bits(&cold_changed.trailing)
         );
         assert_eq!(warm_changed.cacheable_rows, cold_changed.cacheable_rows);
+        Ok(())
+    }
+
+    struct TempGguf(std::path::PathBuf);
+    impl Drop for TempGguf {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn make_q4_k_matrix(in_dim: usize, out_dim: usize, seed: usize) -> Vec<u8> {
+        let blocks_per_row = in_dim / 256;
+        let mut bytes = Vec::with_capacity(out_dim * blocks_per_row * 144);
+        for row in 0..out_dim {
+            for blk in 0..blocks_per_row {
+                let d = 0.01_f32 * f32::from(u8::try_from((seed + row + blk) % 7 + 1).unwrap_or(1));
+                let dmin = 0.003_f32
+                    * f32::from(u8::try_from((seed + row * 3 + blk) % 5 + 1).unwrap_or(1));
+                bytes.extend_from_slice(&bonsai_ternary::float_to_half(d).to_le_bytes());
+                bytes.extend_from_slice(&bonsai_ternary::float_to_half(dmin).to_le_bytes());
+                for i in 0..12 {
+                    bytes.push(
+                        u8::try_from((seed * 13 + row * 7 + blk * 11 + i * 17) % 251).unwrap_or(0),
+                    );
+                }
+                for i in 0..128 {
+                    bytes.push(
+                        u8::try_from((seed * 31 + row * 19 + blk * 23 + i * 37) % 256).unwrap_or(0),
+                    );
+                }
+            }
+        }
+        bytes
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Builds one complete self-contained Q4_K GGUF fixture to exercise every Talker and CodePredictor projection."
+    )]
+    #[test]
+    fn load_repacks_all_talker_and_predictor_projections_without_touching_embeddings()
+    -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        enum MetaVal<'a> {
+            Str(&'a str),
+            U32(u32),
+            F32(f32),
+        }
+
+        let push_str = |buf: &mut Vec<u8>, s: &str| -> std::io::Result<()> {
+            buf.extend_from_slice(
+                &u64::try_from(s.len())
+                    .map_err(std::io::Error::other)?
+                    .to_le_bytes(),
+            );
+            buf.extend_from_slice(s.as_bytes());
+            Ok(())
+        };
+
+        let meta: &[(&str, MetaVal<'_>)] = &[
+            ("qwen3-tts.model_type", MetaVal::Str("voice_design")),
+            ("qwen3-tts.num_code_groups", MetaVal::U32(16)),
+            ("qwen3-tts.talker.embedding_length", MetaVal::U32(256)),
+            ("qwen3-tts.talker.feed_forward_length", MetaVal::U32(256)),
+            ("qwen3-tts.talker.block_count", MetaVal::U32(1)),
+            ("qwen3-tts.talker.attention.head_count", MetaVal::U32(2)),
+            ("qwen3-tts.talker.attention.head_count_kv", MetaVal::U32(2)),
+            ("qwen3-tts.talker.attention.key_length", MetaVal::U32(128)),
+            ("qwen3-tts.talker.vocab_size", MetaVal::U32(1032)),
+            ("qwen3-tts.talker.rope.freq_base", MetaVal::F32(1_000_000.0)),
+            (
+                "qwen3-tts.talker.attention.layer_norm_rms_epsilon",
+                MetaVal::F32(1e-6),
+            ),
+            ("qwen3-tts.talker.text_vocab_size", MetaVal::U32(8)),
+            ("qwen3-tts.code_pred.embedding_length", MetaVal::U32(512)),
+            ("qwen3-tts.code_pred.feed_forward_length", MetaVal::U32(512)),
+            ("qwen3-tts.code_pred.block_count", MetaVal::U32(1)),
+            ("qwen3-tts.code_pred.attention.head_count", MetaVal::U32(4)),
+            (
+                "qwen3-tts.code_pred.attention.head_count_kv",
+                MetaVal::U32(4),
+            ),
+            (
+                "qwen3-tts.code_pred.attention.key_length",
+                MetaVal::U32(128),
+            ),
+            ("qwen3-tts.code_pred.vocab_size", MetaVal::U32(8)),
+            (
+                "qwen3-tts.code_pred.rope.freq_base",
+                MetaVal::F32(1_000_000.0),
+            ),
+            (
+                "qwen3-tts.code_pred.attention.layer_norm_rms_epsilon",
+                MetaVal::F32(1e-6),
+            ),
+            ("qwen3-tts.codec.pad_id", MetaVal::U32(0)),
+            ("qwen3-tts.codec.bos_id", MetaVal::U32(1)),
+            ("qwen3-tts.codec.eos_id", MetaVal::U32(2)),
+            ("qwen3-tts.codec.nothink_id", MetaVal::U32(3)),
+            ("qwen3-tts.codec.think_bos_id", MetaVal::U32(4)),
+            ("qwen3-tts.codec.think_eos_id", MetaVal::U32(5)),
+            ("qwen3-tts.text.tts_pad_id", MetaVal::U32(0)),
+            ("qwen3-tts.text.tts_bos_id", MetaVal::U32(1)),
+            ("qwen3-tts.text.tts_eos_id", MetaVal::U32(2)),
+        ];
+
+        struct TensorSpec {
+            name: String,
+            shape: Vec<u64>,
+            kind: u32,
+            data: Vec<u8>,
+        }
+        let mut specs = Vec::new();
+        let mut seed = 1_usize;
+        let q4_spec = |name: String, in_dim: usize, out_dim: usize, seed: &mut usize| {
+            let data = make_q4_k_matrix(in_dim, out_dim, *seed);
+            *seed += 1;
+            TensorSpec {
+                name,
+                shape: vec![
+                    u64::try_from(in_dim).unwrap_or(0),
+                    u64::try_from(out_dim).unwrap_or(0),
+                ],
+                kind: 12,
+                data,
+            }
+        };
+        let f32_spec = |name: String, len: usize, fill: f32| {
+            let mut data = Vec::with_capacity(len * 4);
+            for i in 0..len {
+                let v = fill + f32::from(u8::try_from(i % 7).unwrap_or(0)) * 0.01;
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            TensorSpec {
+                name,
+                shape: vec![u64::try_from(len).unwrap_or(0)],
+                kind: 0,
+                data,
+            }
+        };
+
+        specs.push(q4_spec(
+            "talker.text_embd.weight".to_owned(),
+            256,
+            8,
+            &mut seed,
+        ));
+        specs.push(q4_spec(
+            "talker.text_proj.fc1.weight".to_owned(),
+            256,
+            256,
+            &mut seed,
+        ));
+        specs.push(f32_spec("talker.text_proj.fc1.bias".to_owned(), 256, 0.01));
+        specs.push(q4_spec(
+            "talker.text_proj.fc2.weight".to_owned(),
+            256,
+            256,
+            &mut seed,
+        ));
+        specs.push(f32_spec("talker.text_proj.fc2.bias".to_owned(), 256, -0.02));
+        specs.push(q4_spec(
+            "talker.codec_embd.weight".to_owned(),
+            256,
+            1032,
+            &mut seed,
+        ));
+        specs.push(q4_spec(
+            "talker.codec_head.weight".to_owned(),
+            256,
+            1032,
+            &mut seed,
+        ));
+        specs.push(f32_spec("talker.output_norm.weight".to_owned(), 256, 1.0));
+        specs.push(q4_spec(
+            "code_pred.mtp_proj.weight".to_owned(),
+            256,
+            512,
+            &mut seed,
+        ));
+        specs.push(f32_spec("code_pred.mtp_proj.bias".to_owned(), 512, 0.02));
+        specs.push(f32_spec(
+            "code_pred.output_norm.weight".to_owned(),
+            512,
+            1.0,
+        ));
+        for suffix in [
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ] {
+            specs.push(q4_spec(
+                format!("talker.blk.0.{suffix}.weight"),
+                256,
+                256,
+                &mut seed,
+            ));
+            specs.push(q4_spec(
+                format!("code_pred.blk.0.{suffix}.weight"),
+                512,
+                512,
+                &mut seed,
+            ));
+        }
+        specs.push(f32_spec(
+            "talker.blk.0.attn_norm.weight".to_owned(),
+            256,
+            1.0,
+        ));
+        specs.push(f32_spec(
+            "talker.blk.0.ffn_norm.weight".to_owned(),
+            256,
+            1.0,
+        ));
+        specs.push(f32_spec(
+            "talker.blk.0.attn_q_norm.weight".to_owned(),
+            128,
+            1.0,
+        ));
+        specs.push(f32_spec(
+            "talker.blk.0.attn_k_norm.weight".to_owned(),
+            128,
+            1.0,
+        ));
+        specs.push(f32_spec(
+            "code_pred.blk.0.attn_norm.weight".to_owned(),
+            512,
+            1.0,
+        ));
+        specs.push(f32_spec(
+            "code_pred.blk.0.ffn_norm.weight".to_owned(),
+            512,
+            1.0,
+        ));
+        specs.push(f32_spec(
+            "code_pred.blk.0.attn_q_norm.weight".to_owned(),
+            128,
+            1.0,
+        ));
+        specs.push(f32_spec(
+            "code_pred.blk.0.attn_k_norm.weight".to_owned(),
+            128,
+            1.0,
+        ));
+        for cb in 0..15_usize {
+            specs.push(q4_spec(
+                format!("code_pred.codec_embd.{cb}.weight"),
+                256,
+                8,
+                &mut seed,
+            ));
+            specs.push(q4_spec(
+                format!("code_pred.lm_head.{cb}.weight"),
+                512,
+                8,
+                &mut seed,
+            ));
+        }
+
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(
+            &u64::try_from(specs.len())
+                .map_err(std::io::Error::other)?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(
+            &u64::try_from(meta.len())
+                .map_err(std::io::Error::other)?
+                .to_le_bytes(),
+        );
+        for (key, val) in meta {
+            push_str(&mut bytes, key)?;
+            match val {
+                MetaVal::Str(s) => {
+                    bytes.extend_from_slice(&8_u32.to_le_bytes());
+                    push_str(&mut bytes, s)?;
+                }
+                MetaVal::U32(v) => {
+                    bytes.extend_from_slice(&4_u32.to_le_bytes());
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                MetaVal::F32(v) => {
+                    bytes.extend_from_slice(&6_u32.to_le_bytes());
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        let mut payload = Vec::new();
+        for spec in &specs {
+            let offset = u64::try_from(payload.len()).map_err(std::io::Error::other)?;
+            push_str(&mut bytes, &spec.name)?;
+            bytes.extend_from_slice(
+                &u32::try_from(spec.shape.len())
+                    .map_err(std::io::Error::other)?
+                    .to_le_bytes(),
+            );
+            for dim in &spec.shape {
+                bytes.extend_from_slice(&dim.to_le_bytes());
+            }
+            bytes.extend_from_slice(&spec.kind.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            payload.extend_from_slice(&spec.data);
+            payload.resize(payload.len().next_multiple_of(32), 0);
+        }
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
+        bytes.extend_from_slice(&payload);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "Bonsai-TalkerRepack-{}-{nonce}.gguf",
+            std::process::id()
+        ));
+        let fixture = TempGguf(path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&fixture.0)?
+            .write_all(&bytes)?;
+
+        let weights = crate::weights::Weights::open(&fixture.0)?;
+        let mut tokenizer = Tokenizer::new();
+        tokenizer.finish()?;
+        let talker = Talker::load(&weights, tokenizer, 2)?;
+
+        let has_dotprod = bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod;
+        let is_repacked = |proj: &LinearProjection| {
+            matches!(proj.weight, WeightQuantization::RepackedQ4K8 { .. })
+        };
+
+        assert!(!is_repacked(&talker.text_embedding));
+        assert!(!is_repacked(&talker.codec_embedding));
+        for embd in &talker.predictor.codec_embeddings {
+            assert!(!is_repacked(embd));
+        }
+
+        // Verify embedding row lookups still succeed on un-repacked tables.
+        let mut emb_row = vec![0.0_f32; 256];
+        talker.text_embedding.row_into(3, &mut emb_row)?;
+        talker.codec_embedding.add_row_into(7, &mut emb_row)?;
+        talker.predictor.codec_embeddings[0].add_row_into(2, &mut emb_row)?;
+
+        if has_dotprod {
+            assert!(is_repacked(&talker.text_fc1));
+            assert!(is_repacked(&talker.text_fc2));
+            assert!(is_repacked(&talker.head));
+            let mtp = talker
+                .predictor
+                .mtp_proj
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("missing mtp_proj"))?;
+            assert!(is_repacked(mtp));
+            for proj in [
+                &talker.layers[0].q_proj,
+                &talker.layers[0].k_proj,
+                &talker.layers[0].v_proj,
+                &talker.layers[0].o_proj,
+                &talker.layers[0].gate_proj,
+                &talker.layers[0].up_proj,
+                &talker.layers[0].down_proj,
+                &talker.predictor.layers[0].q_proj,
+                &talker.predictor.layers[0].k_proj,
+                &talker.predictor.layers[0].v_proj,
+                &talker.predictor.layers[0].o_proj,
+                &talker.predictor.layers[0].gate_proj,
+                &talker.predictor.layers[0].up_proj,
+                &talker.predictor.layers[0].down_proj,
+            ] {
+                assert!(
+                    is_repacked(proj),
+                    "expected repacked Q4_K for {}",
+                    proj.name
+                );
+            }
+            for head in &talker.predictor.lm_heads {
+                assert!(
+                    is_repacked(head),
+                    "expected repacked Q4_K for {}",
+                    head.name
+                );
+            }
+        }
+
+        // Verify parity of every repacked projection vs raw Q4_K weights.
+        let x256: Vec<f32> = (0..256)
+            .map(|i| f32::from(i16::try_from((i * 11) % 37).unwrap_or(0) - 18) * 0.05)
+            .collect();
+        let x512: Vec<f32> = (0..512)
+            .map(|i| f32::from(i16::try_from((i * 7) % 41).unwrap_or(0) - 20) * 0.04)
+            .collect();
+
+        let assert_proj_parity = |repacked: &LinearProjection,
+                                  raw_name: &str,
+                                  in_d: usize,
+                                  out_d: usize,
+                                  x: &[f32],
+                                  has_bias: bool|
+         -> std::io::Result<()> {
+            let mut raw = weights.projection(raw_name, in_d, out_d)?;
+            if has_bias {
+                raw.bias = repacked.bias.clone();
+            }
+            let got = repacked.forward_vec_parallel(x, None, 2)?;
+            let want = raw.forward_vec_parallel(x, None, 2)?;
+            assert_eq!(got.len(), want.len());
+            for (a, b) in got.iter().zip(&want) {
+                assert!(
+                    (a - b).abs() <= 1e-6,
+                    "projection {raw_name} parity mismatch: got={a} want={b}"
+                );
+            }
+            Ok(())
+        };
+
+        assert_proj_parity(
+            &talker.head,
+            "talker.codec_head.weight",
+            256,
+            1032,
+            &x256,
+            false,
+        )?;
+        assert_proj_parity(
+            &talker.text_fc1,
+            "talker.text_proj.fc1.weight",
+            256,
+            256,
+            &x256,
+            true,
+        )?;
+        assert_proj_parity(
+            &talker.text_fc2,
+            "talker.text_proj.fc2.weight",
+            256,
+            256,
+            &x256,
+            true,
+        )?;
+        if let Some(mtp) = &talker.predictor.mtp_proj {
+            assert_proj_parity(mtp, "code_pred.mtp_proj.weight", 256, 512, &x256, true)?;
+        }
+        for (proj, suffix) in [
+            (&talker.layers[0].q_proj, "attn_q"),
+            (&talker.layers[0].k_proj, "attn_k"),
+            (&talker.layers[0].v_proj, "attn_v"),
+            (&talker.layers[0].o_proj, "attn_output"),
+            (&talker.layers[0].gate_proj, "ffn_gate"),
+            (&talker.layers[0].up_proj, "ffn_up"),
+            (&talker.layers[0].down_proj, "ffn_down"),
+        ] {
+            assert_proj_parity(
+                proj,
+                &format!("talker.blk.0.{suffix}.weight"),
+                256,
+                256,
+                &x256,
+                false,
+            )?;
+        }
+        for (cb, head) in talker.predictor.lm_heads.iter().enumerate() {
+            assert_proj_parity(
+                head,
+                &format!("code_pred.lm_head.{cb}.weight"),
+                512,
+                8,
+                &x512,
+                false,
+            )?;
+        }
         Ok(())
     }
 }
