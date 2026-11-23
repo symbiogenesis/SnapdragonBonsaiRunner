@@ -190,20 +190,15 @@ fn conv<S: CodecSource + ?Sized>(
     bias: bool,
     pad_mode: PadMode,
 ) -> io::Result<CausalConv1d> {
-    Ok(CausalConv1d {
-        out_c: output,
-        in_c: input,
-        kernel,
-        dilation,
-        stride,
-        pad_mode,
-        weight: convolution_weight(weights, &format!("{name}.weight"), [kernel, input, output])?,
-        bias: if bias {
-            Some(weights.tensor_f32(&format!("{name}.bias"), &[output])?)
-        } else {
-            None
-        },
-    })
+    let weight = convolution_weight(weights, &format!("{name}.weight"), [kernel, input, output])?;
+    let bias_vec = if bias {
+        Some(weights.tensor_f32(&format!("{name}.bias"), &[output])?)
+    } else {
+        None
+    };
+    CausalConv1d::from_oc_ic_k(
+        output, input, kernel, dilation, stride, pad_mode, weight, bias_vec,
+    )
 }
 
 fn trans_conv<S: CodecSource + ?Sized>(
@@ -2850,6 +2845,7 @@ mod tests {
             stride: 1,
             pad_mode: PadMode::Constant,
             weight: vec![gain * 0.25; 2 * 2 * 3],
+            weight_okic: None,
             bias: Some(vec![0.01, -0.02]),
         };
         let res = |dilation: usize| -> std::io::Result<DacResUnit> {
@@ -2865,6 +2861,7 @@ mod tests {
                     stride: 1,
                     pad_mode: PadMode::Constant,
                     weight: vec![0.4, -0.1, 0.1, 0.4],
+                    weight_okic: None,
                     bias: None,
                 },
             })
@@ -3006,6 +3003,7 @@ mod tests {
                         stride: 1,
                         pad_mode: PadMode::Constant,
                         weight: vec![0.1; 6],
+                        weight_okic: None,
                         bias: None,
                     },
                 },

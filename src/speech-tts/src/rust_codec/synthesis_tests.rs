@@ -39,6 +39,7 @@ fn warm_synthesizer() -> io::Result<Synthesizer> {
         stride: 1,
         pad_mode: PadMode::Constant,
         weight: vec![0.0; 2],
+        weight_okic: None,
         bias: None,
     };
     let group = RvqGroup {

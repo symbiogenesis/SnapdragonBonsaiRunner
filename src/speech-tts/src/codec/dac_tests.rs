@@ -25,6 +25,7 @@ fn current_convolution(gain: f32, dilation: usize) -> CausalConv1d {
         stride: 1,
         pad_mode: PadMode::Constant,
         weight: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gain],
+        weight_okic: None,
         bias: None,
     }
 }
