@@ -2063,14 +2063,58 @@ fn batch_rows_quant_arm64(
     }
 }
 
-#[cfg(all(windows, feature = "rust-qualification"))]
-fn scatter_rows_to_batch(transposed: &[f32], output: usize, batch: usize, out: &mut [f32]) {
-    for t in 0..batch {
-        let dst = &mut out[t * output..(t + 1) * output];
-        for (r, slot) in dst.iter_mut().enumerate() {
-            *slot = transposed[r * batch + t];
+fn scatter_transposed_to_batch(
+    transposed: &[f32],
+    row_stride: usize,
+    output: usize,
+    batch: usize,
+    workers: usize,
+    out: &mut [f32],
+) {
+    const PARALLEL_SCATTER_WORK: usize = 8_192;
+    if batch == 0 || output == 0 {
+        return;
+    }
+    let level = simd_level();
+    let full_quads = batch / 4;
+    if full_quads > 0 {
+        let quad_out = &mut out[..full_quads * 4 * output];
+        if workers > 1 && full_quads >= 2 && quad_out.len() >= PARALLEL_SCATTER_WORK {
+            row_workers::run_aligned(quad_out, workers, 4 * output, &|elem_off, slice| {
+                dispatch!(
+                    level,
+                    simd => scatter_quads_simd(simd, transposed, row_stride, output, elem_off, slice)
+                );
+            });
+        } else {
+            dispatch!(
+                level,
+                simd => scatter_quads_simd(simd, transposed, row_stride, output, 0, quad_out)
+            );
         }
     }
+    let rem = batch % 4;
+    if rem > 0 {
+        let tail_quad = full_quads * 4;
+        let tail_out = &mut out[tail_quad * output..batch * output];
+        for pos in 0..rem {
+            let dst_row = &mut tail_out[pos * output..(pos + 1) * output];
+            for (r, dst) in dst_row.iter_mut().enumerate() {
+                *dst = transposed[r * row_stride + tail_quad + pos];
+            }
+        }
+    }
+}
+
+#[cfg(any(test, all(windows, feature = "rust-qualification")))]
+fn scatter_rows_to_batch(
+    transposed: &[f32],
+    output: usize,
+    batch: usize,
+    workers: usize,
+    out: &mut [f32],
+) {
+    scatter_transposed_to_batch(transposed, batch, output, batch, workers, out);
 }
 
 /// Bit-exact matrix multiplication for a pre-transposed batch `[batch, input]`
@@ -2118,7 +2162,7 @@ pub(super) fn multiply_batch_prepared_into(
                 );
             },
         );
-        scatter_rows_to_batch(transposed, output, batch, out);
+        scatter_rows_to_batch(transposed, output, batch, workers, out);
         return;
     }
 
@@ -2138,27 +2182,7 @@ pub(super) fn multiply_batch_prepared_into(
                 simd => batch_rows_simd(simd, weights, start_row, &prepared.quads, num_quads, slice)
             );
         });
-        let full_quads = prepared.batch / 4;
-        if full_quads > 0 {
-            let quad_out = &mut out[..full_quads * 4 * output];
-            row_workers::run_aligned(quad_out, workers, 4 * output, &|elem_off, slice| {
-                dispatch!(
-                    level,
-                    simd => scatter_quads_simd(simd, transposed, row_stride, output, elem_off, slice)
-                );
-            });
-        }
-        let rem = prepared.batch % 4;
-        if rem > 0 {
-            let tail_quad = full_quads * 4;
-            let tail_out = &mut out[tail_quad * output..prepared.batch * output];
-            for pos in 0..rem {
-                let dst_row = &mut tail_out[pos * output..(pos + 1) * output];
-                for (r, dst) in dst_row.iter_mut().enumerate() {
-                    *dst = transposed[r * row_stride + tail_quad + pos];
-                }
-            }
-        }
+        scatter_transposed_to_batch(transposed, row_stride, output, prepared.batch, workers, out);
     }
 }
 
@@ -2269,6 +2293,7 @@ pub(super) fn multiply_batch_group_into(
                     &transposed[elem_off..elem_off + w.output * batch],
                     w.output,
                     batch,
+                    workers,
                     out,
                 );
             }
@@ -4026,5 +4051,45 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn scatter_rows_to_batch_simd_and_parallel_match_scalar_bits() {
+        for (output, batch) in [
+            (0_usize, 5_usize),
+            (5, 0),
+            (1, 1),
+            (3, 5),
+            (5, 3),
+            (7, 7),
+            (9, 13),
+            (1025, 17),
+        ] {
+            let transposed: Vec<f32> = (0..output * batch)
+                .map(|i| {
+                    if i % 17 == 0 {
+                        -0.0
+                    } else {
+                        f32::from(u16::try_from((i * 13 + 5) % 401).unwrap_or(0)) * 0.125 - 25.0
+                    }
+                })
+                .collect();
+            let mut expected = vec![0.0_f32; batch * output];
+            for t in 0..batch {
+                for r in 0..output {
+                    expected[t * output + r] = transposed[r * batch + t];
+                }
+            }
+            let expected_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+            for workers in [1_usize, 2, 4] {
+                let mut actual = vec![f32::NAN; batch * output];
+                super::scatter_rows_to_batch(&transposed, output, batch, workers, &mut actual);
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected_bits,
+                    "scatter mismatch output={output} batch={batch} workers={workers}"
+                );
+            }
+        }
     }
 }
