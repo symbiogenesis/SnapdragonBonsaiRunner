@@ -2005,9 +2005,7 @@ fn attend_into(
         })?;
         check(cancel)?;
     } else {
-        let row_scores = scores
-            .get_mut(..group_scores_len)
-            .ok_or_else(invalid)?;
+        let row_scores = scores.get_mut(..group_scores_len).ok_or_else(invalid)?;
         for kv_head in 0..c.kv_heads {
             for _ in 0..gqa_group {
                 check(cancel)?;
@@ -2218,10 +2216,8 @@ mod gqa_attention_tests {
                         )?;
                         let expected_bits: Vec<u32> =
                             expected.iter().map(|v| v.to_bits()).collect();
-                        let seq_bits: Vec<u32> =
-                            seq_grouped.iter().map(|v| v.to_bits()).collect();
-                        let par_bits: Vec<u32> =
-                            par_grouped.iter().map(|v| v.to_bits()).collect();
+                        let seq_bits: Vec<u32> = seq_grouped.iter().map(|v| v.to_bits()).collect();
+                        let par_bits: Vec<u32> = par_grouped.iter().map(|v| v.to_bits()).collect();
                         assert_eq!(
                             seq_bits, expected_bits,
                             "seq mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
@@ -2271,7 +2267,10 @@ mod gqa_attention_tests {
                 pre_polls == 3
             },
         );
-        assert_eq!(pre_err.err().map(|e| e.kind()), Some(io::ErrorKind::Interrupted));
+        assert_eq!(
+            pre_err.err().map(|e| e.kind()),
+            Some(io::ErrorKind::Interrupted)
+        );
         assert_eq!(pre_polls, 3);
 
         let mut post_polls = 0_usize;

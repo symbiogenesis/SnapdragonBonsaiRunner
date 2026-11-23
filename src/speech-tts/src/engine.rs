@@ -2968,7 +2968,11 @@ fn attend_query_f16(
     } else {
         total_seq
     };
-    if workers > 1 && num_kv_heads > 1 && total_seq >= 64 && attn_out.len() == num_q_heads * head_dim {
+    if workers > 1
+        && num_kv_heads > 1
+        && total_seq >= 64
+        && attn_out.len() == num_q_heads * head_dim
+    {
         let group_width = gqa_ratio * head_dim;
         row_workers::run_aligned(attn_out, workers, group_width, &|elem_off, out_chunk| {
             let kvh_start = elem_off / group_width;
@@ -4089,7 +4093,17 @@ mod tests {
         let level = super::Level::new();
         let mut max_ulp = 0_u32;
         let mut samples = Vec::with_capacity(4096);
-        samples.extend_from_slice(&[0.0_f32, -0.0, -1e-7, -0.346_573_6, -1.0, -20.0, -87.3, -88.0, -120.0]);
+        samples.extend_from_slice(&[
+            0.0_f32,
+            -0.0,
+            -1e-7,
+            -0.346_573_6,
+            -1.0,
+            -20.0,
+            -87.3,
+            -88.0,
+            -120.0,
+        ]);
         for i in 0..4000_u32 {
             let x = -87.3_f32 * (f32::from(u16::try_from(i).unwrap_or(0)) / 4000.0_f32);
             samples.push(x);

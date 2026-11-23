@@ -5221,7 +5221,12 @@ mod tests {
         // Incompatible option combinations reject with LaunchError::Arguments.
         for bad_args in [
             vec!["--hexagon-arena-cache"],
-            vec!["--hexagon-arena-cache", &existing_str, "--hexagon-arena-cache", &leaf_str],
+            vec![
+                "--hexagon-arena-cache",
+                &existing_str,
+                "--hexagon-arena-cache",
+                &leaf_str,
+            ],
             vec!["--publisher-engine", "--hexagon-arena-cache", &existing_str],
             vec!["--placement", "cpu", "--hexagon-arena-cache", &existing_str],
         ] {
@@ -5281,10 +5286,7 @@ mod tests {
             let symlink_str = symlink_path.to_string_lossy().into_owned();
             let mut rejected = native.clone();
             rejected.extend(["--hexagon-arena-cache", &symlink_str].map(OsString::from));
-            assert_eq!(
-                LaunchConfig::parse(rejected).err(),
-                Some(LaunchError::Path)
-            );
+            assert_eq!(LaunchConfig::parse(rejected).err(), Some(LaunchError::Path));
         }
 
         // Verify unisolated argument emission, validate_paths, and specification behavior.

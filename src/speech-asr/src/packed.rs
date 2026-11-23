@@ -2804,13 +2804,8 @@ fn dot_4keys_group_simd<S: Simd>(
             }
             g_base += 4;
         } else if rem == 3 {
-            let res = dot_4keys_tile_simd(
-                simd,
-                [q_at(0), q_at(1), q_at(2)],
-                k_refs,
-                head_dim,
-                divisor,
-            );
+            let res =
+                dot_4keys_tile_simd(simd, [q_at(0), q_at(1), q_at(2)], k_refs, head_dim, divisor);
             for (local_g, vals) in res.into_iter().enumerate() {
                 store(local_g, vals);
             }
@@ -2998,7 +2993,10 @@ fn attend_kv_group_impl<T: KvSource>(
     };
     for (g, sum_slot) in sums.iter_mut().enumerate() {
         let head_scores = &mut scores[g * total_rows..(g + 1) * total_rows];
-        let max = head_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max = head_scores
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0_f32;
         for score in &mut *head_scores {
             *score = (*score - max).exp();
