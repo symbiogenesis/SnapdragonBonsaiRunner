@@ -28,6 +28,11 @@ mod native;
 
 pub mod quant_kernels;
 
+/// Internal CLI support for `bonsai-push-recovery`.
+#[forbid(unsafe_code)]
+#[doc(hidden)]
+pub mod push_recovery;
+
 /// Read-only memory-mapped file view backed by an owned Win32 section object.
 pub struct MappedFile(native::mmap::NativeMappedFile);
 
@@ -2480,6 +2485,67 @@ mod storage_budget_tests {
             Ok(())
         });
         assert_eq!(err.err().map(|e| e.to_string()), Some("fail-8".to_owned()));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn current_identity_retains_the_running_process() -> io::Result<()> {
+        let created = current_process_creation_time()?;
+        assert_ne!(created, 0);
+        ParentProcess::open(std::process::id(), created)?.ensure_alive()?;
+        assert!(ParentProcess::open(std::process::id(), created + 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn observations_preserve_canonical_time_and_reject_nonlocal_storage() -> io::Result<()> {
+        let stamp = utc_now();
+        assert_eq!(stamp.len(), 28);
+        for (index, expected) in [
+            (4, b'-'),
+            (7, b'-'),
+            (10, b'T'),
+            (13, b':'),
+            (16, b':'),
+            (19, b'.'),
+            (27, b'Z'),
+        ] {
+            assert_eq!(stamp.as_bytes()[index], expected);
+        }
+        for path in [
+            "relative",
+            "C:relative",
+            "C:\\",
+            "C:\\\\",
+            "\\\\server.invalid\\share",
+            "//?/C:/Bonsai",
+        ] {
+            assert!(require_local_data_drive(Path::new(path)).is_err());
+        }
+        require_local_data_drive(&std::env::temp_dir())?;
+        assert!(available_disk_bytes(&std::env::temp_dir())? > 0);
+        assert!(available_disk_bytes(Path::new("C:\\nul\0tail")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_clock_and_process_snapshot_observe_the_live_test_process() -> io::Result<()> {
+        let (first, frequency) = monotonic_ticks()?;
+        let (second, next_frequency) = monotonic_ticks()?;
+        assert!(frequency > 0 && second >= first);
+        assert_eq!(frequency, next_frequency);
+        let executable = std::env::current_exe()?;
+        let name = executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("Missing test executable name."))?;
+        assert!(has_running_process(&[name])?);
+        assert!(has_running_process(&[""]).is_err());
         Ok(())
     }
 }

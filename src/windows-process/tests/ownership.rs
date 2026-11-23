@@ -62,6 +62,7 @@ impl Lane {
 
 fn until(mut predicate: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
     let start = Instant::now();
+    let mut attempt = 0_u32;
     while !predicate()? {
         if start.elapsed() >= TIMEOUT {
             return Err(io::Error::new(
@@ -69,7 +70,13 @@ fn until(mut predicate: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
                 "probe condition not reached",
             ));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            let millis = u64::from(1_u32 << (attempt - 4).min(3)).min(5);
+            std::thread::sleep(Duration::from_millis(millis));
+        }
+        attempt = attempt.saturating_add(1);
     }
     Ok(())
 }
@@ -401,8 +408,7 @@ fn native_sandbox_exit_drains_both_logs_and_releases_capture_files() -> io::Resu
             writable_directory: scratch,
         },
     )?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
-    assert_eq!(process.try_wait()?, Some(0));
+    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
     for (stderr, path) in [(false, &spec.stdout), (true, &spec.stderr)] {
         // Status publication must precede neither tail retention nor release of
         // the parent's no-delete-sharing capture file, even with owner retained.
@@ -482,9 +488,8 @@ fn assert_other_worker_temp_denied(first_scratch: &std::path::Path) -> io::Resul
         },
     )
     .map_err(|error| io::Error::new(error.kind(), format!("second temp worker launch: {error}")))?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
     assert_eq!(
-        process.try_wait()?,
+        process.wait_for_exit(TIMEOUT)?,
         Some(0),
         "{}",
         fs::read_to_string(&spec.stderr)?
@@ -531,9 +536,8 @@ fn native_sandbox_host_loopback_capability_includes_host_interface_services() ->
         writable_directory: scratch.clone(),
     };
     let process = OwnedProcess::start_sandboxed(&spec, &policy)?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
     assert_eq!(
-        process.try_wait()?,
+        process.wait_for_exit(TIMEOUT)?,
         Some(0),
         "{}",
         fs::read_to_string(&spec.stderr)?
@@ -568,9 +572,8 @@ fn native_sandbox_denies_external_tcp_connect_by_policy() -> io::Result<()> {
             writable_directory: scratch.clone(),
         },
     )?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
     assert_eq!(
-        process.try_wait()?,
+        process.wait_for_exit(TIMEOUT)?,
         Some(0),
         "{}",
         fs::read_to_string(&spec.stderr)?
@@ -593,8 +596,7 @@ fn argv_environment_and_native_cwd() -> io::Result<()> {
         OsString::from_wide(&[0xd800, 0x5c, 0x22]),
     ];
     let process = OwnedProcess::start(&lane.spec(arguments.clone()))?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
-    assert_eq!(process.try_wait()?, Some(0));
+    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
     let text = fs::read_to_string(lane.path.join("report.txt"))?;
     assert!(text.contains(&format!("cwd={}\n", lane.path.display())));
     for argument in arguments.iter().skip(1) {
@@ -742,8 +744,7 @@ fn active_process_limit_blocks_descendants() -> io::Result<()> {
     let mut spec = lane.spec(vec![OsString::from("spawn-denied")]);
     spec.active_process_limit = 1;
     let process = OwnedProcess::start(&spec)?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
-    assert_eq!(process.try_wait()?, Some(0));
+    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
     assert_eq!(fs::read_to_string(lane.path.join("spawn.txt"))?, "denied");
     Ok(())
 }
@@ -764,8 +765,7 @@ fn headless_mitigations_apply_at_creation_without_changing_tool_policy() -> io::
 
     let worker = Lane::new("mitigation-worker")?;
     let process = OwnedProcess::start(&worker.spec(vec![OsString::from("mitigations")]))?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
-    assert_eq!(process.try_wait()?, Some(0));
+    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
     let observed = fs::read_to_string(worker.path.join("mitigations.txt"))?;
     for (name, required) in [("win32k", 1), ("extensions", 1), ("images", 3)] {
         let flags = observed
@@ -787,8 +787,7 @@ fn headless_mitigations_apply_at_creation_without_changing_tool_policy() -> io::
         stderr: spec.stderr,
         environment: std::collections::BTreeMap::new(),
     })?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
-    assert_eq!(process.try_wait()?, Some(0));
+    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
     assert_eq!(
         fs::read_to_string(tool.path.join("mitigations.txt"))?,
         baseline
@@ -798,8 +797,7 @@ fn headless_mitigations_apply_at_creation_without_changing_tool_policy() -> io::
     // JobObjectBasicUIRestrictions would prevent this valid hierarchy.
     let nested = Lane::new("mitigation-nested")?;
     let process = OwnedProcess::start(&nested.spec(vec![OsString::from("nested-mitigations")]))?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
-    assert_eq!(process.try_wait()?, Some(0));
+    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
     assert_eq!(
         fs::read_to_string(nested.path.join("mitigations.txt"))?,
         observed
@@ -946,8 +944,7 @@ fn committed_memory_limit_denies_allocations() -> io::Result<()> {
     let mut spec = lane.spec(vec![OsString::from("commit")]);
     spec.memory_limit_bytes = 96 * 1024 * 1024;
     let process = OwnedProcess::start(&spec)?;
-    until(|| process.try_wait().map(|code| code.is_some()))?;
-    assert_eq!(process.try_wait()?, Some(0));
+    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
     assert_eq!(fs::read_to_string(lane.path.join("commit.txt"))?, "denied");
     let peak = process.peak_job_memory_bytes()?;
     assert!(peak > 32 * 1024 * 1024);

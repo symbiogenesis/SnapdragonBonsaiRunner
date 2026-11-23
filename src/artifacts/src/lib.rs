@@ -1583,16 +1583,28 @@ mod tests {
             .take(2 * HASH_BUFFER_BYTES + 137)
             .collect();
         let expected = digest_hex(Sha256::digest(&payload).into());
-        for length in [63, 64, 65, HASH_BUFFER_BYTES] {
+        let mut buffer = vec![0; HASH_BUFFER_BYTES];
+        assert_eq!(
+            hash_reader(
+                &mut Cursor::new(&payload),
+                u64::try_from(payload.len()).map_err(|_| ArtifactError::Identity)?,
+                &mut buffer,
+                &mut || Ok(()),
+            )?,
+            expected
+        );
+        let small = &payload[..4_096 + 137];
+        let small_expected = digest_hex(Sha256::digest(small).into());
+        for length in [63, 64, 65] {
             let mut buffer = vec![0; length];
             assert_eq!(
                 hash_reader(
-                    &mut Cursor::new(&payload),
-                    u64::try_from(payload.len()).map_err(|_| ArtifactError::Identity)?,
+                    &mut Cursor::new(small),
+                    u64::try_from(small.len()).map_err(|_| ArtifactError::Identity)?,
                     &mut buffer,
                     &mut || Ok(()),
                 )?,
-                expected
+                small_expected
             );
         }
         Ok(())
@@ -1891,8 +1903,12 @@ mod tests {
             Some(ArtifactError::Cancelled)
         );
 
-        payload[len - 1] ^= 0x01;
-        fs::write(&file_path, &payload)?;
+        {
+            let mut file = OpenOptions::new().write(true).open(&file_path)?;
+            file.seek(SeekFrom::End(-1))?;
+            file.write_all(&[payload[len - 1] ^ 0x01])?;
+            file.flush()?;
+        }
         assert_eq!(
             VerifiedFile::verify(&file_path, u64::try_from(len)?, &expected_hash).err(),
             Some(ArtifactError::Identity)

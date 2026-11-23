@@ -595,9 +595,15 @@ mod tests {
             std::process::id()
         ));
         let len = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)? + 12_345;
-        let payload: Vec<u8> = (0..len)
+        let tile: Vec<u8> = (0..65_536_usize.min(len))
             .map(|i| u8::try_from((i.wrapping_mul(31) ^ (i >> 8)) & 0xff).unwrap_or(0))
             .collect();
+        let mut payload = vec![0_u8; len];
+        if !tile.is_empty() {
+            for chunk in payload.chunks_mut(tile.len()) {
+                chunk.copy_from_slice(&tile[..chunk.len()]);
+            }
+        }
         std::fs::write(&path, &payload)?;
 
         let expected = Sha256::digest_bytes(&payload)?;

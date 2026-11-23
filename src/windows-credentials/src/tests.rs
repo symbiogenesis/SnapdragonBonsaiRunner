@@ -276,9 +276,17 @@ fn open_read_locked_test_file(path: &Path) -> io::Result<File> {
 }
 
 fn synthetic_chunk_payload(len: usize) -> Vec<u8> {
-    (0..len)
+    const TILE_LEN: usize = 131_072;
+    let tile: Vec<u8> = (0..TILE_LEN.min(len))
         .map(|i| u8::try_from((i.wrapping_mul(37) ^ (i >> 9) ^ 0x5a) & 0xff).unwrap_or(0))
-        .collect()
+        .collect();
+    let mut payload = vec![0_u8; len];
+    if !tile.is_empty() {
+        for chunk in payload.chunks_mut(tile.len()) {
+            chunk.copy_from_slice(&tile[..chunk.len()]);
+        }
+    }
+    payload
 }
 
 #[test]
@@ -300,7 +308,13 @@ fn parallel_mapped_chunk_digests_compute_and_verify_exact_multichunk() -> io::Re
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let total_u64 = u64::try_from(len).map_err(io::Error::other)?;
 
-    for workers in [0, 1, 4, MAX_PARALLEL_HASH_WORKERS, 16] {
+    for workers in [
+        0,
+        1,
+        4,
+        MAX_PARALLEL_HASH_WORKERS,
+        MAX_PARALLEL_HASH_WORKERS + 1,
+    ] {
         let computed =
             compute_mapped_chunk_digests(&file, total_u64, chunk_bytes, workers, &cancel)?;
         assert_eq!(computed.as_deref(), Some(expected.as_slice()));
@@ -361,26 +375,36 @@ fn parallel_mapped_chunk_verification_detects_single_byte_corruption_in_any_chun
 
     // Corrupt a single byte in the first, middle, and last chunks on disk.
     let path = lane.join("corrupt.bin");
+    fs::write(&path, &payload)?;
+    let toggle_byte = |offset: usize| -> io::Result<()> {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let pos = u64::try_from(offset).map_err(io::Error::other)?;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte)?;
+        byte[0] ^= 0x01;
+        file.seek(SeekFrom::Start(pos))?;
+        file.write_all(&byte)?;
+        file.flush()
+    };
     for offset in [0, chunk_bytes - 1, chunk_bytes + 123, len - 1] {
-        let mut tampered = payload.clone();
-        tampered[offset] ^= 0x01;
-        fs::write(&path, &tampered)?;
+        toggle_byte(offset)?;
         let file = open_read_locked_test_file(&path)?;
-        assert_eq!(
-            try_verify_locked_file_chunk_digests_mapped(
-                &file,
-                total_u64,
-                chunk_bytes,
-                &expected,
-                MAX_PARALLEL_HASH_WORKERS,
-                &cancel
-            )?,
-            Some(false)
-        );
+        let actual = try_verify_locked_file_chunk_digests_mapped(
+            &file,
+            total_u64,
+            chunk_bytes,
+            &expected,
+            MAX_PARALLEL_HASH_WORKERS,
+            &cancel,
+        )?;
+        drop(file);
+        toggle_byte(offset)?;
+        assert_eq!(actual, Some(false));
     }
 
-    // Clean payload on disk, but corrupt expected digest for first, middle, and last chunk.
-    fs::write(&path, &payload)?;
+    // Clean payload restored on disk, but corrupt expected digest for first, middle, and last chunk.
     let file = open_read_locked_test_file(&path)?;
     for chunk_index in [0, 1, 2] {
         let mut bad_expected = expected.clone();
@@ -489,8 +513,9 @@ fn parallel_mapped_chunk_verification_rejects_count_chunk_size_and_length_mismat
     // Below MIN_MAPPED_HASH_BYTES returns Ok(None) for sequential fallback.
     let small_path = lane.join("small.bin");
     let small_bytes = MIN_MAPPED_HASH_BYTES - 1;
-    let small_len = usize::try_from(small_bytes).map_err(io::Error::other)?;
-    fs::write(&small_path, vec![0x33_u8; small_len])?;
+    let small_file = File::create(&small_path)?;
+    small_file.set_len(small_bytes)?;
+    drop(small_file);
     let small_file = open_read_locked_test_file(&small_path)?;
     assert_eq!(
         compute_mapped_chunk_digests(&small_file, small_bytes, chunk_bytes, 4, &cancel)?,

@@ -1,6 +1,4 @@
 //! Focused offline runtime installation regressions with synthetic ZIPs.
-#![cfg(windows)]
-#![forbid(unsafe_code)]
 
 use bonsai_artifacts::{
     ArtifactError, ChunkedFileSpec, FileVerificationSpec, RuntimeSpec, VerifiedFile,
@@ -61,7 +59,9 @@ impl Fixture {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    let raw = bonsai_windows_credentials::Sha256::digest_bytes(bytes)
+        .unwrap_or_else(|_| Sha256::digest(bytes).into());
+    hex::encode(raw)
 }
 
 fn image() -> Vec<u8> {
@@ -227,11 +227,12 @@ fn runtime_stage_cleanup_removes_only_its_failed_attempt() -> TestResult {
 #[test]
 fn runtime_stage_rejects_entry_and_expansion_budgets() -> TestResult {
     let image = image();
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    zip.start_file("llama-server.exe", SimpleFileOptions::default())?;
+    zip.start_file("llama-server.exe", stored)?;
     zip.write_all(&image)?;
     for index in 0..4096 {
-        zip.start_file(format!("entry-{index}"), SimpleFileOptions::default())?;
+        zip.start_file(format!("entry-{index}"), stored)?;
     }
     let fixture = Fixture::new(&zip.finish()?.into_inner())?;
     assert_eq!(
@@ -335,11 +336,19 @@ impl TempArtifactDir {
 }
 
 fn synthetic_bytes(len: usize, seed: usize) -> Vec<u8> {
-    (0..len)
+    const TILE_LEN: usize = 65_536;
+    let tile: Vec<u8> = (0..TILE_LEN.min(len))
         .map(|i| {
             u8::try_from((i.wrapping_mul(31).wrapping_add(seed) ^ (i >> 8)) & 0xff).unwrap_or(0)
         })
-        .collect()
+        .collect();
+    let mut payload = vec![0_u8; len];
+    if !tile.is_empty() {
+        for chunk in payload.chunks_mut(tile.len()) {
+            chunk.copy_from_slice(&tile[..chunk.len()]);
+        }
+    }
+    payload
 }
 
 fn chunk_digests(bytes: &[u8], chunk_bytes: usize) -> Vec<String> {
@@ -428,18 +437,27 @@ fn chunk_manifest_verification_rejects_corruption_wrong_count_and_cancellation()
     let mapped_spec = make_chunked_spec(mapped_path.clone(), &mapped_payload, chunk_bytes)?;
     let cancel = AtomicBool::new(false);
 
+    let toggle_bit = |path: &Path, offset: usize, mask: u8| -> std::io::Result<()> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let pos = u64::try_from(offset).map_err(std::io::Error::other)?;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte)?;
+        byte[0] ^= mask;
+        file.seek(SeekFrom::Start(pos))?;
+        file.write_all(&byte)?;
+        file.flush()
+    };
+
     // Single-byte corruption in first, middle, and last chunks.
     for offset in [0, chunk_bytes + 55, mapped_len - 1] {
-        let mut tampered = mapped_payload.clone();
-        tampered[offset] ^= 0x01;
-        fs::write(&mapped_path, &tampered)?;
-        assert_eq!(
-            VerifiedFile::verify_chunked_with(&mapped_spec, 4, &cancel).err(),
-            Some(ArtifactError::Identity)
-        );
+        toggle_bit(&mapped_path, offset, 0x01)?;
+        let result = VerifiedFile::verify_chunked_with(&mapped_spec, 4, &cancel).err();
+        assert_eq!(result, Some(ArtifactError::Identity));
         assert!(OpenOptions::new().write(true).open(&mapped_path).is_ok());
+        toggle_bit(&mapped_path, offset, 0x01)?;
     }
-    fs::write(&mapped_path, &mapped_payload)?;
 
     // Wrong chunk counts (too few, too many, empty).
     let mut short_chunks = mapped_spec.clone();
@@ -507,15 +525,11 @@ fn chunk_manifest_verification_rejects_corruption_wrong_count_and_cancellation()
     let small_spec = make_chunked_spec(small_path.clone(), &small_payload, 32_768)?;
 
     for offset in [0, 40_000, small_payload.len() - 1] {
-        let mut tampered = small_payload.clone();
-        tampered[offset] ^= 0x80;
-        fs::write(&small_path, &tampered)?;
-        assert_eq!(
-            VerifiedFile::verify_chunked(&small_spec).err(),
-            Some(ArtifactError::Identity)
-        );
+        toggle_bit(&small_path, offset, 0x80)?;
+        let result = VerifiedFile::verify_chunked(&small_spec).err();
+        toggle_bit(&small_path, offset, 0x80)?;
+        assert_eq!(result, Some(ArtifactError::Identity));
     }
-    fs::write(&small_path, &small_payload)?;
 
     let mut bad_whole_sha = small_spec.clone();
     bad_whole_sha.sha256 = "0".repeat(64);

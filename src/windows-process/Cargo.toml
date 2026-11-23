@@ -35,6 +35,7 @@ doc = false
 [[bin]]
 name = "bonsai-push-recovery"
 path = "src/bin/bonsai-push-recovery.rs"
+test = false
 doc = false
 
 [lints]

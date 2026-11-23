@@ -648,7 +648,7 @@ fn argument(args: &[OsString], index: usize) -> io::Result<&str> {
 
 fn wait_forever() {
     loop {
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::park();
     }
 }
 
