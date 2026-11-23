@@ -857,10 +857,7 @@ fn native_link_schema_three_uses_only_unbound_iat_when_lookup_is_absent() -> Tes
 
 #[test]
 fn native_link_schema_three_rejects_unrecoverable_or_malformed_symbol_tables() -> TestResult {
-    let scratch = Scratch::new()?;
-    let mut capture = fixture(&scratch)?;
-    capture.schema_version = 3;
-    for (offset, mutation, expected) in [
+    let cases = [
         (
             0x800,
             (1_u64 << 63 | 0x1_0011).to_le_bytes().to_vec(),
@@ -906,13 +903,39 @@ fn native_link_schema_three_rejects_unrecoverable_or_malformed_symbol_tables() -
             0x1ffe_u64.to_le_bytes().to_vec(),
             "PE RVA extent outside raw section",
         ),
-    ] {
-        let mut bytes = runtime_image();
-        bytes[offset..offset + mutation.len()].copy_from_slice(&mutation);
-        replace_image(&scratch, &mut capture, &bytes)?;
-        rejected(verify(&capture, &mut Intake::default()), expected);
-    }
-    Ok(())
+    ];
+    let base_image = runtime_image();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, cases.len());
+    let chunk_len = cases.len().div_ceil(workers);
+    std::thread::scope(|scope| -> TestResult {
+        let handles: Vec<_> = cases
+            .chunks(chunk_len)
+            .map(|chunk| {
+                let base = &base_image;
+                scope.spawn(move || -> Result<()> {
+                    let scratch = Scratch::new().map_err(|error| error.to_string())?;
+                    let mut capture = fixture(&scratch).map_err(|error| error.to_string())?;
+                    capture.schema_version = 3;
+                    for (offset, mutation, expected) in chunk {
+                        let mut bytes = base.clone();
+                        bytes[*offset..*offset + mutation.len()].copy_from_slice(mutation);
+                        replace_image(&scratch, &mut capture, &bytes)
+                            .map_err(|error| error.to_string())?;
+                        rejected(verify(&capture, &mut Intake::default()), expected);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| "native_link worker panicked".to_owned())??;
+        }
+        Ok(())
+    })
 }
 
 #[test]

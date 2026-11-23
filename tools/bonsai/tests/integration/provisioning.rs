@@ -1,5 +1,4 @@
 //! Packaged offline runtime staging request and receipt contract.
-#![cfg(windows)]
 #![forbid(unsafe_code)]
 
 use serde_json::{Value, json};

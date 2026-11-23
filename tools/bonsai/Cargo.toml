@@ -33,6 +33,7 @@ test = false
 [[bin]]
 name = "bonsai-assets"
 path = "src/application_icon.rs"
+test = false
 
 [features]
 test-probe = []

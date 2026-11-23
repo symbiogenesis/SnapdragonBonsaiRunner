@@ -77,8 +77,16 @@ pub(super) fn cleanup(value: &Value) -> Result<Value> {
                 if matches!(error.raw_os_error(), Some(32 | 33))
                     && started.elapsed() < Duration::from_millis(timeout) =>
             {
-                let remaining = Duration::from_millis(timeout).saturating_sub(started.elapsed());
-                std::thread::sleep(remaining.min(Duration::from_millis(100)));
+                let elapsed = started.elapsed();
+                let remaining = Duration::from_millis(timeout).saturating_sub(elapsed);
+                let step = if elapsed < Duration::from_millis(25) {
+                    Duration::from_millis(1)
+                } else if elapsed < Duration::from_millis(250) {
+                    Duration::from_millis(10)
+                } else {
+                    Duration::from_millis(100)
+                };
+                std::thread::sleep(remaining.min(step));
                 if started.elapsed() >= Duration::from_millis(timeout) {
                     return Err(error.to_string());
                 }
@@ -305,7 +313,7 @@ mod tests {
             b"inert"
         );
         let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(20));
             drop(hold);
         });
         cleanup(

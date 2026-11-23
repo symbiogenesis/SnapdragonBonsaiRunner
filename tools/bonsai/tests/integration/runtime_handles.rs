@@ -1,6 +1,5 @@
 //! Synthetic child regression for runtime guards spanning native execution.
 #![forbid(unsafe_code)]
-#![cfg(all(windows, target_arch = "aarch64"))]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Write as _, stdout};
@@ -12,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use zip::{ZipWriter, write::SimpleFileOptions};
 
-#[path = "support/windows.rs"]
+#[path = "../support/windows.rs"]
 mod windows;
 use windows::caller_identity;
 
@@ -85,7 +84,7 @@ fn runtime_guard_survives_child_execution_and_releases_after_exit() -> Result<()
     let creation = caller_identity(&root)?;
     let request = json!({
         "schemaVersion": 1, "executable": runtime.runtime_directory.join("llama-completion.exe"),
-        "arguments": ["--exact", "runtime_child_observes_guards", "--nocapture"],
+        "arguments": ["--exact", "runtime_handles::runtime_child_observes_guards", "--nocapture"],
         "workingDirectory": root, "evidenceDirectory": evidence, "artifacts": [], "runtime": runtime,
         "memoryLimitBytes": 536_870_912, "requiredAvailableBytes": 0, "physicalReserveBytes": 0,
         "timeoutSeconds": 10, "stdoutLimitBytes": 32768, "stderrLimitBytes": 32768,

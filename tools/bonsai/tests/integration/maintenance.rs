@@ -1,6 +1,5 @@
 //! Native CPU admission and launch-disabled server planning without models.
 #![forbid(unsafe_code)]
-#![cfg(all(windows, target_arch = "aarch64"))]
 
 use serde_json::json;
 

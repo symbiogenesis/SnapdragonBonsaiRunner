@@ -251,6 +251,10 @@ pub mod doctor;
 /// Pure hosted capability, admission, runtime and fixed-work receipt gates.
 pub mod ci_report;
 
+/// Internal icon generation entrypoint; not a public CLI API.
+#[doc(hidden)]
+pub mod assets;
+
 mod bounded_input;
 mod https_transfer;
 mod identity;

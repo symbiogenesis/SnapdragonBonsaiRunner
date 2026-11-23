@@ -1,5 +1,4 @@
 //! Native release-review regressions formerly exercised through PowerShell fixtures.
-#![cfg(windows)]
 #![forbid(unsafe_code)]
 
 use std::fs;

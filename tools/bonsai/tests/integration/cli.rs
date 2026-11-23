@@ -54,7 +54,7 @@ fn version_advertises_policy_commands_and_compiled_inference_without_request_fil
     assert_eq!(version["ChatLaunchProtocolVersion"], 1);
     assert_eq!(version["BootstrapProtocolVersion"], 1);
     let inference: Value =
-        serde_json::from_str(include_str!("../../../config/prism-inference.lock.json"))?;
+        serde_json::from_str(include_str!("../../../../config/prism-inference.lock.json"))?;
     assert_eq!(
         version["CompiledInference"],
         json!({
@@ -148,7 +148,7 @@ fn startup_rejects_invalid_caller_identity_before_build_work()
 fn large_legacy_in_memory_evidence_remains_accepted()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let golden: Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/lora-qualification-v1.json"
+        "../../../../tests/fixtures/lora-qualification-v1.json"
     ))?;
     let mut evidence = golden["scenarios"][0]["evidence"].clone();
     let mut review = golden["scenarios"][0]["review"].clone();

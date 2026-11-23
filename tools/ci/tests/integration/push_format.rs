@@ -1,6 +1,5 @@
 //! Cargo-to-native formatter handoff, including local dependencies and modules.
 #![forbid(unsafe_code)]
-#![cfg(all(windows, target_arch = "aarch64"))]
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -49,7 +48,14 @@ fn invoke(
         {
             break Err("Formatter fixture exceeded its work/output allowance.");
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let step = if start.elapsed() < Duration::from_millis(25) {
+            Duration::from_millis(1)
+        } else if start.elapsed() < Duration::from_millis(250) {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_millis(10)
+        };
+        std::thread::sleep(step);
     };
     process.stop(Duration::from_secs(5))?;
     let code = result?;
@@ -82,7 +88,7 @@ fn push_format_preserves_cargo_path_dependencies_configs_and_child_rejection() -
     ));
     fs::create_dir(&root)?;
     let result: Result<()> = (|| {
-        let pin = include_str!("../../../rust-toolchain.toml");
+        let pin = include_str!("../../../../rust-toolchain.toml");
         let parsed: toml::Value = toml::from_str(pin)?;
         let channel = parsed["toolchain"]["channel"]
             .as_str()

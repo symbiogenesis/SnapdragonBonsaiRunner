@@ -10,6 +10,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $Root = [IO.Path]::GetFullPath($Root)
+function Get-PushFileSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    try { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
+    finally { $stream.Dispose() }
+}
 function Test-PushHelperReceipt([string]$ReceiptPath, [string]$Image, [string]$SourceIdentity) {
     if (-not (Test-Path -LiteralPath $Image -PathType Leaf) -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $false }
     try {
@@ -19,7 +24,7 @@ function Test-PushHelperReceipt([string]$ReceiptPath, [string]$Image, [string]$S
             $receipt.SchemaVersion -is [long] -and $receipt.SchemaVersion -eq 1 -and
             $receipt.SourceIdentity -is [string] -and $receipt.Sha256 -is [string] -and
             $receipt.SourceIdentity -ceq $SourceIdentity -and
-            $receipt.Sha256 -ceq (Get-FileHash -LiteralPath $Image -Algorithm SHA256).Hash.ToLowerInvariant()
+            $receipt.Sha256 -ceq (Get-PushFileSha256 $Image)
     } catch { return $false }
 }
 function Lock-PushSourceCache([string]$Target, [Diagnostics.Stopwatch]$Started) {
@@ -293,7 +298,7 @@ try {
                         if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery build failed during preparation.' }
                     }
                     finally { Pop-Location }
-                    @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-FileHash -LiteralPath $recoveryTool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
+                    @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-PushFileSha256 $recoveryTool) } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
                 } else {
                     & $recoveryTool --source $stableSource --target-directory $target --toolchain $toolchain --bootstrap-milliseconds $started.ElapsedMilliseconds
                     if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery failed; checker receipt remains invalid.' }
@@ -303,7 +308,7 @@ try {
             }
         }
         if (-not $prepareForPush) {
-            @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
+            @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-PushFileSha256 $tool) } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
             if (-not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
                 [IO.File]::Delete($receiptPath)
                 throw 'Push blocked: rebuilt checker did not pass receipt verification.'

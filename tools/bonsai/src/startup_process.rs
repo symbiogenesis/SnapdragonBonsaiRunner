@@ -225,7 +225,7 @@ impl ChildGuard {
                 if active == 0 || grace.elapsed() >= Duration::from_millis(250) {
                     break active;
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(poll_step(grace.elapsed(), Duration::from_millis(10)));
             }
         } else {
             0
@@ -362,10 +362,10 @@ pub(crate) fn run_with_checkpoint(
             working,
             environment,
             removed: &[],
-            timeout,
             log,
         },
         ExitPolicy::StopDescendants,
+        timeout,
         checkpoint,
     )
 }
@@ -405,10 +405,10 @@ pub(crate) fn run_strict_with_checkpoint(
             working,
             environment,
             removed: &[],
-            timeout,
             log,
         },
         ExitPolicy::RejectSurvivors,
+        timeout,
         checkpoint,
     )
 }
@@ -429,10 +429,10 @@ pub(crate) fn run_strict_with_removed(
             working,
             environment,
             removed,
-            timeout,
             log,
         },
         ExitPolicy::RejectSurvivors,
+        timeout,
         crate::startup_cancel::checkpoint,
     )
 }
@@ -443,7 +443,6 @@ struct RunSpec<'a> {
     working: &'a Path,
     environment: &'a BTreeMap<String, String>,
     removed: &'a [String],
-    timeout: Duration,
     log: &'a Path,
 }
 
@@ -514,9 +513,35 @@ fn failure_error(
     format!("{message}{cleanup}{evidence} Evidence: {}", log.display())
 }
 
+fn poll_step(elapsed: Duration, max: Duration) -> Duration {
+    let step = if elapsed < Duration::from_millis(25) {
+        Duration::from_millis(1)
+    } else if elapsed < Duration::from_millis(250) {
+        Duration::from_millis(5)
+    } else {
+        max
+    };
+    step.min(max)
+}
+
 fn run_owned(
     spec: &RunSpec<'_>,
     policy: ExitPolicy,
+    timeout: Duration,
+    checkpoint: impl FnMut() -> crate::Result<()>,
+) -> crate::Result<ProcessOutput> {
+    run_owned_with_timeout(
+        spec,
+        policy,
+        |started| !timeout.is_zero() && started.elapsed() >= timeout,
+        checkpoint,
+    )
+}
+
+fn run_owned_with_timeout(
+    spec: &RunSpec<'_>,
+    policy: ExitPolicy,
+    mut is_timed_out: impl FnMut(Instant) -> bool,
     mut checkpoint: impl FnMut() -> crate::Result<()>,
 ) -> crate::Result<ProcessOutput> {
     let &RunSpec {
@@ -525,7 +550,6 @@ fn run_owned(
         working,
         environment,
         removed,
-        timeout,
         log,
     } = spec;
     checkpoint()?;
@@ -584,7 +608,7 @@ fn run_owned(
         if let Some(status) = guard.try_wait()? {
             break status;
         }
-        if (!timeout.is_zero() && started.elapsed() >= timeout)
+        if is_timed_out(started)
             || fs::metadata(&stdout_path)
                 .map_err(|error| error.to_string())?
                 .len()
@@ -602,7 +626,7 @@ fn run_owned(
                 &stderr_path,
             );
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(poll_step(started.elapsed(), Duration::from_millis(20)));
     };
     let survivors = match guard.stop_after_exit(policy) {
         Ok(survivors) => survivors,
@@ -1009,7 +1033,7 @@ mod tests {
             if child.try_wait()?.is_some() {
                 return Err(std::io::Error::other("Compiler descendant failed."));
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(1));
         }
         if wait {
             child.wait()?;
@@ -1095,16 +1119,29 @@ mod tests {
         fs::create_dir(&scratch).map_err(|error| error.to_string())?;
         let (executable, args, marker) = process_tree(&scratch, true)?;
         let mut child = None;
-        let result = run_with_checkpoint(
-            executable.as_os_str(),
-            &args,
-            &scratch,
-            &BTreeMap::new(),
-            Duration::from_secs(10),
-            &scratch.join("timeout.log"),
+        let ready_at = std::cell::Cell::new(None::<Instant>);
+        let result = run_owned_with_timeout(
+            &RunSpec {
+                executable: executable.as_os_str(),
+                args: &args,
+                working: &scratch,
+                environment: &BTreeMap::new(),
+                removed: &[],
+                log: &scratch.join("timeout.log"),
+            },
+            ExitPolicy::StopDescendants,
+            |started| {
+                ready_at
+                    .get()
+                    .is_some_and(|ready| ready.elapsed() >= Duration::from_millis(50))
+                    || started.elapsed() >= Duration::from_secs(10)
+            },
             || {
                 if child.is_none() {
                     child = descendant(&marker)?;
+                    if child.is_some() {
+                        ready_at.set(Some(Instant::now()));
+                    }
                 }
                 Ok(())
             },

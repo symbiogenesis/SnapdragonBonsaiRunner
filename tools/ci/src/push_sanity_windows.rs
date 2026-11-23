@@ -797,6 +797,7 @@ impl Work {
         use std::os::windows::fs::OpenOptionsExt;
         fs::create_dir_all(target_dir).map_err(|error| error.to_string())?;
         let lock_path = target_dir.join(".bonsai-source.lock");
+        let wait_started = Instant::now();
         loop {
             match fs::OpenOptions::new()
                 .read(true)
@@ -816,7 +817,15 @@ impl Work {
                             "Push blocked: timed out waiting for the source cache lock.".into()
                         );
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    let elapsed = wait_started.elapsed();
+                    let step = if elapsed < Duration::from_millis(25) {
+                        Duration::from_millis(1)
+                    } else if elapsed < Duration::from_millis(250) {
+                        Duration::from_millis(5)
+                    } else {
+                        Duration::from_millis(10)
+                    };
+                    std::thread::sleep(step);
                 }
                 Err(error) => return Err(error.to_string()),
             }
@@ -1972,15 +1981,53 @@ mod tests {
             work.git(&root, &["add", "--all"])?;
             work.git(&root, &commit)?;
             let broken = work.snapshot(&root, "HEAD~1", 0)?;
-            for path in adapters {
-                assert!(
-                    work.adapter_checks(&policy, &broken, &selection(&[path.into()]))
-                        .is_err(),
-                    "Trusted controls must reject the non-HEAD candidate's {path}."
-                );
-            }
             let repaired = work.snapshot(&root, "HEAD", 1)?;
-            work.adapter_checks(&policy, &repaired, &selection(&adapters.map(String::from)))
+            std::thread::scope(|scope| -> Result<()> {
+                let mut broken_handles = Vec::with_capacity(adapters.len());
+                for (idx, path) in adapters.into_iter().enumerate() {
+                    let dir = scratch.join(format!("adapter-broken-{idx}"));
+                    fs::create_dir(&dir).map_err(|error| error.to_string())?;
+                    let policy_ref = &policy;
+                    let broken_ref = &broken;
+                    broken_handles.push((
+                        path,
+                        scope.spawn(move || -> Result<()> {
+                            let mut sub_work = Work {
+                                directory: dir,
+                                started: Instant::now(),
+                                sequence: 0,
+                            };
+                            sub_work.adapter_checks(
+                                policy_ref,
+                                broken_ref,
+                                &selection(&[path.into()]),
+                            )
+                        }),
+                    ));
+                }
+                let repaired_dir = scratch.join("adapter-repaired");
+                fs::create_dir(&repaired_dir).map_err(|error| error.to_string())?;
+                let mut repaired_work = Work {
+                    directory: repaired_dir,
+                    started: Instant::now(),
+                    sequence: 0,
+                };
+                let repaired_res = repaired_work.adapter_checks(
+                    &policy,
+                    &repaired,
+                    &selection(&adapters.map(String::from)),
+                );
+                for (path, handle) in broken_handles {
+                    let res = handle
+                        .join()
+                        .map_err(|_| "Adapter fixture worker panicked.".to_owned())?;
+                    assert!(
+                        res.is_err(),
+                        "Trusted controls must reject the non-HEAD candidate's {path}."
+                    );
+                }
+                repaired_res
+            })
         })();
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Push adapter fixture cleanup escaped temp.".into());

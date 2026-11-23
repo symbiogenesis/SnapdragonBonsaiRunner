@@ -1,6 +1,6 @@
 //! Native model-free probe regressions under the production headless policy.
-#![forbid(unsafe_code)]
 #![cfg(all(windows, feature = "test-probe"))]
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};

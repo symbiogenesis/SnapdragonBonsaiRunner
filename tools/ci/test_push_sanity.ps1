@@ -8,8 +8,15 @@ if (-not [Console]::IsInputRedirected) {
     exit $LASTEXITCODE
 }
 . (Join-Path $PSScriptRoot 'test_support.ps1')
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 $adapter = Join-Path $PSScriptRoot 'check_push_sanity.ps1'
 $script:PushTemplateCache = @{}
+
+function Get-CiFileSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    try { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
+    finally { $stream.Dispose() }
+}
 
 function Copy-CiTree([string]$Source, [string]$Destination) {
     $stack = [Collections.Generic.Stack[string[]]]::new()
@@ -107,7 +114,7 @@ function Invoke-PushRecoveryFixture([string]$CheckerState, [string]$RecoveryStat
                 # It cannot compile a checker or manufacture a successful receipt.
                 Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32/where.exe') -Destination $recovery -Force
             }
-            $checkerReceipt = @{SchemaVersion = 1; SourceIdentity = $identities.checker; Sha256 = (Get-FileHash -LiteralPath $checker -Algorithm SHA256).Hash.ToLowerInvariant() }
+            $checkerReceipt = @{SchemaVersion = 1; SourceIdentity = $identities.checker; Sha256 = (Get-CiFileSha256 $checker) }
             if ($CheckerState -ceq 'stale') { $checkerReceipt.SourceIdentity = '0' * 64 }
             if ($CheckerState -ceq 'collection-source') { $checkerReceipt.SourceIdentity = @($identities.checker, ('0' * 64)) }
             if ($CheckerState -ceq 'collection-digest') { $checkerReceipt.Sha256 = @($checkerReceipt.Sha256, ('0' * 64)) }
@@ -115,7 +122,7 @@ function Invoke-PushRecoveryFixture([string]$CheckerState, [string]$RecoveryStat
             if ($CheckerState -ceq 'missing') { [IO.File]::Delete((Join-Path $target 'push-checker.json')) }
             if ($CheckerState -ceq 'malformed') { Write-CiFixture $target 'push-checker.json' '{"unfinished":' }
             if ($CheckerState -ceq 'corrupt') { [IO.File]::AppendAllText($checker, 'Changed after receipt publication.') }
-            $recoveryReceipt = @{SchemaVersion = 1; SourceIdentity = $identities.recovery; Sha256 = (Get-FileHash -LiteralPath $recovery -Algorithm SHA256).Hash.ToLowerInvariant() }
+            $recoveryReceipt = @{SchemaVersion = 1; SourceIdentity = $identities.recovery; Sha256 = (Get-CiFileSha256 $recovery) }
             if ($RecoveryState -ceq 'invalid') { $recoveryReceipt.Sha256 = '0' * 64 }
             if ($RecoveryState -ceq 'stale') { $recoveryReceipt.SourceIdentity = '0' * 64 }
             if ($RecoveryState -ceq 'collection-source') { $recoveryReceipt.SourceIdentity = @($identities.recovery, ('0' * 64)) }
@@ -151,7 +158,7 @@ function Invoke-PushRecoveryFixture([string]$CheckerState, [string]$RecoveryStat
                         Assert-Ci (-not ($args -ccontains '--')) 'Recovery selected a partial policy archive.'
                         $archive = @($args | Where-Object { $_.StartsWith('--output=', [StringComparison]::Ordinal) })[0].Substring(9)
                         $unpacked = Join-Path (Split-Path $repository -Parent) 'unpacked'
-                        Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+                        [IO.Compression.ZipFile]::ExtractToDirectory($archive, $unpacked, $true)
                         Assert-CiEqual ([IO.File]::ReadAllText((Join-Path $unpacked 'unrelated-source.txt'))) 'Committed full-source input.'
                         Assert-Ci (Test-Path -LiteralPath (Join-Path $unpacked 'Cargo.toml')) 'Recovery omitted committed build inputs.'
                         if ($RecoveryState -cne 'valid') {
@@ -228,7 +235,7 @@ $cases = [ordered]@{
             $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
             $binary = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
             Write-CiFixture $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe' 'Inert checker; archive interception must stop before execution.'
-            @{SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-checker.json') -Encoding utf8NoBOM
+            @{SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-CiFileSha256 $binary) } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-checker.json') -Encoding utf8NoBOM
             foreach ($name in $policy) { Write-CiFixture $repository "tools/ci/$name" 'Uncommitted poison must not become checking policy.' }
             $gitPath = (Get-Command git -CommandType Application).Source
             Invoke-RedirectedStdin "refs/heads/main $head refs/heads/main $head`n" {
@@ -239,7 +246,7 @@ $cases = [ordered]@{
                     if ($args -ccontains 'archive') {
                         $archive = @($args | Where-Object { $_.StartsWith('--output=', [StringComparison]::Ordinal) })[0].Substring(9)
                         $unpacked = Join-Path (Split-Path $repository -Parent) 'unpacked'
-                        Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+                        [IO.Compression.ZipFile]::ExtractToDirectory($archive, $unpacked, $true)
                         $expected = @('check_push_snapshot.ps1', 'check_owned_languages.ps1', 'check_powershell_syntax.ps1', 'check_workflow_startup.ps1', 'check_workflow_syntax.ps1', 'native_ci_cache.ps1', 'test_device_concurrency.ps1', 'test_foundation_handoff.ps1', 'test_native_ci_cache.ps1', 'test_rust_toolchain.ps1', 'test_tools_cache_inputs.ps1', 'test_source_checks.ps1', 'test_support.ps1')
                         $actual = @(Get-ChildItem -LiteralPath $unpacked -File -Recurse | ForEach-Object { [IO.Path]::GetRelativePath($unpacked, $_.FullName).Replace('\', '/') })
                         Assert-CiSet $actual @($expected | ForEach-Object { "tools/ci/$_" })
@@ -265,24 +272,15 @@ $cases = [ordered]@{
             & git -C $repository -c user.name=Fixture -c user.email=fixture@example.invalid -c core.hooksPath= -c commit.gpgsign=false commit --quiet -m fixture
             if ($LASTEXITCODE) { throw 'Cannot commit fresh preparation fixture.' }
             Assert-Ci (-not (Test-Path -LiteralPath $target)) 'Fresh preparation target already exists.'
-            $driver = Join-Path $scratch 'prepare-driver.ps1'
-            @'
-#Requires -Version 7.6
-param([string]$Adapter,[string]$Repository,[string]$Target,[string]$Support)
-. $Support
-Assert-Ci ([Console]::IsInputRedirected) 'Preparation fixture requires redirected stdin.'
-$originalInput=[Console]::In
-$unreadableInput=[IO.StringReader]::new('Preparation must ignore this stream.')
-$unreadableInput.Dispose()
-try {
-    # Any read fails immediately, exposing open-pipe hangs without hanging CI.
-    [Console]::SetIn($unreadableInput)
-    Assert-CiReject { & $Adapter -Root $Repository -TargetDirectory $Target -Prepare } 'Cold-start reached committed bootstrap; Cargo must not run.'
-} finally { [Console]::SetIn($originalInput) }
-'Preparation ignored redirected stdin and reached committed bootstrap.'
-'@ | Set-Content -LiteralPath $driver -Encoding utf8NoBOM
-            'Unused redirected input.' | & ([Environment]::ProcessPath) -NoLogo -NoProfile -NonInteractive -File $driver -Adapter $adapter -Repository $repository -Target $target -Support (Join-Path $PSScriptRoot 'test_support.ps1')
-            if ($LASTEXITCODE) { throw 'Redirected-input preparation fixture failed.' }
+            Assert-Ci ([Console]::IsInputRedirected) 'Preparation fixture requires redirected stdin.'
+            $originalInput = [Console]::In
+            $unreadableInput = [IO.StringReader]::new('Preparation must ignore this stream.')
+            $unreadableInput.Dispose()
+            try {
+                # Any read fails immediately, exposing open-pipe hangs without hanging CI.
+                [Console]::SetIn($unreadableInput)
+                Assert-CiReject { & $adapter -Root $repository -TargetDirectory $target -Prepare } 'Cold-start reached committed bootstrap; Cargo must not run.'
+            } finally { [Console]::SetIn($originalInput) }
             Assert-Ci (-not (Test-Path -LiteralPath (Join-Path $target 'push-checker.json'))) 'Failed fresh preparation published a receipt.'
         } finally { Remove-CiScratch $scratch }
     }
@@ -333,25 +331,25 @@ function Get-ReleaseToolchain([string]$RepositoryRoot) {
             Write-CiFixture $cargoHome 'bin/cargo.exe' 'Inert cargo-home placeholder; must never execute.'
             Write-CiFixture $userProfile '.cargo/bin/cargo.exe' 'Inert user-profile placeholder; must never execute.'
             $gitDirectory = [IO.Path]::GetDirectoryName((Get-Command git -CommandType Application | Select-Object -First 1).Source)
-            $driver = Join-Path $scratch 'cargo-path-driver.ps1'
-            @'
-#Requires -Version 7.6
-param([string]$Adapter,[string]$Repository,[string]$Target,[string]$GitDirectory,[string]$CargoHome,[string]$UserProfile,[string]$CargoHomeExe,[string]$UserProfileExe,[string]$Support)
-. $Support
-$cleanPath=$GitDirectory+[IO.Path]::PathSeparator+(Join-Path $env:SystemRoot 'System32')
-$env:PATH=$cleanPath
-Assert-Ci ($null -eq (Get-Command cargo.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)) 'Clean fixture PATH unexpectedly contained cargo.exe.'
-[Environment]::SetEnvironmentVariable('CARGO_HOME',$CargoHome)
-[Environment]::SetEnvironmentVariable('USERPROFILE',$UserProfile)
-Assert-CiReject { & $Adapter -Root $Repository -TargetDirectory $Target -Prepare } "Cargo resolved at: $CargoHomeExe"
-Assert-Ci ([Environment]::GetEnvironmentVariable('PATH') -ceq $cleanPath) 'Adapter did not restore PATH after CARGO_HOME fallback.'
-[Environment]::SetEnvironmentVariable('CARGO_HOME',[NullString]::Value)
-Assert-CiReject { & $Adapter -Root $Repository -TargetDirectory $Target -Prepare } "Cargo resolved at: $UserProfileExe"
-Assert-Ci ([Environment]::GetEnvironmentVariable('PATH') -ceq $cleanPath) 'Adapter did not restore PATH after USERPROFILE fallback.'
-'Cargo PATH fallback and restoration passed.'
-'@ | Set-Content -LiteralPath $driver -Encoding utf8NoBOM
-            & ([Environment]::ProcessPath) -NoLogo -NoProfile -NonInteractive -File $driver -Adapter $adapter -Repository $repository -Target $target -GitDirectory $gitDirectory -CargoHome $cargoHome -UserProfile $userProfile -CargoHomeExe $cargoHomeExe -UserProfileExe $userProfileExe -Support (Join-Path $PSScriptRoot 'test_support.ps1')
-            if ($LASTEXITCODE) { throw 'Cargo PATH fallback fixture failed.' }
+            $cleanPath = $gitDirectory + [IO.Path]::PathSeparator + (Join-Path $env:SystemRoot 'System32')
+            $origPath = [Environment]::GetEnvironmentVariable('PATH')
+            $origCargoHome = [Environment]::GetEnvironmentVariable('CARGO_HOME')
+            $origUserProfile = [Environment]::GetEnvironmentVariable('USERPROFILE')
+            try {
+                $env:PATH = $cleanPath
+                Assert-Ci ($null -eq (Get-Command cargo.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)) 'Clean fixture PATH unexpectedly contained cargo.exe.'
+                [Environment]::SetEnvironmentVariable('CARGO_HOME', $cargoHome)
+                [Environment]::SetEnvironmentVariable('USERPROFILE', $userProfile)
+                Assert-CiReject { & $adapter -Root $repository -TargetDirectory $target -Prepare } "Cargo resolved at: $cargoHomeExe"
+                Assert-Ci ([Environment]::GetEnvironmentVariable('PATH') -ceq $cleanPath) 'Adapter did not restore PATH after CARGO_HOME fallback.'
+                [Environment]::SetEnvironmentVariable('CARGO_HOME', [NullString]::Value)
+                Assert-CiReject { & $adapter -Root $repository -TargetDirectory $target -Prepare } "Cargo resolved at: $userProfileExe"
+                Assert-Ci ([Environment]::GetEnvironmentVariable('PATH') -ceq $cleanPath) 'Adapter did not restore PATH after USERPROFILE fallback.'
+            } finally {
+                if ($null -eq $origPath) { [Environment]::SetEnvironmentVariable('PATH', [NullString]::Value) } else { [Environment]::SetEnvironmentVariable('PATH', $origPath) }
+                if ($null -eq $origCargoHome) { [Environment]::SetEnvironmentVariable('CARGO_HOME', [NullString]::Value) } else { [Environment]::SetEnvironmentVariable('CARGO_HOME', $origCargoHome) }
+                if ($null -eq $origUserProfile) { [Environment]::SetEnvironmentVariable('USERPROFILE', [NullString]::Value) } else { [Environment]::SetEnvironmentVariable('USERPROFILE', $origUserProfile) }
+            }
         } finally { Remove-CiScratch $scratch }
     }
 }

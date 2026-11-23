@@ -1,0 +1,452 @@
+//! Regenerates the native application icon from its bounded two-leaf SVG source.
+#![forbid(unsafe_code)]
+
+use flate2::{Compression, write::ZlibEncoder};
+use std::{fs, io::Write as _, path::Path, process::ExitCode};
+
+type Result<T> = std::result::Result<T, String>;
+const SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
+const SCALE: u32 = 4;
+
+#[derive(Clone, Copy)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+struct Shape {
+    points: Vec<Point>,
+    fill: bool,
+    stroke: f64,
+    closed: bool,
+}
+
+fn attribute<'a>(tag: &'a str, name: &str) -> Result<Option<&'a str>> {
+    let prefix = format!("{name}=\"");
+    let mut values = tag.match_indices(&prefix);
+    let Some((index, _)) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(format!("Duplicate SVG attribute: {name}"));
+    }
+    Ok(Some(
+        tag[index + prefix.len()..]
+            .split_once('"')
+            .ok_or("Unterminated SVG attribute.")?
+            .0,
+    ))
+}
+
+fn attributes(tag: &str, allowed: &[&str]) -> Result<()> {
+    let mut rest = tag
+        .split_once(' ')
+        .ok_or("Missing SVG attributes.")?
+        .1
+        .trim_end_matches('/')
+        .trim();
+    while !rest.is_empty() {
+        let (name, value) = rest.split_once("=\"").ok_or("Invalid SVG attribute.")?;
+        if !allowed.contains(&name) {
+            return Err(format!("Unsupported SVG attribute: {name}"));
+        }
+        rest = value
+            .split_once('"')
+            .ok_or("Unterminated SVG attribute.")?
+            .1
+            .trim_start();
+        attribute(tag, name)?;
+    }
+    Ok(())
+}
+
+fn number(tokens: &[&str], index: &mut usize) -> Result<f64> {
+    let value = tokens
+        .get(*index)
+        .ok_or("Incomplete SVG coordinate.")?
+        .parse::<f64>()
+        .map_err(|_| "Invalid SVG coordinate.")?;
+    *index += 1;
+    if !value.is_finite() || !(0.0..=24.0).contains(&value) {
+        return Err("SVG coordinate outside native 24-unit mark.".into());
+    }
+    Ok(value)
+}
+fn point(tokens: &[&str], index: &mut usize) -> Result<Point> {
+    Ok(Point {
+        x: number(tokens, index)?,
+        y: number(tokens, index)?,
+    })
+}
+fn cubic(start: Point, control1: Point, control2: Point, end: Point, t: f64) -> Point {
+    let u = 1.0 - t;
+    let weights = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+    let coordinate = |a, b, c, d| {
+        weights[3].mul_add(
+            d,
+            weights[2].mul_add(c, weights[1].mul_add(b, weights[0] * a)),
+        )
+    };
+    Point {
+        x: coordinate(start.x, control1.x, control2.x, end.x),
+        y: coordinate(start.y, control1.y, control2.y, end.y),
+    }
+}
+
+// Accept the repository's small SVG dialect explicitly. Unsupported geometry,
+// transforms and external resources must never silently change the native mark.
+fn parse(source: &str) -> Result<Vec<Shape>> {
+    if source.len() > 16_384
+        || source.contains(['&', '!'])
+        || !source.trim_start().starts_with("<svg ")
+        || !source.trim_end().ends_with("</svg>")
+    {
+        return Err("Unsupported application SVG root or extent.".into());
+    }
+    let mut shapes = Vec::new();
+    let mut root_seen = false;
+    for element in source.split('<').skip(1) {
+        let (tag, trailing) = element.split_once('>').ok_or("Unterminated SVG tag.")?;
+        if !trailing.trim().is_empty() {
+            return Err("SVG text nodes unsupported.".into());
+        }
+        if tag == "/svg" {
+            continue;
+        }
+        if tag.starts_with("svg ") {
+            attributes(tag, &["xmlns", "viewBox", "width", "height"])?;
+            if root_seen
+                || attribute(tag, "viewBox")? != Some("0 0 24 24")
+                || attribute(tag, "xmlns")? != Some("http://www.w3.org/2000/svg")
+            {
+                return Err("SVG requires viewBox 0 0 24 24.".into());
+            }
+            root_seen = true;
+            continue;
+        }
+        if !tag.starts_with("path ") || !tag.ends_with('/') || shapes.len() >= 8 {
+            return Err("Only bounded self-closing SVG paths supported.".into());
+        }
+        attributes(tag, &["d", "fill", "stroke", "stroke-width"])?;
+        let fill = match attribute(tag, "fill")? {
+            Some("#2e8555") => true,
+            Some("none") => false,
+            _ => return Err("SVG fill must use native branding color.".into()),
+        };
+        let stroke = match (attribute(tag, "stroke")?, attribute(tag, "stroke-width")?) {
+            (None, None) => 0.0,
+            (Some("#2e8555"), Some(width)) => {
+                let width = width
+                    .parse::<f64>()
+                    .map_err(|_| "Invalid SVG stroke width.")?;
+                if !width.is_finite() || !(0.0..=4.0).contains(&width) {
+                    return Err("SVG stroke exceeds bound.".into());
+                }
+                width
+            }
+            _ => return Err("Unsupported SVG stroke.".into()),
+        };
+        let tokens: Vec<_> = attribute(tag, "d")?
+            .ok_or("Missing SVG path.")?
+            .split_whitespace()
+            .collect();
+        if tokens.len() > 128 || tokens.first() != Some(&"M") {
+            return Err("SVG paths require one bounded move.".into());
+        }
+        let mut index = 1;
+        let mut points = vec![point(&tokens, &mut index)?];
+        let mut closed = false;
+        while index < tokens.len() {
+            let command = tokens[index];
+            index += 1;
+            match command {
+                "C" if !closed => {
+                    let a = *points.last().ok_or("Missing SVG move.")?;
+                    let b = point(&tokens, &mut index)?;
+                    let c = point(&tokens, &mut index)?;
+                    let d = point(&tokens, &mut index)?;
+                    for step in 1..=128 {
+                        points.push(cubic(a, b, c, d, f64::from(step) / 128.0));
+                    }
+                }
+                "Z" if !closed && index == tokens.len() => {
+                    closed = true;
+                }
+                _ => return Err(format!("Unsupported SVG command: {command}")),
+            }
+        }
+        if points.len() < 2 || (fill && !closed) || (!fill && stroke == 0.0) {
+            return Err("SVG path has no visible geometry.".into());
+        }
+        shapes.push(Shape {
+            points,
+            fill,
+            stroke,
+            closed,
+        });
+    }
+    if shapes.is_empty() {
+        return Err("SVG paths missing.".into());
+    }
+    Ok(shapes)
+}
+
+fn segments(shape: &Shape) -> impl Iterator<Item = (Point, Point)> {
+    shape
+        .points
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .chain(
+            shape
+                .closed
+                .then(|| (shape.points[shape.points.len() - 1], shape.points[0])),
+        )
+}
+fn inside(shape: &Shape, p: Point) -> bool {
+    let mut winding = 0_i32;
+    for (a, b) in segments(shape) {
+        let cross = (p.x - a.x).mul_add(-(b.y - a.y), (b.x - a.x) * (p.y - a.y));
+        if a.y <= p.y && b.y > p.y && cross > 0.0 {
+            winding += 1;
+        }
+        if a.y > p.y && b.y <= p.y && cross < 0.0 {
+            winding -= 1;
+        }
+    }
+    winding != 0
+}
+fn on_stroke(shape: &Shape, p: Point) -> bool {
+    segments(shape).any(|(a, b)| {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let length = dy.mul_add(dy, dx * dx);
+        if length == 0.0 {
+            return false;
+        }
+        let t = (p.y - a.y).mul_add(dy, (p.x - a.x) * dx) / length;
+        if !(0.0..=1.0).contains(&t) {
+            return false;
+        }
+        let x = p.x - t.mul_add(dx, a.x);
+        let y = p.y - t.mul_add(dy, a.y);
+        y.mul_add(y, x * x) <= shape.stroke * shape.stroke / 4.0
+    })
+}
+fn rasterize(shapes: &[Shape], size: u32) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let samples = SCALE * SCALE;
+    for y in 0..size {
+        raw.push(0); // PNG scanline filter: None.
+        for x in 0..size {
+            let mut coverage = 0_u32;
+            for sy in 0..SCALE {
+                for sx in 0..SCALE {
+                    let p = Point {
+                        x: (f64::from(x * SCALE + sx) + 0.5) * 24.0 / f64::from(size * SCALE),
+                        y: (f64::from(y * SCALE + sy) + 0.5) * 24.0 / f64::from(size * SCALE),
+                    };
+                    if shapes
+                        .iter()
+                        .any(|s| (s.fill && inside(s, p)) || (s.stroke > 0.0 && on_stroke(s, p)))
+                    {
+                        coverage += 1;
+                    }
+                }
+            }
+            raw.extend_from_slice(&[
+                0x2e,
+                0x85,
+                0x55,
+                u8::try_from((coverage * 255 + samples / 2) / samples)
+                    .map_err(|e| e.to_string())?,
+            ]);
+        }
+    }
+    Ok(raw)
+}
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+fn chunk(png: &mut Vec<u8>, kind: [u8; 4], bytes: &[u8]) -> Result<()> {
+    png.extend_from_slice(
+        &u32::try_from(bytes.len())
+            .map_err(|e| e.to_string())?
+            .to_be_bytes(),
+    );
+    let start = png.len();
+    png.extend_from_slice(&kind);
+    png.extend_from_slice(bytes);
+    png.extend_from_slice(&crc32(&png[start..]).to_be_bytes());
+    Ok(())
+}
+fn png(shapes: &[Shape], size: u32) -> Result<Vec<u8>> {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::from(size.to_be_bytes());
+    header.extend_from_slice(&size.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(&mut png, *b"IHDR", &header)?;
+    let mut compressed = ZlibEncoder::new(Vec::new(), Compression::best());
+    compressed
+        .write_all(&rasterize(shapes, size)?)
+        .map_err(|e| e.to_string())?;
+    chunk(
+        &mut png,
+        *b"IDAT",
+        &compressed.finish().map_err(|e| e.to_string())?,
+    )?;
+    chunk(&mut png, *b"IEND", &[])?;
+    Ok(png)
+}
+fn ico(frames: &[Vec<u8>]) -> Result<Vec<u8>> {
+    if frames.len() != SIZES.len() {
+        return Err("ICO frame inventory differs.".into());
+    }
+    let mut ico = vec![0, 0, 1, 0, 7, 0];
+    let mut offset = 118_u32;
+    for (size, frame) in SIZES.into_iter().zip(frames) {
+        let dimension = u8::try_from(size % 256).map_err(|e| e.to_string())?;
+        ico.extend_from_slice(&[dimension, dimension, 0, 0, 1, 0, 32, 0]);
+        let length = u32::try_from(frame.len()).map_err(|e| e.to_string())?;
+        ico.extend_from_slice(&length.to_le_bytes());
+        ico.extend_from_slice(&offset.to_le_bytes());
+        offset = offset.checked_add(length).ok_or("ICO length overflow.")?;
+    }
+    for frame in frames {
+        ico.extend_from_slice(frame);
+    }
+    Ok(ico)
+}
+fn generate(directory: &Path) -> Result<()> {
+    let file = fs::File::open(directory.join("bonsai.svg")).map_err(|e| e.to_string())?;
+    let mut source = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(file, 16_385), &mut source)
+        .map_err(|e| e.to_string())?;
+    let shapes = parse(&source)?;
+    let frames = SIZES
+        .into_iter()
+        .map(|size| png(&shapes, size))
+        .collect::<Result<Vec<_>>>()?;
+    fs::write(directory.join("bonsai.ico"), ico(&frames)?).map_err(|e| e.to_string())?;
+    fs::write(directory.join("bonsai.png"), &frames[frames.len() - 1])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn run() -> Result<()> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    match args.as_slice() {
+        [command, option, directory] if command == "icons" && option == "--assets" => {
+            generate(Path::new(directory))
+        }
+        _ => Err("Usage: bonsai-assets icons --assets DIRECTORY".into()),
+    }
+}
+/// Executes the native application icon asset generator CLI.
+#[must_use]
+pub fn run_cli() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(std::io::stderr().lock(), "{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+    const SOURCE: &str = include_str!("../../../src/chat-ui/assets/bonsai.svg");
+    #[test]
+    fn icon_rejects_unsupported_geometry_and_changed_branding() {
+        assert_eq!(parse(SOURCE).ok().map(|s| s.len()), Some(3));
+        for changed in [
+            SOURCE.replace("C ", "L "),
+            SOURCE.replace("#2e8555", "#ffffff"),
+            SOURCE.replace("fill=", "transform="),
+            SOURCE.replace("21.5", "999"),
+            SOURCE.replace("24 24", "48 48"),
+            SOURCE.replace("<svg ", "<svg transform=\"translate(2 2)\" "),
+        ] {
+            assert!(parse(&changed).is_err());
+        }
+    }
+    #[test]
+    fn icon_png_has_valid_chunks_transparency_and_native_color() -> Result<()> {
+        let frame = png(&parse(SOURCE)?, 16)?;
+        let (signature, mut rest) = frame
+            .split_first_chunk::<8>()
+            .ok_or("Truncated PNG signature.")?;
+        assert_eq!(signature, b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&frame[16..24], &[0, 0, 0, 16, 0, 0, 0, 16]);
+        let mut payload = Vec::new();
+        while !rest.is_empty() {
+            let (len_bytes, after_len) = rest
+                .split_first_chunk::<4>()
+                .ok_or("Truncated PNG chunk length.")?;
+            let length =
+                usize::try_from(u32::from_be_bytes(*len_bytes)).map_err(|e| e.to_string())?;
+            let (kind_and_data, after_body) = after_len
+                .split_at_checked(4 + length)
+                .ok_or("Truncated PNG chunk payload.")?;
+            let (crc_bytes, next) = after_body
+                .split_first_chunk::<4>()
+                .ok_or("Truncated PNG chunk CRC.")?;
+            assert_eq!(crc32(kind_and_data), u32::from_be_bytes(*crc_bytes));
+            let (kind, data) = kind_and_data
+                .split_first_chunk::<4>()
+                .ok_or("Missing PNG chunk kind.")?;
+            if kind == b"IDAT" {
+                flate2::read::ZlibDecoder::new(data)
+                    .read_to_end(&mut payload)
+                    .map_err(|e| e.to_string())?;
+            }
+            rest = next;
+        }
+        assert_eq!(payload.len(), 16 * 65);
+        let pixels: Vec<_> = payload
+            .as_chunks::<65>()
+            .0
+            .iter()
+            .filter_map(|row| row.split_first())
+            .flat_map(|(_, row)| row.as_chunks::<4>().0.iter())
+            .collect();
+        assert!(pixels.iter().all(|p| p[..3] == [0x2e, 0x85, 0x55]));
+        for alpha in [0, 255] {
+            assert!(pixels.iter().any(|p| p[3] == alpha));
+        }
+        assert!(pixels.iter().any(|p| p[3] > 0 && p[3] < 255));
+        Ok(())
+    }
+    #[test]
+    fn icon_ico_preserves_all_frame_sizes_offsets_and_payloads() -> Result<()> {
+        let frames: Vec<_> = SIZES
+            .into_iter()
+            .map(|s| s.to_le_bytes().to_vec())
+            .collect();
+        let icon = ico(&frames)?;
+        let (header, rest) = icon
+            .split_first_chunk::<6>()
+            .ok_or("Truncated ICO header.")?;
+        assert_eq!(header, &[0, 0, 1, 0, 7, 0]);
+        for ((size, entry), expected_frame) in
+            SIZES.into_iter().zip(rest.as_chunks::<16>().0).zip(&frames)
+        {
+            assert_eq!(u32::from(entry[0]), size % 256);
+            assert_eq!(entry[0], entry[1]);
+            assert_eq!(&entry[4..8], &[1, 0, 32, 0]);
+            let (_, tail) = entry.split_at(12);
+            let (offset_bytes, _) = tail.split_first_chunk::<4>().ok_or("offset")?;
+            let offset =
+                usize::try_from(u32::from_le_bytes(*offset_bytes)).map_err(|e| e.to_string())?;
+            assert_eq!(&icon[offset..offset + 4], expected_frame);
+        }
+        Ok(())
+    }
+}
