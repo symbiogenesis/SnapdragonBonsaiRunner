@@ -5,10 +5,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
-use bonsai_artifacts::{
-    MultiRankEnvelope, is_redirect, open_locked_file, validate_external_path,
-    verify_multi_rank_lora_gguf,
-};
+#[cfg(windows)]
+use bonsai_artifacts::{MultiRankEnvelope, verify_multi_rank_lora_gguf};
+use bonsai_artifacts::{is_redirect, open_locked_file, validate_external_path};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zip::ZipArchive;
