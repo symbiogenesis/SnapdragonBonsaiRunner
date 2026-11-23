@@ -64,6 +64,7 @@ overflow-checks = true
 debug-assertions = false
 
 [profile.test]
+opt-level = 1
 overflow-checks = true
 debug-assertions = true
 debug = "line-tables-only"

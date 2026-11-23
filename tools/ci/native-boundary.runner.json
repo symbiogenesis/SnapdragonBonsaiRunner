@@ -105,8 +105,8 @@
     },
     {
       "path": "Cargo.toml",
-      "bytes": 5087,
-      "sha256": "18010ff0eafd16462ac83e8cf9426a79a4df5bc747e7dddf6310ad573d4e5f37",
+      "bytes": 5102,
+      "sha256": "e0e8ec084a712c9708bf19ff08acb517cd7ed61ea073473b1baa10be9f472822",
       "family": "msvc-unwind"
     },
     {
