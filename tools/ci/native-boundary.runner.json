@@ -100,13 +100,13 @@
     {
       "path": "Cargo.lock",
       "bytes": 140021,
-      "sha256": "260d866e41ce6efa20f256adb006f5195808f2fecfdf68f60932bb839d420b6c",
+      "sha256": "3203760224974cb0a42eccc89014aef98ac74a367cca4287bde4ff72c8fe4851",
       "family": "native-asr"
     },
     {
       "path": "Cargo.toml",
       "bytes": 5003,
-      "sha256": "b30f728f9e594efbd2857cf9c74974a61323578f7c2a3eeee22b8b31364e43ab",
+      "sha256": "7b3f352fa61493a4474d08cc9c18ad5d7b2a4dda9eb15553fa3e6deefc23facf",
       "family": "msvc-unwind"
     },
     {
