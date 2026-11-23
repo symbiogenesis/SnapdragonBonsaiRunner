@@ -7,8 +7,8 @@ run on native ARM64 as part of target-profile acceptance.
 This guide owns arithmetic, dispatch, qualification and the
 [X2 thread screen](#x2-cpu-thread-screen). Synthetic parity qualifies neither
 whole-model parity nor device speedup. Runner's active
-[release lock](../config/prism-inference.lock.json) pins Prism 0.1.32 at
-`23e24e444a821d4426f65d56c6cf874cf568b0d9`; later source candidates retain separate identities. The fixed CPU
+[release lock](../config/prism-inference.lock.json) pins Prism 0.1.34 at
+`c64c9648f85ac4c99ff8d57f709871b31e785370`; later source candidates retain separate identities. The fixed CPU
 comparison baseline remains 0.1.23 with explicit FP16 KV. The current development repin
 does not qualify CPU performance; [PLAN.md](../PLAN.md#cpu-kernels) owns remaining work.
 
@@ -75,7 +75,7 @@ The pinned source includes these consumers. Parallel quantized attention serves
 the selected packed-cache path; explicit `--cpu-prefill-tokens 8|16|32` prompt
 tiling is wired end-to-end through `bonsai-cpu-policy`, `bonsai-tools`, `bonsai-chat`
 and `bonsai-broker` (omitted by default, pairing exact `--cpu-prefill-scratch-bytes`
-and `:cpu-tiled-ffn-v1:{tokens}` readiness on Prism `0.1.32` (with mixed-phase
+and `:cpu-tiled-ffn-v1:{tokens}` readiness on Prism `0.1.34` (with mixed-phase
 Hexagon decode retained unless `--placement cpu` or `--spec-type suffix` is selected,
 alongside `--cpu-prefill-gdn sequential|wy-f32`, `--spec-type none|suffix`,
 `--draft-max 1..=8`, and `--cpu-family x1|x2`):
@@ -95,15 +95,15 @@ below) remain gated on compiled strict Release checks, fallback controls and mat
 complete-request CI receipts. Deferred CPU kernel candidates (`#23`–`#25`, `#27`, `#29`)
 remain outside the active implementation queue until baseline attribution establishes an
 actionable hotspot and each path closes its exact arithmetic, tail/scale and benefit
-requirements. The `0.1.32` binary delivery (incorporating `0.1.31`) includes its source-bound helper
+requirements. The `0.1.34` binary delivery (incorporating `0.1.31`/`0.1.32`) includes its source-bound helper
 implementations; it does not establish model parity, benefit or profile promotion. Changed
 helper registry APIs still require publication before dependent registry crates; binary
 delivery does not establish that separate publication.
 
-### 0.1.31 / 0.1.32 runtime candidates (pending hosted CI and device qualification)
+### 0.1.31–0.1.34 runtime candidates (pending hosted CI and device qualification)
 
-Pinned `0.1.32` incorporates `0.1.31`'s CPU runtime optimizations alongside
-`--cpu-prefill-gdn wy-f32` (`:gdn-wy-f32-v1`), `--spec-type suffix`
+Pinned `0.1.34` incorporates `0.1.31`/`0.1.32`'s CPU runtime optimizations alongside
+`--cpu-prefill-gdn wy-f32` (`:gdn-wy-f32-v1`, including rotated-KV profiles), `--spec-type suffix`
 (`--draft-max 1..=8`), `--prompt-reuse prompt-end-and-latest`, and `[token][head]`
 probabilities (verified in local unit/workspace checks; awaiting full hosted
 Foundation acceptance and complete X1/X2 device qualification):
@@ -118,8 +118,7 @@ Foundation acceptance and complete X1/X2 device qualification):
   once per KV head across all `G` query heads in both decode (`6:1` for Swift's
   24 query / 4 KV heads) and tiled prefill while preserving exact binary32/binary64
   rounding and reduction order.
-- **Post-lock local Prism candidates (`75e1a69`, `f2efd9c`, `af6274d`; awaiting release
-  publication and paired CI/device qualification):**
+- **CPU kernels and scheduler updates included in pinned `0.1.34` (`75e1a69`, `f2efd9c`, `af6274d`, and Wave 5 NEON kernels; awaiting paired CI/device qualification):**
   - `75e1a69` (`NativeRowPool`): cache-line padded atomics, `SPIN_ITERATIONS = 32_768`,
     and Dekker sleep/wake skipping hot-path mutex/condvar syscalls.
   - `f2efd9c` (`neon-dot`, `prefill_neon`): eliminated register spills on `pq2_scaled_rows` /
@@ -591,7 +590,7 @@ work observations, not latency or memory measurements.
 
 Native ARM64/feature-disabled analysis, scalar controls, production linking,
 full-model state/logit/adapter/cancellation acceptance and matched complete-request
-benefit remain required. Runner's 0.1.32 development pin consumes these source
+benefit remain required. Runner's 0.1.34 development pin consumes these source
 changes without qualifying the named controls, model behavior or benefit.
 
 ### Bounded attention score growth
@@ -615,7 +614,7 @@ Poisoned ordinary/tiled score controls, allocation refusal, non-power-of-two
 ceilings and short tails cover storage ownership independently of timing.
 Strict Release analysis/linking, compiled controls, complete-model state/logits/
 adapters/cancellation and matched CPU request benefit remain pending. Runner's
-0.1.32 development pin consumes these source changes without qualifying the
+0.1.34 development pin consumes these source changes without qualifying the
 complete-model controls or matched CPU request benefit.
 
 ## Execution and dispatch

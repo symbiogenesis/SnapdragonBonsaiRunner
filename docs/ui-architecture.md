@@ -433,7 +433,7 @@ and [Qwen](../tools/qwen-tts/README.md) READMEs define companion protocols.
 Service failure exposes setup guidance without substituting a recognizer or
 Windows voice. Image and video keyframe context requires a vision-capable Swift
 launch (`Input modalities: text, image` with verified `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`
-on pinned native Rust `0.1.32` and `--publisher-engine`; `--no-mmproj` or
+on pinned native Rust `0.1.34` and `--publisher-engine`; `--no-mmproj` or
 `--spec-type suffix` disables
 the projector), while raster image and video
 generation remain unavailable in the pinned Swift profile.

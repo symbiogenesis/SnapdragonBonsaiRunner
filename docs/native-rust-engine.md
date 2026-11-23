@@ -6,7 +6,7 @@ app, broker, provisioning and release integration. The
 [compiled release lock](../config/prism-inference.lock.json) is authoritative for
 the runtime version, source, archive and installed file identities.
 
-The development default is Prism **0.1.32**, original Swift PQ2, eight CPU row
+The development default is Prism **0.1.34**, original Swift PQ2, eight CPU row
 workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (four when the host
 family is unknown or in fixed-four qualification controls), `calibrated-cow`
 default admission, K4/V4 cache and the standard adapter at scale 1.3. Supported
@@ -15,7 +15,7 @@ execution when accelerator initialization is unavailable. Trusted `--placement c
 explicitly selects CPU execution, and explicit `--cpu-prefill-tokens 8|16|32`
 (`-CpuPrefillTokens` / `cpuPrefillTokens`) enables CPU tiled FFN prefill with
 exact `--cpu-prefill-scratch-bytes` and `:cpu-tiled-ffn-v1:{tokens}` readiness
-verification on Prism 0.1.32 (keeping mixed-phase Hexagon decode available when
+verification on Prism 0.1.34 (keeping mixed-phase Hexagon decode available when
 `--spec-type suffix` is absent); `--cpu-prefill-gdn sequential|wy-f32`,
 `--spec-type none|suffix`, `--draft-max 1..=8`, `--cpu-family x1|x2`, and
 `--prompt-reuse disabled|latest|prompt-end-and-latest`
@@ -46,7 +46,7 @@ UI availability does not qualify inference.
 | Admission | Selected context and Job budget, 4 GiB running physical reserve and startup margin; the fixed 8K/11.5 GiB Job/15.5 GiB admission profile remains a separate qualification control |
 
 The verified runtime source is
-`89df9aaff9e580d66679f2befe94d471bcf4fc7f`. Runtime and exact-source numerical
+`c64c9648f85ac4c99ff8d57f709871b31e785370`. Runtime and exact-source numerical
 capture locks advance together. A version string alone grants no capability;
 archive and installed file digests must match their compiled locks. Publishing
 the public runtime crate does not publish the private server or replace Runner's
@@ -199,11 +199,11 @@ extend reuse across edited, regenerated and switched branches.
 
 ### Long-request runtime deadline
 
-Runner's ordinary chat path and the pinned Prism 0.1.32 private server impose
+Runner's ordinary chat path and the pinned Prism 0.1.34 private server impose
 no total generation deadline, including prefill. Explicit diagnostic deadlines,
 Stop/cancellation, bounded header/body intake and per-write limits remain in
 force. The verified source-bound release is documented in the
-[delivery record](evidence/prism-0.1.32-release.md).
+[delivery record](evidence/prism-0.1.34-release.md).
 
 The previous 0.1.27 private server imposed a ten-minute cutoff that could surface
 as `backend_generation_failed` before response headers. Older empty backend logs

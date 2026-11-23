@@ -27,7 +27,7 @@ accurate when a later request changes the adapter scale. Runner's trusted launch
 policy selects the cache from the exact reviewed runtime source and checks the
 matching cache and startup graph identity. Application use requires a published, verified Prism bundle with that
 source identity. Trusted launch parsing accepts `--kv-cache f16|rsq4|rsq4k3v`
-without exposing precision in client request bodies. The current 0.1.32 pin admits
+without exposing precision in client request bodies. The current 0.1.34 pin admits
 `f16` and `rsq4`; `rsq4k3v` remains rejected until a separately reviewed, source-bound
 release delivers the K4/V3 profile and M1/M2 memory contract together. Its prepared
 planner charges 14,848 KV and 29,920 process bytes per token, retaining two complete
@@ -39,7 +39,7 @@ work; current cache selection relies on reviewed source and live readiness.
 
 The sibling Prism checkout owns `src/kv_quant.rs`,
 `src/graph/quantized_kv.rs` and its `docs/quantized-kv.md` runtime contract.
-Runner's 0.1.32 pin consumes the reviewed codec implementation. Model-free codec
+Runner's 0.1.34 pin consumes the reviewed codec implementation. Model-free codec
 and graph controls do not establish full-model quality, usable
 capacity, performance or device qualification. Require current-source owning
 checks and the complete packet below for each selected profile.
@@ -99,7 +99,7 @@ For future hybrid-architecture capacity extensions beyond uniform K4/V4:
 
 ## Fitted-value scale candidate
 
-The Prism 0.1.32 runtime (incorporating `0.1.31`) includes explicit `rsq4vf` (`Rotated4FittedValues`) for
+The Prism 0.1.34 runtime (incorporating `0.1.31`/`0.1.32`) includes explicit `rsq4vf` (`Rotated4FittedValues`) for
 investigating reconstruction accuracy without increasing record size. Version-1
 K4 keys remain unchanged; V4 values use codec version 2's guarded fitted scale.
 After the existing normalization, rotation and code selection, the fitter proposes
@@ -130,7 +130,7 @@ not qualify that profile. The sibling Prism
 
 X1 and X2 share a runtime-detected 128-bit NEON execution path with an explicit
 scalar reference. There is no SKU-specific timing or thread-count tuning.
-The pinned 0.1.32 source (incorporating `0.1.31`) distributes independent query heads over the existing
+The pinned 0.1.34 source (incorporating `0.1.31`/`0.1.32`) distributes independent query heads over the existing
 zero-allocation spin-then-park `NativeRowPool` and adds bit-exact
 `G in {2, 3, 6}` grouped GQA packed-KV decode and tiled-prefill attention
 (`PreparedQueryGroup` / `ValueGroupAccumulator`). Each head retains its score,

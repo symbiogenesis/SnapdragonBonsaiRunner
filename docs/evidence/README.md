@@ -9,7 +9,8 @@ consumers below without installing or executing the recorded Python tools.
 | Retained material | Current consumer |
 | --- | --- |
 | [CI failure audit](ci-failure-audit.md) | Root causes for the latest 30 failed runs, targeted prevention and pending hosted acceptance |
-| [Prism 0.1.32 delivery](prism-0.1.32-release.md) | Current runtime/source lock, original release receipt, registry delivery, bounded X2 broker-pipe trial and independent lock-update replay |
+| [Prism 0.1.34 delivery](prism-0.1.34-release.md) | Current runtime/source lock, original release receipt, 8-crate registry delivery, promoted capability gates and independent lock-update replay |
+| [Prism 0.1.32 delivery](prism-0.1.32-release.md) | Prior 0.1.32 runtime/source lock, original release receipt, registry delivery, bounded X2 broker-pipe trial and independent lock-update replay |
 | [Prism 0.1.31 delivery](prism-0.1.31-release.md) | Prior 0.1.31 runtime/source lock, original release receipt, registry delivery and lock-update replay |
 | [Prism 0.1.30 delivery](prism-0.1.30-release.md) | Prior 0.1.30 runtime/source lock, original release receipt, registry delivery and lock-update replay |
 | [Prism 0.1.28 delivery](prism-0.1.28-release.md) | Prior 0.1.28 runtime/source lock, original release receipt and 0.1.29 registry delivery |

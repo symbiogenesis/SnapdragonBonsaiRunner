@@ -146,7 +146,7 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify Prism's Foundation scheduling and source-package/Hexagon caches
   on matching hosted images, preserving complete correctness, mutation, packaging
   and independent ABI/SDK obligations.
-- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.32.**
+- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.34.**
   Complete actual-model, state, resource, quality and device acceptance using
   the source-bound package identities in the [distribution guide](docs/releases.md).
   Model-free release checks leave these development-runtime gates pending.
@@ -382,7 +382,7 @@ adoption decisions without displacing native daily-use acceptance.
   `OwnedProcess::start_sandboxed_broker_pipe_with_sections` (`SandboxNetwork::Offline`,
   6-entry minimal environment, pre-resume kernel `TokenIsAppContainer`/`GetAppContainerFolderPath`
   verification, `64 MiB`/`1_024`-entry private storage ceiling), `BROKER_PIPE_RELEASE`
-  (`0.1.32`), and `inference-authority-v1` fixture/tooling support are wired
+  (`0.1.34`), and `inference-authority-v1` fixture/tooling support are wired
   end-to-end; qualifying `inference-authority-v1` in sandbox CI
   (after a closed local Case 1 fixture failure repaired without retry), and
   qualifying actual-model X1/MXC loading, atomic Job limits and exact identity
@@ -468,22 +468,12 @@ adoption decisions without displacing native daily-use acceptance.
   mixed-phase handoff (`install_default_hexagon_executor` keeping resident
   Hexagon decode active alongside `--cpu-prefill-tokens` when
   `cpu_speculation` is absent and `supports_tile_tokens() == false`), all
-  pinned in Prism `0.1.32` (pending Runner hosted CI and complete X1/X2 device
-  qualification). Post-lock local Prism commit `7186e81` and Runner commit
-  `a57a3afd` additionally enabled `wy-f32` (`:gdn-wy-f32-v1`) on rotated-KV
-  profiles (`Rotated4`, `Rotated4FittedValues`, `Rotated4Keys3Values`) and
-  added NEON-vectorized 8-row triangular updates in `prefill_gdn.rs`, while
-  Prism commits `14ff98e`, `ce0a00c`, and `43809de` added full-K spill-free
-  `PQ2` (`2..=7` / tail), `PTQ1`, and `Q8_0` 8-row multi-token kernels in
-  `bonsai-neon-dot` / `src/kernels/`, Prism commits `c4b94e4` and `da699ed`
-  added full-K spill-free `16`/`8`/`4`/`1`-row `Q8_0` `SDOT` decode kernels
-  (`fill_sixteen_rows`), NEON `vqtbl2q_u8` 3-bit KV codecs, NEON
-  `Quantizer::encode`, and long-context (`> 4,096` tokens) `G in {6, 4, 3, 2, 1}`
-  and 2-token × G-head `attend_tile` reuse without growing caller score
-  allocations, and Prism commit `ec4bcfa` added `prfm pldl1keep` L1 software
-  prefetch on 8/16-row decode loops, full-K `PTQ1_0`/`Q8_0` `dot_scaled_8x8_chunks`
-  `8..=32` token prefill kernels, and 4-way register-blocked `MultiRankAdapter`
-  NEON kernels (`0 ULP`). Verify selected-cache
+  pinned in Prism `0.1.34` (incorporating `0.1.32`, rotated-KV `wy-f32` via
+  `WY_F32_ROTATED_KV_RELEASE`, NEON 8-row triangular updates in `prefill_gdn.rs`,
+  `7186e81` + Runner `a57a3afd`, full-K spill-free `PQ2`/`PTQ1`/`Q8_0` 8-row and
+  `16`-row kernels `14ff98e`/`ce0a00c`/`43809de`/`c4b94e4`/`da699ed`/`ec4bcfa`, and
+  4-way register-blocked `MultiRankAdapter` NEON kernels at `0 ULP`; pending Runner
+  hosted CI and complete X1/X2 device qualification). Verify selected-cache
   service consumers and independent packed-KV head workers: scratch/admission,
   complete state, adapters, cancellation and whole-request benefit.
 - [ ] Qualify six-head/paired-token score/value reuse. Extend score/value or
@@ -1144,20 +1134,12 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   / `PipeBackend::connect_stdio_with_sections`; `prism-inference` `main` implements
   zero-copy `MappedSlice` GGUF mapping, 8-worker parallel tensor payload validation,
   `ServerEndpoint::verified_sections`, `"SB2HQ2C1"` `NativeQ2ArenaCache` and
-  `Qwen35::release_executor_resident_host_weights` (pinned in Prism `0.1.32`
-  with end-to-end launcher/service wiring, and post-lock Prism commit `74d8884`
-  wired `SwiftSession::model_identity`, opt-in `--hexagon-arena-cache <dir>`
-  (`NativeQ2ArenaCache` load/save), and `#41` dynamic VTCM placement in
-  `prism-inference-server`; Prism commits `c362ae0`, `7532363`, and `89ce18b`
-  subsequently admitted `PTQ1_0` (`kind = 143`) on `supports_f32` executors
-  and wired `#18` `release_executor_resident_host_weights` forwarding through
-  `Runtime<Qwen35>`, `SwiftSession`, `NativeQ2Executor` /
-  `OwnedCompositeProjectionExecutor` resident handle rebinding
-  (`release_host_weight_binding` / `has_released_host_weight`, keeping
-  non-opting executors such as `VulkanPq2Executor` fail-closed), and
-  `prism-inference-server` (when `cpu_prefill` is `None`), while Runner commit
-  `eebb25ba` wired release-gated opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`
-  (`HEXAGON_ARENA_CACHE_RELEASE = None`); pending Runner hosted Foundation and
+  `Qwen35::release_executor_resident_host_weights` (now pinned in Prism `0.1.34`,
+  including `74d8884`, `c362ae0`, `7532363`, and `89ce18b` for `SwiftSession::model_identity`,
+  opt-in `--hexagon-arena-cache <dir>` under `HEXAGON_ARENA_CACHE_RELEASE`, `#41` dynamic
+  VTCM placement, `PTQ1_0` (`kind = 143`) on `supports_f32` executors, and `#18`
+  resident handle rebinding via `release_host_weight_binding` / `has_released_host_weight`,
+  keeping `VulkanPq2Executor` fail-closed; pending Runner hosted Foundation and
   X1/X2 device qualification). Deferred screening leads `#16` (aligned staging reuse), `#17`
   (optional Windows unbuffered direct I/O) and end-to-end `#18` qualification
   remain gated behind measured cold-start/I/O/mapping bottlenecks and
@@ -1431,12 +1413,12 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   and at most two exact LUT candidates before choosing further integration.
 - [ ] Qualify explicit `--cpu-prefill-tokens 8|16|32`, zero-alloc spin-then-park
   `NativeRowPool`, and bit-exact `G in {2, 3, 6}` grouped GQA packed-KV
-  attention (pinned in Prism `0.1.32`; pending Runner hosted Foundation and
-  X1/X2 qualification), plus post-lock local Prism CPU candidates (`75e1a69`
-  cache-line padded Dekker `NativeRowPool`, `f2efd9c` spill-free `neon-dot` +
-  fused `8x32` `I8MM`/`SDOT` PQ2 prefill, `af6274d` tile-capable verification;
+  attention alongside the promoted CPU candidates now pinned in Prism `0.1.34`
+  (`75e1a69` cache-line padded Dekker `NativeRowPool`, `f2efd9c` spill-free
+  `neon-dot` + fused `8x32` `I8MM`/`SDOT` PQ2 prefill, `af6274d` tile-capable
+  verification; pending Runner hosted Foundation and X1/X2 qualification, with
   single-arm AC X2E94100 observation `SWIFT_ARM_A_CPU_TILED` at `21.27 tok/s`
-  prefill / `10.21 tok/s` decode, awaiting paired lock-promotion packets), and
+  prefill / `10.21 tok/s` decode awaiting paired qualification packets), and
   integrate further selected cross-token and 8/16/32-token tiled-prefill consumers
   preserving transformed bases, causal state, bounded scratch and rollback
   before timing the complete request.
@@ -1569,7 +1551,7 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
 - [ ] Qualify existing full-FFN chains, sibling packets, multi-tile N=1 and
   tile-major reuse independently. Implement true N>1 prefill only with a supported
   signed solver, causal state, bounded VTCM/DMA and measured total-cost benefit.
-- [ ] Qualify Prism `0.1.32` per-layer active-target gating (`adapter_affects_any`,
+- [ ] Qualify Prism `0.1.34` per-layer active-target gating (`adapter_affects_any`,
   which keeps `external_ffn_chain` active when `[ffn_gate, ffn_up, ffn_down]`
   have no active LoRA and unlocks `external_ffn_swiglu` across all 64 Swift
   layers under active `RankOneAdapter`) and full Hexagon `ffn_down`
@@ -1658,8 +1640,11 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 - [ ] Complete hosted `source-checks` and `foundation` compiler, strict Release
   analyzer and full regression-suite verdicts in `SwiftBonsai2Runner` under
   [promotion criteria](docs/validation.md#promotion-criteria) (`prism-inference`
-  `v0.1.32` at `23e24e444a821d4426f65d56c6cf874cf568b0d9` passed `Source checks`
-  and `Foundation`; local Runner checks ran scoped Clippy and targeted suites).
+  `v0.1.34` at `c64c9648f85ac4c99ff8d57f709871b31e785370` passed `Foundation bundle`
+  (`45113319918`) and `Source checks` (`45111096691`), while full `Foundation`
+  (`45111096706`) failed on `bonsai-adreno-vulkan` private intra-doc links,
+  `x86_64` lints, and `tests/graph/verification.rs:198`; local Runner checks ran
+  scoped Clippy and targeted suites).
 - [ ] Qualify landed controls on actual weights and X1/X2 hardware within
   predeclared 5-to-15-minute AC/battery-logged allowances:
   - [ ] `#8`: Exercise live long-prefill HTTP Stop/disconnect,
@@ -1679,7 +1664,7 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 #### Memory, loading and approximate cache
 
 - [ ] **Single-pass verified-handle inheritance, parallel chunked `SHA256` and
-  cached Hexagon arenas.** Runner (`0.1.32` pin) and Prism implement and wire
+  cached Hexagon arenas.** Runner (`0.1.34` pin) and Prism implement and wire
   end-to-end section inheritance (`--verified-sections` /
   `OwnedProcess::start_sandboxed_broker_pipe_with_sections` /
   `PipeBackend::connect_stdio_with_sections`), `bonsai-windows-credentials`
@@ -1706,7 +1691,7 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   `HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES` (`2,888,663,040`),
   `private_job_commit_with_mapped_credit`, opt-in `SwiftExecutionShape` /
   `bonsai-chat` `window/context_capacity.rs` live footprint diagnostics and
-  default `--admission-policy calibrated-cow` admission are wired on `0.1.32`;
+  default `--admission-policy calibrated-cow` admission are wired on `0.1.34`;
   selective tensor-range mapping, M1–M3 Job-commit verification, physical-RAM
   watchdog checks and explicit NPU-fault recovery qualification remain open.
 - [ ] **#21 — Calibrated K-cache mean centering.** Evaluate subtracting a
@@ -1721,8 +1706,8 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   pressure and L1/L2 cache behavior while preserving per-block reduction order.
   Implemented in source (physical X1/X2 throughput, parity and power qualification
   open): Prism `16`-row `PQ2`/`Q8_0`/`PTQ1` SIMD tiles, X1 `3`-head/`2`-head
-  grouped attention, `[token][head]` F16-packed `4`-head decode, and `0.1.32`
-  (incorporating `0.1.31`) bit-exact `G in {2, 3, 6}` grouped GQA packed-KV
+  grouped attention, `[token][head]` F16-packed `4`-head decode, and `0.1.34`
+  (incorporating `0.1.31`/`0.1.32`) bit-exact `G in {2, 3, 6}` grouped GQA packed-KV
   attention + zero-alloc spin-then-park `NativeRowPool`,
   `bonsai-speech-tts` `4`-row `Q8_0`/`Q4_K`/`Q6_K` SIMD tiles in
   `src/speech-tts/src/engine/packed.rs`, `bonsai-speech-asr` bit-exact non-FMA
@@ -1771,7 +1756,7 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   attention probabilities directly in consumer layout (`[token][head]`) and
   split oversized final head/token tasks via KV-group-aligned balanced
   `partition_heads` and `TileTask` partitioning without changing the FP16
-  boundary or reduction order (pinned in Prism `0.1.32`, pending Runner hosted
+  boundary or reduction order (pinned in Prism `0.1.34`, pending Runner hosted
   CI and X1/X2 parity/throughput qualification) under
   [CPU kernels](docs/cpu-kernels.md#cross-generation-cpu-promotion).
 
@@ -1789,7 +1774,7 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   rejection-sampling masks into the atomic KV/GDN/convolution/sampler rollback
   transaction (`GrammarConstrainedSampler` and `GrammarState` `is_accepting`,
   `accept_candidate`, and `filter_candidates` with atomic rollback integration
-  are pinned in Prism `0.1.32`, pending Runner hosted CI and model parity qualification).
+  are pinned in Prism `0.1.34`, pending Runner hosted CI and model parity qualification).
 
 #### Adreno Vulkan, Hexagon NPU and power policy
 
