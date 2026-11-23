@@ -297,6 +297,17 @@ impl LocalChatService {
         self.policy.vision = true;
     }
 
+    /// Whether per-request cognitive, sampling, DRY, budget, and logprob controls are enabled.
+    #[must_use]
+    pub const fn cognitive_controls_enabled(&self) -> bool {
+        self.policy.cognitive_controls
+    }
+
+    /// Enable per-request cognitive, sampling, DRY, budget, and logprob controls.
+    pub const fn enable_cognitive_controls(&mut self) {
+        self.policy.cognitive_controls = true;
+    }
+
     /// The owned launcher binds admission to the same context used by the child.
     #[cfg(windows)]
     pub(crate) fn select_context_tokens(

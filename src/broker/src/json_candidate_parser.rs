@@ -55,7 +55,16 @@ impl JsonCandidateScratch {
             let mut deserializer = simd_json::Deserializer::from_tape(tape);
             let result = match Object::<ClientChat<'_>>::deserialize(&mut deserializer) {
                 Ok(Object(chat))
-                    if chat.abliteration_scale.is_none() && chat.daisyrose_scale.is_none() =>
+                    if chat.abliteration_scale.is_none()
+                        && chat.daisyrose_scale.is_none()
+                        && chat.temperature.is_none()
+                        && chat.top_p.is_none()
+                        && chat.min_p.is_none()
+                        && chat.presence_penalty.is_none()
+                        && chat.frequency_penalty.is_none()
+                        && chat.repeat_penalty.is_none()
+                        && chat.dry_multiplier.is_none()
+                        && chat.dry_base.is_none() =>
                 {
                     head.prepare_chat(&chat)
                 }
@@ -174,6 +183,18 @@ mod tests {
                     assert_eq!(scratch.tape.0.capacity(), tape_capacity);
                 }
             }
+        }
+        let enabled_head = |len| AuthorizedHead::test_head(len, false).with_cognitive_controls(true);
+        for body in [
+            br#"{"messages":[{"role":"user","content":"rain"}],"reasoning_effort":"low","reasoning_budget":128,"top_k":40,"dry_allowed_length":2,"dry_penalty_last_n":512,"logprobs":true,"top_logprobs":5}"#.as_slice(),
+            br#"{"messages":[{"role":"user","content":"rain"}],"temperature":0.85,"top_p":0.95,"min_p":0.05,"dry_multiplier":0.8,"dry_base":1.75}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"reasoning_effort":"bad"}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"top_logprobs":21,"logprobs":true}"#,
+        ] {
+            let h1 = enabled_head(body.len());
+            let h2 = enabled_head(body.len());
+            let summarize = |chat: crate::PendingChat| (chat.body, chat.max_completion_tokens, chat.stream);
+            assert_eq!(scratch.prepare(h1, body).map(summarize), h2.prepare(body).map(summarize));
         }
     }
 }

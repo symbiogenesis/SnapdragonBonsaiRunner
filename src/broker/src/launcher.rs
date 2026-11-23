@@ -1778,6 +1778,8 @@ impl LaunchConfig {
                     cpu_speculation,
                 )?;
             }
+            let cognitive_controls = !self.native_engine
+                || identity::native_supports_cognitive_controls(&models);
             startup_timing.phase(StartupPhase::FrontendBinding);
             let daisyrose_default_scale_tenths = active_daisyrose.map(|d| d.default_scale_tenths);
             let service = self
@@ -1789,6 +1791,7 @@ impl LaunchConfig {
                     daisyrose_default_scale_tenths,
                     context_tokens,
                     vision_enabled,
+                    cognitive_controls,
                 )
                 .await?;
             startup_timing.finish();
@@ -1823,6 +1826,7 @@ impl LaunchConfig {
         daisyrose_default_scale_tenths: Option<u8>,
         context_tokens: usize,
         vision_enabled: bool,
+        cognitive_controls: bool,
     ) -> Result<LocalChatService, LaunchError> {
         let bound = if let Some(pipe_backend) = pipe_backend {
             LocalChatService::bind_pipe(
@@ -1861,6 +1865,9 @@ impl LaunchConfig {
             }
             if vision_enabled {
                 service.enable_vision();
+            }
+            if cognitive_controls {
+                service.enable_cognitive_controls();
             }
             if self.reset_on_cancel {
                 service.enable_reset_on_cancel();
@@ -2207,6 +2214,11 @@ impl LaunchedService {
     /// Default DaisyRose `LoRA` scale in tenths (`0..=20`), or `0` when unavailable.
     pub const fn daisyrose_default_scale_tenths(&self) -> u8 {
         self.service.daisyrose_default_scale_tenths()
+    }
+
+    /// Whether per-request cognitive, sampling, DRY, budget, and logprob controls are active.
+    pub const fn cognitive_controls_enabled(&self) -> bool {
+        self.service.cognitive_controls_enabled()
     }
 
     /// Protected evidence directory; contains credentials, so share only selected logs.

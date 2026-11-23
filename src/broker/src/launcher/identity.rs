@@ -226,6 +226,22 @@ struct NativeModel<'a> {
     cpu_verification_scratch_bytes: Option<usize>,
     #[serde(default, deserialize_with = "crate::deserialize_present")]
     cpu_speculative_checkpoint_bytes: Option<usize>,
+    #[serde(default, deserialize_with = "crate::deserialize_present")]
+    supports_cognitive_controls: Option<bool>,
+}
+
+/// Reports whether a verified native `/v1/models` payload explicitly advertises
+/// support for per-request cognitive, sampling, DRY, budget, and logprob controls.
+pub(super) fn native_supports_cognitive_controls(bytes: &[u8]) -> bool {
+    let Ok(body) = super::validate_response(bytes, 200) else {
+        return false;
+    };
+    let Ok(crate::Object(models)) = serde_json::from_slice::<crate::Object<Models<'_>>>(body)
+    else {
+        return false;
+    };
+    let [crate::Object(model)] = models.data;
+    model.supports_cognitive_controls == Some(true)
 }
 
 #[derive(Deserialize)]
@@ -2074,6 +2090,28 @@ mod context_tests {
             daisy_policy,
             NativeIdentityError::KvCacheGraph,
         )?;
+
+        assert!(!super::native_supports_cognitive_controls(&wire(
+            &default_model
+        )?));
+        let mut cognitive_off = default_model.clone();
+        cognitive_off["supports_cognitive_controls"] = json!(false);
+        assert!(!super::native_supports_cognitive_controls(&wire(
+            &cognitive_off
+        )?));
+        assert!(
+            validate_native_identity_detailed(&wire(&cognitive_off)?, false, true, default_policy)
+                .is_ok()
+        );
+        let mut cognitive_on = default_model;
+        cognitive_on["supports_cognitive_controls"] = json!(true);
+        assert!(super::native_supports_cognitive_controls(&wire(
+            &cognitive_on
+        )?));
+        assert!(
+            validate_native_identity_detailed(&wire(&cognitive_on)?, false, true, default_policy)
+                .is_ok()
+        );
 
         Ok(())
     }

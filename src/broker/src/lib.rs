@@ -148,6 +148,7 @@ pub struct RequestPolicy {
     daisyrose_default_scale_tenths: u8,
     context_tokens: usize,
     pub(crate) vision: bool,
+    pub(crate) cognitive_controls: bool,
 }
 
 impl Drop for RequestPolicy {
@@ -202,6 +203,7 @@ impl RequestPolicy {
             daisyrose_default_scale_tenths: 0,
             context_tokens: CONTEXT_TOKENS,
             vision: false,
+            cognitive_controls: false,
         })
     }
 
@@ -229,6 +231,13 @@ impl RequestPolicy {
     #[must_use]
     pub const fn with_vision(mut self, vision: bool) -> Self {
         self.vision = vision;
+        self
+    }
+
+    /// Enable or disable per-request cognitive, sampling, DRY, budget, and logprob controls.
+    #[must_use]
+    pub const fn with_cognitive_controls(mut self, enabled: bool) -> Self {
+        self.cognitive_controls = enabled;
         self
     }
 
@@ -351,6 +360,7 @@ impl RequestPolicy {
             daisyrose_default_scale_tenths: self.daisyrose_default_scale_tenths,
             context_tokens: self.context_tokens,
             vision: self.vision,
+            cognitive_controls: self.cognitive_controls,
         })
     }
 }
@@ -443,6 +453,7 @@ pub struct AuthorizedHead {
     daisyrose_default_scale_tenths: u8,
     context_tokens: usize,
     vision: bool,
+    cognitive_controls: bool,
 }
 
 impl AuthorizedHead {
@@ -529,6 +540,7 @@ impl AuthorizedHead {
                 scale: chat.daisyrose_scale.unwrap_or(default_daisyrose),
             });
         }
+        let controls = validate_cognitive_chat_controls(chat, self.cognitive_controls)?;
         let lora = (!loras.is_empty()).then_some(loras);
         let max_completion_tokens = chat.max_completion_tokens;
         let body = request_buffer::serialize_with_hint_and_limit(
@@ -541,16 +553,23 @@ impl AuthorizedHead {
                 cache_prompt: false,
                 n_cache_reuse: 0,
                 ignore_eos: false,
-                temperature: 1.0,
-                top_p: 0.95,
-                top_k: 20,
-                min_p: 0.0,
-                presence_penalty: 0.0,
-                frequency_penalty: 0.0,
-                repeat_penalty: 1.0,
+                temperature: controls.temperature,
+                top_p: controls.top_p,
+                top_k: controls.top_k,
+                min_p: controls.min_p,
+                presence_penalty: controls.presence_penalty,
+                frequency_penalty: controls.frequency_penalty,
+                repeat_penalty: controls.repeat_penalty,
+                reasoning_budget: controls.reasoning_budget,
+                dry_multiplier: controls.dry_multiplier,
+                dry_base: controls.dry_base,
+                dry_allowed_length: controls.dry_allowed_length,
+                dry_penalty_last_n: controls.dry_penalty_last_n,
+                logprobs: controls.logprobs,
+                top_logprobs: controls.top_logprobs,
                 chat_template_kwargs: ChatTemplateKwargs {
                     enable_thinking: chat.enable_thinking,
-                    reasoning_effort: "xhigh",
+                    reasoning_effort: controls.reasoning_effort,
                     preserve_thinking: true,
                 },
             },
@@ -564,6 +583,120 @@ impl AuthorizedHead {
             context_tokens: self.context_tokens,
         })
     }
+}
+
+struct ValidatedChatControls {
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    min_p: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    repeat_penalty: f32,
+    reasoning_effort: &'static str,
+    reasoning_budget: Option<u32>,
+    dry_multiplier: Option<f32>,
+    dry_base: Option<f32>,
+    dry_allowed_length: Option<u32>,
+    dry_penalty_last_n: Option<u32>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<u8>,
+}
+
+const fn is_non_neg_zero_finite(value: f32) -> bool {
+    value.is_finite() && !(value == 0.0 && value.is_sign_negative())
+}
+
+fn validate_cognitive_chat_controls(
+    chat: &ClientChat<'_>,
+    enabled: bool,
+) -> Result<ValidatedChatControls, Rejection> {
+    let any_override = chat.reasoning_effort.is_some()
+        || chat.reasoning_budget.is_some()
+        || chat.temperature.is_some()
+        || chat.top_p.is_some()
+        || chat.top_k.is_some()
+        || chat.min_p.is_some()
+        || chat.presence_penalty.is_some()
+        || chat.frequency_penalty.is_some()
+        || chat.repeat_penalty.is_some()
+        || chat.dry_multiplier.is_some()
+        || chat.dry_base.is_some()
+        || chat.dry_allowed_length.is_some()
+        || chat.dry_penalty_last_n.is_some()
+        || chat.logprobs.is_some()
+        || chat.top_logprobs.is_some();
+    if any_override && !enabled {
+        return Err(Rejection::ChatSchema);
+    }
+    let reasoning_effort = match chat.reasoning_effort.as_deref() {
+        None | Some("xhigh") => "xhigh",
+        Some("medium") => "medium",
+        Some("low") => "low",
+        Some(_) => return Err(Rejection::ChatSchema),
+    };
+    let temperature = chat.temperature.unwrap_or(1.0);
+    let top_p = chat.top_p.unwrap_or(0.95);
+    let top_k = chat.top_k.unwrap_or(20);
+    let min_p = chat.min_p.unwrap_or(0.0);
+    let presence_penalty = chat.presence_penalty.unwrap_or(0.0);
+    let frequency_penalty = chat.frequency_penalty.unwrap_or(0.0);
+    let repeat_penalty = chat.repeat_penalty.unwrap_or(1.0);
+    let dry_active = chat.dry_multiplier.is_some_and(|mult| mult > 0.0);
+    if !is_non_neg_zero_finite(temperature)
+        || !(0.0 < temperature && temperature <= 2.0)
+        || !is_non_neg_zero_finite(top_p)
+        || !(0.0 < top_p && top_p <= 1.0)
+        || top_k > 248_320
+        || !is_non_neg_zero_finite(min_p)
+        || !(0.0..=1.0).contains(&min_p)
+        || !is_non_neg_zero_finite(presence_penalty)
+        || !(-2.0..=2.0).contains(&presence_penalty)
+        || !is_non_neg_zero_finite(frequency_penalty)
+        || !(-2.0..=2.0).contains(&frequency_penalty)
+        || !is_non_neg_zero_finite(repeat_penalty)
+        || !(0.0 < repeat_penalty && repeat_penalty <= 2.0)
+        || chat
+            .reasoning_budget
+            .is_some_and(|budget| !(1..=262_144).contains(&budget))
+        || chat
+            .dry_multiplier
+            .is_some_and(|mult| !is_non_neg_zero_finite(mult) || !(0.0..=4.0).contains(&mult))
+        || chat
+            .dry_base
+            .is_some_and(|base| !is_non_neg_zero_finite(base) || !(1.0..=4.0).contains(&base))
+        || chat.dry_allowed_length.is_some_and(|len| {
+            if dry_active {
+                !(1..=64).contains(&len)
+            } else {
+                len > 64
+            }
+        })
+        || chat.dry_penalty_last_n.is_some_and(|n| n > 8192)
+        || (chat.top_logprobs.is_some() && chat.logprobs != Some(true))
+        || chat
+            .top_logprobs
+            .is_some_and(|count| !(1..=20).contains(&count))
+    {
+        return Err(Rejection::ChatSchema);
+    }
+    Ok(ValidatedChatControls {
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        presence_penalty,
+        frequency_penalty,
+        repeat_penalty,
+        reasoning_effort,
+        reasoning_budget: chat.reasoning_budget,
+        dry_multiplier: chat.dry_multiplier,
+        dry_base: chat.dry_base,
+        dry_allowed_length: chat.dry_allowed_length,
+        dry_penalty_last_n: chat.dry_penalty_last_n,
+        logprobs: chat.logprobs,
+        top_logprobs: chat.top_logprobs,
+    })
 }
 
 #[derive(Deserialize)]
@@ -583,6 +716,36 @@ struct ClientChat<'a> {
     abliteration_scale: Option<f64>,
     #[serde(default, deserialize_with = "deserialize_abliteration_scale")]
     daisyrose_scale: Option<f64>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_text")]
+    reasoning_effort: Option<Cow<'a, str>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    reasoning_budget: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    temperature: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    top_p: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    top_k: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    min_p: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    presence_penalty: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    frequency_penalty: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    repeat_penalty: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    dry_multiplier: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    dry_base: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    dry_allowed_length: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    dry_penalty_last_n: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    logprobs: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    top_logprobs: Option<u8>,
 }
 
 fn deserialize_abliteration_scale<'de, D: Deserializer<'de>>(
@@ -1064,11 +1227,25 @@ struct BackendChat<'a, 'b> {
     ignore_eos: bool,
     temperature: f32,
     top_p: f32,
-    top_k: u8,
+    top_k: u32,
     min_p: f32,
     presence_penalty: f32,
     frequency_penalty: f32,
     repeat_penalty: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_multiplier: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_base: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_allowed_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_penalty_last_n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_logprobs: Option<u8>,
     chat_template_kwargs: ChatTemplateKwargs,
 }
 
@@ -1139,12 +1316,18 @@ impl AuthorizedHead {
             daisyrose_default_scale_tenths: 0,
             context_tokens: CONTEXT_TOKENS,
             vision: false,
+            cognitive_controls: false,
         }
     }
 
     pub(crate) const fn with_daisyrose(mut self, default_scale_tenths: u8) -> Self {
         self.daisyrose_lora = true;
         self.daisyrose_default_scale_tenths = default_scale_tenths;
+        self
+    }
+
+    pub(crate) const fn with_cognitive_controls(mut self, enabled: bool) -> Self {
+        self.cognitive_controls = enabled;
         self
     }
 }
@@ -1378,6 +1561,90 @@ mod tests {
         let mut buf = [0x5Au8; 71];
         super::scrub_bytes(&mut buf);
         assert_eq!(buf, [0u8; 71]);
+        Ok(())
+    }
+
+    #[test]
+    fn cognitive_controls_are_gated_and_preserve_canonical_default_wire_bytes()
+    -> Result<(), super::Rejection> {
+        use super::{Rejection, RequestPolicy};
+
+        let key = "a".repeat(64);
+        let default_policy = RequestPolicy::new(8080, &key)?;
+        let enabled_policy = RequestPolicy::new(8080, &key)?.with_cognitive_controls(true);
+        let plain = br#"{"messages":[{"role":"user","content":"rain"}]}"#;
+        let default_head = |len: usize| {
+            let head = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header("host", "127.0.0.1:8080")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .header("content-length", len.to_string())
+                .body(())
+                .map_err(|_| Rejection::Configuration)?
+                .into_parts()
+                .0;
+            Ok::<_, Rejection>(head)
+        };
+        let legacy_bytes = default_policy
+            .check_head(&default_head(plain.len())?)?
+            .prepare(plain)?
+            .body;
+        let enabled_bytes = enabled_policy
+            .check_head(&default_head(plain.len())?)?
+            .prepare(plain)?
+            .body;
+        assert_eq!(legacy_bytes, enabled_bytes);
+        let legacy_json: serde_json::Value =
+            serde_json::from_slice(&legacy_bytes).map_err(|_| Rejection::ChatSchema)?;
+        assert_eq!(
+            legacy_json["chat_template_kwargs"]["reasoning_effort"],
+            "xhigh"
+        );
+        assert!(legacy_json.get("reasoning_budget").is_none());
+        assert!(legacy_json.get("dry_multiplier").is_none());
+        assert!(legacy_json.get("logprobs").is_none());
+
+        let rich = br#"{"messages":[{"role":"user","content":"rain"}],"reasoning_effort":"medium","reasoning_budget":256,"temperature":0.85,"top_p":0.95,"top_k":40,"min_p":0.05,"presence_penalty":0.15,"frequency_penalty":0.1,"repeat_penalty":1.05,"dry_multiplier":0.8,"dry_base":1.75,"dry_allowed_length":2,"dry_penalty_last_n":1024,"logprobs":true,"top_logprobs":5}"#;
+        assert_eq!(
+            default_policy
+                .check_head(&default_head(rich.len())?)?
+                .prepare(rich)
+                .err(),
+            Some(Rejection::ChatSchema)
+        );
+        let prepared = enabled_policy
+            .check_head(&default_head(rich.len())?)?
+            .prepare(rich)?;
+        let out: serde_json::Value =
+            serde_json::from_slice(&prepared.body).map_err(|_| Rejection::ChatSchema)?;
+        assert_eq!(out["chat_template_kwargs"]["reasoning_effort"], "medium");
+        assert_eq!(out["reasoning_budget"], 256);
+        assert_eq!(out["top_k"], 40);
+        assert_eq!(out["dry_allowed_length"], 2);
+        assert_eq!(out["logprobs"], true);
+        assert_eq!(out["top_logprobs"], 5);
+
+        for bad in [
+            br#"{"messages":[{"role":"user","content":"rain"}],"reasoning_effort":null}"#.as_slice(),
+            br#"{"messages":[{"role":"user","content":"rain"}],"reasoning_effort":"extreme"}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"reasoning_budget":0}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"temperature":0.0}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"min_p":-0.0}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"top_k":248321}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"dry_multiplier":0.8,"dry_allowed_length":0}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"top_logprobs":5}"#,
+            br#"{"messages":[{"role":"user","content":"rain"}],"logprobs":false,"top_logprobs":1}"#,
+        ] {
+            assert_eq!(
+                enabled_policy
+                    .check_head(&default_head(bad.len())?)?
+                    .prepare(bad)
+                    .err(),
+                Some(Rejection::ChatSchema)
+            );
+        }
         Ok(())
     }
 }

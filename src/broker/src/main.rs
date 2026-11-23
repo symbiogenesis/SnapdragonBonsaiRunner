@@ -152,8 +152,13 @@ fn launched(args: Vec<OsString>) -> ExitCode {
         } else {
             "unavailable".to_owned()
         };
+        let cognitive_status = if owner.cognitive_controls_enabled() {
+            "available"
+        } else {
+            "unavailable"
+        };
         let notice = format!(
-            "DEVELOPMENT ONLY: owned {profile_name} backend ready; listening on http://127.0.0.1:{}.\nContext tokens: {}\nInput modalities: {modalities}\nDaisyRose adapter: {daisyrose_status}\n{context_note}Protected credentials and technical evidence: {}\n{containment} Ctrl-C stops the complete owned Job.\n",
+            "DEVELOPMENT ONLY: owned {profile_name} backend ready; listening on http://127.0.0.1:{}.\nContext tokens: {}\nInput modalities: {modalities}\nDaisyRose adapter: {daisyrose_status}\nCognitive controls: {cognitive_status}\n{context_note}Protected credentials and technical evidence: {}\n{containment} Ctrl-C stops the complete owned Job.\n",
             owner.port(), owner.context_tokens(), owner.evidence_directory().display()
         );
         let notified = std::io::stdout().write_all(notice.as_bytes()).is_ok();
