@@ -894,75 +894,156 @@ fn conv1d_oc_outer_channel_first_simd<S: Simd>(
     }
 }
 
+#[inline]
+const fn trans_conv_phase_taps(kernel: usize, stride: usize, phase: usize) -> usize {
+    (kernel - phase).div_ceil(stride)
+}
+
+#[inline]
+const fn trans_conv_phase_tap_offset(kernel: usize, stride: usize, phase: usize) -> usize {
+    let q = kernel / stride;
+    let r = kernel % stride;
+    phase * q + if phase < r { phase } else { r }
+}
+
 #[expect(
     clippy::inline_always,
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
-fn trans_conv1d_scatter_frame_simd<S: Simd>(
+fn trans_conv_frames_16oc_simd<S: Simd, const F: usize>(
     simd: S,
-    in_row: &[f32],
-    weight: &[f32],
-    out_c: usize,
-    kernel_range: std::ops::Range<usize>,
-    raw_window: &mut [f32],
+    input: &[f32],
+    w_tile: &[f32],
+    bias_blk: Option<&[f32]>,
+    (t0_base, n_taps, in_c): (usize, usize, usize),
+    (dst, dst_base, dst_stride): (&mut [f32], usize, usize),
 ) {
-    let in_c = in_row.len();
-    let k_stride = in_c * out_c;
-    let oc_quads = out_c / 4;
-    let (in_quads, in_rem) = in_row.as_chunks::<4>();
-    let tail_ic_start = in_quads.len() * 4;
-    for k in kernel_range.clone() {
-        let dst_row_off = (k - kernel_range.start) * out_c;
-        let dst_row = &mut raw_window[dst_row_off..dst_row_off + out_c];
-        let w_k = &weight[k * k_stride..(k + 1) * k_stride];
-        for (ic_q, &[x0, x1, x2, x3]) in in_quads.iter().enumerate() {
-            let ic = ic_q * 4;
-            let w0 = &w_k[ic * out_c..(ic + 1) * out_c];
-            let w1 = &w_k[(ic + 1) * out_c..(ic + 2) * out_c];
-            let w2 = &w_k[(ic + 2) * out_c..(ic + 3) * out_c];
-            let w3 = &w_k[(ic + 3) * out_c..(ic + 4) * out_c];
-            let x0v = f32x4::splat(simd, x0);
-            let x1v = f32x4::splat(simd, x1);
-            let x2v = f32x4::splat(simd, x2);
-            let x3v = f32x4::splat(simd, x3);
-            let (dst_q, dst_rem) = dst_row.as_chunks_mut::<4>();
-            let w0_q = w0.as_chunks::<4>().0;
-            let w1_q = w1.as_chunks::<4>().0;
-            let w2_q = w2.as_chunks::<4>().0;
-            let w3_q = w3.as_chunks::<4>().0;
-            for (q_idx, dq) in dst_q.iter_mut().enumerate() {
-                let mut rv = f32x4::from_slice(simd, dq);
-                rv = x0v.mul_add(f32x4::from_slice(simd, &w0_q[q_idx]), rv);
-                rv = x1v.mul_add(f32x4::from_slice(simd, &w1_q[q_idx]), rv);
-                rv = x2v.mul_add(f32x4::from_slice(simd, &w2_q[q_idx]), rv);
-                rv = x3v.mul_add(f32x4::from_slice(simd, &w3_q[q_idx]), rv);
-                rv.store_slice(dq);
-            }
-            for (r_idx, ds) in dst_rem.iter_mut().enumerate() {
-                let oc = oc_quads * 4 + r_idx;
-                let mut sum = *ds;
-                sum = x0.mul_add(w0[oc], sum);
-                sum = x1.mul_add(w1[oc], sum);
-                sum = x2.mul_add(w2[oc], sum);
-                sum = x3.mul_add(w3[oc], sum);
-                *ds = sum;
+    let zero = f32x4::splat(simd, 0.0_f32);
+    let mut acc = [[zero; 4]; F];
+    let tap_stride = in_c * 16;
+
+    for tap_idx in 0..n_taps {
+        let m = n_taps - 1 - tap_idx;
+        let t0 = t0_base - m;
+        let x_rows: [&[f32]; F] =
+            core::array::from_fn(|f| &input[(t0 + f) * in_c..(t0 + f + 1) * in_c]);
+        let (w_chunks, _) =
+            w_tile[tap_idx * tap_stride..(tap_idx + 1) * tap_stride].as_chunks::<16>();
+        for (ic, w_chunk) in w_chunks.iter().enumerate() {
+            let xvs: [f32x4<S>; F] = core::array::from_fn(|f| f32x4::splat(simd, x_rows[f][ic]));
+            let wv0 = f32x4::from_slice(simd, &w_chunk[0..4]);
+            let wv1 = f32x4::from_slice(simd, &w_chunk[4..8]);
+            let wv2 = f32x4::from_slice(simd, &w_chunk[8..12]);
+            let wv3 = f32x4::from_slice(simd, &w_chunk[12..16]);
+            for f in 0..F {
+                acc[f][0] = xvs[f].mul_add(wv0, acc[f][0]);
+                acc[f][1] = xvs[f].mul_add(wv1, acc[f][1]);
+                acc[f][2] = xvs[f].mul_add(wv2, acc[f][2]);
+                acc[f][3] = xvs[f].mul_add(wv3, acc[f][3]);
             }
         }
-        for (rel_ic, &x) in in_rem.iter().enumerate() {
-            let ic = tail_ic_start + rel_ic;
-            let w_row = &w_k[ic * out_c..(ic + 1) * out_c];
-            let xv = f32x4::splat(simd, x);
-            let (dst_q, dst_rem) = dst_row.as_chunks_mut::<4>();
-            let w_q = w_row.as_chunks::<4>().0;
-            for (q_idx, dq) in dst_q.iter_mut().enumerate() {
-                let rv = f32x4::from_slice(simd, dq);
-                xv.mul_add(f32x4::from_slice(simd, &w_q[q_idx]), rv)
-                    .store_slice(dq);
+    }
+
+    if let Some(b) = bias_blk {
+        let bv0 = f32x4::from_slice(simd, &b[0..4]);
+        let bv1 = f32x4::from_slice(simd, &b[4..8]);
+        let bv2 = f32x4::from_slice(simd, &b[8..12]);
+        let bv3 = f32x4::from_slice(simd, &b[12..16]);
+        for f in 0..F {
+            let row = &mut dst[dst_base + f * dst_stride..dst_base + f * dst_stride + 16];
+            (acc[f][0] + bv0).store_slice(&mut row[0..4]);
+            (acc[f][1] + bv1).store_slice(&mut row[4..8]);
+            (acc[f][2] + bv2).store_slice(&mut row[8..12]);
+            (acc[f][3] + bv3).store_slice(&mut row[12..16]);
+        }
+    } else {
+        for f in 0..F {
+            let row = &mut dst[dst_base + f * dst_stride..dst_base + f * dst_stride + 16];
+            acc[f][0].store_slice(&mut row[0..4]);
+            acc[f][1].store_slice(&mut row[4..8]);
+            acc[f][2].store_slice(&mut row[8..12]);
+            acc[f][3].store_slice(&mut row[12..16]);
+        }
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn trans_conv_frames_tail_oc_simd<S: Simd, const F: usize>(
+    simd: S,
+    input: &[f32],
+    w_tile: &[f32],
+    bias_blk: Option<&[f32]>,
+    (t0_base, n_taps, in_c, lane_w): (usize, usize, usize, usize),
+    (dst, dst_base, dst_stride): (&mut [f32], usize, usize),
+) {
+    let tap_stride = in_c * lane_w;
+    let quads = lane_w / 4;
+
+    for qg in 0..quads {
+        let lane_off = qg * 4;
+        let mut acc = [f32x4::splat(simd, 0.0_f32); F];
+        for tap_idx in 0..n_taps {
+            let m = n_taps - 1 - tap_idx;
+            let t0 = t0_base - m;
+            let x_rows: [&[f32]; F] =
+                core::array::from_fn(|f| &input[(t0 + f) * in_c..(t0 + f + 1) * in_c]);
+            let w_tap = &w_tile[tap_idx * tap_stride..(tap_idx + 1) * tap_stride];
+            for ic in 0..in_c {
+                let wv = f32x4::from_slice(
+                    simd,
+                    &w_tap[ic * lane_w + lane_off..ic * lane_w + lane_off + 4],
+                );
+                for f in 0..F {
+                    acc[f] = f32x4::splat(simd, x_rows[f][ic]).mul_add(wv, acc[f]);
+                }
             }
-            for (r_idx, ds) in dst_rem.iter_mut().enumerate() {
-                let oc = oc_quads * 4 + r_idx;
-                *ds = x.mul_add(w_row[oc], *ds);
+        }
+        if let Some(b) = bias_blk {
+            let bv = f32x4::from_slice(simd, &b[lane_off..lane_off + 4]);
+            for f in 0..F {
+                (acc[f] + bv).store_slice(
+                    &mut dst[dst_base + f * dst_stride + lane_off
+                        ..dst_base + f * dst_stride + lane_off + 4],
+                );
+            }
+        } else {
+            for f in 0..F {
+                acc[f].store_slice(
+                    &mut dst[dst_base + f * dst_stride + lane_off
+                        ..dst_base + f * dst_stride + lane_off + 4],
+                );
+            }
+        }
+    }
+
+    for lane in (quads * 4)..lane_w {
+        let mut acc = [0.0_f32; F];
+        for tap_idx in 0..n_taps {
+            let m = n_taps - 1 - tap_idx;
+            let t0 = t0_base - m;
+            let x_rows: [&[f32]; F] =
+                core::array::from_fn(|f| &input[(t0 + f) * in_c..(t0 + f + 1) * in_c]);
+            let w_tap = &w_tile[tap_idx * tap_stride..(tap_idx + 1) * tap_stride];
+            for ic in 0..in_c {
+                let wv = w_tap[ic * lane_w + lane];
+                for f in 0..F {
+                    acc[f] = x_rows[f][ic].mul_add(wv, acc[f]);
+                }
+            }
+        }
+        if let Some(b) = bias_blk {
+            let bv = b[lane];
+            for f in 0..F {
+                dst[dst_base + f * dst_stride + lane] = acc[f] + bv;
+            }
+        } else {
+            for f in 0..F {
+                dst[dst_base + f * dst_stride + lane] = acc[f];
             }
         }
     }
@@ -970,182 +1051,351 @@ fn trans_conv1d_scatter_frame_simd<S: Simd>(
 
 #[expect(
     clippy::inline_always,
-    clippy::too_many_arguments,
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
-fn trans_conv1d_scatter_4frames_simd<S: Simd>(
+fn trans_conv_edge_1frame_16oc_simd<S: Simd>(
     simd: S,
-    in_rows: [&[f32]; 4],
-    weight: &[f32],
-    out_c: usize,
-    kernel: usize,
-    stride: usize,
-    base_frame_offset: usize,
-    output: &mut [f32],
+    input: &[f32],
+    w_tile: &[f32],
+    init_carry: Option<&[f32]>,
+    bias_blk: Option<&[f32]>,
+    (q, frames, n_taps, in_c): (usize, usize, usize, usize),
+    dst_row: &mut [f32],
 ) {
-    let in_c = in_rows[0].len();
-    let k_stride = in_c * out_c;
-    let oc_quads = out_c / 4;
-    let ic_quads = in_c / 4;
-    let tail_ic_start = ic_quads * 4;
-    let [in0, in1, in2, in3] = in_rows;
-    let stride_elems = stride * out_c;
-    let gap_elems = stride_elems - out_c;
+    let mut acc = if let Some(c) = init_carry {
+        [
+            f32x4::from_slice(simd, &c[0..4]),
+            f32x4::from_slice(simd, &c[4..8]),
+            f32x4::from_slice(simd, &c[8..12]),
+            f32x4::from_slice(simd, &c[12..16]),
+        ]
+    } else {
+        [f32x4::splat(simd, 0.0_f32); 4]
+    };
 
-    // Descending k preserves exact ascending t -> ic -> FMA accumulation order
-    // whenever two frames t_a < t_b in this 4-frame tile overlap on one output frame.
-    for k in (0..kernel).rev() {
-        let w_k = &weight[k * k_stride..(k + 1) * k_stride];
-        let d0 = (base_frame_offset + k) * out_c;
-        let d3 = d0 + 3 * stride_elems;
-        let (s0, rest1) = output[d0..d3 + out_c].split_at_mut(out_c);
-        let (s1, rest2) = rest1[gap_elems..].split_at_mut(out_c);
-        let (s2, rest3) = rest2[gap_elems..].split_at_mut(out_c);
-        let s3 = &mut rest3[gap_elems..stride_elems];
+    let m_hi = q.min(n_taps - 1);
+    let m_lo = (q + 1).saturating_sub(frames);
+    let tap_start = (n_taps - 1) - m_hi;
+    let tap_end = n_taps - m_lo;
+    let tap_stride = in_c * 16;
 
-        let (s0_q, s0_rem) = s0.as_chunks_mut::<4>();
-        let (s1_q, s1_rem) = s1.as_chunks_mut::<4>();
-        let (s2_q, s2_rem) = s2.as_chunks_mut::<4>();
-        let (s3_q, s3_rem) = s3.as_chunks_mut::<4>();
+    for tap_idx in tap_start..tap_end {
+        let m = n_taps - 1 - tap_idx;
+        let t = q - m;
+        let x_row = &input[t * in_c..(t + 1) * in_c];
+        let (w_chunks, _) =
+            w_tile[tap_idx * tap_stride..(tap_idx + 1) * tap_stride].as_chunks::<16>();
+        for (ic, w_chunk) in w_chunks.iter().enumerate() {
+            let xv = f32x4::splat(simd, x_row[ic]);
+            acc[0] = xv.mul_add(f32x4::from_slice(simd, &w_chunk[0..4]), acc[0]);
+            acc[1] = xv.mul_add(f32x4::from_slice(simd, &w_chunk[4..8]), acc[1]);
+            acc[2] = xv.mul_add(f32x4::from_slice(simd, &w_chunk[8..12]), acc[2]);
+            acc[3] = xv.mul_add(f32x4::from_slice(simd, &w_chunk[12..16]), acc[3]);
+        }
+    }
 
-        for ic_q in 0..ic_quads {
-            let ic = ic_q * 4;
-            let x0_0 = f32x4::splat(simd, in0[ic]);
-            let x0_1 = f32x4::splat(simd, in0[ic + 1]);
-            let x0_2 = f32x4::splat(simd, in0[ic + 2]);
-            let x0_3 = f32x4::splat(simd, in0[ic + 3]);
+    if let Some(b) = bias_blk {
+        acc[0] += f32x4::from_slice(simd, &b[0..4]);
+        acc[1] += f32x4::from_slice(simd, &b[4..8]);
+        acc[2] += f32x4::from_slice(simd, &b[8..12]);
+        acc[3] += f32x4::from_slice(simd, &b[12..16]);
+    }
+    acc[0].store_slice(&mut dst_row[0..4]);
+    acc[1].store_slice(&mut dst_row[4..8]);
+    acc[2].store_slice(&mut dst_row[8..12]);
+    acc[3].store_slice(&mut dst_row[12..16]);
+}
 
-            let x1_0 = f32x4::splat(simd, in1[ic]);
-            let x1_1 = f32x4::splat(simd, in1[ic + 1]);
-            let x1_2 = f32x4::splat(simd, in1[ic + 2]);
-            let x1_3 = f32x4::splat(simd, in1[ic + 3]);
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn trans_conv_edge_1frame_tail_oc_simd<S: Simd>(
+    simd: S,
+    input: &[f32],
+    w_tile: &[f32],
+    init_carry: Option<&[f32]>,
+    bias_blk: Option<&[f32]>,
+    (q, frames, n_taps, in_c, lane_w): (usize, usize, usize, usize, usize),
+    dst_row: &mut [f32],
+) {
+    let m_hi = q.min(n_taps - 1);
+    let m_lo = (q + 1).saturating_sub(frames);
+    let tap_start = (n_taps - 1) - m_hi;
+    let tap_end = n_taps - m_lo;
+    let tap_stride = in_c * lane_w;
+    let quads = lane_w / 4;
 
-            let x2_0 = f32x4::splat(simd, in2[ic]);
-            let x2_1 = f32x4::splat(simd, in2[ic + 1]);
-            let x2_2 = f32x4::splat(simd, in2[ic + 2]);
-            let x2_3 = f32x4::splat(simd, in2[ic + 3]);
-
-            let x3_0 = f32x4::splat(simd, in3[ic]);
-            let x3_1 = f32x4::splat(simd, in3[ic + 1]);
-            let x3_2 = f32x4::splat(simd, in3[ic + 2]);
-            let x3_3 = f32x4::splat(simd, in3[ic + 3]);
-
-            let w0 = &w_k[ic * out_c..(ic + 1) * out_c];
-            let w1 = &w_k[(ic + 1) * out_c..(ic + 2) * out_c];
-            let w2 = &w_k[(ic + 2) * out_c..(ic + 3) * out_c];
-            let w3 = &w_k[(ic + 3) * out_c..(ic + 4) * out_c];
-            let w0_q = w0.as_chunks::<4>().0;
-            let w1_q = w1.as_chunks::<4>().0;
-            let w2_q = w2.as_chunks::<4>().0;
-            let w3_q = w3.as_chunks::<4>().0;
-
-            for (q_idx, (((q0, q1), q2), q3)) in s0_q
-                .iter_mut()
-                .zip(s1_q.iter_mut())
-                .zip(s2_q.iter_mut())
-                .zip(s3_q.iter_mut())
-                .enumerate()
-            {
-                let mut r0 = f32x4::from_slice(simd, q0);
-                let mut r1 = f32x4::from_slice(simd, q1);
-                let mut r2 = f32x4::from_slice(simd, q2);
-                let mut r3 = f32x4::from_slice(simd, q3);
-
-                let wv0 = f32x4::from_slice(simd, &w0_q[q_idx]);
-                r0 = x0_0.mul_add(wv0, r0);
-                r1 = x1_0.mul_add(wv0, r1);
-                r2 = x2_0.mul_add(wv0, r2);
-                r3 = x3_0.mul_add(wv0, r3);
-
-                let wv1 = f32x4::from_slice(simd, &w1_q[q_idx]);
-                r0 = x0_1.mul_add(wv1, r0);
-                r1 = x1_1.mul_add(wv1, r1);
-                r2 = x2_1.mul_add(wv1, r2);
-                r3 = x3_1.mul_add(wv1, r3);
-
-                let wv2 = f32x4::from_slice(simd, &w2_q[q_idx]);
-                r0 = x0_2.mul_add(wv2, r0);
-                r1 = x1_2.mul_add(wv2, r1);
-                r2 = x2_2.mul_add(wv2, r2);
-                r3 = x3_2.mul_add(wv2, r3);
-
-                let wv3 = f32x4::from_slice(simd, &w3_q[q_idx]);
-                r0 = x0_3.mul_add(wv3, r0);
-                r1 = x1_3.mul_add(wv3, r1);
-                r2 = x2_3.mul_add(wv3, r2);
-                r3 = x3_3.mul_add(wv3, r3);
-
-                r0.store_slice(q0);
-                r1.store_slice(q1);
-                r2.store_slice(q2);
-                r3.store_slice(q3);
-            }
-
-            for (r_idx, (((d0_s, d1_s), d2_s), d3_s)) in s0_rem
-                .iter_mut()
-                .zip(s1_rem.iter_mut())
-                .zip(s2_rem.iter_mut())
-                .zip(s3_rem.iter_mut())
-                .enumerate()
-            {
-                let oc = oc_quads * 4 + r_idx;
-                let w_0 = w0[oc];
-                let w_1 = w1[oc];
-                let w_2 = w2[oc];
-                let w_3 = w3[oc];
-
-                *d0_s = in0[ic + 3].mul_add(
-                    w_3,
-                    in0[ic + 2].mul_add(w_2, in0[ic + 1].mul_add(w_1, in0[ic].mul_add(w_0, *d0_s))),
+    for qg in 0..quads {
+        let lane_off = qg * 4;
+        let mut acc = init_carry.map_or_else(
+            || f32x4::splat(simd, 0.0_f32),
+            |c| f32x4::from_slice(simd, &c[lane_off..lane_off + 4]),
+        );
+        for tap_idx in tap_start..tap_end {
+            let m = n_taps - 1 - tap_idx;
+            let t = q - m;
+            let x_row = &input[t * in_c..(t + 1) * in_c];
+            let w_tap = &w_tile[tap_idx * tap_stride..(tap_idx + 1) * tap_stride];
+            for ic in 0..in_c {
+                let wv = f32x4::from_slice(
+                    simd,
+                    &w_tap[ic * lane_w + lane_off..ic * lane_w + lane_off + 4],
                 );
-                *d1_s = in1[ic + 3].mul_add(
-                    w_3,
-                    in1[ic + 2].mul_add(w_2, in1[ic + 1].mul_add(w_1, in1[ic].mul_add(w_0, *d1_s))),
-                );
-                *d2_s = in2[ic + 3].mul_add(
-                    w_3,
-                    in2[ic + 2].mul_add(w_2, in2[ic + 1].mul_add(w_1, in2[ic].mul_add(w_0, *d2_s))),
-                );
-                *d3_s = in3[ic + 3].mul_add(
-                    w_3,
-                    in3[ic + 2].mul_add(w_2, in3[ic + 1].mul_add(w_1, in3[ic].mul_add(w_0, *d3_s))),
-                );
+                acc = f32x4::splat(simd, x_row[ic]).mul_add(wv, acc);
             }
         }
+        if let Some(b) = bias_blk {
+            acc += f32x4::from_slice(simd, &b[lane_off..lane_off + 4]);
+        }
+        acc.store_slice(&mut dst_row[lane_off..lane_off + 4]);
+    }
 
-        for ic in tail_ic_start..in_c {
-            let x0 = f32x4::splat(simd, in0[ic]);
-            let x1 = f32x4::splat(simd, in1[ic]);
-            let x2 = f32x4::splat(simd, in2[ic]);
-            let x3 = f32x4::splat(simd, in3[ic]);
-            let w_row = &w_k[ic * out_c..(ic + 1) * out_c];
-            let w_q = w_row.as_chunks::<4>().0;
-            for (q_idx, (((q0, q1), q2), q3)) in s0_q
-                .iter_mut()
-                .zip(s1_q.iter_mut())
-                .zip(s2_q.iter_mut())
-                .zip(s3_q.iter_mut())
-                .enumerate()
-            {
-                let wv = f32x4::from_slice(simd, &w_q[q_idx]);
-                x0.mul_add(wv, f32x4::from_slice(simd, q0)).store_slice(q0);
-                x1.mul_add(wv, f32x4::from_slice(simd, q1)).store_slice(q1);
-                x2.mul_add(wv, f32x4::from_slice(simd, q2)).store_slice(q2);
-                x3.mul_add(wv, f32x4::from_slice(simd, q3)).store_slice(q3);
+    for lane in (quads * 4)..lane_w {
+        let mut acc = init_carry.map_or(0.0_f32, |c| c[lane]);
+        for tap_idx in tap_start..tap_end {
+            let m = n_taps - 1 - tap_idx;
+            let t = q - m;
+            let x_row = &input[t * in_c..(t + 1) * in_c];
+            let w_tap = &w_tile[tap_idx * tap_stride..(tap_idx + 1) * tap_stride];
+            for ic in 0..in_c {
+                acc = x_row[ic].mul_add(w_tap[ic * lane_w + lane], acc);
             }
-            for (r_idx, (((d0_s, d1_s), d2_s), d3_s)) in s0_rem
-                .iter_mut()
-                .zip(s1_rem.iter_mut())
-                .zip(s2_rem.iter_mut())
-                .zip(s3_rem.iter_mut())
-                .enumerate()
-            {
-                let wv = w_row[oc_quads * 4 + r_idx];
-                *d0_s = in0[ic].mul_add(wv, *d0_s);
-                *d1_s = in1[ic].mul_add(wv, *d1_s);
-                *d2_s = in2[ic].mul_add(wv, *d2_s);
-                *d3_s = in3[ic].mul_add(wv, *d3_s);
+        }
+        if let Some(b) = bias_blk {
+            acc += b[lane];
+        }
+        dst_row[lane] = acc;
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn trans_conv_run_q_range_simd<S: Simd>(
+    simd: S,
+    input: &[f32],
+    carry: &[f32],
+    w_tile: &[f32],
+    bias_blk: Option<&[f32]>,
+    (phase, stride, frames, n_taps, in_c, out_c, oc_base, lane_w): (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ),
+    (q_begin, q_end): (usize, usize),
+    (dst, dst_origin_frame, dst_frame_stride, dst_oc_stride, dst_oc_off): (
+        &mut [f32],
+        usize,
+        usize,
+        usize,
+        usize,
+    ),
+) {
+    let q_count = frames + n_taps - 1;
+    let interior_start = (n_taps - 1).min(q_count);
+    let edge1_end = interior_start.clamp(q_begin, q_end);
+    let mid_start = edge1_end;
+    let mid_end = frames.clamp(mid_start, q_end);
+    let edge2_start = mid_end;
+    let row_step = dst_frame_stride * dst_oc_stride;
+
+    let mut q = q_begin;
+    while q < edge1_end {
+        let y = q * stride + phase;
+        let carry_row = &carry[y * out_c + oc_base..y * out_c + oc_base + lane_w];
+        let b_opt = (q < frames).then_some(bias_blk).flatten();
+        let dst_off = if dst_frame_stride == 1 {
+            (q - dst_origin_frame) * dst_oc_stride + dst_oc_off
+        } else {
+            (y - dst_origin_frame) * dst_oc_stride + dst_oc_off
+        };
+        let dst_row = &mut dst[dst_off..dst_off + lane_w];
+        if lane_w == 16 {
+            trans_conv_edge_1frame_16oc_simd(
+                simd,
+                input,
+                w_tile,
+                Some(carry_row),
+                b_opt,
+                (q, frames, n_taps, in_c),
+                dst_row,
+            );
+        } else {
+            trans_conv_edge_1frame_tail_oc_simd(
+                simd,
+                input,
+                w_tile,
+                Some(carry_row),
+                b_opt,
+                (q, frames, n_taps, in_c, lane_w),
+                dst_row,
+            );
+        }
+        q += 1;
+    }
+
+    let mut q_mid = mid_start;
+    while q_mid + 4 <= mid_end {
+        let dst_base = if dst_frame_stride == 1 {
+            (q_mid - dst_origin_frame) * dst_oc_stride + dst_oc_off
+        } else {
+            (q_mid * stride + phase - dst_origin_frame) * dst_oc_stride + dst_oc_off
+        };
+        if lane_w == 16 {
+            trans_conv_frames_16oc_simd::<S, 4>(
+                simd,
+                input,
+                w_tile,
+                bias_blk,
+                (q_mid, n_taps, in_c),
+                (dst, dst_base, row_step),
+            );
+        } else {
+            trans_conv_frames_tail_oc_simd::<S, 4>(
+                simd,
+                input,
+                w_tile,
+                bias_blk,
+                (q_mid, n_taps, in_c, lane_w),
+                (dst, dst_base, row_step),
+            );
+        }
+        q_mid += 4;
+    }
+    let rem = mid_end - q_mid;
+    if rem > 0 {
+        let dst_base = if dst_frame_stride == 1 {
+            (q_mid - dst_origin_frame) * dst_oc_stride + dst_oc_off
+        } else {
+            (q_mid * stride + phase - dst_origin_frame) * dst_oc_stride + dst_oc_off
+        };
+        match (lane_w == 16, rem) {
+            (true, 3) => trans_conv_frames_16oc_simd::<S, 3>(
+                simd,
+                input,
+                w_tile,
+                bias_blk,
+                (q_mid, n_taps, in_c),
+                (dst, dst_base, row_step),
+            ),
+            (true, 2) => trans_conv_frames_16oc_simd::<S, 2>(
+                simd,
+                input,
+                w_tile,
+                bias_blk,
+                (q_mid, n_taps, in_c),
+                (dst, dst_base, row_step),
+            ),
+            (true, _) => trans_conv_frames_16oc_simd::<S, 1>(
+                simd,
+                input,
+                w_tile,
+                bias_blk,
+                (q_mid, n_taps, in_c),
+                (dst, dst_base, row_step),
+            ),
+            (false, 3) => trans_conv_frames_tail_oc_simd::<S, 3>(
+                simd,
+                input,
+                w_tile,
+                bias_blk,
+                (q_mid, n_taps, in_c, lane_w),
+                (dst, dst_base, row_step),
+            ),
+            (false, 2) => trans_conv_frames_tail_oc_simd::<S, 2>(
+                simd,
+                input,
+                w_tile,
+                bias_blk,
+                (q_mid, n_taps, in_c, lane_w),
+                (dst, dst_base, row_step),
+            ),
+            (false, _) => trans_conv_frames_tail_oc_simd::<S, 1>(
+                simd,
+                input,
+                w_tile,
+                bias_blk,
+                (q_mid, n_taps, in_c, lane_w),
+                (dst, dst_base, row_step),
+            ),
+        }
+    }
+
+    for q_edge in edge2_start..q_end {
+        let y = q_edge * stride + phase;
+        let dst_off = if dst_frame_stride == 1 {
+            (q_edge - dst_origin_frame) * dst_oc_stride + dst_oc_off
+        } else {
+            (y - dst_origin_frame) * dst_oc_stride + dst_oc_off
+        };
+        let dst_row = &mut dst[dst_off..dst_off + lane_w];
+        if lane_w == 16 {
+            trans_conv_edge_1frame_16oc_simd(
+                simd,
+                input,
+                w_tile,
+                None,
+                None,
+                (q_edge, frames, n_taps, in_c),
+                dst_row,
+            );
+        } else {
+            trans_conv_edge_1frame_tail_oc_simd(
+                simd,
+                input,
+                w_tile,
+                None,
+                None,
+                (q_edge, frames, n_taps, in_c, lane_w),
+                dst_row,
+            );
+        }
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn scatter_phase_blocks_to_raw_simd<S: Simd>(
+    simd: S,
+    scratch: &[f32],
+    tile_elems: usize,
+    stride: usize,
+    out_c: usize,
+    first_frame: usize,
+    raw_slice: &mut [f32],
+) {
+    let oc_blocks = out_c.div_ceil(16);
+    for (local_y, dst_row) in raw_slice.chunks_exact_mut(out_c).enumerate() {
+        let y = first_frame + local_y;
+        let phase = y % stride;
+        let q = y / stride;
+        let phase_tile_base = phase * oc_blocks;
+        for oc_blk in 0..oc_blocks {
+            let oc_base = oc_blk * 16;
+            let lane_w = 16.min(out_c - oc_base);
+            let src_off = (phase_tile_base + oc_blk) * tile_elems + q * 16;
+            let src = &scratch[src_off..src_off + lane_w];
+            let dst = &mut dst_row[oc_base..oc_base + lane_w];
+            if lane_w == 16 {
+                f32x4::from_slice(simd, &src[0..4]).store_slice(&mut dst[0..4]);
+                f32x4::from_slice(simd, &src[4..8]).store_slice(&mut dst[4..8]);
+                f32x4::from_slice(simd, &src[8..12]).store_slice(&mut dst[8..12]);
+                f32x4::from_slice(simd, &src[12..16]).store_slice(&mut dst[12..16]);
+            } else {
+                dst.copy_from_slice(src);
             }
         }
     }
@@ -1305,33 +1555,41 @@ fn tanh_scalar(z: f32) -> f32 {
 
 #[expect(
     clippy::inline_always,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
-fn convnext_frame_simd<S: Simd>(
+fn gelu_tanh_f32x4<S: Simd>(simd: S, val: f32x4<S>) -> f32x4<S> {
+    let k_gelu = (2.0_f32 / core::f32::consts::PI).sqrt();
+    let k_gelu_v = f32x4::splat(simd, k_gelu);
+    let c_gelu_v = f32x4::splat(simd, 0.044_715_f32);
+    let half_v = f32x4::splat(simd, 0.5_f32);
+    let one_v = f32x4::splat(simd, 1.0_f32);
+    let inner = k_gelu_v * c_gelu_v.mul_add(val * val * val, val);
+    half_v * val * (one_v + tanh_f32x4(simd, inner))
+}
+
+#[inline]
+fn gelu_tanh_scalar(val: f32) -> f32 {
+    let k_gelu = (2.0_f32 / core::f32::consts::PI).sqrt();
+    let inner = k_gelu * 0.044_715_f32.mul_add(val * val * val, val);
+    0.5_f32 * val * (1.0_f32 + tanh_scalar(inner))
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn convnext_dw_layernorm_row_simd<S: Simd>(
     simd: S,
     ext: &[f32],
     frame: usize,
-    channels: usize,
-    kernel: usize,
-    inv_c: f32,
-    dw_weight: &[f32],
-    dw_bias: &[f32],
-    norm_w: &[f32],
-    norm_b: &[f32],
-    pwconv1_w: &[f32],
-    pwconv1_b: &[f32],
-    pwconv2_w: &[f32],
-    pwconv2_b: &[f32],
-    gamma: &[f32],
-    norm_buf: &mut [f32],
-    mid: &mut [f32],
-    out_row: &mut [f32],
+    (channels, kernel, inv_c): (usize, usize, f32),
+    (dw_weight, dw_bias, norm_w, norm_b): (&[f32], &[f32], &[f32], &[f32]),
+    norm_row: &mut [f32],
 ) {
     // 1. Depthwise causal conv across `channels` channels (4 channels per f32x4 lane)
-    let (y_quads, y_rem) = norm_buf.as_chunks_mut::<4>();
+    let (y_quads, y_rem) = norm_row.as_chunks_mut::<4>();
     let (b_quads, b_rem) = dw_bias.as_chunks::<4>();
     for (q_idx, (yq, bq)) in y_quads.iter_mut().zip(b_quads.iter()).enumerate() {
         let ch_base = q_idx * 4;
@@ -1360,10 +1618,10 @@ fn convnext_frame_simd<S: Simd>(
     }
 
     // 2. LayerNorm across `channels` channels
-    let mean = norm_buf.iter().copied().sum::<f32>() * inv_c;
+    let mean = norm_row.iter().copied().sum::<f32>() * inv_c;
     let mean_v = f32x4::splat(simd, mean);
     let mut var_acc = f32x4::splat(simd, 0.0);
-    let (y_chunks, y_tail) = norm_buf.as_chunks::<4>();
+    let (y_chunks, y_tail) = norm_row.as_chunks::<4>();
     for yc in y_chunks {
         let diff = f32x4::from_slice(simd, yc) - mean_v;
         var_acc = diff.mul_add(diff, var_acc);
@@ -1375,7 +1633,7 @@ fn convnext_frame_simd<S: Simd>(
     }
     let inv_std = 1.0_f32 / var_sum.mul_add(inv_c, 1e-6_f32).sqrt();
     let inv_std_v = f32x4::splat(simd, inv_std);
-    let (y_quads, y_rem) = norm_buf.as_chunks_mut::<4>();
+    let (y_quads, y_rem) = norm_row.as_chunks_mut::<4>();
     let (weight_quads, weight_rem) = norm_w.as_chunks::<4>();
     let (bias_quads, bias_rem) = norm_b.as_chunks::<4>();
     for ((yq, wq), bq) in y_quads
@@ -1390,64 +1648,317 @@ fn convnext_frame_simd<S: Simd>(
     for ((ys, &nw), &nb) in y_rem.iter_mut().zip(weight_rem.iter()).zip(bias_rem.iter()) {
         *ys = ((*ys - mean) * inv_std).mul_add(nw, nb);
     }
+}
 
-    // 3. pwconv1 + vectorized Padé tanh-approximated GELU
-    matvec_4rows_simd(simd, pwconv1_w, norm_buf, Some(pwconv1_b), mid);
-    let k_gelu = (2.0_f32 / core::f32::consts::PI).sqrt();
-    let k_gelu_v = f32x4::splat(simd, k_gelu);
-    let c_gelu_v = f32x4::splat(simd, 0.044_715_f32);
-    let half_v = f32x4::splat(simd, 0.5_f32);
-    let one_v = f32x4::splat(simd, 1.0_f32);
-    let (mid_chunks, mid_tail) = mid.as_chunks_mut::<4>();
-    for chunk in mid_chunks {
-        let val = f32x4::from_slice(simd, chunk);
-        let inner = k_gelu_v * c_gelu_v.mul_add(val * val * val, val);
-        let gelu = half_v * val * (one_v + tanh_f32x4(simd, inner));
-        gelu.store_slice(chunk);
-    }
-    for x_slot in mid_tail {
-        let val = *x_slot;
-        let inner = k_gelu * 0.044_715_f32.mul_add(val * val * val, val);
-        *x_slot = 0.5_f32 * val * (1.0_f32 + tanh_scalar(inner));
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn convnext_pwconv1_gelu_time_first_simd<S: Simd>(
+    simd: S,
+    w_rows: &[f32],
+    b_rows: &[f32],
+    norm_buf: &[f32],
+    (first_frame, num_frames, in_c): (usize, usize, usize),
+    mid_out: &mut [f32],
+) {
+    let num_rows = b_rows.len();
+    let quads = num_rows / 4;
+    let geom = (in_c, 1_usize, 1_usize);
+
+    for q_idx in 0..quads {
+        let oc = q_idx * 4;
+        let w_quad = &w_rows[oc * in_c..(oc + 4) * in_c];
+        let inits = [b_rows[oc], b_rows[oc + 1], b_rows[oc + 2], b_rows[oc + 3]];
+        let mut f = 0_usize;
+        while f + 4 <= num_frames {
+            let ff = [
+                first_frame + f,
+                first_frame + f + 1,
+                first_frame + f + 2,
+                first_frame + f + 3,
+            ];
+            let dots = dot_4rows_4frames_k_f32_simd(simd, w_quad, norm_buf, ff, geom, inits);
+            for (df, dot_row) in dots.iter().enumerate() {
+                let off = (f + df) * num_rows + oc;
+                gelu_tanh_f32x4(simd, f32x4::from_slice(simd, dot_row))
+                    .store_slice(&mut mid_out[off..off + 4]);
+            }
+            f += 4;
+        }
+        while f < num_frames {
+            let dots =
+                dot_4rows_1frame_k_f32_simd(simd, w_quad, norm_buf, first_frame + f, geom, inits);
+            let off = f * num_rows + oc;
+            gelu_tanh_f32x4(simd, f32x4::from_slice(simd, &dots))
+                .store_slice(&mut mid_out[off..off + 4]);
+            f += 1;
+        }
     }
 
-    // 4. pwconv2 + gamma scale + residual add into `out_row`
-    let mid_c = mid.len();
-    let (out_quads, out_rem) = out_row.as_chunks_mut::<4>();
-    let (g_quads, g_rem) = gamma.as_chunks::<4>();
-    for (q_idx, (oq, gq)) in out_quads.iter_mut().zip(g_quads.iter()).enumerate() {
-        let o_base = q_idx * 4;
-        let w_base = o_base * mid_c;
-        let inits = [
-            pwconv2_b[o_base],
-            pwconv2_b[o_base + 1],
-            pwconv2_b[o_base + 2],
-            pwconv2_b[o_base + 3],
+    for oc in (quads * 4)..num_rows {
+        let w_row = &w_rows[oc * in_c..(oc + 1) * in_c];
+        let init = b_rows[oc];
+        let mut f = 0_usize;
+        while f + 4 <= num_frames {
+            let ff = [
+                first_frame + f,
+                first_frame + f + 1,
+                first_frame + f + 2,
+                first_frame + f + 3,
+            ];
+            let dots = dot_1row_4frames_k_f32_simd(simd, w_row, norm_buf, ff, geom, init);
+            let gelus: [f32; 4] = gelu_tanh_f32x4(simd, f32x4::from_slice(simd, &dots)).into();
+            for (df, &val) in gelus.iter().enumerate() {
+                mid_out[(f + df) * num_rows + oc] = val;
+            }
+            f += 4;
+        }
+        while f < num_frames {
+            mid_out[f * num_rows + oc] = gelu_tanh_scalar(dot_1row_1frame_k_f32_simd(
+                simd,
+                w_row,
+                norm_buf,
+                first_frame + f,
+                geom,
+                init,
+            ));
+            f += 1;
+        }
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn convnext_pwconv1_gelu_channel_first_simd<S: Simd>(
+    simd: S,
+    w_rows: &[f32],
+    b_rows: &[f32],
+    norm_buf: &[f32],
+    (frames, in_c): (usize, usize),
+    transposed_rows: &mut [f32],
+) {
+    let num_rows = b_rows.len();
+    let quads = num_rows / 4;
+    let geom = (in_c, 1_usize, 1_usize);
+
+    for q_idx in 0..quads {
+        let oc = q_idx * 4;
+        let w_quad = &w_rows[oc * in_c..(oc + 4) * in_c];
+        let inits = [b_rows[oc], b_rows[oc + 1], b_rows[oc + 2], b_rows[oc + 3]];
+        let dst_quad = &mut transposed_rows[oc * frames..(oc + 4) * frames];
+        let (r0_r1, r2_r3) = dst_quad.split_at_mut(2 * frames);
+        let (r0, r1) = r0_r1.split_at_mut(frames);
+        let (r2, r3) = r2_r3.split_at_mut(frames);
+        let mut f = 0_usize;
+        while f + 4 <= frames {
+            let ff = [f, f + 1, f + 2, f + 3];
+            let dots = dot_4rows_4frames_k_f32_simd(simd, w_quad, norm_buf, ff, geom, inits);
+            let rows_r = [
+                f32x4::from_slice(simd, &[dots[0][0], dots[1][0], dots[2][0], dots[3][0]]),
+                f32x4::from_slice(simd, &[dots[0][1], dots[1][1], dots[2][1], dots[3][1]]),
+                f32x4::from_slice(simd, &[dots[0][2], dots[1][2], dots[2][2], dots[3][2]]),
+                f32x4::from_slice(simd, &[dots[0][3], dots[1][3], dots[2][3], dots[3][3]]),
+            ];
+            gelu_tanh_f32x4(simd, rows_r[0]).store_slice(&mut r0[f..f + 4]);
+            gelu_tanh_f32x4(simd, rows_r[1]).store_slice(&mut r1[f..f + 4]);
+            gelu_tanh_f32x4(simd, rows_r[2]).store_slice(&mut r2[f..f + 4]);
+            gelu_tanh_f32x4(simd, rows_r[3]).store_slice(&mut r3[f..f + 4]);
+            f += 4;
+        }
+        while f < frames {
+            let dots = dot_4rows_1frame_k_f32_simd(simd, w_quad, norm_buf, f, geom, inits);
+            let gelus: [f32; 4] = gelu_tanh_f32x4(simd, f32x4::from_slice(simd, &dots)).into();
+            r0[f] = gelus[0];
+            r1[f] = gelus[1];
+            r2[f] = gelus[2];
+            r3[f] = gelus[3];
+            f += 1;
+        }
+    }
+
+    for oc in (quads * 4)..num_rows {
+        let w_row = &w_rows[oc * in_c..(oc + 1) * in_c];
+        let init = b_rows[oc];
+        let dst_row = &mut transposed_rows[oc * frames..(oc + 1) * frames];
+        let mut f = 0_usize;
+        while f + 4 <= frames {
+            let ff = [f, f + 1, f + 2, f + 3];
+            let dots = dot_1row_4frames_k_f32_simd(simd, w_row, norm_buf, ff, geom, init);
+            gelu_tanh_f32x4(simd, f32x4::from_slice(simd, &dots))
+                .store_slice(&mut dst_row[f..f + 4]);
+            f += 4;
+        }
+        while f < frames {
+            dst_row[f] = gelu_tanh_scalar(dot_1row_1frame_k_f32_simd(
+                simd, w_row, norm_buf, f, geom, init,
+            ));
+            f += 1;
+        }
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn convnext_pwconv2_res_time_first_simd<S: Simd>(
+    simd: S,
+    (w_rows, b_rows, gamma_rows): (&[f32], &[f32], &[f32]),
+    (mid_buf, residual_in): (&[f32], &[f32]),
+    (first_frame, num_frames, mid_c): (usize, usize, usize),
+    out: &mut [f32],
+) {
+    let num_rows = b_rows.len();
+    let quads = num_rows / 4;
+    let geom = (mid_c, 1_usize, 1_usize);
+
+    for q_idx in 0..quads {
+        let oc = q_idx * 4;
+        let w_quad = &w_rows[oc * mid_c..(oc + 4) * mid_c];
+        let inits = [b_rows[oc], b_rows[oc + 1], b_rows[oc + 2], b_rows[oc + 3]];
+        let gv = f32x4::from_slice(simd, &gamma_rows[oc..oc + 4]);
+        let mut f = 0_usize;
+        while f + 4 <= num_frames {
+            let ff = [
+                first_frame + f,
+                first_frame + f + 1,
+                first_frame + f + 2,
+                first_frame + f + 3,
+            ];
+            let dots = dot_4rows_4frames_k_f32_simd(simd, w_quad, mid_buf, ff, geom, inits);
+            for (df, dot_row) in dots.iter().enumerate() {
+                let off = (f + df) * num_rows + oc;
+                let res_off = (first_frame + f + df) * num_rows + oc;
+                let dv = f32x4::from_slice(simd, dot_row);
+                let rv = f32x4::from_slice(simd, &residual_in[res_off..res_off + 4]);
+                dv.mul_add(gv, rv).store_slice(&mut out[off..off + 4]);
+            }
+            f += 4;
+        }
+        while f < num_frames {
+            let dots =
+                dot_4rows_1frame_k_f32_simd(simd, w_quad, mid_buf, first_frame + f, geom, inits);
+            let off = f * num_rows + oc;
+            let res_off = (first_frame + f) * num_rows + oc;
+            let dv = f32x4::from_slice(simd, &dots);
+            let rv = f32x4::from_slice(simd, &residual_in[res_off..res_off + 4]);
+            dv.mul_add(gv, rv).store_slice(&mut out[off..off + 4]);
+            f += 1;
+        }
+    }
+
+    for oc in (quads * 4)..num_rows {
+        let w_row = &w_rows[oc * mid_c..(oc + 1) * mid_c];
+        let init = b_rows[oc];
+        let g = gamma_rows[oc];
+        let mut f = 0_usize;
+        while f + 4 <= num_frames {
+            let ff = [
+                first_frame + f,
+                first_frame + f + 1,
+                first_frame + f + 2,
+                first_frame + f + 3,
+            ];
+            let dots = dot_1row_4frames_k_f32_simd(simd, w_row, mid_buf, ff, geom, init);
+            for (df, &val) in dots.iter().enumerate() {
+                let off = (f + df) * num_rows + oc;
+                let res_off = (first_frame + f + df) * num_rows + oc;
+                out[off] = val.mul_add(g, residual_in[res_off]);
+            }
+            f += 4;
+        }
+        while f < num_frames {
+            let off = f * num_rows + oc;
+            let res_off = (first_frame + f) * num_rows + oc;
+            out[off] =
+                dot_1row_1frame_k_f32_simd(simd, w_row, mid_buf, first_frame + f, geom, init)
+                    .mul_add(g, residual_in[res_off]);
+            f += 1;
+        }
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn convnext_pwconv2_res_channel_first_simd<S: Simd>(
+    simd: S,
+    (w_rows, b_rows, gamma_rows): (&[f32], &[f32], &[f32]),
+    (mid_buf, residual_in): (&[f32], &[f32]),
+    (frames, mid_c, total_c, oc_off): (usize, usize, usize, usize),
+    transposed_rows: &mut [f32],
+) {
+    let num_rows = b_rows.len();
+    let quads = num_rows / 4;
+    let geom = (mid_c, 1_usize, 1_usize);
+
+    for q_idx in 0..quads {
+        let oc = q_idx * 4;
+        let oc_abs = oc_off + oc;
+        let w_quad = &w_rows[oc * mid_c..(oc + 4) * mid_c];
+        let inits = [b_rows[oc], b_rows[oc + 1], b_rows[oc + 2], b_rows[oc + 3]];
+        let g = [
+            gamma_rows[oc],
+            gamma_rows[oc + 1],
+            gamma_rows[oc + 2],
+            gamma_rows[oc + 3],
         ];
-        let dots = dot_four_rows_f32_simd(
-            simd,
-            &pwconv2_w[w_base..w_base + mid_c],
-            &pwconv2_w[w_base + mid_c..w_base + 2 * mid_c],
-            &pwconv2_w[w_base + 2 * mid_c..w_base + 3 * mid_c],
-            &pwconv2_w[w_base + 3 * mid_c..w_base + 4 * mid_c],
-            mid,
-            inits,
-        );
-        let dv = f32x4::from_slice(simd, &dots);
-        let gv = f32x4::from_slice(simd, gq);
-        let rv = f32x4::from_slice(simd, oq);
-        dv.mul_add(gv, rv).store_slice(oq);
+        let dst_quad = &mut transposed_rows[oc * frames..(oc + 4) * frames];
+        let (r0_r1, r2_r3) = dst_quad.split_at_mut(2 * frames);
+        let (r0, r1) = r0_r1.split_at_mut(frames);
+        let (r2, r3) = r2_r3.split_at_mut(frames);
+        let mut f = 0_usize;
+        while f + 4 <= frames {
+            let ff = [f, f + 1, f + 2, f + 3];
+            let dots = dot_4rows_4frames_k_f32_simd(simd, w_quad, mid_buf, ff, geom, inits);
+            for (df, dot_row) in dots.iter().enumerate() {
+                let res_off = (f + df) * total_c + oc_abs;
+                r0[f + df] = dot_row[0].mul_add(g[0], residual_in[res_off]);
+                r1[f + df] = dot_row[1].mul_add(g[1], residual_in[res_off + 1]);
+                r2[f + df] = dot_row[2].mul_add(g[2], residual_in[res_off + 2]);
+                r3[f + df] = dot_row[3].mul_add(g[3], residual_in[res_off + 3]);
+            }
+            f += 4;
+        }
+        while f < frames {
+            let dots = dot_4rows_1frame_k_f32_simd(simd, w_quad, mid_buf, f, geom, inits);
+            let res_off = f * total_c + oc_abs;
+            r0[f] = dots[0].mul_add(g[0], residual_in[res_off]);
+            r1[f] = dots[1].mul_add(g[1], residual_in[res_off + 1]);
+            r2[f] = dots[2].mul_add(g[2], residual_in[res_off + 2]);
+            r3[f] = dots[3].mul_add(g[3], residual_in[res_off + 3]);
+            f += 1;
+        }
     }
-    let rem_base = out_quads.len() * 4;
-    for (r_idx, (os, &g_val)) in out_rem.iter_mut().zip(g_rem.iter()).enumerate() {
-        let out_idx = rem_base + r_idx;
-        let acc = dot_f32_simd(
-            simd,
-            &pwconv2_w[out_idx * mid_c..(out_idx + 1) * mid_c],
-            mid,
-            pwconv2_b[out_idx],
-        );
-        *os = acc.mul_add(g_val, *os);
+
+    for oc in (quads * 4)..num_rows {
+        let oc_abs = oc_off + oc;
+        let w_row = &w_rows[oc * mid_c..(oc + 1) * mid_c];
+        let init = b_rows[oc];
+        let g = gamma_rows[oc];
+        let dst_row = &mut transposed_rows[oc * frames..(oc + 1) * frames];
+        let mut f = 0_usize;
+        while f + 4 <= frames {
+            let ff = [f, f + 1, f + 2, f + 3];
+            let dots = dot_1row_4frames_k_f32_simd(simd, w_row, mid_buf, ff, geom, init);
+            for (df, &val) in dots.iter().enumerate() {
+                dst_row[f + df] = val.mul_add(g, residual_in[(f + df) * total_c + oc_abs]);
+            }
+            f += 4;
+        }
+        while f < frames {
+            dst_row[f] = dot_1row_1frame_k_f32_simd(simd, w_row, mid_buf, f, geom, init)
+                .mul_add(g, residual_in[f * total_c + oc_abs]);
+            f += 1;
+        }
     }
 }
 
@@ -1923,7 +2434,7 @@ fn update_stream_context<'a>(
     ext_buf
 }
 
-/// Causal 1D transposed convolution (pre-permuted `[kernel, in_c, out_c]` layout).
+/// Causal 1D transposed convolution (pre-packed `[phase, oc_block(16), k_tap, ic, oc_lane]` layout).
 #[derive(Clone, Debug)]
 pub struct CausalTransConv1d {
     /// Input channels.
@@ -1934,7 +2445,7 @@ pub struct CausalTransConv1d {
     pub kernel: usize,
     /// Upsampling stride (`>= 1`).
     pub stride: usize,
-    /// Weights `[kernel * in_c * out_c]` in `[k, ic, oc]` order.
+    /// Weights `[kernel * in_c * out_c]` in `[phase, oc_block(16), k_tap(descending k), ic, oc_lane]` order.
     pub weight: Vec<f32>,
     /// Optional bias `[out_c]`.
     pub bias: Option<Vec<f32>>,
@@ -1942,7 +2453,8 @@ pub struct CausalTransConv1d {
 
 impl CausalTransConv1d {
     /// Construct a `CausalTransConv1d` from `PyTorch`/`GGUF` `[in_c, out_c, kernel]` weights,
-    /// pre-permuting into `[kernel, in_c, out_c]` order for contiguous vector scatter.
+    /// pre-packing into `[phase, oc_block(16), k_tap(descending k = ascending t), ic, oc_lane]` order
+    /// for zero-spill phase-blocked gather GEMM.
     pub fn from_ic_oc_k(
         in_c: usize,
         out_c: usize,
@@ -1974,11 +2486,25 @@ impl CausalTransConv1d {
             ));
         }
         let mut weight = vec![0.0_f32; expected];
-        for ic in 0..in_c {
-            for oc in 0..out_c {
-                let src_base = (ic * out_c + oc) * kernel;
-                for k in 0..kernel {
-                    weight[(k * in_c + ic) * out_c + oc] = weight_ic_oc_k[src_base + k];
+        let oc_blocks = out_c.div_ceil(16);
+        for phase in 0..stride {
+            let n_taps = trans_conv_phase_taps(kernel, stride, phase);
+            let phase_base = trans_conv_phase_tap_offset(kernel, stride, phase) * in_c * out_c;
+            for oc_blk in 0..oc_blocks {
+                let oc_base = oc_blk * 16;
+                let lane_w = 16.min(out_c - oc_base);
+                let blk_base = phase_base + oc_base * n_taps * in_c;
+                for tap_idx in 0..n_taps {
+                    let m = n_taps - 1 - tap_idx;
+                    let k = m * stride + phase;
+                    let tap_dst = blk_base + tap_idx * in_c * lane_w;
+                    for ic in 0..in_c {
+                        let ic_dst = tap_dst + ic * lane_w;
+                        for lane in 0..lane_w {
+                            let oc = oc_base + lane;
+                            weight[ic_dst + lane] = weight_ic_oc_k[(ic * out_c + oc) * kernel + k];
+                        }
+                    }
                 }
             }
         }
@@ -2063,6 +2589,9 @@ impl CausalTransConv1d {
         threads: usize,
         raw: &mut Vec<f32>,
     ) -> io::Result<()> {
+        const PHASE_OC_SCRATCH_MAX_ELEMS: usize = 524_288;
+        const PHASE_OC_THRESHOLD_BYTES: usize = 1_048_576;
+
         let trim = self.carry_frames();
         if frames == 0
             || self.in_c == 0
@@ -2083,94 +2612,145 @@ impl CausalTransConv1d {
         let raw_frames = emit + trim;
         raw.clear();
         raw.resize(raw_frames * self.out_c, 0.0_f32);
-        if trim > 0 {
-            raw[..trim * self.out_c].copy_from_slice(carry);
-        }
 
         let level = Level::new();
-        let work = frames.saturating_mul(self.weight.len());
-        let workers = frame_workers(threads, raw_frames, work);
         let bias_ref = self.bias.as_deref();
-        row_workers::run_aligned(raw, workers, self.out_c, &|offset, output| {
+        let active_threads = threads.clamp(1, 18);
+        let oc_blocks = self.out_c.div_ceil(16);
+        let total_tiles = self.stride * oc_blocks;
+        let weight_bytes = self.weight.len().saturating_mul(size_of::<f32>());
+        let work = frames.saturating_mul(self.weight.len());
+
+        // Low-frame / large-weight stages (Block 0, Upsample, Block 1-2 low count):
+        // parallelize across `(phase, oc_block)` into a phase-blocked scratch buffer so
+        // each core loads each weight tile once across all frames and scales to 100% of cores.
+        if active_threads > 1
+            && total_tiles >= 2
+            && work >= 65_536
+            && (frames < active_threads * 4
+                || (weight_bytes >= PHASE_OC_THRESHOLD_BYTES
+                    && raw_frames * self.out_c <= PHASE_OC_SCRATCH_MAX_ELEMS))
+        {
+            let q_max = frames + self.kernel.div_ceil(self.stride) - 1;
+            let tile_elems = q_max * 16;
+            with_channel_tile_out(total_tiles * tile_elems, |scratch| {
+                row_workers::run_aligned(
+                    scratch,
+                    active_threads,
+                    tile_elems,
+                    &|elem_off, slice| {
+                        let start_tile = elem_off / tile_elems;
+                        let num_tiles = slice.len() / tile_elems;
+                        for local_t in 0..num_tiles {
+                            let tile_idx = start_tile + local_t;
+                            let phase = tile_idx / oc_blocks;
+                            let oc_blk = tile_idx % oc_blocks;
+                            let n_taps = trans_conv_phase_taps(self.kernel, self.stride, phase);
+                            let q_count = frames + n_taps - 1;
+                            let oc_base = oc_blk * 16;
+                            let lane_w = 16.min(self.out_c - oc_base);
+                            let phase_base =
+                                trans_conv_phase_tap_offset(self.kernel, self.stride, phase)
+                                    * self.in_c
+                                    * self.out_c;
+                            let blk_base = phase_base + oc_base * n_taps * self.in_c;
+                            let w_tile =
+                                &self.weight[blk_base..blk_base + n_taps * self.in_c * lane_w];
+                            let bias_blk = bias_ref.map(|b| &b[oc_base..oc_base + lane_w]);
+                            let tile_out =
+                                &mut slice[local_t * tile_elems..(local_t + 1) * tile_elems];
+                            dispatch!(
+                                level,
+                                simd => trans_conv_run_q_range_simd(
+                                    simd,
+                                    input,
+                                    carry,
+                                    w_tile,
+                                    bias_blk,
+                                    (phase, self.stride, frames, n_taps, self.in_c, self.out_c, oc_base, lane_w),
+                                    (0, q_count),
+                                    (tile_out, 0, 1, 16, 0),
+                                )
+                            );
+                        }
+                    },
+                );
+                let scatter_workers = if raw.len() >= 8_192 {
+                    active_threads
+                } else {
+                    1
+                };
+                row_workers::run_aligned(raw, scatter_workers, self.out_c, &|offset, slice| {
+                    let first_frame = offset / self.out_c;
+                    dispatch!(
+                        level,
+                        simd => scatter_phase_blocks_to_raw_simd(
+                            simd,
+                            scratch,
+                            tile_elems,
+                            self.stride,
+                            self.out_c,
+                            first_frame,
+                            slice,
+                        )
+                    );
+                });
+            });
+            if trim > 0 {
+                carry.copy_from_slice(&raw[emit * self.out_c..]);
+            }
+            raw.truncate(emit * self.out_c);
+            return Ok(());
+        }
+
+        // High-frame / small-weight stages (DAC Blocks 1-3 steady state):
+        // split raw output along `stride * out_c` boundaries (`phase == 0` aligned) and
+        // run `(q_block, phase)` directly into each worker's disjoint raw slice.
+        let workers = frame_workers(threads, raw_frames, work);
+        row_workers::run_aligned(raw, workers, self.stride * self.out_c, &|offset, output| {
+            const Q_TILE: usize = 64;
             let first_frame = offset / self.out_c;
             let end_frame = first_frame + output.len() / self.out_c;
-            let first_source = first_frame
-                .saturating_sub(self.kernel - 1)
-                .div_ceil(self.stride);
-            let end_source = end_frame.div_ceil(self.stride).min(frames);
-            // Adjacent jobs can read the same input frame, but write disjoint
-            // windows. Each sample keeps the original t -> ic -> FMA sequence.
-            let mut t = first_source;
-            while t < end_source && t * self.stride < first_frame {
-                let base = t * self.stride;
-                let start = base.max(first_frame);
-                let end = (base + self.kernel).min(end_frame);
-                let in_row = &input[t * self.in_c..(t + 1) * self.in_c];
-                let raw_window = &mut output
-                    [(start - first_frame) * self.out_c..(end - first_frame) * self.out_c];
-                dispatch!(
-                    level,
-                    simd => trans_conv1d_scatter_frame_simd(
-                        simd,
-                        in_row,
-                        &self.weight,
-                        self.out_c,
-                        start - base..end - base,
-                        raw_window,
-                    )
-                );
-                t += 1;
-            }
-            while t + 4 <= end_source && (t + 3) * self.stride + self.kernel <= end_frame {
-                let base_frame_offset = t * self.stride - first_frame;
-                let in_rows = [
-                    &input[t * self.in_c..(t + 1) * self.in_c],
-                    &input[(t + 1) * self.in_c..(t + 2) * self.in_c],
-                    &input[(t + 2) * self.in_c..(t + 3) * self.in_c],
-                    &input[(t + 3) * self.in_c..(t + 4) * self.in_c],
-                ];
-                dispatch!(
-                    level,
-                    simd => trans_conv1d_scatter_4frames_simd(
-                        simd,
-                        in_rows,
-                        &self.weight,
-                        self.out_c,
-                        self.kernel,
-                        self.stride,
-                        base_frame_offset,
-                        output,
-                    )
-                );
-                t += 4;
-            }
-            while t < end_source {
-                let base = t * self.stride;
-                let start = base.max(first_frame);
-                let end = (base + self.kernel).min(end_frame);
-                let in_row = &input[t * self.in_c..(t + 1) * self.in_c];
-                let raw_window = &mut output
-                    [(start - first_frame) * self.out_c..(end - first_frame) * self.out_c];
-                dispatch!(
-                    level,
-                    simd => trans_conv1d_scatter_frame_simd(
-                        simd,
-                        in_row,
-                        &self.weight,
-                        self.out_c,
-                        start - base..end - base,
-                        raw_window,
-                    )
-                );
-                t += 1;
-            }
-            if let Some(bias) = bias_ref {
-                let emit_end = end_frame.min(emit);
-                if first_frame < emit_end {
-                    let count = emit_end - first_frame;
-                    for row in output[..count * self.out_c].chunks_exact_mut(self.out_c) {
-                        dispatch!(level, simd => add_slice_in_place_simd(simd, row, bias));
+            let q_start = first_frame / self.stride;
+
+            for phase in 0..self.stride {
+                let n_taps = trans_conv_phase_taps(self.kernel, self.stride, phase);
+                let q_count = frames + n_taps - 1;
+                let q_end = end_frame
+                    .saturating_sub(phase)
+                    .div_ceil(self.stride)
+                    .min(q_count);
+                let q_begin = q_start.min(q_end);
+                if q_begin >= q_end {
+                    continue;
+                }
+                let phase_base = trans_conv_phase_tap_offset(self.kernel, self.stride, phase)
+                    * self.in_c
+                    * self.out_c;
+                let mut q_chunk = q_begin;
+                while q_chunk < q_end {
+                    let q_chunk_end = (q_chunk + Q_TILE).min(q_end);
+                    for oc_blk in 0..oc_blocks {
+                        let oc_base = oc_blk * 16;
+                        let lane_w = 16.min(self.out_c - oc_base);
+                        let blk_base = phase_base + oc_base * n_taps * self.in_c;
+                        let w_tile = &self.weight[blk_base..blk_base + n_taps * self.in_c * lane_w];
+                        let bias_blk = bias_ref.map(|b| &b[oc_base..oc_base + lane_w]);
+                        dispatch!(
+                            level,
+                            simd => trans_conv_run_q_range_simd(
+                                simd,
+                                input,
+                                carry,
+                                w_tile,
+                                bias_blk,
+                                (phase, self.stride, frames, n_taps, self.in_c, self.out_c, oc_base, lane_w),
+                                (q_chunk, q_chunk_end),
+                                (output, first_frame, self.stride, self.out_c, oc_base),
+                            )
+                        );
                     }
+                    q_chunk = q_chunk_end;
                 }
             }
         });
@@ -2482,16 +3062,27 @@ impl ConvNeXtBlock {
         ext_buf: &mut Vec<f32>,
         out: &mut Vec<f32>,
     ) -> io::Result<()> {
+        const OC_PARALLEL_THRESHOLD_BYTES: usize = 262_144;
+        const OC_PARALLEL_MAX_FRAMES: usize = 320;
+
         let c = self.channels;
         let k = self.kernel;
         let ctx_len = k.saturating_sub(1);
+        let mid_c = self.pwconv1_b.len();
         if frames == 0
             || c == 0
             || k == 0
+            || mid_c == 0
             || input.len() != frames * c
             || dw_state.len() != ctx_len * c
             || self.dw_weight.len() != c * k
             || self.dw_bias.len() != c
+            || self.norm_w.len() != c
+            || self.norm_b.len() != c
+            || self.pwconv1_w.len() != mid_c * c
+            || self.pwconv2_w.len() != c * mid_c
+            || self.pwconv2_b.len() != c
+            || self.gamma.len() != c
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2499,43 +3090,190 @@ impl ConvNeXtBlock {
             ));
         }
         let ext = update_stream_context(dw_state, input, ext_buf);
-
         let inv_c = 1.0_f32 / usize_to_f32(c);
-        let mid_c = self.pwconv1_b.len();
-        out.clear();
-        out.extend_from_slice(input);
         let level = Level::new();
-        let work = frames.saturating_mul(self.pwconv1_w.len() + self.pwconv2_w.len());
-        let workers = frame_workers(threads, frames, work);
-        row_workers::run_aligned(out, workers, c, &|offset, output| {
-            with_convnext_scratch(c, mid_c, |y, mid| {
-                for (frame, out_row) in output.chunks_exact_mut(c).enumerate() {
-                    let t = offset / c + frame;
+        let active_threads = threads.clamp(1, 18);
+        out.clear();
+        out.resize(frames * c, 0.0_f32);
+
+        with_convnext_scratch(frames * c, frames * mid_c, |norm_buf, mid_buf| {
+            // Stage 1: parallel depthwise causal conv + LayerNorm across frames.
+            let stage1_workers = if frames > 1 && norm_buf.len() >= 2048 {
+                active_threads
+            } else {
+                1
+            };
+            row_workers::run_aligned(norm_buf, stage1_workers, c, &|offset, slice| {
+                let first_frame = offset / c;
+                for (local_f, norm_row) in slice.chunks_exact_mut(c).enumerate() {
                     dispatch!(
                         level,
-                        simd => convnext_frame_simd(
+                        simd => convnext_dw_layernorm_row_simd(
                             simd,
                             ext,
-                            t,
-                            c,
-                            k,
-                            inv_c,
-                            &self.dw_weight,
-                            &self.dw_bias,
-                            &self.norm_w,
-                            &self.norm_b,
-                            &self.pwconv1_w,
-                            &self.pwconv1_b,
-                            &self.pwconv2_w,
-                            &self.pwconv2_b,
-                            &self.gamma,
-                            y,
-                            mid,
-                            out_row,
+                            first_frame + local_f,
+                            (c, k, inv_c),
+                            (&self.dw_weight, &self.dw_bias, &self.norm_w, &self.norm_b),
+                            norm_row,
                         )
                     );
                 }
             });
+
+            // Stage 2: channel-parallel `oc`-outer x `frame_quad`-inner `pwconv1` + fused SIMD GELU.
+            let pw1_bytes = self.pwconv1_w.len().saturating_mul(size_of::<f32>());
+            let pw1_work = frames.saturating_mul(self.pwconv1_w.len());
+            if active_threads > 1
+                && frames <= OC_PARALLEL_MAX_FRAMES
+                && pw1_bytes >= OC_PARALLEL_THRESHOLD_BYTES
+                && mid_c > 4
+            {
+                if frames == 1 {
+                    row_workers::run_aligned(mid_buf, active_threads, 4, &|oc_off, rows| {
+                        let count = rows.len();
+                        let w_slice = &self.pwconv1_w[oc_off * c..(oc_off + count) * c];
+                        let b_slice = &self.pwconv1_b[oc_off..oc_off + count];
+                        dispatch!(
+                            level,
+                            simd => convnext_pwconv1_gelu_time_first_simd(
+                                simd,
+                                w_slice,
+                                b_slice,
+                                norm_buf,
+                                (0, 1, c),
+                                rows,
+                            )
+                        );
+                    });
+                } else {
+                    with_channel_tile_out(mid_c * frames, |transposed| {
+                        row_workers::run_aligned(
+                            transposed,
+                            active_threads,
+                            4 * frames,
+                            &|elem_off, slice| {
+                                let oc_off = elem_off / frames;
+                                let count = slice.len() / frames;
+                                let w_slice = &self.pwconv1_w[oc_off * c..(oc_off + count) * c];
+                                let b_slice = &self.pwconv1_b[oc_off..oc_off + count];
+                                dispatch!(
+                                    level,
+                                    simd => convnext_pwconv1_gelu_channel_first_simd(
+                                        simd,
+                                        w_slice,
+                                        b_slice,
+                                        norm_buf,
+                                        (frames, c),
+                                        slice,
+                                    )
+                                );
+                            },
+                        );
+                        scatter_transposed_to_time_first(
+                            transposed,
+                            frames,
+                            mid_c,
+                            active_threads,
+                            mid_buf,
+                        );
+                    });
+                }
+            } else {
+                let pw1_workers = frame_workers(threads, frames, pw1_work);
+                row_workers::run_aligned(mid_buf, pw1_workers, mid_c, &|offset, slice| {
+                    let first_frame = offset / mid_c;
+                    let worker_frames = slice.len() / mid_c;
+                    dispatch!(
+                        level,
+                        simd => convnext_pwconv1_gelu_time_first_simd(
+                            simd,
+                            &self.pwconv1_w,
+                            &self.pwconv1_b,
+                            norm_buf,
+                            (first_frame, worker_frames, c),
+                            slice,
+                        )
+                    );
+                });
+            }
+
+            // Stage 3: channel-parallel `pwconv2` + fused `* gamma + residual`.
+            let pw2_bytes = self.pwconv2_w.len().saturating_mul(size_of::<f32>());
+            let pw2_work = frames.saturating_mul(self.pwconv2_w.len());
+            if active_threads > 1
+                && frames <= OC_PARALLEL_MAX_FRAMES
+                && pw2_bytes >= OC_PARALLEL_THRESHOLD_BYTES
+                && c > 4
+            {
+                if frames == 1 {
+                    row_workers::run_aligned(out, active_threads, 4, &|oc_off, rows| {
+                        let count = rows.len();
+                        let w_slice = &self.pwconv2_w[oc_off * mid_c..(oc_off + count) * mid_c];
+                        let b_slice = &self.pwconv2_b[oc_off..oc_off + count];
+                        let g_slice = &self.gamma[oc_off..oc_off + count];
+                        let res_slice = &input[oc_off..oc_off + count];
+                        dispatch!(
+                            level,
+                            simd => convnext_pwconv2_res_time_first_simd(
+                                simd,
+                                (w_slice, b_slice, g_slice),
+                                (mid_buf, res_slice),
+                                (0, 1, mid_c),
+                                rows,
+                            )
+                        );
+                    });
+                } else {
+                    with_channel_tile_out(c * frames, |transposed| {
+                        row_workers::run_aligned(
+                            transposed,
+                            active_threads,
+                            4 * frames,
+                            &|elem_off, slice| {
+                                let oc_off = elem_off / frames;
+                                let count = slice.len() / frames;
+                                let w_slice =
+                                    &self.pwconv2_w[oc_off * mid_c..(oc_off + count) * mid_c];
+                                let b_slice = &self.pwconv2_b[oc_off..oc_off + count];
+                                let g_slice = &self.gamma[oc_off..oc_off + count];
+                                dispatch!(
+                                    level,
+                                    simd => convnext_pwconv2_res_channel_first_simd(
+                                        simd,
+                                        (w_slice, b_slice, g_slice),
+                                        (mid_buf, input),
+                                        (frames, mid_c, c, oc_off),
+                                        slice,
+                                    )
+                                );
+                            },
+                        );
+                        scatter_transposed_to_time_first(
+                            transposed,
+                            frames,
+                            c,
+                            active_threads,
+                            out,
+                        );
+                    });
+                }
+            } else {
+                let pw2_workers = frame_workers(threads, frames, pw2_work);
+                row_workers::run_aligned(out, pw2_workers, c, &|offset, slice| {
+                    let first_frame = offset / c;
+                    let worker_frames = slice.len() / c;
+                    dispatch!(
+                        level,
+                        simd => convnext_pwconv2_res_time_first_simd(
+                            simd,
+                            (&self.pwconv2_w, &self.pwconv2_b, &self.gamma),
+                            (mid_buf, input),
+                            (first_frame, worker_frames, mid_c),
+                            slice,
+                        )
+                    );
+                });
+            }
         });
         Ok(())
     }
@@ -4142,6 +4880,197 @@ mod tests {
                     offline_t1_bits,
                     "chunked [1,2,4,8] streaming mismatch in_c={in_c} out_c={out_c} frames={frames}"
                 );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn causal_trans_conv1d_dac_block0_and_odd_shapes_preserve_zero_ulp_bits() -> std::io::Result<()>
+    {
+        // Odd out_c and kernel > 2 * stride against complete scalar reference across frames & threads.
+        for (in_c, out_c, kernel, stride) in
+            [(19_usize, 17_usize, 11_usize, 3_usize), (37, 23, 9, 2)]
+        {
+            let raw_weight = values(in_c * out_c * kernel);
+            let bias = values(out_c);
+            let trans = CausalTransConv1d::from_ic_oc_k(
+                in_c,
+                out_c,
+                kernel,
+                stride,
+                &raw_weight,
+                Some(bias.clone()),
+            )?;
+            let initial_carry = values(trans.carry_frames() * out_c);
+            for frames in [1_usize, 2, 4, 13, 32] {
+                let input = values(frames * in_c);
+                let mut expected = vec![0.0_f32; (frames * stride + trans.carry_frames()) * out_c];
+                expected[..initial_carry.len()].copy_from_slice(&initial_carry);
+                for t in 0..frames {
+                    for ic in 0..in_c {
+                        for oc in 0..out_c {
+                            for k in 0..kernel {
+                                let dest = (t * stride + k) * out_c + oc;
+                                expected[dest] = input[t * in_c + ic].mul_add(
+                                    raw_weight[(ic * out_c + oc) * kernel + k],
+                                    expected[dest],
+                                );
+                            }
+                        }
+                    }
+                }
+                let expected_carry = expected[frames * stride * out_c..].to_vec();
+                expected.truncate(frames * stride * out_c);
+                for row in expected.chunks_exact_mut(out_c) {
+                    for (value, &b) in row.iter_mut().zip(&bias) {
+                        *value += b;
+                    }
+                }
+                let expected_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+                let expected_carry_bits: Vec<u32> =
+                    expected_carry.iter().map(|v| v.to_bits()).collect();
+                for threads in [1_usize, 4, 10, 16] {
+                    let mut carry = initial_carry.clone();
+                    let actual =
+                        trans.forward_stream_parallel(&input, frames, &mut carry, threads)?;
+                    assert_eq!(
+                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected_bits,
+                        "odd tconv mismatch in_c={in_c} out_c={out_c} k={kernel} s={stride} frames={frames} threads={threads}"
+                    );
+                    assert_eq!(
+                        carry.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected_carry_bits
+                    );
+                }
+            }
+        }
+
+        // Explicit DAC Block 0 geometry: in_c=1536, out_c=768, k=16, s=8.
+        let in_c = 1536_usize;
+        let out_c = 768_usize;
+        let kernel = 16_usize;
+        let stride = 8_usize;
+        let raw_weight = values(in_c * out_c * kernel);
+        let bias = values(out_c);
+        let block0 = CausalTransConv1d::from_ic_oc_k(
+            in_c,
+            out_c,
+            kernel,
+            stride,
+            &raw_weight,
+            Some(bias.clone()),
+        )?;
+        let initial_carry = values(block0.carry_frames() * out_c);
+        for frames in [1_usize, 4, 32] {
+            let input = values(frames * in_c);
+            let mut carry_ref = initial_carry.clone();
+            let out_t1 = block0.forward_stream_parallel(&input, frames, &mut carry_ref, 1)?;
+            let out_t1_bits: Vec<u32> = out_t1.iter().map(|v| v.to_bits()).collect();
+            let carry_ref_bits: Vec<u32> = carry_ref.iter().map(|v| v.to_bits()).collect();
+
+            // Check exact scalar replay on all output/carry frames for frames in [1, 4],
+            // and representative boundary/interior/carry coordinates for frames=32.
+            let check_coords: Vec<(usize, usize)> = if frames <= 4 {
+                (0..frames * stride + block0.carry_frames())
+                    .flat_map(|y| {
+                        [0_usize, 15, 16, 17, 383, 767]
+                            .into_iter()
+                            .map(move |oc| (y, oc))
+                    })
+                    .collect()
+            } else {
+                [0_usize, 7, 8, 9, 127, 255, 256, 263]
+                    .into_iter()
+                    .flat_map(|y| {
+                        [0_usize, 15, 16, 511, 767]
+                            .into_iter()
+                            .map(move |oc| (y, oc))
+                    })
+                    .collect()
+            };
+            for (y, oc) in check_coords {
+                let mut acc = if y < block0.carry_frames() {
+                    initial_carry[y * out_c + oc]
+                } else {
+                    0.0_f32
+                };
+                for t in 0..frames {
+                    if y >= t * stride && y < t * stride + kernel {
+                        let k = y - t * stride;
+                        for ic in 0..in_c {
+                            acc = input[t * in_c + ic]
+                                .mul_add(raw_weight[(ic * out_c + oc) * kernel + k], acc);
+                        }
+                    }
+                }
+                if y < frames * stride {
+                    acc += bias[oc];
+                    assert_eq!(
+                        out_t1[y * out_c + oc].to_bits(),
+                        acc.to_bits(),
+                        "DAC Block 0 0-ULP scalar mismatch frames={frames} y={y} oc={oc}"
+                    );
+                } else {
+                    let cy = y - frames * stride;
+                    assert_eq!(
+                        carry_ref[cy * out_c + oc].to_bits(),
+                        acc.to_bits(),
+                        "DAC Block 0 0-ULP carry mismatch frames={frames} cy={cy} oc={oc}"
+                    );
+                }
+            }
+
+            for threads in [10_usize, 16] {
+                let mut carry = initial_carry.clone();
+                let out_par =
+                    block0.forward_stream_parallel(&input, frames, &mut carry, threads)?;
+                assert_eq!(
+                    out_par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    out_t1_bits,
+                    "DAC Block 0 frames={frames} threads={threads}"
+                );
+                assert_eq!(
+                    carry.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    carry_ref_bits,
+                    "DAC Block 0 carry frames={frames} threads={threads}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn convnext_three_stage_parallel_matches_single_thread_bits() -> std::io::Result<()> {
+        for (channels, mid_c) in [(129_usize, 517_usize), (256, 1024)] {
+            let kernel = 7_usize;
+            let block = ConvNeXtBlock {
+                channels,
+                kernel,
+                dw_weight: values(channels * kernel),
+                dw_bias: values(channels),
+                norm_w: vec![1.05; channels],
+                norm_b: values(channels),
+                pwconv1_w: values(mid_c * channels),
+                pwconv1_b: values(mid_c),
+                pwconv2_w: values(channels * mid_c),
+                pwconv2_b: values(channels),
+                gamma: values(channels),
+            };
+            for frames in [1_usize, 2, 4, 32] {
+                let input = values(frames * channels);
+                let init_state = values((kernel - 1) * channels);
+                let mut state_t1 = init_state.clone();
+                let mut state_t16 = init_state;
+                let out_t1 = block.forward_stream_parallel(&input, frames, &mut state_t1, 1)?;
+                let out_t16 = block.forward_stream_parallel(&input, frames, &mut state_t16, 16)?;
+                assert_eq!(
+                    out_t16.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    out_t1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "ConvNeXt threads=1 vs 16 mismatch channels={channels} mid_c={mid_c} frames={frames}"
+                );
+                assert_eq!(state_t16, state_t1);
             }
         }
         Ok(())
