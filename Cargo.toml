@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 # The pinned nightly provides Polonius lending and the next-generation trait solver.
 rust-version = "1.101"
