@@ -613,3 +613,170 @@ fn rust_asr_encoder_repacks_aligned_q4_k_projections() -> io::Result<()> {
     assert_eq!(out.width(), c.output);
     Ok(())
 }
+
+#[test]
+fn rust_asr_encoder_simd_norm_bias_and_tiled_attention_parity_and_nonfinite() -> io::Result<()> {
+    // 1. LayerNorm scalar parity across SIMD + tail widths and non-finite rejection.
+    for width in [1_usize, 2, 3, 4, 5, 7, 16, 33, 64] {
+        let layer_norm = Norm {
+            weight: (0..width)
+                .map(|i| 0.75 + f32::from(u8::try_from(i % 7).unwrap_or(0)) * 0.1)
+                .collect(),
+            bias: (0..width)
+                .map(|i| (f32::from(u8::try_from(i % 5).unwrap_or(0)) - 2.0) * 0.25)
+                .collect(),
+        };
+        let rows = 5_usize;
+        let input: Vec<f32> = (0..rows * width)
+            .map(|i| (f32::from(u16::try_from((i * 11 + 3) % 41).unwrap_or(0)) - 20.0) * 0.125)
+            .collect();
+        let mut expected = vec![0.0_f32; rows * width];
+        for (src_row, dst_row) in input
+            .chunks_exact(width)
+            .zip(expected.chunks_exact_mut(width))
+        {
+            let mean = src_row.iter().sum::<f32>() / super::scalar(width);
+            let var = src_row
+                .iter()
+                .map(|&v| {
+                    let d = v - mean;
+                    d * d
+                })
+                .sum::<f32>()
+                / super::scalar(width);
+            let scale = 1.0_f32 / (var + 0.000_01).sqrt();
+            for ((dst, &val), (&w, &b)) in dst_row
+                .iter_mut()
+                .zip(src_row)
+                .zip(layer_norm.weight.iter().zip(&layer_norm.bias))
+            {
+                *dst = (((val - mean) * scale) * w) + b;
+            }
+        }
+        let single = layer_norm.apply(&input[..width])?;
+        for (&got, &want) in single.iter().zip(&expected[..width]) {
+            assert!((got - want).abs() < 1e-5, "norm single width={width}");
+        }
+        for workers in [1_usize, 3] {
+            let mut batch_out = vec![0.0_f32; rows * width];
+            layer_norm.apply_batch(&input, &mut batch_out, width, workers)?;
+            for (&got, &want) in batch_out.iter().zip(&expected) {
+                assert!((got - want).abs() < 1e-5, "norm batch width={width}");
+            }
+        }
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut bad_row = input[..width].to_vec();
+            bad_row[width - 1] = bad;
+            assert!(layer_norm.apply(&bad_row).is_err());
+        }
+    }
+    let overflow_norm = Norm {
+        weight: vec![f32::MAX; 4],
+        bias: vec![0.0; 4],
+    };
+    assert!(overflow_norm.apply(&[1.0, 2.0, 3.0, 4.0]).is_err());
+    assert!(norm(4).apply(&[f32::MAX, -f32::MAX, 0.0, 0.0]).is_err());
+
+    // 2. add_batch_bias exact bit parity and non-finite rejection.
+    for width in [0_usize, 1, 3, 4, 7, 33] {
+        let rows = 5_usize;
+        let bias: Vec<f32> = (0..width)
+            .map(|i| {
+                if i % 7 == 0 {
+                    -0.0
+                } else {
+                    (f32::from(u8::try_from(i % 13).unwrap_or(0)) - 6.0) * 0.0625
+                }
+            })
+            .collect();
+        let initial: Vec<f32> = (0..rows * width.max(1))
+            .map(|i| (f32::from(u16::try_from(i % 29).unwrap_or(0)) - 14.0) * 0.125)
+            .collect();
+        let mut expected = initial.clone();
+        if width > 0 {
+            for row in expected.chunks_exact_mut(width) {
+                for (dst, &b) in row.iter_mut().zip(&bias) {
+                    *dst += b;
+                }
+            }
+        }
+        let expected_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+        for workers in [1_usize, 3] {
+            let mut actual = initial.clone();
+            super::add_batch_bias(&mut actual, &bias, workers)?;
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected_bits,
+                "bias mismatch width={width} workers={workers}"
+            );
+        }
+        if width > 0 {
+            let mut bad = initial;
+            bad[rows * width - 1] = f32::MAX;
+            let mut big_bias = bias;
+            big_bias[width - 1] = f32::MAX;
+            assert!(super::add_batch_bias(&mut bad, &big_bias, 2).is_err());
+        }
+    }
+
+    // 3. Tiled bidirectional attention matches single-head attend_head bit-for-bit.
+    for (heads, head_dim) in [(1_usize, 6_usize), (3, 16), (2, 64)] {
+        let hidden = heads * head_dim;
+        let divisor = super::scalar(head_dim).sqrt();
+        for win_len in [1_usize, 2, 4, 5, 11] {
+            let keys: Vec<f32> = (0..win_len * hidden)
+                .map(|i| (f32::from(u16::try_from((i * 7) % 31).unwrap_or(0)) - 15.0) * 0.05)
+                .collect();
+            let values: Vec<f32> = (0..win_len * hidden)
+                .map(|i| (f32::from(u16::try_from((i * 11) % 27).unwrap_or(0)) - 13.0) * 0.0625)
+                .collect();
+            for tile_rows in 1_usize..=4 {
+                let q_rows: Vec<f32> = (0..tile_rows * hidden)
+                    .map(|i| {
+                        (f32::from(u16::try_from((i * 13 + 3) % 23).unwrap_or(0)) - 11.0) * 0.0625
+                    })
+                    .collect();
+                let mut exp_out = vec![0.0_f32; tile_rows * hidden];
+                let mut exp_scores = vec![0.0_f32; win_len];
+                for r in 0..tile_rows {
+                    for head in 0..heads {
+                        let off = head * head_dim;
+                        super::attention_head_bidirectional(
+                            &q_rows[r * hidden + off..r * hidden + off + head_dim],
+                            &keys,
+                            &values,
+                            win_len,
+                            hidden,
+                            off,
+                            head_dim,
+                            divisor,
+                            &mut exp_scores,
+                            &mut exp_out[r * hidden + off..r * hidden + off + head_dim],
+                        )?;
+                    }
+                }
+                let mut got_out = vec![f32::NAN; tile_rows * hidden];
+                let mut tile_scores = vec![0.0_f32; tile_rows * win_len];
+                crate::packed::attend_q_rows_bidirectional_f32(
+                    &q_rows,
+                    &keys,
+                    &values,
+                    win_len,
+                    hidden,
+                    heads,
+                    head_dim,
+                    divisor,
+                    &mut tile_scores,
+                    &mut got_out,
+                    super::invalid,
+                )?;
+                assert_eq!(
+                    got_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    exp_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "tiled attention mismatch heads={heads} dim={head_dim} win={win_len} tile={tile_rows}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

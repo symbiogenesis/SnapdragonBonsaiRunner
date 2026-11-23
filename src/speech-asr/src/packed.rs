@@ -2313,6 +2313,7 @@ pub(super) fn multiply_batch_group_into(
     }
 }
 
+#[cfg(test)]
 /// Compute scaled dot products between `query` and 4 key slices in exact left-to-right order.
 pub(super) fn dot_4keys_seq(query: &[f32], keys: [&[f32]; 4], divisor: f32) -> [f32; 4] {
     let level = simd_level();
@@ -2347,6 +2348,7 @@ fn dot_4keys_seq_simd<S: Simd>(
     (acc / f32x4::splat(simd, divisor)).into()
 }
 
+#[cfg(test)]
 /// Accumulate `out[d] += w * v[d]` in exact left-to-right non-FMA order for 4 value rows.
 pub(super) fn weighted_value_accum_4(out: &mut [f32], values: [&[f32]; 4], weights: [f32; 4]) {
     let level = simd_level();
@@ -2383,6 +2385,7 @@ fn weighted_value_accum_4_simd<S: Simd>(
     }
 }
 
+#[cfg(test)]
 /// Accumulate `out[d] += weight * v[d]` in exact non-FMA order.
 pub(super) fn weighted_value_accum(out: &mut [f32], value: &[f32], weight: f32) {
     let level = simd_level();
@@ -2414,16 +2417,51 @@ pub(super) const fn scalar_f32(value: usize) -> f32 {
     value as f32
 }
 
+#[inline(always)]
+fn ensure_finite_simd<S: Simd>(simd: S, values: &[f32]) -> bool {
+    let inf = f32x4::splat(simd, f32::INFINITY);
+    let (chunks, tail) = values.as_chunks::<4>();
+    for chunk in chunks {
+        if !f32x4::from_slice(simd, chunk).abs().simd_lt(inf).all_true() {
+            return false;
+        }
+    }
+    tail.iter().all(|value| value.is_finite())
+}
+
 /// Verify every slice element is finite, mapping failures with `invalid`.
 pub(super) fn ensure_finite(
     values: &[f32],
     invalid: fn() -> std::io::Error,
 ) -> std::io::Result<()> {
-    if values.iter().all(|value| value.is_finite()) {
+    let level = simd_level();
+    if dispatch!(level, simd => ensure_finite_simd(simd, values)) {
         Ok(())
     } else {
         Err(invalid())
     }
+}
+
+#[inline(always)]
+fn add_residual_slice_simd<S: Simd>(simd: S, dst: &mut [f32], add: &[f32]) -> bool {
+    let inf = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
+    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<4>();
+    let (add_chunks, add_tail) = add.as_chunks::<4>();
+    for (d_chunk, a_chunk) in dst_chunks.iter_mut().zip(add_chunks) {
+        let sum = f32x4::from_slice(simd, d_chunk) + f32x4::from_slice(simd, a_chunk);
+        if !sum.abs().simd_lt(inf).all_true() {
+            all_finite = false;
+        }
+        sum.store_slice(d_chunk);
+    }
+    for (out, &delta) in dst_tail.iter_mut().zip(add_tail) {
+        *out += delta;
+        if !out.is_finite() {
+            all_finite = false;
+        }
+    }
+    all_finite
 }
 
 /// Add `add` into `dst` element-wise across row workers and validate finiteness.
@@ -2434,12 +2472,17 @@ pub(super) fn add_residual_batch(
     width: usize,
     invalid: fn() -> std::io::Error,
 ) -> std::io::Result<()> {
+    if add.len() < dst.len() {
+        return Err(invalid());
+    }
+    let level = simd_level();
     row_workers::try_run_aligned(dst, workers, width, &|elem_off, slice| {
         let end = elem_off + slice.len();
-        for (out, &delta) in slice.iter_mut().zip(&add[elem_off..end]) {
-            *out += delta;
-        }
-        ensure_finite(slice, invalid)
+        let ok = dispatch!(
+            level,
+            simd => add_residual_slice_simd(simd, slice, &add[elem_off..end])
+        );
+        if ok { Ok(()) } else { Err(invalid()) }
     })
 }
 
@@ -2571,12 +2614,120 @@ impl KvSource for &[u16] {
     }
 }
 
-fn dot_row(q_head: &[f32], k: &[f32], divisor: f32) -> f32 {
+#[inline(always)]
+fn dot_row_simd<S: Simd>(simd: S, q_head: &[f32], k: &[f32], divisor: f32) -> f32 {
     let mut dot = 0.0_f32;
-    for (q_elem, k_elem) in q_head.iter().zip(k) {
+    let (q_chunks, q_tail) = q_head.as_chunks::<4>();
+    let (k_chunks, k_tail) = k.as_chunks::<4>();
+    for (qc, kc) in q_chunks.iter().zip(k_chunks) {
+        let prod: [f32; 4] = (f32x4::from_slice(simd, qc) * f32x4::from_slice(simd, kc)).into();
+        dot += prod[0];
+        dot += prod[1];
+        dot += prod[2];
+        dot += prod[3];
+    }
+    for (q_elem, k_elem) in q_tail.iter().zip(k_tail) {
         dot += *q_elem * *k_elem;
     }
     dot / divisor
+}
+
+#[inline(always)]
+fn max_finite_simd<S: Simd>(simd: S, scores: &[f32]) -> f32 {
+    let (chunks, tail) = scores.as_chunks::<4>();
+    let mut max_v = f32x4::splat(simd, f32::NEG_INFINITY);
+    for chunk in chunks {
+        max_v = max_v.max_precise(f32x4::from_slice(simd, chunk));
+    }
+    let lanes: [f32; 4] = max_v.into();
+    let mut max_val = lanes[0].max(lanes[1]).max(lanes[2].max(lanes[3]));
+    for &s in tail {
+        max_val = max_val.max(s);
+    }
+    max_val
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared single-head attention kernel reuses caller score/output storage without allocating."
+)]
+#[inline(always)]
+fn attend_head_impl_simd<S: Simd, T: KvSource>(
+    simd: S,
+    q_head: &[f32],
+    keys: T,
+    values: T,
+    history_rows: usize,
+    row_width: usize,
+    offset: usize,
+    head_dim: usize,
+    divisor: f32,
+    current_kv: Option<(&[f32], &[f32])>,
+    scores: &mut [f32],
+    out_head: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    T::validate(head_dim, q_head.len(), out_head.len(), invalid)?;
+    let mut buf = T::new_scratch();
+    let full_quads = history_rows / 4;
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        keys.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |k_refs| {
+            scores[r..r + 4].copy_from_slice(&dot_4keys_seq_simd(simd, q_head, k_refs, divisor));
+        });
+    }
+    for (row, score) in scores
+        .iter_mut()
+        .enumerate()
+        .take(history_rows)
+        .skip(full_quads * 4)
+    {
+        keys.with_row(row, row_width, offset, head_dim, &mut buf, |k| {
+            *score = dot_row_simd(simd, q_head, k, divisor);
+        });
+    }
+    if let Some((k, _)) = current_kv {
+        scores[history_rows] = dot_row_simd(simd, q_head, k, divisor);
+    }
+    if !ensure_finite_simd(simd, scores) {
+        return Err(invalid());
+    }
+    let max = max_finite_simd(simd, scores);
+    let mut sum = 0.0;
+    for score in &mut *scores {
+        *score = (*score - max).exp();
+        sum += *score;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(invalid());
+    }
+    out_head.fill(0.0);
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        let weights = [
+            scores[r] / sum,
+            scores[r + 1] / sum,
+            scores[r + 2] / sum,
+            scores[r + 3] / sum,
+        ];
+        values.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |v_refs| {
+            weighted_value_accum_4_simd(simd, out_head, v_refs, weights);
+        });
+    }
+    for (row, &score) in scores
+        .iter()
+        .enumerate()
+        .take(history_rows)
+        .skip(full_quads * 4)
+    {
+        values.with_row(row, row_width, offset, head_dim, &mut buf, |v| {
+            weighted_value_accum_simd(simd, out_head, v, score / sum);
+        });
+    }
+    if let Some((_, v)) = current_kv {
+        weighted_value_accum_simd(simd, out_head, v, scores[history_rows] / sum);
+    }
+    Ok(())
 }
 
 #[expect(
@@ -2597,67 +2748,28 @@ fn attend_head_impl<T: KvSource>(
     out_head: &mut [f32],
     invalid: fn() -> std::io::Error,
 ) -> std::io::Result<()> {
-    T::validate(head_dim, q_head.len(), out_head.len(), invalid)?;
-    let mut buf = T::new_scratch();
-    let full_quads = history_rows / 4;
-    for quad in 0..full_quads {
-        let r = quad * 4;
-        keys.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |k_refs| {
-            scores[r..r + 4].copy_from_slice(&dot_4keys_seq(q_head, k_refs, divisor));
-        });
-    }
-    for (row, score) in scores
-        .iter_mut()
-        .enumerate()
-        .take(history_rows)
-        .skip(full_quads * 4)
-    {
-        keys.with_row(row, row_width, offset, head_dim, &mut buf, |k| {
-            *score = dot_row(q_head, k, divisor);
-        });
-    }
-    if let Some((k, _)) = current_kv {
-        scores[history_rows] = dot_row(q_head, k, divisor);
-    }
-    ensure_finite(scores, invalid)?;
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
-    for score in &mut *scores {
-        *score = (*score - max).exp();
-        sum += *score;
-    }
-    if !sum.is_finite() || sum <= 0.0 {
-        return Err(invalid());
-    }
-    out_head.fill(0.0);
-    for quad in 0..full_quads {
-        let r = quad * 4;
-        let weights = [
-            scores[r] / sum,
-            scores[r + 1] / sum,
-            scores[r + 2] / sum,
-            scores[r + 3] / sum,
-        ];
-        values.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |v_refs| {
-            weighted_value_accum_4(out_head, v_refs, weights);
-        });
-    }
-    for (row, &score) in scores
-        .iter()
-        .enumerate()
-        .take(history_rows)
-        .skip(full_quads * 4)
-    {
-        values.with_row(row, row_width, offset, head_dim, &mut buf, |v| {
-            weighted_value_accum(out_head, v, score / sum);
-        });
-    }
-    if let Some((_, v)) = current_kv {
-        weighted_value_accum(out_head, v, scores[history_rows] / sum);
-    }
-    Ok(())
+    let level = simd_level();
+    dispatch!(
+        level,
+        simd => attend_head_impl_simd(
+            simd,
+            q_head,
+            keys,
+            values,
+            history_rows,
+            row_width,
+            offset,
+            head_dim,
+            divisor,
+            current_kv,
+            scores,
+            out_head,
+            invalid,
+        )
+    )
 }
 
+#[cfg(test)]
 /// Evaluate one attention head over cached/history rows plus an optional current key/value pair.
 ///
 /// Preserves exact left-to-right quad dot/accumulation order and scalar tail summation.
@@ -2825,6 +2937,296 @@ fn weighted_value_accum_4_tile_simd<S: Simd, const N: usize>(
             out_tile[g][d] += weights[g][3] * values[3][d];
         }
     }
+}
+
+#[inline(always)]
+fn dot_row_tile_simd<S: Simd, const N: usize>(
+    simd: S,
+    q_tile: [&[f32]; N],
+    k: &[f32],
+    head_dim: usize,
+    divisor: f32,
+) -> [f32; N] {
+    let mut dots = [0.0_f32; N];
+    let chunks = head_dim / 4;
+    for chunk_idx in 0..chunks {
+        let base = chunk_idx * 4;
+        let kv = f32x4::from_slice(simd, &k[base..base + 4]);
+        for g in 0..N {
+            let prod: [f32; 4] = (f32x4::from_slice(simd, &q_tile[g][base..base + 4]) * kv).into();
+            dots[g] += prod[0];
+            dots[g] += prod[1];
+            dots[g] += prod[2];
+            dots[g] += prod[3];
+        }
+    }
+    for d in (chunks * 4)..head_dim {
+        let kv = k[d];
+        for g in 0..N {
+            dots[g] += q_tile[g][d] * kv;
+        }
+    }
+    for dot in &mut dots {
+        *dot /= divisor;
+    }
+    dots
+}
+
+#[inline(always)]
+fn weighted_value_accum_tile_simd<S: Simd, const N: usize>(
+    simd: S,
+    out_tile: [&mut [f32]; N],
+    value: &[f32],
+    weights: [f32; N],
+    head_dim: usize,
+) {
+    let wv: [f32x4<S>; N] = std::array::from_fn(|g| f32x4::splat(simd, weights[g]));
+    let chunks = head_dim / 4;
+    for chunk_idx in 0..chunks {
+        let base = chunk_idx * 4;
+        let vv = f32x4::from_slice(simd, &value[base..base + 4]);
+        for g in 0..N {
+            let dst = &mut out_tile[g][base..base + 4];
+            let ov = f32x4::from_slice(simd, dst);
+            (ov + wv[g] * vv).store_slice(dst);
+        }
+    }
+    for d in (chunks * 4)..head_dim {
+        let vv = value[d];
+        for g in 0..N {
+            out_tile[g][d] += weights[g] * vv;
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tiles up to 4 encoder query rows per head over shared bidirectional K/V windows."
+)]
+#[inline(always)]
+fn attend_q_tile_head_simd<S: Simd, const N: usize>(
+    simd: S,
+    q_tile: [&[f32]; N],
+    keys: &[f32],
+    values: &[f32],
+    win_len: usize,
+    hidden: usize,
+    offset: usize,
+    head_dim: usize,
+    divisor: f32,
+    scores: &mut [f32],
+    mut out_tile: [&mut [f32]; N],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    let full_quads = win_len / 4;
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        let k_refs = [
+            &keys[r * hidden + offset..r * hidden + offset + head_dim],
+            &keys[(r + 1) * hidden + offset..(r + 1) * hidden + offset + head_dim],
+            &keys[(r + 2) * hidden + offset..(r + 2) * hidden + offset + head_dim],
+            &keys[(r + 3) * hidden + offset..(r + 3) * hidden + offset + head_dim],
+        ];
+        let res = dot_4keys_tile_simd(simd, q_tile, k_refs, head_dim, divisor);
+        for g in 0..N {
+            scores[g * win_len + r..g * win_len + r + 4].copy_from_slice(&res[g]);
+        }
+    }
+    for r in (full_quads * 4)..win_len {
+        let k = &keys[r * hidden + offset..r * hidden + offset + head_dim];
+        let res = dot_row_tile_simd(simd, q_tile, k, head_dim, divisor);
+        for g in 0..N {
+            scores[g * win_len + r] = res[g];
+        }
+    }
+    if !ensure_finite_simd(simd, &scores[..N * win_len]) {
+        return Err(invalid());
+    }
+    let mut sums = [0.0_f32; N];
+    for (g, sum_slot) in sums.iter_mut().enumerate() {
+        let head_scores = &mut scores[g * win_len..(g + 1) * win_len];
+        let max = max_finite_simd(simd, head_scores);
+        let mut sum = 0.0_f32;
+        for score in &mut *head_scores {
+            *score = (*score - max).exp();
+            sum += *score;
+        }
+        if !sum.is_finite() || sum <= 0.0 {
+            return Err(invalid());
+        }
+        *sum_slot = sum;
+    }
+    for out in &mut out_tile {
+        out.fill(0.0);
+    }
+    for quad in 0..full_quads {
+        let r = quad * 4;
+        let weights: [[f32; 4]; N] = std::array::from_fn(|g| {
+            let sum = sums[g];
+            let s = &scores[g * win_len + r..g * win_len + r + 4];
+            [s[0] / sum, s[1] / sum, s[2] / sum, s[3] / sum]
+        });
+        let v_refs = [
+            &values[r * hidden + offset..r * hidden + offset + head_dim],
+            &values[(r + 1) * hidden + offset..(r + 1) * hidden + offset + head_dim],
+            &values[(r + 2) * hidden + offset..(r + 2) * hidden + offset + head_dim],
+            &values[(r + 3) * hidden + offset..(r + 3) * hidden + offset + head_dim],
+        ];
+        weighted_value_accum_4_tile_simd(
+            simd,
+            out_tile.each_mut().map(|s| &mut **s),
+            v_refs,
+            weights,
+            head_dim,
+        );
+    }
+    for r in (full_quads * 4)..win_len {
+        let weights: [f32; N] = std::array::from_fn(|g| scores[g * win_len + r] / sums[g]);
+        let v = &values[r * hidden + offset..r * hidden + offset + head_dim];
+        weighted_value_accum_tile_simd(
+            simd,
+            out_tile.each_mut().map(|s| &mut **s),
+            v,
+            weights,
+            head_dim,
+        );
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Evaluates all encoder attention heads for a tile of 1..=4 query rows under one SIMD dispatch."
+)]
+pub(super) fn attend_q_rows_bidirectional_f32(
+    q_rows: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    win_len: usize,
+    hidden: usize,
+    heads: usize,
+    head_dim: usize,
+    divisor: f32,
+    scores: &mut [f32],
+    out_rows: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    let tile_rows = q_rows.len() / hidden;
+    if !(1..=4).contains(&tile_rows)
+        || head_dim == 0
+        || win_len == 0
+        || q_rows.len() != tile_rows * hidden
+        || out_rows.len() != tile_rows * hidden
+        || scores.len() < tile_rows * win_len
+    {
+        return Err(invalid());
+    }
+    let level = simd_level();
+    dispatch!(level, simd => {
+        for head in 0..heads {
+            let offset = head * head_dim;
+            match tile_rows {
+                4 => {
+                    let q_tile = [
+                        &q_rows[offset..offset + head_dim],
+                        &q_rows[hidden + offset..hidden + offset + head_dim],
+                        &q_rows[2 * hidden + offset..2 * hidden + offset + head_dim],
+                        &q_rows[3 * hidden + offset..3 * hidden + offset + head_dim],
+                    ];
+                    let (r0, rest) = out_rows.split_at_mut(hidden);
+                    let (r1, rest) = rest.split_at_mut(hidden);
+                    let (r2, r3) = rest.split_at_mut(hidden);
+                    attend_q_tile_head_simd(
+                        simd,
+                        q_tile,
+                        keys,
+                        values,
+                        win_len,
+                        hidden,
+                        offset,
+                        head_dim,
+                        divisor,
+                        scores,
+                        [
+                            &mut r0[offset..offset + head_dim],
+                            &mut r1[offset..offset + head_dim],
+                            &mut r2[offset..offset + head_dim],
+                            &mut r3[offset..offset + head_dim],
+                        ],
+                        invalid,
+                    )?;
+                }
+                3 => {
+                    let q_tile = [
+                        &q_rows[offset..offset + head_dim],
+                        &q_rows[hidden + offset..hidden + offset + head_dim],
+                        &q_rows[2 * hidden + offset..2 * hidden + offset + head_dim],
+                    ];
+                    let (r0, rest) = out_rows.split_at_mut(hidden);
+                    let (r1, r2) = rest.split_at_mut(hidden);
+                    attend_q_tile_head_simd(
+                        simd,
+                        q_tile,
+                        keys,
+                        values,
+                        win_len,
+                        hidden,
+                        offset,
+                        head_dim,
+                        divisor,
+                        scores,
+                        [
+                            &mut r0[offset..offset + head_dim],
+                            &mut r1[offset..offset + head_dim],
+                            &mut r2[offset..offset + head_dim],
+                        ],
+                        invalid,
+                    )?;
+                }
+                2 => {
+                    let q_tile = [
+                        &q_rows[offset..offset + head_dim],
+                        &q_rows[hidden + offset..hidden + offset + head_dim],
+                    ];
+                    let (r0, r1) = out_rows.split_at_mut(hidden);
+                    attend_q_tile_head_simd(
+                        simd,
+                        q_tile,
+                        keys,
+                        values,
+                        win_len,
+                        hidden,
+                        offset,
+                        head_dim,
+                        divisor,
+                        scores,
+                        [
+                            &mut r0[offset..offset + head_dim],
+                            &mut r1[offset..offset + head_dim],
+                        ],
+                        invalid,
+                    )?;
+                }
+                _ => {
+                    attend_q_tile_head_simd(
+                        simd,
+                        [&q_rows[offset..offset + head_dim]],
+                        keys,
+                        values,
+                        win_len,
+                        hidden,
+                        offset,
+                        head_dim,
+                        divisor,
+                        scores,
+                        [&mut out_rows[offset..offset + head_dim]],
+                        invalid,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 #[expect(
@@ -3008,10 +3410,10 @@ fn attend_kv_group_impl<T: KvSource>(
     let mut buf = T::new_scratch();
     let full_quads = history_rows / 4;
     let level = simd_level();
-    for quad in 0..full_quads {
-        let r = quad * 4;
-        keys.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |k_refs| {
-            dispatch!(level, simd => {
+    dispatch!(level, simd => {
+        for quad in 0..full_quads {
+            let r = quad * 4;
+            keys.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |k_refs| {
                 dot_4keys_group_simd(
                     simd,
                     q_group,
@@ -3024,57 +3426,54 @@ fn attend_kv_group_impl<T: KvSource>(
                     scores,
                 );
             });
-        });
-    }
-    for row in (full_quads * 4)..history_rows {
-        keys.with_row(row, row_width, offset, head_dim, &mut buf, |k| {
+        }
+        for row in (full_quads * 4)..history_rows {
+            keys.with_row(row, row_width, offset, head_dim, &mut buf, |k| {
+                for g in 0..gqa_group {
+                    let q_head = &q_group[g * head_dim..(g + 1) * head_dim];
+                    scores[g * total_rows + row] = dot_row_simd(simd, q_head, k, divisor);
+                }
+            });
+        }
+        if let Some((k, _)) = current_kv {
             for g in 0..gqa_group {
                 let q_head = &q_group[g * head_dim..(g + 1) * head_dim];
-                scores[g * total_rows + row] = dot_row(q_head, k, divisor);
+                scores[g * total_rows + history_rows] = dot_row_simd(simd, q_head, k, divisor);
             }
-        });
-    }
-    if let Some((k, _)) = current_kv {
-        for g in 0..gqa_group {
-            let q_head = &q_group[g * head_dim..(g + 1) * head_dim];
-            scores[g * total_rows + history_rows] = dot_row(q_head, k, divisor);
         }
-    }
-    ensure_finite(scores, invalid)?;
-
-    let mut stack_sums = [0.0_f32; 16];
-    let mut heap_sums = if gqa_group > stack_sums.len() {
-        vec![0.0_f32; gqa_group]
-    } else {
-        Vec::new()
-    };
-    let sums: &mut [f32] = if gqa_group <= stack_sums.len() {
-        &mut stack_sums[..gqa_group]
-    } else {
-        &mut heap_sums[..gqa_group]
-    };
-    for (g, sum_slot) in sums.iter_mut().enumerate() {
-        let head_scores = &mut scores[g * total_rows..(g + 1) * total_rows];
-        let max = head_scores
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0_f32;
-        for score in &mut *head_scores {
-            *score = (*score - max).exp();
-            sum += *score;
-        }
-        if !sum.is_finite() || sum <= 0.0 {
+        if !ensure_finite_simd(simd, scores) {
             return Err(invalid());
         }
-        *sum_slot = sum;
-    }
 
-    out_group.fill(0.0);
-    for quad in 0..full_quads {
-        let r = quad * 4;
-        values.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |v_refs| {
-            dispatch!(level, simd => {
+        let mut stack_sums = [0.0_f32; 16];
+        let mut heap_sums = if gqa_group > stack_sums.len() {
+            vec![0.0_f32; gqa_group]
+        } else {
+            Vec::new()
+        };
+        let sums: &mut [f32] = if gqa_group <= stack_sums.len() {
+            &mut stack_sums[..gqa_group]
+        } else {
+            &mut heap_sums[..gqa_group]
+        };
+        for (g, sum_slot) in sums.iter_mut().enumerate() {
+            let head_scores = &mut scores[g * total_rows..(g + 1) * total_rows];
+            let max = max_finite_simd(simd, head_scores);
+            let mut sum = 0.0_f32;
+            for score in &mut *head_scores {
+                *score = (*score - max).exp();
+                sum += *score;
+            }
+            if !sum.is_finite() || sum <= 0.0 {
+                return Err(invalid());
+            }
+            *sum_slot = sum;
+        }
+
+        out_group.fill(0.0);
+        for quad in 0..full_quads {
+            let r = quad * 4;
+            values.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |v_refs| {
                 weighted_value_accum_4_group_simd(
                     simd,
                     out_group,
@@ -3087,25 +3486,25 @@ fn attend_kv_group_impl<T: KvSource>(
                     r,
                 );
             });
-        });
-    }
-    for row in (full_quads * 4)..history_rows {
-        values.with_row(row, row_width, offset, head_dim, &mut buf, |v| {
-            for (g, &sum) in sums.iter().enumerate() {
-                let w = scores[g * total_rows + row] / sum;
-                let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
-                weighted_value_accum(out_head, v, w);
-            }
-        });
-    }
-    if let Some((_, v)) = current_kv {
-        for (g, &sum) in sums.iter().enumerate() {
-            let w = scores[g * total_rows + history_rows] / sum;
-            let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
-            weighted_value_accum(out_head, v, w);
         }
-    }
-    Ok(())
+        for row in (full_quads * 4)..history_rows {
+            values.with_row(row, row_width, offset, head_dim, &mut buf, |v| {
+                for (g, &sum) in sums.iter().enumerate() {
+                    let w = scores[g * total_rows + row] / sum;
+                    let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
+                    weighted_value_accum_simd(simd, out_head, v, w);
+                }
+            });
+        }
+        if let Some((_, v)) = current_kv {
+            for (g, &sum) in sums.iter().enumerate() {
+                let w = scores[g * total_rows + history_rows] / sum;
+                let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
+                weighted_value_accum_simd(simd, out_head, v, w);
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Evaluate all `gqa_group` query heads sharing one `F32` KV head in a single pass
@@ -4091,5 +4490,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn add_residual_batch_and_ensure_finite_simd_match_scalar_and_reject_nonfinite()
+    -> io::Result<()> {
+        let inv = || io::Error::other("nonfinite");
+        for len in 0_usize..=11 {
+            let finite_vals: Vec<f32> = (0..len)
+                .map(|i| {
+                    if i == 0 {
+                        -0.0
+                    } else if i == len.saturating_sub(1) {
+                        f32::MAX
+                    } else {
+                        f32::from(u16::try_from(i).unwrap_or(0)) * 0.5 - 2.0
+                    }
+                })
+                .collect();
+            super::ensure_finite(&finite_vals, inv)?;
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                for pos in 0..len {
+                    let mut invalid_vals = finite_vals.clone();
+                    invalid_vals[pos] = bad;
+                    assert!(super::ensure_finite(&invalid_vals, inv).is_err());
+                }
+            }
+        }
+
+        for width in [1_usize, 3, 4, 7, 33] {
+            let rows = 5_usize;
+            let dst_init: Vec<f32> = (0..rows * width)
+                .map(|i| {
+                    if i % 9 == 0 {
+                        -0.0
+                    } else {
+                        (f32::from(u16::try_from(i % 29).unwrap_or(0)) - 14.0) * 0.125
+                    }
+                })
+                .collect();
+            let add: Vec<f32> = (0..rows * width)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        -0.0
+                    } else {
+                        (f32::from(u16::try_from((i * 5) % 23).unwrap_or(0)) - 11.0) * 0.0625
+                    }
+                })
+                .collect();
+            let expected_bits: Vec<u32> = dst_init
+                .iter()
+                .zip(&add)
+                .map(|(&a, &b)| (a + b).to_bits())
+                .collect();
+            for workers in [1_usize, 3] {
+                let mut actual = dst_init.clone();
+                super::add_residual_batch(&mut actual, &add, workers, width, inv)?;
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected_bits,
+                    "residual mismatch width={width} workers={workers}"
+                );
+            }
+            let mut overflow_dst = dst_init.clone();
+            let mut overflow_add = add.clone();
+            overflow_dst[rows * width - 1] = f32::MAX;
+            overflow_add[rows * width - 1] = f32::MAX;
+            assert!(
+                super::add_residual_batch(&mut overflow_dst, &overflow_add, 2, width, inv).is_err()
+            );
+            let mut nan_add = add;
+            nan_add[0] = f32::NAN;
+            let mut dst_copy = dst_init;
+            assert!(super::add_residual_batch(&mut dst_copy, &nan_add, 2, width, inv).is_err());
+            assert!(
+                super::add_residual_batch(
+                    &mut dst_copy,
+                    &nan_add[..rows * width - 1],
+                    2,
+                    width,
+                    inv
+                )
+                .is_err()
+            );
+        }
+        Ok(())
     }
 }

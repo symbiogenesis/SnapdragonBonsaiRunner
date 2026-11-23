@@ -17,6 +17,7 @@ use crate::{
     protocol::EncoderLayout,
     row_workers, threads,
 };
+use fearless_simd::{dispatch, f32x4, prelude::*};
 use std::io::{self, Read, Seek};
 
 #[path = "encoder/numerics.rs"]
@@ -105,28 +106,13 @@ impl Norm {
         finite(&self.bias)
     }
 
+    #[cfg(test)]
     fn apply_into(&self, row: &[f32], dst: &mut [f32]) -> io::Result<()> {
-        let mean = row.iter().sum::<f32>() / scalar(row.len());
-        let variance = row
-            .iter()
-            .map(|value| {
-                let delta = *value - mean;
-                delta * delta
-            })
-            .sum::<f32>()
-            / scalar(row.len());
-        if !mean.is_finite() || !variance.is_finite() {
-            return Err(invalid());
-        }
-        let scale = 1.0 / (variance + 0.000_01).sqrt();
-        for ((out, value), (weight, bias)) in dst
-            .iter_mut()
-            .zip(row)
-            .zip(self.weight.iter().zip(&self.bias))
-        {
-            *out = (((*value - mean) * scale) * *weight) + *bias;
-        }
-        finite(dst)
+        let level = packed::simd_level();
+        dispatch!(
+            level,
+            simd => norm_apply_into_simd(simd, &self.weight, &self.bias, row, dst)
+        )
     }
 
     #[cfg(test)]
@@ -143,16 +129,98 @@ impl Norm {
         width: usize,
         workers: usize,
     ) -> io::Result<()> {
+        if width == 0 || input.len() != output.len() || !output.len().is_multiple_of(width) {
+            return Err(invalid());
+        }
+        let level = packed::simd_level();
         row_workers::try_run_aligned(output, workers, width, &|elem_off, slice| {
-            for (src_row, dst_row) in input[elem_off..elem_off + slice.len()]
-                .chunks_exact(width)
-                .zip(slice.chunks_exact_mut(width))
-            {
-                self.apply_into(src_row, dst_row)?;
-            }
-            Ok(())
+            dispatch!(level, simd => {
+                for (src_row, dst_row) in input[elem_off..elem_off + slice.len()]
+                    .chunks_exact(width)
+                    .zip(slice.chunks_exact_mut(width))
+                {
+                    norm_apply_into_simd(simd, &self.weight, &self.bias, src_row, dst_row)?;
+                }
+                Ok(())
+            })
         })
     }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn norm_apply_into_simd<S: Simd>(
+    simd: S,
+    weight: &[f32],
+    bias: &[f32],
+    row: &[f32],
+    dst: &mut [f32],
+) -> io::Result<()> {
+    let width = row.len();
+    if width == 0 || dst.len() != width || weight.len() != width || bias.len() != width {
+        return Err(invalid());
+    }
+    let (chunks, tail) = row.as_chunks::<4>();
+    let mut sum_v = f32x4::splat(simd, 0.0_f32);
+    for chunk in chunks {
+        sum_v += f32x4::from_slice(simd, chunk);
+    }
+    let sum_lanes: [f32; 4] = sum_v.into();
+    let mut sum = (sum_lanes[0] + sum_lanes[1]) + (sum_lanes[2] + sum_lanes[3]);
+    for &value in tail {
+        sum += value;
+    }
+    let denom = scalar(width);
+    let mean = sum / denom;
+    let mean_v = f32x4::splat(simd, mean);
+    let mut var_v = f32x4::splat(simd, 0.0_f32);
+    for chunk in chunks {
+        let delta = f32x4::from_slice(simd, chunk) - mean_v;
+        var_v += delta * delta;
+    }
+    let var_lanes: [f32; 4] = var_v.into();
+    let mut var_sum = (var_lanes[0] + var_lanes[1]) + (var_lanes[2] + var_lanes[3]);
+    for &value in tail {
+        let delta = value - mean;
+        var_sum += delta * delta;
+    }
+    let variance = var_sum / denom;
+    if !mean.is_finite() || !variance.is_finite() {
+        return Err(invalid());
+    }
+    let scale = 1.0 / (variance + 0.000_01).sqrt();
+    let scale_v = f32x4::splat(simd, scale);
+    let inf_v = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
+    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<4>();
+    let (w_chunks, w_tail) = weight.as_chunks::<4>();
+    let (b_chunks, b_tail) = bias.as_chunks::<4>();
+    for (((out_chunk, in_chunk), w_chunk), b_chunk) in dst_chunks
+        .iter_mut()
+        .zip(chunks)
+        .zip(w_chunks)
+        .zip(b_chunks)
+    {
+        let x = f32x4::from_slice(simd, in_chunk);
+        let w = f32x4::from_slice(simd, w_chunk);
+        let b = f32x4::from_slice(simd, b_chunk);
+        let res = (((x - mean_v) * scale_v) * w) + b;
+        if !res.abs().simd_lt(inf_v).all_true() {
+            all_finite = false;
+        }
+        res.store_slice(out_chunk);
+    }
+    for (((out, &value), &w), &b) in dst_tail.iter_mut().zip(tail).zip(w_tail).zip(b_tail) {
+        let res = (((value - mean) * scale) * w) + b;
+        if !res.is_finite() {
+            all_finite = false;
+        }
+        *out = res;
+    }
+    if all_finite { Ok(()) } else { Err(invalid()) }
 }
 
 /// One pre-normalized, biased, bidirectional encoder transformer block.
@@ -774,26 +842,34 @@ fn transform_block(
     let window_rows = window_rows.max(1);
     row_workers::try_run_aligned(attn_out, workers, c.hidden, &|elem_off, slice| {
         let start_row = elem_off / c.hidden;
-        let mut scores = zeros(window_rows.min(num_rows).max(1))?;
-        for (local_idx, out_row) in slice.chunks_exact_mut(c.hidden).enumerate() {
+        let rows_here = slice.len() / c.hidden;
+        let mut scores = zeros(4 * window_rows.min(num_rows).max(1))?;
+        let mut local_idx = 0_usize;
+        while local_idx < rows_here {
             let row_idx = start_row + local_idx;
             let win_start = (row_idx / window_rows) * window_rows;
             let win_end = (win_start + window_rows).min(num_rows);
             let win_len = win_end - win_start;
-            let q_row = &q_ref[row_idx * c.hidden..(row_idx + 1) * c.hidden];
+            let tile_rows = (win_end - row_idx).min(rows_here - local_idx).min(4);
+            let q_tile = &q_ref[row_idx * c.hidden..(row_idx + tile_rows) * c.hidden];
             let k_win = &k_ref[win_start * c.hidden..win_end * c.hidden];
             let v_win = &v_ref[win_start * c.hidden..win_end * c.hidden];
-            let win_scores = &mut scores[..win_len];
-            for head in 0..c.heads {
-                let offset = head * head_dim;
-                let q_head = &q_row[offset..offset + head_dim];
-                let out_head = &mut out_row[offset..offset + head_dim];
-                attention_head_bidirectional(
-                    q_head, k_win, v_win, win_len, c.hidden, offset, head_dim, divisor, win_scores,
-                    out_head,
-                )?;
-            }
-            finite(out_row)?;
+            let out_tile = &mut slice[local_idx * c.hidden..(local_idx + tile_rows) * c.hidden];
+            packed::attend_q_rows_bidirectional_f32(
+                q_tile,
+                k_win,
+                v_win,
+                win_len,
+                c.hidden,
+                c.heads,
+                head_dim,
+                divisor,
+                &mut scores[..tile_rows * win_len],
+                out_tile,
+                invalid,
+            )?;
+            finite(out_tile)?;
+            local_idx += tile_rows;
         }
         Ok(())
     })?;
@@ -819,6 +895,7 @@ fn transform_block(
     add_residual_batch(rows, proj, workers, c.hidden)
 }
 
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Shares SIMD bidirectional score/value accumulation across transformer blocks and tests."
@@ -881,18 +958,47 @@ fn attention(
     Ok(output)
 }
 
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn add_bias_rows_simd<S: Simd>(simd: S, rows: &mut [f32], bias: &[f32]) -> bool {
+    let out_width = bias.len();
+    let inf = f32x4::splat(simd, f32::INFINITY);
+    let (b_chunks, b_tail) = bias.as_chunks::<4>();
+    let mut all_finite = true;
+    for row in rows.chunks_exact_mut(out_width) {
+        let (r_chunks, r_tail) = row.as_chunks_mut::<4>();
+        for (r_chunk, b_chunk) in r_chunks.iter_mut().zip(b_chunks) {
+            let sum = f32x4::from_slice(simd, r_chunk) + f32x4::from_slice(simd, b_chunk);
+            if !sum.abs().simd_lt(inf).all_true() {
+                all_finite = false;
+            }
+            sum.store_slice(r_chunk);
+        }
+        for (value, &b) in r_tail.iter_mut().zip(b_tail) {
+            *value += b;
+            if !value.is_finite() {
+                all_finite = false;
+            }
+        }
+    }
+    all_finite
+}
+
 fn add_batch_bias(out: &mut [f32], bias: &[f32], workers: usize) -> io::Result<()> {
     let out_width = bias.len();
     if out_width == 0 {
         return finite(out);
     }
+    if !out.len().is_multiple_of(out_width) {
+        return Err(invalid());
+    }
+    let level = packed::simd_level();
     row_workers::try_run_aligned(out, workers, out_width, &|_, slice| {
-        for row in slice.chunks_exact_mut(out_width) {
-            for (value, &b) in row.iter_mut().zip(bias) {
-                *value += b;
-            }
-        }
-        finite(slice)
+        let ok = dispatch!(level, simd => add_bias_rows_simd(simd, slice, bias));
+        if ok { Ok(()) } else { Err(invalid()) }
     })
 }
 
