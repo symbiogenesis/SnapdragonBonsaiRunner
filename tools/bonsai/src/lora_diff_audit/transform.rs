@@ -50,6 +50,7 @@ pub(super) struct EditAdapterConfig {
     pub(super) layer_max: Option<u32>,
     pub(super) depth_gain_start: Option<f64>,
     pub(super) depth_gain_end: Option<f64>,
+    pub(super) layer_gains: BTreeMap<u32, f64>,
     pub(super) max_site_frobenius_norm: Option<f64>,
     pub(super) orthogonalize_against_rank_one_path: Option<PathBuf>,
     pub(super) export_dtype: Option<ExportDtype>,
@@ -140,6 +141,18 @@ pub(super) fn validate_edit_config(config: &EditAdapterConfig) -> crate::Result<
                 "editConfig.depthGainStart and editConfig.depthGainEnd must be supplied together."
                     .into(),
             );
+        }
+    }
+    for (&layer, &gain) in &config.layer_gains {
+        if layer >= 64 {
+            return Err(format!(
+                "editConfig.layerGains key {layer} must be in 0..64."
+            ));
+        }
+        if !gain.is_finite() || !(0.0..=100.0).contains(&gain) {
+            return Err(format!(
+                "editConfig.layerGains[{layer}] must be finite and in [0.0, 100.0]."
+            ));
         }
     }
     if let Some(cap) = config.max_site_frobenius_norm
@@ -532,7 +545,8 @@ pub(super) fn run_edit_adapter_with_dims(
             (Some(start), Some(end)) => start + (end - start) * (f64::from(layer) / 63.0),
             _ => 1.0,
         };
-        let site_gain = global_gain * fam_gain * depth_gain;
+        let layer_gain = config.layer_gains.get(&layer).copied().unwrap_or(1.0);
+        let site_gain = global_gain * fam_gain * depth_gain * layer_gain;
         if site_gain == 0.0 {
             dropped_sites += 1;
             continue;

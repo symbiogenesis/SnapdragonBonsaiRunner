@@ -2418,3 +2418,91 @@ fn reallocate_ranks_equal_byte_kl_fisher_knapsack_and_split_disjointness() -> cr
     );
     Ok(())
 }
+
+#[test]
+fn edit_adapter_layer_gains_scales_drops_and_validates() -> crate::Result<()> {
+    let scratch = ScratchDir::new("edit-layer-gains")?;
+    let src = scratch.join("src.gguf");
+    let toy_pair = |name: &str, val: f32| ExportTensorPair {
+        gguf_base_name: name.to_owned(),
+        in_features: 8,
+        out_features: 4,
+        rank: 2,
+        lora_a_f32: vec![val; 16],
+        lora_b_f32: vec![val; 8],
+    };
+    let pairs = vec![
+        toy_pair("blk.0.ffn_down.weight", 0.5),
+        toy_pair("blk.19.ffn_down.weight", 0.5),
+        toy_pair("blk.20.ffn_down.weight", 0.5),
+        toy_pair("blk.23.attn_output.weight", 0.5),
+    ];
+    let toy_dims: BTreeMap<String, (usize, usize, &'static str)> = [
+        ("blk.0.ffn_down.weight".to_owned(), (8, 4, "ffn_down")),
+        ("blk.19.ffn_down.weight".to_owned(), (8, 4, "ffn_down")),
+        ("blk.20.ffn_down.weight".to_owned(), (8, 4, "ffn_down")),
+        (
+            "blk.23.attn_output.weight".to_owned(),
+            (8, 4, "attn_output"),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    write_lora_gguf(
+        &src,
+        ExportDtype::F32,
+        2.0,
+        &[("bonsai.composition.method", "layer-gain-test")],
+        &pairs,
+    )?;
+
+    let out = scratch.join("layer-gains.gguf");
+    let req: Request = serde_json::from_value(json!({
+        "schemaVersion": 1,
+        "operation": "edit-adapter",
+        "adapterPath": src,
+        "outputPath": out,
+        "editConfig": {
+            "familyScales": { "attn_output": 2.0 },
+            "layerGains": { "0": 0.0, "19": 0.5, "23": 1.5 }
+        }
+    }))
+    .map_err(|e| e.to_string())?;
+    super::validate_request(&req)?;
+    let res = super::transform::run_edit_adapter_with_dims(&req, &toy_dims)?;
+    assert_eq!(res["droppedSiteCount"], 1);
+    assert_eq!(res["pairCount"], 3);
+
+    let edited = super::gguf_adapter::read_lora_gguf_pairs_with_dims(&out, &toy_dims)?;
+    assert_eq!(edited.pairs.len(), 3);
+    let by_name: BTreeMap<&str, &ExportTensorPair> = edited
+        .pairs
+        .iter()
+        .map(|p| (p.gguf_base_name.as_str(), p))
+        .collect();
+    assert!(!by_name.contains_key("blk.0.ffn_down.weight"));
+
+    let base_delta_l20 = reconstruct_delta_f64(&pairs[2], 2.0);
+    let got_l19 = reconstruct_delta_f64(by_name["blk.19.ffn_down.weight"], edited.alpha);
+    let got_l20 = reconstruct_delta_f64(by_name["blk.20.ffn_down.weight"], edited.alpha);
+    let got_l23 = reconstruct_delta_f64(by_name["blk.23.attn_output.weight"], edited.alpha);
+    for idx in 0..base_delta_l20.len() {
+        assert!((got_l19[idx] - 0.5 * base_delta_l20[idx]).abs() < 1e-5);
+        assert!((got_l20[idx] - base_delta_l20[idx]).abs() < 1e-5);
+        // attn_output family=2.0 * layerGain[23]=1.5 -> 3.0x
+        assert!((got_l23[idx] - 3.0 * base_delta_l20[idx]).abs() < 1e-5);
+    }
+
+    // Invalid layer >= 64 or negative/out-of-range gain must fail validation.
+    for bad_gains in [json!({"64": 1.0}), json!({"0": -0.5}), json!({"0": 105.0})] {
+        let bad_req = json!({
+            "schemaVersion": 1,
+            "operation": "edit-adapter",
+            "adapterPath": src,
+            "outputPath": scratch.join("invalid-gain.gguf"),
+            "editConfig": { "layerGains": bad_gains }
+        });
+        assert!(run(bad_req).is_err());
+    }
+    Ok(())
+}
