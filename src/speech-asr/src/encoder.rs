@@ -10,8 +10,10 @@
     reason = "Separate scalar operations define this independent encoder reference."
 )]
 
+#[cfg(test)]
+use crate::decoder::binary16_operand;
 use crate::{
-    decoder::{Projection, binary16_operand},
+    decoder::Projection,
     frontend::{Frontend, MelSpectrogram},
     packed::{self, PreparedBatch},
     protocol::EncoderLayout,
@@ -77,7 +79,7 @@ impl Linear {
 
     fn apply_batch_prepared(
         &self,
-        prepared: &PreparedBatch,
+        prepared: &mut PreparedBatch,
         raw_input: &[f32],
         workers: usize,
         scratch: &mut Vec<f32>,
@@ -502,11 +504,11 @@ impl Encoder {
                         dst[cf] = image_a[cf * width + time];
                     }
                 }
-                prepared.prepare_into(&flat_in, retained, flat_dim);
+                prepared.prepare_meta(retained, flat_dim);
                 let chunk_rows =
                     &mut rows[row_offset * c.hidden..(row_offset + retained) * c.hidden];
                 self.weights.convolution_out.multiply_batch_prepared_into(
-                    &prepared,
+                    &mut prepared,
                     &flat_in,
                     workers,
                     &mut conv_scratch,
@@ -558,9 +560,9 @@ impl Encoder {
         self.weights
             .output_norm
             .apply_batch(&rows, &mut norm_buf, c.hidden, workers)?;
-        prepared.prepare_into(&norm_buf, num_rows, c.hidden);
+        prepared.prepare_meta(num_rows, c.hidden);
         self.weights.output_in.apply_batch_prepared(
-            &prepared,
+            &mut prepared,
             &norm_buf,
             workers,
             &mut conv_scratch,
@@ -569,9 +571,9 @@ impl Encoder {
         )?;
         gelu_parallel(&mut proj, workers, c.hidden)?;
         let mut values = zeros(num_rows * c.output)?;
-        prepared.prepare_into(&proj, num_rows, c.hidden);
+        prepared.prepare_meta(num_rows, c.hidden);
         self.weights.output_out.apply_batch_prepared(
-            &prepared,
+            &mut prepared,
             &proj,
             workers,
             &mut conv_scratch,
@@ -610,9 +612,71 @@ impl Encoded {
     }
 }
 
+fn round_chunk_f16(src: &[f32], dst: &mut [f32]) -> io::Result<()> {
+    let mut f16_buf = [0_u16; 1024];
+    for (s, d) in src.chunks(1024).zip(dst.chunks_mut(1024)) {
+        let f16_slice = &mut f16_buf[..s.len()];
+        if !packed::narrow_f32_to_f16_slice(s, f16_slice) {
+            return Err(invalid());
+        }
+        packed::widen_f16_slice(f16_slice, d);
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn add_scalar_bias_simd<S: Simd>(simd: S, values: &mut [f32], bias: f32) -> bool {
+    let b = f32x4::splat(simd, bias);
+    let inf = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
+    let (chunks, tail) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let sum = f32x4::from_slice(simd, chunk) + b;
+        if !sum.abs().simd_lt(inf).all_true() {
+            all_finite = false;
+        }
+        sum.store_slice(chunk);
+    }
+    for value in tail {
+        *value += bias;
+        if !value.is_finite() {
+            all_finite = false;
+        }
+    }
+    all_finite
+}
+
+fn channel_major_bias_and_gelu(
+    out: &mut [f32],
+    bias: &[f32],
+    total_patches: usize,
+    workers: usize,
+) -> io::Result<()> {
+    if total_patches == 0 || bias.is_empty() {
+        return finite(out);
+    }
+    let level = packed::simd_level();
+    row_workers::try_run_aligned(out, workers, total_patches, &|elem_off, slice| {
+        let first_ch = elem_off / total_patches;
+        for (local_ch, ch_slice) in slice.chunks_exact_mut(total_patches).enumerate() {
+            let b = bias[first_ch + local_ch];
+            if !dispatch!(level, simd => add_scalar_bias_simd(simd, ch_slice, b)) {
+                return Err(invalid());
+            }
+            numerics::gelu_slice_in_place(ch_slice);
+            finite(ch_slice)?;
+        }
+        Ok(())
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "Reuses batch im2col, flat output, and channel-major buffers across chunked encoder stages."
+    reason = "Reuses batch im2col, rounded input, and channel-major buffers across chunked encoder stages."
 )]
 fn convolve_into_with_threads(
     linear: &Linear,
@@ -623,7 +687,7 @@ fn convolve_into_with_threads(
     workers: usize,
     prepared: &mut PreparedBatch,
     patches: &mut Vec<f32>,
-    flat_out: &mut Vec<f32>,
+    rounded_input: &mut Vec<f32>,
     scratch: &mut Vec<f32>,
     output: &mut Vec<f32>,
     cancel: &mut impl FnMut() -> bool,
@@ -635,52 +699,79 @@ fn convolve_into_with_threads(
     for _ in 0..total_patches {
         check(cancel)?;
     }
+    let input_len = channels
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(width))
+        .ok_or_else(invalid)?;
+    let input_view = input.get(..input_len).ok_or_else(invalid)?;
+    if total_patches > 0 && patch_width > 0 {
+        ensure_buffer(rounded_input, input_len)?;
+        let rounded_dst = &mut rounded_input[..input_len];
+        if workers > 1 && input_len >= 4_096 {
+            row_workers::try_run_aligned(rounded_dst, workers, 1024, &|elem_off, dst_slice| {
+                round_chunk_f16(&input_view[elem_off..elem_off + dst_slice.len()], dst_slice)
+            })?;
+        } else {
+            round_chunk_f16(input_view, rounded_dst)?;
+        }
+    }
+
     ensure_buffer(patches, total_patches * patch_width)?;
-    let row_stride = out_width * patch_width;
-    row_workers::try_run_aligned(patches, workers, row_stride, &|elem_off, slice| {
-        let first_y = elem_off / row_stride;
-        for (local_y, y_slice) in slice.chunks_exact_mut(row_stride).enumerate() {
-            let y = first_y + local_y;
-            for (x, patch) in y_slice.chunks_exact_mut(patch_width).enumerate() {
-                for channel in 0..channels {
-                    let ch_in_base = channel * height;
-                    let ch_p_base = channel * 9;
-                    for ky in 0..3 {
-                        let py_opt = (2 * y + ky).checked_sub(1).filter(|&py| py < height);
-                        for kx in 0..3 {
-                            let dst = &mut patch[ch_p_base + ky * 3 + kx];
-                            if let Some(py) = py_opt
-                                && let Some(px) =
-                                    (2 * x + kx).checked_sub(1).filter(|&px| px < width)
-                            {
-                                // The pinned native im2col stage narrows every
-                                // activation before its convolution dot product.
-                                *dst = binary16_operand(input[(ch_in_base + py) * width + px])?;
+    if total_patches > 0 && patch_width > 0 {
+        let rounded = &rounded_input[..input_len];
+        let row_stride = out_width * patch_width;
+        row_workers::run_aligned(patches, workers, row_stride, &|elem_off, slice| {
+            let first_y = elem_off / row_stride;
+            for (local_y, y_slice) in slice.chunks_exact_mut(row_stride).enumerate() {
+                let y = first_y + local_y;
+                let py_opts: [Option<usize>; 3] =
+                    std::array::from_fn(|ky| (2 * y + ky).checked_sub(1).filter(|&py| py < height));
+                for (x, patch) in y_slice.chunks_exact_mut(patch_width).enumerate() {
+                    let interior_x = x > 0 && 2 * x + 1 < width;
+                    for channel in 0..channels {
+                        let ch_in_base = channel * height;
+                        let ch_p_base = channel * 9;
+                        for (ky, py_opt) in py_opts.iter().enumerate() {
+                            let row_dst = &mut patch[ch_p_base + ky * 3..ch_p_base + (ky + 1) * 3];
+                            if let Some(py) = *py_opt {
+                                let in_row = &rounded
+                                    [(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
+                                if interior_x {
+                                    row_dst.copy_from_slice(&in_row[2 * x - 1..2 * x + 2]);
+                                } else {
+                                    for (kx, dst) in row_dst.iter_mut().enumerate() {
+                                        *dst = (2 * x + kx)
+                                            .checked_sub(1)
+                                            .filter(|&px| px < width)
+                                            .map_or(0.0, |px| in_row[px]);
+                                    }
+                                }
                             } else {
-                                *dst = 0.0;
+                                row_dst.fill(0.0);
                             }
                         }
                     }
                 }
             }
-        }
-        Ok(())
-    })?;
-    prepared.prepare_into(patches, total_patches, patch_width);
-    ensure_buffer(flat_out, total_patches * out_channels)?;
-    linear.apply_batch_prepared(prepared, patches, workers, scratch, flat_out, cancel)?;
-    gelu_parallel(flat_out, workers, out_channels)?;
-    ensure_buffer(output, total_patches * out_channels)?;
-    row_workers::run_aligned(output, workers, total_patches, &|elem_off, out_slice| {
-        let first_ch = elem_off / total_patches;
-        for (local_ch, ch_dst) in out_slice.chunks_exact_mut(total_patches).enumerate() {
-            let channel = first_ch + local_ch;
-            for (pos, dst) in ch_dst.iter_mut().enumerate() {
-                *dst = flat_out[pos * out_channels + channel];
-            }
-        }
-    });
-    Ok(())
+        });
+    }
+
+    prepared.prepare_meta(total_patches, patch_width);
+    ensure_buffer(output, out_channels * total_patches)?;
+    linear.weights.multiply_batch_channel_major_prepared_into(
+        prepared,
+        &patches[..total_patches * patch_width],
+        workers,
+        scratch,
+        &mut output[..out_channels * total_patches],
+        cancel,
+    )?;
+    channel_major_bias_and_gelu(
+        &mut output[..out_channels * total_patches],
+        &linear.bias,
+        total_patches,
+        workers,
+    )
 }
 
 #[cfg(test)]
@@ -809,7 +900,7 @@ fn transform_block(
     block
         .attention_norm
         .apply_batch(rows, norm_buf, c.hidden, workers)?;
-    prepared.prepare_into(norm_buf, num_rows, c.hidden);
+    prepared.prepare_meta(num_rows, c.hidden);
     Projection::multiply_batch_triple_into(
         &block.query.weights,
         &block.key.weights,
@@ -874,7 +965,7 @@ fn transform_block(
         Ok(())
     })?;
 
-    prepared.prepare_into(attn_out, num_rows, c.hidden);
+    prepared.prepare_meta(num_rows, c.hidden);
     block
         .attention_out
         .apply_batch_prepared(prepared, attn_out, workers, scratch, proj, cancel)?;
@@ -883,12 +974,12 @@ fn transform_block(
     block
         .ffn_norm
         .apply_batch(rows, norm_buf, c.hidden, workers)?;
-    prepared.prepare_into(norm_buf, num_rows, c.hidden);
+    prepared.prepare_meta(num_rows, c.hidden);
     block
         .ffn_in
         .apply_batch_prepared(prepared, norm_buf, workers, scratch, ffn_buf, cancel)?;
     gelu_parallel(ffn_buf, workers, c.intermediate)?;
-    prepared.prepare_into(ffn_buf, num_rows, c.intermediate);
+    prepared.prepare_meta(num_rows, c.intermediate);
     block
         .ffn_out
         .apply_batch_prepared(prepared, ffn_buf, workers, scratch, proj, cancel)?;
@@ -1005,3 +1096,131 @@ fn add_batch_bias(out: &mut [f32], bias: &[f32], workers: usize) -> io::Result<(
 #[cfg(test)]
 #[path = "encoder/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod wave5_tests {
+    use super::*;
+
+    fn scalar_conv2d_reference(
+        weights: &[f32],
+        bias: &[f32],
+        input: &[f32],
+        width: usize,
+        height: usize,
+        channels: usize,
+    ) -> io::Result<Vec<f32>> {
+        let out_width = width.div_ceil(2);
+        let out_height = height.div_ceil(2);
+        let out_channels = bias.len();
+        let total_patches = out_width * out_height;
+        let patch_width = 9 * channels;
+        let mut out = vec![0.0_f32; out_channels * total_patches];
+        for y in 0..out_height {
+            for x in 0..out_width {
+                let mut patch = vec![0.0_f32; patch_width];
+                for ch in 0..channels {
+                    for ky in 0..3 {
+                        let py_opt = (2 * y + ky).checked_sub(1).filter(|&py| py < height);
+                        for kx in 0..3 {
+                            let idx = ch * 9 + ky * 3 + kx;
+                            if let Some(py) = py_opt
+                                && let Some(px) =
+                                    (2 * x + kx).checked_sub(1).filter(|&px| px < width)
+                            {
+                                patch[idx] =
+                                    binary16_operand(input[(ch * height + py) * width + px])?;
+                            }
+                        }
+                    }
+                }
+                let pos = y * out_width + x;
+                for out_ch in 0..out_channels {
+                    let row = &weights[out_ch * patch_width..(out_ch + 1) * patch_width];
+                    let mut sum = 0.0_f32;
+                    for (&w, &p) in row.iter().zip(&patch) {
+                        sum += w * p;
+                    }
+                    out[out_ch * total_patches + pos] = numerics::gelu(sum + bias[out_ch]);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn convolve_channel_major_f16_stem_matches_scalar_bit_exact() -> io::Result<()> {
+        for (width, height, channels, out_channels) in [
+            (1_usize, 1_usize, 1_usize, 3_usize),
+            (3, 2, 1, 5),
+            (7, 5, 4, 9),
+            (17, 13, 8, 13),
+            (70, 64, 1, 6),
+        ] {
+            let patch_width = 9 * channels;
+            let weights: Vec<f32> = (0..out_channels * patch_width)
+                .map(|i| {
+                    if i % 13 == 0 {
+                        -0.0
+                    } else {
+                        (f32::from(u16::try_from((i * 7) % 41).unwrap_or(0)) - 20.0) * 0.03125
+                    }
+                })
+                .collect();
+            let bias: Vec<f32> = (0..out_channels)
+                .map(|i| {
+                    if i % 5 == 0 {
+                        -0.0
+                    } else {
+                        (f32::from(u16::try_from((i * 11) % 29).unwrap_or(0)) - 14.0) * 0.0625
+                    }
+                })
+                .collect();
+            let input: Vec<f32> = (0..channels * height * width)
+                .map(|i| {
+                    if i % 17 == 0 {
+                        -0.0
+                    } else {
+                        (f32::from(u16::try_from((i * 13) % 97).unwrap_or(0)) - 48.0) * 0.025
+                    }
+                })
+                .collect();
+            let linear = Linear {
+                weights: Projection::f32(patch_width, out_channels, weights.clone())?,
+                bias: bias.clone(),
+            };
+            let expected =
+                scalar_conv2d_reference(&weights, &bias, &input, width, height, channels)?;
+            let expected_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+
+            for workers in [1_usize, 3] {
+                let actual = convolve_with_threads(
+                    &linear,
+                    &input,
+                    width,
+                    height,
+                    channels,
+                    workers,
+                    &mut || false,
+                )?;
+                let actual_bits: Vec<u32> = actual.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(
+                    actual_bits, expected_bits,
+                    "conv2d mismatch w={width} h={height} c={channels} oc={out_channels} workers={workers}"
+                );
+            }
+        }
+
+        // Fail-closed on binary16 overflow (> 65504.0) and non-finite pixels, including parallel path.
+        let linear = Linear {
+            weights: Projection::f32(9, 4, vec![0.25_f32; 36])?,
+            bias: vec![0.0_f32; 4],
+        };
+        let mut overflow_in = vec![0.5_f32; 70 * 64];
+        overflow_in[70 * 64 - 1] = 65_520.0;
+        assert!(convolve_with_threads(&linear, &overflow_in, 70, 64, 1, 3, &mut || false).is_err());
+        let mut nan_in = vec![0.5_f32; 70 * 64];
+        nan_in[0] = f32::NAN;
+        assert!(convolve_with_threads(&linear, &nan_in, 70, 64, 1, 3, &mut || false).is_err());
+        Ok(())
+    }
+}

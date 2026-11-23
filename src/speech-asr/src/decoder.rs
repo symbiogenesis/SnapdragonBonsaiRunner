@@ -371,7 +371,7 @@ impl Projection {
     /// Compute batched `[batch, input]` rows using a shared `PreparedBatch` and `4x8` SIMD tiles.
     pub(super) fn multiply_batch_prepared_into(
         &self,
-        prepared: &PreparedBatch,
+        prepared: &mut PreparedBatch,
         raw_input: &[f32],
         workers: usize,
         scratch: &mut Vec<f32>,
@@ -390,6 +390,38 @@ impl Projection {
             check(cancel)?;
         }
         packed::multiply_batch_prepared_into(
+            self.as_weight_matrix(),
+            prepared,
+            raw_input,
+            workers,
+            scratch,
+            out,
+        );
+        finite(out)
+    }
+
+    /// Compute batched channel-major `[output, batch]` rows directly using a shared `PreparedBatch`.
+    pub(super) fn multiply_batch_channel_major_prepared_into(
+        &self,
+        prepared: &mut PreparedBatch,
+        raw_input: &[f32],
+        workers: usize,
+        scratch: &mut Vec<f32>,
+        out: &mut [f32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        let batch = prepared.batch();
+        if prepared.input() != self.input
+            || raw_input.len() != batch.checked_mul(self.input).ok_or_else(invalid)?
+            || out.len() != batch.checked_mul(self.output).ok_or_else(invalid)?
+        {
+            return Err(invalid());
+        }
+        finite(raw_input)?;
+        for _ in 0..(batch + self.output) {
+            check(cancel)?;
+        }
+        packed::multiply_batch_channel_major_into(
             self.as_weight_matrix(),
             prepared,
             raw_input,
@@ -428,7 +460,7 @@ impl Projection {
 
     pub(super) fn multiply_batch_group_into<const N: usize>(
         pairs: [(&Self, &mut [f32]); N],
-        prepared: &PreparedBatch,
+        prepared: &mut PreparedBatch,
         raw_input: &[f32],
         workers: usize,
         scratch: &mut Vec<f32>,
@@ -467,7 +499,7 @@ impl Projection {
         p0: &Self,
         p1: &Self,
         p2: &Self,
-        prepared: &PreparedBatch,
+        prepared: &mut PreparedBatch,
         raw_input: &[f32],
         workers: usize,
         scratch: &mut Vec<f32>,
@@ -1483,14 +1515,14 @@ fn prefill_rows_inner(
             hidden,
             workers,
         )?;
-        ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
+        ws.prepared.prepare_meta(total, hidden);
         Projection::multiply_batch_group_into(
             [
                 (&block.query, &mut ws.batch_q),
                 (&block.key, &mut ws.batch_k),
                 (&block.value, &mut ws.batch_v),
             ],
-            &ws.prepared,
+            &mut ws.prepared,
             &ws.batch_norm,
             workers,
             &mut ws.transposed_scratch,
@@ -1564,9 +1596,9 @@ fn prefill_rows_inner(
             },
         )?;
 
-        ws.prepared.prepare_into(&ws.batch_attn, total, q_width);
+        ws.prepared.prepare_meta(total, q_width);
         block.attention_out.multiply_batch_prepared_into(
-            &ws.prepared,
+            &mut ws.prepared,
             &ws.batch_attn,
             workers,
             &mut ws.transposed_scratch,
@@ -1607,13 +1639,13 @@ fn prefill_rows_inner(
                 hidden,
                 workers,
             )?;
-            ws.prepared.prepare_into(&ws.batch_norm, total, hidden);
+            ws.prepared.prepare_meta(total, hidden);
             Projection::multiply_batch_group_into(
                 [
                     (&block.gate, &mut ws.batch_gate),
                     (&block.up, &mut ws.batch_up),
                 ],
-                &ws.prepared,
+                &mut ws.prepared,
                 &ws.batch_norm,
                 workers,
                 &mut ws.transposed_scratch,
@@ -1632,10 +1664,9 @@ fn prefill_rows_inner(
                     finite(gate_slice)
                 },
             )?;
-            ws.prepared
-                .prepare_into(&ws.batch_gate, total, c.intermediate);
+            ws.prepared.prepare_meta(total, c.intermediate);
             block.down.multiply_batch_prepared_into(
-                &ws.prepared,
+                &mut ws.prepared,
                 &ws.batch_gate,
                 workers,
                 &mut ws.transposed_scratch,

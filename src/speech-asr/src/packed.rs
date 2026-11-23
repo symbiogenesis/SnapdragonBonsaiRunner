@@ -41,13 +41,112 @@ pub(super) struct WeightMatrix<'a> {
     pub(super) data: WeightSlice<'a>,
 }
 
-/// Four-position-packed input activations so sibling projections share transposition.
+/// Four-position-packed input activations so sibling projections share transposition,
+/// and reusable quantized activation buffers so quantized projections skip scalar transposes.
 #[derive(Default)]
 pub(super) struct PreparedBatch {
     input: usize,
     batch: usize,
     num_quads: usize,
     quads: Vec<[f32; 4]>,
+    quads_ready: bool,
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    act_q8_0: Vec<Q8_0ActBlock>,
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    act_q8_k: Vec<Q8_KActBlock>,
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    q8_0_ready: bool,
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    q8_k_ready: bool,
+}
+
+#[inline(always)]
+fn transpose_quads_simd<S: Simd>(
+    simd: S,
+    raw_input: &[f32],
+    batch: usize,
+    input: usize,
+    start_quad: usize,
+    out_quads: &mut [f32],
+) {
+    let quad_stride = 4 * input;
+    let full_quads = batch / 4;
+    let col_chunks = input / 4;
+    let rem = batch % 4;
+    let zero = f32x4::splat(simd, 0.0_f32);
+    for (local_q, dst) in out_quads.chunks_exact_mut(quad_stride).enumerate() {
+        let q = start_quad + local_q;
+        let base = q * 4;
+        if q < full_quads {
+            let p0 = &raw_input[base * input..(base + 1) * input];
+            let p1 = &raw_input[(base + 1) * input..(base + 2) * input];
+            let p2 = &raw_input[(base + 2) * input..(base + 3) * input];
+            let p3 = &raw_input[(base + 3) * input..(base + 4) * input];
+            for c in 0..col_chunks {
+                let col = c * 4;
+                let cols = transpose_4x4(
+                    simd,
+                    [
+                        f32x4::from_slice(simd, &p0[col..col + 4]),
+                        f32x4::from_slice(simd, &p1[col..col + 4]),
+                        f32x4::from_slice(simd, &p2[col..col + 4]),
+                        f32x4::from_slice(simd, &p3[col..col + 4]),
+                    ],
+                );
+                let dst_base = col * 4;
+                cols[0].store_slice(&mut dst[dst_base..dst_base + 4]);
+                cols[1].store_slice(&mut dst[dst_base + 4..dst_base + 8]);
+                cols[2].store_slice(&mut dst[dst_base + 8..dst_base + 12]);
+                cols[3].store_slice(&mut dst[dst_base + 12..dst_base + 16]);
+            }
+            for col in (col_chunks * 4)..input {
+                let dst_base = col * 4;
+                dst[dst_base] = p0[col];
+                dst[dst_base + 1] = p1[col];
+                dst[dst_base + 2] = p2[col];
+                dst[dst_base + 3] = p3[col];
+            }
+        } else if rem > 0 {
+            let p0 = &raw_input[base * input..(base + 1) * input];
+            let p1 = if rem > 1 {
+                &raw_input[(base + 1) * input..(base + 2) * input]
+            } else {
+                p0
+            };
+            let p2 = if rem > 2 {
+                &raw_input[(base + 2) * input..(base + 3) * input]
+            } else {
+                p0
+            };
+            for c in 0..col_chunks {
+                let col = c * 4;
+                let r0 = f32x4::from_slice(simd, &p0[col..col + 4]);
+                let r1 = if rem > 1 {
+                    f32x4::from_slice(simd, &p1[col..col + 4])
+                } else {
+                    zero
+                };
+                let r2 = if rem > 2 {
+                    f32x4::from_slice(simd, &p2[col..col + 4])
+                } else {
+                    zero
+                };
+                let cols = transpose_4x4(simd, [r0, r1, r2, zero]);
+                let dst_base = col * 4;
+                cols[0].store_slice(&mut dst[dst_base..dst_base + 4]);
+                cols[1].store_slice(&mut dst[dst_base + 4..dst_base + 8]);
+                cols[2].store_slice(&mut dst[dst_base + 8..dst_base + 12]);
+                cols[3].store_slice(&mut dst[dst_base + 12..dst_base + 16]);
+            }
+            for col in (col_chunks * 4)..input {
+                let dst_base = col * 4;
+                dst[dst_base] = p0[col];
+                dst[dst_base + 1] = if rem > 1 { p1[col] } else { 0.0 };
+                dst[dst_base + 2] = if rem > 2 { p2[col] } else { 0.0 };
+                dst[dst_base + 3] = 0.0;
+            }
+        }
+    }
 }
 
 impl PreparedBatch {
@@ -62,9 +161,25 @@ impl PreparedBatch {
         self.input = 0;
         self.batch = 0;
         self.num_quads = 0;
+        self.quads_ready = false;
         self.quads.clear();
         if self.quads.capacity() > max_retain.saturating_mul(2) {
             self.quads.shrink_to(max_retain);
+        }
+        #[cfg(all(windows, feature = "rust-qualification"))]
+        {
+            self.q8_0_ready = false;
+            self.q8_k_ready = false;
+            self.act_q8_0.clear();
+            self.act_q8_k.clear();
+            let q8_0_cap = (max_retain / 8).max(64);
+            let q8_k_cap = (max_retain / 64).max(16);
+            if self.act_q8_0.capacity() > q8_0_cap.saturating_mul(2) {
+                self.act_q8_0.shrink_to(q8_0_cap);
+            }
+            if self.act_q8_k.capacity() > q8_k_cap.saturating_mul(2) {
+                self.act_q8_k.shrink_to(q8_k_cap);
+            }
         }
     }
 
@@ -73,50 +188,57 @@ impl PreparedBatch {
         self.quads.capacity()
     }
 
-    pub(super) fn prepare_into(&mut self, raw_input: &[f32], batch: usize, input: usize) {
+    /// Record batch geometry in `O(1)` without eagerly transposing `raw_input` into `quads`
+    /// or quantizing activations until a projection actually consumes them.
+    pub(super) fn prepare_meta(&mut self, batch: usize, input: usize) {
         self.input = input;
         self.batch = batch;
         self.num_quads = batch.div_ceil(4);
-        if self.num_quads > 0 && input > 0 {
-            self.quads.resize(self.num_quads * input, [0.0; 4]);
-            let full_quads = batch / 4;
-            for q in 0..full_quads {
-                let p0 = &raw_input[(q * 4) * input..(q * 4 + 1) * input];
-                let p1 = &raw_input[(q * 4 + 1) * input..(q * 4 + 2) * input];
-                let p2 = &raw_input[(q * 4 + 2) * input..(q * 4 + 3) * input];
-                let p3 = &raw_input[(q * 4 + 3) * input..(q * 4 + 4) * input];
-                let dst = &mut self.quads[q * input..(q + 1) * input];
-                for col in 0..input {
-                    dst[col] = [p0[col], p1[col], p2[col], p3[col]];
-                }
-            }
-            let rem = batch % 4;
-            if rem > 0 {
-                let base = full_quads * 4;
-                let p0 = &raw_input[base * input..(base + 1) * input];
-                let p1 = if rem > 1 {
-                    &raw_input[(base + 1) * input..(base + 2) * input]
-                } else {
-                    p0
-                };
-                let p2 = if rem > 2 {
-                    &raw_input[(base + 2) * input..(base + 3) * input]
-                } else {
-                    p0
-                };
-                let dst = &mut self.quads[full_quads * input..(full_quads + 1) * input];
-                for col in 0..input {
-                    dst[col] = [
-                        p0[col],
-                        if rem > 1 { p1[col] } else { 0.0 },
-                        if rem > 2 { p2[col] } else { 0.0 },
-                        0.0,
-                    ];
-                }
-            }
-        } else {
-            self.quads.clear();
+        self.quads_ready = false;
+        #[cfg(all(windows, feature = "rust-qualification"))]
+        {
+            self.q8_0_ready = false;
+            self.q8_k_ready = false;
         }
+    }
+
+    /// Populate four-position-packed `quads` on demand using parallel SIMD 4x4 transpose.
+    pub(super) fn ensure_quads(&mut self, raw_input: &[f32], workers: usize) {
+        if self.quads_ready {
+            return;
+        }
+        if self.num_quads == 0 || self.input == 0 {
+            self.quads.clear();
+            self.quads_ready = true;
+            return;
+        }
+        let needed = self.num_quads * self.input;
+        self.quads.resize(needed, [0.0; 4]);
+        let level = simd_level();
+        let batch = self.batch;
+        let input = self.input;
+        let flat = self.quads.as_flattened_mut();
+        if workers > 1 && self.num_quads >= 2 && flat.len() >= 8_192 {
+            row_workers::run_aligned(flat, workers, 4 * input, &|elem_off, slice| {
+                let first_quad = elem_off / (4 * input);
+                dispatch!(
+                    level,
+                    simd => transpose_quads_simd(simd, raw_input, batch, input, first_quad, slice)
+                );
+            });
+        } else {
+            dispatch!(
+                level,
+                simd => transpose_quads_simd(simd, raw_input, batch, input, 0, flat)
+            );
+        }
+        self.quads_ready = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare_into(&mut self, raw_input: &[f32], batch: usize, input: usize) {
+        self.prepare_meta(batch, input);
+        self.ensure_quads(raw_input, 1);
     }
 
     pub(super) const fn batch(&self) -> usize {
@@ -826,6 +948,98 @@ fn run_single_rows_repacked_q4_k(
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
+#[inline(always)]
+fn eight_rows<T>(data: &[T], start_row: usize, stride: usize) -> [&[T]; 8] {
+    let row0 = start_row * stride;
+    std::array::from_fn(|r| &data[row0 + r * stride..row0 + (r + 1) * stride])
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+std::thread_local! {
+    static DECODE_ACT_Q8_0: std::cell::RefCell<Vec<Q8_0ActBlock>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static DECODE_ACT_Q8_K: std::cell::RefCell<Vec<Q8_KActBlock>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn with_decode_act_buffers<'a>(
+    weights: impl IntoIterator<Item = WeightMatrix<'a>>,
+    input: &[f32],
+    width: usize,
+    workers: usize,
+    body: impl FnOnce(Arm64QuantCaps, &[Q8_0ActBlock], &[Q8_KActBlock]),
+) {
+    let (need_q8_0, need_q8_k) = activation_needs(weights);
+    DECODE_ACT_Q8_0.with(|q8_cell| {
+        DECODE_ACT_Q8_K.with(|qk_cell| {
+            if let (Ok(mut q8_guard), Ok(mut qk_guard)) =
+                (q8_cell.try_borrow_mut(), qk_cell.try_borrow_mut())
+            {
+                let caps = quantize_batch_activations_flags(
+                    need_q8_0,
+                    need_q8_k,
+                    input,
+                    1,
+                    width,
+                    workers,
+                    &mut q8_guard,
+                    &mut qk_guard,
+                );
+                body(caps, &q8_guard, &qk_guard);
+            } else {
+                let mut q8_fallback = Vec::new();
+                let mut qk_fallback = Vec::new();
+                let caps = quantize_batch_activations_flags(
+                    need_q8_0,
+                    need_q8_k,
+                    input,
+                    1,
+                    width,
+                    workers,
+                    &mut q8_fallback,
+                    &mut qk_fallback,
+                );
+                body(caps, &q8_fallback, &qk_fallback);
+            }
+        });
+    });
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn run_single_rows_q8_0(
+    caps: Arm64QuantCaps,
+    data: &[u8],
+    start_row: usize,
+    row_bytes: usize,
+    act: &[Q8_0ActBlock],
+    out: &mut [f32],
+) {
+    let mut processed = 0_usize;
+    for dst in out.as_chunks_mut::<8>().0 {
+        *dst = quant_kernels::dot_q8_0_8rows(
+            caps,
+            eight_rows(data, start_row + processed, row_bytes),
+            act,
+        );
+        processed += 8;
+    }
+    if out[processed..].len() >= 4 {
+        let four = quant_kernels::dot_q8_0_4rows(
+            caps,
+            four_rows(data, start_row + processed, row_bytes),
+            act,
+        );
+        out[processed..processed + 4].copy_from_slice(&four);
+        processed += 4;
+    }
+    for (local_idx, dst) in out[processed..].iter_mut().enumerate() {
+        let off = (start_row + processed + local_idx) * row_bytes;
+        *dst = quant_kernels::dot_q8_0_row(caps, &data[off..off + row_bytes], act);
+    }
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
 fn single_rows_quant_arm64(
     caps: Arm64QuantCaps,
     weights: WeightMatrix<'_>,
@@ -836,15 +1050,9 @@ fn single_rows_quant_arm64(
 ) {
     let width = weights.input;
     match weights.data {
-        WeightSlice::Q8(data) => run_single_rows_quant(
-            data,
-            start_row,
-            width / 32 * 34,
-            act_q8_0,
-            out,
-            |rows, a| quant_kernels::dot_q8_0_4rows(caps, rows, a),
-            |row, a| quant_kernels::dot_q8_0_row(caps, row, a),
-        ),
+        WeightSlice::Q8(data) => {
+            run_single_rows_q8_0(caps, data, start_row, width / 32 * 34, act_q8_0, out);
+        }
         WeightSlice::Q4K(data) => run_single_rows_quant(
             data,
             start_row,
@@ -879,16 +1087,25 @@ pub(super) fn multiply_single_into(
 ) {
     #[cfg(all(windows, feature = "rust-qualification"))]
     if !matches!(weights.data, WeightSlice::Float(_)) {
-        let (caps, act_q8_0, act_q8_k) =
-            quantize_batch_activations([weights], input, 1, weights.input, workers);
-        let align = if matches!(weights.data, WeightSlice::RepackedQ4K8(_)) {
+        let align = if matches!(
+            weights.data,
+            WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)
+        ) {
             8
         } else {
             4
         };
-        row_workers::run_aligned(out, workers, align, &|start_row, slice| {
-            single_rows_quant_arm64(caps, weights, start_row, &act_q8_0, &act_q8_k, slice);
-        });
+        with_decode_act_buffers(
+            [weights],
+            input,
+            weights.input,
+            workers,
+            |caps, act_q8_0, act_q8_k| {
+                row_workers::run_aligned(out, workers, align, &|start_row, slice| {
+                    single_rows_quant_arm64(caps, weights, start_row, act_q8_0, act_q8_k, slice);
+                });
+            },
+        );
         return;
     }
     let level = simd_level();
@@ -897,38 +1114,21 @@ pub(super) fn multiply_single_into(
     });
 }
 
-/// Execute multiple sibling projections sharing `input` (`query + key + value` or `gate + up`)
-/// in one quantized activation pass and one worker barrier when `workers > 1`.
-pub(super) fn multiply_single_group_into(
+fn run_single_group_with_acts(
     targets: &mut [(WeightMatrix<'_>, &mut [f32])],
     input: &[f32],
     workers: usize,
     scratch: &mut Vec<f32>,
+    #[cfg(all(windows, feature = "rust-qualification"))] caps: Arm64QuantCaps,
+    #[cfg(all(windows, feature = "rust-qualification"))] act_q8_0: &[Q8_0ActBlock],
+    #[cfg(all(windows, feature = "rust-qualification"))] act_q8_k: &[Q8_KActBlock],
 ) {
-    if targets.is_empty() {
-        return;
-    }
-    if targets.len() == 1 {
-        let (weights, out) = &mut targets[0];
-        multiply_single_into(*weights, input, workers, out);
-        return;
-    }
-
-    #[cfg(all(windows, feature = "rust-qualification"))]
-    let (caps, act_q8_0, act_q8_k) = quantize_batch_activations(
-        targets.iter().map(|(w, _)| *w),
-        input,
-        1,
-        input.len(),
-        workers,
-    );
-
     let level = simd_level();
     if workers <= 1 {
         for (weights, out) in targets.iter_mut() {
             #[cfg(all(windows, feature = "rust-qualification"))]
             if !matches!(weights.data, WeightSlice::Float(_)) {
-                single_rows_quant_arm64(caps, *weights, 0, &act_q8_0, &act_q8_k, out);
+                single_rows_quant_arm64(caps, *weights, 0, act_q8_0, act_q8_k, out);
                 continue;
             }
             dispatch!(level, simd => single_rows_simd(simd, *weights, 0, input, out));
@@ -939,7 +1139,7 @@ pub(super) fn multiply_single_group_into(
     #[cfg(all(windows, feature = "rust-qualification"))]
     let row_align = if targets
         .iter()
-        .any(|(w, _)| matches!(w.data, WeightSlice::RepackedQ4K8(_)))
+        .any(|(w, _)| matches!(w.data, WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)))
     {
         8_usize
     } else {
@@ -976,14 +1176,7 @@ pub(super) fn multiply_single_group_into(
             let dst = &mut slice[lo - chunk_start..hi - chunk_start];
             #[cfg(all(windows, feature = "rust-qualification"))]
             if !matches!(matrices[t_idx].data, WeightSlice::Float(_)) {
-                single_rows_quant_arm64(
-                    caps,
-                    matrices[t_idx],
-                    local_row,
-                    &act_q8_0,
-                    &act_q8_k,
-                    dst,
-                );
+                single_rows_quant_arm64(caps, matrices[t_idx], local_row, act_q8_0, act_q8_k, dst);
                 continue;
             }
             dispatch!(
@@ -998,19 +1191,112 @@ pub(super) fn multiply_single_group_into(
     }
 }
 
+/// Execute multiple sibling projections sharing `input` (`query + key + value` or `gate + up`)
+/// in one quantized activation pass and one worker barrier when `workers > 1`.
+pub(super) fn multiply_single_group_into(
+    targets: &mut [(WeightMatrix<'_>, &mut [f32])],
+    input: &[f32],
+    workers: usize,
+    scratch: &mut Vec<f32>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    if targets.len() == 1 {
+        let (weights, out) = &mut targets[0];
+        multiply_single_into(*weights, input, workers, out);
+        return;
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    if targets
+        .iter()
+        .any(|(w, _)| !matches!(w.data, WeightSlice::Float(_)))
+    {
+        let matrices: [WeightMatrix<'_>; 4] = [
+            targets[0].0,
+            targets[1].0,
+            targets.get(2).map_or(targets[0].0, |t| t.0),
+            targets.get(3).map_or(targets[0].0, |t| t.0),
+        ];
+        let count = targets.len();
+        with_decode_act_buffers(
+            matrices[..count].iter().copied(),
+            input,
+            input.len(),
+            workers,
+            |caps, act_q8_0, act_q8_k| {
+                run_single_group_with_acts(
+                    targets, input, workers, scratch, caps, act_q8_0, act_q8_k,
+                );
+            },
+        );
+        return;
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    run_single_group_with_acts(
+        targets,
+        input,
+        workers,
+        scratch,
+        Arm64QuantCaps::portable(),
+        &[],
+        &[],
+    );
+    #[cfg(not(all(windows, feature = "rust-qualification")))]
+    run_single_group_with_acts(targets, input, workers, scratch);
+}
+
 #[inline(always)]
-fn batch_f32_4rows_quads<S: Simd, const Q: usize>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "K-blocked 4x16 float matmul accumulates in exact left-to-right column order."
+)]
+fn batch_f32_4rows_quads_block<S: Simd, const Q: usize>(
     simd: S,
     rows: [&[f32]; 4],
     quads: &[[f32; 4]],
     num_quads: usize,
     q: usize,
+    k_start: usize,
+    k_end: usize,
     transposed_rows: &mut [f32],
 ) {
     let width = rows[0].len();
     let row_stride = num_quads * 4;
-    let mut acc: [[f32x4<S>; 4]; Q] = std::array::from_fn(|_| [f32x4::splat(simd, 0.0_f32); 4]);
-    for col in 0..width {
+    let mut acc: [[f32x4<S>; 4]; Q] = if k_start == 0 {
+        std::array::from_fn(|_| [f32x4::splat(simd, 0.0_f32); 4])
+    } else {
+        std::array::from_fn(|qi| {
+            std::array::from_fn(|r| {
+                let base = r * row_stride + (q + qi) * 4;
+                f32x4::from_slice(simd, &transposed_rows[base..base + 4])
+            })
+        })
+    };
+
+    let mut col = k_start;
+    while col + 4 <= k_end {
+        let w0: [f32; 4] = f32x4::from_slice(simd, &rows[0][col..col + 4]).into();
+        let w1: [f32; 4] = f32x4::from_slice(simd, &rows[1][col..col + 4]).into();
+        let w2: [f32; 4] = f32x4::from_slice(simd, &rows[2][col..col + 4]).into();
+        let w3: [f32; 4] = f32x4::from_slice(simd, &rows[3][col..col + 4]).into();
+        for lane in 0..4 {
+            let c = col + lane;
+            let act: [f32x4<S>; Q] =
+                std::array::from_fn(|qi| f32x4::from_slice(simd, &quads[(q + qi) * width + c]));
+            let w_lanes = [w0[lane], w1[lane], w2[lane], w3[lane]];
+            for r in 0..4 {
+                let w = f32x4::splat(simd, w_lanes[r]);
+                for qi in 0..Q {
+                    acc[qi][r] += w * act[qi];
+                }
+            }
+        }
+        col += 4;
+    }
+    while col < k_end {
         let act: [f32x4<S>; Q] =
             std::array::from_fn(|qi| f32x4::from_slice(simd, &quads[(q + qi) * width + col]));
         for r in 0..4 {
@@ -1019,7 +1305,9 @@ fn batch_f32_4rows_quads<S: Simd, const Q: usize>(
                 acc[qi][r] += w * act[qi];
             }
         }
+        col += 1;
     }
+
     for r in 0..4 {
         for qi in 0..Q {
             let base = r * row_stride + (q + qi) * 4;
@@ -1028,8 +1316,9 @@ fn batch_f32_4rows_quads<S: Simd, const Q: usize>(
     }
 }
 
-// Compute all `num_quads` quads for a 4-row block, storing each row `r`'s quad `q` at
-// `transposed_rows[r * row_stride + q * 4 .. r * row_stride + q * 4 + 4]`.
+// Compute all `num_quads` quads for a 4-row block using K_BLOCK=64 4x16 tiling while
+// preserving exact left-to-right non-FMA summation order, storing each row `r`'s quad `q`
+// at `transposed_rows[r * row_stride + q * 4 .. r * row_stride + q * 4 + 4]`.
 #[inline(always)]
 fn batch_f32_4rows<S: Simd>(
     simd: S,
@@ -1038,13 +1327,59 @@ fn batch_f32_4rows<S: Simd>(
     num_quads: usize,
     transposed_rows: &mut [f32],
 ) {
-    let mut q = 0;
-    while q + 1 < num_quads {
-        batch_f32_4rows_quads::<S, 2>(simd, rows, quads, num_quads, q, transposed_rows);
-        q += 2;
+    const K_BLOCK: usize = 64;
+    if num_quads == 0 {
+        return;
     }
-    if q < num_quads {
-        batch_f32_4rows_quads::<S, 1>(simd, rows, quads, num_quads, q, transposed_rows);
+    let width = rows[0].len();
+    let row_stride = num_quads * 4;
+    if width == 0 {
+        for r in 0..4 {
+            transposed_rows[r * row_stride..r * row_stride + row_stride].fill(0.0);
+        }
+        return;
+    }
+    for k_start in (0..width).step_by(K_BLOCK) {
+        let k_end = (k_start + K_BLOCK).min(width);
+        let mut q = 0_usize;
+        while q + 3 < num_quads {
+            batch_f32_4rows_quads_block::<S, 4>(
+                simd,
+                rows,
+                quads,
+                num_quads,
+                q,
+                k_start,
+                k_end,
+                transposed_rows,
+            );
+            q += 4;
+        }
+        if q + 1 < num_quads {
+            batch_f32_4rows_quads_block::<S, 2>(
+                simd,
+                rows,
+                quads,
+                num_quads,
+                q,
+                k_start,
+                k_end,
+                transposed_rows,
+            );
+            q += 2;
+        }
+        if q < num_quads {
+            batch_f32_4rows_quads_block::<S, 1>(
+                simd,
+                rows,
+                quads,
+                num_quads,
+                q,
+                k_start,
+                k_end,
+                transposed_rows,
+            );
+        }
     }
 }
 
@@ -1779,15 +2114,7 @@ fn scatter_quads_simd<S: Simd>(
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
-fn quantize_batch_activations<'a>(
-    weights: impl IntoIterator<Item = WeightMatrix<'a>>,
-    raw_input: &[f32],
-    batch: usize,
-    width: usize,
-    workers: usize,
-) -> (Arm64QuantCaps, Vec<Q8_0ActBlock>, Vec<Q8_KActBlock>) {
-    const PARALLEL_QUANT_WORK: usize = 8_192;
-    let caps = Arm64QuantCaps::detect();
+fn activation_needs<'a>(weights: impl IntoIterator<Item = WeightMatrix<'a>>) -> (bool, bool) {
     let mut needs_q8_0 = false;
     let mut needs_q8_k = false;
     for w in weights {
@@ -1799,8 +2126,26 @@ fn quantize_batch_activations<'a>(
             WeightSlice::Float(_) => {}
         }
     }
-    let mut act_q8_0 = Vec::new();
-    let mut act_q8_k = Vec::new();
+    (needs_q8_0, needs_q8_k)
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Quantizes requested Q8_0/Q8_K activations directly into caller-owned reusable buffers."
+)]
+fn quantize_batch_activations_flags(
+    needs_q8_0: bool,
+    needs_q8_k: bool,
+    raw_input: &[f32],
+    batch: usize,
+    width: usize,
+    workers: usize,
+    act_q8_0: &mut Vec<Q8_0ActBlock>,
+    act_q8_k: &mut Vec<Q8_KActBlock>,
+) -> Arm64QuantCaps {
+    const PARALLEL_QUANT_WORK: usize = 8_192;
+    let caps = Arm64QuantCaps::detect();
     let q8_0_blocks = width / 32;
     let q8_k_blocks = width / 256;
     if needs_q8_0 {
@@ -1819,22 +2164,26 @@ fn quantize_batch_activations<'a>(
     {
         let chunk_frames = batch.div_ceil(active_workers);
         let num_tasks = batch.div_ceil(chunk_frames);
-        let q8_0_slots: Vec<std::sync::Mutex<&mut [Q8_0ActBlock]>> = if run_q8_0 {
-            act_q8_0
-                .chunks_mut(chunk_frames * q8_0_blocks)
-                .map(std::sync::Mutex::new)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let q8_k_slots: Vec<std::sync::Mutex<&mut [Q8_KActBlock]>> = if run_q8_k {
-            act_q8_k
-                .chunks_mut(chunk_frames * q8_k_blocks)
-                .map(std::sync::Mutex::new)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut q8_0_slots: [Option<std::sync::Mutex<&mut [Q8_0ActBlock]>>;
+            crate::threads::MAX_WORKERS] = [const { None }; crate::threads::MAX_WORKERS];
+        if run_q8_0 {
+            for (slot, chunk) in q8_0_slots
+                .iter_mut()
+                .zip(act_q8_0[..batch * q8_0_blocks].chunks_mut(chunk_frames * q8_0_blocks))
+            {
+                *slot = Some(std::sync::Mutex::new(chunk));
+            }
+        }
+        let mut q8_k_slots: [Option<std::sync::Mutex<&mut [Q8_KActBlock]>>;
+            crate::threads::MAX_WORKERS] = [const { None }; crate::threads::MAX_WORKERS];
+        if run_q8_k {
+            for (slot, chunk) in q8_k_slots
+                .iter_mut()
+                .zip(act_q8_k[..batch * q8_k_blocks].chunks_mut(chunk_frames * q8_k_blocks))
+            {
+                *slot = Some(std::sync::Mutex::new(chunk));
+            }
+        }
         let mut task_tokens = [0.0_f32; crate::threads::MAX_WORKERS];
         row_workers::run_aligned(
             &mut task_tokens[..num_tasks],
@@ -1844,7 +2193,7 @@ fn quantize_batch_activations<'a>(
                 for task_idx in start_task..(start_task + slice.len()) {
                     let start_t = task_idx * chunk_frames;
                     let count = (batch - start_t).min(chunk_frames);
-                    if let Some(slot) = q8_0_slots.get(task_idx) {
+                    if let Some(slot) = q8_0_slots.get(task_idx).and_then(Option::as_ref) {
                         let mut out_chunk = slot
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1856,7 +2205,7 @@ fn quantize_batch_activations<'a>(
                             );
                         }
                     }
-                    if let Some(slot) = q8_k_slots.get(task_idx) {
+                    if let Some(slot) = q8_k_slots.get(task_idx).and_then(Option::as_ref) {
                         let mut out_chunk = slot
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1889,6 +2238,61 @@ fn quantize_batch_activations<'a>(
             }
         }
     }
+    caps
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn quantize_batch_activations_into<'a>(
+    prepared: &mut PreparedBatch,
+    weights: impl IntoIterator<Item = WeightMatrix<'a>>,
+    raw_input: &[f32],
+    batch: usize,
+    width: usize,
+    workers: usize,
+) -> Arm64QuantCaps {
+    let (need_q8_0, need_q8_k) = activation_needs(weights);
+    let run_q8_0 = need_q8_0 && !prepared.q8_0_ready;
+    let run_q8_k = need_q8_k && !prepared.q8_k_ready;
+    let caps = quantize_batch_activations_flags(
+        run_q8_0,
+        run_q8_k,
+        raw_input,
+        batch,
+        width,
+        workers,
+        &mut prepared.act_q8_0,
+        &mut prepared.act_q8_k,
+    );
+    if need_q8_0 {
+        prepared.q8_0_ready = true;
+    }
+    if need_q8_k {
+        prepared.q8_k_ready = true;
+    }
+    caps
+}
+
+#[cfg(all(test, windows, feature = "rust-qualification"))]
+fn quantize_batch_activations<'a>(
+    weights: impl IntoIterator<Item = WeightMatrix<'a>>,
+    raw_input: &[f32],
+    batch: usize,
+    width: usize,
+    workers: usize,
+) -> (Arm64QuantCaps, Vec<Q8_0ActBlock>, Vec<Q8_KActBlock>) {
+    let (need_q8_0, need_q8_k) = activation_needs(weights);
+    let mut act_q8_0 = Vec::new();
+    let mut act_q8_k = Vec::new();
+    let caps = quantize_batch_activations_flags(
+        need_q8_0,
+        need_q8_k,
+        raw_input,
+        batch,
+        width,
+        workers,
+        &mut act_q8_0,
+        &mut act_q8_k,
+    );
     (caps, act_q8_0, act_q8_k)
 }
 
@@ -1942,6 +2346,77 @@ fn run_batch_rows_quant<A>(
         for (t, dst) in row_out.iter_mut().enumerate() {
             *dst = dot1(w_row, &act[t * blocks..(t + 1) * blocks]);
         }
+    }
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "8-row Q8_0 I8MM GEMM kernel driver handles 8x8/8x4/8x2/8x1 tiles and <8-row tails."
+)]
+fn run_batch_rows_q8_0(
+    caps: Arm64QuantCaps,
+    data: &[u8],
+    start_row: usize,
+    row_bytes: usize,
+    blocks: usize,
+    batch: usize,
+    act: &[Q8_0ActBlock],
+    transposed_slice: &mut [f32],
+) {
+    let mut processed = 0_usize;
+    for chunk in transposed_slice.chunks_exact_mut(8 * batch) {
+        let row_slices = eight_rows(data, start_row + processed, row_bytes);
+        let mut t = 0_usize;
+        while t + 8 <= batch {
+            let acts: [&[Q8_0ActBlock]; 8] =
+                std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+            let tile = quant_kernels::gemm_q8_0_8x8(caps, row_slices, acts);
+            for (r, row_vals) in tile.iter().enumerate() {
+                chunk[r * batch + t..r * batch + t + 8].copy_from_slice(row_vals);
+            }
+            t += 8;
+        }
+        if t + 4 <= batch {
+            let acts: [&[Q8_0ActBlock]; 4] =
+                std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+            let tile = quant_kernels::gemm_q8_0_8x4(caps, row_slices, acts);
+            for (r, row_vals) in tile.iter().enumerate() {
+                chunk[r * batch + t..r * batch + t + 4].copy_from_slice(row_vals);
+            }
+            t += 4;
+        }
+        if t + 2 <= batch {
+            let acts: [&[Q8_0ActBlock]; 2] =
+                std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+            let tile = quant_kernels::gemm_q8_0_8x2(caps, row_slices, acts);
+            for (r, row_vals) in tile.iter().enumerate() {
+                chunk[r * batch + t..r * batch + t + 2].copy_from_slice(row_vals);
+            }
+            t += 2;
+        }
+        if t < batch {
+            let col =
+                quant_kernels::dot_q8_0_8rows(caps, row_slices, &act[t * blocks..(t + 1) * blocks]);
+            for (r, &v) in col.iter().enumerate() {
+                chunk[r * batch + t] = v;
+            }
+        }
+        processed += 8;
+    }
+    if processed * batch < transposed_slice.len() {
+        run_batch_rows_quant(
+            data,
+            start_row + processed,
+            row_bytes,
+            blocks,
+            batch,
+            act,
+            &mut transposed_slice[processed * batch..],
+            |r, a, b| quant_kernels::gemm_q8_0_4x2(caps, r, a, b),
+            |r, a| quant_kernels::dot_q8_0_4rows(caps, r, a),
+            |r, a| quant_kernels::dot_q8_0_row(caps, r, a),
+        );
     }
 }
 
@@ -2005,7 +2480,8 @@ fn batch_rows_quant_arm64(
     match weights.data {
         WeightSlice::Q8(data) => {
             let blocks = width / 32;
-            run_batch_rows_quant(
+            run_batch_rows_q8_0(
+                caps,
                 data,
                 start_row,
                 blocks * 34,
@@ -2013,9 +2489,6 @@ fn batch_rows_quant_arm64(
                 batch,
                 act_q8_0,
                 transposed_slice,
-                |r, a, b| quant_kernels::gemm_q8_0_4x2(caps, r, a, b),
-                |r, a| quant_kernels::dot_q8_0_4rows(caps, r, a),
-                |r, a| quant_kernels::dot_q8_0_row(caps, r, a),
             );
         }
         WeightSlice::Q4K(data) => {
@@ -2121,7 +2594,7 @@ fn scatter_rows_to_batch(
 /// using `4x8` / `4x4` SIMD tiles (or ARM64 `I8MM`/`SDOT` kernels) and `row_workers`.
 pub(super) fn multiply_batch_prepared_into(
     weights: WeightMatrix<'_>,
-    prepared: &PreparedBatch,
+    prepared: &mut PreparedBatch,
     raw_input: &[f32],
     workers: usize,
     transposed_scratch: &mut Vec<f32>,
@@ -2129,7 +2602,6 @@ pub(super) fn multiply_batch_prepared_into(
 ) {
     let output = weights.output;
     let batch = prepared.batch;
-    let _ = raw_input;
     if batch == 0 || output == 0 {
         return;
     }
@@ -2139,14 +2611,23 @@ pub(super) fn multiply_batch_prepared_into(
             multiply_single_into(weights, raw_input, workers, out);
             return;
         }
-        let (caps, act_q8_0, act_q8_k) =
-            quantize_batch_activations([weights], raw_input, batch, weights.input, workers);
+        let caps = quantize_batch_activations_into(
+            prepared,
+            [weights],
+            raw_input,
+            batch,
+            weights.input,
+            workers,
+        );
         let needed = output * batch;
         if transposed_scratch.len() < needed {
             transposed_scratch.resize(needed, 0.0);
         }
         let transposed = &mut transposed_scratch[..needed];
-        let row_align = if matches!(weights.data, WeightSlice::RepackedQ4K8(_)) {
+        let row_align = if matches!(
+            weights.data,
+            WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)
+        ) {
             8
         } else {
             4
@@ -2158,7 +2639,13 @@ pub(super) fn multiply_batch_prepared_into(
             &|elem_off, slice| {
                 let start_row = elem_off / batch;
                 batch_rows_quant_arm64(
-                    caps, weights, start_row, batch, &act_q8_0, &act_q8_k, slice,
+                    caps,
+                    weights,
+                    start_row,
+                    batch,
+                    &prepared.act_q8_0,
+                    &prepared.act_q8_k,
+                    slice,
                 );
             },
         );
@@ -2166,6 +2653,7 @@ pub(super) fn multiply_batch_prepared_into(
         return;
     }
 
+    prepared.ensure_quads(raw_input, workers);
     let num_quads = prepared.num_quads;
     let level = simd_level();
     if num_quads > 0 && output > 0 {
@@ -2186,11 +2674,107 @@ pub(super) fn multiply_batch_prepared_into(
     }
 }
 
+/// Bit-exact batched matrix multiplication writing directly in `[output, batch]` channel-major
+/// layout, avoiding batch transpose scatter for callers that consume channel-major tensors.
+pub(super) fn multiply_batch_channel_major_into(
+    weights: WeightMatrix<'_>,
+    prepared: &mut PreparedBatch,
+    raw_input: &[f32],
+    workers: usize,
+    transposed_scratch: &mut Vec<f32>,
+    out: &mut [f32],
+) {
+    let output = weights.output;
+    let batch = prepared.batch;
+    if batch == 0 || output == 0 {
+        return;
+    }
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    if !matches!(weights.data, WeightSlice::Float(_)) {
+        if batch == 1 {
+            multiply_single_into(weights, raw_input, workers, out);
+            return;
+        }
+        let caps = quantize_batch_activations_into(
+            prepared,
+            [weights],
+            raw_input,
+            batch,
+            weights.input,
+            workers,
+        );
+        let row_align = if matches!(
+            weights.data,
+            WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)
+        ) {
+            8
+        } else {
+            4
+        };
+        row_workers::run_aligned(out, workers, row_align * batch, &|elem_off, slice| {
+            let start_row = elem_off / batch;
+            batch_rows_quant_arm64(
+                caps,
+                weights,
+                start_row,
+                batch,
+                &prepared.act_q8_0,
+                &prepared.act_q8_k,
+                slice,
+            );
+        });
+        return;
+    }
+
+    prepared.ensure_quads(raw_input, workers);
+    let num_quads = prepared.num_quads;
+    let level = simd_level();
+    if num_quads > 0 && output > 0 {
+        let row_stride = num_quads * 4;
+        if row_stride == batch {
+            row_workers::run_aligned(out, workers, 4 * batch, &|elem_off, slice| {
+                let start_row = elem_off / batch;
+                dispatch!(
+                    level,
+                    simd => batch_rows_simd(simd, weights, start_row, &prepared.quads, num_quads, slice)
+                );
+            });
+            return;
+        }
+        let needed = output * row_stride;
+        if transposed_scratch.len() < needed {
+            transposed_scratch.resize(needed, 0.0);
+        }
+        let transposed = &mut transposed_scratch[..needed];
+        row_workers::run_aligned(transposed, workers, 4 * row_stride, &|elem_off, slice| {
+            let start_row = elem_off / row_stride;
+            dispatch!(
+                level,
+                simd => batch_rows_simd(simd, weights, start_row, &prepared.quads, num_quads, slice)
+            );
+        });
+        if workers > 1 && out.len() >= 8_192 {
+            row_workers::run_aligned(out, workers, batch, &|elem_off, dst_slice| {
+                let first_row = elem_off / batch;
+                for (local_r, dst_row) in dst_slice.chunks_exact_mut(batch).enumerate() {
+                    let src_off = (first_row + local_r) * row_stride;
+                    dst_row.copy_from_slice(&transposed[src_off..src_off + batch]);
+                }
+            });
+        } else {
+            for (r, dst_row) in out.chunks_exact_mut(batch).enumerate() {
+                let src_off = r * row_stride;
+                dst_row.copy_from_slice(&transposed[src_off..src_off + batch]);
+            }
+        }
+    }
+}
+
 /// Compute batched sibling projections sharing `prepared` / `raw_input` (`query + key + value`
 /// or `gate + up`) in one quantized activation pass and unified worker pass.
 pub(super) fn multiply_batch_group_into(
     targets: &mut [(WeightMatrix<'_>, &mut [f32])],
-    prepared: &PreparedBatch,
+    prepared: &mut PreparedBatch,
     raw_input: &[f32],
     workers: usize,
     transposed_scratch: &mut Vec<f32>,
@@ -2232,7 +2816,8 @@ pub(super) fn multiply_batch_group_into(
                 targets.get(2).map_or(targets[0].0, |t| t.0),
                 targets.get(3).map_or(targets[0].0, |t| t.0),
             ];
-            let (caps, act_q8_0, act_q8_k) = quantize_batch_activations(
+            let caps = quantize_batch_activations_into(
+                prepared,
                 matrices[..count].iter().copied(),
                 raw_input,
                 batch,
@@ -2241,7 +2826,7 @@ pub(super) fn multiply_batch_group_into(
             );
             let row_align = if matrices[..count]
                 .iter()
-                .any(|w| matches!(w.data, WeightSlice::RepackedQ4K8(_)))
+                .any(|w| matches!(w.data, WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)))
             {
                 8_usize
             } else {
@@ -2280,8 +2865,8 @@ pub(super) fn multiply_batch_group_into(
                             *w,
                             lo - t_start,
                             batch,
-                            &act_q8_0,
-                            &act_q8_k,
+                            &prepared.act_q8_0,
+                            &prepared.act_q8_k,
                             &mut slice[slice_lo..slice_hi],
                         );
                     }
@@ -3759,12 +4344,12 @@ mod tests {
                     let mut worker1_batch_bits: Option<Vec<u32>> = None;
 
                     for workers in [1_usize, 3, 8] {
-                        let prepared = PreparedBatch::new(&raw_input, batch, input);
+                        let mut prepared = PreparedBatch::new(&raw_input, batch, input);
                         let mut batch_out = vec![0.0_f32; batch * output];
                         let mut scratch = Vec::new();
                         multiply_batch_prepared_into(
                             weights,
-                            &prepared,
+                            &mut prepared,
                             &raw_input,
                             workers,
                             &mut scratch,
@@ -3888,20 +4473,20 @@ mod tests {
         let raw_in: Vec<f32> = (0..batch * input)
             .map(|i| (f32::from(u16::try_from(i % 29).unwrap_or(0)) - 14.0) * 0.03125)
             .collect();
-        let prepared = PreparedBatch::new(&raw_in, batch, input);
+        let mut prepared = PreparedBatch::new(&raw_in, batch, input);
 
         let mut exp_a = vec![0.0_f32; batch * out_a];
         let mut exp_b = vec![0.0_f32; batch * out_b];
         let mut scratch = Vec::new();
-        multiply_batch_prepared_into(wm4, &prepared, &raw_in, 1, &mut scratch, &mut exp_a);
-        multiply_batch_prepared_into(wm6, &prepared, &raw_in, 1, &mut scratch, &mut exp_b);
+        multiply_batch_prepared_into(wm4, &mut prepared, &raw_in, 1, &mut scratch, &mut exp_a);
+        multiply_batch_prepared_into(wm6, &mut prepared, &raw_in, 1, &mut scratch, &mut exp_b);
 
         for workers in [1_usize, 4] {
             let mut got_a = vec![0.0_f32; batch * out_a];
             let mut got_b = vec![0.0_f32; batch * out_b];
             multiply_batch_group_into(
                 &mut [(wm4, &mut got_a), (wm6, &mut got_b)],
-                &prepared,
+                &mut prepared,
                 &raw_in,
                 workers,
                 &mut scratch,
@@ -4115,7 +4700,7 @@ mod tests {
                         }
                     })
                     .collect();
-                let prepared = PreparedBatch::new(&raw_in, batch, input);
+                let mut prepared = PreparedBatch::new(&raw_in, batch, input);
                 for (name, wm) in [("q4_k", wm4), ("q6_k", wm6)] {
                     let mut exp_batch = Vec::with_capacity(batch * out_rows);
                     for t in 0..batch {
@@ -4143,7 +4728,7 @@ mod tests {
                         let mut scratch = Vec::new();
                         multiply_batch_prepared_into(
                             wm,
-                            &prepared,
+                            &mut prepared,
                             &raw_in,
                             workers,
                             &mut scratch,
@@ -4303,7 +4888,7 @@ mod tests {
                         (f32::from(u16::try_from((i * 11) % 59).unwrap_or(0)) - 29.0) * 0.03125
                     })
                     .collect();
-                let prepared = PreparedBatch::new(&raw_in, batch, input);
+                let mut prepared = PreparedBatch::new(&raw_in, batch, input);
 
                 let mut exp_single = Vec::with_capacity(batch * out_rows);
                 let mut single_buf = vec![0.0_f32; out_rows];
@@ -4322,7 +4907,7 @@ mod tests {
                 let mut scratch = Vec::new();
                 multiply_batch_prepared_into(
                     wm_q8,
-                    &prepared,
+                    &mut prepared,
                     &raw_in,
                     1,
                     &mut scratch,
@@ -4354,7 +4939,7 @@ mod tests {
                     let mut batch_repack = vec![f32::NAN; batch * out_rows];
                     multiply_batch_prepared_into(
                         wm_repack,
-                        &prepared,
+                        &mut prepared,
                         &raw_in,
                         workers,
                         &mut scratch,
@@ -4370,7 +4955,7 @@ mod tests {
                     let mut grp_q8 = vec![0.0_f32; batch * out_rows];
                     multiply_batch_group_into(
                         &mut [(wm_q8, &mut grp_q8), (wm_repack, &mut grp_repack)],
-                        &prepared,
+                        &mut prepared,
                         &raw_in,
                         workers,
                         &mut scratch,
@@ -4575,5 +5160,222 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn q8_8x_gemm_kblocked_float_channel_major_and_lazy_prepared_batch_bit_exact() {
+        // 1) Q8_0 8-row/8x8/8x4/8x2/1x and lazy PreparedBatch zero-quads check.
+        for input in [32_usize, 96] {
+            let blocks = input / 32;
+            for output in [1_usize, 5, 8, 13, 19] {
+                let mut q8_data = Vec::with_capacity(output * blocks * 34);
+                for r in 0..output {
+                    for b in 0..blocks {
+                        let scale = if (r + b) % 5 == 0 {
+                            -0.025_f32
+                        } else {
+                            0.015_f32 * f32::from(u8::try_from((r + b) % 11 + 1).unwrap_or(1))
+                        };
+                        let bits = super::checked_float_to_half(scale).unwrap_or(0);
+                        q8_data.extend_from_slice(&bits.to_le_bytes());
+                        for k in 0..32 {
+                            let q = i8::try_from(
+                                isize::try_from((r * 19 + b * 11 + k * 7) % 255).unwrap_or(0) - 127,
+                            )
+                            .unwrap_or(0);
+                            q8_data.push(q.cast_unsigned());
+                        }
+                    }
+                }
+                let wm = WeightMatrix {
+                    input,
+                    output,
+                    data: WeightSlice::Q8(&q8_data),
+                };
+                for batch in [1_usize, 2, 3, 5, 8, 9, 13, 17] {
+                    let raw_in: Vec<f32> = (0..batch * input)
+                        .map(|i| {
+                            if i % 23 == 0 {
+                                -0.0
+                            } else {
+                                (f32::from(u16::try_from((i * 13) % 59).unwrap_or(0)) - 29.0)
+                                    * 0.03125
+                            }
+                        })
+                        .collect();
+                    let mut exp_single = Vec::with_capacity(batch * output);
+                    let mut row_buf = vec![0.0_f32; output];
+                    for t in 0..batch {
+                        #[cfg(all(windows, feature = "rust-qualification"))]
+                        {
+                            row_buf =
+                                scalar_q8_x_q8_reference(wm, &raw_in[t * input..(t + 1) * input]);
+                        }
+                        #[cfg(not(all(windows, feature = "rust-qualification")))]
+                        {
+                            row_buf =
+                                scalar_multiply_reference(wm, &raw_in[t * input..(t + 1) * input]);
+                        }
+                        exp_single.extend_from_slice(&row_buf);
+                    }
+                    let exp_bits: Vec<u32> = exp_single.iter().map(|v| v.to_bits()).collect();
+                    let mut exp_ch_bits = vec![0_u32; output * batch];
+                    for t in 0..batch {
+                        for r in 0..output {
+                            exp_ch_bits[r * batch + t] = exp_bits[t * output + r];
+                        }
+                    }
+
+                    let mut prepared = PreparedBatch::default();
+                    for workers in [1_usize, 3] {
+                        prepared.prepare_meta(batch, input);
+                        assert_eq!(prepared.quads_capacity(), 0);
+                        let mut scratch = Vec::new();
+                        let mut batch_out = vec![f32::NAN; batch * output];
+                        multiply_batch_prepared_into(
+                            wm,
+                            &mut prepared,
+                            &raw_in,
+                            workers,
+                            &mut scratch,
+                            &mut batch_out,
+                        );
+                        #[cfg(all(windows, feature = "rust-qualification"))]
+                        assert_eq!(
+                            prepared.quads_capacity(),
+                            0,
+                            "Q8 batch path must not allocate float quads"
+                        );
+                        assert_eq!(
+                            batch_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            exp_bits,
+                            "Q8 batch mismatch out={output} batch={batch} input={input} workers={workers}"
+                        );
+
+                        prepared.prepare_meta(batch, input);
+                        let mut ch_out = vec![f32::NAN; output * batch];
+                        super::multiply_batch_channel_major_into(
+                            wm,
+                            &mut prepared,
+                            &raw_in,
+                            workers,
+                            &mut scratch,
+                            &mut ch_out,
+                        );
+                        #[cfg(all(windows, feature = "rust-qualification"))]
+                        assert_eq!(prepared.quads_capacity(), 0);
+                        assert_eq!(
+                            ch_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            exp_ch_bits,
+                            "Q8 channel-major mismatch out={output} batch={batch} workers={workers}"
+                        );
+
+                        let mut grp_a = vec![f32::NAN; batch * output];
+                        let mut grp_b = vec![f32::NAN; batch * output];
+                        prepared.prepare_meta(batch, input);
+                        multiply_batch_group_into(
+                            &mut [(wm, &mut grp_a), (wm, &mut grp_b)],
+                            &mut prepared,
+                            &raw_in,
+                            workers,
+                            &mut scratch,
+                        );
+                        #[cfg(all(windows, feature = "rust-qualification"))]
+                        assert_eq!(prepared.quads_capacity(), 0);
+                        assert_eq!(
+                            grp_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            exp_bits
+                        );
+                        assert_eq!(
+                            grp_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            exp_bits
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2) K_BLOCK=64 4x16 Float GEMM, lazy ensure_quads, and Float channel-major layout.
+        for input in [5_usize, 64, 65, 131] {
+            for output in [3_usize, 9] {
+                let weights_f32: Vec<f32> = (0..output * input)
+                    .map(|i| {
+                        if i % 19 == 0 {
+                            -0.0
+                        } else {
+                            (f32::from(u16::try_from((i * 17) % 43).unwrap_or(0)) - 21.0) * 0.03125
+                        }
+                    })
+                    .collect();
+                let wm = WeightMatrix {
+                    input,
+                    output,
+                    data: WeightSlice::Float(&weights_f32),
+                };
+                for batch in [1_usize, 4, 8, 17, 21] {
+                    let raw_in: Vec<f32> = (0..batch * input)
+                        .map(|i| {
+                            if i % 11 == 0 {
+                                -0.0
+                            } else {
+                                (f32::from(u16::try_from((i * 23) % 53).unwrap_or(0)) - 26.0)
+                                    * 0.0625
+                            }
+                        })
+                        .collect();
+                    let mut exp = Vec::with_capacity(batch * output);
+                    for t in 0..batch {
+                        exp.extend(scalar_multiply_reference(
+                            wm,
+                            &raw_in[t * input..(t + 1) * input],
+                        ));
+                    }
+                    let exp_bits: Vec<u32> = exp.iter().map(|v| v.to_bits()).collect();
+                    let mut exp_ch_bits = vec![0_u32; output * batch];
+                    for t in 0..batch {
+                        for r in 0..output {
+                            exp_ch_bits[r * batch + t] = exp_bits[t * output + r];
+                        }
+                    }
+
+                    for workers in [1_usize, 3] {
+                        let mut prepared = PreparedBatch::default();
+                        prepared.prepare_meta(batch, input);
+                        assert_eq!(prepared.quads_capacity(), 0);
+                        let mut scratch = vec![f32::NAN; output * batch.div_ceil(4) * 4 + 8];
+                        let mut batch_out = vec![f32::NAN; batch * output];
+                        multiply_batch_prepared_into(
+                            wm,
+                            &mut prepared,
+                            &raw_in,
+                            workers,
+                            &mut scratch,
+                            &mut batch_out,
+                        );
+                        assert!(prepared.quads_capacity() >= batch.div_ceil(4) * input);
+                        assert_eq!(
+                            batch_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            exp_bits,
+                            "Float K-blocked mismatch in={input} out={output} batch={batch} workers={workers}"
+                        );
+
+                        let mut ch_out = vec![f32::NAN; output * batch];
+                        super::multiply_batch_channel_major_into(
+                            wm,
+                            &mut prepared,
+                            &raw_in,
+                            workers,
+                            &mut scratch,
+                            &mut ch_out,
+                        );
+                        assert_eq!(
+                            ch_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            exp_ch_bits,
+                            "Float channel-major mismatch in={input} out={output} batch={batch} workers={workers}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
