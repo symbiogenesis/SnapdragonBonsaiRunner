@@ -318,6 +318,15 @@ Qwen reference with MTP tensors does not establish an admitted Swift MTP path.
 Adaptive short draft lengths may reduce wasted verification, but acceptance
 alone cannot establish benefit without full drafting/verify/recovery cost.
 
+Beyond DFlash2, [DSpine](research-register.md#speculative-decoding-kv-free-context-and-confirmed-low-roi-controls)
+(`arXiv:2609.36173`, Apache-2.0 [`tencent/Qwen3.8-27B-DSpine-b16`](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16))
+addresses parallel block-16 stuttering via adjacent causal feature injection, conditional on a
+compact ternary/Swift-compatible drafter artifact; compact native `Qwen3.8-27B` `draft-mtp`
+extraction and [Test-Time Speculation](research-register.md#speculative-decoding-kv-free-context-and-confirmed-low-roi-controls)
+(`arXiv:2605.09329`) remain conditional under `F1`. For frozen VLMs without auxiliary draft weights,
+[Architectural Sampling](research-register.md#decoding-samplers-and-test-time-scaling) (`arXiv:2610.01687`)
+trades decoder-block reuse schedules for parallel diversity behind a separate profile and rollback gate.
+
 Existing algorithm source controls (`#19`–`#20`, `#22`, `#30`–`#34`, `#36` in the
 [screening ledger](research-register.md#august-to-november-2026-screening-ledger)) retain
 their compiled CI, actual-model, full-state restoration and X1/X2 device benefit gates.
@@ -378,6 +387,10 @@ accounts for execution and indexing costs.
 [T5](research-register.md#t5-chunking-recurrence-and-recovering-rejected-tokens) derives the finite
 Neumann expansion and explains why spectral radius zero cannot bound low-order error or
 intermediate growth. Check signed Gram entries/ranges before applying approximation arguments.
+By [T10](research-register.md#t10-recurrent-quantization-error-depends-on-the-trajectory) and
+[Lost in Rounding](https://arxiv.org/abs/2611.12127) (**paper**, Nov 2026), any future 16-bit
+(`bf16`/`fp16`) GDN recurrent checkpoint or accelerator path must use Stochastic Rounding (SR)
+rather than Round-to-Nearest (RTN) to avoid rounding-bias reasoning loops and truncation drops.
 
 ## Validation and promotion
 

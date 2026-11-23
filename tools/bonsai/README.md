@@ -53,10 +53,17 @@ for capture identities, basis, bounds and the separate experimental native path.
 `adapter-edit` edits the existing approved adapter's floating-point weights,
 retaining all 129 sites, the rank-one B directions, embedding and alpha. A request
 supplies `schemaVersion: 1`, `operation: "inspect"` or `"create"`, exact-source
-`adapterPath`, and a rational `keepNumerator` / `keepDenominator` in `(0,1]` with
-denominator at most 1024. Per linear site it retains the largest absolute A
-coefficients, rounding the keep count upward and resolving ties by original
-index. Other coefficients become exact zeros. `inspect` reports per-site/family
+`adapterPath`, a rational `keepNumerator` / `keepDenominator` in `(0,1]` with
+denominator at most 1024, and optional in-band/gain filters (`layerMin`/`layerMax`
+in `0..64`, `familyScales` across `"ffn_down"`/`"attn_output"`/`"ssm_out"` in
+`0.0..=100.0`, and per-layer `layerGains` in `0.0..=100.0`; unfiltered runs retain
+`algorithm: "linear-a-magnitude-prune-stable-index-v1"`, while filtered/scaled
+runs emit `"linear-a-band-magnitude-edit-v1"` and allow `1/1` when weights
+change). Out-of-band/zero-gain linear sites zero their A factors while retaining
+all 129 tensor descriptors; active sites retain the largest absolute A coefficients,
+rounding the keep count upward, resolving ties by original index, and scaling
+nonzero kept entries by `familyScale * layerGain`. Other coefficients become exact
+zeros. `inspect` reports `activeLinearSites`, `zeroedLinearSites`, per-site/family
 weight-space error and predicted sparse payloads without writing. `create`
 requires a new external `outputPath` and atomically publishes a separate GGUF;
 it cannot replace or install the approved adapter. Zeroing F32 payloads leaves
@@ -94,8 +101,8 @@ via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
   into one canonically ordered, alpha-renormalized, verified GGUF at fresh
   external `outputPath` for resumable chunked `DR-E1` extraction.
 - `"edit-adapter"`: applies pure-Rust algebraic direct weight edits (`editConfig`:
-  `targetMaxRank`, `globalGain`, `familyScales`, `layerMin`/`layerMax`,
-  `depthGainStart`/`depthGainEnd`, `maxSiteFrobeniusNorm`,
+  `targetMaxRank`, `perSiteRanks`, `globalGain`, `familyScales`, `layerMin`/`layerMax`,
+  `depthGainStart`/`depthGainEnd`, `layerGains`, `maxSiteFrobeniusNorm`,
   `orthogonalizeAgainstRankOnePath`, `exportDtype`) to an existing multi-rank
   GGUF (`adapterPath`) and publishes a verified GGUF at fresh `outputPath`.
 - `"generate-test-adapter"`: builds a deterministic offline synthetic multi-rank

@@ -81,6 +81,22 @@ anisotropy corrections and precision changes to recurrent state are excluded
 until separately justified. An unbiased inner-product estimator alone does not
 establish unbiased softmax, negligible quality loss or faster inference.
 
+For future hybrid-architecture capacity extensions beyond uniform K4/V4:
+
+- **[GateSight](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2610.14754`, tested on `Qwen3.8-27B`):** uses existing GDN write gates, decay and write
+  magnitudes for query-agnostic KV eviction, compounding multiplicatively with `rsq4` if trained
+  per-head scorers and rollback/retrieval gates pass.
+- **[Who Asks, Who Answers](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2611.01909`):** identifies full-attention heads performing final retrieval lookup after
+  GDN query formation, motivating retrieval-head protection under `U3` eviction or `rsq4k3v`.
+- **[Lost in Rounding](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2611.12127`):** prohibits Round-to-Nearest (RTN) `bf16`/`fp16` GDN state compression due
+  to overthinking loops; any future 16-bit GDN state lane must use Stochastic Rounding (SR).
+- **[iS-KV](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2610.02815`) and [AbridgeKV](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2610.20641`):** separate long-CoT online-SVD and trained pause-token KV approximations.
+
 ## Fitted-value scale candidate
 
 The Prism 0.1.32 runtime (incorporating `0.1.31`) includes explicit `rsq4vf` (`Rotated4FittedValues`) for

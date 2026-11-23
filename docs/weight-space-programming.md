@@ -85,8 +85,17 @@ changes neither storage nor executed operations. An executable sparse factor
 representation is needed to turn zeroed weights into a storage/work reduction.
 
 `bonsai-tools adapter-edit` inspects or creates a candidate from the exact
-approved adapter. It retains the largest absolute A coefficients independently
-at each of the 128 linear sites, with deterministic index ordering for ties.
+approved adapter. By default (`algorithm: "linear-a-magnitude-prune-stable-index-v1"`),
+it retains the largest absolute A coefficients independently at each of the 128
+linear sites, with deterministic index ordering for ties. Optional
+`layerMin`/`layerMax` (`0..64`), `familyScales` (`"ffn_down"`, `"attn_output"`,
+`"ssm_out"`) and per-layer `layerGains` (`0..64`) enable pure-Rust in-band or
+family-masked sweeps (`algorithm: "linear-a-band-magnitude-edit-v1"`, admitting
+`keepNumerator == keepDenominator` when a filter/gain modifies weights) for
+auditing forensic abliteration findings
+([`Qwen-3.8-27b-abliterlitics`](research-register.md#qwen38-27b-adapters-surgical-abliteration-weight-editing-and-low-bit-recovery),
+`Heretic`, iterative LoRA self-distillation) that broad uniform-layer refusal
+subtraction can harm Qwen3.8-27B coding and reasoning self-correction loops.
 This minimizes coefficient L2 error for the chosen number of retained entries;
 it does not minimize answer loss. All B factors, the embedding A factor, alpha,
 metadata, target inventory and surviving coefficient bits remain unchanged.
@@ -485,8 +494,12 @@ pending compiled CI checks), `tools/bonsai/src/` enforces:
   finite-checked scaled `f64` L2 norms/distances (`scaled_l2_norm`, `scaled_l2_distance`),
   clamped `Option<f64>` cosine similarity (`cosine_similarity`), normalized energy entropy
   (`normalized_energy_entropy`), coordinate support coverage (`coordinate_coverage`),
-  relative L2 error (`relative_l2_error`, `worst_row_relative_l2_error`) and bounded
-  streaming aggregation (`RowMetricsAccumulator`, `CalibrationRowSummary`).
+  relative L2 error (`relative_l2_error`, `worst_row_relative_l2_error`), bounded
+  streaming aggregation (`RowMetricsAccumulator`, `CalibrationRowSummary`),
+  exact Softmax-Fisher / MCKP allocation (`per_site_fisher_weighted_kl_metrics`,
+  `solve_multiple_choice_knapsack_maximize`), `TempQuant` temperature/nucleus fitters
+  (`fit_tempquant_temperature`, `fit_tempquant_top_p`), and `DeepConf` trace confidence
+  tracking/voting (`DeepConfWindowTracker`, `deepconf_warmup_threshold`, `deepconf_weighted_vote`).
 - `ffn_surrogate.rs`, `ffn_surrogate/structured.rs` and `weight_patch.rs` compute
   `fitInputSha256` over explicit path-free `FitInputHashView` projections (excluding local
   `output_path`), attach `RowMetricsAccumulator` replay summaries, and bound exported
@@ -500,6 +513,16 @@ pending compiled CI checks), `tools/bonsai/src/` enforces:
 bonsai-tools weight-patch --request C:\Research\direction-request.json
 bonsai-tools weight-patch --request C:\Research\fit-request.json
 ```
+
+Related 2026 editing/steering primitives tracked in the
+[research register](research-register.md#qwen38-27b-adapters-surgical-abliteration-weight-editing-and-low-bit-recovery)
+include closed-form capability-constrained neuron scaling (`CANS`, `arXiv:2610.35530`),
+depth-weighted multi-layer steering via Attention Residuals (`arXiv:2611.21655`), VLM-safe RL
+direction isolation (`Selective-RL`, `arXiv:2610.08659`, protecting `mmproj` visual reasoning),
+cosine-similarity layer selection (`LS-LoRA`, `arXiv:2610.11620`), null-space edit projection
+(`AlphaEdit`, `arXiv:2410.02355`/`2606.26783`), and off-policy model merging (`arXiv:2610.05872`);
+`lora-diff-audit` `edit-adapter` also supports sparse per-layer `layerGains` scaling alongside
+family and depth tapers.
 
 Start with a reproducible complete-answer failure and freeze its ordinary
 controls before collecting activations. Compare a fitted patch with a constant

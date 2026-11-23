@@ -73,7 +73,11 @@ Notes:
   across all 64 Swift layers (`adapter_affects_any`).
 - Full-attention `attn_q`/`attn_k`/`attn_v` run on CPU/attention paths and
   enable steering what full-attention heads attend to, at only `+0.90625 MiB/rank`
-  above `residual-writers`.
+  above `residual-writers`. Meanwhile [Who Asks, Who Answers](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2611.01909`) shows hybrid GDN blocks construct retrieval queries for downstream softmax
+  attention, elevating the value of resolving `P1` to unlock selective `ssm_out` LoRA sites;
+  for multimodal `mmproj` runs, apply [Selective-RL](research-register.md#qwen38-27b-adapters-surgical-abliteration-weight-editing-and-low-bit-recovery)
+  (`arXiv:2610.08659`) visual-preservation checks across `DR-G2`/`DR-W1`.
 
 ## Zero-retraining composition strategy
 
@@ -151,13 +155,16 @@ GPU/gradient retraining). Ordered levers mapped to diagnosed `DR-G2` failures
 1. **Algebraic factor & spectral edits (zero activation capture)**:
    - Adjust rank (`r = 16 -> 32`), Gavish–Donoho shrinkage / `minSpikeRatio` /
      unshrunk-spike retention, per-family multipliers (`ffn_down` vs
-     `attn_q`/`attn_k`/`attn_v`/`attn_output`), and layer-depth masks/tapers
-     (for example, attenuating noisy early layers while emphasizing high-SNR
-     late reasoning layers such as `blk.63.ffn_down` `14.92x` and
-     `blk.63.attn_output` `11.61x`).
+     `attn_q`/`attn_k`/`attn_v`/`attn_output`), sparse per-layer `layerGains`,
+     and layer-depth masks/tapers (for example, attenuating noisy early layers
+     while emphasizing high-SNR late reasoning layers such as `blk.63.ffn_down`
+     `14.92x` and `blk.63.attn_output` `11.61x`, or applying cosine-similarity
+     layer selection per `LS-LoRA`).
    - Surgically drop or re-weight singular modes `(u_k, v_k)`, cap per-site
      norms, and prune small coefficients inside `(A, B)` (generalizing
-     `bonsai-tools adapter-edit` to multi-rank GGUF).
+     `bonsai-tools adapter-edit` to multi-rank GGUF); evaluate `CANS` closed-form
+     neuron scaling, `Attention Residuals` depth steering, and `AlphaEdit`
+     null-space projection where uniform scaling conflicts with preserved skills.
    - Orthogonalize DaisyRose factors against pinned Orca rank-1 factors at
      overlapping `ffn_down`/`attn_*` sites (projecting DaisyRose `B` or `A`
      columns orthogonal to Orca so stacked adapters do not cancel or conflict at
@@ -204,6 +211,28 @@ with `dr-g2-score`. If bounded direct weight editing still fails `DR-G2` on
 untouched holdouts, record the losing/no-go outcome honestly under
 [evidence retention](validation.md#evidence-retention) and keep
 `config/daisyrose-lora.lock.json` unpinned (`Ok(None)`).
+
+### Alternative donor classes and low-bit residual adapters
+
+Beyond `DaisyRose-27B` BF16 extraction, three related donor/recovery routes tracked in the
+[research register](research-register.md#qwen38-27b-adapters-surgical-abliteration-weight-editing-and-low-bit-recovery)
+match `MultiRankAdapter` without retraining Swift's ternary base:
+
+- **Native Thinking-OFF RL LoRAs (`harness-hub`):** Prebuilt rank-32 LoRAs
+  (`harness-hub/Qwen3.8-27B-pi-adapted`, `opencode-adapted`, `hermes-adapted`, merged rank-96
+  `Qwen3.8-27B-super-adapter`) carry native clean LoRA deltas without BF16 1-ULP bulk noise,
+  providing an alternative `npu-friendly` donor source for low-token Thinking-OFF improvements
+  subject to revision/license audit and `DR-G2`.
+- **Creative-prose and frontier reasoning distillations:** Community distill donors such as
+  `barozp/Qwen3.8-27B-Opus-Distill` and `r0b0tlab/qwen3.8-max-distillation-50k` target
+  creative writing and reasoning more directly than pure code-agent RL runs, subject to license
+  review, extraction/denoising and `DR-G2` held-out scoring.
+- **Quantization-residual LoRAs (`SVDQuant`, `Recover-LoRA`, `OnQ` / `OnlineQAT`):** Low-rank
+  FP16 residual branches trained on student rollouts can target ternary approximation loss rather
+  than RL task deltas. **Critical safeguard:** never extract `W_Qwen3.8 - dequant(W_Swift)`
+  naively onto `Swift-Bonsai-2`, because that difference partially cancels Swift's merged
+  anti-overthinking edit; fit residual adapters against Swift's own rollouts (`OnQ`/`Recover-LoRA`)
+  or project updates orthogonal to Swift's anti-overthinking subspace.
 
 ## GGUF multi-rank adapter contract
 

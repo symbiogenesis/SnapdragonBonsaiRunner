@@ -69,7 +69,11 @@ stages; truncated revisions neither replace complete drafts nor become finished 
 Focused checks cover single-call defaults, stage order, bounds, cancellation and draft retention.
 The experimental option has no qualified quality/speed gain; GVS5H coding results do not establish
 Swift creative quality. Promotion requires evidence, with independent service/security gates and
-CI-only benchmarks.
+CI-only benchmarks. For alternative multi-pass scaling after current 3-stage checks,
+[DeepConf](research-register.md#decoding-samplers-and-test-time-scaling) (confidence-gated early trace
+stopping/consensus, with offline tracker helpers in `tools/bonsai/src/calibration_metrics.rs` pending
+Prism SSE logprob streaming) and [Recursive Self-Aggregation (RSA)](research-register.md#decoding-samplers-and-test-time-scaling)
+(iterative multi-draft synthesis for open-ended prose and planning) remain opt-in conditional evaluation arms.
 
 ## What the benchmarks establish
 
@@ -118,7 +122,20 @@ accelerators or daily-service profiles.
 
 Length prediction, guided sampling, trained budget controls and multiple-candidate
 selection change work or answer distribution. They are separate from faster
-kernels, remain unqualified for Swift and need compatible artifacts where applicable.
+kernels, remain unqualified for Swift and need compatible artifacts where applicable:
+
+- **Native `reasoning_effort` (`low`/`medium`/`xhigh`) & soft `</think>` forcing:** Upstream templates
+  support `low`/`medium`/`xhigh`, while Prism `SwiftChatSession` and `native_swift` currently pin
+  `xhigh` and `--reasoning-budget -1`; wiring non-`xhigh` effort or graceful `ReasoningBudget`
+  delimited closing requires aligned Prism/broker/UI plumbing before held-out `U6` qualification.
+- **`TempQuant` sampler calibration (`arXiv:2611.22128`):** Offline pure-Rust `temperature`/`top_p`
+  recalibration against BF16 teacher logits is implemented in `tools/bonsai/src/calibration_metrics.rs`
+  (`fit_tempquant_temperature`, `fit_tempquant_top_p`) to compensate low-bit ternary logit warming,
+  keeping Swift's default `T=1`, `top_p=0.95`, `top_k=20` sampler untouched pending `U6` review.
+- **Anti-slop decode suppression:** Optional decode-time cliché n-gram downweighting
+  ([`Qwen3.8-27B-antislop`](research-register.md#decoding-samplers-and-test-time-scaling)) stays
+  opt-in and unqualified under `U6`, preserving zero default penalties.
+
 Charge predictor work, extra prefills, failed attempts and human revisions to
 useful completed-answer time under the [measurement protocol](performance-expectations.md#measurement-and-comparison).
 Preserve selected Thinking/Extra effort, exact reservations, cancellation and
