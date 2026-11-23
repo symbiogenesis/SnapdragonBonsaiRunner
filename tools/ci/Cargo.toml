@@ -10,6 +10,9 @@ description = "Conservative workspace impact selection and fail-closed CI gates"
 keywords = ["ci", "workspace", "validation"]
 categories = ["development-tools"]
 
+[lib]
+doctest = false
+
 [[bin]]
 name = "bonsai-ci"
 path = "src/main.rs"

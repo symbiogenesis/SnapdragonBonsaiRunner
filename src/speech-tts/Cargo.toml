@@ -11,6 +11,9 @@ keywords = ["speech", "tts", "qwen", "rust", "native"]
 categories = ["multimedia::audio"]
 description = "Owned native Qwen VoiceDesign speech inference for Bonsai"
 
+[lib]
+doctest = false
+
 [features]
 rust-qualification = ["dep:bonsai-artifacts", "dep:bonsai-cpu-policy", "dep:serde"]
 

@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 description = "Offline bounded artifact verification with retained Windows file guards"
 
+[lib]
+doctest = false
+
 [dependencies]
 bonsai-native-hash.workspace = true
 hex.workspace = true

@@ -10,6 +10,9 @@ keywords = ["windows", "process", "job-object", "supervision"]
 categories = ["os::windows-apis"]
 description = "Windows Job ownership and bounded native process lifecycle for Bonsai"
 
+[lib]
+doctest = false
+
 [target.'cfg(windows)'.dependencies]
 ash.workspace = true
 bonsai-neon-dot.workspace = true

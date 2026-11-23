@@ -10,6 +10,9 @@ description = "Bounded native speech companion HTTP, credentials, audio and infe
 keywords = ["speech", "http", "native", "local", "audio"]
 categories = ["network-programming", "multimedia::audio"]
 
+[lib]
+doctest = false
+
 [dependencies]
 bonsai-audio.workspace = true
 bonsai-artifacts.workspace = true

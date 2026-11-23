@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 description = "Bounded development chat transport and request supervision for the Bonsai broker"
 
+[lib]
+doctest = false
+
 [features]
 # Compatibility marker; native inference always uses the pinned external server.
 native-swift = []

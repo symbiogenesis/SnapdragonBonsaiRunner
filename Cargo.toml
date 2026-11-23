@@ -66,6 +66,11 @@ debug-assertions = false
 [profile.test]
 overflow-checks = true
 debug-assertions = true
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+opt-level = 2
+debug = 0
 
 # Native-boundary crates permit individually documented unsafe operations.
 # Safe package target roots additionally forbid unsafe code.

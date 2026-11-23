@@ -11,6 +11,9 @@ repository.workspace = true
 keywords = ["ternary", "quantization", "scalar"]
 categories = ["encoding", "science"]
 
+[lib]
+doctest = false
+
 [[bin]]
 name = "bonsai-tools"
 path = "src/main.rs"

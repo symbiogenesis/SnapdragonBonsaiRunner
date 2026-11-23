@@ -10,6 +10,9 @@ keywords = ["windows", "credentials", "security"]
 categories = ["os::windows-apis"]
 description = "Private Windows credential provisioning for the Bonsai development launcher"
 
+[lib]
+doctest = false
+
 [dependencies]
 bonsai-native-hash.workspace = true
 hex.workspace = true

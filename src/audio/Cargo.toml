@@ -10,5 +10,8 @@ description = "Strict bounded mono PCM16 WAV framing for native Bonsai speech"
 keywords = ["audio", "pcm", "wav", "speech", "native"]
 categories = ["multimedia::audio", "encoding"]
 
+[lib]
+doctest = false
+
 [lints]
 workspace = true
