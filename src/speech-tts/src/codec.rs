@@ -1401,68 +1401,229 @@ fn scatter_phase_blocks_to_raw_simd<S: Simd>(
     }
 }
 
-#[inline(always)]
-fn snake_beta_row_simd<S: Simd>(simd: S, row: &mut [f32], a: &[f32], inv_b: &[f32]) {
-    // Three Cody-Waite pi parts where PI1/PI2 retain 14 trailing mantissa zero
-    // bits so `k * PI1` and `k * PI2` remain exact in `f32` up to `|k| <= 16_384`
-    // (`|z| <= 32_768`). Because `sin^2(r + k * pi) == sin^2(r)` for every integer
-    // `k`, no quadrant sign correction is needed before squaring `sin(r)`.
-    const INV_PI: f32 = std::f32::consts::FRAC_1_PI;
-    const PI1: f32 = f32::from_bits(0x4049_0000);
-    const PI2: f32 = f32::from_bits(0x3a7d_a000);
-    const PI3: f32 = f32::from_bits(0x3422_2169);
-    const RANGE_LIMIT: f32 = 32_768.0;
-    const C3: f32 = f32::from_bits(0xbe2a_aaab);
-    const C5: f32 = f32::from_bits(0x3c08_8889);
-    const C7: f32 = f32::from_bits(0xb950_0d01);
-    const C9: f32 = f32::from_bits(0x3638_ef1d);
-    const C11: f32 = f32::from_bits(0xb2d7_322b);
-    const C13: f32 = f32::from_bits(0x2f30_9231);
+struct SnakeBetaConsts<S: Simd> {
+    limit_v: f32x4<S>,
+    inv_pi_v: f32x4<S>,
+    neg_pi1_v: f32x4<S>,
+    neg_pi2_v: f32x4<S>,
+    neg_pi3_v: f32x4<S>,
+    c3_v: f32x4<S>,
+    c5_v: f32x4<S>,
+    c7_v: f32x4<S>,
+    c9_v: f32x4<S>,
+    c11_v: f32x4<S>,
+    c13_v: f32x4<S>,
+}
 
-    let inv_pi_v = f32x4::splat(simd, INV_PI);
-    let neg_pi1_v = f32x4::splat(simd, -PI1);
-    let neg_pi2_v = f32x4::splat(simd, -PI2);
-    let neg_pi3_v = f32x4::splat(simd, -PI3);
-    let c3_v = f32x4::splat(simd, C3);
-    let c5_v = f32x4::splat(simd, C5);
-    let c7_v = f32x4::splat(simd, C7);
-    let c9_v = f32x4::splat(simd, C9);
-    let c11_v = f32x4::splat(simd, C11);
-    let c13_v = f32x4::splat(simd, C13);
-
-    let (row_q, row_rem) = row.as_chunks_mut::<4>();
-    let (a_q, a_rem) = a.as_chunks::<4>();
-    let (ib_q, ib_rem) = inv_b.as_chunks::<4>();
-    for ((rq, aq), ibq) in row_q.iter_mut().zip(a_q).zip(ib_q) {
-        let x = f32x4::from_slice(simd, rq);
-        let z = f32x4::from_slice(simd, aq) * x;
-        let z_lanes: [f32; 4] = z.into();
-        if z_lanes.iter().all(|v| v.abs() <= RANGE_LIMIT) {
-            let k = (z * inv_pi_v).round_ties_even();
-            let mut r = neg_pi1_v.mul_add(k, z);
-            r = neg_pi2_v.mul_add(k, r);
-            r = neg_pi3_v.mul_add(k, r);
-            let u = r * r;
-            let mut p = c13_v.mul_add(u, c11_v);
-            p = p.mul_add(u, c9_v);
-            p = p.mul_add(u, c7_v);
-            p = p.mul_add(u, c5_v);
-            p = p.mul_add(u, c3_v);
-            let s = (r * u).mul_add(p, r);
-            let ib = f32x4::from_slice(simd, ibq);
-            (s * s).mul_add(ib, x).store_slice(rq);
-        } else {
-            for ((slot, &a_v), &ib_v) in rq.iter_mut().zip(aq).zip(ibq) {
-                let x_s = *slot;
-                let s = (a_v * x_s).sin();
-                *slot = (s * s).mul_add(ib_v, x_s);
-            }
+impl<S: Simd> SnakeBetaConsts<S> {
+    #[inline(always)]
+    fn new(simd: S) -> Self {
+        // Three Cody-Waite pi parts where PI1/PI2 retain 14 trailing mantissa zero
+        // bits so `k * PI1` and `k * PI2` remain exact in `f32` up to `|k| <= 16_384`
+        // (`|z| <= 32_768`). Because `sin^2(r + k * pi) == sin^2(r)` for every integer
+        // `k`, no quadrant sign correction is needed before squaring `sin(r)`.
+        const INV_PI: f32 = std::f32::consts::FRAC_1_PI;
+        const PI1: f32 = f32::from_bits(0x4049_0000);
+        const PI2: f32 = f32::from_bits(0x3a7d_a000);
+        const PI3: f32 = f32::from_bits(0x3422_2169);
+        const RANGE_LIMIT: f32 = 32_768.0;
+        const C3: f32 = f32::from_bits(0xbe2a_aaab);
+        const C5: f32 = f32::from_bits(0x3c08_8889);
+        const C7: f32 = f32::from_bits(0xb950_0d01);
+        const C9: f32 = f32::from_bits(0x3638_ef1d);
+        const C11: f32 = f32::from_bits(0xb2d7_322b);
+        const C13: f32 = f32::from_bits(0x2f30_9231);
+        Self {
+            limit_v: f32x4::splat(simd, RANGE_LIMIT),
+            inv_pi_v: f32x4::splat(simd, INV_PI),
+            neg_pi1_v: f32x4::splat(simd, -PI1),
+            neg_pi2_v: f32x4::splat(simd, -PI2),
+            neg_pi3_v: f32x4::splat(simd, -PI3),
+            c3_v: f32x4::splat(simd, C3),
+            c5_v: f32x4::splat(simd, C5),
+            c7_v: f32x4::splat(simd, C7),
+            c9_v: f32x4::splat(simd, C9),
+            c11_v: f32x4::splat(simd, C11),
+            c13_v: f32x4::splat(simd, C13),
         }
     }
+
+    #[inline(always)]
+    fn estrin_quad(&self, x: f32x4<S>, z: f32x4<S>, ib: f32x4<S>) -> f32x4<S> {
+        let k = (z * self.inv_pi_v).round_ties_even();
+        let mut r = self.neg_pi1_v.mul_add(k, z);
+        r = self.neg_pi2_v.mul_add(k, r);
+        r = self.neg_pi3_v.mul_add(k, r);
+        let u = r * r;
+        let u2 = u * u;
+        let u4 = u2 * u2;
+        let p01 = self.c5_v.mul_add(u, self.c3_v);
+        let p23 = self.c9_v.mul_add(u, self.c7_v);
+        let p45 = self.c13_v.mul_add(u, self.c11_v);
+        let q0 = p23.mul_add(u2, p01);
+        let p = p45.mul_add(u4, q0);
+        let s = (r * u).mul_add(p, r);
+        (s * s).mul_add(ib, x)
+    }
+
+    #[inline(always)]
+    fn eval_quad_checked(&self, simd: S, x: f32x4<S>, a: f32x4<S>, ib: f32x4<S>) -> f32x4<S> {
+        let z = a * x;
+        if z.abs().simd_le(self.limit_v).all_true() {
+            self.estrin_quad(x, z, ib)
+        } else {
+            let x_arr: [f32; 4] = x.into();
+            let a_arr: [f32; 4] = a.into();
+            let ib_arr: [f32; 4] = ib.into();
+            let mut out = [0.0_f32; 4];
+            for i in 0..4 {
+                out[i] = snake_beta_scalar(x_arr[i], a_arr[i], ib_arr[i]);
+            }
+            f32x4::from_slice(simd, &out)
+        }
+    }
+
+    #[inline(always)]
+    fn eval_4quads(
+        &self,
+        simd: S,
+        xs: [f32x4<S>; 4],
+        as_: [f32x4<S>; 4],
+        ibs: [f32x4<S>; 4],
+    ) -> [f32x4<S>; 4] {
+        let z0 = as_[0] * xs[0];
+        let z1 = as_[1] * xs[1];
+        let z2 = as_[2] * xs[2];
+        let z3 = as_[3] * xs[3];
+        let in_range = z0.abs().simd_le(self.limit_v)
+            & z1.abs().simd_le(self.limit_v)
+            & z2.abs().simd_le(self.limit_v)
+            & z3.abs().simd_le(self.limit_v);
+        if in_range.all_true() {
+            [
+                self.estrin_quad(xs[0], z0, ibs[0]),
+                self.estrin_quad(xs[1], z1, ibs[1]),
+                self.estrin_quad(xs[2], z2, ibs[2]),
+                self.estrin_quad(xs[3], z3, ibs[3]),
+            ]
+        } else {
+            [
+                self.eval_quad_checked(simd, xs[0], as_[0], ibs[0]),
+                self.eval_quad_checked(simd, xs[1], as_[1], ibs[1]),
+                self.eval_quad_checked(simd, xs[2], as_[2], ibs[2]),
+                self.eval_quad_checked(simd, xs[3], as_[3], ibs[3]),
+            ]
+        }
+    }
+}
+
+#[inline]
+fn snake_beta_scalar(x: f32, a: f32, inv_b: f32) -> f32 {
+    let s = (a * x).sin();
+    (s * s).mul_add(inv_b, x)
+}
+
+#[inline(always)]
+fn snake_beta_row_simd<S: Simd>(simd: S, row: &mut [f32], a: &[f32], inv_b: &[f32]) {
+    let c = SnakeBetaConsts::new(simd);
+    let (row_16, row_rem16) = row.as_chunks_mut::<16>();
+    let (a_16, a_rem16) = a.as_chunks::<16>();
+    let (ib_16, ib_rem16) = inv_b.as_chunks::<16>();
+    for ((r16, a16), ib16) in row_16.iter_mut().zip(a_16).zip(ib_16) {
+        let xs = [
+            f32x4::from_slice(simd, &r16[0..4]),
+            f32x4::from_slice(simd, &r16[4..8]),
+            f32x4::from_slice(simd, &r16[8..12]),
+            f32x4::from_slice(simd, &r16[12..16]),
+        ];
+        let as_ = [
+            f32x4::from_slice(simd, &a16[0..4]),
+            f32x4::from_slice(simd, &a16[4..8]),
+            f32x4::from_slice(simd, &a16[8..12]),
+            f32x4::from_slice(simd, &a16[12..16]),
+        ];
+        let ibs = [
+            f32x4::from_slice(simd, &ib16[0..4]),
+            f32x4::from_slice(simd, &ib16[4..8]),
+            f32x4::from_slice(simd, &ib16[8..12]),
+            f32x4::from_slice(simd, &ib16[12..16]),
+        ];
+        let ys = c.eval_4quads(simd, xs, as_, ibs);
+        ys[0].store_slice(&mut r16[0..4]);
+        ys[1].store_slice(&mut r16[4..8]);
+        ys[2].store_slice(&mut r16[8..12]);
+        ys[3].store_slice(&mut r16[12..16]);
+    }
+    let (row_q, row_rem) = row_rem16.as_chunks_mut::<4>();
+    let (a_q, a_rem) = a_rem16.as_chunks::<4>();
+    let (ib_q, ib_rem) = ib_rem16.as_chunks::<4>();
+    for ((rq, aq), ibq) in row_q.iter_mut().zip(a_q).zip(ib_q) {
+        c.eval_quad_checked(
+            simd,
+            f32x4::from_slice(simd, rq),
+            f32x4::from_slice(simd, aq),
+            f32x4::from_slice(simd, ibq),
+        )
+        .store_slice(rq);
+    }
     for ((slot, &a_v), &ib_v) in row_rem.iter_mut().zip(a_rem).zip(ib_rem) {
-        let x_s = *slot;
-        let s = (a_v * x_s).sin();
-        *slot = (s * s).mul_add(ib_v, x_s);
+        *slot = snake_beta_scalar(*slot, a_v, ib_v);
+    }
+}
+
+#[inline(always)]
+fn snake_beta_copy_row_simd<S: Simd>(
+    simd: S,
+    src_row: &[f32],
+    dst_row: &mut [f32],
+    a: &[f32],
+    inv_b: &[f32],
+) {
+    let c = SnakeBetaConsts::new(simd);
+    let (src_16, src_rem16) = src_row.as_chunks::<16>();
+    let (dst_16, dst_rem16) = dst_row.as_chunks_mut::<16>();
+    let (a_16, a_rem16) = a.as_chunks::<16>();
+    let (ib_16, ib_rem16) = inv_b.as_chunks::<16>();
+    for (((s16, d16), a16), ib16) in src_16.iter().zip(dst_16).zip(a_16).zip(ib_16) {
+        let xs = [
+            f32x4::from_slice(simd, &s16[0..4]),
+            f32x4::from_slice(simd, &s16[4..8]),
+            f32x4::from_slice(simd, &s16[8..12]),
+            f32x4::from_slice(simd, &s16[12..16]),
+        ];
+        let as_ = [
+            f32x4::from_slice(simd, &a16[0..4]),
+            f32x4::from_slice(simd, &a16[4..8]),
+            f32x4::from_slice(simd, &a16[8..12]),
+            f32x4::from_slice(simd, &a16[12..16]),
+        ];
+        let ibs = [
+            f32x4::from_slice(simd, &ib16[0..4]),
+            f32x4::from_slice(simd, &ib16[4..8]),
+            f32x4::from_slice(simd, &ib16[8..12]),
+            f32x4::from_slice(simd, &ib16[12..16]),
+        ];
+        let ys = c.eval_4quads(simd, xs, as_, ibs);
+        ys[0].store_slice(&mut d16[0..4]);
+        ys[1].store_slice(&mut d16[4..8]);
+        ys[2].store_slice(&mut d16[8..12]);
+        ys[3].store_slice(&mut d16[12..16]);
+    }
+    let (src_q, src_rem) = src_rem16.as_chunks::<4>();
+    let (dst_q, dst_rem) = dst_rem16.as_chunks_mut::<4>();
+    let (a_q, a_rem) = a_rem16.as_chunks::<4>();
+    let (ib_q, ib_rem) = ib_rem16.as_chunks::<4>();
+    for (((sq, dq), aq), ibq) in src_q.iter().zip(dst_q).zip(a_q).zip(ib_q) {
+        c.eval_quad_checked(
+            simd,
+            f32x4::from_slice(simd, sq),
+            f32x4::from_slice(simd, aq),
+            f32x4::from_slice(simd, ibq),
+        )
+        .store_slice(dq);
+    }
+    for (((&x_s, dst_s), &a_v), &ib_v) in src_rem.iter().zip(dst_rem).zip(a_rem).zip(ib_rem) {
+        *dst_s = snake_beta_scalar(x_s, a_v, ib_v);
     }
 }
 
@@ -2826,6 +2987,52 @@ impl SnakeBeta {
         });
         Ok(())
     }
+
+    /// Apply `y = x + sin^2(a * x) * inv_b` reading `src` and writing `dst` directly
+    /// across up to `threads` reusable frame workers, avoiding a separate input copy.
+    pub fn apply_from_into(
+        &self,
+        src: &[f32],
+        dst: &mut Vec<f32>,
+        frames: usize,
+        threads: usize,
+    ) -> io::Result<()> {
+        let channels = self.a.len();
+        if self.inv_b.len() != channels || frames.checked_mul(channels) != Some(src.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SnakeBeta input shape mismatch.",
+            ));
+        }
+        let len = src.len();
+        if dst.len() >= len {
+            dst.truncate(len);
+        } else {
+            dst.resize(len, 0.0_f32);
+        }
+        if frames == 0 || channels == 0 {
+            return Ok(());
+        }
+        let level = Level::new();
+        let workers = if frames <= 1 || len < 4096 {
+            1
+        } else {
+            threads.clamp(1, 18)
+        };
+        row_workers::run_aligned(dst, workers, channels, &|offset, dst_slice| {
+            let src_slice = &src[offset..offset + dst_slice.len()];
+            for (src_row, dst_row) in src_slice
+                .chunks_exact(channels)
+                .zip(dst_slice.chunks_exact_mut(channels))
+            {
+                dispatch!(
+                    level,
+                    simd => snake_beta_copy_row_simd(simd, src_row, dst_row, &self.a, &self.inv_b)
+                );
+            }
+        });
+        Ok(())
+    }
 }
 
 /// Dilated DAC residual unit (`act1 -> conv1(k=7, dilation) -> act2 -> conv2(k=1) + skip`).
@@ -2891,10 +3098,8 @@ impl DacResUnit {
         res_buf: &mut Vec<f32>,
         block_buf: &mut Vec<f32>,
     ) -> io::Result<()> {
-        res_buf.clear();
-        res_buf.extend_from_slice(input_and_out);
         self.act1
-            .apply_in_place_parallel(res_buf, frames, threads)?;
+            .apply_from_into(input_and_out, res_buf, frames, threads)?;
         self.conv1.forward_stream_into(
             res_buf,
             frames,
@@ -2915,7 +3120,15 @@ impl DacResUnit {
             res_buf,
         )?;
         let level = Level::new();
-        dispatch!(level, simd => add_slice_in_place_simd(simd, res_buf, input_and_out));
+        let add_workers = if res_buf.len() < 4096 {
+            1
+        } else {
+            threads.clamp(1, 18)
+        };
+        row_workers::run_aligned(res_buf, add_workers, 64, &|offset, dst_slice| {
+            let src_slice = &input_and_out[offset..offset + dst_slice.len()];
+            dispatch!(level, simd => add_slice_in_place_simd(simd, dst_slice, src_slice));
+        });
         std::mem::swap(input_and_out, res_buf);
         Ok(())
     }
@@ -2987,10 +3200,8 @@ impl DacBlock {
         res_buf: &mut Vec<f32>,
         out: &mut Vec<f32>,
     ) -> io::Result<usize> {
-        block_buf.clear();
-        block_buf.extend_from_slice(input);
         self.snake1
-            .apply_in_place_parallel(block_buf, frames, threads)?;
+            .apply_from_into(input, block_buf, frames, threads)?;
         self.trans_conv
             .forward_stream_into(block_buf, frames, carry, threads, out)?;
         let out_frames = frames * self.trans_conv.stride;
@@ -5073,6 +5284,121 @@ mod tests {
                 assert_eq!(state_t16, state_t1);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn snake_beta_estrin_4x_and_apply_from_into_match_f64_and_parallel_bits() -> std::io::Result<()>
+    {
+        for channels in [1_usize, 7, 17, 96] {
+            let a: Vec<f32> = (0..channels)
+                .map(|c| match c % 5 {
+                    0 => 0.0,
+                    1 => 1.5,
+                    2 => 100.0,
+                    3 => 50_000.0, // Exercises |a * x| > 32_768 fallback even inside 16-lane chunks.
+                    _ => 0.75,
+                })
+                .collect();
+            let inv_b: Vec<f32> = (0..channels)
+                .map(|c| 0.25 + f32::from(u8::try_from(c % 7).unwrap_or(0)) * 0.15)
+                .collect();
+            let snake = SnakeBeta { a, inv_b };
+
+            for frames in [1_usize, 2, 17, 65] {
+                let src: Vec<f32> = (0..frames * channels)
+                    .map(|i| {
+                        let base =
+                            f32::from(i16::try_from((i * 19) % 101).unwrap_or(0) - 50) * 0.67;
+                        if i % 23 == 0 {
+                            base * 100.0
+                        } else if i % 29 == 0 {
+                            -0.0_f32
+                        } else {
+                            base
+                        }
+                    })
+                    .collect();
+
+                let mut seq = src.clone();
+                snake.apply_in_place_parallel(&mut seq, frames, 1)?;
+                let seq_bits: Vec<u32> = seq.iter().map(|v| v.to_bits()).collect();
+
+                // Verify <= 5e-7 accuracy against f64::sin across in-range and |a * x| > 32_768.
+                for frame in 0..frames {
+                    for ch in 0..channels {
+                        let raw_x = src[frame * channels + ch];
+                        let z = f64::from(snake.a[ch] * raw_x);
+                        let s = z.sin();
+                        let expected = s * s * f64::from(snake.inv_b[ch]) + f64::from(raw_x);
+                        let got = f64::from(seq[frame * channels + ch]);
+                        let tol = 5.0e-7_f64.max(expected.abs() * 5.0e-7);
+                        assert!(
+                            (got - expected).abs() <= tol,
+                            "SnakeBeta f64 mismatch ch={channels} frames={frames} f={frame} c={ch}: got={got} expected={expected}"
+                        );
+                    }
+                }
+
+                // Verify 0-ULP parity across threads=1 vs 16 and apply_from_into (even with poisoned dst).
+                for threads in [1_usize, 16] {
+                    let mut par = src.clone();
+                    snake.apply_in_place_parallel(&mut par, frames, threads)?;
+                    assert_eq!(
+                        par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        seq_bits,
+                        "apply_in_place channels={channels} frames={frames} threads={threads}"
+                    );
+
+                    let mut dst = vec![f32::NAN; src.len() + 32];
+                    snake.apply_from_into(&src, &mut dst, frames, threads)?;
+                    assert_eq!(
+                        dst.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        seq_bits,
+                        "apply_from_into channels={channels} frames={frames} threads={threads}"
+                    );
+                }
+            }
+        }
+
+        // Verify DacResUnit fused copy + parallel residual add preserves 0-ULP across threads=1 vs 16.
+        let ch = 96_usize;
+        let ru = DacResUnit {
+            act1: SnakeBeta::from_log_params(&vec![0.1; ch], &vec![0.05; ch])?,
+            conv1: CausalConv1d::from_oc_ic_k(
+                ch,
+                ch,
+                7,
+                3,
+                1,
+                PadMode::Constant,
+                values(ch * ch * 7),
+                Some(values(ch)),
+            )?,
+            act2: SnakeBeta::from_log_params(&vec![-0.1; ch], &vec![0.1; ch])?,
+            conv2: CausalConv1d::from_oc_ic_k(
+                ch,
+                ch,
+                1,
+                1,
+                1,
+                PadMode::Constant,
+                values(ch * ch),
+                Some(values(ch)),
+            )?,
+        };
+        let frames = 64_usize;
+        let input = values(frames * ch);
+        let init_state = values(ru.conv1.stream_context_frames() * ch);
+        let mut st1 = init_state.clone();
+        let mut st16 = init_state;
+        let out1 = ru.forward_stream_parallel(&input, frames, &mut st1, 1)?;
+        let out16 = ru.forward_stream_parallel(&input, frames, &mut st16, 16)?;
+        assert_eq!(
+            out16.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            out1.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(st16, st1);
         Ok(())
     }
 }
