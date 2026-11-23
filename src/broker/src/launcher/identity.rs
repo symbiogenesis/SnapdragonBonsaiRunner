@@ -253,10 +253,11 @@ fn startup_projection_matches(
         // The reviewed 0.1.28, 0.1.30 and 0.1.31 tuples must identify completed initialization.
         return !workers.projection_startup_required;
     };
-    let requested = if workers.placement == crate::inference::Placement::Cpu {
-        "cpu"
-    } else {
-        "auto"
+    let requested = match workers.placement {
+        crate::inference::Placement::Auto => "auto",
+        crate::inference::Placement::Cpu => "cpu",
+        crate::inference::Placement::Vulkan => "vulkan",
+        crate::inference::Placement::Composite => "composite",
     };
     if startup.schema_version != 1 || &*startup.requested != requested {
         return false;
@@ -264,6 +265,11 @@ fn startup_projection_matches(
     let no_residency = startup.resident_tensors == 0
         && startup.resident_weight_bytes == 0
         && startup.host_metadata_bytes == 0;
+    let valid_graphic_identity = startup.identity.as_deref().is_some_and(|identity| {
+        !identity.trim().is_empty()
+            && identity.len() <= 256
+            && identity.bytes().all(|byte| byte.is_ascii_graphic())
+    });
     match &*startup.effective {
         "cpu" => startup.identity.is_none() && no_residency,
         "hexagon-native-q2" => {
@@ -296,11 +302,21 @@ fn startup_projection_matches(
                 && workers.cpu_prefill.is_none()
                 && workers.cpu_speculation.is_none()
                 && no_residency
-                && startup.identity.as_deref().is_some_and(|identity| {
-                    !identity.trim().is_empty()
-                        && identity.len() <= 256
-                        && identity.bytes().all(|byte| byte.is_ascii_graphic())
-                })
+                && valid_graphic_identity
+        }
+        "adreno-vulkan" => {
+            requested == "vulkan"
+                && valid_graphic_identity
+                && startup.resident_tensors >= 1
+                && startup.resident_weight_bytes >= 1
+                && startup.host_metadata_bytes == 0
+        }
+        "composite-hexagon-vulkan" => {
+            requested == "composite"
+                && valid_graphic_identity
+                && startup.resident_tensors >= 2
+                && startup.resident_weight_bytes >= 1
+                && (1..=524_288).contains(&startup.host_metadata_bytes)
         }
         _ => false,
     }
@@ -512,8 +528,17 @@ pub(super) fn validate_native_identity_detailed(
     {
         return Err(NativeIdentityError::CpuSpeculation);
     }
-    let placement = (workers.placement == crate::inference::Placement::Cpu).then_some("cpu");
-    if model.placement.as_deref() != placement || model.projection_backend.as_deref() != placement {
+    let (expected_placement, expected_backend) = match workers.placement {
+        crate::inference::Placement::Auto => (None, None),
+        crate::inference::Placement::Cpu => (Some("cpu"), Some("cpu")),
+        crate::inference::Placement::Vulkan => (Some("vulkan"), Some("adreno-vulkan")),
+        crate::inference::Placement::Composite => {
+            (Some("composite"), Some("composite-hexagon-vulkan"))
+        }
+    };
+    if model.placement.as_deref() != expected_placement
+        || model.projection_backend.as_deref() != expected_backend
+    {
         return Err(NativeIdentityError::Placement);
     }
     if !startup_projection_matches(model, workers, repacked) {
@@ -1078,7 +1103,7 @@ mod tests {
                 Err(NativeIdentityError::CpuPrefill)
             );
 
-            // 0.1.32 preserves mixed-phase Hexagon decode alongside CPU tiled prefill
+            // 0.1.32+ preserves mixed-phase Hexagon decode alongside CPU tiled prefill
             // whenever CPU speculation is disabled, while "external" stays excluded.
             let mut hex_active = prefill_model.clone();
             hex_active["startup_projection"] = projection_startup("hexagon-native-q2");
@@ -1118,7 +1143,7 @@ mod tests {
         let checkpoint_bytes = 1_073_741_824_usize;
 
         // Prompt-end-and-latest reuse with multi-branch checkpoints and chunkwise wy-f32 GDN prefill.
-        let (mut gdn_model, _) = kv_cache_model_for_version("0.1.32", false, false);
+        let (mut gdn_model, _) = kv_cache_model_for_version("0.1.34", false, false);
         gdn_model.as_object_mut().map(|o| o.remove("kv_cache"));
         let base_f16 = gdn_model["startup_graph_identity"]
             .as_str()
@@ -1139,7 +1164,7 @@ mod tests {
             prompt_reuse_checkpoints: 4,
             cpu_prefill: Some((16, prefill_scratch)),
             cpu_prefill_gdn_wy_f32: true,
-            ..WorkerReadiness::for_version("0.1.32", 8)
+            ..WorkerReadiness::for_version("0.1.34", 8)
         };
         let mut gdn_eight = gdn_model.clone();
         gdn_eight["row_workers"] = json!(8);
@@ -1180,7 +1205,7 @@ mod tests {
         );
 
         // Speculative decoding with K4/V4 cache requires CPU projection and :cpu-tiled-verify-v1.
-        let (mut spec_model, base_rsq4) = kv_cache_model_for_version("0.1.32", false, false);
+        let (mut spec_model, base_rsq4) = kv_cache_model_for_version("0.1.34", false, false);
         spec_model["row_workers"] = json!(8);
         spec_model["startup_projection"] = projection_startup("cpu");
         spec_model["cpu_prefill_tokens"] = json!(16);
@@ -1196,7 +1221,7 @@ mod tests {
             kv_cache: Some(KvCache::Rsq4),
             cpu_prefill: Some((16, prefill_scratch)),
             cpu_speculation: Some((4, verify_scratch, checkpoint_bytes)),
-            ..WorkerReadiness::for_version("0.1.32", 8)
+            ..WorkerReadiness::for_version("0.1.34", 8)
         };
         assert_eq!(
             validate_native_identity_detailed(
@@ -1462,6 +1487,107 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn vulkan_and_composite_placements_verify_matching_startup_projection_and_reject_drift()
+    -> Result<(), String> {
+        use crate::inference::{KvCache, Placement};
+        use serde_json::json;
+
+        let (mut base, _) = kv_cache_model_for_version("0.1.34", false, false);
+        base["row_workers"] = json!(8);
+
+        let mut vulkan_model = base.clone();
+        vulkan_model["placement"] = json!("vulkan");
+        vulkan_model["projection_backend"] = json!("adreno-vulkan");
+        vulkan_model["startup_projection"] = json!({
+            "schema_version": 1,
+            "requested": "vulkan",
+            "effective": "adreno-vulkan",
+            "identity": "adreno-vulkan-pq2-v1",
+            "resident_tensors": 256,
+            "resident_weight_bytes": 4_000_000_000_u64,
+            "host_metadata_bytes": 0,
+        });
+        let vulkan_policy = WorkerReadiness {
+            kv_cache: Some(KvCache::Rsq4),
+            placement: Placement::Vulkan,
+            ..WorkerReadiness::for_version("0.1.34", 8)
+        };
+        let vulkan_wire = model_response(&vulkan_model).map_err(|e| e.to_string())?;
+        assert_eq!(
+            validate_native_identity_detailed(&vulkan_wire, false, false, vulkan_policy),
+            Ok(())
+        );
+        let mut bad_vulkan_backend = vulkan_model.clone();
+        bad_vulkan_backend["projection_backend"] = json!("cpu");
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&bad_vulkan_backend).map_err(|e| e.to_string())?,
+                false,
+                false,
+                vulkan_policy,
+            ),
+            Err(NativeIdentityError::Placement)
+        );
+        let mut bad_vulkan_meta = vulkan_model;
+        bad_vulkan_meta["startup_projection"]["host_metadata_bytes"] = json!(1);
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&bad_vulkan_meta).map_err(|e| e.to_string())?,
+                false,
+                false,
+                vulkan_policy,
+            ),
+            Err(NativeIdentityError::StartupProjection)
+        );
+
+        let mut composite_model = base;
+        composite_model["placement"] = json!("composite");
+        composite_model["projection_backend"] = json!("composite-hexagon-vulkan");
+        composite_model["startup_projection"] = json!({
+            "schema_version": 1,
+            "requested": "composite",
+            "effective": "composite-hexagon-vulkan",
+            "identity": "composite-hexagon-v81-adreno-v1",
+            "resident_tensors": 400,
+            "resident_weight_bytes": 6_000_000_000_u64,
+            "host_metadata_bytes": 4096,
+        });
+        let composite_policy = WorkerReadiness {
+            kv_cache: Some(KvCache::Rsq4),
+            placement: Placement::Composite,
+            ..WorkerReadiness::for_version("0.1.34", 8)
+        };
+        let composite_wire = model_response(&composite_model).map_err(|e| e.to_string())?;
+        assert_eq!(
+            validate_native_identity_detailed(&composite_wire, false, false, composite_policy),
+            Ok(())
+        );
+        let mut bad_composite_tensors = composite_model.clone();
+        bad_composite_tensors["startup_projection"]["resident_tensors"] = json!(1);
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&bad_composite_tensors).map_err(|e| e.to_string())?,
+                false,
+                false,
+                composite_policy,
+            ),
+            Err(NativeIdentityError::StartupProjection)
+        );
+        let mut bad_composite_meta = composite_model;
+        bad_composite_meta["startup_projection"]["host_metadata_bytes"] = json!(0);
+        assert_eq!(
+            validate_native_identity_detailed(
+                &model_response(&bad_composite_meta).map_err(|e| e.to_string())?,
+                false,
+                false,
+                composite_policy,
+            ),
+            Err(NativeIdentityError::StartupProjection)
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1552,6 +1678,7 @@ mod context_tests {
             ("0.1.30", false, true, true),
             ("0.1.31", false, true, true),
             ("0.1.32", false, true, true),
+            ("0.1.34", false, true, true),
             ("1.0.0", false, false, true),
             ("0.1.031", false, false, true),
             ("0.1.31-dev", false, false, true),

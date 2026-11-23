@@ -60,7 +60,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--prompt-reuse-checkpoints 1..=8] [--prompt-reuse-checkpoint-bytes <bytes>] (reviewed native runtime only; requires --prompt-reuse)\n",
     "  [--kv-cache f16|rsq4|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
     "  [--cpu-prefill-tokens 8|16|32] (reviewed native runtime only; enables layer-major CPU FFN tile prefill)\n",
-    "  [--cpu-prefill-gdn sequential|wy-f32] (reviewed native runtime only; requires --cpu-prefill-tokens; wy-f32 requires --kv-cache f16 on pinned 0.1.32 and excludes suffix speculation)\n",
+    "  [--cpu-prefill-gdn sequential|wy-f32] (reviewed native runtime only; requires --cpu-prefill-tokens; wy-f32 excludes suffix speculation)\n",
     "  [--spec-type none|suffix] [--draft-max 1..=8] (reviewed native runtime only; suffix requires --cpu-prefill-tokens and suppresses mmproj)\n",
     "  [--cpu-family x1|x2] (reviewed native runtime only; overrides detected Snapdragon X1/X2 family)\n",
     "  [--placement auto|cpu|vulkan|composite] (native Swift only; cpu/vulkan/composite require a reviewed compatible release)\n",
@@ -3303,17 +3303,17 @@ mod tests {
         let daisy_sha = "e".repeat(64);
         let daisy_flag = daisy_path.to_string_lossy().into_owned();
 
-        // Frozen v0.1.32 release pin refuses --daisyrose-lora at parse time.
-        let gated = args_with(&[
+        // Promoted v0.1.34 release pin admits --daisyrose-lora for native Swift launches.
+        let admitted_daisy = LaunchConfig::parse(args_with(&[
             "--profile",
             "swift-pq2-assessment",
             "--native-engine",
             "--daisyrose-lora",
             &daisy_flag,
-        ]);
+        ]))?;
         assert_eq!(
-            LaunchConfig::parse(gated).err(),
-            Some(LaunchError::NativeRuntime)
+            admitted_daisy.daisyrose_lora.as_deref(),
+            Some(daisy_path.as_path())
         );
 
         let non_native = args_with(&[
@@ -3923,13 +3923,13 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
-        for gated in ["vulkan", "composite"] {
-            let mut rejected = native.clone();
-            rejected.extend(["--placement", gated].map(OsString::from));
-            assert_eq!(
-                LaunchConfig::parse(rejected).err(),
-                Some(LaunchError::NativeRuntime)
-            );
+        for (flag, expected) in [
+            ("vulkan", Placement::Vulkan),
+            ("composite", Placement::Composite),
+        ] {
+            let mut admitted = native.clone();
+            admitted.extend(["--placement", flag].map(OsString::from));
+            assert_eq!(LaunchConfig::parse(admitted)?.placement, expected);
         }
         for placement in ["auto", "cpu", "vulkan", "composite"] {
             let mut rejected = arguments();
@@ -3997,7 +3997,7 @@ mod tests {
         assert!(config.memory_context_supported()?);
         let gib = 1024 * 1024 * 1024_u64;
         let available = 20 * gib;
-        // Under promoted 0.1.32 calibrated-CoW admission, full 262,144 K4/V4 context fits at 20 GiB,
+        // Under promoted 0.1.34 calibrated-CoW admission, full 262,144 K4/V4 context fits at 20 GiB,
         // while constrained 18 GiB scales back cleanly below 262,144.
         let packed_18g = config.swift_context_plan(18 * gib)?;
         assert!(packed_18g.context_tokens < 262_144);
@@ -4402,7 +4402,7 @@ mod tests {
             "--require-native-sandbox",
             &["--profile", "swift-pq2-assessment"],
         );
-        // With BROKER_PIPE_RELEASE pinned at 0.1.32, valid flag combinations succeed and enable broker pipe.
+        // With BROKER_PIPE_RELEASE pinned at 0.1.34, valid flag combinations succeed and enable broker pipe.
         let parsed = LaunchConfig::parse(valid.clone())?;
         assert!(parsed.uses_broker_pipe()?);
 
@@ -5157,7 +5157,7 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
-        for gated in [
+        for admitted in [
             vec!["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"],
             vec![
                 "--cpu-prefill-tokens",
@@ -5167,22 +5167,29 @@ mod tests {
                 "--cpu-prefill-gdn",
                 "wy-f32",
             ],
-            vec![
+        ] {
+            let mut parsed_args = native.clone();
+            parsed_args.extend(admitted.into_iter().map(OsString::from));
+            let parsed = LaunchConfig::parse(parsed_args)?;
+            assert_eq!(parsed.cpu_prefill_gdn, Some(CpuPrefillGdn::WyF32));
+        }
+        let mut rsq4k3v_rejected = native.clone();
+        rsq4k3v_rejected.extend(
+            [
                 "--cpu-prefill-tokens",
                 "16",
                 "--kv-cache",
                 "rsq4k3v",
                 "--cpu-prefill-gdn",
                 "wy-f32",
-            ],
-        ] {
-            let mut rejected = native.clone();
-            rejected.extend(gated.into_iter().map(OsString::from));
-            assert_eq!(
-                LaunchConfig::parse(rejected).err(),
-                Some(LaunchError::NativeRuntime)
-            );
-        }
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        assert_eq!(
+            LaunchConfig::parse(rsq4k3v_rejected).err(),
+            Some(LaunchError::NativeRuntime)
+        );
         Ok(())
     }
 
@@ -5208,13 +5215,15 @@ mod tests {
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         assert_eq!(default_cfg.hexagon_arena_cache, None);
 
-        // Pinned 0.1.32 fails closed when `--hexagon-arena-cache` is supplied with valid flags/paths.
+        // Promoted 0.1.34 admits `--hexagon-arena-cache` for unisolated native launches with valid dirs.
         for valid_dir in [&existing_str, &leaf_str] {
-            let mut gated = native.clone();
-            gated.extend(["--hexagon-arena-cache", valid_dir].map(OsString::from));
+            let mut admitted = native.clone();
+            admitted.extend(["--hexagon-arena-cache", valid_dir].map(OsString::from));
+            let parsed = LaunchConfig::parse(admitted)
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
             assert_eq!(
-                LaunchConfig::parse(gated).err(),
-                Some(LaunchError::NativeRuntime)
+                parsed.hexagon_arena_cache.as_deref(),
+                Some(std::path::Path::new(valid_dir))
             );
         }
 

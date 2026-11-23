@@ -2311,7 +2311,7 @@ mod tests {
         fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
         fs::create_dir_all(&inference).map_err(|error| error.to_string())?;
 
-        let current_archive = "prism-inference-0.1.32-aarch64-pc-windows-msvc.zip";
+        let current_archive = "prism-inference-0.1.34-aarch64-pc-windows-msvc.zip";
         let old_archive = downloads.join("prism-inference-0.1.27-aarch64-pc-windows-msvc.zip");
         let old_partial =
             downloads.join("prism-inference-0.1.27-aarch64-pc-windows-msvc.zip.partial");
@@ -2356,7 +2356,7 @@ mod tests {
         assert!(!locked_archive.exists());
         assert!(!locked_sentinel.exists());
 
-        let current_commit = "23e24e444a821d4426f65d56c6cf874cf568b0d9";
+        let current_commit = "c64c9648f85ac4c99ff8d57f709871b31e785370";
         let old_commit = "1429a33772089dfd3a50a96c698b9dbe0b36836a";
         let owner_commit = "abcdef0123456789abcdef0123456789abcdef01";
         let target = "aarch64-pc-windows-msvc";

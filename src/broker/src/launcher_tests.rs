@@ -829,13 +829,14 @@ fn launch_usage_and_vulkan_composite_wy_f32_gates_match_pinned_contract() -> Res
     }
 
     let data = std::env::temp_dir().join("Bonsai-vulkan-wyf32-gates");
-    for placement in ["vulkan", "composite"] {
-        assert_eq!(
-            parse_native_launch_config(&data, &["--placement", placement]).err(),
-            Some(LaunchError::NativeRuntime)
-        );
+    for (flag, expected) in [
+        ("vulkan", crate::inference::Placement::Vulkan),
+        ("composite", crate::inference::Placement::Composite),
+    ] {
+        let parsed = parse_native_launch_config(&data, &["--placement", flag])?;
+        assert_eq!(parsed.placement, expected);
     }
-    for wy_rotated in [
+    for wy_admitted in [
         &["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"][..],
         &[
             "--cpu-prefill-tokens",
@@ -845,20 +846,28 @@ fn launch_usage_and_vulkan_composite_wy_f32_gates_match_pinned_contract() -> Res
             "--cpu-prefill-gdn",
             "wy-f32",
         ][..],
-        &[
-            "--cpu-prefill-tokens",
-            "16",
-            "--kv-cache",
-            "rsq4k3v",
-            "--cpu-prefill-gdn",
-            "wy-f32",
-        ][..],
     ] {
+        let parsed = parse_native_launch_config(&data, wy_admitted)?;
         assert_eq!(
-            parse_native_launch_config(&data, wy_rotated).err(),
-            Some(LaunchError::NativeRuntime)
+            parsed.cpu_prefill_gdn,
+            Some(crate::inference::CpuPrefillGdn::WyF32)
         );
     }
+    assert_eq!(
+        parse_native_launch_config(
+            &data,
+            &[
+                "--cpu-prefill-tokens",
+                "16",
+                "--kv-cache",
+                "rsq4k3v",
+                "--cpu-prefill-gdn",
+                "wy-f32",
+            ]
+        )
+        .err(),
+        Some(LaunchError::NativeRuntime)
+    );
 
     let mut base = parse_native_launch_config(
         &data,
