@@ -23,8 +23,10 @@ impl State {
         } else {
             self.context_draft.has_attachments && self.context_draft.attachment_input == self.input
         };
+        let memory = self.memory.resolve(&self.committed, &self.input).estimated_tokens;
         if let Some(estimate) = self.context_draft.estimate
             && estimate.history == history
+            && estimate.memory == memory
             && estimate.output == usize::try_from(output).unwrap_or(usize::MAX)
             && self.context_draft.extra_effort == self.extra_effort
             && estimate.capacity == self.context_tokens
@@ -60,7 +62,8 @@ impl State {
                 self.extra_effort,
                 self.context_tokens,
             )
-        };
+        }
+        .with_memory(memory);
         self.context_draft.attachments_revision = self.draft_attachments_revision;
         self.context_draft.extra_effort = self.extra_effort;
         self.context_draft.estimate = Some(estimate);
@@ -164,11 +167,17 @@ impl State {
                 for (label, amount, approximate) in [
                     ("Completed history & reasoning", estimate.history, true),
                     ("This draft & message framing", estimate.draft, true),
+                    ("Pinned & active memory", estimate.memory, true),
                     ("Extra effort planning", estimate.workflow, true),
                     ("Reply limit (includes thinking)", estimate.output, false),
                     ("Safety reserve", context::RESERVE_TOKENS, false),
                 ] {
-                    if amount == 0 && label == "Extra effort planning" {
+                    if amount == 0
+                        && matches!(
+                            label,
+                            "Extra effort planning" | "Pinned & active memory"
+                        )
+                    {
                         continue;
                     }
                     ui.label(RichText::new(label).small());

@@ -2,23 +2,28 @@
 use super::{RichText, State, controls, egui};
 
 mod appearance;
+mod memory;
 mod response;
 mod services;
+
+pub(in crate::window) use memory::MemoryEditorDraft;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(super) enum Page {
     #[default]
     Response,
     Appearance,
+    Memory,
     Voice,
     Privacy,
     Application,
 }
 
 impl Page {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Response,
         Self::Appearance,
+        Self::Memory,
         Self::Voice,
         Self::Privacy,
         Self::Application,
@@ -28,6 +33,7 @@ impl Page {
         match self {
             Self::Response => "Response",
             Self::Appearance => "Appearance",
+            Self::Memory => "Memory",
             Self::Voice => "Voice",
             Self::Privacy => "Privacy",
             Self::Application => "Application",
@@ -220,6 +226,7 @@ impl State {
             .show(ui, |ui| match page {
                 Page::Response => self.response_preferences(ui),
                 Page::Appearance => self.appearance_preferences(ui),
+                Page::Memory => self.memory_preferences(ui),
                 Page::Voice => self.voice_preferences(ui),
                 Page::Privacy => settings_card(ui, |ui| self.recovery_controls(ui)),
                 Page::Application => self.application_preferences(ui),

@@ -31,6 +31,8 @@ mod com_dialog;
 #[cfg(windows)]
 mod context;
 #[cfg(windows)]
+mod context_cards;
+#[cfg(windows)]
 mod http;
 #[cfg(windows)]
 mod image_export;

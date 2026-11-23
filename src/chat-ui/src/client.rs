@@ -524,6 +524,7 @@ pub(crate) enum Command {
         abliteration_scale: f32,
         daisyrose_scale: f32,
         cognitive: CognitiveOptions,
+        system_appendix: Option<Arc<str>>,
     },
     NewChat,
     RestoreChat(Vec<Message>),
@@ -641,9 +642,9 @@ impl<'de> Deserialize<'de> for Message {
     }
 }
 
-struct SystemMessageRef;
+struct SystemMessageRef<'a>(Option<&'a str>);
 
-impl Serialize for SystemMessageRef {
+impl Serialize for SystemMessageRef<'_> {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
@@ -651,7 +652,16 @@ impl Serialize for SystemMessageRef {
         use serde::ser::SerializeStruct as _;
         let mut state = serializer.serialize_struct("Message", 2)?;
         state.serialize_field("role", "system")?;
-        state.serialize_field("content", SYSTEM_PROMPT)?;
+        if let Some(appendix) = self.0.filter(|text| !text.is_empty()) {
+            let mut combined =
+                String::with_capacity(SYSTEM_PROMPT.len() + 2 + appendix.len());
+            combined.push_str(SYSTEM_PROMPT);
+            combined.push_str("\n\n");
+            combined.push_str(appendix);
+            state.serialize_field("content", &combined)?;
+        } else {
+            state.serialize_field("content", SYSTEM_PROMPT)?;
+        }
         state.end()
     }
 }
@@ -704,7 +714,7 @@ struct WireMessage<'a> {
     reasoning_content: Option<&'a str>,
 }
 
-struct RequestMessages<'a>(&'a [Message]);
+struct RequestMessages<'a>(&'a [Message], Option<&'a str>);
 
 impl Serialize for RequestMessages<'_> {
     fn serialize<S: serde::Serializer>(
@@ -713,7 +723,7 @@ impl Serialize for RequestMessages<'_> {
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq as _;
         let mut seq = serializer.serialize_seq(Some(self.0.len().saturating_add(1)))?;
-        seq.serialize_element(&SystemMessageRef)?;
+        seq.serialize_element(&SystemMessageRef(self.1))?;
         for message in self.0 {
             seq.serialize_element(&WireMessage {
                 role: message.role,
@@ -776,6 +786,7 @@ struct ResponseOptions {
     cognitive: CognitiveOptions,
     cognitive_controls: bool,
     reset_on_cancel: bool,
+    system_appendix: Option<Arc<str>>,
     request_logprobs: bool,
     temperature_nudge: f32,
 }
@@ -1153,6 +1164,7 @@ fn serve_broker(
                 abliteration_scale,
                 daisyrose_scale,
                 cognitive,
+                system_appendix,
             }) => {
                 if text.trim().is_empty() && images.is_empty() {
                     continue;
@@ -1179,6 +1191,7 @@ fn serve_broker(
                     cognitive,
                     cognitive_controls,
                     reset_on_cancel: config.native_engine,
+                    system_appendix,
                     request_logprobs: false,
                     temperature_nudge: 0.0,
                 };
@@ -1816,7 +1829,7 @@ fn serialize_request_with_options(
     let cognitive = WireCognitiveFields::from_options(options);
     crate::bounded_json::to_vec(
         &ChatRequest {
-            messages: RequestMessages(history),
+            messages: RequestMessages(history, options.system_appendix.as_deref()),
             max_completion_tokens: options.max_completion_tokens,
             stream: true,
             enable_thinking: options.enable_thinking,
@@ -3561,6 +3574,7 @@ mod tests {
                     abliteration_scale: super::DEFAULT_ABLITERATION_SCALE,
                     daisyrose_scale: super::DEFAULT_DAISYROSE_SCALE,
                     cognitive: super::CognitiveOptions::default(),
+                    system_appendix: None,
                 })
                 .is_ok()
         );
@@ -3968,6 +3982,7 @@ mod tests {
                     sampling_preset: SamplingPreset::BalancedDry,
                     extra_effort_strategy: ExtraEffortStrategy::MultiDraftSynthesis,
                 },
+                system_appendix: Some("Pinned card".into()),
                 request_logprobs: true,
                 temperature_nudge: 0.1,
                 ..ResponseOptions::default()
@@ -3980,6 +3995,11 @@ mod tests {
         assert_eq!(parsed["dry_multiplier"], serde_json::json!(0.8));
         assert_eq!(parsed["logprobs"], true);
         assert_eq!(parsed["top_logprobs"], 5);
+        assert!(
+            parsed["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("\n\nPinned card"))
+        );
         Ok(())
     }
 

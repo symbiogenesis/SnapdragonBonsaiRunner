@@ -200,6 +200,8 @@ struct State {
     daisyrose_customized: bool,
     cognitive: client::CognitiveOptions,
     cognitive_controls_available: bool,
+    memory: crate::context_cards::MemoryStore,
+    memory_draft: settings::MemoryEditorDraft,
     focus_composer: bool,
     composing: bool,
     composer_id: Option<egui::Id>,
@@ -372,6 +374,8 @@ impl State {
             daisyrose_customized: false,
             cognitive: client::CognitiveOptions::default(),
             cognitive_controls_available: false,
+            memory: crate::context_cards::MemoryStore::default(),
+            memory_draft: settings::MemoryEditorDraft::default(),
             focus_composer: false,
             composing: false,
             composer_id: None,
@@ -797,6 +801,11 @@ impl State {
             .unwrap_or(4096);
         let (wire_text, images) =
             crate::attachment_import::format_user_turn(&text, &self.draft_attachments);
+        let system_appendix = self
+            .memory
+            .resolve(&self.committed, &wire_text)
+            .appendix
+            .map(std::sync::Arc::<str>::from);
         self.daisyrose_customized = true;
         if self
             .commands
@@ -809,6 +818,7 @@ impl State {
                 abliteration_scale: self.abliteration_scale,
                 daisyrose_scale: self.effective_daisyrose_scale(),
                 cognitive: self.cognitive,
+                system_appendix,
             })
             .is_err()
         {

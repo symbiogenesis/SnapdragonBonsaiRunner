@@ -50,6 +50,8 @@ pub(crate) struct Estimate {
     pub(crate) history: usize,
     /// Trimmed draft plus approximate next-turn template framing.
     pub(crate) draft: usize,
+    /// Estimated token cost of active persistent instructions & context cards.
+    pub(crate) memory: usize,
     /// Approximate Extra effort planning wrapper; zero for Standard.
     pub(crate) workflow: usize,
     /// Selected response cap, including generated thinking.
@@ -117,16 +119,26 @@ impl Estimate {
             capacity,
             history,
             draft,
+            memory: 0,
             workflow,
             output,
             total,
         }
     }
 
+    /// Add active persistent instructions & context-card token cost to this estimate.
+    pub(crate) const fn with_memory(mut self, memory_tokens: usize) -> Self {
+        let delta = memory_tokens.saturating_sub(self.memory);
+        self.memory = memory_tokens;
+        self.total = self.total.saturating_add(delta);
+        self
+    }
+
     /// Rendered input estimate before the response cap and policy reserve.
     pub(crate) const fn prompt_tokens(self) -> usize {
         self.history
             .saturating_add(self.draft)
+            .saturating_add(self.memory)
             .saturating_add(self.workflow)
     }
 
@@ -218,7 +230,7 @@ pub(crate) const fn units_to_tokens(units: usize) -> usize {
     units.div_ceil(8)
 }
 
-fn text_tokens(text: &str) -> usize {
+pub(crate) fn text_tokens(text: &str) -> usize {
     units_to_tokens(text_units(text))
 }
 

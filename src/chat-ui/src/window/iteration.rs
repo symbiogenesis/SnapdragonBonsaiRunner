@@ -273,6 +273,11 @@ impl State {
                 return true;
             }
         }
+        let system_appendix = self
+            .memory
+            .resolve(&self.committed, CONTINUE_PROMPT)
+            .appendix
+            .map(std::sync::Arc::<str>::from);
         if self
             .commands
             .send(Command::Send {
@@ -284,6 +289,7 @@ impl State {
                 abliteration_scale: self.abliteration_scale,
                 daisyrose_scale: self.effective_daisyrose_scale(),
                 cognitive: self.cognitive,
+                system_appendix,
             })
             .is_err()
         {

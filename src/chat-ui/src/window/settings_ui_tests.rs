@@ -294,7 +294,14 @@ fn settings_modal_keeps_navigation_and_dismissal_inside_small_and_large_windows(
     ] {
         let mut chat = harness(size, false);
         open_settings(&mut chat);
-        for page in ["Response", "Appearance", "Voice", "Privacy", "Application"] {
+        for page in [
+            "Response",
+            "Appearance",
+            "Memory",
+            "Voice",
+            "Privacy",
+            "Application",
+        ] {
             select_page(&mut chat, page);
             let scope = if page == "Response" {
                 "This conversation"
@@ -305,6 +312,7 @@ fn settings_modal_keeps_navigation_and_dismissal_inside_small_and_large_windows(
             for label in [
                 "Response",
                 "Appearance",
+                "Memory",
                 "Voice",
                 "Privacy",
                 "Application",
@@ -581,4 +589,15 @@ fn memory_settings_and_advanced_cognitive_controls_round_trip() {
             "missing ComboBox {combo_label}"
         );
     }
+
+    select_page(&mut chat, "Memory");
+    assert!(chat.query_by_label("Persistent instructions").is_some());
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Add card")
+            .is_some()
+    );
+    assert!(
+        chat.query_by_role_and_label(egui::Role::DisclosureTriangle, "Active context inspector")
+            .is_some()
+    );
 }

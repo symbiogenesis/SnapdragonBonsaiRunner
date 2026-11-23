@@ -13,6 +13,8 @@ struct SavedWorkspace {
     next_conversation: u64,
     active: ConversationSnapshot,
     voice_profile: String,
+    #[serde(default)]
+    memory: crate::context_cards::MemoryStore,
 }
 
 pub(super) fn deserialize_history<'de, D>(deserializer: D) -> Result<Vec<client::Message>, D::Error>
@@ -98,6 +100,8 @@ struct WorkspaceView<'a> {
     next_conversation: u64,
     active: ActiveView<'a>,
     voice_profile: &'a str,
+    #[serde(skip_serializing_if = "crate::context_cards::MemoryStore::is_default_empty")]
+    memory: &'a crate::context_cards::MemoryStore,
 }
 
 fn attachments_empty(attachments: &[crate::attachment_import::Attachment]) -> bool {
@@ -165,6 +169,7 @@ impl State {
     pub(super) fn workspace_bytes(&self) -> io::Result<Vec<u8>> {
         if !client::valid_abliteration_scale(self.abliteration_scale)
             || !client::valid_daisyrose_scale(self.daisyrose_scale)
+            || !self.memory.valid()
             || !valid_parts(
                 &self.transcript,
                 &self.input,
@@ -210,6 +215,7 @@ impl State {
                 warning: self.warning,
             },
             voice_profile: &self.voice_profile,
+            memory: &self.memory,
         }, 8 * 1024 * 1024)
         .map_err(|error| {
             if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
@@ -258,6 +264,7 @@ impl State {
         self.active_conversation = saved.active_conversation;
         self.next_conversation = saved.next_conversation;
         self.voice_profile = saved.voice_profile;
+        self.memory = saved.memory;
         self.load_conversation(saved.active);
         self.restore_history = true;
         self.recovery_dirty |= adopted;
@@ -359,6 +366,7 @@ impl SavedWorkspace {
                     }
             })
             && ids.contains(&self.active_conversation)
+            && self.memory.valid()
             && valid_snapshot(&self.active)
     }
 }
@@ -1382,6 +1390,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(legacy_restored.cognitive, client::CognitiveOptions::default());
+        assert!(legacy_restored.memory.is_default_empty());
 
         let mut custom = state();
         custom.cognitive = client::CognitiveOptions {
@@ -1390,21 +1399,29 @@ mod tests {
             sampling_preset: client::SamplingPreset::BalancedDry,
             extra_effort_strategy: client::ExtraEffortStrategy::MultiDraftSynthesis,
         };
+        custom.memory.persistent_instructions = "Always cite sources.".to_owned();
+        custom
+            .memory
+            .add_card("Style", "code, rust", "Prefer small pure helpers.", false)
+            .map_err(io::Error::other)?;
         let saved_custom = custom.workspace_bytes()?;
         let mut restored_custom = state();
         restored_custom.restore_workspace(&saved_custom)?;
         assert_eq!(restored_custom.cognitive, custom.cognitive);
+        assert_eq!(restored_custom.memory, custom.memory);
 
         let mut legacy_no_cog: serde_json::Value =
             serde_json::from_slice(&saved_custom).map_err(io::Error::other)?;
-        if let Some(root) = legacy_no_cog.as_object_mut()
-            && let Some(active) = root["active"].as_object_mut()
-        {
-            active.remove("cognitive");
+        if let Some(root) = legacy_no_cog.as_object_mut() {
+            root.remove("memory");
+            if let Some(active) = root["active"].as_object_mut() {
+                active.remove("cognitive");
+            }
         }
         let mut legacy_loaded = state();
         legacy_loaded
             .restore_workspace(&serde_json::to_vec(&legacy_no_cog).map_err(io::Error::other)?)?;
+        assert!(legacy_loaded.memory.is_default_empty());
         assert_eq!(legacy_loaded.cognitive, client::CognitiveOptions::default());
         Ok(())
     }
