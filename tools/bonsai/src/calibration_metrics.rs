@@ -1,5 +1,7 @@
 //! Scaled floating-point calibration, directional alignment and dispersion metrics.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::Result;
 
 /// Summary across a sequence of candidate-versus-reference calibration rows.
@@ -731,6 +733,792 @@ pub fn solve_multiple_choice_knapsack_minimize(
     solve_multiple_choice_knapsack(groups, budget, false)
 }
 
+const GOLDEN_RATIO_CONJUGATE: f64 = 0.618_033_988_749_894_9;
+const NUCLEUS_KL_FLOOR: f64 = 1e-15;
+const MAX_DEEPCONF_WINDOW: usize = 65_536;
+
+/// Summary of a offline `TempQuant` temperature calibration run on disjoint teacher/student logits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempQuantCalibrationSummary {
+    /// Number of aligned diagnostic token positions evaluated.
+    pub tokens: u32,
+    /// Reference teacher sampling temperature used to define the target next-token distribution.
+    pub teacher_temperature: f64,
+    /// Calibrated student temperature within the declared search bounds minimizing weighted forward KL.
+    pub fitted_student_temperature: f64,
+    /// Mean forward KL divergence `KL(teacher || student)` before recalibration (at `teacher_temperature`).
+    pub baseline_kl: f64,
+    /// Mean forward KL divergence `KL(teacher || student)` at `fitted_student_temperature`.
+    pub calibrated_kl: f64,
+    /// Non-negative forward KL improvement `max(0, baseline_kl - calibrated_kl)`.
+    pub kl_reduction: f64,
+    /// Mean teacher Shannon entropy (nats) at `teacher_temperature`.
+    pub mean_teacher_entropy: f64,
+    /// Mean uncalibrated student Shannon entropy (nats) at `teacher_temperature`.
+    pub mean_student_entropy: f64,
+    /// Mean calibrated student Shannon entropy (nats) at `fitted_student_temperature`.
+    pub mean_calibrated_entropy: f64,
+    /// Whether per-token objective weights used teacher Softmax-Fisher information `sum_v p_v (1 - p_v)`.
+    pub fisher_weighted: bool,
+}
+
+/// Summary of an offline `TempQuant` nucleus (`top_p`) calibration search under fixed `top_k`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempQuantNucleusSummary {
+    /// Number of aligned diagnostic token positions evaluated.
+    pub tokens: u32,
+    /// Fixed top-k shortlist width applied before nucleus truncation.
+    pub top_k: usize,
+    /// Teacher sampling temperature.
+    pub teacher_temperature: f64,
+    /// Reference teacher nucleus threshold (`top_p` in `(0.0, 1.0]`).
+    pub teacher_top_p: f64,
+    /// Fixed student sampling temperature (e.g., from [`fit_tempquant_temperature`]).
+    pub student_temperature: f64,
+    /// Calibrated student `top_p` minimizing smoothed truncated forward KL across `[0.05, 1.00]`.
+    pub fitted_student_top_p: f64,
+    /// Mean smoothed truncated forward KL at `teacher_top_p` (`NUCLEUS_KL_FLOOR = 1e-15` over active union).
+    pub baseline_truncated_kl: f64,
+    /// Mean smoothed truncated forward KL at `fitted_student_top_p`.
+    pub calibrated_truncated_kl: f64,
+    /// Mean number of tokens retained per step in the teacher nucleus (`min_keep = 1`).
+    pub mean_teacher_active_tokens: f64,
+    /// Mean number of tokens retained per step in the calibrated student nucleus (`min_keep = 1`).
+    pub mean_student_active_tokens: f64,
+}
+
+/// Exact Shannon entropy `-sum_v p_v * log(p_v)` (in nats) computed in `f64` from raw logits.
+///
+/// # Errors
+/// Returns an error if `logits` is empty or contains non-finite entries.
+pub fn shannon_entropy_from_logits(logits: &[f64]) -> Result<f64> {
+    let log_p = log_softmax_f64(logits)?;
+    let mut entropy = 0.0_f64;
+    for &lp in &log_p {
+        let p = lp.exp();
+        if p > 0.0 {
+            entropy -= p * lp;
+        }
+    }
+    if !entropy.is_finite() {
+        return Err("Shannon entropy overflowed finite bounds.".to_owned());
+    }
+    Ok(entropy.max(0.0))
+}
+
+fn scale_logits_by_inverse_temperature(logits: &[f64], inv_temp: f64) -> Result<Vec<f64>> {
+    if !inv_temp.is_finite() || inv_temp <= 0.0 {
+        return Err("Inverse temperature must be finite and positive.".to_owned());
+    }
+    let mut scaled = Vec::with_capacity(logits.len());
+    for &value in logits {
+        if !value.is_finite() {
+            return Err(format!("Logit must be finite, got {value}."));
+        }
+        let s = value * inv_temp;
+        if !s.is_finite() {
+            return Err("Temperature-scaled logit overflowed finite f64 bounds.".to_owned());
+        }
+        scaled.push(s);
+    }
+    Ok(scaled)
+}
+
+fn validate_positive_finite_temperature(value: f64, label: &str) -> Result<()> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{label} must be finite and positive, got {value}."));
+    }
+    Ok(())
+}
+
+/// Forward KL divergence `KL(softmax(teacher / T_t) || softmax(student / T_s))` in `f64`.
+///
+/// # Errors
+/// Returns an error on empty/mismatched vectors, non-positive/non-finite temperatures, non-finite
+/// logits, or scaled logit overflow.
+pub fn temperature_scaled_kl_from_logits(
+    teacher_logits: &[f64],
+    student_logits: &[f64],
+    teacher_temperature: f64,
+    student_temperature: f64,
+) -> Result<f64> {
+    if teacher_logits.len() != student_logits.len() {
+        return Err(format!(
+            "Temperature-scaled KL vocabulary mismatch: teacher={}, student={}",
+            teacher_logits.len(),
+            student_logits.len()
+        ));
+    }
+    validate_positive_finite_temperature(teacher_temperature, "teacher_temperature")?;
+    validate_positive_finite_temperature(student_temperature, "student_temperature")?;
+    let scaled_teacher =
+        scale_logits_by_inverse_temperature(teacher_logits, 1.0 / teacher_temperature)?;
+    let scaled_student =
+        scale_logits_by_inverse_temperature(student_logits, 1.0 / student_temperature)?;
+    kl_divergence_from_logits(&scaled_teacher, &scaled_student)
+}
+
+fn normalized_teacher_weights(
+    teacher_scaled: &[Vec<f64>],
+    fisher_weighted: bool,
+) -> Result<Vec<f64>> {
+    let count = count_as_f64(teacher_scaled.len())?;
+    if !fisher_weighted {
+        return Ok(vec![1.0 / count; teacher_scaled.len()]);
+    }
+    let mut raw = Vec::with_capacity(teacher_scaled.len());
+    let mut sum = 0.0_f64;
+    for row in teacher_scaled {
+        let w = softmax_fisher_from_logits(row)?;
+        sum += w;
+        raw.push(w);
+    }
+    if !sum.is_finite() {
+        return Err("Teacher Softmax-Fisher weights overflowed finite f64 bounds.".to_owned());
+    }
+    if sum == 0.0 {
+        return Ok(vec![1.0 / count; teacher_scaled.len()]);
+    }
+    Ok(raw.into_iter().map(|w| w / sum).collect())
+}
+
+fn evaluate_tempquant_beta<T: AsRef<[f64]>>(
+    teacher_log_probs: &[Vec<f64>],
+    teacher_probs: &[Vec<f64>],
+    student_logits: &[T],
+    weights: &[f64],
+    beta: f64,
+) -> Result<(f64, f64)> {
+    let token_count = count_as_f64(student_logits.len())?;
+    let mut weighted_kl = 0.0_f64;
+    let mut entropy_sum = 0.0_f64;
+    for (((t_log_p, t_p), s_raw), &w) in teacher_log_probs
+        .iter()
+        .zip(teacher_probs)
+        .zip(student_logits)
+        .zip(weights)
+    {
+        let scaled = scale_logits_by_inverse_temperature(s_raw.as_ref(), beta)?;
+        let log_q = log_softmax_f64(&scaled)?;
+        let mut kl = 0.0_f64;
+        let mut ent = 0.0_f64;
+        for ((&lp, &p), &lq) in t_log_p.iter().zip(t_p).zip(&log_q) {
+            if p > 0.0 {
+                kl += p * (lp - lq);
+            }
+            let q = lq.exp();
+            if q > 0.0 {
+                ent -= q * lq;
+            }
+        }
+        weighted_kl += w * kl.max(0.0);
+        entropy_sum += ent.max(0.0);
+    }
+    if !weighted_kl.is_finite() || !entropy_sum.is_finite() {
+        return Err("TempQuant objective evaluation overflowed finite bounds.".to_owned());
+    }
+    Ok((weighted_kl.max(0.0), (entropy_sum / token_count).max(0.0)))
+}
+
+/// Calibrates a static student sampling temperature within `[min_student_temperature, max_student_temperature]`
+/// to align quantized student distributions with BF16 teacher logits (`TempQuant`, `arXiv:2611.22128`).
+///
+/// Minimizes the convex weighted forward KL `KL(p_teacher(T_t) || q_student(1 / beta))` over
+/// inverse temperature `beta` via deterministic 96-step golden-section search.
+///
+/// # Errors
+/// Returns an error on empty or mismatched slices, token counts exceeding `u32::MAX`, non-positive or
+/// inverted temperature bounds, or non-finite logits.
+pub fn fit_tempquant_temperature<T: AsRef<[f64]>>(
+    teacher_logits: &[T],
+    student_logits: &[T],
+    teacher_temperature: f64,
+    min_student_temperature: f64,
+    max_student_temperature: f64,
+    fisher_weighted: bool,
+) -> Result<TempQuantCalibrationSummary> {
+    if teacher_logits.is_empty() || teacher_logits.len() != student_logits.len() {
+        return Err(format!(
+            "TempQuant requires matching non-empty logit rows (teacher={}, student={}).",
+            teacher_logits.len(),
+            student_logits.len()
+        ));
+    }
+    let tokens = u32::try_from(teacher_logits.len())
+        .map_err(|_| "TempQuant token count exceeds u32::MAX.".to_owned())?;
+    validate_positive_finite_temperature(teacher_temperature, "teacher_temperature")?;
+    validate_positive_finite_temperature(min_student_temperature, "min_student_temperature")?;
+    validate_positive_finite_temperature(max_student_temperature, "max_student_temperature")?;
+    if min_student_temperature > max_student_temperature {
+        return Err(format!(
+            "min_student_temperature ({min_student_temperature}) cannot exceed max_student_temperature ({max_student_temperature})."
+        ));
+    }
+
+    let inv_t_teacher = 1.0 / teacher_temperature;
+    let mut teacher_scaled = Vec::with_capacity(teacher_logits.len());
+    let mut teacher_log_probs = Vec::with_capacity(teacher_logits.len());
+    let mut teacher_probs = Vec::with_capacity(teacher_logits.len());
+    let mut teacher_entropy_sum = 0.0_f64;
+
+    for (t_row, s_row) in teacher_logits.iter().zip(student_logits) {
+        let t_slice = t_row.as_ref();
+        let s_slice = s_row.as_ref();
+        if t_slice.is_empty() || t_slice.len() != s_slice.len() {
+            return Err(format!(
+                "TempQuant vocabulary mismatch: teacher={}, student={}.",
+                t_slice.len(),
+                s_slice.len()
+            ));
+        }
+        let scaled_t = scale_logits_by_inverse_temperature(t_slice, inv_t_teacher)?;
+        let log_p = log_softmax_f64(&scaled_t)?;
+        let probs: Vec<f64> = log_p.iter().map(|&lp| lp.exp()).collect();
+        let ent = probs
+            .iter()
+            .zip(&log_p)
+            .map(|(&p, &lp)| if p > 0.0 { -(p * lp) } else { 0.0 })
+            .sum::<f64>()
+            .max(0.0);
+        teacher_entropy_sum += ent;
+        teacher_scaled.push(scaled_t);
+        teacher_log_probs.push(log_p);
+        teacher_probs.push(probs);
+    }
+    let mean_teacher_entropy = (teacher_entropy_sum / f64::from(tokens)).max(0.0);
+    let weights = normalized_teacher_weights(&teacher_scaled, fisher_weighted)?;
+
+    let (baseline_kl, mean_student_entropy) = evaluate_tempquant_beta(
+        &teacher_log_probs,
+        &teacher_probs,
+        student_logits,
+        &weights,
+        inv_t_teacher,
+    )?;
+
+    let beta_lo = 1.0 / max_student_temperature;
+    let beta_hi = 1.0 / min_student_temperature;
+    validate_positive_finite_temperature(beta_lo, "inverse max_student_temperature")?;
+    validate_positive_finite_temperature(beta_hi, "inverse min_student_temperature")?;
+
+    let (best_beta, calibrated_kl, mean_calibrated_entropy) =
+        if (beta_hi - beta_lo).abs() <= f64::EPSILON {
+            let (kl, ent) = evaluate_tempquant_beta(
+                &teacher_log_probs,
+                &teacher_probs,
+                student_logits,
+                &weights,
+                beta_lo,
+            )?;
+            (beta_lo, kl, ent)
+        } else {
+            let mut a = beta_lo;
+            let mut b = beta_hi;
+            let mut x1 = b - GOLDEN_RATIO_CONJUGATE * (b - a);
+            let mut x2 = a + GOLDEN_RATIO_CONJUGATE * (b - a);
+            let mut f1 = evaluate_tempquant_beta(
+                &teacher_log_probs,
+                &teacher_probs,
+                student_logits,
+                &weights,
+                x1,
+            )?
+            .0;
+            let mut f2 = evaluate_tempquant_beta(
+                &teacher_log_probs,
+                &teacher_probs,
+                student_logits,
+                &weights,
+                x2,
+            )?
+            .0;
+
+            for _ in 0..96 {
+                if f1 <= f2 {
+                    b = x2;
+                    x2 = x1;
+                    f2 = f1;
+                    x1 = b - GOLDEN_RATIO_CONJUGATE * (b - a);
+                    f1 = evaluate_tempquant_beta(
+                        &teacher_log_probs,
+                        &teacher_probs,
+                        student_logits,
+                        &weights,
+                        x1,
+                    )?
+                    .0;
+                } else {
+                    a = x1;
+                    x1 = x2;
+                    f1 = f2;
+                    x2 = a + GOLDEN_RATIO_CONJUGATE * (b - a);
+                    f2 = evaluate_tempquant_beta(
+                        &teacher_log_probs,
+                        &teacher_probs,
+                        student_logits,
+                        &weights,
+                        x2,
+                    )?
+                    .0;
+                }
+            }
+
+            let mut candidates = vec![0.5 * (a + b), beta_lo, beta_hi, 0.5 * (beta_lo + beta_hi)];
+            if (min_student_temperature..=max_student_temperature).contains(&teacher_temperature) {
+                candidates.push(inv_t_teacher);
+            }
+            let mut best = (candidates[0], f64::INFINITY, 0.0_f64);
+            for cand_beta in candidates {
+                let (kl, ent) = evaluate_tempquant_beta(
+                    &teacher_log_probs,
+                    &teacher_probs,
+                    student_logits,
+                    &weights,
+                    cand_beta,
+                )?;
+                if kl < best.1 {
+                    best = (cand_beta, kl, ent);
+                }
+            }
+            best
+        };
+
+    let fitted_student_temperature =
+        (1.0 / best_beta).clamp(min_student_temperature, max_student_temperature);
+    Ok(TempQuantCalibrationSummary {
+        tokens,
+        teacher_temperature,
+        fitted_student_temperature,
+        baseline_kl,
+        calibrated_kl,
+        kl_reduction: (baseline_kl - calibrated_kl).max(0.0),
+        mean_teacher_entropy,
+        mean_student_entropy,
+        mean_calibrated_entropy,
+        fisher_weighted,
+    })
+}
+
+fn top_k_sorted_probs(logits: &[f64], temperature: f64, top_k: usize) -> Result<Vec<(usize, f64)>> {
+    let scaled = scale_logits_by_inverse_temperature(logits, 1.0 / temperature)?;
+    let log_p = log_softmax_f64(&scaled)?;
+    let mut ranked: Vec<(usize, f64)> = log_p
+        .into_iter()
+        .enumerate()
+        .map(|(idx, lp)| (idx, lp.exp()))
+        .collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked.truncate(top_k.min(ranked.len()));
+    Ok(ranked)
+}
+
+fn nucleus_truncate(sorted_top_k: &[(usize, f64)], top_p: f64) -> Vec<(usize, f64)> {
+    let mut kept = Vec::new();
+    let mut cum = 0.0_f64;
+    for &(idx, prob) in sorted_top_k {
+        kept.push((idx, prob));
+        cum += prob;
+        if cum >= top_p {
+            break;
+        }
+    }
+    let kept_sum: f64 = kept.iter().map(|&(_, prob)| prob).sum();
+    if kept_sum > 0.0 {
+        for &mut (_, ref mut prob) in &mut kept {
+            *prob /= kept_sum;
+        }
+    } else if !kept.is_empty() {
+        let uniform = 1.0 / f64::from(u32::try_from(kept.len()).unwrap_or(1));
+        for &mut (_, ref mut prob) in &mut kept {
+            *prob = uniform;
+        }
+    }
+    kept
+}
+
+fn smoothed_nucleus_kl(teacher_kept: &[(usize, f64)], student_kept: &[(usize, f64)]) -> f64 {
+    let mut union = BTreeSet::new();
+    let mut t_map = BTreeMap::new();
+    let mut s_map = BTreeMap::new();
+    for &(idx, prob) in teacher_kept {
+        union.insert(idx);
+        t_map.insert(idx, prob);
+    }
+    for &(idx, prob) in student_kept {
+        union.insert(idx);
+        s_map.insert(idx, prob);
+    }
+    let mut t_sum = 0.0_f64;
+    let mut s_sum = 0.0_f64;
+    let mut pairs = Vec::with_capacity(union.len());
+    for idx in union {
+        let tp = t_map.get(&idx).copied().unwrap_or(0.0) + NUCLEUS_KL_FLOOR;
+        let sp = s_map.get(&idx).copied().unwrap_or(0.0) + NUCLEUS_KL_FLOOR;
+        t_sum += tp;
+        s_sum += sp;
+        pairs.push((tp, sp));
+    }
+    let mut kl = 0.0_f64;
+    for (tp_raw, sp_raw) in pairs {
+        let tp = tp_raw / t_sum;
+        let sp = sp_raw / s_sum;
+        kl += tp * (tp.ln() - sp.ln());
+    }
+    kl.max(0.0)
+}
+
+/// Calibrates student nucleus threshold `top_p` in `[0.05, 1.00]` under a fixed `top_k` and
+/// `student_temperature` to match teacher truncated distributions (`TempQuant`, `arXiv:2611.22128`).
+///
+/// Always retains at least 1 token per step (`min_keep = 1`), and scores mismatched support cleanly
+/// using a `1e-15` probability floor over the union of active teacher and student nucleus indices.
+///
+/// # Errors
+/// Returns an error on invalid bounds, empty/mismatched slices, or non-finite logits.
+pub fn fit_tempquant_top_p<T: AsRef<[f64]>>(
+    teacher_logits: &[T],
+    student_logits: &[T],
+    teacher_temperature: f64,
+    teacher_top_p: f64,
+    student_temperature: f64,
+    top_k: usize,
+) -> Result<TempQuantNucleusSummary> {
+    if teacher_logits.is_empty() || teacher_logits.len() != student_logits.len() {
+        return Err(format!(
+            "TempQuant nucleus fitting requires matching non-empty logit rows (teacher={}, student={}).",
+            teacher_logits.len(),
+            student_logits.len()
+        ));
+    }
+    let tokens = u32::try_from(teacher_logits.len())
+        .map_err(|_| "TempQuant token count exceeds u32::MAX.".to_owned())?;
+    if top_k == 0 {
+        return Err("TempQuant top_k must be at least 1.".to_owned());
+    }
+    validate_positive_finite_temperature(teacher_temperature, "teacher_temperature")?;
+    validate_positive_finite_temperature(student_temperature, "student_temperature")?;
+    if !teacher_top_p.is_finite() || teacher_top_p <= 0.0 || teacher_top_p > 1.0 {
+        return Err(format!(
+            "teacher_top_p must be finite and in (0.0, 1.0], got {teacher_top_p}."
+        ));
+    }
+
+    let mut teacher_nuclei = Vec::with_capacity(teacher_logits.len());
+    let mut student_ranked = Vec::with_capacity(student_logits.len());
+    let mut teacher_active_total = 0_usize;
+
+    for (t_row, s_row) in teacher_logits.iter().zip(student_logits) {
+        let t_slice = t_row.as_ref();
+        let s_slice = s_row.as_ref();
+        if t_slice.is_empty() || t_slice.len() != s_slice.len() {
+            return Err(format!(
+                "TempQuant vocabulary mismatch: teacher={}, student={}.",
+                t_slice.len(),
+                s_slice.len()
+            ));
+        }
+        let t_top_k = top_k_sorted_probs(t_slice, teacher_temperature, top_k)?;
+        let s_top_k = top_k_sorted_probs(s_slice, student_temperature, top_k)?;
+        let t_kept = nucleus_truncate(&t_top_k, teacher_top_p);
+        teacher_active_total = teacher_active_total.saturating_add(t_kept.len());
+        teacher_nuclei.push(t_kept);
+        student_ranked.push(s_top_k);
+    }
+
+    let eval_top_p = |candidate: f64| -> Result<(f64, f64)> {
+        let mut kl_sum = 0.0_f64;
+        let mut active_sum = 0_usize;
+        for (t_kept, s_top_k) in teacher_nuclei.iter().zip(&student_ranked) {
+            let s_kept = nucleus_truncate(s_top_k, candidate);
+            active_sum = active_sum.saturating_add(s_kept.len());
+            kl_sum += smoothed_nucleus_kl(t_kept, &s_kept);
+        }
+        Ok((
+            (kl_sum / f64::from(tokens)).max(0.0),
+            count_as_f64(active_sum)? / f64::from(tokens),
+        ))
+    };
+
+    let (baseline_truncated_kl, mut best_active_mean) = eval_top_p(teacher_top_p)?;
+    let mut best_top_p = teacher_top_p;
+    let mut best_kl = baseline_truncated_kl;
+
+    for hundredth in 5_u16..=100 {
+        let cand = f64::from(hundredth) / 100.0;
+        let (kl, active_mean) = eval_top_p(cand)?;
+        let strictly_better = kl < best_kl - 1e-12;
+        let close_tie = (kl - best_kl).abs() <= 1e-12
+            && (cand - teacher_top_p).abs() < (best_top_p - teacher_top_p).abs();
+        if strictly_better || close_tie {
+            best_top_p = cand;
+            best_kl = kl;
+            best_active_mean = active_mean;
+        }
+    }
+
+    Ok(TempQuantNucleusSummary {
+        tokens,
+        top_k,
+        teacher_temperature,
+        teacher_top_p,
+        student_temperature,
+        fitted_student_top_p: best_top_p,
+        baseline_truncated_kl,
+        calibrated_truncated_kl: best_kl,
+        mean_teacher_active_tokens: count_as_f64(teacher_active_total)? / f64::from(tokens),
+        mean_student_active_tokens: best_active_mean,
+    })
+}
+
+/// Computes `DeepConf` (`arXiv:2508.15260`) per-token confidence `-(1/k) * sum_{j=1}^k log P(j)`
+/// over the top `k` logits in `f64`.
+///
+/// Higher values denote sharper distributions (greater model confidence relative to the top-k tail).
+///
+/// # Errors
+/// Returns an error if `top_k == 0`, `logits` is empty, or `logits` contains non-finite values.
+pub fn deepconf_token_confidence_from_logits(logits: &[f64], top_k: usize) -> Result<f64> {
+    if top_k == 0 {
+        return Err("DeepConf top_k must be at least 1.".to_owned());
+    }
+    let mut log_p = log_softmax_f64(logits)?;
+    let k = top_k.min(log_p.len());
+    if k < log_p.len() {
+        let _ = log_p.select_nth_unstable_by(k - 1, |left, right| right.total_cmp(left));
+    }
+    let sum_top_k: f64 = log_p[..k].iter().sum();
+    let confidence = (-sum_top_k / count_as_f64(k)?).max(0.0);
+    if !confidence.is_finite() {
+        return Err("DeepConf token confidence overflowed finite bounds.".to_owned());
+    }
+    Ok(confidence)
+}
+
+/// Bounded streaming sliding-window confidence tracker for `DeepConf` (`arXiv:2508.15260`).
+#[derive(Clone, Debug)]
+pub struct DeepConfWindowTracker {
+    window_size: usize,
+    ring: Vec<f64>,
+    cursor: usize,
+    count: usize,
+    window_sum: f64,
+    lowest_full_window: Option<f64>,
+}
+
+impl DeepConfWindowTracker {
+    /// Creates a new tracker with sliding window length `window_size` in `1..=65_536`.
+    ///
+    /// # Errors
+    /// Rejects zero or oversized window sizes.
+    pub fn new(window_size: usize) -> Result<Self> {
+        if window_size == 0 || window_size > MAX_DEEPCONF_WINDOW {
+            return Err(format!(
+                "DeepConf window_size must be in 1..={MAX_DEEPCONF_WINDOW}, got {window_size}."
+            ));
+        }
+        Ok(Self {
+            window_size,
+            ring: Vec::with_capacity(window_size.min(256)),
+            cursor: 0,
+            count: 0,
+            window_sum: 0.0,
+            lowest_full_window: None,
+        })
+    }
+
+    /// Pushes one finite non-negative token confidence observation and returns the updated window mean.
+    ///
+    /// # Errors
+    /// Rejects non-finite or negative confidence values, or non-finite running totals.
+    pub fn push(&mut self, token_confidence: f64) -> Result<f64> {
+        if !token_confidence.is_finite() || token_confidence < 0.0 {
+            return Err(format!(
+                "DeepConf token_confidence must be finite and non-negative, got {token_confidence}."
+            ));
+        }
+        if self.ring.len() < self.window_size {
+            self.ring.push(token_confidence);
+            self.window_sum += token_confidence;
+        } else {
+            let evicted = self.ring[self.cursor];
+            self.ring[self.cursor] = token_confidence;
+            self.cursor = (self.cursor + 1) % self.window_size;
+            if self.cursor == 0 {
+                // Re-sum periodically on ring wrap to prevent accumulated cancellation drift.
+                self.window_sum = self.ring.iter().sum();
+            } else {
+                self.window_sum = (self.window_sum - evicted + token_confidence).max(0.0);
+            }
+        }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| "DeepConf pushed token count overflowed usize.".to_owned())?;
+        if !self.window_sum.is_finite() {
+            return Err(
+                "DeepConf sliding-window confidence sum overflowed finite bounds.".to_owned(),
+            );
+        }
+        let mean = (self.window_sum / count_as_f64(self.ring.len())?).max(0.0);
+        if self.count >= self.window_size {
+            self.lowest_full_window =
+                Some(self.lowest_full_window.map_or(mean, |prev| prev.min(mean)));
+        }
+        Ok(mean)
+    }
+
+    /// Total number of token confidence values pushed into this trace so far.
+    #[must_use]
+    pub const fn token_count(&self) -> usize {
+        self.count
+    }
+
+    /// Mean confidence of the active trailing window, or `None` before any token is pushed.
+    #[must_use]
+    pub fn current_window_confidence(&self) -> Option<f64> {
+        if self.ring.is_empty() {
+            return None;
+        }
+        let denom = u32::try_from(self.ring.len()).ok()?;
+        Some((self.window_sum / f64::from(denom)).max(0.0))
+    }
+
+    /// Lowest full-window group confidence seen so far (falling back to current window for short traces).
+    #[must_use]
+    pub fn lowest_group_confidence(&self) -> Option<f64> {
+        self.lowest_full_window
+            .or_else(|| self.current_window_confidence())
+    }
+
+    /// Trailing tail confidence equal to the most recent window mean.
+    #[must_use]
+    pub fn tail_confidence(&self) -> Option<f64> {
+        self.current_window_confidence()
+    }
+
+    /// Returns `true` when at least one full window has formed and its mean falls below `threshold`.
+    #[must_use]
+    pub fn should_stop_online(&self, threshold: f64) -> bool {
+        threshold.is_finite()
+            && self.count >= self.window_size
+            && self
+                .current_window_confidence()
+                .is_some_and(|mean| mean < threshold)
+    }
+}
+
+fn ceil_fraction_count(total: usize, fraction: f64) -> Result<usize> {
+    let target = count_as_f64(total)? * fraction;
+    let candidates: Vec<usize> = (1..=total).collect();
+    let idx =
+        candidates.partition_point(|&k| f64::from(u32::try_from(k).unwrap_or(u32::MAX)) < target);
+    Ok(candidates.get(idx).copied().unwrap_or(total))
+}
+
+/// Computes the `DeepConf` online warmup stopping threshold `s_tau` keeping `keep_fraction`
+/// of warmup lowest-group confidences (`arXiv:2508.15260`, top-eta quantile boundary).
+///
+/// # Errors
+/// Returns an error if `warmup_lowest_confidences` is empty, contains negative/non-finite entries,
+/// or `keep_fraction` is outside `(0.0, 1.0]`.
+pub fn deepconf_warmup_threshold(
+    warmup_lowest_confidences: &[f64],
+    keep_fraction: f64,
+) -> Result<f64> {
+    if warmup_lowest_confidences.is_empty() {
+        return Err("DeepConf warmup requires at least one confidence observation.".to_owned());
+    }
+    if !keep_fraction.is_finite() || keep_fraction <= 0.0 || keep_fraction > 1.0 {
+        return Err(format!(
+            "DeepConf keep_fraction must be finite and in (0.0, 1.0], got {keep_fraction}."
+        ));
+    }
+    let mut sorted = Vec::with_capacity(warmup_lowest_confidences.len());
+    for &c in warmup_lowest_confidences {
+        if !c.is_finite() || c < 0.0 {
+            return Err(format!(
+                "DeepConf warmup confidence must be finite and non-negative, got {c}."
+            ));
+        }
+        sorted.push(c);
+    }
+    sorted.sort_by(f64::total_cmp);
+    let keep_count = ceil_fraction_count(sorted.len(), keep_fraction)?;
+    Ok(sorted[sorted.len() - keep_count])
+}
+
+/// Filters candidate traces to the top `keep_fraction` by trace confidence and returns the
+/// confidence-weighted majority answer plus its normalized vote share in `[0.0, 1.0]`.
+///
+/// Returns `Ok(None)` when `candidates` is empty. Falls back to equal `1.0` weights if all retained
+/// candidates have zero confidence. Ties in accumulated vote weight resolve deterministically to the
+/// lexicographically smaller answer string.
+///
+/// # Errors
+/// Returns an error on invalid `keep_fraction` or negative/non-finite confidence entries.
+pub fn deepconf_weighted_vote(
+    candidates: &[(&str, f64)],
+    keep_fraction: f64,
+) -> Result<Option<(String, f64)>> {
+    if !keep_fraction.is_finite() || keep_fraction <= 0.0 || keep_fraction > 1.0 {
+        return Err(format!(
+            "DeepConf keep_fraction must be finite and in (0.0, 1.0], got {keep_fraction}."
+        ));
+    }
+    for &(_, confidence) in candidates {
+        if !confidence.is_finite() || confidence < 0.0 {
+            return Err(format!(
+                "DeepConf candidate confidence must be finite and non-negative, got {confidence}."
+            ));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&left, &right| {
+        candidates[right]
+            .1
+            .total_cmp(&candidates[left].1)
+            .then_with(|| left.cmp(&right))
+    });
+    let keep_count = ceil_fraction_count(candidates.len(), keep_fraction)?;
+    let kept = &order[..keep_count];
+    let nonzero_sum: f64 = kept.iter().map(|&idx| candidates[idx].1).sum();
+    let use_uniform = nonzero_sum == 0.0;
+
+    let mut totals: BTreeMap<&str, f64> = BTreeMap::new();
+    let mut total_weight = 0.0_f64;
+    for &idx in kept {
+        let (answer, conf) = candidates[idx];
+        let weight = if use_uniform { 1.0 } else { conf };
+        *totals.entry(answer).or_insert(0.0) += weight;
+        total_weight += weight;
+    }
+    if !total_weight.is_finite() || total_weight <= 0.0 {
+        return Err(
+            "DeepConf weighted vote total weight was non-finite or non-positive.".to_owned(),
+        );
+    }
+    let mut best_answer = "";
+    let mut best_weight = f64::NEG_INFINITY;
+    for (answer, weight) in totals {
+        if weight > best_weight {
+            best_weight = weight;
+            best_answer = answer;
+        }
+    }
+    Ok(Some((
+        best_answer.to_owned(),
+        (best_weight / total_weight).clamp(0.0, 1.0),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +1689,128 @@ mod tests {
         assert_eq!(summary.min_cosine_similarity, Some(1.0));
         assert_eq!(summary.mean_cosine_similarity, Some(1.0));
         assert_eq!(summary.mean_candidate_coordinate_coverage, Some(0.5));
+        Ok(())
+    }
+
+    #[test]
+    fn tempquant_recovers_exact_temperature_and_restores_teacher_entropy() -> Result<()> {
+        let teacher = [
+            vec![3.2_f64, 1.4, -0.5, -2.0],
+            vec![0.8, 0.7, -0.1, -1.2],
+            vec![5.0, 0.2, -1.0, -3.0],
+        ];
+        // Quantized student with logits cooled by 1/0.7 relative to teacher plus constant shift.
+        let student: Vec<Vec<f64>> = teacher
+            .iter()
+            .map(|row| row.iter().map(|&v| 0.7 * v + 3.5).collect())
+            .collect();
+
+        let unweighted = fit_tempquant_temperature(&teacher, &student, 1.0, 0.25, 2.0, false)?;
+        assert_eq!(unweighted.tokens, 3);
+        assert!(!unweighted.fisher_weighted);
+        assert!((unweighted.fitted_student_temperature - 0.7).abs() < 1e-6);
+        assert!(unweighted.baseline_kl > 0.02);
+        assert!(unweighted.calibrated_kl < 1e-12);
+        assert!(unweighted.kl_reduction > 0.02);
+        assert!(
+            (unweighted.mean_calibrated_entropy - unweighted.mean_teacher_entropy).abs() < 1e-6
+        );
+        assert!(
+            (unweighted.mean_teacher_entropy - shannon_entropy_from_logits(&teacher[0])?).abs()
+                < 2.0
+        );
+
+        let weighted = fit_tempquant_temperature(&teacher, &student, 1.0, 0.25, 2.0, true)?;
+        assert!(weighted.fisher_weighted);
+        assert!((weighted.fitted_student_temperature - 0.7).abs() < 1e-6);
+        assert!(weighted.calibrated_kl <= weighted.baseline_kl);
+
+        // Matched logits must preserve T_teacher without regression.
+        let matched = fit_tempquant_temperature(&teacher, &teacher, 1.25, 0.25, 2.0, true)?;
+        assert!(matched.calibrated_kl <= matched.baseline_kl);
+        assert!(matched.calibrated_kl < 1e-12);
+
+        // Temperature-scaled KL helper validates bounds cleanly.
+        assert!(temperature_scaled_kl_from_logits(&teacher[0], &student[0], 1.0, 0.7)? < 1e-12);
+        assert!(temperature_scaled_kl_from_logits(&teacher[0], &student[0], 0.0, 1.0).is_err());
+        assert!(fit_tempquant_temperature(&teacher, &student, 1.0, 1.5, 0.5, false).is_err());
+        assert!(fit_tempquant_temperature(&teacher[..2], &student, 1.0, 0.5, 2.0, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tempquant_nucleus_calibration_reduces_truncated_kl_and_rejects_invalid_inputs() -> Result<()>
+    {
+        // Sharpened student hits top_p=0.95 with too few active tokens unless student_top_p is raised.
+        let teacher = [vec![2.0_f64, 1.35, 0.8, -4.0], vec![1.9, 1.4, 0.7, -4.0]];
+        let student: Vec<Vec<f64>> = teacher
+            .iter()
+            .map(|row| row.iter().map(|&v| v * 1.4).collect())
+            .collect();
+        let summary = fit_tempquant_top_p(&teacher, &student, 1.0, 0.90, 1.0, 4)?;
+        assert_eq!(summary.tokens, 2);
+        assert_eq!(summary.top_k, 4);
+        assert!(summary.calibrated_truncated_kl <= summary.baseline_truncated_kl);
+        assert!(summary.mean_student_active_tokens >= 1.0);
+
+        assert!(fit_tempquant_top_p(&teacher, &student, 1.0, 0.0, 1.0, 4).is_err());
+        assert!(fit_tempquant_top_p(&teacher, &student, 1.0, 1.1, 1.0, 4).is_err());
+        assert!(fit_tempquant_top_p(&teacher, &student, 1.0, 0.9, 1.0, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn deepconf_tracker_detects_low_confidence_dip_and_votes_by_confidence() -> Result<()> {
+        let peaked = [8.0_f64, 0.0, -4.0, -6.0];
+        let flat = [0.1_f64, 0.0, -0.1, -0.2];
+        let c_peaked = deepconf_token_confidence_from_logits(&peaked, 4)?;
+        let c_flat = deepconf_token_confidence_from_logits(&flat, 4)?;
+        assert!(c_peaked > c_flat);
+        assert!(deepconf_token_confidence_from_logits(&peaked, 0).is_err());
+
+        let warmup = [2.4_f64, 3.1, 2.8, 1.9, 3.4];
+        // top 40% of 5 = ceil(2.0) = 2 -> sorted = [1.9, 2.4, 2.8, 3.1, 3.4] -> index 3 = 3.1
+        assert!((deepconf_warmup_threshold(&warmup, 0.4)? - 3.1).abs() < 1e-12);
+        let s_tau = 2.5;
+
+        let mut tracker = DeepConfWindowTracker::new(3)?;
+        assert_eq!(tracker.current_window_confidence(), None);
+        assert_eq!(tracker.lowest_group_confidence(), None);
+
+        // Before window_size=3 tokens, even low values do not fire online early stop.
+        assert!((tracker.push(1.0)? - 1.0).abs() < 1e-12);
+        assert!(!tracker.should_stop_online(s_tau));
+        tracker.push(4.0)?;
+        assert!(!tracker.should_stop_online(s_tau));
+        // 3rd push forms first full window: (1 + 4 + 4)/3 = 3.0 >= 2.5 -> keeps going.
+        assert!((tracker.push(4.0)? - 3.0).abs() < 1e-12);
+        assert!(!tracker.should_stop_online(s_tau));
+        // Push low-confidence dip so trailing window drops to (4 + 0.5 + 0.5)/3 = 1.666... < 2.5.
+        tracker.push(0.5)?;
+        let trailing = tracker.push(0.5)?;
+        assert!((trailing - (5.0 / 3.0)).abs() < 1e-12);
+        assert!(tracker.should_stop_online(s_tau));
+        assert_eq!(tracker.token_count(), 5);
+        assert!((tracker.lowest_group_confidence().unwrap_or(0.0) - trailing).abs() < 1e-12);
+        assert_eq!(tracker.tail_confidence(), Some(trailing));
+
+        // Weighted consensus: 3 low-confidence wrong traces vs 2 high-confidence correct traces.
+        let candidates = [
+            ("wrong", 0.5),
+            ("wrong", 0.6),
+            ("right", 4.5),
+            ("wrong", 0.7),
+            ("right", 3.5),
+        ];
+        let (winner, share) =
+            deepconf_weighted_vote(&candidates, 0.6)?.ok_or("Expected non-empty vote result.")?;
+        assert_eq!(winner, "right");
+        assert!((share - (8.0 / 8.7)).abs() < 1e-12);
+
+        assert_eq!(deepconf_weighted_vote(&[], 0.5)?, None);
+        assert!(DeepConfWindowTracker::new(0).is_err());
+        assert!(deepconf_warmup_threshold(&[], 0.5).is_err());
+        assert!(deepconf_weighted_vote(&[("a", -0.1)], 0.5).is_err());
         Ok(())
     }
 }
