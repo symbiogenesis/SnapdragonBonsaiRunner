@@ -1365,8 +1365,9 @@ mod quant_dispatch {
         Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
         Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows,
         dot_q4_k_repacked8, dot_q4_k_row, dot_q6_k_4rows, dot_q6_k_row, dot_q8_0_4rows,
-        dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x2, gemm_q6_k_4x2, gemm_q8_0_4x2,
-        quantize_row_q8_0, quantize_row_q8_k,
+        dot_q8_0_8rows, dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x2, gemm_q6_k_4x2,
+        gemm_q8_0_4x2, gemm_q8_0_8x2, gemm_q8_0_8x4, gemm_q8_0_8x8, quantize_row_q8_0,
+        quantize_row_q8_k,
     };
 
     use super::{LinearProjection, WeightQuantization, run_row_chunks_aligned};
@@ -1374,6 +1375,7 @@ mod quant_dispatch {
     thread_local! {
         static ACT_Q8_0: RefCell<Vec<Q8_0ActBlock>> = const { RefCell::new(Vec::new()) };
         static ACT_Q8_K: RefCell<Vec<Q8_KActBlock>> = const { RefCell::new(Vec::new()) };
+        static GROUP_COMBINED: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     }
 
     pub(super) fn with_q8_0_act<R>(input: &[f32], action: impl FnOnce(&[Q8_0ActBlock]) -> R) -> R {
@@ -1406,6 +1408,76 @@ mod quant_dispatch {
         })
     }
 
+    pub(super) fn with_group_workspace<R>(
+        total_out: usize,
+        need_q8: bool,
+        need_qk: bool,
+        input: &[f32],
+        action: impl FnOnce(&mut [f32], &[Q8_0ActBlock], &[Q8_KActBlock]) -> R,
+    ) -> R {
+        let q8_blocks = if need_q8 {
+            input.len() / Q8_0_BLOCK_ELEMENTS
+        } else {
+            0
+        };
+        let qk_blocks = if need_qk { input.len() / QK_K } else { 0 };
+        GROUP_COMBINED.with(|comb_cell| {
+            let mut comb_fallback = Vec::new();
+            let mut comb_guard = comb_cell.try_borrow_mut().ok();
+            let combined = match comb_guard.as_deref_mut() {
+                Some(buf) => {
+                    buf.resize(total_out, 0.0);
+                    &mut buf[..total_out]
+                }
+                None => {
+                    comb_fallback.resize(total_out, 0.0);
+                    &mut comb_fallback[..total_out]
+                }
+            };
+            ACT_Q8_0.with(|q8_cell| {
+                ACT_Q8_K.with(|qk_cell| {
+                    let mut q8_fallback = Vec::new();
+                    let mut q8_guard = need_q8.then(|| q8_cell.try_borrow_mut().ok()).flatten();
+                    let q8_slice: &[Q8_0ActBlock] = if need_q8 {
+                        match q8_guard.as_deref_mut() {
+                            Some(buf) => {
+                                buf.resize(q8_blocks, Q8_0ActBlock::default());
+                                quantize_row_q8_0(input, &mut buf[..q8_blocks]);
+                                &buf[..q8_blocks]
+                            }
+                            None => {
+                                q8_fallback.resize(q8_blocks, Q8_0ActBlock::default());
+                                quantize_row_q8_0(input, &mut q8_fallback);
+                                &q8_fallback[..q8_blocks]
+                            }
+                        }
+                    } else {
+                        &[]
+                    };
+                    let mut qk_fallback = Vec::new();
+                    let mut qk_guard = need_qk.then(|| qk_cell.try_borrow_mut().ok()).flatten();
+                    let qk_slice: &[Q8_KActBlock] = if need_qk {
+                        match qk_guard.as_deref_mut() {
+                            Some(buf) => {
+                                buf.resize(qk_blocks, Q8_KActBlock::default());
+                                quantize_row_q8_k(input, &mut buf[..qk_blocks]);
+                                &buf[..qk_blocks]
+                            }
+                            None => {
+                                qk_fallback.resize(qk_blocks, Q8_KActBlock::default());
+                                quantize_row_q8_k(input, &mut qk_fallback);
+                                &qk_fallback[..qk_blocks]
+                            }
+                        }
+                    } else {
+                        &[]
+                    };
+                    action(combined, q8_slice, qk_slice)
+                })
+            })
+        })
+    }
+
     pub(super) fn add_packed_rows(
         ggml_type: u32,
         bytes: &[u8],
@@ -1424,25 +1496,37 @@ mod quant_dispatch {
         };
         let row_bytes = (in_dim / block) * elem_bytes;
         let mut processed = 0_usize;
-        if start_row.is_multiple_of(4) || dst.len() >= 4 {
-            for quad in dst.chunks_exact_mut(4) {
+        if ggml_type == 8 {
+            for oct in dst.chunks_exact_mut(8) {
                 let r0 = (start_row + processed) * row_bytes;
-                let row_refs = [
-                    &bytes[r0..r0 + row_bytes],
-                    &bytes[r0 + row_bytes..r0 + 2 * row_bytes],
-                    &bytes[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
-                    &bytes[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
-                ];
-                let sums = match ggml_type {
-                    8 => dot_q8_0_4rows(caps, row_refs, q8_act),
-                    12 => dot_q4_k_4rows(caps, row_refs, qk_act),
-                    _ => dot_q6_k_4rows(caps, row_refs, qk_act),
-                };
-                for (slot, add) in quad.iter_mut().zip(sums) {
+                let row_refs: [&[u8]; 8] = std::array::from_fn(|r| {
+                    let start = r0 + r * row_bytes;
+                    &bytes[start..start + row_bytes]
+                });
+                let sums = dot_q8_0_8rows(caps, row_refs, q8_act);
+                for (slot, add) in oct.iter_mut().zip(sums) {
                     *slot += add;
                 }
-                processed += 4;
+                processed += 8;
             }
+        }
+        for quad in dst[processed..].chunks_exact_mut(4) {
+            let r0 = (start_row + processed) * row_bytes;
+            let row_refs = [
+                &bytes[r0..r0 + row_bytes],
+                &bytes[r0 + row_bytes..r0 + 2 * row_bytes],
+                &bytes[r0 + 2 * row_bytes..r0 + 3 * row_bytes],
+                &bytes[r0 + 3 * row_bytes..r0 + 4 * row_bytes],
+            ];
+            let sums = match ggml_type {
+                8 => dot_q8_0_4rows(caps, row_refs, q8_act),
+                12 => dot_q4_k_4rows(caps, row_refs, qk_act),
+                _ => dot_q6_k_4rows(caps, row_refs, qk_act),
+            };
+            for (slot, add) in quad.iter_mut().zip(sums) {
+                *slot += add;
+            }
+            processed += 4;
         }
         for (local, slot) in dst[processed..].iter_mut().enumerate() {
             let off = (start_row + processed + local) * row_bytes;
@@ -1472,7 +1556,7 @@ mod quant_dispatch {
         }
         if ggml_type == 8 {
             with_q8_0_act(input, |act| {
-                run_row_chunks_aligned(out, worker_count, 4, |start_row, dst| {
+                run_row_chunks_aligned(out, worker_count, 8, |start_row, dst| {
                     add_packed_rows(8, bytes, in_dim, caps, act, &[], start_row, dst);
                 });
             });
@@ -1702,6 +1786,95 @@ mod quant_dispatch {
 
     #[expect(
         clippy::too_many_arguments,
+        reason = "8-row Q8_0 I8MM GEMM kernel processes 8x8/8x4/8x2/8x1 tiles over arbitrary row slices."
+    )]
+    fn add_batch_q8_0_gemm(
+        dst: &mut [f32],
+        bytes: &[u8],
+        in_dim: usize,
+        seq_len: usize,
+        local_row_start: usize,
+        rows_here: usize,
+        caps: Arm64QuantCaps,
+        q8_act: &[Q8_0ActBlock],
+    ) {
+        let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
+        let row_bytes = blocks_per_tok * Q8_0_BLOCK_BYTES;
+        let mut processed = 0_usize;
+        while processed + 8 <= rows_here {
+            let r0 = (local_row_start + processed) * row_bytes;
+            let row_refs: [&[u8]; 8] = std::array::from_fn(|r| {
+                let start = r0 + r * row_bytes;
+                &bytes[start..start + row_bytes]
+            });
+            let mut t = 0_usize;
+            while t + 8 <= seq_len {
+                let acts: [&[Q8_0ActBlock]; 8] = std::array::from_fn(|k| {
+                    &q8_act[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                });
+                let tile = gemm_q8_0_8x8(caps, row_refs, acts);
+                for (r, row_vals) in tile.iter().enumerate() {
+                    let base = (processed + r) * seq_len + t;
+                    for (k, &val) in row_vals.iter().enumerate() {
+                        dst[base + k] += val;
+                    }
+                }
+                t += 8;
+            }
+            if t + 4 <= seq_len {
+                let acts: [&[Q8_0ActBlock]; 4] = std::array::from_fn(|k| {
+                    &q8_act[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                });
+                let tile = gemm_q8_0_8x4(caps, row_refs, acts);
+                for (r, row_vals) in tile.iter().enumerate() {
+                    let base = (processed + r) * seq_len + t;
+                    for (k, &val) in row_vals.iter().enumerate() {
+                        dst[base + k] += val;
+                    }
+                }
+                t += 4;
+            }
+            if t + 2 <= seq_len {
+                let acts: [&[Q8_0ActBlock]; 2] = std::array::from_fn(|k| {
+                    &q8_act[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                });
+                let tile = gemm_q8_0_8x2(caps, row_refs, acts);
+                for (r, row_vals) in tile.iter().enumerate() {
+                    let base = (processed + r) * seq_len + t;
+                    dst[base] += row_vals[0];
+                    dst[base + 1] += row_vals[1];
+                }
+                t += 2;
+            }
+            if t < seq_len {
+                let a0 = &q8_act[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                let col = dot_q8_0_8rows(caps, row_refs, a0);
+                for (r, &val) in col.iter().enumerate() {
+                    dst[(processed + r) * seq_len + t] += val;
+                }
+            }
+            processed += 8;
+        }
+        if processed < rows_here {
+            add_batch_4row_gemm(
+                &mut dst[processed * seq_len..],
+                bytes,
+                in_dim,
+                seq_len,
+                local_row_start + processed,
+                rows_here - processed,
+                Q8_0_BLOCK_ELEMENTS,
+                Q8_0_BLOCK_BYTES,
+                q8_act,
+                |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
+                |r, a0| dot_q8_0_4rows(caps, r, a0),
+                |r, a0| dot_q8_0_row(caps, r, a0),
+            );
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
         reason = "Dispatches batched quantized GEMM kernels over shared pre-quantized batch activations."
     )]
     fn dispatch_batch_segment(
@@ -1719,19 +1892,8 @@ mod quant_dispatch {
             GroupKind::Packed {
                 ggml_type: 8,
                 bytes,
-            } => add_batch_4row_gemm(
-                dst,
-                bytes,
-                in_dim,
-                seq_len,
-                local_row,
-                rows_here,
-                Q8_0_BLOCK_ELEMENTS,
-                Q8_0_BLOCK_BYTES,
-                q8_act,
-                |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
-                |r, a0| dot_q8_0_4rows(caps, r, a0),
-                |r, a0| dot_q8_0_row(caps, r, a0),
+            } => add_batch_q8_0_gemm(
+                dst, bytes, in_dim, seq_len, local_row, rows_here, caps, q8_act,
             ),
             GroupKind::Packed {
                 ggml_type: 12,
@@ -1914,7 +2076,7 @@ mod quant_dispatch {
         }
         let worker_count = worker_count.clamp(1, 18).min(out_dim.max(1));
         let row_align = match kind {
-            GroupKind::Repacked(_) => 8,
+            GroupKind::Repacked(_) | GroupKind::Packed { ggml_type: 8, .. } => 8,
             GroupKind::Packed { .. } => 4,
         };
         match kind {
@@ -2035,109 +2197,114 @@ fn forward_group_into(
         total_out = total_out.saturating_add(proj.out_dim);
     }
 
-    if threads > 1 && total_out >= 8 {
+    if threads > 1 && total_out >= 8 && targets.len() <= 4 {
         let caps = bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect();
-        let all_packed = caps.dotprod
-            && targets
-                .iter()
-                .all(|(p, _, _)| quant_dispatch::classify_group_proj(p).is_some());
-        if all_packed {
+        if caps.dotprod {
+            #[derive(Clone, Copy)]
             struct Segment<'a> {
                 start: usize,
                 len: usize,
                 in_dim: usize,
                 kind: quant_dispatch::GroupKind<'a>,
             }
-            let mut combined = vec![0.0_f32; total_out];
-            let mut segments = Vec::with_capacity(targets.len());
+            let mut segments: [Option<Segment<'_>>; 4] = [None; 4];
+            let mut seg_count = 0_usize;
             let mut need_q8 = false;
             let mut need_qk = false;
             let mut cursor = 0_usize;
+            let mut all_packed = true;
             for (proj, _, _) in targets.iter() {
                 let Some(kind) = quant_dispatch::classify_group_proj(proj) else {
+                    all_packed = false;
                     break;
                 };
                 match kind {
                     quant_dispatch::GroupKind::Packed { ggml_type: 8, .. } => need_q8 = true,
                     _ => need_qk = true,
                 }
-                if let Some(bias) = &proj.bias {
-                    combined[cursor..cursor + proj.out_dim].copy_from_slice(bias);
-                }
-                segments.push(Segment {
+                segments[seg_count] = Some(Segment {
                     start: cursor,
                     len: proj.out_dim,
                     in_dim: proj.in_dim,
                     kind,
                 });
+                seg_count += 1;
                 cursor += proj.out_dim;
             }
-            if segments.len() == targets.len() {
-                let q8_opt = need_q8.then(|| {
-                    let blocks = input.len() / 32;
-                    let mut buf = vec![
-                        bonsai_windows_process::quant_kernels::Q8_0ActBlock::default(
-                        );
-                        blocks
-                    ];
-                    bonsai_windows_process::quant_kernels::quantize_row_q8_0(input, &mut buf);
-                    buf
-                });
-                let qk_opt = need_qk.then(|| {
-                    let blocks = input.len() / 256;
-                    let mut buf = vec![
-                        bonsai_windows_process::quant_kernels::Q8_KActBlock::default(
-                        );
-                        blocks
-                    ];
-                    bonsai_windows_process::quant_kernels::quantize_row_q8_k(input, &mut buf);
-                    buf
-                });
-                let q8_slice = q8_opt.as_deref().unwrap_or(&[]);
-                let qk_slice = qk_opt.as_deref().unwrap_or(&[]);
-                let alignment = if segments.iter().all(|s| s.len.is_multiple_of(8)) {
+            if all_packed && seg_count == targets.len() {
+                let alignment = if segments[..seg_count]
+                    .iter()
+                    .flatten()
+                    .all(|s| s.len.is_multiple_of(8))
+                {
                     8
-                } else if segments.iter().all(|s| s.len.is_multiple_of(4)) {
+                } else if segments[..seg_count]
+                    .iter()
+                    .flatten()
+                    .all(|s| s.len.is_multiple_of(4))
+                {
                     4
                 } else {
                     1
                 };
                 let workers = threads.clamp(1, 18).min(total_out);
-                run_row_chunks_aligned(&mut combined, workers, alignment, |global_row, dst| {
-                    let chunk_end = global_row + dst.len();
-                    for seg in &segments {
-                        let seg_end = seg.start + seg.len;
-                        let ov_start = global_row.max(seg.start);
-                        let ov_end = chunk_end.min(seg_end);
-                        if ov_start >= ov_end {
-                            continue;
-                        }
-                        let dst_slice = &mut dst[ov_start - global_row..ov_end - global_row];
-                        let local_row = ov_start - seg.start;
-                        match seg.kind {
-                            quant_dispatch::GroupKind::Packed { ggml_type, bytes } => {
-                                quant_dispatch::add_packed_rows(
-                                    ggml_type, bytes, seg.in_dim, caps, q8_slice, qk_slice,
-                                    local_row, dst_slice,
-                                );
-                            }
-                            quant_dispatch::GroupKind::Repacked(bytes) => {
-                                quant_dispatch::add_repacked_rows(
-                                    bytes, seg.in_dim, caps, qk_slice, local_row, dst_slice,
-                                );
+                quant_dispatch::with_group_workspace(
+                    total_out,
+                    need_q8,
+                    need_qk,
+                    input,
+                    |combined, q8_slice, qk_slice| -> io::Result<()> {
+                        for (seg_opt, (proj, _, _)) in
+                            segments[..seg_count].iter().zip(targets.iter())
+                        {
+                            if let Some(seg) = *seg_opt {
+                                let seg_dst = &mut combined[seg.start..seg.start + seg.len];
+                                if let Some(bias) = &proj.bias {
+                                    seg_dst.copy_from_slice(bias);
+                                } else {
+                                    seg_dst.fill(0.0);
+                                }
                             }
                         }
-                    }
-                });
-                let mut offset = 0_usize;
-                for (proj, lora, out) in targets.iter_mut() {
-                    let len = proj.out_dim;
-                    out.copy_from_slice(&combined[offset..offset + len]);
-                    if let Some(patch) = *lora {
-                        patch.apply(input, out)?;
-                    }
-                    offset += len;
-                }
+                        run_row_chunks_aligned(combined, workers, alignment, |global_row, dst| {
+                            let chunk_end = global_row + dst.len();
+                            for seg in segments[..seg_count].iter().flatten() {
+                                let seg_end = seg.start + seg.len;
+                                let ov_start = global_row.max(seg.start);
+                                let ov_end = chunk_end.min(seg_end);
+                                if ov_start >= ov_end {
+                                    continue;
+                                }
+                                let dst_slice =
+                                    &mut dst[ov_start - global_row..ov_end - global_row];
+                                let local_row = ov_start - seg.start;
+                                match seg.kind {
+                                    quant_dispatch::GroupKind::Packed { ggml_type, bytes } => {
+                                        quant_dispatch::add_packed_rows(
+                                            ggml_type, bytes, seg.in_dim, caps, q8_slice, qk_slice,
+                                            local_row, dst_slice,
+                                        );
+                                    }
+                                    quant_dispatch::GroupKind::Repacked(bytes) => {
+                                        quant_dispatch::add_repacked_rows(
+                                            bytes, seg.in_dim, caps, qk_slice, local_row, dst_slice,
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                        let mut offset = 0_usize;
+                        for (proj, lora, out) in targets.iter_mut() {
+                            let len = proj.out_dim;
+                            out.copy_from_slice(&combined[offset..offset + len]);
+                            if let Some(patch) = *lora {
+                                patch.apply(input, out)?;
+                            }
+                            offset += len;
+                        }
+                        Ok(())
+                    },
+                )?;
                 return Ok(());
             }
         }
@@ -2335,7 +2502,148 @@ fn rope_head_simd<S: Simd>(simd: S, lo: &mut [f32], hi: &mut [f32], cos: &[f32],
     }
 }
 
-fn compute_rope_tables(head_dim: usize, pos: usize, theta: f32, cos: &mut [f32], sin: &mut [f32]) {
+struct RopeDivisors {
+    head_dim: usize,
+    theta_bits: u32,
+    values: Vec<f32>,
+}
+
+#[derive(Default)]
+struct RopeCache {
+    divisors: [Option<RopeDivisors>; 4],
+    next_slot: usize,
+    step_key: Option<(usize, u32, usize)>,
+    step_cos: Vec<f32>,
+    step_sin: Vec<f32>,
+    batch_key: Option<(usize, u32, usize, usize)>,
+    batch_cos: Vec<f32>,
+    batch_sin: Vec<f32>,
+}
+
+impl RopeCache {
+    fn divisors_for(&mut self, head_dim: usize, theta: f32) -> &[f32] {
+        let half = head_dim / 2;
+        let theta_bits = theta.to_bits();
+        if let Some(idx) = self.divisors.iter().position(|entry| {
+            matches!(
+                entry,
+                Some(d) if d.head_dim == head_dim && d.theta_bits == theta_bits && d.values.len() == half
+            )
+        }) {
+            return self.divisors[idx].as_ref().map_or(&[], |d| &d.values);
+        }
+        let hd_f = usize_to_f32(head_dim);
+        let values: Vec<f32> = (0..half)
+            .map(|i| theta.powf(usize_to_f32(2 * i) / hd_f))
+            .collect();
+        let slot_idx = self
+            .divisors
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                let idx = self.next_slot;
+                self.next_slot = (self.next_slot + 1) % self.divisors.len();
+                idx
+            });
+        self.divisors[slot_idx] = Some(RopeDivisors {
+            head_dim,
+            theta_bits,
+            values,
+        });
+        self.divisors[slot_idx].as_ref().map_or(&[], |d| &d.values)
+    }
+
+    fn ensure_step(&mut self, head_dim: usize, pos: usize, theta: f32) -> (&[f32], &[f32]) {
+        let half = head_dim / 2;
+        let key = (head_dim, theta.to_bits(), pos);
+        if self.step_key == Some(key) && self.step_cos.len() >= half && self.step_sin.len() >= half
+        {
+            return (&self.step_cos[..half], &self.step_sin[..half]);
+        }
+        self.divisors_for(head_dim, theta);
+        let theta_bits = theta.to_bits();
+        let pos_f = usize_to_f32(pos);
+        self.step_cos.resize(half, 0.0);
+        self.step_sin.resize(half, 0.0);
+        if let Some(divs) = self.divisors.iter().flatten().find(|d| {
+            d.head_dim == head_dim && d.theta_bits == theta_bits && d.values.len() == half
+        }) {
+            for ((dst_cos, dst_sin), &div) in self.step_cos[..half]
+                .iter_mut()
+                .zip(&mut self.step_sin[..half])
+                .zip(&divs.values)
+            {
+                let (sin_v, cos_v) = (pos_f / div).sin_cos();
+                *dst_cos = cos_v;
+                *dst_sin = sin_v;
+            }
+        }
+        self.step_key = Some(key);
+        (&self.step_cos[..half], &self.step_sin[..half])
+    }
+
+    fn ensure_batch(
+        &mut self,
+        head_dim: usize,
+        initial_seq: usize,
+        seq_len: usize,
+        theta: f32,
+    ) -> (&[f32], &[f32]) {
+        let half = head_dim / 2;
+        let needed = seq_len * half;
+        let key = (head_dim, theta.to_bits(), initial_seq, seq_len);
+        if self.batch_key == Some(key)
+            && self.batch_cos.len() >= needed
+            && self.batch_sin.len() >= needed
+        {
+            return (&self.batch_cos[..needed], &self.batch_sin[..needed]);
+        }
+        self.divisors_for(head_dim, theta);
+        let theta_bits = theta.to_bits();
+        self.batch_cos.resize(needed, 0.0);
+        self.batch_sin.resize(needed, 0.0);
+        if let Some(divs) = self.divisors.iter().flatten().find(|d| {
+            d.head_dim == head_dim && d.theta_bits == theta_bits && d.values.len() == half
+        }) {
+            for t in 0..seq_len {
+                let pos_f = usize_to_f32(initial_seq + t);
+                let row_cos = &mut self.batch_cos[t * half..(t + 1) * half];
+                let row_sin = &mut self.batch_sin[t * half..(t + 1) * half];
+                for ((dst_cos, dst_sin), &div) in
+                    row_cos.iter_mut().zip(row_sin.iter_mut()).zip(&divs.values)
+                {
+                    let (sin_v, cos_v) = (pos_f / div).sin_cos();
+                    *dst_cos = cos_v;
+                    *dst_sin = sin_v;
+                }
+            }
+        }
+        self.batch_key = Some(key);
+        (&self.batch_cos[..needed], &self.batch_sin[..needed])
+    }
+}
+
+thread_local! {
+    static ROPE_CACHE: std::cell::RefCell<RopeCache> =
+        const { std::cell::RefCell::new(RopeCache {
+            divisors: [const { None }; 4],
+            next_slot: 0,
+            step_key: None,
+            step_cos: Vec::new(),
+            step_sin: Vec::new(),
+            batch_key: None,
+            batch_cos: Vec::new(),
+            batch_sin: Vec::new(),
+        }) };
+}
+
+fn compute_rope_tables_uncached(
+    head_dim: usize,
+    pos: usize,
+    theta: f32,
+    cos: &mut [f32],
+    sin: &mut [f32],
+) {
     let half = head_dim / 2;
     let hd_f = usize_to_f32(head_dim);
     let pos_f = usize_to_f32(pos);
@@ -2346,6 +2654,103 @@ fn compute_rope_tables(head_dim: usize, pos: usize, theta: f32, cos: &mut [f32],
         cos[i] = cos_v;
         sin[i] = sin_v;
     }
+}
+
+fn with_rope_step_tables<R>(
+    head_dim: usize,
+    pos: usize,
+    theta: f32,
+    action: impl FnOnce(&[f32], &[f32]) -> R,
+) -> R {
+    let half = head_dim / 2;
+    if half == 0 {
+        return action(&[], &[]);
+    }
+    ROPE_CACHE.with(|cell| {
+        if let Ok(mut cache) = cell.try_borrow_mut() {
+            let (cos, sin) = cache.ensure_step(head_dim, pos, theta);
+            action(cos, sin)
+        } else if half <= 128 {
+            let mut cos_stack = [0.0_f32; 128];
+            let mut sin_stack = [0.0_f32; 128];
+            compute_rope_tables_uncached(
+                head_dim,
+                pos,
+                theta,
+                &mut cos_stack[..half],
+                &mut sin_stack[..half],
+            );
+            action(&cos_stack[..half], &sin_stack[..half])
+        } else {
+            let mut cos_heap = vec![0.0_f32; half];
+            let mut sin_heap = vec![0.0_f32; half];
+            compute_rope_tables_uncached(head_dim, pos, theta, &mut cos_heap, &mut sin_heap);
+            action(&cos_heap, &sin_heap)
+        }
+    })
+}
+
+fn with_rope_batch_tables(
+    head_dim: usize,
+    initial_seq: usize,
+    seq_len: usize,
+    theta: f32,
+    mut action: impl FnMut(usize, &[f32], &[f32]) -> io::Result<()>,
+) -> io::Result<()> {
+    const MAX_CACHED_BATCH_ELEMS: usize = 1_048_576;
+    let half = head_dim / 2;
+    if half == 0 || seq_len == 0 {
+        return Ok(());
+    }
+    let within_cache = seq_len
+        .checked_mul(half)
+        .is_some_and(|n| n <= MAX_CACHED_BATCH_ELEMS);
+    if within_cache {
+        let handled = ROPE_CACHE.with(|cell| {
+            let Ok(mut cache) = cell.try_borrow_mut() else {
+                return None;
+            };
+            let (cos_all, sin_all) = cache.ensure_batch(head_dim, initial_seq, seq_len, theta);
+            Some((0..seq_len).try_for_each(|t| {
+                action(
+                    t,
+                    &cos_all[t * half..(t + 1) * half],
+                    &sin_all[t * half..(t + 1) * half],
+                )
+            }))
+        });
+        if let Some(res) = handled {
+            return res;
+        }
+    }
+    let mut cos_stack = [0.0_f32; 128];
+    let mut sin_stack = [0.0_f32; 128];
+    let mut cos_heap = Vec::new();
+    let mut sin_heap = Vec::new();
+    let (cos_buf, sin_buf): (&mut [f32], &mut [f32]) = if half <= cos_stack.len() {
+        (&mut cos_stack[..half], &mut sin_stack[..half])
+    } else {
+        cos_heap.resize(half, 0.0);
+        sin_heap.resize(half, 0.0);
+        (&mut cos_heap[..half], &mut sin_heap[..half])
+    };
+    for t in 0..seq_len {
+        compute_rope_tables(head_dim, initial_seq + t, theta, cos_buf, sin_buf);
+        action(t, cos_buf, sin_buf)?;
+    }
+    Ok(())
+}
+
+fn prefetch_rope_step(head_dim: usize, pos: usize, theta: f32) {
+    with_rope_step_tables(head_dim, pos, theta, |_, _| {});
+}
+
+fn compute_rope_tables(head_dim: usize, pos: usize, theta: f32, cos: &mut [f32], sin: &mut [f32]) {
+    let half = head_dim / 2;
+    with_rope_step_tables(head_dim, pos, theta, |cached_cos, cached_sin| {
+        cos[..half].copy_from_slice(cached_cos);
+        sin[..half].copy_from_slice(cached_sin);
+    });
 }
 
 pub(crate) fn apply_rope_neox_with_tables(
@@ -2393,21 +2798,9 @@ pub fn apply_rope_neox_in_place(
             "Invalid RoPE head dimensions.",
         ));
     }
-    let half = head_dim / 2;
-    if half <= 128 {
-        let mut cos_stack = [0.0_f32; 128];
-        let mut sin_stack = [0.0_f32; 128];
-        let cos_table = &mut cos_stack[..half];
-        let sin_table = &mut sin_stack[..half];
-        compute_rope_tables(head_dim, pos, theta, cos_table, sin_table);
-        apply_rope_neox_with_tables(heads, num_heads, head_dim, cos_table, sin_table)?;
-    } else {
-        let mut cos_table = vec![0.0_f32; half];
-        let mut sin_table = vec![0.0_f32; half];
-        compute_rope_tables(head_dim, pos, theta, &mut cos_table, &mut sin_table);
-        apply_rope_neox_with_tables(heads, num_heads, head_dim, &cos_table, &sin_table)?;
-    }
-    Ok(())
+    with_rope_step_tables(head_dim, pos, theta, |cos_table, sin_table| {
+        apply_rope_neox_with_tables(heads, num_heads, head_dim, cos_table, sin_table)
+    })
 }
 
 fn normalize_heads_in_place(
@@ -2825,19 +3218,10 @@ impl QwenDecoderLayer {
         normalize_heads_in_place(k, num_kv_heads, head_dim, &self.k_norm_w, rms_eps)?;
 
         let pos = kv.seq_len;
-        let half = head_dim / 2;
-        if half <= 128 {
-            let mut cos_stack = [0.0_f32; 128];
-            let mut sin_stack = [0.0_f32; 128];
-            let cos_table = &mut cos_stack[..half];
-            let sin_table = &mut sin_stack[..half];
-            compute_rope_tables(head_dim, pos, rope_theta, cos_table, sin_table);
+        with_rope_step_tables(head_dim, pos, rope_theta, |cos_table, sin_table| {
             apply_rope_neox_with_tables(q, num_q_heads, head_dim, cos_table, sin_table)?;
-            apply_rope_neox_with_tables(k, num_kv_heads, head_dim, cos_table, sin_table)?;
-        } else {
-            apply_rope_neox_in_place(q, num_q_heads, head_dim, pos, rope_theta)?;
-            apply_rope_neox_in_place(k, num_kv_heads, head_dim, pos, rope_theta)?;
-        }
+            apply_rope_neox_with_tables(k, num_kv_heads, head_dim, cos_table, sin_table)
+        })?;
 
         // Attention may read this provisional position, but later projection,
         // adapter or numerical failure must not publish it for the next call.
@@ -3027,27 +3411,21 @@ impl QwenDecoderLayer {
             workers,
         )?;
 
-        let half = head_dim / 2;
-        let mut cos_stack = [0.0_f32; 128];
-        let mut sin_stack = [0.0_f32; 128];
-        let mut cos_heap = Vec::new();
-        let mut sin_heap = Vec::new();
-        let (cos_buf, sin_buf): (&mut [f32], &mut [f32]) = if half <= cos_stack.len() {
-            (&mut cos_stack[..half], &mut sin_stack[..half])
-        } else {
-            cos_heap.resize(half, 0.0);
-            sin_heap.resize(half, 0.0);
-            (&mut cos_heap[..half], &mut sin_heap[..half])
-        };
-        for t in 0..seq_len {
-            let q_tok = &mut q_all[t * query_width..(t + 1) * query_width];
-            normalize_heads_in_place(q_tok, num_q_heads, head_dim, &self.q_norm_w, rms_eps)?;
-            let k_tok = &mut k_all[t * kv_width..(t + 1) * kv_width];
-            normalize_heads_in_place(k_tok, num_kv_heads, head_dim, &self.k_norm_w, rms_eps)?;
-            compute_rope_tables(head_dim, initial_seq + t, rope_theta, cos_buf, sin_buf);
-            apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, cos_buf, sin_buf)?;
-            apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, cos_buf, sin_buf)?;
-        }
+        with_rope_batch_tables(
+            head_dim,
+            initial_seq,
+            seq_len,
+            rope_theta,
+            |t, cos_buf, sin_buf| {
+                let q_tok = &mut q_all[t * query_width..(t + 1) * query_width];
+                normalize_heads_in_place(q_tok, num_q_heads, head_dim, &self.q_norm_w, rms_eps)?;
+                let k_tok = &mut k_all[t * kv_width..(t + 1) * kv_width];
+                normalize_heads_in_place(k_tok, num_kv_heads, head_dim, &self.k_norm_w, rms_eps)?;
+                apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, cos_buf, sin_buf)?;
+                apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, cos_buf, sin_buf)?;
+                Ok(())
+            },
+        )?;
 
         let append = kv_append::KvAppend::new_batch(kv, seq_len, &k_all, &v_all)?;
         let kv = append.cache();
@@ -3703,6 +4081,9 @@ impl CodePredictorModel {
         cancel()?;
         self.project_in_parallel_into(talker_hidden, workers, h_a)?;
         decoder_workspace::resize(h_b, h_a.len())?;
+        if let Some(first_kv) = kv_caches.first() {
+            prefetch_rope_step(self.head_dim, first_kv.seq_len, self.rope_theta);
+        }
         for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
             cancel()?;
             layer.forward_step_into(
@@ -3726,6 +4107,9 @@ impl CodePredictorModel {
             cancel()?;
             self.project_in_parallel_into(next_raw, workers, h_a)?;
             decoder_workspace::resize(h_b, h_a.len())?;
+            if let Some(first_kv) = kv_caches.first() {
+                prefetch_rope_step(self.head_dim, first_kv.seq_len, self.rope_theta);
+            }
             for (layer, kv) in self.layers.iter().zip(kv_caches.iter_mut()) {
                 cancel()?;
                 layer.forward_step_into(
@@ -5395,6 +5779,237 @@ mod tests {
         let last_start = (seq_len - 1) * hidden;
         for (a, b) in sliced_out[last_start..].iter().zip(&seq_out[last_start..]) {
             assert!((a - b).abs() < 1e-4, "last={a} seq={b}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q8_8row_8x_gemm_and_mixed_group_reuse_match_bit_exact() -> std::io::Result<()> {
+        let in_dim = 256_usize;
+        let big_biased_q8 = make_packed_test_proj(
+            "talker.blk.0.ffn_gate.weight",
+            8,
+            in_dim,
+            64,
+            10,
+            Some(
+                (0..64)
+                    .map(|i| 1.25 + super::usize_to_f32(i) * 0.125)
+                    .collect(),
+            ),
+        )?;
+        let q8_unbiased =
+            make_packed_test_proj("talker.blk.0.attn_q.weight", 8, in_dim, 19, 11, None)?;
+        let q4_biased = make_packed_test_proj(
+            "talker.blk.0.attn_k.weight",
+            12,
+            in_dim,
+            13,
+            12,
+            Some(vec![-0.25_f32; 13]),
+        )?;
+        let q6_unbiased =
+            make_packed_test_proj("talker.blk.0.attn_v.weight", 14, in_dim, 9, 13, None)?;
+
+        // First call with large biased Q8_0 fills GROUP_COMBINED with large values.
+        let warm_in: Vec<f32> = (0..in_dim)
+            .map(|i| f32::from(i16::try_from((i * 5 + 1) % 31).unwrap_or(0) - 15) * 0.05)
+            .collect();
+        let mut warm_out_a = Vec::new();
+        let mut warm_out_b = Vec::new();
+        super::forward_group_into(
+            &mut [
+                (&big_biased_q8, None, &mut warm_out_a),
+                (&big_biased_q8, None, &mut warm_out_b),
+            ],
+            &warm_in,
+            4,
+        )?;
+        assert_eq!(
+            warm_out_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            warm_out_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        // Now run unbiased + mixed Q8_0 + Q4_K + Q6_K group; stale GROUP_COMBINED must not leak.
+        let mut ref_q8 = Vec::new();
+        let mut ref_q4 = Vec::new();
+        let mut ref_q6 = Vec::new();
+        q8_unbiased.forward_vec_into(&warm_in, None, None, 1, &mut ref_q8)?;
+        q4_biased.forward_vec_into(&warm_in, None, None, 1, &mut ref_q4)?;
+        q6_unbiased.forward_vec_into(&warm_in, None, None, 1, &mut ref_q6)?;
+
+        for threads in [1_usize, 4] {
+            let mut grp_q8 = Vec::new();
+            let mut grp_q4 = Vec::new();
+            let mut grp_q6 = Vec::new();
+            super::forward_group_into(
+                &mut [
+                    (&q8_unbiased, None, &mut grp_q8),
+                    (&q4_biased, None, &mut grp_q4),
+                    (&q6_unbiased, None, &mut grp_q6),
+                ],
+                &warm_in,
+                threads,
+            )?;
+            assert_eq!(
+                grp_q8.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_q8.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mixed group Q8_0 threads={threads}"
+            );
+            assert_eq!(
+                grp_q4.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_q4.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mixed group Q4_K threads={threads}"
+            );
+            assert_eq!(
+                grp_q6.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_q6.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mixed group Q6_K threads={threads}"
+            );
+        }
+
+        // Verify Q8_0 batch GEMM across 8x8, 8x4, 8x2, 8x1 tiles and row tails (19 = 8 + 8 + 3).
+        for seq_len in [1_usize, 2, 3, 5, 8, 9, 17] {
+            let batch_in: Vec<f32> = (0..seq_len * in_dim)
+                .map(|i| f32::from(i16::try_from((i * 13 + 7) % 43).unwrap_or(0) - 21) * 0.03125)
+                .collect();
+            let mut ref_batch = Vec::with_capacity(seq_len * q8_unbiased.out_dim);
+            let mut step_out = Vec::new();
+            for t in 0..seq_len {
+                q8_unbiased.forward_vec_into(
+                    &batch_in[t * in_dim..(t + 1) * in_dim],
+                    None,
+                    None,
+                    1,
+                    &mut step_out,
+                )?;
+                ref_batch.extend_from_slice(&step_out);
+            }
+            for threads in [1_usize, 4] {
+                let mut got_batch = Vec::new();
+                q8_unbiased.forward_batch_into(
+                    &batch_in,
+                    seq_len,
+                    None,
+                    threads,
+                    &mut got_batch,
+                )?;
+                assert_eq!(
+                    got_batch.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    ref_batch.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "Q8_0 batch GEMM seq_len={seq_len} threads={threads}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_rope_divisors_and_tables_match_uncached_bit_exact() -> std::io::Result<()> {
+        let configs = [
+            (64_usize, 1_000_000.0_f32),
+            (128, 1_000_000.0),
+            (64, 10_000.0),
+            (32, 10_000.0),
+            (264, 1_000_000.0),
+        ];
+        // Run two full sweeps (exceeding the 4-entry divisor ring) and repeated pos hits.
+        for _sweep in 0..2 {
+            for (head_dim, theta) in configs {
+                let half = head_dim / 2;
+                for pos in [0_usize, 1, 7, 15, 255] {
+                    let mut exp_cos = vec![0.0_f32; half];
+                    let mut exp_sin = vec![0.0_f32; half];
+                    super::compute_rope_tables_uncached(
+                        head_dim,
+                        pos,
+                        theta,
+                        &mut exp_cos,
+                        &mut exp_sin,
+                    );
+
+                    // Twice per pos to exercise both step-cache miss (with cached divisors) and hit.
+                    for _hit in 0..2 {
+                        let mut got_cos = vec![0.0_f32; half];
+                        let mut got_sin = vec![0.0_f32; half];
+                        super::compute_rope_tables(
+                            head_dim,
+                            pos,
+                            theta,
+                            &mut got_cos,
+                            &mut got_sin,
+                        );
+                        assert_eq!(
+                            got_cos.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            exp_cos.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "cos mismatch hd={head_dim} theta={theta} pos={pos}"
+                        );
+                        assert_eq!(
+                            got_sin.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            exp_sin.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "sin mismatch hd={head_dim} theta={theta} pos={pos}"
+                        );
+                    }
+
+                    let num_heads = 3_usize;
+                    let base_heads: Vec<f32> = (0..num_heads * head_dim)
+                        .map(|i| f32::from(i16::try_from((i * 19) % 47).unwrap_or(0) - 23) * 0.1)
+                        .collect();
+                    let mut exp_heads = base_heads.clone();
+                    super::apply_rope_neox_with_tables(
+                        &mut exp_heads,
+                        num_heads,
+                        head_dim,
+                        &exp_cos,
+                        &exp_sin,
+                    )?;
+                    let mut got_heads = base_heads;
+                    super::apply_rope_neox_in_place(
+                        &mut got_heads,
+                        num_heads,
+                        head_dim,
+                        pos,
+                        theta,
+                    )?;
+                    assert_eq!(
+                        got_heads.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        exp_heads.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "in-place RoPE mismatch hd={head_dim} theta={theta} pos={pos}"
+                    );
+                }
+
+                // Batch table cache hit/miss check.
+                let initial_seq = 3_usize;
+                let seq_len = 9_usize;
+                for _layer in 0..3 {
+                    super::with_rope_batch_tables(
+                        head_dim,
+                        initial_seq,
+                        seq_len,
+                        theta,
+                        |t, cos_got, sin_got| {
+                            let mut cos_ref = vec![0.0_f32; half];
+                            let mut sin_ref = vec![0.0_f32; half];
+                            super::compute_rope_tables_uncached(
+                                head_dim,
+                                initial_seq + t,
+                                theta,
+                                &mut cos_ref,
+                                &mut sin_ref,
+                            );
+                            assert_eq!(
+                                cos_got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                cos_ref.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                            );
+                            assert_eq!(
+                                sin_got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                sin_ref.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                            );
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
         }
         Ok(())
     }
