@@ -198,6 +198,8 @@ struct State {
     daisyrose_available: bool,
     daisyrose_default_scale_tenths: u8,
     daisyrose_customized: bool,
+    cognitive: client::CognitiveOptions,
+    cognitive_controls_available: bool,
     focus_composer: bool,
     composing: bool,
     composer_id: Option<egui::Id>,
@@ -368,6 +370,8 @@ impl State {
             daisyrose_available: false,
             daisyrose_default_scale_tenths: 0,
             daisyrose_customized: false,
+            cognitive: client::CognitiveOptions::default(),
+            cognitive_controls_available: false,
             focus_composer: false,
             composing: false,
             composer_id: None,
@@ -804,6 +808,7 @@ impl State {
                 enable_thinking: self.enable_thinking,
                 abliteration_scale: self.abliteration_scale,
                 daisyrose_scale: self.effective_daisyrose_scale(),
+                cognitive: self.cognitive,
             })
             .is_err()
         {
@@ -1294,6 +1299,9 @@ impl State {
                     self.daisyrose_enabled = true;
                     self.daisyrose_scale = readiness.default_scale();
                 }
+            }
+            Event::CognitiveControlsAvailable(available) => {
+                self.cognitive_controls_available = available;
             }
             Event::Ready => {
                 self.auto_continuing = false;

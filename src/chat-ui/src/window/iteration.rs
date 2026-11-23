@@ -283,6 +283,7 @@ impl State {
                 enable_thinking: self.enable_thinking,
                 abliteration_scale: self.abliteration_scale,
                 daisyrose_scale: self.effective_daisyrose_scale(),
+                cognitive: self.cognitive,
             })
             .is_err()
         {

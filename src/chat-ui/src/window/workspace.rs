@@ -35,6 +35,8 @@ pub(super) struct ConversationSnapshot {
     pub(super) daisyrose_enabled: bool,
     #[serde(default = "client::default_daisyrose_scale")]
     pub(super) daisyrose_scale: f32,
+    #[serde(default)]
+    pub(super) cognitive: client::CognitiveOptions,
     pub(super) status: String,
     #[serde(skip)]
     pub(super) status_detail: String,
@@ -137,6 +139,7 @@ impl State {
             abliteration_scale: self.abliteration_scale,
             daisyrose_enabled: self.daisyrose_enabled,
             daisyrose_scale: self.daisyrose_scale,
+            cognitive: self.cognitive,
             status: if self.model.ready() {
                 self.status.clone()
             } else {
@@ -184,6 +187,7 @@ impl State {
         self.daisyrose_enabled = self.daisyrose_default_enabled();
         self.daisyrose_scale = self.daisyrose_default_scale();
         self.daisyrose_customized = false;
+        self.cognitive = client::CognitiveOptions::default();
         self.place_composer_cursor(0);
         self.focus_composer = true;
     }
@@ -206,6 +210,7 @@ impl State {
         self.daisyrose_enabled = snapshot.daisyrose_enabled;
         self.daisyrose_scale = snapshot.daisyrose_scale;
         self.daisyrose_customized = true;
+        self.cognitive = snapshot.cognitive;
         // Loading/failure status belongs to the model, not a saved transcript.
         if self.model.ready() {
             self.status = snapshot.status;
@@ -338,6 +343,7 @@ impl State {
         std::mem::swap(&mut self.abliteration_scale, &mut saved.abliteration_scale);
         std::mem::swap(&mut self.daisyrose_enabled, &mut saved.daisyrose_enabled);
         std::mem::swap(&mut self.daisyrose_scale, &mut saved.daisyrose_scale);
+        std::mem::swap(&mut self.cognitive, &mut saved.cognitive);
         std::mem::swap(&mut self.status, &mut saved.status);
         std::mem::swap(&mut self.status_detail, &mut saved.status_detail);
         std::mem::swap(&mut self.warning, &mut saved.warning);

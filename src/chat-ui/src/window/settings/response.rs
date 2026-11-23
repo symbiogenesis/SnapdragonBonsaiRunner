@@ -102,6 +102,15 @@ impl State {
                     );
                     self.daisyrose_customized |= daisyrose_changed;
                     self.recovery_dirty |= daisyrose_changed;
+                    ui.add_space(12.0);
+                    ui.separator();
+                    self.recovery_dirty |= cognitive_preferences(
+                        ui,
+                        &mut self.cognitive,
+                        self.cognitive_controls_available,
+                        self.enable_thinking,
+                        !self.model.busy(),
+                    );
                 });
         });
     }
@@ -250,4 +259,113 @@ fn daisyrose_preferences(
     };
     ui.label(RichText::new(help).small().weak());
     changed
+}
+
+fn cognitive_preferences(
+    ui: &mut egui::Ui,
+    cognitive: &mut crate::client::CognitiveOptions,
+    runtime_supported: bool,
+    thinking_enabled: bool,
+    editable: bool,
+) -> bool {
+    use crate::client::{ExtraEffortStrategy, ReasoningEffort, SamplingPreset, ThinkingBudgetMode};
+
+    ui.add_space(8.0);
+    ui.label(RichText::new("Cognitive & sampling controls").strong());
+    ui.add_space(6.0);
+    let before = *cognitive;
+    ui.add_enabled_ui(editable, |ui| {
+        ui.horizontal(|ui| {
+            let label = ui.label("Extra effort strategy");
+            egui::ComboBox::from_id_salt("extra-effort-strategy")
+                .selected_text(cognitive.extra_effort_strategy.label())
+                .show_ui(ui, |ui| {
+                    for option in [
+                        ExtraEffortStrategy::PlanDraftReview,
+                        ExtraEffortStrategy::MultiDraftSynthesis,
+                    ] {
+                        ui.selectable_value(
+                            &mut cognitive.extra_effort_strategy,
+                            option,
+                            option.label(),
+                        );
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+        });
+    });
+    ui.add_space(4.0);
+    ui.add_enabled_ui(editable && runtime_supported, |ui| {
+        ui.horizontal(|ui| {
+            let label = ui.label("Reasoning effort");
+            egui::ComboBox::from_id_salt("reasoning-effort")
+                .selected_text(cognitive.reasoning_effort.label())
+                .show_ui(ui, |ui| {
+                    for option in [
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::XHigh,
+                    ] {
+                        ui.selectable_value(&mut cognitive.reasoning_effort, option, option.label());
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+        });
+        ui.add_space(4.0);
+        ui.add_enabled_ui(thinking_enabled, |ui| {
+            ui.horizontal(|ui| {
+                let label = ui.label("Thinking budget");
+                egui::ComboBox::from_id_salt("thinking-budget")
+                    .selected_text(cognitive.thinking_budget.label())
+                    .show_ui(ui, |ui| {
+                        for option in [
+                            ThinkingBudgetMode::Unbounded,
+                            ThinkingBudgetMode::Concise,
+                            ThinkingBudgetMode::Balanced,
+                            ThinkingBudgetMode::Deep,
+                        ] {
+                            ui.selectable_value(
+                                &mut cognitive.thinking_budget,
+                                option,
+                                option.label(),
+                            );
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id);
+            });
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let label = ui.label("Sampling preset");
+            egui::ComboBox::from_id_salt("sampling-preset")
+                .selected_text(cognitive.sampling_preset.label())
+                .show_ui(ui, |ui| {
+                    for option in [
+                        SamplingPreset::Canonical,
+                        SamplingPreset::Precise,
+                        SamplingPreset::BalancedDry,
+                        SamplingPreset::Creative,
+                    ] {
+                        ui.selectable_value(&mut cognitive.sampling_preset, option, option.label());
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+        });
+    });
+    if !runtime_supported {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Reasoning effort, soft thinking budget, and calibrated sampling presets require \
+                 a compatible runtime release.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+    before != *cognitive
 }

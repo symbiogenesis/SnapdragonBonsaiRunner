@@ -72,6 +72,7 @@ impl ModelLifecycle {
             Event::ContextCapacity(_)
             | Event::VisionAvailable(_)
             | Event::DaisyRoseAvailable(_)
+            | Event::CognitiveControlsAvailable(_)
             | Event::Ready => {
                 matches!(self, Self::Preparing)
             }

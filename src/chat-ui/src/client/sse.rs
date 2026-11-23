@@ -3,9 +3,69 @@
 use super::{Completion, Failure, MAX_EVENT, Result};
 use serde::{
     Deserialize, Deserializer,
-    de::{IgnoredAny, SeqAccess, Visitor},
+    de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
-use std::{borrow::Cow, fmt, marker::PhantomData};
+use std::{borrow::Cow, collections::VecDeque, fmt, marker::PhantomData};
+
+const DEEPCONF_WINDOW: usize = 32;
+const DEEPCONF_MIN_TOKENS: usize = 64;
+const DEEPCONF_COLLAPSE_MEAN_LOGPROB: f64 = -3.2;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ConfidenceSummary {
+    pub(super) tokens: usize,
+    pub(super) mean_logprob: f64,
+    pub(super) min_window_logprob: Option<f64>,
+    pub(super) collapsed: bool,
+}
+
+#[derive(Default)]
+pub(super) struct DeepConfMonitor {
+    window: VecDeque<f32>,
+    total_sum: f64,
+    tokens: usize,
+    min_window_logprob: Option<f64>,
+    collapsed: bool,
+}
+
+impl DeepConfMonitor {
+    fn observe(&mut self, logprob: f32) {
+        if !logprob.is_finite() {
+            return;
+        }
+        let clamped = logprob.min(0.0);
+        if self.window.len() == DEEPCONF_WINDOW {
+            let _old = self.window.pop_front();
+        }
+        self.window.push_back(clamped);
+        self.tokens = self.tokens.saturating_add(1);
+        self.total_sum += f64::from(clamped);
+        if self.window.len() == DEEPCONF_WINDOW {
+            let sum: f64 = self.window.iter().map(|&value| f64::from(value)).sum();
+            let mean = sum / 32.0;
+            self.min_window_logprob = Some(
+                self.min_window_logprob
+                    .map_or(mean, |previous| previous.min(mean)),
+            );
+            if self.tokens >= DEEPCONF_MIN_TOKENS && mean < DEEPCONF_COLLAPSE_MEAN_LOGPROB {
+                self.collapsed = true;
+            }
+        }
+    }
+
+    fn summary(&self) -> Option<ConfidenceSummary> {
+        if self.tokens == 0 {
+            return None;
+        }
+        let count = u32::try_from(self.tokens).ok()?;
+        Some(ConfidenceSummary {
+            tokens: self.tokens,
+            mean_logprob: self.total_sum / f64::from(count),
+            min_window_logprob: self.min_window_logprob,
+            collapsed: self.collapsed,
+        })
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Sse {
@@ -18,6 +78,7 @@ struct Reply {
     text: String,
     reasoning: String,
     completion: Option<Completion>,
+    confidence: DeepConfMonitor,
     done: bool,
 }
 
@@ -127,6 +188,80 @@ struct Choice<'a> {
     index: Option<u32>,
     #[serde(borrow)]
     finish_reason: Option<Text<'a>>,
+    #[serde(default)]
+    logprobs: Option<FirstTokenLogprob>,
+}
+
+/// Zero-allocation extractor for `choice.logprobs.content[0].logprob`.
+#[derive(Clone, Copy)]
+struct FirstTokenLogprob(Option<f32>);
+
+impl<'de> Deserialize<'de> for FirstTokenLogprob {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct LogprobEntry {
+            #[serde(default)]
+            logprob: Option<f32>,
+        }
+
+        struct ContentSeqVisitor;
+
+        impl<'de> Visitor<'de> for ContentSeqVisitor {
+            type Value = Option<f32>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a logprob content sequence")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let first = seq
+                    .next_element::<LogprobEntry>()?
+                    .and_then(|entry| entry.logprob);
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(first)
+            }
+        }
+
+        struct ContentField(Option<f32>);
+
+        impl<'de> Deserialize<'de> for ContentField {
+            fn deserialize<D: Deserializer<'de>>(
+                deserializer: D,
+            ) -> std::result::Result<Self, D::Error> {
+                deserializer.deserialize_seq(ContentSeqVisitor).map(Self)
+            }
+        }
+
+        struct LogprobsMapVisitor;
+
+        impl<'de> Visitor<'de> for LogprobsMapVisitor {
+            type Value = FirstTokenLogprob;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a choice logprobs map")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut found = None;
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    if key == "content" {
+                        found = map.next_value::<Option<ContentField>>()?.and_then(|c| c.0);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(FirstTokenLogprob(found))
+            }
+        }
+
+        deserializer.deserialize_map(LogprobsMapVisitor)
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -148,6 +283,14 @@ impl Sse {
         drain_frames(&mut self.framer, bytes, |frame| {
             self.reply.dispatch(frame, delta)
         })
+    }
+
+    pub(super) fn confidence_collapsed(&self) -> bool {
+        self.reply.confidence.collapsed
+    }
+
+    pub(super) fn confidence_summary(&self) -> Option<ConfidenceSummary> {
+        self.reply.confidence.summary()
     }
 
     pub(super) fn finish(&self) -> Result<Completion> {
@@ -400,6 +543,9 @@ impl Reply {
                 .reasoning_content
                 .or(choice.delta.reasoning)
                 .map_or(Cow::Borrowed(""), |text| text.0);
+            if let Some(FirstTokenLogprob(Some(logprob))) = choice.logprobs {
+                self.confidence.observe(logprob);
+            }
             self.text.push_str(&text);
             self.reasoning.push_str(&reasoning);
             delta(text, reasoning)?;
@@ -638,6 +784,56 @@ mod tests {
         assert!(framer.line.capacity() <= LINE_DATA_HIGH_WATER_BYTES);
         assert!(framer.data.capacity() <= LINE_DATA_HIGH_WATER_BYTES);
         assert!(framer.event.capacity() <= EVENT_HIGH_WATER_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn deepconf_monitor_ignores_absent_and_high_confidence_then_flags_sustained_collapse()
+    -> Result<()> {
+        let mut plain = Sse::default();
+        plain.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            &mut |_, _| Ok(()),
+        )?;
+        assert_eq!(plain.finish()?, Completion::Finished);
+        assert!(!plain.confidence_collapsed());
+        assert!(plain.confidence_summary().is_none());
+
+        let mut healthy = Sse::default();
+        for _ in 0..70 {
+            healthy.push(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"logprobs\":{\"content\":[{\"token\":\"a\",\"logprob\":-0.15,\"top_logprobs\":[{\"token\":\"a\",\"logprob\":-0.15}]}]}}]}\n\n",
+                &mut |_, _| Ok(()),
+            )?;
+        }
+        assert!(!healthy.confidence_collapsed());
+        let summary = healthy
+            .confidence_summary()
+            .ok_or(Failure::Message("missing healthy summary"))?;
+        assert_eq!(summary.tokens, 70);
+        assert!((summary.mean_logprob + 0.15).abs() < 1e-4);
+
+        let mut collapsing = Sse::default();
+        for index in 0..64 {
+            let lp = if index < 32 { -0.2 } else { -4.0 };
+            let frame = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"x\"}},\"logprobs\":{{\"content\":[{{\"token\":\"x\",\"logprob\":{lp},\"top_logprobs\":[]}}]}}}}]}}\n\n"
+            );
+            collapsing.push(frame.as_bytes(), &mut |_, _| Ok(()))?;
+            if index < 63 {
+                assert!(!collapsing.confidence_collapsed());
+            }
+        }
+        assert!(collapsing.confidence_collapsed());
+        let collapsed_summary = collapsing
+            .confidence_summary()
+            .ok_or(Failure::Message("missing collapsed summary"))?;
+        assert!(collapsed_summary.collapsed);
+        assert!(
+            collapsed_summary
+                .min_window_logprob
+                .is_some_and(|w| w < -3.2)
+        );
         Ok(())
     }
 }

@@ -562,3 +562,23 @@ fn settings_modal_capture_when_requested() -> io::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn memory_settings_and_advanced_cognitive_controls_round_trip() {
+    let mut chat = harness([1180.0, 860.0], false);
+    chat.state_mut().app.cognitive_controls_available = true;
+    open_settings(&mut chat);
+    expand_advanced_response(&mut chat);
+    for combo_label in [
+        "Extra effort strategy",
+        "Reasoning effort",
+        "Thinking budget",
+        "Sampling preset",
+    ] {
+        assert!(
+            chat.query_by_role_and_label(egui::Role::ComboBox, combo_label)
+                .is_some(),
+            "missing ComboBox {combo_label}"
+        );
+    }
+}

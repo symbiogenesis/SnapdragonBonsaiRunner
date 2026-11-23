@@ -1,6 +1,7 @@
 //! Focused orchestration checks with synthetic completions and no model process.
 
 use super::*;
+use crate::client::{CognitiveOptions, serialize_request_with_adapters};
 use std::{collections::VecDeque, sync::mpsc};
 
 fn message(role: &'static str, content: &str) -> Message {
@@ -37,6 +38,7 @@ fn effort_working_material_keeps_json_bytes_and_rejects_oversized_temporaries() 
         enable_thinking: false,
         abliteration_scale: None,
         daisyrose_scale: None,
+        ..ResponseOptions::default()
     };
     let working = Working {
         plan: Some("A plan: 雨 🌱\n\"quoted\""),
@@ -44,7 +46,7 @@ fn effort_working_material_keeps_json_bytes_and_rejects_oversized_temporaries() 
     };
     let expected = serde_json::to_string(&working)
         .map_err(|_| Failure::Message("Could not encode expected working material."))?;
-    let body = stage_request(&pending, "Draft the answer.", working, options)?;
+    let body = stage_request(&pending, "Draft the answer.", working, options.clone())?;
     let request: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| Failure::Message("Could not decode staged working material."))?;
     assert!(
@@ -69,7 +71,7 @@ fn effort_working_material_keeps_json_bytes_and_rejects_oversized_temporaries() 
                     plan: Some(&plan),
                     draft: None
                 },
-                options,
+                options.clone(),
             )
             .err(),
             Some(request_byte_limit()),
@@ -95,6 +97,7 @@ fn effort_applies_thinking_selection_to_every_stage() -> Result<()> {
                 enable_thinking,
                 abliteration_scale: None,
                 daisyrose_scale: None,
+                ..ResponseOptions::default()
             },
             &incoming,
             &events,
@@ -146,6 +149,7 @@ fn effort_stages_use_fresh_original_context() -> Result<()> {
             enable_thinking: false,
             abliteration_scale: Some(1.3),
             daisyrose_scale: Some(0.5),
+            ..ResponseOptions::default()
         },
         &incoming,
         &events,
@@ -226,6 +230,7 @@ fn effort_truncation_stops_later_stages_and_keeps_complete_draft() -> Result<()>
                 enable_thinking: false,
                 abliteration_scale: None,
                 daisyrose_scale: None,
+                ..ResponseOptions::default()
             },
             &incoming,
             &events,
@@ -284,6 +289,7 @@ fn effort_cancellation_and_request_bounds_prevent_later_calls() {
             enable_thinking: false,
             abliteration_scale: None,
             daisyrose_scale: None,
+            ..ResponseOptions::default()
         },
         &incoming,
         &events,
@@ -305,6 +311,7 @@ fn effort_cancellation_and_request_bounds_prevent_later_calls() {
             enable_thinking: false,
             abliteration_scale: None,
             daisyrose_scale: None,
+            ..ResponseOptions::default()
         },
         &incoming,
         &events,
@@ -329,6 +336,7 @@ fn effort_review_failure_leaves_complete_draft_visible() {
             enable_thinking: false,
             abliteration_scale: None,
             daisyrose_scale: None,
+            ..ResponseOptions::default()
         },
         &incoming,
         &events,
@@ -352,4 +360,153 @@ fn effort_review_failure_leaves_complete_draft_visible() {
     assert!(outgoing.try_iter().any(|event| {
         matches!(event, Event::Draft(text) if text == "Keep this complete draft.")
     }));
+}
+
+#[test]
+fn rsa_multi_draft_shares_identical_prompt_prefix_synthesizes_and_handles_collapse() -> Result<()>
+{
+    let pending = task();
+    let (_commands, incoming) = mpsc::channel();
+    let (events, outgoing) = crate::client::event_channel();
+    let options = ResponseOptions {
+        max_completion_tokens: 2048,
+        enable_thinking: true,
+        cognitive_controls: true,
+        reset_on_cancel: true,
+        cognitive: CognitiveOptions {
+            extra_effort_strategy: ExtraEffortStrategy::MultiDraftSynthesis,
+            ..CognitiveOptions::default()
+        },
+        ..ResponseOptions::default()
+    };
+    let mut requests = Vec::new();
+    let mut pass = 0;
+    let (answer, completion) = run_with_detailed(
+        &pending,
+        &options,
+        &incoming,
+        &events,
+        |body, stop_on_collapse| {
+            pass += 1;
+            let json: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|_| Failure::Message("invalid RSA request JSON"))?;
+            requests.push((json, stop_on_collapse));
+            match pass {
+                1 => Ok((
+                    message("assistant", "Draft A green sea."),
+                    Completion::Finished,
+                    Some(ConfidenceSummary {
+                        tokens: 70,
+                        mean_logprob: -0.9,
+                        min_window_logprob: Some(-1.2),
+                        collapsed: false,
+                    }),
+                )),
+                2 => Ok((
+                    message("assistant", "Draft B green sea."),
+                    Completion::Finished,
+                    Some(ConfidenceSummary {
+                        tokens: 70,
+                        mean_logprob: -0.2,
+                        min_window_logprob: Some(-0.4),
+                        collapsed: false,
+                    }),
+                )),
+                _ => Ok((
+                    message("assistant", "Unified superior synthesis."),
+                    Completion::Finished,
+                    None,
+                )),
+            }
+        },
+    )?;
+    assert_eq!(pass, 3);
+    assert_eq!(answer.content.as_ref(), "Unified superior synthesis.");
+    assert_eq!(completion, Completion::Finished);
+    assert_eq!(requests[0].0["messages"], requests[1].0["messages"]);
+    assert!(!requests[0].1);
+    assert!(requests[1].1);
+    assert_eq!(requests[0].0["logprobs"], true);
+    assert_eq!(requests[1].0["temperature"], serde_json::json!(1.1));
+    let synth_prompt = requests[2].0["messages"][3]["content"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(synth_prompt.contains("Draft A green sea."));
+    assert!(synth_prompt.contains("Draft B green sea."));
+    let notifications: Vec<_> = outgoing.try_iter().collect();
+    assert!(
+        notifications
+            .iter()
+            .any(|event| matches!(event, Event::Draft(text) if text == "Draft B green sea."))
+    );
+
+    // Collapsed Pass 2 retains Draft A without calling synthesis.
+    let (_commands2, incoming2) = mpsc::channel();
+    let (events2, _outgoing2) = crate::client::event_channel();
+    let mut pass2 = 0;
+    let (retained, comp2) = run_with_detailed(
+        &pending,
+        &options,
+        &incoming2,
+        &events2,
+        |_, _| {
+            pass2 += 1;
+            match pass2 {
+                1 => Ok((
+                    message("assistant", "Draft A fallback."),
+                    Completion::Finished,
+                    None,
+                )),
+                _ => Err(Failure::CollapsedDraft),
+            }
+        },
+    )?;
+    assert_eq!(pass2, 2);
+    assert_eq!(retained.content.as_ref(), "Draft A fallback.");
+    assert_eq!(comp2, Completion::Finished);
+
+    // Truncated synthesis retains the higher-confidence Draft B.
+    let (_commands3, incoming3) = mpsc::channel();
+    let (events3, _outgoing3) = crate::client::event_channel();
+    let mut pass3 = 0;
+    let (retained_b, comp3) = run_with_detailed(
+        &pending,
+        &options,
+        &incoming3,
+        &events3,
+        |_, _| {
+            pass3 += 1;
+            match pass3 {
+                1 => Ok((
+                    message("assistant", "Weaker Draft A."),
+                    Completion::Finished,
+                    Some(ConfidenceSummary {
+                        tokens: 64,
+                        mean_logprob: -1.1,
+                        min_window_logprob: None,
+                        collapsed: false,
+                    }),
+                )),
+                2 => Ok((
+                    message("assistant", "Stronger Draft B."),
+                    Completion::Finished,
+                    Some(ConfidenceSummary {
+                        tokens: 64,
+                        mean_logprob: -0.15,
+                        min_window_logprob: None,
+                        collapsed: false,
+                    }),
+                )),
+                _ => Ok((
+                    message("assistant", "Truncated partial"),
+                    Completion::TokenLimit,
+                    None,
+                )),
+            }
+        },
+    )?;
+    assert_eq!(pass3, 3);
+    assert_eq!(retained_b.content.as_ref(), "Stronger Draft B.");
+    assert_eq!(comp3, Completion::TokenLimit);
+    Ok(())
 }

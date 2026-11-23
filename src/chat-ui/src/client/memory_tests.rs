@@ -103,11 +103,12 @@ fn owned_request_releases_bytes_before_response_reads_and_preserves_partial_writ
         };
         let (_commands, incoming) = mpsc::channel();
         let (events, outgoing) = event_channel();
-        let (answer, completion) = exchange(
+        let (answer, completion, _) = exchange(
             &mut connection,
             8080,
             "inert-test-key",
             request,
+            false,
             &events,
             &incoming,
         )?;
@@ -144,6 +145,7 @@ fn owned_request_releases_bytes_on_partial_write_and_flush_failure() {
                 8080,
                 "inert-test-key",
                 request,
+                false,
                 &events,
                 &incoming,
             )

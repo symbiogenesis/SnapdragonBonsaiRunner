@@ -389,6 +389,130 @@ pub(crate) struct Config {
     pub(crate) qwen_tts: Option<crate::tts::Config>,
 }
 
+/// Prompt reasoning effort levels supported by cognitive-control backends.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReasoningEffort {
+    Low,
+    Medium,
+    #[default]
+    XHigh,
+}
+
+impl ReasoningEffort {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::XHigh => "xhigh",
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low (fast)",
+            Self::Medium => "Medium",
+            Self::XHigh => "Extra high (default)",
+        }
+    }
+}
+
+/// Soft thinking-token budget preset within `max_completion_tokens`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ThinkingBudgetMode {
+    #[default]
+    Unbounded,
+    Concise,
+    Balanced,
+    Deep,
+}
+
+impl ThinkingBudgetMode {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unbounded => "Unbounded (default)",
+            Self::Concise => "Concise (~35%)",
+            Self::Balanced => "Balanced (~60%)",
+            Self::Deep => "Deep (~80%)",
+        }
+    }
+
+    pub(crate) fn compute_budget(self, max_completion_tokens: u32, enable_thinking: bool) -> Option<u32> {
+        if !enable_thinking {
+            return None;
+        }
+        let pct = match self {
+            Self::Unbounded => return None,
+            Self::Concise => 35_u64,
+            Self::Balanced => 60_u64,
+            Self::Deep => 80_u64,
+        };
+        let scaled = ((u64::from(max_completion_tokens) * pct) / 100).max(1);
+        let ceiling = max_completion_tokens
+            .saturating_sub(128)
+            .max(1)
+            .min(max_completion_tokens);
+        u32::try_from(scaled)
+            .ok()
+            .map(|value| value.clamp(1, ceiling))
+    }
+}
+
+/// Calibrated sampling & DRY anti-repetition preset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SamplingPreset {
+    #[default]
+    Canonical,
+    Precise,
+    BalancedDry,
+    Creative,
+}
+
+impl SamplingPreset {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Canonical => "Canonical default",
+            Self::Precise => "Precise (T=0.6)",
+            Self::BalancedDry => "Balanced + DRY",
+            Self::Creative => "Creative + DRY",
+        }
+    }
+}
+
+/// Multi-call workflow used when Extra effort is enabled.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExtraEffortStrategy {
+    #[default]
+    PlanDraftReview,
+    MultiDraftSynthesis,
+}
+
+impl ExtraEffortStrategy {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::PlanDraftReview => "Plan -> Draft -> Review",
+            Self::MultiDraftSynthesis => "RSA Multi-Draft Synthesis",
+        }
+    }
+}
+
+/// Conversation-scoped cognitive and sampling options.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CognitiveOptions {
+    #[serde(default)]
+    pub(crate) reasoning_effort: ReasoningEffort,
+    #[serde(default)]
+    pub(crate) thinking_budget: ThinkingBudgetMode,
+    #[serde(default)]
+    pub(crate) sampling_preset: SamplingPreset,
+    #[serde(default)]
+    pub(crate) extra_effort_strategy: ExtraEffortStrategy,
+}
+
 /// Commands sent from the native UI to its single background worker.
 pub(crate) enum Command {
     Send {
@@ -399,6 +523,7 @@ pub(crate) enum Command {
         enable_thinking: bool,
         abliteration_scale: f32,
         daisyrose_scale: f32,
+        cognitive: CognitiveOptions,
     },
     NewChat,
     RestoreChat(Vec<Message>),
@@ -416,6 +541,7 @@ pub(crate) enum Event {
     ContextCapacity(usize),
     VisionAvailable(bool),
     DaisyRoseAvailable(DaisyRoseReadiness),
+    CognitiveControlsAvailable(bool),
     Ready,
     Text(String),
     Reasoning(String),
@@ -453,6 +579,7 @@ enum Failure {
     Memory,
     NativeRuntime,
     Teardown,
+    CollapsedDraft,
     Rejected(&'static str),
     Message(&'static str),
 }
@@ -608,14 +735,49 @@ struct ChatRequest<'a> {
     abliteration_scale: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     daisyrose_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_multiplier: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_base: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_allowed_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_penalty_last_n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_logprobs: Option<u8>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Default)]
 struct ResponseOptions {
     max_completion_tokens: u32,
     enable_thinking: bool,
     abliteration_scale: Option<f32>,
     daisyrose_scale: Option<f32>,
+    cognitive: CognitiveOptions,
+    cognitive_controls: bool,
+    reset_on_cancel: bool,
+    request_logprobs: bool,
+    temperature_nudge: f32,
 }
 
 /// Launch the owned broker, then serve one in-memory conversation until shutdown.
@@ -684,6 +846,10 @@ pub(crate) fn run(config: Config, commands: Receiver<Command>, events: EventSend
             Err(failure) => {
                 let message = match failure {
                     Failure::Message(message) | Failure::Rejected(message) => message.to_owned(),
+                    Failure::CollapsedDraft => {
+                        "Draft generation stopped early due to sustained low token confidence."
+                            .to_owned()
+                    }
                     Failure::NativeRuntime => native_runtime_guidance(&config.data),
                     Failure::Shutdown
                     | Failure::Memory
@@ -945,7 +1111,7 @@ fn serve_broker(
     history: &mut Vec<Message>,
     spec: &ToolProcessSpec,
 ) -> Result<()> {
-    let (key, context_tokens, vision_available, daisyrose) = wait_ready(
+    let (key, context_tokens, vision_available, daisyrose, cognitive_controls) = wait_ready(
         broker,
         config,
         commands,
@@ -956,6 +1122,10 @@ fn serve_broker(
     notify(events, Event::ContextCapacity(context_tokens))?;
     notify(events, Event::VisionAvailable(vision_available))?;
     notify(events, Event::DaisyRoseAvailable(daisyrose))?;
+    notify(
+        events,
+        Event::CognitiveControlsAvailable(cognitive_controls),
+    )?;
     notify(events, Event::Ready)?;
     loop {
         if broker
@@ -982,6 +1152,7 @@ fn serve_broker(
                 enable_thinking,
                 abliteration_scale,
                 daisyrose_scale,
+                cognitive,
             }) => {
                 if text.trim().is_empty() && images.is_empty() {
                     continue;
@@ -1000,14 +1171,18 @@ fn serve_broker(
                 });
                 let scale = config.use_abliterate_lora.then_some(abliteration_scale);
                 let daisyrose_scale = daisyrose.available.then_some(daisyrose_scale);
-                let outcome = serialize_request_with_adapters(
-                    &pending,
+                let options = ResponseOptions {
                     max_completion_tokens,
                     enable_thinking,
-                    scale,
+                    abliteration_scale: scale,
                     daisyrose_scale,
-                )
-                .and_then(|request| {
+                    cognitive,
+                    cognitive_controls,
+                    reset_on_cancel: config.native_engine,
+                    request_logprobs: false,
+                    temperature_nudge: 0.0,
+                };
+                let outcome = serialize_request_with_options(&pending, &options).and_then(|request| {
                     if extra_effort {
                         // Validate the original request locally; effort
                         // constructs its own stage bodies.
@@ -1016,12 +1191,7 @@ fn serve_broker(
                             config.frontend_port,
                             key.as_hex(),
                             &pending,
-                            ResponseOptions {
-                                max_completion_tokens,
-                                enable_thinking,
-                                abliteration_scale: scale,
-                                daisyrose_scale,
-                            },
+                            &options,
                             commands,
                             events,
                         )
@@ -1057,7 +1227,7 @@ fn wait_ready(
     history: &mut Vec<Message>,
     stdout_path: &Path,
     stderr_path: &Path,
-) -> Result<(RetainedCredential, usize, bool, DaisyRoseReadiness)> {
+) -> Result<(RetainedCredential, usize, bool, DaisyRoseReadiness, bool)> {
     let until = Instant::now() + STARTUP_TIMEOUT;
     loop {
         check_startup_commands(commands, history)?;
@@ -1071,8 +1241,15 @@ fn wait_ready(
                 available: config.daisyrose_lora.is_some(),
                 default_scale_tenths: 0,
             });
+            let cognitive_controls = cognitive_controls_declaration(&output)?.unwrap_or(false);
             let key = read_api_key(&config.evidence, &directory)?;
-            return Ok((key, context_tokens, vision_available, daisyrose));
+            return Ok((
+                key,
+                context_tokens,
+                vision_available,
+                daisyrose,
+                cognitive_controls,
+            ));
         }
         if broker
             .try_wait()
@@ -1375,6 +1552,21 @@ fn daisyrose_adapter(output: &[u8]) -> Result<Option<DaisyRoseReadiness>> {
     )
 }
 
+fn cognitive_controls_declaration(output: &[u8]) -> Result<Option<bool>> {
+    parse_unique_complete_line(
+        output,
+        "Cognitive controls: ",
+        "The broker reported cognitive controls more than once.",
+        |value| match value {
+            "available" => Ok(true),
+            "unavailable" => Ok(false),
+            _ => Err(Failure::Message(
+                "The broker reported an unsupported cognitive controls status.",
+            )),
+        },
+    )
+}
+
 fn evidence_directory(output: &[u8]) -> Result<Option<PathBuf>> {
     let Some(text) = complete_startup_lines(output)? else {
         return Ok(None);
@@ -1434,6 +1626,9 @@ fn finish_turn(
         Err(failure) => {
             let message = match failure {
                 Failure::Rejected(message) => message,
+                Failure::CollapsedDraft => {
+                    "Draft generation stopped early due to sustained low token confidence."
+                }
                 Failure::Message(_)
                 | Failure::Memory
                 | Failure::NativeRuntime
@@ -1479,6 +1674,7 @@ fn serialize_request(
     )
 }
 
+#[cfg(test)]
 fn serialize_request_with_adapters(
     history: &[Message],
     max_completion_tokens: u32,
@@ -1486,17 +1682,114 @@ fn serialize_request_with_adapters(
     abliteration_scale: Option<f32>,
     daisyrose_scale: Option<f32>,
 ) -> Result<Vec<u8>> {
-    if abliteration_scale.is_some_and(|scale| !valid_adapter_scale(scale)) {
+    let options = ResponseOptions {
+        max_completion_tokens,
+        enable_thinking,
+        abliteration_scale,
+        daisyrose_scale,
+        ..ResponseOptions::default()
+    };
+    serialize_request_with_options(history, &options)
+}
+
+#[derive(Default)]
+struct WireCognitiveFields {
+    reasoning_effort: Option<&'static str>,
+    reasoning_budget: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
+    dry_multiplier: Option<f32>,
+    dry_base: Option<f32>,
+    dry_allowed_length: Option<u32>,
+    dry_penalty_last_n: Option<u32>,
+    logprobs: Option<bool>,
+    top_logprobs: Option<u8>,
+}
+
+impl WireCognitiveFields {
+    fn from_options(options: &ResponseOptions) -> Self {
+        if !options.cognitive_controls {
+            return Self::default();
+        }
+        let mut fields = Self::default();
+        if options.cognitive.reasoning_effort != ReasoningEffort::XHigh {
+            fields.reasoning_effort = Some(options.cognitive.reasoning_effort.as_str());
+        }
+        fields.reasoning_budget = options
+            .cognitive
+            .thinking_budget
+            .compute_budget(options.max_completion_tokens, options.enable_thinking);
+        let base_temp = match options.cognitive.sampling_preset {
+            SamplingPreset::Canonical => None,
+            SamplingPreset::Precise => {
+                fields.top_p = Some(0.90);
+                fields.top_k = Some(40);
+                fields.min_p = Some(0.05);
+                Some(0.6)
+            }
+            SamplingPreset::BalancedDry => {
+                fields.top_p = Some(0.95);
+                fields.top_k = Some(40);
+                fields.min_p = Some(0.05);
+                fields.presence_penalty = Some(0.15);
+                fields.dry_multiplier = Some(0.8);
+                fields.dry_base = Some(1.75);
+                fields.dry_allowed_length = Some(2);
+                fields.dry_penalty_last_n = Some(1024);
+                Some(0.85)
+            }
+            SamplingPreset::Creative => {
+                fields.top_p = Some(0.95);
+                fields.top_k = Some(64);
+                fields.min_p = Some(0.04);
+                fields.presence_penalty = Some(0.25);
+                fields.dry_multiplier = Some(0.8);
+                fields.dry_base = Some(1.75);
+                fields.dry_allowed_length = Some(2);
+                fields.dry_penalty_last_n = Some(1024);
+                Some(1.0)
+            }
+        };
+        fields.temperature = match (base_temp, options.temperature_nudge > 0.0) {
+            (Some(temp), true) => Some((temp + options.temperature_nudge).clamp(0.05, 1.15)),
+            (None, true) => Some((1.0 + options.temperature_nudge).clamp(0.05, 1.15)),
+            (Some(temp), false) => Some(temp),
+            (None, false) => None,
+        };
+        if options.request_logprobs {
+            fields.logprobs = Some(true);
+            fields.top_logprobs = Some(5);
+        }
+        fields
+    }
+}
+
+fn serialize_request_with_options(
+    history: &[Message],
+    options: &ResponseOptions,
+) -> Result<Vec<u8>> {
+    if options
+        .abliteration_scale
+        .is_some_and(|scale| !valid_adapter_scale(scale))
+    {
         return Err(Failure::Rejected(
             "Choose an abliteration scale between 0 and 2.",
         ));
     }
-    if daisyrose_scale.is_some_and(|scale| !valid_adapter_scale(scale)) {
+    if options
+        .daisyrose_scale
+        .is_some_and(|scale| !valid_adapter_scale(scale))
+    {
         return Err(Failure::Rejected(
             "Choose a DaisyRose scale between 0 and 2.",
         ));
     }
-    if !(1..=4096).contains(&max_completion_tokens) {
+    if !(1..=4096).contains(&options.max_completion_tokens) {
         return Err(Failure::Rejected(
             "Choose an output budget between 1 and 4,096 tokens.",
         ));
@@ -1520,14 +1813,30 @@ fn serialize_request_with_adapters(
     } else {
         MAX_REQUEST
     };
+    let cognitive = WireCognitiveFields::from_options(options);
     crate::bounded_json::to_vec(
         &ChatRequest {
             messages: RequestMessages(history),
-            max_completion_tokens,
+            max_completion_tokens: options.max_completion_tokens,
             stream: true,
-            enable_thinking,
-            abliteration_scale,
-            daisyrose_scale,
+            enable_thinking: options.enable_thinking,
+            abliteration_scale: options.abliteration_scale,
+            daisyrose_scale: options.daisyrose_scale,
+            reasoning_effort: cognitive.reasoning_effort,
+            reasoning_budget: cognitive.reasoning_budget,
+            temperature: cognitive.temperature,
+            top_p: cognitive.top_p,
+            top_k: cognitive.top_k,
+            min_p: cognitive.min_p,
+            presence_penalty: cognitive.presence_penalty,
+            frequency_penalty: cognitive.frequency_penalty,
+            repeat_penalty: cognitive.repeat_penalty,
+            dry_multiplier: cognitive.dry_multiplier,
+            dry_base: cognitive.dry_base,
+            dry_allowed_length: cognitive.dry_allowed_length,
+            dry_penalty_last_n: cognitive.dry_penalty_last_n,
+            logprobs: cognitive.logprobs,
+            top_logprobs: cognitive.top_logprobs,
         },
         limit,
     )
@@ -1667,6 +1976,19 @@ fn generate(
     commands: &Receiver<Command>,
     events: &EventSender,
 ) -> Result<(Message, Completion)> {
+    let (message, completion, _) =
+        generate_with_options(port, key, request, false, commands, events)?;
+    Ok((message, completion))
+}
+
+fn generate_with_options(
+    port: u16,
+    key: &str,
+    request: Vec<u8>,
+    stop_on_collapse: bool,
+    commands: &Receiver<Command>,
+    events: &EventSender,
+) -> Result<(Message, Completion, Option<sse::ConfidenceSummary>)> {
     check_commands(commands)?;
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let connect_timeout = Duration::from_secs(1);
@@ -1685,7 +2007,15 @@ fn generate(
             Ok(_) | Err(RecvTimeoutError::Timeout) => check_commands(commands),
         },
     });
-    let outcome = exchange(&mut connection, port, key, request, events, commands);
+    let outcome = exchange(
+        &mut connection,
+        port,
+        key,
+        request,
+        stop_on_collapse,
+        events,
+        commands,
+    );
     let _checked = connection.check();
     connection.take_interrupted().map_or(outcome, Err)
 }
@@ -1695,9 +2025,10 @@ fn exchange(
     port: u16,
     key: &str,
     request: impl AsRef<[u8]>,
+    stop_on_collapse: bool,
     events: &EventSender,
     commands: &Receiver<Command>,
-) -> Result<(Message, Completion)> {
+) -> Result<(Message, Completion, Option<sse::ConfidenceSummary>)> {
     {
         let head = crate::http::bearer_request_head(
             "POST",
@@ -1736,9 +2067,13 @@ fn exchange(
             }
             Ok(())
         })?;
+        if stop_on_collapse && sse.confidence_collapsed() {
+            return Err(Failure::CollapsedDraft);
+        }
     }
     check_commands(commands)?;
     let completion = sse.finish()?;
+    let summary = sse.confidence_summary();
     let (text, reasoning) = sse.into_answer();
     Ok((
         Message {
@@ -1748,6 +2083,7 @@ fn exchange(
             images: Arc::default(),
         },
         completion,
+        summary,
     ))
 }
 
@@ -3224,6 +3560,7 @@ mod tests {
                     enable_thinking: false,
                     abliteration_scale: super::DEFAULT_ABLITERATION_SCALE,
                     daisyrose_scale: super::DEFAULT_DAISYROSE_SCALE,
+                    cognitive: super::CognitiveOptions::default(),
                 })
                 .is_ok()
         );
@@ -3568,6 +3905,82 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn startup_cognitive_controls_declaration_and_gated_serialization() -> Result<(), Failure> {
+        use crate::client::{
+            CognitiveOptions, ExtraEffortStrategy, ReasoningEffort, ResponseOptions,
+            SamplingPreset, ThinkingBudgetMode, cognitive_controls_declaration,
+            serialize_request_with_options,
+        };
+
+        assert_eq!(
+            cognitive_controls_declaration(b"Cognitive controls: available\n"),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            cognitive_controls_declaration(b"Cognitive controls: unavailable\r\n"),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            cognitive_controls_declaration(b"Context tokens: 8192\n"),
+            Ok(None)
+        );
+        assert!(
+            cognitive_controls_declaration(b"Cognitive controls: maybe\n").is_err()
+        );
+        let history = [Message {
+            role: "user",
+            content: "rain".into(),
+            reasoning_content: None,
+            images: super::Arc::default(),
+        }];
+        let baseline = serialize_request(&history, 2048, true, None)?;
+        let disabled = serialize_request_with_options(
+            &history,
+            &ResponseOptions {
+                max_completion_tokens: 2048,
+                enable_thinking: true,
+                cognitive_controls: false,
+                cognitive: CognitiveOptions {
+                    reasoning_effort: ReasoningEffort::Low,
+                    thinking_budget: ThinkingBudgetMode::Concise,
+                    sampling_preset: SamplingPreset::BalancedDry,
+                    extra_effort_strategy: ExtraEffortStrategy::MultiDraftSynthesis,
+                },
+                request_logprobs: true,
+                temperature_nudge: 0.1,
+                ..ResponseOptions::default()
+            },
+        )?;
+        assert_eq!(baseline, disabled);
+
+        let enabled = serialize_request_with_options(
+            &history,
+            &ResponseOptions {
+                max_completion_tokens: 2048,
+                enable_thinking: true,
+                cognitive_controls: true,
+                cognitive: CognitiveOptions {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    thinking_budget: ThinkingBudgetMode::Balanced,
+                    sampling_preset: SamplingPreset::BalancedDry,
+                    extra_effort_strategy: ExtraEffortStrategy::MultiDraftSynthesis,
+                },
+                request_logprobs: true,
+                temperature_nudge: 0.1,
+                ..ResponseOptions::default()
+            },
+        )?;
+        let parsed: serde_json::Value = serde_json::from_slice(&enabled)
+            .map_err(|_| Failure::Message("invalid cognitive request JSON"))?;
+        assert_eq!(parsed["reasoning_effort"], "medium");
+        assert_eq!(parsed["reasoning_budget"], 1228);
+        assert_eq!(parsed["dry_multiplier"], serde_json::json!(0.8));
+        assert_eq!(parsed["logprobs"], true);
+        assert_eq!(parsed["top_logprobs"], 5);
+        Ok(())
     }
 
     #[test]

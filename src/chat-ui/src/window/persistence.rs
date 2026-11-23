@@ -125,6 +125,7 @@ struct ActiveView<'a> {
     abliteration_scale: f32,
     daisyrose_enabled: bool,
     daisyrose_scale: f32,
+    cognitive: client::CognitiveOptions,
     status: &'a str,
     warning: bool,
 }
@@ -204,6 +205,7 @@ impl State {
                 abliteration_scale: self.abliteration_scale,
                 daisyrose_enabled: self.daisyrose_enabled,
                 daisyrose_scale: self.daisyrose_scale,
+                cognitive: self.cognitive,
                 status: &self.status,
                 warning: self.warning,
             },
@@ -1379,6 +1381,31 @@ mod tests {
                 .attachments
                 .is_empty()
         );
+        assert_eq!(legacy_restored.cognitive, client::CognitiveOptions::default());
+
+        let mut custom = state();
+        custom.cognitive = client::CognitiveOptions {
+            reasoning_effort: client::ReasoningEffort::Medium,
+            thinking_budget: client::ThinkingBudgetMode::Balanced,
+            sampling_preset: client::SamplingPreset::BalancedDry,
+            extra_effort_strategy: client::ExtraEffortStrategy::MultiDraftSynthesis,
+        };
+        let saved_custom = custom.workspace_bytes()?;
+        let mut restored_custom = state();
+        restored_custom.restore_workspace(&saved_custom)?;
+        assert_eq!(restored_custom.cognitive, custom.cognitive);
+
+        let mut legacy_no_cog: serde_json::Value =
+            serde_json::from_slice(&saved_custom).map_err(io::Error::other)?;
+        if let Some(root) = legacy_no_cog.as_object_mut()
+            && let Some(active) = root["active"].as_object_mut()
+        {
+            active.remove("cognitive");
+        }
+        let mut legacy_loaded = state();
+        legacy_loaded
+            .restore_workspace(&serde_json::to_vec(&legacy_no_cog).map_err(io::Error::other)?)?;
+        assert_eq!(legacy_loaded.cognitive, client::CognitiveOptions::default());
         Ok(())
     }
 }
