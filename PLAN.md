@@ -602,7 +602,14 @@ adoption decisions without displacing native daily-use acceptance.
   kernels in `bonsai-speech-asr`, followed by Runner commit `eebb25ba` adding
   `PredictorWorkspace` scratch reuse across `CodePredictor` frames and parallel
   `f32x4` minimax-exp `attend_query_f16` in `bonsai-speech-tts`, plus parallel
-  GQA KV-head-grouped `0-ULP` `attend_into` in `bonsai-speech-asr`. Complete
+  GQA KV-head-grouped `0-ULP` `attend_into` in `bonsai-speech-asr`, and
+  Runner commits `9450ac9c`/`ea2489ae`/`7cde4855`/`d1b76fa4` (`bonsai-speech-tts`
+  Talker/CodePredictor/Mimi 8-row `Q4_K` repacks, SIMD `swiglu_in_place`,
+  batched QKV/Gate+Up fusion + parallel RMSNorm/attention, and SIMD/parallel
+  Mimi pre-transformer) plus `cbfd8765`/`6c78adc4`/`267d4b00`/`87128152`
+  (`bonsai-speech-asr` 8-row repacked `Q4_K`, unified `row_workers` batch
+  quantization, parallel SIMD 4x4 `scatter_rows_to_batch`, and SIMD encoder
+  LayerNorm/bias/residual/tiled attention). Complete
   compiled CI, actual-model `fp64`/teacher-forced/WER/listening, and
   X1/X2 device qualification gates before promotion.
 - [ ] Retire the remaining Windows queue ABI, ASR, Prism reference and publisher
@@ -1487,7 +1494,11 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   host `Model` after GPU upload, `block_tokens: 16` prefill, `f16` KV default),
   while Runner wired opt-in
   release-gated `--placement vulkan|composite` routing in commit `a57a3afd`
-  (`VULKAN_PLACEMENT_RELEASE = None`); physical X2/X1-85 hardware parity, TDR
+  (`VULKAN_PLACEMENT_RELEASE = None`), and Prism commits `8ef7ca4` and `92d1a79`
+  added native coalesced `Q8_0` GPU weight kernels/dispatch (avoiding F32
+  dequantization of `output.weight`/`lm_head`) plus single-dispatch
+  register-resident batched GDN scan, in-place `conv1d_silu`, and strided
+  `l2_norm` (verified in live `Adreno(TM) X2-90 GPU` parity tests); physical X2/X1-85 hardware parity, TDR
   qualification, and release lock promotion remain open.
 - [ ] Qualify the opt-in native ARM64 OpenCL original-PQ2/Q8_K projection
   pilot under unchanged mitigations, including owning hosted analysis/linking,
@@ -1718,7 +1729,9 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   `attend_tile` grouped KV reuse landed in `c4b94e4` and `da699ed`, and
   `prfm pldl1keep` decode L1 prefetch + full-K `PTQ1_0`/`Q8_0` `dot_scaled_8x8_chunks`
   `8..=32` token prefill kernels + 4-way register-blocked `MultiRankAdapter` NEON
-  kernels (`0 ULP`) landed in `ec4bcfa`; device crossover benchmarking remains open.)
+  kernels (`0 ULP`) landed in `ec4bcfa`, and `dot_pair`/`gdn_wy_update_eight_rows`
+  NEON register-spill elimination plus 4-row fused-pass state-only GDN prefill
+  (`0 ULP` bit-exact) landed in Prism `4c745eb` and `3d4ef57`; device crossover benchmarking remains open.)
 - [ ] **#25 — Remaining shared activation-preparation consumers.** Extend shared
   transform-and-quantize preparation to remaining recurrent sibling projections
   sharing identical input, basis, width and quantizer. (Recurrent sibling audit on
@@ -1787,7 +1800,10 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   `OwnedCompositeProjectionExecutor` resident handle rebinding
   (`release_host_weight_binding` / `has_released_host_weight`), and
   `prism-inference-server` (when `cpu_prefill` is `None`), and Runner commit
-  `eebb25ba` wired release-gated opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`;
+  `eebb25ba` wired release-gated opt-in `--hexagon-arena-cache <dir>` forwarding in `bonsai-broker`,
+  while Prism commits `b135ffd` and `0a7eade` added word-packed `PTQ1_0` LUT
+  cold transcoding, streamlined `PQ2` packing, and `4 MiB` buffered fail-closed
+  SHA-256 `SB2HQ2C1` arena cache I/O;
   physical NPU device qualification and release lock promotion remain open.)
 - [ ] **#42 — Pipelined DMA, HVX preparation and HMX chunkwise GDN.** Gate under an
   explicit separate numerical profile (HMX FP16 intermediates do not preserve the
