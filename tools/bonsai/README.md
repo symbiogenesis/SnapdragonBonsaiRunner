@@ -77,16 +77,16 @@ smoke establishes broad quality or an inference-speed improvement.
 via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
 - `"plan"` / `"audit"`: requires `source` (`{"kind":"pinned-daisyrose"}` or
   `{"kind":"local-directories","candidateDirectory":...,"baseDirectory":...}`),
-  optional `scope` (`layers`, `targetEnvelope` in `"all"` | `"residual-writers"` |
-  `"npu-friendly"` | `"full-linear"`, `includeOutputNorm`, `includeVocab`,
-  `includeSvd`, `includeSpectralDenoising`, `exportDtype` `"f16"` | `"f32"`,
+  optional `scope` (`layers`, `targetEnvelope` in `"all"`, `"residual-writers"`,
+  `"npu-friendly"`, or `"full-linear"`, `includeOutputNorm`, `includeVocab`,
+  `includeSvd`, `includeSpectralDenoising`, `exportDtype` `"f16"` or `"f32"`,
   `minSpikeRatio`, `maxRank`, `oversampling`, `powerIterations`), optional
   `controls` (`timeBudgetSeconds` in `10..=900`, `workers`, `httpConcurrency`),
   and optional fresh external `outputPath`. Audits emit both `gate1Screen` (raw
   SVD) and `spectralDenoisingScreen` (Rademacher-null bulk calibration +
   Gavish–Donoho optimal shrinkage + `tailSaturated` check).
 - `"export-denoised"`: requires `source`, fresh external `outputPath`, and
-  `targetEnvelope` in `"residual-writers"` | `"npu-friendly"` (default) |
+  `targetEnvelope` in `"residual-writers"`, `"npu-friendly"` (default), or
   `"full-linear"`, atomically exporting shrunk above-bulk spikes to a GGUF v3
   LoRA with both `adapter.lora.alpha` and `adapter.lora_alpha` and immediately
   self-verifying the published bytes.

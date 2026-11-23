@@ -1,6 +1,6 @@
 # DaisyRose-27B BF16 Task-Vector Audit (Gate 1 No-Go)
 
-On November 19, 2026, Gate 1 (`DR1`) of the conditional `DaisyRose-27B` task-vector LoRA investigation returned an empirical **No-Go (`no-go-high-rank`)** verdict under [PLAN.md](../../PLAN.md#daisyrose-27b-composition-boundary). Across all 24 FFN and full-attention linear matrices in the 4-layer probe (`blk.0`, `blk.3`, `blk.31`, `blk.63`), energy-weighted cumulative Frobenius energy captured at rank 32 was **14.26%** (`0.142637`), well below the **50%** hard stop threshold (`E(64) = 18.38%`), and only **31.87%** of block linear delta energy sat in `ffn_down + attn_output`. Per the gated plan, `DR2`–`DR4` stopped before any adapter export, `prism-inference`, broker, or UI changes.
+On November 19, 2026, Gate 1 (`DR1`) of the conditional `DaisyRose-27B` task-vector LoRA investigation returned an empirical **No-Go (`no-go-high-rank`)** verdict under [PLAN.md](../../PLAN.md#daisyrose-27b--swift-bonsai-2-hybrid-composition). Across all 24 FFN and full-attention linear matrices in the 4-layer probe (`blk.0`, `blk.3`, `blk.31`, `blk.63`), energy-weighted cumulative Frobenius energy captured at rank 32 was **14.26%** (`0.142637`), well below the **50%** hard stop threshold (`E(64) = 18.38%`), and only **31.87%** of block linear delta energy sat in `ffn_down + attn_output`. Per the gated plan, `DR2`–`DR4` stopped before any adapter export, `prism-inference`, broker, or UI changes.
 
 ## Verdict and Root-Cause Analysis
 
