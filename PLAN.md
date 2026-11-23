@@ -652,6 +652,13 @@ adoption decisions without displacing native daily-use acceptance.
   between local prose and complete-story continuity/coherence; retain independent
   human review and held-out tasks without importing its Python/cloud-judge harness
   or claiming leaderboard equivalence for a shortened packet.
+  Include opt-in equal-resource comparisons of [DeepConf](docs/research-register.md#decoding-samplers-and-test-time-scaling)
+  (online sliding-window logprob confidence stopping/weighted voting; offline pure-Rust
+  tracker/consensus primitives landed in `tools/bonsai/src/calibration_metrics.rs`, with
+  per-token Prism SSE logprob streaming remaining a prerequisite) and
+  [Recursive Self-Aggregation (RSA)](docs/research-register.md#decoding-samplers-and-test-time-scaling)
+  (iterative multi-draft synthesis for open-ended prose/planning) alongside current 3-stage
+  [Extra effort](docs/inference-defaults.md#experimental-extra-effort-mode).
 - [ ] Qualify [standard LoRA](docs/swift-lora.md#standard-profile-qualification)
   writer basis, loaded-zero/no-adapter identity, nonzero effect and application
   at scale 1.3; retain scale-specific throughput, complete-answer quality and RAM.
@@ -698,7 +705,10 @@ adoption decisions without displacing native daily-use acceptance.
   exclusion reasons, and a bounded token budget with authoritative broker
   counting. Require reviewed canon changes; preserve branch ownership, encrypted
   persistence/opt-out and draft recovery. Start without embeddings or an MCP/web
-  frontend, and evaluate complete-scene continuity and task cost before expansion.
+  frontend, and evaluate complete-scene continuity and task cost before expansion;
+  treat [Doc-to-LoRA](docs/research-register.md#speculative-decoding-kv-free-context-and-confirmed-low-roi-controls)
+  (`arXiv:2602.15902`, hypernetwork canon compilation into temporary LoRAs without KV bloat)
+  only as a later conditional complement after compatible artifacts and Rust support exist.
 
 ### Direct LoRA weight editing
 
@@ -849,6 +859,13 @@ nor editing the available Abliteration factors.
   and ordinary controls before selecting a direction/LP fit. Compare constant
   steering at the same site, preserve the original activation basis and qualify
   held-out complete answers, composition, state and resources before serving.
+- [ ] Audit pinned Orca rank-1 abliteration (128 sites, `scale 1.3`) for Qwen3.8-27B
+  coding/reasoning self-correction regressions (`Abliterlitics` / `Heretic` / iterative LoRA
+  self-distillation findings in
+  [the research register](docs/research-register.md#qwen38-27b-adapters-surgical-abliteration-weight-editing-and-low-bit-recovery)),
+  comparing unchanged Orca against in-band (`layerMin: 20, layerMax: 47`) and `ssm_out: 0.0`
+  candidates exported via extended `bonsai-tools adapter-edit` (`linear-a-band-magnitude-edit-v1`)
+  across per-layer KL, self-correction loops, refusal behavior and held-out complete answers.
 
 ### DaisyRose-27B + Swift-Bonsai-2 hybrid composition
 
@@ -917,10 +934,14 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   Triggered only if the unedited `DR-E1` stack fails `DR-G2`; keep
   `Swift-Bonsai-2`'s packed ternary base immutable and stay inside `npu-friendly`
   with zero GPU/gradient retraining. Start with algebraic factor edits (rank
-  `16 -> 32`, shrinkage / unshrunk-spike retention, per-family/per-layer gain &
-  depth masking, singular-mode/coefficient pruning and norm capping generalizing
-  `adapter-edit`, and Orca subspace orthogonalization at overlapping sites); if
-  behavioral or manifold defects persist, apply bounded closed-form
+  `16 -> 32`, shrinkage / unshrunk-spike retention, per-family/per-layer gain,
+  sparse `layerGains` & depth masking, singular-mode/coefficient pruning and norm
+  capping generalizing `adapter-edit`, Orca subspace orthogonalization at overlapping
+  sites, plus closed-form/null-space helpers `CANS`, `Attention Residuals` depth
+  steering, `Selective-RL` `mmproj` preservation, `LS-LoRA`, `AlphaEdit`, and
+  `Off-Policy Merging` per
+  [the research register](docs/research-register.md#qwen38-27b-adapters-surgical-abliteration-weight-editing-and-low-bit-recovery));
+  if behavioral or manifold defects persist, apply bounded closed-form
   activation-guided pure-Rust edits (equal-byte per-site KL-gap &
   Softmax-Fisher variable-rank reallocation `r = 0..32` across the 128
   `npu-friendly` sites within `<= 64 MiB` F16 — prioritizing high-SNR late
@@ -936,7 +957,7 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   leave `config/daisyrose-lora.lock.json` unpinned.
   (Pure-Rust `calibration_metrics` KL-gap / Softmax-Fisher / exact MCKP helpers
   and `bonsai-tools lora-diff-audit` `reallocate-ranks` plus `edit-adapter`
-  `perSiteRanks` landed locally with synthetic unit controls; conditional `DR-G2`
+  `perSiteRanks`/`layerGains` landed locally with synthetic unit controls; conditional `DR-G2`
   trigger and X1/X2 device qualification remain open.)
 - [ ] **DR-C1 — Extend `prism-inference` for stackable `MultiRankAdapter` after `DR-G2` passes.**
   Generalize `prism-inference` (`src/model/lora.rs`) beyond rank-1
@@ -979,12 +1000,25 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   complete; `config/daisyrose-lora.lock.json`, `MULTI_RANK_LORA_RELEASE`
   enablement, physical X1 matched-power throughput/RAM qualification, awake
   4-category `DR-G2` + held-out human review, and owning CI remain open.
+- [ ] **DR-Alt — Conditional alternative Qwen3.8-27B donor & quantization-residual `MultiRankAdapter` lane.**
+  Using `MultiRankAdapter` without retraining Swift's ternary base, audit and
+  screen alternative donors tracked in
+  [alternative donor classes](docs/daisyrose-composition.md#alternative-donor-classes-and-low-bit-residual-adapters):
+  native clean Thinking-OFF RL LoRAs (`harness-hub` `pi-adapted` / `opencode-adapted` /
+  `hermes-adapted` / `super-adapter`), creative-prose/reasoning distillations (`Opus-Distill` /
+  `qwen3.8-max-distillation-50k`), and `SVDQuant`/`Recover-LoRA`/`OnQ`/`OnlineQAT`
+  quantization-residual adapters (fitting against Swift's own rollouts or projecting
+  orthogonal to Swift's merged anti-overthinking subspace rather than naively
+  subtracting `W_Qwen3.8 - dequant(W_Swift)`). Require license/revision audit,
+  `verify-adapter` NPU bounds, `Selective-RL` `mmproj` checks and full `DR-G2` scoring.
 
 ### Memory and profiles
 
 - [ ] **P1 — Run public adapter reconstruction.** Execute the declared all-48
   A-factor [public-pack recipe](docs/adapter-public-reference.md), then independently
-  replay retained comparisons with the schema-2 scalar auditor. Separately obtain
+  replay retained comparisons with the schema-2 scalar auditor (unlocking GDN query-forming
+  `ssm_out` LoRA/editing sites highlighted by
+  [`Who Asks, Who Answers`](docs/research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)). Separately obtain
   authenticated original checkpoint/conversion/invocation/toolchain inputs and
   verify native writer mappings through [authoring intake](docs/adapter-authoring-intake.md).
 - [ ] **P2 — Qualify PTQ1 numerical execution.** Bind one released-source
@@ -1151,7 +1185,9 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   For a measured cache/activation bottleneck, compare one explicit static
   per-layer/per-role policy with uniform K4/V4 and FP16 controls; reuse K1's
   fitted-scale candidate where applicable. Protect F32 recurrent/convolution
-  state and existing norm/accumulation contracts initially. Preserve packed base
+  state, full-attention retrieval heads identified by
+  [`Who Asks, Who Answers`](docs/research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency),
+  and existing norm/accumulation contracts initially. Preserve packed base
   weights; charge scales, exception paths, retained copies, scratch and recovery
   factors against net resources. Add native kernels only for an admitted format;
   bind the complete policy to discovery, admission, prefix/checkpoint identity,
@@ -1179,14 +1215,20 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   losing candidates, or retry a closed owner-device trial.
 - [ ] **U6 — Evaluate explicit reasoning/sampling profiles on unchanged Swift.**
   Use Q1's held-out tasks to compare enabled Thinking at `low`/`medium` against
-  current `xhigh`, and assess publisher non-thinking sampler guidance separately
-  from effort. Qualify any exposed control through native Settings, persistence,
-  broker canonical count/generation bodies, exact context reservation and runtime
-  effective-setting confirmation; preserve current defaults. Review reasoning
-  replay policy as a separate context/quality tradeoff rather than dropping it
-  silently. Count complete answers, truncation, useful-answer latency and RAM;
-  shorter reasoning or fewer tokens alone cannot establish a win. No automatic
-  penalty, forced-thinking, early-exit or model-switch heuristic is selected.
+  current `xhigh`, and assess publisher non-thinking sampler guidance,
+  [`TempQuant`](docs/research-register.md#decoding-samplers-and-test-time-scaling)
+  temperature/`top_p` recalibration (`fit_tempquant_temperature` /
+  `fit_tempquant_top_p` pure-Rust offline fitters landed in
+  `tools/bonsai/src/calibration_metrics.rs`), and opt-in decode-time anti-slop
+  cliché suppression separately from effort. Qualify any exposed effort or soft
+  `</think>` `ReasoningBudget` control through `prism-inference` `SwiftChatSession` /
+  `native_swift`, native Settings, persistence, broker canonical count/generation bodies,
+  exact context reservation and runtime effective-setting confirmation; preserve current
+  defaults. Review reasoning replay policy as a separate context/quality tradeoff
+  rather than dropping it silently. Count complete answers, truncation,
+  useful-answer latency and RAM; shorter reasoning or fewer tokens alone cannot
+  establish a win. No automatic penalty, forced-thinking, early-exit or
+  model-switch heuristic is selected by default.
 - [ ] **K1 — Qualify K4/V4 independently on X1/X2.** Complete the
   [three-task paired packet](docs/quantized-kv.md#first-practical-promotion-packet)
   for held-out retrieval, instructions and creative continuation: at least 65%
@@ -1204,9 +1246,21 @@ The tasks below do not displace native daily-use acceptance or reopen past trial
   Screening audit `#1` (`ClampedL2` reference identity) is closed; deferred item `#21`
   (calibrated K-cache mean centering) remains gated behind K1 baseline attribution,
   separate center-vector accounting and held-out answer parity.
-- [ ] Only for material recurrent-state traffic/storage, compare FP16 recurrence
-  with FP32, then at most one DAMP-inspired split; qualify trajectory error,
-  convolution, rounding/RNG, restore and total benefit before extra factors.
+- [ ] Only for material recurrent-state traffic/storage, compare FP16/BF16 recurrence
+  with FP32 using mandatory **Stochastic Rounding (SR)** per
+  [Lost in Rounding](docs/research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2611.12127`; Round-to-Nearest 16-bit GDN state is rejected due to
+  overthinking loops and cap hits), then at most one DAMP-inspired split; qualify
+  trajectory error, convolution, rounding/RNG, restore and total benefit before
+  extra factors.
+- [ ] For long-context/thinking KV pressure beyond K4/V4 (`rsq4`), evaluate
+  [GateSight](docs/research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2610.14754` GDN-gate-guided query-agnostic eviction compounding
+  multiplicatively with `rsq4`), long-CoT `iS-KV`/`AbridgeKV`, and conditional
+  [VisionWeave](docs/research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+  (`arXiv:2610.07987` elastic spatial visual tokens for multimodal `mmproj`) as
+  separate artifact/profile gates requiring retrieval, creative-continuation and
+  rollback qualification.
 - [ ] Only for a demonstrated weight/codec bottleneck, evaluate exact entropy
   coding, random access and decode cost against PTQ1; new codebooks/rotations/
   scales need bounded native layerwise cost and held-out quality preflight under
@@ -1743,11 +1797,18 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 ## Survey ideas outside the current laptop backlog
 
 - [ ] **F1 — Conditional research.** After a useful verifier and compatible
-  published auxiliary exist, screen trained parallel/phrase proposals with
-  admitted native resources. After a useful
-  fixed chain, consider scheduling, rejected-suffix conditioning or overlap only
-  with required target features and independent hardware capacity under the
-  [research scope](docs/research-register.md#research-catalog).
+  published auxiliary exist, screen trained parallel/phrase proposals — including
+  Apache-2.0 [`DSpine`](docs/research-register.md#speculative-decoding-kv-free-context-and-confirmed-low-roi-controls)
+  (`arXiv:2609.36173`, conditional on a compact ternary/Swift-compatible draft),
+  compact extracted native `Qwen3.8` `draft-mtp` heads,
+  [Test-Time Speculation](docs/research-register.md#speculative-decoding-kv-free-context-and-confirmed-low-roi-controls)
+  (`arXiv:2605.09329`), and [Architectural Sampling](docs/research-register.md#decoding-samplers-and-test-time-scaling)
+  (`arXiv:2610.01687`) — with admitted native resources and full stochastic target
+  verification. After a useful fixed chain, consider scheduling, rejected-suffix
+  conditioning or overlap only with required target features and independent hardware
+  capacity under the [research scope](docs/research-register.md#research-catalog).
+  (`Dynamic Evaluation / Gradient TTT` on `Qwen3.8-27B` is **closed low-ROI** per
+  `arXiv:2610.33025` `<1%` gain on GDN hybrids.)
 - [ ] Reopen exact full-precision weight codecs only for a suitable measured
   bottleneck; exact FP16 KV codecs only for material selected-context traffic;
   transfer/inactive-session codecs only for a selected capacity or transfer need.
