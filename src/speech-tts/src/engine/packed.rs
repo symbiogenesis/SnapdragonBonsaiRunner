@@ -154,7 +154,7 @@ fn q6_k_rows<S: Simd, const N: usize>(simd: S, sources: [&[u8]; N], input: &[f32
 }
 
 #[inline(always)]
-fn transpose_4x4<S: Simd>(simd: S, rows: [f32x4<S>; 4]) -> [f32x4<S>; 4] {
+pub(super) fn transpose_4x4<S: Simd>(simd: S, rows: [f32x4<S>; 4]) -> [f32x4<S>; 4] {
     let t0 = simd.zip_low_f32x4(rows[0], rows[1]);
     let t1 = simd.zip_high_f32x4(rows[0], rows[1]);
     let t2 = simd.zip_low_f32x4(rows[2], rows[3]);

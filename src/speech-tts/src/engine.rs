@@ -1205,6 +1205,83 @@ impl LinearProjection {
         forward_group_into(&mut targets, input, threads)
     }
 
+    /// Fuse multiple sibling batched projections sharing `inputs` (`[seq_len * in_dim]`) into
+    /// `[seq_len * out_dim]` per target so activation quantization and worker orchestration run once.
+    pub fn forward_batch_group_into(
+        targets: &mut [(&Self, Option<&LoraProjectionPatch>, &mut Vec<f32>)],
+        inputs: &[f32],
+        seq_len: usize,
+        threads: usize,
+    ) -> io::Result<()> {
+        if !(1..=256).contains(&threads) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid CPU worker count.",
+            ));
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        for (proj, lora, _) in targets.iter() {
+            let _layout = projection_layout::validate(proj.in_dim, proj.out_dim, &proj.weight)?;
+            let expected_in = seq_len.checked_mul(proj.in_dim).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Batch input length overflow.")
+            })?;
+            if inputs.len() != expected_in {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Batch projection input length mismatch.",
+                ));
+            }
+            if seq_len.checked_mul(proj.out_dim).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Batch output length overflow.",
+                ));
+            }
+            if let Some(bias) = &proj.bias
+                && bias.len() != proj.out_dim
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Projection bias length mismatch.",
+                ));
+            }
+            if let Some(patch) = *lora {
+                patch.validate(proj.in_dim, proj.out_dim)?;
+            }
+        }
+        if seq_len == 0 {
+            for (_, _, out) in targets.iter_mut() {
+                out.clear();
+            }
+            return Ok(());
+        }
+        if seq_len == 1 {
+            return forward_group_into(targets, inputs, threads);
+        }
+        for (proj, _, out) in targets.iter_mut() {
+            out.resize(seq_len * proj.out_dim, 0.0);
+        }
+        if quant_dispatch::dispatch_batch_group_quant_kernels(targets, inputs, seq_len, threads) {
+            for (proj, lora, out) in targets.iter_mut() {
+                if let Some(patch) = *lora {
+                    for t in 0..seq_len {
+                        patch.apply(
+                            &inputs[t * proj.in_dim..(t + 1) * proj.in_dim],
+                            &mut out[t * proj.out_dim..(t + 1) * proj.out_dim],
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for (proj, lora, out) in targets.iter_mut() {
+            proj.forward_batch_into(inputs, seq_len, *lora, threads, out)?;
+        }
+        Ok(())
+    }
+
     /// Project a sequence of `seq_len` vectors (`[seq_len * in_dim]`) into `out`
     /// (`[seq_len * out_dim]`), using `I8MM` (`SMMLA`) `4x2`/`8x2` tiles on ARM64 Windows.
     pub fn forward_batch_into(
@@ -1472,72 +1549,345 @@ mod quant_dispatch {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "Generic 4-row GEMM driver parameterizes activation quantization and block kernels without dynamic dispatch."
+        reason = "Generic 4-row GEMM slice kernel parameterizes block geometry and activation kernels without dynamic dispatch."
     )]
-    fn run_batch_4row_gemm<Act: Default + Clone + Sync>(
-        transposed: &mut [f32],
+    fn add_batch_4row_gemm<Act>(
+        dst: &mut [f32],
         bytes: &[u8],
-        inputs: &[f32],
         in_dim: usize,
         seq_len: usize,
-        worker_count: usize,
+        local_row_start: usize,
+        rows_here: usize,
         block_elems: usize,
         elem_bytes: usize,
-        quantize: impl Fn(&[f32], &mut [Act]),
-        gemm_4x2: impl Fn([&[u8]; 4], &[Act], &[Act]) -> [[f32; 2]; 4] + Sync,
-        dot_4rows: impl Fn([&[u8]; 4], &[Act]) -> [f32; 4] + Sync,
-        dot_row: impl Fn(&[u8], &[Act]) -> f32 + Sync,
+        acts: &[Act],
+        gemm_4x2: impl Fn([&[u8]; 4], &[Act], &[Act]) -> [[f32; 2]; 4],
+        dot_4rows: impl Fn([&[u8]; 4], &[Act]) -> [f32; 4],
+        dot_row: impl Fn(&[u8], &[Act]) -> f32,
     ) {
         let blocks_per_tok = in_dim / block_elems;
         let row_bytes = blocks_per_tok * elem_bytes;
-        let mut acts = vec![Act::default(); seq_len * blocks_per_tok];
-        for t in 0..seq_len {
-            quantize(
-                &inputs[t * in_dim..(t + 1) * in_dim],
-                &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
-            );
-        }
-        run_row_chunks_aligned(transposed, worker_count, 4 * seq_len, |flat_off, dst| {
-            let start_row = flat_off / seq_len;
-            let rows_here = dst.len() / seq_len;
-            let mut processed = 0_usize;
-            while processed + 4 <= rows_here {
-                let r0 = (start_row + processed) * row_bytes;
-                let row_refs = std::array::from_fn(|r| {
-                    let start = r0 + r * row_bytes;
-                    &bytes[start..start + row_bytes]
-                });
-                let mut t = 0_usize;
-                while t + 1 < seq_len {
-                    let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                    let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
-                    let tile = gemm_4x2(row_refs, a0, a1);
-                    for r in 0..4 {
-                        let base = (processed + r) * seq_len + t;
-                        dst[base] += tile[r][0];
-                        dst[base + 1] += tile[r][1];
-                    }
-                    t += 2;
+        let mut processed = 0_usize;
+        while processed + 4 <= rows_here {
+            let r0 = (local_row_start + processed) * row_bytes;
+            let row_refs = std::array::from_fn(|r| {
+                let start = r0 + r * row_bytes;
+                &bytes[start..start + row_bytes]
+            });
+            let mut t = 0_usize;
+            while t + 1 < seq_len {
+                let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
+                let tile = gemm_4x2(row_refs, a0, a1);
+                for r in 0..4 {
+                    let base = (processed + r) * seq_len + t;
+                    dst[base] += tile[r][0];
+                    dst[base + 1] += tile[r][1];
                 }
-                if t < seq_len {
-                    let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                    let col = dot_4rows(row_refs, a0);
-                    for r in 0..4 {
-                        dst[(processed + r) * seq_len + t] += col[r];
-                    }
-                }
-                processed += 4;
+                t += 2;
             }
-            for local_r in processed..rows_here {
-                let off = (start_row + local_r) * row_bytes;
-                let w_row = &bytes[off..off + row_bytes];
-                let base = local_r * seq_len;
-                for t in 0..seq_len {
-                    let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                    dst[base + t] += dot_row(w_row, a0);
+            if t < seq_len {
+                let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                let col = dot_4rows(row_refs, a0);
+                for r in 0..4 {
+                    dst[(processed + r) * seq_len + t] += col[r];
+                }
+            }
+            processed += 4;
+        }
+        for local_r in processed..rows_here {
+            let off = (local_row_start + local_r) * row_bytes;
+            let w_row = &bytes[off..off + row_bytes];
+            let base = local_r * seq_len;
+            for t in 0..seq_len {
+                let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                dst[base + t] += dot_row(w_row, a0);
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Executes repacked 8-row Q4_K batched GEMM over an arbitrary row sub-range."
+    )]
+    fn add_batch_repacked_gemm(
+        dst: &mut [f32],
+        bytes: &[u8],
+        in_dim: usize,
+        seq_len: usize,
+        local_row_start: usize,
+        rows_here: usize,
+        caps: Arm64QuantCaps,
+        acts: &[Q8_KActBlock],
+    ) {
+        let blocks_per_tok = in_dim / QK_K;
+        let strip_bytes = blocks_per_tok * Q4_K_REPACK8_BLOCK_BYTES;
+        let mut idx = 0_usize;
+        while idx < rows_here {
+            let abs_row = local_row_start + idx;
+            let strip_idx = abs_row / 8;
+            let lane = abs_row % 8;
+            let take = (8 - lane).min(rows_here - idx);
+            let strip = &bytes[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
+            let mut t = 0_usize;
+            while t + 1 < seq_len {
+                let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
+                let tile = gemm_q4_k_repacked8_8x2(caps, strip, a0, a1);
+                for k in 0..take {
+                    let base = (idx + k) * seq_len + t;
+                    dst[base] += tile[lane + k][0];
+                    dst[base + 1] += tile[lane + k][1];
+                }
+                t += 2;
+            }
+            if t < seq_len {
+                let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                let col = dot_q4_k_repacked8(caps, strip, a0);
+                for k in 0..take {
+                    dst[(idx + k) * seq_len + t] += col[lane + k];
+                }
+            }
+            idx += take;
+        }
+    }
+
+    fn transpose_to_row_major(src: &[f32], out_dim: usize, seq_len: usize, dst: &mut [f32]) {
+        use fearless_simd::{Level, dispatch, f32x4, prelude::*};
+
+        let r_tiles = out_dim / 4;
+        let r_tail = r_tiles * 4;
+        let t_tiles = seq_len / 4;
+        let t_tail = t_tiles * 4;
+        let level = Level::new();
+        dispatch!(level, simd => {
+            for rt in 0..r_tiles {
+                let r0 = rt * 4;
+                let row0 = &src[r0 * seq_len..(r0 + 1) * seq_len];
+                let row1 = &src[(r0 + 1) * seq_len..(r0 + 2) * seq_len];
+                let row2 = &src[(r0 + 2) * seq_len..(r0 + 3) * seq_len];
+                let row3 = &src[(r0 + 3) * seq_len..(r0 + 4) * seq_len];
+                for tt in 0..t_tiles {
+                    let t0 = tt * 4;
+                    let cols = super::packed::transpose_4x4(
+                        simd,
+                        [
+                            f32x4::from_slice(simd, &row0[t0..t0 + 4]),
+                            f32x4::from_slice(simd, &row1[t0..t0 + 4]),
+                            f32x4::from_slice(simd, &row2[t0..t0 + 4]),
+                            f32x4::from_slice(simd, &row3[t0..t0 + 4]),
+                        ],
+                    );
+                    for (dt, col) in cols.into_iter().enumerate() {
+                        let base = (t0 + dt) * out_dim + r0;
+                        col.store_slice(&mut dst[base..base + 4]);
+                    }
+                }
+                for t in t_tail..seq_len {
+                    let base = t * out_dim + r0;
+                    dst[base] = row0[t];
+                    dst[base + 1] = row1[t];
+                    dst[base + 2] = row2[t];
+                    dst[base + 3] = row3[t];
                 }
             }
         });
+        for r in r_tail..out_dim {
+            let row = &src[r * seq_len..(r + 1) * seq_len];
+            for (t, &val) in row.iter().enumerate() {
+                dst[t * out_dim + r] = val;
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Dispatches batched quantized GEMM kernels over shared pre-quantized batch activations."
+    )]
+    fn dispatch_batch_segment(
+        kind: GroupKind<'_>,
+        dst: &mut [f32],
+        in_dim: usize,
+        seq_len: usize,
+        local_row: usize,
+        rows_here: usize,
+        caps: Arm64QuantCaps,
+        q8_act: &[Q8_0ActBlock],
+        qk_act: &[Q8_KActBlock],
+    ) {
+        match kind {
+            GroupKind::Packed {
+                ggml_type: 8,
+                bytes,
+            } => add_batch_4row_gemm(
+                dst,
+                bytes,
+                in_dim,
+                seq_len,
+                local_row,
+                rows_here,
+                Q8_0_BLOCK_ELEMENTS,
+                Q8_0_BLOCK_BYTES,
+                q8_act,
+                |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
+                |r, a0| dot_q8_0_4rows(caps, r, a0),
+                |r, a0| dot_q8_0_row(caps, r, a0),
+            ),
+            GroupKind::Packed {
+                ggml_type: 12,
+                bytes,
+            } => add_batch_4row_gemm(
+                dst,
+                bytes,
+                in_dim,
+                seq_len,
+                local_row,
+                rows_here,
+                QK_K,
+                Q4_K_BLOCK_BYTES,
+                qk_act,
+                |r, a0, a1| gemm_q4_k_4x2(caps, r, a0, a1),
+                |r, a0| dot_q4_k_4rows(caps, r, a0),
+                |r, a0| dot_q4_k_row(caps, r, a0),
+            ),
+            GroupKind::Packed { bytes, .. } => add_batch_4row_gemm(
+                dst,
+                bytes,
+                in_dim,
+                seq_len,
+                local_row,
+                rows_here,
+                QK_K,
+                Q6_K_BLOCK_BYTES,
+                qk_act,
+                |r, a0, a1| gemm_q6_k_4x2(caps, r, a0, a1),
+                |r, a0| dot_q6_k_4rows(caps, r, a0),
+                |r, a0| dot_q6_k_row(caps, r, a0),
+            ),
+            GroupKind::Repacked(bytes) => add_batch_repacked_gemm(
+                dst, bytes, in_dim, seq_len, local_row, rows_here, caps, qk_act,
+            ),
+        }
+    }
+
+    pub(super) fn dispatch_batch_group_quant_kernels(
+        targets: &mut [(
+            &LinearProjection,
+            Option<&super::LoraProjectionPatch>,
+            &mut Vec<f32>,
+        )],
+        inputs: &[f32],
+        seq_len: usize,
+        worker_count: usize,
+    ) -> bool {
+        let caps = Arm64QuantCaps::detect();
+        if !caps.dotprod {
+            return false;
+        }
+        struct Segment<'a> {
+            start: usize,
+            len: usize,
+            in_dim: usize,
+            kind: GroupKind<'a>,
+        }
+        let mut segments = Vec::with_capacity(targets.len());
+        let mut need_q8 = false;
+        let mut need_qk = false;
+        let mut total_out = 0_usize;
+        for (proj, _, _) in targets.iter() {
+            let Some(kind) = classify_group_proj(proj) else {
+                return false;
+            };
+            match kind {
+                GroupKind::Packed { ggml_type: 8, .. } => need_q8 = true,
+                _ => need_qk = true,
+            }
+            segments.push(Segment {
+                start: total_out,
+                len: proj.out_dim,
+                in_dim: proj.in_dim,
+                kind,
+            });
+            total_out += proj.out_dim;
+        }
+        let mut combined = vec![0.0_f32; total_out * seq_len];
+        for (seg, (proj, _, _)) in segments.iter().zip(targets.iter()) {
+            if let Some(bias) = &proj.bias {
+                for (r, &b) in bias.iter().enumerate() {
+                    let off = (seg.start + r) * seq_len;
+                    combined[off..off + seq_len].fill(b);
+                }
+            }
+        }
+        let in_dim = segments[0].in_dim;
+        let q8_opt = need_q8.then(|| {
+            let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
+            let mut buf = vec![Q8_0ActBlock::default(); seq_len * blocks_per_tok];
+            for t in 0..seq_len {
+                quantize_row_q8_0(
+                    &inputs[t * in_dim..(t + 1) * in_dim],
+                    &mut buf[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+                );
+            }
+            buf
+        });
+        let qk_opt = need_qk.then(|| {
+            let blocks_per_tok = in_dim / QK_K;
+            let mut buf = vec![Q8_KActBlock::default(); seq_len * blocks_per_tok];
+            for t in 0..seq_len {
+                quantize_row_q8_k(
+                    &inputs[t * in_dim..(t + 1) * in_dim],
+                    &mut buf[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+                );
+            }
+            buf
+        });
+        let q8_slice = q8_opt.as_deref().unwrap_or(&[]);
+        let qk_slice = qk_opt.as_deref().unwrap_or(&[]);
+        let row_align = if segments.iter().all(|s| s.len.is_multiple_of(8)) {
+            8
+        } else if segments.iter().all(|s| s.len.is_multiple_of(4)) {
+            4
+        } else {
+            1
+        };
+        let workers = worker_count.clamp(1, 18).min(total_out.max(1));
+        run_row_chunks_aligned(
+            &mut combined,
+            workers,
+            row_align * seq_len,
+            |flat_off, dst| {
+                let global_row = flat_off / seq_len;
+                let rows_total = dst.len() / seq_len;
+                let chunk_end = global_row + rows_total;
+                for seg in &segments {
+                    let seg_end = seg.start + seg.len;
+                    let ov_start = global_row.max(seg.start);
+                    let ov_end = chunk_end.min(seg_end);
+                    if ov_start >= ov_end {
+                        continue;
+                    }
+                    let dst_slice = &mut dst
+                        [(ov_start - global_row) * seq_len..(ov_end - global_row) * seq_len];
+                    dispatch_batch_segment(
+                        seg.kind,
+                        dst_slice,
+                        seg.in_dim,
+                        seq_len,
+                        ov_start - seg.start,
+                        ov_end - ov_start,
+                        caps,
+                        q8_slice,
+                        qk_slice,
+                    );
+                }
+            },
+        );
+        for (seg, (_, _, out)) in segments.iter().zip(targets.iter_mut()) {
+            let src_slice = &combined[seg.start * seq_len..(seg.start + seg.len) * seq_len];
+            transpose_to_row_major(src_slice, seg.len, seq_len, out);
+        }
+        true
     }
 
     pub(super) fn dispatch_batch_quant_kernels(
@@ -1563,59 +1913,43 @@ mod quant_dispatch {
             }
         }
         let worker_count = worker_count.clamp(1, 18).min(out_dim.max(1));
-
+        let row_align = match kind {
+            GroupKind::Repacked(_) => 8,
+            GroupKind::Packed { .. } => 4,
+        };
         match kind {
-            GroupKind::Packed {
-                ggml_type: 8,
-                bytes,
-            } => run_batch_4row_gemm(
-                &mut transposed,
-                bytes,
-                inputs,
-                in_dim,
-                seq_len,
-                worker_count,
-                Q8_0_BLOCK_ELEMENTS,
-                Q8_0_BLOCK_BYTES,
-                quantize_row_q8_0,
-                |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
-                |r, a0| dot_q8_0_4rows(caps, r, a0),
-                |r, a0| dot_q8_0_row(caps, r, a0),
-            ),
-            GroupKind::Packed {
-                ggml_type: 12,
-                bytes,
-            } => run_batch_4row_gemm(
-                &mut transposed,
-                bytes,
-                inputs,
-                in_dim,
-                seq_len,
-                worker_count,
-                QK_K,
-                Q4_K_BLOCK_BYTES,
-                quantize_row_q8_k,
-                |r, a0, a1| gemm_q4_k_4x2(caps, r, a0, a1),
-                |r, a0| dot_q4_k_4rows(caps, r, a0),
-                |r, a0| dot_q4_k_row(caps, r, a0),
-            ),
-            GroupKind::Packed { bytes, .. } => run_batch_4row_gemm(
-                &mut transposed,
-                bytes,
-                inputs,
-                in_dim,
-                seq_len,
-                worker_count,
-                QK_K,
-                Q6_K_BLOCK_BYTES,
-                quantize_row_q8_k,
-                |r, a0, a1| gemm_q6_k_4x2(caps, r, a0, a1),
-                |r, a0| dot_q6_k_4rows(caps, r, a0),
-                |r, a0| dot_q6_k_row(caps, r, a0),
-            ),
-            GroupKind::Repacked(bytes) => {
+            GroupKind::Packed { ggml_type: 8, .. } => {
+                let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
+                let mut acts = vec![Q8_0ActBlock::default(); seq_len * blocks_per_tok];
+                for t in 0..seq_len {
+                    quantize_row_q8_0(
+                        &inputs[t * in_dim..(t + 1) * in_dim],
+                        &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+                    );
+                }
+                run_row_chunks_aligned(
+                    &mut transposed,
+                    worker_count,
+                    row_align * seq_len,
+                    |flat_off, dst| {
+                        let start_row = flat_off / seq_len;
+                        let rows_here = dst.len() / seq_len;
+                        dispatch_batch_segment(
+                            kind,
+                            dst,
+                            in_dim,
+                            seq_len,
+                            start_row,
+                            rows_here,
+                            caps,
+                            &acts,
+                            &[],
+                        );
+                    },
+                );
+            }
+            _ => {
                 let blocks_per_tok = in_dim / QK_K;
-                let strip_bytes = blocks_per_tok * Q4_K_REPACK8_BLOCK_BYTES;
                 let mut acts = vec![Q8_KActBlock::default(); seq_len * blocks_per_tok];
                 for t in 0..seq_len {
                     quantize_row_q8_k(
@@ -1623,44 +1957,30 @@ mod quant_dispatch {
                         &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
                     );
                 }
-                let align = 8 * seq_len;
-                run_row_chunks_aligned(&mut transposed, worker_count, align, |flat_off, dst| {
-                    let start_row = flat_off / seq_len;
-                    let strips_here = (dst.len() / seq_len) / 8;
-                    for s in 0..strips_here {
-                        let strip_idx = (start_row / 8) + s;
-                        let strip = &bytes[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
-                        let row_base = s * 8;
-                        let mut t = 0_usize;
-                        while t + 1 < seq_len {
-                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                            let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
-                            let tile = gemm_q4_k_repacked8_8x2(caps, strip, a0, a1);
-                            for r in 0..8 {
-                                let base = (row_base + r) * seq_len + t;
-                                dst[base] += tile[r][0];
-                                dst[base + 1] += tile[r][1];
-                            }
-                            t += 2;
-                        }
-                        if t < seq_len {
-                            let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                            let col = dot_q4_k_repacked8(caps, strip, a0);
-                            for r in 0..8 {
-                                dst[(row_base + r) * seq_len + t] += col[r];
-                            }
-                        }
-                    }
-                });
+                run_row_chunks_aligned(
+                    &mut transposed,
+                    worker_count,
+                    row_align * seq_len,
+                    |flat_off, dst| {
+                        let start_row = flat_off / seq_len;
+                        let rows_here = dst.len() / seq_len;
+                        dispatch_batch_segment(
+                            kind,
+                            dst,
+                            in_dim,
+                            seq_len,
+                            start_row,
+                            rows_here,
+                            caps,
+                            &[],
+                            &acts,
+                        );
+                    },
+                );
             }
         }
 
-        for r in 0..out_dim {
-            let row = &transposed[r * seq_len..(r + 1) * seq_len];
-            for (t, &val) in row.iter().enumerate() {
-                out[t * out_dim + r] = val;
-            }
-        }
+        transpose_to_row_major(&transposed, out_dim, seq_len, out);
         Ok(true)
     }
 }
@@ -1892,6 +2212,19 @@ pub fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> io::Result<Vec<f32>>
     Ok(out)
 }
 
+fn rms_norm_to_slice_with_level(
+    level: Level,
+    input: &[f32],
+    weight: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) {
+    let inv_n = 1.0_f32 / usize_to_f32(input.len());
+    let mean_sq = input.iter().map(|&v| v * v).sum::<f32>() * inv_n;
+    let scale = 1.0_f32 / (mean_sq + eps).sqrt();
+    dispatch!(level, simd => rms_norm_scale_simd(simd, input, weight, scale, out));
+}
+
 pub(crate) fn rms_norm_into(
     input: &[f32],
     weight: &[f32],
@@ -1904,12 +2237,49 @@ pub(crate) fn rms_norm_into(
             "RMSNorm dimension mismatch.",
         ));
     }
-    let inv_n = 1.0_f32 / usize_to_f32(input.len());
-    let mean_sq = input.iter().map(|&v| v * v).sum::<f32>() * inv_n;
-    let scale = 1.0_f32 / (mean_sq + eps).sqrt();
     decoder_workspace::resize(out, input.len())?;
+    rms_norm_to_slice_with_level(Level::new(), input, weight, eps, out);
+    Ok(())
+}
+
+fn rms_norm_batch_into(
+    inputs: &[f32],
+    seq_len: usize,
+    weight: &[f32],
+    eps: f32,
+    workers: usize,
+    out: &mut Vec<f32>,
+) -> io::Result<()> {
+    let hidden = weight.len();
+    if hidden == 0 || inputs.len() != seq_len * hidden {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RMSNorm batch dimension mismatch.",
+        ));
+    }
+    if seq_len == 0 {
+        out.clear();
+        return Ok(());
+    }
+    decoder_workspace::resize(out, inputs.len())?;
     let level = Level::new();
-    dispatch!(level, simd => rms_norm_scale_simd(simd, input, weight, scale, out));
+    if seq_len > 1 && workers > 1 {
+        row_workers::run_aligned(out, workers, hidden, &|elem_off, dst_chunk| {
+            for (row_in, row_out) in inputs[elem_off..elem_off + dst_chunk.len()]
+                .chunks_exact(hidden)
+                .zip(dst_chunk.chunks_exact_mut(hidden))
+            {
+                rms_norm_to_slice_with_level(level, row_in, weight, eps, row_out);
+            }
+        });
+    } else {
+        for (row_in, row_out) in inputs
+            .chunks_exact(hidden)
+            .zip(out.chunks_exact_mut(hidden))
+        {
+            rms_norm_to_slice_with_level(level, row_in, weight, eps, row_out);
+        }
+    }
     Ok(())
 }
 
@@ -2632,61 +3002,51 @@ impl QwenDecoderLayer {
             return Err(invalid_geometry());
         }
 
-        let mut h_norm = vec![0.0_f32; seq_len * hidden];
-        let mut row_norm = Vec::with_capacity(hidden);
-        for t in 0..seq_len {
-            rms_norm_into(
-                &inputs[t * hidden..(t + 1) * hidden],
-                &self.attn_norm_w,
-                rms_eps,
-                &mut row_norm,
-            )?;
-            h_norm[t * hidden..(t + 1) * hidden].copy_from_slice(&row_norm);
-        }
+        let mut h_norm = Vec::new();
+        rms_norm_batch_into(
+            inputs,
+            seq_len,
+            &self.attn_norm_w,
+            rms_eps,
+            workers,
+            &mut h_norm,
+        )?;
 
         let patch = |proj: &LinearProjection| adapter.and_then(|a| a.patches.get(&proj.name));
         let mut q_all = Vec::new();
         let mut k_all = Vec::new();
         let mut v_all = Vec::new();
-        self.q_proj.forward_batch_into(
+        LinearProjection::forward_batch_group_into(
+            &mut [
+                (&self.q_proj, patch(&self.q_proj), &mut q_all),
+                (&self.k_proj, patch(&self.k_proj), &mut k_all),
+                (&self.v_proj, patch(&self.v_proj), &mut v_all),
+            ],
             &h_norm,
             seq_len,
-            patch(&self.q_proj),
             workers,
-            &mut q_all,
-        )?;
-        self.k_proj.forward_batch_into(
-            &h_norm,
-            seq_len,
-            patch(&self.k_proj),
-            workers,
-            &mut k_all,
-        )?;
-        self.v_proj.forward_batch_into(
-            &h_norm,
-            seq_len,
-            patch(&self.v_proj),
-            workers,
-            &mut v_all,
         )?;
 
         let half = head_dim / 2;
-        let mut cos_buf = vec![0.0_f32; half];
-        let mut sin_buf = vec![0.0_f32; half];
+        let mut cos_stack = [0.0_f32; 128];
+        let mut sin_stack = [0.0_f32; 128];
+        let mut cos_heap = Vec::new();
+        let mut sin_heap = Vec::new();
+        let (cos_buf, sin_buf): (&mut [f32], &mut [f32]) = if half <= cos_stack.len() {
+            (&mut cos_stack[..half], &mut sin_stack[..half])
+        } else {
+            cos_heap.resize(half, 0.0);
+            sin_heap.resize(half, 0.0);
+            (&mut cos_heap[..half], &mut sin_heap[..half])
+        };
         for t in 0..seq_len {
             let q_tok = &mut q_all[t * query_width..(t + 1) * query_width];
             normalize_heads_in_place(q_tok, num_q_heads, head_dim, &self.q_norm_w, rms_eps)?;
             let k_tok = &mut k_all[t * kv_width..(t + 1) * kv_width];
             normalize_heads_in_place(k_tok, num_kv_heads, head_dim, &self.k_norm_w, rms_eps)?;
-            compute_rope_tables(
-                head_dim,
-                initial_seq + t,
-                rope_theta,
-                &mut cos_buf,
-                &mut sin_buf,
-            );
-            apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, &cos_buf, &sin_buf)?;
-            apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, &cos_buf, &sin_buf)?;
+            compute_rope_tables(head_dim, initial_seq + t, rope_theta, cos_buf, sin_buf);
+            apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, cos_buf, sin_buf)?;
+            apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, cos_buf, sin_buf)?;
         }
 
         let append = kv_append::KvAppend::new_batch(kv, seq_len, &k_all, &v_all)?;
@@ -2696,26 +3056,21 @@ impl QwenDecoderLayer {
         let gqa_ratio = num_q_heads / num_kv_heads;
         let scale = 1.0_f32 / usize_to_f32(head_dim).sqrt();
         let mut attn_seq = vec![0.0_f32; seq_len * query_width];
-        let mut scores = Vec::new();
-        for t in 0..seq_len {
-            let q_tok = &q_all[t * query_width..(t + 1) * query_width];
-            let out_tok = &mut attn_seq[t * query_width..(t + 1) * query_width];
-            attend_query_f16(
-                level,
-                q_tok,
-                kv,
-                initial_seq + t + 1,
-                kv_width,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                gqa_ratio,
-                scale,
-                &mut scores,
-                out_tok,
-                workers,
-            )?;
-        }
+        attend_batch_f16(
+            level,
+            &q_all,
+            kv,
+            initial_seq,
+            seq_len,
+            kv_width,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            gqa_ratio,
+            scale,
+            &mut attn_seq,
+            workers,
+        )?;
 
         let mut projected = Vec::new();
         self.o_proj.forward_batch_into(
@@ -2732,6 +3087,7 @@ impl QwenDecoderLayer {
 
         if final_ffn_last_only {
             let last_start = (seq_len - 1) * hidden;
+            let mut row_norm = Vec::with_capacity(hidden);
             rms_norm_into(
                 &output[last_start..],
                 &self.ffn_norm_w,
@@ -2758,34 +3114,26 @@ impl QwenDecoderLayer {
                 workers,
                 &mut projected,
             )?;
-            for (dst, &val) in output[last_start..].iter_mut().zip(&projected) {
-                *dst += val;
-            }
+            dispatch!(level, simd => axpy_simd(simd, 1.0_f32, &projected, &mut output[last_start..]));
         } else {
-            for t in 0..seq_len {
-                rms_norm_into(
-                    &output[t * hidden..(t + 1) * hidden],
-                    &self.ffn_norm_w,
-                    rms_eps,
-                    &mut row_norm,
-                )?;
-                h_norm[t * hidden..(t + 1) * hidden].copy_from_slice(&row_norm);
-            }
+            rms_norm_batch_into(
+                output,
+                seq_len,
+                &self.ffn_norm_w,
+                rms_eps,
+                workers,
+                &mut h_norm,
+            )?;
             let mut gate_all = Vec::new();
             let mut up_all = Vec::new();
-            self.gate_proj.forward_batch_into(
+            LinearProjection::forward_batch_group_into(
+                &mut [
+                    (&self.gate_proj, patch(&self.gate_proj), &mut gate_all),
+                    (&self.up_proj, patch(&self.up_proj), &mut up_all),
+                ],
                 &h_norm,
                 seq_len,
-                patch(&self.gate_proj),
                 workers,
-                &mut gate_all,
-            )?;
-            self.up_proj.forward_batch_into(
-                &h_norm,
-                seq_len,
-                patch(&self.up_proj),
-                workers,
-                &mut up_all,
             )?;
             swiglu_in_place_parallel(&mut gate_all, &up_all, workers);
             self.down_proj.forward_batch_into(
@@ -2795,9 +3143,7 @@ impl QwenDecoderLayer {
                 workers,
                 &mut projected,
             )?;
-            for (dst, &val) in output.iter_mut().zip(&projected) {
-                *dst += val;
-            }
+            dispatch!(level, simd => axpy_simd(simd, 1.0_f32, &projected, output));
         }
 
         if output.iter().any(|v| !v.is_finite()) {
@@ -2978,6 +3324,24 @@ fn attend_kv_group_range_f16(
     }
 }
 
+thread_local! {
+    static ATTN_SCORES: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_attn_scores<R>(needed: usize, action: impl FnOnce(&mut [f32]) -> R) -> R {
+    ATTN_SCORES.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            if buf.len() < needed {
+                buf.resize(needed, 0.0_f32);
+            }
+            action(&mut buf[..needed])
+        } else {
+            let mut fallback = vec![0.0_f32; needed];
+            action(&mut fallback)
+        }
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Shared F16 KV attention kernel used by both single-step decode and batched prefill."
@@ -3011,21 +3375,22 @@ fn attend_query_f16(
         row_workers::run_aligned(attn_out, workers, group_width, &|elem_off, out_chunk| {
             let kvh_start = elem_off / group_width;
             let kvh_count = out_chunk.len() / group_width;
-            let mut local_scores = vec![0.0_f32; needed_scores];
-            attend_kv_group_range_f16(
-                level,
-                q,
-                kv,
-                total_seq,
-                kv_stride,
-                kvh_start,
-                kvh_count,
-                head_dim,
-                gqa_ratio,
-                scale,
-                &mut local_scores,
-                out_chunk,
-            );
+            with_attn_scores(needed_scores, |local_scores| {
+                attend_kv_group_range_f16(
+                    level,
+                    q,
+                    kv,
+                    total_seq,
+                    kv_stride,
+                    kvh_start,
+                    kvh_count,
+                    head_dim,
+                    gqa_ratio,
+                    scale,
+                    local_scores,
+                    out_chunk,
+                );
+            });
         });
     } else {
         decoder_workspace::resize(scores, needed_scores)?;
@@ -3043,6 +3408,99 @@ fn attend_query_f16(
             scores,
             attn_out,
         );
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Executes causal F16 KV attention across prefill tokens in one worker pass with thread-local score reuse."
+)]
+fn attend_batch_f16(
+    level: Level,
+    q_all: &[f32],
+    kv: &LayerKvCache,
+    initial_seq: usize,
+    seq_len: usize,
+    kv_stride: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    gqa_ratio: usize,
+    scale: f32,
+    attn_seq: &mut [f32],
+    workers: usize,
+) -> io::Result<()> {
+    let query_width = num_q_heads * head_dim;
+    let group_width = gqa_ratio * head_dim;
+    let max_seq = initial_seq + seq_len;
+    let max_needed = if gqa_ratio <= 8 {
+        gqa_ratio * max_seq
+    } else {
+        max_seq
+    };
+    if workers > 1 && seq_len * num_kv_heads >= 2 && attn_seq.len() == seq_len * query_width {
+        row_workers::run_aligned(attn_seq, workers, group_width, &|elem_off, out_chunk| {
+            let first_group = elem_off / group_width;
+            let groups_here = out_chunk.len() / group_width;
+            with_attn_scores(max_needed, |scores| {
+                for local_g in 0..groups_here {
+                    let flat_group = first_group + local_g;
+                    let t = flat_group / num_kv_heads;
+                    let kvh = flat_group % num_kv_heads;
+                    let total_seq_t = initial_seq + t + 1;
+                    let needed_t = if gqa_ratio <= 8 {
+                        gqa_ratio * total_seq_t
+                    } else {
+                        total_seq_t
+                    };
+                    let q_tok = &q_all[t * query_width..(t + 1) * query_width];
+                    let dst_group =
+                        &mut out_chunk[local_g * group_width..(local_g + 1) * group_width];
+                    attend_kv_group_range_f16(
+                        level,
+                        q_tok,
+                        kv,
+                        total_seq_t,
+                        kv_stride,
+                        kvh,
+                        1,
+                        head_dim,
+                        gqa_ratio,
+                        scale,
+                        &mut scores[..needed_t],
+                        dst_group,
+                    );
+                }
+            });
+        });
+    } else {
+        with_attn_scores(max_needed, |scores| {
+            for t in 0..seq_len {
+                let total_seq_t = initial_seq + t + 1;
+                let needed_t = if gqa_ratio <= 8 {
+                    gqa_ratio * total_seq_t
+                } else {
+                    total_seq_t
+                };
+                let q_tok = &q_all[t * query_width..(t + 1) * query_width];
+                let out_tok = &mut attn_seq[t * query_width..(t + 1) * query_width];
+                attend_kv_group_range_f16(
+                    level,
+                    q_tok,
+                    kv,
+                    total_seq_t,
+                    kv_stride,
+                    0,
+                    num_kv_heads,
+                    head_dim,
+                    gqa_ratio,
+                    scale,
+                    &mut scores[..needed_t],
+                    out_tok,
+                );
+            }
+        });
     }
     Ok(())
 }
@@ -4464,5 +4922,480 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn make_packed_test_proj(
+        name: &str,
+        ggml_type: u32,
+        in_dim: usize,
+        out_dim: usize,
+        seed: usize,
+        bias: Option<Vec<f32>>,
+    ) -> std::io::Result<LinearProjection> {
+        let (block, elem_bytes) = crate::weights::packed_layout(ggml_type)?;
+        let blocks = in_dim / block;
+        let mut bytes = Vec::with_capacity(out_dim * blocks * elem_bytes);
+        for row in 0..out_dim {
+            for b in 0..blocks {
+                match ggml_type {
+                    8 => {
+                        let scale = 0.015_f32
+                            * f32::from(u8::try_from((seed + row + b) % 11 + 1).unwrap_or(1));
+                        bytes
+                            .extend_from_slice(&bonsai_ternary::float_to_half(scale).to_le_bytes());
+                        for k in 0..32 {
+                            let q = i8::try_from(
+                                isize::try_from((seed * 17 + row * 7 + b * 5 + k * 3) % 199)
+                                    .unwrap_or(0)
+                                    - 99,
+                            )
+                            .unwrap_or(0);
+                            bytes.push(q.cast_unsigned());
+                        }
+                    }
+                    12 => {
+                        let d = 0.01_f32
+                            * f32::from(u8::try_from((seed + row + b) % 9 + 1).unwrap_or(1));
+                        let dmin = 0.003_f32
+                            * f32::from(u8::try_from((seed + row * 3 + b) % 7 + 1).unwrap_or(1));
+                        bytes.extend_from_slice(&bonsai_ternary::float_to_half(d).to_le_bytes());
+                        bytes.extend_from_slice(&bonsai_ternary::float_to_half(dmin).to_le_bytes());
+                        for i in 0..12 {
+                            bytes.push(
+                                u8::try_from((seed * 13 + row * 29 + b * 11 + i * 41) % 251)
+                                    .unwrap_or(0),
+                            );
+                        }
+                        for i in 0..128 {
+                            bytes.push(
+                                u8::try_from((seed * 31 + row * 19 + b * 23 + i * 37) % 256)
+                                    .unwrap_or(0),
+                            );
+                        }
+                    }
+                    _ => {
+                        for i in 0..128 {
+                            bytes.push(
+                                u8::try_from((seed * 23 + row * 11 + b * 19 + i * 43) % 256)
+                                    .unwrap_or(0),
+                            );
+                        }
+                        for i in 0..64 {
+                            bytes.push(
+                                u8::try_from((seed * 19 + row * 7 + b * 17 + i * 53) % 256)
+                                    .unwrap_or(0),
+                            );
+                        }
+                        for i in 0..16 {
+                            let s = i8::try_from(
+                                isize::try_from((seed * 5 + row * 3 + b * 7 + i * 11) % 63)
+                                    .unwrap_or(0)
+                                    - 31,
+                            )
+                            .unwrap_or(1);
+                            bytes.push(s.cast_unsigned());
+                        }
+                        let d = 0.008_f32
+                            * f32::from(u8::try_from((seed + row + b) % 11 + 1).unwrap_or(1));
+                        bytes.extend_from_slice(&bonsai_ternary::float_to_half(d).to_le_bytes());
+                    }
+                }
+            }
+        }
+        LinearProjection::new(
+            name,
+            in_dim,
+            out_dim,
+            WeightQuantization::Packed { ggml_type, bytes },
+            bias,
+        )
+    }
+
+    #[test]
+    fn forward_batch_group_into_matches_sequential_across_quantizations_and_alignments()
+    -> std::io::Result<()> {
+        let in_dim = 256_usize;
+        let mut p_repack = make_packed_test_proj(
+            "talker.blk.0.attn_q.weight",
+            12,
+            in_dim,
+            16,
+            1,
+            Some(vec![0.05; 16]),
+        )?;
+        p_repack.repack_q4_k_if_aligned();
+        let p_q4 = make_packed_test_proj(
+            "talker.blk.0.attn_k.weight",
+            12,
+            in_dim,
+            8,
+            2,
+            Some(vec![-0.02; 8]),
+        )?;
+        let p_q8_odd = make_packed_test_proj("talker.blk.0.attn_v.weight", 8, in_dim, 5, 3, None)?;
+        let p_q6 = make_packed_test_proj(
+            "talker.blk.0.ffn_gate.weight",
+            14,
+            in_dim,
+            12,
+            4,
+            Some(vec![0.01; 12]),
+        )?;
+        let p_f32 = LinearProjection::new(
+            "f32.proj",
+            in_dim,
+            6,
+            WeightQuantization::F32(
+                (0..6 * in_dim)
+                    .map(|i| f32::from(i16::try_from(i % 29).unwrap_or(0) - 14) * 0.02)
+                    .collect(),
+            ),
+            Some(vec![0.1; 6]),
+        )?;
+
+        let lora_zero = LoraProjectionPatch {
+            in_dim,
+            out_dim: 16,
+            rank: 2,
+            alpha_over_rank: 1.5,
+            scale: 0.0,
+            lora_a: vec![0.1; 2 * in_dim],
+            lora_b: vec![0.2; 16 * 2],
+        };
+        let lora_active = LoraProjectionPatch {
+            in_dim,
+            out_dim: 8,
+            rank: 2,
+            alpha_over_rank: 1.5,
+            scale: 0.5,
+            lora_a: (0..2 * in_dim)
+                .map(|i| f32::from(i16::try_from(i % 19).unwrap_or(0) - 9) * 0.01)
+                .collect(),
+            lora_b: (0..8 * 2)
+                .map(|i| f32::from(i16::try_from(i % 17).unwrap_or(0) - 8) * 0.02)
+                .collect(),
+        };
+
+        for seq_len in [0_usize, 1, 2, 3, 5, 9] {
+            let inputs: Vec<f32> = (0..seq_len * in_dim)
+                .map(|i| f32::from(i16::try_from((i * 11 + 3) % 53).unwrap_or(0) - 26) * 0.05)
+                .collect();
+            for threads in [1_usize, 4] {
+                let mut ref_q = Vec::new();
+                let mut ref_k = Vec::new();
+                let mut ref_v = Vec::new();
+                let mut ref_g = Vec::new();
+                p_repack.forward_batch_into(
+                    &inputs,
+                    seq_len,
+                    Some(&lora_zero),
+                    threads,
+                    &mut ref_q,
+                )?;
+                p_q4.forward_batch_into(&inputs, seq_len, Some(&lora_active), threads, &mut ref_k)?;
+                p_q8_odd.forward_batch_into(&inputs, seq_len, None, threads, &mut ref_v)?;
+                p_q6.forward_batch_into(&inputs, seq_len, None, threads, &mut ref_g)?;
+
+                let mut grp_q = Vec::new();
+                let mut grp_k = Vec::new();
+                let mut grp_v = Vec::new();
+                let mut grp_g = Vec::new();
+                LinearProjection::forward_batch_group_into(
+                    &mut [
+                        (&p_repack, Some(&lora_zero), &mut grp_q),
+                        (&p_q4, Some(&lora_active), &mut grp_k),
+                        (&p_q8_odd, None, &mut grp_v),
+                        (&p_q6, None, &mut grp_g),
+                    ],
+                    &inputs,
+                    seq_len,
+                    threads,
+                )?;
+                assert_eq!(
+                    grp_q.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    ref_q.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "q seq_len={seq_len} threads={threads}"
+                );
+                assert_eq!(
+                    grp_k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    ref_k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "k seq_len={seq_len} threads={threads}"
+                );
+                assert_eq!(
+                    grp_v.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    ref_v.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "v seq_len={seq_len} threads={threads}"
+                );
+                assert_eq!(
+                    grp_g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    ref_g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "g seq_len={seq_len} threads={threads}"
+                );
+
+                // Also verify fallback path when mixing F32 into the group.
+                let mut ref_f = Vec::new();
+                p_f32.forward_batch_into(&inputs, seq_len, None, threads, &mut ref_f)?;
+                let mut grp_f = Vec::new();
+                let mut grp_k2 = Vec::new();
+                LinearProjection::forward_batch_group_into(
+                    &mut [(&p_q4, None, &mut grp_k2), (&p_f32, None, &mut grp_f)],
+                    &inputs,
+                    seq_len,
+                    threads,
+                )?;
+                assert_eq!(
+                    grp_f.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    ref_f.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rms_norm_batch_into_and_attend_batch_f16_match_sequential_bits() -> std::io::Result<()> {
+        for (hidden, seq_len) in [(4_usize, 3_usize), (64, 7), (256, 5)] {
+            let weight: Vec<f32> = (0..hidden)
+                .map(|i| 0.5 + f32::from(u8::try_from(i % 13).unwrap_or(0)) * 0.1)
+                .collect();
+            let inputs: Vec<f32> = (0..seq_len * hidden)
+                .map(|i| f32::from(i16::try_from((i * 17) % 41).unwrap_or(0) - 20) * 0.05)
+                .collect();
+            let mut expected = Vec::with_capacity(inputs.len());
+            let mut row = Vec::new();
+            for t in 0..seq_len {
+                super::rms_norm_into(
+                    &inputs[t * hidden..(t + 1) * hidden],
+                    &weight,
+                    1e-6,
+                    &mut row,
+                )?;
+                expected.extend_from_slice(&row);
+            }
+            for workers in [1_usize, 4] {
+                let mut actual = Vec::new();
+                super::rms_norm_batch_into(&inputs, seq_len, &weight, 1e-6, workers, &mut actual)?;
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "rms_norm_batch_into hidden={hidden} seq_len={seq_len} workers={workers}"
+                );
+            }
+        }
+
+        let level = super::Level::new();
+        let head_dim = 64_usize;
+        for (initial_seq, seq_len, num_kv_heads, gqa_ratio) in [
+            (0_usize, 5_usize, 4_usize, 2_usize),
+            (31, 9, 2, 4),
+            (64, 6, 1, 2),
+        ] {
+            let num_q_heads = num_kv_heads * gqa_ratio;
+            let query_width = num_q_heads * head_dim;
+            let kv_width = num_kv_heads * head_dim;
+            let total_kv_seq = initial_seq + seq_len;
+            let scale = 1.0_f32 / super::usize_to_f32(head_dim).sqrt();
+
+            let q_all: Vec<f32> = (0..seq_len * query_width)
+                .map(|i| f32::from(i16::try_from((i * 13 + 7) % 31).unwrap_or(0) - 15) * 0.05)
+                .collect();
+            let k_f32: Vec<f32> = (0..total_kv_seq * kv_width)
+                .map(|i| f32::from(i16::try_from((i * 19 + 3) % 29).unwrap_or(0) - 14) * 0.0625)
+                .collect();
+            let v_f32: Vec<f32> = (0..total_kv_seq * kv_width)
+                .map(|i| f32::from(i16::try_from((i * 23 + 5) % 37).unwrap_or(0) - 18) * 0.03125)
+                .collect();
+            let mut k_f16 = vec![0_u16; k_f32.len()];
+            let mut v_f16 = vec![0_u16; v_f32.len()];
+            assert!(super::narrow_f32_slice(&k_f32, &mut k_f16));
+            assert!(super::narrow_f32_slice(&v_f32, &mut v_f16));
+            let kv = LayerKvCache {
+                k: k_f16,
+                v: v_f16,
+                seq_len: total_kv_seq,
+            };
+
+            let mut expected = vec![0.0_f32; seq_len * query_width];
+            let mut scores = Vec::new();
+            for t in 0..seq_len {
+                super::attend_query_f16(
+                    level,
+                    &q_all[t * query_width..(t + 1) * query_width],
+                    &kv,
+                    initial_seq + t + 1,
+                    kv_width,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gqa_ratio,
+                    scale,
+                    &mut scores,
+                    &mut expected[t * query_width..(t + 1) * query_width],
+                    1,
+                )?;
+            }
+            for workers in [1_usize, 4] {
+                let mut actual = vec![f32::NAN; seq_len * query_width];
+                super::attend_batch_f16(
+                    level,
+                    &q_all,
+                    &kv,
+                    initial_seq,
+                    seq_len,
+                    kv_width,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gqa_ratio,
+                    scale,
+                    &mut actual,
+                    workers,
+                )?;
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "attend_batch_f16 initial={initial_seq} seq_len={seq_len} workers={workers}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forward_batch_into_repacked_layer_matches_sequential_steps() -> std::io::Result<()> {
+        let hidden = 256_usize;
+        let num_q_heads = 4_usize;
+        let num_kv_heads = 2_usize;
+        let head_dim = 64_usize;
+        let intermediate = 256_usize;
+        let mut layer = QwenDecoderLayer {
+            attn_norm_w: vec![1.0; hidden],
+            q_proj: make_packed_test_proj(
+                "talker.blk.0.attn_q.weight",
+                12,
+                hidden,
+                hidden,
+                1,
+                None,
+            )?,
+            k_proj: make_packed_test_proj(
+                "talker.blk.0.attn_k.weight",
+                12,
+                hidden,
+                num_kv_heads * head_dim,
+                2,
+                None,
+            )?,
+            v_proj: make_packed_test_proj(
+                "talker.blk.0.attn_v.weight",
+                12,
+                hidden,
+                num_kv_heads * head_dim,
+                3,
+                None,
+            )?,
+            o_proj: make_packed_test_proj(
+                "talker.blk.0.attn_output.weight",
+                12,
+                hidden,
+                hidden,
+                4,
+                None,
+            )?,
+            q_norm_w: vec![1.0; head_dim],
+            k_norm_w: vec![1.0; head_dim],
+            ffn_norm_w: vec![1.0; hidden],
+            gate_proj: make_packed_test_proj(
+                "talker.blk.0.ffn_gate.weight",
+                12,
+                hidden,
+                intermediate,
+                5,
+                None,
+            )?,
+            up_proj: make_packed_test_proj(
+                "talker.blk.0.ffn_up.weight",
+                12,
+                hidden,
+                intermediate,
+                6,
+                None,
+            )?,
+            down_proj: make_packed_test_proj(
+                "talker.blk.0.ffn_down.weight",
+                12,
+                intermediate,
+                hidden,
+                7,
+                None,
+            )?,
+        };
+        layer.repack_q4_k_if_aligned();
+
+        let seq_len = 5_usize;
+        let inputs: Vec<f32> = (0..seq_len * hidden)
+            .map(|i| f32::from(i16::try_from((i * 7 + 11) % 37).unwrap_or(0) - 18) * 0.04)
+            .collect();
+        let mut seq_kv = LayerKvCache::default();
+        let mut seq_out = Vec::with_capacity(inputs.len());
+        for t in 0..seq_len {
+            let step = layer.forward_step_parallel(
+                &inputs[t * hidden..(t + 1) * hidden],
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                1_000_000.0,
+                1e-6,
+                &mut seq_kv,
+                None,
+                4,
+            )?;
+            seq_out.extend_from_slice(&step);
+        }
+
+        let mut batch_kv = LayerKvCache::default();
+        let mut batch_out = Vec::new();
+        layer.forward_batch_into(
+            &inputs,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            1_000_000.0,
+            1e-6,
+            &mut batch_kv,
+            None,
+            4,
+            false,
+            &mut batch_out,
+        )?;
+        assert_eq!(batch_kv.seq_len, seq_kv.seq_len);
+        assert_eq!(batch_kv.k, seq_kv.k);
+        assert_eq!(batch_kv.v, seq_kv.v);
+        for (a, b) in batch_out.iter().zip(&seq_out) {
+            assert!((a - b).abs() < 1e-4, "batch={a} seq={b}");
+        }
+
+        let mut sliced_kv = LayerKvCache::default();
+        let mut sliced_out = Vec::new();
+        layer.forward_batch_into(
+            &inputs,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            1_000_000.0,
+            1e-6,
+            &mut sliced_kv,
+            None,
+            4,
+            true,
+            &mut sliced_out,
+        )?;
+        let last_start = (seq_len - 1) * hidden;
+        for (a, b) in sliced_out[last_start..].iter().zip(&seq_out[last_start..]) {
+            assert!((a - b).abs() < 1e-4, "last={a} seq={b}");
+        }
+        Ok(())
     }
 }
