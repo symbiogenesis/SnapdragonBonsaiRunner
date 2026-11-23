@@ -984,78 +984,85 @@ fn native_representation_profiles_leave_skipped_arms_pending_at_original_deadlin
 
 #[test]
 fn native_representation_complete_bytes_survive_expired_second_request() {
-    run_timed(Duration::from_secs(10), async {
-        let evidence = TempEvidence::new("Bonsai-Representation-Partial");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let fixture = tokio::spawn(async move {
-            for step in 0..2 {
-                let (peer, _) = listener.accept().await.unwrap();
-                let mut peer = BufReader::new(peer);
-                assert_eq!(read_fixture_request(&mut peer).await, body());
-                if step == 0 {
-                    let payload = concat!(
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"cèdre\\n\"},\"finish_reason\":null}]}\n\n",
-                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":3}}\n\n",
-                        "data: [DONE]\n\n"
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n",
-                        payload.len()
-                    );
-                    peer.get_mut().write_all(response.as_bytes()).await.unwrap();
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    peer.get_mut().write_all(b"0\r\n\r\n").await.unwrap();
-                    peer.get_mut().shutdown().await.unwrap();
-                } else {
-                    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    run_paused(async {
+        timeout(Duration::from_secs(10), async {
+            let evidence = TempEvidence::new("Bonsai-Representation-Partial");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let fixture = tokio::spawn(async move {
+                for step in 0..2 {
+                    let (peer, _) = listener.accept().await.unwrap();
+                    let mut peer = BufReader::new(peer);
+                    assert_eq!(read_fixture_request(&mut peer).await, body());
+                    if step == 0 {
+                        let payload = concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"cèdre\\n\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":3}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n",
+                            payload.len()
+                        );
+                        peer.get_mut().write_all(response.as_bytes()).await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        peer.get_mut().write_all(b"0\r\n\r\n").await.unwrap();
+                        peer.get_mut().shutdown().await.unwrap();
+                    } else {
+                        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+                    }
                 }
-            }
-        });
-        let deadline = tokio::time::Instant::now() + STOP_WAIT + Duration::from_millis(300);
-        let mut report = json!({"passed":false,"samples":[{},{}]});
-        let captured = record_response(port, "fixture", &evidence, deadline, &mut report, 0).await;
-        assert!(captured.is_some());
-        assert!(report["samples"][0]["stream"].is_null());
-        report["samples"][0]["cleanup"] =
-            json!({"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true});
-        assert!(finish_response_after_cleanup(
-            captured.as_ref(),
-            &evidence,
-            &mut report,
-            0
-        ));
-        let first: Value =
-            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-        assert!(
-            record_response(port, "fixture", &evidence, deadline, &mut report, 1)
-                .await
-                .is_none()
-        );
-        fixture.await.unwrap();
-        let saved: Value =
-            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-        assert_eq!(saved["samples"][0], first["samples"][0]);
-        assert_eq!(saved["samples"][0]["stream"]["visibleContent"], "cèdre\n");
-        assert_eq!(
-            saved["samples"][0]["stream"]["visibleContentSha256"],
-            adapter_digest("cèdre\n".as_bytes())
-        );
-        assert_eq!(saved["samples"][0]["stream"]["reportedCompletionTokens"], 3);
-        assert_eq!(saved["samples"][0]["stream"]["naturallyStopped"], true);
-        assert!(
-            saved["samples"][0]["stream"]["requestMilliseconds"]
-                .as_f64()
-                .unwrap()
-                >= 20.0
-        );
-        assert!(saved["samples"][1]["stream"].is_null());
-        assert_eq!(saved["pendingReason"], "request-budget-expired");
-        assert_eq!(saved["passed"], false);
-        assert_eq!(
-            comparison(saved["samples"].as_array().unwrap(), 1)["status"],
-            "pending"
-        );
+            });
+            let deadline = tokio::time::Instant::now() + STOP_WAIT + Duration::from_millis(300);
+            let mut report = json!({"passed":false,"samples":[{},{}]});
+            let captured =
+                record_response(port, "fixture", &evidence, deadline, &mut report, 0).await;
+            assert!(captured.is_some());
+            assert!(report["samples"][0]["stream"].is_null());
+            report["samples"][0]["cleanup"] =
+                json!({"status":"confirmed","ownedJobEmpty":true,"listenerReleased":true});
+            assert!(finish_response_after_cleanup(
+                captured.as_ref(),
+                &evidence,
+                &mut report,
+                0
+            ));
+            let first: Value =
+                serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
+                    .unwrap();
+            assert!(
+                record_response(port, "fixture", &evidence, deadline, &mut report, 1)
+                    .await
+                    .is_none()
+            );
+            fixture.await.unwrap();
+            let saved: Value =
+                serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["samples"][0], first["samples"][0]);
+            assert_eq!(saved["samples"][0]["stream"]["visibleContent"], "cèdre\n");
+            assert_eq!(
+                saved["samples"][0]["stream"]["visibleContentSha256"],
+                adapter_digest("cèdre\n".as_bytes())
+            );
+            assert_eq!(saved["samples"][0]["stream"]["reportedCompletionTokens"], 3);
+            assert_eq!(saved["samples"][0]["stream"]["naturallyStopped"], true);
+            assert!(
+                saved["samples"][0]["stream"]["requestMilliseconds"]
+                    .as_f64()
+                    .unwrap()
+                    >= 20.0
+            );
+            assert!(saved["samples"][1]["stream"].is_null());
+            assert_eq!(saved["pendingReason"], "request-budget-expired");
+            assert_eq!(saved["passed"], false);
+            assert_eq!(
+                comparison(saved["samples"].as_array().unwrap(), 1)["status"],
+                "pending"
+            );
+        })
+        .await
+        .unwrap();
     });
 }
 

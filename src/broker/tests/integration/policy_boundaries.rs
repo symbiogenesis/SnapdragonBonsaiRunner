@@ -1,9 +1,4 @@
-#![forbid(unsafe_code)]
 //! Small boundary and metamorphic fixtures for strict request policy.
-#![expect(
-    clippy::unwrap_used,
-    reason = "successful fixture setup and operations must fail the test on error"
-)]
 
 use bonsai_broker::{
     CONTEXT_TOKENS, MAX_COMPLETION_TOKENS, MAX_HEADER_BYTES, MAX_HEADERS, Rejection, RequestPolicy,
@@ -11,7 +6,7 @@ use bonsai_broker::{
 };
 use http::{HeaderValue, Request, request::Parts};
 
-const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+use crate::support::CLIENT_KEY as KEY;
 const CHAT: &[u8] = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
 
 fn head(length: usize) -> Parts {

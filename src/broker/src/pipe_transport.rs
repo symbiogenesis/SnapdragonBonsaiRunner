@@ -1098,6 +1098,7 @@ mod tests {
     struct PipeQueue {
         bytes: VecDeque<u8>,
         closed: bool,
+        waiting_readers: usize,
     }
 
     struct MemoryStream {
@@ -1108,6 +1109,13 @@ mod tests {
         fn buffered_bytes(&self) -> usize {
             lock_unpoisoned(&self.shared.0).bytes.len()
         }
+
+        fn wait_for_reader_idle(&self) {
+            let mut guard = lock_unpoisoned(&self.shared.0);
+            while !guard.closed && (!guard.bytes.is_empty() || guard.waiting_readers == 0) {
+                guard = wait_unpoisoned(&self.shared.1, guard);
+            }
+        }
     }
 
     fn memory_channel() -> (MemoryStream, MemoryStream) {
@@ -1115,6 +1123,7 @@ mod tests {
             Mutex::new(PipeQueue {
                 bytes: VecDeque::new(),
                 closed: false,
+                waiting_readers: 0,
             }),
             Condvar::new(),
         ));
@@ -1138,8 +1147,13 @@ mod tests {
     impl Read for MemoryStream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let mut guard = lock_unpoisoned(&self.shared.0);
-            while guard.bytes.is_empty() && !guard.closed {
-                guard = wait_unpoisoned(&self.shared.1, guard);
+            if guard.bytes.is_empty() && !guard.closed {
+                guard.waiting_readers += 1;
+                self.shared.1.notify_all();
+                while guard.bytes.is_empty() && !guard.closed {
+                    guard = wait_unpoisoned(&self.shared.1, guard);
+                }
+                guard.waiting_readers -= 1;
             }
             let count = guard.bytes.len().min(buf.len());
             for slot in &mut buf[..count] {
@@ -1218,15 +1232,28 @@ mod tests {
             complete_handshake(&mut p_to_c_r, &mut c_to_p_w)?;
 
             // Calling wait_server_ready concurrently before KIND_SERVER_READY arrives must wait and succeed.
+            let (send_ready_tx, send_ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
             let server_ready_sender = std::thread::spawn(move || -> io::Result<MemoryStream> {
-                std::thread::sleep(Duration::from_millis(20));
+                let _ = send_ready_rx.recv();
                 write_frame(&mut c_to_p_w, 0, KIND_SERVER_READY, &[])?;
                 Ok(c_to_p_w)
             });
-            backend
-                .wait_server_ready(Instant::now() + Duration::from_secs(2))
+            {
+                let mut ready = std::pin::pin!(
+                    backend.wait_server_ready(Instant::now() + Duration::from_secs(2))
+                );
+                let mut signaled = false;
+                std::future::poll_fn(|cx| {
+                    let poll = ready.as_mut().poll(cx);
+                    if poll.is_pending() && !signaled {
+                        signaled = true;
+                        let _ = send_ready_tx.send(());
+                    }
+                    poll
+                })
                 .await
                 .map_err(|_| io::Error::other("wait_server_ready failed"))?;
+            }
             let mut c_to_p_w = server_ready_sender
                 .join()
                 .map_err(|_| io::Error::other("server ready thread panicked"))??;
@@ -1367,7 +1394,7 @@ mod tests {
             s2.write_all(b"aborted").await?;
             write_frame(&mut c_to_p_w, 2, KIND_DATA, b"unread-rx")?;
             // Let reader enqueue the RX chunk before dropping s2.
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            c_to_p_w.wait_for_reader_idle();
             drop(s2);
             assert!(backend.pool.len() >= 1);
             assert!(backend.pool.len() <= FREE_LIST_CAPACITY);
@@ -1499,7 +1526,7 @@ mod tests {
             assert_eq!(&handshake[8..], VALID_KEY.as_bytes());
 
             // No KIND_VERIFIED_SECTION frame may be emitted before SB2OKAY1 arrives.
-            std::thread::sleep(Duration::from_millis(25));
+            c_to_p_w.wait_for_reader_idle();
             assert_eq!(p_to_c_r.buffered_bytes(), 0);
 
             c_to_p_w.write_all(HANDSHAKE_RESPONSE_MAGIC)?;
@@ -1513,7 +1540,7 @@ mod tests {
             assert!(
                 matches!(
                     backend
-                        .wait_server_ready(Instant::now() + Duration::from_millis(25))
+                        .wait_server_ready(Instant::now() + Duration::from_millis(1))
                         .await,
                     Err(BackendError::Deadline)
                 ),

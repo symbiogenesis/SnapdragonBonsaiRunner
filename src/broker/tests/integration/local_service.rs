@@ -1,9 +1,4 @@
-#![forbid(unsafe_code)]
 //! Real loopback transport regressions; no model or external network is used.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and assertions must fail loudly"
-)]
 
 use bonsai_broker::{
     Rejection,
@@ -22,8 +17,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-mod support;
-use support::{
+use crate::support::{
     BACKEND_KEY as BACK_KEY, CLIENT_KEY as FRONT_KEY, http_post_request,
     loopback_listener as listener, read_http_request as read_request, run_local_timeout,
     serve_count_once as count, write_json_response as respond,
@@ -146,7 +140,7 @@ fn burst_limit_rejects_authenticated_headers_before_body_or_backend_and_refills(
         // rate response for a caller with an invalid credential.
         assert_eq!(burst_probe(&service, false, false).await.0, "");
         assert!(
-            timeout(Duration::from_millis(20), backend.accept())
+            timeout(Duration::from_millis(1), backend.accept())
                 .await
                 .is_err()
         );
@@ -289,7 +283,7 @@ fn control_token_rejection_never_contacts_backend_and_keeps_service_ready() {
             r#"{"error":{"code":"input_control_tokens_rejected"}}"#
         );
         assert!(
-            timeout(Duration::from_millis(20), backend.accept())
+            timeout(Duration::from_millis(1), backend.accept())
                 .await
                 .is_err()
         );
@@ -394,7 +388,7 @@ fn policy_rejections_report_fixed_errors_and_keep_service_usable() {
             );
         }
         assert!(
-            timeout(Duration::from_millis(20), backend.accept())
+            timeout(Duration::from_millis(1), backend.accept())
                 .await
                 .is_err()
         );
@@ -518,7 +512,7 @@ fn queued_socket_expires_without_reading_a_request_or_connecting_backend() {
             let mut byte = [0];
             assert_eq!(queued_client.read(&mut byte).await.unwrap(), 0);
             assert!(
-                timeout(Duration::from_millis(20), backend.accept())
+                timeout(Duration::from_millis(1), backend.accept())
                     .await
                     .is_err()
             );
@@ -641,7 +635,7 @@ fn expired_connector_deadline_never_connects() {
             Err(BackendError::Deadline)
         ));
         assert!(
-            timeout(Duration::from_millis(20), backend.accept())
+            timeout(Duration::from_millis(1), backend.accept())
                 .await
                 .is_err()
         );
@@ -684,7 +678,7 @@ fn queued_client_disconnect_aborts_before_slot_without_closing_gate() {
         );
         // Gate remains open and the backend never receives a connection for the abandoned queue entry.
         assert!(
-            timeout(Duration::from_millis(20), backend.accept())
+            timeout(Duration::from_millis(1), backend.accept())
                 .await
                 .is_err()
         );

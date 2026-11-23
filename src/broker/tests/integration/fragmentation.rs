@@ -1,11 +1,7 @@
-#![forbid(unsafe_code)]
 //! Whole-pipeline framing regressions with bounded, deterministic in-memory I/O.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test fixtures and successful-operation assertions must fail loudly"
-)]
 
 use bonsai_broker::{
+    RequestPolicy,
     backend::{BackendError, BackendPolicy},
     response::ResponseError,
     supervisor::{BackendConnector, ServeError, serve_chat},
@@ -24,8 +20,9 @@ use tokio::{
     time::Instant,
 };
 
-mod support;
-use support::{BACKEND_KEY, CLIENT_KEY, COUNT_BODY as COUNT, chat_policy, http_post_request, run};
+use crate::support::{
+    BACKEND_KEY, CLIENT_KEY, COUNT_BODY as COUNT, chat_policy, http_post_request, run,
+};
 
 const TEXT: &str = "Keep rain, snow ☃, and the voice.\nNext line.";
 const JSON: &[u8] = "{\"choices\":[{\"text\":\"rain ☃\"}]}".as_bytes();
@@ -234,7 +231,11 @@ impl Exchange {
     }
 
     fn with_replies(streaming: bool, counter: Vec<u8>, generation: Vec<u8>) -> Self {
-        let mut client = Stream::new(request(streaming));
+        Self::with_wires(request(streaming), counter, generation)
+    }
+
+    fn with_wires(client_request: Vec<u8>, counter: Vec<u8>, generation: Vec<u8>) -> Self {
+        let mut client = Stream::new(client_request);
         client.keep_open = true;
         let counter = Stream::new(counter);
         let generation = Stream::new(generation);
@@ -262,15 +263,19 @@ impl Exchange {
         }
     }
 
+    async fn finish(self) -> Outcome {
+        self.finish_with_policy(&chat_policy()).await
+    }
+
     #[expect(
         clippy::future_not_send,
         reason = "owned Rc observations are confined to the deterministic local runtime"
     )]
-    async fn finish(self) -> Outcome {
+    async fn finish_with_policy(self, policy: &RequestPolicy) -> Outcome {
         let start = Instant::now();
         let result = serve_chat(
             self.client,
-            &chat_policy(),
+            policy,
             &self.backend,
             start + Duration::from_secs(1),
         )
@@ -317,6 +322,16 @@ fn assert_stage_failure(wire: &[u8], code: &str) {
 }
 
 fn assert_success(outcome: &Outcome, streaming: bool) {
+    let expected_auth = format!("Authorization: Bearer {BACKEND_KEY}\r\n");
+    let _body = assert_success_with(outcome, streaming, &expected_auth, None);
+}
+
+fn assert_success_with(
+    outcome: &Outcome,
+    streaming: bool,
+    expected_auth: &str,
+    expected_body: Option<&[u8]>,
+) -> Vec<u8> {
     assert_eq!(outcome.result, Ok(()));
     assert_eq!(outcome.calls, 2);
     let counter = outcome.states[1].borrow();
@@ -328,13 +343,17 @@ fn assert_success(outcome: &Outcome, streaming: bool) {
     assert_eq!(count_body, generation_body);
     for head in [count_head, generation_head] {
         let head = std::str::from_utf8(head).unwrap();
-        assert!(head.contains(&format!("Authorization: Bearer {BACKEND_KEY}\r\n")));
+        assert!(head.contains(expected_auth));
         assert!(!head.contains(CLIENT_KEY));
     }
-    let forwarded: serde_json::Value = serde_json::from_slice(generation_body).unwrap();
-    assert_eq!(forwarded["messages"][0]["content"], TEXT);
-    assert_eq!(forwarded["cache_prompt"], false);
-    assert_eq!(forwarded["stream"], streaming);
+    if let Some(expected_body) = expected_body {
+        assert_eq!(generation_body, expected_body);
+    } else {
+        let forwarded: serde_json::Value = serde_json::from_slice(generation_body).unwrap();
+        assert_eq!(forwarded["messages"][0]["content"], TEXT);
+        assert_eq!(forwarded["cache_prompt"], false);
+        assert_eq!(forwarded["stream"], streaming);
+    }
     let client = outcome.states[0].borrow();
     let (head, mut body) = parts(&client.written);
     assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
@@ -360,25 +379,44 @@ fn assert_success(outcome: &Outcome, streaming: bool) {
     } else {
         assert_eq!(body, JSON);
     }
+    generation_body.to_vec()
 }
 
 #[test]
 fn every_single_wire_split_preserves_the_complete_count_and_generation_pipeline() {
     run(async {
+        let policy = chat_policy();
+        let expected_auth = format!("Authorization: Bearer {BACKEND_KEY}\r\n");
+        let requests = [request(false), request(true)];
+        let count_responses = [response(COUNT, false, false), response(COUNT, false, true)];
+        let generation_responses = [
+            [response(JSON, false, false), response(JSON, false, true)],
+            [response(SSE, true, false), response(SSE, true, true)],
+        ];
         // Vary one endpoint at a time: linear coverage of every boundary instead
         // of a redundant Cartesian product. Both framing modes get controls.
         for streaming in [false, true] {
+            let req = &requests[usize::from(streaming)];
+            let mut expected_body: Option<Vec<u8>> = None;
             for chunked in [false, true] {
-                let lengths = [
-                    request(streaming).len(),
-                    response(COUNT, false, chunked).len(),
-                    response(if streaming { SSE } else { JSON }, streaming, chunked).len(),
-                ];
+                let count_resp = &count_responses[usize::from(chunked)];
+                let gen_resp = &generation_responses[usize::from(streaming)][usize::from(chunked)];
+                let lengths = [req.len(), count_resp.len(), gen_resp.len()];
                 for (endpoint, length) in lengths.into_iter().enumerate() {
                     for boundary in 1..length {
-                        let mut exchange = Exchange::new(streaming, chunked);
+                        let mut exchange =
+                            Exchange::with_wires(req.clone(), count_resp.clone(), gen_resp.clone());
                         exchange.split(endpoint, boundary);
-                        assert_success(&exchange.finish().await, streaming);
+                        let outcome = exchange.finish_with_policy(&policy).await;
+                        let body = assert_success_with(
+                            &outcome,
+                            streaming,
+                            &expected_auth,
+                            expected_body.as_deref(),
+                        );
+                        if expected_body.is_none() {
+                            expected_body = Some(body);
+                        }
                     }
                 }
             }

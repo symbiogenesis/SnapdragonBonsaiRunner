@@ -1,9 +1,4 @@
-#![forbid(unsafe_code)]
 //! Regression coverage for private backend HTTP exchanges and body decoding.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and successful-operation assertions must panic on failure"
-)]
 
 use bonsai_broker::{
     AdmittedChat, MAX_HEADER_BYTES, MAX_HEADERS, PendingChat, Rejection,
@@ -16,8 +11,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-mod support;
-use support::{
+use crate::support::{
     BACKEND_KEY, CLIENT_KEY, COUNT_BODY as COUNT, MockStream as Stream, backend_policy as policy,
     deadline, http_chunked_response as chunked_response, http_length_response as length_response,
     pending_chat, run,

@@ -1,16 +1,10 @@
-#![forbid(unsafe_code)]
 //! Regression coverage for bounded single-active request admission.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and successful-operation assertions must panic on failure"
-)]
 
 use bonsai_broker::scheduler::{GateError, MAX_WAITING, RequestGate};
 use std::{future::poll_fn, pin::pin, task::Poll, time::Duration};
 use tokio::time::{Instant, advance};
 
-mod support;
-use support::{deadline, run};
+use crate::support::{deadline, run};
 
 #[test]
 fn waiting_limit_rejects_invalid_configuration() {

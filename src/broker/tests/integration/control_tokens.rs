@@ -1,15 +1,10 @@
-#![forbid(unsafe_code)]
 //! Exact content-control rejection before canonical counting or generation.
-#![expect(
-    clippy::unwrap_used,
-    reason = "Fixture decoding and successful control assertions must fail the test."
-)]
 
 use bonsai_broker::{PendingChat, Rejection, RequestPolicy};
 use http::{Request, Version};
 use serde_json::{Value, json};
 
-const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+use crate::support::CLIENT_KEY as KEY;
 
 fn prepare(body: &[u8]) -> Result<PendingChat, Rejection> {
     let request = Request::builder()
@@ -46,7 +41,7 @@ fn rejects(messages: &Value) {
 #[test]
 fn chat_controls_reject_every_pinned_special_in_every_text_position() {
     let inventory: Value =
-        serde_json::from_str(include_str!("fixtures/swift-control-tokens.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/swift-control-tokens.json")).unwrap();
     let entries = inventory["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 33);
     for entry in entries {

@@ -235,90 +235,98 @@ fn native_speed_comparison_requires_matched_output_usage_and_cleanup() {
 
 #[test]
 fn native_speed_stream_waits_for_complete_framing_and_uses_usage_not_events() {
-    run_timed(Duration::from_secs(10), async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let fixture = tokio::spawn(async move {
-            let (peer, _) = listener.accept().await.unwrap();
-            let mut peer = BufReader::new(peer);
-            assert_eq!(read_fixture_request(&mut peer).await, speed_request());
-            let payload = concat!(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"1 2 \"},\"finish_reason\":null}]}\n\n",
-                "data: {\"choices\":[{\"delta\":{\"content\":\"3 4\"},\"finish_reason\":null}]}\n\n",
-                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":8}}\n\n",
-                "data: [DONE]\n\n"
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n",
-                payload.len()
-            );
-            peer.get_mut().write_all(response.as_bytes()).await.unwrap();
-            // Terminal usage and DONE alone do not finish the HTTP frame.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            peer.get_mut().write_all(b"0\r\n\r\n").await.unwrap();
-            peer.get_mut().shutdown().await.unwrap();
-        });
-        let measured = measured_stream(port, "public-fixture-key").await;
-        fixture.await.unwrap();
-        assert_eq!(measured["reportedCompletionTokens"], 8);
-        assert_eq!(measured["visibleContent"], "1 2 3 4");
-        assert!(measured["requestMilliseconds"].as_f64().unwrap() >= 20.0);
-        assert!(measured["requestTokensPerSecond"].as_f64().unwrap() <= 400.0);
+    run_paused(async {
+        timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let fixture = tokio::spawn(async move {
+                let (peer, _) = listener.accept().await.unwrap();
+                let mut peer = BufReader::new(peer);
+                assert_eq!(read_fixture_request(&mut peer).await, speed_request());
+                let payload = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"1 2 \"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"3 4\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":8}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{payload}\r\n",
+                    payload.len()
+                );
+                peer.get_mut().write_all(response.as_bytes()).await.unwrap();
+                // Terminal usage and DONE alone do not finish the HTTP frame.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                peer.get_mut().write_all(b"0\r\n\r\n").await.unwrap();
+                peer.get_mut().shutdown().await.unwrap();
+            });
+            let measured = measured_stream(port, "public-fixture-key").await;
+            fixture.await.unwrap();
+            assert_eq!(measured["reportedCompletionTokens"], 8);
+            assert_eq!(measured["visibleContent"], "1 2 3 4");
+            assert!(measured["requestMilliseconds"].as_f64().unwrap() >= 20.0);
+            assert!(measured["requestTokensPerSecond"].as_f64().unwrap() <= 400.0);
+        })
+        .await
+        .unwrap();
     });
 }
 
 #[test]
 fn native_speed_partial_pair_survives_cancelled_second_request() {
-    run_timed(Duration::from_secs(10), async {
-        let evidence = TempEvidence::new("Bonsai-Speed-Partial");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let fixture = tokio::spawn(async move {
-            for step in 0..2 {
-                let (peer, _) = listener.accept().await.unwrap();
-                let mut peer = BufReader::new(peer);
-                let _ = read_fixture_request(&mut peer).await;
-                if step == 0 {
-                    let payload = concat!(
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"1 2 3 4\"},\"finish_reason\":null}]}\n\n",
-                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":8}}\n\n",
-                        "data: [DONE]\n\n"
-                    );
-                    let response = chunked_sse(payload);
-                    peer.get_mut().write_all(&response).await.unwrap();
-                    peer.get_mut().shutdown().await.unwrap();
-                } else {
-                    // The deadline must drop the in-flight second connection.
-                    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    run_paused(async {
+        timeout(Duration::from_secs(10), async {
+            let evidence = TempEvidence::new("Bonsai-Speed-Partial");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let fixture = tokio::spawn(async move {
+                for step in 0..2 {
+                    let (peer, _) = listener.accept().await.unwrap();
+                    let mut peer = BufReader::new(peer);
+                    let _ = read_fixture_request(&mut peer).await;
+                    if step == 0 {
+                        let payload = concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"1 2 3 4\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":8}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        let response = chunked_sse(payload);
+                        peer.get_mut().write_all(&response).await.unwrap();
+                        peer.get_mut().shutdown().await.unwrap();
+                    } else {
+                        // The deadline must drop the in-flight second connection.
+                        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+                    }
                 }
-            }
-        });
-        let deadline = tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(2);
-        let mut report = json!({"passed":false,"samples":[{"configuredNativeRowWorkers":1},
-            {"configuredNativeRowWorkers":4}]});
-        assert!(
-            record_measured_request(port, "fixture", &evidence, deadline, &mut report, 0).await
-        );
-        // Compare persisted receipts on both sides. Parsing a measured f64
-        // can round by one ULP; that does not mean a later write changed it.
-        let first: Value =
-            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-        let first = first["samples"][0].clone();
-        assert!(
-            !record_measured_request(port, "fixture", &evidence, deadline, &mut report, 1).await
-        );
-        fixture.await.unwrap();
-        let saved: Value =
-            serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
-        assert_eq!(saved["samples"][0], first);
-        assert_eq!(saved["samples"][0]["stream"]["reportedCompletionTokens"], 8);
-        assert!(saved["samples"][1]["stream"].is_null());
-        assert_eq!(saved["pendingReason"], "request-budget-expired");
-        assert_eq!(saved["passed"], false);
-        assert_eq!(
-            comparison(saved["samples"].as_array().unwrap())["status"],
-            "pending"
-        );
+            });
+            let deadline = tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(2);
+            let mut report = json!({"passed":false,"samples":[{"configuredNativeRowWorkers":1},
+                {"configuredNativeRowWorkers":4}]});
+            assert!(
+                record_measured_request(port, "fixture", &evidence, deadline, &mut report, 0).await
+            );
+            // Compare persisted receipts on both sides. Parsing a measured f64
+            // can round by one ULP; that does not mean a later write changed it.
+            let first: Value =
+                serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
+            let first = first["samples"][0].clone();
+            assert!(
+                !record_measured_request(port, "fixture", &evidence, deadline, &mut report, 1).await
+            );
+            fixture.await.unwrap();
+            let saved: Value =
+                serde_json::from_slice(&fs::read(evidence.join("acceptance.json")).unwrap()).unwrap();
+            assert_eq!(saved["samples"][0], first);
+            assert_eq!(saved["samples"][0]["stream"]["reportedCompletionTokens"], 8);
+            assert!(saved["samples"][1]["stream"].is_null());
+            assert_eq!(saved["pendingReason"], "request-budget-expired");
+            assert_eq!(saved["passed"], false);
+            assert_eq!(
+                comparison(saved["samples"].as_array().unwrap())["status"],
+                "pending"
+            );
+        })
+        .await
+        .unwrap();
     });
 }
 

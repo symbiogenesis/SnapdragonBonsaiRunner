@@ -753,9 +753,16 @@ fn staged_long_context_intake_preserves_unicode_and_exact_reply_reservations() {
             Err(Rejection::ContextLimit)
         ));
         // A shorter reply admits exactly the newly released token reservation.
-        let mut larger_reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        larger_reply["max_completion_tokens"] = serde_json::json!(4096);
-        let larger_reply = serde_json::to_vec(&larger_reply).unwrap();
+        const CURRENT_CAP: &[u8] = br#""max_completion_tokens":1024"#;
+        const LARGER_CAP: &[u8] = br#""max_completion_tokens":4096"#;
+        let offset = body
+            .windows(CURRENT_CAP.len())
+            .position(|window| window == CURRENT_CAP)
+            .unwrap();
+        let mut larger_reply = Vec::with_capacity(body.len());
+        larger_reply.extend_from_slice(&body[..offset]);
+        larger_reply.extend_from_slice(LARGER_CAP);
+        larger_reply.extend_from_slice(&body[offset + CURRENT_CAP.len()..]);
         assert!(
             policy
                 .check_head(&head(larger_reply.len()))

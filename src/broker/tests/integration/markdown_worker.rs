@@ -1,6 +1,4 @@
 //! Production-image regression for the offline parser's native launch boundary.
-#![cfg(windows)]
-#![forbid(unsafe_code)]
 
 use bonsai_windows_credentials::PrivateDirectory;
 use bonsai_windows_process::{OwnedProcess, ProcessSpec, SandboxPolicy, ToolProcessSpec};
@@ -9,9 +7,9 @@ use std::{
     fs::{self, File},
     io::{self, Read as _, Write as _},
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 fn complete(results: impl IntoIterator<Item = (&'static str, io::Result<()>)>) -> io::Result<()> {
@@ -209,9 +207,21 @@ fn markdown_production_image_formats_under_native_containment() -> io::Result<()
         fs::create_dir(&worker)?;
         let (process, input, output) = OwnedProcess::start_sandboxed_piped_minimal(&spec, &policy)?;
         let (sender, receiver) = mpsc::sync_channel(1);
+        let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let finished_signal = Arc::clone(&finished);
         let reader = thread::Builder::new()
             .name("markdown-production-protocol".into())
             .spawn(move || {
+                struct MarkDone(Arc<(Mutex<bool>, Condvar)>);
+                impl Drop for MarkDone {
+                    fn drop(&mut self) {
+                        if let Ok(mut done) = self.0.0.lock() {
+                            *done = true;
+                            self.0.1.notify_all();
+                        }
+                    }
+                }
+                let _mark = MarkDone(finished_signal);
                 let _sent = sender.send(exchange(input, output));
             });
         let reader = match reader {
@@ -237,10 +247,13 @@ fn markdown_production_image_formats_under_native_containment() -> io::Result<()
         let result = result
             .map_err(|error| io::Error::other(format!("{error}; worker before cleanup: {state}")));
         // Attempt stop and reader cleanup even when startup/framing/parsing failed.
-        let deadline = Instant::now() + Duration::from_secs(5);
         let stopped = process.stop(Duration::from_secs(5));
-        while stopped.is_ok() && !reader.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
+        if stopped.is_ok()
+            && let Ok(done) = finished.0.lock()
+        {
+            let _ = finished
+                .1
+                .wait_timeout_while(done, Duration::from_secs(5), |done| !*done);
         }
         let joined = if reader.is_finished() {
             reader

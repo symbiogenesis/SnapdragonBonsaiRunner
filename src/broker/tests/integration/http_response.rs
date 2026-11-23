@@ -1,9 +1,4 @@
-#![forbid(unsafe_code)]
 //! Regression coverage for bounded response framing and endpoint ownership.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and successful-operation assertions must panic on failure"
-)]
 
 use bonsai_broker::{
     AdmittedChat,
@@ -27,8 +22,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-mod support;
-use support::{MockStream as Backend, MockStreamState, admitted_chat, deadline, run};
+use crate::support::{MockStream as Backend, MockStreamState, admitted_chat, deadline, run};
 
 fn admitted(stream: bool) -> AdmittedChat {
     let body =
@@ -405,6 +399,10 @@ fn cap_plus_one_probe_rejects_json_and_sse_without_forwarding_excess() {
 fn fragmented_sse_is_flushed_in_bounded_chunks_without_inventing_events() {
     run(async {
         assert_eq!(RESPONSE_BUFFER_BYTES, 8192);
+        let mut body = b": comment\r\ndata: {\"delta\":\"rain\"}\n\n".to_vec();
+        body.extend(std::iter::repeat_n(b'x', RESPONSE_BUFFER_BYTES * 2 + 17));
+        body.extend_from_slice(b"\n\ndata: \xff\n\n");
+        let admitted = admitted(true);
         for fragment in [
             1,
             15,
@@ -414,9 +412,6 @@ fn fragmented_sse_is_flushed_in_bounded_chunks_without_inventing_events() {
             RESPONSE_BUFFER_BYTES,
             RESPONSE_BUFFER_BYTES * 2,
         ] {
-            let mut body = b": comment\r\ndata: {\"delta\":\"rain\"}\n\n".to_vec();
-            body.extend(std::iter::repeat_n(b'x', RESPONSE_BUFFER_BYTES * 2 + 17));
-            body.extend_from_slice(b"\n\ndata: \xff\n\n");
             let backend = Backend::new(body.clone(), fragment);
             let backend_state = backend.state.clone();
             let client = client(3);
@@ -424,7 +419,7 @@ fn fragmented_sse_is_flushed_in_bounded_chunks_without_inventing_events() {
             Box::pin(send_chat_response(
                 client,
                 response(backend, true),
-                &admitted(true),
+                &admitted,
                 deadline(),
             ))
             .await

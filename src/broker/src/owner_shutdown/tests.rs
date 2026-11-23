@@ -43,6 +43,12 @@ fn owner_shutdown_arguments_preserve_launch_selection_and_reject_ambiguous_stora
     Ok(())
 }
 
+fn current_runtime() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
 #[test]
 fn owner_shutdown_early_request_survives_startup_intake_and_requires_empty_regular_file()
 -> io::Result<()> {
@@ -51,10 +57,7 @@ fn owner_shutdown_early_request_survives_startup_intake_and_requires_empty_regul
     fs::write(&request, [])?;
     let (_, control) = OwnerShutdown::take_arguments(arguments(&directory))?;
     let control = control.ok_or_else(invalid)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
+    current_runtime()?.block_on(async {
         tokio::time::timeout(Duration::from_millis(100), control.requested())
             .await
             .map_err(io::Error::other)?
@@ -73,10 +76,7 @@ fn owner_shutdown_same_pending_future_observes_request_after_startup_handoff() -
     let directory = storage()?;
     let (_, control) = OwnerShutdown::take_arguments(arguments(&directory))?;
     let control = control.ok_or_else(invalid)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
+    current_runtime()?.block_on(async {
         let mut shutdown = pin!(control.requested());
         assert!(poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await);
         fs::write(directory.path().join(REQUEST), [])?;

@@ -1,9 +1,4 @@
-#![forbid(unsafe_code)]
 //! Bounded, replayable scheduler histories against a semaphore-free model.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and model invariants must fail immediately"
-)]
 
 use bonsai_broker::scheduler::{ActiveRequest, GateError, MAX_WAITING, RequestGate, Reservation};
 use std::{
@@ -479,11 +474,10 @@ fn exhaustive_gate_latch_and_queued_drop_interleavings_prevent_orphan_admission(
         .start_paused(true)
         .build()
         .unwrap()
-        .block_on(async {
+        .block_on(tokio::task::unconstrained(async {
             // Family 1: active attempt aborts and latches gate across all queue/wakeup/drop orders.
             for &[a, b, c] in &queue_orders {
                 for &order in &four_orders {
-                    tokio::task::yield_now().await;
                     let gate = RequestGate::new(2).unwrap();
                     let origin = Instant::now();
                     let deadline = origin + Duration::from_millis(50);
@@ -628,7 +622,6 @@ fn exhaustive_gate_latch_and_queued_drop_interleavings_prevent_orphan_admission(
             // takeover/abort latch, third waiter wakeup, and late orphan probe.
             for &[a, b, c] in &queue_orders {
                 for &order in &five_orders {
-                    tokio::task::yield_now().await;
                     let gate = RequestGate::new(2).unwrap();
                     let origin = Instant::now();
                     let deadline = origin + Duration::from_millis(50);
@@ -807,5 +800,5 @@ fn exhaustive_gate_latch_and_queued_drop_interleavings_prevent_orphan_admission(
                     }
                 }
             }
-        });
+        }));
 }

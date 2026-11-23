@@ -438,9 +438,16 @@ mod tests {
     }
 
     fn synthetic_gguf_bytes(len: usize) -> Vec<u8> {
-        let mut payload: Vec<u8> = (0..len)
+        const TILE_LEN: usize = 32 * 1024;
+        let tile: Vec<u8> = (0..TILE_LEN.min(len))
             .map(|i| u8::try_from((i.wrapping_mul(29) ^ (i >> 7) ^ 0x5c) & 0xff).unwrap_or(0))
             .collect();
+        let mut payload = vec![0_u8; len];
+        if !tile.is_empty() {
+            for chunk in payload.chunks_mut(tile.len()) {
+                chunk.copy_from_slice(&tile[..chunk.len()]);
+            }
+        }
         if payload.len() >= 4 {
             payload[..4].copy_from_slice(b"GGUF");
         }
@@ -504,23 +511,37 @@ mod tests {
         drop(whole_guard);
 
         // 1-byte corruption in chunk 0, chunk 1, and final tail chunk must fail with Identity.
+        let toggle_byte = |offset: usize| -> std::io::Result<()> {
+            use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&model_path)?;
+            let pos = u64::try_from(offset).map_err(std::io::Error::other)?;
+            file.seek(SeekFrom::Start(pos))?;
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte)?;
+            byte[0] ^= 0x01;
+            file.seek(SeekFrom::Start(pos))?;
+            file.write_all(&byte)?;
+            file.flush()
+        };
         for tamper_offset in [17_usize, chunk_bytes + 17, total_len - 1] {
-            let mut tampered = payload.clone();
-            tampered[tamper_offset] ^= 0x01;
-            fs::write(&model_path, &tampered)?;
+            toggle_byte(tamper_offset)?;
+            let chunked_err =
+                VerifiedArtifacts::verify_model_artifact(&model_path, &artifact, false).err();
+            let whole_err =
+                VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact, false).err();
+            toggle_byte(tamper_offset)?;
             assert_eq!(
-                VerifiedArtifacts::verify_model_artifact(&model_path, &artifact, false).err(),
+                chunked_err,
                 Some(ArtifactError::Identity),
                 "missed corruption at offset {tamper_offset}"
             );
-            assert_eq!(
-                VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact, false).err(),
-                Some(ArtifactError::Identity)
-            );
+            assert_eq!(whole_err, Some(ArtifactError::Identity));
         }
 
-        // Restore valid file and verify manifest schema/identity mismatches fail closed.
-        fs::write(&model_path, &payload)?;
+        // Valid file is restored; verify manifest schema/identity mismatches fail closed.
         let mut wrong_count = artifact.clone();
         wrong_count.chunk_manifest = Some((chunk_bytes, chunk_sha256s[..2].to_vec()));
         assert_eq!(

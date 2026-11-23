@@ -1,9 +1,4 @@
-#![forbid(unsafe_code)]
 //! Regression coverage for bounded HTTP request reception and cancellation.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and successful-operation assertions must panic on failure"
-)]
 
 use bonsai_broker::{
     MAX_BODY_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, MAX_MULTIMODAL_BODY_BYTES, Rejection,
@@ -21,8 +16,7 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 
-mod support;
-use support::{CLIENT_KEY as KEY, chat_policy as policy, deadline, run};
+use crate::support::{CLIENT_KEY as KEY, chat_policy as policy, deadline, run};
 
 // Literal JSON whitespace newlines must never be inspected as HTTP head bytes.
 const CHAT: &[u8] = br#"{

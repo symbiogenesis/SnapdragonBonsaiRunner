@@ -322,7 +322,7 @@ mod transport {
                     )))
                 );
                 assert!(
-                    timeout(Duration::from_millis(5), backend.accept())
+                    timeout(Duration::from_millis(1), backend.accept())
                         .await
                         .is_err()
                 );

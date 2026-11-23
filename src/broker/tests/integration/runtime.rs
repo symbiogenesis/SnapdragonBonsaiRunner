@@ -1,9 +1,4 @@
-#![forbid(unsafe_code)]
 //! Development runner regressions use synthetic loopback backends only.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and assertions must fail loudly"
-)]
 
 use bonsai_broker::{
     runtime::{ConfigurationError, DevelopmentConfig, RunExit, run},
@@ -26,8 +21,7 @@ use tokio::{
     task::spawn_local,
 };
 
-mod support;
-use support::{
+use crate::support::{
     BACKEND_KEY as BACK_KEY, CLIENT_KEY as FRONT_KEY, http_post_request, loopback_listener,
     read_http_request, run_local_timeout, write_json_response as respond,
 };

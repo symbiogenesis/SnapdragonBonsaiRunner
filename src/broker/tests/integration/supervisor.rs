@@ -1,9 +1,4 @@
-#![forbid(unsafe_code)]
 //! Focused regressions for one-request orchestration and real disconnect reads.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test setup and successful-operation assertions must panic on failure"
-)]
 
 use bonsai_broker::{
     Rejection,
@@ -26,8 +21,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-mod support;
-use support::{
+use crate::support::{
     BACKEND_KEY, CLIENT_KEY, COUNT_BODY as COUNT, MockStream as BackendStream, backend_policy,
     chat_policy as policy, deadline, http_length_response as response, http_post_request, run,
 };
@@ -494,7 +488,7 @@ fn backend_failure_diagnostics_preserve_stage_and_redact_private_values() {
         Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "backend_failures_before_response_report_counting_or_generation_stage",
+                "supervisor::backend_failures_before_response_report_counting_or_generation_stage",
                 "--nocapture",
             ])
             .stdin(Stdio::null())
@@ -509,7 +503,7 @@ fn backend_failure_diagnostics_preserve_stage_and_redact_private_values() {
             std::time::Instant::now() < until,
             "Diagnostic replay timed out."
         );
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(1));
     }
     let output = replay.0.take().unwrap().wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
