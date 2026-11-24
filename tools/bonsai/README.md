@@ -72,24 +72,32 @@ for memory or arithmetic savings. Neither retained weight energy nor a factual
 smoke establishes broad quality or an inference-speed improvement.
 
 `lora-diff-audit` runs Gate 1 (`DR1`), spectral-denoising audit/export (`DR-A1`/
-`DR-E1`), and `DR-G2` GGUF adapter verification/readiness against
-`RadixArk/DaisyRose-27B` vs `Qwen/Qwen3.8-27B` (or `local-directories` fixtures)
-via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
-- `"plan"` / `"audit"`: requires `source` (`{"kind":"pinned-daisyrose"}` or
-  `{"kind":"local-directories","candidateDirectory":...,"baseDirectory":...}`),
+`DR-E1`), `DR-W1` algebraic/activation-guided multi-rank editing, `DR-Alt` donor
+auditing/PEFT import, and `DR-G2` adapter verification, capture, blinding, and
+readiness scoring against `RadixArk/DaisyRose-27B` vs `Qwen/Qwen3.8-27B`,
+generic `pinned-huggingface` donors, or `local-directories` fixtures via bounded
+HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
+- `"plan"` / `"audit"`: requires `source` (`{"kind":"pinned-daisyrose"}`,
+  `{"kind":"pinned-huggingface","candidateRepository":...,"candidateRevision":...,"candidateLicense":...,"baseRepository":...,"baseRevision":...}`,
+  or `{"kind":"local-directories","candidateDirectory":...,"baseDirectory":...}`),
   optional `scope` (`layers`, `targetEnvelope` in `"all"`, `"residual-writers"`,
   `"npu-friendly"`, or `"full-linear"`, `includeOutputNorm`, `includeVocab`,
   `includeSvd`, `includeSpectralDenoising`, `exportDtype` `"f16"` or `"f32"`,
-  `minSpikeRatio`, `maxRank`, `oversampling`, `powerIterations`), optional
-  `controls` (`timeBudgetSeconds` in `10..=900`, `workers`, `httpConcurrency`),
-  and optional fresh external `outputPath`. Audits emit both `gate1Screen` (raw
+  `minSpikeRatio`, `shrinkageMode` in `"gavish-donoho"`, `"unshrunk"`, or
+  `"blended"`, `shrinkageBlend` in `0.0..=1.0` required iff `"blended"`,
+  `maxRank`, `oversampling`, `powerIterations`), optional `controls`
+  (`timeBudgetSeconds` in `10..=900`, `workers`, `httpConcurrency`), and
+  optional fresh external `outputPath`. Audits emit both `gate1Screen` (raw
   SVD) and `spectralDenoisingScreen` (Rademacher-null bulk calibration +
   Gavish–Donoho optimal shrinkage + `tailSaturated` check).
 - `"export-denoised"`: requires `source`, fresh external `outputPath`, and
   `targetEnvelope` in `"residual-writers"`, `"npu-friendly"` (default), or
-  `"full-linear"`, atomically exporting shrunk above-bulk spikes to a GGUF v3
-  LoRA with both `adapter.lora.alpha` and `adapter.lora_alpha` and immediately
-  self-verifying the published bytes.
+  `"full-linear"` (honoring `scope.shrinkageMode` and `scope.shrinkageBlend`),
+  atomically exporting above-bulk spikes to a GGUF v3 LoRA with dual
+  `adapter.lora.alpha` / `adapter.lora_alpha` plus `bonsai.composition.*`
+  provenance (`shrinkage_mode`, `candidate_repo`, `candidate_revision`,
+  `candidate_license` for `pinned-huggingface`, `base_repo`, `base_revision`)
+  and immediately self-verifying the published bytes.
 - `"verify-adapter"`: requires external `adapterPath` and optional `verifyPolicy`
   (`expectedSha256`, `expectedEnvelope`, `requireNpuFriendly`,
   `requireNoGroupedSsm`, `maxAllowedRank`), verifying GGUF v3 structure, dual
@@ -101,10 +109,46 @@ via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
   into one canonically ordered, alpha-renormalized, verified GGUF at fresh
   external `outputPath` for resumable chunked `DR-E1` extraction.
 - `"edit-adapter"`: applies pure-Rust algebraic direct weight edits (`editConfig`:
-  `targetMaxRank`, `perSiteRanks`, `globalGain`, `familyScales`, `layerMin`/`layerMax`,
-  `depthGainStart`/`depthGainEnd`, `layerGains`, `maxSiteFrobeniusNorm`,
-  `orthogonalizeAgainstRankOnePath`, `exportDtype`) to an existing multi-rank
-  GGUF (`adapterPath`) and publishes a verified GGUF at fresh `outputPath`.
+  `targetMaxRank`, `perSiteRanks`, `dropModes`, `modeWeights`,
+  `pruneKeepNumerator`/`pruneKeepDenominator` with `pruneTarget` in `"a"`,
+  `"b"`, `"both"`, `minCoeffAbs`, `globalGain`, `familyScales`,
+  `layerMin`/`layerMax`, `depthGainStart`/`depthGainEnd` with `depthGainCurve`
+  in `"linear"`, `"cosine"`, or `"power"` + `depthGainExponent`, `layerGains`,
+  `minSiteFrobeniusNorm`/`maxSiteFrobeniusNorm`, `lsLoraReferenceAdapterPath` +
+  `lsLoraMinCosine`, `cansNeuronScales`, `orthogonalizeAgainstRankOnePath` +
+  `orthogonalizeSide`, `orthogonalizeAgainstAdapterPath` +
+  `orthogonalizeAdapterSide`, `alphaEditNullSpaceRidge`, `exportDtype`) to an
+  existing multi-rank GGUF (`adapterPath`) and publishes a verified GGUF
+  (`bonsai.composition.edit_method = "algebraic-multi-rank-edit-v1"`) at fresh
+  `outputPath`.
+- `"reallocate-ranks"`: performs equal-byte KL-gap and Softmax-Fisher exact
+  multiple-choice knapsack variable-rank reallocation (`reallocateConfig`:
+  `maxPayloadBytes`, `minRank`, `maxRank`, `candidateRanks`, `exportDtype`,
+  `diagnosticPromptSha256s`, `thinkingOffPenaltyWeight`, `siteSensitivities`)
+  on `adapterPath` and publishes a verified GGUF at fresh `outputPath`.
+- `"fold-patch"`: folds or appends `1..=64` rank-one patches (`foldPatchConfig`:
+  `mode` in `"append"` or `"fold-svd"`, `targetMaxRank`, `exportDtype`,
+  `diagnosticPromptSha256s`, `patches` entries of `kind: "weight-patch-file"`
+  with `patchPath`/optional `patchScale` or `kind: "inline-rank-one"` with
+  `target`, `a`, `b`, `scale`) onto optional `adapterPath` and publishes a
+  verified GGUF at fresh `outputPath`.
+- `"realign-factors"`: performs closed-form Cholesky/Jacobi Tikhonov ridge
+  manifold realignment (`realignConfig`: `mode` in `"realign-b"`, `"realign-a"`,
+  or `"alternating-ab"` with `alternatingSteps` in `1..=6`, `ridge`,
+  `allowDevelopmentRegression` defaulting to `false` fail-closed, `exportDtype`,
+  `timeBudgetMilliseconds`, `diagnosticPromptSha256s`, and `1..=16` `sites`
+  with `target` and disjoint fit/development `rows` or `rowsPath`) on
+  `adapterPath` and publishes a verified GGUF at fresh `outputPath` unless
+  quantized development MSE regresses.
+- `"import-peft-lora"`: imports a native PEFT `safetensors` + `adapter_config.json`
+  checkpoint (`peftConfig`: `source` `"local-directory"` or
+  `"pinned-huggingface"` with `repository`, `revision`, `license`, optional
+  `configFilename`/`weightsFilename`, `targetEnvelope` excluding `"all"`,
+  `maxRank` in `1..=64`, `exportDtype`, `maxPayloadBytes`, optional
+  `orthogonalizeAgainstRankOnePath` / `orthogonalizeAgainstAdapterPath`),
+  filtering vision/`mmproj`/`ssm_out`, projecting out reference subspaces,
+  compressing over-rank sites via exact thin QR + Jacobi SVD, and publishing a
+  verified GGUF at fresh `outputPath`.
 - `"generate-test-adapter"`: builds a deterministic offline synthetic multi-rank
   GGUF fixture (`scope.layers`, `scope.targetEnvelope`, `scope.exportDtype`,
   `scope.maxRank`) at fresh external `outputPath` and self-verifies it for
@@ -117,10 +161,37 @@ via bounded HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
   `bonsai-cpu-policy`, and writes a candidate DaisyRose lock at fresh external
   `outputPath`.
 - `"dr-g2-plan"` / `"dr-g2-score"`: emits the canonical `DR-G2` three-way
-  screen contract/template (optional `screenConfig` and `outputPath`) and scores
-  `evidencePath` fail-closed across capability gain, Thinking-ON `<= 1.10x`
-  anti-looping, Thinking-OFF creative/Orca non-regression, split disjointness,
-  and zero-scale bit identity.
+  screen contract/template (`screenConfig`: `baseModel` in `"swift-pq2"`,
+  `"nariq-2.5bpw"`, `"nariq-3.0bpw"`, `"nariq-2.0bpw"`, where NariQ requires
+  `orcaAdapterSha256: null` and `orcaScale: 0.0`; `includeMultimodalChecks`;
+  `candidateAdapterSha256`; `candidateMaxRank`; `candidateTargetCount`;
+  `scaleGrid`; plus optional `outputPath`) and scores `evidencePath` fail-closed
+  across capability gain, Thinking-ON `<= 1.10x` anti-looping, Thinking-OFF
+  creative/Orca non-regression, optional `Selective-RL` `multimodalPrompts`
+  (`visualGroundingPreserved` / `>= 3.0` floor), split disjointness, and
+  zero-scale bit identity.
+- `"dr-g2-blind-packet"` / `"dr-g2-apply-reviews"`: `dr-g2-blind-packet` reads
+  `evidencePath` plus `blindConfig` (`responsesPath`, `blindKeyPath`, optional
+  `blindSalt`) to emit a deterministically swapped `armA`/`armB` review packet at
+  `outputPath` and an integrity-hashed unblinding key (`integritySha256`) at
+  `blindKeyPath`; `dr-g2-apply-reviews` reads `evidencePath` plus `applyConfig`
+  (`reviewPath`, `blindKeyPath`), verifies text/key digests, unblinds
+  `humanReviewed: true` scores into `outputPath`, and scores fail-closed via
+  `dr-g2-score`.
+- `"dr-g2-capture"`: native Windows capture (`captureConfig`: `serverPath`,
+  `modelPath`, optional `orcaAdapterPath`, `candidateAdapterPath`, `baseModel`,
+  `selectedScale`, `scaleGrid`, `candidateMaxRank`, `candidateTargetCount`,
+  `rowWorkers`, `kvCache`, `contextTokens`, `cpuPrefillTokens`, `placement`,
+  `timeBudgetSeconds` in `30..=900`, `responsesOutputPath`,
+  `trainingPromptSha256s`, `zeroScaleControls`, `thinkingOnPrompts`,
+  `thinkingOffPrompts`) that acquires a thread-local
+  `bonsai_windows_process::SystemAwakeGuard` (`SetThreadExecutionState`
+  `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` restored to `ES_CONTINUOUS` on drop) to
+  inhibit idle system sleep (`sleepInhibitionActive: true`), supervises two
+  owned `prism-inference-server` Jobs over loopback HTTP, records per-arm
+  `GetSystemPowerStatus` snapshots (`armPowerObservations`), detects repetition
+  loops, and writes `DrG2Evidence` (`outputPath`) and optional blinded
+  responses (`responsesOutputPath`).
 
 `ffn-plan` screens the packed-payload envelope of an explicit structured FFN
 omission plan without reading a model or choosing important sites. Supply

@@ -903,9 +903,9 @@ resolves grouped-SSM channel order), with **pure-Rust direct weight editing (`DR
 as the remediation path only if the unedited stacked LoRA fails `DR-G2`. Direct
 quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary in
 [model selection](docs/model-selection.md#selection-boundary). Checked-in
-`bonsai-tools lora-diff-audit` (including spectral denoising, `export-denoised`
-and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
-(`source-checks`, `foundation`) acceptance.
+`bonsai-tools lora-diff-audit`, `bonsai_windows_process::SystemAwakeGuard`, and
+`https_transfer::fetch_range` still require owning CI (`source-checks`,
+`foundation`) acceptance.
 
 - [ ] **DR-E1 — Extract full 64-layer zero-retraining spectral-denoised `npu-friendly` LoRA and verify in pure Rust.**
   Run `bonsai-tools lora-diff-audit` `operation: "export-denoised"` across all
@@ -916,10 +916,11 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   `timeBudgetSeconds <= 900`, add pure-Rust layer-chunked GGUF merge rather than
   inflating inference trials), then verify finiteness, dual alpha equality, and
   NPU/SSM bounds with `verify-adapter`. Local pure-Rust `merge-adapters` &
-  `edit-adapter` (`937b27c0`), full 64-layer chunked extraction (`r = 32`,
-  `133,326,912` bytes, SHA-256 `8820b56a...`), offline `r = 16` derivation
-  (`66,930,944` bytes, `128` pairs, SHA-256 `1b850494...`), and `verify-adapter`
-  verification are complete locally
+  `edit-adapter` (`937b27c0`), `export-denoised` `shrinkageMode`/`shrinkageBlend`
+  (`"gavish-donoho"`, `"unshrunk"`, `"blended"`, `12c28ee0`), full 64-layer
+  chunked extraction (`r = 32`, `133,326,912` bytes, SHA-256 `8820b56a...`),
+  offline `r = 16` derivation (`66,930,944` bytes, `128` pairs, SHA-256
+  `1b850494...`), and `verify-adapter` verification are complete locally
   ([DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md));
   immutable remote hosting and owning CI remain open.
 - [ ] **DR-G2 — Direct-stack three-way empirical screen on `Swift-Bonsai-2` + Orca `1.3`.**
@@ -931,18 +932,25 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   require (1) Thinking-ON coding/reasoning/IF gain over `scale = 0.0` with zero
   category regression, (2) Swift anti-looping preservation (`<= 1.10x` thinking
   tokens, zero extra loops or `4,096`-token truncations), (3) Thinking-OFF
-  creative prose & Orca non-regression, and (4) zero-scale bit identity. If it
-  passes as-is, skip `DR-W1` and proceed directly to `DR-C1`/`DR-C2`; if it
-  fails, capture exact per-category/prompt failure modes for `DR-W1`. Pure-Rust
-  `dr-g2-plan`/`dr-g2-score` tooling (`574b961a`) is checked in, and closed local
+  creative prose & Orca non-regression (plus `multimodalPreservation` when
+  enabled), and (4) zero-scale bit identity. If it passes as-is, skip `DR-W1`
+  and proceed directly to `DR-C1`/`DR-C2`; if it fails, capture exact
+  per-category/prompt failure modes for `DR-W1`. Pure-Rust
+  `dr-g2-plan`/`dr-g2-score` (`574b961a`), `BaseModelProfile` NariQ profiles,
+  `Selective-RL` `includeMultimodalChecks`/`multimodalPrompts`, integrity-hashed
+  blinded review (`dr-g2-blind-packet` / `dr-g2-apply-reviews`, `3f4b0b8d`),
+  `bonsai_windows_process::SystemAwakeGuard` (`14fb0c70`,
+  `SetThreadExecutionState`), and the native sleep-inhibited two-server
+  `dr-g2-capture` harness (`0dd8a7e8`) are checked in locally. Closed local
   `prism-inference-server` runs verified bit-exact `scale = 0.0` parity on
   `zero-ctrl-001` (`51` tokens, `cb08876d...`) alongside partial captures
   (`1/8` pairs on battery CPU, `2/8` pairs on `28d47fe` AC `900 s` ceiling, and
   `1/4` pairs on `91298a4c` AC before host Windows suspend exceeded `900 s`;
   [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md)).
   Awake AC-powered 4-category completion (`coding`, `reasoning`,
-  `instruction-following`, `creative-prose`) with sleep inhibition and blinded
-  human review (`humanReviewed: true`) remain open.
+  `instruction-following`, `creative-prose`) using `dr-g2-capture`, blinded
+  owner review (`humanReviewed: true`), and fail-closed `dr-g2-score` pass
+  remain open.
 - [ ] **DR-W1 — Conditional pure-Rust direct weight editing on the multi-rank LoRA if `DR-G2` fails (zero retraining).**
   Triggered only if the unedited `DR-E1` stack fails `DR-G2`; keep
   `Swift-Bonsai-2`'s packed ternary base immutable and stay inside `npu-friendly`
@@ -968,10 +976,18 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   re-verify with `verify-adapter`, and re-score fail-closed with `dr-g2-score`;
   if bounded direct edits still fail `DR-G2`, record the no-go outcome and
   leave `config/daisyrose-lora.lock.json` unpinned.
-  (Pure-Rust `calibration_metrics` KL-gap / Softmax-Fisher / exact MCKP helpers
-  and `bonsai-tools lora-diff-audit` `reallocate-ranks` plus `edit-adapter`
-  `perSiteRanks`/`layerGains` landed locally with synthetic unit controls; conditional `DR-G2`
-  trigger and X1/X2 device qualification remain open.)
+  (All pure-Rust `DR-W1` editing engines landed locally with unit controls:
+  `export-denoised` `shrinkageMode`/`shrinkageBlend` (`12c28ee0`),
+  `edit-adapter` algebraic levers `dropModes`/`modeWeights`, rational & threshold
+  pruning (`pruneKeepNumerator`/`pruneKeepDenominator`/`pruneTarget`/`minCoeffAbs`),
+  `depthGainCurve` (`linear`/`cosine`/`power`/`depthGainExponent`), norm bounds,
+  `LS-LoRA` (`lsLoraReferenceAdapterPath`/`lsLoraMinCosine`), `CANS`
+  (`cansNeuronScales`), and `AlphaEdit`/multi-rank orthogonalization (`86b318fd`),
+  `calibration_metrics` KL-gap/Softmax-Fisher/MCKP `reallocate-ranks`,
+  `fold-patch` (`append` & `fold-svd`, `e17d2c96`), and `realign-factors`
+  (`realign-b`/`realign-a`/`alternating-ab` Tikhonov ridge with fail-closed
+  `allowDevelopmentRegression` gate, `60a0591c`); conditional `DR-G2` trigger,
+  X1/X2 device qualification, and owning CI remain open.)
 - [ ] **DR-C1 — Extend `prism-inference` for stackable `MultiRankAdapter` after `DR-G2` passes.**
   Generalize `prism-inference` (`src/model/lora.rs`) beyond rank-1
   `RankOneAdapter` to support a stackable `MultiRankAdapter` alongside
@@ -980,16 +996,23 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   64 layers, scalar/NEON/tiled-prefill parity and `swift_model_check rollback`
   bit-exact state before repinning Prism. Local `..\prism-inference` source
   wiring (`39ae592`, `4c49f6f`, `5aab2f4`, `7d63f8a`), green Foundation `main`
-  (`91298a4c`), unit/example checks, bounded 27B `scale = 0.0` parity vets, an
-  offline AC-powered 27B 4-layer `:0.0`/`:0.5` vet (`33.875 s`), and full
+  (`91298a4c`, shipped in `0.1.34`), `examples/swift_model_check` `--nariq` &
+  `--multi-rank-adapter` across `trajectory`/`request-timing`/`ffn-timing`
+  (`7fe4bbf`), Adreno Vulkan per-site heterogeneous rank staging & scratch
+  layout (`tools/adreno-vulkan/src/graph.rs` `prepare_adapters_upload`,
+  `51a5a84`), sparse heterogeneous Hexagon fusion / `rsq4kvf` / NariQ trellis /
+  folded speculation parity tests (`src/graph.rs`, `prefill_ffn_tests.rs`,
+  `prefill_folded_tests.rs`, `51a5a84`), bounded 27B `scale = 0.0` parity vets,
+  an offline AC-powered 27B 4-layer `:0.0`/`:0.5` vet (`33.875 s`), and full
   64-layer (`128`-pair `daisyrose-npu-r16.gguf`) parity / perturbation /
   rollback / matched-AC overhead vets (`138.61 s` on battery; `48.518 s` /
   `5.07%` mean overhead on `28d47fe`; `65.152 s` / **`3.16%` mean / `3.56%`
   median overhead** `<= 10%`, `+74.05 MiB` WS / `+74.20 MiB` private RAM,
   bit-exact `0.0`, `6/6` rollback on `91298a4c`;
   [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md))
-  are complete locally; Prism `v0.1.34+` release bundle publication and lock
-  repin remain open pending `DR-G2` human review and hosting.
+  are complete locally; publishing a Prism `v0.1.35+` release bundle containing
+  the NariQ + `7fe4bbf`/`51a5a84` updates, lock repin, `DR-G2` human review,
+  and remote hosting remain open.
 - [ ] **DR-C2 — Wire Runner lockfile, memory accounting, UI controls and qualification gates.**
   Pin the verified adapter in `config/daisyrose-lora.lock.json`, charge exact
   factor payload (`4.00 MiB/rank` F16) and multi-rank scratch in
@@ -1006,12 +1029,19 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   `daisyrose-lora` with `verify_multi_rank_lora_gguf`, `chat_launch::setup`
   auto-setup hook + `bonsai-chat` startup progress stage, `--no-daisyrose-lora`
   across CLI/`chat_launch`/`chat_package`/`bonsai-chat`/`bonsai-broker`,
-  and promoted default-on broker/UI plumbing (lock `effective_default_scale_*`
-  helpers, broker promoted-pin auto-resolution, exact lock-digest enforcement,
-  tight-RAM shedding, default-scale request policy and readiness reporting,
-  and fresh/new-conversation UI initialization preserving saved workspaces)) are
-  complete; `config/daisyrose-lora.lock.json`, `MULTI_RANK_LORA_RELEASE`
-  enablement, physical X1 matched-power throughput/RAM qualification, awake
+  promoted default-on broker/UI plumbing with `MULTI_RANK_LORA_RELEASE` already
+  enabled on pinned Prism `0.1.34` (`REVIEWED_0_1_34`, `c64c9648...`),
+  NariQ-base lock resolution (`daisyrose_lora_artifact_for_base_sha256` &
+  `DaisyRoseLoraArtifact::for_nariq_lock`) and rank budget estimation
+  (`MultiRankAdapterBudget::for_npu_friendly_rank`) (`7091d129`), broker
+  `Placement::Composite` AppContainer readonly Hexagon fix, NariQ PQ2
+  auto-attach guard, and `Vulkan`/`Composite` suffix-speculation readiness
+  checks (`449d97e9`), and native UI loaded rank/fingerprint display
+  (`Loaded: rank ≤<rank> · <prefix>`) plus `+ <N> MiB DaisyRose` footprint
+  diagnostics (`418c123b`) are complete locally; `config/daisyrose-lora.lock.json`
+  (`pinned_daisyrose_lora_artifact`), Prism `v0.1.35+` release publication and
+  repin for NariQ (`NARIQ_TRELLIS_RELEASE`) + `DR-C1` updates (`7fe4bbf`,
+  `51a5a84`), physical X1/X2 matched-power throughput/RAM qualification, awake
   4-category `DR-G2` + held-out human review, and owning CI remain open.
 - [ ] **DR-Alt — Conditional alternative Qwen3.8-27B donor & quantization-residual `MultiRankAdapter` lane.**
   Using `MultiRankAdapter` without retraining Swift's ternary base, audit and
@@ -1022,20 +1052,30 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   `qwen3.8-max-distillation-50k`), and `SVDQuant`/`Recover-LoRA`/`OnQ`/`OnlineQAT`
   quantization-residual adapters (fitting against Swift's own rollouts or projecting
   orthogonal to Swift's merged anti-overthinking subspace rather than naively
-  subtracting `W_Qwen3.8 - dequant(W_Swift)`). Require license/revision audit,
-  `verify-adapter` NPU bounds, `Selective-RL` `mmproj` checks and full `DR-G2` scoring.
+  subtracting `W_Qwen3.8 - dequant(W_Swift)`). Generic `SourceSpec`
+  `"pinned-huggingface"` diff auditing (`5264193c`), pure-Rust
+  `import-peft-lora` PEFT `safetensors` intake/orthogonalization/Jacobi-SVD
+  compression (`ccf75998`), and `Selective-RL` `multimodalPrompts` checks
+  (`3f4b0b8d`) landed locally; license/revision audits, `verify-adapter` NPU
+  bounds, empirical `DR-G2` scoring, and device qualification remain open.
 - [ ] **NQ-1 — Opt-in `Qwen3.8-27B-NariQ-GGUF` (`2.0bpw` / `2.5bpw` / `3.0bpw`) native trellis representation + DaisyRose stackability.**
   Source wiring is complete across `..\prism-inference` (trellis `TRL1..=TRL6` /
   `TrellisBandedHead` / `token_embd.vocab_gather` `embed_bands=16` fixes,
   `Representation::{NariQ2_5Bpw, NariQ3_0Bpw, NariQ2_0Bpw}`, `swift_state`,
-  `swift_chat`, `swift_session` calibrated headroom, and `prism-inference-server --nariq`)
+  `swift_chat`, `swift_session` calibrated headroom, `prism-inference-server --nariq`,
+  `swift_model_check --nariq` + `--multi-rank-adapter` across `trajectory` /
+  `request-timing` / `ffn-timing` (`7fe4bbf`), and 4-layer trellis heterogeneous
+  `MultiRankAdapter` + `rsq4kvf` parity (`51a5a84`))
   and `SwiftBonsai2Runner` (`config/nariq-qwen38.lock.json`,
-  `bonsai-cpu-policy::{nariq, context}`, `bonsai-broker` `--nariq` policy/artifacts/identity,
-  and `bonsai-tools` CLI/`provision`/`chat_launch`), keeping `Swift-Bonsai-2-PQ2_0`
+  `bonsai-cpu-policy::{nariq, context}`, `DaisyRoseLoraArtifact::for_nariq_lock`
+  (`7091d129`), `bonsai-broker` `--nariq` policy/artifacts/identity and
+  PQ2 auto-attach guard (`449d97e9`), `dr-g2-plan`/`dr-g2-score`/`dr-g2-capture`
+  `BaseModelProfile::Nariq*` support (`3f4b0b8d`, `0dd8a7e8`), and
+  `bonsai-tools` CLI/`provision`/`chat_launch`), keeping `Swift-Bonsai-2-PQ2_0`
   + Orca as the unchanged default while stacking NariQ cleanly with
   `MultiRankAdapter` (DaisyRose) and Prism `K4/V4` (`rsq4`), and rejecting
   `abliterate_lora`, GPU/NPU offload, and `mmproj`. Remaining open: publishing
-  a compatible Prism release bundle and enabling `NARIQ_TRELLIS_RELEASE`, owning
+  a Prism `v0.1.35+` release bundle and enabling `NARIQ_TRELLIS_RELEASE`, owning
   CI (`source-checks`, `foundation`), verifying DaisyRose (`DR-G2`) compatibility
   on NariQ vs Swift-Bonsai-2, and matched-power X1/X2 throughput/RAM and held-out
   creative/coding quality comparisons across `2.0bpw`, `2.5bpw`, `3.0bpw`, and `PQ2_0`.

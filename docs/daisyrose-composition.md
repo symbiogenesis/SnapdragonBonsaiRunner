@@ -101,6 +101,10 @@ shrinkage**:
    with `β = min(m, n) / max(m, n)`, hard-threshold `y_i <= 1 + sqrt(β)`, and
    shrink surviving spikes by
    `η_F*(y_i; β) = sqrt((y_i^2 - β - 1)^2 - 4β) / (y_i * (1 + sqrt(β))) * bulk_edge`.
+   For `export-denoised` gain sensitivity testing, `scope.shrinkageMode` selects
+   `"gavish-donoho"` (default), `"unshrunk"`, or `"blended"` (interpolating
+   `(1 - alpha) * sigma + alpha * shrunk` via `scope.shrinkageBlend` in
+   `0.0..=1.0`, recorded in GGUF metadata `bonsai.composition.shrinkage_mode`).
 4. **Tail saturation guard**: If `σ_k > effective_bulk_edge` at the maximum
    sketch rank (`tailSaturated = true`), the spectrum has a power-law tail
    extending beyond the truncated rank rather than an isolated finite-rank spike
@@ -119,8 +123,8 @@ shrinkage**:
    tensors across both models transfers `29,527,900,160` bytes (`27.50 GiB`,
    `13.75 GiB` per model). Keep offline extraction (`local-directories` over
    pre-fetched safetensors shards, a dedicated `export-denoised` pass decoupled
-   from inference timers, or layer-chunked extraction merged into one GGUF in
-   pure Rust if live Hugging Face Range I/O exceeds
+   from inference timers, or layer-chunked extraction joined via pure-Rust
+   `merge-adapters` if live Hugging Face Range I/O exceeds
    `controls.timeBudgetSeconds <= 900`) strictly separate from owner-device
    inference qualification clocks.
 
@@ -129,16 +133,47 @@ shrinkage**:
 1. Verify the extracted full 64-layer GGUF via `bonsai-tools lora-diff-audit`
    `operation: "verify-adapter"`.
 2. Stack the unedited LoRA directly on `Swift-Bonsai-2-PQ2_0.gguf` + pinned Orca
-   `1.3` via `--publisher-engine` `--lora-scaled` across a scale grid starting
-   at `0.0` (for example `[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`; `dr-g2-plan`
-   and `dr-g2-score` accept any strictly increasing grid in `[0.0, 2.0]`, and
-   scales `> 1.0` are directly relevant given `relDelta ~ 0.0005–0.0018` and
-   Gavish–Donoho shrinkage).
+   `1.3` (or opt-in `NariQ` without Orca) across a scale grid starting at
+   `0.0` (for example `[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`; `dr-g2-plan`,
+   `dr-g2-capture`, and `dr-g2-score` accept any strictly increasing grid in
+   `[0.0, 2.0]`, and scales `> 1.0` are directly relevant given
+   `relDelta ~ 0.0005–0.0018` and Gavish–Donoho shrinkage):
+   - **Native sleep-inhibited capture (`dr-g2-capture`):** Spawns two owned
+     `prism-inference-server` child Jobs (`Server A` baseline vs `Server B`
+     with `--daisyrose-lora`, `--daisyrose-lora-bytes`, and
+     `--daisyrose-lora-sha256`) on numeric loopback while acquiring
+     `bonsai_windows_process::SystemAwakeGuard` (a `!Send + !Sync` thread-local
+     RAII wrapper around `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`
+     restored to `ES_CONTINUOUS` on drop) so idle Windows suspend cannot abort
+     multi-category captures (`sleepInhibitionActive: true`), recording overall
+     and per-arm `GetSystemPowerStatus` snapshots (`armPowerObservations`),
+     `thinkingTokens`, `hit4096Truncation`, `detect_repetition_loop`
+     (`loopDetected`), `DrG2Evidence` (`outputPath`), and optional
+     `responsesOutputPath`.
+   - **Blinded owner review (`dr-g2-blind-packet` / `dr-g2-apply-reviews`):**
+     `dr-g2-blind-packet` (`blindConfig`: `responsesPath`, `blindKeyPath`,
+     optional `blindSalt`) hashes `dr-g2-blind-v1` + `contractSha256` +
+     `promptId` + `blindSalt` to randomize `armA`/`armB` placement alongside an
+     integrity-hashed unblinding key (`integritySha256`); `dr-g2-apply-reviews`
+     (`applyConfig`: `reviewPath`, `blindKeyPath`) verifies text and key
+     digests, populates `humanReviewed: true` back into `DrG2Evidence`, and runs
+     `dr-g2-score` fail-closed.
+   - **Base-profile and `Selective-RL` multimodal options:** `dr-g2-plan`
+     (`screenConfig`) and `dr-g2-score` support `baseModel`
+     (`BaseModelProfile`: `"swift-pq2"` default, `"nariq-2.5bpw"`,
+     `"nariq-3.0bpw"`, `"nariq-2.0bpw"` — where NariQ profiles validate against
+     `NariqVariant::sha256()` and require `orcaAdapterSha256: null` and
+     `orcaScale: 0.0`, also supported by `dr-g2-capture`), plus
+     `includeMultimodalChecks: true` / `multimodalPrompts`
+     (`MultimodalPromptPair` carrying `imageSha256` and
+     `visualGroundingPreserved` under a `>= 3.0` median/floor
+     `multimodalPreservation` gate).
 3. Score fail-closed with `dr-g2-score` (`trainingPromptSha256s: []` for the
    unedited extraction).
 4. **Branching decision**:
-   - If the unedited direct stack passes all four `DR-G2` gates, **skip `DR-W1`**
-     and advance directly to `DR-C1` / `DR-C2`.
+   - If the unedited direct stack passes all four `DR-G2` gates (plus
+     `multimodalPreservation` when enabled), **skip `DR-W1`** and advance
+     directly to `DR-C1` / `DR-C2`.
    - If it fails, record exact per-category and per-prompt failure modes (e.g.,
      weak/muted signal, overthinking/cognitive looping, creative/Orca
      interference, or layer/numerical instability) and enter `DR-W1`.
@@ -153,52 +188,90 @@ GPU/gradient retraining). Ordered levers mapped to diagnosed `DR-G2` failures
 (following [weight-space programming](weight-space-programming.md)):
 
 1. **Algebraic factor & spectral edits (zero activation capture)**:
-   - Adjust rank (`r = 16 -> 32`), Gavish–Donoho shrinkage / `minSpikeRatio` /
-     unshrunk-spike retention, per-family multipliers (`ffn_down` vs
-     `attn_q`/`attn_k`/`attn_v`/`attn_output`), sparse per-layer `layerGains`,
-     and layer-depth masks/tapers (for example, attenuating noisy early layers
-     while emphasizing high-SNR late reasoning layers such as `blk.63.ffn_down`
-     `14.92x` and `blk.63.attn_output` `11.61x`, or applying cosine-similarity
-     layer selection per `LS-LoRA`).
-   - Surgically drop or re-weight singular modes `(u_k, v_k)`, cap per-site
-     norms, and prune small coefficients inside `(A, B)` (generalizing
-     `bonsai-tools adapter-edit` to multi-rank GGUF); evaluate `CANS` closed-form
-     neuron scaling, `Attention Residuals` depth steering, and `AlphaEdit`
-     null-space projection where uniform scaling conflicts with preserved skills.
-   - Orthogonalize DaisyRose factors against pinned Orca rank-1 factors at
-     overlapping `ffn_down`/`attn_*` sites (projecting DaisyRose `B` or `A`
-     columns orthogonal to Orca so stacked adapters do not cancel or conflict at
-     Orca `scale = 1.3`).
+   - Adjust rank (`r = 16 -> 32`) and shrinkage (`scope.shrinkageMode`:
+     `"gavish-donoho"`, `"unshrunk"`, `"blended"` with `scope.shrinkageBlend`,
+     plus `scope.minSpikeRatio`) via `export-denoised`.
+   - Apply pure-Rust algebraic factor edits via `bonsai-tools lora-diff-audit`
+     `operation: "edit-adapter"` (`editConfig` -> `EditAdapterConfig`, which
+     renormalizes dual alpha keys `adapter.lora.alpha` and `adapter.lora_alpha`
+     to `max_new_rank`, writes `bonsai.composition.edit_parent_sha256` and
+     `bonsai.composition.edit_method = "algebraic-multi-rank-edit-v1"`, and
+     self-verifies the GGUF via `verify_published_adapter`):
+     - **Rank & mode controls:** `targetMaxRank` (`1..=64`), `perSiteRanks`
+       (`0..=64`, `0` drops the site), `dropModes` (`0..64`), and `modeWeights`
+       (`[0.0, 100.0]`).
+     - **Gains, layer masks & `Attention Residuals` depth steering:**
+       `globalGain` (`(0.0, 100.0]`), `familyScales` (`ffn_down` vs
+       `attn_q`/`attn_k`/`attn_v`/`attn_output`), `layerMin`/`layerMax` (`0..64`),
+       sparse per-layer `layerGains` (`0..64` -> `[0.0, 100.0]`), and
+       `depthGainStart`/`depthGainEnd` with `depthGainCurve` (`"linear"`,
+       `"cosine"`, or `"power"` with `depthGainExponent` in `0.25..=8.0`) to
+       attenuate noisy early layers while emphasizing high-SNR late reasoning
+       layers such as `blk.63.ffn_down` (`14.92x`) and `blk.63.attn_output`
+       (`11.61x`).
+     - **Magnitude pruning, norm bounds & `LS-LoRA` site selection:**
+       `pruneKeepNumerator`/`pruneKeepDenominator` (`1 <= num <= denom <= 1024`)
+       with `pruneTarget` (`"a"`, `"b"`, `"both"`), `minCoeffAbs`,
+       `minSiteFrobeniusNorm`/`maxSiteFrobeniusNorm`, and `lsLoraReferenceAdapterPath`
+       + `lsLoraMinCosine` (`-1.0..=1.0`) for `LS-LoRA` cosine-similarity filtering.
+     - **`CANS` neuron scaling & Orca / `AlphaEdit` subspace orthogonalization:**
+       `cansNeuronScales` (per-site input-neuron scales matching `in_features` on
+       `A` rows), `orthogonalizeAgainstRankOnePath` (e.g., pinned Orca rank-1 GGUF)
+       with `orthogonalizeSide` (`"b"`, `"a"`, `"both"`),
+       `orthogonalizeAgainstAdapterPath` (multi-rank reference GGUF) with
+       `orthogonalizeAdapterSide` (`"b"`, `"a"`, `"both"`), and
+       `alphaEditNullSpaceRidge` (`>= 0.0`) for `AlphaEdit` Tikhonov null-space
+       projection; `exportDtype` selects `"f16"` or `"f32"`.
 2. **Closed-form activation-guided weight-space edits (pure-Rust linear algebra
    / convex LP on bounded `Swift-Bonsai-2` activations — zero gradient
    retraining)**:
    - Apply equal-byte per-site KL-gap and Softmax-Fisher variable-rank
-     reallocation (following
+     reallocation via `operation: "reallocate-ranks"` (`reallocateConfig` ->
+     `ReallocateRanksConfig`, following
      [LookAtMyQuant sensitivity allocation](research-register.md#small-edits-around-cheaper-execution)):
      instead of uniform `r = 16` across all 128 `npu-friendly` sites
      (`64 MiB` F16), score each site on disjoint diagnostic splits by isolated /
      leave-one-out KL gap (`KL(all) - KL(site = 0)`) and token-weighted output
      Softmax-Fisher (`E[p_v(1 - p_v)]`), separating Thinking-ON coding/reasoning
-     gain from Thinking-OFF creative/Orca drift. Reallocate variable per-site
+     gain from Thinking-OFF creative/Orca drift. Exact multiple-choice knapsack
+     selection (`maxPayloadBytes`, `minRank`/`maxRank`, `candidateRanks`,
+     `thinkingOffPenaltyWeight`, `siteSensitivities`) reallocates variable per-site
      rank (`r = 0..32`, bounded to `<= 64 MiB` total F16 payload inside
      `npu-friendly` and `MultiRankAdapter`) toward high-SNR late reasoning
-     layers (such as `blk.63.ffn_down` `14.92x` and `blk.63.attn_output`
-     `11.61x`) while zeroing or trimming noisy or prose-interfering early sites.
-     Record all diagnostic prompt digests in `trainingPromptSha256s` so final
-     held-out `DR-G2` splits remain untouched.
+     layers while zeroing or trimming noisy or prose-interfering early sites.
+     Record all diagnostic prompt digests in `diagnosticPromptSha256s` and
+     `trainingPromptSha256s` so final held-out `DR-G2` splits remain untouched.
    - Apply targeted behavioral remediation via `bonsai-tools weight-patch` (PDHG
      sparse LP `u * (v^T * h)` on original-basis activations, compared against a
      constant residual steering baseline `x + β d` per
-     [practical investigation order](weight-space-programming.md#practical-investigation-order)),
-     folded or appended directly into the multi-rank DaisyRose GGUF at selected
-     `ffn_down` sites to eliminate diagnosed cognitive looping, unwanted
-     refusals, or Thinking-OFF prose drift.
-   - Apply closed-form ridge / least-squares `B` or `A` manifold realignment
-     (reusing the algebraic dual-ridge solver pattern from
-     `bonsai-tools ffn-surrogate`) on small bounded `Swift-Bonsai-2`
-     hidden-state captures (`min ||B (A^T X_swift) - Y_target||_F^2 + λ ||Δ||_F^2`)
-     if the QAT ternary manifold gap misaligns or attenuates BF16-extracted
-     factors.
+     [practical investigation order](weight-space-programming.md#practical-investigation-order))
+     and fold/append those patches directly into the multi-rank DaisyRose GGUF via
+     `operation: "fold-patch"` (`foldPatchConfig` -> `FoldPatchConfig`): accepts
+     optional `adapterPath`, `diagnosticPromptSha256s`, `exportDtype`,
+     `targetMaxRank` (`1..=64`), `mode` (`"append"` -> `"activation-fold-append-v1"`
+     or exact thin-QR + Jacobi-SVD compression `"fold-svd"` ->
+     `"activation-fold-svd-v1"`), and `1..=64` `patches` entries (`"weight-patch-file"`
+     referencing schema-1 `"experimental-ffn-rank-one-patch"` JSON with `patchPath` /
+     optional `patchScale`, or `"inline-rank-one"` with `target`, `a`, `b`, `scale`),
+     recording `bonsai.composition.fold_parent_sha256` and
+     `bonsai.composition.fold_method`.
+   - Apply closed-form Tikhonov ridge manifold realignment via
+     `operation: "realign-factors"` (`realignConfig` -> `RealignFactorsConfig`) on
+     bounded `Swift-Bonsai-2` hidden-state captures
+     (`min ||B (A^T X_swift) - Y_target||_F^2 + λ ||Δ||_F^2`) if the QAT ternary
+     manifold gap misaligns or attenuates BF16-extracted factors: solves exact
+     Cholesky/Jacobi updates across `1..=16` `sites` (`target` + inline `rows` or
+     `rowsPath` up to `48 MiB`, `3..=256` rows with `>= 2` `"fit"` and `>= 1`
+     `"development"` rows and disjoint `sampleId`/`groupId`/inputs) using
+     `mode` in `"realign-b"` (`"activation-ridge-realign-b-v1"`), `"realign-a"`
+     (`"activation-ridge-realign-a-v1"`), or `"alternating-ab"`
+     (`"activation-ridge-alternating-ab-v1"` with `alternatingSteps` `1..=6`),
+     `ridge` (`1e-8..=1e6`), `timeBudgetMilliseconds` (`1..=30000`),
+     `diagnosticPromptSha256s`, `exportDtype`, and fail-closed
+     `allowDevelopmentRegression` (default `false` — rejects publication as
+     `"development-regression-rejected"` if target-dtype quantization regresses
+     development MSE), recording `bonsai.composition.realign_parent_sha256` and
+     `bonsai.composition.realign_method`.
 
 **Split discipline and stop criteria**: Any prompts used to diagnose failures or
 fit LP/ridge edits must remain strictly disjoint from final held-out `DR-G2`
@@ -223,10 +296,32 @@ match `MultiRankAdapter` without retraining Swift's ternary base:
   `Qwen3.8-27B-super-adapter`) carry native clean LoRA deltas without BF16 1-ULP bulk noise,
   providing an alternative `npu-friendly` donor source for low-token Thinking-OFF improvements
   subject to revision/license audit and `DR-G2`.
+  - **Pure-Rust PEFT importer (`import-peft-lora`):** `peftConfig` (`ImportPeftConfig`)
+    imports native PEFT `safetensors` checkpoints directly from
+    `peftConfig.source` (`"local-directory"` with `directory`, `license`,
+    optional `repository`/`revision`; or `"pinned-huggingface"` with
+    `repository`, `revision`, `license`, optional `configFilename` /
+    `weightsFilename`). It parses `adapter_config.json` (`peft_type = "LORA"`,
+    `r` in `1..=256`, `lora_alpha`, `use_rslora`, rejecting DoRA/`fan_in_fan_out`/bias),
+    drops vision/`mmproj`, `ssm_out`, and out-of-envelope tensors
+    (`targetEnvelope` in `"residual-writers"`, `"npu-friendly"` default, or
+    `"full-linear"`, recording `droppedCounts`), optionally projects out
+    rank-1 (`orthogonalizeAgainstRankOnePath`) or multi-rank
+    (`orthogonalizeAgainstAdapterPath`) subspaces, compresses sites with
+    `r_src > maxRank` (`1..=64`) via exact thin QR + one-sided Hestenes–Jacobi
+    SVD (`jacobi_svd_f64`), enforces `maxPayloadBytes`, records
+    `bonsai.composition.method = "peft-safetensors-import-v1"` plus donor
+    metadata, and self-verifies the published GGUF v3 output.
 - **Creative-prose and frontier reasoning distillations:** Community distill donors such as
   `barozp/Qwen3.8-27B-Opus-Distill` and `r0b0tlab/qwen3.8-max-distillation-50k` target
   creative writing and reasoning more directly than pure code-agent RL runs, subject to license
   review, extraction/denoising and `DR-G2` held-out scoring.
+  - **Generic Hugging Face diff auditing (`"pinned-huggingface"`):** `plan`,
+    `audit`, and `export-denoised` accept `source.kind = "pinned-huggingface"`
+    (`candidateRepository`, `candidateRevision`, `candidateLicense`,
+    `baseRepository`, `baseRevision`), embedding
+    `bonsai.composition.candidate_repo`, `candidate_revision`,
+    `candidate_license`, `base_repo`, and `base_revision` in GGUF provenance.
 - **Quantization-residual LoRAs (`SVDQuant`, `Recover-LoRA`, `OnQ` / `OnlineQAT`):** Low-rank
   FP16 residual branches trained on student rollouts can target ternary approximation loss rather
   than RL task deltas. **Critical safeguard:** never extract `W_Qwen3.8 - dequant(W_Swift)`
@@ -253,9 +348,10 @@ native `prism-inference` `MultiRankAdapter`:
 
 ## Shared acceptance gates (`DR-G2`, `DR-C1`, `DR-C2`)
 
-No runtime (`prism-inference`), broker, or UI changes happen until **`DR-G2`**
-passes on `--publisher-engine` with `--lora-scaled` stacking Orca (`1.3`) +
-candidate (`scale` grid starting at `0.0`, e.g. `[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`):
+No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
+(or verified native `prism-inference-server` via `dr-g2-capture`) stacking Orca
+(`1.3`, omitted on `NariQ`) + candidate (`scale` grid starting at `0.0`, e.g.
+`[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`):
 
 1. **DaisyRose capability gain**: Measurable Thinking-ON gain on held-out
    coding, reasoning, and instruction-following prompts over `scale = 0.0`
@@ -264,34 +360,95 @@ candidate (`scale` grid starting at `0.0`, e.g. `[0.0, 0.25, 0.5, 0.75, 1.0, 1.5
    `scale = 0.0` Swift baseline, with zero regression in `4,096`-token
    truncation or pathological repetition/loop rates.
 3. **Creative & Orca non-regression**: Thinking-OFF creative prose quality,
-   conciseness, and Orca refusal behavior match or exceed `scale = 0.0`.
+   conciseness, and Orca refusal behavior match or exceed `scale = 0.0` (plus
+   `multimodalPreservation` `>= 3.0` median/floor visual grounding when
+   `includeMultimodalChecks` / `multimodalPrompts` are enabled).
 4. **Native runtime (`DR-C1`) & Runner integration (`DR-C2`)**: Stackable opt-in
    `MultiRankAdapter` runtime wiring (`DR-C1` in `prism-inference`) and Runner
-   artifact, `bonsai-cpu-policy::context` accounting, canonical broker validation,
-   default-off Settings controls, CLI/prefetch forwarding, gated-off download
-   provenance/provisioning/`chat_launch::setup`/`--no-daisyrose-lora` plumbing,
-   promoted default-on broker/UI plumbing (promoted-pin auto-resolution,
-   lock-digest verification, tight-RAM shedding, default-scale request policy
-   and readiness reporting, and fresh/new-conversation UI default initialization
-   preserving saved workspaces; `DR-C2`, with `pinned_daisyrose_lora_artifact`
-   returning `Ok(None)` and `MULTI_RANK_LORA_RELEASE = None`), and pure-Rust
-   offline readiness tooling (`bonsai-tools lora-diff-audit` operations
-   `generate-test-adapter`, `generate-lock`, `dr-g2-plan`, and `dr-g2-score`)
-   are implemented. Runtime wiring is vetted locally on both a 4-layer
-   `npu-friendly` F16 export at `scale = 0.0` (battery) and an offline AC-powered
-   4-layer `r = 16` synthetic fixture covering `:0.0` bit-exact parity, `:0.5`
-   nonzero logits perturbation, matched-AC 4-layer overhead, and `:0.5`
-   full-state `rollback` (`status: "passed"` in `33.875 s`; see
-   [multi-rank wiring and vet](evidence/daisyrose-multirank-wiring-vet.md)).
-   Promoting DaisyRose to default-on still requires full 64-layer
-   zero-retraining extraction (`DR-E1`), `DR-G2` + held-out human review (plus
-   conditional `DR-W1` direct weight editing only if `DR-G2` fails on the
-   unedited adapter), Prism `v0.1.33+` publication and repin in
-   `config/prism-inference.lock.json` (`MULTI_RANK_LORA_RELEASE`), pinning
-   `config/daisyrose-lora.lock.json`, matched-power full-adapter X1/X2 device
-   qualification under [validation](validation.md) and
-   [Swift LoRA qualification](swift-lora.md#standard-profile-qualification), and
-   owning CI (`source-checks`, `foundation`).
+   artifact/policy/UI integration (`DR-C2`) are implemented locally:
+   - **Pin status:** In [inference.rs](../src/broker/src/inference.rs),
+     `MULTI_RANK_LORA_RELEASE` is already enabled and set to `REVIEWED_0_1_34`
+     (`("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370")`), while
+     `pinned_daisyrose_lora_artifact` in [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs)
+     continues to return `Ok(None)` pending a qualified `config/daisyrose-lora.lock.json`,
+     and `NARIQ_TRELLIS_RELEASE` (alongside `RSQ4KVF_RELEASE` and
+     `K4V3_CONTEXT_RELEASE`) remains `None` pending a published Prism `v0.1.35+`
+     release bundle.
+   - **Newly landed `DR-C1` work in `..\prism-inference`:**
+     - `examples/swift_model_check.rs`, `examples/swift_model_check/request_timing.rs`,
+       and `examples/swift_model_check/ffn_timing.rs` support `--nariq`
+       (`<2.5bpw|3.0bpw|2.0bpw>`) and `--multi-rank-adapter`
+       (`<absolute-gguf>[:<scale-0..2>]`) across `trajectory`, `request-timing`,
+       and `ffn-timing` modes (rejecting `--nariq` + `--rank-one-adapter` and
+       recording `multiRankAdapterSha256`, `multiRankAdapterMaxRank`, and
+       `multiRankAdapterScaleBits`).
+     - `tools/adreno-vulkan/src/graph.rs` (`prepare_adapters_upload` /
+       `PreparedAdapters` / `PreparedLinearLoraFactor`, verified by
+       `sparse_heterogeneous_multi_rank_adapter_prepares_per_site_ranks_and_scratch_layout`)
+       preserves per-site heterogeneous `MultiRankAdapter` ranks and per-site
+       scaling while sizing scratch by `max_rank`.
+     - `src/graph.rs`, `src/graph/prefill_ffn_tests.rs`, and
+       `src/graph/prefill_folded_tests.rs` add parity tests verifying sparse
+       heterogeneous `MultiRankAdapter` stacked with `RankOneAdapter` (`Orca`),
+       Hexagon NPU FFN fusion preservation
+       (`sparse_heterogeneous_multi_rank_keeps_omitted_chain_lora_and_matches_zero_ulp_decode_and_tiled`),
+       `rsq4kvf` and NariQ trellis graphs
+       (`qwen35_four_layer_trellis_heterogeneous_multi_rank_and_rsq4kvf_parity`),
+       and folded speculative verification
+       (`folded_speculative_verification_with_stacked_orca_sparse_heterogeneous_multi_rank_and_rsq4kvf`).
+   - **Newly landed `DR-C2` work in Runner:**
+     - [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs):
+       `daisyrose_lora_artifact_for_base_sha256` and
+       `DaisyRoseLoraArtifact::for_nariq_lock` (offline lock resolution/validation
+       against `NariqVariant::sha256()`).
+     - [context.rs](../src/cpu-policy/src/context.rs):
+       `MultiRankAdapterBudget::for_npu_friendly_rank` (charging `4_194_304`
+       bytes/rank `F16` or `8_388_608` bytes/rank `F32` plus
+       `DAISYROSE_SCRATCH_HEADROOM_BYTES`), alongside `from_verified_bytes` and
+       `for_calibrated_execution_with_adapter_reserve`.
+     - [launcher.rs](../src/broker/src/launcher.rs), [main.rs](../src/broker/src/main.rs),
+       and `launcher/identity.rs`: `Placement::Composite` AppContainer fix in
+       `sandbox_readonly_paths` granting read-only access to
+       `hexagon_runtime_readonly_paths`, NariQ auto-attach guard in
+       `resolve_daisyrose_selection_with` (ensuring compiled PQ2 locks never
+       auto-attach onto NariQ base weights), `swift_context_plan_with_daisyrose`
+       calibrated CoW checks, `LaunchedService::daisyrose_max_rank()` and
+       `daisyrose_sha256()` surfaced on readiness, and `launcher/identity.rs`
+       tests for DaisyRose stacking with suffix speculation and `Vulkan` /
+       `Composite` placements.
+     - [context_capacity.rs](../src/chat-ui/src/window/context_capacity.rs),
+       [response.rs](../src/chat-ui/src/window/settings/response.rs),
+       `client.rs`, and `window.rs`: readiness parsing and Settings summary
+       (`Loaded: rank ≤<rank> · <prefix>` via `loaded_daisyrose_summary`), plus
+       `npu_friendly_daisyrose_adapter_bytes`,
+       `PlannerRuntimeShape.daisyrose_adapter_bytes`, and
+       `format_footprint_diagnostic` reporting `+ <N> MiB DaisyRose` in context
+       capacity diagnostics.
+     - Pure-Rust `bonsai-tools lora-diff-audit` operations (`plan`, `audit`,
+       `export-denoised`, `verify-adapter`, `merge-adapters`, `edit-adapter`,
+       `reallocate-ranks`, `fold-patch`, `realign-factors`,
+       `generate-test-adapter`, `generate-lock`, `dr-g2-plan`, `dr-g2-score`,
+       `dr-g2-blind-packet`, `dr-g2-apply-reviews`, `dr-g2-capture`,
+       `import-peft-lora`) and `bonsai_windows_process::SystemAwakeGuard`.
+   - **Local vetting & open gates:** Runtime wiring is vetted locally on a
+     4-layer `npu-friendly` F16 export at `scale = 0.0` (battery), an offline
+     AC-powered 4-layer `r = 16` synthetic fixture (`status: "passed"` in
+     `33.875 s`; see
+     [multi-rank wiring and vet](evidence/daisyrose-multirank-wiring-vet.md)),
+     and full 64-layer (`128`-pair `daisyrose-npu-r16.gguf`) parity, rollback,
+     and matched-AC overhead vets (`3.16%` mean / `3.56%` median overhead on
+     `91298a4c`; see
+     [DR-E1/DR-G2 screen summary](evidence/daisyrose-dr-e1-dr-g2-screen.md)).
+     Promoting DaisyRose to default-on still requires awake AC 4-category
+     `DR-G2` capture + blinded held-out human review (`humanReviewed: true`,
+     plus conditional `DR-W1` direct weight editing only if needed), immutable
+     remote hosting + `config/daisyrose-lora.lock.json`, Prism `v0.1.35+`
+     release publication and repin in `config/prism-inference.lock.json` (for
+     `NARIQ_TRELLIS_RELEASE`, `RSQ4KVF_RELEASE`, and the new `DR-C1`
+     parity/timing updates), matched-power full-adapter X1/X2 device
+     qualification under [validation](validation.md) and
+     [Swift LoRA qualification](swift-lora.md#standard-profile-qualification),
+     and owning CI (`source-checks`, `foundation`).
 
 ## Zero-retraining workflow, direct-edit fallback, and promotion checklist
 
@@ -333,47 +490,63 @@ Forbidden targets excluded by `verify-adapter` (`requireNpuFriendly: true`,
 
 1. **Extract full 64-layer spectral-denoised GGUF (`DR-E1`)**: Run pure-Rust
    `bonsai-tools lora-diff-audit` `operation: "export-denoised"` across all 64
-   layers (`128` `npu-friendly` pairs, `F16`, `r = 16` first, optional `r = 32`)
-   against pinned `RadixArk/DaisyRose-27B` vs `Qwen/Qwen3.8-27B` (using local
-   prefetched shards or a dedicated extraction pass decoupled from inference
-   timers). Verify GGUF v3 layout, finiteness (`|v| < 65520.0`), dual alpha
-   equality, and NPU/SSM bounds with `verify-adapter`.
+   layers (`128` `npu-friendly` pairs, `F16`, `r = 16` first, optional `r = 32`,
+   optionally chunked and combined via `merge-adapters`) against pinned
+   `RadixArk/DaisyRose-27B` vs `Qwen/Qwen3.8-27B` (using local prefetched
+   shards or a dedicated extraction pass decoupled from inference timers).
+   Verify GGUF v3 layout, finiteness (`|v| < 65520.0`), dual alpha equality, and
+   NPU/SSM bounds with `verify-adapter`.
 2. **Screen direct stack (`DR-G2`)**: Stack the unedited `DR-E1` GGUF directly
-   on `Swift-Bonsai-2-PQ2_0.gguf` + Orca `1.3` via `--publisher-engine`
-   `--lora-scaled` across `scaleGrid` (`[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`)
-   and score fail-closed with `dr-g2-plan` / `dr-g2-score`
+   on `Swift-Bonsai-2-PQ2_0.gguf` + Orca `1.3` (or `NariQ` without Orca) via
+   `dr-g2-capture` (sleep-inhibited via `SystemAwakeGuard`) or
+   `--publisher-engine` `--lora-scaled` across `scaleGrid`
+   (`[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]`), blind via `dr-g2-blind-packet`,
+   and unblind/score fail-closed with `dr-g2-apply-reviews` / `dr-g2-score`
    (`trainingPromptSha256s: []`).
 3. **If `DR-G2` passes, stop editing and promote (`DR-C1` / `DR-C2`)**: Do not
    run `DR-W1` if the unedited `DR-E1` direct stack already satisfies all four
    `DR-G2` gates.
 4. **If `DR-G2` fails, apply pure-Rust direct weight editing (`DR-W1`) and
    re-screen**: Diagnose exact failing categories/prompts, apply bounded
-   algebraic or closed-form activation-guided edits to the floating-point `(A, B)`
-   factors within `npu-friendly` (zero retraining), record any diagnostic/fit
-   prompt SHA-256 digests in `trainingPromptSha256s` so final held-out splits
-   stay strictly disjoint, re-verify with `verify-adapter`, and re-score on an
-   untouched held-out `DR-G2` split.
+   algebraic (`edit-adapter` / `export-denoised` `shrinkageMode`) or
+   closed-form activation-guided (`reallocate-ranks`, `fold-patch`,
+   `realign-factors`) edits to the floating-point `(A, B)` factors within
+   `npu-friendly` (zero retraining), record any diagnostic/fit prompt SHA-256
+   digests in `diagnosticPromptSha256s` and `trainingPromptSha256s` so final
+   held-out splits stay strictly disjoint, re-verify with `verify-adapter`, and
+   re-score on an untouched held-out `DR-G2` split.
 
 ### Pure-Rust candidate intake, `DR-G2` screen, and lock generation
 
-`DR-W1` direct weight-edited candidates follow the same `verify-adapter` ->
-`dr-g2-plan` -> `dr-g2-score` -> `generate-lock` pipeline after editing:
+`DR-W1` direct weight-edited and `DR-Alt` imported candidates follow the same
+`verify-adapter` -> `dr-g2-plan` -> `dr-g2-capture` -> `dr-g2-blind-packet` ->
+`dr-g2-apply-reviews` -> `dr-g2-score` -> `generate-lock` pipeline after
+editing:
 
 ```powershell
 # 1. Extract full 64-layer npu-friendly denoised F16 LoRA (use local-directories or dedicated pass decoupled from inference clocks)
-bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"export-denoised","source":{"kind":"pinned-daisyrose"},"scope":{"layers":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63],"targetEnvelope":"npu-friendly","exportDtype":"f16","maxRank":16},"outputPath":"C:/External/daisyrose-r16.gguf"}'
+bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"export-denoised","source":{"kind":"pinned-daisyrose"},"scope":{"layers":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63],"targetEnvelope":"npu-friendly","exportDtype":"f16","shrinkageMode":"gavish-donoho","maxRank":16},"outputPath":"C:/External/daisyrose-r16.gguf"}'
 
 # 2. Verify GGUF v3 layout, finiteness, dual alpha equality, and NPU/SSM bounds
 bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"verify-adapter","adapterPath":"C:/External/daisyrose-r16.gguf","verifyPolicy":{"requireNpuFriendly":true,"requireNoGroupedSsm":true,"maxAllowedRank":32}}'
 
-# 3. Emit canonical DR-G2 contract + evidenceTemplate (then capture --publisher-engine three-way + human review)
-bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"dr-g2-plan","screenConfig":{"candidateAdapterSha256":"<CANDIDATE_SHA256>","candidateMaxRank":16,"candidateTargetCount":128,"scaleGrid":[0.0,0.25,0.5,0.75,1.0,1.5,2.0]}}'
+# 3. Emit canonical DR-G2 contract + evidenceTemplate (or capture directly with SystemAwakeGuard via dr-g2-capture)
+bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"dr-g2-plan","screenConfig":{"baseModel":"swift-pq2","includeMultimodalChecks":false,"candidateAdapterSha256":"<CANDIDATE_SHA256>","candidateMaxRank":16,"candidateTargetCount":128,"scaleGrid":[0.0,0.25,0.5,0.75,1.0,1.5,2.0]}}'
+
+# 3b. Sleep-inhibited two-server loopback capture, then generate blinded owner review packet + unblind/score
+bonsai-tools lora-diff-audit --request C:/External/dr-g2-capture-request.json
+bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"dr-g2-blind-packet","evidencePath":"C:/External/dr-g2-evidence.json","outputPath":"C:/External/dr-g2-blind-packet.json","blindConfig":{"responsesPath":"C:/External/dr-g2-responses.json","blindKeyPath":"C:/External/dr-g2-blind-key.json"}}'
+bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"dr-g2-apply-reviews","evidencePath":"C:/External/dr-g2-evidence.json","outputPath":"C:/External/dr-g2-evidence-reviewed.json","applyConfig":{"reviewPath":"C:/External/dr-g2-blind-packet-reviewed.json","blindKeyPath":"C:/External/dr-g2-blind-key.json"}}'
 
 # 4. Score completed held-out evidence + human reviews fail-closed
-bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"dr-g2-score","evidencePath":"C:/External/dr-g2-evidence.json"}'
+bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"dr-g2-score","evidencePath":"C:/External/dr-g2-evidence-reviewed.json"}'
 
-# 4b. Conditional DR-W1 only: equal-byte KL-gap & Softmax-Fisher variable-rank reallocation (r=0..32, <= 64 MiB F16) using disjoint diagnosticPromptSha256s
+# 4b. Conditional DR-W1 / DR-Alt operations: algebraic edit, variable-rank reallocation, patch folding, ridge realignment, or PEFT import
+bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"edit-adapter","adapterPath":"C:/External/daisyrose-r32.gguf","outputPath":"C:/External/daisyrose-edited.gguf","editConfig":{"targetMaxRank":16,"depthGainStart":0.5,"depthGainEnd":1.5,"depthGainCurve":"cosine","orthogonalizeAgainstRankOnePath":"C:/External/orca.gguf","orthogonalizeSide":"b","alphaEditNullSpaceRidge":0.01}}'
 bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"reallocate-ranks","adapterPath":"C:/External/daisyrose-r32.gguf","outputPath":"C:/External/daisyrose-reallocated.gguf","reallocateConfig":{"maxPayloadBytes":67108864,"maxRank":32,"diagnosticPromptSha256s":["<DIAGNOSTIC_PROMPT_SHA256>"],"siteSensitivities":[{"target":"blk.63.ffn_down.weight","reasoningKlGap":2.4,"thinkingOffKlPenalty":0.0}]}}'
+bonsai-tools lora-diff-audit --request C:/External/fold-patch-request.json
+bonsai-tools lora-diff-audit --request C:/External/realign-factors-request.json
+bonsai-tools lora-diff-audit --request C:/External/import-peft-request.json
 
 # 5. After DR-G2 passes, write schema-validated candidate lock JSON (refuses synthetic fixtures when defaultEnabled=true; supports host "huggingface", "github", or "github-release")
 bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"generate-lock","adapterPath":"C:/External/daisyrose-r16.gguf","outputPath":"C:/External/daisyrose-lora.lock.json","lockSource":{"host":"github-release","repository":"<OWNER>/<REPO>","release":"<TAG>","revision":"<40_HEX>","path":"<FILE>.gguf","filename":"<FILE>.gguf","url":"https://github.com/<OWNER>/<REPO>/releases/download/<TAG>/<FILE>.gguf","license":"Apache-2.0"},"defaultEnabled":true,"defaultScaleTenths":10}'
@@ -382,12 +555,15 @@ bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"generate-lo
 
 ### Default-on promotion flip checklist
 
-1. Publish a `prism-inference` `v0.1.33+` bundle containing `MultiRankAdapter`
-   through Foundation, verify and pin it in
-   [prism-inference.lock.json](../config/prism-inference.lock.json) via
-   `bonsai-tools inference-lock`, and set `MULTI_RANK_LORA_RELEASE` in
-   [inference.rs](../src/broker/src/inference.rs) to that exact
-   `(version, commit)` tuple.
+1. `MULTI_RANK_LORA_RELEASE` in [inference.rs](../src/broker/src/inference.rs)
+   is already enabled on `REVIEWED_0_1_34`
+   (`0.1.34`, `c64c9648f85ac4c99ff8d57f709871b31e785370`); publish a
+   `prism-inference` `v0.1.35+` bundle via Foundation to pick up the NariQ
+   trellis runtime and the new `DR-C1` parity/timing updates, verify and pin it
+   in [prism-inference.lock.json](../config/prism-inference.lock.json) via
+   `bonsai-tools inference-lock`, and update `MULTI_RANK_LORA_RELEASE` /
+   `NARIQ_TRELLIS_RELEASE` in [inference.rs](../src/broker/src/inference.rs) to
+   that exact `(version, commit)` tuple.
 2. Commit the `generate-lock` output as `config/daisyrose-lora.lock.json` and
    wire `include_str!("../../../config/daisyrose-lora.lock.json")` into
    `pinned_daisyrose_lora_artifact` in
