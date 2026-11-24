@@ -905,3 +905,76 @@ fn launch_usage_and_vulkan_composite_wy_f32_gates_match_pinned_contract() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn daisyrose_stacks_with_nariq_no_orca_suffix_speculation_and_placements() -> Result<(), LaunchError>
+{
+    let data = std::env::temp_dir().join("Bonsai-daisyrose-stacking");
+    let daisy_path = data.join("adapters").join("custom-daisy.gguf");
+    let daisy_text = daisy_path.to_str().ok_or(LaunchError::Path)?;
+    let key = data.join("backend.key");
+
+    // NariQ rejects Orca even when --daisyrose-lora is also passed.
+    assert_eq!(
+        parse_native_launch_config(
+            &data,
+            &[
+                "--nariq",
+                "2.5bpw",
+                "--use-abliterate-lora",
+                "--daisyrose-lora",
+                daisy_text,
+            ],
+        )
+        .err(),
+        Some(LaunchError::Arguments)
+    );
+
+    // NariQ LaunchPlan forbids Orca while budgeting DaisyRose reserve bytes cleanly.
+    let mut nariq_plan =
+        LaunchPlan::for_swift_nariq(&data, 8081, &key, bonsai_cpu_policy::NariqVariant::Bpw2_5)
+            .map_err(|_| LaunchError::Policy)?;
+    assert!(nariq_plan.adapter.is_none());
+    let base_ws = nariq_plan.working_set_limit_bytes;
+    let daisy_plan = crate::launch_policy::DaisyRoseLoraPlan {
+        path: daisy_path.clone(),
+        bytes: 32 * 1024 * 1024,
+        sha256: "a".repeat(64),
+        max_rank: 16,
+    };
+    let reserve_usize = daisy_plan
+        .reserve_bytes()
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or(LaunchError::Memory)?;
+    nariq_plan.working_set_limit_bytes = base_ws + reserve_usize;
+    nariq_plan
+        .enable_daisyrose_lora(daisy_plan)
+        .map_err(|_| LaunchError::Policy)?;
+    assert_eq!(nariq_plan.native_child_memory_limit_bytes(), base_ws);
+
+    // Suffix speculation + Vulkan/Composite placements parse alongside --daisyrose-lora.
+    for placement in ["vulkan", "composite"] {
+        let parsed = parse_native_launch_config(
+            &data,
+            &[
+                "--cpu-prefill-tokens",
+                "16",
+                "--spec-type",
+                "suffix",
+                "--draft-max",
+                "6",
+                "--placement",
+                placement,
+                "--daisyrose-lora",
+                daisy_text,
+            ],
+        )?;
+        assert_eq!(
+            parsed.spec_type,
+            Some(crate::inference::SpeculationType::Suffix)
+        );
+        assert_eq!(parsed.draft_max, Some(6));
+        assert_eq!(parsed.daisyrose_lora.as_ref(), Some(&daisy_path));
+    }
+    Ok(())
+}

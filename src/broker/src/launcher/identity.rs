@@ -2254,4 +2254,105 @@ mod context_tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn daisyrose_accepts_suffix_speculation_with_vulkan_and_composite_placements()
+    -> Result<(), String> {
+        use super::NativeIdentityError;
+        use serde_json::json;
+
+        let pinned = crate::inference::pinned_version().map_err(|e| format!("{e:?}"))?;
+        let daisy_sha = "ef".repeat(32);
+        let daisy_exec_sha = "12".repeat(32);
+        let graph = format!(
+            "{}:qwen35-text-v1:nonflash-f16:kv-rsq4-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1:multi-rank-lora-v1:{daisy_exec_sha}:00000000:cpu-tiled-ffn-v1:16:cpu-tiled-verify-v1",
+            crate::inference::MODEL_SHA256
+        );
+
+        for (placement, requested, effective, host_meta_bytes, resident_tensors) in [
+            (
+                crate::inference::Placement::Vulkan,
+                "vulkan",
+                "adreno-vulkan",
+                0_u64,
+                1_usize,
+            ),
+            (
+                crate::inference::Placement::Composite,
+                "composite",
+                "composite-hexagon-vulkan",
+                4096_u64,
+                2_usize,
+            ),
+        ] {
+            let payload = json!({
+                "id": "Swift-Bonsai-2-PQ2_0",
+                "object": "model",
+                "model_sha256": crate::inference::MODEL_SHA256,
+                "template_sha256": crate::inference::TEMPLATE_SHA256,
+                "runtime": "prism-inference",
+                "context_tokens": 32_768,
+                "seed": 42,
+                "row_workers": 4,
+                "supports_daisyrose_scale": true,
+                "daisyrose_scale_range": [0, 2],
+                "daisyrose_adapter_sha256": daisy_sha,
+                "daisyrose_adapter_max_rank": 16,
+                "kv_cache": "rsq4",
+                "startup_graph_identity": graph,
+                "cpu_prefill_tokens": 16,
+                "cpu_prefill_scratch_bytes": 1,
+                "cpu_speculative_tokens": 6,
+                "cpu_verification_scratch_bytes": 1,
+                "cpu_speculative_checkpoint_bytes": 1,
+                "placement": requested,
+                "projection_backend": effective,
+                "startup_projection": {
+                    "schema_version": 1,
+                    "requested": requested,
+                    "effective": effective,
+                    "identity": format!("{effective}-test-v1"),
+                    "resident_tensors": resident_tensors,
+                    "resident_weight_bytes": 1_048_576_u64,
+                    "host_metadata_bytes": host_meta_bytes,
+                },
+            });
+            let wire = crate::test_util::http_models_response(&payload)
+                .map_err(|err| format!("{err:?}"))?;
+            let policy = WorkerReadiness {
+                kv_cache: Some(crate::inference::KvCache::Rsq4),
+                context_tokens: 32_768,
+                cpu_prefill: Some((16, 1)),
+                cpu_speculation: Some((6, 1, 1)),
+                placement,
+                daisyrose: Some((daisy_sha.as_str(), 16)),
+                ..WorkerReadiness::for_version(&pinned, 4)
+            };
+            assert_eq!(
+                super::validate_native_identity_for_representation(
+                    &wire,
+                    super::super::WeightRepresentation::Source,
+                    false,
+                    policy,
+                ),
+                Ok(())
+            );
+
+            let mut missing_verify = payload;
+            missing_verify["startup_graph_identity"] =
+                json!(graph.replace(":cpu-tiled-verify-v1", ""));
+            let bad_wire = crate::test_util::http_models_response(&missing_verify)
+                .map_err(|err| format!("{err:?}"))?;
+            assert_eq!(
+                super::validate_native_identity_for_representation(
+                    &bad_wire,
+                    super::super::WeightRepresentation::Source,
+                    false,
+                    policy,
+                ),
+                Err(NativeIdentityError::KvCacheGraph)
+            );
+        }
+        Ok(())
+    }
 }

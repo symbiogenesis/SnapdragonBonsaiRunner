@@ -868,6 +868,15 @@ impl LaunchConfig {
                 )?
                 .context_plan);
         }
+        if self.nariq_variant().is_some()
+            || self.effective_speculation_tokens().is_some()
+            || self.cpu_prefill_gdn.is_some()
+            || self.prompt_reuse == crate::inference::PromptReuseMode::PromptEndAndLatest
+            || self.prompt_reuse_checkpoints.is_some()
+            || self.prompt_reuse_checkpoint_bytes.is_some()
+        {
+            return Err(LaunchError::NativeRuntime);
+        }
         Ok(self
             .profile_context_plan_with_reserve(available_bytes, false, daisyrose_reserve_bytes)?
             .0)
@@ -1004,6 +1013,13 @@ impl LaunchConfig {
         {
             return Ok(None);
         }
+        // Compiled PQ2 locks never auto-attach onto NariQ base weights; require
+        // an explicit --daisyrose-lora until NariQ has its own promoted lock.
+        let pinned = if self.nariq_variant().is_some() {
+            None
+        } else {
+            pinned
+        };
         if let Some(explicit) = &self.daisyrose_lora {
             if !multi_rank_supported {
                 return Err(LaunchError::NativeRuntime);
@@ -1393,6 +1409,37 @@ impl LaunchConfig {
         })
     }
 
+    fn sandbox_readonly_paths(
+        &self,
+        executable: &std::path::Path,
+        artifacts: &VerifiedArtifacts,
+        adapter: Option<&bonsai_artifacts::VerifiedFile>,
+        daisyrose: Option<&bonsai_artifacts::VerifiedMultiRankAdapter>,
+        mmproj: Option<&bonsai_artifacts::VerifiedFile>,
+        credentials: &PrivateCredentials,
+        broker_pipe: bool,
+    ) -> Vec<PathBuf> {
+        let mut readonly_paths = artifacts.runtime_files();
+        readonly_paths.extend([executable.to_path_buf(), artifacts.model().to_owned()]);
+        if self.native_engine
+            && matches!(
+                self.placement,
+                crate::inference::Placement::Auto | crate::inference::Placement::Composite
+            )
+        {
+            readonly_paths.extend(hexagon_runtime_readonly_paths(&self.data));
+        }
+        if !broker_pipe && credentials.has_backend_file() {
+            readonly_paths.push(credentials.backend_path().to_owned());
+        }
+        readonly_paths.extend(adapter.map(|file| file.path().to_owned()));
+        readonly_paths.extend(daisyrose.map(|file| file.path().to_owned()));
+        readonly_paths.extend(mmproj.map(|file| file.path().to_owned()));
+        readonly_paths.sort();
+        readonly_paths.dedup();
+        readonly_paths
+    }
+
     fn start_process(
         &self,
         specification: &ProcessSpec,
@@ -1421,22 +1468,15 @@ impl LaunchConfig {
         if self.hexagon_arena_cache.is_some() {
             return Err(LaunchError::Sandbox);
         }
-        let mut readonly_paths = artifacts.runtime_files();
-        readonly_paths.extend([
-            specification.executable.clone(),
-            artifacts.model().to_owned(),
-        ]);
-        if self.native_engine && self.placement == crate::inference::Placement::Auto {
-            readonly_paths.extend(hexagon_runtime_readonly_paths(&self.data));
-        }
-        if !broker_pipe && credentials.has_backend_file() {
-            readonly_paths.push(credentials.backend_path().to_owned());
-        }
-        readonly_paths.extend(adapter.map(|file| file.path().to_owned()));
-        readonly_paths.extend(daisyrose.map(|file| file.path().to_owned()));
-        readonly_paths.extend(mmproj.map(|file| file.path().to_owned()));
-        readonly_paths.sort();
-        readonly_paths.dedup();
+        let readonly_paths = self.sandbox_readonly_paths(
+            &specification.executable,
+            artifacts,
+            adapter,
+            daisyrose,
+            mmproj,
+            credentials,
+            broker_pipe,
+        );
         let policy = SandboxPolicy {
             readonly_paths,
             writable_directory: specification.working_directory.clone(),
@@ -5504,6 +5544,295 @@ mod tests {
             calibrated.working_set_limit_bytes - calibrated.context_plan.memory_limit_bytes,
             nariq_weight_bytes
         );
+        Ok(())
+    }
+
+    #[test]
+    fn daisyrose_stacks_with_nariq_cow_reserve_and_ignores_pq2_pinned_lock() -> std::io::Result<()>
+    {
+        let temp = crate::test_util::TempDir::new("Bonsai-nariq-daisyrose")?;
+        let gguf_path = temp.path().join("nariq-daisy.gguf");
+        let sha256 = build_test_daisyrose_gguf(&gguf_path, 8)?;
+        let bytes = std::fs::metadata(&gguf_path)?.len();
+
+        let mut args = arguments();
+        args.extend(
+            [
+                "--profile",
+                "swift-pq2-assessment",
+                "--daisyrose-lora",
+                gguf_path
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("utf8 path"))?,
+            ]
+            .map(OsString::from),
+        );
+        let mut cfg =
+            LaunchConfig::parse(args).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        cfg.data = temp.path().to_path_buf();
+        cfg.evidence_parent = temp.path().to_path_buf();
+        cfg.kv_cache = Some(crate::inference::KvCache::Rsq4);
+        cfg.weight_representation =
+            super::WeightRepresentation::NariQ(bonsai_cpu_policy::NariqVariant::Bpw2_5);
+
+        // Even if a future PQ2 DaisyRose lock is promoted, NariQ must never auto-attach it.
+        let pq2_promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact {
+            path: temp.path().join("pq2-promoted.gguf"),
+            bytes: 1024,
+            sha256: "a".repeat(64),
+            base_model_sha256: "b".repeat(64),
+            envelope: "npu-friendly".into(),
+            dtype: "f16".into(),
+            max_rank: 16,
+            target_count: 1,
+            repository: "symbiogenesis/DaisyRose-Swift-LoRA".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            release: None,
+            filename: "pq2-promoted.gguf".into(),
+            url: "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/pq2-promoted.gguf".into(),
+            default_enabled: true,
+            default_scale_tenths: Some(10),
+        };
+        let mut implicit_nariq = LaunchConfig::parse(
+            [
+                arguments(),
+                vec!["--profile".into(), "swift-pq2-assessment".into()],
+            ]
+            .concat(),
+        )
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        implicit_nariq.weight_representation =
+            super::WeightRepresentation::NariQ(bonsai_cpu_policy::NariqVariant::Bpw2_5);
+        assert_eq!(
+            implicit_nariq
+                .resolve_daisyrose_selection_with(Some(pq2_promoted.clone()), true)
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?,
+            None
+        );
+
+        let selection = cfg
+            .resolve_daisyrose_selection_with(Some(pq2_promoted), true)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        assert_eq!(
+            selection,
+            Some(super::DaisyRoseSelection::Explicit(gguf_path.clone()))
+        );
+        let verified = selection
+            .as_ref()
+            .map(LaunchConfig::verify_daisyrose_selection)
+            .transpose()
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?
+            .flatten()
+            .ok_or_else(|| std::io::Error::other("missing verified daisyrose"))?;
+        assert!(!verified.sheddable);
+        assert_eq!(verified.default_scale_tenths, 0);
+        let reserve = verified.reserve_bytes();
+        assert_eq!(
+            reserve,
+            bytes + bonsai_cpu_policy::DAISYROSE_SCRATCH_HEADROOM_BYTES
+        );
+
+        fn find_min_budget(max_probe: u64, probe: impl Fn(u64) -> bool) -> u64 {
+            let mut lo = 1_u64;
+            let mut hi = max_probe;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if probe(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        }
+
+        let min_nariq_budget = find_min_budget(64 * 1024 * 1024 * 1024_u64, |bytes| {
+            cfg.calibrated_context_plan_with_daisyrose(bytes, false, 0)
+                .is_ok()
+        });
+        let boundary = min_nariq_budget.saturating_add(reserve);
+        let (stacked, admitted) = cfg
+            .resolve_calibrated_daisyrose_admission(boundary, false, reserve, verified.sheddable)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        assert!(admitted);
+        // Explicit DaisyRose on NariQ is non-sheddable: 1 byte short rejects rather than dropping.
+        assert_eq!(
+            cfg.resolve_calibrated_daisyrose_admission(
+                boundary - 1,
+                false,
+                reserve,
+                verified.sheddable,
+            )
+            .err(),
+            Some(LaunchError::Memory)
+        );
+
+        let creds = super::PrivateCredentials::create(temp.path())?;
+        let mut plan = cfg
+            .build_launch_plan(cfg.backend_port, creds.backend_path())
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        assert!(plan.adapter.is_none());
+        assert!(plan.mmproj.is_none());
+        plan.select_calibrated_swift_context(&stacked)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        plan.enable_daisyrose_lora(crate::launch_policy::DaisyRoseLoraPlan {
+            path: verified.guard.path().to_path_buf(),
+            bytes,
+            sha256: sha256.clone(),
+            max_rank: verified.guard.max_rank(),
+        })
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        let reserve_usize = usize::try_from(reserve).map_err(std::io::Error::other)?;
+        assert_eq!(
+            plan.native_child_memory_limit_bytes() + reserve_usize,
+            plan.working_set_limit_bytes
+        );
+
+        let child_args = cfg.native_arguments(&plan, None);
+        assert!(has_flag_pair(
+            &child_args,
+            "--nariq",
+            std::ffi::OsStr::new("2.5bpw")
+        ));
+        assert!(has_flag_pair(
+            &child_args,
+            "--daisyrose-lora",
+            gguf_path.as_os_str()
+        ));
+        assert!(has_flag_pair(
+            &child_args,
+            "--daisyrose-lora-sha256",
+            std::ffi::OsStr::new(&sha256),
+        ));
+        assert!(!child_args.iter().any(|arg| arg == "--abliterate-lora"));
+        Ok(())
+    }
+
+    #[test]
+    fn daisyrose_stacks_with_suffix_speculation_and_vulkan_or_composite_sandbox_paths()
+    -> std::io::Result<()> {
+        let temp = crate::test_util::TempDir::new("Bonsai-suffix-placement-daisy")?;
+        let gguf_path = temp.path().join("daisy-stack.gguf");
+        let sha256 = build_test_daisyrose_gguf(&gguf_path, 16)?;
+        let bytes = std::fs::metadata(&gguf_path)?.len();
+        let verified = LaunchConfig::verify_daisyrose_selection(
+            &super::DaisyRoseSelection::Explicit(gguf_path.clone()),
+        )
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?
+        .ok_or_else(|| std::io::Error::other("missing verified daisyrose"))?;
+        let reserve = verified.reserve_bytes();
+
+        let htp_dir = temp.path().join("hexagon").join("runtime");
+        std::fs::create_dir_all(&htp_dir)?;
+        let htp_so = htp_dir.join("libggml-htp-v81.so");
+        std::fs::write(&htp_so, b"htp-v81")?;
+        let creds = super::PrivateCredentials::create(temp.path())?;
+        let artifacts = super::VerifiedArtifacts::synthetic_for_test();
+        let exe = temp.path().join("prism-inference.exe");
+
+        for (placement_flag, expected_placement, expects_hexagon) in [
+            ("vulkan", "vulkan", false),
+            ("composite", "composite", true),
+        ] {
+            let mut args = arguments();
+            args.extend(
+                [
+                    "--profile",
+                    "swift-pq2-assessment",
+                    "--cpu-prefill-tokens",
+                    "16",
+                    "--spec-type",
+                    "suffix",
+                    "--draft-max",
+                    "6",
+                    "--placement",
+                    placement_flag,
+                    "--daisyrose-lora",
+                    gguf_path
+                        .to_str()
+                        .ok_or_else(|| std::io::Error::other("utf8 path"))?,
+                ]
+                .map(OsString::from),
+            );
+            let mut cfg =
+                LaunchConfig::parse(args).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            cfg.data = temp.path().to_path_buf();
+            cfg.evidence_parent = temp.path().to_path_buf();
+            cfg.kv_cache = Some(crate::inference::KvCache::Rsq4);
+            assert!(
+                !cfg.runtime_supports_vision()
+                    .map_err(|e| std::io::Error::other(format!("{e:?}")))?
+            );
+
+            let (calibrated, admitted) = cfg
+                .resolve_calibrated_daisyrose_admission(
+                    24 * 1024 * 1024 * 1024_u64,
+                    false,
+                    reserve,
+                    false,
+                )
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            assert!(admitted);
+
+            let mut plan = cfg
+                .build_launch_plan(cfg.backend_port, creds.backend_path())
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            plan.select_calibrated_swift_context(&calibrated)
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            plan.cpu_prefill = cfg.cpu_prefill_tokens.zip(calibrated.prefill_scratch_bytes);
+            plan.cpu_speculation = cfg
+                .effective_speculation_tokens()
+                .zip(calibrated.speculation_reserves)
+                .map(|(tokens, (verify, checkpoint))| (tokens, verify, checkpoint));
+            plan.enable_daisyrose_lora(crate::launch_policy::DaisyRoseLoraPlan {
+                path: verified.guard.path().to_path_buf(),
+                bytes,
+                sha256: sha256.clone(),
+                max_rank: verified.guard.max_rank(),
+            })
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+            let reserve_usize = usize::try_from(reserve).map_err(std::io::Error::other)?;
+            assert_eq!(
+                plan.native_child_memory_limit_bytes() + reserve_usize,
+                plan.working_set_limit_bytes
+            );
+
+            let child_args = cfg.native_arguments(&plan, None);
+            assert!(has_flag_pair(
+                &child_args,
+                "--spec-type",
+                std::ffi::OsStr::new("suffix"),
+            ));
+            assert!(has_flag_pair(
+                &child_args,
+                "--draft-max",
+                std::ffi::OsStr::new("6")
+            ));
+            assert!(has_flag_pair(
+                &child_args,
+                "--placement",
+                std::ffi::OsStr::new(expected_placement),
+            ));
+            assert!(has_flag_pair(
+                &child_args,
+                "--daisyrose-lora",
+                gguf_path.as_os_str(),
+            ));
+
+            let readonly = cfg.sandbox_readonly_paths(
+                &exe,
+                &artifacts,
+                None,
+                Some(&verified.guard),
+                None,
+                &creds,
+                true,
+            );
+            assert!(readonly.contains(&gguf_path));
+            assert_eq!(readonly.contains(&htp_so), expects_hexagon);
+        }
         Ok(())
     }
 }

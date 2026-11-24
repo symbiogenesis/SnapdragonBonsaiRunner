@@ -209,6 +209,28 @@ fn stacked_daisyrose_lora_uses_configured_default_scale_and_preserves_explicit_o
     Ok(())
 }
 
+#[test]
+fn nariq_daisyrose_without_orca_rejects_abliteration_and_maps_slot_zero() -> Result<(), Rejection> {
+    // NariQ / --no-abliterate-lora disables Orca while allowing explicit DaisyRose at slot 0.
+    let explicit_abliteration = br#"{"messages":[{"role":"user","content":"Write a scene."}],"abliteration_scale":1.3,"daisyrose_scale":0.5}"#;
+    assert_eq!(
+        canonical_with_default(explicit_abliteration, false, true, 0).err(),
+        Some(Rejection::ChatSchema)
+    );
+
+    let explicit_daisy =
+        br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.7}"#;
+    assert_eq!(
+        canonical_with_default(explicit_daisy, false, true, 0)?["lora"],
+        json!([{"id": 0, "scale": 0.7}])
+    );
+    assert_eq!(
+        canonical_with_default(CHAT, false, true, 0)?["lora"],
+        json!([{"id": 0, "scale": 0.0}])
+    );
+    Ok(())
+}
+
 #[cfg(windows)]
 mod transport {
     #![expect(clippy::unwrap_used, reason = "Transport fixtures must fail loudly.")]
