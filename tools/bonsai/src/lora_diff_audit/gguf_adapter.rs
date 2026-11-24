@@ -1124,9 +1124,17 @@ pub(super) fn read_lora_gguf_pairs_with_dims(
     })
 }
 
-/// Reads unit-normalized output (`lora_b`) directions from a rank-1 reference GGUF adapter.
-pub(super) fn read_rank_one_b_directions(path: &Path) -> crate::Result<BTreeMap<String, Vec<f64>>> {
-    let base_dims = swift_base_dims_map();
+#[derive(Clone, Copy)]
+enum RankOneFactorSide {
+    A,
+    B,
+}
+
+fn read_rank_one_directions_with_dims(
+    path: &Path,
+    side: RankOneFactorSide,
+    base_dims: &BTreeMap<String, (usize, usize, &'static str)>,
+) -> crate::Result<BTreeMap<String, Vec<f64>>> {
     let mut parsed = parse_gguf_header(path, None)?;
     let mut directions = BTreeMap::new();
     for (base_name, (maybe_a, maybe_b)) in &parsed.by_base {
@@ -1136,31 +1144,59 @@ pub(super) fn read_rank_one_b_directions(path: &Path) -> crate::Result<BTreeMap<
         let (Some(a), Some(b)) = (maybe_a, maybe_b) else {
             return Err(format!("Incomplete rank-1 LoRA pair for '{base_name}'."));
         };
-        let (_in_dim, out_dim, rank, _family) = validate_pair_dims(base_name, a, b, &base_dims)?;
+        let (in_dim, out_dim, rank, _family) = validate_pair_dims(base_name, a, b, base_dims)?;
         if rank != 1 {
             return Err(format!(
                 "orthogonalizeAgainstRankOnePath requires rank-1 factors, got rank {rank} on '{base_name}'."
             ));
         }
-        let b_vals = read_tensor_f32(
+        let (desc, elem_len) = match side {
+            RankOneFactorSide::A => (a, in_dim),
+            RankOneFactorSide::B => (b, out_dim),
+        };
+        let vals = read_tensor_f32(
             &mut parsed.file,
-            parsed.data_start + b.offset,
-            b.byte_len,
-            out_dim,
-            b.dtype,
+            parsed.data_start + desc.offset,
+            desc.byte_len,
+            elem_len,
+            desc.dtype,
         )?;
-        let b_f64: Vec<f64> = b_vals.into_iter().map(f64::from).collect();
-        let norm_sq: f64 = b_f64.iter().map(|&v| v * v).sum();
+        let vec_f64: Vec<f64> = vals.into_iter().map(f64::from).collect();
+        let norm_sq: f64 = vec_f64.iter().map(|&v| v * v).sum();
         let norm = norm_sq.sqrt();
         if !norm.is_finite() || norm <= 0.0 {
             return Err(format!(
                 "Rank-1 reference direction '{base_name}' has zero or nonfinite norm."
             ));
         }
-        let unit: Vec<f64> = b_f64.into_iter().map(|v| v / norm).collect();
+        let unit: Vec<f64> = vec_f64.into_iter().map(|v| v / norm).collect();
         directions.insert(base_name.clone(), unit);
     }
     Ok(directions)
+}
+
+/// Reads unit-normalized output (`lora_b`) directions from a rank-1 reference GGUF adapter.
+pub(super) fn read_rank_one_b_directions(path: &Path) -> crate::Result<BTreeMap<String, Vec<f64>>> {
+    read_rank_one_directions_with_dims(path, RankOneFactorSide::B, &swift_base_dims_map())
+}
+
+/// Reads unit-normalized input (`lora_a`) directions from a rank-1 reference GGUF adapter.
+pub(super) fn read_rank_one_a_directions(path: &Path) -> crate::Result<BTreeMap<String, Vec<f64>>> {
+    read_rank_one_directions_with_dims(path, RankOneFactorSide::A, &swift_base_dims_map())
+}
+
+pub(super) fn read_rank_one_b_directions_with_dims(
+    path: &Path,
+    base_dims: &BTreeMap<String, (usize, usize, &'static str)>,
+) -> crate::Result<BTreeMap<String, Vec<f64>>> {
+    read_rank_one_directions_with_dims(path, RankOneFactorSide::B, base_dims)
+}
+
+pub(super) fn read_rank_one_a_directions_with_dims(
+    path: &Path,
+    base_dims: &BTreeMap<String, (usize, usize, &'static str)>,
+) -> crate::Result<BTreeMap<String, Vec<f64>>> {
+    read_rank_one_directions_with_dims(path, RankOneFactorSide::A, base_dims)
 }
 
 /// Verifies a GGUF v3 LoRA adapter file against `Swift-Bonsai-2` shapes, finite scalars,
