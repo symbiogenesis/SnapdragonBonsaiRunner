@@ -123,6 +123,44 @@ struct ChatCompletionOutcome {
     thinking_tokens: u32,
     hit4096_truncation: bool,
     loop_detected: bool,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    finish_reason: Option<String>,
+    wall_milliseconds: u64,
+}
+
+fn bounded_utf8_preview(bytes: &[u8]) -> String {
+    let slice = &bytes[..bytes.len().min(256)];
+    let text = String::from_utf8_lossy(slice);
+    let mut out = String::with_capacity(text.len().min(256));
+    for ch in text.chars() {
+        let mapped = if ch.is_control() { ' ' } else { ch };
+        if out.len() + mapped.len_utf8() > 256 {
+            break;
+        }
+        out.push(mapped);
+    }
+    out.trim().to_owned()
+}
+
+fn prompt_timing_entry(
+    prompt_id: &str,
+    category: &str,
+    arm: &str,
+    outcome: &ChatCompletionOutcome,
+) -> Value {
+    json!({
+        "promptId": prompt_id,
+        "category": category,
+        "arm": arm,
+        "promptTokens": outcome.prompt_tokens,
+        "completionTokens": outcome.completion_tokens,
+        "thinkingTokens": outcome.thinking_tokens,
+        "finishReason": outcome.finish_reason,
+        "hit4096Truncation": outcome.hit4096_truncation,
+        "loopDetected": outcome.loop_detected,
+        "wallMilliseconds": outcome.wall_milliseconds,
+    })
 }
 
 fn validate_regular_external_file(path: &Path, label: &str) -> crate::Result<()> {
@@ -1150,6 +1188,39 @@ fn run_chat_completion(
     )
     .map_err(HttpExchangeError::Fatal)?;
 
+    let (reset_status, reset_bytes) = loopback_http_exchange(
+        endpoint,
+        "POST",
+        "/reset",
+        None,
+        MAX_CONTROL_RESPONSE_BYTES,
+        deadline,
+        &check,
+    )?;
+    if reset_status != 200 {
+        return Err(HttpExchangeError::Fatal(format!(
+            "Loopback /reset returned HTTP {reset_status}: {}",
+            bounded_utf8_preview(&reset_bytes)
+        )));
+    }
+
+    let (count_status, count_bytes) = loopback_http_exchange(
+        endpoint,
+        "POST",
+        "/v1/chat/completions/input_tokens",
+        Some(&payload),
+        MAX_CONTROL_RESPONSE_BYTES,
+        deadline,
+        &check,
+    )?;
+    if count_status != 200 {
+        return Err(HttpExchangeError::Fatal(format!(
+            "Loopback /v1/chat/completions/input_tokens returned HTTP {count_status}: {}",
+            bounded_utf8_preview(&count_bytes)
+        )));
+    }
+
+    let gen_started = Instant::now();
     let (status, resp_bytes) = loopback_http_exchange(
         endpoint,
         "POST",
@@ -1159,9 +1230,11 @@ fn run_chat_completion(
         deadline,
         check,
     )?;
+    let wall_milliseconds = u64::try_from(gen_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if status != 200 {
         return Err(HttpExchangeError::Fatal(format!(
-            "Loopback /v1/chat/completions returned HTTP {status}."
+            "Loopback /v1/chat/completions returned HTTP {status}: {}",
+            bounded_utf8_preview(&resp_bytes)
         )));
     }
     let resp: Value = serde_json::from_slice(&resp_bytes)
@@ -1211,10 +1284,11 @@ fn run_chat_completion(
         &resp["usage"],
         enable_thinking,
     );
-    let finish_reason = choice["finish_reason"].as_str();
+    let prompt_tokens = resp["usage"]["prompt_tokens"].as_u64();
     let completion_tokens = resp["usage"]["completion_tokens"].as_u64();
+    let finish_reason = choice["finish_reason"].as_str().map(str::to_owned);
     let hit4096_truncation = (max_completion_tokens >= DEFAULT_MAX_COMPLETION_TOKENS
-        && finish_reason == Some("length"))
+        && finish_reason.as_deref() == Some("length"))
         || completion_tokens.is_some_and(|t| t >= u64::from(DEFAULT_MAX_COMPLETION_TOKENS));
     let loop_detected = detect_repetition_loop(&canonical_text);
 
@@ -1224,6 +1298,10 @@ fn run_chat_completion(
         thinking_tokens,
         hit4096_truncation,
         loop_detected,
+        prompt_tokens,
+        completion_tokens,
+        finish_reason,
+        wall_milliseconds,
     })
 }
 
@@ -1277,6 +1355,7 @@ fn capture_against_endpoints_inner(
     let mut thinking_off_prompts = Vec::with_capacity(config.thinking_off_prompts.len());
     let mut blind_responses: BTreeMap<String, BlindResponseEntry> = BTreeMap::new();
     let mut arm_power_observations = Vec::new();
+    let mut prompt_timings = Vec::new();
     let mut skipped_prompts = Vec::new();
     let mut budget_exceeded = false;
 
@@ -1396,6 +1475,18 @@ fn capture_against_endpoints_inner(
             "completed": true,
         }));
 
+        prompt_timings.push(prompt_timing_entry(
+            &ctrl.prompt_id,
+            "zero-scale-control",
+            "zero-no-adapter",
+            &no_adapter,
+        ));
+        prompt_timings.push(prompt_timing_entry(
+            &ctrl.prompt_id,
+            "zero-scale-control",
+            "zero-scale",
+            &zero_scale,
+        ));
         zero_scale_controls.push(ZeroScaleControl {
             prompt_id: ctrl.prompt_id.clone(),
             prompt_sha256: crate::identity::sha256(ctrl.prompt_text.as_bytes()),
@@ -1508,6 +1599,18 @@ fn capture_against_endpoints_inner(
             "completed": true,
         }));
 
+        prompt_timings.push(prompt_timing_entry(
+            &prompt.prompt_id,
+            &prompt.category,
+            "baseline",
+            &baseline,
+        ));
+        prompt_timings.push(prompt_timing_entry(
+            &prompt.prompt_id,
+            &prompt.category,
+            "candidate",
+            &candidate,
+        ));
         blind_responses.insert(
             prompt.prompt_id.clone(),
             BlindResponseEntry {
@@ -1647,6 +1750,18 @@ fn capture_against_endpoints_inner(
             "completed": true,
         }));
 
+        prompt_timings.push(prompt_timing_entry(
+            &prompt.prompt_id,
+            &prompt.category,
+            "baseline",
+            &baseline,
+        ));
+        prompt_timings.push(prompt_timing_entry(
+            &prompt.prompt_id,
+            &prompt.category,
+            "candidate",
+            &candidate,
+        ));
         blind_responses.insert(
             prompt.prompt_id.clone(),
             BlindResponseEntry {
@@ -1743,6 +1858,7 @@ fn capture_against_endpoints_inner(
         "powerAfter": power_after,
         "powerConditions": power_conditions,
         "armPowerObservations": arm_power_observations,
+        "promptTimings": prompt_timings,
     }))
 }
 
@@ -1799,6 +1915,28 @@ fn allocate_two_loopback_ports() -> crate::Result<(u16, u16)> {
         return Err("Failed to allocate two distinct nonprivileged loopback ports.".into());
     }
     Ok((port_a, port_b))
+}
+
+#[cfg(windows)]
+fn read_stderr_preview(path: &Path) -> String {
+    let Ok(file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    if file.take(4096).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    bounded_utf8_preview(&buf)
+}
+
+#[cfg(windows)]
+fn unexpected_server_exit_error(label: &str, code: u32, stderr_path: &Path) -> String {
+    let preview = read_stderr_preview(stderr_path);
+    if preview.is_empty() {
+        format!("{label} prism-inference-server exited unexpectedly with code {code}.")
+    } else {
+        format!("{label} prism-inference-server exited unexpectedly with code {code}: {preview}")
+    }
 }
 
 #[cfg(windows)]
@@ -1886,13 +2024,17 @@ fn run_windows_capture(request: &Request) -> crate::Result<Value> {
     let check_servers = || -> crate::Result<()> {
         crate::startup_cancel::checkpoint()?;
         if let Some(code) = proc_a.try_wait().map_err(|e| e.to_string())? {
-            return Err(format!(
-                "Server A prism-inference-server exited unexpectedly with code {code}."
+            return Err(unexpected_server_exit_error(
+                "Server A",
+                code,
+                &work_a.join("stderr.log"),
             ));
         }
         if let Some(code) = proc_b.try_wait().map_err(|e| e.to_string())? {
-            return Err(format!(
-                "Server B prism-inference-server exited unexpectedly with code {code}."
+            return Err(unexpected_server_exit_error(
+                "Server B",
+                code,
+                &work_b.join("stderr.log"),
             ));
         }
         Ok(())
@@ -2029,8 +2171,8 @@ mod tests {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -2224,18 +2366,28 @@ mod tests {
         Ok(())
     }
 
+    struct MockServerHandle {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        reset_count: Arc<AtomicUsize>,
+        join: thread::JoinHandle<()>,
+    }
+
     fn spawn_mock_server(
         expected_token: String,
         is_candidate_server: bool,
         delay_ms: u64,
-    ) -> crate::Result<(u16, Arc<AtomicBool>, thread::JoinHandle<()>)> {
+    ) -> crate::Result<MockServerHandle> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let reset_count = Arc::new(AtomicUsize::new(0));
+        let reset_counter = Arc::clone(&reset_count);
+        let counted_body: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
-        let handle = thread::spawn(move || {
+        let join = thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
@@ -2244,6 +2396,8 @@ mod tests {
                             &expected_token,
                             is_candidate_server,
                             delay_ms,
+                            &counted_body,
+                            &reset_counter,
                         );
                     }
                     Err(err) if err.kind() == io_error_would_block() => {
@@ -2253,7 +2407,12 @@ mod tests {
                 }
             }
         });
-        Ok((port, stop, handle))
+        Ok(MockServerHandle {
+            port,
+            stop,
+            reset_count,
+            join,
+        })
     }
 
     const fn io_error_would_block() -> std::io::ErrorKind {
@@ -2265,6 +2424,8 @@ mod tests {
         expected_token: &str,
         is_candidate_server: bool,
         delay_ms: u64,
+        counted_body: &Mutex<Option<Vec<u8>>>,
+        reset_count: &AtomicUsize,
     ) -> crate::Result<()> {
         let _ = stream.set_nonblocking(false);
         let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
@@ -2273,6 +2434,7 @@ mod tests {
             .read_line(&mut request_line)
             .map_err(|e| e.to_string())?;
         let mut content_length = 0_usize;
+        let mut has_content_type = false;
         let mut authorized = false;
         let expected_auth = format!("Bearer {expected_token}");
         loop {
@@ -2286,6 +2448,8 @@ mod tests {
                 let val_trim = val.trim();
                 if name_lower == "content-length" {
                     content_length = val_trim.parse::<usize>().unwrap_or(0);
+                } else if name_lower == "content-type" {
+                    has_content_type = true;
                 } else if name_lower == "authorization" && val_trim == expected_auth {
                     authorized = true;
                 }
@@ -2310,77 +2474,107 @@ mod tests {
                     }]
                 }),
             )
-        } else if request_line.starts_with("POST /v1/chat/completions ") {
-            if delay_ms > 0 {
-                thread::sleep(Duration::from_millis(delay_ms));
+        } else if request_line.starts_with("POST /reset ") {
+            if has_content_type || content_length != 0 {
+                ("400 Bad Request", json!({ "error": "invalid_reset" }))
+            } else {
+                let mut guard = counted_body
+                    .lock()
+                    .map_err(|_| "Mock counted_body mutex poisoned.".to_owned())?;
+                *guard = None;
+                reset_count.fetch_add(1, Ordering::Relaxed);
+                ("200 OK", json!({ "status": "ok" }))
             }
-            let req_val: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-            let prompt = req_val["messages"][0]["content"].as_str().unwrap_or("");
-            let thinking = req_val["chat_template_kwargs"]["enable_thinking"]
-                .as_bool()
-                .unwrap_or(true);
-            let daisy_scale = if is_candidate_server {
-                req_val["lora"]
-                    .as_array()
-                    .and_then(|arr| {
-                        arr.iter()
-                            .find(|item| item["id"] == 1)
-                            .or_else(|| arr.first())
-                    })
-                    .and_then(|item| item["scale"].as_f64())
-                    .unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            let is_zero = daisy_scale.abs() <= 1e-12;
-            let (reasoning, content, finish_reason, comp_tokens) = if is_zero {
-                (
-                    if thinking { "Think step." } else { "" },
-                    "Baseline answer 391.".to_owned(),
-                    "stop",
-                    60_u64,
-                )
-            } else if prompt.contains("binary search") {
-                (
-                    "Check binary search bounds carefully.",
-                    "fn search() {}\n".to_owned(),
-                    "length",
-                    4096_u64,
-                )
-            } else if prompt.contains("pigeonhole") {
-                (
-                    "Count pigeons and holes.",
-                    "Repeating loop line here.\n".repeat(6),
-                    "stop",
-                    120_u64,
-                )
-            } else {
-                (
-                    if thinking { "Thinking carefully." } else { "" },
-                    "Candidate improved answer.".to_owned(),
-                    "stop",
-                    80_u64,
-                )
-            };
+        } else if request_line.starts_with("POST /v1/chat/completions/input_tokens ") {
+            let mut guard = counted_body
+                .lock()
+                .map_err(|_| "Mock counted_body mutex poisoned.".to_owned())?;
+            *guard = Some(body);
             (
                 "200 OK",
-                json!({
-                    "choices": [{
-                        "index": 0,
-                        "finish_reason": finish_reason,
-                        "message": {
-                            "role": "assistant",
-                            "content": content,
-                            "reasoning_content": reasoning
-                        }
-                    }],
-                    "usage": {
-                        "prompt_tokens": 30,
-                        "completion_tokens": comp_tokens,
-                        "total_tokens": 30 + comp_tokens
-                    }
-                }),
+                json!({ "input_tokens": 30, "object": "response.input_tokens" }),
             )
+        } else if request_line.starts_with("POST /v1/chat/completions ") {
+            let counted = {
+                let mut guard = counted_body
+                    .lock()
+                    .map_err(|_| "Mock counted_body mutex poisoned.".to_owned())?;
+                guard.take()
+            };
+            if counted.as_deref() != Some(body.as_slice()) {
+                ("400 Bad Request", json!({ "error": "count_mismatch" }))
+            } else {
+                if delay_ms > 0 {
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+                let req_val: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+                let prompt = req_val["messages"][0]["content"].as_str().unwrap_or("");
+                let thinking = req_val["chat_template_kwargs"]["enable_thinking"]
+                    .as_bool()
+                    .unwrap_or(true);
+                let daisy_scale = if is_candidate_server {
+                    req_val["lora"]
+                        .as_array()
+                        .and_then(|arr| {
+                            arr.iter()
+                                .find(|item| item["id"] == 1)
+                                .or_else(|| arr.first())
+                        })
+                        .and_then(|item| item["scale"].as_f64())
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let is_zero = daisy_scale.abs() <= 1e-12;
+                let (reasoning, content, finish_reason, comp_tokens) = if is_zero {
+                    (
+                        if thinking { "Think step." } else { "" },
+                        "Baseline answer 391.".to_owned(),
+                        "stop",
+                        60_u64,
+                    )
+                } else if prompt.contains("binary search") {
+                    (
+                        "Check binary search bounds carefully.",
+                        "fn search() {}\n".to_owned(),
+                        "length",
+                        4096_u64,
+                    )
+                } else if prompt.contains("pigeonhole") {
+                    (
+                        "Count pigeons and holes.",
+                        "Repeating loop line here.\n".repeat(6),
+                        "stop",
+                        120_u64,
+                    )
+                } else {
+                    (
+                        if thinking { "Thinking carefully." } else { "" },
+                        "Candidate improved answer.".to_owned(),
+                        "stop",
+                        80_u64,
+                    )
+                };
+                (
+                    "200 OK",
+                    json!({
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": finish_reason,
+                            "message": {
+                                "role": "assistant",
+                                "content": content,
+                                "reasoning_content": reasoning
+                            }
+                        }],
+                        "usage": {
+                            "prompt_tokens": 30,
+                            "completion_tokens": comp_tokens,
+                            "total_tokens": 30 + comp_tokens
+                        }
+                    }),
+                )
+            }
         } else {
             ("404 Not Found", json!({ "error": "not found" }))
         };
@@ -2402,8 +2596,8 @@ mod tests {
         let scratch = ScratchDir::new("Bonsai-CaptureMock")?;
         let token_a = "11".repeat(32);
         let token_b = "22".repeat(32);
-        let (port_a, stop_a, handle_a) = spawn_mock_server(token_a.clone(), false, 0)?;
-        let (port_b, stop_b, handle_b) = spawn_mock_server(token_b.clone(), true, 0)?;
+        let mock_a = spawn_mock_server(token_a.clone(), false, 0)?;
+        let mock_b = spawn_mock_server(token_b.clone(), true, 0)?;
 
         let evidence_out = scratch.join("dr-g2-evidence.json");
         let responses_out = scratch.join("dr-g2-responses.json");
@@ -2413,19 +2607,19 @@ mod tests {
 
         let receipt = run_capture_against_endpoints(
             &req,
-            port_a,
+            mock_a.port,
             &token_a,
-            port_b,
+            mock_b.port,
             &token_b,
             &cand_sha,
             Some(16),
             Some(128),
             None,
         );
-        stop_a.store(true, Ordering::Relaxed);
-        stop_b.store(true, Ordering::Relaxed);
-        let _ = handle_a.join();
-        let _ = handle_b.join();
+        mock_a.stop.store(true, Ordering::Relaxed);
+        mock_b.stop.store(true, Ordering::Relaxed);
+        let _ = mock_a.join.join();
+        let _ = mock_b.join.join();
 
         let receipt = receipt?;
         assert_eq!(receipt["completed"], true);
@@ -2447,6 +2641,15 @@ mod tests {
                 .len(),
             10
         );
+        assert_eq!(
+            receipt["promptTimings"]
+                .as_array()
+                .ok_or("Missing promptTimings.")?
+                .len(),
+            10
+        );
+        assert_eq!(mock_a.reset_count.load(Ordering::Relaxed), 5);
+        assert_eq!(mock_b.reset_count.load(Ordering::Relaxed), 5);
 
         let evidence: Value =
             serde_json::from_slice(&fs::read(&evidence_out).map_err(|e| e.to_string())?)
@@ -2515,8 +2718,8 @@ mod tests {
         let scratch = ScratchDir::new("Bonsai-CaptureNariqBudget")?;
         let token_a = "33".repeat(32);
         let token_b = "44".repeat(32);
-        let (port_a, stop_a, handle_a) = spawn_mock_server(token_a.clone(), false, 0)?;
-        let (port_b, stop_b, handle_b) = spawn_mock_server(token_b.clone(), true, 0)?;
+        let mock_a = spawn_mock_server(token_a.clone(), false, 0)?;
+        let mock_b = spawn_mock_server(token_b.clone(), true, 0)?;
 
         let evidence_out = scratch.join("nariq-evidence.json");
         let mut nariq_cfg = base_capture_config(None);
@@ -2527,19 +2730,19 @@ mod tests {
 
         let receipt = run_capture_against_endpoints(
             &req,
-            port_a,
+            mock_a.port,
             &token_a,
-            port_b,
+            mock_b.port,
             &token_b,
             &cand_sha,
             Some(16),
             Some(128),
             None,
         );
-        stop_a.store(true, Ordering::Relaxed);
-        stop_b.store(true, Ordering::Relaxed);
-        let _ = handle_a.join();
-        let _ = handle_b.join();
+        mock_a.stop.store(true, Ordering::Relaxed);
+        mock_b.stop.store(true, Ordering::Relaxed);
+        let _ = mock_a.join.join();
+        let _ = mock_b.join.join();
 
         let receipt = receipt?;
         assert_eq!(receipt["completed"], true);
@@ -2552,25 +2755,25 @@ mod tests {
         assert_eq!(nariq_evidence["orcaScale"], 0.0);
 
         // Now test tight budget expiry after server startup: unpaired prompts are skipped cleanly.
-        let (slow_a, stop_slow_a, h_slow_a) = spawn_mock_server(token_a.clone(), false, 150)?;
-        let (slow_b, stop_slow_b, h_slow_b) = spawn_mock_server(token_b.clone(), true, 150)?;
+        let slow_a = spawn_mock_server(token_a.clone(), false, 150)?;
+        let slow_b = spawn_mock_server(token_b.clone(), true, 150)?;
         let partial_out = scratch.join("partial-evidence.json");
         let partial_req = dummy_request_with_config(base_capture_config(None), partial_out.clone());
         let partial_receipt = run_capture_against_endpoints(
             &partial_req,
-            slow_a,
+            slow_a.port,
             &token_a,
-            slow_b,
+            slow_b.port,
             &token_b,
             &cand_sha,
             Some(16),
             Some(128),
             Some(Duration::from_millis(250)),
         );
-        stop_slow_a.store(true, Ordering::Relaxed);
-        stop_slow_b.store(true, Ordering::Relaxed);
-        let _ = h_slow_a.join();
-        let _ = h_slow_b.join();
+        slow_a.stop.store(true, Ordering::Relaxed);
+        slow_b.stop.store(true, Ordering::Relaxed);
+        let _ = slow_a.join.join();
+        let _ = slow_b.join.join();
 
         let partial_receipt = partial_receipt?;
         assert_eq!(partial_receipt["completed"], false);
