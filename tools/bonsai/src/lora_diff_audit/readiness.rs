@@ -16,95 +16,189 @@ const SWIFT_LORA_LOCK: &str = include_str!("../../../../config/swift-lora.lock.j
 const ORCA_EXPECTED_SCALE: f64 = 1.3;
 const MAX_THINKING_TOKEN_RATIO: f64 = 1.10;
 const MIN_CREATIVE_SCORE: f64 = 3.0;
+const MIN_MULTIMODAL_SCORE: f64 = 3.0;
 const MAX_DR_G2_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DR_G2_RESPONSES_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DR_G2_SCALE_GRID_LEN: usize = 16;
 const SYNTHETIC_FIXTURE_METHOD: &str = "synthetic-runtime-test-fixture-v1";
 const THINKING_ON_CATEGORIES: [&str; 3] = ["coding", "reasoning", "instruction-following"];
 const THINKING_OFF_CATEGORY: &str = "creative-prose";
+const MULTIMODAL_DEFAULT_CATEGORY: &str = "multimodal";
+
+/// Base model quantization profile evaluated by a DR-G2 screen.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum BaseModelProfile {
+    #[default]
+    #[serde(rename = "swift-pq2")]
+    SwiftPq2,
+    #[serde(rename = "nariq-2.5bpw")]
+    Nariq2_5Bpw,
+    #[serde(rename = "nariq-3.0bpw")]
+    Nariq3_0Bpw,
+    #[serde(rename = "nariq-2.0bpw")]
+    Nariq2_0Bpw,
+}
+
+impl BaseModelProfile {
+    pub(super) const fn is_nariq(self) -> bool {
+        !matches!(self, Self::SwiftPq2)
+    }
+
+    pub(super) const fn nariq_variant(self) -> Option<bonsai_cpu_policy::NariqVariant> {
+        match self {
+            Self::SwiftPq2 => None,
+            Self::Nariq2_5Bpw => Some(bonsai_cpu_policy::NariqVariant::Bpw2_5),
+            Self::Nariq3_0Bpw => Some(bonsai_cpu_policy::NariqVariant::Bpw3_0),
+            Self::Nariq2_0Bpw => Some(bonsai_cpu_policy::NariqVariant::Bpw2_0),
+        }
+    }
+
+    pub(super) fn base_model_sha256(self) -> crate::Result<String> {
+        match self.nariq_variant() {
+            Some(variant) => Ok(variant.sha256().to_owned()),
+            None => compiled_swift_base_sha256(),
+        }
+    }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 /// Optional candidate configuration for `dr-g2-plan`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct DrG2PlanConfig {
+    pub(super) base_model: Option<BaseModelProfile>,
+    pub(super) include_multimodal_checks: bool,
     pub(super) candidate_adapter_sha256: Option<String>,
     pub(super) candidate_max_rank: Option<u16>,
     pub(super) candidate_target_count: Option<usize>,
     pub(super) scale_grid: Option<Vec<f64>>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+/// Request configuration for `dr-g2-blind-packet`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ThinkingOnArm {
-    scale: f64,
-    response_sha256: String,
-    human_reviewed: bool,
-    reviewer_id: String,
-    score: f64,
-    thinking_tokens: u32,
-    hit4096_truncation: bool,
-    loop_detected: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ThinkingOnPromptPair {
-    prompt_id: String,
-    prompt_sha256: String,
-    category: String,
-    baseline: ThinkingOnArm,
-    candidate: ThinkingOnArm,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ThinkingOffArm {
-    scale: f64,
-    response_sha256: String,
-    human_reviewed: bool,
-    reviewer_id: String,
-    score: f64,
-    unwanted_refusal: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ThinkingOffPromptPair {
-    prompt_id: String,
-    prompt_sha256: String,
-    category: String,
-    baseline: ThinkingOffArm,
-    candidate: ThinkingOffArm,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ZeroScaleControl {
-    prompt_id: String,
-    prompt_sha256: String,
-    no_adapter_response_sha256: String,
-    zero_scale_response_sha256: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DrG2Evidence {
-    schema_version: u32,
-    contract_sha256: String,
-    base_model_sha256: String,
-    orca_adapter_sha256: String,
-    orca_scale: f64,
-    candidate_adapter_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    candidate_max_rank: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    candidate_target_count: Option<usize>,
-    scale_grid: Vec<f64>,
-    selected_scale: f64,
+pub(super) struct DrG2BlindConfig {
+    pub(super) responses_path: std::path::PathBuf,
+    pub(super) blind_key_path: std::path::PathBuf,
     #[serde(default)]
-    training_prompt_sha256s: Vec<String>,
-    thinking_on_prompts: Vec<ThinkingOnPromptPair>,
-    thinking_off_prompts: Vec<ThinkingOffPromptPair>,
-    zero_scale_controls: Vec<ZeroScaleControl>,
+    pub(super) blind_salt: Option<String>,
+}
+
+/// Request configuration for `dr-g2-apply-reviews`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DrG2ApplyConfig {
+    pub(super) review_path: std::path::PathBuf,
+    pub(super) blind_key_path: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ThinkingOnArm {
+    pub(super) scale: f64,
+    pub(super) response_sha256: String,
+    pub(super) human_reviewed: bool,
+    pub(super) reviewer_id: String,
+    pub(super) score: f64,
+    pub(super) thinking_tokens: u32,
+    pub(super) hit4096_truncation: bool,
+    pub(super) loop_detected: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ThinkingOnPromptPair {
+    pub(super) prompt_id: String,
+    pub(super) prompt_sha256: String,
+    pub(super) category: String,
+    pub(super) baseline: ThinkingOnArm,
+    pub(super) candidate: ThinkingOnArm,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ThinkingOffArm {
+    pub(super) scale: f64,
+    pub(super) response_sha256: String,
+    pub(super) human_reviewed: bool,
+    pub(super) reviewer_id: String,
+    pub(super) score: f64,
+    pub(super) unwanted_refusal: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ThinkingOffPromptPair {
+    pub(super) prompt_id: String,
+    pub(super) prompt_sha256: String,
+    pub(super) category: String,
+    pub(super) baseline: ThinkingOffArm,
+    pub(super) candidate: ThinkingOffArm,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct MultimodalArm {
+    pub(super) scale: f64,
+    pub(super) response_sha256: String,
+    pub(super) human_reviewed: bool,
+    pub(super) reviewer_id: String,
+    pub(super) score: f64,
+    pub(super) visual_grounding_preserved: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct MultimodalPromptPair {
+    pub(super) prompt_id: String,
+    pub(super) prompt_sha256: String,
+    pub(super) image_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) category: Option<String>,
+    pub(super) baseline: MultimodalArm,
+    pub(super) candidate: MultimodalArm,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ZeroScaleControl {
+    pub(super) prompt_id: String,
+    pub(super) prompt_sha256: String,
+    pub(super) no_adapter_response_sha256: String,
+    pub(super) zero_scale_response_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct DrG2Evidence {
+    pub(super) schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) base_model: Option<BaseModelProfile>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(super) include_multimodal_checks: bool,
+    pub(super) contract_sha256: String,
+    pub(super) base_model_sha256: String,
+    #[serde(default)]
+    pub(super) orca_adapter_sha256: Option<String>,
+    pub(super) orca_scale: f64,
+    pub(super) candidate_adapter_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) candidate_max_rank: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) candidate_target_count: Option<usize>,
+    pub(super) scale_grid: Vec<f64>,
+    pub(super) selected_scale: f64,
+    #[serde(default)]
+    pub(super) training_prompt_sha256s: Vec<String>,
+    pub(super) thinking_on_prompts: Vec<ThinkingOnPromptPair>,
+    pub(super) thinking_off_prompts: Vec<ThinkingOffPromptPair>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) multimodal_prompts: Vec<MultimodalPromptPair>,
+    pub(super) zero_scale_controls: Vec<ZeroScaleControl>,
 }
 
 #[expect(
@@ -446,7 +540,7 @@ pub(super) fn run_generate_lock(request: &Request) -> crate::Result<Value> {
     }))
 }
 
-fn validate_scale_grid(grid: &[f64]) -> crate::Result<()> {
+pub(super) fn validate_scale_grid(grid: &[f64]) -> crate::Result<()> {
     if !(2..=MAX_DR_G2_SCALE_GRID_LEN).contains(&grid.len()) {
         return Err(format!(
             "DR-G2 scaleGrid must contain 2..={MAX_DR_G2_SCALE_GRID_LEN} entries."
@@ -471,8 +565,8 @@ fn validate_scale_grid(grid: &[f64]) -> crate::Result<()> {
     Ok(())
 }
 
-fn resolve_scale_grid(config: Option<&DrG2PlanConfig>) -> crate::Result<Vec<f64>> {
-    let grid = match config.and_then(|item| item.scale_grid.as_ref()) {
+pub(super) fn resolve_scale_grid(custom: Option<&Vec<f64>>) -> crate::Result<Vec<f64>> {
+    let grid = match custom {
         Some(custom) => custom.clone(),
         None => vec![0.0, 0.25, 0.5, 0.75, 1.0],
     };
@@ -499,40 +593,65 @@ fn validate_plan_config(config: &DrG2PlanConfig) -> crate::Result<()> {
     Ok(())
 }
 
-fn build_dr_g2_contract(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Canonical DR-G2 contract construction keeps all pinned model, adapter, and threshold fields explicit."
+)]
+pub(super) fn build_dr_g2_contract(
+    base_model: Option<BaseModelProfile>,
+    include_multimodal_checks: bool,
     base_model_sha256: &str,
-    orca_adapter_sha256: &str,
+    orca_adapter_sha256: Option<&str>,
     scale_grid: &[f64],
     candidate_adapter_sha256: Option<&str>,
     candidate_max_rank: Option<u16>,
     candidate_target_count: Option<usize>,
 ) -> Value {
-    json!({
+    let profile = base_model.unwrap_or(BaseModelProfile::SwiftPq2);
+    let orca_scale = if profile.is_nariq() {
+        0.0
+    } else {
+        ORCA_EXPECTED_SCALE
+    };
+    let mut thresholds = json!({
+        "maxThinkingTokenRatio": MAX_THINKING_TOKEN_RATIO,
+        "minCreativeScore": MIN_CREATIVE_SCORE,
+        "zeroExtraLoops": true,
+        "zeroExtra4096Truncations": true,
+        "zeroExtraUnwantedRefusals": true,
+        "requireZeroScaleBitIdentity": true,
+        "requireHumanReview": true,
+        "requireHeldOutSplitDisjointness": true,
+    });
+    if include_multimodal_checks && let Some(obj) = thresholds.as_object_mut() {
+        obj.insert(
+            "requireMultimodalVisualPreservation".to_owned(),
+            json!(true),
+        );
+    }
+    let mut contract = json!({
         "schemaVersion": 1,
         "gate": "DR-G2",
         "baseModelSha256": base_model_sha256,
         "orcaAdapterSha256": orca_adapter_sha256,
-        "orcaScale": ORCA_EXPECTED_SCALE,
+        "orcaScale": orca_scale,
         "candidateAdapterSha256": candidate_adapter_sha256,
         "candidateMaxRank": candidate_max_rank,
         "candidateTargetCount": candidate_target_count,
         "scaleGrid": scale_grid,
         "requiredThinkingOnCategories": THINKING_ON_CATEGORIES,
         "requiredThinkingOffCategories": [THINKING_OFF_CATEGORY],
-        "thresholds": {
-            "maxThinkingTokenRatio": MAX_THINKING_TOKEN_RATIO,
-            "minCreativeScore": MIN_CREATIVE_SCORE,
-            "zeroExtraLoops": true,
-            "zeroExtra4096Truncations": true,
-            "zeroExtraUnwantedRefusals": true,
-            "requireZeroScaleBitIdentity": true,
-            "requireHumanReview": true,
-            "requireHeldOutSplitDisjointness": true,
-        }
-    })
+        "thresholds": thresholds,
+    });
+    if profile.is_nariq()
+        && let Some(obj) = contract.as_object_mut()
+    {
+        obj.insert("baseModel".to_owned(), json!(profile));
+    }
+    contract
 }
 
-fn hash_contract(contract: &Value) -> crate::Result<String> {
+pub(super) fn hash_contract(contract: &Value) -> crate::Result<String> {
     let bytes = serde_json::to_vec(contract)
         .map_err(|error| format!("Cannot serialize DR-G2 contract: {error}"))?;
     Ok(crate::identity::sha256(&bytes))
@@ -546,9 +665,32 @@ pub(super) fn run_dr_g2_plan(request: &Request) -> crate::Result<Value> {
     if let Some(config) = &request.screen_config {
         validate_plan_config(config)?;
     }
-    let scale_grid = resolve_scale_grid(request.screen_config.as_ref())?;
-    let base_sha = compiled_swift_base_sha256()?;
-    let orca_sha = compiled_orca_adapter_sha256()?;
+    let scale_grid = resolve_scale_grid(
+        request
+            .screen_config
+            .as_ref()
+            .and_then(|item| item.scale_grid.as_ref()),
+    )?;
+    let base_profile = request
+        .screen_config
+        .as_ref()
+        .and_then(|cfg| cfg.base_model)
+        .unwrap_or(BaseModelProfile::SwiftPq2);
+    let include_multimodal = request
+        .screen_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.include_multimodal_checks);
+    let base_sha = base_profile.base_model_sha256()?;
+    let orca_sha = if base_profile.is_nariq() {
+        None
+    } else {
+        Some(compiled_orca_adapter_sha256()?)
+    };
+    let orca_scale = if base_profile.is_nariq() {
+        0.0
+    } else {
+        ORCA_EXPECTED_SCALE
+    };
     let cand_sha = request
         .screen_config
         .as_ref()
@@ -563,8 +705,10 @@ pub(super) fn run_dr_g2_plan(request: &Request) -> crate::Result<Value> {
         .and_then(|cfg| cfg.candidate_target_count);
 
     let contract = build_dr_g2_contract(
+        base_profile.is_nariq().then_some(base_profile),
+        include_multimodal,
         &base_sha,
-        &orca_sha,
+        orca_sha.as_deref(),
         &scale_grid,
         cand_sha,
         cand_rank,
@@ -582,7 +726,7 @@ pub(super) fn run_dr_g2_plan(request: &Request) -> crate::Result<Value> {
         "contractSha256": contract_sha256,
         "baseModelSha256": base_sha,
         "orcaAdapterSha256": orca_sha,
-        "orcaScale": ORCA_EXPECTED_SCALE,
+        "orcaScale": orca_scale,
         "candidateAdapterSha256": cand_sha.unwrap_or("COPY_CANDIDATE_ADAPTER_SHA256"),
         "scaleGrid": scale_grid,
         "selectedScale": default_selected,
@@ -640,6 +784,33 @@ pub(super) fn run_dr_g2_plan(request: &Request) -> crate::Result<Value> {
             "zeroScaleResponseSha256": "COPY_ZERO_SCALE_RESPONSE_SHA256"
         }]
     });
+    if base_profile.is_nariq() {
+        evidence_template["baseModel"] = json!(base_profile);
+    }
+    if include_multimodal {
+        evidence_template["includeMultimodalChecks"] = json!(true);
+        evidence_template["multimodalPrompts"] = json!([{
+            "promptId": "mm-001",
+            "promptSha256": "COPY_HELD_OUT_PROMPT_SHA256",
+            "imageSha256": "COPY_IMAGE_SHA256",
+            "baseline": {
+                "scale": 0.0,
+                "responseSha256": "COPY_BASELINE_RESPONSE_SHA256",
+                "humanReviewed": false,
+                "reviewerId": "REVIEWER",
+                "score": 0.0,
+                "visualGroundingPreserved": false
+            },
+            "candidate": {
+                "scale": default_selected,
+                "responseSha256": "COPY_CANDIDATE_RESPONSE_SHA256",
+                "humanReviewed": false,
+                "reviewerId": "REVIEWER",
+                "score": 0.0,
+                "visualGroundingPreserved": false
+            }
+        }]);
+    }
     if let Some(rank) = cand_rank {
         evidence_template["candidateMaxRank"] = json!(rank);
     }
@@ -697,27 +868,45 @@ fn median_f64(mut values: Vec<f64>) -> crate::Result<f64> {
     })
 }
 
-fn validate_evidence_header(
-    evidence: &DrG2Evidence,
-    base_sha: &str,
-    orca_sha: &str,
-) -> crate::Result<&'static str> {
+pub(super) fn validate_evidence_header(evidence: &DrG2Evidence) -> crate::Result<&'static str> {
     if evidence.schema_version != 1 {
         return Err("DR-G2 evidence requires schemaVersion 1.".into());
     }
     if !crate::identity::is_lower_hex(&evidence.contract_sha256, 64) {
         return Err("DR-G2 evidence contractSha256 must be a lowercase 64-hex SHA-256.".into());
     }
-    if evidence.base_model_sha256 != base_sha {
-        return Err("DR-G2 evidence baseModelSha256 disagrees with pinned Swift PQ2 lock.".into());
+    let profile = evidence.base_model.unwrap_or(BaseModelProfile::SwiftPq2);
+    let expected_base_sha = profile.base_model_sha256()?;
+    if evidence.base_model_sha256 != expected_base_sha {
+        return Err(if profile.is_nariq() {
+            "DR-G2 evidence baseModelSha256 disagrees with pinned NariQ lock.".into()
+        } else {
+            "DR-G2 evidence baseModelSha256 disagrees with pinned Swift PQ2 lock.".into()
+        });
     }
-    if evidence.orca_adapter_sha256 != orca_sha {
-        return Err("DR-G2 evidence orcaAdapterSha256 disagrees with pinned Orca lock.".into());
-    }
-    if !evidence.orca_scale.is_finite() || (evidence.orca_scale - ORCA_EXPECTED_SCALE).abs() > 1e-9
-    {
-        return Err("DR-G2 evidence orcaScale must equal 1.3.".into());
-    }
+    let expected_orca_sha = if profile.is_nariq() {
+        if evidence.orca_adapter_sha256.is_some() {
+            return Err("DR-G2 evidence for NariQ requires orcaAdapterSha256: null.".into());
+        }
+        if !evidence.orca_scale.is_finite()
+            || evidence.orca_scale.is_sign_negative()
+            || evidence.orca_scale.abs() > 1e-9
+        {
+            return Err("DR-G2 evidence for NariQ requires orcaScale equal to 0.0.".into());
+        }
+        None
+    } else {
+        let orca_sha = compiled_orca_adapter_sha256()?;
+        if evidence.orca_adapter_sha256.as_deref() != Some(orca_sha.as_str()) {
+            return Err("DR-G2 evidence orcaAdapterSha256 disagrees with pinned Orca lock.".into());
+        }
+        if !evidence.orca_scale.is_finite()
+            || (evidence.orca_scale - ORCA_EXPECTED_SCALE).abs() > 1e-9
+        {
+            return Err("DR-G2 evidence orcaScale must equal 1.3.".into());
+        }
+        Some(orca_sha)
+    };
     if !crate::identity::is_lower_hex(&evidence.candidate_adapter_sha256, 64) {
         return Err(
             "DR-G2 evidence candidateAdapterSha256 must be a lowercase 64-hex SHA-256.".into(),
@@ -746,56 +935,65 @@ fn validate_evidence_header(
         );
     }
 
-    let bound_contract = build_dr_g2_contract(
-        base_sha,
-        orca_sha,
-        &evidence.scale_grid,
-        Some(&evidence.candidate_adapter_sha256),
-        evidence.candidate_max_rank,
-        evidence.candidate_target_count,
-    );
-    let bound_sha = hash_contract(&bound_contract)?;
-    if evidence.contract_sha256 == bound_sha {
-        return Ok("candidate-bound");
-    }
+    let multimodal_candidates: &[bool] = if evidence.include_multimodal_checks {
+        &[true]
+    } else if !evidence.multimodal_prompts.is_empty() {
+        &[true, false]
+    } else {
+        &[false]
+    };
 
-    if evidence.candidate_max_rank.is_none() && evidence.candidate_target_count.is_none() {
-        let generic_contract =
-            build_dr_g2_contract(base_sha, orca_sha, &evidence.scale_grid, None, None, None);
-        let generic_sha = hash_contract(&generic_contract)?;
-        if evidence.contract_sha256 == generic_sha {
-            return Ok("policy-and-grid");
+    for &include_mm in multimodal_candidates {
+        let bound_contract = build_dr_g2_contract(
+            profile.is_nariq().then_some(profile),
+            include_mm,
+            &expected_base_sha,
+            expected_orca_sha.as_deref(),
+            &evidence.scale_grid,
+            Some(&evidence.candidate_adapter_sha256),
+            evidence.candidate_max_rank,
+            evidence.candidate_target_count,
+        );
+        if evidence.contract_sha256 == hash_contract(&bound_contract)? {
+            return Ok("candidate-bound");
+        }
+
+        if evidence.candidate_max_rank.is_none() && evidence.candidate_target_count.is_none() {
+            let generic_contract = build_dr_g2_contract(
+                profile.is_nariq().then_some(profile),
+                include_mm,
+                &expected_base_sha,
+                expected_orca_sha.as_deref(),
+                &evidence.scale_grid,
+                None,
+                None,
+                None,
+            );
+            if evidence.contract_sha256 == hash_contract(&generic_contract)? {
+                return Ok("policy-and-grid");
+            }
         }
     }
 
     Err("DR-G2 evidence contractSha256 does not match canonical DR-G2 contract.".into())
 }
 
-/// Validates and scores a completed DR-G2 evidence bundle fail-closed without network I/O.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Fail-closed validation of split disjointness, human review, and all four DR-G2 quality/safety gates."
-)]
-pub(super) fn run_dr_g2_score(request: &Request) -> crate::Result<Value> {
-    if request.operation != Operation::DrG2Score {
-        return Err("Invalid operation dispatch for dr-g2-score.".into());
-    }
-    let evidence_path = request
-        .evidence_path
-        .as_ref()
-        .ok_or("dr-g2-score requires evidencePath.")?;
+fn read_dr_g2_evidence(path: &Path) -> crate::Result<DrG2Evidence> {
     let raw_bytes = crate::bounded_input::read_regular_file(
-        evidence_path,
+        path,
         MAX_DR_G2_EVIDENCE_BYTES,
         "DR-G2 evidence exceeds 16 MiB.",
     )?;
-    let evidence: DrG2Evidence =
-        serde_json::from_slice(crate::bounded_input::strip_utf8_bom(&raw_bytes))
-            .map_err(|error| crate::cli::bounded_json_error(&error))?;
+    serde_json::from_slice(crate::bounded_input::strip_utf8_bom(&raw_bytes))
+        .map_err(|error| crate::cli::bounded_json_error(&error))
+}
 
-    let base_sha = compiled_swift_base_sha256()?;
-    let orca_sha = compiled_orca_adapter_sha256()?;
-    let contract_scope = validate_evidence_header(&evidence, &base_sha, &orca_sha)?;
+#[expect(
+    clippy::too_many_lines,
+    reason = "Fail-closed validation of split disjointness, human review, and all DR-G2 quality/safety gates."
+)]
+pub(super) fn score_dr_g2_evidence(evidence: &DrG2Evidence) -> crate::Result<Value> {
+    let contract_scope = validate_evidence_header(evidence)?;
 
     let mut training_digests = BTreeSet::new();
     for digest in &evidence.training_prompt_sha256s {
@@ -817,6 +1015,11 @@ pub(super) fn run_dr_g2_score(request: &Request) -> crate::Result<Value> {
     }
     if evidence.zero_scale_controls.is_empty() {
         return Err("DR-G2 requires at least one zero-scale identity control.".into());
+    }
+    let multimodal_active =
+        evidence.include_multimodal_checks || !evidence.multimodal_prompts.is_empty();
+    if multimodal_active && evidence.multimodal_prompts.is_empty() {
+        return Err("DR-G2 multimodal checks require at least one multimodal prompt pair.".into());
     }
 
     let mut cat_totals: BTreeMap<&str, (f64, f64, usize)> = BTreeMap::new();
@@ -949,6 +1152,62 @@ pub(super) fn run_dr_g2_score(request: &Request) -> crate::Result<Value> {
         }
     }
 
+    let mut mm_base_scores = Vec::with_capacity(evidence.multimodal_prompts.len());
+    let mut mm_cand_scores = Vec::with_capacity(evidence.multimodal_prompts.len());
+    let mut cand_min_mm = f64::INFINITY;
+    let mut base_visual_lost = 0_usize;
+    let mut cand_visual_lost = 0_usize;
+
+    for pair in &evidence.multimodal_prompts {
+        validate_nonempty_id(&pair.prompt_id, "Multimodal promptId")?;
+        if !prompt_ids.insert(pair.prompt_id.as_str()) {
+            return Err("Duplicate promptId across DR-G2 evidence.".into());
+        }
+        if !crate::identity::is_lower_hex(&pair.prompt_sha256, 64) {
+            return Err("Multimodal promptSha256 must be lowercase 64-hex.".into());
+        }
+        if !crate::identity::is_lower_hex(&pair.image_sha256, 64) {
+            return Err("Multimodal imageSha256 must be lowercase 64-hex.".into());
+        }
+        if training_digests.contains(pair.prompt_sha256.as_str()) {
+            return Err(
+                "Held-out Multimodal promptSha256 overlaps trainingPromptSha256s split.".into(),
+            );
+        }
+        if let Some(cat) = &pair.category
+            && cat != MULTIMODAL_DEFAULT_CATEGORY
+        {
+            return Err("Multimodal prompt category must be multimodal when supplied.".into());
+        }
+        for (arm, expected_scale) in [
+            (&pair.baseline, 0.0_f64),
+            (&pair.candidate, evidence.selected_scale),
+        ] {
+            if !arm.scale.is_finite() || (arm.scale - expected_scale).abs() > 1e-12 {
+                return Err(
+                    "Multimodal arm scale disagrees with baseline 0.0 or selectedScale.".into(),
+                );
+            }
+            if !crate::identity::is_lower_hex(&arm.response_sha256, 64) {
+                return Err("Multimodal responseSha256 must be lowercase 64-hex.".into());
+            }
+            if !arm.human_reviewed {
+                return Err("DR-G2 requires humanReviewed=true on every Multimodal arm.".into());
+            }
+            validate_nonempty_id(&arm.reviewer_id, "Multimodal reviewerId")?;
+            validate_score(arm.score, "Multimodal")?;
+        }
+        mm_base_scores.push(pair.baseline.score);
+        mm_cand_scores.push(pair.candidate.score);
+        cand_min_mm = cand_min_mm.min(pair.candidate.score);
+        if !pair.baseline.visual_grounding_preserved {
+            base_visual_lost += 1;
+        }
+        if !pair.candidate.visual_grounding_preserved {
+            cand_visual_lost += 1;
+        }
+    }
+
     let mut zero_scale_mismatches = 0_usize;
     for ctrl in &evidence.zero_scale_controls {
         validate_nonempty_id(&ctrl.prompt_id, "Zero-scale control promptId")?;
@@ -1067,62 +1326,1253 @@ pub(super) fn run_dr_g2_score(request: &Request) -> crate::Result<Value> {
         ));
     }
 
+    let mut gates = json!({
+        "capabilityGain": {
+            "passed": capability_gain_passed,
+            "promptCount": evidence.thinking_on_prompts.len(),
+            "baselineMeanScore": base_mean,
+            "candidateMeanScore": cand_mean,
+            "deltaMeanScore": cand_mean - base_mean,
+            "byCategory": category_json,
+        },
+        "antiLoopingPreservation": {
+            "passed": anti_looping_passed,
+            "baselineMedianThinkingTokens": base_median_thinking,
+            "candidateMedianThinkingTokens": cand_median_thinking,
+            "thinkingTokenRatio": thinking_ratio,
+            "maxAllowedRatio": MAX_THINKING_TOKEN_RATIO,
+            "baselineLoops": base_loops,
+            "candidateLoops": cand_loops,
+            "baseline4096Truncations": base_truncations,
+            "candidate4096Truncations": cand_truncations,
+        },
+        "creativeAndOrcaNonRegression": {
+            "passed": creative_passed,
+            "promptCount": evidence.thinking_off_prompts.len(),
+            "baselineMedianScore": base_median_creative,
+            "candidateMedianScore": cand_median_creative,
+            "candidateMinScore": cand_min_creative,
+            "minAllowedScore": MIN_CREATIVE_SCORE,
+            "baselineUnwantedRefusals": base_refusals,
+            "candidateUnwantedRefusals": cand_refusals,
+        },
+        "zeroScaleIdentity": {
+            "passed": zero_scale_passed,
+            "controlCount": evidence.zero_scale_controls.len(),
+            "mismatchCount": zero_scale_mismatches,
+        },
+    });
+
+    let multimodal_passed = if multimodal_active {
+        let base_median_mm = median_f64(mm_base_scores)?;
+        let cand_median_mm = median_f64(mm_cand_scores)?;
+        if cand_median_mm < base_median_mm {
+            failures.push(format!(
+                "Multimodal visual median score regressed ({cand_median_mm:.4} < {base_median_mm:.4})."
+            ));
+        }
+        if cand_min_mm < MIN_MULTIMODAL_SCORE {
+            failures.push(format!(
+                "Multimodal candidate prompt scored below {MIN_MULTIMODAL_SCORE:.1} floor ({cand_min_mm:.4})."
+            ));
+        }
+        if cand_visual_lost > base_visual_lost {
+            failures.push(format!(
+                "Candidate lost visual grounding on more prompts than baseline ({cand_visual_lost} > {base_visual_lost})."
+            ));
+        }
+        let passed = cand_median_mm >= base_median_mm
+            && cand_min_mm >= MIN_MULTIMODAL_SCORE
+            && cand_visual_lost <= base_visual_lost;
+        gates["multimodalPreservation"] = json!({
+            "passed": passed,
+            "promptCount": evidence.multimodal_prompts.len(),
+            "baselineMedianScore": base_median_mm,
+            "candidateMedianScore": cand_median_mm,
+            "candidateMinScore": cand_min_mm,
+            "minAllowedScore": MIN_MULTIMODAL_SCORE,
+            "baselineVisualGroundingLost": base_visual_lost,
+            "candidateVisualGroundingLost": cand_visual_lost,
+        });
+        passed
+    } else {
+        true
+    };
+
     let dr_g2_passed = capability_gain_passed
         && anti_looping_passed
         && creative_passed
         && zero_scale_passed
+        && multimodal_passed
         && failures.is_empty();
 
-    let receipt = json!({
+    Ok(json!({
         "schemaVersion": 1,
         "operation": "dr-g2-score",
         "drG2Passed": dr_g2_passed,
         "status": if dr_g2_passed { "passed" } else { "failed" },
         "contractScope": contract_scope,
+        "baseModel": evidence.base_model.unwrap_or(BaseModelProfile::SwiftPq2),
         "selectedScale": evidence.selected_scale,
         "contractSha256": evidence.contract_sha256,
         "candidateAdapterSha256": evidence.candidate_adapter_sha256,
-        "gates": {
-            "capabilityGain": {
-                "passed": capability_gain_passed,
-                "promptCount": evidence.thinking_on_prompts.len(),
-                "baselineMeanScore": base_mean,
-                "candidateMeanScore": cand_mean,
-                "deltaMeanScore": cand_mean - base_mean,
-                "byCategory": category_json,
-            },
-            "antiLoopingPreservation": {
-                "passed": anti_looping_passed,
-                "baselineMedianThinkingTokens": base_median_thinking,
-                "candidateMedianThinkingTokens": cand_median_thinking,
-                "thinkingTokenRatio": thinking_ratio,
-                "maxAllowedRatio": MAX_THINKING_TOKEN_RATIO,
-                "baselineLoops": base_loops,
-                "candidateLoops": cand_loops,
-                "baseline4096Truncations": base_truncations,
-                "candidate4096Truncations": cand_truncations,
-            },
-            "creativeAndOrcaNonRegression": {
-                "passed": creative_passed,
-                "promptCount": evidence.thinking_off_prompts.len(),
-                "baselineMedianScore": base_median_creative,
-                "candidateMedianScore": cand_median_creative,
-                "candidateMinScore": cand_min_creative,
-                "minAllowedScore": MIN_CREATIVE_SCORE,
-                "baselineUnwantedRefusals": base_refusals,
-                "candidateUnwantedRefusals": cand_refusals,
-            },
-            "zeroScaleIdentity": {
-                "passed": zero_scale_passed,
-                "controlCount": evidence.zero_scale_controls.len(),
-                "mismatchCount": zero_scale_mismatches,
-            },
-        },
+        "gates": gates,
         "failures": failures,
         "promotionDisclaimer": "DR-G2 scoring validates the supplied screen evidence only; Prism repin, lock pinning, owning CI, and X1/X2 device qualification remain separate.",
-    });
+    }))
+}
+
+/// Validates and scores a completed DR-G2 evidence bundle fail-closed without network I/O.
+pub(super) fn run_dr_g2_score(request: &Request) -> crate::Result<Value> {
+    if request.operation != Operation::DrG2Score {
+        return Err("Invalid operation dispatch for dr-g2-score.".into());
+    }
+    let evidence_path = request
+        .evidence_path
+        .as_ref()
+        .ok_or("dr-g2-score requires evidencePath.")?;
+    let evidence = read_dr_g2_evidence(evidence_path)?;
+    let receipt = score_dr_g2_evidence(&evidence)?;
     if let Some(output) = &request.output_path {
         crate::bounded_input::write_pretty_json_new(output, &receipt)?;
     }
     Ok(receipt)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct BlindResponseEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) prompt_text: Option<String>,
+    pub(super) baseline_text: String,
+    pub(super) candidate_text: String,
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThinkingOnBlindItem {
+    prompt_id: String,
+    category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_text: Option<String>,
+    arm_a: String,
+    arm_b: String,
+    reviewer_id: String,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    arm_a_score: Option<f64>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    arm_b_score: Option<f64>,
+    arm_a_loop_detected: bool,
+    arm_b_loop_detected: bool,
+    arm_a_hit4096: bool,
+    arm_b_hit4096: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThinkingOffBlindItem {
+    prompt_id: String,
+    category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_text: Option<String>,
+    arm_a: String,
+    arm_b: String,
+    reviewer_id: String,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    arm_a_score: Option<f64>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    arm_b_score: Option<f64>,
+    arm_a_unwanted_refusal: bool,
+    arm_b_unwanted_refusal: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MultimodalBlindItem {
+    prompt_id: String,
+    category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_text: Option<String>,
+    arm_a: String,
+    arm_b: String,
+    reviewer_id: String,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    arm_a_score: Option<f64>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    arm_b_score: Option<f64>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    arm_a_visual_grounding_preserved: Option<bool>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    arm_b_visual_grounding_preserved: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum BlindReviewItem {
+    ThinkingOn(ThinkingOnBlindItem),
+    ThinkingOff(ThinkingOffBlindItem),
+    Multimodal(MultimodalBlindItem),
+}
+
+impl BlindReviewItem {
+    fn prompt_id(&self) -> &str {
+        match self {
+            Self::ThinkingOn(item) => &item.prompt_id,
+            Self::ThinkingOff(item) => &item.prompt_id,
+            Self::Multimodal(item) => &item.prompt_id,
+        }
+    }
+
+    fn arm_a(&self) -> &str {
+        match self {
+            Self::ThinkingOn(item) => &item.arm_a,
+            Self::ThinkingOff(item) => &item.arm_a,
+            Self::Multimodal(item) => &item.arm_a,
+        }
+    }
+
+    fn arm_b(&self) -> &str {
+        match self {
+            Self::ThinkingOn(item) => &item.arm_b,
+            Self::ThinkingOff(item) => &item.arm_b,
+            Self::Multimodal(item) => &item.arm_b,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BlindReviewPacket {
+    schema_version: u32,
+    operation: String,
+    contract_sha256: String,
+    items: Vec<BlindReviewItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BlindKeyEntry {
+    prompt_id: String,
+    kind: String,
+    arm_a_role: String,
+    arm_b_role: String,
+    baseline_response_sha256: String,
+    candidate_response_sha256: String,
+    arm_a_text_sha256: String,
+    arm_b_text_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlindKeyIntegrityView<'a> {
+    schema_version: u32,
+    contract_sha256: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blind_salt: Option<&'a str>,
+    entries: &'a [BlindKeyEntry],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BlindKeyFile {
+    schema_version: u32,
+    contract_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blind_salt: Option<String>,
+    entries: Vec<BlindKeyEntry>,
+    integrity_sha256: String,
+}
+
+fn blind_key_integrity_sha256(
+    schema_version: u32,
+    contract_sha256: &str,
+    blind_salt: Option<&str>,
+    entries: &[BlindKeyEntry],
+) -> crate::Result<String> {
+    let view = BlindKeyIntegrityView {
+        schema_version,
+        contract_sha256,
+        blind_salt,
+        entries,
+    };
+    let bytes = serde_json::to_vec(&view)
+        .map_err(|error| format!("Cannot serialize blind key integrity view: {error}"))?;
+    Ok(crate::identity::sha256(&bytes))
+}
+
+fn blind_swap_arm_a_is_candidate(
+    contract_sha256: &str,
+    prompt_id: &str,
+    salt: Option<&str>,
+) -> crate::Result<bool> {
+    let mut hasher = crate::identity::Hasher::new()?;
+    hasher.update(b"dr-g2-blind-v1\0")?;
+    hasher.update(contract_sha256.as_bytes())?;
+    hasher.update(b"\0")?;
+    hasher.update(prompt_id.as_bytes())?;
+    hasher.update(b"\0")?;
+    hasher.update(salt.unwrap_or("").as_bytes())?;
+    let digest = hasher.finalize_bytes()?;
+    Ok((digest[0] & 1) == 1)
+}
+
+/// Generates a blinded side-by-side human-review packet and separate integrity-protected unblinding key.
+pub(super) fn run_dr_g2_blind_packet(request: &Request) -> crate::Result<Value> {
+    if request.operation != Operation::DrG2BlindPacket {
+        return Err("Invalid operation dispatch for dr-g2-blind-packet.".into());
+    }
+    let evidence_path = request
+        .evidence_path
+        .as_ref()
+        .ok_or("dr-g2-blind-packet requires evidencePath.")?;
+    let output_path = request
+        .output_path
+        .as_ref()
+        .ok_or("dr-g2-blind-packet requires outputPath.")?;
+    let config = request
+        .blind_config
+        .as_ref()
+        .ok_or("dr-g2-blind-packet requires blindConfig.")?;
+    if let Some(salt) = &config.blind_salt
+        && salt.len() > 256
+    {
+        return Err("blindConfig.blindSalt must be <= 256 bytes.".into());
+    }
+    if output_path == &config.blind_key_path {
+        return Err("blindConfig.blindKeyPath must differ from outputPath.".into());
+    }
+
+    let evidence = read_dr_g2_evidence(evidence_path)?;
+    let _contract_scope = validate_evidence_header(&evidence)?;
+    let responses_bytes = crate::bounded_input::read_regular_file(
+        &config.responses_path,
+        MAX_DR_G2_RESPONSES_BYTES,
+        "DR-G2 responses JSON exceeds 64 MiB.",
+    )?;
+    let responses: BTreeMap<String, BlindResponseEntry> =
+        serde_json::from_slice(crate::bounded_input::strip_utf8_bom(&responses_bytes))
+            .map_err(|error| crate::cli::bounded_json_error(&error))?;
+
+    let mut seen_ids = BTreeSet::new();
+    let total_prompts = evidence
+        .thinking_on_prompts
+        .len()
+        .saturating_add(evidence.thinking_off_prompts.len())
+        .saturating_add(evidence.multimodal_prompts.len());
+    if total_prompts == 0 {
+        return Err("DR-G2 evidence has no reviewable prompt pairs.".into());
+    }
+    let mut items = Vec::with_capacity(total_prompts);
+    let mut entries = Vec::with_capacity(total_prompts);
+
+    let mut build_arms = |prompt_id: &str,
+                          kind: &str,
+                          base_sha: &str,
+                          cand_sha: &str|
+     -> crate::Result<(Option<String>, String, String, BlindKeyEntry)> {
+        validate_nonempty_id(prompt_id, "Blind packet promptId")?;
+        if !seen_ids.insert(prompt_id.to_owned()) {
+            return Err("Duplicate promptId across DR-G2 evidence.".into());
+        }
+        let resp = responses
+            .get(prompt_id)
+            .ok_or_else(|| format!("responsesPath is missing entry for promptId '{prompt_id}'."))?;
+        let swap = blind_swap_arm_a_is_candidate(
+            &evidence.contract_sha256,
+            prompt_id,
+            config.blind_salt.as_deref(),
+        )?;
+        let (arm_a, arm_b, arm_a_role, arm_b_role) = if swap {
+            (
+                resp.candidate_text.clone(),
+                resp.baseline_text.clone(),
+                "candidate".to_owned(),
+                "baseline".to_owned(),
+            )
+        } else {
+            (
+                resp.baseline_text.clone(),
+                resp.candidate_text.clone(),
+                "baseline".to_owned(),
+                "candidate".to_owned(),
+            )
+        };
+        let arm_a_text_sha256 = crate::identity::sha256(arm_a.as_bytes());
+        let arm_b_text_sha256 = crate::identity::sha256(arm_b.as_bytes());
+        Ok((
+            resp.prompt_text.clone(),
+            arm_a,
+            arm_b,
+            BlindKeyEntry {
+                prompt_id: prompt_id.to_owned(),
+                kind: kind.to_owned(),
+                arm_a_role,
+                arm_b_role,
+                baseline_response_sha256: base_sha.to_owned(),
+                candidate_response_sha256: cand_sha.to_owned(),
+                arm_a_text_sha256,
+                arm_b_text_sha256,
+            },
+        ))
+    };
+
+    for pair in &evidence.thinking_on_prompts {
+        let (prompt_text, arm_a, arm_b, key_entry) = build_arms(
+            &pair.prompt_id,
+            "thinking-on",
+            &pair.baseline.response_sha256,
+            &pair.candidate.response_sha256,
+        )?;
+        items.push(BlindReviewItem::ThinkingOn(ThinkingOnBlindItem {
+            prompt_id: pair.prompt_id.clone(),
+            category: pair.category.clone(),
+            prompt_text,
+            arm_a,
+            arm_b,
+            reviewer_id: String::new(),
+            arm_a_score: None,
+            arm_b_score: None,
+            arm_a_loop_detected: false,
+            arm_b_loop_detected: false,
+            arm_a_hit4096: false,
+            arm_b_hit4096: false,
+        }));
+        entries.push(key_entry);
+    }
+
+    for pair in &evidence.thinking_off_prompts {
+        let (prompt_text, arm_a, arm_b, key_entry) = build_arms(
+            &pair.prompt_id,
+            "thinking-off",
+            &pair.baseline.response_sha256,
+            &pair.candidate.response_sha256,
+        )?;
+        items.push(BlindReviewItem::ThinkingOff(ThinkingOffBlindItem {
+            prompt_id: pair.prompt_id.clone(),
+            category: pair.category.clone(),
+            prompt_text,
+            arm_a,
+            arm_b,
+            reviewer_id: String::new(),
+            arm_a_score: None,
+            arm_b_score: None,
+            arm_a_unwanted_refusal: false,
+            arm_b_unwanted_refusal: false,
+        }));
+        entries.push(key_entry);
+    }
+
+    for pair in &evidence.multimodal_prompts {
+        let (prompt_text, arm_a, arm_b, key_entry) = build_arms(
+            &pair.prompt_id,
+            "multimodal",
+            &pair.baseline.response_sha256,
+            &pair.candidate.response_sha256,
+        )?;
+        items.push(BlindReviewItem::Multimodal(MultimodalBlindItem {
+            prompt_id: pair.prompt_id.clone(),
+            category: pair
+                .category
+                .clone()
+                .unwrap_or_else(|| MULTIMODAL_DEFAULT_CATEGORY.to_owned()),
+            prompt_text,
+            arm_a,
+            arm_b,
+            reviewer_id: String::new(),
+            arm_a_score: None,
+            arm_b_score: None,
+            arm_a_visual_grounding_preserved: None,
+            arm_b_visual_grounding_preserved: None,
+        }));
+        entries.push(key_entry);
+    }
+
+    let packet = BlindReviewPacket {
+        schema_version: 1,
+        operation: "dr-g2-blind-packet".to_owned(),
+        contract_sha256: evidence.contract_sha256.clone(),
+        items,
+    };
+    let integrity_sha256 = blind_key_integrity_sha256(
+        1,
+        &evidence.contract_sha256,
+        config.blind_salt.as_deref(),
+        &entries,
+    )?;
+    let key_file = BlindKeyFile {
+        schema_version: 1,
+        contract_sha256: evidence.contract_sha256.clone(),
+        blind_salt: config.blind_salt.clone(),
+        entries,
+        integrity_sha256,
+    };
+
+    let packet_bytes = crate::bounded_input::pretty_json_bytes(&packet)?;
+    let packet_sha256 = crate::identity::sha256(&packet_bytes);
+    let key_bytes = crate::bounded_input::pretty_json_bytes(&key_file)?;
+    let key_sha256 = crate::identity::sha256(&key_bytes);
+
+    crate::bounded_input::write_new_synced(output_path, &packet_bytes)?;
+    crate::bounded_input::write_new_synced(&config.blind_key_path, &key_bytes)?;
+
+    Ok(json!({
+        "schemaVersion": 1,
+        "operation": "dr-g2-blind-packet",
+        "status": "blind-packet-written",
+        "contractSha256": evidence.contract_sha256,
+        "itemCount": packet.items.len(),
+        "packetSha256": packet_sha256,
+        "blindKeySha256": key_sha256,
+    }))
+}
+
+/// Validates and unblinds a completed review packet back into `DrG2Evidence`, then scores it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Fail-closed integrity verification, unblinding, evidence update, and DR-G2 scoring."
+)]
+pub(super) fn run_dr_g2_apply_reviews(request: &Request) -> crate::Result<Value> {
+    if request.operation != Operation::DrG2ApplyReviews {
+        return Err("Invalid operation dispatch for dr-g2-apply-reviews.".into());
+    }
+    let evidence_path = request
+        .evidence_path
+        .as_ref()
+        .ok_or("dr-g2-apply-reviews requires evidencePath.")?;
+    let output_path = request
+        .output_path
+        .as_ref()
+        .ok_or("dr-g2-apply-reviews requires outputPath.")?;
+    let config = request
+        .apply_config
+        .as_ref()
+        .ok_or("dr-g2-apply-reviews requires applyConfig.")?;
+
+    let mut evidence = read_dr_g2_evidence(evidence_path)?;
+    let _contract_scope = validate_evidence_header(&evidence)?;
+
+    let key_bytes = crate::bounded_input::read_regular_file(
+        &config.blind_key_path,
+        MAX_DR_G2_EVIDENCE_BYTES,
+        "DR-G2 blind key exceeds 16 MiB.",
+    )?;
+    let key_file: BlindKeyFile =
+        serde_json::from_slice(crate::bounded_input::strip_utf8_bom(&key_bytes))
+            .map_err(|error| crate::cli::bounded_json_error(&error))?;
+    if key_file.schema_version != 1 {
+        return Err("DR-G2 blind key requires schemaVersion 1.".into());
+    }
+    if key_file.contract_sha256 != evidence.contract_sha256 {
+        return Err("DR-G2 blind key contractSha256 disagrees with evidence.".into());
+    }
+    let expected_integrity = blind_key_integrity_sha256(
+        key_file.schema_version,
+        &key_file.contract_sha256,
+        key_file.blind_salt.as_deref(),
+        &key_file.entries,
+    )?;
+    if key_file.integrity_sha256 != expected_integrity {
+        return Err("DR-G2 blind key integritySha256 verification failed.".into());
+    }
+
+    let review_bytes = crate::bounded_input::read_regular_file(
+        &config.review_path,
+        MAX_DR_G2_RESPONSES_BYTES,
+        "DR-G2 review packet exceeds 64 MiB.",
+    )?;
+    let packet: BlindReviewPacket =
+        serde_json::from_slice(crate::bounded_input::strip_utf8_bom(&review_bytes))
+            .map_err(|error| crate::cli::bounded_json_error(&error))?;
+    if packet.schema_version != 1 || packet.operation != "dr-g2-blind-packet" {
+        return Err(
+            "DR-G2 review packet requires schemaVersion 1 and operation dr-g2-blind-packet.".into(),
+        );
+    }
+    if packet.contract_sha256 != evidence.contract_sha256 {
+        return Err("DR-G2 review packet contractSha256 disagrees with evidence.".into());
+    }
+
+    let mut key_by_id: BTreeMap<&str, &BlindKeyEntry> = BTreeMap::new();
+    for entry in &key_file.entries {
+        if key_by_id.insert(entry.prompt_id.as_str(), entry).is_some() {
+            return Err("Duplicate promptId in DR-G2 blind key.".into());
+        }
+    }
+    let mut review_by_id: BTreeMap<&str, &BlindReviewItem> = BTreeMap::new();
+    for item in &packet.items {
+        let id = item.prompt_id();
+        validate_nonempty_id(id, "Blind review promptId")?;
+        if review_by_id.insert(id, item).is_some() {
+            return Err("Duplicate promptId in DR-G2 review packet.".into());
+        }
+    }
+
+    let expected_total = evidence
+        .thinking_on_prompts
+        .len()
+        .saturating_add(evidence.thinking_off_prompts.len())
+        .saturating_add(evidence.multimodal_prompts.len());
+    if key_by_id.len() != expected_total || review_by_id.len() != expected_total {
+        return Err(
+            "DR-G2 blind key or review packet prompt count disagrees with evidence.".into(),
+        );
+    }
+
+    let verify_binding = |prompt_id: &str,
+                          expected_kind: &str,
+                          base_sha: &str,
+                          cand_sha: &str|
+     -> crate::Result<(&BlindKeyEntry, &BlindReviewItem, bool)> {
+        let entry = key_by_id
+            .get(prompt_id)
+            .copied()
+            .ok_or_else(|| format!("DR-G2 blind key is missing promptId '{prompt_id}'."))?;
+        if entry.kind != expected_kind
+            || entry.baseline_response_sha256 != base_sha
+            || entry.candidate_response_sha256 != cand_sha
+        {
+            return Err(format!(
+                "DR-G2 blind key entry for '{prompt_id}' disagrees with evidence."
+            ));
+        }
+        let a_is_candidate = match (entry.arm_a_role.as_str(), entry.arm_b_role.as_str()) {
+            ("candidate", "baseline") => true,
+            ("baseline", "candidate") => false,
+            _ => {
+                return Err(format!(
+                    "DR-G2 blind key entry for '{prompt_id}' has invalid arm roles."
+                ));
+            }
+        };
+        let item = review_by_id
+            .get(prompt_id)
+            .copied()
+            .ok_or_else(|| format!("DR-G2 review packet is missing promptId '{prompt_id}'."))?;
+        if crate::identity::sha256(item.arm_a().as_bytes()) != entry.arm_a_text_sha256
+            || crate::identity::sha256(item.arm_b().as_bytes()) != entry.arm_b_text_sha256
+        {
+            return Err(format!(
+                "DR-G2 review packet text for '{prompt_id}' was modified after blinding."
+            ));
+        }
+        Ok((entry, item, a_is_candidate))
+    };
+
+    for pair in &mut evidence.thinking_on_prompts {
+        let (_entry, item, a_is_candidate) = verify_binding(
+            &pair.prompt_id,
+            "thinking-on",
+            &pair.baseline.response_sha256,
+            &pair.candidate.response_sha256,
+        )?;
+        let BlindReviewItem::ThinkingOn(review) = item else {
+            return Err(format!(
+                "Review item '{}' does not match Thinking-ON schema.",
+                pair.prompt_id
+            ));
+        };
+        validate_nonempty_id(&review.reviewer_id, "Blind review reviewerId")?;
+        let score_a = review
+            .arm_a_score
+            .ok_or("Blind review armAScore must be provided (0.0..=4.0).")?;
+        let score_b = review
+            .arm_b_score
+            .ok_or("Blind review armBScore must be provided (0.0..=4.0).")?;
+        validate_score(score_a, "Blind review armAScore")?;
+        validate_score(score_b, "Blind review armBScore")?;
+
+        let ((base_score, base_loop, base_hit4096), (cand_score, cand_loop, cand_hit4096)) =
+            if a_is_candidate {
+                (
+                    (score_b, review.arm_b_loop_detected, review.arm_b_hit4096),
+                    (score_a, review.arm_a_loop_detected, review.arm_a_hit4096),
+                )
+            } else {
+                (
+                    (score_a, review.arm_a_loop_detected, review.arm_a_hit4096),
+                    (score_b, review.arm_b_loop_detected, review.arm_b_hit4096),
+                )
+            };
+        pair.baseline.human_reviewed = true;
+        pair.baseline.reviewer_id = review.reviewer_id.clone();
+        pair.baseline.score = base_score;
+        pair.baseline.loop_detected = pair.baseline.loop_detected || base_loop;
+        pair.baseline.hit4096_truncation = pair.baseline.hit4096_truncation || base_hit4096;
+
+        pair.candidate.human_reviewed = true;
+        pair.candidate.reviewer_id = review.reviewer_id.clone();
+        pair.candidate.score = cand_score;
+        pair.candidate.loop_detected = pair.candidate.loop_detected || cand_loop;
+        pair.candidate.hit4096_truncation = pair.candidate.hit4096_truncation || cand_hit4096;
+    }
+
+    for pair in &mut evidence.thinking_off_prompts {
+        let (_entry, item, a_is_candidate) = verify_binding(
+            &pair.prompt_id,
+            "thinking-off",
+            &pair.baseline.response_sha256,
+            &pair.candidate.response_sha256,
+        )?;
+        let BlindReviewItem::ThinkingOff(review) = item else {
+            return Err(format!(
+                "Review item '{}' does not match Thinking-OFF schema.",
+                pair.prompt_id
+            ));
+        };
+        validate_nonempty_id(&review.reviewer_id, "Blind review reviewerId")?;
+        let score_a = review
+            .arm_a_score
+            .ok_or("Blind review armAScore must be provided (0.0..=4.0).")?;
+        let score_b = review
+            .arm_b_score
+            .ok_or("Blind review armBScore must be provided (0.0..=4.0).")?;
+        validate_score(score_a, "Blind review armAScore")?;
+        validate_score(score_b, "Blind review armBScore")?;
+
+        let ((base_score, base_refusal), (cand_score, cand_refusal)) = if a_is_candidate {
+            (
+                (score_b, review.arm_b_unwanted_refusal),
+                (score_a, review.arm_a_unwanted_refusal),
+            )
+        } else {
+            (
+                (score_a, review.arm_a_unwanted_refusal),
+                (score_b, review.arm_b_unwanted_refusal),
+            )
+        };
+        pair.baseline.human_reviewed = true;
+        pair.baseline.reviewer_id = review.reviewer_id.clone();
+        pair.baseline.score = base_score;
+        pair.baseline.unwanted_refusal = base_refusal;
+
+        pair.candidate.human_reviewed = true;
+        pair.candidate.reviewer_id = review.reviewer_id.clone();
+        pair.candidate.score = cand_score;
+        pair.candidate.unwanted_refusal = cand_refusal;
+    }
+
+    for pair in &mut evidence.multimodal_prompts {
+        let (_entry, item, a_is_candidate) = verify_binding(
+            &pair.prompt_id,
+            "multimodal",
+            &pair.baseline.response_sha256,
+            &pair.candidate.response_sha256,
+        )?;
+        let BlindReviewItem::Multimodal(review) = item else {
+            return Err(format!(
+                "Review item '{}' does not match Multimodal schema.",
+                pair.prompt_id
+            ));
+        };
+        validate_nonempty_id(&review.reviewer_id, "Blind review reviewerId")?;
+        let score_a = review
+            .arm_a_score
+            .ok_or("Blind review armAScore must be provided (0.0..=4.0).")?;
+        let score_b = review
+            .arm_b_score
+            .ok_or("Blind review armBScore must be provided (0.0..=4.0).")?;
+        validate_score(score_a, "Blind review armAScore")?;
+        validate_score(score_b, "Blind review armBScore")?;
+        let vis_a = review
+            .arm_a_visual_grounding_preserved
+            .ok_or("Blind review must specify armAVisualGroundingPreserved.")?;
+        let vis_b = review
+            .arm_b_visual_grounding_preserved
+            .ok_or("Blind review must specify armBVisualGroundingPreserved.")?;
+
+        let ((base_score, base_vis), (cand_score, cand_vis)) = if a_is_candidate {
+            ((score_b, vis_b), (score_a, vis_a))
+        } else {
+            ((score_a, vis_a), (score_b, vis_b))
+        };
+        pair.baseline.human_reviewed = true;
+        pair.baseline.reviewer_id = review.reviewer_id.clone();
+        pair.baseline.score = base_score;
+        pair.baseline.visual_grounding_preserved = base_vis;
+
+        pair.candidate.human_reviewed = true;
+        pair.candidate.reviewer_id = review.reviewer_id.clone();
+        pair.candidate.score = cand_score;
+        pair.candidate.visual_grounding_preserved = cand_vis;
+    }
+
+    let updated_bytes = crate::bounded_input::pretty_json_bytes(&evidence)?;
+    let updated_evidence_sha256 = crate::identity::sha256(&updated_bytes);
+    let scoring = score_dr_g2_evidence(&evidence)?;
+    crate::bounded_input::write_new_synced(output_path, &updated_bytes)?;
+
+    Ok(json!({
+        "schemaVersion": 1,
+        "operation": "dr-g2-apply-reviews",
+        "status": "reviews-applied",
+        "promptCount": expected_total,
+        "updatedEvidenceSha256": updated_evidence_sha256,
+        "drG2Passed": scoring["drG2Passed"],
+        "scoring": scoring,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use serde_json::{Value, json};
+
+    use super::super::run;
+    use super::BaseModelProfile;
+    use crate::bounded_input::ScratchDir;
+
+    #[test]
+    fn dr_g2_plan_preserves_swift_pq2_contract_sha256_backward_compatibility() -> crate::Result<()>
+    {
+        let cand_sha = "1b850494b8759e24c511aac39621db3e88a4d708a075012b47dca2682001c569";
+        let default_plan = run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-plan",
+            "screenConfig": {
+                "candidateAdapterSha256": cand_sha,
+                "candidateMaxRank": 16,
+                "candidateTargetCount": 128,
+                "scaleGrid": [0.0, 0.5, 1.0, 1.5, 2.0]
+            }
+        }))?;
+        let explicit_swift_plan = run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-plan",
+            "screenConfig": {
+                "baseModel": "swift-pq2",
+                "includeMultimodalChecks": false,
+                "candidateAdapterSha256": cand_sha,
+                "candidateMaxRank": 16,
+                "candidateTargetCount": 128,
+                "scaleGrid": [0.0, 0.5, 1.0, 1.5, 2.0]
+            }
+        }))?;
+        assert_eq!(
+            default_plan["contractSha256"],
+            "963b26d9cb7d2e5dcba0cf4e3b5290706594f7e89dac7f0cfbb8a6661dc39413"
+        );
+        assert_eq!(
+            explicit_swift_plan["contractSha256"],
+            default_plan["contractSha256"]
+        );
+        assert!(default_plan["contract"].get("baseModel").is_none());
+        assert!(
+            default_plan["contract"]["thresholds"]
+                .get("requireMultimodalVisualPreservation")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dr_g2_nariq_variants_require_null_orca_and_zero_orca_scale() -> crate::Result<()> {
+        let scratch = ScratchDir::new("Bonsai-DrG2-Nariq")?;
+        let cand_sha = "ab".repeat(32);
+        for (profile_str, profile) in [
+            ("nariq-2.5bpw", BaseModelProfile::Nariq2_5Bpw),
+            ("nariq-3.0bpw", BaseModelProfile::Nariq3_0Bpw),
+            ("nariq-2.0bpw", BaseModelProfile::Nariq2_0Bpw),
+        ] {
+            let plan = run(json!({
+                "schemaVersion": 1,
+                "operation": "dr-g2-plan",
+                "screenConfig": {
+                    "baseModel": profile_str,
+                    "candidateAdapterSha256": cand_sha,
+                    "candidateMaxRank": 16,
+                    "candidateTargetCount": 128
+                }
+            }))?;
+            assert_eq!(plan["contract"]["baseModel"], profile_str);
+            assert_eq!(plan["contract"]["orcaAdapterSha256"], Value::Null);
+            assert_eq!(plan["contract"]["orcaScale"], 0.0);
+            assert_eq!(
+                plan["contract"]["baseModelSha256"],
+                profile.base_model_sha256()?
+            );
+
+            let evidence = json!({
+                "schemaVersion": 1,
+                "baseModel": profile_str,
+                "contractSha256": plan["contractSha256"],
+                "baseModelSha256": profile.base_model_sha256()?,
+                "orcaAdapterSha256": null,
+                "orcaScale": 0.0,
+                "candidateAdapterSha256": cand_sha,
+                "candidateMaxRank": 16,
+                "candidateTargetCount": 128,
+                "scaleGrid": [0.0, 0.25, 0.5, 0.75, 1.0],
+                "selectedScale": 0.25,
+                "trainingPromptSha256s": [],
+                "thinkingOnPrompts": [
+                    {
+                        "promptId": "c1", "promptSha256": "11".repeat(32), "category": "coding",
+                        "baseline": { "scale": 0.0, "responseSha256": "a1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 2.5, "thinkingTokens": 100, "hit4096Truncation": false, "loopDetected": false },
+                        "candidate": { "scale": 0.25, "responseSha256": "b1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "thinkingTokens": 105, "hit4096Truncation": false, "loopDetected": false }
+                    },
+                    {
+                        "promptId": "r1", "promptSha256": "12".repeat(32), "category": "reasoning",
+                        "baseline": { "scale": 0.0, "responseSha256": "c1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.0, "thinkingTokens": 100, "hit4096Truncation": false, "loopDetected": false },
+                        "candidate": { "scale": 0.25, "responseSha256": "d1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "thinkingTokens": 105, "hit4096Truncation": false, "loopDetected": false }
+                    },
+                    {
+                        "promptId": "i1", "promptSha256": "13".repeat(32), "category": "instruction-following",
+                        "baseline": { "scale": 0.0, "responseSha256": "e1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.0, "thinkingTokens": 100, "hit4096Truncation": false, "loopDetected": false },
+                        "candidate": { "scale": 0.25, "responseSha256": "f1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.0, "thinkingTokens": 105, "hit4096Truncation": false, "loopDetected": false }
+                    }
+                ],
+                "thinkingOffPrompts": [{
+                    "promptId": "cr1", "promptSha256": "14".repeat(32), "category": "creative-prose",
+                    "baseline": { "scale": 0.0, "responseSha256": "21".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "unwantedRefusal": false },
+                    "candidate": { "scale": 0.25, "responseSha256": "31".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "unwantedRefusal": false }
+                }],
+                "zeroScaleControls": [{
+                    "promptId": "z1", "promptSha256": "15".repeat(32),
+                    "noAdapterResponseSha256": "41".repeat(32),
+                    "zeroScaleResponseSha256": "41".repeat(32)
+                }]
+            });
+            let path = scratch.join(format!("{profile_str}.json"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&evidence).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let scored = run(json!({
+                "schemaVersion": 1,
+                "operation": "dr-g2-score",
+                "evidencePath": path
+            }))?;
+            assert_eq!(scored["drG2Passed"], true);
+            assert_eq!(scored["baseModel"], profile_str);
+
+            // Reject non-null Orca on NariQ and non-zero orcaScale on NariQ.
+            let mut bad_orca = evidence.clone();
+            bad_orca["orcaAdapterSha256"] = json!("ff".repeat(32));
+            let bad_path = scratch.join(format!("{profile_str}-bad-orca.json"));
+            fs::write(
+                &bad_path,
+                serde_json::to_vec(&bad_orca).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            assert!(
+                run(json!({
+                    "schemaVersion": 1,
+                    "operation": "dr-g2-score",
+                    "evidencePath": bad_path
+                }))
+                .is_err()
+            );
+
+            let mut bad_scale = evidence;
+            bad_scale["orcaScale"] = json!(1.3);
+            let bad_scale_path = scratch.join(format!("{profile_str}-bad-scale.json"));
+            fs::write(
+                &bad_scale_path,
+                serde_json::to_vec(&bad_scale).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            assert!(
+                run(json!({
+                    "schemaVersion": 1,
+                    "operation": "dr-g2-score",
+                    "evidencePath": bad_scale_path
+                }))
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dr_g2_selective_rl_multimodal_and_blind_review_round_trip() -> crate::Result<()> {
+        let scratch = ScratchDir::new("Bonsai-DrG2-Blind")?;
+        let cand_sha = "cc".repeat(32);
+        let plan = run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-plan",
+            "screenConfig": {
+                "includeMultimodalChecks": true,
+                "candidateAdapterSha256": cand_sha,
+                "candidateMaxRank": 16,
+                "candidateTargetCount": 128
+            }
+        }))?;
+        assert_eq!(
+            plan["contract"]["thresholds"]["requireMultimodalVisualPreservation"],
+            true
+        );
+
+        let base_sha = plan["contract"]["baseModelSha256"]
+            .as_str()
+            .ok_or("Missing baseModelSha256.")?
+            .to_owned();
+        let orca_sha = plan["contract"]["orcaAdapterSha256"]
+            .as_str()
+            .ok_or("Missing orcaAdapterSha256.")?
+            .to_owned();
+        let train_sha = "99".repeat(32);
+
+        let unreviewed_evidence = json!({
+            "schemaVersion": 1,
+            "includeMultimodalChecks": true,
+            "contractSha256": plan["contractSha256"],
+            "baseModelSha256": base_sha,
+            "orcaAdapterSha256": orca_sha,
+            "orcaScale": 1.3,
+            "candidateAdapterSha256": cand_sha,
+            "candidateMaxRank": 16,
+            "candidateTargetCount": 128,
+            "scaleGrid": [0.0, 0.25, 0.5, 0.75, 1.0],
+            "selectedScale": 0.25,
+            "trainingPromptSha256s": [train_sha],
+            "thinkingOnPrompts": [
+                {
+                    "promptId": "code-1", "promptSha256": "11".repeat(32), "category": "coding",
+                    "baseline": { "scale": 0.0, "responseSha256": "a1".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "thinkingTokens": 400, "hit4096Truncation": false, "loopDetected": false },
+                    "candidate": { "scale": 0.25, "responseSha256": "b1".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "thinkingTokens": 420, "hit4096Truncation": false, "loopDetected": false }
+                },
+                {
+                    "promptId": "reason-1", "promptSha256": "12".repeat(32), "category": "reasoning",
+                    "baseline": { "scale": 0.0, "responseSha256": "c1".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "thinkingTokens": 400, "hit4096Truncation": false, "loopDetected": false },
+                    "candidate": { "scale": 0.25, "responseSha256": "d1".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "thinkingTokens": 410, "hit4096Truncation": false, "loopDetected": false }
+                },
+                {
+                    "promptId": "if-1", "promptSha256": "13".repeat(32), "category": "instruction-following",
+                    "baseline": { "scale": 0.0, "responseSha256": "e1".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "thinkingTokens": 300, "hit4096Truncation": false, "loopDetected": false },
+                    "candidate": { "scale": 0.25, "responseSha256": "f1".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "thinkingTokens": 310, "hit4096Truncation": false, "loopDetected": false }
+                }
+            ],
+            "thinkingOffPrompts": [{
+                "promptId": "creative-1", "promptSha256": "14".repeat(32), "category": "creative-prose",
+                "baseline": { "scale": 0.0, "responseSha256": "21".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "unwantedRefusal": false },
+                "candidate": { "scale": 0.25, "responseSha256": "31".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "unwantedRefusal": false }
+            }],
+            "multimodalPrompts": [{
+                "promptId": "mm-1", "promptSha256": "15".repeat(32), "imageSha256": "88".repeat(32),
+                "baseline": { "scale": 0.0, "responseSha256": "41".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "visualGroundingPreserved": false },
+                "candidate": { "scale": 0.25, "responseSha256": "51".repeat(32), "humanReviewed": false, "reviewerId": "", "score": 0.0, "visualGroundingPreserved": false }
+            }],
+            "zeroScaleControls": [{
+                "promptId": "z-1", "promptSha256": "16".repeat(32),
+                "noAdapterResponseSha256": "00".repeat(32), "zeroScaleResponseSha256": "00".repeat(32)
+            }]
+        });
+        let evidence_path = scratch.join("unreviewed.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec(&unreviewed_evidence).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let responses = json!({
+            "code-1": { "promptText": "Write Rust code.", "baselineText": "base code", "candidateText": "cand code" },
+            "reason-1": { "baselineText": "base reason", "candidateText": "cand reason" },
+            "if-1": { "baselineText": "base if", "candidateText": "cand if" },
+            "creative-1": { "promptText": "Write a poem.", "baselineText": "base prose", "candidateText": "cand prose" },
+            "mm-1": { "promptText": "Describe the image.", "baselineText": "base vision", "candidateText": "cand vision" }
+        });
+        let responses_path = scratch.join("responses.json");
+        fs::write(
+            &responses_path,
+            serde_json::to_vec(&responses).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let packet_path = scratch.join("blind-packet.json");
+        let blind_key_path = scratch.join("blind-key.json");
+        let blind_receipt = run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-blind-packet",
+            "evidencePath": evidence_path,
+            "outputPath": packet_path,
+            "blindConfig": {
+                "responsesPath": responses_path,
+                "blindKeyPath": blind_key_path,
+                "blindSalt": "deterministic-salt"
+            }
+        }))?;
+        assert_eq!(blind_receipt["status"], "blind-packet-written");
+        assert_eq!(blind_receipt["itemCount"], 5);
+
+        let packet_text = fs::read_to_string(&packet_path).map_err(|e| e.to_string())?;
+        assert!(!packet_text.contains("baseline"));
+        assert!(!packet_text.contains("candidate"));
+        assert!(!packet_text.contains("scale"));
+        let mut packet: Value = serde_json::from_str(&packet_text).map_err(|e| e.to_string())?;
+        let key_json: Value =
+            serde_json::from_slice(&fs::read(&blind_key_path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+
+        // Check deterministic permutation & optional promptText presence/omission.
+        let items = packet["items"].as_array_mut().ok_or("Missing items.")?;
+        assert_eq!(items[0]["promptText"], "Write Rust code.");
+        assert!(items[1].get("promptText").is_none());
+
+        // Blank packet must be rejected by dr-g2-apply-reviews.
+        let rejected_out = scratch.join("rejected-out.json");
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "dr-g2-apply-reviews",
+                "evidencePath": evidence_path,
+                "outputPath": rejected_out,
+                "applyConfig": {
+                    "reviewPath": packet_path,
+                    "blindKeyPath": blind_key_path
+                }
+            }))
+            .is_err()
+        );
+
+        // Fill in completed review scores using arm_a_role from blind key to verify unblinding accuracy.
+        let key_entries = key_json["entries"].as_array().ok_or("Missing entries.")?;
+        for (item, key_entry) in items.iter_mut().zip(key_entries.iter()) {
+            item["reviewerId"] = json!("owner");
+            let a_is_cand = key_entry["armARole"] == "candidate";
+            let (cand_score, base_score) = match item["promptId"].as_str() {
+                Some("code-1") => (3.5, 2.5),
+                Some("reason-1") => (3.5, 3.0),
+                Some("if-1") => (3.0, 3.0),
+                Some("creative-1") => (3.5, 3.5),
+                Some("mm-1") => (3.5, 3.0),
+                _ => return Err("Unexpected promptId.".into()),
+            };
+            item["armAScore"] = json!(if a_is_cand { cand_score } else { base_score });
+            item["armBScore"] = json!(if a_is_cand { base_score } else { cand_score });
+            if item["promptId"] == "mm-1" {
+                item["armAVisualGroundingPreserved"] = json!(true);
+                item["armBVisualGroundingPreserved"] = json!(true);
+            }
+        }
+        let completed_review_path = scratch.join("completed-review.json");
+        fs::write(
+            &completed_review_path,
+            serde_json::to_vec_pretty(&packet).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let applied_evidence_path = scratch.join("applied-evidence.json");
+        let applied = run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-apply-reviews",
+            "evidencePath": evidence_path,
+            "outputPath": applied_evidence_path,
+            "applyConfig": {
+                "reviewPath": completed_review_path,
+                "blindKeyPath": blind_key_path
+            }
+        }))?;
+        assert_eq!(applied["status"], "reviews-applied");
+        assert_eq!(applied["drG2Passed"], true);
+        assert_eq!(
+            applied["scoring"]["gates"]["multimodalPreservation"]["passed"],
+            true
+        );
+
+        let scored = run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-score",
+            "evidencePath": applied_evidence_path
+        }))?;
+        assert_eq!(scored["drG2Passed"], true);
+        assert_eq!(scored["gates"]["multimodalPreservation"]["passed"], true);
+
+        // Verify multimodal failure modes (lost grounding, score < 3.0, split overlap, empty multimodal).
+        let mut applied_val: Value =
+            serde_json::from_slice(&fs::read(&applied_evidence_path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+
+        let mut lost_grounding = applied_val.clone();
+        lost_grounding["multimodalPrompts"][0]["candidate"]["visualGroundingPreserved"] =
+            json!(false);
+        let lost_path = scratch.join("mm-lost.json");
+        fs::write(
+            &lost_path,
+            serde_json::to_vec(&lost_grounding).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let lost_score = run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-score",
+            "evidencePath": lost_path
+        }))?;
+        assert_eq!(lost_score["drG2Passed"], false);
+        assert_eq!(
+            lost_score["gates"]["multimodalPreservation"]["passed"],
+            false
+        );
+
+        let mut mm_overlap = applied_val.clone();
+        mm_overlap["multimodalPrompts"][0]["promptSha256"] = json!(train_sha);
+        let overlap_path = scratch.join("mm-overlap.json");
+        fs::write(
+            &overlap_path,
+            serde_json::to_vec(&mm_overlap).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "dr-g2-score",
+                "evidencePath": overlap_path
+            }))
+            .is_err()
+        );
+
+        applied_val["multimodalPrompts"] = json!([]);
+        let empty_mm_path = scratch.join("mm-empty.json");
+        fs::write(
+            &empty_mm_path,
+            serde_json::to_vec(&applied_val).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "dr-g2-score",
+                "evidencePath": empty_mm_path
+            }))
+            .is_err()
+        );
+
+        // Verify tampered blind key integrity fails closed.
+        let mut tampered_key = key_json;
+        tampered_key["entries"][0]["armARole"] =
+            json!(if tampered_key["entries"][0]["armARole"] == "candidate" {
+                "baseline"
+            } else {
+                "candidate"
+            });
+        let tampered_key_path = scratch.join("tampered-key.json");
+        fs::write(
+            &tampered_key_path,
+            serde_json::to_vec(&tampered_key).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "dr-g2-apply-reviews",
+                "evidencePath": evidence_path,
+                "outputPath": scratch.join("tampered-out.json"),
+                "applyConfig": {
+                    "reviewPath": completed_review_path,
+                    "blindKeyPath": tampered_key_path
+                }
+            }))
+            .is_err()
+        );
+
+        Ok(())
+    }
 }

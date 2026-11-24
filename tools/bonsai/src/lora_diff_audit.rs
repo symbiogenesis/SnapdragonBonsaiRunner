@@ -57,6 +57,8 @@ enum Operation {
     GenerateLock,
     DrG2Plan,
     DrG2Score,
+    DrG2BlindPacket,
+    DrG2ApplyReviews,
     ImportPeftLora,
 }
 
@@ -282,6 +284,10 @@ struct Request {
     #[serde(default)]
     screen_config: Option<readiness::DrG2PlanConfig>,
     #[serde(default)]
+    blind_config: Option<readiness::DrG2BlindConfig>,
+    #[serde(default)]
+    apply_config: Option<readiness::DrG2ApplyConfig>,
+    #[serde(default)]
     peft_config: Option<peft_import::ImportPeftConfig>,
 }
 
@@ -339,6 +345,8 @@ fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
         | Operation::GenerateLock
         | Operation::DrG2Plan
         | Operation::DrG2Score
+        | Operation::DrG2BlindPacket
+        | Operation::DrG2ApplyReviews
         | Operation::ImportPeftLora => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
     }
 }
@@ -402,11 +410,24 @@ fn validate_request(request: &Request) -> crate::Result<()> {
                 .into(),
         );
     }
-    if request.operation != Operation::DrG2Score && request.evidence_path.is_some() {
-        return Err("evidencePath is only supported for dr-g2-score.".into());
+    if !matches!(
+        request.operation,
+        Operation::DrG2Score | Operation::DrG2BlindPacket | Operation::DrG2ApplyReviews
+    ) && request.evidence_path.is_some()
+    {
+        return Err(
+            "evidencePath is only supported for dr-g2-score, dr-g2-blind-packet, and dr-g2-apply-reviews."
+                .into(),
+        );
     }
     if request.operation != Operation::DrG2Plan && request.screen_config.is_some() {
         return Err("screenConfig is only supported for dr-g2-plan.".into());
+    }
+    if request.operation != Operation::DrG2BlindPacket && request.blind_config.is_some() {
+        return Err("blindConfig is only supported for dr-g2-blind-packet.".into());
+    }
+    if request.operation != Operation::DrG2ApplyReviews && request.apply_config.is_some() {
+        return Err("applyConfig is only supported for dr-g2-apply-reviews.".into());
     }
     if request.operation != Operation::ImportPeftLora && request.peft_config.is_some() {
         return Err("peftConfig is only supported for import-peft-lora.".into());
@@ -646,6 +667,62 @@ fn validate_request(request: &Request) -> crate::Result<()> {
             peft_import::validate_import_peft_config(config)?;
             return Ok(());
         }
+        Operation::DrG2BlindPacket => {
+            if request.source.is_some() {
+                return Err("dr-g2-blind-packet does not accept a model diff source.".into());
+            }
+            if request.adapter_path.is_some() {
+                return Err("dr-g2-blind-packet does not accept adapterPath.".into());
+            }
+            let evidence_path = request
+                .evidence_path
+                .as_ref()
+                .ok_or("dr-g2-blind-packet requires evidencePath.")?;
+            bonsai_artifacts::validate_external_path(evidence_path).map_err(|e| e.to_string())?;
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("dr-g2-blind-packet requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            let config = request
+                .blind_config
+                .as_ref()
+                .ok_or("dr-g2-blind-packet requires blindConfig.")?;
+            bonsai_artifacts::validate_external_path(&config.responses_path)
+                .map_err(|e| e.to_string())?;
+            validate_output_path(&config.blind_key_path)?;
+            if &config.blind_key_path == output {
+                return Err("blindConfig.blindKeyPath must differ from outputPath.".into());
+            }
+            return Ok(());
+        }
+        Operation::DrG2ApplyReviews => {
+            if request.source.is_some() {
+                return Err("dr-g2-apply-reviews does not accept a model diff source.".into());
+            }
+            if request.adapter_path.is_some() {
+                return Err("dr-g2-apply-reviews does not accept adapterPath.".into());
+            }
+            let evidence_path = request
+                .evidence_path
+                .as_ref()
+                .ok_or("dr-g2-apply-reviews requires evidencePath.")?;
+            bonsai_artifacts::validate_external_path(evidence_path).map_err(|e| e.to_string())?;
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("dr-g2-apply-reviews requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            let config = request
+                .apply_config
+                .as_ref()
+                .ok_or("dr-g2-apply-reviews requires applyConfig.")?;
+            bonsai_artifacts::validate_external_path(&config.review_path)
+                .map_err(|e| e.to_string())?;
+            bonsai_artifacts::validate_external_path(&config.blind_key_path)
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         Operation::Plan | Operation::Audit | Operation::ExportDenoised => {}
     }
 
@@ -770,6 +847,8 @@ fn validate_request(request: &Request) -> crate::Result<()> {
         | Operation::GenerateLock
         | Operation::DrG2Plan
         | Operation::DrG2Score
+        | Operation::DrG2BlindPacket
+        | Operation::DrG2ApplyReviews
         | Operation::ImportPeftLora => {}
     }
     Ok(())
@@ -2640,6 +2719,8 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::GenerateLock => readiness::run_generate_lock(&parsed),
         Operation::DrG2Plan => readiness::run_dr_g2_plan(&parsed),
         Operation::DrG2Score => readiness::run_dr_g2_score(&parsed),
+        Operation::DrG2BlindPacket => readiness::run_dr_g2_blind_packet(&parsed),
+        Operation::DrG2ApplyReviews => readiness::run_dr_g2_apply_reviews(&parsed),
         Operation::ImportPeftLora => peft_import::run_import_peft_lora(&parsed),
     }
 }
