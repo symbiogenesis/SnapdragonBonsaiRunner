@@ -2,6 +2,7 @@
 
 mod activation_edit;
 mod gguf_adapter;
+mod peft_import;
 mod readiness;
 mod reallocate;
 mod safetensors;
@@ -56,6 +57,7 @@ enum Operation {
     GenerateLock,
     DrG2Plan,
     DrG2Score,
+    ImportPeftLora,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -279,6 +281,8 @@ struct Request {
     evidence_path: Option<PathBuf>,
     #[serde(default)]
     screen_config: Option<readiness::DrG2PlanConfig>,
+    #[serde(default)]
+    peft_config: Option<peft_import::ImportPeftConfig>,
 }
 
 #[expect(
@@ -334,7 +338,8 @@ fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
         | Operation::RealignFactors
         | Operation::GenerateLock
         | Operation::DrG2Plan
-        | Operation::DrG2Score => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
+        | Operation::DrG2Score
+        | Operation::ImportPeftLora => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
     }
 }
 
@@ -402,6 +407,9 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     }
     if request.operation != Operation::DrG2Plan && request.screen_config.is_some() {
         return Err("screenConfig is only supported for dr-g2-plan.".into());
+    }
+    if request.operation != Operation::ImportPeftLora && request.peft_config.is_some() {
+        return Err("peftConfig is only supported for import-peft-lora.".into());
     }
 
     match request.operation {
@@ -607,6 +615,37 @@ fn validate_request(request: &Request) -> crate::Result<()> {
             }
             return Ok(());
         }
+        Operation::ImportPeftLora => {
+            if request.source.is_some() {
+                return Err(
+                    "import-peft-lora does not accept a model diff source; supply peftConfig.source."
+                        .into(),
+                );
+            }
+            if request.adapter_path.is_some() {
+                return Err("import-peft-lora does not accept adapterPath.".into());
+            }
+            if !(10..=900).contains(&request.controls.time_budget_seconds) {
+                return Err("controls.timeBudgetSeconds must be in 10..=900.".into());
+            }
+            if !(1..=32).contains(&request.controls.workers) {
+                return Err("controls.workers must be in 1..=32.".into());
+            }
+            if !(1..=4).contains(&request.controls.http_concurrency) {
+                return Err("controls.httpConcurrency must be in 1..=4.".into());
+            }
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("import-peft-lora requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            let config = request
+                .peft_config
+                .as_ref()
+                .ok_or("import-peft-lora requires peftConfig.")?;
+            peft_import::validate_import_peft_config(config)?;
+            return Ok(());
+        }
         Operation::Plan | Operation::Audit | Operation::ExportDenoised => {}
     }
 
@@ -730,7 +769,8 @@ fn validate_request(request: &Request) -> crate::Result<()> {
         | Operation::GenerateTestAdapter
         | Operation::GenerateLock
         | Operation::DrG2Plan
-        | Operation::DrG2Score => {}
+        | Operation::DrG2Score
+        | Operation::ImportPeftLora => {}
     }
     Ok(())
 }
@@ -2600,6 +2640,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::GenerateLock => readiness::run_generate_lock(&parsed),
         Operation::DrG2Plan => readiness::run_dr_g2_plan(&parsed),
         Operation::DrG2Score => readiness::run_dr_g2_score(&parsed),
+        Operation::ImportPeftLora => peft_import::run_import_peft_lora(&parsed),
     }
 }
 
