@@ -610,6 +610,9 @@ const VISION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
 // Multi-rank DaisyRose LoRA support requires a reviewed Prism release supporting
 // `--multi-rank-adapter` and `multi-rank-lora-v1` readiness identity.
 const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+// Opt-in NariQ trellis support requires a separately reviewed native Prism
+// release supporting `--nariq <2.5bpw|3.0bpw|2.0bpw>` and `:trellis-v1` identity.
+pub(crate) const NARIQ_TRELLIS_RELEASE: Option<(&str, &str)> = None;
 
 // CPU tiled prefill requires a separately reviewed native release supporting
 // `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
@@ -646,6 +649,10 @@ pub(super) fn vision_supported() -> Result<bool, LaunchError> {
 
 pub(super) fn multi_rank_lora_supported() -> Result<bool, LaunchError> {
     pinned_matches(MULTI_RANK_LORA_RELEASE)
+}
+
+pub(super) fn nariq_trellis_supported() -> Result<bool, LaunchError> {
+    pinned_matches(NARIQ_TRELLIS_RELEASE)
 }
 
 pub(super) fn pinned_version() -> Result<String, LaunchError> {
@@ -1319,6 +1326,16 @@ mod tests {
             HEXAGON_ARENA_CACHE_RELEASE
         ));
         assert!(!hexagon_arena_cache_supported_for(&pin, None));
+        Ok(())
+    }
+
+    #[test]
+    fn nariq_trellis_requires_exact_reviewed_release() -> Result<(), LaunchError> {
+        assert_eq!(NARIQ_TRELLIS_RELEASE, None);
+        assert!(!nariq_trellis_supported()?);
+        let pin = release(LOCK)?;
+        assert!(reviewed_release_matches(&pin, Some(("0.1.34", &pin.commit))));
+        assert!(!reviewed_release_matches(&pin, NARIQ_TRELLIS_RELEASE));
         Ok(())
     }
 }

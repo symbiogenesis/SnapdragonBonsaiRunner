@@ -202,6 +202,40 @@ impl VerifiedArtifacts {
         })
     }
 
+    #[cfg(windows)]
+    pub(crate) fn verify_nariq_model(
+        data: &Path,
+        variant: bonsai_cpu_policy::NariqVariant,
+    ) -> Result<Self, ArtifactError> {
+        use std::io::Write as _;
+        let artifact = bonsai_cpu_policy::nariq_model_artifact(data, variant)
+            .map_err(|_| ArtifactError::Configuration)?;
+        let model_guard = verify_file_with_optional_chunks(
+            &artifact.path,
+            artifact.bytes,
+            &artifact.sha256,
+            None,
+            None,
+        )
+        .inspect_err(|error| {
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(
+                err,
+                "Selected NariQ model verification failed: variant={}, reason={}, error={error:?}.",
+                variant.as_str(),
+                model_failure_reason(&artifact.path, *error),
+            );
+        })?;
+        Ok(Self {
+            executable: PathBuf::new(),
+            model: artifact.path,
+            runtime_directory: PathBuf::new(),
+            archive_path: PathBuf::new(),
+            runtime: None,
+            _model: Some(model_guard),
+        })
+    }
+
     fn verify_model_artifact(
         model: &Path,
         artifact: &ModelArtifact,

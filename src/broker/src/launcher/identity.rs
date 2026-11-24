@@ -263,11 +263,12 @@ fn startup_projection_matches(
     model: &NativeModel<'_>,
     workers: WorkerReadiness<'_>,
     repacked: bool,
+    is_nariq: bool,
 ) -> bool {
     let Some(startup) = &model.startup_projection else {
         // Historical releases, including 0.1.27, predate this observation.
         // The reviewed 0.1.28, 0.1.30 and 0.1.31 tuples must identify completed initialization.
-        return !workers.projection_startup_required;
+        return !is_nariq && !workers.projection_startup_required;
     };
     let requested = match workers.placement {
         crate::inference::Placement::Auto => "auto",
@@ -276,6 +277,9 @@ fn startup_projection_matches(
         crate::inference::Placement::Composite => "composite",
     };
     if startup.schema_version != 1 || &*startup.requested != requested {
+        return false;
+    }
+    if is_nariq && &*startup.effective != "cpu" {
         return false;
     }
     let no_residency = startup.resident_tensors == 0
@@ -343,6 +347,7 @@ fn cache_identity_matches(
     workers: WorkerReadiness<'_>,
     repacked: bool,
     adapter: bool,
+    is_nariq: bool,
 ) -> bool {
     let Some(policy) = workers.kv_cache else {
         return workers.cpu_prefill.is_none()
@@ -364,8 +369,9 @@ fn cache_identity_matches(
         format!("kv-{}-d256-rht3-v1", policy.name())
     };
     let mut prefix = format!(
-        "{}:qwen35-text-v1:nonflash-f16:{cache}:gdn-f32:prism-arm64-fused-v1",
-        &*model.model_sha256
+        "{}:qwen35-text-v1:nonflash-f16:{cache}:gdn-f32:prism-arm64-fused-v1{}",
+        &*model.model_sha256,
+        if is_nariq { ":trellis-v1" } else { "" }
     );
     if adapter {
         use std::fmt::Write as _;
@@ -436,9 +442,24 @@ fn cache_identity_matches(
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_native_identity_detailed(
     bytes: &[u8],
     repacked: bool,
+    adapter: bool,
+    workers: WorkerReadiness<'_>,
+) -> Result<(), NativeIdentityError> {
+    let representation = if repacked {
+        super::WeightRepresentation::CurrentRepackedPtq1
+    } else {
+        super::WeightRepresentation::Source
+    };
+    validate_native_identity_for_representation(bytes, representation, adapter, workers)
+}
+
+pub(super) fn validate_native_identity_for_representation(
+    bytes: &[u8],
+    representation_kind: super::WeightRepresentation,
     adapter: bool,
     workers: WorkerReadiness<'_>,
 ) -> Result<(), NativeIdentityError> {
@@ -446,20 +467,38 @@ pub(super) fn validate_native_identity_detailed(
     let crate::Object(models): crate::Object<Models<'_>> =
         serde_json::from_slice(body).map_err(|_| NativeIdentityError::Schema)?;
     let [crate::Object(model)] = &models.data;
-    let (id, hash, representation) = if repacked {
-        (
+    let repacked = matches!(
+        representation_kind,
+        super::WeightRepresentation::CurrentRepackedPtq1
+    );
+    let nariq_variant = match representation_kind {
+        super::WeightRepresentation::NariQ(variant) => Some(variant),
+        super::WeightRepresentation::Source | super::WeightRepresentation::CurrentRepackedPtq1 => {
+            None
+        }
+    };
+    let is_nariq = nariq_variant.is_some();
+    if is_nariq && adapter {
+        return Err(NativeIdentityError::Adapter);
+    }
+    let (id, hash, representation) = match representation_kind {
+        super::WeightRepresentation::CurrentRepackedPtq1 => (
             "Swift-Bonsai-2-current-repacked-PTQ1_0",
             crate::inference::REPACKED_PTQ1_SHA256,
             "current-repacked-PTQ1_0",
-        )
-    } else {
-        (
+        ),
+        super::WeightRepresentation::Source => (
             "Swift-Bonsai-2-PQ2_0",
             crate::inference::MODEL_SHA256,
             "PQ2_0",
-        )
+        ),
+        super::WeightRepresentation::NariQ(variant) => (
+            variant.model_id(),
+            variant.sha256(),
+            variant.representation_name(),
+        ),
     };
-    let weight_representation_matches = if repacked || adapter {
+    let weight_representation_matches = if repacked || is_nariq || adapter {
         model.weight_representation.as_deref() == Some(representation)
     } else {
         model.weight_representation.is_none()
@@ -487,7 +526,7 @@ pub(super) fn validate_native_identity_detailed(
     {
         return Err(NativeIdentityError::PromptReuse);
     }
-    let adapter_matches = if repacked || adapter {
+    let adapter_matches = if repacked || is_nariq || adapter {
         matches!(&model.adapter_sha256, AdapterIdentity::Present(value)
             if value.as_deref() == adapter.then_some(crate::inference::ADAPTER_SHA256))
             && model.supports_abliteration_scale == Some(adapter)
@@ -517,7 +556,7 @@ pub(super) fn validate_native_identity_detailed(
     if !daisyrose_matches {
         return Err(NativeIdentityError::Adapter);
     }
-    if !cache_identity_matches(model, workers, repacked, adapter) {
+    if !cache_identity_matches(model, workers, repacked, adapter, is_nariq) {
         return Err(NativeIdentityError::KvCacheGraph);
     }
     let expected_prefill = workers
@@ -557,10 +596,15 @@ pub(super) fn validate_native_identity_detailed(
     {
         return Err(NativeIdentityError::Placement);
     }
-    if !startup_projection_matches(model, workers, repacked) {
+    if !startup_projection_matches(model, workers, repacked, is_nariq) {
         return Err(NativeIdentityError::StartupProjection);
     }
-    let vision_match = if workers.vision {
+    let vision_match = if is_nariq {
+        !workers.vision
+            && !model.vision.unwrap_or(false)
+            && model.mmproj_sha256.is_none()
+            && model.image_max_tokens.is_none()
+    } else if workers.vision {
         model.vision == Some(true)
             && model.mmproj_sha256.as_deref() == Some(crate::inference::MMPROJ_SHA256)
             && model.image_max_tokens == Some(bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS)
@@ -2113,6 +2157,101 @@ mod context_tests {
                 .is_ok()
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn nariq_identity_accepts_trellis_with_daisyrose_and_rejects_drift() -> Result<(), String> {
+        use serde_json::json;
+        use super::NativeIdentityError;
+        let variant = bonsai_cpu_policy::NariqVariant::Bpw2_5;
+        let pinned = crate::inference::pinned_version().map_err(|e| format!("{e:?}"))?;
+        let daisy_sha = "cd".repeat(32);
+        let daisy_exec_sha = "ab".repeat(32);
+        let graph = format!(
+            "{}:qwen35-text-v1:nonflash-f16:kv-rsq4-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1:trellis-v1:multi-rank-lora-v1:{daisy_exec_sha}:00000000",
+            variant.sha256()
+        );
+        let payload = json!({
+            "id": variant.model_id(),
+            "object": "model",
+            "model_sha256": variant.sha256(),
+            "template_sha256": crate::inference::TEMPLATE_SHA256,
+            "runtime": "prism-inference",
+            "context_tokens": 32_768,
+            "seed": 42,
+            "row_workers": 4,
+            "weight_representation": variant.representation_name(),
+            "adapter_sha256": null,
+            "supports_abliteration_scale": false,
+            "supports_daisyrose_scale": true,
+            "daisyrose_scale_range": [0, 2],
+            "daisyrose_adapter_sha256": daisy_sha,
+            "daisyrose_adapter_max_rank": 16,
+            "kv_cache": "rsq4",
+            "startup_graph_identity": graph,
+            "startup_projection": {
+                "schema_version": 1,
+                "requested": "auto",
+                "effective": "cpu",
+                "identity": null,
+                "resident_tensors": 0,
+                "resident_weight_bytes": 0,
+                "host_metadata_bytes": 0,
+            },
+        });
+        let wire = crate::test_util::http_models_response(&payload)
+            .map_err(|err| format!("{err:?}"))?;
+        let policy = WorkerReadiness {
+            kv_cache: Some(crate::inference::KvCache::Rsq4),
+            context_tokens: 32_768,
+            daisyrose: Some((daisy_sha.as_str(), 16)),
+            ..WorkerReadiness::for_version(&pinned, 4)
+        };
+        let repr = super::super::WeightRepresentation::NariQ(variant);
+        assert_eq!(
+            super::validate_native_identity_for_representation(&wire, repr, false, policy),
+            Ok(())
+        );
+        assert_eq!(
+            super::validate_native_identity_for_representation(&wire, repr, true, policy),
+            Err(NativeIdentityError::Adapter)
+        );
+
+        let mut missing_trellis = payload.clone();
+        missing_trellis["startup_graph_identity"] = json!(graph.replace(":trellis-v1", ""));
+        let missing_trellis_wire = crate::test_util::http_models_response(&missing_trellis)
+            .map_err(|err| format!("{err:?}"))?;
+        assert_eq!(
+            super::validate_native_identity_for_representation(
+                &missing_trellis_wire,
+                repr,
+                false,
+                policy
+            ),
+            Err(NativeIdentityError::KvCacheGraph)
+        );
+
+        let mut gpu_proj = payload.clone();
+        gpu_proj["startup_projection"]["effective"] = json!("adreno-vulkan");
+        gpu_proj["startup_projection"]["identity"] = json!("vulkan-test");
+        gpu_proj["startup_projection"]["resident_tensors"] = json!(1);
+        gpu_proj["startup_projection"]["resident_weight_bytes"] = json!(1024);
+        let gpu_wire = crate::test_util::http_models_response(&gpu_proj)
+            .map_err(|err| format!("{err:?}"))?;
+        assert_eq!(
+            super::validate_native_identity_for_representation(&gpu_wire, repr, false, policy),
+            Err(NativeIdentityError::StartupProjection)
+        );
+
+        let mut with_vision = payload;
+        with_vision["vision"] = json!(true);
+        let vision_wire = crate::test_util::http_models_response(&with_vision)
+            .map_err(|err| format!("{err:?}"))?;
+        assert_eq!(
+            super::validate_native_identity_for_representation(&vision_wire, repr, false, policy),
+            Err(NativeIdentityError::Vision)
+        );
         Ok(())
     }
 }

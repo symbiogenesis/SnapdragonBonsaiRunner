@@ -9,7 +9,7 @@ mod startup;
 
 #[cfg(test)]
 use identity::validate_native_identity;
-use identity::{NativeIdentityError, WorkerReadiness, validate_native_identity_detailed};
+use identity::{NativeIdentityError, WorkerReadiness};
 use startup::StartupTimer;
 
 pub use startup::{StartupPhase, StartupProgress};
@@ -70,7 +70,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--use-abliterate-lora] (pinned adapter; request scale 0..2, default 1.3; Swift CPU only)\n",
     "  [--daisyrose-lora <absolute-gguf>] (stackable multi-rank NpuFriendly LoRA; native Swift only; request scale 0..2, default 0.0 unless promoted lock)\n",
     "  [--no-daisyrose-lora] (disable any default-enabled DaisyRose adapter; native Swift only)\n",
-    "  [--use-repacked-ptq1|--use-original-pq2] (mutually exclusive weight selections; Swift CPU only)\n",
+    "  [--use-repacked-ptq1|--use-original-pq2|--nariq 2.5bpw|3.0bpw|2.0bpw] (mutually exclusive weight selections; Swift only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
     "Default: reference-cpu. Only compiled model/runtime pins and fixed CPU policies are accepted.\n",
     "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise) and original PQ2 weights; PTQ1 requires explicit selection. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
@@ -121,9 +121,11 @@ pub enum LaunchError {
     Stop,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WeightRepresentation {
     Source,
     CurrentRepackedPtq1,
+    NariQ(bonsai_cpu_policy::NariqVariant),
 }
 
 enum BackendContainment {
@@ -285,7 +287,8 @@ impl LaunchConfig {
             (None, None, None, None);
         let (mut reset_on_cancel, mut no_mmproj, mut use_abliterate_lora, mut no_daisyrose_lora) =
             (false, false, false, false);
-        let (mut daisyrose_lora, mut use_repacked_ptq1, mut profile) = (None, None, None);
+        let (mut daisyrose_lora, mut use_repacked_ptq1, mut nariq_variant, mut profile) =
+            (None, None, None, None);
         let (mut data, mut evidence_parent) = (None, None);
         let (mut frontend_port, mut backend_port, mut max_waiting) = (None, None, None);
         let take_path = |v: Option<OsString>| v.map(PathBuf::from).ok_or(LaunchError::Arguments);
@@ -352,6 +355,11 @@ impl LaunchConfig {
                 Some("--no-daisyrose-lora") => set_flag(&mut no_daisyrose_lora)?,
                 Some("--use-repacked-ptq1") => set_once(&mut use_repacked_ptq1, true)?,
                 Some("--use-original-pq2") => set_once(&mut use_repacked_ptq1, false)?,
+                Some("--nariq") => take_once(&mut nariq_variant, &mut args, |v| {
+                    v.and_then(|s| s.into_string().ok())
+                        .and_then(|s| s.parse::<bonsai_cpu_policy::NariqVariant>().ok())
+                        .ok_or(LaunchError::Arguments)
+                })?,
                 Some("--profile") => {
                     take_once(&mut profile, &mut args, |v| launch_profile(v.as_deref()))?;
                 }
@@ -366,6 +374,9 @@ impl LaunchConfig {
                 }
                 _ => return Err(LaunchError::Arguments),
             }
+        }
+        if nariq_variant.is_some() && use_repacked_ptq1.is_some() {
+            return Err(LaunchError::Arguments);
         }
         let frontend_port = frontend_port.ok_or(LaunchError::Arguments)?;
         let backend_port = match backend_port {
@@ -435,17 +446,21 @@ impl LaunchConfig {
             use_abliterate_lora,
             daisyrose_lora,
             no_daisyrose_lora,
-            weight_representation: if use_repacked_ptq1.unwrap_or(false) {
+            weight_representation: if let Some(variant) = nariq_variant {
+                WeightRepresentation::NariQ(variant)
+            } else if use_repacked_ptq1.unwrap_or(false) {
                 WeightRepresentation::CurrentRepackedPtq1
             } else {
                 WeightRepresentation::Source
             },
         };
-        configuration.validate_selection(use_repacked_ptq1.is_some())?;
+        configuration.validate_selection(
+            use_repacked_ptq1.is_some() || nariq_variant.is_some(),
+        )?;
         if let Some(cache_dir) = &configuration.hexagon_arena_cache {
             validate_hexagon_arena_cache_dir(cache_dir)?;
         }
-        let gates: [(bool, fn() -> Result<bool, LaunchError>); 8] = [
+        let gates: [(bool, fn() -> Result<bool, LaunchError>); 9] = [
             (
                 configuration.reset_on_cancel,
                 crate::inference::reset_on_cancel_supported,
@@ -480,6 +495,10 @@ impl LaunchConfig {
                 configuration.hexagon_arena_cache.is_some(),
                 crate::inference::hexagon_arena_cache_supported,
             ),
+            (
+                configuration.nariq_variant().is_some(),
+                crate::inference::nariq_trellis_supported,
+            ),
         ];
         for (enabled, supported) in gates {
             if enabled && !supported()? {
@@ -503,8 +522,35 @@ impl LaunchConfig {
         }
     }
 
+    const fn nariq_variant(&self) -> Option<bonsai_cpu_policy::NariqVariant> {
+        match self.weight_representation {
+            WeightRepresentation::NariQ(variant) => Some(variant),
+            WeightRepresentation::Source | WeightRepresentation::CurrentRepackedPtq1 => None,
+        }
+    }
+
+    fn build_launch_plan(
+        &self,
+        backend_port: u16,
+        key_file: &std::path::Path,
+    ) -> Result<LaunchPlan, crate::launch_policy::PolicyError> {
+        if let Some(variant) = self.nariq_variant() {
+            LaunchPlan::for_swift_nariq(&self.data, backend_port, key_file, variant)
+        } else {
+            LaunchPlan::for_profile_with_options(
+                &self.data,
+                backend_port,
+                key_file,
+                self.profile,
+                self.use_abliterate_lora,
+                self.uses_repacked_ptq1(),
+            )
+        }
+    }
+
     fn validate_selection(&self, explicit_weight: bool) -> Result<(), LaunchError> {
         let swift = self.profile == LaunchProfile::SwiftPq2Assessment;
+        let is_nariq = self.nariq_variant().is_some();
         if (self.frontend_port != 0 && self.frontend_port < 1024)
             || self.backend_port < 1024
             || self.backend_port == self.frontend_port
@@ -534,14 +580,22 @@ impl LaunchConfig {
                 && self.spec_type == Some(crate::inference::SpeculationType::Suffix))
             || (self.reset_on_cancel && !self.native_engine)
             || (self.no_mmproj && !swift)
-            || (self.use_abliterate_lora && !swift)
+            || (self.use_abliterate_lora && (!swift || is_nariq))
             || (self.daisyrose_lora.is_some() && (!swift || !self.native_engine))
             || (self.no_daisyrose_lora && (!swift || self.daisyrose_lora.is_some()))
             || (self.hexagon_arena_cache.is_some()
                 && (!swift
                     || !self.native_engine
+                    || is_nariq
                     || self.placement == crate::inference::Placement::Cpu
                     || self.requires_native_sandbox()))
+            || (is_nariq
+                && (!swift
+                    || !self.native_engine
+                    || matches!(
+                        self.placement,
+                        crate::inference::Placement::Vulkan | crate::inference::Placement::Composite
+                    )))
             || (explicit_weight && !swift)
         {
             return Err(LaunchError::Arguments);
@@ -617,6 +671,7 @@ impl LaunchConfig {
     fn runtime_supports_vision(&self) -> Result<bool, LaunchError> {
         Ok(self.memory_context_supported()?
             && !self.no_mmproj
+            && self.nariq_variant().is_none()
             && self.effective_speculation_tokens().is_none()
             && (!self.native_engine || crate::inference::vision_supported()?))
     }
@@ -661,10 +716,10 @@ impl LaunchConfig {
         use bonsai_cpu_policy::context::{
             SwiftCalibratedOptions, SwiftCalibratedReuse, SwiftContextPlan, SwiftWeightPacking,
         };
-        let weight_packing = if self.uses_repacked_ptq1() {
-            SwiftWeightPacking::Ptq1_0
-        } else {
-            SwiftWeightPacking::Pq2_0
+        let weight_packing = match self.weight_representation {
+            WeightRepresentation::Source => SwiftWeightPacking::Pq2_0,
+            WeightRepresentation::CurrentRepackedPtq1 => SwiftWeightPacking::Ptq1_0,
+            WeightRepresentation::NariQ(variant) => SwiftWeightPacking::from_nariq(variant),
         };
         let checkpoints = self.prompt_reuse_checkpoints.unwrap_or(1);
         let checkpoint_bytes = self.prompt_reuse_checkpoint_bytes;
@@ -839,15 +894,12 @@ impl LaunchConfig {
     pub fn check(&self) -> Result<LaunchCheck, LaunchError> {
         self.check_sandbox_support()?;
         self.validate_paths()?;
-        let plan = LaunchPlan::for_profile_with_options(
-            &self.data,
-            self.backend_port,
-            &self.evidence_parent.join("not-created.key"),
-            self.profile,
-            self.use_abliterate_lora,
-            self.uses_repacked_ptq1(),
-        )
-        .map_err(|_| LaunchError::Policy)?;
+        let plan = self
+            .build_launch_plan(
+                self.backend_port,
+                &self.evidence_parent.join("not-created.key"),
+            )
+            .map_err(|_| LaunchError::Policy)?;
         let guards = self.verify_launch_artifacts(&plan)?;
         let daisyrose_reserve = guards
             .daisyrose
@@ -1079,11 +1131,15 @@ impl LaunchConfig {
 
     fn verify_artifacts(&self, plan: &LaunchPlan) -> Result<VerifiedArtifacts, LaunchError> {
         if self.native_engine {
-            let artifacts = VerifiedArtifacts::verify_model_for_profile(
-                &self.data,
-                self.profile,
-                self.uses_repacked_ptq1(),
-            )
+            let artifacts = if let Some(variant) = self.nariq_variant() {
+                VerifiedArtifacts::verify_nariq_model(&self.data, variant)
+            } else {
+                VerifiedArtifacts::verify_model_for_profile(
+                    &self.data,
+                    self.profile,
+                    self.uses_repacked_ptq1(),
+                )
+            }
             .map_err(|_| LaunchError::Artifacts)?;
             if artifacts.model() != plan.model_path {
                 return Err(LaunchError::Artifacts);
@@ -1269,7 +1325,9 @@ impl LaunchConfig {
                 cache_dir.as_os_str(),
             );
         }
-        if self.uses_repacked_ptq1() {
+        if let Some(variant) = self.nariq_variant() {
+            push_arg(&mut arguments, "--nariq", variant.as_str());
+        } else if self.uses_repacked_ptq1() {
             arguments.push("--use-repacked-ptq1".into());
         }
         if let Some(adapter) = &plan.adapter {
@@ -1395,7 +1453,9 @@ impl LaunchConfig {
         if broker_pipe {
             let mut section_files: Vec<&std::fs::File> = Vec::with_capacity(4);
             let mut section_digests: Vec<[u8; 32]> = Vec::with_capacity(4);
-            let model_hash = if self.uses_repacked_ptq1() {
+            let model_hash = if let Some(variant) = self.nariq_variant() {
+                variant.sha256()
+            } else if self.uses_repacked_ptq1() {
                 crate::inference::REPACKED_PTQ1_SHA256
             } else {
                 crate::inference::MODEL_SHA256
@@ -1497,15 +1557,9 @@ impl LaunchConfig {
         self.validate_paths()?;
         // Resolve policy before creating secrets or loading any native code.
         let pending_key = self.evidence_parent.join("not-created.key");
-        let preliminary = LaunchPlan::for_profile_with_options(
-            &self.data,
-            self.backend_port,
-            &pending_key,
-            self.profile,
-            self.use_abliterate_lora,
-            self.uses_repacked_ptq1(),
-        )
-        .map_err(|_| LaunchError::Policy)?;
+        let preliminary = self
+            .build_launch_plan(self.backend_port, &pending_key)
+            .map_err(|_| LaunchError::Policy)?;
         self.initial_memory_admission(&preliminary)?;
         if self.native_engine {
             startup_timing.phase(StartupPhase::NativeRuntimeVerification);
@@ -1559,15 +1613,9 @@ impl LaunchConfig {
                 }
                 reset_worker_attempt_files(credentials.directory())?;
             }
-            let mut plan = LaunchPlan::for_profile_with_options(
-                &self.data,
-                self.backend_port,
-                credentials.backend_path(),
-                self.profile,
-                self.use_abliterate_lora,
-                self.uses_repacked_ptq1(),
-            )
-            .map_err(|_| LaunchError::Policy)?;
+            let mut plan = self
+                .build_launch_plan(self.backend_port, credentials.backend_path())
+                .map_err(|_| LaunchError::Policy)?;
             // Reserve as a collision check in TCP modes before sampling free RAM so
             // socket binding cannot widen the window between context sizing and admission.
             let reservation = if broker_pipe {
@@ -1621,7 +1669,8 @@ impl LaunchConfig {
                         .map(|(tokens, (verify, checkpoint))| (tokens, verify, checkpoint));
                     daisyrose.is_some() && admitted
                 } else {
-                    if self.effective_speculation_tokens().is_some()
+                    if self.nariq_variant().is_some()
+                        || self.effective_speculation_tokens().is_some()
                         || self.cpu_prefill_gdn.is_some()
                         || self.prompt_reuse
                             == crate::inference::PromptReuseMode::PromptEndAndLatest
@@ -1896,9 +1945,9 @@ impl LaunchConfig {
         let verification = crate::inference::pinned_version()
             .map_err(|_| NativeIdentityError::ReleasePin)
             .and_then(|version| {
-                validate_native_identity_detailed(
+                identity::validate_native_identity_for_representation(
                     models,
-                    self.uses_repacked_ptq1(),
+                    self.weight_representation,
                     self.use_abliterate_lora,
                     WorkerReadiness {
                         prompt_reuse: self.prompt_reuse,
@@ -5365,6 +5414,91 @@ mod tests {
                 )
                 .err(),
             Some(LaunchError::Sandbox)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nariq_options_validate_conflicts_and_release_gate() {
+        assert!(super::LAUNCH_USAGE.contains("--nariq"));
+        let mut native = arguments();
+        native.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+
+        for bad_extra in [
+            vec!["--nariq", "invalid"],
+            vec!["--nariq", "2.5bpw", "--nariq", "3.0bpw"],
+            vec!["--use-repacked-ptq1", "--nariq", "2.5bpw"],
+            vec!["--use-original-pq2", "--nariq", "2.5bpw"],
+            vec!["--use-abliterate-lora", "--nariq", "2.5bpw"],
+            vec!["--publisher-engine", "--nariq", "2.5bpw"],
+            vec!["--placement", "vulkan", "--nariq", "2.5bpw"],
+            vec!["--placement", "composite", "--nariq", "2.5bpw"],
+        ] {
+            let mut rejected = native.clone();
+            rejected.extend(bad_extra.into_iter().map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(rejected).err(),
+                Some(LaunchError::Arguments)
+            );
+        }
+
+        let mut gated = native;
+        gated.extend(["--nariq", "2.5bpw"].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse(gated).err(),
+            Some(LaunchError::NativeRuntime)
+        );
+    }
+
+    #[test]
+    fn nariq_configuration_plans_args_memory_and_disables_vision() -> std::io::Result<()> {
+        let temp = crate::test_util::TempDir::new("Bonsai-nariq-launcher")?;
+        let mut native = arguments();
+        native.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+        let mut cfg = LaunchConfig::parse(native)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        cfg.data = temp.path().to_path_buf();
+        cfg.evidence_parent = temp.path().to_path_buf();
+        cfg.use_abliterate_lora = false;
+        cfg.kv_cache = Some(crate::inference::KvCache::Rsq4);
+        cfg.weight_representation =
+            super::WeightRepresentation::NariQ(bonsai_cpu_policy::NariqVariant::Bpw2_5);
+
+        assert!(
+            !cfg.runtime_supports_vision()
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+        );
+        let creds = super::PrivateCredentials::create(temp.path())?;
+        let plan = cfg
+            .build_launch_plan(cfg.backend_port, creds.backend_path())
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        assert!(
+            plan.model_path
+                .ends_with("Qwen3.8-27B-NariQ-2.5bpw.gguf")
+        );
+        let args = cfg.native_arguments(&plan, None);
+        assert!(has_flag_pair(
+            &args,
+            "--nariq",
+            std::ffi::OsStr::new("2.5bpw")
+        ));
+        assert!(!args.iter().any(|arg| arg == "--use-repacked-ptq1"));
+
+        let calibrated = cfg
+            .calibrated_context_plan(32 * 1024 * 1024 * 1024, false)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        let fixed_runtime = bonsai_cpu_policy::context::SwiftWeightPacking::from_nariq(
+            bonsai_cpu_policy::NariqVariant::Bpw2_5,
+        )
+        .calibrated_fixed_runtime_bytes();
+        let fixed_runtime_usize = usize::try_from(fixed_runtime)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let nariq_weight_bytes = usize::try_from(bonsai_cpu_policy::NariqVariant::Bpw2_5.weight_bytes())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert!(calibrated.working_set_limit_bytes > fixed_runtime_usize);
+        assert_eq!(
+            calibrated.working_set_limit_bytes - calibrated.context_plan.memory_limit_bytes,
+            nariq_weight_bytes
         );
         Ok(())
     }

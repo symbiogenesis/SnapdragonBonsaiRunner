@@ -393,6 +393,66 @@ impl LaunchPlan {
             cpu_speculation: None,
         })
     }
+
+    /// Build a launch plan for an opt-in native `NariQ` `GGUF` variant (never selects Orca or Swift `mmproj`).
+    ///
+    /// # Errors
+    /// Rejects invalid external paths, privileged ports, or compiled policy drift.
+    pub fn for_swift_nariq(
+        data: &Path,
+        backend_port: u16,
+        key_file: &Path,
+        variant: bonsai_cpu_policy::NariqVariant,
+    ) -> Result<Self, PolicyError> {
+        validate_environment(std::env::vars_os().map(|(name, _)| name))?;
+        validate_external_path(data)?;
+        validate_external_path(key_file)?;
+        if backend_port < 1024 {
+            return Err(PolicyError::Port);
+        }
+        let pins = reviewed_pins(LaunchProfile::SwiftPq2Assessment)?;
+        let nariq = bonsai_cpu_policy::nariq_model_artifact(data, variant)
+            .map_err(|_| PolicyError::Configuration)?;
+        let runtime_directory = data.join("runtime").join(&pins.runtime.commit);
+        let executable = runtime_directory.join("llama-server.exe");
+        let archive_path = data.join("downloads").join(&pins.runtime.asset.filename);
+        for path in [&executable, &nariq.path, &archive_path] {
+            validate_external_path(path)?;
+        }
+        let arguments: Vec<OsString> = bonsai_cpu_policy::server::arguments(
+            nariq.path.to_str().ok_or(PolicyError::Path)?,
+            key_file.to_str().ok_or(PolicyError::Path)?,
+            backend_port,
+            LaunchProfile::SwiftPq2Assessment.cpu_profile(),
+        )
+        .map_err(|_| PolicyError::Configuration)?
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let fixed_runtime =
+            bonsai_cpu_policy::context::SwiftWeightPacking::from_nariq(variant)
+                .calibrated_fixed_runtime_bytes();
+        let memory_limit_bytes = usize::try_from(fixed_runtime)
+            .unwrap_or(LaunchProfile::SwiftPq2Assessment.memory_limit_bytes());
+        Ok(Self {
+            executable,
+            arguments,
+            model_path: nariq.path,
+            mmproj: None,
+            adapter: None,
+            daisyrose_lora: None,
+            archive_path,
+            runtime_directory,
+            key_file: key_file.to_path_buf(),
+            required_available_bytes: fixed_runtime
+                .saturating_add(bonsai_cpu_policy::context::HOST_RESERVE_BYTES),
+            memory_limit_bytes,
+            working_set_limit_bytes: memory_limit_bytes,
+            context_tokens: crate::CONTEXT_TOKENS,
+            cpu_prefill: None,
+            cpu_speculation: None,
+        })
+    }
 }
 
 // Struct deserialization rejects duplicate and unknown fields. Object wrappers
