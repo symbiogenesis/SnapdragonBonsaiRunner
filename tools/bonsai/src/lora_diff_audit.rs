@@ -1,6 +1,7 @@
 //! Read-only BF16 weight-diff, spectral-denoising audit, and GGUF LoRA export/verification.
 
 mod activation_edit;
+mod dr_g2_capture;
 mod gguf_adapter;
 mod peft_import;
 mod readiness;
@@ -59,6 +60,7 @@ enum Operation {
     DrG2Score,
     DrG2BlindPacket,
     DrG2ApplyReviews,
+    DrG2Capture,
     ImportPeftLora,
 }
 
@@ -289,6 +291,8 @@ struct Request {
     apply_config: Option<readiness::DrG2ApplyConfig>,
     #[serde(default)]
     peft_config: Option<peft_import::ImportPeftConfig>,
+    #[serde(default)]
+    capture_config: Option<dr_g2_capture::DrG2CaptureConfig>,
 }
 
 #[expect(
@@ -347,6 +351,7 @@ fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
         | Operation::DrG2Score
         | Operation::DrG2BlindPacket
         | Operation::DrG2ApplyReviews
+        | Operation::DrG2Capture
         | Operation::ImportPeftLora => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
     }
 }
@@ -431,6 +436,9 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     }
     if request.operation != Operation::ImportPeftLora && request.peft_config.is_some() {
         return Err("peftConfig is only supported for import-peft-lora.".into());
+    }
+    if request.operation != Operation::DrG2Capture && request.capture_config.is_some() {
+        return Err("captureConfig is only supported for dr-g2-capture.".into());
     }
 
     match request.operation {
@@ -723,6 +731,25 @@ fn validate_request(request: &Request) -> crate::Result<()> {
                 .map_err(|e| e.to_string())?;
             return Ok(());
         }
+        Operation::DrG2Capture => {
+            if request.source.is_some() {
+                return Err("dr-g2-capture does not accept a model diff source.".into());
+            }
+            if request.adapter_path.is_some() {
+                return Err("dr-g2-capture does not accept adapterPath.".into());
+            }
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("dr-g2-capture requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            let config = request
+                .capture_config
+                .as_ref()
+                .ok_or("dr-g2-capture requires captureConfig.")?;
+            dr_g2_capture::validate_capture_request(request, config, output)?;
+            return Ok(());
+        }
         Operation::Plan | Operation::Audit | Operation::ExportDenoised => {}
     }
 
@@ -849,6 +876,7 @@ fn validate_request(request: &Request) -> crate::Result<()> {
         | Operation::DrG2Score
         | Operation::DrG2BlindPacket
         | Operation::DrG2ApplyReviews
+        | Operation::DrG2Capture
         | Operation::ImportPeftLora => {}
     }
     Ok(())
@@ -2721,6 +2749,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::DrG2Score => readiness::run_dr_g2_score(&parsed),
         Operation::DrG2BlindPacket => readiness::run_dr_g2_blind_packet(&parsed),
         Operation::DrG2ApplyReviews => readiness::run_dr_g2_apply_reviews(&parsed),
+        Operation::DrG2Capture => dr_g2_capture::run_dr_g2_capture(&parsed),
         Operation::ImportPeftLora => peft_import::run_import_peft_lora(&parsed),
     }
 }

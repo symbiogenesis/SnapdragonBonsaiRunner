@@ -272,7 +272,7 @@ fn compiled_swift_base_sha256() -> crate::Result<String> {
         .ok_or_else(|| "Compiled swift-assessment.lock.json is missing model.sha256.".into())
 }
 
-fn compiled_orca_adapter_sha256() -> crate::Result<String> {
+pub(super) fn compiled_orca_adapter_sha256() -> crate::Result<String> {
     let lock: Value = serde_json::from_str(SWIFT_LORA_LOCK)
         .map_err(|error| format!("Invalid compiled Swift LoRA lock: {error}"))?;
     lock["adapter"]["sha256"]
