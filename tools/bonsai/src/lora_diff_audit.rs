@@ -51,6 +51,7 @@ enum Operation {
     EditAdapter,
     ReallocateRanks,
     FoldPatch,
+    RealignFactors,
     GenerateTestAdapter,
     GenerateLock,
     DrG2Plan,
@@ -210,6 +211,8 @@ struct Request {
     #[serde(default)]
     fold_patch_config: Option<activation_edit::FoldPatchConfig>,
     #[serde(default)]
+    realign_config: Option<activation_edit::RealignFactorsConfig>,
+    #[serde(default)]
     verify_policy: VerifyPolicy,
     #[serde(default)]
     lock_source: Option<bonsai_cpu_policy::DaisyRoseLoraSource>,
@@ -273,6 +276,7 @@ fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
         | Operation::EditAdapter
         | Operation::ReallocateRanks
         | Operation::FoldPatch
+        | Operation::RealignFactors
         | Operation::GenerateLock
         | Operation::DrG2Plan
         | Operation::DrG2Score => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
@@ -324,6 +328,9 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     }
     if request.operation != Operation::FoldPatch && request.fold_patch_config.is_some() {
         return Err("foldPatchConfig is only supported for fold-patch.".into());
+    }
+    if request.operation != Operation::RealignFactors && request.realign_config.is_some() {
+        return Err("realignConfig is only supported for realign-factors.".into());
     }
     if request.operation != Operation::GenerateLock
         && (request.lock_source.is_some()
@@ -450,6 +457,27 @@ fn validate_request(request: &Request) -> crate::Result<()> {
                 .as_ref()
                 .ok_or("fold-patch requires foldPatchConfig.")?;
             activation_edit::validate_fold_patch_config(config)?;
+            return Ok(());
+        }
+        Operation::RealignFactors => {
+            if request.source.is_some() {
+                return Err("realign-factors does not accept a model diff source.".into());
+            }
+            let adapter_path = request
+                .adapter_path
+                .as_ref()
+                .ok_or("realign-factors requires adapterPath.")?;
+            bonsai_artifacts::validate_external_path(adapter_path).map_err(|e| e.to_string())?;
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("realign-factors requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            let config = request
+                .realign_config
+                .as_ref()
+                .ok_or("realign-factors requires realignConfig.")?;
+            activation_edit::validate_realign_config(config)?;
             return Ok(());
         }
         Operation::GenerateTestAdapter => {
@@ -627,6 +655,7 @@ fn validate_request(request: &Request) -> crate::Result<()> {
         | Operation::EditAdapter
         | Operation::ReallocateRanks
         | Operation::FoldPatch
+        | Operation::RealignFactors
         | Operation::GenerateTestAdapter
         | Operation::GenerateLock
         | Operation::DrG2Plan
@@ -2435,6 +2464,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::EditAdapter => transform::run_edit_adapter(&parsed),
         Operation::ReallocateRanks => reallocate::run_reallocate_ranks(&parsed),
         Operation::FoldPatch => activation_edit::run_fold_patch(&parsed),
+        Operation::RealignFactors => activation_edit::run_realign_factors(&parsed),
         Operation::GenerateTestAdapter => readiness::run_generate_test_adapter(&parsed),
         Operation::GenerateLock => readiness::run_generate_lock(&parsed),
         Operation::DrG2Plan => readiness::run_dr_g2_plan(&parsed),

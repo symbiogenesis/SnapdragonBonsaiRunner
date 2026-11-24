@@ -2,14 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::calibration_metrics::RowMetricsAccumulator;
+
 use super::gguf_adapter::{
-    ExportDtype, ExportTensorPair, classify_families, read_lora_gguf_pairs_with_dims,
-    sort_pairs_canonically, swift_base_dims_map, write_lora_gguf,
+    ExportDtype, ExportTensorPair, classify_families, encode_f16_le,
+    read_lora_gguf_pairs_with_dims, sort_pairs_canonically, swift_base_dims_map, write_lora_gguf,
 };
+use super::safetensors::{FloatDtype, decode_scalar_f32};
 use super::transform::{
     check_factor_value, effective_delta_frobenius_norm_f64, verify_published_adapter,
 };
@@ -18,6 +22,15 @@ use super::{Operation, Request, usize_to_f32};
 const MAX_FOLD_PATCHES: usize = 64;
 const MAX_LORA_RANK: usize = 64;
 const MAX_PATCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REALIGN_SITES: usize = 16;
+const MIN_REALIGN_ROWS: usize = 3;
+const MAX_REALIGN_ROWS: usize = 256;
+const MAX_REALIGN_ROWS_FILE_BYTES: u64 = 48 * 1024 * 1024;
+const MAX_REALIGN_WORK: u64 = 500_000_000;
+const DEFAULT_REALIGN_RIDGE: f64 = 1e-3;
+const DEFAULT_ALTERNATING_STEPS: usize = 2;
+const DEFAULT_REALIGN_TIME_BUDGET_MS: u64 = 10_000;
+const MAX_REALIGN_TIME_BUDGET_MS: u64 = 30_000;
 const ALLOWED_LINEAR_FAMILIES: [&str; 9] = [
     "ffn_down",
     "attn_output",
@@ -1023,6 +1036,1023 @@ pub(super) fn run_fold_patch_with_dims(
     }))
 }
 
+/// Closed-form ridge factor realignment strategy for `realign-factors`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum RealignMode {
+    #[default]
+    RealignB,
+    RealignA,
+    AlternatingAb,
+}
+
+impl RealignMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RealignB => "realign-b",
+            Self::RealignA => "realign-a",
+            Self::AlternatingAb => "alternating-ab",
+        }
+    }
+
+    const fn provenance_method(self) -> &'static str {
+        match self {
+            Self::RealignB => "activation-ridge-realign-b-v1",
+            Self::RealignA => "activation-ridge-realign-a-v1",
+            Self::AlternatingAb => "activation-ridge-alternating-ab-v1",
+        }
+    }
+}
+
+/// Split assignment for one captured activation/target row in `realign-factors`.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum RealignSplit {
+    Fit,
+    Development,
+}
+
+/// Single captured activation/output target row for factor realignment.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct RealignRow {
+    pub(super) sample_id: String,
+    pub(super) group_id: String,
+    pub(super) token_index: u32,
+    pub(super) split: RealignSplit,
+    pub(super) input: Vec<f32>,
+    pub(super) target_output: Vec<f32>,
+}
+
+/// Per-site activation rows or external JSON file reference for `realign-factors`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct RealignSiteInput {
+    pub(super) target: String,
+    pub(super) rows: Vec<RealignRow>,
+    pub(super) rows_path: Option<PathBuf>,
+}
+
+/// Configuration payload for `realign-factors`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct RealignFactorsConfig {
+    pub(super) mode: RealignMode,
+    pub(super) ridge: Option<f64>,
+    pub(super) alternating_steps: Option<usize>,
+    pub(super) allow_development_regression: bool,
+    pub(super) export_dtype: Option<ExportDtype>,
+    pub(super) time_budget_milliseconds: Option<u64>,
+    pub(super) diagnostic_prompt_sha256s: Vec<String>,
+    pub(super) sites: Vec<RealignSiteInput>,
+}
+
+struct WorkBudget {
+    work: u64,
+    deadline: Instant,
+}
+
+impl WorkBudget {
+    fn new(budget_ms: u64) -> crate::Result<Self> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(budget_ms))
+            .ok_or("Realign time budget overflow.")?;
+        Ok(Self { work: 0, deadline })
+    }
+
+    fn charge(&mut self, units: usize) -> crate::Result<()> {
+        crate::startup_cancel::checkpoint()?;
+        let add = u64::try_from(units).map_err(|e| e.to_string())?;
+        self.work = self
+            .work
+            .checked_add(add)
+            .ok_or("Realign work counter overflow.")?;
+        if self.work > MAX_REALIGN_WORK || Instant::now() >= self.deadline {
+            return Err("Realign time/work budget exhausted; no adapter published.".into());
+        }
+        Ok(())
+    }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
+}
+
+fn validate_realign_rows(
+    rows: &[RealignRow],
+    target: &str,
+    expected_dims: Option<(usize, usize)>,
+) -> crate::Result<()> {
+    if !(MIN_REALIGN_ROWS..=MAX_REALIGN_ROWS).contains(&rows.len()) {
+        return Err(format!(
+            "Site '{target}' row count {} must be in {MIN_REALIGN_ROWS}..={MAX_REALIGN_ROWS}.",
+            rows.len()
+        ));
+    }
+    let mut groups = BTreeMap::new();
+    let mut samples = BTreeMap::new();
+    let mut inputs = BTreeMap::new();
+    let mut tokens = BTreeSet::new();
+    let mut fit_count = 0_usize;
+    let mut dev_count = 0_usize;
+    let first_in = rows[0].input.len();
+    let first_out = rows[0].target_output.len();
+    if first_in == 0 || first_out == 0 {
+        return Err(format!(
+            "Site '{target}' rows must have positive input and targetOutput lengths."
+        ));
+    }
+
+    for row in rows {
+        if !valid_identifier(&row.sample_id) || !valid_identifier(&row.group_id) {
+            return Err(format!(
+                "Site '{target}' row has empty, oversized, or control-char sampleId/groupId."
+            ));
+        }
+        if let Some((in_f, out_f)) = expected_dims {
+            if row.input.len() != in_f || row.target_output.len() != out_f {
+                return Err(format!(
+                    "Site '{target}' row vector lengths ({}, {}) mismatch target ({in_f}, {out_f}).",
+                    row.input.len(),
+                    row.target_output.len()
+                ));
+            }
+        } else if row.input.len() != first_in || row.target_output.len() != first_out {
+            return Err(format!(
+                "Site '{target}' rows have inconsistent vector dimensions."
+            ));
+        }
+        if row
+            .input
+            .iter()
+            .chain(&row.target_output)
+            .any(|v| !v.is_finite())
+        {
+            return Err(format!(
+                "Site '{target}' row contains nonfinite input or targetOutput values."
+            ));
+        }
+        if !tokens.insert((row.sample_id.as_str(), row.token_index)) {
+            return Err(format!(
+                "Site '{target}' contains duplicate (sampleId, tokenIndex) pair ({}, {}).",
+                row.sample_id, row.token_index
+            ));
+        }
+        for (map, key) in [
+            (&mut groups, row.group_id.as_str()),
+            (&mut samples, row.sample_id.as_str()),
+        ] {
+            if map
+                .insert(key, row.split)
+                .is_some_and(|split| split != row.split)
+            {
+                return Err(format!(
+                    "Site '{target}' sampleId or groupId crosses fit/development splits."
+                ));
+            }
+        }
+        let input_bits: Vec<u32> = row.input.iter().map(|v| v.to_bits()).collect();
+        if inputs
+            .insert(input_bits, row.split)
+            .is_some_and(|split| split != row.split)
+        {
+            return Err(format!(
+                "Site '{target}' has identical F32 input vector crossing fit/development splits."
+            ));
+        }
+        match row.split {
+            RealignSplit::Fit => fit_count += 1,
+            RealignSplit::Development => dev_count += 1,
+        }
+    }
+    if fit_count < 2 || dev_count == 0 {
+        return Err(format!(
+            "Site '{target}' requires at least 2 fit rows and 1 development row (got fit={fit_count}, development={dev_count})."
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_realign_config(config: &RealignFactorsConfig) -> crate::Result<()> {
+    let ridge = config.ridge.unwrap_or(DEFAULT_REALIGN_RIDGE);
+    if !ridge.is_finite() || !(1e-8..=1e6).contains(&ridge) {
+        return Err(format!(
+            "realignConfig.ridge must be finite and in [1e-8, 1e6], got {ridge}."
+        ));
+    }
+    match config.mode {
+        RealignMode::AlternatingAb => {
+            let steps = config
+                .alternating_steps
+                .unwrap_or(DEFAULT_ALTERNATING_STEPS);
+            if !(1..=6).contains(&steps) {
+                return Err(format!(
+                    "realignConfig.alternatingSteps must be in 1..=6, got {steps}."
+                ));
+            }
+        }
+        RealignMode::RealignB | RealignMode::RealignA => {
+            if config.alternating_steps.is_some() {
+                return Err(
+                    "realignConfig.alternatingSteps is only supported for alternating-ab mode."
+                        .into(),
+                );
+            }
+        }
+    }
+    let budget_ms = config
+        .time_budget_milliseconds
+        .unwrap_or(DEFAULT_REALIGN_TIME_BUDGET_MS);
+    if !(1..=MAX_REALIGN_TIME_BUDGET_MS).contains(&budget_ms) {
+        return Err(format!(
+            "realignConfig.timeBudgetMilliseconds must be in 1..={MAX_REALIGN_TIME_BUDGET_MS}, got {budget_ms}."
+        ));
+    }
+    let _ = validate_diagnostic_prompt_digests(&config.diagnostic_prompt_sha256s, "realignConfig")?;
+    if !(1..=MAX_REALIGN_SITES).contains(&config.sites.len()) {
+        return Err(format!(
+            "realignConfig.sites must contain 1..={MAX_REALIGN_SITES} entries."
+        ));
+    }
+    let mut seen_targets = BTreeSet::new();
+    for site in &config.sites {
+        if site.target.trim().is_empty() {
+            return Err("realignConfig.sites contains an empty target name.".into());
+        }
+        if !seen_targets.insert(site.target.as_str()) {
+            return Err(format!(
+                "Duplicate target '{}' in realignConfig.sites.",
+                site.target
+            ));
+        }
+        let has_inline = !site.rows.is_empty();
+        let has_path = site.rows_path.is_some();
+        if has_inline == has_path {
+            return Err(format!(
+                "Site '{}' must supply exactly one of non-empty rows or rowsPath.",
+                site.target
+            ));
+        }
+        if let Some(path) = &site.rows_path {
+            bonsai_artifacts::validate_external_path(path).map_err(|e| e.to_string())?;
+        } else {
+            validate_realign_rows(&site.rows, &site.target, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn cholesky_f64(mat: &mut [f64], n: usize) -> crate::Result<()> {
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = mat[i * n + j];
+            for k in 0..j {
+                sum -= mat[i * n + k] * mat[j * n + k];
+            }
+            if i == j {
+                if !sum.is_finite() || sum <= 0.0 {
+                    return Err(
+                        "Realignment normal-equation system is not numerically positive definite."
+                            .into(),
+                    );
+                }
+                mat[i * n + j] = sum.sqrt();
+            } else {
+                mat[i * n + j] = sum / mat[j * n + j];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn solve_cholesky_in_place_f64(chol: &[f64], rhs: &mut [f64], n: usize) {
+    for i in 0..n {
+        let mut sum = rhs[i];
+        for k in 0..i {
+            sum -= chol[i * n + k] * rhs[k];
+        }
+        rhs[i] = sum / chol[i * n + i];
+    }
+    for i in (0..n).rev() {
+        let mut sum = rhs[i];
+        for k in (i + 1)..n {
+            sum -= chol[k * n + i] * rhs[k];
+        }
+        rhs[i] = sum / chol[i * n + i];
+    }
+}
+
+fn compute_hidden_activations(
+    a_rows: &[Vec<f64>],
+    fit_rows: &[&RealignRow],
+    budget: &mut WorkBudget,
+) -> crate::Result<Vec<Vec<f64>>> {
+    let rank = a_rows.len();
+    let n_fit = fit_rows.len();
+    let in_features = a_rows[0].len();
+    let mut h_mat = vec![vec![0.0_f64; n_fit]; rank];
+    for (j, row) in fit_rows.iter().enumerate() {
+        budget.charge(rank * in_features)?;
+        for (k, a_k) in a_rows.iter().enumerate() {
+            let val: f64 = a_k
+                .iter()
+                .zip(&row.input)
+                .map(|(&akc, &xc)| akc * f64::from(xc))
+                .sum();
+            if !val.is_finite() {
+                return Err("Nonfinite hidden activation in realignment.".into());
+            }
+            h_mat[k][j] = val;
+        }
+    }
+    Ok(h_mat)
+}
+
+fn realign_b_step(
+    a_rows: &[Vec<f64>],
+    b_cols: &mut [Vec<f64>],
+    fit_rows: &[&RealignRow],
+    ridge: f64,
+    budget: &mut WorkBudget,
+) -> crate::Result<()> {
+    let rank = a_rows.len();
+    let out_features = b_cols[0].len();
+    let n_fit = fit_rows.len();
+    let h_mat = compute_hidden_activations(a_rows, fit_rows, budget)?;
+
+    let mut gram = vec![0.0_f64; rank * rank];
+    for i in 0..rank {
+        for j in i..rank {
+            let dot = dot_f64(&h_mat[i], &h_mat[j]);
+            gram[i * rank + j] = dot;
+            gram[j * rank + i] = dot;
+        }
+        gram[i * rank + i] += ridge;
+    }
+    budget.charge(rank * rank * n_fit)?;
+    cholesky_f64(&mut gram, rank)?;
+
+    let mut residual_o = vec![0.0_f64; n_fit];
+    let mut rhs = vec![0.0_f64; rank];
+    for o in 0..out_features {
+        if o.is_multiple_of(256) {
+            let remaining = (out_features - o).min(256);
+            budget.charge(remaining * (rank * n_fit * 2 + rank * rank))?;
+        }
+        for (j, row) in fit_rows.iter().enumerate() {
+            let mut pred_o = 0.0_f64;
+            for k in 0..rank {
+                pred_o += b_cols[k][o] * h_mat[k][j];
+            }
+            residual_o[j] = f64::from(row.target_output[o]) - pred_o;
+        }
+        for k in 0..rank {
+            rhs[k] = dot_f64(&h_mat[k], &residual_o);
+        }
+        solve_cholesky_in_place_f64(&gram, &mut rhs, rank);
+        for k in 0..rank {
+            let updated = b_cols[k][o] + rhs[k];
+            if !updated.is_finite() {
+                return Err("Nonfinite updated B factor during RealignB.".into());
+            }
+            b_cols[k][o] = updated;
+        }
+    }
+    Ok(())
+}
+
+struct InputGramSpectrum {
+    eig_x: Vec<f64>,
+    q_x: Vec<Vec<f64>>,
+    x_tol: f64,
+}
+
+fn precompute_input_gram_spectrum(
+    fit_rows: &[&RealignRow],
+    in_features: usize,
+    budget: &mut WorkBudget,
+) -> crate::Result<InputGramSpectrum> {
+    let n_fit = fit_rows.len();
+    let mut g_x = vec![0.0_f64; n_fit * n_fit];
+    for i in 0..n_fit {
+        for j in i..n_fit {
+            budget.charge(in_features)?;
+            let dot: f64 = fit_rows[i]
+                .input
+                .iter()
+                .zip(&fit_rows[j].input)
+                .map(|(&xi, &xj)| f64::from(xi) * f64::from(xj))
+                .sum();
+            g_x[i * n_fit + j] = dot;
+            g_x[j * n_fit + i] = dot;
+        }
+    }
+    budget.charge(n_fit * n_fit * n_fit)?;
+    let (eig_x, q_x) = super::svd::jacobi_eigendecomp_f64(&mut g_x, n_fit)?;
+    let x_tol = eig_x.first().copied().unwrap_or(0.0) * 1e-24;
+    Ok(InputGramSpectrum { eig_x, q_x, x_tol })
+}
+
+fn realign_a_step(
+    a_rows: &mut [Vec<f64>],
+    b_cols: &[Vec<f64>],
+    fit_rows: &[&RealignRow],
+    input_spec: &InputGramSpectrum,
+    ridge: f64,
+    budget: &mut WorkBudget,
+) -> crate::Result<()> {
+    let rank = a_rows.len();
+    let in_features = a_rows[0].len();
+    let out_features = b_cols[0].len();
+    let n_fit = fit_rows.len();
+
+    let mut g_b = vec![0.0_f64; rank * rank];
+    for i in 0..rank {
+        for j in i..rank {
+            let dot = dot_f64(&b_cols[i], &b_cols[j]);
+            g_b[i * rank + j] = dot;
+            g_b[j * rank + i] = dot;
+        }
+    }
+    budget.charge(rank * rank * out_features)?;
+    let (eig_b, q_b) = super::svd::jacobi_eigendecomp_f64(&mut g_b, rank)?;
+
+    let h_mat = compute_hidden_activations(a_rows, fit_rows, budget)?;
+    let mut c_mat = vec![vec![0.0_f64; n_fit]; rank];
+    let mut residual = vec![0.0_f64; out_features];
+    for (j, row) in fit_rows.iter().enumerate() {
+        budget.charge(rank * out_features * 2)?;
+        for o in 0..out_features {
+            let mut pred_o = 0.0_f64;
+            for k in 0..rank {
+                pred_o += b_cols[k][o] * h_mat[k][j];
+            }
+            residual[o] = f64::from(row.target_output[o]) - pred_o;
+        }
+        for k in 0..rank {
+            c_mat[k][j] = dot_f64(&b_cols[k], &residual);
+        }
+    }
+
+    // T[a][j] = (Q_B^T * C)[a, j]
+    let mut t_mat = vec![vec![0.0_f64; n_fit]; rank];
+    for a in 0..rank {
+        for j in 0..n_fit {
+            let mut acc = 0.0_f64;
+            for k in 0..rank {
+                acc += q_b[a][k] * c_mat[k][j];
+            }
+            t_mat[a][j] = acc;
+        }
+    }
+
+    // Z[a][b] = (T * Q_X)[a, b] / (eig_b[a] * eig_x[b] + ridge)
+    let mut z_mat = vec![vec![0.0_f64; n_fit]; rank];
+    for a in 0..rank {
+        for b in 0..n_fit {
+            if input_spec.eig_x[b] <= input_spec.x_tol {
+                continue;
+            }
+            let s_ab = dot_f64(&t_mat[a], &input_spec.q_x[b]);
+            let denom = eig_b[a] * input_spec.eig_x[b] + ridge;
+            z_mat[a][b] = s_ab / denom;
+        }
+    }
+
+    // U[a][j] = (Z * Q_X^T)[a, j], then W_X[k][j] = (Q_B * U)[k, j]
+    let mut u_mat = vec![vec![0.0_f64; n_fit]; rank];
+    for a in 0..rank {
+        for b in 0..n_fit {
+            let zab = z_mat[a][b];
+            if zab == 0.0 {
+                continue;
+            }
+            for j in 0..n_fit {
+                u_mat[a][j] += zab * input_spec.q_x[b][j];
+            }
+        }
+    }
+    let mut w_x = vec![vec![0.0_f64; n_fit]; rank];
+    for k in 0..rank {
+        for j in 0..n_fit {
+            let mut acc = 0.0_f64;
+            for a in 0..rank {
+                acc += q_b[a][k] * u_mat[a][j];
+            }
+            w_x[k][j] = acc;
+        }
+    }
+    budget.charge(rank * n_fit * (rank + n_fit) * 2)?;
+
+    // A_new = A_old + W_X * X_fit^T
+    for (j, row) in fit_rows.iter().enumerate() {
+        budget.charge(rank * in_features)?;
+        for k in 0..rank {
+            let w = w_x[k][j];
+            if w == 0.0 {
+                continue;
+            }
+            for (dst, &xc) in a_rows[k].iter_mut().zip(&row.input) {
+                let updated = *dst + w * f64::from(xc);
+                if !updated.is_finite() {
+                    return Err("Nonfinite updated A factor during RealignA.".into());
+                }
+                *dst = updated;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct SplitStats {
+    rows: u32,
+    mean_squared_error: f64,
+    zero_target_mean_squared_error: f64,
+    relative_squared_error: Option<f64>,
+    worst_row_relative_l2_error: Option<f64>,
+    mean_cosine_similarity: Option<f64>,
+    min_cosine_similarity: Option<f64>,
+}
+
+impl SplitStats {
+    fn to_json(&self) -> Value {
+        json!({
+            "rows": self.rows,
+            "meanSquaredError": self.mean_squared_error,
+            "zeroTargetMeanSquaredError": self.zero_target_mean_squared_error,
+            "relativeSquaredError": self.relative_squared_error,
+            "worstRowRelativeL2Error": self.worst_row_relative_l2_error,
+            "meanCosineSimilarity": self.mean_cosine_similarity,
+            "minCosineSimilarity": self.min_cosine_similarity,
+        })
+    }
+}
+
+struct RealignSiteMetrics {
+    fit: SplitStats,
+    development: SplitStats,
+}
+
+impl RealignSiteMetrics {
+    fn to_json(&self) -> Value {
+        json!({
+            "fit": self.fit.to_json(),
+            "development": self.development.to_json(),
+        })
+    }
+}
+
+fn evaluate_realign_site_metrics(
+    rows: &[RealignRow],
+    a_rows: &[Vec<f64>],
+    b_cols: &[Vec<f64>],
+    budget: &mut WorkBudget,
+) -> crate::Result<RealignSiteMetrics> {
+    let rank = a_rows.len();
+    let in_features = a_rows[0].len();
+    let out_features = b_cols[0].len();
+
+    let mut fit_count = 0_u32;
+    let mut fit_sq_err = 0.0_f64;
+    let mut fit_energy = 0.0_f64;
+    let mut fit_acc = RowMetricsAccumulator::new();
+
+    let mut dev_count = 0_u32;
+    let mut dev_sq_err = 0.0_f64;
+    let mut dev_energy = 0.0_f64;
+    let mut dev_acc = RowMetricsAccumulator::new();
+
+    let mut hidden = vec![0.0_f64; rank];
+    let mut pred = vec![0.0_f64; out_features];
+    let mut target = vec![0.0_f64; out_features];
+
+    for row in rows {
+        budget.charge(rank * (in_features + out_features) + out_features * 2)?;
+        for (k, a_k) in a_rows.iter().enumerate() {
+            hidden[k] = a_k
+                .iter()
+                .zip(&row.input)
+                .map(|(&akc, &xc)| akc * f64::from(xc))
+                .sum();
+        }
+        pred.fill(0.0);
+        for (k, b_k) in b_cols.iter().enumerate() {
+            let hk = hidden[k];
+            if hk == 0.0 {
+                continue;
+            }
+            for (dst, &bko) in pred.iter_mut().zip(b_k) {
+                *dst += bko * hk;
+            }
+        }
+        let mut sq_err = 0.0_f64;
+        let mut energy = 0.0_f64;
+        for (o, &tgt_f32) in row.target_output.iter().enumerate() {
+            let tgt = f64::from(tgt_f32);
+            target[o] = tgt;
+            let diff = pred[o] - tgt;
+            sq_err += diff * diff;
+            energy += tgt * tgt;
+        }
+        match row.split {
+            RealignSplit::Fit => {
+                fit_count += 1;
+                fit_sq_err += sq_err;
+                fit_energy += energy;
+                fit_acc.record_pair(&target, &pred)?;
+            }
+            RealignSplit::Development => {
+                dev_count += 1;
+                dev_sq_err += sq_err;
+                dev_energy += energy;
+                dev_acc.record_pair(&target, &pred)?;
+            }
+        }
+    }
+
+    let out_f64 = f64::from(u32::try_from(out_features).map_err(|e| e.to_string())?);
+    let finalize = |count: u32,
+                    sq_err: f64,
+                    energy: f64,
+                    acc: RowMetricsAccumulator|
+     -> crate::Result<SplitStats> {
+        if !sq_err.is_finite() || !energy.is_finite() {
+            return Err("Nonfinite realignment error or energy diagnostic.".into());
+        }
+        let cells = f64::from(count) * out_f64;
+        let summary = acc.finish();
+        Ok(SplitStats {
+            rows: count,
+            mean_squared_error: sq_err / cells,
+            zero_target_mean_squared_error: energy / cells,
+            relative_squared_error: (energy > 0.0).then_some(sq_err / energy),
+            worst_row_relative_l2_error: summary.worst_row_relative_l2_error,
+            mean_cosine_similarity: summary.mean_cosine_similarity,
+            min_cosine_similarity: summary.min_cosine_similarity,
+        })
+    };
+
+    Ok(RealignSiteMetrics {
+        fit: finalize(fit_count, fit_sq_err, fit_energy, fit_acc)?,
+        development: finalize(dev_count, dev_sq_err, dev_energy, dev_acc)?,
+    })
+}
+
+fn round_trip_factor_value(val: f64, dtype: ExportDtype, label: &str) -> crate::Result<(f32, f64)> {
+    let v_f32 = check_factor_value(val, dtype, label)?;
+    let effective_f64 = match dtype {
+        ExportDtype::F32 => f64::from(v_f32),
+        ExportDtype::F16 => {
+            let bytes = encode_f16_le(v_f32)?;
+            f64::from(decode_scalar_f32(FloatDtype::F16, &bytes)?)
+        }
+    };
+    Ok((v_f32, effective_f64))
+}
+
+fn quantize_site_factors(
+    a_rows: &[Vec<f64>],
+    b_cols: &[Vec<f64>],
+    alpha: f32,
+    out_dtype: ExportDtype,
+) -> crate::Result<(Vec<f32>, Vec<f32>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+    let rank = a_rows.len();
+    let in_features = a_rows[0].len();
+    let out_features = b_cols[0].len();
+    let s1 = (f64::from(alpha) / usize_to_f64(rank)).sqrt();
+    let s2 = (usize_to_f64(rank) / f64::from(alpha)).sqrt();
+
+    let mut lora_a_f32 = Vec::new();
+    lora_a_f32
+        .try_reserve_exact(
+            rank.checked_mul(in_features)
+                .ok_or("Realigned lora_a size overflow.")?,
+        )
+        .map_err(|e| format!("Cannot allocate realigned lora_a: {e}"))?;
+    let mut eval_a = vec![vec![0.0_f64; in_features]; rank];
+    for (k, a_k) in a_rows.iter().enumerate() {
+        for (c, &v) in a_k.iter().enumerate() {
+            let (v_f32, v_eff) = round_trip_factor_value(v * s2, out_dtype, "realigned lora_a")?;
+            lora_a_f32.push(v_f32);
+            eval_a[k][c] = v_eff * s1;
+        }
+    }
+
+    let mut lora_b_f32 = Vec::new();
+    lora_b_f32
+        .try_reserve_exact(
+            out_features
+                .checked_mul(rank)
+                .ok_or("Realigned lora_b size overflow.")?,
+        )
+        .map_err(|e| format!("Cannot allocate realigned lora_b: {e}"))?;
+    lora_b_f32.resize(out_features * rank, 0.0_f32);
+    let mut eval_b = vec![vec![0.0_f64; out_features]; rank];
+    for (k, b_k) in b_cols.iter().enumerate() {
+        for (o, &v) in b_k.iter().enumerate() {
+            let (v_f32, v_eff) = round_trip_factor_value(v * s2, out_dtype, "realigned lora_b")?;
+            lora_b_f32[o * rank + k] = v_f32;
+            eval_b[k][o] = v_eff * s1;
+        }
+    }
+    Ok((lora_a_f32, lora_b_f32, eval_a, eval_b))
+}
+
+/// Runs `realign-factors` against the built-in Swift base tensor dimensions.
+pub(super) fn run_realign_factors(request: &Request) -> crate::Result<Value> {
+    run_realign_factors_with_dims(request, &swift_base_dims_map())
+}
+
+/// Runs `realign-factors` with explicit base tensor dimensions (production and test entry point).
+#[expect(
+    clippy::too_many_lines,
+    reason = "Coordinates bounded row intake, closed-form ridge solves, development gate checking, and atomic verification."
+)]
+pub(super) fn run_realign_factors_with_dims(
+    request: &Request,
+    base_dims: &BTreeMap<String, (usize, usize, &'static str)>,
+) -> crate::Result<Value> {
+    if request.operation != Operation::RealignFactors {
+        return Err("Invalid operation dispatch for realign-factors.".into());
+    }
+    let adapter_path = request
+        .adapter_path
+        .as_ref()
+        .ok_or("realign-factors requires adapterPath.")?;
+    let output_path = request
+        .output_path
+        .as_ref()
+        .ok_or("realign-factors requires outputPath.")?;
+    let config = request
+        .realign_config
+        .as_ref()
+        .ok_or("realign-factors requires realignConfig.")?;
+    validate_realign_config(config)?;
+    let training_prompt_sha256s =
+        validate_diagnostic_prompt_digests(&config.diagnostic_prompt_sha256s, "realignConfig")?;
+
+    let ridge = config.ridge.unwrap_or(DEFAULT_REALIGN_RIDGE);
+    let alternating_steps = match config.mode {
+        RealignMode::AlternatingAb => Some(
+            config
+                .alternating_steps
+                .unwrap_or(DEFAULT_ALTERNATING_STEPS),
+        ),
+        RealignMode::RealignB | RealignMode::RealignA => None,
+    };
+    let budget_ms = config
+        .time_budget_milliseconds
+        .unwrap_or(DEFAULT_REALIGN_TIME_BUDGET_MS);
+    let mut budget = WorkBudget::new(budget_ms)?;
+
+    let loaded = read_lora_gguf_pairs_with_dims(adapter_path, base_dims)?;
+    let out_dtype = config.export_dtype.unwrap_or(loaded.dtype);
+    let alpha = loaded.alpha;
+    let mut pairs_by_target: BTreeMap<String, ExportTensorPair> = loaded
+        .pairs
+        .into_iter()
+        .map(|p| (p.gguf_base_name.clone(), p))
+        .collect();
+
+    let mut per_site_diagnostics = serde_json::Map::new();
+    let mut realigned_sites: Vec<String> = Vec::with_capacity(config.sites.len());
+    let mut regressed_sites: Vec<String> = Vec::new();
+    let mut updated_pairs: Vec<ExportTensorPair> = Vec::new();
+
+    for site in &config.sites {
+        let pair = pairs_by_target.remove(&site.target).ok_or_else(|| {
+            format!(
+                "realignConfig.sites target '{}' is missing from source adapter.",
+                site.target
+            )
+        })?;
+        let loaded_rows: Vec<RealignRow>;
+        let rows: &[RealignRow] = if let Some(path) = &site.rows_path {
+            bonsai_artifacts::validate_external_path(path).map_err(|e| e.to_string())?;
+            loaded_rows = crate::bounded_input::read_regular_json(
+                path,
+                MAX_REALIGN_ROWS_FILE_BYTES,
+                "Realign site rows JSON exceeds 48 MiB.",
+            )?;
+            &loaded_rows
+        } else {
+            &site.rows
+        };
+        validate_realign_rows(
+            rows,
+            &site.target,
+            Some((pair.in_features, pair.out_features)),
+        )?;
+
+        let s1 = (f64::from(alpha) / usize_to_f64(pair.rank)).sqrt();
+        let mut a_rows: Vec<Vec<f64>> = (0..pair.rank)
+            .map(|k| {
+                let off = k * pair.in_features;
+                pair.lora_a_f32[off..off + pair.in_features]
+                    .iter()
+                    .map(|&v| f64::from(v) * s1)
+                    .collect()
+            })
+            .collect();
+        let mut b_cols: Vec<Vec<f64>> = (0..pair.rank)
+            .map(|k| {
+                (0..pair.out_features)
+                    .map(|o| f64::from(pair.lora_b_f32[o * pair.rank + k]) * s1)
+                    .collect()
+            })
+            .collect();
+
+        let before = evaluate_realign_site_metrics(rows, &a_rows, &b_cols, &mut budget)?;
+        let fit_rows: Vec<&RealignRow> = rows
+            .iter()
+            .filter(|r| r.split == RealignSplit::Fit)
+            .collect();
+        let dev_count = rows.len() - fit_rows.len();
+
+        let input_spec = match config.mode {
+            RealignMode::RealignB => None,
+            RealignMode::RealignA | RealignMode::AlternatingAb => Some(
+                precompute_input_gram_spectrum(&fit_rows, pair.in_features, &mut budget)?,
+            ),
+        };
+
+        match (config.mode, &input_spec) {
+            (RealignMode::RealignB, _) => {
+                realign_b_step(&a_rows, &mut b_cols, &fit_rows, ridge, &mut budget)?;
+            }
+            (RealignMode::RealignA, Some(spec)) => {
+                realign_a_step(&mut a_rows, &b_cols, &fit_rows, spec, ridge, &mut budget)?;
+            }
+            (RealignMode::AlternatingAb, Some(spec)) => {
+                let steps = alternating_steps.unwrap_or(DEFAULT_ALTERNATING_STEPS);
+                for _ in 0..steps {
+                    realign_b_step(&a_rows, &mut b_cols, &fit_rows, ridge, &mut budget)?;
+                    realign_a_step(&mut a_rows, &b_cols, &fit_rows, spec, ridge, &mut budget)?;
+                }
+            }
+            (RealignMode::RealignA | RealignMode::AlternatingAb, None) => {
+                return Err("Internal invariant error: missing input Gram spectrum.".into());
+            }
+        }
+
+        let (lora_a_f32, lora_b_f32, eval_a, eval_b) =
+            quantize_site_factors(&a_rows, &b_cols, alpha, out_dtype)?;
+        let after = evaluate_realign_site_metrics(rows, &eval_a, &eval_b, &mut budget)?;
+
+        let regressed = after.development.mean_squared_error
+            > before.development.mean_squared_error * (1.0 + 1e-12);
+        if regressed {
+            regressed_sites.push(site.target.clone());
+        }
+        let accepted = config.allow_development_regression || !regressed;
+        realigned_sites.push(site.target.clone());
+        per_site_diagnostics.insert(
+            site.target.clone(),
+            json!({
+                "target": site.target,
+                "rank": pair.rank,
+                "fitRows": fit_rows.len(),
+                "developmentRows": dev_count,
+                "regressed": regressed,
+                "accepted": accepted,
+                "before": before.to_json(),
+                "after": after.to_json(),
+            }),
+        );
+
+        updated_pairs.push(ExportTensorPair {
+            gguf_base_name: pair.gguf_base_name,
+            in_features: pair.in_features,
+            out_features: pair.out_features,
+            rank: pair.rank,
+            lora_a_f32,
+            lora_b_f32,
+        });
+    }
+
+    if !config.allow_development_regression && !regressed_sites.is_empty() {
+        return Ok(json!({
+            "schemaVersion": 1,
+            "operation": "realign-factors",
+            "published": false,
+            "status": "development-regression-rejected",
+            "mode": config.mode.as_str(),
+            "ridge": ridge,
+            "alternatingSteps": alternating_steps,
+            "allowDevelopmentRegression": config.allow_development_regression,
+            "sourceAdapterPath": adapter_path,
+            "sourceAdapterSha256": loaded.sha256,
+            "exportDtype": out_dtype,
+            "alpha": alpha,
+            "trainingPromptSha256s": training_prompt_sha256s,
+            "realignedSites": realigned_sites,
+            "regressedSites": regressed_sites,
+            "perSiteDiagnostics": per_site_diagnostics,
+            "workUnits": budget.work,
+        }));
+    }
+
+    // Re-encode any untouched pairs into the chosen output dtype cleanly.
+    let mut final_pairs = Vec::with_capacity(updated_pairs.len() + pairs_by_target.len());
+    final_pairs.extend(updated_pairs);
+    for (_, pair) in pairs_by_target {
+        if out_dtype == loaded.dtype {
+            final_pairs.push(pair);
+        } else {
+            let mut a_f32 = Vec::with_capacity(pair.lora_a_f32.len());
+            for v in pair.lora_a_f32 {
+                a_f32.push(check_factor_value(
+                    f64::from(v),
+                    out_dtype,
+                    "untouched lora_a",
+                )?);
+            }
+            let mut b_f32 = Vec::with_capacity(pair.lora_b_f32.len());
+            for v in pair.lora_b_f32 {
+                b_f32.push(check_factor_value(
+                    f64::from(v),
+                    out_dtype,
+                    "untouched lora_b",
+                )?);
+            }
+            final_pairs.push(ExportTensorPair {
+                gguf_base_name: pair.gguf_base_name,
+                in_features: pair.in_features,
+                out_features: pair.out_features,
+                rank: pair.rank,
+                lora_a_f32: a_f32,
+                lora_b_f32: b_f32,
+            });
+        }
+    }
+    sort_pairs_canonically(&mut final_pairs);
+
+    let max_rank = final_pairs.iter().map(|p| p.rank).max().unwrap_or(1);
+    let mut families_used = BTreeSet::new();
+    for pair in &final_pairs {
+        let (_, _, family) = validate_target_linear_dims(&pair.gguf_base_name, base_dims)?;
+        families_used.insert(family);
+    }
+    let (expected_env, _, _) = classify_families(&families_used);
+
+    let mut meta: Vec<(String, String)> = loaded
+        .provenance_meta
+        .into_iter()
+        .filter(|(k, _)| {
+            k != "bonsai.composition.realign_parent_sha256"
+                && k != "bonsai.composition.realign_method"
+        })
+        .collect();
+    meta.push((
+        "bonsai.composition.realign_parent_sha256".to_owned(),
+        loaded.sha256.clone(),
+    ));
+    meta.push((
+        "bonsai.composition.realign_method".to_owned(),
+        config.mode.provenance_method().to_owned(),
+    ));
+    let meta_refs: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let written = write_lora_gguf(output_path, out_dtype, alpha, &meta_refs, &final_pairs)?;
+    let verification = verify_published_adapter(
+        output_path,
+        &written.sha256,
+        written.bytes,
+        max_rank,
+        final_pairs.len(),
+        base_dims,
+    )?;
+
+    Ok(json!({
+        "schemaVersion": 1,
+        "operation": "realign-factors",
+        "published": true,
+        "status": "published-and-verified",
+        "mode": config.mode.as_str(),
+        "ridge": ridge,
+        "alternatingSteps": alternating_steps,
+        "allowDevelopmentRegression": config.allow_development_regression,
+        "sourceAdapterPath": adapter_path,
+        "sourceAdapterSha256": loaded.sha256,
+        "outputPath": output_path,
+        "targetEnvelope": expected_env,
+        "exportDtype": out_dtype,
+        "alpha": alpha,
+        "minRank": verification["minRank"],
+        "maxRank": verification["maxRank"],
+        "bytes": written.bytes,
+        "sha256": written.sha256,
+        "tensorCount": written.tensor_count,
+        "pairCount": final_pairs.len(),
+        "trainingPromptSha256s": training_prompt_sha256s,
+        "realignedSites": realigned_sites,
+        "regressedSites": regressed_sites,
+        "perSiteDiagnostics": per_site_diagnostics,
+        "workUnits": budget.work,
+        "verification": verification,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1034,7 +2064,11 @@ mod tests {
         ExportDtype, ExportTensorPair, read_lora_gguf_pairs_with_dims, write_lora_gguf,
     };
     use super::super::{Request, run, validate_request};
-    use super::{f32_le_sha256, run_fold_patch_with_dims, thin_qr_f64};
+    use super::{
+        RealignRow, RealignSplit, WorkBudget, f32_le_sha256, precompute_input_gram_spectrum,
+        realign_a_step, realign_b_step, run_fold_patch_with_dims, run_realign_factors_with_dims,
+        thin_qr_f64,
+    };
     use crate::bounded_input::ScratchDir;
 
     fn toy_dims() -> BTreeMap<String, (usize, usize, &'static str)> {
@@ -1510,6 +2544,837 @@ mod tests {
             }
         }));
         assert!(bad_entry.is_err());
+
+        Ok(())
+    }
+
+    fn make_realign_row(
+        sample_id: &str,
+        group_id: &str,
+        token_index: u32,
+        split: RealignSplit,
+        input: Vec<f32>,
+        target_output: Vec<f32>,
+    ) -> RealignRow {
+        RealignRow {
+            sample_id: sample_id.to_owned(),
+            group_id: group_id.to_owned(),
+            token_index,
+            split,
+            input,
+            target_output,
+        }
+    }
+
+    fn eval_objective_a(
+        a: &[Vec<f64>],
+        a0: &[Vec<f64>],
+        b: &[Vec<f64>],
+        fit_rows: &[&RealignRow],
+        ridge: f64,
+    ) -> f64 {
+        let rank = a.len();
+        let out_features = b[0].len();
+        let mut data_loss = 0.0_f64;
+        for row in fit_rows {
+            let mut h = vec![0.0_f64; rank];
+            for (k, ak) in a.iter().enumerate() {
+                h[k] = ak
+                    .iter()
+                    .zip(&row.input)
+                    .map(|(&akc, &xc)| akc * f64::from(xc))
+                    .sum();
+            }
+            for o in 0..out_features {
+                let mut pred = 0.0_f64;
+                for (k, bk) in b.iter().enumerate() {
+                    pred += bk[o] * h[k];
+                }
+                let diff = pred - f64::from(row.target_output[o]);
+                data_loss += diff * diff;
+            }
+        }
+        let mut reg = 0.0_f64;
+        for (ak, ak0) in a.iter().zip(a0) {
+            for (&v, &v0) in ak.iter().zip(ak0) {
+                let d = v - v0;
+                reg += d * d;
+            }
+        }
+        data_loss + ridge * reg
+    }
+
+    #[test]
+    fn realign_a_and_b_match_exact_normal_equations_and_finite_differences() -> crate::Result<()> {
+        let rank = 3;
+        let in_f = 12;
+        let out_f = 8;
+        let ridge = 0.05;
+
+        let a0: Vec<Vec<f64>> = (0..rank)
+            .map(|k| {
+                (0..in_f)
+                    .map(|c| {
+                        let kf = f64::from(u32::try_from(k + 1).unwrap_or(1));
+                        let cf = f64::from(u32::try_from(c + 1).unwrap_or(1));
+                        0.3 * (kf * 0.7 + cf * 0.4).sin()
+                    })
+                    .collect()
+            })
+            .collect();
+        let b0: Vec<Vec<f64>> = (0..rank)
+            .map(|k| {
+                (0..out_f)
+                    .map(|o| {
+                        let kf = f64::from(u32::try_from(k + 1).unwrap_or(1));
+                        let of = f64::from(u32::try_from(o + 1).unwrap_or(1));
+                        0.4 * (kf * 0.5 - of * 0.3).cos()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Build 5 fit rows where row 4 is an exact linear combination of rows 0 and 1
+        // so X_fit is intentionally rank-deficient to exercise the nullspace threshold.
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "Synthetic test vectors narrow exact deterministic values to f32."
+        )]
+        let mut inputs: Vec<Vec<f32>> = (0..4)
+            .map(|j| {
+                (0..in_f)
+                    .map(|c| {
+                        let jf = f64::from(u32::try_from(j + 1).unwrap_or(1));
+                        let cf = f64::from(u32::try_from(c + 1).unwrap_or(1));
+                        ((jf * 1.1 + cf * 0.37).sin() * 0.8) as f32
+                    })
+                    .collect()
+            })
+            .collect();
+        let dep_row: Vec<f32> = inputs[0]
+            .iter()
+            .zip(&inputs[1])
+            .map(|(&x0, &x1)| 1.5 * x0 - 0.5 * x1)
+            .collect();
+        inputs.push(dep_row);
+
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "Synthetic test targets narrow deterministic values to f32."
+        )]
+        let targets: Vec<Vec<f32>> = (0..5)
+            .map(|j| {
+                (0..out_f)
+                    .map(|o| {
+                        let jf = f64::from(u32::try_from(j + 1).unwrap_or(1));
+                        let of = f64::from(u32::try_from(o + 1).unwrap_or(1));
+                        ((jf * 0.9 - of * 0.6).cos() * 1.2) as f32
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let owned_rows: Vec<RealignRow> = inputs
+            .into_iter()
+            .zip(targets)
+            .enumerate()
+            .map(|(j, (inp, tgt))| {
+                make_realign_row(
+                    &format!("s{j}"),
+                    &format!("g{j}"),
+                    0,
+                    RealignSplit::Fit,
+                    inp,
+                    tgt,
+                )
+            })
+            .collect();
+        let fit_refs: Vec<&RealignRow> = owned_rows.iter().collect();
+
+        // 1. Verify RealignA against exact normal equation and finite-difference gradient.
+        let mut budget = WorkBudget::new(5_000)?;
+        let spec = precompute_input_gram_spectrum(&fit_refs, in_f, &mut budget)?;
+        let mut a_sol = a0.clone();
+        realign_a_step(&mut a_sol, &b0, &fit_refs, &spec, ridge, &mut budget)?;
+
+        // Check normal equation: (B^T B) ΔA (X X^T) + λ ΔA == B^T (Y - B A0 X) X^T
+        let mut delta_a = vec![vec![0.0_f64; in_f]; rank];
+        for k in 0..rank {
+            for c in 0..in_f {
+                delta_a[k][c] = a_sol[k][c] - a0[k][c];
+            }
+        }
+        // Compute lhs = (B^T B) ΔA (X X^T) + λ ΔA and rhs = B^T (Y - B A0 X) X^T
+        let mut lhs_mid = vec![vec![0.0_f64; fit_refs.len()]; rank];
+        let mut rhs_mid = vec![vec![0.0_f64; fit_refs.len()]; rank];
+        for (j, row) in fit_refs.iter().enumerate() {
+            let mut b_da_x = vec![0.0_f64; out_f];
+            let mut r0 = vec![0.0_f64; out_f];
+            for o in 0..out_f {
+                r0[o] = f64::from(row.target_output[o]);
+            }
+            for k in 0..rank {
+                let da_x: f64 = delta_a[k]
+                    .iter()
+                    .zip(&row.input)
+                    .map(|(&d, &x)| d * f64::from(x))
+                    .sum();
+                let a0_x: f64 = a0[k]
+                    .iter()
+                    .zip(&row.input)
+                    .map(|(&a, &x)| a * f64::from(x))
+                    .sum();
+                for o in 0..out_f {
+                    b_da_x[o] += b0[k][o] * da_x;
+                    r0[o] -= b0[k][o] * a0_x;
+                }
+            }
+            for k in 0..rank {
+                lhs_mid[k][j] = b0[k].iter().zip(&b_da_x).map(|(&bv, &y)| bv * y).sum();
+                rhs_mid[k][j] = b0[k].iter().zip(&r0).map(|(&bv, &y)| bv * y).sum();
+            }
+        }
+        let mut max_ne_residual = 0.0_f64;
+        for k in 0..rank {
+            for c in 0..in_f {
+                let mut lhs_val = ridge * delta_a[k][c];
+                let mut rhs_val = 0.0_f64;
+                for (j, row) in fit_refs.iter().enumerate() {
+                    let xc = f64::from(row.input[c]);
+                    lhs_val += lhs_mid[k][j] * xc;
+                    rhs_val += rhs_mid[k][j] * xc;
+                }
+                max_ne_residual = max_ne_residual.max((lhs_val - rhs_val).abs());
+            }
+        }
+        assert!(
+            max_ne_residual < 1e-10,
+            "RealignA normal equation residual={max_ne_residual}"
+        );
+
+        // Finite-difference optimality check around a_sol
+        let h_fd = 1e-6_f64;
+        let mut max_grad = 0.0_f64;
+        for k in 0..rank {
+            for c in 0..in_f {
+                let mut plus = a_sol.clone();
+                plus[k][c] += h_fd;
+                let mut minus = a_sol.clone();
+                minus[k][c] -= h_fd;
+                let grad = (eval_objective_a(&plus, &a0, &b0, &fit_refs, ridge)
+                    - eval_objective_a(&minus, &a0, &b0, &fit_refs, ridge))
+                    / (2.0 * h_fd);
+                max_grad = max_grad.max(grad.abs());
+            }
+        }
+        assert!(max_grad < 1e-7, "RealignA finite-diff gradient={max_grad}");
+
+        // 2. Verify RealignB against exact normal equation: (H H^T + λ I) ΔB^T = H (Y - B0 H)^T
+        let mut b_sol = b0.clone();
+        realign_b_step(&a0, &mut b_sol, &fit_refs, ridge, &mut budget)?;
+        let h_mat = super::compute_hidden_activations(&a0, &fit_refs, &mut budget)?;
+        let mut max_b_ne_residual = 0.0_f64;
+        for o in 0..out_f {
+            for i in 0..rank {
+                let mut lhs_val = ridge * (b_sol[i][o] - b0[i][o]);
+                let mut rhs_val = 0.0_f64;
+                for (j, row) in fit_refs.iter().enumerate() {
+                    let mut bsol_h = 0.0_f64;
+                    let mut b0_h = 0.0_f64;
+                    for k in 0..rank {
+                        bsol_h += b_sol[k][o] * h_mat[k][j];
+                        b0_h += b0[k][o] * h_mat[k][j];
+                    }
+                    let delta_pred = bsol_h - b0_h;
+                    let r0 = f64::from(row.target_output[o]) - b0_h;
+                    lhs_val += h_mat[i][j] * delta_pred;
+                    rhs_val += h_mat[i][j] * r0;
+                }
+                max_b_ne_residual = max_b_ne_residual.max((lhs_val - rhs_val).abs());
+            }
+        }
+        assert!(
+            max_b_ne_residual < 1e-10,
+            "RealignB normal equation residual={max_b_ne_residual}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn realign_factors_modes_rows_path_and_regression_gate() -> crate::Result<()> {
+        let scratch = ScratchDir::new("realign-factors")?;
+        let dims = toy_dims();
+        let src = scratch.join("src-r3.gguf");
+
+        let in_f = 12_usize;
+        let out_f = 8_usize;
+        let rank = 3_usize;
+        let alpha = 3.0_f32;
+
+        // Initial adapter factors (slightly perturbed from ground truth).
+        let mut a_init = vec![0.0_f32; rank * in_f];
+        let mut b_init = vec![0.0_f32; out_f * rank];
+        for k in 0..rank {
+            a_init[k * in_f + k] = 0.5;
+            a_init[k * in_f + k + 3] = 0.2;
+            b_init[k * rank + k] = 0.4;
+            b_init[(k + 3) * rank + k] = 0.25;
+        }
+        let untouched_pair = ExportTensorPair {
+            gguf_base_name: "blk.3.attn_k.weight".to_owned(),
+            in_features: 10,
+            out_features: 6,
+            rank: 2,
+            lora_a_f32: vec![0.125_f32; 2 * 10],
+            lora_b_f32: vec![-0.25_f32; 6 * 2],
+        };
+        let untouched_expected = untouched_pair.lora_a_f32.clone();
+        write_lora_gguf(
+            &src,
+            ExportDtype::F32,
+            alpha,
+            &[("bonsai.composition.method", "realign-parent-test")],
+            &[
+                untouched_pair,
+                ExportTensorPair {
+                    gguf_base_name: "blk.63.ffn_down.weight".to_owned(),
+                    in_features: in_f,
+                    out_features: out_f,
+                    rank,
+                    lora_a_f32: a_init,
+                    lora_b_f32: b_init,
+                },
+            ],
+        )?;
+
+        // Ground-truth rank-3 linear target shifted from initial factors.
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "Synthetic test matrix narrows deterministic f64 values to f32."
+        )]
+        let eval_true_y = |x: &[f32]| -> Vec<f32> {
+            let mut y = vec![0.0_f32; out_f];
+            for k in 0..rank {
+                let mut h = 0.0_f64;
+                for (c, &xc) in x.iter().enumerate() {
+                    let ac = if c == k {
+                        0.9
+                    } else if c == k + 3 {
+                        -0.4
+                    } else if c == k + 6 {
+                        0.3
+                    } else {
+                        0.0
+                    };
+                    h += ac * f64::from(xc);
+                }
+                for (o, yo) in y.iter_mut().enumerate() {
+                    let bo = if o == k {
+                        1.1
+                    } else if o == k + 3 {
+                        0.6
+                    } else {
+                        0.05 * f64::from(u32::try_from(o + k + 1).unwrap_or(1))
+                    };
+                    *yo += (bo * h) as f32;
+                }
+            }
+            y
+        };
+
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "Deterministic synthetic input vectors narrow f64 cosines/sines to f32."
+        )]
+        let make_input = |seed: usize| -> Vec<f32> {
+            (0..in_f)
+                .map(|c| {
+                    let sf = f64::from(u32::try_from(seed + 1).unwrap_or(1));
+                    let cf = f64::from(u32::try_from(c + 1).unwrap_or(1));
+                    ((sf * 0.73 + cf * 1.19).sin() + 0.5 * (sf * 0.41 - cf * 0.29).cos()) as f32
+                })
+                .collect()
+        };
+
+        let mut rows = Vec::new();
+        for idx in 0..8_usize {
+            let x = make_input(idx);
+            let y = eval_true_y(&x);
+            rows.push(make_realign_row(
+                &format!("fit-{idx}"),
+                &format!("grp-fit-{idx}"),
+                0,
+                RealignSplit::Fit,
+                x,
+                y,
+            ));
+        }
+        for idx in 8..11_usize {
+            let x = make_input(idx);
+            let y = eval_true_y(&x);
+            rows.push(make_realign_row(
+                &format!("dev-{idx}"),
+                &format!("grp-dev-{idx}"),
+                0,
+                RealignSplit::Development,
+                x,
+                y,
+            ));
+        }
+
+        let rows_path = scratch.join("site-rows.json");
+        fs::write(
+            &rows_path,
+            serde_json::to_vec(&rows).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let diag_a = "11".repeat(32);
+        let diag_b = "22".repeat(32);
+
+        // Run RealignB, RealignA, and AlternatingAb (via rowsPath) and verify MSE decreases cleanly.
+        let mut alt_dev_mse = f64::INFINITY;
+        for (mode, steps, tag) in [
+            ("realign-b", None, "rb"),
+            ("realign-a", None, "ra"),
+            ("alternating-ab", Some(4_usize), "alt"),
+        ] {
+            let out_path = scratch.join(format!("realigned-{tag}.gguf"));
+            let mut cfg = json!({
+                "mode": mode,
+                "ridge": 1e-6,
+                "exportDtype": "f32",
+                "diagnosticPromptSha256s": [diag_b, diag_a],
+                "sites": [{
+                    "target": "blk.63.ffn_down.weight",
+                    "rowsPath": rows_path
+                }]
+            });
+            if let Some(s) = steps {
+                cfg["alternatingSteps"] = json!(s);
+            }
+            let req: Request = serde_json::from_value(json!({
+                "schemaVersion": 1,
+                "operation": "realign-factors",
+                "adapterPath": src,
+                "outputPath": out_path,
+                "realignConfig": cfg
+            }))
+            .map_err(|e| e.to_string())?;
+            validate_request(&req)?;
+            let res = run_realign_factors_with_dims(&req, &dims)?;
+            assert_eq!(res["published"], true);
+            assert_eq!(res["status"], "published-and-verified");
+            assert_eq!(res["mode"], mode);
+            assert_eq!(res["trainingPromptSha256s"], json!([diag_a, diag_b]));
+            assert_eq!(res["realignedSites"], json!(["blk.63.ffn_down.weight"]));
+            assert_eq!(res["verification"]["verified"], true);
+            assert_eq!(
+                res["verification"]["provenanceMetadata"]["bonsai.composition.method"],
+                "realign-parent-test"
+            );
+            assert!(
+                res["verification"]["provenanceMetadata"]
+                    ["bonsai.composition.realign_parent_sha256"]
+                    .is_string()
+            );
+
+            let diag = &res["perSiteDiagnostics"]["blk.63.ffn_down.weight"];
+            let before_fit_mse = diag["before"]["fit"]["meanSquaredError"]
+                .as_f64()
+                .ok_or("Missing before fit mse")?;
+            let after_fit_mse = diag["after"]["fit"]["meanSquaredError"]
+                .as_f64()
+                .ok_or("Missing after fit mse")?;
+            let before_dev_mse = diag["before"]["development"]["meanSquaredError"]
+                .as_f64()
+                .ok_or("Missing before dev mse")?;
+            let after_dev_mse = diag["after"]["development"]["meanSquaredError"]
+                .as_f64()
+                .ok_or("Missing after dev mse")?;
+            assert!(after_fit_mse < before_fit_mse * 0.25);
+            assert!(after_dev_mse < before_dev_mse * 0.5);
+            assert!(diag["after"]["development"]["meanCosineSimilarity"].is_f64());
+            assert!(diag["after"]["development"]["minCosineSimilarity"].is_f64());
+            assert!(diag["after"]["development"]["worstRowRelativeL2Error"].is_f64());
+            assert!(diag["after"]["development"]["relativeSquaredError"].is_f64());
+
+            if mode == "alternating-ab" {
+                alt_dev_mse = after_dev_mse;
+                let reloaded = read_lora_gguf_pairs_with_dims(&out_path, &dims)?;
+                let p3 = reloaded
+                    .pairs
+                    .iter()
+                    .find(|p| p.gguf_base_name == "blk.3.attn_k.weight")
+                    .ok_or("Missing untouched blk.3")?;
+                assert_eq!(p3.lora_a_f32, untouched_expected);
+            }
+        }
+        assert!(alt_dev_mse < 1e-4, "alternating_ab dev_mse={alt_dev_mse}");
+
+        // Fail-closed development regression gate: adversarial dev targets regress MSE!
+        let mut reg_rows = rows;
+        for row in &mut reg_rows {
+            if row.split == RealignSplit::Development {
+                for v in &mut row.target_output {
+                    *v = -*v;
+                }
+            }
+        }
+        let reg_out = scratch.join("rejected-regression.gguf");
+        let reg_req: Request = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "operation": "realign-factors",
+            "adapterPath": src,
+            "outputPath": reg_out,
+            "realignConfig": {
+                "mode": "realign-b",
+                "ridge": 1e-4,
+                "allowDevelopmentRegression": false,
+                "diagnosticPromptSha256s": [diag_a],
+                "sites": [{
+                    "target": "blk.63.ffn_down.weight",
+                    "rows": reg_rows
+                }]
+            }
+        }))
+        .map_err(|e| e.to_string())?;
+        let reg_res = run_realign_factors_with_dims(&reg_req, &dims)?;
+        assert_eq!(reg_res["published"], false);
+        assert_eq!(reg_res["status"], "development-regression-rejected");
+        assert_eq!(reg_res["regressedSites"], json!(["blk.63.ffn_down.weight"]));
+        assert!(
+            !reg_out.exists(),
+            "Rejected run must NOT write output GGUF file!"
+        );
+
+        // Same rows with allowDevelopmentRegression: true must publish!
+        let allow_out = scratch.join("allowed-regression.gguf");
+        let allow_req: Request = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "operation": "realign-factors",
+            "adapterPath": src,
+            "outputPath": allow_out,
+            "realignConfig": {
+                "mode": "realign-b",
+                "ridge": 1e-4,
+                "allowDevelopmentRegression": true,
+                "diagnosticPromptSha256s": [diag_a],
+                "sites": [{
+                    "target": "blk.63.ffn_down.weight",
+                    "rows": reg_rows
+                }]
+            }
+        }))
+        .map_err(|e| e.to_string())?;
+        let allow_res = run_realign_factors_with_dims(&allow_req, &dims)?;
+        assert_eq!(allow_res["published"], true);
+        assert!(allow_out.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn realign_factors_rejects_split_leakage_and_invalid_configs() -> crate::Result<()> {
+        let scratch = ScratchDir::new("realign-validation")?;
+        let src = scratch.join("real-dims-src.gguf");
+        let in_f = 17_408_usize;
+        let out_f = 5_120_usize;
+        let mut a = vec![0.0_f32; in_f];
+        let mut b = vec![0.0_f32; out_f];
+        a[0] = 0.25;
+        b[0] = 0.5;
+        write_lora_gguf(
+            &src,
+            ExportDtype::F16,
+            1.0,
+            &[],
+            &[ExportTensorPair {
+                gguf_base_name: "blk.63.ffn_down.weight".to_owned(),
+                in_features: in_f,
+                out_features: out_f,
+                rank: 1,
+                lora_a_f32: a,
+                lora_b_f32: b,
+            }],
+        )?;
+
+        let diag = "cc".repeat(32);
+        let mk_vec = |len: usize, val: f32| -> Vec<f32> {
+            let mut v = vec![0.0_f32; len];
+            v[0] = val;
+            v
+        };
+        let valid_rows = vec![
+            make_realign_row(
+                "s1",
+                "g1",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 1.0),
+                mk_vec(out_f, 0.4),
+            ),
+            make_realign_row(
+                "s2",
+                "g2",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 2.0),
+                mk_vec(out_f, 0.8),
+            ),
+            make_realign_row(
+                "s3",
+                "g3",
+                0,
+                RealignSplit::Development,
+                mk_vec(in_f, 1.5),
+                mk_vec(out_f, 0.6),
+            ),
+        ];
+
+        // Smoke test real Swift 17408 x 5120 F16 end-to-end through top-level lora_diff_audit::run!
+        let real_out = scratch.join("real-realigned.gguf");
+        let real_res = run(json!({
+            "schemaVersion": 1,
+            "operation": "realign-factors",
+            "adapterPath": src,
+            "outputPath": real_out,
+            "realignConfig": {
+                "mode": "alternating-ab",
+                "alternatingSteps": 2,
+                "ridge": 1e-3,
+                "diagnosticPromptSha256s": [diag],
+                "sites": [{
+                    "target": "blk.63.ffn_down.weight",
+                    "rows": valid_rows
+                }]
+            }
+        }))?;
+        assert_eq!(real_res["published"], true);
+        assert_eq!(real_res["verification"]["verified"], true);
+
+        // 1. SampleId crossing split
+        let cross_sample = vec![
+            make_realign_row(
+                "s1",
+                "g1",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 1.0),
+                mk_vec(out_f, 0.4),
+            ),
+            make_realign_row(
+                "s2",
+                "g2",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 2.0),
+                mk_vec(out_f, 0.8),
+            ),
+            make_realign_row(
+                "s1",
+                "g3",
+                1,
+                RealignSplit::Development,
+                mk_vec(in_f, 1.5),
+                mk_vec(out_f, 0.6),
+            ),
+        ];
+        // 2. GroupId crossing split
+        let cross_group = vec![
+            make_realign_row(
+                "s1",
+                "g1",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 1.0),
+                mk_vec(out_f, 0.4),
+            ),
+            make_realign_row(
+                "s2",
+                "g2",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 2.0),
+                mk_vec(out_f, 0.8),
+            ),
+            make_realign_row(
+                "s3",
+                "g1",
+                0,
+                RealignSplit::Development,
+                mk_vec(in_f, 1.5),
+                mk_vec(out_f, 0.6),
+            ),
+        ];
+        // 3. Identical F32 input crossing split
+        let cross_input = vec![
+            make_realign_row(
+                "s1",
+                "g1",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 1.0),
+                mk_vec(out_f, 0.4),
+            ),
+            make_realign_row(
+                "s2",
+                "g2",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 2.0),
+                mk_vec(out_f, 0.8),
+            ),
+            make_realign_row(
+                "s3",
+                "g3",
+                0,
+                RealignSplit::Development,
+                mk_vec(in_f, 1.0),
+                mk_vec(out_f, 0.4),
+            ),
+        ];
+        // 4. Only 1 fit row (needs >= 2)
+        let one_fit = vec![
+            make_realign_row(
+                "s1",
+                "g1",
+                0,
+                RealignSplit::Fit,
+                mk_vec(in_f, 1.0),
+                mk_vec(out_f, 0.4),
+            ),
+            make_realign_row(
+                "s2",
+                "g2",
+                0,
+                RealignSplit::Development,
+                mk_vec(in_f, 2.0),
+                mk_vec(out_f, 0.8),
+            ),
+            make_realign_row(
+                "s3",
+                "g3",
+                0,
+                RealignSplit::Development,
+                mk_vec(in_f, 3.0),
+                mk_vec(out_f, 1.2),
+            ),
+        ];
+
+        for (idx, bad_rows) in [cross_sample, cross_group, cross_input, one_fit]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                run(json!({
+                    "schemaVersion": 1,
+                    "operation": "realign-factors",
+                    "adapterPath": src,
+                    "outputPath": scratch.join(format!("bad-rows-{idx}.gguf")),
+                    "realignConfig": {
+                        "mode": "realign-b",
+                        "diagnosticPromptSha256s": [diag],
+                        "sites": [{
+                            "target": "blk.63.ffn_down.weight",
+                            "rows": bad_rows
+                        }]
+                    }
+                }))
+                .is_err(),
+                "Expected bad_rows[{idx}] to be rejected"
+            );
+        }
+
+        // alternatingSteps forbidden unless alternating-ab
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "realign-factors",
+                "adapterPath": src,
+                "outputPath": scratch.join("bad-steps.gguf"),
+                "realignConfig": {
+                    "mode": "realign-b",
+                    "alternatingSteps": 2,
+                    "diagnosticPromptSha256s": [diag],
+                    "sites": [{ "target": "blk.63.ffn_down.weight", "rows": valid_rows }]
+                }
+            }))
+            .is_err()
+        );
+
+        // Both rows and rowsPath provided must fail
+        let dummy_rows_path = scratch.join("dummy-rows.json");
+        fs::write(&dummy_rows_path, b"[]").map_err(|e| e.to_string())?;
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "realign-factors",
+                "adapterPath": src,
+                "outputPath": scratch.join("both-rows.gguf"),
+                "realignConfig": {
+                    "mode": "realign-b",
+                    "diagnosticPromptSha256s": [diag],
+                    "sites": [{
+                        "target": "blk.63.ffn_down.weight",
+                        "rows": valid_rows,
+                        "rowsPath": dummy_rows_path
+                    }]
+                }
+            }))
+            .is_err()
+        );
+
+        // Neither rows nor rowsPath provided must fail
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "realign-factors",
+                "adapterPath": src,
+                "outputPath": scratch.join("neither-rows.gguf"),
+                "realignConfig": {
+                    "mode": "realign-b",
+                    "diagnosticPromptSha256s": [diag],
+                    "sites": [{ "target": "blk.63.ffn_down.weight" }]
+                }
+            }))
+            .is_err()
+        );
+
+        // Ridge out of bounds must fail
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "realign-factors",
+                "adapterPath": src,
+                "outputPath": scratch.join("bad-ridge.gguf"),
+                "realignConfig": {
+                    "mode": "realign-b",
+                    "ridge": 1e-12,
+                    "diagnosticPromptSha256s": [diag],
+                    "sites": [{ "target": "blk.63.ffn_down.weight", "rows": valid_rows }]
+                }
+            }))
+            .is_err()
+        );
+
+        // Unknown field rejected
+        let bad_field: Result<Value, _> = run(json!({
+            "schemaVersion": 1,
+            "operation": "realign-factors",
+            "adapterPath": src,
+            "outputPath": scratch.join("bad-field.gguf"),
+            "realignConfig": {
+                "mode": "realign-b",
+                "unknownOpt": true,
+                "diagnosticPromptSha256s": [diag],
+                "sites": [{ "target": "blk.63.ffn_down.weight", "rows": valid_rows }]
+            }
+        }));
+        assert!(bad_field.is_err());
 
         Ok(())
     }
