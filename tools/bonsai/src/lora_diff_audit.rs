@@ -1,5 +1,6 @@
 //! Read-only BF16 weight-diff, spectral-denoising audit, and GGUF LoRA export/verification.
 
+mod activation_edit;
 mod gguf_adapter;
 mod readiness;
 mod reallocate;
@@ -49,6 +50,7 @@ enum Operation {
     MergeAdapters,
     EditAdapter,
     ReallocateRanks,
+    FoldPatch,
     GenerateTestAdapter,
     GenerateLock,
     DrG2Plan,
@@ -206,6 +208,8 @@ struct Request {
     #[serde(default)]
     reallocate_config: Option<reallocate::ReallocateRanksConfig>,
     #[serde(default)]
+    fold_patch_config: Option<activation_edit::FoldPatchConfig>,
+    #[serde(default)]
     verify_policy: VerifyPolicy,
     #[serde(default)]
     lock_source: Option<bonsai_cpu_policy::DaisyRoseLoraSource>,
@@ -268,6 +272,7 @@ fn effective_envelope(request: &Request) -> crate::Result<TargetEnvelope> {
         | Operation::MergeAdapters
         | Operation::EditAdapter
         | Operation::ReallocateRanks
+        | Operation::FoldPatch
         | Operation::GenerateLock
         | Operation::DrG2Plan
         | Operation::DrG2Score => Ok(request.scope.target_envelope.unwrap_or(TargetEnvelope::All)),
@@ -316,6 +321,9 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     }
     if request.operation != Operation::ReallocateRanks && request.reallocate_config.is_some() {
         return Err("reallocateConfig is only supported for reallocate-ranks.".into());
+    }
+    if request.operation != Operation::FoldPatch && request.fold_patch_config.is_some() {
+        return Err("foldPatchConfig is only supported for fold-patch.".into());
     }
     if request.operation != Operation::GenerateLock
         && (request.lock_source.is_some()
@@ -422,6 +430,26 @@ fn validate_request(request: &Request) -> crate::Result<()> {
                 .as_ref()
                 .ok_or("reallocate-ranks requires reallocateConfig.")?;
             reallocate::validate_reallocate_config(config)?;
+            return Ok(());
+        }
+        Operation::FoldPatch => {
+            if request.source.is_some() {
+                return Err("fold-patch does not accept a model diff source.".into());
+            }
+            if let Some(adapter_path) = &request.adapter_path {
+                bonsai_artifacts::validate_external_path(adapter_path)
+                    .map_err(|e| e.to_string())?;
+            }
+            let output = request
+                .output_path
+                .as_ref()
+                .ok_or("fold-patch requires a fresh external outputPath.")?;
+            validate_output_path(output)?;
+            let config = request
+                .fold_patch_config
+                .as_ref()
+                .ok_or("fold-patch requires foldPatchConfig.")?;
+            activation_edit::validate_fold_patch_config(config)?;
             return Ok(());
         }
         Operation::GenerateTestAdapter => {
@@ -598,6 +626,7 @@ fn validate_request(request: &Request) -> crate::Result<()> {
         | Operation::MergeAdapters
         | Operation::EditAdapter
         | Operation::ReallocateRanks
+        | Operation::FoldPatch
         | Operation::GenerateTestAdapter
         | Operation::GenerateLock
         | Operation::DrG2Plan
@@ -2405,6 +2434,7 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::MergeAdapters => transform::run_merge_adapters(&parsed),
         Operation::EditAdapter => transform::run_edit_adapter(&parsed),
         Operation::ReallocateRanks => reallocate::run_reallocate_ranks(&parsed),
+        Operation::FoldPatch => activation_edit::run_fold_patch(&parsed),
         Operation::GenerateTestAdapter => readiness::run_generate_test_adapter(&parsed),
         Operation::GenerateLock => readiness::run_generate_lock(&parsed),
         Operation::DrG2Plan => readiness::run_dr_g2_plan(&parsed),
