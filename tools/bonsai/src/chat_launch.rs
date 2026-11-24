@@ -194,6 +194,8 @@ struct Request {
     no_mmproj: bool,
     #[serde(default)]
     use_repacked_ptq1: bool,
+    #[serde(default, rename = "NariqVariant")]
+    nariq_variant: Option<bonsai_cpu_policy::NariqVariant>,
     #[serde(default = "default_native_engine")]
     native_engine: bool,
     #[serde(default)]
@@ -487,6 +489,14 @@ impl Request {
                 return Err("DaisyRoseLora requires NativeEngine.".into());
             }
             external(path)?;
+        }
+        if self.nariq_variant.is_some() {
+            if self.use_repacked_ptq1 {
+                return Err("NariqVariant cannot be combined with UseRepackedPtq1.".into());
+            }
+            if !self.native_engine {
+                return Err("NariqVariant requires NativeEngine.".into());
+            }
         }
         self.native_row_workers = Some(workers);
         Ok(())
@@ -1060,7 +1070,7 @@ fn effective_daisyrose_lora_path(
 }
 
 fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
-    if request.no_abliterate_lora {
+    if request.no_abliterate_lora || request.nariq_variant.is_some() {
         arguments.push("--no-abliterate-lora".into());
     }
     if request.no_daisyrose_lora {
@@ -1074,14 +1084,16 @@ fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
     {
         argument(arguments, "--daisyrose-lora", daisyrose_lora);
     }
-    if request.no_mmproj {
+    if request.no_mmproj || request.nariq_variant.is_some() {
         arguments.push("--no-mmproj".into());
     }
-    arguments.push(if request.use_repacked_ptq1 {
-        "--use-repacked-ptq1".into()
+    if let Some(variant) = request.nariq_variant {
+        argument(arguments, "--nariq", variant.as_str());
+    } else if request.use_repacked_ptq1 {
+        arguments.push("--use-repacked-ptq1".into());
     } else {
-        "--use-original-pq2".into()
-    });
+        arguments.push("--use-original-pq2".into());
+    }
     arguments.push(if request.native_engine {
         "--native-engine".into()
     } else {

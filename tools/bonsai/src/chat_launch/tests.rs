@@ -1887,3 +1887,42 @@ fn effective_daisyrose_path_respects_promotion_opt_out_and_explicit_override() -
 
     fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
 }
+
+#[test]
+fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -> crate::Result<()> {
+    let fixture = fixture("nariq-chat-args")?;
+    let mut vulkan_payload = fixture.request.clone();
+    vulkan_payload["NativeEngine"] = serde_json::json!(true);
+    vulkan_payload["NariqVariant"] = serde_json::json!("2.5bpw");
+    vulkan_payload["Placement"] = serde_json::json!("vulkan");
+    assert!(serde_json::from_value::<Request>(vulkan_payload).is_err());
+
+    let mut req: Request = serde_json::from_value(fixture.request).map_err(|e| e.to_string())?;
+    req.native_engine = true;
+    req.nariq_variant = Some(bonsai_cpu_policy::NariqVariant::Bpw2_5);
+    req.use_repacked_ptq1 = true;
+    assert!(req.validate_native_runtime(None).is_err());
+
+    req.use_repacked_ptq1 = false;
+    req.native_engine = false;
+    assert!(req.validate_native_runtime(None).is_err());
+
+    req.native_engine = true;
+    let daisy = fixture.root.join("daisyrose.gguf");
+    req.daisyrose_lora = Some(daisy);
+    req.validate_native_runtime(None)?;
+
+    let mut args = Vec::new();
+    runtime_arguments(&req, &mut args);
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    assert!(rendered.windows(2).any(|w| w == ["--nariq", "2.5bpw"]));
+    assert!(rendered.contains(&"--no-abliterate-lora".to_owned()));
+    assert!(rendered.contains(&"--no-mmproj".to_owned()));
+    assert!(rendered.iter().any(|a| a == "--daisyrose-lora"));
+    assert!(!rendered.iter().any(|a| a == "--use-original-pq2" || a == "--use-repacked-ptq1"));
+
+    fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
+}

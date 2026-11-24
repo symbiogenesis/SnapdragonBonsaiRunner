@@ -41,6 +41,16 @@ fn text<'a>(value: &'a Value, key: &str) -> crate::Result<&'a str> {
 }
 
 fn model(request: &Request) -> crate::Result<Model> {
+    if let Some(variant) = request.nariq_variant {
+        let selected =
+            bonsai_cpu_policy::nariq_model_artifact(&request.data_directory, variant)?;
+        return Ok(Model {
+            path: selected.path,
+            bytes: selected.bytes,
+            sha256: selected.sha256,
+            url: Some(selected.url),
+        });
+    }
     let lock = cached_json(&SWIFT_LOCK, SWIFT)?;
     let derived = cached_json(&PTQ1_EXPORT, PTQ1)?;
     let pin = bonsai_cpu_policy::select_artifact(
@@ -199,7 +209,7 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
     if !request.native_engine {
         publisher(request, working, kind)?;
     }
-    let mmproj = (!request.no_mmproj)
+    let mmproj = (!request.no_mmproj && request.nariq_variant.is_none())
         .then(|| bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory))
         .transpose()?;
     let daisyrose =
@@ -259,7 +269,7 @@ fn prepare_weights(
     } else {
         "first-run"
     };
-    let mmproj = (!request.no_mmproj)
+    let mmproj = (!request.no_mmproj && request.nariq_variant.is_none())
         .then(|| bonsai_cpu_policy::swift_mmproj_artifact(&request.data_directory))
         .transpose()?;
     let daisyrose =
@@ -317,7 +327,7 @@ fn prepare_weights_with(
         verify(&selected.path, selected.bytes, &selected.sha256)
             .map_err(|error| format!("The explicitly selected PTQ1 export at {} could not be verified: {error}. Automatic setup cannot create this export. Supply the matching current-weight export, or close and relaunch with original PQ2 selected.", selected.path.display()))?;
     }
-    if !request.no_abliterate_lora {
+    if !request.no_abliterate_lora && request.nariq_variant.is_none() {
         let selected = bonsai_cpu_policy::abliterate_lora_artifact(&request.data_directory)?;
         let lock = cached_json(&ADAPTER_LOCK, ADAPTER)?;
         status(
@@ -766,6 +776,80 @@ mod tests {
         .err()
         .ok_or("Expected DaisyRose setup failure.")?;
         assert!(err.contains("DaisyRose adapter setup failed"));
+
+        fs::remove_dir_all(working).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn nariq_setup_downloads_model_skips_abliterate_and_mmproj_and_keeps_daisyrose()
+    -> crate::Result<()> {
+        let working = std::env::temp_dir().join(format!(
+            "Bonsai-SetupNariQ-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&working).map_err(|error| error.to_string())?;
+        let data = working.join("data");
+        fs::create_dir(&data).map_err(|error| error.to_string())?;
+        let request: Request = serde_json::from_value(json!({
+            "DataDirectory": data,
+            "RepositoryRoot": working.join("source"),
+            "NativeEngine": true,
+            "NariqVariant": "2.5bpw",
+        }))
+        .map_err(|error| error.to_string())?;
+        let selected = model(&request)?;
+        let pinned_nariq =
+            bonsai_cpu_policy::nariq_model_artifact(&data, bonsai_cpu_policy::NariqVariant::Bpw2_5)?;
+        assert_eq!(selected.path, pinned_nariq.path);
+        assert_eq!(selected.bytes, pinned_nariq.bytes);
+        assert_eq!(selected.sha256, pinned_nariq.sha256);
+        assert_eq!(selected.url.as_deref(), Some(pinned_nariq.url.as_str()));
+
+        let daisy_lock = json!({
+            "schemaVersion": 1,
+            "envelope": "npu-friendly",
+            "dtype": "f16",
+            "maxRank": 16,
+            "targetCount": 128,
+            "bytes": 67_108_864_u64,
+            "sha256": "a".repeat(64),
+            "baseModelSha256": "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
+            "source": {
+                "host": "huggingface",
+                "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
+                "path": "gguf/daisyrose.gguf",
+                "filename": "daisyrose.gguf",
+                "url": "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose.gguf",
+                "license": "Apache-2.0"
+            },
+            "defaultEnabled": true,
+            "defaultScaleTenths": 10
+        });
+        let promoted =
+            bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &daisy_lock.to_string())?;
+        let mut received = Vec::new();
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            false,
+            "first-run",
+            None,
+            Some(&promoted),
+            |url, path, bytes, hash, _| {
+                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].0, pinned_nariq.url);
+        assert_eq!(received[0].1, pinned_nariq.path);
+        assert_eq!(received[0].2, pinned_nariq.bytes);
+        assert_eq!(received[0].3, pinned_nariq.sha256);
+        assert_eq!(received[1].0, promoted.url);
+        assert_eq!(received[1].1, promoted.path);
 
         fs::remove_dir_all(working).map_err(|error| error.to_string())
     }

@@ -136,6 +136,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--native-engine" | "--publisher-engine" => ("NativeEngine", true, false),
             "--require-broker-pipe" => ("RequireBrokerPipe", true, false),
             "--use-repacked-ptq1" | "--use-original-pq2" => ("UseRepackedPtq1", true, false),
+            "--nariq" => ("NariqVariant", false, false),
             "--no-abliterate-lora" => ("NoAbliterateLora", true, false),
             "--daisyrose-lora" => ("DaisyRoseLora", false, false),
             "--no-daisyrose-lora" => ("NoDaisyRoseLora", true, false),
@@ -168,6 +169,12 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
         if request.insert(key.into(), value).is_some() {
             return Err(format!("Repeated or conflicting chat option: {option}"));
         }
+    }
+    if request.contains_key("NariqVariant") && request.contains_key("UseRepackedPtq1") {
+        return Err(
+            "`--nariq` cannot be combined with `--use-repacked-ptq1` or `--use-original-pq2`."
+                .into(),
+        );
     }
     Ok(request)
 }
@@ -231,6 +238,7 @@ pub fn installed_chat(arguments: &[OsString]) -> crate::Result<Value> {
                 | "NoDaisyRoseLora"
                 | "NoMmproj"
                 | "UseRepackedPtq1"
+                | "NariqVariant"
                 | "NativeEngine"
                 | "RequireBrokerPipe"
                 | "NativeRowWorkers"
@@ -523,6 +531,22 @@ mod tests {
             for second in ["--native-engine", "--publisher-engine"] {
                 assert!(chat_options(&[first.into(), second.into()]).is_err());
             }
+        }
+        for variant in ["2.5bpw", "3.0bpw", "2.0bpw"] {
+            assert_eq!(
+                chat_options(&["--nariq".into(), variant.into()])?["NariqVariant"],
+                variant
+            );
+        }
+        for conflict in [
+            vec!["--nariq", "2.5bpw", "--use-repacked-ptq1"],
+            vec!["--nariq", "2.5bpw", "--use-original-pq2"],
+            vec!["--use-repacked-ptq1", "--nariq", "2.5bpw"],
+            vec!["--nariq", "2.5bpw", "--nariq", "3.0bpw"],
+        ] {
+            assert!(
+                chat_options(&conflict.into_iter().map(Into::into).collect::<Vec<_>>()).is_err()
+            );
         }
         Ok(())
     }
