@@ -2,9 +2,36 @@
 
 use std::io;
 
-use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+use windows_sys::Win32::System::Power::{
+    ES_CONTINUOUS, ES_SYSTEM_REQUIRED, GetSystemPowerStatus, SYSTEM_POWER_STATUS,
+    SetThreadExecutionState,
+};
 
 use crate::PowerStatus;
+
+// Thread-local RAII guard (`!Send` and `!Sync` via `*mut ()`) because
+// `SetThreadExecutionState` tracks state strictly per calling OS thread.
+pub(crate) struct NativeSystemAwakeGuard(std::marker::PhantomData<*mut ()>);
+
+impl NativeSystemAwakeGuard {
+    pub(crate) fn acquire() -> io::Result<Self> {
+        // SAFETY: Synchronous Win32 thread-local bitmask call passing only
+        // execution-state flags; no caller pointers or handles are passed or retained.
+        let previous = unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
+        if previous == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(std::marker::PhantomData))
+    }
+}
+
+impl Drop for NativeSystemAwakeGuard {
+    fn drop(&mut self) {
+        // SAFETY: Synchronous Win32 thread-local bitmask call clearing the
+        // calling thread's continuous system-awake assertion on drop.
+        let _ = unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    }
+}
 
 pub(crate) fn query() -> io::Result<PowerStatus> {
     let mut status = SYSTEM_POWER_STATUS::default();
@@ -100,6 +127,31 @@ mod tests {
     fn power_status_queries_current_windows_host_without_changing_policy() -> io::Result<()> {
         let status = crate::power_status()?;
         assert!(status.battery_percent.is_none_or(|percent| percent <= 100));
+        Ok(())
+    }
+
+    #[test]
+    fn system_awake_guard_acquires_and_restores_thread_execution_state() -> io::Result<()> {
+        use windows_sys::Win32::System::Power::{
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+        };
+
+        let guard = crate::SystemAwakeGuard::acquire()?;
+        // SAFETY: Synchronous Win32 thread-local bitmask probe confirming `ES_SYSTEM_REQUIRED`
+        // is currently asserted on this thread while `guard` is live.
+        let while_held = unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
+        assert_ne!(while_held, 0);
+        assert_eq!(
+            while_held & (ES_CONTINUOUS | ES_SYSTEM_REQUIRED),
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        );
+        drop(guard);
+
+        // SAFETY: Synchronous Win32 thread-local bitmask call checking that dropping `guard`
+        // cleared `ES_SYSTEM_REQUIRED` back to `ES_CONTINUOUS`.
+        let after_drop = unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+        assert_ne!(after_drop, 0);
+        assert_eq!(after_drop & ES_SYSTEM_REQUIRED, 0);
         Ok(())
     }
 }

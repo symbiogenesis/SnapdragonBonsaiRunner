@@ -915,6 +915,26 @@ pub fn power_policy() -> io::Result<PowerPolicy> {
     native::power_policy::query()
 }
 
+/// Thread-local RAII guard inhibiting Windows idle system sleep on the acquiring thread.
+///
+/// Calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` on acquisition
+/// and restores `SetThreadExecutionState(ES_CONTINUOUS)` on drop, without forcing the
+/// display awake or preventing explicit user/lid sleep. Marked `!Send` and `!Sync`
+/// because Windows thread execution state is tracked per OS thread and is not
+/// reference-counted across overlapping guards on the same thread.
+#[must_use]
+pub struct SystemAwakeGuard(native::power::NativeSystemAwakeGuard);
+
+impl SystemAwakeGuard {
+    /// Inhibits idle system sleep for the calling thread until the returned guard drops.
+    ///
+    /// # Errors
+    /// Returns the last Win32 error when `SetThreadExecutionState` returns zero.
+    pub fn acquire() -> io::Result<Self> {
+        native::power::NativeSystemAwakeGuard::acquire().map(Self)
+    }
+}
+
 /// Explicit launch inputs; no shell or executable search path is used.
 #[derive(Debug)]
 pub struct ProcessSpec {
