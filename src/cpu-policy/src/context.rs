@@ -244,15 +244,34 @@ pub enum SwiftWeightPacking {
     Pq2_0,
     /// Derived repacked PTQ1.0 weights (`5_946_648_928` bytes; `1_259_520_000` bytes smaller).
     Ptq1_0,
+    /// Opt-in `NariQ` `2.5bpw` trellis weights (`8_443_119_712` bytes).
+    NariQ2_5Bpw,
+    /// Opt-in `NariQ` `3.0bpw` trellis weights (`10_123_626_592` bytes).
+    NariQ3_0Bpw,
+    /// Opt-in `NariQ` `2.0bpw` trellis weights (`6_753_954_304` bytes).
+    NariQ2_0Bpw,
 }
 
 impl SwiftWeightPacking {
+    /// Converts a selected opt-in [`crate::NariqVariant`] into its host packing policy.
+    #[must_use]
+    pub const fn from_nariq(variant: crate::NariqVariant) -> Self {
+        match variant {
+            crate::NariqVariant::Bpw2_5 => Self::NariQ2_5Bpw,
+            crate::NariqVariant::Bpw3_0 => Self::NariQ3_0Bpw,
+            crate::NariqVariant::Bpw2_0 => Self::NariQ2_0Bpw,
+        }
+    }
+
     /// Exact pinned GGUF weight byte length for this packing format.
     #[must_use]
     pub const fn weight_bytes(self) -> u64 {
         match self {
             Self::Pq2_0 => crate::SWIFT_WEIGHT_BYTES,
             Self::Ptq1_0 => crate::PTQ1_WEIGHT_BYTES,
+            Self::NariQ2_5Bpw => crate::NariqVariant::Bpw2_5.weight_bytes(),
+            Self::NariQ3_0Bpw => crate::NariqVariant::Bpw3_0.weight_bytes(),
+            Self::NariQ2_0Bpw => crate::NariqVariant::Bpw2_0.weight_bytes(),
         }
     }
 
@@ -263,6 +282,11 @@ impl SwiftWeightPacking {
             Self::Pq2_0 => FIXED_RUNTIME_BYTES,
             Self::Ptq1_0 => {
                 FIXED_RUNTIME_BYTES - (crate::SWIFT_WEIGHT_BYTES - crate::PTQ1_WEIGHT_BYTES)
+            }
+            Self::NariQ2_5Bpw | Self::NariQ3_0Bpw | Self::NariQ2_0Bpw => {
+                (FIXED_RUNTIME_BYTES - crate::SWIFT_WEIGHT_BYTES)
+                    + self.weight_bytes()
+                    + crate::NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES
             }
         }
     }
@@ -343,15 +367,10 @@ impl SwiftExecutionShape {
     }
 
     /// Calibrate [`Self::weights_and_fixed_runtime_bytes`] for `packing` relative
-    /// to [`FIXED_RUNTIME_BYTES`], subtracting `1_259_520_000` bytes (`PQ2 - PTQ1`)
-    /// when [`SwiftWeightPacking::Ptq1_0`] is selected.
+    /// to [`FIXED_RUNTIME_BYTES`].
     #[must_use]
     pub const fn with_weight_packing_calibrated(mut self, packing: SwiftWeightPacking) -> Self {
-        const PQ2_TO_PTQ1_DELTA_BYTES: u64 = crate::SWIFT_WEIGHT_BYTES - crate::PTQ1_WEIGHT_BYTES;
-        self.weights_and_fixed_runtime_bytes = match packing {
-            SwiftWeightPacking::Pq2_0 => FIXED_RUNTIME_BYTES,
-            SwiftWeightPacking::Ptq1_0 => FIXED_RUNTIME_BYTES - PQ2_TO_PTQ1_DELTA_BYTES,
-        };
+        self.weights_and_fixed_runtime_bytes = packing.calibrated_fixed_runtime_bytes();
         self
     }
 
@@ -1824,6 +1843,28 @@ mod tests {
         assert!(
             stacked_plan.context_plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 24 * gib
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nariq_weight_packing_calibration_accounts_for_artifact_sizes_and_headroom()
+    -> Result<(), Box<dyn Error>> {
+        for (variant, expected_packing) in [
+            (crate::NariqVariant::Bpw2_5, SwiftWeightPacking::NariQ2_5Bpw),
+            (crate::NariqVariant::Bpw3_0, SwiftWeightPacking::NariQ3_0Bpw),
+            (crate::NariqVariant::Bpw2_0, SwiftWeightPacking::NariQ2_0Bpw),
+        ] {
+            let packing = SwiftWeightPacking::from_nariq(variant);
+            assert_eq!(packing, expected_packing);
+            assert_eq!(packing.weight_bytes(), variant.weight_bytes());
+            let expected_fixed = (FIXED_RUNTIME_BYTES - crate::SWIFT_WEIGHT_BYTES)
+                + variant.weight_bytes()
+                + crate::NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES;
+            assert_eq!(packing.calibrated_fixed_runtime_bytes(), expected_fixed);
+            let shape = SwiftExecutionShape::for_profile(SwiftContextProfile::NativeRsq4Full)
+                .with_weight_packing_calibrated(packing);
+            assert_eq!(shape.weights_and_fixed_runtime_bytes, expected_fixed);
+        }
         Ok(())
     }
 }

@@ -27,6 +27,11 @@ pub use daisyrose::{
     DaisyRoseLoraArtifact, DaisyRoseLoraLock, DaisyRoseLoraSource,
     daisyrose_lora_artifact_from_lock, parse_daisyrose_lora_lock, pinned_daisyrose_lora_artifact,
 };
+mod nariq;
+pub use nariq::{
+    NARIQ_LOCK, NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES, NariqModelArtifact, NariqVariant,
+    nariq_model_artifact,
+};
 
 const REFERENCE_LOCK: &str = include_str!("../../../config/runtime.lock.json");
 pub(crate) const SWIFT_LOCK: &str = include_str!("../../../config/swift-assessment.lock.json");

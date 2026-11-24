@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "decision": "docs/model-selection.md",
+  "repository": "nari-labs/Qwen3.8-27B-NariQ-GGUF",
+  "revision": "17886395feb8a752b5ca5f02ad0c25543950915e",
+  "license": "Apache-2.0",
+  "architecture": "qwen35",
+  "variants": {
+    "2.5bpw": {
+      "filename": "Qwen3.8-27B-NariQ-2.5bpw.gguf",
+      "bytes": 8443119712,
+      "sha256": "2445372e6de20620b940fbfab53aa718af9ba741f202da30cd2f02b5df78d05c",
+      "url": "https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF/resolve/17886395feb8a752b5ca5f02ad0c25543950915e/Qwen3.8-27B-NariQ-2.5bpw.gguf",
+      "tensorCount": 2710,
+      "lmHeadBands": 16,
+      "embedBands": null
+    },
+    "3.0bpw": {
+      "filename": "Qwen3.8-27B-NariQ-3.0bpw.gguf",
+      "bytes": 10123626592,
+      "sha256": "1eaad934aa05579b8eba47ed9b26450392f9875fc2354efe8cfa8b29be8f4419",
+      "url": "https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF/resolve/17886395feb8a752b5ca5f02ad0c25543950915e/Qwen3.8-27B-NariQ-3.0bpw.gguf",
+      "tensorCount": 2710,
+      "lmHeadBands": 16,
+      "embedBands": null
+    },
+    "2.0bpw": {
+      "filename": "Qwen3.8-27B-NariQ-2.0bpw.gguf",
+      "bytes": 6753954304,
+      "sha256": "3a9e4955329dba8ba0be5509a9552220e5ccdae2f66bcc72c21c4580cd49bbb2",
+      "url": "https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF/resolve/17886395feb8a752b5ca5f02ad0c25543950915e/Qwen3.8-27B-NariQ-2.0bpw.gguf",
+      "tensorCount": 2771,
+      "lmHeadBands": 16,
+      "embedBands": 16
+    }
+  },
+  "mmproj": {
+    "filename": "Qwen3.8-27B-NariQ-mmproj-BF16.gguf",
+    "bytes": 931145760,
+    "sha256": "8832425f593068d3278e08eda4c1591072c7a2d8dc90f21e4f86394e4b2eb002",
+    "url": "https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF/resolve/17886395feb8a752b5ca5f02ad0c25543950915e/Qwen3.8-27B-NariQ-mmproj-BF16.gguf",
+    "runtimeWired": false
+  }
+}
