@@ -122,6 +122,22 @@ impl DaisyRoseLoraArtifact {
     pub fn effective_default_scale_f32(&self) -> f32 {
         f32::from(self.effective_default_scale_tenths()) / 10.0
     }
+
+    /// Resolve and validate a [`DaisyRoseLoraArtifact`] from an explicit lock JSON string
+    /// against the base model `SHA-256` of a pinned [`crate::NariqVariant`].
+    ///
+    /// This performs no filesystem I/O, downloads, or model loading.
+    ///
+    /// # Errors
+    /// Rejects invalid data directories, invalid lock JSON, missing `source` provenance,
+    /// or `baseModelSha256` drift against `variant.sha256()`.
+    pub fn for_nariq_lock(
+        data: &Path,
+        variant: crate::NariqVariant,
+        lock_json: &str,
+    ) -> Result<Self, String> {
+        daisyrose_lora_artifact_for_base_sha256(data, lock_json, variant.sha256())
+    }
 }
 
 fn atom(value: &str) -> bool {
@@ -286,23 +302,32 @@ pub fn parse_daisyrose_lora_lock(json: &str) -> Result<DaisyRoseLoraLock, String
     Ok(lock)
 }
 
-/// Resolve and validate a [`DaisyRoseLoraArtifact`] from an explicit lock JSON string.
+/// Resolve and validate a [`DaisyRoseLoraArtifact`] from an explicit lock JSON string against
+/// an explicit lowercase 64-hex base model `SHA-256` digest.
 ///
 /// This performs no filesystem I/O, downloads, or model loading.
 ///
 /// # Errors
-/// Rejects invalid data directories, invalid lock JSON, missing `source` provenance,
-/// or `baseModelSha256` drift against the compiled Swift PQ2 model lock.
-pub fn daisyrose_lora_artifact_from_lock(
+/// Rejects invalid data directories, non-64-hex `expected_base_sha256` digests, invalid lock JSON,
+/// missing `source` provenance, or `baseModelSha256` drift against `expected_base_sha256`.
+#[expect(
+    unreachable_pub,
+    reason = "src/cpu-policy/src/lib.rs is digest-pinned; callers outside the crate use DaisyRoseLoraArtifact::for_nariq_lock."
+)]
+pub fn daisyrose_lora_artifact_for_base_sha256(
     data: &Path,
     lock_json: &str,
+    expected_base_sha256: &str,
 ) -> Result<DaisyRoseLoraArtifact, String> {
     validate_data_dir(data)?;
-    let lock = parse_daisyrose_lora_lock(lock_json)?;
-    let swift_lock = parse(SWIFT_LOCK)?;
     require(
-        swift_lock["model"]["sha256"].as_str() == Some(lock.base_model_sha256.as_str()),
-        "DaisyRose lock baseModelSha256 differs from the pinned Swift model.",
+        hex(expected_base_sha256, 64),
+        "Expected DaisyRose baseModelSha256 must be a lowercase 64-hex SHA-256.",
+    )?;
+    let lock = parse_daisyrose_lora_lock(lock_json)?;
+    require(
+        lock.base_model_sha256 == expected_base_sha256,
+        "DaisyRose lock baseModelSha256 differs from the expected base model.",
     )?;
     let source = lock
         .source
@@ -330,6 +355,24 @@ pub fn daisyrose_lora_artifact_from_lock(
     })
 }
 
+/// Resolve and validate a [`DaisyRoseLoraArtifact`] from an explicit lock JSON string.
+///
+/// This performs no filesystem I/O, downloads, or model loading.
+///
+/// # Errors
+/// Rejects invalid data directories, invalid lock JSON, missing `source` provenance,
+/// or `baseModelSha256` drift against the compiled Swift PQ2 model lock.
+pub fn daisyrose_lora_artifact_from_lock(
+    data: &Path,
+    lock_json: &str,
+) -> Result<DaisyRoseLoraArtifact, String> {
+    let swift_lock = parse(SWIFT_LOCK)?;
+    let expected_base_sha256 = swift_lock["model"]["sha256"]
+        .as_str()
+        .ok_or("Pinned Swift model lock is missing model.sha256.")?;
+    daisyrose_lora_artifact_for_base_sha256(data, lock_json, expected_base_sha256)
+}
+
 /// Resolve the compiled pinned DaisyRose multi-rank `LoRA` artifact if one has been promoted.
 ///
 /// Remains `Ok(None)` until zero-retraining extraction / direct weight editing (`DR-E1`/`DR-W1`), `DR-G2`, and Prism `v0.1.33+` promotion
@@ -347,6 +390,7 @@ pub fn pinned_daisyrose_lora_artifact(
 #[cfg(test)]
 mod tests {
     use super::{
+        DaisyRoseLoraArtifact, daisyrose_lora_artifact_for_base_sha256,
         daisyrose_lora_artifact_from_lock, parse_daisyrose_lora_lock,
         pinned_daisyrose_lora_artifact,
     };
@@ -604,6 +648,70 @@ mod tests {
             assert_eq!(mutated.effective_default_scale_tenths(), 0);
             assert!((mutated.effective_default_scale_f64() - 0.0).abs() < 1e-12);
             assert!((mutated.effective_default_scale_f32() - 0.0).abs() < f32::EPSILON);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_nariq_variant_locks_and_rejects_cross_base_drift() -> Result<(), String> {
+        let data = if cfg!(windows) {
+            Path::new(r"C:\External\SwiftData")
+        } else {
+            Path::new("/tmp/swift-data")
+        };
+        let hf_url = "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose-npu-r16.gguf";
+        let pq2_lock = sample_full_lock("huggingface", hf_url);
+
+        for variant in [
+            crate::NariqVariant::Bpw2_5,
+            crate::NariqVariant::Bpw3_0,
+            crate::NariqVariant::Bpw2_0,
+        ] {
+            let mut nariq_lock = pq2_lock.clone();
+            nariq_lock["baseModelSha256"] = json!(variant.sha256());
+            let resolved =
+                DaisyRoseLoraArtifact::for_nariq_lock(data, variant, &nariq_lock.to_string())?;
+            assert_eq!(resolved.base_model_sha256, variant.sha256());
+            assert_eq!(resolved.max_rank, 16);
+            assert_eq!(
+                resolved.path,
+                data.join("adapters")
+                    .join("0123456789abcdef0123456789abcdef01234567")
+                    .join("daisyrose-npu-r16.gguf")
+            );
+
+            assert!(daisyrose_lora_artifact_from_lock(data, &nariq_lock.to_string()).is_err());
+        }
+
+        assert!(
+            DaisyRoseLoraArtifact::for_nariq_lock(
+                data,
+                crate::NariqVariant::Bpw2_5,
+                &pq2_lock.to_string(),
+            )
+            .is_err()
+        );
+
+        let mut bpw25_lock = pq2_lock;
+        bpw25_lock["baseModelSha256"] = json!(crate::NariqVariant::Bpw2_5.sha256());
+        assert!(
+            DaisyRoseLoraArtifact::for_nariq_lock(
+                data,
+                crate::NariqVariant::Bpw3_0,
+                &bpw25_lock.to_string(),
+            )
+            .is_err()
+        );
+
+        for invalid_expected in ["", "abc", &"A".repeat(64), &format!("{}g", "a".repeat(63))] {
+            assert!(
+                daisyrose_lora_artifact_for_base_sha256(
+                    data,
+                    &bpw25_lock.to_string(),
+                    invalid_expected,
+                )
+                .is_err()
+            );
         }
         Ok(())
     }

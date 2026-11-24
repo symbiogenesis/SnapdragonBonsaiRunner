@@ -994,18 +994,39 @@ pub struct MultiRankAdapterBudget {
 }
 
 impl MultiRankAdapterBudget {
-    /// Conservative budget estimate for an `NpuFriendly` `F16` adapter of `max_rank` (`1..=64`).
+    /// Conservative budget estimate for an `NpuFriendly` adapter of `max_rank` (`1..=64`).
+    ///
+    /// Charges `4_194_304` payload bytes per rank for `F16` adapters and `8_388_608`
+    /// payload bytes per rank for `F32` adapters, plus [`crate::DAISYROSE_SCRATCH_HEADROOM_BYTES`].
     #[must_use]
-    pub fn for_npu_friendly_f16(max_rank: u16) -> Option<Self> {
-        if !(1..=64).contains(&max_rank) {
+    pub const fn for_npu_friendly_rank(max_rank: u16, is_f32: bool) -> Option<Self> {
+        if max_rank == 0 || max_rank > 64 {
             return None;
         }
-        let payload_bytes =
-            u64::from(max_rank).checked_mul(crate::DAISYROSE_NPU_FRIENDLY_BYTES_PER_RANK_F16)?;
-        Some(Self {
-            payload_bytes,
-            scratch_headroom_bytes: crate::DAISYROSE_SCRATCH_HEADROOM_BYTES,
-        })
+        let bytes_per_rank = if is_f32 {
+            match crate::DAISYROSE_NPU_FRIENDLY_BYTES_PER_RANK_F16.checked_mul(2) {
+                Some(bytes) => bytes,
+                None => return None,
+            }
+        } else {
+            crate::DAISYROSE_NPU_FRIENDLY_BYTES_PER_RANK_F16
+        };
+        let mut payload_bytes = 0_u64;
+        let mut remaining = max_rank;
+        while remaining > 0 {
+            payload_bytes = match payload_bytes.checked_add(bytes_per_rank) {
+                Some(sum) => sum,
+                None => return None,
+            };
+            remaining -= 1;
+        }
+        Self::from_verified_bytes(payload_bytes)
+    }
+
+    /// Conservative budget estimate for an `NpuFriendly` `F16` adapter of `max_rank` (`1..=64`).
+    #[must_use]
+    pub const fn for_npu_friendly_f16(max_rank: u16) -> Option<Self> {
+        Self::for_npu_friendly_rank(max_rank, false)
     }
 
     /// Conservative budget bound from a verified GGUF file's exact byte size.
@@ -1843,6 +1864,45 @@ mod tests {
         assert!(
             stacked_plan.context_plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 24 * gib
         );
+        Ok(())
+    }
+
+    #[test]
+    fn npu_friendly_rank_budget_supports_f16_and_f32_bounds() -> Result<(), Box<dyn Error>> {
+        for rank in [1_u16, 16, 64] {
+            let f16_budget =
+                MultiRankAdapterBudget::for_npu_friendly_rank(rank, false).ok_or("f16 rank")?;
+            assert_eq!(f16_budget.payload_bytes, u64::from(rank) * 4_194_304);
+            assert_eq!(
+                f16_budget.scratch_headroom_bytes,
+                crate::DAISYROSE_SCRATCH_HEADROOM_BYTES
+            );
+            assert_eq!(
+                Some(f16_budget),
+                MultiRankAdapterBudget::for_npu_friendly_f16(rank)
+            );
+            assert_eq!(
+                f16_budget.total_bytes(),
+                Some(u64::from(rank) * 4_194_304 + crate::DAISYROSE_SCRATCH_HEADROOM_BYTES)
+            );
+
+            let f32_budget =
+                MultiRankAdapterBudget::for_npu_friendly_rank(rank, true).ok_or("f32 rank")?;
+            assert_eq!(f32_budget.payload_bytes, u64::from(rank) * 8_388_608);
+            assert_eq!(
+                f32_budget.scratch_headroom_bytes,
+                crate::DAISYROSE_SCRATCH_HEADROOM_BYTES
+            );
+            assert_eq!(
+                f32_budget.total_bytes(),
+                Some(u64::from(rank) * 8_388_608 + crate::DAISYROSE_SCRATCH_HEADROOM_BYTES)
+            );
+        }
+
+        for invalid_rank in [0_u16, 65, u16::MAX] {
+            assert!(MultiRankAdapterBudget::for_npu_friendly_rank(invalid_rank, false).is_none());
+            assert!(MultiRankAdapterBudget::for_npu_friendly_rank(invalid_rank, true).is_none());
+        }
         Ok(())
     }
 
