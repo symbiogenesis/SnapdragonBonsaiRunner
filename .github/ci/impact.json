@@ -28,12 +28,14 @@
       "config/runtime.lock.json",
       "config/swift-assessment.lock.json",
       "config/swift-lora.lock.json",
+      "config/nariq-qwen38.lock.json",
       "config/swift.ptq1-export.json",
       "config/profiles/reference-cpu.json"
     ],
     "bonsai-broker": [
       "config/runtime.lock.json",
       "config/swift-assessment.lock.json",
+      "config/nariq-qwen38.lock.json",
       "config/swift.metadata.json",
       "config/profiles/reference-cpu.json",
       "config/prism-inference.lock.json"
@@ -48,6 +50,7 @@
       "config/runtime.lock.json",
       "config/swift-assessment.lock.json",
       "config/swift-lora.lock.json",
+      "config/nariq-qwen38.lock.json",
       "config/swift.ptq1-export.json",
       "config/swift-lora.qualification.json",
       "config/swift-lora.app-qualification.json",
@@ -147,6 +150,7 @@
         "config/runtime.lock.json",
         "config/swift-assessment.lock.json",
         "config/swift-lora.lock.json",
+        "config/nariq-qwen38.lock.json",
         "config/swift.ptq1-export.json",
         "config/profiles/**",
         "scripts/release/**",

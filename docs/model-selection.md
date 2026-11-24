@@ -107,6 +107,29 @@ the [native UI boundary](ui-architecture.md). Colibri CUDA/Vulkan results establ
 neither Adreno/Hexagon behavior nor local disk latency; use the existing
 [qualification budgets and power observations](validation.md).
 
+## Opt-in Qwen3.8-27B NariQ trellis representations
+
+[nariq-qwen38.lock.json](../config/nariq-qwen38.lock.json) pins the Apache-2.0
+[`nari-labs/Qwen3.8-27B-NariQ-GGUF`](https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF)
+repository at revision `17886395feb8a752b5ca5f02ad0c25543950915e` as an opt-in
+native CPU representation (`--nariq 2.5bpw|3.0bpw|2.0bpw`), keeping
+`Swift-Bonsai-2-PQ2_0` + Orca (+ DaisyRose) unchanged as the default:
+
+| Variant | Filename | Bytes | SHA-256 | Tensors | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `2.5bpw` | `Qwen3.8-27B-NariQ-2.5bpw.gguf` | `8,443,119,712` | `2445372e6de20620b940fbfab53aa718af9ba741f202da30cd2f02b5df78d05c` | `2,710` | `lm_head_bands = 16`, unbanded `token_embd.weight`, `9 GiB` ceiling |
+| `3.0bpw` | `Qwen3.8-27B-NariQ-3.0bpw.gguf` | `10,123,626,592` | `1eaad934aa05579b8eba47ed9b26450392f9875fc2354efe8cfa8b29be8f4419` | `2,710` | `lm_head_bands = 16`, unbanded `token_embd.weight`, `11 GiB` ceiling |
+| `2.0bpw` | `Qwen3.8-27B-NariQ-2.0bpw.gguf` | `6,753,954,304` | `3a9e4955329dba8ba0be5509a9552220e5ccdae2f66bcc72c21c4580cd49bbb2` | `2,771` | `lm_head_bands = 16`, `embed_bands = 16` (`token_embd.vocab_gather`), `8 GiB` ceiling |
+
+The lock also records `Qwen3.8-27B-NariQ-mmproj-BF16.gguf` (`931,145,760` bytes,
+SHA-256 `8832425f593068d3278e08eda4c1591072c7a2d8dc90f21e4f86394e4b2eb002`) as a
+reserved text-excluded projector (runtime vision remains disabled for NariQ).
+Native CPU NariQ stacks with `MultiRankAdapter` (DaisyRose) and Prism's
+`K4/V4` (`rsq4`) KV cache, excludes Orca `abliterate_lora`, Vulkan/Hexagon
+offload, and uncalibrated fallback sizing, and remains broker-gated on
+`NARIQ_TRELLIS_RELEASE = None` until a compatible Prism release bundle and
+matched X1/X2 qualification complete.
+
 ## Stop and reopen conditions
 
 Reject file/hash/header mismatches and unsupported graphs or types. Limit the first

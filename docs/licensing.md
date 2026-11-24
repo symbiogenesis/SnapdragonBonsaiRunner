@@ -155,6 +155,7 @@ Weights and adapters retain their publishers' terms.
 | Swift Bonsai 2 GGUF | `a3bdac086bbb6b04d87d0108d18943b5f63868f7` | [Apache-2.0](https://huggingface.co/ukisai/Swift-Bonsai-2-GGUF/blob/a3bdac086bbb6b04d87d0108d18943b5f63868f7/LICENSE) |
 | Qwen3.8-27B GGUF reference | `4ca720788d1e01f1bff70c033e0d0028fd02e502` | [Apache-2.0 declaration](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/README.md) |
 | Approved OrcaBonsai LoRA | `703028bb7fba03496e796b144839b161cf0f5409` | [Apache-2.0 declaration](https://github.com/Continuum-AI-Corp/OrcaBonsai-27B-Uncensored/blob/703028bb7fba03496e796b144839b161cf0f5409/README.md#license) |
+| Qwen3.8-27B-NariQ-GGUF | `17886395feb8a752b5ca5f02ad0c25543950915e` | [Apache-2.0](https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF/tree/17886395feb8a752b5ca5f02ad0c25543950915e) (`2.0bpw`, `2.5bpw`, `3.0bpw`, and reserved `mmproj-BF16` in [the NariQ lock](../config/nariq-qwen38.lock.json)) |
 | Qwen3-ASR 1.7B Q8_0 recognition | Conversion `0e0a596e3959c3f3f2ab7d443a5b6f0f4a4bba6f`; source `7278e1e70fe206f11671096ffdd38061171dd6e5` | Apache-2.0, recorded in the [native lock](../src/speech-asr/model.lock.json); retain model attribution and identify conversion changes. |
 | Qwen3-TTS VoiceDesign/Base and codec | Conversion `b7ee2e8c7459c3bea99da23e3d178125a7d1713c` | Apache-2.0; [speech artifact documentation](../tools/qwen-tts/README.md#artifacts) identifies the Q8_0 and optional Q4_K_M selections. |
 

@@ -1024,6 +1024,21 @@ and `verify-adapter`) and `https_transfer::fetch_range` still require owning CI
   orthogonal to Swift's merged anti-overthinking subspace rather than naively
   subtracting `W_Qwen3.8 - dequant(W_Swift)`). Require license/revision audit,
   `verify-adapter` NPU bounds, `Selective-RL` `mmproj` checks and full `DR-G2` scoring.
+- [ ] **NQ-1 — Opt-in `Qwen3.8-27B-NariQ-GGUF` (`2.0bpw` / `2.5bpw` / `3.0bpw`) native trellis representation + DaisyRose stackability.**
+  Source wiring is complete across `..\prism-inference` (trellis `TRL1..=TRL6` /
+  `TrellisBandedHead` / `token_embd.vocab_gather` `embed_bands=16` fixes,
+  `Representation::{NariQ2_5Bpw, NariQ3_0Bpw, NariQ2_0Bpw}`, `swift_state`,
+  `swift_chat`, `swift_session` calibrated headroom, and `prism-inference-server --nariq`)
+  and `SwiftBonsai2Runner` (`config/nariq-qwen38.lock.json`,
+  `bonsai-cpu-policy::{nariq, context}`, `bonsai-broker` `--nariq` policy/artifacts/identity,
+  and `bonsai-tools` CLI/`provision`/`chat_launch`), keeping `Swift-Bonsai-2-PQ2_0`
+  + Orca as the unchanged default while stacking NariQ cleanly with
+  `MultiRankAdapter` (DaisyRose) and Prism `K4/V4` (`rsq4`), and rejecting
+  `abliterate_lora`, GPU/NPU offload, and `mmproj`. Remaining open: publishing
+  a compatible Prism release bundle and enabling `NARIQ_TRELLIS_RELEASE`, owning
+  CI (`source-checks`, `foundation`), verifying DaisyRose (`DR-G2`) compatibility
+  on NariQ vs Swift-Bonsai-2, and matched-power X1/X2 throughput/RAM and held-out
+  creative/coding quality comparisons across `2.0bpw`, `2.5bpw`, `3.0bpw`, and `PQ2_0`.
 
 ### Memory and profiles
 

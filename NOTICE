@@ -77,3 +77,10 @@ Copyright (c) 2026 Tim Toole
 Licensed under the MIT License, reproduced in
 https://github.com/symbiogenesis/prism-inference/blob/main/CAMELID-LICENSE.txt.
 The exact Prism/ggml layouts and arithmetic remain the conformance authority.
+
+Optional Qwen3.8-27B-NariQ GGUF artifacts (when separately provisioned via
+config/nariq-qwen38.lock.json) derive from Qwen3.8-27B by Alibaba Cloud and are
+distributed by Nari Labs under Apache License 2.0 at
+https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF
+(revision 17886395feb8a752b5ca5f02ad0c25543950915e). Retain upstream license
+and base-model attributions when redistributing weights.
