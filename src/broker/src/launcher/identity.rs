@@ -2162,8 +2162,8 @@ mod context_tests {
 
     #[test]
     fn nariq_identity_accepts_trellis_with_daisyrose_and_rejects_drift() -> Result<(), String> {
-        use serde_json::json;
         use super::NativeIdentityError;
+        use serde_json::json;
         let variant = bonsai_cpu_policy::NariqVariant::Bpw2_5;
         let pinned = crate::inference::pinned_version().map_err(|e| format!("{e:?}"))?;
         let daisy_sha = "cd".repeat(32);
@@ -2200,8 +2200,8 @@ mod context_tests {
                 "host_metadata_bytes": 0,
             },
         });
-        let wire = crate::test_util::http_models_response(&payload)
-            .map_err(|err| format!("{err:?}"))?;
+        let wire =
+            crate::test_util::http_models_response(&payload).map_err(|err| format!("{err:?}"))?;
         let policy = WorkerReadiness {
             kv_cache: Some(crate::inference::KvCache::Rsq4),
             context_tokens: 32_768,
@@ -2237,8 +2237,8 @@ mod context_tests {
         gpu_proj["startup_projection"]["identity"] = json!("vulkan-test");
         gpu_proj["startup_projection"]["resident_tensors"] = json!(1);
         gpu_proj["startup_projection"]["resident_weight_bytes"] = json!(1024);
-        let gpu_wire = crate::test_util::http_models_response(&gpu_proj)
-            .map_err(|err| format!("{err:?}"))?;
+        let gpu_wire =
+            crate::test_util::http_models_response(&gpu_proj).map_err(|err| format!("{err:?}"))?;
         assert_eq!(
             super::validate_native_identity_for_representation(&gpu_wire, repr, false, policy),
             Err(NativeIdentityError::StartupProjection)

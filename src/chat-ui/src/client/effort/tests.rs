@@ -363,8 +363,7 @@ fn effort_review_failure_leaves_complete_draft_visible() {
 }
 
 #[test]
-fn rsa_multi_draft_shares_identical_prompt_prefix_synthesizes_and_handles_collapse() -> Result<()>
-{
+fn rsa_multi_draft_shares_identical_prompt_prefix_synthesizes_and_handles_collapse() -> Result<()> {
     let pending = task();
     let (_commands, incoming) = mpsc::channel();
     let (events, outgoing) = crate::client::event_channel();
@@ -444,23 +443,17 @@ fn rsa_multi_draft_shares_identical_prompt_prefix_synthesizes_and_handles_collap
     let (_commands2, incoming2) = mpsc::channel();
     let (events2, _outgoing2) = crate::client::event_channel();
     let mut pass2 = 0;
-    let (retained, comp2) = run_with_detailed(
-        &pending,
-        &options,
-        &incoming2,
-        &events2,
-        |_, _| {
-            pass2 += 1;
-            match pass2 {
-                1 => Ok((
-                    message("assistant", "Draft A fallback."),
-                    Completion::Finished,
-                    None,
-                )),
-                _ => Err(Failure::CollapsedDraft),
-            }
-        },
-    )?;
+    let (retained, comp2) = run_with_detailed(&pending, &options, &incoming2, &events2, |_, _| {
+        pass2 += 1;
+        match pass2 {
+            1 => Ok((
+                message("assistant", "Draft A fallback."),
+                Completion::Finished,
+                None,
+            )),
+            _ => Err(Failure::CollapsedDraft),
+        }
+    })?;
     assert_eq!(pass2, 2);
     assert_eq!(retained.content.as_ref(), "Draft A fallback.");
     assert_eq!(comp2, Completion::Finished);
@@ -469,12 +462,8 @@ fn rsa_multi_draft_shares_identical_prompt_prefix_synthesizes_and_handles_collap
     let (_commands3, incoming3) = mpsc::channel();
     let (events3, _outgoing3) = crate::client::event_channel();
     let mut pass3 = 0;
-    let (retained_b, comp3) = run_with_detailed(
-        &pending,
-        &options,
-        &incoming3,
-        &events3,
-        |_, _| {
+    let (retained_b, comp3) =
+        run_with_detailed(&pending, &options, &incoming3, &events3, |_, _| {
             pass3 += 1;
             match pass3 {
                 1 => Ok((
@@ -503,8 +492,7 @@ fn rsa_multi_draft_shares_identical_prompt_prefix_synthesizes_and_handles_collap
                     None,
                 )),
             }
-        },
-    )?;
+        })?;
     assert_eq!(pass3, 3);
     assert_eq!(retained_b.content.as_ref(), "Stronger Draft B.");
     assert_eq!(comp3, Completion::TokenLimit);

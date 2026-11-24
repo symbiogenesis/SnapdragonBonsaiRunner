@@ -581,7 +581,9 @@ fn select_wy_f32_kv_cache(
         {
             Ok(())
         }
-        Some(KvCache::Rsq4 | KvCache::Rsq4Kvf | KvCache::Rsq4K3v) => Err(LaunchError::NativeRuntime),
+        Some(KvCache::Rsq4 | KvCache::Rsq4Kvf | KvCache::Rsq4K3v) => {
+            Err(LaunchError::NativeRuntime)
+        }
         None => Err(LaunchError::Arguments),
     }
 }
@@ -1334,7 +1336,10 @@ mod tests {
         assert_eq!(NARIQ_TRELLIS_RELEASE, None);
         assert!(!nariq_trellis_supported()?);
         let pin = release(LOCK)?;
-        assert!(reviewed_release_matches(&pin, Some(("0.1.34", &pin.commit))));
+        assert!(reviewed_release_matches(
+            &pin,
+            Some(("0.1.34", &pin.commit))
+        ));
         assert!(!reviewed_release_matches(&pin, NARIQ_TRELLIS_RELEASE));
         Ok(())
     }

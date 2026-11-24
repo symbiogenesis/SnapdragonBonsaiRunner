@@ -55,9 +55,11 @@ impl State {
             } else if resolved.instructions_rejected_budget {
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Persistent instructions exceed the selected memory token budget.")
-                        .small()
-                        .color(ui.visuals().warn_fg_color),
+                    RichText::new(
+                        "Persistent instructions exceed the selected memory token budget.",
+                    )
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
                 );
             }
             ui.add_space(8.0);
@@ -165,7 +167,11 @@ impl State {
                 }
             });
             if let Some(notice) = self.memory_draft.notice {
-                ui.label(RichText::new(notice).small().color(ui.visuals().warn_fg_color));
+                ui.label(
+                    RichText::new(notice)
+                        .small()
+                        .color(ui.visuals().warn_fg_color),
+                );
             }
         });
 

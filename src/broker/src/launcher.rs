@@ -454,9 +454,7 @@ impl LaunchConfig {
                 WeightRepresentation::Source
             },
         };
-        configuration.validate_selection(
-            use_repacked_ptq1.is_some() || nariq_variant.is_some(),
-        )?;
+        configuration.validate_selection(use_repacked_ptq1.is_some() || nariq_variant.is_some())?;
         if let Some(cache_dir) = &configuration.hexagon_arena_cache {
             validate_hexagon_arena_cache_dir(cache_dir)?;
         }
@@ -594,7 +592,8 @@ impl LaunchConfig {
                     || !self.native_engine
                     || matches!(
                         self.placement,
-                        crate::inference::Placement::Vulkan | crate::inference::Placement::Composite
+                        crate::inference::Placement::Vulkan
+                            | crate::inference::Placement::Composite
                     )))
             || (explicit_weight && !swift)
         {
@@ -1827,8 +1826,8 @@ impl LaunchConfig {
                     cpu_speculation,
                 )?;
             }
-            let cognitive_controls = !self.native_engine
-                || identity::native_supports_cognitive_controls(&models);
+            let cognitive_controls =
+                !self.native_engine || identity::native_supports_cognitive_controls(&models);
             startup_timing.phase(StartupPhase::FrontendBinding);
             let daisyrose_default_scale_tenths = active_daisyrose.map(|d| d.default_scale_tenths);
             let service = self
@@ -3922,10 +3921,7 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
-        for (flag, name) in [
-            ("rsq4k3v", KvCache::Rsq4K3v),
-            ("rsq4kvf", KvCache::Rsq4Kvf),
-        ] {
+        for (flag, name) in [("rsq4k3v", KvCache::Rsq4K3v), ("rsq4kvf", KvCache::Rsq4Kvf)] {
             let mut unsupported = native.clone();
             unsupported.extend(["--kv-cache", flag].map(OsString::from));
             assert_eq!(
@@ -3946,7 +3942,12 @@ mod tests {
         )
         .map_err(|_| LaunchError::Policy)?;
         let mut config = LaunchConfig::parse(native)?;
-        for policy in [KvCache::Rsq4, KvCache::Rsq4Kvf, KvCache::F16, KvCache::Rsq4K3v] {
+        for policy in [
+            KvCache::Rsq4,
+            KvCache::Rsq4Kvf,
+            KvCache::F16,
+            KvCache::Rsq4K3v,
+        ] {
             config.kv_cache = Some(policy);
             let child = config.native_arguments(&plan, Some(&key));
             assert_eq!(
@@ -4541,7 +4542,12 @@ mod tests {
             bonsai_cpu_policy::swift_mmproj_artifact(&data).map_err(|_| LaunchError::Policy)?;
         let gib = 1024 * 1024 * 1024_u64;
 
-        for policy in [KvCache::Rsq4, KvCache::Rsq4Kvf, KvCache::F16, KvCache::Rsq4K3v] {
+        for policy in [
+            KvCache::Rsq4,
+            KvCache::Rsq4Kvf,
+            KvCache::F16,
+            KvCache::Rsq4K3v,
+        ] {
             config.kv_cache = Some(policy);
             let profile = config.swift_context_profile()?;
             for available in [17 * gib, 18 * gib, 20 * gib, 22 * gib, 24 * gib, 48 * gib] {
@@ -5472,10 +5478,7 @@ mod tests {
         let plan = cfg
             .build_launch_plan(cfg.backend_port, creds.backend_path())
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
-        assert!(
-            plan.model_path
-                .ends_with("Qwen3.8-27B-NariQ-2.5bpw.gguf")
-        );
+        assert!(plan.model_path.ends_with("Qwen3.8-27B-NariQ-2.5bpw.gguf"));
         let args = cfg.native_arguments(&plan, None);
         assert!(has_flag_pair(
             &args,
@@ -5493,8 +5496,9 @@ mod tests {
         .calibrated_fixed_runtime_bytes();
         let fixed_runtime_usize = usize::try_from(fixed_runtime)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let nariq_weight_bytes = usize::try_from(bonsai_cpu_policy::NariqVariant::Bpw2_5.weight_bytes())
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let nariq_weight_bytes =
+            usize::try_from(bonsai_cpu_policy::NariqVariant::Bpw2_5.weight_bytes())
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
         assert!(calibrated.working_set_limit_bytes > fixed_runtime_usize);
         assert_eq!(
             calibrated.working_set_limit_bytes - calibrated.context_plan.memory_limit_bytes,

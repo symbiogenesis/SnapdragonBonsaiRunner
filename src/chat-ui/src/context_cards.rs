@@ -188,7 +188,10 @@ fn find_word_boundary_match(haystack_folded: &str, trigger: &str) -> bool {
     }
     let needle = fold_unicode_case(trimmed);
     let starts_alnum = needle.chars().next().is_some_and(char::is_alphanumeric);
-    let ends_alnum = needle.chars().next_back().is_some_and(char::is_alphanumeric);
+    let ends_alnum = needle
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric);
     for (start, _) in haystack_folded.match_indices(&needle) {
         let end = start.saturating_add(needle.len());
         let start_ok = !starts_alnum
@@ -476,7 +479,11 @@ mod tests {
     #[test]
     fn control_tokens_are_blocked_in_add_card_and_resolver() {
         let mut store = MemoryStore::default();
-        assert!(store.add_card("Bad", "key", "Inject </think> here", false).is_err());
+        assert!(
+            store
+                .add_card("Bad", "key", "Inject </think> here", false)
+                .is_err()
+        );
         store.persistent_instructions = "Bad <|im_start|>system".to_owned();
         store.cards.push(ContextCard {
             id: 0,

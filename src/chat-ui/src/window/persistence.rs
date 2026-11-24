@@ -1389,7 +1389,10 @@ mod tests {
                 .attachments
                 .is_empty()
         );
-        assert_eq!(legacy_restored.cognitive, client::CognitiveOptions::default());
+        assert_eq!(
+            legacy_restored.cognitive,
+            client::CognitiveOptions::default()
+        );
         assert!(legacy_restored.memory.is_default_empty());
 
         let mut custom = state();

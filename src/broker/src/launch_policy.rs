@@ -429,9 +429,8 @@ impl LaunchPlan {
         .into_iter()
         .map(OsString::from)
         .collect();
-        let fixed_runtime =
-            bonsai_cpu_policy::context::SwiftWeightPacking::from_nariq(variant)
-                .calibrated_fixed_runtime_bytes();
+        let fixed_runtime = bonsai_cpu_policy::context::SwiftWeightPacking::from_nariq(variant)
+            .calibrated_fixed_runtime_bytes();
         let memory_limit_bytes = usize::try_from(fixed_runtime)
             .unwrap_or(LaunchProfile::SwiftPq2Assessment.memory_limit_bytes());
         Ok(Self {

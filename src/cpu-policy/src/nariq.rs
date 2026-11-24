@@ -189,8 +189,13 @@ struct NariqLockFile {
 ///
 /// # Errors
 /// Rejects relative, NUL-containing, or unexpanded data directories, or lockfile drift.
-pub fn nariq_model_artifact(data: &Path, variant: NariqVariant) -> Result<NariqModelArtifact, String> {
-    let data_text = data.to_str().ok_or("DataDirectory must be valid Unicode.")?;
+pub fn nariq_model_artifact(
+    data: &Path,
+    variant: NariqVariant,
+) -> Result<NariqModelArtifact, String> {
+    let data_text = data
+        .to_str()
+        .ok_or("DataDirectory must be valid Unicode.")?;
     require(
         data.is_absolute() && !data_text.contains('\0') && !unexpanded_variable(data_text),
         "An expanded absolute data directory is required.",
@@ -205,9 +210,14 @@ fn nariq_model_artifact_from_lock(
 ) -> Result<NariqModelArtifact, String> {
     let parsed: NariqLockFile =
         serde_json::from_str(lock_json).map_err(|_| "Invalid NariQ lock JSON.".to_owned())?;
-    require(parsed.schema_version == 1, "NariQ lock schemaVersion must be 1.")?;
     require(
-        !parsed.decision.is_empty() && parsed.architecture == "qwen35" && parsed.license == "Apache-2.0",
+        parsed.schema_version == 1,
+        "NariQ lock schemaVersion must be 1.",
+    )?;
+    require(
+        !parsed.decision.is_empty()
+            && parsed.architecture == "qwen35"
+            && parsed.license == "Apache-2.0",
         "Unexpected NariQ lock metadata.",
     )?;
     require(
@@ -245,7 +255,10 @@ fn nariq_model_artifact_from_lock(
     )?;
 
     Ok(NariqModelArtifact {
-        path: data.join("models").join(&parsed.revision).join(&entry.filename),
+        path: data
+            .join("models")
+            .join(&parsed.revision)
+            .join(&entry.filename),
         variant,
         repository: parsed.repository,
         revision: parsed.revision,

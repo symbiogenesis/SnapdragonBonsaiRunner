@@ -24,9 +24,15 @@ pub(super) fn run(
     commands: &Receiver<Command>,
     events: &EventSender,
 ) -> Result<(Message, Completion)> {
-    run_with_detailed(pending, options, commands, events, |request, stop_on_collapse| {
-        generate_with_options(port, key, request, stop_on_collapse, commands, events)
-    })
+    run_with_detailed(
+        pending,
+        options,
+        commands,
+        events,
+        |request, stop_on_collapse| {
+            generate_with_options(port, key, request, stop_on_collapse, commands, events)
+        },
+    )
 }
 
 #[derive(Clone, Copy, Serialize)]

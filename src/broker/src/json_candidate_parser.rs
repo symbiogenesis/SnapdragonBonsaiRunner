@@ -184,7 +184,8 @@ mod tests {
                 }
             }
         }
-        let enabled_head = |len| AuthorizedHead::test_head(len, false).with_cognitive_controls(true);
+        let enabled_head =
+            |len| AuthorizedHead::test_head(len, false).with_cognitive_controls(true);
         for body in [
             br#"{"messages":[{"role":"user","content":"rain"}],"reasoning_effort":"low","reasoning_budget":128,"top_k":40,"dry_allowed_length":2,"dry_penalty_last_n":512,"logprobs":true,"top_logprobs":5}"#.as_slice(),
             br#"{"messages":[{"role":"user","content":"rain"}],"temperature":0.85,"top_p":0.95,"min_p":0.05,"dry_multiplier":0.8,"dry_base":1.75}"#,

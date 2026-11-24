@@ -438,7 +438,11 @@ impl ThinkingBudgetMode {
         }
     }
 
-    pub(crate) fn compute_budget(self, max_completion_tokens: u32, enable_thinking: bool) -> Option<u32> {
+    pub(crate) fn compute_budget(
+        self,
+        max_completion_tokens: u32,
+        enable_thinking: bool,
+    ) -> Option<u32> {
         if !enable_thinking {
             return None;
         }
@@ -653,8 +657,7 @@ impl Serialize for SystemMessageRef<'_> {
         let mut state = serializer.serialize_struct("Message", 2)?;
         state.serialize_field("role", "system")?;
         if let Some(appendix) = self.0.filter(|text| !text.is_empty()) {
-            let mut combined =
-                String::with_capacity(SYSTEM_PROMPT.len() + 2 + appendix.len());
+            let mut combined = String::with_capacity(SYSTEM_PROMPT.len() + 2 + appendix.len());
             combined.push_str(SYSTEM_PROMPT);
             combined.push_str("\n\n");
             combined.push_str(appendix);
@@ -1195,29 +1198,30 @@ fn serve_broker(
                     request_logprobs: false,
                     temperature_nudge: 0.0,
                 };
-                let outcome = serialize_request_with_options(&pending, &options).and_then(|request| {
-                    if extra_effort {
-                        // Validate the original request locally; effort
-                        // constructs its own stage bodies.
-                        drop(request);
-                        effort::run(
-                            config.frontend_port,
-                            key.as_hex(),
-                            &pending,
-                            &options,
-                            commands,
-                            events,
-                        )
-                    } else {
-                        generate(
-                            config.frontend_port,
-                            key.as_hex(),
-                            request,
-                            commands,
-                            events,
-                        )
-                    }
-                });
+                let outcome =
+                    serialize_request_with_options(&pending, &options).and_then(|request| {
+                        if extra_effort {
+                            // Validate the original request locally; effort
+                            // constructs its own stage bodies.
+                            drop(request);
+                            effort::run(
+                                config.frontend_port,
+                                key.as_hex(),
+                                &pending,
+                                &options,
+                                commands,
+                                events,
+                            )
+                        } else {
+                            generate(
+                                config.frontend_port,
+                                key.as_hex(),
+                                request,
+                                commands,
+                                events,
+                            )
+                        }
+                    });
                 finish_turn(
                     history,
                     pending,
@@ -3941,9 +3945,7 @@ mod tests {
             cognitive_controls_declaration(b"Context tokens: 8192\n"),
             Ok(None)
         );
-        assert!(
-            cognitive_controls_declaration(b"Cognitive controls: maybe\n").is_err()
-        );
+        assert!(cognitive_controls_declaration(b"Cognitive controls: maybe\n").is_err());
         let history = [Message {
             role: "user",
             content: "rain".into(),

@@ -42,8 +42,7 @@ fn text<'a>(value: &'a Value, key: &str) -> crate::Result<&'a str> {
 
 fn model(request: &Request) -> crate::Result<Model> {
     if let Some(variant) = request.nariq_variant {
-        let selected =
-            bonsai_cpu_policy::nariq_model_artifact(&request.data_directory, variant)?;
+        let selected = bonsai_cpu_policy::nariq_model_artifact(&request.data_directory, variant)?;
         return Ok(Model {
             path: selected.path,
             bytes: selected.bytes,
@@ -798,8 +797,10 @@ mod tests {
         }))
         .map_err(|error| error.to_string())?;
         let selected = model(&request)?;
-        let pinned_nariq =
-            bonsai_cpu_policy::nariq_model_artifact(&data, bonsai_cpu_policy::NariqVariant::Bpw2_5)?;
+        let pinned_nariq = bonsai_cpu_policy::nariq_model_artifact(
+            &data,
+            bonsai_cpu_policy::NariqVariant::Bpw2_5,
+        )?;
         assert_eq!(selected.path, pinned_nariq.path);
         assert_eq!(selected.bytes, pinned_nariq.bytes);
         assert_eq!(selected.sha256, pinned_nariq.sha256);

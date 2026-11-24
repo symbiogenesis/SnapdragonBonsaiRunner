@@ -307,7 +307,11 @@ fn cognitive_preferences(
                         ReasoningEffort::Medium,
                         ReasoningEffort::XHigh,
                     ] {
-                        ui.selectable_value(&mut cognitive.reasoning_effort, option, option.label());
+                        ui.selectable_value(
+                            &mut cognitive.reasoning_effort,
+                            option,
+                            option.label(),
+                        );
                     }
                 })
                 .response

@@ -1889,7 +1889,8 @@ fn effective_daisyrose_path_respects_promotion_opt_out_and_explicit_override() -
 }
 
 #[test]
-fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -> crate::Result<()> {
+fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -> crate::Result<()>
+{
     let fixture = fixture("nariq-chat-args")?;
     let mut vulkan_payload = fixture.request.clone();
     vulkan_payload["NativeEngine"] = serde_json::json!(true);
@@ -1922,7 +1923,11 @@ fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -
     assert!(rendered.contains(&"--no-abliterate-lora".to_owned()));
     assert!(rendered.contains(&"--no-mmproj".to_owned()));
     assert!(rendered.iter().any(|a| a == "--daisyrose-lora"));
-    assert!(!rendered.iter().any(|a| a == "--use-original-pq2" || a == "--use-repacked-ptq1"));
+    assert!(
+        !rendered
+            .iter()
+            .any(|a| a == "--use-original-pq2" || a == "--use-repacked-ptq1")
+    );
 
     fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
 }

@@ -23,7 +23,10 @@ impl State {
         } else {
             self.context_draft.has_attachments && self.context_draft.attachment_input == self.input
         };
-        let memory = self.memory.resolve(&self.committed, &self.input).estimated_tokens;
+        let memory = self
+            .memory
+            .resolve(&self.committed, &self.input)
+            .estimated_tokens;
         if let Some(estimate) = self.context_draft.estimate
             && estimate.history == history
             && estimate.memory == memory
@@ -173,10 +176,7 @@ impl State {
                     ("Safety reserve", context::RESERVE_TOKENS, false),
                 ] {
                     if amount == 0
-                        && matches!(
-                            label,
-                            "Extra effort planning" | "Pinned & active memory"
-                        )
+                        && matches!(label, "Extra effort planning" | "Pinned & active memory")
                     {
                         continue;
                     }
