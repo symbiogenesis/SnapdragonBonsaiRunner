@@ -31,6 +31,7 @@ const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
 const DEFAULT_ZERO_CONTROL_MAX_TOKENS: u32 = 64;
 const DEFAULT_ROW_WORKERS: u8 = 8;
 const DEFAULT_KV_CACHE: &str = "rsq4";
+const DEFAULT_REASONING_EFFORT: &str = "xhigh";
 const THINKING_ON_CATEGORIES: [&str; 3] = ["coding", "reasoning", "instruction-following"];
 const THINKING_OFF_CATEGORY: &str = "creative-prose";
 #[cfg(windows)]
@@ -88,7 +89,13 @@ pub(super) struct DrG2CaptureConfig {
     #[serde(default)]
     pub(super) cpu_prefill_tokens: Option<u8>,
     #[serde(default)]
+    pub(super) cpu_prefill_gdn: Option<String>,
+    #[serde(default)]
     pub(super) placement: Option<String>,
+    #[serde(default)]
+    pub(super) reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub(super) reasoning_budget: Option<u32>,
     #[serde(default)]
     pub(super) time_budget_seconds: Option<u64>,
     #[serde(default)]
@@ -280,6 +287,16 @@ pub(super) fn validate_capture_request(
     {
         return Err("captureConfig.cpuPrefillTokens must be 8, 16, or 32.".into());
     }
+    if let Some(gdn) = &config.cpu_prefill_gdn {
+        if !matches!(gdn.as_str(), "sequential" | "wy-f32") {
+            return Err("captureConfig.cpuPrefillGdn must be sequential or wy-f32.".into());
+        }
+        if config.cpu_prefill_tokens.is_none() {
+            return Err(
+                "captureConfig.cpuPrefillGdn requires captureConfig.cpuPrefillTokens.".into(),
+            );
+        }
+    }
     if let Some(placement) = &config.placement {
         if !matches!(placement.as_str(), "auto" | "cpu" | "vulkan" | "composite") {
             return Err("captureConfig.placement must be auto, cpu, vulkan, or composite.".into());
@@ -287,6 +304,26 @@ pub(super) fn validate_capture_request(
         if profile.is_nariq() && matches!(placement.as_str(), "vulkan" | "composite") {
             return Err("NariQ base models do not support vulkan or composite placement.".into());
         }
+        if placement == "vulkan"
+            && (config.cpu_prefill_tokens.is_some() || config.cpu_prefill_gdn.is_some())
+        {
+            return Err(
+                "captureConfig.placement='vulkan' does not support cpuPrefillTokens or cpuPrefillGdn."
+                    .into(),
+            );
+        }
+    }
+    if let Some(effort) = &config.reasoning_effort
+        && !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh")
+    {
+        return Err("captureConfig.reasoningEffort must be low, medium, high, or xhigh.".into());
+    }
+    if let Some(budget) = config.reasoning_budget
+        && !(1..=DEFAULT_MAX_COMPLETION_TOKENS).contains(&budget)
+    {
+        return Err(format!(
+            "captureConfig.reasoningBudget must be in 1..={DEFAULT_MAX_COMPLETION_TOKENS}."
+        ));
     }
     if let Some(resp_out) = &config.responses_output_path {
         validate_output_path(resp_out)?;
@@ -526,6 +563,10 @@ fn build_server_arguments(
             args.push(OsString::from(tokens.to_string()));
             args.push(OsString::from("--cpu-prefill-scratch-bytes"));
             args.push(OsString::from(scratch.to_string()));
+            if let Some(gdn) = &config.cpu_prefill_gdn {
+                args.push(OsString::from("--cpu-prefill-gdn"));
+                args.push(OsString::from(gdn));
+            }
         }
     }
 
@@ -977,6 +1018,12 @@ fn wait_endpoint_ready(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ChatRequestControls<'a> {
+    reasoning_effort: &'a str,
+    reasoning_budget: Option<u32>,
+}
+
 fn build_chat_completion_payload(
     prompt_text: &str,
     max_completion_tokens: u32,
@@ -984,6 +1031,7 @@ fn build_chat_completion_payload(
     profile: BaseModelProfile,
     has_candidate_adapter: bool,
     daisyrose_scale: f64,
+    controls: ChatRequestControls<'_>,
 ) -> crate::Result<Vec<u8>> {
     let lora = match (profile.is_nariq(), has_candidate_adapter) {
         (false, false) => Some(json!([{ "id": 0, "scale": 1.3 }])),
@@ -1011,14 +1059,17 @@ fn build_chat_completion_payload(
         "repeat_penalty": 1.0,
         "chat_template_kwargs": {
             "enable_thinking": enable_thinking,
-            "reasoning_effort": "xhigh",
+            "reasoning_effort": controls.reasoning_effort,
             "preserve_thinking": true,
         }
     });
-    if let Some(lora_arr) = lora
-        && let Some(obj) = payload.as_object_mut()
-    {
-        obj.insert("lora".to_owned(), lora_arr);
+    if let Some(obj) = payload.as_object_mut() {
+        if enable_thinking && let Some(budget) = controls.reasoning_budget {
+            obj.insert("reasoning_budget".to_owned(), json!(budget));
+        }
+        if let Some(lora_arr) = lora {
+            obj.insert("lora".to_owned(), lora_arr);
+        }
     }
     serde_json::to_vec(&payload).map_err(|e| format!("Cannot serialize chat payload: {e}"))
 }
@@ -1167,6 +1218,10 @@ pub(super) fn detect_repetition_loop(text: &str) -> bool {
     false
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Passes explicit prompt, model/adapter scales, cognitive controls, and shared deadline."
+)]
 fn run_chat_completion(
     endpoint: &CaptureEndpoint<'_>,
     prompt_text: &str,
@@ -1175,6 +1230,7 @@ fn run_chat_completion(
     profile: BaseModelProfile,
     has_candidate_adapter: bool,
     daisyrose_scale: f64,
+    controls: ChatRequestControls<'_>,
     deadline: Instant,
     check: impl Fn() -> crate::Result<()>,
 ) -> Result<ChatCompletionOutcome, HttpExchangeError> {
@@ -1185,6 +1241,7 @@ fn run_chat_completion(
         profile,
         has_candidate_adapter,
         daisyrose_scale,
+        controls,
     )
     .map_err(HttpExchangeError::Fatal)?;
 
@@ -1337,6 +1394,14 @@ fn capture_against_endpoints_inner(
         Some(compiled_orca_adapter_sha256()?)
     };
     let orca_scale = if profile.is_nariq() { 0.0 } else { 1.3 };
+    let reasoning_effort = config
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or(DEFAULT_REASONING_EFFORT);
+    let chat_controls = ChatRequestControls {
+        reasoning_effort,
+        reasoning_budget: config.reasoning_budget,
+    };
     let scale_grid = resolve_scale_grid(config.scale_grid.as_ref())?;
     let contract = build_dr_g2_contract(
         profile.is_nariq().then_some(profile),
@@ -1394,6 +1459,7 @@ fn capture_against_endpoints_inner(
             profile,
             false,
             0.0,
+            chat_controls,
             inference_deadline,
             &check_servers,
         ) {
@@ -1425,6 +1491,12 @@ fn capture_against_endpoints_inner(
             "powerConditions": bonsai_cpu_policy::power::compare_endpoints(&arm_a_power_before, &arm_a_power_after),
             "completed": true,
         }));
+        prompt_timings.push(prompt_timing_entry(
+            &ctrl.prompt_id,
+            "zero-scale-control",
+            "zero-no-adapter",
+            &no_adapter,
+        ));
 
         if Instant::now() >= inference_deadline {
             budget_exceeded = true;
@@ -1443,6 +1515,7 @@ fn capture_against_endpoints_inner(
             profile,
             true,
             0.0,
+            chat_controls,
             inference_deadline,
             &check_servers,
         ) {
@@ -1474,19 +1547,13 @@ fn capture_against_endpoints_inner(
             "powerConditions": bonsai_cpu_policy::power::compare_endpoints(&arm_b_power_before, &arm_b_power_after),
             "completed": true,
         }));
-
-        prompt_timings.push(prompt_timing_entry(
-            &ctrl.prompt_id,
-            "zero-scale-control",
-            "zero-no-adapter",
-            &no_adapter,
-        ));
         prompt_timings.push(prompt_timing_entry(
             &ctrl.prompt_id,
             "zero-scale-control",
             "zero-scale",
             &zero_scale,
         ));
+
         zero_scale_controls.push(ZeroScaleControl {
             prompt_id: ctrl.prompt_id.clone(),
             prompt_sha256: crate::identity::sha256(ctrl.prompt_text.as_bytes()),
@@ -1518,6 +1585,7 @@ fn capture_against_endpoints_inner(
             profile,
             false,
             0.0,
+            chat_controls,
             inference_deadline,
             &check_servers,
         ) {
@@ -1549,6 +1617,12 @@ fn capture_against_endpoints_inner(
             "powerConditions": bonsai_cpu_policy::power::compare_endpoints(&base_power_before, &base_power_after),
             "completed": true,
         }));
+        prompt_timings.push(prompt_timing_entry(
+            &prompt.prompt_id,
+            &prompt.category,
+            "baseline",
+            &baseline,
+        ));
 
         if Instant::now() >= inference_deadline {
             budget_exceeded = true;
@@ -1567,6 +1641,7 @@ fn capture_against_endpoints_inner(
             profile,
             true,
             config.selected_scale,
+            chat_controls,
             inference_deadline,
             &check_servers,
         ) {
@@ -1598,19 +1673,13 @@ fn capture_against_endpoints_inner(
             "powerConditions": bonsai_cpu_policy::power::compare_endpoints(&cand_power_before, &cand_power_after),
             "completed": true,
         }));
-
-        prompt_timings.push(prompt_timing_entry(
-            &prompt.prompt_id,
-            &prompt.category,
-            "baseline",
-            &baseline,
-        ));
         prompt_timings.push(prompt_timing_entry(
             &prompt.prompt_id,
             &prompt.category,
             "candidate",
             &candidate,
         ));
+
         blind_responses.insert(
             prompt.prompt_id.clone(),
             BlindResponseEntry {
@@ -1669,6 +1738,7 @@ fn capture_against_endpoints_inner(
             profile,
             false,
             0.0,
+            chat_controls,
             inference_deadline,
             &check_servers,
         ) {
@@ -1700,6 +1770,12 @@ fn capture_against_endpoints_inner(
             "powerConditions": bonsai_cpu_policy::power::compare_endpoints(&base_power_before, &base_power_after),
             "completed": true,
         }));
+        prompt_timings.push(prompt_timing_entry(
+            &prompt.prompt_id,
+            &prompt.category,
+            "baseline",
+            &baseline,
+        ));
 
         if Instant::now() >= inference_deadline {
             budget_exceeded = true;
@@ -1718,6 +1794,7 @@ fn capture_against_endpoints_inner(
             profile,
             true,
             config.selected_scale,
+            chat_controls,
             inference_deadline,
             &check_servers,
         ) {
@@ -1749,19 +1826,13 @@ fn capture_against_endpoints_inner(
             "powerConditions": bonsai_cpu_policy::power::compare_endpoints(&cand_power_before, &cand_power_after),
             "completed": true,
         }));
-
-        prompt_timings.push(prompt_timing_entry(
-            &prompt.prompt_id,
-            &prompt.category,
-            "baseline",
-            &baseline,
-        ));
         prompt_timings.push(prompt_timing_entry(
             &prompt.prompt_id,
             &prompt.category,
             "candidate",
             &candidate,
         ));
+
         blind_responses.insert(
             prompt.prompt_id.clone(),
             BlindResponseEntry {
@@ -1846,6 +1917,8 @@ fn capture_against_endpoints_inner(
         "timeBudgetSeconds": budget_seconds,
         "sleepInhibitionActive": sleep_inhibition_active,
         "baseModel": profile,
+        "reasoningEffort": reasoning_effort,
+        "reasoningBudget": config.reasoning_budget,
         "contractSha256": contract_sha256,
         "evidenceSha256": evidence_sha256,
         "responsesSha256": responses_sha256,
@@ -2179,8 +2252,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CapturePromptInput, CaptureZeroControlInput, DrG2CaptureConfig, build_server_arguments,
-        detect_repetition_loop, run_capture_against_endpoints, validate_capture_request,
+        CapturePromptInput, CaptureZeroControlInput, ChatRequestControls, DrG2CaptureConfig,
+        build_chat_completion_payload, build_server_arguments, detect_repetition_loop,
+        run_capture_against_endpoints, validate_capture_request,
     };
     use crate::bounded_input::ScratchDir;
     use crate::lora_diff_audit::{Operation, Request, Scope, readiness::BaseModelProfile};
@@ -2227,7 +2301,10 @@ mod tests {
             kv_cache: Some("rsq4".to_owned()),
             context_tokens: Some(4608),
             cpu_prefill_tokens: Some(16),
+            cpu_prefill_gdn: None,
             placement: Some("cpu".to_owned()),
+            reasoning_effort: None,
+            reasoning_budget: None,
             time_budget_seconds: Some(60),
             responses_output_path: responses_out,
             training_prompt_sha256s: vec!["99".repeat(32)],
@@ -2313,6 +2390,108 @@ mod tests {
         assert!(args_b.iter().any(|a| a == "--abliterate-lora"));
         assert!(args_b.iter().any(|a| a == "--daisyrose-lora"));
         assert!(args_b.iter().any(|a| a == "--cpu-prefill-scratch-bytes"));
+
+        // Optional cpuPrefillGdn, reasoningEffort, and reasoningBudget validation & serialization.
+        let mut cognitive_cfg = swift_cfg.clone();
+        cognitive_cfg.cpu_prefill_gdn = Some("wy-f32".to_owned());
+        cognitive_cfg.reasoning_effort = Some("medium".to_owned());
+        cognitive_cfg.reasoning_budget = Some(512);
+        validate_capture_request(
+            &dummy_request_with_config(cognitive_cfg.clone(), out_path.clone()),
+            &cognitive_cfg,
+            &out_path,
+        )?;
+        let cognitive_args = build_server_arguments(
+            &cognitive_cfg,
+            18083,
+            &scratch.join("c.key"),
+            true,
+            1234,
+            &cand_sha,
+        )?;
+        assert!(
+            cognitive_args
+                .windows(2)
+                .any(|w| w == ["--cpu-prefill-gdn", "wy-f32"])
+        );
+
+        let payload_on: Value = serde_json::from_slice(&build_chat_completion_payload(
+            "test prompt",
+            2048,
+            true,
+            BaseModelProfile::SwiftPq2,
+            true,
+            1.0,
+            ChatRequestControls {
+                reasoning_effort: "medium",
+                reasoning_budget: Some(512),
+            },
+        )?)
+        .map_err(|e| e.to_string())?;
+        assert_eq!(
+            payload_on["chat_template_kwargs"]["reasoning_effort"],
+            "medium"
+        );
+        assert_eq!(payload_on["reasoning_budget"], 512);
+
+        let payload_off: Value = serde_json::from_slice(&build_chat_completion_payload(
+            "test prompt",
+            1024,
+            false,
+            BaseModelProfile::SwiftPq2,
+            true,
+            1.0,
+            ChatRequestControls {
+                reasoning_effort: "medium",
+                reasoning_budget: Some(512),
+            },
+        )?)
+        .map_err(|e| e.to_string())?;
+        assert!(payload_off.get("reasoning_budget").is_none());
+
+        for mut bad_opt in [
+            {
+                let mut c = swift_cfg.clone();
+                c.cpu_prefill_tokens = None;
+                c.cpu_prefill_gdn = Some("wy-f32".to_owned());
+                c
+            },
+            {
+                let mut c = swift_cfg.clone();
+                c.cpu_prefill_gdn = Some("invalid-gdn".to_owned());
+                c
+            },
+            {
+                let mut c = swift_cfg.clone();
+                c.placement = Some("vulkan".to_owned());
+                c
+            },
+            {
+                let mut c = swift_cfg.clone();
+                c.reasoning_effort = Some("extreme".to_owned());
+                c
+            },
+            {
+                let mut c = swift_cfg.clone();
+                c.reasoning_budget = Some(0);
+                c
+            },
+            {
+                let mut c = swift_cfg.clone();
+                c.reasoning_budget = Some(4097);
+                c
+            },
+        ] {
+            assert!(
+                validate_capture_request(
+                    &dummy_request_with_config(bad_opt.clone(), out_path.clone()),
+                    &bad_opt,
+                    &out_path
+                )
+                .is_err()
+            );
+            let _ = &mut bad_opt;
+        }
 
         // NariQ must omit orcaAdapterPath, pass --nariq, and forbid vulkan/composite placement.
         let mut nariq_cfg = swift_cfg.clone();
@@ -2625,6 +2804,8 @@ mod tests {
         assert_eq!(receipt["completed"], true);
         assert_eq!(receipt["budgetExceeded"], false);
         assert_eq!(receipt["sleepInhibitionActive"], cfg!(windows));
+        assert_eq!(receipt["reasoningEffort"], "xhigh");
+        assert_eq!(receipt["reasoningBudget"], Value::Null);
         assert_eq!(receipt["lingeringServerCount"], 0);
         assert_eq!(receipt["credDirExistsAfter"], false);
         assert_eq!(receipt["completedZeroControls"], 1);
@@ -2725,6 +2906,8 @@ mod tests {
         let mut nariq_cfg = base_capture_config(None);
         nariq_cfg.base_model = Some(BaseModelProfile::Nariq2_5Bpw);
         nariq_cfg.orca_adapter_path = None;
+        nariq_cfg.reasoning_effort = Some("low".to_owned());
+        nariq_cfg.reasoning_budget = Some(256);
         let req = dummy_request_with_config(nariq_cfg, evidence_out.clone());
         let cand_sha = "ef".repeat(32);
 
@@ -2747,6 +2930,8 @@ mod tests {
         let receipt = receipt?;
         assert_eq!(receipt["completed"], true);
         assert_eq!(receipt["baseModel"], "nariq-2.5bpw");
+        assert_eq!(receipt["reasoningEffort"], "low");
+        assert_eq!(receipt["reasoningBudget"], 256);
         let nariq_evidence: Value =
             serde_json::from_slice(&fs::read(&evidence_out).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
@@ -2754,7 +2939,8 @@ mod tests {
         assert_eq!(nariq_evidence["orcaAdapterSha256"], Value::Null);
         assert_eq!(nariq_evidence["orcaScale"], 0.0);
 
-        // Now test tight budget expiry after server startup: unpaired prompts are skipped cleanly.
+        // Now test tight budget expiry after server startup: unpaired prompts are skipped cleanly
+        // while completed individual-arm timings remain retained in promptTimings.
         let slow_a = spawn_mock_server(token_a.clone(), false, 150)?;
         let slow_b = spawn_mock_server(token_b.clone(), true, 150)?;
         let partial_out = scratch.join("partial-evidence.json");
@@ -2778,12 +2964,28 @@ mod tests {
         let partial_receipt = partial_receipt?;
         assert_eq!(partial_receipt["completed"], false);
         assert_eq!(partial_receipt["budgetExceeded"], true);
+        assert_eq!(partial_receipt["completedZeroControls"], 0);
         assert!(
             !partial_receipt["skippedPrompts"]
                 .as_array()
                 .ok_or("Missing skippedPrompts.")?
                 .is_empty()
         );
+        let completed_arms = partial_receipt["armPowerObservations"]
+            .as_array()
+            .ok_or("Missing armPowerObservations.")?
+            .iter()
+            .filter(|arm| arm["completed"] == true)
+            .count();
+        let partial_timings = partial_receipt["promptTimings"]
+            .as_array()
+            .ok_or("Missing promptTimings.")?;
+        assert!(
+            completed_arms >= 1,
+            "Expected at least the first arm to complete before deadline."
+        );
+        assert_eq!(partial_timings.len(), completed_arms);
+        assert_eq!(partial_timings[0]["arm"], "zero-no-adapter");
         Ok(())
     }
 }
