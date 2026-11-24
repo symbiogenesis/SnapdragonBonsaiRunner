@@ -26,8 +26,8 @@ use self::safetensors::{
     coalesce_small_spans, decode_scalar_f32, swift_tensor_inventory,
 };
 use self::svd::{
-    CumulativeEnergy, StreamingTwoSidedSketch, SvdSpectrum, randomized_subspace_denoised_factors,
-    randomized_subspace_svd,
+    CumulativeEnergy, ShrinkageMode, StreamingTwoSidedSketch, SvdSpectrum,
+    randomized_subspace_denoised_factors_with_mode, randomized_subspace_svd,
 };
 
 const DAISYROSE_REPO: &str = "RadixArk/DaisyRose-27B";
@@ -135,6 +135,10 @@ struct Scope {
     export_dtype: ExportDtype,
     #[serde(default = "default_min_spike_ratio")]
     min_spike_ratio: f64,
+    #[serde(default)]
+    shrinkage_mode: ShrinkageMode,
+    #[serde(default)]
+    shrinkage_blend: Option<f64>,
     max_rank: usize,
     oversampling: usize,
     power_iterations: usize,
@@ -151,6 +155,8 @@ impl Default for Scope {
             include_spectral_denoising: true,
             export_dtype: ExportDtype::F16,
             min_spike_ratio: 1.0,
+            shrinkage_mode: ShrinkageMode::GavishDonoho,
+            shrinkage_blend: None,
             max_rank: 64,
             oversampling: 16,
             power_iterations: 2,
@@ -524,6 +530,31 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     {
         return Err("scope.minSpikeRatio must be finite and in 1.0..=100.0.".into());
     }
+    match request.scope.shrinkage_mode {
+        ShrinkageMode::Blended => match request.scope.shrinkage_blend {
+            Some(alpha) if alpha.is_finite() && (0.0..=1.0).contains(&alpha) => {}
+            Some(_) => {
+                return Err(
+                    "scope.shrinkageBlend must be finite and in 0.0..=1.0 when shrinkageMode is 'blended'."
+                        .into(),
+                );
+            }
+            None => {
+                return Err(
+                    "scope.shrinkageBlend is required when scope.shrinkageMode is 'blended'."
+                        .into(),
+                );
+            }
+        },
+        ShrinkageMode::GavishDonoho | ShrinkageMode::Unshrunk => {
+            if request.scope.shrinkage_blend.is_some() {
+                return Err(
+                    "scope.shrinkageBlend is only allowed when scope.shrinkageMode is 'blended'."
+                        .into(),
+                );
+            }
+        }
+    }
     if !(10..=900).contains(&request.controls.time_budget_seconds) {
         return Err("controls.timeBudgetSeconds must be in 10..=900.".into());
     }
@@ -604,7 +635,7 @@ fn select_tensors(scope: &Scope, envelope: TargetEnvelope) -> Vec<TensorSpec> {
 }
 
 fn resolved_scope_json(scope: &Scope, envelope: TargetEnvelope) -> Value {
-    json!({
+    let mut obj = json!({
         "layers": scope.layers,
         "targetEnvelope": envelope,
         "includeOutputNorm": if envelope == TargetEnvelope::All { scope.include_output_norm } else { false },
@@ -613,10 +644,17 @@ fn resolved_scope_json(scope: &Scope, envelope: TargetEnvelope) -> Value {
         "includeSpectralDenoising": scope.include_spectral_denoising,
         "exportDtype": scope.export_dtype,
         "minSpikeRatio": scope.min_spike_ratio,
+        "shrinkageMode": scope.shrinkage_mode,
         "maxRank": scope.max_rank,
         "oversampling": scope.oversampling,
         "powerIterations": scope.power_iterations,
-    })
+    });
+    if let Some(blend) = scope.shrinkage_blend
+        && let Some(map) = obj.as_object_mut()
+    {
+        map.insert("shrinkageBlend".to_owned(), json!(blend));
+    }
+    obj
 }
 
 fn estimated_bf16_bytes(spec: &TensorSpec) -> u64 {
@@ -2147,7 +2185,7 @@ fn run_export_denoised_with_dims(
             drop(cb);
             drop(bb);
 
-            let factors = randomized_subspace_denoised_factors(
+            let factors = randomized_subspace_denoised_factors_with_mode(
                 &p.spec.hf_name,
                 &delta,
                 rows,
@@ -2157,6 +2195,8 @@ fn run_export_denoised_with_dims(
                 stats.delta_energy,
                 request.scope.max_rank,
                 request.scope.min_spike_ratio,
+                request.scope.shrinkage_mode,
+                request.scope.shrinkage_blend,
                 workers,
             )?;
             let report = build_tensor_report(
@@ -2275,6 +2315,10 @@ fn run_export_denoised_with_dims(
             "rademacher-null-gavish-donoho-v1",
         ),
         ("bonsai.composition.envelope", envelope.as_str()),
+        (
+            "bonsai.composition.shrinkage_mode",
+            request.scope.shrinkage_mode.as_str(),
+        ),
         (
             "bonsai.composition.candidate_index_sha256",
             &cand_idx.sha256,

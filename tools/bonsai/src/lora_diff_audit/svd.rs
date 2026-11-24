@@ -2,7 +2,27 @@
 
 use std::f64::consts::PI;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Singular value shrinkage policy applied to above-bulk spikes during factor extraction.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum ShrinkageMode {
+    #[default]
+    GavishDonoho,
+    Unshrunk,
+    Blended,
+}
+
+impl ShrinkageMode {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::GavishDonoho => "gavish-donoho",
+            Self::Unshrunk => "unshrunk",
+            Self::Blended => "blended",
+        }
+    }
+}
 
 /// Cumulative Frobenius energy `sum_{i < r} sigma_i^2 / ||Delta||_F^2` at standard ranks.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -119,6 +139,29 @@ pub(super) fn gavish_donoho_frobenius_shrink(sigma: f64, bulk_edge: f64, beta: f
         return 0.0;
     }
     (radicand.sqrt() / (y * y_edge)) * bulk_edge
+}
+
+/// Applies the selected singular value shrinkage mode to a candidate singular value.
+#[must_use]
+pub(super) fn apply_shrinkage_mode(
+    sigma: f64,
+    bulk_edge: f64,
+    beta: f64,
+    mode: ShrinkageMode,
+    blend: Option<f64>,
+) -> f64 {
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return 0.0;
+    }
+    match mode {
+        ShrinkageMode::GavishDonoho => gavish_donoho_frobenius_shrink(sigma, bulk_edge, beta),
+        ShrinkageMode::Unshrunk => sigma,
+        ShrinkageMode::Blended => {
+            let shrunk = gavish_donoho_frobenius_shrink(sigma, bulk_edge, beta);
+            let alpha = blend.unwrap_or(1.0);
+            (1.0 - alpha) * sigma + alpha * shrunk
+        }
+    }
 }
 
 #[expect(
@@ -1028,7 +1071,9 @@ fn normalize_f64_to_f32(values: &[f64]) -> Option<Vec<f32>> {
 }
 
 /// Computes denoised SVD spectrum and extracts shrunk singular triplets `(u_k, v_k, shrunk_sigma_k)`
-/// for modes clearing `sigma > min_spike_ratio * effective_bulk_edge` up to `export_max_rank`.
+/// for modes clearing `sigma > min_spike_ratio * effective_bulk_edge` up to `export_max_rank`
+/// using the default Gavish–Donoho shrinkage mode.
+#[cfg(test)]
 pub(super) fn randomized_subspace_denoised_factors(
     name: &str,
     d: &[f32],
@@ -1041,6 +1086,49 @@ pub(super) fn randomized_subspace_denoised_factors(
     min_spike_ratio: f64,
     workers: usize,
 ) -> crate::Result<DenoisedFactors> {
+    randomized_subspace_denoised_factors_with_mode(
+        name,
+        d,
+        m,
+        n,
+        k_requested,
+        power_iterations,
+        total_energy,
+        export_max_rank,
+        min_spike_ratio,
+        ShrinkageMode::GavishDonoho,
+        None,
+        workers,
+    )
+}
+
+/// Computes denoised SVD spectrum and extracts singular triplets `(u_k, v_k, effective_sigma_k)`
+/// for modes clearing `sigma > min_spike_ratio * effective_bulk_edge` up to `export_max_rank`
+/// under the selected [`ShrinkageMode`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct extension of randomized_subspace_denoised_factors adding shrinkage mode and optional blend weight."
+)]
+pub(super) fn randomized_subspace_denoised_factors_with_mode(
+    name: &str,
+    d: &[f32],
+    m: usize,
+    n: usize,
+    k_requested: usize,
+    power_iterations: usize,
+    total_energy: f64,
+    export_max_rank: usize,
+    min_spike_ratio: f64,
+    shrinkage_mode: ShrinkageMode,
+    shrinkage_blend: Option<f64>,
+    workers: usize,
+) -> crate::Result<DenoisedFactors> {
+    if shrinkage_mode == ShrinkageMode::Blended
+        && let Some(alpha) = shrinkage_blend
+        && (!alpha.is_finite() || !(0.0..=1.0).contains(&alpha))
+    {
+        return Err("shrinkageBlend must be finite and in 0.0..=1.0.".into());
+    }
     if total_energy <= 0.0 || export_max_rank == 0 {
         return Ok(DenoisedFactors {
             spectrum: SvdSpectrum::zero(),
@@ -1086,7 +1174,8 @@ pub(super) fn randomized_subspace_denoised_factors(
                 break;
             }
             let sigma = lambda.sqrt();
-            let shrunk = gavish_donoho_frobenius_shrink(sigma, eff_edge, beta);
+            let shrunk =
+                apply_shrinkage_mode(sigma, eff_edge, beta, shrinkage_mode, shrinkage_blend);
             if sigma <= min_spike_ratio * eff_edge || shrunk <= 0.0 {
                 continue;
             }
@@ -1183,7 +1272,7 @@ pub(super) fn randomized_subspace_denoised_factors(
             break;
         }
         let sigma = lambda.sqrt();
-        let shrunk = gavish_donoho_frobenius_shrink(sigma, eff_edge, beta);
+        let shrunk = apply_shrinkage_mode(sigma, eff_edge, beta, shrinkage_mode, shrinkage_blend);
         if sigma <= min_spike_ratio * eff_edge || shrunk <= 0.0 {
             continue;
         }
@@ -1557,5 +1646,341 @@ impl StreamingTwoSidedSketch {
             )
         });
         spectrum_from_eigenvalues(method, &eigenvalues, k_eff, total_energy, false, denoised)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs::{self, File};
+    use std::io::Write as _;
+    use std::path::Path;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::bounded_input::ScratchDir;
+
+    fn test_spiked_matrix(
+        rows: usize,
+        cols: usize,
+        sigmas: &[f64],
+        noise_ratio: f64,
+    ) -> (Vec<f32>, f64) {
+        let mut signal = vec![0.0_f64; rows * cols];
+        for (k, &sigma) in sigmas.iter().enumerate() {
+            let mut u = vec![0.0_f64; rows];
+            for (r, dst) in u.iter_mut().enumerate() {
+                *dst = (usize_to_f64((r + 1) * (k + 3) + 17) * 0.713).sin();
+            }
+            let u_norm = dot_f64(&u, &u).sqrt();
+            for val in &mut u {
+                *val /= u_norm;
+            }
+            let mut v = vec![0.0_f64; cols];
+            for (c, dst) in v.iter_mut().enumerate() {
+                *dst = (usize_to_f64((c + 1) * (k + 5) + 41) * 0.371).cos();
+            }
+            let v_norm = dot_f64(&v, &v).sqrt();
+            for val in &mut v {
+                *val /= v_norm;
+            }
+            for r in 0..rows {
+                for c in 0..cols {
+                    signal[r * cols + c] += sigma * u[r] * v[c];
+                }
+            }
+        }
+        let sig_energy: f64 = signal.iter().map(|&x| x * x).sum();
+        let amp = ((sig_energy * noise_ratio) / usize_to_f64(rows * cols)).sqrt();
+        let mut state = 0xfeed_b0b0_u64;
+        let mut mixed = Vec::with_capacity(rows * cols);
+        let mut total_energy = 0.0_f64;
+        for &s in &signal {
+            let bits = splitmix64_step(&mut state);
+            let noise = if (bits & 1) == 1 { amp } else { -amp };
+            let val = f64_to_f32_lossy(s + noise);
+            let vf = f64::from(val);
+            total_energy += vf * vf;
+            mixed.push(val);
+        }
+        (mixed, total_energy)
+    }
+
+    #[test]
+    fn shrinkage_modes_cover_gavish_donoho_unshrunk_and_blended() -> crate::Result<()> {
+        for (label, rows, cols, k_req) in [
+            ("exact-branch", 40_usize, 48_usize, 48_usize),
+            ("randomized-branch", 128_usize, 160_usize, 32_usize),
+        ] {
+            let (mixed, total_energy) = test_spiked_matrix(rows, cols, &[3.2, 2.4, 1.8], 1.0);
+
+            let default_factors = randomized_subspace_denoised_factors(
+                label,
+                &mixed,
+                rows,
+                cols,
+                k_req,
+                2,
+                total_energy,
+                16,
+                1.0,
+                2,
+            )?;
+            let gd_factors = randomized_subspace_denoised_factors_with_mode(
+                label,
+                &mixed,
+                rows,
+                cols,
+                k_req,
+                2,
+                total_energy,
+                16,
+                1.0,
+                ShrinkageMode::GavishDonoho,
+                None,
+                2,
+            )?;
+            assert_eq!(default_factors.rank, 3, "{label} should recover 3 spikes");
+            assert_eq!(gd_factors.rank, default_factors.rank);
+            for (&a, &b) in default_factors
+                .shrunk_sigmas
+                .iter()
+                .zip(&gd_factors.shrunk_sigmas)
+            {
+                assert_eq!(a.to_bits(), b.to_bits(), "{label} default != GavishDonoho");
+            }
+
+            let unshrunk = randomized_subspace_denoised_factors_with_mode(
+                label,
+                &mixed,
+                rows,
+                cols,
+                k_req,
+                2,
+                total_energy,
+                16,
+                1.0,
+                ShrinkageMode::Unshrunk,
+                None,
+                2,
+            )?;
+            assert_eq!(unshrunk.rank, 3);
+            assert!(
+                unshrunk.spectrum.top_singular_values.len() > 3,
+                "{label} should have bulk singular values rejected by spike threshold"
+            );
+            for k in 0..3 {
+                let raw_sigma = unshrunk.spectrum.top_singular_values[k];
+                assert_eq!(
+                    unshrunk.shrunk_sigmas[k].to_bits(),
+                    raw_sigma.to_bits(),
+                    "{label} mode {k} should retain exact raw sigma"
+                );
+                assert!(unshrunk.shrunk_sigmas[k] > gd_factors.shrunk_sigmas[k]);
+            }
+
+            let blend_zero = randomized_subspace_denoised_factors_with_mode(
+                label,
+                &mixed,
+                rows,
+                cols,
+                k_req,
+                2,
+                total_energy,
+                16,
+                1.0,
+                ShrinkageMode::Blended,
+                Some(0.0),
+                2,
+            )?;
+            let blend_one = randomized_subspace_denoised_factors_with_mode(
+                label,
+                &mixed,
+                rows,
+                cols,
+                k_req,
+                2,
+                total_energy,
+                16,
+                1.0,
+                ShrinkageMode::Blended,
+                Some(1.0),
+                2,
+            )?;
+            let blend_mid = randomized_subspace_denoised_factors_with_mode(
+                label,
+                &mixed,
+                rows,
+                cols,
+                k_req,
+                2,
+                total_energy,
+                16,
+                1.0,
+                ShrinkageMode::Blended,
+                Some(0.35),
+                2,
+            )?;
+            assert_eq!(blend_zero.rank, 3);
+            assert_eq!(blend_one.rank, 3);
+            assert_eq!(blend_mid.rank, 3);
+            for k in 0..3 {
+                assert!(
+                    (blend_zero.shrunk_sigmas[k] - unshrunk.shrunk_sigmas[k]).abs() < 1e-12,
+                    "{label} blend=0 must match unshrunk"
+                );
+                assert!(
+                    (blend_one.shrunk_sigmas[k] - gd_factors.shrunk_sigmas[k]).abs() < 1e-12,
+                    "{label} blend=1 must match GavishDonoho"
+                );
+                let expected =
+                    0.65 * unshrunk.shrunk_sigmas[k] + 0.35 * gd_factors.shrunk_sigmas[k];
+                assert!(
+                    (blend_mid.shrunk_sigmas[k] - expected).abs() < 1e-12,
+                    "{label} blend=0.35 mismatch"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn write_toy_safetensors_dir(
+        dir: &Path,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        vals: &[f32],
+    ) -> crate::Result<()> {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let mut payload = Vec::with_capacity(vals.len() * 2);
+        for &v in vals {
+            let bits = v.to_bits();
+            let rounding = 0x7FFF_u32 + ((bits >> 16) & 1);
+            let rounded = bits.wrapping_add(rounding);
+            let hi = u16::try_from(rounded >> 16).unwrap_or(0);
+            payload.extend_from_slice(&hi.to_le_bytes());
+        }
+        let header = json!({
+            tensor_name: {
+                "dtype": "BF16",
+                "shape": [rows, cols],
+                "data_offsets": [0_u64, u64::try_from(payload.len()).map_err(|e| e.to_string())?],
+            }
+        });
+        let header_bytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+        let header_len = u64::try_from(header_bytes.len()).map_err(|e| e.to_string())?;
+        let shard_name = "model-00001-of-00001.safetensors";
+        let mut file = File::create(dir.join(shard_name)).map_err(|e| e.to_string())?;
+        file.write_all(&header_len.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        file.write_all(&header_bytes).map_err(|e| e.to_string())?;
+        file.write_all(&payload).map_err(|e| e.to_string())?;
+        let index = json!({
+            "metadata": {"total_size": 0},
+            "weight_map": { tensor_name: shard_name },
+        });
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn scope_shrinkage_validation_and_export_metadata_work() -> crate::Result<()> {
+        let plan_default = super::super::run(json!({
+            "schemaVersion": 1,
+            "operation": "plan",
+            "source": { "kind": "pinned-daisyrose" }
+        }))?;
+        assert_eq!(plan_default["scope"]["shrinkageMode"], "gavish-donoho");
+        assert!(plan_default["scope"].get("shrinkageBlend").is_none());
+
+        let plan_blended = super::super::run(json!({
+            "schemaVersion": 1,
+            "operation": "plan",
+            "source": { "kind": "pinned-daisyrose" },
+            "scope": { "shrinkageMode": "blended", "shrinkageBlend": 0.4 }
+        }))?;
+        assert_eq!(plan_blended["scope"]["shrinkageMode"], "blended");
+        assert_eq!(plan_blended["scope"]["shrinkageBlend"], 0.4);
+
+        for bad_scope in [
+            json!({ "shrinkageMode": "blended" }),
+            json!({ "shrinkageMode": "blended", "shrinkageBlend": -0.05 }),
+            json!({ "shrinkageMode": "blended", "shrinkageBlend": 1.05 }),
+            json!({ "shrinkageMode": "gavish-donoho", "shrinkageBlend": 0.5 }),
+            json!({ "shrinkageMode": "unshrunk", "shrinkageBlend": 0.5 }),
+        ] {
+            assert!(
+                super::super::run(json!({
+                    "schemaVersion": 1,
+                    "operation": "plan",
+                    "source": { "kind": "pinned-daisyrose" },
+                    "scope": bad_scope
+                }))
+                .is_err()
+            );
+        }
+
+        let scratch = ScratchDir::new("shrinkage-export-meta")?;
+        let base_dir = scratch.join("base");
+        let cand_dir = scratch.join("cand");
+        let rows = 64_usize;
+        let cols = 80_usize;
+        let (delta, _) = test_spiked_matrix(rows, cols, &[2.4, 1.7], 3.0);
+        let base_vals = vec![1.0_f32; rows * cols];
+        let cand_vals: Vec<f32> = base_vals.iter().zip(&delta).map(|(&b, &d)| b + d).collect();
+        let hf_name = "model.language_model.layers.0.mlp.down_proj.weight";
+        let gguf_name = "blk.0.ffn_down.weight";
+        write_toy_safetensors_dir(&base_dir, hf_name, rows, cols, &base_vals)?;
+        write_toy_safetensors_dir(&cand_dir, hf_name, rows, cols, &cand_vals)?;
+
+        let mut toy_dims = BTreeMap::new();
+        toy_dims.insert(gguf_name.to_owned(), (cols, rows, "ffn_down"));
+
+        for (mode_str, blend_json) in [
+            ("unshrunk", None),
+            ("blended", Some(0.25_f64)),
+            ("gavish-donoho", None),
+        ] {
+            let out_gguf = scratch.join(format!("export-{mode_str}.gguf"));
+            let mut scope_json = json!({
+                "layers": [0],
+                "targetEnvelope": "residual-writers",
+                "exportDtype": "f32",
+                "maxRank": 8,
+                "oversampling": 4,
+                "powerIterations": 2,
+                "shrinkageMode": mode_str,
+            });
+            if let Some(alpha) = blend_json
+                && let Some(obj) = scope_json.as_object_mut()
+            {
+                obj.insert("shrinkageBlend".to_owned(), json!(alpha));
+            }
+            let req: super::super::Request = serde_json::from_value(json!({
+                "schemaVersion": 1,
+                "operation": "export-denoised",
+                "source": {
+                    "kind": "local-directories",
+                    "candidateDirectory": cand_dir,
+                    "baseDirectory": base_dir
+                },
+                "scope": scope_json,
+                "controls": { "timeBudgetSeconds": 60, "workers": 2, "httpConcurrency": 1 },
+                "outputPath": out_gguf
+            }))
+            .map_err(|e| e.to_string())?;
+            super::super::validate_request(&req)?;
+            let receipt = super::super::run_export_denoised_with_dims(&req, &toy_dims)?;
+            assert_eq!(receipt["published"], true);
+            assert_eq!(
+                receipt["verification"]["provenanceMetadata"]["bonsai.composition.shrinkage_mode"],
+                mode_str
+            );
+        }
+        Ok(())
     }
 }
