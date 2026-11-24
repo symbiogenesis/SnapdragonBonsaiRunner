@@ -941,16 +941,22 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   blinded review (`dr-g2-blind-packet` / `dr-g2-apply-reviews`, `3f4b0b8d`),
   `bonsai_windows_process::SystemAwakeGuard` (`14fb0c70`,
   `SetThreadExecutionState`), and the native sleep-inhibited two-server
-  `dr-g2-capture` harness (`0dd8a7e8`) are checked in locally. Closed local
-  `prism-inference-server` runs verified bit-exact `scale = 0.0` parity on
-  `zero-ctrl-001` (`51` tokens, `cb08876d...`) alongside partial captures
-  (`1/8` pairs on battery CPU, `2/8` pairs on `28d47fe` AC `900 s` ceiling, and
-  `1/4` pairs on `91298a4c` AC before host Windows suspend exceeded `900 s`;
+  `dr-g2-capture` harness (`0dd8a7e8`, updated to retain completed-arm timings
+  and support optional `reasoningEffort` / `reasoningBudget` / `cpuPrefillGdn`)
+  are checked in locally. Closed local `prism-inference-server` runs verified
+  bit-exact `scale = 0.0` parity (`zero-ctrl-001` `51` tokens `cb08876d...`,
+  `zero-ctrl-002` `64` tokens `967dea21...`) alongside partial captures
+  (`1/8` pairs on battery CPU, `2/8` pairs on `28d47fe` AC `900 s` ceiling,
+  `1/4` pairs on `91298a4c` AC before host Windows suspend exceeded `900 s`, and
+  `1/4` pairs on awake `v0.1.34` AC `885.027 s` with `sleepInhibitionActive: true`
+  and `if-003` byte-identical JSON / `1.047x` thinking tokens before `coding-003`
+  hit the `885 s` deadline under `v0.1.34` hardcoded `reasoning_effort: "xhigh"`;
   [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md)).
   Awake AC-powered 4-category completion (`coding`, `reasoning`,
-  `instruction-following`, `creative-prose`) using `dr-g2-capture`, blinded
-  owner review (`humanReviewed: true`), and fail-closed `dr-g2-score` pass
-  remain open.
+  `instruction-following`, `creative-prose`) inside `<= 900 s` (via Prism
+  `v0.1.35+` configurable `reasoningEffort` / `reasoningBudget` or tighter
+  single-focus prompts), blinded owner review (`humanReviewed: true`), and
+  fail-closed `dr-g2-score` pass remain open.
 - [ ] **DR-W1 — Conditional pure-Rust direct weight editing on the multi-rank LoRA if `DR-G2` fails (zero retraining).**
   Triggered only if the unedited `DR-E1` stack fails `DR-G2`; keep
   `Swift-Bonsai-2`'s packed ternary base immutable and stay inside `npu-friendly`
