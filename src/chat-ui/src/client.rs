@@ -179,19 +179,33 @@ pub(crate) fn valid_daisyrose_scale(scale: f32) -> bool {
     valid_adapter_scale(scale)
 }
 
-/// Broker-reported DaisyRose multi-rank `LoRA` readiness and default scale (in tenths `0..=20`).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Normalize a DaisyRose `SHA-256` fingerprint to its leading 12 lowercase hex characters.
+pub(crate) fn valid_daisyrose_sha256_prefix(raw: &str) -> Option<String> {
+    if raw.len() < 12
+        || !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some(raw[..12].to_owned())
+}
+
+/// Broker-reported DaisyRose multi-rank `LoRA` readiness, default scale, and verified identity.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DaisyRoseReadiness {
     pub(crate) available: bool,
     pub(crate) default_scale_tenths: u8,
+    pub(crate) max_rank: Option<u16>,
+    pub(crate) sha256_prefix: Option<String>,
 }
 
 impl DaisyRoseReadiness {
-    pub(crate) const fn default_enabled(self) -> bool {
+    pub(crate) const fn default_enabled(&self) -> bool {
         self.available && self.default_scale_tenths > 0
     }
 
-    pub(crate) fn default_scale(self) -> f32 {
+    pub(crate) fn default_scale(&self) -> f32 {
         if self.available {
             f32::from(self.default_scale_tenths) / 10.0
         } else {
@@ -1135,6 +1149,7 @@ fn serve_broker(
     )?;
     notify(events, Event::ContextCapacity(context_tokens))?;
     notify(events, Event::VisionAvailable(vision_available))?;
+    let daisyrose_available = daisyrose.available;
     notify(events, Event::DaisyRoseAvailable(daisyrose))?;
     notify(
         events,
@@ -1185,7 +1200,7 @@ fn serve_broker(
                     images,
                 });
                 let scale = config.use_abliterate_lora.then_some(abliteration_scale);
-                let daisyrose_scale = daisyrose.available.then_some(daisyrose_scale);
+                let daisyrose_scale = daisyrose_available.then_some(daisyrose_scale);
                 let options = ResponseOptions {
                     max_completion_tokens,
                     enable_thinking,
@@ -1254,9 +1269,9 @@ fn wait_ready(
                 "The broker did not report its selected context capacity. Rebuild the broker and retry.",
             ))?;
             let vision_available = input_modalities(&output)?.unwrap_or(false);
-            let daisyrose = daisyrose_adapter(&output)?.unwrap_or(DaisyRoseReadiness {
+            let daisyrose = daisyrose_adapter(&output)?.unwrap_or_else(|| DaisyRoseReadiness {
                 available: config.daisyrose_lora.is_some(),
-                default_scale_tenths: 0,
+                ..DaisyRoseReadiness::default()
             });
             let cognitive_controls = cognitive_controls_declaration(&output)?.unwrap_or(false);
             let key = read_api_key(&config.evidence, &directory)?;
@@ -1549,17 +1564,43 @@ fn daisyrose_adapter(output: &[u8]) -> Result<Option<DaisyRoseReadiness>> {
             if value == "unavailable" {
                 return Ok(DaisyRoseReadiness::default());
             }
-            if let Some(scale) = value.strip_prefix("available, default scale ")
-                && let [whole, b'.', frac] = scale.as_bytes()
-                && (b'0'..=b'2').contains(whole)
-                && frac.is_ascii_digit()
-            {
-                let tenths = (*whole - b'0') * 10 + (*frac - b'0');
-                if tenths <= 20 {
-                    return Ok(DaisyRoseReadiness {
-                        available: true,
-                        default_scale_tenths: tenths,
-                    });
+            if let Some(rest) = value.strip_prefix("available, default scale ") {
+                let mut parts = rest.split(", ");
+                if let Some(scale) = parts.next()
+                    && let [whole, b'.', frac] = scale.as_bytes()
+                    && (b'0'..=b'2').contains(whole)
+                    && frac.is_ascii_digit()
+                {
+                    let tenths = (*whole - b'0') * 10 + (*frac - b'0');
+                    if tenths <= 20 {
+                        let mut max_rank = None;
+                        let mut sha256_prefix = None;
+                        for part in parts {
+                            if let Some(rank_str) = part.strip_prefix("rank ")
+                                && max_rank.is_none()
+                                && let Ok(rank) = rank_str.parse::<u16>()
+                                && (1..=64).contains(&rank)
+                            {
+                                max_rank = Some(rank);
+                            } else if let Some(sha_str) = part.strip_prefix("sha256 ")
+                                && sha256_prefix.is_none()
+                                && sha_str.len() <= 64
+                                && let Some(prefix) = valid_daisyrose_sha256_prefix(sha_str)
+                            {
+                                sha256_prefix = Some(prefix);
+                            } else {
+                                return Err(Failure::Message(
+                                    "The broker reported an unsupported DaisyRose adapter status.",
+                                ));
+                            }
+                        }
+                        return Ok(DaisyRoseReadiness {
+                            available: true,
+                            default_scale_tenths: tenths,
+                            max_rank,
+                            sha256_prefix,
+                        });
+                    }
                 }
             }
             Err(Failure::Message(
@@ -3881,6 +3922,8 @@ mod tests {
             Ok(Some(DaisyRoseReadiness {
                 available: false,
                 default_scale_tenths: 0,
+                max_rank: None,
+                sha256_prefix: None,
             }))
         );
         for (text, tenths) in [("0.0", 0), ("1.0", 10), ("1.3", 13), ("2.0", 20)] {
@@ -3891,9 +3934,33 @@ mod tests {
                 Ok(Some(DaisyRoseReadiness {
                     available: true,
                     default_scale_tenths: tenths,
+                    max_rank: None,
+                    sha256_prefix: None,
                 }))
             );
         }
+        let full_sha = format!("1b850494b875{}", "a".repeat(52));
+        let with_meta = format!(
+            "DaisyRose adapter: available, default scale 1.0, rank 16, sha256 {full_sha}\n"
+        );
+        assert_eq!(
+            daisyrose_adapter(with_meta.as_bytes()),
+            Ok(Some(DaisyRoseReadiness {
+                available: true,
+                default_scale_tenths: 10,
+                max_rank: Some(16),
+                sha256_prefix: Some("1b850494b875".to_owned()),
+            }))
+        );
+        assert_eq!(
+            daisyrose_adapter(b"DaisyRose adapter: available, default scale 0.0, rank 32\n"),
+            Ok(Some(DaisyRoseReadiness {
+                available: true,
+                default_scale_tenths: 0,
+                max_rank: Some(32),
+                sha256_prefix: None,
+            }))
+        );
         assert_eq!(daisyrose_adapter(b"Context tokens: 8192\n"), Ok(None));
         assert_eq!(
             daisyrose_adapter(b"other\nDaisyRose adapter: available, default scale 1.0"),
@@ -3906,6 +3973,14 @@ mod tests {
             "available, default scale -0.0",
             "available, default scale 1.00",
             "available, default scale 1",
+            "available, default scale 1.0, rank 0",
+            "available, default scale 1.0, rank 65",
+            "available, default scale 1.0, rank 16, rank 8",
+            "available, default scale 1.0, sha256 1b850494b87",
+            "available, default scale 1.0, sha256 1B850494B875",
+            &format!("available, default scale 1.0, sha256 {}", "a".repeat(65)),
+            "available, default scale 1.0, sha256 1b850494b875, sha256 1b850494b875",
+            "available, default scale 1.0, bogus 1",
             "unavailable ",
         ] {
             assert!(

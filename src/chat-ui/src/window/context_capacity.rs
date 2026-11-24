@@ -215,6 +215,13 @@ impl State {
             );
         }
         ui.label(RichText::new("Capacity is selected when the model starts. Closing memory-heavy apps before the next model start or Retry may leave room for a larger window. This model's current capacity stays fixed.").small().weak());
+        let daisyrose_adapter_bytes = if self.daisyrose_available {
+            self.daisyrose_max_rank
+                .and_then(npu_friendly_daisyrose_adapter_bytes)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if let Some(capacity) = estimate.capacity
             && let Some(footprint) = estimate_runtime_footprint(PlannerRuntimeShape {
                 context_tokens: capacity,
@@ -224,6 +231,7 @@ impl State {
                 evictable_mapped_weight_bytes: WeightPacking::Pq2_0.weight_bytes(),
                 npu_resident_arena_bytes: 0,
                 npu_released_host_pq2_bytes: 0,
+                daisyrose_adapter_bytes,
                 branch_checkpoints: 1,
             })
         {
@@ -522,6 +530,28 @@ impl KvSharingMode {
 }
 
 /// Input parameters for pure steady-state physical RAM vs private Job commit diagnostics.
+const DAISYROSE_NPU_FRIENDLY_BYTES_PER_RANK_F16: u64 = 4_194_304;
+const DAISYROSE_SCRATCH_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Conservative `NpuFriendly` `F16` adapter payload and scratch reserve for `max_rank` (`1..=64`).
+///
+/// Mirrors `bonsai_cpu_policy::context::MultiRankAdapterBudget::for_npu_friendly_rank(max_rank, false).total_bytes()`.
+pub(super) const fn npu_friendly_daisyrose_adapter_bytes(max_rank: u16) -> Option<u64> {
+    if max_rank == 0 || max_rank > 64 {
+        return None;
+    }
+    let mut payload = 0_u64;
+    let mut remaining = max_rank;
+    while remaining > 0 {
+        payload = match payload.checked_add(DAISYROSE_NPU_FRIENDLY_BYTES_PER_RANK_F16) {
+            Some(sum) => sum,
+            None => return None,
+        };
+        remaining -= 1;
+    }
+    payload.checked_add(DAISYROSE_SCRATCH_HEADROOM_BYTES)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannerRuntimeShape {
     pub(super) context_tokens: usize,
@@ -531,6 +561,7 @@ pub(super) struct PlannerRuntimeShape {
     pub(super) evictable_mapped_weight_bytes: u64,
     pub(super) npu_resident_arena_bytes: u64,
     pub(super) npu_released_host_pq2_bytes: u64,
+    pub(super) daisyrose_adapter_bytes: u64,
     pub(super) branch_checkpoints: u8,
 }
 
@@ -548,6 +579,7 @@ pub(super) struct PlannerFootprintEstimate {
     pub(super) recurrent_bytes: u64,
     pub(super) npu_arena_bytes: u64,
     pub(super) npu_released_host_bytes: u64,
+    pub(super) daisyrose_adapter_bytes: u64,
     pub(super) branch_checkpoints: u8,
 }
 
@@ -616,7 +648,8 @@ pub(super) fn estimate_runtime_footprint(
     let recurrent_bytes = recurrent_copies.checked_mul(RECURRENT_BYTES)?;
     let host_total = host_weights_and_fixed
         .checked_add(recurrent_bytes)?
-        .checked_add(kv_bytes)?;
+        .checked_add(kv_bytes)?
+        .checked_add(shape.daisyrose_adapter_bytes)?;
     let private_job_commit_bytes = host_total.checked_sub(shape.evictable_mapped_weight_bytes)?;
     let steady_state_physical_bytes = host_total.checked_add(shape.npu_resident_arena_bytes)?;
     Some(PlannerFootprintEstimate {
@@ -631,6 +664,7 @@ pub(super) fn estimate_runtime_footprint(
         recurrent_bytes,
         npu_arena_bytes: shape.npu_resident_arena_bytes,
         npu_released_host_bytes: shape.npu_released_host_pq2_bytes,
+        daisyrose_adapter_bytes: shape.daisyrose_adapter_bytes,
         branch_checkpoints: shape.branch_checkpoints,
     })
 }
@@ -684,7 +718,15 @@ pub(super) fn format_footprint_diagnostic(estimate: &PlannerFootprintEstimate) -
         format!("{} branch checkpoints", estimate.branch_checkpoints)
     };
     parts.push(branch_label);
-    parts.join(" · ")
+    let mut formatted = parts.join(" · ");
+    if estimate.daisyrose_adapter_bytes > 0 {
+        use std::fmt::Write as _;
+        const MIB: u64 = 1024 * 1024;
+        let mib =
+            (u128::from(estimate.daisyrose_adapter_bytes) + u128::from(MIB / 2)) / u128::from(MIB);
+        let _written = write!(formatted, " + {mib} MiB DaisyRose");
+    }
+    formatted
 }
 
 #[cfg(test)]

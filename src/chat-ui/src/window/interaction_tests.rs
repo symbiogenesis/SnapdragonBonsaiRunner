@@ -612,11 +612,18 @@ fn daisyrose_promoted_readiness_enables_fresh_and_new_conversations_without_clob
         .model_event(Event::DaisyRoseAvailable(client::DaisyRoseReadiness {
             available: true,
             default_scale_tenths: 10,
+            max_rank: Some(16),
+            sha256_prefix: Some("1b850494b875".to_owned()),
         }));
     chat.state_mut().app.model_event(Event::Ready);
     chat.run();
 
     assert!(chat.state().app.daisyrose_available);
+    assert_eq!(chat.state().app.daisyrose_max_rank, Some(16));
+    assert_eq!(
+        chat.state().app.daisyrose_sha256_prefix.as_deref(),
+        Some("1b850494b875")
+    );
     assert!(chat.state().app.daisyrose_enabled);
     assert!((chat.state().app.daisyrose_scale - 1.0).abs() < f32::EPSILON);
 
@@ -645,6 +652,14 @@ fn daisyrose_promoted_readiness_enables_fresh_and_new_conversations_without_clob
             .rect()
             .is_positive()
     );
+    let loaded_label = chat.get_by_label("Loaded: rank \u{2264}16 · 1b850494b875");
+    loaded_label.scroll_to_me();
+    chat.run();
+    assert!(
+        chat.get_by_label("Loaded: rank \u{2264}16 · 1b850494b875")
+            .rect()
+            .is_positive()
+    );
     chat.state_mut().app.show_settings = false;
     chat.run();
 
@@ -652,7 +667,7 @@ fn daisyrose_promoted_readiness_enables_fresh_and_new_conversations_without_clob
     assert!(chat.state().app.daisyrose_enabled);
     assert!((chat.state().app.daisyrose_scale - 1.0).abs() < f32::EPSILON);
 
-    // Tight-RAM shedding on restart marks DaisyRose unavailable and clamps effective scale to 0.0.
+    // Tight-RAM shedding on restart marks DaisyRose unavailable and clears identity metadata.
     chat.state_mut().app.model = ModelLifecycle::Retryable;
     chat.state_mut().app.retry();
     assert!(matches!(
@@ -660,16 +675,42 @@ fn daisyrose_promoted_readiness_enables_fresh_and_new_conversations_without_clob
         Ok(Command::Retry)
     ));
     assert!(!chat.state().app.daisyrose_available);
+    assert_eq!(chat.state().app.daisyrose_max_rank, None);
+    assert_eq!(chat.state().app.daisyrose_sha256_prefix, None);
     chat.state_mut().app.model_event(Event::Starting);
     chat.state_mut().app.model_event(Event::DaisyRoseAvailable(
         client::DaisyRoseReadiness::default(),
     ));
     chat.state_mut().app.model_event(Event::Ready);
     assert!(!chat.state().app.daisyrose_available);
+    assert_eq!(chat.state().app.daisyrose_max_rank, None);
+    assert_eq!(chat.state().app.daisyrose_sha256_prefix, None);
     assert!((chat.state().app.effective_daisyrose_scale() - 0.0).abs() < f32::EPSILON);
     chat.state_mut().app.new_chat();
     assert!(!chat.state().app.daisyrose_enabled);
     assert!((chat.state().app.effective_daisyrose_scale() - 0.0).abs() < f32::EPSILON);
+
+    // Teardown via ModelStopped also clears DaisyRose availability and metadata.
+    chat.state_mut().app.model = ModelLifecycle::Preparing;
+    chat.state_mut()
+        .app
+        .model_event(Event::DaisyRoseAvailable(client::DaisyRoseReadiness {
+            available: true,
+            default_scale_tenths: 10,
+            max_rank: Some(16),
+            sha256_prefix: Some("1b850494b875".to_owned()),
+        }));
+    chat.state_mut().app.model_event(Event::Ready);
+    assert_eq!(chat.state().app.daisyrose_max_rank, Some(16));
+    assert_eq!(
+        chat.state().app.daisyrose_sha256_prefix.as_deref(),
+        Some("1b850494b875")
+    );
+    chat.state_mut().app.model = ModelLifecycle::StoppingModel;
+    chat.state_mut().app.model_event(Event::ModelStopped);
+    assert!(!chat.state().app.daisyrose_available);
+    assert_eq!(chat.state().app.daisyrose_max_rank, None);
+    assert_eq!(chat.state().app.daisyrose_sha256_prefix, None);
 
     // Restoring a saved or legacy conversation before promoted readiness preserves disabled state,
     // while new conversations still initialize to the promoted default.
@@ -695,6 +736,7 @@ fn daisyrose_promoted_readiness_enables_fresh_and_new_conversations_without_clob
             .model_event(Event::DaisyRoseAvailable(client::DaisyRoseReadiness {
                 available: true,
                 default_scale_tenths: 10,
+                ..client::DaisyRoseReadiness::default()
             }));
         restored.app.model_event(Event::Ready);
         assert!(!restored.app.daisyrose_enabled);

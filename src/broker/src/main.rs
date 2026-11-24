@@ -148,7 +148,19 @@ fn launched(args: Vec<OsString>) -> ExitCode {
         };
         let daisyrose_status = if owner.daisyrose_enabled() {
             let tenths = owner.daisyrose_default_scale_tenths();
-            format!("available, default scale {}.{}", tenths / 10, tenths % 10)
+            let rank_part = owner
+                .daisyrose_max_rank()
+                .map(|rank| format!(", rank {rank}"))
+                .unwrap_or_default();
+            let sha_part = owner
+                .daisyrose_sha256()
+                .map(|sha| format!(", sha256 {sha}"))
+                .unwrap_or_default();
+            format!(
+                "available, default scale {}.{tx}{rank_part}{sha_part}",
+                tenths / 10,
+                tx = tenths % 10
+            )
         } else {
             "unavailable".to_owned()
         };

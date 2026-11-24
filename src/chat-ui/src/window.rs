@@ -197,6 +197,8 @@ struct State {
     daisyrose_enabled: bool,
     daisyrose_available: bool,
     daisyrose_default_scale_tenths: u8,
+    daisyrose_max_rank: Option<u16>,
+    daisyrose_sha256_prefix: Option<String>,
     daisyrose_customized: bool,
     cognitive: client::CognitiveOptions,
     cognitive_controls_available: bool,
@@ -371,6 +373,8 @@ impl State {
             daisyrose_enabled: false,
             daisyrose_available: false,
             daisyrose_default_scale_tenths: 0,
+            daisyrose_max_rank: None,
+            daisyrose_sha256_prefix: None,
             daisyrose_customized: false,
             cognitive: client::CognitiveOptions::default(),
             cognitive_controls_available: false,
@@ -453,6 +457,8 @@ impl State {
         state.model = ModelLifecycle::Preparing;
         state.abliteration_enabled = false;
         state.daisyrose_available = false;
+        state.daisyrose_max_rank = None;
+        state.daisyrose_sha256_prefix = None;
         state.record(&format!(
             "Swift Bonsai {}. Data directory: {}",
             env!("CARGO_PKG_VERSION"),
@@ -616,6 +622,8 @@ impl State {
         };
         self.apply_model_config(&config);
         self.daisyrose_default_scale_tenths = 0;
+        self.daisyrose_max_rank = None;
+        self.daisyrose_sha256_prefix = None;
         if !speech_pending {
             self.attach_speech_configuration(&config);
         }
@@ -632,6 +640,8 @@ impl State {
         self.runtime_description = runtime_description(config);
         self.abliteration_enabled = config.use_abliterate_lora;
         self.daisyrose_available = config.daisyrose_lora.is_some();
+        self.daisyrose_max_rank = None;
+        self.daisyrose_sha256_prefix = None;
     }
 
     fn apply_speech_flags(&mut self, config: &Config) {
@@ -717,11 +727,13 @@ impl State {
         );
     }
 
-    const fn reset_model_capabilities(&mut self) {
+    fn reset_model_capabilities(&mut self) {
         self.context_tokens = None;
         self.vision_available = false;
         self.daisyrose_available = false;
         self.daisyrose_default_scale_tenths = 0;
+        self.daisyrose_max_rank = None;
+        self.daisyrose_sha256_prefix = None;
     }
 
     pub(super) fn set_draft_attachments(
@@ -1299,6 +1311,19 @@ impl State {
                 } else {
                     0
                 };
+                self.daisyrose_max_rank = if readiness.available {
+                    readiness.max_rank.filter(|rank| (1..=64).contains(rank))
+                } else {
+                    None
+                };
+                self.daisyrose_sha256_prefix = if readiness.available {
+                    readiness
+                        .sha256_prefix
+                        .as_deref()
+                        .and_then(client::valid_daisyrose_sha256_prefix)
+                } else {
+                    None
+                };
                 if readiness.default_enabled()
                     && !self.daisyrose_customized
                     && self.committed.is_empty()
@@ -1450,8 +1475,7 @@ impl State {
 
     fn stopped_model(&mut self) {
         self.auto_continuing = false;
-        self.context_tokens = None;
-        self.vision_available = false;
+        self.reset_model_capabilities();
         self.model = ModelLifecycle::Stopped;
         self.set_status("Local model stopped.", false);
         self.focus_composer = true;

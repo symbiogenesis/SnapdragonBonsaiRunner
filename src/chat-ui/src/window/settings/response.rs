@@ -96,6 +96,8 @@ impl State {
                         ui,
                         self.daisyrose_available,
                         self.daisyrose_default_scale_tenths,
+                        self.daisyrose_max_rank,
+                        self.daisyrose_sha256_prefix.as_deref(),
                         &mut self.daisyrose_enabled,
                         &mut self.daisyrose_scale,
                         !self.model.busy(),
@@ -203,10 +205,25 @@ fn adapter_preferences(ui: &mut egui::Ui, scale: &mut f32, enabled: bool, editab
     changed
 }
 
+fn loaded_daisyrose_summary(max_rank: Option<u16>, sha256_prefix: Option<&str>) -> Option<String> {
+    match (max_rank, sha256_prefix) {
+        (Some(rank), Some(prefix)) => Some(format!("Loaded: rank \u{2264}{rank} · {prefix}")),
+        (Some(rank), None) => Some(format!("Loaded: rank \u{2264}{rank}")),
+        (None, Some(prefix)) => Some(format!("Loaded: {prefix}")),
+        (None, None) => None,
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrowed UI settings arguments avoid coupling presentation to State."
+)]
 fn daisyrose_preferences(
     ui: &mut egui::Ui,
     available: bool,
     default_scale_tenths: u8,
+    max_rank: Option<u16>,
+    sha256_prefix: Option<&str>,
     enabled: &mut bool,
     scale: &mut f32,
     editable: bool,
@@ -258,6 +275,9 @@ fn daisyrose_preferences(
         "Enable DaisyRose above to adjust its scale.".to_owned()
     };
     ui.label(RichText::new(help).small().weak());
+    if available && let Some(summary) = loaded_daisyrose_summary(max_rank, sha256_prefix) {
+        ui.label(RichText::new(summary).small().weak());
+    }
     changed
 }
 

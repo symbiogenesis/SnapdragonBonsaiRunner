@@ -447,6 +447,7 @@ fn footprint_diagnostics_surface_ptq1_cow_npu_dedup_and_mapped_commit_split()
         evictable_mapped_weight_bytes: 0,
         npu_resident_arena_bytes: 0,
         npu_released_host_pq2_bytes: 0,
+        daisyrose_adapter_bytes: 0,
         branch_checkpoints: 1,
     })
     .ok_or("valid PQ2 divergent baseline")?;
@@ -459,6 +460,7 @@ fn footprint_diagnostics_surface_ptq1_cow_npu_dedup_and_mapped_commit_split()
         evictable_mapped_weight_bytes: WeightPacking::Ptq1_0.weight_bytes(),
         npu_resident_arena_bytes: 0,
         npu_released_host_pq2_bytes: 0,
+        daisyrose_adapter_bytes: 0,
         branch_checkpoints: 1,
     })
     .ok_or("valid PTQ1 CoW estimate")?;
@@ -486,6 +488,7 @@ fn footprint_diagnostics_surface_ptq1_cow_npu_dedup_and_mapped_commit_split()
         evictable_mapped_weight_bytes: 0,
         npu_resident_arena_bytes: 0,
         npu_released_host_pq2_bytes: 0,
+        daisyrose_adapter_bytes: 0,
         branch_checkpoints: 1,
     })
     .ok_or("valid PTQ1 append-only CoW estimate")?;
@@ -502,6 +505,7 @@ fn footprint_diagnostics_surface_ptq1_cow_npu_dedup_and_mapped_commit_split()
         evictable_mapped_weight_bytes: 0,
         npu_resident_arena_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 32 * 1024 * 1024,
         npu_released_host_pq2_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+        daisyrose_adapter_bytes: 0,
         branch_checkpoints: 1,
     })
     .ok_or("valid NPU dedup estimate")?;
@@ -513,6 +517,7 @@ fn footprint_diagnostics_surface_ptq1_cow_npu_dedup_and_mapped_commit_split()
         evictable_mapped_weight_bytes: 0,
         npu_resident_arena_bytes: 0,
         npu_released_host_pq2_bytes: 0,
+        daisyrose_adapter_bytes: 0,
         branch_checkpoints: 1,
     })
     .ok_or("valid CPU comparison estimate")?;
@@ -554,6 +559,7 @@ fn footprint_diagnostics_enforce_branch_checkpoint_dedup_and_mapped_bounds()
             evictable_mapped_weight_bytes: 0,
             npu_resident_arena_bytes: 0,
             npu_released_host_pq2_bytes: 0,
+            daisyrose_adapter_bytes: 0,
             branch_checkpoints: branches,
         })
         .ok_or("valid branch checkpoint count")?;
@@ -579,6 +585,7 @@ fn footprint_diagnostics_enforce_branch_checkpoint_dedup_and_mapped_bounds()
             evictable_mapped_weight_bytes: 0,
             npu_resident_arena_bytes: 0,
             npu_released_host_pq2_bytes: 0,
+            daisyrose_adapter_bytes: 0,
             branch_checkpoints: 9,
         })
         .is_none()
@@ -592,6 +599,7 @@ fn footprint_diagnostics_enforce_branch_checkpoint_dedup_and_mapped_bounds()
             evictable_mapped_weight_bytes: 0,
             npu_resident_arena_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
             npu_released_host_pq2_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+            daisyrose_adapter_bytes: 0,
             branch_checkpoints: 1,
         })
         .is_none()
@@ -605,6 +613,7 @@ fn footprint_diagnostics_enforce_branch_checkpoint_dedup_and_mapped_bounds()
             evictable_mapped_weight_bytes: 0,
             npu_resident_arena_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 1,
             npu_released_host_pq2_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES + 1,
+            daisyrose_adapter_bytes: 0,
             branch_checkpoints: 1,
         })
         .is_none()
@@ -618,6 +627,7 @@ fn footprint_diagnostics_enforce_branch_checkpoint_dedup_and_mapped_bounds()
             evictable_mapped_weight_bytes: WeightPacking::Ptq1_0.fixed_runtime_bytes() + 1,
             npu_resident_arena_bytes: 0,
             npu_released_host_pq2_bytes: 0,
+            daisyrose_adapter_bytes: 0,
             branch_checkpoints: 1,
         })
         .is_none()
@@ -641,10 +651,67 @@ fn context_details_popover_renders_live_footprint_diagnostic() -> Result<(), &'s
             evictable_mapped_weight_bytes: WeightPacking::Pq2_0.weight_bytes(),
             npu_resident_arena_bytes: 0,
             npu_released_host_pq2_bytes: 0,
+            daisyrose_adapter_bytes: 0,
             branch_checkpoints: 1,
         })
         .ok_or("valid default footprint")?,
     );
     assert!(chat.query_by_label(expected.as_str()).is_some());
+    Ok(())
+}
+
+#[test]
+fn daisyrose_adapter_footprint_scales_physical_commit_and_formats_diagnostic_cleanly()
+-> Result<(), &'static str> {
+    assert_eq!(npu_friendly_daisyrose_adapter_bytes(0), None);
+    assert_eq!(npu_friendly_daisyrose_adapter_bytes(65), None);
+    let rank16_bytes = npu_friendly_daisyrose_adapter_bytes(16).ok_or("rank 16 bytes")?;
+    assert_eq!(rank16_bytes, 16 * 4_194_304 + 16 * 1024 * 1024);
+
+    let baseline = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 262_144,
+        weight_packing: WeightPacking::Pq2_0,
+        kv_layout: KvCacheLayout::Rsq4,
+        kv_sharing: KvSharingMode::CowRollback,
+        evictable_mapped_weight_bytes: WeightPacking::Pq2_0.weight_bytes(),
+        npu_resident_arena_bytes: 0,
+        npu_released_host_pq2_bytes: 0,
+        daisyrose_adapter_bytes: 0,
+        branch_checkpoints: 1,
+    })
+    .ok_or("baseline footprint")?;
+    let stacked = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 262_144,
+        weight_packing: WeightPacking::Pq2_0,
+        kv_layout: KvCacheLayout::Rsq4,
+        kv_sharing: KvSharingMode::CowRollback,
+        evictable_mapped_weight_bytes: WeightPacking::Pq2_0.weight_bytes(),
+        npu_resident_arena_bytes: 0,
+        npu_released_host_pq2_bytes: 0,
+        daisyrose_adapter_bytes: rank16_bytes,
+        branch_checkpoints: 1,
+    })
+    .ok_or("stacked DaisyRose footprint")?;
+
+    assert_eq!(
+        stacked.steady_state_physical_bytes - baseline.steady_state_physical_bytes,
+        rank16_bytes
+    );
+    assert_eq!(
+        stacked.private_job_commit_bytes - baseline.private_job_commit_bytes,
+        rank16_bytes
+    );
+    assert!(!format_footprint_diagnostic(&baseline).contains("DaisyRose"));
+    assert!(format_footprint_diagnostic(&stacked).ends_with(" + 80 MiB DaisyRose"));
+
+    let mut chat = harness([680.0, 640.0], "Question");
+    chat.state_mut().app.context_tokens = Some(262_144);
+    chat.state_mut().app.daisyrose_available = true;
+    chat.state_mut().app.daisyrose_max_rank = Some(16);
+    chat.get_by_role_and_label(egui::Role::Button, "Context")
+        .click();
+    chat.run();
+    let expected_live = format_footprint_diagnostic(&stacked);
+    assert!(chat.query_by_label(expected_live.as_str()).is_some());
     Ok(())
 }

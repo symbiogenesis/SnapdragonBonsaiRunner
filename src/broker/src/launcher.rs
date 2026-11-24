@@ -2304,6 +2304,32 @@ impl LaunchedService {
         self.service.daisyrose_default_scale_tenths()
     }
 
+    /// Verified maximum rank (`1..=64`) of the active DaisyRose adapter, if loaded.
+    #[must_use]
+    pub fn daisyrose_max_rank(&self) -> Option<u16> {
+        self.service
+            .daisyrose_enabled()
+            .then(|| {
+                self._daisyrose
+                    .as_ref()
+                    .map(bonsai_artifacts::VerifiedMultiRankAdapter::max_rank)
+            })
+            .flatten()
+    }
+
+    /// Verified lowercase 64-hex `SHA-256` digest of the active DaisyRose adapter, if loaded.
+    #[must_use]
+    pub fn daisyrose_sha256(&self) -> Option<&str> {
+        self.service
+            .daisyrose_enabled()
+            .then(|| {
+                self._daisyrose
+                    .as_ref()
+                    .map(bonsai_artifacts::VerifiedMultiRankAdapter::sha256)
+            })
+            .flatten()
+    }
+
     /// Whether per-request cognitive, sampling, DRY, budget, and logprob controls are active.
     pub const fn cognitive_controls_enabled(&self) -> bool {
         self.service.cognitive_controls_enabled()
