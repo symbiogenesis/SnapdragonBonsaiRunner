@@ -129,8 +129,8 @@
     },
     {
       "path": "src/cpu-policy/src/lib.rs",
-      "bytes": 41933,
-      "sha256": "6c0bbba5bddd4c21e91cf614240968540bcb6993dea0e9cf0d1de4f88c3796f0",
+      "bytes": 42083,
+      "sha256": "a12c16f04e19f2b6a760539ff89bacb44aab1fd9109d6959541619cb306107b9",
       "family": "msvc-unwind"
     },
     {
