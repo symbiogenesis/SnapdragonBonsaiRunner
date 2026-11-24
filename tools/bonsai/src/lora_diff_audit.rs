@@ -109,12 +109,67 @@ impl TargetEnvelope {
 enum SourceSpec {
     #[serde(rename = "pinned-daisyrose")]
     PinnedDaisyrose,
+    #[serde(rename = "pinned-huggingface")]
+    PinnedHuggingFace {
+        #[serde(rename = "candidateRepository")]
+        candidate_repository: String,
+        #[serde(rename = "candidateRevision")]
+        candidate_revision: String,
+        #[serde(rename = "candidateLicense")]
+        candidate_license: String,
+        #[serde(rename = "baseRepository")]
+        base_repository: String,
+        #[serde(rename = "baseRevision")]
+        base_revision: String,
+    },
     LocalDirectories {
         #[serde(rename = "candidateDirectory")]
         candidate_directory: PathBuf,
         #[serde(rename = "baseDirectory")]
         base_directory: PathBuf,
     },
+}
+
+pub(super) fn is_safe_ascii_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+}
+
+pub(super) fn validate_hf_repository(repository: &str, label: &str) -> crate::Result<()> {
+    let valid = repository
+        .split_once('/')
+        .is_some_and(|(owner, name)| is_safe_ascii_atom(owner) && is_safe_ascii_atom(name));
+    if !valid {
+        return Err(format!(
+            "{label} must be owner/name using safe ASCII atoms ([A-Za-z0-9_.-])."
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_commit_revision(revision: &str, label: &str) -> crate::Result<()> {
+    if !crate::identity::is_lower_hex(revision, 40) {
+        return Err(format!(
+            "{label} must be a lowercase 40-character hex commit hash."
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_license(license: &str, label: &str) -> crate::Result<()> {
+    let valid = !license.trim().is_empty()
+        && license.len() <= 64
+        && license.bytes().all(|byte| (0x20..=0x7e).contains(&byte));
+    if !valid {
+        return Err(format!(
+            "{label} must be a non-empty printable ASCII string (<= 64 bytes)."
+        ));
+    }
+    Ok(())
 }
 
 const fn default_true() -> bool {
@@ -620,15 +675,31 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     if !(1..=4).contains(&request.controls.http_concurrency) {
         return Err("controls.httpConcurrency must be in 1..=4.".into());
     }
-    if let SourceSpec::LocalDirectories {
-        candidate_directory,
-        base_directory,
-    } = source
-    {
-        bonsai_artifacts::validate_external_path(candidate_directory).map_err(|e| e.to_string())?;
-        bonsai_artifacts::validate_external_path(base_directory).map_err(|e| e.to_string())?;
-        if !candidate_directory.is_dir() || !base_directory.is_dir() {
-            return Err("Local candidateDirectory and baseDirectory must both exist.".into());
+    match source {
+        SourceSpec::PinnedDaisyrose => {}
+        SourceSpec::PinnedHuggingFace {
+            candidate_repository,
+            candidate_revision,
+            candidate_license,
+            base_repository,
+            base_revision,
+        } => {
+            validate_hf_repository(candidate_repository, "source.candidateRepository")?;
+            validate_commit_revision(candidate_revision, "source.candidateRevision")?;
+            validate_license(candidate_license, "source.candidateLicense")?;
+            validate_hf_repository(base_repository, "source.baseRepository")?;
+            validate_commit_revision(base_revision, "source.baseRevision")?;
+        }
+        SourceSpec::LocalDirectories {
+            candidate_directory,
+            base_directory,
+        } => {
+            bonsai_artifacts::validate_external_path(candidate_directory)
+                .map_err(|e| e.to_string())?;
+            bonsai_artifacts::validate_external_path(base_directory).map_err(|e| e.to_string())?;
+            if !candidate_directory.is_dir() || !base_directory.is_dir() {
+                return Err("Local candidateDirectory and baseDirectory must both exist.".into());
+            }
         }
     }
     match request.operation {
@@ -751,6 +822,26 @@ fn source_summary(source: &SourceSpec) -> Value {
             "base": {
                 "repository": QWEN38_REPO,
                 "revision": QWEN38_REVISION,
+                "baseUrl": HUGGINGFACE_BASE_URL
+            }
+        }),
+        SourceSpec::PinnedHuggingFace {
+            candidate_repository,
+            candidate_revision,
+            candidate_license,
+            base_repository,
+            base_revision,
+        } => json!({
+            "kind": "pinned-huggingface",
+            "candidate": {
+                "repository": candidate_repository,
+                "revision": candidate_revision,
+                "license": candidate_license,
+                "baseUrl": HUGGINGFACE_BASE_URL
+            },
+            "base": {
+                "repository": base_repository,
+                "revision": base_revision,
                 "baseUrl": HUGGINGFACE_BASE_URL
             }
         }),
@@ -1565,6 +1656,26 @@ fn open_sources(
                 per_side_http,
             )?,
         )),
+        SourceSpec::PinnedHuggingFace {
+            candidate_repository,
+            candidate_revision,
+            candidate_license: _,
+            base_repository,
+            base_revision,
+        } => Ok((
+            ShardSource::https(
+                HUGGINGFACE_BASE_URL.to_owned(),
+                candidate_repository.clone(),
+                candidate_revision.clone(),
+                per_side_http,
+            )?,
+            ShardSource::https(
+                HUGGINGFACE_BASE_URL.to_owned(),
+                base_repository.clone(),
+                base_revision.clone(),
+                per_side_http,
+            )?,
+        )),
         SourceSpec::LocalDirectories {
             candidate_directory,
             base_directory,
@@ -2107,6 +2218,31 @@ fn run_audit(request: &Request) -> crate::Result<Value> {
     Ok(receipt)
 }
 
+fn append_source_provenance<'a>(source: &'a SourceSpec, meta: &mut Vec<(&'a str, &'a str)>) {
+    match source {
+        SourceSpec::PinnedDaisyrose => {
+            meta.push(("bonsai.composition.candidate_repo", DAISYROSE_REPO));
+            meta.push(("bonsai.composition.candidate_revision", DAISYROSE_REVISION));
+            meta.push(("bonsai.composition.base_repo", QWEN38_REPO));
+            meta.push(("bonsai.composition.base_revision", QWEN38_REVISION));
+        }
+        SourceSpec::PinnedHuggingFace {
+            candidate_repository,
+            candidate_revision,
+            candidate_license,
+            base_repository,
+            base_revision,
+        } => {
+            meta.push(("bonsai.composition.candidate_repo", candidate_repository));
+            meta.push(("bonsai.composition.candidate_revision", candidate_revision));
+            meta.push(("bonsai.composition.candidate_license", candidate_license));
+            meta.push(("bonsai.composition.base_repo", base_repository));
+            meta.push(("bonsai.composition.base_revision", base_revision));
+        }
+        SourceSpec::LocalDirectories { .. } => {}
+    }
+}
+
 fn run_export_denoised(request: &Request) -> crate::Result<Value> {
     run_export_denoised_with_dims(request, &swift_base_dims_map())
 }
@@ -2383,12 +2519,7 @@ fn run_export_denoised_with_dims(
         ),
         ("bonsai.composition.base_index_sha256", &base_idx.sha256),
     ];
-    if matches!(source, SourceSpec::PinnedDaisyrose) {
-        meta.push(("bonsai.composition.candidate_repo", DAISYROSE_REPO));
-        meta.push(("bonsai.composition.candidate_revision", DAISYROSE_REVISION));
-        meta.push(("bonsai.composition.base_repo", QWEN38_REPO));
-        meta.push(("bonsai.composition.base_revision", QWEN38_REVISION));
-    }
+    append_source_provenance(source, &mut meta);
 
     let written = write_lora_gguf(output_path, export_dtype, global_alpha, &meta, &pairs)?;
     let verification = verify_lora_gguf_with_dims(
@@ -2469,5 +2600,157 @@ pub fn run(request: Value) -> crate::Result<Value> {
         Operation::GenerateLock => readiness::run_generate_lock(&parsed),
         Operation::DrG2Plan => readiness::run_dr_g2_plan(&parsed),
         Operation::DrG2Score => readiness::run_dr_g2_score(&parsed),
+    }
+}
+
+#[cfg(test)]
+mod pinned_huggingface_tests {
+    use super::*;
+
+    const CAND_REV: &str = "0123456789abcdef0123456789abcdef01234567";
+    const BASE_REV: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    #[test]
+    fn pinned_huggingface_plan_provenance_and_validation() -> crate::Result<()> {
+        let valid_source = json!({
+            "kind": "pinned-huggingface",
+            "candidateRepository": "barozp/Qwen3.8-27B-Opus-Distill",
+            "candidateRevision": CAND_REV,
+            "candidateLicense": "Apache-2.0",
+            "baseRepository": "Qwen/Qwen3.8-27B",
+            "baseRevision": BASE_REV,
+        });
+
+        let plan = run(json!({
+            "schemaVersion": 1,
+            "operation": "plan",
+            "source": valid_source.clone(),
+        }))?;
+        assert_eq!(plan["status"], "planned-no-io");
+        assert_eq!(plan["source"]["kind"], "pinned-huggingface");
+        assert_eq!(
+            plan["source"]["candidate"]["repository"],
+            "barozp/Qwen3.8-27B-Opus-Distill"
+        );
+        assert_eq!(plan["source"]["candidate"]["revision"], CAND_REV);
+        assert_eq!(plan["source"]["candidate"]["license"], "Apache-2.0");
+        assert_eq!(plan["source"]["candidate"]["baseUrl"], HUGGINGFACE_BASE_URL);
+        assert_eq!(plan["source"]["base"]["repository"], "Qwen/Qwen3.8-27B");
+        assert_eq!(plan["source"]["base"]["revision"], BASE_REV);
+        assert_eq!(plan["source"]["base"]["baseUrl"], HUGGINGFACE_BASE_URL);
+
+        let spec: SourceSpec = serde_json::from_value(valid_source).map_err(|e| e.to_string())?;
+        let _sources = open_sources(&spec, 4)?;
+        let mut meta = Vec::new();
+        append_source_provenance(&spec, &mut meta);
+        assert_eq!(
+            meta,
+            vec![
+                (
+                    "bonsai.composition.candidate_repo",
+                    "barozp/Qwen3.8-27B-Opus-Distill"
+                ),
+                ("bonsai.composition.candidate_revision", CAND_REV),
+                ("bonsai.composition.candidate_license", "Apache-2.0"),
+                ("bonsai.composition.base_repo", "Qwen/Qwen3.8-27B"),
+                ("bonsai.composition.base_revision", BASE_REV),
+            ]
+        );
+
+        let bad_cases = [
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "Apache-2.0",
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": BASE_REV,
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "../evil",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "Apache-2.0",
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": BASE_REV,
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp/repo/extra",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "Apache-2.0",
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": BASE_REV,
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp/Qwen3.8-27B-Opus-Distill",
+                "candidateRevision": "0123456789ABCDEF0123456789ABCDEF01234567",
+                "candidateLicense": "Apache-2.0",
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": BASE_REV,
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp/Qwen3.8-27B-Opus-Distill",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "   ",
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": BASE_REV,
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp/Qwen3.8-27B-Opus-Distill",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "A".repeat(65),
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": BASE_REV,
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp/Qwen3.8-27B-Opus-Distill",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "Apache-2.0\n",
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": BASE_REV,
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp/Qwen3.8-27B-Opus-Distill",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "Apache-2.0",
+                "baseRepository": "Qwen/.",
+                "baseRevision": BASE_REV,
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp/Qwen3.8-27B-Opus-Distill",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "Apache-2.0",
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": "short",
+            }),
+            json!({
+                "kind": "pinned-huggingface",
+                "candidateRepository": "barozp/Qwen3.8-27B-Opus-Distill",
+                "candidateRevision": CAND_REV,
+                "candidateLicense": "Apache-2.0",
+                "baseRepository": "Qwen/Qwen3.8-27B",
+                "baseRevision": BASE_REV,
+                "extraField": true,
+            }),
+        ];
+        for bad in bad_cases {
+            assert!(
+                run(json!({
+                    "schemaVersion": 1,
+                    "operation": "plan",
+                    "source": bad,
+                }))
+                .is_err()
+            );
+        }
+
+        Ok(())
     }
 }
