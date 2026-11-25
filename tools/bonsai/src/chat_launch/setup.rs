@@ -207,6 +207,24 @@ fn publisher(request: &Request, working: &Path, kind: &str) -> crate::Result<()>
     Ok(())
 }
 
+fn prepare_cached_or_receive(
+    url: &str,
+    path: &Path,
+    bytes: u64,
+    hash: &str,
+    working: &Path,
+    mut receive: impl FnMut(&str, &Path, u64, &str, &Path) -> crate::Result<()>,
+) -> crate::Result<()> {
+    // Cached files with exact locked byte length are cryptographically hashed
+    // and bound via `KIND_VERIFIED_SECTION` immediately by `bonsai-broker`;
+    // skipping Pass-1 single-threaded SHA-256 removes ~7.9 GiB of cold-start I/O,
+    // while missing or size-mismatched files fall through to verified repair.
+    if crate::startup_download::verify_length(path, bytes).is_ok() {
+        return Ok(());
+    }
+    receive(url, path, bytes, hash, working)
+}
+
 pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
     crate::startup_cancel::checkpoint()?;
     let selected = model(request)?;
@@ -257,16 +275,18 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
             } else {
                 "adapter"
             };
-            crate::startup_download::receive_repair_observed(
-                url,
-                path,
-                bytes,
-                hash,
-                working,
-                &mut |activity| artifact_status(working, stage, kind, path, bytes, activity),
-            )
+            prepare_cached_or_receive(url, path, bytes, hash, working, |u, p, b, h, w| {
+                crate::startup_download::receive_repair_observed(
+                    u,
+                    p,
+                    b,
+                    h,
+                    w,
+                    &mut |activity| artifact_status(working, stage, kind, p, b, activity),
+                )
+            })
         },
-        crate::startup_download::verify,
+        |path, bytes, _hash| crate::startup_download::verify_length(path, bytes),
     )
 }
 
@@ -1036,6 +1056,67 @@ mod tests {
         assert_eq!(received[0].1, pinned_b25.path);
         assert_eq!(received[1].1, orca.path);
         assert_eq!(received[2].1, mmproj.path);
+
+        fs::remove_dir_all(working).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn prepare_cached_or_receive_skips_exact_length_and_falls_back_on_missing_or_mismatch()
+    -> crate::Result<()> {
+        let working = std::env::temp_dir().join(format!(
+            "Bonsai-SetupCachedLength-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&working).map_err(|error| error.to_string())?;
+        let artifact = working.join("cached.gguf");
+
+        let mut repairs = 0_usize;
+        prepare_cached_or_receive(
+            "https://huggingface.co/example/resolve/main/cached.gguf",
+            &artifact,
+            5,
+            &"a".repeat(64),
+            &working,
+            |_, _, _, _, _| {
+                repairs += 1;
+                Ok(())
+            },
+        )?;
+        assert_eq!(repairs, 1, "missing file must enter verified receive/repair");
+
+        fs::write(&artifact, b"hello").map_err(|error| error.to_string())?;
+        prepare_cached_or_receive(
+            "https://huggingface.co/example/resolve/main/cached.gguf",
+            &artifact,
+            5,
+            &"a".repeat(64),
+            &working,
+            |_, _, _, _, _| {
+                repairs += 1;
+                Ok(())
+            },
+        )?;
+        assert_eq!(
+            repairs, 1,
+            "exact-length cached file must skip redundant Pass-1 SHA-256/repair"
+        );
+
+        fs::write(&artifact, b"hell").map_err(|error| error.to_string())?;
+        prepare_cached_or_receive(
+            "https://huggingface.co/example/resolve/main/cached.gguf",
+            &artifact,
+            5,
+            &"a".repeat(64),
+            &working,
+            |_, _, _, _, _| {
+                repairs += 1;
+                Ok(())
+            },
+        )?;
+        assert_eq!(
+            repairs, 2,
+            "1-byte length mismatch must enter verified receive/repair"
+        );
 
         fs::remove_dir_all(working).map_err(|error| error.to_string())
     }

@@ -136,6 +136,10 @@ pub struct NariqModelArtifact {
     pub lm_head_bands: u32,
     /// Optional number of banded token embedding matrices (`Some(16)` for `2.0bpw`).
     pub embed_bands: Option<u32>,
+    /// Optional fixed chunk size (`>= 4 MiB`) for parallel mapped SHA-256 verification.
+    pub chunk_bytes: Option<usize>,
+    /// Optional ordered lowercase 64-hex SHA-256 digests covering `0..bytes`.
+    pub chunk_sha256s: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +153,10 @@ struct NariqVariantLock {
     lm_head_bands: u32,
     #[serde(default)]
     embed_bands: Option<u32>,
+    #[serde(default, rename = "chunkBytes")]
+    chunk_bytes: Option<usize>,
+    #[serde(default, rename = "chunkSha256s")]
+    chunk_sha256s: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +261,9 @@ fn nariq_model_artifact_from_lock(
             && entry.embed_bands == expected_embed_bands,
         "NariQ variant lock entry disagrees with compiled identity.",
     )?;
+    let (chunk_bytes, chunk_sha256s) =
+        crate::validate_chunk_manifest(entry.bytes, entry.chunk_bytes, entry.chunk_sha256s)?
+            .map_or((None, None), |(cb, cs)| (Some(cb), Some(cs)));
 
     Ok(NariqModelArtifact {
         path: data
@@ -270,6 +281,8 @@ fn nariq_model_artifact_from_lock(
         tensor_count: entry.tensor_count,
         lm_head_bands: entry.lm_head_bands,
         embed_bands: entry.embed_bands,
+        chunk_bytes,
+        chunk_sha256s,
     })
 }
 
@@ -299,12 +312,78 @@ mod tests {
                 artifact.embed_bands,
                 matches!(variant, NariqVariant::Bpw2_0).then_some(16)
             );
+            assert_eq!(artifact.chunk_bytes, None);
+            assert_eq!(artifact.chunk_sha256s, None);
             assert!(artifact.path.ends_with(variant.filename()));
             assert_eq!(variant.as_str().parse::<NariqVariant>(), Ok(variant));
         }
         assert!("1.5bpw".parse::<NariqVariant>().is_err());
         assert!(nariq_model_artifact(Path::new("relative-data"), NariqVariant::Bpw2_5).is_err());
         assert!(nariq_model_artifact_from_lock(data, NariqVariant::Bpw2_5, "{}").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn nariq_lock_accepts_optional_chunk_manifests_and_rejects_malformed_ones()
+    -> Result<(), String> {
+        let data = Path::new(if cfg!(windows) {
+            r"C:\BonsaiData"
+        } else {
+            "/var/lib/bonsai"
+        });
+        let chunk_bytes: usize = 64 * 1024 * 1024;
+        let chunk_bytes_u64 = u64::try_from(chunk_bytes).map_err(|_| "chunk_bytes overflow")?;
+        let expected_chunks = usize::try_from(
+            NariqVariant::Bpw2_5
+                .weight_bytes()
+                .div_ceil(chunk_bytes_u64),
+        )
+        .map_err(|_| "chunk count overflow")?;
+        let digests = vec!["b".repeat(64); expected_chunks];
+
+        let mut valid: serde_json::Value =
+            serde_json::from_str(NARIQ_LOCK).map_err(|error| error.to_string())?;
+        valid["variants"]["2.5bpw"]["chunkBytes"] = serde_json::json!(chunk_bytes);
+        valid["variants"]["2.5bpw"]["chunkSha256s"] = serde_json::json!(digests);
+        let artifact = nariq_model_artifact_from_lock(
+            data,
+            NariqVariant::Bpw2_5,
+            &serde_json::to_string(&valid).map_err(|error| error.to_string())?,
+        )?;
+        assert_eq!(artifact.chunk_bytes, Some(chunk_bytes));
+        assert_eq!(
+            artifact.chunk_sha256s.as_ref().map(Vec::len),
+            Some(expected_chunks)
+        );
+
+        let mut only_hashes = valid.clone();
+        if let Some(obj) = only_hashes["variants"]["2.5bpw"].as_object_mut() {
+            obj.remove("chunkBytes");
+        }
+        assert!(
+            nariq_model_artifact_from_lock(
+                data,
+                NariqVariant::Bpw2_5,
+                &serde_json::to_string(&only_hashes).map_err(|error| error.to_string())?,
+            )
+            .is_err()
+        );
+
+        let mut uppercase_hex = valid;
+        if let Some(first) = uppercase_hex["variants"]["2.5bpw"]["chunkSha256s"]
+            .as_array_mut()
+            .and_then(|items| items.first_mut())
+        {
+            *first = serde_json::json!("B".repeat(64));
+        }
+        assert!(
+            nariq_model_artifact_from_lock(
+                data,
+                NariqVariant::Bpw2_5,
+                &serde_json::to_string(&uppercase_hex).map_err(|error| error.to_string())?,
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

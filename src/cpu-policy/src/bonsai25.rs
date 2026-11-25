@@ -136,6 +136,10 @@ pub struct Bonsai25ModelArtifact {
     pub tensor_count: usize,
     /// Exact expected `general.file_type` value.
     pub file_type: u64,
+    /// Optional fixed chunk size (`>= 4 MiB`) for parallel mapped SHA-256 verification.
+    pub chunk_bytes: Option<usize>,
+    /// Optional ordered lowercase 64-hex SHA-256 digests covering `0..bytes`.
+    pub chunk_sha256s: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +154,10 @@ struct Bonsai25VariantLock {
     tensor_count: usize,
     file_type: u64,
     runtime_wired: bool,
+    #[serde(default, rename = "chunkBytes")]
+    chunk_bytes: Option<usize>,
+    #[serde(default, rename = "chunkSha256s")]
+    chunk_sha256s: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -333,6 +341,9 @@ fn bonsai25_model_artifact_from_lock(
             && entry.file_type == variant.file_type(),
         "Bonsai 2.5 variant lock entry disagrees with compiled identity.",
     )?;
+    let (chunk_bytes, chunk_sha256s) =
+        crate::validate_chunk_manifest(entry.bytes, entry.chunk_bytes, entry.chunk_sha256s)?
+            .map_or((None, None), |(cb, cs)| (Some(cb), Some(cs)));
 
     Ok(Bonsai25ModelArtifact {
         path: data
@@ -349,6 +360,8 @@ fn bonsai25_model_artifact_from_lock(
         license: parsed.license,
         tensor_count: entry.tensor_count,
         file_type: entry.file_type,
+        chunk_bytes,
+        chunk_sha256s,
     })
 }
 
@@ -371,6 +384,8 @@ mod tests {
             assert_eq!(artifact.tensor_count, 851);
             assert_eq!(artifact.file_type, variant.file_type());
             assert_eq!(artifact.license, "Apache-2.0");
+            assert_eq!(artifact.chunk_bytes, None);
+            assert_eq!(artifact.chunk_sha256s, None);
             assert_eq!(
                 artifact.path,
                 data.join("models")
@@ -402,6 +417,73 @@ mod tests {
                 data,
                 Bonsai25Variant::Ptq1,
                 &BONSAI_2_5_LOCK.replace("\"runtimeWired\": false", "\"runtimeWired\": true"),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bonsai25_lock_accepts_optional_chunk_manifests_and_rejects_malformed_ones()
+    -> Result<(), String> {
+        let data = Path::new(if cfg!(windows) {
+            r"C:\BonsaiData"
+        } else {
+            "/var/lib/bonsai"
+        });
+        let chunk_bytes: usize = 64 * 1024 * 1024;
+        let chunk_bytes_u64 = u64::try_from(chunk_bytes).map_err(|_| "chunk_bytes overflow")?;
+        let expected_chunks =
+            usize::try_from(Bonsai25Variant::Pq2.weight_bytes().div_ceil(chunk_bytes_u64))
+                .map_err(|_| "chunk count overflow")?;
+        let digests = vec!["a".repeat(64); expected_chunks];
+
+        let mut valid: serde_json::Value =
+            serde_json::from_str(BONSAI_2_5_LOCK).map_err(|error| error.to_string())?;
+        valid["variants"]["pq2"]["chunkBytes"] = serde_json::json!(chunk_bytes);
+        valid["variants"]["pq2"]["chunkSha256s"] = serde_json::json!(digests);
+        let artifact = bonsai25_model_artifact_from_lock(
+            data,
+            Bonsai25Variant::Pq2,
+            &serde_json::to_string(&valid).map_err(|error| error.to_string())?,
+        )?;
+        assert_eq!(artifact.chunk_bytes, Some(chunk_bytes));
+        assert_eq!(
+            artifact.chunk_sha256s.as_ref().map(Vec::len),
+            Some(expected_chunks)
+        );
+
+        let mut only_size = valid.clone();
+        if let Some(obj) = only_size["variants"]["pq2"].as_object_mut() {
+            obj.remove("chunkSha256s");
+        }
+        assert!(
+            bonsai25_model_artifact_from_lock(
+                data,
+                Bonsai25Variant::Pq2,
+                &serde_json::to_string(&only_size).map_err(|error| error.to_string())?,
+            )
+            .is_err()
+        );
+
+        let mut wrong_count = valid.clone();
+        wrong_count["variants"]["pq2"]["chunkSha256s"] = serde_json::json!(["a".repeat(64)]);
+        assert!(
+            bonsai25_model_artifact_from_lock(
+                data,
+                Bonsai25Variant::Pq2,
+                &serde_json::to_string(&wrong_count).map_err(|error| error.to_string())?,
+            )
+            .is_err()
+        );
+
+        let mut sub_4mib = valid;
+        sub_4mib["variants"]["pq2"]["chunkBytes"] = serde_json::json!(1024_u64 * 1024);
+        assert!(
+            bonsai25_model_artifact_from_lock(
+                data,
+                Bonsai25Variant::Pq2,
+                &serde_json::to_string(&sub_4mib).map_err(|error| error.to_string())?,
             )
             .is_err()
         );

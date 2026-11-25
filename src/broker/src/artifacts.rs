@@ -214,8 +214,8 @@ impl VerifiedArtifacts {
             &artifact.path,
             artifact.bytes,
             &artifact.sha256,
-            None,
-            None,
+            artifact.chunk_bytes,
+            artifact.chunk_sha256s.as_deref(),
         )
         .inspect_err(|error| {
             let mut err = std::io::stderr().lock();
@@ -248,8 +248,8 @@ impl VerifiedArtifacts {
             &artifact.path,
             artifact.bytes,
             &artifact.sha256,
-            None,
-            None,
+            artifact.chunk_bytes,
+            artifact.chunk_sha256s.as_deref(),
         )
         .inspect_err(|error| {
             let mut err = std::io::stderr().lock();
