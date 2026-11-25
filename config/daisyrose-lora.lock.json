@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "envelope": "npu-friendly",
+  "dtype": "f16",
+  "maxRank": 16,
+  "targetCount": 128,
+  "bytes": 66930944,
+  "sha256": "ba307a5f60372c69c2f4b773cc04771933a5db16b09aa5bc754b05743a7bc5d0",
+  "baseModelSha256": "103a11c94324029d8bae3f8152f30bba414730064cfb77438f8589db72e1aa85",
+  "defaultEnabled": false,
+  "defaultScaleTenths": 10
+}

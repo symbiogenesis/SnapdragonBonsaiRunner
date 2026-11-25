@@ -85,9 +85,16 @@ https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF
 (revision 17886395feb8a752b5ca5f02ad0c25543950915e). Retain upstream license
 and base-model attributions when redistributing weights.
 
-Optional Ternary Bonsai 2.5 27B GGUF artifacts (when separately provisioned via
+Ternary Bonsai 2.5 27B GGUF artifacts (now the native Rust default via
 config/bonsai-2-5-27b.lock.json) derive from Qwen3.8-27B by Alibaba Cloud and
 are distributed by PrismML under Apache License 2.0 at
 https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF
 (revision 28a7093cc25bc151cc2b284c5570f12ce343fdcf). Retain upstream license,
 NOTICE, and base-model attributions when redistributing weights.
+
+Pinned stackable DaisyRose multi-rank LoRA artifact (config/daisyrose-lora.lock.json,
+daisyrose-npu-r16-drw1.gguf, SHA-256 ba307a5f60372c69c2f4b773cc04771933a5db16b09aa5bc754b05743a7bc5d0)
+is spectral-denoised and directly weight-edited (DR-E1/DR-W1) from RadixArk/DaisyRose-27B
+(revision 64a4ec665091bb0c1931babce4e97e686eef3c5c, Apache License 2.0) minus
+Qwen/Qwen3.8-27B (revision 37561816e66b5b9153b1b64c10968c18c1e6f4a0, Apache License 2.0).
+Retain Apache-2.0 notices and upstream attribution when redistributing adapter weights.

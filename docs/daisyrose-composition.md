@@ -389,27 +389,37 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
      `REVIEWED_0_1_35`
      (`("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839")`) now enables
      `MULTI_RANK_LORA_RELEASE`, `RSQ4KVF_RELEASE`, `NARIQ_TRELLIS_RELEASE`, and
-     `BONSAI_2_5_RELEASE` (`K4V3_CONTEXT_RELEASE` remains `None`), while
-     `pinned_daisyrose_lora_artifact` in [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs)
-     continues to return `Ok(None)` pending a qualified `config/daisyrose-lora.lock.json`
-     and owner `DR-G2` review.
-   - **Trials #2 & #3 + delegated blinded review ([bonsai-2-5-x2-vet.md](evidence/bonsai-2-5-x2-vet.md)):**
+     `BONSAI_2_5_RELEASE` (`K4V3_CONTEXT_RELEASE` remains `None`).
+     [daisyrose-lora.lock.json](../config/daisyrose-lora.lock.json) pins
+     `daisyrose-npu-r16-drw1.gguf` (`ba307a5f...`, `scale 1.0`, `baseModelSha256`
+     matching `Ternary-Bonsai-2.5-27B-PQ2_0.gguf`, `defaultEnabled: false`
+     pending immutable remote HTTPS `source`), and
+     `DaisyRoseLoraArtifact::pinned_for_base_sha256` in
+     [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs) auto-attaches it on the
+     native `Ternary-Bonsai-2.5-27B-PQ2_0` (Orca-free) default when present and
+     verified locally (`pinned_daisyrose_lora_artifact` keeps `Ok(None)` without
+     a remote `source`).
+   - **Trials #2–#4 + delegated blinded review ([bonsai-2-5-x2-vet.md](evidence/bonsai-2-5-x2-vet.md)):**
      On `bonsai-2.5-pq2` Orca-free + `daisyrose-npu-r16-drw1.gguf` (`scale 1.0`,
      `reasoningEffort: "medium"`, `reasoningBudget: 448`), Trial #2 (`886.959 s`,
      `900 s` AC allowance) sealed zero-scale parity (`0` mismatches) and `3/3`
-     Thinking-ON pairs (`4b221d19...`) while skipping `creative-b25-001` on the
-     budget guard; Trial #3 (`138.826 s`, `300 s` AC allowance) captured
-     `creative-b25-001` (`thinkingOff`) via pure-Rust `supplementEvidencePath`
-     and sealed the complete `4/4` blind packet (`6dc82c06...`). Owner-delegated
-     blinded scoring (`reviewerId: "agent-delegated-by-owner"`, pre-unblinding
-     scores applied via `dr-g2-apply-reviews` and scored via `dr-g2-score`,
-     receipt `9d8e9a71...`) returned **`drG2Passed: false` (No-Go for default flip today)**:
-     `3/4` gates passed (`capabilityGain` `+0.8333` with `coding` `+1.5`, `reasoning`
-     `+1.0`, `instruction-following` `0.0`; `antiLoopingPreservation` `474 / 472 = 1.0042x`,
-     `0` loops/truncations; `zeroScaleIdentity` `0/1` mismatches), while Gate 3
-     (`creativeAndOrcaNonRegression`) failed strictly (`3.2 < 3.5` on `n = 1`
-     `creative-b25-001`, though clearing the `>= 3.0` floor with `0` refusals).
-     Default remains `Swift-Bonsai-2-PQ2_0` + Orca.
+     Thinking-ON pairs (`4b221d19...`). Trial #3 (`138.826 s`, `300 s` AC)
+     merged `n = 1` Thinking-OFF `creative-b25-001` (`6dc82c06...`), returning
+     `drG2Passed: false` (`9d8e9a71...`, `3.2 < 3.5`). Bounded disjoint `n = 3`
+     Thinking-OFF Trial #4 (`459.898 s <= 540 s` AC, `creative-b25-002..004`
+     merged against sealed Trial #2 into `c708ef98...`, receipt `eff37bb1...`,
+     owner-delegated blinded `reviewerId: "agent-delegated-by-owner"` applied via
+     `dr-g2-apply-reviews` / `dr-g2-score`) returned **`drG2Passed: true`** across
+     all `4/4` gates: `capabilityGain` `+0.8333` (`3.1667` vs `2.3333`; `coding`
+     `+1.5`, `reasoning` `+1.0`, `IF` `0.0`), `antiLoopingPreservation`
+     `474 / 472 = 1.0042x` (`0` loops/truncations),
+     `creativeAndOrcaNonRegression` candidate beat baseline on `3/3` prompts
+     (`3.4` vs `3.1`, `3.6` vs `2.2`, `3.5` vs `3.2`; median `3.5 >= 3.1`,
+     `min = 3.4 >= 3.0`, `0` refusals), and `zeroScaleIdentity` (`0/1`
+     mismatches). `Ternary-Bonsai-2.5-27B-PQ2_0` (Orca-free, 100% Apache-2.0) +
+     local-verified DaisyRose (`scale 1.0`) is now the native Rust default,
+     preserving `Swift-Bonsai-2-PQ2_0` + Orca rollback via `--use-original-pq2`
+     / `--publisher-engine`.
    - **Newly landed `DR-C1` work in `..\prism-inference`:**
      - `examples/swift_model_check.rs`, `examples/swift_model_check/request_timing.rs`,
        and `examples/swift_model_check/ffn_timing.rs` support `--nariq`
@@ -484,17 +494,18 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
      and is sealed as
      `packetSha256 = 399d08ed0fa685b8bccc3f1cddfdaeb59134f142d24c94ecf796f45535e9558a`
      awaiting owner blinded review (`humanReviewed = true`) and fail-closed
-     `dr-g2-score` to decide default-on promotion vs categorical no-go, while the
-     `bonsai-2.5-pq2` `6dc82c06...` packet completed delegated blinded scoring
-     (`9d8e9a71...`, **`drG2Passed: false`**: `3/4` gates passed with `+0.8333`
-     Thinking-ON gain, failed Gate 3 `3.2 < 3.5` on `n = 1` Thinking-OFF). Prism
-     `v0.1.35` (`3bc76f135bf23c538b3bb789aef382143ff36839`) is now pinned with
-     `MULTI_RANK_LORA_RELEASE`, `RSQ4KVF_RELEASE`, `NARIQ_TRELLIS_RELEASE`, and
-     `BONSAI_2_5_RELEASE` enabled; before any default flip, a passing disjoint
-     Thinking-OFF screen or `DR-W1` pass + independent human review, immutable remote
-     hosting + `config/daisyrose-lora.lock.json` (`pinned_daisyrose_lora_artifact`),
-     matched-power full-adapter X1/X2 device qualification under
-     [validation](validation.md) and
+     `dr-g2-score` to decide default-on promotion vs categorical no-go, while on
+     `bonsai-2.5-pq2`, Trial #4 (`c708ef98...`, `eff37bb1...`) passed `4/4` `DR-G2`
+     gates under delegated blinded review (following Trial #3 `6dc82c06...`
+     `n = 1` Gate 3 miss `9d8e9a71...`). Prism `v0.1.35`
+     (`3bc76f135bf23c538b3bb789aef382143ff36839`) is pinned and
+     [daisyrose-lora.lock.json](../config/daisyrose-lora.lock.json) + native
+     `Ternary-Bonsai-2.5-27B-PQ2_0` (Orca-free) + local-verified DaisyRose
+     (`scale 1.0`) are wired by default (`Swift-Bonsai-2-PQ2_0` + Orca retained
+     via rollback flags). Before clean-install automatic download can be enabled
+     (`defaultEnabled: true`), immutable remote hosting (`huggingface`/
+     `github-release`) + independent human review, matched-power full-adapter
+     X1/X2 device qualification under [validation](validation.md) and
      [Swift LoRA qualification](swift-lora.md#standard-profile-qualification),
      and owning CI (`source-checks`, `foundation`) remain open.
 
@@ -608,10 +619,14 @@ bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"generate-lo
    now pinned to `REVIEWED_0_1_35`
    (`0.1.35`, `3bc76f135bf23c538b3bb789aef382143ff36839`) in
    [prism-inference.lock.json](../config/prism-inference.lock.json).
-2. Commit the `generate-lock` output as `config/daisyrose-lora.lock.json` and
-   wire `include_str!("../../../config/daisyrose-lora.lock.json")` into
-   `pinned_daisyrose_lora_artifact` in
-   [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs).
+2. [daisyrose-lora.lock.json](../config/daisyrose-lora.lock.json) is committed
+   with exact schema-1 `bonsai-2.5-pq2` identity (`defaultScaleTenths: 10`,
+   `defaultEnabled: false` pending immutable remote `source`) and wired into
+   `DaisyRoseLoraArtifact::pinned_for_base_sha256` in
+   [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs) for local-verified
+   auto-attach on native `Ternary-Bonsai-2.5-27B-PQ2_0` (updating
+   `source` + `defaultEnabled: true` via `generate-lock` once uploaded to an
+   immutable remote host enables `pinned_daisyrose_lora_artifact` auto-download).
 3. Add `config/daisyrose-lora.lock.json` to `package_inputs` (`bonsai-cpu-policy`
    and `bonsai-tools`) and `groups.release.paths` in
    [impact.json](../.github/ci/impact.json), and add the Apache-2.0 artifact

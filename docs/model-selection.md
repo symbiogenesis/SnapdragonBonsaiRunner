@@ -112,8 +112,10 @@ neither Adreno/Hexagon behavior nor local disk latency; use the existing
 [nariq-qwen38.lock.json](../config/nariq-qwen38.lock.json) pins the Apache-2.0
 [`nari-labs/Qwen3.8-27B-NariQ-GGUF`](https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF)
 repository at revision `17886395feb8a752b5ca5f02ad0c25543950915e` as an opt-in
-native CPU representation (`--nariq 2.5bpw|3.0bpw|2.0bpw`), keeping
-`Swift-Bonsai-2-PQ2_0` + Orca (+ DaisyRose) unchanged as the default:
+native CPU representation (`--nariq 2.5bpw|3.0bpw|2.0bpw`), while native Rust chat
+defaults to `Ternary-Bonsai-2.5-27B-PQ2_0` (Orca-free) + local-verified DaisyRose
+(`Swift-Bonsai-2-PQ2_0` + Orca remains available via `--use-original-pq2` /
+`--publisher-engine` rollback):
 
 | Variant | Filename | Bytes | SHA-256 | Tensors | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -130,13 +132,17 @@ offload, and uncalibrated fallback sizing, and is broker-enabled on pinned Prism
 `0.1.35` (`NARIQ_TRELLIS_RELEASE`), with full X1/X2 device and quality
 qualification still pending.
 
-## Opt-in Ternary Bonsai 2.5 27B representations
+## Native default Ternary Bonsai 2.5 27B representations
 
 [bonsai-2-5-27b.lock.json](../config/bonsai-2-5-27b.lock.json) pins the Apache-2.0
 [`prism-ml/Ternary-Bonsai-2.5-27B-GGUF`](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF)
-repository at revision `28a7093cc25bc151cc2b284c5570f12ce343fdcf` as an opt-in
-native representation (`--bonsai-2-5 pq2|ptq1`), keeping
-`Swift-Bonsai-2-PQ2_0` + Orca (+ DaisyRose) unchanged as the default:
+repository at revision `28a7093cc25bc151cc2b284c5570f12ce343fdcf`. On native
+Rust (`--native-engine`), **`Ternary-Bonsai-2.5-27B-PQ2_0` (Orca-free, 100%
+Apache-2.0)** + local-verified `daisyrose-npu-r16-drw1.gguf` (`scale 1.0`,
+[daisyrose-lora.lock.json](../config/daisyrose-lora.lock.json)) is now the
+default (`--bonsai-2-5 ptq1` selects `PTQ1_0`; `--use-abliterate-lora` opts into
+Orca `1.3`; `--use-original-pq2` and `--publisher-engine` retain
+`Swift-Bonsai-2-PQ2_0` + Orca rollback):
 
 | Variant | Filename | Bytes | SHA-256 | Tensors | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -152,7 +158,7 @@ Vulkan / Composite placement, and bit-identical `mmproj` Vision, while allowing
 Orca (`scale 1.3`) and `MultiRankAdapter` (`DaisyRose-27B`) stacking either
 Orca-free or Orca-stacked. Runtime launch is broker-enabled on pinned Prism
 `0.1.35` (`BONSAI_2_5_RELEASE = REVIEWED_0_1_35`, `3bc76f135bf23c538b3bb789aef382143ff36839`);
-bounded X2 Trial #1 (`106.1 s`) verified `PTQ1_0` (`-1.173 GiB` Peak WS, `8/8` greedy parity, slower warm decode `226.3 ms/tok`) vs `PQ2_0` (`177.8 ms/tok` warm decode), Orca `1.3` digest parity on both, and DaisyRose `r16` `:0.0` bit-exactness / `:1.0` `+4.30%` overhead / `6/6` rollback. For `DR-G2` thinking-mode captures on `bonsai-2.5-pq2`, prefer `reasoningEffort: "medium"` (`reasoningBudget: 448`), noting `low` is unsupported upstream; `Swift-Bonsai-2-PQ2_0` + Orca remains default until owner `DR-G2` review and full X1/X2 acceptance close, and reserved `866`-tensor `*-mtp` (`nextn_predict_layers = 1`) speculative draft checkpoints target `v0.1.36+` (see [Bonsai 2.5 X2 vetting](evidence/bonsai-2-5-x2-vet.md)).
+bounded X2 Trial #1 (`106.1 s`) verified `PTQ1_0` (`-1.173 GiB` Peak WS, `8/8` greedy parity, slower warm decode `226.3 ms/tok`) vs `PQ2_0` (`177.8 ms/tok` warm decode), Orca `1.3` digest parity on both, and DaisyRose `r16` `:0.0` bit-exactness / `:1.0` `+4.30%` overhead / `6/6` rollback, and Trial #4 (`459.9 s` AC `n = 3` disjoint Thinking-OFF supplement merged with Trial #2) passed `4/4` `DR-G2` gates under delegated blinded review (`drG2Passed: true`, `eff37bb1...`). For `DR-G2` thinking-mode captures on `bonsai-2.5-pq2`, prefer `reasoningEffort: "medium"` (`reasoningBudget: 448`), noting `low` is unsupported upstream; clean installs without local DaisyRose degrade to standalone `Ternary-Bonsai-2.5-27B-PQ2_0` until remote hosting populates `config/daisyrose-lora.lock.json`, independent human review and full X1/X2 acceptance remain open, and reserved `866`-tensor `*-mtp` (`nextn_predict_layers = 1`) speculative draft checkpoints target `v0.1.36+` (see [Bonsai 2.5 X2 vetting](evidence/bonsai-2-5-x2-vet.md)).
 
 ## Stop and reopen conditions
 
