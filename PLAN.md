@@ -528,7 +528,10 @@ adoption decisions without displacing native daily-use acceptance.
   transfer queues, terminal completion and cancellation before publication/reuse.
   Qualify fault paths, resources and whole-request benefit.
 - [ ] Consider FP32 factor buffers or SpecLA/TreeWY/RecoverSSM recovery only for
-  measured state/checkpoint cost; preserve complete checkpoints and numerical scope.
+  measured state/checkpoint cost; preserve complete checkpoints and numerical scope,
+  and require a `T15` Crouzeix numerical-range error certificate
+  ([open math conjectures](docs/open-math-conjectures.md#gated-deltanet-non-normal-stability-and-recurrent-state-capacity))
+  before implementing any truncated-Neumann / multiplication-only GDN inverse approximation.
   Deferred screening items `#35` (shared drafter embeddings/head), `#37` (checkpointable
   delayed recurrent updates / `ReplaySSM`) and `#38` (transactional grammar speculation)
   likewise require explicit weight/feature/mask identity, atomic KV/GDN/convolution/sampler
@@ -1946,7 +1949,9 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   physical NPU device qualification and release lock promotion remain open.)
 - [ ] **#42 — Pipelined DMA, HVX preparation and HMX chunkwise GDN.** Gate under an
   explicit separate numerical profile (HMX FP16 intermediates do not preserve the
-  FP32 GDN contract) with a small-token CPU/HVX fallback.
+  FP32 GDN contract) with a small-token CPU/HVX fallback and a `T15` Crouzeix
+  numerical-range error certificate (`docs/open-math-conjectures.md#gated-deltanet-non-normal-stability-and-recurrent-state-capacity`)
+  for any truncated-Neumann chunkwise approximation.
 - [ ] **#43 — Device-side explicit async storage fences.** Extend implicit-storage
   dependency tracking and terminal-completion transfer batching to Adreno/Hexagon
   async arenas (CPU `GraphAllocator` multi-hop view/alias liveness is already landed).
@@ -1988,15 +1993,25 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   behavior, rollback/freeze rejection and recovery before changing release
   publication or the installed updater. Current checksums remain within GitHub's
   trust boundary; this research does not establish signing or authenticity.
+- [ ] **Closed 2026 foundational-proof research boundary.** Keep the October–November 2026
+  Anthropic, OpenAI and Google Cogentic proof releases (RH/GRH, Navier–Stokes,
+  `VP != VNP`, `ETH`, `omega = 9/4`, sub-`n log n` FFT, `3SUM`/`APSP`, factoring/games
+  recorded in [open math conjectures](docs/open-math-conjectures.md)) closed for
+  inference-engine implementation unless a finite-size, numerically stable,
+  low-constant construction meets Swift's geometry and matched-power acceptance gates.
 
 ## Future Qwen MoE migration
 
 - [ ] After Qwen 4 and the corresponding Bonsai upgrade are available,
   authenticate actual architecture/artifacts and establish native Rust support.
 - [ ] Evaluate justified expert capacity/tiering and download-space preflight
-  under the [conditional MoE design](docs/model-selection.md#conditional-future-bonsai-moe-design),
-  then qualify state/resources, quality, Stop/Retry, cleanup, native application
-  behavior and practical benefit with explicit Swift rollback.
+  under the [conditional MoE design](docs/model-selection.md#conditional-future-bonsai-moe-design)
+  (using `OpenAI 110` weighted `k`-server competitive bounds in
+  [open math conjectures](docs/open-math-conjectures.md#kv-compression-dimension-reduction-online-paging-and-space-time)
+  only as a conditional reference for large-`k` tiered expert/KV eviction while
+  preserving deterministic policy controls), then qualify state/resources,
+  quality, Stop/Retry, cleanup, native application behavior and practical benefit
+  with explicit Swift rollback.
 
 ## Deferred Prism migration
 
