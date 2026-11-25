@@ -226,7 +226,7 @@ try {
     if ($KvCache) { $launchArguments += @('--kv-cache', $KvCache.ToLowerInvariant()) }
     if ($PSBoundParameters.ContainsKey('CpuPrefillTokens')) {
         $launchArguments += @('--cpu-prefill-tokens', [string]$CpuPrefillTokens)
-    } elseif ($nativeActive -and -not $suffixSpec -and -not $CpuPrefillGdn) {
+    } elseif ($nativeActive -and -not $suffixSpec) {
         $launchArguments += @('--cpu-prefill-tokens', '16')
     }
     if ($CpuPrefillGdn) {
