@@ -386,13 +386,21 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
    `MultiRankAdapter` runtime wiring (`DR-C1` in `prism-inference`) and Runner
    artifact/policy/UI integration (`DR-C2`) are implemented locally:
    - **Pin status:** In [inference.rs](../src/broker/src/inference.rs),
-     `MULTI_RANK_LORA_RELEASE` is already enabled and set to `REVIEWED_0_1_34`
-     (`("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370")`), while
+     `REVIEWED_0_1_35`
+     (`("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839")`) now enables
+     `MULTI_RANK_LORA_RELEASE`, `RSQ4KVF_RELEASE`, `NARIQ_TRELLIS_RELEASE`, and
+     `BONSAI_2_5_RELEASE` (`K4V3_CONTEXT_RELEASE` remains `None`), while
      `pinned_daisyrose_lora_artifact` in [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs)
-     continues to return `Ok(None)` pending a qualified `config/daisyrose-lora.lock.json`,
-     and `NARIQ_TRELLIS_RELEASE` (alongside `RSQ4KVF_RELEASE` and
-     `K4V3_CONTEXT_RELEASE`) remains `None` pending a published Prism `v0.1.35+`
-     release bundle.
+     continues to return `Ok(None)` pending a qualified `config/daisyrose-lora.lock.json`
+     and owner `DR-G2` review.
+   - **Trial #2 update ([bonsai-2-5-x2-vet.md](evidence/bonsai-2-5-x2-vet.md)):**
+     On `bonsai-2.5-pq2` Orca-free + `daisyrose-npu-r16-drw1.gguf` (`scale 1.0`,
+     `reasoningEffort: "medium"`, `reasoningBudget: 448`, `900 s` AC allowance),
+     zero-scale parity (`0` mismatches) and `3/3` Thinking-ON pairs completed in
+     `886.959 s` (`itemCount: 3`, sealed packet `4b221d19...`; `dr-g2-blind-key.json`
+     and `dr-g2-responses.json` unopened), while `creative-b25-001`
+     (`thinkingOff`) was cleanly skipped by the remaining-budget guard and requires
+     a separate AC-budgeted capture before running `dr-g2-score`.
    - **Newly landed `DR-C1` work in `..\prism-inference`:**
      - `examples/swift_model_check.rs`, `examples/swift_model_check/request_timing.rs`,
        and `examples/swift_model_check/ffn_timing.rs` support `--nariq`
@@ -467,16 +475,16 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
      and is sealed as
      `packetSha256 = 399d08ed0fa685b8bccc3f1cddfdaeb59134f142d24c94ecf796f45535e9558a`
      awaiting owner blinded review (`humanReviewed = true`) and fail-closed
-     `dr-g2-score` to decide default-on promotion vs categorical no-go. If
-     promoted, immutable remote hosting + `config/daisyrose-lora.lock.json`
-     (`pinned_daisyrose_lora_artifact`), optional Prism `v0.1.35+` release
-     publication and repin in `config/prism-inference.lock.json` (for
-     `NARIQ_TRELLIS_RELEASE`, `RSQ4KVF_RELEASE`, and the new `DR-C1`
-     parity/timing updates; `MULTI_RANK_LORA_RELEASE` is already enabled on
-     `0.1.34`), matched-power full-adapter X1/X2 device qualification under
+     `dr-g2-score` to decide default-on promotion vs categorical no-go. Prism
+     `v0.1.35` (`3bc76f135bf23c538b3bb789aef382143ff36839`) is now pinned with
+     `MULTI_RANK_LORA_RELEASE`, `RSQ4KVF_RELEASE`, `NARIQ_TRELLIS_RELEASE`, and
+     `BONSAI_2_5_RELEASE` enabled; if promoted, immutable remote hosting +
+     `config/daisyrose-lora.lock.json` (`pinned_daisyrose_lora_artifact`),
+     matched-power full-adapter X1/X2 device qualification under
      [validation](validation.md) and
      [Swift LoRA qualification](swift-lora.md#standard-profile-qualification),
-     and owning CI (`source-checks`, `foundation`) remain open.
+     a separate Thinking-OFF creative capture on `bonsai-2.5-pq2` plus owner
+     blinded `DR-G2` review, and owning CI (`source-checks`, `foundation`) remain open.
 
 ## Zero-retraining workflow, direct-edit fallback, and promotion checklist
 
@@ -583,15 +591,11 @@ bonsai-tools lora-diff-audit --json '{"schemaVersion":1,"operation":"generate-lo
 
 ### Default-on promotion flip checklist
 
-1. `MULTI_RANK_LORA_RELEASE` in [inference.rs](../src/broker/src/inference.rs)
-   is already enabled on `REVIEWED_0_1_34`
-   (`0.1.34`, `c64c9648f85ac4c99ff8d57f709871b31e785370`); publish a
-   `prism-inference` `v0.1.35+` bundle via Foundation to pick up the NariQ
-   trellis runtime and the new `DR-C1` parity/timing updates, verify and pin it
-   in [prism-inference.lock.json](../config/prism-inference.lock.json) via
-   `bonsai-tools inference-lock`, and update `MULTI_RANK_LORA_RELEASE` /
-   `NARIQ_TRELLIS_RELEASE` in [inference.rs](../src/broker/src/inference.rs) to
-   that exact `(version, commit)` tuple.
+1. `MULTI_RANK_LORA_RELEASE`, `RSQ4KVF_RELEASE`, `NARIQ_TRELLIS_RELEASE`, and
+   `BONSAI_2_5_RELEASE` in [inference.rs](../src/broker/src/inference.rs) are
+   now pinned to `REVIEWED_0_1_35`
+   (`0.1.35`, `3bc76f135bf23c538b3bb789aef382143ff36839`) in
+   [prism-inference.lock.json](../config/prism-inference.lock.json).
 2. Commit the `generate-lock` output as `config/daisyrose-lora.lock.json` and
    wire `include_str!("../../../config/daisyrose-lora.lock.json")` into
    `pinned_daisyrose_lora_artifact` in

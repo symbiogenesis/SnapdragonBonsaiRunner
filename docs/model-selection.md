@@ -126,9 +126,9 @@ SHA-256 `8832425f593068d3278e08eda4c1591072c7a2d8dc90f21e4f86394e4b2eb002`) as a
 reserved text-excluded projector (runtime vision remains disabled for NariQ).
 Native CPU NariQ stacks with `MultiRankAdapter` (DaisyRose) and Prism's
 `K4/V4` (`rsq4`) KV cache, excludes Orca `abliterate_lora`, Vulkan/Hexagon
-offload, and uncalibrated fallback sizing, and remains broker-gated on
-`NARIQ_TRELLIS_RELEASE = None` until a compatible Prism release bundle and
-matched X1/X2 qualification complete.
+offload, and uncalibrated fallback sizing, and is broker-enabled on pinned Prism
+`0.1.35` (`NARIQ_TRELLIS_RELEASE`), with full X1/X2 device and quality
+qualification still pending.
 
 ## Opt-in Ternary Bonsai 2.5 27B representations
 
@@ -150,9 +150,9 @@ Unlike NariQ, Bonsai 2.5 preserves `qwen35` geometry, Hadamard sign transforms,
 tokenizer/template (`c3cf9e34...`), Hexagon NPU `PQ2`/`PTQ1` FFN fusion, Adreno
 Vulkan / Composite placement, and bit-identical `mmproj` Vision, while allowing
 Orca (`scale 1.3`) and `MultiRankAdapter` (`DaisyRose-27B`) stacking either
-Orca-free or Orca-stacked. Runtime launch remains broker-gated on
-`BONSAI_2_5_RELEASE = None` until a `v0.1.35+` Prism release bundle and
-matched X1/X2 qualification complete.
+Orca-free or Orca-stacked. Runtime launch is broker-enabled on pinned Prism
+`0.1.35` (`BONSAI_2_5_RELEASE = REVIEWED_0_1_35`, `3bc76f135bf23c538b3bb789aef382143ff36839`);
+bounded X2 Trial #1 (`106.1 s`) verified `PTQ1_0` (`-1.173 GiB` Peak WS, `8/8` greedy parity, slower warm decode `226.3 ms/tok`) vs `PQ2_0` (`177.8 ms/tok` warm decode), Orca `1.3` digest parity on both, and DaisyRose `r16` `:0.0` bit-exactness / `:1.0` `+4.30%` overhead / `6/6` rollback. For `DR-G2` thinking-mode captures on `bonsai-2.5-pq2`, prefer `reasoningEffort: "medium"` (`reasoningBudget: 448`), noting `low` is unsupported upstream; `Swift-Bonsai-2-PQ2_0` + Orca remains default until owner `DR-G2` review and full X1/X2 acceptance close, and reserved `866`-tensor `*-mtp` (`nextn_predict_layers = 1`) speculative draft checkpoints target `v0.1.36+` (see [Bonsai 2.5 X2 vetting](evidence/bonsai-2-5-x2-vet.md)).
 
 ## Stop and reopen conditions
 

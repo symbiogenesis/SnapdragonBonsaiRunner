@@ -146,7 +146,7 @@ adoption decisions without displacing native daily-use acceptance.
 - [ ] Qualify Prism's Foundation scheduling and source-package/Hexagon caches
   on matching hosted images, preserving complete correctness, mutation, packaging
   and independent ABI/SDK obligations.
-- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.34.**
+- [ ] **R1 — Qualify the Runner release candidate with pinned Prism 0.1.35.**
   Complete actual-model, state, resource, quality and device acceptance using
   the source-bound package identities in the [distribution guide](docs/releases.md).
   Model-free release checks leave these development-runtime gates pending.
@@ -382,7 +382,7 @@ adoption decisions without displacing native daily-use acceptance.
   `OwnedProcess::start_sandboxed_broker_pipe_with_sections` (`SandboxNetwork::Offline`,
   6-entry minimal environment, pre-resume kernel `TokenIsAppContainer`/`GetAppContainerFolderPath`
   verification, `64 MiB`/`1_024`-entry private storage ceiling), `BROKER_PIPE_RELEASE`
-  (`0.1.34`), and `inference-authority-v1` fixture/tooling support are wired
+  (`0.1.35`), and `inference-authority-v1` fixture/tooling support are wired
   end-to-end; qualifying `inference-authority-v1` in sandbox CI
   (after a closed local Case 1 fixture failure repaired without retry), and
   qualifying actual-model X1/MXC loading, atomic Job limits and exact identity
@@ -1023,8 +1023,9 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   `6.66%` mean / `8.27%` median, `+64.28 MiB` WS, `8/8` bit-exact `0.0`, `6/6`
   rollback);
   [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md))
-  are complete locally; publishing a Prism `v0.1.35+` release bundle containing
-  the NariQ + `7fe4bbf`/`51a5a84` updates, lock repin, `DR-G2` human review,
+  and `prism-inference` `v0.1.35` (`3bc76f135bf23c538b3bb789aef382143ff36839`,
+  Foundation bundle `45546690940`, Runner pin + `NARIQ_TRELLIS_RELEASE` /
+  `RSQ4KVF_RELEASE` promotion) are complete locally; `DR-G2` human review
   and remote hosting remain open.
 - [ ] **DR-C2 — Wire Runner lockfile, memory accounting, UI controls and qualification gates.**
   Pin the verified adapter in `config/daisyrose-lora.lock.json`, charge exact
@@ -1052,13 +1053,15 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   checks (`449d97e9`), and native UI loaded rank/fingerprint display
   (`Loaded: rank ≤<rank> · <prefix>`) plus `+ <N> MiB DaisyRose` footprint
   diagnostics (`418c123b`), `51a5a84` matched-AC `r = 32` / `DR-W1 r = 16` vets,
-  and sealed `4/4` `*-008` `DR-G2` capture (`packetSha256 = 399d08ed...`) are
+  published `prism-inference` `v0.1.35` (`3bc76f135bf23c538b3bb789aef382143ff36839`)
+  pinned and `NARIQ_TRELLIS_RELEASE` / `RSQ4KVF_RELEASE` promoted (`648fcadf`),
+  and sealed `4/4` `*-008` `DR-G2` capture (`packetSha256 = 399d08ed...`) +
+  Bonsai 2.5 PQ2 `3/3` Thinking-ON + zero-scale `DR-G2` capture (`packetSha256 = 4b221d19...`)
   complete locally; `config/daisyrose-lora.lock.json`
-  (`pinned_daisyrose_lora_artifact`), optional Prism `v0.1.35+` release
-  publication and repin for NariQ (`NARIQ_TRELLIS_RELEASE`) + `DR-C1` updates
-  (`7fe4bbf`, `51a5a84`), physical X1/X2 matched-power throughput/RAM
-  qualification, owner blinded review (`humanReviewed: true`) & fail-closed
-  `dr-g2-score` on the sealed `*-008` packet, and owning CI remain open.
+  (`pinned_daisyrose_lora_artifact`), physical X1/X2 matched-power throughput/RAM
+  qualification, a separate Thinking-OFF creative capture on `bonsai-2.5-pq2`,
+  owner blinded review (`humanReviewed: true`) & fail-closed `dr-g2-score`,
+  and owning CI remain open.
 - [ ] **DR-Alt — Conditional alternative Qwen3.8-27B donor & quantization-residual `MultiRankAdapter` lane.**
   Using `MultiRankAdapter` without retraining Swift's ternary base, audit and
   screen alternative donors tracked in
@@ -1090,8 +1093,8 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   `bonsai-tools` CLI/`provision`/`chat_launch`), keeping `Swift-Bonsai-2-PQ2_0`
   + Orca as the unchanged default while stacking NariQ cleanly with
   `MultiRankAdapter` (DaisyRose) and Prism `K4/V4` (`rsq4`), and rejecting
-  `abliterate_lora`, GPU/NPU offload, and `mmproj`. Remaining open: publishing
-  a Prism `v0.1.35+` release bundle and enabling `NARIQ_TRELLIS_RELEASE`, owning
+  `abliterate_lora`, GPU/NPU offload, and `mmproj`. Prism `v0.1.35` (`3bc76f135bf23c538b3bb789aef382143ff36839`)
+  is now published/pinned and `NARIQ_TRELLIS_RELEASE` promoted (`648fcadf`). Remaining open: owning
   CI (`source-checks`, `foundation`), verifying DaisyRose (`DR-G2`) compatibility
   on NariQ vs Swift-Bonsai-2, and matched-power X1/X2 throughput/RAM and held-out
   creative/coding quality comparisons across `2.0bpw`, `2.5bpw`, `3.0bpw`, and `PQ2_0`.
@@ -1105,13 +1108,17 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   and `SwiftBonsai2Runner` (`config/bonsai-2-5-27b.lock.json`,
   `bonsai-cpu-policy::{bonsai25, context}`, `DaisyRoseLoraArtifact::for_bonsai25_lock`,
   `bonsai-broker` `--bonsai-2-5` policy/artifacts/identity/`BONSAI_2_5_RELEASE`,
-  `bonsai-chat` `--bonsai-2-5`, `bonsai-tools` CLI/`provision`/`chat_launch`, and
+  `bonsai-chat` `--bonsai-2-5` + `WeightPacking::Bonsai25*` footprint diagnostics, `Start-Chat.ps1`,
+  `bonsai-tools` CLI/`provision`/`chat_launch`, and
   `dr-g2-plan`/`dr-g2-score`/`dr-g2-capture`/`generate-lock` `BaseModelProfile::Bonsai25*`
-  with Orca-free default and optional Orca stacking), keeping `Swift-Bonsai-2-PQ2_0` +
-  Orca unchanged as default. Remaining open: publishing a Prism `v0.1.35+` release
-  bundle and enabling `BONSAI_2_5_RELEASE`, owning CI (`source-checks`, `foundation`),
-  running DaisyRose `DR-G2` screen + matched-power X1/X2 comparisons on Bonsai 2.5 vs
-  Swift-Bonsai-2, and (separate future speculative draft work) wiring the reserved
+  with Orca-free default and optional Orca stacking), `prism-inference` `v0.1.35`
+  (`3bc76f135bf23c538b3bb789aef382143ff36839`) is published/pinned with `BONSAI_2_5_RELEASE`
+  promoted (`648fcadf`), X2 Trial #1 (`106.1 s` AC: `PTQ1_0` `-1.173 GiB` Peak WS / `8/8` greedy parity vs `PQ2_0` `177.8 ms/tok` decode, Orca `1.3` digests, DaisyRose `r16` `:0.0` / `:1.0` / `6/6` rollback)
+  and Trial #2 (`887.0 s` AC `bonsai-2.5-pq2` Orca-free `DR-G2` zero-scale + `3/3` Thinking-ON blind packet `4b221d19...`, `creative-b25-001` skipped on budget guard; [bonsai-2-5-x2-vet](docs/evidence/bonsai-2-5-x2-vet.md)) passed locally, keeping `Swift-Bonsai-2-PQ2_0` +
+  Orca unchanged as default. Remaining open: separate AC Thinking-OFF capture on
+  `bonsai-2.5-pq2` + owner blinded `DR-G2` review/scoring, owning CI (`source-checks`,
+  `foundation`), X1/X2 full-device comparisons on Bonsai 2.5 vs
+  Swift-Bonsai-2, and (`v0.1.36+` separate future speculative draft work) wiring the reserved
   866-tensor `*-mtp` (`qwen35.nextn_predict_layers = 1`) checkpoints.
 
 ### Memory and profiles
@@ -1738,11 +1745,11 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
 - [ ] Complete hosted `source-checks` and `foundation` compiler, strict Release
   analyzer and full regression-suite verdicts in `SwiftBonsai2Runner` under
   [promotion criteria](docs/validation.md#promotion-criteria) (`prism-inference`
-  `v0.1.34` at `c64c9648f85ac4c99ff8d57f709871b31e785370` passed `Foundation bundle`
-  (`45113319918`) and `Source checks` (`45111096691`), while full `Foundation`
-  (`45111096706`) failed on `bonsai-adreno-vulkan` private intra-doc links,
-  `x86_64` lints, and `tests/graph/verification.rs:198`; local Runner checks ran
-  scoped Clippy and targeted suites).
+  `v0.1.35` at `3bc76f135bf23c538b3bb789aef382143ff36839` passed `Foundation bundle`
+  [`45546690940`], after `a5630e2` fixed the `v0.1.34` full-`Foundation` blockers
+  on `bonsai-adreno-vulkan` private intra-doc links, `x86_64` dead-code lints, and
+  `tests/graph/verification.rs`; local Runner checks ran scoped Clippy and
+  external-target suites).
 - [ ] Qualify landed controls on actual weights and X1/X2 hardware within
   predeclared 5-to-15-minute AC/battery-logged allowances:
   - [ ] `#8`: Exercise live long-prefill HTTP Stop/disconnect,

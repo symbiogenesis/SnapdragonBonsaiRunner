@@ -9,7 +9,9 @@ consumers below without installing or executing the recorded Python tools.
 | Retained material | Current consumer |
 | --- | --- |
 | [CI failure audit](ci-failure-audit.md) | Root causes for the latest 30 failed runs, targeted prevention and pending hosted acceptance |
-| [Prism 0.1.34 delivery](prism-0.1.34-release.md) | Current runtime/source lock, original release receipt, 8-crate registry delivery, promoted capability gates and independent lock-update replay |
+| [Prism 0.1.35 delivery](prism-0.1.35-release.md) | Current `0.1.35` runtime/source lock, Foundation bundle `45546690940`, `inference-lock` replay, independent ZIP re-verification and promoted `RSQ4KVF_RELEASE` / `NARIQ_TRELLIS_RELEASE` / `BONSAI_2_5_RELEASE` gates |
+| [Bonsai 2.5 X2 vetting](bonsai-2-5-x2-vet.md) | Bounded AC X2 `PTQ1_0` vs `PQ2_0` real-weight parity/memory/latency trial (`106.1 s`), Orca `1.3` digest parity, DaisyRose `r16` rollback (`6/6`), and `bonsai-2.5-pq2` Orca-free `DR-G2` blind capture (`887.0 s`, 3 Thinking-ON + zero-scale sealed; Thinking-OFF + human review pending) |
+| [Prism 0.1.34 delivery](prism-0.1.34-release.md) | Prior `0.1.34` runtime/source lock, original release receipt, 8-crate registry delivery, promoted capability gates and independent lock-update replay |
 | [Prism 0.1.32 delivery](prism-0.1.32-release.md) | Prior 0.1.32 runtime/source lock, original release receipt, registry delivery, bounded X2 broker-pipe trial and independent lock-update replay |
 | [Prism 0.1.31 delivery](prism-0.1.31-release.md) | Prior 0.1.31 runtime/source lock, original release receipt, registry delivery and lock-update replay |
 | [Prism 0.1.30 delivery](prism-0.1.30-release.md) | Prior 0.1.30 runtime/source lock, original release receipt, registry delivery and lock-update replay |
