@@ -250,6 +250,10 @@ pub enum SwiftWeightPacking {
     NariQ3_0Bpw,
     /// Opt-in `NariQ` `2.0bpw` trellis weights (`6_753_954_304` bytes).
     NariQ2_0Bpw,
+    /// Opt-in `Ternary Bonsai 2.5` `PQ2_0` weights (`7_253_354_848` bytes).
+    Bonsai25Pq2,
+    /// Opt-in `Ternary Bonsai 2.5` `PTQ1_0` weights (`5_993_834_848` bytes).
+    Bonsai25Ptq1,
 }
 
 impl SwiftWeightPacking {
@@ -263,6 +267,15 @@ impl SwiftWeightPacking {
         }
     }
 
+    /// Converts a selected opt-in [`crate::Bonsai25Variant`] into its host packing policy.
+    #[must_use]
+    pub const fn from_bonsai25(variant: crate::Bonsai25Variant) -> Self {
+        match variant {
+            crate::Bonsai25Variant::Pq2 => Self::Bonsai25Pq2,
+            crate::Bonsai25Variant::Ptq1 => Self::Bonsai25Ptq1,
+        }
+    }
+
     /// Exact pinned GGUF weight byte length for this packing format.
     #[must_use]
     pub const fn weight_bytes(self) -> u64 {
@@ -272,6 +285,8 @@ impl SwiftWeightPacking {
             Self::NariQ2_5Bpw => crate::NariqVariant::Bpw2_5.weight_bytes(),
             Self::NariQ3_0Bpw => crate::NariqVariant::Bpw3_0.weight_bytes(),
             Self::NariQ2_0Bpw => crate::NariqVariant::Bpw2_0.weight_bytes(),
+            Self::Bonsai25Pq2 => crate::Bonsai25Variant::Pq2.weight_bytes(),
+            Self::Bonsai25Ptq1 => crate::Bonsai25Variant::Ptq1.weight_bytes(),
         }
     }
 
@@ -287,6 +302,9 @@ impl SwiftWeightPacking {
                 (FIXED_RUNTIME_BYTES - crate::SWIFT_WEIGHT_BYTES)
                     + self.weight_bytes()
                     + crate::NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES
+            }
+            Self::Bonsai25Pq2 | Self::Bonsai25Ptq1 => {
+                (FIXED_RUNTIME_BYTES - crate::SWIFT_WEIGHT_BYTES) + self.weight_bytes()
             }
         }
     }
@@ -1920,6 +1938,29 @@ mod tests {
             let expected_fixed = (FIXED_RUNTIME_BYTES - crate::SWIFT_WEIGHT_BYTES)
                 + variant.weight_bytes()
                 + crate::NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES;
+            assert_eq!(packing.calibrated_fixed_runtime_bytes(), expected_fixed);
+            let shape = SwiftExecutionShape::for_profile(SwiftContextProfile::NativeRsq4Full)
+                .with_weight_packing_calibrated(packing);
+            assert_eq!(shape.weights_and_fixed_runtime_bytes, expected_fixed);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bonsai25_weight_packing_calibration_tracks_exact_artifact_sizes_without_trellis_headroom()
+    -> Result<(), Box<dyn Error>> {
+        for (variant, expected_packing) in [
+            (crate::Bonsai25Variant::Pq2, SwiftWeightPacking::Bonsai25Pq2),
+            (
+                crate::Bonsai25Variant::Ptq1,
+                SwiftWeightPacking::Bonsai25Ptq1,
+            ),
+        ] {
+            let packing = SwiftWeightPacking::from_bonsai25(variant);
+            assert_eq!(packing, expected_packing);
+            assert_eq!(packing.weight_bytes(), variant.weight_bytes());
+            let expected_fixed =
+                (FIXED_RUNTIME_BYTES - crate::SWIFT_WEIGHT_BYTES) + variant.weight_bytes();
             assert_eq!(packing.calibrated_fixed_runtime_bytes(), expected_fixed);
             let shape = SwiftExecutionShape::for_profile(SwiftContextProfile::NativeRsq4Full)
                 .with_weight_packing_calibrated(packing);

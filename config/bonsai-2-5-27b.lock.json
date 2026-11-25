@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "decision": "docs/model-selection.md",
+  "family": "ternary-bonsai-2.5-27b",
+  "repository": "prism-ml/Ternary-Bonsai-2.5-27B-GGUF",
+  "revision": "28a7093cc25bc151cc2b284c5570f12ce343fdcf",
+  "license": "Apache-2.0",
+  "architecture": "qwen35",
+  "source": {
+    "baseModel": "Qwen/Qwen3.8-27B",
+    "announcementUrl": "https://prismml.com/news/bonsai-2-5-27b",
+    "publishedDate": "2026-11-24"
+  },
+  "variants": {
+    "pq2": {
+      "filename": "Ternary-Bonsai-2.5-27B-PQ2_0.gguf",
+      "modelId": "Ternary-Bonsai-2.5-27B-PQ2_0",
+      "representation": "Bonsai-2.5-PQ2_0",
+      "bytes": 7253354848,
+      "sha256": "103a11c94324029d8bae3f8152f30bba414730064cfb77438f8589db72e1aa85",
+      "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/resolve/28a7093cc25bc151cc2b284c5570f12ce343fdcf/Ternary-Bonsai-2.5-27B-PQ2_0.gguf",
+      "tensorCount": 851,
+      "fileType": 141,
+      "runtimeWired": true
+    },
+    "ptq1": {
+      "filename": "Ternary-Bonsai-2.5-27B-PTQ1_0.gguf",
+      "modelId": "Ternary-Bonsai-2.5-27B-PTQ1_0",
+      "representation": "Bonsai-2.5-PTQ1_0",
+      "bytes": 5993834848,
+      "sha256": "929560ec9d37cf3cadd4b00cc87b51c570082a628dd830b4692dc0b2ed18dbbe",
+      "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/resolve/28a7093cc25bc151cc2b284c5570f12ce343fdcf/Ternary-Bonsai-2.5-27B-PTQ1_0.gguf",
+      "tensorCount": 851,
+      "fileType": 143,
+      "runtimeWired": true
+    }
+  },
+  "mmproj": {
+    "filename": "Ternary-Bonsai-2.5-27B-mmproj-Q8_0.gguf",
+    "bytes": 629246976,
+    "sha256": "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903",
+    "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/resolve/28a7093cc25bc151cc2b284c5570f12ce343fdcf/Ternary-Bonsai-2.5-27B-mmproj-Q8_0.gguf",
+    "sharedWithSwiftMmproj": true,
+    "runtimeWired": true
+  },
+  "mtpReserved": {
+    "pq2-mtp": {
+      "filename": "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf",
+      "bytes": 7492338944,
+      "sha256": "ededc9fc0a8a6a8dd30914d107b2d2ce7674d789f1d05a1a481f240609aa6c23",
+      "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/resolve/28a7093cc25bc151cc2b284c5570f12ce343fdcf/Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf",
+      "tensorCount": 866,
+      "nextnPredictLayers": 1,
+      "runtimeWired": false
+    },
+    "ptq1-mtp": {
+      "filename": "Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf",
+      "bytes": 6232818944,
+      "sha256": "e0fc5f3d47b9c926d52677d303b19df356a2376614b3e1cb9973865fc04ca431",
+      "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF/resolve/28a7093cc25bc151cc2b284c5570f12ce343fdcf/Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf",
+      "tensorCount": 866,
+      "nextnPredictLayers": 1,
+      "runtimeWired": false
+    }
+  },
+  "qualification": {
+    "status": "source-wired-unqualified",
+    "notes": "Source and artifact wiring only; Prism v0.1.35+ release pin, actual-model numerical parity, DR-G2 DaisyRose composition screen, and X1/X2 device qualification remain pending."
+  }
+}

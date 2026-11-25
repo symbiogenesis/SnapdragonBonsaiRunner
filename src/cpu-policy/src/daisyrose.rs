@@ -138,6 +138,22 @@ impl DaisyRoseLoraArtifact {
     ) -> Result<Self, String> {
         daisyrose_lora_artifact_for_base_sha256(data, lock_json, variant.sha256())
     }
+
+    /// Resolve and validate a [`DaisyRoseLoraArtifact`] from an explicit lock JSON string
+    /// against the base model `SHA-256` of a pinned [`crate::Bonsai25Variant`].
+    ///
+    /// This performs no filesystem I/O, downloads, or model loading.
+    ///
+    /// # Errors
+    /// Rejects invalid data directories, invalid lock JSON, missing `source` provenance,
+    /// or `baseModelSha256` drift against `variant.sha256()`.
+    pub fn for_bonsai25_lock(
+        data: &Path,
+        variant: crate::Bonsai25Variant,
+        lock_json: &str,
+    ) -> Result<Self, String> {
+        daisyrose_lora_artifact_for_base_sha256(data, lock_json, variant.sha256())
+    }
 }
 
 fn atom(value: &str) -> bool {

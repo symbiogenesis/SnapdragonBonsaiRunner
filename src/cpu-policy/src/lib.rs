@@ -32,6 +32,10 @@ pub use nariq::{
     NARIQ_LOCK, NARIQ_TRELLIS_SCRATCH_HEADROOM_BYTES, NariqModelArtifact, NariqVariant,
     nariq_model_artifact,
 };
+mod bonsai25;
+pub use bonsai25::{
+    BONSAI_2_5_LOCK, Bonsai25ModelArtifact, Bonsai25Variant, bonsai25_model_artifact,
+};
 
 const REFERENCE_LOCK: &str = include_str!("../../../config/runtime.lock.json");
 pub(crate) const SWIFT_LOCK: &str = include_str!("../../../config/swift-assessment.lock.json");
