@@ -43,6 +43,11 @@ param(
     [string]$Placement,
     [switch]$UseRepackedPtq1,
     [switch]$UseOriginalPq2,
+    [ValidateSet('pq2', 'ptq1')]
+    [string]$Bonsai25,
+    [switch]$NoAbliterateLora,
+    [string]$DaisyRoseLora,
+    [switch]$NoDaisyRoseLora,
     [ValidateSet('dx12', 'vulkan', 'gl')]
     [string]$GraphicsBackend,
     [switch]$ForceBuild,
@@ -181,6 +186,10 @@ try {
     }
     if ($UseRepackedPtq1) { $launchArguments += '--use-repacked-ptq1' }
     if ($UseOriginalPq2) { $launchArguments += '--use-original-pq2' }
+    if ($Bonsai25) { $launchArguments += @('--bonsai-2-5', $Bonsai25.ToLowerInvariant()) }
+    if ($NoAbliterateLora) { $launchArguments += '--no-abliterate-lora' }
+    if ($DaisyRoseLora) { $launchArguments += @('--daisyrose-lora', $DaisyRoseLora) }
+    if ($NoDaisyRoseLora) { $launchArguments += '--no-daisyrose-lora' }
     if ($GraphicsBackend) { $launchArguments += @('--graphics-backend', $GraphicsBackend.ToLowerInvariant()) }
     if ($PromptReuse) { $launchArguments += @('--prompt-reuse', $PromptReuse.ToLowerInvariant()) }
     if ($PSBoundParameters.ContainsKey('PromptReuseCheckpoints')) {

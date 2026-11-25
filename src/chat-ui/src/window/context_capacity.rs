@@ -225,10 +225,10 @@ impl State {
         if let Some(capacity) = estimate.capacity
             && let Some(footprint) = estimate_runtime_footprint(PlannerRuntimeShape {
                 context_tokens: capacity,
-                weight_packing: WeightPacking::Pq2_0,
+                weight_packing: self.weight_packing,
                 kv_layout: KvCacheLayout::Rsq4,
                 kv_sharing: KvSharingMode::CowRollback,
-                evictable_mapped_weight_bytes: WeightPacking::Pq2_0.weight_bytes(),
+                evictable_mapped_weight_bytes: self.weight_packing.weight_bytes(),
                 npu_resident_arena_bytes: 0,
                 npu_released_host_pq2_bytes: 0,
                 daisyrose_adapter_bytes,
@@ -412,6 +412,8 @@ fn tokens(amount: usize) -> String {
 const FIXED_RUNTIME_BYTES: u64 = 11 * 1024 * 1024 * 1024;
 const PQ2_WEIGHT_BYTES: u64 = 7_206_168_928;
 const PTQ1_WEIGHT_BYTES: u64 = 5_946_648_928;
+const BONSAI25_PQ2_WEIGHT_BYTES: u64 = 7_253_354_848;
+const BONSAI25_PTQ1_WEIGHT_BYTES: u64 = 5_993_834_848;
 const PQ2_TO_PTQ1_SAVING_BYTES: u64 = PQ2_WEIGHT_BYTES - PTQ1_WEIGHT_BYTES;
 const HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES: u64 = 2_888_663_040;
 const RECURRENT_BYTES: u64 = 156_893_184;
@@ -424,14 +426,9 @@ const SEQUENTIAL_KV_BOOKKEEPING_BYTES_PER_TOKEN: u64 = 24 * 4 + 128;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WeightPacking {
     Pq2_0,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Alternative weight packing variant covered by footprint tests."
-        )
-    )]
     Ptq1_0,
+    Bonsai25Pq2,
+    Bonsai25Ptq1,
 }
 
 impl WeightPacking {
@@ -439,6 +436,8 @@ impl WeightPacking {
         match self {
             Self::Pq2_0 => "PQ2_0",
             Self::Ptq1_0 => "PTQ1_0",
+            Self::Bonsai25Pq2 => "Bonsai 2.5 PQ2_0",
+            Self::Bonsai25Ptq1 => "Bonsai 2.5 PTQ1_0",
         }
     }
 
@@ -446,6 +445,8 @@ impl WeightPacking {
         match self {
             Self::Pq2_0 => PQ2_WEIGHT_BYTES,
             Self::Ptq1_0 => PTQ1_WEIGHT_BYTES,
+            Self::Bonsai25Pq2 => BONSAI25_PQ2_WEIGHT_BYTES,
+            Self::Bonsai25Ptq1 => BONSAI25_PTQ1_WEIGHT_BYTES,
         }
     }
 
@@ -453,6 +454,9 @@ impl WeightPacking {
         match self {
             Self::Pq2_0 => FIXED_RUNTIME_BYTES,
             Self::Ptq1_0 => FIXED_RUNTIME_BYTES - PQ2_TO_PTQ1_SAVING_BYTES,
+            Self::Bonsai25Pq2 | Self::Bonsai25Ptq1 => {
+                (FIXED_RUNTIME_BYTES - PQ2_WEIGHT_BYTES) + self.weight_bytes()
+            }
         }
     }
 }
@@ -617,7 +621,12 @@ pub(super) fn estimate_runtime_footprint(
     {
         return None;
     }
-    if shape.npu_released_host_pq2_bytes > 0 && shape.weight_packing != WeightPacking::Pq2_0 {
+    if shape.npu_released_host_pq2_bytes > 0
+        && !matches!(
+            shape.weight_packing,
+            WeightPacking::Pq2_0 | WeightPacking::Bonsai25Pq2
+        )
+    {
         return None;
     }
     let host_weights_and_fixed = shape

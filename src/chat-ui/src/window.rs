@@ -180,6 +180,7 @@ struct State {
     status: String,
     status_detail: String,
     runtime_description: String,
+    weight_packing: context_capacity::WeightPacking,
     warning: bool,
     alerts: error_ui::View,
     diagnostics: VecDeque<String>,
@@ -356,6 +357,7 @@ impl State {
             status: "Preparing your local model…".to_owned(),
             status_detail: String::new(),
             runtime_description: "Model-free preview".to_owned(),
+            weight_packing: context_capacity::WeightPacking::Pq2_0,
             warning: false,
             alerts: error_ui::View::default(),
             diagnostics: VecDeque::new(),
@@ -643,6 +645,14 @@ impl State {
     fn apply_model_config(&mut self, config: &Config) {
         self.markdown_image = Some(config.broker.clone());
         self.runtime_description = runtime_description(config);
+        self.weight_packing = match (config.bonsai25_variant, config.use_repacked_ptq1) {
+            (Some(client::Bonsai25Variant::Pq2), _) => context_capacity::WeightPacking::Bonsai25Pq2,
+            (Some(client::Bonsai25Variant::Ptq1), _) => {
+                context_capacity::WeightPacking::Bonsai25Ptq1
+            }
+            (None, true) => context_capacity::WeightPacking::Ptq1_0,
+            (None, false) => context_capacity::WeightPacking::Pq2_0,
+        };
         self.abliteration_enabled = config.use_abliterate_lora;
         self.daisyrose_available = config.daisyrose_lora.is_some();
         self.daisyrose_max_rank = None;

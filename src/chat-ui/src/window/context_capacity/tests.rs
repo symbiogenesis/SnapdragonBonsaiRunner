@@ -715,3 +715,65 @@ fn daisyrose_adapter_footprint_scales_physical_commit_and_formats_diagnostic_cle
     assert!(chat.query_by_label(expected_live.as_str()).is_some());
     Ok(())
 }
+
+#[test]
+fn footprint_diagnostics_cover_bonsai25_pq2_and_ptq1_variants() -> Result<(), &'static str> {
+    let pq2 = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 262_144,
+        weight_packing: WeightPacking::Bonsai25Pq2,
+        kv_layout: KvCacheLayout::Rsq4,
+        kv_sharing: KvSharingMode::CowRollback,
+        evictable_mapped_weight_bytes: WeightPacking::Bonsai25Pq2.weight_bytes(),
+        npu_resident_arena_bytes: 3_000_000_000,
+        npu_released_host_pq2_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+        daisyrose_adapter_bytes: 0,
+        branch_checkpoints: 1,
+    })
+    .ok_or("Expected Bonsai 2.5 PQ2 footprint estimate")?;
+    let ptq1 = estimate_runtime_footprint(PlannerRuntimeShape {
+        context_tokens: 262_144,
+        weight_packing: WeightPacking::Bonsai25Ptq1,
+        kv_layout: KvCacheLayout::Rsq4,
+        kv_sharing: KvSharingMode::CowRollback,
+        evictable_mapped_weight_bytes: WeightPacking::Bonsai25Ptq1.weight_bytes(),
+        npu_resident_arena_bytes: 0,
+        npu_released_host_pq2_bytes: 0,
+        daisyrose_adapter_bytes: 0,
+        branch_checkpoints: 1,
+    })
+    .ok_or("Expected Bonsai 2.5 PTQ1 footprint estimate")?;
+    assert_eq!(pq2.weight_packing, WeightPacking::Bonsai25Pq2);
+    assert_eq!(ptq1.weight_packing, WeightPacking::Bonsai25Ptq1);
+    assert_eq!(
+        WeightPacking::Bonsai25Pq2.weight_bytes() - WeightPacking::Bonsai25Ptq1.weight_bytes(),
+        1_259_520_000
+    );
+    assert!(
+        estimate_runtime_footprint(PlannerRuntimeShape {
+            context_tokens: 262_144,
+            weight_packing: WeightPacking::Bonsai25Ptq1,
+            kv_layout: KvCacheLayout::Rsq4,
+            kv_sharing: KvSharingMode::CowRollback,
+            evictable_mapped_weight_bytes: WeightPacking::Bonsai25Ptq1.weight_bytes(),
+            npu_resident_arena_bytes: 3_000_000_000,
+            npu_released_host_pq2_bytes: HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES,
+            daisyrose_adapter_bytes: 0,
+            branch_checkpoints: 1,
+        })
+        .is_none()
+    );
+    assert!(format_footprint_diagnostic(&pq2).contains("Bonsai 2.5 PQ2_0"));
+    assert!(format_footprint_diagnostic(&ptq1).contains("Bonsai 2.5 PTQ1_0"));
+
+    let mut chat = harness([680.0, 640.0], "Question");
+    chat.state_mut().app.context_tokens = Some(262_144);
+    chat.state_mut().app.weight_packing = WeightPacking::Bonsai25Ptq1;
+    chat.get_by_role_and_label(egui::Role::Button, "Context")
+        .click();
+    chat.run();
+    assert!(
+        chat.query_by_label(format_footprint_diagnostic(&ptq1).as_str())
+            .is_some()
+    );
+    Ok(())
+}
