@@ -146,6 +146,7 @@ struct State {
     updates: Option<updates::Updates>,
     update_exit: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     model: ModelLifecycle,
+    awaiting_first_token: bool,
     vision_available: bool,
     preview: bool,
     input: String,
@@ -323,6 +324,7 @@ impl State {
             updates: None,
             update_exit: None,
             model: ModelLifecycle::Unavailable,
+            awaiting_first_token: false,
             vision_available: false,
             preview: true,
             input: String::new(),
@@ -885,6 +887,7 @@ impl State {
         self.input.clear();
         self.place_composer_cursor(0);
         self.model = ModelLifecycle::Generating;
+        self.awaiting_first_token = true;
         // A turn begun without speech stays silent even if preparation finishes
         // mid-answer. Only an explicit read or a later turn may start playback.
         self.streaming_suppressed = !self.speech_output;
@@ -1141,6 +1144,7 @@ impl State {
         }
         self.context_tokens = None;
         self.vision_available = false;
+        self.awaiting_first_token = false;
         self.model = ModelLifecycle::Unavailable;
         self.transcript.remove_empty_response();
         if !adopted && !auto_continuing && !self.transcript.latest_interrupted(&self.committed) {
@@ -1296,26 +1300,36 @@ impl State {
         match event {
             Event::Starting => {
                 self.auto_continuing = false;
+                self.awaiting_first_token = false;
                 self.reset_model_capabilities();
                 self.model = ModelLifecycle::Preparing;
                 self.set_status("Preparing your local model…", false);
             }
             Event::Restarting => {
                 self.auto_continuing = false;
+                self.awaiting_first_token = false;
                 self.reset_model_capabilities();
                 self.model = ModelLifecycle::Restarting;
                 self.set_status("Restarting the local model…", false);
             }
             Event::Retryable(message) => {
+                self.awaiting_first_token = false;
                 self.fail(&message);
                 self.model = ModelLifecycle::Retryable;
             }
             Event::Stopping(text) => {
+                self.awaiting_first_token = false;
                 self.stopping_response(&text);
                 self.touch_conversation(self.active_or_routed_conversation());
             }
-            Event::Stopped => self.stopped_response(),
-            Event::ModelStopped => self.stopped_model(),
+            Event::Stopped => {
+                self.awaiting_first_token = false;
+                self.stopped_response();
+            }
+            Event::ModelStopped => {
+                self.awaiting_first_token = false;
+                self.stopped_model();
+            }
             Event::ContextCapacity(tokens) => self.context_tokens = Some(tokens),
             Event::VisionAvailable(available) => self.vision_available = available,
             Event::DaisyRoseAvailable(readiness) => {
@@ -1354,6 +1368,7 @@ impl State {
             }
             Event::Ready => {
                 self.auto_continuing = false;
+                self.awaiting_first_token = false;
                 self.model = ModelLifecycle::Ready;
                 self.set_status("Ready when you are.", false);
             }
@@ -1361,12 +1376,16 @@ impl State {
                 message,
                 text,
                 retry_required,
-            } => self.reject(&message, &text, retry_required),
+            } => {
+                self.awaiting_first_token = false;
+                self.reject(&message, &text, retry_required);
+            }
             Event::Stage(label) => {
                 self.replace_streaming_stage();
                 self.stage = Some(label);
                 clear_and_shrink_buffer(&mut self.last_answer);
                 self.answer_complete = false;
+                self.awaiting_first_token = true;
                 self.transcript.stage();
                 self.set_status(label, false);
                 self.touch_conversation(self.active_or_routed_conversation());
@@ -1376,6 +1395,9 @@ impl State {
                 self.touch_conversation(self.active_or_routed_conversation());
             }
             Event::Text(text) | Event::RetainedAnswer(text) => {
+                if !text.is_empty() {
+                    self.awaiting_first_token = false;
+                }
                 self.last_answer.push_str(&text);
                 self.transcript.append(&text, false);
                 self.stream_answer(text);
@@ -1385,6 +1407,9 @@ impl State {
                 self.touch_conversation(self.active_or_routed_conversation());
             }
             Event::Reasoning(text) => {
+                if !text.is_empty() {
+                    self.awaiting_first_token = false;
+                }
                 self.transcript.append(&text, true);
                 self.touch_conversation(self.active_or_routed_conversation());
             }
@@ -1394,6 +1419,7 @@ impl State {
             }
             Event::Complete(completion) => {
                 self.auto_continuing = false;
+                self.awaiting_first_token = false;
                 self.transcript.remove_empty_response();
                 self.model = ModelLifecycle::Ready;
                 self.answer_complete = true;
@@ -1427,7 +1453,10 @@ impl State {
                     }
                 }
             }
-            Event::Failed(message) => self.fail(&message),
+            Event::Failed(message) => {
+                self.awaiting_first_token = false;
+                self.fail(&message);
+            }
         }
     }
 
@@ -2816,11 +2845,22 @@ impl eframe::App for State {
             self.appearance.apply(ctx);
             self.last_theme_check = Instant::now();
         }
-        // No frame-rate polling: wait between events when idle. Microphone's
-        // WinRT state machine is polled only during an explicit capture session.
+        // No frame-rate polling: wait between events when idle. While waiting for
+        // the first token of an active turn, throttle to 125 ms (8 Hz) and let
+        // `event_channel_with_repaint` wake the UI immediately on token arrival.
+        ctx.request_repaint_after(self.next_repaint_delay());
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+        self.flush_voice_transcript(ui.ctx());
+    }
+}
+
+impl State {
+    fn next_repaint_delay(&self) -> Duration {
         let active_generation = !self.preview && self.model.busy();
-        let waiting = active_generation
-            || self.image_cache.has_pending()
+        let waiting = self.image_cache.has_pending()
             || self.image_export.is_some()
             || self.attachment_import.is_some()
             || self
@@ -2833,18 +2873,15 @@ impl eframe::App for State {
                     || self.dictation_requested
                     || self.audio_import.is_some()
                     || !self.speech_checked));
-        ctx.request_repaint_after(if active_generation {
+        if active_generation && !self.awaiting_first_token {
             Duration::from_millis(16)
         } else if waiting {
             Duration::from_millis(50)
+        } else if active_generation {
+            Duration::from_millis(125)
         } else {
             Duration::from_secs(1)
-        });
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.draw(ui);
-        self.flush_voice_transcript(ui.ctx());
+        }
     }
 }
 

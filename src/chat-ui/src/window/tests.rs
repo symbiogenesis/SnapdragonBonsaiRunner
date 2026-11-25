@@ -1731,3 +1731,34 @@ fn conversation_history_orders_by_most_recent_update_and_ignores_viewing() -> io
     assert_eq!(order(&state), vec![first, second]);
     Ok(())
 }
+
+#[test]
+fn prefill_repaint_cadence_throttles_until_first_token_arrives() {
+    let (mut state, _commands, _events) = state();
+    state.model = ModelLifecycle::Ready;
+    assert_eq!(state.next_repaint_delay(), Duration::from_secs(1));
+
+    state.input = "Wait for prefill".into();
+    state.submit();
+    assert!(state.model.busy());
+    assert!(state.awaiting_first_token);
+    assert_eq!(state.next_repaint_delay(), Duration::from_millis(125));
+
+    // Empty deltas keep prefill throttling; first non-empty reasoning or text token restores 16 ms pacing.
+    state.model_event(Event::Text(String::new()));
+    assert_eq!(state.next_repaint_delay(), Duration::from_millis(125));
+
+    state.model_event(Event::Reasoning("Thinking".into()));
+    assert!(!state.awaiting_first_token);
+    assert_eq!(state.next_repaint_delay(), Duration::from_millis(16));
+
+    // Extra effort stage transitions return to 125 ms until that stage emits its first token.
+    state.model_event(Event::Stage("Extra effort: Drafting (2/3)"));
+    assert_eq!(state.next_repaint_delay(), Duration::from_millis(125));
+
+    state.model_event(Event::Text("First answer token".into()));
+    assert_eq!(state.next_repaint_delay(), Duration::from_millis(16));
+
+    state.model_event(Event::Complete(Completion::Finished));
+    assert_eq!(state.next_repaint_delay(), Duration::from_secs(1));
+}

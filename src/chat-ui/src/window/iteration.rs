@@ -313,6 +313,7 @@ impl State {
         self.request_conversation = Some(owner);
         self.touch_conversation(owner);
         self.model = ModelLifecycle::Generating;
+        self.awaiting_first_token = true;
         self.auto_continuing = true;
         self.set_status("Continuing response…", false);
         true

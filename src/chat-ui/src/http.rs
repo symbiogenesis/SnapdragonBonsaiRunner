@@ -10,9 +10,7 @@ use crate::scrub::ScrubbingBytes;
 use std::{
     io::{self, BufRead as _, BufReader, IoSlice, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
-    sync::mpsc::RecvTimeoutError,
-    thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Maximum HTTP/1.1 response header block admitted from a loopback peer.
@@ -101,50 +99,45 @@ pub(crate) fn retry_poll(error: &io::Error) -> bool {
 pub(crate) fn connect_loopback<E>(
     port: u16,
     connect_timeout: Duration,
-    thread_name: &str,
     mut poll_step: impl FnMut() -> Duration,
     mut check: impl FnMut() -> Result<(), E>,
 ) -> Result<TcpStream, Error<E>> {
     check().map_err(Error::Interrupted)?;
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    connect_socket(
-        address,
-        connect_timeout,
-        thread_name,
-        &mut poll_step,
-        &mut check,
-    )
+    connect_socket(address, connect_timeout, &mut poll_step, &mut check)
 }
 
+/// Connects to `address` using bounded `connect_timeout` slices without spawning a helper thread.
 pub(crate) fn connect_socket<E>(
     address: SocketAddr,
     connect_timeout: Duration,
-    thread_name: &str,
     mut poll_step: impl FnMut() -> Duration,
     mut check: impl FnMut() -> Result<(), E>,
 ) -> Result<TcpStream, Error<E>> {
     check().map_err(Error::Interrupted)?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    if thread::Builder::new()
-        .name(thread_name.into())
-        .spawn(move || {
-            let _sent = sender.send(TcpStream::connect_timeout(&address, connect_timeout));
-        })
-        .is_err()
-    {
-        let connected = TcpStream::connect_timeout(&address, connect_timeout);
-        check().map_err(Error::Interrupted)?;
-        return connected.map_err(|_| Error::Transport(TransportError::Connect));
-    }
+    let deadline = Instant::now() + connect_timeout;
     loop {
         check().map_err(Error::Interrupted)?;
-        match receiver.recv_timeout(poll_step()) {
-            Ok(connected) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Transport(TransportError::Connect));
+        }
+        let slice = poll_step().min(remaining);
+        if slice.is_zero() {
+            return Err(Error::Transport(TransportError::Connect));
+        }
+        match TcpStream::connect_timeout(&address, slice) {
+            Ok(stream) => {
                 check().map_err(Error::Interrupted)?;
-                return connected.map_err(|_| Error::Transport(TransportError::Connect));
+                return Ok(stream);
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
+            Err(error) if retry_poll(&error) => {
+                check().map_err(Error::Interrupted)?;
+                if Instant::now() >= deadline {
+                    return Err(Error::Transport(TransportError::Connect));
+                }
+            }
+            Err(_) => {
                 check().map_err(Error::Interrupted)?;
                 return Err(Error::Transport(TransportError::Connect));
             }
@@ -903,5 +896,47 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    #[test]
+    fn connect_loopback_uses_bounded_slices_and_honors_cancellation() -> std::io::Result<()> {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        let connected = super::connect_loopback(
+            port,
+            std::time::Duration::from_millis(200),
+            || std::time::Duration::from_millis(25),
+            || Ok::<(), &'static str>(()),
+        );
+        assert!(connected.is_ok());
+
+        let zero_step = super::connect_loopback(
+            port,
+            std::time::Duration::from_millis(200),
+            || std::time::Duration::ZERO,
+            || Ok::<(), &'static str>(()),
+        );
+        assert_eq!(
+            zero_step.err(),
+            Some(super::Error::Transport(super::TransportError::Connect))
+        );
+
+        drop(listener);
+        let mut checks = 0_usize;
+        let cancelled = super::connect_loopback(
+            port,
+            std::time::Duration::from_millis(200),
+            || std::time::Duration::from_millis(25),
+            || {
+                checks += 1;
+                if checks >= 3 {
+                    Err("stopped")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(cancelled.err(), Some(super::Error::Interrupted("stopped")));
+        Ok(())
     }
 }

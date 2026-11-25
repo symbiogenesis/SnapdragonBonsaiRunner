@@ -313,7 +313,6 @@ impl Client {
         let mut stream = crate::http::connect_loopback(
             self.port,
             timeout,
-            "canary-connect",
             || CONNECT_POLL.min(call.until.saturating_duration_since(Instant::now())),
             || call.check(),
         )

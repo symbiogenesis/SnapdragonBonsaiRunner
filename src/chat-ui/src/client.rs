@@ -42,7 +42,7 @@ use sse::Sse;
 
 const POLL: Duration = Duration::from_millis(100);
 const IO_POLL: Duration = Duration::from_millis(50);
-const SOCKET_POLL: Duration = Duration::from_millis(5);
+const SOCKET_POLL: Duration = Duration::from_millis(25);
 const STARTUP_TIMEOUT: Duration = Duration::from_mins(10);
 // Ten seconds for the broker's explicit model stop, then bounded exit polling
 // and outer-Job cleanup. All phases share this one absolute deadline.
@@ -2099,7 +2099,6 @@ fn connect_interruptible(
     crate::http::connect_socket(
         address,
         connect_timeout,
-        "chat-connect",
         || IO_POLL,
         || check_commands(commands),
     )
@@ -2133,16 +2132,12 @@ fn generate_with_options(
     check_commands(commands)?;
     let _nodelay = stream.set_nodelay(true);
     stream
-        .set_nonblocking(true)
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(Some(SOCKET_POLL)))
+        .and_then(|()| stream.set_write_timeout(Some(SOCKET_POLL)))
         .map_err(|_| Failure::Message("Could not configure the local connection."))?;
     let mut connection = crate::http::PollStream::new(stream, |phase| match phase {
-        crate::http::PollPhase::Check => check_commands(commands),
-        crate::http::PollPhase::Wait => match commands.recv_timeout(SOCKET_POLL) {
-            Ok(Command::StopModel) => Err(Failure::ModelStopped),
-            Ok(Command::Stop) => Err(Failure::Stopped),
-            Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => Err(Failure::Shutdown),
-            Ok(_) | Err(RecvTimeoutError::Timeout) => check_commands(commands),
-        },
+        crate::http::PollPhase::Check | crate::http::PollPhase::Wait => check_commands(commands),
     });
     let outcome = exchange(
         &mut connection,

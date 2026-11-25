@@ -168,3 +168,40 @@ fn connect_interruptible_honors_prequeued_stop_and_shutdown() -> io::Result<()> 
     }
     Ok(())
 }
+
+#[test]
+fn blocking_read_timeout_streams_tokens_and_still_cancels_when_stalled() -> io::Result<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    let server = thread::spawn(move || -> io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte)?;
+            head.push(byte[0]);
+        }
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes())?;
+        // Pause longer than SOCKET_POLL (25 ms) so PollStream exercises read timeouts before bytes arrive.
+        thread::sleep(Duration::from_millis(75));
+        stream.write_all(body)?;
+        Ok(())
+    });
+    let (_commands, incoming) = mpsc::channel();
+    let (events, notifications) = event_channel();
+    let (answer, completion) = generate(port, "inert-test-key", b"{}".to_vec(), &incoming, &events)
+        .map_err(|failure| io::Error::other(format!("{failure:?}")))?;
+    assert_eq!(answer.content.as_ref(), "hi");
+    assert_eq!(completion, Completion::Finished);
+    assert!(matches!(notifications.try_recv(), Ok(Event::Text(text)) if text == "hi"));
+    server
+        .join()
+        .map_err(|_| io::Error::other("Loopback fixture panicked"))??;
+    Ok(())
+}
