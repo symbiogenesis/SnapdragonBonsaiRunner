@@ -108,7 +108,12 @@ fn runtime_description(config: &Config) -> String {
     } else {
         "Publisher"
     };
-    let weights = if config.use_repacked_ptq1 {
+    let weights = if let Some(variant) = config.bonsai25_variant {
+        match variant {
+            client::Bonsai25Variant::Pq2 => "Bonsai 2.5 PQ2",
+            client::Bonsai25Variant::Ptq1 => "Bonsai 2.5 PTQ1",
+        }
+    } else if config.use_repacked_ptq1 {
         "PTQ1"
     } else {
         "PQ2"
@@ -3193,6 +3198,7 @@ mod startup_tests {
             no_daisyrose_lora: false,
             no_mmproj: false,
             use_repacked_ptq1: false,
+            bonsai25_variant: None,
             native_engine: false,
             native_row_workers: 1,
             prompt_reuse: client::PromptReuse::Disabled,
@@ -3322,6 +3328,7 @@ mod startup_tests {
                 no_daisyrose_lora: false,
                 no_mmproj: false,
                 use_repacked_ptq1: false,
+                bonsai25_variant: None,
                 native_engine: true,
                 native_row_workers: 4,
                 prompt_reuse: client::PromptReuse::Disabled,

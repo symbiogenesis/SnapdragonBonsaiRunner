@@ -213,6 +213,7 @@ fn configuration_for_family(
     let mut no_daisyrose_lora = false;
     let mut no_mmproj = false;
     let mut use_repacked_ptq1 = None;
+    let mut bonsai25_variant = None;
     let mut native_engine = None;
     let mut native_row_workers = None;
     let mut prompt_reuse = None;
@@ -242,6 +243,13 @@ fn configuration_for_family(
             }
             Some("--use-original-pq2") if use_repacked_ptq1.is_none() => {
                 use_repacked_ptq1 = Some(false);
+            }
+            Some("--bonsai-2-5") if bonsai25_variant.is_none() => {
+                bonsai25_variant = Some(next_str(
+                    &mut args,
+                    client::Bonsai25Variant::from_cli,
+                    "Bonsai 2.5 variant must be pq2 or ptq1.",
+                )?);
             }
             Some("--native-engine") if native_engine.is_none() => native_engine = Some(true),
             Some("--publisher-engine") if native_engine.is_none() => native_engine = Some(false),
@@ -423,7 +431,7 @@ fn configuration_for_family(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2|--bonsai-2-5 pq2|ptq1] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
@@ -490,6 +498,12 @@ fn configuration_for_family(
     if daisyrose_lora.is_some() && !native_engine {
         return Err("DaisyRose multi-rank LoRA requires --native-engine.");
     }
+    if bonsai25_variant.is_some() && use_repacked_ptq1.is_some() {
+        return Err("Do not combine --bonsai-2-5 with --use-repacked-ptq1 or --use-original-pq2.");
+    }
+    if bonsai25_variant.is_some() && !native_engine {
+        return Err("--bonsai-2-5 requires --native-engine.");
+    }
     if native_row_workers != 1 && !native_engine {
         return Err("Parallel native row workers require --native-engine.");
     }
@@ -544,6 +558,7 @@ fn configuration_for_family(
         no_daisyrose_lora,
         no_mmproj,
         use_repacked_ptq1: use_repacked_ptq1.unwrap_or(false),
+        bonsai25_variant,
         native_engine,
         native_row_workers,
         prompt_reuse,
@@ -909,6 +924,31 @@ mod tests {
                 rejected.extend([first, second].map(OsString::from));
                 assert!(configuration(rejected).is_err());
             }
+        }
+        for (flag, expected) in [
+            ("pq2", crate::client::Bonsai25Variant::Pq2),
+            ("ptq1", crate::client::Bonsai25Variant::Ptq1),
+        ] {
+            let mut valid = base.clone();
+            valid.extend(["--native-engine", "--bonsai-2-5", flag].map(OsString::from));
+            assert_eq!(
+                configuration(valid)
+                    .map_err(io::Error::other)?
+                    .bonsai25_variant,
+                Some(expected)
+            );
+        }
+        for bad in [
+            vec!["--bonsai-2-5"],
+            vec!["--bonsai-2-5", "invalid"],
+            vec!["--bonsai-2-5", "pq2", "--bonsai-2-5", "ptq1"],
+            vec!["--bonsai-2-5", "pq2", "--use-repacked-ptq1"],
+            vec!["--bonsai-2-5", "pq2", "--use-original-pq2"],
+            vec!["--publisher-engine", "--bonsai-2-5", "pq2"],
+        ] {
+            let mut rejected = base.clone();
+            rejected.extend(bad.into_iter().map(OsString::from));
+            assert!(configuration(rejected).is_err());
         }
         fs::remove_file(broker)?;
         fs::remove_dir(directory)?;

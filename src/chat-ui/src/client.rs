@@ -369,6 +369,29 @@ impl CpuFamily {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Bonsai25Variant {
+    Pq2,
+    Ptq1,
+}
+
+impl Bonsai25Variant {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Pq2 => "pq2",
+            Self::Ptq1 => "ptq1",
+        }
+    }
+
+    pub(crate) fn from_cli(value: &str) -> Option<Self> {
+        match value {
+            "pq2" => Some(Self::Pq2),
+            "ptq1" => Some(Self::Ptq1),
+            _ => None,
+        }
+    }
+}
+
 /// Fixed development launch inputs; paths and keys have no debug representation.
 #[derive(Clone)]
 #[expect(
@@ -387,6 +410,7 @@ pub(crate) struct Config {
     pub(crate) no_daisyrose_lora: bool,
     pub(crate) no_mmproj: bool,
     pub(crate) use_repacked_ptq1: bool,
+    pub(crate) bonsai25_variant: Option<Bonsai25Variant>,
     pub(crate) native_engine: bool,
     pub(crate) native_row_workers: u8,
     pub(crate) prompt_reuse: PromptReuse,
@@ -993,14 +1017,18 @@ fn runtime_arguments(config: &Config) -> Vec<String> {
     if config.no_mmproj {
         arguments.push("--no-mmproj".into());
     }
-    arguments.push(
-        if config.use_repacked_ptq1 {
-            "--use-repacked-ptq1"
-        } else {
-            "--use-original-pq2"
-        }
-        .into(),
-    );
+    if let Some(variant) = config.bonsai25_variant {
+        arguments.extend(["--bonsai-2-5".into(), variant.name().into()]);
+    } else {
+        arguments.push(
+            if config.use_repacked_ptq1 {
+                "--use-repacked-ptq1"
+            } else {
+                "--use-original-pq2"
+            }
+            .into(),
+        );
+    }
     arguments.push(
         if config.native_engine {
             "--native-engine"
@@ -2353,6 +2381,7 @@ mod tests {
             no_daisyrose_lora: false,
             no_mmproj: false,
             use_repacked_ptq1: false,
+            bonsai25_variant: None,
             native_engine: false,
             native_row_workers: 1,
             prompt_reuse: super::PromptReuse::Disabled,
@@ -2526,6 +2555,7 @@ mod tests {
             no_daisyrose_lora: false,
             no_mmproj: false,
             use_repacked_ptq1: false,
+            bonsai25_variant: None,
             native_engine: true,
             native_row_workers: 4,
             prompt_reuse: super::PromptReuse::Disabled,

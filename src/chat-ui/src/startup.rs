@@ -591,6 +591,7 @@ mod tests {
             no_daisyrose_lora: false,
             no_mmproj: false,
             use_repacked_ptq1: false,
+            bonsai25_variant: None,
             native_engine: true,
             native_row_workers: 4,
             prompt_reuse: crate::client::PromptReuse::Disabled,
