@@ -433,9 +433,12 @@ mod tests {
         });
         let chunk_bytes: usize = 64 * 1024 * 1024;
         let chunk_bytes_u64 = u64::try_from(chunk_bytes).map_err(|_| "chunk_bytes overflow")?;
-        let expected_chunks =
-            usize::try_from(Bonsai25Variant::Pq2.weight_bytes().div_ceil(chunk_bytes_u64))
-                .map_err(|_| "chunk count overflow")?;
+        let expected_chunks = usize::try_from(
+            Bonsai25Variant::Pq2
+                .weight_bytes()
+                .div_ceil(chunk_bytes_u64),
+        )
+        .map_err(|_| "chunk count overflow")?;
         let digests = vec!["a".repeat(64); expected_chunks];
 
         let mut valid: serde_json::Value =

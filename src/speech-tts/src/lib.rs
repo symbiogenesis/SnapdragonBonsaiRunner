@@ -468,10 +468,7 @@ impl<T> VoiceCache<T> {
     where
         T: VoiceParts,
     {
-        if self
-            .0
-            .as_ref()
-            .is_some_and(|(key, _)| &**key == profile)
+        if self.0.as_ref().is_some_and(|(key, _)| &**key == profile)
             && let Some((_, voice)) = self.0.as_mut()
         {
             return Ok(voice);
@@ -1278,10 +1275,7 @@ mod tests {
             fn into_talker(self) -> Self::Talker {
                 self.talker
             }
-            fn from_parts(
-                talker: Self::Talker,
-                reference: crate::rust_talker::Reference,
-            ) -> Self {
+            fn from_parts(talker: Self::Talker, reference: crate::rust_talker::Reference) -> Self {
                 Self { talker, reference }
             }
         }
@@ -1310,10 +1304,10 @@ mod tests {
         let ref_cache = Mutex::new(super::DerivedReferenceCache::new());
 
         let select = |cache: &mut VoiceCache<FakeVoice>,
-                          design: &mut Option<FakeTalker>,
-                          profile: &str,
-                          d_path: &std::path::Path,
-                          b_path: &std::path::Path|
+                      design: &mut Option<FakeTalker>,
+                      profile: &str,
+                      d_path: &std::path::Path,
+                      b_path: &std::path::Path|
          -> io::Result<(Vec<f32>, Vec<[i32; 16]>)> {
             let voice = cache.get_or_acquire(
                 profile,
@@ -1346,18 +1340,33 @@ mod tests {
                     ))
                 },
             )?;
-            Ok((voice.reference.speaker.clone(), voice.reference.codes.clone()))
+            Ok((
+                voice.reference.speaker.clone(),
+                voice.reference.codes.clone(),
+            ))
         };
 
         // Voice A cold -> runs VoiceDesign + Base load.
-        let (spk_a, codes_a) = select(&mut cache, &mut preloaded_design, "Warm narrator", &design_path, &base_path)?;
+        let (spk_a, codes_a) = select(
+            &mut cache,
+            &mut preloaded_design,
+            "Warm narrator",
+            &design_path,
+            &base_path,
+        )?;
         assert_eq!(design_runs.get(), 1);
         assert_eq!(base_loads.get(), 1);
         assert_eq!(alive_design.get(), 0);
         assert_eq!(alive_base.get(), 1);
 
         // Voice B cold -> drops Base, runs VoiceDesign + Base load.
-        let (spk_b, codes_b) = select(&mut cache, &mut preloaded_design, "Clear alto", &design_path, &base_path)?;
+        let (spk_b, codes_b) = select(
+            &mut cache,
+            &mut preloaded_design,
+            "Clear alto",
+            &design_path,
+            &base_path,
+        )?;
         assert_ne!(spk_a, spk_b);
         assert_ne!(codes_a, codes_b);
         assert_eq!(design_runs.get(), 2);
@@ -1365,7 +1374,13 @@ mod tests {
         assert_eq!(alive_base.get(), 1);
 
         // Switch back to Voice A -> hits derived cache AND reuses loaded Base Talker.
-        let (spk_a2, codes_a2) = select(&mut cache, &mut preloaded_design, "Warm narrator", &design_path, &base_path)?;
+        let (spk_a2, codes_a2) = select(
+            &mut cache,
+            &mut preloaded_design,
+            "Warm narrator",
+            &design_path,
+            &base_path,
+        )?;
         assert_eq!(spk_a2, spk_a);
         assert_eq!(codes_a2, codes_a);
         assert_eq!(design_runs.get(), 2);
@@ -1376,7 +1391,13 @@ mod tests {
         // only reloading Base.
         cache.0 = None;
         assert_eq!(alive_base.get(), 0);
-        let (spk_a3, codes_a3) = select(&mut cache, &mut preloaded_design, "Warm narrator", &design_path, &base_path)?;
+        let (spk_a3, codes_a3) = select(
+            &mut cache,
+            &mut preloaded_design,
+            "Warm narrator",
+            &design_path,
+            &base_path,
+        )?;
         assert_eq!(spk_a3, spk_a);
         assert_eq!(codes_a3, codes_a);
         assert_eq!(design_runs.get(), 2);
@@ -1389,8 +1410,13 @@ mod tests {
         let q4_sha = super::model_identity_sha256(&design_path, &base_path, &mut || Ok(()))?;
         assert_ne!(q4_sha, q8_sha);
         let mut q4_cache = VoiceCache::<FakeVoice>(None);
-        let (spk_a_q4, _) =
-            select(&mut q4_cache, &mut preloaded_design, "Warm narrator", &design_path, &base_path)?;
+        let (spk_a_q4, _) = select(
+            &mut q4_cache,
+            &mut preloaded_design,
+            "Warm narrator",
+            &design_path,
+            &base_path,
+        )?;
         assert_ne!(spk_a_q4, spk_a);
         assert_eq!(design_runs.get(), 3);
 
@@ -1413,7 +1439,13 @@ mod tests {
             );
         }
         assert!(lru.get("voice-0", &[1_u8; 32]).is_none());
-        assert!(lru.get(&format!("voice-{}", super::MAX_DERIVED_REFERENCES), &[1_u8; 32]).is_some());
+        assert!(
+            lru.get(
+                &format!("voice-{}", super::MAX_DERIVED_REFERENCES),
+                &[1_u8; 32]
+            )
+            .is_some()
+        );
         Ok(())
     }
 

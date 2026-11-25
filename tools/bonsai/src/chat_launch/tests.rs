@@ -1739,7 +1739,13 @@ fn session_options_0_1_32_validate_and_forward_in_chat_launch() -> crate::Result
 
     // Bug C fixed: `wy-f32` admits omitted `KvCache` (default `rsq4`) as well as
     // `f16`, `rsq4`, `rsq4kvf`, and `rsq4k3v`.
-    for kv in [None, Some("f16"), Some("rsq4"), Some("rsq4kvf"), Some("rsq4k3v")] {
+    for kv in [
+        None,
+        Some("f16"),
+        Some("rsq4"),
+        Some("rsq4kvf"),
+        Some("rsq4k3v"),
+    ] {
         let mut wy_fixture = fixture("wy-f32-kv")?;
         wy_fixture.request["NativeEngine"] = json!(true);
         wy_fixture.request["NoSpeechModels"] = json!(true);

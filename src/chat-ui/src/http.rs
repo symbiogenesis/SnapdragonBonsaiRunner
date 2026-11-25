@@ -929,11 +929,7 @@ mod tests {
             || std::time::Duration::from_millis(25),
             || {
                 checks += 1;
-                if checks >= 3 {
-                    Err("stopped")
-                } else {
-                    Ok(())
-                }
+                if checks >= 3 { Err("stopped") } else { Ok(()) }
             },
         );
         assert_eq!(cancelled.err(), Some(super::Error::Interrupted("stopped")));

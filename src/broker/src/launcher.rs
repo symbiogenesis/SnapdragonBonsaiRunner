@@ -2941,7 +2941,9 @@ async fn exchange_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     path: &str,
     key: Option<&str>,
 ) -> io::Result<Vec<u8>> {
-    let key_bytes = key.map_or(0, |secret| "Authorization: Bearer \r\n".len() + secret.len());
+    let key_bytes = key.map_or(0, |secret| {
+        "Authorization: Bearer \r\n".len() + secret.len()
+    });
     let mut request = String::with_capacity(64 + path.len() + key_bytes);
     let _ = std::fmt::Write::write_fmt(
         &mut request,
@@ -6155,12 +6157,18 @@ mod tests {
                 Poll::Ready(Ok(buf.len()))
             }
 
-            fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
                 self.flush_calls += 1;
                 Poll::Ready(Ok(()))
             }
 
-            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
         }

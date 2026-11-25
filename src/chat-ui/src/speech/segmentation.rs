@@ -64,8 +64,7 @@ pub(super) fn phrase_boundary(text: &str, maximum: usize) -> usize {
                 word = Some(index);
             }
             if is_clause_punctuation(character)
-                && let Some(end) =
-                    clause_pause_end(text, bounded, index, character, previous, true)
+                && let Some(end) = clause_pause_end(text, bounded, index, character, previous, true)
             {
                 clause = Some(end);
             }
@@ -93,8 +92,7 @@ pub(super) fn first_clause_boundary(
         }
         if speakable
             && is_clause_punctuation(character)
-            && let Some(end) =
-                clause_pause_end(text, bounded, index, character, previous, complete)
+            && let Some(end) = clause_pause_end(text, bounded, index, character, previous, complete)
             && text[..end].chars().count() >= min_chars
         {
             return Some(include_non_speakable_tail(text, limit, end, complete));

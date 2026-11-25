@@ -1080,7 +1080,11 @@ fn calibrated_cow_execution_matches_prism_accounting_across_packings_reuse_and_s
         true,
     )?;
     assert_eq!(
-        tile_64_plan.prefill_scratch_bytes.map(u64::try_from).transpose().map_err(|e| e.to_string())?,
+        tile_64_plan
+            .prefill_scratch_bytes
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|e| e.to_string())?,
         context::swift_tiled_prefill_scratch_bytes_for_tile(
             64,
             tile_64_plan.context_plan.context_tokens,

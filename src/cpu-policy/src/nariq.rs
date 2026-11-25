@@ -324,8 +324,8 @@ mod tests {
     }
 
     #[test]
-    fn nariq_lock_accepts_optional_chunk_manifests_and_rejects_malformed_ones()
-    -> Result<(), String> {
+    fn nariq_lock_accepts_optional_chunk_manifests_and_rejects_malformed_ones() -> Result<(), String>
+    {
         let data = Path::new(if cfg!(windows) {
             r"C:\BonsaiData"
         } else {

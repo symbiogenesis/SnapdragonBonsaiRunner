@@ -276,14 +276,9 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
                 "adapter"
             };
             prepare_cached_or_receive(url, path, bytes, hash, working, |u, p, b, h, w| {
-                crate::startup_download::receive_repair_observed(
-                    u,
-                    p,
-                    b,
-                    h,
-                    w,
-                    &mut |activity| artifact_status(working, stage, kind, p, b, activity),
-                )
+                crate::startup_download::receive_repair_observed(u, p, b, h, w, &mut |activity| {
+                    artifact_status(working, stage, kind, p, b, activity)
+                })
             })
         },
         |path, bytes, _hash| crate::startup_download::verify_length(path, bytes),
@@ -1082,7 +1077,10 @@ mod tests {
                 Ok(())
             },
         )?;
-        assert_eq!(repairs, 1, "missing file must enter verified receive/repair");
+        assert_eq!(
+            repairs, 1,
+            "missing file must enter verified receive/repair"
+        );
 
         fs::write(&artifact, b"hello").map_err(|error| error.to_string())?;
         prepare_cached_or_receive(

@@ -612,17 +612,11 @@ mod tests {
         text.append(" followed by a pause;", now)?;
         assert!(text.ready(now).is_empty());
         text.append(" then a detail:", now)?;
-        assert_eq!(
-            text.ready(now),
-            ["A quiet opening, followed by a pause;"]
-        );
+        assert_eq!(text.ready(now), ["A quiet opening, followed by a pause;"]);
         text.append(" and a complete ending.", now)?;
         assert!(text.ready(now).is_empty());
         text.append(" ", now)?;
-        assert_eq!(
-            text.ready(now),
-            ["then a detail: and a complete ending."]
-        );
+        assert_eq!(text.ready(now), ["then a detail: and a complete ending."]);
         text.finished = true;
         assert!(text.ready(now).is_empty());
         Ok(())
@@ -650,10 +644,7 @@ mod tests {
             );
             // Subsequent segments must NOT flush early on clause punctuation even >= 24 chars.
             text.append(" ", now)?;
-            assert_eq!(
-                text.ready(now),
-                ["following clause, kept for sentence."]
-            );
+            assert_eq!(text.ready(now), ["following clause, kept for sentence."]);
         }
         Ok(())
     }

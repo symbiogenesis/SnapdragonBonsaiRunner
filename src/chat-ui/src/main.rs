@@ -1136,7 +1136,9 @@ mod tests {
             (Some("rsq4k3v"), Some(crate::client::KvCache::Rsq4K3v)),
         ] {
             let mut wy_args = args.to_vec();
-            wy_args.extend(["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"].map(OsString::from));
+            wy_args.extend(
+                ["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"].map(OsString::from),
+            );
             if let Some(kv) = kv_name {
                 wy_args.extend(["--kv-cache", kv].map(OsString::from));
             }

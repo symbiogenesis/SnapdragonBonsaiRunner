@@ -760,7 +760,11 @@ impl Serialize for WireContent<'_> {
             return serializer.serialize_str(text.as_ref());
         }
         let has_text = !text.is_empty();
-        let len = self.message.images.len().saturating_add(usize::from(has_text));
+        let len = self
+            .message
+            .images
+            .len()
+            .saturating_add(usize::from(has_text));
         let mut seq = serializer.serialize_seq(Some(len))?;
         for url in self.message.images.iter() {
             seq.serialize_element(&WireContentPart::ImageUrl {

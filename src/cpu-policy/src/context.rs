@@ -545,11 +545,7 @@ impl SwiftExecutionShape {
     /// Attach Prism's exact `CPU` tiled-prefill scratch reserve for `tokens` (`8`,
     /// `16`, or `32`) at `context_tokens` using this shape's `kv_format`.
     #[must_use]
-    pub fn with_tiled_prefill_tokens(
-        self,
-        tokens: usize,
-        context_tokens: usize,
-    ) -> Option<Self> {
+    pub fn with_tiled_prefill_tokens(self, tokens: usize, context_tokens: usize) -> Option<Self> {
         self.with_tiled_prefill_tokens_for_tile(tokens, context_tokens, false)
     }
 

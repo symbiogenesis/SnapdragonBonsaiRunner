@@ -412,8 +412,15 @@ async fn write_buffered_sse_response<W: AsyncWrite + Unpin, R: AsyncBufRead + Un
         }
         // Small/fragmented spans retain immediate-ready coalescing and one
         // contiguous write. Never exchange saved copies for tiny socket writes.
-        if !forward_sse_chunk(client, body, &mut frame, &mut sent, &mut pending_head, deadline)
-            .await?
+        if !forward_sse_chunk(
+            client,
+            body,
+            &mut frame,
+            &mut sent,
+            &mut pending_head,
+            deadline,
+        )
+        .await?
         {
             break;
         }

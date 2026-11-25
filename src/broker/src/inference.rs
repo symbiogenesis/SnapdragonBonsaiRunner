@@ -708,7 +708,9 @@ pub(super) fn pinned_cpu_prefill_tokens(
     )
 }
 
-pub(super) fn parse_prefill_row_workers(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
+pub(super) fn parse_prefill_row_workers(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<u8, LaunchError> {
     parse_enum(
         value,
         &[("1", 1), ("4", 4), ("8", 8), ("12", 12), ("16", 16)],
@@ -1599,14 +1601,7 @@ mod tests {
             Ok(Some(16))
         );
         assert_eq!(
-            select_prefill_row_workers(
-                &future_pin,
-                true,
-                None,
-                None,
-                None,
-                Some(reviewed_0_1_36),
-            ),
+            select_prefill_row_workers(&future_pin, true, None, None, None, Some(reviewed_0_1_36),),
             Ok(Some(4))
         );
         assert_eq!(

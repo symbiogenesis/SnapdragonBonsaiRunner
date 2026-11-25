@@ -682,7 +682,9 @@ impl<S: AsyncRead + Unpin> BackendBody<S> {
                     digits,
                     cr: false,
                 } => {
-                    let max_hex = MAX_CHUNK_LINE_BYTES.saturating_sub(2).saturating_sub(digits);
+                    let max_hex = MAX_CHUNK_LINE_BYTES
+                        .saturating_sub(2)
+                        .saturating_sub(digits);
                     let scan = &available[..available.len().min(max_hex.saturating_add(1))];
                     if let Some(cr_pos) = memchr::memchr(b'\r', scan) {
                         match parse_hex_chunk_digits(value, digits, &scan[..cr_pos]) {

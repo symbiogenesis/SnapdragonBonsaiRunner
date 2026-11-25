@@ -1052,7 +1052,8 @@ fn validate_image_data_url_body(bytes: &[u8], pad: usize) -> bool {
 
 #[cfg(test)]
 fn validate_image_data_url(url: &str) -> bool {
-    validate_image_data_url_parts(url).is_some_and(|(bytes, pad)| validate_image_data_url_body(bytes, pad))
+    validate_image_data_url_parts(url)
+        .is_some_and(|(bytes, pad)| validate_image_data_url_body(bytes, pad))
 }
 
 fn validate_image_data_url_cached(url: &str, cache: Option<&ValidatedImageCache>) -> bool {
@@ -1075,8 +1076,11 @@ fn validate_image_data_url_cached(url: &str, cache: Option<&ValidatedImageCache>
 }
 
 fn validate_image_data_url_in_active_scope(url: &str) -> bool {
-    let cache = ACTIVE_IMAGE_CACHE
-        .with(|slot| slot.try_borrow().ok().and_then(|guard| guard.as_ref().map(Arc::clone)));
+    let cache = ACTIVE_IMAGE_CACHE.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(Arc::clone))
+    });
     validate_image_data_url_cached(url, cache.as_deref())
 }
 
@@ -1857,8 +1861,12 @@ mod tests {
                 .map_err(|_| Rejection::Configuration)
                 .map(|request| request.into_parts().0)
         };
-        policy.check_head(&head(valid_turn1.len())?)?.prepare(valid_turn1)?;
-        policy.check_head(&head(valid_turn2.len())?)?.prepare(valid_turn2)?;
+        policy
+            .check_head(&head(valid_turn1.len())?)?
+            .prepare(valid_turn1)?;
+        policy
+            .check_head(&head(valid_turn2.len())?)?
+            .prepare(valid_turn2)?;
         assert_eq!(
             policy
                 .check_head(&head(invalid_turn.len())?)?
