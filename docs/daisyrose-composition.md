@@ -393,14 +393,16 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
      `pinned_daisyrose_lora_artifact` in [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs)
      continues to return `Ok(None)` pending a qualified `config/daisyrose-lora.lock.json`
      and owner `DR-G2` review.
-   - **Trial #2 update ([bonsai-2-5-x2-vet.md](evidence/bonsai-2-5-x2-vet.md)):**
+   - **Trials #2 & #3 update ([bonsai-2-5-x2-vet.md](evidence/bonsai-2-5-x2-vet.md)):**
      On `bonsai-2.5-pq2` Orca-free + `daisyrose-npu-r16-drw1.gguf` (`scale 1.0`,
-     `reasoningEffort: "medium"`, `reasoningBudget: 448`, `900 s` AC allowance),
-     zero-scale parity (`0` mismatches) and `3/3` Thinking-ON pairs completed in
-     `886.959 s` (`itemCount: 3`, sealed packet `4b221d19...`; `dr-g2-blind-key.json`
-     and `dr-g2-responses.json` unopened), while `creative-b25-001`
-     (`thinkingOff`) was cleanly skipped by the remaining-budget guard and requires
-     a separate AC-budgeted capture before running `dr-g2-score`.
+     `reasoningEffort: "medium"`, `reasoningBudget: 448`), Trial #2 (`886.959 s`,
+     `900 s` AC allowance) sealed zero-scale parity (`0` mismatches) and `3/3`
+     Thinking-ON pairs (`4b221d19...`) while skipping `creative-b25-001` on the
+     budget guard; Trial #3 (`138.826 s`, `300 s` AC allowance) then captured
+     `creative-b25-001` (`thinkingOff`) via pure-Rust `supplementEvidencePath`
+     and sealed the complete `4/4` blind packet (`6dc82c06...`;
+     `dr-g2-blind-key.json` and `dr-g2-responses.json` remain unopened) for
+     owner blinded review and fail-closed `dr-g2-score`.
    - **Newly landed `DR-C1` work in `..\prism-inference`:**
      - `examples/swift_model_check.rs`, `examples/swift_model_check/request_timing.rs`,
        and `examples/swift_model_check/ffn_timing.rs` support `--nariq`
@@ -483,8 +485,8 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
      matched-power full-adapter X1/X2 device qualification under
      [validation](validation.md) and
      [Swift LoRA qualification](swift-lora.md#standard-profile-qualification),
-     a separate Thinking-OFF creative capture on `bonsai-2.5-pq2` plus owner
-     blinded `DR-G2` review, and owning CI (`source-checks`, `foundation`) remain open.
+     owner blinded `DR-G2` review on `6dc82c06...`, and owning CI (`source-checks`,
+     `foundation`) remain open.
 
 ## Zero-retraining workflow, direct-edit fallback, and promotion checklist
 

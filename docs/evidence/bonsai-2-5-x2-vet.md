@@ -43,6 +43,19 @@ This note records bounded AC-logged owner-device trials on Snapdragon X2 for `pr
   - `responsesSha256: bd94f19cc5f0218d8c65f89e8ed6e9a68f0d996dfb02ef0d0cd4491bff4782c2` (`dr-g2-responses.json` unopened)
   - `blindKeySha256: 8ecc38316ec7156b8daa3d5171dba6d60a3d4d45c6db1a7ad2e52974a3648c9b` (`dr-g2-blind-key.json` unopened)
 
+## Trial #3 — AC-logged Thinking-OFF supplement capture (`<= 300 s` budget)
+
+- **Configuration & binaries:** Prebuilt `bonsai-tools.exe` (`14,538,240` bytes, SHA-256 `6c1dc5c5b9717819a61a5af4b2fcdc1768b050eac1db43d9b9a916d98b19d92e`, commit `b83fbea3`) and published `prism-inference-server.exe` (`v0.1.35`, `3bc76f13...`, SHA-256 `8cf39507...`) run with `supplementEvidencePath` / `supplementResponsesPath` pointing to sealed Trial #2 (`69a2fae9...`) under the identical `bonsai-2.5-pq2` Orca-free + `daisyrose-npu-r16-drw1.gguf` (`selectedScale: 1.0`, `contractSha256: e4f77b6f...`) contract (`innerTimeBudgetSeconds: 285`, zero compilation/network inside timer). Trial #2's directory remains untouched.
+- **Timing, power & cleanup:** `138.826 s` total wrapper elapsed (`136,307 ms` inside `dr-g2-capture`, `2026-11-25T16:16:00.609Z` to `16:18:19.435Z`), AC online at preflight, `powerBefore`, `powerAfter`, and both `creative-b25-001` arm endpoints (`ac_online: true`, `battery_percent: 99`, `battery_saver: false`, `performanceComparisonEligible: true`; continuous mid-run power stability remains unproven), `sleepInhibitionActive: true`, `lingeringProcessCount: 0`, `credDirExistsAfter: false`.
+- **Captured outcome (`status: "capture-completed"`, `completed: true`, `budgetExceeded: false`):**
+  - `creative-b25-001` (`creative-prose`, `enableThinking: false`, cap `384`): baseline `77 + 242` tokens (`64,151 ms`, `finishReason: "stop"`), candidate `77 + 271` tokens (`63,573 ms`, `finishReason: "stop"`); `hit4096Truncation: false`, `loopDetected: false`, `unwantedRefusal: false`, distinct `responseSha256` (`8a3e04ab...` vs `b7c68f36...`).
+- **Complete `4/4` sealed blind review packet (key and responses remain unopened):**
+  - Directory: `%LOCALAPPDATA%\SwiftBonsai2\staging\daisyrose-dr-e1\dr-g2-awake-bonsai25-pq2-3bc76f1-r16-drw1-s10-heldout-001-complete\`
+  - `dr-g2-blind-packet.json` (`itemCount: 4`, SHA-256 `6dc82c06739de52c3274b1d1704ca99c9c9d3ad603a448797fd43ccacc5b0cc1`)
+  - `dr-g2-evidence.json` (`evidenceSha256: bda85f10ff332fa765fbd76840b691d02f912ed2aab90cd0b48edbf601dbc208`, `contractSha256: e4f77b6f9a05feb47132329752d60a7326f9f4045af03e1d6461e209020937af`, `completedZeroControls: 1`, `completedThinkingOn: 3`, `completedThinkingOff: 1`, `zeroScaleMismatches: 0`)
+  - `responsesSha256: 99380cbfe46a24222c310d18089df44ba47344a665413b86838db7aabc1bfdd5` (`dr-g2-responses.json` unopened)
+  - `blindKeySha256: b6f40f7a3f1c10bfe401fa474f5dce1a4dedca96756bf2c35a303a7e2775a562` (`dr-g2-blind-key.json` unopened)
+
 ## Swifting Bonsai 2.5 exploration (No-Go)
 
 - **Outcome:** **No-Go (stripped).** Neither `Swift-Bonsai-2` PQ2 diff extraction nor BF16 `ukisai/Swift-1.5-Qwen3.8-27b` minus `Qwen/Qwen3.8-27B` LoRA extraction (`npu-friendly` or full-linear `AnyLinear`) transferred useful anti-overthinking behavior onto `Ternary-Bonsai-2.5-27B-PQ2_0`. All Swifting source code, temporary Prism probe worktree/branch/binaries, and staged Swift adapters/receipts were removed completely; the `Ternary-Bonsai-2.5-27B` + `DaisyRose` path remains 100% Apache-2.0.
@@ -61,6 +74,6 @@ This note records bounded AC-logged owner-device trials on Snapdragon X2 for `pr
 
 ## Remaining qualification limits
 
-- Full `dr-g2-score` requires at least one Thinking-OFF (`creative-prose`) prompt pair (`readiness.rs` fails closed without it), so a separate AC-budgeted Thinking-OFF capture plus owner blinded review (`dr-g2-apply-reviews` -> `dr-g2-score`) remain open.
+- Trial #3 completed the missing Thinking-OFF (`creative-b25-001`) pair in `138.826 s` AC and sealed the complete `4/4` merged blind packet (`6dc82c06...`); owner blinded review (`dr-g2-apply-reviews` -> `dr-g2-score`) remains open.
 - Snapdragon X1 testing, physical X1/X2 Hexagon NPU / Adreno Vulkan / Composite device-resident multi-rank LoRA trials, and `*-mtp` (`nextn_predict_layers = 1`, planned for `v0.1.36+`) remain open.
 - `Swift-Bonsai-2-PQ2_0` + Orca remains the default profile until blinded `DR-G2` review and full acceptance qualification close.
