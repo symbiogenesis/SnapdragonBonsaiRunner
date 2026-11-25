@@ -944,19 +944,17 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   `dr-g2-capture` harness (`0dd8a7e8`, updated to retain completed-arm timings
   and support optional `reasoningEffort` / `reasoningBudget` / `cpuPrefillGdn`)
   are checked in locally. Closed local `prism-inference-server` runs verified
-  bit-exact `scale = 0.0` parity (`zero-ctrl-001` `51` tokens `cb08876d...`,
-  `zero-ctrl-002` `64` tokens `967dea21...`) alongside partial captures
-  (`1/8` pairs on battery CPU, `2/8` pairs on `28d47fe` AC `900 s` ceiling,
-  `1/4` pairs on `91298a4c` AC before host Windows suspend exceeded `900 s`, and
-  `1/4` pairs on awake `v0.1.34` AC `885.027 s` with `sleepInhibitionActive: true`
-  and `if-003` byte-identical JSON / `1.047x` thinking tokens before `coding-003`
-  hit the `885 s` deadline under `v0.1.34` hardcoded `reasoning_effort: "xhigh"`;
+  bit-exact `scale = 0.0` parity (`zero-ctrl-001`..`008`), diagnostic
+  `r = 16 @ 1.0` (`if-001`..`004` byte-identical JSON) and `r = 32 @ 2.0` runs
+  on `51a5a84` (`*-005` `4/4` in `573.9 s`, `*-006` `coding-006` win, `*-007`
+  `coding-007` syntax regression triggering `DR-W1`), plus a complete
+  `4/4`-category untouched held-out awake AC capture on `DR-W1`
+  `daisyrose-npu-r16-drw1.gguf @ 1.0` (`*-008`, `664.15 s` <= `900 s`,
+  `1.0149x` median thinking ratio, `0` loops/truncations,
+  `zeroScaleMismatches = 0`, sealed as `packetSha256 = 399d08ed...`;
   [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md)).
-  Awake AC-powered 4-category completion (`coding`, `reasoning`,
-  `instruction-following`, `creative-prose`) inside `<= 900 s` (via Prism
-  `v0.1.35+` configurable `reasoningEffort` / `reasoningBudget` or tighter
-  single-focus prompts), blinded owner review (`humanReviewed: true`), and
-  fail-closed `dr-g2-score` pass remain open.
+  Blinded owner review (`humanReviewed: true` via `dr-g2-apply-reviews`) and
+  fail-closed `dr-g2-score` on the sealed `*-008` packet remain open.
 - [ ] **DR-W1 — Conditional pure-Rust direct weight editing on the multi-rank LoRA if `DR-G2` fails (zero retraining).**
   Triggered only if the unedited `DR-E1` stack fails `DR-G2`; keep
   `Swift-Bonsai-2`'s packed ternary base immutable and stay inside `npu-friendly`
@@ -992,8 +990,13 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   `calibration_metrics` KL-gap/Softmax-Fisher/MCKP `reallocate-ranks`,
   `fold-patch` (`append` & `fold-svd`, `e17d2c96`), and `realign-factors`
   (`realign-b`/`realign-a`/`alternating-ab` Tikhonov ridge with fail-closed
-  `allowDevelopmentRegression` gate, `60a0591c`); conditional `DR-G2` trigger,
-  X1/X2 device qualification, and owning CI remain open.)
+  `allowDevelopmentRegression` gate, `60a0591c`); `DR-W1` was triggered by
+  `coding-007` uniform-gain syntax regression, producing verified
+  `daisyrose-npu-r16-drw1.gguf` (`66,930,944` B, SHA-256 `ba307a5f...`, cosine
+  depth steering `0.35 -> 1.75`, SNR `familyScales`, Orca B-side
+  orthogonalization across `80` sites, sealed held-out `*-008` capture
+  complete); owner blinded review (`dr-g2-score`), X1/X2 device qualification,
+  and owning CI remain open.)
 - [ ] **DR-C1 — Extend `prism-inference` for stackable `MultiRankAdapter` after `DR-G2` passes.**
   Generalize `prism-inference` (`src/model/lora.rs`) beyond rank-1
   `RankOneAdapter` to support a stackable `MultiRankAdapter` alongside
@@ -1014,7 +1017,11 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   rollback / matched-AC overhead vets (`138.61 s` on battery; `48.518 s` /
   `5.07%` mean overhead on `28d47fe`; `65.152 s` / **`3.16%` mean / `3.56%`
   median overhead** `<= 10%`, `+74.05 MiB` WS / `+74.20 MiB` private RAM,
-  bit-exact `0.0`, `6/6` rollback on `91298a4c`;
+  bit-exact `0.0`, `6/6` rollback on `91298a4c`; `51a5a84` matched-AC vets on
+  `daisyrose-npu-r32.gguf @ 2.0` (`49.193 s`, `-1.9%` mean / `5.01%` median,
+  `+137.60 MiB` WS) and `DR-W1` `daisyrose-npu-r16-drw1.gguf @ 1.0` (`56.714 s`,
+  `6.66%` mean / `8.27%` median, `+64.28 MiB` WS, `8/8` bit-exact `0.0`, `6/6`
+  rollback);
   [DR-E1/DR-G2 screen summary](docs/evidence/daisyrose-dr-e1-dr-g2-screen.md))
   are complete locally; publishing a Prism `v0.1.35+` release bundle containing
   the NariQ + `7fe4bbf`/`51a5a84` updates, lock repin, `DR-G2` human review,
@@ -1044,11 +1051,14 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   auto-attach guard, and `Vulkan`/`Composite` suffix-speculation readiness
   checks (`449d97e9`), and native UI loaded rank/fingerprint display
   (`Loaded: rank ≤<rank> · <prefix>`) plus `+ <N> MiB DaisyRose` footprint
-  diagnostics (`418c123b`) are complete locally; `config/daisyrose-lora.lock.json`
-  (`pinned_daisyrose_lora_artifact`), Prism `v0.1.35+` release publication and
-  repin for NariQ (`NARIQ_TRELLIS_RELEASE`) + `DR-C1` updates (`7fe4bbf`,
-  `51a5a84`), physical X1/X2 matched-power throughput/RAM qualification, awake
-  4-category `DR-G2` + held-out human review, and owning CI remain open.
+  diagnostics (`418c123b`), `51a5a84` matched-AC `r = 32` / `DR-W1 r = 16` vets,
+  and sealed `4/4` `*-008` `DR-G2` capture (`packetSha256 = 399d08ed...`) are
+  complete locally; `config/daisyrose-lora.lock.json`
+  (`pinned_daisyrose_lora_artifact`), optional Prism `v0.1.35+` release
+  publication and repin for NariQ (`NARIQ_TRELLIS_RELEASE`) + `DR-C1` updates
+  (`7fe4bbf`, `51a5a84`), physical X1/X2 matched-power throughput/RAM
+  qualification, owner blinded review (`humanReviewed: true`) & fail-closed
+  `dr-g2-score` on the sealed `*-008` packet, and owning CI remain open.
 - [ ] **DR-Alt — Conditional alternative Qwen3.8-27B donor & quantization-residual `MultiRankAdapter` lane.**
   Using `MultiRankAdapter` without retraining Swift's ternary base, audit and
   screen alternative donors tracked in

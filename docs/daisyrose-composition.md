@@ -435,20 +435,29 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
      AC-powered 4-layer `r = 16` synthetic fixture (`status: "passed"` in
      `33.875 s`; see
      [multi-rank wiring and vet](evidence/daisyrose-multirank-wiring-vet.md)),
-     and full 64-layer (`128`-pair `daisyrose-npu-r16.gguf`) parity, rollback,
-     and matched-AC overhead vets (`3.16%` mean / `3.56%` median overhead on
-     `91298a4c`; see
+     and full 64-layer (`128`-pair) parity, rollback, and matched-AC overhead
+     vets (`3.16%` mean / `3.56%` median overhead for `daisyrose-npu-r16.gguf @ 1.0`
+     on `91298a4c`; `-1.9%` mean / `5.01%` median overhead for
+     `daisyrose-npu-r32.gguf @ 2.0` on `51a5a84`; and `6.66%` mean / `8.27%`
+     median overhead, `+64.28 MiB` WS, `8/8` bit-exact `0.0`, `6/6` rollback for
+     pure-Rust `DR-W1` `daisyrose-npu-r16-drw1.gguf @ 1.0` on `51a5a84`; see
      [DR-E1/DR-G2 screen summary](evidence/daisyrose-dr-e1-dr-g2-screen.md)).
-     Promoting DaisyRose to default-on still requires awake AC 4-category
-     `DR-G2` capture + blinded held-out human review (`humanReviewed: true`,
-     plus conditional `DR-W1` direct weight editing only if needed), immutable
-     remote hosting + `config/daisyrose-lora.lock.json`, Prism `v0.1.35+`
-     release publication and repin in `config/prism-inference.lock.json` (for
+     An awake AC untouched held-out `4/4`-category `DR-G2` capture (`*-008`,
+     `664.15 s`, `zeroScaleMismatches = 0`, `1.0149x` median thinking token
+     ratio, `0` loops/truncations) completed on `daisyrose-npu-r16-drw1.gguf @ 1.0`
+     and is sealed as
+     `packetSha256 = 399d08ed0fa685b8bccc3f1cddfdaeb59134f142d24c94ecf796f45535e9558a`
+     awaiting owner blinded review (`humanReviewed = true`) and fail-closed
+     `dr-g2-score` to decide default-on promotion vs categorical no-go. If
+     promoted, immutable remote hosting + `config/daisyrose-lora.lock.json`
+     (`pinned_daisyrose_lora_artifact`), optional Prism `v0.1.35+` release
+     publication and repin in `config/prism-inference.lock.json` (for
      `NARIQ_TRELLIS_RELEASE`, `RSQ4KVF_RELEASE`, and the new `DR-C1`
-     parity/timing updates), matched-power full-adapter X1/X2 device
-     qualification under [validation](validation.md) and
+     parity/timing updates; `MULTI_RANK_LORA_RELEASE` is already enabled on
+     `0.1.34`), matched-power full-adapter X1/X2 device qualification under
+     [validation](validation.md) and
      [Swift LoRA qualification](swift-lora.md#standard-profile-qualification),
-     and owning CI (`source-checks`, `foundation`).
+     and owning CI (`source-checks`, `foundation`) remain open.
 
 ## Zero-retraining workflow, direct-edit fallback, and promotion checklist
 
