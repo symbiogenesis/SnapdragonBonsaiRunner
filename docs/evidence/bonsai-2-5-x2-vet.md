@@ -49,12 +49,35 @@ This note records bounded AC-logged owner-device trials on Snapdragon X2 for `pr
 - **Timing, power & cleanup:** `138.826 s` total wrapper elapsed (`136,307 ms` inside `dr-g2-capture`, `2026-11-25T16:16:00.609Z` to `16:18:19.435Z`), AC online at preflight, `powerBefore`, `powerAfter`, and both `creative-b25-001` arm endpoints (`ac_online: true`, `battery_percent: 99`, `battery_saver: false`, `performanceComparisonEligible: true`; continuous mid-run power stability remains unproven), `sleepInhibitionActive: true`, `lingeringProcessCount: 0`, `credDirExistsAfter: false`.
 - **Captured outcome (`status: "capture-completed"`, `completed: true`, `budgetExceeded: false`):**
   - `creative-b25-001` (`creative-prose`, `enableThinking: false`, cap `384`): baseline `77 + 242` tokens (`64,151 ms`, `finishReason: "stop"`), candidate `77 + 271` tokens (`63,573 ms`, `finishReason: "stop"`); `hit4096Truncation: false`, `loopDetected: false`, `unwantedRefusal: false`, distinct `responseSha256` (`8a3e04ab...` vs `b7c68f36...`).
-- **Complete `4/4` sealed blind review packet (key and responses remain unopened):**
+- **Complete `4/4` sealed blind review packet (before delegated scoring):**
   - Directory: `%LOCALAPPDATA%\SwiftBonsai2\staging\daisyrose-dr-e1\dr-g2-awake-bonsai25-pq2-3bc76f1-r16-drw1-s10-heldout-001-complete\`
   - `dr-g2-blind-packet.json` (`itemCount: 4`, SHA-256 `6dc82c06739de52c3274b1d1704ca99c9c9d3ad603a448797fd43ccacc5b0cc1`)
   - `dr-g2-evidence.json` (`evidenceSha256: bda85f10ff332fa765fbd76840b691d02f912ed2aab90cd0b48edbf601dbc208`, `contractSha256: e4f77b6f9a05feb47132329752d60a7326f9f4045af03e1d6461e209020937af`, `completedZeroControls: 1`, `completedThinkingOn: 3`, `completedThinkingOff: 1`, `zeroScaleMismatches: 0`)
-  - `responsesSha256: 99380cbfe46a24222c310d18089df44ba47344a665413b86838db7aabc1bfdd5` (`dr-g2-responses.json` unopened)
-  - `blindKeySha256: b6f40f7a3f1c10bfe401fa474f5dce1a4dedca96756bf2c35a303a7e2775a562` (`dr-g2-blind-key.json` unopened)
+  - `responsesSha256: 99380cbfe46a24222c310d18089df44ba47344a665413b86838db7aabc1bfdd5` (`dr-g2-responses.json` remained unopened during scoring)
+  - `blindKeySha256: b6f40f7a3f1c10bfe401fa474f5dce1a4dedca96756bf2c35a303a7e2775a562` (`dr-g2-blind-key.json` remained unopened until `dr-g2-apply-reviews`)
+
+## Delegated blinded `DR-G2` review and fail-closed `dr-g2-score` verdict (`drG2Passed: false` — No-Go for default flip)
+
+- **Reviewer provenance & tooling:** Owner-delegated blinded assessment (`reviewerId: "agent-delegated-by-owner"`, not an independent external human reviewer). All four `Arm A` / `Arm B` ratings were locked blind against `dr-g2-blind-packet.json` (`6dc82c06...`) before `dr-g2-blind-key.json` (`b6f40f7a...`) was unblinded via prebuilt `bonsai-tools.exe` `dr-g2-apply-reviews` and independently re-scored via `dr-g2-score`.
+- **Retained review & score artifacts (same Trial #3 directory):**
+  - `dr-g2-blind-packet-reviewed.json`: SHA-256 `19c40b843a14ca92dcedbf188305fc3d5f3dad33d97c9071d640b98cde0a1393`
+  - `dr-g2-evidence-reviewed.json`: SHA-256 `a9110b2f498ec50e781d50081de54b470be76566aa29372f4181869efd57218b`
+  - `dr-g2-apply-receipt.json`: SHA-256 `1722da9b4d1c5c6d9cd6467b5d1d314a47814e4ebfec202cffc66777461bee48`
+  - `dr-g2-score-receipt.json`: SHA-256 `9d8e9a71dacdd672867168473bc2b617431fa08e2087994c15cd1a7582e93ff9`
+
+| Prompt ID | Category | Blind placement (`Arm A` / `Arm B`) | Baseline (`0.0`) | Candidate (`1.0`) | Delta | Rationale summary |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| `if-b25-001` | `instruction-following` (Thinking-ON) | `baseline` / `candidate` | `4.0` | `4.0` | `0.0` | Both produced byte-identical exact minified JSON matching schema, dependency filtering, sorting, and sums. |
+| `coding-b25-001` | `coding` (Thinking-ON) | `baseline` / `candidate` | `1.5` | `3.0` | `+1.5` | Baseline used broken `used <= limit.saturating_sub(w)` (admitting `w > limit` at `used == 0`), lacked `else { break; }`, and omitted bullet list formatting; candidate used bullets and `else { break; }`, missing only `checked_add` near `u64::MAX`. |
+| `reasoning-b25-001` | `reasoning` (Thinking-ON) | `candidate` / `baseline` | `1.5` | `2.5` | `+1.0` | Baseline computed wrong second-draw probability `1/8` and emitted invalid fraction `635/531 > 1`; candidate derived exact unreduced numerator/denominator `94754/219303` (`1606/3717`), erring only in final GCD reduction to `1504/3481`. |
+| `creative-b25-001` | `creative-prose` (Thinking-OFF) | `candidate` / `baseline` | `3.5` | `3.2` | `-0.3` | Both cleared the `>= 3.0` floor with `0` unwanted refusals; baseline had cleaner physical restraint despite dawn-timing drift, while candidate kept night-before timing but introduced "chalk was old ... previous night's darkness" and "turned the dial" phrasing slips. |
+
+- **Fail-closed `dr-g2-score` summary (`drG2Passed: false`, `status: "failed"`):**
+  - **Gate 1 — `capabilityGain` (`passed: true`):** Overall Thinking-ON mean `3.1667` vs `2.3333` (`+0.8333`), zero per-category regressions (`coding` `+1.5`, `reasoning` `+1.0`, `instruction-following` `0.0`).
+  - **Gate 2 — `antiLoopingPreservation` (`passed: true`):** Median Thinking-ON tokens `474.0` vs `472.0` (`ratio = 1.0042 <= 1.10`), `0` loops (`baselineLoops = 0`, `candidateLoops = 0`), `0` `4,096`-token truncations.
+  - **Gate 3 — `creativeAndOrcaNonRegression` (`passed: false`):** `candidateMedianScore = 3.2 < baselineMedianScore = 3.5` (`n = 1`, `candidateMinScore = 3.2 >= 3.0`, `0` unwanted refusals) — triggers `failures: ["Thinking-OFF creative median score regressed (3.2000 < 3.5000)."]`.
+  - **Gate 4 — `zeroScaleIdentity` (`passed: true`):** `controlCount = 1`, `mismatchCount = 0`.
+- **No-Go / Hold decision for default-on promotion:** Fail-closed `DR-G2` Gate 3 failed on `creative-b25-001` (`3.2 < 3.5`, `n = 1`), `daisyrose-npu-r16-drw1.gguf` (`ba307a5f...`) currently has no immutable remote HTTPS URL (`huggingface` / `github` / `github-release`) required by `config/daisyrose-lora.lock.json` (`defaultEnabled: true`), and `Ternary-Bonsai-2.5-27B-PQ2_0` without DaisyRose scored `1.5/4.0` on coding and reasoning under `reasoningBudget: 448` while lacking head-to-head qualification against `Swift-Bonsai-2-PQ2_0`. Keep `Swift-Bonsai-2-PQ2_0` + Orca unchanged as default and `config/daisyrose-lora.lock.json` unpinned.
 
 ## Swifting Bonsai 2.5 exploration (No-Go)
 
@@ -74,6 +97,7 @@ This note records bounded AC-logged owner-device trials on Snapdragon X2 for `pr
 
 ## Remaining qualification limits
 
-- Trial #3 completed the missing Thinking-OFF (`creative-b25-001`) pair in `138.826 s` AC and sealed the complete `4/4` merged blind packet (`6dc82c06...`); owner blinded review (`dr-g2-apply-reviews` -> `dr-g2-score`) remains open.
-- Snapdragon X1 testing, physical X1/X2 Hexagon NPU / Adreno Vulkan / Composite device-resident multi-rank LoRA trials, and `*-mtp` (`nextn_predict_layers = 1`, planned for `v0.1.36+`) remain open.
-- `Swift-Bonsai-2-PQ2_0` + Orca remains the default profile until blinded `DR-G2` review and full acceptance qualification close.
+- Delegated blinded `DR-G2` review on the complete `4/4` merged packet (`6dc82c06...`) closed **No-Go (`drG2Passed: false`, `9d8e9a71...`)** for immediate default flip (`3/4` gates passed with `+0.8333` Thinking-ON gain, failed Gate 3 `3.2 < 3.5` on `n = 1` Thinking-OFF `creative-b25-001`). Disjoint multi-prompt Thinking-OFF follow-up (or `DR-W1` refinement), independent human review, and immutable remote hosting (`huggingface`/`github-release`) for `daisyrose-npu-r16-drw1.gguf` remain open before `config/daisyrose-lora.lock.json` can be pinned.
+- Standalone `Ternary-Bonsai-2.5-27B-PQ2_0` (without DaisyRose) scored `1.5/4.0` on `coding-b25-001` and `reasoning-b25-001` (`2.3333` Thinking-ON mean under `reasoningBudget: 448`) and still lacks a head-to-head comparison against `Swift-Bonsai-2-PQ2_0`.
+- Snapdragon X1 testing, physical X1/X2 Hexagon NPU / Adreno Vulkan / Composite device-resident multi-rank LoRA trials, owning CI (`source-checks`, `foundation`), and `*-mtp` (`nextn_predict_layers = 1`, planned for `v0.1.36+`) remain open.
+- `Swift-Bonsai-2-PQ2_0` + Orca remains the default profile and `config/daisyrose-lora.lock.json` remains unpinned (`Ok(None)`).

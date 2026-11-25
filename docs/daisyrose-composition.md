@@ -393,16 +393,23 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
      `pinned_daisyrose_lora_artifact` in [daisyrose.rs](../src/cpu-policy/src/daisyrose.rs)
      continues to return `Ok(None)` pending a qualified `config/daisyrose-lora.lock.json`
      and owner `DR-G2` review.
-   - **Trials #2 & #3 update ([bonsai-2-5-x2-vet.md](evidence/bonsai-2-5-x2-vet.md)):**
+   - **Trials #2 & #3 + delegated blinded review ([bonsai-2-5-x2-vet.md](evidence/bonsai-2-5-x2-vet.md)):**
      On `bonsai-2.5-pq2` Orca-free + `daisyrose-npu-r16-drw1.gguf` (`scale 1.0`,
      `reasoningEffort: "medium"`, `reasoningBudget: 448`), Trial #2 (`886.959 s`,
      `900 s` AC allowance) sealed zero-scale parity (`0` mismatches) and `3/3`
      Thinking-ON pairs (`4b221d19...`) while skipping `creative-b25-001` on the
-     budget guard; Trial #3 (`138.826 s`, `300 s` AC allowance) then captured
+     budget guard; Trial #3 (`138.826 s`, `300 s` AC allowance) captured
      `creative-b25-001` (`thinkingOff`) via pure-Rust `supplementEvidencePath`
-     and sealed the complete `4/4` blind packet (`6dc82c06...`;
-     `dr-g2-blind-key.json` and `dr-g2-responses.json` remain unopened) for
-     owner blinded review and fail-closed `dr-g2-score`.
+     and sealed the complete `4/4` blind packet (`6dc82c06...`). Owner-delegated
+     blinded scoring (`reviewerId: "agent-delegated-by-owner"`, pre-unblinding
+     scores applied via `dr-g2-apply-reviews` and scored via `dr-g2-score`,
+     receipt `9d8e9a71...`) returned **`drG2Passed: false` (No-Go for default flip today)**:
+     `3/4` gates passed (`capabilityGain` `+0.8333` with `coding` `+1.5`, `reasoning`
+     `+1.0`, `instruction-following` `0.0`; `antiLoopingPreservation` `474 / 472 = 1.0042x`,
+     `0` loops/truncations; `zeroScaleIdentity` `0/1` mismatches), while Gate 3
+     (`creativeAndOrcaNonRegression`) failed strictly (`3.2 < 3.5` on `n = 1`
+     `creative-b25-001`, though clearing the `>= 3.0` floor with `0` refusals).
+     Default remains `Swift-Bonsai-2-PQ2_0` + Orca.
    - **Newly landed `DR-C1` work in `..\prism-inference`:**
      - `examples/swift_model_check.rs`, `examples/swift_model_check/request_timing.rs`,
        and `examples/swift_model_check/ffn_timing.rs` support `--nariq`
@@ -477,16 +484,19 @@ No promoted default lock ships until **`DR-G2`** passes on `--publisher-engine`
      and is sealed as
      `packetSha256 = 399d08ed0fa685b8bccc3f1cddfdaeb59134f142d24c94ecf796f45535e9558a`
      awaiting owner blinded review (`humanReviewed = true`) and fail-closed
-     `dr-g2-score` to decide default-on promotion vs categorical no-go. Prism
+     `dr-g2-score` to decide default-on promotion vs categorical no-go, while the
+     `bonsai-2.5-pq2` `6dc82c06...` packet completed delegated blinded scoring
+     (`9d8e9a71...`, **`drG2Passed: false`**: `3/4` gates passed with `+0.8333`
+     Thinking-ON gain, failed Gate 3 `3.2 < 3.5` on `n = 1` Thinking-OFF). Prism
      `v0.1.35` (`3bc76f135bf23c538b3bb789aef382143ff36839`) is now pinned with
      `MULTI_RANK_LORA_RELEASE`, `RSQ4KVF_RELEASE`, `NARIQ_TRELLIS_RELEASE`, and
-     `BONSAI_2_5_RELEASE` enabled; if promoted, immutable remote hosting +
-     `config/daisyrose-lora.lock.json` (`pinned_daisyrose_lora_artifact`),
+     `BONSAI_2_5_RELEASE` enabled; before any default flip, a passing disjoint
+     Thinking-OFF screen or `DR-W1` pass + independent human review, immutable remote
+     hosting + `config/daisyrose-lora.lock.json` (`pinned_daisyrose_lora_artifact`),
      matched-power full-adapter X1/X2 device qualification under
      [validation](validation.md) and
      [Swift LoRA qualification](swift-lora.md#standard-profile-qualification),
-     owner blinded `DR-G2` review on `6dc82c06...`, and owning CI (`source-checks`,
-     `foundation`) remain open.
+     and owning CI (`source-checks`, `foundation`) remain open.
 
 ## Zero-retraining workflow, direct-edit fallback, and promotion checklist
 
