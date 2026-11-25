@@ -163,7 +163,10 @@ shrinkage**:
      (`BaseModelProfile`: `"swift-pq2"` default, `"nariq-2.5bpw"`,
      `"nariq-3.0bpw"`, `"nariq-2.0bpw"` — where NariQ profiles validate against
      `NariqVariant::sha256()` and require `orcaAdapterSha256: null` and
-     `orcaScale: 0.0`, also supported by `dr-g2-capture`), plus
+     `orcaScale: 0.0`, plus `"bonsai-2.5-pq2"` and `"bonsai-2.5-ptq1"` — which
+     default to `orcaAdapterSha256: null, orcaScale: 0.0` via
+     `includeOrca: false` or stack Orca via `includeOrca: true`, also
+     supported by `dr-g2-capture` and `generate-lock`), plus
      `includeMultimodalChecks: true` / `multimodalPrompts`
      (`MultimodalPromptPair` carrying `imageSha256` and
      `visualGroundingPreserved` under a `>= 3.0` median/floor
@@ -177,6 +180,22 @@ shrinkage**:
    - If it fails, record exact per-category and per-prompt failure modes (e.g.,
      weak/muted signal, overthinking/cognitive looping, creative/Orca
      interference, or layer/numerical instability) and enter `DR-W1`.
+
+### Ternary Bonsai 2.5 27B + DaisyRose-27B composition
+
+**Ternary Bonsai 2.5 27B (`prism-ml/Ternary-Bonsai-2.5-27B-GGUF`) does not obviate
+DaisyRose-27B; the two compose directly.** Bonsai 2.5 recovers the ternary
+quantization loss relative to FP16 `Qwen/Qwen3.8-27B` and fixes Swift-Bonsai-2's
+overthinking/looping natively in the base weights, while `DaisyRose-27B` adds pure-RL
+post-training gains above FP16 `Qwen3.8-27B` on agentic coding, terminal tool use,
+and strict instruction following (`IFBench`, `Terminal-Bench`, `SWE-bench Pro`).
+Because Bonsai 2.5 preserves exact `qwen35` geometry, all 128 `npu-friendly` matrix
+shapes, identical Hadamard signs, identical tokenizer/template (`c3cf9e34...`),
+and bit-for-bit identical `mmproj-Q8_0.gguf`, `MultiRankAdapter` (`DaisyRose`)
+GGUFs stack directly onto `--bonsai-2-5 pq2|ptq1` — both **Orca-free** (default
+for `bonsai-2.5-*` `DR-G2` plans, omitting `--abliterate-lora`) and
+**Orca-stacked** (`--use-abliterate-lora`, `scale 1.3`) — while preserving Hexagon
+NPU FFN chains, Adreno Vulkan, Composite placement, and Vision.
 
 ### Stage 3 (`DR-W1`): Direct weight editing remediation (zero retraining, pure Rust)
 

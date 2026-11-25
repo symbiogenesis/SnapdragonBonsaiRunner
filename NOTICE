@@ -84,3 +84,10 @@ distributed by Nari Labs under Apache License 2.0 at
 https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF
 (revision 17886395feb8a752b5ca5f02ad0c25543950915e). Retain upstream license
 and base-model attributions when redistributing weights.
+
+Optional Ternary Bonsai 2.5 27B GGUF artifacts (when separately provisioned via
+config/bonsai-2-5-27b.lock.json) derive from Qwen3.8-27B by Alibaba Cloud and
+are distributed by PrismML under Apache License 2.0 at
+https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF
+(revision 28a7093cc25bc151cc2b284c5570f12ce343fdcf). Retain upstream license,
+NOTICE, and base-model attributions when redistributing weights.

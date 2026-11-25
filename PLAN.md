@@ -1095,6 +1095,24 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   CI (`source-checks`, `foundation`), verifying DaisyRose (`DR-G2`) compatibility
   on NariQ vs Swift-Bonsai-2, and matched-power X1/X2 throughput/RAM and held-out
   creative/coding quality comparisons across `2.0bpw`, `2.5bpw`, `3.0bpw`, and `PQ2_0`.
+- [ ] **B25-1 — Opt-in `prism-ml/Ternary-Bonsai-2.5-27B-GGUF` (`PQ2_0` & `PTQ1_0`) + DaisyRose composition.**
+  Source wiring is complete across `..\prism-inference`
+  (`BONSAI_2_5_PQ2`/`BONSAI_2_5_PTQ1`, `Representation::{Bonsai25Pq2, Bonsai25Ptq1}`,
+  `ssm_alpha.weight`/`ssm_beta.weight` `F32` layout contract, `F32` recurrent gate
+  folded-verification + stacked-adapter parity tests, Hexagon NPU native `PQ2`/`PTQ1`
+  admission for both variants, Orca/DaisyRose/mmproj/Vulkan/Composite preservation,
+  `prism-inference --bonsai-2-5 pq2|ptq1`, `prism-inference-server`, and `swift_model_check`)
+  and `SwiftBonsai2Runner` (`config/bonsai-2-5-27b.lock.json`,
+  `bonsai-cpu-policy::{bonsai25, context}`, `DaisyRoseLoraArtifact::for_bonsai25_lock`,
+  `bonsai-broker` `--bonsai-2-5` policy/artifacts/identity/`BONSAI_2_5_RELEASE`,
+  `bonsai-chat` `--bonsai-2-5`, `bonsai-tools` CLI/`provision`/`chat_launch`, and
+  `dr-g2-plan`/`dr-g2-score`/`dr-g2-capture`/`generate-lock` `BaseModelProfile::Bonsai25*`
+  with Orca-free default and optional Orca stacking), keeping `Swift-Bonsai-2-PQ2_0` +
+  Orca unchanged as default. Remaining open: publishing a Prism `v0.1.35+` release
+  bundle and enabling `BONSAI_2_5_RELEASE`, owning CI (`source-checks`, `foundation`),
+  running DaisyRose `DR-G2` screen + matched-power X1/X2 comparisons on Bonsai 2.5 vs
+  Swift-Bonsai-2, and (separate future speculative draft work) wiring the reserved
+  866-tensor `*-mtp` (`qwen35.nextn_predict_layers = 1`) checkpoints.
 
 ### Memory and profiles
 

@@ -130,6 +130,30 @@ offload, and uncalibrated fallback sizing, and remains broker-gated on
 `NARIQ_TRELLIS_RELEASE = None` until a compatible Prism release bundle and
 matched X1/X2 qualification complete.
 
+## Opt-in Ternary Bonsai 2.5 27B representations
+
+[bonsai-2-5-27b.lock.json](../config/bonsai-2-5-27b.lock.json) pins the Apache-2.0
+[`prism-ml/Ternary-Bonsai-2.5-27B-GGUF`](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF)
+repository at revision `28a7093cc25bc151cc2b284c5570f12ce343fdcf` as an opt-in
+native representation (`--bonsai-2-5 pq2|ptq1`), keeping
+`Swift-Bonsai-2-PQ2_0` + Orca (+ DaisyRose) unchanged as the default:
+
+| Variant | Filename | Bytes | SHA-256 | Tensors | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `pq2` (`PQ2_0`) | `Ternary-Bonsai-2.5-27B-PQ2_0.gguf` | `7,253,354,848` | `103a11c94324029d8bae3f8152f30bba414730064cfb77438f8589db72e1aa85` | `851` | `[449 F32, 0 BF16, 402 PQ2_0]`, `ssm_alpha`/`ssm_beta` in `F32` |
+| `ptq1` (`PTQ1_0`) | `Ternary-Bonsai-2.5-27B-PTQ1_0.gguf` | `5,993,834,848` | `929560ec9d37cf3cadd4b00cc87b51c570082a628dd830b4692dc0b2ed18dbbe` | `851` | `[449 F32, 0 BF16, 402 PTQ1_0]`, `ssm_alpha`/`ssm_beta` in `F32` |
+| `mmproj` (`Q8_0`) | `Ternary-Bonsai-2.5-27B-mmproj-Q8_0.gguf` | `629,246,976` | `6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903` | — | Bit-for-bit identical to [swift-mmproj.lock.json](../config/swift-mmproj.lock.json) |
+| `pq2-mtp` (reserved) | `Ternary-Bonsai-2.5-27B-PQ2_0-MTP.gguf` | `7,492,338,944` | `ededc9fc0a8a6a8dd30914d107b2d2ce7674d789f1d05a1a481f240609aa6c23` | `866` | `qwen35.nextn_predict_layers = 1`, `runtimeWired = false` |
+| `ptq1-mtp` (reserved) | `Ternary-Bonsai-2.5-27B-PTQ1_0-MTP.gguf` | `6,232,818,944` | `e0fc5f3d47b9c926d52677d303b19df356a2376614b3e1cb9973865fc04ca431` | `866` | `qwen35.nextn_predict_layers = 1`, `runtimeWired = false` |
+
+Unlike NariQ, Bonsai 2.5 preserves `qwen35` geometry, Hadamard sign transforms,
+tokenizer/template (`c3cf9e34...`), Hexagon NPU `PQ2`/`PTQ1` FFN fusion, Adreno
+Vulkan / Composite placement, and bit-identical `mmproj` Vision, while allowing
+Orca (`scale 1.3`) and `MultiRankAdapter` (`DaisyRose-27B`) stacking either
+Orca-free or Orca-stacked. Runtime launch remains broker-gated on
+`BONSAI_2_5_RELEASE = None` until a `v0.1.35+` Prism release bundle and
+matched X1/X2 qualification complete.
+
 ## Stop and reopen conditions
 
 Reject file/hash/header mismatches and unsupported graphs or types. Limit the first
