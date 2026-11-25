@@ -207,21 +207,21 @@ impl Placement {
     }
 }
 
-const REVIEWED_0_1_34: Option<(&str, &str)> =
-    Some(("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"));
+const REVIEWED_0_1_35: Option<(&str, &str)> =
+    Some(("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"));
 
 // CPU placement must skip accelerator initialization and report both its
 // requested placement and effective CPU backend in a genuine reviewed release.
 // Source omission alone does not justify a smaller fixed memory allowance.
-const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 // Explicit Vulkan/Composite placements require a separately reviewed native
 // release before they can be admitted on a pinned bundle.
-const VULKAN_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const VULKAN_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 // Opt-in Hexagon arena cache persistence requires a separately reviewed native
 // release implementing `--hexagon-arena-cache <dir>` and verified cache I/O.
-const HEXAGON_ARENA_CACHE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const HEXAGON_ARENA_CACHE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 fn hexagon_arena_cache_supported_for(
     release: &ReleasePin,
@@ -482,7 +482,7 @@ fn pinned_matches(identity: Option<(&str, &str)>) -> Result<bool, LaunchError> {
 // not activate smaller process allowances. A version number alone attests neither.
 // This combined review also retains four row workers, K4/V4 and latest reuse;
 // a later repin cannot silently lose those existing serving capabilities.
-const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 // K4/V3 changes precision and needs its own reviewed capacity/quality release.
 // Both gates must identify the same genuine released source before this profile
@@ -490,15 +490,15 @@ const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
 const K4V3_CONTEXT_RELEASE: Option<(&str, &str)> = None;
 
 // Version-3 scale-code co-optimized K4/V4 (`rsq4kvf`) and cognitive request
-// controls await the next reviewed Prism release pin beyond `0.1.34`.
-const RSQ4KVF_RELEASE: Option<(&str, &str)> = None;
+// controls promoted with the reviewed Prism v0.1.35 release pin.
+const RSQ4KVF_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 // Full-model K4/V4 context needs the separately reviewed larger live-state and
 // checkpoint guards, not just the existing paired memory protocol. This exact
 // source supplies the geometry-derived Swift allowance; generic graphs retain
 // 4 GiB. Precision and process charges remain unchanged; this gate cannot
 // authorize an unrelated memory release.
-const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 fn full_context_release_matches(release: &ReleasePin, reviewed: Option<(&str, &str)>) -> bool {
     reviewed.is_some()
@@ -537,7 +537,7 @@ pub(super) fn memory_context_supported() -> Result<bool, LaunchError> {
 // observes abandoned generation sockets, settles active computation within a
 // bounded timeout, and resets live model state on authenticated `POST /reset`
 // without expecting a `Content-Type` header.
-const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
     pinned_matches(RESET_ON_CANCEL_RELEASE)
@@ -546,7 +546,7 @@ pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
 // Offline anonymous broker-pipe transport requires a separately reviewed native
 // release implementing `--broker-pipe`, `AppContainer` verification, `SB2PIPE1`
 // / `SB2OKAY1` handshake, `KIND_SERVER_READY`, `KIND_RESET`, and `KIND_VERIFIED_SECTION`.
-const BROKER_PIPE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const BROKER_PIPE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
     pinned_matches(BROKER_PIPE_RELEASE)
@@ -554,13 +554,13 @@ pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
 
 // Calibrated CoW admission, sparse branch prompt reuse, chunkwise GDN prefill,
 // and suffix CPU speculation require the reviewed post-0.1.31 Prism release.
-const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
-const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
-const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 // `wy-f32` chunkwise GDN prefill with rotated KV caches (`rsq4` / `rsq4k3v`)
 // requires a reviewed Prism release implementing rotated-KV WY prefill.
-const WY_F32_ROTATED_KV_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
-const CPU_SPECULATION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const WY_F32_ROTATED_KV_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const CPU_SPECULATION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 pub(super) fn calibrated_cow_admission_supported() -> Result<bool, LaunchError> {
     pinned_matches(CALIBRATED_COW_ADMISSION_RELEASE)
@@ -621,21 +621,21 @@ pub(super) fn cpu_speculation_supported() -> Result<bool, LaunchError> {
 // Multimodal image/mmproj support requires a separately reviewed native release
 // that implements vision projector loading, image embedding injection and the
 // matching readiness identity fields.
-const VISION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const VISION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 // Multi-rank DaisyRose LoRA support requires a reviewed Prism release supporting
 // `--multi-rank-adapter` and `multi-rank-lora-v1` readiness identity.
-const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 // Opt-in NariQ trellis support requires a separately reviewed native Prism
 // release supporting `--nariq <2.5bpw|3.0bpw|2.0bpw>` and `:trellis-v1` identity.
-pub(crate) const NARIQ_TRELLIS_RELEASE: Option<(&str, &str)> = None;
+pub(crate) const NARIQ_TRELLIS_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 // Opt-in Ternary Bonsai 2.5 27B support requires a separately reviewed native
 // Prism release (`v0.1.35+`) supporting `--bonsai-2-5 <pq2|ptq1>`.
-pub(crate) const BONSAI_2_5_RELEASE: Option<(&str, &str)> = None;
+pub(crate) const BONSAI_2_5_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 // CPU tiled prefill requires a separately reviewed native release supporting
 // `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
 // readiness fields (`cpu_prefill_tokens`, `cpu_prefill_scratch_bytes`, `:cpu-tiled-ffn-v1:{n}`).
-const CPU_PREFILL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
+const CPU_PREFILL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
 pub(super) fn parse_cpu_prefill_tokens(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
     parse_enum(value, &[("8", 8), ("16", 16), ("32", 32)])
@@ -731,15 +731,16 @@ mod tests {
             Placement::Cpu
         );
         for (version, commit) in [
-            ("0.1.27", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.28", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.30", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.27", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.28", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.30", "3bc76f135bf23c538b3bb789aef382143ff36839"),
             ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.33", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.34", "0000000000000000000000000000000000000000"),
-            ("0.1.34", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.35", "0000000000000000000000000000000000000000"),
+            ("0.1.35", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -767,13 +768,14 @@ mod tests {
         let mut pin = release(LOCK)?;
         assert!(reviewed_release_matches(&pin, RESET_ON_CANCEL_RELEASE));
         for (version, commit) in [
-            ("0.1.27", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.28", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.30", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.27", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.28", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.30", "3bc76f135bf23c538b3bb789aef382143ff36839"),
             ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.34", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.34", "0000000000000000000000000000000000000000"),
+            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.35", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.35", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -813,16 +815,22 @@ mod tests {
             select_kv_cache(&pin, Some(KvCache::Rsq4))?,
             Some(KvCache::Rsq4)
         );
+        assert_eq!(
+            select_kv_cache(&pin, Some(KvCache::Rsq4Kvf))?,
+            Some(KvCache::Rsq4Kvf)
+        );
+        assert!(rsq4kvf_supported(&pin));
         for (version, commit) in [
-            ("0.1.27", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.28", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.30", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.27", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.28", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.30", "3bc76f135bf23c538b3bb789aef382143ff36839"),
             ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.33", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.34", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.34", "0000000000000000000000000000000000000000"),
+            ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.35", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.35", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -830,6 +838,10 @@ mod tests {
             assert_eq!(select_kv_cache(&pin, Some(KvCache::F16))?, None);
             assert_eq!(
                 select_kv_cache(&pin, Some(KvCache::Rsq4)),
+                Err(LaunchError::NativeRuntime)
+            );
+            assert_eq!(
+                select_kv_cache(&pin, Some(KvCache::Rsq4Kvf)),
                 Err(LaunchError::NativeRuntime)
             );
         }
@@ -844,12 +856,12 @@ mod tests {
         assert!(!full_context_release_matches(&pin, None));
         assert!(full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         for version in [
-            "0.1.27", "0.1.28", "0.1.30", "0.1.31", "0.1.32", "0.1.33", "0.1.35",
+            "0.1.27", "0.1.28", "0.1.30", "0.1.31", "0.1.32", "0.1.33", "0.1.34", "0.1.36",
         ] {
             pin.version = version.into();
             assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         }
-        pin.version = "0.1.34".into();
+        pin.version = "0.1.35".into();
         pin.commit = "0".repeat(40);
         assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         let other_source = (pin.version.as_str(), pin.commit.as_str());
@@ -874,14 +886,15 @@ mod tests {
             KvCache::Rsq4K3v
         );
         for (version, commit) in [
-            ("0.1.27", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.28", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.30", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.27", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.28", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.30", "3bc76f135bf23c538b3bb789aef382143ff36839"),
             ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.33", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.34", "0000000000000000000000000000000000000000"),
+            ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.35", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -911,11 +924,12 @@ mod tests {
             "0.1.31",
             "0.1.32",
             "0.1.33",
-            "0.1.35",
-            "0.1.34-dev",
-            "v0.1.34",
-            "0.1.34.0",
-            "0.1.034",
+            "0.1.34",
+            "0.1.36",
+            "0.1.35-dev",
+            "v0.1.35",
+            "0.1.35.0",
+            "0.1.035",
             "",
             "latest",
         ] {
@@ -1009,11 +1023,12 @@ mod tests {
             "0.1.31",
             "0.1.32",
             "0.1.33",
-            "0.1.35",
-            "0.1.34-dev",
-            "v0.1.34",
-            "0.1.34.0",
-            "0.1.034",
+            "0.1.34",
+            "0.1.36",
+            "0.1.35-dev",
+            "v0.1.35",
+            "0.1.35.0",
+            "0.1.035",
             "",
             "latest",
         ] {
@@ -1118,11 +1133,11 @@ mod tests {
     }
 
     #[test]
-    fn broker_pipe_and_0_1_34_capabilities_require_reviewed_release() -> Result<(), LaunchError> {
+    fn broker_pipe_and_0_1_35_capabilities_require_reviewed_release() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
         assert_eq!(
             BROKER_PIPE_RELEASE,
-            Some(("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"))
+            Some(("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"))
         );
         assert!(broker_pipe_supported()?);
         assert!(reviewed_release_matches(&pin, BROKER_PIPE_RELEASE));
@@ -1132,12 +1147,16 @@ mod tests {
         assert!(cpu_speculation_supported()?);
         assert!(multi_rank_lora_supported()?);
         assert!(hexagon_arena_cache_supported()?);
+        assert!(rsq4kvf_supported(&pin));
+        assert!(nariq_trellis_supported()?);
+        assert!(bonsai_2_5_supported()?);
         for (version, commit) in [
             ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.34", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.34", "0000000000000000000000000000000000000000"),
-            ("0.1.35", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
+            ("0.1.35", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.35", "0000000000000000000000000000000000000000"),
+            ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -1211,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_and_composite_placements_parse_and_admit_reviewed_0_1_34() -> Result<(), LaunchError>
+    fn vulkan_and_composite_placements_parse_and_admit_reviewed_0_1_35() -> Result<(), LaunchError>
     {
         use std::ffi::OsStr;
         let vulkan = Placement::parse(Some(OsStr::new("vulkan")))?;
@@ -1275,10 +1294,10 @@ mod tests {
     }
 
     #[test]
-    fn wy_f32_rotated_kv_gate_admits_reviewed_0_1_34_and_rejects_unreviewed_release()
+    fn wy_f32_rotated_kv_gate_admits_reviewed_0_1_35_and_rejects_unreviewed_release()
     -> Result<(), LaunchError> {
         let pinned = release(LOCK)?;
-        assert_eq!(WY_F32_ROTATED_KV_RELEASE, REVIEWED_0_1_34);
+        assert_eq!(WY_F32_ROTATED_KV_RELEASE, REVIEWED_0_1_35);
         for kv in [KvCache::F16, KvCache::Rsq4, KvCache::Rsq4K3v] {
             assert_eq!(
                 pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::WyF32), Some(kv)),
@@ -1326,7 +1345,7 @@ mod tests {
     #[test]
     fn hexagon_arena_cache_requires_reviewed_release() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
-        assert_eq!(HEXAGON_ARENA_CACHE_RELEASE, REVIEWED_0_1_34);
+        assert_eq!(HEXAGON_ARENA_CACHE_RELEASE, REVIEWED_0_1_35);
         assert!(hexagon_arena_cache_supported()?);
         assert!(hexagon_arena_cache_supported_for(
             &pin,
@@ -1337,7 +1356,7 @@ mod tests {
         assert!(!hexagon_arena_cache_supported_for(&pin, Some(unreviewed)));
         assert!(!hexagon_arena_cache_supported_for(
             &pin,
-            Some(("0.1.34", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+            Some(("0.1.35", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
         ));
         assert!(!hexagon_arena_cache_supported_for(&pin, None));
 
@@ -1353,22 +1372,26 @@ mod tests {
 
     #[test]
     fn nariq_trellis_requires_exact_reviewed_release() -> Result<(), LaunchError> {
-        assert_eq!(NARIQ_TRELLIS_RELEASE, None);
-        assert!(!nariq_trellis_supported()?);
-        let pin = release(LOCK)?;
-        assert!(reviewed_release_matches(
+        assert_eq!(NARIQ_TRELLIS_RELEASE, REVIEWED_0_1_35);
+        assert!(nariq_trellis_supported()?);
+        let mut pin = release(LOCK)?;
+        assert!(reviewed_release_matches(&pin, NARIQ_TRELLIS_RELEASE));
+        assert!(!reviewed_release_matches(
             &pin,
             Some(("0.1.34", &pin.commit))
         ));
+        pin.version = "0.1.34".into();
         assert!(!reviewed_release_matches(&pin, NARIQ_TRELLIS_RELEASE));
         Ok(())
     }
 
     #[test]
     fn bonsai25_release_gate_and_execution_digests_are_pinned() -> Result<(), LaunchError> {
-        assert_eq!(BONSAI_2_5_RELEASE, None);
-        assert!(!bonsai_2_5_supported()?);
-        let pin = release(LOCK)?;
+        assert_eq!(BONSAI_2_5_RELEASE, REVIEWED_0_1_35);
+        assert!(bonsai_2_5_supported()?);
+        let mut pin = release(LOCK)?;
+        assert!(reviewed_release_matches(&pin, BONSAI_2_5_RELEASE));
+        pin.version = "0.1.34".into();
         assert!(!reviewed_release_matches(&pin, BONSAI_2_5_RELEASE));
         assert_eq!(
             adapter_execution_sha256_for_bonsai25(bonsai_cpu_policy::Bonsai25Variant::Pq2),

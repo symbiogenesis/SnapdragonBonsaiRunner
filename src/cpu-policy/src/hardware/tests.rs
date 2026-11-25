@@ -324,7 +324,7 @@ fn hardware_contracts_reject_positional_json_arrays() -> Result<(), String> {
     for (pointer, array) in [
         (
             "/runtime",
-            json!(["prism-inference", "0.1.34", ["aarch64", "windows", "msvc"]]),
+            json!(["prism-inference", "0.1.35", ["aarch64", "windows", "msvc"]]),
         ),
         ("/runtime/target", json!(["aarch64", "windows", "msvc"])),
         ("/cpu", json!([true, true])),

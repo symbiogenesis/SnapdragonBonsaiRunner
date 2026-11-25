@@ -4039,15 +4039,20 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
-        for (flag, name) in [("rsq4k3v", KvCache::Rsq4K3v), ("rsq4kvf", KvCache::Rsq4Kvf)] {
-            let mut unsupported = native.clone();
-            unsupported.extend(["--kv-cache", flag].map(OsString::from));
-            assert_eq!(
-                LaunchConfig::parse(unsupported).err(),
-                Some(LaunchError::NativeRuntime),
-                "{flag} ({name:?}) should wait for its reviewed release pin"
-            );
-        }
+        let mut rsq4kvf = native.clone();
+        rsq4kvf.extend(["--kv-cache", "rsq4kvf"].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse(rsq4kvf)?.kv_cache,
+            Some(KvCache::Rsq4Kvf)
+        );
+        let mut unsupported = native.clone();
+        unsupported.extend(["--kv-cache", "rsq4k3v"].map(OsString::from));
+        assert_eq!(
+            LaunchConfig::parse(unsupported).err(),
+            Some(LaunchError::NativeRuntime),
+            "rsq4k3v ({:?}) should wait for its reviewed release pin",
+            KvCache::Rsq4K3v
+        );
         let data = std::env::temp_dir().join("Bonsai-kv-routing");
         let key = data.join("backend.key");
         let plan = super::LaunchPlan::for_profile_with_options(
@@ -5566,11 +5571,13 @@ mod tests {
             );
         }
 
-        let mut gated = native;
-        gated.extend(["--nariq", "2.5bpw"].map(OsString::from));
+        let mut promoted = native;
+        promoted.extend(["--nariq", "2.5bpw"].map(OsString::from));
         assert_eq!(
-            LaunchConfig::parse(gated).err(),
-            Some(LaunchError::NativeRuntime)
+            LaunchConfig::parse(promoted).map(|cfg| cfg.weight_representation),
+            Ok(super::WeightRepresentation::NariQ(
+                bonsai_cpu_policy::NariqVariant::Bpw2_5
+            ))
         );
     }
 
@@ -5596,24 +5603,43 @@ mod tests {
             );
         }
 
-        // Gated on BONSAI_2_5_RELEASE = None while allowing Orca, placements, and DaisyRose parsing.
-        for extra in [
-            vec!["--bonsai-2-5", "pq2"],
-            vec!["--bonsai-2-5", "ptq1", "--use-abliterate-lora"],
-            vec![
-                "--bonsai-2-5",
-                "ptq1",
-                "--placement",
-                "composite",
-                "--use-abliterate-lora",
-            ],
+        // Promoted v0.1.35 release pin admits `--bonsai-2-5` while allowing Orca, placements, and DaisyRose parsing.
+        for (extra, expected_variant, expected_abliterate, expected_placement) in [
+            (
+                vec!["--bonsai-2-5", "pq2"],
+                bonsai_cpu_policy::Bonsai25Variant::Pq2,
+                false,
+                crate::inference::Placement::Auto,
+            ),
+            (
+                vec!["--bonsai-2-5", "ptq1", "--use-abliterate-lora"],
+                bonsai_cpu_policy::Bonsai25Variant::Ptq1,
+                true,
+                crate::inference::Placement::Auto,
+            ),
+            (
+                vec![
+                    "--bonsai-2-5",
+                    "ptq1",
+                    "--placement",
+                    "composite",
+                    "--use-abliterate-lora",
+                ],
+                bonsai_cpu_policy::Bonsai25Variant::Ptq1,
+                true,
+                crate::inference::Placement::Composite,
+            ),
         ] {
-            let mut gated = native.clone();
-            gated.extend(extra.into_iter().map(OsString::from));
+            let mut promoted = native.clone();
+            promoted.extend(extra.into_iter().map(OsString::from));
+            let parsed = LaunchConfig::parse(promoted)
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
             assert_eq!(
-                LaunchConfig::parse(gated).err(),
-                Some(LaunchError::NativeRuntime)
+                parsed.weight_representation,
+                super::WeightRepresentation::Bonsai25(expected_variant)
             );
+            assert_eq!(parsed.use_abliterate_lora, expected_abliterate);
+            assert_eq!(parsed.placement, expected_placement);
         }
 
         let temp = crate::test_util::TempDir::new("Bonsai-bonsai25-launcher")?;
