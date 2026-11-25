@@ -115,6 +115,22 @@ impl SnapdragonFamily {
         }
     }
 
+    /// Default native inference `(decode, prefill)` CPU row-worker budget for
+    /// releases supporting split prefill row-worker counts (`0.1.36+`).
+    ///
+    /// Snapdragon X Elite uses `8` decode workers across two Oryon clusters and
+    /// `12` prefill workers across all `12` homogeneous Oryon cores; Snapdragon
+    /// X2 Elite Extreme uses `8` decode workers and `16` prefill workers;
+    /// unrecognized hosts default to `(4, 4)`.
+    #[must_use]
+    pub const fn default_native_row_worker_budget(family: Option<Self>) -> (u8, u8) {
+        match family {
+            Some(Self::XElite) => (8, 12),
+            Some(Self::X2EliteExtreme) => (8, 16),
+            None => (4, 4),
+        }
+    }
+
     /// Check an evidence label against the observed name when present.
     ///
     /// Only legacy X1 receipts may omit the processor observation. Newer family

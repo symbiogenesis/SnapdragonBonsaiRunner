@@ -367,7 +367,7 @@ fn placement_survives_deferred_preparation_and_rejects_publisher_selection() -> 
     let default = plan(fixture.request.clone())?;
     let omitted = serde_json::to_value(&default.request).map_err(|error| error.to_string())?;
     assert!(omitted.get("Placement").is_none());
-    for value in ["auto", "cpu"] {
+    for value in ["auto", "cpu", "vulkan", "composite"] {
         fixture.request["Placement"] = json!(value);
         let mut recorder = Recorder::new(fixture.root.clone());
         launch_pending(
@@ -419,7 +419,7 @@ fn kv_cache_survives_deferred_preparation_and_rejects_unsupported_selection() ->
     let restored: Request =
         serde_json::from_slice(&serialized).map_err(|error| error.to_string())?;
     assert!(restored.kv_cache.is_none());
-    for value in ["f16", "rsq4", "rsq4k3v"] {
+    for value in ["f16", "rsq4", "rsq4kvf", "rsq4k3v"] {
         fixture.request["KvCache"] = json!(value);
         let prepared = plan(fixture.request.clone())?;
         let serialized =
@@ -567,11 +567,30 @@ fn development_default_and_explicit_rollback_survive_deferred_preparation() -> c
                         .array_windows::<2>()
                         .any(|args| args[0] == "--bonsai-2-5" && args[1] == "pq2")
                 );
+                assert!(
+                    arguments
+                        .array_windows::<2>()
+                        .any(|args| args[0] == "--cpu-prefill-tokens" && args[1] == "16")
+                );
+                assert!(
+                    arguments
+                        .array_windows::<2>()
+                        .any(|args| args[0] == "--cpu-prefill-gdn" && args[1] == "wy-f32")
+                );
+                assert!(
+                    arguments
+                        .array_windows::<2>()
+                        .any(|args| args[0] == "--prompt-reuse"
+                            && args[1] == "prompt-end-and-latest")
+                );
                 assert!(!arguments.iter().any(|arg| arg == "--use-original-pq2"));
                 assert!(!arguments.iter().any(|arg| arg == "--use-abliterate-lora"));
             } else {
                 assert!(arguments.iter().any(|arg| arg == "--use-original-pq2"));
                 assert!(!arguments.iter().any(|arg| arg == "--bonsai-2-5"));
+                assert!(!arguments.iter().any(|arg| arg == "--cpu-prefill-tokens"));
+                assert!(!arguments.iter().any(|arg| arg == "--cpu-prefill-gdn"));
+                assert!(!arguments.iter().any(|arg| arg == "--prompt-reuse"));
             }
             assert_eq!(
                 recorder
@@ -1715,6 +1734,76 @@ fn session_options_0_1_32_validate_and_forward_in_chat_launch() -> crate::Result
         );
     }
 
+    assert!(!spec_args.iter().any(|arg| arg == "--cpu-prefill-gdn"));
+    assert!(!spec_args.iter().any(|arg| arg == "--prompt-reuse"));
+
+    // Bug C fixed: `wy-f32` admits omitted `KvCache` (default `rsq4`) as well as
+    // `f16`, `rsq4`, `rsq4kvf`, and `rsq4k3v`.
+    for kv in [None, Some("f16"), Some("rsq4"), Some("rsq4kvf"), Some("rsq4k3v")] {
+        let mut wy_fixture = fixture("wy-f32-kv")?;
+        wy_fixture.request["NativeEngine"] = json!(true);
+        wy_fixture.request["NoSpeechModels"] = json!(true);
+        wy_fixture.request["CpuPrefillTokens"] = json!(16);
+        wy_fixture.request["CpuPrefillGdn"] = json!("wy-f32");
+        if let Some(kv) = kv {
+            wy_fixture.request["KvCache"] = json!(kv);
+        }
+        let mut wy_recorder = Recorder::new(wy_fixture.root);
+        let wy_result = prepare_backend(
+            plan(wy_fixture.request)?,
+            &mut wy_recorder,
+            &wy_fixture.working,
+        )?;
+        let wy_args = wy_result["Arguments"]
+            .as_array()
+            .ok_or("Missing launch arguments.")?;
+        assert!(
+            wy_args
+                .windows(2)
+                .any(|pair| pair[0] == "--cpu-prefill-gdn" && pair[1] == "wy-f32")
+        );
+    }
+
+    // Explicit overrides (`--prompt-reuse disabled`, `--cpu-prefill-gdn sequential`,
+    // `--cpu-prefill-tokens 8`) suppress fast TTFT defaults across deferred JSON.
+    let mut override_fixture = fixture("fast-ttft-override")?;
+    override_fixture.request["NativeEngine"] = json!(true);
+    override_fixture.request["NoSpeechModels"] = json!(true);
+    override_fixture.request["PromptReuse"] = json!("disabled");
+    override_fixture.request["CpuPrefillTokens"] = json!(8);
+    override_fixture.request["CpuPrefillGdn"] = json!("sequential");
+    let mut override_recorder = Recorder::new(override_fixture.root.clone());
+    launch_pending(
+        plan(override_fixture.request)?.request,
+        &mut override_recorder,
+        &override_fixture.working,
+        &override_fixture.root.join("maintenance.exe"),
+    )?;
+    let (_, launch_args, _) = override_recorder.launch()?;
+    let startup_path = PathBuf::from(value_after(launch_args, "--startup-request")?);
+    let startup_req: Request =
+        serde_json::from_slice(&fs::read(startup_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let override_prepared = prepare_backend(
+        prepare(startup_req, true)?,
+        &mut override_recorder,
+        &override_fixture.working,
+    )?;
+    let override_args = override_prepared["Arguments"]
+        .as_array()
+        .ok_or("Missing launch arguments.")?;
+    assert!(!override_args.iter().any(|arg| arg == "--prompt-reuse"));
+    assert!(
+        override_args
+            .windows(2)
+            .any(|pair| pair[0] == "--cpu-prefill-tokens" && pair[1] == "8")
+    );
+    assert!(
+        override_args
+            .windows(2)
+            .any(|pair| pair[0] == "--cpu-prefill-gdn" && pair[1] == "sequential")
+    );
+
     let bad_fixture = fixture("session-0-1-32-invalid")?;
     for patch in [
         json!({"NativeEngine": false, "RequireBrokerPipe": true}),
@@ -1722,8 +1811,6 @@ fn session_options_0_1_32_validate_and_forward_in_chat_launch() -> crate::Result
         json!({"NativeEngine": true, "PromptReuse": "latest", "PromptReuseCheckpoints": 9}),
         json!({"NativeEngine": true, "PromptReuse": "latest", "PromptReuseCheckpointBytes": 0}),
         json!({"NativeEngine": true, "CpuPrefillGdn": "wy-f32"}),
-        json!({"NativeEngine": true, "CpuPrefillTokens": 16, "CpuPrefillGdn": "wy-f32"}),
-        json!({"NativeEngine": true, "CpuPrefillTokens": 16, "KvCache": "rsq4", "CpuPrefillGdn": "wy-f32"}),
         json!({"NativeEngine": true, "DraftMax": 4}),
         json!({"NativeEngine": true, "SpecType": "none", "DraftMax": 4}),
         json!({"NativeEngine": true, "SpecType": "suffix"}),
@@ -1924,11 +2011,13 @@ fn effective_daisyrose_path_respects_promotion_opt_out_and_explicit_override() -
 fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -> crate::Result<()>
 {
     let fixture = fixture("nariq-chat-args")?;
-    let mut vulkan_payload = fixture.request.clone();
-    vulkan_payload["NativeEngine"] = serde_json::json!(true);
-    vulkan_payload["NariqVariant"] = serde_json::json!("2.5bpw");
-    vulkan_payload["Placement"] = serde_json::json!("vulkan");
-    assert!(serde_json::from_value::<Request>(vulkan_payload).is_err());
+    for placement in ["vulkan", "composite"] {
+        let mut vulkan_payload = fixture.request.clone();
+        vulkan_payload["NativeEngine"] = serde_json::json!(true);
+        vulkan_payload["NariqVariant"] = serde_json::json!("2.5bpw");
+        vulkan_payload["Placement"] = serde_json::json!(placement);
+        assert!(plan(vulkan_payload).is_err());
+    }
 
     let mut req: Request = serde_json::from_value(fixture.request).map_err(|e| e.to_string())?;
     req.native_engine = true;

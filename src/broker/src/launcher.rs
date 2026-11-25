@@ -151,6 +151,7 @@ pub struct LaunchConfig {
     profile: LaunchProfile,
     native_engine: bool,
     native_row_workers: u8,
+    prefill_row_workers: Option<u8>,
     prompt_reuse: crate::inference::PromptReuseMode,
     prompt_reuse_checkpoints: Option<u8>,
     prompt_reuse_checkpoint_bytes: Option<usize>,
@@ -280,7 +281,8 @@ impl LaunchConfig {
             (false, false, false, false);
         let mut check_only = false;
         let mut native_engine = None;
-        let (mut native_row_workers, mut prompt_reuse) = (None, None);
+        let (mut native_row_workers, mut prefill_row_workers, mut prompt_reuse) =
+            (None, None, None);
         let (mut prompt_reuse_checkpoints, mut prompt_reuse_checkpoint_bytes) = (None, None);
         let (mut kv_cache, mut cpu_prefill_tokens, mut cpu_prefill_gdn, mut placement) =
             (None, None, None, None);
@@ -311,6 +313,11 @@ impl LaunchConfig {
                 Some("--native-row-workers") => {
                     take_once(&mut native_row_workers, &mut args, |v| {
                         row_workers(v.as_deref())
+                    })?;
+                }
+                Some("--prefill-row-workers") => {
+                    take_once(&mut prefill_row_workers, &mut args, |v| {
+                        crate::inference::parse_prefill_row_workers(v.as_deref())
                     })?;
                 }
                 Some("--prompt-reuse") => take_once(&mut prompt_reuse, &mut args, |v| {
@@ -419,6 +426,7 @@ impl LaunchConfig {
         let prompt_reuse = prompt_reuse.unwrap_or_default();
         let kv_cache = crate::inference::pinned_kv_cache(native_engine, kv_cache)?;
         if (cpu_prefill_tokens.is_some()
+            || prefill_row_workers.is_some()
             || cpu_prefill_gdn.is_some()
             || spec_type.is_some()
             || draft_max.is_some()
@@ -431,6 +439,12 @@ impl LaunchConfig {
         }
         let cpu_prefill_tokens =
             crate::inference::pinned_cpu_prefill_tokens(native_engine, cpu_prefill_tokens)?;
+        let prefill_row_workers = crate::inference::pinned_prefill_row_workers(
+            native_engine,
+            prefill_row_workers,
+            family,
+            cpu_family,
+        )?;
         let placement = crate::inference::pinned_placement(native_engine, placement)?;
         let configuration = Self {
             data: data.ok_or(LaunchError::Arguments)?,
@@ -444,6 +458,7 @@ impl LaunchConfig {
             profile,
             native_engine,
             native_row_workers,
+            prefill_row_workers,
             prompt_reuse,
             prompt_reuse_checkpoints,
             prompt_reuse_checkpoint_bytes,
@@ -604,6 +619,7 @@ impl LaunchConfig {
             || (self.require_broker_pipe
                 && (!self.requires_native_sandbox() || !self.native_engine))
             || (self.native_row_workers != 1 && !self.native_engine)
+            || (self.prefill_row_workers.is_some() && !self.native_engine)
             || (self.prompt_reuse.enabled() && !self.native_engine)
             || ((self.prompt_reuse_checkpoints.is_some()
                 || self.prompt_reuse_checkpoint_bytes.is_some())
@@ -784,7 +800,7 @@ impl LaunchConfig {
                 }
             }
         };
-        SwiftContextPlan::for_calibrated_execution_with_adapter_reserve(
+        SwiftContextPlan::for_calibrated_execution_with_adapter_reserve_and_tile_64(
             available_bytes,
             self.swift_context_profile()?,
             SwiftCalibratedOptions {
@@ -798,6 +814,7 @@ impl LaunchConfig {
                 prompt_reuse,
             },
             daisyrose_reserve_bytes,
+            crate::inference::prefill_tile_64_supported()?,
         )
         .map_err(|_| LaunchError::Memory)
     }
@@ -1351,6 +1368,9 @@ impl LaunchConfig {
         }
         if self.native_row_workers > 1 {
             push_num(&mut arguments, "--row-workers", self.native_row_workers);
+        }
+        if let Some(workers) = self.prefill_row_workers {
+            push_num(&mut arguments, "--prefill-row-workers", workers);
         }
         if let Some(family) = self.cpu_family {
             push_arg(&mut arguments, "--cpu-family", family.as_str());
@@ -5026,7 +5046,7 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
-        for invalid in ["0", "4", "12", "64", "eight"] {
+        for invalid in ["0", "4", "12", "eight"] {
             let mut args = arguments();
             args.extend(
                 [
@@ -5042,6 +5062,20 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
+        let mut gated_64 = arguments();
+        gated_64.extend(
+            [
+                "--profile",
+                "swift-pq2-assessment",
+                "--cpu-prefill-tokens",
+                "64",
+            ]
+            .map(OsString::from),
+        );
+        assert_eq!(
+            LaunchConfig::parse(gated_64).err(),
+            Some(LaunchError::NativeRuntime)
+        );
         let mut publisher = arguments();
         publisher.extend(
             [

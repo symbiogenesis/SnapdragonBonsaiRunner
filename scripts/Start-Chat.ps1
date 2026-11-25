@@ -38,7 +38,7 @@ param(
     [int]$PromptReuseCheckpoints,
     [ValidateRange(1, 9223372036854775807)]
     [long]$PromptReuseCheckpointBytes,
-    [ValidateSet('f16', 'rsq4', 'rsq4k3v')]
+    [ValidateSet('f16', 'rsq4', 'rsq4kvf', 'rsq4k3v')]
     [string]$KvCache,
     [ValidateSet(8, 16, 32)]
     [int]$CpuPrefillTokens,
@@ -50,7 +50,7 @@ param(
     [int]$DraftMax,
     [ValidateSet('x1', 'x2')]
     [string]$CpuFamily,
-    [ValidateSet('auto', 'cpu')]
+    [ValidateSet('auto', 'cpu', 'vulkan', 'composite')]
     [string]$Placement,
     [switch]$UseRepackedPtq1,
     [switch]$UseOriginalPq2,
@@ -207,7 +207,16 @@ try {
     if ($DaisyRoseLora) { $launchArguments += @('--daisyrose-lora', $DaisyRoseLora) }
     if ($NoDaisyRoseLora) { $launchArguments += '--no-daisyrose-lora' }
     if ($GraphicsBackend) { $launchArguments += @('--graphics-backend', $GraphicsBackend.ToLowerInvariant()) }
-    if ($PromptReuse) { $launchArguments += @('--prompt-reuse', $PromptReuse.ToLowerInvariant()) }
+    $nativeActive = -not $PublisherEngine
+    $suffixSpec = $SpecType -and ($SpecType.ToLowerInvariant() -eq 'suffix')
+    $effectivePromptReuse = if ($PSBoundParameters.ContainsKey('PromptReuse')) {
+        $PromptReuse.ToLowerInvariant()
+    } elseif ($nativeActive -and -not $suffixSpec) {
+        'prompt-end-and-latest'
+    } else {
+        $null
+    }
+    if ($effectivePromptReuse) { $launchArguments += @('--prompt-reuse', $effectivePromptReuse) }
     if ($PSBoundParameters.ContainsKey('PromptReuseCheckpoints')) {
         $launchArguments += @('--prompt-reuse-checkpoints', [string]$PromptReuseCheckpoints)
     }
@@ -217,8 +226,14 @@ try {
     if ($KvCache) { $launchArguments += @('--kv-cache', $KvCache.ToLowerInvariant()) }
     if ($PSBoundParameters.ContainsKey('CpuPrefillTokens')) {
         $launchArguments += @('--cpu-prefill-tokens', [string]$CpuPrefillTokens)
+    } elseif ($nativeActive -and -not $suffixSpec -and -not $CpuPrefillGdn) {
+        $launchArguments += @('--cpu-prefill-tokens', '16')
     }
-    if ($CpuPrefillGdn) { $launchArguments += @('--cpu-prefill-gdn', $CpuPrefillGdn.ToLowerInvariant()) }
+    if ($CpuPrefillGdn) {
+        $launchArguments += @('--cpu-prefill-gdn', $CpuPrefillGdn.ToLowerInvariant())
+    } elseif ($nativeActive -and -not $suffixSpec) {
+        $launchArguments += @('--cpu-prefill-gdn', 'wy-f32')
+    }
     if ($SpecType) { $launchArguments += @('--spec-type', $SpecType.ToLowerInvariant()) }
     if ($PSBoundParameters.ContainsKey('DraftMax')) {
         $launchArguments += @('--draft-max', [string]$DraftMax)

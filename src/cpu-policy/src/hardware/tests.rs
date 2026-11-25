@@ -78,6 +78,18 @@ fn snapdragon_evidence_preserves_x2_extreme_and_rejects_family_relabeling() {
         8
     );
     assert_eq!(SnapdragonFamily::default_native_row_workers(None), 4);
+    assert_eq!(
+        SnapdragonFamily::default_native_row_worker_budget(Some(SnapdragonFamily::XElite)),
+        (8, 12)
+    );
+    assert_eq!(
+        SnapdragonFamily::default_native_row_worker_budget(Some(SnapdragonFamily::X2EliteExtreme)),
+        (8, 16)
+    );
+    assert_eq!(
+        SnapdragonFamily::default_native_row_worker_budget(None),
+        (4, 4)
+    );
 }
 
 fn key() -> Value {

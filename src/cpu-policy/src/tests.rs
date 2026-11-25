@@ -965,6 +965,60 @@ fn calibrated_cow_execution_matches_prism_accounting_across_packings_reuse_and_s
     assert!(ptq1_plan.context_plan.required_available_bytes + STARTUP_RESERVE_BYTES <= 24 * gib);
     assert!(ptq1_plan.context_plan.context_tokens % CONTEXT_PAGE_TOKENS == 0);
 
+    // `wy-f32` is admitted for F16, Rsq4, Rotated4FittedKv (`rsq4kvf`), and Rsq4K3v
+    // when tiled prefill is active and speculation is inactive.
+    assert!(context::SwiftKvCacheFormat::F16.supports_chunkwise_gdn_wy_f32());
+    assert!(context::SwiftKvCacheFormat::Rsq4.supports_chunkwise_gdn_wy_f32());
+    assert!(context::SwiftKvCacheFormat::Rotated4FittedKv.supports_chunkwise_gdn_wy_f32());
+    assert!(context::SwiftKvCacheFormat::Rsq4K3v.supports_chunkwise_gdn_wy_f32());
+    assert!(!context::SwiftKvCacheFormat::Rotated4FittedValues.supports_chunkwise_gdn_wy_f32());
+
+    for profile in [
+        SwiftContextProfile::NativeF16,
+        SwiftContextProfile::NativeRsq4,
+        SwiftContextProfile::NativeRsq4Full,
+        SwiftContextProfile::NativeRsq4K3v,
+    ] {
+        let plan = SwiftContextPlan::for_calibrated_execution(
+            24 * gib,
+            profile,
+            SwiftCalibratedOptions {
+                chunkwise_gdn_wy_f32: true,
+                prefill_tokens: Some(16),
+                ..pq2_options
+            },
+        )?;
+        assert!(plan.prefill_scratch_bytes.is_some());
+    }
+
+    // Desktop fast TTFT defaults (Bonsai 2.5 PQ2, tile=16, wy-f32, prompt-end-and-latest)
+    // admit cleanly on both 16 GiB and 32 GiB available RAM.
+    let desktop_fast_options = SwiftCalibratedOptions {
+        weight_packing: SwiftWeightPacking::Bonsai25Pq2,
+        request_vision: true,
+        prefill_tokens: Some(16),
+        chunkwise_gdn_wy_f32: true,
+        speculation_tokens: None,
+        prompt_reuse: SwiftCalibratedReuse::PromptEndAndLatest {
+            checkpoints: 1,
+            checkpoint_bytes: None,
+        },
+    };
+    let fast_16g = SwiftContextPlan::for_calibrated_execution(
+        16 * gib,
+        SwiftContextProfile::NativeRsq4Full,
+        desktop_fast_options,
+    )?;
+    assert!(!fast_16g.vision_admitted);
+    assert!(fast_16g.prefill_scratch_bytes.is_some());
+    let fast_32g = SwiftContextPlan::for_calibrated_execution(
+        32 * gib,
+        SwiftContextProfile::NativeRsq4Full,
+        desktop_fast_options,
+    )?;
+    assert!(fast_32g.vision_admitted);
+    assert_eq!(fast_32g.context_plan.context_tokens, 262_144);
+
     // Invalid option pairings reject cleanly.
     assert!(
         SwiftContextPlan::for_calibrated_execution(
@@ -972,7 +1026,7 @@ fn calibrated_cow_execution_matches_prism_accounting_across_packings_reuse_and_s
             SwiftContextProfile::NativeRsq4Full,
             SwiftCalibratedOptions {
                 chunkwise_gdn_wy_f32: true,
-                prefill_tokens: Some(8),
+                prefill_tokens: None,
                 ..pq2_options
             },
         )
@@ -981,14 +1035,58 @@ fn calibrated_cow_execution_matches_prism_accounting_across_packings_reuse_and_s
     assert!(
         SwiftContextPlan::for_calibrated_execution(
             24 * gib,
-            SwiftContextProfile::NativeF16,
+            SwiftContextProfile::NativeRsq4Full,
+            SwiftCalibratedOptions {
+                chunkwise_gdn_wy_f32: true,
+                prefill_tokens: Some(8),
+                speculation_tokens: Some(4),
+                ..pq2_options
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        SwiftContextPlan::for_calibrated_execution(
+            24 * gib,
+            SwiftContextProfile::PublisherF16,
             SwiftCalibratedOptions {
                 chunkwise_gdn_wy_f32: true,
                 prefill_tokens: Some(8),
                 ..pq2_options
             },
         )
-        .is_ok()
+        .is_err()
+    );
+
+    // Release-gated 64-token prefill tiles remain rejected on 0.1.35 and admit when enabled.
+    let tile_64_options = SwiftCalibratedOptions {
+        chunkwise_gdn_wy_f32: true,
+        prefill_tokens: Some(64),
+        ..pq2_options
+    };
+    assert!(
+        SwiftContextPlan::for_calibrated_execution_with_tile_64(
+            24 * gib,
+            SwiftContextProfile::NativeRsq4Full,
+            tile_64_options,
+            false,
+        )
+        .is_err()
+    );
+    let tile_64_plan = SwiftContextPlan::for_calibrated_execution_with_tile_64(
+        24 * gib,
+        SwiftContextProfile::NativeRsq4Full,
+        tile_64_options,
+        true,
+    )?;
+    assert_eq!(
+        tile_64_plan.prefill_scratch_bytes.map(u64::try_from).transpose().map_err(|e| e.to_string())?,
+        context::swift_tiled_prefill_scratch_bytes_for_tile(
+            64,
+            tile_64_plan.context_plan.context_tokens,
+            context::SwiftKvCacheFormat::Rsq4,
+            true,
+        )
     );
     Ok(())
 }

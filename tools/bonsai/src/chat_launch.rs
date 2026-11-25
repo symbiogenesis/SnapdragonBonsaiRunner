@@ -107,6 +107,7 @@ impl CpuFamily {
 enum KvCache {
     F16,
     Rsq4,
+    Rsq4Kvf,
     Rsq4K3v,
 }
 
@@ -115,6 +116,7 @@ impl KvCache {
         match self {
             Self::F16 => "f16",
             Self::Rsq4 => "rsq4",
+            Self::Rsq4Kvf => "rsq4kvf",
             Self::Rsq4K3v => "rsq4k3v",
         }
     }
@@ -125,6 +127,8 @@ impl KvCache {
 enum Placement {
     Auto,
     Cpu,
+    Vulkan,
+    Composite,
 }
 
 impl Placement {
@@ -132,6 +136,8 @@ impl Placement {
         match self {
             Self::Auto => "auto",
             Self::Cpu => "cpu",
+            Self::Vulkan => "vulkan",
+            Self::Composite => "composite",
         }
     }
 }
@@ -206,8 +212,12 @@ struct Request {
     require_broker_pipe: bool,
     #[serde(default, deserialize_with = "requested_native_row_workers")]
     native_row_workers: Option<u8>,
-    #[serde(default)]
-    prompt_reuse: PromptReuse,
+    #[serde(
+        default,
+        deserialize_with = "requested_prompt_reuse",
+        skip_serializing_if = "Option::is_none"
+    )]
+    prompt_reuse: Option<PromptReuse>,
     #[serde(
         default,
         deserialize_with = "requested_prompt_reuse_checkpoints",
@@ -304,6 +314,13 @@ where
 {
     // Omission selects the engine's default; an explicit null remains invalid.
     u8::deserialize(deserializer).map(Some)
+}
+
+fn requested_prompt_reuse<'de, D>(deserializer: D) -> Result<Option<PromptReuse>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    PromptReuse::deserialize(deserializer).map(Some)
 }
 
 fn requested_kv_cache<'de, D>(deserializer: D) -> Result<Option<KvCache>, D::Error>
@@ -457,11 +474,12 @@ impl Request {
         if self.require_broker_pipe && !self.native_engine {
             return Err("RequireBrokerPipe requires NativeEngine.".into());
         }
-        if self.prompt_reuse.enabled() && !self.native_engine {
+        let prompt_reuse_enabled = self.prompt_reuse.is_some_and(PromptReuse::enabled);
+        if prompt_reuse_enabled && !self.native_engine {
             return Err("PromptReuse requires NativeEngine.".into());
         }
         if (self.prompt_reuse_checkpoints.is_some() || self.prompt_reuse_checkpoint_bytes.is_some())
-            && (!self.native_engine || !self.prompt_reuse.enabled())
+            && (!self.native_engine || !prompt_reuse_enabled)
         {
             return Err(
                 "PromptReuseCheckpoints and PromptReuseCheckpointBytes require NativeEngine and enabled PromptReuse."
@@ -483,10 +501,6 @@ impl Request {
             && (!self.native_engine || self.cpu_prefill_tokens.is_none())
         {
             return Err("CpuPrefillGdn requires NativeEngine and CpuPrefillTokens.".into());
-        }
-        if self.cpu_prefill_gdn == Some(CpuPrefillGdn::WyF32) && self.kv_cache != Some(KvCache::F16)
-        {
-            return Err("CpuPrefillGdn wy-f32 requires KvCache f16.".into());
         }
         if (self.spec_type.is_some() || self.draft_max.is_some()) && !self.native_engine {
             return Err("CPU speculation options require NativeEngine.".into());
@@ -533,6 +547,14 @@ impl Request {
             if self.bonsai25_variant.is_some() {
                 return Err("NariqVariant cannot be combined with Bonsai25Variant.".into());
             }
+            if matches!(
+                self.placement,
+                Some(Placement::Vulkan | Placement::Composite)
+            ) {
+                return Err(
+                    "NariqVariant cannot be combined with Vulkan or Composite placement.".into(),
+                );
+            }
         }
         if self.bonsai25_variant.is_some() {
             if self.use_repacked_ptq1.is_some() {
@@ -540,6 +562,17 @@ impl Request {
             }
             if !self.native_engine {
                 return Err("Bonsai25Variant requires NativeEngine.".into());
+            }
+        }
+        if self.native_engine && self.spec_type != Some(SpeculationType::Suffix) {
+            if self.prompt_reuse.is_none() {
+                self.prompt_reuse = Some(PromptReuse::PromptEndAndLatest);
+            }
+            if self.cpu_prefill_tokens.is_none() {
+                self.cpu_prefill_tokens = Some(16);
+            }
+            if self.cpu_prefill_gdn.is_none() {
+                self.cpu_prefill_gdn = Some(CpuPrefillGdn::WyF32);
             }
         }
         self.native_row_workers = Some(workers);
@@ -1166,8 +1199,10 @@ fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
     if let Some(family) = request.cpu_family {
         argument(arguments, "--cpu-family", family.name());
     }
-    if request.prompt_reuse.enabled() {
-        argument(arguments, "--prompt-reuse", request.prompt_reuse.name());
+    if let Some(prompt_reuse) = request.prompt_reuse
+        && prompt_reuse.enabled()
+    {
+        argument(arguments, "--prompt-reuse", prompt_reuse.name());
     }
     if let Some(checkpoints) = request.prompt_reuse_checkpoints {
         argument(

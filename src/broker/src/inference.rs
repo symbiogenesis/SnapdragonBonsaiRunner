@@ -173,6 +173,13 @@ impl CpuFamily {
             Self::X1 | Self::X2 => 8,
         }
     }
+
+    pub(super) const fn into_snapdragon(self) -> bonsai_cpu_policy::hardware::SnapdragonFamily {
+        match self {
+            Self::X1 => bonsai_cpu_policy::hardware::SnapdragonFamily::XElite,
+            Self::X2 => bonsai_cpu_policy::hardware::SnapdragonFamily::X2EliteExtreme,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -637,28 +644,128 @@ pub(crate) const BONSAI_2_5_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 // readiness fields (`cpu_prefill_tokens`, `cpu_prefill_scratch_bytes`, `:cpu-tiled-ffn-v1:{n}`).
 const CPU_PREFILL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 
+// 64-token CPU tiled prefill (`--cpu-prefill-tokens 64`) requires a separately
+// reviewed native release (`0.1.36+`) supporting 64-row prefill tiles.
+const PREFILL_TILE_64_RELEASE: Option<(&str, &str)> = None;
+
+// Split decode/prefill CPU row-worker pools (`--prefill-row-workers`;
+// X1: 8 decode / 12 prefill, X2: 8 decode / 16 prefill) require a separately
+// reviewed native release (`0.1.36+`).
+const PREFILL_ROW_WORKERS_RELEASE: Option<(&str, &str)> = None;
+
+pub(super) fn prefill_tile_64_supported() -> Result<bool, LaunchError> {
+    let release = pinned_release()?;
+    Ok(reviewed_release_matches(release, MEMORY_CONTEXT_RELEASE)
+        && reviewed_release_matches(release, CPU_PREFILL_RELEASE)
+        && reviewed_release_matches(release, PREFILL_TILE_64_RELEASE))
+}
+
 pub(super) fn parse_cpu_prefill_tokens(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
-    parse_enum(value, &[("8", 8), ("16", 16), ("32", 32)])
+    parse_enum(value, &[("8", 8), ("16", 16), ("32", 32), ("64", 64)])
+}
+
+fn select_cpu_prefill_tokens(
+    release: &ReleasePin,
+    native: bool,
+    requested: Option<u8>,
+    memory_release: Option<(&str, &str)>,
+    prefill_release: Option<(&str, &str)>,
+    tile_64_release: Option<(&str, &str)>,
+) -> Result<Option<u8>, LaunchError> {
+    let Some(tokens) = requested else {
+        return Ok(None);
+    };
+    if !native || !matches!(tokens, 8 | 16 | 32 | 64) {
+        return Err(LaunchError::Arguments);
+    }
+    if tokens == 64 {
+        return if reviewed_release_matches(release, tile_64_release) {
+            Ok(Some(64))
+        } else {
+            Err(LaunchError::NativeRuntime)
+        };
+    }
+    if reviewed_release_matches(release, memory_release)
+        && reviewed_release_matches(release, prefill_release)
+    {
+        Ok(Some(tokens))
+    } else {
+        Err(LaunchError::NativeRuntime)
+    }
 }
 
 pub(super) fn pinned_cpu_prefill_tokens(
     native: bool,
     requested: Option<u8>,
 ) -> Result<Option<u8>, LaunchError> {
-    let Some(tokens) = requested else {
-        return Ok(None);
-    };
-    if !native || !matches!(tokens, 8 | 16 | 32) {
-        return Err(LaunchError::Arguments);
+    select_cpu_prefill_tokens(
+        pinned_release()?,
+        native,
+        requested,
+        MEMORY_CONTEXT_RELEASE,
+        CPU_PREFILL_RELEASE,
+        PREFILL_TILE_64_RELEASE,
+    )
+}
+
+pub(super) fn parse_prefill_row_workers(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
+    parse_enum(
+        value,
+        &[("1", 1), ("4", 4), ("8", 8), ("12", 12), ("16", 16)],
+    )
+}
+
+fn select_prefill_row_workers(
+    release: &ReleasePin,
+    native: bool,
+    requested: Option<u8>,
+    family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+    explicit_family: Option<CpuFamily>,
+    prefill_row_workers_release: Option<(&str, &str)>,
+) -> Result<Option<u8>, LaunchError> {
+    if !native {
+        return if requested.is_some() {
+            Err(LaunchError::Arguments)
+        } else {
+            Ok(None)
+        };
     }
-    let pin = pinned_release()?;
-    if reviewed_release_matches(pin, MEMORY_CONTEXT_RELEASE)
-        && reviewed_release_matches(pin, CPU_PREFILL_RELEASE)
-    {
-        Ok(Some(tokens))
+    if let Some(workers) = requested {
+        if !matches!(workers, 1 | 4 | 8 | 12 | 16) {
+            return Err(LaunchError::Arguments);
+        }
+        return if reviewed_release_matches(release, prefill_row_workers_release) {
+            Ok(Some(workers))
+        } else {
+            Err(LaunchError::NativeRuntime)
+        };
+    }
+    if reviewed_release_matches(release, prefill_row_workers_release) {
+        let effective_family = explicit_family.map(CpuFamily::into_snapdragon).or(family);
+        let (_, prefill) =
+            bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_worker_budget(
+                effective_family,
+            );
+        Ok(Some(prefill))
     } else {
-        Err(LaunchError::NativeRuntime)
+        Ok(None)
     }
+}
+
+pub(super) fn pinned_prefill_row_workers(
+    native: bool,
+    requested: Option<u8>,
+    family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+    explicit_family: Option<CpuFamily>,
+) -> Result<Option<u8>, LaunchError> {
+    select_prefill_row_workers(
+        pinned_release()?,
+        native,
+        requested,
+        family,
+        explicit_family,
+        PREFILL_ROW_WORKERS_RELEASE,
+    )
 }
 
 pub(super) fn vision_supported() -> Result<bool, LaunchError> {
@@ -1298,7 +1405,12 @@ mod tests {
     -> Result<(), LaunchError> {
         let pinned = release(LOCK)?;
         assert_eq!(WY_F32_ROTATED_KV_RELEASE, REVIEWED_0_1_35);
-        for kv in [KvCache::F16, KvCache::Rsq4, KvCache::Rsq4K3v] {
+        for kv in [
+            KvCache::F16,
+            KvCache::Rsq4,
+            KvCache::Rsq4Kvf,
+            KvCache::Rsq4K3v,
+        ] {
             assert_eq!(
                 pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::WyF32), Some(kv)),
                 Ok(())
@@ -1327,7 +1439,7 @@ mod tests {
             ),
             Ok(())
         );
-        for kv in [KvCache::Rsq4, KvCache::Rsq4K3v] {
+        for kv in [KvCache::Rsq4, KvCache::Rsq4Kvf, KvCache::Rsq4K3v] {
             assert_eq!(
                 select_wy_f32_kv_cache(
                     &unreviewed,
@@ -1400,6 +1512,113 @@ mod tests {
         assert_eq!(
             adapter_execution_sha256_for_bonsai25(bonsai_cpu_policy::Bonsai25Variant::Ptq1),
             ADAPTER_BONSAI25_PTQ1_EXECUTION_SHA256
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn future_0_1_36_tile_64_and_prefill_row_workers_remain_gated_on_0_1_35_and_unlock_on_pin()
+    -> Result<(), LaunchError> {
+        use bonsai_cpu_policy::hardware::SnapdragonFamily;
+        use std::ffi::OsStr;
+
+        assert_eq!(PREFILL_TILE_64_RELEASE, None);
+        assert_eq!(PREFILL_ROW_WORKERS_RELEASE, None);
+        assert!(!prefill_tile_64_supported()?);
+        assert_eq!(parse_cpu_prefill_tokens(Some(OsStr::new("64"))), Ok(64));
+        assert_eq!(
+            pinned_cpu_prefill_tokens(true, Some(64)),
+            Err(LaunchError::NativeRuntime)
+        );
+        assert_eq!(
+            pinned_cpu_prefill_tokens(false, Some(64)),
+            Err(LaunchError::Arguments)
+        );
+
+        assert_eq!(parse_prefill_row_workers(Some(OsStr::new("12"))), Ok(12));
+        assert_eq!(parse_prefill_row_workers(Some(OsStr::new("16"))), Ok(16));
+        assert_eq!(
+            pinned_prefill_row_workers(true, None, Some(SnapdragonFamily::XElite), None),
+            Ok(None)
+        );
+        assert_eq!(
+            pinned_prefill_row_workers(true, Some(12), Some(SnapdragonFamily::XElite), None),
+            Err(LaunchError::NativeRuntime)
+        );
+        assert_eq!(
+            pinned_prefill_row_workers(false, Some(12), None, None),
+            Err(LaunchError::Arguments)
+        );
+
+        let mut future_pin = release(LOCK)?;
+        let reviewed_0_1_36 = ("0.1.36", "4444444444444444444444444444444444444444");
+        future_pin.version = reviewed_0_1_36.0.into();
+        future_pin.commit = reviewed_0_1_36.1.into();
+        assert_eq!(
+            select_cpu_prefill_tokens(
+                &future_pin,
+                true,
+                Some(64),
+                Some(reviewed_0_1_36),
+                Some(reviewed_0_1_36),
+                Some(reviewed_0_1_36),
+            ),
+            Ok(Some(64))
+        );
+        assert_eq!(
+            select_prefill_row_workers(
+                &future_pin,
+                true,
+                None,
+                Some(SnapdragonFamily::XElite),
+                None,
+                Some(reviewed_0_1_36),
+            ),
+            Ok(Some(12))
+        );
+        assert_eq!(
+            select_prefill_row_workers(
+                &future_pin,
+                true,
+                None,
+                Some(SnapdragonFamily::X2EliteExtreme),
+                None,
+                Some(reviewed_0_1_36),
+            ),
+            Ok(Some(16))
+        );
+        assert_eq!(
+            select_prefill_row_workers(
+                &future_pin,
+                true,
+                None,
+                Some(SnapdragonFamily::XElite),
+                Some(CpuFamily::X2),
+                Some(reviewed_0_1_36),
+            ),
+            Ok(Some(16))
+        );
+        assert_eq!(
+            select_prefill_row_workers(
+                &future_pin,
+                true,
+                None,
+                None,
+                None,
+                Some(reviewed_0_1_36),
+            ),
+            Ok(Some(4))
+        );
+        assert_eq!(
+            select_prefill_row_workers(
+                &future_pin,
+                true,
+                Some(12),
+                None,
+                None,
+                Some(reviewed_0_1_36),
+            ),
+            Ok(Some(12))
         );
         Ok(())
     }
