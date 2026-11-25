@@ -18,7 +18,7 @@ const MAX_THINKING_TOKEN_RATIO: f64 = 1.10;
 const MIN_CREATIVE_SCORE: f64 = 3.0;
 const MIN_MULTIMODAL_SCORE: f64 = 3.0;
 const MAX_DR_G2_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_DR_G2_RESPONSES_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_DR_G2_RESPONSES_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DR_G2_SCALE_GRID_LEN: usize = 16;
 const SYNTHETIC_FIXTURE_METHOD: &str = "synthetic-runtime-test-fixture-v1";
 const THINKING_ON_CATEGORIES: [&str; 3] = ["coding", "reasoning", "instruction-following"];
@@ -1079,14 +1079,22 @@ pub(super) fn validate_evidence_header(evidence: &DrG2Evidence) -> crate::Result
     Err("DR-G2 evidence contractSha256 does not match canonical DR-G2 contract.".into())
 }
 
-fn read_dr_g2_evidence(path: &Path) -> crate::Result<DrG2Evidence> {
+pub(super) fn read_dr_g2_evidence_with_sha256(
+    path: &Path,
+) -> crate::Result<(DrG2Evidence, String)> {
     let raw_bytes = crate::bounded_input::read_regular_file(
         path,
         MAX_DR_G2_EVIDENCE_BYTES,
         "DR-G2 evidence exceeds 16 MiB.",
     )?;
-    serde_json::from_slice(crate::bounded_input::strip_utf8_bom(&raw_bytes))
-        .map_err(|error| crate::cli::bounded_json_error(&error))
+    let sha256 = crate::identity::sha256(&raw_bytes);
+    let evidence = serde_json::from_slice(crate::bounded_input::strip_utf8_bom(&raw_bytes))
+        .map_err(|error| crate::cli::bounded_json_error(&error))?;
+    Ok((evidence, sha256))
+}
+
+pub(super) fn read_dr_g2_evidence(path: &Path) -> crate::Result<DrG2Evidence> {
+    read_dr_g2_evidence_with_sha256(path).map(|(evidence, _)| evidence)
 }
 
 #[expect(

@@ -182,8 +182,10 @@ HTTP Range streaming. Supply `schemaVersion: 1` and `operation`:
   `modelPath`, optional `orcaAdapterPath`, `candidateAdapterPath`, `baseModel`,
   `selectedScale`, `scaleGrid`, `candidateMaxRank`, `candidateTargetCount`,
   `rowWorkers`, `kvCache`, `contextTokens`, `cpuPrefillTokens`, `placement`,
-  `timeBudgetSeconds` in `30..=900`, `responsesOutputPath`,
-  `trainingPromptSha256s`, `zeroScaleControls`, `thinkingOnPrompts`,
+  `timeBudgetSeconds` in `30..=900`, `responsesOutputPath`, optional
+  `supplementEvidencePath` / `supplementResponsesPath` to extend a partial
+  capture under matching contract/adapter headers without re-running completed
+  arms, `trainingPromptSha256s`, `zeroScaleControls`, `thinkingOnPrompts`,
   `thinkingOffPrompts`) that acquires a thread-local
   `bonsai_windows_process::SystemAwakeGuard` (`SetThreadExecutionState`
   `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` restored to `ES_CONTINUOUS` on drop) to

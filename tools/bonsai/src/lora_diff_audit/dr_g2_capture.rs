@@ -13,9 +13,10 @@ use serde_json::{Value, json};
 
 use super::gguf_adapter::{VerifyPolicy, verify_lora_gguf};
 use super::readiness::{
-    BaseModelProfile, BlindResponseEntry, DrG2Evidence, ThinkingOffArm, ThinkingOffPromptPair,
-    ThinkingOnArm, ThinkingOnPromptPair, ZeroScaleControl, build_dr_g2_contract,
-    compiled_orca_adapter_sha256, hash_contract, resolve_scale_grid,
+    BaseModelProfile, BlindResponseEntry, DrG2Evidence, MAX_DR_G2_RESPONSES_BYTES, ThinkingOffArm,
+    ThinkingOffPromptPair, ThinkingOnArm, ThinkingOnPromptPair, ZeroScaleControl,
+    build_dr_g2_contract, compiled_orca_adapter_sha256, hash_contract,
+    read_dr_g2_evidence_with_sha256, resolve_scale_grid, validate_evidence_header,
 };
 use super::{Operation, Request, validate_output_path};
 
@@ -100,6 +101,10 @@ pub(super) struct DrG2CaptureConfig {
     pub(super) time_budget_seconds: Option<u64>,
     #[serde(default)]
     pub(super) responses_output_path: Option<PathBuf>,
+    #[serde(default)]
+    pub(super) supplement_evidence_path: Option<PathBuf>,
+    #[serde(default)]
+    pub(super) supplement_responses_path: Option<PathBuf>,
     #[serde(default)]
     pub(super) training_prompt_sha256s: Vec<String>,
     #[serde(default)]
@@ -331,6 +336,43 @@ pub(super) fn validate_capture_request(
             return Err("captureConfig.responsesOutputPath must differ from outputPath.".into());
         }
     }
+    if config.supplement_responses_path.is_some() && config.supplement_evidence_path.is_none() {
+        return Err(
+            "captureConfig.supplementResponsesPath requires captureConfig.supplementEvidencePath."
+                .into(),
+        );
+    }
+    if let Some(sup_ev) = &config.supplement_evidence_path {
+        bonsai_artifacts::validate_external_path(sup_ev).map_err(|e| e.to_string())?;
+        if sup_ev == output_path {
+            return Err("captureConfig.supplementEvidencePath must differ from outputPath.".into());
+        }
+        if config.responses_output_path.as_deref() == Some(sup_ev.as_path()) {
+            return Err(
+                "captureConfig.supplementEvidencePath must differ from responsesOutputPath.".into(),
+            );
+        }
+        if config.responses_output_path.is_some() && config.supplement_responses_path.is_none() {
+            return Err(
+                "captureConfig.responsesOutputPath requires captureConfig.supplementResponsesPath when supplementing prior evidence."
+                    .into(),
+            );
+        }
+    }
+    if let Some(sup_resp) = &config.supplement_responses_path {
+        bonsai_artifacts::validate_external_path(sup_resp).map_err(|e| e.to_string())?;
+        if sup_resp == output_path {
+            return Err(
+                "captureConfig.supplementResponsesPath must differ from outputPath.".into(),
+            );
+        }
+        if config.responses_output_path.as_deref() == Some(sup_resp.as_path()) {
+            return Err(
+                "captureConfig.supplementResponsesPath must differ from responsesOutputPath."
+                    .into(),
+            );
+        }
+    }
 
     let mut training_digests = BTreeSet::new();
     for digest in &config.training_prompt_sha256s {
@@ -343,19 +385,33 @@ pub(super) fn validate_capture_request(
         training_digests.insert(digest.as_str());
     }
 
-    if config.zero_scale_controls.is_empty() {
-        return Err("captureConfig.zeroScaleControls must contain at least one prompt.".into());
-    }
-    if config.thinking_on_prompts.is_empty() {
-        return Err(
-            "captureConfig.thinkingOnPrompts must contain at least one prompt per category.".into(),
-        );
-    }
-    if config.thinking_off_prompts.is_empty() {
-        return Err(
-            "captureConfig.thinkingOffPrompts must contain at least one creative-prose prompt."
-                .into(),
-        );
+    let is_supplement = config.supplement_evidence_path.is_some();
+    if is_supplement {
+        if config.zero_scale_controls.is_empty()
+            && config.thinking_on_prompts.is_empty()
+            && config.thinking_off_prompts.is_empty()
+        {
+            return Err(
+                "Supplemental captureConfig must supply at least one new prompt across zeroScaleControls, thinkingOnPrompts, or thinkingOffPrompts."
+                    .into(),
+            );
+        }
+    } else {
+        if config.zero_scale_controls.is_empty() {
+            return Err("captureConfig.zeroScaleControls must contain at least one prompt.".into());
+        }
+        if config.thinking_on_prompts.is_empty() {
+            return Err(
+                "captureConfig.thinkingOnPrompts must contain at least one prompt per category."
+                    .into(),
+            );
+        }
+        if config.thinking_off_prompts.is_empty() {
+            return Err(
+                "captureConfig.thinkingOffPrompts must contain at least one creative-prose prompt."
+                    .into(),
+            );
+        }
     }
 
     let mut prompt_ids = BTreeSet::new();
@@ -406,11 +462,13 @@ pub(super) fn validate_capture_request(
             return Err("Thinking-ON promptText overlaps trainingPromptSha256s split.".into());
         }
     }
-    for cat in THINKING_ON_CATEGORIES {
-        if !seen_categories.contains(cat) {
-            return Err(format!(
-                "captureConfig.thinkingOnPrompts is missing required category '{cat}'."
-            ));
+    if !is_supplement {
+        for cat in THINKING_ON_CATEGORIES {
+            if !seen_categories.contains(cat) {
+                return Err(format!(
+                    "captureConfig.thinkingOnPrompts is missing required category '{cat}'."
+                ));
+            }
         }
     }
 
@@ -590,6 +648,12 @@ fn verify_capture_inputs(config: &DrG2CaptureConfig) -> crate::Result<CandidateA
         &config.candidate_adapter_path,
         "captureConfig.candidateAdapterPath",
     )?;
+    if let Some(sup_ev) = &config.supplement_evidence_path {
+        validate_regular_external_file(sup_ev, "captureConfig.supplementEvidencePath")?;
+    }
+    if let Some(sup_resp) = &config.supplement_responses_path {
+        validate_regular_external_file(sup_resp, "captureConfig.supplementResponsesPath")?;
+    }
     if let Some(orca_path) = &config.orca_adapter_path {
         validate_regular_external_file(orca_path, "captureConfig.orcaAdapterPath")?;
         let mut orca_file =
@@ -653,6 +717,390 @@ fn verify_capture_inputs(config: &DrG2CaptureConfig) -> crate::Result<CandidateA
         max_rank: Some(verified_max_rank),
         target_count: Some(verified_target_count),
     })
+}
+
+struct ResolvedCaptureContract {
+    profile: BaseModelProfile,
+    has_orca_adapter: bool,
+    base_model_sha256: String,
+    orca_adapter_sha256: Option<String>,
+    orca_scale: f64,
+    scale_grid: Vec<f64>,
+    contract_sha256: String,
+}
+
+struct SupplementInputs {
+    prior_evidence_sha256: String,
+    prior_zero_controls: usize,
+    prior_thinking_on: usize,
+    prior_thinking_off: usize,
+    zero_scale_controls: Vec<ZeroScaleControl>,
+    thinking_on_prompts: Vec<ThinkingOnPromptPair>,
+    thinking_off_prompts: Vec<ThinkingOffPromptPair>,
+    blind_responses: BTreeMap<String, BlindResponseEntry>,
+    merged_training_prompt_sha256s: Vec<String>,
+}
+
+fn resolve_capture_contract(
+    config: &DrG2CaptureConfig,
+    candidate_meta: &CandidateAdapterMeta,
+) -> crate::Result<ResolvedCaptureContract> {
+    let profile = config.base_model.unwrap_or(BaseModelProfile::SwiftPq2);
+    let has_orca_adapter = config.orca_adapter_path.is_some();
+    let base_model_sha256 = profile.base_model_sha256()?;
+    let orca_adapter_sha256 = if has_orca_adapter {
+        Some(compiled_orca_adapter_sha256()?)
+    } else {
+        None
+    };
+    let orca_scale = if has_orca_adapter { 1.3 } else { 0.0 };
+    let scale_grid = resolve_scale_grid(config.scale_grid.as_ref())?;
+    let contract = build_dr_g2_contract(
+        (profile != BaseModelProfile::SwiftPq2).then_some(profile),
+        false,
+        &base_model_sha256,
+        orca_adapter_sha256.as_deref(),
+        &scale_grid,
+        Some(&candidate_meta.sha256),
+        candidate_meta.max_rank,
+        candidate_meta.target_count,
+    );
+    let contract_sha256 = hash_contract(&contract)?;
+    Ok(ResolvedCaptureContract {
+        profile,
+        has_orca_adapter,
+        base_model_sha256,
+        orca_adapter_sha256,
+        orca_scale,
+        scale_grid,
+        contract_sha256,
+    })
+}
+
+fn verify_supplement_contract(
+    prior: &DrG2Evidence,
+    config: &DrG2CaptureConfig,
+    candidate_meta: &CandidateAdapterMeta,
+    expected: &ResolvedCaptureContract,
+) -> crate::Result<()> {
+    if prior.include_multimodal_checks || !prior.multimodal_prompts.is_empty() {
+        return Err("DR-G2 supplement capture does not support multimodal prior evidence.".into());
+    }
+    if prior.base_model.unwrap_or(BaseModelProfile::SwiftPq2) != expected.profile {
+        return Err("DR-G2 supplement baseModel disagrees with captureConfig.".into());
+    }
+    if prior.base_model_sha256 != expected.base_model_sha256 {
+        return Err("DR-G2 supplement baseModelSha256 disagrees with captureConfig.".into());
+    }
+    if prior.orca_adapter_sha256 != expected.orca_adapter_sha256 {
+        return Err("DR-G2 supplement orcaAdapterSha256 disagrees with captureConfig.".into());
+    }
+    if !prior.orca_scale.is_finite() || (prior.orca_scale - expected.orca_scale).abs() > 1e-12 {
+        return Err("DR-G2 supplement orcaScale disagrees with captureConfig.".into());
+    }
+    if prior.candidate_adapter_sha256 != candidate_meta.sha256 {
+        return Err("DR-G2 supplement candidateAdapterSha256 disagrees with captureConfig.".into());
+    }
+    if prior.candidate_max_rank != candidate_meta.max_rank {
+        return Err("DR-G2 supplement candidateMaxRank disagrees with captureConfig.".into());
+    }
+    if prior.candidate_target_count != candidate_meta.target_count {
+        return Err("DR-G2 supplement candidateTargetCount disagrees with captureConfig.".into());
+    }
+    if prior.scale_grid.len() != expected.scale_grid.len()
+        || prior
+            .scale_grid
+            .iter()
+            .zip(&expected.scale_grid)
+            .any(|(a, b)| (a - b).abs() > 1e-12)
+    {
+        return Err("DR-G2 supplement scaleGrid disagrees with captureConfig.".into());
+    }
+    if !prior.selected_scale.is_finite()
+        || (prior.selected_scale - config.selected_scale).abs() > 1e-12
+    {
+        return Err("DR-G2 supplement selectedScale disagrees with captureConfig.".into());
+    }
+    if prior.contract_sha256 != expected.contract_sha256 {
+        return Err("DR-G2 supplement contractSha256 disagrees with captureConfig.".into());
+    }
+    Ok(())
+}
+
+fn validate_and_merge_supplement_prompts(
+    prior: &DrG2Evidence,
+    config: &DrG2CaptureConfig,
+) -> crate::Result<(Vec<String>, BTreeSet<String>)> {
+    let mut merged_training_set = BTreeSet::new();
+    for digest in prior
+        .training_prompt_sha256s
+        .iter()
+        .chain(config.training_prompt_sha256s.iter())
+    {
+        if !crate::identity::is_lower_hex(digest, 64) {
+            return Err(
+                "DR-G2 trainingPromptSha256s must contain only lowercase 64-hex SHA-256 digests."
+                    .into(),
+            );
+        }
+        merged_training_set.insert(digest.clone());
+    }
+
+    let mut seen_ids = BTreeSet::new();
+    let mut new_ids = BTreeSet::new();
+    let mut thinking_on_cats = BTreeSet::new();
+
+    for ctrl in &prior.zero_scale_controls {
+        validate_prompt_id(&ctrl.prompt_id, "Prior zero-scale control")?;
+        if !seen_ids.insert(ctrl.prompt_id.clone()) {
+            return Err("Duplicate promptId in supplementEvidencePath.".into());
+        }
+        if !crate::identity::is_lower_hex(&ctrl.prompt_sha256, 64)
+            || !crate::identity::is_lower_hex(&ctrl.no_adapter_response_sha256, 64)
+            || !crate::identity::is_lower_hex(&ctrl.zero_scale_response_sha256, 64)
+        {
+            return Err(
+                "Prior zero-scale control digests must be lowercase 64-hex SHA-256s.".into(),
+            );
+        }
+        if merged_training_set.contains(&ctrl.prompt_sha256) {
+            return Err(
+                "Prior zero-scale control promptSha256 overlaps trainingPromptSha256s split."
+                    .into(),
+            );
+        }
+    }
+
+    for pair in &prior.thinking_on_prompts {
+        validate_prompt_id(&pair.prompt_id, "Prior Thinking-ON")?;
+        if !seen_ids.insert(pair.prompt_id.clone()) {
+            return Err("Duplicate promptId in supplementEvidencePath.".into());
+        }
+        if !THINKING_ON_CATEGORIES.contains(&pair.category.as_str()) {
+            return Err(
+                "Prior Thinking-ON prompt category must be coding, reasoning, or instruction-following."
+                    .into(),
+            );
+        }
+        thinking_on_cats.insert(pair.category.as_str());
+        if !crate::identity::is_lower_hex(&pair.prompt_sha256, 64)
+            || !crate::identity::is_lower_hex(&pair.baseline.response_sha256, 64)
+            || !crate::identity::is_lower_hex(&pair.candidate.response_sha256, 64)
+        {
+            return Err("Prior Thinking-ON digests must be lowercase 64-hex SHA-256s.".into());
+        }
+        if !pair.baseline.scale.is_finite()
+            || pair.baseline.scale.abs() > 1e-12
+            || !pair.candidate.scale.is_finite()
+            || (pair.candidate.scale - config.selected_scale).abs() > 1e-12
+        {
+            return Err(
+                "Prior Thinking-ON arm scale disagrees with baseline 0.0 or selectedScale.".into(),
+            );
+        }
+        if merged_training_set.contains(&pair.prompt_sha256) {
+            return Err(
+                "Prior Thinking-ON promptSha256 overlaps trainingPromptSha256s split.".into(),
+            );
+        }
+    }
+
+    for pair in &prior.thinking_off_prompts {
+        validate_prompt_id(&pair.prompt_id, "Prior Thinking-OFF")?;
+        if !seen_ids.insert(pair.prompt_id.clone()) {
+            return Err("Duplicate promptId in supplementEvidencePath.".into());
+        }
+        if pair.category != THINKING_OFF_CATEGORY {
+            return Err("Prior Thinking-OFF prompt category must be creative-prose.".into());
+        }
+        if !crate::identity::is_lower_hex(&pair.prompt_sha256, 64)
+            || !crate::identity::is_lower_hex(&pair.baseline.response_sha256, 64)
+            || !crate::identity::is_lower_hex(&pair.candidate.response_sha256, 64)
+        {
+            return Err("Prior Thinking-OFF digests must be lowercase 64-hex SHA-256s.".into());
+        }
+        if !pair.baseline.scale.is_finite()
+            || pair.baseline.scale.abs() > 1e-12
+            || !pair.candidate.scale.is_finite()
+            || (pair.candidate.scale - config.selected_scale).abs() > 1e-12
+        {
+            return Err(
+                "Prior Thinking-OFF arm scale disagrees with baseline 0.0 or selectedScale.".into(),
+            );
+        }
+        if merged_training_set.contains(&pair.prompt_sha256) {
+            return Err(
+                "Prior Thinking-OFF promptSha256 overlaps trainingPromptSha256s split.".into(),
+            );
+        }
+    }
+
+    for ctrl in &config.zero_scale_controls {
+        if !seen_ids.insert(ctrl.prompt_id.clone()) {
+            return Err(format!(
+                "Duplicate promptId '{}' between supplementEvidencePath and captureConfig.",
+                ctrl.prompt_id
+            ));
+        }
+        new_ids.insert(ctrl.prompt_id.clone());
+        let prompt_sha = crate::identity::sha256(ctrl.prompt_text.as_bytes());
+        if merged_training_set.contains(&prompt_sha) {
+            return Err(
+                "Zero-scale control promptText overlaps merged trainingPromptSha256s split.".into(),
+            );
+        }
+    }
+
+    for prompt in &config.thinking_on_prompts {
+        if !seen_ids.insert(prompt.prompt_id.clone()) {
+            return Err(format!(
+                "Duplicate promptId '{}' between supplementEvidencePath and captureConfig.",
+                prompt.prompt_id
+            ));
+        }
+        new_ids.insert(prompt.prompt_id.clone());
+        thinking_on_cats.insert(prompt.category.as_str());
+        let prompt_sha = crate::identity::sha256(prompt.prompt_text.as_bytes());
+        if merged_training_set.contains(&prompt_sha) {
+            return Err(
+                "Thinking-ON promptText overlaps merged trainingPromptSha256s split.".into(),
+            );
+        }
+    }
+
+    for prompt in &config.thinking_off_prompts {
+        if !seen_ids.insert(prompt.prompt_id.clone()) {
+            return Err(format!(
+                "Duplicate promptId '{}' between supplementEvidencePath and captureConfig.",
+                prompt.prompt_id
+            ));
+        }
+        new_ids.insert(prompt.prompt_id.clone());
+        let prompt_sha = crate::identity::sha256(prompt.prompt_text.as_bytes());
+        if merged_training_set.contains(&prompt_sha) {
+            return Err(
+                "Thinking-OFF promptText overlaps merged trainingPromptSha256s split.".into(),
+            );
+        }
+    }
+
+    if prior.zero_scale_controls.is_empty() && config.zero_scale_controls.is_empty() {
+        return Err("Combined DR-G2 capture must contain at least one zero-scale control.".into());
+    }
+    for cat in THINKING_ON_CATEGORIES {
+        if !thinking_on_cats.contains(cat) {
+            return Err(format!(
+                "Combined DR-G2 Thinking-ON prompts are missing required category '{cat}'."
+            ));
+        }
+    }
+    if prior.thinking_off_prompts.is_empty() && config.thinking_off_prompts.is_empty() {
+        return Err(
+            "Combined DR-G2 capture must contain at least one Thinking-OFF creative-prose prompt."
+                .into(),
+        );
+    }
+
+    let merged_training_prompt_sha256s: Vec<String> = merged_training_set.into_iter().collect();
+    Ok((merged_training_prompt_sha256s, new_ids))
+}
+
+fn verify_prior_response_pair(
+    responses: &BTreeMap<String, BlindResponseEntry>,
+    prompt_id: &str,
+    expected_baseline_sha256: &str,
+    expected_candidate_sha256: &str,
+) -> crate::Result<BlindResponseEntry> {
+    let entry = responses.get(prompt_id).ok_or_else(|| {
+        format!("supplementResponsesPath is missing entry for promptId '{prompt_id}'.")
+    })?;
+    if crate::identity::sha256(entry.baseline_text.as_bytes()) != expected_baseline_sha256 {
+        return Err(format!(
+            "supplementResponsesPath baseline SHA-256 mismatch for promptId '{prompt_id}'."
+        ));
+    }
+    if crate::identity::sha256(entry.candidate_text.as_bytes()) != expected_candidate_sha256 {
+        return Err(format!(
+            "supplementResponsesPath candidate SHA-256 mismatch for promptId '{prompt_id}'."
+        ));
+    }
+    Ok(entry.clone())
+}
+
+fn load_and_verify_supplement_responses(
+    sup_resp_path: &Path,
+    prior: &DrG2Evidence,
+    new_ids: &BTreeSet<String>,
+) -> crate::Result<BTreeMap<String, BlindResponseEntry>> {
+    let resp_bytes = crate::bounded_input::read_regular_file(
+        sup_resp_path,
+        MAX_DR_G2_RESPONSES_BYTES,
+        "DR-G2 supplement responses JSON exceeds 64 MiB.",
+    )?;
+    let raw_responses: BTreeMap<String, BlindResponseEntry> =
+        serde_json::from_slice(crate::bounded_input::strip_utf8_bom(&resp_bytes))
+            .map_err(|error| crate::cli::bounded_json_error(&error))?;
+
+    for key in raw_responses.keys() {
+        if new_ids.contains(key) {
+            return Err(format!(
+                "supplementResponsesPath contains promptId '{key}' that collides with captureConfig."
+            ));
+        }
+    }
+
+    let mut verified = BTreeMap::new();
+    for pair in &prior.thinking_on_prompts {
+        let entry = verify_prior_response_pair(
+            &raw_responses,
+            &pair.prompt_id,
+            &pair.baseline.response_sha256,
+            &pair.candidate.response_sha256,
+        )?;
+        verified.insert(pair.prompt_id.clone(), entry);
+    }
+    for pair in &prior.thinking_off_prompts {
+        let entry = verify_prior_response_pair(
+            &raw_responses,
+            &pair.prompt_id,
+            &pair.baseline.response_sha256,
+            &pair.candidate.response_sha256,
+        )?;
+        verified.insert(pair.prompt_id.clone(), entry);
+    }
+    Ok(verified)
+}
+
+fn load_supplement_inputs(
+    config: &DrG2CaptureConfig,
+    candidate_meta: &CandidateAdapterMeta,
+) -> crate::Result<Option<SupplementInputs>> {
+    let Some(sup_ev_path) = &config.supplement_evidence_path else {
+        return Ok(None);
+    };
+    let (prior_evidence, prior_evidence_sha256) = read_dr_g2_evidence_with_sha256(sup_ev_path)?;
+    let _contract_scope = validate_evidence_header(&prior_evidence)?;
+    let expected = resolve_capture_contract(config, candidate_meta)?;
+    verify_supplement_contract(&prior_evidence, config, candidate_meta, &expected)?;
+    let (merged_training_prompt_sha256s, new_ids) =
+        validate_and_merge_supplement_prompts(&prior_evidence, config)?;
+    let blind_responses = match &config.supplement_responses_path {
+        Some(sup_resp_path) => {
+            load_and_verify_supplement_responses(sup_resp_path, &prior_evidence, &new_ids)?
+        }
+        None => BTreeMap::new(),
+    };
+    Ok(Some(SupplementInputs {
+        prior_evidence_sha256,
+        prior_zero_controls: prior_evidence.zero_scale_controls.len(),
+        prior_thinking_on: prior_evidence.thinking_on_prompts.len(),
+        prior_thinking_off: prior_evidence.thinking_off_prompts.len(),
+        zero_scale_controls: prior_evidence.zero_scale_controls,
+        thinking_on_prompts: prior_evidence.thinking_on_prompts,
+        thinking_off_prompts: prior_evidence.thinking_off_prompts,
+        blind_responses,
+        merged_training_prompt_sha256s,
+    }))
 }
 
 fn should_retry_socket(error: &io::Error) -> bool {
@@ -1379,6 +1827,7 @@ fn run_chat_completion(
 fn capture_against_endpoints_inner(
     config: &DrG2CaptureConfig,
     candidate_meta: &CandidateAdapterMeta,
+    supplement: Option<SupplementInputs>,
     output_path: &Path,
     server_a: &CaptureEndpoint<'_>,
     server_b: &CaptureEndpoint<'_>,
@@ -1396,15 +1845,15 @@ fn capture_against_endpoints_inner(
     wait_endpoint_ready(server_a, false, inference_deadline, &check_servers)?;
     wait_endpoint_ready(server_b, true, inference_deadline, &check_servers)?;
 
-    let profile = config.base_model.unwrap_or(BaseModelProfile::SwiftPq2);
-    let has_orca_adapter = config.orca_adapter_path.is_some();
-    let base_model_sha256 = profile.base_model_sha256()?;
-    let orca_adapter_sha256 = if has_orca_adapter {
-        Some(compiled_orca_adapter_sha256()?)
-    } else {
-        None
-    };
-    let orca_scale = if has_orca_adapter { 1.3 } else { 0.0 };
+    let ResolvedCaptureContract {
+        profile,
+        has_orca_adapter,
+        base_model_sha256,
+        orca_adapter_sha256,
+        orca_scale,
+        scale_grid,
+        contract_sha256,
+    } = resolve_capture_contract(config, candidate_meta)?;
     let reasoning_effort = config
         .reasoning_effort
         .as_deref()
@@ -1413,23 +1862,46 @@ fn capture_against_endpoints_inner(
         reasoning_effort,
         reasoning_budget: config.reasoning_budget,
     };
-    let scale_grid = resolve_scale_grid(config.scale_grid.as_ref())?;
-    let contract = build_dr_g2_contract(
-        (profile != BaseModelProfile::SwiftPq2).then_some(profile),
-        false,
-        &base_model_sha256,
-        orca_adapter_sha256.as_deref(),
-        &scale_grid,
-        Some(&candidate_meta.sha256),
-        candidate_meta.max_rank,
-        candidate_meta.target_count,
-    );
-    let contract_sha256 = hash_contract(&contract)?;
 
-    let mut zero_scale_controls = Vec::with_capacity(config.zero_scale_controls.len());
-    let mut thinking_on_prompts = Vec::with_capacity(config.thinking_on_prompts.len());
-    let mut thinking_off_prompts = Vec::with_capacity(config.thinking_off_prompts.len());
-    let mut blind_responses: BTreeMap<String, BlindResponseEntry> = BTreeMap::new();
+    let (
+        supplement_summary,
+        mut zero_scale_controls,
+        mut thinking_on_prompts,
+        mut thinking_off_prompts,
+        mut blind_responses,
+        training_prompt_sha256s,
+    ) = match supplement {
+        Some(sup) => {
+            let summary = json!({
+                "priorEvidenceSha256": sup.prior_evidence_sha256,
+                "priorZeroControls": sup.prior_zero_controls,
+                "priorThinkingOn": sup.prior_thinking_on,
+                "priorThinkingOff": sup.prior_thinking_off,
+            });
+            let mut z = sup.zero_scale_controls;
+            z.reserve(config.zero_scale_controls.len());
+            let mut on = sup.thinking_on_prompts;
+            on.reserve(config.thinking_on_prompts.len());
+            let mut off = sup.thinking_off_prompts;
+            off.reserve(config.thinking_off_prompts.len());
+            (
+                Some(summary),
+                z,
+                on,
+                off,
+                sup.blind_responses,
+                sup.merged_training_prompt_sha256s,
+            )
+        }
+        None => (
+            None,
+            Vec::with_capacity(config.zero_scale_controls.len()),
+            Vec::with_capacity(config.thinking_on_prompts.len()),
+            Vec::with_capacity(config.thinking_off_prompts.len()),
+            BTreeMap::new(),
+            config.training_prompt_sha256s.clone(),
+        ),
+    };
     let mut arm_power_observations = Vec::new();
     let mut prompt_timings = Vec::new();
     let mut skipped_prompts = Vec::new();
@@ -1895,7 +2367,7 @@ fn capture_against_endpoints_inner(
         candidate_target_count: candidate_meta.target_count,
         scale_grid,
         selected_scale: config.selected_scale,
-        training_prompt_sha256s: config.training_prompt_sha256s.clone(),
+        training_prompt_sha256s,
         thinking_on_prompts,
         thinking_off_prompts,
         multimodal_prompts: Vec::new(),
@@ -1918,7 +2390,7 @@ fn capture_against_endpoints_inner(
     let completed = !budget_exceeded && skipped_prompts.is_empty();
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    Ok(json!({
+    let mut receipt = json!({
         "schemaVersion": 1,
         "operation": "dr-g2-capture",
         "status": if completed { "capture-completed" } else { "budget-exceeded-incomplete" },
@@ -1943,7 +2415,11 @@ fn capture_against_endpoints_inner(
         "powerConditions": power_conditions,
         "armPowerObservations": arm_power_observations,
         "promptTimings": prompt_timings,
-    }))
+    });
+    if let Some(summary) = supplement_summary {
+        receipt["supplement"] = summary;
+    }
+    Ok(receipt)
 }
 
 #[cfg(windows)]
@@ -2041,6 +2517,7 @@ fn run_windows_capture(request: &Request) -> crate::Result<Value> {
     let _awake_guard = SystemAwakeGuard::acquire()
         .map_err(|error| format!("Failed to acquire Windows idle-sleep inhibition: {error}"))?;
     let candidate_meta = verify_capture_inputs(config)?;
+    let supplement = load_supplement_inputs(config, &candidate_meta)?;
 
     let scratch = CaptureScratchRoot::new()?;
     let cred_a = PrivateCredentials::create(scratch.path())
@@ -2129,6 +2606,7 @@ fn run_windows_capture(request: &Request) -> crate::Result<Value> {
     let capture_result = capture_against_endpoints_inner(
         config,
         &candidate_meta,
+        supplement,
         output_path,
         &endpoint_a,
         &endpoint_b,
@@ -2225,6 +2703,7 @@ fn run_capture_against_endpoints(
         max_rank: candidate_max_rank,
         target_count: candidate_target_count,
     };
+    let supplement = load_supplement_inputs(config, &candidate_meta)?;
     let endpoint_a = CaptureEndpoint {
         port: port_a,
         token: token_a,
@@ -2236,6 +2715,7 @@ fn run_capture_against_endpoints(
     let mut receipt = capture_against_endpoints_inner(
         config,
         &candidate_meta,
+        supplement,
         output_path,
         &endpoint_a,
         &endpoint_b,
@@ -2319,6 +2799,8 @@ mod tests {
             reasoning_budget: None,
             time_budget_seconds: Some(60),
             responses_output_path: responses_out,
+            supplement_evidence_path: None,
+            supplement_responses_path: None,
             training_prompt_sha256s: vec!["99".repeat(32)],
             zero_scale_controls: vec![CaptureZeroControlInput {
                 prompt_id: "zero-ctrl-001".to_owned(),
@@ -3091,6 +3573,399 @@ mod tests {
         );
         assert_eq!(partial_timings.len(), completed_arms);
         assert_eq!(partial_timings[0]["arm"], "zero-no-adapter");
+        Ok(())
+    }
+
+    fn seed_prior_bonsai25_thinking_on_only(
+        scratch: &ScratchDir,
+        cand_sha: &str,
+    ) -> crate::Result<(PathBuf, PathBuf, String)> {
+        let plan = super::super::run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-plan",
+            "screenConfig": {
+                "baseModel": "bonsai-2.5-pq2",
+                "includeOrca": false,
+                "includeMultimodalChecks": false,
+                "candidateAdapterSha256": cand_sha,
+                "candidateMaxRank": 16,
+                "candidateTargetCount": 128,
+                "scaleGrid": [0.0, 0.5, 1.0, 1.5, 2.0]
+            }
+        }))?;
+        let contract_sha = plan["contractSha256"]
+            .as_str()
+            .ok_or("Plan missing contractSha256.")?
+            .to_owned();
+        let base_sha = BaseModelProfile::Bonsai25Pq2.base_model_sha256()?;
+
+        let pairs = [
+            (
+                "if-001",
+                "instruction-following",
+                "Return minified JSON.",
+                "<think>b</think>\n{\"ok\":true}",
+                "<think>c</think>\n{\"ok\":true}",
+                380_u32,
+                390_u32,
+            ),
+            (
+                "coding-001",
+                "coding",
+                "Write safe add.",
+                "<think>b</think>\nfn add(a: u64, b: u64) -> u64 { a + b }",
+                "<think>c</think>\npub fn add(a: u64, b: u64) -> Option<u64> { a.checked_add(b) }",
+                400_u32,
+                410_u32,
+            ),
+            (
+                "reasoning-001",
+                "reasoning",
+                "Prove 1+1=2.",
+                "<think>b</think>\n2",
+                "<think>c</think>\n2 by Peano successor",
+                450_u32,
+                455_u32,
+            ),
+        ];
+
+        let mut thinking_on = Vec::new();
+        let mut responses = serde_json::Map::new();
+        for (id, cat, prompt, base_txt, cand_txt, base_tok, cand_tok) in pairs {
+            thinking_on.push(json!({
+                "promptId": id,
+                "promptSha256": crate::identity::sha256(prompt.as_bytes()),
+                "category": cat,
+                "baseline": {
+                    "scale": 0.0,
+                    "responseSha256": crate::identity::sha256(base_txt.as_bytes()),
+                    "humanReviewed": false,
+                    "reviewerId": "",
+                    "score": 0.0,
+                    "thinkingTokens": base_tok,
+                    "hit4096Truncation": false,
+                    "loopDetected": false
+                },
+                "candidate": {
+                    "scale": 1.0,
+                    "responseSha256": crate::identity::sha256(cand_txt.as_bytes()),
+                    "humanReviewed": false,
+                    "reviewerId": "",
+                    "score": 0.0,
+                    "thinkingTokens": cand_tok,
+                    "hit4096Truncation": false,
+                    "loopDetected": false
+                }
+            }));
+            responses.insert(
+                id.to_owned(),
+                json!({
+                    "promptText": prompt,
+                    "baselineText": base_txt,
+                    "candidateText": cand_txt
+                }),
+            );
+        }
+
+        let zero_sha = crate::identity::sha256(b"5561");
+        let evidence_val = json!({
+            "schemaVersion": 1,
+            "baseModel": "bonsai-2.5-pq2",
+            "contractSha256": contract_sha,
+            "baseModelSha256": base_sha,
+            "orcaAdapterSha256": Value::Null,
+            "orcaScale": 0.0,
+            "candidateAdapterSha256": cand_sha,
+            "candidateMaxRank": 16,
+            "candidateTargetCount": 128,
+            "scaleGrid": [0.0, 0.5, 1.0, 1.5, 2.0],
+            "selectedScale": 1.0,
+            "trainingPromptSha256s": ["99".repeat(32)],
+            "thinkingOnPrompts": thinking_on,
+            "thinkingOffPrompts": [],
+            "zeroScaleControls": [{
+                "promptId": "zero-ctrl-001",
+                "promptSha256": crate::identity::sha256(b"Compute 67 * 83."),
+                "noAdapterResponseSha256": zero_sha,
+                "zeroScaleResponseSha256": zero_sha
+            }]
+        });
+
+        let prior_ev_path = scratch.join("prior-evidence.json");
+        let prior_resp_path = scratch.join("prior-responses.json");
+        let ev_bytes = crate::bounded_input::pretty_json_bytes(&evidence_val)?;
+        let prior_ev_sha = crate::identity::sha256(&ev_bytes);
+        fs::write(&prior_ev_path, &ev_bytes).map_err(|e| e.to_string())?;
+        fs::write(
+            &prior_resp_path,
+            crate::bounded_input::pretty_json_bytes(&Value::Object(responses))?,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((prior_ev_path, prior_resp_path, prior_ev_sha))
+    }
+
+    fn build_supplement_capture_config(
+        prior_ev_path: PathBuf,
+        prior_resp_path: Option<PathBuf>,
+        responses_out: Option<PathBuf>,
+    ) -> DrG2CaptureConfig {
+        let mut cfg = base_capture_config(responses_out);
+        cfg.base_model = Some(BaseModelProfile::Bonsai25Pq2);
+        cfg.orca_adapter_path = None;
+        cfg.selected_scale = 1.0;
+        cfg.scale_grid = Some(vec![0.0, 0.5, 1.0, 1.5, 2.0]);
+        cfg.supplement_evidence_path = Some(prior_ev_path);
+        cfg.supplement_responses_path = prior_resp_path;
+        cfg.training_prompt_sha256s = vec!["88".repeat(32)];
+        cfg.zero_scale_controls.clear();
+        cfg.thinking_on_prompts.clear();
+        cfg
+    }
+
+    #[test]
+    fn dr_g2_capture_supplement_merges_thinking_off_into_prior_evidence_and_blinds_cleanly()
+    -> crate::Result<()> {
+        let scratch = ScratchDir::new("Bonsai-CaptureSupplement")?;
+        let cand_sha = "cd".repeat(32);
+        let (prior_ev_path, prior_resp_path, prior_ev_sha) =
+            seed_prior_bonsai25_thinking_on_only(&scratch, &cand_sha)?;
+
+        let token_a = "55".repeat(32);
+        let token_b = "66".repeat(32);
+        let mock_a = spawn_mock_server(token_a.clone(), false, 0)?;
+        let mock_b = spawn_mock_server(token_b.clone(), true, 0)?;
+
+        let merged_ev_out = scratch.join("merged-evidence.json");
+        let merged_resp_out = scratch.join("merged-responses.json");
+        let cfg = build_supplement_capture_config(
+            prior_ev_path,
+            Some(prior_resp_path),
+            Some(merged_resp_out.clone()),
+        );
+        let req = dummy_request_with_config(cfg, merged_ev_out.clone());
+        let receipt = run_capture_against_endpoints(
+            &req,
+            mock_a.port,
+            &token_a,
+            mock_b.port,
+            &token_b,
+            &cand_sha,
+            Some(16),
+            Some(128),
+            None,
+        );
+        mock_a.stop.store(true, Ordering::Relaxed);
+        mock_b.stop.store(true, Ordering::Relaxed);
+        let _ = mock_a.join.join();
+        let _ = mock_b.join.join();
+
+        let receipt = receipt?;
+        assert_eq!(receipt["completed"], true);
+        assert_eq!(receipt["budgetExceeded"], false);
+        assert_eq!(receipt["completedZeroControls"], 1);
+        assert_eq!(receipt["completedThinkingOn"], 3);
+        assert_eq!(receipt["completedThinkingOff"], 1);
+        assert_eq!(receipt["zeroScaleMismatches"], 0);
+        assert_eq!(receipt["supplement"]["priorEvidenceSha256"], prior_ev_sha);
+        assert_eq!(receipt["supplement"]["priorZeroControls"], 1);
+        assert_eq!(receipt["supplement"]["priorThinkingOn"], 3);
+        assert_eq!(receipt["supplement"]["priorThinkingOff"], 0);
+        // Only the 1 Thinking-OFF prompt was executed on the servers.
+        assert_eq!(mock_a.reset_count.load(Ordering::Relaxed), 1);
+        assert_eq!(mock_b.reset_count.load(Ordering::Relaxed), 1);
+
+        let merged_ev: Value =
+            serde_json::from_slice(&fs::read(&merged_ev_out).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        assert_eq!(
+            merged_ev["trainingPromptSha256s"],
+            json!(["88".repeat(32), "99".repeat(32)])
+        );
+
+        let blind_out = scratch.join("blind.json");
+        let blind_key = scratch.join("blind-key.json");
+        let blind_res = super::super::run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-blind-packet",
+            "evidencePath": merged_ev_out,
+            "outputPath": blind_out,
+            "blindConfig": {
+                "responsesPath": merged_resp_out,
+                "blindKeyPath": blind_key,
+                "blindSalt": "bonsai25-supplement-test"
+            }
+        }))?;
+        assert_eq!(blind_res["itemCount"], 4);
+
+        let key_val: Value =
+            serde_json::from_slice(&fs::read(&blind_key).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let mut packet: Value =
+            serde_json::from_slice(&fs::read(&blind_out).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let key_entries = key_val["entries"]
+            .as_array()
+            .ok_or("Missing blind key entries.")?;
+        for (item, key_entry) in packet["items"]
+            .as_array_mut()
+            .ok_or("Missing blind packet items.")?
+            .iter_mut()
+            .zip(key_entries.iter())
+        {
+            item["reviewerId"] = json!("owner");
+            let a_is_cand = key_entry["armARole"] == "candidate";
+            if key_entry["kind"] == "thinking-on" {
+                item["armAScore"] = json!(if a_is_cand { 4.0 } else { 3.0 });
+                item["armBScore"] = json!(if a_is_cand { 3.0 } else { 4.0 });
+            } else {
+                item["armAScore"] = json!(3.5);
+                item["armBScore"] = json!(3.5);
+            }
+        }
+        let reviewed = scratch.join("reviewed.json");
+        fs::write(
+            &reviewed,
+            serde_json::to_vec(&packet).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let applied_out = scratch.join("applied.json");
+        let applied = super::super::run(json!({
+            "schemaVersion": 1,
+            "operation": "dr-g2-apply-reviews",
+            "evidencePath": merged_ev_out,
+            "outputPath": applied_out,
+            "applyConfig": {
+                "reviewPath": reviewed,
+                "blindKeyPath": blind_key
+            }
+        }))?;
+        assert_eq!(applied["status"], "reviews-applied");
+        assert_eq!(applied["promptCount"], 4);
+        assert_eq!(applied["drG2Passed"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn dr_g2_capture_supplement_rejects_mismatched_contract_or_tampered_prior_responses()
+    -> crate::Result<()> {
+        let scratch = ScratchDir::new("Bonsai-CaptureSupplementReject")?;
+        let cand_sha = "cd".repeat(32);
+        let (prior_ev_path, prior_resp_path, _) =
+            seed_prior_bonsai25_thinking_on_only(&scratch, &cand_sha)?;
+        let out_path = scratch.join("unused-evidence.json");
+
+        // 1. Validation rejects supplementResponsesPath without supplementEvidencePath,
+        // responsesOutputPath without supplementResponsesPath, and empty prompt lists.
+        let mut no_sup_ev = base_capture_config(None);
+        no_sup_ev.supplement_responses_path = Some(prior_resp_path.clone());
+        assert!(
+            validate_capture_request(
+                &dummy_request_with_config(no_sup_ev.clone(), out_path.clone()),
+                &no_sup_ev,
+                &out_path
+            )
+            .is_err()
+        );
+        let _ = no_sup_ev;
+
+        let missing_sup_resp = build_supplement_capture_config(
+            prior_ev_path.clone(),
+            None,
+            Some(scratch.join("resp-out.json")),
+        );
+        assert!(
+            validate_capture_request(
+                &dummy_request_with_config(missing_sup_resp.clone(), out_path.clone()),
+                &missing_sup_resp,
+                &out_path
+            )
+            .is_err()
+        );
+
+        let mut empty_prompts = build_supplement_capture_config(prior_ev_path.clone(), None, None);
+        empty_prompts.thinking_off_prompts.clear();
+        assert!(
+            validate_capture_request(
+                &dummy_request_with_config(empty_prompts.clone(), out_path.clone()),
+                &empty_prompts,
+                &out_path
+            )
+            .is_err()
+        );
+
+        // 2. Contract mismatch (different selectedScale) fails closed before any HTTP traffic.
+        let mut scale_mismatch = build_supplement_capture_config(
+            prior_ev_path.clone(),
+            Some(prior_resp_path.clone()),
+            Some(scratch.join("resp-mismatch.json")),
+        );
+        scale_mismatch.selected_scale = 0.5;
+        let scale_err = run_capture_against_endpoints(
+            &dummy_request_with_config(scale_mismatch, out_path.clone()),
+            1,
+            "aa",
+            2,
+            "bb",
+            &cand_sha,
+            Some(16),
+            Some(128),
+            None,
+        );
+        assert!(scale_err.is_err());
+
+        // 3. Duplicate promptId between prior evidence and new captureConfig fails closed.
+        let mut dup_id = build_supplement_capture_config(
+            prior_ev_path.clone(),
+            Some(prior_resp_path.clone()),
+            Some(scratch.join("resp-dup.json")),
+        );
+        dup_id.thinking_off_prompts[0].prompt_id = "coding-001".to_owned();
+        let dup_err = run_capture_against_endpoints(
+            &dummy_request_with_config(dup_id, out_path.clone()),
+            1,
+            "aa",
+            2,
+            "bb",
+            &cand_sha,
+            Some(16),
+            Some(128),
+            None,
+        )
+        .err()
+        .ok_or("Expected duplicate promptId error.")?;
+        assert!(dup_err.contains("Duplicate promptId"));
+
+        // 4. Tampered prior response text fails SHA-256 verification before any HTTP traffic.
+        let mut resp_json: Value =
+            serde_json::from_slice(&fs::read(&prior_resp_path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        resp_json["coding-001"]["baselineText"] = json!("tampered response text");
+        let tampered_resp_path = scratch.join("tampered-responses.json");
+        fs::write(
+            &tampered_resp_path,
+            crate::bounded_input::pretty_json_bytes(&resp_json)?,
+        )
+        .map_err(|e| e.to_string())?;
+        let tampered_cfg = build_supplement_capture_config(
+            prior_ev_path,
+            Some(tampered_resp_path),
+            Some(scratch.join("resp-tampered.json")),
+        );
+        let tampered_err = run_capture_against_endpoints(
+            &dummy_request_with_config(tampered_cfg, out_path),
+            1,
+            "aa",
+            2,
+            "bb",
+            &cand_sha,
+            Some(16),
+            Some(128),
+            None,
+        )
+        .err()
+        .ok_or("Expected tampered prior response SHA-256 mismatch error.")?;
+        assert!(tampered_err.contains("SHA-256 mismatch"));
         Ok(())
     }
 }
