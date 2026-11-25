@@ -524,6 +524,16 @@ cosine-similarity layer selection (`LS-LoRA`, `arXiv:2610.11620`), null-space ed
 `lora-diff-audit` `edit-adapter` also supports sparse per-layer `layerGains` scaling alongside
 family and depth tapers.
 
+For prospective Bonsai 2.5+ behavioral steering (`r = 1..4` surgical abliteration,
+anti-slop/sycophancy/register sliders, or activation-derived thinking-conciseness vectors;
+see [future native low-rank steering adapters](swift-lora.md#future-native-low-rank-steering-adapters)),
+apply those primitives only to directions derived from the **active base model's own
+weights/activations** (never cross-checkpoint diffs), keep targets inside `npu-friendly`
+residual writers (`ffn_down` + `attn_output`, excluding `ssm_out` and leaving all 64
+Hexagon NPU fused FFN chains intact), stack orthogonally alongside `DaisyRose` at
+`< 10 MiB`, and keep behavioral steering strictly secondary to capability-building
+multi-rank RL, `*-mtp` speculative decoding, accelerator offload, and future base upgrades.
+
 Start with a reproducible complete-answer failure and freeze its ordinary
 controls before collecting activations. Compare a fitted patch with a constant
 steering baseline at the same site. Do not transfer the cited Qwen model's

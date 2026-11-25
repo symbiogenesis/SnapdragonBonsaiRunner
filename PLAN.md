@@ -872,13 +872,26 @@ nor editing the available Abliteration factors.
   and ordinary controls before selecting a direction/LP fit. Compare constant
   steering at the same site, preserve the original activation basis and qualify
   held-out complete answers, composition, state and resources before serving.
-- [ ] Audit pinned Orca rank-1 abliteration (128 sites, `scale 1.3`) for Qwen3.8-27B
-  coding/reasoning self-correction regressions (`Abliterlitics` / `Heretic` / iterative LoRA
-  self-distillation findings in
+- [ ] Audit pinned opt-in/rollback-only Orca rank-1 abliteration (128 sites, `scale 1.3`
+  via `--use-abliterate-lora` or `--use-original-pq2` / `--publisher-engine` rollback)
+  for Qwen3.8-27B coding/reasoning self-correction regressions (`Abliterlitics` / `Heretic`
+  / iterative LoRA self-distillation findings in
   [the research register](docs/research-register.md#qwen38-27b-adapters-surgical-abliteration-weight-editing-and-low-bit-recovery)),
   comparing unchanged Orca against in-band (`layerMin: 20, layerMax: 47`) and `ssm_out: 0.0`
   candidates exported via extended `bonsai-tools adapter-edit` (`linear-a-band-magnitude-edit-v1`)
   across per-layer KL, self-correction loops, refusal behavior and held-out complete answers.
+- [ ] **W9 — Conditional base-native low-rank (`r = 1..4`) behavioral steering adapters (opt-in only).**
+  Trigger only when observed active usage on `Ternary-Bonsai-2.5-27B-PQ2_0` (or a future
+  base) exhibits concrete false-positive refusals, prose-slop/sycophancy habits, or
+  overthinking latency; do not pursue low-rank projections for raw coding/math/reasoning
+  intelligence gains. Derive directions strictly from the active base's own
+  weights/activations (never cross-checkpoint diffs), restrict targets to unambiguous
+  `npu-friendly` residual writers (`ffn_down` + `attn_output`, excluding `ssm_out` and
+  leaving all 64 Hexagon NPU fused FFN chains intact), preserve `< 10 MiB` orthogonal
+  stacking alongside `DaisyRose` with bit-exact `0.0` bypass, and require `DR-G2`-style
+  blind quality, calibration, and zero-scale identity checks before serving opt-in. See
+  [future native low-rank steering adapters](docs/swift-lora.md#future-native-low-rank-steering-adapters)
+  and [weight-space steering](docs/weight-space-programming.md#offline-fitting-and-an-explicit-native-research-path).
 
 ### DaisyRose-27B + Swift-Bonsai-2 hybrid composition
 
@@ -1099,15 +1112,16 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   (`7091d129`), `bonsai-broker` `--nariq` policy/artifacts/identity and
   PQ2 auto-attach guard (`449d97e9`), `dr-g2-plan`/`dr-g2-score`/`dr-g2-capture`
   `BaseModelProfile::Nariq*` support (`3f4b0b8d`, `0dd8a7e8`), and
-  `bonsai-tools` CLI/`provision`/`chat_launch`), keeping `Swift-Bonsai-2-PQ2_0`
-  + Orca as the unchanged default while stacking NariQ cleanly with
+  `bonsai-tools` CLI/`provision`/`chat_launch`), keeping `Ternary-Bonsai-2.5-27B-PQ2_0`
+  (Orca-free) + local-verified DaisyRose as the native default (with
+  `Swift-Bonsai-2-PQ2_0` + Orca rollback) while stacking NariQ cleanly with
   `MultiRankAdapter` (DaisyRose) and Prism `K4/V4` (`rsq4`), and rejecting
   `abliterate_lora`, GPU/NPU offload, and `mmproj`. Prism `v0.1.35` (`3bc76f135bf23c538b3bb789aef382143ff36839`)
   is now published/pinned and `NARIQ_TRELLIS_RELEASE` promoted (`648fcadf`). Remaining open: owning
   CI (`source-checks`, `foundation`), verifying DaisyRose (`DR-G2`) compatibility
   on NariQ vs Swift-Bonsai-2, and matched-power X1/X2 throughput/RAM and held-out
   creative/coding quality comparisons across `2.0bpw`, `2.5bpw`, `3.0bpw`, and `PQ2_0`.
-- [ ] **B25-1 — Opt-in `prism-ml/Ternary-Bonsai-2.5-27B-GGUF` (`PQ2_0` & `PTQ1_0`) + DaisyRose composition.**
+- [ ] **B25-1 — Default `prism-ml/Ternary-Bonsai-2.5-27B-GGUF` (`PQ2_0` & opt-in `PTQ1_0`) + DaisyRose composition.**
   Source wiring is complete across `..\prism-inference`
   (`BONSAI_2_5_PQ2`/`BONSAI_2_5_PTQ1`, `Representation::{Bonsai25Pq2, Bonsai25Ptq1}`,
   `ssm_alpha.weight`/`ssm_beta.weight` `F32` layout contract, `F32` recurrent gate
@@ -1123,7 +1137,17 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   with Orca-free default and optional Orca stacking), `prism-inference` `v0.1.35`
   (`3bc76f135bf23c538b3bb789aef382143ff36839`) is published/pinned with `BONSAI_2_5_RELEASE`
   promoted (`648fcadf`), X2 Trial #1 (`106.1 s` AC: `PTQ1_0` `-1.173 GiB` Peak WS / `8/8` greedy parity vs `PQ2_0` `177.8 ms/tok` decode, Orca `1.3` digests, DaisyRose `r16` `:0.0` / `:1.0` / `6/6` rollback)
-  and Trial #2 (`887.0 s` AC `bonsai-2.5-pq2` Orca-free `DR-G2` zero-scale + `3/3` Thinking-ON blind packet `4b221d19...`), Trial #3 (`138.8 s` AC `n = 1` Thinking-OFF `creative-b25-001` supplement `6dc82c06...`, delegated blinded `drG2Passed: false` `9d8e9a71...` on `3.2 < 3.5`), and Trial #4 (`459.9 s` AC `n = 3` disjoint Thinking-OFF `creative-b25-002..004` supplement merged against sealed Trial #2 into `c708ef98...`, delegated blinded `dr-g2-score` `eff37bb1...` returning **`drG2Passed: true`** across all `4/4` gates; [bonsai-2-5-x2-vet](docs/evidence/bonsai-2-5-x2-vet.md)) passed locally, promoting 100% Apache-2.0 `Ternary-Bonsai-2.5-27B-PQ2_0` (Orca-free) + local-verified `daisyrose-npu-r16-drw1.gguf @ 1.0` ([config/daisyrose-lora.lock.json](config/daisyrose-lora.lock.json)) as the native Rust default while retaining `Swift-Bonsai-2-PQ2_0` + Orca via `--use-original-pq2` / `--publisher-engine` rollback and `--use-abliterate-lora` opt-in. A separate Swifting Bonsai 2.5 exploration (`Swift-Bonsai-2` PQ2 scale-only diff plus BF16 `Swift-1.5-Qwen3.8-27b` `npu-friendly` and full-linear `AnyLinear` LoRAs) closed **no-go** (multi-step logic thinking increased `+6.4%` to `+8.9%`, decode latency `+9.4%` to `+16.9%`, breaks Hexagon NPU FFN chains) and was completely stripped ([Swifting no-go record](docs/evidence/bonsai-2-5-x2-vet.md#swifting-bonsai-25-exploration-no-go)). Remaining open: immutable DaisyRose remote hosting for clean-install auto-download (`defaultEnabled: true`), independent human `DR-G2` review, owning CI (`source-checks`, `foundation`), X1/X2 full-device comparisons on Bonsai 2.5 vs Swift-Bonsai-2, and (`v0.1.36+` separate future speculative draft work) wiring the reserved 866-tensor `*-mtp` (`qwen35.nextn_predict_layers = 1`) checkpoints.
+  and Trial #2 (`887.0 s` AC `bonsai-2.5-pq2` Orca-free `DR-G2` zero-scale + `3/3` Thinking-ON blind packet `4b221d19...`), Trial #3 (`138.8 s` AC `n = 1` Thinking-OFF `creative-b25-001` supplement `6dc82c06...`, delegated blinded `drG2Passed: false` `9d8e9a71...` on `3.2 < 3.5`), and Trial #4 (`459.9 s` AC `n = 3` disjoint Thinking-OFF `creative-b25-002..004` supplement merged against sealed Trial #2 into `c708ef98...`, delegated blinded `dr-g2-score` `eff37bb1...` returning **`drG2Passed: true`** across all `4/4` gates; [bonsai-2-5-x2-vet](docs/evidence/bonsai-2-5-x2-vet.md)) passed locally, promoting 100% Apache-2.0 `Ternary-Bonsai-2.5-27B-PQ2_0` (Orca-free) + local-verified `daisyrose-npu-r16-drw1.gguf @ 1.0` ([config/daisyrose-lora.lock.json](config/daisyrose-lora.lock.json)) as the native Rust default while retaining `Swift-Bonsai-2-PQ2_0` + Orca via `--use-original-pq2` / `--publisher-engine` rollback and `--use-abliterate-lora` opt-in. A separate Swifting Bonsai 2.5 exploration (`Swift-Bonsai-2` PQ2 scale-only diff plus BF16 `Swift-1.5-Qwen3.8-27b` `npu-friendly` and full-linear `AnyLinear` LoRAs) closed **no-go** (multi-step logic thinking increased `+6.4%` to `+8.9%`, decode latency `+9.4%` to `+16.9%`, breaks Hexagon NPU FFN chains) and was completely stripped ([Swifting no-go record](docs/evidence/bonsai-2-5-x2-vet.md#swifting-bonsai-25-exploration-no-go)). Remaining open: immutable DaisyRose remote hosting for clean-install auto-download (`defaultEnabled: true`), independent human `DR-G2` review, owning CI (`source-checks`, `foundation`), and X1/X2 full-device comparisons on Bonsai 2.5 vs Swift-Bonsai-2.
+- [ ] **B25-2 — Wire reserved Bonsai 2.5 `*-mtp` (`qwen35.nextn_predict_layers = 1`) speculative draft checkpoints (`v0.1.36+`).**
+  Primary intelligence-per-GB latency lever alongside `DaisyRose` / future Apache-2.0
+  multi-rank RL donors, NPU/Vulkan offload, and future base upgrades: activate the
+  `866`-tensor `pq2-mtp` (`+239 MB` over `PQ2_0`) / `ptq1-mtp` checkpoints pinned in
+  [config/bonsai-2-5-27b.lock.json](config/bonsai-2-5-27b.lock.json) (`runtimeWired: false`)
+  across `prism-inference` `v0.1.36+` and Runner so faster speculative decode buys room
+  for deeper thinking or `PQ2_0` over `PTQ1_0` within tight laptop RAM/latency budgets.
+  Require exact target-distribution parity, stacked `DaisyRose` (`MultiRankAdapter`)
+  compatibility, atomic KV/GDN/convolution/sampler rollback, and matched-power X1/X2
+  complete-cycle benefit before promotion.
 
 ### Memory and profiles
 

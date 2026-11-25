@@ -1,10 +1,20 @@
 # Swift LoRA: artifact, basis and qualification
 
-The native app experimentally enables the pinned OrcaRouter adapter at scale **1.3**;
-`bonsai-tools chat --no-abliterate-lora` opts out. Settings accepts 0 to 2 in 0.1 steps
-for the next response and every Extra effort pass, without reloading. Zero disables
-correction while retaining the adapter. The broker exposes an explicit development
-option; no local training is needed.
+Native Rust chat (`--native-engine`) defaults to **Orca-free `Ternary-Bonsai-2.5-27B-PQ2_0`**
+(+ local-verified `DaisyRose` `r = 16 @ 1.0`, [model selection](model-selection.md#native-default-ternary-bonsai-25-27b-representations)):
+Orca (`bonsai-abliterate-lora.gguf`) was authored from original Ternary Bonsai 2 PTQ1
+(`4.58%–12.08%` trit drift vs Bonsai 2.5, `relW = 0.26–0.42`), leaves grouped `ssm_out`
+channel ordering unresolved (`prism.hadamard.gdn_v_grouped=true`), and Bonsai 2.5 +
+DaisyRose Orca-free produced `0` unwanted refusals across `DR-G2` captures.
+
+`bonsai-tools chat --use-abliterate-lora` (`Start-Chat.ps1 -UseAbliterateLora`) remains
+available as an explicit Orca opt-in on Bonsai 2.5 (defaulting to scale **1.3** when
+enabled), while explicit `Swift-Bonsai-2-PQ2_0` rollback (`--use-original-pq2` or
+`--publisher-engine`) retains Orca `1.3` with `--no-abliterate-lora` opt-out. When
+Orca is active, Settings accepts `0` to `2` in `0.1` steps for the next response and
+every Extra effort pass without reloading weights; `0.0` disables the correction while
+retaining the loaded adapter. The broker exposes an explicit development option; no local
+training is needed.
 
 **Swift basis correctness, effectiveness, quality and standard/daily-service
 acceptance remain unqualified**.
@@ -336,3 +346,40 @@ or attestations. Missing reviews/native evidence stay pending; known regressions
 `StandardProfileMayEnable` becomes true only when all implemented mandatory gates pass.
 The scorer enables no serving profile, and daily security and broader creative/comfort
 gates remain separate.
+
+## Future native low-rank steering adapters
+
+While legacy `bonsai-abliterate-lora.gguf` is off by default on Bonsai 2.5, the same
+rank-1 / tiny-rank (`r = 1..4`) residual-stream projection mechanism stays viable for
+**opt-in behavioral steering** (`< 10 MiB` F16/F32 payload, live `0.0–2.0` per-request
+scaling with bit-exact `0.0` bypass, shared-`B` layout reuse, and orthogonal stacking
+alongside `DaisyRose` `r = 16`):
+
+- **Active-base derivation only:** Derive any direction strictly from the active base
+  model's own weights or activations (`Ternary-Bonsai-2.5-27B-PQ2_0` or a future base).
+  Do not transplant cross-checkpoint diffs or directions across models with ternary
+  trit drift (matching the closed cross-checkpoint Swifting no-go in
+  [Bonsai 2.5 X2 vetting](evidence/bonsai-2-5-x2-vet.md#swifting-bonsai-25-exploration-no-go)).
+- **Hardware-safe target envelope:** Restrict steering targets to unambiguous
+  `npu-friendly` residual writers (`ffn_down` and `attn_output`). Exclude `ssm_out`
+  until `P1` resolves `prism.hadamard.gdn_v_grouped=true`, and leave `ffn_gate`/`ffn_up`
+  untouched so all 64 Hexagon NPU fused `external_ffn_swiglu` chains remain intact.
+- **Plausible opt-in targets (only if triggered by an observed defect):**
+  1. *Base-native surgical / norm-preserving abliteration (`r = 1..4` biprojected):* only
+     if false-positive refusals appear on Bonsai 2.5 in creative fiction or
+     technical/security analysis.
+  2. *Runtime-tunable style, anti-slop, or sycophancy sliders:* contrast-pair residual
+     projections to damp AI prose clichés, sycophancy, or verbose tone without GPU
+     fine-tuning.
+  3. *Base-native activation-derived anti-overthinking / conciseness steering:* a small-rank
+     vector contrasting Bonsai 2.5's own concise vs. ruminating chains of thought
+     (distinct from the rejected cross-checkpoint `Swift-1.5` diff), gated so it never
+     truncates necessary multi-step reasoning.
+- **Capability boundary & promotion gate:** Low-rank residual projections modulate
+  existing linear traits; they do **not** add coding, math, or reasoning intelligence.
+  Primary intelligence-per-GB work remains multi-rank spectral-denoised RL adapters
+  (`DaisyRose` and qualified Apache-2.0 donors), reserved `*-mtp` (`nextn_predict_layers = 1`)
+  speculative decoding (`v0.1.36+`), Hexagon NPU / Adreno Vulkan / Composite
+  acceleration, and future base upgrades. Any candidate steering adapter stays opt-in and
+  must pass `DR-G2`-style blind quality, calibration, and zero-scale bit-identity gates
+  so over-steering cannot degrade instruction adherence or prose coherence.
