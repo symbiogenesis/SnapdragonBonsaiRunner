@@ -49,5 +49,6 @@ updates and publication. [PLAN.md](../PLAN.md) is the single backlog.
 | [Inference defaults](inference-defaults.md) | Sampling, Thinking, output and prompt harness |
 | [Performance](performance-expectations.md) | Latency, memory, energy and speech measurement |
 | [Application and inference research](research-register.md) | Repository/design sources, numerical proof obligations, adoption boundaries and applicability |
+| [Open math conjectures](open-math-conjectures.md) | Oct–Nov 2026 proof releases (Anthropic, OpenAI, Google Cogentic), verification status and inference-engine implications |
 
 [Retained evidence](evidence/README.md) lists fixture, policy and replay consumers.

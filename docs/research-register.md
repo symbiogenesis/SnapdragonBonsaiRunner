@@ -111,7 +111,9 @@ approximate aggregation. LUTs are not automatically exact Q8_K/Q8_0 replacements
 [Saha/Ye, ICML 2024](https://proceedings.mlr.press/v235/saha24a.html) prove
 FlashAttention I/O-optimal up to constants for fast memory `M >= d^2` in their
 model, with separate small-memory results: no universal latency optimum or
-unconditional exact subquadratic attention follows.
+unconditional exact subquadratic attention follows. The October 2026 `3SUM`/`APSP`
+and `ETH` refutations do not relax Saha–Ye's unconditional I/O lower bound; see
+[open math conjectures](open-math-conjectures.md#matrix-multiplication-rectangular-prefill-and-output-sparse-attention).
 [FlashAttention](https://arxiv.org/abs/2205.14135) merges tiled online-softmax
 statistics `(m_a,l_a,o_a)`/`(m_b,l_b,o_b)` by rescaling sums to `m=max(m_a,m_b)`.
 That real-arithmetic identity does not reproduce Prism's globally normalized
@@ -132,7 +134,9 @@ singular or inversion unstable; convolution overwrites history too. Retain snaps
 with forward reconstruction and atomic commit. For strictly triangular size-`c`
 `L`, `L^c=0` and `(I-L)^(-1)=I+L+...+L^(c-1)` exactly, but short-truncation error
 depends on powers/norms of `L`, not spectral radius zero alone. This constrains
-[multiplication-only approximations](inference-algorithms.md#chunkwise-gated-deltanet-prefill).
+[multiplication-only approximations](inference-algorithms.md#chunkwise-gated-deltanet-prefill);
+[T15](#t15-sharp-non-normal-gdn-polynomial-truncation-bounds-via-crouzeix)
+supplies a computable numerical-range error certificate for those truncations.
 
 ### T6. Exact speculative sampling preserves a distribution
 
@@ -198,6 +202,7 @@ states change future gates. Small one-step MSE misses coherent persistent error.
 [decay-aware precision](https://arxiv.org/abs/2608.27513v2) address it experimentally,
 without proving exact FP32 continuation.
 [Lost in Rounding](https://arxiv.org/abs/2611.12127) (**paper**, Nov 2026) reinforces this for hybrid Gated DeltaNet / Mamba-2 reasoning models: standard Round-to-Nearest (RTN) `bf16` recurrent-state rounding introduces directional bias that lengthens chains of thought (`1.07x`–`1.27x`) and increases token-cap truncations, whereas same-width Stochastic Rounding (SR) recovers near-FP32 accuracy and conciseness without proving bit-exact FP32 continuation.
+Information-theoretically, [T16](#t16-recurrent-state-capacity-dimension-reduction-paging-and-lp-and-packing-limits) (`OpenAI 140`'s `A d^2` streaming regression floor) independently bounds compressing GDN's `O(d^2)` matrix state below `Theta(d^2)` bits.
 
 ### T11. Quantization search theorems optimize a stated objective
 
@@ -217,6 +222,58 @@ and token generation. Retain objective, feasible set and included work for every
 Arbitrarily small errors can swap near ties. Maximum-logit difference alone does
 not prove token identity; greedy ranks do not prove equal sampling probabilities.
 Reordered kernels/quantizers still need sampler and continuation checks.
+
+### T13. Asymptotic matmul, output-sparse thin products and circuit bounds
+
+**Theorems (`OpenAI 107/379`, `arXiv:2610.06783`, `OpenAI 135`, `Anthropic vp-vnp`):**
+Over every field, square matrix multiplication has asymptotic exponent `omega = 9/4`
+with claimed `>= n^(9/4)/2` nonscalar mul/div gates (`OpenAI 107/379`), while
+`N x D` by `D x N` integer products with `D <= N^(1/18)` compute `N^2/sqrt(D)`
+selected entries in `O(N^2 / D^0.063)` (`3sum-apsp/`). Separately, iterated
+`n x n` matrix products require `n^Theta(sqrt(n))` depth-5 homogeneous gates
+(`OpenAI 135`) and `VP != VNP` over every field (`vp-vnp/` / `Family 379`).
+For Swift (`K = 5,120`, `D = 256`, `N <= 262,144`), `D <= N^(1/18)` requires
+`N >= 2^144`, batch-one decode stays DRAM-bandwidth-bound `GEMV` (`T2`), and
+`VP != VNP` reinforces autoregressive factorization; see
+[open math conjectures](open-math-conjectures.md#matrix-multiplication-rectangular-prefill-and-output-sparse-attention).
+
+### T14. Sub-n log n finite abelian transforms versus fixed-size rounding stability
+
+**Theorems (`OpenAI 130`, `OpenAI 109`, `Family 379`):** Finite abelian Fourier
+transforms of order `N` admit `N (log N)^(1/2+o(1))` binary linear gates
+(explicit `O(n (log n)^(1 - 10^-13))` exact-complex DFT), and multitape integer
+multiplication runs in `n (1 + log n)^(1/2+o(1))` bit steps. Because Swift uses
+fixed `1024`-point activation FWHT, `256`-point KV WHT and `512`-point speech
+FFT (`log2 N <= 10`) under pinned binary32/`ARITHMETIC_IDENTITY` rounding (`T8`),
+these asymptotic constructions yield no finite-size speedup; see
+[open math conjectures](open-math-conjectures.md#finite-abelian-fourier-transforms-and-bit-arithmetic).
+
+### T15. Sharp non-normal GDN polynomial truncation bounds via Crouzeix
+
+**Theorem (`OpenAI 325`, Complete Crouzeix Conjecture):** For any bounded Hilbert-space
+operator `A` and polynomial `P`, `||P[A]|| <= 2 sup_{z in W(A)} ||P(z)||` where
+`W(A) = {<Ax, x> : ||x|| = 1}` is the numerical range and constant `2` is sharp.
+For chunkwise GDN's non-normal strictly lower-triangular transition `L` (`T5`),
+spectral radius `0` cannot bound truncated Neumann error `R_m(L) = (I - L)^(-1) - sum_{j=0}^m L^j`,
+whereas `||R_m(L)|| <= 2 sup_{z in W(L)} |z^(m+1) / (1 - z)|` provides a
+computable pre-implementation certificate for multiplication-only (`arXiv:2606.06034`)
+or `#42` HMX FP16 candidates; see
+[open math conjectures](open-math-conjectures.md#gated-deltanet-non-normal-stability-and-recurrent-state-capacity).
+
+### T16. Recurrent state-capacity, dimension-reduction, paging and LP and packing limits
+
+**Theorems (`OpenAI 140`, `094`, `098`, `110`, `137`, `380`, `118`, `102`, Cogentic):**
+One-pass Gaussian regression with `A d^2` bits needs `Omega_A(d log(1/eps))`
+samples (`140`), reinforcing FP32 `O(d^2)` GDN state protection (`T10`); `L_p`
+(`p != 2`) distorted `n^o(1)` vs. exact `Theta(n^2)` reduction (`094`/`098`)
+justifies separating lossless FP16 KV from approximate `rsq4`/`rsq4k3v` KV;
+`O(log^2(k+1))` `k`-server (`110`) applies conditionally only at `k >> 8` (tiered
+MoE/KV paging), while `O(T^(2/5) polylog T)` space simulation (`137`) violates
+interactive latency; strongly polynomial LP/QP (`380`) leaves dense offline
+PDHG/ridge intact, while unbounded bin-packing LP gaps (`118`) and `UGC` (`102`)
+require explicit discrete NPU arena packing (`#41`); and Cogentic Log-Rank / VC
+bounds do not beat `PTQ1_0` (`T1`) or relax `U1`/`DR-G2` held-out splits. See
+[open math conjectures](open-math-conjectures.md#kv-compression-dimension-reduction-online-paging-and-space-time).
 
 ## Research catalog
 
