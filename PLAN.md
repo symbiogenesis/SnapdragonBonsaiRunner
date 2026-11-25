@@ -1115,7 +1115,7 @@ quantized `DaisyRose-27B` remains under the separate high-RAM reference boundary
   (`3bc76f135bf23c538b3bb789aef382143ff36839`) is published/pinned with `BONSAI_2_5_RELEASE`
   promoted (`648fcadf`), X2 Trial #1 (`106.1 s` AC: `PTQ1_0` `-1.173 GiB` Peak WS / `8/8` greedy parity vs `PQ2_0` `177.8 ms/tok` decode, Orca `1.3` digests, DaisyRose `r16` `:0.0` / `:1.0` / `6/6` rollback)
   and Trial #2 (`887.0 s` AC `bonsai-2.5-pq2` Orca-free `DR-G2` zero-scale + `3/3` Thinking-ON blind packet `4b221d19...`, `creative-b25-001` skipped on budget guard; [bonsai-2-5-x2-vet](docs/evidence/bonsai-2-5-x2-vet.md)) passed locally, keeping `Swift-Bonsai-2-PQ2_0` +
-  Orca unchanged as default. Remaining open: separate AC Thinking-OFF capture on
+  Orca unchanged as default. A separate Swifting Bonsai 2.5 exploration (`Swift-Bonsai-2` PQ2 scale-only diff plus BF16 `Swift-1.5-Qwen3.8-27b` `npu-friendly` and full-linear `AnyLinear` LoRAs) closed **no-go** (multi-step logic thinking increased `+6.4%` to `+8.9%`, decode latency `+9.4%` to `+16.9%`, breaks Hexagon NPU FFN chains) and was completely stripped ([Swifting no-go record](docs/evidence/bonsai-2-5-x2-vet.md#swifting-bonsai-25-exploration-no-go)). Remaining open: separate AC Thinking-OFF capture on
   `bonsai-2.5-pq2` + owner blinded `DR-G2` review/scoring, owning CI (`source-checks`,
   `foundation`), X1/X2 full-device comparisons on Bonsai 2.5 vs
   Swift-Bonsai-2, and (`v0.1.36+` separate future speculative draft work) wiring the reserved
