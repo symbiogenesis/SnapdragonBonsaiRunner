@@ -185,6 +185,8 @@ struct Request {
     #[serde(default)]
     tts_threads: u16,
     #[serde(default)]
+    use_abliterate_lora: bool,
+    #[serde(default)]
     no_abliterate_lora: bool,
     #[serde(default, rename = "DaisyRoseLora")]
     daisyrose_lora: Option<PathBuf>,
@@ -192,8 +194,8 @@ struct Request {
     no_daisyrose_lora: bool,
     #[serde(default)]
     no_mmproj: bool,
-    #[serde(default)]
-    use_repacked_ptq1: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    use_repacked_ptq1: Option<bool>,
     #[serde(default, rename = "NariqVariant")]
     nariq_variant: Option<bonsai_cpu_policy::NariqVariant>,
     #[serde(default, rename = "Bonsai25Variant")]
@@ -398,6 +400,29 @@ where
 }
 
 impl Request {
+    const fn effective_bonsai25_variant(&self) -> Option<bonsai_cpu_policy::Bonsai25Variant> {
+        if let Some(variant) = self.bonsai25_variant {
+            Some(variant)
+        } else if self.native_engine
+            && self.nariq_variant.is_none()
+            && self.use_repacked_ptq1.is_none()
+        {
+            Some(bonsai_cpu_policy::Bonsai25Variant::Pq2)
+        } else {
+            None
+        }
+    }
+
+    const fn effective_use_abliterate_lora(&self) -> bool {
+        if self.no_abliterate_lora || self.nariq_variant.is_some() {
+            false
+        } else if self.use_abliterate_lora {
+            true
+        } else {
+            self.effective_bonsai25_variant().is_none()
+        }
+    }
+
     const fn native_row_workers(&self) -> u8 {
         self.native_row_workers_for_family(None)
     }
@@ -492,8 +517,14 @@ impl Request {
             }
             external(path)?;
         }
+        if self.use_abliterate_lora && self.no_abliterate_lora {
+            return Err("UseAbliterateLora cannot be combined with NoAbliterateLora.".into());
+        }
         if self.nariq_variant.is_some() {
-            if self.use_repacked_ptq1 {
+            if self.use_abliterate_lora {
+                return Err("UseAbliterateLora cannot be combined with NariqVariant.".into());
+            }
+            if self.use_repacked_ptq1.is_some() {
                 return Err("NariqVariant cannot be combined with UseRepackedPtq1.".into());
             }
             if !self.native_engine {
@@ -504,7 +535,7 @@ impl Request {
             }
         }
         if self.bonsai25_variant.is_some() {
-            if self.use_repacked_ptq1 {
+            if self.use_repacked_ptq1.is_some() {
                 return Err("Bonsai25Variant cannot be combined with UseRepackedPtq1.".into());
             }
             if !self.native_engine {
@@ -1077,25 +1108,32 @@ fn effective_daisyrose_lora_path(
     if let Some(explicit) = &request.daisyrose_lora {
         return Some(explicit.clone());
     }
-    if request.bonsai25_variant.is_some() {
-        return None;
-    }
+    let expected_base_sha256 = setup::model(request).ok().map(|selected| selected.sha256);
     pinned
-        .filter(|artifact| artifact.default_enabled)
+        .filter(|artifact| {
+            artifact.default_enabled
+                && expected_base_sha256.as_deref() == Some(artifact.base_model_sha256.as_str())
+        })
         .map(|artifact| artifact.path.clone())
 }
 
 fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
-    if request.no_abliterate_lora || request.nariq_variant.is_some() {
+    if request.use_abliterate_lora {
+        arguments.push("--use-abliterate-lora".into());
+    } else if request.no_abliterate_lora || request.nariq_variant.is_some() {
         arguments.push("--no-abliterate-lora".into());
     }
     if request.no_daisyrose_lora {
         arguments.push("--no-daisyrose-lora".into());
     }
-    let pinned_daisyrose =
-        bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&request.data_directory)
-            .ok()
-            .flatten();
+    let pinned_daisyrose = setup::model(request).ok().and_then(|selected| {
+        bonsai_cpu_policy::DaisyRoseLoraArtifact::pinned_for_base_sha256(
+            &request.data_directory,
+            &selected.sha256,
+        )
+        .ok()
+        .flatten()
+    });
     if let Some(daisyrose_lora) = effective_daisyrose_lora_path(request, pinned_daisyrose.as_ref())
     {
         argument(arguments, "--daisyrose-lora", daisyrose_lora);
@@ -1105,9 +1143,9 @@ fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
     }
     if let Some(variant) = request.nariq_variant {
         argument(arguments, "--nariq", variant.as_str());
-    } else if let Some(variant) = request.bonsai25_variant {
+    } else if let Some(variant) = request.effective_bonsai25_variant() {
         argument(arguments, "--bonsai-2-5", variant.as_str());
-    } else if request.use_repacked_ptq1 {
+    } else if request.use_repacked_ptq1 == Some(true) {
         arguments.push("--use-repacked-ptq1".into());
     } else {
         arguments.push("--use-original-pq2".into());

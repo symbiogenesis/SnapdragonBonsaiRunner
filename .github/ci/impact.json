@@ -30,6 +30,7 @@
       "config/swift-lora.lock.json",
       "config/nariq-qwen38.lock.json",
       "config/bonsai-2-5-27b.lock.json",
+      "config/daisyrose-lora.lock.json",
       "config/swift.ptq1-export.json",
       "config/profiles/reference-cpu.json"
     ],
@@ -54,6 +55,7 @@
       "config/swift-lora.lock.json",
       "config/nariq-qwen38.lock.json",
       "config/bonsai-2-5-27b.lock.json",
+      "config/daisyrose-lora.lock.json",
       "config/swift.ptq1-export.json",
       "config/swift-lora.qualification.json",
       "config/swift-lora.app-qualification.json",
@@ -155,6 +157,7 @@
         "config/swift-lora.lock.json",
         "config/nariq-qwen38.lock.json",
         "config/bonsai-2-5-27b.lock.json",
+        "config/daisyrose-lora.lock.json",
         "config/swift.ptq1-export.json",
         "config/profiles/**",
         "scripts/release/**",

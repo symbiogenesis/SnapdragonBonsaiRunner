@@ -154,7 +154,96 @@ impl DaisyRoseLoraArtifact {
     ) -> Result<Self, String> {
         daisyrose_lora_artifact_for_base_sha256(data, lock_json, variant.sha256())
     }
+
+    /// Whether this resolved `DaisyRose` artifact carries immutable remote download provenance.
+    #[must_use]
+    pub fn has_remote_source(&self) -> bool {
+        !self.url.is_empty()
+    }
+
+    /// Resolve the compiled `config/daisyrose-lora.lock.json` against an explicit lowercase
+    /// 64-hex base model `SHA-256` digest when matched, preferring remote provenance when present
+    /// and otherwise resolving an already-present local-verified adapter under
+    /// `data/adapters/<sha256>/daisyrose-npu-r16-drw1.gguf`.
+    ///
+    /// Returns `Ok(None)` when the pinned lock targets a different base model or when a local-only
+    /// lock's file is absent from `data`.
+    ///
+    /// # Errors
+    /// Rejects invalid data directories, non-64-hex `expected_base_sha256` digests, or an invalid
+    /// compiled `config/daisyrose-lora.lock.json`.
+    pub fn pinned_for_base_sha256(
+        data: &Path,
+        expected_base_sha256: &str,
+    ) -> Result<Option<Self>, String> {
+        validate_data_dir(data)?;
+        require(
+            hex(expected_base_sha256, 64),
+            "Expected DaisyRose baseModelSha256 must be a lowercase 64-hex SHA-256.",
+        )?;
+        let lock = parse_daisyrose_lora_lock(PINNED_DAISYROSE_LOCK)?;
+        if lock.base_model_sha256 != expected_base_sha256 {
+            return Ok(None);
+        }
+        if let Some(source) = lock.source {
+            let path = data
+                .join("adapters")
+                .join(&source.revision)
+                .join(&source.filename);
+            return Ok(Some(Self {
+                path,
+                bytes: lock.bytes,
+                sha256: lock.sha256,
+                base_model_sha256: lock.base_model_sha256,
+                envelope: lock.envelope,
+                dtype: lock.dtype,
+                max_rank: lock.max_rank,
+                target_count: lock.target_count,
+                repository: source.repository,
+                release: source.release,
+                revision: source.revision,
+                filename: source.filename,
+                url: source.url,
+                default_enabled: lock.default_enabled,
+                default_scale_tenths: lock.default_scale_tenths,
+            }));
+        }
+        let Some(scale_tenths) = lock
+            .default_scale_tenths
+            .filter(|tenths| (1..=20).contains(tenths))
+        else {
+            return Ok(None);
+        };
+        let path = data
+            .join("adapters")
+            .join(&lock.sha256)
+            .join(LOCAL_PINNED_DAISYROSE_FILENAME);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            path,
+            bytes: lock.bytes,
+            sha256: lock.sha256.clone(),
+            base_model_sha256: lock.base_model_sha256,
+            envelope: lock.envelope,
+            dtype: lock.dtype,
+            max_rank: lock.max_rank,
+            target_count: lock.target_count,
+            repository: String::new(),
+            release: None,
+            revision: lock.sha256,
+            filename: LOCAL_PINNED_DAISYROSE_FILENAME.to_owned(),
+            url: String::new(),
+            default_enabled: true,
+            default_scale_tenths: Some(scale_tenths),
+        }))
+    }
 }
+
+const PINNED_DAISYROSE_LOCK: &str = include_str!("../../../config/daisyrose-lora.lock.json");
+
+const LOCAL_PINNED_DAISYROSE_FILENAME: &str = "daisyrose-npu-r16-drw1.gguf";
 
 fn atom(value: &str) -> bool {
     !value.is_empty()
@@ -389,10 +478,12 @@ pub fn daisyrose_lora_artifact_from_lock(
     daisyrose_lora_artifact_for_base_sha256(data, lock_json, expected_base_sha256)
 }
 
-/// Resolve the compiled pinned DaisyRose multi-rank `LoRA` artifact if one has been promoted.
+/// Resolve the compiled pinned DaisyRose multi-rank `LoRA` artifact if remote provenance has
+/// been published for the Swift `PQ2_0` base model.
 ///
-/// Remains `Ok(None)` until zero-retraining extraction / direct weight editing (`DR-E1`/`DR-W1`), `DR-G2`, and Prism `v0.1.33+` promotion
-/// publish a verified `config/daisyrose-lora.lock.json` artifact.
+/// Remains `Ok(None)` when `config/daisyrose-lora.lock.json` omits remote `source` provenance
+/// or targets another base model (for instance local-verified `Bonsai 2.5 PQ2_0`); native runtime
+/// launchers resolve base-matched artifacts via [`DaisyRoseLoraArtifact::pinned_for_base_sha256`].
 ///
 /// # Errors
 /// Rejects non-absolute, NUL-containing, or unexpanded data directories.
@@ -401,6 +492,91 @@ pub fn pinned_daisyrose_lora_artifact(
 ) -> Result<Option<DaisyRoseLoraArtifact>, String> {
     validate_data_dir(data)?;
     Ok(None)
+}
+
+#[cfg(test)]
+mod pinned_lock_tests {
+    use super::{
+        DaisyRoseLoraArtifact, LOCAL_PINNED_DAISYROSE_FILENAME, PINNED_DAISYROSE_LOCK, SWIFT_LOCK,
+        parse, parse_daisyrose_lora_lock,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn pinned_lock_matches_bonsai25_pq2_local_and_rejects_other_bases() -> Result<(), String> {
+        let lock = parse_daisyrose_lora_lock(PINNED_DAISYROSE_LOCK)?;
+        assert_eq!(lock.schema_version, 1);
+        assert!(lock.source.is_none());
+        assert!(!lock.default_enabled);
+        assert_eq!(lock.default_scale_tenths, Some(10));
+        assert_eq!(lock.base_model_sha256, crate::Bonsai25Variant::Pq2.sha256());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let data = std::env::temp_dir().join(format!(
+            "bonsai-cpu-policy-daisyrose-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&data).map_err(|error| error.to_string())?;
+
+        // Clean install without local file degrades to None without error.
+        assert_eq!(
+            DaisyRoseLoraArtifact::pinned_for_base_sha256(
+                &data,
+                crate::Bonsai25Variant::Pq2.sha256()
+            )?,
+            None
+        );
+
+        let expected_path = data
+            .join("adapters")
+            .join(&lock.sha256)
+            .join(LOCAL_PINNED_DAISYROSE_FILENAME);
+        fs::create_dir_all(
+            expected_path
+                .parent()
+                .ok_or("missing local adapter parent dir")?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(&expected_path, b"local-daisyrose-placeholder")
+            .map_err(|error| error.to_string())?;
+
+        let resolved = DaisyRoseLoraArtifact::pinned_for_base_sha256(
+            &data,
+            crate::Bonsai25Variant::Pq2.sha256(),
+        )?
+        .ok_or("expected Bonsai 2.5 PQ2 local pinned DaisyRose artifact")?;
+        assert_eq!(resolved.path, expected_path);
+        assert!(!resolved.has_remote_source());
+        assert!(resolved.default_enabled);
+        assert_eq!(resolved.effective_default_scale_tenths(), 10);
+        assert_eq!(resolved.sha256, lock.sha256);
+        assert_eq!(resolved.bytes, lock.bytes);
+
+        let swift_lock = parse(SWIFT_LOCK)?;
+        let swift_pq2_sha = swift_lock["model"]["sha256"]
+            .as_str()
+            .ok_or("SWIFT_LOCK missing model.sha256")?;
+        for other_sha in [
+            crate::Bonsai25Variant::Ptq1.sha256(),
+            swift_pq2_sha,
+            crate::NariqVariant::Bpw2_5.sha256(),
+            crate::NariqVariant::Bpw2_0.sha256(),
+        ] {
+            assert_eq!(
+                DaisyRoseLoraArtifact::pinned_for_base_sha256(&data, other_sha)?,
+                None,
+                "DaisyRose lock must not cross-attach onto {other_sha}"
+            );
+        }
+        assert!(DaisyRoseLoraArtifact::pinned_for_base_sha256(&data, "not-a-sha").is_err());
+
+        let _ = fs::remove_dir_all(&data);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

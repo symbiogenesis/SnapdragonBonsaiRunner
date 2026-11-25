@@ -138,6 +138,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--use-repacked-ptq1" | "--use-original-pq2" => ("UseRepackedPtq1", true, false),
             "--nariq" => ("NariqVariant", false, false),
             "--bonsai-2-5" => ("Bonsai25Variant", false, false),
+            "--use-abliterate-lora" => ("UseAbliterateLora", true, false),
             "--no-abliterate-lora" => ("NoAbliterateLora", true, false),
             "--daisyrose-lora" => ("DaisyRoseLora", false, false),
             "--no-daisyrose-lora" => ("NoDaisyRoseLora", true, false),
@@ -177,6 +178,12 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
     if weight_options > 1 {
         return Err(
             "Weight selection flags (`--nariq`, `--bonsai-2-5`, `--use-repacked-ptq1`, `--use-original-pq2`) are mutually exclusive."
+                .into(),
+        );
+    }
+    if request.contains_key("UseAbliterateLora") && request.contains_key("NoAbliterateLora") {
+        return Err(
+            "Orca flags (`--use-abliterate-lora`, `--no-abliterate-lora`) are mutually exclusive."
                 .into(),
         );
     }
@@ -238,6 +245,7 @@ pub fn installed_chat(arguments: &[OsString]) -> crate::Result<Value> {
             "DataDirectory"
                 | "NoSpeechModels"
                 | "NoTts"
+                | "UseAbliterateLora"
                 | "NoAbliterateLora"
                 | "NoDaisyRoseLora"
                 | "NoMmproj"
@@ -563,6 +571,24 @@ mod tests {
                 variant
             );
         }
+        assert_eq!(
+            chat_options(&["--use-abliterate-lora".into()])?["UseAbliterateLora"],
+            true
+        );
+        assert!(
+            chat_options(&[
+                "--use-abliterate-lora".into(),
+                "--use-abliterate-lora".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            chat_options(&[
+                "--use-abliterate-lora".into(),
+                "--no-abliterate-lora".into()
+            ])
+            .is_err()
+        );
         Ok(())
     }
 

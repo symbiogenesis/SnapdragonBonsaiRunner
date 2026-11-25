@@ -208,7 +208,7 @@ fn configuration_for_family(
     let mut tts_voice_model = None;
     let (mut tts_quantization, mut tts_threads) = (None, None);
     let mut require_broker_pipe = false;
-    let mut no_abliterate_lora = false;
+    let mut use_abliterate_lora = None;
     let mut daisyrose_lora = None;
     let mut no_daisyrose_lora = false;
     let mut no_mmproj = false;
@@ -229,7 +229,12 @@ fn configuration_for_family(
     while let Some(option) = args.next() {
         match option.to_str() {
             Some("--require-broker-pipe") if !require_broker_pipe => require_broker_pipe = true,
-            Some("--no-abliterate-lora") if !no_abliterate_lora => no_abliterate_lora = true,
+            Some("--use-abliterate-lora") if use_abliterate_lora.is_none() => {
+                use_abliterate_lora = Some(true);
+            }
+            Some("--no-abliterate-lora") if use_abliterate_lora.is_none() => {
+                use_abliterate_lora = Some(false);
+            }
             Some("--daisyrose-lora") if daisyrose_lora.is_none() => {
                 daisyrose_lora = Some(next_path(
                     &mut args,
@@ -431,7 +436,7 @@ fn configuration_for_family(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2|--bonsai-2-5 pq2|ptq1] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--use-abliterate-lora|--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2|--bonsai-2-5 pq2|ptq1] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
@@ -546,6 +551,14 @@ fn configuration_for_family(
     if (tts_quantization.is_some() || tts_threads.is_some()) && tts_launch.is_none() {
         return Err("TTS quantization and thread settings require an owned native TTS service.");
     }
+    let bonsai25_variant = if bonsai25_variant.is_some() {
+        bonsai25_variant
+    } else if native_engine && use_repacked_ptq1.is_none() {
+        Some(client::Bonsai25Variant::Pq2)
+    } else {
+        None
+    };
+    let use_abliterate_lora = use_abliterate_lora.unwrap_or(bonsai25_variant.is_none());
     let config = client::Config {
         broker: broker.ok_or("A broker executable is required.")?,
         data: data.ok_or("A provisioned data directory is required.")?,
@@ -553,7 +566,7 @@ fn configuration_for_family(
         frontend_port: frontend_port.unwrap_or(5173),
         backend_port: backend_port.unwrap_or(8081),
         require_broker_pipe,
-        use_abliterate_lora: !no_abliterate_lora,
+        use_abliterate_lora,
         daisyrose_lora,
         no_daisyrose_lora,
         no_mmproj,
@@ -957,8 +970,12 @@ mod tests {
 
     fn assert_runtime_defaults_and_rollback(args: &[OsString]) -> io::Result<()> {
         let default = configuration(args.to_vec()).map_err(io::Error::other)?;
-        assert!(default.use_abliterate_lora);
+        assert!(!default.use_abliterate_lora);
         assert!(!default.use_repacked_ptq1);
+        assert_eq!(
+            default.bonsai25_variant,
+            Some(crate::client::Bonsai25Variant::Pq2)
+        );
         assert!(default.native_engine);
         assert!(!default.require_broker_pipe);
         assert_eq!(default.native_row_workers, 4);
@@ -1221,7 +1238,10 @@ mod tests {
         assert!(configuration(repacked).is_err());
         let mut native = args.clone();
         native.push("--native-engine".into());
-        assert!(configuration(native.clone()).is_ok_and(|config| config.use_abliterate_lora));
+        assert!(configuration(native.clone()).is_ok_and(|config| {
+            !config.use_abliterate_lora
+                && config.bonsai25_variant == Some(crate::client::Bonsai25Variant::Pq2)
+        }));
         for value in ["0", "2", "3", "5", "16", "01", "+4", "4.0", " 4"] {
             let mut rejected = native.clone();
             rejected.extend(["--native-row-workers", value].map(OsString::from));
@@ -1232,7 +1252,11 @@ mod tests {
             configured.extend(["--native-row-workers", value].map(OsString::from));
             let selected = configuration(configured.clone()).map_err(io::Error::other)?;
             assert_eq!(selected.native_row_workers.to_string(), value);
-            assert!(selected.use_abliterate_lora && !selected.use_repacked_ptq1);
+            assert!(
+                !selected.use_abliterate_lora
+                    && !selected.use_repacked_ptq1
+                    && selected.bonsai25_variant == Some(crate::client::Bonsai25Variant::Pq2)
+            );
             configured.extend(["--native-row-workers", value].map(OsString::from));
             assert!(configuration(configured).is_err());
         }
@@ -1331,7 +1355,21 @@ mod tests {
         assert!(configuration(publisher_daisy).is_err());
 
         native.push("--use-repacked-ptq1".into());
-        assert!(configuration(native).is_ok_and(|config| config.use_repacked_ptq1));
+        assert!(
+            configuration(native).is_ok_and(|config| config.use_repacked_ptq1
+                && config.bonsai25_variant.is_none()
+                && !config.use_abliterate_lora)
+        );
+        let mut enabled_orca = args.clone();
+        enabled_orca.push("--use-abliterate-lora".into());
+        let opted_in = configuration(enabled_orca.clone()).map_err(io::Error::other)?;
+        assert!(opted_in.use_abliterate_lora);
+        assert_eq!(
+            opted_in.bonsai25_variant,
+            Some(crate::client::Bonsai25Variant::Pq2)
+        );
+        enabled_orca.push("--no-abliterate-lora".into());
+        assert!(configuration(enabled_orca).is_err());
         let mut disabled = args;
         disabled.push("--no-abliterate-lora".into());
         let opted_out = configuration(disabled.clone()).map_err(io::Error::other)?;

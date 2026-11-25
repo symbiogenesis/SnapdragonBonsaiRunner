@@ -535,7 +535,8 @@ fn development_default_and_explicit_rollback_survive_deferred_preparation() -> c
                     .map_err(|error| error.to_string())?;
             assert_eq!(serialized["NativeEngine"], selected_native);
             assert_eq!(serialized["NativeRowWorkers"], selected_workers);
-            assert_eq!(serialized["UseRepackedPtq1"], false);
+            assert!(serialized.get("UseRepackedPtq1").is_none());
+            assert_eq!(serialized["UseAbliterateLora"], false);
             assert_eq!(serialized["NoAbliterateLora"], false);
             let prepared = prepare_backend(plan(serialized)?, &mut recorder, &fixture.working)?;
             let arguments = prepared["Arguments"]
@@ -560,7 +561,18 @@ fn development_default_and_explicit_rollback_survive_deferred_preparation() -> c
                     .array_windows::<2>()
                     .any(|args| args[0] == "--native-row-workers" && args[1] == worker_argument)
             );
-            assert!(arguments.iter().any(|arg| arg == "--use-original-pq2"));
+            if selected_native {
+                assert!(
+                    arguments
+                        .array_windows::<2>()
+                        .any(|args| args[0] == "--bonsai-2-5" && args[1] == "pq2")
+                );
+                assert!(!arguments.iter().any(|arg| arg == "--use-original-pq2"));
+                assert!(!arguments.iter().any(|arg| arg == "--use-abliterate-lora"));
+            } else {
+                assert!(arguments.iter().any(|arg| arg == "--use-original-pq2"));
+                assert!(!arguments.iter().any(|arg| arg == "--bonsai-2-5"));
+            }
             assert_eq!(
                 recorder
                     .events
@@ -858,8 +870,8 @@ fn staged_model_preparation_never_waits_for_owned_or_external_speech() -> crate:
         );
         assert!(
             arguments
-                .iter()
-                .any(|argument| argument == "--use-original-pq2")
+                .array_windows::<2>()
+                .any(|pair| pair[0] == "--bonsai-2-5" && pair[1] == "pq2")
         );
         assert!(arguments.iter().any(|argument| argument == "--broker-path"));
         assert!(arguments.iter().all(|argument| {
@@ -1846,7 +1858,7 @@ fn effective_daisyrose_path_respects_promotion_opt_out_and_explicit_override() -
         "targetCount": 128,
         "bytes": 67_108_864_u64,
         "sha256": "a".repeat(64),
-        "baseModelSha256": "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
+        "baseModelSha256": bonsai_cpu_policy::Bonsai25Variant::Pq2.sha256(),
         "source": {
             "host": "huggingface",
             "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
@@ -1859,16 +1871,36 @@ fn effective_daisyrose_path_respects_promotion_opt_out_and_explicit_override() -
         "defaultEnabled": true,
         "defaultScaleTenths": 10
     });
-    let promoted = bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &lock.to_string())?;
+    let promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact::for_bonsai25_lock(
+        &data,
+        bonsai_cpu_policy::Bonsai25Variant::Pq2,
+        &lock.to_string(),
+    )?;
+    let mut swift_pq2_lock = lock;
+    swift_pq2_lock["baseModelSha256"] =
+        json!("5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5");
+    let swift_promoted =
+        bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &swift_pq2_lock.to_string())?;
     let mut unpromoted = promoted.clone();
     unpromoted.default_enabled = false;
 
     assert_eq!(effective_daisyrose_lora_path(&req, None), None);
     assert_eq!(effective_daisyrose_lora_path(&req, Some(&unpromoted)), None);
     assert_eq!(
+        effective_daisyrose_lora_path(&req, Some(&swift_promoted)),
+        None
+    );
+    assert_eq!(
         effective_daisyrose_lora_path(&req, Some(&promoted)),
         Some(promoted.path.clone())
     );
+
+    req.use_repacked_ptq1 = Some(false);
+    assert_eq!(
+        effective_daisyrose_lora_path(&req, Some(&swift_promoted)),
+        Some(swift_promoted.path.clone())
+    );
+    req.use_repacked_ptq1 = None;
 
     req.no_daisyrose_lora = true;
     assert_eq!(effective_daisyrose_lora_path(&req, Some(&promoted)), None);
@@ -1901,10 +1933,17 @@ fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -
     let mut req: Request = serde_json::from_value(fixture.request).map_err(|e| e.to_string())?;
     req.native_engine = true;
     req.nariq_variant = Some(bonsai_cpu_policy::NariqVariant::Bpw2_5);
-    req.use_repacked_ptq1 = true;
+    req.use_repacked_ptq1 = Some(true);
     assert!(req.validate_native_runtime(None).is_err());
 
-    req.use_repacked_ptq1 = false;
+    req.use_repacked_ptq1 = Some(false);
+    assert!(req.validate_native_runtime(None).is_err());
+
+    req.use_repacked_ptq1 = None;
+    req.use_abliterate_lora = true;
+    assert!(req.validate_native_runtime(None).is_err());
+
+    req.use_abliterate_lora = false;
     req.native_engine = false;
     assert!(req.validate_native_runtime(None).is_err());
 
@@ -1939,7 +1978,7 @@ fn bonsai25_chat_request_allows_orca_mmproj_composite_and_explicit_daisyrose() -
     let mut conflict_ptq1: Request =
         serde_json::from_value(fixture.request.clone()).map_err(|e| e.to_string())?;
     conflict_ptq1.native_engine = true;
-    conflict_ptq1.use_repacked_ptq1 = true;
+    conflict_ptq1.use_repacked_ptq1 = Some(true);
     conflict_ptq1.bonsai25_variant = Some(bonsai_cpu_policy::Bonsai25Variant::Pq2);
     assert!(conflict_ptq1.validate_native_runtime(None).is_err());
 
@@ -1953,7 +1992,7 @@ fn bonsai25_chat_request_allows_orca_mmproj_composite_and_explicit_daisyrose() -
     let mut req: Request = serde_json::from_value(fixture.request).map_err(|e| e.to_string())?;
     req.native_engine = true;
     req.bonsai25_variant = Some(bonsai_cpu_policy::Bonsai25Variant::Ptq1);
-    req.use_repacked_ptq1 = false;
+    req.use_repacked_ptq1 = None;
     req.placement = Some(Placement::Auto);
     let daisy = fixture.root.join("daisyrose.gguf");
     req.daisyrose_lora = Some(daisy);
@@ -1966,6 +2005,7 @@ fn bonsai25_chat_request_allows_orca_mmproj_composite_and_explicit_daisyrose() -
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
     assert!(rendered.windows(2).any(|w| w == ["--bonsai-2-5", "ptq1"]));
+    assert!(!rendered.contains(&"--use-abliterate-lora".to_owned()));
     assert!(!rendered.contains(&"--no-abliterate-lora".to_owned()));
     assert!(!rendered.contains(&"--no-mmproj".to_owned()));
     assert!(rendered.iter().any(|a| a == "--daisyrose-lora"));
@@ -1974,6 +2014,11 @@ fn bonsai25_chat_request_allows_orca_mmproj_composite_and_explicit_daisyrose() -
             .iter()
             .any(|a| a == "--use-original-pq2" || a == "--use-repacked-ptq1")
     );
+
+    req.use_abliterate_lora = true;
+    let mut orca_args = Vec::new();
+    runtime_arguments(&req, &mut orca_args);
+    assert!(orca_args.iter().any(|a| a == "--use-abliterate-lora"));
 
     fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
 }

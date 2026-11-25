@@ -45,6 +45,7 @@ param(
     [switch]$UseOriginalPq2,
     [ValidateSet('pq2', 'ptq1')]
     [string]$Bonsai25,
+    [switch]$UseAbliterateLora,
     [switch]$NoAbliterateLora,
     [string]$DaisyRoseLora,
     [switch]$NoDaisyRoseLora,
@@ -187,6 +188,7 @@ try {
     if ($UseRepackedPtq1) { $launchArguments += '--use-repacked-ptq1' }
     if ($UseOriginalPq2) { $launchArguments += '--use-original-pq2' }
     if ($Bonsai25) { $launchArguments += @('--bonsai-2-5', $Bonsai25.ToLowerInvariant()) }
+    if ($UseAbliterateLora) { $launchArguments += '--use-abliterate-lora' }
     if ($NoAbliterateLora) { $launchArguments += '--no-abliterate-lora' }
     if ($DaisyRoseLora) { $launchArguments += @('--daisyrose-lora', $DaisyRoseLora) }
     if ($NoDaisyRoseLora) { $launchArguments += '--no-daisyrose-lora' }

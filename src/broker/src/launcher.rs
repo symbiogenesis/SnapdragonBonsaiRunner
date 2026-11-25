@@ -73,7 +73,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--use-repacked-ptq1|--use-original-pq2|--nariq 2.5bpw|3.0bpw|2.0bpw|--bonsai-2-5 pq2|ptq1] (mutually exclusive weight selections; Swift only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
     "Default: reference-cpu. Only compiled model/runtime pins and fixed CPU policies are accepted.\n",
-    "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise) and original PQ2 weights; PTQ1 requires explicit selection. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
+    "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise), Orca-free Bonsai 2.5 PQ2 weights (with local-verified DaisyRose attached when present), and --use-original-pq2/--use-repacked-ptq1/--bonsai-2-5 ptq1/--nariq as explicit selections; --publisher-engine rollback defaults to original PQ2. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
     "Creates fresh protected credentials; prints paths, never key values.\n",
 );
 
@@ -464,10 +464,15 @@ impl LaunchConfig {
                 WeightRepresentation::NariQ(variant)
             } else if let Some(variant) = bonsai25_variant {
                 WeightRepresentation::Bonsai25(variant)
-            } else if use_repacked_ptq1.unwrap_or(false) {
+            } else if use_repacked_ptq1 == Some(true) {
                 WeightRepresentation::CurrentRepackedPtq1
-            } else {
+            } else if use_repacked_ptq1 == Some(false)
+                || profile != LaunchProfile::SwiftPq2Assessment
+                || !native_engine
+            {
                 WeightRepresentation::Source
+            } else {
+                WeightRepresentation::Bonsai25(bonsai_cpu_policy::Bonsai25Variant::Pq2)
             },
         };
         configuration.validate_selection(
@@ -1040,9 +1045,21 @@ impl LaunchConfig {
             .transpose()
     }
 
+    const fn active_base_sha256(&self) -> &'static str {
+        match self.weight_representation {
+            WeightRepresentation::Source => crate::inference::MODEL_SHA256,
+            WeightRepresentation::CurrentRepackedPtq1 => crate::inference::REPACKED_PTQ1_SHA256,
+            WeightRepresentation::NariQ(variant) => variant.sha256(),
+            WeightRepresentation::Bonsai25(variant) => variant.sha256(),
+        }
+    }
+
     fn resolve_daisyrose_selection(&self) -> Result<Option<DaisyRoseSelection>, LaunchError> {
-        let pinned = bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&self.data)
-            .map_err(|_| LaunchError::Policy)?;
+        let pinned = bonsai_cpu_policy::DaisyRoseLoraArtifact::pinned_for_base_sha256(
+            &self.data,
+            self.active_base_sha256(),
+        )
+        .map_err(|_| LaunchError::Policy)?;
         let multi_rank_supported = crate::inference::multi_rank_lora_supported()?;
         self.resolve_daisyrose_selection_with(pinned, multi_rank_supported)
     }
@@ -1058,13 +1075,9 @@ impl LaunchConfig {
         {
             return Ok(None);
         }
-        // Compiled PQ2 locks never auto-attach onto NariQ base weights; require
-        // an explicit --daisyrose-lora until NariQ has its own promoted lock.
-        let pinned = if self.nariq_variant().is_some() || self.bonsai25_variant().is_some() {
-            None
-        } else {
-            pinned
-        };
+        // Only auto-attach a compiled lock when its baseModelSha256 matches the active weights.
+        let expected_base_sha256 = self.active_base_sha256();
+        let pinned = pinned.filter(|artifact| artifact.base_model_sha256 == expected_base_sha256);
         if let Some(explicit) = &self.daisyrose_lora {
             if !multi_rank_supported {
                 return Err(LaunchError::NativeRuntime);
@@ -3681,7 +3694,7 @@ mod tests {
             path: promoted_path.clone(),
             bytes: 1024,
             sha256: "a".repeat(64),
-            base_model_sha256: "b".repeat(64),
+            base_model_sha256: bonsai_cpu_policy::Bonsai25Variant::Pq2.sha256().into(),
             envelope: "npu-friendly".into(),
             dtype: "f16".into(),
             max_rank: 16,
@@ -3696,6 +3709,8 @@ mod tests {
         };
         let mut unpromoted = promoted.clone();
         unpromoted.default_enabled = false;
+        let mut wrong_base = promoted.clone();
+        wrong_base.base_model_sha256 = crate::inference::MODEL_SHA256.into();
 
         let mut base_args = arguments();
         base_args.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
@@ -3707,6 +3722,10 @@ mod tests {
         );
         assert_eq!(
             base_cfg.resolve_daisyrose_selection_with(Some(unpromoted), true)?,
+            None
+        );
+        assert_eq!(
+            base_cfg.resolve_daisyrose_selection_with(Some(wrong_base), true)?,
             None
         );
         assert_eq!(
@@ -4236,6 +4255,11 @@ mod tests {
             config.uses_native_engine()
                 && config.native_row_workers == 4
                 && !config.uses_repacked_ptq1()
+                && !config.use_abliterate_lora
+                && config.weight_representation
+                    == super::WeightRepresentation::Bonsai25(
+                        bonsai_cpu_policy::Bonsai25Variant::Pq2,
+                    )
         }));
         assert!(LaunchConfig::parse(arguments()).is_ok_and(|config| {
             !config.uses_native_engine() && config.native_row_workers == 1
@@ -4243,7 +4267,9 @@ mod tests {
         let mut publisher = swift.clone();
         publisher.push("--publisher-engine".into());
         assert!(LaunchConfig::parse(publisher).is_ok_and(|config| {
-            !config.uses_native_engine() && config.native_row_workers == 1
+            !config.uses_native_engine()
+                && config.native_row_workers == 1
+                && config.weight_representation == super::WeightRepresentation::Source
         }));
         for first in ["--native-engine", "--publisher-engine"] {
             for second in ["--native-engine", "--publisher-engine"] {
@@ -5658,12 +5684,12 @@ mod tests {
                     .map_err(|error| std::io::Error::other(format!("{error:?}")))?
             );
 
-            // Compiled Swift PQ2 DaisyRose lock never auto-attaches onto Bonsai 2.5.
-            let pq2_promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact {
+            // Foreign-base DaisyRose locks (such as legacy Swift PQ2) never auto-attach onto Bonsai 2.5.
+            let foreign_promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact {
                 path: temp.path().join("pq2-promoted.gguf"),
                 bytes: 1024,
                 sha256: "a".repeat(64),
-                base_model_sha256: "b".repeat(64),
+                base_model_sha256: crate::inference::MODEL_SHA256.into(),
                 envelope: "npu-friendly".into(),
                 dtype: "f16".into(),
                 max_rank: 16,
@@ -5677,9 +5703,19 @@ mod tests {
                 default_scale_tenths: Some(10),
             };
             assert_eq!(
-                cfg.resolve_daisyrose_selection_with(Some(pq2_promoted), true)
+                cfg.resolve_daisyrose_selection_with(Some(foreign_promoted.clone()), true)
                     .map_err(|error| std::io::Error::other(format!("{error:?}")))?,
                 None
+            );
+            let mut b25_pq2_promoted = foreign_promoted;
+            b25_pq2_promoted.base_model_sha256 =
+                bonsai_cpu_policy::Bonsai25Variant::Pq2.sha256().into();
+            let resolved_b25 = cfg
+                .resolve_daisyrose_selection_with(Some(b25_pq2_promoted), true)
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            assert_eq!(
+                resolved_b25.is_some(),
+                variant == bonsai_cpu_policy::Bonsai25Variant::Pq2
             );
 
             let creds = super::PrivateCredentials::create(temp.path())?;

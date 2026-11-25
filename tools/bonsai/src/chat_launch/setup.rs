@@ -27,11 +27,11 @@ fn cached_json(
         .map_err(Clone::clone)
 }
 
-struct Model {
-    path: PathBuf,
-    bytes: u64,
-    sha256: String,
-    url: Option<String>,
+pub(super) struct Model {
+    pub(super) path: PathBuf,
+    pub(super) bytes: u64,
+    pub(super) sha256: String,
+    pub(super) url: Option<String>,
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> crate::Result<&'a str> {
@@ -40,7 +40,7 @@ fn text<'a>(value: &'a Value, key: &str) -> crate::Result<&'a str> {
         .ok_or_else(|| format!("Missing compiled Swift setup identity: {key}."))
 }
 
-fn model(request: &Request) -> crate::Result<Model> {
+pub(super) fn model(request: &Request) -> crate::Result<Model> {
     if let Some(variant) = request.nariq_variant {
         let selected = bonsai_cpu_policy::nariq_model_artifact(&request.data_directory, variant)?;
         return Ok(Model {
@@ -50,7 +50,7 @@ fn model(request: &Request) -> crate::Result<Model> {
             url: Some(selected.url),
         });
     }
-    if let Some(variant) = request.bonsai25_variant {
+    if let Some(variant) = request.effective_bonsai25_variant() {
         let selected =
             bonsai_cpu_policy::bonsai25_model_artifact(&request.data_directory, variant)?;
         return Ok(Model {
@@ -60,13 +60,14 @@ fn model(request: &Request) -> crate::Result<Model> {
             url: Some(selected.url),
         });
     }
+    let repacked = request.use_repacked_ptq1.unwrap_or(false);
     let lock = cached_json(&SWIFT_LOCK, SWIFT)?;
     let derived = cached_json(&PTQ1_EXPORT, PTQ1)?;
     let pin = bonsai_cpu_policy::select_artifact(
         lock,
         bonsai_cpu_policy::Profile::SwiftPq2Assessment,
-        request.use_repacked_ptq1,
-        request.use_repacked_ptq1.then_some(derived),
+        repacked,
+        repacked.then_some(derived),
     )?;
     let source = &lock["model"];
     let filename = text(&pin, "Filename")?;
@@ -80,7 +81,7 @@ fn model(request: &Request) -> crate::Result<Model> {
             .as_u64()
             .ok_or("Missing compiled Swift model length.")?,
         sha256: text(&pin, "Sha256")?.into(),
-        url: (!request.use_repacked_ptq1).then(|| {
+        url: (!repacked).then(|| {
             format!(
                 "https://huggingface.co/{}/resolve/{}/{filename}",
                 source["repository"].as_str().unwrap_or_default(),
@@ -223,10 +224,15 @@ pub(super) fn prepare(request: &Request, working: &Path) -> crate::Result<()> {
         .transpose()?;
     let daisyrose =
         (request.native_engine && !request.no_daisyrose_lora && request.daisyrose_lora.is_none())
-            .then(|| bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&request.data_directory))
+            .then(|| {
+                bonsai_cpu_policy::DaisyRoseLoraArtifact::pinned_for_base_sha256(
+                    &request.data_directory,
+                    &selected.sha256,
+                )
+            })
             .transpose()?
             .flatten()
-            .filter(|artifact| artifact.default_enabled);
+            .filter(|artifact| artifact.default_enabled && artifact.has_remote_source());
     prepare_weights_with(
         request,
         working,
@@ -283,10 +289,15 @@ fn prepare_weights(
         .transpose()?;
     let daisyrose =
         (request.native_engine && !request.no_daisyrose_lora && request.daisyrose_lora.is_none())
-            .then(|| bonsai_cpu_policy::pinned_daisyrose_lora_artifact(&request.data_directory))
+            .then(|| {
+                bonsai_cpu_policy::DaisyRoseLoraArtifact::pinned_for_base_sha256(
+                    &request.data_directory,
+                    &selected.sha256,
+                )
+            })
             .transpose()?
             .flatten()
-            .filter(|artifact| artifact.default_enabled);
+            .filter(|artifact| artifact.default_enabled && artifact.has_remote_source());
     prepare_weights_with(
         request,
         working,
@@ -336,7 +347,7 @@ fn prepare_weights_with(
         verify(&selected.path, selected.bytes, &selected.sha256)
             .map_err(|error| format!("The explicitly selected PTQ1 export at {} could not be verified: {error}. Automatic setup cannot create this export. Supply the matching current-weight export, or close and relaunch with original PQ2 selected.", selected.path.display()))?;
     }
-    if !request.no_abliterate_lora && request.nariq_variant.is_none() {
+    if request.effective_use_abliterate_lora() {
         let selected = bonsai_cpu_policy::abliterate_lora_artifact(&request.data_directory)?;
         let lock = cached_json(&ADAPTER_LOCK, ADAPTER)?;
         status(
@@ -364,10 +375,11 @@ fn prepare_weights_with(
     }
     if let Some(daisyrose) = daisyrose.filter(|artifact| {
         artifact.default_enabled
+            && artifact.has_remote_source()
+            && artifact.base_model_sha256 == selected.sha256
             && request.native_engine
             && !request.no_daisyrose_lora
             && request.daisyrose_lora.is_none()
-            && request.bonsai25_variant.is_none()
     }) {
         status(
             working,
@@ -472,6 +484,22 @@ mod tests {
             "DataDirectory":data,"RepositoryRoot":data.join("source"),
         }))
         .map_err(|error| error.to_string())?;
+        let default_b25 = model(&request)?;
+        assert_eq!(
+            default_b25.bytes,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2.weight_bytes()
+        );
+        assert_eq!(
+            default_b25.sha256,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2.sha256()
+        );
+        assert!(
+            default_b25
+                .path
+                .ends_with("Ternary-Bonsai-2.5-27B-PQ2_0.gguf")
+        );
+
+        request.use_repacked_ptq1 = Some(false);
         let pq2 = model(&request)?;
         assert_eq!(pq2.bytes, 7_206_168_928);
         assert_eq!(
@@ -487,11 +515,12 @@ mod tests {
                 "https://huggingface.co/ukisai/Swift-Bonsai-2-GGUF/resolve/a3bdac086bbb6b04d87d0108d18943b5f63868f7/Swift-Bonsai-2-PQ2_0.gguf"
             )
         );
-        request.use_repacked_ptq1 = true;
+        request.use_repacked_ptq1 = Some(true);
         let ptq1 = model(&request)?;
         assert!(ptq1.url.is_none());
         assert_eq!(ptq1.bytes, 5_946_648_928);
         assert_ne!(ptq1.path, pq2.path);
+        assert_ne!(ptq1.path, default_b25.path);
         Ok(())
     }
 
@@ -571,6 +600,7 @@ mod tests {
         fs::write(&selected.path, b"intentionally invalid model-free fixture")
             .map_err(|error| error.to_string())?;
         for (adapter, no_mmproj) in [(false, false), (true, false), (true, true)] {
+            request.use_abliterate_lora = adapter;
             request.no_abliterate_lora = !adapter;
             request.no_mmproj = no_mmproj;
             let mut received = Vec::new();
@@ -604,6 +634,7 @@ mod tests {
                 assert_eq!(received[next_index].0, expected.url);
             }
         }
+        request.use_abliterate_lora = false;
         request.no_abliterate_lora = false;
         request.no_mmproj = false;
         let mut count = 0;
@@ -621,7 +652,7 @@ mod tests {
         assert!(error.contains("Synthetic interrupted download"));
         assert_eq!(count, 1);
 
-        request.use_repacked_ptq1 = true;
+        request.use_repacked_ptq1 = Some(true);
         request.no_abliterate_lora = true;
         request.no_mmproj = true;
         let mut verified = Vec::new();
@@ -687,7 +718,7 @@ mod tests {
             "targetCount": 128,
             "bytes": 67_108_864_u64,
             "sha256": "a".repeat(64),
-            "baseModelSha256": "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
+            "baseModelSha256": bonsai_cpu_policy::Bonsai25Variant::Pq2.sha256(),
             "source": {
                 "host": "huggingface",
                 "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
@@ -700,8 +731,11 @@ mod tests {
             "defaultEnabled": true,
             "defaultScaleTenths": 10
         });
-        let promoted =
-            bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &lock.to_string())?;
+        let promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact::for_bonsai25_lock(
+            &data,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
+            &lock.to_string(),
+        )?;
 
         // Promoted default downloads DaisyRose after model when enabled.
         let mut received = Vec::new();
@@ -724,6 +758,46 @@ mod tests {
         assert_eq!(received[1].1, promoted.path);
         assert_eq!(received[1].2, promoted.bytes);
         assert_eq!(received[1].3, promoted.sha256);
+
+        // Local-only DaisyRose (no remote URL) and foreign-base locks skip download cleanly.
+        let mut local_only = promoted.clone();
+        local_only.url.clear();
+        received.clear();
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            true,
+            "existing",
+            None,
+            Some(&local_only),
+            |url, path, bytes, hash, _| {
+                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(received.len(), 1);
+
+        let mut foreign_base = promoted.clone();
+        foreign_base.base_model_sha256 =
+            "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5".into();
+        received.clear();
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            true,
+            "existing",
+            None,
+            Some(&foreign_base),
+            |url, path, bytes, hash, _| {
+                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(received.len(), 1);
 
         // NoDaisyRoseLora skips automatic DaisyRose download.
         request.no_daisyrose_lora = true;
@@ -825,7 +899,7 @@ mod tests {
             "targetCount": 128,
             "bytes": 67_108_864_u64,
             "sha256": "a".repeat(64),
-            "baseModelSha256": "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
+            "baseModelSha256": bonsai_cpu_policy::NariqVariant::Bpw2_5.sha256(),
             "source": {
                 "host": "huggingface",
                 "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
@@ -838,8 +912,11 @@ mod tests {
             "defaultEnabled": true,
             "defaultScaleTenths": 10
         });
-        let promoted =
-            bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &daisy_lock.to_string())?;
+        let promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact::for_nariq_lock(
+            &data,
+            bonsai_cpu_policy::NariqVariant::Bpw2_5,
+            &daisy_lock.to_string(),
+        )?;
         let mut received = Vec::new();
         prepare_weights_with(
             &request,
@@ -876,7 +953,7 @@ mod tests {
         fs::create_dir(&working).map_err(|error| error.to_string())?;
         let data = working.join("data");
         fs::create_dir(&data).map_err(|error| error.to_string())?;
-        let request: Request = serde_json::from_value(json!({
+        let mut request: Request = serde_json::from_value(json!({
             "DataDirectory": data,
             "RepositoryRoot": working.join("source"),
             "NativeEngine": true,
@@ -933,7 +1010,28 @@ mod tests {
             },
             |_, _, _| Ok(()),
         )?;
-        // Expects: Bonsai 2.5 model + Orca + mmproj (3 downloads); PQ2 DaisyRose skipped!
+        // Default Bonsai 2.5 downloads model + mmproj (2 downloads; Orca-free and foreign DaisyRose skipped).
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].1, pinned_b25.path);
+        assert_eq!(received[1].1, mmproj.path);
+
+        // Explicit Orca opt-in downloads Bonsai 2.5 model + Orca + mmproj (3 downloads; foreign DaisyRose skipped).
+        request.use_abliterate_lora = true;
+        received.clear();
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            false,
+            "first-run",
+            Some(&mmproj),
+            Some(&promoted),
+            |url, path, bytes, hash, _| {
+                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
         assert_eq!(received.len(), 3);
         assert_eq!(received[0].1, pinned_b25.path);
         assert_eq!(received[1].1, orca.path);
