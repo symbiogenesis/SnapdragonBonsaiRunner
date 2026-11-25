@@ -773,11 +773,12 @@ fn read_header<R: Read>(reader: &mut R) -> io::Result<HeaderRead> {
     Ok(HeaderRead::Frame(header))
 }
 
-fn write_raw_frame(
+fn write_raw_frame_into(
     writer: &mut impl Write,
     stream_id: u32,
     kind: u8,
     payload: &[u8],
+    scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
         io::Error::new(
@@ -785,9 +786,25 @@ fn write_raw_frame(
             "broker-pipe frame exceeds u32 bound",
         )
     })?;
-    writer
-        .write_all(&encode_header(stream_id, kind, payload_len))
-        .and_then(|()| writer.write_all(payload))
+    let header = encode_header(stream_id, kind, payload_len);
+    if payload.is_empty() {
+        return writer.write_all(&header);
+    }
+    scratch.clear();
+    scratch.reserve(FRAME_HEADER_BYTES + payload.len());
+    scratch.extend_from_slice(&header);
+    scratch.extend_from_slice(payload);
+    writer.write_all(scratch)
+}
+
+fn write_raw_frame(
+    writer: &mut impl Write,
+    stream_id: u32,
+    kind: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    let mut scratch = Vec::new();
+    write_raw_frame_into(writer, stream_id, kind, payload, &mut scratch)
 }
 
 #[cfg(test)]
@@ -1057,10 +1074,16 @@ fn run_writer<W: Write>(
             seq
         };
 
+        let mut frame_scratch = Vec::with_capacity(FRAME_HEADER_BYTES + MAX_FRAME_PAYLOAD);
         let mut io_result = Ok(());
         for frame in batch.drain(..) {
-            let write_result =
-                write_raw_frame(&mut writer, frame.stream_id, frame.kind, &frame.payload);
+            let write_result = write_raw_frame_into(
+                &mut writer,
+                frame.stream_id,
+                frame.kind,
+                &frame.payload,
+                &mut frame_scratch,
+            );
             pool.recycle(frame.payload);
             if let Err(error) = write_result {
                 io_result = Err(error);
@@ -1631,5 +1654,37 @@ mod tests {
                 .map_err(|_| io::Error::other("wait_server_ready failed"))?;
             Ok(())
         })
+    }
+
+    #[test]
+    fn write_raw_frame_coalesces_header_and_payload_into_single_write() -> io::Result<()> {
+        struct CountingWriter {
+            bytes: Vec<u8>,
+            write_calls: usize,
+        }
+        impl Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.write_calls += 1;
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = CountingWriter {
+            bytes: Vec::new(),
+            write_calls: 0,
+        };
+        let payload = b"HTTP/1.1 200 OK\r\n\r\n";
+        write_raw_frame(&mut writer, 7, KIND_DATA, payload)?;
+        assert_eq!(writer.write_calls, 1);
+        let mut cursor = io::Cursor::new(writer.bytes);
+        assert_eq!(
+            read_test_frame_opt(&mut cursor)?,
+            Some((7, KIND_DATA, payload.to_vec()))
+        );
+        Ok(())
     }
 }

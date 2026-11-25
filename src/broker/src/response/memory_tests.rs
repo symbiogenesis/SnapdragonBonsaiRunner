@@ -191,6 +191,9 @@ struct VectoredClient {
     bytes: Vec<u8>,
     maximum_write: usize,
     payload_pointers: Vec<*const u8>,
+    write_calls: usize,
+    vectored_calls: usize,
+    flush_calls: usize,
     zero: bool,
     shutdown: bool,
 }
@@ -201,6 +204,9 @@ impl VectoredClient {
             bytes: Vec::new(),
             maximum_write,
             payload_pointers: Vec::new(),
+            write_calls: 0,
+            vectored_calls: 0,
+            flush_calls: 0,
             zero: false,
             shutdown: false,
         }
@@ -213,6 +219,7 @@ impl AsyncWrite for VectoredClient {
         _: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        self.write_calls += 1;
         let count = self.maximum_write.min(bytes.len());
         self.bytes.extend_from_slice(&bytes[..count]);
         Poll::Ready(Ok(count))
@@ -226,6 +233,7 @@ impl AsyncWrite for VectoredClient {
         if self.zero {
             return Poll::Ready(Ok(0));
         }
+        self.vectored_calls += 1;
         let mut count = 0;
         for buffer in buffers {
             if buffer.len() >= RESPONSE_BUFFER_BYTES {
@@ -245,7 +253,8 @@ impl AsyncWrite for VectoredClient {
         true
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.flush_calls += 1;
         Poll::Ready(Ok(()))
     }
 
@@ -343,6 +352,48 @@ fn borrowed_sse_preserves_exact_cap_probe_and_deadline_failure() -> io::Result<(
         );
         assert!(!client.shutdown);
         assert!(!client.bytes.ends_with(b"0\r\n\r\n"));
+        Ok(())
+    })
+}
+
+#[test]
+fn buffered_sse_coalesces_head_and_initial_payload_into_one_vectored_flush() -> io::Result<()> {
+    runtime()?.block_on(async {
+        let small = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let mut reader = tokio::io::BufReader::with_capacity(
+            RESPONSE_BUFFER_BYTES,
+            io::Cursor::new(small.as_slice()),
+        );
+        let mut client = VectoredClient::new(usize::MAX);
+        write_buffered_sse_response(&mut client, &mut reader, deadline())
+            .await
+            .map_err(|_| io::Error::other("Small buffered SSE failed."))?;
+        let mut expected = SSE_HEAD.as_bytes().to_vec();
+        expected.extend_from_slice(format!("{:X}\r\n", small.len()).as_bytes());
+        expected.extend_from_slice(small);
+        expected.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert_eq!(client.bytes, expected);
+        // 1 vectored write for (SSE_HEAD + first chunk) + 1 write for 0\r\n\r\n terminator.
+        assert_eq!(client.vectored_calls, 1);
+        assert_eq!(client.write_calls, 1);
+        assert_eq!(client.flush_calls, 2);
+        assert!(client.shutdown);
+
+        let large = vec![b'y'; RESPONSE_BUFFER_BYTES];
+        let mut reader = tokio::io::BufReader::with_capacity(
+            RESPONSE_BUFFER_BYTES,
+            io::Cursor::new(large.clone()),
+        );
+        let pointer = reader.buffer().as_ptr();
+        let mut client = VectoredClient::new(usize::MAX);
+        write_buffered_sse_response(&mut client, &mut reader, deadline())
+            .await
+            .map_err(|_| io::Error::other("Large buffered SSE failed."))?;
+        assert_eq!(client.vectored_calls, 1);
+        assert_eq!(client.write_calls, 1);
+        assert_eq!(client.flush_calls, 2);
+        assert!(client.payload_pointers.contains(&pointer));
+        assert!(client.shutdown);
         Ok(())
     })
 }

@@ -539,6 +539,7 @@ fn validate_count_rejection_metadata(headers: &[httparse::Header<'_>]) -> Result
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 enum Framing {
     Length(usize),
     Size {
@@ -672,73 +673,132 @@ impl<S: AsyncRead + Unpin> BackendBody<S> {
                 }
                 _ => {}
             }
-            let byte = ready!(this.poll_available(cx))?[0];
+            let current_framing = this.framing;
+            let remaining_budget = this.remaining_budget;
+            let available = ready!(this.poll_available(cx))?;
+            let step = match current_framing {
+                Framing::Size {
+                    value,
+                    digits,
+                    cr: false,
+                } => {
+                    let max_hex = MAX_CHUNK_LINE_BYTES.saturating_sub(2).saturating_sub(digits);
+                    let scan = &available[..available.len().min(max_hex.saturating_add(1))];
+                    if let Some(cr_pos) = memchr::memchr(b'\r', scan) {
+                        match parse_hex_chunk_digits(value, digits, &scan[..cr_pos]) {
+                            Some((new_value, new_digits)) if new_digits > 0 => {
+                                let has_lf = available.get(cr_pos + 1) == Some(&b'\n');
+                                let consumed = cr_pos + 1 + usize::from(has_lf);
+                                if has_lf {
+                                    if new_value > remaining_budget {
+                                        Err(io::ErrorKind::InvalidData)
+                                    } else if new_value == 0 {
+                                        Ok((consumed, Framing::EndCr))
+                                    } else {
+                                        Ok((consumed, Framing::Data(new_value)))
+                                    }
+                                } else if available.len() == cr_pos + 1 {
+                                    Ok((
+                                        consumed,
+                                        Framing::Size {
+                                            value: new_value,
+                                            digits: new_digits,
+                                            cr: true,
+                                        },
+                                    ))
+                                } else {
+                                    Err(io::ErrorKind::InvalidData)
+                                }
+                            }
+                            _ => Err(io::ErrorKind::InvalidData),
+                        }
+                    } else if available.len() > max_hex {
+                        Err(io::ErrorKind::InvalidData)
+                    } else {
+                        match parse_hex_chunk_digits(value, digits, available) {
+                            Some((new_value, new_digits)) => Ok((
+                                available.len(),
+                                Framing::Size {
+                                    value: new_value,
+                                    digits: new_digits,
+                                    cr: false,
+                                },
+                            )),
+                            None => Err(io::ErrorKind::InvalidData),
+                        }
+                    }
+                }
+                Framing::DataCr if available.starts_with(b"\r\n") => Ok((
+                    2,
+                    Framing::Size {
+                        value: 0,
+                        digits: 0,
+                        cr: false,
+                    },
+                )),
+                Framing::EndCr if available.starts_with(b"\r\n") => Ok((2, Framing::Complete)),
+                _ => {
+                    let byte = available[0];
+                    match current_framing {
+                        Framing::Size {
+                            value,
+                            digits: _,
+                            cr: true,
+                        } if byte == b'\n' => {
+                            if value > remaining_budget {
+                                Err(io::ErrorKind::InvalidData)
+                            } else if value == 0 {
+                                Ok((1, Framing::EndCr))
+                            } else {
+                                Ok((1, Framing::Data(value)))
+                            }
+                        }
+                        Framing::DataCr if byte == b'\r' => Ok((1, Framing::DataLf)),
+                        Framing::DataLf if byte == b'\n' => Ok((
+                            1,
+                            Framing::Size {
+                                value: 0,
+                                digits: 0,
+                                cr: false,
+                            },
+                        )),
+                        Framing::EndCr if byte == b'\r' => Ok((1, Framing::EndLf)),
+                        Framing::EndLf if byte == b'\n' => Ok((1, Framing::Complete)),
+                        _ => Err(io::ErrorKind::InvalidData),
+                    }
+                }
+            };
+            let Ok((consumed, next_framing)) = step else {
+                return this.fail(io::ErrorKind::InvalidData);
+            };
             let Some(reader) = this.reader.as_mut() else {
                 return this.fail(io::ErrorKind::InvalidData);
             };
-            Pin::new(reader).consume(1);
-            this.metadata_bytes += 1;
+            this.metadata_bytes += consumed;
             if this.metadata_bytes > MAX_CHUNK_METADATA_BYTES {
                 return this.fail(io::ErrorKind::InvalidData);
             }
-            this.framing = match this.framing {
-                Framing::Size {
-                    value,
-                    digits: _,
-                    cr: true,
-                } if byte == b'\n' => {
-                    if value > this.remaining_budget {
-                        return this.fail(io::ErrorKind::InvalidData);
-                    }
-                    if value == 0 {
-                        Framing::EndCr
-                    } else {
-                        Framing::Data(value)
-                    }
-                }
-                Framing::Size {
-                    value,
-                    digits,
-                    cr: false,
-                } if byte == b'\r' && digits > 0 => Framing::Size {
-                    value,
-                    digits,
-                    cr: true,
-                },
-                Framing::Size {
-                    value,
-                    digits,
-                    cr: false,
-                } if byte.is_ascii_hexdigit() && digits + 3 <= MAX_CHUNK_LINE_BYTES => {
-                    let Some(digit) = char::from(byte).to_digit(16) else {
-                        return this.fail(io::ErrorKind::InvalidData);
-                    };
-                    let Some(value) = value
-                        .checked_mul(16)
-                        .and_then(|n| usize::try_from(digit).ok().and_then(|d| n.checked_add(d)))
-                    else {
-                        return this.fail(io::ErrorKind::InvalidData);
-                    };
-                    Framing::Size {
-                        value,
-                        digits: digits + 1,
-                        cr: false,
-                    }
-                }
-                Framing::DataCr if byte == b'\r' => Framing::DataLf,
-                Framing::DataLf if byte == b'\n' => Framing::Size {
-                    value: 0,
-                    digits: 0,
-                    cr: false,
-                },
-                Framing::EndCr if byte == b'\r' => Framing::EndLf,
-                Framing::EndLf if byte == b'\n' => Framing::Complete,
-                _ => return this.fail(io::ErrorKind::InvalidData),
-            };
+            Pin::new(reader).consume(consumed);
+            this.framing = next_framing;
         }
         cx.waker().wake_by_ref();
         Poll::Pending
     }
+}
+
+fn parse_hex_chunk_digits(
+    mut value: usize,
+    mut digits: usize,
+    bytes: &[u8],
+) -> Option<(usize, usize)> {
+    for &byte in bytes {
+        let digit = char::from(byte).to_digit(16)?;
+        value = value
+            .checked_mul(16)
+            .and_then(|n| usize::try_from(digit).ok().and_then(|d| n.checked_add(d)))?;
+        digits += 1;
+    }
+    Some((value, digits))
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for BackendBody<S> {

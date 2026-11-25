@@ -250,7 +250,8 @@ impl LocalChatService {
         Ok(Self {
             listener,
             policy: RequestPolicy::new(port, frontend_key)
-                .map_err(|_| ServiceError::Configuration)?,
+                .map_err(|_| ServiceError::Configuration)?
+                .with_shared_image_cache(std::sync::Arc::new(crate::ValidatedImageCache::new())),
             backend,
             gate,
             port,
@@ -823,6 +824,46 @@ mod tests {
             })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "service test timed out"))?
+        })
+    }
+
+    #[test]
+    fn service_shares_bounded_image_digest_cache_across_turns() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let backend_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            let backend_port = backend_listener.local_addr()?.port();
+            let mut service = LocalChatService::bind(0, &"a".repeat(64), backend_port, &"b".repeat(64), 1)
+                .await
+                .map_err(|error| io::Error::other(format!("bind failed: {error:?}")))?;
+            service.enable_vision();
+            let body = br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}]}]}"#;
+            let head = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header("host", format!("127.0.0.1:{}", service.port()))
+                .header("authorization", format!("Bearer {}", "a".repeat(64)))
+                .header("content-type", "application/json")
+                .header("content-length", body.len().to_string())
+                .body(())
+                .map_err(io::Error::other)?
+                .into_parts()
+                .0;
+            service
+                .policy
+                .check_head(&head)
+                .and_then(|authorized| authorized.prepare(body))
+                .map_err(|error| io::Error::other(format!("turn 1 failed: {error:?}")))?;
+            service
+                .policy
+                .check_head(&head)
+                .and_then(|authorized| authorized.prepare(body))
+                .map_err(|error| io::Error::other(format!("turn 2 failed: {error:?}")))?;
+            #[cfg(windows)]
+            assert_eq!(service.policy.validated_image_cache_len(), 1);
+            Ok(())
         })
     }
 }

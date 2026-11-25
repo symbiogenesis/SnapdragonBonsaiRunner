@@ -43,10 +43,120 @@ mod json_candidate_parser;
 
 use http::{HeaderMap, HeaderValue, Method, Version, request::Parts, uri::PathAndQuery};
 use serde::{Deserialize, Deserializer, Serialize, de};
-use std::{borrow::Cow, fmt, marker::PhantomData};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::VecDeque,
+    fmt,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
 use subtle::ConstantTimeEq;
 
 mod chat_controls;
+
+const IMAGE_VALIDATION_CACHE_CAPACITY: usize = 64;
+
+#[derive(Default)]
+pub(crate) struct ValidatedImageCache(Mutex<VecDeque<[u8; 32]>>);
+
+impl ValidatedImageCache {
+    pub(crate) fn new() -> Self {
+        Self(Mutex::new(VecDeque::new()))
+    }
+
+    fn contains_and_touch(&self, digest: &[u8; 32]) -> bool {
+        let Ok(mut order) = self.0.lock() else {
+            return false;
+        };
+        let Some(pos) = order.iter().position(|entry| entry == digest) else {
+            return false;
+        };
+        if pos + 1 != order.len()
+            && let Some(found) = order.remove(pos)
+        {
+            order.push_back(found);
+        }
+        true
+    }
+
+    fn insert(&self, digest: [u8; 32]) {
+        let Ok(mut order) = self.0.lock() else {
+            return;
+        };
+        if let Some(pos) = order.iter().position(|entry| entry == &digest) {
+            if pos + 1 != order.len()
+                && let Some(found) = order.remove(pos)
+            {
+                order.push_back(found);
+            }
+            return;
+        }
+        if order.len() >= IMAGE_VALIDATION_CACHE_CAPACITY {
+            order.pop_front();
+        }
+        order.push_back(digest);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().map(|order| order.len()).unwrap_or(0)
+    }
+}
+
+thread_local! {
+    static ACTIVE_IMAGE_CACHE: RefCell<Option<Arc<ValidatedImageCache>>> =
+        const { RefCell::new(None) };
+}
+
+struct ActiveImageCacheGuard {
+    active: bool,
+    previous: Option<Arc<ValidatedImageCache>>,
+}
+
+impl ActiveImageCacheGuard {
+    fn enter(cache: Option<&Arc<ValidatedImageCache>>) -> Self {
+        let Some(cache) = cache else {
+            return Self {
+                active: false,
+                previous: None,
+            };
+        };
+        let previous = ACTIVE_IMAGE_CACHE.with(|slot| {
+            slot.try_borrow_mut()
+                .ok()
+                .and_then(|mut guard| guard.replace(Arc::clone(cache)))
+        });
+        Self {
+            active: true,
+            previous,
+        }
+    }
+}
+
+impl Drop for ActiveImageCacheGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let previous = self.previous.take();
+        ACTIVE_IMAGE_CACHE.with(|slot| {
+            if let Ok(mut guard) = slot.try_borrow_mut() {
+                *guard = previous;
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+fn image_url_sha256(url: &str) -> Option<[u8; 32]> {
+    bonsai_windows_credentials::Sha256::digest_bytes(url.as_bytes()).ok()
+}
+
+#[cfg(not(windows))]
+const fn image_url_sha256(_url: &str) -> Option<[u8; 32]> {
+    None
+}
 
 /// Largest accepted client or canonical backend request body in bytes.
 ///
@@ -149,6 +259,7 @@ pub struct RequestPolicy {
     context_tokens: usize,
     pub(crate) vision: bool,
     pub(crate) cognitive_controls: bool,
+    image_cache: Option<Arc<ValidatedImageCache>>,
 }
 
 impl Drop for RequestPolicy {
@@ -204,7 +315,18 @@ impl RequestPolicy {
             context_tokens: CONTEXT_TOKENS,
             vision: false,
             cognitive_controls: false,
+            image_cache: Some(Arc::new(ValidatedImageCache::new())),
         })
+    }
+
+    pub(crate) fn with_shared_image_cache(mut self, cache: Arc<ValidatedImageCache>) -> Self {
+        self.image_cache = Some(cache);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validated_image_cache_len(&self) -> usize {
+        self.image_cache.as_ref().map_or(0, |cache| cache.len())
     }
 
     /// Construct a policy for an already selected and verified model context.
@@ -361,6 +483,7 @@ impl RequestPolicy {
             context_tokens: self.context_tokens,
             vision: self.vision,
             cognitive_controls: self.cognitive_controls,
+            image_cache: self.image_cache.as_ref().map(Arc::clone),
         })
     }
 }
@@ -454,6 +577,7 @@ pub struct AuthorizedHead {
     context_tokens: usize,
     vision: bool,
     cognitive_controls: bool,
+    image_cache: Option<Arc<ValidatedImageCache>>,
 }
 
 impl AuthorizedHead {
@@ -466,8 +590,10 @@ impl AuthorizedHead {
         self.check_body_size(body)?;
         // Deserialize directly: maps/Value would silently erase duplicate keys.
         // Parser error strings can include private values; never propagate them.
-        let Object(chat): Object<ClientChat<'_>> =
-            serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?;
+        let Object(chat): Object<ClientChat<'_>> = {
+            let _guard = ActiveImageCacheGuard::enter(self.image_cache.as_ref());
+            serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?
+        };
         self.prepare_chat(&chat)
     }
 
@@ -886,16 +1012,13 @@ const fn base64_sextet(byte: u8) -> Option<u8> {
     }
 }
 
-fn validate_image_data_url(url: &str) -> bool {
-    let Some(encoded) = url
+fn validate_image_data_url_parts(url: &str) -> Option<(&[u8], usize)> {
+    let encoded = url
         .strip_prefix("data:image/png;base64,")
-        .or_else(|| url.strip_prefix("data:image/jpeg;base64,"))
-    else {
-        return false;
-    };
+        .or_else(|| url.strip_prefix("data:image/jpeg;base64,"))?;
     let bytes = encoded.as_bytes();
     if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
-        return false;
+        return None;
     }
     let pad = if bytes.ends_with(b"==") {
         2
@@ -904,6 +1027,13 @@ fn validate_image_data_url(url: &str) -> bool {
     } else {
         0
     };
+    let decoded = (bytes.len() / 4) * 3 - pad;
+    (1..=MAX_IMAGE_DATA_BYTES)
+        .contains(&decoded)
+        .then_some((bytes, pad))
+}
+
+fn validate_image_data_url_body(bytes: &[u8], pad: usize) -> bool {
     let core = &bytes[..bytes.len() - pad];
     if core.iter().any(|&byte| base64_sextet(byte).is_none()) {
         return false;
@@ -917,8 +1047,37 @@ fn validate_image_data_url(url: &str) -> bool {
             return false;
         }
     }
-    let decoded = (bytes.len() / 4) * 3 - pad;
-    (1..=MAX_IMAGE_DATA_BYTES).contains(&decoded)
+    true
+}
+
+#[cfg(test)]
+fn validate_image_data_url(url: &str) -> bool {
+    validate_image_data_url_parts(url).is_some_and(|(bytes, pad)| validate_image_data_url_body(bytes, pad))
+}
+
+fn validate_image_data_url_cached(url: &str, cache: Option<&ValidatedImageCache>) -> bool {
+    let Some((bytes, pad)) = validate_image_data_url_parts(url) else {
+        return false;
+    };
+    if let Some(cache) = cache
+        && let Some(digest) = image_url_sha256(url)
+    {
+        if cache.contains_and_touch(&digest) {
+            return true;
+        }
+        if !validate_image_data_url_body(bytes, pad) {
+            return false;
+        }
+        cache.insert(digest);
+        return true;
+    }
+    validate_image_data_url_body(bytes, pad)
+}
+
+fn validate_image_data_url_in_active_scope(url: &str) -> bool {
+    let cache = ACTIVE_IMAGE_CACHE
+        .with(|slot| slot.try_borrow().ok().and_then(|guard| guard.as_ref().map(Arc::clone)));
+    validate_image_data_url_cached(url, cache.as_deref())
 }
 
 fn deserialize_content<'de, D: Deserializer<'de>>(
@@ -973,7 +1132,7 @@ fn deserialize_content<'de, D: Deserializer<'de>>(
                         let Some(Object(RawImageUrl { url })) = part.image_url else {
                             return Err(de::Error::custom("missing image_url field"));
                         };
-                        if !validate_image_data_url(&url) {
+                        if !validate_image_data_url_in_active_scope(&url) {
                             return Err(de::Error::custom("unsupported image data URL"));
                         }
                         has_image = true;
@@ -1317,6 +1476,7 @@ impl AuthorizedHead {
             context_tokens: CONTEXT_TOKENS,
             vision: false,
             cognitive_controls: false,
+            image_cache: None,
         }
     }
 
@@ -1645,6 +1805,69 @@ mod tests {
                 Some(Rejection::ChatSchema)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn multimodal_image_digest_cache_accelerates_repeats_rejects_invalid_and_bounds_lru()
+    -> Result<(), super::Rejection> {
+        use super::{
+            IMAGE_VALIDATION_CACHE_CAPACITY, Rejection, RequestPolicy, ValidatedImageCache,
+        };
+
+        let cache = ValidatedImageCache::new();
+        for i in 0..IMAGE_VALIDATION_CACHE_CAPACITY {
+            let mut digest = [0_u8; 32];
+            let index = u64::try_from(i).map_err(|_| Rejection::Configuration)?;
+            digest[0..8].copy_from_slice(&index.to_le_bytes());
+            cache.insert(digest);
+        }
+        assert_eq!(cache.len(), IMAGE_VALIDATION_CACHE_CAPACITY);
+
+        let mut oldest = [0_u8; 32];
+        oldest[0..8].copy_from_slice(&0_u64.to_le_bytes());
+        assert!(cache.contains_and_touch(&oldest));
+
+        let mut newest = [0_u8; 32];
+        let newest_index =
+            u64::try_from(IMAGE_VALIDATION_CACHE_CAPACITY).map_err(|_| Rejection::Configuration)?;
+        newest[0..8].copy_from_slice(&newest_index.to_le_bytes());
+        cache.insert(newest);
+        assert_eq!(cache.len(), IMAGE_VALIDATION_CACHE_CAPACITY);
+        assert!(cache.contains_and_touch(&oldest));
+
+        let mut evicted = [0_u8; 32];
+        evicted[0..8].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(!cache.contains_and_touch(&evicted));
+
+        let key = "b".repeat(64);
+        let policy = RequestPolicy::new(8080, &key)?.with_vision(true);
+        let valid_turn1 = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,eA=="}}]}]}"#;
+        let valid_turn2 = br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,eA=="}}]},{"role":"assistant","content":"ok"},{"role":"user","content":"next"}]}"#;
+        let invalid_turn = br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA!"}}]}]}"#;
+        let head = |len: usize| {
+            http::Request::builder()
+                .method(http::Method::POST)
+                .uri("/v1/chat/completions")
+                .header("host", "127.0.0.1:8080")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .header("content-length", len.to_string())
+                .body(())
+                .map_err(|_| Rejection::Configuration)
+                .map(|request| request.into_parts().0)
+        };
+        policy.check_head(&head(valid_turn1.len())?)?.prepare(valid_turn1)?;
+        policy.check_head(&head(valid_turn2.len())?)?.prepare(valid_turn2)?;
+        assert_eq!(
+            policy
+                .check_head(&head(invalid_turn.len())?)?
+                .prepare(invalid_turn)
+                .err(),
+            Some(Rejection::ChatSchema)
+        );
+        #[cfg(windows)]
+        assert_eq!(policy.validated_image_cache_len(), 1);
         Ok(())
     }
 }

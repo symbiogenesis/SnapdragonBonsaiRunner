@@ -219,3 +219,65 @@ fn borrowed_payloads_exclude_framing_and_interoperate_with_direct_reads() -> io:
         Ok(())
     })
 }
+
+#[test]
+fn chunk_header_slice_scan_matches_line_bounds_and_handles_fragmentation() -> io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async {
+        // Exact MAX_CHUNK_LINE_BYTES (30 hex digits + CRLF = 32 bytes), fragmented payload/CRLF.
+        let exact_line = b"000000000000000000000000000005\r\nhello\r\n0\r\n\r\n";
+        let mut body = BackendBody {
+            reader: Some(BufReader::with_capacity(
+                31,
+                io::Cursor::new(exact_line.to_vec()),
+            )),
+            framing: Framing::Size {
+                value: 0,
+                digits: 0,
+                cr: false,
+            },
+            remaining_budget: MAX_RESPONSE_BYTES,
+            metadata_bytes: 0,
+            deadline: (Instant::now() + Duration::from_mins(1)).into(),
+            timer: Some(Box::pin(tokio::time::sleep_until(
+                Instant::now() + Duration::from_mins(1),
+            ))),
+        };
+        let mut out = Vec::new();
+        body.read_to_end(&mut out).await?;
+        assert_eq!(out, b"hello");
+
+        // Reject 31-digit chunk line, bad hex, empty chunk line, and bad CR follower.
+        for bad in [
+            b"0000000000000000000000000000005\r\nhello\r\n0\r\n\r\n".as_slice(),
+            b"1g\r\na\r\n0\r\n\r\n",
+            b"\r\n0\r\n\r\n",
+            b"1\rXa\r\n0\r\n\r\n",
+        ] {
+            let mut body = BackendBody {
+                reader: Some(BufReader::new(io::Cursor::new(bad.to_vec()))),
+                framing: Framing::Size {
+                    value: 0,
+                    digits: 0,
+                    cr: false,
+                },
+                remaining_budget: MAX_RESPONSE_BYTES,
+                metadata_bytes: 0,
+                deadline: (Instant::now() + Duration::from_mins(1)).into(),
+                timer: Some(Box::pin(tokio::time::sleep_until(
+                    Instant::now() + Duration::from_mins(1),
+                ))),
+            };
+            let mut out = Vec::new();
+            let err = body
+                .read_to_end(&mut out)
+                .await
+                .err()
+                .ok_or_else(|| io::Error::other("Malformed chunked wire accepted."))?;
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+        Ok(())
+    })
+}

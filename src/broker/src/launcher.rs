@@ -2941,14 +2941,22 @@ async fn exchange_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     path: &str,
     key: Option<&str>,
 ) -> io::Result<Vec<u8>> {
-    let head = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
-    stream.write_all(head.as_bytes()).await?;
+    let key_bytes = key.map_or(0, |secret| "Authorization: Bearer \r\n".len() + secret.len());
+    let mut request = String::with_capacity(64 + path.len() + key_bytes);
+    let _ = std::fmt::Write::write_fmt(
+        &mut request,
+        format_args!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"),
+    );
     if let Some(key) = key {
-        stream.write_all(b"Authorization: Bearer ").await?;
-        stream.write_all(key.as_bytes()).await?;
-        stream.write_all(b"\r\n").await?;
+        request.push_str("Authorization: Bearer ");
+        request.push_str(key);
+        request.push_str("\r\n");
     }
-    stream.write_all(b"Connection: close\r\n\r\n").await?;
+    request.push_str("Connection: close\r\n\r\n");
+    let mut request = request.into_bytes();
+    let write_result = stream.write_all(&request).await;
+    crate::scrub_bytes(&mut request);
+    write_result?;
     stream.flush().await?;
     let mut bytes = Vec::with_capacity(1024);
     stream
@@ -2972,6 +2980,7 @@ async fn exchange(
     };
     check_owner()?;
     let stream = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
+    stream.set_nodelay(true)?;
     check_owner()?;
     exchange_http(stream, port, path, key).await
 }
@@ -6106,5 +6115,86 @@ mod tests {
             assert_eq!(readonly.contains(&htp_so), expects_hexagon);
         }
         Ok(())
+    }
+
+    #[test]
+    fn readiness_probe_coalesces_request_head_into_single_write() -> std::io::Result<()> {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        struct ProbeStream {
+            written: Vec<u8>,
+            write_calls: usize,
+            flush_calls: usize,
+            response: std::io::Cursor<Vec<u8>>,
+        }
+
+        impl AsyncRead for ProbeStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let n = std::io::Read::read(&mut self.response, buf.initialize_unfilled())?;
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for ProbeStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.write_calls += 1;
+                self.written.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                self.flush_calls += 1;
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            for key in [None, Some("0123456789abcdef")] {
+                let mut stream = ProbeStream {
+                    written: Vec::new(),
+                    write_calls: 0,
+                    flush_calls: 0,
+                    response: std::io::Cursor::new(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}"
+                            .to_vec(),
+                    ),
+                };
+                let reply = super::exchange_http(&mut stream, 8192, "/health", key).await?;
+                assert!(reply.ends_with(b"{\"status\":\"ok\"}"));
+                assert_eq!(stream.write_calls, 1);
+                assert_eq!(stream.flush_calls, 1);
+                let expected = match key {
+                    Some(secret) => format!(
+                        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:8192\r\nAuthorization: Bearer {secret}\r\nConnection: close\r\n\r\n"
+                    ),
+                    None => {
+                        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:8192\r\nConnection: close\r\n\r\n"
+                            .to_owned()
+                    }
+                };
+                assert_eq!(stream.written, expected.as_bytes());
+            }
+            Ok(())
+        })
     }
 }
