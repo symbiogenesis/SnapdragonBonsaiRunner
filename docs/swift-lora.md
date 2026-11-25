@@ -7,10 +7,12 @@ Orca (`bonsai-abliterate-lora.gguf`) was authored from original Ternary Bonsai 2
 channel ordering unresolved (`prism.hadamard.gdn_v_grouped=true`), and Bonsai 2.5 +
 DaisyRose Orca-free produced `0` unwanted refusals across `DR-G2` captures.
 
-`bonsai-tools chat --use-abliterate-lora` (`Start-Chat.ps1 -UseAbliterateLora`) remains
+`bonsai-tools chat --use-abliterate-lora` (`Start-Chat.ps1 -AbliterateLora on`) remains
 available as an explicit Orca opt-in on Bonsai 2.5 (defaulting to scale **1.3** when
 enabled), while explicit `Swift-Bonsai-2-PQ2_0` rollback (`--use-original-pq2` or
-`--publisher-engine`) retains Orca `1.3` with `--no-abliterate-lora` opt-out. When
+`--publisher-engine`) retains Orca `1.3` with `--no-abliterate-lora`
+(`Start-Chat.ps1 -AbliterateLora off`) opt-out; `Start-Chat.ps1` defaults to
+`-AbliterateLora auto`, delegating the default to the selected model/engine profile. When
 Orca is active, Settings accepts `0` to `2` in `0.1` steps for the next response and
 every Extra effort pass without reloading weights; `0.0` disables the correction while
 retaining the loaded adapter. The broker exposes an explicit development option; no local
