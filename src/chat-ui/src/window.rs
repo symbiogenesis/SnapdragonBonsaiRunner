@@ -828,11 +828,9 @@ impl State {
             .unwrap_or(4096);
         let (wire_text, images) =
             crate::attachment_import::format_user_turn(&text, &self.draft_attachments);
-        let system_appendix = self
-            .memory
-            .resolve(&self.committed, &wire_text)
-            .appendix
-            .map(std::sync::Arc::<str>::from);
+        let memory = self.memory.resolve(&self.committed, &wire_text);
+        let system_appendix = memory.pinned_appendix.map(std::sync::Arc::<str>::from);
+        let turn_appendix = memory.triggered_appendix.map(std::sync::Arc::<str>::from);
         self.daisyrose_customized = true;
         if self
             .commands
@@ -846,6 +844,7 @@ impl State {
                 daisyrose_scale: self.effective_daisyrose_scale(),
                 cognitive: self.cognitive,
                 system_appendix,
+                turn_appendix,
             })
             .is_err()
         {

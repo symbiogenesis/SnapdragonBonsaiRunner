@@ -164,7 +164,10 @@ pub(crate) struct CardReport {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ResolvedMemory {
-    pub(crate) appendix: Option<String>,
+    /// Persistent instructions and pinned cards kept immutable in the system prompt.
+    pub(crate) pinned_appendix: Option<String>,
+    /// Keyword-triggered cards attached only to the current user turn on the wire.
+    pub(crate) triggered_appendix: Option<String>,
     pub(crate) estimated_tokens: usize,
     pub(crate) instructions_included: bool,
     pub(crate) instructions_rejected_control: bool,
@@ -313,7 +316,8 @@ impl MemoryStore {
             ],
             ..ResolvedMemory::default()
         };
-        let mut sections: Vec<String> = Vec::new();
+        let mut pinned_sections: Vec<String> = Vec::new();
+        let mut triggered_sections: Vec<String> = Vec::new();
         let mut used_tokens = 0_usize;
 
         let instr = self.persistent_instructions.trim();
@@ -325,7 +329,7 @@ impl MemoryStore {
                 let cost = crate::context::text_tokens(&section);
                 if used_tokens.saturating_add(cost) <= self.token_budget {
                     used_tokens = used_tokens.saturating_add(cost);
-                    sections.push(section);
+                    pinned_sections.push(section);
                     resolved.instructions_included = true;
                 } else {
                     resolved.instructions_rejected_budget = true;
@@ -359,7 +363,7 @@ impl MemoryStore {
                 let cost = crate::context::text_tokens(&section);
                 if used_tokens.saturating_add(cost) <= self.token_budget {
                     used_tokens = used_tokens.saturating_add(cost);
-                    sections.push(section);
+                    pinned_sections.push(section);
                     CardDecision::IncludedPinned
                 } else {
                     CardDecision::SkippedBudgetExceeded
@@ -373,7 +377,7 @@ impl MemoryStore {
                 let cost = crate::context::text_tokens(&section);
                 if used_tokens.saturating_add(cost) <= self.token_budget {
                     used_tokens = used_tokens.saturating_add(cost);
-                    sections.push(section);
+                    triggered_sections.push(section);
                     CardDecision::IncludedMatched(matched.clone())
                 } else {
                     CardDecision::SkippedBudgetExceeded
@@ -388,11 +392,22 @@ impl MemoryStore {
             };
         }
 
-        if !sections.is_empty() {
-            let joined = sections.join("\n\n");
-            resolved.estimated_tokens = crate::context::text_tokens(&joined);
-            resolved.appendix = Some(joined);
+        if !pinned_sections.is_empty() {
+            resolved.pinned_appendix = Some(pinned_sections.join("\n\n"));
         }
+        if !triggered_sections.is_empty() {
+            resolved.triggered_appendix = Some(triggered_sections.join("\n\n"));
+        }
+        resolved.estimated_tokens = resolved
+            .pinned_appendix
+            .as_deref()
+            .map_or(0, crate::context::text_tokens)
+            .saturating_add(
+                resolved
+                    .triggered_appendix
+                    .as_deref()
+                    .map_or(0, crate::context::text_tokens),
+            );
         resolved
     }
 }
@@ -417,7 +432,8 @@ mod tests {
         assert!(store.valid());
         assert!(store.is_default_empty());
         let resolved = store.resolve(&[user_msg("hello")], "draft");
-        assert_eq!(resolved.appendix, None);
+        assert_eq!(resolved.pinned_appendix, None);
+        assert_eq!(resolved.triggered_appendix, None);
         assert_eq!(resolved.estimated_tokens, 0);
         assert!(!resolved.instructions_included);
     }
@@ -443,20 +459,21 @@ mod tests {
 
         // "trustworthy" must NOT match "Rust"
         let no_match = store.resolve(&[user_msg("A trustworthy tool")], "");
-        let appendix = no_match.appendix.as_deref().unwrap_or_default();
-        assert!(appendix.contains("Always verify units."));
-        assert!(appendix.contains("[Context: PinCard]"));
-        assert!(!appendix.contains("[Context: TrigCard]"));
+        let pinned = no_match.pinned_appendix.as_deref().unwrap_or_default();
+        assert!(pinned.contains("Always verify units."));
+        assert!(pinned.contains("[Context: PinCard]"));
+        assert!(!pinned.contains("[Context: TrigCard]"));
+        assert_eq!(no_match.triggered_appendix, None);
         assert_eq!(no_match.reports[0].decision, CardDecision::SkippedNoMatch);
         assert_eq!(no_match.reports[1].decision, CardDecision::IncludedPinned);
 
-        // Case-insensitive boundary match for "straße" & verify pinned comes BEFORE triggered!
+        // Case-insensitive boundary match for "straße" keeps pinned appendix identical
+        // and routes the dynamic triggered card separately to the turn tail.
         let matched = store.resolve(&[], "Review STRASSE layout");
-        let appendix2 = matched.appendix.as_deref().unwrap_or_default();
-        let pin_pos = appendix2.find("[Context: PinCard]");
-        let trig_pos = appendix2.find("[Context: TrigCard]");
-        assert!(pin_pos.is_some() && trig_pos.is_some());
-        assert!(pin_pos < trig_pos);
+        assert_eq!(matched.pinned_appendix, no_match.pinned_appendix);
+        let triggered = matched.triggered_appendix.as_deref().unwrap_or_default();
+        assert!(!triggered.contains("[Context: PinCard]"));
+        assert!(triggered.contains("[Context: TrigCard]"));
         assert!(matches!(
             matched.reports[0].decision,
             CardDecision::IncludedMatched(ref trig) if trig == "Straße"
@@ -469,6 +486,7 @@ mod tests {
                 .is_ok()
         );
         let budgeted = store.resolve(&[], "trigger");
+        assert_eq!(budgeted.pinned_appendix, no_match.pinned_appendix);
         assert!(budgeted.estimated_tokens <= MIN_TOKEN_BUDGET + 16);
         assert_eq!(
             budgeted.reports[2].decision,
@@ -495,7 +513,8 @@ mod tests {
         });
         store.next_card_id = 1;
         let resolved = store.resolve(&[], "x");
-        assert_eq!(resolved.appendix, None);
+        assert_eq!(resolved.pinned_appendix, None);
+        assert_eq!(resolved.triggered_appendix, None);
         assert!(resolved.instructions_rejected_control);
         assert_eq!(
             resolved.reports[0].decision,

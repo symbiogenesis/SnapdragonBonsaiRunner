@@ -218,6 +218,7 @@ impl DaisyRoseReadiness {
 pub(crate) enum KvCache {
     F16,
     Rsq4,
+    Rsq4Kvf,
     Rsq4K3v,
 }
 
@@ -226,6 +227,7 @@ impl KvCache {
         match self {
             Self::F16 => "f16",
             Self::Rsq4 => "rsq4",
+            Self::Rsq4Kvf => "rsq4kvf",
             Self::Rsq4K3v => "rsq4k3v",
         }
     }
@@ -234,6 +236,7 @@ impl KvCache {
         match value {
             "f16" => Some(Self::F16),
             "rsq4" => Some(Self::Rsq4),
+            "rsq4kvf" => Some(Self::Rsq4Kvf),
             "rsq4k3v" => Some(Self::Rsq4K3v),
             _ => None,
         }
@@ -244,6 +247,8 @@ impl KvCache {
 pub(crate) enum Placement {
     Auto,
     Cpu,
+    Vulkan,
+    Composite,
 }
 
 impl Placement {
@@ -251,6 +256,8 @@ impl Placement {
         match self {
             Self::Auto => "auto",
             Self::Cpu => "cpu",
+            Self::Vulkan => "vulkan",
+            Self::Composite => "composite",
         }
     }
 
@@ -258,6 +265,8 @@ impl Placement {
         match value {
             "auto" => Some(Self::Auto),
             "cpu" => Some(Self::Cpu),
+            "vulkan" => Some(Self::Vulkan),
+            "composite" => Some(Self::Composite),
             _ => None,
         }
     }
@@ -567,6 +576,7 @@ pub(crate) enum Command {
         daisyrose_scale: f32,
         cognitive: CognitiveOptions,
         system_appendix: Option<Arc<str>>,
+        turn_appendix: Option<Arc<str>>,
     },
     NewChat,
     RestoreChat(Vec<Message>),
@@ -719,7 +729,25 @@ enum WireContentPart<'a> {
     ImageUrl { image_url: WireImageUrl<'a> },
 }
 
-struct WireContent<'a>(&'a Message);
+struct WireContent<'a> {
+    message: &'a Message,
+    turn_appendix: Option<&'a str>,
+}
+
+fn combined_turn_text<'a>(content: &'a str, turn_appendix: Option<&'a str>) -> Cow<'a, str> {
+    let Some(appendix) = turn_appendix.filter(|text| !text.is_empty()) else {
+        return Cow::Borrowed(content);
+    };
+    if content.is_empty() {
+        Cow::Borrowed(appendix)
+    } else {
+        let mut combined = String::with_capacity(appendix.len() + 2 + content.len());
+        combined.push_str(appendix);
+        combined.push_str("\n\n");
+        combined.push_str(content);
+        Cow::Owned(combined)
+    }
+}
 
 impl Serialize for WireContent<'_> {
     fn serialize<S: serde::Serializer>(
@@ -727,20 +755,21 @@ impl Serialize for WireContent<'_> {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq as _;
-        if self.0.images.is_empty() {
-            return serializer.serialize_str(self.0.content.as_ref());
+        let text = combined_turn_text(self.message.content.as_ref(), self.turn_appendix);
+        if self.message.images.is_empty() {
+            return serializer.serialize_str(text.as_ref());
         }
-        let has_text = !self.0.content.is_empty();
-        let len = self.0.images.len().saturating_add(usize::from(has_text));
+        let has_text = !text.is_empty();
+        let len = self.message.images.len().saturating_add(usize::from(has_text));
         let mut seq = serializer.serialize_seq(Some(len))?;
-        for url in self.0.images.iter() {
+        for url in self.message.images.iter() {
             seq.serialize_element(&WireContentPart::ImageUrl {
                 image_url: WireImageUrl { url: url.as_ref() },
             })?;
         }
         if has_text {
             seq.serialize_element(&WireContentPart::Text {
-                text: self.0.content.as_ref(),
+                text: text.as_ref(),
             })?;
         }
         seq.end()
@@ -755,7 +784,11 @@ struct WireMessage<'a> {
     reasoning_content: Option<&'a str>,
 }
 
-struct RequestMessages<'a>(&'a [Message], Option<&'a str>);
+struct RequestMessages<'a> {
+    history: &'a [Message],
+    system_appendix: Option<&'a str>,
+    turn_appendix: Option<&'a str>,
+}
 
 impl Serialize for RequestMessages<'_> {
     fn serialize<S: serde::Serializer>(
@@ -763,12 +796,23 @@ impl Serialize for RequestMessages<'_> {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq as _;
-        let mut seq = serializer.serialize_seq(Some(self.0.len().saturating_add(1)))?;
-        seq.serialize_element(&SystemMessageRef(self.1))?;
-        for message in self.0 {
+        let mut seq = serializer.serialize_seq(Some(self.history.len().saturating_add(1)))?;
+        seq.serialize_element(&SystemMessageRef(self.system_appendix))?;
+        let last_user_index = self
+            .history
+            .len()
+            .checked_sub(1)
+            .filter(|&index| self.history[index].role == "user");
+        for (index, message) in self.history.iter().enumerate() {
+            let turn_appendix = (Some(index) == last_user_index)
+                .then_some(self.turn_appendix)
+                .flatten();
             seq.serialize_element(&WireMessage {
                 role: message.role,
-                content: WireContent(message),
+                content: WireContent {
+                    message,
+                    turn_appendix,
+                },
                 reasoning_content: message.reasoning_content.as_deref(),
             })?;
         }
@@ -828,6 +872,7 @@ struct ResponseOptions {
     cognitive_controls: bool,
     reset_on_cancel: bool,
     system_appendix: Option<Arc<str>>,
+    turn_appendix: Option<Arc<str>>,
     request_logprobs: bool,
     temperature_nudge: f32,
 }
@@ -1211,6 +1256,7 @@ fn serve_broker(
                 daisyrose_scale,
                 cognitive,
                 system_appendix,
+                turn_appendix,
             }) => {
                 if text.trim().is_empty() && images.is_empty() {
                     continue;
@@ -1238,6 +1284,7 @@ fn serve_broker(
                     cognitive_controls,
                     reset_on_cancel: config.native_engine,
                     system_appendix,
+                    turn_appendix,
                     request_logprobs: false,
                     temperature_nudge: 0.0,
                 };
@@ -1902,7 +1949,11 @@ fn serialize_request_with_options(
     let cognitive = WireCognitiveFields::from_options(options);
     crate::bounded_json::to_vec(
         &ChatRequest {
-            messages: RequestMessages(history, options.system_appendix.as_deref()),
+            messages: RequestMessages {
+                history,
+                system_appendix: options.system_appendix.as_deref(),
+                turn_appendix: options.turn_appendix.as_deref(),
+            },
             max_completion_tokens: options.max_completion_tokens,
             stream: true,
             enable_thinking: options.enable_thinking,
@@ -2483,6 +2534,7 @@ mod tests {
         config.no_mmproj = false;
         for policy in [
             super::KvCache::Rsq4,
+            super::KvCache::Rsq4Kvf,
             super::KvCache::F16,
             super::KvCache::Rsq4K3v,
         ] {
@@ -2496,20 +2548,37 @@ mod tests {
                 1
             );
         }
+        for placement in [
+            super::Placement::Auto,
+            super::Placement::Cpu,
+            super::Placement::Vulkan,
+            super::Placement::Composite,
+        ] {
+            config.placement = Some(placement);
+            let arguments = runtime_arguments(&config);
+            assert_eq!(
+                arguments
+                    .array_windows::<2>()
+                    .filter(|args| **args == ["--placement", placement.name()])
+                    .count(),
+                1
+            );
+        }
         config.prompt_reuse = super::PromptReuse::PromptEndAndLatest;
         config.prompt_reuse_checkpoints = Some(4);
         config.prompt_reuse_checkpoint_bytes = Some(134_217_728);
         config.cpu_prefill_tokens = Some(16);
-        config.kv_cache = Some(super::KvCache::F16);
+        config.kv_cache = Some(super::KvCache::Rsq4Kvf);
         config.cpu_prefill_gdn = Some(super::CpuPrefillGdn::WyF32);
         config.cpu_family = Some(super::CpuFamily::X2);
-        config.placement = Some(super::Placement::Cpu);
+        config.placement = Some(super::Placement::Vulkan);
         let selected = runtime_arguments(&config);
         for pair in [
             ["--cpu-family", "x2"],
+            ["--kv-cache", "rsq4kvf"],
             ["--cpu-prefill-tokens", "16"],
             ["--cpu-prefill-gdn", "wy-f32"],
-            ["--placement", "cpu"],
+            ["--placement", "vulkan"],
             ["--prompt-reuse", "prompt-end-and-latest"],
             ["--prompt-reuse-checkpoints", "4"],
             ["--prompt-reuse-checkpoint-bytes", "134217728"],
@@ -3650,6 +3719,7 @@ mod tests {
                     daisyrose_scale: super::DEFAULT_DAISYROSE_SCALE,
                     cognitive: super::CognitiveOptions::default(),
                     system_appendix: None,
+                    turn_appendix: None,
                 })
                 .is_ok()
         );
@@ -4106,6 +4176,85 @@ mod tests {
             parsed["messages"][0]["content"]
                 .as_str()
                 .is_some_and(|s| s.ends_with("\n\nPinned card"))
+        );
+
+        let multi_turn = [
+            Message {
+                role: "user",
+                content: "First prompt".into(),
+                reasoning_content: None,
+                images: super::Arc::default(),
+            },
+            Message {
+                role: "assistant",
+                content: "First answer".into(),
+                reasoning_content: None,
+                images: super::Arc::default(),
+            },
+            Message {
+                role: "user",
+                content: "Second prompt".into(),
+                reasoning_content: None,
+                images: super::Arc::default(),
+            },
+        ];
+        let without_trigger = serialize_request_with_options(
+            &multi_turn,
+            &ResponseOptions {
+                max_completion_tokens: 2048,
+                enable_thinking: true,
+                system_appendix: Some("Pinned card".into()),
+                ..ResponseOptions::default()
+            },
+        )?;
+        let with_trigger = serialize_request_with_options(
+            &multi_turn,
+            &ResponseOptions {
+                max_completion_tokens: 2048,
+                enable_thinking: true,
+                system_appendix: Some("Pinned card".into()),
+                turn_appendix: Some("[Context: Rust]\nUse strict types.".into()),
+                ..ResponseOptions::default()
+            },
+        )?;
+        let json_plain: serde_json::Value = serde_json::from_slice(&without_trigger)
+            .map_err(|_| Failure::Message("invalid baseline JSON"))?;
+        let json_trig: serde_json::Value = serde_json::from_slice(&with_trigger)
+            .map_err(|_| Failure::Message("invalid triggered JSON"))?;
+        assert_eq!(json_plain["messages"][0], json_trig["messages"][0]);
+        assert_eq!(json_plain["messages"][1], json_trig["messages"][1]);
+        assert_eq!(json_plain["messages"][2], json_trig["messages"][2]);
+        assert_eq!(
+            json_trig["messages"][3]["content"],
+            "[Context: Rust]\nUse strict types.\n\nSecond prompt"
+        );
+        assert_eq!(multi_turn[2].content.as_ref(), "Second prompt");
+
+        let multimodal_tail = [Message {
+            role: "user",
+            content: "Check screenshot".into(),
+            reasoning_content: None,
+            images: super::Arc::from([super::Arc::from("data:image/png;base64,AAAA")]),
+        }];
+        let multimodal_body = serialize_request_with_options(
+            &multimodal_tail,
+            &ResponseOptions {
+                max_completion_tokens: 2048,
+                enable_thinking: true,
+                system_appendix: Some("Pinned card".into()),
+                turn_appendix: Some("[Context: Vision]\nInspect details.".into()),
+                ..ResponseOptions::default()
+            },
+        )?;
+        let json_mm: serde_json::Value = serde_json::from_slice(&multimodal_body)
+            .map_err(|_| Failure::Message("invalid multimodal trigger JSON"))?;
+        assert_eq!(json_mm["messages"][0], json_plain["messages"][0]);
+        assert_eq!(
+            json_mm["messages"][1]["content"],
+            serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "text", "text": "[Context: Vision]\nInspect details.\n\nCheck screenshot"}
+            ])
         );
         Ok(())
     }

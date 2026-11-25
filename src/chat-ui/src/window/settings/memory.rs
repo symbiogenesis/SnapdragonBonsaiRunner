@@ -19,9 +19,9 @@ impl State {
         let resolved = self.memory.resolve(&self.committed, &self.input);
         ui.label(
             RichText::new(
-                "Persistent instructions and pinned cards stay at the start of the system message \
-                 for prefix cache stability. Triggered cards activate deterministically when \
-                 their keywords appear in the current turn.",
+                "Persistent instructions and pinned cards stay in the system message \
+                 for prefix cache stability. Triggered cards attach to the current user \
+                 turn when their keywords appear.",
             )
             .small()
             .weak(),

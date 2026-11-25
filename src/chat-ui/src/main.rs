@@ -299,7 +299,7 @@ fn configuration_for_family(
                 kv_cache = Some(next_str(
                     &mut args,
                     client::KvCache::from_cli,
-                    "KV cache must be f16, rsq4 or rsq4k3v.",
+                    "KV cache must be f16, rsq4, rsq4kvf or rsq4k3v.",
                 )?);
             }
             Some("--cpu-prefill-tokens") if cpu_prefill_tokens.is_none() => {
@@ -344,7 +344,7 @@ fn configuration_for_family(
                 placement = Some(next_str(
                     &mut args,
                     client::Placement::from_cli,
-                    "Placement must be auto or cpu.",
+                    "Placement must be auto, cpu, vulkan or composite.",
                 )?);
             }
             Some("--broker-path") if broker.is_none() => {
@@ -436,7 +436,7 @@ fn configuration_for_family(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--use-abliterate-lora|--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2|--bonsai-2-5 pq2|ptq1] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--use-abliterate-lora|--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2|--bonsai-2-5 pq2|ptq1] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4kvf|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu|vulkan|composite] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
@@ -472,11 +472,8 @@ fn configuration_for_family(
     if cpu_prefill_gdn.is_some() && (!native_engine || cpu_prefill_tokens.is_none()) {
         return Err("CPU prefill GDN selection requires --native-engine and --cpu-prefill-tokens.");
     }
-    if cpu_prefill_gdn == Some(client::CpuPrefillGdn::WyF32)
-        && kv_cache != Some(client::KvCache::F16)
-    {
-        return Err("CPU prefill GDN wy-f32 requires --kv-cache f16.");
-    }
+    // `wy-f32` supports default `rsq4` (`kv_cache == None`) as well as explicit
+    // `f16`, `rsq4`, `rsq4kvf`, and `rsq4k3v`; broker admission validates the pinned release.
     if (spec_type.is_some() || draft_max.is_some()) && !native_engine {
         return Err("CPU speculative decoding requires --native-engine.");
     }
@@ -991,6 +988,8 @@ mod tests {
         for (name, placement) in [
             ("auto", crate::client::Placement::Auto),
             ("cpu", crate::client::Placement::Cpu),
+            ("vulkan", crate::client::Placement::Vulkan),
+            ("composite", crate::client::Placement::Composite),
         ] {
             let mut selected = args.to_vec();
             selected.extend(["--placement", name].map(OsString::from));
@@ -1009,6 +1008,8 @@ mod tests {
             vec!["--placement", "npu"],
             vec!["--publisher-engine", "--placement", "auto"],
             vec!["--publisher-engine", "--placement", "cpu"],
+            vec!["--publisher-engine", "--placement", "vulkan"],
+            vec!["--publisher-engine", "--placement", "composite"],
         ] {
             let mut rejected = args.to_vec();
             rejected.extend(suffix.into_iter().map(OsString::from));
@@ -1017,6 +1018,7 @@ mod tests {
         for (name, policy) in [
             ("f16", crate::client::KvCache::F16),
             ("rsq4", crate::client::KvCache::Rsq4),
+            ("rsq4kvf", crate::client::KvCache::Rsq4Kvf),
             ("rsq4k3v", crate::client::KvCache::Rsq4K3v),
         ] {
             let mut selected = args.to_vec();
@@ -1126,6 +1128,26 @@ mod tests {
         assert_eq!(parsed_spec.cpu_family, Some(crate::client::CpuFamily::X2));
         assert_eq!(parsed_spec.native_row_workers, 8);
 
+        for (kv_name, expected_kv) in [
+            (None, None),
+            (Some("f16"), Some(crate::client::KvCache::F16)),
+            (Some("rsq4"), Some(crate::client::KvCache::Rsq4)),
+            (Some("rsq4kvf"), Some(crate::client::KvCache::Rsq4Kvf)),
+            (Some("rsq4k3v"), Some(crate::client::KvCache::Rsq4K3v)),
+        ] {
+            let mut wy_args = args.to_vec();
+            wy_args.extend(["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"].map(OsString::from));
+            if let Some(kv) = kv_name {
+                wy_args.extend(["--kv-cache", kv].map(OsString::from));
+            }
+            let parsed_wy = configuration(wy_args).map_err(io::Error::other)?;
+            assert_eq!(
+                parsed_wy.cpu_prefill_gdn,
+                Some(crate::client::CpuPrefillGdn::WyF32)
+            );
+            assert_eq!(parsed_wy.kv_cache, expected_kv);
+        }
+
         for invalid in [
             vec!["--publisher-engine", "--require-broker-pipe"],
             vec!["--prompt-reuse-checkpoints", "2"],
@@ -1160,15 +1182,6 @@ mod tests {
                 "0",
             ],
             vec!["--cpu-prefill-gdn", "wy-f32"],
-            vec!["--cpu-prefill-tokens", "16", "--cpu-prefill-gdn", "wy-f32"],
-            vec![
-                "--cpu-prefill-tokens",
-                "16",
-                "--kv-cache",
-                "rsq4",
-                "--cpu-prefill-gdn",
-                "wy-f32",
-            ],
             vec!["--draft-max", "4"],
             vec!["--spec-type", "none", "--draft-max", "4"],
             vec!["--spec-type", "suffix"],

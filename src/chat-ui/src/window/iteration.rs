@@ -273,11 +273,9 @@ impl State {
                 return true;
             }
         }
-        let system_appendix = self
-            .memory
-            .resolve(&self.committed, CONTINUE_PROMPT)
-            .appendix
-            .map(std::sync::Arc::<str>::from);
+        let memory = self.memory.resolve(&self.committed, CONTINUE_PROMPT);
+        let system_appendix = memory.pinned_appendix.map(std::sync::Arc::<str>::from);
+        let turn_appendix = memory.triggered_appendix.map(std::sync::Arc::<str>::from);
         if self
             .commands
             .send(Command::Send {
@@ -290,6 +288,7 @@ impl State {
                 daisyrose_scale: self.effective_daisyrose_scale(),
                 cognitive: self.cognitive,
                 system_appendix,
+                turn_appendix,
             })
             .is_err()
         {
