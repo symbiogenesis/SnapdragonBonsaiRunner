@@ -40,6 +40,8 @@ struct Request {
     tts_quantization: String,
     #[serde(default)]
     nariq_variant: Option<bonsai_cpu_policy::NariqVariant>,
+    #[serde(default)]
+    bonsai25_variant: Option<bonsai_cpu_policy::Bonsai25Variant>,
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -47,6 +49,8 @@ struct Request {
 enum Operation {
     Model,
     NariqModel,
+    #[serde(rename = "bonsai-2.5-model")]
+    Bonsai25Model,
     Adapter,
     DaisyroseLora,
     Mmproj,
@@ -333,6 +337,39 @@ fn nariq_model(request: &Request, working: &Path) -> crate::Result<Value> {
         "Bytes": selected.bytes,
         "License": selected.license,
         "Qualification": "pinned NariQ GGUF integrity only; runtime release pin and device/quality qualification remain separate"
+    }))
+}
+
+fn bonsai25_model(request: &Request, working: &Path) -> crate::Result<Value> {
+    let variant = request
+        .bonsai25_variant
+        .unwrap_or(bonsai_cpu_policy::Bonsai25Variant::Pq2);
+    let selected = bonsai_cpu_policy::bonsai25_model_artifact(&request.data_directory, variant)?;
+    if !request.verify_only && !request.data_directory.is_dir() {
+        return Err("The external DataDirectory must already exist.".into());
+    }
+    if request.verify_only {
+        crate::startup_download::verify(&selected.path, selected.bytes, &selected.sha256)?;
+    } else {
+        crate::startup_download::receive_with_timeout(
+            &selected.url,
+            &selected.path,
+            selected.bytes,
+            &selected.sha256,
+            working,
+            std::time::Duration::from_mins(15),
+        )?;
+    }
+    Ok(json!({
+        "Status": "verified",
+        "Variant": selected.variant.as_str(),
+        "ModelPath": selected.path,
+        "Repository": selected.repository,
+        "Revision": selected.revision,
+        "Sha256": selected.sha256,
+        "Bytes": selected.bytes,
+        "License": selected.license,
+        "Qualification": "pinned Ternary Bonsai 2.5 27B GGUF integrity only; runtime release pin and device/quality qualification remain separate"
     }))
 }
 
@@ -1580,6 +1617,7 @@ pub fn run(value: Value) -> crate::Result<Value> {
             )
         || request.tts_quantization != "Q8_0" && request.operation != Operation::Speech
         || request.nariq_variant.is_some() && request.operation != Operation::NariqModel
+        || request.bonsai25_variant.is_some() && request.operation != Operation::Bonsai25Model
     {
         return Err("Provisioning options do not apply to the selected operation.".into());
     }
@@ -1587,6 +1625,7 @@ pub fn run(value: Value) -> crate::Result<Value> {
     match request.operation {
         Operation::Model => model(&request, &working),
         Operation::NariqModel => nariq_model(&request, &working),
+        Operation::Bonsai25Model => bonsai25_model(&request, &working),
         Operation::Adapter => adapter(&request, &working),
         Operation::DaisyroseLora => daisyrose_lora(&request, &working),
         Operation::Mmproj => mmproj(&request, &working),
@@ -2703,6 +2742,60 @@ mod tests {
             json!({"operation": "nariq-model", "dataDirectory": data, "verifyOnly": true}),
             json!({"operation": "nariq-model", "dataDirectory": data, "nariqVariant": "3.0bpw", "verifyOnly": true}),
             json!({"operation": "nariq-model", "dataDirectory": data, "nariqVariant": "2.0bpw", "verifyOnly": true}),
+        ] {
+            assert!(run(payload).is_err());
+        }
+
+        fs::remove_dir_all(root).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn bonsai25_model_provisioning_validates_variant_and_option_isolation() -> crate::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "Bonsai-Provision-Bonsai25-{}",
+            crate::startup_process::unique()
+        ));
+        let data = root.join("data");
+        fs::create_dir_all(&data).map_err(|error| error.to_string())?;
+
+        // Reject `bonsai25Variant` on every non-`bonsai-2.5-model` operation.
+        for op in [
+            "model",
+            "nariq-model",
+            "daisyrose-lora",
+            "mmproj",
+            "engine",
+            "inference",
+        ] {
+            assert!(
+                run(json!({
+                    "operation": op,
+                    "dataDirectory": data,
+                    "bonsai25Variant": "pq2",
+                    "verifyOnly": true,
+                }))
+                .is_err()
+            );
+        }
+
+        // Reject inapplicable options or bogus variants on `bonsai-2.5-model`.
+        for bad in [
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "bonsai25Variant": "q4", "verifyOnly": true}),
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "nariqVariant": "2.5bpw", "verifyOnly": true}),
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "lockPath": root.join("x.json"), "verifyOnly": true}),
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "includeHelp": true, "verifyOnly": true}),
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "includeCapabilities": true, "verifyOnly": true}),
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "model": "QwenTts", "verifyOnly": true}),
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "ttsQuantization": "Q4_K_M", "verifyOnly": true}),
+        ] {
+            assert!(run(bad).is_err());
+        }
+
+        // Verify-only on absent pq2 (default) and ptq1 rejects cleanly without network I/O.
+        for payload in [
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "verifyOnly": true}),
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "bonsai25Variant": "pq2", "verifyOnly": true}),
+            json!({"operation": "bonsai-2.5-model", "dataDirectory": data, "bonsai25Variant": "ptq1", "verifyOnly": true}),
         ] {
             assert!(run(payload).is_err());
         }

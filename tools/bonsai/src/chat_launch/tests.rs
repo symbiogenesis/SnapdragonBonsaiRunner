@@ -1931,3 +1931,49 @@ fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -
 
     fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
 }
+
+#[test]
+fn bonsai25_chat_request_allows_orca_mmproj_composite_and_explicit_daisyrose() -> crate::Result<()>
+{
+    let fixture = fixture("bonsai25-chat-args")?;
+    let mut conflict_ptq1: Request =
+        serde_json::from_value(fixture.request.clone()).map_err(|e| e.to_string())?;
+    conflict_ptq1.native_engine = true;
+    conflict_ptq1.use_repacked_ptq1 = true;
+    conflict_ptq1.bonsai25_variant = Some(bonsai_cpu_policy::Bonsai25Variant::Pq2);
+    assert!(conflict_ptq1.validate_native_runtime(None).is_err());
+
+    let mut conflict_nariq: Request =
+        serde_json::from_value(fixture.request.clone()).map_err(|e| e.to_string())?;
+    conflict_nariq.native_engine = true;
+    conflict_nariq.nariq_variant = Some(bonsai_cpu_policy::NariqVariant::Bpw2_5);
+    conflict_nariq.bonsai25_variant = Some(bonsai_cpu_policy::Bonsai25Variant::Pq2);
+    assert!(conflict_nariq.validate_native_runtime(None).is_err());
+
+    let mut req: Request = serde_json::from_value(fixture.request).map_err(|e| e.to_string())?;
+    req.native_engine = true;
+    req.bonsai25_variant = Some(bonsai_cpu_policy::Bonsai25Variant::Ptq1);
+    req.use_repacked_ptq1 = false;
+    req.placement = Some(Placement::Auto);
+    let daisy = fixture.root.join("daisyrose.gguf");
+    req.daisyrose_lora = Some(daisy);
+    req.validate_native_runtime(None)?;
+
+    let mut args = Vec::new();
+    runtime_arguments(&req, &mut args);
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    assert!(rendered.windows(2).any(|w| w == ["--bonsai-2-5", "ptq1"]));
+    assert!(!rendered.contains(&"--no-abliterate-lora".to_owned()));
+    assert!(!rendered.contains(&"--no-mmproj".to_owned()));
+    assert!(rendered.iter().any(|a| a == "--daisyrose-lora"));
+    assert!(
+        !rendered
+            .iter()
+            .any(|a| a == "--use-original-pq2" || a == "--use-repacked-ptq1")
+    );
+
+    fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
+}

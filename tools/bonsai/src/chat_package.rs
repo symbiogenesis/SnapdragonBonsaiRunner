@@ -361,6 +361,7 @@ fn launch_options(package: &Value, options: Value) -> crate::Result<Value> {
                 | "NoAbliterateLora"
                 | "NoDaisyRoseLora"
                 | "UseRepackedPtq1"
+                | "Bonsai25Variant"
                 | "NativeEngine"
                 | "RequireBrokerPipe"
                 | "NativeRowWorkers"

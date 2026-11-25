@@ -50,6 +50,16 @@ fn model(request: &Request) -> crate::Result<Model> {
             url: Some(selected.url),
         });
     }
+    if let Some(variant) = request.bonsai25_variant {
+        let selected =
+            bonsai_cpu_policy::bonsai25_model_artifact(&request.data_directory, variant)?;
+        return Ok(Model {
+            path: selected.path,
+            bytes: selected.bytes,
+            sha256: selected.sha256,
+            url: Some(selected.url),
+        });
+    }
     let lock = cached_json(&SWIFT_LOCK, SWIFT)?;
     let derived = cached_json(&PTQ1_EXPORT, PTQ1)?;
     let pin = bonsai_cpu_policy::select_artifact(
@@ -357,6 +367,7 @@ fn prepare_weights_with(
             && request.native_engine
             && !request.no_daisyrose_lora
             && request.daisyrose_lora.is_none()
+            && request.bonsai25_variant.is_none()
     }) {
         status(
             working,
@@ -851,6 +862,82 @@ mod tests {
         assert_eq!(received[0].3, pinned_nariq.sha256);
         assert_eq!(received[1].0, promoted.url);
         assert_eq!(received[1].1, promoted.path);
+
+        fs::remove_dir_all(working).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn bonsai25_setup_downloads_model_keeps_orca_and_mmproj_and_skips_pq2_daisyrose()
+    -> crate::Result<()> {
+        let working = std::env::temp_dir().join(format!(
+            "Bonsai-SetupBonsai25-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&working).map_err(|error| error.to_string())?;
+        let data = working.join("data");
+        fs::create_dir(&data).map_err(|error| error.to_string())?;
+        let request: Request = serde_json::from_value(json!({
+            "DataDirectory": data,
+            "RepositoryRoot": working.join("source"),
+            "NativeEngine": true,
+            "Bonsai25Variant": "ptq1",
+        }))
+        .map_err(|error| error.to_string())?;
+        let selected = model(&request)?;
+        let pinned_b25 = bonsai_cpu_policy::bonsai25_model_artifact(
+            &data,
+            bonsai_cpu_policy::Bonsai25Variant::Ptq1,
+        )?;
+        assert_eq!(selected.path, pinned_b25.path);
+        assert_eq!(selected.bytes, pinned_b25.bytes);
+        assert_eq!(selected.sha256, pinned_b25.sha256);
+        assert_eq!(selected.url.as_deref(), Some(pinned_b25.url.as_str()));
+
+        let daisy_lock = json!({
+            "schemaVersion": 1,
+            "envelope": "npu-friendly",
+            "dtype": "f16",
+            "maxRank": 16,
+            "targetCount": 128,
+            "bytes": 67_108_864_u64,
+            "sha256": "a".repeat(64),
+            "baseModelSha256": "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5",
+            "source": {
+                "host": "huggingface",
+                "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
+                "path": "gguf/daisyrose.gguf",
+                "filename": "daisyrose.gguf",
+                "url": "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose.gguf",
+                "license": "Apache-2.0"
+            },
+            "defaultEnabled": true,
+            "defaultScaleTenths": 10
+        });
+        let promoted =
+            bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &daisy_lock.to_string())?;
+        let orca = bonsai_cpu_policy::abliterate_lora_artifact(&data)?;
+        let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&data)?;
+        let mut received = Vec::new();
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            false,
+            "first-run",
+            Some(&mmproj),
+            Some(&promoted),
+            |url, path, bytes, hash, _| {
+                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        // Expects: Bonsai 2.5 model + Orca + mmproj (3 downloads); PQ2 DaisyRose skipped!
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0].1, pinned_b25.path);
+        assert_eq!(received[1].1, orca.path);
+        assert_eq!(received[2].1, mmproj.path);
 
         fs::remove_dir_all(working).map_err(|error| error.to_string())
     }

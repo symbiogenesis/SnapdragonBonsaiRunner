@@ -137,6 +137,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--require-broker-pipe" => ("RequireBrokerPipe", true, false),
             "--use-repacked-ptq1" | "--use-original-pq2" => ("UseRepackedPtq1", true, false),
             "--nariq" => ("NariqVariant", false, false),
+            "--bonsai-2-5" => ("Bonsai25Variant", false, false),
             "--no-abliterate-lora" => ("NoAbliterateLora", true, false),
             "--daisyrose-lora" => ("DaisyRoseLora", false, false),
             "--no-daisyrose-lora" => ("NoDaisyRoseLora", true, false),
@@ -170,9 +171,12 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             return Err(format!("Repeated or conflicting chat option: {option}"));
         }
     }
-    if request.contains_key("NariqVariant") && request.contains_key("UseRepackedPtq1") {
+    let weight_options = usize::from(request.contains_key("NariqVariant"))
+        + usize::from(request.contains_key("Bonsai25Variant"))
+        + usize::from(request.contains_key("UseRepackedPtq1"));
+    if weight_options > 1 {
         return Err(
-            "`--nariq` cannot be combined with `--use-repacked-ptq1` or `--use-original-pq2`."
+            "Weight selection flags (`--nariq`, `--bonsai-2-5`, `--use-repacked-ptq1`, `--use-original-pq2`) are mutually exclusive."
                 .into(),
         );
     }
@@ -239,6 +243,7 @@ pub fn installed_chat(arguments: &[OsString]) -> crate::Result<Value> {
                 | "NoMmproj"
                 | "UseRepackedPtq1"
                 | "NariqVariant"
+                | "Bonsai25Variant"
                 | "NativeEngine"
                 | "RequireBrokerPipe"
                 | "NativeRowWorkers"
@@ -543,9 +548,19 @@ mod tests {
             vec!["--nariq", "2.5bpw", "--use-original-pq2"],
             vec!["--use-repacked-ptq1", "--nariq", "2.5bpw"],
             vec!["--nariq", "2.5bpw", "--nariq", "3.0bpw"],
+            vec!["--bonsai-2-5", "pq2", "--use-repacked-ptq1"],
+            vec!["--bonsai-2-5", "ptq1", "--use-original-pq2"],
+            vec!["--bonsai-2-5", "pq2", "--nariq", "2.5bpw"],
+            vec!["--bonsai-2-5", "pq2", "--bonsai-2-5", "ptq1"],
         ] {
             assert!(
                 chat_options(&conflict.into_iter().map(Into::into).collect::<Vec<_>>()).is_err()
+            );
+        }
+        for variant in ["pq2", "ptq1"] {
+            assert_eq!(
+                chat_options(&["--bonsai-2-5".into(), variant.into()])?["Bonsai25Variant"],
+                variant
             );
         }
         Ok(())
