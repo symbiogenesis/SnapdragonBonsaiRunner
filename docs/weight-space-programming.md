@@ -18,6 +18,12 @@ window. [Beaker's experiments](https://www.withbeaker.ai/blog/weight-space-progr
 show why ordinary token/output controls belong in the comparison and why shorter
 answers alone cannot count as improved reasoning. These reports concern other
 models and settings; directions, layers and strengths cannot transfer to Swift.
+While `OpenAI 380` ([T16](research-register.md#t16-recurrent-state-capacity-dimension-reduction-paging-and-lp-and-packing-limits),
+[open math conjectures](open-math-conjectures.md#offline-pure-rust-weight-space-optimization-and-npu-arena-packing))
+proves linear and convex-quadratic programming are strongly polynomial in exact
+arithmetic, practical pure-Rust offline fitting (`weight-patch` PDHG and `DR-W1`
+closed-form Tikhonov ridge) remains faster and simpler on dense `17,408`-wide
+floating-point matrices.
 
 Swift defaults to Thinking off, a 4,096-token completion cap and memory-selected
 context. It does not reproduce the cited long-reasoning workloads. A changed

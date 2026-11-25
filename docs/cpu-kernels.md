@@ -69,6 +69,17 @@ focused Rust ports. Optional DOTPROD/I8MM retains checked dispatch and fallback;
 SVE/SME support elsewhere does not imply Snapdragon availability. These sources
 change neither the selected runtime nor the existing candidate/promotion order.
 
+Under [T13](research-register.md#t13-asymptotic-matmul-output-sparse-thin-products-and-circuit-bounds)
+and [T14](research-register.md#t14-sub-n-log-n-finite-abelian-transforms-versus-fixed-size-rounding-stability)
+([open math conjectures](open-math-conjectures.md#matrix-multiplication-rectangular-prefill-and-output-sparse-attention)),
+the October–November 2026 asymptotic `omega = 9/4` matmul (`OpenAI 107/379`),
+output-sparse thin matmul (`3sum-apsp/`), and `N (log N)^(1/2+o(1))` finite
+abelian transform bounds (`OpenAI 130/379`) do not supersede Swift's
+DRAM-bandwidth-bound `M = 1` `PQ2`/`PTQ1` `SDOT`/`I8MM` decode kernels,
+cache-tiled `8/16/32`-token prefill, or fixed-order `1024`/`256` WHT and
+`512`-point speech FFT paths (galactic crossover sizes and exact-field
+constructions break ternary/Q8 integer packing and binary32 stability).
+
 ## Prompt and attention consumers
 
 The pinned source includes these consumers. Parallel quantized attention serves

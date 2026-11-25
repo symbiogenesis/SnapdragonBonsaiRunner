@@ -165,6 +165,11 @@ needs declared state/logit tolerances and long-prefix restoration checks, preser
 The [attention I/O theorem](research-register.md#t4-attention-io-optimality-has-a-computation-model)
 motivates tiling under its stated memory/computation model; it forecasts neither device speed nor
 unconditional exact subquadratic work. FlashAttention also faces the rounding boundary below.
+Likewise, the October 2026 `3SUM`/`APSP` refutation's output-sparse thin rectangular matmul
+([T13](research-register.md#t13-asymptotic-matmul-output-sparse-thin-products-and-circuit-bounds),
+[open math conjectures](open-math-conjectures.md#matrix-multiplication-rectangular-prefill-and-output-sparse-attention))
+requires `D <= N^(1/18)` (`N >= 2^144` at Swift's `D = 256`), leaving tiling, `6:1` GQA KV reuse,
+rotated `rsq4` and `GateSight` as the practical Snapdragon levers.
 
 Scalar nonflash attention rounds **globally normalized probabilities to FP16 before multiplying V**.
 Ordinary online-softmax merging changes that operation. Grouped-head tiling and contiguous V reads
@@ -386,8 +391,14 @@ accounts for execution and indexing costs.
 
 [T5](research-register.md#t5-chunking-recurrence-and-recovering-rejected-tokens) derives the finite
 Neumann expansion and explains why spectral radius zero cannot bound low-order error or
-intermediate growth. Check signed Gram entries/ranges before applying approximation arguments.
-By [T10](research-register.md#t10-recurrent-quantization-error-depends-on-the-trajectory) and
+intermediate growth; [T15](research-register.md#t15-sharp-non-normal-gdn-polynomial-truncation-bounds-via-crouzeix)
+([open math conjectures](open-math-conjectures.md#gated-deltanet-non-normal-stability-and-recurrent-state-capacity))
+supplies a computable Crouzeix numerical-range error certificate `||R_m(L)|| <= 2 sup_{z in W(L)} |z^(m+1) / (1 - z)|`
+required before implementing any multiplication-only GDN inverse candidate (`arXiv:2606.06034`, `#42`).
+Check signed Gram entries/ranges before applying approximation arguments.
+By [T10](research-register.md#t10-recurrent-quantization-error-depends-on-the-trajectory),
+[T16](research-register.md#t16-recurrent-state-capacity-dimension-reduction-paging-and-lp-and-packing-limits)
+(`OpenAI 140`'s `A d^2` streaming regression floor reinforcing why shrinking GDN's `O(d^2)` matrix state degrades recall) and
 [Lost in Rounding](https://arxiv.org/abs/2611.12127) (**paper**, Nov 2026), any future 16-bit
 (`bf16`/`fp16`) GDN recurrent checkpoint or accelerator path must use Stochastic Rounding (SR)
 rather than Round-to-Nearest (RTN) to avoid rounding-bias reasoning loops and truncation drops.

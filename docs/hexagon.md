@@ -220,7 +220,15 @@ and independent resource/isolation qualification; drivers/services are not impli
 the single-process Job. Deferred August–November 2026 screening candidates covering Hexagon
 NPU, Adreno GPU, async storage lifetimes and DCVS/power-scaling gates (`#39`–`#44` in
 [PLAN.md](../PLAN.md#hexagon-npu)) leave these Job commit, arena-sealing, signed-package
-and benefit rules intact until explicitly reopened and qualified.
+and benefit rules intact until explicitly reopened and qualified. Under
+[T15](research-register.md#t15-sharp-non-normal-gdn-polynomial-truncation-bounds-via-crouzeix)
+and [T16](research-register.md#t16-recurrent-state-capacity-dimension-reduction-paging-and-lp-and-packing-limits)
+([open math conjectures](open-math-conjectures.md#offline-pure-rust-weight-space-optimization-and-npu-arena-packing)),
+`OpenAI 118`/`102` (unbounded bin-packing configuration-LP gaps and `UGC`
+hardness) reinforce explicit verified discrete VTCM/arena placement (`#41`) over
+LP-relaxation rounding, and `OpenAI 325`'s Crouzeix numerical-range bound
+provides a computable pre-implementation error certificate for any future
+multiplication-only or `#42` HMX FP16 chunkwise GDN candidate.
 
 ## Qualification evidence
 

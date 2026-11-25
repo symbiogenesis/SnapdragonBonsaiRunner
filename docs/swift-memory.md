@@ -564,6 +564,10 @@ shares one 1024² F32 rotation per CPU buffer type and signs by width/type:
 4,423,680 retained rotation/sign/metadata bytes (including 114,688 sign-metadata bytes)
 and a temporary 4 MiB initialization vector. Charging per transformed weight would
 double-count shared storage. A butterfly rewrite changes floating-point order.
+Asymptotic sub-`n log n` finite abelian transform circuits ([T14](research-register.md#t14-sub-n-log-n-finite-abelian-transforms-versus-fixed-size-rounding-stability),
+[open math conjectures](open-math-conjectures.md#finite-abelian-fourier-transforms-and-bit-arithmetic))
+carry galactic overhead and exact-field instability and do not replace this shared
+`1024^2` rotation or its pinned rounding order.
 
 Original F32/BF16 weights are retained: 10.09 MiB F32 and 45 MiB BF16, totalling
 57,767,936 bytes. Narrowing all F32 to sixteen bits could save at most 5,291,008 bytes
@@ -599,3 +603,10 @@ selection and explicit FP16 recovery. [Inference constraints](inference-algorith
 own arithmetic and error boundaries; the [research catalog](research-register.md#research-catalog)
 holds optional alternatives. Only a demonstrated bottleneck justifies another
 codec or precision experiment, with its own exact-source, quality and resource gates.
+Under [T16](research-register.md#t16-recurrent-state-capacity-dimension-reduction-paging-and-lp-and-packing-limits)
+([open math conjectures](open-math-conjectures.md#kv-compression-dimension-reduction-online-paging-and-space-time)),
+Cogentic's asymptotic Log-Rank bound does not beat `PTQ1_0`'s `T1` byte-aligned ternary
+packing on Swift's `32.76%`-zero tensors; `OpenAI 137`'s `O(T^(2/5) polylog T)` space
+simulation pays unacceptable recomputation latency for interactive chat; and `OpenAI 110`'s
+randomized `O(log^2(k+1))` `k`-server policy is unnecessary for `k <= 8` deterministic
+`BranchCheckpoints` (conditionally relevant only to future large-`k` tiered KV/MoE paging).

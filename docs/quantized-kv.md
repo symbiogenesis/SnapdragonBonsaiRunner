@@ -93,9 +93,15 @@ For future hybrid-architecture capacity extensions beyond uniform K4/V4:
 - **[Lost in Rounding](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
   (`arXiv:2611.12127`):** prohibits Round-to-Nearest (RTN) `bf16`/`fp16` GDN state compression due
   to overthinking loops; any future 16-bit GDN state lane must use Stochastic Rounding (SR).
-- **[iS-KV](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
+- **[iS-KV](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)**
   (`arXiv:2610.02815`) and [AbridgeKV](research-register.md#hybrid-gated-deltanet-full-attention-and-multimodal-efficiency)
-  (`arXiv:2610.20641`):** separate long-CoT online-SVD and trained pause-token KV approximations.
+  (`arXiv:2610.20641`): separate long-CoT online-SVD and trained pause-token KV approximations.
+- **[2026 complexity & dimension-reduction bounds](open-math-conjectures.md#kv-compression-dimension-reduction-online-paging-and-space-time) (`T14`, `T16`):**
+  `OpenAI 094`/`098` (exact `Theta(n^2)` vs. distorted `n^o(1)` `L_p` reduction) and
+  `OpenAI 140` (`A d^2` recurrent state floor) formalize Swift's separation between lossless
+  FP16 KV / protected FP32 GDN state and approximate rotated `rsq4`/`rsq4k3v` KV, while
+  asymptotic sub-`n log n` abelian transforms (`OpenAI 130/379`) leave the pinned
+  256-channel WHT butterfly contract unchanged.
 
 ## Fitted-value scale candidate
 
