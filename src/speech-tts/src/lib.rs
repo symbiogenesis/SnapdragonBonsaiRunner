@@ -7,8 +7,13 @@
 #![cfg(windows)]
 
 use std::{
-    fmt, io,
+    collections::VecDeque,
+    fmt,
+    fs::OpenOptions,
+    io::{self, Read},
     path::{Path, PathBuf},
+    sync::Mutex,
+    time::SystemTime,
 };
 
 #[cfg(test)]
@@ -215,9 +220,201 @@ where
     sink(&chunk).map_err(|error| SynthesisStage::AudioOutput.failure(error))
 }
 
+const MAX_DERIVED_REFERENCES: usize = 32;
+const MAX_MODEL_DIGESTS: usize = 8;
+const MODEL_DIGEST_MEMOIZE_MIN_BYTES: u64 = 16 * 1024 * 1024;
+const HASH_READ_BUFFER_BYTES: usize = 1024 * 1024;
+
 struct Voice {
     talker: rust_talker::Talker,
     reference: rust_talker::Reference,
+}
+
+trait VoiceParts {
+    type Talker;
+    fn into_talker(self) -> Self::Talker;
+    fn from_parts(talker: Self::Talker, reference: rust_talker::Reference) -> Self;
+}
+
+impl VoiceParts for Voice {
+    type Talker = rust_talker::Talker;
+
+    fn into_talker(self) -> Self::Talker {
+        self.talker
+    }
+
+    fn from_parts(talker: Self::Talker, reference: rust_talker::Reference) -> Self {
+        Self { talker, reference }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DerivedReferenceKey {
+    voice_profile_id: Box<str>,
+    model_sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DerivedReference {
+    speaker_embedding: Vec<f32>,
+    reference_codes: Vec<[i32; engine::TOTAL_CODE_GROUPS]>,
+}
+
+struct DerivedReferenceCache {
+    entries: VecDeque<(DerivedReferenceKey, DerivedReference)>,
+}
+
+impl DerivedReferenceCache {
+    const fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, profile: &str, model_sha256: &[u8; 32]) -> Option<DerivedReference> {
+        let index = self.entries.iter().position(|(key, _)| {
+            key.voice_profile_id.as_ref() == profile && &key.model_sha256 == model_sha256
+        })?;
+        let entry = self.entries.remove(index)?;
+        let result = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(result)
+    }
+
+    fn insert(&mut self, profile: &str, model_sha256: [u8; 32], value: DerivedReference) {
+        if let Some(index) = self.entries.iter().position(|(key, _)| {
+            key.voice_profile_id.as_ref() == profile && key.model_sha256 == model_sha256
+        }) {
+            let _removed = self.entries.remove(index);
+        } else {
+            while self.entries.len() >= MAX_DERIVED_REFERENCES {
+                let _evicted = self.entries.pop_front();
+            }
+        }
+        self.entries.push_back((
+            DerivedReferenceKey {
+                voice_profile_id: Box::from(profile),
+                model_sha256,
+            },
+            value,
+        ));
+    }
+}
+
+struct CachedModelDigest {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    sha256: [u8; 32],
+}
+
+struct ModelDigestCache {
+    entries: VecDeque<CachedModelDigest>,
+}
+
+impl ModelDigestCache {
+    const fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, path: &Path, len: u64, modified: Option<SystemTime>) -> Option<[u8; 32]> {
+        let index = self.entries.iter().position(|entry| {
+            entry.len == len && entry.modified == modified && entry.path == path
+        })?;
+        let entry = self.entries.remove(index)?;
+        let sha256 = entry.sha256;
+        self.entries.push_back(entry);
+        Some(sha256)
+    }
+
+    fn insert(&mut self, path: &Path, len: u64, modified: Option<SystemTime>, sha256: [u8; 32]) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            let _removed = self.entries.remove(index);
+        } else {
+            while self.entries.len() >= MAX_MODEL_DIGESTS {
+                let _evicted = self.entries.pop_front();
+            }
+        }
+        self.entries.push_back(CachedModelDigest {
+            path: path.to_path_buf(),
+            len,
+            modified,
+            sha256,
+        });
+    }
+}
+
+static DERIVED_REFERENCE_CACHE: Mutex<DerivedReferenceCache> =
+    Mutex::new(DerivedReferenceCache::new());
+static MODEL_DIGEST_CACHE: Mutex<ModelDigestCache> = Mutex::new(ModelDigestCache::new());
+
+fn file_sha256(path: &Path, cancel: &mut impl FnMut() -> io::Result<()>) -> io::Result<[u8; 32]> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Speech model path must be absolute.",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // Read sharing only + reject reparse points + sequential scan.
+    options
+        .share_mode(1)
+        .custom_flags(0x0020_0000 | 0x0800_0000);
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Speech model must be a regular non-reparse file.",
+        ));
+    }
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+    if len > MODEL_DIGEST_MEMOIZE_MIN_BYTES
+        && let Ok(mut cache) = MODEL_DIGEST_CACHE.lock()
+        && let Some(digest) = cache.get(path, len, modified)
+    {
+        return Ok(digest);
+    }
+    let mut hasher = bonsai_native_hash::Hasher::new().map_err(io::Error::other)?;
+    let mut buffer = vec![0_u8; HASH_READ_BUFFER_BYTES];
+    loop {
+        cancel()?;
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => hasher.update(&buffer[..count]).map_err(io::Error::other)?,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let digest = hasher.finish().map_err(io::Error::other)?;
+    if len > MODEL_DIGEST_MEMOIZE_MIN_BYTES
+        && let Ok(mut cache) = MODEL_DIGEST_CACHE.lock()
+    {
+        cache.insert(path, len, modified, digest);
+    }
+    Ok(digest)
+}
+
+fn model_identity_sha256(
+    model_path: &Path,
+    voice_model_path: &Path,
+    cancel: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<[u8; 32]> {
+    let design_digest = file_sha256(model_path, cancel)?;
+    let base_digest = file_sha256(voice_model_path, cancel)?;
+    let mut combined = bonsai_native_hash::Hasher::new().map_err(io::Error::other)?;
+    combined
+        .update(b"bonsai-tts-voice-model-v1")
+        .map_err(io::Error::other)?;
+    combined.update(&design_digest).map_err(io::Error::other)?;
+    combined.update(&base_digest).map_err(io::Error::other)?;
+    combined.finish().map_err(io::Error::other)
 }
 
 // The cache key deliberately excludes utterance text, request identifiers,
@@ -243,6 +440,7 @@ fn finish_voice_bootstrap<D, B, S: AsRef<[f32]>, R>(
 }
 
 impl<T> VoiceCache<T> {
+    #[cfg(test)]
     fn get_or_create(
         &mut self,
         profile: &str,
@@ -255,6 +453,65 @@ impl<T> VoiceCache<T> {
         }
         self.0 = None;
         let voice = create()?;
+        Ok(&mut self.0.insert((Box::from(profile), voice)).1)
+    }
+
+    fn get_or_acquire<D>(
+        &mut self,
+        profile: &str,
+        design_slot: &mut Option<D>,
+        reference_cache: &Mutex<DerivedReferenceCache>,
+        model_sha256: impl FnOnce() -> io::Result<[u8; 32]>,
+        load_base: impl FnOnce() -> io::Result<T::Talker>,
+        derive_voice: impl FnOnce(&mut Option<D>) -> io::Result<(T::Talker, rust_talker::Reference)>,
+    ) -> io::Result<&mut T>
+    where
+        T: VoiceParts,
+    {
+        if self
+            .0
+            .as_ref()
+            .is_some_and(|(key, _)| &**key == profile)
+            && let Some((_, voice)) = self.0.as_mut()
+        {
+            return Ok(voice);
+        }
+        let digest = model_sha256()?;
+        let cached = reference_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(profile, &digest));
+        if let Some(derived) = cached {
+            // Release any preloaded Design model before loading/retaining Base
+            // so both model contexts never coexist in memory.
+            *design_slot = None;
+            let talker = match self.0.take() {
+                Some((_, previous)) => previous.into_talker(),
+                None => load_base()?,
+            };
+            let voice = T::from_parts(
+                talker,
+                rust_talker::Reference {
+                    speaker: derived.speaker_embedding,
+                    codes: derived.reference_codes,
+                },
+            );
+            return Ok(&mut self.0.insert((Box::from(profile), voice)).1);
+        }
+        // Release the active Base model before VoiceDesign runs on a cache miss.
+        self.0 = None;
+        let (talker, reference) = derive_voice(design_slot)?;
+        if let Ok(mut cache) = reference_cache.lock() {
+            cache.insert(
+                profile,
+                digest,
+                DerivedReference {
+                    speaker_embedding: reference.speaker.clone(),
+                    reference_codes: reference.codes.clone(),
+                },
+            );
+        }
+        let voice = T::from_parts(talker, reference);
         Ok(&mut self.0.insert((Box::from(profile), voice)).1)
     }
 }
@@ -367,6 +624,33 @@ impl Synthesizer {
         self.codec.sample_rate()
     }
 
+    fn validate_base_weights(weights: &weights::Weights) -> io::Result<()> {
+        if weights
+            .string("qwen3-tts.model_type")
+            .map_err(|error| SynthesisStage::BaseMetadata.failure(error))?
+            != "base"
+        {
+            return Err(SynthesisStage::BaseMetadata.failure(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Speech voice model must be Base.",
+            )));
+        }
+        Ok(())
+    }
+
+    fn load_talker_from_base_weights(
+        weights: &weights::Weights,
+        threads: usize,
+        cancel: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<rust_talker::Talker> {
+        cancel().map_err(|error| SynthesisStage::BaseTokenizer.failure(error))?;
+        let tokenizer = tokenizer::Tokenizer::from_weights(weights)
+            .map_err(|error| SynthesisStage::BaseTokenizer.failure(error))?;
+        cancel().map_err(|error| SynthesisStage::BaseModel.failure(error))?;
+        rust_talker::Talker::load(weights, tokenizer, threads)
+            .map_err(|error| SynthesisStage::BaseModel.failure(error))
+    }
+
     fn voice<C, O>(
         &mut self,
         profile: &str,
@@ -385,91 +669,100 @@ impl Synthesizer {
             codec,
             threads,
         } = self;
-        voices.get_or_create(profile, || {
-            (cancel.borrow_mut())().map_err(|error| SynthesisStage::DesignModel.failure(error))?;
-            let mut talker = match design.take() {
-                Some(talker) => talker,
-                None => load_talker(model_path, "voice_design", *threads)
-                    .map_err(|error| SynthesisStage::DesignModel.failure(error))?,
-            };
-            let mut codes = Vec::new();
-            talker
-                .generate_observed(
-                    rust_talker::REFERENCE_TEXT,
-                    Some(profile),
-                    None,
-                    &mut |frame| {
-                        codes.push(frame);
-                        Ok(())
+        voices.get_or_acquire(
+            profile,
+            design,
+            &DERIVED_REFERENCE_CACHE,
+            || {
+                model_identity_sha256(model_path, voice_model_path, &mut || {
+                    (cancel.borrow_mut())()
+                })
+                .map_err(|error| SynthesisStage::BaseWeights.failure(error))
+            },
+            || {
+                (cancel.borrow_mut())()
+                    .map_err(|error| SynthesisStage::BaseWeights.failure(error))?;
+                let weights = weights::Weights::open(voice_model_path)
+                    .map_err(|error| SynthesisStage::BaseWeights.failure(error))?;
+                Self::validate_base_weights(&weights)?;
+                Self::load_talker_from_base_weights(&weights, *threads, &mut || {
+                    (cancel.borrow_mut())()
+                })
+            },
+            |design| {
+                (cancel.borrow_mut())()
+                    .map_err(|error| SynthesisStage::DesignModel.failure(error))?;
+                let mut talker = match design.take() {
+                    Some(talker) => talker,
+                    None => load_talker(model_path, "voice_design", *threads)
+                        .map_err(|error| SynthesisStage::DesignModel.failure(error))?,
+                };
+                let mut codes = Vec::new();
+                talker
+                    .generate_observed(
+                        rust_talker::REFERENCE_TEXT,
+                        Some(profile),
+                        None,
+                        &mut |frame| {
+                            codes.push(frame);
+                            Ok(())
+                        },
+                        &mut || (cancel.borrow_mut())(),
+                        &mut |observation| {
+                            observe.borrow_mut()(observation::Observation::Talker {
+                                phase: observation::Phase::Design,
+                                observation,
+                            })
+                        },
+                    )
+                    .map_err(|error| SynthesisStage::ReferenceGeneration.failure(error))?;
+                let samples = codec
+                    .decode_cancellable(&codes, &mut || (cancel.borrow_mut())())
+                    .map_err(|error| SynthesisStage::ReferenceDecode.failure(error))?;
+                let count = sample_count(&samples, 0)
+                    .ok_or_else(|| SynthesisStage::ReferenceValidation.failure(invalid_audio()))?;
+                if !(1920..=24_000 * 30).contains(&count) {
+                    return Err(SynthesisStage::ReferenceValidation.failure(invalid_audio()));
+                }
+                observe.borrow_mut()(observation::Observation::Pcm {
+                    phase: observation::Phase::Design,
+                    samples: samples.as_ref(),
+                })?;
+                // This is the same ownership handoff exercised by the independent
+                // drop-order control: Design is gone before Base intake, and one
+                // waveform survives through both speaker and acoustic extraction.
+                let (_, voice_parts) = finish_voice_bootstrap(
+                    talker,
+                    samples,
+                    || {
+                        (cancel.borrow_mut())()
+                            .map_err(|error| SynthesisStage::BaseWeights.failure(error))?;
+                        weights::Weights::open(voice_model_path)
+                            .map_err(|error| SynthesisStage::BaseWeights.failure(error))
                     },
-                    &mut || (cancel.borrow_mut())(),
-                    &mut |observation| {
-                        observe.borrow_mut()(observation::Observation::Talker {
-                            phase: observation::Phase::Design,
-                            observation,
-                        })
+                    |weights, samples| {
+                        Self::validate_base_weights(weights)?;
+                        let speaker = rust_codec::Speaker::load(weights, *threads)
+                            .map_err(|error| SynthesisStage::SpeakerWeights.failure(error))?
+                            .extract_cancellable(samples, &mut || (cancel.borrow_mut())())
+                            .map_err(|error| SynthesisStage::SpeakerExtraction.failure(error))?;
+                        let reference_codes = codec
+                            .encode_reference_cancellable(samples, &mut || (cancel.borrow_mut())())
+                            .map_err(|error| SynthesisStage::ReferenceEncoding.failure(error))?;
+                        let talker =
+                            Self::load_talker_from_base_weights(weights, *threads, &mut || {
+                                (cancel.borrow_mut())()
+                            })?;
+                        let reference = rust_talker::Reference {
+                            speaker,
+                            codes: reference_codes,
+                        };
+                        Ok((talker, reference))
                     },
-                )
-                .map_err(|error| SynthesisStage::ReferenceGeneration.failure(error))?;
-            let samples = codec
-                .decode_cancellable(&codes, &mut || (cancel.borrow_mut())())
-                .map_err(|error| SynthesisStage::ReferenceDecode.failure(error))?;
-            let count = sample_count(&samples, 0)
-                .ok_or_else(|| SynthesisStage::ReferenceValidation.failure(invalid_audio()))?;
-            if !(1920..=24_000 * 30).contains(&count) {
-                return Err(SynthesisStage::ReferenceValidation.failure(invalid_audio()));
-            }
-            observe.borrow_mut()(observation::Observation::Pcm {
-                phase: observation::Phase::Design,
-                samples: samples.as_ref(),
-            })?;
-            // This is the same ownership handoff exercised by the independent
-            // drop-order control: Design is gone before Base intake, and one
-            // waveform survives through both speaker and acoustic extraction.
-            let (_, voice) = finish_voice_bootstrap(
-                talker,
-                samples,
-                || {
-                    (cancel.borrow_mut())()
-                        .map_err(|error| SynthesisStage::BaseWeights.failure(error))?;
-                    weights::Weights::open(voice_model_path)
-                        .map_err(|error| SynthesisStage::BaseWeights.failure(error))
-                },
-                |weights, samples| {
-                    if weights
-                        .string("qwen3-tts.model_type")
-                        .map_err(|error| SynthesisStage::BaseMetadata.failure(error))?
-                        != "base"
-                    {
-                        return Err(SynthesisStage::BaseMetadata.failure(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Speech voice model must be Base.",
-                        )));
-                    }
-                    let speaker = rust_codec::Speaker::load(weights, *threads)
-                        .map_err(|error| SynthesisStage::SpeakerWeights.failure(error))?
-                        .extract_cancellable(samples, &mut || (cancel.borrow_mut())())
-                        .map_err(|error| SynthesisStage::SpeakerExtraction.failure(error))?;
-                    let reference_codes = codec
-                        .encode_reference_cancellable(samples, &mut || (cancel.borrow_mut())())
-                        .map_err(|error| SynthesisStage::ReferenceEncoding.failure(error))?;
-                    (cancel.borrow_mut())()
-                        .map_err(|error| SynthesisStage::BaseTokenizer.failure(error))?;
-                    let tokenizer = tokenizer::Tokenizer::from_weights(weights)
-                        .map_err(|error| SynthesisStage::BaseTokenizer.failure(error))?;
-                    (cancel.borrow_mut())()
-                        .map_err(|error| SynthesisStage::BaseModel.failure(error))?;
-                    let talker = rust_talker::Talker::load(weights, tokenizer, *threads)
-                        .map_err(|error| SynthesisStage::BaseModel.failure(error))?;
-                    let reference = rust_talker::Reference {
-                        speaker,
-                        codes: reference_codes,
-                    };
-                    Ok(Voice { talker, reference })
-                },
-            )?;
-            Ok(voice)
-        })
+                )?;
+                Ok(voice_parts)
+            },
+        )
     }
 
     /// Generate a complete clip using the voice selected by its description.
@@ -960,6 +1253,167 @@ mod tests {
         assert_eq!(cache.get_or_create("Warm narrator", acquire)?.identity, 3);
         drop(cache);
         assert_eq!(alive.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn derived_reference_cache_avoids_rederiving_on_voice_switches_and_isolates_models()
+    -> std::io::Result<()> {
+        use std::{cell::Cell, fs, io, rc::Rc, sync::Mutex, time::UNIX_EPOCH};
+
+        struct FakeTalker {
+            alive: Rc<Cell<usize>>,
+        }
+        impl Drop for FakeTalker {
+            fn drop(&mut self) {
+                self.alive.set(self.alive.get() - 1);
+            }
+        }
+        struct FakeVoice {
+            talker: FakeTalker,
+            reference: crate::rust_talker::Reference,
+        }
+        impl super::VoiceParts for FakeVoice {
+            type Talker = FakeTalker;
+            fn into_talker(self) -> Self::Talker {
+                self.talker
+            }
+            fn from_parts(
+                talker: Self::Talker,
+                reference: crate::rust_talker::Reference,
+            ) -> Self {
+                Self { talker, reference }
+            }
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("Bonsai-TTS-RefCache-{stamp}"));
+        fs::create_dir(&dir)?;
+        let design_path = dir.join("design.gguf");
+        let base_path = dir.join("base.gguf");
+        fs::write(&design_path, b"design-q8-bytes")?;
+        fs::write(&base_path, b"base-q8-bytes")?;
+        let q8_sha = super::model_identity_sha256(&design_path, &base_path, &mut || Ok(()))?;
+
+        let alive_base = Rc::new(Cell::new(0));
+        let alive_design = Rc::new(Cell::new(1));
+        let design_runs = Cell::new(0_usize);
+        let base_loads = Cell::new(0_usize);
+
+        let mut cache = VoiceCache::<FakeVoice>(None);
+        let mut preloaded_design = Some(FakeTalker {
+            alive: Rc::clone(&alive_design),
+        });
+        let ref_cache = Mutex::new(super::DerivedReferenceCache::new());
+
+        let select = |cache: &mut VoiceCache<FakeVoice>,
+                          design: &mut Option<FakeTalker>,
+                          profile: &str,
+                          d_path: &std::path::Path,
+                          b_path: &std::path::Path|
+         -> io::Result<(Vec<f32>, Vec<[i32; 16]>)> {
+            let voice = cache.get_or_acquire(
+                profile,
+                design,
+                &ref_cache,
+                || super::model_identity_sha256(d_path, b_path, &mut || Ok(())),
+                || {
+                    assert_eq!(alive_design.get(), 0, "Design and Base never coexist");
+                    assert_eq!(alive_base.get(), 0, "Two Base models never coexist");
+                    base_loads.set(base_loads.get() + 1);
+                    alive_base.set(alive_base.get() + 1);
+                    Ok(FakeTalker {
+                        alive: Rc::clone(&alive_base),
+                    })
+                },
+                |design_slot| {
+                    assert_eq!(alive_base.get(), 0, "Base must drop before Design runs");
+                    let _taken = design_slot.take();
+                    design_runs.set(design_runs.get() + 1);
+                    let run_id = design_runs.get();
+                    base_loads.set(base_loads.get() + 1);
+                    alive_base.set(alive_base.get() + 1);
+                    let speaker = vec![f32::from(u8::try_from(run_id).unwrap_or(1))];
+                    let codes = vec![[i32::try_from(run_id).unwrap_or(1); 16]];
+                    Ok((
+                        FakeTalker {
+                            alive: Rc::clone(&alive_base),
+                        },
+                        crate::rust_talker::Reference { speaker, codes },
+                    ))
+                },
+            )?;
+            Ok((voice.reference.speaker.clone(), voice.reference.codes.clone()))
+        };
+
+        // Voice A cold -> runs VoiceDesign + Base load.
+        let (spk_a, codes_a) = select(&mut cache, &mut preloaded_design, "Warm narrator", &design_path, &base_path)?;
+        assert_eq!(design_runs.get(), 1);
+        assert_eq!(base_loads.get(), 1);
+        assert_eq!(alive_design.get(), 0);
+        assert_eq!(alive_base.get(), 1);
+
+        // Voice B cold -> drops Base, runs VoiceDesign + Base load.
+        let (spk_b, codes_b) = select(&mut cache, &mut preloaded_design, "Clear alto", &design_path, &base_path)?;
+        assert_ne!(spk_a, spk_b);
+        assert_ne!(codes_a, codes_b);
+        assert_eq!(design_runs.get(), 2);
+        assert_eq!(base_loads.get(), 2);
+        assert_eq!(alive_base.get(), 1);
+
+        // Switch back to Voice A -> hits derived cache AND reuses loaded Base Talker.
+        let (spk_a2, codes_a2) = select(&mut cache, &mut preloaded_design, "Warm narrator", &design_path, &base_path)?;
+        assert_eq!(spk_a2, spk_a);
+        assert_eq!(codes_a2, codes_a);
+        assert_eq!(design_runs.get(), 2);
+        assert_eq!(base_loads.get(), 2);
+        assert_eq!(alive_base.get(), 1);
+
+        // Clearing active voice (e.g. after failure) then requesting Voice A again skips VoiceDesign,
+        // only reloading Base.
+        cache.0 = None;
+        assert_eq!(alive_base.get(), 0);
+        let (spk_a3, codes_a3) = select(&mut cache, &mut preloaded_design, "Warm narrator", &design_path, &base_path)?;
+        assert_eq!(spk_a3, spk_a);
+        assert_eq!(codes_a3, codes_a);
+        assert_eq!(design_runs.get(), 2);
+        assert_eq!(base_loads.get(), 3);
+
+        // Changing model bytes (e.g. loading a new Q4 Synthesizer) changes model_sha256 -> cache misses!
+        drop(cache);
+        assert_eq!(alive_base.get(), 0);
+        fs::write(&design_path, b"design-q4-bytes")?;
+        let q4_sha = super::model_identity_sha256(&design_path, &base_path, &mut || Ok(()))?;
+        assert_ne!(q4_sha, q8_sha);
+        let mut q4_cache = VoiceCache::<FakeVoice>(None);
+        let (spk_a_q4, _) =
+            select(&mut q4_cache, &mut preloaded_design, "Warm narrator", &design_path, &base_path)?;
+        assert_ne!(spk_a_q4, spk_a);
+        assert_eq!(design_runs.get(), 3);
+
+        drop(q4_cache);
+        assert_eq!(alive_base.get(), 0);
+        fs::remove_file(&design_path)?;
+        fs::remove_file(&base_path)?;
+        fs::remove_dir(&dir)?;
+
+        // Verify LRU eviction capacity bound on DerivedReferenceCache.
+        let mut lru = super::DerivedReferenceCache::new();
+        for i in 0..=super::MAX_DERIVED_REFERENCES {
+            lru.insert(
+                &format!("voice-{i}"),
+                [1_u8; 32],
+                super::DerivedReference {
+                    speaker_embedding: vec![f32::from(u8::try_from(i).unwrap_or(0))],
+                    reference_codes: vec![[i32::try_from(i).unwrap_or(0); 16]],
+                },
+            );
+        }
+        assert!(lru.get("voice-0", &[1_u8; 32]).is_none());
+        assert!(lru.get(&format!("voice-{}", super::MAX_DERIVED_REFERENCES), &[1_u8; 32]).is_some());
         Ok(())
     }
 

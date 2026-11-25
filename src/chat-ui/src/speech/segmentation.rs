@@ -63,30 +63,77 @@ pub(super) fn phrase_boundary(text: &str, maximum: usize) -> usize {
             if character.is_whitespace() {
                 word = Some(index);
             }
-            if matches!(character, ',' | ';' | ':' | '，' | '；' | '：' | '、') {
-                let mut end = index + character.len_utf8();
-                let next = text[end..].chars().next();
-                // Thousands separators and times belong to the number. ASCII
-                // punctuation inside a token (URLs, paths, etc.) is not a pause.
-                let numeric =
-                    previous.is_some_and(char::is_numeric) && next.is_some_and(char::is_numeric);
-                while let Some(next) = bounded[end..].chars().next() {
-                    if !is_closing_delimiter(next) {
-                        break;
-                    }
-                    end += next.len_utf8();
-                }
-                if !numeric
-                    && (matches!(character, '，' | '；' | '：' | '、')
-                        || text[end..].chars().next().is_none_or(char::is_whitespace))
-                {
-                    clause = Some(end);
-                }
+            if is_clause_punctuation(character)
+                && let Some(end) =
+                    clause_pause_end(text, bounded, index, character, previous, true)
+            {
+                clause = Some(end);
             }
         }
         previous = Some(character);
     }
     clause.or(word).unwrap_or(maximum)
+}
+
+/// Return the first clause boundary once the spoken prefix reaches `min_chars`.
+pub(super) fn first_clause_boundary(
+    text: &str,
+    limit: usize,
+    complete: bool,
+    min_chars: usize,
+) -> Option<usize> {
+    let bounded = &text[..limit];
+    let mut speakable = false;
+    let mut previous = None;
+    for (index, character) in bounded.char_indices() {
+        if character.is_alphanumeric() {
+            speakable = true;
+            previous = Some(character);
+            continue;
+        }
+        if speakable
+            && is_clause_punctuation(character)
+            && let Some(end) =
+                clause_pause_end(text, bounded, index, character, previous, complete)
+            && text[..end].chars().count() >= min_chars
+        {
+            return Some(include_non_speakable_tail(text, limit, end, complete));
+        }
+        previous = Some(character);
+    }
+    None
+}
+
+fn clause_pause_end(
+    text: &str,
+    bounded: &str,
+    index: usize,
+    character: char,
+    previous: Option<char>,
+    allow_eof: bool,
+) -> Option<usize> {
+    let mut end = index + character.len_utf8();
+    let next = text[end..].chars().next();
+    // Thousands separators and times belong to the number. ASCII punctuation
+    // inside a token (URLs, paths, etc.) is not a pause.
+    let numeric = previous.is_some_and(char::is_numeric) && next.is_some_and(char::is_numeric);
+    while let Some(next_char) = bounded[end..].chars().next() {
+        if !is_closing_delimiter(next_char) {
+            break;
+        }
+        end += next_char.len_utf8();
+    }
+    if numeric {
+        return None;
+    }
+    let valid_follow = if matches!(character, '，' | '；' | '：' | '、') {
+        end < text.len() || allow_eof
+    } else if allow_eof {
+        text[end..].chars().next().is_none_or(char::is_whitespace)
+    } else {
+        text[end..].chars().next().is_some_and(char::is_whitespace)
+    };
+    valid_follow.then_some(end)
 }
 
 /// Return the byte offset after the first complete sentence within `limit`.
@@ -194,6 +241,10 @@ fn include_non_speakable_tail(text: &str, limit: usize, end: usize, complete: bo
 
 pub(super) const fn is_sentence_punctuation(character: char) -> bool {
     matches!(character, '.' | '!' | '?' | '…' | '。' | '！' | '？')
+}
+
+pub(super) const fn is_clause_punctuation(character: char) -> bool {
+    matches!(character, ',' | ';' | ':' | '，' | '；' | '：' | '、')
 }
 
 pub(super) const fn is_closing_delimiter(character: char) -> bool {

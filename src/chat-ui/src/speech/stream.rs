@@ -1,11 +1,14 @@
 //! Unicode-safe incremental speech segmentation with a bounded text lifetime.
 
 use super::segmentation::{
-    self, horizontal_whitespace, is_closing_delimiter, is_sentence_punctuation, line_break,
+    self, horizontal_whitespace, is_clause_punctuation, is_closing_delimiter,
+    is_sentence_punctuation, line_break,
 };
 use super::{Duration, Instant, MAX_TEXT, VecDeque};
 
 const LATENCY: Duration = Duration::from_millis(700);
+const FIRST_CLAUSE_LATENCY: Duration = Duration::from_millis(250);
+const FIRST_CLAUSE_MIN_CHARS: usize = 24;
 
 #[derive(Default)]
 pub(super) struct Text {
@@ -13,6 +16,7 @@ pub(super) struct Text {
     units: usize,
     since: Option<Instant>,
     pub(super) finished: bool,
+    first_emitted: bool,
     scanned_ws: usize,
     scanned_bytes: usize,
     scanned_chars: usize,
@@ -22,13 +26,17 @@ pub(super) struct Text {
     scanned_checks: usize,
 }
 
-fn safe_scan_end(pending: &str, min_offset: usize) -> usize {
+fn safe_scan_end(pending: &str, min_offset: usize, watch_clauses: bool) -> usize {
     let mut end = pending.len();
     while end > min_offset {
         let Some(ch) = pending[min_offset..end].chars().next_back() else {
             break;
         };
-        if is_sentence_punctuation(ch) || is_closing_delimiter(ch) || ch == '\r' {
+        if is_sentence_punctuation(ch)
+            || is_closing_delimiter(ch)
+            || ch == '\r'
+            || (watch_clauses && is_clause_punctuation(ch))
+        {
             end -= ch.len_utf8();
         } else {
             break;
@@ -64,9 +72,14 @@ impl Text {
     }
 
     pub(super) fn drain_ready(&mut self, now: Instant, result: &mut VecDeque<String>) {
+        let latency = if self.first_emitted {
+            LATENCY
+        } else {
+            FIRST_CLAUSE_LATENCY
+        };
         let expired = self
             .since
-            .is_some_and(|since| now.duration_since(since) >= LATENCY);
+            .is_some_and(|since| now.duration_since(since) >= latency);
         if !self.finished && !expired && self.since.is_some() {
             let ws_start = if self.scanned_bytes > 0 {
                 self.scanned_ws
@@ -79,23 +92,27 @@ impl Text {
             {
                 self.scanned_checks += tail.len();
             }
-            if !tail
-                .chars()
-                .any(|ch| line_break(ch) || is_sentence_punctuation(ch))
+            let tail_chars = tail.chars().count();
+            let total_chars = self.scanned_chars + tail_chars;
+            let clause_candidate = !self.first_emitted
+                && total_chars >= FIRST_CLAUSE_MIN_CHARS
+                && tail.chars().any(is_clause_punctuation);
+            if !clause_candidate
+                && !tail
+                    .chars()
+                    .any(|ch| line_break(ch) || is_sentence_punctuation(ch))
+                && total_chars <= super::MAX_SEGMENT
             {
-                let tail_chars = tail.chars().count();
-                if self.scanned_chars + tail_chars <= super::MAX_SEGMENT {
-                    let safe_end = safe_scan_end(&self.pending, ws_start);
-                    if safe_end > resume {
-                        self.scanned_chars += self.pending[resume..safe_end].chars().count();
-                        self.scanned_bytes = safe_end;
-                    } else if self.scanned_bytes == 0 {
-                        self.scanned_bytes = ws_start;
-                        self.scanned_chars = 0;
-                    }
-                    self.scanned_ws = ws_start;
-                    return;
+                let safe_end = safe_scan_end(&self.pending, ws_start, !self.first_emitted);
+                if safe_end > resume {
+                    self.scanned_chars += self.pending[resume..safe_end].chars().count();
+                    self.scanned_bytes = safe_end;
+                } else if self.scanned_bytes == 0 {
+                    self.scanned_bytes = ws_start;
+                    self.scanned_chars = 0;
                 }
+                self.scanned_ws = ws_start;
+                return;
             }
         }
         let mut consumed = 0;
@@ -117,7 +134,18 @@ impl Text {
             let sentence = if self.finished {
                 Some(segmentation::clip_boundary(pending))
             } else {
-                segmentation::sentence_boundary(pending, limit, expired)
+                segmentation::sentence_boundary(pending, limit, expired).or_else(|| {
+                    (!self.first_emitted)
+                        .then(|| {
+                            segmentation::first_clause_boundary(
+                                pending,
+                                limit,
+                                expired,
+                                FIRST_CLAUSE_MIN_CHARS,
+                            )
+                        })
+                        .flatten()
+                })
             };
             let boundary = sentence.or_else(|| {
                 if maximum.is_some() {
@@ -150,6 +178,7 @@ impl Text {
             if !piece.trim().is_empty() {
                 result.push_back(piece.to_owned());
                 emitted = true;
+                self.first_emitted = true;
             }
             consumed += boundary;
         }
@@ -176,7 +205,7 @@ impl Text {
             if !self.finished && !expired && self.since.is_some() && !self.pending.is_empty() {
                 let ws_start = self.pending.len()
                     - self.pending.trim_start_matches(horizontal_whitespace).len();
-                let safe_end = safe_scan_end(&self.pending, ws_start);
+                let safe_end = safe_scan_end(&self.pending, ws_start, !self.first_emitted);
                 self.scanned_ws = ws_start;
                 self.scanned_bytes = safe_end;
                 self.scanned_chars = self.pending[ws_start..safe_end].chars().count();
@@ -187,7 +216,7 @@ impl Text {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instant, LATENCY, MAX_TEXT, Text};
+    use super::{FIRST_CLAUSE_LATENCY, Instant, LATENCY, MAX_TEXT, Text};
     use crate::speech::{MAX_SEGMENT, segments};
 
     #[test]
@@ -341,19 +370,33 @@ mod tests {
     fn streaming_latency_waits_for_idle_while_words_keep_arriving() -> Result<(), &'static str> {
         let now = Instant::now();
         let mut text = Text::default();
+        // First segment uses the shorter 250 ms idle clause timeout, resetting while tokens arrive.
         text.append("A clause", now)?;
+        let almost_first = FIRST_CLAUSE_LATENCY
+            .checked_sub(std::time::Duration::from_millis(1))
+            .ok_or("first-clause latency must exceed one millisecond")?;
+        let later = now + almost_first;
+        text.append(" continuing", later)?;
+        assert!(text.ready(now + FIRST_CLAUSE_LATENCY).is_empty());
+        assert!(text.ready(later + almost_first).is_empty());
+        assert_eq!(text.ready(later + FIRST_CLAUSE_LATENCY), ["A clause"]);
+
+        // Subsequent segments keep the full 700 ms latency window.
+        let next_start = later + FIRST_CLAUSE_LATENCY;
+        text.append(" softly", next_start)?;
         let almost_latency = LATENCY
             .checked_sub(std::time::Duration::from_millis(1))
             .ok_or("latency must exceed one millisecond")?;
-        let later = now + almost_latency;
-        text.append(" continuing", later)?;
-        assert!(text.ready(now + LATENCY).is_empty());
-        assert!(text.ready(later + almost_latency).is_empty());
-        assert_eq!(text.ready(later + LATENCY), ["A clause"]);
-        text.append(" softly.", later + LATENCY)?;
+        let second_later = next_start + almost_latency;
+        text.append(" onward", second_later)?;
+        assert!(text.ready(next_start + LATENCY).is_empty());
+        assert!(text.ready(second_later + almost_latency).is_empty());
+        assert_eq!(text.ready(second_later + LATENCY), ["continuing softly"]);
+
+        text.append(".", second_later + LATENCY)?;
         text.finished = true;
-        assert_eq!(text.ready(later + LATENCY), ["continuing softly."]);
-        assert!(text.ready(later + LATENCY).is_empty());
+        assert_eq!(text.ready(second_later + LATENCY), ["onward."]);
+        assert!(text.ready(second_later + LATENCY).is_empty());
         Ok(())
     }
 
@@ -563,22 +606,55 @@ mod tests {
     fn prosody_streaming_clauses_wait_for_sentence_context() -> Result<(), &'static str> {
         let now = Instant::now();
         let mut text = Text::default();
-        for part in [
-            "A quiet opening,",
-            " followed by a pause;",
-            " then a detail:",
-            " and a complete ending.",
-        ] {
-            text.append(part, now)?;
-            assert!(text.ready(now).is_empty());
-        }
+        // Short early comma (< 24 chars) does not split; once >= 24 chars, the first clause flushes.
+        text.append("A quiet opening,", now)?;
+        assert!(text.ready(now).is_empty());
+        text.append(" followed by a pause;", now)?;
+        assert!(text.ready(now).is_empty());
+        text.append(" then a detail:", now)?;
+        assert_eq!(
+            text.ready(now),
+            ["A quiet opening, followed by a pause;"]
+        );
+        text.append(" and a complete ending.", now)?;
+        assert!(text.ready(now).is_empty());
         text.append(" ", now)?;
         assert_eq!(
             text.ready(now),
-            ["A quiet opening, followed by a pause; then a detail: and a complete ending."]
+            ["then a detail: and a complete ending."]
         );
         text.finished = true;
         assert!(text.ready(now).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn first_segment_flushes_early_on_clause_punctuation_only_above_threshold()
+    -> Result<(), &'static str> {
+        let now = Instant::now();
+        for separator in [',', ';', ':'] {
+            let mut text = Text::default();
+            // Below 24 chars, clause punctuation waits; numeric 12,345 / 08:30 also waits.
+            text.append(&format!("Brief{separator} 12,345 at 08:30"), now)?;
+            assert!(text.ready(now).is_empty());
+
+            // Crossing >= 24 chars and ending on clause punctuation + whitespace flushes first segment.
+            text.append(&format!(" and enough text{separator}"), now)?;
+            assert!(text.ready(now).is_empty());
+            text.append(" following clause, kept for sentence.", now)?;
+            assert_eq!(
+                text.ready(now),
+                [format!(
+                    "Brief{separator} 12,345 at 08:30 and enough text{separator}"
+                )]
+            );
+            // Subsequent segments must NOT flush early on clause punctuation even >= 24 chars.
+            text.append(" ", now)?;
+            assert_eq!(
+                text.ready(now),
+                ["following clause, kept for sentence."]
+            );
+        }
         Ok(())
     }
 
