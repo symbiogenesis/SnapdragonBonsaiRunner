@@ -25,6 +25,10 @@ pub(super) const ADAPTER_PQ2_EXECUTION_SHA256: &str =
     "73d7c72c706b7e310bafb314f70564fd1d006d56ff742bff7372f9f47223b9e6";
 pub(super) const ADAPTER_REPACKED_PTQ1_EXECUTION_SHA256: &str =
     "f7f50497a217f23cbeafc49781fedce3a8437aa629ad98740aaf53b892b4b81a";
+pub(super) const ADAPTER_BONSAI25_PQ2_EXECUTION_SHA256: &str =
+    "d6b597fe8e1d1d559a41cbba127756be42401fbf5a44866cd4527471770f94ca";
+pub(super) const ADAPTER_BONSAI25_PTQ1_EXECUTION_SHA256: &str =
+    "e8dce51125fb57607b007789d4837cfc0856715e8cab6846010c1c6844ad127f";
 pub(super) const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 pub(super) const MMPROJ_SHA256: &str =
@@ -35,6 +39,15 @@ pub(super) const fn adapter_execution_sha256(repacked: bool) -> &'static str {
         ADAPTER_REPACKED_PTQ1_EXECUTION_SHA256
     } else {
         ADAPTER_PQ2_EXECUTION_SHA256
+    }
+}
+
+pub(super) const fn adapter_execution_sha256_for_bonsai25(
+    variant: bonsai_cpu_policy::Bonsai25Variant,
+) -> &'static str {
+    match variant {
+        bonsai_cpu_policy::Bonsai25Variant::Pq2 => ADAPTER_BONSAI25_PQ2_EXECUTION_SHA256,
+        bonsai_cpu_policy::Bonsai25Variant::Ptq1 => ADAPTER_BONSAI25_PTQ1_EXECUTION_SHA256,
     }
 }
 
@@ -615,6 +628,9 @@ const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_34;
 // Opt-in NariQ trellis support requires a separately reviewed native Prism
 // release supporting `--nariq <2.5bpw|3.0bpw|2.0bpw>` and `:trellis-v1` identity.
 pub(crate) const NARIQ_TRELLIS_RELEASE: Option<(&str, &str)> = None;
+// Opt-in Ternary Bonsai 2.5 27B support requires a separately reviewed native
+// Prism release (`v0.1.35+`) supporting `--bonsai-2-5 <pq2|ptq1>`.
+pub(crate) const BONSAI_2_5_RELEASE: Option<(&str, &str)> = None;
 
 // CPU tiled prefill requires a separately reviewed native release supporting
 // `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
@@ -655,6 +671,10 @@ pub(super) fn multi_rank_lora_supported() -> Result<bool, LaunchError> {
 
 pub(super) fn nariq_trellis_supported() -> Result<bool, LaunchError> {
     pinned_matches(NARIQ_TRELLIS_RELEASE)
+}
+
+pub(super) fn bonsai_2_5_supported() -> Result<bool, LaunchError> {
+    pinned_matches(BONSAI_2_5_RELEASE)
 }
 
 pub(super) fn pinned_version() -> Result<String, LaunchError> {
@@ -1341,6 +1361,23 @@ mod tests {
             Some(("0.1.34", &pin.commit))
         ));
         assert!(!reviewed_release_matches(&pin, NARIQ_TRELLIS_RELEASE));
+        Ok(())
+    }
+
+    #[test]
+    fn bonsai25_release_gate_and_execution_digests_are_pinned() -> Result<(), LaunchError> {
+        assert_eq!(BONSAI_2_5_RELEASE, None);
+        assert!(!bonsai_2_5_supported()?);
+        let pin = release(LOCK)?;
+        assert!(!reviewed_release_matches(&pin, BONSAI_2_5_RELEASE));
+        assert_eq!(
+            adapter_execution_sha256_for_bonsai25(bonsai_cpu_policy::Bonsai25Variant::Pq2),
+            ADAPTER_BONSAI25_PQ2_EXECUTION_SHA256
+        );
+        assert_eq!(
+            adapter_execution_sha256_for_bonsai25(bonsai_cpu_policy::Bonsai25Variant::Ptq1),
+            ADAPTER_BONSAI25_PTQ1_EXECUTION_SHA256
+        );
         Ok(())
     }
 }

@@ -345,10 +345,14 @@ fn startup_projection_matches(
 fn cache_identity_matches(
     model: &NativeModel<'_>,
     workers: WorkerReadiness<'_>,
-    repacked: bool,
+    representation_kind: super::WeightRepresentation,
     adapter: bool,
     is_nariq: bool,
 ) -> bool {
+    let repacked = matches!(
+        representation_kind,
+        super::WeightRepresentation::CurrentRepackedPtq1
+    );
     let Some(policy) = workers.kv_cache else {
         return workers.cpu_prefill.is_none()
             && !workers.cpu_prefill_gdn_wy_f32
@@ -375,12 +379,22 @@ fn cache_identity_matches(
     );
     if adapter {
         use std::fmt::Write as _;
+        let adapter_exec_sha = match representation_kind {
+            super::WeightRepresentation::Bonsai25(variant) => {
+                crate::inference::adapter_execution_sha256_for_bonsai25(variant)
+            }
+            super::WeightRepresentation::Source
+            | super::WeightRepresentation::CurrentRepackedPtq1
+            | super::WeightRepresentation::NariQ(_) => {
+                crate::inference::adapter_execution_sha256(repacked)
+            }
+        };
         let write_result = if workers.adapter_execution_digest_required {
             write!(
                 prefix,
                 ":rank-one-lora-v1:{}:sha256={}:{:08x}",
                 crate::inference::ADAPTER_SHA256,
-                crate::inference::adapter_execution_sha256(repacked),
+                adapter_exec_sha,
                 1.3_f32.to_bits()
             )
         } else {
@@ -473,11 +487,13 @@ pub(super) fn validate_native_identity_for_representation(
     );
     let nariq_variant = match representation_kind {
         super::WeightRepresentation::NariQ(variant) => Some(variant),
-        super::WeightRepresentation::Source | super::WeightRepresentation::CurrentRepackedPtq1 => {
-            None
-        }
+        super::WeightRepresentation::Source
+        | super::WeightRepresentation::CurrentRepackedPtq1
+        | super::WeightRepresentation::Bonsai25(_) => None,
     };
     let is_nariq = nariq_variant.is_some();
+    let extended_identity =
+        !matches!(representation_kind, super::WeightRepresentation::Source) || adapter;
     if is_nariq && adapter {
         return Err(NativeIdentityError::Adapter);
     }
@@ -497,8 +513,13 @@ pub(super) fn validate_native_identity_for_representation(
             variant.sha256(),
             variant.representation_name(),
         ),
+        super::WeightRepresentation::Bonsai25(variant) => (
+            variant.model_id(),
+            variant.sha256(),
+            variant.representation_name(),
+        ),
     };
-    let weight_representation_matches = if repacked || is_nariq || adapter {
+    let weight_representation_matches = if extended_identity {
         model.weight_representation.as_deref() == Some(representation)
     } else {
         model.weight_representation.is_none()
@@ -526,7 +547,7 @@ pub(super) fn validate_native_identity_for_representation(
     {
         return Err(NativeIdentityError::PromptReuse);
     }
-    let adapter_matches = if repacked || is_nariq || adapter {
+    let adapter_matches = if extended_identity {
         matches!(&model.adapter_sha256, AdapterIdentity::Present(value)
             if value.as_deref() == adapter.then_some(crate::inference::ADAPTER_SHA256))
             && model.supports_abliteration_scale == Some(adapter)
@@ -556,7 +577,7 @@ pub(super) fn validate_native_identity_for_representation(
     if !daisyrose_matches {
         return Err(NativeIdentityError::Adapter);
     }
-    if !cache_identity_matches(model, workers, repacked, adapter, is_nariq) {
+    if !cache_identity_matches(model, workers, representation_kind, adapter, is_nariq) {
         return Err(NativeIdentityError::KvCacheGraph);
     }
     let expected_prefill = workers
@@ -2252,6 +2273,107 @@ mod context_tests {
             super::validate_native_identity_for_representation(&vision_wire, repr, false, policy),
             Err(NativeIdentityError::Vision)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn bonsai25_identity_accepts_orca_free_and_orca_stacked_with_daisyrose_hexagon_and_vision()
+    -> Result<(), String> {
+        use super::NativeIdentityError;
+        use serde_json::json;
+        let pinned = crate::inference::pinned_version().map_err(|e| format!("{e:?}"))?;
+        let daisy_sha = "cd".repeat(32);
+        let daisy_exec_sha = "ab".repeat(32);
+
+        for variant in [
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
+            bonsai_cpu_policy::Bonsai25Variant::Ptq1,
+        ] {
+            let repr = super::super::WeightRepresentation::Bonsai25(variant);
+            let exec_orca = crate::inference::adapter_execution_sha256_for_bonsai25(variant);
+            for use_orca in [false, true] {
+                let mut graph = format!(
+                    "{}:qwen35-text-v1:nonflash-f16:kv-rsq4-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1",
+                    variant.sha256()
+                );
+                if use_orca {
+                    graph.push_str(&format!(
+                        ":rank-one-lora-v1:{}:sha256={}:{:08x}",
+                        crate::inference::ADAPTER_SHA256,
+                        exec_orca,
+                        1.3_f32.to_bits()
+                    ));
+                }
+                graph.push_str(&format!(":multi-rank-lora-v1:{daisy_exec_sha}:00000000"));
+                let mut payload = json!({
+                    "id": variant.model_id(),
+                    "object": "model",
+                    "model_sha256": variant.sha256(),
+                    "template_sha256": crate::inference::TEMPLATE_SHA256,
+                    "runtime": "prism-inference",
+                    "context_tokens": 32_768,
+                    "seed": 42,
+                    "row_workers": 4,
+                    "vision": true,
+                    "mmproj_sha256": crate::inference::MMPROJ_SHA256,
+                    "image_max_tokens": bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS,
+                    "weight_representation": variant.representation_name(),
+                    "adapter_sha256": if use_orca { json!(crate::inference::ADAPTER_SHA256) } else { json!(null) },
+                    "supports_abliteration_scale": use_orca,
+                    "supports_daisyrose_scale": true,
+                    "daisyrose_scale_range": [0, 2],
+                    "daisyrose_adapter_sha256": daisy_sha,
+                    "daisyrose_adapter_max_rank": 16,
+                    "kv_cache": "rsq4",
+                    "startup_graph_identity": graph,
+                    "startup_projection": {
+                        "schema_version": 1,
+                        "requested": "auto",
+                        "effective": "hexagon-native-q2",
+                        "identity": "hexagon-hvx-native-q2-resident-v1-experimental",
+                        "resident_tensors": 168,
+                        "resident_weight_bytes": 2_888_663_040_u64,
+                        "host_metadata_bytes": 4096_u64,
+                    },
+                });
+                if use_orca {
+                    payload["abliteration_scale_range"] = json!([0, 2]);
+                }
+                let wire = crate::test_util::http_models_response(&payload)
+                    .map_err(|err| format!("{err:?}"))?;
+                let policy = WorkerReadiness {
+                    kv_cache: Some(crate::inference::KvCache::Rsq4),
+                    context_tokens: 32_768,
+                    vision: true,
+                    daisyrose: Some((daisy_sha.as_str(), 16)),
+                    ..WorkerReadiness::for_version(&pinned, 4)
+                };
+                assert_eq!(
+                    super::validate_native_identity_for_representation(
+                        &wire, repr, use_orca, policy
+                    ),
+                    Ok(())
+                );
+                assert_eq!(
+                    super::validate_native_identity_for_representation(
+                        &wire, repr, !use_orca, policy
+                    ),
+                    Err(NativeIdentityError::Adapter)
+                );
+
+                // Reject unexpected NariQ `:trellis-v1` tag or mismatched Orca digest on Bonsai 2.5.
+                let mut bad_trellis = payload;
+                bad_trellis["startup_graph_identity"] = json!(format!("{graph}:trellis-v1"));
+                let bad_wire = crate::test_util::http_models_response(&bad_trellis)
+                    .map_err(|err| format!("{err:?}"))?;
+                assert_eq!(
+                    super::validate_native_identity_for_representation(
+                        &bad_wire, repr, use_orca, policy
+                    ),
+                    Err(NativeIdentityError::KvCacheGraph)
+                );
+            }
+        }
         Ok(())
     }
 

@@ -70,7 +70,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--use-abliterate-lora] (pinned adapter; request scale 0..2, default 1.3; Swift CPU only)\n",
     "  [--daisyrose-lora <absolute-gguf>] (stackable multi-rank NpuFriendly LoRA; native Swift only; request scale 0..2, default 0.0 unless promoted lock)\n",
     "  [--no-daisyrose-lora] (disable any default-enabled DaisyRose adapter; native Swift only)\n",
-    "  [--use-repacked-ptq1|--use-original-pq2|--nariq 2.5bpw|3.0bpw|2.0bpw] (mutually exclusive weight selections; Swift only)\n",
+    "  [--use-repacked-ptq1|--use-original-pq2|--nariq 2.5bpw|3.0bpw|2.0bpw|--bonsai-2-5 pq2|ptq1] (mutually exclusive weight selections; Swift only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
     "Default: reference-cpu. Only compiled model/runtime pins and fixed CPU policies are accepted.\n",
     "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise) and original PQ2 weights; PTQ1 requires explicit selection. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
@@ -126,6 +126,7 @@ enum WeightRepresentation {
     Source,
     CurrentRepackedPtq1,
     NariQ(bonsai_cpu_policy::NariqVariant),
+    Bonsai25(bonsai_cpu_policy::Bonsai25Variant),
 }
 
 enum BackendContainment {
@@ -287,8 +288,13 @@ impl LaunchConfig {
             (None, None, None, None);
         let (mut reset_on_cancel, mut no_mmproj, mut use_abliterate_lora, mut no_daisyrose_lora) =
             (false, false, false, false);
-        let (mut daisyrose_lora, mut use_repacked_ptq1, mut nariq_variant, mut profile) =
-            (None, None, None, None);
+        let (
+            mut daisyrose_lora,
+            mut use_repacked_ptq1,
+            mut nariq_variant,
+            mut bonsai25_variant,
+            mut profile,
+        ) = (None, None, None, None, None);
         let (mut data, mut evidence_parent) = (None, None);
         let (mut frontend_port, mut backend_port, mut max_waiting) = (None, None, None);
         let take_path = |v: Option<OsString>| v.map(PathBuf::from).ok_or(LaunchError::Arguments);
@@ -360,6 +366,11 @@ impl LaunchConfig {
                         .and_then(|s| s.parse::<bonsai_cpu_policy::NariqVariant>().ok())
                         .ok_or(LaunchError::Arguments)
                 })?,
+                Some("--bonsai-2-5") => take_once(&mut bonsai25_variant, &mut args, |v| {
+                    v.and_then(|s| s.into_string().ok())
+                        .and_then(|s| s.parse::<bonsai_cpu_policy::Bonsai25Variant>().ok())
+                        .ok_or(LaunchError::Arguments)
+                })?,
                 Some("--profile") => {
                     take_once(&mut profile, &mut args, |v| launch_profile(v.as_deref()))?;
                 }
@@ -375,7 +386,10 @@ impl LaunchConfig {
                 _ => return Err(LaunchError::Arguments),
             }
         }
-        if nariq_variant.is_some() && use_repacked_ptq1.is_some() {
+        let explicit_variants = usize::from(nariq_variant.is_some())
+            + usize::from(bonsai25_variant.is_some())
+            + usize::from(use_repacked_ptq1.is_some());
+        if explicit_variants > 1 {
             return Err(LaunchError::Arguments);
         }
         let frontend_port = frontend_port.ok_or(LaunchError::Arguments)?;
@@ -448,17 +462,21 @@ impl LaunchConfig {
             no_daisyrose_lora,
             weight_representation: if let Some(variant) = nariq_variant {
                 WeightRepresentation::NariQ(variant)
+            } else if let Some(variant) = bonsai25_variant {
+                WeightRepresentation::Bonsai25(variant)
             } else if use_repacked_ptq1.unwrap_or(false) {
                 WeightRepresentation::CurrentRepackedPtq1
             } else {
                 WeightRepresentation::Source
             },
         };
-        configuration.validate_selection(use_repacked_ptq1.is_some() || nariq_variant.is_some())?;
+        configuration.validate_selection(
+            use_repacked_ptq1.is_some() || nariq_variant.is_some() || bonsai25_variant.is_some(),
+        )?;
         if let Some(cache_dir) = &configuration.hexagon_arena_cache {
             validate_hexagon_arena_cache_dir(cache_dir)?;
         }
-        let gates: [(bool, fn() -> Result<bool, LaunchError>); 9] = [
+        let gates: [(bool, fn() -> Result<bool, LaunchError>); 10] = [
             (
                 configuration.reset_on_cancel,
                 crate::inference::reset_on_cancel_supported,
@@ -497,6 +515,10 @@ impl LaunchConfig {
                 configuration.nariq_variant().is_some(),
                 crate::inference::nariq_trellis_supported,
             ),
+            (
+                configuration.bonsai25_variant().is_some(),
+                crate::inference::bonsai_2_5_supported,
+            ),
         ];
         for (enabled, supported) in gates {
             if enabled && !supported()? {
@@ -523,7 +545,18 @@ impl LaunchConfig {
     const fn nariq_variant(&self) -> Option<bonsai_cpu_policy::NariqVariant> {
         match self.weight_representation {
             WeightRepresentation::NariQ(variant) => Some(variant),
-            WeightRepresentation::Source | WeightRepresentation::CurrentRepackedPtq1 => None,
+            WeightRepresentation::Source
+            | WeightRepresentation::CurrentRepackedPtq1
+            | WeightRepresentation::Bonsai25(_) => None,
+        }
+    }
+
+    const fn bonsai25_variant(&self) -> Option<bonsai_cpu_policy::Bonsai25Variant> {
+        match self.weight_representation {
+            WeightRepresentation::Bonsai25(variant) => Some(variant),
+            WeightRepresentation::Source
+            | WeightRepresentation::CurrentRepackedPtq1
+            | WeightRepresentation::NariQ(_) => None,
         }
     }
 
@@ -534,6 +567,14 @@ impl LaunchConfig {
     ) -> Result<LaunchPlan, crate::launch_policy::PolicyError> {
         if let Some(variant) = self.nariq_variant() {
             LaunchPlan::for_swift_nariq(&self.data, backend_port, key_file, variant)
+        } else if let Some(variant) = self.bonsai25_variant() {
+            LaunchPlan::for_swift_bonsai25(
+                &self.data,
+                backend_port,
+                key_file,
+                variant,
+                self.use_abliterate_lora,
+            )
         } else {
             LaunchPlan::for_profile_with_options(
                 &self.data,
@@ -549,6 +590,7 @@ impl LaunchConfig {
     fn validate_selection(&self, explicit_weight: bool) -> Result<(), LaunchError> {
         let swift = self.profile == LaunchProfile::SwiftPq2Assessment;
         let is_nariq = self.nariq_variant().is_some();
+        let is_bonsai25 = self.bonsai25_variant().is_some();
         if (self.frontend_port != 0 && self.frontend_port < 1024)
             || self.backend_port < 1024
             || self.backend_port == self.frontend_port
@@ -595,6 +637,7 @@ impl LaunchConfig {
                         crate::inference::Placement::Vulkan
                             | crate::inference::Placement::Composite
                     )))
+            || (is_bonsai25 && (!swift || !self.native_engine))
             || (explicit_weight && !swift)
         {
             return Err(LaunchError::Arguments);
@@ -719,6 +762,7 @@ impl LaunchConfig {
             WeightRepresentation::Source => SwiftWeightPacking::Pq2_0,
             WeightRepresentation::CurrentRepackedPtq1 => SwiftWeightPacking::Ptq1_0,
             WeightRepresentation::NariQ(variant) => SwiftWeightPacking::from_nariq(variant),
+            WeightRepresentation::Bonsai25(variant) => SwiftWeightPacking::from_bonsai25(variant),
         };
         let checkpoints = self.prompt_reuse_checkpoints.unwrap_or(1);
         let checkpoint_bytes = self.prompt_reuse_checkpoint_bytes;
@@ -869,6 +913,7 @@ impl LaunchConfig {
                 .context_plan);
         }
         if self.nariq_variant().is_some()
+            || self.bonsai25_variant().is_some()
             || self.effective_speculation_tokens().is_some()
             || self.cpu_prefill_gdn.is_some()
             || self.prompt_reuse == crate::inference::PromptReuseMode::PromptEndAndLatest
@@ -1015,7 +1060,7 @@ impl LaunchConfig {
         }
         // Compiled PQ2 locks never auto-attach onto NariQ base weights; require
         // an explicit --daisyrose-lora until NariQ has its own promoted lock.
-        let pinned = if self.nariq_variant().is_some() {
+        let pinned = if self.nariq_variant().is_some() || self.bonsai25_variant().is_some() {
             None
         } else {
             pinned
@@ -1148,6 +1193,8 @@ impl LaunchConfig {
         if self.native_engine {
             let artifacts = if let Some(variant) = self.nariq_variant() {
                 VerifiedArtifacts::verify_nariq_model(&self.data, variant)
+            } else if let Some(variant) = self.bonsai25_variant() {
+                VerifiedArtifacts::verify_bonsai25_model(&self.data, variant)
             } else {
                 VerifiedArtifacts::verify_model_for_profile(
                     &self.data,
@@ -1342,6 +1389,8 @@ impl LaunchConfig {
         }
         if let Some(variant) = self.nariq_variant() {
             push_arg(&mut arguments, "--nariq", variant.as_str());
+        } else if let Some(variant) = self.bonsai25_variant() {
+            push_arg(&mut arguments, "--bonsai-2-5", variant.as_str());
         } else if self.uses_repacked_ptq1() {
             arguments.push("--use-repacked-ptq1".into());
         }
@@ -1493,6 +1542,8 @@ impl LaunchConfig {
             let mut section_files: Vec<&std::fs::File> = Vec::with_capacity(4);
             let mut section_digests: Vec<[u8; 32]> = Vec::with_capacity(4);
             let model_hash = if let Some(variant) = self.nariq_variant() {
+                variant.sha256()
+            } else if let Some(variant) = self.bonsai25_variant() {
                 variant.sha256()
             } else if self.uses_repacked_ptq1() {
                 crate::inference::REPACKED_PTQ1_SHA256
@@ -1709,6 +1760,7 @@ impl LaunchConfig {
                     daisyrose.is_some() && admitted
                 } else {
                     if self.nariq_variant().is_some()
+                        || self.bonsai25_variant().is_some()
                         || self.effective_speculation_tokens().is_some()
                         || self.cpu_prefill_gdn.is_some()
                         || self.prompt_reuse
@@ -5520,6 +5572,104 @@ mod tests {
             LaunchConfig::parse(gated).err(),
             Some(LaunchError::NativeRuntime)
         );
+    }
+
+    #[test]
+    fn bonsai25_options_validate_conflicts_release_gate_and_stacking() -> std::io::Result<()> {
+        assert!(super::LAUNCH_USAGE.contains("--bonsai-2-5"));
+        let mut native = arguments();
+        native.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
+
+        for bad_extra in [
+            vec!["--bonsai-2-5", "invalid"],
+            vec!["--bonsai-2-5", "pq2", "--bonsai-2-5", "ptq1"],
+            vec!["--use-repacked-ptq1", "--bonsai-2-5", "pq2"],
+            vec!["--use-original-pq2", "--bonsai-2-5", "ptq1"],
+            vec!["--nariq", "2.5bpw", "--bonsai-2-5", "pq2"],
+            vec!["--publisher-engine", "--bonsai-2-5", "pq2"],
+        ] {
+            let mut rejected = native.clone();
+            rejected.extend(bad_extra.into_iter().map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(rejected).err(),
+                Some(LaunchError::Arguments)
+            );
+        }
+
+        // Gated on BONSAI_2_5_RELEASE = None while allowing Orca, placements, and DaisyRose parsing.
+        for extra in [
+            vec!["--bonsai-2-5", "pq2"],
+            vec!["--bonsai-2-5", "ptq1", "--use-abliterate-lora"],
+            vec![
+                "--bonsai-2-5",
+                "ptq1",
+                "--placement",
+                "composite",
+                "--use-abliterate-lora",
+            ],
+        ] {
+            let mut gated = native.clone();
+            gated.extend(extra.into_iter().map(OsString::from));
+            assert_eq!(
+                LaunchConfig::parse(gated).err(),
+                Some(LaunchError::NativeRuntime)
+            );
+        }
+
+        let temp = crate::test_util::TempDir::new("Bonsai-bonsai25-launcher")?;
+        for variant in [
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
+            bonsai_cpu_policy::Bonsai25Variant::Ptq1,
+        ] {
+            let mut cfg = LaunchConfig::parse(native.clone())
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            cfg.data = temp.path().to_path_buf();
+            cfg.evidence_parent = temp.path().to_path_buf();
+            cfg.kv_cache = Some(crate::inference::KvCache::Rsq4);
+            cfg.weight_representation = super::WeightRepresentation::Bonsai25(variant);
+            assert!(
+                cfg.runtime_supports_vision()
+                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+            );
+
+            // Compiled Swift PQ2 DaisyRose lock never auto-attaches onto Bonsai 2.5.
+            let pq2_promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact {
+                path: temp.path().join("pq2-promoted.gguf"),
+                bytes: 1024,
+                sha256: "a".repeat(64),
+                base_model_sha256: "b".repeat(64),
+                envelope: "npu-friendly".into(),
+                dtype: "f16".into(),
+                max_rank: 16,
+                target_count: 1,
+                repository: "symbiogenesis/DaisyRose-Swift-LoRA".into(),
+                revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                release: None,
+                filename: "pq2-promoted.gguf".into(),
+                url: "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/pq2-promoted.gguf".into(),
+                default_enabled: true,
+                default_scale_tenths: Some(10),
+            };
+            assert_eq!(
+                cfg.resolve_daisyrose_selection_with(Some(pq2_promoted), true)
+                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?,
+                None
+            );
+
+            let creds = super::PrivateCredentials::create(temp.path())?;
+            let plan = cfg
+                .build_launch_plan(cfg.backend_port, creds.backend_path())
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            assert!(plan.model_path.ends_with(variant.filename()));
+            let args = cfg.native_arguments(&plan, None);
+            assert!(has_flag_pair(
+                &args,
+                "--bonsai-2-5",
+                std::ffi::OsStr::new(variant.as_str())
+            ));
+            assert!(!args.iter().any(|arg| arg == "--use-repacked-ptq1"));
+        }
+        Ok(())
     }
 
     #[test]

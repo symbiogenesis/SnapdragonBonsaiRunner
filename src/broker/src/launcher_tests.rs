@@ -978,3 +978,44 @@ fn daisyrose_stacks_with_nariq_no_orca_suffix_speculation_and_placements() -> Re
     }
     Ok(())
 }
+
+#[test]
+fn bonsai25_supports_orca_on_and_off_with_daisyrose_and_exact_cow_bytes() -> Result<(), LaunchError>
+{
+    let data = std::env::temp_dir().join("Bonsai-bonsai25-launch-plan");
+    let daisy_path = data.join("adapters").join("custom-daisy.gguf");
+    let key = data.join("backend.key");
+    let daisy_plan = crate::launch_policy::DaisyRoseLoraPlan {
+        path: daisy_path,
+        bytes: 32 * 1024 * 1024,
+        sha256: "a".repeat(64),
+        max_rank: 16,
+    };
+    let reserve_usize = daisy_plan
+        .reserve_bytes()
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or(LaunchError::Memory)?;
+
+    for variant in [
+        bonsai_cpu_policy::Bonsai25Variant::Pq2,
+        bonsai_cpu_policy::Bonsai25Variant::Ptq1,
+    ] {
+        for use_orca in [false, true] {
+            let mut plan = LaunchPlan::for_swift_bonsai25(&data, 8081, &key, variant, use_orca)
+                .map_err(|_| LaunchError::Policy)?;
+            assert_eq!(plan.adapter.is_some(), use_orca);
+            let base_ws = plan.working_set_limit_bytes;
+            let expected_fixed = usize::try_from(
+                bonsai_cpu_policy::context::SwiftWeightPacking::from_bonsai25(variant)
+                    .calibrated_fixed_runtime_bytes(),
+            )
+            .map_err(|_| LaunchError::Memory)?;
+            assert_eq!(base_ws, expected_fixed);
+            plan.working_set_limit_bytes = base_ws + reserve_usize;
+            plan.enable_daisyrose_lora(daisy_plan.clone())
+                .map_err(|_| LaunchError::Policy)?;
+            assert_eq!(plan.native_child_memory_limit_bytes(), base_ws);
+        }
+    }
+    Ok(())
+}
