@@ -38,16 +38,35 @@ pub(super) enum BaseModelProfile {
     Nariq3_0Bpw,
     #[serde(rename = "nariq-2.0bpw")]
     Nariq2_0Bpw,
+    #[serde(rename = "bonsai-2.5-pq2")]
+    Bonsai25Pq2,
+    #[serde(rename = "bonsai-2.5-ptq1")]
+    Bonsai25Ptq1,
 }
 
 impl BaseModelProfile {
     pub(super) const fn is_nariq(self) -> bool {
-        !matches!(self, Self::SwiftPq2)
+        matches!(
+            self,
+            Self::Nariq2_5Bpw | Self::Nariq3_0Bpw | Self::Nariq2_0Bpw
+        )
+    }
+
+    pub(super) const fn is_bonsai25(self) -> bool {
+        matches!(self, Self::Bonsai25Pq2 | Self::Bonsai25Ptq1)
+    }
+
+    pub(super) const fn bonsai25_variant(self) -> Option<bonsai_cpu_policy::Bonsai25Variant> {
+        match self {
+            Self::Bonsai25Pq2 => Some(bonsai_cpu_policy::Bonsai25Variant::Pq2),
+            Self::Bonsai25Ptq1 => Some(bonsai_cpu_policy::Bonsai25Variant::Ptq1),
+            Self::SwiftPq2 | Self::Nariq2_5Bpw | Self::Nariq3_0Bpw | Self::Nariq2_0Bpw => None,
+        }
     }
 
     pub(super) const fn nariq_variant(self) -> Option<bonsai_cpu_policy::NariqVariant> {
         match self {
-            Self::SwiftPq2 => None,
+            Self::SwiftPq2 | Self::Bonsai25Pq2 | Self::Bonsai25Ptq1 => None,
             Self::Nariq2_5Bpw => Some(bonsai_cpu_policy::NariqVariant::Bpw2_5),
             Self::Nariq3_0Bpw => Some(bonsai_cpu_policy::NariqVariant::Bpw3_0),
             Self::Nariq2_0Bpw => Some(bonsai_cpu_policy::NariqVariant::Bpw2_0),
@@ -57,7 +76,10 @@ impl BaseModelProfile {
     pub(super) fn base_model_sha256(self) -> crate::Result<String> {
         match self.nariq_variant() {
             Some(variant) => Ok(variant.sha256().to_owned()),
-            None => compiled_swift_base_sha256(),
+            None => match self.bonsai25_variant() {
+                Some(variant) => Ok(variant.sha256().to_owned()),
+                None => compiled_swift_base_sha256(),
+            },
         }
     }
 }
@@ -71,6 +93,7 @@ const fn is_false(value: &bool) -> bool {
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct DrG2PlanConfig {
     pub(super) base_model: Option<BaseModelProfile>,
+    pub(super) include_orca: Option<bool>,
     pub(super) include_multimodal_checks: bool,
     pub(super) candidate_adapter_sha256: Option<String>,
     pub(super) candidate_max_rank: Option<u16>,
@@ -500,7 +523,8 @@ pub(super) fn run_generate_lock(request: &Request) -> crate::Result<Value> {
         }
     }
 
-    let base_model_sha256 = compiled_swift_base_sha256()?;
+    let base_profile = request.base_model.unwrap_or(BaseModelProfile::SwiftPq2);
+    let base_model_sha256 = base_profile.base_model_sha256()?;
     let lock = bonsai_cpu_policy::DaisyRoseLoraLock {
         schema_version: 1,
         envelope: envelope.to_owned(),
@@ -524,7 +548,31 @@ pub(super) fn run_generate_lock(request: &Request) -> crate::Result<Value> {
     } else {
         Path::new("/tmp/swift-data")
     };
-    let _resolved = bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(dummy_data, lock_text)?;
+    let _resolved = match base_profile {
+        BaseModelProfile::SwiftPq2 => {
+            bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(dummy_data, lock_text)?
+        }
+        BaseModelProfile::Nariq2_5Bpw
+        | BaseModelProfile::Nariq3_0Bpw
+        | BaseModelProfile::Nariq2_0Bpw => {
+            bonsai_cpu_policy::DaisyRoseLoraArtifact::for_nariq_lock(
+                dummy_data,
+                base_profile
+                    .nariq_variant()
+                    .ok_or("Missing NariQ variant.")?,
+                lock_text,
+            )?
+        }
+        BaseModelProfile::Bonsai25Pq2 | BaseModelProfile::Bonsai25Ptq1 => {
+            bonsai_cpu_policy::DaisyRoseLoraArtifact::for_bonsai25_lock(
+                dummy_data,
+                base_profile
+                    .bonsai25_variant()
+                    .ok_or("Missing Bonsai 2.5 variant.")?,
+                lock_text,
+            )?
+        }
+    };
 
     let lock_sha256 = crate::identity::sha256(&lock_bytes);
     crate::bounded_input::write_new_synced(output_path, &lock_bytes)?;
@@ -607,11 +655,10 @@ pub(super) fn build_dr_g2_contract(
     candidate_max_rank: Option<u16>,
     candidate_target_count: Option<usize>,
 ) -> Value {
-    let profile = base_model.unwrap_or(BaseModelProfile::SwiftPq2);
-    let orca_scale = if profile.is_nariq() {
-        0.0
-    } else {
+    let orca_scale = if orca_adapter_sha256.is_some() {
         ORCA_EXPECTED_SCALE
+    } else {
+        0.0
     };
     let mut thresholds = json!({
         "maxThinkingTokenRatio": MAX_THINKING_TOKEN_RATIO,
@@ -643,7 +690,7 @@ pub(super) fn build_dr_g2_contract(
         "requiredThinkingOffCategories": [THINKING_OFF_CATEGORY],
         "thresholds": thresholds,
     });
-    if profile.is_nariq()
+    if let Some(profile) = base_model.filter(|p| *p != BaseModelProfile::SwiftPq2)
         && let Some(obj) = contract.as_object_mut()
     {
         obj.insert("baseModel".to_owned(), json!(profile));
@@ -676,20 +723,40 @@ pub(super) fn run_dr_g2_plan(request: &Request) -> crate::Result<Value> {
         .as_ref()
         .and_then(|cfg| cfg.base_model)
         .unwrap_or(BaseModelProfile::SwiftPq2);
+    let include_orca_override = request
+        .screen_config
+        .as_ref()
+        .and_then(|cfg| cfg.include_orca);
+    let include_orca = match (base_profile, include_orca_override) {
+        (BaseModelProfile::SwiftPq2, Some(false)) => {
+            return Err(
+                "DR-G2 on swift-pq2 requires Orca stacking (includeOrca cannot be false).".into(),
+            );
+        }
+        (BaseModelProfile::SwiftPq2, _) => true,
+        (p, Some(true)) if p.is_nariq() => {
+            return Err(
+                "DR-G2 on NariQ forbids Orca stacking (includeOrca cannot be true).".into(),
+            );
+        }
+        (p, _) if p.is_nariq() => false,
+        (_, Some(explicit)) => explicit,
+        (_, None) => false,
+    };
     let include_multimodal = request
         .screen_config
         .as_ref()
         .is_some_and(|cfg| cfg.include_multimodal_checks);
     let base_sha = base_profile.base_model_sha256()?;
-    let orca_sha = if base_profile.is_nariq() {
-        None
-    } else {
+    let orca_sha = if include_orca {
         Some(compiled_orca_adapter_sha256()?)
-    };
-    let orca_scale = if base_profile.is_nariq() {
-        0.0
     } else {
+        None
+    };
+    let orca_scale = if include_orca {
         ORCA_EXPECTED_SCALE
+    } else {
+        0.0
     };
     let cand_sha = request
         .screen_config
@@ -705,7 +772,7 @@ pub(super) fn run_dr_g2_plan(request: &Request) -> crate::Result<Value> {
         .and_then(|cfg| cfg.candidate_target_count);
 
     let contract = build_dr_g2_contract(
-        base_profile.is_nariq().then_some(base_profile),
+        (base_profile != BaseModelProfile::SwiftPq2).then_some(base_profile),
         include_multimodal,
         &base_sha,
         orca_sha.as_deref(),
@@ -880,6 +947,8 @@ pub(super) fn validate_evidence_header(evidence: &DrG2Evidence) -> crate::Result
     if evidence.base_model_sha256 != expected_base_sha {
         return Err(if profile.is_nariq() {
             "DR-G2 evidence baseModelSha256 disagrees with pinned NariQ lock.".into()
+        } else if profile.is_bonsai25() {
+            "DR-G2 evidence baseModelSha256 disagrees with pinned Bonsai 2.5 lock.".into()
         } else {
             "DR-G2 evidence baseModelSha256 disagrees with pinned Swift PQ2 lock.".into()
         });
@@ -895,6 +964,38 @@ pub(super) fn validate_evidence_header(evidence: &DrG2Evidence) -> crate::Result
             return Err("DR-G2 evidence for NariQ requires orcaScale equal to 0.0.".into());
         }
         None
+    } else if profile.is_bonsai25() {
+        match &evidence.orca_adapter_sha256 {
+            None => {
+                if !evidence.orca_scale.is_finite()
+                    || evidence.orca_scale.is_sign_negative()
+                    || evidence.orca_scale.abs() > 1e-9
+                {
+                    return Err(
+                        "DR-G2 evidence for Orca-free Bonsai 2.5 requires orcaScale equal to 0.0."
+                            .into(),
+                    );
+                }
+                None
+            }
+            Some(actual) => {
+                let orca_sha = compiled_orca_adapter_sha256()?;
+                if actual != &orca_sha {
+                    return Err(
+                        "DR-G2 evidence orcaAdapterSha256 disagrees with pinned Orca lock.".into(),
+                    );
+                }
+                if !evidence.orca_scale.is_finite()
+                    || (evidence.orca_scale - ORCA_EXPECTED_SCALE).abs() > 1e-9
+                {
+                    return Err(
+                        "DR-G2 evidence with Orca stacked on Bonsai 2.5 requires orcaScale equal to 1.3."
+                            .into(),
+                    );
+                }
+                Some(orca_sha)
+            }
+        }
     } else {
         let orca_sha = compiled_orca_adapter_sha256()?;
         if evidence.orca_adapter_sha256.as_deref() != Some(orca_sha.as_str()) {
@@ -945,7 +1046,7 @@ pub(super) fn validate_evidence_header(evidence: &DrG2Evidence) -> crate::Result
 
     for &include_mm in multimodal_candidates {
         let bound_contract = build_dr_g2_contract(
-            profile.is_nariq().then_some(profile),
+            (profile != BaseModelProfile::SwiftPq2).then_some(profile),
             include_mm,
             &expected_base_sha,
             expected_orca_sha.as_deref(),
@@ -960,7 +1061,7 @@ pub(super) fn validate_evidence_header(evidence: &DrG2Evidence) -> crate::Result
 
         if evidence.candidate_max_rank.is_none() && evidence.candidate_target_count.is_none() {
             let generic_contract = build_dr_g2_contract(
-                profile.is_nariq().then_some(profile),
+                (profile != BaseModelProfile::SwiftPq2).then_some(profile),
                 include_mm,
                 &expected_base_sha,
                 expected_orca_sha.as_deref(),
@@ -2288,6 +2389,179 @@ mod tests {
                     "evidencePath": bad_scale_path
                 }))
                 .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dr_g2_bonsai25_supports_orca_free_orca_stacked_and_generate_lock() -> crate::Result<()> {
+        let scratch = ScratchDir::new("Bonsai-DrG2-Bonsai25")?;
+        let cand_sha = "cd".repeat(32);
+
+        // Invalid includeOrca overrides fail closed on SwiftPq2 and NariQ.
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "dr-g2-plan",
+                "screenConfig": {
+                    "baseModel": "swift-pq2",
+                    "includeOrca": false
+                }
+            }))
+            .is_err()
+        );
+        assert!(
+            run(json!({
+                "schemaVersion": 1,
+                "operation": "dr-g2-plan",
+                "screenConfig": {
+                    "baseModel": "nariq-2.5bpw",
+                    "includeOrca": true
+                }
+            }))
+            .is_err()
+        );
+
+        for (profile_str, profile) in [
+            ("bonsai-2.5-pq2", BaseModelProfile::Bonsai25Pq2),
+            ("bonsai-2.5-ptq1", BaseModelProfile::Bonsai25Ptq1),
+        ] {
+            for include_orca in [false, true] {
+                let mut screen = json!({
+                    "baseModel": profile_str,
+                    "candidateAdapterSha256": cand_sha,
+                    "candidateMaxRank": 16,
+                    "candidateTargetCount": 128
+                });
+                if include_orca {
+                    screen["includeOrca"] = json!(true);
+                }
+                let plan = run(json!({
+                    "schemaVersion": 1,
+                    "operation": "dr-g2-plan",
+                    "screenConfig": screen
+                }))?;
+                assert_eq!(plan["contract"]["baseModel"], profile_str);
+                assert_eq!(
+                    plan["contract"]["baseModelSha256"],
+                    profile.base_model_sha256()?
+                );
+                if include_orca {
+                    assert!(plan["contract"]["orcaAdapterSha256"].is_string());
+                    assert_eq!(plan["contract"]["orcaScale"], 1.3);
+                } else {
+                    assert_eq!(plan["contract"]["orcaAdapterSha256"], Value::Null);
+                    assert_eq!(plan["contract"]["orcaScale"], 0.0);
+                }
+
+                let evidence = json!({
+                    "schemaVersion": 1,
+                    "baseModel": profile_str,
+                    "contractSha256": plan["contractSha256"],
+                    "baseModelSha256": profile.base_model_sha256()?,
+                    "orcaAdapterSha256": plan["contract"]["orcaAdapterSha256"],
+                    "orcaScale": plan["contract"]["orcaScale"],
+                    "candidateAdapterSha256": cand_sha,
+                    "candidateMaxRank": 16,
+                    "candidateTargetCount": 128,
+                    "scaleGrid": [0.0, 0.25, 0.5, 0.75, 1.0],
+                    "selectedScale": 0.25,
+                    "trainingPromptSha256s": [],
+                    "thinkingOnPrompts": [
+                        {
+                            "promptId": "c1", "promptSha256": "11".repeat(32), "category": "coding",
+                            "baseline": { "scale": 0.0, "responseSha256": "a1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.0, "thinkingTokens": 90, "hit4096Truncation": false, "loopDetected": false },
+                            "candidate": { "scale": 0.25, "responseSha256": "b1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "thinkingTokens": 95, "hit4096Truncation": false, "loopDetected": false }
+                        },
+                        {
+                            "promptId": "r1", "promptSha256": "12".repeat(32), "category": "reasoning",
+                            "baseline": { "scale": 0.0, "responseSha256": "c1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.0, "thinkingTokens": 90, "hit4096Truncation": false, "loopDetected": false },
+                            "candidate": { "scale": 0.25, "responseSha256": "d1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "thinkingTokens": 95, "hit4096Truncation": false, "loopDetected": false }
+                        },
+                        {
+                            "promptId": "i1", "promptSha256": "13".repeat(32), "category": "instruction-following",
+                            "baseline": { "scale": 0.0, "responseSha256": "e1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.0, "thinkingTokens": 90, "hit4096Truncation": false, "loopDetected": false },
+                            "candidate": { "scale": 0.25, "responseSha256": "f1".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "thinkingTokens": 95, "hit4096Truncation": false, "loopDetected": false }
+                        }
+                    ],
+                    "thinkingOffPrompts": [{
+                        "promptId": "cr1", "promptSha256": "14".repeat(32), "category": "creative-prose",
+                        "baseline": { "scale": 0.0, "responseSha256": "21".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "unwantedRefusal": false },
+                        "candidate": { "scale": 0.25, "responseSha256": "31".repeat(32), "humanReviewed": true, "reviewerId": "owner", "score": 3.5, "unwantedRefusal": false }
+                    }],
+                    "zeroScaleControls": [{
+                        "promptId": "z1", "promptSha256": "15".repeat(32),
+                        "noAdapterResponseSha256": "41".repeat(32),
+                        "zeroScaleResponseSha256": "41".repeat(32)
+                    }]
+                });
+                let path = scratch.join(format!("{profile_str}-orca-{include_orca}.json"));
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&evidence).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                let scored = run(json!({
+                    "schemaVersion": 1,
+                    "operation": "dr-g2-score",
+                    "evidencePath": path
+                }))?;
+                assert_eq!(scored["drG2Passed"], true);
+                assert_eq!(scored["baseModel"], profile_str);
+
+                // Reject mismatched Orca adapter/scale pair on Bonsai 2.5.
+                let mut mismatched = evidence;
+                mismatched["orcaScale"] = json!(if include_orca { 0.0 } else { 1.3 });
+                let bad_path = scratch.join(format!("{profile_str}-bad-{include_orca}.json"));
+                fs::write(
+                    &bad_path,
+                    serde_json::to_vec(&mismatched).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                assert!(
+                    run(json!({
+                        "schemaVersion": 1,
+                        "operation": "dr-g2-score",
+                        "evidencePath": bad_path
+                    }))
+                    .is_err()
+                );
+            }
+
+            // Generate-lock binds baseModelSha256 to the selected Bonsai 2.5 variant.
+            let adapter_path = scratch.join(format!("adapter-{profile_str}.gguf"));
+            let _gen_adapter = run(json!({
+                "schemaVersion": 1,
+                "operation": "generate-test-adapter",
+                "scope": {
+                    "layers": [0, 3],
+                    "targetEnvelope": "npu-friendly",
+                    "exportDtype": "f16",
+                    "maxRank": 2
+                },
+                "outputPath": adapter_path
+            }))?;
+            let lock_path = scratch.join(format!("lock-{profile_str}.json"));
+            let lock_res = run(json!({
+                "schemaVersion": 1,
+                "operation": "generate-lock",
+                "baseModel": profile_str,
+                "adapterPath": adapter_path,
+                "outputPath": lock_path,
+                "lockSource": {
+                    "host": "huggingface",
+                    "repository": "symbiogenesis/DaisyRose-Swift-LoRA",
+                    "revision": "0123456789abcdef0123456789abcdef01234567",
+                    "path": "gguf/daisyrose.gguf",
+                    "filename": "daisyrose.gguf",
+                    "url": "https://huggingface.co/symbiogenesis/DaisyRose-Swift-LoRA/resolve/0123456789abcdef0123456789abcdef01234567/gguf/daisyrose.gguf",
+                    "license": "Apache-2.0"
+                }
+            }))?;
+            assert_eq!(
+                lock_res["lock"]["baseModelSha256"],
+                profile.base_model_sha256()?
             );
         }
         Ok(())

@@ -266,7 +266,7 @@ pub(super) fn validate_capture_request(
                 "captureConfig.orcaAdapterPath must be omitted/null for NariQ base models.".into(),
             );
         }
-    } else if config.orca_adapter_path.is_none() {
+    } else if !profile.is_bonsai25() && config.orca_adapter_path.is_none() {
         return Err("captureConfig.orcaAdapterPath is required for SwiftPq2 DR-G2 capture.".into());
     }
     let row_workers = config.row_workers.unwrap_or(DEFAULT_ROW_WORKERS);
@@ -451,7 +451,10 @@ fn calibrated_server_memory_bytes(
 
     let packing = match profile.nariq_variant() {
         Some(variant) => SwiftWeightPacking::from_nariq(variant),
-        None => SwiftWeightPacking::Pq2_0,
+        None => match profile.bonsai25_variant() {
+            Some(variant) => SwiftWeightPacking::from_bonsai25(variant),
+            None => SwiftWeightPacking::Pq2_0,
+        },
     };
     let fixed_bytes = packing.calibrated_fixed_runtime_bytes();
     let recurrent_bytes = 2_u64
@@ -531,6 +534,13 @@ fn build_server_arguments(
     if let Some(variant) = profile.nariq_variant() {
         args.push(OsString::from("--nariq"));
         args.push(OsString::from(variant.as_str()));
+    } else if let Some(variant) = profile.bonsai25_variant() {
+        args.push(OsString::from("--bonsai-2-5"));
+        args.push(OsString::from(variant.as_str()));
+        if let Some(orca_path) = &config.orca_adapter_path {
+            args.push(OsString::from("--abliterate-lora"));
+            args.push(orca_path.as_os_str().to_owned());
+        }
     } else if let Some(orca_path) = &config.orca_adapter_path {
         args.push(OsString::from("--abliterate-lora"));
         args.push(orca_path.as_os_str().to_owned());
@@ -1028,19 +1038,19 @@ fn build_chat_completion_payload(
     prompt_text: &str,
     max_completion_tokens: u32,
     enable_thinking: bool,
-    profile: BaseModelProfile,
+    has_orca_adapter: bool,
     has_candidate_adapter: bool,
     daisyrose_scale: f64,
     controls: ChatRequestControls<'_>,
 ) -> crate::Result<Vec<u8>> {
-    let lora = match (profile.is_nariq(), has_candidate_adapter) {
-        (false, false) => Some(json!([{ "id": 0, "scale": 1.3 }])),
-        (false, true) => Some(json!([
+    let lora = match (has_orca_adapter, has_candidate_adapter) {
+        (true, false) => Some(json!([{ "id": 0, "scale": 1.3 }])),
+        (true, true) => Some(json!([
             { "id": 0, "scale": 1.3 },
             { "id": 1, "scale": daisyrose_scale }
         ])),
-        (true, false) => None,
-        (true, true) => Some(json!([{ "id": 0, "scale": daisyrose_scale }])),
+        (false, false) => None,
+        (false, true) => Some(json!([{ "id": 0, "scale": daisyrose_scale }])),
     };
     let mut payload = json!({
         "messages": [{ "role": "user", "content": prompt_text }],
@@ -1227,7 +1237,7 @@ fn run_chat_completion(
     prompt_text: &str,
     max_completion_tokens: u32,
     enable_thinking: bool,
-    profile: BaseModelProfile,
+    has_orca_adapter: bool,
     has_candidate_adapter: bool,
     daisyrose_scale: f64,
     controls: ChatRequestControls<'_>,
@@ -1238,7 +1248,7 @@ fn run_chat_completion(
         prompt_text,
         max_completion_tokens,
         enable_thinking,
-        profile,
+        has_orca_adapter,
         has_candidate_adapter,
         daisyrose_scale,
         controls,
@@ -1387,13 +1397,14 @@ fn capture_against_endpoints_inner(
     wait_endpoint_ready(server_b, true, inference_deadline, &check_servers)?;
 
     let profile = config.base_model.unwrap_or(BaseModelProfile::SwiftPq2);
+    let has_orca_adapter = config.orca_adapter_path.is_some();
     let base_model_sha256 = profile.base_model_sha256()?;
-    let orca_adapter_sha256 = if profile.is_nariq() {
-        None
-    } else {
+    let orca_adapter_sha256 = if has_orca_adapter {
         Some(compiled_orca_adapter_sha256()?)
+    } else {
+        None
     };
-    let orca_scale = if profile.is_nariq() { 0.0 } else { 1.3 };
+    let orca_scale = if has_orca_adapter { 1.3 } else { 0.0 };
     let reasoning_effort = config
         .reasoning_effort
         .as_deref()
@@ -1404,7 +1415,7 @@ fn capture_against_endpoints_inner(
     };
     let scale_grid = resolve_scale_grid(config.scale_grid.as_ref())?;
     let contract = build_dr_g2_contract(
-        profile.is_nariq().then_some(profile),
+        (profile != BaseModelProfile::SwiftPq2).then_some(profile),
         false,
         &base_model_sha256,
         orca_adapter_sha256.as_deref(),
@@ -1456,7 +1467,7 @@ fn capture_against_endpoints_inner(
             &ctrl.prompt_text,
             max_tokens,
             enable_thinking,
-            profile,
+            has_orca_adapter,
             false,
             0.0,
             chat_controls,
@@ -1512,7 +1523,7 @@ fn capture_against_endpoints_inner(
             &ctrl.prompt_text,
             max_tokens,
             enable_thinking,
-            profile,
+            has_orca_adapter,
             true,
             0.0,
             chat_controls,
@@ -1582,7 +1593,7 @@ fn capture_against_endpoints_inner(
             &prompt.prompt_text,
             max_tokens,
             true,
-            profile,
+            has_orca_adapter,
             false,
             0.0,
             chat_controls,
@@ -1638,7 +1649,7 @@ fn capture_against_endpoints_inner(
             &prompt.prompt_text,
             max_tokens,
             true,
-            profile,
+            has_orca_adapter,
             true,
             config.selected_scale,
             chat_controls,
@@ -1735,7 +1746,7 @@ fn capture_against_endpoints_inner(
             &prompt.prompt_text,
             max_tokens,
             false,
-            profile,
+            has_orca_adapter,
             false,
             0.0,
             chat_controls,
@@ -1791,7 +1802,7 @@ fn capture_against_endpoints_inner(
             &prompt.prompt_text,
             max_tokens,
             false,
-            profile,
+            has_orca_adapter,
             true,
             config.selected_scale,
             chat_controls,
@@ -1873,7 +1884,7 @@ fn capture_against_endpoints_inner(
 
     let evidence = DrG2Evidence {
         schema_version: 1,
-        base_model: profile.is_nariq().then_some(profile),
+        base_model: (profile != BaseModelProfile::SwiftPq2).then_some(profile),
         include_multimodal_checks: false,
         contract_sha256: contract_sha256.clone(),
         base_model_sha256,
@@ -2275,6 +2286,7 @@ mod tests {
             realign_config: None,
             verify_policy: super::super::VerifyPolicy::default(),
             lock_source: None,
+            base_model: None,
             default_enabled: false,
             default_scale_tenths: None,
             evidence_path: None,
@@ -2419,7 +2431,7 @@ mod tests {
             "test prompt",
             2048,
             true,
-            BaseModelProfile::SwiftPq2,
+            true,
             true,
             1.0,
             ChatRequestControls {
@@ -2438,7 +2450,7 @@ mod tests {
             "test prompt",
             1024,
             false,
-            BaseModelProfile::SwiftPq2,
+            true,
             true,
             1.0,
             ChatRequestControls {
@@ -2448,6 +2460,21 @@ mod tests {
         )?)
         .map_err(|e| e.to_string())?;
         assert!(payload_off.get("reasoning_budget").is_none());
+
+        let payload_orca_free: Value = serde_json::from_slice(&build_chat_completion_payload(
+            "test prompt",
+            1024,
+            false,
+            false,
+            true,
+            0.75,
+            ChatRequestControls {
+                reasoning_effort: "medium",
+                reasoning_budget: None,
+            },
+        )?)
+        .map_err(|e| e.to_string())?;
+        assert_eq!(payload_orca_free["lora"], json!([{"id": 0, "scale": 0.75}]));
 
         for mut bad_opt in [
             {
@@ -2531,6 +2558,41 @@ mod tests {
             )
             .is_err()
         );
+
+        // Bonsai 2.5 allows Orca-free and Orca-stacked capture plus Vulkan/Composite placements.
+        for (profile, placement, include_orca, expected_flag) in [
+            (BaseModelProfile::Bonsai25Pq2, None, false, "pq2"),
+            (
+                BaseModelProfile::Bonsai25Ptq1,
+                Some("composite"),
+                true,
+                "ptq1",
+            ),
+        ] {
+            let mut b25_cfg = swift_cfg.clone();
+            b25_cfg.base_model = Some(profile);
+            b25_cfg.placement = placement.map(str::to_owned);
+            b25_cfg.orca_adapter_path = include_orca.then(|| PathBuf::from(r"C:\Dummy\orca.gguf"));
+            let b25_req = dummy_request_with_config(b25_cfg.clone(), out_path.clone());
+            validate_capture_request(&b25_req, &b25_cfg, &out_path)?;
+            let b25_args = build_server_arguments(
+                &b25_cfg,
+                18083,
+                &scratch.join("b25.key"),
+                true,
+                1234,
+                &cand_sha,
+            )?;
+            assert!(
+                b25_args
+                    .windows(2)
+                    .any(|w| w == ["--bonsai-2-5", expected_flag])
+            );
+            assert_eq!(
+                b25_args.iter().any(|a| a == "--abliterate-lora"),
+                include_orca
+            );
+        }
 
         let mut bad_budget = swift_cfg;
         bad_budget.time_budget_seconds = Some(29);
@@ -2938,6 +3000,49 @@ mod tests {
         assert_eq!(nariq_evidence["baseModel"], "nariq-2.5bpw");
         assert_eq!(nariq_evidence["orcaAdapterSha256"], Value::Null);
         assert_eq!(nariq_evidence["orcaScale"], 0.0);
+
+        // Bonsai 2.5 supports both Orca-free and Orca-stacked capture round-trips.
+        for include_orca in [false, true] {
+            let b_mock_a = spawn_mock_server(token_a.clone(), false, 0)?;
+            let b_mock_b = spawn_mock_server(token_b.clone(), true, 0)?;
+            let b_out = scratch.join(format!("b25-orca-{include_orca}.json"));
+            let mut b_cfg = base_capture_config(None);
+            b_cfg.base_model = Some(BaseModelProfile::Bonsai25Ptq1);
+            if !include_orca {
+                b_cfg.orca_adapter_path = None;
+            }
+            let b_req = dummy_request_with_config(b_cfg, b_out.clone());
+            let b_receipt = run_capture_against_endpoints(
+                &b_req,
+                b_mock_a.port,
+                &token_a,
+                b_mock_b.port,
+                &token_b,
+                &cand_sha,
+                Some(16),
+                Some(128),
+                None,
+            );
+            b_mock_a.stop.store(true, Ordering::Relaxed);
+            b_mock_b.stop.store(true, Ordering::Relaxed);
+            let _ = b_mock_a.join.join();
+            let _ = b_mock_b.join.join();
+
+            let b_receipt = b_receipt?;
+            assert_eq!(b_receipt["completed"], true);
+            assert_eq!(b_receipt["baseModel"], "bonsai-2.5-ptq1");
+            let b_evidence: Value =
+                serde_json::from_slice(&fs::read(&b_out).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            assert_eq!(b_evidence["baseModel"], "bonsai-2.5-ptq1");
+            if include_orca {
+                assert!(b_evidence["orcaAdapterSha256"].is_string());
+                assert_eq!(b_evidence["orcaScale"], 1.3);
+            } else {
+                assert_eq!(b_evidence["orcaAdapterSha256"], Value::Null);
+                assert_eq!(b_evidence["orcaScale"], 0.0);
+            }
+        }
 
         // Now test tight budget expiry after server startup: unpaired prompts are skipped cleanly
         // while completed individual-arm timings remain retained in promptTimings.

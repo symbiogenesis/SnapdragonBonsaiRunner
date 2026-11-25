@@ -278,6 +278,8 @@ struct Request {
     #[serde(default)]
     lock_source: Option<bonsai_cpu_policy::DaisyRoseLoraSource>,
     #[serde(default)]
+    base_model: Option<readiness::BaseModelProfile>,
+    #[serde(default)]
     default_enabled: bool,
     #[serde(default)]
     default_scale_tenths: Option<u8>,
@@ -407,11 +409,12 @@ fn validate_request(request: &Request) -> crate::Result<()> {
     }
     if request.operation != Operation::GenerateLock
         && (request.lock_source.is_some()
+            || request.base_model.is_some()
             || request.default_enabled
             || request.default_scale_tenths.is_some())
     {
         return Err(
-            "lockSource, defaultEnabled, and defaultScaleTenths are only supported for generate-lock."
+            "lockSource, baseModel, defaultEnabled, and defaultScaleTenths are only supported for generate-lock."
                 .into(),
         );
     }
